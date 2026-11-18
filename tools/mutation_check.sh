@@ -1061,6 +1061,19 @@ check "the promotion pass ticks a marked fluid cell" \
             }
         }' \
   structure_template::template_structures_tests::postprocess_ticks_a_marked_source_fluid_into_its_neighbour
+# The promotion footprint. A recorded plan is a window of native's decorated region, so a
+# promotion window that leaves the plan cannot be evidence of a missing pass; and a fluid
+# replaces a cell whose collision shape is empty instead of refusing it.
+check "a recorded plan's window is native's decoration, not this model's" \
+  src/worldgen.rs '                let c = (cx + dx, cz + dz);
+                !in_window(c) || self.pop_done.contains(&c)' \
+  '                let c = (cx + dx, cz + dz);
+                self.pop_done.contains(&c)' \
+  worldgen::wg_tests::a_recorded_plan_window_answers_for_the_neighbours_it_does_not_cover
+check "a fluid replaces a cell whose collision shape is empty" \
+  src/flowing_fluid.rs '            Cell::Passable => self.put(p, Cell::Fluid(fluid)),' \
+  '            Cell::Passable => Ok(()),' \
+  flowing_fluid::tests::a_source_replaces_an_empty_collision_shape_cell_sideways
 check "a traced column names the layer that answered it" \
   src/generation_context.rs '        } else if self.rc.contains_key(&(x, y, z)) {
             "rc"' \

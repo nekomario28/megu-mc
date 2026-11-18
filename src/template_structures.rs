@@ -1692,6 +1692,10 @@ pub(crate) enum FluidCell {
     Air,
     Solid,
     Fluid { water: bool, level: u8 },
+    /// Non-air, no fluid, empty collision shape: `FlowingFluid.canHoldFluid` answers true and
+    /// `canPassThrough` cannot fail, so a spread replaces the cell (`short_grass` in the
+    /// measured cell `(100,19,-513)`, a lush-cave plant). It is never written by the machine.
+    Passable,
 }
 
 /// The two verbs one `FluidState.tick` needs from the world. `None` from [`fluid_cell`] is
@@ -1730,6 +1734,8 @@ impl<W: TemplateWorld> FluidTickTarget for W {
                     Some(FluidCell::Air)
                 } else if reg.is_solid_render(state) {
                     Some(FluidCell::Solid)
+                } else if holds_fluid(reg, state) {
+                    Some(FluidCell::Passable)
                 } else {
                     None
                 }
@@ -1751,6 +1757,9 @@ impl<W: TemplateWorld> FluidTickTarget for W {
         let state = match cell {
             FluidCell::Air => reg.state_of("minecraft:air", None),
             FluidCell::Solid => return,
+            // A `Passable` cell is only ever an *input*: the machine replaces it with the fluid
+            // it spreads, so a write of one would be a plan bug, not a state.
+            FluidCell::Passable => return,
             FluidCell::Fluid { water, level } => {
                 let name = if water {
                     "minecraft:water"
@@ -1778,6 +1787,36 @@ fn fluid_level(reg: &BReg, state: u32) -> u8 {
     reg.get_prop(state, "level")
         .and_then(|v| v.parse::<u8>().ok())
         .unwrap_or(0)
+}
+
+/// `FlowingFluid.canHoldFluid` / `canPassThrough` for a cell that holds no fluid of its own,
+/// restricted to the case this machine models: an **empty collision shape**.
+///
+/// From the pinned jar (`epc`): `canHoldFluid` delegates to `SimpleWaterloggedBlock` first
+/// (a waterlogged-capable state is entered through `placeLiquid`, which this machine does not
+/// model — so those states stay unsupported), refuses `DoorBlock`, `#minecraft:signs`,
+/// `ladder`, `sugar_cane`, `bubble_column`, `nether_portal`, `end_portal`, `end_gateway` and
+/// `structure_void` outright, and otherwise answers `!state.blocksMotion()`. `canPassThrough`
+/// intersects the two collision shapes; against an empty shape it cannot fail. A cell with a
+/// non-empty partial shape keeps its refusal: its answer depends on the two shapes' geometry.
+fn holds_fluid(reg: &BReg, state: u32) -> bool {
+    // `SimpleWaterloggedBlock.canPlaceLiquid` is the first branch of `canHoldFluid` and enters a
+    // state through `placeLiquid`; every `DoorBlock` and sign state carries `waterlogged`, so this
+    // guard answers both families as well as the arm this machine cannot write.
+    if reg.get_prop(state, "waterlogged").is_some() {
+        return false;
+    }
+    let refused = matches!(
+        reg.name_of(state),
+        "minecraft:ladder"
+            | "minecraft:sugar_cane"
+            | "minecraft:bubble_column"
+            | "minecraft:nether_portal"
+            | "minecraft:end_portal"
+            | "minecraft:end_gateway"
+            | "minecraft:structure_void"
+    ) || reg.in_tag(state, "minecraft:signs");
+    !refused && reg.is_collision_empty(state) && !reg.blocks_motion(state)
 }
 
 /// `LevelChunk.postProcessGeneration`'s per-cell rule, for the positions a `WorldGenRegion`
@@ -4288,6 +4327,57 @@ mod template_structures_tests {
             Some("0"),
             "the marked source cell itself is untouched"
         );
+    }
+
+    /// The pass' cell vocabulary is `FlowingFluid.canHoldFluid` / `canPassThrough`, not "air or
+    /// full cube": a cell with an **empty collision shape** and no fluid is `Passable`.
+    ///
+    /// The measured cell is `(100,19,-513)` of the village capture: `minecraft:short_grass` in
+    /// this port and water in native, and the tick at the marked source `(98,19,-513)` stopped
+    /// there before this arm existed. A waterlogged state is *not* `Passable` (vanilla enters it
+    /// through `placeLiquid`, which this machine cannot write) and neither is a state vanilla's
+    /// `canHoldFluid` refuses by name.
+    #[test]
+    fn the_pass_sees_an_empty_collision_shape_as_a_cell_a_fluid_can_hold() {
+        let reg = breg().expect("block registry");
+        let scene = SceneSpec::parse(None, reg);
+        let mut world = TestWorld::new(scene);
+        let air = reg.state_of("minecraft:air", None);
+        world.set(0, -30, 0, reg.state_of("minecraft:short_grass", None));
+        world.set(0, -30, 1, reg.state_of("minecraft:stone", None));
+        world.set(0, -30, 2, reg.state_of("minecraft:water", None));
+        world.set(0, -30, 3, air);
+        world.set(0, -30, 4, reg.state_of("minecraft:ladder", None));
+        world.set(
+            0,
+            -30,
+            5,
+            reg.state_of("minecraft:sugar_cane", None),
+        );
+        let sign = reg.state_of("minecraft:oak_sign", None);
+        world.set(0, -30, 6, sign);
+        assert_eq!(
+            world.fluid_cell((0, -30, 0)),
+            Some(FluidCell::Passable),
+            "short_grass: empty collision, not in canHoldFluid's refusal list"
+        );
+        assert_eq!(world.fluid_cell((0, -30, 1)), Some(FluidCell::Solid));
+        assert_eq!(
+            world.fluid_cell((0, -30, 2)),
+            Some(FluidCell::Fluid { water: true, level: 0 })
+        );
+        assert_eq!(world.fluid_cell((0, -30, 3)), Some(FluidCell::Air));
+        for (z, name) in [
+            (4, "ladder"),
+            (5, "sugar_cane"),
+            (6, "oak_sign (waterlogged-capable)"),
+        ] {
+            assert_eq!(
+                world.fluid_cell((0, -30, z)),
+                None,
+                "{name} keeps its refusal: canHoldFluid answers it by name"
+            );
+        }
     }
 
     /// The other half of the same rule: once the last face is gone the cell is air, not

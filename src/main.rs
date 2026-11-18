@@ -8552,7 +8552,11 @@ impl GeneratedFluidOwner {
                     96
                 }) + u32::from(f.level)
             }
-            flowing_fluid::Cell::Solid => return Err("fluid plan cannot write a solid".into()),
+            // A plan replaces a `Passable` cell *with* the fluid it spreads, so neither of these
+            // is reachable as a write; refusing them keeps the writer's contract honest.
+            flowing_fluid::Cell::Solid | flowing_fluid::Cell::Passable => {
+                return Err("fluid plan cannot write a non-fluid cell".into())
+            }
         };
         if old == state {
             return Ok(());
@@ -8768,6 +8772,7 @@ impl flowing_fluid::Reader for PassFluidReader<'_> {
         match self.0.fluid_cell(pos) {
             Some(structure_template::FluidCell::Air) => Ok(flowing_fluid::Cell::Air),
             Some(structure_template::FluidCell::Solid) => Ok(flowing_fluid::Cell::Solid),
+            Some(structure_template::FluidCell::Passable) => Ok(flowing_fluid::Cell::Passable),
             Some(structure_template::FluidCell::Fluid { water, level }) => {
                 Ok(flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
                     kind: if water {
@@ -8778,8 +8783,8 @@ impl flowing_fluid::Reader for PassFluidReader<'_> {
                     level,
                 }))
             }
-            // Vanilla's `FlowingFluid` has no such answer: a non-full collision shape or a
-            // cross-fluid contact is a case this machine refuses rather than guesses. The
+            // Vanilla's `FlowingFluid` has no such answer: a non-empty partial collision shape
+            // or a cross-fluid contact is a case this machine refuses rather than guesses. The
             // pass then leaves the cell alone, which is the fail-closed half of the contract
             // on `flowing_fluid::Reader`.
             None => Err(pos),
@@ -8843,7 +8848,9 @@ fn promotion_fluid_tick(
                 water: f.kind == flowing_fluid::Kind::Water,
                 level: f.level,
             },
-            flowing_fluid::Cell::Solid => continue,
+            // A plan writes air or fluid only (`spread_to` replaces a `Passable` cell *with* the
+            // fluid), so these two arms are unreachable; skipping is the honest translation.
+            flowing_fluid::Cell::Solid | flowing_fluid::Cell::Passable => continue,
         };
         world.set_fluid(write_pos, cell);
     }
@@ -27573,7 +27580,7 @@ fn main() {
                         "invalid MC_SPINE_POP_ORDER_SCOPE {other:?}; expected exact or recorded"
                     )),
                 };
-                let order = worldgen::parse_population_order(&text, ox, oz, n, allow_extra)
+                let plan = worldgen::parse_population_order(&text, ox, oz, n, allow_extra)
                     .unwrap_or_else(|error| fail(error));
                 // The terrain stage runs before the plan, not lazily inside it. Vanilla's
                 // `SURFACE` precedes `CARVERS`/`FEATURES` for a chunk, and the marks that
@@ -27583,10 +27590,10 @@ fn main() {
                 // scratch generators the dump uses) is also what makes the marks independent
                 // of the worker count: they are decided by the terrain pass, not by whichever
                 // section the dump happens to ask for first.
-                prefetch_terrain_group(&order, lo, hi, dump_workers, dump_round);
-                let requested = order.len();
+                prefetch_terrain_group(&plan.order, lo, hi, dump_workers, dump_round);
+                let requested = plan.order.len();
                 let executed =
-                    worldgen::with_gen(|g| g.populate_in_order(order, feature::populate))
+                    worldgen::with_gen(|g| g.populate_plan(plan, feature::populate))
                         .unwrap_or_else(|| fail("generator not initialized".into()));
                 if executed != requested {
                     fail(format!("{executed} of {requested} chunks executed; plan overlaps prior population (use MC_SPINE_WG_PROFILE=0)"));

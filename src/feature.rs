@@ -9355,7 +9355,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             }
         }
     }
-    // `ChunkMap.protoChunkToFullChunk` promotes the chunks of this pass' 3x3 whose status has
+    // `ChunkMap`'s load path promotes the chunks of this pass' 3x3 once their own 3x3 has
     // reached `FULL` and `LevelChunk.postProcessGeneration` then consumes the marks a
     // `WorldGenRegion` write left on them: a `StructurePiece.placeBlock` cell in
     // `SHAPE_CHECK_BLOCKS` and a cell whose written state passed `hasPostProcess` (mushrooms,
@@ -9372,15 +9372,20 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     g.stage_payloads((sx, sz), &mut staged_payloads);
 }
 
-/// The chunk-promotion boundary: `ChunkMap.protoChunkToFullChunk` followed by
-/// `LevelChunk.postProcessGeneration`, for every chunk of this pass' 3x3 whose status has
+/// The chunk-promotion boundary: `ChunkMap`'s load path (`getChunkRangeFuture(pos, 1, FULL)`
+/// then `LevelChunk.postProcessGeneration`) for every chunk of the demand region whose 3x3 has
 /// reached `FULL`.
 ///
-/// `pop_done` is the port's status table and `shape_marks_ready` is "the whole 3x3 is FULL",
-/// which is the condition `protoChunkToFullChunk` asks for over radius one, so a chunk's marks
-/// are complete the moment this loop sees it. The marks are flushed to their owning chunks
-/// first (`markPosForPostprocessing` files on `getChunk(pos)`, not on the chunk being
-/// generated), then consumed once, in section order then mark order.
+/// `pop_done` is the port's status table and `promotion_window_ready` is "the whole 3x3 is
+/// `FULL`", which is the condition `ChunkMap` asks for over radius one, so a chunk's marks are
+/// complete the moment this loop sees it. The marks are flushed to their owning chunks first
+/// (`markPosForPostprocessing` files on `getChunk(pos)`, not on the chunk being generated),
+/// then consumed once, in section order then mark order.
+///
+/// The demand region itself is `promotion_region_contains` (`(n+4)²` for an `(n+2)²` plan
+/// window): native's `FULL` region is the request plus two rings, one further out than the
+/// plan keeps, so the outer ring of this loop is exactly the chunks native promoted outside the
+/// recorded input. A chunk in that ring with no data is skipped by its empty mark bucket.
 ///
 /// `pop_active` is dropped here, before anything is rewritten, because `postProcessGeneration`
 /// runs on a promoted `LevelChunk`, not inside a `WorldGenRegion`: a write from the pass must
@@ -9397,7 +9402,10 @@ fn promote_full_chunks(ctx: &mut FC<'_>, sx: i32, sz: i32) {
     for dx in -1..=1 {
         for dz in -1..=1 {
             let (cx, cz) = (sx + dx, sz + dz);
-            if !ctx.g.shape_marks_ready(cx, cz) {
+            if !ctx.g.promotion_region_contains(cx, cz) {
+                continue;
+            }
+            if !ctx.g.promotion_window_ready(cx, cz) {
                 continue;
             }
             let mut marks = ctx.g.take_shape_marks(cx, cz);

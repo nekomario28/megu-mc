@@ -76,7 +76,7 @@ captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部
 | matrix-v2 4行(end-city/basalt/fossil/sculk) | **MATCH**(exit 0) |
 | fortress 0/256 | **MATCH**(0/65536、`expected_runtime_writes` 宣言済み・検証済み) |
 | fortress 0/128(matrix-v1) | **MATCH**(0/32768、同じ宣言。宣言値が両captureでbit一致) |
-| village-taiga | 宣言は検証済みだが比較**DIFF 4/884736** — 受入行にしない(§3) |
+| village-taiga | 宣言は検証済みだが比較**DIFF 1/884736** — 受入行にしない(§3) |
 | jungle-temple | **MATCH**(0/98304、2026-11-18実測)。121 → 47(樹冠、vine lane)→ **0**(`ClampedNormalInt`の`f2i`切り捨て、`jungle-dripstone-random-offset-20261118.md`)。port dumpはnative chunkとbyte一致(`77964c22…a715bf`) |
 | Overworld (3,−2) | 順序・mineshaft残差あり(population-order lane進行中) |
 | forest 3×3・dimension_terrain 4件・(0,0)・stronghold・(−96,35) | committed gate緑(新SHAでの再検証は行ごとに必要) |
@@ -97,9 +97,15 @@ captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部
   16セル全てが保存worldに存在。0/128=0/32768、0/256=0/65536、OCEAN_FLOOR heightmap 0列差。
 - **village-taiga**: 書き込みは fortress と**同じ決定的・生成中のclass**(2つの独立captureで
   payload hash一致 `62fc3ddc…`、書き込みsiteはchunk-gen task/生成中feature、5セル全てが保存
-  worldに存在、`game_times [3,3]`)。ゆえに宣言は正当だが、比較は4セル差で、うち3セルは
-  まさに宣言した書き込みセル((98,19,−512)/(99,19,−512) の `water[level=1]`→`air`、
-  (82,69,−500) の `air`→`fern`)。**受入行にはしない**(§3のgreenのみ追加の規律)。
+  worldに存在、`game_times [3,3]`)。ゆえに宣言は正当だが、比較は**DIFF 1/884736**
+  (2026-11-18、promotion-footprint lane: 3→1、両captureで同一)。残る1セルは
+  (82,69,−500) の `air`→`fern` で、nativeの`air`は`LevelChunk.postProcessGeneration`
+  (`dvi.H`、RUNTIME `82 69 -500 state=0 wrote=true` の stack)が書いたもの — つまり
+  nativeはこのセルを**markしており**、このportのmark集合にはその位置が無い
+  (`MARK_TRACE=all` に該当行なし、`FWRITE 82 * -500` にdisk書き込みなし)。
+  宣言した書き込みセル2つ((98,19,−512)/(99,19,−512) の `water[level=1]`→`air`)は
+  promotion footprint((n+4)²)と water の empty-collision-shape アームで一致した。
+  **受入行にはしない**(§3のgreenのみ追加の規律)。
 - **capture自身のprovenance**: matrix-v2 fortress-256 / matrix-v1 fortress / end-outer の
   `inputs.sha256` は instrument を含めて現ツリーと一致する。ruined-portal と village-taiga は
   2026-11-16 capture で、`tools/carve-agent/{Agent,CarveLog}.java` と `native_fixture.sh` の

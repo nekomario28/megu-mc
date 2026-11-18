@@ -1,7 +1,13 @@
-//! FlowingFluid's scheduled update for full-cube, air and liquid cells.
+//! FlowingFluid's scheduled update for full-cube, air, plant and liquid cells.
 //!
-//! Non-full collision shapes and cross-fluid contact require additional native
-//! shape/contact contracts; callers receive an error before committing writes.
+//! A cell with a **non-empty, non-full** collision shape, and cross-fluid contact, still need
+//! additional native shape/contact contracts; callers receive an error before committing
+//! writes. A cell whose collision shape is empty (a plant, `minecraft:short_grass` in the
+//! measured case) is modelled: `FlowingFluid.canPassThrough` intersects the two collision
+//! shapes and an empty one intersects nothing, while `canHoldFluid` answers
+//! `!state.blocksMotion()` for every block outside its sign/door/ladder/sugar-cane/bubble-column
+//! and portal/structure-void families, so the fluid enters and `spreadTo` destroys the block
+//! before writing itself.
 use std::collections::HashMap;
 
 pub(crate) type Pos = (i32, i32, i32);
@@ -53,6 +59,13 @@ pub(crate) enum Cell {
     Air,
     Solid,
     Fluid(Fluid),
+    /// Non-air, no fluid, **empty collision shape**: `FlowingFluid.canHoldFluid` is true here
+    /// (nothing for an entity to collide with, and not in the families it refuses) and
+    /// `canPassThrough` cannot fail against an empty shape, so a spread *replaces* the cell the
+    /// way `spreadTo`'s `beforeDestroyingBlock` + `setBlock(fluidState.createLegacyBlock())`
+    /// does. A non-empty partial shape stays [`Cell::Solid`]: its pass-through answer depends on
+    /// the two shapes' geometry, which this machine does not model.
+    Passable,
 }
 
 pub(crate) trait Reader {
@@ -163,6 +176,9 @@ impl<W: Reader> Context<'_, W> {
     fn spread_to(&mut self, p: Pos, fluid: Fluid) -> Result<(), W::Error> {
         match self.get(p)? {
             Cell::Air => self.put(p, Cell::Fluid(fluid)),
+            // `spreadTo`: a non-air cell outside the waterlogged arm is destroyed first and the
+            // fluid written over it. `beforeDestroyingBlock` is a no-op for water.
+            Cell::Passable => self.put(p, Cell::Fluid(fluid)),
             Cell::Fluid(other) if other.kind != fluid.kind => {
                 Err(self.world.unsupported_contact(p))
             }
@@ -255,7 +271,9 @@ pub(crate) fn tick<W: Reader>(
     }
     let below = add(p, (0, -1, 0));
     let below_state = cx.get(below)?;
-    if matches!(below_state, Cell::Air) {
+    // `canSpreadTo(..., Direction.DOWN, below, ...)`: the same empty-shape answer that lets a
+    // fluid take a plant cell sideways lets it fall through one.
+    if matches!(below_state, Cell::Air | Cell::Passable) {
         if let Some(next) = cx.new_liquid(below, source_conversion)? {
             cx.spread_to(below, next)?;
         }
@@ -293,6 +311,7 @@ mod tests {
         match s {
             "A" => Some(Cell::Air),
             "S" => Some(Cell::Solid),
+            "P" => Some(Cell::Passable),
             "U" => None,
             _ => Some(Cell::Fluid(Fluid {
                 kind: if s.starts_with('W') {
@@ -304,6 +323,66 @@ mod tests {
             })),
         }
     }
+    /// The empty-collision-shape arm, on two synthetic scenes: `canHoldFluid` answers true for a
+    /// plant and `canPassThrough` cannot fail against an empty shape, so the fluid enters and
+    /// `spreadTo` replaces the block. A full-cube cell in the same position takes nothing, which
+    /// is what makes these a gate for the arm rather than for the scene.
+    ///
+    /// The native cell this was measured from is `(100,19,-513)` of the village capture
+    /// (`short_grass` here, water in native); it sits outside the compared window, so these
+    /// tests pin the model's answer and not a fixture row.
+    #[test]
+    fn a_source_replaces_an_empty_collision_shape_cell_sideways() {
+        let mut cells: HashMap<Pos, Option<Cell>> = HashMap::new();
+        for x in -2..=2 {
+            for z in -2..=2 {
+                cells.insert((x, -1, z), Some(Cell::Solid));
+                cells.insert((x, 0, z), Some(Cell::Solid));
+                // `getNewLiquid` reads the cell above every candidate, so the scene has to
+                // answer it: open sky above the one-wide channel.
+                cells.insert((x, 1, z), Some(Cell::Air));
+            }
+        }
+        cells.insert((0, 0, 0), Some(Cell::Fluid(Fluid { kind: Kind::Water, level: 0 })));
+        cells.insert((1, 0, 0), Some(Cell::Passable));
+        let mut fixture = Fixture(cells.clone());
+        let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, true, true).unwrap();
+        let flowing = Cell::Fluid(Fluid { kind: Kind::Water, level: 1 });
+        assert!(
+            plan.writes.contains(&((1, 0, 0), flowing)),
+            "the plant east of the source is replaced by a flowing level: {:?}",
+            plan.writes
+        );
+        // The same scene with a full cube there writes nothing: the arm is the empty shape.
+        cells.insert((1, 0, 0), Some(Cell::Solid));
+        let mut fixture = Fixture(cells);
+        let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, true, true).unwrap();
+        assert!(plan.writes.is_empty(), "a full cube takes no fluid: {:?}", plan.writes);
+    }
+
+    #[test]
+    fn a_source_falls_through_an_empty_collision_shape_cell() {
+        let mut cells: HashMap<Pos, Option<Cell>> = HashMap::new();
+        for x in -2..=2 {
+            for z in -2..=2 {
+                cells.insert((x, -2, z), Some(Cell::Solid));
+                cells.insert((x, -1, z), Some(Cell::Solid));
+                cells.insert((x, 0, z), Some(Cell::Solid));
+                cells.insert((x, 1, z), Some(Cell::Air));
+            }
+        }
+        cells.insert((0, 0, 0), Some(Cell::Fluid(Fluid { kind: Kind::Water, level: 0 })));
+        cells.insert((0, -1, 0), Some(Cell::Passable));
+        let mut fixture = Fixture(cells);
+        let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, true, true).unwrap();
+        let falling = Cell::Fluid(Fluid { kind: Kind::Water, level: 8 });
+        assert!(
+            plan.writes.contains(&((0, -1, 0), falling)),
+            "the plant below the source takes the falling fluid: {:?}",
+            plan.writes
+        );
+    }
+
     #[test]
     fn cave_fluid_ticks_match_native_writes() {
         let mut count = 0;
