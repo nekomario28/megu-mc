@@ -35,6 +35,7 @@ mod trace_env;
 mod tree;
 mod world_rng;
 mod worldgen;
+include!("paletted.rs");
 
 // ---------- varint / wire ----------
 fn read_varint(b: &mut &[u8]) -> Option<i64> {
@@ -27106,6 +27107,14 @@ fn main() {
             eprintln!("Rebuild with --features fabric-probe to run the diagnostic");
             std::process::exit(1);
         }
+    }
+
+    if probe_args
+        .first()
+        .is_some_and(|arg| arg == "--paletted-bench")
+    {
+        run_paletted_bench();
+        return;
     }
 
     // quick profile: MC_SPINE_WG_PROFILE=n generates n^2 chunks then exits

@@ -3351,6 +3351,22 @@ check "clamped_normal's int clamp keeps min_inclusive and max_inclusive apart" \
                 };' \
   feature::generation_contract_tests::clamped_normal_int_provider_truncates_toward_zero_like_f2i
 
+# PalettedSection (M3 Slice P2a): non-straddling u64 packing/unpacking, Single fast path, and Direct 15-bit masking.
+check "paletted_read_shift_matches_pack_layout" \
+  src/paletted.rs '    ((words[word_idx] >> (slot * BITS)) & mask) as u32' \
+  '    ((words[word_idx] >> (slot * BITS + 1)) & mask) as u32' \
+  paletted_tests::paletted_exact_bit_transitions_and_wire_identity
+
+check "paletted_single_returns_stored_state" \
+  src/paletted.rs '            SectionPalette::Single(st) => *st,' \
+  '            SectionPalette::Single(_) => 0,' \
+  paletted_tests::paletted_single_variants_and_non_air_air_ids
+
+check "paletted_direct_keeps_all_15_bits" \
+  src/paletted.rs '                word |= ((st as u64) & 0x7fff) << (j * 15);' \
+  '                word |= ((st as u64) & 0x3fff) << (j * 15);' \
+  paletted_tests::paletted_exact_bit_transitions_and_wire_identity
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
