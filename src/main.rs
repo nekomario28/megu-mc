@@ -289,6 +289,14 @@ type Advancements = HashMap<String, HashMap<String, HashSet<String>>>;
 #[cfg(test)]
 type RegionSets = (HashSet<ChunkKey>, HashSet<ChunkKey>);
 
+#[derive(Clone, Debug)]
+struct ChestSyncState {
+    window: (ContainerKey, Option<ContainerKey>),
+    anchor: Option<BlockPos>,
+    state_id: i32,
+    last_slots: Vec<Stack>,
+}
+
 struct Client {
     eid: i32,
     uuid: [u8; 16],
@@ -300,6 +308,7 @@ struct Client {
     cursor: Mutex<Stack>,
     drag: Mutex<(i32, Vec<i16>)>, // (button, painted window slots) for click-mode 5
     open_chest: Mutex<Option<(ContainerKey, Option<ContainerKey>)>>, // (key, double-chest partner)
+    chest_sync: Mutex<Option<ChestSyncState>>,
     open_furnace: Mutex<Option<(i32, i32, i32)>>,
     craft: Mutex<HashMap<i16, Stack>>,
     craft9: Mutex<HashMap<i16, Stack>>,
@@ -2419,6 +2428,10 @@ fn mobs() -> &'static Mutex<Vec<Arc<Mob>>> {
 static SHEARED: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
 fn sheared() -> &'static Mutex<std::collections::HashSet<i32>> {
     SHEARED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+static SITTING_CATS: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
+fn sitting_cats() -> &'static Mutex<std::collections::HashSet<i32>> {
+    SITTING_CATS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 // /schedule: pending (function, due server-tick) — vanilla keeps
 // scheduled functions in world data; persisted in the meta tail.
@@ -6444,10 +6457,11 @@ fn half_openers(audience: &[Arc<Client>], pos: BlockPos) -> u32 {
     audience
         .iter()
         .filter(|c| {
-            c.open_chest
-                .lock()
-                .map(|open| open.is_some_and(|(a, b)| a == key || b == Some(key)))
-                .unwrap_or(false)
+            !c.is_spectator()
+                && c.open_chest
+                    .lock()
+                    .map(|open| open.is_some_and(|(a, b)| a == key || b == Some(key)))
+                    .unwrap_or(false)
         })
         .count() as u32
 }
@@ -6539,6 +6553,9 @@ fn invalidate_container_windows(
                 false
             }
         };
+        if had {
+            *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         if had {
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x12, vec![1u8]);
@@ -6681,6 +6698,7 @@ fn break_generated_cart(target_eid: i32, drop_loot: bool) -> bool {
                 }
             };
             if close {
+                *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 if let Ok(mut w) = c.sock.lock() {
                     let _ = send_packet(&mut w, 0x12, vec![1u8]);
                 }
@@ -7496,6 +7514,237 @@ fn chest_window_halves(open: (ContainerKey, Option<ContainerKey>)) -> Vec<BlockP
         }
     }
     out
+}
+/// `ChestBlock.isBlockedChestByBlock` (`dhb.a(Ldcc;Ljd;)Z`): true when `pos.above()`
+/// `isRedstoneConductor`. Shared by `ChestBlock` and `EnderChestBlock.useWithoutItem`.
+fn is_blocked_chest_by_block(pos: BlockPos) -> bool {
+    let above = block_at(pos.0, pos.1 + 1, pos.2);
+    breg().is_some_and(|reg| reg.is_redstone_conductor(above))
+}
+/// `ChestBlock.isCatSittingOnChest` (`dhb.b(Ldcx;Ljd;)Z`): true when a sitting `Cat`
+/// (`etype == 15`, dimensions `0.6 x 0.7`) intersects `AABB(x, y+1, z, x+1, y+2, z+1)`.
+fn is_cat_sitting_on_chest(pos: BlockPos) -> bool {
+    let sitting = sitting_cats().lock().unwrap();
+    if sitting.is_empty() {
+        return false;
+    }
+    let min = [f64::from(pos.0), f64::from(pos.1 + 1), f64::from(pos.2)];
+    let max = [
+        f64::from(pos.0 + 1),
+        f64::from(pos.1 + 2),
+        f64::from(pos.2 + 1),
+    ];
+    let ms = mobs().lock().unwrap();
+    ms.iter().any(|m| {
+        if m.etype != 15 || !sitting.contains(&m.eid) || *m.hp.lock().unwrap() <= 0.0 {
+            return false;
+        }
+        let (mx, my, mz, ..) = *m.pos.lock().unwrap();
+        aabb_overlaps(
+            (min, max),
+            ([mx - 0.3, my, mz - 0.3], [mx + 0.3, my + 0.7, mz + 0.3]),
+        )
+    })
+}
+/// `ChestBlock.isChestBlockedAt` (`dhb.a(Ldcx;Ljd;)Z`): blocked if the block above is
+/// a redstone conductor or a cat is sitting on top.
+fn is_chest_blocked_at(pos: BlockPos) -> bool {
+    is_blocked_chest_by_block(pos) || is_cat_sitting_on_chest(pos)
+}
+/// `ChestBlock.getMenuProvider` (`dhb.b` -> `dif.a` with `dhb::isChestBlockedAt`):
+/// a single chest is blocked if its cell is blocked; a double chest is blocked if EITHER
+/// half is blocked. Barrels and minecart chests never use this predicate.
+fn chest_window_blocked(window: (ContainerKey, Option<ContainerKey>)) -> bool {
+    chest_window_halves(window)
+        .into_iter()
+        .any(is_chest_blocked_at)
+}
+fn client_eye_pos(c: &Client) -> (f64, f64, f64) {
+    let (px, py, pz, ..) = *c.pos.lock().unwrap();
+    // 1.21.1 `Player` pose eye heights (`cmx.<clinit>`): standing 1.62f, crouching 1.27f.
+    let eye_h = if *c.sneaking.lock().unwrap() {
+        1.27
+    } else {
+        1.62
+    };
+    (px, py + eye_h, pz)
+}
+fn aabb_dist_sq_to_point(min: [f64; 3], max: [f64; 3], pt: (f64, f64, f64)) -> f64 {
+    // 1.21.1 `AABB.distanceToSqr(Vec3)` (`ewx.e(Lexc;)D`).
+    let dx = (min[0] - pt.0).max(pt.0 - max[0]).max(0.0);
+    let dy = (min[1] - pt.1).max(pt.1 - max[1]).max(0.0);
+    let dz = (min[2] - pt.2).max(pt.2 - max[2]).max(0.0);
+    dx * dx + dy * dy + dz * dz
+}
+fn can_interact_with_block(c: &Client, pos: BlockPos, extra: f64) -> bool {
+    // 1.21.1 `Player.canInteractWithBlock(BlockPos, double)` (`cmx.a(Ljd;D)Z`):
+    // `double d = this.blockInteractionRange() + distance;`
+    // `return new AABB(pos).distanceToSqr(this.getEyePosition()) < d * d;`
+    // `Attributes.BLOCK_INTERACTION_RANGE` = 4.5, creative modifier `+0.5` -> 5.0.
+    let base = if *c.gm.lock().unwrap() == 1 {
+        5.0
+    } else {
+        4.5
+    };
+    let d = base + extra;
+    let min = [f64::from(pos.0), f64::from(pos.1), f64::from(pos.2)];
+    let max = [
+        f64::from(pos.0 + 1),
+        f64::from(pos.1 + 1),
+        f64::from(pos.2 + 1),
+    ];
+    aabb_dist_sq_to_point(min, max, client_eye_pos(c)) < d * d
+}
+/// 1.21.1 `ChestMenu.stillValid` (`cqc.b`) -> `Container.stillValidBlockEntity`
+/// (`bqk.a(Ldqh;Lcmx;F)` with `4.0f`) / `CompoundContainer.stillValid` (`bqj.a` checks
+/// both halves) / `ContainerEntity.isChestVehicleStillValid` (`cox.g`).
+fn chest_still_valid(
+    c: &Client,
+    open: (ContainerKey, Option<ContainerKey>),
+    anchor: Option<BlockPos>,
+) -> bool {
+    if !window_live(open) {
+        return false;
+    }
+    match open {
+        (ContainerKey::Block(first), second) => {
+            let first_ok = if is_ender_key(first) {
+                anchor.is_none_or(|pos| can_interact_with_block(c, pos, 4.0))
+            } else {
+                can_interact_with_block(c, first, 4.0)
+            };
+            if !first_ok {
+                return false;
+            }
+            match second {
+                Some(ContainerKey::Block(pos2)) => can_interact_with_block(c, pos2, 4.0),
+                _ => true,
+            }
+        }
+        (ContainerKey::Cart(uuid), _) => {
+            let cart_pos = generated_content()
+                .lock()
+                .unwrap()
+                .carts
+                .iter()
+                .find(|cart| cart.uuid().ok() == Some(uuid))
+                .and_then(|cart| cart.pos().ok());
+            let Some(pos) = cart_pos else {
+                return false;
+            };
+            // `Attributes.ENTITY_INTERACTION_RANGE` = 3.0, creative modifier `+2.0` -> 5.0.
+            let base = if *c.gm.lock().unwrap() == 1 {
+                5.0
+            } else {
+                3.0
+            };
+            let d = base + 4.0;
+            let min = [pos[0] - 0.49, pos[1], pos[2] - 0.49];
+            let max = [pos[0] + 0.49, pos[1] + 0.7, pos[2] + 0.49];
+            aabb_dist_sq_to_point(min, max, client_eye_pos(c)) < d * d
+        }
+    }
+}
+fn chest_window_slots(window: (ContainerKey, Option<ContainerKey>)) -> Vec<Stack> {
+    let first = window.0;
+    let rows = if window.1.is_some() { 54usize } else { 27usize };
+    let mut out = vec![(0, 0, Vec::new()); rows];
+    let all = chests().lock().unwrap();
+    let ch = all.get(&first).cloned().unwrap_or_default();
+    for i in 0..27i16 {
+        if let Some(st) = ch.get(&i) {
+            if st.1 > 0 {
+                out[i as usize] = st.clone();
+            }
+        }
+    }
+    if let Some(second) = window.1 {
+        if let Some(ch2) = all.get(&second) {
+            for i in 0..27i16 {
+                if let Some(st) = ch2.get(&i) {
+                    if st.1 > 0 {
+                        out[27 + i as usize] = st.clone();
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+/// Per-tick `ServerPlayer.tick` (`aqv.l`) container maintenance: closes viewers that
+/// fail `stillValid` (emitting `0x12` and updating opener counts via `0x08`) and runs
+/// `AbstractContainerMenu.broadcastChanges` (`cpu.d`) for remaining viewers by diffing
+/// container slots `0..rows` and sending `0x15` (`ClientboundContainerSetSlotPacket`)
+/// with incremented `stateId` (`(stateId + 1) & 32767`).
+fn chest_viewer_tick_on(audience: &[Arc<Client>]) {
+    if audience.is_empty() {
+        return;
+    }
+    for c in audience {
+        let open = *c.open_chest.lock().unwrap();
+        let Some(win) = open else {
+            *c.chest_sync.lock().unwrap() = None;
+            continue;
+        };
+        let anchor = c
+            .chest_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|s| s.window == win)
+            .and_then(|s| s.anchor);
+        if !chest_still_valid(c, win, anchor) {
+            let halves = chest_window_halves(win);
+            let before = chest_opener_snapshot(audience, &halves);
+            *c.open_chest.lock().unwrap() = None;
+            *c.chest_sync.lock().unwrap() = None;
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x12, vec![1u8]);
+            }
+            sync_chest_openers(audience, &before);
+            continue;
+        }
+        let current = chest_window_slots(win);
+        let updates: Vec<(i16, i32, Stack)> = {
+            let mut sync_guard = c.chest_sync.lock().unwrap();
+            let sync = sync_guard.get_or_insert_with(|| ChestSyncState {
+                window: win,
+                anchor,
+                state_id: 0,
+                last_slots: vec![(0, 0, Vec::new()); current.len()],
+            });
+            if sync.window != win || sync.last_slots.len() != current.len() {
+                sync.window = win;
+                sync.anchor = anchor;
+                sync.state_id = 0;
+                sync.last_slots = vec![(0, 0, Vec::new()); current.len()];
+            }
+            let mut out = Vec::new();
+            for (idx, stack) in current.iter().enumerate() {
+                if sync.last_slots[idx] != *stack {
+                    sync.state_id = (sync.state_id + 1) & 0x7fff;
+                    sync.last_slots[idx] = stack.clone();
+                    out.push((idx as i16, sync.state_id, stack.clone()));
+                }
+            }
+            out
+        };
+        if !updates.is_empty() {
+            if let Ok(mut w) = c.sock.lock() {
+                for (slot, state_id, stack) in updates {
+                    let mut p = vec![1u8];
+                    write_varint(&mut p, i64::from(state_id));
+                    p.extend_from_slice(&slot.to_be_bytes());
+                    p.extend_from_slice(&slot_wire(&stack));
+                    let _ = send_packet(&mut w, 0x15, p);
+                }
+            }
+        }
+    }
+}
+fn chest_viewer_tick() {
+    let audience = client_snapshot();
+    chest_viewer_tick_on(&audience);
 }
 /// `ChestBlock.candidatePartnerFacing`: the facing of the chest at `pos` if a new one
 /// could pair with it. `is(this)` plus `TYPE == SINGLE` is the whole gate, so an
@@ -18118,18 +18367,17 @@ fn trade_list_pkt(wid: u8) -> Vec<u8> {
     p.push(1); // regular + canRestock
     p
 }
-fn open_chest_window(
+fn write_open_chest_packets(
     s: &mut TcpStream,
-    first: ContainerKey,
-    second: Option<ContainerKey>,
+    wide: bool,
+    initial: &[Stack],
     inv: &HashMap<i16, Stack>,
     title: &str,
 ) {
     // `first` owns window slots 0..=26 and `second` 27..=53. For a chest pair that is
     // `DoubleBlockCombiner`'s order (`CompoundContainer(right, left)`), not a click
     // order: the caller passes the right half first.
-    let wide = second.is_some();
-    let rows = if wide { 54i16 } else { 27i16 };
+    let rows = initial.len() as i16;
     let mut p = Vec::new();
     write_varint(&mut p, 1); // windowId
     write_varint(&mut p, if wide { 5 } else { 2 }); // generic_9x6 / generic_9x3
@@ -18138,19 +18386,8 @@ fn open_chest_window(
     let mut q = vec![1u8];
     write_varint(&mut q, 0);
     write_varint(&mut q, (rows + 36) as i64);
-    let all = chests().lock().unwrap();
-    let ch = all.get(&first).cloned().unwrap_or_default();
-    let ch2 = second.and_then(|k| all.get(&k).cloned()).unwrap_or_default();
-    drop(all);
-    for i in 0..rows {
-        let (it, c, _cc) = if i < 27 {
-            ch.get(&i)
-        } else {
-            ch2.get(&(i - 27))
-        }
-        .cloned()
-        .unwrap_or((0, 0, Vec::new()));
-        q.extend_from_slice(&slot_wire(&(it, c, _cc)));
+    for norm in initial {
+        q.extend_from_slice(&slot_wire(norm));
     }
     for wsl in rows..(rows + 36) {
         let islot = wsl - rows + 9; // window inv section -> inv slots 9..44
@@ -18159,6 +18396,36 @@ fn open_chest_window(
     }
     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); // carried
     let _ = send_packet(s, 0x13, q);
+}
+#[cfg(test)]
+fn open_chest_window(
+    s: &mut TcpStream,
+    first: ContainerKey,
+    second: Option<ContainerKey>,
+    inv: &HashMap<i16, Stack>,
+    title: &str,
+) {
+    let initial = chest_window_slots((first, second));
+    write_open_chest_packets(s, second.is_some(), &initial, inv, title);
+}
+fn open_chest_for_client(
+    me: &Client,
+    window: (ContainerKey, Option<ContainerKey>),
+    anchor: Option<BlockPos>,
+    inv: &HashMap<i16, Stack>,
+    title: &str,
+) {
+    let initial = chest_window_slots(window);
+    *me.open_chest.lock().unwrap() = Some(window);
+    *me.chest_sync.lock().unwrap() = Some(ChestSyncState {
+        window,
+        anchor,
+        state_id: 0,
+        last_slots: initial.clone(),
+    });
+    if let Ok(mut w) = me.sock.lock() {
+        write_open_chest_packets(&mut w, window.1.is_some(), &initial, inv, title);
+    }
 }
 // which armor slot (5=helm..8=boots) an item equips into, or -1
 fn armor_slot_for(it: i64) -> i16 {
@@ -18490,8 +18757,40 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
 fn dr_btn_right(btn: i32) -> bool {
     btn >= 4
 }
+fn send_chest_slot(me: &Client, wslot: i16, st: &Stack) {
+    let norm = if st.1 > 0 {
+        st.clone()
+    } else {
+        (0, 0, Vec::new())
+    };
+    let state_id = {
+        let mut sync_guard = me.chest_sync.lock().unwrap();
+        if let Some(sync) = sync_guard.as_mut() {
+            sync.state_id = (sync.state_id + 1) & 0x7fff;
+            if wslot >= 0 {
+                if let Some(slot_ref) = sync.last_slots.get_mut(wslot as usize) {
+                    *slot_ref = norm.clone();
+                }
+            }
+            sync.state_id
+        } else {
+            0
+        }
+    };
+    let mut p = vec![1u8];
+    write_varint(&mut p, i64::from(state_id));
+    p.extend_from_slice(&wslot.to_be_bytes());
+    p.extend_from_slice(&slot_wire(&norm));
+    if let Ok(mut w) = me.sock.lock() {
+        let _ = send_packet(&mut w, 0x15, p);
+    }
+}
 // re-send one window slot so the client can't drift
 fn resync_slot(me: &Client, wid: u8, wslot: i16, st: &Stack) {
+    if wid == 1 {
+        send_chest_slot(me, wslot, st);
+        return;
+    }
     let mut p = vec![wid];
     write_varint(&mut p, 0);
     p.extend_from_slice(&wslot.to_be_bytes());
@@ -22388,6 +22687,7 @@ fn handle(mut s: TcpStream) {
         cursor: Mutex::new((0, 0, Vec::new())),
         drag: Mutex::new((-1, Vec::new())),
         open_chest: Mutex::new(None),
+        chest_sync: Mutex::new(None),
         open_furnace: Mutex::new(None),
         craft: Mutex::new(HashMap::new()),
         craft9: Mutex::new(HashMap::new()),
@@ -23228,6 +23528,13 @@ fn handle(mut s: TcpStream) {
                     // The window is `DoubleBlockCombiner` order, not click order: the
                     // right half owns slots 0..=26 whichever half was right-clicked.
                     let window = chest_window(x, y, z);
+                    // `ChestBlock.getMenuProvider` (`dhb.b`): refuses single or double
+                    // chest if either half has a redstone conductor or sitting cat above.
+                    // `BarrelBlock` (`dfe.a`) does not check `isBlockedChestByBlock`.
+                    if kind == "Chest" && chest_window_blocked(window) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        continue;
+                    }
                     let audience = client_snapshot();
                     let mut halves = chest_window_halves(window);
                     // A second container opening on the same client closes the first,
@@ -23241,15 +23548,8 @@ fn handle(mut s: TcpStream) {
                         }
                     }
                     let before = chest_opener_snapshot(&audience, &halves);
-                    *me.open_chest.lock().unwrap() = Some(window);
                     let inv = me.inv.lock().unwrap().clone();
-                    open_chest_window(
-                        &mut me.sock.lock().unwrap(),
-                        window.0,
-                        window.1,
-                        &inv,
-                        kind,
-                    );
+                    open_chest_for_client(&me, window, None, &inv, kind);
                     // `ContainerOpenersCounter.incrementOpeners` -> openerCountChanged
                     sync_chest_openers(&audience, &before);
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
@@ -23257,16 +23557,15 @@ fn handle(mut s: TcpStream) {
                 }
                 // ender chest: per-player shared storage (synthetic key, not world pos)
                 if (7513..=7520).contains(&block_at(x, y, z)) {
+                    // `EnderChestBlock.useWithoutItem` (`dip.a`): refuses when the cell
+                    // above `isRedstoneConductor`.
+                    if is_blocked_chest_by_block((x, y, z)) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        continue;
+                    }
                     let key = ContainerKey::Block(ender_key(&me.uuid));
-                    *me.open_chest.lock().unwrap() = Some((key, None));
                     let inv = me.inv.lock().unwrap().clone();
-                    open_chest_window(
-                        &mut me.sock.lock().unwrap(),
-                        key,
-                        None,
-                        &inv,
-                        "Ender Chest",
-                    );
+                    open_chest_for_client(&me, (key, None), Some((x, y, z)), &inv, "Ender Chest");
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
@@ -23681,15 +23980,26 @@ fn handle(mut s: TcpStream) {
                         if *me.gm.lock().unwrap() != 3 {
                             unpack_cart_loot_if_needed(uuid);
                             let key = ContainerKey::Cart(uuid);
-                            *me.open_chest.lock().unwrap() = Some((key, None));
+                            let previous = *me.open_chest.lock().unwrap();
+                            let (audience, before) = if let Some(prev) = previous {
+                                let aud = client_snapshot();
+                                let halves = chest_window_halves(prev);
+                                let snap = chest_opener_snapshot(&aud, &halves);
+                                (aud, snap)
+                            } else {
+                                (Vec::new(), Vec::new())
+                            };
                             let inv = me.inv.lock().unwrap().clone();
-                            open_chest_window(
-                                &mut me.sock.lock().unwrap(),
-                                key,
+                            open_chest_for_client(
+                                &me,
+                                (key, None),
                                 None,
                                 &inv,
                                 "Minecart with Chest",
                             );
+                            if !before.is_empty() {
+                                sync_chest_openers(&audience, &before);
+                            }
                         }
                         continue;
                     }
@@ -24527,6 +24837,7 @@ fn handle(mut s: TcpStream) {
                     let halves = chest_window_halves(open);
                     let before = chest_opener_snapshot(&audience, &halves);
                     *me.open_chest.lock().unwrap() = None;
+                    *me.chest_sync.lock().unwrap() = None;
                     sync_chest_openers(&audience, &before);
                 }
                 let had_container = chest_window.is_some()
@@ -24534,6 +24845,7 @@ fn handle(mut s: TcpStream) {
                     || *me.open_table.lock().unwrap()
                     || *me.open_merchant.lock().unwrap();
                 *me.open_chest.lock().unwrap() = None;
+                *me.chest_sync.lock().unwrap() = None;
                 *me.open_furnace.lock().unwrap() = None;
                 *me.open_table.lock().unwrap() = false;
                 if had_container {
@@ -24649,13 +24961,11 @@ fn handle(mut s: TcpStream) {
                                             (slot - rows + 9, &mut inv)
                                         };
                                     click_slot(gmap, &mut cur, gslot, btn as i8);
-                                    let (it, c2, _cc) =
-                                        gmap.get(&gslot).cloned().unwrap_or((0, 0, Vec::new()));
-                                    let mut p = vec![1u8];
-                                    write_varint(&mut p, 0);
-                                    p.extend_from_slice(&slot.to_be_bytes());
-                                    p.extend_from_slice(&slot_wire(&(it, c2, _cc)));
-                                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                                    let st = gmap.get(&gslot).cloned().unwrap_or((0, 0, Vec::new()));
+                                    drop(all);
+                                    drop(inv);
+                                    drop(cur);
+                                    send_chest_slot(&me, slot, &st);
                                 }
                                 continue;
                             }
@@ -25918,6 +26228,7 @@ fn handle(mut s: TcpStream) {
             let halves = chest_window_halves(open);
             let before = chest_opener_snapshot(&audience, &halves);
             *me_cleanup.open_chest.lock().unwrap() = None;
+            *me_cleanup.chest_sync.lock().unwrap() = None;
             sync_chest_openers(&audience, &before);
         }
         let mut cls = clients().lock().unwrap();
@@ -26740,6 +27051,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("falling", falling_tick);
     run("random_ticks", random_tick_pass);
     run("block_updates", apply_queued_block_updates);
+    run("chest_viewers", chest_viewer_tick);
 }
 
 fn main() {
@@ -28562,6 +28874,210 @@ mod mineshaft_runtime_tests {
         let _ = sock.shutdown(Shutdown::Both);
         drop(sock);
         let _ = server_thread.join();
+    }
+
+    #[test]
+    fn chest_contract_live_tcp_blocked_broadcast_and_reach() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _snap = RuntimeSnapshot::take();
+        *WORLD_SPAWN.lock().unwrap() = (0.5, 70.0, 0.5);
+        forceloaded().lock().unwrap().insert((0, 0));
+        refresh_hot();
+
+        let chest_st = name_to_state("chest").unwrap();
+        let stone_st = name_to_state("stone").unwrap();
+        let ender_st = name_to_state("ender_chest").unwrap();
+        let barrel_st = name_to_state("barrel").unwrap();
+
+        let blocked_single: BlockPos = (2, 70, 0);
+        set_block(blocked_single.0, blocked_single.1, blocked_single.2, chest_st);
+        set_block(blocked_single.0, blocked_single.1 + 1, blocked_single.2, stone_st);
+
+        let blocked_left: BlockPos = (2, 70, 3);
+        let blocked_right: BlockPos = (3, 70, 3);
+        set_block(blocked_left.0, blocked_left.1, blocked_left.2, chest_st);
+        set_block(
+            blocked_right.0,
+            blocked_right.1,
+            blocked_right.2,
+            chest_placement_state("minecraft:chest", blocked_right, 0.0, false, 1),
+        );
+        set_block(blocked_left.0, blocked_left.1 + 1, blocked_left.2, stone_st);
+
+        let blocked_ender: BlockPos = (2, 70, 6);
+        set_block(blocked_ender.0, blocked_ender.1, blocked_ender.2, ender_st);
+        set_block(blocked_ender.0, blocked_ender.1 + 1, blocked_ender.2, stone_st);
+
+        let barrel: BlockPos = (2, 70, 9);
+        set_block(barrel.0, barrel.1, barrel.2, barrel_st);
+        set_block(barrel.0, barrel.1 + 1, barrel.2, stone_st);
+
+        let open_left: BlockPos = (4, 70, 0);
+        let open_right: BlockPos = (5, 70, 0);
+        set_block(open_left.0, open_left.1, open_left.2, chest_st);
+        set_block(
+            open_right.0,
+            open_right.1,
+            open_right.2,
+            chest_placement_state("minecraft:chest", open_right, 0.0, false, 1),
+        );
+        assert_eq!(
+            chest_window(open_left.0, open_left.1, open_left.2),
+            (
+                ContainerKey::Block(open_right),
+                Some(ContainerKey::Block(open_left))
+            )
+        );
+
+        materialize_generation_payloads(vec![(
+            (0, 70, 2),
+            crate::generation_payload::GenerationPayload::ChestMinecart { loot_seed: 2 },
+        )]);
+        set_block(0, 71, 2, stone_st);
+        let cart_eid = generated_content().lock().unwrap().carts[0].eid;
+
+        let (mut sock_a, th_a, alice) = connect_play_client("Alice", [0x11u8; 16]);
+        let (mut sock_b, th_b, bob) = connect_play_client("Bob", [0x22u8; 16]);
+        *alice.gm.lock().unwrap() = 0;
+        *bob.gm.lock().unwrap() = 0;
+
+        let use_until_ack = |sock: &mut TcpStream, pos: BlockPos, seq: i64| -> Vec<(i64, Vec<u8>)> {
+            let mut pkt = Vec::new();
+            write_varint(&mut pkt, 0); // main hand
+            write_pos(&mut pkt, pos.0, pos.1, pos.2);
+            write_varint(&mut pkt, 1); // UP face
+            pkt.extend_from_slice(&0.5f32.to_be_bytes());
+            pkt.extend_from_slice(&1.0f32.to_be_bytes());
+            pkt.extend_from_slice(&0.5f32.to_be_bytes());
+            pkt.push(0);
+            write_varint(&mut pkt, seq);
+            send_packet(sock, 0x38, pkt).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut seen = Vec::new();
+            loop {
+                let (pid, body) = read_server_packet(sock, deadline).expect("expected 0x05 ack");
+                if pid == 0x05 {
+                    let mut sl = &body[..];
+                    if read_varint(&mut sl) == Some(seq) {
+                        return seen;
+                    }
+                }
+                seen.push((pid, body));
+            }
+        };
+
+        // 1. Blocked single, blocked double (via left or right), and blocked ender chest refuse open.
+        *alice.pos.lock().unwrap() = (2.5, 70.0, 1.5, 0.0, 0.0, true);
+        for (idx, pos) in [blocked_single, blocked_left, blocked_right, blocked_ender]
+            .into_iter()
+            .enumerate()
+        {
+            if pos == blocked_ender {
+                *alice.pos.lock().unwrap() = (2.5, 70.0, 5.5, 0.0, 0.0, true);
+            }
+            let pkts = use_until_ack(&mut sock_a, pos, 100 + idx as i64);
+            assert!(
+                !pkts.iter().any(|(pid, _)| matches!(*pid, 0x33 | 0x13 | 0x08)),
+                "blocked container at {pos:?} must not open or emit blockEvent"
+            );
+            assert!(alice.open_chest.lock().unwrap().is_none());
+        }
+
+        // 2. Barrel and minecart chest under stone still open normally.
+        *alice.pos.lock().unwrap() = (2.5, 70.0, 8.5, 0.0, 0.0, true);
+        let barrel_pkts = use_until_ack(&mut sock_a, barrel, 200);
+        assert!(
+            barrel_pkts.iter().any(|(pid, _)| *pid == 0x33),
+            "barrel under stone must still open"
+        );
+        assert!(alice.open_chest.lock().unwrap().is_some());
+        send_packet(&mut sock_a, 0x0f, vec![1u8]).unwrap();
+        let wait_close = Instant::now() + Duration::from_secs(2);
+        while alice.open_chest.lock().unwrap().is_some() {
+            assert!(Instant::now() < wait_close);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        *alice.pos.lock().unwrap() = (0.5, 70.0, 2.5, 0.0, 0.0, true);
+        let mut cart_open = Vec::new();
+        write_varint(&mut cart_open, cart_eid as i64);
+        write_varint(&mut cart_open, 0);
+        write_varint(&mut cart_open, 0);
+        cart_open.push(0);
+        send_packet(&mut sock_a, 0x16, cart_open).unwrap();
+        let _ = wait_packet(&mut sock_a, 0x33);
+        let _ = wait_packet(&mut sock_a, 0x13);
+        *alice.pos.lock().unwrap() = (0.5, 70.0, 10.5, 0.0, 0.0, true);
+        game_tick(|_, tick| tick());
+        assert_eq!(wait_packet(&mut sock_a, 0x12), vec![1u8]);
+        assert!(alice.open_chest.lock().unwrap().is_none());
+
+        // 3. Alice & Bob open the unblocked double chest -> Alice clicks -> Bob gets 0x15 on tick.
+        *alice.pos.lock().unwrap() = (4.5, 70.0, 1.5, 0.0, 0.0, true);
+        *bob.pos.lock().unwrap() = (4.5, 70.0, 1.5, 0.0, 0.0, true);
+        let open_a = use_until_ack(&mut sock_a, open_left, 301);
+        assert!(open_a.iter().any(|(pid, _)| *pid == 0x33));
+        let open_b = use_until_ack(&mut sock_b, open_right, 302);
+        assert!(open_b.iter().any(|(pid, _)| *pid == 0x33));
+
+        let diamond = name_to_item("diamond").unwrap();
+        alice.inv.lock().unwrap().insert(9, (diamond, 1, Vec::new()));
+        let mut click1 = vec![1u8];
+        write_varint(&mut click1, 0);
+        click1.extend_from_slice(&54i16.to_be_bytes()); // inv slot 9 in 54-slot chest
+        click1.push(0);
+        write_varint(&mut click1, 0);
+        write_varint(&mut click1, 0);
+        click1.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+        send_packet(&mut sock_a, 0x0e, click1).unwrap();
+        let _ = wait_packet(&mut sock_a, 0x15);
+
+        let mut click2 = vec![1u8];
+        write_varint(&mut click2, 0);
+        click2.extend_from_slice(&30i16.to_be_bytes()); // left half slot 3 (27 + 3)
+        click2.push(0);
+        write_varint(&mut click2, 0);
+        write_varint(&mut click2, 0);
+        click2.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+        send_packet(&mut sock_a, 0x0e, click2).unwrap();
+        let alice_echo = wait_packet(&mut sock_a, 0x15);
+        assert_eq!(
+            slot_read_wire(&alice_echo[2..]),
+            Some((30, (diamond, 1, Vec::new())))
+        );
+
+        game_tick(|_, tick| tick());
+        let bob_sync = wait_packet(&mut sock_b, 0x15);
+        let mut sl = &bob_sync[1..];
+        let st_id = read_varint(&mut sl).unwrap();
+        assert!(st_id >= 1);
+        assert_eq!(slot_read_wire(sl), Some((30, (diamond, 1, Vec::new()))));
+
+        // 4. Alice walks out of reach -> game_tick closes her window (0x12) and drops 0x08 to 1.
+        *alice.pos.lock().unwrap() = (15.0, 70.0, 0.5, 0.0, 0.0, true);
+        game_tick(|_, tick| tick());
+        assert_eq!(wait_packet(&mut sock_a, 0x12), vec![1u8]);
+        assert!(alice.open_chest.lock().unwrap().is_none());
+
+        let mut dropped_counts = Vec::new();
+        for _ in 0..2 {
+            let ev = wait_packet(&mut sock_b, 0x08);
+            let pos = read_pos(&ev[..8]);
+            dropped_counts.push((pos, ev[8], ev[9]));
+        }
+        assert!(dropped_counts.contains(&(open_right, 1, 1)));
+        assert!(dropped_counts.contains(&(open_left, 1, 1)));
+
+        let _ = sock_a.shutdown(Shutdown::Both);
+        let _ = sock_b.shutdown(Shutdown::Both);
+        drop(sock_a);
+        drop(sock_b);
+        let _ = th_a.join();
+        let _ = th_b.join();
     }
 
     #[test]

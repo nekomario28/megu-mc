@@ -5983,6 +5983,437 @@ fn chest_pairing_states_and_contents_survive_a_save_and_load() {
     drops().lock().unwrap().clear();
 }
 
+// ---------- chest world-side contract (M2 slice 3c) ----------
+//
+// `ChestBlock.isChestBlockedAt` / `isBlockedChestByBlock` / `isCatSittingOnChest`,
+// `AbstractContainerMenu.broadcastChanges`, and `ChestBlockEntity.recheckOpeners` ->
+// `Container.stillValidBlockEntity` (`Player.canInteractWithBlock(pos, 4.0)`).
+
+fn decode_set_slot_frames(frames: Vec<(i64, Vec<u8>)>) -> Vec<(u8, i64, i16, Stack)> {
+    frames
+        .into_iter()
+        .filter(|(pid, _)| *pid == 0x15)
+        .map(|(_, body)| {
+            let wid = body[0];
+            let mut sl = &body[1..];
+            let state_id = read_varint(&mut sl).expect("set_slot state_id");
+            let (slot, stack) = slot_read_wire(sl).expect("set_slot item wire");
+            (wid, state_id, slot, stack)
+        })
+        .collect()
+}
+
+fn fast_chest_viewer(eid: i32, at: BlockPos) -> (Arc<Client>, TcpStream) {
+    let (viewer, receiver) = chest_viewer(eid, at);
+    receiver
+        .set_read_timeout(Some(std::time::Duration::from_millis(25)))
+        .unwrap();
+    (viewer, receiver)
+}
+
+#[test]
+fn chest_contract_redstone_conductor_matches_1211_rules() {
+    crate::test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    let reg = breg().expect("block registry");
+    let cell: BlockPos = (74, 165, 60);
+
+    // Conductors in 1.21.1 `BlockStateBase.isRedstoneConductor`: full collision blocks plus
+    // `mud` and `soul_sand`, excluding transparent/redstone exceptions.
+    let slab_base = name_to_state("oak_slab").expect("oak_slab");
+    let double_slab = reg.with_prop(slab_base, "type", "double");
+    let bottom_slab = reg.with_prop(slab_base, "type", "bottom");
+    let top_slab = reg.with_prop(slab_base, "type", "top");
+    let conductor_states: Vec<(&str, u32)> = [
+        "stone",
+        "oak_planks",
+        "cobblestone",
+        "deepslate",
+        "bricks",
+        "mud",
+        "soul_sand",
+    ]
+    .into_iter()
+    .map(|name| (name, name_to_state(name).unwrap_or_else(|| panic!("state for {name}"))))
+    .chain(std::iter::once(("oak_slab[type=double]", double_slab)))
+    .collect();
+    for (name, st) in conductor_states {
+        assert!(
+            reg.is_redstone_conductor(st),
+            "{name} must be isRedstoneConductor=true"
+        );
+        set_block(cell.0, cell.1 + 1, cell.2, st);
+        assert!(
+            is_blocked_chest_by_block(cell),
+            "{name} above chest must block"
+        );
+    }
+
+    let non_conductor_states: Vec<(&str, u32)> = [
+        "air",
+        "glass",
+        "white_stained_glass",
+        "tinted_glass",
+        "ice",
+        "frosted_ice",
+        "beacon",
+        "oak_leaves",
+        "glowstone",
+        "sea_lantern",
+        "redstone_block",
+        "tnt",
+        "observer",
+        "piston",
+        "sticky_piston",
+        "copper_grate",
+        "torch",
+        "chest",
+        "trapped_chest",
+        "ender_chest",
+        "water",
+    ]
+    .into_iter()
+    .map(|name| (name, name_to_state(name).unwrap_or_else(|| panic!("state for {name}"))))
+    .chain([
+        ("oak_slab[type=bottom]", bottom_slab),
+        ("oak_slab[type=top]", top_slab),
+    ])
+    .collect();
+    for (name, st) in non_conductor_states {
+        assert!(
+            !reg.is_redstone_conductor(st),
+            "{name} must be isRedstoneConductor=false"
+        );
+        set_block(cell.0, cell.1 + 1, cell.2, st);
+        assert!(
+            !is_blocked_chest_by_block(cell),
+            "{name} above chest must NOT block"
+        );
+    }
+    set_block(cell.0, cell.1 + 1, cell.2, 0);
+}
+
+#[test]
+fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
+    crate::test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    let y = 166;
+    let stone = name_to_state("stone").unwrap();
+    let glass = name_to_state("glass").unwrap();
+
+    // Single chest blocked by stone, opened by glass.
+    let single: BlockPos = (76, y, 60);
+    set_block(single.0, single.1, single.2, chest_state("chest"));
+    set_block(single.0, single.1 + 1, single.2, stone);
+    assert!(is_chest_blocked_at(single));
+    assert!(chest_window_blocked((ContainerKey::Block(single), None)));
+    set_block(single.0, single.1 + 1, single.2, glass);
+    assert!(!is_chest_blocked_at(single));
+    assert!(!chest_window_blocked((ContainerKey::Block(single), None)));
+    set_block(single.0, single.1 + 1, single.2, 0);
+
+    // Double chest: blocked if EITHER right OR left half has a conductor above.
+    let left: BlockPos = (78, y, 60);
+    let right: BlockPos = (79, y, 60);
+    set_block(left.0, left.1, left.2, chest_state("chest"));
+    set_block(
+        right.0,
+        right.1,
+        right.2,
+        placed_chest("minecraft:chest", right),
+    );
+    let win = chest_window(left.0, left.1, left.2);
+    assert_eq!(
+        win,
+        (ContainerKey::Block(right), Some(ContainerKey::Block(left)))
+    );
+    assert!(!chest_window_blocked(win));
+
+    set_block(right.0, right.1 + 1, right.2, stone);
+    assert!(
+        chest_window_blocked(win),
+        "stone above right half only must block the double chest"
+    );
+    set_block(right.0, right.1 + 1, right.2, 0);
+    set_block(left.0, left.1 + 1, left.2, stone);
+    assert!(
+        chest_window_blocked(win),
+        "stone above left half only must block the double chest"
+    );
+    set_block(left.0, left.1 + 1, left.2, glass);
+    assert!(!chest_window_blocked(win), "glass above allows open");
+    set_block(left.0, left.1 + 1, left.2, 0);
+
+    // Sitting cat (`etype == 15`) intersecting AABB(x, y+1, z, x+1, y+2, z+1) blocks either half.
+    let cat_eid = 910_001;
+    let cat = Arc::new(Mob {
+        eid: cat_eid,
+        uuid: [0xCA; 16],
+        etype: 15,
+        pos: Mutex::new((
+            f64::from(left.0) + 0.5,
+            f64::from(left.1) + 1.0,
+            f64::from(left.2) + 0.5,
+            0.0,
+            0.0,
+        )),
+        hp: Mutex::new(10.0),
+        last_hit: Mutex::new(Instant::now()),
+        hurt_at: Mutex::new(Instant::now()),
+        fuse: Mutex::new(0),
+        love: Mutex::new(0),
+        air: Mutex::new(300),
+    });
+    mobs().lock().unwrap().push(cat.clone());
+    assert!(
+        !chest_window_blocked(win),
+        "standing cat does not block ChestBlock.isCatSittingOnChest"
+    );
+    sitting_cats().lock().unwrap().insert(cat_eid);
+    assert!(
+        is_cat_sitting_on_chest(left),
+        "sitting cat on left cell blocks left half"
+    );
+    assert!(
+        chest_window_blocked(win),
+        "sitting cat on left half blocks double chest window"
+    );
+    // Moving the sitting cat off the chest unblocks it.
+    *cat.pos.lock().unwrap() = (
+        f64::from(left.0) + 0.5,
+        f64::from(left.1) + 2.5,
+        f64::from(left.2) + 0.5,
+        0.0,
+        0.0,
+    );
+    assert!(!chest_window_blocked(win));
+    sitting_cats().lock().unwrap().remove(&cat_eid);
+    mobs().lock().unwrap().retain(|m| m.eid != cat_eid);
+
+    for cell in [single, left, right] {
+        set_block(cell.0, cell.1, cell.2, 0);
+    }
+}
+
+#[test]
+fn chest_contract_multi_viewer_broadcast_changes() {
+    crate::test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    let y = 167;
+    let left: BlockPos = (82, y, 60);
+    let right: BlockPos = (83, y, 60);
+    let other: BlockPos = (86, y, 60);
+    set_block(left.0, left.1, left.2, chest_state("chest"));
+    set_block(
+        right.0,
+        right.1,
+        right.2,
+        placed_chest("minecraft:chest", right),
+    );
+    set_block(other.0, other.1, other.2, chest_state("chest"));
+    let win = chest_window(left.0, left.1, left.2);
+    assert_eq!(
+        win,
+        (ContainerKey::Block(right), Some(ContainerKey::Block(left)))
+    );
+    let other_win = (ContainerKey::Block(other), None);
+
+    let (v1, mut r1) = fast_chest_viewer(101, right);
+    let (v2, mut r2) = fast_chest_viewer(102, left);
+    let (v3, mut r3) = fast_chest_viewer(103, other);
+    let audience = [v1.clone(), v2.clone(), v3.clone()];
+
+    open_chest_for_client(&v1, win, None, &HashMap::new(), "Chest");
+    open_chest_for_client(&v2, win, None, &HashMap::new(), "Chest");
+    open_chest_for_client(&v3, other_win, None, &HashMap::new(), "Chest");
+    // Drain initial 0x33 + 0x13 packets.
+    assert!(frames_on(&mut r1).iter().any(|(pid, _)| *pid == 0x33));
+    assert!(frames_on(&mut r2).iter().any(|(pid, _)| *pid == 0x33));
+    assert!(frames_on(&mut r3).iter().any(|(pid, _)| *pid == 0x33));
+
+    // Idle tick must emit no 0x15 updates.
+    chest_viewer_tick_on(&audience);
+    assert!(frames_on(&mut r1).is_empty());
+    assert!(frames_on(&mut r2).is_empty());
+    assert!(frames_on(&mut r3).is_empty());
+
+    // Mutate right half slot 3 and left half slot 5 (window slots 3 and 32).
+    let iron = name_to_item("iron_ingot").unwrap();
+    let gold = name_to_item("gold_ingot").unwrap();
+    let s_iron: Stack = (iron, 7, Vec::new());
+    let s_gold: Stack = (gold, 4, Vec::new());
+    {
+        let mut all = chests().lock().unwrap();
+        all.entry(ContainerKey::Block(right))
+            .or_default()
+            .insert(3, s_iron.clone());
+        all.entry(ContainerKey::Block(left))
+            .or_default()
+            .insert(5, s_gold.clone());
+    }
+    chest_viewer_tick_on(&audience);
+    let expected = vec![
+        (1u8, 1i64, 3i16, s_iron.clone()),
+        (1u8, 2i64, 32i16, s_gold.clone()),
+    ];
+    assert_eq!(decode_set_slot_frames(frames_on(&mut r1)), expected);
+    assert_eq!(decode_set_slot_frames(frames_on(&mut r2)), expected);
+    assert!(
+        frames_on(&mut r3).is_empty(),
+        "viewer of a separate chest must not receive updates"
+    );
+
+    // Viewer 1 takes slot 32 via click (`send_chest_slot`), so only viewer 2 gets tick diff.
+    chests()
+        .lock()
+        .unwrap()
+        .entry(ContainerKey::Block(left))
+        .or_default()
+        .remove(&5);
+    let empty: Stack = (0, 0, Vec::new());
+    send_chest_slot(&v1, 32, &empty);
+    assert_eq!(
+        decode_set_slot_frames(frames_on(&mut r1)),
+        vec![(1u8, 3i64, 32i16, empty.clone())]
+    );
+    chest_viewer_tick_on(&audience);
+    assert!(
+        frames_on(&mut r1).is_empty(),
+        "acting viewer already synced slot 32 via click echo"
+    );
+    assert_eq!(
+        decode_set_slot_frames(frames_on(&mut r2)),
+        vec![(1u8, 3i64, 32i16, empty)]
+    );
+
+    for cell in [right, left, other] {
+        chests().lock().unwrap().remove(&ContainerKey::Block(cell));
+        set_block(cell.0, cell.1, cell.2, 0);
+    }
+}
+
+#[test]
+fn chest_contract_recheck_openers_reach_and_lid_close() {
+    crate::test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    let y = 168;
+    let left: BlockPos = (88, y, 60);
+    let right: BlockPos = (89, y, 60);
+    let chest_id = i64::from(breg().unwrap().block_id_of(chest_state("chest")).unwrap());
+    set_block(left.0, left.1, left.2, chest_state("chest"));
+    set_block(
+        right.0,
+        right.1,
+        right.2,
+        placed_chest("minecraft:chest", right),
+    );
+    let win = chest_window(left.0, left.1, left.2);
+    assert_eq!(
+        win,
+        (ContainerKey::Block(right), Some(ContainerKey::Block(left)))
+    );
+
+    // Viewer 1 interacts; Observer sits adjacent to watch 0x08 lid events.
+    let (v1, mut r1) = fast_chest_viewer(201, right);
+    let (obs, mut r_obs) = fast_chest_viewer(202, right);
+    *v1.gm.lock().unwrap() = 0;
+    let audience = [v1.clone(), obs.clone()];
+
+    // Check exact `Player.canInteractWithBlock(pos, 4.0)` boundary:
+    // For survival (`4.5 + 4.0 = 8.5`), eye at z = 69.40 gives dz = 8.40, dy = 0.62 -> dist = 8.423 < 8.5.
+    *v1.pos.lock().unwrap() = (89.5, f64::from(y), 69.40, 0.0, 0.0, true);
+    let before = chest_opener_snapshot(&audience, &[right, left]);
+    open_chest_for_client(&v1, win, None, &HashMap::new(), "Chest");
+    sync_chest_openers(&audience, &before);
+    let _ = frames_on(&mut r1);
+    assert_eq!(
+        block_events(frames_on(&mut r_obs)),
+        vec![(right, 1, 1, chest_id), (left, 1, 1, chest_id)]
+    );
+
+    chest_viewer_tick_on(&audience);
+    assert!(
+        v1.open_chest.lock().unwrap().is_some(),
+        "inside 8.5 block reach stays open"
+    );
+    assert!(frames_on(&mut r1).is_empty());
+    assert!(frames_on(&mut r_obs).is_empty());
+
+    // Move to z = 69.49: dist = sqrt(0.62^2 + 8.49^2) = 8.513 (> 8.5 survival, < 9.0 creative).
+    *v1.gm.lock().unwrap() = 1;
+    *v1.pos.lock().unwrap() = (89.5, f64::from(y), 69.49, 0.0, 0.0, true);
+    chest_viewer_tick_on(&audience);
+    assert!(
+        v1.open_chest.lock().unwrap().is_some(),
+        "creative range 5.0 + 4.0 = 9.0 keeps chest open at 8.513"
+    );
+
+    // Switch back to survival at 8.513 -> closes window (`0x12`), drops both halves to 0 (`0x08`).
+    *v1.gm.lock().unwrap() = 0;
+    chest_viewer_tick_on(&audience);
+    assert!(v1.open_chest.lock().unwrap().is_none());
+    assert!(v1.chest_sync.lock().unwrap().is_none());
+    let v1_frames = frames_on(&mut r1);
+    assert!(
+        v1_frames.iter().any(|(pid, body)| *pid == 0x12 && *body == vec![1u8]),
+        "out-of-reach viewer must receive ClientboundContainerClosePacket(1)"
+    );
+    assert_eq!(
+        block_events(frames_on(&mut r_obs)),
+        vec![(right, 1, 0, chest_id), (left, 1, 0, chest_id)],
+        "closing out-of-reach viewer must broadcast lid close (count=0) on both halves"
+    );
+
+    // Double chest: within 8.5 of `right` (x = 97.5 -> dx = 7.5) but > 8.5 from `left` (dx = 8.5)
+    // must still fail `CompoundContainer.stillValid` and close.
+    *v1.pos.lock().unwrap() = (97.5, f64::from(y), 60.5, 0.0, 0.0, true);
+    open_chest_for_client(&v1, win, None, &HashMap::new(), "Chest");
+    let _ = frames_on(&mut r1);
+    chest_viewer_tick_on(&audience);
+    assert!(
+        v1.open_chest.lock().unwrap().is_none(),
+        "double chest must close when farthest half is beyond reach"
+    );
+    let _ = frames_on(&mut r1);
+    let _ = frames_on(&mut r_obs);
+
+    // Crouching eye height (1.27 vs 1.62) affects vertical reach cleanly.
+    *v1.pos.lock().unwrap() = (89.5, f64::from(y) + 7.89, 60.5, 0.0, 0.0, true);
+    *v1.sneaking.lock().unwrap() = true;
+    open_chest_for_client(&v1, win, None, &HashMap::new(), "Chest");
+    let _ = frames_on(&mut r1);
+    chest_viewer_tick_on(&audience);
+    assert!(
+        v1.open_chest.lock().unwrap().is_some(),
+        "crouching eye height (y + 1.27 -> dy = 8.16 < 8.5) stays open"
+    );
+    *v1.sneaking.lock().unwrap() = false;
+    chest_viewer_tick_on(&audience);
+    assert!(
+        v1.open_chest.lock().unwrap().is_none(),
+        "standing up lifts eye to dy = 8.51 > 8.5 and closes"
+    );
+
+    // Ender chest anchor reach check (`is_ender_key`).
+    let _ = frames_on(&mut r1);
+    let ek = ContainerKey::Block(ender_key(&v1.uuid));
+    *v1.pos.lock().unwrap() = (88.5, f64::from(y), 60.5, 0.0, 0.0, true);
+    open_chest_for_client(&v1, (ek, None), Some(right), &HashMap::new(), "Ender Chest");
+    let _ = frames_on(&mut r1);
+    chest_viewer_tick_on(&audience);
+    assert!(v1.open_chest.lock().unwrap().is_some());
+    *v1.pos.lock().unwrap() = (99.0, f64::from(y), 60.5, 0.0, 0.0, true);
+    chest_viewer_tick_on(&audience);
+    assert!(v1.open_chest.lock().unwrap().is_none());
+    assert!(frames_on(&mut r1)
+        .iter()
+        .any(|(pid, body)| *pid == 0x12 && *body == vec![1u8]));
+
+    for cell in [left, right] {
+        set_block(cell.0, cell.1, cell.2, 0);
+    }
+}
+
 // --- Behaviour identity -----------------------------------------------------------------
 //
 // A tick-cost change is only allowed if the world it produces is the same world. This

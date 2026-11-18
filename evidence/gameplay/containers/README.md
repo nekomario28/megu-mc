@@ -55,19 +55,20 @@ Inventory oracle追加後の再実行は[回収の記録](../inventory-pickup/RE
 チェストの入力・期待結果は変えず、共有Javaソースのprovenanceだけを更新した。
 このsliceの結果は、1.21.1 datapack移行ブランチ全体の受け入れではない。
 
-未検証・未移植: 開いている window の毎 tick 同期（`broadcastChanges`、あるいは
-A が動かした item が B の window に出ること）、window/state-id 整合、
-`isChestBlockedAt` による結合拒否、開閉音、shulkerの中身制約、
-任意component patchの意味的同値、特殊結果スロット、全エンティティ挙動。
-向き／left-right／異種チェストの接続判定と複数閲覧者の開閉同期は
+未検証・未移植: 開閉音、shulkerの中身制約、任意component patchの意味的同値、特殊結果スロット、
+waterlogged chest の water tick 再予約、barrel の `open` state。
+向き／left-right／異種チェストの接続判定、複数閲覧者の開閉同期、`isChestBlockedAt` 閉塞判定、
+毎 tick `broadcastChanges` 同期、`recheckOpeners` 到達距離検証は
 [チェストのワールド側契約](#チェストのワールド側契約)で閉塞した。
 
 ## チェストのワールド側契約
 
-M2 slice 3。二重チェストを「隣接」ではなく block state で判定し、開閉・閲覧者数・
-破壊時の window 無効化と drop・永続化を 1.21.1 の機構に合わせた。
-bytecode は `server-1.21.1.jar` を `javap -p -c` で読み、mappings は
-`/var/tmp/mcm/server.txt` で解決した。参照した機構とその根拠:
+M2 slice 3 + 3c。二重チェストを「隣接」ではなく block state で判定し、開閉・閲覧者数・
+破壊時の window 無効化と drop・永続化、さらに Slice 3c の閉塞判定・複数閲覧者同期・
+到達距離再検証を 1.21.1 の機構に合わせた。
+bytecode は `server-1.21.1.jar` (`59353fb40c36d304f2035d51e7d6e6baa98dc05c`) を
+`javap -p -c` および jar probe で読み、mappings (`03f8985492bda0afc0898465341eb0acef35f570`) で解決した。
+参照した機構とその根拠:
 
 - `dhb.g(dtc)`（`ChestBlock` の BlockType 写像）は `single→SINGLE`, `right→FIRST`,
   `left→SECOND`。`dif.a` は own が FIRST なら own を先に、SECOND なら隣を先にして
@@ -87,21 +88,45 @@ bytecode は `server-1.21.1.jar` を `javap -p -c` で読み、mappings は
   `openerCountChanged(prev, count)` → `dqo.a(dcw,jd,dtc,int,int)` が
   `level.blockEvent(pos, block, 1, count)` を呼ぶ。double chest は結合 container の
   `startOpen` が両方の BE に届くので、両半分がそれぞれ event を出す。
+- `ChestBlock.isChestBlockedAt` (`dhb.a(Ldcx;Ljd;)Z`) は `isBlockedChestByBlock(level, pos)`
+  (`dhb.a(Ldcc;Ljd;)Z`: `level.getBlockState(pos.above()).isRedstoneConductor(...)`) または
+  `isCatSittingOnChest` (`dhb.b(Ldcx;Ljd;)Z`: `AABB(x, y+1, z, x+1, y+2, z+1)` に交差する
+  `isInSittingPose()` な `Cat`)。`BlockStateBase.isRedstoneConductor` (`dtb$a.g`) を
+  全 26,684 block state で検証し、`blocksMotion && isCollisionShapeFullBlock` に対して
+  `mud`/`soul_sand` を `true`、ガラス類・葉・`beacon`/`glowstone`/`sea_lantern`/`redstone_block`/
+  `tnt`/`observer`/`piston`/`sticky_piston`/`*copper_grate`/`*copper_bulb` を `false` とする
+  `BReg::is_redstone_conductor` に一致させた。`ChestBlock.getMenuProvider` (`dhb.b` → `dif.a`) は
+  double chest のどちらか片方が blocked なら `Optional.empty()` を返し、`EnderChestBlock.useWithoutItem`
+  (`dip.a`) は `isBlockedChestByBlock` のみ検査し、`BarrelBlock` (`dfe.a`) と minecart chest は閉塞しない。
+- `AbstractContainerMenu.broadcastChanges` (`cpu.d`): `ServerPlayer.tick` (`aqv.l`) 内で毎 tick
+  viewer ごとの直前送信 slot (`Client.chest_sync`) と現在の container slots (`0..27` / `0..54`) を
+  比較し、差分を単調増加 `stateId` 付きの `ClientboundContainerSetSlotPacket` (`acr` = `0x15`,
+  `wid = 1`) として配信する。`0x0e` click 側の即時応答 (`send_chest_slot` / `resync_slot`) も
+  同じ `chest_sync` の `last_slots` / `state_id` を更新して重複送出と逆転を防ぐ。
+- `ChestBlockEntity.recheckOpeners` (`dqo.c`) / `ChestMenu.stillValid` (`cqc.b`) →
+  `Container.stillValidBlockEntity` (`bqk.a(Ldqh;Lcmx;F)` `4.0f`) / `CompoundContainer.stillValid` (`bqj.a`) →
+  `Player.canInteractWithBlock(pos, 4.0)` (`cmx.a(Ljd;D)Z`): 単位 block AABB から player eye
+  (`1.62f` standing / `1.27f` crouching) までの二乗距離 `< (blockInteractionRange + 4.0)^2`
+  (survival/adventure `8.5`、creative `9.0`)。double chest は両半分を検査し、ender chest は
+  `chest_sync.anchor` を検査し、minecart chest は `ContainerEntity.isChestVehicleStillValid` (`cox.g`) の
+  `canInteractWithEntity(boundingBox, 4.0)` (`< 7.0` survival / `< 9.0` creative) を検査する。
+  失効時は `ClientboundContainerClosePacket` (`aco` = `0x12`, windowId 1) と `sync_chest_openers` (`0x08`) を送る。
 - 1.21.1 play clientbound の `ClientboundBlockEventPacket` は 0x08。
   `agh.a` の登録順（`agg.a`=bundle 0x00 → `agg.c..agg.j`）で `agg.j` が `acc`
   （`ClientboundBlockEventPacket`）であり 9 番目。隣の 0x07 が block entity data、
   0x09 が block update、`agg.t`(0x12) が `ClientboundContainerClosePacket` で、
   既存の packet id と一致する。
 
-観測点は 2 層に分けた。`src/tick_tests.rs` の 9 本は block state（設置・pairing・
-3連・sneak・updateShape）、slot 順、drop 引き金、window 無効化、閲覧者数と event を
-それぞれ別の assertion で固定し、`tests/container_wire.py` は実 TCP で
-2 client の開閉、半分ごとの slot 所有、破壊時の `0x12` と drop、再起動後の
-left/right と中身を読む。5 step を 1 slice で入れたが、失敗が「state が違う」か
-「event が来ない」かを assertion の名前で区別できるようにしてある。
+観測点は 2 層に分けた。`src/tick_tests.rs` の 9 本 + Slice 3c の 4 本 (`chest_contract_*`) と
+`src/main.rs::mineshaft_runtime_tests::chest_contract_live_tcp_blocked_broadcast_and_reach` は
+block state（設置・pairing・3連・sneak・updateShape）、slot 順、drop 引き金、window 無効化、
+閲覧者数と event、`isRedstoneConductor` / 閉塞判定 / 猫、`broadcastChanges` 毎 tick 差分、
+`recheckOpeners` 境界（survival/creative・立位/しゃがみ・double chest 遠側半分・ender chest・cart）を
+実 TCP と unit fixture で固定し、`tests/container_wire.py` は実 TCP で 2 client の開閉、
+半分ごとの slot 所有、破壊時の `0x12` と drop、再起動後の left/right と中身を読む。
+`tools/mutation_check.sh` には `chest_contract_*` 3 本（片側閉塞、27..53 同期、reach 再検証）を接続し、
+`MUTATION_STABILITY=1` で 3/3 検出を確認した。
 
-検証済みの範囲は上の 5 機構だけである。開いている window の毎 tick 同期、
-`isChestBlockedAt`、waterlogged chest の water tick、`LootTableSeed` の初回 open まで
-の保持、視界外閲覧者の `recheckOpeners`、ender/minecart chest の viewer 同期は
-未実装で、この段階の合格には含めていない。
+未検証・未移植（Slice 3c 後）: waterlogged chest の water tick、`LootTableSeed` の初回 open までの保持
+（block chest 側）、ender chest / minecart chest の蓋・entity event 同期、barrel の `open` state。
 続きは[移植順序](../../../specs/horizon-gameplay/README.md)を参照。

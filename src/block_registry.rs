@@ -746,6 +746,40 @@ impl BReg {
     pub(crate) fn is_collision_shape_full_block(&self, st: u32) -> bool {
         state_fact(st)[0] & FACT_COLLISION_FULL != 0
     }
+    /// Pinned `BlockStateBase.isRedstoneConductor(level, pos)` (`dtb$a.g`):
+    /// default in `BlockBehaviour.Properties` is `blocksMotion && isCollisionShapeFullBlock`,
+    /// overridden in `Blocks.<clinit>` to `always` for `mud` and `soul_sand`, and `never` for
+    /// glass, stained_glass, tinted_glass, ice, frosted_ice, beacon, leaves, copper grates,
+    /// copper bulbs, glowstone, sea_lantern, redstone_block, tnt, observer, piston, and
+    /// sticky_piston. Verified across all 26,684 states of the pinned 1.21.1 server jar.
+    pub(crate) fn is_redstone_conductor(&self, st: u32) -> bool {
+        let name = self.name_of(st);
+        if matches!(name, "minecraft:mud" | "minecraft:soul_sand") {
+            return true;
+        }
+        if matches!(
+            name,
+            "minecraft:glass"
+                | "minecraft:tinted_glass"
+                | "minecraft:ice"
+                | "minecraft:frosted_ice"
+                | "minecraft:beacon"
+                | "minecraft:glowstone"
+                | "minecraft:sea_lantern"
+                | "minecraft:redstone_block"
+                | "minecraft:tnt"
+                | "minecraft:observer"
+                | "minecraft:piston"
+                | "minecraft:sticky_piston"
+        ) || name.ends_with("_stained_glass")
+            || name.ends_with("_leaves")
+            || name.ends_with("copper_grate")
+            || name.ends_with("copper_bulb")
+        {
+            return false;
+        }
+        self.blocks_motion(st) && self.is_collision_shape_full_block(st)
+    }
     /// Pinned `isFaceSturdy(level, pos, direction, supportType)`. `direction` uses the native
     /// DOWN/UP/NORTH/SOUTH/WEST/EAST indices. `Support::Center` is the `canSupportCenter`
     /// question (torches, plants, signs) and differs from `Full` on 10,621 states for one

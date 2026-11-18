@@ -3387,6 +3387,23 @@ check "entity_collide_block_window_catches_1_5_fence" \
   '    let by0 = (min[1] - 1e-7).floor() as i32;' \
   entity_collision_tests::entity_collide_fence_1_5_block_prevents_step_over_and_catches_window
 
+# Chest world-side contract (M2 Gameplay Slice 3c):
+# `ChestBlock.isChestBlockedAt` on both halves, multi-viewer `broadcastChanges`, and `recheckOpeners`.
+check "chest_contract_double_chest_blocks_when_either_half_blocked" \
+  src/main.rs '        .any(is_chest_blocked_at)' \
+  '        .all(is_chest_blocked_at)' \
+  tick_tests::chest_contract_blocked_single_double_cat_and_unblocked_barrel
+
+check "chest_contract_broadcast_changes_diffs_both_halves" \
+  src/main.rs '                if sync.last_slots[idx] != *stack {' \
+  '                if idx < 27 && sync.last_slots[idx] != *stack {' \
+  tick_tests::chest_contract_multi_viewer_broadcast_changes
+
+check "chest_contract_recheck_openers_enforces_reach" \
+  src/main.rs '        if !chest_still_valid(c, win, anchor) {' \
+  '        if !window_live(win) {' \
+  tick_tests::chest_contract_recheck_openers_reach_and_lid_close
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

@@ -72,13 +72,26 @@ pickup delay は[独立した slice](pickup-delay.md)で閉塞した。実プレ
   `0x12` で閉じ、閉じた window への click は container map を作り直さない。
 - 閲覧者数は開いている window から導出し（永続化しない）、半分ごとに
   `ClientboundBlockEventPacket`（0x08, action 1, param=count）を送る。
+- 閉塞判定は `ChestBlock.isChestBlockedAt`（`dhb.a` = `isBlockedChestByBlock` の
+  `BlockStateBase.isRedstoneConductor` + `isCatSittingOnChest` の sitting `Cat` AABB 交差）
+  および `ChestBlock.getMenuProvider`（`dhb.b` → `DoubleBlockCombiner` 経由で単体は自身、
+  二重チェストは**どちらか一方**が閉塞していれば結合を拒否）に合わせる。`EnderChestBlock.useWithoutItem`
+  （`dip.a`）は上空セルの `isBlockedChestByBlock` で拒否し、`BarrelBlock`（`dfe.a`）と
+  minecart chest は上空ブロック閉塞を行わない。
+- 複数閲覧者同期は `AbstractContainerMenu.broadcastChanges`（`cpu.d`）相当として
+  viewer ごとの送信済み slot snapshot を保持し、毎 tick `chest_viewer_tick` が開いている
+  コンテナ slot (`0..27` / `0..54`) を diff して変化 slot に単調増加の `stateId` 付き
+  `0x15` (`ClientboundContainerSetSlotPacket`) を配信する。
+- 到達距離の再検証は `ChestBlockEntity.recheckOpeners` / `Container.stillValidBlockEntity`
+  （`bqk.a` → `Player.canInteractWithBlock(pos, 4.0)`: 単体／二重チェスト両半分の単位 AABB から
+  eye position `1.62f` / crouching `1.27f` まで `< 8.5` survival / `< 9.0` creative、
+  ender chest は操作した block anchor、minecart chest は `ContainerEntity.isChestVehicleStillValid`
+  の `< 7.0` / `< 9.0`）を毎 tick 検査し、無効化または射程外となった viewer に `0x12`
+  (`ClientboundContainerClosePacket`) を送って `sync_chest_openers` で `0x08` count を減算する。
 
-未検証・未移植: 開いている複数閲覧者への毎 tick の `broadcastChanges`
-（A が動かした item は B の開いた window に次の tick では出ない）、
-`isChestBlockedAt`（上に載った block / 猫で結合を拒む）、waterlogged chest の
-water tick 再予約、`LootTable`/`LootTableSeed` の初回 open まで保持、
-視界外に出た閲覧者の `recheckOpeners`、ender chest と minecart chest の
-viewer 同期（entity event 経路）、barrel の `open` state。
+未検証・未移植: waterlogged chest の water tick 再予約、`LootTable`/`LootTableSeed` の
+初回 open まで保持（block chest 側）、ender chest の block event 経由の蓋アニメーション、
+minecart chest の entity event 経路、barrel の `open` state。
 
 ### 4. エンティティの属性・移動・接触
 
