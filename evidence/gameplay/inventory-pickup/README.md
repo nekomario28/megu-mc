@@ -114,3 +114,13 @@ actor側の旧規則は残っている。先に時間・所有者・接触条件
 所有者制限（thrower の UUID / `canPickup`）、`ItemEntity.playerTouch` 自体の実行、
 接触bounding box、scheduler、統計／advancement は引き続き未実装で、このsliceの
 「部分実装で止める」という結論も変えない。
+
+## 後続: ItemEntity playerTouch / target UUID / spectator (Slice 2b)
+
+その後 [item-touch slice](../../../specs/horizon-gameplay/item-touch.md) が、固定 1.21.1 jar
+(`59353fb40c36d304f2035d51e7d6e6baa98dc05c`) と公式 mappings (`03f8985492bda0afc0898465341eb0acef35f570`) の
+`cjh.b_(cmx)` / `cjh.a(cjh)` / `cmx.m_()` / `bsu.a(DDD)` / `ewx.a(DDDDDD)` に基づき、
+`Drop` に `target` / `thrower` を追加し、`Drop::can_be_picked_up_by`・`player_touch_aabb` で
+1.21.1 接触 AABB・`!isSpectator()` / `hp > 0`・`target` UUID 一致・`merge_drops` の `target` 一致・`DRO1`
+永続化を閉塞した（`tools/mutation_check.sh` 9/9 `MUTATION_STABILITY=1` 証明、全 670 test 緑）。
+

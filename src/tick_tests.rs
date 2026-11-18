@@ -687,6 +687,8 @@ fn pickup_tick_drains_across_selected_offhand_then_hotbar() {
         cnt: 10,
         comps: vec![],
         age: 100,
+        target: None,
+        thrower: None,
     });
     drop_tick();
     let remaining: Vec<_> = drops().lock().unwrap().iter().map(|d| d.cnt).collect();
@@ -728,6 +730,8 @@ fn pickup_tick_keeps_the_partial_entity_without_a_take_event() {
         cnt: 10,
         comps: vec![],
         age: 100,
+        target: None,
+        thrower: None,
     });
     drop_tick();
     let remaining: Vec<_> = drops().lock().unwrap().iter().map(|d| d.cnt).collect();
@@ -783,6 +787,8 @@ fn pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack() {
             cnt: 10,
             comps: vec![],
             age: 100,
+            target: None,
+            thrower: None,
         });
         drop_tick();
         let remaining = drops().lock().unwrap().len();
@@ -842,6 +848,8 @@ fn pickup_tick_refuses_a_drop_inside_its_pickup_delay() {
         cnt: 10,
         comps: vec![],
         age: 0,
+        target: None,
+        thrower: None,
     });
     // Fresh. The cell is hot, so the same tick that refuses the take advances the age.
     drop_tick();
@@ -941,6 +949,8 @@ fn pickup_tick_collects_at_the_delay_and_reports_the_original_count() {
         cnt: 10,
         comps: vec![],
         age: server_ticks(PICKUP_DELAY_GT) as i32,
+        target: None,
+        thrower: None,
     });
     drop_tick();
     assert!(
@@ -1009,6 +1019,8 @@ fn pickup_tick_delay_boundary_keeps_the_partial_insert_and_leftover() {
         cnt: 10,
         comps: vec![],
         age: delay - 1,
+        target: None,
+        thrower: None,
     });
     drop_tick();
     assert_eq!(
@@ -1086,6 +1098,8 @@ fn pickup_tick_delay_keeps_the_next_player_eligible() {
         cnt: 10,
         comps: vec![],
         age: delay - 1,
+        target: None,
+        thrower: None,
     });
     drop_tick();
     assert!(
@@ -1112,6 +1126,239 @@ fn pickup_tick_delay_keeps_the_next_player_eligible() {
         full,
         "the full player's inventory must not change"
     );
+}
+
+#[test]
+fn pickup_tick_excludes_spectator_and_dead_players() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+    let (spectator, mut spectator_rx) = client_pair();
+    *spectator.gm.lock().unwrap() = 3;
+    spectator.seen.lock().unwrap().insert(9201);
+    let spectator = Arc::new(spectator);
+
+    let (mut dead, mut dead_rx) = client_pair();
+    dead.eid += 1;
+    *dead.hp.lock().unwrap() = 0.0;
+    dead.seen.lock().unwrap().insert(9201);
+    let dead = Arc::new(dead);
+
+    *clients().lock().unwrap() = vec![spectator.clone(), dead.clone()];
+    let stone = name_to_item("stone").unwrap();
+    drops().lock().unwrap().push(Drop {
+        eid: 9201,
+        x: 0.0,
+        y: 70.0,
+        z: 0.0,
+        item: stone,
+        cnt: 8,
+        comps: vec![],
+        age: 100,
+        target: None,
+        thrower: None,
+    });
+    drop_tick();
+    assert!(
+        spectator.inv.lock().unwrap().is_empty(),
+        "spectator player must never pick up drops"
+    );
+    assert!(
+        dead.inv.lock().unwrap().is_empty(),
+        "dead player (hp <= 0) must never pick up drops"
+    );
+    assert_eq!(
+        drops().lock().unwrap().iter().map(|d| (d.eid, d.cnt)).collect::<Vec<_>>(),
+        [(9201, 8)],
+        "spectator/dead players must leave the drop intact"
+    );
+
+    spectator
+        .sock
+        .lock()
+        .unwrap()
+        .shutdown(std::net::Shutdown::Write)
+        .unwrap();
+    dead.sock
+        .lock()
+        .unwrap()
+        .shutdown(std::net::Shutdown::Write)
+        .unwrap();
+    assert!(read_packet(&mut spectator_rx, Instant::now() + Duration::from_secs(1)).is_none());
+    assert!(read_packet(&mut dead_rx, Instant::now() + Duration::from_secs(1)).is_none());
+
+    // Switching the player back out of spectator into survival allows pickup.
+    *spectator.gm.lock().unwrap() = 0;
+    drop_tick();
+    assert!(drops().lock().unwrap().is_empty());
+    assert_eq!(
+        spectator.inv.lock().unwrap().get(&36),
+        Some(&(stone, 8, vec![]))
+    );
+}
+
+#[test]
+fn pickup_tick_matches_1_21_1_player_touch_aabb_boundaries() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+    let (client, _rx) = client_pair();
+    let client = Arc::new(client);
+    *clients().lock().unwrap() = vec![client.clone()];
+    let stone = name_to_item("stone").unwrap();
+    let ready = server_ticks(PICKUP_DELAY_GT) as i32;
+
+    // Player at (0.0, 70.0, 0.0):
+    // Standing bounding box (0.6f x 1.8f) inflated by (1.0, 0.5, 1.0) covers
+    // X,Z in [-1.300000011920929, +1.300000011920929], Y in [69.5, 72.29999995231628].
+    // ItemEntity bounding box (0.25 x 0.25) is [x - 0.125, x + 0.125] x [y, y + 0.25].
+    let cases = [
+        // (eid, x, y, z, sneaking, fall_fly, should_pick_up, reason)
+        // Above player head (y=72.0): old <1.3 sphere had dist^2 = 4.0 and failed; 1.21.1 AABB touches!
+        (9210, 0.0, 72.0, 0.0, false, false, true, "vertical reach inside [py-0.5, py+2.3]"),
+        // Exact top edge y=72.3 >= max_y (strict `<` in AABB.intersects): must NOT touch.
+        (9211, 0.0, 72.3, 0.0, false, false, false, "vertical top boundary y=py+2.3 must not touch"),
+        // Drop bottom y=69.25 -> drop max_y=69.5 == player min_y (strict `>`): must NOT touch.
+        (9212, 0.0, 69.25, 0.0, false, false, false, "vertical bottom boundary y+0.25==py-0.5 must not touch"),
+        // Slightly higher (y=69.26 -> max_y=69.51 > 69.5): touches!
+        (9213, 0.0, 69.26, 0.0, false, false, true, "vertical bottom inside reach"),
+        // Horizontal corner (1.4, 70.0, 1.4): old sphere failed (dist^2 = 3.92 > 1.69), AABB touches (1.4 - 0.125 = 1.275 < 1.3)!
+        (9214, 1.4, 70.0, 1.4, false, false, true, "horizontal corner inside AABB"),
+        // Horizontal reach just outside 1.3 + 0.125 = 1.425: must NOT touch.
+        (9215, 1.426, 70.0, 0.0, false, false, false, "horizontal outside 1.3+0.125 must not touch"),
+        // Horizontal inside 1.42: touches!
+        (9216, 1.42, 70.0, 0.0, false, false, true, "horizontal inside 1.3+0.125"),
+        // Crouching (height 1.5 -> max_y = 72.0): y=72.05 must NOT touch while crouching.
+        (9217, 0.0, 72.05, 0.0, true, false, false, "crouching max_y=py+2.0 excludes y=72.05"),
+        // Same y=72.05 when standing (height 1.8 -> max_y ~ 72.3): touches!
+        (9218, 0.0, 72.05, 0.0, false, false, true, "standing max_y=py+2.3 includes y=72.05"),
+        // Fall-flying (height 0.6 -> max_y ~ 71.1): y=71.15 must NOT touch.
+        (9219, 0.0, 71.15, 0.0, false, true, false, "fall-flying max_y=py+1.1 excludes y=71.15"),
+    ];
+
+    for (eid, x, y, z, sneaking, fall_fly, expect_pickup, reason) in cases {
+        client.inv.lock().unwrap().clear();
+        drops().lock().unwrap().clear();
+        *client.sneaking.lock().unwrap() = sneaking;
+        *client.fall_fly.lock().unwrap() = fall_fly;
+        drops().lock().unwrap().push(Drop {
+            eid,
+            x,
+            y,
+            z,
+            item: stone,
+            cnt: 1,
+            comps: vec![],
+            age: ready,
+            target: None,
+            thrower: None,
+        });
+        drop_tick();
+        let picked = drops().lock().unwrap().is_empty();
+        assert_eq!(picked, expect_pickup, "case {eid} ({reason})");
+    }
+}
+
+#[test]
+fn pickup_tick_enforces_target_uuid_over_closer_non_target() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+    let uuid_non_target = [0x11; 16];
+    let uuid_owner = [0x22; 16];
+
+    let (mut closer, _rx1) = client_pair();
+    closer.uuid = uuid_non_target;
+    *closer.pos.lock().unwrap() = (0.0, 70.0, 0.0, 0.0, 0.0, true);
+    let closer = Arc::new(closer);
+
+    let (mut owner, _rx2) = client_pair();
+    owner.eid += 1;
+    owner.uuid = uuid_owner;
+    *owner.pos.lock().unwrap() = (1.2, 70.0, 0.0, 0.0, 0.0, true);
+    let owner = Arc::new(owner);
+
+    *clients().lock().unwrap() = vec![closer.clone(), owner.clone()];
+    let stone = name_to_item("stone").unwrap();
+    let ready = server_ticks(PICKUP_DELAY_GT) as i32;
+
+    // 1. Target = uuid_owner, Thrower = uuid_non_target: closer (even at distance 0 & thrower) is rejected; owner collects!
+    drops().lock().unwrap().push(Drop {
+        eid: 9230,
+        x: 0.0,
+        y: 70.0,
+        z: 0.0,
+        item: stone,
+        cnt: 5,
+        comps: vec![],
+        age: ready,
+        target: Some(uuid_owner),
+        thrower: Some(uuid_non_target),
+    });
+    drop_tick();
+    assert!(drops().lock().unwrap().is_empty());
+    assert!(closer.inv.lock().unwrap().is_empty(), "non-target closer player must not pick up targeted drop");
+    assert_eq!(
+        owner.inv.lock().unwrap().get(&36),
+        Some(&(stone, 5, vec![])),
+        "target owner must pick up targeted drop"
+    );
+
+    // 2. Target = None, Thrower = uuid_owner: thrower alone does NOT restrict pickup in 1.21.1 ItemEntity.playerTouch.
+    closer.inv.lock().unwrap().clear();
+    owner.inv.lock().unwrap().clear();
+    drops().lock().unwrap().push(Drop {
+        eid: 9231,
+        x: 0.0,
+        y: 70.0,
+        z: 0.0,
+        item: stone,
+        cnt: 3,
+        comps: vec![],
+        age: ready,
+        target: None,
+        thrower: Some(uuid_owner),
+    });
+    drop_tick();
+    assert!(drops().lock().unwrap().is_empty());
+    assert_eq!(
+        closer.inv.lock().unwrap().get(&36),
+        Some(&(stone, 3, vec![])),
+        "thrower alone must not block another player from picking up an untargeted drop"
+    );
+
+    // 3. Targeted drop with non-present owner stays on the ground even when closer non-target or an Actor is on top.
+    closer.inv.lock().unwrap().clear();
+    let old_actors = std::mem::take(&mut *actors().lock().unwrap());
+    let actor = Arc::new(Actor {
+        name: "bot".into(),
+        eid: 9239,
+        pos: Mutex::new((0.0, 70.0, 0.0)),
+        look: Mutex::new(None),
+        action: Mutex::new(""),
+        held: Mutex::new((0, 0, Vec::new())),
+        inv: Mutex::new(HashMap::new()),
+    });
+    actors().lock().unwrap().insert("bot".into(), actor.clone());
+    *clients().lock().unwrap() = vec![closer.clone()];
+    drops().lock().unwrap().push(Drop {
+        eid: 9232,
+        x: 0.0,
+        y: 70.0,
+        z: 0.0,
+        item: stone,
+        cnt: 4,
+        comps: vec![],
+        age: ready,
+        target: Some(uuid_owner),
+        thrower: None,
+    });
+    drop_tick();
+    actor_tick();
+    assert!(closer.inv.lock().unwrap().is_empty());
+    assert!(actor.inv.lock().unwrap().is_empty(), "actor without matching UUID must not absorb targeted drop");
+    assert_eq!(drops().lock().unwrap().len(), 1);
+    *actors().lock().unwrap() = old_actors;
 }
 
 /// Sets a test's saver-thread stop flag when dropped, so a panic does not leave the thread taking
@@ -1608,6 +1855,8 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
         cnt: 1,
         comps: Vec::new(),
         age: 0,
+        target: None,
+        thrower: None,
     });
     xps().lock().unwrap().push(Xp {
         eid: 9102,
@@ -1627,6 +1876,8 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
         cnt: 1,
         comps: Vec::new(),
         age: 0,
+        target: None,
+        thrower: None,
     });
     for _ in 0..5 {
         game_tick(|_, tick| tick());
@@ -1673,6 +1924,8 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
         cnt: 1,
         comps: Vec::new(),
         age: 0,
+        target: None,
+        thrower: None,
     });
     let mut pickup_ready_at = None;
     for step in 1..=20 {
@@ -1896,6 +2149,8 @@ fn profile_game_tick() {
                     cnt: 1,
                     comps: Vec::new(),
                     age: i,
+                    target: None,
+                    thrower: None,
                 });
             }
             for i in 0..600 {
@@ -1913,6 +2168,8 @@ fn profile_game_tick() {
                     cnt: 1,
                     comps: Vec::new(),
                     age: i,
+                    target: None,
+                    thrower: None,
                 });
             }
         }
@@ -1928,6 +2185,8 @@ fn profile_game_tick() {
                     cnt: 1,
                     comps: Vec::new(),
                     age: (i % 400),
+                    target: None,
+                    thrower: None,
                 });
                 xps().lock().unwrap().push(Xp {
                     eid: 21_000 + i,
@@ -5795,6 +6054,8 @@ fn identity_fixture(orbs: &mut Vec<Xp>, items: &mut Vec<Drop>) -> IdentityFixtur
             cnt: 1,
             comps: Vec::new(),
             age,
+            target: None,
+            thrower: None,
         });
         deid += 1;
     };

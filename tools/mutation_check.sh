@@ -1402,6 +1402,21 @@ check "a real client observes the pickup delay the actor path already enforced" 
   '            let mut source = (d.item, d.cnt, d.comps.clone());' \
   pickup_tick_refuses_a_drop_inside_its_pickup_delay
 
+check "a targeted drop refuses a closer non-target player" \
+  src/main.rs '            (Some(owner), Some(uuid)) => owner == uuid,' \
+  '            (Some(_owner), Some(_uuid)) => true,' \
+  pickup_tick_enforces_target_uuid_over_closer_non_target
+
+check "spectator and dead players do not pick up drops" \
+  src/main.rs '        if spectator || !alive {' \
+  '        if false && (spectator || !alive) {' \
+  pickup_tick_excludes_spectator_and_dead_players
+
+check "player pickup uses the 1.21.1 inflated touch AABB" \
+  src/main.rs '    EntityAabb::from_dimensions(x, y, z, 0.6, height).inflate(1.0, 0.5, 1.0)' \
+  '    EntityAabb::from_dimensions(x, y, z, 0.6, height)' \
+  pickup_tick_matches_1_21_1_player_touch_aabb_boundaries
+
 # Pinned surface-loader slice: codecs, weather dispatch, and its shared noise owner.
 check "the pinned inline surface rule is actually installed" \
   src/worldgen.rs 'ns.get("surface_rule").or_else(|| ns.get("material_rule"))' \

@@ -336,6 +336,75 @@ struct Client {
     held: Mutex<i16>,
     effs: Mutex<Vec<Eff>>,
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EntityAabb {
+    min_x: f64,
+    min_y: f64,
+    min_z: f64,
+    max_x: f64,
+    max_y: f64,
+    max_z: f64,
+}
+impl EntityAabb {
+    /// 1.21.1 `EntityDimensions.makeBoundingBox(x, y, z)` (`bsu.a(DDD)`):
+    /// half-width is `(width / 2.0f32) as f64`, vertical span is `[y, y + height as f64]`.
+    fn from_dimensions(x: f64, y: f64, z: f64, width: f32, height: f32) -> Self {
+        let half_w = f64::from(width / 2.0);
+        let h = f64::from(height);
+        Self {
+            min_x: x - half_w,
+            min_y: y,
+            min_z: z - half_w,
+            max_x: x + half_w,
+            max_y: y + h,
+            max_z: z + half_w,
+        }
+    }
+    /// 1.21.1 `AABB.inflate(x, y, z)` (`ewx.c(DDD)`).
+    fn inflate(self, dx: f64, dy: f64, dz: f64) -> Self {
+        Self {
+            min_x: self.min_x - dx,
+            min_y: self.min_y - dy,
+            min_z: self.min_z - dz,
+            max_x: self.max_x + dx,
+            max_y: self.max_y + dy,
+            max_z: self.max_z + dz,
+        }
+    }
+    /// 1.21.1 `AABB.intersects(AABB)` (`ewx.c(Lewx;)Z` -> `ewx.a(DDDDDD)Z`).
+    fn intersects(self, other: Self) -> bool {
+        self.min_x < other.max_x
+            && self.max_x > other.min_x
+            && self.min_y < other.max_y
+            && self.max_y > other.min_y
+            && self.min_z < other.max_z
+            && self.max_z > other.min_z
+    }
+}
+/// 1.21.1 `Player.aiStep()` (`cmx.m_()`): `player.getBoundingBox().inflate(1.0, 0.5, 1.0)`.
+/// `Player` (`cmx.<clinit>`) has `0.6f x 1.8f` standing, `0.6f x 1.5f` crouching,
+/// `0.6f x 0.6f` fall-flying.
+fn player_touch_aabb(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> EntityAabb {
+    let height = if fall_fly {
+        0.6
+    } else if sneaking {
+        1.5
+    } else {
+        1.8
+    };
+    EntityAabb::from_dimensions(x, y, z, 0.6, height).inflate(1.0, 0.5, 1.0)
+}
+impl Client {
+    fn is_spectator(&self) -> bool {
+        *self.gm.lock().unwrap() == 3
+    }
+    fn touch_aabb(&self) -> EntityAabb {
+        let (px, py, pz, ..) = *self.pos.lock().unwrap();
+        let sneaking = *self.sneaking.lock().unwrap();
+        let fall_fly = *self.fall_fly.lock().unwrap();
+        player_touch_aabb(px, py, pz, sneaking, fall_fly)
+    }
+}
 static CLIENTS: OnceLock<Mutex<Vec<Arc<Client>>>> = OnceLock::new();
 static NEXT_EID: AtomicI32 = AtomicI32::new(1000);
 fn clients() -> &'static Mutex<Vec<Arc<Client>>> {
@@ -700,6 +769,8 @@ fn interest_tick() {
                     cnt,
                     comps: comps.clone(),
                     age: 0,
+                    target: None,
+                    thrower: None,
                 };
                 vec![(0x01, spawn_drop_pkt(&d)), (0x58, drop_meta_pkt(&d))]
             }),
@@ -1754,6 +1825,8 @@ struct Drop {
     cnt: u8,
     comps: Comps,
     age: i32,
+    target: Option<[u8; 16]>,
+    thrower: Option<[u8; 16]>,
 }
 impl Drop {
     /// Vanilla keeps an ItemEntity out of reach for its pickup delay. Both collectors of a
@@ -1764,6 +1837,51 @@ impl Drop {
     /// delay keeps its existing cadence instead of gaining a second clock.
     fn pickup_delay_elapsed(&self) -> bool {
         self.age >= server_ticks(PICKUP_DELAY_GT) as i32
+    }
+
+    /// 1.21.1 `EntityType.ITEM` (`bsx.ag`): `sized(0.25f, 0.25f)` via `EntityDimensions.makeBoundingBox`
+    /// (`bsu.a(DDD)`): `[x - 0.125, x + 0.125] x [y, y + 0.25] x [z - 0.125, z + 0.125]`.
+    fn bounding_box(&self) -> EntityAabb {
+        EntityAabb::from_dimensions(self.x, self.y, self.z, 0.25, 0.25)
+    }
+
+    /// 1.21.1 `Player.aiStep()` (`cmx.m_()`) + `ItemEntity.playerTouch(Player)` (`cjh.b_(Lcmx;)V`):
+    /// alive non-spectator whose inflated bounding box intersects the drop's bounding box, and
+    /// `target == null || target.equals(player.getUUID())`. `thrower` (`cjh.l`) is not gated here.
+    fn can_be_picked_up_by_parts(
+        target: Option<[u8; 16]>,
+        drop_aabb: EntityAabb,
+        collector_uuid: Option<[u8; 16]>,
+        spectator: bool,
+        alive: bool,
+        player_aabb: EntityAabb,
+    ) -> bool {
+        if spectator || !alive {
+            return false;
+        }
+        let target_ok = match (target, collector_uuid) {
+            (None, _) => true,
+            (Some(owner), Some(uuid)) => owner == uuid,
+            (Some(_), None) => false,
+        };
+        target_ok && player_aabb.intersects(drop_aabb)
+    }
+
+    fn can_be_picked_up_by(
+        &self,
+        uuid: Option<[u8; 16]>,
+        spectator: bool,
+        alive: bool,
+        player_aabb: EntityAabb,
+    ) -> bool {
+        Self::can_be_picked_up_by_parts(
+            self.target,
+            self.bounding_box(),
+            uuid,
+            spectator,
+            alive,
+            player_aabb,
+        )
     }
 }
 static DROPS: OnceLock<Mutex<Vec<Drop>>> = OnceLock::new();
@@ -1913,6 +2031,8 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
             cnt,
             comps,
             age: 0,
+            target: None,
+            thrower: None,
         };
         drops().lock().unwrap().push(d);
     }
@@ -1982,6 +2102,8 @@ fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) 
             cnt,
             comps,
             age: 0,
+            target: None,
+            thrower: None,
         });
     }
 }
@@ -2695,6 +2817,7 @@ fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
             // Cheap integer and distance tests first; the component blobs are a Vec
             // comparison, so they run only for a real candidate.
             if ait == bit
+                && dp[i].target == dp[j].target
                 && (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 0.25
                 && dp[i].comps == dp[j].comps
                 && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16
@@ -4000,6 +4123,8 @@ fn arrow_tick() {
                 cnt: 1,
                 comps: rc,
                 age: 0,
+                target: None,
+                thrower: None,
             });
         }
     }
@@ -4361,6 +4486,8 @@ fn actor_tick() {
                                 cnt: 1,
                                 comps: Vec::new(),
                                 age: 0,
+                                target: None,
+                                thrower: None,
                             };
                             drops().lock().unwrap().push(d);
                             // spawn streams via interest_tick
@@ -4394,8 +4521,9 @@ fn actor_tick() {
                 _ => {}
             }
         }
-        // absorb nearby drops (vanilla pickup radius ~1.5)
+        // absorb nearby drops via shared 1.21.1 AABB + target pickup gate
         {
+            let actor_aabb = player_touch_aabb(ax, ay, az, false, false);
             let mut inv = a.inv.lock().unwrap();
             let mut ds = drops().lock().unwrap();
             let mut gone: Vec<i32> = vec![];
@@ -4405,7 +4533,7 @@ fn actor_tick() {
                 if !d.pickup_delay_elapsed() {
                     continue;
                 }
-                if (d.x - ax).powi(2) + (d.y - ay).powi(2) + (d.z - az).powi(2) < 2.25 {
+                if d.can_be_picked_up_by(None, false, true, actor_aabb) {
                     // vanilla takes the whole stack; a mergeable slot is
                     // filled to 64 and the entity keeps the remainder
                     let smax = item_stack_max(d.item, &d.comps) as u8;
@@ -4462,6 +4590,8 @@ fn wash_away(x: i32, y: i32, z: i32) {
             cnt: 1,
             comps: Vec::new(),
             age: 0,
+            target: None,
+            thrower: None,
         };
         drops().lock().unwrap().push(d);
     }
@@ -4830,26 +4960,33 @@ fn drop_tick() {
     let __prof = tickprof::enabled();
     let mut __t = __prof.then(std::time::Instant::now);
     let region = region_guard();
-    // player within 1.3 blocks picks up the drop
+    // 1.21.1 Player.aiStep() touch box + !isSpectator() + ItemEntity.target match
     let mut taken: Vec<(i32, Arc<Client>)> = vec![];
     {
-        let ds: Vec<(i32, f64, f64, f64)> = drops()
+        let ds: Vec<(i32, f64, f64, Option<[u8; 16]>, EntityAabb)> = drops()
             .lock()
             .unwrap()
             .iter()
-            .map(|d| (d.eid, d.x, d.y, d.z))
+            .map(|d| (d.eid, d.x, d.z, d.target, d.bounding_box()))
             .collect();
         let cls: Vec<Arc<Client>> = client_snapshot();
-        for (d_eid, dx, dy, dz) in ds.iter() {
+        let touches: Vec<(bool, bool, EntityAabb)> = cls
+            .iter()
+            .map(|c| (c.is_spectator(), *c.hp.lock().unwrap() > 0.0, c.touch_aabb()))
+            .collect();
+        for (d_eid, dx, dz, d_target, d_aabb) in ds.iter() {
             if !region.is_hot(*dx as i32, *dz as i32) {
                 continue;
             }
-            for c in cls.iter() {
-                let (px, py, pz, ..) = {
-                    let p = c.pos.lock().unwrap();
-                    *p
-                };
-                if (px - dx).powi(2) + (py - dy).powi(2) + (pz - dz).powi(2) < 1.69 {
+            for (c, &(spectator, alive, player_aabb)) in cls.iter().zip(touches.iter()) {
+                if Drop::can_be_picked_up_by_parts(
+                    *d_target,
+                    *d_aabb,
+                    Some(c.uuid),
+                    spectator,
+                    alive,
+                    player_aabb,
+                ) {
                     taken.push((*d_eid, c.clone()));
                 }
             }
@@ -4931,6 +5068,9 @@ fn drop_tick() {
     for (deid, c) in taken {
         let selected = *c.held.lock().unwrap();
         let creative = *c.gm.lock().unwrap() == 1;
+        let spectator = c.is_spectator();
+        let alive = *c.hp.lock().unwrap() > 0.0;
+        let player_aabb = c.touch_aabb();
         let (accepted, original, changed, remaining) = {
             // Same inventory -> drops lock order as actor_tick. Read the live
             // entity, not a stack snapshot another collector may have consumed.
@@ -4939,6 +5079,9 @@ fn drop_tick() {
             let Some(d) = ds.iter_mut().find(|d| d.eid == deid) else {
                 continue;
             };
+            if !d.can_be_picked_up_by(Some(c.uuid), spectator, alive, player_aabb) {
+                continue;
+            }
             // The delay belongs to the take, not to the candidate scan: it is judged on
             // the live entity under the same locks the insertion uses, so a drop spawned
             // after the snapshot above, or merged into a fresher age, is still too young
@@ -5163,6 +5306,8 @@ fn mob_tick() {
                                 cnt,
                                 comps,
                                 age: 0,
+                                target: None,
+                                thrower: None,
                             };
                             drops().lock().unwrap().push(d);
                         }
@@ -5597,6 +5742,8 @@ fn mob_tick() {
                                                         cnt,
                                                         comps,
                                                         age: 0,
+                                                        target: None,
+                                                        thrower: None,
                                                     });
                                                 }
                                             }
@@ -6538,6 +6685,8 @@ fn break_generated_cart(target_eid: i32, drop_loot: bool) -> bool {
                 cnt: 1,
                 comps: Vec::new(),
                 age: 0,
+                target: None,
+                thrower: None,
             });
         }
         for (item, cnt, comps) in spilled {
@@ -6550,6 +6699,8 @@ fn break_generated_cart(target_eid: i32, drop_loot: bool) -> bool {
                 cnt,
                 comps,
                 age: 0,
+                target: None,
+                thrower: None,
             });
         }
     }
@@ -9106,6 +9257,8 @@ fn set_block_if_inner(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) ->
                         cnt,
                         comps,
                         age: 0,
+                        target: None,
+                        thrower: None,
                     });
                 }
             }
@@ -9535,6 +9688,8 @@ fn falling_tick() {
                         cnt: 1,
                         comps: Vec::new(),
                         age: 0,
+                        target: None,
+                        thrower: None,
                     });
                 }
                 despawn.push(f.eid);
@@ -9607,6 +9762,8 @@ fn note_fragile_supports(x: i32, y: i32, z: i32) {
                     cnt: 1,
                     comps: Vec::new(),
                     age: 0,
+                    target: None,
+                    thrower: None,
                 });
             }
         }
@@ -10056,6 +10213,7 @@ fn save_world_into(f: &mut Vec<u8>) {
     // META section: mobs + world time + inventories (offline store + live).
     // MET4 = stacks carry component blobs and entity ages are server ticks.
     // MET2/MET3 stored those ages in milliseconds, which the loader converts.
+    let mut drop_owners: Vec<(u32, Option<[u8; 16]>, Option<[u8; 16]>)> = Vec::new();
     (*f).extend_from_slice(b"MET4");
     {
         let ms = mobs().lock().unwrap();
@@ -10181,7 +10339,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         {
             let ds = drops().lock().unwrap();
             write_varint(&mut *f, (ds.len() + tridents.len()) as i64);
-            for d in ds.iter() {
+            for (idx, d) in ds.iter().enumerate() {
                 (*f).extend_from_slice(&d.eid.to_be_bytes());
                 (*f).extend_from_slice(&d.x.to_be_bytes());
                 (*f).extend_from_slice(&d.y.to_be_bytes());
@@ -10193,6 +10351,9 @@ fn save_world_into(f: &mut Vec<u8>) {
                 // negative pickup-delay marker round-trips; only the load-side
                 // clamp used to destroy it.
                 drop_ages.push(d.age as u32); // server ticks, signed
+                if d.target.is_some() || d.thrower.is_some() {
+                    drop_owners.push((idx as u32, d.target, d.thrower));
+                }
             }
             for (x, y, z, item, comps) in tridents.iter() {
                 // eid 0 is remapped on load and age 0 grants a full pickup delay.
@@ -10500,6 +10661,97 @@ fn save_world_into(f: &mut Vec<u8>) {
         generated_fluids,
     }
     .append(f);
+    if !drop_owners.is_empty() {
+        append_drop_owners_footer(f, &drop_owners);
+    }
+}
+const DROP_OWNERS_FOOTER_LEN: usize = 12;
+const DROP_OWNERS_MAGIC: &[u8; 4] = b"DRO1";
+fn append_drop_owners_footer(
+    out: &mut Vec<u8>,
+    owners: &[(u32, Option<[u8; 16]>, Option<[u8; 16]>)],
+) {
+    let start = out.len();
+    out.extend_from_slice(&(owners.len() as u32).to_be_bytes());
+    for &(idx, target, thrower) in owners {
+        out.extend_from_slice(&idx.to_be_bytes());
+        let flags = u8::from(target.is_some()) | (u8::from(thrower.is_some()) << 1);
+        out.push(flags);
+        if let Some(t) = target {
+            out.extend_from_slice(&t);
+        }
+        if let Some(th) = thrower {
+            out.extend_from_slice(&th);
+        }
+    }
+    let size = (out.len() - start) as u64;
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(DROP_OWNERS_MAGIC);
+}
+fn read_drop_owners_footer(
+    payload: &[u8],
+) -> Result<(&[u8], Vec<(usize, Option<[u8; 16]>, Option<[u8; 16]>)>), &'static str> {
+    if !payload.ends_with(DROP_OWNERS_MAGIC) {
+        return Ok((payload, Vec::new()));
+    }
+    let end = payload
+        .len()
+        .checked_sub(DROP_OWNERS_FOOTER_LEN)
+        .ok_or("truncated drop owners footer")?;
+    let size = usize::try_from(u64::from_be_bytes(
+        payload[end..end + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| "invalid drop owners size")?;
+    if size == 0 {
+        return Err("invalid drop owners size");
+    }
+    let start = end.checked_sub(size).ok_or("invalid drop owners size")?;
+    let mut input = &payload[start..end];
+    if input.len() < 4 {
+        return Err("truncated drop owners count");
+    }
+    let count = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
+    input = &input[4..];
+    if count > input.len() / 5 {
+        return Err("invalid drop owners count");
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if input.len() < 5 {
+            return Err("truncated drop owner entry");
+        }
+        let idx = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
+        let flags = input[4];
+        input = &input[5..];
+        if flags == 0 || (flags & !0b11) != 0 {
+            return Err("invalid drop owner flags");
+        }
+        let target = if flags & 1 != 0 {
+            if input.len() < 16 {
+                return Err("truncated drop target uuid");
+            }
+            let u: [u8; 16] = input[..16].try_into().unwrap();
+            input = &input[16..];
+            Some(u)
+        } else {
+            None
+        };
+        let thrower = if flags & 2 != 0 {
+            if input.len() < 16 {
+                return Err("truncated drop thrower uuid");
+            }
+            let u: [u8; 16] = input[..16].try_into().unwrap();
+            input = &input[16..];
+            Some(u)
+        } else {
+            None
+        };
+        out.push((idx, target, thrower));
+    }
+    if !input.is_empty() {
+        return Err("invalid drop owners tail");
+    }
+    Ok((&payload[..start], out))
 }
 fn load_world() -> Result<(), &'static str> {
     let raw = match std::fs::read(WORLD_FILE) {
@@ -10511,6 +10763,7 @@ fn load_world() -> Result<(), &'static str> {
 }
 
 fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
+    let (payload, drop_owners) = read_drop_owners_footer(payload)?;
     let tick_state = tick_persistence::TickState::read(payload)?;
     let generated = generated_content::Snapshot::read(tick_persistence::prefix(payload)?)?;
     if generated.as_ref().is_some_and(|s| (!s.sources.is_empty() || !s.spider_flags.is_empty())
@@ -10784,7 +11037,15 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                     cnt,
                     comps,
                     age: 0,
+                    target: None,
+                    thrower: None,
                 });
+            }
+            for &(idx, target, thrower) in &drop_owners {
+                if let Some(d) = ds.get_mut(idx) {
+                    d.target = target;
+                    d.thrower = thrower;
+                }
             }
         }
         if p < payload.len() {
@@ -21222,7 +21483,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 let n = items.len();
                 for (item, cnt, ic) in items {
                     drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                        x: lx, y: ly, z: lz, item, cnt, comps: ic, age: 0 });
+                        x: lx, y: ly, z: lz, item, cnt, comps: ic, age: 0, target: None, thrower: None });
                 }
                 format!("Dropped {} item stack(s)", n)
             } else { "usage: /loot spawn x y z loot <table>|kill <entity>".into() }
@@ -22861,6 +23122,8 @@ fn handle(mut s: TcpStream) {
                                 cnt,
                                 comps,
                                 age: 0,
+                                target: None,
+                                thrower: Some(me.uuid),
                             });
                             {
                                 let mut p = vec![0u8];
@@ -23006,6 +23269,8 @@ fn handle(mut s: TcpStream) {
                                     cnt: 1,
                                     comps: Vec::new(),
                                     age: 0,
+                                    target: None,
+                                    thrower: None,
                                 };
                                 drops().lock().unwrap().push(d);
                             }
@@ -23023,6 +23288,8 @@ fn handle(mut s: TcpStream) {
                                     cnt: drop_cnt,
                                     comps: Vec::new(),
                                     age: 0,
+                                    target: None,
+                                    thrower: None,
                                 };
                                 drops().lock().unwrap().push(d);
                             }
@@ -23599,6 +23866,8 @@ fn handle(mut s: TcpStream) {
                                     cnt: 1,
                                     comps: Vec::new(),
                                     age: 0,
+                                    target: None,
+                                    thrower: None,
                                 };
                                 drops().lock().unwrap().push(d);
                             }
@@ -24116,6 +24385,8 @@ fn handle(mut s: TcpStream) {
                                 cnt: cnt + extra,
                                 comps,
                                 age: 0,
+                                target: None,
+                                thrower: None,
                             };
                             drops().lock().unwrap().push(d);
                         }
@@ -24185,6 +24456,8 @@ fn handle(mut s: TcpStream) {
                                     cnt,
                                     comps,
                                     age: 0,
+                                    target: None,
+                                    thrower: None,
                                 });
                             }
                         }
@@ -24410,7 +24683,9 @@ fn handle(mut s: TcpStream) {
                             item: cur.0,
                             cnt: cur.1,
                             comps: cur.2,
-                            age: -(server_ticks(40) as i32), // pickup delay: 2s already elapsed
+                            age: -(server_ticks(40) as i32), // pickup delay: 2s already elapsed,
+                            target: None,
+                            thrower: None,
                         });
                     }
                     let mut inv = me.inv.lock().unwrap();
@@ -24491,6 +24766,8 @@ fn handle(mut s: TcpStream) {
                                             cnt: n,
                                             comps: it.2.clone(),
                                             age: 0,
+                                            target: None,
+                                            thrower: Some(me.uuid),
                                         };
                                         drops().lock().unwrap().push(d);
                                     }
@@ -24553,6 +24830,8 @@ fn handle(mut s: TcpStream) {
                                             cnt: n,
                                             comps: it.2.clone(),
                                             age: 0,
+                                            target: None,
+                                            thrower: Some(me.uuid),
                                         };
                                         drops().lock().unwrap().push(d);
                                     }
@@ -24810,6 +25089,8 @@ fn handle(mut s: TcpStream) {
                                             cnt: n,
                                             comps: it.2.clone(),
                                             age: 0,
+                                            target: None,
+                                            thrower: Some(me.uuid),
                                         };
                                         drops().lock().unwrap().push(d);
                                         drop(cur);
@@ -24897,6 +25178,8 @@ fn handle(mut s: TcpStream) {
                                         cnt: n,
                                         comps: cur.2.clone(),
                                         age: 0,
+                                        target: None,
+                                        thrower: Some(me.uuid),
                                     };
                                     drops().lock().unwrap().push(d);
                                 }
@@ -25331,6 +25614,8 @@ fn handle(mut s: TcpStream) {
                                             cnt: st.1,
                                             comps: st.2,
                                             age: 0,
+                                            target: None,
+                                            thrower: Some(me.uuid),
                                         });
                                     }
                                 }};
@@ -25739,6 +26024,8 @@ fn handle(mut s: TcpStream) {
                         cnt: st.1,
                         comps: st.2,
                         age: 0,
+                        target: None,
+                        thrower: None,
                     });
                 }
             }

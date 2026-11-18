@@ -41,6 +41,8 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
         z: 0.5,
         item: name_to_item("iron_ingot").unwrap(),
         cnt: 3,
+        target: None,
+        thrower: None,
         comps: vec![(2i64, br#"{"text":"legacy"}"#.to_vec())],
         age: drop_age,
     });
@@ -654,3 +656,110 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
         name_to_state("oak_sign").unwrap()
     );
 }
+
+#[test]
+fn dro1_round_trip_preserves_drop_target_and_thrower_uuids() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _world_guard = world_guard();
+    let old_world = std::mem::take(&mut *world().lock().unwrap());
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
+    let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
+    let old_time = WORLD_TIME.swap(555, Ordering::Relaxed);
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_rng = world_rng::saved_state();
+
+    let stone = name_to_item("stone").unwrap();
+    let uuid_a = [0xAA; 16];
+    let uuid_b = [0xBB; 16];
+    let uuid_c = [0xCC; 16];
+    *drops().lock().unwrap() = vec![
+        Drop {
+            eid: 8801,
+            x: 1.5,
+            y: 70.0,
+            z: 2.5,
+            item: stone,
+            cnt: 1,
+            comps: Vec::new(),
+            age: 4,
+            target: Some(uuid_a),
+            thrower: Some(uuid_b),
+        },
+        Drop {
+            eid: 8802,
+            x: 3.5,
+            y: 70.0,
+            z: 4.5,
+            item: stone,
+            cnt: 2,
+            comps: Vec::new(),
+            age: 5,
+            target: Some(uuid_c),
+            thrower: None,
+        },
+        Drop {
+            eid: 8803,
+            x: 5.5,
+            y: 70.0,
+            z: 6.5,
+            item: stone,
+            cnt: 3,
+            comps: Vec::new(),
+            age: 6,
+            target: None,
+            thrower: Some(uuid_a),
+        },
+        Drop {
+            eid: 8804,
+            x: 7.5,
+            y: 70.0,
+            z: 8.5,
+            item: stone,
+            cnt: 4,
+            comps: Vec::new(),
+            age: 7,
+            target: None,
+            thrower: None,
+        },
+    ];
+
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    assert!(payload.ends_with(b"DRO1"), "save with drop owners must carry DRO1 footer");
+
+    drops().lock().unwrap().clear();
+    load_world_from(&payload).unwrap();
+    let restored: Vec<_> = drops()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| (d.eid, d.cnt, d.age, d.target, d.thrower))
+        .collect();
+
+    // Corrupting the DRO1 footer must be rejected cleanly.
+    let mut bad = payload.clone();
+    let len = bad.len();
+    bad[len - 12..len - 4].copy_from_slice(&0u64.to_be_bytes());
+    let corrupt_err = load_world_from(&bad).is_err();
+
+    *world().lock().unwrap() = old_world;
+    *drops().lock().unwrap() = old_drops;
+    *mobs().lock().unwrap() = old_mobs;
+    WORLD_TIME.store(old_time, Ordering::Relaxed);
+    *forceloaded().lock().unwrap() = old_forced;
+    world_rng::restore(old_rng);
+
+    assert_eq!(
+        restored,
+        vec![
+            (8801, 1, 4, Some(uuid_a), Some(uuid_b)),
+            (8802, 2, 5, Some(uuid_c), None),
+            (8803, 3, 6, None, Some(uuid_a)),
+            (8804, 4, 7, None, None),
+        ]
+    );
+    assert!(corrupt_err, "corrupt DRO1 footer must return Err");
+}
+

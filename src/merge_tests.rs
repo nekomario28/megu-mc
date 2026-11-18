@@ -39,6 +39,8 @@ fn drop(eid: i32, x: f64, y: f64, z: f64, item: i64, cnt: u8, age: i32) -> Drop 
         cnt,
         comps: Vec::new(),
         age,
+        target: None,
+        thrower: None,
     }
 }
 
@@ -57,6 +59,7 @@ fn reference_outcome(mut dp: Vec<Drop>) -> Vec<(i32, i64, u8)> {
                 (b.x, b.y, b.z, b.item, b.cnt, b.age)
             };
             if ait == bit
+                && dp[i].target == dp[j].target
                 && dp[i].comps == dp[j].comps
                 && (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 0.25
                 && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16
@@ -111,6 +114,8 @@ fn scenario(index: usize) -> Vec<Drop> {
                 z: 0.5,
                 item: 811,
                 cnt: 1,
+                target: None,
+                thrower: None,
                 comps: vec![(2, b"{}".to_vec())],
                 age: 5,
             },
@@ -370,4 +375,31 @@ fn xp_merge_still_merges_at_all() {
     let apart = bucketed_orb_merge(vec![orb(1, 0.5, 70.0, 0.5, 1, 0), orb(2, 1.5, 70.0, 0.5, 1, 0)]);
     assert_eq!(apart.0.len(), 2, "orbs 1.0 apart are not merged by vanilla");
     assert!(apart.1.is_empty());
+}
+
+#[test]
+fn merge_drops_respects_target_uuid_but_ignores_thrower() {
+    let mut d1 = drop(901, 0.5, 70.0, 0.5, 811, 2, 1);
+    d1.target = Some([0x11; 16]);
+    d1.thrower = Some([0xAA; 16]);
+    let mut d2 = drop(902, 0.5, 70.0, 0.5, 811, 3, 2);
+    d2.target = Some([0x22; 16]);
+    d2.thrower = Some([0xAA; 16]);
+    assert_eq!(
+        merge_outcome(vec![d1, d2]),
+        vec![(901, 811, 2), (902, 811, 3)],
+        "drops with differing target UUIDs must not merge (ItemEntity.tryToMerge)"
+    );
+
+    let mut s1 = drop(903, 0.5, 70.0, 0.5, 811, 2, 1);
+    s1.target = Some([0x11; 16]);
+    s1.thrower = Some([0xAA; 16]);
+    let mut s2 = drop(904, 0.5, 70.0, 0.5, 811, 3, 2);
+    s2.target = Some([0x11; 16]);
+    s2.thrower = Some([0xBB; 16]);
+    assert_eq!(
+        merge_outcome(vec![s1, s2]),
+        vec![(903, 811, 5)],
+        "drops with same target UUID and differing throwers must merge"
+    );
 }

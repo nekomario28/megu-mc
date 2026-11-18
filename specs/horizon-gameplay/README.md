@@ -40,9 +40,12 @@ donor は `horizon-world/src/inventory_pickup.rs` / `player_inventory.rs` と
 pickup delay は[独立した slice](pickup-delay.md)で閉塞した。実プレイヤーの `drop_tick` と
 擬似 player の `actor_tick` が同じ age 述語を問い合わせ、しきい値の境界、満杯の先行プレイヤーが
 次の適格者を塞がないこと、部分挿入時に `age` の加齢段が保全されることを検査している。
-この段階は部分実装。擬似 player の表現統合、所有者制限（thrower の UUID / `canPickup`）、
-`ItemEntity.playerTouch` 自体の実行、接触範囲・scheduler・統計／advancement は未検証。
-次は item entity の所有者・接触条件を独立に固定し、その後で actor の表現を統合する。
+続いて [ItemEntity playerTouch / target / spectator (Slice 2b)](item-touch.md) で、
+`ItemEntity` の `target` / `thrower` UUID（`playerTouch` と `tryToMerge`）、1.21.1 `Player.aiStep` の
+接触 AABB 交差、`isSpectator()` / `getHealth() > 0` 除外、`DRO1` 永続化を共通所有者
+(`Drop::can_be_picked_up_by`) に閉塞した。
+この段階は部分実装。擬似 player の表現統合、scheduler、統計／advancement（`THROWN_ITEM_PICKED_UP_BY_ENTITY` 等）は未検証。
+次は actor の表現統合または後続スライスを独立に固定する。
 
 ### 3. チェストのワールド側契約
 
