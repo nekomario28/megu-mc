@@ -178,6 +178,83 @@ binary sha256 `486435229adfb20525e5c7cbe8c8fefd84074ed52170133742990419d5cde23d`
   「22 SHAPE_CHECK_BLOCKSセルはいずれもreference mark setに無い」と実測して不landingを選んでおり、
   本laneのS01–S03の0はその状態で成立している。
 
+**2026-11-18 P2-1受入lane 第2便(同blueprintのS04–S07、`9a6169ba`基点)**
+
+source `9a6169ba4bd1637540c82214dd2f79b1205ffeba`(`perf/worldgen-parallel` tip、dirty 0)。binary sha256
+`5b56f0aba28f185f998f8354dba6eb59fbc351195512ab49fee42be071524a52`(debug、HEADから
+`cargo build --offline --locked -j4`)。**新しいnative captureは作らない**受入: 既存captureを現HEADの
+binaryで再生成して比較した。raw: `audit/p2-1-acceptance-s04-s07-20261118T130912Z/`。
+
+- **S04 stronghold — Overworld (−96,35) seed 4242 — 0 / 98,304**。capture `matrix-v1/nat-4242-stronghold`
+  に自分の `order.tsv`(3×3、対象chunkが中心)を入力にして **0 / 98,304**(port dump
+  `98ae8d73e4e6f448…`、両側 non_air 30,605・cave_air 1,116、window内に stronghold/trial_chambers/
+  mineshaft の3 start が同居)。**受入行に昇格**: `matrix-v2/manifest-promotable.json` の
+  `ow-4242-structures--96-35--64-384`(level.dat / `world/region/r.-3.1.mca` / dump / run.log /
+  order.tsv をsha256束縛、stage structures)。このcaptureは `boundary.json` が `runtime_writes 10` を
+  記録するので **`inputs.expected_runtime_writes` を宣言**した(count 10 = `oak_fence` 4状態×2 +
+  `air`×2、`writes_sha256 7cb3aa18…`)。suiteは capture 自身の `run.log` の `wrote=true` 10行に
+  ついて個数・census・hash の3つが一致することを検証(`"verified": true`)。さらに10セル全部を
+  native chunk と port dump で突き合わせて state-for-state 一致(`triage/s04-runtime-cells.txt`)。
+  `run.log` の window内書き込み行 9,920行・unique 8,699セルも全て一致。
+  **対照**: `--mode terrain`(構造物・feature・carverを書かない)= **13,837 / 98,304**
+  (stronghold `sh*`/trial_chambers `jigsaw#`/mineshaft `mscorridor#` のBB内セルが消える)。
+  **既定順序の対照は 0 / 98,304** — このwindowでは記録順序と既定順序が同じ結果を出し、順序入力は
+  ここでは判別力を持たない(控えめに記録する。S01の(3,−2)が30差だったのとは性質が違う)。
+  OCEAN_FLOOR heightmap 0列差。
+- **S05 end_city — End (65,45) seed 4242 — 0/256行は 0 / 65,536、0/128行は 0 / 32,768(受入行にしない)**。
+  0/256 (`matrix-v2/nat-4242-end-city-256`、order.tsv入力): **0 / 65,536**、dump `124c58c4baa2081b…`
+  = 既存manifestの束縛hashとbyte一致、両側 non_air 14,977。`run.log` の window内書き込み
+  6,921行・unique 6,660セルも全て一致。**対照**: seed 4243 = 11,563/65,536、`--mode terrain` =
+  2,275/65,536(いずれも end_city `ecp#` のセルを含む)。OCEAN_FLOOR 0列差。
+  0/128 (`matrix-v1/nat-4242-end-city`)は `--out-of-window report` で **0 / 32,768**、ただし
+  **section Y=8 の273セル(purpur系・`WORLD_SURFACE`の最大は140)が比較窓の外**なので §4-2 を満たさず
+  **行にしない**(この欠落が `WORLD_SURFACE_vs_non_air_top_mismatches 121` の正体 — 窓を切った
+  ことの artifact であって port の不一致ではない)。
+- **S06 nether_fossil — Nether (−22,20) seed 4242 — 0/256 と 0/128 の両行が0**。
+  0/256 (`matrix-v2/nat-4242-nether-fossil-256`、order.tsv入力): **0 / 65,536**、dump
+  `b6628d89652caa1b…` = 既存束縛hashとbyte一致、両側 non_air 24,688。23 uniqueセルの書き込み一致。
+  0/128 (`matrix-v1/nat-4242-nether-fossil`): **0 / 32,768**、dump `b5448161bc6b795b…`。
+  **受入行に昇格**: `nether-fossil-4242-structures--22-20--0-128`(level.dat / `world/DIM-1/region/
+  r.-1.0.mca` / dump / run.log を束縛)。このcaptureの `order.tsv` は **(−24,20) 中心**で(−22,20)の
+  3×3を覆わないため、この行には `inputs.order` を**宣言しない**(比較は既定順序で走らせた)。
+  そのcapture自身の対象 (−24,20) は自分の order.tsv 入力で **0 / 32,768**(dump `4710ef2d…`)。
+  **対照**: 0/256窓で seed 4243 = 21,372/65,536、`--mode terrain` = 5,306/65,536
+  (nether_fossil `nefos#0` の骨blockセルを含む)。OCEAN_FLOOR 0列差。
+- **S07 ruined_portal — Overworld (6,7) seed 4242 — 0 / 98,304**(window −64/384、order.tsv入力)。
+  dump `2e4e3fedab3ba71f…` = 既存束縛hashとbyte一致、両側 non_air 40,396・cave_air 171、window内に
+  `ruined_portal` start (6,7) と mineshaft `mscorridor#60/#61`。`run.log` の window内書き込み
+  3,795行・unique 3,628セルも全て一致。**対照**: `--mode terrain` = 11,047/98,304、seed 4243 =
+  23,907/98,304(いずれも `rupo#0` のセルを含む)。OCEAN_FLOOR 0列差。
+  **§4-5(A/B両方)は依然満たせない** — host上の native run は1本だけで、`/tmp` の同名dirも同じrunの
+  複製(level.dat一致)。よってこの行は「MATCH、ただし単一native run」のまま据え置く。
+- **lane gates**: fixture_suite `manifest-promotable.json` は **9 → 11行**、**11 MATCH / 0 DIFF /
+  0 INVALID、exit 0**。serial suite **698 passed / 0 failed / 1 ignored**(=699、exit 0)、
+  `--test-threads=8` は 3回中 **2回 698/0/1 緑**、初回だけ
+  `tick_tests::a_saved_snapshot_never_holds_an_unbooked_gravity_block` が
+  `the saver must capture at least one snapshot` (src/tick_tests.rs:5303) で落ちた — saver thread が
+  1度も走る前に `stop` が立つ**テスト側の scheduling race**で、本laneはsrcを1行も変えていない
+  (serial では緑)。seed-0 の64chunk identity dump は `670fdfe3…9949def` で**bit-identical**。
+  **mutation entry は追加なし** — 4スライスとも HEAD で既に0で、挙動を変える修正をlandしなかった。
+- **§6上の記述の更新(本laneの実測が上書きする)**:
+  1. 「matrix-v1 fossil 0/128 行は未実行」→ 本laneで **0/32,768**、受入行にした(上記)。
+  2. 「matrix-v1 end-city 0/128 行は未実行(F1により比較不能)」→ 本laneで 0/32,768 を実測し、除外は
+     **ちょうど273セル(section Y=8)**であることを確認。窓を広げるのが正しい(F1の記述は維持)。
+  3. 「stronghold capture は runtime_writes 10 …本レーンでは行を宣言していない」→ 本laneで宣言した。
+  4. 「fortress-256/fortress/end-outer の `inputs.sha256` は instrument を含めて現ツリーと一致する」→
+     **9a6169b では成立しない**。`238da77`(2026-11-18 09:03)が `tools/carve-agent/Agent.java` と
+     `CarveLog.java` を編集したため、それ以前の **matrix-v1 の `ow-c6x0-20261118` を除く全captureと
+     matrix-v2 の end-city/fossil/basalt/fortress も** `Agent.java`/`CarveLog.java`/
+     `build_carve_agent.sh`(+ matrix-v1 は `native_fixture.sh`) が一致しない(実測:
+     `triage/provenance.txt`)。
+     一致するのは `238da77` 以降の capture(jungle-tree/vine/vine-all、ow-c6x0)だけ。これは
+     **capture instrument の再現性**の話で、比較の妥当性(world/level.dat/run.log をbyte束縛し、
+     port と state-for-state で比べる)には影響しないが、「instrument を含めて現ツリーと一致」は
+     F5の対象を ruined-portal/village-taiga に限らず**全 pre-238da77 capture に広げて読む**必要がある。
+  5. **§2のwindow集合の外にあるmanifest行が2つある**: `ow-4242-structures-74--41--64-384`(前便が追加)
+     と `ow-4242-structures-6-7--64-384`(ruined-portal)。§2は(6,7)も(74,−41)も宣言していないので、
+     これらの行は §3 の構造物リストの主張(`jungle_temple`/`ruined_portal` の「MATCH」)を支えるが、
+     §5のGoal文(§2のwindow集合上の量化)には入らない。§2は凍結なので、追加はrevisionで行う。
+
 ## 改定規則
 
 - 行の追加/除外/変更は、結果を見てからでなく**理由を先に**書いたrevisionとしてのみ。
