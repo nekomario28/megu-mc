@@ -190,6 +190,18 @@ public class Extract {
         Method mFullCube = method(stateC, "isFullCube", viewC, posC);
         Method mFluid = method(stateC, "getFluidState");
         Method mFluidEmpty = method(cls("net/minecraft/fluid/FluidState"), "isEmpty");
+        // The collision shape is a per-state box list, not a scalar: `getCollisionShape` answers
+        // an empty VoxelShape for air, a plant or a torch and several boxes for a fence, a stair
+        // or a lit candle. `getBoundingBoxes` is the same decomposition `VoxelShape.toAabbs`
+        // gives, but reads the already-cached box list instead of walking the voxel planes.
+        Class<?> shapeC = cls("net/minecraft/util/shape/VoxelShape");
+        Class<?> boxC = cls("net/minecraft/util/math/Box");
+        Method mCollision = method(stateC, "getCollisionShape", viewC, posC);
+        Method mBoxes = method(shapeC, "getBoundingBoxes");
+        Field[] boxField = {
+            field(boxC, "minX"), field(boxC, "minY"), field(boxC, "minZ"),
+            field(boxC, "maxX"), field(boxC, "maxY"), field(boxC, "maxZ"),
+        };
         Method mRawId = method(blockC, "getRawIdFromState", cls("net/minecraft/block/BlockState"));
         Class<?> regC = cls("net/minecraft/registry/Registry");
         Object blockReg = field(cls("net/minecraft/registry/Registries"), "BLOCK").get(null);
@@ -199,6 +211,7 @@ public class Extract {
         StringBuilder names = new StringBuilder();
         List<int[]> rows = new ArrayList<>();
         List<String> blockOf = new ArrayList<>();
+        List<String> shapesOf = new ArrayList<>();
         int id = 0;
         for (Object st : (Iterable<?>) stateIds) {
             int raw = (Integer) mRawId.invoke(null, st);
@@ -230,6 +243,19 @@ public class Extract {
                 r[9] = (Boolean) mFullCube.invoke(st, view, pos) ? 1 : 0;
             }
             rows.add(r);
+            // One token per box, `minX,minY,minZ,maxX,maxY,maxZ`, comma-joined; an empty
+            // collision shape is an empty field. `Double.toString` round-trips through
+            // `float()` in the writer, so the AABBs survive without a rounding decision here.
+            StringBuilder shape = new StringBuilder();
+            for (Object box : (List<?>) mBoxes.invoke(mCollision.invoke(st, view, pos))) {
+                for (int k = 0; k < 6; k++) {
+                    if (k > 0) shape.append(',');
+                    shape.append(Double.toString((Double) boxField[k].get(box)));
+                }
+                shape.append('\t');
+            }
+            if (shape.length() > 0) shape.setLength(shape.length() - 1);
+            shapesOf.add(shape.toString());
             id++;
         }
         // one line per state id: id lum opacity flags sides [candidates...]
@@ -239,6 +265,12 @@ public class Extract {
                 sb.append(i).append('\t').append(blockOf.get(i));
                 for (int v : rows.get(i)) sb.append('\t').append(v);
                 w.println(sb);
+            }
+        }
+        // one line per state id: id then one `minX,minY,minZ,maxX,maxY,maxZ` field per box
+        try (PrintWriter w = new PrintWriter(Files.newBufferedWriter(out.resolve("state_shapes.tsv")))) {
+            for (int i = 0; i < shapesOf.size(); i++) {
+                w.println(shapesOf.get(i).isEmpty() ? Integer.toString(i) : i + "\t" + shapesOf.get(i));
             }
         }
 

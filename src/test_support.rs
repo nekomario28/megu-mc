@@ -6,8 +6,7 @@
 /// reads them, so a checkout without them is a broken checkout, not a normal state.
 const REQUIRED_DATA: &[&str] = &[
     "assets/blocks_1211.json",
-    "assets/pblocks.json",
-    "assets/properties.json",
+    "assets/block_states_1211.json",
     "datapacks/vanilla/multi_noise_biome_tree.json",
     "datapacks/vanilla/data/minecraft/worldgen/noise_settings/overworld.json",
 ];

@@ -28,9 +28,11 @@ logs/
 /evidence/**/tmp/
 
 # ---- local world / saves written by the server ---------------------------------------------
-# The server writes ./world_overlay.bin (+ .tmp while writing and .bak, the retained previous save).
-/world_overlay.bin
-/world_overlay.bin.*
+# The server writes ./world_overlay.bin (+ .tmp while writing and .bak, the retained previous save),
+# and a fixture that runs a second overlay writes world_overlay_<name>.bin. Both spellings are
+# local state: the file is regenerable from the seed and must never be committed.
+/world_overlay*.bin
+/world_overlay*.bin.*
 /world/
 /saves/
 *.mca
@@ -58,12 +60,20 @@ mappings*.txt
 /eula.txt
 
 # ---- game data ----------------------------------------------------------------------------
-# This branch keeps its data in-tree (datapacks/vanilla, config_packets.bin, the block/property
-# tables and the tests/data fixtures are tracked on purpose: the suite reads them, and the
-# fixtures are this project's own measurements). `tools/vanilla_data/gen_vanilla_data.sh` exists
-# for regenerating them from your own 1.21.1 jar, but its output is *not* ignored here.
-# Only the optional server resource pack is user-supplied.
+# This branch keeps its data in-tree (datapacks/vanilla, config_packets.bin, assets/*.json and the
+# tests/data fixtures are tracked on purpose: the suite reads them, and the fixtures are this
+# project's own measurements). `tools/vanilla_data/gen_vanilla_data.sh` regenerates them from your
+# own pinned 1.21.1 jar and `--verify` checks the tree without one; its output is *not* ignored
+# here.
+# The three files that were tracked without a usable provenance are gone - assets/pblocks.json and
+# assets/properties.json (byte-identical to another project's GPL-3.0 data) and resourcepack.zip
+# (origin unknown, optional server feature) - and `tools/provenance_check.py` fails the build if one
+# comes back into the index or into src/. A resource pack you supply yourself for a local run is
+# still only a user input: this tree ships none, so nothing here is hidden from `git status`
+# except that local copy.
 /resourcepack.zip
+# `gen_vanilla_data.sh` builds the datapack in this sibling directory and swaps it in whole.
+/datapacks/vanilla.stage/
 
 # ---- secrets and key material --------------------------------------------------------------
 .env

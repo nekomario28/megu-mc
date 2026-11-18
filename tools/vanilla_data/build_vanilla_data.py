@@ -4,16 +4,19 @@ after checking it against the data generator's own reports.
 
   build_vanilla_data.py <extract-dir> <datagen-reports-dir> <repo-root> <jar-sha1>
 
-Reads   <extract-dir>/{state_facts.tsv,biome_tree.json,biome_probe.tsv,biome_probe_ties.tsv,
+Reads   <extract-dir>/{state_facts.tsv,state_shapes.tsv,biome_tree.json,biome_probe.tsv,biome_probe_ties.tsv,
         random_next_int.tsv,vanilla_vectors.tsv}   (Extract.java)
         <datagen-reports-dir>/{blocks.json,biome_parameters/minecraft/*.json}  (vanilla --reports)
-Writes  assets/block_states_1211.json        per-state light / flag / face facts, our schema
-        datapacks/vanilla/biome_climate_tree.json   the game's own biome search trees
+Writes  assets/block_states_1211.json        per-state light / flag / face / collision facts, our schema
         tests/data/biome_probe_1211.tsv      points looked up through the game's tree
         tests/data/vanilla_vectors_1211.tsv  questions put to the game (xoroshiro draws, climate noise,
                                              biome lookups, aquifer helpers) and its answers
         tests/data/biome_probe_ties_1211.tsv tie-heavy points (range edges) for the scan order
         tests/data/random_next_int_1211.tsv  nextInt(bound) streams of the game's random classes
+
+The biome search tree itself is written by `tools/biome_tree_from_jar.py` (the schema
+`src/worldgen.rs` reads, with its own provenance block), so it is not duplicated here; this
+script only cross-checks the tree it exports against the data generator's parameter list.
 
 Every check below must pass or nothing is written.
 """
@@ -73,6 +76,38 @@ facts = {
 }
 assert max(facts["luminance"]) <= 15 and max(facts["light_block"]) <= 15
 
+# ---- collision shapes -----------------------------------------------------------------------
+# One line per state: the state id, then one `minX,minY,minZ,maxX,maxY,maxZ` field per box of
+# `getCollisionShape(EmptyBlockView, ORIGIN)`. The boxes repeat across the 26,684 states (a stone
+# cube, a slab's two halves, a fence's four posts), so they are deduplicated into one `shapes`
+# table and each state keeps the indices it uses. The registry reads exactly this pair; nothing
+# else in the tree defines a collision box.
+shape_rows = (ex / "state_shapes.tsv").read_text().splitlines()
+assert len(shape_rows) == n, f"{len(shape_rows)} collision rows for {n} states"
+shapes, shape_index = [], {}
+collision_shapes = []
+for i, line in enumerate(shape_rows):
+    fields = line.split("\t")
+    assert int(fields[0]) == i, f"collision row {i} is state {fields[0]}"
+    indices = []
+    for token in fields[1:]:
+        box = tuple(float(v) for v in token.split(","))
+        assert len(box) == 6, f"state {i}: box {token} is not six coordinates"
+        low, high = box[:3], box[3:]
+        for a, b in zip(low, high):
+            assert a <= b, f"state {i}: box {token} has min > max"
+        index = shape_index.get(box)
+        if index is None:
+            index = shape_index[box] = len(shapes)
+            shapes.append(box)
+        indices.append(index)
+    collision_shapes.append(indices)
+facts["shapes"] = [{"min": list(box[:3]), "max": list(box[3:])} for box in shapes]
+facts["collision_shapes"] = collision_shapes
+facts["about"] += (" `shapes` is the deduplicated collision-box table and `collision_shapes` "
+                   "lists, per state, the indices it collides with, both from "
+                   "getCollisionShape(EmptyBlockView, BlockPos.ORIGIN).getBoundingBoxes().")
+
 # ---- biome trees ----------------------------------------------------------------------------
 tree = json.loads((ex / "biome_tree.json").read_text())
 
@@ -120,8 +155,8 @@ def dump_compact(obj):
     items = list(obj.items())
     for i, (k, v) in enumerate(items):
         comma = "," if i + 1 < len(items) else ""
-        if isinstance(v, list) and v and isinstance(v[0], (int, list)):
-            body = "[\n" + ",\n".join(json.dumps(x, separators=(",", ":")) for x in v) + "\n]" if isinstance(v[0], list) \
+        if isinstance(v, list) and v and isinstance(v[0], (int, list, dict)):
+            body = "[\n" + ",\n".join(json.dumps(x, separators=(",", ":")) for x in v) + "\n]" if isinstance(v[0], (list, dict)) \
                 else json.dumps(v, separators=(",", ":"))
             out.append(f"{json.dumps(k)}:{body}{comma}")
         else:
@@ -131,12 +166,10 @@ def dump_compact(obj):
 
 (root / "assets").mkdir(exist_ok=True)
 (root / "assets" / "block_states_1211.json").write_text(dump_compact(facts))
-(root / "datapacks" / "vanilla").mkdir(parents=True, exist_ok=True)
-(root / "datapacks" / "vanilla" / "biome_climate_tree.json").write_text(json.dumps(tree, separators=(",", ":")) + "\n")
 (root / "tests" / "data").mkdir(parents=True, exist_ok=True)
 (root / "tests" / "data" / "biome_probe_1211.tsv").write_text((ex / "biome_probe.tsv").read_text())
 (root / "tests" / "data" / "vanilla_vectors_1211.tsv").write_text((ex / "vanilla_vectors.tsv").read_text())
 # Small reference vectors for the differential tests (numbers only, read from the running game).
 (root / "tests" / "data" / "biome_probe_ties_1211.tsv").write_text((ex / "biome_probe_ties.tsv").read_text())
 (root / "tests" / "data" / "random_next_int_1211.tsv").write_text((ex / "random_next_int.tsv").read_text())
-print("wrote assets/block_states_1211.json, datapacks/vanilla/biome_climate_tree.json, tests/data/biome_probe_1211.tsv, tests/data/vanilla_vectors_1211.tsv, tests/data/biome_probe_ties_1211.tsv, tests/data/random_next_int_1211.tsv")
+print("wrote assets/block_states_1211.json, tests/data/biome_probe_1211.tsv, tests/data/vanilla_vectors_1211.tsv, tests/data/biome_probe_ties_1211.tsv, tests/data/random_next_int_1211.tsv")

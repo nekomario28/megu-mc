@@ -667,85 +667,113 @@ fn setting_a_property_lower_than_its_current_value_stays_inside_the_block() {
     }
 }
 
-/// Luminance and opacity are per-state fields in pblocks.json. That file is a different
-/// Minecraft version from blocks_1211.json - it has pale_oak_planks - so its state ids are
-/// its own numbering and cannot be used as the global state. The registry pairs the two by
-/// block name and state position, which is what this checks.
+/// Luminance and opacity are per-state columns of `assets/block_states_1211.json`, which uses the
+/// same 1.21.1 state-id numbering as `assets/blocks_1211.json`. The registry answers both from
+/// `assets/block_state_facts_1211.bin`, a separate export of the same pinned jar, so this compares
+/// two independent recordings of one state space by id - a shifted row in either file shows up as
+/// a disagreement instead of as two plausible tables.
 #[test]
 fn light_values_come_from_the_asset_for_every_state() {
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
-    let raw = std::fs::read("assets/pblocks.json").expect("pblocks must be readable");
-    let blocks = crate::json::jparse(&raw)
-        .expect("pblocks must parse")
-        .get("blocks")
-        .expect("pblocks has blocks")
-        .as_arr()
-        .expect("blocks is an array")
-        .clone();
-    use std::collections::HashMap;
-    let mut by_name: HashMap<String, &crate::json::J> = HashMap::new();
-    for b in &blocks {
-        if let Some(n) = crate::json::jstr(b, "name") {
-            by_name.insert(n, b);
-        }
-    }
+    let raw = std::fs::read("assets/block_states_1211.json")
+        .expect("block_states_1211 must be readable");
+    let facts = crate::json::jparse(&raw).expect("block_states_1211 must parse");
+    let col = |key: &str| -> Vec<u8> {
+        facts
+            .get(key)
+            .and_then(|c| c.as_arr())
+            .unwrap_or_else(|| panic!("block_states_1211 must have a {key} column"))
+            .iter()
+            .map(|v| v.num() as u8)
+            .collect()
+    };
+    let luminance = col("luminance");
+    let opacity = col("light_block");
+    assert_eq!(
+        luminance.len(),
+        reg.state_count(),
+        "the asset must have one luminance per state"
+    );
+    assert_eq!(
+        opacity.len(),
+        reg.state_count(),
+        "the asset must have one opacity per state"
+    );
 
-    let raw_md = std::fs::read("assets/blocks_1211.json").expect("blocks_1211 must be readable");
-    let md = crate::json::jparse(&raw_md)
-        .expect("blocks_1211 must parse")
-        .as_arr()
-        .expect("blocks_1211 is an array")
-        .clone();
     let mut checked = 0usize;
     let mut emitters = 0usize;
-    let mut no_states = Vec::new();
-    for b in &md {
-        let name = crate::json::jstr(b, "name").unwrap_or_default();
-        let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
-        let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
-        let n = (hi - lo + 1) as usize;
-        let Some(pb) = by_name.get(&name) else {
-            continue;
-        };
-        let Some(states) = pb.get("states").and_then(|s| s.as_arr()) else {
-            continue;
-        };
-        if states.len() != n {
-            // Positional pairing is impossible for these; they are counted so the hole is
-            // visible rather than silent.
-            no_states.push(name);
-            continue;
+    for st in 0..reg.state_count() as u32 {
+        let i = st as usize;
+        assert_eq!(reg.luminance_of(st), luminance[i], "luminance of state {st}");
+        assert_eq!(reg.opacity_of(st), opacity[i], "opacity of state {st}");
+        if luminance[i] > 0 {
+            emitters += 1;
         }
-        for (i, s) in states.iter().enumerate() {
-            let st = lo + i as u32;
-            if (st as usize) >= reg.state_count() {
-                continue;
-            }
-            let lum = crate::json::jnum(s, "luminance").unwrap_or(0.0) as u8;
-            let op = crate::json::jnum(s, "opacity").unwrap_or(0.0) as u8;
-            assert_eq!(reg.luminance_of(st), lum, "luminance of {name} state {st}");
-            assert_eq!(reg.opacity_of(st), op, "opacity of {name} state {st}");
-            if lum > 0 {
-                emitters += 1;
-            }
-            checked += 1;
-        }
+        checked += 1;
     }
     assert!(
         checked > 20_000,
         "the check must cover the state space, covered {checked}"
     );
     assert!(
-        emitters > 100,
-        "the asset must have light sources, found {emitters}"
+        emitters > 100 && emitters < checked / 10,
+        "the asset must have light sources and they must stay a minority, found {emitters}"
     );
-    // The two assets are different versions, so a handful of blocks cannot be paired.
-    // If this grows, the pairing assumption has broken.
+    // A column that reads back as all zeros would satisfy every equality above; the light-block
+    // column is three populations in 1.21.1 (transparent 14,616, half 9,552, full 2,516), so the
+    // two non-zero ones are what a shifted or truncated export loses first.
     assert!(
-        no_states.len() <= 4,
-        "too many blocks cannot be paired by position: {no_states:?}"
+        opacity.iter().filter(|&&v| v > 0).count() > 10_000,
+        "the asset must have light blockers, found {:?}",
+        opacity.iter().filter(|&&v| v > 0).count()
+    );
+    assert!(
+        opacity.iter().any(|&v| v == 15) && opacity.iter().any(|&v| v == 1),
+        "both blocked-light populations must be present"
+    );
+}
+
+/// The collision list and the pinned collision predicate are one answer split across two files:
+/// the boxes are `assets/block_states_1211.json`, the `isEmpty`/`isFullBlock` bits are
+/// `assets/block_state_facts_1211.bin`, and both come from one `getCollisionShape(EmptyBlockView,
+/// ORIGIN)` call per state. A list that is empty exactly when the predicate says so is what makes
+/// the two interchangeable; a state that disagrees means one of the exports moved.
+#[test]
+fn collision_boxes_agree_with_the_pinned_collision_predicate() {
+    let Some(reg) = breg() else {
+        panic!("the block registry must load from assets/");
+    };
+    let mut disagreements = Vec::new();
+    let mut boxes = 0usize;
+    let mut colliding_states = 0usize;
+    for st in 0..reg.state_count() as u32 {
+        let list: Vec<_> = reg.collision_boxes(st).collect();
+        boxes += list.len();
+        if !list.is_empty() {
+            colliding_states += 1;
+        }
+        if reg.is_collision_empty(st) != list.is_empty() {
+            disagreements.push(format!("state {st} ({})", reg.name_of(st)));
+        }
+        for (min, max) in list {
+            if (0..3).any(|k| min[k] > max[k]) {
+                disagreements.push(format!("state {st} ({}) has an inverted box", reg.name_of(st)));
+            }
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "the collision list and the pinned predicate disagree on {} states, first: {:?}",
+        disagreements.len(),
+        &disagreements[..disagreements.len().min(8)]
+    );
+    // A table that exported no boxes at all would satisfy every equality above; the state space
+    // is dominated by states that collide, and a fence or a slab contributes more than one box.
+    assert!(
+        colliding_states > 20_000 && boxes > colliding_states,
+        "colliding states {colliding_states}, boxes {boxes}"
     );
 }
 

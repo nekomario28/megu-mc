@@ -47,15 +47,15 @@ DIRTY = "// MC_SPINE_DIRTY_MARKER"
 # a digest rather than "a file exists".
 WIRE_CONFIG = b"MCSPINE-CONFIG-" + bytes(range(96))
 WIRE_SHA = hashlib.sha256(WIRE_CONFIG).hexdigest()
-PACK = b"PK\x03\x04mc-spine-gate-selftest-pack"
 # Files the campaign must not copy even though they sit inside an input directory: the exclusion
 # policy and the copy used to be separate (`find -type f` versus `tar` over the directory).
 EXCLUDED = ["tools/target/cached.bin", "src/__pycache__/stray.pyc", "evidence/target/obj.o",
             "tests/cache.pyc", "tools/notes.mutation-backup"]
-# Ordinary inputs, including the two the server reads from its cwd, that must travel with the copy.
+# Ordinary inputs, including the one the server reads from its cwd, that must travel with the copy.
+# `resourcepack.zip` used to be a second one; it was removed as unprovenanced (THIRD_PARTY.md) and
+# the server advertises no resource pack without it, so it is no longer a runtime input.
 INCLUDED = ["Cargo.toml", "src/main.rs", "tools/mutation_check.sh", "assets/sentinel.json",
-            "datapacks/sentinel.json", "evidence/sentinel.bin", "config_packets.bin",
-            "resourcepack.zip"]
+            "datapacks/sentinel.json", "evidence/sentinel.bin", "config_packets.bin"]
 # The campaign refuses to start without room for a cold private target (1.5 GiB), and /tmp is a
 # small tmpfs on some hosts, so the fixture's tree sits where the real snapshot parent sits and
 # `TemporaryDirectory` removes it - including any residue a killed fixture left behind.
@@ -114,7 +114,6 @@ def build_fixture(root, *, dirty=False, leftover=False, missing_anchor=False, sy
         (root / folder).mkdir()
     (root / "Cargo.toml").write_text('[package]\nname = "mc-spine"\nversion = "0.0.0"\n')
     (root / "config_packets.bin").write_bytes(WIRE_CONFIG)
-    (root / "resourcepack.zip").write_bytes(PACK)
     for path in EXCLUDED:
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_text("excluded sentinel\n")

@@ -38,16 +38,18 @@ case "${MUTATION_STABILITY:-0}" in
   esac
 
 # What the campaign reads from the tree it measures: the crate, the harness, the data the suite
-# loads, and the two files the *server* reads from its working directory. The build
+# loads, and the file the *server* reads from its working directory. The build
 # `include_bytes!`s fixtures under `assets/`, `tests/` and `evidence/`, so a copy without
 # `evidence/` does not compile (measured: 13 missing-fixture errors). `config_packets.bin` is not a
 # build input, which is why it was missed until 2026-11-16: the wire helper's `local_server`
 # symlinks it into the server's cwd and `src/main.rs::load_config_packets` reads it there, so a copy
 # without it runs a server with empty registries and every wire gate then measures different inputs
-# than this tree does. Everything else (specs, .git, target, caches) is not an input and is not
-# copied.
+# than this tree does. `src/main.rs::load_pack_info` used to read a second cwd file,
+# `resourcepack.zip`; that file was removed as unprovenanced (see THIRD_PARTY.md) and the server
+# now simply advertises no resource pack, so there is nothing to copy. Everything else (specs,
+# .git, target, caches) is not an input and is not copied.
 INPUTS=(Cargo.toml Cargo.lock rust-toolchain.toml src tests tools assets datapacks evidence)
-RUNTIME_INPUTS=(config_packets.bin resourcepack.zip)
+RUNTIME_INPUTS=(config_packets.bin)
 
 fail() {
   echo "FAIL  $*" >&2

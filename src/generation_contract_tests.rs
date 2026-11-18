@@ -7006,15 +7006,23 @@ fn state_facts_answer_the_predicates_vanilla_separates() {
     assert!(reg.is_collision_empty(grass) && reg.is_collision_empty(torch));
     assert!(!reg.is_collision_empty(stone) && !reg.is_collision_empty(dirt_path));
     assert!(reg.is_collision_shape_full_block(stone) && !reg.is_collision_shape_full_block(dirt_path));
-    // The registry's collision list and the native collision shape agree on 26,683 of the 26,684
-    // states. The exception is a pitcher crop's upper half at age 0, where the asset lists no box
-    // and vanilla does collide - so the fact table is the exact owner of the predicate.
+    // The registry's collision list and the native collision shape now agree on all 26,684
+    // states: both are read from one `getCollisionShape(EmptyBlockView, ORIGIN)` export, so the
+    // list is the geometry of the same answer the fact table records as a predicate. The pitcher
+    // crop's upper half at age 0 is the state that separates them when the two come from
+    // different exports (the removed pblocks asset had no box for it, so pairing files across
+    // versions silently changed the geometry while the predicate stayed right).
     let pitcher_upper = reg.state_of(
         "minecraft:pitcher_crop",
         Some(&jparse(br#"{"half":"upper","age":"0"}"#).expect("props")),
     );
     assert!(!reg.is_collision_empty(pitcher_upper));
-    assert!(reg.collision_boxes(pitcher_upper).next().is_none());
+    let pitcher_boxes: Vec<_> = reg.collision_boxes(pitcher_upper).collect();
+    assert_eq!(
+        pitcher_boxes,
+        vec![([0.3125, -0.0625, 0.3125], [0.6875, 0.1875, 0.6875])],
+        "vanilla collides with one box here"
+    );
     assert!(reg.is_collision_empty(grass) && reg.collision_boxes(grass).next().is_none());
 
     // Light: emission 15 on glowstone, 0 on stone; block 15 through stone, 0 through glass.

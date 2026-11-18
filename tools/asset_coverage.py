@@ -7,10 +7,13 @@ that script, so the remaining fields cost one command each instead of one survey
 
 The asset is the owner of block knowledge. `assets/blocks_1211.json` carries fields per
 block; `assets/block_states_1211.json` (generated from the 1.21.1 jar by
-tools/vanilla_data/) carries luminance, light opacity, flags and FULL-face bits per *state*.
-The former per-state `assets/pblocks.json` (collision shapes, slipperiness, ...) was removed
-because it was byte-identical to a file from another project and was not 1.21.1 data (see
-THIRD_PARTY.md); fields that only it carried are listed below as "REMOVED".
+tools/vanilla_data/) carries luminance, light opacity, flags, FULL-face bits and the
+collision box table per *state*. Both files are the same 1.21.1 export, so a field's
+`states` count is the whole state space and the values line up by state id.
+
+Fields that only the removed `assets/pblocks.json` carried (slipperiness, blast
+resistance, instrument, map colour, piston behaviour) are listed below as "removed":
+there is no data for them in the tree, and a consumer would need a new export.
 
   --list                     every field, with whether the server reads it and what
                              covering it would take
@@ -48,10 +51,10 @@ FIELDS = {
     "emitLight": ("blocks", "light emission; no model at all"),
     "filterLight": ("blocks", "occlusion; partly via state_flags"),
     "transparent": ("blocks", "occlusion; partly via state_flags"),
-    "boundingBox": ("blocks", "collision; no shape model"),
+    "boundingBox": ("blocks", "collision; the coarse box class, superseded by collision_shapes"),
     "diggable": ("blocks", "covered by hardness < 0"),
-    "collision_shapes": ("removed", "per-state collision; pblocks.json removed - needs extractor extension"),
-    "outline_shapes": ("removed", "selection box; pblocks.json removed - needs extractor extension"),
+    "collision_shapes": ("states", "per-state collision boxes, indices into `shapes`; read by the registry"),
+    "outline_shapes": ("removed", "selection box; not exported (drawing only, no generation caller)"),
     "luminance": ("states", "per-state light; read by the registry from block_states_1211.json"),
     "opacity": ("states", "per-state light opacity; read by the registry from block_states_1211.json"),
     "blast_resistance": ("removed", "per-state explosion resistance; pblocks.json removed"),
@@ -61,7 +64,7 @@ FIELDS = {
     "instrument": ("removed", "note block sound; pblocks.json removed"),
     "map_color": ("removed", "map rendering; pblocks.json removed"),
     "piston_behavior": ("removed", "pistons; pblocks.json removed"),
-    "state_flags": ("states", "air/replaceable/liquid/solid/fluid bits; read by the registry"),
+    "state_flags": ("states", "air/replaceable/liquid/solid/fluid bits; the registry reads only `replaceable`"),
     "side_flags": ("states", "full_sides bits; read by the registry"),
 }
 
@@ -75,6 +78,7 @@ STATE_FILE_KEYS = {
     "opacity": "light_block",
     "state_flags": "flags",
     "side_flags": "full_sides",
+    "collision_shapes": "collision_shapes",
 }
 
 
@@ -209,6 +213,10 @@ def cmd_field(field):
 def cmd_compare(field, rust_fn):
     source, _ = FIELDS[field]
     cov = per_state(source, field)
+    if any(not isinstance(v, (int, float)) for v in cov.values()):
+        print(f"{field}: the asset's values are not scalars (a box list, a flag word), so a\n"
+              "  numeric match table cannot be compared against them", file=sys.stderr)
+        return 2
     path, arms = parse_rust_arms(rust_fn)
     if path is None:
         print(f"no Rust function named {rust_fn!r}", file=sys.stderr)
