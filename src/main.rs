@@ -38,6 +38,8 @@ mod worldgen;
 include!("paletted.rs");
 include!("entity_collision.rs");
 include!("entity_fluid.rs");
+include!("entity_spatial.rs");
+include!("entity_push.rs");
 
 // ---------- varint / wire ----------
 fn read_varint(b: &mut &[u8]) -> Option<i64> {
@@ -2425,6 +2427,10 @@ struct Mob {
     hp: Mutex<f32>,
     last_hit: Mutex<Instant>,
     hurt_at: Mutex<Instant>,
+    /// `LivingEntity.invulnerableTime` (`btn.am:I`), tick-stamped: the tick of the last
+    /// accepted hurt, so `LivingEntity.hurt`'s 10-tick window (`btn.a(brk,F)`) can be
+    /// applied. Not persisted — vanilla does not keep the window across a reload either.
+    last_hurt_tick: Mutex<Option<u64>>,
     fuse: Mutex<i32>,
     love: Mutex<i32>,
     air: Mutex<i32>,
@@ -2669,6 +2675,7 @@ static GR_MOB_SPAWNING: AtomicU8 = AtomicU8::new(1);
 static GR_MOB_GRIEFING: AtomicU8 = AtomicU8::new(1);
 static GR_NATURAL_REGEN: AtomicU8 = AtomicU8::new(1);
 static GR_MOB_LOOT: AtomicU8 = AtomicU8::new(1);
+static GR_MAX_ENTITY_CRAMMING: AtomicI32 = AtomicI32::new(ENTITY_CRAMMING_DEFAULT);
 // world spawn (vanilla /setworldspawn) + difficulty — both persisted
 static WORLD_SPAWN: Mutex<(f64, f64, f64)> = Mutex::new((0.5, 16.0, 0.5));
 static WORLD_SEED: AtomicU64 = AtomicU64::new(0);
@@ -3503,6 +3510,7 @@ fn keepalive_time_tick() {
                     hp: Mutex::new(20.0),
                     last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                     hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                    last_hurt_tick: Mutex::new(None),
                     fuse: Mutex::new(0),
                     love: Mutex::new(0),
                     air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -3675,6 +3683,7 @@ fn keepalive_time_tick() {
                     hp: Mutex::new(4.0),
                     last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                     hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                    last_hurt_tick: Mutex::new(None),
                     fuse: Mutex::new(0),
                     love: Mutex::new(0),
                     air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -5200,10 +5209,17 @@ fn mob_tick() {
     }
     let mobs_snap: Vec<Arc<Mob>> = mobs().lock().unwrap().iter().cloned().collect();
     let region = region_guard();
+    let grid = EntitySpatialGrid::build_mobs_and_clients(&mobs_snap, &cls_snap);
+    let dead_by_cramming = apply_entity_push_step(&mobs_snap, &cls_snap, &region, &grid);
+    let mut breed_scratch = SpatialScratch::default();
+    let mut breed_cands = Vec::new();
 
     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
     let day = !(13000..=23000).contains(&wt);
-    for m in mobs_snap.iter() {
+    for (mob_idx, m) in mobs_snap.iter().enumerate() {
+        if dead_by_cramming[mob_idx] {
+            continue;
+        }
         let mut mp = m.pos.lock().unwrap();
         // died from last tick's fall/environmental damage
         if *m.hp.lock().unwrap() <= 0.0 {
@@ -5499,11 +5515,14 @@ fn mob_tick() {
             let mut lov = m.love.lock().unwrap();
             if *lov > 0 {
                 *lov -= 1;
-                let partner = mobs_snap.iter().find(|p| {
-                    p.eid != m.eid && p.etype == m.etype && *p.love.lock().unwrap() > 0 && {
-                        let q = p.pos.lock().unwrap();
-                        (q.0 - mp.0).powi(2) + (q.2 - mp.2).powi(2) < 16.0
+                grid.query_radius_xz_into(mp.0, mp.2, 4.0, m.eid, &mut breed_scratch, &mut breed_cands);
+                let partner = breed_cands.iter().find_map(|&slot| {
+                    let ent = &grid.entities[slot as usize];
+                    if !ent.is_mob || ent.etype != m.etype || dead_by_cramming[ent.idx] {
+                        return None;
                     }
+                    let p = &mobs_snap[ent.idx];
+                    (*p.love.lock().unwrap() > 0).then_some(p)
                 });
                 if let Some(p) = partner {
                     *lov = 0;
@@ -5521,6 +5540,7 @@ fn mob_tick() {
                         hp: Mutex::new(20.0),
                         last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                         hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                        last_hurt_tick: Mutex::new(None),
                         fuse: Mutex::new(0),
                         love: Mutex::new(0),
                         air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -6361,6 +6381,7 @@ fn materialize_generation_payloads_inner(
                             hp: Mutex::new(default_mob_hp(&id)),
                             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                            last_hurt_tick: Mutex::new(None),
                             fuse: Mutex::new(0),
                             love: Mutex::new(0),
                             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -7106,6 +7127,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
             hp: Mutex::new(12.0),
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
             fuse: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -10860,6 +10882,11 @@ fn save_world_into(f: &mut Vec<u8>) {
     // from the seed, so two runs of the same seed diverge after a restart.
     (*f).extend_from_slice(b"RNG1");
     (*f).extend_from_slice(&world_rng::saved_state().to_be_bytes());
+    let max_cramming = GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed);
+    if max_cramming != ENTITY_CRAMMING_DEFAULT {
+        (*f).extend_from_slice(b"GCR1");
+        (*f).extend_from_slice(&max_cramming.to_be_bytes());
+    }
     generated.append(f);
     let (sources, generated_blocks, generated_fluids) = worldgen::with_gen(|g| {
         (
@@ -11067,6 +11094,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                 hp: Mutex::new(hp),
                 last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                 hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                last_hurt_tick: Mutex::new(None),
                 fuse: Mutex::new(0),
                 love: Mutex::new(0),
                 air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -11926,12 +11954,23 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
         }
     }
 
+    GR_MAX_ENTITY_CRAMMING.store(ENTITY_CRAMMING_DEFAULT, Ordering::Relaxed);
     // World random state, when the save carries one. A save without it (written before
     // this section existed) leaves the stream at the seed-derived start.
     if p + 4 <= payload.len() && &payload[p..p + 4] == b"RNG1" {
         p += 4;
         if p + 8 <= payload.len() {
             world_rng::restore(u64::from_be_bytes(payload[p..p + 8].try_into().unwrap()));
+            p += 8;
+        }
+    }
+    if p + 4 <= payload.len() && &payload[p..p + 4] == b"GCR1" {
+        p += 4;
+        if p + 4 <= payload.len() {
+            GR_MAX_ENTITY_CRAMMING.store(
+                i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()),
+                Ordering::Relaxed,
+            );
         }
     }
     if let Some(state) = tick_state {
@@ -21499,6 +21538,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
                         etype: et, pos: Mutex::new((x, y, z, 0.0, 0.0)), hp: Mutex::new(20.0),
                         last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                        last_hurt_tick: Mutex::new(None),
                         fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
                     if mobs().lock().unwrap().len() >= MOB_CAP { "mob cap reached".into() } else {
                     mobs().lock().unwrap().push(m);
@@ -22147,7 +22187,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             }
         }
         "gamerule" => {
-            // gamerule <rule> [true|false] — subset wired to real systems
+            // gamerule <rule> [true|false|<int>] — subset wired to real systems
             let rules: &[(&str, &AtomicU8)] = &[
                 ("keepInventory", &GR_KEEP_INVENTORY),
                 ("doDaylightCycle", &GR_DAYLIGHT_CYCLE),
@@ -22157,20 +22197,51 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 ("naturalRegeneration", &GR_NATURAL_REGEN),
                 ("doMobLoot", &GR_MOB_LOOT),
             ];
+            let int_rules: &[(&str, &AtomicI32)] = &[
+                ("maxEntityCramming", &GR_MAX_ENTITY_CRAMMING),
+            ];
             match args.first().copied() {
-                None => rules.iter().map(|(n, r)| format!("{}={}", n, r.load(Ordering::Relaxed) == 1))
-                    .collect::<Vec<_>>().join(", "),
+                None => {
+                    let mut list: Vec<String> = rules
+                        .iter()
+                        .map(|(n, r)| format!("{}={}", n, r.load(Ordering::Relaxed) == 1))
+                        .collect();
+                    list.extend(
+                        int_rules
+                            .iter()
+                            .map(|(n, r)| format!("{}={}", n, r.load(Ordering::Relaxed))),
+                    );
+                    list.join(", ")
+                }
                 Some(name) => {
-                    match rules.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
-                        None => format!("unknown gamerule '{name}' (have: {})",
-                            rules.iter().map(|r| r.0).collect::<Vec<_>>().join(", ")),
-                        Some((_, r)) if args.len() >= 2 => {
-                            let v = match args[1] { "true" => 1u8, "false" => 0,
-                                _ => return format!("usage: /gamerule {name} true|false") };
+                    if let Some((n, r)) = rules.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                        if args.len() >= 2 {
+                            let v = match args[1] {
+                                "true" => 1u8,
+                                "false" => 0,
+                                _ => return format!("usage: /gamerule {name} true|false"),
+                            };
                             r.store(v, Ordering::Relaxed);
                             format!("Gamerule {name} is now set to: {}", v == 1)
+                        } else {
+                            format!("{n} = {}", r.load(Ordering::Relaxed) == 1)
                         }
-                        Some((n, r)) => format!("{n} = {}", r.load(Ordering::Relaxed) == 1),
+                    } else if let Some((n, r)) =
+                        int_rules.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    {
+                        if args.len() >= 2 {
+                            let Ok(v) = args[1].parse::<i32>() else {
+                                return format!("usage: /gamerule {name} <int>");
+                            };
+                            r.store(v, Ordering::Relaxed);
+                            format!("Gamerule {n} is now set to: {v}")
+                        } else {
+                            format!("{n} = {}", r.load(Ordering::Relaxed))
+                        }
+                    } else {
+                        let mut names: Vec<&str> = rules.iter().map(|r| r.0).collect();
+                        names.extend(int_rules.iter().map(|r| r.0));
+                        format!("unknown gamerule '{name}' (have: {})", names.join(", "))
                     }
                 }
             }
@@ -28143,6 +28214,7 @@ fn main() {
                 hp: Mutex::new(20.0),
                 last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                 hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                last_hurt_tick: Mutex::new(None),
                 fuse: Mutex::new(0),
                 love: Mutex::new(0),
                 air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -29385,6 +29457,7 @@ mod mineshaft_runtime_tests {
                 hp: Mutex::new(12.0),
                 last_hit: Mutex::new(Instant::now()),
                 hurt_at: Mutex::new(Instant::now()),
+                last_hurt_tick: Mutex::new(None),
                 fuse: Mutex::new(0),
                 love: Mutex::new(0),
                 air: Mutex::new(60),
@@ -29818,6 +29891,7 @@ mod mineshaft_runtime_tests {
                     hp: Mutex::new(20.0),
                     last_hit: Mutex::new(Instant::now()),
                     hurt_at: Mutex::new(Instant::now()),
+                    last_hurt_tick: Mutex::new(None),
                     fuse: Mutex::new(0),
                     love: Mutex::new(0),
                     air: Mutex::new(60),

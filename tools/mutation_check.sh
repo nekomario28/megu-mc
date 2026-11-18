@@ -3453,6 +3453,44 @@ check "chest_contract_recheck_openers_enforces_reach" \
   '        if !window_live(win) {' \
   tick_tests::chest_contract_recheck_openers_reach_and_lid_close
 
+# Entity push, cramming & spatial grid (M2 Gameplay Slice 4c + M3 P5): 1.21.1 Entity.push & LivingEntity.pushEntities.
+check "entity_push_clamps_inverse_distance_at_one" \
+  src/entity_push.rs '        let scale = (1.0 / d).min(1.0);' \
+  '        let scale = 1.0 / d;' \
+  entity_push_tests::entity_push_exact_constants_sign_clamp_and_guards
+
+check "entity_push_cramming_checks_non_passengers_above_max_minus_one" \
+  src/entity_push.rs '        if non_passengers > (max_cramming - 1) as usize {' \
+  '        if non_passengers >= (max_cramming - 1) as usize {' \
+  entity_push_tests::entity_push_cramming_threshold_passengers_and_gamerule_zero
+
+check "entity_push_no_physics_spectator_skips_impulse" \
+  src/entity_push.rs '    if same_vehicle || self_ent.no_physics || other_ent.no_physics {' \
+  '    if same_vehicle {' \
+  entity_push_tests::entity_push_exact_constants_sign_clamp_and_guards
+
+# The cramming hit is a `LivingEntity.hurt` call, so its invulnerability window gates the rate.
+check "entity_hurt_window_rejects_equal_hits_inside_ten_ticks" \
+  src/entity_push.rs 'const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 10;' \
+  'const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 0;' \
+  entity_push_tests::entity_hurt_window_rejects_equal_hits_for_ten_ticks
+
+# ...and the call site has to ask the window, not just the damage amount, or a pile loses two hits
+# inside two ticks (the integration assertion measures exactly that).
+check "entity_push_cramming_asks_the_hurt_window_before_damaging" \
+  src/entity_push.rs '        if accepted {' \
+  '        if dmg > 0.0 {' \
+  entity_push_tests::entity_push_integration_mob_tick_walls_spectator_cramming_and_breeding
+
+# `bsw.a(Lbsr;Leyi;Leyi$a;Lbsr;)Z` denies a *different-team* candidate when either side is
+# PUSH_OTHER_TEAMS; the constant names read inverted, so the bytecode has to be pinned.
+check "entity_selector_push_other_teams_denies_different_team" \
+  src/entity_push.rs '        || candidate_rule == TeamCollisionRule::PushOtherTeams)
+        && !same_team' \
+  '        || candidate_rule == TeamCollisionRule::PushOtherTeams)
+        && same_team' \
+  entity_push_tests::entity_selector_team_rules_match_the_bytecode_deny_shape
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

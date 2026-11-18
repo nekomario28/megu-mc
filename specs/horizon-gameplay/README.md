@@ -120,3 +120,12 @@ AI・経路探索・戦利品・乗り物なども再利用対象から除外し
 `FlowingFluid.getOwnHeight` / `hasSameAbove` / `getFlow`、`Entity.updateFluidHeightAndDoFluidPushing`（`deflate(0.001)`、Player/Mob の正規化差と `0.014`/`0.007`/`0.0045000000000000005`）、`Entity.updateFluidOnEyes`（1.21.1 `bsr.H()` は `getEyeY()` 直接参照かつ `bubble_column` 除外）、`Entity.isInLava`（`bsr.bt()` の `fluidHeight[LAVA] > 0.0`）を共通所有者
 [`src/entity_fluid.rs`](../../src/entity_fluid.rs) に閉塞し、`Client` 溺水／溶岩・`cart_in_water`・`mob_snap_y`（水中落下ダメージ無効化）・`mob_tick`（水流押し流し・溺水・溶岩接触ダメージ・水による不死系燃焼解除）へ接続した。`src/entity_collision.rs::mob_dimensions` の `cave_spider` ID（`13 -> 16`）も合わせて是正した。
 `LivingEntity.travel` の完全な浮力・水泳速度統合およびネザー `lava` の `0.0023333333333333335` 次元分岐は後続 slice へ分離。
+
+実装済み（Slice 4c + M3 P5）: [Entity Push, Cramming & Spatial Grid (Slice 4c + M3 P5)](entity-push.md) および
+[検証記録](../../evidence/gameplay/entity-push/README.md) で、固定 1.21.1 jar の
+`Entity.push(Entity)`（`0.01F`/`0.05F`、`(1.0 / d).min(1.0)`、`noPhysics`/spectator/`isVehicle`/`isPushable` 除外）、
+`LivingEntity.pushEntities()` + `EntitySelector.pushableBy`（`ArmorStand`/`Bat` 非押し出し、team collision rule モデル化）、
+`maxEntityCramming`（`dcs.u` 既定 `24`、非搭乗エンティティ `> max - 1` かつ `rand_int(4) == 0` で `6.0F` ダメージ＋`0x24`/`mob_env_die`、`/gamerule maxEntityCramming` と `GCR1` 永続化）を
+[`src/entity_push.rs`](../../src/entity_push.rs) に閉塞し、チャンク境界対応・`O(1)` 償却近傍探索の
+[`src/entity_spatial.rs`](../../src/entity_spatial.rs) (`EntitySpatialGrid`) 経由で `mob_tick` の押し合い (`mob_collide_move` + `0x70` + `Client` へ `0x5a`) と繁殖相手探索 (`O(N^2)` 走査置換) へ接続した。
+

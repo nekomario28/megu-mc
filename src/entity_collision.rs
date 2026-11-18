@@ -328,6 +328,8 @@ fn step_entity_move(
 /// 1.21.1 `EntityType.<clinit>` (`bsx.javap`) bounding-box `(width, height)`.
 fn mob_dimensions(etype: i64) -> (f32, f32) {
     match etype {
+        3 => (0.5, 1.975),  // armor_stand
+        6 => (0.5, 0.9),    // bat
         16 => (0.7, 0.5),   // cave_spider
         19 => (0.4, 0.7),   // chicken
         22 => (0.9, 1.4),   // cow
@@ -672,6 +674,7 @@ mod entity_collision_tests {
                 hp: Mutex::new(20.0),
                 last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                 hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                last_hurt_tick: Mutex::new(None),
                 fuse: Mutex::new(0),
                 love: Mutex::new(0),
                 air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),

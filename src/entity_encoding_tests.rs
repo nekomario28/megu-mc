@@ -48,6 +48,7 @@ fn entity_angles_spawn_matches_native_constructors() {
         hp: Mutex::new(20.0),
         last_hit: Mutex::new(Instant::now()),
         hurt_at: Mutex::new(Instant::now()),
+        last_hurt_tick: Mutex::new(None),
         fuse: Mutex::new(0),
         love: Mutex::new(0),
         air: Mutex::new(300),

@@ -21,7 +21,7 @@ TICK_STAGES = {
     "environment", "hot_regions", "scheduled_blocks", "generated_fluids",
     "generated_content", "interest", "drops", "arrows", "tnt", "furnaces",
     "hoppers", "water", "lava", "observers", "plugins", "actors", "mobs",
-    "spawners", "carts", "falling", "random_ticks", "block_updates",
+    "spawners", "carts", "falling", "random_ticks", "block_updates", "chest_viewers",
 }
 
 
