@@ -3387,6 +3387,26 @@ check "entity_collide_block_window_catches_1_5_fence" \
   '    let by0 = (min[1] - 1e-7).floor() as i32;' \
   entity_collision_tests::entity_collide_fence_1_5_block_prevents_step_over_and_catches_window
 
+# Fluid height, eye immersion, fluid push & lava contact (M2 Gameplay Slice 4b): 1.21.1 FlowingFluid & Entity fluid contracts.
+check "entity_fluid_has_same_above_returns_full_height" \
+  src/entity_fluid.rs '    let h = if fluid_has_same_above_with(fs.kind, x, y, z, get_block) {
+        1.0f32
+    } else {' \
+  '    let h = if false && fluid_has_same_above_with(fs.kind, x, y, z, get_block) {
+        1.0f32
+    } else {' \
+  entity_fluid_tests::entity_fluid_height_and_has_same_above_water_lava_waterlogged_and_kelp
+
+check "entity_fluid_is_in_lava_uses_0_001_deflate" \
+  src/entity_fluid.rs '    let deflated = aabb.deflate(0.001);' \
+  '    let deflated = aabb.deflate_xyz(0.1, 0.4, 0.1);' \
+  entity_fluid_tests::entity_fluid_is_in_lava_deflate_0_001_boundary_and_flowing_lava
+
+check "entity_fluid_eye_immersion_respects_pose_and_surface" \
+  src/entity_fluid.rs '    fk == kind && f64::from(by as f32 + h) > eye_y' \
+  '    fk == kind' \
+  entity_fluid_tests::entity_fluid_eye_immersion_player_poses_and_mobs
+
 # Chest world-side contract (M2 Gameplay Slice 3c):
 # `ChestBlock.isChestBlockedAt` on both halves, multi-viewer `broadcastChanges`, and `recheckOpeners`.
 check "chest_contract_double_chest_blocks_when_either_half_blocked" \

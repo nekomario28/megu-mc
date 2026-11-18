@@ -114,3 +114,9 @@ AI・経路探索・戦利品・乗り物なども再利用対象から除外し
 [`src/entity_collision.rs`](../../src/entity_collision.rs) に閉塞し、`CartRuntimeWorld::move_cart`
 と `mob_tick` の水平移動（`Attributes.STEP_HEIGHT = 0.6` と `EntityType` 寸法）へ接続した。
 `LivingEntity.travel` の重力・流体・完全な落下統合および entity-entity 押し戻しは後続 slice へ分離。
+
+実装済み（Slice 4b）: [Entity Fluid Height, Eye Immersion, Fluid Push & Lava Contact (Slice 4b)](entity-fluid.md) および
+[検証記録](../../evidence/gameplay/entity-fluid/README.md) で、固定 1.21.1 jar の
+`FlowingFluid.getOwnHeight` / `hasSameAbove` / `getFlow`、`Entity.updateFluidHeightAndDoFluidPushing`（`deflate(0.001)`、Player/Mob の正規化差と `0.014`/`0.007`/`0.0045000000000000005`）、`Entity.updateFluidOnEyes`（1.21.1 `bsr.H()` は `getEyeY()` 直接参照かつ `bubble_column` 除外）、`Entity.isInLava`（`bsr.bt()` の `fluidHeight[LAVA] > 0.0`）を共通所有者
+[`src/entity_fluid.rs`](../../src/entity_fluid.rs) に閉塞し、`Client` 溺水／溶岩・`cart_in_water`・`mob_snap_y`（水中落下ダメージ無効化）・`mob_tick`（水流押し流し・溺水・溶岩接触ダメージ・水による不死系燃焼解除）へ接続した。`src/entity_collision.rs::mob_dimensions` の `cave_spider` ID（`13 -> 16`）も合わせて是正した。
+`LivingEntity.travel` の完全な浮力・水泳速度統合およびネザー `lava` の `0.0023333333333333335` 次元分岐は後続 slice へ分離。

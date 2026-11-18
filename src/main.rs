@@ -37,6 +37,7 @@ mod world_rng;
 mod worldgen;
 include!("paletted.rs");
 include!("entity_collision.rs");
+include!("entity_fluid.rs");
 
 // ---------- varint / wire ----------
 fn read_varint(b: &mut &[u8]) -> Option<i64> {
@@ -396,14 +397,7 @@ impl EntityAabb {
 /// `Player` (`cmx.<clinit>`) has `0.6f x 1.8f` standing, `0.6f x 1.5f` crouching,
 /// `0.6f x 0.6f` fall-flying.
 fn player_touch_aabb(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> EntityAabb {
-    let height = if fall_fly {
-        0.6
-    } else if sneaking {
-        1.5
-    } else {
-        1.8
-    };
-    EntityAabb::from_dimensions(x, y, z, 0.6, height).inflate(1.0, 0.5, 1.0)
+    player_bounding_box(x, y, z, sneaking, fall_fly).inflate(1.0, 0.5, 1.0)
 }
 impl Client {
     fn is_spectator(&self) -> bool {
@@ -2059,13 +2053,25 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
     // spawn streams via interest_tick
 }
 fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
-    if mob_has_support(m.etype, mp.0, mp.1, mp.2) {
+    if mob_has_support(m.etype, mp.0, mp.1, mp.2) || mob_in_water(m.etype, mp.0, mp.1, mp.2) {
         return;
     }
     // snap to ground surface; while buried only allow snaps within step height
     // so a fully enclosed mob cannot teleport out through solid blocks
     let (land_x, land_z) = (mp.0.floor() as i32, mp.2.floor() as i32);
     let mut sy = surface_y(land_x, land_z);
+    let mut landed_in_water = false;
+    while sy > MIN_Y as f64 {
+        let below = block_at(land_x, sy as i32 - 1, land_z);
+        if !fluid_blocks_motion(below)
+            && entity_fluid_state_of(below).is_some_and(|fs| fs.kind == EntityFluidKind::Water)
+        {
+            landed_in_water = true;
+            sy -= 1.0;
+        } else {
+            break;
+        }
+    }
     if (4286..=4293).contains(&block_at(land_x, sy as i32 - 1, land_z)) {
         sy -= 1.0 / 16.0;
     }
@@ -2079,13 +2085,15 @@ fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
             }
             yy += 1;
         }
-        let converted = landing::cow_land(
-            m,
-            (land_x, (sy - 0.2).floor() as i32, land_z),
-            (mp.1 - sy) as f32,
-        );
-        // fall damage on descent >3 blocks; chicken/cat/ocelot immune (vanilla)
-        if mp.1 - sy > 3.0 && !matches!(m.etype, 19 | 15 | 72) {
+        landed_in_water |= mob_in_water(m.etype, mp.0, sy, mp.2);
+        let converted = !landed_in_water
+            && landing::cow_land(
+                m,
+                (land_x, (sy - 0.2).floor() as i32, land_z),
+                (mp.1 - sy) as f32,
+            );
+        // fall damage on descent >3 blocks; chicken/cat/ocelot immune (vanilla); water resets fall distance
+        if !landed_in_water && mp.1 - sy > 3.0 && !matches!(m.etype, 19 | 15 | 72) {
             let mut hp = m.hp.lock().unwrap();
             *hp -= (mp.1 - sy - 3.0).floor() as f32;
             drop(hp);
@@ -3149,14 +3157,11 @@ fn keepalive_time_tick() {
                 *h = (*h - 1.0).max(1.0);
                 dirty = true;
             }
+            let sneaking = *c.sneaking.lock().unwrap();
+            let fall_fly = *c.fall_fly.lock().unwrap();
             {
-                // drowning: head in water drains air, then 2hp/s
-                let wst = name_to_state("water").unwrap_or(u32::MAX);
-                let submerged = block_at(
-                    px.floor() as i32,
-                    (py + 1.62).floor() as i32,
-                    pz.floor() as i32,
-                ) == wst;
+                // drowning: 1.21.1 Entity.updateFluidOnEyes + LivingEntity.baseTick (!bubble_column)
+                let submerged = player_drowning_submerged(px, py, pz, sneaking, fall_fly);
                 let mut air = c.air.lock().unwrap();
                 if !submerged {
                     *air = server_ticks(AIR_SUPPLY_GT) as i32;
@@ -3184,21 +3189,9 @@ fn keepalive_time_tick() {
                 }
             }
             {
-                // lava: feet in lava -> 4hp/tick-ish (vanilla 4hp/0.5s; ours every 2 ticks)
-                let lst = name_to_state("lava").unwrap_or(u32::MAX);
+                // lava: 1.21.1 Entity.isInLava (fluidHeight[LAVA] > 0.0 with deflate(0.001))
                 let fire_immune = c.effs.lock().unwrap().iter().any(|e| e.id == 11);
-                let in_lava = !fire_immune
-                    && block_at(
-                        px.floor() as i32,
-                        (py - 0.2).floor() as i32,
-                        pz.floor() as i32,
-                    ) == lst
-                    || block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32) == lst
-                    || block_at(
-                        px.floor() as i32,
-                        (py + 1.0).floor() as i32,
-                        pz.floor() as i32,
-                    ) == lst;
+                let in_lava = !fire_immune && player_in_lava(px, py, pz, sneaking, fall_fly);
                 if in_lava && t.is_multiple_of(server_ticks(10)) {
                     *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
                     dirty = true;
@@ -5242,14 +5235,46 @@ fn mob_tick() {
                 continue;
             }
         }
-        // drowning: head cell in water drains air (15s), then 2hp/s; undead don't drown
+        let water_state = mob_water_state(m.etype, mp.0, mp.1, mp.2);
+        if water_state.in_fluid {
+            if matches!(m.etype, 124 | 91) {
+                *m.fuse.lock().unwrap() = 0;
+            }
+            if water_state.push[0] != 0.0 || water_state.push[2] != 0.0 {
+                let (prev_x, prev_z) = (mp.0, mp.2);
+                mob_collide_move(m, &mut mp, water_state.push[0], water_state.push[2]);
+                if (mp.0 - prev_x).abs() > 1e-9 || (mp.2 - prev_z).abs() > 1e-9 {
+                    let (x, y, z, yaw, pitch) = *mp;
+                    let on_ground = mob_has_support(m.etype, x, y, z);
+                    broadcast_seen(m.eid, |_c| {
+                        (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, on_ground))
+                    });
+                }
+            }
+        }
+        // lava contact: 1.21.1 Entity.isInLava + EntityType$Builder.fireImmune
+        if !mob_fire_immune(m.etype)
+            && mob_in_lava(m.etype, mp.0, mp.1, mp.2)
+            && TICK
+                .load(Ordering::Relaxed)
+                .is_multiple_of(server_ticks(10))
+        {
+            let mut hp = m.hp.lock().unwrap();
+            *hp -= 4.0;
+            let dead = *hp <= 0.0;
+            drop(hp);
+            broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
+            if dead {
+                let (mx, my, mz) = (mp.0, mp.1, mp.2);
+                let et = m.etype;
+                drop(mp);
+                mob_env_die(m.eid, et, mx, my, mz, true);
+                continue;
+            }
+        }
+        // drowning: 1.21.1 Entity.updateFluidOnEyes + LivingEntity.baseTick (!bubble_column); undead don't drown
         if !matches!(m.etype, 124 | 91) {
-            let wst = name_to_state("water").unwrap_or(u32::MAX);
-            let submerged = block_at(
-                mp.0.floor() as i32,
-                (mp.1 + 1.0).floor() as i32,
-                mp.2.floor() as i32,
-            ) == wst;
+            let submerged = mob_drowning_submerged(m.etype, mp.0, mp.1, mp.2);
             let mut air = m.air.lock().unwrap();
             if !submerged {
                 *air = server_ticks(AIR_SUPPLY_GT) as i32;
@@ -5274,8 +5299,8 @@ fn mob_tick() {
                 }
             }
         }
-        // undead burn in daylight with clear sky
-        if day && matches!(m.etype, 124 | 91) {
+        // undead burn in daylight with clear sky (suppressed in water: Entity.baseTick clearFire)
+        if day && matches!(m.etype, 124 | 91) && !water_state.in_fluid {
             let (bx, by, bz) = (
                 mp.0.round() as i32,
                 mp.1.round() as i32,
@@ -6746,25 +6771,7 @@ fn cart_comparator_signal(slots: &HashMap<i16, Stack>) -> i32 {
     }
 }
 fn cart_in_water(pos: [f64; 3]) -> bool {
-    let Some(reg) = crate::block_registry::breg() else {
-        return false;
-    };
-    let x0 = (pos[0] - 0.489).floor() as i32;
-    let x1 = (pos[0] + 0.489).floor() as i32;
-    let y0 = (pos[1] + 0.001).floor() as i32;
-    let y1 = (pos[1] + 0.699).floor() as i32;
-    let z0 = (pos[2] - 0.489).floor() as i32;
-    let z1 = (pos[2] + 0.489).floor() as i32;
-    for by in y0..=y1 {
-        for bz in z0..=z1 {
-            for bx in x0..=x1 {
-                if reg.has_water(block_at(bx, by, bz)) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    aabb_in_water(EntityAabb::from_dimensions(pos[0], pos[1], pos[2], 0.98, 0.7))
 }
 struct CartRuntimeWorld;
 impl crate::minecart::World for CartRuntimeWorld {

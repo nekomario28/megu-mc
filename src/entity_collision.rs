@@ -328,7 +328,7 @@ fn step_entity_move(
 /// 1.21.1 `EntityType.<clinit>` (`bsx.javap`) bounding-box `(width, height)`.
 fn mob_dimensions(etype: i64) -> (f32, f32) {
     match etype {
-        13 => (0.7, 0.5),   // cave_spider
+        16 => (0.7, 0.5),   // cave_spider
         19 => (0.4, 0.7),   // chicken
         22 => (0.9, 1.4),   // cow
         23 => (0.6, 1.7),   // creeper
