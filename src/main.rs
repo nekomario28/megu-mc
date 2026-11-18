@@ -16625,6 +16625,18 @@ fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
 }
 
 // ---------- chunks ----------
+/// Slots in the palette writer's stack hash table: a power of two above twice the largest
+/// palette a call can build (256 entries), so the probe run at a 50% load factor is short.
+const PAL_SLOTS: usize = 512;
+/// `PalSlots::vals` marker for a free slot. A palette index never reaches it (max 256).
+const PAL_FREE: u16 = u16::MAX;
+/// Entries the stack palette has room for: the larger of the two ceilings a caller can reach
+/// (`1 << max_bits`, i.e. 256 for block states, 8 for quart biomes), so one shape serves both.
+const PAL_MAX_VALUES: usize = 1 << 8;
+/// Cells in one section: the stack index buffer is this long. A longer input (a caller passing
+/// a slice it built itself) falls back to a `Vec` rather than truncating.
+const PAL_STACK_CELLS: usize = 4096;
+
 /// One network palette writer for block states and quart biomes. Values never
 /// straddle longs; global mode writes registry IDs, without a local palette.
 fn write_palette(
@@ -16634,47 +16646,216 @@ fn write_palette(
     max_bits: usize,
     global_bits: usize,
 ) {
-    let mut palette = Vec::new();
-    let mut lookup = HashMap::new();
-    let indices: Vec<_> = values
-        .iter()
-        .map(|&value| {
-            *lookup.entry(value).or_insert_with(|| {
-                let index = palette.len();
-                palette.push(value);
-                index
-            })
-        })
-        .collect();
-    if palette.len() == 1 {
-        out.push(0);
-        write_varint(out, palette[0]);
+    write_palette_core(
+        out,
+        values.len(),
+        |i| values[i],
+        min_bits,
+        max_bits,
+        global_bits,
+    )
+}
+
+/// [`write_palette`] over the section's own `[u32; 4096]`: the block-state path does not widen
+/// the array into `[i64; 4096]` first, which was a 32 KiB copy per section (24 per chunk).
+fn write_palette_u32(
+    out: &mut Vec<u8>,
+    values: &[u32],
+    min_bits: usize,
+    max_bits: usize,
+    global_bits: usize,
+) {
+    write_palette_core(
+        out,
+        values.len(),
+        |i| i64::from(values[i]),
+        min_bits,
+        max_bits,
+        global_bits,
+    )
+}
+
+/// The stack-resident half of the palette writer: value -> palette index by open addressing,
+/// and the palette itself in first-seen order.
+///
+/// This is why an encode allocates nothing. The writer used to build three heap objects per
+/// call - a SipHash `HashMap`, a palette `Vec` and an index `Vec` - and a chunk encodes 48
+/// arrays (24 sections x block states + quart biomes), so that was 144 allocations plus a
+/// SipHash per distinct value per chunk. The work is identical; only the memory moved.
+struct PalSlots {
+    keys: [i64; PAL_SLOTS],
+    vals: [u16; PAL_SLOTS],
+    palette: [i64; PAL_MAX_VALUES],
+}
+
+/// Where a value sits in the table: an existing palette index, or the free slot it would take.
+/// One probe answers both, so a miss costs one pass rather than a lookup followed by an insert.
+enum PalProbe {
+    Hit(u16),
+    Free(usize),
+}
+
+#[inline]
+fn pal_hash(value: i64) -> usize {
+    // A small state id's informative bits are the low ones, so a multiply-mix spreads them and
+    // the high bits of the product become the slot. The constant is the 64-bit Weyl
+    // (golden-ratio) odd multiplier.
+    ((value as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 55) as usize
+}
+
+impl PalSlots {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            keys: [0; PAL_SLOTS],
+            vals: [PAL_FREE; PAL_SLOTS],
+            palette: [0; PAL_MAX_VALUES],
+        }
+    }
+
+    #[inline]
+    fn probe(&self, value: i64) -> PalProbe {
+        let mut slot = pal_hash(value);
+        loop {
+            let index = self.vals[slot];
+            if index == PAL_FREE {
+                return PalProbe::Free(slot);
+            }
+            if self.keys[slot] == value {
+                return PalProbe::Hit(index);
+            }
+            slot = (slot + 1) & (PAL_SLOTS - 1);
+        }
+    }
+}
+
+/// Bits a palette of `distinct` entries needs: `ceil(log2(distinct))`, as before.
+#[inline]
+fn palette_bits(distinct: usize) -> usize {
+    (usize::BITS - (distinct - 1).leading_zeros()) as usize
+}
+
+/// One non-straddling u64 word per `64 / bits` cells, zero-padded in the trailing slots.
+/// `entry` returns the value to pack: a palette index for the indirect form, the state itself
+/// for the direct one. Neither is masked to `bits` - the caller's ids fit, and masking here
+/// would be a behaviour change for a value that did not.
+#[inline]
+fn write_packed_words(
+    out: &mut Vec<u8>,
+    bits: usize,
+    len: usize,
+    mut entry: impl FnMut(usize) -> u64,
+) {
+    let per = 64 / bits;
+    write_varint(out, len.div_ceil(per) as i64);
+    let mut base = 0usize;
+    while base < len {
+        let end = (base + per).min(len);
+        let mut word = 0u64;
+        for cell in base..end {
+            word |= entry(cell) << ((cell - base) * bits);
+        }
+        out.extend_from_slice(&word.to_be_bytes());
+        base = end;
+    }
+}
+
+/// The writer both palette entry points share. `get` reads the n-th value: `[i64]` for quart
+/// biomes, `[u32]` for block states.
+fn write_palette_core(
+    out: &mut Vec<u8>,
+    len: usize,
+    get: impl Fn(usize) -> i64,
+    min_bits: usize,
+    max_bits: usize,
+    global_bits: usize,
+) {
+    // No values: there is no palette to build and nothing to index. The allocating writer took
+    // its direct branch here by wrapping `len - 1`; say it rather than rely on the wrap.
+    if len == 0 {
+        out.push(global_bits as u8);
         write_varint(out, 0);
         return;
     }
-    let bits = ((usize::BITS - (palette.len() - 1).leading_zeros()) as usize).max(min_bits);
-    let direct = bits > max_bits;
-    let bits = if direct { global_bits } else { bits };
+    // One value: no table, no index buffer, no allocation. A chunk's 24 sections are mostly
+    // uniform (all air above the surface, all stone below it), so this path carries most of
+    // the encodes.
+    let first = get(0);
+    let mut uniform = true;
+    for i in 1..len {
+        if get(i) != first {
+            uniform = false;
+            break;
+        }
+    }
+    if uniform {
+        out.push(0);
+        write_varint(out, first);
+        write_varint(out, 0);
+        return;
+    }
+    // The indirect form's ceiling: 256 entries for block states (`max_bits = 8`), 8 for quart
+    // biomes (`max_bits = 3`). Past it the section is packed directly, with no local palette.
+    //
+    // The assert is the invariant the stack buffers rest on: a wider palette would overrun
+    // `palette` and fill the probe table past the load factor that bounds it. It is a branch on
+    // a constant at every call site.
+    assert!(
+        max_bits <= 8,
+        "the stack palette holds {PAL_MAX_VALUES} entries, so max_bits may not exceed 8"
+    );
+    let max_distinct = 1usize << max_bits;
+    let mut table = PalSlots::new();
+    let mut stack = [0u16; PAL_STACK_CELLS];
+    let mut heap: Vec<u16> = Vec::new();
+    let indices: &mut [u16] = if len <= PAL_STACK_CELLS {
+        &mut stack[..len]
+    } else {
+        heap.resize(len, 0);
+        &mut heap[..]
+    };
+    let mut distinct = 0usize;
+    // Stop building the palette the moment it cannot address the section: the direct form
+    // needs no indices at all, so abandoning the buffer here saves the rest of the pass.
+    let mut direct = false;
+    for (i, slot) in indices.iter_mut().enumerate() {
+        let value = get(i);
+        match table.probe(value) {
+            PalProbe::Hit(index) => *slot = index,
+            PalProbe::Free(free) => {
+                if distinct == max_distinct {
+                    direct = true;
+                    break;
+                }
+                table.keys[free] = value;
+                table.vals[free] = distinct as u16;
+                table.palette[distinct] = value;
+                *slot = distinct as u16;
+                distinct += 1;
+            }
+        }
+    }
+    // At most `max_distinct` entries reach here, so the width cannot exceed `max_bits`; the
+    // min-clamp is what lifts a tiny palette (2..=8 block states, 2..=4 biomes) to 4 and 1 bits.
+    let indirect_bits = palette_bits(distinct).max(min_bits);
+    let direct = direct || indirect_bits > max_bits;
+    let bits = if direct { global_bits } else { indirect_bits };
     out.push(bits as u8);
     if !direct {
-        write_varint(out, palette.len() as i64);
-        for &value in &palette {
+        write_varint(out, distinct as i64);
+        for &value in &table.palette[..distinct] {
             write_varint(out, value);
         }
-    }
-    let per = 64 / bits;
-    write_varint(out, values.len().div_ceil(per) as i64);
-    for (chunk, indexed) in values.chunks(per).zip(indices.chunks(per)) {
-        let mut word = 0u64;
-        for (i, (&value, &index)) in chunk.iter().zip(indexed).enumerate() {
-            let entry = if direct { value as u64 } else { index as u64 };
-            word |= entry << (i * bits);
-        }
-        out.extend_from_slice(&word.to_be_bytes());
+        write_packed_words(out, bits, len, |cell| u64::from(indices[cell]));
+    } else {
+        write_packed_words(out, bits, len, |cell| get(cell) as u64);
     }
 }
-fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
-    let mut out = Vec::new();
+
+/// One section's payload, appended to `out`: the non-air count, the block-state palette and the
+/// quart-biome palette. Writing into a caller's buffer is what keeps the 48 default-sized
+/// `Vec`s a chunk used to allocate out of the delivery path.
+fn section_encode_into(out: &mut Vec<u8>, states: &[u32; 4096], biomes: &[i64; 64]) {
     // Protocol-767 air/void_air/cave_air IDs; do not depend on optional
     // cross-version metadata to decide the section's wire count.
     let non_air = states
@@ -16683,9 +16864,14 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
         .count() as i16;
     out.extend_from_slice(&non_air.to_be_bytes());
     // The pinned registry has 26684 block states, requiring fifteen global bits.
-    write_palette(&mut out, &states.map(i64::from), 4, 8, 15);
+    write_palette_u32(out, states, 4, 8, 15);
     // The protocol-767 configuration registry has 64 biome IDs (six global bits).
-    write_palette(&mut out, biomes, 1, 3, 6);
+    write_palette(out, biomes, 1, 3, 6);
+}
+
+fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    section_encode_into(&mut out, states, biomes);
     out
 }
 
@@ -16859,69 +17045,90 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
     // path that needs both takes them in that order, and this pass must not be the one that
     // reverses it.
     let lava: Vec<(i32, i32, i32)> = lavas().lock().unwrap().iter().copied().collect();
-    // The 3x3 window's edits, copied under one short lock, then read without it.
+    // Sources are collected under one short lock, **by reference**: the 3x3 window's edit maps
+    // are copied only once something has to be lit.
     //
     // This pass used to hold `world()` from here to the end: it reads a cell per neighbour
     // per visited cell (tens of thousands of reads for a single torch), and taking the
     // mutex per read was what made this the expensive half of the light work. Holding it
     // instead meant every tick-thread read queued behind a whole light pass. The copy is
     // the window's own edit maps — a handful of entries per chunk, empty on fresh chunks.
-    let w: HashMap<(i32, i32), HashMap<u32, u32>> = {
-        let guard = world().lock().unwrap();
-        (-1..=1)
-            .flat_map(|dx| (-1..=1).map(move |dz| (cx + dx, cz + dz)))
-            .filter_map(|k| guard.get(&k).map(|c| (k, c.clone())))
-            .collect()
-    };
+    //
+    // The copy is skipped entirely when the window holds no emitter, which is the common case
+    // and the one the call is measured on: a fresh chunk has no edits at all, so the nine
+    // clones bought nothing. So the scan runs first, over the maps themselves, and the maps
+    // are cloned afterwards only for the spread's opacity lookups.
     let mut sources: Vec<((i32, i32, i32), u8)> = Vec::new();
-    // Generated light sources for this chunk and the eight neighbours (recorded by `chunk_data`
-    // as each was streamed). `block_light_sections_from` clips them to the search area, so an
-    // emitter across a border lights this chunk exactly as if it were inside it. A cell the
-    // overlay now holds is skipped: the overlay scan below decides its live emission, so a
-    // generated lava the player has since removed does not light again.
-    for dx in -1..=1 {
-        for dz in -1..=1 {
-            let Some(g) = gen.get(&(cx + dx, cz + dz)) else {
-                continue;
-            };
-            for (p, lum) in g {
-                if w.get(&(p.0 >> 4, p.2 >> 4))
-                    .and_then(|c| c.get(&local_idx(p.0, p.1, p.2)))
-                    .is_some()
-                {
+    let mut w: HashMap<(i32, i32), HashMap<u32, u32>> = HashMap::new();
+    {
+        let guard = world().lock().unwrap();
+        // Generated light sources for this chunk and the eight neighbours (recorded by
+        // `chunk_data` as each was streamed). `block_light_sections_from` clips them to the
+        // search area, so an emitter across a border lights this chunk exactly as if it were
+        // inside it. A cell the overlay now holds is skipped: the overlay scan below decides
+        // its live emission, so a generated lava the player has since removed does not light
+        // again.
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let Some(g) = gen.get(&(cx + dx, cz + dz)) else {
                     continue;
+                };
+                for (p, lum) in g {
+                    if guard
+                        .get(&(p.0 >> 4, p.2 >> 4))
+                        .and_then(|c| c.get(&local_idx(p.0, p.1, p.2)))
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    sources.push((*p, *lum));
                 }
-                sources.push((*p, *lum));
             }
         }
-    }
-    for dx in -1..=1 {
-        for dz in -1..=1 {
-            let (ncx, ncz) = (cx + dx, cz + dz);
-            let Some(col) = w.get(&(ncx, ncz)) else {
-                continue;
-            };
-            for (idx, st) in col {
-                let lum = reg.luminance_of(*st);
-                if lum == 0 {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let (ncx, ncz) = (cx + dx, cz + dz);
+                let Some(col) = guard.get(&(ncx, ncz)) else {
                     continue;
+                };
+                for (idx, st) in col {
+                    let lum = reg.luminance_of(*st);
+                    if lum == 0 {
+                        continue;
+                    }
+                    let x = ncx * 16 + (*idx & 15) as i32;
+                    let z = ncz * 16 + ((*idx >> 4) & 15) as i32;
+                    let y = (*idx >> 8) as i32 + MIN_Y;
+                    sources.push(((x, y, z), lum));
                 }
-                let x = ncx * 16 + (*idx & 15) as i32;
-                let z = ncz * 16 + ((*idx >> 4) & 15) as i32;
-                let y = (*idx >> 8) as i32 + MIN_Y;
-                sources.push(((x, y, z), lum));
             }
         }
-    }
-    for (x, y, z) in lava {
-        sources.push(((x, y, z), 15));
-    }
-    // Nothing to light: return before the height map is built. Building it unconditionally cost
-    // this call 45 microseconds on a chunk with no source, against 5.5 before, which is the
-    // common case - measured, and the reason the early return is here rather than inside the
-    // spread.
-    if sources.is_empty() {
-        return vec![[0u8; 2048]; 26];
+        // The tracked lava is a source only inside this chunk's search area, which is exactly
+        // what `block_light_sections_from` would filter it to; dropping it here instead means a
+        // chunk whose only candidate is remote lava takes the empty path below.
+        for (x, y, z) in &lava {
+            if within_search(cx, cz, *x, *y, *z) {
+                sources.push(((*x, *y, *z), 15));
+            }
+        }
+        // Nothing to light: return before the window is copied and before the height map is
+        // built. Building the height map unconditionally cost this call 45 microseconds on a
+        // chunk with no source, against 5.5 before, which is the common case - measured, and
+        // the reason the early return is here rather than inside the spread.
+        if sources.is_empty() {
+            drop(guard);
+            return vec![[0u8; 2048]; 26];
+        }
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let key = (cx + dx, cz + dz);
+                if let Some(col) = guard.get(&key) {
+                    if !col.is_empty() {
+                        w.insert(key, col.clone());
+                    }
+                }
+            }
+        }
     }
     // The heights for the search area, once. A dense row per z rather than a map: the closure
     // is called six times per visited cell, and a hash lookup there would cost what the
@@ -16979,28 +17186,156 @@ fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     sky_light_sections_from(cx, cz, &floors)
 }
 
-/// One section's 2048 bytes from a level function, in the client's layout: for each y,
-/// each z, eight bytes carrying the sixteen x values as nibbles. Both light kinds need this
-/// and a wrong index lights the wrong column with nothing else to notice, so it has one
-/// owner.
 /// Sky light that arrives sideways, which the per-column rule cannot produce: a window or a cave
 /// mouth lights what is beside it and a column test lights only what is above it.
 ///
 /// The seed is the lit cell just above each column's floor (the cell the per-column rule lights).
 /// A cave with a solid ceiling seeds from the cell above the ceiling, which is its own sky; the
 /// light that reaches inside it arrives through the opening, and the BFS only enters dark cells.
+///
+/// The result is a **dense flat grid**, not a `HashMap<(i32, i32, i32), u8>`. The BFS visits
+/// tens of thousands of cells and the map hashing cost what the arithmetic it saved did — the
+/// same conclusion `block_light_sections_from` reached and wrote down. The box is exact rather
+/// than generous: a seed starts at level 15, every step costs at least one, and a level of 1 or
+/// less stops, so nothing more than fourteen blocks from a seed can be lit, and nothing more
+/// than fifteen can be reached horizontally (`W = D = 46`, the centre chunk plus one of margin).
+struct SkySpill {
+    x0: i32,
+    z0: i32,
+    y0: i32,
+    w: usize,
+    d: usize,
+    h: usize,
+    light: Vec<u8>,
+    /// Every cell the spread lit, as a flat index and its level, in the order it was set. The
+    /// applier walks this rather than the whole box: the box is one cell per layer of the 3x3
+    /// window, and most of it stays dark, so scanning it cost more than the BFS saved.
+    lit: Vec<(u32, u8)>,
+}
+
+impl Default for SkySpill {
+    /// No box: a grid that holds nothing and applies nothing. Used by the mutation campaign,
+    /// which replaces the build with `Default::default()` and requires the light assembly test
+    /// to notice the missing spill.
+    fn default() -> Self {
+        Self {
+            x0: 0,
+            z0: 0,
+            y0: 0,
+            w: 0,
+            d: 0,
+            h: 0,
+            light: Vec::new(),
+            lit: Vec::new(),
+        }
+    }
+}
+
+impl SkySpill {
+    #[inline]
+    fn index(&self, x: i32, y: i32, z: i32) -> usize {
+        (((y - self.y0) as usize) * self.d + ((z - self.z0) as usize)) * self.w
+            + ((x - self.x0) as usize)
+    }
+
+    /// The level at a world position, `None` outside the box. A cell inside it that no seed or
+    /// step reached reads as `Some(&0)`, so a caller merging levels sees no light either way.
+    /// The map-shaped accessor the spill's own behavioural test drives, kept so that test states
+    /// positions rather than flat indices.
+    #[cfg(test)]
+    fn get(&self, key: &(i32, i32, i32)) -> Option<&u8> {
+        let (x, y, z) = *key;
+        if self.w == 0
+            || !(self.x0..self.x0 + self.w as i32).contains(&x)
+            || !(self.z0..self.z0 + self.d as i32).contains(&z)
+            || !(self.y0..self.y0 + self.h as i32).contains(&y)
+        {
+            return None;
+        }
+        self.light.get(self.index(x, y, z))
+    }
+
+    /// Raise the centre chunk's packed nibbles to this grid's levels.
+    fn raise_into(&self, cx: i32, cz: i32, out: &mut [[u8; 2048]]) {
+        let plane = self.w * self.d;
+        for &(at, level) in &self.lit {
+            let at = at as usize;
+            let x = self.x0 + (at % self.w) as i32;
+            let z = self.z0 + ((at / self.w) % self.d) as i32;
+            let y = self.y0 + (at / plane) as i32;
+            raise_sky_nibble(out, cx, cz, x, y, z, level);
+        }
+    }
+}
+
+/// Raise one cell's nibble in the packed 26-section sky-light output. The single owner of the
+/// layout arithmetic: both the map-shaped composition the tests drive and the dense grid above
+/// write through it.
+fn raise_sky_nibble(
+    out: &mut [[u8; 2048]],
+    cx: i32,
+    cz: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    level: u8,
+) {
+    if x.div_euclid(16) != cx
+        || z.div_euclid(16) != cz
+        || !(LIGHT_MIN_Y..LIGHT_MIN_Y + 26 * 16).contains(&y)
+    {
+        return;
+    }
+    let (lx, lz, relative_y) = (
+        (x & 15) as usize,
+        (z & 15) as usize,
+        (y - LIGHT_MIN_Y) as usize,
+    );
+    let byte = &mut out[relative_y / 16][(relative_y & 15) * 128 + lz * 8 + lx / 2];
+    let shift = (lx & 1) * 4;
+    let raised = ((*byte >> shift) & 15).max(level) & 15;
+    *byte = (*byte & !(15 << shift)) | (raised << shift);
+}
+
 fn sky_spill(
     cx: i32,
     cz: i32,
     floor_of: impl Fn(i32, i32) -> i32,
     opacity: impl Fn(i32, i32, i32) -> u8,
-) -> HashMap<(i32, i32, i32), u8> {
+) -> SkySpill {
     let (x0, x1) = (cx * 16 - 15, cx * 16 + 30);
     let (z0, z1) = (cz * 16 - 15, cz * 16 + 30);
+    let (w, d) = ((x1 - x0 + 1) as usize, (z1 - z0 + 1) as usize);
+    // The box has to hold every seed before it can be sized, and the seeds are the centre
+    // chunk's own columns (256 of them). Two passes over the columns rather than a `Vec` of
+    // seeds: `floor_of` is a read of a cached floor array.
+    let (mut smin, mut smax) = (i32::MAX, i32::MIN);
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let y = floor_of(cx * 16 + lx as i32, cz * 16 + lz as i32) + 1;
+            smin = smin.min(y);
+            smax = smax.max(y);
+        }
+    }
+    // Fourteen steps of reach in both directions, clipped to the world — plus the seeds
+    // themselves, which a floor outside the world's range can put a block past that clip.
+    let y0 = (smin.saturating_sub(14).max(MIN_Y)).min(smin);
+    let y1 = (smax.saturating_add(14).min(MIN_Y + 383)).max(smax);
+    let h = (y1 - y0 + 1) as usize;
     let dark = |x: i32, y: i32, z: i32| -> bool { y <= floor_of(x, z) };
-    let mut lit: HashMap<(i32, i32, i32), u8> = HashMap::new();
-    let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> =
-        std::collections::VecDeque::new();
+    let mut grid = SkySpill {
+        x0,
+        z0,
+        y0,
+        w,
+        d,
+        h,
+        light: vec![0u8; w * d * h],
+        lit: Vec::new(),
+    };
+    // Flat index plus level, so a queue entry is five bytes of payload instead of a position
+    // triple: the queue holds tens of thousands of these at the worst point of a spread.
+    let mut queue: std::collections::VecDeque<(u32, u8)> = std::collections::VecDeque::new();
     for lz in 0..16usize {
         for lx in 0..16usize {
             let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
@@ -17008,14 +17343,20 @@ fn sky_spill(
             // Every column seeds: the floor+1 cell is never dark by the `y <= floor` test, so the
             // old `if dark(..) { continue }` guard was dead. The per-column rule already lights
             // this cell to 15; the seed exists so the BFS has a source to spread sideways from.
-            lit.insert((x, y, z), 15);
-            queue.push_back(((x, y, z), 15));
+            let i = grid.index(x, y, z);
+            grid.light[i] = 15;
+            grid.lit.push((i as u32, 15));
+            queue.push_back((i as u32, 15));
         }
     }
-    while let Some((p, level)) = queue.pop_front() {
+    while let Some((at, level)) = queue.pop_front() {
         if level <= 1 {
             continue;
         }
+        let at = at as usize;
+        let x = x0 + (at % w) as i32;
+        let z = z0 + ((at / w) % d) as i32;
+        let y = y0 + (at / (w * d)) as i32;
         for (dx, dy, dz) in [
             (1, 0, 0),
             (-1, 0, 0),
@@ -17024,22 +17365,48 @@ fn sky_spill(
             (0, 0, 1),
             (0, 0, -1),
         ] {
-            let (qx, qy, qz) = (p.0 + dx, p.1 + dy, p.2 + dz);
-            if qx < x0 || qx > x1 || qz < z0 || qz > z1 || !(MIN_Y..MIN_Y + 384).contains(&qy) {
+            let (qx, qy, qz) = (x + dx, y + dy, z + dz);
+            if !(x0..=x1).contains(&qx)
+                || !(z0..=z1).contains(&qz)
+                || !(y0..=y1).contains(&qy)
+                || !(MIN_Y..MIN_Y + 384).contains(&qy)
+            {
                 continue;
             }
             if !dark(qx, qy, qz) {
                 continue;
             }
             let nl = level.saturating_sub(opacity(qx, qy, qz).max(1));
-            if nl == 0 || lit.get(&(qx, qy, qz)).copied().unwrap_or(0) >= nl {
+            if nl == 0 {
                 continue;
             }
-            lit.insert((qx, qy, qz), nl);
-            queue.push_back(((qx, qy, qz), nl));
+            let i = grid.index(qx, qy, qz);
+            if grid.light[i] >= nl {
+                continue;
+            }
+            grid.light[i] = nl;
+            grid.lit.push((i as u32, nl));
+            queue.push_back((i as u32, nl));
         }
     }
-    lit
+    grid
+}
+
+/// Build the spill and raise it into an already-packed centre chunk, without a map in between.
+fn sky_spill_apply(
+    cx: i32,
+    cz: i32,
+    floor_of: impl Fn(i32, i32) -> i32,
+    op: impl Fn(i32, i32, i32) -> u8,
+    out: &mut [[u8; 2048]],
+) {
+    let spill = sky_spill(cx, cz, floor_of, op);
+    // The type is pinned on its own line rather than at the call. `tools/mutation_check.sh`
+    // replaces the line above with `Default::default()` and requires the light assembly test to
+    // go red; a `default()` whose type is only fixed by a method call on it is an inference
+    // error (E0282), and a mutant that does not build proves nothing.
+    let grid: SkySpill = spill;
+    grid.raise_into(cx, cz, out);
 }
 
 /// The first opaque block y in each column, scanning down from the surface (the sky floor).
@@ -17569,11 +17936,60 @@ fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
 ///
 /// Invalidation: a floor is a function of the blocks in its chunk, so an entry is used
 /// only while that chunk's write version has not moved (`bump_world_epoch`).
-static SKY_FLOORS: OnceLock<Mutex<std::collections::VecDeque<((i32, i32), u64, [i32; 256])>>> =
-    OnceLock::new();
+///
+/// A hash index plus insertion order, exactly like `BandCache`: the first version scanned a
+/// `VecDeque` per lookup, and this cache is asked ten times per delivered chunk with a 1 KiB
+/// entry to find, so the scan was the whole cost of a hit. `order` exists only for the bound.
+struct SkyFloorsCache {
+    map: HashMap<(i32, i32), (u64, [i32; 256])>,
+    order: std::collections::VecDeque<(i32, i32)>,
+}
 
-fn sky_floors_cache() -> &'static Mutex<std::collections::VecDeque<((i32, i32), u64, [i32; 256])>> {
-    SKY_FLOORS.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+impl SkyFloorsCache {
+    /// Entries retained; a moving viewer asks for a chunk's floors while it is in reach and
+    /// never again, so eviction order is insertion order.
+    const CAP: usize = 256;
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// The floors for `key`, when the entry was computed at the chunk's current version.
+    fn get(&self, key: (i32, i32), epoch: u64) -> Option<[i32; 256]> {
+        match self.map.get(&key) {
+            Some((entry_epoch, floors)) if *entry_epoch == epoch => Some(*floors),
+            _ => None,
+        }
+    }
+
+    /// Store (or refresh) an entry, evicting the oldest when the bound is passed. A key that is
+    /// already present is updated in place: it keeps its position in `order`, so a refresh is
+    /// not an insertion and the bound cannot be moved by one chunk being asked for repeatedly.
+    fn put(&mut self, key: (i32, i32), epoch: u64, floors: [i32; 256]) {
+        if let Some(slot) = self.map.get_mut(&key) {
+            slot.0 = epoch;
+            slot.1 = floors;
+            return;
+        }
+        if self.len() >= Self::CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(key, (epoch, floors));
+        self.order.push_back(key);
+    }
+}
+
+static SKY_FLOORS: OnceLock<Mutex<SkyFloorsCache>> = OnceLock::new();
+
+fn sky_floors_cache() -> &'static Mutex<SkyFloorsCache> {
+    SKY_FLOORS.get_or_init(|| {
+        Mutex::new(SkyFloorsCache {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    })
 }
 
 /// A per-chunk write version. Cached per-chunk data (the state band, the sky floors) is
@@ -17614,18 +18030,11 @@ fn bump_world_epoch(x: i32, z: i32) {
 fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32; 256] {
     let __t = chunkprof::enabled().then(std::time::Instant::now);
     let epoch = chunk_version(cx, cz);
-    {
-        let cache = sky_floors_cache().lock().unwrap();
-        if let Some((_, e, f)) = cache.iter().find(|(k, _, _)| *k == (cx, cz)) {
-            if *e == epoch {
-                let out = *f;
-                drop(cache);
-                if let Some(t) = __t {
-                    chunkprof::add(&chunkprof::FLOORS, t);
-                }
-                return out;
-            }
+    if let Some(floors) = sky_floors_cache().lock().unwrap().get((cx, cz), epoch) {
+        if let Some(t) = __t {
+            chunkprof::add(&chunkprof::FLOORS, t);
         }
+        return floors;
     }
     if __t.is_some() {
         chunkprof::FLOORS_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -17686,20 +18095,10 @@ fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32;
             floors[i] = y;
         }
     }
-    {
-        let mut cache = sky_floors_cache().lock().unwrap();
-        if let Some(slot) = cache.iter_mut().find(|(k, _, _)| *k == (cx, cz)) {
-            slot.1 = epoch;
-            slot.2 = floors;
-        } else {
-            // Bounded FIFO: a moving viewer asks for a chunk's floors while it is in
-            // reach and never again, so eviction order is insertion order.
-            if cache.len() >= 256 {
-                cache.pop_front();
-            }
-            cache.push_back(((cx, cz), epoch, floors));
-        }
-    }
+    sky_floors_cache()
+        .lock()
+        .unwrap()
+        .put((cx, cz), epoch, floors);
     if let Some(t) = __t {
         chunkprof::add(&chunkprof::FLOORS, t);
     }
@@ -17730,10 +18129,18 @@ fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
         }
         f9[(dx * 3 + dz) as usize][(((z & 15) as usize) << 4) | (x & 15) as usize]
     };
-    let spill = sky_spill(cx, cz, floor_of, op);
-    sky_light_sections_with_spill(cx, cz, &floors, &spill)
+    // The spill raises only the cells the column rule left dark, so it composes onto the packed
+    // columns instead of replacing them; a map is never built.
+    let mut out = sky_light_sections_from(cx, cz, &floors);
+    sky_spill_apply(cx, cz, floor_of, op, &mut out);
+    out
 }
 
+#[cfg(test)]
+/// The composition the tests drive: a stored spill map merged into the packed columns. Kept as
+/// the independent statement of what the dense grid must produce — `light_pack_tests` hands it
+/// levels the producer cannot make (negative coordinates, out-of-range y) and compares every
+/// nibble against a formula written from the layout alone.
 fn sky_light_sections_with_spill(
     cx: i32,
     cz: i32,
@@ -17745,25 +18152,15 @@ fn sky_light_sections_with_spill(
     // map at every voxel needlessly defeated the uniform-section fast paths.
     let mut out = sky_light_sections_from(cx, cz, floors);
     for (&(x, y, z), &level) in spill {
-        if x.div_euclid(16) != cx
-            || z.div_euclid(16) != cz
-            || !(LIGHT_MIN_Y..LIGHT_MIN_Y + 26 * 16).contains(&y)
-        {
-            continue;
-        }
-        let (lx, lz, relative_y) = (
-            (x & 15) as usize,
-            (z & 15) as usize,
-            (y - LIGHT_MIN_Y) as usize,
-        );
-        let byte = &mut out[relative_y / 16][(relative_y & 15) * 128 + lz * 8 + lx / 2];
-        let shift = (lx & 1) * 4;
-        let raised = ((*byte >> shift) & 15).max(level) & 15;
-        *byte = (*byte & !(15 << shift)) | (raised << shift);
+        raise_sky_nibble(&mut out, cx, cz, x, y, z, level);
     }
     out
 }
 
+/// One section's 2048 bytes from a level function, in the client's layout: for each y,
+/// each z, eight bytes carrying the sixteen x values as nibbles. Both light kinds need this
+/// and a wrong index lights the wrong column with nothing else to notice, so it has one
+/// owner.
 fn pack_light_section(sy: i32, level: impl Fn(usize, i32, usize) -> u8) -> [u8; 2048] {
     let mut arr = [0u8; 2048];
     for y in 0..16usize {
@@ -17940,7 +18337,7 @@ fn chunk_data_opt(
             if st != 0 {
                 arr = [st; 4096];
             }
-            data.extend_from_slice(&section_encode(&arr, &biomes));
+            section_encode_into(&mut data, &arr, &biomes);
         } else {
             let mut arr = [0u32; 4096];
             // One terrain pass for the section: the previous shape took the worldgen
@@ -18195,7 +18592,7 @@ fn chunk_data_opt(
             prev_base = base;
             carried_next = next_base;
             let __tl = chunkprof::enabled().then(std::time::Instant::now);
-            data.extend_from_slice(&section_encode(&arr, &biomes));
+            section_encode_into(&mut data, &arr, &biomes);
             if let Some(t) = __tl {
                 chunkprof::add(&chunkprof::ENC_SECTION, t);
             }

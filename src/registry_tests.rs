@@ -1295,3 +1295,702 @@ fn a_panicking_scene_fixture_leaves_the_parent_untouched() {
         "the child's writes and its panic must not be visible in this process"
     );
 }
+
+// ---------- M3 P5: the encode and light hot paths, against the code they replaced ----------
+//
+// Each of the three rewrites below is a shape change with an identity obligation: the stack
+// palette writer must produce the bytes the allocating one produced, the dense spill grid must
+// produce the levels the hash map produced, and the floor cache must evict the entry the
+// `VecDeque` scan evicted. The references are transcribed old implementations rather than
+// recorded bytes: recorded bytes pin only the cases someone typed, and these are the two places
+// in the delivery path where a wrong level or a wrong palette index is invisible until a client
+// renders it.
+
+/// The palette writer this change replaced, in its original shape: a SipHash `HashMap`, a `Vec`
+/// palette and a `Vec` of indices, built per call.
+fn p5_reference_write_palette(
+    out: &mut Vec<u8>,
+    values: &[i64],
+    min_bits: usize,
+    max_bits: usize,
+    global_bits: usize,
+) {
+    let mut palette = Vec::new();
+    let mut lookup = HashMap::new();
+    let indices: Vec<usize> = values
+        .iter()
+        .map(|&value| {
+            *lookup.entry(value).or_insert_with(|| {
+                let index = palette.len();
+                palette.push(value);
+                index
+            })
+        })
+        .collect();
+    assert!(
+        !palette.is_empty(),
+        "the reference writer has no answer for an empty input"
+    );
+    if palette.len() == 1 {
+        out.push(0);
+        write_varint(out, palette[0]);
+        write_varint(out, 0);
+        return;
+    }
+    let bits = ((usize::BITS - (palette.len() - 1).leading_zeros()) as usize).max(min_bits);
+    let direct = bits > max_bits;
+    let bits = if direct { global_bits } else { bits };
+    out.push(bits as u8);
+    if !direct {
+        write_varint(out, palette.len() as i64);
+        for &value in &palette {
+            write_varint(out, value);
+        }
+    }
+    let per = 64 / bits;
+    write_varint(out, values.len().div_ceil(per) as i64);
+    for (chunk, indexed) in values.chunks(per).zip(indices.chunks(per)) {
+        let mut word = 0u64;
+        for (i, (&value, &index)) in chunk.iter().zip(indexed).enumerate() {
+            let entry = if direct { value as u64 } else { index as u64 };
+            word |= entry << (i * bits);
+        }
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+}
+
+/// Every width decision the writer makes, at the palette sizes either side of each boundary.
+/// Stated here so the widths are pinned by name and not only by agreeing with the reference.
+#[test]
+fn m3_p5_write_palette_matches_all_bit_widths() {
+    // (distinct, block-state bits, quart-biome bits). `None` is the direct form.
+    let widths: [(usize, Option<usize>, Option<usize>); 12] = [
+        (1, None, None), // the single-value form: bits byte 0, no palette
+        (2, Some(4), Some(1)),
+        (3, Some(4), Some(2)),
+        (4, Some(4), Some(2)),
+        (5, Some(4), Some(3)),
+        (8, Some(4), Some(3)),
+        (9, Some(4), Some(6)),
+        (16, Some(4), Some(6)),
+        (17, Some(5), Some(6)),
+        (33, Some(6), Some(6)),
+        (129, Some(8), Some(6)),
+        (257, Some(15), Some(6)),
+    ];
+    let generate = |len: usize, distinct: usize, negative: bool| -> Vec<i64> {
+        (0..len)
+            .map(|i| {
+                // A stride coprime with most sizes, so the first-seen palette order is not the
+                // numeric order and a palette that sorts would not match.
+                let slot = (i * 7) as i64 % distinct as i64;
+                if negative {
+                    slot - 1000
+                } else {
+                    slot * 3 + 11
+                }
+            })
+            .collect()
+    };
+
+    for &(distinct, block_bits, biome_bits) in &widths {
+        for &len in &[distinct, 4096, 4095, 4097] {
+            if len < distinct {
+                continue;
+            }
+            for negative in [false, true] {
+                let values = generate(len, distinct, negative);
+                let mut unique: Vec<i64> = values.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                assert_eq!(unique.len(), distinct, "the fixture must hold {distinct} values");
+                for (label, min_bits, max_bits, global_bits, want_bits) in [
+                    ("blocks", 4, 8, 15, block_bits),
+                    ("biomes", 1, 3, 6, biome_bits),
+                ] {
+                    let mut want = Vec::new();
+                    p5_reference_write_palette(&mut want, &values, min_bits, max_bits, global_bits);
+                    let mut got = Vec::new();
+                    write_palette(&mut got, &values, min_bits, max_bits, global_bits);
+                    assert_eq!(
+                        got, want,
+                        "{label}: {distinct} distinct over {len} cells (negative {negative})"
+                    );
+                    if let Some(bits) = want_bits {
+                        assert_eq!(got[0] as usize, bits, "{label}: {distinct} distinct width");
+                    } else if distinct == 1 {
+                        assert_eq!(got[0], 0, "{label}: one value takes the single-value form");
+                    }
+                    // The section path enters through the `u32` overload, so it must encode
+                    // identically. A negative fixture leaves the `u32` range, where the two
+                    // entry points are documented to differ (the state id would be truncated).
+                    if !negative {
+                        let states: Vec<u32> = values.iter().map(|&v| v as u32).collect();
+                        let mut got_u32 = Vec::new();
+                        write_palette_u32(&mut got_u32, &states, min_bits, max_bits, global_bits);
+                        assert_eq!(
+                            got_u32, want,
+                            "{label}: the u32 entry point must not encode differently"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // An empty input: no palette to build, no cells to pack. The allocating writer reached this
+    // answer by wrapping `len - 1`; the rewrite states it.
+    let mut empty = Vec::new();
+    write_palette(&mut empty, &[], 4, 8, 15);
+    assert_eq!(empty, vec![15u8, 0], "no values: the direct width and zero words");
+
+    // `section_encode_into` appends exactly what `section_encode` returns, and computes the
+    // non-air count the same way - the wrapper is what `paletted` and `primitives_tests` call,
+    // the `_into` form is what the delivery path calls, and they must not diverge.
+    let states: [u32; 4096] = std::array::from_fn(|i| match i % 5 {
+        0 => 0,
+        1 => 1,
+        2 => 12958,
+        3 => 12959,
+        _ => (i % 300) as u32,
+    });
+    let biomes: [i64; 64] = std::array::from_fn(|i| (i % 11) as i64);
+    let whole = section_encode(&states, &biomes);
+    let mut prefixed = vec![0xaa, 0xbb, 0xcc];
+    section_encode_into(&mut prefixed, &states, &biomes);
+    assert_eq!(
+        &prefixed[3..],
+        &whole[..],
+        "section_encode_into must append the same bytes section_encode returns"
+    );
+    let non_air = states
+        .iter()
+        .filter(|&&st| !matches!(st, 0 | 12958 | 12959))
+        .count() as i16;
+    assert_eq!(
+        i16::from_be_bytes([whole[0], whole[1]]),
+        non_air,
+        "the leading count is the non-air cell count"
+    );
+}
+
+/// The spill this change replaced, in its original shape: a `HashMap` of positions and a
+/// `VecDeque` of `((x, y, z), level)`.
+fn p5_reference_sky_spill(
+    cx: i32,
+    cz: i32,
+    floor_of: &impl Fn(i32, i32) -> i32,
+    opacity: &impl Fn(i32, i32, i32) -> u8,
+) -> HashMap<(i32, i32, i32), u8> {
+    let (x0, x1) = (cx * 16 - 15, cx * 16 + 30);
+    let (z0, z1) = (cz * 16 - 15, cz * 16 + 30);
+    let dark = |x: i32, y: i32, z: i32| -> bool { y <= floor_of(x, z) };
+    let mut lit: HashMap<(i32, i32, i32), u8> = HashMap::new();
+    let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> =
+        std::collections::VecDeque::new();
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+            let y = floor_of(x, z) + 1;
+            lit.insert((x, y, z), 15);
+            queue.push_back(((x, y, z), 15));
+        }
+    }
+    while let Some((p, level)) = queue.pop_front() {
+        if level <= 1 {
+            continue;
+        }
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let (qx, qy, qz) = (p.0 + dx, p.1 + dy, p.2 + dz);
+            if qx < x0 || qx > x1 || qz < z0 || qz > z1 || !(MIN_Y..MIN_Y + 384).contains(&qy) {
+                continue;
+            }
+            if !dark(qx, qy, qz) {
+                continue;
+            }
+            let nl = level.saturating_sub(opacity(qx, qy, qz).max(1));
+            if nl == 0 || lit.get(&(qx, qy, qz)).copied().unwrap_or(0) >= nl {
+                continue;
+            }
+            lit.insert((qx, qy, qz), nl);
+            queue.push_back(((qx, qy, qz), nl));
+        }
+    }
+    lit
+}
+
+/// One scene: a solidity predicate as the world's only input, from which both the sky floor of
+/// every column in the 3x3 window and the opacity of every cell are read.
+fn p5_check_spill_scene(label: &str, solid: impl Fn(i32, i32, i32) -> bool) {
+    const X0: i32 = -16; // the 3x3 window around chunk (0, 0): one chunk of margin either side
+    const SPAN: usize = 48;
+    let mut floor_rows = vec![i32::MIN; SPAN * SPAN];
+    for xi in 0..SPAN {
+        for zi in 0..SPAN {
+            let (x, z) = (X0 + xi as i32, X0 + zi as i32);
+            let mut y = 340;
+            while y > MIN_Y && !solid(x, y, z) {
+                y -= 1;
+            }
+            floor_rows[xi * SPAN + zi] = y;
+        }
+    }
+    let floor_of = |x: i32, z: i32| -> i32 {
+        let (xi, zi) = (x - X0, z - X0);
+        if !(0..SPAN as i32).contains(&xi) || !(0..SPAN as i32).contains(&zi) {
+            return i32::MIN;
+        }
+        floor_rows[(xi * SPAN as i32 + zi) as usize]
+    };
+    let opacity = |x: i32, y: i32, z: i32| -> u8 {
+        if solid(x, y, z) {
+            15
+        } else {
+            0
+        }
+    };
+
+    let dense = sky_spill(0, 0, &floor_of, &opacity);
+    let sparse = p5_reference_sky_spill(0, 0, &floor_of, &opacity);
+    // A scene that produced nothing would agree trivially, and one that produced only seeds
+    // would never enter the BFS at all.
+    assert!(
+        sparse.len() > 256,
+        "{label}: the spread visited nothing beyond the 256 seeds ({} entries)",
+        sparse.len()
+    );
+    assert!(
+        sparse.values().any(|&level| level > 0 && level < 15),
+        "{label}: no cell holds a level between 1 and 14, so no light travelled"
+    );
+
+    // Every cell within reach of any seed, plus a margin either side so a missing entry is a
+    // failure rather than an out-of-range skip.
+    let (mut fmin, mut fmax) = (i32::MAX, i32::MIN);
+    for x in X0..(X0 + SPAN as i32) {
+        for z in X0..(X0 + SPAN as i32) {
+            let f = floor_of(x, z);
+            fmin = fmin.min(f);
+            fmax = fmax.max(f);
+        }
+    }
+    let mut compared = 0usize;
+    let mut lit_cells = 0usize;
+    for x in X0..(X0 + SPAN as i32) {
+        for z in X0..(X0 + SPAN as i32) {
+            for y in (fmin - 16)..=(fmax + 16) {
+                let want = sparse.get(&(x, y, z)).copied().unwrap_or(0);
+                let got = dense.get(&(x, y, z)).copied().unwrap_or(0);
+                assert_eq!(got, want, "{label}: cell ({x}, {y}, {z})");
+                compared += 1;
+                if want > 0 {
+                    lit_cells += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        compared >= SPAN * SPAN * 30,
+        "{label}: only {compared} cells compared, so the scan was not the whole window"
+    );
+    assert_eq!(
+        lit_cells,
+        sparse.len(),
+        "{label}: the reference and the scan disagree on how many cells are lit"
+    );
+
+    // And the payload, which is what a client renders: the dense applier must produce the same
+    // 26 arrays as merging the reference map into the packed columns.
+    let mut floors = [0i32; 256];
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            floors[(lz << 4) | lx] = floor_of(lx as i32, lz as i32);
+        }
+    }
+    let mut applied = sky_light_sections_from(0, 0, &floors);
+    sky_spill_apply(0, 0, &floor_of, &opacity, &mut applied);
+    let composed = sky_light_sections_with_spill(0, 0, &floors, &sparse);
+    assert_eq!(applied, composed, "{label}: the packed payloads differ");
+}
+
+/// The dense spill against the map it replaced, in the four shapes where sideways sky light has
+/// to cross a boundary: a cave only reachable down a shaft, a window through a wall, an alcove
+/// under an overhang whose own sky is the overhang's top, and a column whose topmost solid block
+/// is the world's last layer.
+#[test]
+fn m3_p5_sky_spill_flat_matches_dense_edge_cases() {
+    // Two joined tunnels under a solid roof, entered by one-block shafts at x = 6 and x = 11.
+    p5_check_spill_scene("cave mouth", |x: i32, y: i32, z: i32| -> bool {
+        let (lx, lz) = (x.rem_euclid(16), z.rem_euclid(16));
+        let shaft = (lx == 6 && lz == 7) || (lx == 11 && lz == 12);
+        if y > 71 {
+            return false; // open sky
+        }
+        if y > 69 {
+            return !shaft; // a solid roof with two holes in it
+        }
+        if !(61..=69).contains(&y) {
+            return true; // solid below the tunnels
+        }
+        let tunnel =
+            ((lz == 7 || lz == 12) && (4..=12).contains(&lx)) || (lx == 12 && (7..=12).contains(&lz));
+        !tunnel
+    });
+
+    // Two roofed rooms divided by a wall with a window in it. The far room's columns are all
+    // below the roof, so every cell in it is dark, and the only way in is the window the BFS
+    // has to find from the shaft above the near room.
+    p5_check_spill_scene("window spill", |x: i32, y: i32, z: i32| -> bool {
+        let (lx, lz) = (x.rem_euclid(16), z.rem_euclid(16));
+        if y <= 50 {
+            return true; // ground
+        }
+        if y > 58 {
+            if y > 60 {
+                return false; // open sky above the roof
+            }
+            // The roof, with a shaft down into each room.
+            return !((lx == 6 && lz == 7) || (lx == 10 && lz == 8));
+        }
+        if lz == 10 {
+            // The dividing wall, with a window at x 7..=9, y 53..=56.
+            return !((7..=9).contains(&lx) && (53..=56).contains(&y));
+        }
+        let room = (4..=12).contains(&lx) && ((4..=9).contains(&lz) || (11..=14).contains(&lz));
+        !room
+    });
+
+    // A mesa with an overhanging lip. The alcove's columns report the lip's top as their floor,
+    // so every cell in the alcove is dark, and only the fourteen steps of reach from a seed get
+    // any light in.
+    p5_check_spill_scene("cliff overhang", |x: i32, y: i32, z: i32| -> bool {
+        let (lx, lz) = (x.rem_euclid(16), z.rem_euclid(16));
+        if y > 88 {
+            return false;
+        }
+        if y <= 59 {
+            return true;
+        }
+        let body = (6..=9).contains(&lx) && (6..=9).contains(&lz);
+        let lip = (3..=5).contains(&lx) && (6..=9).contains(&lz) && (80..=88).contains(&y);
+        body || lip
+    });
+
+    // A column whose topmost solid block is the world's last layer: its seed lands one block
+    // above the build limit, where the spread may not enter, but the seed is still part of the
+    // answer - it is the cell the column rule lights, and dropping it would take the cell out of
+    // a payload a client compares. Beside it, a tunnel under the ground with one shaft into it,
+    // so the same scene also carries a spread the seed comparison can be measured against.
+    p5_check_spill_scene("build-limit column", |x: i32, y: i32, z: i32| -> bool {
+        let (lx, lz) = (x.rem_euclid(16), z.rem_euclid(16));
+        if (6..=9).contains(&lx) && (6..=9).contains(&lz) {
+            return y <= MIN_Y + 383; // a column reaching the world's top layer
+        }
+        if y > 60 {
+            return false; // open sky
+        }
+        if y > 48 {
+            return !(lx == 2 && lz == 2); // the ground, with one shaft in it
+        }
+        if y >= 40 {
+            let tunnel = (1..=7).contains(&lx) && (1..=7).contains(&lz);
+            return !tunnel; // the tunnel, roofed by the ground above
+        }
+        true
+    });
+}
+
+/// The floor cache against the `VecDeque` scan it replaced: same capacity, same FIFO eviction,
+/// same "an entry is only used while its chunk's version has not moved".
+#[test]
+fn m3_p5_sky_floors_cache_fifo_eviction() {
+    // The bound is what the production singleton is built with, so it is asserted where the
+    // eviction is tested rather than read from the type.
+    assert_eq!(SkyFloorsCache::CAP, 256);
+    let mut cache = SkyFloorsCache {
+        map: HashMap::new(),
+        order: std::collections::VecDeque::new(),
+    };
+    let floors = |seed: i32| -> [i32; 256] { [MIN_Y + seed; 256] };
+
+    for i in 0..SkyFloorsCache::CAP as i32 {
+        cache.put((i, 0), 1, floors(i));
+    }
+    assert_eq!(cache.len(), SkyFloorsCache::CAP, "the cache fills to its cap");
+    assert_eq!(cache.get((0, 0), 1), Some(floors(0)));
+    assert_eq!(
+        cache.get((0, 0), 2),
+        None,
+        "a version this entry was not computed at must not answer"
+    );
+
+    // A refresh of a key already present updates in place: the value and the version change,
+    // and the entry keeps its position in the eviction order - it does not move to the back.
+    cache.put((0, 0), 2, floors(-1));
+    assert_eq!(cache.len(), SkyFloorsCache::CAP, "a refresh is not an insertion");
+    assert_eq!(
+        cache.get((0, 0), 1),
+        None,
+        "the refreshed entry answers only at the version it was computed at"
+    );
+    assert_eq!(cache.get((0, 0), 2), Some(floors(-1)));
+
+    // One more distinct key evicts the oldest *position*, which is still (0, 0) after its
+    // refresh. (1, 0) surviving is what proves the refresh did not move it to the back: had it
+    // done that, this insertion would have taken (1, 0) instead.
+    cache.put((SkyFloorsCache::CAP as i32, 0), 1, floors(7));
+    assert_eq!(cache.len(), SkyFloorsCache::CAP, "the cap holds");
+    assert_eq!(
+        cache.get((1, 0), 1),
+        Some(floors(1)),
+        "a refreshed entry keeps its position, so its neighbour is not the one evicted"
+    );
+    assert_eq!(
+        cache.get((0, 0), 2),
+        None,
+        "FIFO evicts the oldest insertion, even one that has been asked for since"
+    );
+    assert_eq!(
+        cache.get((SkyFloorsCache::CAP as i32, 0), 1),
+        Some(floors(7)),
+        "the newest entry is present"
+    );
+
+    // Draining the order into a hash-only map would leave the two disagreeing; the bound is
+    // only meaningful while every stored key is in the order exactly once, oldest first.
+    assert_eq!(cache.order.len(), cache.map.len(), "order and map agree in size");
+    let oldest = cache.order.front().copied().unwrap();
+    cache.put((999, 0), 1, floors(0));
+    assert_eq!(
+        cache.get(oldest, 1),
+        None,
+        "the front of the order is what the next insertion evicts"
+    );
+}
+
+/// The section encoder this change replaced, in its original shape: the state array widened into
+/// `[i64; 4096]`, then the allocating writer twice.
+fn p5_reference_section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let non_air = states
+        .iter()
+        .filter(|&&state| !matches!(state, 0 | 12958 | 12959))
+        .count() as i16;
+    out.extend_from_slice(&non_air.to_be_bytes());
+    p5_reference_write_palette(&mut out, &states.map(i64::from), 4, 8, 15);
+    p5_reference_write_palette(&mut out, biomes, 1, 3, 6);
+    out
+}
+
+/// What the four rewrites of this slice cost, old against new, **in one process**: every replaced
+/// implementation is still in this file as the identity reference, so each pair is timed on the
+/// same inputs in the same run and the host's load cancels. That is the measurement this
+/// repository requires before a speed claim, and it is the only one that can attribute the change:
+/// the delivery-path bench (`chunk_delivery_path_bench`) measures terrain and the anti-xray loop,
+/// and does not call the light pass at all.
+///
+///   M3_P5_BENCH=1 cargo test --release --nocapture m3_p5_hot_path_ab_bench
+///
+/// Reported as the median of nine rounds; an iteration count per round keeps each sample above a
+/// millisecond so the clock's resolution is not the measurement.
+#[test]
+fn m3_p5_hot_path_ab_bench() {
+    if std::env::var("M3_P5_BENCH").is_err() {
+        return;
+    }
+    const ROUNDS: usize = 9;
+
+    fn median(mut samples: Vec<f64>) -> f64 {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        samples[samples.len() / 2]
+    }
+
+    // One chunk's worth of sections: the mix a delivered chunk actually carries, which is mostly
+    // uniform (air above the surface, stone below it) and a handful of mixed sections at it.
+    let biomes: [i64; 64] = std::array::from_fn(|i| (i % 11) as i64);
+    let shapes: Vec<[u32; 4096]> = vec![
+        [0u32; 4096],
+        [1u32; 4096],
+        std::array::from_fn(|i| (i % 90) as u32),
+        std::array::from_fn(|i| if i < 2048 { 1 } else { 0 }),
+        std::array::from_fn(|i| (i * 7 % 300) as u32),
+    ];
+    // Sanity: the two writers agree before anything is timed, so a timing cannot be of one path
+    // and an identity claim about another.
+    for states in &shapes {
+        assert_eq!(
+            section_encode(states, &biomes),
+            p5_reference_section_encode(states, &biomes),
+            "the A/B must time identical work"
+        );
+    }
+    let per_round = 400usize; // 400 encoders per sample, above a millisecond on this host
+    let time = |mut run: Box<dyn FnMut() + '_>| -> f64 {
+        let mut samples = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            let start = std::time::Instant::now();
+            for _ in 0..per_round {
+                run();
+            }
+            samples.push(start.elapsed().as_secs_f64() * 1e6 / per_round as f64);
+        }
+        median(samples)
+    };
+    let mut bytes = 0usize;
+    let old_section = time(Box::new(|| {
+        let mut sum = 0usize;
+        for states in &shapes {
+            sum += p5_reference_section_encode(states, &biomes).len();
+        }
+        bytes = sum;
+    }));
+    let new_section = time(Box::new(|| {
+        let mut out = Vec::with_capacity(16384);
+        for states in &shapes {
+            out.clear();
+            section_encode_into(&mut out, states, &biomes);
+        }
+        std::hint::black_box(&out);
+    }));
+    assert_ne!(bytes, 0, "the reference arm must run");
+    // A chunk is 24 sections, each encoding its states and its biomes.
+    let sections_per_chunk = 24.0;
+    eprintln!(
+        "P5BENCH section encode (24/chunk): old={:.2}us new={:.2}us | per chunk old={:.0}us new={:.0}us ({:+.1}%)",
+        old_section,
+        new_section,
+        old_section * sections_per_chunk,
+        new_section * sections_per_chunk,
+        (new_section / old_section - 1.0) * 100.0
+    );
+
+    // The spill, in both regimes, with both arms composed the way the call sites compose them:
+    // pack the columns, then merge the spread. Timing the map build against the grid build would
+    // have flattered the map, which never paid for its own merge here.
+    let mut floors = [0i32; 256];
+    let mut spill_ab = |label: &str, scene: &dyn Fn(i32, i32, i32) -> bool| {
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                let (x, z) = (lx as i32, lz as i32);
+                let mut y = 340;
+                while y > MIN_Y && !scene(x, y, z) {
+                    y -= 1;
+                }
+                floors[(lz << 4) | lx] = y;
+            }
+        }
+        let floor_of =
+            |x: i32, z: i32| -> i32 { floors[(((z & 15) as usize) << 4) | ((x & 15) as usize)] };
+        let opacity = |x: i32, y: i32, z: i32| -> u8 { if scene(x, y, z) { 15 } else { 0 } };
+        let mut cells = 0usize;
+        let old_spill = time(Box::new(|| {
+            let spill = p5_reference_sky_spill(0, 0, &floor_of, &opacity);
+            cells = spill.len();
+            let out = sky_light_sections_with_spill(0, 0, &floors, &spill);
+            std::hint::black_box(&out);
+        }));
+        let new_spill = time(Box::new(|| {
+            let mut out = sky_light_sections_from(0, 0, &floors);
+            sky_spill_apply(0, 0, &floor_of, &opacity, &mut out);
+            std::hint::black_box(&out);
+        }));
+        assert!(cells > 256, "{label}: the scene must spread, got {cells} cells");
+        eprintln!(
+            "P5BENCH sky spill {label} (1/chunk, {cells} lit): map={:.1}us grid={:.1}us ({:+.1}%)",
+            old_spill,
+            new_spill,
+            (new_spill / old_spill - 1.0) * 100.0
+        );
+    };
+    // A shallow roofed cave: a few hundred lit cells, which is a quiet chunk.
+    let cave = |x: i32, y: i32, z: i32| -> bool {
+        let (lx, lz) = (x.rem_euclid(16), z.rem_euclid(16));
+        let shaft = (lx == 6 && lz == 7) || (lx == 11 && lz == 12);
+        if y > 71 {
+            return false;
+        }
+        if y > 69 {
+            return !shaft;
+        }
+        if !(61..=69).contains(&y) {
+            return true;
+        }
+        let tunnel = ((lz == 7 || lz == 12) && (4..=12).contains(&lx))
+            || (lx == 12 && (7..=12).contains(&lz));
+        !tunnel
+    };
+    spill_ab("sparse", &cave);
+    // Porous rock: thousands of dark, transparent cells within reach of a seed, which is what a
+    // chunk under a large overhang or a deep cave system looks like.
+    let porous = |x: i32, y: i32, z: i32| -> bool {
+        if y > 90 {
+            return false;
+        }
+        (x * 7 + y * 13 + z * 3).rem_euclid(11) >= 5
+    };
+    spill_ab("dense", &porous);
+
+    // The block-light pass's no-source path: what it stopped copying. The old version cloned the
+    // window's edit maps before asking whether there was anything to light; these are nine of the
+    // maps it copied, at the size an edited chunk reaches (300 cells is a few hundred blocks
+    // moved or broken), so this is the work the reordering removes from a call that lights
+    // nothing.
+    let edited: Vec<HashMap<u32, u32>> = (0..9)
+        .map(|c| (0..300u32).map(|i| (i * 7 + c, 1u32)).collect())
+        .collect();
+    let clones = time(Box::new(|| {
+        let copied: Vec<HashMap<u32, u32>> = edited.iter().map(|c| c.clone()).collect();
+        std::hint::black_box(&copied);
+    }));
+    eprintln!(
+        "P5BENCH block light, no sources (1/chunk): 9 overlay copies removed = {clones:.1}us/call"
+    );
+
+    // The floor cache's hit path, ten lookups per delivered chunk (the centre plus the 3x3
+    // window): a 256-entry `VecDeque` scanned per lookup against a hash index.
+    let keyed: Vec<((i32, i32), u64, [i32; 256])> = (0..256)
+        .map(|i| ((i, 0), 1u64, [i; 256]))
+        .collect();
+    let scan: std::collections::VecDeque<((i32, i32), u64, [i32; 256])> =
+        keyed.iter().copied().collect();
+    let mut cache = SkyFloorsCache {
+        map: HashMap::new(),
+        order: std::collections::VecDeque::new(),
+    };
+    for (key, epoch, values) in keyed.iter().copied() {
+        cache.put(key, epoch, values);
+    }
+    // The last chunk inserted is the worst case for the scan, so the old arm is not flattered.
+    let probes: Vec<(i32, i32)> = (0..10).map(|i| (255 - i, 0)).collect();
+    let mut sink = 0i32;
+    let old_lookup = time(Box::new(|| {
+        for key in &probes {
+            if let Some((_, e, f)) = scan.iter().find(|(k, _, _)| k == key) {
+                if *e == 1 {
+                    sink += f[0];
+                }
+            }
+        }
+    }));
+    let new_lookup = time(Box::new(|| {
+        for key in &probes {
+            if let Some(f) = cache.get(*key, 1) {
+                sink += f[0];
+            }
+        }
+    }));
+    assert_ne!(sink, 0, "the cache arms must both answer");
+    eprintln!(
+        "P5BENCH floors cache (10 hits/chunk): scan={:.2}us hash={:.2}us ({:+.1}%)",
+        old_lookup,
+        new_lookup,
+        (new_lookup / old_lookup - 1.0) * 100.0
+    );
+}

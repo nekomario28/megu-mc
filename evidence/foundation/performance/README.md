@@ -620,3 +620,102 @@ path (both parity tests), dropping the lava-level gate and dropping the
 out-of-chunk gate (the gate test, each with its own message). `bash tools/layers_check.sh`
 and `bash tools/debt_ratchet.sh` pass; the full suite is 726 passed, 0 failed,
 1 ignored (`cargo test --offline --locked -j 2`, 187 s).
+
+## M3 P5-wire/light: the delivery path's allocations (2026-11-20)
+
+Four shapes in the chunk delivery path allocated per call, on a path that runs for every
+delivered chunk: the section palette writer (a SipHash `HashMap`, a palette `Vec` and an index
+`Vec` per section, 48 sections per chunk), the sky-spill BFS (a `HashMap` keyed by position and a
+`VecDeque` of position triples), the sky-floor cache (a `VecDeque` scanned linearly per lookup,
+ten lookups per delivered chunk), and the block-light pass (up to nine overlay `HashMap`s cloned
+before asking whether anything emits light). Each now runs over fixed or dense storage.
+
+### Identity, before speed
+
+The palette and spill writers are rewrites of code whose output is a client payload, so the first
+question is byte identity, not speed. The replaced implementations are transcribed into
+`src/registry_tests.rs` as the reference the new ones are compared against, so the comparison
+enumerates widths instead of pinning the cases someone typed:
+
+| check | result |
+|---|---|
+| `m3_p5_write_palette_matches_all_bit_widths` — the stack writer against the allocating one, 12 palette sizes either side of every width boundary (1, 2, 3, 5, 9, 16, 17, 33, 129, 257 distinct) x lengths 1/4095/4096/4097 x block (4-8-15) and biome (1-3-6) parameters x negative and non-negative ids | byte-identical, 192 comparisons (12 palette sizes x up to 4 lengths x 2 sign cases x 2 parameter sets) |
+| the same, through the `u32` entry point the section path takes | byte-identical |
+| `section_encode_into` appending into a caller's buffer vs `section_encode` returning a fresh one | identical tail, equal non-air count |
+| `paletted_real_worldgen_sections_differential` — 2,048 real worldgen sections, wire vs `PalettedSection::write_wire` | green (unchanged) |
+| `primitives_section_encoding_matches_native_palettes` | green (unchanged) |
+| `chunk_delivery_digest` — 2 seeds x 3 sweep directions x 30 chunks, terrain-state md5s | identical to `3135354`: 180 lines, `sha256 064aa8ff…`, `PREFETCH-DIFF 0` |
+| `m3_p5_sky_spill_flat_matches_dense_edge_cases` — dense grid vs a map BFS over every cell within reach, in four scenes (cave reachable only down a shaft, two roofed rooms joined by a window, mesa with an overhanging lip, and a column whose topmost solid block is the world's last layer so its seed lands above the build limit) | cell-for-cell identical, at least 99k cells compared per scene, and the packed 26 arrays identical |
+| `m3_p5_sky_floors_cache_fifo_eviction` — 256-entry capacity, refresh-in-place keeps its FIFO position, oldest-position eviction, per-chunk version invalidation | green |
+| `registry_tests::sky_light_*`, `light_pack_tests::*` (sparse composition, generated sources, cross-border sources, removal re-exposing a source) | green (unchanged) |
+
+Both mutation entries that guard this code were re-run by hand and still go red:
+
+* `let spill = Default::default();` (the registered "the light packet assembles spill into its
+  floors" entry) → `sky_light_assembly_lights_through_an_opening_and_stops_at_a_barrier` fails
+  with `sideways arrival down an open tunnel`. The call shape carries an explicit `SkySpill`
+  annotation on the line after the build for this reason: the substitution is only a *proof* if
+  it compiles, and `default()` inferred from a method call on itself does not (E0282).
+* `let nl = level;` (the registered "sky spill loses one level per step" entry) → the same test
+  fails.
+* three further mutants were run against the new gates: dropping the `min_bits` clamp, moving a
+  refreshed floor-cache entry to the back of the eviction order, and skipping a level per BFS
+  step. Each failed its own new test with the expected message.
+
+### Measurement
+
+Host load swings 2-3x here, and the delivery-path bench's own header says a wall-clock A/B cannot
+resolve a small change on it. So the attribution comes from an **in-process** A/B: the replaced
+implementations are in the test file, and each pair is timed on identical inputs in one process,
+median of nine rounds, three interleaved runs.
+
+```sh
+M3_P5_BENCH=1 systemd-run --user --scope -p CPUQuota=250% -p MemoryMax=3G \
+  cargo test --offline --locked --release -j 2 -- --nocapture m3_p5_hot_path_ab_bench
+```
+
+| measurement | before | after | delta |
+|---|---|---|---|
+| section encode (24 per chunk: 5 section shapes incl. uniform air, uniform stone and 90/300-distinct mixes) | 146.2-146.8 µs/section, **3.51 ms/chunk** | 15.2-15.5 µs/section, **0.37 ms/chunk** | **-89%** |
+| sky spill, sparse scene (435 lit cells) | 25.4-26.9 µs/call | 12.0-12.1 µs/call | **-52 to -55%** |
+| sky spill, dense scene (2,261 lit cells) | 172.3-177.5 µs/call | 63.1-63.9 µs/call | **-63%** |
+| floor cache, 10 hit lookups per delivered chunk | 0.71-0.73 µs | 0.09 µs | **-88%** |
+| block-light pass, no sources: the nine overlay copies it no longer makes (300 cells each) | 0.6 µs per call | 0 | removed |
+
+Three things that measurement settled, which the shape alone did not:
+
+* **The allocating writer was the section encoder's cost, not the packing.** 4096 cells through a
+  SipHash `HashMap` plus two `Vec`s is 36 ns a cell; the stack table and the `u16` index buffer
+  are 15 µs for the same arrays. The `[i64; 4096]` widening copy the `u32` overload removes is
+  part of that, one 32 KiB copy per section.
+* **The dense spill grid only wins once its applier stops scanning the box.** The first version
+  walked all 46x46xH cells to find the lit ones and measured **+26% slower than the map** on a
+  sparse scene (23.3 → 29.5 µs): the box is mostly dark, so the scan was most of the work. The
+  grid now records each cell it lights as it goes and the applier walks that list — the same
+  number of entries the map held, without a hash each. That is the -52% above. The report of this
+  measurement is the reason the list exists.
+* **The block-light reordering is worth 0.6 µs, not milliseconds.** It is kept because it also
+  removes that copying from under the `world()` lock (the reason the pass stopped holding the lock
+  at all), not because it moves throughput.
+
+The delivery-path bench, run because it is the only end-to-end yardstick the tree has:
+
+| `chunk_delivery_path_bench`, 300 chunks/pass | base `3135354` | this tree |
+|---|---|---|
+| warm passes (1-3), total | 9,004 / 9,136 / 9,170 / 9,367 / 9,531 / 9,015 ms | 8,571 / 8,714 / 8,752 / 8,780 / 8,781 / 8,805 ms (the last three with `MC_SPINE_CHUNK_PROFILE=1`, whose counters only add work) |
+| warm passes, median chunk | 3.3 ms | 3.2 ms |
+
+The warm-pass totals sit ~4% lower at the median, which is inside this host's 5% spread across
+runs of one arm — read it as "no regression on the path as a whole", not as a second measurement
+of the 89%. The bench drives `chunk_data` (terrain, band install, encode) and **does not call the
+light pass at all**, so it cannot see the spill or the floor cache; that is why the in-process A/B
+above is the attribution.
+
+### What was not changed
+
+`write_palette` still packs a value's high bits into a word without masking them to `bits` (as it
+did before), because masking would be a behaviour change for a value that did not fit — every
+current id does, and the identity tests would then disagree with the reference for a deliberate
+reason. `sky_spill` keeps its seed at every column's `floor + 1`, including the one case where that
+cell is above the build limit: the seed is part of the payload even though the spread cannot enter
+from it, and the build-limit scene above pins it.
