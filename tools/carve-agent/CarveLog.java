@@ -293,6 +293,8 @@ public class CarveLog {
     static final java.util.Set<String> RUNTIME_CELLS = new java.util.HashSet<>(
         java.util.Arrays.asList(System.getProperty("runtimecell", "").split(";")));
     static final int[] FEATURE_BOX=box("featurebox"), RUNTIME_BOX=box("runtimebox");
+    /** A second feature-write box: the halo's chunks, not just the target's. */
+    static final int[] FEATURE_BOX2=box("featurebox2");
     static int[] box(String property) {
         String value=System.getProperty(property);if(value==null) return null;
         int[] b=java.util.Arrays.stream(value.split(",")).mapToInt(Integer::parseInt).toArray();
@@ -324,10 +326,143 @@ public class CarveLog {
     }
 
     public static void featureCell(int x, int y, int z, int state, boolean wrote) {
-        if ((!FEATURE_CELLS.contains(x + "," + y + "," + z) && !inside(FEATURE_BOX,x,y,z)) || !overworld()) return;
+        if ((!FEATURE_CELLS.contains(x + "," + y + "," + z) && !inside(FEATURE_BOX,x,y,z)
+                && !inside(FEATURE_BOX2,x,y,z)) || !overworld()) return;
         int[] f = FEAT.get(), c = CHUNK.get();
+        // `s=` is the placement-window serial (SculkLog), so a write can be ordered against
+        // the `BPRED`/`VSHAPE` records of the window it happened in: a predicate that reads a
+        // cell a *later* window writes looks exactly like a predicate that ignores it.
         System.out.println("FCELL " + x + " " + y + " " + z + " state=" + state
-            + " wrote=" + wrote + " feature=" + f[0] + "," + f[1] + " chunk=" + c[0] + "," + c[1]);
+            + " wrote=" + wrote + " feature=" + f[0] + "," + f[1] + " chunk=" + c[0] + "," + c[1]
+            + " s=" + SculkLog.windowSerial());
+    }
+
+    /**
+     * One `VineBlock.updateShape` call, after it returns (`-Dvinechunk=cx,cz`).
+     *
+     * The call is the whole decision: `dir` is the edge direction the caller passed (0..5 in
+     * `Direction`'s declaration order down, up, north, south, west, east), `before`/`after` are
+     * `Block.getId` values. `dir=0` with `before==after` is the `Direction.DOWN` short circuit;
+     * `after==0` is the vine becoming air. Nothing in the written blocks distinguishes "the
+     * pass never visited this vine" from "the pass visited it and kept it" - only this line does.
+     */
+    public static void vine(int dir, int x, int y, int z, int before, int after) {
+        VINE_CALLS++;
+        String p = System.getProperty("vinechunk");
+        if (p == null) return;
+        if (!p.equals("all")) {
+            String[] a = p.split(",");
+            if (a.length != 2) return;
+            if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
+        }
+        if (!overworld()) return;
+        VINE_LOGGED++;
+        int[] f = FEAT.get();
+        SculkLog.line("VSHAPE " + dir + " " + x + " " + y + " " + z + " before=" + before
+                + " after=" + after + " feature=" + f[0] + "," + f[1]
+                + " s=" + SculkLog.windowSerial());
+    }
+
+    /**
+     * One visited face of `StructureTemplate.updateShapeAtEdge(level, flags, shape, x, y, z)`,
+     * the visitor `TreeFeature.place` runs over its shape after `updateLeaves` and the
+     * decorators (`-Dedgechunk=cx,cz` limits it to one chunk of inside cells).
+     *
+     * The visited set IS the shape: `LeavesBlock.updateShape` only reserves a tick (invisible in
+     * the written blocks) and `VineBlock.updateShape` can turn a vine into air, so "which cell
+     * was asked" cannot be recovered from the world afterwards. `x,y,z` is the inside cell; the
+     * neighbour is `dir`'s offset from it.
+     */
+    public static void edgeFace(int dir, int x, int y, int z) {
+        EDGE_CALLS++;
+        String p = System.getProperty("edgechunk");
+        if (p == null) return;
+        if (!p.equals("all")) {
+            String[] a = p.split(",");
+            if (a.length != 2) return;
+            if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
+        }
+        if (!overworld()) return;
+        EDGE_LOGGED++;
+        int[] f = FEAT.get();
+        SculkLog.line("EDGE " + dir + " " + x + " " + y + " " + z + " feature=" + f[0] + ","
+                + f[1] + " s=" + SculkLog.windowSerial());
+    }
+
+    /**
+     * `BlockPredicateFilter` verdicts (`-Dblockpredchunk=cx,cz`).
+     *
+     * A rejected candidate draws nothing, so a `block_predicate_filter` that rejects where the
+     * port accepts is invisible in both draw streams and in the written blocks - the only trace
+     * of it is the *absence* of the later weighted-state draw. This logs the verdict, the
+     * position it was asked about and the feature it belongs to, so the two sides can be
+     * compared candidate by candidate instead of inferred from silence.
+     */
+    public static void blockpred(int x, int y, int z, boolean ok) {
+        String p = System.getProperty("blockpredchunk");
+        if (p == null) return;
+        if (!p.equals("all")) {
+            String[] a = p.split(",");
+            if (a.length != 2) return;
+            if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
+        }
+        if (!overworld()) return;
+        int[] f = FEAT.get();
+        SculkLog.line("BPRED " + x + " " + y + " " + z + " " + ok + " feature=" + f[0] + "," + f[1]
+                + " s=" + SculkLog.windowSerial());
+    }
+
+    /**
+     * `HeightmapPlacement`'s heightmap answer (`-Dhmchunk=cx,cz`).
+     *
+     * A heightmap placement's `y` is a heightmap read of the in-square column, so a `y` that
+     * differs between the two sides moves the candidate without moving any draw and looks like a
+     * filter disagreement further down. Logging the value at the read site is the only way to
+     * tell a heightmap disagreement from a filter disagreement.
+     */
+    public static void heightmap(int x, int height, int z) {
+        String p = System.getProperty("hmchunk");
+        if (p == null) return;
+        if (!p.equals("all")) {
+            String[] a = p.split(",");
+            if (a.length != 2) return;
+            if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
+        }
+        if (!overworld()) return;
+        int[] f = FEAT.get();
+        SculkLog.line("HMP " + x + " " + height + " " + z + " feature=" + f[0] + "," + f[1]
+                + " s=" + SculkLog.windowSerial());
+    }
+
+    /**
+     * The caller of a write to one cell (`-Dwritestack=x,y,z`).
+     *
+     * `FCELL` says a cell was written twice (a vine, then air); it does not say who wrote it.
+     * A cell that is cleared inside the same placement window is a rule the port is missing, and
+     * the class that clears it is the rule's name.
+     */
+    public static void writeStack(int x, int y, int z, int state, boolean wrote) {
+        String want = System.getProperty("writestack");
+        if (want == null || !want.equals(x + "," + y + "," + z)) return;
+        String stack=java.util.Arrays.stream(Thread.currentThread().getStackTrace())
+            .skip(2).limit(14).map(StackTraceElement::toString)
+            .collect(java.util.stream.Collectors.joining(" | "));
+        System.out.println("WSTACK " + x + " " + y + " " + z + " state=" + state
+            + " wrote=" + wrote + " s=" + SculkLog.windowSerial() + " stack=" + stack);
+    }
+
+    static long VINE_CALLS, VINE_LOGGED, EDGE_CALLS, EDGE_LOGGED;
+
+    static {
+        // A hook that never fires and a hook that fires but filters everything out both leave an
+        // empty trace. Count before filtering and report at shutdown, so "no VSHAPE lines" is a
+        // measurement ("no vine updateShape ran here") rather than a silent wiring failure.
+        Runtime.getRuntime().addShutdownHook(new Thread() {
+            @Override public void run() {
+                System.out.println("VINESUM calls=" + VINE_CALLS + " logged=" + VINE_LOGGED
+                        + " edges=" + EDGE_CALLS + " edges_logged=" + EDGE_LOGGED);
+            }
+        });
     }
 
     public static void seagrassRead(Object pos,Object state) {
