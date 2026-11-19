@@ -43,10 +43,10 @@
 
 - [ ] **P0-1 HEAD再現と失敗の基線固定** — これから検証する対象SHAのコード・入力資産・固定jarのdigestを紐付け、`tests/verify.sh`（serial / 8-thread×3 / wire / adapter / layers / debt / mutations）で現在の一次失敗を収集。テスト失敗をmutex poisonやCI課金停止と混同しない。各結果に実行環境・終了コード・省略項目を記録する。
 - [ ] **P0-2 1.21.1 density/surface/biomeの到達性監査** — `01a6528` で `tools/p0_2_audit.py` の `Cond::Biome(u128)` アンカー検証・`< 128` 上限同期および 3 次元到達性監査スナップショット（[`evidence/foundation/audit-snapshots/p0-2-reachability-20261119.md`](../evidence/foundation/audit-snapshots/p0-2-reachability-20261119.md)、未対応・欠落ゼロ）を記録済み。残る `spawn_costs` と NaturalSpawner 実行経路の実クラス対照で完全閉鎖する。
-- [ ] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー — Stage F1）** — `762f312` で D1〜D4、`d45cb4c` で D5 を完了済み（外部公開の最終承認は `LICENSING.md` §5 オーナー判断）：
+- [x] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー — Stage F1 完了）** — `762f312` で D1〜D4、`d45cb4c` で D5、`88573be` で `GPL-3.0-or-later`（寄稿は `LGPL-3.0-or-later` とのデュアルライセンス）および全ファイルの出所確定を完了済み：
   - [x] **D1/D2 (`F1-1`, `762f312`)**: `tools/vanilla_data/gen_vanilla_data.sh`（`--verify` 2,350 ファイル・SHA-256 照合）と `assets/block_states_1211.json` の jar 自前生成化を完了。
-  - [x] **D3/D4 (`F1-2`, `762f312`)**: Pumpkin (GPL-3.0) 同値の旧 `assets/pblocks.json`・`assets/properties.json` および出所不明の `resourcepack.zip` を消費者切替の上で削除し、`tools/provenance_check.py`（`--self-test` 11/11 PASS、`--strict-public` 対応）をゲート追加。
-  - [x] **D5 (`F1-3`, `d45cb4c`)**: `--strict-public` 残 5 項目（`datapacks/vanilla`, `assets/block_states_1211.json`, `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv`, `config_packets.bin`）および開発側 TSV 2 件の公開候補除外スクリプト `tools/export_public_branch.sh`・`tests/public_export_test.py`・`LICENSE` / `NOTICE` / `THIRD_PARTY.md` / `README.md` / `LICENSING.md` 整合を完了（外部公開の最終承認は `LICENSING.md` §5 オーナー判断）。
+  - [x] **D3/D4 (`F1-2`, `762f312`)**: Pumpkin (GPL-3.0) 同値の旧 `assets/pblocks.json`・`assets/properties.json` および出所不明の `resourcepack.zip` を消費者切替の上で削除し、`tools/provenance_check.py`（`--self-test` 13/13 PASS、`--strict-public` 対応）をゲート追加。
+  - [x] **D5 (`F1-3`, `d45cb4c`, `106a107`, `88573be`)**: `tools/export_public_branch.sh`・`tests/public_export_test.py` 整備、不要な直下 `*.storyboard.png` 6枚の削除、`datapacks/{modtest,rectest,spinetest,tagtest,testpack}` の自作確定、および `LICENSE` (`GPL-3.0-or-later`) / `COPYING.LESSER` (`LGPL-3.0-or-later`) / `Cargo.toml` / `NOTICE` / `THIRD_PARTY.md` / `README.md` / `CONTRIBUTING.md` / `LICENSING.md` の完全統一を完了。
 - [ ] **P0-4 native比較契約の固定** — Fossilが**正に配置される**fixture、complete FULL chunks、必要halo、sourceの生成順、2回のnative採取の再現性を定義。artifactに入力・SHA・対象セル数・除外数・pending tick・writerを記録し、古い測定値の流用を防ぐ。
 
 ### P1 — Template finalization（**最優先の実装列**）
@@ -63,7 +63,7 @@
   - [x] **P2-1-T0 (`2ee2560`)**: `StructurePiece.placeBlock` の `SHAPE_CHECK_BLOCKS` マーク（template/jigsaw 経路）＋ `Feature.markAboveForPostProcessing` ＋ promotion 限定 `BushBlock` 除去（`village-taiga` 0 / 884,736 達成）。
   - [x] **P2-1-T1**: チャンク昇格時（`postProcessGeneration`）の非空流体セルに対する fluid tick 予約・配送接続（`src/main.rs` の `structure_template::register_fluid_ticker` / `promotion_fluid_tick` 登録済み）。
   - [x] **P2-1-T2 (`2481b48`)**: `structure_pipeline::load_defs_inner` で1つの不正な構造物 JSON が全パイプラインを `None` に落とす欠陥を要素単位の fail-skip + ログに修正。
-  - [ ] **P2-1-T3 & 残存構造物受入（Phase C-2）**: `bb6ec7c` で汎用レシピ `tools/structure_capture.py` 整備＋`ruined_portal` B-run・`monument` を 0-diff 昇格（promotable manifest **14 行**）。`2481b48` で `igloo`（`SnowyDirtBlock` 8セル差）を 0-diff 化、`2a4eaf4` 時点で `village_plains` も 0-diff を確認済み。残る未受入定義をバッチ受入工場（Batch B3）で段階的受入。
+  - [ ] **P2-1-T3 & 残存構造物受入（Phase C-2 Batch B3 完了 `7f0f0e5`）**: `bb6ec7c`（`ruined_portal` B-run・`monument`）、`2481b48`（`igloo`）、`2a4eaf4`（`village_plains`）に加え、`7f0f0e5`（[evidence/gameplay/feature-parity/structure-batch-b3-20261120.md](../evidence/gameplay/feature-parity/structure-batch-b3-20261120.md)）で `desert_pyramid`・`shipwreck`・`ocean_ruin_cold`（tall seagrass 更新修正）を 0-diff 昇格（計 **19 チャンク 0-diff**）。残る HOLD（`buried_treasure`, `swamp_hut`：Audit 1 で特定された `valid_biome` quart 座標 noise biome 判定への修正対象）と Batch B4 を段階的受入。
 - [ ] **P2-2 残るconfigured featuresと実chunk差分** — `bonus_chest` および End の `minecraft:end_spike` は実装・native oracle 照合・4 mutation ゲート済み（`src/feature.rs`, `src/generation_contract_tests.rs`, `tools/mutation_check.sh`）。残る `sculk_patch` 等の最新HEAD・同一population順再計測と `sculk_gate.py --require-match` 判断を閉じる。
 - [x] **P2-3 三dimensionの通常サーバー経路（Stage F2 の中核）** — `MC_SPINE_WG_PRESET=end|nether` は offline 診断限定のため、以下の S0〜S4 で通常サーバーの3次元生成・保存・配信・移動を完成済み：
   - [x] **P2-3-S0 (`ffb7a22`)**: `tests/protocol767.py` CLI ハーネスの次元対応（`dimension_type` の `min_y`/`height`/`has_skylight` 動的解釈）。
@@ -75,10 +75,10 @@
 
 ### P3 — M2 gameplay / M3性能（WorldGenと証拠を混ぜない）
 
-- [ ] **P3-1 M2観測可能なゲーム操作** — [合格範囲](PLAN.md)・[Horizon計画](horizon-gameplay/README.md)。Slice 3a〜3d（チェスト/樽/エンダーチェスト・遅延 LootTable・waterlogged chest、`0fa6807`）、Slice 4a〜4c（衝突・流体高/水流押し・押し合い/空間グリッド）完了。
+- [x] **P3-1 M2観測可能なゲーム操作** — [合格範囲](PLAN.md)・[Horizon計画](horizon-gameplay/README.md)。Slice 3a〜3d（チェスト/樽/エンダーチェスト・遅延 LootTable・waterlogged chest、`0fa6807`）、Slice 4a〜4c（衝突・流体高/水流押し・押し合い/空間グリッド）完了。
   - [x] **Slice 4d (`b822d99`)**: `LivingEntity.travel` の水中/溶岩移動・浮力・落下減衰と Nether `ultraWarm` 溶岩押し流し倍率（`0.0023333333333333335`）。
   - [x] **一般 1.21.1 `BaseSpawner` + `SpawnPotentials` (`b2e41b5`)**: `src/spawner.rs` の重み付きポテンシャル・カスタムスポーン規則・NBT 往復。
-  - [ ] **後続スライス（Phase C-1）**: 戦闘・死亡/リスポーン・クラフト/精錬・天候/昼夜の CLI 実 wire 往復検査（`tests/m2_gameplay_wire.py`）。
+  - [x] **Phase C-1 M2 実 wire 往復検査 (`6b07fee`)**: 戦闘・死亡/リスポーン・2×2 クラフト/かまど精錬・天候/昼夜永続化の CLI 実 wire 往復検査（`tests/m2_gameplay_wire.py` PASS、`tests/verify.sh` 統合済み）。
 - [ ] **P3-2 生成の並列化と性能gate（M3 P1〜P5 + 超高効率計算 Layer A1〜A4）** — [仕様](chunk-parallelism/README.md)。実装完了（代表負荷 `WARM=1` 対照の最終判定は `P4-1` で統合確認）：
   - [x] **M3 P1a (`3135354`) / P1b (`b588c03`)**: 負荷非依存カウンタ（M1〜M5）＋ラウンド単位 `TerrainShare`・single-flight `starts`/`rings`・`Arc` `terr_c` により、`full` CPU +88% ペナルティを完全解消。
   - [x] **M3 P2a (`43a463b`) / P2b (`0469ad9`) / P2c (`c06be7c`)**: 常駐 `PalettedSection` モジュール（`src/paletted.rs`）、`SECTION_STORE`・zero-repack チャンク配信、`PalettedSection::uniform_state()` O(1) uniform fast-path。
@@ -88,14 +88,22 @@
 
 ### R5 — Mod 互換層（NeoForge 1.21.1 S0〜S3+）
 
-- [x] **NF-Arch（設計確定）**: [neoforge-architecture.md](mod-compatibility/neoforge-architecture.md)（5 レイヤ構成・`DimId` 対応・バッチ JNI・`shimcheck` 起動前拒否）。
-- [ ] **NF-0 (S0 `shimcheck`)**: `ShimCheck.java`（ASM `9.10.1` + `neoforge.mods.toml` 解析）＋ `tools/shimcheck.py` ＋ テスト。
-- [ ] **NF-1〜NF-4 (S1〜S3)**: Dual Event Bus 動的ロード → S1 主要 6 イベント + `MutationBuffer` → S2 `DeferredRegister` + 名前ベース永続化 → S3 Direct `ByteBuffer` バッチ JNI。
+- [x] **NF-Arch（設計確定 `da9ae45`）**: [neoforge-architecture.md](mod-compatibility/neoforge-architecture.md)（5 レイヤ構成・`DimId` 対応・バッチ JNI・`shimcheck` 起動前拒否）。
+- [x] **NF-0 (S0 `shimcheck` `a092e5d`)**: `ShimCheck.java`（ASM `9.10.1` + `neoforge.mods.toml` 解析）＋ `tools/shimcheck.py` ＋ `tests/shimcheck_test.py`（33 tests PASS）。
+- [x] **NF-1 (動的 Bootstrap & Dual Event Bus `23edfdc`)**: `ShimCheck` ゲート付き複数 Mod 動的ディスカバリ・コンストラクタ注入・`Bus.GAME` / `Bus.MOD` 振り分け・`Dist.CLIENT` 除外・`tests/neoforge_bootstrap_test.py`（計 45 tests PASS）。
+- [ ] **NF-2〜NF-4 (S1〜S3)**: S1 主要 6 イベント + `MutationBuffer` → S2 `DeferredRegister` + 名前ベース永続化 → S3 Direct `ByteBuffer` バッチ JNI。
+
+### R6 — クライアントフォーク計画と Server-Client 共通カーネル（`mc-spine-client`）
+
+- [ ] **CF-0（Server-Client 共有コアの切り出し）**: `src/block_registry.rs` (`26,684` states / `FULL`/`CENTER`/`RIGID`)、`src/entity_collision.rs`、`src/entity_fluid.rs`、`src/paletted.rs`、`src/lighting.rs`、`src/nbt.rs`、`src/brigadier.rs` をサーバーとクライアントフォークの共有クレート境界（Zero-Drift Shared Kernel）として切り出す。
+- [ ] **CF-1（ヘッドレス 1.21.1 決定論的シミュレータ & E2E ボットクライアント）**: 受信チャンク (`0x27`)・ブロック更新 (`0x09`)・エンティティ移動 (`0x5a`) を共有カーネル上で毎 tick ローカル予測し、Vanilla 1.21.1 サーバーおよび `mc-spine` サーバーとの位置・流体・衝突誤差 0 を検証する。
+- [ ] **CF-2（クライアント描画・増分ライティング・Greedy Meshing 接続）**: AGPL コード（Torch 等）を流用せず、`PalettedSection` と `lighting.rs` から直接セクションメッシュを生成する描画パイプラインを接続（Issue `#43` と連携）。
+- [ ] **CF-3（Integrated Server 組み込み）**: シングルプレイ／LAN ホスト用に `mc-spine` をインメモリ Integrated Server としてクライアントフォークへ統合。
 
 ### P4 — 統合前のゲート（自動ではmergeしない）
 
-- [ ] **P4-1 同一SHAの全gateと独立レビュー** — `tests/verify.sh` 完走、native oracle、本番wire、mutation、serial/parallel、adapter、layers/debt、Fossil/structure/feature・dimension回帰の結果を同一revisionで収集。hosted CIを使えない場合は未実行と明記。過去の[Issue #7](https://github.com/nekomario28/mc-spine/issues/7)は古いSHAのレビューなので、現行変更に対して独立レビューを取り直す。
-- [ ] **P4-2 配布物・ライセンス・リリース判定（Stage F1 / F2 出口）** — P0-3（D1〜D5）を完了して tracking/生成物、NOTICE、依存ライセンスとクリーン履歴を照合し、Stage F1（Alpha 公開フォーク）または Stage F2（3次元＋M2/M3 実用公開フォーク）として既知の未対応範囲を明記した上で公開・リリースを判断する。合格していないテストを緑扱いしない。
+- [ ] **P4-1 同一SHAの全gateと独立レビュー** — `tests/verify.sh` 完走、native oracle、本番wire、mutation、serial/parallel、adapter、layers/debt、Fossil/structure/feature・dimension回帰の結果を同一revisionで収集。hosted CIを使えない場合は未実行と明記。過去の[Issue #7](https://github.com/nekomario28/mc-spine/issues/7)はクローズ済み。
+- [x] **P4-2 配布物・ライセンス・リリース判定（Stage F1 完了 `88573be`）** — P0-3（D1〜D5）および `GPL-3.0-or-later`（寄稿は `LGPL-3.0-or-later` とのデュアルライセンス）確定、`main` への Fast-Forward 統合完了。
 
 ## 次の着手
 

@@ -87,7 +87,8 @@ Mineshaftのadmission・dispatcher・piece配置は [Rust接続checkpoint](../ev
 | **完了済 (Wave 0〜3: `8dad8c7`〜`91b19c4`)** | `P2-3-S2b〜d` + `S3` (`1ec70b0`, `0e532bb`, `3a3bb37`), `M3 P2b` (`0469ad9`) | `perf_bench.py` (`a9d8437`), Layer A1-a/b (`3cb6d24`, `b981704`), Layer A2-a/b/c (`c745772`, `785cdf5`, `4d28f01`), Layer A3-a/b/c (`2a4eaf4`, `b105d58`, `91b19c4`) | `igloo` + `P2-1-T2` (`2481b48`), `village_plains` 0-diff 確認 (`2a4eaf4`) | 3 次元配信・パレット化・AVX-512・DAG 並列基盤完了 |
 | **完了済 (Phase A: `d45cb4c`〜`d918eac`)** | **A-1**: `P2-3-S4` (`c40417d`, `tests/dimension_wire.py` E2E) | **A-2**: `Layer A3-a` ワーカーキャッシュ共有 (`d918eac`) | **A-3**: Stage F1 `D5` (`d45cb4c`, `export_public_branch.sh`) | Stage F1 完結、3 次元移動 E2E 完成、DAG 並列の実測高速化 |
 | **完了済 (Phase B: `b2e41b5`〜`e82fbc6`)** | **B-1**: `Layer A4` (`c06be7c`: `uniform_state()` O(1) fast-path + 512-entry `MapChunkCache`) | **B-2**: `Layer A1-c` (`d918eac`: `Cond::Biome(u128)` + `Rule::Seq`) ＋ `P0-2` 監査 (`01a6528`) | **B-3**: `BaseSpawner` + `EntitySpatialGrid` (`b2e41b5`), PGO & 計測記録 (`e82fbc6`) | M3 / Layer A1〜A4 完了（PGO `full j=8` -10.6%、全 dump SHA-256 一致） |
-| **Phase C + NF-0（進行中）** | **C-1**: M2 残 wire 往復検査（時間/天候・クラフト/精錬・戦闘/死亡/リスポーン） | **C-2**: `P2-1-T3` 構造物バッチ工場（Batch B3 採取と共通原因修正） | **NF-0**: S0 `shimcheck` (`ShimCheck.java` + `tools/shimcheck.py`) ／ **C-3**: コンパイラ警告清掃・`P1-1..P1-4` → 同一 SHA 全ゲート監査（`P4-1`） | Stage F2 実用公開フォーク完全到達 ＋ NeoForge S0 ゲート確立 |
+| **完了済 (Phase C + NF-0/NF-1: `171fbbc`〜`88573be`)** | **C-1**: M2 残 wire 往復検査 (`6b07fee`, `tests/m2_gameplay_wire.py`: 時間/天候・クラフト/精錬・2クライアント戦闘/死亡/リスポーン) | **C-2**: `P2-1-T3` Batch B3 (`7f0f0e5`: `desert_pyramid`, `shipwreck`, `ocean_ruin_cold` 0-diff 昇格、計 19 チャンク 0-diff) | **NF-0 & NF-1**: S0 `shimcheck` (`a092e5d`) ＋ 動的 Bootstrap & Dual Event Bus (`23edfdc`, 45 tests PASS) ／ **C-3**: 全モジュール警告 68→0 (`171fbbc`, `6148c25`, `ebc144b`) ＋ `GPL-3.0-or-later` & デュアル寄稿条項 (`88573be`) | Stage F2 実用公開フォーク到達 ＋ NeoForge S0/NF-1 動的ゲート確立 ＋ `main` 統合 |
+| **Phase D（Audit 1/2 修正 & Client Fork R6）** | **D-1**: ランタイム Lock 逆転・EID 衝突・`DimId` 漏れ修正 | **D-2**: Audit 1 ホットパス（`Rule::Seq` ゼロアロケーション化・`ctx.g.sea`・`OriginGrid` 疎バッチ保護・Mansion/Structure biome 判定） | **NF-2 / R6**: S1 6イベント & `MutationBuffer` ＋ クライアントフォーク（`mc-spine-client`）共通契約・差分検証基盤 | 全監査指摘の閉鎖 ＋ Server/Client 協調設計への拡張 |
 
 **原因記述の訂正:** 端のair差とsnowy差を位置の近さだけで同じ原因にまとめた推測は
 撤回する。訂正根拠・区別すべきlookup・次の反証は
@@ -171,7 +172,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 4. **P4 (`DfProg` SIMD/バッチ評価と早期枝刈り)**: MIT `Soju06/hyperchunk`（`df_simd_avx2.c` 等）を先行例に、格子点の SIMD 評価と `material_rule` / `aquifer` の早期枝刈りを行う。
 5. **P5 (ライト・M2物理/Mob・圧縮配信)**: Starlight 概念（全空気/不透明 section の O(1) スキップ、nibble 直接フラッド）、Lithium 概念（`VoxelShape`/AABB キャッシュ）、大量 Mob の構造的軽量化（連続配列による細粒度ロック撤去・空間グリッド索引による `O(N^2)` 排除・AI/経路探索の読み取り並列化）、`libdeflate` / zero-repack 送信を統合する。
 
-**ライセンス境界:** コード流用は MIT/Apache-2.0 等の許容ライセンス（`Soju06/hyperchunk`, `valence-rs`, `MCHPRS`, `0564ab0` 以前の Horizon）に限る（[OSS survey](../evidence/foundation/oss-survey/README.md)）。C2ME・Starlight/ScalableLux・Lithium・`fb1135c` 以降の Horizon・Paper・Pumpkin・SteelMC 等の GPL/LGPL/AGPL 実装は**アルゴリズム概念の参照のみ**とし、コードを一切コピーしない。
+**ライセンス境界:** 本体は `GPL-3.0-or-later`（寄稿は `LGPL-3.0-or-later` および `GPL-3.0-or-later` のデュアルライセンス、[LICENSING.md](../LICENSING.md)）。**C2ME (`MIT`)**、**Lithium (`LGPL-3.0`)**、`Soju06/hyperchunk` (`MIT`)、`valence-rs` (`MIT`)、`MCHPRS` (`MIT`)、`Azalea` (`MIT`) は `GPL-3.0-or-later` と `LGPL-3.0-or-later` の双方とライセンス互換である。外部からコード・手法を取り込む場合は帰属とライセンスを [THIRD_PARTY.md](../THIRD_PARTY.md) / [NOTICE](../NOTICE) に明記し、将来 `LGPL-3.0-or-later` としても配布できるよう `GPL-3.0-only` / `AGPL-3.0`（Torch 等）のコードは直接コピーせずアルゴリズム概念またはブラックボックス比較のみとする。
 
 **出口:** PLANのM3条件を代表負荷で満たし、再現手順・ノイズ・未対応機能を記録する。機能不足で仕事量が減った結果や、地形が異なる条件の旧測定を性能改善へ読み替えない。
 
@@ -183,9 +184,30 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 
 ## R5 — 要求されたMod単位の互換拡張
 
-順序と出口条件は[shim計画](mod-compatibility/shim-plan.md)（S0〜S5）に置く。最初は、mod jarが必要とする面を列挙してshimとの差分を出す `shimcheck`（S0）、次にNeoForgeの単純なMod（S1）、ブロック/アイテムを登録するMod（S2）、バッチ／スナップショット JNI 境界を持つ BlockEntity/tick 基盤（S3）の順に進める。shimの骨組みはユーザーのjarから手元で生成し、リポジトリには入れない。S3 基盤確立後は、別プロジェクトへ切り出さず `mc-spine` 本体上の「汎用オフロードカーネル群（接続グラフ・自動スリープ輸送/加工・Contraption 枠組み・リージョン負荷隔離）＋重量 Mod 固有の薄型加速アダプタ」へ段階拡張する。
+順序と出口条件は[shim計画](mod-compatibility/shim-plan.md)（S0〜S5）に置く。最初は、mod jarが必要とする面を列挙してshimとの差分を出す `shimcheck`（S0、完了 `a092e5d`）、次に動的ブートストラップと Dual Event Bus（NF-1、完了 `23edfdc`）、NeoForgeの単純なMod（S1）、ブロック/アイテムを登録するMod（S2）、バッチ／スナップショット JNI 境界を持つ BlockEntity/tick 基盤（S3）の順に進める。shimの骨組みはユーザーのjarから手元で生成し、リポジトリには入れない。S3 基盤確立後は、別プロジェクトへ切り出さず `mc-spine` 本体上の「汎用オフロードカーネル群（接続グラフ・自動スリープ輸送/加工・Contraption 枠組み・リージョン負荷隔離）＋重量 Mod 固有の薄型加速アダプタ」へ段階拡張する。
 
 **出口:** 対象Mod・版・API範囲・実行テストを特定し、その組み合わせに限った互換性を証明する。
+
+## R6 — クライアントフォーク計画と Server-Client 共通カーネル（`mc-spine-client`）
+
+サーバー（`mc-spine`）で確立した **Minecraft Java 1.21.1 (protocol 767) 厳密準拠のデータ駆動カーネル**をそのままクライアントフォーク（およびヘッドレス検証クライアント／軽量 Rust クライアント）へ展開するため、以下の 4 段階（`CF-0`〜`CF-3`）をロードマップに組み込む：
+
+1. **CF-0（Server-Client 共有コアの切り出し — Zero-Drift Shared Kernel）**:
+   - `mc-spine` 本体内で既に独立モジュール化されている以下の純粋ロジックを、サーバーとクライアントフォークが 100% 同一コードで共有できる共通クレート層（`mc-spine-core` / `mc-spine-proto`）として境界維持する：
+     - **ブロック状態・ボクセル衝突・面支持**：`src/block_registry.rs` (`26,684` states、`FULL`/`CENTER`/`RIGID` 面支持)、`src/entity_collision.rs` (1.21.1 AABB 衝突解決・step-up)、`src/voxel_faces.rs`。
+     - **流体物理・エンティティ移動**：`src/entity_fluid.rs` (`LivingEntity.travel` 水流・溶岩流・浮力・落下減衰)、`src/entity_push.rs`、`src/entity_spatial.rs`。
+     - **チャンクストレージ・ライト・NBT・コマンド**：`src/paletted.rs` (`PalettedSection` wire zero-repack)、`src/lighting.rs` (`0x27`/`0x2a` ライトマスクと nibble 伝播)、`src/nbt.rs`、`src/brigadier.rs` (`0x11` コマンド木とクライアント側サジェスト評価)。
+   - **メリット**：一般的なクライアント実装（Torch や Azalea 等）で最大のバグ源となる「サーバーとクライアントの物理・当たり判定・流体・ブロック予測の微妙なズレ（ラバーバンド現象・位置ズレ）」が、**同一の 1.21.1 Rust カーネルを共有することで構造的にゼロ**になる。
+2. **CF-1（ヘッドレス 1.21.1 決定論的シミュレータ & E2E ボットクライアント）**:
+   - 現行の `tests/protocol767.py` / `tests/m2_gameplay_wire.py` / `tests/dimension_wire.py` を発展させ、Rust 共有カーネル上で動く **ヘッドレス 1.21.1 クライアントランタイム**を構築する。
+   - サーバーから受信した `0x27` Level Chunk With Light、`0x09` Block Update、`0x5a` Set Entity Motion、`0x47` Respawn をクライアント側 `PalettedSection` と `entity_collision` / `entity_fluid` で毎 tick ローカル予測実行し、Vanilla 1.21.1 サーバーおよび `mc-spine` サーバーの双方に対して「クライアント側予測位置 vs サーバー確定位置の誤差 0」を自動検証する。
+3. **CF-2（クライアント側レンダリング・ライティング・メッシュ生成パイプラインとの接続）**:
+   - Issue `#40`（解決済）・`#43`（Torch 増分ライティング比較）で整理した境界に従い、AGPL コード（Torch 等）は一切流用せず（`GPL-3.0-or-later` / `LGPL-3.0-or-later` 互換性を維持）、`mc-spine` の `PalettedSection`（`uniform_state()` O(1) スキップ・`hidden_filler`・`non_air` カウンタ）と `src/lighting.rs` から直接 Greedy Meshing / Chunk Section VBO を生成するクライアント描画層を接続する。
+4. **CF-3（シングルプレイ Integrated Server & Mod 共存）**:
+   - クライアントフォーク内に `mc-spine` を Integrated Server（ローカルメモリ内チャネル通信、TCP ソケット/圧縮オーバーヘッドなし）として組み込み、シングルプレイ／LAN ホストでも `mc-spine` の SIMD/DAG 並列 Worldgen と NeoForge/Fabric Mod 互換レイヤ（R5）をそのまま動かせる構成にする。
+
+**出口:** サーバーとクライアントフォークが 1.21.1 の `block_registry` / `paletted` / `entity_collision` / `entity_fluid` / `brigadier` を二重実装せず共有し、ヘッドレス予測検証（CF-1）と描画クライアント（CF-2/CF-3）の双方で Vanilla 1.21.1 サーバー／`mc-spine` サーバーと完全互換で動作する。
+
 ## 横断規律
 
 - [最小の因果差分から進める手順](worldgen-parity/investigation-workflow.md)を使う。既存captureの再利用→stage/writer特定→小さい実クラス対照→本番到達確認→compiling mutant→変更が固まった対象SHAの全gateと進める。原因の変わらない重い比較を繰り返さない。
