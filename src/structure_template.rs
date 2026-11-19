@@ -427,7 +427,7 @@ pub(crate) enum CappedLimit {
     Const(i32),
     Uniform(i32, i32),
     BiasBottom(i32, i32),
-    VeryBias(i32, i32, i32),
+    VeryBias(i32, i32),
     Clamped(Box<CappedLimit>, i32, i32),
     Trap(i32, i32, i32),
     Norm(f64, f64, i32, i32),
@@ -440,7 +440,7 @@ impl CappedLimit {
             Self::Const(v) => *v,
             Self::Uniform(a, _)
             | Self::BiasBottom(a, _)
-            | Self::VeryBias(a, _, _)
+            | Self::VeryBias(a, _)
             | Self::Trap(a, _, _) => *a,
             Self::Clamped(_, a, _) => *a,
             Self::Norm(_, _, a, _) => *a,
@@ -453,7 +453,7 @@ impl CappedLimit {
             Self::Const(v) => *v,
             Self::Uniform(_, b)
             | Self::BiasBottom(_, b)
-            | Self::VeryBias(_, b, _)
+            | Self::VeryBias(_, b)
             | Self::Trap(_, b, _) => *b,
             Self::Clamped(_, _, b) => *b,
             Self::Norm(_, _, _, b) => *b,
@@ -481,7 +481,6 @@ impl CappedLimit {
             "very_biased_to_bottom" => Self::VeryBias(
                 jint(j, "min_inclusive", jint(j, "min", 0)),
                 jint(j, "max_inclusive", jint(j, "max", 0)),
-                jint(j, "inner", 1),
             ),
             "clamped" => Self::Clamped(
                 Box::new(Self::parse(js(j, "source")?)?),
@@ -570,7 +569,7 @@ fn sample_ip_lcg(
                 a + rng.next_bound(bound)
             }
         }
-        CappedLimit::VeryBias(a, b, _) => {
+        CappedLimit::VeryBias(a, b) => {
             if a >= b {
                 *a
             } else {
@@ -635,6 +634,7 @@ impl Processor {
             .ok_or("missing template processor list")?;
         processors.iter().map(|p| Self::parse(p, reg)).collect()
     }
+    #[cfg(test)]
     pub(crate) fn from_json(value: &crate::json::J, reg: &BReg) -> Result<Self, &'static str> {
         Self::parse(value, reg)
     }
@@ -1227,6 +1227,7 @@ impl Template {
     /// block entities. Callers add their own restrictions on top (the fossil path
     /// requires full cubes), so admission is not baked into placement and one owner
     /// serves every caller.
+    #[cfg(test)]
     pub(crate) fn validate_placement(&self) -> Result<(), &'static str> {
         let reg = crate::block_registry::breg().ok_or("missing block registry")?;
         if !self.entities.is_empty() {

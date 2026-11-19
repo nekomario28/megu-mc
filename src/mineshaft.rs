@@ -18,7 +18,9 @@ struct Entry {
     variant: Variant,
     weight: i32,
     biomes: HashSet<String>,
+    #[cfg(test)]
     step: usize,
+    #[cfg(test)]
     slot: usize,
 }
 struct Config {
@@ -162,11 +164,15 @@ fn config() -> Option<&'static Config> {
                     let weight = field(v, "weight").num() as i32;
                     assert!(weight > 0, "mineshafts: nonpositive weight");
                     let (step, slot) = *slots.get(&id).expect("mineshafts: missing registry slot");
+                    // Keep registry validation in release builds as well.
+                    let _ = (step, slot);
                     Entry {
                         id,
                         variant,
                         weight,
+                        #[cfg(test)]
                         step,
+                        #[cfg(test)]
                         slot,
                         biomes: biomes(field(&s, "biomes"), &mut HashSet::new()),
                     }
@@ -321,10 +327,12 @@ pub(crate) fn reference_order_by_type(keys: impl IntoIterator<Item = (usize, u64
         })
         .collect()
 }
+#[cfg(test)]
 fn packed(x: i32, z: i32) -> u64 {
     u64::from(x as u32) | (u64::from(z as u32) << 32)
 }
 
+#[cfg(test)]
 fn decoration_entries(entries: &[Entry], step: usize) -> Vec<(usize, &Entry)> {
     let mut result: Vec<_> = entries
         .iter()
@@ -335,22 +343,13 @@ fn decoration_entries(entries: &[Entry], step: usize) -> Vec<(usize, &Entry)> {
     result
 }
 
+#[cfg(test)]
 pub(crate) struct References {
     starts: Vec<(u64, Start)>,
-    #[cfg(test)]
     rng_after: HashMap<(usize, usize), (u64, u64)>,
 }
+#[cfg(test)]
 impl References {
-    pub(crate) fn step_count(&self) -> usize {
-        config().map_or(0, |c| {
-            self.starts
-                .iter()
-                .map(|(_, s)| c.entries[s.entry].step + 1)
-                .max()
-                .unwrap_or(0)
-        })
-    }
-
     pub(crate) fn collect(g: &mut Gen, cx: i32, cz: i32) -> Self {
         if g.preset != crate::worldgen::NoisePreset::Overworld || config().is_none() {
             return Self {
@@ -507,13 +506,6 @@ pub(crate) fn exclusion_forbids(
 pub(crate) fn start_id(start: &Start) -> &str {
     let c = config().expect("mineshafts: config");
     &c.entries[start.entry].id
-}
-
-/// The registry step and in-step slot of an admitted start's structure.
-pub(crate) fn start_slot(start: &Start) -> (usize, usize) {
-    let c = config().expect("mineshafts: config");
-    let e = &c.entries[start.entry];
-    (e.step, e.slot)
 }
 
 /// `StructureStart.getBoundingBox`: the union of the piece boxes.

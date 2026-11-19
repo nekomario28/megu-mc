@@ -149,7 +149,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if !valid_expected(expected) || !Path::new(super::WORLD_FILE).is_file() {
             return Err("Missing diagnostic world or invalid expected state".into());
         }
-        super::load_world();
+        super::load_world()?;
         let actual = super::block_at(8, 70, 8);
         if actual != expected {
             return Err(format!("Reload mismatch: {actual} != {expected}").into());
