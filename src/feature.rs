@@ -17,6 +17,7 @@ use crate::trace_env::{env_flag, env_str};
 use crate::worldgen::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 #[cfg(test)]
 #[path = "generation_contract_tests.rs"]
@@ -5210,9 +5211,40 @@ fn p_cf(j: &J) -> Option<Cf> {
 
 type FeatureOrder = Vec<Vec<(u32, String)>>;
 
+/// One pre-resolved entry of a preset's per-step feature order.
+///
+/// Built once in `load_freg` so `populate_body` never re-runs the
+/// `biomes.iter().any(|b| bsteps[b][step].contains(name))` scan nor the
+/// `placed.get(name)` hash lookup on a per-chunk basis. `gi`/`name` are the
+/// values `sort_features` produced; `step_biome_mask` is the union of the bit
+/// indices of every biome whose `bsteps[b][step]` lists `name`, so the
+/// `BiomeFilter`-equivalent `present` test is a single integer AND with the
+/// chunk's `present_mask`. `placed_idx` indexes `placed_vec` directly.
+struct StepEntry {
+    gi: u32,
+    name: String,
+    step_biome_mask: u128,
+    placed_idx: usize,
+}
+
 pub(crate) struct FReg {
     cfg: HashMap<String, Cf>,
-    placed: HashMap<String, Pf>,
+    /// Kept for legacy/test callers (and child placed features) that look a
+    /// placed feature up by name. Shares its `Pf` values with `placed_vec`
+    /// through `Arc`, so both views are the same object.
+    placed: HashMap<String, Arc<Pf>>,
+    /// Direct-index view over the same `Pf` values, used by `populate_body`'s
+    /// hot loop. A `StepEntry.placed_idx` points straight into this vector.
+    placed_vec: Vec<Arc<Pf>>,
+    /// Compact bit index (`0..N`) for every biome name appearing in `bsteps`
+    /// or `ball`. Vanilla 1.21.1 has ~64 biomes, comfortably within `u128`.
+    biome_bits: HashMap<String, u8>,
+    /// Precomputed `ball_biome_mask` per placed-feature name: the union of
+    /// bit(biome) over all biomes whose flattened feature list contains it.
+    ball_masks: HashMap<String, u128>,
+    /// False only if there were more than 128 distinct feature biomes; in
+    /// that defensive case `populate_body` uses the original string path.
+    bit_ok: bool,
     bsteps: HashMap<String, Vec<Vec<String>>>,
     ball: HashMap<String, HashSet<String>>,
     btemp: HashMap<String, f32>,
@@ -5222,6 +5254,8 @@ pub(crate) struct FReg {
     spawn_costs: HashMap<String, HashMap<String, SpawnCost>>,
     spawn_probability: HashMap<String, f32>,
     order: HashMap<NoisePreset, FeatureOrder>,
+    /// Pre-resolved hot-path form of `order`, parallel to it element by element.
+    step_entries: HashMap<NoisePreset, Vec<Vec<StepEntry>>>,
 }
 
 /// `MobSpawnSettings.SpawnerData`: type, min/max group size, Weight value.
@@ -5302,6 +5336,10 @@ fn load_freg() -> FReg {
     let mut reg = FReg {
         cfg: HashMap::new(),
         placed: HashMap::new(),
+        placed_vec: Vec::new(),
+        biome_bits: HashMap::new(),
+        ball_masks: HashMap::new(),
+        bit_ok: true,
         bsteps: HashMap::new(),
         ball: HashMap::new(),
         btemp: HashMap::new(),
@@ -5309,6 +5347,7 @@ fn load_freg() -> FReg {
         spawn_costs: HashMap::new(),
         spawn_probability: HashMap::new(),
         order: HashMap::new(),
+        step_entries: HashMap::new(),
     };
     for (name, b) in Gen::dp_files_any(&["configured_feature", "feature"]) {
         if let Some(j) = jparse(&b) {
@@ -5328,7 +5367,7 @@ fn load_freg() -> FReg {
         if let Some(j) = jparse(&b) {
             if let Some(mut pf) = p_pf(&j) {
                 pf.name = name.clone();
-                reg.placed.insert(name, pf);
+                reg.placed.insert(name, Arc::new(pf));
             }
         }
     }
@@ -5386,6 +5425,51 @@ fn load_freg() -> FReg {
             reg.bsteps.insert(name, steps);
         }
     }
+    // Compact biome -> bit index over every biome that declares features.
+    // Sorted for a deterministic assignment; the only consumer is the integer
+    // mask arithmetic, so the particular bit numbers carry no semantics.
+    let mut names: Vec<&String> = reg.bsteps.keys().chain(reg.ball.keys()).collect();
+    names.sort();
+    names.dedup();
+    let bit_ok = names.len() <= 128;
+    let mut biome_bits = HashMap::with_capacity(names.len());
+    if bit_ok {
+        for (i, name) in names.into_iter().enumerate() {
+            biome_bits.insert(name.clone(), i as u8);
+        }
+    }
+    reg.biome_bits = biome_bits;
+    reg.bit_ok = bit_ok;
+
+    if bit_ok {
+        // `ball_biome_mask` per placed-feature name: the union of bit(biome)
+        // over every biome whose flattened `features` list contains it.
+        // Kept as a registry-level map because `Pf` literals also live in
+        // test modules that this change may not touch.
+        let mut ball_masks: HashMap<String, u128> = HashMap::new();
+        for (biome, feats) in reg.ball.iter() {
+            let Some(&bi) = reg.biome_bits.get(biome) else {
+                continue;
+            };
+            let bit = 1u128 << bi;
+            for f in feats.iter() {
+                *ball_masks.entry(f.clone()).or_insert(0) |= bit;
+            }
+        }
+        reg.ball_masks = ball_masks;
+    }
+
+    // Direct-index view over the same `Pf` values; `StepEntry.placed_idx`
+    // points straight into this vector on the per-chunk hot path.
+    let placed_vec: Vec<Arc<Pf>> = reg.placed.values().cloned().collect();
+    reg.placed_vec = placed_vec;
+    let placed_idx: HashMap<&str, usize> = reg
+        .placed_vec
+        .iter()
+        .enumerate()
+        .map(|(i, pf)| (pf.name.as_str(), i))
+        .collect();
+
     let sources = jparse(include_bytes!("../assets/feature_order_1211.json"))
         .expect("native biome-source iteration");
     for preset in [
@@ -5411,6 +5495,38 @@ fn load_freg() -> FReg {
             .max()
             .unwrap_or(0);
         let order = sort_features(&reg, &biomes, max_steps);
+        // Pre-resolve each order slot's biome mask and placed-feature index so
+        // `populate_body` does no hash lookup / string scan per chunk.
+        let mut step_entries = Vec::with_capacity(order.len());
+        for (step, list) in order.iter().enumerate() {
+            let mut entries = Vec::with_capacity(list.len());
+            for (gi, name) in list {
+                let mut mask = 0u128;
+                if bit_ok {
+                    for (biome, steps) in reg.bsteps.iter() {
+                        if steps
+                            .get(step)
+                            .is_some_and(|l| l.iter().any(|f| f == name))
+                        {
+                            if let Some(&bi) = reg.biome_bits.get(biome) {
+                                mask |= 1u128 << bi;
+                            }
+                        }
+                    }
+                }
+                entries.push(StepEntry {
+                    gi: *gi,
+                    name: name.clone(),
+                    step_biome_mask: mask,
+                    placed_idx: placed_idx
+                        .get(name.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                });
+            }
+            step_entries.push(entries);
+        }
+        reg.step_entries.insert(preset, step_entries);
         reg.order.insert(preset, order);
     }
     reg
@@ -5605,7 +5721,17 @@ fn veg_col_trace(pos: (i32, i32, i32)) -> bool {
     want == Some((pos.0 >> 4, pos.2 >> 4))
 }
 
+// The `ball_biome_mask` of the `Pf` whose modifier chain is currently running.
+// `gen_pf` resolves it once per feature (a single hash lookup) and pushes it;
+// `PM::Biome` then reads the top of this stack, so each placement candidate
+// needs only one integer AND. Nested placed features push their own mask.
+thread_local! {
+    static PF_MASK: std::cell::RefCell<Vec<u128>> = std::cell::RefCell::new(Vec::new());
+}
+
 fn gen_pf(pf: &Pf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
+    let mask = fr.ball_masks.get(&pf.name).copied().unwrap_or(0);
+    PF_MASK.with(|s| s.borrow_mut().push(mask));
     // Modifiers are streams of positions, not passes over a list. Vanilla builds
     // `Stream.of(origin).flatMap(modifier::getPositions)` for each modifier in turn, and the
     // terminal operation places the feature as each position is pulled. So a position produced by
@@ -5618,6 +5744,19 @@ fn gen_pf(pf: &Pf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
     // (0,0) put its veins at y=15 and y=18 instead of y=49 and y=18 - which is why no step index
     // reproduced vanilla's ore cells.
     apply_modifiers(pf.mods.as_slice(), pf, fr, ctx, rng, pos);
+    PF_MASK.with(|s| {
+        s.borrow_mut().pop();
+    });
+}
+
+// Reusable scratch buffers for `apply_modifiers`' per-stage position lists.
+// Each modifier stage used to allocate a fresh `Vec`; with a pool the buffers
+// survive across stages and features and the steady-state path allocates
+// nothing. A buffer is returned to the pool *before* the recursive walk so
+// deeper stages can pop it again.
+thread_local! {
+    static MOD_SCRATCH: std::cell::RefCell<Vec<Vec<(i32, i32, i32)>>> =
+        std::cell::RefCell::new(Vec::new());
 }
 
 fn apply_modifiers(
@@ -5632,9 +5771,15 @@ fn apply_modifiers(
         gen_cf_ref(&pf.feat, fr, ctx, rng, pos);
         return;
     };
-    let mut out = Vec::new();
+    let mut out = MOD_SCRATCH
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_default();
     mod_positions(m, fr, ctx, rng, pos, pf, &mut out);
-    for p in out {
+    // Hand the (now empty) buffer back before recursing: each nested stage can
+    // reuse it, so a whole feature's modifier chain may allocate no new Vec.
+    let positions = std::mem::take(&mut out);
+    MOD_SCRATCH.with(|p| p.borrow_mut().push(out));
+    for p in positions {
         apply_modifiers(rest, pf, fr, ctx, rng, p);
     }
 }
@@ -5665,6 +5810,69 @@ fn gen_cf_ref(fref: &FRef, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: 
         },
         FRef::Inline(cf) => gen_cf(cf, fr, ctx, rng, pos),
     }
+}
+
+/// Thread-local `leaf -> biome-bit` cache used by `PM::Biome` during the
+/// dynamic extent of `populate_body`, where all feature placement on this
+/// thread happens. Each distinct biome leaf is resolved at most once per
+/// chunk (a handful of values in practice), after which the hot check is a
+/// single array index plus an integer AND — no `String` allocation and no
+/// hash lookup per placement candidate. Leaves >= 128 fall back to the
+/// original string path. `active` is false outside `populate_body`, which
+/// keeps direct callers (unit tests, structure-pipeline tests) on the exact
+/// pre-change path.
+struct LeafBitCache {
+    active: bool,
+    bits: [u128; 128],
+    known: u128,
+}
+thread_local! {
+    static LEAF_BITS: std::cell::RefCell<LeafBitCache> = std::cell::RefCell::new(LeafBitCache {
+        active: false,
+        bits: [0; 128],
+        known: 0,
+    });
+}
+
+/// Test-only override that makes `FC::biome` return a pinned leaf regardless
+/// of position; the fast path must defer to the original path when it is set.
+#[cfg(test)]
+fn test_biome_leaf(ctx: &FC) -> Option<u16> {
+    ctx.test_biome_leaf
+}
+#[cfg(not(test))]
+fn test_biome_leaf(_ctx: &FC) -> Option<u16> {
+    None
+}
+
+/// Resolve the bit for a biome leaf, caching it in `LEAF_BITS`. Returns
+/// `None` only when the leaf cannot be resolved by the fast path (leaf index
+/// out of range), in which case the caller uses the original string path.
+fn leaf_bit(ctx: &mut FC, fr: &FReg, leaf: u16) -> Option<u128> {
+    if usize::from(leaf) >= 128 {
+        return None;
+    }
+    let l = usize::from(leaf);
+    let flag = 1u128 << l;
+    let (known, cached) = LEAF_BITS.with(|c| {
+        let c = c.borrow();
+        (c.known & flag != 0, c.bits[l])
+    });
+    if known {
+        return Some(cached);
+    }
+    // At most one allocation / name lookup per distinct leaf per chunk.
+    let bit = ctx
+        .g
+        .biome_name_of_leaf(leaf)
+        .and_then(|name| fr.biome_bits.get(&name).copied())
+        .map_or(0, |i| 1u128 << i);
+    LEAF_BITS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.bits[l] = bit;
+        c.known |= flag;
+    });
+    Some(bit)
 }
 
 fn mod_positions(
@@ -5773,34 +5981,69 @@ fn mod_positions(
         }
         PM::Fixed => out.push(pos),
         PM::Biome => {
-            if let Some(b) = ctx.biome(pos.0, pos.1, pos.2) {
-                let ok = fr
-                    .ball
-                    .get(&b)
-                    .map(|s| s.contains(&pf.name))
-                    .unwrap_or(false);
-                if let Some(spec) = env_str!("BIOMEF_TRACE") {
-                    if let Some((a, c)) = spec.split_once(',') {
-                        if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
-                            if (pos.0 >> 4) == cx && (pos.2 >> 4) == cz {
-                                let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
-                                eprintln!(
-                                    "BIOMEF {} {} {} {} biome={} feature={},{}",
-                                    pos.0,
-                                    pos.1,
-                                    pos.2,
-                                    ok,
-                                    b,
-                                    cf >> 32,
-                                    cf & 0xFFFF
-                                );
-                            }
+            let trace_spec = env_str!("BIOMEF_TRACE");
+            // `FC::biome` selects the blended biome's leaf, falling back to
+            // the quart-sampled leaf; mirror that leaf selection exactly so
+            // the fast path and the original string path agree 100%.
+            let fast = fr.bit_ok
+                && test_biome_leaf(ctx).is_none()
+                && LEAF_BITS.with(|c| c.borrow().active);
+            let leaf = if fast {
+                ctx.g
+                    .biome_blended(pos.0, pos.1, pos.2)
+                    .map(|(_, l)| l)
+                    .or_else(|| {
+                        ctx.g
+                            .biome_quart(pos.0 >> 2, pos.1 >> 2, pos.2 >> 2, None)
+                            .map(|(_, l)| l)
+                    })
+                    .filter(|l| usize::from(*l) < 128)
+            } else {
+                None
+            };
+            let mut ok = false;
+            let mut bname: Option<String> = None;
+            if let Some(leaf) = leaf {
+                // At most one name lookup / allocation per distinct leaf.
+                let bit = leaf_bit(ctx, fr, leaf);
+                let mask = PF_MASK.with(|s| s.borrow().last().copied().unwrap_or(0));
+                ok = bit.is_some_and(|b| (mask & b) != 0);
+                if trace_spec.is_some() {
+                    bname = ctx.g.biome_name_of_leaf(leaf);
+                }
+            } else {
+                // Defensive fallback: test override, overflow, or outside a
+                // populate pass. This is the exact original path.
+                if let Some(b) = ctx.biome(pos.0, pos.1, pos.2) {
+                    ok = fr
+                        .ball
+                        .get(&b)
+                        .map(|s| s.contains(&pf.name))
+                        .unwrap_or(false);
+                    bname = Some(b);
+                }
+            }
+            if let Some(spec) = trace_spec {
+                if let Some((a, c)) = spec.split_once(',') {
+                    if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
+                        if (pos.0 >> 4) == cx && (pos.2 >> 4) == cz {
+                            let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "BIOMEF {} {} {} {} biome={} feature={},{}",
+                                pos.0,
+                                pos.1,
+                                pos.2,
+                                ok,
+                                bname.as_deref().unwrap_or(""),
+                                cf >> 32,
+                                cf & 0xFFFF
+                            );
                         }
                     }
                 }
-                if ok {
-                    out.push(pos);
-                }
+            }
+            if ok {
+                out.push(pos);
             }
         }
         PM::BlockPred(p) => {
@@ -9699,12 +9942,20 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
     // `river` - which silently skipped `trees_water` (step 9 index 48) in chunk
     // (-2,1) and left the canopies of its trees missing here (measured: the draw
     // streams for that chunk's trees_birch_and_oak then diverged at draw 120).
-    let mut biomes: Vec<String> = vec![];
-    let mut seen: HashSet<String> = HashSet::new();
+    // Zero-allocation 3x3 biome union: map each biome name straight to its
+    // precomputed bit. The legacy `Vec<String>` is built only under the
+    // defensive >128-biome fallback, so the normal path clones no names.
+    let use_bits = fr.bit_ok;
+    let mut present_mask: u128 = 0;
+    let mut biomes: Vec<String> = Vec::new();
     for dx in -1..=1 {
         for dz in -1..=1 {
             for b in g.chunk_biome_set(sx + dx, sz + dz).iter() {
-                if seen.insert(b.clone()) {
+                if use_bits {
+                    if let Some(&bit) = fr.biome_bits.get(b) {
+                        present_mask |= 1u128 << bit;
+                    }
+                } else if !biomes.iter().any(|v| v == b) {
                     biomes.push(b.clone());
                 }
             }
@@ -9735,10 +9986,26 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
     // chunk at the FEATURES step. See `Gen::feature_write_allowed` for the refusal and
     // for the chunk-level half of vanilla's rule that is deliberately not modelled.
     g.pop_active = Some((sx, sz));
+    let preset = g.preset;
     let mut structures = References::collect(g, sx, sz);
     let mut ctx = FC::new(g);
+    // Activate the thread-local leaf -> bit cache for this pass. Every
+    // `mod_positions` call below runs on this same thread, so at most a
+    // handful of leaf names are resolved per chunk and the rest of the
+    // `PM::Biome` checks are a single array index plus an integer AND.
+    LEAF_BITS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.active = true;
+        c.known = 0;
+    });
     let trace = env_flag!("FEAT_TRACE");
     let profile = env_flag!("FEAT_PROFILE");
+    // Hoisted out of the per-feature loop: the env macros cache their answer,
+    // but a hoisted `Option<&str>` avoids even the static load on every slot.
+    let attempt_trace = env_str!("FEATURE_ATTEMPT_TRACE");
+    let fseed_arm = env_str!("FSEED_ARM");
+    let fseed_trace = env_str!("FSEED_TRACE");
+    let cell_trace = env_str!("FEATURE_CELL_TRACE").is_some();
     // M3 P1a M5: the decoration steps only, without the carver stage above or the promotion
     // and write-out below. Load-dependent by construction (it is a stopwatch), which is why
     // the P1a conclusion rests on the M1-M4 counts and this only splits the remainder.
@@ -9748,25 +10015,40 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
         // Their registry slots and RNG streams are independent.
         structures.place_step(&mut ctx, step, pop as u64, sx, sz);
         let Some(entries) = order.get(step) else { continue };
-        for (gi, name) in entries {
-            let present = biomes.iter().any(|b| {
-                fr.bsteps
-                    .get(b)
-                    .and_then(|s| s.get(step))
-                    .map(|l| l.iter().any(|f| f == name))
-                    .unwrap_or(false)
-            });
+        let bit_entries = fr.step_entries.get(&preset).and_then(|v| v.get(step));
+        for (ei, (gi, name)) in entries.iter().enumerate() {
+            let slot = bit_entries.map(|v| &v[ei]);
+            let present = if use_bits {
+                slot.is_some_and(|s| (present_mask & s.step_biome_mask) != 0)
+            } else {
+                biomes.iter().any(|b| {
+                    fr.bsteps
+                        .get(b)
+                        .and_then(|s| s.get(step))
+                        .map(|l| l.iter().any(|f| f == name))
+                        .unwrap_or(false)
+                })
+            };
             if !present {
                 continue;
             }
-            let Some(pf) = fr.placed.get(name) else {
-                continue;
+            let pf: &Pf = if use_bits {
+                let idx = slot.expect("step entry parallel to order").placed_idx;
+                if idx == usize::MAX {
+                    continue;
+                }
+                &*fr.placed_vec[idx]
+            } else {
+                let Some(p) = fr.placed.get(name) else {
+                    continue;
+                };
+                p
             };
             // Feature-attempt trace, for comparing the *placement pipeline* with the native side
             // (`SPLACE` from the agent's `ebq.a` hook): one line per (chunk, placed feature) in
             // the order they are attempted, which is what localises an RNG-stream divergence to
             // the first feature that differs. `FEATURE_ATTEMPT_TRACE=1`.
-            if env_str!("FEATURE_ATTEMPT_TRACE").is_some() {
+            if attempt_trace.is_some() {
                 eprintln!("SATTEMPT {name} {sx} {sz} {gi} {step}");
             }
             let deco = pop
@@ -9782,7 +10064,7 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
             );
             // feature placement sees a `WorldgenRandom` (legacy draw semantics)
             let mut rng = Xor::seed_worldgen(deco);
-            if let Some(spec) = env_str!("FSEED_ARM") {
+            if let Some(spec) = fseed_arm {
                 let arm = if spec
                     .split(';')
                     .any(|want| want == format!("{sx},{sz},{gi},{step}"))
@@ -9796,7 +10078,7 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
                 crate::generation_math::FTRACE.store(arm, std::sync::atomic::Ordering::Relaxed);
                 crate::generation_math::DTRACE.store(arm, std::sync::atomic::Ordering::Relaxed);
             }
-            if let Some(spec) = env_str!("FSEED_TRACE") {
+            if let Some(spec) = fseed_trace {
                 if let Some((a, b)) = spec.split_once(',') {
                     if a.parse::<i32>() == Ok(sx) && b.parse::<i32>() == Ok(sz) {
                         eprintln!("FSEED {pop} {gi} {step}");
@@ -9810,7 +10092,7 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
             } else {
                 None
             };
-            if env_str!("FEATURE_CELL_TRACE").is_some() {
+            if cell_trace {
                 eprintln!("FCTX {sx} {sz} {gi} {step} {name}");
             }
             gen_pf(pf, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
@@ -9857,6 +10139,7 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
         g.feat_write(x, y, z, st);
     }
     g.stage_payloads((sx, sz), &mut staged_payloads);
+    LEAF_BITS.with(|c| c.borrow_mut().active = false);
 }
 
 /// The chunk-promotion boundary: `ChunkMap`'s load path (`getChunkRangeFuture(pos, 1, FULL)`
@@ -10348,6 +10631,139 @@ mod carver_parity_tests {
         assert_eq!(cold.0, warm.0, "the carve writes differ");
         assert_eq!(cold.1, warm.1, "the post-carve WG heightmaps differ");
         assert_eq!(cold.2, warm.2, "the mark order differs");
+    }
+}
+
+#[cfg(test)]
+mod a3b_tests {
+    use super::*;
+
+    /// Every precomputed bitmask must agree exhaustively with the original
+    /// string-set lookups it replaced: `ball_biome_mask` against `fr.ball`,
+    /// and each `StepEntry.step_biome_mask` against `fr.bsteps[b][step]`,
+    /// for all presets, steps and placed features.
+    #[test]
+    fn a3b_biome_bitmask_matches_bsteps_and_ball_exhaustively() {
+        let fr = freg();
+        assert!(
+            fr.bit_ok,
+            "the vanilla 1.21.1 feature biome set must fit in u128"
+        );
+
+        // `ball_masks`: exactly the biomes whose flattened feature list
+        // contains the placed feature, no more and no less.
+        for pf in fr.placed_vec.iter() {
+            let mask = fr.ball_masks.get(&pf.name).copied().unwrap_or(0);
+            for (biome, &b) in fr.biome_bits.iter() {
+                let expected = fr
+                    .ball
+                    .get(biome)
+                    .is_some_and(|s| s.contains(&pf.name));
+                let fast = (mask & (1u128 << b)) != 0;
+                assert_eq!(
+                    fast, expected,
+                    "ball mask mismatch for {biome}/{}",
+                    pf.name
+                );
+            }
+        }
+        // Every `ball` member also has a placed feature with that bit set.
+        for (biome, feats) in fr.ball.iter() {
+            let b = 1u128 << fr.biome_bits[biome];
+            for name in feats {
+                let mask = fr.ball_masks.get(name).copied().unwrap_or(0);
+                assert_ne!(mask & b, 0, "ball membership lost for {biome}/{name}");
+            }
+        }
+
+        // `step_biome_mask`: parallel to `order` and equal to the set of
+        // biomes whose `bsteps[b][step]` lists that entry's feature.
+        for (preset, order) in fr.order.iter() {
+            let entries = &fr.step_entries[preset];
+            assert_eq!(entries.len(), order.len(), "{preset:?} step count");
+            for (step, (list, elist)) in order.iter().zip(entries.iter()).enumerate() {
+                assert_eq!(list.len(), elist.len(), "{preset:?} step {step} count");
+                for ((gi, name), e) in list.iter().zip(elist.iter()) {
+                    assert_eq!(e.gi, *gi, "{preset:?} step {step} gi");
+                    assert_eq!(&e.name, name, "{preset:?} step {step} name");
+                    let pf = &fr.placed_vec[e.placed_idx];
+                    assert_eq!(pf.name, *name, "{preset:?} step {step} placed_idx");
+                    for (biome, &b) in fr.biome_bits.iter() {
+                        let expected = fr
+                            .bsteps
+                            .get(biome)
+                            .and_then(|s| s.get(step))
+                            .is_some_and(|l| l.iter().any(|f| f == name));
+                        let fast = (e.step_biome_mask & (1u128 << b)) != 0;
+                        assert_eq!(
+                            fast, expected,
+                            "step mask mismatch {preset:?} step {step} {biome}/{name}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The fast path's leaf selection (`biome_blended`, falling back to the
+    /// quart sample) and `leaf_bit_cache` must give the same biome name and
+    /// bit as `FC::biome` for sample coordinates in every dimension.
+    #[test]
+    fn a3b_leaf_bit_cache_matches_biome_name_for_all_presets() {
+        crate::test_support::require_vanilla_data();
+        let _gen = crate::worldgen::lock_gen_for_tests();
+        let fr = freg();
+        let coords = [
+            (0, 0, 0),
+            (7, 64, 9),
+            (-3, 120, -5),
+            (16, 32, 48),
+            (1, -8, 2),
+        ];
+        for preset in [
+            NoisePreset::Overworld,
+            NoisePreset::Nether,
+            NoisePreset::End,
+        ] {
+            let mut g =
+                Gen::load_preset(4242, crate::name_to_state, preset).expect("datapack");
+            let mut ctx = crate::generation_context::FC::new(&mut g);
+            for (x, y, z) in coords {
+                let expected = ctx.biome(x, y, z);
+                let leaf = ctx
+                    .g
+                    .biome_blended(x, y, z)
+                    .map(|(_, l)| l)
+                    .or_else(|| {
+                        ctx.g
+                            .biome_quart(x >> 2, y >> 2, z >> 2, None)
+                            .map(|(_, l)| l)
+                    })
+                    .filter(|l| usize::from(*l) < 128);
+                let actual = leaf.and_then(|l| ctx.g.biome_name_of_leaf(l));
+                assert_eq!(expected, actual, "{preset:?} at ({x},{y},{z})");
+                if let Some(l) = leaf {
+                    LEAF_BITS.with(|c| {
+                        let mut c = c.borrow_mut();
+                        c.active = true;
+                        c.known = 0;
+                    });
+                    let bit = leaf_bit(&mut ctx, fr, l);
+                    let want = expected
+                        .as_deref()
+                        .and_then(|n| fr.biome_bits.get(n).copied())
+                        .map_or(0, |i| 1u128 << i);
+                    assert_eq!(bit, Some(want), "{preset:?} leaf bit at ({x},{y},{z})");
+                    // A second lookup from the cache must return the same bit.
+                    assert_eq!(
+                        leaf_bit(&mut ctx, fr, l),
+                        Some(want),
+                        "{preset:?} cached leaf bit at ({x},{y},{z})"
+                    );
+                    LEAF_BITS.with(|c| c.borrow_mut().active = false);
+                }
+            }
+        }
     }
 }
 
