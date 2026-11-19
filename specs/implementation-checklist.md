@@ -46,7 +46,7 @@
 - [ ] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー — Stage F1）** — `762f312` で D1〜D4 を解消済み。残る D5（`--strict-public` の残 5 項目とクリーン公開基点）が閉じるまで `main` へマージ／外部公開しない（内部実装は並行可能）：
   - [x] **D1/D2 (`F1-1`, `762f312`)**: `tools/vanilla_data/gen_vanilla_data.sh`（`--verify` 2,350 ファイル・SHA-256 照合）と `assets/block_states_1211.json` の jar 自前生成化を完了。
   - [x] **D3/D4 (`F1-2`, `762f312`)**: Pumpkin (GPL-3.0) 同値の旧 `assets/pblocks.json`・`assets/properties.json` および出所不明の `resourcepack.zip` を消費者切替の上で削除し、`tools/provenance_check.py`（`--self-test` 11/11 PASS、`--strict-public` 対応）をゲート追加。
-  - [ ] **D5 (`F1-3`)**: `--strict-public` 残 5 項目（`datapacks/vanilla`, `assets/block_states_1211.json`, `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv`, `config_packets.bin`）の公開扱い整理、`LICENSE` / `NOTICE` / `THIRD_PARTY.md` / `README.md` の実ツリー完全一致、および旧データ履歴を含まない公開用クリーン基点（orphan/squash）手順の確定。
+  - [x] **D5 (`F1-3`, `d45cb4c`)**: `--strict-public` 残 5 項目（`datapacks/vanilla`, `assets/block_states_1211.json`, `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv`, `config_packets.bin`）および開発側 TSV 2 件の公開候補除外スクリプト `tools/export_public_branch.sh`・`tests/public_export_test.py`・`LICENSE` / `NOTICE` / `THIRD_PARTY.md` / `README.md` / `LICENSING.md` 整合を完了（外部公開の最終承認は `LICENSING.md` §5 オーナー判断）。
 - [ ] **P0-4 native比較契約の固定** — Fossilが**正に配置される**fixture、complete FULL chunks、必要halo、sourceの生成順、2回のnative採取の再現性を定義。artifactに入力・SHA・対象セル数・除外数・pending tick・writerを記録し、古い測定値の流用を防ぐ。
 
 ### P1 — Template finalization（**最優先の実装列**）
@@ -65,13 +65,13 @@
   - [x] **P2-1-T2 (`2481b48`)**: `structure_pipeline::load_defs_inner` で1つの不正な構造物 JSON が全パイプラインを `None` に落とす欠陥を要素単位の fail-skip + ログに修正。
   - [ ] **P2-1-T3 & 残存構造物受入（Phase C）**: `bb6ec7c` で汎用レシピ `tools/structure_capture.py` 整備＋`ruined_portal` B-run・`monument` を 0-diff 昇格（promotable manifest **14 行**）。`2481b48` で `igloo`（`SnowyDirtBlock` 8セル差）を 0-diff 化、`2a4eaf4` 時点で `village_plains` も 0-diff を確認済み。残る未受入定義をバッチ受入工場（Phase C）で段階的受入。
 - [ ] **P2-2 残るconfigured featuresと実chunk差分** — `bonus_chest` および End の `minecraft:end_spike` は実装・native oracle 照合・4 mutation ゲート済み（`src/feature.rs`, `src/generation_contract_tests.rs`, `tools/mutation_check.sh`）。残る `sculk_patch` 等の最新HEAD・同一population順再計測と `sculk_gate.py --require-match` 判断を閉じる。
-- [ ] **P2-3 三dimensionの通常サーバー経路（Stage F2 の中核）** — `MC_SPINE_WG_PRESET=end|nether` は offline 診断限定のため、以下の S0〜S4 で通常サーバーの3次元生成・保存・配信・移動を完成させる：
+- [x] **P2-3 三dimensionの通常サーバー経路（Stage F2 の中核）** — `MC_SPINE_WG_PRESET=end|nether` は offline 診断限定のため、以下の S0〜S4 で通常サーバーの3次元生成・保存・配信・移動を完成済み：
   - [x] **P2-3-S0 (`ffb7a22`)**: `tests/protocol767.py` CLI ハーネスの次元対応（`dimension_type` の `min_y`/`height`/`has_skylight` 動的解釈）。
   - [x] **P2-3-S1 (`71e96a5`)**: `DimId` (`Overworld | Nether | End`) と次元別 `Gen` レジストリ（同一 seed 初期化）、`chunk_data` / `write_light_arrays` への `DimId` 配線。
   - [x] **P2-3-S2a (`2e95617`)**: `WORLD` オーバーレイの `DimChunkKey = (DimId, i32, i32)` 化・次元別コンパニオンセーブ・旧 `world_overlay.bin` 後方互換（選択 mutation 4/4 proved）。
   - [x] **P2-3-S2b〜d (`1ec70b0`, `0e532bb`)**: 残り 8 ストア（`S2b`: `CHESTS`/`FURNACES`/`CROPS`、`S2c`: `SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`、`S2d`: `POS_STORE`）の `DimId` キー化。
   - [x] **P2-3-S3 (`3a3bb37`)**: Nether/End の 16 セクション（`0..256`）チャンク構築と `has_skylight == false` 時の `skyLightMask = 0` 配信。
-  - [ ] **P2-3-S4（Phase A-1 回収中）**: `0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン次元復元の wire 検証。
+  - [x] **P2-3-S4**: `0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン次元復元の wire 検証（`tests/dimension_wire.py` PASS、選択 mutation 8/8 proved）。
 
 ### P3 — M2 gameplay / M3性能（WorldGenと証拠を混ぜない）
 

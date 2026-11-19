@@ -357,7 +357,7 @@ control() {
   local name="$1" filter="$2" phase="$3" pattern
   run_filter "$filter"
   if [[ "$filter" == tests/*.py ]]; then
-    pattern='^((client settings|gameplay|containers) wire: PASS|population plan: PASS|mineshaft dispatch: PASS)$'
+    pattern='^((client settings|gameplay|containers|dimension) wire: PASS|population plan: PASS|mineshaft dispatch: PASS)$'
   else
     pattern='^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored'
   fi
@@ -3794,6 +3794,60 @@ check "p2_3_s3_band_cache_is_keyed_by_dimension" \
   src/main.rs '    let band = op_bands().lock().unwrap().get((dim, cx, cz))?;' \
   '    let band = op_bands().lock().unwrap().get((DimId::Overworld, cx, cz))?;' \
   tick_tests::p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords
+
+# P2-3-S4: the dimension a client is in has to reach the wire id, the 0x47 payload, the
+# chunk window, the block-delta audience and the persisted position. Each mutant below
+# breaks one of those links and leaves the rest of the Overworld path identical.
+check "p2_3_s4_wire_id_is_the_registry_id" \
+  src/main.rs '    dim_type_wire_ids()[dim.index()]' \
+  '    dim.index() as i32' \
+  tick_tests::p2_3_s4_dimension_type_wire_ids_come_from_the_pinned_registry
+
+check "p2_3_s4_join_game_declares_every_dimension" \
+  src/main.rs '    write_varint(&mut p, 3);
+    for d in DimId::ALL {' \
+  '    write_varint(&mut p, 1);
+    for d in DimId::ALL {' \
+  tick_tests::p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim
+
+check "p2_3_s4_spawn_info_uses_wire_id" \
+  src/main.rs '    write_varint(&mut p, dim_type_wire_id(dim) as i64);' \
+  '    write_varint(&mut p, dim.index() as i64);' \
+  tick_tests::p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim
+
+check "p2_3_s4_switch_clears_the_old_window" \
+  src/main.rs '        me.chunks.lock().unwrap().clear();' \
+  '        me.chunks.lock().unwrap().insert((9999, 9999));' \
+  tick_tests::p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_position
+
+check "p2_3_s4_respawn_names_the_destination" \
+  src/main.rs '    let mut rp = spawn_info_dim(new_dim, gm);' \
+  '    let mut rp = spawn_info_dim(DimId::Overworld, gm);' \
+  tick_tests::p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_position
+
+check "p2_3_s4_portal_horizontal_scaling" \
+  src/main.rs '        (DimId::Nether, bx as f64 / 8.0, bz as f64 / 8.0)' \
+  '        (DimId::Nether, bx as f64, bz as f64)' \
+  tick_tests::p2_3_s4_portal_scaling_clamps_y_and_the_arrival_guard_blocks_bounce
+
+check "p2_3_s4_logout_saves_the_live_dimension" \
+  src/main.rs '    let d = *c.dim.lock().unwrap();
+    (d, p.0, p.1, p.2, p.3, p.4)' \
+  '    let d = DimId::Overworld;
+    (d, p.0, p.1, p.2, p.3, p.4)' \
+  tick_tests::p2_3_s4_logout_persists_the_clients_live_dimension
+
+check "p2_3_s4_chunk_deltas_respect_the_dimension_filter" \
+  src/main.rs '        |c| *c.dim.lock().unwrap() == dim && c.chunks.lock().unwrap().contains(&(cx, cz)),' \
+  '        |c| c.chunks.lock().unwrap().contains(&(cx, cz)),' \
+  tick_tests::p2_3_s4_broadcast_chunk_dim_filters_other_dimensions
+
+# The same filter, observed end-to-end with two live clients on the wire. This gate is not
+# selected by MUTATION_FILTER=p2_3_s4 (its filter names the script), but the full campaign runs it.
+check "p2_3_s4_block_deltas_are_dimension_scoped" \
+  src/main.rs '        |c| *c.dim.lock().unwrap() == dim && c.chunks.lock().unwrap().contains(&(cx, cz)),' \
+  '        |c| c.chunks.lock().unwrap().contains(&(cx, cz)),' \
+  tests/dimension_wire.py "dimension wire: FAIL nether-edit-leaked-to-overworld"
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then

@@ -86,6 +86,7 @@ trap 'rm -f "$build_manifest"' EXIT
 cargo build --offline --locked -j 2 --message-format=json-render-diagnostics >"$build_manifest"
 binary=$(python3 tools/cargo_executable.py <"$build_manifest")
 timeout 180 python3 tests/wire_smoke.py "$binary"
+timeout 180 python3 tests/dimension_wire.py "$binary"
 timeout 180 python3 tests/client_settings_wire.py "$binary"
 timeout 180 python3 tests/gameplay_wire.py "$binary"
 timeout 180 python3 tests/container_wire.py "$binary"

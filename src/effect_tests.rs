@@ -55,6 +55,11 @@ pub(super) fn client_pair() -> (Client, TcpStream) {
         walk_acc: Mutex::new(0.0),
         lastp: Mutex::new((0.0, 70.0, 0.0)),
         spawn_pt: Mutex::new(None),
+        dim: Mutex::new(DimId::Overworld),
+        spawn_dim: Mutex::new(DimId::Overworld),
+        view: Mutex::new(2),
+        in_portal: Mutex::new(false),
+        portal_at: Mutex::new(None),
         held: Mutex::new(0),
         effs: Mutex::new(Vec::new()),
     };

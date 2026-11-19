@@ -8401,3 +8401,209 @@ fn p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords() {
         assert_eq!(slots.len(), sections, "{dim:?}: section store window");
     }
 }
+
+// ---------- P2-3-S4: cross-dimension client flow ----------
+fn s4_varint(b: &[u8], p: &mut usize) -> i64 {
+    let mut v = 0i64;
+    let mut shift = 0;
+    for _ in 0..5 {
+        let byte = b[*p];
+        *p += 1;
+        v |= i64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return v;
+        }
+        shift += 7;
+    }
+    panic!("oversized varint");
+}
+fn s4_str(b: &[u8], p: &mut usize) -> String {
+    let n = s4_varint(b, p) as usize;
+    let s = String::from_utf8(b[*p..*p + n].to_vec()).unwrap();
+    *p += n;
+    s
+}
+/// The spawn-info struct shared by 0x2b and 0x47: (wire dimension_type id, dimension name).
+fn s4_spawn_info(b: &[u8], p: &mut usize) -> (i64, String) {
+    let id = s4_varint(b, p);
+    let name = s4_str(b, p);
+    *p += 8; // seed
+    for _ in 0..4 {
+        *p += 1;
+    } // gamemode, prev, is_debug, is_flat
+    if b[*p] != 0 {
+        *p += 1;
+        s4_str(b, p); // death dimension
+        *p += 8;
+    } else {
+        *p += 1;
+    }
+    s4_varint(b, p); // portal cooldown
+    (id, name)
+}
+
+#[test]
+fn p2_3_s4_dimension_type_wire_ids_come_from_the_pinned_registry() {
+    // The blob must be readable from the crate root: the ids are derived from it, not
+    // hard-coded, so a regenerated registry with a different order changes the wire id.
+    assert!(std::path::Path::new("config_packets.bin").exists());
+    let parsed = parse_dim_type_wire_ids().expect("dimension_type registry in config_packets.bin");
+    assert_eq!(parsed, [0, 3, 2]);
+    assert_eq!(dim_type_wire_id(DimId::Overworld), 0);
+    assert_eq!(dim_type_wire_id(DimId::Nether), 3);
+    assert_eq!(dim_type_wire_id(DimId::End), 2);
+    // The wire id is NOT the internal slot index: Nether is slot 1 but wire id 3.
+    assert_ne!(dim_type_wire_id(DimId::Nether), DimId::Nether.index() as i32);
+}
+
+#[test]
+fn p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim() {
+    for (dim, id, name) in [
+        (DimId::Overworld, 0, "minecraft:overworld"),
+        (DimId::Nether, 3, "minecraft:the_nether"),
+        (DimId::End, 2, "minecraft:the_end"),
+    ] {
+        let bytes = join_game(dim, 1);
+        let mut p = 0;
+        let _eid = i32::from_be_bytes(bytes[..4].try_into().unwrap()); // entity id
+        p += 4;
+        assert_eq!(bytes[p], 0);
+        p += 1; // hardcore
+        let count = s4_varint(&bytes, &mut p);
+        assert_eq!(count, 3, "every reachable dimension must be declared");
+        let mut names = Vec::new();
+        for _ in 0..count {
+            names.push(s4_str(&bytes, &mut p));
+        }
+        assert_eq!(
+            names,
+            vec![
+                "minecraft:overworld",
+                "minecraft:the_nether",
+                "minecraft:the_end"
+            ]
+        );
+        s4_varint(&bytes, &mut p); // max players
+        s4_varint(&bytes, &mut p); // view distance
+        s4_varint(&bytes, &mut p); // simulation distance
+        p += 3; // reduced debug, respawn screen, limited crafting
+        assert_eq!(s4_spawn_info(&bytes, &mut p), (id, name.to_string()));
+        assert_eq!(bytes[p], 0); // secure chat off
+        p += 1;
+        assert_eq!(p, bytes.len(), "join_game left trailing bytes");
+    }
+}
+
+#[test]
+fn p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_position() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    crate::test_support::require_vanilla_data();
+    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
+    assert!(worldgen::init(0, crate::name_to_state), "overworld");
+    assert!(
+        worldgen::init_dim(DimId::Nether, 0, crate::name_to_state),
+        "nether"
+    );
+
+    let (client, mut receiver) = client_pair();
+    *client.dim.lock().unwrap() = DimId::Overworld;
+    *client.pos.lock().unwrap() = (7.5, 70.0, 9.5, 10.0, 20.0, true);
+    client.seen.lock().unwrap().insert(4242);
+    client.chunks.lock().unwrap().insert((0, 0));
+    client.gen_sources.lock().unwrap().insert((0, 0), Vec::new());
+    let client = Arc::new(client);
+    // A far-away chunk proves the whole window was dropped, not just the centre.
+    client.chunks.lock().unwrap().insert((90, 90));
+
+    switch_client_dimension(&client, DimId::Nether, (100.5, 32.0, 200.5, 30.0, 40.0), 0);
+
+    assert_eq!(*client.dim.lock().unwrap(), DimId::Nether);
+    assert!(client.seen.lock().unwrap().is_empty());
+    assert!(!client.chunks.lock().unwrap().contains(&(90, 90)));
+    let p = *client.pos.lock().unwrap();
+    assert_eq!((p.0, p.1, p.2, p.3, p.4), (100.5, 32.0, 200.5, 30.0, 40.0));
+
+    let mut packets = Vec::new();
+    while let Some((id, body)) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)) {
+        packets.push((id, body));
+    }
+    let ids: Vec<i64> = packets.iter().map(|(id, _)| *id).collect();
+    assert!(ids.contains(&0x42), "old-world entities must be removed: {ids:?}");
+    // The client drops its own chunk map on 0x47. If the server kept the old set it would
+    // answer with 0x21 unloads for chunks the client no longer holds — a protocol error.
+    assert!(!ids.contains(&0x21), "the old window must be cleared, not unloaded: {ids:?}");
+    let respawn = packets.iter().find(|(id, _)| *id == 0x47).map(|(_, b)| b).unwrap();
+    let mut p = 0;
+    assert_eq!(s4_spawn_info(respawn, &mut p), (3, "minecraft:the_nether".to_string()));
+    assert_eq!(respawn[p], 0x03, "data_kept must be 3");
+    assert_eq!(p + 1, respawn.len());
+    assert!(ids.contains(&0x22), "Game Event 13 must be sent: {ids:?}");
+    assert!(ids.contains(&0x40), "authoritative position sync must be sent: {ids:?}");
+    assert!(ids.contains(&0x27), "the new dimension's chunks must stream: {ids:?}");
+}
+
+#[test]
+fn p2_3_s4_portal_scaling_clamps_y_and_the_arrival_guard_blocks_bounce() {
+    assert!(is_nether_portal_state(5864) && is_nether_portal_state(5865));
+    assert!(is_end_portal_state(7406));
+    assert!(!is_nether_portal_state(7406));
+    // 1:8 horizontal scaling in both directions, with the y clamped to the destination window.
+    assert_eq!(
+        nether_portal_target(DimId::Overworld, 100, 40, 80),
+        Some((DimId::Nether, 12, 40, 10))
+    );
+    assert_eq!(
+        nether_portal_target(DimId::Nether, 12, 40, 10),
+        Some((DimId::Overworld, 96, 40, 80))
+    );
+    assert_eq!(
+        nether_portal_target(DimId::Overworld, 8, 500, 8),
+        Some((DimId::Nether, 1, 248, 1))
+    );
+    assert_eq!(nether_portal_target(DimId::End, 0, 0, 0), None);
+}
+
+#[test]
+fn p2_3_s4_logout_persists_the_clients_live_dimension() {
+    let (client, _rx) = client_pair();
+    *client.pos.lock().unwrap() = (12.5, 64.0, 48.5, 90.0, -10.0, true);
+    *client.dim.lock().unwrap() = DimId::End;
+    let (dim, x, y, z, yaw, pitch) = client_dim_pos(&client);
+    assert_eq!(dim, DimId::End, "the saved dimension is the live one");
+    assert_eq!((x, y, z, yaw, pitch), (12.5, 64.0, 48.5, 90.0, -10.0));
+    *client.dim.lock().unwrap() = DimId::Nether;
+    assert_eq!(client_dim_pos(&client).0, DimId::Nether);
+}
+
+#[test]
+fn p2_3_s4_broadcast_chunk_dim_filters_other_dimensions() {
+    let _guard = world_guard();
+    // Two clients holding the same column in different dimensions: only the one in the
+    // edited dimension may receive the block delta.
+    let (ow, mut ow_rx) = client_pair();
+    let (ne, mut ne_rx) = client_pair();
+    *ne.dim.lock().unwrap() = DimId::Nether;
+    ow.chunks.lock().unwrap().insert((0, 0));
+    ne.chunks.lock().unwrap().insert((0, 0));
+    let (ow, ne) = (Arc::new(ow), Arc::new(ne));
+    let saved = std::mem::take(&mut *clients().lock().unwrap());
+    clients().lock().unwrap().extend([ow.clone(), ne.clone()]);
+
+    broadcast_chunk_dim(DimId::Nether, 0, 0, |_c| (0x49, vec![1, 2, 3]));
+
+    let mut ne_ids = Vec::new();
+    while let Some((id, _)) = read_packet(&mut ne_rx, Instant::now() + Duration::from_secs(1)) {
+        ne_ids.push(id);
+    }
+    let mut ow_ids = Vec::new();
+    while let Some((id, _)) = read_packet(&mut ow_rx, Instant::now() + Duration::from_secs(1)) {
+        ow_ids.push(id);
+    }
+    *clients().lock().unwrap() = saved;
+
+    assert!(ne_ids.contains(&0x49), "the Nether holder must see the edit: {ne_ids:?}");
+    assert!(!ow_ids.contains(&0x49), "the Overworld holder must not: {ow_ids:?}");
+}

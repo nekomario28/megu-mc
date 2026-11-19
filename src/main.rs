@@ -376,6 +376,21 @@ struct Client {
     walk_acc: Mutex<f64>,
     lastp: Mutex<(f64, f64, f64)>,
     spawn_pt: Mutex<Option<(f64, f64, f64)>>,
+    // P2-3-S4: a player lives in one dimension at a time. Every dimension-scoped
+    // audience filter (chunks, block deltas, entity visibility) reads this, and a
+    // 0x47 Respawn flips it together with the chunk window. The saved spawn point
+    // carries its own dimension so death respawn returns the player to the right
+    // world even when they died in another one.
+    dim: Mutex<DimId>,
+    // The client's effective view distance, mirrored from the connection so commands and
+    // portals can rebuild a window of the same size without a stream reference.
+    view: Mutex<i32>,
+    spawn_dim: Mutex<DimId>,
+    // Set while the client is standing inside a portal block. Cleared on arrival
+    // in the destination so the freshly-materialised return portal does not bounce
+    // the player straight back (a per-player, not per-block, guard).
+    in_portal: Mutex<bool>,
+    portal_at: Mutex<Option<Instant>>,
     held: Mutex<i16>,
     effs: Mutex<Vec<Eff>>,
 }
@@ -902,6 +917,13 @@ fn interest_tick() {
             Box::new(move || vec![(0x02, xp_orb_pkt(eid, x, y, z, val))]),
         ));
     }
+    // P2-3-S4: a player is only interested in players sharing their dimension. Two players
+    // at the same coordinates in different worlds must not spawn for one another; on a
+    // dimension switch the 0x42 removals below retire the old-world players.
+    let player_dims: HashMap<i32, DimId> = cls
+        .iter()
+        .map(|o| (o.eid, *o.dim.lock().unwrap()))
+        .collect();
     for o in cls.iter() {
         let p = {
             let p = o.pos.lock().unwrap();
@@ -945,6 +967,21 @@ fn interest_tick() {
             if *eid == c.eid {
                 continue;
             }
+            if let Some(&edim) = player_dims.get(eid) {
+                if edim != *c.dim.lock().unwrap() {
+                    // crossing a dimension retires the other world's players immediately,
+                    // even when their coordinates are still inside the interest radius.
+                    if seen.remove(eid) {
+                        let mut p = Vec::new();
+                        write_varint(&mut p, 1);
+                        write_varint(&mut p, *eid as i64);
+                        if let Ok(mut w) = c.sock.lock() {
+                            let _ = send_packet(&mut w, 0x42, p);
+                        }
+                    }
+                    continue;
+                }
+            }
             let d2 = (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2);
             if d2 <= VIS_R2 {
                 if seen.insert(*eid) {
@@ -979,9 +1016,24 @@ fn broadcast_chunk_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     cz: i32,
     mk: F,
 ) {
+    broadcast_chunk_dim_in(DimId::Overworld, audience, cx, cz, mk)
+}
+/// The dimension-scoped chunk audience: a client only receives a block delta if it is in the
+/// same dimension AND holds that column. Two players standing at the same `(cx, cz)` in
+/// different dimensions must never see each other's edits.
+fn broadcast_chunk_dim<F: Fn(&Client) -> (i64, Vec<u8>)>(dim: DimId, cx: i32, cz: i32, mk: F) {
+    broadcast_chunk_dim_in(dim, &client_snapshot(), cx, cz, mk)
+}
+fn broadcast_chunk_dim_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
+    dim: DimId,
+    audience: &[Arc<Client>],
+    cx: i32,
+    cz: i32,
+    mk: F,
+) {
     fanout_in(
         audience,
-        |c| c.chunks.lock().unwrap().contains(&(cx, cz)),
+        |c| *c.dim.lock().unwrap() == dim && c.chunks.lock().unwrap().contains(&(cx, cz)),
         mk,
     )
 }
@@ -7494,6 +7546,14 @@ fn inv_store() -> &'static Mutex<HashMap<String, HashMap<i16, Stack>>> {
 }
 // name -> (x,y,z,yaw,pitch): vanilla respawns a player where they left
 static POS_STORE: Registry<String, DimPosRot> = OnceLock::new();
+/// The position record a client leaves behind: its live dimension plus the six legacy
+/// fields. Both the logout write and the periodic world save call this, so a test can prove
+/// the persisted dimension comes from `Client::dim` rather than a hard-coded Overworld.
+fn client_dim_pos(c: &Client) -> DimPosRot {
+    let p = *c.pos.lock().unwrap();
+    let d = *c.dim.lock().unwrap();
+    (d, p.0, p.1, p.2, p.3, p.4)
+}
 fn pos_store() -> &'static LockedMap<String, DimPosRot> {
     POS_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -8457,6 +8517,9 @@ fn hidden_filler_with<F: FnMut(i32, i32, i32) -> u32>(
         })
 }
 fn block_exposed(x: i32, y: i32, z: i32) -> bool {
+    block_exposed_dim(DimId::Overworld, x, y, z)
+}
+fn block_exposed_dim(dim: DimId, x: i32, y: i32, z: i32) -> bool {
     [
         (1, 0, 0),
         (-1, 0, 0),
@@ -8466,11 +8529,14 @@ fn block_exposed(x: i32, y: i32, z: i32) -> bool {
         (0, 0, -1),
     ]
     .iter()
-    .any(|(dx, dy, dz)| exposes(block_at(x + dx, y + dy, z + dz)))
+    .any(|(dx, dy, dz)| exposes(block_at_dim(dim, x + dx, y + dy, z + dz)))
 }
 // re-resolve every hidden neighbor's wire state after ANY mutation:
 // exposed -> true state, still-buried -> context filler (re-hide).
 fn refresh_hidden_neighbors(x: i32, y: i32, z: i32) {
+    refresh_hidden_neighbors_dim(DimId::Overworld, x, y, z)
+}
+fn refresh_hidden_neighbors_dim(dim: DimId, x: i32, y: i32, z: i32) {
     for (dx, dy, dz) in [
         (1, 0, 0),
         (-1, 0, 0),
@@ -8480,14 +8546,14 @@ fn refresh_hidden_neighbors(x: i32, y: i32, z: i32) {
         (0, 0, -1),
     ] {
         let (nx, ny, nz) = (x + dx, y + dy, z + dz);
-        let ns = block_at(nx, ny, nz);
+        let ns = block_at_dim(dim, nx, ny, nz);
         if is_hidden(ns) {
-            let out = if block_exposed(nx, ny, nz) {
+            let out = if block_exposed_dim(dim, nx, ny, nz) {
                 ns
             } else {
                 hidden_filler(nx, ny, nz, height_at(nx, nz))
             };
-            note_block_update(nx, ny, nz, out);
+            note_block_update_dim(dim, nx, ny, nz, out);
         }
     }
 }
@@ -9698,9 +9764,12 @@ fn pending_blocks() -> &'static LockedMap<DimBlockPos, HashMap<u16, u32>> {
     PENDING_BLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
+    note_block_update_dim(DimId::Overworld, x, y, z, st)
+}
+fn note_block_update_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     // anti-xray invariant: a hidden block that is not exposed must never
     // reach the wire as its true id, on ANY path — chunk send AND deltas.
-    let out = if is_hidden(st) && !block_exposed(x, y, z) {
+    let out = if is_hidden(st) && !block_exposed_dim(dim, x, y, z) {
         hidden_filler(x, y, z, height_at(x, z))
     } else {
         st
@@ -9709,7 +9778,7 @@ fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
         .lock()
         .unwrap()
         .entry((
-            DimId::Overworld,
+            dim,
             x.div_euclid(16),
             y.div_euclid(16),
             z.div_euclid(16),
@@ -9719,7 +9788,7 @@ fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
 }
 fn apply_queued_block_updates() {
     let map = std::mem::take(&mut *pending_blocks().lock().unwrap());
-    for ((_dim, sx, sy, sz), recs) in map {
+    for ((dim, sx, sy, sz), recs) in map {
         let mut p = Vec::with_capacity(9 + recs.len() * 5);
         let key =
             ((sx as i64 & 0x3fffff) << 42) | ((sz as i64 & 0x3fffff) << 20) | (sy as i64 & 0xfffff);
@@ -9728,7 +9797,7 @@ fn apply_queued_block_updates() {
         for (idx, st) in &recs {
             write_varint(&mut p, ((*st as i64) << 12) | *idx as i64);
         }
-        broadcast_chunk(sx, sz, |_c| (0x49, p.clone()));
+        broadcast_chunk_dim(dim, sx, sz, |_c| (0x49, p.clone()));
     }
 }
 
@@ -10337,8 +10406,11 @@ fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
 /// during the two-tick booking window; only the scheduled callback may turn
 /// one into an entity, emitting the intervening air update.
 fn place_block(wx: i32, wy: i32, wz: i32, st: u32) {
-    set_block(wx, wy, wz, st);
-    note_block_update(wx, wy, wz, block_at(wx, wy, wz));
+    place_block_dim(DimId::Overworld, wx, wy, wz, st)
+}
+fn place_block_dim(dim: DimId, wx: i32, wy: i32, wz: i32, st: u32) {
+    set_block_dim(dim, wx, wy, wz, st);
+    note_block_update_dim(dim, wx, wy, wz, block_at_dim(dim, wx, wy, wz));
 }
 /// Advance each falling entity by vanilla's gravity and land it on the first solid block
 /// below. The physics is the bytecode-derived contract in evidence/gameplay/falling-vanilla:
@@ -11317,9 +11389,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         // a player who logged out elsewhere is corrected from the footer on load.
         let mut allp: HashMap<String, DimPosRot> = pos_store().lock().unwrap().clone();
         for c in clients().lock().unwrap().iter() {
-            let p = *c.pos.lock().unwrap();
-            // S4 wires live `Client::dim` here; until then an online player is Overworld.
-            allp.insert(c.name.clone(), (DimId::Overworld, p.0, p.1, p.2, p.3, p.4));
+            allp.insert(c.name.clone(), client_dim_pos(c));
         }
         write_varint(&mut *f, allp.len() as i64);
         for (name, &(dim, x, y, z, yaw, pitch)) in allp.iter() {
@@ -19892,6 +19962,7 @@ fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSo
 /// emitters, and the client leaves a section out of both masks unchanged (verified against
 /// `ClientPacketListener.applyLightData`). Sections whose block light is zero go in the empty
 /// mask with no array, which is vanilla's own encoding for them.
+#[allow(dead_code)] // retained as the Overworld-named seam for light tests
 fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
     update_light_packet_dim(DimId::Overworld, cx, cz, gen)
 }
@@ -19931,6 +20002,13 @@ fn update_light_packet_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Ve
 /// and re-sent. Neighbours generated later name this chunk in their own call, so every ordered
 /// pair is covered once.
 fn light_dirty_for(gen: &GenSources, cx: i32, cz: i32) -> Vec<(i32, i32)> {
+    light_dirty_for_dim(DimId::Overworld, gen, cx, cz)
+}
+
+/// [`light_dirty_for`] for one dimension. A Nether emitter at y=32 is inside the Nether's
+/// 0..256 window but outside the Overworld's search window; using the Overworld predicate
+/// would skip neighbours a Nether torch actually lights.
+fn light_dirty_for_dim(dim: DimId, gen: &GenSources, cx: i32, cz: i32) -> Vec<(i32, i32)> {
     let Some(sources) = gen.get(&(cx, cz)) else {
         return Vec::new();
     };
@@ -19949,7 +20027,7 @@ fn light_dirty_for(gen: &GenSources, cx: i32, cz: i32) -> Vec<(i32, i32)> {
             }
             if sources
                 .iter()
-                .any(|(p, _)| within_search(nx, nz, p.0, p.1, p.2))
+                .any(|(p, _)| within_search_dim(dim, nx, nz, p.0, p.1, p.2))
             {
                 out.push((nx, nz));
             }
@@ -20057,10 +20135,24 @@ fn prefetch_terrain_group(
     workers: usize,
     round: Option<u64>,
 ) {
+    prefetch_terrain_group_dim(DimId::Overworld, news, lo, hi, workers, round)
+}
+
+/// [`prefetch_terrain_group`] for one dimension: the snapshot, the scratch generators and
+/// the beard resolver all have to come from that dimension's registry slot, or a Nether
+/// window would be built from Overworld noise and installed into the Overworld generator.
+fn prefetch_terrain_group_dim(
+    dim: DimId,
+    news: &[(i32, i32)],
+    lo: i32,
+    hi: i32,
+    workers: usize,
+    round: Option<u64>,
+) {
     if news.is_empty() {
         return;
     }
-    let Some(data) = worldgen::data_snapshot() else {
+    let Some(data) = worldgen::data_snapshot_dim(dim) else {
         return;
     };
     // `jobs = 1` builds the same rows on one scratch generator instead of eight. It is not
@@ -20069,11 +20161,11 @@ fn prefetch_terrain_group(
     // chunk was already promoted, and `MC_SPINE_WG_GEN_JOBS=1` vs `8` would stop being a
     // comparison of the same thing.
     let jobs = workers.max(1);
-    let resolver = worldgen::with_gen(|g| g.beard_resolver()).flatten();
+    let resolver = worldgen::with_gen_dim(dim, |g| g.beard_resolver()).flatten();
     let cols = worldgen::prefetch_cols_with(&data, resolver, news, jobs, round);
     let chunks =
         worldgen::prefetch_terrain(&data, resolver, news, &cols, lo, hi, jobs, round);
-    let _ = worldgen::with_gen(|g| g.install_prefetched(chunks));
+    let _ = worldgen::with_gen_dim(dim, |g| g.install_prefetched(chunks));
 }
 
 fn stream_chunks(
@@ -20081,6 +20173,7 @@ fn stream_chunks(
     sent: &mut std::collections::HashSet<(i32, i32)>,
     gen: &mut GenSources,
     ack: &mut ChunkFeedback,
+    dim: DimId,
     ccx: i32,
     ccz: i32,
     view: i32,
@@ -20157,22 +20250,16 @@ fn stream_chunks(
     if let Some(round) = delivery_round {
         let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
     }
+    // The terrain rows stop one section below the dimension's own ceiling: a Nether/End
+    // window is 0..256 (16 sections), not the Overworld's -64..320.
+    let (lo, hi) = (dim.min_y(), dim.min_y() + dim.height() - 16);
     for chunk_group in news.chunks(terrain_group(delivery_workers)) {
-        prefetch_terrain_group(
-            chunk_group,
-            MIN_Y,
-            MIN_Y + 384 - 16,
-            delivery_workers,
-            delivery_round,
-        );
+        prefetch_terrain_group_dim(dim, chunk_group, lo, hi, delivery_workers, delivery_round);
         for (cx, cz) in chunk_group {
-            // The player-facing stream is the Overworld: the seam exists so P2-3-S2 can pass
-            // the dimension the client is actually in.
-            let dim = DimId::Overworld;
             if send_packet(s, 0x27, map_chunk(*cx, *cz, dim, gen)).is_err() {
                 return;
             }
-            for n in light_dirty_for(gen, *cx, *cz) {
+            for n in light_dirty_for_dim(dim, gen, *cx, *cz) {
                 dirty.insert(n);
             }
             let snap = signs_in_chunk(dim, *cx, *cz);
@@ -20193,7 +20280,7 @@ fn stream_chunks(
             continue;
         }
         let __t = chunkprof::enabled().then(std::time::Instant::now);
-        let pkt = update_light_packet(cx, cz, gen);
+        let pkt = update_light_packet_dim(dim, cx, cz, gen);
         if let Some(t) = __t {
             use std::sync::atomic::Ordering;
             chunkprof::add(&chunkprof::RE_LIGHT, t);
@@ -20209,34 +20296,419 @@ fn stream_chunks(
     ack.sent_batch(Instant::now(), batch);
 }
 
-fn join_game() -> Vec<u8> {
+/// Skip one **unnamed-root** network NBT value (the shape carried inside a
+/// `minecraft:dimension_type` registry entry) starting at `*p`. Returns false on any
+/// truncation or absurd length, so a corrupt `config_packets.bin` fails closed rather than
+/// handing out a wrong dimension id.
+fn nbt_wire_skip(data: &[u8], p: &mut usize, depth: usize) -> bool {
+    if depth > 32 || *p >= data.len() {
+        return false;
+    }
+    let tag = data[*p];
+    *p += 1;
+    nbt_wire_value(data, p, tag, depth)
+}
+/// Skip the *payload* of a value whose tag byte has already been consumed.
+fn nbt_wire_value(data: &[u8], p: &mut usize, tag: u8, depth: usize) -> bool {
+    if depth > 32 || *p > data.len() {
+        return false;
+    }
+    fn take(data: &[u8], p: &mut usize, n: usize) -> bool {
+        n <= data.len().saturating_sub(*p) && {
+            *p += n;
+            true
+        }
+    }
+    fn num(data: &[u8], p: &mut usize, n: usize) -> Option<u64> {
+        if !take(data, p, n) {
+            return None;
+        }
+        Some(data[*p - n..*p].iter().fold(0u64, |v, &b| (v << 8) | u64::from(b)))
+    }
+    match tag {
+        0 => true,
+        1 => take(data, p, 1),
+        2 => take(data, p, 2),
+        3 => take(data, p, 4),
+        4 => take(data, p, 8),
+        5 => take(data, p, 4),
+        6 => take(data, p, 8),
+        7 | 11 | 12 => {
+            let width = if tag == 7 { 1 } else if tag == 11 { 4 } else { 8 };
+            let Some(n) = num(data, p, 4) else { return false };
+            n <= (1 << 24) && take(data, p, (n as usize).saturating_mul(width))
+        }
+        8 => {
+            let Some(n) = num(data, p, 2) else { return false };
+            take(data, p, n as usize)
+        }
+        9 => {
+            let Some(elem) = data.get(*p).copied() else { return false };
+            *p += 1;
+            let Some(n) = num(data, p, 4) else { return false };
+            if n > (1 << 20) {
+                return false;
+            }
+            for _ in 0..n {
+                if !nbt_wire_value(data, p, elem, depth + 1) {
+                    return false;
+                }
+            }
+            true
+        }
+        10 => loop {
+            let Some(child) = data.get(*p).copied() else { return false };
+            *p += 1;
+            if child == 0 {
+                return true;
+            }
+            let Some(n) = num(data, p, 2) else { return false };
+            if !take(data, p, n as usize) || !nbt_wire_value(data, p, child, depth + 1) {
+                return false;
+            }
+        },
+        _ => false,
+    }
+}
+
+/// The `dimension_type` registry ids from `config_packets.bin`, indexed by `DimId::index()`.
+///
+/// The registry order is a property of the pinned blob, not of this port's slot order:
+/// `Overworld = 0`, `End = 2`, `Nether = 3` (slot 1 is `overworld_caves`, which the server
+/// never sends a player to). Reading the blob keeps the wire id and the 0x2b/0x47 payload in
+/// agreement if the blob is ever regenerated with a different order.
+fn parse_dim_type_wire_ids() -> Option<[i32; 3]> {
+    let data = std::fs::read("config_packets.bin").ok()?;
+    let mut sl = &data[..];
+    while !sl.is_empty() {
+        let len = read_varint(&mut sl)? as usize;
+        if sl.len() < len {
+            return None;
+        }
+        let pkt = &sl[..len];
+        sl = &sl[len..];
+        let mut p = &pkt[..];
+        if read_varint(&mut p)? != 7 {
+            continue;
+        }
+        let nlen = read_varint(&mut p)? as usize;
+        if p.len() < nlen {
+            return None;
+        }
+        let registry = std::str::from_utf8(&p[..nlen]).ok()?;
+        p = &p[nlen..];
+        if registry != "minecraft:dimension_type" {
+            continue;
+        }
+        let count = read_varint(&mut p)? as usize;
+        if count > 4096 {
+            return None;
+        }
+        let mut ids = [-1i32; 3];
+        for idx in 0..count {
+            let l = read_varint(&mut p)? as usize;
+            if p.len() < l + 1 {
+                return None;
+            }
+            let entry = std::str::from_utf8(&p[..l]).ok()?;
+            p = &p[l..];
+            let has_nbt = p[0];
+            p = &p[1..];
+            if has_nbt != 0 {
+                let mut off = 0usize;
+                if !nbt_wire_skip(p, &mut off, 0) {
+                    return None;
+                }
+                p = &p[off..];
+            }
+            if let Some(dim) = DimId::parse_dimension_id(entry) {
+                ids[dim.index()] = idx as i32;
+            }
+        }
+        if ids.iter().all(|v| *v >= 0) {
+            return Some(ids);
+        }
+    }
+    None
+}
+
+static DIM_WIRE_IDS: OnceLock<Option<[i32; 3]>> = OnceLock::new();
+/// Fallback for a server started without a readable `config_packets.bin`: the ids in the
+/// pinned blob this crate ships. The unit test asserts these are the values actually parsed.
+const DIM_WIRE_IDS_FALLBACK: [i32; 3] = [0, 3, 2];
+fn dim_type_wire_ids() -> [i32; 3] {
+    *DIM_WIRE_IDS
+        .get_or_init(parse_dim_type_wire_ids)
+        .as_ref()
+        .unwrap_or(&DIM_WIRE_IDS_FALLBACK)
+}
+fn dim_type_wire_id(dim: DimId) -> i32 {
+    dim_type_wire_ids()[dim.index()]
+}
+
+/// 0x2b Join Game. Every dimension type the client can be moved into is declared so a
+/// later 0x47 Respawn can name one the client already knows; the spawn info carries the
+/// dimension the player actually starts in.
+fn join_game(dim: DimId, gm: u8) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&1i32.to_be_bytes());
     p.push(0);
-    write_varint(&mut p, 1);
-    write_str(&mut p, "minecraft:overworld");
+    write_varint(&mut p, 3);
+    for d in DimId::ALL {
+        write_str(&mut p, d.dimension_id());
+    }
     write_varint(&mut p, 20);
     write_varint(&mut p, SERVER_VIEW_DISTANCE as i64);
     write_varint(&mut p, 8);
     p.push(0);
     p.push(1);
     p.push(0);
-    p.extend_from_slice(&spawn_info());
+    p.extend_from_slice(&spawn_info_dim(dim, gm));
     p.push(0); // secure chat off
     p
 }
-fn spawn_info() -> Vec<u8> {
+
+/// The spawn-info sub-struct shared by 0x2b Join Game and 0x47 Respawn. `dim_type` is the
+/// registry id from `config_packets.bin` (NOT `DimId::index()`), and the name is the
+/// dimension's resource id.
+fn spawn_info_dim(dim: DimId, gm: u8) -> Vec<u8> {
     let mut p = Vec::new();
-    write_varint(&mut p, 0);
-    write_str(&mut p, "minecraft:overworld");
+    write_varint(&mut p, dim_type_wire_id(dim) as i64);
+    write_str(&mut p, dim.dimension_id());
     p.extend_from_slice(&0i64.to_be_bytes());
-    p.push(1); // creative
+    p.push(gm);
     p.push(255); // prev -1
     p.push(0);
     p.push(1); // isDebug=false, isFlat=true
     p.push(0); // no death loc
     write_varint(&mut p, 0);
     p
+}
+/// The Overworld/creative spawn info used by legacy callers that have no client context.
+fn spawn_info() -> Vec<u8> {
+    spawn_info_dim(DimId::Overworld, 1)
+}
+
+/// Move one connected player to another dimension and rebuild the authoritative window.
+///
+/// The 0x47 Respawn packet names the destination through `spawn_info_dim`, so the client
+/// re-interprets every following 0x27 chunk with the destination's section count and sky
+/// light rules. The chunk set and the light sources are dimension-local, so they are only
+/// dropped when the dimension actually changes; an End return to a different Overworld
+/// position in the same dimension keeps the window and just streams the new centre.
+fn switch_client_dimension(
+    me: &Arc<Client>,
+    new_dim: DimId,
+    target: (f64, f64, f64, f32, f32),
+    view: i32,
+) {
+    let old_dim = *me.dim.lock().unwrap();
+    // Retire everything the old world was tracking before the client drops its chunks.
+    {
+        let mut seen = me.seen.lock().unwrap();
+        if !seen.is_empty() {
+            let mut p = Vec::new();
+            write_varint(&mut p, seen.len() as i64);
+            for e in seen.iter() {
+                write_varint(&mut p, *e as i64);
+            }
+            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x42, p);
+            seen.clear();
+        }
+    }
+    if old_dim != new_dim {
+        me.chunks.lock().unwrap().clear();
+        me.gen_sources.lock().unwrap().clear();
+    }
+    *me.dim.lock().unwrap() = new_dim;
+    *me.in_portal.lock().unwrap() = false;
+    {
+        let mut p = me.pos.lock().unwrap();
+        *p = (target.0, target.1, target.2, target.3, target.4, true);
+    }
+    *me.fall_from.lock().unwrap() = target.1;
+    {
+        let mut ack = me.chunk_ack.lock().unwrap();
+        *ack = ChunkFeedback::new(window_batch(view));
+    }
+    let gm = *me.gm.lock().unwrap();
+    let mut rp = spawn_info_dim(new_dim, gm);
+    rp.push(0x03); // data_kept: keep inventory and attributes across the move
+    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x47, rp);
+    let mut ge = vec![13u8]; // START_WAITING_CHUNKS
+    ge.extend_from_slice(&0f32.to_be_bytes());
+    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x22, ge);
+    let (ccx, ccz) = (
+        (target.0 / 16.0).floor() as i32,
+        (target.2 / 16.0).floor() as i32,
+    );
+    {
+        let mut ack = me.chunk_ack.lock().unwrap();
+        let mut ch = me.chunks.lock().unwrap();
+        let mut gen = me.gen_sources.lock().unwrap();
+        stream_chunks(
+            &mut me.sock.lock().unwrap(),
+            &mut ch,
+            &mut gen,
+            &mut ack,
+            new_dim,
+            ccx,
+            ccz,
+            view,
+            true,
+        );
+    }
+    let _ = send_packet(
+        &mut me.sock.lock().unwrap(),
+        0x40,
+        teleport_pkt(target.0, target.1, target.2, target.3, target.4, 0),
+    );
+}
+
+/// The portal block states this port recognises (`assets/blocks_1211.json`). The nether
+/// portal has two axis states; the end portal has one.
+fn is_nether_portal_state(st: u32) -> bool {
+    (5864..=5865).contains(&st)
+}
+fn is_end_portal_state(st: u32) -> bool {
+    st == 7406
+}
+
+/// Materialise a safe landing in a Nether or Overworld destination: an obsidian floor under
+/// the teleported column, clear space above it, and a complete obsidian portal frame with a
+/// live portal inside. Materialising the frame matters for the bounce guard — the arrival
+/// portal is intentional, and a per-player flag (not the block's absence) stops the return.
+fn materialize_nether_landing(dim: DimId, bx: i32, by: i32, bz: i32) {
+    let obsidian = name_to_state("obsidian").unwrap_or(2354);
+    for dx in -2..=2 {
+        for dz in -2..=2 {
+            set_block_dim(dim, bx + dx, by - 1, bz + dz, obsidian);
+            for dy in by..by + 4 {
+                set_block_dim(dim, bx + dx, dy, bz + dz, 0);
+            }
+        }
+    }
+    for dy in 0..4 {
+        set_block_dim(dim, bx - 1, by + dy, bz, obsidian);
+        set_block_dim(dim, bx + 1, by + dy, bz, obsidian);
+    }
+    set_block_dim(dim, bx, by - 1, bz, obsidian);
+    set_block_dim(dim, bx, by + 3, bz, obsidian);
+    for dy in 0..3 {
+        set_block_dim(dim, bx, by + dy, bz, 5864);
+    }
+}
+
+/// The End spawn platform: vanilla's obsidian 5x5 at (100, 48, 0) with three air layers
+/// above it. Portalled players always arrive here, so it must exist even in a fresh world.
+fn materialize_end_spawn() {
+    let obsidian = name_to_state("obsidian").unwrap_or(2354);
+    for dx in -2..=2 {
+        for dz in -2..=2 {
+            set_block_dim(DimId::End, 100 + dx, 48, dz, obsidian);
+            for y in 49..=51 {
+                set_block_dim(DimId::End, 100 + dx, y, dz, 0);
+            }
+        }
+    }
+}
+
+/// The Nether portal landing, as a pure function of the source block: 1:8 horizontal
+/// scaling and a y clamped into the destination's own 0..256 window. Split out so the
+/// scaling and the bounce guard can be asserted without a live connection.
+fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId, i32, i32, i32)> {
+    if dim == DimId::End {
+        return None;
+    }
+    let (ndim, nx, nz) = if dim == DimId::Overworld {
+        (DimId::Nether, bx as f64 / 8.0, bz as f64 / 8.0)
+    } else {
+        (DimId::Overworld, bx as f64 * 8.0, bz as f64 * 8.0)
+    };
+    let ny = (by as f64).clamp(
+        (ndim.min_y() + 4) as f64,
+        (ndim.min_y() + ndim.height() - 8) as f64,
+    );
+    Some((ndim, nx.floor() as i32, ny.floor() as i32, nz.floor() as i32))
+}
+
+/// Complete one portal trip. `st` is the block the player stood in, which decides whether
+/// this is an Overworld<->Nether trip (1:8 horizontal scaling) or an End trip.
+fn enter_portal(
+    me: &Arc<Client>,
+    st: u32,
+    bx: i32,
+    by: i32,
+    bz: i32,
+    yaw: f32,
+    pitch: f32,
+    view: i32,
+) {
+    let dim = *me.dim.lock().unwrap();
+    if is_end_portal_state(st) {
+        if dim == DimId::Overworld {
+            materialize_end_spawn();
+            switch_client_dimension(me, DimId::End, (100.5, 49.0, 0.5, yaw, pitch), view);
+        } else {
+            let (sdim, sx, sy, sz) = {
+                let sdim = *me.spawn_dim.lock().unwrap();
+                let pos = me.spawn_pt.lock().unwrap().unwrap_or_else(|| {
+                    let w = *WORLD_SPAWN.lock().unwrap();
+                    (w.0, w.1, w.2)
+                });
+                (sdim, pos.0, pos.1, pos.2)
+            };
+            switch_client_dimension(me, sdim, (sx, sy, sz, yaw, pitch), view);
+        }
+    } else {
+        // 1:8 horizontal scaling. Overworld (x,z) -> Nether (x/8, z/8) and back.
+        let (ndim, nx, ny, nz) =
+            nether_portal_target(dim, bx, by, bz).expect("only the End has no Nether portal");
+        materialize_nether_landing(ndim, nx, ny, nz);
+        switch_client_dimension(
+            me,
+            ndim,
+            (nx as f64 + 0.5, ny as f64, nz as f64 + 0.5, yaw, pitch),
+            view,
+        );
+    }
+    // Arrival is inside a real portal; hold the per-player guard until the player steps out
+    // so the destination portal cannot send them straight back.
+    *me.in_portal.lock().unwrap() = true;
+}
+
+/// Called after a movement frame. Returns whether a dimension transition happened.
+fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
+    let dim = *me.dim.lock().unwrap();
+    let (px, py, pz, yaw, pitch, _) = *me.pos.lock().unwrap();
+    let (bx, by, bz) = (px.floor() as i32, py.floor() as i32, pz.floor() as i32);
+    let st = block_at_dim(dim, bx, by, bz);
+    if !is_nether_portal_state(st) && !is_end_portal_state(st) {
+        *me.in_portal.lock().unwrap() = false;
+        *me.portal_at.lock().unwrap() = None;
+        return false;
+    }
+    if *me.in_portal.lock().unwrap() {
+        return false; // arrival guard: wait until the player leaves the portal block
+    }
+    *me.in_portal.lock().unwrap() = true;
+    if *me.gm.lock().unwrap() != 0 {
+        enter_portal(me, st, bx, by, bz, yaw, pitch, view);
+        return true;
+    }
+    // Survival: vanilla's 4-second portal delay. Creative/spectator is instant.
+    let mut at = me.portal_at.lock().unwrap();
+    if at.is_none() {
+        *at = Some(Instant::now());
+        return false;
+    }
+    if at.unwrap().elapsed() < Duration::from_secs(4) {
+        return false;
+    }
+    *at = None;
+    drop(at);
+    enter_portal(me, st, bx, by, bz, yaw, pitch, view);
+    true
 }
 fn hurt_anim(eid: i32) -> Vec<u8> {
     let mut p = Vec::new();
@@ -21765,6 +22237,18 @@ struct CmdCtx {
     y: f64,
     z: f64,
 }
+// `/execute in <dim> run ...` overrides the dimension for the subcommand only. A
+// thread-local keeps the existing four-field CmdCtx (and every test that builds one)
+// unchanged while still letting setblock/tp know which world the command names.
+thread_local! {
+    static EXEC_DIM: std::cell::Cell<Option<DimId>> = const { std::cell::Cell::new(None) };
+}
+fn cmd_dim(ctx: &CmdCtx) -> DimId {
+    EXEC_DIM
+        .with(|d| d.get())
+        .or_else(|| ctx.me.as_ref().map(|c| *c.dim.lock().unwrap()))
+        .unwrap_or(DimId::Overworld)
+}
 fn coord(tok: &str, base: f64) -> f64 {
     if let Some(off) = tok.strip_prefix('~') {
         base + off.parse::<f64>().unwrap_or(0.0)
@@ -21977,8 +22461,10 @@ fn run_execute(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>) -> S
     if depth >= 16 {
         return "execute depth limit".into();
     }
+    let saved_dim = EXEC_DIM.with(|d| d.get());
     EXEC_DEPTH.set(depth + 1);
     let r = run_execute_inner(ctx, args, s);
+    EXEC_DIM.with(|d| d.set(saved_dim));
     EXEC_DEPTH.set(depth);
     r
 }
@@ -21991,6 +22477,19 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
     while i < args.len() {
         match args[i] {
             "run" => break,
+            "in" => {
+                // `/execute in <overworld|the_nether|the_end> run <subcommand>`
+                let raw = args.get(i + 1).copied().unwrap_or("");
+                let name = if raw.contains(':') {
+                    raw.to_string()
+                } else {
+                    format!("minecraft:{raw}")
+                };
+                if let Some(dim) = DimId::parse_dimension_id(&name) {
+                    EXEC_DIM.with(|d| d.set(Some(dim)));
+                }
+                i += 1;
+            }
             "store" => {
                 // store result score <entry> <objective>
                 if args.get(i + 1).copied() == Some("result")
@@ -22220,7 +22719,7 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
                     x: p.0,
                     y: p.1,
                     z: p.2,
-                };
+                    };
                 let _ = run_command_ctx(&cc, &format!("/{}", cmd), s);
                 n += 1;
             }
@@ -23144,6 +23643,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                         (coord(xyz[0], ctx.x), coord(xyz[1], ctx.y), coord(xyz[2], ctx.z))
                     } else { let p = c.pos.lock().unwrap(); (p.0, p.1, p.2) };
                     *c.spawn_pt.lock().unwrap() = Some((x, y, z));
+                    *c.spawn_dim.lock().unwrap() = cmd_dim(ctx);
                     format!("Set spawn point to {}, {}, {} for {}", x, y, z, c.name)
                 }
             }
@@ -23177,8 +23677,20 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 let cls: Vec<Arc<Client>> = client_snapshot();
                 for t in &targets {
                     if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
-                        { let mut p = c.pos.lock().unwrap(); *p = (x, y, z, p.3, p.4, true); }
-                        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x40, teleport_pkt(x, y, z, 0.0, 0.0, 100)); }
+                        let (yaw, pitch) = {
+                            let p = c.pos.lock().unwrap();
+                            (p.3, p.4)
+                        };
+                        let cur_dim = *c.dim.lock().unwrap();
+                        if cur_dim != cmd_dim(ctx) {
+                            // A cross-dimension /tp is a real respawn, not a coordinate patch:
+                            // the client needs 0x47 and a whole new window before 0x40.
+                            let view = *c.view.lock().unwrap();
+                            switch_client_dimension(c, cmd_dim(ctx), (x, y, z, yaw, pitch), view);
+                        } else {
+                            { let mut p = c.pos.lock().unwrap(); *p = (x, y, z, yaw, pitch, true); }
+                            let _ = send_packet(&mut c.sock.lock().unwrap(), 0x40, teleport_pkt(x, y, z, yaw, pitch, 100));
+                        }
                         n += 1;
                     }
                 }
@@ -23448,8 +23960,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             if args.len() >= 4 {
                 let (x, y, z) = (coord(args[0], ctx.x) as i32, coord(args[1], ctx.y) as i32, coord(args[2], ctx.z) as i32);
                 let st = state_from_arg(args[3]).unwrap_or(0);
-                place_block(x, y, z, st);
-                format!("Set block at {} {} {}", x, y, z)
+                place_block_dim(cmd_dim(ctx), x, y, z, st);
+                format!("Set block at {} {} {} in {}", x, y, z, cmd_dim(ctx).dimension_id())
             } else { "usage: /setblock x y z <block>".into() }
         }
         "summon" => {
@@ -24688,7 +25200,19 @@ fn handle(mut s: TcpStream) {
         }
     }
     // ---- play ----
-    if send_packet(&mut s, 0x2b, join_game()).is_err() {
+    // P2-3-S4: read the saved dimension BEFORE 0x2b so Join Game and the first chunk
+    // window both name the world the player actually logged out in. The 0x2b payload and
+    // the camera position must agree or the client asks for chunks from the wrong generator.
+    let (saved_dim, sx, sy, sz, syaw, spitch) = pos_store()
+        .lock()
+        .unwrap()
+        .get(&name)
+        .copied()
+        .unwrap_or_else(|| {
+            let w = *WORLD_SPAWN.lock().unwrap();
+            (DimId::Overworld, w.0, w.1, w.2, 0.0, 0.0)
+        });
+    if send_packet(&mut s, 0x2b, join_game(saved_dim, 1)).is_err() {
         return;
     }
     let _ = send_packet(&mut s, 0x53, vec![0]); // held slot 0
@@ -24718,24 +25242,15 @@ fn handle(mut s: TcpStream) {
     let mut view = client_view.clamp(2, SERVER_VIEW_DISTANCE);
     // the window is the ceiling; the client's first acknowledgement lowers the pace
     let mut chunk_ack = ChunkFeedback::new(window_batch(view));
-    // vanilla: a returning player resumes where they logged out — the
-    // chunk window, spawn teleport and authoritative pos all agree.
-    // S4 will thread `Client::dim` here; until then every login is the Overworld's, and a
-    // non-Overworld dimension stored in the footer stays dormant rather than being lost.
-    let (_dim, sx, sy, sz, syaw, spitch) = pos_store()
-        .lock()
-        .unwrap()
-        .get(&name)
-        .copied()
-        .unwrap_or_else(|| {
-            let w = *WORLD_SPAWN.lock().unwrap();
-            (DimId::Overworld, w.0, w.1, w.2, 0.0, 0.0)
-        });
+    // vanilla: a returning player resumes where they logged out — the chunk window,
+    // spawn teleport and authoritative pos all agree. The dimension was read above,
+    // before Join Game, and is threaded through the first stream as well.
     stream_chunks(
         &mut s,
         &mut sent,
         &mut gen,
         &mut chunk_ack,
+        saved_dim,
         (sx / 16.0).floor() as i32,
         (sz / 16.0).floor() as i32,
         view,
@@ -24831,6 +25346,11 @@ fn handle(mut s: TcpStream) {
         walk_acc: Mutex::new(0.0),
         lastp: Mutex::new((0.0, 0.0, 0.0)),
         spawn_pt: Mutex::new(None),
+        dim: Mutex::new(saved_dim),
+        view: Mutex::new(view),
+        spawn_dim: Mutex::new(saved_dim),
+        in_portal: Mutex::new(false),
+        portal_at: Mutex::new(None),
         skin: Mutex::new(None),
         held: Mutex::new(0),
         effs: Mutex::new(Vec::new()),
@@ -24883,7 +25403,10 @@ fn handle(mut s: TcpStream) {
     let mut last_ka = Instant::now();
     let mut held_slot: i16 = 0;
 
-    let mut player_chunk: (i32, i32) = (0, 0);
+    // Start from the saved column, not (0,0): a Nether login at x=800 would otherwise
+    // stream a second, Overworld-keyed window on the first movement frame.
+    let mut player_chunk: (i32, i32) =
+        ((sx / 16.0).floor() as i32, (sz / 16.0).floor() as i32);
     let mut rx = RxBuf::new();
     // play-state liveness: a client that stops sending complete packets (it
     // answers our 8 s keepalive and moves, so this is never quiet for long)
@@ -24959,6 +25482,7 @@ fn handle(mut s: TcpStream) {
                     &mut ch,
                     &mut gen,
                     &mut ack,
+                    *me.dim.lock().unwrap(),
                     ccx,
                     ccz,
                     view,
@@ -24972,6 +25496,7 @@ fn handle(mut s: TcpStream) {
                 let effective = requested.clamp(2, SERVER_VIEW_DISTANCE);
                 if effective != view {
                     view = effective;
+                    *me.view.lock().unwrap() = view;
                     let (x, _, z, _, _, _) = *me.pos.lock().unwrap();
                     let mut ack = me.chunk_ack.lock().unwrap();
                     ack.set_window(window_batch(view));
@@ -24982,6 +25507,7 @@ fn handle(mut s: TcpStream) {
                         &mut chunks,
                         &mut gen,
                         &mut ack,
+                        *me.dim.lock().unwrap(),
                         (x / 16.0).floor() as i32,
                         (z / 16.0).floor() as i32,
                         view,
@@ -25014,6 +25540,14 @@ fn handle(mut s: TcpStream) {
                         *me.pos.lock().unwrap() = (px, py, pz, yaw, pitch, gnd);
                         landing::player_move(&me, prev_gnd);
                     }
+                    // P2-3-S4: standing in a portal resps the dimension switch. The guard
+                    // lives on the player, so arriving in a destination portal does not
+                    // immediately trigger the return trip.
+                    if tick_portal(&me, view) {
+                        let (nx, _, nz, _, _, _) = *me.pos.lock().unwrap();
+                        player_chunk = ((nx / 16.0).floor() as i32, (nz / 16.0).floor() as i32);
+                        continue;
+                    }
                     let (ccx, ccz) = ((px / 16.0).floor() as i32, (pz / 16.0).floor() as i32);
                     if (ccx, ccz) != player_chunk {
                         player_chunk = (ccx, ccz);
@@ -25027,6 +25561,7 @@ fn handle(mut s: TcpStream) {
                                 &mut ch,
                                 &mut gen,
                                 &mut ack,
+                                *me.dim.lock().unwrap(),
                                 ccx,
                                 ccz,
                                 view,
@@ -25433,7 +25968,8 @@ fn handle(mut s: TcpStream) {
                         z as f64 + 0.5 - pz,
                     );
                     let in_range = ddx * ddx + ddy * ddy + ddz * ddz <= reach * reach;
-                    let old = block_at(x, y, z);
+                    let dim = *me.dim.lock().unwrap();
+                    let old = block_at_dim(dim, x, y, z);
                     let held = {
                         let inv = me.inv.lock().unwrap();
                         inv.get(&(36 + held_slot))
@@ -25475,11 +26011,11 @@ fn handle(mut s: TcpStream) {
                         *me.dig.lock().unwrap() = None;
                     }
                     if !break_now && status == 2 && old != 0 {
-                        note_block_update(x, y, z, old); // rejected: resync truth
+                        note_block_update_dim(dim, x, y, z, old); // rejected: resync truth
                     }
                     if break_now {
-                        set_block(x, y, z, 0);
-                        note_block_update(x, y, z, 0);
+                        set_block_dim(dim, x, y, z, 0);
+                        note_block_update_dim(dim, x, y, z, 0);
                         if *me.gm.lock().unwrap() != 1 {
                             *me.walk_acc.lock().unwrap() += 0.005; // block-break exhaustion
                                                                    // vanilla: breaking a block damages the held tool
@@ -25814,6 +26350,7 @@ fn handle(mut s: TcpStream) {
                         WORLD_TIME.store(0, Ordering::Relaxed);
                         *me.spawn_pt.lock().unwrap() =
                             Some((x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5));
+                        *me.spawn_dim.lock().unwrap() = *me.dim.lock().unwrap();
                         let mut sp = Vec::new();
                         write_pos(&mut sp, x, y, z);
                         sp.extend_from_slice(&0.0f32.to_be_bytes());
@@ -26784,29 +27321,18 @@ fn handle(mut s: TcpStream) {
                         }
                         drop(xs);
                     }
-                    let mut rp = spawn_info();
-                    rp.push(0);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x47, rp);
-                    let (rx, ry, rz) = me
-                        .spawn_pt
-                        .lock()
-                        .unwrap()
-                        .unwrap_or(*WORLD_SPAWN.lock().unwrap());
-                    {
-                        let mut p = me.pos.lock().unwrap();
-                        p.0 = rx;
-                        p.1 = ry;
-                        p.2 = rz;
-                    }
-                    let mut ps = Vec::new();
-                    ps.extend_from_slice(&rx.to_be_bytes());
-                    ps.extend_from_slice(&ry.to_be_bytes());
-                    ps.extend_from_slice(&rz.to_be_bytes());
-                    ps.extend_from_slice(&0f32.to_be_bytes());
-                    ps.extend_from_slice(&0f32.to_be_bytes());
-                    ps.push(0);
-                    write_varint(&mut ps, 2);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x40, ps);
+                    // P2-3-S4: respawn in the dimension the spawn point belongs to. A
+                    // death in the Nether returns to the Overworld bed/world spawn when that
+                    // is where the spawn point was set, with a full window rebuild.
+                    let (sdim, rx, ry, rz) = {
+                        let sdim = *me.spawn_dim.lock().unwrap();
+                        let pos = me.spawn_pt.lock().unwrap().unwrap_or_else(|| {
+                            let w = *WORLD_SPAWN.lock().unwrap();
+                            (w.0, w.1, w.2)
+                        });
+                        (sdim, pos.0, pos.1, pos.2)
+                    };
+                    switch_client_dimension(&me, sdim, (rx, ry, rz, 0.0, 0.0), view);
                     *me.food.lock().unwrap() = 20;
                     *me.sat.lock().unwrap() = 5.0;
                     {
@@ -28334,12 +28860,10 @@ fn handle(mut s: TcpStream) {
                 .lock()
                 .unwrap()
                 .insert(name.clone(), inv.clone());
-            let p = *me_cleanup.pos.lock().unwrap();
-            // S4 wires a live `Client::dim` here; until then a logout is an Overworld logout.
-            pos_store()
-                .lock()
-                .unwrap()
-                .insert(name.clone(), (DimId::Overworld, p.0, p.1, p.2, p.3, p.4));
+            // A logout persists the dimension the player was actually in, so the next
+            // login's 0x2b Join Game and first chunk window resume in that world.
+            let record = client_dim_pos(&me_cleanup);
+            pos_store().lock().unwrap().insert(name.clone(), record);
         }
         // vanilla `ServerPlayer.disconnect` -> `containerMenu.removed` -> stopOpen:
         // the leaving viewer stops counting before it leaves the client list. The window
@@ -28821,7 +29345,7 @@ fn rcon_conn(mut s: TcpStream, pass: String) {
                             x: 0.5,
                             y: 16.0,
                             z: 0.5,
-                        },
+                                        },
                         &format!("/{}", cmd.trim_start_matches('/')),
                         &mut None,
                     )

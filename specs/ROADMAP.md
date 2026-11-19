@@ -52,15 +52,15 @@ Mineshaftのadmission・dispatcher・piece配置は [Rust接続checkpoint](../ev
   - `tools/vanilla_data/gen_vanilla_data.sh`（＋`verify_pack.py`、`--verify` 2,350 ファイル照合）と `assets/block_states_1211.json` の jar 自前生成化を完了。
 - **F1-2 (`P0-3 D3/D4`: GPL 同値アセット・Mojang 派生物の追跡解除と fail-closed ゲート — 完了 `762f312`)**:
   - Pumpkin (GPL-3.0) 同値の旧 `assets/pblocks.json`・`assets/properties.json` と出所不明の `resourcepack.zip` を消費者ごと切替・除去し、`tools/provenance_check.py`（`--self-test` 11/11 PASS、`--strict-public` モード付き）をゲートに追加済み。
-- **F1-3 (`P0-3 D5 / P4-2`: クリーン履歴ブランチ・ライセンス表記の確定 — 残件 1 スライス)**:
-  - `--strict-public` が指摘する残 5 項目（`datapacks/vanilla`, `assets/block_states_1211.json`, `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv`, `config_packets.bin`）の配布扱い整理、`LICENSE`（Apache-2.0）・`NOTICE`・`THIRD_PARTY.md`・`README.md` の実ツリー完全一致、および過去履歴を含まないクリーン公開用ブランチ（orphan / squash 基点）手順の確定。
+- **F1-3 (`P0-3 D5`: クリーン履歴ブランチ生成・ライセンス表記の確定 — 完了 `d45cb4c`)**:
+  - `--strict-public` が指摘する残 5 項目（`datapacks/vanilla`, `assets/block_states_1211.json`, `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv`, `config_packets.bin`）＋開発側生成 TSV 2 件を除外した単一ルートコミット公開候補を作る `tools/export_public_branch.sh` と `tests/public_export_test.py`、`LICENSE`（Apache-2.0）・`NOTICE`・`THIRD_PARTY.md`・`README.md`・`LICENSING.md` の実ツリー完全一致を完了（公開実行の最終承認は `LICENSING.md` §5 オーナー判断）。
 
 #### Stage F2: 3次元・構造物・M2/M3 軽量性を備えた実用公開フォーク
-- **F2-1 (`P2-3-S1〜S4`: 3次元サーバーの通常経路とワールドストア次元分離)**:
+- **F2-1 (`P2-3-S1〜S4`: 3次元サーバーの通常経路とワールドストア次元分離 — 完了)**:
   - `S0`（済 `ffb7a22`）・`S1`（済 `71e96a5`：`DimId` と次元別 `Gen` レジストリ）・`S2a`（済 `2e95617`：`WORLD` オーバーレイ `DimChunkKey` 化と次元別セーブ互換）。
   - `S2b〜S2d`（済 `1ec70b0`, `0e532bb`）：残り 8 ストア（`CHESTS`/`FURNACES`/`CROPS`/`SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`/`POS_STORE`）の `DimId` 化。
   - `S3`（済 `3a3bb37`）：Nether/End の 16 セクション（`min_y = 0`, `height = 256`）チャンク配信と `has_skylight = false` での `skyLightMask == 0` 送信。
-  - `S4`（残・Phase A-1 回収中）：`0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン時次元復元。
+  - `S4`（済）：`0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン時次元復元（`tests/dimension_wire.py` PASS、8/8 mutations proved）。
 - **F2-2 (`M3 P1〜P5` + 超高効率計算 Layer A1〜A4)**:
   - `P1a`（済 `3135354`）・`P1b`（済 `b588c03`）・`P2a`（済 `43a463b`）・`P2b`（済 `0469ad9`：`SECTION_STORE` + zero-repack wire）・`P3a`（済 `1befd35`）・`P4`（済 `06abd5f`）・`P5-wire/light`（済 `ea59c4e`）に加え、**Layer A1-a/b**（済 `3cb6d24`, `b981704`）、**Layer A2-a/b/c**（済 `c745772`, `785cdf5`, `4d28f01`）、**Layer A3-a/b/c**（済 `2a4eaf4`, `b105d58`, `91b19c4`）まで統合完了。
   - 残る仕上げ（詳細：[chunk-parallelism/README.md](chunk-parallelism/README.md#超高効率計算アーキテクチャ計画layer-a1a42026-11-19-2e95617-基準)）：**Layer A3-a 速度回収**（`populate_parallel` の `TerrainShare`/owner キャッシュ共有）、**Layer A1-c**（`Cond::Biome(u128)` + `SurfaceProg`）、**Layer A4**（`PalettedSection` P2c–f O(1) light skip + 共有圧縮キャッシュ + `EntitySpatialGrid` ゼロアロケ/Mob SoA + PGO + `WARM=1` 対照ベンチマーク）。
