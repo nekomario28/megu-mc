@@ -1282,6 +1282,39 @@ fn update_shape<W: TemplateWorld>(
             }
         }
     }
+    // `SnowyDirtBlock.updateShape` (`dnj.a(dtc,ji,dtc,dcx,jd,jd)`):
+    //
+    // ```java
+    // if (direction == Direction.UP)
+    //     return state.setValue(SNOWY, isSnowySetting(neighborState));
+    // return super.updateShape(...);
+    // // isSnowySetting(state) = state.is(BlockTags.SNOW)   (`awe.bA`)
+    // ```
+    //
+    // Only three blocks in the pinned 1.21.1 state table carry `snowy`
+    // (`blocks_1211.json`): `grass_block`, `podzol` and `mycelium`, so the property
+    // is the family predicate — a name list would have to be kept in step with the
+    // table. `#minecraft:snow` is `snow`, `snow_block` and `powder_snow` (the
+    // vanilla tag), which is why the igloo's bottom `snow_block` marks the
+    // `grass_block` directly under it.
+    //
+    // Both directions of the change arrive here: `apply_shape_passes` asks each
+    // side of an exposed face, so placing a `snow_block` above grass answers `UP`
+    // on the grass (`false -> true`, the igloo floor) and removing it answers `UP`
+    // with air or stone (`true -> false`). Every other direction is the vanilla
+    // `super.updateShape(...)`, which this port models with the generic arms below.
+    if let Some(snowy) = reg.get_prop(state, "snowy") {
+        if direction == 1 {
+            let want = if reg.in_tag(neighbor, "minecraft:snow") {
+                "true"
+            } else {
+                "false"
+            };
+            if snowy != want {
+                return reg.with_prop(state, "snowy", want);
+            }
+        }
+    }
     if name.ends_with("_stairs") && matches!(direction, 2..=5) {
         if let Some(next) = reg.stair_after_neighbors(state, pos, |cell| {
             world.get(cell.0, cell.1, cell.2)
@@ -4272,6 +4305,114 @@ mod template_structures_tests {
             world.get(stale_pos.0, stale_pos.1, stale_pos.2),
             placement,
             "a fence outside the written set keeps its state"
+        );
+    }
+
+    /// `SnowyDirtBlock.updateShape` with `UP`: the three blocks in the pinned 1.21.1
+    /// table that carry `snowy` (`grass_block`, `podzol`, `mycelium`) flip to `true`
+    /// under either form of snow. This is the arm the igloo `(37,-512)` residual
+    /// was missing (`evidence/gameplay/feature-parity/igloo-snowy-under-floor-20261119.md`).
+    #[test]
+    fn snowy_dirt_flips_true_under_snow_block_and_snow_layer() {
+        let reg = breg().expect("block registry");
+        let mut world = TestWorld::new(SceneSpec::parse(None, reg));
+        let pos = (0, 70, 0);
+        let snow_block = reg.state_of("minecraft:snow_block", None);
+        let snow_layer = reg
+            .checked_state("minecraft:snow", &[("layers".into(), "1".into())])
+            .expect("snow[layers=1]");
+        assert!(reg.in_tag(snow_block, "minecraft:snow"));
+        assert!(reg.in_tag(snow_layer, "minecraft:snow"));
+
+        for name in ["minecraft:grass_block", "minecraft:podzol", "minecraft:mycelium"] {
+            let dry = reg.with_prop(reg.state_of(name, None), "snowy", "false");
+            assert_eq!(reg.get_prop(dry, "snowy").as_deref(), Some("false"));
+            for (neighbor, label) in [(snow_block, "snow_block"), (snow_layer, "snow[layers=1]")] {
+                let next = update_shape(reg, dry, 1, neighbor, &mut world, pos);
+                assert_eq!(reg.name_of(next), name, "{name} under {label} keeps its block");
+                assert_eq!(
+                    reg.get_prop(next, "snowy").as_deref(),
+                    Some("true"),
+                    "{name} under {label} must become snowy"
+                );
+                assert_ne!(next, dry, "{name} under {label} must actually change state");
+            }
+        }
+    }
+
+    /// The other direction of the same update: removing the snow above a snowy
+    /// dirt block (`UP` with a non-snow neighbour) clears the property.
+    #[test]
+    fn snowy_dirt_flips_false_when_the_snow_above_is_removed() {
+        let reg = breg().expect("block registry");
+        let mut world = TestWorld::new(SceneSpec::parse(None, reg));
+        let pos = (0, 70, 0);
+        let air = reg.state_of("minecraft:air", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        for name in ["minecraft:grass_block", "minecraft:podzol", "minecraft:mycelium"] {
+            let snowy = reg.with_prop(reg.state_of(name, None), "snowy", "true");
+            for (neighbor, label) in [(air, "air"), (stone, "stone")] {
+                let next = update_shape(reg, snowy, 1, neighbor, &mut world, pos);
+                assert_eq!(
+                    reg.get_prop(next, "snowy").as_deref(),
+                    Some("false"),
+                    "{name} under {label} must not stay snowy"
+                );
+                assert_eq!(reg.name_of(next), name);
+            }
+        }
+    }
+
+    /// `SnowyDirtBlock.updateShape` delegates to `super` for every other side, so
+    /// a snow neighbour below or beside the block must not touch `snowy`.
+    #[test]
+    fn snowy_dirt_ignores_snow_on_non_up_faces() {
+        let reg = breg().expect("block registry");
+        let mut world = TestWorld::new(SceneSpec::parse(None, reg));
+        let pos = (0, 70, 0);
+        let snow_block = reg.state_of("minecraft:snow_block", None);
+        let grass = reg.state_of("minecraft:grass_block", None);
+        for snowy in ["false", "true"] {
+            let state = reg.with_prop(grass, "snowy", snowy);
+            for direction in [0u8, 2, 3, 4, 5] {
+                let next = update_shape(reg, state, direction, snow_block, &mut world, pos);
+                assert_eq!(
+                    next, state,
+                    "direction {direction} with a snow neighbour must leave snowy={snowy}"
+                );
+            }
+        }
+    }
+
+    /// The real caller, not just the arm: writing the igloo's bottom `snow_block`
+    /// (or later replacing it with stone) must be visible on the grass below.
+    #[test]
+    fn shape_passes_flip_the_grass_below_a_written_snow_block() {
+        let reg = breg().expect("block registry");
+        let mut world = TestWorld::new(SceneSpec::parse(None, reg));
+        let below = (0, 70, 0);
+        let above = (0, 71, 0);
+        let grass = reg.with_prop(reg.state_of("minecraft:grass_block", None), "snowy", "false");
+        world.set(below.0, below.1, below.2, grass);
+        let snow_block = reg.state_of("minecraft:snow_block", None);
+        world.set(above.0, above.1, above.2, snow_block);
+
+        apply_shape_passes(&[above], &mut world, reg);
+        assert_eq!(
+            reg.get_prop(world.get(below.0, below.1, below.2), "snowy").as_deref(),
+            Some("true"),
+            "the grass under a newly written snow_block becomes snowy"
+        );
+
+        // Removing the snow (replacing it with stone) is the same face, now UP
+        // with a non-snow neighbour, so the grass must flip back.
+        let stone = reg.state_of("minecraft:stone", None);
+        world.set(above.0, above.1, above.2, stone);
+        apply_shape_passes(&[above], &mut world, reg);
+        assert_eq!(
+            reg.get_prop(world.get(below.0, below.1, below.2), "snowy").as_deref(),
+            Some("false"),
+            "the grass under a removed snow_block stops being snowy"
         );
     }
 

@@ -198,23 +198,113 @@ fn load_defs_inner() -> Option<Defs> {
     // registry enumeration, which is what `setFeatureSeed(pop, index, step)` uses.
     let mut structure_files: Vec<(String, Vec<u8>)> = Gen::dp_files("structure").into_iter().collect();
     structure_files.sort_by(|a, b| registry_sort_key(&a.0).cmp(&registry_sort_key(&b.0)));
+    let mut set_files: Vec<(String, Vec<u8>)> = Gen::dp_files("structure_set").into_iter().collect();
+    set_files.sort_by(|a, b| registry_sort_key(&a.0).cmp(&registry_sort_key(&b.0)));
+    load_defs_from_files(&structure_files, &set_files)
+}
+
+/// Parse one `worldgen/structure_set` JSON into a `SetDef`.
+///
+/// Kept separate from the file loop so a single malformed set can be skipped: the
+/// old loader's `?` on `placement`/`structures` returned `None` from the whole
+/// registry load, which silently disabled every structure in the seed.
+fn parse_set(bytes: &[u8]) -> Result<SetDef, String> {
+    let j = crate::json::jparse(bytes).ok_or("not valid JSON")?;
+    let p = j.get("placement").ok_or("missing `placement`")?;
+    let placement_type = p.get("type").map(|v| v.str()).unwrap_or_default();
+    let placement = match placement_type {
+        "minecraft:random_spread" => {
+            let number = |k: &str, d: f64| p.get(k).map(|v| v.num()).unwrap_or(d);
+            let reducer_name = p
+                .get("frequency_reduction_method")
+                .map(|v| v.str())
+                .unwrap_or("default");
+            let reducer = match reducer_name {
+                "default" => 0,
+                "legacy_type_1" => 1,
+                "legacy_type_2" => 2,
+                "legacy_type_3" => 3,
+                other => return Err(format!("unknown frequency reducer {other}")),
+            };
+            // The zone names another set by id; the index is resolved in a second
+            // pass, because the sets are enumerated in registry order and the
+            // referenced set may not have been parsed yet.
+            let exclusion = p.get("exclusion_zone").map(|z| {
+                (
+                    ns(z.get("other_set").map(|v| v.str()).unwrap_or_default()),
+                    z.get("chunk_count").map(|v| v.num()).unwrap_or(0.0) as i32,
+                )
+            });
+            PlacementDef::Spread {
+                spacing: number("spacing", 0.0) as i32,
+                separation: number("separation", 0.0) as i32,
+                salt: number("salt", 0.0) as i32,
+                triangular: p.get("spread_type").map(|v| v.str()) == Some("triangular"),
+                frequency: number("frequency", 1.0) as f32,
+                reducer,
+                exclusion,
+            }
+        }
+        "minecraft:concentric_rings" => PlacementDef::Rings {
+            distance: p.get("distance").map(|v| v.num()).unwrap_or(0.0) as i32,
+            spread: p.get("spread").map(|v| v.num()).unwrap_or(0.0) as i32,
+            count: p.get("count").map(|v| v.num()).unwrap_or(0.0) as i32,
+            preferred_biomes: p
+                .get("preferred_biomes")
+                .map(|v| biome_set(v, &mut HashSet::new()))
+                .unwrap_or_default(),
+        },
+        other => return Err(format!("unknown placement {other}")),
+    };
+    let entries: Vec<(String, i32)> = j
+        .get("structures")
+        .and_then(|v| v.as_arr())
+        .ok_or("missing or invalid `structures`")?
+        .iter()
+        .filter_map(|e| {
+            let structure = ns(e.get("structure")?.str());
+            let weight = e.get("weight").map(|v| v.num()).unwrap_or(1.0) as i32;
+            Some((structure, weight))
+        })
+        .collect();
+    if entries.is_empty() {
+        return Err("`structures` has no usable entries".into());
+    }
+    Ok(SetDef { placement, entries })
+}
+
+/// The loader proper, over already-enumerated `(id, bytes)` pairs so a test can hand
+/// it a pack with one broken entry in it.
+///
+/// Every per-entry failure is a **skip**, never a `None`: native's
+/// `RegistryDataLoader` reports the resource it cannot deserialize and keeps the
+/// rest of the registry, and this port has to do the same. Before, one malformed
+/// structure or structure_set JSON returned `None` from here, which disabled the
+/// whole pipeline and was indistinguishable from "this seed has no structures".
+///
+/// A skipped structure also takes no **slot**: `counts[step]` only advances for an
+/// entry that reached `by_step`, so `setFeatureSeed(pop, slot, step)` still numbers
+/// the survivors exactly the way the registry enumerates them. With no malformed
+/// file the result is bit-identical to the pre-skip loader (pinned by the
+/// `vanilla_defs_load_identically` fingerprint test).
+fn load_defs_from_files(
+    structure_files: &[(String, Vec<u8>)],
+    set_files: &[(String, Vec<u8>)],
+) -> Option<Defs> {
     let mut counts = [0usize; STRUCTURE_STEPS.len()];
     let mut structures = HashMap::new();
     let mut by_step: Vec<Vec<String>> = vec![Vec::new(); STRUCTURE_STEPS.len()];
-    for (id, bytes) in &structure_files {
-        let j = crate::json::jparse(bytes)?;
-        let step = step_index(
-            j.get("step")
-                .map(|v| v.str())
-                .or_else(|| {
-                    // 1.21.1 writes `step` on every structure; a missing one is a parse
-                    // failure rather than a default step.
-                    None
-                })
-                .as_deref()?,
-        )?;
-        let slot = counts[step];
-        counts[step] += 1;
+    for (id, bytes) in structure_files {
+        let Some(j) = crate::json::jparse(bytes) else {
+            eprintln!("SPIPE skipping malformed structure {id}: not valid JSON");
+            continue;
+        };
+        // 1.21.1 writes `step` on every structure; a missing or unknown one is a
+        // parse failure rather than a default step.
+        let Some(step) = j.get("step").map(|v| v.str()).and_then(step_index) else {
+            eprintln!("SPIPE skipping malformed structure {id}: missing or unknown `step`");
+            continue;
+        };
         let ty = j.get("type").map(|v| v.str().to_owned()).unwrap_or_default();
         let adjustment = j
             .get("terrain_adaptation")
@@ -230,10 +320,13 @@ fn load_defs_inner() -> Option<Defs> {
             | "minecraft:nether_fossil"
             | "minecraft:shipwreck"
             | "minecraft:ocean_ruin"
-            | "minecraft:ruined_portal" => (
-                Kick::Template,
-                Some(structure_template::parse_structure(&j).ok()?),
-            ),
+            | "minecraft:ruined_portal" => match structure_template::parse_structure(&j) {
+                Ok(kind) => (Kick::Template, Some(kind)),
+                Err(why) => {
+                    eprintln!("SPIPE skipping malformed structure {id}: template payload {why}");
+                    continue;
+                }
+            },
             "minecraft:buried_treasure" => {
                 (Kick::SinglePiece(SinglePieceKind::BuriedTreasure), None)
             }
@@ -249,10 +342,14 @@ fn load_defs_inner() -> Option<Defs> {
             "minecraft:ocean_monument" => (Kick::Wave3a(Wave3aKind::Monument), None),
             "minecraft:stronghold" => (Kick::Wave3a(Wave3aKind::Stronghold), None),
             other => {
-                eprintln!("SPIPE unknown structure type {other} for {id}");
+                eprintln!("SPIPE skipping malformed structure {id}: unknown type {other}");
                 continue;
             }
         };
+        // The slot is taken last, so an entry that never made it into `by_step`
+        // cannot shift the numbering of the ones after it.
+        let slot = counts[step];
+        counts[step] += 1;
         by_step[step].push(id.clone());
         structures.insert(
             id.clone(),
@@ -267,79 +364,16 @@ fn load_defs_inner() -> Option<Defs> {
         );
     }
     // Structure sets, in the same registry enumeration order.
-    let mut set_files: Vec<(String, Vec<u8>)> = Gen::dp_files("structure_set").into_iter().collect();
-    set_files.sort_by(|a, b| registry_sort_key(&a.0).cmp(&registry_sort_key(&b.0)));
     let mut sets = Vec::new();
     let mut by_id = HashMap::new();
-    for (id, bytes) in &set_files {
-        let j = crate::json::jparse(bytes)?;
-        let p = j.get("placement")?;
-        let placement_type = p.get("type").map(|v| v.str().to_owned()).unwrap_or_default();
-        let placement = match placement_type.as_str() {
-            "minecraft:random_spread" => {
-                let number = |k: &str, d: f64| p.get(k).map(|v| v.num()).unwrap_or(d);
-                let reducer_name = p
-                    .get("frequency_reduction_method")
-                    .map(|v| v.str().to_owned())
-                    .unwrap_or_else(|| "default".into());
-                let reducer = match reducer_name.as_str() {
-                    "default" => 0,
-                    "legacy_type_1" => 1,
-                    "legacy_type_2" => 2,
-                    "legacy_type_3" => 3,
-                    other => {
-                        eprintln!("SPIPE unknown frequency reducer {other} in {id}");
-                        return None;
-                    }
-                };
-                // The zone names another set by id; the index is resolved in a second
-                // pass, because the sets are enumerated in registry order and the
-                // referenced set may not have been parsed yet.
-                let exclusion = p.get("exclusion_zone").map(|z| {
-                    (
-                        ns(z.get("other_set").map(|v| v.str()).unwrap_or_default()),
-                        z.get("chunk_count").map(|v| v.num()).unwrap_or(0.0) as i32,
-                    )
-                });
-                PlacementDef::Spread {
-                    spacing: number("spacing", 0.0) as i32,
-                    separation: number("separation", 0.0) as i32,
-                    salt: number("salt", 0.0) as i32,
-                    triangular: p.get("spread_type").map(|v| v.str()) == Some("triangular"),
-                    frequency: number("frequency", 1.0) as f32,
-                    reducer,
-                    exclusion,
-                }
+    for (id, bytes) in set_files {
+        match parse_set(bytes) {
+            Ok(set) => {
+                by_id.insert(id.clone(), sets.len());
+                sets.push(set);
             }
-            "minecraft:concentric_rings" => PlacementDef::Rings {
-                distance: p.get("distance").map(|v| v.num()).unwrap_or(0.0) as i32,
-                spread: p.get("spread").map(|v| v.num()).unwrap_or(0.0) as i32,
-                count: p.get("count").map(|v| v.num()).unwrap_or(0.0) as i32,
-                preferred_biomes: p
-                    .get("preferred_biomes")
-                    .map(|v| biome_set(v, &mut HashSet::new()))
-                    .unwrap_or_default(),
-            },
-            other => {
-                eprintln!("SPIPE unknown placement {other} in {id}");
-                return None;
-            }
-        };
-        let entries: Vec<(String, i32)> = j
-            .get("structures")?
-            .as_arr()?
-            .iter()
-            .filter_map(|e| {
-                let structure = ns(e.get("structure")?.str());
-                let weight = e.get("weight").map(|v| v.num()).unwrap_or(1.0) as i32;
-                Some((structure, weight))
-            })
-            .collect();
-        if entries.is_empty() {
-            return None;
+            Err(why) => eprintln!("SPIPE skipping malformed structure_set {id}: {why}"),
         }
-        by_id.insert(id.clone(), sets.len());
-        sets.push(SetDef { placement, entries });
     }
     if crate::trace_env::env_flag!("SPIPE_TRACE") {
         eprintln!(
@@ -3009,5 +3043,198 @@ mod window_tests {
             "the world window must be able to draw above the roof, or the two windows are \\
              indistinguishable here"
         );
+    }
+}
+
+#[cfg(test)]
+mod defs_loader_tests {
+    use super::*;
+
+    fn vanilla(kind: &str) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<_> = Gen::dp_files(kind).into_iter().collect();
+        files.sort_by(|a, b| registry_sort_key(&a.0).cmp(&registry_sort_key(&b.0)));
+        files
+    }
+
+    fn fingerprint(d: &Defs) -> String {
+        let mut s = String::new();
+        let mut ids: Vec<_> = d.structures.keys().collect();
+        ids.sort();
+        for id in ids {
+            let v = &d.structures[id];
+            let mut biomes: Vec<_> = v.biomes.iter().collect();
+            biomes.sort();
+            s.push_str(&format!(
+                "S|{id}|{:?}|{}|{}|{:?}|{:?}|{}\n",
+                v.kick,
+                v.step,
+                v.slot,
+                v.adjustment,
+                v.template,
+                biomes.into_iter().map(String::as_str).collect::<Vec<_>>().join(",")
+            ));
+        }
+        for (i, step) in d.by_step.iter().enumerate() {
+            s.push_str(&format!("P|{i}|{}\n", step.join(",")));
+        }
+        let mut set_ids: Vec<_> = d.by_id.iter().collect();
+        set_ids.sort();
+        for (id, &idx) in set_ids {
+            let set = &d.sets[idx];
+            let entries: Vec<String> = set
+                .entries
+                .iter()
+                .map(|(e, w)| format!("{e}:{w}"))
+                .collect();
+            let placement = match &set.placement {
+                PlacementDef::Spread {
+                    spacing,
+                    separation,
+                    salt,
+                    triangular,
+                    frequency,
+                    reducer,
+                    exclusion,
+                } => format!(
+                    "spread|{spacing}|{separation}|{salt}|{triangular}|{}|{reducer}|{exclusion:?}",
+                    frequency.to_bits()
+                ),
+                PlacementDef::Rings {
+                    distance,
+                    spread,
+                    count,
+                    preferred_biomes,
+                } => {
+                    let mut bs: Vec<_> = preferred_biomes.iter().collect();
+                    bs.sort();
+                    format!(
+                        "rings|{distance}|{spread}|{count}|{}",
+                        bs.into_iter().map(String::as_str).collect::<Vec<_>>().join(",")
+                    )
+                }
+            };
+            s.push_str(&format!("T|{id}|{idx}|{placement}|{}\n", entries.join(",")));
+        }
+        s.push_str(&format!("A|{:?}\n", d.adapting_sets));
+        let mut mono: Vec<_> = d.monument_surrounding.iter().collect();
+        mono.sort();
+        s.push_str(&format!(
+            "M|{}\n",
+            mono.into_iter().map(String::as_str).collect::<Vec<_>>().join(",")
+        ));
+        s
+    }
+
+    /// SHA-256 of the fingerprint the pre-skip loader produced from the pinned
+    /// vanilla datapack — measured at HEAD `8dad8c7` before `load_defs_from_files`
+    /// existed. If a refactor moves one structure slot, template payload, set
+    /// placement, biome list or adapting-set index, this digest moves with it.
+    const VANILLA_FP: &str = "915d86995cdbf21f7df2b7e40fb6d6152e19a683edc8b081c7146cb60a35f230";
+
+    fn digest(d: &Defs) -> String {
+        let bytes = crate::generation_math::sha256(fingerprint(d).as_bytes());
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn vanilla_defs_load_identically() {
+        let structures = vanilla("structure");
+        let sets = vanilla("structure_set");
+        let d = load_defs_from_files(&structures, &sets).expect("vanilla defs load");
+        assert_eq!(d.structures.len(), 34);
+        assert_eq!(d.sets.len(), 20);
+        assert_eq!(d.by_step.iter().map(|v| v.len()).sum::<usize>(), 34);
+        assert_eq!(
+            digest(&d),
+            VANILLA_FP,
+            "the 0-malformed-file path must be identical to the pre-skip loader"
+        );
+        // The production entry point enumerates the same files and must agree with
+        // the helper exactly, not just in count.
+        assert_eq!(digest(&load_defs_inner().expect("defs")), VANILLA_FP);
+    }
+
+    #[test]
+    fn malformed_structure_entries_are_skipped_without_shifting_slots() {
+        let mut structures = vanilla("structure");
+        // All three ids sort before `minecraft:ancient_city`, so an entry that
+        // wrongly consumed a slot would shift every valid structure's number.
+        structures.push(("minecraft:aaa_bad_json".into(), b"{not json".to_vec()));
+        structures.push((
+            "minecraft:aaa_bad_step".into(),
+            br#"{"type":"minecraft:buried_treasure"}"#.to_vec(),
+        ));
+        structures.push((
+            "minecraft:aaa_bad_template".into(),
+            br#"{"type":"minecraft:nether_fossil","step":"underground_structures"}"#.to_vec(),
+        ));
+        let sets = vanilla("structure_set");
+        let d = load_defs_from_files(&structures, &sets)
+            .expect("the pipeline must survive malformed structures");
+        assert_eq!(d.structures.len(), 34, "exactly the three injected entries drop");
+        assert_eq!(d.sets.len(), 20);
+        assert_eq!(
+            digest(&d),
+            VANILLA_FP,
+            "every survivor keeps its exact slot, template and set"
+        );
+        for bad in ["aaa_bad_json", "aaa_bad_step", "aaa_bad_template"] {
+            assert!(!d.structures.contains_key(&format!("minecraft:{bad}")));
+        }
+        // The valid igloo still carries its template and its surface slot.
+        let igloo = &d.structures["minecraft:igloo"];
+        assert_eq!(igloo.step, 4);
+        assert_eq!(igloo.slot, 3);
+        assert!(igloo.template.is_some());
+    }
+
+    #[test]
+    fn malformed_structure_set_entries_are_skipped() {
+        let structures = vanilla("structure");
+        let mut sets = vanilla("structure_set");
+        // These sort before the vanilla sets, so a bad set must not shift `by_id`.
+        sets.push(("minecraft:aaa_bad_json".into(), b"{not json".to_vec()));
+        sets.push((
+            "minecraft:aaa_bad_placement".into(),
+            br#"{"placement":{"type":"minecraft:no_such_placement"}}"#.to_vec(),
+        ));
+        sets.push((
+            "minecraft:aaa_bad_structures".into(),
+            br#"{"placement":{"type":"minecraft:random_spread","spacing":32}}"#.to_vec(),
+        ));
+        sets.push((
+            "minecraft:aaa_empty_structures".into(),
+            br#"{"placement":{"type":"minecraft:random_spread","spacing":32},"structures":[]}"#
+                .to_vec(),
+        ));
+        let d = load_defs_from_files(&structures, &sets)
+            .expect("the pipeline must survive malformed sets");
+        assert_eq!(d.sets.len(), 20, "exactly the four injected sets drop");
+        assert_eq!(d.structures.len(), 34);
+        assert_eq!(
+            digest(&d),
+            VANILLA_FP,
+            "the surviving sets keep their ids and indices"
+        );
+        for bad in [
+            "aaa_bad_json",
+            "aaa_bad_placement",
+            "aaa_bad_structures",
+            "aaa_empty_structures",
+        ] {
+            assert!(!d.by_id.contains_key(&format!("minecraft:{bad}")));
+        }
+        // The pillager exclusion zone and the stronghold rings still resolve.
+        let pillager = &d.sets[*d.by_id.get("minecraft:pillager_outposts").expect("pillager")];
+        assert!(matches!(
+            &pillager.placement,
+            PlacementDef::Spread { exclusion: Some((other, 10)), .. }
+                if other == "minecraft:villages"
+        ));
+        let strongholds = &d.sets[*d.by_id.get("minecraft:strongholds").expect("strongholds")];
+        assert!(matches!(
+            &strongholds.placement,
+            PlacementDef::Rings { distance: 32, spread: 3, count: 128, .. }
+        ));
     }
 }
