@@ -47,6 +47,6 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 ## ライセンスとデータ
 
-コード本体は **`GPL-3.0-or-later`**（[LICENSE](LICENSE)、[NOTICE](NOTICE)、[LICENSING.md](LICENSING.md)）でライセンスされています。また、寄稿コードは `LGPL-3.0-or-later`（[COPYING.LESSER](COPYING.LESSER)）および `GPL-3.0-or-later` のデュアルライセンスで提供されるものとし、将来 `LGPL-3.0-or-later` への移行や C2ME (`MIT`)・Lithium (`LGPL-3.0`)・NeoForge (`LGPL-2.1`) との親和性も確保しています。Fabric / NeoForge 互換レイヤ経由で動的ロードされる独立した外部 Mod JAR には本体のコピーレフトは波及しません。
+コード本体は **`GPL-3.0-or-later`**（[LICENSE](LICENSE)、[NOTICE](NOTICE)、[LICENSING.md](LICENSING.md)）で配布されています。また、寄稿コードおよびファーストパーティコードは `LGPL-3.0-or-later`（[COPYING.LESSER](COPYING.LESSER)）、`GPL-3.0-or-later`（[LICENSE](LICENSE)）、および `AGPL-3.0-or-later`（[COPYING.AGPL](COPYING.AGPL)）のトリプルライセンスで提供されるものとし、将来 `LGPL-3.0-or-later`・`GPL-3.0-or-later`・`AGPL-3.0-or-later` のいずれの間でも自由に行き来できる柔軟性と、C2ME (`MIT`)・Lithium (`LGPL-3.0`)・NeoForge (`LGPL-2.1`) との完全な互換性を確保しています。Fabric / NeoForge 互換レイヤ経由で動的ロードされる独立した外部 Mod JAR には本体のコピーレフトは波及しません。
 
-貢献の条件は、寄稿コードの `LGPL-3.0-or-later` および `GPL-3.0-or-later` デュアルライセンス提供、DCO の `Signed-off-by`（`git commit -s`）、Mojang 逆コンパイルコードや第三者 JAR を混入させないことです。詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+貢献の条件は、寄稿コードの `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` トリプルライセンス提供、DCO の `Signed-off-by`（`git commit -s`）、Mojang 逆コンパイルコードや第三者 JAR を混入させないことです。詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。

@@ -1,11 +1,13 @@
 mc-spine
 Copyright 2026 nekomario28
 
-LICENSE (GNU GPL v3.0 or later), COPYING.LESSER (GNU LGPL v3.0 or later), and Cargo.toml specify
-`GPL-3.0-or-later OR LGPL-3.0-or-later` for mc-spine's own code (so the project operates under
-GPL-3.0-or-later today and may also be used or relicensed under LGPL-3.0-or-later; independent
-third-party Mod JARs loaded at runtime via the Fabric/NeoForge compatibility layer remain under
-their own licenses). This file records attributions for third-party material that is committed in
+LICENSE (GNU GPL v3.0 or later) and Cargo.toml (`license = "GPL-3.0-or-later"`) specify
+`GPL-3.0-or-later` as the current outbound distribution license of mc-spine, while all first-party
+and contributed code is provided under a triple license of `LGPL-3.0-or-later` (COPYING.LESSER),
+`GPL-3.0-or-later` (LICENSE), and `AGPL-3.0-or-later` (COPYING.AGPL) so the project or its shared
+kernel modules may freely transition between LGPLv3+, GPLv3+, and AGPLv3+ (independent third-party
+Mod JARs loaded at runtime via the Fabric/NeoForge compatibility layer remain under their own
+licenses). This file records attributions for third-party material that is committed in
 this repository, and lists the components that are fetched or supplied at setup time but are NOT
 distributed here. The full provenance inventory is in THIRD_PARTY.md, and licensing notes are in
 LICENSING.md.
