@@ -1114,9 +1114,11 @@ check "the frozen population digest notices shared provider changes" \
 
 check "the deep-state memo returns the value it computed" \
   src/worldgen.rs '        if let Some(&v) = self.deep_c.get(&(x, y, z)) {
+            inc_if(m3_read, M3_DEEP_HIT);
             return v;
         }' \
   '        if self.deep_c.contains_key(&(x, y, z)) {
+            inc_if(m3_read, M3_DEEP_HIT);
             return 0;
         }' \
   feature_population_output_matches_the_pre_refactor_capture
@@ -1572,18 +1574,38 @@ check "weird sampler type_2 thresholds are strict" \
   weird_sampler_matches_native_mapper_and_samples
 
 check "weird sampler installed definitions do not become zero" \
-  src/worldgen.rs 'rarity * self.noises[*ni].get(xd, yd, zd).abs()' \
-  'rarity * self.noises[*ni].get(xd, yd, zd).abs() * 0.0' \
+  src/worldgen.rs '                let rarity = mapper.rarity(self.eval_c(*input, x, y, z, memo, cc));
+                let xd = x as f64 / rarity;
+                let yd = y as f64 / rarity;
+                let zd = z as f64 / rarity;
+                rarity * self.noises[*ni].get(xd, yd, zd).abs()' \
+  '                let rarity = mapper.rarity(self.eval_c(*input, x, y, z, memo, cc));
+                let xd = x as f64 / rarity;
+                let yd = y as f64 / rarity;
+                let zd = z as f64 / rarity;
+                rarity * self.noises[*ni].get(xd, yd, zd).abs() * 0.0' \
   weird_sampler_installed_nodes_are_nonzero
 
 check "weird sampler divides the vertical coordinate by rarity" \
-  src/worldgen.rs 'let yd = y as f64 / rarity;' \
-  'let yd = y as f64 * rarity;' \
+  src/worldgen.rs '                let rarity = mapper.rarity(self.eval_c(*input, x, y, z, memo, cc));
+                let xd = x as f64 / rarity;
+                let yd = y as f64 / rarity;' \
+  '                let rarity = mapper.rarity(self.eval_c(*input, x, y, z, memo, cc));
+                let xd = x as f64 / rarity;
+                let yd = y as f64 * rarity;' \
   weird_sampler_matches_native_mapper_and_samples
 
 check "weird sampler takes absolute noise before scaling" \
-  src/worldgen.rs 'rarity * self.noises[*ni].get(xd, yd, zd).abs()' \
-  'rarity * self.noises[*ni].get(xd, yd, zd)' \
+  src/worldgen.rs '                let rarity = mapper.rarity(self.eval_c(*input, x, y, z, memo, cc));
+                let xd = x as f64 / rarity;
+                let yd = y as f64 / rarity;
+                let zd = z as f64 / rarity;
+                rarity * self.noises[*ni].get(xd, yd, zd).abs()' \
+  '                let rarity = mapper.rarity(self.eval_c(*input, x, y, z, memo, cc));
+                let xd = x as f64 / rarity;
+                let yd = y as f64 / rarity;
+                let zd = z as f64 / rarity;
+                rarity * self.noises[*ni].get(xd, yd, zd)' \
   weird_sampler_matches_native_mapper_and_samples
 
 check "weird sampler keeps its input in grid reachability" \
@@ -1622,8 +1644,16 @@ check "weird sampler native noise keeps per-octave multiplication order" \
   worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples
 
 check "weird sampler multiplies the absolute noise by rarity" \
-  src/worldgen.rs 'rarity * self.noises[*ni].get(xd, yd, zd).abs()' \
-  'self.noises[*ni].get(xd, yd, zd).abs()' \
+  src/worldgen.rs '                let rarity = mapper.rarity(self.eval_c(*input, x, y, z, memo, cc));
+                let xd = x as f64 / rarity;
+                let yd = y as f64 / rarity;
+                let zd = z as f64 / rarity;
+                rarity * self.noises[*ni].get(xd, yd, zd).abs()' \
+  '                let rarity = mapper.rarity(self.eval_c(*input, x, y, z, memo, cc));
+                let xd = x as f64 / rarity;
+                let yd = y as f64 / rarity;
+                let zd = z as f64 / rarity;
+                self.noises[*ni].get(xd, yd, zd).abs()' \
   worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples
 
 check "aquifer preliminary surface uses the pinned threshold" \
@@ -1637,8 +1667,16 @@ check "aquifer preliminary surface scans quart columns" \
   aquifer_matches_the_pinned_chunk_through_its_public_api
 
 check "aquifer spline keeps the native float interpolation order" \
-  src/worldgen.rs 'let lerp = |delta: f32, start: f32, end: f32| start + delta * (end - start);' \
-  'let lerp = |delta: f32, start: f32, end: f32| (1.0 - delta) * start + delta * end;' \
+  src/worldgen.rs '        let lerp = |delta: f32, start: f32, end: f32| start + delta * (end - start);
+        (lerp(t, v0, v1) + t * (1.0 - t) * lerp(t, d0t, d1t)) as f64
+    }
+
+    fn eval0_c(' \
+  '        let lerp = |delta: f32, start: f32, end: f32| (1.0 - delta) * start + delta * end;
+        (lerp(t, v0, v1) + t * (1.0 - t) * lerp(t, d0t, d1t)) as f64
+    }
+
+    fn eval0_c(' \
   aquifer_matches_the_pinned_chunk_through_its_public_api
 
 check "aquifer deep test keeps the depth threshold" \
@@ -1845,8 +1883,8 @@ check "independent generators cannot share generated tick queues" \
   worldgen::wg_tests::generated_ticks_belong_to_their_generator
 
 check "runtime drains the published generator queues" \
-  src/worldgen.rs '            *GEN_TICK_QUEUES.lock().unwrap() = Some(g.generated_ticks.clone());' \
-  '            *GEN_TICK_QUEUES.lock().unwrap() = None;' \
+  src/worldgen.rs '        *GEN_TICK_QUEUES.lock().unwrap() = Some(ticks);' \
+  '        *GEN_TICK_QUEUES.lock().unwrap() = None;' \
   worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock
 
 check "runtime tick drain does not wait for the generation lock" \
@@ -1964,7 +2002,10 @@ check "the canonical state keeps its properties" \
   overworld_chunk_matches_native_capture_state_for_state
 
 check "an Overworld chunk falls back to the deep state" \
-  src/worldgen.rs '            let st = self.deep_state_cached(x, y, z, cc);' '            let st = self.def_st;' \
+  src/worldgen.rs '            let st = self.deep_state_cached(x, y, z, cc);
+            let st = self.vein_override(cc, x, y, z, st);' \
+  '            let st = self.def_st;
+            let st = self.vein_override(cc, x, y, z, st);' \
   overworld_chunk_matches_native_capture_state_for_state
 
 check "an entity offset flips the axis native flips" \
@@ -3355,8 +3396,8 @@ check "a terrain round claims every chunk of the group" \
   worldgen::wg_tests::terrain_prefetch_fills_more_than_one_chunk_at_a_time
 
 check "a prefetched section is consumed by its own section key" \
-  src/worldgen.rs '        let mut arr = match self.terr_c.get(&(cx, sy, cz)) {' \
-  '        let mut arr = match self.terr_c.get(&(cx, sy + 16, cz)) {' \
+  src/worldgen.rs '        let mut arr: Box<[u32; 4096]> = match self.terr_c.get(&(cx, sy, cz)) {' \
+  '        let mut arr: Box<[u32; 4096]> = match self.terr_c.get(&(cx, sy + 16, cz)) {' \
   worldgen::wg_tests::a_prefetched_section_is_identical_to_the_serial_section_with_features
 
 # `ClampedNormalInt` (`bpr`) is `(int) Mth.clamp(Mth.nextGaussian(random, mean, deviation),
