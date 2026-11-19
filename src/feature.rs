@@ -5222,7 +5222,9 @@ type FeatureOrder = Vec<Vec<(u32, String)>>;
 /// `BiomeFilter`-equivalent `present` test is a single integer AND with the
 /// chunk's `present_mask`. `placed_idx` indexes `placed_vec` directly.
 struct StepEntry {
+    #[cfg(test)]
     gi: u32,
+    #[cfg(test)]
     name: String,
     step_biome_mask: u128,
     placed_idx: usize,
@@ -5515,8 +5517,11 @@ fn load_freg() -> FReg {
                         }
                     }
                 }
+                let _ = gi;
                 entries.push(StepEntry {
+                    #[cfg(test)]
                     gi: *gi,
+                    #[cfg(test)]
                     name: name.clone(),
                     step_biome_mask: mask,
                     placed_idx: placed_idx
