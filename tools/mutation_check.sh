@@ -845,8 +845,8 @@ check "breaking a chest drops the slots it owned" \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a state whose metadata row cannot be matched is reported as unpaired" \
-  src/block_registry.rs '.and_then(|index| pbr.and_then(|block| jarr(block, "states")?.get(index)))' \
-  '.and_then(|index| pbr.and_then(|block| jarr(block, "states")?.get(index + 1)))' \
+  src/block_registry.rs 'match state_flags.get(st) {' \
+  'match state_flags.get(st + 1) {' \
   every_wire_state_has_complete_metadata
 
 check "the client's view distance is read from its packet" \
@@ -1402,7 +1402,8 @@ check "a removed container closes its window on windowId 1" \
   a_removed_container_closes_the_window_built_on_it
 
 check "a block container stops existing when its block does" \
-  src/main.rs '            is_ender_key(pos) || container_kind(block_at(pos.0, pos.1, pos.2)).is_some()' \
+  src/main.rs '            is_ender_key((pos.1, pos.2, pos.3))
+                || container_kind(block_at_dim(pos.0, pos.1, pos.2, pos.3)).is_some()' \
   '            true' \
   breaking_a_chest_drops_each_stack_once_and_leaves_no_entry
 
@@ -1453,8 +1454,8 @@ check "spectator and dead players do not pick up drops" \
   pickup_tick_excludes_spectator_and_dead_players
 
 check "player pickup uses the 1.21.1 inflated touch AABB" \
-  src/main.rs '    EntityAabb::from_dimensions(x, y, z, 0.6, height).inflate(1.0, 0.5, 1.0)' \
-  '    EntityAabb::from_dimensions(x, y, z, 0.6, height)' \
+  src/main.rs '    player_bounding_box(x, y, z, sneaking, fall_fly).inflate(1.0, 0.5, 1.0)' \
+  '    player_bounding_box(x, y, z, sneaking, fall_fly)' \
   pickup_tick_matches_1_21_1_player_touch_aabb_boundaries
 
 # Pinned surface-loader slice: codecs, weather dispatch, and its shared noise owner.
@@ -1518,8 +1519,8 @@ check "entity spawn head angles keep the constructor double precision" \
 
 # Binary/geometry primitives: actual-class vectors plus production dispatch.
 check "section palettes switch to registry IDs above the indirect limit" \
-  src/main.rs '    let direct = bits > max_bits;' \
-  '    let direct = bits > max_bits + 1;' \
+  src/main.rs '    let direct = direct || indirect_bits > max_bits;' \
+  '    let direct = indirect_bits > max_bits + 1;' \
   primitives_section_encoding_matches_native_palettes
 
 check "section packing leaves unused high bits instead of straddling words" \
@@ -2025,7 +2026,7 @@ check "a sign message that is not a string component is refused" \
   unsupported_sign_components_are_refused
 
 check "staged signs reach the sign store" \
-  src/main.rs '                    .insert((pos.0, pos.1, pos.2, 1), lines);' '                    .insert((pos.0, pos.1, pos.2, 0), lines);' \
+  src/main.rs '                    .insert((DimId::Overworld, pos.0, pos.1, pos.2, 1), lines);' '                    .insert((DimId::Overworld, pos.0, pos.1, pos.2, 0), lines);' \
   template_sign_text_matches_native_and_reaches_the_sign_store
 
 check "a furnace is staged as a furnace, not a chest" \
@@ -2085,7 +2086,7 @@ check "template NBT other than container Items is refused" \
   the_fossil_contract_still_refuses_a_container
 
 check "a block write is not split from its tick booking by a save" \
-  src/main.rs '    with_save_guard(|| set_block_if_inner(x, y, z, st, expected))' '    set_block_if_inner(x, y, z, st, expected)' \
+  src/main.rs '    with_save_guard(|| set_block_if_inner_dim(dim, x, y, z, st, expected))' '    set_block_if_dim_edit(dim, x, y, z, st, expected)' \
   tick_tests::a_block_write_waits_for_an_in_progress_save_before_booking
 
 check "fluid handoff adopts the generated positions" \
@@ -3603,7 +3604,7 @@ check "lake_feature_barrier_marks_above_for_post_processing" \
 # and EnderChestBlockEntity anchored 0x08 opener counting.
 check "chest_contract_3d_block_loot_lazy_defers_materialization" \
   src/main.rs '                pending_block_loot().lock().unwrap().insert(
-                    pos,
+                    ow_block(pos),
                     PendingBlockLoot {
                         kind,
                         loot_table,
@@ -3611,7 +3612,7 @@ check "chest_contract_3d_block_loot_lazy_defers_materialization" \
                     },
                 );' \
   '                let rolled = roll_loot_container_slots(kind, &loot_table, loot_seed);
-                chests().lock().unwrap_or_else(|e| e.into_inner()).insert(ContainerKey::Block(pos), rolled);' \
+                chests().lock().unwrap_or_else(|e| e.into_inner()).insert(ContainerKey::Block(ow_block(pos)), rolled);' \
   tick_tests::chest_contract_3d_block_loot_stays_lazy_until_first_open
 
 check "chest_contract_3d_block_loot_spectator_gate_unpacks_for_viewers" \
@@ -3642,8 +3643,8 @@ check "chest_contract_3d_dry_chest_is_solid_for_fluid" \
   tick_tests::chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_partner_error
 
 check "chest_contract_3d_ender_chest_counts_anchor_openers" \
-  src/main.rs '            if matches!(a, ContainerKey::Block(ek) if is_ender_key(ek)) && b.is_none() {' \
-  '            if false && matches!(a, ContainerKey::Block(ek) if is_ender_key(ek)) && b.is_none() {' \
+  src/main.rs '            if matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {' \
+  '            if false && matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {' \
   tick_tests::chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break
 
 # P2-3-S1: the per-dimension registry must select the dimension it is asked for. Routing
