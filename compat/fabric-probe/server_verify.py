@@ -161,7 +161,7 @@ def main():
             record.update({'reload':json.loads(reload.stdout.splitlines()[-1]),'world_sha256':hashlib.sha256(world.read_bytes()).hexdigest(),'log':log.read_text()})
             records.append(record)
         refusals=[('fabric_missing_invoke','fabric','Critical injection failure'),('fabric_unknown_mod','fabric','Unsupported mod hash'),('conflicting_adapters','both','Select only one Java loader adapter')]
-        if args.neoforge: refusals.append(('neoforge_unknown_mod','neoforge','Unsupported NeoForge mod hash'))
+        if args.neoforge: refusals.append(('neoforge_unknown_mod','neoforge','ShimCheck rejected NeoForge mod:'))
         for index,(name,adapter,reason) in enumerate(refusals):
             cwd=pathlib.Path(scratch)/name;cwd.mkdir();(cwd/'mods').mkdir()
             env={**os.environ,'JAVA_HOME':'/usr/lib/jvm/java-21-openjdk','MC_SPINE_WG':'old','MC_SPINE_PORT':str(25670+index*2),'MC_SPINE_RCON_PORT':str(25671+index*2),'MC_SPINE_RCON_PASS':'probe-only'}

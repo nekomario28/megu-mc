@@ -16,7 +16,7 @@
     "net/neoforged/neoforge/event/level/BlockEvent": {"methods": [], "fields": []},
     "net/neoforged/neoforge/event/level/BlockEvent$FarmlandTrampleEvent": {"methods": ["setCanceled(Z)V", "isCanceled()Z", "getEntity()Lnet/minecraft/world/entity/Entity;", "getFallDistance()F", "<init>(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;FLnet/minecraft/world/entity/Entity;)V"], "fields": []},
     "net/neoforged/bus/api/IEventBus": {"methods": ["register(Ljava/lang/Object;)V", "unregister(Ljava/lang/Object;)V", "post(Lnet/neoforged/bus/api/Event;)Lnet/neoforged/bus/api/Event;", "addListener(Lnet/neoforged/bus/api/EventPriority;ZLjava/lang/Class;Ljava/util/function/Consumer;)V"], "fields": []},
-    "net/neoforged/bus/api/Event": {"methods": [], "fields": []},
+    "net/neoforged/bus/api/Event": {"methods": ["<init>()V"], "fields": []},
     "net/neoforged/bus/api/SubscribeEvent": {"methods": ["priority()Lnet/neoforged/bus/api/EventPriority;", "receiveCanceled()Z"], "fields": []},
     "net/neoforged/bus/api/EventPriority": {"methods": [], "fields": ["HIGHEST:Lnet/neoforged/bus/api/EventPriority;", "HIGH:Lnet/neoforged/bus/api/EventPriority;", "NORMAL:Lnet/neoforged/bus/api/EventPriority;", "LOW:Lnet/neoforged/bus/api/EventPriority;", "LOWEST:Lnet/neoforged/bus/api/EventPriority;"]},
     "net/neoforged/bus/api/ICancellableEvent": {"methods": ["setCanceled(Z)V", "isCanceled()Z"], "fields": []}

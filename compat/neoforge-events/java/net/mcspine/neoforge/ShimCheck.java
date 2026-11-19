@@ -45,6 +45,64 @@ public final class ShimCheck {
 
     private ShimCheck() { }
 
+    public record Rejection(String code, String symbol, String detail) { }
+    public record ModEntry(String modId, String className) { }
+    public record Subscriber(String modId, String className, String bus) { }
+    public record VerifiedJar(Path path, List<String> modIds, List<ModEntry> entries,
+                              List<Subscriber> subscribers, List<Rejection> rejections) { }
+    public record Discovery(List<VerifiedJar> jars) {
+        public boolean compatible() {
+            return jars.stream().allMatch(jar -> jar.rejections().isEmpty());
+        }
+        public String rejectionDetails() {
+            List<String> details = new ArrayList<>();
+            for (VerifiedJar jar : jars) {
+                for (Rejection reason : jar.rejections()) {
+                    details.add(jar.path() + " [" + reason.code() + "] " + reason.symbol()
+                        + " (" + reason.detail() + ")");
+                }
+            }
+            return String.join("; ", details);
+        }
+    }
+
+    /** Audit the entire mod set before any application class is loaded. */
+    public static Discovery verifyMods(List<Path> jars, Surface surface) {
+        List<JarReport> reports = new ArrayList<>();
+        for (Path jar : jars) {
+            try {
+                reports.add(scan(jar, surface));
+            } catch (IOException error) {
+                JarReport report = new JarReport(jar.toString());
+                report.reject("INVALID_JAR", jar.toString(), error.getMessage());
+                reports.add(report);
+            }
+        }
+        checkInterModDependencies(reports);
+        List<VerifiedJar> verified = new ArrayList<>();
+        for (int i = 0; i < reports.size(); i++) {
+            JarReport report = reports.get(i);
+            List<ModEntry> entries = new ArrayList<>();
+            List<Subscriber> subscribers = new ArrayList<>();
+            for (ClassInfo info : report.classes.values()) {
+                if (info.modId != null && !info.client && report.mods.containsKey(info.modId)) {
+                    entries.add(new ModEntry(info.modId, info.name.replace('/', '.')));
+                }
+                if (info.subscriber && !info.client) {
+                    String owner = info.subscriberModId.isEmpty() && report.mods.size() == 1
+                        ? report.mods.keySet().iterator().next() : info.subscriberModId;
+                    if (report.mods.containsKey(owner)) {
+                        subscribers.add(new Subscriber(owner, info.name.replace('/', '.'), info.subscriberBus));
+                    }
+                }
+            }
+            verified.add(new VerifiedJar(jars.get(i), List.copyOf(report.mods.keySet()),
+                List.copyOf(entries), List.copyOf(subscribers),
+                report.reasons.stream().map(r -> new Rejection(r.code, r.symbol, r.detail)).toList()));
+        }
+        return new Discovery(List.copyOf(verified));
+    }
+
     public static void main(String[] args) {
         boolean json = false;
         Path surface = Path.of("compat/neoforge-events/shim-surface.json");
@@ -228,6 +286,16 @@ public final class ShimCheck {
         for (ClassInfo info : result.classes.values()) {
             if (info.modId != null && !ids.contains(info.modId)) {
                 result.reject("MOD_ANNOTATION_MISMATCH", info.name, "@Mod(" + info.modId + ") missing from TOML");
+            }
+            if (info.subscriber) {
+                if (!Set.of("GAME", "MOD").contains(info.subscriberBus)) {
+                    result.reject("INVALID_SUBSCRIBER_BUS", info.name, info.subscriberBus);
+                }
+                if (!info.subscriberModId.isEmpty() && !ids.contains(info.subscriberModId)) {
+                    result.reject("UNKNOWN_SUBSCRIBER_MOD", info.name, info.subscriberModId);
+                } else if (info.subscriberModId.isEmpty() && ids.size() != 1) {
+                    result.reject("AMBIGUOUS_SUBSCRIBER_MOD", info.name, "Specify modid for multi-mod JAR");
+                }
             }
         }
         for (String id : ids) {
@@ -438,9 +506,12 @@ public final class ShimCheck {
     private static final class ClassInfo {
         String name;
         String modId;
+        final Set<String> modDist = new TreeSet<>();
+        boolean modDistExplicit;
         boolean client;
         boolean onlyInClient;
         boolean subscriber;
+        String subscriberModId = "";
         String subscriberBus = "GAME";
         final Set<String> subscriberDist = new TreeSet<>();
         final Set<String> symbols = new TreeSet<>();
@@ -524,15 +595,30 @@ public final class ShimCheck {
                 @Override public void visit(String key, Object value) {
                     info.constant(value);
                     if (MOD.equals(desc) && "value".equals(key) && value instanceof String id) info.modId = id;
+                    if (SUBSCRIBER.equals(desc) && "modid".equals(key) && value instanceof String id) info.subscriberModId = id;
                     if (desc.endsWith("/At;") && "value".equals(key) && value instanceof String at) info.atValues.add(at);
                 }
                 @Override public void visitEnum(String key, String enumDesc, String value) {
                     info.descriptor(enumDesc);
-                    if (SUBSCRIBER.equals(desc) && enumDesc.endsWith("/Dist;")) info.subscriberDist.add(value);
+                    if (SUBSCRIBER.equals(desc) && "value".equals(key) && enumDesc.endsWith("/Dist;")) info.subscriberDist.add(value);
+                    if (MOD.equals(desc) && "dist".equals(key) && enumDesc.endsWith("/Dist;")) info.modDist.add(value);
                     if (SUBSCRIBER.equals(desc) && enumDesc.endsWith("/EventBusSubscriber$Bus;")) info.subscriberBus = value;
                     if (classLevel && ONLY_IN.equals(desc) && "CLIENT".equals(value)) info.onlyInClient = true;
                 }
-                @Override public AnnotationVisitor visitArray(String key) { return this; }
+                @Override public AnnotationVisitor visitArray(String key) {
+                    if (MOD.equals(desc) && "dist".equals(key)) info.modDistExplicit = true;
+                    return new AnnotationVisitor(Opcodes.ASM9) {
+                        @Override public void visitEnum(String ignored, String enumDesc, String value) {
+                            info.descriptor(enumDesc);
+                            if (SUBSCRIBER.equals(desc) && "value".equals(key) && enumDesc.endsWith("/Dist;")) {
+                                info.subscriberDist.add(value);
+                            }
+                            if (MOD.equals(desc) && "dist".equals(key) && enumDesc.endsWith("/Dist;")) {
+                                info.modDist.add(value);
+                            }
+                        }
+                    };
+                }
                 @Override public AnnotationVisitor visitAnnotation(String key, String nested) { return annotation(nested); }
             };
         }
@@ -544,8 +630,10 @@ public final class ShimCheck {
             return annotation(desc, true);
         }
         @Override public void visitEnd() {
-            info.client = info.onlyInClient || (info.subscriber && info.subscriberDist.contains("CLIENT")
-                && !info.subscriberDist.contains("DEDICATED_SERVER"));
+            info.client = info.onlyInClient
+                || (info.subscriber && info.subscriberDist.contains("CLIENT")
+                    && !info.subscriberDist.contains("DEDICATED_SERVER"))
+                || (info.modId != null && info.modDistExplicit && !info.modDist.contains("DEDICATED_SERVER"));
         }
         @Override public FieldVisitor visitField(int access, String name, String desc, String signature, Object value) {
             info.descriptor(desc);
@@ -584,12 +672,21 @@ public final class ShimCheck {
         }
     }
 
-    private static final class Surface {
+    public static final class Surface {
         private final Map<String, Set<String>> methods = new TreeMap<>();
         private final Map<String, Set<String>> fields = new TreeMap<>();
         static Surface read(Path path) throws IOException {
+            return parse(Files.readString(path, StandardCharsets.UTF_8));
+        }
+        public static Surface readFromResource() throws IOException {
+            try (InputStream stream = ShimCheck.class.getResourceAsStream("shim-surface.json")) {
+                if (stream == null) throw new IOException("Bundled NeoForge shim-surface.json missing");
+                return parse(new String(stream.readAllBytes(), StandardCharsets.UTF_8));
+            }
+        }
+        private static Surface parse(String json) throws IOException {
             Map<String, Object> data;
-            try { data = Json.object(Json.parse(Files.readString(path, StandardCharsets.UTF_8))); }
+            try { data = Json.object(Json.parse(json)); }
             catch (IllegalArgumentException error) { throw new IOException("Invalid surface: " + error.getMessage(), error); }
             Surface surface = new Surface();
             if (!"mc-spine-neoforge-s0".equals(data.get("schema"))) throw new IOException("Unsupported surface schema");

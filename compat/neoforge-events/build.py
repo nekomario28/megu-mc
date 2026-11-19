@@ -24,8 +24,10 @@ def main():
     sources=sorted((ROOT/'java').rglob('*.java'))+[ROOT.parent/'fabric-probe/java/net/mcspine/probe/Host.java']
     classes=build/'classes';classes.mkdir()
     subprocess.run([str(pathlib.Path(args.java_home)/'bin/javac'),'-J-Xmx128m','--release','21','-proc:none','-cp',os.pathsep.join(map(str,libraries)),'-d',str(classes),*map(str,sources)],check=True)
-    jar(build/'game.jar',{str(path.relative_to(classes)):path.read_bytes() for path in classes.rglob('*.class')})
+    contents={str(path.relative_to(classes)):path.read_bytes() for path in classes.rglob('*.class')}
+    contents['net/mcspine/neoforge/shim-surface.json']=(ROOT/'shim-surface.json').read_bytes()
+    jar(build/'game.jar',contents)
     (build/'classpath.txt').write_text(os.pathsep.join(map(str,[build/'game.jar',*libraries])))
-    (build/'build-receipt.json').write_text(json.dumps({'pins':pins,'sources':{str(path):sha(path) for path in sources},'jar_sha256':sha(build/'game.jar')},indent=2)+'\n')
+    (build/'build-receipt.json').write_text(json.dumps({'pins':pins,'sources':{str(path):sha(path) for path in sources},'surface_sha256':sha(ROOT/'shim-surface.json'),'jar_sha256':sha(build/'game.jar')},indent=2)+'\n')
     print(build/'classpath.txt')
 if __name__=='__main__':main()

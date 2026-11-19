@@ -1,33 +1,147 @@
 package net.mcspine.neoforge;
-import java.nio.file.*;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.net.URL;
 import java.net.URLClassLoader;
-import net.neoforged.fml.common.Mod;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.BusBuilder;
+import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.common.NeoForge;
-/** Pinned event adapter discovery, not the full FML loader/bootstrap. */
+
+/** Static compatibility gate followed by the supported NeoForge event bootstrap. */
 public final class Bootstrap {
     static Object instance;
     private static URLClassLoader modLoader;
-    public static Class<?> initialize(String directory) throws Exception {
+    private static final Map<String, Object> instances = new LinkedHashMap<>();
+    private static final Map<String, IEventBus> modBuses = new LinkedHashMap<>();
+    private static final List<Class<?>> gameSubscribers = new ArrayList<>();
+    private static boolean initialized;
+
+    private Bootstrap() { }
+
+    public static synchronized Class<?> initialize(String directory) throws Exception {
+        if (initialized) throw new IllegalStateException("NeoForge bootstrap already initialized");
         Path mods = Path.of(directory).resolve("mods");
         Files.createDirectories(mods);
+        List<Path> jars;
         try (var paths = Files.list(mods)) {
-            var entries = paths.toList();
-            if (entries.size() > 1) throw new IllegalStateException("Only one pinned NeoForge mod is supported");
-            for (Path path : entries) {
-                if (!Files.isRegularFile(path)) throw new IllegalStateException("Unsupported NeoForge mod entry");
-                String hash = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(path)));
-                if (!hash.equals("90d3318ce049d2e684b08d12ab6e35410a9d8e159afc43757102ab127c028acf"))
-                    throw new IllegalStateException("Unsupported NeoForge mod hash in scoped event contract");
-                modLoader = new URLClassLoader(new java.net.URL[]{path.toUri().toURL()}, Bootstrap.class.getClassLoader());
-                Class<?> mod = modLoader.loadClass("com.seedprotect.SeedProtectMod");
-                Mod annotation = mod.getAnnotation(Mod.class);
-                if (annotation == null || !annotation.value().equals("seedprotect")) throw new IllegalStateException("Pinned NeoForge Mod annotation mismatch");
-                instance = mod.getConstructor().newInstance();
+            jars = paths.sorted(Comparator.comparing(path -> path.getFileName().toString())).toList();
+        }
+        for (Path jar : jars) {
+            if (!Files.isRegularFile(jar) || !jar.getFileName().toString().endsWith(".jar")) {
+                throw new IllegalStateException("ShimCheck rejected NeoForge mod: [INVALID_MOD_ENTRY] " + jar);
             }
         }
-        // The actual NeoForge class creates a shutdown game bus. Registration precedes start.
-        NeoForge.EVENT_BUS.start();
+        if (jars.isEmpty()) {
+            NeoForge.EVENT_BUS.start();
+            initialized = true;
+            return net.mcspine.probe.Host.class;
+        }
+
+        ShimCheck.Discovery discovery;
+        try {
+            discovery = ShimCheck.verifyMods(jars, ShimCheck.Surface.readFromResource());
+        } catch (Exception error) {
+            throw new IllegalStateException("ShimCheck rejected NeoForge mod: [INVALID_SURFACE] "
+                + error.getMessage(), error);
+        }
+        if (!discovery.compatible()) {
+            throw new IllegalStateException("ShimCheck rejected NeoForge mod: " + discovery.rejectionDetails());
+        }
+
+        // The entire mod set has passed bytecode and metadata inspection before class loading.
+        modLoader = new URLClassLoader(jars.stream().map(path -> {
+            try { return path.toUri().toURL(); }
+            catch (java.net.MalformedURLException error) { throw new IllegalArgumentException(error); }
+        }).toArray(URL[]::new), Bootstrap.class.getClassLoader());
+        try {
+            for (ShimCheck.VerifiedJar jar : discovery.jars()) {
+                for (String id : jar.modIds()) {
+                    modBuses.put(id, BusBuilder.builder().startShutdown().build());
+                }
+            }
+            for (ShimCheck.VerifiedJar jar : discovery.jars()) {
+                for (ShimCheck.ModEntry entry : jar.entries()) {
+                    Class<?> type = Class.forName(entry.className(), false, modLoader);
+                    Object mod = construct(type, entry.modId(), modBuses.get(entry.modId()));
+                    instances.putIfAbsent(entry.modId(), mod);
+                    if (instance == null) instance = mod;
+                }
+            }
+            for (ShimCheck.VerifiedJar jar : discovery.jars()) {
+                for (ShimCheck.Subscriber subscriber : jar.subscribers()) {
+                    Class<?> type = Class.forName(subscriber.className(), false, modLoader);
+                    if (subscriber.bus().equals("GAME")) {
+                        NeoForge.EVENT_BUS.register(type);
+                        gameSubscribers.add(type);
+                    } else {
+                        modBuses.get(subscriber.modId()).register(type);
+                    }
+                }
+            }
+            for (IEventBus bus : modBuses.values()) bus.start();
+            NeoForge.EVENT_BUS.start();
+            initialized = true;
+        } catch (Exception | LinkageError error) {
+            close();
+            throw error;
+        }
         return net.mcspine.probe.Host.class;
     }
+
+    private static Object construct(Class<?> type, String modId, IEventBus modBus) throws Exception {
+        List<Constructor<?>> supported = new ArrayList<>();
+        for (Constructor<?> constructor : type.getDeclaredConstructors()) {
+            Class<?>[] parameters = constructor.getParameterTypes();
+            if (parameters.length > 2) continue;
+            boolean bus = false;
+            boolean dist = false;
+            boolean valid = true;
+            for (Class<?> parameter : parameters) {
+                if (parameter == IEventBus.class && !bus) bus = true;
+                else if (parameter == Dist.class && !dist) dist = true;
+                else valid = false;
+            }
+            if (valid) supported.add(constructor);
+        }
+        if (supported.size() != 1) {
+            throw new IllegalStateException("@Mod(" + modId + ") " + type.getName()
+                + " requires exactly one supported constructor (IEventBus and/or Dist): found " + supported.size());
+        }
+        Constructor<?> constructor = supported.getFirst();
+        Object[] arguments = java.util.Arrays.stream(constructor.getParameterTypes()).map(parameter ->
+            parameter == IEventBus.class ? modBus : Dist.DEDICATED_SERVER).toArray();
+        try {
+            constructor.setAccessible(true);
+            return constructor.newInstance(arguments);
+        } catch (InvocationTargetException error) {
+            throw new IllegalStateException("@Mod(" + modId + ") constructor failed: " + type.getName(), error.getCause());
+        }
+    }
+
+    public static synchronized Map<String, Object> instances() { return Map.copyOf(instances); }
+    public static synchronized IEventBus modBus(String modId) { return modBuses.get(modId); }
+
+    /** Release class-loader and event registrations for isolated runtimes/tests. */
+    public static synchronized void close() throws java.io.IOException {
+        for (Class<?> subscriber : gameSubscribers) NeoForge.EVENT_BUS.unregister(subscriber);
+        gameSubscribers.clear();
+        for (Object mod : instances.values()) NeoForge.EVENT_BUS.unregister(mod);
+        instances.clear();
+        modBuses.clear();
+        instance = null;
+        if (modLoader != null) modLoader.close();
+        modLoader = null;
+        initialized = false;
+    }
+
     public static Class<?> initializeServer() { return ServerHooks.class; }
 }
