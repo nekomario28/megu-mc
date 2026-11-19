@@ -119,6 +119,45 @@ impl DimId {
     pub(crate) fn has_skylight(self) -> bool {
         matches!(self, DimId::Overworld)
     }
+
+    /// The `dimension_type.min_y`: -64 for the Overworld, 0 for the Nether and the End.
+    pub(crate) fn min_y(self) -> i32 {
+        match self {
+            Self::Overworld => -64,
+            Self::Nether | Self::End => 0,
+        }
+    }
+
+    /// The `dimension_type.height`: 384 for the Overworld, 256 for the Nether and the End.
+    pub(crate) fn height(self) -> i32 {
+        match self {
+            Self::Overworld => 384,
+            Self::Nether | Self::End => 256,
+        }
+    }
+
+    /// `height / 16`: 24 block sections for the Overworld, 16 for the Nether and the End.
+    pub(crate) fn sections(self) -> i32 {
+        self.height() / 16
+    }
+
+    /// `LevelLightEngine.getLightSectionCount() = getSectionsCount() + 2`: 26 for the
+    /// Overworld, 18 for the Nether and the End.
+    pub(crate) fn light_sections(self) -> usize {
+        (self.sections() + 2) as usize
+    }
+
+    /// `getMinLightSection() = min_y - 16`: -80 for the Overworld, -16 for the Nether and
+    /// the End. Light section `i` covers `[light_min_y + 16*i, light_min_y + 16*i + 16)`.
+    pub(crate) fn light_min_y(self) -> i32 {
+        self.min_y() - 16
+    }
+
+    /// The all-ones mask over this dimension's light sections: `0x3ff_ffff` for the
+    /// Overworld (26 bits), `0x3_ffff` for the Nether and the End (18 bits).
+    pub(crate) fn light_mask(self) -> i64 {
+        (1i64 << self.light_sections()) - 1
+    }
 }
 
 impl From<NoisePreset> for DimId {
@@ -7043,7 +7082,14 @@ pub fn cols_cached(cx: i32, cz: i32) -> bool {
 }
 
 pub fn chunk_cols(cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
-    gen_lock().as_mut()?.cols(cx, cz)
+    chunk_cols_dim(active_dim(), cx, cz)
+}
+
+/// [`chunk_cols`] for one named dimension. A streaming caller must ask the generator that
+/// owns the chunk, not whichever one `init` installed last: the Nether's column heights are
+/// not the Overworld's.
+pub fn chunk_cols_dim(dimension: DimId, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
+    gen_lock_dim(dimension).as_mut()?.cols(cx, cz)
 }
 
 impl Gen {
@@ -10522,7 +10568,19 @@ pub fn biome_dump(spec: &str) {
 }
 
 pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
-    let mut gg = gen_lock();
+    biome_section_dim(active_dim(), cx, sy, cz)
+}
+
+/// [`biome_section`] for one named dimension. An unset quart keeps the same default the
+/// dim-less form used: 39 (plains) is the protocol-767 default biome and is what a caller
+/// writes when the generator has no answer for that cell.
+pub fn biome_section_dim(
+    dimension: DimId,
+    cx: i32,
+    sy: i32,
+    cz: i32,
+) -> Option<Box<[i64; 64]>> {
+    let mut gg = gen_lock_dim(dimension);
     let g = gg.as_mut()?;
     let mut out = Box::new([39i64; 64]); // plains
     let (qx0, qy0, qz0) = (cx * 4, sy >> 2, cz * 4);

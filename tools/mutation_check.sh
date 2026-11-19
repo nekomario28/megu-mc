@@ -3759,6 +3759,42 @@ check "p2_3_s2b_dim2_furnace_loads_into_its_own_dimension" \
             }' \
   persistence_tests::p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
 
+# P2-3-S3: the chunk and light a dimension serves must use that dimension's window. Each
+# mutant below keeps the Overworld path identical and breaks exactly one Nether/End promise,
+# so the packet-level test has to notice it rather than trusting the helper that was edited.
+check "p2_3_s3_nether_and_end_have_zero_sky_mask" \
+  src/main.rs '    let sky_mask: i64 = if worldgen::has_skylight(dim) { mask } else { 0 };' \
+  '    let sky_mask: i64 = if worldgen::has_skylight(dim) { mask } else { mask };' \
+  tick_tests::p2_3_s3_nether_and_end_chunk_packets_emit_16_sections_and_zero_sky_mask
+
+# Sixteen sections in the Nether/End, not the Overworld's twenty-four. A hard-coded 24 also
+# changes the light and biome loops' reach, which the packet's section count catches.
+check "p2_3_s3_nether_and_end_emit_16_block_sections" \
+  src/main.rs '    let sections = dim.sections();' \
+  '    let sections = 24;' \
+  tick_tests::p2_3_s3_nether_and_end_chunk_packets_emit_16_sections_and_zero_sky_mask
+
+# MOTION_BLOCKING is relative to the chunk's own min_y. Subtracting the Overworld's -64
+# makes every Nether/End height 64 too large while the Overworld bytes stay the same.
+check "p2_3_s3_heightmap_uses_the_dimension_min_y" \
+  src/main.rs '        let val = (*t - min_y).max(0) as u64;' \
+  '        let val = (*t - MIN_Y).max(0) as u64;' \
+  tick_tests::p2_3_s3_nether_and_end_chunk_packets_emit_16_sections_and_zero_sky_mask
+
+# Block light is anchored one section below min_y: -16 in the Nether/End, not the
+# Overworld's -80. Using the Overworld anchor shifts a Nether torch from section 3 to 7.
+check "p2_3_s3_block_light_anchors_at_dimension_light_min_y" \
+  src/main.rs '    let light_min_y = dim.light_min_y();' \
+  '    let light_min_y = LIGHT_MIN_Y;' \
+  tick_tests::p2_3_s3_nether_and_end_block_light_anchors_at_light_min_y_minus_16
+
+# A band read that answers from the Overworld's key makes a Nether write invisible to its own
+# band (and lets an Overworld cell answer for it) at the same (cx, cz).
+check "p2_3_s3_band_cache_is_keyed_by_dimension" \
+  src/main.rs '    let band = op_bands().lock().unwrap().get((dim, cx, cz))?;' \
+  '    let band = op_bands().lock().unwrap().get((DimId::Overworld, cx, cz))?;' \
+  tick_tests::p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

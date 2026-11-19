@@ -8008,3 +8008,396 @@ fn section_light_class_answers_are_exactly_uniform_opacity() {
     assert_eq!(reg.opacity_of(mixed.get(123)), 15);
     assert_eq!(reg.opacity_of(mixed.get(0)), 0);
 }
+
+// ---------- P2-3-S3: three-dimension chunk and light construction ----------
+//
+// These tests parse the bytes a client receives, not an intermediate helper's return value:
+// the section count, the two light masks and the length of each light list are properties of
+// the protocol-767 packet itself. They install all three generators, so each runs in its own
+// process (`isolated_world_test`) — a generator left installed would change later tick tests.
+
+fn s3_take<'a>(b: &mut &'a [u8], n: usize) -> &'a [u8] {
+    assert!(b.len() >= n, "packet truncated: wanted {n}, left {}", b.len());
+    let (head, tail) = b.split_at(n);
+    *b = tail;
+    head
+}
+
+fn s3_varint(b: &mut &[u8]) -> usize {
+    read_varint(b).expect("packet varint") as usize
+}
+
+/// A protocol-767 palette: one bits byte, then either a single value and a zero-length data
+/// list (bits 0), a local palette followed by packed words, or packed words only (direct).
+fn s3_skip_palette(b: &mut &[u8], max_local_bits: usize) {
+    let bits = s3_take(b, 1)[0] as usize;
+    if bits == 0 {
+        s3_varint(b); // the one palette value
+        s3_varint(b); // zero data words
+        return;
+    }
+    if bits > max_local_bits {
+        let words = s3_varint(b);
+        s3_take(b, words * 8);
+        return;
+    }
+    let distinct = s3_varint(b);
+    for _ in 0..distinct {
+        s3_varint(b);
+    }
+    let words = s3_varint(b);
+    s3_take(b, words * 8);
+}
+
+fn s3_skip_section(b: &mut &[u8]) {
+    s3_take(b, 2); // non-air count
+    s3_skip_palette(b, 8); // block states, 15 bits means direct
+    s3_skip_palette(b, 3); // quart biomes, 6 bits means direct
+}
+
+fn s3_skip_nbt(b: &mut &[u8], id: u8) {
+    match id {
+        0 => {}
+        1 => {
+            s3_take(b, 1);
+        }
+        2 => {
+            s3_take(b, 2);
+        }
+        3 | 5 => {
+            s3_take(b, 4);
+        }
+        4 | 6 => {
+            s3_take(b, 8);
+        }
+        7 => {
+            let n = i32::from_be_bytes(s3_take(b, 4).try_into().unwrap());
+            assert!(n >= 0);
+            s3_take(b, n as usize);
+        }
+        8 => {
+            let n = u16::from_be_bytes(s3_take(b, 2).try_into().unwrap());
+            s3_take(b, n as usize);
+        }
+        9 => {
+            let element = s3_take(b, 1)[0];
+            let n = i32::from_be_bytes(s3_take(b, 4).try_into().unwrap());
+            assert!(n >= 0);
+            for _ in 0..n {
+                s3_skip_nbt(b, element);
+            }
+        }
+        10 => loop {
+            let id = s3_take(b, 1)[0];
+            if id == 0 {
+                break;
+            }
+            let n = u16::from_be_bytes(s3_take(b, 2).try_into().unwrap());
+            s3_take(b, n as usize);
+            s3_skip_nbt(b, id);
+        },
+        11 => {
+            let n = i32::from_be_bytes(s3_take(b, 4).try_into().unwrap());
+            assert!(n >= 0);
+            s3_take(b, (n as usize) * 4);
+        }
+        12 => {
+            let n = i32::from_be_bytes(s3_take(b, 4).try_into().unwrap());
+            assert!(n >= 0);
+            s3_take(b, (n as usize) * 8);
+        }
+        _ => panic!("unknown NBT tag {id}"),
+    }
+}
+
+struct S3Packet {
+    heightmap_first: i32,
+    sections: usize,
+    sky_mask: i64,
+    block_mask: i64,
+    sky_arrays: usize,
+    block_arrays: usize,
+}
+
+/// Parse `map_chunk`'s payload: x/z, anonymous heightmaps NBT, the chunk's section list,
+/// block entities, then the `write_light_arrays` tail.
+fn s3_parse_map_chunk(bytes: &[u8]) -> S3Packet {
+    let mut b = bytes;
+    s3_take(&mut b, 8); // chunk x and z
+    assert_eq!(s3_take(&mut b, 1)[0], 10, "heightmaps compound");
+    assert_eq!(s3_take(&mut b, 1)[0], 12, "MOTION_BLOCKING is a long array");
+    let name_len = u16::from_be_bytes(s3_take(&mut b, 2).try_into().unwrap()) as usize;
+    assert_eq!(s3_take(&mut b, name_len), b"MOTION_BLOCKING");
+    let longs = i32::from_be_bytes(s3_take(&mut b, 4).try_into().unwrap());
+    assert_eq!(longs, 37);
+    let mut first = 0i32;
+    for i in 0..longs as usize {
+        let value = i64::from_be_bytes(s3_take(&mut b, 8).try_into().unwrap());
+        if i == 0 {
+            first = (value & 0x1ff) as i32; // column 0 occupies bits 0..9
+        }
+    }
+    assert_eq!(s3_take(&mut b, 1)[0], 0, "end of heightmaps compound");
+
+    let data_len = s3_varint(&mut b);
+    let mut data = s3_take(&mut b, data_len);
+    let mut sections = 0;
+    while !data.is_empty() {
+        s3_skip_section(&mut data);
+        sections += 1;
+    }
+    let entities = s3_varint(&mut b);
+    for _ in 0..entities {
+        s3_take(&mut b, 3); // packed x/z and the y short
+        s3_varint(&mut b); // block entity type
+        s3_skip_nbt(&mut b, 10); // anonymous root compound
+    }
+
+    assert_eq!(s3_varint(&mut b), 1, "sky mask is one long");
+    let sky_mask = i64::from_be_bytes(s3_take(&mut b, 8).try_into().unwrap());
+    assert_eq!(s3_varint(&mut b), 1, "block mask is one long");
+    let block_mask = i64::from_be_bytes(s3_take(&mut b, 8).try_into().unwrap());
+    assert_eq!(s3_varint(&mut b), 0, "empty sky list");
+    assert_eq!(s3_varint(&mut b), 0, "empty block list");
+    let sky_arrays = s3_varint(&mut b);
+    for _ in 0..sky_arrays {
+        assert_eq!(s3_varint(&mut b), 2048);
+        s3_take(&mut b, 2048);
+    }
+    let block_arrays = s3_varint(&mut b);
+    for _ in 0..block_arrays {
+        assert_eq!(s3_varint(&mut b), 2048);
+        s3_take(&mut b, 2048);
+    }
+    assert!(b.is_empty(), "light tail left {} bytes", b.len());
+    S3Packet {
+        heightmap_first: first,
+        sections,
+        sky_mask,
+        block_mask,
+        sky_arrays,
+        block_arrays,
+    }
+}
+
+#[test]
+fn p2_3_s3_nether_and_end_chunk_packets_emit_16_sections_and_zero_sky_mask() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    crate::test_support::require_vanilla_data();
+    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
+    assert!(worldgen::init(0, crate::name_to_state), "overworld");
+    assert!(
+        worldgen::init_dim(DimId::Nether, 0, crate::name_to_state),
+        "nether"
+    );
+    assert!(
+        worldgen::init_dim(DimId::End, 0, crate::name_to_state),
+        "end"
+    );
+
+    // (dimension, block sections, sky mask, block mask, sky arrays, block arrays, min_y)
+    let cases = [
+        (DimId::Overworld, 24, 0x3ff_ffffi64, 0x3ff_ffffi64, 26, 26, -64),
+        (DimId::Nether, 16, 0, 0x3_ffff, 0, 18, 0),
+        (DimId::End, 16, 0, 0x3_ffff, 0, 18, 0),
+    ];
+    for (dim, sections, sky_mask, block_mask, sky_arrays, block_arrays, min_y) in cases {
+        let mut gen: GenSources = HashMap::new();
+        let packet = s3_parse_map_chunk(&map_chunk(0, 0, dim, &mut gen));
+        assert_eq!(
+            packet.sections, sections,
+            "{dim:?}: block section count in the chunk packet"
+        );
+        assert_eq!(packet.sky_mask, sky_mask, "{dim:?}: skyLightMask");
+        assert_eq!(packet.block_mask, block_mask, "{dim:?}: blockLightMask");
+        assert_eq!(packet.sky_arrays, sky_arrays, "{dim:?}: sky light arrays");
+        assert_eq!(packet.block_arrays, block_arrays, "{dim:?}: block light arrays");
+        // MOTION_BLOCKING is stored relative to this dimension's min_y, not -64.
+        let cols = worldgen::chunk_cols_dim(dim, 0, 0).unwrap_or_else(|| panic!("{dim:?}: columns"));
+        let top = cols.wtop(0, 0) + 1;
+        assert_eq!(
+            packet.heightmap_first,
+            (top - min_y).max(0),
+            "{dim:?}: heightmap column 0 (top {top}, min_y {min_y})"
+        );
+    }
+    assert_eq!(worldgen::active_dim(), DimId::Overworld);
+}
+
+#[test]
+fn p2_3_s3_nether_and_end_block_light_anchors_at_light_min_y_minus_16() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    crate::test_support::require_vanilla_data();
+    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
+    assert!(worldgen::init(0, crate::name_to_state), "overworld");
+    assert!(worldgen::init_dim(DimId::Nether, 0, crate::name_to_state));
+    assert!(worldgen::init_dim(DimId::End, 0, crate::name_to_state));
+    let glowstone = name_to_state("glowstone").expect("glowstone in the pinned registry");
+    let ow_band_keys = op_bands()
+        .lock()
+        .unwrap()
+        .map
+        .keys()
+        .filter(|k| k.0 == DimId::Overworld)
+        .count();
+    let ow_section_keys = section_store()
+        .lock()
+        .unwrap()
+        .map
+        .keys()
+        .filter(|k| k.0 == DimId::Overworld)
+        .count();
+
+    // The light section a y lands in is (y - light_min_y)/16. For the Overworld that is
+    // (32 + 80)/16 = 7; the Nether anchors at -16, so the same y lands in section 3.
+    for (dim, y, expected_section) in [(DimId::Nether, 32, 3usize), (DimId::End, 64, 5)] {
+        let (x, z) = (8, 8);
+        set_block_dim(dim, x, y, z, glowstone);
+        // Carve the six neighbours to air so the spread has somewhere to go: a glowstone
+        // embedded in solid netherrack legitimately lights nothing outside itself.
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            set_block_dim(dim, x + dx, y + dy, z + dz, 0);
+        }
+        let gen = GenSources::new();
+        let sections = block_light_sections_dim(dim, 0, 0, &gen);
+        assert_eq!(
+            sections.len(),
+            dim.light_sections(),
+            "{dim:?}: block light array count"
+        );
+        let nibble = |secs: &[[u8; 2048]], (x, y, z): (i32, i32, i32)| -> i32 {
+            let rel = y - dim.light_min_y();
+            if rel < 0 || rel >= (dim.light_sections() as i32) * 16 {
+                return 0;
+            }
+            let rel = rel as usize;
+            let lx = (x & 15) as usize;
+            let lz = (z & 15) as usize;
+            i32::from((secs[rel / 16][(rel & 15) * 128 + lz * 8 + lx / 2] >> ((lx & 1) * 4)) & 15)
+        };
+        let anchored = ((y - dim.light_min_y()) / 16) as usize;
+        assert_eq!(anchored, expected_section, "{dim:?}: light section anchor");
+        assert_eq!(nibble(&sections, (x, y, z)), 15, "{dim:?}: source brightness");
+        assert!(
+            nibble(&sections, (x + 1, y, z)) > 0,
+            "{dim:?}: light reaches a neighbour cell"
+        );
+        // An Overworld light pass must not see a Nether/End overlay at the same coordinates.
+        let overworld = block_light_sections(0, 0, &gen);
+        assert_eq!(
+            nibble(&overworld, (x, y, z)),
+            0,
+            "{dim:?}: its edit lit an Overworld cell"
+        );
+    }
+    assert_eq!(
+        op_bands()
+            .lock()
+            .unwrap()
+            .map
+            .keys()
+            .filter(|k| k.0 == DimId::Overworld)
+            .count(),
+        ow_band_keys,
+        "a non-Overworld edit changed the Overworld band cache"
+    );
+    assert_eq!(
+        section_store()
+            .lock()
+            .unwrap()
+            .map
+            .keys()
+            .filter(|k| k.0 == DimId::Overworld)
+            .count(),
+        ow_section_keys,
+        "a non-Overworld edit changed the Overworld section store"
+    );
+}
+
+#[test]
+fn p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    crate::test_support::require_vanilla_data();
+    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
+    assert!(worldgen::init(0, crate::name_to_state), "overworld");
+    assert!(worldgen::init_dim(DimId::Nether, 0, crate::name_to_state));
+    assert!(worldgen::init_dim(DimId::End, 0, crate::name_to_state));
+    let stone = name_to_state("stone").expect("stone in the pinned registry");
+    let torch = name_to_state("torch").expect("torch in the pinned registry");
+    let mut gen: GenSources = HashMap::new();
+    let (x, y, z) = (8, 70, 8);
+
+    // The same (0,0) chunk is served three times back to back. Every derived cache must keep
+    // one slot per dimension, including the thread-local CELL_SOURCE a light pass holds.
+    chunk_data(0, 0, DimId::Overworld, &mut gen);
+    set_block(x, y, z, stone);
+    let ow_state = stored_state(DimId::Overworld, x, y, z);
+    let ow_band = band_state_dim(DimId::Overworld, x, y, z);
+    assert_eq!(ow_state, Some(stone), "Overworld store holds its own edit");
+    assert_eq!(opacity_windowed_dim(DimId::Overworld, x, y, z), 15);
+
+    chunk_data(0, 0, DimId::Nether, &mut gen);
+    set_block_dim(DimId::Nether, x, y, z, torch);
+    assert_eq!(
+        stored_state(DimId::Overworld, x, y, z),
+        ow_state,
+        "Nether delivery overwrote the Overworld section store"
+    );
+    assert_eq!(
+        band_state_dim(DimId::Overworld, x, y, z),
+        ow_band,
+        "Nether delivery overwrote the Overworld band"
+    );
+    assert_eq!(stored_state(DimId::Nether, x, y, z), Some(torch));
+    assert_eq!(opacity_windowed_dim(DimId::Nether, x, y, z), 0);
+    // Band coverage is per-dimension: pick a row the Nether's own band spans, then require
+    // its write to land there and nowhere in the Overworld's band.
+    let (nlo, nhi) = band_range(DimId::Nether, 0, 0).expect("Nether band");
+    let by = nlo.min(nhi);
+    assert!(by < nhi, "the Nether band has at least two rows");
+    set_block_dim(DimId::Nether, x, by, z, torch);
+    assert_eq!(
+        band_state_dim(DimId::Nether, x, by, z),
+        Some(torch),
+        "the Nether band must hold the Nether edit, not the Overworld cell"
+    );
+    assert_eq!(opacity_windowed_dim(DimId::Overworld, x, y, z), 15);
+    assert_eq!(opacity_windowed_dim(DimId::Nether, x, y, z), 0);
+
+    chunk_data(0, 0, DimId::End, &mut gen);
+    set_block_dim(DimId::End, x, y, z, torch);
+    assert_eq!(stored_state(DimId::Overworld, x, y, z), ow_state);
+    assert_eq!(stored_state(DimId::Nether, x, y, z), Some(torch));
+    assert_eq!(stored_state(DimId::End, x, y, z), Some(torch));
+    assert_eq!(opacity_windowed_dim(DimId::Overworld, x, y, z), 15);
+    assert_eq!(opacity_windowed_dim(DimId::End, x, y, z), 0);
+
+    let store = section_store().lock().unwrap();
+    for (dim, sections) in [
+        (DimId::Overworld, 24),
+        (DimId::Nether, 16),
+        (DimId::End, 16),
+    ] {
+        let slots = store
+            .map
+            .get(&(dim, 0, 0))
+            .unwrap_or_else(|| panic!("{dim:?}: no section store slot at (0,0)"));
+        assert_eq!(slots.len(), sections, "{dim:?}: section store window");
+    }
+}

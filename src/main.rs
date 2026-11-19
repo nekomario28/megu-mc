@@ -7529,6 +7529,23 @@ fn height_at(x: i32, z: i32) -> i32 {
     (8.0 + vnoise(x as f64, z as f64, 48) * 10.0
         + vnoise(x as f64 + 1000.0, z as f64 - 500.0, 12) * 4.0) as i32
 }
+
+/// The surface height a delivery for `dim` must use for anti-xray's vertical neighbours.
+/// The Overworld arm is the long-standing `height_at`, byte for byte; a Nether or End
+/// chunk asks that dimension's generator and, before a column exists, starts at its own
+/// `min_y` rather than the Overworld's -64.
+fn height_at_dim(dim: DimId, x: i32, z: i32) -> i32 {
+    if dim == DimId::Overworld {
+        return height_at(x, z);
+    }
+    if worldgen::enabled() {
+        return worldgen::chunk_cols_dim(dim, x >> 4, z >> 4)
+            .map(|c| c.surface((x & 15) as usize, (z & 15) as usize))
+            .unwrap_or_else(|| dim.min_y());
+    }
+    height_at(x, z)
+}
+
 fn tree_at(x: i32, z: i32) -> bool {
     hash01(x ^ 0x5d3f, z ^ 0x7a1b) < 0.006
 }
@@ -9751,6 +9768,13 @@ fn dim_base_state(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     worldgen::with_gen_dim(dim, |g| g.block_state_at(x, y, z, crate::feature::populate))
 }
 
+/// The generated state at a cell in `dim`, air when that dimension has no generator. The
+/// Overworld arm is exactly `base_state`, so the existing Overworld packet bytes are moved by
+/// neither the name nor the fallback here.
+fn base_state_dim(dim: DimId, x: i32, y: i32, z: i32) -> u32 {
+    dim_base_state(dim, x, y, z).unwrap_or(0)
+}
+
 fn block_at_dim(dim: DimId, x: i32, y: i32, z: i32) -> u32 {
     let w = timed_world();
     let hit = w
@@ -9838,11 +9862,11 @@ fn set_block_if_inner_dim(
     // The written cell is patched instead, which keeps the band equal to `block_at` for
     // every cell it covers. The version still moves for the sky floors, which are derived
     // from the column rather than stored per cell.
-    band_patch(x, y, z, st);
+    band_patch_dim(dim, x, y, z, st);
     // Only Overworld reaches this point (the early return above handles the other
     // dimensions), but pass `dim` so the patched store slot keeps its dimension key.
     store_patch(dim, x, y, z, st);
-    bump_world_epoch(x, z);
+    bump_world_epoch_dim(dim, x, z);
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
         schedule_leaf_neighbors(x, y, z, st);
@@ -10015,6 +10039,15 @@ fn set_block_if_dim_edit(
     } else {
         c.insert(cell, st);
     }
+    drop(w);
+    // The non-Overworld write path used to stop at the overlay, leaving the band and the
+    // section store answering with the *generated* state after an Nether/End edit. Those
+    // caches are dimension-keyed now, so patching the dimension that was written is as
+    // write-through here as it is on the Overworld path — with no chance of touching an
+    // Overworld slot at the same `(cx, cz)`.
+    band_patch_dim(dim, x, y, z, st);
+    store_patch(dim, x, y, z, st);
+    bump_world_epoch_dim(dim, x, z);
     true
 }
 
@@ -17752,11 +17785,18 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
 /// The area a block light spread may use: the centre chunk with one chunk of margin, which is
 /// where light from a neighbouring source can reach.
 fn within_search(cx: i32, cz: i32, x: i32, y: i32, z: i32) -> bool {
+    within_search_dim(DimId::Overworld, cx, cz, x, y, z)
+}
+
+/// [`within_search`] for one dimension. The y window is the dimension's own `min_y..height`,
+/// so a Nether source at y=32 is not silently clipped by the Overworld's -64 floor and an
+/// Overworld cell below 0 is not lit by a Nether emitter.
+fn within_search_dim(dim: DimId, cx: i32, cz: i32, x: i32, y: i32, z: i32) -> bool {
     x >= cx * 16 - 15
         && x <= cx * 16 + 30
         && z >= cz * 16 - 15
         && z <= cz * 16 + 30
-        && (MIN_Y..MIN_Y + 384).contains(&y)
+        && (dim.min_y()..dim.min_y() + dim.height()).contains(&y)
 }
 
 /// Light-emitting blocks the **generator** placed in a chunk, recorded by `chunk_data` as it
@@ -17782,13 +17822,25 @@ fn block_light_sections_from(
     sources: &[((i32, i32, i32), u8)],
     opacity: impl Fn(i32, i32, i32) -> u8,
 ) -> Vec<[u8; 2048]> {
+    block_light_sections_from_dim(DimId::Overworld, cx, cz, sources, opacity)
+}
+
+fn block_light_sections_from_dim(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    sources: &[((i32, i32, i32), u8)],
+    opacity: impl Fn(i32, i32, i32) -> u8,
+) -> Vec<[u8; 2048]> {
+    let light_sections = dim.light_sections();
+    let light_min_y = dim.light_min_y();
     let live: Vec<((i32, i32, i32), u8)> = sources
         .iter()
         .copied()
-        .filter(|(p, l)| *l > 0 && within_search(cx, cz, p.0, p.1, p.2))
+        .filter(|(p, l)| *l > 0 && within_search_dim(dim, cx, cz, p.0, p.1, p.2))
         .collect();
     if live.is_empty() {
-        return vec![[0u8; 2048]; 26];
+        return vec![[0u8; 2048]; light_sections];
     }
     // A dense box rather than a hash map. The spread visits every cell within fifteen of a
     // source, so a hash of the position for each of tens of thousands of visits costs more than
@@ -17810,8 +17862,8 @@ fn block_light_sections_from(
     let x1 = (bx1 + 15).min(cx * 16 + 30);
     let z0 = (bz0 - 15).max(cz * 16 - 15);
     let z1 = (bz1 + 15).min(cz * 16 + 30);
-    let y0 = (by0 - 15).max(MIN_Y);
-    let y1 = (by1 + 15).min(MIN_Y + 383);
+    let y0 = (by0 - 15).max(dim.min_y());
+    let y1 = (by1 + 15).min(dim.min_y() + dim.height() - 1);
     let (w, d, h) = (
         (x1 - x0 + 1) as usize,
         (z1 - z0 + 1) as usize,
@@ -17869,9 +17921,9 @@ fn block_light_sections_from(
             queue.push_back(((qx, qy, qz), nl));
         }
     }
-    let mut out = Vec::with_capacity(26);
-    for sec in 0..26 {
-        let sy = sec * 16 + LIGHT_MIN_Y;
+    let mut out = Vec::with_capacity(light_sections);
+    for sec in 0..light_sections {
+        let sy = (sec as i32) * 16 + light_min_y;
         out.push(pack_light_section(sy, |lx, wy, lz| {
             let (wx, wz) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
             // The box only covers the sources' fifteen-block reach, so a chunk column the box
@@ -17891,13 +17943,23 @@ fn block_light_sections_from(
 /// list of what the world contains is the overlay of edits; that limit is recorded rather
 /// than papered over by scanning every block.
 fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
+    block_light_sections_dim(DimId::Overworld, cx, cz, gen)
+}
+
+fn block_light_sections_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
+    let light_sections = dim.light_sections();
     let Some(reg) = crate::block_registry::breg() else {
-        return vec![[0u8; 2048]; 26];
+        return vec![[0u8; 2048]; light_sections];
     };
-    // The lava set is taken first and released before the world lock is acquired: every other
-    // path that needs both takes them in that order, and this pass must not be the one that
-    // reverses it.
-    let lava: Vec<(i32, i32, i32)> = lavas().lock().unwrap().iter().copied().collect();
+    // The lava set is server-tracked for the Overworld only. It is deliberately not read for
+    // the Nether/End: a lava block a player placed in the Overworld must not phantom-light a
+    // Nether chunk at the same coordinate. Generated Nether lava oceans are in `gen` instead.
+    // It is still taken first and released before the world lock, so the lock order holds.
+    let lava: Vec<(i32, i32, i32)> = if dim == DimId::Overworld {
+        lavas().lock().unwrap().iter().copied().collect()
+    } else {
+        Vec::new()
+    };
     // Sources are collected under one short lock, **by reference**: the 3x3 window's edit maps
     // are copied only once something has to be lit.
     //
@@ -17912,7 +17974,7 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
     // clones bought nothing. So the scan runs first, over the maps themselves, and the maps
     // are cloned afterwards only for the spread's opacity lookups.
     let mut sources: Vec<((i32, i32, i32), u8)> = Vec::new();
-    let mut w: HashMap<(i32, i32), HashMap<u32, u32>> = HashMap::new();
+    let mut w: HashMap<(DimId, i32, i32), HashMap<u32, u32>> = HashMap::new();
     {
         let guard = world().lock().unwrap();
         // Generated light sources for this chunk and the eight neighbours (recorded by
@@ -17927,7 +17989,8 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
                     continue;
                 };
                 for (p, lum) in g {
-                    if overworld_edits(&guard, p.0 >> 4, p.2 >> 4)
+                    if guard
+                        .get(&(dim, p.0 >> 4, p.2 >> 4))
                         .and_then(|c| c.get(&local_idx(p.0, p.1, p.2)))
                         .is_some()
                     {
@@ -17940,7 +18003,7 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
         for dx in -1..=1 {
             for dz in -1..=1 {
                 let (ncx, ncz) = (cx + dx, cz + dz);
-                let Some(col) = overworld_edits(&guard, ncx, ncz) else {
+                let Some(col) = guard.get(&(dim, ncx, ncz)) else {
                     continue;
                 };
                 for (idx, st) in col {
@@ -17959,7 +18022,7 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
         // what `block_light_sections_from` would filter it to; dropping it here instead means a
         // chunk whose only candidate is remote lava takes the empty path below.
         for (x, y, z) in &lava {
-            if within_search(cx, cz, *x, *y, *z) {
+            if within_search_dim(dim, cx, cz, *x, *y, *z) {
                 sources.push(((*x, *y, *z), 15));
             }
         }
@@ -17969,14 +18032,14 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
         // the reason the early return is here rather than inside the spread.
         if sources.is_empty() {
             drop(guard);
-            return vec![[0u8; 2048]; 26];
+            return vec![[0u8; 2048]; light_sections];
         }
         for dx in -1..=1 {
             for dz in -1..=1 {
                 let key = (cx + dx, cz + dz);
-                if let Some(col) = overworld_edits(&guard, key.0, key.1) {
+                if let Some(col) = guard.get(&(dim, key.0, key.1)) {
                     if !col.is_empty() {
-                        w.insert(key, col.clone());
+                        w.insert((dim, key.0, key.1), col.clone());
                     }
                 }
             }
@@ -17992,7 +18055,7 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
     let mut heights = Vec::with_capacity(hw * hd);
     for z in hz0..=hz1 {
         for x in hx0..=hx1 {
-            heights.push(height_at(x, z));
+            heights.push(height_at_dim(dim, x, z));
         }
     }
     let height_of = |x: i32, z: i32| -> i32 {
@@ -18000,15 +18063,21 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
         if ix < hw && iz < hd {
             heights[iz * hw + ix]
         } else {
-            height_at(x, z)
+            height_at_dim(dim, x, z)
         }
     };
-    block_light_sections_from(cx, cz, &sources, |x, y, z| {
+    block_light_sections_from_dim(dim, cx, cz, &sources, |x, y, z| {
         let h = height_of(x, z);
         let st = w
-            .get(&(x >> 4, z >> 4))
+            .get(&(dim, x >> 4, z >> 4))
             .and_then(|c| c.get(&local_idx(x, y, z)).copied())
-            .unwrap_or_else(|| base_state_h(x, y, z, h));
+            .unwrap_or_else(|| {
+                if dim == DimId::Overworld {
+                    base_state_h(x, y, z, h)
+                } else {
+                    base_state_dim(dim, x, y, z)
+                }
+            });
         reg.opacity_of(st)
     })
 }
@@ -18317,8 +18386,8 @@ impl OpBand {
 /// alone was most of its 12.5 ms. A `HashMap` makes it a hash hit; the `order` deque only
 /// exists for the bound.
 struct BandCache {
-    map: HashMap<(i32, i32), (u64, std::sync::Arc<OpBand>)>,
-    order: std::collections::VecDeque<(i32, i32)>,
+    map: HashMap<(DimId, i32, i32), (u64, std::sync::Arc<OpBand>)>,
+    order: std::collections::VecDeque<(DimId, i32, i32)>,
     generation: u64,
 }
 
@@ -18345,12 +18414,12 @@ impl BandCache {
         }
     }
 
-    fn get(&mut self, key: (i32, i32)) -> Option<std::sync::Arc<OpBand>> {
+    fn get(&mut self, key: (DimId, i32, i32)) -> Option<std::sync::Arc<OpBand>> {
         self.sync_generation();
         self.map.get(&key).map(|(_, b)| b.clone())
     }
     /// Insert (or replace) and evict the oldest entry when the bound is passed.
-    fn put(&mut self, key: (i32, i32), version: u64, band: std::sync::Arc<OpBand>) {
+    fn put(&mut self, key: (DimId, i32, i32), version: u64, band: std::sync::Arc<OpBand>) {
         if self.map.insert(key, (version, band)).is_none() {
             self.order.push_back(key);
         }
@@ -18362,7 +18431,7 @@ impl BandCache {
     }
 }
 
-fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
+fn op_band(dim: DimId, cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
     let __t = chunkprof::enabled().then(std::time::Instant::now);
     if __t.is_some() {
         chunkprof::BAND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -18370,13 +18439,13 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
     // A band is reused while it exists, whatever its build version: writes patch it, so
     // it is current for the cells it covers (see `band_patch`). Rebuilding on a version
     // change would rebuild once per leaf write.
-    if let Some(b) = op_bands().lock().unwrap().get((cx, cz)) {
+    if let Some(b) = op_bands().lock().unwrap().get((dim, cx, cz)) {
         return Some(b);
     }
     let reg = crate::block_registry::breg()?;
     let __tr = chunkprof::enabled().then(std::time::Instant::now);
     let warm = worldgen::cols_cached(cx, cz);
-    let (y0, y1) = band_range(cx, cz)?;
+    let (y0, y1) = band_range(dim, cx, cz)?;
     if let (Some(t), false) = (__tr, warm) {
         use std::sync::atomic::Ordering;
         chunkprof::BAND_COLS_MISS.fetch_add(1, Ordering::Relaxed);
@@ -18389,7 +18458,7 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
     let __ts = chunkprof::enabled().then(std::time::Instant::now);
     let mut sy = y0 & !15;
     while sy <= y1 {
-        if let Some(sec) = worldgen::terrain_section(cx, sy, cz, feature::populate) {
+        if let Some(sec) = worldgen::terrain_section_dim(dim, cx, sy, cz, feature::populate) {
             for ly in 0..16i32 {
                 let y = sy + ly;
                 if y < y0 || y > y1 {
@@ -18416,7 +18485,7 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
     // `block_at` prefers it.
     {
         let w = world().lock().unwrap();
-        if let Some(col) = overworld_edits(&w, cx, cz) {
+        if let Some(col) = w.get(&(dim, cx, cz)) {
             for (idx, st) in col {
                 let y = (*idx >> 8) as i32 + MIN_Y;
                 if y < y0 || y > y1 {
@@ -18437,7 +18506,7 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
     op_bands()
         .lock()
         .unwrap()
-        .put((cx, cz), epoch, band.clone());
+        .put((dim, cx, cz), epoch, band.clone());
     if let Some(t) = __t {
         chunkprof::BAND_NS.fetch_add(
             t.elapsed().as_nanos() as u64,
@@ -18583,9 +18652,9 @@ fn stored_section(dim: DimId, cx: i32, cz: i32, sy: i32) -> Option<std::sync::Ar
     store.map.get(&(dim, cx, cz))?.get(idx)?.clone()
 }
 
-/// The surface band for a chunk, if installed and current.
-fn band_for(cx: i32, cz: i32) -> Option<std::sync::Arc<OpBand>> {
-    op_bands().lock().unwrap().get((cx, cz))
+/// The surface band for a chunk in `dim`, if installed and current.
+fn band_for(dim: DimId, cx: i32, cz: i32) -> Option<std::sync::Arc<OpBand>> {
+    op_bands().lock().unwrap().get((dim, cx, cz))
 }
 
 fn stored_state(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
@@ -18625,10 +18694,10 @@ fn store_patch(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     );
 }
 
-fn band_patch(x: i32, y: i32, z: i32, st: u32) {
+fn band_patch_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     let (cx, cz) = (x >> 4, z >> 4);
     let mut bands = op_bands().lock().unwrap();
-    let Some((_, slot)) = bands.map.get_mut(&(cx, cz)) else {
+    let Some((_, slot)) = bands.map.get_mut(&(dim, cx, cz)) else {
         return;
     };
     let band = std::sync::Arc::make_mut(slot);
@@ -18640,6 +18709,10 @@ fn band_patch(x: i32, y: i32, z: i32, st: u32) {
 }
 
 fn band_state(x: i32, y: i32, z: i32) -> Option<u32> {
+    band_state_dim(DimId::Overworld, x, y, z)
+}
+
+fn band_state_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     if !worldgen::enabled() {
         return None;
     }
@@ -18654,7 +18727,7 @@ fn band_state(x: i32, y: i32, z: i32) -> Option<u32> {
     // for an unpopulated chunk that includes its population), so it only pays when the
     // reader wants thousands of cells from that chunk — which is `chunk_data`, and it
     // installs the band from states it already has (`install_band_rows`).
-    let band = op_bands().lock().unwrap().get((cx, cz))?;
+    let band = op_bands().lock().unwrap().get((dim, cx, cz))?;
     band.get(y, (x & 15) as usize, (z & 15) as usize)
 }
 
@@ -18665,8 +18738,8 @@ fn band_state(x: i32, y: i32, z: i32) -> Option<u32> {
 /// Both users stay inside it (the sky floor scan walks down from `surface + 17`, the
 /// spill BFS spreads ±15 around a floor), and it is derived from `ChunkCols`, so it
 /// costs one hash lookup rather than a terrain pass.
-fn band_range(cx: i32, cz: i32) -> Option<(i32, i32)> {
-    let cols = worldgen::chunk_cols(cx, cz)?;
+fn band_range(dim: DimId, cx: i32, cz: i32) -> Option<(i32, i32)> {
+    let cols = worldgen::chunk_cols_dim(dim, cx, cz)?;
     let (mut lo, mut hi) = (i32::MAX, i32::MIN);
     for lz in 0..16usize {
         for lx in 0..16usize {
@@ -18675,7 +18748,10 @@ fn band_range(cx: i32, cz: i32) -> Option<(i32, i32)> {
             hi = hi.max(t);
         }
     }
-    Some(((lo - 18).max(MIN_Y), (hi + 18).min(MIN_Y + 383)))
+    Some((
+        (lo - 18).max(dim.min_y()),
+        (hi + 18).min(dim.min_y() + dim.height() - 1),
+    ))
 }
 
 /// Record the opacity rows `chunk_data` has just computed for this section.
@@ -18685,22 +18761,22 @@ fn band_range(cx: i32, cz: i32) -> Option<(i32, i32)> {
 /// from worldgen later — measured at 13.6-15.7 ms per new band (~700 ns/cell) against
 /// the ~200 ns/cell the delivery pass pays, i.e. the same work done twice. Installing
 /// the rows here makes the band nearly free for a chunk that was just streamed.
-fn install_band_rows(cx: i32, cz: i32, sy: i32, sec: &PalettedSection) {
+fn install_band_rows(dim: DimId, cx: i32, cz: i32, sy: i32, sec: &PalettedSection) {
     if breg().is_none() {
         return;
     }
-    let Some((y0, y1)) = band_range(cx, cz) else {
+    let Some((y0, y1)) = band_range(dim, cx, cz) else {
         return;
     };
     if sy + 15 < y0 || sy > y1 {
         return;
     }
-    let epoch = chunk_version(cx, cz);
+    let epoch = chunk_version_dim(dim, cx, cz);
     let mut bands = op_bands().lock().unwrap();
-    if bands.get((cx, cz)).is_none() {
+    if bands.get((dim, cx, cz)).is_none() {
         let rows = (y1 - y0 + 1) as usize;
         bands.put(
-            (cx, cz),
+            (dim, cx, cz),
             epoch,
             std::sync::Arc::new(OpBand {
                 y0,
@@ -18709,7 +18785,7 @@ fn install_band_rows(cx: i32, cz: i32, sy: i32, sec: &PalettedSection) {
             }),
         );
     }
-    let Some((_, slot)) = bands.map.get_mut(&(cx, cz)) else {
+    let Some((_, slot)) = bands.map.get_mut(&(dim, cx, cz)) else {
         return;
     };
     let band = std::sync::Arc::make_mut(slot);
@@ -18732,12 +18808,12 @@ fn install_band_rows(cx: i32, cz: i32, sy: i32, sec: &PalettedSection) {
 
 /// Apply a chunk's overlay edits to its band: the overlay wins over generated state,
 /// exactly as `block_at` prefers it. Called once per chunk delivery, after the rows.
-fn overlay_band(cx: i32, cz: i32) {
+fn overlay_band(dim: DimId, cx: i32, cz: i32) {
     let Some(reg) = crate::block_registry::breg() else {
         return;
     };
     let mut bands = op_bands().lock().unwrap();
-    let Some((_, slot)) = bands.map.get_mut(&(cx, cz)) else {
+    let Some((_, slot)) = bands.map.get_mut(&(dim, cx, cz)) else {
         return;
     };
     let band = std::sync::Arc::make_mut(slot);
@@ -18746,7 +18822,7 @@ fn overlay_band(cx: i32, cz: i32) {
     // rows are written, and the tick thread reads `world()` every tick.
     let col: Vec<(u32, u32)> = {
         let w = world().lock().unwrap();
-        match overworld_edits(&w, cx, cz) {
+        match w.get(&(dim, cx, cz)) {
             Some(c) => c.iter().map(|(k, v)| (*k, *v)).collect(),
             None => {
                 return;
@@ -18775,8 +18851,9 @@ fn overlay_band(cx: i32, cz: i32) {
 /// per-chunk version invalidates the derived floors on that same write, so the next pass
 /// recomputes them.
 thread_local! {
-    static CELL_SOURCE: std::cell::RefCell<Option<(u64, (i32, i32, i32), CellSource)>> =
-        const { std::cell::RefCell::new(None) };
+    static CELL_SOURCE: std::cell::RefCell<
+        Option<(u64, (DimId, i32, i32, i32), CellSource)>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Clone)]
@@ -18789,29 +18866,33 @@ enum CellSource {
 /// band's locks taken at most once per distinct chunk-section. The generator sequence is
 /// part of the cache key: a section published by a replaced generator must not answer for
 /// the new one (the store itself checks the same sequence on every miss).
-fn cell_source(x: i32, y: i32, z: i32) -> Option<CellSource> {
-    let key = (x >> 4, y >> 4, z >> 4);
+fn cell_source(dim: DimId, x: i32, y: i32, z: i32) -> Option<CellSource> {
+    // The dimension is part of the key: a Nether and an Overworld query at the same chunk and
+    // section must never share a cached source, even back to back on one thread.
+    let key = (dim, x >> 4, y >> 4, z >> 4);
     let seq = current_gen_seq();
     if let Some((cached_seq, k, src)) = CELL_SOURCE.with(|c| c.borrow().clone()) {
         if cached_seq == seq && k == key {
             return Some(src);
         }
     }
-    // The light pass is Overworld-only today (a non-Overworld write records its overlay and
-    // nothing else), but the store is dimension-keyed so the seam is ready for streaming.
-    let src = stored_section(DimId::Overworld, x >> 4, z >> 4, y & !15)
+    let src = stored_section(dim, x >> 4, z >> 4, y & !15)
         .map(CellSource::Section)
-        .or_else(|| band_for(x >> 4, z >> 4).map(CellSource::Band))?;
+        .or_else(|| band_for(dim, x >> 4, z >> 4).map(CellSource::Band))?;
     CELL_SOURCE.with(|c| *c.borrow_mut() = Some((seq, key, src.clone())));
     Some(src)
 }
 
 fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
+    opacity_windowed_dim(DimId::Overworld, x, y, z)
+}
+
+fn opacity_windowed_dim(dim: DimId, x: i32, y: i32, z: i32) -> u8 {
     let Some(reg) = breg() else {
         return 0;
     };
     if !worldgen::enabled() {
-        return reg.opacity_of(block_at(x, y, z));
+        return reg.opacity_of(block_at_dim(dim, x, y, z));
     }
     // The published sections first, then the surface band. The band stops 18 blocks below
     // the surface, and the light pass reads the 3x3 ring: a neighbour that has not been
@@ -18823,7 +18904,7 @@ fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
     // A packed section carries enough metadata to answer whole-class reads in O(1):
     // `Empty` is every cell air/void_air/cave_air (opacity 0), `Opaque` is every cell at
     // opacity 15. Only `Mixed` needs a single palette lookup at the cell's index.
-    match cell_source(x, y, z) {
+    match cell_source(dim, x, y, z) {
         Some(CellSource::Section(sec)) => match sec.light_class() {
             SectionLightClass::Empty => 0,
             SectionLightClass::Opaque => 15,
@@ -18834,8 +18915,8 @@ fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
         },
         Some(CellSource::Band(b)) => b
             .get(y, (x & 15) as usize, (z & 15) as usize)
-            .map_or_else(|| reg.opacity_of(block_at(x, y, z)), |st| reg.opacity_of(st)),
-        None => reg.opacity_of(block_at(x, y, z)),
+            .map_or_else(|| reg.opacity_of(block_at_dim(dim, x, y, z)), |st| reg.opacity_of(st)),
+        None => reg.opacity_of(block_at_dim(dim, x, y, z)),
     }
 }
 
@@ -18852,9 +18933,24 @@ fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
 /// A hash index plus insertion order, exactly like `BandCache`: the first version scanned a
 /// `VecDeque` per lookup, and this cache is asked ten times per delivered chunk with a 1 KiB
 /// entry to find, so the scan was the whole cost of a hit. `order` exists only for the bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SkyFloorsKey(DimId, i32, i32);
+
+impl From<(i32, i32)> for SkyFloorsKey {
+    fn from((cx, cz): (i32, i32)) -> Self {
+        Self(DimId::Overworld, cx, cz)
+    }
+}
+
+impl From<(DimId, i32, i32)> for SkyFloorsKey {
+    fn from((dim, cx, cz): (DimId, i32, i32)) -> Self {
+        Self(dim, cx, cz)
+    }
+}
+
 struct SkyFloorsCache {
-    map: HashMap<(i32, i32), (u64, [i32; 256])>,
-    order: std::collections::VecDeque<(i32, i32)>,
+    map: HashMap<SkyFloorsKey, (u64, [i32; 256])>,
+    order: std::collections::VecDeque<SkyFloorsKey>,
 }
 
 impl SkyFloorsCache {
@@ -18867,8 +18963,8 @@ impl SkyFloorsCache {
     }
 
     /// The floors for `key`, when the entry was computed at the chunk's current version.
-    fn get(&self, key: (i32, i32), epoch: u64) -> Option<[i32; 256]> {
-        match self.map.get(&key) {
+    fn get(&self, key: impl Into<SkyFloorsKey>, epoch: u64) -> Option<[i32; 256]> {
+        match self.map.get(&key.into()) {
             Some((entry_epoch, floors)) if *entry_epoch == epoch => Some(*floors),
             _ => None,
         }
@@ -18877,7 +18973,8 @@ impl SkyFloorsCache {
     /// Store (or refresh) an entry, evicting the oldest when the bound is passed. A key that is
     /// already present is updated in place: it keeps its position in `order`, so a refresh is
     /// not an insertion and the bound cannot be moved by one chunk being asked for repeatedly.
-    fn put(&mut self, key: (i32, i32), epoch: u64, floors: [i32; 256]) {
+    fn put(&mut self, key: impl Into<SkyFloorsKey>, epoch: u64, floors: [i32; 256]) {
+        let key = key.into();
         if let Some(slot) = self.map.get_mut(&key) {
             slot.0 = epoch;
             slot.1 = floors;
@@ -18911,38 +19008,55 @@ fn sky_floors_cache() -> &'static Mutex<SkyFloorsCache> {
 /// every tick, so one write anywhere would invalidate every cached band and the next
 /// light pass would rebuild the whole 3x3 (14 ms each). A write only changes its own
 /// chunk's cells, and each cache entry describes one chunk, so the version is per chunk.
-static CHUNK_VERSIONS: OnceLock<Mutex<HashMap<(i32, i32), u64>>> = OnceLock::new();
+static CHUNK_VERSIONS: OnceLock<Mutex<HashMap<(DimId, i32, i32), u64>>> = OnceLock::new();
 static CHUNK_VERSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
-fn chunk_versions() -> &'static Mutex<HashMap<(i32, i32), u64>> {
+fn chunk_versions() -> &'static Mutex<HashMap<(DimId, i32, i32), u64>> {
     CHUNK_VERSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn chunk_version(cx: i32, cz: i32) -> u64 {
+    chunk_version_dim(DimId::Overworld, cx, cz)
+}
+
+fn chunk_version_dim(dim: DimId, cx: i32, cz: i32) -> u64 {
     chunk_versions()
         .lock()
         .unwrap()
-        .get(&(cx, cz))
+        .get(&(dim, cx, cz))
         .copied()
         .unwrap_or(0)
 }
 
 /// Call after any write into `world()` at `(x, z)`: that chunk's caches are now suspect.
 fn bump_world_epoch(x: i32, z: i32) {
+    bump_world_epoch_dim(DimId::Overworld, x, z);
+}
+
+fn bump_world_epoch_dim(dim: DimId, x: i32, z: i32) {
     let seq = CHUNK_VERSION_SEQ.fetch_add(1, Ordering::Relaxed);
     chunk_versions()
         .lock()
         .unwrap()
-        .insert((x >> 4, z >> 4), seq);
+        .insert((dim, x >> 4, z >> 4), seq);
     if chunkprof::enabled() {
         chunkprof::EPOCH_BUMPS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32; 256] {
+    sky_floors_dim(DimId::Overworld, cx, cz, opacity)
+}
+
+fn sky_floors_dim(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    opacity: &impl Fn(i32, i32, i32) -> u8,
+) -> [i32; 256] {
     let __t = chunkprof::enabled().then(std::time::Instant::now);
-    let epoch = chunk_version(cx, cz);
-    if let Some(floors) = sky_floors_cache().lock().unwrap().get((cx, cz), epoch) {
+    let epoch = chunk_version_dim(dim, cx, cz);
+    if let Some(floors) = sky_floors_cache().lock().unwrap().get((dim, cx, cz), epoch) {
         if let Some(t) = __t {
             chunkprof::add(&chunkprof::FLOORS, t);
         }
@@ -18962,8 +19076,8 @@ fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32;
     // so this costs one pass over the chunk's columns rather than a per-cell scan.
     let __ts = chunkprof::enabled().then(std::time::Instant::now);
     let starts: [i32; 256] = {
-        let cols = worldgen::chunk_cols(cx, cz);
-        let feature = worldgen::with_gen(|g| {
+        let cols = worldgen::chunk_cols_dim(dim, cx, cz);
+        let feature = worldgen::with_gen_dim(dim, |g| {
             let mut v = [i32::MIN; 256];
             for lz in 0..16usize {
                 for lx in 0..16usize {
@@ -18981,7 +19095,7 @@ fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32;
                 let base = cols
                     .as_ref()
                     .map(|c| c.wtop(lx, lz) as i32)
-                    .unwrap_or_else(|| height_at(cx * 16 + lx as i32, cz * 16 + lz as i32));
+                    .unwrap_or_else(|| height_at_dim(dim, cx * 16 + lx as i32, cz * 16 + lz as i32));
                 starts[i] = base.max(feature[i]) + 1;
             }
         }
@@ -18992,7 +19106,7 @@ fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32;
         for lx in 0..16usize {
             let i = (lz << 4) | lx;
             let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
-            let mut y = starts[i].min(MIN_Y + 383);
+            let mut y = starts[i].min(dim.min_y() + dim.height() - 1);
             let mut steps = 0;
             while steps < 24 {
                 if chunkprof::enabled() {
@@ -19010,7 +19124,7 @@ fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32;
     sky_floors_cache()
         .lock()
         .unwrap()
-        .put((cx, cz), epoch, floors);
+        .put((dim, cx, cz), epoch, floors);
     if let Some(t) = __t {
         chunkprof::add(&chunkprof::FLOORS, t);
     }
@@ -19206,11 +19320,16 @@ fn chunk_data_opt(
         chunkprof::add(&chunkprof::OVERLAY_APPLY, t);
     }
     let overlay_empty = overlay.is_empty();
+    // The block section window is this dimension's, not the Overworld's hard-coded -64/384.
+    // Overworld keeps its 24 sections from -64; the Nether and the End get 16 from 0.
+    let min_y = dim.min_y();
+    let sections = dim.sections();
+    let top_y = min_y + dim.height();
     let mut hs = [0i32; 256];
     let (mut hmin, mut hmax) = (i32::MAX, i32::MIN);
     for lz in 0..16 {
         for lx in 0..16 {
-            let h = height_at(cx * 16 + lx, cz * 16 + lz);
+            let h = height_at_dim(dim, cx * 16 + lx, cz * 16 + lz);
             hs[((lz << 4) | lx) as usize] = h;
             hmin = hmin.min(h);
             hmax = hmax.max(h);
@@ -19236,10 +19355,11 @@ fn chunk_data_opt(
     // copy nor a repack.
     let mut carried_next: Option<std::sync::Arc<PalettedSection>> = None;
     let mut prev_base: Option<std::sync::Arc<PalettedSection>> = None;
-    for sec in 0..24 {
-        let sy = sec * 16 + MIN_Y;
+    for sec in 0..sections {
+        let sy = sec * 16 + min_y;
         let __tb = chunkprof::enabled().then(std::time::Instant::now);
-        let biomes = worldgen::biome_section(cx, sy, cz).unwrap_or_else(|| Box::new([39i64; 64])); // plains
+        let biomes = worldgen::biome_section_dim(dim, cx, sy, cz)
+            .unwrap_or_else(|| Box::new([39i64; 64])); // plains
         if let Some(t) = __tb {
             chunkprof::add(&chunkprof::BIOMES, t);
         }
@@ -19316,7 +19436,7 @@ fn chunk_data_opt(
             }
             // The section above, computed now so this section's reads have it and the next
             // iteration does not pay for it twice.
-            let next_base = if sy + 16 < MIN_Y + 384 {
+            let next_base = if sy + 16 < top_y {
                 // The +x neighbour's delivery published this one a step ago in a sweep, so
                 // ask the store before computing it again.
                 match take_published(dim, cx, cz, sy + 16) {
@@ -19339,7 +19459,7 @@ fn chunk_data_opt(
             // re-evaluate them through `block_state_at` later.
             if let Some(sec) = &base {
                 let __ti = chunkprof::enabled().then(std::time::Instant::now);
-                install_band_rows(cx, cz, sy, sec);
+                install_band_rows(dim, cx, cz, sy, sec);
                 if let Some(t) = __ti {
                     chunkprof::add(&chunkprof::BAND_INSTALL, t);
                 }
@@ -19451,13 +19571,13 @@ fn chunk_data_opt(
                         }
                         return st;
                     }
-                    let band = band_state(wx, wy, wz);
+                    let band = band_state_dim(dim, wx, wy, wz);
                     if let Some(t) = __tb {
                         chunkprof::add(&chunkprof::BAND_LOOKUP_NS, t);
                     }
                     let overlay_hit = if band.is_none() {
                         let __to = chunkprof::enabled().then(std::time::Instant::now);
-                        let v = overlay_block(wx, wy, wz);
+                        let v = overlay_block_dim(dim, wx, wy, wz);
                         if let Some(t) = __to {
                             chunkprof::add(&chunkprof::OVERLAY_READ_NS, t);
                         }
@@ -19481,7 +19601,7 @@ fn chunk_data_opt(
                                 chunkprof::BASE_STATE_N
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
-                            let st = base_state(wx, wy, wz);
+                            let st = base_state_dim(dim, wx, wy, wz);
                             if let Some(t) = __tbs {
                                 chunkprof::add(&chunkprof::BASE_STATE_NS, t);
                             }
@@ -19513,7 +19633,7 @@ fn chunk_data_opt(
                             let gen = if has_base {
                                 arr[(ly << 8) | (lz << 4) | lx]
                             } else {
-                                base_state(wx, wy, wz)
+                                base_state_dim(dim, wx, wy, wz)
                             };
                             let st = ov.unwrap_or(gen);
                             // Record the generated emitter even when an overlay edit covers it:
@@ -19617,6 +19737,10 @@ fn nbt_str(v: &mut Vec<u8>, s: &str) {
     v[start..start + 2].copy_from_slice(&length.to_be_bytes());
 }
 fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
+    heightmaps_nbt_dim(tops, MIN_Y)
+}
+
+fn heightmaps_nbt_dim(tops: &[i32; 256], min_y: i32) -> Vec<u8> {
     let mut v = Vec::new();
     v.push(10); // TAG_Compound — anonymousNbt: contents directly, no root name
     v.push(12); // TAG_Long_Array
@@ -19627,7 +19751,9 @@ fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
     for (i, t) in tops.iter().enumerate().take(256) {
         let li = i / per;
         let off = (i % per) * 9;
-        let val = (*t - MIN_Y).max(0) as u64; // tops already = top y+1; stored relative to min_y
+        // tops already = top y+1; the heightmap is stored relative to this dimension's min_y.
+        // A Nether/End column top of 70 is 70, not 134 (70 - (-64)).
+        let val = (*t - min_y).max(0) as u64;
         if li < 37 {
             longs[li] |= (val & 0x1ff) << off;
         }
@@ -19645,7 +19771,7 @@ fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     p.extend_from_slice(&cx.to_be_bytes());
     p.extend_from_slice(&cz.to_be_bytes());
     let mut tops = [0i32; 256];
-    if let Some(c) = worldgen::chunk_cols(cx, cz) {
+    if let Some(c) = worldgen::chunk_cols_dim(dim, cx, cz) {
         for lz in 0..16usize {
             for lx in 0..16usize {
                 // MOTION_BLOCKING is the top of the fluid-inclusive surface, not the density top.
@@ -19653,7 +19779,7 @@ fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
             }
         }
     }
-    p.extend_from_slice(&heightmaps_nbt(&tops));
+    p.extend_from_slice(&heightmaps_nbt_dim(&tops, dim.min_y()));
     let __td = chunkprof::enabled().then(std::time::Instant::now);
     let data = chunk_data(cx, cz, dim, gen);
     if let Some(t) = __td {
@@ -19682,7 +19808,12 @@ fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
             ((x, y, z), 7i64, n)
         })
         .collect();
-    be.extend(generated_spawner_chunk_entities(cx,cz));
+    // The spawner table holds Overworld positions only. Filing a Nether/End chunk with an
+    // Overworld spawner at the same coordinates would send a block entity the client cannot
+    // place there.
+    if dim == DimId::Overworld {
+        be.extend(generated_spawner_chunk_entities(cx, cz));
+    }
     write_varint(&mut p, be.len() as i64);
     for ((x, y, z), ty, n) in be {
         p.push(((x & 15) as u8) << 4 | (z & 15) as u8);
@@ -19690,7 +19821,7 @@ fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
         write_varint(&mut p, ty);
         p.extend_from_slice(&n);
     }
-    overlay_band(cx, cz);
+    overlay_band(dim, cx, cz);
     let __tl = chunkprof::enabled().then(std::time::Instant::now);
     write_light_arrays(&mut p, cx, cz, dim, gen);
     if let Some(t) = __tl {
@@ -19717,15 +19848,12 @@ fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSo
     // all-sections ones. The Overworld — every dimension this build streams today — takes the
     // unchanged path; the Nether/End shape here is the packet's own contract and is not
     // exercised by a delivery test until streaming is wired (P2-3-S2).
-    let sky_mask: i64 = if worldgen::has_skylight(dim) {
-        0x3ffffff
-    } else {
-        0
-    };
+    let mask = dim.light_mask();
+    let sky_mask: i64 = if worldgen::has_skylight(dim) { mask } else { 0 };
     write_varint(p, 1);
     p.extend_from_slice(&sky_mask.to_be_bytes()); // skyLightMask
     write_varint(p, 1);
-    p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // blockLightMask
+    p.extend_from_slice(&mask.to_be_bytes()); // blockLightMask
     write_varint(p, 0); // emptySky
     write_varint(p, 0); // emptyBlock
                         // The arrays follow as two counted lists, each entry prefixed by its length.
@@ -19746,7 +19874,7 @@ fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSo
         p.extend_from_slice(&sec);
     }
     let __tbl = chunkprof::enabled().then(std::time::Instant::now);
-    let block = block_light_sections(cx, cz, gen);
+    let block = block_light_sections_dim(dim, cx, cz, gen);
     if let Some(t) = __tbl {
         chunkprof::add(&chunkprof::BLOCKLIGHT, t);
     }
@@ -19765,10 +19893,14 @@ fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSo
 /// `ClientPacketListener.applyLightData`). Sections whose block light is zero go in the empty
 /// mask with no array, which is vanilla's own encoding for them.
 fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
+    update_light_packet_dim(DimId::Overworld, cx, cz, gen)
+}
+
+fn update_light_packet_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, cx as i64);
     write_varint(&mut p, cz as i64);
-    let block = block_light_sections(cx, cz, gen);
+    let block = block_light_sections_dim(dim, cx, cz, gen);
     let (mut mask, mut empty) = (0u64, 0u64);
     for (i, sec) in block.iter().enumerate() {
         if sec.iter().all(|b| *b == 0) {
