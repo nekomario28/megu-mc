@@ -98,14 +98,14 @@
 
 - [ ] **CF-0（Server-Client 共有コアの切り出し）**: `src/block_registry.rs` (`26,684` states / `FULL`/`CENTER`/`RIGID`)、`src/entity_collision.rs`、`src/entity_fluid.rs`、`src/paletted.rs`、`src/lighting.rs`、`src/nbt.rs`、`src/brigadier.rs` をサーバーとクライアントフォークの共有クレート境界（Zero-Drift Shared Kernel）として切り出す。
 - [ ] **CF-1（ヘッドレス 1.21.1 決定論的シミュレータ & E2E ボットクライアント）**: 受信チャンク (`0x27`)・ブロック更新 (`0x09`)・エンティティ移動 (`0x5a`) を共有カーネル上で毎 tick ローカル予測し、Vanilla 1.21.1 サーバーおよび `mc-spine` サーバーとの位置・流体・衝突誤差 0 を検証する。
-- [ ] **CF-2（クライアント描画・増分ライティング・Greedy Meshing 接続）**: AGPL コード（Torch 等）を流用せず、`PalettedSection` と `lighting.rs` から直接セクションメッシュを生成する描画パイプラインを接続（Issue `#43` と連携）。
+- [ ] **CF-2（クライアント描画・増分ライティング・Greedy Meshing 接続）**: ファーストパーティファイルに外部 `AGPL-3.0-only` コードを混ぜず（トリプルライセンス双方向性を維持）、`PalettedSection` と `lighting.rs` から直接セクションメッシュを生成する描画パイプラインを接続（Issue `#43` と連携）。
 - [ ] **CF-3（`mods/` 投入型 Rust Integrated Server — `mc-spine-integrated.jar` / `cdylib`）**: 既存 Fabric/NeoForge クライアント（Sodium/Iris 等）の `mods/` に 1 個 JAR を入れるだけで、シングルプレイ／LAN ホストのサーバー処理を 100% Rust (`libmc_spine` + 共有メモリ / Direct `ByteBuffer` FFI) にオフロード。
 - [ ] **CF-4（Default Launcher / Prism Launcher ネイティブ起動パッケージ）**: Custom Version JSON + 極薄 Bootstrapper JAR（約 20 KB、起動 50ms 後に JVM 退場）および Prism `Wrapper command`（JVM 非起動で直接 Rust 起動）により、公式/Prism/Modrinth 全ランチャーで内部 100% Rust ネイティブ動作を実現。
 
 ### P4 — 統合前のゲート（自動ではmergeしない）
 
 - [ ] **P4-1 同一SHAの全gateと独立レビュー** — `tests/verify.sh` 完走、native oracle、本番wire、mutation、serial/parallel、adapter、layers/debt、Fossil/structure/feature・dimension回帰の結果を同一revisionで収集。hosted CIを使えない場合は未実行と明記。過去の[Issue #7](https://github.com/nekomario28/mc-spine/issues/7)はクローズ済み。
-- [x] **P4-2 配布物・ライセンス・リリース判定（Stage F1 完了 `88573be`）** — P0-3（D1〜D5）および `GPL-3.0-or-later`（寄稿は `LGPL-3.0-or-later` とのデュアルライセンス）確定、`main` への Fast-Forward 統合完了。
+- [x] **P4-2 配布物・ライセンス・履歴クリーンアップ（Stage F1 & F2 完了 `bd06c8a`）** — P0-3（D1〜D5）、本体 `GPL-3.0-or-later` ＋ 寄稿 `LGPL-3.0-or-later / GPL-3.0-or-later / AGPL-3.0-or-later` トリプルライセンス確定、`git filter-repo --invert-paths` による過去の削除済み不純ファイルの全履歴抹消、`main` への統合完了。
 
 ## 次の着手
 

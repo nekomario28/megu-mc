@@ -172,7 +172,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 4. **P4 (`DfProg` SIMD/バッチ評価と早期枝刈り)**: MIT `Soju06/hyperchunk`（`df_simd_avx2.c` 等）を先行例に、格子点の SIMD 評価と `material_rule` / `aquifer` の早期枝刈りを行う。
 5. **P5 (ライト・M2物理/Mob・圧縮配信)**: Starlight 概念（全空気/不透明 section の O(1) スキップ、nibble 直接フラッド）、Lithium 概念（`VoxelShape`/AABB キャッシュ）、大量 Mob の構造的軽量化（連続配列による細粒度ロック撤去・空間グリッド索引による `O(N^2)` 排除・AI/経路探索の読み取り並列化）、`libdeflate` / zero-repack 送信を統合する。
 
-**ライセンス境界:** 本体は `GPL-3.0-or-later`（寄稿は `LGPL-3.0-or-later` および `GPL-3.0-or-later` のデュアルライセンス、[LICENSING.md](../LICENSING.md)）。**C2ME (`MIT`)**、**Lithium (`LGPL-3.0`)**、`Soju06/hyperchunk` (`MIT`)、`valence-rs` (`MIT`)、`MCHPRS` (`MIT`)、`Azalea` (`MIT`) は `GPL-3.0-or-later` と `LGPL-3.0-or-later` の双方とライセンス互換である。外部からコード・手法を取り込む場合は帰属とライセンスを [THIRD_PARTY.md](../THIRD_PARTY.md) / [NOTICE](../NOTICE) に明記し、将来 `LGPL-3.0-or-later` としても配布できるよう `GPL-3.0-only` / `AGPL-3.0`（Torch 等）のコードは直接コピーせずアルゴリズム概念またはブラックボックス比較のみとする。
+**ライセンス境界:** 本体は `GPL-3.0-or-later`（寄稿およびファーストパーティコードは `LGPL-3.0-or-later`、`GPL-3.0-or-later`、および `AGPL-3.0-or-later` のトリプルライセンス、[LICENSING.md](../LICENSING.md)）。**C2ME (`MIT`)**、**Lithium (`LGPL-3.0`)**、`Soju06/hyperchunk` (`MIT`)、`valence-rs` (`MIT`)、`MCHPRS` (`MIT`)、`Azalea` (`MIT`) は `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` のすべてとライセンス互換である。外部からコード・手法を取り込む場合は帰属とライセンスを [THIRD_PARTY.md](../THIRD_PARTY.md) / [NOTICE](../NOTICE) に明記し、将来いつでも `LGPL-3.0-or-later`・`GPL-3.0-or-later`・`AGPL-3.0-or-later` の間を双方向に行き来できるよう、第三者の `GPL-3.0-only` / `AGPL-3.0-only` コードはファーストパーティファイルへ直接コピーせずアルゴリズム概念・ブラックボックス比較または専用モジュール境界で分離する。
 
 **出口:** PLANのM3条件を代表負荷で満たし、再現手順・ノイズ・未対応機能を記録する。機能不足で仕事量が減った結果や、地形が異なる条件の旧測定を性能改善へ読み替えない。
 
@@ -202,7 +202,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
    - 現行の `tests/protocol767.py` / `tests/m2_gameplay_wire.py` / `tests/dimension_wire.py` を発展させ、Rust 共有カーネル上で動く **ヘッドレス 1.21.1 クライアントランタイム**を構築する。
    - サーバーから受信した `0x27` Level Chunk With Light、`0x09` Block Update、`0x5a` Set Entity Motion、`0x47` Respawn をクライアント側 `PalettedSection` と `entity_collision` / `entity_fluid` で毎 tick ローカル予測実行し、Vanilla 1.21.1 サーバーおよび `mc-spine` サーバーの双方に対して「クライアント側予測位置 vs サーバー確定位置の誤差 0」を自動検証する。
 3. **CF-2（クライアント側レンダリング・ライティング・メッシュ生成パイプラインとの接続）**:
-   - Issue `#40`（解決済）・`#43`（Torch 増分ライティング比較）で整理した境界に従い、AGPL コード（Torch 等）は一切流用せず（`GPL-3.0-or-later` / `LGPL-3.0-or-later` 互換性を維持）、`mc-spine` の `PalettedSection`（`uniform_state()` O(1) スキップ・`hidden_filler`・`non_air` カウンタ）と `src/lighting.rs` から直接 Greedy Meshing / Chunk Section VBO を生成するクライアント描画層を接続する。
+   - Issue `#40`（解決済）・`#43`（Torch 増分ライティング比較）で整理した境界に従い、ファーストパーティファイルへ外部の `AGPL-3.0-only` コードを混ぜず（トリプルライセンス `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` の双方向性を維持）、`mc-spine` の `PalettedSection`（`uniform_state()` O(1) スキップ・`hidden_filler`・`non_air` カウンタ）と `src/lighting.rs` から直接 Greedy Meshing / Chunk Section VBO を生成するクライアント描画層を接続する。
 4. **CF-3（`mods/` 投入型 Rust Integrated Server — `mc-spine-integrated.jar` / `cdylib`）**:
    - 既存の Fabric / NeoForge クライアント環境（Sodium / Iris シェーダー等をそのまま利用）の `mods/` に JAR 1 個を入れるだけで、シングルプレイ／LAN ホスト時の重い Java Integrated Server を **JAR 内蔵の Rust ネイティブ `libmc_spine` (`cdylib`) + 共有メモリ / Direct `ByteBuffer` FFI** に完全置換する。
    - 描画・UI は使い慣れた既存クライアント Mod 資産を活かしつつ、ワールド生成（SIMD / Rayon DAG 並列）・構造物・照明・Redstone・流体・エンティティ Tick を 100% Rust で爆速実行する。
