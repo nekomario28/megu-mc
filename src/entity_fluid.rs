@@ -429,6 +429,7 @@ fn player_bounding_box(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -
     EntityAabb::from_dimensions(x, y, z, 0.6, height)
 }
 
+#[cfg(test)]
 fn player_eye_in_water(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> bool {
     let eh = player_eye_height(sneaking, fall_fly);
     eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &block_at)
@@ -552,6 +553,7 @@ fn level_ultra_warm() -> bool {
     LEVEL_ULTRA_WARM.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
 fn set_level_ultra_warm(v: bool) {
     LEVEL_ULTRA_WARM.store(v, Ordering::Relaxed);
 }

@@ -18,6 +18,7 @@ struct CollideResult {
 }
 
 impl EntityAabb {
+    #[cfg(test)]
     fn from_min_max(min: [f64; 3], max: [f64; 3]) -> Self {
         Self {
             min_x: min[0],

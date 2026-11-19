@@ -16,6 +16,7 @@ use crate::json::{jarr, jbool, jf32, jint, jnum, jparse, js, jstr, J};
 use crate::trace_env::{env_flag, env_str};
 use crate::worldgen::*;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -2862,23 +2863,23 @@ const SPC_ORIGIN_RADIUS_SQ: i64 = 225;
 
 const SPC_VEIN: &str = "minecraft:sculk_vein";
 
-/// Counts `SculkSpreader.updateCursors` calls, matching the reference agent's counter.
-///
-/// Thread-local like the trace sink: a process-wide counter made a test's trace start at
-/// whatever round another test had reached (measured: `r=16` as the first line instead of `r=0`).
-/// A CLI run has one thread, so its numbering is unchanged.
 thread_local! {
+    /// Counts `SculkSpreader.updateCursors` calls, matching the reference agent's counter.
+    ///
+    /// Thread-local like the trace sink: a process-wide counter made a test's trace start at
+    /// whatever round another test had reached (measured: `r=16` as the first line instead of `r=0`).
+    /// A CLI run has one thread, so its numbering is unchanged.
     static SPC_ROUND: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
-/// Where the sculk cursor trace goes: a test installs a **thread-local** sink and reads the lines
-/// back in-process, the CLI gets them on stderr with `SPC_CURSOR_TRACE=1`.
-///
-/// Thread-local rather than a global with a lock, because the suite runs its tests on threads: a
-/// process-wide sink let a concurrently running sculk test's cursors land in this test's trace
-/// (measured: 5310 lines instead of 5150, and no line matched). A thread-local sink cannot be
-/// polluted by another test, because population runs on the thread that asked for it.
 thread_local! {
+    /// Where the sculk cursor trace goes: a test installs a **thread-local** sink and reads the lines
+    /// back in-process, the CLI gets them on stderr with `SPC_CURSOR_TRACE=1`.
+    ///
+    /// Thread-local rather than a global with a lock, because the suite runs its tests on threads: a
+    /// process-wide sink let a concurrently running sculk test's cursors land in this test's trace
+    /// (measured: 5310 lines instead of 5150, and no line matched). A thread-local sink cannot be
+    /// polluted by another test, because population runs on the thread that asked for it.
     static SPC_TRACE_SINK: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -3879,7 +3880,7 @@ fn grow_vines(
     tip: &str,
 ) {
     let Some(reg) = breg() else { return };
-    let (mut x, mut y, mut z) = pos;
+    let (x, mut y, z) = pos;
     let (start, step) = if down { (0, -1) } else { (1, 1) };
     let mut i = start;
     while if down { i <= height } else { i <= height } {
@@ -3918,7 +3919,7 @@ fn gen_twisting_vines(
         let dx = rng.next_inbetween(-width, width);
         let dy = rng.next_inbetween(-height, height);
         let dz = rng.next_inbetween(-width, width);
-        let (mut x, mut y, mut z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+        let (x, mut y, z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
         // walk down to the ground, as the native helper does
         let mut found = false;
         loop {
@@ -4133,7 +4134,7 @@ fn gen_delta_feature(
         ] {
             // air anywhere but above rejects; the cell above must be air
             let empty = ctx.is_air(x + dx, y + dy, z + dz);
-            if (empty != (dy == 1)) {
+            if empty != (dy == 1) {
                 return false;
             }
         }
@@ -4324,7 +4325,7 @@ fn gen_basalt_pillar(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     // north, south, west, east
     const SIDES: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
     let mut hang = [true; 4];
-    let (mut x, mut y, mut z) = pos;
+    let (x, mut y, z) = pos;
     while ctx.is_air(x, y, z) {
         if ctx.out_of_h(y) {
             return;
@@ -4354,7 +4355,7 @@ fn gen_basalt_pillar(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
             if rng.next_bound(10) >= 10 - (dx.abs() * dz.abs()) {
                 continue;
             }
-            let (mut mx, mut my, mz) = (x + dx, y, z + dz);
+            let (mx, mut my, mz) = (x + dx, y, z + dz);
             let mut left = 3;
             while ctx.is_air(mx, my - 1, mz) {
                 my -= 1;
@@ -5923,7 +5924,7 @@ fn mod_positions(
                     let z = pos.2 + rng.next_bound(16);
                     let top = ctx.heightmap(HeightmapKind::MotionBlocking, x, z);
                     let y = cel_find_y(ctx, reg, x, top, z, layer);
-                    if let Some(layers) = trace {
+                    if trace.is_some() {
                         // Every layer the column offers, so a layer-count difference says which
                         // boundary one side has and the other does not instead of only "one more".
                         let all = cel_layer_ys(ctx, reg, x, top, z);
