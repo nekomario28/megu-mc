@@ -417,13 +417,15 @@ def native_start(native_world, structure_id, origin, n, preset):
             structs = nbt.get("structures") or nbt.get("Structures") or {}
             starts = structs.get("starts") or {}
             refs = structs.get("References") or {}
-            if structure_id in starts:
-                for index, child in enumerate(starts[structure_id].get("Children") or []):
-                    found.append({
-                        "chunk": [cx, cz],
-                        "child_index": index,
-                        "BB": list(child.get("BB") or []),
-                    })
+            start = starts.get(structure_id)
+            if not isinstance(start, dict) or start.get("id") == "INVALID":
+                continue
+            for index, child in enumerate(start.get("Children") or []):
+                found.append({
+                    "chunk": [cx, cz],
+                    "child_index": index,
+                    "BB": list(child.get("BB") or []),
+                })
             for packed in refs.get(structure_id) or []:
                 found.append({"chunk": [cx, cz], "reference": chunk_triage.decode_chunk_pos_long(packed)})
     return found

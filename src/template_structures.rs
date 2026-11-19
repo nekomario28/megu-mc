@@ -1360,6 +1360,23 @@ fn update_shape<W: TemplateWorld>(
             return reg.with_prop(state, key, want);
         }
     }
+    // `TallSeagrassBlock` inherits `DoublePlantBlock.updateShape` (`dig.a`):
+    // when the neighbouring half changes, a mismatched vertical partner is
+    // replaced by air. A template's edge-shape pass can expose an upper half
+    // over gravel before the water fluid tick restores the emptied cell.
+    if bare == "tall_seagrass" {
+        let half = reg.get_prop(state, "half");
+        let partner_direction = match half.as_deref() {
+            Some("upper") => Some(0),
+            Some("lower") => Some(1),
+            _ => None,
+        };
+        if partner_direction == Some(direction)
+            && (reg.name_of(neighbor) != name || reg.get_prop(neighbor, "half") == half)
+        {
+            return air;
+        }
+    }
     // `DoorBlock.updateShape`: the vertical partner copies the partner's state
     // (keeping this half); a lower half whose `canSurvive` fails becomes air
     // (modelled as "nothing solid below").
@@ -4259,6 +4276,30 @@ mod template_structures_tests {
         assert_eq!(reg.get_prop(after, "east").as_deref(), Some("false"));
         assert_eq!(reg.get_prop(after, "north").as_deref(), Some("false"));
         assert_eq!(world.get(0, 70, 1), wall, "the written cell keeps its state");
+    }
+
+    #[test]
+    fn shape_passes_remove_tall_seagrass_upper_when_template_breaks_its_lower_half() {
+        let reg = breg().expect("block registry");
+        let scene = SceneSpec::parse(None, reg);
+        let mut world = TestWorld::new(scene);
+        let upper = reg.with_prop(reg.state_of("minecraft:tall_seagrass", None), "half", "upper");
+        let lower = reg.with_prop(reg.state_of("minecraft:tall_seagrass", None), "half", "lower");
+        let gravel = reg.state_of("minecraft:gravel", None);
+        let air = reg.state_of("minecraft:air", None);
+
+        // Seed 4242 ocean_ruin_cold (-151,-180): the upper half at
+        // (-2414,40,-2880) is exposed over gravel by a structure template.
+        world.set(0, 70, 0, upper);
+        world.set(0, 69, 0, gravel);
+        let writes = apply_shape_passes(&[(0, 69, 0)], &mut world, reg);
+        assert_eq!(world.get(0, 70, 0), air);
+        assert!(writes.contains(&((0, 70, 0), air)));
+
+        world.set(0, 70, 0, upper);
+        world.set(0, 69, 0, lower);
+        apply_shape_passes(&[(0, 69, 0)], &mut world, reg);
+        assert_eq!(world.get(0, 70, 0), upper);
     }
 
     /// The other measured half. A fence the placement state left pointing at air

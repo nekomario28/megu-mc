@@ -151,6 +151,13 @@ class StartVerification(unittest.TestCase):
             starts = sc.native_start(Path("/nonexistent"), "minecraft:igloo", (3, 4), 1, "overworld")
         self.assertEqual(starts, [])
 
+    def test_a_reference_without_a_start_is_not_a_verified_start(self):
+        chunk = make_chunk_nbt(3, 4, starts={},
+                               references={"minecraft:igloo": [encode_chunk_pos_long(3, 4)]})
+        with patch.object(sc.chunk_triage, "read_chunk_nbt", return_value=chunk):
+            starts = sc.native_start(Path("/nonexistent"), "minecraft:igloo", (3, 4), 1, "overworld")
+        self.assertEqual(starts, [])
+
 
 class RowAssembly(unittest.TestCase):
     """A row may not claim an artifact it cannot bind, and it binds what the comparator reads."""
