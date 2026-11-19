@@ -682,16 +682,17 @@ check "block light uses generated sources, not only the overlay" \
   block_light_uses_generated_sources
 
 check "block light sees a neighbour's generated source" \
-  src/main.rs 'gen.get(&(cx + dx, cz + dz))' \
-  'gen.get(&(cx, cz))' \
+  src/main.rs '                let Some(g) = gen.get(&(cx + dx, cz + dz)) else {' \
+  '                let Some(g) = gen.get(&(cx, cz)) else {' \
   block_light_sees_a_neighbours_generated_source
 
 check "a removed generated emitter stops lighting" \
-  src/main.rs '                if w.get(&(p.0 >> 4, p.2 >> 4))
-                    .and_then(|c| c.get(&local_idx(p.0, p.1, p.2)))
-                    .is_some()
-                {' \
-  '                if false {' \
+  src/main.rs '                    if guard
+                        .get(&(dim, p.0 >> 4, p.2 >> 4))
+                        .and_then(|c| c.get(&local_idx(p.0, p.1, p.2)))
+                        .is_some()
+                    {' \
+  '                    if false {' \
   a_removed_generated_emitter_stops_lighting
 check "sky spill loses one level per step" \
   src/main.rs '            let nl = level.saturating_sub(opacity(qx, qy, qz).max(1));' \
@@ -836,11 +837,11 @@ check "breaking a chest drops the slots it owned" \
   src/main.rs '            if let Some(slots) = chests()
                 .lock()
                 .unwrap()
-                .remove(&ContainerKey::Block((x, y, z)))' \
+                .remove(&ContainerKey::ow((x, y, z)))' \
   '            if let Some(slots) = chests()
                 .lock()
                 .unwrap()
-                .remove(&ContainerKey::Block((x, y + 1000, z)))' \
+                .remove(&ContainerKey::ow((x, y + 1000, z)))' \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a state whose metadata row cannot be matched is reported as unpaired" \
@@ -859,15 +860,17 @@ check "containers must be decoded, not merely remain absent" \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a broken furnace cannot retain its slots" \
-  src/main.rs '        if let Some(f) = furnaces().lock().unwrap().remove(&(x, y, z)) {' \
-  '        if let Some(f) = furnaces().lock().unwrap().remove(&(x, y, z + 1000)) {' \
+  src/main.rs '            if let Some(f) = furnaces().lock().unwrap().remove(&ow_block((x, y, z))) {' \
+  '            if let Some(f) = furnaces().lock().unwrap().remove(&ow_block((x, y, z + 1000))) {' \
   furnace_and_sign_round_trip_keeps_only_live_owners
 
 check "broken sign text cannot survive its block" \
   src/main.rs '            signs()
                 .lock()
                 .unwrap()
-                .retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));' \
+                .retain(|&(dim, sx, sy, sz, _), _| {
+                    !(dim == DimId::Overworld && sx == x && sy == y && sz == z)
+                });' \
   '            signs()
                 .lock()
                 .unwrap()
@@ -1134,13 +1137,13 @@ check "the queue cap cannot visit a cell before its real backoff" \
   src/main.rs '    backoff()
         .lock()
         .unwrap()
-        .get(&(x, y, z))
+        .get(&(DimId::Overworld, x, y, z))
         .map(|(t, _)| *t <= now)
         .unwrap_or(true)' \
   '    backoff()
         .lock()
         .unwrap()
-        .get(&(x, y, z))
+        .get(&(DimId::Overworld, x, y, z))
         .map(|(_t, _)| true)
         .unwrap_or(true)' \
   a_backoff_past_the_queue_cap_waits_for_its_real_deadline
@@ -1183,7 +1186,7 @@ check "play information reaches the live chunk window" \
   tests/client_settings_wire.py 'client settings wire: FAIL play-view-3'
 check "breaking changes server state, not only the predicted wire update" \
   src/main.rs '                    if break_now {
-                        set_block(x, y, z, 0);' \
+                        set_block_dim(dim, x, y, z, 0);' \
   '                    if break_now {
                         let _ = old;' \
   tests/gameplay_wire.py 'gameplay wire: FAIL fresh-reader-block'
@@ -1193,10 +1196,8 @@ check "chat returns the actual sender and message" \
   tests/gameplay_wire.py 'gameplay wire: FAIL chat-echo'
 
 check "light arrays agree with their section masks" \
-  src/main.rs '    write_varint(p, 1);
-    p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask' \
-  '    write_varint(p, 1);
-    p.extend_from_slice(&0x3fffffei64.to_be_bytes()); // skyLightMask' \
+  src/main.rs '    p.extend_from_slice(&sky_mask.to_be_bytes()); // skyLightMask' \
+  '    p.extend_from_slice(&(sky_mask - 1).to_be_bytes()); // skyLightMask' \
   tests/gameplay_wire.py 'gameplay wire: FAIL light-mask-count'
 check "an update packet sends block light only" \
   src/main.rs '    write_varint(&mut p, 0); // skyLightMask: sky is unchanged' \
@@ -1381,11 +1382,17 @@ check "the lid broadcast carries the new opener count" \
 
 check "a removed container closes its window on windowId 1" \
   src/main.rs '        if had {
+            *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        if had {
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x12, vec![1u8]);
             }
             closed += 1;' \
   '        if had {
+            *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        if had {
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x12, Vec::new());
             }
