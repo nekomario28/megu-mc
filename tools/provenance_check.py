@@ -53,8 +53,7 @@ DECLARED = {
         "a comment recording why the fixture no longer plants one",
     ),
 }
-# Data derived from Mojang's jar that this branch still tracks. `--strict-public` is the check that
-# a release without it would pass; the default branch does not.
+# D5 requires these generator outputs to be untracked AND ignored on the public branch.
 STRICT_PUBLIC = (
     "datapacks/vanilla",
     "assets/block_states_1211.json",
@@ -118,9 +117,11 @@ def scan_for_references(root):
     return failures, notes
 
 
-def check_state_asset(root):
-    """The per-state asset must be present and must say which jar produced it."""
+def check_state_asset(root, *, allow_missing=False):
+    """Validate the generated asset, including a local copy in a public checkout."""
     path = root / STATE_ASSET
+    if allow_missing and not path.exists() and not path.is_symlink():
+        return []
     if not path.is_file():
         return [f"{STATE_ASSET} is missing; the registry reads it"]
     try:
@@ -169,7 +170,9 @@ def check(root, strict_public=False):
     failures = [f"{path} is tracked; it has no usable provenance" for path in GONE if path in index]
     references, notices = scan_for_references(root)
     failures += references
-    failures += check_state_asset(root)
+    failures += check_state_asset(root, allow_missing=(
+        strict_public or (STATE_ASSET not in index and ignored(root, STATE_ASSET))
+    ))
     if strict_public:
         failures += check_strict_public(root)
     return failures, notices
@@ -177,12 +180,18 @@ def check(root, strict_public=False):
 
 # ---- self-test -----------------------------------------------------------------------------
 # A guard that has never been observed failing is not evidence. Each case builds a throwaway
-# repository in one shape and asserts the verdict, including the shape that must pass. The asset is
-# this checkout's, so the passing case carries a real one: a green case built on an empty table
-# would only prove that "not there" reads as "fine".
+# repository in one shape and asserts the verdict, including the shape that must pass.
 
 
-def selftest_case(asset, name, *, index=(), write=(), strict_public=False, expect):
+def synthetic_state_asset():
+    table = [0] * 20_000
+    return json.dumps(dict(jar_sha1=PINNED_JAR_SHA1, minecraft="1.21.1",
+                           generated_by="gen_vanilla_data.sh (self-test fixture)",
+                           flags=table, luminance=table, light_block=table,
+                           collision_shapes=table, shapes=[[]])).encode()
+
+
+def selftest_case(asset, name, *, index=(), write=(), strict_public=False, missing=False, expect):
     with tempfile.TemporaryDirectory(prefix="provenance-selftest-") as tmp:
         root = Path(tmp)
         git(root, "init", "-q")
@@ -206,6 +215,8 @@ def selftest_case(asset, name, *, index=(), write=(), strict_public=False, expec
             if not target.exists():
                 target.write_text("planted\n")
             git(root, "add", "-f", path)
+        if missing:
+            (root / STATE_ASSET).unlink()
         failures, _ = check(root, strict_public=strict_public)
         ok = bool(failures) == expect
         print(f"  {'ok  ' if ok else 'FAIL'} {name}: {len(failures)} finding(s)")
@@ -215,15 +226,22 @@ def selftest_case(asset, name, *, index=(), write=(), strict_public=False, expec
 
 
 def selftest(root):
-    asset = (root / STATE_ASSET).read_bytes()
-    if not asset:
-        raise Unrunnable("no state asset to seed the self-test with")
+    try:
+        asset = (root / STATE_ASSET).read_bytes()
+    except FileNotFoundError:
+        asset = synthetic_state_asset()
 
     def case(name, **kwargs):
         return selftest_case(asset, name, **kwargs)
 
     results = [
         case("a clean tree passes", expect=False),
+        case("a strict export without a generated asset passes", missing=True,
+             strict_public=True, expect=False),
+        case("a missing unignored asset fails", missing=True, write=[(".gitignore", "")],
+             expect=True),
+        case("a missing tracked asset fails even if ignored", missing=True, index=[STATE_ASSET],
+             expect=True),
         case("a tracked pblocks.json fails", index=["assets/pblocks.json"], expect=True),
         case("a tracked resourcepack.zip fails", index=["resourcepack.zip"], expect=True),
         case("a new source that reads resourcepack.zip fails",

@@ -1,7 +1,7 @@
 # THIRD_PARTY.md — 第三者由来物の出所一覧 / Third-party provenance inventory
 
 > **これは事実の一覧です。法的な判断・結論ではありません。** 各ファイルを再配布してよいか、どのライセンスが適用されるかは、このドキュメントでは判断していません。
-> **This is an inventory of facts only. It is not a legal opinion** and does not assert the license or redistribution status of any file. (Revision note: the original version of this document changed nothing; a follow-up PR removed the Mojang-derived and Pumpkin-identical data files and replaced them with generated data, see §3, §5 and §9; a further PR renamed identifiers and replaced test tables, see §10.)
+> **This is an inventory of facts only. It is not a legal opinion** and does not assert the license or redistribution status of any file. See §1 for development versus export contents and LICENSING.md §5 for release blockers.
 
 - 対象リビジョン / Revision: `main` @ `ef6e14a` (+ #16 + この PR / this PR)
 - リポジトリのコード本体は Apache-2.0 ([LICENSE](LICENSE)。提案段階で、公開前の確認事項は [LICENSING.md](LICENSING.md) を参照。以前は MIT でした)。以下の表は、**リポジトリ内にコミットされているがオリジナルのコードではないもの**(または出所が文書化されていないもの)の一覧です。
@@ -17,25 +17,25 @@
 
 ## 1. コミット済みの非オリジナル資産 / Committed non-original files
 
-> **この PR 以降**: Mojang 由来のデータ (`datapacks/vanilla/`、`assets/block_states_1211.json`、`tests/data/biome_probe_1211.tsv`、`config_packets.bin`) と Mojang クラスの javap / マッピング抜粋、出所不明の `resourcepack.zip` は**コミットされていません**。下の該当行は削除・生成物化の記録です (§9)。
->
-> **追記 (2026-11-19, Stage F1 / P0-3 D1–D4)**: 現行のブランチは、上の記述のうち **Mojang 由来の生成物の多くをまだ追跡しています** (`datapacks/vanilla/**`、`config_packets.bin`、`assets/block_states_1211.json`、`tests/data/*_1211.tsv`)。追跡を外すのは D5 の作業で、この段階では「テストが読むデータを無条件に消さない」ことを優先しています。実際に何が追跡されているかは `git ls-files` を正とし、`tools/provenance_check.py --strict-public` が D5 の準備状態を検査します。この段階で**索引から実際に削除した**のは、Pumpkin とバイト一致していた 2 ファイルと出所不明の 1 ファイル (§3) だけです。
+> 開発ブランチはテスト用の生成データを一部追跡します。以下は開発ツリーの一覧です。
+> `tools/export_public_branch.sh --out ../mc-spine-public --verify` は §5 の生成物を除外して ignore し、開発履歴を継がない別リポジトリを作ります。
+> `tools/provenance_check.py --strict-public` は D5 の対象パスが未追跡かつ ignore 済みかを検査します。公開許可ではありません。
 
 | パス / Path | 内容・規模 / What & size | README の記述 | 出所 | 根拠・観察 (facts) |
 |---|---|---|---|---|
-| `datapacks/vanilla/` (旧: `data/minecraft/**` 1083 files + `biome_climate_tree.json` + `pack.mcmeta`) | **コミットから削除・生成物に変更 (§9)**。旧データは出所不明で、worldgen 部分の多くが 26.x 形式だった | Mojang 由来・MIT 対象外 | 削除済み。以後は手元の 1.21.1 jar から `gen_vanilla_data.sh` が生成 (783 JSON + pack.mcmeta, `.gitignore` 済み) | 履歴には旧データが残っています (この PR は履歴を書き換えません)。 |
+| `datapacks/vanilla/` | worldgen JSON・tag・構造テンプレート・biome tree | Mojang 由来 | `documented` | 開発用に追跡。`tools/vanilla_data/gen_vanilla_data.sh --verify` で目録を照合する (§5)。 |
 | `datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` | テスト用の小さな datapack (計 約25 files) | 記述なし | `unknown - owner to confirm` | テスト用途と思われるが、作成者の記録はない (`rectest`/`testpack` は `data/minecraft` 配下に1ファイルずつ持つ)。 |
 | `assets/blocks_1211.json` | ブロック物性 (1060 entries, 765,435 bytes, sha256 `7d1d95c4…c654`, `id/name/displayName/hardness/resistance/stackSize/diggable/material/...`) | Mojang 由来 | `documented` (下記) | **PrismarineJS/minecraft-data の `data/pc/1.21.1/blocks.json` とバイト単位で同一** (2026-10-25 に GitHub API で取得して `cmp` で確認。最終変更 commit `d56346a4e32d`, 2024-10-26)。minecraft-data は MIT (同リポジトリの README「License: MIT」。リポジトリ直下に LICENSE ファイルは無く、著作権者名の記載は見つからなかったため、ここでは作成していない)。README は「一部のデータは wiki.vg / minecraft.gamepedia.com から抽出」とも記載。帰属表示は [NOTICE](NOTICE) と README を参照。 |
-| `assets/block_states_1211.json` | 状態ごとの luminance / light_block / flags / full_sides と衝突形状 (dedup した `shapes` + 状態ごとの `collision_shapes`) | Mojang 由来 (jar の事実値) | `documented` | `tools/vanilla_data/gen_vanilla_data.sh` が 1.21.1 jar から生成し、`jar_sha1` を自分のフィールドに持つ (照合は `tools/provenance_check.py`)。**現行ブランチでは追跡**しており、`git ls-files` で確認できる。D5 で追跡を外す前提。 |
-| `tests/data/biome_probe_1211.tsv` | **コミットから外し、生成物のみ (`.gitignore`)** | 事実値 | `documented` | `gen_vanilla_data.sh` が生成し、`worldgen.rs` のテストが全点を検証する。 |
-| `tests/data/biome_probe_ties_1211.tsv` | **コミットから外し、生成物のみ (`.gitignore`)**。leaf の range 端から作った同距離 tie の多い biome 検索結果 2,500 点 (seed 固定) | 事実値 | `documented` | 同じツールで再生成。tie をゲームと同じ子の走査順で解くことを `worldgen.rs` のテストが全点で検証する。 |
-| `tests/data/random_next_int_1211.tsv` | **コミットから外し、生成物のみ (`.gitignore`)**。ゲームの乱数クラスの `nextInt(bound)` 256 回分のハッシュ 1,116 行 (数値のみ) | 事実値 | `documented` | 同じツールで再生成。`generation_math.rs` のテストが全行を検証する。 |
+| `assets/block_states_1211.json` | 状態ごとの luminance / light_block / flags / full_sides と衝突形状 (dedup した `shapes` + 状態ごとの `collision_shapes`) | Mojang 由来 (jar の事実値) | `documented` | `tools/vanilla_data/gen_vanilla_data.sh` が 1.21.1 jar から生成し、`jar_sha1` を自分のフィールドに持つ (照合は `tools/provenance_check.py`)。**現行ブランチでは追跡**しており、`git ls-files` で確認できる。公開候補では除外。 |
+| `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv` | biome 検索結果・照合値 | 事実値 | `documented` | 生成対象だが開発 HEAD では未追跡かつ ignore されていない。 |
+| `tests/data/biome_probe_ties_1211.tsv` | 開発用に追跡。leaf の range 端から作った同距離 tie の多い biome 検索結果 2,500 点 (seed 固定) | 事実値 | `documented` | 同じツールで再生成。tie をゲームと同じ子の走査順で解くことを `worldgen.rs` のテストが全点で検証する。 |
+| `tests/data/random_next_int_1211.tsv` | 開発用に追跡。ゲームの乱数クラスの `nextInt(bound)` 256 回分のハッシュ 1,116 行 (数値のみ) | 事実値 | `documented` | 同じツールで再生成。`generation_math.rs` のテストが全行を検証する。 |
 | `resourcepack.zip` (旧: 345 bytes, `pack.mcmeta` + 72 B の `stone.png`) | **索引から削除 (`git rm`)**。サーバーは `resourcepack.zip` が無ければリソースパックを配信しない (任意機能) ので、再生成しない。ローカルで使う場合だけ利用者が作業ディレクトリに置く | — | 削除済み | 出所不明 (Mojang のテクスチャかは未確認) だったため。`tools/provenance_check.py` が「追跡または `src/`・`tests/` から参照されたら失敗」する。`src/main.rs` の任意機能の読み取り 2 か所だけを宣言付きで許している (§1 追記)。 |
-| `config_packets.bin` (旧: 105,095 bytes) | **コミットから外し、生成物のみ (`.gitignore`)** (§9) | Mojang 由来 | 生成手順あり: `tools/vanilla_data/capture_config_packets.py` | 手元の 1.21.1 jar から実サーバーを一時起動して Configuration フェーズを記録する (`--accept-eula` 必須)。旧ファイルとは tag パケットの registry の並びだけが異なる (同サイズ、registry data は先頭から一致)。 |
+| `config_packets.bin` (旧: 105,095 bytes) | 開発用に追跡 (§9) | Mojang 由来 | 生成手順あり: `tools/vanilla_data/capture_config_packets.py` | 手元の 1.21.1 jar から実サーバーを一時起動して Configuration フェーズを記録する (`--accept-eula` 必須)。旧ファイルとは tag パケットの registry の並びだけが異なる (同サイズ、registry data は先頭から一致)。 |
 | `evidence/gameplay/**/*.javap.txt` (旧 6 files) | **削除** (§9) | — | 削除済み | Mojang クラスの逆アセンブルは再配布しない。`tools/bytecode_probe.sh <class>` が手元の jar と公式マッピングから同じ出力を作る。 |
 | `evidence/gameplay/**/*.mapping.txt`, `evidence/gameplay/light-update/mappings.txt` (旧 3 files) | **削除** (§9) | — | 削除済み | Mojang 公式マッピングの抜粋は再配布しない。`tools/bytecode_probe.sh` が利用者の手元のマッピングを読む。 |
 | `evidence/foundation/audit-snapshots/main.*.rs` (4 files) | 過去の自作 `src/main.rs` のスナップショット | (第三者物ではない) | `documented` | 同ディレクトリの README が由来と sha256 を記載。第三者由来ではなく、このリポジトリの自作コードの旧版です。`AUDIT_WIRE.md` / `SECURITY_NOTES.md` から参照されています (削除していません)。 |
-| `src/brigadier.rs` (Rust 移植、約 2,400 行) | Mojang の Brigadier 1.3.10 (MIT) のコア (StringReader / コマンド木 / dispatcher / context / suggestion / 基本引数型) を Rust に翻訳したもの。**Java のソースは同梱していない** | 記述なし (issue #51 slice 1 で追加) | `documented` (下記 §11) | 上流 `https://github.com/Mojang/brigadier` の commit `b5419b186e4882290a188d11d6e661d4f56bd8fd` (2024-08-07) を参照。MIT の著作権表示は上流 LICENSE のまま「Copyright (c) Microsoft Corporation」。NOTICE に MIT 全文と帰属を記載。参照クローンは `/home/yuu/mc-spine-local/reference/brigadier-1.3.10/` に置き、リポジトリには含めない。 |
+| `src/brigadier.rs` (Rust 移植) | Mojang の Brigadier 1.3.10 (MIT) のコア (StringReader / コマンド木 / dispatcher / context / suggestion / 基本引数型) を Rust に翻訳したもの。**Java のソースは同梱していない** | 記述なし (issue #51 slice 1 で追加) | `documented` (下記 §11) | 上流 `https://github.com/Mojang/brigadier` の commit `b5419b186e4882290a188d11d6e661d4f56bd8fd` (2024-08-07) を参照。MIT の著作権表示は上流 LICENSE のまま「Copyright (c) Microsoft Corporation」。NOTICE に MIT 全文と帰属を記載。参照クローンは `/home/yuu/mc-spine-local/reference/brigadier-1.3.10/` に置き、リポジトリには含めない。 |
 | `*.storyboard.png` (リポジトリ直下 6 files, `evidence/gameplay/protocol-lifecycle/spine_proto.storyboard.png`) | 図 | 記述なし | `unknown - owner to confirm` | 作成方法の記録は未確認 (自作図と思われる)。 |
 
 ## 2. Rust 依存クレートのライセンス / Rust dependency licenses
@@ -178,7 +178,7 @@ Pumpkin (GPL-3.0) のコードは読んでいない・参照していない。
 1. (削除済み) `assets/pblocks.json`, `assets/properties.json`, `datapacks/vanilla/multi_noise_biome_tree.json` は、どこから入手しましたか? 履歴には残っているので、来歴の確認は引き続き必要です。 Pumpkin のリポジトリからですか、Mojang のリリースから自分で生成したものですか、第三者の配布物ですか? (§3 のとおり Pumpkin のファイルとバイト単位で同一です。)
 2. (調査済み) `assets/blocks_1211.json` は PrismarineJS/minecraft-data (MIT) の `data/pc/1.21.1/blocks.json` とバイト単位で同一でした (§1)。入手元がそこで正しいか確認してください。
 3. (対応済み・§9) 旧 `datapacks/vanilla/data/**` (1083 files) は削除し、1.21.1 jar から生成する形にしました。履歴に残る旧データの出所は引き続き不明です。
-4. (対応済み・§9) `config_packets.bin` は削除し、実サーバーのキャプチャを再現するスクリプトにしました。
+4. (対応済み・§9) `config_packets.bin` は実サーバーから再取得でき、開発ブランチでは追跡しています。
 5. (対応済み・§9) javap / マッピング抜粋は削除しました (`tools/bytecode_probe.sh` で再生成できます)。履歴には残っています。
 6. (対応済み・§9) `resourcepack.zip` は削除しました (任意機能)。履歴には残っています。
 7. `datapacks/{modtest,rectest,spinetest,tagtest,testpack}` と `*.storyboard.png` は自作ですか?
@@ -190,8 +190,7 @@ Pumpkin (GPL-3.0) のコードは読んでいない・参照していない。
 
 ## 5. 生成データと再生成ツール / Generated data and how to regenerate it
 
-方針 / Decision (この PR で変更 / changed in this PR): 生成物は**コミットしない** (`.gitignore`)。Mojang 由来のデータをリポジトリに置かず、利用者が手元の jar から1コマンドで生成する。ビルド・テストの前に1回 `gen_vanilla_data.sh` が必要 (README「セットアップ」)。(以前の版はこの節で「コミットする」としていた。)
-Decision (changed): generated files are **not committed**; a fresh clone runs the generator once before `cargo test`.
+開発ブランチでの追跡状況は §1 の通り。公開候補はこれらの生成物を含まないので、ビルド・実行前に利用者が手元で生成します（手順: [開発ガイド](docs/development.md)）。
 
 ```
 tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar [--mappings DIR | --fetch-fabric-mappings]
@@ -202,7 +201,7 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar [--mappi
 - 生成器の検査 / Generator checks: `verify_pack.py` は data generator 由来 1,084 JSON と jar メンバー 1,263 個の**件数・JSON 妥当性・`members_sha256` 全件一致・予期しないディレクトリ/ファイルが無いこと**を検査し、1 つでも外れたら exit 1 でツリーを差し替えない。jar 無しでも走るので CI で使える (`gen_vanilla_data.sh --verify`)。
 - 難読名の解決: この jar は難読化されており、Mojang のマッピングは使っていない。代わりに Fabric の `intermediary-1.21.1-v2` と Yarn `1.21.1+build.3-v2` (どちらも CC0-1.0, maven.fabricmc.net) を使い、**実行時に**クラス・メンバー名を引く。sha256 を固定: intermediary `e8bd6a4c39e235ee2dc73063558610775c72a2572fa0c6b32915b149074012a6`、Yarn `4ec570889585cb958b7d3c9dd94ce4064b16ab797dffec152bc8486c59a4010b`。これらは**ツールの入力**であり、リポジトリには含めない。
 - 検証 (cargo test): `block_registry` / `registry_tests` が全 26,684 状態を独立に読み直して照合。`worldgen` が (a) 7,593 + 5 leaves が 1.21.1 のみの biome であること (pale_garden / dappled_forest / sulfur_caves が無いこと)、(b) ゲーム自身の検索結果 6,000 点のうち等距離の同点でない 5,415 点すべてが一致することを検査する (同点 585 点は、ゲーム内でも検索の履歴依存で答えが決まるため集計のみ)。
-- 旧データとの差: 旧 pblocks 由来の状態値と新ファイルは全 26,684 状態で一致 (差 0)。biome は旧 overworld tree の 133 leaf (`dappled_forest` 92 / `pale_garden` 40 / `sulfur_caves` 1) が 1.21.1 には存在せず、対応する位置は `plains` (92) と `dark_forest` (40) になる。衝突形状は 25,534 の対応可能な状態で 1 件だけ差があり、その 1 件は旧ファイルが誤っていた (§3 追記)。
+- 旧データとの差: 対応可能な状態での比較範囲・差は §3 を参照。biome は旧 overworld tree の 133 leaf (`dappled_forest` 92 / `pale_garden` 40 / `sulfur_caves` 1) が 1.21.1 には存在せず、対応する位置は `plains` (92) と `dark_forest` (40) になる。衝突形状は 25,534 の対応可能な状態で 1 件だけ差があり、その 1 件は旧ファイルが誤っていた (§3 追記)。
 - 含まれるもの / Included: 衝突形状 (`shapes` + `collision_shapes`、1.21.1 の 26,684 状態で `getCollisionShape(...).isEmpty()` と全件一致)。
 - 含まれないもの: 選択形状 (`outline_shapes`、描画専用で生成側に消費者が無い)、摩擦・速度係数、`blast_resistance`、`instrument`、`map_color`、`piston_behavior` (旧 pblocks にあったが、Rust 側の消費者は無かった)。必要になったら `Extract.java` を拡張する。
 
@@ -248,7 +247,7 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar [--mappi
 
 ## 9. Mojang 由来データのコミット廃止 / Removing committed Mojang-derived data
 
-この PR (#20 の上に積んだ変更) で、Mojang 由来または出所不明だったデータと資料をコミットから外した。**履歴には残っている** (この PR は履歴を書き換えない。公開前に履歴の扱いを決める必要がある、README の残課題を参照)。
+以下は #20 の上で行った変更の履歴であり、現行の追跡状況 (§1) ではない。当時、Mojang 由来または出所不明だったデータと資料をコミットから外した。**履歴には残っている** (この PR は履歴を書き換えない。公開前に履歴の扱いを決める必要がある、README の残課題を参照)。
 
 | 対象 | 変更 |
 |---|---|
@@ -257,7 +256,7 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar [--mappi
 | `config_packets.bin` | コミットから外し、`tools/vanilla_data/capture_config_packets.py` で生成 (実 1.21.1 サーバーを一時起動して Configuration フェーズを記録)。旧ファイルと同サイズ (105,095 bytes) で、registry data は先頭から一致、tag パケットの registry の並びだけが異なった。 |
 | `resourcepack.zip` | 削除 (サーバーは無ければ配信しない任意機能)。`.gitignore` に追加。Stage F1 で `git rm` により索引からも削除し、`tools/provenance_check.py` が再混入を止める。 |
 | `evidence/gameplay/**` の javap 6 ファイル + マッピング抜粋 3 ファイル | 削除。`tools/bytecode_probe.sh` が再生成する。`receipt.json` の sha256 固定 (javap / mappings / `config_packets.bin`) は外し、`generated_inputs_note` を足した。 |
-| `assets/block_states_1211.json`, `tests/data/biome_probe_1211.tsv`, `datapacks/vanilla/{biome_climate_tree.json,pack.mcmeta}` | コミットから外し、`.gitignore` へ (#19 では「コミットする」方針だった。§5 を更新)。現行ブランチは `assets/block_states_1211.json` を**追跡**しており (D5 で外す)、`biome_climate_tree.json` は生成対象から外した (消費者は `multi_noise_biome_tree.json` だけ)。 |
+| `assets/block_states_1211.json`, `tests/data/biome_probe_1211.tsv`, `datapacks/vanilla/{biome_climate_tree.json,pack.mcmeta}` | コミットから外し、`.gitignore` へ (#19 では「コミットする」方針だった。§5 を更新)。現行ブランチは `assets/block_states_1211.json` を**追跡**しており (公開候補では除外)、`biome_climate_tree.json` は生成対象から外した (消費者は `multi_noise_biome_tree.json` だけ)。 |
 | `tools/vanilla_tags_sync.py` | 削除 (リポジトリのタグを jar と同期する道具で、データ自体を jar から生成するようになったため不要)。 |
 
 **Pumpkin との照合 (再確認、`b0c48b2` の全ファイルの git blob sha と比較)**: 旧 HEAD で一致したのは `tags/block` の 13 ファイルのみ (他のパスはなし)。この PR の HEAD にコミットされている全ファイルで一致は 0。生成された 784 ファイルのうち 6 個 (`tags/block/{trail_ruins_replaceable,tall_flowers,incorrect_for_diamond_tool,incorrect_for_netherite_tool,enchantment_power_provider,concrete_powder}.json`, 18–652 bytes) は、Pumpkin の短い JSON とバイト一致する。これは jar が出力する短いリストが同じ内容になっただけで (例: `enchantment_power_provider` は `["minecraft:bookshelf"]` で、Pumpkin の `c:bookshelves` と同一)、コミットされず、利用者の手元で生成される。
@@ -273,9 +272,9 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar [--mappi
 | 識別子の改名 (src) | Pumpkin の識別子と一致していたものを、vanilla の名前、なければこのリポジトリ独自の名前に改名した。`hash_block_pos`→`mth_get_seed`、`java_hash`→`string_hash_code`、`build_octaves`→`octave_table`、`legacy_fbm`→`legacy_octave_perlins`、`resolve_rule`→`load_named_rule`、aquifer の `aq_*` 関数と定数、`fetch_skin`→`load_skin_properties`、`flush_block_updates`→`apply_queued_block_updates`、`reschedule`→`requeue`、`CarveRun`→`CarveSpan`、など。以前の一致範囲内のローカル変数名とコメントの言い回しも置き換えた。 |
 | tree / cached_lookup / world_rng / main | `tree.rs` の forking 幹 (`lay` クロージャで行ごとに配置、乱数の消費順序は不変) と fancy 幹のローカル名、`cached_lookup.rs` の Default、`world_rng.rs` のテストの反復、`main.rs` の引数処理を書き直した。`tree.rs` の型名・feature 名は vanilla のデータパックの `tree` configured feature の名前に従う (そのまま)。 |
 | 削除 | `normal_new` (未使用)、`noise_id` の旧スキーマ分岐 (1.21.1 のデータには存在しない形)、`main.rs` の `WGDIFF` デバッグ出力 (他実装から取った参照値を含んでいた)。 |
-| テスト値 | `AQ_NB` ほか 7 個の aquifer 表 (約 780 行)、`biome_vectors` の固定値、xoroshiro のテストベクタ (他実装のテストの数値と一致していた) を削除。代わりに `tools/vanilla_data/Extract.java` の `Vectors` が、利用者の 1.21.1 jar のゲーム本体の関数 (aquifer の `getFluidLevel` ほか、NoiseRouter、MultiNoiseSampler、Xoroshiro) をランダムな問い合わせで呼び、`tests/data/vanilla_vectors_1211.tsv` (git 管理外) に書き出す。テスト (`aquifer_vectors`, `biome_vectors`, `climate_functions_match_the_games_router`, `xoroshiro_parity`) がその値と照合する。 |
+| テスト値 | `AQ_NB` ほか 7 個の aquifer 表 (約 780 行)、`biome_vectors` の固定値、xoroshiro のテストベクタ (他実装のテストの数値と一致していた) を削除。代わりに `tools/vanilla_data/Extract.java` の `Vectors` が、利用者の 1.21.1 jar のゲーム本体の関数 (aquifer の `getFluidLevel` ほか、NoiseRouter、MultiNoiseSampler、Xoroshiro) をランダムな問い合わせで呼び、`tests/data/vanilla_vectors_1211.tsv` (開発 HEAD では未追跡) に書き出す。テスト (`aquifer_vectors`, `biome_vectors`, `climate_functions_match_the_games_router`, `xoroshiro_parity`) がその値と照合する。 |
 | 旧表との差 | 旧表の 1270 個の aquifer 値と biome の 2 ベクタは、jar から得たゲームの値と全て一致した (期待値の変更なし)。新しいランダム問い合わせでの差は f32 (ゲーム) と f64 (このコード) の丸めのみ: biome の気候パラメータで 1 単位 (180 個中 1 個、depth 6177 と 6178)、density の最大差 4.08e-8。テストの許容誤差をそれに合わせて明記した。 |
-| 生成物 | `tests/data/vanilla_vectors_1211.tsv` を追加 (`.gitignore` 済み、NOTICE に記載)。 |
+| 生成物 | `tests/data/vanilla_vectors_1211.tsv` を追加 (公開候補で ignore、NOTICE に記載)。 |
 | 残る言及 | README / THIRD_PARTY.md / NOTICE の帰属、`tick_queue.rs` の設計参照 (設計のみ、issue #3)、`specs/` と `DESIGN.md` の設計参照、`evidence/foundation/provenance/` の 2026-10-21 の測定記録。ブロック名 `pumpkin` / `carved_pumpkin` は Minecraft の名前。 |
 | `evidence/time-contract/**/*.log` ほか | 一部の AI レビューのログ (Pumpkin に触れた引用を含む) は `main` にのみ存在し、このブランチの系列 (#16→#19→#20→#22) では #20 で削除済み (`evidence/time-contract/REDACTION.md` 参照)。公開リポジトリから消えるのは `main` を置き換える・書き換えるときで、この PR は `main` に触れない。 |
 

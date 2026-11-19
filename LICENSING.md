@@ -4,7 +4,7 @@
 > **Status: Apache-2.0 は「提案」です。§5 の項目が解消するまで、Apache-2.0 / MIT を確定・公開しないでください。** 解消できない項目があれば GPL-3.0 になる可能性があります (§5)。
 > 作成: 2026-10-26 (Asia/Tokyo)。対象: `chore/generate-vanilla-data-locally` (#22) の上。
 
-## 1. 現状の棚卸し / What the repo said before this change
+## 1. 変更前の記録 / What the repo said before this change
 
 | 場所 | 内容 | 不整合 |
 |---|---|---|
@@ -48,7 +48,9 @@
 `assets/blocks_1211.json` は上流の `data/pc/1.21.1/blocks.json` とバイト一致 (確認済み)。README に MIT と書かれているが LICENSE ファイルと著作権者名が無く、「一部は wiki.vg / minecraft.gamepedia.com 由来」との注記がある。NOTICE に帰属を記載済み (維持)。wiki 由来部分の扱い (wiki の CC BY-SA の可能性) は上流に確認が必要。取得スクリプト化すればコミットから外せる (A' に近づく)。
 
 ### (d) Mojang / Minecraft
-Mojang 由来のもの (worldgen JSON・ブロック状態・biome tree・`config_packets.bin`・javap・マッピング) はコミットされておらず、利用者の jar から生成する (#22)。`--accept-eula` は利用者の EULA 同意を意味する。公式マッピング (`server.txt`) は `bytecode_probe.sh` の入力として利用者が用意する。Minecraft EULA / Usage Guidelines の現行文面と、「Mojang のデータ由来のコードを Apache-2.0 で出すこと」「`net.minecraft.*` と同名の空の型」(名前のみ・コードなし) の扱いは**この変更では確認していません** (確認項目: §5)。
+開発ブランチは jar 由来の datapack、状態表、テスト TSV、config_packets.bin を一部追跡している (内訳は THIRD_PARTY.md §1)。
+
+`tools/export_public_branch.sh --out ../mc-spine-public --verify` は、対象パスを含まない単一のルートコミットを別のローカルリポジトリに作る。これは §5 の判断を代行しない。除外した生成物は利用者の jar から再生成でき、`tools/vanilla_data/gen_vanilla_data.sh --verify` は生成済み datapack を検査する。`--accept-eula` は利用者の EULA 同意を意味する。公式マッピング (`server.txt`) は `bytecode_probe.sh` の入力として利用者が用意する。Minecraft EULA / Usage Guidelines の現行文面と、「Mojang のデータ由来のコードを Apache-2.0 で出すこと」「`net.minecraft.*` と同名の空の型」(名前のみ・コードなし) の扱いは**この変更では確認していません** (確認項目: §5)。
 **履歴には旧データ・javap・マッピングが残っている** (§5)。
 
 ### (e) 出所が未解決の項目 → §5。
@@ -72,7 +74,7 @@ Mojang 由来のもの (worldgen JSON・ブロック状態・biome tree・`confi
 - **A': mc-spine は自作のブリッジ/shim だけを持ち、NeoForge / Fabric / Mixin / Mojang の中身は一切再配布しない (利用者が用意・取得)**。
 - **B: JVM 側のブリッジ/shim/adapter を別リポジトリに分ける**。
 
-**現状は A' にすでに合っている** (確認した事実): jar / class / 上流ソースのコミットなし。`.cache/` `.build/` は `.gitignore` 済み (今回 `*.jar` `*.class` も追加)。`compat/**` の Java は自作で、NeoForge / Fabric のコードを写していない (import のみ)。`compat/*/java/net/minecraft/**` は名前だけの空の型で Mojang のコードは含まない。Mojang の jar・マッピング・生成データは `gen_vanilla_data.sh` で利用者が作る。
+**現状は A' にすでに合っている** (確認した事実): jar / class / 上流ソースのコミットなし。`.cache/` `.build/` は `.gitignore` 済み (今回 `*.jar` `*.class` も追加)。`compat/**` の Java は自作で、NeoForge / Fabric のコードを写していない (import のみ)。`compat/*/java/net/minecraft/**` は名前だけの空の型で Mojang のコードは含まない。jar とマッピングは利用者が用意する入力で、生成データの扱いは §2d の通り。
 A' として残る作業: (1) 上の「再配布しない」を CONTRIBUTING / NOTICE / README に明記 (今回実施)。(2) `build.py` が Maven から自動取得するのは**利用者が build を実行したとき**なので許容範囲 (SHA-256 固定)。(3) Seed Protect jar は「テスト入力として取得するだけ・再配布しない」(ライセンス表示が jar と Modrinth で食い違う)。(4) **リリース成果物 (zip / Docker / CI artifact) に jar を入れない**。入れる場合は LGPL の義務が出るので B か同梱表記を再検討。(5) 任意: CI に「`*.jar`, `net/neoforged`, `net/fabricmc` がコミットされていない」検査を足す。
 
 | | A | A' | B |

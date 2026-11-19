@@ -45,4 +45,4 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 コードは Apache-2.0（[LICENSE](LICENSE)、[NOTICE](NOTICE)）として**提案**されていますが、[LICENSING.md](LICENSING.md) §5 の項目が解消するまで確定していません。公開可能・リリース可能という状態ではありません。
 
-貢献の条件は inbound = outbound（Apache-2.0 §5）、DCO の `Signed-off-by`、GPL／AGPL／LGPL のコード・データを写さない、Mojang由来データや第三者jarを追加しない、です。現行ツリーには方針文書と食い違う追跡データが残っており、その扱いは未解決です。**新しいデータを追加せず**、[CONTRIBUTING.md](CONTRIBUTING.md) の「データと来歴」に従ってください。
+貢献の条件は inbound = outbound（Apache-2.0 §5）、DCO の `Signed-off-by`、GPL／AGPL／LGPL のコード・データを写さない、Mojang由来データや第三者jarを追加しない、です。開発ブランチはテスト用の生成データを追跡します。`tools/export_public_branch.sh --out ../mc-spine-public --verify` は、対象データと開発履歴を含まないローカルの審査用コピーを作ります（公開はしません）。**新しいデータを追加せず**、[CONTRIBUTING.md](CONTRIBUTING.md) の「データと来歴」に従ってください。

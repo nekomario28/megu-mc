@@ -1,7 +1,7 @@
 mc-spine
 Copyright 2026 nekomario28
 
-mc-spine's own code is licensed under the Apache License, Version 2.0 (see LICENSE). This
+LICENSE and Cargo.toml specify Apache-2.0 for mc-spine's own code, subject to LICENSING.md §5. This
 file records attributions for third-party material that is committed in this repository, and
 lists the components that are fetched or supplied at setup time but are NOT distributed here.
 The full inventory, including items whose origin is not yet documented, is in THIRD_PARTY.md.
@@ -56,17 +56,18 @@ upstream repository has no LICENSE file and no named copyright holder at the tim
 writing, so none is reproduced here. The upstream README also notes that some of the data
 was extracted from wiki.vg and minecraft.gamepedia.com.
 
-Minecraft data (generated locally, not committed)
-------------------------------------------------------------------------------------
-Derived from Minecraft, (c) Mojang Studios / Microsoft. This repository does not contain
-Mojang data. tools/vanilla_data/gen_vanilla_data.sh generates, from the user's own
-Minecraft 1.21.1 server jar (sha1 59353fb40c36d304f2035d51e7d6e6baa98dc05c), the files
-datapacks/vanilla/** (worldgen JSON and block tags), assets/block_states_1211.json,
-tests/data/biome_probe_1211.tsv, tests/data/vanilla_vectors_1211.tsv,
-tests/data/biome_probe_ties_1211.tsv, tests/data/random_next_int_1211.tsv (the game's answers
-to random test questions) and (with --accept-eula) config_packets.bin. They are
-git-ignored, are not covered by mc-spine's Apache-2.0 license, and must not be redistributed.
-The jar is not distributed here.
+Minecraft data (development checkout versus public export)
+---------------------------------------------------------
+Derived from Minecraft, (c) Mojang Studios / Microsoft; not covered by mc-spine's
+Apache-2.0 license. Do not redistribute these outputs or the jar. The development
+branch tracks datapacks/vanilla/, assets/block_states_1211.json, config_packets.bin,
+tests/data/biome_probe_ties_1211.tsv and tests/data/random_next_int_1211.tsv.
+tools/vanilla_data/gen_vanilla_data.sh generates these and tests/data/biome_probe_1211.tsv
+and tests/data/vanilla_vectors_1211.tsv from the user's own 1.21.1 server jar
+(sha1 59353fb40c36d304f2035d51e7d6e6baa98dc05c). Capturing config_packets.bin
+requires the user's explicit --accept-eula. --verify checks the datapack without a jar.
+tools/export_public_branch.sh omits all these paths and ignores local regenerated copies
+in a new repository with no development history. Passing its audit is not release clearance.
 
 Tool inputs that are not distributed
 ------------------------------------

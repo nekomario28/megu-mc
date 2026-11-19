@@ -48,6 +48,7 @@ python3 tests/chunk_triage_test.py
 python3 tests/port_triage_test.py
 python3 tests/structure_capture_test.py
 python3 tests/p0_2_audit_test.py
+python3 tests/public_export_test.py
 
 echo "== module layering"
 python3 tests/layers_gate_test.py

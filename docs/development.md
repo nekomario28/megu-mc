@@ -17,9 +17,9 @@
 
 ### 2.1 3つの種類
 
-| 種類 | 例 | 現行HEADでの状態 |
+| 種類 | 例 | 開発ブランチでの状態 |
 |---|---|---|
-| 追跡されている入力 | `assets/block_states_1211.json`、`assets/*_1211.bin`、`datapacks/vanilla/`、`config_packets.bin`、`tests/data/` のfixture | クローンしただけでビルド・一部テストに使える。`include_bytes!` でコンパイル時に読むものもある（`assets/block_states_1211.json` は `762f312` で jar 生成出力へ切替済み） |
+| 追跡されている入力 | `assets/block_states_1211.json`、`assets/*_1211.bin`、`datapacks/vanilla/`、`config_packets.bin`、`tests/data/` のfixture | クローンしただけでビルド・一部テストに使える。`include_bytes!` でコンパイル時に読むものもある（`tests/data/biome_probe_ties_1211.tsv`・`tests/data/random_next_int_1211.tsv` も追跡。`assets/block_states_1211.json` は `762f312` で jar 生成出力へ切替済み） |
 | 生成器が作るが、このHEADには無いもの | `tests/data/biome_probe_1211.tsv`、`tests/data/vanilla_vectors_1211.tsv` | 無い。`tools/` 側の生成・照合が対象 |
 | 利用者が任意で置くもの（任意機能の入力） | `resourcepack.zip` | 無ければリソースパックを配信しない。`762f312` で追跡から削除し、`tools/provenance_check.py` で再混入を禁止している |
 
@@ -60,16 +60,21 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-
 [tools/README.md](../tools/README.md) にあります。どのコマンドを走らせるかは
 [tests/verify.sh](../tests/verify.sh) が正本です。
 
-### 2.4 追跡データと方針文書の食い違い（未解決）
+### 2.4 開発ツリーと公開候補を分ける
 
-これは**ライセンス判断ではなく、現行HEADの事実**です。判断は [LICENSING.md](../LICENSING.md) §5 と
-[THIRD_PARTY.md](../THIRD_PARTY.md) §3・§9 に委ねます。
+開発ブランチの入力は削除しません。追跡の有無は `git ls-files`、生成済み datapack の検査は
+`tools/vanilla_data/gen_vanilla_data.sh --verify` で確認できます（jar 不要）。
 
-| 分類 | 現行HEADで追跡されているパス | 方針文書との差 |
-|---|---|---|
-| Mojangのjar由来の生成データ | `datapacks/vanilla/`（worldgen JSON・tag・構造物template）、`assets/block_states_1211.json`、`config_packets.bin`、`tests/data/*.tsv` / `*.tsv.gz`（native captureを含む）、`assets/*_1211.bin`、`assets/feature_order_1211.json` | LICENSING §2d・THIRD_PARTY §1/§5/§9・生成器のヘッダは「コミットしない・`.gitignore`・手元で生成」と記録する。Stage F1 D5 の整理まで追跡が残る（`tools/provenance_check.py --strict-public` で一覧化） |
-| THIRD_PARTY §3 が Pumpkin 同値と記録していた旧 asset | **解消済み（`762f312`）** — `assets/pblocks.json`・`assets/properties.json` は追跡削除済み、`tools/provenance_check.py` が再混入を拒否 | `datapacks/vanilla/multi_noise_biome_tree.json` も jar 生成の `biome_climate_tree.json` へ切替済み |
-| 出所不明 / テストパック | `resourcepack.zip` は **`762f312` で削除済み**（再混入禁止）。`*.storyboard.png`、`datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` は残存 | §1/§9 と D5 で最終整理予定 |
+```sh
+tools/export_public_branch.sh --out ../mc-spine-public --verify
+```
+
+このコマンドは HEAD の追跡ファイルから、D5 対象の datapack・状態表・4 TSV・パケットを除いた
+単一コミットの別リポジトリを作ります。出力先は開発ツリーの外の新規または空ディレクトリにしてください。
+既定のブランチ名は `public-export`。`--from-worktree` はコミット前の検査専用で、索引にあるパスの作業コピーを読みます。
+元の履歴は変更せず、push もしません。候補では `--strict-public` が通り、再生成前の `dev_check.py` は
+ビルド・実行時入力が不足して exit 1 になるのが正常です。ビルドするには §2.2 に従ってください。
+この検査は他の fixture や画像等の出所を認定しません。[LICENSING.md](../LICENSING.md) §5 の確認が別途必要です。
 
 貢献者へのルール:
 
