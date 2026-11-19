@@ -1066,7 +1066,7 @@ pub struct Gen {
     feat_ord: std::collections::VecDeque<(i32, i32)>,
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
-    pop_done: HashSet<(i32, i32)>,
+    pub(crate) pop_done: HashSet<(i32, i32)>,
     /// The window a recorded population plan covers (`None` outside a planned run): the
     /// chunks the input decorates. Native decorated three rings around the request and the
     /// plan keeps one (`parse_population_order`), so a chunk outside this box is one native
@@ -1101,7 +1101,7 @@ pub struct Gen {
     // Sources reconstructed after loading must recreate terrain but not enqueue
     // the generation ticks a second time.
     restored_tick_sources: HashSet<(i32, i32)>,
-    suppress_generated_ticks: bool,
+    pub(crate) suppress_generated_ticks: bool,
     /// `ChunkAccess`'s carve stage: one record per chunk, holding the latch `begin_carve`
     /// reads and both outputs the stage writes (see `CarveStage`). **Nothing else may
     /// hold a carve claim or a post-carve WG value** — three containers with three
@@ -1115,6 +1115,11 @@ pub struct Gen {
     pub(crate) payload_sources: HashSet<(i32, i32)>,
     /// Decoration region whose lexicographic scan order to follow (`MC_SPINE_POP_REGION`).
     pop_region: Option<(i32, i32, i32, i32)>,
+    /// A3-a dispatch hand-off. `populate_in_order` records the pending chunks here when a
+    /// multi-chunk feature run can be parallelised; the first `feature::populate` call takes
+    /// the batch and drives it. `worldgen` cannot import `feature` (layer policy), so the
+    /// higher layer pulls the work instead of being called from here.
+    pub(crate) a3a_dispatch: Option<Vec<(i32, i32)>>,
     // per column: (highest non-air + 1, highest solid + 1) written by the feature layer
     feat_hm: HashMap<(i32, i32), (i32, i32)>,
     // Each generator owns its pending ticks; only the active world's handles are published.
@@ -2409,6 +2414,7 @@ impl Gen {
                     None
                 }
             }),
+            a3a_dispatch: None,
             memo: HashMap::new(),
             mineshaft_spawners: HashSet::new(),
             payload_sources: HashSet::new(),
@@ -6108,7 +6114,7 @@ impl FromIterator<Option<SurfMat>> for SurfMatsCell {
     }
 }
 
-type GeneratedTick = ((i32, i32, i32), u32);
+pub(crate) type GeneratedTick = ((i32, i32, i32), u32);
 type PendingGeneratedTicks = (Vec<GeneratedTick>, HashSet<GeneratedTick>);
 
 /// Per-world pending ticks. Sharing these handles with runtime avoids taking the generator
@@ -7156,6 +7162,35 @@ impl Gen {
         fq.0 = fluids;
     }
 
+    /// Take this generator's pending feature ticks. A wave worker fills its own queues; the
+    /// owner appends them in population order at the wave commit (A3-a), which keeps the tick
+    /// order identical to the serial loop instead of interleaving workers arbitrarily.
+    pub(crate) fn take_generated_ticks(&mut self) -> (Vec<GeneratedTick>, Vec<GeneratedTick>) {
+        (
+            drain_generated_ticks(&self.generated_ticks.leaves),
+            drain_generated_ticks(&self.generated_ticks.fluids),
+        )
+    }
+
+    /// Append ticks a wave worker produced, preserving their order and the dedup set.
+    pub(crate) fn append_generated_ticks(
+        &mut self,
+        leaves: Vec<GeneratedTick>,
+        fluids: Vec<GeneratedTick>,
+    ) {
+        for (queue, ticks) in [
+            (&self.generated_ticks.leaves, leaves),
+            (&self.generated_ticks.fluids, fluids),
+        ] {
+            let mut q = queue.lock().unwrap();
+            for tick in ticks {
+                if q.1.insert(tick) {
+                    q.0.push(tick);
+                }
+            }
+        }
+    }
+
     /// Per-Gen cached chunk column builder (terrain layer only — no features).
     /// A generator over the same immutable inputs with empty caches: the per-job scratch
     /// for terrain work (`specs/chunk-parallelism`, stage 2A). Every cache on `Gen` is a
@@ -7213,6 +7248,7 @@ impl Gen {
                     None
                 }
             }),
+            a3a_dispatch: None,
             mineshaft_spawners: HashSet::new(),
             payload_sources: HashSet::new(),
             feat_hm: HashMap::new(),
@@ -8497,6 +8533,13 @@ impl Gen {
             })
     }
 
+    /// Read-only view of a resident column. A3-a wave workers use this to answer terrain
+    /// reads from the owner's already-built columns without rebuilding them on the owner or
+    /// taking a lock; the `Arc` is immutable.
+    pub(crate) fn col_c_get(&self, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
+        self.col_c.get(&(cx, cz)).cloned()
+    }
+
     /// feature-layer lookup: runs the default population dispatch on demand, then
     /// returns the override state for (x,y,z) if a feature wrote one.
     pub(crate) fn feat_state(
@@ -8653,18 +8696,58 @@ impl Gen {
     }
 
     /// Claim before executing each source chunk, exactly once in caller order.
+    ///
+    /// Layer A3-a keeps this the single execution owner. With more than one pending chunk the
+    /// carver stage of the whole demand is pre-carved in one batch, and (for a large enough
+    /// window) the feature placement loops run in dependency-DAG waves on worker generators and
+    /// are committed here, in caller order. Every diagnostic/trace mode and every small or
+    /// explicitly ordered run takes the original serial arm, which is also the reference the
+    /// parallel arm is measured against.
     pub(crate) fn populate_in_order(
         &mut self,
         order: impl IntoIterator<Item = (i32, i32)>,
         mut populate: impl FnMut(&mut Gen, i32, i32),
     ) -> usize {
-        let mut executed = 0;
-        for (x, z) in order {
+        let list: Vec<(i32, i32)> = order.into_iter().collect();
+        // The return value is the number of distinct chunks this call decorated: duplicates
+        // in `order` claim once (as in the original loop), whether the serial or the A3-a
+        // arm ran them.
+        let mut distinct: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        for &(x, z) in &list {
+            if !self.pop_done.contains(&(x, z)) {
+                distinct.insert((x, z));
+            }
+        }
+        let executed = distinct.len();
+        let jobs = terrain_jobs();
+        // A generic `FnMut` callback cannot be analysed or sent to a worker. The one driver
+        // this layer is allowed to split is `feature::populate`; every other caller (unit
+        // fixtures counting callbacks, `POP_REGION` replay) stays on the original serial arm.
+        // The type name is a dispatch gate only: a false negative costs a optimisation, never
+        // correctness, and a false positive is ruled out by the explicit call sites.
+        let is_feature_driver = std::any::type_name_of_val(&populate).contains("feature::populate");
+        let gate = jobs > 1 && self.pop_region.is_none() && is_feature_driver;
+
+        if gate && list.len() >= 2 {
+            let mut pending: Vec<(i32, i32)> = Vec::with_capacity(list.len());
+            let mut seen = std::collections::HashSet::new();
+            for &(x, z) in &list {
+                if !self.pop_done.contains(&(x, z)) && seen.insert((x, z)) {
+                    pending.push((x, z));
+                }
+            }
+            if pending.len() >= 2 {
+                // `feature::populate` (the driver this call site was given) takes this batch
+                // on its first invocation and runs the pre-carve / wave schedule itself.
+                self.a3a_dispatch = Some(pending);
+            }
+        }
+
+        for (x, z) in list {
             if self.pop_done.insert((x, z)) {
                 self.suppress_generated_ticks = self.restored_tick_sources.contains(&(x, z));
                 populate(self, x, z);
                 self.suppress_generated_ticks = false;
-                executed += 1;
             }
         }
         executed
@@ -8808,6 +8891,51 @@ impl Gen {
     /// The marks of a promoted chunk, in mark order. Consumed once.
     pub(crate) fn take_shape_marks(&mut self, cx: i32, cz: i32) -> Vec<(i32, i32, i32)> {
         self.shape_marks.remove(&(cx, cz)).unwrap_or_default()
+    }
+
+    /// Drain every shape-mark bucket a wave worker filed directly on its generator (the
+    /// `markAboveForPostProcessing` and piece-writer paths file there rather than in `FC`).
+    /// A target bucket is written by at most one worker of a wave (the wave spacing keeps the
+    /// 3x3 write regions disjoint), so appending per bucket in the worker's own mark order is
+    /// the serial order.
+    pub(crate) fn take_all_shape_marks(
+        &mut self,
+    ) -> Vec<((i32, i32), Vec<(i32, i32, i32)>)> {
+        std::mem::take(&mut self.shape_marks).into_iter().collect()
+    }
+
+    /// Land a worker's direct shape marks on the owner, keeping each bucket's mark order.
+    pub(crate) fn merge_shape_marks(
+        &mut self,
+        marks: Vec<((i32, i32), Vec<(i32, i32, i32)>)>,
+    ) {
+        for (chunk, bucket) in marks {
+            self.shape_marks.entry(chunk).or_default().extend(bucket);
+        }
+    }
+
+    /// Merge a wave worker's feature-height maxima into the owner's. Max is associative, so
+    /// the order in which disjoint wave windows are merged cannot change the bound.
+    pub(crate) fn merge_feat_hm(
+        &mut self,
+        entries: HashMap<(i32, i32), (i32, i32)>,
+    ) {
+        for (key, (non_air, solid)) in entries {
+            let e = self.feat_hm.entry(key).or_insert((i32::MIN, i32::MIN));
+            e.0 = e.0.max(non_air);
+            e.1 = e.1.max(solid);
+        }
+    }
+
+    /// Whether this owner suppresses generated ticks for a restored chunk; a wave worker
+    /// inherits the flag before it places anything.
+    pub(crate) fn restores_ticks_for(&self, chunk: (i32, i32)) -> bool {
+        self.restored_tick_sources.contains(&chunk)
+    }
+
+    /// Take a wave worker's feature-height maxima for the owner to merge at commit.
+    pub(crate) fn feat_hm_for_worker(&mut self) -> HashMap<(i32, i32), (i32, i32)> {
+        std::mem::take(&mut self.feat_hm)
     }
 
     /// Execute the default population order for a request box: the named member of vanilla's

@@ -9399,6 +9399,373 @@ fn carve_claimed(g: &mut Gen, tx: i32, tz: i32) {
     commit_carve(g, out);
 }
 
+// ---------- Layer A3-a: whole-order pre-carve + dependency-DAG feature waves ----------
+
+/// True when a feature diagnostic depends on serial per-chunk scheduling (interleaved stdout,
+/// a thread-local RNG trace, or a height dump taken mid-population). The bytes are the same on
+/// either arm; the *trace* is not, so these modes keep the original serial loop.
+fn populate_diag_env() -> bool {
+    carver_diag_env()
+        || env_str!("FEAT_LIST").is_some()
+        || env_flag!("FEAT_TRACE")
+        || env_flag!("FEAT_PROFILE")
+        || env_str!("FEATURE_ATTEMPT_TRACE").is_some()
+        || env_str!("FSEED_ARM").is_some()
+        || env_str!("FSEED_TRACE").is_some()
+        || env_str!("FEATURE_CELL_TRACE").is_some()
+        || env_str!("FEATURE_REFUSE_TRACE").is_some()
+        || env_str!("FEATURE_WRITE_TRACE").is_some()
+        || env_str!("MARK_TRACE").is_some()
+        || env_flag!("MC_SPINE_NOFEAT")
+        || env_str!("MC_SPINE_HM_DUMP").is_some()
+        || env_str!("CEL_COLUMN_TRACE").is_some()
+        || env_flag!("MINESHAFT_TRACE")
+}
+
+/// Pre-carve the union of every pending chunk's 3x3 before any feature runs.
+///
+/// Serial `populate_body` carves `(sx,sz)` and its ring before `(sx,sz)`'s features, so a
+/// feature may read a neighbour's carved air. The batch leaves those claims and writes on the
+/// owner first, which makes every later `carve_ring` a no-op (`begin_carve` returns false) and
+/// removes the 49+ tiny per-chunk scopes the old loop spawned.
+pub(crate) fn precarve_order(g: &mut Gen, pending: &[(i32, i32)], jobs: usize) {
+    let mut order: Vec<(i32, i32)> = Vec::with_capacity(pending.len().saturating_mul(9));
+    let mut seen: HashSet<(i32, i32)> = HashSet::with_capacity(order.capacity());
+    for &(sx, sz) in pending {
+        // The chunk itself comes first, then the ring in the same `(dx, dz)` order as
+        // `carve_ring`, so the claims (and therefore the commit order) stay identical.
+        if seen.insert((sx, sz)) {
+            order.push((sx, sz));
+        }
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                let c = (sx + dx, sz + dz);
+                if seen.insert(c) {
+                    order.push(c);
+                }
+            }
+        }
+    }
+    // Carve writes live in the same `feat_c` buckets as feature writes, bounded by
+    // `FEATURE_BUCKET_BOUND` (384). A recorded plan can cover far more than 42 source chunks;
+    // keep each batch under 9*32 = 288 buckets so no carve output is evicted before the
+    // feature pass that reads it.
+    const PER_CALL: usize = 32;
+    for part in order.chunks(PER_CALL) {
+        carve_batch(g, part, jobs);
+    }
+}
+
+/// The minimum Chebyshev-independent spacing of two chunks in one wave. `POP_WRITE_RADIUS`
+/// is one chunk, so `|dx| >= 3 || |dz| >= 3` keeps their write windows disjoint. The value is
+/// adjustable under `cfg(test)` so the parity test can try the conservative `4` arm too.
+fn pop_wave_spacing() -> i32 {
+    #[cfg(test)]
+    {
+        let override_value = POP_WAVE_SPACING.load(Ordering::Relaxed);
+        if override_value > 0 {
+            return override_value as i32;
+        }
+    }
+    3
+}
+
+#[cfg(test)]
+static POP_WAVE_SPACING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn set_pop_wave_spacing(spacing: usize) {
+    POP_WAVE_SPACING.store(spacing, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static POPULATE_WORKERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn populate_workers() -> usize {
+    POPULATE_WORKERS.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn wave_conflict(a: (i32, i32), b: (i32, i32), spacing: i32) -> bool {
+    (a.0 - b.0).abs() < spacing && (a.1 - b.1).abs() < spacing
+}
+
+/// Topological wave levels. If `j` precedes `i` in `pending` and their write windows overlap,
+/// `i` must be committed after `j`: `level[i] > level[j]`. Two chunks at one level therefore
+/// neither overlap nor violate the caller's dependency order, which is the checkerboard
+/// colouring generalised to an arbitrary `POP_ORDER`.
+fn wave_levels(pending: &[(i32, i32)], spacing: i32) -> Vec<usize> {
+    let mut levels = vec![0usize; pending.len()];
+    for i in 0..pending.len() {
+        for j in 0..i {
+            if wave_conflict(pending[i], pending[j], spacing) {
+                levels[i] = levels[i].max(levels[j] + 1);
+            }
+        }
+    }
+    levels
+}
+
+/// What one worker hands back: every write and mark the placement loop produced, plus the
+/// ticks and direct marks it filed on its scratch `Gen`. The owner replays them in `pending`
+/// order at the wave commit.
+struct PopulateWorkerResult {
+    wr: HashMap<(i32, i32, i32), u32>,
+    shape_marks: Vec<(i32, i32, i32)>,
+    direct_marks: Vec<((i32, i32), Vec<(i32, i32, i32)>)>,
+    payloads: crate::generation_context::StagedPayloads,
+    feat_hm: HashMap<(i32, i32), (i32, i32)>,
+    leaves: Vec<GeneratedTick>,
+    fluids: Vec<GeneratedTick>,
+}
+
+/// The worker half of a feature pass: biome union, `References::collect` and the placement
+/// loop. It deliberately omits `carve_ring` (already claimed by `precarve_order`) and the
+/// promotion boundary (an owner-only operation, because it reads `pop_done`).
+fn populate_worker(scratch: &mut Gen, owner: &Gen, sx: i32, sz: i32) -> PopulateWorkerResult {
+    #[cfg(test)]
+    POPULATE_WORKERS.fetch_add(1, Ordering::Relaxed);
+
+    let empty = || PopulateWorkerResult {
+        wr: HashMap::new(),
+        shape_marks: Vec::new(),
+        direct_marks: Vec::new(),
+        payloads: Vec::new(),
+        feat_hm: HashMap::new(),
+        leaves: Vec::new(),
+        fluids: Vec::new(),
+    };
+    if env_flag!("MC_SPINE_NOFEAT") {
+        return empty();
+    }
+    let fr = freg();
+    let Some(order) = fr.order.get(&owner.preset) else {
+        return empty();
+    };
+    if breg().is_none() {
+        return empty();
+    }
+
+    let mut gen: &mut Gen = scratch;
+    gen.pop_active = Some((sx, sz));
+    gen.suppress_generated_ticks = owner.restores_ticks_for((sx, sz));
+
+    let use_bits = fr.bit_ok;
+    let mut present_mask: u128 = 0;
+    let mut biomes: Vec<String> = Vec::new();
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            for b in gen.chunk_biome_set(sx + dx, sz + dz).iter() {
+                if use_bits {
+                    if let Some(&bit) = fr.biome_bits.get(b) {
+                        present_mask |= 1u128 << bit;
+                    }
+                } else if !biomes.iter().any(|v| v == b) {
+                    biomes.push(b.clone());
+                }
+            }
+        }
+    }
+    let pop = pop_seed(owner.wseed(), sx * 16, sz * 16);
+    let mut structures = References::collect(&mut gen, sx, sz);
+    let mut ctx = FC::new_worker(&mut gen, owner);
+    LEAF_BITS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.active = true;
+        c.known = 0;
+    });
+    let preset = owner.preset;
+    let t0 = crate::worldgen::m3_start();
+    for step in 0..order.len().max(structures.step_count()) {
+        structures.place_step(&mut ctx, step, pop as u64, sx, sz);
+        let Some(entries) = order.get(step) else { continue };
+        let bit_entries = fr.step_entries.get(&preset).and_then(|v| v.get(step));
+        for (ei, (gi, name)) in entries.iter().enumerate() {
+            let slot = bit_entries.map(|v| &v[ei]);
+            let present = if use_bits {
+                slot.is_some_and(|s| (present_mask & s.step_biome_mask) != 0)
+            } else {
+                biomes.iter().any(|b| {
+                    fr.bsteps
+                        .get(b)
+                        .and_then(|s| s.get(step))
+                        .map(|l| l.iter().any(|f| f == name))
+                        .unwrap_or(false)
+                })
+            };
+            if !present {
+                continue;
+            }
+            let pf: &Pf = if use_bits {
+                let idx = slot.expect("step entry parallel to order").placed_idx;
+                if idx == usize::MAX {
+                    continue;
+                }
+                &*fr.placed_vec[idx]
+            } else {
+                let Some(p) = fr.placed.get(name) else { continue };
+                p
+            };
+            let deco = pop
+                .wrapping_add(*gi as u64)
+                .wrapping_add(10_000u64.wrapping_mul(step as u64));
+            let mut rng = Xor::seed_worldgen(deco);
+            gen_pf(pf, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
+        }
+    }
+    crate::worldgen::m3_elapsed(
+        crate::worldgen::M3_FEATURE_NS,
+        crate::worldgen::M3_FEATURE_N,
+        t0,
+    );
+    LEAF_BITS.with(|c| c.borrow_mut().active = false);
+
+    let wr = std::mem::take(&mut ctx.wr);
+    let shape_marks = std::mem::take(&mut ctx.shape_marks);
+    let payloads = std::mem::take(&mut ctx.payloads);
+    let direct_marks = gen.take_all_shape_marks();
+    let feat_hm = std::mem::take(&mut gen.feat_hm_for_worker());
+    let (leaves, fluids) = gen.take_generated_ticks();
+    PopulateWorkerResult {
+        wr,
+        shape_marks,
+        direct_marks,
+        payloads,
+        feat_hm,
+        leaves,
+        fluids,
+    }
+}
+
+/// Generated ticks this chunk contributed, in the serial order: the placement loop's first,
+/// then the promotion pass'. They are buffered and replayed in caller order at the end of the
+/// whole population, because waves commit in dependency order rather than caller order.
+struct TickBatch {
+    leaves: Vec<GeneratedTick>,
+    fluids: Vec<GeneratedTick>,
+}
+
+/// The owner continuation of one worker result: land the worker's state, run the same
+/// promotion boundary as the serial arm, and flush the writes in the same order.
+fn commit_populate(g: &mut Gen, sx: i32, sz: i32, res: PopulateWorkerResult) -> TickBatch {
+    g.pop_done.insert((sx, sz));
+    g.suppress_generated_ticks = g.restores_ticks_for((sx, sz));
+    g.merge_shape_marks(res.direct_marks);
+    g.merge_feat_hm(res.feat_hm);
+
+    let PopulateWorkerResult {
+        wr,
+        shape_marks,
+        payloads,
+        leaves,
+        fluids,
+        ..
+    } = res;
+    let mut ctx = FC::new_commit(g, wr, shape_marks, payloads);
+    promote_full_chunks(&mut ctx, sx, sz);
+    let mut staged_payloads = std::mem::take(&mut ctx.payloads);
+    for ((x, y, z), st) in std::mem::take(&mut ctx.wr) {
+        ctx.g.feat_write(x, y, z, st);
+    }
+    ctx.g.stage_payloads((sx, sz), &mut staged_payloads);
+    ctx.g.suppress_generated_ticks = false;
+    // The promotion pass scheduled on the owner; keep it with this chunk's placement ticks
+    // instead of leaving it in the global queue, which is replayed later in caller order.
+    let (promo_leaves, promo_fluids) = ctx.g.take_generated_ticks();
+    TickBatch {
+        leaves: [leaves, promo_leaves].concat(),
+        fluids: [fluids, promo_fluids].concat(),
+    }
+}
+
+/// Run the feature placement of a multi-chunk population in dependency-DAG waves.
+pub(crate) fn populate_parallel(g: &mut Gen, pending: &[(i32, i32)], jobs: usize) -> usize {
+    let levels = wave_levels(pending, pop_wave_spacing());
+    let wave_count = levels.iter().copied().max().unwrap_or(0) + 1;
+    let mut results: Vec<Option<PopulateWorkerResult>> = (0..pending.len()).map(|_| None).collect();
+    let mut ticks: Vec<Option<TickBatch>> = (0..pending.len()).map(|_| None).collect();
+    // Ticks filed by the pre-carve stay in front of the feature ticks, as they do in the
+    // serial arm (CARVERS precede FEATURES for every chunk).
+    let (pre_leaves, pre_fluids) = g.take_generated_ticks();
+    for wave in 0..wave_count {
+        let idxs: Vec<usize> = (0..pending.len()).filter(|&i| levels[i] == wave).collect();
+        if idxs.is_empty() {
+            continue;
+        }
+        let nthreads = idxs.len().min(jobs.max(1));
+        let per = idxs.len().div_ceil(nthreads).max(1);
+        if idxs.len() == 1 {
+            // A one-chunk wave has nothing to overlap: a thread and a channel would cost more
+            // than the placement itself.
+            let i = idxs[0];
+            let (sx, sz) = pending[i];
+            let mut scratch = Gen::fresh_scratch(g.data.clone());
+            scratch.starts_round = g.starts_round;
+            if let Some(resolver) = g.beard_resolver() {
+                scratch.set_beard_resolver(resolver);
+            }
+            let owner: &Gen = &*g;
+            results[i] = Some(populate_worker(&mut scratch, owner, sx, sz));
+            let (sx, sz) = pending[i];
+            let res = results[i].take().expect("just stored");
+            ticks[i] = Some(commit_populate(g, sx, sz, res));
+            continue;
+        }
+        {
+            let owner: &Gen = &*g;
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::scope(|s| {
+                for slice in idxs.chunks(per) {
+                    let coords: Vec<usize> = slice.to_vec();
+                    let tx = tx.clone();
+                    s.spawn(move || {
+                        crate::worldgen::m3_set_worker(true);
+                        // One scratch generator per worker (not per chunk): the structure
+                        // starts, columns and memos it warms are reused by the next chunk on
+                        // this thread, which is where the per-chunk arm paid most of its cost.
+                        let mut scratch = Gen::fresh_scratch(owner.data.clone());
+                        scratch.starts_round = owner.starts_round;
+                        if let Some(resolver) = owner.beard_resolver() {
+                            scratch.set_beard_resolver(resolver);
+                        }
+                        for &i in &coords {
+                            let (sx, sz) = pending[i];
+                            // Results are indexed by the chunk's place in `pending`, so a
+                            // worker finishing early cannot change the commit order.
+                            let _ = tx.send((i, populate_worker(&mut scratch, owner, sx, sz)));
+                        }
+                        crate::worldgen::m3_flush();
+                    });
+                }
+            });
+            drop(tx);
+            for (i, res) in rx {
+                results[i] = Some(res);
+            }
+        }
+        // Commit in caller order within the wave, never worker-finish order: a chunk's
+        // conflicting predecessors are in earlier waves, so their writes are already on the
+        // owner when a later wave is committed.
+        for &i in &idxs {
+            let (sx, sz) = pending[i];
+            if let Some(res) = results[i].take() {
+                ticks[i] = Some(commit_populate(g, sx, sz, res));
+            }
+        }
+    }
+    // Replay every tick queue in the caller's order. Waves are dependency-ordered, which can
+    // differ from `order` for independent chunks; the tick queue is the one global observable
+    // where that difference would be visible.
+    g.append_generated_ticks(pre_leaves, pre_fluids);
+    for batch in ticks.into_iter().flatten() {
+        g.append_generated_ticks(batch.leaves, batch.fluids);
+    }
+    pending.len()
+}
+
 /// Everything one chunk's carver pass produces, before it is committed onto an owner.
 struct CarveOutput {
     tx: i32,
@@ -10227,6 +10594,19 @@ pub(crate) fn feat_prof_dump() {
 /// Populate one chunk (and the 3x3 around it, as a feature read would) so that a
 /// diagnostic sees the same feature-layer state a generation loop would.
 pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
+    // A3-a: `Gen::populate_in_order` hands a multi-chunk feature run to us through `Gen`
+    // (it cannot call this layer directly). The first call drives the whole batch, so the
+    // remaining calls in its serial loop are no-ops on `pop_done`.
+    if let Some(pending) = g.a3a_dispatch.take() {
+        if !populate_diag_env() {
+            let jobs = crate::worldgen::terrain_jobs();
+            precarve_order(g, &pending, jobs);
+            if pending.len() >= 4 {
+                let _ = populate_parallel(g, &pending, jobs);
+                return;
+            }
+        }
+    }
     populate_body(g, sx, sz);
 }
 
@@ -11185,6 +11565,223 @@ mod a3b_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod a3a_tests {
+    use super::*;
+    use crate::worldgen::{lock_gen_for_tests, NoisePreset};
+
+    /// Everything the feature + carver layers leave on the owner for a window: the write
+    /// buckets, the heightmap maxima, the promotion marks, the staged payloads, the ticks,
+    /// the post-carve WG tops and the `pop_done` set. Order is preserved where serial order
+    /// is observable (writes, marks, ticks).
+    #[derive(Debug)]
+    struct State {
+        writes: Vec<((i32, i32), Vec<((i32, i32, i32), u32)>)>,
+        heights: Vec<((i32, i32), (i32, i32))>,
+        marks: Vec<((i32, i32), Vec<(i32, i32, i32)>)>,
+        payloads: crate::generation_context::StagedPayloads,
+        leaves: Vec<GeneratedTick>,
+        fluids: Vec<GeneratedTick>,
+        wg: Vec<((i32, i32), Vec<i32>)>,
+        done: Vec<(i32, i32)>,
+    }
+
+    fn state(g: &mut Gen, x0: i32, z0: i32, n: i32) -> State {
+        let mut writes = Vec::new();
+        let mut heights = Vec::new();
+        let mut marks = Vec::new();
+        let mut wg = Vec::new();
+        for cz in z0 - 1..=z0 + n {
+            for cx in x0 - 1..=x0 + n {
+                let mut w: Vec<_> = g.feature_bucket_writes(cx, cz).collect();
+                w.sort();
+                writes.push(((cx, cz), w));
+                heights.push((
+                    (cx, cz),
+                    (g.feature_height(cx * 16, cz * 16, 0), g.feature_height(cx * 16, cz * 16, 1)),
+                ));
+                let mut m = g.take_shape_marks(cx, cz);
+                m.sort();
+                marks.push(((cx, cz), m));
+                let mut tops = Vec::new();
+                for ocean_floor in [false, true] {
+                    for lz in 0..16 {
+                        for lx in 0..16 {
+                            let x = cx * 16 + lx;
+                            let z = cz * 16 + lz;
+                            tops.push(
+                                g.wg_after_carve_height(ocean_floor, x, z)
+                                    .unwrap_or(i32::MIN),
+                            );
+                        }
+                    }
+                }
+                wg.push(((cx, cz), tops));
+            }
+        }
+        let mut done: Vec<_> = g.pop_done.iter().copied().collect();
+        done.sort();
+        State {
+            writes,
+            heights,
+            marks,
+            payloads: g.take_staged_payloads(),
+            leaves: g.generated_leaf_ticks(),
+            fluids: g.generated_fluid_ticks(),
+            wg,
+            done,
+        }
+    }
+
+    /// A deterministic window order with a deliberately non-lexicographic tail: the wave
+    /// schedule must respect the caller's dependency order, not sort the chunks itself.
+    fn window(n: i32) -> Vec<(i32, i32)> {
+        let mut order: Vec<(i32, i32)> = (0..n)
+            .flat_map(|x| (0..n).map(move |z| (x, z)))
+            .collect();
+        order.reverse();
+        order
+    }
+
+    fn serial(g: &mut Gen, order: &[(i32, i32)]) {
+        for &(x, z) in order {
+            if g.pop_done.insert((x, z)) {
+                g.suppress_generated_ticks = g.restores_ticks_for((x, z));
+                super::populate(g, x, z);
+                g.suppress_generated_ticks = false;
+            }
+        }
+    }
+
+    fn parallel(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
+        super::precarve_order(g, order, jobs);
+        let _ = super::populate_parallel(g, order, jobs);
+    }
+
+    fn assert_same(a: &State, b: &State, what: &str) {
+        assert_eq!(a.wg, b.wg, "{what}: post-carve WG tops differ");
+        assert_eq!(a.heights, b.heights, "{what}: feature heightmap maxima differ");
+        assert_eq!(a.marks, b.marks, "{what}: promotion marks differ");
+        assert_eq!(a.payloads, b.payloads, "{what}: staged payloads differ");
+        assert_eq!(a.writes, b.writes, "{what}: feature/carve write buckets differ");
+        assert_eq!(a.leaves, b.leaves, "{what}: leaf ticks differ");
+        assert_eq!(a.fluids, b.fluids, "{what}: fluid ticks differ");
+        assert_eq!(a.done, b.done, "{what}: pop_done differs");
+    }
+
+    /// The headline A3-a gate: three dimensions, three seeds, 5x5 windows at both ends of
+    /// the job range. The serial arm is the original `populate_in_order` loop inlined (the
+    /// process-wide `MC_SPINE_GEN_JOBS` env cannot be changed mid-test).
+    #[test]
+    fn populate_order_parallel_matches_serial_bit_for_bit() {
+        crate::test_support::require_vanilla_data();
+        let _guard = lock_gen_for_tests();
+        for preset in [NoisePreset::Overworld, NoisePreset::Nether, NoisePreset::End] {
+            for seed in [0u64, 4242, 12345] {
+                let order = window(5);
+                let mut a = Gen::load_preset(seed, crate::name_to_state, preset).expect("serial gen");
+                serial(&mut a, &order);
+                let a = state(&mut a, 0, 0, 5);
+                for jobs in [5usize, 8] {
+                    let mut b =
+                        Gen::load_preset(seed, crate::name_to_state, preset).expect("parallel gen");
+                    parallel(&mut b, &order, jobs);
+                    let b = state(&mut b, 0, 0, 5);
+                    assert_same(&a, &b, &format!("{preset:?} seed={seed} jobs={jobs}"));
+                }
+            }
+        }
+    }
+
+    /// The batch pre-carve alone (2-3 pending chunks, below the wave threshold) must be a
+    /// no-op on the bytes: it only moves carver work ahead of the first feature pass.
+    #[test]
+    fn precarve_only_matches_serial_bit_for_bit() {
+        crate::test_support::require_vanilla_data();
+        let _guard = lock_gen_for_tests();
+        let order = vec![(3, 1), (4, 1), (3, 2)];
+        for preset in [NoisePreset::Overworld, NoisePreset::Nether] {
+            let mut a = Gen::load_preset(4242, crate::name_to_state, preset).expect("serial gen");
+            serial(&mut a, &order);
+            let a = state(&mut a, 3, 1, 2);
+            let mut b = Gen::load_preset(4242, crate::name_to_state, preset).expect("parallel gen");
+            super::precarve_order(&mut b, &order, 5);
+            serial(&mut b, &order);
+            let b = state(&mut b, 3, 1, 2);
+            assert_same(&a, &b, &format!("{preset:?} pre-carve only"));
+        }
+    }
+
+    /// The real `populate_in_order` dispatch (not just the private wave helper) must take
+    /// the parallel arm and leave the owner in the serial state. This is the path the
+    /// `--wgdump` plan uses; the env-cached `MC_SPINE_GEN_JOBS` is whatever the harness set.
+    #[test]
+    fn populate_in_order_dispatches_to_waves_bit_for_bit() {
+        crate::test_support::require_vanilla_data();
+        let _guard = lock_gen_for_tests();
+        let order = window(5);
+        let mut a = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        serial(&mut a, &order);
+        let a = state(&mut a, 0, 0, 5);
+        super::POPULATE_WORKERS.store(0, Ordering::Relaxed);
+        let mut b = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        assert_eq!(
+            b.populate_in_order(order.iter().copied(), super::populate),
+            25
+        );
+        let workers = super::populate_workers();
+        let b = state(&mut b, 0, 0, 5);
+        assert_same(&a, &b, "populate_in_order dispatch");
+        assert!(
+            workers >= 2 || crate::worldgen::terrain_jobs() <= 1,
+            "the real dispatch must use wave workers when jobs > 1, got {workers}"
+        );
+    }
+
+    /// The conservative spacing from the Layer A3 plan (`% 4`) must be bit-identical too.
+    #[test]
+    fn populate_wave_spacing_four_matches_serial_bit_for_bit() {
+        crate::test_support::require_vanilla_data();
+        let _guard = lock_gen_for_tests();
+        super::set_pop_wave_spacing(4);
+        let order = window(5);
+        let mut a = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        serial(&mut a, &order);
+        let a = state(&mut a, 0, 0, 5);
+        let mut b = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        parallel(&mut b, &order, 5);
+        let b = state(&mut b, 0, 0, 5);
+        super::set_pop_wave_spacing(0);
+        assert_same(&a, &b, "spacing 4");
+    }
+
+    /// The wave arm must actually use more than one thread: a serial loop accidentally left
+    /// in place would still be bit-identical, so this probe is the guard against a false
+    /// green.
+    #[test]
+    fn populate_waves_run_on_multiple_worker_threads() {
+        crate::test_support::require_vanilla_data();
+        let _guard = lock_gen_for_tests();
+        let order = window(6);
+        super::POPULATE_WORKERS.store(0, Ordering::Relaxed);
+        let mut b = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        parallel(&mut b, &order, 5);
+        assert!(
+            super::populate_workers() >= 2,
+            "the 6x6 window must populate on at least two workers, got {}",
+            super::populate_workers()
+        );
+        super::POPULATE_WORKERS.store(0, Ordering::Relaxed);
+        let mut a = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        serial(&mut a, &order);
+        assert_eq!(
+            super::populate_workers(),
+            0,
+            "the serial reference must not spawn wave workers"
+        );
     }
 }
 

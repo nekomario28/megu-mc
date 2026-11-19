@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[allow(unused_imports)]
 pub(crate) use crate::generation_payload::{ContainerKind, GenerationPayload};
 
+/// Staged container contents, named at this layer so its callers need no new module edge.
+pub(crate) type StagedPayloads =
+    Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>;
+
 /// FEAT_PROFILE diagnostic: time spent in feature-side terrain reads.
 pub(crate) static READ_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static READ_N: AtomicU64 = AtomicU64::new(0);
@@ -60,6 +64,11 @@ pub(crate) struct PromoLight {
 
 pub(crate) struct FC<'a> {
     pub(crate) g: &'a mut Gen,
+    /// A3-a wave workers borrow the owner read-only for the state a feature placement reads
+    /// across chunks (`feat_c`, `carve_c`, the feature heightmap and the built columns). The
+    /// serial path has no owner. Every fallback here is read-only: a worker never mutates the
+    /// owner, it only commits its own results when the wave ends.
+    owner: Option<&'a Gen>,
     pub(crate) wr: HashMap<(i32, i32, i32), u32>,
     /// `ChunkAccess.postProcessing` as it stands after this chunk's own generation:
     /// the write positions `StructurePiece.placeBlock` marked, in mark order. They
@@ -106,6 +115,7 @@ impl<'a> FC<'a> {
     pub(crate) fn new(g: &'a mut Gen) -> Self {
         FC {
             g,
+            owner: None,
             wr: HashMap::new(),
             shape_marks: Vec::new(),
             rc: HashMap::new(),
@@ -126,6 +136,74 @@ impl<'a> FC<'a> {
             test_writes: None,
         }
     }
+
+    /// A wave worker's context: its own scratch generator for writes, the owner for the
+    /// read-only cross-chunk state the placement loop needs.
+    pub(crate) fn new_worker(g: &'a mut Gen, owner: &'a Gen) -> Self {
+        let mut ctx = FC::new(g);
+        ctx.owner = Some(owner);
+        ctx
+    }
+
+    /// The owner-side continuation of a wave worker: the worker's writes are installed on the
+    /// owner and the same promotion boundary as the serial arm runs here, in population order.
+    pub(crate) fn new_commit(
+        g: &'a mut Gen,
+        wr: HashMap<(i32, i32, i32), u32>,
+        shape_marks: Vec<(i32, i32, i32)>,
+        payloads: Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>,
+    ) -> Self {
+        let mut ctx = FC::new(g);
+        ctx.wr = wr;
+        ctx.shape_marks = shape_marks;
+        ctx.payloads = payloads;
+        ctx
+    }
+
+    /// `feature_override` through the worker's own layer first, then the owner's. A worker's
+    /// own `feat_c` is empty (it never calls `feat_write`), so in practice this is the owner's
+    /// carve + earlier-chunk feature writes.
+    fn feature_override(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        self.g
+            .feature_override(x, y, z)
+            .or_else(|| self.owner.and_then(|o| o.feature_override(x, y, z)))
+    }
+
+    fn wg_after_carve_height(&self, ocean_floor: bool, x: i32, z: i32) -> Option<i32> {
+        self.g.wg_after_carve_height(ocean_floor, x, z).or_else(|| {
+            self.owner
+                .and_then(|o| o.wg_after_carve_height(ocean_floor, x, z))
+        })
+    }
+
+    /// The live heightmap scan bound: the maximum of the worker's own writes and the owner's
+    /// earlier writes. Wave windows are disjoint, so a column is at most in one of them.
+    fn feature_height(&self, x: i32, z: i32, solid: usize) -> i32 {
+        let own = self.g.feature_height(x, z, solid);
+        match self.owner {
+            Some(o) => own.max(o.feature_height(x, z, solid)),
+            None => own,
+        }
+    }
+
+    fn prefetched_cell(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        self.g.prefetched_cell(x, y, z).or_else(|| {
+            self.owner
+                .and_then(|o| o.prefetched_cell(x, y, z))
+        })
+    }
+
+    /// Columns for a terrain read: the worker's cache, then the owner's already-built columns
+    /// (A3-a's batch pre-carve leaves them resident), finally a cold build on the worker.
+    fn cols_for(&mut self, cx: i32, cz: i32) -> Option<std::sync::Arc<crate::worldgen::ChunkCols>> {
+        if let Some(o) = self.owner {
+            if let Some(c) = o.col_c_get(cx, cz) {
+                return Some(c);
+            }
+        }
+        self.g.cols(cx, cz)
+    }
+
     pub(crate) fn push_loot_container(
         &mut self,
         pos: (i32, i32, i32),
@@ -196,7 +274,7 @@ impl<'a> FC<'a> {
         // Carvers run before features and write into the feature layer. A feature
         // reading terrain_cell alone would see the uncarved stone and, for example,
         // place an ore into the reference cave air.
-        if let Some(st) = self.g.feature_override(x, y, z) {
+        if let Some(st) = self.feature_override(x, y, z) {
             return st;
         }
         #[cfg(test)]
@@ -222,12 +300,12 @@ impl<'a> FC<'a> {
         // misses are attributed to the feature layer's cold reads.
         let st = {
             let _read = crate::worldgen::M3FeatureRead::enter();
-            match self.g.prefetched_cell(x, y, z) {
+            match self.prefetched_cell(x, y, z) {
                 Some(st) => st,
                 None => {
                     let (cx, cz) = (x >> 4, z >> 4);
                     if !matches!(&self.cc, Some((a, b, _)) if *a == cx && *b == cz) {
-                        match self.g.cols(cx, cz) {
+                        match self.cols_for(cx, cz) {
                             Some(c) => self.cc = Some((cx, cz, c)),
                             None => return 0,
                         }
@@ -258,7 +336,7 @@ impl<'a> FC<'a> {
             "wr"
         } else if self.rc.contains_key(&(x, y, z)) {
             "rc"
-        } else if self.g.feature_override(x, y, z).is_some() {
+        } else if self.feature_override(x, y, z).is_some() {
             "ovr"
         } else {
             "terrain"
@@ -354,7 +432,7 @@ impl<'a> FC<'a> {
     fn heightmap_above(&mut self, x: i32, z: i32, from: i32, kind: HeightmapKind) -> i32 {
         let reg = breg();
         let terrain = if kind.is_wg() {
-            self.g.cols(x >> 4, z >> 4)
+            self.cols_for(x >> 4, z >> 4)
         } else {
             None
         };
@@ -391,7 +469,7 @@ impl<'a> FC<'a> {
             // whose `heightmapsAfter` is exactly these two maps. Feature and structure
             // writes (the FEATURES status) never move them, so the answer is neither the
             // pre-carve terrain nor a live scan.
-            if let Some(v) = self.g.wg_after_carve_height(
+            if let Some(v) = self.wg_after_carve_height(
                 matches!(kind, HeightmapKind::OceanFloorWg),
                 x,
                 z,
@@ -457,7 +535,7 @@ impl<'a> FC<'a> {
         if !kind.is_wg() {
             // The tracked maxima are scan bounds, not answers: a later writer
             // may have removed that cell or a different predicate may reject it.
-            start = start.max(self.g.feature_height(x, z, 0));
+            start = start.max(self.feature_height(x, z, 0));
         }
         self.heightmap_above(x, z, start, kind)
     }
