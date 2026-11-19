@@ -5523,8 +5523,14 @@ pub(crate) struct ChunkCols {
     cell_w: i32,
     cell_h: i32,
     min_y: i32,
-    mats: Vec<Option<SurfMat>>, // per-column material-rule results (surface window)
-    rd: [i16; 256],             // per-column run_depth (surface noise)
+    /// Per-column material-rule results (surface window). Layer A2-b builds these on the
+    /// first material read, not in `build_cols_body`: a neighbour column used only as a
+    /// heightmap source pays none of the 256-column surface-rule scan. `FromIterator` is
+    /// implemented so synthetic `ChunkCols` literals in tests keep their original shape.
+    mats: SurfMatsCell,
+    /// Per-column run_depth (surface noise). Kept as a field for the same synthetic-column
+    /// literals; production reads the lazy value through [`ChunkCols::surface_mats`].
+    rd: [i16; 256],
     wtop: [i16; 256],           // per-column top of solid-or-fluid (heightmap basis)
     /// The beardifier input of the chunk that owns these columns, resolved by
     /// `Gen::resolve_beard` before `surf`, `wtop` and `mats` are built (vanilla's
@@ -5532,6 +5538,52 @@ pub(crate) struct ChunkCols {
     /// `SurfaceSystem.buildSurface`). `None` during nested structure-heightmap
     /// queries (`beard_depth > 0`) and for chunks with no structures.
     beard: Option<std::sync::Arc<BeardChunkData>>,
+}
+
+/// The lazily-built half of a [`ChunkCols`]: surface material windows and the per-column
+/// `run_depth` the deep rules read. Split out so a neighbour column that is only used as a
+/// heightmap source pays none of this cost.
+struct SurfaceMats {
+    mats: Vec<Option<SurfMat>>,
+    rd: [i16; 256],
+}
+
+/// Interior-mutable container for the lazy [`SurfaceMats`]. A finished column carries
+/// `grids`/`surf`/`wtop`/`beard` already, so the reading generator can reproduce the exact
+/// density/aquifer/surface-rule answers the old eager in-pipeline scan produced. `OnceLock`
+/// is `Send + Sync`, so a `ChunkCols` shared through `TerrainShare::cols` initializes its
+/// materials exactly once across threads.
+struct SurfMatsCell {
+    cell: std::sync::OnceLock<SurfaceMats>,
+    cx: i32,
+    cz: i32,
+}
+
+impl SurfMatsCell {
+    fn new(cx: i32, cz: i32) -> Self {
+        Self {
+            cell: std::sync::OnceLock::new(),
+            cx,
+            cz,
+        }
+    }
+
+    /// Compute with the *reading* generator, not a fresh scratch: the aquifer and the
+    /// preliminary-surface memos it warmed while scanning `surf`/`wtop` are the ones the
+    /// eager in-pipeline scan used, so the deferred scan costs the same as it always did
+    /// and produces the same bytes.
+    fn get_or_compute(&self, g: &mut Gen, cc: &ChunkCols) -> &SurfaceMats {
+        self.cell
+            .get_or_init(|| g.build_surface_mats(self.cx, self.cz, cc))
+    }
+}
+
+impl FromIterator<Option<SurfMat>> for SurfMatsCell {
+    fn from_iter<T: IntoIterator<Item = Option<SurfMat>>>(_iter: T) -> Self {
+        // A synthetic column built by a test has no owning chunk; its (unused) material
+        // answer is the empty eager default, computed with the test's own generator.
+        Self::new(0, 0)
+    }
 }
 
 type GeneratedTick = ((i32, i32, i32), u32);
@@ -6161,7 +6213,7 @@ pub fn with_gen<R>(f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
 
 /// A stable fingerprint of one chunk's generated columns, for determinism tests.
 /// Every field is part of the terrain answer, including the interpolated grids.
-pub(crate) fn cols_fingerprint(cc: &ChunkCols) -> u64 {
+pub(crate) fn cols_fingerprint(g: &mut Gen, cc: &ChunkCols) -> u64 {
     fn mix(h: &mut u64, v: u64) {
         *h ^= v;
         *h = h.wrapping_mul(0x100_0000_01b3);
@@ -6173,10 +6225,11 @@ pub(crate) fn cols_fingerprint(cc: &ChunkCols) -> u64 {
     for &s in &cc.wtop {
         mix(&mut h, s as u64);
     }
-    for &s in &cc.rd {
+    let sm = cc.surface_mats(g);
+    for &s in &sm.rd {
         mix(&mut h, s as u64);
     }
-    for m in &cc.mats {
+    for m in &sm.mats {
         match m {
             None => mix(&mut h, u64::MAX),
             Some(m) => {
@@ -7201,7 +7254,7 @@ impl Gen {
             cell_w: g.noise_cell_w,
             cell_h: g.noise_cell_h,
             min_y: g.min_y,
-            mats: Vec::new(),
+            mats: SurfMatsCell::new(cx, cz),
             rd: [0i16; 256],
             wtop: [0i16; 256],
             beard,
@@ -7267,6 +7320,19 @@ impl Gen {
                 cc.wtop[lz * 16 + lx] = wt as i16;
             }
         }
+        // Layer A2-b: `mats`/`rd` are built on first material read (`ChunkCols::surface_mats`),
+        // not here. Most columns in a worldgen round are neighbour/heightmap sources and never
+        // read them; the exact in-pipeline scan now lives in `Gen::build_surface_mats`.
+        Some(cc)
+    }
+
+    /// The eager `build_cols_body` surface-material scan, now the body of the lazy
+    /// `ChunkCols::surface_mats` cell. The loop is byte-for-byte the old one: four columns
+    /// of one `z` row share a density buffer, then each column is walked top-down in the
+    /// same order so the aquifer, the surface predicates and the per-column caches see
+    /// the same sequence as before (Layer A2-b is bit-identity by construction).
+    fn build_surface_mats(&mut self, cx: i32, cz: i32, cc: &ChunkCols) -> SurfaceMats {
+        let g = self;
         // vanilla surface material rules: per-column top-down scan over the
         // surface window [est_min .. max(surf, sea)] tracking vanilla's
         // stone_depth_above/below and fluid_height.
@@ -7298,7 +7364,7 @@ impl Gen {
                     let gx = cx * 16 + xb as i32;
                     for yi in 0..span {
                         let y = g.min_y + yi as i32;
-                        let d = g.block_density_x4(&cc, gx, y, z);
+                        let d = g.block_density_x4(cc, gx, y, z);
                         for k in 0..DF4 {
                             dbuf[k * span + yi] = d[k];
                         }
@@ -7339,9 +7405,7 @@ impl Gen {
                 }
             }
         }
-        cc.mats = mats;
-        cc.rd = rd;
-        Some(cc)
+        SurfaceMats { mats, rd }
     }
 }
 
@@ -7466,7 +7530,7 @@ impl Gen {
             // asked about (measured: `--worldgen-cell` reported `mark=true` for solid
             // `grass_block` surface cells).
             self.aq_sched = false;
-            if let Some(st) = cc.mat((x & 15) as usize, (z & 15) as usize, y) {
+            if let Some(st) = cc.mat(self, (x & 15) as usize, (z & 15) as usize, y) {
                 let st = if st == u32::MAX { self.def_st } else { st };
                 return self.vein_override(&cc, x, y, z, st);
             }
@@ -7484,7 +7548,7 @@ impl Gen {
         let lz = (z & 15) as usize;
         let surface_top = cc.wtop[lz * 16 + lx] as i32;
         if surface_material_applies(y, surface_top) {
-            if let Some(st) = cc.mat(lx, lz, y) {
+            if let Some(st) = cc.mat(self, lx, lz, y) {
                 if st != u32::MAX {
                     return self.vein_override(&cc, x, y, z, st);
                 }
@@ -7705,7 +7769,7 @@ impl Gen {
             // asked about (measured: `--worldgen-cell` reported `mark=true` for solid
             // `grass_block` surface cells).
             self.aq_sched = false;
-            if let Some(st) = cc.mat((x & 15) as usize, (z & 15) as usize, y) {
+            if let Some(st) = cc.mat(self, (x & 15) as usize, (z & 15) as usize, y) {
                 let st = if st == u32::MAX { self.def_st } else { st };
                 let st = self.vein_override(cc, x, y, z, st);
                 inc_if(m3_read, M3_FALLBACK_DENSITY);
@@ -7734,7 +7798,7 @@ impl Gen {
         let lz = (z & 15) as usize;
         let surface_top = cc.wtop[lz * 16 + lx] as i32;
         if surface_material_applies(y, surface_top) {
-            if let Some(st) = cc.mat(lx, lz, y) {
+            if let Some(st) = cc.mat(self, lx, lz, y) {
                 if st != u32::MAX {
                     let st = self.vein_override(cc, x, y, z, st);
                     // The aquifer answered a barrier here, so this state is the surface
@@ -7764,16 +7828,89 @@ impl Gen {
     pub(crate) fn has_skylight(&self) -> bool {
         self.preset.dim().has_skylight()
     }
+    /// Single-column `surf` scan over an already-built chunk, top-down. This is the
+    /// one-column form of `build_cols_body`'s four-lane scan: the first `y` from the top
+    /// whose density is positive, or `min_y - 1` when the column has no solid cell.
+    /// `block_density` at one column equals that lane's `block_density_x4` value bit for
+    /// bit, so the answer is the same cell the full column build would have filed.
+    fn single_col_surf(&self, cc: &ChunkCols, x: i32, z: i32) -> i32 {
+        let mut yy = self.min_y + self.height - 1;
+        while yy >= self.min_y {
+            if self.block_density(cc, x, yy, z) > 0.0 {
+                return yy;
+            }
+            yy -= 1;
+        }
+        self.min_y - 1
+    }
+
+    /// The matching single-column water-surface scan: a solid top below sea level probes
+    /// the aquifer downward for the default fluid, exactly as `build_cols_body` does for
+    /// every column of a final chunk.
+    fn single_col_wtop(&mut self, x: i32, z: i32, surf: i32) -> i32 {
+        let mut wt = surf;
+        if surf < self.sea {
+            let mut yy = self.sea;
+            while yy > surf {
+                if self.aq_state(x, yy, z, -1.0) == Some(self.def_fl) {
+                    wt = yy;
+                    break;
+                }
+                yy -= 1;
+            }
+        }
+        wt
+    }
+
     /// WORLD_SURFACE_WG-style height (first non-air + 1) at a column.
+    ///
+    /// Layer A2-b: while a beardifier resolution is in flight, a structure start queries
+    /// the same chunk's heightmap several times (`JigsawPlacement`,
+    /// `min_corner_occupied_y`). The old body went through `cols`, which at
+    /// `beard_depth > 0` builds all 256 columns (surf, wtop AND the surface materials)
+    /// and then refuses to cache them because they are the preliminary answer. Here the
+    /// *cached* base column supplies the identical corner grids (both builds have
+    /// `beard = None` unless a final column is already in `col_c`, which is checked
+    /// first), and only the one asked-for column is scanned.
     pub(crate) fn top_ws(&mut self, x: i32, z: i32) -> i32 {
-        match self.cols(x >> 4, z >> 4) {
+        let cx = x >> 4;
+        let cz = z >> 4;
+        if self.beard_depth > 0 {
+            // Same first hit as `cols`: a final column already in `col_c` wins, so a
+            // bearded answer for a chunk built earlier in this round is preserved.
+            if let Some(c) = self.col_c.get(&(cx, cz)) {
+                m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
+                return c.wtop((x & 15) as usize, (z & 15) as usize) + 1;
+            }
+            return match self.base_cols(cx, cz) {
+                Some(cc) => {
+                    let surf = self.single_col_surf(&cc, x, z);
+                    self.single_col_wtop(x, z, surf) + 1
+                }
+                None => self.min_y,
+            };
+        }
+        match self.cols(cx, cz) {
             Some(c) => c.wtop((x & 15) as usize, (z & 15) as usize) + 1,
             None => self.min_y,
         }
     }
-    /// OCEAN_FLOOR_WG-style height (first solid + 1).
+    /// OCEAN_FLOOR_WG-style height (first solid + 1). See [`Gen::top_ws`] for the
+    /// `beard_depth > 0` single-column path.
     pub(crate) fn top_oc(&mut self, x: i32, z: i32) -> i32 {
-        match self.cols(x >> 4, z >> 4) {
+        let cx = x >> 4;
+        let cz = z >> 4;
+        if self.beard_depth > 0 {
+            if let Some(c) = self.col_c.get(&(cx, cz)) {
+                m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
+                return c.surface((x & 15) as usize, (z & 15) as usize) + 1;
+            }
+            return match self.base_cols(cx, cz) {
+                Some(cc) => self.single_col_surf(&cc, x, z) + 1,
+                None => self.min_y,
+            };
+        }
+        match self.cols(cx, cz) {
             Some(c) => c.surface((x & 15) as usize, (z & 15) as usize) + 1,
             None => self.min_y,
         }
@@ -8355,17 +8492,32 @@ impl ChunkCols {
     pub fn wtop(&self, lx: usize, lz: usize) -> i32 {
         self.wtop[lz * 16 + lx] as i32
     }
+    /// The surface materials, built on first material read and then shared. Heightmap,
+    /// `surf`/`wtop`, `grids` and `beard` readers never enter `get_or_init`, so neighbour
+    /// chunks that are only height sources stay material-free (Layer A2-b).
+    pub(crate) fn surface_mats(&self, g: &mut Gen) -> &SurfaceMats {
+        self.mats.get_or_compute(g, self)
+    }
+    /// Diagnostic used by the lazy-material unit test.
+    #[cfg(test)]
+    fn surface_mats_computed(&self) -> bool {
+        self.mats.cell.get().is_some()
+    }
     /// material-rule result inside the surface window.
     /// Some(u32::MAX) = scanned but no rule matched -> default block.
     /// None = outside the scanned window -> caller runs deep_state.
-    pub fn mat(&self, lx: usize, lz: usize, y: i32) -> Option<u32> {
-        let m = self.mats[lz * 16 + lx].as_ref()?;
+    pub fn mat(&self, g: &mut Gen, lx: usize, lz: usize, y: i32) -> Option<u32> {
+        let m = self.surface_mats(g).mats[lz * 16 + lx].as_ref()?;
         let i = y - m.lo as i32;
         if i < 0 || i as usize >= m.vals.len() {
             return None;
         }
         let v = m.vals[i as usize];
         Some(if v == u16::MAX { u32::MAX } else { v as u32 })
+    }
+    /// Per-column `run_depth`, used by the deep material rule.
+    pub(crate) fn run_depth(&self, g: &mut Gen, lx: usize, lz: usize) -> i16 {
+        self.surface_mats(g).rd[lz * 16 + lx]
     }
     /// Trilinear value of this chunk's grid for `interpolated` node `id`, or
     /// `None` when that node has no grid (not reachable from final_density).
@@ -8649,7 +8801,7 @@ impl Gen {
         c.x = x;
         c.z = z;
         c.y = y;
-        c.run_depth = cc.rd[((z & 15) as usize) * 16 + (x & 15) as usize] as i32;
+        c.run_depth = cc.run_depth(self, (x & 15) as usize, (z & 15) as usize) as i32;
         c.est_min = i32::MAX; // above_preliminary_surface -> false
         c.sda = 32000;
         c.sdb = 32000;
@@ -10065,7 +10217,7 @@ mod wg_tests {
                 cell_w,
                 cell_h,
                 min_y,
-                mats: Vec::new(),
+                mats: (0..256).map(|_| None).collect(),
                 rd: [0; 256],
                 wtop: [0; 256],
                 beard: None,
@@ -11066,14 +11218,19 @@ mod wg_tests {
                 df4_test_force_scalar(false);
                 g.col_c.clear();
                 let vector = g.cols(cx, cz).expect("columns with the vector arm");
+                // A2-b: force the lazy material scan while its own density arm is active.
+                let vector_sm = vector.surface_mats(&mut g);
                 df4_test_force_scalar(true);
                 g.col_c.clear();
                 let scalar = g.cols(cx, cz).expect("columns with the scalar arm");
+                let scalar_sm = scalar.surface_mats(&mut g);
                 df4_test_force_scalar(false);
                 assert_eq!(vector.surf, scalar.surf, "{preset:?} surf at ({cx},{cz})");
                 assert_eq!(vector.wtop, scalar.wtop, "{preset:?} wtop at ({cx},{cz})");
-                assert_eq!(vector.rd, scalar.rd, "{preset:?} rd at ({cx},{cz})");
-                for (i, (a, b)) in vector.mats.iter().zip(scalar.mats.iter()).enumerate() {
+                assert_eq!(
+                    &vector_sm.rd, &scalar_sm.rd, "{preset:?} rd at ({cx},{cz})"
+                );
+                for (i, (a, b)) in vector_sm.mats.iter().zip(scalar_sm.mats.iter()).enumerate() {
                     match (a, b) {
                         (None, None) => {}
                         (Some(a), Some(b)) => {
@@ -11687,11 +11844,13 @@ mod wg_tests {
         // real state ids: grass/dirt/stone or sand should appear in a
         // plains-ish spawn column; "no match" (u32::MAX->default) is stone.
         let cc = chunk_cols(0, 0).unwrap();
+        let mut gg = gen_lock();
+        let g = gg.as_mut().unwrap();
         let mut kinds: HashMap<u32, u32> = HashMap::new();
         let mut nmat = 0;
         for lz in 0..16 {
             for lx in 0..16 {
-                if let Some(m) = &cc.mats[lz * 16 + lx] {
+                if let Some(m) = &cc.surface_mats(g).mats[lz * 16 + lx] {
                     nmat += 1;
                     for &v in m.vals.iter() {
                         *kinds.entry(v as u32).or_default() += 1;
@@ -11708,10 +11867,12 @@ mod wg_tests {
         let _guard = lock_gen();
         assert!(init(0, crate::name_to_state));
         let cc = chunk_cols(0, 0).unwrap();
+        let mut gg = gen_lock();
+        let g = gg.as_mut().unwrap();
         let mut kinds: HashMap<u32, u32> = HashMap::new();
         for lz in 0..16 {
             for lx in 0..16 {
-                if let Some(m) = &cc.mats[lz * 16 + lx] {
+                if let Some(m) = &cc.surface_mats(g).mats[lz * 16 + lx] {
                     for &v in m.vals.iter() {
                         *kinds.entry(v as u32).or_default() += 1;
                     }
@@ -13443,8 +13604,12 @@ mod wg_tests {
         // reference: the shared generator's own cache
         let reference: Vec<u64> = keys
             .iter()
-            .map(|&(cx, cz)| cols_fingerprint(&chunk_cols(cx, cz).expect("cols")))
+            .map(|&(cx, cz)| {
+                let cc = chunk_cols(cx, cz).expect("cols");
+                with_gen(|g| cols_fingerprint(g, &cc)).expect("the generator for the fingerprint")
+            })
             .collect();
+        let mut fp_gen = Gen::fresh_scratch(data.clone());
         for workers in [1usize, 2, 4, 8] {
             let got = prefetch_cols(&data, &keys, workers);
             assert_eq!(got.len(), keys.len());
@@ -13452,7 +13617,7 @@ mod wg_tests {
                 assert_eq!(key, &keys[i]);
                 let cc = cols.as_ref().expect("prefetched cols");
                 assert_eq!(
-                    cols_fingerprint(cc),
+                    cols_fingerprint(&mut fp_gen, cc),
                     reference[i],
                     "worker count {workers} diverged at {key:?}"
                 );
@@ -13467,7 +13632,7 @@ mod wg_tests {
         fresh.install_cols(installed);
         for (i, &(cx, cz)) in keys.iter().enumerate() {
             let cc = fresh.cols(cx, cz).expect("cached cols");
-            assert_eq!(cols_fingerprint(&cc), reference[i]);
+            assert_eq!(cols_fingerprint(&mut fresh, &cc), reference[i]);
         }
     }
 
@@ -13495,9 +13660,10 @@ mod wg_tests {
             let (cc, rows) = reference
                 .build_terrain_rows(cx, cz, lo, hi, None)
                 .expect("reference rows");
-            want_cols.push(cols_fingerprint(&cc));
+            want_cols.push(cols_fingerprint(&mut reference, &cc));
             want_rows.push(rows);
         }
+        let mut fp_gen = Gen::fresh_scratch(data.clone());
         for jobs in [1usize, 2, 8] {
             let cols = prefetch_cols_with(&data, None, &keys, jobs, None);
             let got = prefetch_terrain(&data, None, &keys, &cols, lo, hi, jobs, None);
@@ -13508,7 +13674,7 @@ mod wg_tests {
                     .unwrap_or_else(|| panic!("jobs {jobs}: no rows for {:?}", keys[i]));
                 assert_eq!(chunk.key, keys[i]);
                 assert_eq!(
-                    cols_fingerprint(&chunk.cols),
+                    cols_fingerprint(&mut fp_gen, &chunk.cols),
                     want_cols[i],
                     "jobs {jobs}: columns diverged at {:?}",
                     keys[i]
@@ -13621,6 +13787,7 @@ mod wg_tests {
                     (key, chunk.unwrap_or_else(|| panic!("{preset:?}: no reference rows for {key:?}")))
                 })
                 .collect();
+            let mut fp_gen = Gen::fresh_scratch(data.clone());
             for jobs in [1usize, 5, 8] {
                 let round = crate::feature::starts_round_begin();
                 let cols = prefetch_cols_with(&data, Some(resolver), &keys, jobs, Some(round));
@@ -13634,8 +13801,8 @@ mod wg_tests {
                         .unwrap_or_else(|| panic!("{preset:?} jobs={jobs}: no rows for {key:?}"));
                     assert_eq!(chunk.key, key, "{preset:?} jobs={jobs}: chunk order");
                     assert_eq!(
-                        cols_fingerprint(&chunk.cols),
-                        cols_fingerprint(&want_chunk.cols),
+                        cols_fingerprint(&mut fp_gen, &chunk.cols),
+                        cols_fingerprint(&mut fp_gen, &want_chunk.cols),
                         "{preset:?} jobs={jobs}: columns diverged at {key:?}; the round's share \
                          must not change what a column contains"
                     );
@@ -13741,7 +13908,7 @@ mod wg_tests {
                     g.set_beard_resolver(resolver);
                     barrier.wait();
                     let cc = g.cols(7, 7).expect("columns for the raced chunk");
-                    fingers.lock().unwrap().push(cols_fingerprint(&cc));
+                    fingers.lock().unwrap().push(cols_fingerprint(&mut g, &cc));
                 });
             }
         });
@@ -14379,10 +14546,18 @@ mod wg_tests {
         let wet = chunk_cols(0, 0).unwrap();
         assert_eq!(wet.surface(2, 0), 54, "top solid of the spawn ocean column");
         assert_eq!(wet.wtop(2, 0), 62, "its water surface");
-        assert_eq!(wet.mat(2, 0, 54), Some(dirt), "a submerged floor is dirt");
+        assert_eq!(
+            with_gen(|g| wet.mat(g, 2, 0, 54)),
+            Some(Some(dirt)),
+            "a submerged floor is dirt"
+        );
         let dry = chunk_cols(0, 2).unwrap();
         assert_eq!(dry.surface(4, 0), 63, "top solid of a dry column");
-        assert_eq!(dry.mat(4, 0, 63), Some(grass), "a dry surface is grass");
+        assert_eq!(
+            with_gen(|g| dry.mat(g, 4, 0, 63)),
+            Some(Some(grass)),
+            "a dry surface is grass"
+        );
     }
 
     #[test]
@@ -14465,7 +14640,7 @@ mod wg_tests {
         let plain_surf = plain_cc.surface(4, 0);
         assert_eq!(plain_surf, 63, "unbeardified surface of the check column");
         assert_eq!(plain_cc.wtop(4, 0), 63, "unbeardified column is dry");
-        assert_eq!(plain_cc.mat(4, 0, 63), Some(grass));
+        assert_eq!(plain_cc.mat(&mut g_plain, 4, 0, 63), Some(grass));
         let plain_prelim = g_plain.prelim_min(4, 32);
 
         // Positive beard: the surface rises above y=63, and the *material rules* have to
@@ -14480,7 +14655,7 @@ mod wg_tests {
             raised_surf > plain_surf,
             "positive beard should raise the surface ({raised_surf} vs {plain_surf})"
         );
-        assert_eq!(raise_cc.mat(4, 0, raised_surf), Some(grass));
+        assert_eq!(raise_cc.mat(&mut g_raise, 4, 0, raised_surf), Some(grass));
         assert_eq!(
             raise_cc.wtop(4, 0),
             raised_surf,
@@ -15695,6 +15870,95 @@ mod wg_tests {
         if df4_avx2() {
             assert!(vec > 0, "the vector arm never ran: {vec} groups");
         }
+    }
+
+    /// Layer A2-b: at `beard_depth > 0` a structure start asks the same chunk's heightmap
+    /// several times. The single-column answer from a cached `base_cols` must equal the
+    /// full `build_cols(cx, cz, true)` cell for cell. Both references are built at
+    /// `beard_depth = 1` so neither can pick up a process-wide beardifier resolver and
+    /// both see `beard = None`, which is the premise of the fast path.
+    #[test]
+    fn a2b_single_column_top_ws_and_top_oc_match_full_cols_bit_for_bit() {
+        let cases: [(NoisePreset, u64, &[(i32, i32)]); 4] = [
+            (NoisePreset::Overworld, 0, &[(0, 0), (1, 0), (-1, 0), (0, -1)]),
+            (NoisePreset::Overworld, 4242, &[(0, 0), (-2, 1)]),
+            (NoisePreset::Nether, 4242, &[(0, 0), (-1, 1)]),
+            (NoisePreset::End, 0, &[(0, 0), (-1, 0)]),
+        ];
+        let mut compared = 0usize;
+        for (preset, seed, chunks) in cases {
+            let mut full = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            let mut single = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            full.beard_depth = 1;
+            single.beard_depth = 1;
+            assert!(single.col_c.is_empty(), "a nested query must start with no final columns");
+            for &(cx, cz) in chunks {
+                let cc = full.build_cols(cx, cz, true).expect("full columns");
+                for lz in 0..16usize {
+                    for lx in 0..16usize {
+                        let x = cx * 16 + lx as i32;
+                        let z = cz * 16 + lz as i32;
+                        let i = lz * 16 + lx;
+                        assert_eq!(
+                            single.top_oc(x, z),
+                            cc.surf[i] as i32 + 1,
+                            "{preset:?} seed {seed} OCEAN_FLOOR at ({x},{z})"
+                        );
+                        assert_eq!(
+                            single.top_ws(x, z),
+                            cc.wtop[i] as i32 + 1,
+                            "{preset:?} seed {seed} WORLD_SURFACE at ({x},{z})"
+                        );
+                        compared += 2;
+                    }
+                }
+            }
+        }
+        assert!(compared >= 5_000, "the identity check was too small: {compared}");
+    }
+
+    /// Layer A2-b: building a column and answering height queries must leave the
+    /// surface-material cell empty; the first material read computes exactly what the
+    /// old eager in-pipeline scan produced.
+    #[test]
+    fn a2b_lazy_surface_mats_stays_uncomputed_on_height_queries_and_matches_eager() {
+        let mut g = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        let (cx, cz) = (0, 0);
+        let cc = g.cols(cx, cz).unwrap();
+        assert!(
+            !cc.surface_mats_computed(),
+            "build_cols must not compute surface materials eagerly"
+        );
+        // A nested height query on a different chunk goes through `base_cols`; its
+        // lazy material cell must stay empty too.
+        g.beard_depth = 1;
+        let base = g.base_cols(1, 0).unwrap();
+        let _ = g.top_ws(19, 5);
+        let _ = g.top_oc(19, 5);
+        assert!(
+            !base.surface_mats_computed(),
+            "a heightmap query must not populate the material cell"
+        );
+        assert!(
+            !cc.surface_mats_computed(),
+            "a heightmap query on a final column must not populate the material cell"
+        );
+        // The eager body and the lazy cell must agree field for field.
+        let eager = g.build_surface_mats(cx, cz, &cc);
+        let lazy = cc.surface_mats(&mut g);
+        assert_eq!(lazy.mats.len(), eager.mats.len());
+        for (i, (a, b)) in lazy.mats.iter().zip(eager.mats.iter()).enumerate() {
+            match (a, b) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    assert_eq!(a.lo, b.lo, "material window at column {i}");
+                    assert_eq!(a.vals, b.vals, "material result at column {i}");
+                }
+                _ => panic!("column {i}: one arm produced a window and the other did not"),
+            }
+        }
+        assert_eq!(&lazy.rd, &eager.rd, "run_depth differs between the lazy and eager scans");
+        assert!(cc.surface_mats_computed(), "the lazy cell was not published");
     }
 }
 
