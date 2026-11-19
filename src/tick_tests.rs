@@ -2,6 +2,40 @@ use super::*;
 use effect_tests::client_pair;
 
 #[test]
+fn m2_crafting_log_to_planks_uses_item_registry_ids() {
+    for (log, plank) in [
+        ("oak_log", "oak_planks"),
+        ("spruce_log", "spruce_planks"),
+        ("birch_log", "birch_planks"),
+        ("jungle_log", "jungle_planks"),
+        ("acacia_log", "acacia_planks"),
+        ("cherry_log", "cherry_planks"),
+        ("dark_oak_log", "dark_oak_planks"),
+        ("mangrove_log", "mangrove_planks"),
+        ("bamboo_block", "bamboo_planks"),
+        ("crimson_stem", "crimson_planks"),
+        ("warped_stem", "warped_planks"),
+    ] {
+        let log_id = name_to_item(log).unwrap();
+        let plank_id = name_to_item(plank).unwrap();
+        assert_eq!(planks_for_log(log_id), Some(plank_id), "{log}");
+        assert!(tag_planks(plank_id), "{plank}");
+        let grid = HashMap::from([(1i16, (log_id, 1u8, Vec::new()))]);
+        assert_eq!(craft_result(&grid), Some((plank_id, 4, Vec::new())), "{log}");
+    }
+    assert!(!tag_planks(name_to_item("tuff_wall").unwrap()));
+}
+
+#[test]
+fn m2_join_game_uses_actual_player_entity_id() {
+    let first = join_game(DimId::Overworld, 1, 41);
+    let second = join_game(DimId::Overworld, 1, 42);
+    assert_eq!(i32::from_be_bytes(first[..4].try_into().unwrap()), 41);
+    assert_eq!(i32::from_be_bytes(second[..4].try_into().unwrap()), 42);
+    assert_eq!(first[4..], second[4..]);
+}
+
+#[test]
 fn generated_fluid_handoff_matches_native_proto_unpack() {
     fn ticks(text: &str) -> Vec<scheduled_ticks::ScheduledTick> {
         text.split(';')
@@ -8463,9 +8497,10 @@ fn p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim() {
         (DimId::Nether, 3, "minecraft:the_nether"),
         (DimId::End, 2, "minecraft:the_end"),
     ] {
-        let bytes = join_game(dim, 1);
+        let bytes = join_game(dim, 1, 41);
         let mut p = 0;
-        let _eid = i32::from_be_bytes(bytes[..4].try_into().unwrap()); // entity id
+        let eid = i32::from_be_bytes(bytes[..4].try_into().unwrap()); // entity id
+        assert_eq!(eid, 41);
         p += 4;
         assert_eq!(bytes[p], 0);
         p += 1; // hardcore

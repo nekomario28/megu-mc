@@ -20678,9 +20678,9 @@ fn dim_type_wire_id(dim: DimId) -> i32 {
 /// 0x2b Join Game. Every dimension type the client can be moved into is declared so a
 /// later 0x47 Respawn can name one the client already knows; the spawn info carries the
 /// dimension the player actually starts in.
-fn join_game(dim: DimId, gm: u8) -> Vec<u8> {
+fn join_game(dim: DimId, gm: u8, eid: i32) -> Vec<u8> {
     let mut p = Vec::new();
-    p.extend_from_slice(&1i32.to_be_bytes());
+    p.extend_from_slice(&eid.to_be_bytes());
     p.push(0);
     write_varint(&mut p, 3);
     for d in DimId::ALL {
@@ -21591,20 +21591,20 @@ fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) 
 }
 // vanilla item tags used by recipes
 fn tag_planks(it: i64) -> bool {
-    (15..=23).contains(&it) || (45..=46).contains(&it)
+    (36..=46).contains(&it)
 }
 // log id -> its own plank item (vanilla: oak_log->oak_planks, not oak for all)
 fn planks_for_log(it: i64) -> Option<i64> {
     Some(match it {
-        132 => 15,
-        133 => 16,
-        134 => 17,
-        135 => 18,
-        136 => 19,
-        137 => 20,
-        138 => 21,
-        139 => 22,
-        144 => 23, // logs + bamboo_block
+        132 => 36,
+        133 => 37,
+        134 => 38,
+        135 => 39,
+        136 => 40,
+        137 => 41,
+        138 => 42,
+        139 => 43,
+        144 => 44, // logs + bamboo_block
         142 => 45,
         143 => 46, // crimson/warped stems
         _ => return None,
@@ -25441,7 +25441,8 @@ fn handle(mut s: TcpStream) {
             let w = *WORLD_SPAWN.lock().unwrap();
             (DimId::Overworld, w.0, w.1, w.2, 0.0, 0.0)
         });
-    if send_packet(&mut s, 0x2b, join_game(saved_dim, 1)).is_err() {
+    let player_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    if send_packet(&mut s, 0x2b, join_game(saved_dim, 1, player_eid)).is_err() {
         return;
     }
     let _ = send_packet(&mut s, 0x53, vec![0]); // held slot 0
@@ -25526,7 +25527,7 @@ fn handle(mut s: TcpStream) {
     );
     // ---- multiplayer: register self, tell others, learn others ----
     let me = Arc::new(Client {
-        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+        eid: player_eid,
         uuid: {
             let mut u = [0u8; 16];
             u.copy_from_slice(&uuid);
