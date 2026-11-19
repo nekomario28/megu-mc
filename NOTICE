@@ -1,11 +1,14 @@
 mc-spine
 Copyright 2026 nekomario28
 
-LICENSE and Cargo.toml specify Apache-2.0 for mc-spine's own code, subject to LICENSING.md §5. This
-file records attributions for third-party material that is committed in this repository, and
-lists the components that are fetched or supplied at setup time but are NOT distributed here.
-The full inventory, including items whose origin is not yet documented, is in THIRD_PARTY.md.
-Licensing analysis and the open items before the licence is final: LICENSING.md.
+LICENSE (GNU GPL v3.0 or later), COPYING.LESSER (GNU LGPL v3.0 or later), and Cargo.toml specify
+`GPL-3.0-or-later OR LGPL-3.0-or-later` for mc-spine's own code (so the project operates under
+GPL-3.0-or-later today and may also be used or relicensed under LGPL-3.0-or-later; independent
+third-party Mod JARs loaded at runtime via the Fabric/NeoForge compatibility layer remain under
+their own licenses). This file records attributions for third-party material that is committed in
+this repository, and lists the components that are fetched or supplied at setup time but are NOT
+distributed here. The full provenance inventory is in THIRD_PARTY.md, and licensing notes are in
+LICENSING.md.
 
 src/brigadier.rs: Brigadier 1.3.10 core, translated to Rust
 ----------------------------------------------------------
@@ -59,7 +62,7 @@ was extracted from wiki.vg and minecraft.gamepedia.com.
 Minecraft data (development checkout versus public export)
 ---------------------------------------------------------
 Derived from Minecraft, (c) Mojang Studios / Microsoft; not covered by mc-spine's
-Apache-2.0 license. Do not redistribute these outputs or the jar. The development
+GPL-3.0-or-later / LGPL-3.0-or-later license. Do not redistribute these outputs or the jar. The development
 branch tracks datapacks/vanilla/, assets/block_states_1211.json, config_packets.bin,
 tests/data/biome_probe_ties_1211.tsv and tests/data/random_next_int_1211.tsv.
 tools/vanilla_data/gen_vanilla_data.sh generates these and tests/data/biome_probe_1211.tsv

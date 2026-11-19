@@ -5,13 +5,37 @@ mc-spine は実験段階のサーバーで、完成品ではありません。�
 [開発ガイド](docs/development.md)、現在の作業は [specs/README.md](specs/README.md)、
 次の順序は [specs/ROADMAP.md](specs/ROADMAP.md) を参照してください。
 
-## 最初の一歩
+## 最初の一歩（3 コマンド・オンボーディング）
+
+Clone 後にまず以下の 3 コマンドで環境とゲートを確認してください：
+
+```sh
+# 1. ツールチェーン (Rust 1.98.0, Python 3, Java 21) と入力データの確認
+python3 tools/dev_check.py
+
+# 2. モジュール境界・技術的負債・来歴（Provenance）の静的ゲート
+bash tools/layers_check.sh && bash tools/debt_ratchet.sh && python3 tools/provenance_check.py
+
+# 3. ターゲットを絞った高速テスト確認
+cargo test --locked <test_filter>
+```
+
+（クリーンエクスポートブランチから作業する場合は `bash tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar --fetch-fabric-mappings --accept-eula` で vanilla データを生成できます。）
 
 1. [specs/README.md](specs/README.md) で、いま何が未確認かを読む。
 2. [specs/ROADMAP.md](specs/ROADMAP.md) で、次に閉じる出口を確認する。
 3. [docs/development.md](docs/development.md) で、環境・データ・テストの段階を確認する。
-4. 変更するownerを1つに絞る。`rg` でシンボルと呼び出し元を確認し、既存のテストを読む。
-5. 実行したコマンドとexit、実行しなかった段階を控える。提出時にそのまま書く。
+4. 変更する owner（モジュール）を 1 つに絞る。`rg` でシンボルと呼び出し元を確認し、既存のテストを読む。
+5. 実行したコマンドと exit、実行しなかった段階を控える。提出時にそのまま書く。
+
+## 並列開発のモジュール分担（コンフリクト防止ルール）
+
+複数人で並行作業する際は、以下の 3 トラックに作業ブランチを分け、`src/main.rs` での衝突を避けてください：
+
+- **Track 1（Worldgen & Structure Parity）**: `src/worldgen.rs`, `src/feature.rs`, `src/structure_*.rs`, `src/jigsaw_structures.rs`, `src/template_structures.rs`, `src/single_piece_structures.rs`, `src/end_city_mansion.rs`, `tools/structure_capture.py`
+- **Track 2（NeoForge / Fabric Mod 互換レイヤ）**: `compat/neoforge-events/`, `compat/fabric-probe/`, `src/java_compat.rs`, `src/landing*.rs`, `tools/shimcheck.py`
+- **Track 3（Runtime / Protocol 767 / Gameplay / Networking）**: `src/main.rs`, `src/entity_*.rs`, `src/lighting.rs`, `src/paletted.rs`, `tests/*_wire.py`
+  - **`src/main.rs` の Single-Writer ルール**: `src/main.rs` を編集するブランチは同時に 1 つに絞るか、新しいロジックは専用サブモジュールに切り出して `src/main.rs` 側は最小の呼び出し配線のみにしてください。
 
 作業中のブランチやworktreeを上書きしないでください。`git add -A` / `git commit -a` / `git stash` で
 他人のindexを巻き込まず、pathspecで自分の変更だけをstageします。
@@ -34,14 +58,14 @@ mc-spine は実験段階のサーバーで、完成品ではありません。�
 
 ## コミット
 
-- コミットは `git commit -s` で `Signed-off-by:` を付ける（[DCO 1.1](https://developercertificate.org/)）。CIではまだ強制していません。
+- コミットは必ず `git commit -s` で `Signed-off-by:` を付ける（[DCO 1.1](https://developercertificate.org/)）。
 - AI支援ツールの attribution 行（`Generated with ...`、`Co-Authored-By: <agent>` など）を入れない。
 - 生成データ・`*.jar`・`*.class`・マッピング・`world_overlay.bin`・秘密情報をコミットしない。
 - 共有worktreeで衝突したら、その場で解決するか `git merge --abort`。conflict markerを残さない。
 
 ## データと来歴
 
-**GPL／AGPL／LGPLのコード・データを写さない**という方針は維持します。Pumpkin（GPL-3.0）からの機械的な書き換えも含めません。
+後に `LGPL-3.0-or-later` 単体でも配布・再ライセンスできる柔軟性を維持するため、**外部の GPL／AGPL コードを直接コピーしない（クリーンルーム実装を維持する）**という方針は引き続き守ります。
 アルゴリズムはvanillaの挙動・公開された仕様・論文から書き、参考にした公開情報をPRに書きます。トークン一致の検査は
 `tools/provenance_scan.py`、記録は [THIRD_PARTY.md](THIRD_PARTY.md) §8です。
 
@@ -49,36 +73,17 @@ mc-spine は実験段階のサーバーで、完成品ではありません。�
   必要なデータは手元のjarから [開発ガイド](docs/development.md#22-生成器) の手順で生成し、コミットしない。
 - `--accept-eula` はMinecraft EULAへの同意です。自分が同意するときだけ使い、他人・CIの代わりに付けない。
 - NeoForge／Fabric Loader／Mixinなどのjarとソースをコミットしない。`compat/*/dependencies.json` のURLとSHA-256で取得する。
-- 第三者のコードを入れるときはライセンスを確認し、[THIRD_PARTY.md](THIRD_PARTY.md) と [NOTICE](NOTICE) に追記する。
-  許可リスト（`deny.toml`）にGPL系を足さない。
-
-### 現行ツリーの未解決事項
-
-このHEADには、上の方針と**食い違う追跡データ**があります。分類・パス・確認した事実は
-[開発ガイド](docs/development.md#24-追跡データと方針文書の食い違い未解決) にまとめました。要点だけ:
-
-- Mojangのjar由来の生成データ（`datapacks/vanilla/`、`assets/block_states_1211.json`、`config_packets.bin`、`tests/data/` のfixture、`assets/*_1211.bin` など）が追跡されています（残件は D5、`tools/provenance_check.py --strict-public` で一覧化）。
-- 旧 `assets/pblocks.json` / `assets/properties.json`（Pumpkin 同値）および出所不明の `resourcepack.zip` は `762f312` で削除し、`tools/provenance_check.py` で再混入を禁止しています。
-- テスト用パック `datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` 等は引き続き追跡されています。
-
-**貢献者へのお願い**: 追加しない、削除しない、公開しない。判断はオーナーと [LICENSING.md](LICENSING.md) §5／
-[THIRD_PARTY.md](THIRD_PARTY.md) §3・§9 に委ねます。食い違いを見つけたら、変更を混ぜずにissueで
-「パス・分類・確認したコマンド」を報告してください。ここでライセンスを決めないでください。
+- 第三者のコードを入れるときはライセンス（MIT / Apache-2.0 / BSD / LGPL 等の互換ライセンス）を確認し、[THIRD_PARTY.md](THIRD_PARTY.md) と [NOTICE](NOTICE) に追記する。
+- 旧 `assets/pblocks.json` / `assets/properties.json` および `resourcepack.zip` は削除済みで、`tools/provenance_check.py` で再混入を禁止しています。
 
 ## ライセンス
 
-- **inbound = outbound**: 提出した変更（PR・パッチ）は Apache-2.0（[LICENSE](LICENSE) §5）でmc-spineにライセンスされるものとします。
-  別の条件を付ける場合は提出前に明記してください。自分が書いた、または再ライセンスする権利のあるコードだけを提出してください。
-- Apache-2.0 は**提案段階**です。[LICENSING.md](LICENSING.md) §5 の項目が解消するまで確定せず、公開・リリース可能でもありません。
-  「公開してよい」と受け取れる書き方をしないでください。
-- ライセンスの状況と未解決項目は [LICENSING.md](LICENSING.md)、ファイルごとの出所は [THIRD_PARTY.md](THIRD_PARTY.md)。
+- **Inbound = Outbound (`GPL-3.0-or-later OR LGPL-3.0-or-later`)**: 提出した変更（PR・パッチ）は、GNU GPL v3.0 or later（[LICENSE](LICENSE)）および GNU LGPL v3.0 or later（[COPYING.LESSER](COPYING.LESSER)）のデュアルライセンス（`GPL-3.0-or-later OR LGPL-3.0-or-later`）で mc-spine にライセンスされるものとします。これにより、プロジェクトを `GPL-3.0-or-later` として運用しつつ、将来いつでも追加同意なしに `LGPL-3.0-or-later` へ移行・提供できます。
+- 自分が書いた、または上記条件でライセンスする権利のあるコードだけを提出してください。
+- ライセンスの技術的整理は [LICENSING.md](LICENSING.md)、ファイルごとの出所は [THIRD_PARTY.md](THIRD_PARTY.md)。
 - 秘密情報（`.env`、鍵、トークン）をコミットしない。見つけたら [SECURITY.md](SECURITY.md) へ。
 
 ## English summary
 
-Contributions are licensed under Apache-2.0 (inbound = outbound), and commits should be signed off (DCO).
-Do not copy GPL/AGPL/LGPL code or data (including Pumpkin). Do not add Mojang-derived data, mappings or
-third-party jars. Record any third-party material in THIRD_PARTY.md/NOTICE. This HEAD tracks some data that the
-policy documents say is generated locally; do not add to it, delete it, or publish it — report it and leave the
-decision to the owner. The repository is not publish-ready. See docs/development.md for environment, data and
-test tiers.
+Contributions are licensed under `GPL-3.0-or-later OR LGPL-3.0-or-later` (inbound = outbound, matching [LICENSE](LICENSE) and [COPYING.LESSER](COPYING.LESSER)), and commits must be signed off (`git commit -s`, DCO 1.1).
+To preserve the ability to distribute under `LGPL-3.0-or-later`, do not copy third-party GPL/AGPL code or data into the tree. Do not add Mojang-derived data, mappings, or third-party jars. Record any third-party material in [THIRD_PARTY.md](THIRD_PARTY.md) and [NOTICE](NOTICE). Run `python3 tools/dev_check.py`, `bash tools/layers_check.sh`, `bash tools/debt_ratchet.sh`, and `python3 tools/provenance_check.py` before opening a PR. See [docs/development.md](docs/development.md) for environment, data, and test tiers.

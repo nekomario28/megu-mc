@@ -13,26 +13,30 @@ Minecraft Java 1.21.1（protocol 767）向けの実験的なRustサーバーで�
 
 現在の状態・限界・次の順序は [specs/README.md](specs/README.md) と [specs/ROADMAP.md](specs/ROADMAP.md) が正本です。このREADMEには状態表を複製しません。
 
-## 試す
+## Collaborator クイックスタート（3 コマンド）
 
-前提は Rust 1.98.0（[rust-toolchain.toml](rust-toolchain.toml) で固定）と python3 です。リポジトリ直下で実行します。
-
-まず `python3 tools/dev_check.py` を実行してください。ビルドもダウンロードもせず、このチェックアウトで
-何が動き何が欠けているか（と次に打つコマンド）を数秒で出します。
+前提は Rust 1.98.0（[rust-toolchain.toml](rust-toolchain.toml) で固定）、Python 3、Java 21（NeoForge / Fabric 互換テスト用）です。開発ブランチ（`main` / `perf/worldgen-parallel`）にはテスト用の vanilla データが同梱されているため、clone 直後に以下の 3 ステップで開発・検証を開始できます：
 
 ```sh
-cargo build --locked
+# 1. ツールチェーンとローカル入力の診断（数秒）
+python3 tools/dev_check.py
+
+# 2. アーキテクチャ層・技術的負債・来歴（Provenance）ゲートの検証
+bash tools/layers_check.sh && bash tools/debt_ratchet.sh && python3 tools/provenance_check.py
+
+# 3. ビルド・単体テスト・サーバー起動
 cargo test --locked -- --test-threads=1
 MC_SPINE_PORT=25699 cargo run --locked
 ```
 
-通常のゲームlistenerは `127.0.0.1` にbindし、セーブはカレントディレクトリの `world_overlay.bin` に書きます。外部ネットワークに公開しないでください（[SECURITY_NOTES.md](SECURITY_NOTES.md)）。
+> **Note**: `tools/export_public_branch.sh` で生成されたクリーンエクスポート環境（Mojang 由来データを含まないツリー）から始める場合は、ステップ 1 の後に手元の 1.21.1 `server.jar` から 1 コマンドでデータを再生成できます：
+> `bash tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar --fetch-fabric-mappings --accept-eula`
 
-ビルドとテストには、手元で用意・生成するデータを要求するものがあります。データの種類、生成手順（Minecraft EULAへの同意を含む）、生成データなしで走る確認、テストの段階は [開発ガイド](docs/development.md) にまとめています。テストが緑でも、vanillaとの全機能一致や性能優位を意味しません。
+通常のゲームlistenerは `127.0.0.1` にbindし、セーブはカレントディレクトリの `world_overlay.bin` に書きます。外部ネットワークに公開しないでください（[SECURITY_NOTES.md](SECURITY_NOTES.md)）。データの種類、生成手順、テストの段階（T0 → T1 → T2）は [開発ガイド](docs/development.md) にまとめています。
 
 ## どこから読むか
 
-- 参加する: [CONTRIBUTING.md](CONTRIBUTING.md) → [開発ガイド](docs/development.md)
+- 参加する・並列作業の担当境界: [CONTRIBUTING.md](CONTRIBUTING.md) → [開発ガイド](docs/development.md)
 - 現在の作業と未解決事項: [specs/README.md](specs/README.md)
 - 目標と合格条件: [specs/PLAN.md](specs/PLAN.md) / 次の順序: [specs/ROADMAP.md](specs/ROADMAP.md)
 - 設計原則と比較の規律: [DESIGN.md](DESIGN.md)
@@ -43,6 +47,6 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 ## ライセンスとデータ
 
-コードは Apache-2.0（[LICENSE](LICENSE)、[NOTICE](NOTICE)）として**提案**されていますが、[LICENSING.md](LICENSING.md) §5 の項目が解消するまで確定していません。公開可能・リリース可能という状態ではありません。
+コード本体は **`GPL-3.0-or-later OR LGPL-3.0-or-later`**（[LICENSE](LICENSE)、[COPYING.LESSER](COPYING.LESSER)、[NOTICE](NOTICE)、[LICENSING.md](LICENSING.md)）でライセンスされています。通常は `GPL-3.0-or-later` として保護しつつ、後からいつでも `LGPL-3.0-or-later` としても利用・再ライセンス可能です。Fabric / NeoForge 互換レイヤ経由で動的ロードされる独立した外部 Mod JAR には本体のコピーレフトは波及しません。
 
-貢献の条件は inbound = outbound（Apache-2.0 §5）、DCO の `Signed-off-by`、GPL／AGPL／LGPL のコード・データを写さない、Mojang由来データや第三者jarを追加しない、です。開発ブランチはテスト用の生成データを追跡します。`tools/export_public_branch.sh --out ../mc-spine-public --verify` は、対象データと開発履歴を含まないローカルの審査用コピーを作ります（公開はしません）。**新しいデータを追加せず**、[CONTRIBUTING.md](CONTRIBUTING.md) の「データと来歴」に従ってください。
+貢献の条件は **Inbound = Outbound（`GPL-3.0-or-later OR LGPL-3.0-or-later`）**、DCO の `Signed-off-by`（`git commit -s`）、第三者の未許諾コード・Mojang 逆コンパイルコード・第三者 JAR を混入させないことです。詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。

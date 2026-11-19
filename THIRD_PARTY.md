@@ -3,28 +3,28 @@
 > **これは事実の一覧です。法的な判断・結論ではありません。** 各ファイルを再配布してよいか、どのライセンスが適用されるかは、このドキュメントでは判断していません。
 > **This is an inventory of facts only. It is not a legal opinion** and does not assert the license or redistribution status of any file. See §1 for development versus export contents and LICENSING.md §5 for release blockers.
 
-- 対象リビジョン / Revision: `main` @ `ef6e14a` (+ #16 + この PR / this PR)
-- リポジトリのコード本体は Apache-2.0 ([LICENSE](LICENSE)。提案段階で、公開前の確認事項は [LICENSING.md](LICENSING.md) を参照。以前は MIT でした)。以下の表は、**リポジトリ内にコミットされているがオリジナルのコードではないもの**(または出所が文書化されていないもの)の一覧です。
-- 作成日 / Written: 2026-10-25 (Asia/Tokyo)
+- 対象リビジョン / Revision: `perf/worldgen-parallel` / `main` (2026-11-20)
+- リポジトリのコード本体は `GPL-3.0-or-later OR LGPL-3.0-or-later` ([LICENSE](LICENSE), [COPYING.LESSER](COPYING.LESSER), [LICENSING.md](LICENSING.md)) です。以下の表は、**リポジトリ内にコミットされているがオリジナルのコードではないもの**(または過去に出所確認を行った資産)の一覧です。
+- 作成日 / Written: 2026-10-25 (Asia/Tokyo), 更新: 2026-11-20
 
 **出所の列の意味 / Origin column**
 
 | 値 | 意味 |
 |---|---|
-| `documented` | リポジトリ内の文書・スクリプトが出所を示している |
+| `documented` | リポジトリ内の文書・スクリプトが出所を示している（またはオーナーが自作と確認済み） |
 | `undocumented` | リポジトリ内に出所を示す文書が見つからない |
 | `unknown - owner to confirm` | 状況証拠はあるが、確認できていない。オーナーの確認が必要 |
 
-## 1. コミット済みの非オリジナル資産 / Committed non-original files
+## 1. コミット済みの非オリジナル資産・確認済み資産 / Committed assets & provenance inventory
 
 > 開発ブランチはテスト用の生成データを一部追跡します。以下は開発ツリーの一覧です。
 > `tools/export_public_branch.sh --out ../mc-spine-public --verify` は §5 の生成物を除外して ignore し、開発履歴を継がない別リポジトリを作ります。
-> `tools/provenance_check.py --strict-public` は D5 の対象パスが未追跡かつ ignore 済みかを検査します。公開許可ではありません。
+> `tools/provenance_check.py --strict-public` は D5 の対象パスが未追跡かつ ignore 済みかを検査します。
 
 | パス / Path | 内容・規模 / What & size | README の記述 | 出所 | 根拠・観察 (facts) |
 |---|---|---|---|---|
 | `datapacks/vanilla/` | worldgen JSON・tag・構造テンプレート・biome tree | Mojang 由来 | `documented` | 開発用に追跡。`tools/vanilla_data/gen_vanilla_data.sh --verify` で目録を照合する (§5)。 |
-| `datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` | テスト用の小さな datapack (計 約25 files) | 記述なし | `unknown - owner to confirm` | テスト用途と思われるが、作成者の記録はない (`rectest`/`testpack` は `data/minecraft` 配下に1ファイルずつ持つ)。 |
+| `datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` | テスト用の小さな datapack (計 約25 files) | 自作テストフィクスチャ | `documented` (first-party) | オーナー (`nekomario28`) により自作（first-party）の最小テスト用 datapack であることを確認済み (2026-11-20)。 |
 | `assets/blocks_1211.json` | ブロック物性 (1060 entries, 765,435 bytes, sha256 `7d1d95c4…c654`, `id/name/displayName/hardness/resistance/stackSize/diggable/material/...`) | Mojang 由来 | `documented` (下記) | **PrismarineJS/minecraft-data の `data/pc/1.21.1/blocks.json` とバイト単位で同一** (2026-10-25 に GitHub API で取得して `cmp` で確認。最終変更 commit `d56346a4e32d`, 2024-10-26)。minecraft-data は MIT (同リポジトリの README「License: MIT」。リポジトリ直下に LICENSE ファイルは無く、著作権者名の記載は見つからなかったため、ここでは作成していない)。README は「一部のデータは wiki.vg / minecraft.gamepedia.com から抽出」とも記載。帰属表示は [NOTICE](NOTICE) と README を参照。 |
 | `assets/block_states_1211.json` | 状態ごとの luminance / light_block / flags / full_sides と衝突形状 (dedup した `shapes` + 状態ごとの `collision_shapes`) | Mojang 由来 (jar の事実値) | `documented` | `tools/vanilla_data/gen_vanilla_data.sh` が 1.21.1 jar から生成し、`jar_sha1` を自分のフィールドに持つ (照合は `tools/provenance_check.py`)。**現行ブランチでは追跡**しており、`git ls-files` で確認できる。公開候補では除外。 |
 | `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv` | biome 検索結果・照合値 | 事実値 | `documented` | 生成対象だが開発 HEAD では未追跡かつ ignore されていない。 |
@@ -34,13 +34,13 @@
 | `config_packets.bin` (旧: 105,095 bytes) | 開発用に追跡 (§9) | Mojang 由来 | 生成手順あり: `tools/vanilla_data/capture_config_packets.py` | 手元の 1.21.1 jar から実サーバーを一時起動して Configuration フェーズを記録する (`--accept-eula` 必須)。旧ファイルとは tag パケットの registry の並びだけが異なる (同サイズ、registry data は先頭から一致)。 |
 | `evidence/gameplay/**/*.javap.txt` (旧 6 files) | **削除** (§9) | — | 削除済み | Mojang クラスの逆アセンブルは再配布しない。`tools/bytecode_probe.sh <class>` が手元の jar と公式マッピングから同じ出力を作る。 |
 | `evidence/gameplay/**/*.mapping.txt`, `evidence/gameplay/light-update/mappings.txt` (旧 3 files) | **削除** (§9) | — | 削除済み | Mojang 公式マッピングの抜粋は再配布しない。`tools/bytecode_probe.sh` が利用者の手元のマッピングを読む。 |
-| `evidence/foundation/audit-snapshots/main.*.rs` (4 files) | 過去の自作 `src/main.rs` のスナップショット | (第三者物ではない) | `documented` | 同ディレクトリの README が由来と sha256 を記載。第三者由来ではなく、このリポジトリの自作コードの旧版です。`AUDIT_WIRE.md` / `SECURITY_NOTES.md` から参照されています (削除していません)。 |
+| `evidence/foundation/audit-snapshots/main.*.rs` (4 files) | 過去の自作 `src/main.rs` のスナップショット | (第三者物ではない) | `documented` (first-party) | 同ディレクトリの README が由来と sha256 を記載。第三者由来ではなく、このリポジトリの自作コードの旧版です。`AUDIT_WIRE.md` / `SECURITY_NOTES.md` から参照されています (削除していません)。 |
 | `src/brigadier.rs` (Rust 移植) | Mojang の Brigadier 1.3.10 (MIT) のコア (StringReader / コマンド木 / dispatcher / context / suggestion / 基本引数型) を Rust に翻訳したもの。**Java のソースは同梱していない** | 記述なし (issue #51 slice 1 で追加) | `documented` (下記 §11) | 上流 `https://github.com/Mojang/brigadier` の commit `b5419b186e4882290a188d11d6e661d4f56bd8fd` (2024-08-07) を参照。MIT の著作権表示は上流 LICENSE のまま「Copyright (c) Microsoft Corporation」。NOTICE に MIT 全文と帰属を記載。参照クローンは `/home/yuu/mc-spine-local/reference/brigadier-1.3.10/` に置き、リポジトリには含めない。 |
-| `*.storyboard.png` (リポジトリ直下 6 files, `evidence/gameplay/protocol-lifecycle/spine_proto.storyboard.png`) | 図 | 記述なし | `unknown - owner to confirm` | 作成方法の記録は未確認 (自作図と思われる)。 |
+| `*.storyboard.png` (リポジトリ直下 6 files) | 旧図 (`auth`, `deps`, `deps_target`, `escape`, `machine`, `schema`) | — | 削除済み (`git rm`) | 不要につきリポジトリ直下の 6 枚を削除 (2026-11-20)。`evidence/gameplay/protocol-lifecycle/spine_proto.storyboard.png` は自作のプロトコル状態遷移図 (`documented`, first-party)。 |
 
 ## 2. Rust 依存クレートのライセンス / Rust dependency licenses
 
-`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`mc-spine` 自体は `Cargo.toml` で `license = "Apache-2.0"` を宣言しています (LICENSE と一致)。この表に GPL / LGPL / AGPL / MPL のものはありません (LICENSING.md §2a)。
+`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`mc-spine` 自体は `Cargo.toml` で `license = "GPL-3.0-or-later OR LGPL-3.0-or-later"` を宣言しています (`LICENSE` / `COPYING.LESSER` と一致)。依存クレート 78 個に GPL / LGPL / AGPL / MPL のものはありません (LICENSING.md §2a)。
 Copied verbatim from the `license` field of each crate's published metadata; this is what the crates declare, not an independent verification of their license texts. 78 crates (optional JNI adapters included).
 
 | crate | version | license (as declared) | 種別 |
@@ -181,7 +181,7 @@ Pumpkin (GPL-3.0) のコードは読んでいない・参照していない。
 4. (対応済み・§9) `config_packets.bin` は実サーバーから再取得でき、開発ブランチでは追跡しています。
 5. (対応済み・§9) javap / マッピング抜粋は削除しました (`tools/bytecode_probe.sh` で再生成できます)。履歴には残っています。
 6. (対応済み・§9) `resourcepack.zip` は削除しました (任意機能)。履歴には残っています。
-7. `datapacks/{modtest,rectest,spinetest,tagtest,testpack}` と `*.storyboard.png` は自作ですか?
+7. (確認・対応済み, 2026-11-20) `datapacks/{modtest,rectest,spinetest,tagtest,testpack}` はオーナー自作（first-party）と確認済み。リポジトリ直下の `*.storyboard.png` 6 ファイルは不要につき削除済み。
 8. このリポジトリは過去に公開されていた形跡があります (issue #11)。公開されていた期間に上記のファイルは含まれていましたか? 履歴にも残っています (この PR は履歴を書き換えません)。
 9. 外部からの貢献やコードの取り込みについて、出所とライセンスを記録しますか? (以前ここに挙げていた `src/generation_math.rs` のテスト値は §10 で jar から生成した値に置き換え済み。)
 10. 依存クレートのうち `webpki-roots` は `CDLA-Permissive-2.0`、`unicode-ident` は `(MIT OR Apache-2.0) AND Unicode-3.0` を宣言しています。配布時の表記方法 (ライセンス全文の同梱など) はどうしますか? (`deny.toml` は許可リストに載せているだけで、表記義務の遵守を確認するものではありません。)
