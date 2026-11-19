@@ -42,11 +42,11 @@
 ### P0 — 作業の検証基盤と入力意味論（並行して先行）
 
 - [ ] **P0-1 HEAD再現と失敗の基線固定** — これから検証する対象SHAのコード・入力資産・固定jarのdigestを紐付け、`tests/verify.sh`（serial / 8-thread×3 / wire / adapter / layers / debt / mutations）で現在の一次失敗を収集。テスト失敗をmutex poisonやCI課金停止と混同しない。各結果に実行環境・終了コード・省略項目を記録する。
-- [ ] **P0-2 1.21.1 density/surface/biomeの到達性監査** — `01a6528` で `tools/p0_2_audit.py` の `Cond::Biome(u128)` アンカー検証・`< 128` 上限同期および 3 次元到達性監査スナップショット（[`evidence/foundation/audit-snapshots/p0-2-reachability-20261119.md`](../evidence/foundation/audit-snapshots/p0-2-reachability-20261119.md)、未対応・欠落ゼロ）を記録済み。残る `spawn_costs` と NaturalSpawner 実行経路の実クラス対照で完全閉鎖する。
-- [x] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー — Stage F1 完了）** — `762f312` で D1〜D4、`d45cb4c` で D5、`88573be` で `GPL-3.0-or-later`（寄稿は `LGPL-3.0-or-later` とのデュアルライセンス）および全ファイルの出所確定を完了済み：
-  - [x] **D1/D2 (`F1-1`, `762f312`)**: `tools/vanilla_data/gen_vanilla_data.sh`（`--verify` 2,350 ファイル・SHA-256 照合）と `assets/block_states_1211.json` の jar 自前生成化を完了。
-  - [x] **D3/D4 (`F1-2`, `762f312`)**: Pumpkin (GPL-3.0) 同値の旧 `assets/pblocks.json`・`assets/properties.json` および出所不明の `resourcepack.zip` を消費者切替の上で削除し、`tools/provenance_check.py`（`--self-test` 13/13 PASS、`--strict-public` 対応）をゲート追加。
-  - [x] **D5 (`F1-3`, `d45cb4c`, `106a107`, `88573be`)**: `tools/export_public_branch.sh`・`tests/public_export_test.py` 整備、不要な直下 `*.storyboard.png` 6枚の削除、`datapacks/{modtest,rectest,spinetest,tagtest,testpack}` の自作確定、および `LICENSE` (`GPL-3.0-or-later`) / `COPYING.LESSER` (`LGPL-3.0-or-later`) / `Cargo.toml` / `NOTICE` / `THIRD_PARTY.md` / `README.md` / `CONTRIBUTING.md` / `LICENSING.md` の完全統一を完了。
+- [ ] **P0-2 1.21.1 density/surface/biomeの到達性監査** — `8d047a9` で `tools/p0_2_audit.py` の `Cond::Biome(u128)` アンカー検証・`< 128` 上限同期および 3 次元到達性監査スナップショット（[`evidence/foundation/audit-snapshots/p0-2-reachability-20261119.md`](../evidence/foundation/audit-snapshots/p0-2-reachability-20261119.md)、未対応・欠落ゼロ）を記録済み。残る `spawn_costs` と NaturalSpawner 実行経路の実クラス対照で完全閉鎖する。
+- [x] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー — Stage F1 完了）** — `4b43735` で D1〜D4、`04f61a7` で D5、`bd06c8a` で本体 `GPL-3.0-or-later`（寄稿は `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` のトリプルライセンス）・全ファイルの出所確定・`git filter-repo --invert-paths` による過去の削除済み不純ファイルの全履歴抹消を完了済み：
+  - [x] **D1/D2 (`F1-1`, `4b43735`)**: `tools/vanilla_data/gen_vanilla_data.sh`（`--verify` 2,350 ファイル・SHA-256 照合）と `assets/block_states_1211.json` の jar 自前生成化を完了。
+  - [x] **D3/D4 (`F1-2`, `4b43735`)**: 旧 `assets/pblocks.json`・`assets/properties.json` および `resourcepack.zip` を消費者切替の上で削除・全履歴抹消し、`tools/provenance_check.py`（`--self-test` 11/11 PASS、`--strict-public` 対応）をゲート追加。
+  - [x] **D5 (`F1-3`, `04f61a7`, `6127c66`, `bd06c8a`)**: `tools/export_public_branch.sh`・`tests/public_export_test.py` 整備、不要な直下 `*.storyboard.png` 6枚の削除（および履歴抹消）、`datapacks/{modtest,rectest,spinetest,tagtest,testpack}` の自作確定、および `LICENSE` (`GPL-3.0-or-later`) / `COPYING.LESSER` (`LGPL-3.0-or-later`) / `COPYING.AGPL` (`AGPL-3.0-or-later`) / `Cargo.toml` / `NOTICE` / `THIRD_PARTY.md` / `README.md` / `CONTRIBUTING.md` / `LICENSING.md` の完全統一を完了。
 - [ ] **P0-4 native比較契約の固定** — Fossilが**正に配置される**fixture、complete FULL chunks、必要halo、sourceの生成順、2回のnative採取の再現性を定義。artifactに入力・SHA・対象セル数・除外数・pending tick・writerを記録し、古い測定値の流用を防ぐ。
 
 ### P1 — Template finalization（**最優先の実装列**）
@@ -60,43 +60,43 @@
 ### P2 — 全WorldGenへ段階的拡張
 
 - [ ] **P2-1 汎用template / processor / structure starts** — [仕様](worldgen-parity/README.md)。**34定義・16アルゴリズム型**すべてが `src/structure_pipeline.rs` に dispatch 先と scripted oracle TSV を持つ。残る作業は：
-  - [x] **P2-1-T0 (`2ee2560`)**: `StructurePiece.placeBlock` の `SHAPE_CHECK_BLOCKS` マーク（template/jigsaw 経路）＋ `Feature.markAboveForPostProcessing` ＋ promotion 限定 `BushBlock` 除去（`village-taiga` 0 / 884,736 達成）。
+  - [x] **P2-1-T0 (`35cf12c`)**: `StructurePiece.placeBlock` の `SHAPE_CHECK_BLOCKS` マーク（template/jigsaw 経路）＋ `Feature.markAboveForPostProcessing` ＋ promotion 限定 `BushBlock` 除去（`village-taiga` 0 / 884,736 達成）。
   - [x] **P2-1-T1**: チャンク昇格時（`postProcessGeneration`）の非空流体セルに対する fluid tick 予約・配送接続（`src/main.rs` の `structure_template::register_fluid_ticker` / `promotion_fluid_tick` 登録済み）。
-  - [x] **P2-1-T2 (`2481b48`)**: `structure_pipeline::load_defs_inner` で1つの不正な構造物 JSON が全パイプラインを `None` に落とす欠陥を要素単位の fail-skip + ログに修正。
-  - [ ] **P2-1-T3 & 残存構造物受入（Phase C-2 Batch B3 完了 `7f0f0e5`）**: `bb6ec7c`（`ruined_portal` B-run・`monument`）、`2481b48`（`igloo`）、`2a4eaf4`（`village_plains`）に加え、`7f0f0e5`（[evidence/gameplay/feature-parity/structure-batch-b3-20261120.md](../evidence/gameplay/feature-parity/structure-batch-b3-20261120.md)）で `desert_pyramid`・`shipwreck`・`ocean_ruin_cold`（tall seagrass 更新修正）を 0-diff 昇格（計 **19 チャンク 0-diff**）。残る HOLD（`buried_treasure`, `swamp_hut`：Audit 1 で特定された `valid_biome` quart 座標 noise biome 判定への修正対象）と Batch B4 を段階的受入。
+  - [x] **P2-1-T2 (`5fb816b`)**: `structure_pipeline::load_defs_inner` で1つの不正な構造物 JSON が全パイプラインを `None` に落とす欠陥を要素単位の fail-skip + ログに修正。
+  - [ ] **P2-1-T3 & 残存構造物受入（Phase C-2 Batch B3 完了 `ba6e2c3`）**: `ruined_portal` B-run・`monument`、`5fb816b`（`igloo`）、`b1beec5`（`village_plains`）に加え、`ba6e2c3`（[evidence/gameplay/feature-parity/structure-batch-b3-20261120.md](../evidence/gameplay/feature-parity/structure-batch-b3-20261120.md)）で `desert_pyramid`・`shipwreck`・`ocean_ruin_cold`（tall seagrass 更新修正）を 0-diff 昇格（計 **19 チャンク 0-diff**）。残る HOLD（`buried_treasure`, `swamp_hut`：Audit 1 で特定された `valid_biome` quart 座標 noise biome 判定への修正対象）と Batch B4 を段階的受入。
 - [ ] **P2-2 残るconfigured featuresと実chunk差分** — `bonus_chest` および End の `minecraft:end_spike` は実装・native oracle 照合・4 mutation ゲート済み（`src/feature.rs`, `src/generation_contract_tests.rs`, `tools/mutation_check.sh`）。残る `sculk_patch` 等の最新HEAD・同一population順再計測と `sculk_gate.py --require-match` 判断を閉じる。
 - [x] **P2-3 三dimensionの通常サーバー経路（Stage F2 の中核）** — `MC_SPINE_WG_PRESET=end|nether` は offline 診断限定のため、以下の S0〜S4 で通常サーバーの3次元生成・保存・配信・移動を完成済み：
-  - [x] **P2-3-S0 (`ffb7a22`)**: `tests/protocol767.py` CLI ハーネスの次元対応（`dimension_type` の `min_y`/`height`/`has_skylight` 動的解釈）。
-  - [x] **P2-3-S1 (`71e96a5`)**: `DimId` (`Overworld | Nether | End`) と次元別 `Gen` レジストリ（同一 seed 初期化）、`chunk_data` / `write_light_arrays` への `DimId` 配線。
-  - [x] **P2-3-S2a (`2e95617`)**: `WORLD` オーバーレイの `DimChunkKey = (DimId, i32, i32)` 化・次元別コンパニオンセーブ・旧 `world_overlay.bin` 後方互換（選択 mutation 4/4 proved）。
-  - [x] **P2-3-S2b〜d (`1ec70b0`, `0e532bb`)**: 残り 8 ストア（`S2b`: `CHESTS`/`FURNACES`/`CROPS`、`S2c`: `SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`、`S2d`: `POS_STORE`）の `DimId` キー化。
-  - [x] **P2-3-S3 (`3a3bb37`)**: Nether/End の 16 セクション（`0..256`）チャンク構築と `has_skylight == false` 時の `skyLightMask = 0` 配信。
-  - [x] **P2-3-S4 (`c40417d`)**: `0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン次元復元の wire 検証（`tests/dimension_wire.py` PASS、選択 mutation 8/8 proved）。
+  - [x] **P2-3-S0 (`b38aa75`)**: `tests/protocol767.py` CLI ハーネスの次元対応（`dimension_type` の `min_y`/`height`/`has_skylight` 動的解釈）。
+  - [x] **P2-3-S1 (`4576ec1`)**: `DimId` (`Overworld | Nether | End`) と次元別 `Gen` レジストリ（同一 seed 初期化）、`chunk_data` / `write_light_arrays` への `DimId` 配線。
+  - [x] **P2-3-S2a (`526c338`)**: `WORLD` オーバーレイの `DimChunkKey = (DimId, i32, i32)` 化・次元別コンパニオンセーブ・旧 `world_overlay.bin` 後方互換（選択 mutation 4/4 proved）。
+  - [x] **P2-3-S2b〜d (`77db4a6`, `0c0ecbb`)**: 残り 8 ストア（`S2b`: `CHESTS`/`FURNACES`/`CROPS`、`S2c`: `SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`、`S2d`: `POS_STORE`）の `DimId` キー化。
+  - [x] **P2-3-S3 (`e2c8939`)**: Nether/End の 16 セクション（`0..256`）チャンク構築と `has_skylight == false` 時の `skyLightMask = 0` 配信。
+  - [x] **P2-3-S4 (`c543c92`)**: `0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン次元復元の wire 検証（`tests/dimension_wire.py` PASS、選択 mutation 8/8 proved）。
 
 ### P3 — M2 gameplay / M3性能（WorldGenと証拠を混ぜない）
 
-- [x] **P3-1 M2観測可能なゲーム操作** — [合格範囲](PLAN.md)・[Horizon計画](horizon-gameplay/README.md)。Slice 3a〜3d（チェスト/樽/エンダーチェスト・遅延 LootTable・waterlogged chest、`0fa6807`）、Slice 4a〜4c（衝突・流体高/水流押し・押し合い/空間グリッド）完了。
-  - [x] **Slice 4d (`b822d99`)**: `LivingEntity.travel` の水中/溶岩移動・浮力・落下減衰と Nether `ultraWarm` 溶岩押し流し倍率（`0.0023333333333333335`）。
-  - [x] **一般 1.21.1 `BaseSpawner` + `SpawnPotentials` (`b2e41b5`)**: `src/spawner.rs` の重み付きポテンシャル・カスタムスポーン規則・NBT 往復。
-  - [x] **Phase C-1 M2 実 wire 往復検査 (`6b07fee`)**: 戦闘・死亡/リスポーン・2×2 クラフト/かまど精錬・天候/昼夜永続化の CLI 実 wire 往復検査（`tests/m2_gameplay_wire.py` PASS、`tests/verify.sh` 統合済み）。
-  - [x] **Phase D-1 ランタイム Lock 順序・EID 衝突・次元別流体/作物修正 (`d0f0afd`)**: `FURNACES`/`CROPS`/`Mob.pos` のロック順序逆転解消、`load_world` 保存ドロップと Mob EID の衝突防止、Nether/End の次元別プレイヤー流体（溺水/溶岩）＆作物成長修正（`d1_` 3 tests + `m2_gameplay_wire.py` & `dimension_wire.py` PASS）。
-- [ ] **P3-2 生成の並列化と性能gate（M3 P1〜P5 + 超高効率計算 Layer A1〜A4）** — [仕様](chunk-parallelism/README.md)。実装完了（代表負荷 `WARM=1` 対照の最終判定は `P4-1` で統合確認）：
-  - [x] **M3 P1a (`3135354`) / P1b (`b588c03`)**: 負荷非依存カウンタ（M1〜M5）＋ラウンド単位 `TerrainShare`・single-flight `starts`/`rings`・`Arc` `terr_c` により、`full` CPU +88% ペナルティを完全解消。
-  - [x] **M3 P2a (`43a463b`) / P2b (`0469ad9`) / P2c (`c06be7c`)**: 常駐 `PalettedSection` モジュール（`src/paletted.rs`）、`SECTION_STORE`・zero-repack チャンク配信、`PalettedSection::uniform_state()` O(1) uniform fast-path。
-  - [x] **M3 P3a (`1befd35`) / Layer A3-a/b/c (`2a4eaf4`, `b105d58`, `91b19c4`) / A3-a キャッシュ共有 (`d918eac`)**: Carver dense map + `OriginGrid` + `carve_batch`、Feature `u128` バイオームマスク、バッチ pre-carve + 依存 DAG 並列 `populate_parallel` ＋ ワーカー `col_c`/`chunk_biomes` 共有（全次元 SHA-256 ビット完全一致）。
-  - [x] **M3 P4a (`06abd5f`) / Layer A1-a/b/c (`3cb6d24`, `b981704`, `d918eac`) / Layer A2-a/b/c (`c745772`, `785cdf5`, `4d28f01`)**: Aquifer `AqChunkGrid` 化、`beard`/stronghold 遅延化、2D コーナーメモ＋AVX2/AVX-512 `DfProg`/noise、lazy surface mats、`Cond::Biome(u128)`＋`Rule::Seq` 直接反復。
-  - [x] **M3 P5 & Layer A4 (`ea59c4e`, `b2e41b5`, `c06be7c`, `e82fbc6`)**: 配信パレット書込 -89%、sky spill -52〜63%、floor cache -88%、`EntitySpatialGrid` 単一マップ化、512-entry `MapChunkCache`、`tools/pgo_build.sh`（PGO `full j=8` `2.971s -> 2.656s`、-10.6%、全 dump SHA-256 ビット完全一致）。
+- [x] **P3-1 M2観測可能なゲーム操作** — [合格範囲](PLAN.md)・[Horizon計画](horizon-gameplay/README.md)。Slice 3a〜3d（チェスト/樽/エンダーチェスト・遅延 LootTable・waterlogged chest、`3374380`）、Slice 4a〜4c（衝突・流体高/水流押し・押し合い/空間グリッド、`150e53a`）完了。
+  - [x] **Slice 4d (`e15a7ce`)**: `LivingEntity.travel` の水中/溶岩移動・浮力・落下減衰と Nether `ultraWarm` 溶岩押し流し倍率（`0.0023333333333333335`）。
+  - [x] **一般 1.21.1 `BaseSpawner` + `SpawnPotentials` (`0c88980`)**: `src/spawner.rs` の重み付きポテンシャル・カスタムスポーン規則・NBT 往復。
+  - [x] **Phase C-1 M2 実 wire 往復検査 (`2a68722`)**: 戦闘・死亡/リスポーン・2×2 クラフト/かまど精錬・天候/昼夜永続化の CLI 実 wire 往復検査（`tests/m2_gameplay_wire.py` PASS、`tests/verify.sh` 統合済み）。
+  - [x] **Phase D-1 ランタイム Lock 順序・EID 衝突・次元別流体/作物修正 (`ff8addf`)**: `FURNACES`/`CROPS`/`Mob.pos` のロック順序逆転解消、`load_world` 保存ドロップと Mob EID の衝突防止、Nether/End の次元別プレイヤー流体（溺水/溶岩）＆作物成長修正（`d1_` 3 tests + `m2_gameplay_wire.py` & `dimension_wire.py` PASS）。
+- [ ] **P3-2 生成の並列化と性能gate（M3 P1〜P5 + 超高効率計算 Layer A1〜A4）** — [仕様](chunk-parallelism/README.md)。実装完了（Phase D-2 のホットパス修正と代表負荷 `WARM=1` 対照の最終判定は `P4-1` で統合確認）：
+  - [x] **M3 P1a (`7c00617`) / P1b (`5f01327`)**: 負荷非依存カウンタ（M1〜M5）＋ラウンド単位 `TerrainShare`・single-flight `starts`/`rings`・`Arc` `terr_c` により、`full` CPU +88% ペナルティを完全解消。
+  - [x] **M3 P2a (`src/paletted.rs`) / P2b (`0ef6a60`) / P2c (`30d0346`)**: 常駐 `PalettedSection` モジュール（`src/paletted.rs`）、`SECTION_STORE`・zero-repack チャンク配信、`PalettedSection::uniform_state()` O(1) uniform fast-path。
+  - [x] **M3 P3a (`61d516d`) / Layer A3-a/b/c (`b1beec5`, `c0478a1`, `c99fff9`) / A3-a キャッシュ共有 (`482e81b`)**: Carver dense map + `OriginGrid` + `carve_batch`、Feature `u128` バイオームマスク、バッチ pre-carve + 依存 DAG 並列 `populate_parallel` ＋ ワーカー `col_c`/`chunk_biomes` 共有（全次元 SHA-256 ビット完全一致）。
+  - [x] **M3 P4a (`3e1ba0b`) / Layer A1-a/b/c (`101b9f7`, `cd3abf9`, `482e81b`) / Layer A2-a/b/c (`79a2002`, `2733c13`, `7b3917f`)**: Aquifer `AqChunkGrid` 化、`beard`/stronghold 遅延化、2D コーナーメモ＋AVX2/AVX-512 `DfProg`/noise、lazy surface mats、`Cond::Biome(u128)`＋`Rule::Seq` 直接反復。
+  - [x] **M3 P5 & Layer A4 (`d4fa504`, `0c88980`, `30d0346`, `d06032e`)**: 配信パレット書込 -89%、sky spill -52〜63%、floor cache -88%、`EntitySpatialGrid` 単一マップ化、512-entry `MapChunkCache`、`tools/pgo_build.sh`（PGO `full j=8` `2.971s -> 2.656s`、-10.6%、全 dump SHA-256 ビット完全一致）。
 
 ### R5 — Mod 互換層（NeoForge 1.21.1 S0〜S3+）
 
-- [x] **NF-Arch（設計確定 `da9ae45`）**: [neoforge-architecture.md](mod-compatibility/neoforge-architecture.md)（5 レイヤ構成・`DimId` 対応・バッチ JNI・`shimcheck` 起動前拒否）。
-- [x] **NF-0 (S0 `shimcheck` `a092e5d`)**: `ShimCheck.java`（ASM `9.10.1` + `neoforge.mods.toml` 解析）＋ `tools/shimcheck.py` ＋ `tests/shimcheck_test.py`（33 tests PASS）。
-- [x] **NF-1 (動的 Bootstrap & Dual Event Bus `23edfdc`)**: `ShimCheck` ゲート付き複数 Mod 動的ディスカバリ・コンストラクタ注入・`Bus.GAME` / `Bus.MOD` 振り分け・`Dist.CLIENT` 除外・`tests/neoforge_bootstrap_test.py`（計 45 tests PASS）。
+- [x] **NF-Arch（設計確定 `3efb811`）**: [neoforge-architecture.md](mod-compatibility/neoforge-architecture.md)（5 レイヤ構成・`DimId` 対応・バッチ JNI・`shimcheck` 起動前拒否）。
+- [x] **NF-0 (S0 `shimcheck` `a42ebb2`)**: `ShimCheck.java`（ASM `9.10.1` + `neoforge.mods.toml` 解析）＋ `tools/shimcheck.py` ＋ `tests/shimcheck_test.py`（33 tests PASS）。
+- [x] **NF-1 (動的 Bootstrap & Dual Event Bus `6d3a03d`)**: `ShimCheck` ゲート付き複数 Mod 動的ディスカバリ・コンストラクタ注入・`Bus.GAME` / `Bus.MOD` 振り分け・`Dist.CLIENT` 除外・`tests/neoforge_bootstrap_test.py`（計 45 tests PASS）。
 - [ ] **NF-2〜NF-4 (S1〜S3)**: S1 主要 6 イベント + `MutationBuffer` → S2 `DeferredRegister` + 名前ベース永続化 → S3 Direct `ByteBuffer` バッチ JNI。
 
 ### R6 — クライアントフォーク計画と Server-Client 共通カーネル（`mc-spine-client`）
 
-- [ ] **CF-0（Server-Client 共有コアの切り出し）**: `src/block_registry.rs` (`26,684` states / `FULL`/`CENTER`/`RIGID`)、`src/entity_collision.rs`、`src/entity_fluid.rs`、`src/paletted.rs`、`src/lighting.rs`、`src/nbt.rs`、`src/brigadier.rs` をサーバーとクライアントフォークの共有クレート境界（Zero-Drift Shared Kernel）として切り出す。
+- [ ] **CF-0（Server-Client 共有コアの公開 — `layers_check.sh` 互換）**: `tools/layers_check.sh`（44 modules / 111 edges）の静的モジュールグラフを維持したまま、`src/block_registry.rs` (`26,684` states / `FULL`/`CENTER`/`RIGID`)、`src/entity_collision.rs`、`src/entity_fluid.rs`、`src/paletted.rs`、`src/lighting.rs`、`src/nbt.rs`、`src/brigadier.rs` をライブラリ境界（`rlib` / `cdylib` Zero-Drift Shared Kernel）としてサーバー・クライアント間で共有する。
 - [ ] **CF-1（ヘッドレス 1.21.1 決定論的シミュレータ & E2E ボットクライアント）**: 受信チャンク (`0x27`)・ブロック更新 (`0x09`)・エンティティ移動 (`0x5a`) を共有カーネル上で毎 tick ローカル予測し、Vanilla 1.21.1 サーバーおよび `mc-spine` サーバーとの位置・流体・衝突誤差 0 を検証する。
 - [ ] **CF-2（クライアント描画・増分ライティング・Greedy Meshing 接続）**: ファーストパーティファイルに外部 `AGPL-3.0-only` コードを混ぜず（トリプルライセンス双方向性を維持）、`PalettedSection` と `lighting.rs` から直接セクションメッシュを生成する描画パイプラインを接続（Issue `#43` と連携）。
 - [ ] **CF-3（`mods/` 投入型 Rust Integrated Server — `mc-spine-integrated.jar` / `cdylib`）**: 既存 Fabric/NeoForge クライアント（Sodium/Iris 等）の `mods/` に 1 個 JAR を入れるだけで、シングルプレイ／LAN ホストのサーバー処理を 100% Rust (`libmc_spine` + 共有メモリ / Direct `ByteBuffer` FFI) にオフロード。
@@ -109,11 +109,8 @@
 
 ## 次の着手
 
-[ROADMAPの直近の実行順](ROADMAP.md#直近の実行順2026-11-13)を参照する。
-最初は既存captureの再現診断とsnowyセルの読み取り位置・writer比較。
-P1-1/P1-2/P1-3は既存の限定実装を再利用して不足する出口だけを追加する。
+[ROADMAPの直近の実行順](ROADMAP.md#直近の実行順2026-11-20-同期)（Track 1: Phase D-2 ホットパス修正＆残存構造物 Batch B4、Track 2: NeoForge S1 `NF-2`、Track 3: Client Fork `CF-0`〜`CF-4` ＆ Template 最終化 `P1`）を参照する。
 下記の作成時点の「未実行」を、現在の未実装一覧や最新gate結果に読み替えない。
-資産・出所の監査は未完であり、新しいデータの再配布やリリースの承認にはならない。
 
 ## 履歴: 作成時点の作業実績（2026-11-06〜07）
 

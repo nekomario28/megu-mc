@@ -45,11 +45,13 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 - **Valence は部品単位で評価。** 旧版 framework や registry は導入せず、entity角度・section palette・NBT文字列書き出し・有限AABB判定を既存 owner で修復しています。[再利用判断](../evidence/foundation/valence-reuse/README.md)、[角度](../evidence/gameplay/entity-angles/README.md)、[binary/geometryの検証範囲](../evidence/foundation/valence-primitives/README.md)、[分割した契約](valence-primitives/README.md)を参照。entity全体・任意NBT・worldのparityではありません。
 - **feature生成境界は限定一致、runtimeは未達。** seed 0・structures=falseのforest 3×3を、nativeと同じ明示source順・tick停止状態で通常バイナリからdumpし、884,736セルすべて0差。leaf属性や流体の除外はありません。元の保存参照との差1,803セルは残り、新しいnative tick有効controlとwriter traceで境界を確認しました。生成順は入力であり、vanilla ticket schedulerは未実装です。[feature contracts](../evidence/gameplay/forest-r1/feature-contracts.md)を数値・範囲の正本とします。
 - **kelpは実装済みだが移行後のvanilla parityは未確定。** 正の参照セルを持つ固定具とdraw列・列単位の比較は[過去の記録](../evidence/gameplay/carvers/README.md)にあります。古い一時worldを前提にせず、自前データの意味論を修正した後、同じseed・座標・stageで参照を再構成して比較します。
-- **構造物は未実装。** jigsaw、template pool、NBT経由の構造物配置は未対応です。
-- **M3は未達。** 地形が一致しない条件で得た旧x0.63値は性能根拠に使いません。比較条件・最新の測定と限界は[生成器の費用](../evidence/gameplay/worldgen-cost/README.md)を参照してください。
+- **構造物は34定義・16アルゴリズム型の生成パイプライン接続済み、実チャンク受入を拡大中。** jigsaw、template pool、NBT経由の構造物配置は `src/structure_pipeline.rs` に接続され、Batch B1〜B3（`ruined_portal`, `monument`, `igloo`, `village_plains`, `desert_pyramid`, `shipwreck`, `ocean_ruin_cold` 等）で**計19チャンクの0差分昇格**を確認済みです（[structure-batch-b3-20261120.md](../evidence/gameplay/feature-parity/structure-batch-b3-20261120.md)）。残る HOLD（`buried_treasure`, `swamp_hut`）と未検証構造物を段階的に受け入れます。
+- **3ディメンション通常経路（Overworld / Nether / End）と M2 実 wire 往復は接続済み。** `DimId` による9ストア分離、16セクション（`min_y=0, height=256, skyLightMask=0`）の Nether/End チャンク配信、ポータル移動・リスポーン・再起動復元の実通信検査（`tests/dimension_wire.py`）、および戦闘/死亡/リスポーン・クラフト/かまど・天候/昼夜の実通信検査（`tests/m2_gameplay_wire.py`）を通過しています。
+- **M3 超軽量化（P1〜P5 + Layer A1〜A4 + PGO）は実装済み、最終統合 SHA での代表負荷 back-to-back 判定待ち。** `PalettedSection` 常駐ストア、AVX2/AVX-512 `DfProg`/noise、依存 DAG 並列 `populate_parallel`、空間グリッド・パケットキャッシュ・PGO レシピ（`tools/pgo_build.sh`）を統合済みです。地形が一致しない旧測定は性能根拠に使わず、最新の計測と限界は[生成器の費用](../evidence/gameplay/worldgen-cost/README.md)を参照してください。
+- **NeoForge 1.21.1 互換レイヤ（R5）と クライアントフォーク計画（R6）:** S0 `shimcheck`（`tools/shimcheck.py`）および NF-1 動的ブートストラップ＆Dual Event Bus（`tests/neoforge_bootstrap_test.py`、計45 tests PASS）が稼働しています。クライアントフォーク・ランチャー統合計画（`CF-0`〜`CF-4`）は [ROADMAP.md](ROADMAP.md#r6--クライアントフォーク計画と-server-client-共通カーネルmc-spine-client) を参照してください。
 - **ローカルsuiteと限定native一致は、全体合格ではありません。** 個別oracle・mutation・全体回帰のreceiptを確認し、hosted CI、whole-world、M2/M3を別々に判定します。以前のleaf-distance属性除外によるno-tick 0は受け入れ根拠から撤回しました。次の境界は[ROADMAP](ROADMAP.md)にあります。
-- **コード検証（旧統合線の履歴）:** `tests/verify.sh` 通過時の記録は159 passed、8スレッド×3回、wire smoke、adapterチェック、mutation 53 proved / 0 skipped、layers 16 modules / 40 edges / 0 named errors、debt ratchet 0 over limit。これは現在のデータ移行ブランチの合格結果ではありません。現在の実行結果は上記の移行証拠を参照。
-- **clippy削減の履歴:** 457 → 83 → **0**（`--all-targets`・release、当時テスト176本green）。現在の警告数とsuite・層ゲートの件数は実行のたびに変わるので、このページには書きません（数値と条件は各 `evidence/` の receipt が持ちます）。
+- **コード検証（旧統合線の履歴）:** `tests/verify.sh` 通過時の記録は159 passed、8スレッド×3回、wire smoke、adapterチェック、mutation 53 proved / 0 skipped、layers 16 modules / 40 edges / 0 named errors、debt ratchet 0 over limit。これは現在のデータ移行ブランチの合格結果ではありません。現在の層ゲートは **44 modules / 111 edges / 0 named errors**、コンパイラ警告 **0 件**、来歴ゲート（`tools/provenance_check.py`）**clean** です。
+- **clippy / 警告削減の履歴:** 初期 457 → 0 に続き、データ移行・構造物拡張後の全モジュール警告も 68 → **0** に解消済みです。現在の警告数とsuite・層ゲートの件数は実行のたびに変わるので、数値と条件は各 `evidence/` の receipt が持ちます。
   前半は機械的に等価な変換（`&*`/`&mut *` の冗長、`x % n == 0` → `is_multiple_of`、不要な `as`、
   `sort_by` → `sort_by_key` など）。残る判断が要るクラスは次のように閉じました:
   - `unnecessary_unwrap` 14: `is_some()` を見て `unwrap()` は `if let`/`match` に。3つのスロット
@@ -66,11 +68,11 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 
 ## 保留・外部依存（値ではなく事実だけ）
 
-- **hosted CIの過去の未開始はコード失敗とは別です。** 当時の注記は「The job was not started because recent account payments have failed or your spending limit needs to be increased」。現在の作業ブランチへのpush自体はworkflowのpush対象ではなく、今回hosted CIは実行していません。必須ローカルゲートにも未実行の範囲があり、CI・ローカルとも未実行を緑にしません。
+- **hosted CIの過去の未開始はコード失敗とは別です。** 当時の注記は「The job was not started because recent account payments have failed or your spending limit needs to be increased」。今回hosted CIは実行していません。必須ローカルゲートにも未実行の範囲があり、CI・ローカルとも未実行を緑にしません。
 - **比較の前提（固定具の基点）は再構成できます:** `tools/fixture_base.sh` が `CARVER_FIXTURE_BASE`（既定 `/tmp/carverfresh`）を組みます。jar は sha1 で固定（`59353fb4…`、既存の1.21.1導入ディレクトリを donor に使う）。基点が無いまま固定具を回すと比較は空振りします。
 - **層ゲートの検査器は固定revision:** `.github/workflows/ci.yml` の `GXKIT_REV`。同一バージョン文字列の古いビルドは独立した2循環を1つしか報告しないため、`tools/layers_check.sh` が `MC_SPINE_DEPSGX` → ローカルの固定ビルド → PATH の順で解決します。
 - **被ダメ無敵は vanilla の `invulnerableTime` に載せ替えました**（slice 25、2026-10-24）。環境ダメージが timer を立てる点までは実装、環境ダメージ自身の差分適用は簡略（同 slice に明記）。
-- **開放中の項目:** 独立レビュー（#7）。LICENSEは存在し、未追加のissue #11はclosedです（remoteを再確認）。
+- **ライセンス・出所・Issue #7/#11:** 本体は `GPL-3.0-or-later`（寄稿は `LGPL-3.0-or-later / GPL-3.0-or-later / AGPL-3.0-or-later` のトリプルライセンス、[LICENSING.md](../LICENSING.md)）、過去の削除済み不純ファイルは `git filter-repo --invert-paths` で全履歴から完全抹消済みです。旧 Issue #1, #7, #11, #38, #51 はすべて解決・クローズ済みです。
 - **draft PR #2/#4/#6 は決着しました（2026-10-24）。** `main` に同一patchが無かった62コミットを読み、
   現行線に無い4点だけを取り込みました: play frameの上限をvanillaの2MiBへ、非有限・世界外の移動値の拒否、
   tickの実測（作業時間・TPS・予算超過）、チャンクバッチのACKペーシング。残りは現行線に新しい形であるか、
