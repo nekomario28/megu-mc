@@ -3712,6 +3712,27 @@ check "p2_3_s2a_a_companion_table_loads_into_its_own_dimension" \
   '        let c = w.entry((DimId::Overworld, cx, cz)).or_default();' \
   persistence_tests::p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip
 
+# P2-3-S2c: the legacy sign section must hold the Overworld's signs only. Dropping the filter puts
+# Nether and End signs in the legacy bytes, so a non-Overworld edit shifts the Overworld save.
+check "p2_3_s2c_legacy_sign_section_is_overworld_only" \
+  src/main.rs 'let ow_signs: Vec<_> = sg.iter().filter(|(k, _)| k.0 == DimId::Overworld).collect();' \
+  'let ow_signs: Vec<_> = sg.iter().collect();' \
+  persistence_tests::p2_3_s2c_signs_stay_isolated_per_dimension_and_round_trip
+
+# The footer must fail closed on a dimension tag it does not know. Mapping unknown bytes to the
+# Overworld would silently relocate a sign or a player from a dimension this build cannot name.
+check "p2_3_s2_dim_footer_rejects_unknown_dimension" \
+  src/main.rs 'DimId::from_index(b as usize).ok_or("invalid dimension tag")' \
+  'Ok(DimId::from_index(b as usize).unwrap_or(DimId::Overworld))' \
+  persistence_tests::p2_3_s2_dim_footer_rejects_unknown_dimension_and_truncation
+
+# P2-3-S2d: a player's saved dimension comes from the footer. Writing Overworld there makes a
+# Nether or End login point at the Overworld after reload.
+check "p2_3_s2d_footer_carries_the_players_real_dimension" \
+  src/main.rs 'dim_players.push((name.clone(), dim));' \
+  'dim_players.push((name.clone(), DimId::Overworld));' \
+  persistence_tests::p2_3_s2d_pos_store_preserves_dimension_and_defaults_legacy_to_overworld
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

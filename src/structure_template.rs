@@ -1963,11 +1963,18 @@ mod tests {
         }
         crate::materialize_generation_payloads(g.take_staged_payloads());
         assert_eq!(
-            crate::signs().lock().unwrap().get(&(cell.0, cell.1, cell.2, 1)).cloned(),
+            crate::signs()
+                .lock()
+                .unwrap()
+                .get(&(crate::worldgen::DimId::Overworld, cell.0, cell.1, cell.2, 1))
+                .cloned(),
             Some(["Hi".to_string(), String::new(), String::new(), String::new()]),
             "the sign store holds the front lines the template carried"
         );
-        crate::signs().lock().unwrap().remove(&(cell.0, cell.1, cell.2, 1));
+        crate::signs()
+            .lock()
+            .unwrap()
+            .remove(&(crate::worldgen::DimId::Overworld, cell.0, cell.1, cell.2, 1));
     }
 
     /// A furnace's `Items` belong in `furnaces()`, not `chests()`: the furnace window reads

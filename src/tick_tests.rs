@@ -2638,7 +2638,10 @@ fn a_periodic_system_expresses_its_backoff_in_invocations() {
         backoff()
             .lock()
             .unwrap()
-            .insert(pos, (TICK_IDX.load(Ordering::Relaxed) + ahead, 1));
+            .insert(
+                (DimId::Overworld, pos.0, pos.1, pos.2),
+                (TICK_IDX.load(Ordering::Relaxed) + ahead, 1),
+            );
         lava_queue().lock().unwrap().cancel(pos);
         requeue_lava(pos.0, pos.1, pos.2);
         for n in 1..=12 {
@@ -2670,7 +2673,10 @@ fn a_periodic_system_expresses_its_backoff_in_invocations() {
         "crossing a period boundary must cost an invocation"
     );
     lava_queue().lock().unwrap().cancel(pos);
-    backoff().lock().unwrap().remove(&pos);
+    backoff()
+        .lock()
+        .unwrap()
+        .remove(&(DimId::Overworld, pos.0, pos.1, pos.2));
 }
 
 /// The delay queue caps a wait at four seconds, but the backoff ladder does not:
@@ -2727,7 +2733,12 @@ fn a_backoff_past_the_queue_cap_waits_for_its_real_deadline() {
     let mut fails = 0u32;
     for t in 0..=700u64 {
         game_tick(|_, tick| tick());
-        if let Some((_, f)) = backoff().lock().unwrap().get(&pos).copied() {
+        if let Some((_, f)) = backoff()
+            .lock()
+            .unwrap()
+            .get(&(DimId::Overworld, pos.0, pos.1, pos.2))
+            .copied()
+        {
             if f != fails {
                 fails = f;
                 visits.push(t);
@@ -3926,7 +3937,7 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
     let queued = pending_blocks()
         .lock()
         .unwrap()
-        .get(&(x >> 4, y >> 4, z >> 4))
+        .get(&(DimId::Overworld, x >> 4, y >> 4, z >> 4))
         .and_then(|m| m.get(&idx))
         .copied();
     assert_eq!(

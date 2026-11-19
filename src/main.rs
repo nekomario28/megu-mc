@@ -267,15 +267,19 @@ type ChunkKey = (i32, i32);
 /// an Overworld edit of the same `(cx, cz)` are one entry, and whichever was written last answers
 /// for both — the Nether's netherrack appears in the Overworld, or the edit is simply lost.
 type DimChunkKey = (DimId, i32, i32);
+/// A block position *in a named dimension*: the key of the block-scoped registries below. Keyed by
+/// `(x, y, z)` alone, a Nether edit and an Overworld edit at the same coordinates are one entry.
+type DimBlockPos = (DimId, i32, i32, i32);
 /// The shape every world registry in this file has: one map behind one mutex,
 /// built the first time something asks for it.
 type Registry<K, V> = OnceLock<Mutex<HashMap<K, V>>>;
 /// What those accessors hand out.
 type LockedMap<K, V> = Mutex<HashMap<K, V>>;
-/// A saved player position with its look direction.
-type PosRot = (f64, f64, f64, f32, f32);
-/// One stored sign: its four lines, front or back.
-type SignKey = (i32, i32, i32, u8);
+/// A saved player position with its look direction *and* the dimension they logged out in. On disk
+/// the dimension lives in the footer; the legacy six fields stay in their original wire layout.
+type DimPosRot = (DimId, f64, f64, f64, f32, f32);
+/// One stored sign in a named dimension: its four lines, front or back.
+type SignKey = (DimId, i32, i32, i32, u8);
 type SignLines = [String; 4];
 /// A block entity on its way out inside a chunk packet: position, type, NBT.
 type ChunkBlockEntity = (BlockPos, i64, Vec<u8>);
@@ -6571,7 +6575,7 @@ fn materialize_generation_payloads_inner(
                 signs()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert((pos.0, pos.1, pos.2, 1), lines);
+                    .insert((DimId::Overworld, pos.0, pos.1, pos.2, 1), lines);
             }
         }
     }
@@ -7452,8 +7456,8 @@ fn inv_store() -> &'static Mutex<HashMap<String, HashMap<i16, Stack>>> {
     INV_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 // name -> (x,y,z,yaw,pitch): vanilla respawns a player where they left
-static POS_STORE: Registry<String, PosRot> = OnceLock::new();
-fn pos_store() -> &'static LockedMap<String, PosRot> {
+static POS_STORE: Registry<String, DimPosRot> = OnceLock::new();
+fn pos_store() -> &'static LockedMap<String, DimPosRot> {
     POS_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 const MIN_Y: i32 = -64;
@@ -8554,8 +8558,8 @@ fn is_warm(x: i32, z: i32) -> bool {
 // up to 80 game ticks (4 s); any neighbor block change invalidates it back
 // to full rate. Event-driven reset + exponential backoff, not polling.
 // The tick counts live in backoff_ticks; only the 4 s ceiling belongs here.
-static BACKOFF: Registry<BlockPos, (u64, u32)> = OnceLock::new();
-fn backoff() -> &'static LockedMap<BlockPos, (u64, u32)> {
+static BACKOFF: Registry<DimBlockPos, (u64, u32)> = OnceLock::new();
+fn backoff() -> &'static LockedMap<DimBlockPos, (u64, u32)> {
     BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
 }
 static TICK_IDX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -9197,7 +9201,7 @@ fn sched_ready(x: i32, y: i32, z: i32) -> bool {
     backoff()
         .lock()
         .unwrap()
-        .get(&(x, y, z))
+        .get(&(DimId::Overworld, x, y, z))
         .map(|(t, _)| *t <= now)
         .unwrap_or(true)
 }
@@ -9217,7 +9221,11 @@ fn lava_queue() -> &'static Mutex<tick_queue::TickQueue> {
 /// thirty times too long.
 fn requeue_fluid(queue: &Mutex<tick_queue::TickQueue>, pos: (i32, i32, i32), period: u64) {
     let now = TICK_IDX.load(Ordering::Relaxed);
-    let delay = match backoff().lock().unwrap().get(&pos) {
+    let delay = match backoff()
+        .lock()
+        .unwrap()
+        .get(&(DimId::Overworld, pos.0, pos.1, pos.2))
+    {
         Some((due, _)) if *due > now => (*due - now).div_ceil(period) as usize,
         _ => 1,
     };
@@ -9244,11 +9252,12 @@ fn requeue_water(x: i32, y: i32, z: i32) {
 fn sched_result(x: i32, y: i32, z: i32, did_work: bool) {
     let now = TICK_IDX.load(Ordering::Relaxed);
     let mut b = backoff().lock().unwrap();
+    let key = (DimId::Overworld, x, y, z);
     if did_work {
-        b.remove(&(x, y, z));
+        b.remove(&key);
     } else {
-        let fails = b.get(&(x, y, z)).map(|e| e.1).unwrap_or(0) + 1;
-        b.insert((x, y, z), (now + backoff_ticks(u64::from(fails)), fails));
+        let fails = b.get(&key).map(|e| e.1).unwrap_or(0) + 1;
+        b.insert(key, (now + backoff_ticks(u64::from(fails)), fails));
     }
 }
 /// any world mutation resets backoff for the cell and its 6 neighbors —
@@ -9363,7 +9372,7 @@ fn sched_invalidate(x: i32, y: i32, z: i32) {
     {
         let mut b = backoff().lock().unwrap();
         for c in cells {
-            b.remove(&c);
+            b.remove(&(DimId::Overworld, c.0, c.1, c.2));
         }
     }
     if !water_queue().lock().unwrap().is_empty() {
@@ -9443,7 +9452,7 @@ impl PluginApi {
         if cells.values().flatten().filter(|c| c.pi == self.pi).count() >= PLUGIN_MAX_CELLS {
             return Err("cell cap");
         }
-        let bucket = cells.entry((x >> 4, z >> 4)).or_default();
+        let bucket = cells.entry((DimId::Overworld, x >> 4, z >> 4)).or_default();
         if !bucket
             .iter()
             .any(|c| c.pi == self.pi && c.x == x && c.y == y && c.z == z && c.key == key)
@@ -9476,11 +9485,11 @@ struct PluginCell {
     key: u32,
     warm_ok: bool,
 }
-type CellKey = (usize, i32, i32, i32, u32);
-static PLUGIN_CELLS: Registry<ChunkKey, Vec<PluginCell>> = OnceLock::new();
+type CellKey = (DimId, usize, i32, i32, i32, u32);
+static PLUGIN_CELLS: Registry<DimChunkKey, Vec<PluginCell>> = OnceLock::new();
 static PLUGIN_BACKOFF: OnceLock<Mutex<HashMap<CellKey, (u64, u8)>>> = OnceLock::new();
 static PLUGINS: OnceLock<Mutex<Vec<Box<dyn Plugin>>>> = OnceLock::new();
-fn plugin_cells() -> &'static Mutex<HashMap<(i32, i32), Vec<PluginCell>>> {
+fn plugin_cells() -> &'static Mutex<HashMap<DimChunkKey, Vec<PluginCell>>> {
     PLUGIN_CELLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn plugin_backoff() -> &'static Mutex<HashMap<CellKey, (u64, u8)>> {
@@ -9505,7 +9514,7 @@ fn plugins() -> &'static Mutex<Vec<Box<dyn Plugin>>> {
 
 fn plugin_sched_remove(x: i32, y: i32, z: i32) {
     let mut cells = plugin_cells().lock().unwrap();
-    let ck = (x >> 4, z >> 4);
+    let ck = (DimId::Overworld, x >> 4, z >> 4);
     if let Some(b) = cells.get_mut(&ck) {
         b.retain(|c| !(c.x == x && c.y == y && c.z == z));
         if b.is_empty() {
@@ -9525,10 +9534,10 @@ fn plugin_invalidate(x: i32, y: i32, z: i32) {
     let mut b = plugin_backoff().lock().unwrap();
     for cx in (x >> 4) - 1..=(x >> 4) + 1 {
         for cz in (z >> 4) - 1..=(z >> 4) + 1 {
-            if let Some(bucket) = cells.get(&(cx, cz)) {
+            if let Some(bucket) = cells.get(&(DimId::Overworld, cx, cz)) {
                 for c in bucket {
                     if (c.x - x).abs() <= 1 && (c.y - y).abs() <= 1 && (c.z - z).abs() <= 1 {
-                        b.remove(&(c.pi, c.x, c.y, c.z, c.key));
+                        b.remove(&(DimId::Overworld, c.pi, c.x, c.y, c.z, c.key));
                     }
                 }
             }
@@ -9554,7 +9563,7 @@ fn plugin_tick() {
     let region = region_guard();
     let now = TICK_IDX.load(Ordering::Relaxed);
     for c in cells {
-        let ck = (c.pi, c.x, c.y, c.z, c.key);
+        let ck = (DimId::Overworld, c.pi, c.x, c.y, c.z, c.key);
         let due = plugin_backoff()
             .lock()
             .unwrap()
@@ -9626,8 +9635,8 @@ impl Plugin for GrowthLamp {
 
 // per-tick block-change batching (vanilla multi_block_change, 0x49):
 // N individual block_change packets -> 1 packet per touched section.
-static PENDING_BLOCKS: Registry<BlockPos, HashMap<u16, u32>> = OnceLock::new();
-fn pending_blocks() -> &'static LockedMap<BlockPos, HashMap<u16, u32>> {
+static PENDING_BLOCKS: Registry<DimBlockPos, HashMap<u16, u32>> = OnceLock::new();
+fn pending_blocks() -> &'static LockedMap<DimBlockPos, HashMap<u16, u32>> {
     PENDING_BLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
@@ -9641,13 +9650,18 @@ fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
     pending_blocks()
         .lock()
         .unwrap()
-        .entry((x.div_euclid(16), y.div_euclid(16), z.div_euclid(16)))
+        .entry((
+            DimId::Overworld,
+            x.div_euclid(16),
+            y.div_euclid(16),
+            z.div_euclid(16),
+        ))
         .or_default()
         .insert((((x & 15) << 8) | ((z & 15) << 4) | (y & 15)) as u16, out);
 }
 fn apply_queued_block_updates() {
     let map = std::mem::take(&mut *pending_blocks().lock().unwrap());
-    for ((sx, sy, sz), recs) in map {
+    for ((_dim, sx, sy, sz), recs) in map {
         let mut p = Vec::with_capacity(9 + recs.len() * 5);
         let key =
             ((sx as i64 & 0x3fffff) << 42) | ((sz as i64 & 0x3fffff) << 20) | (sy as i64 & 0xfffff);
@@ -9804,7 +9818,9 @@ fn set_block_if_inner_dim(
             signs()
                 .lock()
                 .unwrap()
-                .retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));
+                .retain(|&(dim, sx, sy, sz, _), _| {
+                    !(dim == DimId::Overworld && sx == x && sy == y && sz == z)
+                });
             // The halves this container was part of, read from the state it still had
             // as a block: the pair lives in the block state, so the *old* state is the
             // one that knows it.
@@ -9909,7 +9925,7 @@ fn set_block_if_inner_dim(
         plugin_cells()
             .lock()
             .unwrap()
-            .entry((x >> 4, z >> 4))
+            .entry((DimId::Overworld, x >> 4, z >> 4))
             .or_default()
             .push(PluginCell {
                 pi: 0,
@@ -10022,7 +10038,13 @@ fn piston_set_extended(bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
             || (9345..=9356).contains(&front)                          // dispenser
             || (523..=534).contains(&front)                            // dropper
             || (9225..=9234).contains(&front)                          // hopper
-            || signs().lock().unwrap().keys().any(|&(sx, sy, sz, _)| sx == px && sy == py && sz == pz);
+            || signs()
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|&(dim, sx, sy, sz, _)| {
+                    dim == DimId::Overworld && sx == px && sy == py && sz == pz
+                });
         if front != 0 && !immovable && block_at(qx, qy, qz) == 0 {
             place_block(qx, qy, qz, front);
             place_block(px, py, pz, head);
@@ -10538,19 +10560,24 @@ fn gc_backoff() {
     let wtr = waters().lock().unwrap();
     let hh = hoppers().lock().unwrap();
     let cells = plugin_cells().lock().unwrap();
+    // waters/hoppers are Overworld-only indexes. A non-Overworld backoff stays live only while a
+    // plugin cell in that same dimension names its position; neither may answer for another dim.
     backoff().lock().unwrap().retain(|k, _| {
-        wtr.contains(k)
-            || hh.contains(k)
-            || cells
-                .values()
-                .flatten()
-                .any(|c| c.x == k.0 && c.y == k.1 && c.z == k.2)
+        let (dim, x, y, z) = *k;
+        let plugin_live = cells.iter().any(|((cdim, _, _), bucket)| {
+            *cdim == dim && bucket.iter().any(|c| c.x == x && c.y == y && c.z == z)
+        });
+        (dim == DimId::Overworld && (wtr.contains(&(x, y, z)) || hh.contains(&(x, y, z))))
+            || plugin_live
     });
     let mut pb = plugin_backoff().lock().unwrap();
     let live: std::collections::HashSet<CellKey> = cells
-        .values()
-        .flatten()
-        .map(|c| (c.pi, c.x, c.y, c.z, c.key))
+        .iter()
+        .flat_map(|((dim, _, _), bucket)| {
+            bucket
+                .iter()
+                .map(move |c| (*dim, c.pi, c.x, c.y, c.z, c.key))
+        })
         .collect();
     pb.retain(|k, _| live.contains(k));
 }
@@ -10601,7 +10628,10 @@ fn rebuild_derived_indexes() {
                 cg.insert((x, y, z), (*st - 4278) as u8);
             }
             if lamp_on && *st == ST_GROWTH_LAMP {
-                cells.entry((cx, cz)).or_default().push(PluginCell {
+                cells
+                    .entry((DimId::Overworld, cx, cz))
+                    .or_default()
+                    .push(PluginCell {
                     pi: 0,
                     x,
                     y,
@@ -10981,6 +11011,10 @@ fn save_world_into(f: &mut Vec<u8>) {
     // MET4 = stacks carry component blobs and entity ages are server ticks.
     // MET2/MET3 stored those ages in milliseconds, which the loader converts.
     let mut drop_owners: Vec<(u32, Option<[u8; 16]>, Option<[u8; 16]>)> = Vec::new();
+    // Non-Overworld signs and player dimensions ride in a footer (see `append_dim_footer`), so the
+    // legacy sections below stay byte-for-byte identical for an Overworld-only save.
+    let mut dim_signs: Vec<(DimId, i32, i32, i32, u8, [String; 4])> = Vec::new();
+    let mut dim_players: Vec<(String, DimId)> = Vec::new();
     (*f).extend_from_slice(b"MET4");
     {
         let ms = mobs().lock().unwrap();
@@ -11053,17 +11087,27 @@ fn save_world_into(f: &mut Vec<u8>) {
             }
         }
         let sg = signs().lock().unwrap();
-        write_varint(&mut *f, sg.len() as i64);
-        for (&(x, y, z, front), lines) in sg.iter() {
+        // The legacy signs section carries the Overworld's signs only, in the exact old wire
+        // layout. Another dimension's sign goes to the footer, so its presence cannot shift a
+        // single byte of an Overworld-only save.
+        let ow_signs: Vec<_> = sg.iter().filter(|(k, _)| k.0 == DimId::Overworld).collect();
+        write_varint(&mut *f, ow_signs.len() as i64);
+        for (k, lines) in &ow_signs {
+            let &(_dim, x, y, z, front) = *k;
             (*f).extend_from_slice(&x.to_be_bytes());
             (*f).extend_from_slice(&y.to_be_bytes());
             (*f).extend_from_slice(&z.to_be_bytes());
             (*f).push(front);
-            for l in lines {
+            for l in lines.iter() {
                 (*f).extend_from_slice(&(l.len() as u16).to_be_bytes());
                 (*f).extend_from_slice(l.as_bytes());
             }
         }
+        dim_signs = sg
+            .iter()
+            .filter(|(k, _)| k.0 != DimId::Overworld)
+            .map(|(k, v)| (k.0, k.1, k.2, k.3, k.4, v.clone()))
+            .collect();
         // forceload tail — vanilla keeps forced chunks across restarts;
         // losing them would silently freeze fixture+machine regions.
         let fl = forceloaded().lock().unwrap();
@@ -11072,15 +11116,17 @@ fn save_world_into(f: &mut Vec<u8>) {
             (*f).extend_from_slice(&cx.to_be_bytes());
             (*f).extend_from_slice(&cz.to_be_bytes());
         }
-        // player positions — vanilla respawns you where you logged out
-        let mut allp: HashMap<String, (f64, f64, f64, f32, f32)> =
-            pos_store().lock().unwrap().clone();
+        // player positions — vanilla respawns you where you logged out. The legacy six fields are
+        // written for every player (so an Overworld-only save is byte-identical); the dimension of
+        // a player who logged out elsewhere is corrected from the footer on load.
+        let mut allp: HashMap<String, DimPosRot> = pos_store().lock().unwrap().clone();
         for c in clients().lock().unwrap().iter() {
             let p = *c.pos.lock().unwrap();
-            allp.insert(c.name.clone(), (p.0, p.1, p.2, p.3, p.4));
+            // S4 wires live `Client::dim` here; until then an online player is Overworld.
+            allp.insert(c.name.clone(), (DimId::Overworld, p.0, p.1, p.2, p.3, p.4));
         }
         write_varint(&mut *f, allp.len() as i64);
-        for (name, &(x, y, z, yaw, pitch)) in allp.iter() {
+        for (name, &(dim, x, y, z, yaw, pitch)) in allp.iter() {
             (*f).extend_from_slice(&(name.len() as u16).to_be_bytes());
             (*f).extend_from_slice(name.as_bytes());
             (*f).extend_from_slice(&x.to_be_bytes());
@@ -11088,6 +11134,9 @@ fn save_world_into(f: &mut Vec<u8>) {
             (*f).extend_from_slice(&z.to_be_bytes());
             (*f).extend_from_slice(&yaw.to_be_bytes());
             (*f).extend_from_slice(&pitch.to_be_bytes());
+            if dim != DimId::Overworld {
+                dim_players.push((name.clone(), dim));
+            }
         }
         // dropped items are world entities in vanilla — they survive
         // restart inside their despawn budget
@@ -11446,6 +11495,152 @@ fn save_world_into(f: &mut Vec<u8>) {
     if !block_loot.is_empty() {
         append_block_loot_footer(f, &block_loot);
     }
+    // Written last so it is read first: an Overworld-only save emits nothing here, leaving every
+    // legacy byte (and every other footer's position) exactly where it was.
+    if !dim_signs.is_empty() || !dim_players.is_empty() {
+        append_dim_footer(f, &dim_signs, &dim_players);
+    }
+}
+
+// Non-Overworld signs and player dimensions. The body is `[sign count][signs][player count][players]`,
+// framed by `[body size u64][DIM1]` exactly like the drop-owners footer. A `DimId` byte is validated on
+// read with `DimId::from_index`, so an unknown dimension fails closed instead of being silently
+// mapped to the Overworld.
+const DIM_FOOTER_LEN: usize = 12;
+const DIM_MAGIC: &[u8; 4] = b"DIM1";
+fn append_dim_footer(
+    out: &mut Vec<u8>,
+    signs: &[(DimId, i32, i32, i32, u8, [String; 4])],
+    players: &[(String, DimId)],
+) {
+    let start = out.len();
+    out.extend_from_slice(&(signs.len() as u32).to_be_bytes());
+    for &(dim, x, y, z, front, ref lines) in signs {
+        out.push(dim.index() as u8);
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out.extend_from_slice(&z.to_be_bytes());
+        out.push(front);
+        for l in lines.iter() {
+            out.extend_from_slice(&(l.len() as u16).to_be_bytes());
+            out.extend_from_slice(l.as_bytes());
+        }
+    }
+    out.extend_from_slice(&(players.len() as u32).to_be_bytes());
+    for (name, dim) in players {
+        out.push(dim.index() as u8);
+        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        out.extend_from_slice(name.as_bytes());
+    }
+    let size = (out.len() - start) as u64;
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(DIM_MAGIC);
+}
+fn read_dim_footer(
+    payload: &[u8],
+) -> Result<
+    (
+        &[u8],
+        Vec<(DimId, i32, i32, i32, u8, [String; 4])>,
+        Vec<(String, DimId)>,
+    ),
+    &'static str,
+> {
+    if !payload.ends_with(DIM_MAGIC) {
+        return Ok((payload, Vec::new(), Vec::new()));
+    }
+    let end = payload
+        .len()
+        .checked_sub(DIM_FOOTER_LEN)
+        .ok_or("truncated dimension footer")?;
+    let size = usize::try_from(u64::from_be_bytes(
+        payload[end..end + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| "invalid dimension footer size")?;
+    // Two u32 counts are the smallest possible body.
+    if size < 8 {
+        return Err("invalid dimension footer size");
+    }
+    let start = end.checked_sub(size).ok_or("invalid dimension footer size")?;
+    let mut input = &payload[start..end];
+    let read_dim = |input: &mut &[u8]| -> Result<DimId, &'static str> {
+        let b = *input.first().ok_or("truncated dimension tag")?;
+        *input = &input[1..];
+        DimId::from_index(b as usize).ok_or("invalid dimension tag")
+    };
+    let n = u32::from_be_bytes(
+        input
+            .get(..4)
+            .ok_or("truncated dimension sign count")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    input = &input[4..];
+    // Each sign has at least 1 dim + 13 position/front + 4 * 2 empty line lengths = 22 bytes.
+    if n > input.len() / 22 {
+        return Err("invalid dimension sign count");
+    }
+    let mut signs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let dim = read_dim(&mut input)?;
+        let pos = input.get(..13).ok_or("truncated dimension sign position")?;
+        let x = i32::from_be_bytes(pos[..4].try_into().unwrap());
+        let y = i32::from_be_bytes(pos[4..8].try_into().unwrap());
+        let z = i32::from_be_bytes(pos[8..12].try_into().unwrap());
+        let front = pos[12];
+        input = &input[13..];
+        let mut lines: [String; 4] = Default::default();
+        for l in lines.iter_mut() {
+            let nl = u16::from_be_bytes(
+                input
+                    .get(..2)
+                    .ok_or("truncated dimension sign line length")?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            input = &input[2..];
+            if input.len() < nl {
+                return Err("truncated dimension sign line");
+            }
+            *l = String::from_utf8_lossy(&input[..nl]).to_string();
+            input = &input[nl..];
+        }
+        signs.push((dim, x, y, z, front, lines));
+    }
+    let pn = u32::from_be_bytes(
+        input
+            .get(..4)
+            .ok_or("truncated dimension player count")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    input = &input[4..];
+    // Each player has at least 1 dim + 2 name length + 0 name bytes = 3 bytes.
+    if pn > input.len() / 3 {
+        return Err("invalid dimension player count");
+    }
+    let mut players = Vec::with_capacity(pn);
+    for _ in 0..pn {
+        let dim = read_dim(&mut input)?;
+        let nl = u16::from_be_bytes(
+            input
+                .get(..2)
+                .ok_or("truncated dimension player name length")?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        input = &input[2..];
+        if input.len() < nl {
+            return Err("truncated dimension player name");
+        }
+        let name = String::from_utf8_lossy(&input[..nl]).to_string();
+        input = &input[nl..];
+        players.push((name, dim));
+    }
+    if !input.is_empty() {
+        return Err("invalid dimension footer tail");
+    }
+    Ok((&payload[..start], signs, players))
 }
 const BLOCK_LOOT_FOOTER_LEN: usize = 12;
 const BLOCK_LOOT_MAGIC: &[u8; 4] = b"BLT1";
@@ -11695,6 +11890,9 @@ fn load_dim_overlay_file(dir: &std::path::Path, dim: DimId) -> Result<(), &'stat
 }
 
 fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
+    // The dimension footer is written last, so it is stripped first; otherwise its bytes would
+    // hide the block-loot footer beneath it and leave trailing data in the main parser.
+    let (payload, dim_signs, dim_players) = read_dim_footer(payload)?;
     let (payload, block_loot) = read_block_loot_footer(payload)?;
     let (payload, drop_owners) = read_drop_owners_footer(payload)?;
     let tick_state = tick_persistence::TickState::read(payload)?;
@@ -11871,7 +12069,8 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                     *l = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
                     p += nl;
                 }
-                sg.insert((x, y, z, front), lines);
+                // The legacy sign section has no dimension byte: every sign in it is Overworld.
+                sg.insert((DimId::Overworld, x, y, z, front), lines);
             }
         }
         if p < payload.len() {
@@ -11912,7 +12111,9 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                 p += 4;
                 let pitch = f32::from_be_bytes(b[p..p + 4].try_into().unwrap());
                 p += 4;
-                ps.insert(name, (x, y, z, yaw, pitch));
+                // The legacy position section has no dimension byte: every player defaulted to
+                // the Overworld; a footer entry below corrects the few who logged out elsewhere.
+                ps.insert(name, (DimId::Overworld, x, y, z, yaw, pitch));
             }
         }
         if p < payload.len() {
@@ -12537,6 +12738,24 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             inv_store().lock().unwrap().len(),
             chests().lock().unwrap().len()
         );
+    }
+
+    // Apply the non-Overworld overrides after the legacy sections have loaded. A sign whose key
+    // already exists in the Overworld section stays independent: the footer's key names its own
+    // dimension. A player's coordinates came from the legacy section; only the dimension changes.
+    if !dim_signs.is_empty() {
+        let mut sg = signs().lock().unwrap();
+        for (dim, x, y, z, front, lines) in dim_signs {
+            sg.insert((dim, x, y, z, front), lines);
+        }
+    }
+    if !dim_players.is_empty() {
+        let mut ps = pos_store().lock().unwrap();
+        for (name, dim) in dim_players {
+            if let Some(entry) = ps.get_mut(&name) {
+                entry.0 = dim;
+            }
+        }
     }
 
     // Falling queue, when the save carries one. Absent sections are the normal case for saves
@@ -18962,27 +19181,24 @@ fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     materialize_pending_generation();
     // block entities ride inside the chunk packet in vanilla — signs
     // would otherwise render blank until edited after each chunk load
-    let mut be: Vec<ChunkBlockEntity> = {
-        let sg = signs().lock().unwrap();
-        sg.iter()
-            .filter(|(&(x, _, z, _), _)| x >> 4 == cx && z >> 4 == cz)
-            .map(|(&(x, y, z, front), lines)| {
-                let empty: [String; 4] = Default::default();
-                let (fl, bl) = if front != 0 {
-                    (lines, &empty)
-                } else {
-                    (&empty, lines)
-                };
-                let mut n = Vec::new();
-                n.push(10);
-                sign_side_nbt(&mut n, "front_text", fl);
-                sign_side_nbt(&mut n, "back_text", bl);
-                nbt_named_byte(&mut n, "is_waxed", 0);
-                n.push(0);
-                ((x, y, z), 7i64, n)
-            })
-            .collect()
-    };
+    let mut be: Vec<ChunkBlockEntity> = signs_in_chunk(dim, cx, cz)
+        .into_iter()
+        .map(|((_, x, y, z, front), lines)| {
+            let empty: [String; 4] = Default::default();
+            let (fl, bl) = if front != 0 {
+                (&lines, &empty)
+            } else {
+                (&empty, &lines)
+            };
+            let mut n = Vec::new();
+            n.push(10);
+            sign_side_nbt(&mut n, "front_text", fl);
+            sign_side_nbt(&mut n, "back_text", bl);
+            nbt_named_byte(&mut n, "is_waxed", 0);
+            n.push(0);
+            ((x, y, z), 7i64, n)
+        })
+        .collect();
     be.extend(generated_spawner_chunk_entities(cx,cz));
     write_varint(&mut p, be.len() as i64);
     for ((x, y, z), ty, n) in be {
@@ -19337,20 +19553,15 @@ fn stream_chunks(
         for (cx, cz) in chunk_group {
             // The player-facing stream is the Overworld: the seam exists so P2-3-S2 can pass
             // the dimension the client is actually in.
-            if send_packet(s, 0x27, map_chunk(*cx, *cz, DimId::Overworld, gen)).is_err() {
+            let dim = DimId::Overworld;
+            if send_packet(s, 0x27, map_chunk(*cx, *cz, dim, gen)).is_err() {
                 return;
             }
             for n in light_dirty_for(gen, *cx, *cz) {
                 dirty.insert(n);
             }
-            let snap: Vec<(SignKey, SignLines)> = signs()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|((sx, _, sz, _), _)| sx.div_euclid(16) == *cx && sz.div_euclid(16) == *cz)
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
-            for ((sx, sy, sz, front), lines) in snap {
+            let snap = signs_in_chunk(dim, *cx, *cz);
+            for ((_, sx, sy, sz, front), lines) in snap {
                 let _ = send_packet(s, 0x07, sign_entity_pkt(sx, sy, sz, front, &lines));
             }
         }
@@ -20626,6 +20837,17 @@ fn food_value(item: i64) -> i32 {
 static SIGNS: Registry<SignKey, SignLines> = OnceLock::new();
 fn signs() -> &'static LockedMap<SignKey, SignLines> {
     SIGNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// The signs one dimension's chunk packet carries. One filter owns the dimension check so a chunk
+/// sent to the Nether cannot answer with an Overworld sign at the same coordinates (and vice versa).
+fn signs_in_chunk(dim: DimId, cx: i32, cz: i32) -> Vec<(SignKey, SignLines)> {
+    signs()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(&(sdim, x, _, z, _), _)| sdim == dim && x >> 4 == cx && z >> 4 == cz)
+        .map(|(k, v)| (*k, v.clone()))
+        .collect()
 }
 fn nbt_named_str(v: &mut Vec<u8>, name: &str, val: &str) {
     v.push(8);
@@ -23883,14 +24105,16 @@ fn handle(mut s: TcpStream) {
     let mut chunk_ack = ChunkFeedback::new(window_batch(view));
     // vanilla: a returning player resumes where they logged out — the
     // chunk window, spawn teleport and authoritative pos all agree.
-    let (sx, sy, sz, syaw, spitch) = pos_store()
+    // S4 will thread `Client::dim` here; until then every login is the Overworld's, and a
+    // non-Overworld dimension stored in the footer stays dormant rather than being lost.
+    let (_dim, sx, sy, sz, syaw, spitch) = pos_store()
         .lock()
         .unwrap()
         .get(&name)
         .copied()
         .unwrap_or_else(|| {
             let w = *WORLD_SPAWN.lock().unwrap();
-            (w.0, w.1, w.2, 0.0, 0.0)
+            (DimId::Overworld, w.0, w.1, w.2, 0.0, 0.0)
         });
     stream_chunks(
         &mut s,
@@ -26017,7 +26241,7 @@ fn handle(mut s: TcpStream) {
                     signs()
                         .lock()
                         .unwrap()
-                        .insert((sx, sy, sz, front), lines.clone());
+                        .insert((DimId::Overworld, sx, sy, sz, front), lines.clone());
                     broadcast_chunk(sx.div_euclid(16), sz.div_euclid(16), |_c| {
                         (0x07, sign_entity_pkt(sx, sy, sz, front, &lines))
                     });
@@ -27496,10 +27720,11 @@ fn handle(mut s: TcpStream) {
                 .unwrap()
                 .insert(name.clone(), inv.clone());
             let p = *me_cleanup.pos.lock().unwrap();
+            // S4 wires a live `Client::dim` here; until then a logout is an Overworld logout.
             pos_store()
                 .lock()
                 .unwrap()
-                .insert(name.clone(), (p.0, p.1, p.2, p.3, p.4));
+                .insert(name.clone(), (DimId::Overworld, p.0, p.1, p.2, p.3, p.4));
         }
         // vanilla `ServerPlayer.disconnect` -> `containerMenu.removed` -> stopOpen:
         // the leaving viewer stops counting before it leaves the client list. The window

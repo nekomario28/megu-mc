@@ -615,7 +615,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
             signs()
                 .lock()
                 .unwrap()
-                .insert((pos.0, pos.1, pos.2, front), lines.clone());
+                .insert((DimId::Overworld, pos.0, pos.1, pos.2, front), lines.clone());
         }
     }
     for pos in [broken_furnace, broken_sign] {
@@ -626,7 +626,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
         .lock()
         .unwrap()
         .keys()
-        .any(|&(x, y, z, _)| (x, y, z) == broken_sign));
+        .any(|&(dim, x, y, z, _)| dim == DimId::Overworld && (x, y, z) == broken_sign));
     let mut payload = Vec::new();
     save_world_into(&mut payload);
     world().lock().unwrap().clear();
@@ -649,7 +649,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
     assert_eq!(sg.len(), 2);
     for front in [0, 1] {
         assert_eq!(
-            sg.get(&(live_sign.0, live_sign.1, live_sign.2, front)),
+            sg.get(&(DimId::Overworld, live_sign.0, live_sign.1, live_sign.2, front)),
             Some(&lines)
         );
     }
@@ -1050,4 +1050,393 @@ fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
     let _ = std::fs::remove_dir_all(&dir);
     *world().lock().unwrap() = old_world;
     assert!(worldgen::init(0, name_to_state), "leave the Overworld active");
+}
+
+/// P2-3-S2c: the same sign at one coordinate in three dimensions is three signs. The legacy sign
+/// section carries only the Overworld's, so an Overworld-only save keeps every legacy byte and has
+/// no dimension footer; the other two ride in the footer and reload into their own keys.
+#[test]
+fn p2_3_s2c_signs_stay_isolated_per_dimension_and_round_trip() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _world_guard = world_guard();
+    let old_signs = std::mem::take(&mut *signs().lock().unwrap());
+    let old_pos = std::mem::take(&mut *pos_store().lock().unwrap());
+    let old_rng = world_rng::saved_state();
+
+    let cell = (5, 100, 7);
+    let chunk = (cell.0 >> 4, cell.2 >> 4);
+    let lines = [
+        "front".to_string(),
+        "b".to_string(),
+        "c".to_string(),
+        "d".to_string(),
+    ];
+    let ow_key = (DimId::Overworld, cell.0, cell.1, cell.2, 1);
+
+    signs()
+        .lock()
+        .unwrap()
+        .insert(ow_key, lines.clone());
+    // The first save materialises staged generation payloads; both compared saves come after it.
+    let mut warmup = Vec::new();
+    save_world_into(&mut warmup);
+    let mut overworld_only = Vec::new();
+    save_world_into(&mut overworld_only);
+    assert!(
+        !overworld_only
+            .windows(DIM_MAGIC.len())
+            .any(|w| w == DIM_MAGIC),
+        "an Overworld-only save must contain no dimension footer bytes"
+    );
+
+    // Same coordinate in the other two dimensions: three independent entries, and one sign per
+    // dimension in that dimension's chunk. A neighbouring chunk sees none.
+    for dim in [DimId::Nether, DimId::End] {
+        signs()
+            .lock()
+            .unwrap()
+            .insert((dim, cell.0, cell.1, cell.2, 1), lines.clone());
+    }
+    assert_eq!(signs().lock().unwrap().len(), 3);
+    for dim in DimId::ALL {
+        let here = signs_in_chunk(dim, chunk.0, chunk.1);
+        assert_eq!(here.len(), 1, "{dim:?}: the chunk carries exactly its sign");
+        assert_eq!(here[0].0, (dim, cell.0, cell.1, cell.2, 1));
+        assert_eq!(here[0].1, lines);
+    }
+    assert!(signs_in_chunk(DimId::Overworld, chunk.0 + 1, chunk.1).is_empty());
+
+    // Stripping the footer from the three-dimension save leaves the exact Overworld-only payload.
+    // A non-Overworld sign must not shift one byte of the legacy section.
+    let mut with_dims = Vec::new();
+    save_world_into(&mut with_dims);
+    assert!(
+        with_dims
+            .windows(DIM_MAGIC.len())
+            .any(|w| w == DIM_MAGIC),
+        "a non-Overworld sign must produce a footer"
+    );
+    let (legacy_region, footer_signs, footer_players) = read_dim_footer(&with_dims).unwrap();
+    assert_eq!(
+        legacy_region, overworld_only.as_slice(),
+        "a non-Overworld sign changed a byte of the legacy save"
+    );
+    assert!(footer_players.is_empty());
+    assert_eq!(footer_signs.len(), 2);
+    assert!(footer_signs.iter().all(|s| s.0 != DimId::Overworld));
+
+    // Full round-trip: all three come back, each into its own dimension.
+    signs().lock().unwrap().clear();
+    load_world_from(&with_dims).unwrap();
+    assert_eq!(signs().lock().unwrap().len(), 3);
+    for dim in DimId::ALL {
+        assert_eq!(
+            signs()
+                .lock()
+                .unwrap()
+                .get(&(dim, cell.0, cell.1, cell.2, 1)),
+            Some(&lines),
+            "{dim:?}: its own key came back from the footer"
+        );
+    }
+
+    // A legacy payload without the footer defaults its sign to the Overworld.
+    signs().lock().unwrap().clear();
+    load_world_from(&overworld_only).unwrap();
+    assert_eq!(signs().lock().unwrap().len(), 1);
+    assert_eq!(signs().lock().unwrap().get(&ow_key), Some(&lines));
+
+    world_rng::restore(old_rng);
+    *signs().lock().unwrap() = old_signs;
+    *pos_store().lock().unwrap() = old_pos;
+}
+
+/// P2-3-S2c: the pending-block, backoff and plugin-cell stores keyed by chunk/block alone made the
+/// same coordinate one entry in every dimension. All three (and the plugin backoff) now name their
+/// dimension, and GC must not let one dimension's live cell keep another's backoff alive.
+#[test]
+fn p2_3_s2c_pending_blocks_backoff_and_plugin_cells_stay_isolated_per_dimension() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _world_guard = world_guard();
+    let old_pending = std::mem::take(&mut *pending_blocks().lock().unwrap());
+    let old_backoff = std::mem::take(&mut *backoff().lock().unwrap());
+    let old_cells = std::mem::take(&mut *plugin_cells().lock().unwrap());
+    let old_pb = std::mem::take(&mut *plugin_backoff().lock().unwrap());
+    let old_waters = std::mem::take(&mut *waters().lock().unwrap());
+    let old_hoppers = std::mem::take(&mut *hoppers().lock().unwrap());
+
+    let pos = (5, 100, 7);
+    let sec = (pos.0 >> 4, pos.1 >> 4, pos.2 >> 4);
+    let ck = (pos.0 >> 4, pos.2 >> 4);
+    let recs = HashMap::from([(42u16, 7u32)]);
+    for dim in DimId::ALL {
+        pending_blocks()
+            .lock()
+            .unwrap()
+            .entry((dim, sec.0, sec.1, sec.2))
+            .or_default()
+            .insert(42, 7);
+        backoff()
+            .lock()
+            .unwrap()
+            .insert((dim, pos.0, pos.1, pos.2), (100, 1));
+        plugin_cells()
+            .lock()
+            .unwrap()
+            .entry((dim, ck.0, ck.1))
+            .or_default()
+            .push(PluginCell {
+                pi: 0,
+                x: pos.0,
+                y: pos.1,
+                z: pos.2,
+                key: 9,
+                warm_ok: true,
+            });
+        plugin_backoff()
+            .lock()
+            .unwrap()
+            .insert((dim, 0, pos.0, pos.1, pos.2, 9), (100, 1));
+    }
+    assert_eq!(pending_blocks().lock().unwrap().len(), 3);
+    assert_eq!(backoff().lock().unwrap().len(), 3);
+    assert_eq!(plugin_cells().lock().unwrap().len(), 3);
+    assert_eq!(plugin_backoff().lock().unwrap().len(), 3);
+    for dim in DimId::ALL {
+        assert_eq!(
+            pending_blocks()
+                .lock()
+                .unwrap()
+                .get(&(dim, sec.0, sec.1, sec.2)),
+            Some(&recs),
+            "{dim:?}: its own pending-block entry"
+        );
+        assert_eq!(
+            backoff()
+                .lock()
+                .unwrap()
+                .get(&(dim, pos.0, pos.1, pos.2)),
+            Some(&(100, 1)),
+            "{dim:?}: its own backoff entry"
+        );
+        assert_eq!(
+            plugin_cells()
+                .lock()
+                .unwrap()
+                .get(&(dim, ck.0, ck.1))
+                .map(|b| b.len()),
+            Some(1),
+            "{dim:?}: its own plugin cell"
+        );
+        assert_eq!(
+            plugin_backoff()
+                .lock()
+                .unwrap()
+                .get(&(dim, 0, pos.0, pos.1, pos.2, 9)),
+            Some(&(100, 1)),
+            "{dim:?}: its own plugin backoff entry"
+        );
+    }
+
+    // Drop the Nether's cell; GC must reap only the Nether's backoff entries. waters/hoppers are
+    // Overworld-only indexes and are empty here, so only the per-dimension cell keeps a backoff.
+    plugin_cells()
+        .lock()
+        .unwrap()
+        .remove(&(DimId::Nether, ck.0, ck.1));
+    gc_backoff();
+    assert!(!backoff()
+        .lock()
+        .unwrap()
+        .contains_key(&(DimId::Nether, pos.0, pos.1, pos.2)));
+    for dim in [DimId::Overworld, DimId::End] {
+        assert!(
+            backoff()
+                .lock()
+                .unwrap()
+                .contains_key(&(dim, pos.0, pos.1, pos.2)),
+            "{dim:?}: a live cell keeps its own backoff"
+        );
+    }
+    assert!(!plugin_backoff()
+        .lock()
+        .unwrap()
+        .contains_key(&(DimId::Nether, 0, pos.0, pos.1, pos.2, 9)));
+    assert!(plugin_backoff()
+        .lock()
+        .unwrap()
+        .contains_key(&(DimId::End, 0, pos.0, pos.1, pos.2, 9)));
+
+    *waters().lock().unwrap() = old_waters;
+    *hoppers().lock().unwrap() = old_hoppers;
+    *plugin_backoff().lock().unwrap() = old_pb;
+    *plugin_cells().lock().unwrap() = old_cells;
+    *backoff().lock().unwrap() = old_backoff;
+    *pending_blocks().lock().unwrap() = old_pending;
+}
+
+/// P2-3-S2d: a player's dimension is part of their saved position. The legacy section writes all
+/// players in the old six-field layout (so it stays readable and an Overworld-only save emits no
+/// footer), and the footer carries only the non-Overworld dimensions.
+#[test]
+fn p2_3_s2d_pos_store_preserves_dimension_and_defaults_legacy_to_overworld() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _world_guard = world_guard();
+    let old_pos = std::mem::take(&mut *pos_store().lock().unwrap());
+    let old_signs = std::mem::take(&mut *signs().lock().unwrap());
+    let old_rng = world_rng::saved_state();
+
+    let expected = [
+        (
+            DimId::Overworld,
+            "ow".to_string(),
+            1.0f64,
+            2.0f64,
+            3.0f64,
+            0.5f32,
+            0.25f32,
+        ),
+        (
+            DimId::Nether,
+            "net".to_string(),
+            4.0,
+            5.0,
+            6.0,
+            1.5,
+            -0.5,
+        ),
+        (
+            DimId::End,
+            "end".to_string(),
+            7.0,
+            8.0,
+            9.0,
+            -2.0,
+            0.75,
+        ),
+    ];
+    for (dim, name, x, y, z, yaw, pitch) in &expected {
+        pos_store()
+            .lock()
+            .unwrap()
+            .insert(name.clone(), (*dim, *x, *y, *z, *yaw, *pitch));
+    }
+    let mut warmup = Vec::new();
+    save_world_into(&mut warmup);
+    let mut full = Vec::new();
+    save_world_into(&mut full);
+    assert!(
+        full.windows(DIM_MAGIC.len()).any(|w| w == DIM_MAGIC),
+        "a non-Overworld player must produce a footer"
+    );
+    let (legacy, footer_signs, footer_players) = read_dim_footer(&full).unwrap();
+    assert!(footer_signs.is_empty());
+    assert_eq!(footer_players.len(), 2);
+    assert!(footer_players.iter().all(|(_, d)| *d != DimId::Overworld));
+
+    // The footer-stripped payload is the legacy wire form. Every player is in it, and a legacy
+    // load restores all of them into the Overworld with their exact coordinates and look.
+    pos_store().lock().unwrap().clear();
+    load_world_from(legacy).unwrap();
+    for (_, name, x, y, z, yaw, pitch) in &expected {
+        assert_eq!(
+            pos_store().lock().unwrap().get(name),
+            Some(&(DimId::Overworld, *x, *y, *z, *yaw, *pitch)),
+            "{name}: a legacy position defaults to the Overworld"
+        );
+    }
+
+    // The full payload restores each player's exact (DimId, x, y, z, yaw, pitch).
+    pos_store().lock().unwrap().clear();
+    load_world_from(&full).unwrap();
+    for (dim, name, x, y, z, yaw, pitch) in &expected {
+        assert_eq!(
+            pos_store().lock().unwrap().get(name),
+            Some(&(*dim, *x, *y, *z, *yaw, *pitch)),
+            "{name}: its dimension and position round-trip"
+        );
+    }
+
+    // An Overworld-only save writes zero footer bytes.
+    pos_store().lock().unwrap().clear();
+    pos_store()
+        .lock()
+        .unwrap()
+        .insert("ow".to_string(), (DimId::Overworld, 1.0, 2.0, 3.0, 0.5, 0.25));
+    let mut overworld_only = Vec::new();
+    save_world_into(&mut overworld_only);
+    assert!(
+        !overworld_only
+            .windows(DIM_MAGIC.len())
+            .any(|w| w == DIM_MAGIC),
+        "an Overworld-only save must contain no dimension footer bytes"
+    );
+
+    world_rng::restore(old_rng);
+    *signs().lock().unwrap() = old_signs;
+    *pos_store().lock().unwrap() = old_pos;
+}
+
+/// The dimension footer fails closed: an unknown dimension tag, a body that claims more bytes than
+/// exist, or a truncated sign entry is an error rather than a silent Overworld fallback.
+#[test]
+fn p2_3_s2_dim_footer_rejects_unknown_dimension_and_truncation() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let base = b"legacy-body";
+
+    // A well-formed footer parses back into its overrides and leaves the legacy bytes untouched.
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u32.to_be_bytes()); // signs
+    body.extend_from_slice(&1u32.to_be_bytes()); // player dimensions
+    body.push(DimId::End.index() as u8);
+    body.extend_from_slice(&3u16.to_be_bytes());
+    body.extend_from_slice(b"bob");
+    let mut good = base.to_vec();
+    good.extend_from_slice(&body);
+    good.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    good.extend_from_slice(DIM_MAGIC);
+    let (rest, signs, players) = read_dim_footer(&good).unwrap();
+    assert_eq!(rest, base.as_slice());
+    assert!(signs.is_empty());
+    assert_eq!(players, vec![("bob".to_string(), DimId::End)]);
+
+    // DimId::from_index rejects anything outside 0..3.
+    let mut bad_dim = good.clone();
+    let dim_at = base.len() + 4 + 4; // sign count, then player count
+    assert_eq!(bad_dim[dim_at], DimId::End.index() as u8);
+    bad_dim[dim_at] = 3;
+    assert!(
+        read_dim_footer(&bad_dim).is_err(),
+        "an unknown dimension tag must fail closed"
+    );
+
+    // The size field claiming more bytes than the payload holds is a truncation error.
+    let mut bad_size = base.to_vec();
+    bad_size.extend_from_slice(&1_000u64.to_be_bytes());
+    bad_size.extend_from_slice(DIM_MAGIC);
+    assert!(
+        read_dim_footer(&bad_size).is_err(),
+        "an oversized body length must fail closed"
+    );
+
+    // A sign count of one with no sign bytes is a truncated footer.
+    let mut trunc = base.to_vec();
+    let mut body2 = Vec::new();
+    body2.extend_from_slice(&1u32.to_be_bytes());
+    body2.extend_from_slice(&1u32.to_be_bytes());
+    trunc.extend_from_slice(&body2);
+    trunc.extend_from_slice(&(body2.len() as u64).to_be_bytes());
+    trunc.extend_from_slice(DIM_MAGIC);
+    assert!(
+        read_dim_footer(&trunc).is_err(),
+        "a truncated sign entry must fail closed"
+    );
 }
