@@ -58,35 +58,34 @@ Mineshaftのadmission・dispatcher・piece配置は [Rust接続checkpoint](../ev
 #### Stage F2: 3次元・構造物・M2/M3 軽量性を備えた実用公開フォーク
 - **F2-1 (`P2-3-S1〜S4`: 3次元サーバーの通常経路とワールドストア次元分離)**:
   - `S0`（済 `ffb7a22`）・`S1`（済 `71e96a5`：`DimId` と次元別 `Gen` レジストリ）・`S2a`（済 `2e95617`：`WORLD` オーバーレイ `DimChunkKey` 化と次元別セーブ互換）。
-  - `S2b〜S2d`（残）：残り 8 ストア（`CHESTS`/`FURNACES`/`CROPS`/`SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`/`POS_STORE`）の `DimId` 化。
-  - `S3`（残）：Nether/End の 16 セクション（`min_y = 0`, `height = 256`）チャンク配信と `has_skylight = false` での `skyLightMask == 0` 送信。
-  - `S4`（残）：`0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン時次元復元。
+  - `S2b〜S2d`（済 `1ec70b0`, `0e532bb`）：残り 8 ストア（`CHESTS`/`FURNACES`/`CROPS`/`SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`/`POS_STORE`）の `DimId` 化。
+  - `S3`（済 `3a3bb37`）：Nether/End の 16 セクション（`min_y = 0`, `height = 256`）チャンク配信と `has_skylight = false` での `skyLightMask == 0` 送信。
+  - `S4`（残・Phase A-1 回収中）：`0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン時次元復元。
 - **F2-2 (`M3 P1〜P5` + 超高効率計算 Layer A1〜A4)**:
-  - `P1a`（済 `3135354`）・`P1b`（済 `b588c03`、full CPU ペナルティ解消）・`P2a`（済 `43a463b`）・`P3a`（済 `1befd35`）・`P4`（済 `06abd5f`、AVX2 4-lane）・`P5-wire/light`（済 `ea59c4e`）まで完了。
-  - 残る超高効率計算（詳細：[chunk-parallelism/README.md](chunk-parallelism/README.md#超高効率計算アーキテクチャ計画layer-a1a42026-11-19-2e95617-基準)）：**Layer A1**（Aquifer `AqChunkGrid` + `beard` 4 点削減 + Biome `u64`/`SurfaceProg`）、**Layer A2**（SIMD `Perlin`/`NormalNoise` + 2D/3D 分離 Corner Grid + AVX-512 8-lane）、**Layer A3**（Carver 全バッチ並列 + Feature チェッカーボード並列）、**Layer A4**（`PalettedSection` P2b–f 配線 + 共有圧縮キャッシュ + Mob SoA + PGO）。
+  - `P1a`（済 `3135354`）・`P1b`（済 `b588c03`）・`P2a`（済 `43a463b`）・`P2b`（済 `0469ad9`：`SECTION_STORE` + zero-repack wire）・`P3a`（済 `1befd35`）・`P4`（済 `06abd5f`）・`P5-wire/light`（済 `ea59c4e`）に加え、**Layer A1-a/b**（済 `3cb6d24`, `b981704`）、**Layer A2-a/b/c**（済 `c745772`, `785cdf5`, `4d28f01`）、**Layer A3-a/b/c**（済 `2a4eaf4`, `b105d58`, `91b19c4`）まで統合完了。
+  - 残る仕上げ（詳細：[chunk-parallelism/README.md](chunk-parallelism/README.md#超高効率計算アーキテクチャ計画layer-a1a42026-11-19-2e95617-基準)）：**Layer A3-a 速度回収**（`populate_parallel` の `TerrainShare`/owner キャッシュ共有）、**Layer A1-c**（`Cond::Biome(u128)` + `SurfaceProg`）、**Layer A4**（`PalettedSection` P2c–f O(1) light skip + 共有圧縮キャッシュ + `EntitySpatialGrid` ゼロアロケ/Mob SoA + PGO + `WARM=1` 対照ベンチマーク）。
 - **F2-3 (`P2-1 / P2-2`: 構造物実チャンク受入の拡大と残存 Feature / 境界の閉鎖)**:
-  - `P2-1-T0`（済 `2ee2560`）・`P2-1-T1`（済 `promotion_fluid_tick` 登録済み）・`P2-1-T3` 第 1 段（済 `bb6ec7c`：`tools/structure_capture.py` + `ruined_portal` B / `monument` 昇格で promotable 14 行）・`P2-2` `minecraft:end_spike`（済・oracle 検証＆4 mutation ゲート済み）。
-  - 残件：`P2-1-T2`（不正構造物 JSON の要素単位 fail-skip）、`igloo`（`SnowyDirtBlock`）・`village_plains` 等の HOLD 解消、および自動バッチ受入工場による残存 24 定義の段階的受入。
+  - `P2-1-T0`（済 `2ee2560`）・`P2-1-T1`（済 `promotion_fluid_tick` 登録済み）・`P2-1-T2`（済 `2481b48`：要素単位 fail-skip）・`P2-1-T3` 第 1〜2 段（済 `bb6ec7c`, `2481b48`, `2a4eaf4`：`ruined_portal` B / `monument` / `igloo` / `village_plains` 0-diff 確認）・`P2-2` `minecraft:end_spike`（済・oracle 検証＆4 mutation ゲート済み）。
+  - 残件：自動バッチ受入工場（B3/B4）による残存未検証構造物の段階的受入。
 - **F2-4 (`M2 Gameplay`: 流体 `travel` と残る操作契約の閉鎖)**:
   - `Slice 4d`（済 `b822d99`：`LivingEntity.travel` 流体浮力・減衰・Nether `ultraWarm` 溶岩押し流し）。
-  - 後続スライス：構造物 Entity スポーン初期化と `spawn_overrides`、戦闘/死亡/リスポーン・精錬・天候等の CLI live wire 往復検査。
+  - 後続スライス：一般 `BaseSpawner`・構造物 Entity スポーン初期化と `spawn_overrides`、戦闘/死亡/リスポーン・精錬・天候等の CLI live wire 往復検査。
 
-#### 超高効率計算＋収束加速の統合実行計画（Wave 0〜Wave 4、2026-11-19 承認）
+#### 超高効率計算＋収束加速の統合実行計画（Wave 0〜3 完了分 ＋ Phase A〜C 収束計画、2026-11-19 `91b19c4` 同期）
 
 完成速度と並列スループットを最大化するため、**5 つの収束規律（B1〜B5）** を固定する：
 - **B1**: Stage F1（残 D5 のみ）を先行確定し、いつでも外部公開可能な Alpha ラインを確保する。
 - **B2 (`src/main.rs` 単一レーン規約)**: 31,219 行の `src/main.rs` 衝突を避けるため、ロジックは既存の専用モジュールへ厚く閉じ、**1 バッチ内で `src/main.rs` を編集するレーンは常に 1 つ**に固定して常時 3 並列をコンフリクトゼロで回す。
-- **B3 (構造物バッチ受入工場)**: `tools/structure_capture.py` をバッチ化し、未受入 24 定義を「0-diff 自動昇格」「共通カーネル原因クラスタ」「個別原因」に自動仕分けして波及の大きい 1 修正で複数構造物を同時 0-diff 化する。
+- **B3 (構造物バッチ受入工場)**: `tools/structure_capture.py` をバッチ化し、未受入定義を「0-diff 自動昇格」「共通カーネル原因クラスタ」「個別原因」に自動仕分けして波及の大きい 1 修正で複数構造物を同時 0-diff 化する。
 - **B4 (2 階層高速ゲート＋自動ベンチ)**: サブエージェントは対象フィルタ＋`layers_check`/`debt_ratchet`/`provenance_check`、インテグレータは `TMPDIR=target/tmp` 分割実行＋`tools/perf_bench.py`（SHA-256・M1–M6・wall/CPU 中央値自動計測）で 600s タイムアウトと手動計測ロスを根絶する。
-- **B5 (台帳同期)**: Wave 完了ごとに `specs/` と運用文書を実態へ同期し、陳腐化による再調査ロスをゼロにする。
+- **B5 (台帳同期)**: フェーズ完了ごとに `specs/` と運用文書を実態へ同期し、陳腐化による再調査ロスをゼロにする。
 
-| Wave | Lane 1（`src/main.rs` 専任） | Lane 2（計算カーネル専任） | Lane 3（構造物 / ツール専任） | 出口マイルストーン |
+| フェーズ | Lane 1（`src/main.rs` 専任） | Lane 2（計算カーネル専任） | Lane 3（法務・構造物・独立モジュール専任） | 出口マイルストーン |
 |---|---|---|---|---|
-| **Wave 0** | 文書同期＋計画反映＋Stage F1 D5 準備 | `tools/perf_bench.py` 自動計測器＋テスト | `igloo` (`SnowyDirtBlock`) + `P2-1-T2` fail-skip | 台帳同期、自動計測器稼働、`igloo` 0-diff 検証 |
-| **Wave 1** | `P2-3-S2b〜d` + `S3`（残 8 ストア次元分離 + Nether/End 16 セクション配信） | Layer A1-a: Aquifer `AqChunkGrid` 化 & `Vec::remove(0)` 根絶 (`src/worldgen.rs`) | Layer A1-b: `beard` 4 点削減 (`src/structure_pipeline.rs`) | 3 次元配信完成、`full j=1` 8.07s → ~3.5s |
-| **Wave 2** | `M3 P2b〜f`: `PalettedSection` 単一正本配線 (`src/paletted.rs` + `src/main.rs`) | Layer A2: SIMD `Perlin`/`NormalNoise` + 2D/3D 分離 Corner Grid + AVX-512 8-lane (`src/generation_math.rs`, `src/worldgen.rs`) | 構造物バッチ工場（B1/B2）＋`village_plains` 159 セル解消 (`tools/structure_capture.py`, `src/jigsaw_structures.rs`) | ライト/配信桁違い軽量化、`full j=1` ~2.0s、Jigsaw 群前進 |
-| **Wave 3** | `P2-3-S4`（`0x2b`/`0x47` 次元遷移・ポータル・ログイン復元 wire） | Layer A3 + A1-c: Carver 全バッチ並列 + Feature `u64` バイオーム + チェッカーボード並列 + `SurfaceProg` (`src/feature.rs`, `src/worldgen.rs`) | 構造物バッチ工場（B3/B4：`ancient_city`/`bastion`/`trial_chambers`/`mansion` 等） | 64ch `full j=8` 1s 未満、Stage F2 機能ライン到達 |
-| **Wave 4** | M2 残スライス（Entity スポーン・戦闘/死亡/精錬 live wire）＋ PGO 計測 | `WARM=1` vanilla 対照ベンチマーク証明（CPU <= vanilla, 20 TPS, RSS ~1/8） | 同一 SHA 全ゲート監査（`verify.sh` / mutation / `--strict-public` / D5 公開判定） | Stage F2 実用公開フォーク判定 |
+| **完了済 (Wave 0〜3: `8dad8c7`〜`91b19c4`)** | `P2-3-S2b〜d` + `S3` (`1ec70b0`, `0e532bb`, `3a3bb37`), `M3 P2b` (`0469ad9`) | `perf_bench.py` (`a9d8437`), Layer A1-a/b (`3cb6d24`, `b981704`), Layer A2-a/b/c (`c745772`, `785cdf5`, `4d28f01`), Layer A3-a/b/c (`2a4eaf4`, `b105d58`, `91b19c4`) | `igloo` + `P2-1-T2` (`2481b48`), `village_plains` 0-diff 確認 (`2a4eaf4`) | 3 次元配信・パレット化・AVX-512・DAG 並列基盤完了 |
+| **Phase A（半完成回収＋逆転解消）** | **A-1**: `P2-3-S4` worktree 回収・`tests/dimension_wire.py` E2E 統合 | **A-2**: `Layer A3-a` 速度回収（`populate_parallel` の `TerrainShare`/owner キャッシュ共有） | **A-3**: Stage F1 `D5` worktree 回収（`export_public_branch.sh` + `public_export_test.py` + 文書同期） | Stage F1 完結、3 次元移動 E2E 完成、DAG 並列の実測高速化 |
+| **Phase B（M3 性能完結）** | **B-1**: `Layer A4` 本体（`PalettedSection` P2c–f O(1) light skip + 共有圧縮チャンクキャッシュ） | **B-2**: `Layer A1-c`（`Cond::Biome(u128)` + `SurfaceProg`）＋ `P0-2` 到達性監査文書 | **B-3**: `src/entity_spatial.rs` ゼロアロケ化 ＋ PGO / `WARM=1` 対照ベンチマーク | M3 / Layer A1〜A4 性能目標達成、`WARM=1` 対照証明 |
+| **Phase C（構造物・M2/P1 拡張＆最終ゲート）** | **C-1**: M2 残 wire 往復検査（戦闘・死亡/リスポーン・精錬・天候） | **C-2**: `P2-1-T3` 構造物バッチ工場（B3/B4：未検証構造物の採取と共通原因修正） | **C-3**: `src/spawner.rs` 一般 `BaseSpawner` 化 ＋ `P1-1..P1-4` → 同一 SHA 全ゲート監査（`P4-1`） | Stage F2 実用公開フォーク完全到達 |
 
 **原因記述の訂正:** 端のair差とsnowy差を位置の近さだけで同じ原因にまとめた推測は
 撤回する。訂正根拠・区別すべきlookup・次の反証は
