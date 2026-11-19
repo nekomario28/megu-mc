@@ -88,7 +88,7 @@ Mineshaftのadmission・dispatcher・piece配置は [Rust接続checkpoint](../ev
 | **完了済 (Phase A: `d45cb4c`〜`d918eac`)** | **A-1**: `P2-3-S4` (`c40417d`, `tests/dimension_wire.py` E2E) | **A-2**: `Layer A3-a` ワーカーキャッシュ共有 (`d918eac`) | **A-3**: Stage F1 `D5` (`d45cb4c`, `export_public_branch.sh`) | Stage F1 完結、3 次元移動 E2E 完成、DAG 並列の実測高速化 |
 | **完了済 (Phase B: `b2e41b5`〜`e82fbc6`)** | **B-1**: `Layer A4` (`c06be7c`: `uniform_state()` O(1) fast-path + 512-entry `MapChunkCache`) | **B-2**: `Layer A1-c` (`d918eac`: `Cond::Biome(u128)` + `Rule::Seq`) ＋ `P0-2` 監査 (`01a6528`) | **B-3**: `BaseSpawner` + `EntitySpatialGrid` (`b2e41b5`), PGO & 計測記録 (`e82fbc6`) | M3 / Layer A1〜A4 完了（PGO `full j=8` -10.6%、全 dump SHA-256 一致） |
 | **完了済 (Phase C + NF-0/NF-1: `171fbbc`〜`88573be`)** | **C-1**: M2 残 wire 往復検査 (`6b07fee`, `tests/m2_gameplay_wire.py`: 時間/天候・クラフト/精錬・2クライアント戦闘/死亡/リスポーン) | **C-2**: `P2-1-T3` Batch B3 (`7f0f0e5`: `desert_pyramid`, `shipwreck`, `ocean_ruin_cold` 0-diff 昇格、計 19 チャンク 0-diff) | **NF-0 & NF-1**: S0 `shimcheck` (`a092e5d`) ＋ 動的 Bootstrap & Dual Event Bus (`23edfdc`, 45 tests PASS) ／ **C-3**: 全モジュール警告 68→0 (`171fbbc`, `6148c25`, `ebc144b`) ＋ `GPL-3.0-or-later` & デュアル寄稿条項 (`88573be`) | Stage F2 実用公開フォーク到達 ＋ NeoForge S0/NF-1 動的ゲート確立 ＋ `main` 統合 |
-| **Phase D（Audit 1/2 修正 & Client Fork R6）** | **D-1**: ランタイム Lock 逆転・EID 衝突・`DimId` 漏れ修正 | **D-2**: Audit 1 ホットパス（`Rule::Seq` ゼロアロケーション化・`ctx.g.sea`・`OriginGrid` 疎バッチ保護・Mansion/Structure biome 判定） | **NF-2 / R6**: S1 6イベント & `MutationBuffer` ＋ クライアントフォーク（`mc-spine-client`）共通契約・差分検証基盤 | 全監査指摘の閉鎖 ＋ Server/Client 協調設計への拡張 |
+| **Phase D（Audit 1/2 修正 & Client Fork R6）** | **D-1**（済 `d0f0afd`）: ランタイム Lock 逆転（Furnace/Crop/Mob）・`load_world` EID 衝突・次元別 `set_block_dim`/プレイヤー流体判定修正（3 tests + `m2_gameplay_wire.py` & `dimension_wire.py` PASS） | **D-2**: Audit 1 ホットパス（`Rule::Seq` ゼロアロケーション化・`ctx.g.sea`・`OriginGrid` 疎バッチ保護・Mansion/Structure biome 判定） | **NF-2 / R6**: S1 6イベント & `MutationBuffer` ＋ クライアントフォーク（`mc-spine-client`）共通契約・ランチャー統合基盤 | 全監査指摘の閉鎖 ＋ Server/Client 協調設計への拡張 |
 
 **原因記述の訂正:** 端のair差とsnowy差を位置の近さだけで同じ原因にまとめた推測は
 撤回する。訂正根拠・区別すべきlookup・次の反証は
@@ -190,7 +190,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 
 ## R6 — クライアントフォーク計画と Server-Client 共通カーネル（`mc-spine-client`）
 
-サーバー（`mc-spine`）で確立した **Minecraft Java 1.21.1 (protocol 767) 厳密準拠のデータ駆動カーネル**をそのままクライアントフォーク（およびヘッドレス検証クライアント／軽量 Rust クライアント）へ展開するため、以下の 4 段階（`CF-0`〜`CF-3`）をロードマップに組み込む：
+サーバー（`mc-spine`）で確立した **Minecraft Java 1.21.1 (protocol 767) 厳密準拠のデータ駆動カーネル**をそのままクライアントフォーク（および公式 Launcher / Prism Launcher でワンクリック起動できる軽量 Rust クライアント／Integrated Server）へ展開するため、以下の 5 段階（`CF-0`〜`CF-4`）をロードマップに組み込む：
 
 1. **CF-0（Server-Client 共有コアの切り出し — Zero-Drift Shared Kernel）**:
    - `mc-spine` 本体内で既に独立モジュール化されている以下の純粋ロジックを、サーバーとクライアントフォークが 100% 同一コードで共有できる共通クレート層（`mc-spine-core` / `mc-spine-proto`）として境界維持する：
@@ -203,10 +203,14 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
    - サーバーから受信した `0x27` Level Chunk With Light、`0x09` Block Update、`0x5a` Set Entity Motion、`0x47` Respawn をクライアント側 `PalettedSection` と `entity_collision` / `entity_fluid` で毎 tick ローカル予測実行し、Vanilla 1.21.1 サーバーおよび `mc-spine` サーバーの双方に対して「クライアント側予測位置 vs サーバー確定位置の誤差 0」を自動検証する。
 3. **CF-2（クライアント側レンダリング・ライティング・メッシュ生成パイプラインとの接続）**:
    - Issue `#40`（解決済）・`#43`（Torch 増分ライティング比較）で整理した境界に従い、AGPL コード（Torch 等）は一切流用せず（`GPL-3.0-or-later` / `LGPL-3.0-or-later` 互換性を維持）、`mc-spine` の `PalettedSection`（`uniform_state()` O(1) スキップ・`hidden_filler`・`non_air` カウンタ）と `src/lighting.rs` から直接 Greedy Meshing / Chunk Section VBO を生成するクライアント描画層を接続する。
-4. **CF-3（シングルプレイ Integrated Server & Mod 共存）**:
-   - クライアントフォーク内に `mc-spine` を Integrated Server（ローカルメモリ内チャネル通信、TCP ソケット/圧縮オーバーヘッドなし）として組み込み、シングルプレイ／LAN ホストでも `mc-spine` の SIMD/DAG 並列 Worldgen と NeoForge/Fabric Mod 互換レイヤ（R5）をそのまま動かせる構成にする。
+4. **CF-3（`mods/` 投入型 Rust Integrated Server — `mc-spine-integrated.jar` / `cdylib`）**:
+   - 既存の Fabric / NeoForge クライアント環境（Sodium / Iris シェーダー等をそのまま利用）の `mods/` に JAR 1 個を入れるだけで、シングルプレイ／LAN ホスト時の重い Java Integrated Server を **JAR 内蔵の Rust ネイティブ `libmc_spine` (`cdylib`) + 共有メモリ / Direct `ByteBuffer` FFI** に完全置換する。
+   - 描画・UI は使い慣れた既存クライアント Mod 資産を活かしつつ、ワールド生成（SIMD / Rayon DAG 並列）・構造物・照明・Redstone・流体・エンティティ Tick を 100% Rust で爆速実行する。
+5. **CF-4（Default Launcher / Prism Launcher ネイティブ起動パッケージ — 極薄 Bootstrapper JAR & Wrapper Command）**:
+   - **公式 Launcher / Prism / Modrinth App 全対応の Custom Version JSON + 極薄 Bootstrapper JAR（約 20 KB）**：ランチャーが起動する `mainClass` から `--username` / `--uuid` / `--accessToken` / `--assetIndex` / `--gameDir` を受け取って即座に Rust ネイティブバイナリへ引き渡し（`execve` 置換または JVM 即時終了）、**起動 50ms 以降は JVM メモリ 0・GC カクつき 0 の 100% 純粋な Rust ネイティブプロセス**として動作させる。
+   - **Prism Launcher `Wrapper command` / `.mrpack` 直接起動**：Prism Launcher のラッパーコマンド機能に `mc-spine-wrapper` を指定することで、**一瞬たりとも `java` プロセスを起動せず**ランチャーのアカウント認証・アセット管理だけをそのまま流用して 0.1 秒で Rust クライアントを起動する。
 
-**出口:** サーバーとクライアントフォークが 1.21.1 の `block_registry` / `paletted` / `entity_collision` / `entity_fluid` / `brigadier` を二重実装せず共有し、ヘッドレス予測検証（CF-1）と描画クライアント（CF-2/CF-3）の双方で Vanilla 1.21.1 サーバー／`mc-spine` サーバーと完全互換で動作する。
+**出口:** サーバーとクライアントフォークが 1.21.1 の `block_registry` / `paletted` / `entity_collision` / `entity_fluid` / `brigadier` を二重実装せず共有し、ヘッドレス予測検証（CF-1）、`mods/` 投入型 Integrated Server（CF-3）、および公式/Prism ランチャーからの 100% Rust ネイティブ起動（CF-4）が Vanilla 1.21.1 と完全互換で動作する。
 
 ## 横断規律
 

@@ -79,6 +79,7 @@
   - [x] **Slice 4d (`b822d99`)**: `LivingEntity.travel` の水中/溶岩移動・浮力・落下減衰と Nether `ultraWarm` 溶岩押し流し倍率（`0.0023333333333333335`）。
   - [x] **一般 1.21.1 `BaseSpawner` + `SpawnPotentials` (`b2e41b5`)**: `src/spawner.rs` の重み付きポテンシャル・カスタムスポーン規則・NBT 往復。
   - [x] **Phase C-1 M2 実 wire 往復検査 (`6b07fee`)**: 戦闘・死亡/リスポーン・2×2 クラフト/かまど精錬・天候/昼夜永続化の CLI 実 wire 往復検査（`tests/m2_gameplay_wire.py` PASS、`tests/verify.sh` 統合済み）。
+  - [x] **Phase D-1 ランタイム Lock 順序・EID 衝突・次元別流体/作物修正 (`d0f0afd`)**: `FURNACES`/`CROPS`/`Mob.pos` のロック順序逆転解消、`load_world` 保存ドロップと Mob EID の衝突防止、Nether/End の次元別プレイヤー流体（溺水/溶岩）＆作物成長修正（`d1_` 3 tests + `m2_gameplay_wire.py` & `dimension_wire.py` PASS）。
 - [ ] **P3-2 生成の並列化と性能gate（M3 P1〜P5 + 超高効率計算 Layer A1〜A4）** — [仕様](chunk-parallelism/README.md)。実装完了（代表負荷 `WARM=1` 対照の最終判定は `P4-1` で統合確認）：
   - [x] **M3 P1a (`3135354`) / P1b (`b588c03`)**: 負荷非依存カウンタ（M1〜M5）＋ラウンド単位 `TerrainShare`・single-flight `starts`/`rings`・`Arc` `terr_c` により、`full` CPU +88% ペナルティを完全解消。
   - [x] **M3 P2a (`43a463b`) / P2b (`0469ad9`) / P2c (`c06be7c`)**: 常駐 `PalettedSection` モジュール（`src/paletted.rs`）、`SECTION_STORE`・zero-repack チャンク配信、`PalettedSection::uniform_state()` O(1) uniform fast-path。
@@ -98,7 +99,8 @@
 - [ ] **CF-0（Server-Client 共有コアの切り出し）**: `src/block_registry.rs` (`26,684` states / `FULL`/`CENTER`/`RIGID`)、`src/entity_collision.rs`、`src/entity_fluid.rs`、`src/paletted.rs`、`src/lighting.rs`、`src/nbt.rs`、`src/brigadier.rs` をサーバーとクライアントフォークの共有クレート境界（Zero-Drift Shared Kernel）として切り出す。
 - [ ] **CF-1（ヘッドレス 1.21.1 決定論的シミュレータ & E2E ボットクライアント）**: 受信チャンク (`0x27`)・ブロック更新 (`0x09`)・エンティティ移動 (`0x5a`) を共有カーネル上で毎 tick ローカル予測し、Vanilla 1.21.1 サーバーおよび `mc-spine` サーバーとの位置・流体・衝突誤差 0 を検証する。
 - [ ] **CF-2（クライアント描画・増分ライティング・Greedy Meshing 接続）**: AGPL コード（Torch 等）を流用せず、`PalettedSection` と `lighting.rs` から直接セクションメッシュを生成する描画パイプラインを接続（Issue `#43` と連携）。
-- [ ] **CF-3（Integrated Server 組み込み）**: シングルプレイ／LAN ホスト用に `mc-spine` をインメモリ Integrated Server としてクライアントフォークへ統合。
+- [ ] **CF-3（`mods/` 投入型 Rust Integrated Server — `mc-spine-integrated.jar` / `cdylib`）**: 既存 Fabric/NeoForge クライアント（Sodium/Iris 等）の `mods/` に 1 個 JAR を入れるだけで、シングルプレイ／LAN ホストのサーバー処理を 100% Rust (`libmc_spine` + 共有メモリ / Direct `ByteBuffer` FFI) にオフロード。
+- [ ] **CF-4（Default Launcher / Prism Launcher ネイティブ起動パッケージ）**: Custom Version JSON + 極薄 Bootstrapper JAR（約 20 KB、起動 50ms 後に JVM 退場）および Prism `Wrapper command`（JVM 非起動で直接 Rust 起動）により、公式/Prism/Modrinth 全ランチャーで内部 100% Rust ネイティブ動作を実現。
 
 ### P4 — 統合前のゲート（自動ではmergeしない）
 
