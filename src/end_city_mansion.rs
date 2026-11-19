@@ -3131,23 +3131,6 @@ mod end_city_mansion_tests {
         out.extend_from_slice(text.as_bytes());
     }
 
-    fn point(value: &J) -> Pos {
-        let a = value.as_arr().expect("point");
-        (a[0].num() as i32, a[1].num() as i32, a[2].num() as i32)
-    }
-
-    fn box_of(value: &J) -> BB {
-        let a = value.as_arr().expect("box");
-        [
-            a[0].num() as i32,
-            a[1].num() as i32,
-            a[2].num() as i32,
-            a[3].num() as i32,
-            a[4].num() as i32,
-            a[5].num() as i32,
-        ]
-    }
-
     /// The oracle's `ScriptedTerrain`, restricted to the dry-world fields the
     /// two structures use: a per-column `WORLD_SURFACE_WG` height, a top block
     /// at `height - 1`, fill below, air above, plus explicit cells.
@@ -3160,7 +3143,6 @@ mod end_city_mansion_tests {
         air: u32,
         top: u32,
         fill: u32,
-        water: u32,
     }
 
     impl Scene {
@@ -3174,7 +3156,6 @@ mod end_city_mansion_tests {
                 air: reg.state_of("minecraft:air", None),
                 top: reg.state_of("minecraft:stone", None),
                 fill: reg.state_of("minecraft:stone", None),
-                water: reg.state_of("minecraft:water", None),
             };
             let Some(terrain) = terrain else {
                 return scene;
@@ -3817,7 +3798,6 @@ mod end_city_mansion_tests {
             air: reg.state_of("minecraft:air", None),
             top: reg.state_of("minecraft:stone", None),
             fill: reg.state_of("minecraft:stone", None),
-            water: reg.state_of("minecraft:water", None),
         }
     }
 

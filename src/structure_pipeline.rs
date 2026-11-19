@@ -681,6 +681,7 @@ fn placement_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32) -> bool {
 }
 
 /// `StructurePlacement.isStructureChunk` for one set, including the exclusion zone.
+#[cfg(test)]
 fn set_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32, depth: u32) -> bool {
     if depth > 2 {
         // The exclusion graph is shallow in 1.21.1 (one set points at another); a

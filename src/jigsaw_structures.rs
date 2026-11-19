@@ -259,7 +259,6 @@ fn weighted_pick<'a, T>(items: &'a [(i32, T)], rng: &mut Lcg) -> Option<&'a T> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct JigsawStructure {
-    pub(crate) id: String,
     pub(crate) start_pool: String,
     pub(crate) start_jigsaw_name: Option<String>,
     pub(crate) max_depth: i32,
@@ -273,7 +272,7 @@ pub(crate) struct JigsawStructure {
 }
 
 impl JigsawStructure {
-    fn parse(id: &str, v: &J) -> Result<Self, String> {
+    fn parse(_id: &str, v: &J) -> Result<Self, String> {
         let start_pool = ns_name(
             v.get("start_pool")
                 .and_then(|j| match j {
@@ -338,7 +337,6 @@ impl JigsawStructure {
             _ => return Err("invalid liquid_settings".into()),
         };
         Ok(Self {
-            id: id.to_owned(),
             start_pool,
             start_jigsaw_name,
             max_depth,
@@ -1080,6 +1078,7 @@ impl PoolElement {
         }
     }
 
+    #[cfg(test)]
     fn describe(&self) -> String {
         match self {
             Self::Empty => "empty".to_owned(),
@@ -2404,8 +2403,8 @@ enum JigsawTarget<'a, 'g> {
     Live(&'a mut FC<'g>),
 }
 
-impl JigsawTarget<'_, '_> {
-    fn get_world(&mut self, p: Pos, reg: &BReg) -> u32 {
+impl<'a, 'g> JigsawTarget<'a, 'g> {
+    fn get_world(&mut self, p: Pos, #[cfg_attr(not(test), allow(unused_variables))] reg: &BReg) -> u32 {
         match self {
             #[cfg(test)]
             Self::Scene { scene, writes, .. } => writes
@@ -2413,6 +2412,14 @@ impl JigsawTarget<'_, '_> {
                 .copied()
                 .unwrap_or_else(|| scene_state(scene, p.0, p.1, p.2, reg)),
             Self::Live(ctx) => ctx.get(p.0, p.1, p.2),
+        }
+    }
+
+    fn live_ctx(&mut self) -> Option<&mut FC<'g>> {
+        match self {
+            #[cfg(test)]
+            Self::Scene { .. } => None,
+            Self::Live(ctx) => Some(&mut **ctx),
         }
     }
 
@@ -2767,7 +2774,7 @@ fn place_single_or_legacy<D: JigsawData>(
             // pins through its `rng_after` column.
             let loot_seed = is_randomizable_container_be(bname).then(|| rng.next_i64_legacy());
             let loot_table = nbt_str(nbt, "LootTable");
-            if let JigsawTarget::Live(ctx) = &mut *target {
+            if let Some(ctx) = target.live_ctx() {
                 if let Some(table) = loot_table {
                     let table = ns_name(&table);
                     // The store is decided BEFORE anything can refuse the state: a
@@ -2859,7 +2866,7 @@ fn place_single_or_legacy<D: JigsawData>(
         }
     }
 
-    if let JigsawTarget::Live(ctx) = &mut *target {
+    if let Some(ctx) = target.live_ctx() {
         // `StructureTemplate.placeInWorld`'s shape passes, which the jigsaw path
         // used to skip (measured: they are what lets a fence/panes/wall written by
         // an earlier piece pick up a connection to a block a later piece writes).
@@ -2867,7 +2874,7 @@ fn place_single_or_legacy<D: JigsawData>(
         // *write sequence* against the recorded native oracle, and it carries no
         // `TemplateWorld`, so running a pass there would need a second world adapter
         // and would move every golden that has an outside neighbour.
-        let changed = crate::structure_template::apply_shape_passes(&written, &mut **ctx, reg);
+        let changed = crate::structure_template::apply_shape_passes(&written, ctx, reg);
         // A shape write is a `setBlock`, so a cell that drops to a state with no
         // block entity loses the one it had. Nothing a shape pass writes owns a
         // block entity, so only the removal direction is reachable here.
