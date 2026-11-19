@@ -277,6 +277,7 @@ fn spawner_fails_closed_on_unsupported_edited_nbt() {
     let mut rng = Lcg::new(42);
     let mut world = DummyWorld;
 
+    // Malformed SpawnPotentials: an entry without `data`.
     let mut potentials_tag = build_spawner(0, 1, 6, None, [0, 15]);
     if let Tag::Compound(map) = &mut potentials_tag {
         map.insert(
@@ -286,15 +287,58 @@ fn spawner_fails_closed_on_unsupported_edited_nbt() {
     }
     assert!(tick(&mut potentials_tag, (0, 0, 0), &mut world, &mut rng).is_err());
 
+    // Invalid potential entries: non-positive weight, missing
+    // `data.entity.id`, and an unsupported mob id.
+    for potentials in [
+        Tag::List(
+            10,
+            vec![compound([
+                ("weight", Tag::Int(0)),
+                (
+                    "data",
+                    compound([("entity", compound([("id", s("minecraft:zombie"))]))]),
+                ),
+            ]),
+        ]),
+        Tag::List(
+            10,
+            vec![compound([
+                ("weight", Tag::Int(1)),
+                ("data", compound([("entity", compound([]))])),
+            ]),
+        ]),
+        Tag::List(
+            10,
+            vec![compound([
+                ("weight", Tag::Int(1)),
+                (
+                    "data",
+                    compound([(
+                        "entity",
+                        compound([("id", s("minecraft:unknown_mob"))]),
+                    )]),
+                ),
+            ]),
+        ]),
+    ] {
+        let mut tag = build_spawner(0, 1, 6, None, [0, 15]);
+        if let Tag::Compound(map) = &mut tag {
+            map.insert(NbtString::text("SpawnPotentials"), potentials);
+        }
+        assert!(tick(&mut tag, (0, 0, 0), &mut world, &mut rng).is_err());
+    }
+
+    // Unsupported spawner entity ids still fail closed.
     let mut wrong_mob = build_spawner(0, 1, 6, None, [0, 15]);
     if let Tag::Compound(map) = &mut wrong_mob {
         map.insert(
             NbtString::text("SpawnData"),
-            compound([("entity", compound([("id", s("minecraft:zombie"))]))]),
+            compound([("entity", compound([("id", s("minecraft:unknown_mob"))]))]),
         );
     }
     assert!(tick(&mut wrong_mob, (0, 0, 0), &mut world, &mut rng).is_err());
 
+    // Edited entity fields still fail closed (the allowlist is `id`/`Pos`).
     let mut extra_field = build_spawner(0, 1, 6, None, [0, 15]);
     if let Tag::Compound(map) = &mut extra_field {
         map.insert(
@@ -309,4 +353,98 @@ fn spawner_fails_closed_on_unsupported_edited_nbt() {
         );
     }
     assert!(tick(&mut extra_field, (0, 0, 0), &mut world, &mut rng).is_err());
+}
+
+#[test]
+fn spawner_validates_general_1211_mobs_and_weighted_potentials() {
+    struct DummyWorld;
+    impl World for DummyWorld {
+        fn active(&mut self, _: Pos, _: i32) -> bool {
+            true
+        }
+        fn no_collision(&mut self, _: [f64; 3]) -> bool {
+            true
+        }
+        fn rules(&mut self, _: [f64; 3], _: Option<LightRules>, _: &mut Lcg) -> bool {
+            true
+        }
+        fn nearby(&mut self, _: Pos, _: i32) -> usize {
+            0
+        }
+        fn unobstructed(&mut self, _: [f64; 3]) -> bool {
+            true
+        }
+        fn insert(&mut self, _: [f64; 3], _: f32) -> bool {
+            true
+        }
+        fn effects(&mut self, _: Pos, _: [f64; 3]) {}
+    }
+
+    // Every supported 1.21.1 mob id validates as a direct `SpawnData` entity.
+    for id in [
+        "minecraft:zombie",
+        "minecraft:skeleton",
+        "minecraft:spider",
+        "minecraft:cave_spider",
+        "minecraft:blaze",
+        "minecraft:magma_cube",
+        "minecraft:silverfish",
+        "minecraft:drowned",
+        "minecraft:stray",
+        "minecraft:husk",
+        "minecraft:breeze",
+        "minecraft:pig",
+    ] {
+        let mut tag = build_spawner(0, 1, 6, None, [0, 15]);
+        if let Tag::Compound(map) = &mut tag {
+            map.insert(
+                NbtString::text("SpawnData"),
+                compound([("entity", compound([("id", s(id))]))]),
+            );
+        }
+        let mut world = DummyWorld;
+        let mut rng = Lcg::new(7);
+        assert!(tick(&mut tag, (0, 0, 0), &mut world, &mut rng).is_ok(), "{id}");
+    }
+
+    // A non-empty SpawnPotentials list validates, and the selected entry
+    // becomes the active SpawnData (vanilla `BaseSpawner` re-picks
+    // `spawnData` after a cycle).
+    let mut tag = build_spawner(0, 1, 6, None, [0, 15]);
+    let potentials = Tag::List(
+        10,
+        vec![
+            compound([
+                ("weight", Tag::Int(3)),
+                (
+                    "data",
+                    compound([("entity", compound([("id", s("minecraft:blaze"))]))]),
+                ),
+            ]),
+            compound([
+                ("weight", Tag::Int(1)),
+                (
+                    "data",
+                    compound([("entity", compound([("id", s("minecraft:zombie"))]))]),
+                ),
+            ]),
+        ],
+    );
+    if let Tag::Compound(map) = &mut tag {
+        map.insert(NbtString::text("SpawnPotentials"), potentials);
+    }
+    let mut world = DummyWorld;
+    let mut rng = Lcg::new(7);
+    assert!(tick(&mut tag, (0, 0, 0), &mut world, &mut rng).is_ok());
+    let active = tag
+        .get("SpawnData")
+        .and_then(|d| d.get("entity"))
+        .and_then(|e| e.get("id"))
+        .and_then(Tag::string)
+        .map(|v| v.to_utf8().unwrap_or_default());
+    assert!(
+        active == Some("minecraft:blaze".to_owned())
+            || active == Some("minecraft:zombie".to_owned()),
+        "selected SpawnData id: {active:?}"
+    );
 }

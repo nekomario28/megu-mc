@@ -61,7 +61,11 @@ fn mob_type_is_pushable(etype: i64) -> bool {
 
 impl EntitySpatialGrid {
     fn from_entities(entities: Vec<SpatialEntity>) -> Self {
-        let mut counts: HashMap<(i32, i32), u32> = HashMap::with_capacity(entities.len().max(1));
+        // Pass 1: per-chunk entity counts. The single `cells` map holds
+        // `(0, count)` — range start in the first field, write cursor in the
+        // second — so the separate `counts` map disappears.
+        let mut cells: HashMap<(i32, i32), (u32, u32)> =
+            HashMap::with_capacity(entities.len().max(1));
         let mut total_entries = 0usize;
 
         for ent in &entities {
@@ -81,22 +85,24 @@ impl EntitySpatialGrid {
             }
             for cx in cx0..=cx1 {
                 for cz in cz0..=cz1 {
-                    *counts.entry((cx, cz)).or_insert(0) += 1;
+                    cells.entry((cx, cz)).or_insert((0, 0)).1 += 1;
                     total_entries += 1;
                 }
             }
         }
 
-        let mut cells: HashMap<(i32, i32), (u32, u32)> = HashMap::with_capacity(counts.len());
-        let mut cursors: HashMap<(i32, i32), u32> = HashMap::with_capacity(counts.len());
+        // Conversion pass: `(0, count)` becomes `(start, start)` — the range
+        // start in the first field and the cursor in the second.
         let mut offset = 0u32;
-        for (key, cnt) in counts {
-            let end = offset + cnt;
-            cells.insert(key, (offset, end));
-            cursors.insert(key, offset);
-            offset = end;
+        for value in cells.values_mut() {
+            let count = value.1;
+            value.0 = offset;
+            value.1 = offset;
+            offset += count;
         }
 
+        // Pass 2: fill `cell_entries` through the per-cell cursors. After the
+        // pass each value reads `(start, start + count)` — the query range.
         let mut cell_entries = vec![0u32; total_entries];
         for (slot, ent) in entities.iter().enumerate() {
             if !ent.aabb.min_x.is_finite()
@@ -115,9 +121,9 @@ impl EntitySpatialGrid {
             }
             for cx in cx0..=cx1 {
                 for cz in cz0..=cz1 {
-                    if let Some(cur) = cursors.get_mut(&(cx, cz)) {
-                        cell_entries[*cur as usize] = slot as u32;
-                        *cur += 1;
+                    if let Some(cursor) = cells.get_mut(&(cx, cz)) {
+                        cell_entries[cursor.1 as usize] = slot as u32;
+                        cursor.1 += 1;
                     }
                 }
             }
@@ -403,5 +409,120 @@ mod entity_spatial_tests {
         assert_eq!(grid.query_aabb(e1.aabb, e1.eid), vec![0]);
         assert_eq!(grid.query_aabb(e2.aabb, e2.eid), vec![3]);
         assert_eq!(grid.query_aabb(e3.aabb, e3.eid), vec![2]);
+    }
+
+    #[test]
+    fn entity_spatial_grid_from_entities_is_identical_across_multi_chunk_distributions() {
+        // Multi-chunk distribution: entities in several chunks, entities that
+        // straddle chunk boundaries (so one entity writes several cells), and
+        // dense duplicates inside cells.
+        let mut entities = Vec::new();
+        for (x, z) in [
+            (0.5, 0.5),
+            (15.6, 15.6),
+            (0.1, -0.1),
+            (16.05, -0.2),
+            (-0.05, 0.05),
+            (-15.5, -15.5),
+            (31.5, -31.5),
+            (47.9, 47.9),
+            (32.1, -32.1),
+            (0.5, 0.5),
+        ] {
+            entities.push(make_test_entity(
+                entities.len(),
+                1000 + entities.len() as i32,
+                x,
+                64.0,
+                z,
+                0.9,
+                1.4,
+            ));
+        }
+
+        let grid = EntitySpatialGrid::from_entities(entities.clone());
+        // A second construction over the same distribution produces the same
+        // cell ranges: every cell maps to the identical ascending entry set
+        // (absolute offsets may differ — the map is a HashMap).
+        let twin = EntitySpatialGrid::from_entities(entities.clone());
+        let range_of = |g: &EntitySpatialGrid| {
+            g.cells
+                .iter()
+                .map(|(&cell, &(start, end))| {
+                    (cell, g.cell_entries[start as usize..end as usize].to_vec())
+                })
+                .collect::<HashMap<(i32, i32), Vec<u32>>>()
+        };
+        assert_eq!(range_of(&grid), range_of(&twin));
+
+        // Every cell range is non-empty, in bounds, ascending by entity slot,
+        // and exactly matches the brute-force span of its cell.
+        let mut expected: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+        for (slot, ent) in entities.iter().enumerate() {
+            let cx0 = spatial_chunk_coord(ent.aabb.min_x);
+            let cx1 = spatial_chunk_coord(ent.aabb.max_x);
+            let cz0 = spatial_chunk_coord(ent.aabb.min_z);
+            let cz1 = spatial_chunk_coord(ent.aabb.max_z);
+            for cx in cx0..=cx1 {
+                for cz in cz0..=cz1 {
+                    expected.entry((cx, cz)).or_default().push(slot as u32);
+                }
+            }
+        }
+        assert_eq!(grid.cells.len(), expected.len());
+        for (cell, expected_slots) in &expected {
+            let (start, end) = grid
+                .cells
+                .get(cell)
+                .copied()
+                .unwrap_or_else(|| panic!("missing cell {cell:?}"));
+            assert!(end > start, "non-empty range for {cell:?}");
+            assert!(end as usize <= grid.cell_entries.len());
+            assert_eq!(
+                end - start,
+                expected_slots.len() as u32,
+                "range length for {cell:?}"
+            );
+            assert_eq!(
+                grid.cell_entries[start as usize..end as usize].to_vec(),
+                expected_slots.to_vec(),
+                "range mismatch for cell {cell:?}"
+            );
+        }
+        assert_eq!(range_of(&grid), expected);
+
+        // Query results match brute force across the multi-chunk distribution.
+        let mut scratch = SpatialScratch::default();
+        let mut grid_aabb_hits = Vec::new();
+        let mut grid_rad_hits = Vec::new();
+        for ent in &entities {
+            grid.query_aabb_into(ent.aabb, ent.eid, &mut scratch, &mut grid_aabb_hits);
+            let brute_aabb: Vec<u32> = entities
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.eid != ent.eid && o.aabb.intersects(ent.aabb))
+                .map(|(slot, _)| slot as u32)
+                .collect();
+            assert_eq!(
+                grid_aabb_hits, brute_aabb,
+                "AABB query mismatch for eid={}",
+                ent.eid
+            );
+            grid.query_radius_xz_into(ent.x, ent.z, 4.0, ent.eid, &mut scratch, &mut grid_rad_hits);
+            let brute_rad: Vec<u32> = entities
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| {
+                    o.eid != ent.eid
+                        && ((o.x - ent.x) * (o.x - ent.x) + (o.z - ent.z) * (o.z - ent.z) < 16.0)
+                })
+                .map(|(slot, _)| slot as u32)
+                .collect();
+            assert_eq!(
+                grid_rad_hits, brute_rad,
+                "radius_xz query mismatch for eid={}",
+                ent.eid
+            );
+        }
     }
 }

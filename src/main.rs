@@ -32452,7 +32452,8 @@ mod mineshaft_runtime_tests {
         *client.gm.lock().unwrap() = 0;
         clients().lock().unwrap().push(Arc::new(client));
 
-        // Direct spawner::tick refuses non-cave-spider spawners without panicking.
+        // Direct spawner::tick accepts the general 1.21.1 monster mobs and
+        // still refuses an entity id outside them without panicking.
         struct DummySpawnerWorld;
         impl spawner::World for DummySpawnerWorld {
             fn active(&mut self, _: BlockPos, _: i32) -> bool { true }
@@ -32470,11 +32471,13 @@ mod mineshaft_runtime_tests {
             if let crate::nbt::Tag::Compound(ref mut map) = tag {
                 map.insert(crate::nbt::NbtString::text("Delay"), crate::nbt::Tag::Short(0));
             }
-            assert_eq!(
-                spawner::tick(&mut tag, (0, 64, 0), &mut dummy, &mut rng),
-                Err("only cave-spider spawners are implemented")
-            );
+            assert!(spawner::tick(&mut tag, (0, 64, 0), &mut dummy, &mut rng).is_ok());
         }
+        let mut unsupported = generated_content::spawner_nbt_for((0, 64, 0), "minecraft:unknown_mob");
+        if let crate::nbt::Tag::Compound(ref mut map) = unsupported {
+            map.insert(crate::nbt::NbtString::text("Delay"), crate::nbt::Tag::Short(0));
+        }
+        assert!(spawner::tick(&mut unsupported, (0, 64, 0), &mut dummy, &mut rng).is_err());
 
         // Materialize SpawnerEntity + living structure Entity payloads.
         let mut payloads = vec![
