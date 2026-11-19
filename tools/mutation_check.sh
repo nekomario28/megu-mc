@@ -3733,6 +3733,32 @@ check "p2_3_s2d_footer_carries_the_players_real_dimension" \
   'dim_players.push((name.clone(), DimId::Overworld));' \
   persistence_tests::p2_3_s2d_pos_store_preserves_dimension_and_defaults_legacy_to_overworld
 
+# P2-3-S2b: the legacy chest table must carry Overworld entries only. Accepting every block key
+# puts Nether and End chests in the old wire layout, shifting the Overworld-only bytes and leaving
+# DIM2 without the chests that should have gone there.
+check "p2_3_s2b_legacy_chest_section_is_overworld_only" \
+  src/main.rs 'ContainerKey::Block((DimId::Overworld, x, y, z)) => Some(((*x, *y, *z), slots)),' \
+  'ContainerKey::Block((_, x, y, z)) => Some(((*x, *y, *z), slots)),' \
+  persistence_tests::p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overworld
+
+# A footer entry whose dimension byte names no known dimension must fail closed. Mapping it to a
+# real dimension instead relocates the entry and hides the corrupt tag.
+check "p2_3_s2b_dim2_footer_rejects_unknown_dimension" \
+  src/main.rs 'let dim = DimId::from_index(b as usize).ok_or("invalid DIM2 dimension tag")?;' \
+  'let dim = DimId::from_index(b as usize).unwrap_or(DimId::End);' \
+  persistence_tests::p2_3_s2b_dim2_footer_rejects_unknown_dimension_and_truncation
+
+# DIM2 furnaces must restore into the dimension they were saved from. Filing them under Overworld
+# both loses the Nether/End state and overwrites the Overworld furnace at the same coordinate.
+check "p2_3_s2b_dim2_furnace_loads_into_its_own_dimension" \
+  src/main.rs '            for (pos, fr) in dim2.furnaces {
+                fs.insert(pos, fr);
+            }' \
+  '            for (pos, fr) in dim2.furnaces {
+                fs.insert((DimId::Overworld, pos.1, pos.2, pos.3), fr);
+            }' \
+  persistence_tests::p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

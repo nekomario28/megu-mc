@@ -75,8 +75,8 @@ fn container_transfers_match_real_1_21_1_classes() {
             "quick_move" => {
                 let rows = row.get("rows").unwrap().num() as i16 * 9;
                 assert!(matches!(rows, 27 | 54));
-                let cp = ContainerKey::Block((0, 70, 0));
-                let cp2 = (rows == 54).then_some(ContainerKey::Block((1, 70, 0)));
+                let cp = ContainerKey::ow((0, 70, 0));
+                let cp2 = (rows == 54).then_some(ContainerKey::ow((1, 70, 0)));
                 let mut all = HashMap::new();
                 let mut inv = HashMap::new();
                 for (slot, st) in slot_map(row.get("slots").unwrap()) {
@@ -300,18 +300,18 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
             },
         )]);
         assert!(
-            !chests().lock().unwrap().contains_key(&ContainerKey::Block(pos)),
+            !chests().lock().unwrap().contains_key(&ContainerKey::ow(pos)),
             "{kind:?} LootTable stays unmaterialized before unpack"
         );
         assert!(
-            pending_block_loot().lock().unwrap().contains_key(&pos),
+            pending_block_loot().lock().unwrap().contains_key(&ow_block(pos)),
             "{kind:?} LootTable staged in pending_block_loot"
         );
-        assert!(unpack_block_loot_if_needed(pos));
+        assert!(unpack_block_loot_if_needed(ow_block(pos)));
         let slots = chests()
             .lock()
             .unwrap()
-            .get(&ContainerKey::Block(pos))
+            .get(&ContainerKey::ow(pos))
             .cloned()
             .expect("a container entry is created on unpack");
         assert!(!slots.is_empty(), "{kind:?} wrote its roll");
@@ -321,8 +321,8 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
                 "{kind:?} cannot hold slot {slot} (highest is {highest})"
             );
         }
-        chests().lock().unwrap().remove(&ContainerKey::Block(pos));
-        pending_block_loot().lock().unwrap().remove(&pos);
+        chests().lock().unwrap().remove(&ContainerKey::ow(pos));
+        pending_block_loot().lock().unwrap().remove(&ow_block(pos));
     }
     // A furnace's table names the furnace store, never the chest store.
     let furnace_pos = (6, 70, 6);
@@ -338,13 +338,13 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
         !chests()
             .lock()
             .unwrap()
-            .contains_key(&ContainerKey::Block(furnace_pos)),
+            .contains_key(&ContainerKey::ow(furnace_pos)),
         "a furnace's loot belongs in furnaces(), not chests()"
     );
     assert!(furnaces()
         .lock()
         .unwrap()
-        .contains_key(&furnace_pos));
-    furnaces().lock().unwrap().remove(&furnace_pos);
+        .contains_key(&ow_block(furnace_pos)));
+    furnaces().lock().unwrap().remove(&ow_block(furnace_pos));
     loot_tables().lock().unwrap().remove(table);
 }

@@ -589,7 +589,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
     for pos in [broken_furnace, live_furnace] {
         set_block(pos.0, pos.1, pos.2, name_to_state("furnace").unwrap());
         furnaces().lock().unwrap().insert(
-            pos,
+            ow_block(pos),
             Furnace {
                 input: input.clone(),
                 fuel: (0, 0, Vec::new()),
@@ -621,7 +621,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
     for pos in [broken_furnace, broken_sign] {
         set_block(pos.0, pos.1, pos.2, 0);
     }
-    assert!(!furnaces().lock().unwrap().contains_key(&broken_furnace));
+    assert!(!furnaces().lock().unwrap().contains_key(&ow_block(broken_furnace)));
     assert!(!signs()
         .lock()
         .unwrap()
@@ -637,7 +637,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
     let fs = furnaces().lock().unwrap();
     assert_eq!(fs.len(), 1);
     let loaded = fs
-        .get(&live_furnace)
+        .get(&ow_block(live_furnace))
         .expect("live furnace must be restored");
     assert_eq!(loaded.input, input);
     assert_eq!((loaded.burn_left, loaded.progress), (43, 17));
@@ -1438,5 +1438,290 @@ fn p2_3_s2_dim_footer_rejects_unknown_dimension_and_truncation() {
     assert!(
         read_dim_footer(&trunc).is_err(),
         "a truncated sign entry must fail closed"
+    );
+}
+
+/// P2-3-S2b: chests, furnaces and crops at one coordinate are three independent entries per
+/// dimension, and the DIM2 footer returns each to the dimension that owned it. The synthetic
+/// per-player Ender key is the exception: it is always filed under the Overworld so opening a
+/// chest in any dimension reaches the same storage.
+#[test]
+fn p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+    let old_chests = std::mem::take(&mut *chests().lock().unwrap());
+    let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap());
+    let old_crops = std::mem::take(&mut *crops().lock().unwrap());
+    let old_world = std::mem::take(&mut *world().lock().unwrap());
+    let old_loot = std::mem::take(&mut *pending_block_loot().lock().unwrap());
+    let old_rng = world_rng::saved_state();
+
+    let pos = (5, 70, 7);
+    let iron = name_to_item("iron_ingot").unwrap();
+    let raw = name_to_item("raw_iron").unwrap();
+    let make_furnace = |burn: i32| Furnace {
+        input: (raw, 2, Vec::new()),
+        fuel: (0, 0, Vec::new()),
+        output: (iron, 4, Vec::new()),
+        burn_left: burn,
+        progress: 17,
+        dirty: false,
+        xp: 0.0,
+        recipe_cache: CachedLookup::default(),
+        fuel_cache: CachedLookup::default(),
+    };
+    for (i, dim) in DimId::ALL.into_iter().enumerate() {
+        let key = (dim, pos.0, pos.1, pos.2);
+        let slots: HashMap<i16, Stack> = [(0i16, (iron, (i + 1) as u8, Vec::new()))]
+            .into_iter()
+            .collect();
+        chests()
+            .lock()
+            .unwrap()
+            .insert(ContainerKey::Block(key), slots);
+        furnaces()
+            .lock()
+            .unwrap()
+            .insert(key, make_furnace(100 + i as i32));
+        crops().lock().unwrap().insert(key, i as u8);
+    }
+    // The Overworld's crop age also lives in its overlay: there is no legacy crop section, so a
+    // legacy load rebuilds it from the block state.
+    world()
+        .lock()
+        .unwrap()
+        .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
+        .or_default()
+        .insert(local_idx(pos.0, pos.1, pos.2), 4278 + 0);
+    let uuid = [7u8; 16];
+    let ender = ender_container_key(&uuid);
+    assert!(
+        matches!(ender, ContainerKey::Block((DimId::Overworld, _, _, _))),
+        "an Ender key must be stored under the Overworld in every dimension"
+    );
+    let ender_slots: HashMap<i16, Stack> = [(1i16, (iron, 9, Vec::new()))].into_iter().collect();
+    chests().lock().unwrap().insert(ender, ender_slots.clone());
+    assert_eq!(chests().lock().unwrap().len(), 4);
+    assert_eq!(furnaces().lock().unwrap().len(), 3);
+    assert_eq!(crops().lock().unwrap().len(), 3);
+
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    assert!(
+        payload.windows(DIM2_MAGIC.len()).any(|w| w == DIM2_MAGIC),
+        "a non-Overworld container must produce a DIM2 footer"
+    );
+    chests().lock().unwrap().clear();
+    furnaces().lock().unwrap().clear();
+    crops().lock().unwrap().clear();
+    world().lock().unwrap().clear();
+    load_world_from(&payload).unwrap();
+
+    assert_eq!(chests().lock().unwrap().len(), 4);
+    assert_eq!(furnaces().lock().unwrap().len(), 3);
+    assert_eq!(crops().lock().unwrap().len(), 3);
+    for (i, dim) in DimId::ALL.into_iter().enumerate() {
+        let key = (dim, pos.0, pos.1, pos.2);
+        assert_eq!(
+            chests().lock().unwrap().get(&ContainerKey::Block(key)).and_then(|m| m.get(&0)).map(|s| s.1),
+            Some((i + 1) as u8),
+            "{dim:?}: its own chest content came back"
+        );
+        assert_eq!(
+            furnaces().lock().unwrap().get(&key).map(|f| f.burn_left),
+            Some(100 + i as i32),
+            "{dim:?}: its own furnace state came back"
+        );
+        assert_eq!(
+            crops().lock().unwrap().get(&key).copied(),
+            Some(i as u8),
+            "{dim:?}: its own crop age came back"
+        );
+    }
+    assert_eq!(
+        chests().lock().unwrap().get(&ender),
+        Some(&ender_slots),
+        "the Ender chest is shared across dimensions through its Overworld key"
+    );
+
+    world_rng::restore(old_rng);
+    *chests().lock().unwrap() = old_chests;
+    *furnaces().lock().unwrap() = old_furnaces;
+    *crops().lock().unwrap() = old_crops;
+    *world().lock().unwrap() = old_world;
+    *pending_block_loot().lock().unwrap() = old_loot;
+}
+
+/// P2-3-S2b: an Overworld-only save has no DIM2 footer at all, and stripping DIM2 from a mixed
+/// save leaves the legacy bytes untouched. A payload with no DIM2 footer restores every legacy
+/// chest, furnace and crop into the Overworld.
+#[test]
+fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overworld() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+    let old_chests = std::mem::take(&mut *chests().lock().unwrap());
+    let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap());
+    let old_crops = std::mem::take(&mut *crops().lock().unwrap());
+    let old_world = std::mem::take(&mut *world().lock().unwrap());
+    let old_rng = world_rng::saved_state();
+    let pos = (8, 70, 9);
+    let iron = name_to_item("iron_ingot").unwrap();
+    let slots: HashMap<i16, Stack> = [(0i16, (iron, 3, Vec::new()))].into_iter().collect();
+    for (i, dim) in DimId::ALL.into_iter().enumerate() {
+        let key = (dim, pos.0, pos.1, pos.2);
+        chests()
+            .lock()
+            .unwrap()
+            .insert(ContainerKey::Block(key), slots.clone());
+        furnaces().lock().unwrap().insert(
+            key,
+            Furnace {
+                input: (iron, 1, Vec::new()),
+                fuel: (0, 0, Vec::new()),
+                output: (0, 0, Vec::new()),
+                burn_left: 50 + i as i32,
+                progress: 5,
+                dirty: false,
+                xp: 0.0,
+                recipe_cache: CachedLookup::default(),
+                fuel_cache: CachedLookup::default(),
+            },
+        );
+        crops().lock().unwrap().insert(key, 3);
+    }
+    world()
+        .lock()
+        .unwrap()
+        .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
+        .or_default()
+        .insert(local_idx(pos.0, pos.1, pos.2), 4281);
+
+    let mut with_dims = Vec::new();
+    save_world_into(&mut with_dims);
+    assert!(with_dims.windows(4).any(|w| w == DIM2_MAGIC));
+    let (legacy, dim2) = read_dim2_footer(&with_dims).unwrap();
+    assert_eq!(dim2.chests.len(), 2);
+    assert_eq!(dim2.furnaces.len(), 2);
+    assert_eq!(dim2.crops.len(), 2);
+    assert!(dim2.chests.iter().all(|(k, _)| k.0 != DimId::Overworld));
+    assert!(dim2.furnaces.iter().all(|(k, _)| k.0 != DimId::Overworld));
+    assert!(dim2.crops.iter().all(|(k, _)| k.0 != DimId::Overworld));
+
+    // Remove the non-Overworld entries *without* replacing the map, so the surviving Overworld
+    // entries keep their iteration order and the two legacy regions must compare byte for byte.
+    for dim in [DimId::Nether, DimId::End] {
+        let key = (dim, pos.0, pos.1, pos.2);
+        chests().lock().unwrap().remove(&ContainerKey::Block(key));
+        furnaces().lock().unwrap().remove(&key);
+        crops().lock().unwrap().remove(&key);
+    }
+    let mut overworld_only = Vec::new();
+    save_world_into(&mut overworld_only);
+    assert!(
+        !overworld_only
+            .windows(DIM2_MAGIC.len())
+            .any(|w| w == DIM2_MAGIC),
+        "an Overworld-only save must contain no DIM2 bytes"
+    );
+    assert_eq!(
+        legacy,
+        overworld_only.as_slice(),
+        "a non-Overworld entry changed a byte of the legacy save"
+    );
+
+    chests().lock().unwrap().clear();
+    furnaces().lock().unwrap().clear();
+    crops().lock().unwrap().clear();
+    world().lock().unwrap().clear();
+    load_world_from(&overworld_only).unwrap();
+    let ow = ow_block(pos);
+    assert_eq!(chests().lock().unwrap().len(), 1);
+    assert!(chests().lock().unwrap().contains_key(&ContainerKey::Block(ow)));
+    assert!(furnaces().lock().unwrap().contains_key(&ow));
+    assert_eq!(crops().lock().unwrap().get(&ow).copied(), Some(3));
+
+    world_rng::restore(old_rng);
+    *chests().lock().unwrap() = old_chests;
+    *furnaces().lock().unwrap() = old_furnaces;
+    *crops().lock().unwrap() = old_crops;
+    *world().lock().unwrap() = old_world;
+}
+
+/// P2-3-S2b: the DIM2 footer is the trust boundary for another dimension's containers. It must
+/// fail closed on a dimension tag it cannot name, on an Overworld tag that does not belong in it,
+/// and on a body that is shorter than its stated size or the entries it declares.
+#[test]
+fn p2_3_s2b_dim2_footer_rejects_unknown_dimension_and_truncation() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let base = b"legacy-body";
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u32.to_be_bytes()); // chests
+    body.extend_from_slice(&0u32.to_be_bytes()); // furnaces
+    body.extend_from_slice(&1u32.to_be_bytes()); // crops
+    body.push(DimId::End.index() as u8);
+    body.extend_from_slice(&5i32.to_be_bytes());
+    body.extend_from_slice(&70i32.to_be_bytes());
+    body.extend_from_slice(&7i32.to_be_bytes());
+    body.push(3u8);
+    body.extend_from_slice(&0u32.to_be_bytes()); // pending loot
+    let mut good = base.to_vec();
+    good.extend_from_slice(&body);
+    good.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    good.extend_from_slice(DIM2_MAGIC);
+    let (rest, dim2) = read_dim2_footer(&good).unwrap();
+    assert_eq!(rest, base.as_slice());
+    assert_eq!(dim2.crops.len(), 1);
+    assert_eq!(dim2.crops[0].0.0, DimId::End);
+    assert_eq!(dim2.crops[0].1, 3);
+    // A payload without the footer is the legacy form and parses cleanly.
+    assert!(read_dim2_footer(base).unwrap().1.is_empty());
+
+    let dim_at = base.len() + 12; // three u32 counts, then the crop entry's dimension byte
+    let mut bad_dim = good.clone();
+    assert_eq!(bad_dim[dim_at], DimId::End.index() as u8);
+    bad_dim[dim_at] = 3; // outside 0..3
+    assert!(
+        read_dim2_footer(&bad_dim).is_err(),
+        "an unknown dimension tag must fail closed"
+    );
+    let mut ow_dim = good.clone();
+    ow_dim[dim_at] = DimId::Overworld.index() as u8;
+    assert!(
+        read_dim2_footer(&ow_dim).is_err(),
+        "an Overworld tag has no place in a non-Overworld footer"
+    );
+
+    let mut bad_size = base.to_vec();
+    bad_size.extend_from_slice(&1_000u64.to_be_bytes());
+    bad_size.extend_from_slice(DIM2_MAGIC);
+    assert!(
+        read_dim2_footer(&bad_size).is_err(),
+        "an oversized body length must fail closed"
+    );
+
+    // The declared crop entry is one byte short of its age.
+    let mut short = base.to_vec();
+    let mut short_body = Vec::new();
+    short_body.extend_from_slice(&0u32.to_be_bytes());
+    short_body.extend_from_slice(&0u32.to_be_bytes());
+    short_body.extend_from_slice(&1u32.to_be_bytes());
+    short_body.push(DimId::End.index() as u8);
+    short_body.extend_from_slice(&5i32.to_be_bytes());
+    short_body.extend_from_slice(&70i32.to_be_bytes());
+    short_body.extend_from_slice(&7i32.to_be_bytes());
+    // no crop age byte, no loot count: both the count bound and the entry reader must reject it
+    short.extend_from_slice(&short_body);
+    short.extend_from_slice(&(short_body.len() as u64).to_be_bytes());
+    short.extend_from_slice(DIM2_MAGIC);
+    assert!(
+        read_dim2_footer(&short).is_err(),
+        "a truncated crop entry must fail closed"
     );
 }

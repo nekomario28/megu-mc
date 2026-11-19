@@ -17,7 +17,7 @@ fn reference_tick() {
     let mut fs = furnaces().lock().unwrap();
     let mut dirty_pos: Vec<(i32, i32, i32)> = Vec::new();
     for (pos, f) in fs.iter_mut() {
-        if !is_warm(pos.0, pos.2) {
+        if !is_warm(pos.1, pos.3) {
             continue;
         }
         let out = smelt_out(f.input.0);
@@ -63,7 +63,7 @@ fn reference_tick() {
         }
         if f.dirty {
             f.dirty = false;
-            dirty_pos.push(*pos);
+            dirty_pos.push((pos.1, pos.2, pos.3));
         }
     }
     drop(fs);
@@ -109,7 +109,7 @@ struct Frame {
 }
 
 fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
-    let pos = (0, 70, 0);
+    let pos = ow_block((0, 70, 0));
     let iron = name_to_item("raw_iron").unwrap();
     let ingot = name_to_item("iron_ingot").unwrap();
     let gold = name_to_item("gold_ingot").unwrap();

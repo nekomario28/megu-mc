@@ -313,7 +313,7 @@ struct WorldSnapshot {
     region: crate::RegionSets,
     scheduled_blocks: scheduled_ticks::ScheduledTicks,
     generated_fluids: Option<GeneratedFluidOwner>,
-    pending_block_loot: HashMap<BlockPos, PendingBlockLoot>,
+    pending_block_loot: HashMap<DimBlockPos, PendingBlockLoot>,
 }
 impl WorldSnapshot {
     fn take() -> WorldSnapshot {
@@ -1401,13 +1401,13 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
     forceloaded().lock().unwrap().insert((0, 0));
     let warm_pos = (0, 70, 0);
     let cold_pos = (1600, 70, 1600);
-    furnaces().lock().unwrap().insert(warm_pos, furnace(2));
-    furnaces().lock().unwrap().insert(cold_pos, furnace(2));
+    furnaces().lock().unwrap().insert(ow_block(warm_pos), furnace(2));
+    furnaces().lock().unwrap().insert(ow_block(cold_pos), furnace(2));
     game_tick(|_, tick| tick());
     let actual = {
         let fs = furnaces().lock().unwrap();
-        let hot = &fs[&warm_pos];
-        let cold = &fs[&cold_pos];
+        let hot = &fs[&ow_block(warm_pos)];
+        let cold = &fs[&ow_block(cold_pos)];
         (
             hot.progress,
             hot.burn_left,
@@ -2200,7 +2200,7 @@ fn profile_game_tick() {
                 crops()
                     .lock()
                     .unwrap()
-                    .insert((x as i32, y as i32, z as i32), (i % 7) as u8);
+                    .insert(ow_block((x as i32, y as i32, z as i32)), (i % 7) as u8);
                 mobs().lock().unwrap().push(Arc::new(Mob {
                     eid: 22_000 + i,
                     uuid: [0u8; 16],
@@ -2242,7 +2242,7 @@ fn profile_game_tick() {
         }
         for i in 0..machines {
             furnaces().lock().unwrap().insert(
-                (i % 16, 70 + i / 256, (i / 16) % 16),
+                ow_block((i % 16, 70 + i / 256, (i / 16) % 16)),
                 furnace(if active { 64 } else { 0 }),
             );
         }
@@ -2491,7 +2491,7 @@ fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
     chests()
         .lock()
         .unwrap()
-        .entry(ContainerKey::Block((0, hy, 0)))
+        .entry(ContainerKey::ow((0, hy, 0)))
         .or_default()
         .insert(0, (item, 3, Vec::new()));
     let mut trace: Vec<(u8, u8)> = Vec::new();
@@ -2500,13 +2500,13 @@ fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
         let own = chests()
             .lock()
             .unwrap()
-            .get(&ContainerKey::Block((0, hy, 0)))
+            .get(&ContainerKey::ow((0, hy, 0)))
             .map(|m| m.values().map(|v| v.1).sum::<u8>())
             .unwrap_or(0);
         let dst = chests()
             .lock()
             .unwrap()
-            .get(&ContainerKey::Block((0, hy - 1, 0)))
+            .get(&ContainerKey::ow((0, hy - 1, 0)))
             .map(|m| m.values().map(|v| v.1).sum::<u8>())
             .unwrap_or(0);
         trace.push((own, dst));
@@ -4082,13 +4082,13 @@ fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
         chests()
             .lock()
             .unwrap()
-            .entry(ContainerKey::Block(pos))
+            .entry(ContainerKey::ow(pos))
             .or_default()
             .insert(0, stack.clone());
     }
     set_block(broken.0, broken.1, broken.2, 0);
     assert!(
-        !chests().lock().unwrap().contains_key(&ContainerKey::Block(broken)),
+        !chests().lock().unwrap().contains_key(&ContainerKey::ow(broken)),
         "cleanup on break"
     );
     let mut payload = Vec::new();
@@ -4104,12 +4104,12 @@ fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
     let containers = chests().lock().unwrap().clone();
     assert_eq!(containers.len(), 2);
     assert!(
-        !containers.contains_key(&ContainerKey::Block(broken)),
+        !containers.contains_key(&ContainerKey::ow(broken)),
         "broken contents must not resurrect"
     );
     for pos in [live, barrel] {
         assert_eq!(
-            containers.get(&ContainerKey::Block(pos)).and_then(|slots| slots.get(&0)),
+            containers.get(&ContainerKey::ow(pos)).and_then(|slots| slots.get(&0)),
             Some(&stack)
         );
         assert!(container_kind(block_at(pos.0, pos.1, pos.2)).is_some());
@@ -5639,7 +5639,7 @@ fn a_chest_state_change_keeps_its_contents() {
     chests()
         .lock()
         .unwrap()
-        .entry(ContainerKey::Block(pos))
+        .entry(ContainerKey::ow(pos))
         .or_default()
         .insert(0, stack.clone());
     let dropped = drops().lock().unwrap().len();
@@ -5652,7 +5652,7 @@ fn a_chest_state_change_keeps_its_contents() {
             chests()
                 .lock()
                 .unwrap()
-                .get(&ContainerKey::Block(pos))
+                .get(&ContainerKey::ow(pos))
                 .and_then(|slots| slots.get(&0)),
             Some(&stack),
             "{prop} changed the state, not the block, so the contents must stay"
@@ -5664,7 +5664,7 @@ fn a_chest_state_change_keeps_its_contents() {
         "no state change may drop the contents"
     );
     // The break itself does drop, so take the map entry out before clearing the block.
-    chests().lock().unwrap().remove(&ContainerKey::Block(pos));
+    chests().lock().unwrap().remove(&ContainerKey::ow(pos));
     set_block(pos.0, pos.1, pos.2, 0);
 }
 
@@ -5823,8 +5823,8 @@ fn a_double_chest_window_opens_right_half_first() {
         placed_chest("minecraft:chest", right),
     );
     let expected = (
-        ContainerKey::Block(right),
-        Some(ContainerKey::Block(left)),
+        ContainerKey::ow(right),
+        Some(ContainerKey::ow(left)),
     );
     assert_eq!(chest_window(left.0, left.1, left.2), expected, "left half");
     assert_eq!(chest_window(right.0, right.1, right.2), expected, "right half");
@@ -5833,7 +5833,7 @@ fn a_double_chest_window_opens_right_half_first() {
     set_block(lone.0, lone.1, lone.2, chest_state("chest"));
     assert_eq!(
         chest_window(lone.0, lone.1, lone.2),
-        (ContainerKey::Block(lone), None)
+        (ContainerKey::ow(lone), None)
     );
     for cell in [left, right, lone] {
         set_block(cell.0, cell.1, cell.2, 0);
@@ -5856,8 +5856,8 @@ fn two_viewers_move_the_opener_count_and_broadcast_it() {
     let audience = [first.clone(), second.clone()];
     let halves = [right, left];
     let window = (
-        ContainerKey::Block(right),
-        Some(ContainerKey::Block(left)),
+        ContainerKey::ow(right),
+        Some(ContainerKey::ow(left)),
     );
     let chest_id = i64::from(breg().unwrap().block_id_of(block_at(right.0, right.1, right.2)).unwrap());
     assert_eq!(chest_id, 177, "1.21.1's block id for minecraft:chest");
@@ -5925,10 +5925,10 @@ fn a_removed_container_closes_the_window_built_on_it() {
     let pos: BlockPos = (66, y, 60);
     set_block(pos.0, pos.1, pos.2, chest_state("chest"));
     let (viewer, mut receiver) = chest_viewer(1, pos);
-    *viewer.open_chest.lock().unwrap() = Some((ContainerKey::Block(pos), None));
+    *viewer.open_chest.lock().unwrap() = Some((ContainerKey::ow(pos), None));
     let closed = invalidate_container_windows(
         &[viewer.clone()],
-        ContainerKey::Block(pos),
+        ContainerKey::ow(pos),
         &[pos],
     );
     assert_eq!(closed, 1, "one window was closed");
@@ -5946,7 +5946,7 @@ fn a_removed_container_closes_the_window_built_on_it() {
     );
     // Second time round there is nothing to close and the count does not move.
     let again =
-        invalidate_container_windows(&[viewer.clone()], ContainerKey::Block(pos), &[pos]);
+        invalidate_container_windows(&[viewer.clone()], ContainerKey::ow(pos), &[pos]);
     assert_eq!(again, 0);
     assert!(frames_on(&mut receiver).is_empty());
     set_block(pos.0, pos.1, pos.2, 0);
@@ -5968,18 +5968,18 @@ fn breaking_a_chest_drops_each_stack_once_and_leaves_no_entry() {
     chests()
         .lock()
         .unwrap()
-        .insert(ContainerKey::Block(pos), slots);
+        .insert(ContainerKey::ow(pos), slots);
     let before = drops().lock().unwrap().len();
     set_block(pos.0, pos.1, pos.2, 0);
     assert!(
-        !chests().lock().unwrap().contains_key(&ContainerKey::Block(pos)),
+        !chests().lock().unwrap().contains_key(&ContainerKey::ow(pos)),
         "no container entry may outlive the block"
     );
     assert!(
-        !window_live((ContainerKey::Block(pos), None)),
+        !window_live((ContainerKey::ow(pos), None)),
         "the click guard must refuse a window whose block is gone"
     );
-    assert!(!container_exists(ContainerKey::Block(pos)));
+    assert!(!container_exists(ContainerKey::ow(pos)));
     let ds = drops().lock().unwrap();
     assert_eq!(
         ds.len(),
@@ -6029,7 +6029,7 @@ fn chest_pairing_states_and_contents_survive_a_save_and_load() {
         chests()
             .lock()
             .unwrap()
-            .entry(ContainerKey::Block(pos))
+            .entry(ContainerKey::ow(pos))
             .or_default()
             .insert(0, stack);
     }
@@ -6055,26 +6055,26 @@ fn chest_pairing_states_and_contents_survive_a_save_and_load() {
     assert_eq!(
         keys,
         HashSet::from([
-            ContainerKey::Block(left),
-            ContainerKey::Block(right),
-            ContainerKey::Block(lone),
+            ContainerKey::ow(left),
+            ContainerKey::ow(right),
+            ContainerKey::ow(lone),
         ]),
         "exactly the three chests: no phantom key and no persisted viewer count"
     );
     assert_eq!(
-        containers[&ContainerKey::Block(left)].get(&0),
+        containers[&ContainerKey::ow(left)].get(&0),
         Some(&(iron, 4, Vec::new()))
     );
     assert_eq!(
-        containers[&ContainerKey::Block(right)].get(&0),
+        containers[&ContainerKey::ow(right)].get(&0),
         Some(&(gold, 1, Vec::new()))
     );
     assert_eq!(
-        containers[&ContainerKey::Block(lone)].get(&0),
+        containers[&ContainerKey::ow(lone)].get(&0),
         Some(&(diamond, 3, Vec::new()))
     );
     for cell in [left, right, lone] {
-        chests().lock().unwrap().remove(&ContainerKey::Block(cell));
+        chests().lock().unwrap().remove(&ContainerKey::ow(cell));
         set_block(cell.0, cell.1, cell.2, 0);
     }
     drops().lock().unwrap().clear();
@@ -6203,10 +6203,10 @@ fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
     set_block(single.0, single.1, single.2, chest_state("chest"));
     set_block(single.0, single.1 + 1, single.2, stone);
     assert!(is_chest_blocked_at(single));
-    assert!(chest_window_blocked((ContainerKey::Block(single), None)));
+    assert!(chest_window_blocked((ContainerKey::ow(single), None)));
     set_block(single.0, single.1 + 1, single.2, glass);
     assert!(!is_chest_blocked_at(single));
-    assert!(!chest_window_blocked((ContainerKey::Block(single), None)));
+    assert!(!chest_window_blocked((ContainerKey::ow(single), None)));
     set_block(single.0, single.1 + 1, single.2, 0);
 
     // Double chest: blocked if EITHER right OR left half has a conductor above.
@@ -6222,7 +6222,7 @@ fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
     let win = chest_window(left.0, left.1, left.2);
     assert_eq!(
         win,
-        (ContainerKey::Block(right), Some(ContainerKey::Block(left)))
+        (ContainerKey::ow(right), Some(ContainerKey::ow(left)))
     );
     assert!(!chest_window_blocked(win));
 
@@ -6313,9 +6313,9 @@ fn chest_contract_multi_viewer_broadcast_changes() {
     let win = chest_window(left.0, left.1, left.2);
     assert_eq!(
         win,
-        (ContainerKey::Block(right), Some(ContainerKey::Block(left)))
+        (ContainerKey::ow(right), Some(ContainerKey::ow(left)))
     );
-    let other_win = (ContainerKey::Block(other), None);
+    let other_win = (ContainerKey::ow(other), None);
 
     let (v1, mut r1) = fast_chest_viewer(101, right);
     let (v2, mut r2) = fast_chest_viewer(102, left);
@@ -6343,10 +6343,10 @@ fn chest_contract_multi_viewer_broadcast_changes() {
     let s_gold: Stack = (gold, 4, Vec::new());
     {
         let mut all = chests().lock().unwrap();
-        all.entry(ContainerKey::Block(right))
+        all.entry(ContainerKey::ow(right))
             .or_default()
             .insert(3, s_iron.clone());
-        all.entry(ContainerKey::Block(left))
+        all.entry(ContainerKey::ow(left))
             .or_default()
             .insert(5, s_gold.clone());
     }
@@ -6366,7 +6366,7 @@ fn chest_contract_multi_viewer_broadcast_changes() {
     chests()
         .lock()
         .unwrap()
-        .entry(ContainerKey::Block(left))
+        .entry(ContainerKey::ow(left))
         .or_default()
         .remove(&5);
     let empty: Stack = (0, 0, Vec::new());
@@ -6386,7 +6386,7 @@ fn chest_contract_multi_viewer_broadcast_changes() {
     );
 
     for cell in [right, left, other] {
-        chests().lock().unwrap().remove(&ContainerKey::Block(cell));
+        chests().lock().unwrap().remove(&ContainerKey::ow(cell));
         set_block(cell.0, cell.1, cell.2, 0);
     }
 }
@@ -6409,7 +6409,7 @@ fn chest_contract_recheck_openers_reach_and_lid_close() {
     let win = chest_window(left.0, left.1, left.2);
     assert_eq!(
         win,
-        (ContainerKey::Block(right), Some(ContainerKey::Block(left)))
+        (ContainerKey::ow(right), Some(ContainerKey::ow(left)))
     );
 
     // Viewer 1 interacts; Observer sits adjacent to watch 0x08 lid events.
@@ -6502,7 +6502,7 @@ fn chest_contract_recheck_openers_reach_and_lid_close() {
         ender_pos.2,
         breg().expect("block registry").state_of("minecraft:ender_chest", None),
     );
-    let ek = ContainerKey::Block(ender_key(&v1.uuid));
+    let ek = ender_container_key(&v1.uuid);
     *v1.pos.lock().unwrap() = (88.5, f64::from(y), 60.5, 0.0, 0.0, true);
     open_chest_for_client(&v1, (ek, None), Some(ender_pos), &HashMap::new(), "Ender Chest");
     let _ = frames_on(&mut r1);
@@ -6797,11 +6797,11 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     materialize_generation_payloads(payloads);
 
     assert!(
-        !chests().lock().unwrap().contains_key(&ContainerKey::Block(chest_pos)),
+        !chests().lock().unwrap().contains_key(&ContainerKey::ow(chest_pos)),
         "placed chest with LootTable must remain unmaterialized before first open"
     );
     assert!(
-        !chests().lock().unwrap().contains_key(&ContainerKey::Block(save_pos)),
+        !chests().lock().unwrap().contains_key(&ContainerKey::ow(save_pos)),
         "placed barrel with LootTable must remain unmaterialized before first open"
     );
 
@@ -6811,7 +6811,7 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     chests().lock().unwrap().clear();
     load_world_from(&saved).unwrap();
     assert!(
-        !chests().lock().unwrap().contains_key(&ContainerKey::Block(save_pos)),
+        !chests().lock().unwrap().contains_key(&ContainerKey::ow(save_pos)),
         "save/reload before opening must not expand LootTable early"
     );
 
@@ -6820,26 +6820,26 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     *viewer.gm.lock().unwrap() = 0;
     open_chest_for_client(
         &viewer,
-        (ContainerKey::Block(chest_pos), None),
+        (ContainerKey::ow(chest_pos), None),
         None,
         &HashMap::new(),
         "Chest",
     );
     let expected_chest = roll_cart_loot(424242);
     assert_eq!(
-        chests().lock().unwrap().get(&ContainerKey::Block(chest_pos)).cloned(),
+        chests().lock().unwrap().get(&ContainerKey::ow(chest_pos)).cloned(),
         Some(expected_chest.clone())
     );
     // Clearing slot 0 and re-opening must NOT re-roll the loot table.
     chests()
         .lock()
         .unwrap()
-        .entry(ContainerKey::Block(chest_pos))
+        .entry(ContainerKey::ow(chest_pos))
         .or_default()
         .clear();
     open_chest_for_client(
         &viewer,
-        (ContainerKey::Block(chest_pos), None),
+        (ContainerKey::ow(chest_pos), None),
         None,
         &HashMap::new(),
         "Chest",
@@ -6848,7 +6848,7 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
         chests()
             .lock()
             .unwrap()
-            .get(&ContainerKey::Block(chest_pos))
+            .get(&ContainerKey::ow(chest_pos))
             .unwrap()
             .is_empty(),
         "loot table must clear after first unpack and not refill on second open"
@@ -6857,13 +6857,13 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     // Saved/reloaded barrel unpacks deterministically from its saved LootTableSeed.
     open_chest_for_client(
         &viewer,
-        (ContainerKey::Block(save_pos), None),
+        (ContainerKey::ow(save_pos), None),
         None,
         &HashMap::new(),
         "Barrel",
     );
     assert_eq!(
-        chests().lock().unwrap().get(&ContainerKey::Block(save_pos)).cloned(),
+        chests().lock().unwrap().get(&ContainerKey::ow(save_pos)).cloned(),
         Some(roll_cart_loot(13579))
     );
 
@@ -6919,20 +6919,20 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     ]);
     open_chest_for_client(
         &viewer,
-        (ContainerKey::Block(seed_a), None),
+        (ContainerKey::ow(seed_a), None),
         None,
         &HashMap::new(),
         "Chest",
     );
     open_chest_for_client(
         &viewer,
-        (ContainerKey::Block(seed_b), None),
+        (ContainerKey::ow(seed_b), None),
         None,
         &HashMap::new(),
         "Chest",
     );
-    let rolled_a = chests().lock().unwrap().get(&ContainerKey::Block(seed_a)).cloned();
-    let rolled_b = chests().lock().unwrap().get(&ContainerKey::Block(seed_b)).cloned();
+    let rolled_a = chests().lock().unwrap().get(&ContainerKey::ow(seed_a)).cloned();
+    let rolled_b = chests().lock().unwrap().get(&ContainerKey::ow(seed_b)).cloned();
     assert!(rolled_a.as_ref().is_some_and(|m| !m.is_empty()));
     assert_eq!(
         rolled_a, rolled_b,
@@ -6941,7 +6941,7 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     loot_tables().lock().unwrap().remove(custom_table);
 
     for pos in [chest_pos, save_pos, break_pos, seed_a, seed_b] {
-        chests().lock().unwrap().remove(&ContainerKey::Block(pos));
+        chests().lock().unwrap().remove(&ContainerKey::ow(pos));
         set_block(pos.0, pos.1, pos.2, 0);
     }
 }
@@ -6966,7 +6966,7 @@ fn chest_contract_3d_barrel_toggles_open_property_without_block_event() {
     let (v2, mut r2) = fast_chest_viewer(312, barrel_pos);
     let (obs, mut r_obs) = fast_chest_viewer(313, barrel_pos);
     let audience = [v1.clone(), v2.clone(), obs.clone()];
-    let win = (ContainerKey::Block(barrel_pos), None);
+    let win = (ContainerKey::ow(barrel_pos), None);
 
     // 0 -> 1: open becomes true preserving facing=north, 0x09 broadcast, NO 0x08.
     let before = chest_opener_snapshot(&audience, &[barrel_pos]);
@@ -7141,7 +7141,7 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
     let before = chest_opener_snapshot(&audience, &[ender_a, ender_b]);
     open_chest_for_client(
         &v1,
-        (ContainerKey::Block(ender_key(&v1.uuid)), None),
+        (ender_container_key(&v1.uuid), None),
         Some(ender_a),
         &HashMap::new(),
         "Ender Chest",
@@ -7156,7 +7156,7 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
     let before = chest_opener_snapshot(&audience, &[ender_a, ender_b]);
     open_chest_for_client(
         &v2,
-        (ContainerKey::Block(ender_key(&v2.uuid)), None),
+        (ender_container_key(&v2.uuid), None),
         Some(ender_a),
         &HashMap::new(),
         "Ender Chest",
@@ -7172,7 +7172,7 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
     let before = chest_opener_snapshot(&audience, &[ender_a, ender_b]);
     open_chest_for_client(
         &other,
-        (ContainerKey::Block(ender_key(&other.uuid)), None),
+        (ender_container_key(&other.uuid), None),
         Some(ender_b),
         &HashMap::new(),
         "Ender Chest",
@@ -7188,7 +7188,7 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
     let before = chest_opener_snapshot(&audience, &[ender_a]);
     open_chest_for_client(
         &spec,
-        (ContainerKey::Block(ender_key(&spec.uuid)), None),
+        (ender_container_key(&spec.uuid), None),
         Some(ender_a),
         &HashMap::new(),
         "Ender Chest",
@@ -7204,7 +7204,7 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
     chests()
         .lock()
         .unwrap()
-        .entry(ContainerKey::Block(ender_key(&v1.uuid)))
+        .entry(ender_container_key(&v1.uuid))
         .or_default()
         .insert(0, (diamond, 3, Vec::new()));
     let _ = frames_on(&mut r1);
@@ -7229,14 +7229,14 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
         chests()
             .lock()
             .unwrap()
-            .get(&ContainerKey::Block(ender_key(&v1.uuid)))
+            .get(&ender_container_key(&v1.uuid))
             .and_then(|m| m.get(&0))
             .cloned(),
         Some((diamond, 3, Vec::new())),
         "breaking an ender chest must preserve player's personal ender inventory"
     );
 
-    chests().lock().unwrap().remove(&ContainerKey::Block(ender_key(&v1.uuid)));
+    chests().lock().unwrap().remove(&ender_container_key(&v1.uuid));
     set_block(ender_b.0, ender_b.1, ender_b.2, 0);
 }
 

@@ -253,10 +253,27 @@ struct Eff {
 /// A block position. It is the key of every world registry below.
 type BlockPos = (i32, i32, i32);
 /// Unified key for chests/barrels/hoppers/dispensers and chest-minecarts.
+///
+/// A block container names its dimension: a Nether chest and an Overworld chest at the same
+/// coordinates are different block entities. A minecart keeps its UUID (the same cart is the
+/// same cart in every dimension). Ender-chest storage is the one exception to the block rule:
+/// it is per-player and cross-dimension in vanilla, so `ender_container_key` always files it
+/// under the Overworld even when the chest was opened in the Nether or the End.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ContainerKey {
-    Block(BlockPos),
+    Block(DimBlockPos),
     Cart([u8; 16]),
+}
+impl ContainerKey {
+    /// The Overworld block key every dimension-less caller means until S3 threads a dimension
+    /// through it.
+    fn ow(pos: BlockPos) -> Self {
+        ContainerKey::Block(ow_block(pos))
+    }
+}
+/// Lift a world position into the Overworld's dimension.
+fn ow_block(pos: BlockPos) -> DimBlockPos {
+    (DimId::Overworld, pos.0, pos.1, pos.2)
 }
 /// A chunk column, for the maps keyed by chunk rather than by block.
 type ChunkKey = (i32, i32);
@@ -3480,22 +3497,25 @@ fn keepalive_time_tick() {
     {
         let mut cg = crops().lock().unwrap();
         let mut ripe: Vec<(i32, i32, i32)> = Vec::new();
-        let keys: Vec<(i32, i32, i32)> = cg
+        // Only the Overworld has a block write path so far (S2a): a crop in another dimension
+        // lives in its own registry entry, but there is no set_block_dim transaction to grow it.
+        let keys: Vec<DimBlockPos> = cg
             .keys()
             .copied()
-            .filter(|p| region.is_warm(p.0, p.2))
+            .filter(|&(dim, x, _, z)| dim == DimId::Overworld && region.is_warm(x, z))
             .collect();
         for p in keys {
+            let (_, x, y, z) = p;
             let age = cg.get(&p).cloned().unwrap_or(0);
-            let hh = ((p.0 as i64).wrapping_mul(31)
-                ^ (p.2 as i64).wrapping_mul(37)
-                ^ (p.1 as i64)
+            let hh = ((x as i64).wrapping_mul(31)
+                ^ (z as i64).wrapping_mul(37)
+                ^ (y as i64)
                 ^ t as i64) as u64;
             if hh.is_multiple_of(CROP_GROWTH_DENOMINATOR) && age < 7 {
                 cg.insert(p, age + 1);
                 let st = 4278 + (age as u32) + 1;
-                set_block(p.0, p.1, p.2, st);
-                ripe.push(p);
+                set_block(x, y, z, st);
+                ripe.push((x, y, z));
             }
         }
         drop(cg);
@@ -4345,7 +4365,9 @@ fn furnace_tick() {
     // what dominated this stage, not the set lookup itself.
     let region = region_guard();
     for (pos, f) in fs.iter_mut() {
-        if !region.is_warm(pos.0, pos.2) {
+        // The smelting tick's block-write path is Overworld-only until S3 (S2a): ticking a
+        // Nether or End furnace here would push its Overworld-coordinate open window.
+        if pos.0 != DimId::Overworld || !region.is_warm(pos.1, pos.3) {
             continue;
         }
         // The recipe result is only ever read behind `input.1 > 0`, so an empty
@@ -4404,7 +4426,7 @@ fn furnace_tick() {
         }
         if f.dirty {
             f.dirty = false;
-            dirty_pos.push(*pos);
+            dirty_pos.push((pos.1, pos.2, pos.3));
         }
     }
     drop(region);
@@ -4517,6 +4539,14 @@ fn ender_key(uuid: &[u8; 16]) -> (i32, i32, i32) {
 /// construction: there is no block entity behind an ender chest's per-player storage.
 fn is_ender_key(pos: (i32, i32, i32)) -> bool {
     pos.0 >= ENDER_KEY_X && pos.1 == ENDER_KEY_Y
+}
+/// The storage key for one player's Ender chest. Vanilla Ender chests are per-player and shared
+/// across every dimension, so the synthetic position is always filed under the Overworld: opening
+/// one from the Nether or the End reaches this exact entry, and its bytes stay in the legacy
+/// section where an old build expects them.
+fn ender_container_key(uuid: &[u8; 16]) -> ContainerKey {
+    let ek = ender_key(uuid);
+    ContainerKey::Block((DimId::Overworld, ek.0, ek.1, ek.2))
 }
 // ---------- fake players (carpet-actor equivalent for parity fixtures) ----------
 struct Actor {
@@ -4899,14 +4929,14 @@ fn hopper_tick() {
         }
         let mut did = false;
         // push one item from the hopper's own inventory toward facing container
-        unpack_block_loot_if_needed((hx, hy, hz));
-        unpack_block_loot_if_needed(dst);
+        unpack_block_loot_if_needed(ow_block((hx, hy, hz)));
+        unpack_block_loot_if_needed(ow_block(dst));
         if let Some(partner) = chest_partner(dst.0, dst.1, dst.2) {
-            unpack_block_loot_if_needed(partner);
+            unpack_block_loot_if_needed(ow_block(partner));
         }
         {
             let mut all = chests().lock().unwrap();
-            let own = all.get(&ContainerKey::Block((hx, hy, hz))).and_then(|m| {
+            let own = all.get(&ContainerKey::ow((hx, hy, hz))).and_then(|m| {
                 m.iter()
                     .find(|(_, v)| v.1 > 0)
                     .map(|(k, v)| (*k, v.clone()))
@@ -4917,7 +4947,7 @@ fn hopper_tick() {
                 // partner half when the facing half is full
                 let dsts = [dst, chest_partner(dst.0, dst.1, dst.2).unwrap_or(dst)];
                 for dp in dsts {
-                    let dstm = all.entry(ContainerKey::Block(dp)).or_default();
+                    let dstm = all.entry(ContainerKey::ow(dp)).or_default();
                     let slot = dstm
                         .iter()
                         .find(|(_, v)| v.0 == it && v.2 == _cc && v.1 < smax)
@@ -4926,7 +4956,7 @@ fn hopper_tick() {
                     let Some(slot) = slot else { continue }; // full -> try partner
                     let cur = dstm.get(&slot).map(|v| v.1).unwrap_or(0);
                     dstm.insert(slot, (it, cur + 1, _cc.clone()));
-                    if let Some(sm) = all.get_mut(&ContainerKey::Block((hx, hy, hz))) {
+                    if let Some(sm) = all.get_mut(&ContainerKey::ow((hx, hy, hz))) {
                         if let Some(v) = sm.get_mut(&k) {
                             v.1 -= 1;
                             if v.1 == 0 {
@@ -4943,9 +4973,9 @@ fn hopper_tick() {
             // pull one item from the chest above into the destination chest
             let src = (hx, hy + 1, hz);
             if container_kind(block_at(src.0, src.1, src.2)).is_some() {
-                unpack_block_loot_if_needed(src);
+                unpack_block_loot_if_needed(ow_block(src));
                 if let Some(partner) = chest_partner(src.0, src.1, src.2) {
-                    unpack_block_loot_if_needed(partner);
+                    unpack_block_loot_if_needed(ow_block(partner));
                 }
                 let mut all = chests().lock().unwrap();
                 // vanilla merges double chests into one container — a
@@ -4955,7 +4985,7 @@ fn hopper_tick() {
                 let item = srcs
                     .iter()
                     .filter_map(|sp| {
-                        all.get(&ContainerKey::Block(*sp)).and_then(|ch| {
+                        all.get(&ContainerKey::ow(*sp)).and_then(|ch| {
                             ch.iter()
                                 .find(|(_, v)| v.1 > 0)
                                 .map(|(k, v)| (*k, v.clone()))
@@ -4965,7 +4995,7 @@ fn hopper_tick() {
                     .next();
                 if let Some((srcp, (k, (it, c, _xc)))) = item {
                     let smax = item_stack_max(it, &_xc) as u8;
-                    let dstm = all.entry(ContainerKey::Block(dst)).or_default();
+                    let dstm = all.entry(ContainerKey::ow(dst)).or_default();
                     let slot = dstm
                         .iter()
                         .find(|(_, v)| v.0 == it && v.2 == _xc && v.1 < smax)
@@ -4976,7 +5006,7 @@ fn hopper_tick() {
                     let nc = dstm.get(&slot).map(|v| v.1).unwrap_or(0) + 1;
                     if nc <= smax {
                         dstm.insert(slot, (it, nc, _xc.clone()));
-                        if let Some(srcm) = all.get_mut(&ContainerKey::Block(srcp)) {
+                        if let Some(srcm) = all.get_mut(&ContainerKey::ow(srcp)) {
                             if c <= 1 {
                                 srcm.remove(&k);
                             } else {
@@ -5004,7 +5034,7 @@ fn hopper_tick() {
                 {
                     let mut all = chests().lock().unwrap();
                     let smax = item_stack_max(item, &dcp) as u8;
-                    let dstm = all.entry(ContainerKey::Block(dst)).or_default();
+                    let dstm = all.entry(ContainerKey::ow(dst)).or_default();
                     let slot = dstm
                         .iter()
                         .find(|(_, v)| v.0 == item && v.2 == dcp && v.1 < smax)
@@ -6013,12 +6043,12 @@ struct Furnace {
     recipe_cache: CachedLookup<(i64, u64), Option<(i64, u8)>>,
     fuel_cache: CachedLookup<i64, i32>,
 }
-static FURNACES: Registry<BlockPos, Furnace> = OnceLock::new();
-static CROPS: Registry<BlockPos, u8> = OnceLock::new();
-fn crops() -> &'static Mutex<HashMap<(i32, i32, i32), u8>> {
+static FURNACES: Registry<DimBlockPos, Furnace> = OnceLock::new();
+static CROPS: Registry<DimBlockPos, u8> = OnceLock::new();
+fn crops() -> &'static LockedMap<DimBlockPos, u8> {
     CROPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
-fn furnaces() -> &'static Mutex<HashMap<(i32, i32, i32), Furnace>> {
+fn furnaces() -> &'static LockedMap<DimBlockPos, Furnace> {
     FURNACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 // furnace block states 4295..=4302 (facing x lit); one store for
@@ -6028,7 +6058,7 @@ fn is_furnace_at(x: i32, y: i32, z: i32) -> bool {
 }
 fn furnace_slots(pos: (i32, i32, i32)) -> HashMap<i16, Stack> {
     let fs = furnaces().lock().unwrap();
-    fs.get(&pos)
+    fs.get(&ow_block(pos))
         .map(|f| {
             let mut m = HashMap::new();
             if f.input.1 > 0 {
@@ -6161,8 +6191,8 @@ struct PendingBlockLoot {
     loot_table: String,
     loot_seed: Option<i64>,
 }
-static PENDING_BLOCK_LOOT: Registry<BlockPos, PendingBlockLoot> = OnceLock::new();
-fn pending_block_loot() -> &'static LockedMap<BlockPos, PendingBlockLoot> {
+static PENDING_BLOCK_LOOT: Registry<DimBlockPos, PendingBlockLoot> = OnceLock::new();
+fn pending_block_loot() -> &'static LockedMap<DimBlockPos, PendingBlockLoot> {
     PENDING_BLOCK_LOOT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 /// Chest-minecart spawn packet; the tracker owns visibility, not mob AI.
@@ -6342,7 +6372,7 @@ fn roll_loot_container_slots(
         out
     }
 }
-fn unpack_block_loot_if_needed(pos: BlockPos) -> bool {
+fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
     with_save_guard(|| {
         let pending = pending_block_loot().lock().unwrap().remove(&pos);
         let Some(entry) = pending else {
@@ -6359,14 +6389,15 @@ fn unpack_block_loot_if_needed(pos: BlockPos) -> bool {
 }
 fn window_has_pending_loot(window: (ContainerKey, Option<ContainerKey>)) -> bool {
     let map = pending_block_loot().lock().unwrap();
-    [Some(window.0), window.1].into_iter().flatten().any(|key| {
-        matches!(key, ContainerKey::Block(pos) if !is_ender_key(pos) && map.contains_key(&pos))
-    })
+    [Some(window.0), window.1]
+        .into_iter()
+        .flatten()
+        .any(|key| matches!(key, ContainerKey::Block(pos) if !is_ender_key((pos.1, pos.2, pos.3)) && map.contains_key(&pos)))
 }
 fn unpack_window_loot_if_needed(window: (ContainerKey, Option<ContainerKey>)) {
     for key in [Some(window.0), window.1].into_iter().flatten() {
         if let ContainerKey::Block(pos) = key {
-            if !is_ender_key(pos) {
+            if !is_ender_key((pos.1, pos.2, pos.3)) {
                 unpack_block_loot_if_needed(pos);
             }
         }
@@ -6389,7 +6420,7 @@ fn materialize_generation_payloads_inner(
                 // on placed chests/barrels/pots/dispensers/hoppers until first non-spectator
                 // open, automation access, or destruction.
                 pending_block_loot().lock().unwrap().insert(
-                    pos,
+                    ow_block(pos),
                     PendingBlockLoot {
                         kind,
                         loot_table,
@@ -6422,14 +6453,14 @@ fn materialize_generation_payloads_inner(
                 match kind {
                     ContainerKind::Chest | ContainerKind::BlockContainer(_) => {
                         let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
-                        let entry = store.entry(ContainerKey::Block(pos)).or_default();
+                        let entry = store.entry(ContainerKey::ow(pos)).or_default();
                         for (slot, stack) in container_slots {
                             entry.insert(slot, stack);
                         }
                     }
                     ContainerKind::Furnace => {
                         let mut store = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-                        let furnace = store.entry(pos).or_insert(Furnace {
+                        let furnace = store.entry(ow_block(pos)).or_insert(Furnace {
                             input: (0, 0, Vec::new()),
                             fuel: (0, 0, Vec::new()),
                             output: (0, 0, Vec::new()),
@@ -6607,7 +6638,8 @@ fn chests() -> &'static LockedMap<ContainerKey, HashMap<i16, Stack>> {
 fn container_exists(key: ContainerKey) -> bool {
     match key {
         ContainerKey::Block(pos) => {
-            is_ender_key(pos) || container_kind(block_at(pos.0, pos.1, pos.2)).is_some()
+            is_ender_key((pos.1, pos.2, pos.3))
+                || container_kind(block_at_dim(pos.0, pos.1, pos.2, pos.3)).is_some()
         }
         ContainerKey::Cart(uuid) => generated_content()
             .lock()
@@ -6637,7 +6669,7 @@ fn container_exists(key: ContainerKey) -> bool {
 /// `audience` hold a menu built on it. A paired window contains both halves, so both
 /// halves see the same viewers - which is what `CompoundContainer.startOpen` does.
 fn half_openers(audience: &[Arc<Client>], pos: BlockPos) -> u32 {
-    let key = ContainerKey::Block(pos);
+    let key = ContainerKey::ow(pos);
     audience
         .iter()
         .filter(|c| {
@@ -6654,7 +6686,7 @@ fn half_openers(audience: &[Arc<Client>], pos: BlockPos) -> u32 {
             if a == key || b == Some(key) {
                 return true;
             }
-            if matches!(a, ContainerKey::Block(ek) if is_ender_key(ek)) && b.is_none() {
+            if matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {
                 return c
                     .chest_sync
                     .lock()
@@ -6765,10 +6797,15 @@ fn window_live(open: (ContainerKey, Option<ContainerKey>)) -> bool {
     if !container_exists(first) || second.is_some_and(|key| !container_exists(key)) {
         return false;
     }
-    let (ContainerKey::Block(right), Some(ContainerKey::Block(left))) = (first, second) else {
+    let (
+        ContainerKey::Block((rdim, rx, ry, rz)),
+        Some(ContainerKey::Block((ldim, lx, ly, lz))),
+    ) = (first, second)
+    else {
         return true;
     };
-    chest_pair(right.0, right.1, right.2) == Some((right, left))
+    // A pair is block state, so both halves must be in the same dimension.
+    rdim == ldim && chest_pair(rx, ry, rz) == Some(((rx, ry, rz), (lx, ly, lz)))
 }
 fn window_live_for(
     c: &Client,
@@ -6777,7 +6814,7 @@ fn window_live_for(
     if !window_live(open) {
         return false;
     }
-    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key(ek)) {
+    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key((ek.1, ek.2, ek.3))) {
         let anchor = c
             .chest_sync
             .lock()
@@ -6830,7 +6867,7 @@ fn invalidate_ender_chest_windows(audience: &[Arc<Client>], pos: BlockPos) -> us
             let mut open = c.open_chest.lock().unwrap_or_else(|e| e.into_inner());
             let mut sync = c.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
             let matches_anchor = open.is_some_and(|(a, b)| {
-                matches!(a, ContainerKey::Block(ek) if is_ender_key(ek)) && b.is_none()
+                matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none()
             }) && sync.as_ref().and_then(|s| s.anchor) == Some(pos);
             if matches_anchor {
                 *open = None;
@@ -6854,7 +6891,7 @@ fn invalidate_client_chest_window(
     me: &Client,
     open: (ContainerKey, Option<ContainerKey>),
 ) {
-    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key(ek)) {
+    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key((ek.1, ek.2, ek.3))) {
         if let Some((_, Some(pos))) = client_open_window_and_anchor(me) {
             invalidate_ender_chest_windows(audience, pos);
             return;
@@ -7777,8 +7814,8 @@ fn chest_halves_of(st: u32, pos: BlockPos) -> Vec<BlockPos> {
 /// owns slots 0..=26. A barrel, a shulker box or a `single` chest is its own window.
 fn chest_window(x: i32, y: i32, z: i32) -> (ContainerKey, Option<ContainerKey>) {
     match chest_pair(x, y, z) {
-        Some((right, left)) => (ContainerKey::Block(right), Some(ContainerKey::Block(left))),
-        None => (ContainerKey::Block((x, y, z)), None),
+        Some((right, left)) => (ContainerKey::ow(right), Some(ContainerKey::ow(left))),
+        None => (ContainerKey::ow((x, y, z)), None),
     }
 }
 /// Which cells a window's opener counters live on. The synthetic ender-chest key has
@@ -7787,7 +7824,8 @@ fn chest_window(x: i32, y: i32, z: i32) -> (ContainerKey, Option<ContainerKey>) 
 fn chest_window_halves(open: (ContainerKey, Option<ContainerKey>)) -> Vec<BlockPos> {
     let mut out: Vec<BlockPos> = Vec::new();
     for key in [Some(open.0), open.1].into_iter().flatten() {
-        if let ContainerKey::Block(pos) = key {
+        if let ContainerKey::Block((_dim, x, y, z)) = key {
+            let pos = (x, y, z);
             if !is_ender_key(pos) && !out.contains(&pos) {
                 out.push(pos);
             }
@@ -7799,7 +7837,7 @@ fn client_window_halves(
     open: (ContainerKey, Option<ContainerKey>),
     anchor: Option<BlockPos>,
 ) -> Vec<BlockPos> {
-    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key(ek)) {
+    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key((ek.1, ek.2, ek.3))) {
         return anchor.into_iter().collect();
     }
     chest_window_halves(open)
@@ -7909,7 +7947,8 @@ fn chest_still_valid(
         return false;
     }
     match open {
-        (ContainerKey::Block(first), second) => {
+        (ContainerKey::Block((_dim, x, y, z)), second) => {
+            let first = (x, y, z);
             let first_ok = if is_ender_key(first) {
                 anchor.is_some_and(|pos| {
                     (7513..=7520).contains(&block_at(pos.0, pos.1, pos.2))
@@ -7922,7 +7961,9 @@ fn chest_still_valid(
                 return false;
             }
             match second {
-                Some(ContainerKey::Block(pos2)) => can_interact_with_block(c, pos2, 4.0),
+                Some(ContainerKey::Block((_, x2, y2, z2))) => {
+                    can_interact_with_block(c, (x2, y2, z2), 4.0)
+                }
                 _ => true,
             }
         }
@@ -9827,12 +9868,12 @@ fn set_block_if_inner_dim(
             let halves = chest_halves_of(old, (x, y, z));
             // broken containers throw their contents (vanilla): one drop
             // entity per stack, not per item.
-            unpack_block_loot_if_needed((x, y, z));
+            unpack_block_loot_if_needed(ow_block((x, y, z)));
             let mut spill: Vec<Stack> = Vec::new();
             if let Some(slots) = chests()
                 .lock()
                 .unwrap()
-                .remove(&ContainerKey::Block((x, y, z)))
+                .remove(&ContainerKey::ow((x, y, z)))
             {
                 spill.extend(
                     slots
@@ -9841,7 +9882,7 @@ fn set_block_if_inner_dim(
                         .cloned(),
                 );
             }
-            if let Some(f) = furnaces().lock().unwrap().remove(&(x, y, z)) {
+            if let Some(f) = furnaces().lock().unwrap().remove(&ow_block((x, y, z))) {
                 spill.extend(
                     [f.input.clone(), f.fuel.clone(), f.output.clone()]
                         .into_iter()
@@ -9871,7 +9912,7 @@ fn set_block_if_inner_dim(
             let audience = client_snapshot();
             invalidate_container_windows(
                 &audience,
-                ContainerKey::Block((x, y, z)),
+                ContainerKey::ow((x, y, z)),
                 &halves,
             );
             if (7513..=7520).contains(&old) {
@@ -9880,7 +9921,7 @@ fn set_block_if_inner_dim(
             disp_power().lock().unwrap().remove(&(x, y, z));
             obs_unpower().lock().unwrap().remove(&(x, y, z));
             if !(4278..=4285).contains(&st) {
-                crops().lock().unwrap().remove(&(x, y, z));
+                crops().lock().unwrap().remove(&ow_block((x, y, z)));
             }
         }
         // Chest pairing is block state, so the chests beside this cell re-derive it
@@ -10079,8 +10120,8 @@ fn fire_dispenser(dx: i32, dy: i32, dz: i32, st: u32) {
         _ => (0, -1, 0),
     };
     let (tx, ty, tz) = (dx + fx, dy + fy, dz + fz);
-    unpack_block_loot_if_needed((dx, dy, dz));
-    let first = chests().lock().unwrap().get(&ContainerKey::Block((dx, dy, dz))).and_then(|m| {
+    unpack_block_loot_if_needed(ow_block((dx, dy, dz)));
+    let first = chests().lock().unwrap().get(&ContainerKey::ow((dx, dy, dz))).and_then(|m| {
         m.iter()
             .find(|(_, v)| v.1 > 0)
             .map(|(k, v)| (*k, v.clone()))
@@ -10109,7 +10150,7 @@ fn fire_dispenser(dx: i32, dy: i32, dz: i32, st: u32) {
                 note_block_update(tx, ty, tz, nst);
             }
             let mut ch = chests().lock().unwrap();
-            if let Some(m) = ch.get_mut(&ContainerKey::Block((dx, dy, dz))) {
+            if let Some(m) = ch.get_mut(&ContainerKey::ow((dx, dy, dz))) {
                 if let Some(v) = m.get_mut(&slot) {
                     v.1 = v.1.saturating_sub(1);
                     if v.1 == 0 {
@@ -10625,7 +10666,7 @@ fn rebuild_derived_indexes() {
                 hopper_queue().lock().unwrap().schedule((x, y, z), 1);
             }
             if (4278..=4285).contains(st) {
-                cg.insert((x, y, z), (*st - 4278) as u8);
+                cg.insert((DimId::Overworld, x, y, z), (*st - 4278) as u8);
             }
             if lamp_on && *st == ST_GROWTH_LAMP {
                 cells
@@ -10778,6 +10819,118 @@ fn read_comps(b: &[u8], p: &mut usize) -> Comps {
         *p += l;
     }
     c
+}
+/// The one wire encoder for a container's slot table. The legacy chest section and the DIM2
+/// footer both call this, so a future change to item components cannot make one format drift.
+fn write_stack_table(out: &mut Vec<u8>, slots: &HashMap<i16, Stack>) {
+    write_varint(out, slots.len() as i64);
+    for (&slot, (item, cnt, comps)) in slots.iter() {
+        out.extend_from_slice(&slot.to_be_bytes());
+        write_varint(out, *item);
+        out.push(*cnt);
+        write_comps(out, comps);
+    }
+}
+/// The matching decoder. `has_comps` is false for MET2 (the pre-component wire form); the lenient
+/// `break` on truncation is the legacy loader's behaviour, and DIM2 adds strictness by requiring
+/// that the footer's length-delimited body be consumed exactly.
+fn read_stack_table(payload: &[u8], p: &mut usize, has_comps: bool) -> HashMap<i16, Stack> {
+    let n = rv_varint(payload, p);
+    let mut slots = HashMap::new();
+    for _ in 0..n {
+        if p.saturating_add(3) > payload.len() {
+            break;
+        }
+        let slot = i16::from_be_bytes(payload[*p..*p + 2].try_into().unwrap());
+        *p += 2;
+        let item = rv_varint(payload, p);
+        if *p >= payload.len() {
+            break;
+        }
+        let cnt = payload[*p];
+        *p += 1;
+        let comps = if has_comps {
+            read_comps(payload, p)
+        } else {
+            Vec::new()
+        };
+        slots.insert(slot, (item, cnt, comps));
+    }
+    slots
+}
+/// A byte-for-byte copy of the fields the footer serialises. The caches are deliberately fresh:
+/// they are derived state and are rebuilt on load, never persisted.
+fn clone_furnace_for_footer(fr: &Furnace) -> Furnace {
+    Furnace {
+        input: fr.input.clone(),
+        fuel: fr.fuel.clone(),
+        output: fr.output.clone(),
+        burn_left: fr.burn_left,
+        progress: fr.progress,
+        dirty: false,
+        xp: 0.0,
+        recipe_cache: CachedLookup::default(),
+        fuel_cache: CachedLookup::default(),
+    }
+}
+/// One Furnace's three stacks and two counters, in the legacy furnace-section layout.
+fn write_furnace_state(out: &mut Vec<u8>, fr: &Furnace) {
+    write_varint(out, fr.input.0);
+    out.push(fr.input.1);
+    write_comps(out, &fr.input.2);
+    write_varint(out, fr.fuel.0);
+    out.push(fr.fuel.1);
+    write_comps(out, &fr.fuel.2);
+    write_varint(out, fr.output.0);
+    out.push(fr.output.1);
+    write_comps(out, &fr.output.2);
+    out.extend_from_slice(&fr.burn_left.to_be_bytes());
+    out.extend_from_slice(&fr.progress.to_be_bytes());
+}
+fn read_furnace_state(
+    payload: &[u8],
+    p: &mut usize,
+    has_comps: bool,
+    legacy_ms_ages: bool,
+) -> Option<Furnace> {
+    let rd = |p: &mut usize| -> Stack {
+        let it = rv_varint(payload, p);
+        let c = if *p < payload.len() { payload[*p] } else { 0 };
+        *p += 1;
+        let comps = if has_comps {
+            read_comps(payload, p)
+        } else {
+            Vec::new()
+        };
+        (it, c, comps)
+    };
+    let input = rd(p);
+    let fuel = rd(p);
+    let output = rd(p);
+    if p.saturating_add(8) > payload.len() {
+        return None;
+    }
+    let burn_left = legacy_tick_count(
+        i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap()) as u64,
+        legacy_ms_ages,
+    ) as i32;
+    *p += 4;
+    let progress = legacy_tick_count(
+        i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap()) as u64,
+        legacy_ms_ages,
+    ) as i32;
+    *p += 4;
+    Some(Furnace {
+        input,
+        fuel,
+        output,
+        burn_left,
+        progress,
+        dirty: false,
+        xp: 0.0,
+        recipe_cache: CachedLookup::default(),
+        fuel_cache: CachedLookup::default(),
+    })
 }
 fn rv_varint(b: &[u8], p: &mut usize) -> i64 {
     let mut v = 0i64;
@@ -11015,6 +11168,18 @@ fn save_world_into(f: &mut Vec<u8>) {
     // legacy sections below stay byte-for-byte identical for an Overworld-only save.
     let mut dim_signs: Vec<(DimId, i32, i32, i32, u8, [String; 4])> = Vec::new();
     let mut dim_players: Vec<(String, DimId)> = Vec::new();
+    // Chests, furnaces, crops and pending loot outside the Overworld go to their own footer; the
+    // legacy sections below carry the Overworld's entries in the old wire layout. Crops are
+    // collected before any container lock: the growth tick holds `crops` while writing a block,
+    // which can take `chests`, so taking them in the opposite order here would invert the locks.
+    let mut dim2 = Dim2Entries::default();
+    dim2.crops = crops()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(pos, _)| pos.0 != DimId::Overworld)
+        .map(|(pos, age)| (*pos, *age))
+        .collect();
     (*f).extend_from_slice(b"MET4");
     {
         let ms = mobs().lock().unwrap();
@@ -11061,30 +11226,26 @@ fn save_world_into(f: &mut Vec<u8>) {
             }
         }
         let ch = chests().lock().unwrap();
-        let block_chests: Vec<_> = ch
+        // The legacy chest table holds the Overworld's block containers only — including the
+        // synthetic per-player Ender keys, which always live under the Overworld — in the exact
+        // old `(x, y, z)` wire layout. Anything in another dimension goes to DIM2.
+        let ow_chests: Vec<_> = ch
             .iter()
             .filter_map(|(key, slots)| match key {
-                ContainerKey::Block(pos) => Some((*pos, slots)),
+                ContainerKey::Block((DimId::Overworld, x, y, z)) => Some(((*x, *y, *z), slots)),
+                ContainerKey::Block(pos) => {
+                    dim2.chests.push((*pos, slots.clone()));
+                    None
+                }
                 ContainerKey::Cart(_) => None,
             })
             .collect();
-        write_varint(&mut *f, block_chests.len() as i64);
-        for ((x, y, z), slots) in block_chests {
+        write_varint(&mut *f, ow_chests.len() as i64);
+        for ((x, y, z), slots) in ow_chests {
             (*f).extend_from_slice(&x.to_be_bytes());
             (*f).extend_from_slice(&y.to_be_bytes());
             (*f).extend_from_slice(&z.to_be_bytes());
-            write_varint(&mut *f, slots.len() as i64);
-            for (&slot, (item, cnt, ic)) in slots.iter() {
-                (*f).extend_from_slice(&slot.to_be_bytes());
-                write_varint(&mut *f, *item);
-                (*f).push(*cnt);
-                write_varint(&mut *f, ic.len() as i64);
-                for (ty, d) in ic {
-                    write_varint(&mut *f, *ty);
-                    (*f).extend_from_slice(&(d.len() as u16).to_be_bytes());
-                    (*f).extend_from_slice(d);
-                }
-            }
+            write_stack_table(&mut *f, slots);
         }
         let sg = signs().lock().unwrap();
         // The legacy signs section carries the Overworld's signs only, in the exact old wire
@@ -11183,25 +11344,26 @@ fn save_world_into(f: &mut Vec<u8>) {
                 drop_ages.push(0);
             }
         }
-        // furnaces are block entities — contents and smelting state are
-        // durable in vanilla, not session-scoped
+        // Furnaces are block entities — contents and smelting state are durable in vanilla. The
+        // legacy furnace table holds the Overworld's entries in the old wire layout; another
+        // dimension's furnace goes to DIM2.
         let fs = furnaces().lock().unwrap();
-        write_varint(&mut *f, fs.len() as i64);
-        for (&(x, y, z), fr) in fs.iter() {
+        let ow_furnaces: Vec<_> = fs
+            .iter()
+            .filter_map(|(pos, fr)| match pos.0 {
+                DimId::Overworld => Some((pos, fr)),
+                _ => {
+                    dim2.furnaces.push((*pos, clone_furnace_for_footer(fr)));
+                    None
+                }
+            })
+            .collect();
+        write_varint(&mut *f, ow_furnaces.len() as i64);
+        for ((_, x, y, z), fr) in ow_furnaces {
             (*f).extend_from_slice(&x.to_be_bytes());
             (*f).extend_from_slice(&y.to_be_bytes());
             (*f).extend_from_slice(&z.to_be_bytes());
-            write_varint(&mut *f, fr.input.0);
-            (*f).push(fr.input.1);
-            write_comps(&mut *f, &fr.input.2);
-            write_varint(&mut *f, fr.fuel.0);
-            (*f).push(fr.fuel.1);
-            write_comps(&mut *f, &fr.fuel.2);
-            write_varint(&mut *f, fr.output.0);
-            (*f).push(fr.output.1);
-            write_comps(&mut *f, &fr.output.2);
-            (*f).extend_from_slice(&fr.burn_left.to_be_bytes());
-            (*f).extend_from_slice(&fr.progress.to_be_bytes());
+            write_furnace_state(&mut *f, fr);
         }
         // sheared-mob indices (eids are re-issued on load — persist by
         // mob order, not eid)
@@ -11485,12 +11647,14 @@ fn save_world_into(f: &mut Vec<u8>) {
     if !drop_owners.is_empty() {
         append_drop_owners_footer(f, &drop_owners);
     }
-    let mut block_loot: Vec<(BlockPos, PendingBlockLoot)> = pending_block_loot()
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(&pos, entry)| (pos, entry.clone()))
-        .collect();
+    let mut block_loot: Vec<(BlockPos, PendingBlockLoot)> = Vec::new();
+    for (&(dim, x, y, z), entry) in pending_block_loot().lock().unwrap().iter() {
+        if dim == DimId::Overworld {
+            block_loot.push(((x, y, z), entry.clone()));
+        } else {
+            dim2.loot.push(((dim, x, y, z), entry.clone()));
+        }
+    }
     block_loot.sort_by_key(|(pos, _)| *pos);
     if !block_loot.is_empty() {
         append_block_loot_footer(f, &block_loot);
@@ -11499,6 +11663,11 @@ fn save_world_into(f: &mut Vec<u8>) {
     // legacy byte (and every other footer's position) exactly where it was.
     if !dim_signs.is_empty() || !dim_players.is_empty() {
         append_dim_footer(f, &dim_signs, &dim_players);
+    }
+    // DIM2 is written after DIM1 and is therefore stripped before it on load. Emitted only when
+    // something outside the Overworld actually exists.
+    if !dim2.is_empty() {
+        append_dim2_footer(f, &dim2);
     }
 }
 
@@ -11641,6 +11810,219 @@ fn read_dim_footer(
         return Err("invalid dimension footer tail");
     }
     Ok((&payload[..start], signs, players))
+}
+
+/// Non-Overworld block containers, furnaces, crops (and their pending loot) ride in this footer.
+/// The legacy sections keep their exact wire layout and hold the Overworld's entries only, so an
+/// Overworld-only save emits nothing here and stays byte-for-byte identical to the old file.
+const DIM2_FOOTER_LEN: usize = 12;
+const DIM2_MAGIC: &[u8; 4] = b"DIM2";
+#[derive(Default)]
+struct Dim2Entries {
+    chests: Vec<(DimBlockPos, HashMap<i16, Stack>)>,
+    furnaces: Vec<(DimBlockPos, Furnace)>,
+    crops: Vec<(DimBlockPos, u8)>,
+    loot: Vec<(DimBlockPos, PendingBlockLoot)>,
+}
+impl Dim2Entries {
+    fn is_empty(&self) -> bool {
+        self.chests.is_empty()
+            && self.furnaces.is_empty()
+            && self.crops.is_empty()
+            && self.loot.is_empty()
+    }
+}
+fn append_dim2_footer(out: &mut Vec<u8>, entries: &Dim2Entries) {
+    use crate::generation_payload::ContainerKind;
+    let start = out.len();
+    out.extend_from_slice(&(entries.chests.len() as u32).to_be_bytes());
+    for ((dim, x, y, z), slots) in &entries.chests {
+        out.push(dim.index() as u8);
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out.extend_from_slice(&z.to_be_bytes());
+        write_stack_table(out, slots);
+    }
+    out.extend_from_slice(&(entries.furnaces.len() as u32).to_be_bytes());
+    for ((dim, x, y, z), fr) in &entries.furnaces {
+        out.push(dim.index() as u8);
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out.extend_from_slice(&z.to_be_bytes());
+        write_furnace_state(out, fr);
+    }
+    out.extend_from_slice(&(entries.crops.len() as u32).to_be_bytes());
+    for ((dim, x, y, z), age) in &entries.crops {
+        out.push(dim.index() as u8);
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out.extend_from_slice(&z.to_be_bytes());
+        out.push(*age);
+    }
+    out.extend_from_slice(&(entries.loot.len() as u32).to_be_bytes());
+    for ((dim, x, y, z), entry) in &entries.loot {
+        out.push(dim.index() as u8);
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out.extend_from_slice(&z.to_be_bytes());
+        match entry.kind {
+            ContainerKind::Chest => out.push(0),
+            ContainerKind::Furnace => out.push(1),
+            ContainerKind::BlockContainer(size) => {
+                out.push(2);
+                out.push(size);
+            }
+        }
+        let table = entry.loot_table.as_bytes();
+        let tlen = table.len().min(u16::MAX as usize);
+        out.extend_from_slice(&(tlen as u16).to_be_bytes());
+        out.extend_from_slice(&table[..tlen]);
+        if let Some(seed) = entry.loot_seed {
+            out.push(1);
+            out.extend_from_slice(&seed.to_be_bytes());
+        } else {
+            out.push(0);
+        }
+    }
+    let size = (out.len() - start) as u64;
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(DIM2_MAGIC);
+}
+/// `DimId::from_index` is the fail-closed gate: an unknown tag, or an Overworld tag in a footer
+/// that is only supposed to carry the other dimensions, is an error rather than a silent
+/// relocation into the Overworld.
+fn read_dim2_dim(body: &[u8], p: &mut usize) -> Result<DimId, &'static str> {
+    let b = *body.get(*p).ok_or("truncated DIM2 dimension tag")?;
+    *p += 1;
+    let dim = DimId::from_index(b as usize).ok_or("invalid DIM2 dimension tag")?;
+    if dim == DimId::Overworld {
+        return Err("Overworld entry in DIM2 footer");
+    }
+    Ok(dim)
+}
+fn read_dim2_pos(body: &[u8], p: &mut usize) -> Result<DimBlockPos, &'static str> {
+    let dim = read_dim2_dim(body, p)?;
+    let raw = body
+        .get(*p..*p + 12)
+        .ok_or("truncated DIM2 position")?;
+    *p += 12;
+    Ok((
+        dim,
+        i32::from_be_bytes(raw[0..4].try_into().unwrap()),
+        i32::from_be_bytes(raw[4..8].try_into().unwrap()),
+        i32::from_be_bytes(raw[8..12].try_into().unwrap()),
+    ))
+}
+fn read_dim2_count(body: &[u8], p: &mut usize, min_entry: usize) -> Result<usize, &'static str> {
+    let n = u32::from_be_bytes(
+        body.get(*p..*p + 4)
+            .ok_or("truncated DIM2 count")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    *p += 4;
+    if n > body.len().saturating_sub(*p) / min_entry {
+        return Err("invalid DIM2 count");
+    }
+    Ok(n)
+}
+fn read_dim2_footer(payload: &[u8]) -> Result<(&[u8], Dim2Entries), &'static str> {
+    if !payload.ends_with(DIM2_MAGIC) {
+        return Ok((payload, Dim2Entries::default()));
+    }
+    // Four u32 counts make the smallest possible body.
+    let end = payload
+        .len()
+        .checked_sub(DIM2_FOOTER_LEN)
+        .ok_or("truncated DIM2 footer")?;
+    let size = usize::try_from(u64::from_be_bytes(
+        payload[end..end + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| "invalid DIM2 footer size")?;
+    if size < 16 {
+        return Err("invalid DIM2 footer size");
+    }
+    let start = end.checked_sub(size).ok_or("invalid DIM2 footer size")?;
+    let body = &payload[start..end];
+    let mut p = 0usize;
+    let mut out = Dim2Entries::default();
+    let n = read_dim2_count(body, &mut p, 14)?;
+    for _ in 0..n {
+        let pos = read_dim2_pos(body, &mut p)?;
+        let slots = read_stack_table(body, &mut p, true);
+        out.chests.push((pos, slots));
+    }
+    let n = read_dim2_count(body, &mut p, 14)?;
+    for _ in 0..n {
+        let pos = read_dim2_pos(body, &mut p)?;
+        let fr = read_furnace_state(body, &mut p, true, false)
+            .ok_or("truncated DIM2 furnace")?;
+        out.furnaces.push((pos, fr));
+    }
+    let n = read_dim2_count(body, &mut p, 14)?;
+    for _ in 0..n {
+        let pos = read_dim2_pos(body, &mut p)?;
+        let age = *body.get(p).ok_or("truncated DIM2 crop age")?;
+        p += 1;
+        out.crops.push((pos, age));
+    }
+    {
+        use crate::generation_payload::ContainerKind;
+        let n = read_dim2_count(body, &mut p, 17)?;
+        for _ in 0..n {
+            let pos = read_dim2_pos(body, &mut p)?;
+            let tag = *body.get(p).ok_or("truncated DIM2 loot kind")?;
+            p += 1;
+            let kind = match tag {
+                0 => ContainerKind::Chest,
+                1 => ContainerKind::Furnace,
+                2 => {
+                    let sz = *body.get(p).ok_or("truncated DIM2 loot size")?;
+                    p += 1;
+                    ContainerKind::BlockContainer(sz)
+                }
+                _ => return Err("invalid DIM2 loot kind"),
+            };
+            let tlen = u16::from_be_bytes(
+                body.get(p..p + 2)
+                    .ok_or("truncated DIM2 loot table length")?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            p += 2;
+            let table = body.get(p..p + tlen).ok_or("truncated DIM2 loot table")?;
+            p += tlen;
+            let loot_table = String::from_utf8_lossy(table).to_string();
+            let has_seed = *body.get(p).ok_or("truncated DIM2 loot seed flag")?;
+            p += 1;
+            let loot_seed = match has_seed {
+                0 => None,
+                1 => {
+                    let s = i64::from_be_bytes(
+                        body.get(p..p + 8)
+                            .ok_or("truncated DIM2 loot seed")?
+                            .try_into()
+                            .unwrap(),
+                    );
+                    p += 8;
+                    Some(s)
+                }
+                _ => return Err("invalid DIM2 loot seed flag"),
+            };
+            out.loot.push((
+                pos,
+                PendingBlockLoot {
+                    kind,
+                    loot_table,
+                    loot_seed,
+                },
+            ));
+        }
+    }
+    if p != body.len() {
+        return Err("invalid DIM2 footer tail");
+    }
+    Ok((&payload[..start], out))
 }
 const BLOCK_LOOT_FOOTER_LEN: usize = 12;
 const BLOCK_LOOT_MAGIC: &[u8; 4] = b"BLT1";
@@ -11890,8 +12272,9 @@ fn load_dim_overlay_file(dir: &std::path::Path, dim: DimId) -> Result<(), &'stat
 }
 
 fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
-    // The dimension footer is written last, so it is stripped first; otherwise its bytes would
-    // hide the block-loot footer beneath it and leave trailing data in the main parser.
+    // Footers are stripped last-written-first: DIM2, then DIM1, then block loot, then drop owners.
+    // A payload with no DIM2 footer is the legacy (or DIM1-only) form and parses exactly as before.
+    let (payload, dim2) = read_dim2_footer(payload)?;
     let (payload, dim_signs, dim_players) = read_dim_footer(payload)?;
     let (payload, block_loot) = read_block_loot_footer(payload)?;
     let (payload, drop_owners) = read_drop_owners_footer(payload)?;
@@ -12017,28 +12400,9 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                 p += 4;
                 let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
                 p += 4;
-                let en = rv(payload, &mut p);
-                let mut slots = HashMap::new();
-                for _ in 0..en {
-                    if p + 3 > payload.len() {
-                        break;
-                    }
-                    let slot = i16::from_be_bytes(b[p..p + 2].try_into().unwrap());
-                    p += 2;
-                    let item = rv(payload, &mut p);
-                    if p >= payload.len() {
-                        break;
-                    }
-                    let cnt = b[p];
-                    p += 1;
-                    let comps = if has_comps {
-                        read_comps(payload, &mut p)
-                    } else {
-                        Vec::new()
-                    };
-                    slots.insert(slot, (item, cnt, comps));
-                }
-                ch.insert(ContainerKey::Block((x, y, z)), slots);
+                let slots = read_stack_table(payload, &mut p, has_comps);
+                // The legacy chest section has no dimension byte: every entry in it is Overworld.
+                ch.insert(ContainerKey::Block((DimId::Overworld, x, y, z)), slots);
             }
         }
         if p < payload.len() {
@@ -12178,50 +12542,12 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                 p += 4;
                 let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
                 p += 4;
-                let rd = |b: &[u8], p: &mut usize| -> Stack {
-                    let it = rv(b, p);
-                    let c = if *p < payload.len() { b[*p] } else { 0 };
-                    *p += 1;
-                    (
-                        it,
-                        c,
-                        if has_comps {
-                            read_comps(b, p)
-                        } else {
-                            Vec::new()
-                        },
-                    )
-                };
-                let input = rd(payload, &mut p);
-                let fuel = rd(payload, &mut p);
-                let output = rd(payload, &mut p);
-                if p + 8 > payload.len() {
+                let Some(fr) = read_furnace_state(payload, &mut p, has_comps, legacy_ms_ages)
+                else {
                     break;
-                }
-                let burn_left = legacy_tick_count(
-                    i32::from_be_bytes(b[p..p + 4].try_into().unwrap()) as u64,
-                    legacy_ms_ages,
-                ) as i32;
-                p += 4;
-                let progress = legacy_tick_count(
-                    i32::from_be_bytes(b[p..p + 4].try_into().unwrap()) as u64,
-                    legacy_ms_ages,
-                ) as i32;
-                p += 4;
-                fs.insert(
-                    (x, y, z),
-                    Furnace {
-                        input,
-                        fuel,
-                        output,
-                        burn_left,
-                        progress,
-                        dirty: false,
-                        xp: 0.0,
-                        recipe_cache: CachedLookup::default(),
-                        fuel_cache: CachedLookup::default(),
-                    },
-                );
+                };
+                // The legacy furnace section has no dimension byte: every entry is Overworld.
+                fs.insert((DimId::Overworld, x, y, z), fr);
             }
             eprintln!("[spine] loaded {} furnaces", fs.len());
         }
@@ -12897,7 +13223,39 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             g.mineshaft_spawners = generated.spider_flags;
         });
     }
-    *pending_block_loot().lock().unwrap() = block_loot;
+    // The legacy block-loot footer is Overworld-only; its positions load back with that dimension.
+    *pending_block_loot().lock().unwrap() = block_loot
+        .into_iter()
+        .map(|(pos, entry)| (ow_block(pos), entry))
+        .collect();
+    // DIM2 entries restore into their own dimensions. They are applied after the legacy sections
+    // so a mixed save cannot let an old Overworld entry overwrite a new one at the same coordinate.
+    if !dim2.is_empty() {
+        {
+            let mut ch = chests().lock().unwrap();
+            for (pos, slots) in dim2.chests {
+                ch.insert(ContainerKey::Block(pos), slots);
+            }
+        }
+        {
+            let mut fs = furnaces().lock().unwrap();
+            for (pos, fr) in dim2.furnaces {
+                fs.insert(pos, fr);
+            }
+        }
+        {
+            let mut cg = crops().lock().unwrap();
+            for (pos, age) in dim2.crops {
+                cg.insert(pos, age);
+            }
+        }
+        {
+            let mut all = pending_block_loot().lock().unwrap();
+            for (pos, entry) in dim2.loot {
+                all.insert(pos, entry);
+            }
+        }
+    }
     rebuild_derived_indexes();
     Ok(())
 }
@@ -20334,7 +20692,7 @@ fn furnace_push_items(s: &mut TcpStream, pos: (i32, i32, i32), inv: &HashMap<i16
     write_varint(&mut q, 39);
     let (fi, fu, fo) = {
         let fs = furnaces().lock().unwrap();
-        let f = fs.get(&pos);
+        let f = fs.get(&ow_block(pos));
         (
             f.map(|f| f.input.clone()).unwrap_or((0, 0, Vec::new())),
             f.map(|f| f.fuel.clone()).unwrap_or((0, 0, Vec::new())),
@@ -21481,7 +21839,7 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
                             chests()
                                 .lock()
                                 .unwrap()
-                                .get(&ContainerKey::Block((bx, by, bz)))
+                                .get(&ContainerKey::ow((bx, by, bz)))
                                 .cloned()
                                 .unwrap_or_default()
                         };
@@ -23021,13 +23379,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                         let key = (bx, by, bz);
                         if is_furnace_at(bx, by, bz) && slot <= 2 {
                             let mut fs = furnaces().lock().unwrap();
-                            let f = fs.entry(key).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
+                            let f = fs.entry(ow_block(key)).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
                             let cell = match slot { 0 => &mut f.input, 1 => &mut f.fuel, _ => &mut f.output };
                             *cell = (item, cnt, comps); f.dirty = true;
                         } else {
-                            unpack_block_loot_if_needed(key);
+                            unpack_block_loot_if_needed(ow_block(key));
                             let mut ch = chests().lock().unwrap();
-                            let m = ch.entry(ContainerKey::Block(key)).or_default();
+                            let m = ch.entry(ContainerKey::ow(key)).or_default();
                             if item == 0 { m.remove(&slot); } else { m.insert(slot, (item, cnt, comps)); }
                         }
                         format!("Replaced slot {} in block", slot)
@@ -23062,9 +23420,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                         let fns = item_mods().lock().unwrap().get(mod_id).cloned();
                         let Some(fns) = fns else { return format!("Unknown item modifier: {}", mod_id) };
                         let cslot: i16 = args[5].trim_start_matches("container.").parse().unwrap_or(-1);
-                        unpack_block_loot_if_needed((bx, by, bz));
+                        unpack_block_loot_if_needed(ow_block((bx, by, bz)));
                         let mut ch = chests().lock().unwrap();
-                        let ok = ch.get_mut(&ContainerKey::Block((bx, by, bz))).and_then(|m| m.get_mut(&cslot))
+                        let ok = ch.get_mut(&ContainerKey::ow((bx, by, bz))).and_then(|m| m.get_mut(&cslot))
                             .map(|st| { apply_loot_funcs(st, &fns); }).is_some();
                         (if ok { "Modified item".to_string() } else { "No item in slot".to_string() }).to_string()
                     } else { "usage: /item modify entity|block ... <modifier>".into() }
@@ -23720,8 +24078,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 match args[0] {
                     "remove" => {
                         if path == "Items" {
-                            chests().lock().unwrap().remove(&ContainerKey::Block((bx, by, bz)));
-                            if let Some(f) = furnaces().lock().unwrap().get_mut(&(bx, by, bz)) {
+                            chests().lock().unwrap().remove(&ContainerKey::ow((bx, by, bz)));
+                            if let Some(f) = furnaces().lock().unwrap().get_mut(&ow_block((bx, by, bz))) {
                                 f.input = (0, 0, Vec::new()); f.fuel = (0, 0, Vec::new()); f.output = (0, 0, Vec::new());
                             }
                         }
@@ -23730,7 +24088,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     "get" => {
                         if path == "Items" || path.is_empty() {
                             let mut slots = if is_furnace_at(bx, by, bz) { furnace_slots((bx, by, bz)) }
-                                else { chests().lock().unwrap().get(&ContainerKey::Block((bx, by, bz))).cloned().unwrap_or_default() };
+                                else { chests().lock().unwrap().get(&ContainerKey::ow((bx, by, bz))).cloned().unwrap_or_default() };
                             let mut v: Vec<(i16, Stack)> = slots.drain().collect();
                             v.sort_by_key(|(k, _)| *k);
                             let items: Vec<String> = v.iter()
@@ -24919,7 +25277,7 @@ fn handle(mut s: TcpStream) {
                                 };
                                 (it, n)
                             };
-                            crops().lock().unwrap().remove(&(x, y, z));
+                            crops().lock().unwrap().remove(&ow_block((x, y, z)));
                             if old == 4285 {
                                 // ripe: extra wheat drop
                                 let d = Drop {
@@ -25068,7 +25426,7 @@ fn handle(mut s: TcpStream) {
                         }
                     }
                     let before = chest_opener_snapshot(&audience, &halves);
-                    let key = ContainerKey::Block(ender_key(&me.uuid));
+                    let key = ender_container_key(&me.uuid);
                     let inv = me.inv.lock().unwrap().clone();
                     open_chest_for_client(&me, (key, None), Some((x, y, z)), &inv, "Ender Chest");
                     sync_chest_openers(&audience, &before);
@@ -25253,7 +25611,7 @@ fn handle(mut s: TcpStream) {
                         let bump = 2 + ((x.wrapping_mul(7) ^ z.wrapping_mul(13) ^ y) & 1) as u8;
                         let nage = (age + bump).min(7);
                         set_block(x, y, z, 4278 + nage as u32);
-                        crops().lock().unwrap().insert((x, y, z), nage);
+                        crops().lock().unwrap().insert(ow_block((x, y, z)), nage);
                         note_block_update(x, y, z, 4278 + nage as u32);
                         if *me.gm.lock().unwrap() != 1 {
                             let mut inv = me.inv.lock().unwrap();
@@ -25295,7 +25653,7 @@ fn handle(mut s: TcpStream) {
                         && block_at(x, y, z) == name_to_state("farmland").unwrap_or(u32::MAX)
                     {
                         set_block(tx, ty, tz, 4278);
-                        crops().lock().unwrap().insert((tx, ty, tz), 0);
+                        crops().lock().unwrap().insert(ow_block((tx, ty, tz)), 0);
                         note_block_update(tx, ty, tz, 4278);
                         if *me.gm.lock().unwrap() != 1 {
                             let mut inv = me.inv.lock().unwrap();
@@ -26479,7 +26837,7 @@ fn handle(mut s: TcpStream) {
                             let furnace_pos = *me.open_furnace.lock().unwrap();
                             if let Some(fp) = furnace_pos {
                                 let mut fs = furnaces().lock().unwrap();
-                                let f = fs.entry(fp).or_insert(Furnace {
+                                let f = fs.entry(ow_block(fp)).or_insert(Furnace {
                                     input: (0, 0, Vec::new()),
                                     fuel: (0, 0, Vec::new()),
                                     output: (0, 0, Vec::new()),
@@ -27096,7 +27454,7 @@ fn handle(mut s: TcpStream) {
                                             }
                                             resync_slot(&me, 2, slot, &hst);
                                         } else {
-                                            let f = fs.entry(fp).or_insert(Furnace {
+                                            let f = fs.entry(ow_block(fp)).or_insert(Furnace {
                                                 input: (0, 0, Vec::new()),
                                                 fuel: (0, 0, Vec::new()),
                                                 output: (0, 0, Vec::new()),
@@ -27119,7 +27477,7 @@ fn handle(mut s: TcpStream) {
                                                     furnace_xp_pop(f, px, py, pz);
                                                     let rem = move_to_slots(&mut inv, 9..=44, st);
                                                     if rem.1 > 0 {
-                                                        fs.get_mut(&fp).unwrap().output = rem;
+                                                        fs.get_mut(&ow_block(fp)).unwrap().output = rem;
                                                     }
                                                 }
                                             } else {
@@ -27367,7 +27725,7 @@ fn handle(mut s: TcpStream) {
                                                 throw!(st);
                                             }
                                         } else {
-                                            let f = fs.entry(fp).or_insert(Furnace {
+                                            let f = fs.entry(ow_block(fp)).or_insert(Furnace {
                                                 input: (0, 0, Vec::new()),
                                                 fuel: (0, 0, Vec::new()),
                                                 output: (0, 0, Vec::new()),
@@ -27405,7 +27763,7 @@ fn handle(mut s: TcpStream) {
                                         }
                                     } else if slot == 2 {
                                         // shift-take output into inventory
-                                        let f = fs.entry(fp).or_insert(Furnace {
+                                        let f = fs.entry(ow_block(fp)).or_insert(Furnace {
                                             input: (0, 0, Vec::new()),
                                             fuel: (0, 0, Vec::new()),
                                             output: (0, 0, Vec::new()),
@@ -27426,12 +27784,12 @@ fn handle(mut s: TcpStream) {
                                             furnace_xp_pop(f, px, py, pz);
                                             let rem = move_to_slots(&mut inv, 9..=44, st);
                                             if rem.1 > 0 {
-                                                fs.get_mut(&fp).unwrap().output = rem;
+                                                fs.get_mut(&ow_block(fp)).unwrap().output = rem;
                                             }
                                         }
                                     } else if slot <= 1 {
                                         // shift input/fuel -> inv
-                                        let f = fs.entry(fp).or_insert(Furnace {
+                                        let f = fs.entry(ow_block(fp)).or_insert(Furnace {
                                             input: (0, 0, Vec::new()),
                                             fuel: (0, 0, Vec::new()),
                                             output: (0, 0, Vec::new()),
@@ -27448,7 +27806,7 @@ fn handle(mut s: TcpStream) {
                                             f.dirty = true;
                                             let rem = move_to_slots(&mut inv, 9..=44, st);
                                             if rem.1 > 0 {
-                                                let f2 = fs.get_mut(&fp).unwrap();
+                                                let f2 = fs.get_mut(&ow_block(fp)).unwrap();
                                                 if slot == 0 {
                                                     f2.input = rem
                                                 } else {
@@ -27459,7 +27817,7 @@ fn handle(mut s: TcpStream) {
                                     } else {
                                         // shift inv -> furnace input/fuel by type, else stays
                                         if let Some(st) = inv.get(&(slot + 6)).cloned() {
-                                            let f = fs.entry(fp).or_insert(Furnace {
+                                            let f = fs.entry(ow_block(fp)).or_insert(Furnace {
                                                 input: (0, 0, Vec::new()),
                                                 fuel: (0, 0, Vec::new()),
                                                 output: (0, 0, Vec::new()),
@@ -27517,7 +27875,7 @@ fn handle(mut s: TcpStream) {
                                     let cur_st = if slot >= 3 {
                                         inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new()))
                                     } else {
-                                        let f2 = fs.get(&fp).unwrap();
+                                        let f2 = fs.get(&ow_block(fp)).unwrap();
                                         match slot {
                                             0 => f2.input.clone(),
                                             1 => f2.fuel.clone(),
@@ -30025,7 +30383,7 @@ mod mineshaft_runtime_tests {
     struct RuntimeSnapshot {
         world: HashMap<DimChunkKey, HashMap<u32, u32>>,
         chests: HashMap<ContainerKey, HashMap<i16, Stack>>,
-        pending_block_loot: HashMap<BlockPos, PendingBlockLoot>,
+        pending_block_loot: HashMap<DimBlockPos, PendingBlockLoot>,
         drops: Vec<Drop>,
         mobs: Vec<Arc<Mob>>,
         clients: Vec<Arc<Client>>,
@@ -30516,8 +30874,8 @@ mod mineshaft_runtime_tests {
         assert_eq!(
             chest_window(open_left.0, open_left.1, open_left.2),
             (
-                ContainerKey::Block(open_right),
-                Some(ContainerKey::Block(open_left))
+                ContainerKey::ow(open_right),
+                Some(ContainerKey::ow(open_left))
             )
         );
 
@@ -30750,15 +31108,15 @@ mod mineshaft_runtime_tests {
             !spec_pkts.iter().any(|(pid, _)| matches!(*pid, 0x33 | 0x13)),
             "spectator must not open unopened loot chest"
         );
-        assert!(pending_block_loot().lock().unwrap().contains_key(&loot_chest));
-        assert!(!chests().lock().unwrap().contains_key(&ContainerKey::Block(loot_chest)));
+        assert!(pending_block_loot().lock().unwrap().contains_key(&ow_block(loot_chest)));
+        assert!(!chests().lock().unwrap().contains_key(&ContainerKey::ow(loot_chest)));
 
         *alice.gm.lock().unwrap() = 0;
         let surv_pkts = use_until_ack(&mut sock_a, loot_chest, 2);
         assert!(surv_pkts.iter().any(|(pid, _)| *pid == 0x33));
-        assert!(!pending_block_loot().lock().unwrap().contains_key(&loot_chest));
+        assert!(!pending_block_loot().lock().unwrap().contains_key(&ow_block(loot_chest)));
         assert_eq!(
-            chests().lock().unwrap().get(&ContainerKey::Block(loot_chest)).cloned(),
+            chests().lock().unwrap().get(&ContainerKey::ow(loot_chest)).cloned(),
             Some(roll_cart_loot(77777))
         );
         send_packet(&mut sock_a, 0x0f, vec![1u8]).unwrap();
@@ -30801,7 +31159,7 @@ mod mineshaft_runtime_tests {
         chests()
             .lock()
             .unwrap()
-            .entry(ContainerKey::Block(ender_key(&alice.uuid)))
+            .entry(ender_container_key(&alice.uuid))
             .or_default()
             .insert(0, (emerald, 2, Vec::new()));
         *alice.pos.lock().unwrap() = (2.5, 70.0, 7.5, 0.0, 0.0, true);
@@ -30819,7 +31177,7 @@ mod mineshaft_runtime_tests {
             chests()
                 .lock()
                 .unwrap()
-                .get(&ContainerKey::Block(ender_key(&alice.uuid)))
+                .get(&ender_container_key(&alice.uuid))
                 .and_then(|m| m.get(&0))
                 .map(|s| (s.0, s.1)),
             Some((emerald, 2))
