@@ -3388,6 +3388,23 @@ impl Gen {
         out
     }
 
+    /// [`Gen::block_density`] at the eight consecutive columns `x..x+8` (layer A2-c). The
+    /// values are eight `block_density` values bit for bit; the vector arm exists because the
+    /// terrain stage asks for a whole 16-wide row of a section. A generator that kept the
+    /// interpreter (`MC_SPINE_DF_INTERP=1`) answers the eight positions through it, so the A/B
+    /// switch keeps meaning what it meant.
+    pub(crate) fn block_density_x8(&self, cc: &ChunkCols, x: i32, y: i32, z: i32) -> [f64; DF8] {
+        if let Some(prog) = self.dfprog.as_ref() {
+            return prog.eval_x8(self, Some(cc), x, y, z);
+        }
+        let mut out = [0.0f64; DF8];
+        for (k, o) in out.iter_mut().enumerate() {
+            let mut memo = HashMap::new();
+            *o = self.eval_c(self.final_density, x + k as i32, y, z, &mut memo, Some(cc));
+        }
+        out
+    }
+
     /// Density-function ids a node reads, for the grid reachability walk.
     fn push_kids(&self, id: usize, out: &mut Vec<usize>) {
         df_kids(&self.dfs[id], out);
@@ -4339,6 +4356,39 @@ fn df4_avx2() -> bool {
     *ON.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
 }
 
+// ---------- Layer A2-c: the eight-lane density evaluator ----------
+//
+// Same contract as the four-lane arm above, on one AVX-512 `__m512d`: bit identity with
+// `DfProg::run`, no FMA, the same compare/blend sequences for min/max/clamp and the same
+// lane-uniform branch rule. A conditional that splits the eight lanes returns `None` and the
+// caller finishes the group through two `eval_x4` calls (so a four-lane subset that agrees
+// still gets AVX2). `MC_SPINE_DF8=0` keeps the same binary on the 4-lane path for A/B.
+
+/// Lanes in the eight-lane evaluator: one `__m512d`.
+pub(crate) const DF8: usize = 8;
+
+/// The A/B switch for the eight-lane arm: `MC_SPINE_DF8=0` leaves the 4-lane path (and
+/// `MC_SPINE_DF4=0` / `DF4_TEST_SCALAR` still disable every vector arm).
+fn df8_disabled() -> bool {
+    #[cfg(test)]
+    if DF4_TEST_SCALAR.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    df4_disabled() || matches!(env_str!("MC_SPINE_DF8").as_deref(), Some("0"))
+}
+
+/// Does this CPU have AVX-512F + AVX-512DQ? Asked once; `dq` is required for the
+/// floating-point-domain logical ops (`or_pd`/`and_pd`/`xor_pd`) the min/max/neg/abs
+/// sequences use. A host without either feature keeps the 4-lane arm.
+#[cfg(target_arch = "x86_64")]
+fn df8_avx512() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+    })
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn v4_to_arr(v: std::arch::x86_64::__m256d) -> [f64; DF4] {
@@ -4350,6 +4400,20 @@ fn v4_to_arr(v: std::arch::x86_64::__m256d) -> [f64; DF4] {
 #[inline]
 fn v4_from_arr(a: [f64; DF4]) -> std::arch::x86_64::__m256d {
     // SAFETY: as above; `__m256d` has no padding.
+    unsafe { std::mem::transmute(a) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn v8_to_arr(v: std::arch::x86_64::__m512d) -> [f64; DF8] {
+    // SAFETY: `__m512d` is eight `f64` lanes and nothing else.
+    unsafe { std::mem::transmute(v) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn v8_from_arr(a: [f64; DF8]) -> std::arch::x86_64::__m512d {
+    // SAFETY: as above; `__m512d` has no padding.
     unsafe { std::mem::transmute(a) }
 }
 
@@ -4380,6 +4444,31 @@ impl DfProg {
             *o = self.eval(g, cc, x + k as i32, y, z);
         }
         out
+    }
+
+    /// Density at the eight consecutive columns `x..x+8`, all at one `(y, z)` (layer A2-c).
+    /// The AVX-512 arm is tried first; a lane-divergent conditional (or a host without
+    /// AVX-512) falls back to two `eval_x4` calls, so each agreeing four-lane half still
+    /// takes the AVX2 arm. The values are always eight `eval` results bit for bit.
+    fn eval_x8(&self, g: &Gen, cc: Option<&ChunkCols>, x: i32, y: i32, z: i32) -> [f64; DF8] {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.slots <= DF4_SLOTS && !df8_disabled() && df8_avx512() {
+                // SAFETY: `df8_avx512` proved both features are present at runtime.
+                if let Some(v) = unsafe { run8_avx512(self, g, cc, x, y, z) } {
+                    if m3_on() {
+                        m3_inc(M3_DF4_VEC);
+                    }
+                    return v;
+                }
+                if m3_on() {
+                    m3_inc(M3_DF4_BAIL);
+                }
+            }
+        }
+        let a = self.eval_x4(g, cc, x, y, z);
+        let b = self.eval_x4(g, cc, x + DF4 as i32, y, z);
+        std::array::from_fn(|k| if k < DF4 { a[k] } else { b[k - DF4] })
     }
 }
 
@@ -4450,6 +4539,28 @@ unsafe fn trilinear_x4(
         m0,
         _mm256_mul_pd(c, _mm256_sub_pd(m1, m0)),
     )))
+}
+
+/// [`trilinear`] for eight consecutive columns at one `(y, z)`, as two `trilinear_x4`
+/// halves (layer A2-c). `None` when the group cannot be split into two cell-aligned
+/// four-lane runs (`cell_w != 4`, or an `x` that is not 8-aligned), so the caller answers
+/// the eight positions one at a time - the same fallback `trilinear_x4` has.
+fn trilinear_x8(cells: &[f64], cc: &ChunkCols, x: i32, y: i32, z: i32) -> Option<[f64; DF8]> {
+    let lx0 = x & 15;
+    if lx0 % DF8 as i32 != 0 || cc.cell_w != DF4 as i32 || 16 % cc.cell_w != 0 {
+        return None;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if df4_avx2() {
+            // SAFETY: `df4_avx2` proved AVX2. `lx0` is 8-aligned and `cell_w` is 4, so
+            // both halves start at a cell-aligned run that `trilinear_x4` accepts.
+            let a = unsafe { trilinear_x4(cells, cc, x, y, z)? };
+            let b = unsafe { trilinear_x4(cells, cc, x + DF4 as i32, y, z)? };
+            return Some(std::array::from_fn(|k| if k < DF4 { a[k] } else { b[k - DF4] }));
+        }
+    }
+    Some(std::array::from_fn(|k| trilinear(cells, cc, x + k as i32, y, z)))
 }
 
 /// The four-lane interpreter: `DfProg::run` with `__m256d` slots. `None` means a conditional
@@ -4819,6 +4930,378 @@ unsafe fn run4_avx2(
                 Op::Halt => {
                     debug_assert_eq!(sp, 1, "compiled program left {sp} values, not 1");
                     return Some(v4_to_arr(rd!(0)));
+                }
+            }
+        }
+    }
+}
+
+/// The eight-lane interpreter: `DfProg::run` with `__m512d` slots (layer A2-c). `None`
+/// means a conditional jump found the lanes disagreeing, and the caller finishes the group
+/// through two `eval_x4` calls. Every arithmetic op is the plain IEEE-754 operation (NO FMA),
+/// and the compare/blend sequences mirror `run4_avx2` exactly, so the eight results are the
+/// eight `DfProg::run` results bit for bit - including the two zeros and NaN.
+///
+/// # Safety
+/// The caller must have checked `is_x86_feature_detected!("avx512f")` and
+/// `is_x86_feature_detected!("avx512dq")`, and `prog.slots` must be at most `DF4_SLOTS`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq")]
+unsafe fn run8_avx512(
+    prog: &DfProg,
+    g: &Gen,
+    cc: Option<&ChunkCols>,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Option<[f64; DF8]> {
+    use std::arch::x86_64::*;
+    unsafe {
+        // Written before it is read: the program's compile-time depth and its runtime depth
+        // agree (`DfProg::run` relies on the same invariant), so slot `sp` always holds a
+        // value pushed earlier in the same evaluation.
+        let mut st: [std::mem::MaybeUninit<__m512d>; DF4_SLOTS] =
+            [std::mem::MaybeUninit::uninit(); DF4_SLOTS];
+        macro_rules! rd {
+            ($i:expr) => {
+                st[$i].assume_init()
+            };
+        }
+        macro_rules! wr {
+            ($i:expr, $v:expr) => {
+                st[$i] = std::mem::MaybeUninit::new($v)
+            };
+        }
+        let lane_x: [f64; DF8] = std::array::from_fn(|k| (x + k as i32) as f64);
+        let yv = _mm512_set1_pd(y as f64);
+        let zero = _mm512_setzero_pd();
+        let negzero = _mm512_set1_pd(-0.0);
+        let abs_mask = _mm512_castsi512_pd(_mm512_set1_epi64(0x7fff_ffff_ffff_ffffu64 as i64));
+        let mut sp = 0usize;
+        let mut pc = 0usize;
+        /// Two lane operands through one floating-point instruction.
+        macro_rules! binop {
+            ($f:ident) => {{
+                let b = rd!(sp - 1);
+                let a = rd!(sp - 2);
+                sp -= 1;
+                wr!(sp - 1, $f(a, b));
+                pc += 1;
+            }};
+        }
+        /// `f64::clamp`'s own two comparisons, so `NaN` and the sign of zero answer what the
+        /// scalar method answers (`_mm512_mask_blend_pd(k, a, b)` picks `b` where `k` is set).
+        macro_rules! clampv {
+            ($v:expr, $lo:expr, $hi:expr) => {{
+                let v = $v;
+                let lo = _mm512_set1_pd($lo);
+                let hi = _mm512_set1_pd($hi);
+                let r = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(v, lo, _CMP_LT_OQ), v, lo);
+                _mm512_mask_blend_pd(_mm512_cmp_pd_mask(r, hi, _CMP_GT_OQ), r, hi)
+            }};
+        }
+        /// [`df_min`] on eight lanes: the same four cases (`a < b`, `b < a`, equal, one NaN)
+        /// and the same operand order as `run4_avx2`'s `minv!`.
+        macro_rules! minv {
+            ($a:expr, $b:expr) => {{
+                let a = $a;
+                let b = $b;
+                let r = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(a, b, _CMP_LT_OQ), b, a);
+                let r = _mm512_mask_blend_pd(
+                    _mm512_cmp_pd_mask(a, b, _CMP_EQ_OQ),
+                    r,
+                    _mm512_or_pd(a, b),
+                );
+                let r = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(b, b, _CMP_UNORD_Q), r, a);
+                _mm512_mask_blend_pd(_mm512_cmp_pd_mask(a, a, _CMP_UNORD_Q), r, b)
+            }};
+        }
+        /// [`df_max`] on eight lanes, the same four cases (`+0.0` for the two zeros).
+        macro_rules! maxv {
+            ($a:expr, $b:expr) => {{
+                let a = $a;
+                let b = $b;
+                let r = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(a, b, _CMP_GT_OQ), b, a);
+                let r = _mm512_mask_blend_pd(
+                    _mm512_cmp_pd_mask(a, b, _CMP_EQ_OQ),
+                    r,
+                    _mm512_and_pd(a, b),
+                );
+                let r = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(b, b, _CMP_UNORD_Q), r, a);
+                _mm512_mask_blend_pd(_mm512_cmp_pd_mask(a, a, _CMP_UNORD_Q), r, b)
+            }};
+        }
+        /// Eight `f64`s out of the top three stack slots, for the ops that must be scalar.
+        macro_rules! lanes3 {
+            () => {{
+                let c = v8_to_arr(rd!(sp - 1));
+                let b = v8_to_arr(rd!(sp - 2));
+                let a = v8_to_arr(rd!(sp - 3));
+                (a, b, c)
+            }};
+        }
+        loop {
+            match prog.ops[pc] {
+                Op::Push(v) => {
+                    wr!(sp, _mm512_set1_pd(v));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Add => binop!(_mm512_add_pd),
+                Op::Sub => binop!(_mm512_sub_pd),
+                Op::Mul => binop!(_mm512_mul_pd),
+                Op::Div => binop!(_mm512_div_pd),
+                Op::Min => {
+                    let b = rd!(sp - 1);
+                    let a = rd!(sp - 2);
+                    sp -= 1;
+                    wr!(sp - 1, minv!(a, b));
+                    pc += 1;
+                }
+                Op::Max => {
+                    let b = rd!(sp - 1);
+                    let a = rd!(sp - 2);
+                    sp -= 1;
+                    wr!(sp - 1, maxv!(a, b));
+                    pc += 1;
+                }
+                Op::Neg => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm512_xor_pd(a, negzero));
+                    pc += 1;
+                }
+                Op::Abs => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm512_and_pd(a, abs_mask));
+                    pc += 1;
+                }
+                Op::Sq => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm512_mul_pd(a, a));
+                    pc += 1;
+                }
+                Op::Cube => {
+                    let a = rd!(sp - 1);
+                    let sq = _mm512_mul_pd(a, a);
+                    wr!(sp - 1, _mm512_mul_pd(sq, a));
+                    pc += 1;
+                }
+                Op::HNeg => {
+                    let a = rd!(sp - 1);
+                    let half = _mm512_mul_pd(a, _mm512_set1_pd(0.5));
+                    let pos = _mm512_cmp_pd_mask(a, zero, _CMP_GT_OQ);
+                    wr!(sp - 1, _mm512_mask_blend_pd(pos, half, a));
+                    pc += 1;
+                }
+                Op::QNeg => {
+                    let a = rd!(sp - 1);
+                    let quarter = _mm512_mul_pd(a, _mm512_set1_pd(0.25));
+                    let pos = _mm512_cmp_pd_mask(a, zero, _CMP_GT_OQ);
+                    wr!(sp - 1, _mm512_mask_blend_pd(pos, quarter, a));
+                    pc += 1;
+                }
+                Op::Squeeze => {
+                    let a = rd!(sp - 1);
+                    let v = clampv!(a, -1.0, 1.0);
+                    let cube = _mm512_mul_pd(_mm512_mul_pd(v, v), v);
+                    let half = _mm512_div_pd(v, _mm512_set1_pd(2.0));
+                    let over = _mm512_div_pd(cube, _mm512_set1_pd(24.0));
+                    wr!(sp - 1, _mm512_sub_pd(half, over));
+                    pc += 1;
+                }
+                Op::Clamp { lo, hi } => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, clampv!(a, lo, hi));
+                    pc += 1;
+                }
+                Op::Lerp => {
+                    let s = rd!(sp - 1);
+                    let f = rd!(sp - 2);
+                    let a = rd!(sp - 3);
+                    sp -= 2;
+                    wr!(sp - 1, _mm512_add_pd(f, _mm512_mul_pd(a, _mm512_sub_pd(s, f))));
+                    pc += 1;
+                }
+                Op::AddC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm512_add_pd(a, _mm512_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MulC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm512_mul_pd(a, _mm512_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MinC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, minv!(a, _mm512_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MaxC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, maxv!(a, _mm512_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::Grad { fc, fv, tc, tv } => {
+                    let denom = _mm512_set1_pd(tc - fc);
+                    let t = _mm512_div_pd(
+                        _mm512_sub_pd(yv, _mm512_set1_pd(fc)),
+                        denom,
+                    );
+                    let t = clampv!(t, 0.0, 1.0);
+                    wr!(
+                        sp,
+                        _mm512_add_pd(
+                            _mm512_set1_pd(fv),
+                            _mm512_mul_pd(t, _mm512_set1_pd(tv - fv))
+                        )
+                    );
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Noise { ni, xzs, ys } => {
+                    let (xs, ysv, zs) = lanes3!();
+                    sp -= 2;
+                    let noise = &g.noises[ni as usize];
+                    // The z coordinate is `z as f64 * xzs + zs[k]`, NOT another copy of
+                    // `lane_x[k] * xzs`: the lanes differ in x only.
+                    let nx: [f64; DF8] = std::array::from_fn(|k| lane_x[k] * xzs + xs[k]);
+                    let ny: [f64; DF8] = std::array::from_fn(|k| y as f64 * ys + ysv[k]);
+                    let nz: [f64; DF8] = std::array::from_fn(|k| z as f64 * xzs + zs[k]);
+                    let r = noise.get_8(nx, ny, nz);
+                    wr!(sp - 1, v8_from_arr(r));
+                    pc += 1;
+                }
+                Op::ShiftA(ni) => {
+                    let noise = &g.noises[ni as usize];
+                    let nx: [f64; DF8] = std::array::from_fn(|k| lane_x[k] * 0.25);
+                    let nz = [z as f64 * 0.25; DF8];
+                    let r = noise.get_8(nx, [0.0; DF8], nz).map(|v| v * 4.0);
+                    wr!(sp, v8_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::ShiftB(ni) => {
+                    let noise = &g.noises[ni as usize];
+                    let nx = [z as f64 * 0.25; DF8];
+                    let ny: [f64; DF8] = std::array::from_fn(|k| lane_x[k] * 0.25);
+                    let r = noise.get_8(nx, ny, [0.0; DF8]).map(|v| v * 4.0);
+                    wr!(sp, v8_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Weird { ni, mapper } => {
+                    let rarity_in = v8_to_arr(rd!(sp - 1));
+                    let noise = &g.noises[ni as usize];
+                    let rarity: [f64; DF8] = std::array::from_fn(|k| mapper.rarity(rarity_in[k]));
+                    let nx: [f64; DF8] = std::array::from_fn(|k| lane_x[k] / rarity[k]);
+                    let ny: [f64; DF8] = std::array::from_fn(|k| y as f64 / rarity[k]);
+                    let nz: [f64; DF8] = std::array::from_fn(|k| z as f64 / rarity[k]);
+                    let nv = noise.get_8(nx, ny, nz);
+                    let r: [f64; DF8] = std::array::from_fn(|k| rarity[k] * nv[k].abs());
+                    wr!(sp - 1, v8_from_arr(r));
+                    pc += 1;
+                }
+                Op::Beardifier => {
+                    let beard = cc.and_then(|cc| cc.beard.as_deref());
+                    // The common case is no beardifier at all (or an empty one): the
+                    // marker evaluates to zero at every lane, so push one vector rather
+                    // than eight scalar `compute_beardifier` calls.
+                    if beard.map_or(true, |b| b.is_empty()) {
+                        wr!(sp, _mm512_setzero_pd());
+                    } else {
+                        let beard = beard.unwrap();
+                        let r: [f64; DF8] = std::array::from_fn(|k| {
+                            compute_beardifier(beard, x + k as i32, y, z)
+                        });
+                        wr!(sp, v8_from_arr(r));
+                    }
+                    sp += 1;
+                    pc += 1;
+                }
+                // The grid's presence is a property of the columns, not of the position,
+                // so this jump is lane-uniform: either all eight lanes read a trilinear
+                // cell or all eight fall through to the node's own program.
+                Op::Interp { slot, join } => {
+                    let cells = cc
+                        .and_then(|c| c.grids.get(slot as usize))
+                        .and_then(|g| g.as_deref());
+                    match (cells, cc) {
+                        (Some(cells), Some(columns)) => {
+                            let r = match trilinear_x8(cells, columns, x, y, z) {
+                                Some(r) => r,
+                                None => std::array::from_fn(|k| {
+                                    trilinear(cells, columns, x + k as i32, y, z)
+                                }),
+                            };
+                            wr!(sp, v8_from_arr(r));
+                            sp += 1;
+                            pc = join as usize;
+                        }
+                        _ => pc += 1,
+                    }
+                }
+                Op::Call(id) => {
+                    let r: [f64; DF8] = std::array::from_fn(|k| {
+                        let mut memo = HashMap::new();
+                        g.eval_c(id as usize, x + k as i32, y, z, &mut memo, cc)
+                    });
+                    wr!(sp, v8_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::BranchOut { mi, ma, target } => {
+                    // `t >= mi && t < ma` with ordered-quiet compares, exactly as in
+                    // `run4_avx2` and the scalar `run`: NaN answers false in both, so it
+                    // takes the "out of range" branch. The eight lanes must all agree.
+                    let v = rd!(sp - 1);
+                    let lo = _mm512_cmp_pd_mask(v, _mm512_set1_pd(mi), _CMP_GE_OQ);
+                    let hi = _mm512_cmp_pd_mask(v, _mm512_set1_pd(ma), _CMP_LT_OQ);
+                    match lo & hi {
+                        m if m == 0xFF => {
+                            sp -= 1;
+                            pc += 1;
+                        }
+                        0 => {
+                            sp -= 1;
+                            pc = target as usize;
+                        }
+                        _ => return None, // lanes disagree: caller finishes on eval_x4
+                    }
+                }
+                Op::BranchLt { t, target } => {
+                    let v = rd!(sp - 1);
+                    let mask = _mm512_cmp_pd_mask(v, _mm512_set1_pd(t), _CMP_LT_OQ);
+                    sp -= 1;
+                    if mask == 0xFF {
+                        pc = target as usize;
+                    } else if mask == 0 {
+                        pc += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                Op::BranchZero { target } => {
+                    let v = rd!(sp - 1);
+                    // `== 0.0` is true for both zeros and false for NaN, which is what
+                    // the ordered-equal compare answers too.
+                    let mask = _mm512_cmp_pd_mask(v, zero, _CMP_EQ_OQ);
+                    if mask == 0xFF {
+                        pc = target as usize;
+                    } else if mask == 0 {
+                        pc += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                Op::Jump(target) => pc = target as usize,
+                Op::Drop => {
+                    sp -= 1;
+                    pc += 1;
+                }
+                Op::Halt => {
+                    debug_assert_eq!(sp, 1, "compiled program left {sp} values, not 1");
+                    return Some(v8_to_arr(rd!(0)));
                 }
             }
         }
@@ -6733,10 +7216,11 @@ impl Gen {
         // (`terrain_section_at`'s feature pass) copies it out once.
         let mut arr = Box::new([0u32; 4096]);
         let mut marks: Vec<(u8, i32, i32, i32)> = Vec::new();
-        // M3 P4: the section's densities are asked for four columns at a time
-        // (`Gen::block_density_x4`) and the cell rules then run per cell in the order they
-        // always ran: `ly`, `lz`, `lx`. Only the density call is batched, and the four values
-        // are the four `block_density` values bit for bit, so the order the aquifer, the
+        // M3 P4 / A2-c: the section's densities are asked for eight columns at a time
+        // (`Gen::block_density_x8`, falling back to two `x4` calls where the 8-lane arm
+        // cannot run) and the cell rules then run per cell in the order they always ran:
+        // `ly`, `lz`, `lx`. Only the density call is batched, and the values are the
+        // individual `block_density` values bit for bit, so the order the aquifer, the
         // material rules and the deep rules see is the order they saw before.
         let ly_top = self.min_y + self.height;
         for ly in 0..16i32 {
@@ -6750,11 +7234,11 @@ impl Gen {
                 while lx < 16 {
                     let x = cx * 16 + lx;
                     let d = if in_window {
-                        Some(self.block_density_x4(cc, x, y, z))
+                        Some(self.block_density_x8(cc, x, y, z))
                     } else {
                         None
                     };
-                    for k in 0..DF4 {
+                    for k in 0..DF8 {
                         let (state, marked) = match d {
                             Some(d) => self.terrain_cell_density(cc, x + k as i32, y, z, d[k]),
                             None => (0, 0),
@@ -6770,7 +7254,7 @@ impl Gen {
                             }
                         }
                     }
-                    lx += DF4 as i32;
+                    lx += DF8 as i32;
                 }
             }
         }
@@ -7266,22 +7750,22 @@ impl Gen {
             return Some(cc);
         }
         let top = g.min_y + g.height - 1;
-        // M3 P4: four columns of one `z` row per pass. Each lane keeps its own answer - the
-        // first `y` from the top whose density is positive - so the four searches share the
+        // M3 P4 / A2-c: eight columns of one `z` row per pass. Each lane keeps its own answer
+        // - the first `y` from the top whose density is positive - so the searches share the
         // pass and the step down, and the lanes that have already found their surface are
         // simply no longer updated. Evaluating a lane past its own surface changes nothing
         // (density is pure in the position and the columns), which is what makes the lockstep
-        // scan exactly the four independent scans.
+        // scan exactly the independent scans.
         for zi in 0..16usize {
             let wz = cz * 16 + zi as i32;
             let mut xb = 0usize;
             while xb < 16 {
                 let wx = cx * 16 + xb as i32;
-                let mut sy = [g.min_y - 1; DF4];
-                let mut live = DF4;
+                let mut sy = [g.min_y - 1; DF8];
+                let mut live = DF8;
                 let mut yy = top;
                 while yy >= g.min_y && live > 0 {
-                    let d = g.block_density_x4(&cc, wx, yy, wz);
+                    let d = g.block_density_x8(&cc, wx, yy, wz);
                     for (k, lane) in d.iter().enumerate() {
                         if sy[k] == g.min_y - 1 && *lane > 0.0 {
                             sy[k] = yy;
@@ -7293,7 +7777,7 @@ impl Gen {
                 for (k, lane) in sy.iter().enumerate() {
                     cc.surf[zi * 16 + xb + k] = *lane as i16;
                 }
-                xb += DF4;
+                xb += DF8;
             }
         }
 
@@ -15870,6 +16354,361 @@ mod wg_tests {
         if df4_avx2() {
             assert!(vec > 0, "the vector arm never ran: {vec} groups");
         }
+    }
+
+    // ---- Layer A2-c: the eight-lane density evaluator ----
+
+    /// `trilinear_x8` must be eight scalar `trilinear` calls bit for bit on every 8-aligned
+    /// start, and refuse a start that cannot be split into two cell-aligned 4-lane halves.
+    #[test]
+    fn a2c_trilinear_x8_matches_scalar_bit_for_bit() {
+        let (cell_w, cell_h, min_y, world_height) = (4, 8, -64, 128);
+        let nx = (16 / cell_w + 1) as usize;
+        let ny = (world_height / cell_h + 1) as usize;
+        let columns = ChunkCols {
+            grids: Vec::new(),
+            surf: [0; 256],
+            ny,
+            cell_w,
+            cell_h,
+            min_y,
+            mats: (0..256).map(|_| None).collect(),
+            rd: [0; 256],
+            wtop: [0; 256],
+            beard: None,
+        };
+        // Distinct corner values with signed zeros and subnormals, so a wrong corner load
+        // or a reordered lerp cannot hide behind a constant grid.
+        let mut cells = vec![0.0f64; nx * nx * ny];
+        for (i, c) in cells.iter_mut().enumerate() {
+            let bits = 0x3ff0_0000_0000_0000u64.wrapping_add((i as u64).wrapping_mul(0x9e37_79b9));
+            *c = f64::from_bits(bits) * (if i % 3 == 0 { -1.0 } else { 0.5 });
+            if i % 11 == 0 {
+                *c = -0.0;
+            }
+        }
+        let mut compared = 0usize;
+        for cz in [0, 3] {
+            for cx in [0, -2] {
+                for z in [cz * 16 + 1, cz * 16 + 6, cz * 16 + 15] {
+                    for x in [cx * 16, cx * 16 + 8] {
+                        for y in [min_y, min_y + 13, min_y + 121] {
+                            let got = trilinear_x8(&cells, &columns, x, y, z)
+                                .expect("8-aligned start with cell_w = 4");
+                            for k in 0..DF8 {
+                                let want = trilinear(&cells, &columns, x + k as i32, y, z);
+                                assert_eq!(
+                                    want.to_bits(),
+                                    got[k].to_bits(),
+                                    "trilinear lane {k} at {x}+{k}, {y}, {z}"
+                                );
+                                compared += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared >= 2 * 2 * 3 * 2 * 3 * DF8, "trilinear cases did not run");
+        for x in [1, 2, 4, 6, 15] {
+            assert!(
+                trilinear_x8(&cells, &columns, x, min_y, 0).is_none(),
+                "x={x} is not 8-aligned"
+            );
+        }
+        let narrow = ChunkCols {
+            grids: Vec::new(),
+            surf: [0; 256],
+            ny,
+            cell_w: 2,
+            cell_h,
+            min_y,
+            mats: (0..256).map(|_| None).collect(),
+            rd: [0; 256],
+            wtop: [0; 256],
+            beard: None,
+        };
+        assert!(trilinear_x8(&cells, &narrow, 0, min_y, 0).is_none());
+    }
+
+    /// Every op the eight-lane evaluator implements, over the same edge values as the
+    /// four-lane test (cycled across successive groups), held to `DfProg::run` bit for bit.
+    /// `Push` is lane-uniform, so each group checks eight lanes of one operand pair; cycling
+    /// the pair across all edge values covers the same IEEE-754 corner cases.
+    #[test]
+    fn a2c_run8_ops_match_scalar_over_edge_values() {
+        let _guard = lock_gen();
+        let _measurement = M3_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        df4_test_force_scalar(false);
+        m3_test_force(true);
+        m3_reset_local();
+        let mut compared = 0usize;
+        let mut nan_results = 0usize;
+        let mut check = |ops: Vec<Op>, what: &str, a: f64, b: f64| {
+            let prog = df4_prog(ops);
+            for x in [-8, 0, 5] {
+                let want: [f64; DF8] =
+                    std::array::from_fn(|k| prog.eval(&g, None, x + k as i32, 7, 3));
+                let got = prog.eval_x8(&g, None, x, 7, 3);
+                for k in 0..DF8 {
+                    // Two-NaN operands: as in the four-lane test, neither lowering promises
+                    // which payload survives, so "both NaN" is the honest comparison.
+                    if want[k].is_nan() && got[k].is_nan() {
+                        nan_results += 1;
+                        continue;
+                    }
+                    assert_eq!(
+                        want[k].to_bits(),
+                        got[k].to_bits(),
+                        "{what} lane {k} of x={x}: {a:?} / {b:?} -> scalar {:?} vector {:?}",
+                        want[k],
+                        got[k]
+                    );
+                    compared += 1;
+                }
+            }
+        };
+        let unary: [(&str, Op); 8] = [
+            ("neg", Op::Neg),
+            ("abs", Op::Abs),
+            ("sq", Op::Sq),
+            ("cube", Op::Cube),
+            ("hneg", Op::HNeg),
+            ("qneg", Op::QNeg),
+            ("squeeze", Op::Squeeze),
+            ("clamp(-1,1)", Op::Clamp { lo: -1.0, hi: 1.0 }),
+        ];
+        for (name, op) in unary {
+            for v in DF4_EDGES {
+                check(vec![Op::Push(v), op.clone(), Op::Halt], name, v, v);
+            }
+        }
+        let binary: [(&str, Op); 6] = [
+            ("add", Op::Add),
+            ("sub", Op::Sub),
+            ("mul", Op::Mul),
+            ("div", Op::Div),
+            ("min", Op::Min),
+            ("max", Op::Max),
+        ];
+        for (name, op) in binary {
+            for a in DF4_EDGES {
+                for b in DF4_EDGES {
+                    check(vec![Op::Push(a), Op::Push(b), op.clone(), Op::Halt], name, a, b);
+                }
+            }
+        }
+        for c in DF4_EDGES {
+            for v in DF4_EDGES {
+                check(vec![Op::Push(v), Op::AddC(c), Op::Halt], "addC", v, c);
+                check(vec![Op::Push(v), Op::MulC(c), Op::Halt], "mulC", v, c);
+                check(vec![Op::Push(v), Op::MinC(c), Op::Halt], "minC", v, c);
+                check(vec![Op::Push(v), Op::MaxC(c), Op::Halt], "maxC", v, c);
+            }
+        }
+        for a in [0.0f64, -0.0, 1.0, -1.0, f64::NAN] {
+            for f in [0.0f64, 1.0, -1.0, f64::NAN] {
+                for s in [0.5f64, -0.25, f64::NEG_INFINITY] {
+                    check(
+                        vec![Op::Push(a), Op::Push(f), Op::Push(s), Op::Lerp, Op::Halt],
+                        "lerp",
+                        a,
+                        f,
+                    );
+                }
+            }
+        }
+        for (fc, fv, tc, tv) in [
+            (-64.0, 0.0, -40.0, 1.0),
+            (240.0, 1.0, 256.0, 0.0),
+            (0.0, -0.0, 0.0, 1.0),
+        ] {
+            let prog = df4_prog(vec![Op::Grad { fc, fv, tc, tv }, Op::Halt]);
+            for y in [g.min_y, -40, 0, 240, g.min_y + g.height - 1] {
+                let want = prog.eval(&g, None, 3, y, -2);
+                let got = prog.eval_x8(&g, None, 3, y, -2);
+                for k in 0..DF8 {
+                    assert_eq!(want.to_bits(), got[k].to_bits(), "grad {fc} y={y} lane {k}");
+                    compared += 1;
+                }
+            }
+        }
+        let vec = m3_local().get(M3_DF4_VEC);
+        m3_test_force(false);
+        assert!(compared > 1_000, "only {compared} lane values were compared");
+        assert!(nan_results > 0, "NaN cases stopped being covered");
+        if df8_avx512() {
+            assert!(vec > 0, "eight-lane vector arm never ran: {vec} groups");
+        }
+    }
+
+    /// A lane-divergent conditional must bail out of the 8-lane arm; the two `eval_x4` halves
+    /// it falls back to must still answer all eight positions bit for bit.
+    #[test]
+    fn a2c_run8_mixed_branches_fall_back_to_eval_x4_bit_for_bit() {
+        let _guard = lock_gen();
+        let _measurement = M3_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        df4_test_force_scalar(false);
+        // A noise whose value varies with x so the eight lanes disagree at a chosen cut.
+        let probe = df4_prog(vec![
+            Op::Push(0.0),
+            Op::Push(0.0),
+            Op::Push(0.0),
+            Op::Noise { ni: 0, xzs: 1.0, ys: 0.0 },
+            Op::Halt,
+        ]);
+        let (x, y, z) = (3, 7, -2);
+        let vals: [f64; DF8] =
+            std::array::from_fn(|k| probe.eval(&g, None, x + k as i32, y, z));
+        let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(lo < hi, "the probe noise did not vary across the eight lanes");
+        let mid = lo + (hi - lo) * 0.5;
+        let check = |ops: Vec<Op>, what: &str| {
+            let prog = df4_prog(ops);
+            let want: [f64; DF8] =
+                std::array::from_fn(|k| prog.eval(&g, None, x + k as i32, y, z));
+            let got = prog.eval_x8(&g, None, x, y, z);
+            for k in 0..DF8 {
+                assert_eq!(
+                    want[k].to_bits(),
+                    got[k].to_bits(),
+                    "{what} fallback lane {k}"
+                );
+            }
+            #[cfg(target_arch = "x86_64")]
+            if df8_avx512() {
+                let direct = unsafe { run8_avx512(&prog, &g, None, x, y, z) };
+                assert!(direct.is_none(), "{what}: mixed lanes must bail out of run8");
+            }
+        };
+        // BranchLt with a cut strictly between the lane values.
+        check(
+            vec![
+                Op::Push(0.0),
+                Op::Push(0.0),
+                Op::Push(0.0),
+                Op::Noise { ni: 0, xzs: 1.0, ys: 0.0 },
+                Op::BranchLt { t: mid, target: 7 },
+                Op::Push(1.0),
+                Op::Halt,
+                Op::Push(0.0),
+                Op::Halt,
+            ],
+            "branch_lt",
+        );
+        // BranchOut with a lower bound strictly between the lane values.
+        check(
+            vec![
+                Op::Push(0.0),
+                Op::Push(0.0),
+                Op::Push(0.0),
+                Op::Noise { ni: 0, xzs: 1.0, ys: 0.0 },
+                Op::BranchOut { mi: mid, ma: 1.0e9, target: 7 },
+                Op::Push(1.0),
+                Op::Halt,
+                Op::Push(0.0),
+                Op::Halt,
+            ],
+            "branch_out",
+        );
+        // BranchZero: subtract lane 0's value so exactly that lane becomes +0.0.
+        check(
+            vec![
+                Op::Push(0.0),
+                Op::Push(0.0),
+                Op::Push(0.0),
+                Op::Noise { ni: 0, xzs: 1.0, ys: 0.0 },
+                Op::AddC(-vals[0]),
+                Op::BranchZero { target: 9 },
+                Op::Drop,
+                Op::Push(1.0),
+                Op::Halt,
+                Op::Drop,
+                Op::Push(0.0),
+                Op::Halt,
+            ],
+            "branch_zero",
+        );
+        // A NaN is "out of range" for both ordered compares, so every lane takes the
+        // branch - the same answer the scalar `>= mi && < ma` gives. This pins the
+        // vector form against an inverted `< mi || >= ma` formulation (which would
+        // answer false for NaN and fall through).
+        let nan_branch = df4_prog(vec![
+            Op::Push(f64::NAN),
+            Op::BranchOut { mi: -1.0, ma: 1.0, target: 4 },
+            Op::Push(1.0),
+            Op::Halt,
+            Op::Push(0.0),
+            Op::Halt,
+        ]);
+        let want = nan_branch.eval(&g, None, x, y, z);
+        let got = nan_branch.eval_x8(&g, None, x, y, z);
+        for k in 0..DF8 {
+            assert_eq!(want.to_bits(), got[k].to_bits(), "NaN branch_out lane {k}");
+        }
+    }
+
+    /// The main A2-c identity: `block_density_x8` (full 8-lane arm or the 4-lane fallback)
+    /// against eight scalar `block_density` calls, on Overworld, Nether and End programs
+    /// including `Noise`, `Weird`, `Interp`, the three branches and signed-zero `Min`/`Max`.
+    #[test]
+    fn a2c_run8_avx512_matches_scalar_bit_for_bit() {
+        let _guard = lock_gen();
+        let _measurement = M3_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        df4_test_force_scalar(false);
+        m3_test_force(true);
+        m3_reset_local();
+        let mut compared = 0usize;
+        let mut programs = 0usize;
+        for (preset, seed) in [
+            (NoisePreset::Overworld, 0u64),
+            (NoisePreset::Overworld, 12345),
+            (NoisePreset::Nether, 4242),
+            (NoisePreset::End, 0),
+        ] {
+            let mut g = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            if DfProg::compile_inner(&g).is_none() {
+                continue;
+            }
+            programs += 1;
+            for (cx, cz) in [(0, 0), (-3, 2)] {
+                let cc = g.cols(cx, cz).expect("columns");
+                for lz in (0..16).step_by(5) {
+                    for lx in (0..16).step_by(DF8) {
+                        for ly in (0..16).step_by(3) {
+                            let x = cx * 16 + lx;
+                            let y = g.min_y + ly;
+                            let z = cz * 16 + lz;
+                            let got = g.block_density_x8(&cc, x, y, z);
+                            for k in 0..DF8 {
+                                let want = g.block_density(&cc, x + k as i32, y, z);
+                                assert_eq!(
+                                    want.to_bits(),
+                                    got[k].to_bits(),
+                                    "{preset:?} seed {seed} chunk ({cx},{cz}) x={} y={y} z={z}",
+                                    x + k as i32
+                                );
+                                compared += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let vec = m3_local().get(M3_DF4_VEC);
+        let bail = m3_local().get(M3_DF4_BAIL);
+        m3_test_force(false);
+        assert_eq!(programs, 4, "every preset must compile here");
+        assert!(compared > 2_000, "only {compared} positions compared");
+        if df8_avx512() {
+            assert!(vec > 0, "the 8-lane vector arm never ran: {vec} groups");
+        }
+        // The counter is informational: which groups diverge depends on the preset. Keep the
+        // variable used so a future reader sees the bailout is measured, not assumed.
+        let _ = bail;
     }
 
     /// Layer A2-b: at `beard_depth > 0` a structure start asks the same chunk's heightmap

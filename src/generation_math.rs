@@ -851,6 +851,117 @@ impl Perlin {
         // SAFETY: `__m256d` is four `f64` lanes with no padding.
         std::mem::transmute::<__m256d, [f64; 4]>(r)
     }
+
+    /// Eight scalar [`Perlin::get`] values, bit for bit. Layer A2-c: the same contract as
+    /// [`Perlin::get_4`], but on one AVX-512 `__m512d`. The wrap, permutation hashes and eight
+    /// gradient dots stay scalar (same order); only `smooth` and `lerp3`'s seven stages run
+    /// across lanes. No FMA is enabled on the kernel, so every add/mul/sub rounds exactly as
+    /// the scalar helper does. A host without AVX-512F/DQ keeps the two-`get_4` path.
+    pub(crate) fn get_8(&self, x: [f64; 8], y: [f64; 8], z: [f64; 8]) -> [f64; 8] {
+        #[cfg(target_arch = "x86_64")]
+        {
+            static AVX512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *AVX512.get_or_init(|| {
+                std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512dq")
+            }) {
+                // SAFETY: both AVX-512 features were just detected at runtime.
+                return unsafe { self.get_8_avx512(x, y, z) };
+            }
+        }
+        let a = self.get_4([x[0], x[1], x[2], x[3]], [y[0], y[1], y[2], y[3]], [z[0], z[1], z[2], z[3]]);
+        let b = self.get_4([x[4], x[5], x[6], x[7]], [y[4], y[5], y[6], y[7]], [z[4], z[5], z[6], z[7]]);
+        std::array::from_fn(|k| if k < 4 { a[k] } else { b[k - 4] })
+    }
+
+    /// AVX-512 kernel behind [`Perlin::get_8`].
+    ///
+    /// # Safety
+    /// The caller must have checked `is_x86_feature_detected!("avx512f")` and
+    /// `is_x86_feature_detected!("avx512dq")`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512dq")]
+    unsafe fn get_8_avx512(&self, x: [f64; 8], y: [f64; 8], z: [f64; 8]) -> [f64; 8] {
+        use std::arch::x86_64::*;
+        // Coordinate preparation: exactly `get`'s wrap/floor/fraction per lane.
+        let mut ix = [0i32; 8];
+        let mut iy = [0i32; 8];
+        let mut iz = [0i32; 8];
+        let mut rx = [0.0f64; 8];
+        let mut ry = [0.0f64; 8];
+        let mut rz = [0.0f64; 8];
+        for k in 0..8 {
+            let wx = wrap(x[k]) + self.xo;
+            let wy = wrap(y[k]) + self.yo;
+            let wz = wrap(z[k]) + self.zo;
+            ix[k] = wx.floor() as i32;
+            iy[k] = wy.floor() as i32;
+            iz[k] = wz.floor() as i32;
+            rx[k] = wx - ix[k] as f64;
+            ry[k] = wy - iy[k] as f64;
+            rz[k] = wz - iz[k] as f64;
+        }
+        // The eight gradient dots per lane, in `sample_lerp`'s order and with the
+        // scalar grad_dot operation order `((g0*x) + (g1*y)) + (g2*z)`.
+        let mut d = [[0.0f64; 8]; 8];
+        for k in 0..8 {
+            let (px, py, pz) = (ix[k], iy[k], iz[k]);
+            let (dx, dy, dz) = (rx[k], ry[k], rz[k]);
+            let x0 = self.perm(px);
+            let x1 = self.perm(px + 1);
+            let xy00 = self.perm(x0 + py);
+            let xy01 = self.perm(x0 + py + 1);
+            let xy10 = self.perm(x1 + py);
+            let xy11 = self.perm(x1 + py + 1);
+            d[k] = [
+                Self::grad_dot(self.perm(xy00 + pz), dx, dy, dz),
+                Self::grad_dot(self.perm(xy10 + pz), dx - 1.0, dy, dz),
+                Self::grad_dot(self.perm(xy01 + pz), dx, dy - 1.0, dz),
+                Self::grad_dot(self.perm(xy11 + pz), dx - 1.0, dy - 1.0, dz),
+                Self::grad_dot(self.perm(xy00 + pz + 1), dx, dy, dz - 1.0),
+                Self::grad_dot(self.perm(xy10 + pz + 1), dx - 1.0, dy, dz - 1.0),
+                Self::grad_dot(self.perm(xy01 + pz + 1), dx, dy - 1.0, dz - 1.0),
+                Self::grad_dot(self.perm(xy11 + pz + 1), dx - 1.0, dy - 1.0, dz - 1.0),
+            ];
+        }
+        // Lift each of the eight gradient results and the three fractions into lanes.
+        let dvec = |j: usize| {
+            _mm512_setr_pd(
+                d[0][j], d[1][j], d[2][j], d[3][j], d[4][j], d[5][j], d[6][j], d[7][j],
+            )
+        };
+        let (v0, v1, v2, v3) = (dvec(0), dvec(1), dvec(2), dvec(3));
+        let (v4, v5, v6, v7) = (dvec(4), dvec(5), dvec(6), dvec(7));
+        // smooth(t) = t*t*t*(t*(t*6-15)+10), same op order as scalar `smooth`.
+        let smoothv = |t: __m512d| -> __m512d {
+            let t2 = _mm512_mul_pd(t, t);
+            let t3 = _mm512_mul_pd(t2, t);
+            let a = _mm512_mul_pd(t, _mm512_set1_pd(6.0));
+            let b = _mm512_sub_pd(a, _mm512_set1_pd(15.0));
+            let c = _mm512_mul_pd(t, b);
+            let e = _mm512_add_pd(c, _mm512_set1_pd(10.0));
+            _mm512_mul_pd(t3, e)
+        };
+        let a = smoothv(_mm512_setr_pd(
+            rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7],
+        ));
+        let b = smoothv(_mm512_setr_pd(
+            ry[0], ry[1], ry[2], ry[3], ry[4], ry[5], ry[6], ry[7],
+        ));
+        let c = smoothv(_mm512_setr_pd(
+            rz[0], rz[1], rz[2], rz[3], rz[4], rz[5], rz[6], rz[7],
+        ));
+        // lerp3's seven stages, in the exact order of the scalar helper.
+        let l0 = _mm512_add_pd(v0, _mm512_mul_pd(a, _mm512_sub_pd(v1, v0)));
+        let l1 = _mm512_add_pd(v2, _mm512_mul_pd(a, _mm512_sub_pd(v3, v2)));
+        let l2 = _mm512_add_pd(v4, _mm512_mul_pd(a, _mm512_sub_pd(v5, v4)));
+        let l3 = _mm512_add_pd(v6, _mm512_mul_pd(a, _mm512_sub_pd(v7, v6)));
+        let m0 = _mm512_add_pd(l0, _mm512_mul_pd(b, _mm512_sub_pd(l1, l0)));
+        let m1 = _mm512_add_pd(l2, _mm512_mul_pd(b, _mm512_sub_pd(l3, l2)));
+        let r = _mm512_add_pd(m0, _mm512_mul_pd(c, _mm512_sub_pd(m1, m0)));
+        // SAFETY: `__m512d` is eight `f64` lanes with no padding.
+        std::mem::transmute::<__m512d, [f64; 8]>(r)
+    }
     // smeared variant (old_blended_noise): y snapped up within fudge cells
     fn get_smeared(&self, x: f64, oy: f64, z: f64, fudge_y_scale: f64) -> f64 {
         let x = wrap(x) + self.xo;
@@ -1060,6 +1171,101 @@ impl Normal {
                     let nz = std::array::from_fn(|k| z[k] * o.f);
                     let nv = o.n.get_4(nx, ny, nz);
                     for k in 0..4 {
+                        v[k] += o.a * nv[k];
+                    }
+                }
+                v
+            }
+        }
+    }
+
+    /// Eight scalar [`Normal::get`] values, bit for bit (layer A2-c). All eight NCACHE probes
+    /// (and, on a miss, all eight stores) share one `RefCell` borrow per phase; the layer
+    /// summation keeps `Normal::get`'s exact accumulation order and calls [`Perlin::get_8`]
+    /// for each octave's eight samples.
+    pub(crate) fn get_8(&self, x: [f64; 8], y: [f64; 8], z: [f64; 8]) -> [f64; 8] {
+        let key: [NKey; 8] = std::array::from_fn(|k| {
+            (
+                self.cache_id,
+                x[k].to_bits(),
+                y[k].to_bits(),
+                z[k].to_bits(),
+            )
+        });
+        let idx: [usize; 8] = std::array::from_fn(|k| nhash(key[k]));
+        let cached: [Option<f64>; 8] = NCACHE.with(|c| {
+            let c = c.borrow();
+            std::array::from_fn(|k| {
+                let slot = c[idx[k]];
+                if slot.0 == key[k] {
+                    Some(slot.1)
+                } else {
+                    None
+                }
+            })
+        });
+        if cached.iter().all(Option::is_some) {
+            return cached.map(Option::unwrap);
+        }
+        let vals = self.eval_x8_uncached(x, y, z);
+        NCACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            for k in 0..8 {
+                if cached[k].is_none() {
+                    c[idx[k]] = (key[k], vals[k]);
+                }
+            }
+        });
+        vals
+    }
+
+    /// `Normal::get`'s body without the NCACHE, evaluated for eight lanes at once. Each
+    /// octave's eight Perlin samples are one [`Perlin::get_8`] call; the scalar per-lane
+    /// multiply and accumulate order is preserved exactly.
+    fn eval_x8_uncached(&self, x: [f64; 8], y: [f64; 8], z: [f64; 8]) -> [f64; 8] {
+        match &self.native {
+            Some(native) => {
+                let mut first = [0.0f64; 8];
+                for (o, weight) in self.layers[..native.split]
+                    .iter()
+                    .zip(&native.octave_weights)
+                {
+                    let nx = std::array::from_fn(|k| x[k] * o.f);
+                    let ny = std::array::from_fn(|k| y[k] * o.f);
+                    let nz = std::array::from_fn(|k| z[k] * o.f);
+                    let nv = o.n.get_8(nx, ny, nz);
+                    for k in 0..8 {
+                        first[k] += o.a * nv[k] * weight;
+                    }
+                }
+                // Java multiplies the coordinate by INPUT_FACTOR before the second
+                // PerlinNoise applies its per-octave frequency scaling.
+                let ix: [f64; 8] = std::array::from_fn(|k| x[k] * INPUT_FACTOR);
+                let iy: [f64; 8] = std::array::from_fn(|k| y[k] * INPUT_FACTOR);
+                let iz: [f64; 8] = std::array::from_fn(|k| z[k] * INPUT_FACTOR);
+                let mut second = [0.0f64; 8];
+                for (o, weight) in self.layers[native.split..]
+                    .iter()
+                    .zip(&native.octave_weights)
+                {
+                    let nx = std::array::from_fn(|k| ix[k] * o.f);
+                    let ny = std::array::from_fn(|k| iy[k] * o.f);
+                    let nz = std::array::from_fn(|k| iz[k] * o.f);
+                    let nv = o.n.get_8(nx, ny, nz);
+                    for k in 0..8 {
+                        second[k] += o.a * nv[k] * weight;
+                    }
+                }
+                std::array::from_fn(|k| (first[k] + second[k]) * native.value_factor)
+            }
+            None => {
+                let mut v = [0.0f64; 8];
+                for o in &self.layers {
+                    let nx = std::array::from_fn(|k| x[k] * o.f);
+                    let ny = std::array::from_fn(|k| y[k] * o.f);
+                    let nz = std::array::from_fn(|k| z[k] * o.f);
+                    let nv = o.n.get_8(nx, ny, nz);
+                    for k in 0..8 {
                         v[k] += o.a * nv[k];
                     }
                 }
@@ -2141,6 +2347,107 @@ mod next_int_vs_vanilla_tests {
         }
         assert!(perlin_cases >= 3 * 16 * 4, "Perlin cases did not run");
         assert!(normal_cases >= 4 * 16 * 4, "Normal cases did not run");
+        assert!(cache_hit_cases > 0, "cache-hit path was never exercised");
+    }
+
+    /// Layer A2-c: eight-lane `Perlin::get_8` / `Normal::get_8` must equal eight scalar
+    /// calls bit for bit, including NaN, infinities, the two zeros and the `wrap` boundary.
+    #[test]
+    fn a2c_perlin_and_normal_get_8_match_scalar_bit_for_bit() {
+        fn clear_ncache() {
+            NCACHE.with(|c| c.borrow_mut().fill(((usize::MAX, 0, 0, 0), 0.0)));
+        }
+        const COORDS: [f64; 24] = [
+            0.0,
+            -0.0,
+            0.25,
+            -0.375,
+            1.0,
+            -1.0,
+            7.9375,
+            -8.0625,
+            255.999,
+            -256.001,
+            1_000.0,
+            -1_000.0,
+            33_554_431.75,
+            -33_554_431.75,
+            1.0e8,
+            -1.0e8,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::from_bits(1),
+        ];
+        let group = |base: usize| -> ([f64; 8], [f64; 8], [f64; 8]) {
+            (
+                std::array::from_fn(|k| COORDS[(base + k) % COORDS.len()]),
+                std::array::from_fn(|k| COORDS[(base + k + 7) % COORDS.len()]),
+                std::array::from_fn(|k| COORDS[(base + k + 13) % COORDS.len()]),
+            )
+        };
+        let mut r = Xor::seed(0xa2c8_1234_5678_9abc);
+        let perlins: Vec<Perlin> = (0..3).map(|_| Perlin::new(&mut r)).collect();
+        let mut perlin_cases = 0usize;
+        for p in &perlins {
+            for base in 0..COORDS.len() {
+                let (gx, gy, gz) = group(base);
+                let got = p.get_8(gx, gy, gz);
+                for k in 0..8 {
+                    let want = p.get(gx[k], gy[k], gz[k]);
+                    assert_eq!(
+                        want.to_bits(),
+                        got[k].to_bits(),
+                        "Perlin lane {k} of group {base}: x={} y={} z={}",
+                        gx[k],
+                        gy[k],
+                        gz[k]
+                    );
+                    perlin_cases += 1;
+                }
+            }
+        }
+
+        let normals = [
+            normal_new(&mut Xor::seed(111), -2, 0.9, &[1.0, 0.75, 0.5]),
+            normal_new_amps(&mut Xor::seed(222), 0, &[1.0, 0.5, 0.25, 0.125]),
+            normal_new_amps(&mut Xor::seed(333), -1, &[0.0, 1.0, 0.0, 0.5]),
+            normal_legacy_nether(444),
+        ];
+        let mut normal_cases = 0usize;
+        let mut cache_hit_cases = 0usize;
+        for n in &normals {
+            for base in 0..COORDS.len() {
+                let (gx, gy, gz) = group(base);
+                clear_ncache();
+                let want: [f64; 8] = std::array::from_fn(|k| n.get(gx[k], gy[k], gz[k]));
+                clear_ncache();
+                let got = n.get_8(gx, gy, gz);
+                for k in 0..8 {
+                    assert_eq!(
+                        want[k].to_bits(),
+                        got[k].to_bits(),
+                        "Normal lane {k} of group {base}: x={} y={} z={}",
+                        gx[k],
+                        gy[k],
+                        gz[k]
+                    );
+                    normal_cases += 1;
+                }
+                // All-hit path: a second get_8 must return exactly the same bits.
+                let hit = n.get_8(gx, gy, gz);
+                for k in 0..8 {
+                    assert_eq!(got[k].to_bits(), hit[k].to_bits(), "NCACHE hit lane {k}");
+                    cache_hit_cases += 1;
+                }
+            }
+        }
+        assert!(perlin_cases >= 3 * 24 * 8, "Perlin cases did not run");
+        assert!(normal_cases >= 4 * 24 * 8, "Normal cases did not run");
         assert!(cache_hit_cases > 0, "cache-hit path was never exercised");
     }
 }
