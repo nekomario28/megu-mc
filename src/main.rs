@@ -9839,7 +9839,9 @@ fn set_block_if_inner_dim(
     // every cell it covers. The version still moves for the sky floors, which are derived
     // from the column rather than stored per cell.
     band_patch(x, y, z, st);
-    store_patch(x, y, z, st);
+    // Only Overworld reaches this point (the early return above handles the other
+    // dimensions), but pass `dim` so the patched store slot keeps its dimension key.
+    store_patch(dim, x, y, z, st);
     bump_world_epoch(x, z);
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
@@ -18452,12 +18454,17 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
 /// there (readers fall back), and a chunk with no band yet needs nothing: its first build
 /// reads the world as it is then.
 /// Sections computed for a chunk, kept so a reader (the anti-xray exposure test, or the
-/// chunk's own delivery after a neighbour prefetched it) can read an array instead of
-/// evaluating cells. Bounded to the last 32 chunks (~7 MB at 10-14 published sections of
-/// 16 KB each).
+/// chunk's own delivery after a neighbour prefetched it) can read a packed section instead of
+/// evaluating cells. The key carries the dimension so a Nether/End stream cannot collide with
+/// an Overworld chunk at the same `(cx, cz)`.
+///
+/// Each slot is an `Arc<PalettedSection>`, not a 16 KB `Box<[u32; 4096]>`: a typical section
+/// holds a 4-8 bit palette (a few hundred bytes to ~4 KB; Direct is 8 KB), and the delivery
+/// path can now reuse the very same `Arc` it publishes — no 16 KB copy out of the store and
+/// no repack on the way back to the wire. Bounded to the last 32 chunks.
 struct SectionStore {
-    map: HashMap<(i32, i32), Vec<Option<std::sync::Arc<Vec<u32>>>>>,
-    order: std::collections::VecDeque<(i32, i32)>,
+    map: HashMap<(DimId, i32, i32), Vec<Option<std::sync::Arc<PalettedSection>>>>,
+    order: std::collections::VecDeque<(DimId, i32, i32)>,
     generation: u64,
 }
 
@@ -18473,17 +18480,45 @@ fn section_store() -> &'static Mutex<SectionStore> {
     })
 }
 
-fn section_index(sy: i32) -> Option<usize> {
-    let idx = (sy - MIN_Y) >> 4;
-    if (0..24).contains(&idx) {
+/// `(world min_y, section count)` for a dimension. The Overworld window is `-64..320` (24
+/// sections); Nether and End are `0..256` (16 sections). Kept here rather than on `DimId`
+/// because that type lives in `worldgen.rs` and the storage window is a delivery concern.
+#[inline]
+fn section_window(dim: DimId) -> (i32, usize) {
+    match dim {
+        DimId::Overworld => (MIN_Y, 24),
+        DimId::Nether | DimId::End => (0, 16),
+    }
+}
+
+fn section_index_dim(dim: DimId, sy: i32) -> Option<usize> {
+    let (min_y, count) = section_window(dim);
+    let idx = (sy - min_y) >> 4;
+    if (0..count as i32).contains(&idx) {
         Some(idx as usize)
     } else {
         None
     }
 }
 
-fn publish_section(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
-    let Some(idx) = section_index(sy) else {
+fn section_index(sy: i32) -> Option<usize> {
+    section_index_dim(DimId::Overworld, sy)
+}
+
+/// Pack generated states into the representation the store and the wire share. The
+/// predicates must match the delivery loop's (`breg().opacity_of(st) == 15` and
+/// `HiddenSet`), otherwise the section's `light_class`/`has_hidden` would disagree with
+/// the raw states and the zero-repack fast path would take the wrong branch.
+fn pack_section(states: &[u32; 4096]) -> PalettedSection {
+    let reg = breg();
+    let hidden = HiddenSet::new();
+    let is_opaque = |st: u32| reg.is_some_and(|r| r.opacity_of(st) == 15);
+    let is_hid = |st: u32| hidden.contains(st);
+    PalettedSection::pack(states, &is_opaque, &is_hid)
+}
+
+fn publish_section(dim: DimId, cx: i32, cz: i32, sy: i32, sec: std::sync::Arc<PalettedSection>) {
+    let Some(idx) = section_index_dim(dim, sy) else {
         return;
     };
     let mut store = section_store().lock().unwrap();
@@ -18493,57 +18528,59 @@ fn publish_section(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
         store.order.clear();
         store.generation = seq;
     }
-    if !store.map.contains_key(&(cx, cz)) {
-        store.map.insert((cx, cz), (0..24).map(|_| None).collect());
-        store.order.push_back((cx, cz));
+    let key = (dim, cx, cz);
+    if !store.map.contains_key(&key) {
+        let (_, count) = section_window(dim);
+        store.map.insert(key, (0..count).map(|_| None).collect());
+        store.order.push_back(key);
         while store.order.len() > 32 {
             if let Some(old) = store.order.pop_front() {
                 store.map.remove(&old);
             }
         }
     }
-    if let Some(sections) = store.map.get_mut(&(cx, cz)) {
-        sections[idx] = Some(std::sync::Arc::new(states.to_vec()));
+    if let Some(sections) = store.map.get_mut(&key) {
+        sections[idx] = Some(sec);
     }
 }
 
 /// The published section, *without* removing it: the light pass for this chunk and for its
 /// neighbours reads the same sections, so consuming one must not empty the store. The LRU
-/// bound is what keeps the memory in check.
-fn take_published(cx: i32, cz: i32, sy: i32) -> Option<Box<[u32; 4096]>> {
-    let idx = section_index(sy)?;
+/// bound is what keeps the memory in check. Returns the stored `Arc` itself, so the caller
+/// can publish and encode the same section without a 16 KB copy.
+fn take_published(dim: DimId, cx: i32, cz: i32, sy: i32) -> Option<std::sync::Arc<PalettedSection>> {
+    let idx = section_index_dim(dim, sy)?;
     let store = section_store().lock().unwrap();
     if store.generation != current_gen_seq() {
         return None;
     }
-    let sections = store.map.get(&(cx, cz))?;
-    let arc = sections[idx].as_ref()?;
-    let mut out = Box::new([0u32; 4096]);
-    out.copy_from_slice(arc.as_slice());
-    Some(out)
+    store.map.get(&(dim, cx, cz))?.get(idx)?.clone()
 }
 
 /// Is this section already published? The ring prefetch asks before computing, so a section
 /// is computed once no matter how many neighbours want it.
-fn has_section(cx: i32, cz: i32, sy: i32) -> bool {
-    let Some(idx) = section_index(sy) else {
+fn has_section(dim: DimId, cx: i32, cz: i32, sy: i32) -> bool {
+    let Some(idx) = section_index_dim(dim, sy) else {
         return false;
     };
     let store = section_store().lock().unwrap();
     if store.generation != current_gen_seq() {
         return false;
     }
-    store.map.get(&(cx, cz)).is_some_and(|s| s[idx].is_some())
+    store
+        .map
+        .get(&(dim, cx, cz))
+        .is_some_and(|s| s[idx].is_some())
 }
 
-/// The published section as a shared slice, for a scan that reads many of its cells.
-fn stored_section(cx: i32, cz: i32, sy: i32) -> Option<std::sync::Arc<Vec<u32>>> {
-    let idx = section_index(sy)?;
+/// The published section as a shared handle, for a scan that reads many of its cells.
+fn stored_section(dim: DimId, cx: i32, cz: i32, sy: i32) -> Option<std::sync::Arc<PalettedSection>> {
+    let idx = section_index_dim(dim, sy)?;
     let store = section_store().lock().unwrap();
     if store.generation != current_gen_seq() {
         return None;
     }
-    store.map.get(&(cx, cz))?.get(idx)?.clone()
+    store.map.get(&(dim, cx, cz))?.get(idx)?.clone()
 }
 
 /// The surface band for a chunk, if installed and current.
@@ -18551,30 +18588,41 @@ fn band_for(cx: i32, cz: i32) -> Option<std::sync::Arc<OpBand>> {
     op_bands().lock().unwrap().get((cx, cz))
 }
 
-fn stored_state(x: i32, y: i32, z: i32) -> Option<u32> {
-    let idx = section_index(y & !15)?;
+fn stored_state(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
+    let idx = section_index_dim(dim, y & !15)?;
     let store = section_store().lock().unwrap();
     if store.generation != current_gen_seq() {
         return None;
     }
-    let sections = store.map.get(&(x >> 4, z >> 4))?;
-    let sec = sections[idx].as_ref()?;
-    Some(sec[(((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize)])
+    let sections = store.map.get(&(dim, x >> 4, z >> 4))?;
+    Some(
+        sections[idx].as_ref()?.get(
+            (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize),
+        ),
+    )
 }
 
-fn store_patch(x: i32, y: i32, z: i32, st: u32) {
-    let Some(idx) = section_index(y & !15) else {
+fn store_patch(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    let Some(idx) = section_index_dim(dim, y & !15) else {
         return;
     };
+    let reg = breg();
+    let hidden = HiddenSet::new();
+    let is_opaque = |s: u32| reg.is_some_and(|r| r.opacity_of(s) == 15);
+    let is_hid = |s: u32| hidden.contains(s);
     let mut store = section_store().lock().unwrap();
-    let Some(sections) = store.map.get_mut(&(x >> 4, z >> 4)) else {
+    let Some(sections) = store.map.get_mut(&(dim, x >> 4, z >> 4)) else {
         return;
     };
     let Some(sec) = sections[idx].as_mut() else {
         return;
     };
-    let cells = std::sync::Arc::make_mut(sec);
-    cells[(((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize)] = st;
+    std::sync::Arc::make_mut(sec).set(
+        (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize),
+        st,
+        &is_opaque,
+        &is_hid,
+    );
 }
 
 fn band_patch(x: i32, y: i32, z: i32, st: u32) {
@@ -18637,10 +18685,10 @@ fn band_range(cx: i32, cz: i32) -> Option<(i32, i32)> {
 /// from worldgen later — measured at 13.6-15.7 ms per new band (~700 ns/cell) against
 /// the ~200 ns/cell the delivery pass pays, i.e. the same work done twice. Installing
 /// the rows here makes the band nearly free for a chunk that was just streamed.
-fn install_band_rows(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
-    let Some(reg) = crate::block_registry::breg() else {
+fn install_band_rows(cx: i32, cz: i32, sy: i32, sec: &PalettedSection) {
+    if breg().is_none() {
         return;
-    };
+    }
     let Some((y0, y1)) = band_range(cx, cz) else {
         return;
     };
@@ -18665,18 +18713,20 @@ fn install_band_rows(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
         return;
     };
     let band = std::sync::Arc::make_mut(slot);
-    for ly in 0..16i32 {
-        let y = sy + ly;
-        if y < band.y0 || y > band.y1 {
-            continue;
-        }
-        let row = ((y - band.y0) as usize) << 8;
-        for lz in 0..16usize {
-            for lx in 0..16usize {
-                band.cells[row | (lz << 4) | lx] =
-                    states[((ly << 8) | ((lz as i32) << 4) | lx as i32) as usize];
-            }
-        }
+    let ly0 = (band.y0 - sy).max(0) as usize;
+    let ly1 = (band.y1 - sy).min(15) as usize;
+    if ly0 > ly1 {
+        return;
+    }
+    let count = ly1 - ly0 + 1;
+    // `copy_y_slice` fills a uniform section with one `fill` and otherwise unpacks only
+    // the rows the band overlaps, so neither shape needs a 4096-cell scan here.
+    let mut rows = [0u32; 4096];
+    sec.copy_y_slice(ly0, count, &mut rows[..count * 256]);
+    for ly in ly0..=ly1 {
+        let dst = ((sy + ly as i32 - band.y0) as usize) << 8;
+        let src = (ly - ly0) * 256;
+        band.cells[dst..dst + 256].copy_from_slice(&rows[src..src + 256]);
     }
 }
 
@@ -18725,34 +18775,39 @@ fn overlay_band(cx: i32, cz: i32) {
 /// per-chunk version invalidates the derived floors on that same write, so the next pass
 /// recomputes them.
 thread_local! {
-    static CELL_SOURCE: std::cell::RefCell<Option<((i32, i32, i32), CellSource)>> =
+    static CELL_SOURCE: std::cell::RefCell<Option<(u64, (i32, i32, i32), CellSource)>> =
         const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Clone)]
 enum CellSource {
-    Section(std::sync::Arc<Vec<u32>>),
+    Section(std::sync::Arc<PalettedSection>),
     Band(std::sync::Arc<OpBand>),
 }
 
 /// The section (full height) or band entry covering `(x, y, z)`, with the store's and the
-/// band's locks taken at most once per distinct chunk-section.
+/// band's locks taken at most once per distinct chunk-section. The generator sequence is
+/// part of the cache key: a section published by a replaced generator must not answer for
+/// the new one (the store itself checks the same sequence on every miss).
 fn cell_source(x: i32, y: i32, z: i32) -> Option<CellSource> {
     let key = (x >> 4, y >> 4, z >> 4);
-    if let Some((k, src)) = CELL_SOURCE.with(|c| c.borrow().clone()) {
-        if k == key {
+    let seq = current_gen_seq();
+    if let Some((cached_seq, k, src)) = CELL_SOURCE.with(|c| c.borrow().clone()) {
+        if cached_seq == seq && k == key {
             return Some(src);
         }
     }
-    let src = stored_section(x >> 4, z >> 4, y & !15)
+    // The light pass is Overworld-only today (a non-Overworld write records its overlay and
+    // nothing else), but the store is dimension-keyed so the seam is ready for streaming.
+    let src = stored_section(DimId::Overworld, x >> 4, z >> 4, y & !15)
         .map(CellSource::Section)
         .or_else(|| band_for(x >> 4, z >> 4).map(CellSource::Band))?;
-    CELL_SOURCE.with(|c| *c.borrow_mut() = Some((key, src.clone())));
+    CELL_SOURCE.with(|c| *c.borrow_mut() = Some((seq, key, src.clone())));
     Some(src)
 }
 
 fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
-    let Some(reg) = crate::block_registry::breg() else {
+    let Some(reg) = breg() else {
         return 0;
     };
     if !worldgen::enabled() {
@@ -18764,17 +18819,24 @@ fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
     // `block_at` (a full worldgen evaluation). Measured: 13,571 such calls per delivered
     // chunk, ~20 ms. The +x neighbour's sections are in the store already (the delivery
     // path's prefetch publishes them), and they cover the full height.
-    let st = cell_source(x, y, z).and_then(|src| match src {
-        CellSource::Section(sec) => {
-            let idx = (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize);
-            sec.get(idx).copied()
-        }
-        CellSource::Band(b) => b.get(y, (x & 15) as usize, (z & 15) as usize),
-    });
-    if let Some(st) = st {
-        return reg.opacity_of(st);
+    //
+    // A packed section carries enough metadata to answer whole-class reads in O(1):
+    // `Empty` is every cell air/void_air/cave_air (opacity 0), `Opaque` is every cell at
+    // opacity 15. Only `Mixed` needs a single palette lookup at the cell's index.
+    match cell_source(x, y, z) {
+        Some(CellSource::Section(sec)) => match sec.light_class() {
+            SectionLightClass::Empty => 0,
+            SectionLightClass::Opaque => 15,
+            SectionLightClass::Mixed => {
+                let idx = (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize);
+                reg.opacity_of(sec.get(idx))
+            }
+        },
+        Some(CellSource::Band(b)) => b
+            .get(y, (x & 15) as usize, (z & 15) as usize)
+            .map_or_else(|| reg.opacity_of(block_at(x, y, z)), |st| reg.opacity_of(st)),
+        None => reg.opacity_of(block_at(x, y, z)),
     }
-    reg.opacity_of(block_at(x, y, z))
 }
 
 /// Per-chunk sky floors, memoized.
@@ -19169,8 +19231,11 @@ fn chunk_data_opt(
     // rather than assumed: `chunk_delivery_digest` compares terrain-state digests with this
     // setting on and off over 2 seeds x 3 sweep directions (60 sweeps) and finds them
     // identical, and it asserts that stays true. `MC_SPINE_NO_PREFETCH_NEIGHBOUR=1` reverts.
-    let mut carried_next: Option<Box<[u32; 4096]>> = None;
-    let mut prev_base: Option<Box<[u32; 4096]>> = None;
+    // Packed sections, not raw 16 KB arrays: the store hands out the very same `Arc` the
+    // encode step writes to the wire, so publishing and reading a section costs neither a
+    // copy nor a repack.
+    let mut carried_next: Option<std::sync::Arc<PalettedSection>> = None;
+    let mut prev_base: Option<std::sync::Arc<PalettedSection>> = None;
     for sec in 0..24 {
         let sy = sec * 16 + MIN_Y;
         let __tb = chunkprof::enabled().then(std::time::Instant::now);
@@ -19187,11 +19252,9 @@ fn chunk_data_opt(
                 chunkprof::FASTPATH_N.fetch_add(1, Ordering::Relaxed);
             }
             let st = if sy + 15 < hmin - 4 { 1 } else { 0 };
-            let mut arr = [0u32; 4096];
-            if st != 0 {
-                arr = [st; 4096];
-            }
-            section_encode_into(&mut data, &arr, &biomes);
+            // A uniform section's wire is just its header; `single` avoids both the
+            // 4096-cell stack array and the 4096-cell scan the legacy encoder would do.
+            PalettedSection::single(st, false, false).write_wire(&biomes, &mut data);
         } else {
             let mut arr = [0u32; 4096];
             // One terrain pass for the section: the previous shape took the worldgen
@@ -19204,19 +19267,22 @@ fn chunk_data_opt(
             }
             let base = match carried_next.take() {
                 Some(b) => Some(b),
-                None => match take_published(cx, cz, sy) {
+                None => match take_published(dim, cx, cz, sy) {
                     Some(b) => Some(b),
                     None => {
                         if chunkprof::enabled() {
                             chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
                         }
+                        // Pack once at the source: the same Arc is published, handed to
+                        // the band, and written straight to the wire below.
                         worldgen::terrain_section_dim(dim, cx, sy, cz, feature::populate)
+                            .map(|rows| std::sync::Arc::new(pack_section(&rows)))
                     }
                 },
             };
             if prefetch {
-                if let Some(rows) = &base {
-                    publish_section(cx, cz, sy, rows);
+                if let Some(sec) = &base {
+                    publish_section(dim, cx, cz, sy, sec.clone());
                     // Only +x. The exposure test also reads +z and the diagonal, and
                     // prefetching those too (measured) takes encode from 29 to 12 ms but
                     // raises the window's CPU from 29.6 to 32.1 s: the diagonal's sections
@@ -19230,14 +19296,20 @@ fn chunk_data_opt(
                     // deliveries are not next. The section phase went 33.4 -> 106.2 ms and
                     // the window's CPU 29.3 -> 31.0 s, so it is a net loss and only +x is
                     // prefetched.
-                    if !has_section(cx + 1, cz, sy) {
+                    if !has_section(dim, cx + 1, cz, sy) {
                         if chunkprof::enabled() {
                             chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
                         }
                         if let Some(nbr) =
                             worldgen::terrain_section_dim(dim, cx + 1, sy, cz, feature::populate)
                         {
-                            publish_section(cx + 1, cz, sy, &nbr);
+                            publish_section(
+                                dim,
+                                cx + 1,
+                                cz,
+                                sy,
+                                std::sync::Arc::new(pack_section(&nbr)),
+                            );
                         }
                     }
                 }
@@ -19247,13 +19319,14 @@ fn chunk_data_opt(
             let next_base = if sy + 16 < MIN_Y + 384 {
                 // The +x neighbour's delivery published this one a step ago in a sweep, so
                 // ask the store before computing it again.
-                match take_published(cx, cz, sy + 16) {
+                match take_published(dim, cx, cz, sy + 16) {
                     Some(b) => Some(b),
                     None => {
                         if chunkprof::enabled() {
                             chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
                         }
                         worldgen::terrain_section_dim(dim, cx, sy + 16, cz, feature::populate)
+                            .map(|rows| std::sync::Arc::new(pack_section(&rows)))
                     }
                 }
             } else {
@@ -19264,15 +19337,56 @@ fn chunk_data_opt(
             }
             // Hand the states the light pass needs to its band, instead of letting it
             // re-evaluate them through `block_state_at` later.
-            if let Some(rows) = &base {
+            if let Some(sec) = &base {
                 let __ti = chunkprof::enabled().then(std::time::Instant::now);
-                install_band_rows(cx, cz, sy, rows);
+                install_band_rows(cx, cz, sy, sec);
                 if let Some(t) = __ti {
                     chunkprof::add(&chunkprof::BAND_INSTALL, t);
                 }
             }
             let __te = chunkprof::enabled().then(std::time::Instant::now);
-            {
+            // A clean, hidden-free section packed by `pack_section` has exactly the palette
+            // `section_encode` would choose. Its wire can be written verbatim: no 4096-cell
+            // scan, no hidden loop, no second palette build. An overlay or a `set()` patch
+            // (which leaves stale palette entries behind) forces the legacy path below.
+            let zero_repack = overlay_empty
+                && base.as_ref().is_some_and(|s| !s.has_hidden() && s.is_clean_wire());
+            let has_base = base.is_some();
+            if zero_repack {
+                let sec = base.as_ref().expect("zero_repack requires a section");
+                if let Some(reg) = reg {
+                    // `any_palette_entry` avoids a 4096-cell scan in the vast majority of
+                    // sections. When emitters exist, keep the exact (ly, lz, lx) order so
+                    // `GenSources` (and therefore block light) is unchanged.
+                    if sec.any_palette_entry(|st| reg.luminance_of(st) > 0) {
+                        for ly in 0..16usize {
+                            for lz in 0..16usize {
+                                for lx in 0..16usize {
+                                    let gen = sec.get((ly << 8) | (lz << 4) | lx);
+                                    let lum = reg.luminance_of(gen);
+                                    if lum > 0 {
+                                        gen_sources_here.push((
+                                            (
+                                                cx * 16 + lx as i32,
+                                                sy + ly as i32,
+                                                cz * 16 + lz as i32,
+                                            ),
+                                            lum,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                if let Some(sec) = &base {
+                    // One fast unpack into the stack array: the 4096-cell loop and the
+                    // `gen` reads below are then L1 array reads, not per-cell palette
+                    // lookups. `arr` is fully overwritten by the loop that follows.
+                    sec.unpack_into(&mut arr);
+                }
+                {
                 // Neighbour reads (the anti-xray exposure test) go through a per-call
                 // lock instead of holding `world()` across all 4096 cells: the hold is
                 // what the tick thread queues behind, and `base_state` is called with no
@@ -19298,11 +19412,12 @@ fn chunk_data_opt(
                         }
                         let lx = (wx & 15) as usize;
                         let lz = (wz & 15) as usize;
-                        let section_of = |arr: &Option<Box<[u32; 4096]>>, dy: i32| -> Option<u32> {
-                            let a = arr.as_ref()?;
-                            let idx = ((dy as usize) << 8) | (lz << 4) | lx;
-                            Some(a[idx])
-                        };
+                        let section_of =
+                            |sec: &Option<std::sync::Arc<PalettedSection>>, dy: i32| -> Option<u32> {
+                                let sec = sec.as_ref()?;
+                                let idx = ((dy as usize) << 8) | (lz << 4) | lx;
+                                Some(sec.get(idx))
+                            };
                         if wy >= sy && wy < sy + 16 {
                             if let Some(v) = section_of(&base, wy - sy) {
                                 if let Some(t) = __t {
@@ -19330,7 +19445,7 @@ fn chunk_data_opt(
                     if __tb.is_some() {
                         chunkprof::READ_BAND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    if let Some(st) = stored_state(wx, wy, wz) {
+                    if let Some(st) = stored_state(dim, wx, wy, wz) {
                         if let Some(t) = __t {
                             chunkprof::add(&chunkprof::READ_NS, t);
                         }
@@ -19395,9 +19510,10 @@ fn chunk_data_opt(
                             } else {
                                 overlay.get(&local_idx(wx, wy, wz)).copied()
                             };
-                            let gen = match &base {
-                                Some(a) => a[(ly << 8) | (lz << 4) | lx],
-                                None => base_state(wx, wy, wz),
+                            let gen = if has_base {
+                                arr[(ly << 8) | (lz << 4) | lx]
+                            } else {
+                                base_state(wx, wy, wz)
                             };
                             let st = ov.unwrap_or(gen);
                             // Record the generated emitter even when an overlay edit covers it:
@@ -19439,17 +19555,26 @@ fn chunk_data_opt(
                         }
                     }
                 }
+                }
             }
             if let Some(t) = __te {
                 chunkprof::add(&chunkprof::ENCODE, t);
             }
-            prev_base = base;
-            carried_next = next_base;
             let __tl = chunkprof::enabled().then(std::time::Instant::now);
-            section_encode_into(&mut data, &arr, &biomes);
+            if zero_repack {
+                // Byte-identical to `section_encode_into(&arr, &biomes)` for the states
+                // `pack_section` was given, but written straight from the stored palette.
+                base.as_ref()
+                    .expect("zero_repack requires a section")
+                    .write_wire(&biomes, &mut data);
+            } else {
+                section_encode_into(&mut data, &arr, &biomes);
+            }
             if let Some(t) = __tl {
                 chunkprof::add(&chunkprof::ENC_SECTION, t);
             }
+            prev_base = base;
+            carried_next = next_base;
         }
     }
     gen.insert((cx, cz), gen_sources_here);

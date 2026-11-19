@@ -7816,3 +7816,195 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
         "a mob in neither fluid must have its fluid velocity cleared"
     );
 }
+
+/// M3 P2b: the section store is keyed by `(DimId, cx, cz)`, so streaming a second
+/// dimension cannot overwrite an Overworld chunk at the same coordinates. A patch goes
+/// through `Arc::make_mut` and must leave the wire clean flag false even when reverted.
+#[test]
+fn section_store_is_dimension_keyed_and_patch_dirties_wire() {
+    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
+
+    // Exclusive chunk coordinates: the store is a process global shared with other tests.
+    let (cx, cz) = (31_003i32, 31_003i32);
+    let sy = 0; // a valid section index in all three dimensions
+    let mk = |st: u32| std::sync::Arc::new(PalettedSection::single(st, false, false));
+    publish_section(DimId::Overworld, cx, cz, sy, mk(1));
+    publish_section(DimId::Nether, cx, cz, sy, mk(2));
+    publish_section(DimId::End, cx, cz, sy, mk(3));
+
+    for (dim, want) in [
+        (DimId::Overworld, 1u32),
+        (DimId::Nether, 2u32),
+        (DimId::End, 3u32),
+    ] {
+        let sec = stored_section(dim, cx, cz, sy).expect("published section");
+        assert_eq!(sec.get(0), want, "{dim:?} read the wrong section");
+        assert!(sec.is_clean_wire(), "{dim:?} section should start wire-clean");
+        assert_eq!(take_published(dim, cx, cz, sy).unwrap().get(0), want);
+    }
+
+    // Each dimension has its own window: Overworld starts at -64 with 24 sections,
+    // Nether/End at 0 with 16. `section_index` stays the Overworld convenience wrapper.
+    assert_eq!(section_index_dim(DimId::Overworld, MIN_Y), Some(0));
+    assert_eq!(section_index_dim(DimId::Overworld, MIN_Y + 16), Some(1));
+    assert_eq!(section_index_dim(DimId::Overworld, MIN_Y + 384), None);
+    assert_eq!(section_index_dim(DimId::Nether, 0), Some(0));
+    assert_eq!(section_index_dim(DimId::Nether, 240), Some(15));
+    assert_eq!(section_index_dim(DimId::Nether, 256), None);
+    assert_eq!(section_index_dim(DimId::End, 0), Some(0));
+    assert_eq!(section_index(MIN_Y), Some(0));
+
+    // Patch one cell in one dimension only; edit + revert keeps the cells but loses the
+    // "clean wire" guarantee because `set()` never reclaims the temporary palette entry.
+    let (x, y, z) = (cx * 16 + 5, sy + 3, cz * 16 + 7);
+    let idx = (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize);
+    let original = stored_section(DimId::Nether, cx, cz, sy).unwrap().get(idx);
+    let other = if original == 1 { 2 } else { 1 };
+    store_patch(DimId::Nether, x, y, z, other);
+    store_patch(DimId::Nether, x, y, z, original);
+
+    let patched = stored_section(DimId::Nether, cx, cz, sy).unwrap();
+    assert_eq!(patched.get(idx), original, "revert must restore the cell");
+    assert!(!patched.is_clean_wire(), "an edited section is no longer wire-clean");
+    assert_eq!(stored_state(DimId::Nether, x, y, z), Some(original));
+    assert_eq!(
+        stored_section(DimId::Overworld, cx, cz, sy).unwrap().get(idx),
+        1,
+        "Nether patch leaked into Overworld"
+    );
+    assert_eq!(
+        stored_section(DimId::End, cx, cz, sy).unwrap().get(idx),
+        3,
+        "Nether patch leaked into End"
+    );
+    assert!(stored_section(DimId::Overworld, cx, cz, sy).unwrap().is_clean_wire());
+}
+
+/// M3 P2b: the two section-encode paths `chunk_data_opt` chooses between must produce
+/// byte-identical wire *and* the same generated emitter list in the same order. The
+/// zero-repack path writes the packed palette directly when the stored section is clean
+/// and hidden-free; the fallback unpacks it and calls `section_encode_into`. An edit +
+/// revert restores every cell but leaves `is_clean_wire() == false`, which is exactly the
+/// condition that forces the fallback. Kept deterministic (no worldgen) because the
+/// feature layer's population order makes two full deliveries of the same bytes differ.
+#[test]
+fn chunk_data_opt_zero_repack_matches_legacy_wire_and_gen_sources() {
+    let Some(reg) = breg() else {
+        return;
+    };
+    let biomes: [i64; 64] = std::array::from_fn(|i| (i % 7) as i64);
+    let emitter = (0..2000u32)
+        .find(|&st| reg.luminance_of(st) > 0 && !is_hidden(st))
+        .expect("a non-hidden luminous block state");
+
+    let mut states = [0u32; 4096];
+    for (idx, st) in [
+        (0usize, 1u32),
+        (17, 2),
+        (100, emitter),
+        (257, emitter),
+        (2000, 3),
+        (4095, emitter),
+    ] {
+        states[idx] = st;
+    }
+    let clean = pack_section(&states);
+    assert!(clean.is_clean_wire());
+    assert!(!clean.has_hidden(), "the test needs a hidden-free section");
+    assert!(clean.any_palette_entry(|st| reg.luminance_of(st) > 0));
+
+    // The delivery path records generated emitters in exact (ly, lz, lx) order.
+    let origin = (32i32, -64i32, -16i32);
+    let record = |states: &[u32; 4096]| -> Vec<((i32, i32, i32), u8)> {
+        let mut out = Vec::new();
+        for ly in 0..16 {
+            for lz in 0..16 {
+                for lx in 0..16 {
+                    let gen = states[(ly << 8) | (lz << 4) | lx];
+                    let lum = reg.luminance_of(gen);
+                    if lum > 0 {
+                        out.push((
+                            (
+                                origin.0 + lx as i32,
+                                origin.1 + ly as i32,
+                                origin.2 + lz as i32,
+                            ),
+                            lum,
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    // Zero-repack path: write straight from the packed palette, then take the
+    // palette-gated emitter scan only when the section actually has an emitter.
+    let mut clean_wire = Vec::new();
+    let mut clean_sources: Vec<((i32, i32, i32), u8)> = Vec::new();
+    clean.write_wire(&biomes, &mut clean_wire);
+    if clean.any_palette_entry(|st| reg.luminance_of(st) > 0) {
+        let mut unpacked = [0u32; 4096];
+        clean.unpack_into(&mut unpacked);
+        clean_sources = record(&unpacked);
+    }
+    assert_eq!(clean_sources.len(), 3, "the fixture needs three emitters");
+
+    // Fallback path: a temporary state grows the palette, reverting restores every cell
+    // but leaves the wire dirty, and the legacy encoder writes the unpacked states.
+    let mut dirty = clean.clone();
+    let is_opaque = |st: u32| reg.opacity_of(st) == 15;
+    let is_hid = |st: u32| is_hidden(st);
+    dirty.set(100, 4242, &is_opaque, &is_hid);
+    dirty.set(100, states[100], &is_opaque, &is_hid);
+    assert!(!dirty.is_clean_wire());
+    let mut arr = [0u32; 4096];
+    dirty.unpack_into(&mut arr);
+    assert_eq!(arr, states, "revert must restore every cell");
+
+    let mut legacy_wire = Vec::new();
+    section_encode_into(&mut legacy_wire, &arr, &biomes);
+    let legacy_sources = record(&arr);
+
+    assert_eq!(clean_wire, legacy_wire, "zero-repack wire is not byte-identical");
+    assert_eq!(clean_sources, legacy_sources, "GenSources order/content differs");
+
+    // No emitters: `any_palette_entry` skips the scan and both paths record nothing,
+    // yet the wire is still identical.
+    let plain = [1u32; 4096];
+    let plain_sec = pack_section(&plain);
+    assert!(!plain_sec.any_palette_entry(|st| reg.luminance_of(st) > 0));
+    let mut plain_wire = Vec::new();
+    plain_sec.write_wire(&biomes, &mut plain_wire);
+    assert_eq!(plain_wire, section_encode(&plain, &biomes));
+}
+
+/// The O(1) `opacity_windowed` shortcut returns a constant for `Empty`/`Opaque` sections;
+/// this pins the invariant that makes that exact: those classes really are uniform 0 / 15
+/// under the pinned block registry's `opacity_of`.
+#[test]
+fn section_light_class_answers_are_exactly_uniform_opacity() {
+    let Some(reg) = breg() else {
+        return;
+    };
+    let air = pack_section(&[0u32; 4096]);
+    assert_eq!(air.light_class(), SectionLightClass::Empty);
+    assert!(air.any_palette_entry(|st| reg.opacity_of(st) == 0));
+    assert!(!air.any_palette_entry(|st| reg.opacity_of(st) == 15));
+
+    let solid = (0..2000u32)
+        .find(|&st| reg.opacity_of(st) == 15)
+        .expect("an opaque block state");
+    let opaque = pack_section(&[solid; 4096]);
+    assert_eq!(opaque.light_class(), SectionLightClass::Opaque);
+    assert!(opaque.any_palette_entry(|st| reg.opacity_of(st) == 15));
+    assert!(!opaque.any_palette_entry(|st| reg.opacity_of(st) == 0));
+
+    let mut mixed = [0u32; 4096];
+    mixed[123] = solid;
+    let mixed = pack_section(&mixed);
+    assert_eq!(mixed.light_class(), SectionLightClass::Mixed);
+    assert_eq!(reg.opacity_of(mixed.get(123)), 15);
+    assert_eq!(reg.opacity_of(mixed.get(0)), 0);
+}

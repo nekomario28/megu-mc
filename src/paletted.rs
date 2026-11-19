@@ -31,6 +31,12 @@ pub(crate) struct PalettedSection {
     non_air: u16,
     all_opaque: bool,
     has_hidden: bool,
+    /// True only while this section's palette is exactly the one `section_encode` would
+    /// pick for its cells. `set()` never removes unused palette entries, so an edited
+    /// section can no longer be written verbatim; the caller must fall back to the
+    /// per-cell encoder in that case. Unmodified sections are byte-identical to
+    /// `section_encode` (proved by `run_paletted_bench` over 10,000+ real sections).
+    clean_wire: bool,
 }
 
 #[inline]
@@ -199,6 +205,7 @@ impl PalettedSection {
                 non_air: if is_air_state(first) { 0 } else { 4096 },
                 all_opaque: is_opaque(first),
                 has_hidden: is_hidden(first),
+                clean_wire: true,
             };
         }
 
@@ -277,6 +284,7 @@ impl PalettedSection {
                 non_air,
                 all_opaque,
                 has_hidden,
+                clean_wire: true,
             };
         }
 
@@ -301,6 +309,20 @@ impl PalettedSection {
             non_air,
             all_opaque,
             has_hidden,
+            clean_wire: true,
+        }
+    }
+
+    /// O(1) constructor for a uniform section. No `[u32; 4096]` stack array and no
+    /// 4096-cell scan: the all-air / all-stone fast path in `chunk_data_opt` needs only
+    /// the palette header to write byte-identical wire.
+    pub(crate) fn single(st: u32, is_opaque: bool, is_hidden: bool) -> Self {
+        Self {
+            states: SectionPalette::Single(st),
+            non_air: if is_air_state(st) { 0 } else { 4096 },
+            all_opaque: is_opaque,
+            has_hidden: is_hidden,
+            clean_wire: true,
         }
     }
 
@@ -318,7 +340,6 @@ impl PalettedSection {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn set(
         &mut self,
         idx: usize,
@@ -331,6 +352,10 @@ impl PalettedSection {
         if old == st {
             return;
         }
+        // The palette is now a superset of the minimal one `section_encode` would pick:
+        // unused entries are never reclaimed. Writing this section verbatim would no
+        // longer be byte-identical, so the caller must take the repack path.
+        self.clean_wire = false;
         match (is_air_state(old), is_air_state(st)) {
             (true, false) => self.non_air += 1,
             (false, true) => self.non_air -= 1,
@@ -398,7 +423,6 @@ impl PalettedSection {
         }
     }
 
-    #[allow(dead_code)]
     fn compute_all_opaque(&self, is_opaque: &impl Fn(u32) -> bool) -> bool {
         match &self.states {
             SectionPalette::Single(st) => is_opaque(*st),
@@ -439,7 +463,6 @@ impl PalettedSection {
         }
     }
 
-    #[allow(dead_code)]
     fn compute_has_hidden(&self, is_hidden: &impl Fn(u32) -> bool) -> bool {
         match &self.states {
             SectionPalette::Single(st) => is_hidden(*st),
@@ -485,13 +508,11 @@ impl PalettedSection {
         self.non_air
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn has_hidden(&self) -> bool {
         self.has_hidden
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn light_class(&self) -> SectionLightClass {
         if self.non_air == 0 {
@@ -503,7 +524,6 @@ impl PalettedSection {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_uniform(&self) -> Option<u32> {
         match &self.states {
             SectionPalette::Single(st) => Some(*st),
@@ -526,6 +546,70 @@ impl PalettedSection {
                 } else {
                     None
                 }
+            }
+        }
+    }
+
+    /// Whether `write_wire` still produces exactly what `section_encode` would for this
+    /// section's cells. Only `set()` clears it; every constructor starts clean.
+    #[inline]
+    pub(crate) fn is_clean_wire(&self) -> bool {
+        self.clean_wire
+    }
+
+    /// Test the section's *palette* instead of scanning all 4096 cells. `Single`/`Indirect`
+    /// enumerate their distinct states; `Direct` has no local palette, so it answers
+    /// conservatively `true` and the caller must scan the cells. This is what lets the
+    /// delivery path skip a full-cell luminance scan in sections with no emitters.
+    pub(crate) fn any_palette_entry(&self, mut pred: impl FnMut(u32) -> bool) -> bool {
+        match &self.states {
+            SectionPalette::Single(st) => pred(*st),
+            SectionPalette::Indirect { entries, .. } => entries.iter().any(|&st| pred(st)),
+            SectionPalette::Direct { .. } => true,
+        }
+    }
+
+    /// Expand this section into the caller's stack array, with one fast path per
+    /// representation. Used by the delivery fallback, which has to feed the legacy
+    /// per-cell encoder an ordinary `[u32; 4096]`.
+    pub(crate) fn unpack_into(&self, out: &mut [u32; 4096]) {
+        match &self.states {
+            SectionPalette::Single(st) => out.fill(*st),
+            SectionPalette::Indirect {
+                bits,
+                entries,
+                words,
+            } => {
+                for (idx, cell) in out.iter_mut().enumerate() {
+                    *cell = entries[indirect_get_word(*bits, words, idx)];
+                }
+            }
+            SectionPalette::Direct { words } => {
+                for (idx, cell) in out.iter_mut().enumerate() {
+                    *cell = packed_get::<15>(words, idx);
+                }
+            }
+        }
+    }
+
+    /// Copy `ly_count` contiguous y-rows (`[ly0, ly0 + ly_count)`) into `dst`, whose
+    /// length must be at least `ly_count * 256`. This is the `install_band_rows` shape:
+    /// it copies only the rows a band overlaps, and a uniform section is a single
+    /// `fill` rather than a 4096-cell unpack.
+    pub(crate) fn copy_y_slice(&self, ly0: usize, ly_count: usize, dst: &mut [u32]) {
+        let need = ly_count * 256;
+        assert!(dst.len() >= need, "copy_y_slice destination too small");
+        if ly_count == 0 {
+            return;
+        }
+        if let Some(st) = self.is_uniform() {
+            dst[..need].fill(st);
+            return;
+        }
+        for ly in ly0..ly0 + ly_count {
+            let row = (ly - ly0) * 256;
+            for i in 0..256usize {
+                dst[row + i] = self.get((ly << 8) | i);
             }
         }
     }
@@ -1017,5 +1101,67 @@ mod paletted_tests {
             }
         }
         assert_eq!(total_sections, 2048);
+    }
+
+    #[test]
+    fn paletted_single_clean_wire_and_bulk_copy_helpers() {
+        let biomes: [i64; 64] = std::array::from_fn(|i| (i % 5) as i64);
+        for st in [0u32, 1u32, 12958u32, 20_000u32] {
+            let states = [st; 4096];
+            let packed = PalettedSection::pack(&states, &|_| false, &|_| false);
+            let single = PalettedSection::single(st, false, false);
+            assert_eq!(single.get(0), st);
+            assert_eq!(single.get(4095), st);
+            assert_eq!(single.non_air(), packed.non_air());
+            assert_eq!(single.is_uniform(), Some(st));
+            assert!(single.is_clean_wire());
+
+            let mut from_single = Vec::new();
+            let mut from_pack = Vec::new();
+            single.write_wire(&biomes, &mut from_single);
+            packed.write_wire(&biomes, &mut from_pack);
+            assert_eq!(from_single, from_pack);
+            assert_eq!(from_single, section_encode(&states, &biomes));
+
+            let mut out = [0u32; 4096];
+            single.unpack_into(&mut out);
+            assert_eq!(out, states);
+            let mut slice = [0u32; 512];
+            single.copy_y_slice(3, 2, &mut slice);
+            assert!(slice.iter().all(|&v| v == st));
+        }
+
+        // `any_palette_entry` consults the palette, never the cells.
+        let mut states = [0u32; 4096];
+        states[100] = 7;
+        states[200] = 9;
+        let mut sec = PalettedSection::pack(&states, &|_| false, &|_| false);
+        assert!(sec.any_palette_entry(|s| s == 7));
+        assert!(sec.any_palette_entry(|s| s == 9));
+        assert!(!sec.any_palette_entry(|s| s == 8));
+        assert!(!sec.any_palette_entry(|s| s > 100));
+
+        let mut out = [0u32; 4096];
+        sec.unpack_into(&mut out);
+        assert_eq!(out, states);
+        let mut rows = [0u32; 768];
+        sec.copy_y_slice(1, 3, &mut rows);
+        for (i, &v) in rows.iter().enumerate() {
+            assert_eq!(v, states[256 + i]);
+        }
+
+        // An edit + revert restores the cells but NOT the wire: the palette kept the
+        // temporary entry, so `is_clean_wire()` stays false and the caller must repack.
+        assert!(sec.is_clean_wire());
+        sec.set(100, 8, &|_| false, &|_| false);
+        assert!(!sec.is_clean_wire());
+        sec.set(100, 7, &|_| false, &|_| false);
+        assert!(!sec.is_clean_wire());
+        sec.unpack_into(&mut out);
+        assert_eq!(out, states);
+        let mut dirty = Vec::new();
+        sec.write_wire(&biomes, &mut dirty);
+        assert_ne!(dirty, section_encode(&states, &biomes));
+        assert_eq!(decode_wire_section(&dirty).1, states);
     }
 }
