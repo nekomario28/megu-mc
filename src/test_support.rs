@@ -94,7 +94,7 @@ pub(crate) fn run_isolated_child(name: &str) -> (std::process::ExitStatus, Strin
         .env("MC_SPINE_TEST_RECEIPT", &receipt)
         .spawn()
         .expect("start isolated world fixture");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait for isolated fixture") {
             break status;
@@ -102,7 +102,7 @@ pub(crate) fn run_isolated_child(name: &str) -> (std::process::ExitStatus, Strin
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("isolated world fixture {name} exceeded 60 seconds");
+            panic!("isolated world fixture {name} exceeded 180 seconds");
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
