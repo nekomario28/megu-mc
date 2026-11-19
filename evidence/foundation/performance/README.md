@@ -1057,3 +1057,66 @@ current id does, and the identity tests would then disagree with the reference f
 reason. `sky_spill` keeps its seed at every column's `floor + 1`, including the one case where that
 cell is above the build limit: the seed is part of the payload even though the spread cannot enter
 from it, and the build-limit scene above pins it.
+
+
+## Layer A1-a: chunk-local aquifer grid, `Vec::remove(0)` eradication (2026-11-19)
+
+`src/worldgen.rs` only, base `8dad8c7`. The aquifer's two SipHash caches
+(`aq_near`: 16,384-key cell→position, `aq_lv`: cell→level) and three FIFO vectors
+whose eviction used `Vec::remove(0)` (the 16,384-element `aq_neo`/`aq_lvo`, plus the
+128-element `col_ord`) are replaced by a 4-slot MRU ring of chunk-local flat grids:
+3×35×3 cells (~315) with `rpos`/`levels` at the **same flat index**, because
+`aq_rpos(g)` returns `g*16+r_x, g*12+r_y, g*16+r_z` with `r_x,r_z < 16`, `r_y < 12`.
+`aq_near4` now tracks only the three slots `computeSubstance` actually reads, reuses
+their squared distances, and reads levels by flat index. All seven `*.remove(0)`
+FIFO caches on `Gen` (`prelim_ord`, `col_ord` ×2, `feat_ord`, `aq_neo`, `aq_lvo`,
+`clim_ord`) are `VecDeque::pop_front()`. `aq_trace_at` is hoisted to one call per
+`aq_state` instead of one per return branch.
+
+### Identity
+
+64-chunk `MC_SPINE_WG_DUMP_N=8`, seed 0, `jobs=1` and `jobs=5`, **three interleaved
+runs per arm**, base binary vs this tree — byte for byte, 25,165,824 B each:
+
+| arm | sha256 |
+|---|---|
+| `full` | `670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def` |
+| `MC_SPINE_NOFEAT=1` | `57101c434d49edf21f7efdd4207beca8cae34ff74cbf4ffdc009b680cb5d5a48` |
+| `+MC_SPINE_NOCARVE=1` | `bb499dfb6c53128734a23f8722534a5f1882e7acbb53a9885a604ce74352beff` |
+
+Additional A/B dumps (base vs this tree, identical sha256 each): Nether seed 4242
+`7b670c1c9f5a84c2cb…`, End seed 0 `cf3dd31540d1d57e…`, negative-origin Overworld
+`(-32,-48)` `4cc379fd8dc83828…`, negative-origin Nether `(-19,7)`
+`dcb9feee6a1c7eeb…`. `m3_counters_are_deterministic_across_runs` and the three new
+`a1a_aq_*` tests (dense uncached differential, flat-index geometry, tie-break) are
+green; breaking `idx`'s flat index or `>=`→`>` in `aq_near3` turns them red.
+
+### Measurement
+
+Same 64-chunk dump, `CPUQuota=250%`, `MemoryMax=3G`, base vs this tree, three
+interleaved runs per configuration. Wall/CPU medians (s), `base → after`:
+
+| arm | jobs=1 wall / CPU | jobs=5 wall / CPU |
+|---|---|---|
+| `full` | 8.061 / 8.025 → 7.291 / 7.253 (−9.6% / −9.6%) | 5.929 / 7.857 → 5.499 / 7.024 (−7.3% / −10.6%) |
+| `NOFEAT` | 3.850 / 3.829 → 3.150 / 3.125 (−18.2% / −18.4%) | 1.952 / 3.605 → 1.642 / 2.905 (−15.9% / −19.4%) |
+| `terrain` | 2.233 / 2.212 → 1.618 / 1.602 (−27.5% / −27.6%) | 0.871 / 2.162 → 0.639 / 1.541 (−26.6% / −28.7%) |
+
+`MC_SPINE_M3_PROFILE=1`, `M5 fill` ms: `NOFEAT` **1433.9 → 784.6** (jobs=1, −45.3%)
+and **2215.6 → 793.6** (jobs=5, −64.2%); `full` jobs=5 **1868.6 → 800.2** (−57.2%).
+The feature-side `aqlv hit/miss` counters move 277401/1280 → 270354/8327 (the ring
+recomputes more levels at chunk boundaries) but stay deterministic; the hash misses
+and the 16,384-element memmove are gone from every hot cell.
+
+```sh
+BASE=/home/yuu/mc-spine/target/tmp/mc-spine-a1a-base   # saved at base 8dad8c7
+for jobs in 1 5; do
+  for arm in "" MC_SPINE_NOFEAT=1 "MC_SPINE_NOFEAT=1 MC_SPINE_NOCARVE=1"; do
+    systemd-run --user --scope -p CPUQuota=250% -p MemoryMax=3G --collect \
+      env MC_SPINE_SEED=0 MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP=$D/d.bin \
+          MC_SPINE_WG_DUMP_N=8 MC_SPINE_GEN_JOBS=$jobs $arm ./target/release/mc-spine
+    sha256sum "$D/d.bin"
+  done
+done
+MC_SPINE_M3_PROFILE=1 MC_SPINE_NOFEAT=1 MC_SPINE_GEN_JOBS=1 ./target/release/mc-spine 2>&1 | grep M5
+```

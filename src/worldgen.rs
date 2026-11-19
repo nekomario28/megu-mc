@@ -837,23 +837,25 @@ pub struct Gen {
     pub(crate) data: std::sync::Arc<GenData>,
     // scratch memo for the vein sampler's density evaluations
     memo: HashMap<(usize, i32, i32, i32), f64>,
-    aq_lv: HashMap<(i32, i32, i32), (i32, u8)>,
-    aq_lvo: Vec<(i32, i32, i32)>,
-    aq_near: HashMap<(i32, i32, i32), (i32, i32, i32)>,
-    aq_neo: Vec<(i32, i32, i32)>,
+    /// Chunk-local aquifer grids (see [`AqChunkCache`]). A small MRU ring rather than a
+    /// single slot: carvers and features read neighbour chunks while a chunk is being
+    /// filled, and a one-slot cache would recompute the same 12-cell neighbourhood.
+    aq_chunk: [Option<AqChunkCache>; AQ_CHUNK_SLOTS],
+    aq_chunk_use: [u64; AQ_CHUNK_SLOTS],
+    aq_chunk_tick: u64,
     prelim_c: HashMap<(i32, i32), i32>,
     /// per chunk: the distinct biomes of its section palettes, i.e. what vanilla's
     /// `applyBiomeDecoration` unions over the 3x3 before deciding which features run
     chunk_biomes: HashMap<(i32, i32), std::sync::Arc<Vec<String>>>,
     chunk_biomes_ord: std::collections::VecDeque<(i32, i32)>,
-    prelim_ord: Vec<(i32, i32)>,
+    prelim_ord: std::collections::VecDeque<(i32, i32)>,
     clim_c: HashMap<(i32, i32), ([i64; 5], f64)>,
-    clim_ord: Vec<(i32, i32)>,
+    clim_ord: std::collections::VecDeque<(i32, i32)>,
     // Surface-rule biome leaf cache; Nether's fuzzy source keys actual blocks.
     bioq: HashMap<(i32, i32, i32), u16>,
     bioq_ord: std::collections::VecDeque<(i32, i32, i32)>,
     col_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
-    col_ord: Vec<(i32, i32)>,
+    col_ord: std::collections::VecDeque<(i32, i32)>,
     /// The parallel terrain round this generator belongs to, if any: selects that round's
     /// shared structure-start cache instead of the thread-local one. `Gen` cannot name the
     /// cache's type (it lives above this layer), so the round is a number here; see
@@ -896,7 +898,7 @@ pub struct Gen {
     /// this generator's lock is released (see `block_state`), never kept as a second
     /// live store.
     staged_payloads: Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>,
-    feat_ord: Vec<(i32, i32)>,
+    feat_ord: std::collections::VecDeque<(i32, i32)>,
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
     pop_done: HashSet<(i32, i32)>,
@@ -1882,6 +1884,8 @@ pub(crate) struct CarveStage {
 }
 
 /// `AQ_TRACE="<cx>,<cz>"` prints the aquifer's decision terms for that chunk.
+/// Warm cost is one `OnceLock` atomic load; callers hoist it out of the hot path
+/// so each `aq_state` call pays it once rather than at every return branch.
 fn aq_trace_at(x: i32, z: i32) -> bool {
     use std::sync::OnceLock;
     static SPEC: OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
@@ -2155,20 +2159,19 @@ impl Gen {
                 world_seed: seed,
                 dfprog: None,
             }),
-            aq_lv: HashMap::new(),
-            aq_lvo: Vec::new(),
-            aq_near: HashMap::new(),
-            aq_neo: Vec::new(),
+            aq_chunk: std::array::from_fn(|_| None),
+            aq_chunk_use: [0; AQ_CHUNK_SLOTS],
+            aq_chunk_tick: 0,
             prelim_c: HashMap::new(),
             chunk_biomes: HashMap::new(),
             chunk_biomes_ord: std::collections::VecDeque::new(),
-            prelim_ord: Vec::new(),
+            prelim_ord: std::collections::VecDeque::new(),
             clim_c: HashMap::new(),
-            clim_ord: Vec::new(),
+            clim_ord: std::collections::VecDeque::new(),
             bioq: HashMap::new(),
             bioq_ord: std::collections::VecDeque::new(),
             col_c: HashMap::new(),
-            col_ord: Vec::new(),
+            col_ord: std::collections::VecDeque::new(),
             starts_round: None,
             base_c: HashMap::new(),
             base_ord: std::collections::VecDeque::new(),
@@ -2181,7 +2184,7 @@ impl Gen {
             terr_pending: std::collections::BTreeSet::new(),
             feat_c: HashMap::new(),
             staged_payloads: Vec::new(),
-            feat_ord: Vec::new(),
+            feat_ord: std::collections::VecDeque::new(),
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
@@ -5007,9 +5010,9 @@ impl Gen {
             None => i32::MAX,
         };
         self.prelim_c.insert(k, v);
-        self.prelim_ord.push(k);
+        self.prelim_ord.push_back(k);
         if self.prelim_ord.len() > 8192 {
-            let old = self.prelim_ord.remove(0);
+            let old = self.prelim_ord.pop_front().unwrap();
             self.prelim_c.remove(&old);
         }
         v
@@ -6284,20 +6287,19 @@ impl Gen {
         Gen {
             data,
             memo: HashMap::new(),
-            aq_lv: HashMap::new(),
-            aq_lvo: Vec::new(),
-            aq_near: HashMap::new(),
-            aq_neo: Vec::new(),
+            aq_chunk: std::array::from_fn(|_| None),
+            aq_chunk_use: [0; AQ_CHUNK_SLOTS],
+            aq_chunk_tick: 0,
             prelim_c: HashMap::new(),
             chunk_biomes: HashMap::new(),
             chunk_biomes_ord: std::collections::VecDeque::new(),
-            prelim_ord: Vec::new(),
+            prelim_ord: std::collections::VecDeque::new(),
             clim_c: HashMap::new(),
-            clim_ord: Vec::new(),
+            clim_ord: std::collections::VecDeque::new(),
             bioq: HashMap::new(),
             bioq_ord: std::collections::VecDeque::new(),
             col_c: HashMap::new(),
-            col_ord: Vec::new(),
+            col_ord: std::collections::VecDeque::new(),
             starts_round: None,
             base_c: HashMap::new(),
             base_ord: std::collections::VecDeque::new(),
@@ -6310,7 +6312,7 @@ impl Gen {
             terr_pending: std::collections::BTreeSet::new(),
             feat_c: HashMap::new(),
             staged_payloads: Vec::new(),
-            feat_ord: Vec::new(),
+            feat_ord: std::collections::VecDeque::new(),
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
@@ -6346,9 +6348,9 @@ impl Gen {
             if self.col_c.contains_key(&(cx, cz)) {
                 continue;
             }
-            self.col_ord.push((cx, cz));
+            self.col_ord.push_back((cx, cz));
             if self.col_ord.len() > 128 {
-                let old = self.col_ord.remove(0);
+                let old = self.col_ord.pop_front().unwrap();
                 self.col_c.remove(&old);
             }
             self.col_c.insert((cx, cz), arc);
@@ -6736,9 +6738,9 @@ impl Gen {
         // (structure-free) answer on purpose, and must not be cached: the same chunk's
         // final columns need the structure data this build could not ask for.
         if self.beard_depth == 0 {
-            self.col_ord.push((cx, cz));
+            self.col_ord.push_back((cx, cz));
             if self.col_ord.len() > 128 {
-                let old = self.col_ord.remove(0);
+                let old = self.col_ord.pop_front().unwrap();
                 self.col_c.remove(&old);
             }
             self.col_c.insert((cx, cz), arc.clone());
@@ -7540,7 +7542,7 @@ impl Gen {
         }
         // bound the override maps (LRU over chunks)
         while self.feat_ord.len() > FEATURE_BUCKET_BOUND {
-            let old = self.feat_ord.remove(0);
+            let old = self.feat_ord.pop_front().unwrap();
             self.forget_feature_bucket(old);
         }
         let k = ((y - self.min_y) as u32) << 8 | (((z & 15) as u32) << 4) | (x & 15) as u32;
@@ -7905,7 +7907,7 @@ impl Gen {
         let key = (x >> 4, z >> 4);
         let k = ((y - self.min_y) as u32) << 8 | (((z & 15) as u32) << 4) | (x & 15) as u32;
         if !self.feat_c.contains_key(&key) {
-            self.feat_ord.push(key);
+            self.feat_ord.push_back(key);
         }
         self.feat_c.entry(key).or_default().insert(k, st);
     }
@@ -8390,6 +8392,91 @@ fn lxz(v: i32) -> i32 {
 fn ly12(v: i32) -> i32 {
     v.div_euclid(12)
 }
+
+/// Chunk-local aquifer grids kept on a generator. A terrain fill walks one chunk
+/// densely while carvers/features probe its neighbours, so a small ring avoids both
+/// a single-slot thrash and a global hash lookup on every cell.
+const AQ_CHUNK_SLOTS: usize = 4;
+
+/// The whole 12-cell neighbourhood of every block in a chunk fits in a flat grid:
+/// `sx = lxz(x-5)` is `cx-1..=cx` and `sz = lxz(z-5)` is `cz-1..=cz`, so the sampled
+/// cells span `gx ∈ [cx-1, cx+1]`, `gz ∈ [cz-1, cz+1]`; `sy = ly12(y+1)` spans
+/// `ly12(min_y+1)..=ly12(min_y+height)`, so `gy = sy + dy` spans
+/// `ly12(min_y+1)-1..=ly12(min_y+height)+1`. That is 3×35×3 cells in the Overworld
+/// (~4 KiB of positions, ~3 KiB of levels — both L1-resident).
+///
+/// `aq_rpos(gx,gy,gz)` returns `(gx*16 + r_x, gy*12 + r_y, gz*16 + r_z)` with
+/// `r_x, r_z < 16` and `r_y < 12`, so `rx.div_euclid(16) == gx` (likewise Y/Z):
+/// the fluid level of a cell's own sample position belongs at that cell's flat
+/// index. Both arrays are therefore indexed by the same cell index, populated
+/// lazily: sparse neighbour probes do not pay for all 315 sample positions, while
+/// a dense fill pays one bounds check and a direct array index per cell.
+struct AqChunkCache {
+    cx: i32,
+    cz: i32,
+    min_gx: i32,
+    min_gy: i32,
+    min_gz: i32,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    /// `aq_rpos` for each cell, filled on first probe.
+    rpos: Vec<Option<(i32, i32, i32)>>,
+    /// `aq_fluid_level_at` for the same cell's sample position, filled on first read.
+    levels: Vec<Option<(i32, u8)>>,
+}
+
+impl AqChunkCache {
+    fn new(cx: i32, cz: i32, min_y: i32, height: i32) -> Self {
+        let min_gx = lxz(cx * 16 - 5);
+        let max_gx = lxz(cx * 16 + 15 - 5) + 1;
+        let min_gz = lxz(cz * 16 - 5);
+        let max_gz = lxz(cz * 16 + 15 - 5) + 1;
+        let min_gy = ly12(min_y + 1) - 1;
+        let max_gy = ly12(min_y + height) + 1;
+        let nx = (max_gx - min_gx + 1) as usize;
+        let ny = (max_gy - min_gy + 1) as usize;
+        let nz = (max_gz - min_gz + 1) as usize;
+        let n = nx * ny * nz;
+        Self {
+            cx,
+            cz,
+            min_gx,
+            min_gy,
+            min_gz,
+            nx,
+            ny,
+            nz,
+            rpos: vec![None; n],
+            levels: vec![None; n],
+        }
+    }
+
+    #[inline]
+    fn contains(&self, gx: i32, gy: i32, gz: i32) -> bool {
+        gx >= self.min_gx
+            && gx < self.min_gx + self.nx as i32
+            && gy >= self.min_gy
+            && gy < self.min_gy + self.ny as i32
+            && gz >= self.min_gz
+            && gz < self.min_gz + self.nz as i32
+    }
+
+    #[inline]
+    fn idx(&self, gx: i32, gy: i32, gz: i32) -> usize {
+        let i = (gx - self.min_gx) as usize;
+        let j = (gy - self.min_gy) as usize;
+        let k = (gz - self.min_gz) as usize;
+        ((j * self.nz) + k) * self.nx + i
+    }
+}
+
+/// The three nearest aquifer nodes of a query block: `(position, squared distance,
+/// flat cell index)`. The vanilla selection keeps four slots, but slot 4 is never
+/// read: the final `>=` branch only writes it and no caller of `aq_near4` observes
+/// it. Keeping three produces the exact same `near[0..3]`.
+type AqNear = [((i32, i32, i32), i64, usize); 3];
+
 // fluid level = (max_y exclusive, kind); kind: 1=water, 2=lava
 impl Gen {
     #[inline]
@@ -8424,7 +8511,7 @@ impl Gen {
         for dx in 0..=1 {
             for dy in -1..=1 {
                 for dz in 0..=1 {
-                    let (px, py, pz) = self.aq_rpos_c(sx + dx, sy + dy, sz + dz);
+                    let (px, py, pz) = self.aq_rpos(sx + dx, sy + dy, sz + dz);
                     eprintln!(
                         "APOS {} {} {} {} {} {}",
                         sx + dx,
@@ -8446,83 +8533,145 @@ impl Gen {
             gz * 16 + r.next_bound(10),
         )
     }
-    // per-cell random position, cached per cell (pumpkin packed_positions)
-    fn aq_rpos_c(&mut self, gx: i32, gy: i32, gz: i32) -> (i32, i32, i32) {
-        let key = (gx, gy, gz);
-        if let Some(&v) = self.aq_near.get(&key) {
-            return v;
-        }
-        let v = self.aq_rpos(gx, gy, gz);
-        self.aq_near.insert(key, v);
-        self.aq_neo.push(key);
-        if self.aq_neo.len() > 16384 {
-            let old = self.aq_neo.remove(0);
-            self.aq_near.remove(&old);
-        }
-        v
+    #[inline]
+    fn aq_cache(&self, slot: usize) -> &AqChunkCache {
+        self.aq_chunk[slot].as_ref().unwrap()
     }
-    // 12 neighbor-cell random positions -> 4 nearest positions to (x,y,z)
-    // (vanilla sorts per query point — result depends on (x,y,z), not just cell)
-    /// `NoiseBasedAquifer.computeSubstance` nearest-four selection.
-    ///
-    /// Bytecode order is x outer, y middle, z inner (`dx 0..1`, `dy -1..1`,
-    /// `dz 0..1`) and every comparison is `>=`, i.e. on a tie the *later*
-    /// cell is inserted in front and the earlier one shifts down. Symmetric
-    /// cells tie often, and which cells land in slots 2/3 picks the pairs the
-    /// three pressure tests use, so the tie rule is observable.
-    fn aq_near4(&mut self, x: i32, y: i32, z: i32) -> [(i32, i32, i32); 4] {
-        let sx = lxz(x - 5);
-        let sy = ly12(y + 1);
-        let sz = lxz(z - 5);
-        let mut near = [((0, 0, 0), i64::MAX); 4];
-        for dx in 0..=1 {
-            for dy in -1..=1 {
-                for dz in 0..=1 {
-                    let (px, py, pz) = self.aq_rpos_c(sx + dx, sy + dy, sz + dz);
-                    let (ex, ey, ez) = (px - x, py - y, pz - z);
-                    let h = ex as i64 * ex as i64 + ey as i64 * ey as i64 + ez as i64 * ez as i64;
-                    let p = ((px, py, pz), h);
-                    if near[0].1 >= h {
-                        near[3] = near[2];
-                        near[2] = near[1];
-                        near[1] = near[0];
-                        near[0] = p;
-                    } else if near[1].1 >= h {
-                        near[3] = near[2];
-                        near[2] = near[1];
-                        near[1] = p;
-                    } else if near[2].1 >= h {
-                        near[3] = near[2];
-                        near[2] = p;
-                    } else if near[3].1 >= h {
-                        near[3] = p;
-                    }
-                }
+    #[inline]
+    fn aq_cache_mut(&mut self, slot: usize) -> &mut AqChunkCache {
+        self.aq_chunk[slot].as_mut().unwrap()
+    }
+    /// MRU slot holding `(cx, cz)`'s chunk-local grid. The reuse order is a pure
+    /// function of the access sequence, so both bytes and counters stay repeatable.
+    fn aq_chunk_slot(&mut self, cx: i32, cz: i32) -> usize {
+        let tick = self.aq_chunk_tick.wrapping_add(1);
+        self.aq_chunk_tick = tick;
+        for (i, c) in self.aq_chunk.iter().enumerate() {
+            if c.as_ref().is_some_and(|c| c.cx == cx && c.cz == cz) {
+                self.aq_chunk_use[i] = tick;
+                return i;
             }
         }
-        [near[0].0, near[1].0, near[2].0, near[3].0]
+        let mut victim = 0;
+        for i in 1..AQ_CHUNK_SLOTS {
+            if self.aq_chunk[i].is_none() {
+                victim = i;
+                break;
+            }
+            if self.aq_chunk_use[i] < self.aq_chunk_use[victim] {
+                victim = i;
+            }
+        }
+        self.aq_chunk[victim] = Some(AqChunkCache::new(cx, cz, self.data.min_y, self.data.height));
+        self.aq_chunk_use[victim] = tick;
+        victim
     }
-    // FluidLevel (max_y, kind) at a cell-random position, cached per cell
-    // (pumpkin get_water_level). Only ever called with a cell's own random
-    // position — arbitrary positions must use aq_fluid_level_at to avoid
-    // polluting the per-cell cache (pumpkin's get_fluid_level is uncached).
-    fn aq_water_level(&mut self, rx: i32, ry: i32, rz: i32) -> (i32, u8) {
-        // Cache key = the cell the sample position belongs to: vanilla's
-        // `NoiseBasedAquifer.a(long)` keys on `floorDiv(px,16)`, `floorDiv(py,12)`,
-        // `floorDiv(pz,16)` - **without** the `-5/+1` offsets the neighbour
-        // selection uses. Those offsets are not a bijection on positions: a
-        // position with r>=5 in cell c and one with r<5 in cell c+1 land on the
-        // same key, so the two cells would share one level.
-        let key = (rx.div_euclid(16), ry.div_euclid(12), rz.div_euclid(16));
-        let m3_read = m3_on() && m3_in_feature_read();
-        if let Some(&v) = self.aq_lv.get(&key) {
+    /// One cell's sample position, computed once per cell per chunk residency.
+    fn aq_cell_rpos(&mut self, slot: usize, gx: i32, gy: i32, gz: i32) -> (i32, i32, i32) {
+        let idx = self.aq_cache(slot).idx(gx, gy, gz);
+        if let Some(p) = self.aq_cache(slot).rpos[idx] {
+            return p;
+        }
+        let p = self.aq_rpos(gx, gy, gz);
+        self.aq_cache_mut(slot).rpos[idx] = Some(p);
+        p
+    }
+    /// Fluid level at a cell's own sample position, stored at that cell's flat
+    /// index. Keeps the M3 feature-read HIT/MISS counters on the same path as the
+    /// hash cache it replaces.
+    fn aq_cell_level(&mut self, slot: usize, idx: usize, m3_read: bool) -> (i32, u8) {
+        if let Some(v) = self.aq_cache(slot).levels[idx] {
             inc_if(m3_read, M3_AQLV_HIT);
             return v;
         }
         inc_if(m3_read, M3_AQLV_MISS);
+        let (rx, ry, rz) = self.aq_cache(slot).rpos[idx].expect("aq_cell_rpos fills before level");
         let v = self.aq_fluid_level_at(rx, ry, rz);
-        self.aq_lv_ins(key, v);
+        self.aq_cache_mut(slot).levels[idx] = Some(v);
         v
+    }
+    /// Level for one of the three nearest nodes; `None` is the out-of-Y-window
+    /// fallback, which computes directly without populating a chunk grid.
+    fn aq_near_level(
+        &mut self,
+        near: &AqNear,
+        i: usize,
+        slot: Option<usize>,
+        m3_read: bool,
+    ) -> (i32, u8) {
+        let (p, _, idx) = near[i];
+        match slot {
+            Some(slot) => self.aq_cell_level(slot, idx, m3_read),
+            None => {
+                inc_if(m3_read, M3_AQLV_MISS);
+                self.aq_fluid_level_at(p.0, p.1, p.2)
+            }
+        }
+    }
+    /// The three nearest sample positions to `(x,y,z)` in exact bytecode order
+    /// (`dx 0..1`, `dy -1..1`, `dz 0..1`, `>=` inserts in front). `None` means the
+    /// block is outside the generator's Y window, where the caller computes the
+    /// same selection directly instead.
+    fn aq_near3(&mut self, x: i32, y: i32, z: i32) -> Option<(AqNear, usize)> {
+        let (sx, sy, sz) = (lxz(x - 5), ly12(y + 1), lxz(z - 5));
+        let slot = self.aq_chunk_slot(x.div_euclid(16), z.div_euclid(16));
+        if !(self.aq_cache(slot).contains(sx, sy - 1, sz)
+            && self.aq_cache(slot).contains(sx + 1, sy + 1, sz + 1))
+        {
+            return None;
+        }
+        let mut near: AqNear = [((0, 0, 0), i64::MAX, 0); 3];
+        for dx in 0..=1 {
+            for dy in -1..=1 {
+                for dz in 0..=1 {
+                    let (gx, gy, gz) = (sx + dx, sy + dy, sz + dz);
+                    let idx = self.aq_cache(slot).idx(gx, gy, gz);
+                    let (px, py, pz) = self.aq_cell_rpos(slot, gx, gy, gz);
+                    let (ex, ey, ez) = (px - x, py - y, pz - z);
+                    let h = ex as i64 * ex as i64 + ey as i64 * ey as i64 + ez as i64 * ez as i64;
+                    let p = ((px, py, pz), h, idx);
+                    if near[0].1 >= h {
+                        near[2] = near[1];
+                        near[1] = near[0];
+                        near[0] = p;
+                    } else if near[1].1 >= h {
+                        near[2] = near[1];
+                        near[1] = p;
+                    } else if near[2].1 >= h {
+                        near[2] = p;
+                    }
+                }
+            }
+        }
+        Some((near, slot))
+    }
+    /// Uncached selection for the out-of-window fallback: same 12 cells, same `>=`
+    /// tie rule, but sample positions computed directly (the flat index is unused).
+    fn aq_near3_uncached(&self, x: i32, y: i32, z: i32) -> AqNear {
+        let (sx, sy, sz) = (lxz(x - 5), ly12(y + 1), lxz(z - 5));
+        let mut near: AqNear = [((0, 0, 0), i64::MAX, 0); 3];
+        for dx in 0..=1 {
+            for dy in -1..=1 {
+                for dz in 0..=1 {
+                    let (gx, gy, gz) = (sx + dx, sy + dy, sz + dz);
+                    let (px, py, pz) = self.aq_rpos(gx, gy, gz);
+                    let (ex, ey, ez) = (px - x, py - y, pz - z);
+                    let h = ex as i64 * ex as i64 + ey as i64 * ey as i64 + ez as i64 * ez as i64;
+                    let p = ((px, py, pz), h, 0);
+                    if near[0].1 >= h {
+                        near[2] = near[1];
+                        near[1] = near[0];
+                        near[0] = p;
+                    } else if near[1].1 >= h {
+                        near[2] = near[1];
+                        near[1] = p;
+                    } else if near[2].1 >= h {
+                        near[2] = p;
+                    }
+                }
+            }
+        }
+        near
     }
     fn aq_fluid_level_at(&mut self, rx: i32, ry: i32, rz: i32) -> (i32, u8) {
         let def = self.aq_pick(ry);
@@ -8555,14 +8704,6 @@ impl Gen {
         let p = self.aq_fluid_y(rx, ry, rz, def, min_est, bl);
         let kind = self.aq_fluid_kind(rx, ry, rz, def, p);
         (p, kind)
-    }
-    fn aq_lv_ins(&mut self, key: (i32, i32, i32), v: (i32, u8)) {
-        self.aq_lv.insert(key, v);
-        self.aq_lvo.push(key);
-        if self.aq_lvo.len() > 16384 {
-            let old = self.aq_lvo.remove(0);
-            self.aq_lv.remove(&old);
-        }
     }
     fn aq_fluid_y(
         &mut self,
@@ -8887,6 +9028,9 @@ impl Gen {
                 0
             });
         }
+        // One OnceLock load per cell, not one per return branch: tracing is almost
+        // always off, and this is the hottest function in the terrain fill.
+        let trace = aq_trace_at(x, z);
         let (water, lava) = {
             let a = g.aq.as_ref().unwrap();
             (a.water, a.lava_st)
@@ -8895,30 +9039,33 @@ impl Gen {
         let def_blk = Gen::lvl_block(def.0, def.1, y);
         if def_blk == 2 {
             g.aq_sched = false;
-            if aq_trace_at(x, z) {
+            if trace {
                 eprintln!("Aqd {x} {y} {z} d={density} lava");
             }
             return Some(lava);
         }
         g.aq_pos_trace(x, y, z);
-        let near = g.aq_near4(x, y, z);
-        let d = |p: (i32, i32, i32)| -> i64 {
-            let (dx, dy, dz) = (p.0 - x, p.1 - y, p.2 - z);
-            dx as i64 * dx as i64 + dy as i64 * dy as i64 + dz as i64 * dz as i64
+        let (near, slot) = match g.aq_near3(x, y, z) {
+            Some((near, slot)) => (near, Some(slot)),
+            None => (g.aq_near3_uncached(x, y, z), None),
         };
-        let (d0, d1) = (d(near[0]), d(near[1]));
-        let l2 = g.aq_water_level(near[0].0, near[0].1, near[0].2);
+        let m3_read = m3_on() && m3_in_feature_read();
+        // Distances come straight out of the nearest-three selection — no second
+        // `(p - query)` recomputation, and no hash lookup for the levels: each
+        // node's level lives at its own chunk-local flat index.
+        let (d0, d1, d2) = (near[0].1, near[1].1, near[2].1);
+        let l2 = g.aq_near_level(&near, 0, slot, m3_read);
         let blk = Gen::lvl_block(l2.0, l2.1, y);
         let sim12 = 1.0 - (d1 - d0).abs() as f64 / 25.0;
-        if aq_trace_at(x, z) {
+        if trace {
             eprintln!(
             "AQ x={x} y={y} z={z} sim12={sim12:.4} near0={:?} lvl0={:?} near1={:?} lvl1={:?} d0={d0} d1={d1}",
-            near[0], l2, near[1], g.aq_water_level(near[1].0, near[1].1, near[1].2)
+            near[0].0, l2, near[1].0, g.aq_near_level(&near, 1, slot, m3_read)
         );
         }
         if sim12 <= 0.0 {
             g.aq_sched = sim12 >= AQ_FLOWING_UPDATE_SIMULARITY;
-            if aq_trace_at(x, z) {
+            if trace {
                 eprintln!("Aqd {x} {y} {z} d={density} sim {blk} sim12={sim12:.4} l0={l2:?}");
             }
             return Some(match blk {
@@ -8931,31 +9078,30 @@ impl Gen {
         let pb = g.aq_pick(y - 1);
         if blk == 1 && Gen::lvl_block(pb.0, pb.1, y - 1) == 2 {
             g.aq_sched = true;
-            if aq_trace_at(x, z) {
+            if trace {
                 eprintln!("Aqd {x} {y} {z} d={density} lavaunder {blk} sim12={sim12:.4} l0={l2:?}");
             }
             return Some(water);
         }
         let mut barrier = None;
-        let l3 = g.aq_water_level(near[1].0, near[1].1, near[1].2);
+        let l3 = g.aq_near_level(&near, 1, slot, m3_read);
         let c12 = g.aq_calc_density(x, y, z, l2, l3, &mut barrier);
         let (mut c13, mut c23) = (0.0f64, 0.0f64);
         if density + sim12 * c12 > 0.0 {
             g.aq_sched = false;
-            if aq_trace_at(x, z) {
+            if trace {
                 eprintln!("Aqd {x} {y} {z} d={density} null 12 sim={sim12:.4} c12={c12:.4} c13=0 c23=0 l0={:?} l1={:?} l2={:?}", l2, l3, (0, 0));
             }
             return None;
         }
-        let l4 = g.aq_water_level(near[2].0, near[2].1, near[2].2);
-        let d2 = d(near[2]);
+        let l4 = g.aq_near_level(&near, 2, slot, m3_read);
         let sim13 = 1.0 - (d2 - d0).abs() as f64 / 25.0;
         if sim13 > 0.0 {
             c13 = g.aq_calc_density(x, y, z, l2, l4, &mut barrier);
             let b13 = sim12 * sim13 * c13;
             if density + b13 > 0.0 {
                 g.aq_sched = false;
-                if aq_trace_at(x, z) {
+                if trace {
                     eprintln!("Aqd {x} {y} {z} d={density} null 13 sim={sim12:.4} c12={c12:.4} s13={sim13:.4} c13={c13:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
                 }
                 return None;
@@ -8967,14 +9113,14 @@ impl Gen {
             let b23 = sim12 * sim23 * c23;
             if density + b23 > 0.0 {
                 g.aq_sched = false;
-                if aq_trace_at(x, z) {
+                if trace {
                     eprintln!("Aqd {x} {y} {z} d={density} null 23 sim={sim12:.4} s23={sim23:.4} c23={c23:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
                 }
                 return None;
             }
         }
         g.aq_sched = true;
-        if aq_trace_at(x, z) {
+        if trace {
             eprintln!("Aqd {x} {y} {z} d={density} state {blk} sim={sim12:.4} c12={c12:.4} c13={c13:.4} c23={c23:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
         }
         Some(match blk {
@@ -9200,9 +9346,9 @@ impl Gen {
             None => 0.0,
         };
         self.clim_c.insert((qx, qz), (t, off));
-        self.clim_ord.push((qx, qz));
+        self.clim_ord.push_back((qx, qz));
         if self.clim_ord.len() > 4096 {
-            let old = self.clim_ord.remove(0);
+            let old = self.clim_ord.pop_front().unwrap();
             self.clim_c.remove(&old);
         }
         Some((t, off))
@@ -14693,7 +14839,7 @@ mod wg_tests {
             g.feat_write(cx * 16 + 1, 60, cz * 16 + 1, 1);
             g.feat_write(1_000_000 + round * 16, 60, 1_000_000, 1);
             let _ = g.feat_state(1_000_000, 60, 1_000_000, |_, _, _| {});
-            let mut ord = g.feat_ord.clone();
+            let mut ord: Vec<_> = g.feat_ord.iter().copied().collect();
             ord.sort();
             assert!(
                 ord.windows(2).all(|w| w[0] != w[1]),
@@ -14757,6 +14903,276 @@ mod wg_tests {
         )];
         g.stage_payloads((0, 0), &mut again);
         assert!(again.is_empty(), "a regenerated chunk keeps its payload source");
+    }
+
+    // ---- Layer A1-a: chunk-local aquifer grid (a1a_aq_*) ----
+
+    /// The pre-A1a answer, computed from the same *uncached* primitives the cache
+    /// is meant to accelerate: `aq_rpos` for the 12 cells (exact `>=` four-slot
+    /// insertion) and `aq_fluid_level_at` for each of the three levels. This is the
+    /// oracle the cached `aq_state` is compared against; it does not touch either
+    /// generator's chunk cache.
+    fn aq_state_uncached(g: &mut Gen, x: i32, y: i32, z: i32, density: f64) -> (Option<u32>, bool) {
+        if density > 0.0 {
+            return (None, false);
+        }
+        if g.aq.is_none() {
+            return (
+                Some(if y < -54 {
+                    1
+                } else if y < g.sea {
+                    g.def_fl
+                } else {
+                    0
+                }),
+                false,
+            );
+        }
+        let (water, lava) = {
+            let a = g.aq.as_ref().unwrap();
+            (a.water, a.lava_st)
+        };
+        let def = g.aq_pick(y);
+        if Gen::lvl_block(def.0, def.1, y) == 2 {
+            return (Some(lava), false);
+        }
+        let (sx, sy, sz) = (lxz(x - 5), ly12(y + 1), lxz(z - 5));
+        let mut near = [((0, 0, 0), i64::MAX); 4];
+        for dx in 0..=1 {
+            for dy in -1..=1 {
+                for dz in 0..=1 {
+                    let p = g.aq_rpos(sx + dx, sy + dy, sz + dz);
+                    let (ex, ey, ez) = (p.0 - x, p.1 - y, p.2 - z);
+                    let h = ex as i64 * ex as i64 + ey as i64 * ey as i64 + ez as i64 * ez as i64;
+                    let e = (p, h);
+                    if near[0].1 >= h {
+                        near[3] = near[2];
+                        near[2] = near[1];
+                        near[1] = near[0];
+                        near[0] = e;
+                    } else if near[1].1 >= h {
+                        near[3] = near[2];
+                        near[2] = near[1];
+                        near[1] = e;
+                    } else if near[2].1 >= h {
+                        near[3] = near[2];
+                        near[2] = e;
+                    } else if near[3].1 >= h {
+                        near[3] = e;
+                    }
+                }
+            }
+        }
+        let dist = |p: (i32, i32, i32)| -> i64 {
+            let (dx, dy, dz) = (p.0 - x, p.1 - y, p.2 - z);
+            dx as i64 * dx as i64 + dy as i64 * dy as i64 + dz as i64 * dz as i64
+        };
+        let (d0, d1) = (dist(near[0].0), dist(near[1].0));
+        let lv = |g: &mut Gen, i: usize| {
+            let p = near[i].0;
+            g.aq_fluid_level_at(p.0, p.1, p.2)
+        };
+        let l2 = lv(g, 0);
+        let blk = Gen::lvl_block(l2.0, l2.1, y);
+        let sim12 = 1.0 - (d1 - d0).abs() as f64 / 25.0;
+        if sim12 <= 0.0 {
+            return (
+                Some(match blk {
+                    1 => water,
+                    2 => lava,
+                    _ => 0,
+                }),
+                sim12 >= AQ_FLOWING_UPDATE_SIMULARITY,
+            );
+        }
+        let pb = g.aq_pick(y - 1);
+        if blk == 1 && Gen::lvl_block(pb.0, pb.1, y - 1) == 2 {
+            return (Some(water), true);
+        }
+        let mut barrier = None;
+        let l3 = lv(g, 1);
+        let c12 = g.aq_calc_density(x, y, z, l2, l3, &mut barrier);
+        if density + sim12 * c12 > 0.0 {
+            return (None, false);
+        }
+        let l4 = lv(g, 2);
+        let d2 = dist(near[2].0);
+        let sim13 = 1.0 - (d2 - d0).abs() as f64 / 25.0;
+        if sim13 > 0.0 {
+            let c13 = g.aq_calc_density(x, y, z, l2, l4, &mut barrier);
+            if density + sim12 * sim13 * c13 > 0.0 {
+                return (None, false);
+            }
+        }
+        let sim23 = 1.0 - (d2 - d1).abs() as f64 / 25.0;
+        if sim23 > 0.0 {
+            let c23 = g.aq_calc_density(x, y, z, l3, l4, &mut barrier);
+            if density + sim12 * sim23 * c23 > 0.0 {
+                return (None, false);
+            }
+        }
+        (
+            Some(match blk {
+                1 => water,
+                2 => lava,
+                _ => 0,
+            }),
+            true,
+        )
+    }
+
+    #[test]
+    fn a1a_aq_chunk_grid_geometry_and_flat_index_identity() {
+        let _guard = lock_gen();
+        let g = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        let (min_y, height) = (g.min_y, g.height);
+        for (cx, cz) in [(-3i32, -2i32), (0, 0), (7, -5)] {
+            let c = AqChunkCache::new(cx, cz, min_y, height);
+            assert_eq!((c.nx, c.nz), (3, 3), "the X/Z span is [c-1, c+1]");
+            assert_eq!(c.cx, cx);
+            assert_eq!(c.cz, cz);
+            assert_eq!(
+                c.rpos.len(),
+                c.nx * c.ny * c.nz,
+                "positions and levels share one flat index space"
+            );
+            assert_eq!(c.levels.len(), c.rpos.len());
+            // All 12 cells of every corner block and of the boundary-offset blocks
+            // live in this chunk's grid, at distinct indices.
+            for lx in [0, 5, 15] {
+                for lz in [0, 5, 15] {
+                    let (x, z) = (cx * 16 + lx, cz * 16 + lz);
+                    let (sx, sz) = (lxz(x - 5), lxz(z - 5));
+                    for y in [min_y, -54, 0, 63, min_y + height - 1] {
+                        let sy = ly12(y + 1);
+                        let mut idxs = std::collections::HashSet::new();
+                        for dx in 0..=1 {
+                            for dy in -1..=1 {
+                                for dz in 0..=1 {
+                                    let (gx, gy, gz) = (sx + dx, sy + dy, sz + dz);
+                                    assert!(c.contains(gx, gy, gz), "({gx},{gy},{gz}) outside grid");
+                                    assert!(idxs.insert(c.idx(gx, gy, gz)), "flat index collision");
+                                }
+                            }
+                        }
+                        assert_eq!(idxs.len(), 12);
+                    }
+                }
+            }
+            // The sample position of each cell rounds back to that very cell: this
+            // is why the fluid level can be stored at the position's own index.
+            for gx in (c.min_gx - 1)..=(c.min_gx + c.nx as i32) {
+                for gy in (c.min_gy - 1)..=(c.min_gy + c.ny as i32) {
+                    for gz in (c.min_gz - 1)..=(c.min_gz + c.nz as i32) {
+                        let (rx, ry, rz) = g.aq_rpos(gx, gy, gz);
+                        assert_eq!((rx.div_euclid(16), ry.div_euclid(12), rz.div_euclid(16)), (gx, gy, gz));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a1a_aq_state_matches_uncached_overworld_and_nether() {
+        let _guard = lock_gen();
+        for (preset, seed, label) in [
+            (NoisePreset::Overworld, 0, "overworld"),
+            (NoisePreset::Nether, 4242, "nether"),
+        ] {
+            let local = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            let data = std::sync::Arc::clone(&local.data);
+            let mut cached = Gen::fresh_scratch(data.clone());
+            let mut direct = Gen::fresh_scratch(data);
+            let (lo, hi) = (cached.data.min_y, cached.data.min_y + cached.data.height - 1);
+            let sea = cached.sea;
+            let ys = [lo, -54, 0, sea, hi];
+            let mut checked = 0usize;
+            // Negative chunk origins plus the chunk boundary offsets the neighbour
+            // scan hinges on; interleaving the two generators also exercises the
+            // MRU ring's eviction and reuse.
+            for (cx, cz) in [(-2i32, -1i32), (0, 0), (3, -4)] {
+                for lx in [0, 5, 15] {
+                    for lz in [0, 5, 15] {
+                        let (x, z) = (cx * 16 + lx, cz * 16 + lz);
+                        for y in ys {
+                            for density in [-0.5f64, 0.0, 0.25] {
+                                let got = cached.aq_state(x, y, z, density);
+                                let sched = cached.aq_schedule_fluid_update();
+                                let want = aq_state_uncached(&mut direct, x, y, z, density);
+                                assert_eq!(
+                                    (got, sched),
+                                    want,
+                                    "{label} ({x},{y},{z}) d={density}: cached vs uncached"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(checked, 405, "{label}: dense sweep actually ran");
+        }
+    }
+
+    #[test]
+    fn a1a_aq_near3_tie_break_matches_four_slot_selection() {
+        let _guard = lock_gen();
+        let mut g = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        let mut ties = 0usize;
+        let mut checked = 0usize;
+        // Dense X/Z sweep at several Y bands: symmetric cells tie often, and the
+        // `>=` insertion rule decides which of the tied pair lands in slot 0.
+        for y in [-60, -20, 20, 63] {
+            for x in -48..48 {
+                for z in [-17, 0, 5, 16] {
+                    let (near, slot) = g.aq_near3(x, y, z).expect("inside the Y window");
+                    assert!(slot < AQ_CHUNK_SLOTS);
+                    let (sx, sy, sz) = (lxz(x - 5), ly12(y + 1), lxz(z - 5));
+                    let mut four = [((0, 0, 0), i64::MAX); 4];
+                    for dx in 0..=1 {
+                        for dy in -1..=1 {
+                            for dz in 0..=1 {
+                                let p = g.aq_rpos(sx + dx, sy + dy, sz + dz);
+                                let (ex, ey, ez) = (p.0 - x, p.1 - y, p.2 - z);
+                                let h = ex as i64 * ex as i64 + ey as i64 * ey as i64
+                                    + ez as i64 * ez as i64;
+                                let e = (p, h);
+                                if four[0].1 >= h {
+                                    four[3] = four[2];
+                                    four[2] = four[1];
+                                    four[1] = four[0];
+                                    four[0] = e;
+                                } else if four[1].1 >= h {
+                                    four[3] = four[2];
+                                    four[2] = four[1];
+                                    four[1] = e;
+                                } else if four[2].1 >= h {
+                                    four[3] = four[2];
+                                    four[2] = e;
+                                } else if four[3].1 >= h {
+                                    four[3] = e;
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        [near[0].0, near[1].0, near[2].0],
+                        [four[0].0, four[1].0, four[2].0],
+                        "({x},{y},{z}): nearest-three selection differs"
+                    );
+                    assert_eq!(
+                        [near[0].1, near[1].1, near[2].1],
+                        [four[0].1, four[1].1, four[2].1],
+                        "({x},{y},{z}): reused distance differs"
+                    );
+                    if four[0].1 == four[1].1 || four[1].1 == four[2].1 {
+                        ties += 1;
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000 && ties > 0, "sweep must include observable ties: {ties}");
     }
 }
 
