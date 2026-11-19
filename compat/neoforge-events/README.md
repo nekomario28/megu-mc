@@ -20,3 +20,23 @@ For a normal server, put the pinned original JAR alone in its isolated `mods/` d
 Full NeoForge reference-server comparison, lifecycle/bootstrap and arbitrary mod compatibility remain NOT RUN. Crop/loot and other entities remain outside the validated landing contract.
 
 Sources: [NeoForge 21.1.172 POM](https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.172/neoforge-21.1.172.pom), pinned upstream source/runtime JARs in dependencies.json, [publisher artifact metadata](https://api.modrinth.com/v2/version/HetyfPep), and [NeoForge 1.21.1 events](https://docs.neoforged.net/docs/1.21.1/concepts/events/).
+
+## NF-0 static compatibility check
+
+Before loading a NeoForge 1.21.1 mod, audit its metadata and bytecode with Java 21
+and the pinned ASM 9.10.1 dependency. The first invocation builds the pinned
+adapter if needed. The checked-in `shim-surface.json` enumerates currently
+supported S0 classes and exact method/field descriptors.
+
+```sh
+python3 tools/shimcheck.py --json path/to/mod.jar
+python3 tools/shimcheck.py --surface compat/neoforge-events/shim-surface.json path/to/mod.jar
+```
+
+Use `--java-home PATH` to override Java autodetection. The report includes
+coverage, client-side exclusions, annotations, rejected symbols and precise
+reason codes. Exit 0 means `COMPATIBLE`, exit 2 means `REJECTED`, and exit 1
+means command or I/O failure. The check is static and does not start a server.
+Mixin transformations and access transformers are unsupported in S0 and fail
+closed. `COMPATIBLE` describes the pinned shim surface, not arbitrary Mod
+runtime behavior. For tight `/tmp` environments the wrapper uses `target/tmp`.
