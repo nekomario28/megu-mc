@@ -20,8 +20,8 @@ def run(cwd, *cmd, expect=0):
 
 
 def check_docs(root):
-    assert re.search(r'^license\s*=\s*"Apache-2.0"$', (root / 'Cargo.toml').read_text(), re.M)
-    assert re.search(r'Apache License\s+Version 2\.0', (root / 'LICENSE').read_text())
+    assert re.search(r'^license\s*=\s*"GPL-3.0-or-later"$', (root / 'Cargo.toml').read_text(), re.M)
+    assert re.search(r'GNU GENERAL PUBLIC LICENSE\s+Version 3', (root / 'LICENSE').read_text())
     notice = (root / 'NOTICE').read_text()
     assert 'does not contain Mojang data' not in ' '.join(notice.split())
     for name in TSVS:

@@ -155,6 +155,7 @@ def write_wire_backends(root, artifact, *, cargo_output, wire_error, wrong_failu
     """The fake wire gates. Each one resolves the wire config the way the real helper does."""
     for name, passed in {"client_settings_wire.py": "client settings wire: PASS",
                          "gameplay_wire.py": "gameplay wire: PASS",
+                         "dimension_wire.py": "dimension wire: PASS",
                          "container_wire.py": "containers wire: PASS",
                          "population_plan_test.py": "population plan: PASS",
                          "mineshaft_dispatch_test.py": "mineshaft dispatch: PASS"}.items():

@@ -3847,7 +3847,7 @@ check "p2_3_s4_chunk_deltas_respect_the_dimension_filter" \
 check "p2_3_s4_block_deltas_are_dimension_scoped" \
   src/main.rs '        |c| *c.dim.lock().unwrap() == dim && c.chunks.lock().unwrap().contains(&(cx, cz)),' \
   '        |c| c.chunks.lock().unwrap().contains(&(cx, cz)),' \
-  tests/dimension_wire.py "dimension wire: FAIL nether-edit-leaked-to-overworld"
+  tests/dimension_wire.py 'dimension wire: FAIL nether-edit-leaked-to-overworld'
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
