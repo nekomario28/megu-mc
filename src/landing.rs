@@ -31,8 +31,13 @@ pub fn initialize() -> Result<(), String> {
     };
     #[cfg(not(feature = "java-compat"))]
     {
-        let _ = (classpath, loader);
-        Err("MC_SPINE_FABRIC_CLASSPATH requires --features fabric-probe".into())
+        let _ = classpath;
+        match loader {
+            Loader::Fabric => Err("MC_SPINE_FABRIC_CLASSPATH requires --features fabric-probe".into()),
+            Loader::NeoForge => {
+                Err("MC_SPINE_NEOFORGE_CLASSPATH requires --features neoforge-events".into())
+            }
+        }
     }
     #[cfg(feature = "java-compat")]
     {
@@ -76,6 +81,13 @@ pub fn eligible(
         && width * width * height > 0.512
 }
 
+fn dim_from_slot(slot: u8) -> DimId {
+    DimId::ALL
+        .get(usize::from(slot))
+        .copied()
+        .unwrap_or(DimId::Overworld)
+}
+
 fn commit(trample: Trample) -> Result<bool, String> {
     #[cfg(feature = "java-compat")]
     if let Some(callbacks) = CALLBACKS.get() {
@@ -88,7 +100,8 @@ fn commit(trample: Trample) -> Result<bool, String> {
             .map_err(|_| "Java game owner terminated")?;
         return receive.recv().map_err(|_| "Java callback terminated")?;
     }
-    Ok(super::set_block_if(
+    Ok(super::set_block_if_dim(
+        dim_from_slot(trample.dim),
         trample.position.0,
         trample.position.1,
         trample.position.2,
@@ -103,7 +116,8 @@ pub fn cow_land(mob: &Arc<Mob>, position: (i32, i32, i32), distance: f32) -> boo
     if mob.etype != 22 || *mob.hp.lock().unwrap() <= 0.0 {
         return false;
     }
-    let state = block_at(position.0, position.1, position.2);
+    let dim = DimId::Overworld;
+    let state = block_at_dim(dim, position.0, position.1, position.2);
     if !(4286..=4293).contains(&state) {
         return false;
     }
@@ -120,12 +134,13 @@ pub fn cow_land(mob: &Arc<Mob>, position: (i32, i32, i32), distance: f32) -> boo
         return false;
     }
     match commit(Trample {
+        dim: dim.index() as u8,
         position,
         state,
         distance,
     }) {
         Ok(true) => {
-            note_block_update(position.0, position.1, position.2, 10);
+            note_block_update_dim(dim, position.0, position.1, position.2, 10);
             true
         }
         Ok(false) => false,
@@ -141,10 +156,11 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
     if !x.is_finite() || !y.is_finite() || !z.is_finite() {
         return;
     }
+    let dim = *me.dim.lock().unwrap();
     let water = name_to_state("water").unwrap_or(u32::MAX);
-    // Block containing a point.
+    // Block containing a point in the player's current dimension.
     let block_containing = |px: f64, py: f64, pz: f64| {
-        block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32)
+        block_at_dim(dim, px.floor() as i32, py.floor() as i32, pz.floor() as i32)
     };
     let gliding = *me.fall_fly.lock().unwrap();
     let mut peak = me.fall_from.lock().unwrap();
@@ -165,7 +181,7 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
     *peak = y;
     drop(peak);
     let position = (x.floor() as i32, (y - 0.2).floor() as i32, z.floor() as i32);
-    let state = block_at(position.0, position.1, position.2);
+    let state = block_at_dim(dim, position.0, position.1, position.2);
     let wet = block_containing(x, y - 0.5, z) == water || block_containing(x, y, z) == water;
     let height = if gliding {
         0.6
@@ -178,11 +194,12 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
         let random = (crate::world_rng::next_u64() >> 40) as f32 / 16777216.0;
         if eligible(distance as f32, random, true, true, true, 0.6, height) {
             match commit(Trample {
+                dim: dim.index() as u8,
                 position,
                 state,
                 distance: distance as f32,
             }) {
-                Ok(true) => note_block_update(position.0, position.1, position.2, 10),
+                Ok(true) => note_block_update_dim(dim, position.0, position.1, position.2, 10),
                 Ok(false) => {}
                 Err(error) => {
                     // Fail closed. Never apply an unreviewed vanilla fallback after callback failure.
@@ -243,5 +260,31 @@ mod tests {
         super::super::set_block(p.0, p.1, p.2, original);
         assert!(!replaced, "a stale landing must not replace the new block");
         assert_eq!(landed, 1);
+    }
+    #[test]
+    fn commit_trample_is_dimension_scoped() {
+        let _world_guard = super::super::WORLD_TEST_LOCK.lock().unwrap();
+        let p = (812, 71, 812);
+        let orig_ow = block_at_dim(DimId::Overworld, p.0, p.1, p.2);
+        let orig_ne = block_at_dim(DimId::Nether, p.0, p.1, p.2);
+        super::super::set_block_dim(DimId::Overworld, p.0, p.1, p.2, 4286);
+        super::super::set_block_dim(DimId::Nether, p.0, p.1, p.2, 4286);
+        let changed = commit(Trample {
+            dim: DimId::Nether.index() as u8,
+            position: p,
+            state: 4286,
+            distance: 4.0,
+        })
+        .expect("nether trample commit");
+        let after_ow = block_at_dim(DimId::Overworld, p.0, p.1, p.2);
+        let after_ne = block_at_dim(DimId::Nether, p.0, p.1, p.2);
+        super::super::set_block_dim(DimId::Overworld, p.0, p.1, p.2, orig_ow);
+        super::super::set_block_dim(DimId::Nether, p.0, p.1, p.2, orig_ne);
+        assert!(changed, "nether farmland must convert in the Nether");
+        assert_eq!(after_ne, 10, "nether cell must become dirt");
+        assert_eq!(
+            after_ow, 4286,
+            "nether trample must not mutate Overworld farmland at the same coordinates"
+        );
     }
 }

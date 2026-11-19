@@ -9,6 +9,8 @@ pub enum Loader {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Trample {
+    /// Dimension slot (`DimId::index() as u8`: 0 = Overworld, 1 = Nether, 2 = End).
+    pub dim: u8,
     pub position: (i32, i32, i32),
     pub state: u32,
     // read by the Java adapter (java_compat.rs passes it as a JNI float), so it

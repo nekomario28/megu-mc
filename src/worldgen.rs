@@ -6080,7 +6080,7 @@ pub(crate) struct ChunkCols {
 /// The lazily-built half of a [`ChunkCols`]: surface material windows and the per-column
 /// `run_depth` the deep rules read. Split out so a neighbour column that is only used as a
 /// heightmap source pays none of this cost.
-struct SurfaceMats {
+pub(crate) struct SurfaceMats {
     mats: Vec<Option<SurfMat>>,
     rd: [i16; 256],
 }

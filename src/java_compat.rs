@@ -51,8 +51,12 @@ extern "system" fn set_block(
         let active = *ACTIVE.lock().unwrap();
         if let Some(active) = active {
             if active.position == (x, y, z) && state == 10 {
+                let dim = super::DimId::ALL
+                    .get(usize::from(active.dim))
+                    .copied()
+                    .unwrap_or(super::DimId::Overworld);
                 return match catch_unwind(AssertUnwindSafe(|| {
-                    super::set_block_if(x, y, z, 10, Some(active.state))
+                    super::set_block_if_dim(dim, x, y, z, 10, Some(active.state))
                 })) {
                     Ok(changed) => {
                         COMMITTED.store(changed, super::Ordering::Relaxed);
@@ -96,22 +100,30 @@ extern "system" fn get_block(mut env: JNIEnv, _class: JClass, x: jint, y: jint, 
     if !on_owner(&mut env) {
         return -1;
     }
-    let valid = if SERVER.get() == Some(&true) {
-        ACTIVE
-            .lock()
-            .unwrap()
-            .is_some_and(|active| active.position == (x, y, z))
+    let active_dim = if SERVER.get() == Some(&true) {
+        let active = *ACTIVE.lock().unwrap();
+        match active {
+            Some(a) if a.position == (x, y, z) => Some(
+                super::DimId::ALL
+                    .get(usize::from(a.dim))
+                    .copied()
+                    .unwrap_or(super::DimId::Overworld),
+            ),
+            _ => None,
+        }
+    } else if valid_position(x, y, z) {
+        Some(super::DimId::Overworld)
     } else {
-        valid_position(x, y, z)
+        None
     };
-    if !valid {
+    let Some(dim) = active_dim else {
         let _ = env.throw_new(
             "java/lang/IllegalArgumentException",
             "Position outside diagnostic ABI",
         );
         return -1;
-    }
-    match catch_unwind(AssertUnwindSafe(|| super::block_at(x, y, z))) {
+    };
+    match catch_unwind(AssertUnwindSafe(|| super::block_at_dim(dim, x, y, z))) {
         Ok(state) => state as jint,
         Err(_) => {
             let _ = env.throw_new("java/lang/IllegalStateException", "Rust world read failed");
