@@ -1,6 +1,6 @@
 # Mod互換shim計画（S0〜S5）
 
-状態: **計画のみ。未着手。** 根拠は2026-10-25の実現性調査（Seed Protect実測、modの表面積の概算、先行事例）。数値は調査時点のもので、各マイルストーンで再測定する。出口条件は[ROADMAP R5](../ROADMAP.md)と、このディレクトリの[README](README.md)の契約に従う。PLANのM2/M3と区別するため、ここではS番号を使う。
+状態: **S0〜S3+ 設計確定済み（[NeoForge 1.21.1 互換層アーキテクチャ設計](neoforge-architecture.md)）。NF-0 (`shimcheck`) 着手待機。** 根拠は2026-10-25の実現性調査（Seed Protect実測、modの表面積の概算、先行事例）。数値は調査時点のもので、各マイルストーンで再測定する。出口条件は[ROADMAP R5](../ROADMAP.md)と、このディレクトリの[README](README.md)の契約に従う。PLANのM2/M3と区別するため、ここではS番号を使う。
 
 ## 方針
 

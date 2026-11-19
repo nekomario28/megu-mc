@@ -61,31 +61,33 @@ Mineshaftのadmission・dispatcher・piece配置は [Rust接続checkpoint](../ev
   - `S2b〜S2d`（済 `1ec70b0`, `0e532bb`）：残り 8 ストア（`CHESTS`/`FURNACES`/`CROPS`/`SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`/`POS_STORE`）の `DimId` 化。
   - `S3`（済 `3a3bb37`）：Nether/End の 16 セクション（`min_y = 0`, `height = 256`）チャンク配信と `has_skylight = false` での `skyLightMask == 0` 送信。
   - `S4`（済）：`0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン時次元復元（`tests/dimension_wire.py` PASS、8/8 mutations proved）。
-- **F2-2 (`M3 P1〜P5` + 超高効率計算 Layer A1〜A4)**:
-  - `P1a`（済 `3135354`）・`P1b`（済 `b588c03`）・`P2a`（済 `43a463b`）・`P2b`（済 `0469ad9`：`SECTION_STORE` + zero-repack wire）・`P3a`（済 `1befd35`）・`P4`（済 `06abd5f`）・`P5-wire/light`（済 `ea59c4e`）に加え、**Layer A1-a/b**（済 `3cb6d24`, `b981704`）、**Layer A2-a/b/c**（済 `c745772`, `785cdf5`, `4d28f01`）、**Layer A3-a/b/c**（済 `2a4eaf4`, `b105d58`, `91b19c4`）まで統合完了。
-  - 残る仕上げ（詳細：[chunk-parallelism/README.md](chunk-parallelism/README.md#超高効率計算アーキテクチャ計画layer-a1a42026-11-19-2e95617-基準)）：**Layer A3-a 速度回収**（`populate_parallel` の `TerrainShare`/owner キャッシュ共有）、**Layer A1-c**（`Cond::Biome(u128)` + `SurfaceProg`）、**Layer A4**（`PalettedSection` P2c–f O(1) light skip + 共有圧縮キャッシュ + `EntitySpatialGrid` ゼロアロケ/Mob SoA + PGO + `WARM=1` 対照ベンチマーク）。
+- **F2-2 (`M3 P1〜P5` + 超高効率計算 Layer A1〜A4 — 完了 `e82fbc6`)**:
+  - `P1a`（済 `3135354`）・`P1b`（済 `b588c03`）・`P2a`（済 `43a463b`）・`P2b`（済 `0469ad9`：`SECTION_STORE` + zero-repack wire）・`P3a`（済 `1befd35`）・`P4`（済 `06abd5f`）・`P5-wire/light`（済 `ea59c4e`）に加え、**Layer A1-a/b**（済 `3cb6d24`, `b981704`）、**Layer A2-a/b/c**（済 `c745772`, `785cdf5`, `4d28f01`）、**Layer A3-a/b/c**（済 `2a4eaf4`, `b105d58`, `91b19c4`）を統合。
+  - **Phase A-2 / B-1 / B-2 / B-3 完了**: `d918eac`（`populate_parallel` ワーカー `col_c`/`chunk_biomes` 共有＋`Cond::Biome(u128)`＋`Rule::Seq` 直接反復）、`b2e41b5`（`EntitySpatialGrid` 単一マップ化）、`c06be7c`（`PalettedSection::uniform_state()` O(1) fast-path＋512-entry `MapChunkCache`＋決定論的 `hidden_filler_with`）、`01a6528`（`P0-2` 到達性監査スナップショット＆`u128` アンカー）、`e82fbc6`（`tools/pgo_build.sh` ＋ PGO A/B 実測 `full j=8` 2.971s → 2.656s、-10.6%、全 dump SHA-256 ビット完全一致）。
 - **F2-3 (`P2-1 / P2-2`: 構造物実チャンク受入の拡大と残存 Feature / 境界の閉鎖)**:
   - `P2-1-T0`（済 `2ee2560`）・`P2-1-T1`（済 `promotion_fluid_tick` 登録済み）・`P2-1-T2`（済 `2481b48`：要素単位 fail-skip）・`P2-1-T3` 第 1〜2 段（済 `bb6ec7c`, `2481b48`, `2a4eaf4`：`ruined_portal` B / `monument` / `igloo` / `village_plains` 0-diff 確認）・`P2-2` `minecraft:end_spike`（済・oracle 検証＆4 mutation ゲート済み）。
   - 残件：自動バッチ受入工場（B3/B4）による残存未検証構造物の段階的受入。
-- **F2-4 (`M2 Gameplay`: 流体 `travel` と残る操作契約の閉鎖)**:
-  - `Slice 4d`（済 `b822d99`：`LivingEntity.travel` 流体浮力・減衰・Nether `ultraWarm` 溶岩押し流し）。
-  - 後続スライス：一般 `BaseSpawner`・構造物 Entity スポーン初期化と `spawn_overrides`、戦闘/死亡/リスポーン・精錬・天候等の CLI live wire 往復検査。
+- **F2-4 (`M2 Gameplay`: 流体 `travel`・一般 Spawner と残る操作契約の閉鎖)**:
+  - `Slice 4d`（済 `b822d99`：`LivingEntity.travel` 流体浮力・減衰・Nether `ultraWarm` 溶岩押し流し）、一般 1.21.1 `BaseSpawner` + `SpawnPotentials`（済 `b2e41b5`）。
+  - 後続スライス：戦闘/死亡/リスポーン・クラフト/精錬・天候/昼夜の CLI live wire 往復検査（Phase C-1）。
+- **R5 並行トラック（NeoForge 1.21.1 互換層 `NF-0〜NF-4`）**:
+  - 設計書 [neoforge-architecture.md](mod-compatibility/neoforge-architecture.md) 確定。`NF-0`（S0 `shimcheck`：ASM `9.10.1` + `neoforge.mods.toml` 静的監査）から段階実装。
 
-#### 超高効率計算＋収束加速の統合実行計画（Wave 0〜3 完了分 ＋ Phase A〜C 収束計画、2026-11-19 `91b19c4` 同期）
+#### 超高効率計算＋収束加速の統合実行計画（Phase A〜B 完了 ＋ Phase C / NF-0 実行計画、2026-11-19 `e82fbc6` 同期）
 
 完成速度と並列スループットを最大化するため、**5 つの収束規律（B1〜B5）** を固定する：
-- **B1**: Stage F1（残 D5 のみ）を先行確定し、いつでも外部公開可能な Alpha ラインを確保する。
-- **B2 (`src/main.rs` 単一レーン規約)**: 31,219 行の `src/main.rs` 衝突を避けるため、ロジックは既存の専用モジュールへ厚く閉じ、**1 バッチ内で `src/main.rs` を編集するレーンは常に 1 つ**に固定して常時 3 並列をコンフリクトゼロで回す。
+- **B1**: Stage F1（D1〜D5 完了 `d45cb4c`）を維持し、いつでも外部公開可能な Alpha ラインを確保する。
+- **B2 (`src/main.rs` 単一レーン規約)**: 肥大化した `src/main.rs` の衝突を避けるため、ロジックは既存の専用モジュールへ厚く閉じ、**1 バッチ内で `src/main.rs` を編集するレーンは常に 1 つ**に固定して並列レーンをコンフリクトゼロで回す。
 - **B3 (構造物バッチ受入工場)**: `tools/structure_capture.py` をバッチ化し、未受入定義を「0-diff 自動昇格」「共通カーネル原因クラスタ」「個別原因」に自動仕分けして波及の大きい 1 修正で複数構造物を同時 0-diff 化する。
 - **B4 (2 階層高速ゲート＋自動ベンチ)**: サブエージェントは対象フィルタ＋`layers_check`/`debt_ratchet`/`provenance_check`、インテグレータは `TMPDIR=target/tmp` 分割実行＋`tools/perf_bench.py`（SHA-256・M1–M6・wall/CPU 中央値自動計測）で 600s タイムアウトと手動計測ロスを根絶する。
 - **B5 (台帳同期)**: フェーズ完了ごとに `specs/` と運用文書を実態へ同期し、陳腐化による再調査ロスをゼロにする。
 
-| フェーズ | Lane 1（`src/main.rs` 専任） | Lane 2（計算カーネル専任） | Lane 3（法務・構造物・独立モジュール専任） | 出口マイルストーン |
+| フェーズ | Lane 1（`src/main.rs` 専任） | Lane 2（計算・構造物専任） | Lane 3（法務・互換・独立モジュール専任） | 出口マイルストーン |
 |---|---|---|---|---|
 | **完了済 (Wave 0〜3: `8dad8c7`〜`91b19c4`)** | `P2-3-S2b〜d` + `S3` (`1ec70b0`, `0e532bb`, `3a3bb37`), `M3 P2b` (`0469ad9`) | `perf_bench.py` (`a9d8437`), Layer A1-a/b (`3cb6d24`, `b981704`), Layer A2-a/b/c (`c745772`, `785cdf5`, `4d28f01`), Layer A3-a/b/c (`2a4eaf4`, `b105d58`, `91b19c4`) | `igloo` + `P2-1-T2` (`2481b48`), `village_plains` 0-diff 確認 (`2a4eaf4`) | 3 次元配信・パレット化・AVX-512・DAG 並列基盤完了 |
-| **Phase A（半完成回収＋逆転解消）** | **A-1**: `P2-3-S4` worktree 回収・`tests/dimension_wire.py` E2E 統合 | **A-2**: `Layer A3-a` 速度回収（`populate_parallel` の `TerrainShare`/owner キャッシュ共有） | **A-3**: Stage F1 `D5` worktree 回収（`export_public_branch.sh` + `public_export_test.py` + 文書同期） | Stage F1 完結、3 次元移動 E2E 完成、DAG 並列の実測高速化 |
-| **Phase B（M3 性能完結）** | **B-1**: `Layer A4` 本体（`PalettedSection` P2c–f O(1) light skip + 共有圧縮チャンクキャッシュ） | **B-2**: `Layer A1-c`（`Cond::Biome(u128)` + `SurfaceProg`）＋ `P0-2` 到達性監査文書 | **B-3**: `src/entity_spatial.rs` ゼロアロケ化 ＋ PGO / `WARM=1` 対照ベンチマーク | M3 / Layer A1〜A4 性能目標達成、`WARM=1` 対照証明 |
-| **Phase C（構造物・M2/P1 拡張＆最終ゲート）** | **C-1**: M2 残 wire 往復検査（戦闘・死亡/リスポーン・精錬・天候） | **C-2**: `P2-1-T3` 構造物バッチ工場（B3/B4：未検証構造物の採取と共通原因修正） | **C-3**: `src/spawner.rs` 一般 `BaseSpawner` 化 ＋ `P1-1..P1-4` → 同一 SHA 全ゲート監査（`P4-1`） | Stage F2 実用公開フォーク完全到達 |
+| **完了済 (Phase A: `d45cb4c`〜`d918eac`)** | **A-1**: `P2-3-S4` (`c40417d`, `tests/dimension_wire.py` E2E) | **A-2**: `Layer A3-a` ワーカーキャッシュ共有 (`d918eac`) | **A-3**: Stage F1 `D5` (`d45cb4c`, `export_public_branch.sh`) | Stage F1 完結、3 次元移動 E2E 完成、DAG 並列の実測高速化 |
+| **完了済 (Phase B: `b2e41b5`〜`e82fbc6`)** | **B-1**: `Layer A4` (`c06be7c`: `uniform_state()` O(1) fast-path + 512-entry `MapChunkCache`) | **B-2**: `Layer A1-c` (`d918eac`: `Cond::Biome(u128)` + `Rule::Seq`) ＋ `P0-2` 監査 (`01a6528`) | **B-3**: `BaseSpawner` + `EntitySpatialGrid` (`b2e41b5`), PGO & 計測記録 (`e82fbc6`) | M3 / Layer A1〜A4 完了（PGO `full j=8` -10.6%、全 dump SHA-256 一致） |
+| **Phase C + NF-0（進行中）** | **C-1**: M2 残 wire 往復検査（時間/天候・クラフト/精錬・戦闘/死亡/リスポーン） | **C-2**: `P2-1-T3` 構造物バッチ工場（Batch B3 採取と共通原因修正） | **NF-0**: S0 `shimcheck` (`ShimCheck.java` + `tools/shimcheck.py`) ／ **C-3**: コンパイラ警告清掃・`P1-1..P1-4` → 同一 SHA 全ゲート監査（`P4-1`） | Stage F2 実用公開フォーク完全到達 ＋ NeoForge S0 ゲート確立 |
 
 **原因記述の訂正:** 端のair差とsnowy差を位置の近さだけで同じ原因にまとめた推測は
 撤回する。訂正根拠・区別すべきlookup・次の反証は
