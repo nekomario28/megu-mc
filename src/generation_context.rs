@@ -193,8 +193,11 @@ impl<'a> FC<'a> {
         })
     }
 
-    /// Columns for a terrain read: the worker's cache, then the owner's already-built columns
-    /// (A3-a's batch pre-carve leaves them resident), finally a cold build on the worker.
+    /// Columns for a terrain read: the owner's resident columns first (A3-a leaves them
+    /// there — the round share's columns and the wave commits' merged `col_c` entries),
+    /// then a cold build on the worker through the round-scoped `TerrainShare`. A biome
+    /// lookup in `FC` (`biome_leaf`/`biome`) never builds columns at all: the quart lookup
+    /// answers from the biome tree.
     fn cols_for(&mut self, cx: i32, cz: i32) -> Option<std::sync::Arc<crate::worldgen::ChunkCols>> {
         if let Some(o) = self.owner {
             if let Some(c) = o.col_c_get(cx, cz) {

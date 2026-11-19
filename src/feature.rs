@@ -9520,6 +9520,12 @@ struct PopulateWorkerResult {
     feat_hm: HashMap<(i32, i32), (i32, i32)>,
     leaves: Vec<GeneratedTick>,
     fluids: Vec<GeneratedTick>,
+    /// The worker's resident terrain answers: the columns it built (`Gen::col_c`) and the
+    /// biome unions it computed (`Gen::chunk_biomes`). Pure functions of the round's chunks,
+    /// so the owner installs them (`Gen::install_cols` / `Gen::merge_chunk_biomes`) and
+    /// later waves plus `promote_full_chunks` answer from the owner instead of rebuilding.
+    cols: Vec<((i32, i32), std::sync::Arc<crate::worldgen::ChunkCols>)>,
+    chunk_biomes: Vec<((i32, i32), std::sync::Arc<Vec<String>>)>,
 }
 
 /// The worker half of a feature pass: biome union, `References::collect` and the placement
@@ -9537,6 +9543,8 @@ fn populate_worker(scratch: &mut Gen, owner: &Gen, sx: i32, sz: i32) -> Populate
         feat_hm: HashMap::new(),
         leaves: Vec::new(),
         fluids: Vec::new(),
+        cols: Vec::new(),
+        chunk_biomes: Vec::new(),
     };
     if env_flag!("MC_SPINE_NOFEAT") {
         return empty();
@@ -9558,7 +9566,14 @@ fn populate_worker(scratch: &mut Gen, owner: &Gen, sx: i32, sz: i32) -> Populate
     let mut biomes: Vec<String> = Vec::new();
     for dx in -1..=1 {
         for dz in -1..=1 {
-            for b in gen.chunk_biome_set(sx + dx, sz + dz).iter() {
+            // A3-a: the union of a chunk the owner already built is the owner's answer
+            // (the serial arm populates the same `chunk_biomes` on `g`; the parallel arm
+            // merges each wave's unions back into the owner at the wave commit). Only a
+            // genuinely new union is built, on the scratch.
+            let set = owner
+                .chunk_biome_set_readonly(sx + dx, sz + dz)
+                .unwrap_or_else(|| gen.chunk_biome_set(sx + dx, sz + dz));
+            for b in set.iter() {
                 if use_bits {
                     if let Some(&bit) = fr.biome_bits.get(b) {
                         present_mask |= 1u128 << bit;
@@ -9629,6 +9644,10 @@ fn populate_worker(scratch: &mut Gen, owner: &Gen, sx: i32, sz: i32) -> Populate
     let direct_marks = gen.take_all_shape_marks();
     let feat_hm = std::mem::take(&mut gen.feat_hm_for_worker());
     let (leaves, fluids) = gen.take_generated_ticks();
+    // A3-a: snapshot the worker's resident terrain answers (its built columns and the
+    // biome unions it computed) so the owner can install them after the wave.
+    let cols = gen.col_c_snapshot();
+    let chunk_biomes = gen.chunk_biomes_snapshot();
     PopulateWorkerResult {
         wr,
         shape_marks,
@@ -9637,6 +9656,8 @@ fn populate_worker(scratch: &mut Gen, owner: &Gen, sx: i32, sz: i32) -> Populate
         feat_hm,
         leaves,
         fluids,
+        cols,
+        chunk_biomes,
     }
 }
 
@@ -9651,19 +9672,27 @@ struct TickBatch {
 /// The owner continuation of one worker result: land the worker's state, run the same
 /// promotion boundary as the serial arm, and flush the writes in the same order.
 fn commit_populate(g: &mut Gen, sx: i32, sz: i32, res: PopulateWorkerResult) -> TickBatch {
-    g.pop_done.insert((sx, sz));
-    g.suppress_generated_ticks = g.restores_ticks_for((sx, sz));
-    g.merge_shape_marks(res.direct_marks);
-    g.merge_feat_hm(res.feat_hm);
-
     let PopulateWorkerResult {
         wr,
         shape_marks,
+        direct_marks,
         payloads,
+        feat_hm,
         leaves,
         fluids,
-        ..
+        cols,
+        chunk_biomes,
     } = res;
+    // A3-a: install the worker's resident terrain answers (built columns, biome unions)
+    // before the promotion pass, so `FC::cols_for` and any later-wave read answer from
+    // the owner instead of rebuilding them.
+    g.install_cols(cols);
+    g.merge_chunk_biomes(chunk_biomes);
+    g.pop_done.insert((sx, sz));
+    g.suppress_generated_ticks = g.restores_ticks_for((sx, sz));
+    g.merge_shape_marks(direct_marks);
+    g.merge_feat_hm(feat_hm);
+
     let mut ctx = FC::new_commit(g, wr, shape_marks, payloads);
     promote_full_chunks(&mut ctx, sx, sz);
     let mut staged_payloads = std::mem::take(&mut ctx.payloads);

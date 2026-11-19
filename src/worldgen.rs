@@ -701,7 +701,10 @@ impl YA {
 #[derive(Clone, Copy)]
 enum Cond {
     False,
-    Biome(u64), // bitmask over biome leaf ids (<64 distinct names)
+    // Bitmask over biome leaf ids: up to 128 distinct leaves are supported (a
+    // `minecraft:biome` condition naming more, or one with an out-of-range leaf,
+    // simply leaves its bit unset and matches nothing).
+    Biome(u128),
     NoiseTh {
         ni: usize,
         is3d: bool,
@@ -2930,10 +2933,15 @@ impl Gen {
         };
         Some(match ty.as_str() {
             "biome" => {
-                let mut mask = 0u64;
+                let mut mask = 0u128;
                 let mut one = |s: &str| {
+                    // Unknown biomes and leaves >= 128 leave their bit unset: the
+                    // condition then matches nothing, and nothing panics on a shift
+                    // that would overflow the old `u64` mask.
                     if let Some(&l) = self.bleaf.get(s) {
-                        mask |= 1u64 << l;
+                        if usize::from(l) < 128 {
+                            mask |= 1u128 << usize::from(l);
+                        }
                     }
                 };
                 match j.get("biome_is")? {
@@ -5877,7 +5885,10 @@ impl Gen {
             }
             Cond::Biome(mask) => {
                 let l = self.leaf_at(c);
-                l != u16::MAX && l < 64 && (mask >> l) & 1 == 1
+                // `leaf_at` answers `u16::MAX` for a missing biome; every out-of-range
+                // leaf is excluded by the same bound. The shift itself is short-circuited
+                // for any `l >= 128`.
+                usize::from(l) < 128 && (mask >> usize::from(l)) & 1 == 1
             }
             Cond::NoiseTh { ni, is3d, lo, hi } => {
                 if !is3d {
@@ -5974,21 +5985,19 @@ impl Gen {
                 let off = (self.noises[ni].get(c.x as f64, 0.0, c.z as f64) * 4.0).round() as i32;
                 Some(bands[((c.y + off).rem_euclid(192)) as usize])
             }
-            Rule::Seq(_) => {
-                let mut i = 0;
-                loop {
-                    let next = match &self.rules[rid] {
-                        Rule::Seq(v) => v.get(i).copied(),
-                        _ => None,
-                    };
-                    {
-                        let sub = next?;
-                        i += 1;
-                        if let Some(st) = self.eval_rule(sub, c, heightmap) {
-                            return Some(st);
-                        }
+            Rule::Seq(v) => {
+                // The sequence's index slice is copied out of `self.rules` once per visit:
+                // the loop below recurses with `&mut self`, so it cannot hold a borrow of
+                // `self.rules` across a step. Iterating the local copy visits the same
+                // elements in the same order as the old re-index loop (`self.rules[rid]`
+                // again on every step) and returns the same first `Some`.
+                let subs: Box<[usize]> = (*v).clone();
+                for &sub in subs.iter() {
+                    if let Some(st) = self.eval_rule(sub, c, heightmap) {
+                        return Some(st);
                     }
                 }
+                None
             }
             Rule::Cond(ci, ri) => {
                 let (ci, ri) = (*ci, *ri);
@@ -7272,6 +7281,32 @@ impl Gen {
         }
     }
 
+    /// Install a wave worker's biome unions onto the owner (A3-a): `populate_worker`
+    /// computes the union of each chunk's 3x3 (`chunk_biome_set`), so a chunk a later
+    /// wave places inside that 3x3 reads the union from the owner instead of rebuilding
+    /// it on the scratch, and `promote_full_chunks` answers from the same resident sets.
+    /// Idempotent: unions already resident are left alone; the eviction bound matches
+    /// `chunk_biome_set`.
+    pub(crate) fn merge_chunk_biomes(
+        &mut self,
+        entries: Vec<((i32, i32), std::sync::Arc<Vec<String>>)>,
+    ) {
+        for (key, arc) in entries {
+            if self.chunk_biomes.contains_key(&key) {
+                continue;
+            }
+            self.chunk_biomes.insert(key, arc);
+            self.chunk_biomes_ord.push_back(key);
+            while self.chunk_biomes.len() > 384 {
+                if let Some(old) = self.chunk_biomes_ord.pop_front() {
+                    self.chunk_biomes.remove(&old);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     /// This generator's own beardifier resolver, for a worker that has to build the same
     /// columns the owner would (a test's per-generator override, not the global one).
     pub(crate) fn beard_resolver(&self) -> Option<BeardResolver> {
@@ -8540,6 +8575,20 @@ impl Gen {
         self.col_c.get(&(cx, cz)).cloned()
     }
 
+    /// This generator's resident columns as a snapshot: `(chunk, Arc)` pairs, for the
+    /// owner to install after a wave (`Gen::install_cols`). `Arc` clones only.
+    pub(crate) fn col_c_snapshot(&self) -> Vec<((i32, i32), std::sync::Arc<ChunkCols>)> {
+        self.col_c.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    /// This generator's resident biome unions as a snapshot: `(chunk, Arc)` pairs, for
+    /// the owner to merge after a wave (`Gen::merge_chunk_biomes`). `Arc` clones only.
+    pub(crate) fn chunk_biomes_snapshot(
+        &self,
+    ) -> Vec<((i32, i32), std::sync::Arc<Vec<String>>)> {
+        self.chunk_biomes.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
     /// feature-layer lookup: runs the default population dispatch on demand, then
     /// returns the override state for (x,y,z) if a feature wrote one.
     pub(crate) fn feat_state(
@@ -8693,6 +8742,19 @@ impl Gen {
         }
         self.chunk_biomes.insert((cx, cz), arc.clone());
         arc
+    }
+
+    /// Read-only view of one resident biome-union cache entry: the answer
+    /// [`Gen::chunk_biome_set`] would return, without the build, the LRU push or the
+    /// mutation. A wave worker (`populate_worker`) takes this first so a chunk whose
+    /// owner already built the union of its 3x3 reads that instead of rebuilding the
+    /// ~2304 `biome_quart` visits per chunk on the scratch, across waves.
+    pub(crate) fn chunk_biome_set_readonly(
+        &self,
+        cx: i32,
+        cz: i32,
+    ) -> Option<std::sync::Arc<Vec<String>>> {
+        self.chunk_biomes.get(&(cx, cz)).cloned()
     }
 
     /// Claim before executing each source chunk, exactly once in caller order.
