@@ -8430,6 +8430,20 @@ struct CarverDef {
     // CanyonCarverConfiguration
     rotation: FProv,
     canyon: Option<CanyonShape>,
+    /// Flat bitmap of the state ids the `#replaceable` tag accepts. Resolved once, lazily,
+    /// from `breg()` on the first carve that reaches this carver: asking `in_tag` for every
+    /// candidate cell was one of the carver hot loop's costs. `OnceLock` keeps `creg()`
+    /// independent of `breg()`'s initialisation order.
+    replaceable_bits: std::sync::OnceLock<Box<[u64]>>,
+}
+
+/// One carver name in a biome's list, resolved to its index in [`CarverReg::defs`]. The index is
+/// the answer the carve loop used to get from a `cfg.get(name)` hash lookup on every origin.
+struct ResolvedCarver {
+    name: String,
+    /// `usize::MAX` when the name has no configured carver — the original `cfg.get` miss was
+    /// skipped at the same list index, which is the carver's seed offset.
+    def_idx: usize,
 }
 
 /// `CanyonShapeConfiguration`, flattened. Field order matches its codec:
@@ -8446,10 +8460,26 @@ struct CanyonShape {
 }
 
 pub(crate) struct CarverReg {
-    cfg: HashMap<String, CarverDef>,
-    /// biome -> carver ids, in the order the biome lists them (the index is the
-    /// seed offset, so the order is load-bearing)
+    /// name -> carver definition, kept for the diagnostics that name a carver. The carve hot
+    /// loop never consults it: [`Self::biome_resolved`] carries the direct index instead.
+    cfg: HashMap<String, &'static CarverDef>,
+    /// Every configured carver in insertion order. Indexed directly by the resolved `def_idx`
+    /// in the `17x17` origin loop instead of hash-looking up a name per candidate.
+    defs: Vec<&'static CarverDef>,
+    /// biome -> carver names, in the order the biome lists them (the index is the seed offset,
+    /// so the order is load-bearing). Kept as the canonical name list.
     biome: HashMap<String, Vec<String>>,
+    /// biome -> the same lists with each name resolved to its index in `defs`, so the hot loop
+    /// needs no name lookup at all.
+    biome_resolved: HashMap<String, Vec<ResolvedCarver>>,
+}
+
+impl CarverReg {
+    /// A configured carver by its resource name, for diagnostics and tests only.
+    #[cfg(test)]
+    fn def(&self, name: &str) -> Option<&'static CarverDef> {
+        self.cfg.get(name).copied()
+    }
 }
 
 pub(crate) fn creg() -> &'static CarverReg {
@@ -8460,13 +8490,22 @@ pub(crate) fn creg() -> &'static CarverReg {
 fn load_creg() -> CarverReg {
     let mut reg = CarverReg {
         cfg: HashMap::new(),
+        defs: Vec::new(),
         biome: HashMap::new(),
+        biome_resolved: HashMap::new(),
     };
+    let mut by_name: HashMap<String, usize> = HashMap::new();
     for (name, b) in Gen::dp_files("configured_carver") {
         if let Some(j) = jparse(&b) {
             match p_carver(&j) {
                 Some(d) => {
-                    reg.cfg.insert(name, d);
+                    // The registry is `&'static` and each carver is immutable, so leaking the
+                    // definition lets both `cfg` and `defs` own a stable `&'static` reference.
+                    let d: &'static CarverDef = Box::leak(Box::new(d));
+                    let idx = reg.defs.len();
+                    reg.cfg.insert(name.clone(), d);
+                    reg.defs.push(d);
+                    by_name.insert(name, idx);
                 }
                 // A carver type this port does not implement must not silently
                 // become a different algorithm: it stays out of the registry and
@@ -8476,10 +8515,18 @@ fn load_creg() -> CarverReg {
         }
     }
     for (name, b) in Gen::dp_files("biome") {
-        if let Some(j) = jparse(&b) {
-            if let Some(list) = carver_list(&j) {
-                reg.biome.insert(name, list);
-            }
+        if let Some(list) = jparse(&b).and_then(|j| carver_list(&j)) {
+            // Resolve every name once. Keep unknown names as a sentinel entry so the
+            // seed offset (`k`, the list position) stays exactly as before.
+            let resolved = list
+                .iter()
+                .map(|name| ResolvedCarver {
+                    def_idx: by_name.get(name).copied().unwrap_or(usize::MAX),
+                    name: name.clone(),
+                })
+                .collect();
+            reg.biome_resolved.insert(name.clone(), resolved);
+            reg.biome.insert(name, list);
         }
     }
     reg
@@ -8588,6 +8635,7 @@ fn p_carver(j: &J) -> Option<CarverDef> {
         vert: fprov(cfg, "vertical_radius_multiplier"),
         canyon,
         rotation: fprov(cfg, "vertical_rotation"),
+        replaceable_bits: std::sync::OnceLock::new(),
     })
 }
 
@@ -8643,7 +8691,7 @@ fn canyon_y(shape: CanyonShape, r: &mut Lcg, y_scale: f64, branch_count: f32, i:
 /// lookup behind it (`biome_name_at`: a quart sample plus one `String` clone) is a pure
 /// function of the generator's data and seed, and the `17x17` origin scan repeats it across
 /// adjacent chunks, so it is resolved once per origin and kept.
-type OriginCarvers = Option<(&'static str, &'static [String])>;
+type OriginCarvers = Option<(&'static str, &'static [ResolvedCarver])>;
 
 /// How many origin chunks one thread keeps resolved. The scan is 289 entries per chunk and a
 /// run walks chunks in raster order, so a few rows of the window is all any thread re-reads;
@@ -8679,8 +8727,50 @@ thread_local! {
         std::cell::RefCell::new(OriginCarversCache::default());
 }
 
+/// Number of block state ids the replaceable bitset covers. The loaded registry has 26_684
+/// states; this power-of-two bound leaves headroom. A state at or above it takes the
+/// (unreachable in practice) `in_tag` fallback in [`is_replaceable`].
+const CARVE_STATE_CAP: usize = 32 * 1024;
+
+/// The lazily-built bitset for one carver's `replaceable` tag.
+fn replaceable_bits<'a>(c: &'a CarverDef, br: &BReg) -> &'a [u64] {
+    c.replaceable_bits.get_or_init(|| {
+        let mut bits = vec![0u64; CARVE_STATE_CAP.div_ceil(64)];
+        for st in 0..CARVE_STATE_CAP as u32 {
+            if br.in_tag(st, &c.replaceable) {
+                bits[st as usize >> 6] |= 1u64 << (st & 63);
+            }
+        }
+        bits.into_boxed_slice()
+    })
+}
+
+/// Whether state `st` is in `c.replaceable`, answered from a flat bitmap instead of two hash
+/// lookups per carved cell. The bounds branch keeps the answer exact if the registry ever grows
+/// past [`CARVE_STATE_CAP`].
+#[inline]
+fn is_replaceable(c: &CarverDef, br: &BReg, st: u32) -> bool {
+    let bits = replaceable_bits(c, br);
+    if (st as usize) < CARVE_STATE_CAP {
+        bits[st as usize >> 6] >> (st & 63) & 1 != 0
+    } else {
+        br.in_tag(st, &c.replaceable)
+    }
+}
+
+/// Resolve the carver list of origin `(ox, oz)` from the biome at its minimum corner. Pure in
+/// `(data, seed, preset)`: a worker's scratch generator and the owner give the same answer.
+fn resolve_origin(g: &mut Gen, ox: i32, oz: i32) -> OriginCarvers {
+    g.biome_name_at(ox * 16, 0, oz * 16).and_then(|biome| {
+        creg()
+            .biome_resolved
+            .get_key_value(&biome)
+            .map(|(name, list)| (name.as_str(), list.as_slice()))
+    })
+}
+
 /// The carver list of origin chunk `(ox, oz)`, resolved once per (generator, seed, preset,
-/// origin).
+/// origin) and kept in the owner's thread-local cache.
 fn origin_carvers(g: &mut Gen, ox: i32, oz: i32) -> OriginCarvers {
     let ctx = (crate::worldgen::generation_seq(), g.wseed(), g.preset);
     ORIGIN_CARVERS.with(|cache| {
@@ -8693,14 +8783,7 @@ fn origin_carvers(g: &mut Gen, ox: i32, oz: i32) -> OriginCarvers {
         if let Some(hit) = cache.map.get(&(ox, oz)) {
             return *hit;
         }
-        // Resolving through a worker's scratch generator is the same answer: the biome source
-        // reads the immutable data and the seed and only fills this generator's own memo.
-        let resolved = g.biome_name_at(ox * 16, 0, oz * 16).and_then(|biome| {
-            creg()
-                .biome
-                .get_key_value(&biome)
-                .map(|(name, list)| (name.as_str(), list.as_slice()))
-        });
+        let resolved = resolve_origin(g, ox, oz);
         cache.map.insert((ox, oz), resolved);
         cache.order.push_back((ox, oz));
         while cache.order.len() > ORIGIN_CARVERS_CAP {
@@ -8710,6 +8793,120 @@ fn origin_carvers(g: &mut Gen, ox: i32, oz: i32) -> OriginCarvers {
         }
         resolved
     })
+}
+
+/// A rectangular grid of resolved origin-carver lists over
+/// `[ox0..ox0+w) x [oz0..oz0+h)`, shared read-only by every carve worker so each origin is
+/// sampled once per batch instead of `jobs` times. All its contents borrow from `creg()` (and
+/// are `Send + Sync`), so no lock is needed to read a cell.
+struct OriginGrid {
+    ox0: i32,
+    oz0: i32,
+    w: usize,
+    h: usize,
+    cells: Vec<OriginCarvers>,
+}
+
+impl OriginGrid {
+    /// The union bounding box of the claims plus each carver's `+/-8` origin reach.
+    fn new(order: &[(i32, i32)]) -> Self {
+        let min_tx = order.iter().map(|p| p.0).min().unwrap_or(0);
+        let max_tx = order.iter().map(|p| p.0).max().unwrap_or(0);
+        let min_tz = order.iter().map(|p| p.1).min().unwrap_or(0);
+        let max_tz = order.iter().map(|p| p.1).max().unwrap_or(0);
+        let (ox0, oz0) = (min_tx - 8, min_tz - 8);
+        let w = (max_tx - min_tx + 17) as usize;
+        let h = (max_tz - min_tz + 17) as usize;
+        Self {
+            ox0,
+            oz0,
+            w,
+            h,
+            cells: vec![None; w * h],
+        }
+    }
+    #[inline]
+    fn idx(&self, ox: i32, oz: i32) -> Option<usize> {
+        let ix = (ox - self.ox0) as usize;
+        let iz = (oz - self.oz0) as usize;
+        (ix < self.w && iz < self.h).then_some(ix * self.h + iz)
+    }
+    #[inline]
+    fn get(&self, ox: i32, oz: i32) -> OriginCarvers {
+        self.idx(ox, oz).map_or(None, |i| self.cells[i])
+    }
+    #[inline]
+    fn set(&mut self, ox: i32, oz: i32, v: OriginCarvers) {
+        if let Some(i) = self.idx(ox, oz) {
+            self.cells[i] = v;
+        }
+    }
+}
+
+/// Fill an [`OriginGrid`] for `claims`: reuse the owner's cache first, resolve the misses once
+/// (in parallel when there are enough of them), then record the new answers back in the cache.
+fn build_origin_grid(g: &mut Gen, claims: &[(i32, i32)], jobs: usize) -> OriginGrid {
+    let mut grid = OriginGrid::new(claims);
+    let ctx = (crate::worldgen::generation_seq(), g.wseed(), g.preset);
+    let mut missing: Vec<(i32, i32)> = Vec::new();
+    ORIGIN_CARVERS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.ctx != ctx {
+            cache.ctx = ctx;
+            cache.map.clear();
+            cache.order.clear();
+        }
+        let (ox0, oz0, w, h) = (grid.ox0, grid.oz0, grid.w, grid.h);
+        for ix in 0..w {
+            for iz in 0..h {
+                let (ox, oz) = (ox0 + ix as i32, oz0 + iz as i32);
+                match cache.map.get(&(ox, oz)) {
+                    Some(&v) => grid.set(ox, oz, v),
+                    None => missing.push((ox, oz)),
+                }
+            }
+        }
+    });
+    if jobs > 1 && missing.len() >= 8 {
+        let owner: &Gen = &*g;
+        let per = missing.len().div_ceil(jobs).max(1);
+        let mut resolved: Vec<OriginCarvers> = vec![None; missing.len()];
+        std::thread::scope(|s| {
+            for (chunk, out) in missing.chunks(per).zip(resolved.chunks_mut(per)) {
+                s.spawn(move || {
+                    let mut scratch = Gen::fresh_scratch(owner.data.clone());
+                    scratch.starts_round = owner.starts_round;
+                    if let Some(resolver) = owner.beard_resolver() {
+                        scratch.set_beard_resolver(resolver);
+                    }
+                    for (&(ox, oz), slot) in chunk.iter().zip(out.iter_mut()) {
+                        *slot = resolve_origin(&mut scratch, ox, oz);
+                    }
+                });
+            }
+        });
+        for (&(ox, oz), &v) in missing.iter().zip(&resolved) {
+            grid.set(ox, oz, v);
+        }
+    } else {
+        for &(ox, oz) in &missing {
+            let v = resolve_origin(g, ox, oz);
+            grid.set(ox, oz, v);
+        }
+    }
+    ORIGIN_CARVERS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        for &(ox, oz) in &missing {
+            cache.map.insert((ox, oz), grid.get(ox, oz));
+            cache.order.push_back((ox, oz));
+            while cache.order.len() > ORIGIN_CARVERS_CAP {
+                if let Some(old) = cache.order.pop_front() {
+                    cache.map.remove(&old);
+                }
+            }
+        }
+    });
+    grid
 }
 
 /// The prefetched base state of one cell: the owner generator a worker carves for, else the
@@ -8730,14 +8927,61 @@ thread_local! {
     static CARVE_PREFETCH_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Test-side proof that [`carve_ring_parallel`] really spawned workers: the serial and the
+/// Test-side proof that [`carve_batch`] really spawned workers: the serial and the
 /// parallel arm produce the same bytes, so the comparison alone cannot say which one ran.
 #[cfg(test)]
 static CARVE_RING_WORKERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// One target chunk's carving state: the shared mask, the cells written so far,
-/// and the `CarvingContext` facts the carve reads (world bounds, floor level).
-struct CarveRun<'a> {
+/// Reusable per-thread buffers for one target chunk's carve. A worker creates one and keeps it
+/// across every chunk in its slice; the owner has a thread-local one for serial carves. Reusing
+/// them removed a 396 KB allocate-and-zero (384 KB `out` + 12 KB `mask`) on every chunk.
+struct CarveScratch {
+    height: usize,
+    mask: Vec<u64>,
+    out: Vec<u32>,
+    out_order: Vec<u32>,
+    shape_marks: Vec<(i32, i32, i32)>,
+}
+
+impl CarveScratch {
+    fn new() -> Self {
+        Self {
+            height: 0,
+            mask: Vec::new(),
+            out: Vec::new(),
+            out_order: Vec::new(),
+            shape_marks: Vec::new(),
+        }
+    }
+    /// Make the buffers ready for a chunk of `height` blocks. On the common same-height path
+    /// only the slots actually written last time are restored, both small vectors are cleared
+    /// and the mask is zeroed in place, so no allocation happens per chunk.
+    fn reset_for(&mut self, height: usize) {
+        if self.height != height {
+            self.mask = vec![0u64; (height * 256).div_ceil(64)];
+            self.out = vec![u32::MAX; height * 256];
+            self.height = height;
+        } else {
+            for &i in &self.out_order {
+                self.out[i as usize] = u32::MAX;
+            }
+            self.mask.fill(0);
+        }
+        self.out_order.clear();
+        self.shape_marks.clear();
+    }
+}
+
+thread_local! {
+    /// The owner's scratch buffer for the serial carve paths (`apply_carvers`, `carve_claimed`).
+    static CARVE_SCRATCH: std::cell::RefCell<CarveScratch> =
+        std::cell::RefCell::new(CarveScratch::new());
+}
+
+/// One target chunk's carving state: a borrowed [`CarveScratch`] holding the shared mask and the
+/// cells written so far, plus the `CarvingContext` facts the carve reads (world bounds, floor
+/// level) and the block states resolved once per run instead of once per candidate cell.
+struct CarveRun<'a, 's> {
     tx: i32,
     tz: i32,
     min_y: i32,
@@ -8748,15 +8992,7 @@ struct CarveRun<'a> {
     /// `lava_level` of the carver being applied, set before its first read: see
     /// [`CarveRun::read`] for why the prefetch fast path refuses a cell at or below it.
     lava: i32,
-    mask: Vec<u64>,
-    /// The cells written so far, indexed by [`CarveRun::idx`], with `u32::MAX` for "not
-    /// written". This used to be a `HashMap<(lx, y, lz), u32>`: the carver reads one cell per
-    /// block it considers, so every read paid a hash and every write an allocation.
-    out: Vec<u32>,
-    /// The written indices in first-write order. A rewrite of the same cell updates `out`
-    /// without appending, so this is the exact write set the stage reports, scans for the WG
-    /// heightmaps and then commits to `feat_c`, in the order the carvers made the writes.
-    out_order: Vec<u32>,
+    scratch: &'s mut CarveScratch,
     /// The generator whose prefetched base rows answer a cell this run has not written
     /// (`None`: the generator being carved). A worker's scratch generator has no prefetch of
     /// its own, so its owner supplies the answers (see [`prefetched_cell`]).
@@ -8768,20 +9004,31 @@ struct CarveRun<'a> {
     probe: bool,
     probe_air: u32,
     probe_lava: u32,
+    /// `minecraft:stone`, for the probe read; resolved once per run.
+    stone_state: u32,
+    /// `grass_block` / `podzol` / `dirt`, for the surface-restore check in `carve_block`.
+    grass_state: u32,
+    podzol_state: u32,
+    dirt_state: u32,
+    /// `MC_SPINE_NOFOLD`, hoisted out of the per-cell `carve_block`.
+    nofold: bool,
     /// First cell the current source chunk wrote, for the `SRC` trace that is
     /// compared against the real server's carve agent.
     mark: Option<(i32, i32, i32)>,
-    /// `ChunkAccess.markPosForPostprocessing` calls this carve run filed, in the order the
-    /// carver made them. `WorldCarver.apply` has two sites: the carved cell when the aquifer
-    /// says its fluid is settled (`shouldScheduleFluidUpdate`), and the cell below when the
-    /// restored top material carries a fluid.
-    shape_marks: Vec<(i32, i32, i32)>,
 }
 
-impl<'a> CarveRun<'a> {
+impl<'a, 's> CarveRun<'a, 's> {
     /// An empty run for `(tx, tz)`: no writes, no mask bits, probe off.
-    fn empty(g: &Gen, pref: Option<&'a Gen>, tx: i32, tz: i32) -> Self {
+    fn empty(
+        g: &Gen,
+        pref: Option<&'a Gen>,
+        tx: i32,
+        tz: i32,
+        scratch: &'s mut CarveScratch,
+    ) -> Self {
         let (min_y, height) = (g.min_y, g.height);
+        scratch.reset_for(height as usize);
+        let br = breg();
         Self {
             tx,
             tz,
@@ -8791,15 +9038,17 @@ impl<'a> CarveRun<'a> {
             // No carver has run yet, so no cell is at or below a lava level this run knows:
             // the first `carve_block` sets it before its first read.
             lava: min_y - 1,
-            mask: vec![0u64; (height as usize * 256).div_ceil(64)],
-            out: vec![u32::MAX; height as usize * 256],
-            out_order: Vec::new(),
+            scratch,
             pref,
             probe: false,
-            probe_air: breg().map_or(12959, |b| b.state_of("minecraft:cave_air", None)),
-            probe_lava: breg().map_or(96, |b| b.state_of("minecraft:lava", None)),
+            probe_air: br.map_or(12959, |b| b.state_of("minecraft:cave_air", None)),
+            probe_lava: br.map_or(96, |b| b.state_of("minecraft:lava", None)),
+            stone_state: br.map_or(1, |b| b.state_of("minecraft:stone", None)),
+            grass_state: br.map_or(0, |b| b.state_of("minecraft:grass_block", None)),
+            podzol_state: br.map_or(0, |b| b.state_of("minecraft:podzol", None)),
+            dirt_state: br.map_or(0, |b| b.state_of("minecraft:dirt", None)),
+            nofold: env_flag!("MC_SPINE_NOFOLD"),
             mark: None,
-            shape_marks: Vec::new(),
         }
     }
     #[inline]
@@ -8822,18 +9071,18 @@ impl<'a> CarveRun<'a> {
     #[inline]
     fn mask_get(&self, lx: i32, y: i32, lz: i32) -> bool {
         let i = self.idx(lx, y, lz);
-        self.mask[i >> 6] >> (i & 63) & 1 != 0
+        self.scratch.mask[i >> 6] >> (i & 63) & 1 != 0
     }
     #[inline]
     fn mask_set(&mut self, lx: i32, y: i32, lz: i32) {
         let i = self.idx(lx, y, lz);
-        self.mask[i >> 6] |= 1 << (i & 63);
+        self.scratch.mask[i >> 6] |= 1 << (i & 63);
     }
     /// The cell this run has written, if it has: the fold (`& 15`) is inside [`CarveRun::idx`].
     #[inline]
     fn written(&self, lx: i32, y: i32, lz: i32) -> Option<u32> {
         let i = self.slot(lx, y, lz)?;
-        let st = self.out[i];
+        let st = self.scratch.out[i];
         (st != u32::MAX).then_some(st)
     }
     /// Record a carve write: the first write to a cell appends its index, later ones only
@@ -8841,10 +9090,10 @@ impl<'a> CarveRun<'a> {
     #[inline]
     fn put(&mut self, lx: i32, y: i32, lz: i32, st: u32) {
         if let Some(i) = self.slot(lx, y, lz) {
-            if self.out[i] == u32::MAX {
-                self.out_order.push(i as u32);
+            if self.scratch.out[i] == u32::MAX {
+                self.scratch.out_order.push(i as u32);
             }
-            self.out[i] = st;
+            self.scratch.out[i] = st;
         }
     }
     /// The local position a flat index stands for, inverting [`CarveRun::idx`].
@@ -8861,7 +9110,7 @@ impl<'a> CarveRun<'a> {
     /// this pass, else the surface-rule terrain.
     fn read(&self, g: &mut Gen, cc: &ChunkCols, x: i32, y: i32, z: i32) -> u32 {
         if self.probe {
-            return breg().map_or(1, |b| b.state_of("minecraft:stone", None));
+            return self.stone_state;
         }
         // Vanilla hands `carveBlock` the *target* chunk and both the read and the
         // write go through `pos` folded with `& 15`, so out-of-chunk candidates
@@ -8913,7 +9162,7 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
     // M3 P1a M5: the carver stage is the tail the rest of the batch waits on. The body has
     // several early exits; the wrapper is how every one of them is timed without moving them.
     let t0 = crate::worldgen::m3_start();
-    apply_carvers_body(g, tx, tz);
+    apply_carvers_body(g, tx, tz, None);
     crate::worldgen::m3_elapsed(
         crate::worldgen::M3_CARVER_NS,
         crate::worldgen::M3_CARVER_N,
@@ -8921,19 +9170,24 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
     );
 }
 
-fn apply_carvers_body(g: &mut Gen, tx: i32, tz: i32) {
+/// `grid`, when a batch has already resolved the origins, is passed straight through; a serial
+/// single-chunk call falls back to [`origin_carvers`] and its owner-thread cache.
+fn apply_carvers_body(g: &mut Gen, tx: i32, tz: i32, grid: Option<&OriginGrid>) {
     if env_flag!("MC_SPINE_NOCARVE") {
         return;
     }
     let reg = creg();
-    if reg.cfg.is_empty() || reg.biome.is_empty() || breg().is_none() {
+    if reg.defs.is_empty() || reg.biome.is_empty() || breg().is_none() {
         return;
     }
     let Some(cc) = g.cols(tx, tz) else { return };
     if !g.begin_carve(tx, tz) {
         return;
     }
-    let out = compute_carve_chunk(g, None, &cc, tx, tz);
+    let out = CARVE_SCRATCH.with(|s| {
+        let mut scratch = s.borrow_mut();
+        compute_carve_chunk(g, None, grid, &cc, tx, tz, &mut scratch)
+    });
     commit_carve(g, out);
 }
 
@@ -8968,7 +9222,7 @@ fn carve_ring_with(g: &mut Gen, sx: i32, sz: i32, jobs: usize) {
         }
         return;
     }
-    carve_ring_parallel(g, &order, jobs);
+    carve_batch(g, &order, jobs);
 }
 
 /// `true` when a carver diagnostic that prints per-carver or per-cell lines is on.
@@ -8984,22 +9238,23 @@ fn carver_diag_env() -> bool {
         || env_flag!("MC_SPINE_NOFOLD")
 }
 
-/// Carve the ring's chunks on `jobs` worker threads, the same work [`carve_ring`] does on one.
+/// Carve a batch of chunks on `jobs` worker threads, the same work the serial arm does on one.
 ///
-/// The claims are made on the owner first (they are the owner's state, and the order is what
-/// the commit order follows); each worker then carves its share on its own scratch generator,
-/// reading the owner's prefetched base terrain, and the results are committed on the owner in
-/// claim order. Nothing a carve reads is another chunk's carve output — `carve_state`,
-/// `top_material_at` and `terrain_cell` read `data`, `starts_round` and the beard resolver,
-/// never `feat_c` — so the split cannot change the answer, only its schedule.
-fn carve_ring_parallel(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
-    // The same gates `apply_carvers_body` applies, once for the whole ring: a run that skips
+/// The claims are made on the owner first (they are the owner's state, and the order is what the
+/// commit order follows); the origins the carvers read are resolved once into a shared
+/// [`OriginGrid`]; each worker then carves its share on its own scratch generator and reusable
+/// [`CarveScratch`], reading the owner's prefetched base terrain, and the results are committed
+/// on the owner in claim order. Nothing a carve reads is another chunk's carve output —
+/// `carve_state`, `top_material_at` and `terrain_cell` read `data`, `starts_round` and the beard
+/// resolver, never `feat_c` — so the split cannot change the answer, only its schedule.
+pub(crate) fn carve_batch(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
+    // The same gates `apply_carvers_body` applies, once for the whole batch: a run that skips
     // carvers or has no carver registry must not claim anything.
     if env_flag!("MC_SPINE_NOCARVE") {
         return;
     }
     let reg = creg();
-    if reg.cfg.is_empty() || reg.biome.is_empty() || breg().is_none() {
+    if reg.defs.is_empty() || reg.biome.is_empty() || breg().is_none() {
         return;
     }
     // Claim first, and claim *only*: the columns a carve needs are most of the stage's cost,
@@ -9020,6 +9275,9 @@ fn carve_ring_parallel(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
         }
         return;
     }
+    // Resolve every origin the batch will read once, up front, then share the answer. Workers no
+    // longer recompute 289 `biome_name_at` calls each on a cold thread-local cache.
+    let grid = build_origin_grid(g, &claims, jobs);
     let jobs = jobs.min(claims.len());
     let mut results: Vec<Option<CarveSlot>> = claims.iter().map(|_| None).collect();
     {
@@ -9027,6 +9285,9 @@ fn carve_ring_parallel(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
         // landed row is the state `terrain_cell` would compute, and nothing a worker writes
         // reaches the owner until the commit below.
         let owner: &Gen = &*g;
+        // Take a shared reference outside the loop: a `move` worker closure captures it by copy,
+        // while capturing `grid` itself would try to move the same value into every worker.
+        let grid_ref: &OriginGrid = &grid;
         let per = claims.len().div_ceil(jobs).max(1);
         let mut start = 0usize;
         std::thread::scope(|s| {
@@ -9038,22 +9299,25 @@ fn carve_ring_parallel(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
                     CARVE_RING_WORKERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // M3 P1a M1/M4: everything this thread does is off-owner work.
                     crate::worldgen::m3_set_worker(true);
-                    let mut scratch = Gen::fresh_scratch(owner.data.clone());
-                    scratch.starts_round = owner.starts_round;
+                    let mut gen = Gen::fresh_scratch(owner.data.clone());
+                    gen.starts_round = owner.starts_round;
                     if let Some(resolver) = owner.beard_resolver() {
-                        scratch.set_beard_resolver(resolver);
+                        gen.set_beard_resolver(resolver);
                     }
+                    let mut carve_scratch = CarveScratch::new();
                     for (slot, &(tx, tz)) in slice.iter_mut().zip(cslice) {
                         let t0 = crate::worldgen::m3_start();
                         let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            match scratch.cols(tx, tz) {
+                            match gen.cols(tx, tz) {
                                 Some(cc) => {
                                     let out = compute_carve_chunk(
-                                        &mut scratch,
+                                        &mut gen,
                                         Some(owner),
+                                        Some(grid_ref),
                                         &cc,
                                         tx,
                                         tz,
+                                        &mut carve_scratch,
                                     );
                                     Some((out, cc))
                                 }
@@ -9071,15 +9335,16 @@ fn carve_ring_parallel(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
                             Ok(Some((out, cc))) => *slot = Some(CarveSlot::Carved(out, cc)),
                             Ok(None) => *slot = Some(CarveSlot::NoColumns),
                             // The claim is already made, so a panicking worker leaves its
-                            // chunk to the owner (re-run after the scope). The generator may
-                            // hold a half-updated memo after a panic, so it is replaced
-                            // rather than handed the next chunk.
+                            // chunk to the owner (re-run after the scope). Both the generator
+                            // and the scratch buffer can hold half-updated state after a panic,
+                            // so both are replaced rather than handed the next chunk.
                             Err(_) => {
-                                scratch = Gen::fresh_scratch(owner.data.clone());
-                                scratch.starts_round = owner.starts_round;
+                                gen = Gen::fresh_scratch(owner.data.clone());
+                                gen.starts_round = owner.starts_round;
                                 if let Some(resolver) = owner.beard_resolver() {
-                                    scratch.set_beard_resolver(resolver);
+                                    gen.set_beard_resolver(resolver);
                                 }
+                                carve_scratch = CarveScratch::new();
                             }
                         }
                     }
@@ -9122,7 +9387,10 @@ fn carve_claimed(g: &mut Gen, tx: i32, tz: i32) {
     let Some(cc) = g.cols(tx, tz) else {
         return;
     };
-    let out = compute_carve_chunk(g, None, &cc, tx, tz);
+    let out = CARVE_SCRATCH.with(|s| {
+        let mut scratch = s.borrow_mut();
+        compute_carve_chunk(g, None, None, &cc, tx, tz, &mut scratch)
+    });
     crate::worldgen::m3_elapsed(
         crate::worldgen::M3_CARVER_NS,
         crate::worldgen::M3_CARVER_N,
@@ -9173,46 +9441,70 @@ fn commit_carve(g: &mut Gen, out: CarveOutput) {
 fn compute_carve_chunk(
     g: &mut Gen,
     pref: Option<&Gen>,
+    grid: Option<&OriginGrid>,
     cc: &ChunkCols,
     tx: i32,
     tz: i32,
+    scratch: &mut CarveScratch,
 ) -> CarveOutput {
     let reg = creg();
+    // All diagnostics are read once per chunk and then reused; in particular `here` is only
+    // formatted when a diagnostic that compares against it is actually on.
     let trace = env_flag!("CARVE_TRACE");
-    let here = format!("{tx},{tz}");
     let probe_env = env_str!("CARVE_PROBE");
-    let probe_here = probe_env == Some("all") || probe_env == Some(&here);
-    let dump_here = env_str!("CARVE_DUMP_WRITES") == Some(here.as_str());
+    let dump_env = env_str!("CARVE_DUMP_WRITES");
     let only = env_str!("CARVE_ONLY");
+    let carve_rng = env_str!("CARVE_RNG");
+    let carve_src = env_str!("CARVE_SRC");
+    let here = if probe_env.is_some() || dump_env.is_some() || carve_src.is_some() {
+        Some(format!("{tx},{tz}"))
+    } else {
+        None
+    };
+    let here_str = here.as_deref();
+    let probe_here = probe_env == Some("all") || (here_str.is_some() && probe_env == here_str);
+    let dump_here = dump_env.is_some() && dump_env == here_str;
     let wseed = g.wseed();
-    let mut run = CarveRun::empty(g, pref, tx, tz);
+    let mut run = CarveRun::empty(g, pref, tx, tz, scratch);
     run.probe = probe_here;
     let mut starts = 0u32;
     for ox in tx - 8..=tx + 8 {
         for oz in tz - 8..=tz + 8 {
             // the carver list comes from the biome at the neighbour chunk's
-            // minimum corner at y=0, not from its centre
-            let Some((biome, list)) = origin_carvers(g, ox, oz) else {
+            // minimum corner at y=0, not from its centre. With a shared grid this is one
+            // bounds-checked slice read per origin, with no lock and no duplicate sampling.
+            let origin = match grid {
+                Some(grid) => grid.get(ox, oz),
+                None => origin_carvers(g, ox, oz),
+            };
+            let Some((biome, list)) = origin else {
                 continue;
             };
-            for (k, name) in list.iter().enumerate() {
+            for (k, rc) in list.iter().enumerate() {
+                let name = &rc.name;
                 if only.is_some_and(|only| only != name) {
                     continue;
                 }
-                let Some(c) = reg.cfg.get(name) else { continue };
+                // An unconfigured name was skipped at this same `k` before any RNG draw; keep
+                // the sentinel so the carver's seed offset is unchanged.
+                if rc.def_idx == usize::MAX {
+                    continue;
+                }
+                let c = reg.defs[rc.def_idx];
                 let mut r = Lcg::new(0);
                 set_large_feature_seed(&mut r, wseed.wrapping_add(k as u64), ox, oz);
                 if r.next_f32() > c.probability {
                     continue;
                 }
                 starts += 1;
-                if let Some(spec) = env_str!("CARVE_RNG") {
+                // The `format!` here only runs when CARVE_RNG is actually set.
+                if let Some(spec) = carve_rng {
                     if spec == format!("{ox},{oz}") || spec == "all" {
                         crate::generation_math::RNG_TRACE
                             .store(400, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                if env_flag!("CARVE_TRACE") {
+                if trace {
                     eprintln!("START target={tx},{tz} origin={ox},{oz} k={k} {name} ({biome})");
                 }
                 run.mark = None;
@@ -9220,8 +9512,8 @@ fn compute_carve_chunk(
                     CKind::Cave | CKind::NetherCave => run.cave(g, cc, c, &mut r, ox, oz),
                     CKind::Canyon => run.canyon(g, cc, c, &mut r, ox, oz),
                 }
-                if let Some(spec) = env_str!("CARVE_SRC") {
-                    if spec == "all" || spec == format!("{tx},{tz}") {
+                if let Some(spec) = carve_src {
+                    if spec == "all" || here_str.is_some_and(|h| spec == h) {
                         if let Some((x, y, z)) = run.mark {
                             eprintln!("SRC ox={ox} oz={oz} k={k} first={x},{y},{z}");
                         }
@@ -9234,18 +9526,26 @@ fn compute_carve_chunk(
         eprintln!(
             "[carve] chunk {tx},{tz}: {} starts, {} mask bits, {} cells written",
             starts,
-            run.mask.iter().map(|w| w.count_ones() as u64).sum::<u64>(),
-            run.out_order.len()
+            run.scratch
+                .mask
+                .iter()
+                .map(|w| w.count_ones() as u64)
+                .sum::<u64>(),
+            run.scratch.out_order.len()
         );
     }
     if probe_here || dump_here {
         let tag = if probe_here { "CELL" } else { "WCELL" };
         let mut cells: Vec<((u8, i32, u8), u32)> = run
+            .scratch
             .out_order
             .iter()
             .map(|&i| {
                 let (lx, y, lz) = run.pos_of(i);
-                (((lx & 15) as u8, y, (lz & 15) as u8), run.out[i as usize])
+                (
+                    ((lx & 15) as u8, y, (lz & 15) as u8),
+                    run.scratch.out[i as usize],
+                )
             })
             .collect();
         cells.sort();
@@ -9261,20 +9561,25 @@ fn compute_carve_chunk(
         eprintln!(
             "PROBE {} cells={}",
             if probe_here { "stone" } else { "world" },
-            run.out_order.len()
+            run.scratch.out_order.len()
         );
     }
     let wg = wg_heightmaps_after_carve_run(g, cc, tx, tz, &run);
-    let mut out_writes = Vec::with_capacity(run.out_order.len());
-    for &i in &run.out_order {
+    let mut out_writes = Vec::with_capacity(run.scratch.out_order.len());
+    for &i in &run.scratch.out_order {
         let (lx, y, lz) = run.pos_of(i);
-        out_writes.push((tx * 16 + lx, y, tz * 16 + lz, run.out[i as usize]));
+        out_writes.push((
+            tx * 16 + lx,
+            y,
+            tz * 16 + lz,
+            run.scratch.out[i as usize],
+        ));
     }
     CarveOutput {
         tx,
         tz,
         wg,
-        shape_marks: std::mem::take(&mut run.shape_marks),
+        shape_marks: std::mem::take(&mut run.scratch.shape_marks),
         out_writes,
     }
 }
@@ -9290,7 +9595,8 @@ fn wg_heightmaps_after_carve(
     tz: i32,
     writes: &HashMap<(u8, i32, u8), u32>,
 ) -> Box<[i32; 512]> {
-    let mut run = CarveRun::empty(g, None, tx, tz);
+    let mut scratch = CarveScratch::new();
+    let mut run = CarveRun::empty(g, None, tx, tz, &mut scratch);
     for (&(lx, y, lz), &st) in writes {
         run.put(lx as i32, y, lz as i32, st);
     }
@@ -9311,7 +9617,7 @@ fn wg_heightmaps_after_carve_run(
     cc: &ChunkCols,
     tx: i32,
     tz: i32,
-    run: &CarveRun<'_>,
+    run: &CarveRun<'_, '_>,
 ) -> Box<[i32; 512]> {
     let reg = breg();
     let Some(reg) = reg else {
@@ -9323,7 +9629,7 @@ fn wg_heightmaps_after_carve_run(
     // excludes air), but take the written maximum anyway so the scan bound is never the
     // reason a value is missed.
     let mut carve_top = [[i32::MIN; 16]; 16];
-    for &i in &run.out_order {
+    for &i in &run.scratch.out_order {
         let (lx, y, lz) = run.pos_of(i);
         let slot = &mut carve_top[(lz & 15) as usize][(lx & 15) as usize];
         *slot = (*slot).max(y);
@@ -9341,12 +9647,21 @@ fn wg_heightmaps_after_carve_run(
                 // Every `(wx, wz)` here is inside `(tx, tz)`, so the prefetched row is this
                 // chunk's own cell (see `CarveRun::read` for the two gates a carver read
                 // needs; the fold one cannot apply here).
-                let st = match run.written(lx as i32, y, lz as i32) {
-                    Some(st) => st,
-                    None => match prefetched_cell(g, run.pref, wx, y, wz) {
+                // A column with no carve writes has nothing for `written` to find, so skip
+                // that lookup entirely there — the base/terrain answer is identical.
+                let st = if carve_top[lz][lx] == i32::MIN {
+                    match prefetched_cell(g, run.pref, wx, y, wz) {
                         Some(st) => st,
                         None => g.terrain_cell(cc, wx, y, wz),
-                    },
+                    }
+                } else {
+                    match run.written(lx as i32, y, lz as i32) {
+                        Some(st) => st,
+                        None => match prefetched_cell(g, run.pref, wx, y, wz) {
+                            Some(st) => st,
+                            None => g.terrain_cell(cc, wx, y, wz),
+                        },
+                    }
                 };
                 if surface.is_none() && reg.heightmap_counts(st, HeightmapKind::WorldSurfaceWg) {
                     surface = Some(y + 1);
@@ -9367,7 +9682,7 @@ fn wg_heightmaps_after_carve_run(
     tops
 }
 
-impl CarveRun<'_> {
+impl CarveRun<'_, '_> {
     /// `CaveWorldCarver.carve`.
     fn cave(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, r: &mut Lcg, ox: i32, oz: i32) {
         // nextInt(nextInt(nextInt(getRange()) + 1) + 1); getRange() is 15 here
@@ -9767,9 +10082,8 @@ impl CarveRun<'_> {
             Some(br) => br,
             None => return false,
         };
-        let reached_surface = cur == br.state_of("minecraft:grass_block", None)
-            || cur == br.state_of("minecraft:podzol", None);
-        if !br.in_tag(cur, &c.replaceable) {
+        let reached_surface = cur == self.grass_state || cur == self.podzol_state;
+        if !is_replaceable(c, br, cur) {
             return false;
         }
         let lava_level = self.lava;
@@ -9796,7 +10110,7 @@ impl CarveRun<'_> {
         // (`x & 15`), so a tunnel from a source chunk up to 8 chunks away paints
         // its cells into the target chunk at folded coordinates. Keep that as
         // the default; MC_SPINE_NOFOLD=1 clips instead, for experiments.
-        if env_flag!("MC_SPINE_NOFOLD") && ((x >> 4) != self.tx || (z >> 4) != self.tz) {
+        if self.nofold && ((x >> 4) != self.tx || (z >> 4) != self.tz) {
             return false;
         }
         if self.mark.is_none() {
@@ -9810,17 +10124,19 @@ impl CarveRun<'_> {
         if !self.probe && g.aq_schedule_fluid_update() && has_fluid_state(br, st) {
             // Folded onto the chunk being carved: vanilla stores the mark as the packed local
             // offset on `chunk` (the target), so a far-chunk carve marks the cell it folds to.
-            self.shape_marks
+            self.scratch
+                .shape_marks
                 .push((self.tx * 16 + (x & 15), y, self.tz * 16 + (z & 15)));
         }
-        if reached_surface && self.read(g, cc, x, y - 1, z) == br.state_of("minecraft:dirt", None) {
+        if reached_surface && self.read(g, cc, x, y - 1, z) == self.dirt_state {
             let fluid = g.is_fluid_state(st);
             if let Some(top) = g.top_material_at(x, y - 1, z, fluid) {
                 self.put(x, y - 1, z, top);
                 // Second site: the restored top material is marked when its own fluid state is
                 // non-empty (no aquifer gate — vanilla asks the restored state only).
                 if !self.probe && has_fluid_state(br, top) {
-                    self.shape_marks
+                    self.scratch
+                        .shape_marks
                         .push((self.tx * 16 + (x & 15), y - 1, self.tz * 16 + (z & 15)));
                 }
             }
@@ -10530,13 +10846,13 @@ mod carver_parity_tests {
         // The level the data gives the overworld cave carver, not a literal: this test is about
         // the gate `carve_state` takes, which is that number.
         let lava = super::creg()
-            .cfg
-            .get("minecraft:cave")
+            .def("minecraft:cave")
             .expect("cave carver")
             .lava
             .resolve(g.min_y, g.height);
         let above_lava = lava + 6;
-        let mut run = super::CarveRun::empty(&g, None, cx, cz);
+        let mut carve_scratch = super::CarveScratch::new();
+        let mut run = super::CarveRun::empty(&g, None, cx, cz, &mut carve_scratch);
         run.lava = lava;
         let (x, z) = (cx * 16 + 1, cz * 16 + 1);
         let reads = || super::CARVE_PREFETCH_READS.with(|c| c.get());
@@ -10631,6 +10947,111 @@ mod carver_parity_tests {
         assert_eq!(cold.0, warm.0, "the carve writes differ");
         assert_eq!(cold.1, warm.1, "the post-carve WG heightmaps differ");
         assert_eq!(cold.2, warm.2, "the mark order differs");
+    }
+
+    /// The precomputed replaceable bitmap must agree with `in_tag` for every state id in the
+    /// tested range, including the ids past the real registry's 26_684 states (both answer false).
+    #[test]
+    fn carver_replaceable_bitset_matches_in_tag() {
+        crate::test_support::require_vanilla_data();
+        let _gen = lock_gen_for_tests();
+        let br = crate::block_registry::breg().expect("block registry");
+        let reg = super::creg();
+        assert!(!reg.defs.is_empty(), "the carver registry must be loaded");
+        for (def_idx, c) in reg.defs.iter().enumerate() {
+            for st in 0..30_000u32 {
+                assert_eq!(
+                    super::is_replaceable(c, br, st),
+                    br.in_tag(st, &c.replaceable),
+                    "carver {def_idx} ({}) state {st}",
+                    c.replaceable
+                );
+            }
+        }
+    }
+
+    /// The shared `OriginGrid` plus reusable scratch batch must leave the owner in exactly the
+    /// state the serial per-chunk arm leaves it over a 4x4 grid: same writes, WG heightmaps and
+    /// mark order for every chunk.
+    #[test]
+    fn carve_batch_matches_serial_bit_for_bit() {
+        crate::test_support::require_vanilla_data();
+        let _gen = lock_gen_for_tests();
+        let coords: Vec<(i32, i32)> = (0..4)
+            .flat_map(|cx| (0..4).map(move |cz| (cx, cz)))
+            .collect();
+
+        let mut serial = Gen::load(0, crate::name_to_state).expect("datapack");
+        for &(tx, tz) in &coords {
+            apply_carvers(&mut serial, tx, tz);
+        }
+        let mut par = Gen::load(0, crate::name_to_state).expect("datapack");
+        super::carve_batch(&mut par, &coords, 4);
+
+        let a: Vec<_> = coords
+            .iter()
+            .map(|&(cx, cz)| (cx, cz, snapshot(&mut serial, cx, cz)))
+            .collect();
+        let b: Vec<_> = coords
+            .iter()
+            .map(|&(cx, cz)| (cx, cz, snapshot(&mut par, cx, cz)))
+            .collect();
+        let writes: usize = a.iter().map(|s| s.2.0.len()).sum();
+        assert!(
+            writes > 0,
+            "the fixture must carve something before its identity means anything"
+        );
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!((x.0, x.1), (y.0, y.1));
+            assert_eq!(
+                x.2.0, y.2.0,
+                "chunk {},{}: batch carve writes differ",
+                x.0, x.1
+            );
+            assert_eq!(
+                x.2.1, y.2.1,
+                "chunk {},{}: post-carve WG heightmaps differ",
+                x.0, x.1
+            );
+            assert_eq!(
+                x.2.2, y.2.2,
+                "chunk {},{}: mark order differs",
+                x.0, x.1
+            );
+        }
+    }
+
+    /// Reusing one `CarveScratch` over consecutive chunks must not leak a written cell, a mask
+    /// bit, an order entry or a shape mark into the next chunk — on both the same-height fast
+    /// path and the resize path.
+    #[test]
+    fn carve_scratch_reuse_leaves_no_stale_state() {
+        let mut scratch = super::CarveScratch::new();
+        scratch.reset_for(384);
+        assert_eq!(scratch.out.len(), 384 * 256);
+        assert!(scratch.out.iter().all(|&v| v == u32::MAX));
+        assert!(scratch.mask.iter().all(|&v| v == 0));
+
+        // Dirty every kind of state, then reuse at the same height (the common path).
+        scratch.out[0] = 7;
+        scratch.out[12345] = 9;
+        scratch.mask[0] = u64::MAX;
+        scratch.mask[1] = 1;
+        scratch.out_order.extend([0, 12345]);
+        scratch.shape_marks.push((1, 2, 3));
+        scratch.reset_for(384);
+        assert!(scratch.out.iter().all(|&v| v == u32::MAX), "stale cell state");
+        assert!(scratch.mask.iter().all(|&v| v == 0), "stale mask bit");
+        assert!(scratch.out_order.is_empty(), "stale order entry");
+        assert!(scratch.shape_marks.is_empty(), "stale shape mark");
+
+        // The resize path must also start perfectly clean.
+        scratch.reset_for(320);
+        assert_eq!(scratch.out.len(), 320 * 256);
+        assert!(scratch.out.iter().all(|&v| v == u32::MAX));
+        assert!(scratch.mask.iter().all(|&v| v == 0));
+        assert!(scratch.out_order.is_empty());
+        assert!(scratch.shape_marks.is_empty());
     }
 }
 
