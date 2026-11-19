@@ -312,6 +312,41 @@ class PerfBenchTest(unittest.TestCase):
         ):
             self.assertIn(flag, proc.stdout)
 
+    def test_pgo_build_script_cli(self):
+        script = ROOT / "tools" / "pgo_build.sh"
+        self.assertTrue(script.is_file(), "tools/pgo_build.sh must exist")
+        self.assertTrue(
+            os.access(script, os.X_OK), "tools/pgo_build.sh must be executable"
+        )
+
+        def run(argv):
+            return subprocess.run(
+                [str(script)] + argv, capture_output=True, text=True, check=False,
+            )
+
+        # --help is accepted and documents the supported flags.
+        proc = run(["--help"])
+        self.assertEqual(proc.returncode, 0)
+        for flag in ("--out", "--dry-run", "--jobs"):
+            self.assertIn(flag, proc.stdout)
+
+        # Unknown flags are rejected (exit 2).
+        proc = run(["--frobnicate"])
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("unknown argument", proc.stderr)
+
+        # --dry-run parses arguments and reports the plan; it exits 0 when
+        # llvm-profdata is discoverable, otherwise with the actionable message.
+        proc = run(["--dry-run", "--out", "target/pgo/mc-spine", "--jobs", "2"])
+        if proc.returncode == 0:
+            self.assertIn("target/pgo/mc-spine", proc.stdout)
+            self.assertIn("llvm-profdata", proc.stdout)
+            self.assertIn("step 1 instrumented build", proc.stdout)
+            self.assertIn("step 5", proc.stdout)
+        else:
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("rustup component add llvm-tools", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

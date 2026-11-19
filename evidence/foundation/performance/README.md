@@ -1120,3 +1120,128 @@ for jobs in 1 5; do
 done
 MC_SPINE_M3_PROFILE=1 MC_SPINE_NOFEAT=1 MC_SPINE_GEN_JOBS=1 ./target/release/mc-spine 2>&1 | grep M5
 ```
+
+## Layer A1–A3 consolidated checkpoint (2026-11-19, d918eac)
+
+Baseline release binary (`target/release/mc-spine`, d918eac) on this host: AMD Ryzen 7
+9800X3D 8-Core Processor, nproc 16, Linux 7.3.4-1-cachyos; rustc/cargo 1.98.0;
+`TMPDIR=$PWD/target/tmp` for every command below.
+
+```sh
+export TMPDIR="$PWD/target/tmp"; mkdir -p target/tmp
+cargo build --release --offline --locked -j 2
+
+python3 tools/perf_bench.py --binary ./target/release/mc-spine \
+    --jobs 1,5,8 --rounds 3 --profile-counters --tmpdir target/tmp --markdown
+
+# Release-dump digests (seed 0, N=8, world window):
+env MC_SPINE_SEED=4242 MC_SPINE_WG_PRESET=nether MC_SPINE_WG_PROFILE=0 \
+    MC_SPINE_WG_DUMP=nether4242.bin MC_SPINE_WG_DUMP_N=8 MC_SPINE_WG_DUMP_X=0 MC_SPINE_WG_DUMP_Z=0 \
+    ./target/release/mc-spine && sha256sum nether4242.bin
+env MC_SPINE_SEED=0 MC_SPINE_WG_PRESET=end MC_SPINE_WG_PROFILE=0 \
+    MC_SPINE_WG_DUMP=end0.bin MC_SPINE_WG_DUMP_N=8 MC_SPINE_WG_DUMP_X=0 MC_SPINE_WG_DUMP_Z=0 \
+    ./target/release/mc-spine && sha256sum end0.bin
+
+tools/pgo_build.sh              # PGO binary: target/pgo/use/release/mc-spine
+
+python3 tools/perf_bench.py --compare-binary target/pgo/use/release/mc-spine \
+    --jobs 1,5,8 --rounds 3 --tmpdir target/tmp --markdown
+```
+
+Median wall/phase/CPU per cell, base binary, 3 interleaved rounds per cell
+(dump digests in column 9, verified against the recorded values):
+
+| workload | jobs | binary | wall median (s) | wall spread (s) | phase median (s) | cpu median (s) | ms/chunk | sha256 |
+|---|---|---|---|---|---|---|---|---|
+| full | 1 | base | 4.816 | 0.045 | 4.788 | 4.796 | 75.3 | 670fdfe34728 |
+| full | 5 | base | 3.117 | 0.069 | 3.089 | 5.606 | 48.7 | 670fdfe34728 |
+| full | 8 | base | 2.980 | 0.219 | 2.951 | 5.639 | 46.6 | 670fdfe34728 |
+| nofeat | 1 | base | 2.426 | 0.056 | 2.396 | 2.399 | 37.9 | 57101c434d49 |
+| nofeat | 5 | base | 1.292 | 0.060 | 1.265 | 2.483 | 20.2 | 57101c434d49 |
+| nofeat | 8 | base | 1.209 | 0.058 | 1.180 | 2.486 | 18.9 | 57101c434d49 |
+| terrain | 1 | base | 1.256 | 0.078 | 1.230 | 1.247 | 19.6 | bb499dfb6c53 |
+| terrain | 5 | base | 0.351 | 0.069 | 0.324 | 1.252 | 5.5 | bb499dfb6c53 |
+| terrain | 8 | base | 0.262 | 0.074 | 0.234 | 1.271 | 4.1 | bb499dfb6c53 |
+
+M1–M6 highlights (one profile pass per cell; M1 = `chunk_starts` owner/worker,
+M2 = `terr_c` evict, M4 = section installs, M6 = `df4` vec/bail, M5 = stage
+`ms/n`; base binary):
+
+| workload | jobs | M1 starts o/w | M2 evict | M4 worker sections | M6 vec/bail | M5 cols ms/n |
+|---|---|---|---|---|---|---|
+| full | 1 | 511/0 | 1024 | 1536 | 4687778/73829 | 3169.7/516 |
+| full | 5 | 126/385 | 1024 | 1536 | 3662746/60065 | 3858.8/454 |
+| full | 8 | 126/385 | 1024 | 1536 | 3662746/60065 | 4983.6/454 |
+| nofeat | 1 | 0/0 | 1024 | 1536 | 4598671/72741 | 899.9/230 |
+| nofeat | 5 | 0/0 | 1024 | 1536 | 3590058/59150 | 713.3/169 |
+| nofeat | 8 | 0/0 | 1024 | 1536 | 3590058/59150 | 716.3/169 |
+| terrain | 1 | 0/0 | 1024 | 1536 | 1846067/29090 | 264.7/64 |
+| terrain | 5 | 0/0 | 1024 | 1536 | 1846067/29090 | 266.4/64 |
+| terrain | 8 | 0/0 | 1024 | 1536 | 1846067/29090 | 276.0/64 |
+
+Reading the counters: M2 evictions stay pinned at 1024 everywhere (the
+persistent round FIFO bounds hold); M4 installs run at 1536 worker sections in
+every cell; the M1 owner/worker split is 511/0 at `full` j=1 and 126/385 at
+j=5/8; `full` j1 does the most `df4` traversal (vec 4,687,778 / bail 73,829)
+while `terrain` j1 needs little (1,846,067 / 29,090).
+
+SHA-256 verification (release binary, seed 0, `MC_SPINE_WG_DUMP_N=8`,
+`MC_SPINE_WG_DUMP_X=0`, `MC_SPINE_WG_DUMP_Z=0`):
+
+| dump | sha256 | result |
+|---|---|---|
+| full | `670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def` | matches `EXPECTED_SHA_DEFAULT["full"]` (tools/perf_bench.py) |
+| nofeat | `57101c434d49edf21f7efdd4207beca8cae34ff74cbf4ffdc009b680cb5d5a48` | matches |
+| terrain | `bb499dfb6c53128734a23f8722534a5f1882e7acbb53a9885a604ce74352beff` | matches |
+| Nether 4242 | `e2a3c1083d3f29fc01cc2145e296a59da1fc8858a5e032da84eee2d67eb3f97c` | matches (16,777,216 B dump) |
+| End 0 | `e2eb489f5746aed790e9730e9398c598ceb5f8d80bf4d126b832ccac1e833308` | matches (16,777,216 B dump) |
+
+PGO build (`tools/pgo_build.sh`, executable, `--out`/`--dry-run`/`--jobs N`
+supported; llvm-profdata discovery order: active toolchain rustup sysroot →
+other installed toolchains' sysroots → PATH → `/usr/bin/llvm-profdata*`).
+Used: `/home/yuu/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata`
+(LLVM 22.1.6). `/usr/bin/llvm-profdata` (23.1.5) was also discovered but
+rejected the raw profiles: "raw profile format version = 10; expected version
+= 11", so the script's first-working-candidate merge picked the 1.97.1
+toolchain tool. Training dumps (instrumented binary, `target/pgo/tmp`, deleted
+after each run) hashed to the recorded digests: overworld-j1/j8 =
+`670fdfe34728…`, nofeat-j8 = `57101c43…`, nether-4242 = `e2a3c108…`, end-0 =
+`e2eb489f…` — deterministic against the overworld full dump. Merged with
+`llvm-profdata merge -o target/pgo/merged.profdata target/pgo/raw/*.profraw`
+(absolute path: rustc resolves `-Cprofile-use` against its own cwd when cargo
+runs with `--target-dir`). Optimized build: `RUSTFLAGS="-Cprofile-use=target/pgo/merged.profdata
+-Cllvm-args=-pgo-warn-missing-function" cargo build --release --offline --locked -j 2
+--target-dir target/pgo/use` → `target/pgo/use/release/mc-spine`. Step 5: PGO
+binary 64-chunk full dump `sha256=670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def`
+→ **bit-identity check PASS**.
+
+Interleaved A/B (base = `./target/release/mc-spine`, candidate =
+`target/pgo/use/release/mc-spine`; 3 interleaved rounds per cell; every
+candidate dump hash equals the base hash — no `sha256 mismatch` anywhere):
+
+| workload | jobs | binary | wall median (s) | wall spread (s) | phase median (s) | cpu median (s) | ms/chunk | sha256 | Δ wall % | speedup |
+|---|---|---|---|---|---|---|---|---|---|---|
+| full | 1 | base | 4.802 | 0.026 | 4.774 | 4.791 | 75.0 | 670fdfe34728 | — | — |
+| full | 5 | base | 3.112 | 0.087 | 3.083 | 5.609 | 48.6 | 670fdfe34728 | — | — |
+| full | 8 | base | 2.971 | 0.139 | 2.942 | 5.626 | 46.4 | 670fdfe34728 | — | — |
+| nofeat | 1 | base | 2.438 | 0.050 | 2.412 | 2.375 | 38.1 | 57101c434d49 | — | — |
+| nofeat | 5 | base | 1.342 | 0.069 | 1.314 | 2.477 | 21.0 | 57101c434d49 | — | — |
+| nofeat | 8 | base | 1.212 | 0.096 | 1.186 | 2.490 | 18.9 | 57101c434d49 | — | — |
+| terrain | 1 | base | 1.296 | 0.061 | 1.270 | 1.239 | 20.2 | bb499dfb6c53 | — | — |
+| terrain | 5 | base | 0.400 | 0.069 | 0.374 | 1.249 | 6.3 | bb499dfb6c53 | — | — |
+| terrain | 8 | base | 0.304 | 0.099 | 0.278 | 1.249 | 4.8 | bb499dfb6c53 | — | — |
+| full | 1 | candidate | 4.324 | 0.031 | 4.297 | 4.312 | 67.6 | 670fdfe34728 | -10.0 | 1.11 |
+| full | 5 | candidate | 2.809 | 0.052 | 2.783 | 4.953 | 43.9 | 670fdfe34728 | -9.7 | 1.11 |
+| full | 8 | candidate | 2.656 | 0.111 | 2.631 | 4.997 | 41.5 | 670fdfe34728 | -10.6 | 1.12 |
+| nofeat | 1 | candidate | 2.207 | 0.068 | 2.183 | 2.137 | 34.5 | 57101c434d49 | -9.5 | 1.10 |
+| nofeat | 5 | candidate | 1.163 | 0.065 | 1.140 | 2.182 | 18.2 | 57101c434d49 | -13.3 | 1.15 |
+| nofeat | 8 | candidate | 1.077 | 0.085 | 1.053 | 2.200 | 16.8 | 57101c434d49 | -11.1 | 1.13 |
+| terrain | 1 | candidate | 1.156 | 0.042 | 1.131 | 1.109 | 18.1 | bb499dfb6c53 | -10.8 | 1.12 |
+| terrain | 5 | candidate | 0.352 | 0.075 | 0.327 | 1.113 | 5.5 | bb499dfb6c53 | -12.2 | 1.14 |
+| terrain | 8 | candidate | 0.265 | 0.082 | 0.242 | 1.124 | 4.1 | bb499dfb6c53 | -12.8 | 1.15 |
+
+PGO A/B summary: median wall −9.5 to −13.3% per cell (speedup 1.10–1.15 per
+cell, mean ≈ 1.13); phase medians track wall (−9.7 to −13.2%); candidate CPU
+medians are also modestly lower (e.g. `full` j1: 4.791 → 4.312, `nofeat` j8:
+2.490 → 2.200). The PGO binary is bit-identical on the dump digests
+(`670fdfe3…` / `57101c43…` / `bb499dfb6c53…`).
