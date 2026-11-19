@@ -435,14 +435,19 @@ fn player_eye_in_water(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -
     eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &block_at)
 }
 
-fn player_drowning_submerged(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> bool {
+fn player_drowning_submerged(
+    dim: DimId, x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool,
+) -> bool {
     let eh = player_eye_height(sneaking, fall_fly);
-    eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &block_at)
-        && !eye_in_bubble_column_with(x, y, z, eh, &block_at)
+    let get_block = |bx, by, bz| block_at_dim(dim, bx, by, bz);
+    eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &get_block)
+        && !eye_in_bubble_column_with(x, y, z, eh, &get_block)
 }
 
-fn player_in_lava(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> bool {
-    aabb_in_lava(player_bounding_box(x, y, z, sneaking, fall_fly))
+fn player_in_lava(dim: DimId, x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> bool {
+    aabb_in_lava_with(player_bounding_box(x, y, z, sneaking, fall_fly), &|bx, by, bz| {
+        block_at_dim(dim, bx, by, bz)
+    })
 }
 
 /// 1.21.1 `EntityType.<clinit>` (`bsx.javap`) & `EntityDimensions.defaultEyeHeight` (`height * 0.85f`).
@@ -1384,13 +1389,13 @@ mod entity_fluid_tests {
 
         // Client pose drowning & bubble column & flowing lava.
         set_block(4, 61, 0, 83); // level 3 water -> surf 61.5556
-        assert!(!player_drowning_submerged(4.5, 60.0, 0.5, false, false)); // standing eye 61.62
-        assert!(player_drowning_submerged(4.5, 60.0, 0.5, true, false)); // crouching eye 61.27
+        assert!(!player_drowning_submerged(DimId::Overworld, 4.5, 60.0, 0.5, false, false)); // standing eye 61.62
+        assert!(player_drowning_submerged(DimId::Overworld, 4.5, 60.0, 0.5, true, false)); // crouching eye 61.27
         set_block(4, 61, 0, bubble);
         assert!(player_eye_in_water(4.5, 60.0, 0.5, false, false));
-        assert!(!player_drowning_submerged(4.5, 60.0, 0.5, false, false));
+        assert!(!player_drowning_submerged(DimId::Overworld, 4.5, 60.0, 0.5, false, false));
         set_block(4, 60, 0, 102); // flowing lava level 6
-        assert!(player_in_lava(4.5, 60.0, 0.5, false, false));
+        assert!(player_in_lava(DimId::Overworld, 4.5, 60.0, 0.5, false, false));
 
         // Mob fall-damage cancellation in water (mob_snap_y).
         let cow_water = Arc::new(Mob {

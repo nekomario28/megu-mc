@@ -2136,14 +2136,14 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
     });
     // spawn streams via interest_tick
 }
-fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
+fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) -> Option<((i32, i32, i32), f32)> {
     // A mob in water or lava has its vertical motion owned by `LivingEntity.travel`
     // (`mob_fluid_travel_tick`), so the surface snap must not teleport it to the bed.
     if mob_has_support(m.etype, mp.0, mp.1, mp.2)
         || mob_in_water(m.etype, mp.0, mp.1, mp.2)
         || mob_in_lava(m.etype, mp.0, mp.1, mp.2)
     {
-        return;
+        return None;
     }
     // snap to ground surface; while buried only allow snaps within step height
     // so a fully enclosed mob cannot teleport out through solid blocks
@@ -2170,17 +2170,15 @@ fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
         let mut yy = mp.1.floor() as i32 + 1;
         while yy < sy.floor() as i32 {
             if !mob_passable(block_at(fx, yy, fz)) {
-                return;
+                return None;
             }
             yy += 1;
         }
         landed_in_water |= mob_in_water(m.etype, mp.0, sy, mp.2);
-        let converted = !landed_in_water
-            && landing::cow_land(
-                m,
-                (land_x, (sy - 0.2).floor() as i32, land_z),
-                (mp.1 - sy) as f32,
-            );
+        let landing = (!landed_in_water).then_some((
+            (land_x, (sy - 0.2).floor() as i32, land_z),
+            (mp.1 - sy) as f32,
+        ));
         // fall damage on descent >3 blocks; chicken/cat/ocelot immune (vanilla); water resets fall distance
         if !landed_in_water && mp.1 - sy > 3.0 && !matches!(m.etype, 19 | 15 | 72) {
             let mut hp = m.hp.lock().unwrap();
@@ -2188,11 +2186,10 @@ fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
             drop(hp);
             broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
         }
-        if converted {
-            sy += 1.0 / 16.0;
-        }
         mp.1 = sy;
+        return landing;
     }
+    None
 }
 fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) {
     // environmental death (suffocation/drowning/fall): drops but no XP —
@@ -3281,11 +3278,12 @@ fn keepalive_time_tick() {
                 *h = (*h - 1.0).max(1.0);
                 dirty = true;
             }
+            let player_dim = *c.dim.lock().unwrap();
             let sneaking = *c.sneaking.lock().unwrap();
             let fall_fly = *c.fall_fly.lock().unwrap();
             {
                 // drowning: 1.21.1 Entity.updateFluidOnEyes + LivingEntity.baseTick (!bubble_column)
-                let submerged = player_drowning_submerged(px, py, pz, sneaking, fall_fly);
+                let submerged = player_drowning_submerged(player_dim, px, py, pz, sneaking, fall_fly);
                 let mut air = c.air.lock().unwrap();
                 if !submerged {
                     *air = server_ticks(AIR_SUPPLY_GT) as i32;
@@ -3315,7 +3313,7 @@ fn keepalive_time_tick() {
             {
                 // lava: 1.21.1 Entity.isInLava (fluidHeight[LAVA] > 0.0 with deflate(0.001))
                 let fire_immune = c.effs.lock().unwrap().iter().any(|e| e.id == 11);
-                let in_lava = !fire_immune && player_in_lava(px, py, pz, sneaking, fall_fly);
+                let in_lava = !fire_immune && player_in_lava(player_dim, px, py, pz, sneaking, fall_fly);
                 if in_lava && t.is_multiple_of(server_ticks(10)) {
                     *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
                     dirty = true;
@@ -3333,7 +3331,7 @@ fn keepalive_time_tick() {
                 // fire_protection epf applies, armor does not
                 let fst = name_to_state("fire").unwrap_or(u32::MAX);
                 let in_fire = !fire_immune
-                    && (block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32) == fst);
+                    && (block_at_dim(player_dim, px.floor() as i32, py.floor() as i32, pz.floor() as i32) == fst);
                 if in_fire && t.is_multiple_of(server_ticks(20)) {
                     *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
                     dirty = true;
@@ -3545,37 +3543,8 @@ fn keepalive_time_tick() {
         }
         __t = __prof.then(std::time::Instant::now);
     }
-    // crop growth: ~1/30 chance per real second (per-tick denominator scales
-    // with ticks per second, so a cadence change keeps the same rate)
-    {
-        let mut cg = crops().lock().unwrap();
-        let mut ripe: Vec<(i32, i32, i32)> = Vec::new();
-        // Only the Overworld has a block write path so far (S2a): a crop in another dimension
-        // lives in its own registry entry, but there is no set_block_dim transaction to grow it.
-        let keys: Vec<DimBlockPos> = cg
-            .keys()
-            .copied()
-            .filter(|&(dim, x, _, z)| dim == DimId::Overworld && region.is_warm(x, z))
-            .collect();
-        for p in keys {
-            let (_, x, y, z) = p;
-            let age = cg.get(&p).cloned().unwrap_or(0);
-            let hh = ((x as i64).wrapping_mul(31)
-                ^ (z as i64).wrapping_mul(37)
-                ^ (y as i64)
-                ^ t as i64) as u64;
-            if hh.is_multiple_of(CROP_GROWTH_DENOMINATOR) && age < 7 {
-                cg.insert(p, age + 1);
-                let st = 4278 + (age as u32) + 1;
-                set_block(x, y, z, st);
-                ripe.push((x, y, z));
-            }
-        }
-        drop(cg);
-        for (x, y, z) in ripe {
-            note_block_update(x, y, z, block_at(x, y, z));
-        }
-    }
+    // Crop writes acquire SAVE_LOCK; grow_crops releases CROPS before any block write.
+    grow_crops(t, |x, z| region.is_warm(x, z));
     let autosave = server_ticks(AUTOSAVE_GT);
     if t % autosave == autosave - 1 {
         save_world();
@@ -3920,6 +3889,35 @@ fn keepalive_time_tick() {
         if let Some(t) = __t {
             tickprof::add("env/rest", t.elapsed());
         }
+    }
+}
+
+// ~1/30 chance per real second, with the per-tick denominator scaled to TPS.
+fn grow_crops(t: u64, is_warm: impl Fn(i32, i32) -> bool) {
+    let transitions = {
+        let mut cg = crops().lock().unwrap();
+        let keys: Vec<DimBlockPos> = cg
+            .keys()
+            .copied()
+            .filter(|&(_, x, _, z)| is_warm(x, z))
+            .collect();
+        let mut transitions = Vec::new();
+        for pos @ (dim, x, y, z) in keys {
+            let age = cg.get(&pos).copied().unwrap_or(0);
+            let hash = ((x as i64).wrapping_mul(31)
+                ^ (z as i64).wrapping_mul(37)
+                ^ (y as i64)
+                ^ t as i64) as u64;
+            if hash.is_multiple_of(CROP_GROWTH_DENOMINATOR) && age < 7 {
+                cg.insert(pos, age + 1);
+                transitions.push((dim, x, y, z, 4278 + age as u32 + 1));
+            }
+        }
+        transitions
+    };
+    for (dim, x, y, z, state) in transitions {
+        set_block_dim(dim, x, y, z, state);
+        note_block_update_dim(dim, x, y, z, state);
     }
 }
 /// Finite segment geometry. Unlike Valence's inclusive infinite ray, pinned
@@ -4493,8 +4491,9 @@ fn furnace_tick() {
         if let Some(fp) = fp {
             if dirty_pos.contains(&fp) {
                 let inv = c.inv.lock().unwrap().clone();
+                let slots = furnace_slot_snapshot(fp);
                 if let Ok(mut w) = c.sock.lock() {
-                    furnace_push_items(&mut w, fp, &inv);
+                    furnace_push_items_snap(&mut w, &inv, &slots);
                 }
             }
         }
@@ -5550,6 +5549,8 @@ fn mob_tick() {
                             mp.1.round() as i32,
                             mp.2.round() as i32,
                         );
+                        let (ex, ey, ez) = (mp.0, mp.1, mp.2);
+                        drop(mp);
                         let mut recs: Vec<(i8, i8, i8)> = vec![];
                         for dx in -3i32..=3 {
                             for dy in -3i32..=3 {
@@ -5571,10 +5572,10 @@ fn mob_tick() {
                                 }
                             }
                         }
-                        broadcast(-1, |_c| (0x20, explosion_pkt(mp.0, mp.1, mp.2, &recs)));
+                        broadcast(-1, |_c| (0x20, explosion_pkt(ex, ey, ez, &recs)));
                         for &(_eid, px, py, pz) in &cls {
                             let dd =
-                                ((px - mp.0).powi(2) + (py - mp.1).powi(2) + (pz - mp.2).powi(2))
+                                ((px - ex).powi(2) + (py - ey).powi(2) + (pz - ez).powi(2))
                                     .sqrt();
                             if dd < 5.0 {
                                 let c = clients().lock().unwrap();
@@ -5608,7 +5609,6 @@ fn mob_tick() {
                             }
                         }
                         drop(fuse);
-                        drop(mp);
                         let deid = m.eid;
                         mobs().lock().unwrap().retain(|m| m.eid != deid);
                         broadcast_seen_destroy(deid);
@@ -5645,14 +5645,23 @@ fn mob_tick() {
                 && ((m.eid as u64).wrapping_mul(1103515245) ^ TICK.load(Ordering::Relaxed))
                     .is_multiple_of(MOB_SPAWN_CHANCE_DENOMINATOR)
             {
+                drop(mp);
                 set_block(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
                 sheared().lock().unwrap().remove(&m.eid);
                 note_block_update(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
+                mp = m.pos.lock().unwrap();
             }
         }
         // passive mobs: slow wander + breeding (two loved animals -> baby)
         if matches!(m.etype, 22 | 77 | 87 | 19) {
-            mob_snap_y(m, &mut mp);
+            let landing = mob_snap_y(m, &mut mp);
+            drop(mp);
+            if let Some((landing_pos, fall)) = landing {
+                if landing::cow_land(m, landing_pos, fall) {
+                    m.pos.lock().unwrap().1 += 1.0 / 16.0;
+                }
+            }
+            let mut mp = m.pos.lock().unwrap();
             let mut lov = m.love.lock().unwrap();
             if *lov > 0 {
                 *lov -= 1;
@@ -12413,6 +12422,9 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
         world().lock().unwrap().len()
     );
     // optional META tail
+    let mut restored_mobs = Vec::new();
+    let mut restored_sheared = Vec::new();
+    let mut restored_mob_tags = Vec::new();
     if p + 4 <= payload.len() && matches!(&payload[p..p + 4], b"MET2" | b"MET3" | b"MET4") {
         let magic = &payload[p..p + 4];
         let has_comps = magic != b"MET2";
@@ -12422,7 +12434,6 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
         let legacy_ms_ages = magic != b"MET4";
         p += 4;
         let mn = rv(payload, &mut p);
-        let mut ms = mobs().lock().unwrap();
         for _ in 0..mn {
             if p + 28 > payload.len() {
                 break;
@@ -12436,22 +12447,8 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             p += 8;
             let hp = f32::from_be_bytes(b[p..p + 4].try_into().unwrap());
             p += 4;
-            ms.push(Arc::new(Mob {
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                uuid: [0u8; 16],
-                etype: et,
-                pos: Mutex::new((x, y, z, 0.0, 0.0)),
-                hp: Mutex::new(hp),
-                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                last_hurt_tick: Mutex::new(None),
-                vel: Mutex::new([0.0; 3]),
-                fuse: Mutex::new(0),
-                love: Mutex::new(0),
-                air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
-            }));
+            restored_mobs.push((et, x, y, z, hp));
         }
-        drop(ms);
         if p + 8 <= payload.len() {
             WORLD_TIME.store(
                 u64::from_be_bytes(b[p..p + 8].try_into().unwrap()),
@@ -12664,16 +12661,8 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
         if p < payload.len() {
             // sheared mob indices -> mark by load order (fresh eids)
             let sn = rv(payload, &mut p);
-            let mut shidx: Vec<usize> = Vec::new();
             for _ in 0..sn {
-                shidx.push(rv(payload, &mut p) as usize);
-            }
-            let ms = mobs().lock().unwrap();
-            let mut sh = sheared().lock().unwrap();
-            for i in shidx {
-                if let Some(m) = ms.get(i) {
-                    sh.insert(m.eid);
-                }
+                restored_sheared.push(rv(payload, &mut p) as usize);
             }
         }
         if p < payload.len() {
@@ -13035,13 +13024,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                     mtag.push((i, st));
                 }
             }
-            let ms = mobs().lock().unwrap();
-            for (i, st) in mtag {
-                if let Some(m) = ms.get(i) {
-                    tm.insert(format!("e:{}", m.eid), st);
-                }
-            }
-            drop(ms);
+            restored_mob_tags = mtag;
             if p < payload.len() {
                 let sn = rv(payload, &mut p);
                 let mut sf = sched_fns().lock().unwrap();
@@ -13363,6 +13346,41 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             let mut all = pending_block_loot().lock().unwrap();
             for (pos, entry) in dim2.loot {
                 all.insert(pos, entry);
+            }
+        }
+    }
+    // Persisted drop, projectile, TNT and falling-block IDs must reserve their range
+    // before mobs receive fresh IDs. Keep mob ordinals stable for shearing and tags.
+    if !restored_mobs.is_empty() {
+        let mut ms = mobs().lock().unwrap();
+        let first = ms.len();
+        for (etype, x, y, z, hp) in restored_mobs {
+            ms.push(Arc::new(Mob {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                uuid: [0u8; 16],
+                etype,
+                pos: Mutex::new((x, y, z, 0.0, 0.0)),
+                hp: Mutex::new(hp),
+                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                last_hurt_tick: Mutex::new(None),
+                vel: Mutex::new([0.0; 3]),
+                fuse: Mutex::new(0),
+                love: Mutex::new(0),
+                air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            }));
+        }
+        let mut sh = sheared().lock().unwrap();
+        for index in restored_sheared {
+            if let Some(m) = ms.get(first + index) {
+                sh.insert(m.eid);
+            }
+        }
+        drop(sh);
+        let mut tm = tags().lock().unwrap();
+        for (index, state) in restored_mob_tags {
+            if let Some(m) = ms.get(first + index) {
+                tm.insert(format!("e:{}", m.eid), state);
             }
         }
     }
@@ -21522,36 +21540,42 @@ fn craft_result(grid: &HashMap<i16, Stack>) -> Option<Stack> {
     }
     None
 }
-fn open_furnace_window(s: &mut TcpStream, pos: (i32, i32, i32), inv: &HashMap<i16, Stack>) {
+fn open_furnace_window(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: &[Stack; 3]) {
     let mut p = Vec::new();
     write_varint(&mut p, 2); // windowId 2 (chest uses 1)
     write_varint(&mut p, 14); // furnace menu
     p.extend_from_slice(&chat_nbt("Furnace"));
     let _ = send_packet(s, 0x33, p);
-    furnace_push_items(s, pos, inv);
+    furnace_push_items_snap(s, inv, slots);
 }
-fn furnace_push_items(s: &mut TcpStream, pos: (i32, i32, i32), inv: &HashMap<i16, Stack>) {
+fn furnace_slot_snapshot(pos: (i32, i32, i32)) -> [Stack; 3] {
+    let fs = furnaces().lock().unwrap();
+    let f = fs.get(&ow_block(pos));
+    [
+        f.map(|f| f.input.clone()).unwrap_or((0, 0, Vec::new())),
+        f.map(|f| f.fuel.clone()).unwrap_or((0, 0, Vec::new())),
+        f.map(|f| f.output.clone()).unwrap_or((0, 0, Vec::new())),
+    ]
+}
+fn furnace_push_items_snap(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: &[Stack; 3]) {
     let mut q = vec![2u8];
     write_varint(&mut q, 0);
     write_varint(&mut q, 39);
-    let (fi, fu, fo) = {
-        let fs = furnaces().lock().unwrap();
-        let f = fs.get(&ow_block(pos));
-        (
-            f.map(|f| f.input.clone()).unwrap_or((0, 0, Vec::new())),
-            f.map(|f| f.fuel.clone()).unwrap_or((0, 0, Vec::new())),
-            f.map(|f| f.output.clone()).unwrap_or((0, 0, Vec::new())),
-        )
-    };
-    q.extend_from_slice(&slot_wire(&fi));
-    q.extend_from_slice(&slot_wire(&fu));
-    q.extend_from_slice(&slot_wire(&fo));
+    for slot in slots {
+        q.extend_from_slice(&slot_wire(slot));
+    }
     for wsl in 3..39i16 {
         let (it, c, _cc) = inv.get(&(wsl + 6)).cloned().unwrap_or((0, 0, Vec::new()));
         q.extend_from_slice(&slot_wire(&(it, c, _cc)));
     }
     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
     let _ = send_packet(s, 0x13, q);
+}
+// The frozen reference in furnace_cache_tests still exercises the original signature.
+#[cfg(test)]
+fn furnace_push_items(s: &mut TcpStream, pos: (i32, i32, i32), inv: &HashMap<i16, Stack>) {
+    let slots = furnace_slot_snapshot(pos);
+    furnace_push_items_snap(s, inv, &slots);
 }
 fn ingr_match(ig: &Ingr, item: i64, depth: usize) -> bool {
     match ig {
@@ -26402,7 +26426,8 @@ fn handle(mut s: TcpStream) {
                 if block_at(x, y, z) == name_to_state("furnace").unwrap_or(u32::MAX) {
                     *me.open_furnace.lock().unwrap() = Some((x, y, z));
                     let inv = me.inv.lock().unwrap().clone();
-                    open_furnace_window(&mut me.sock.lock().unwrap(), (x, y, z), &inv);
+                    let slots = furnace_slot_snapshot((x, y, z));
+                    open_furnace_window(&mut me.sock.lock().unwrap(), &inv, &slots);
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
@@ -27860,26 +27885,30 @@ fn handle(mut s: TcpStream) {
                                         click_slot(&mut inv, &mut cur, islot, btn as i8);
                                         *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
                                     }
-                                    // echo whole furnace window (cheap, keeps client honest)
-                                    let (fi, fu, fo) =
-                                        (f.input.clone(), f.fuel.clone(), f.output.clone());
-                                    for (wsl, st) in [(0i16, fi), (1, fu), (2, fo)] {
+                                }
+                                // Snapshot the changed slots before acquiring the socket mutex.
+                                let slots = [f.input.clone(), f.fuel.clone(), f.output.clone()];
+                                let player_slot = (3..39).contains(&slot).then(|| {
+                                    (slot, inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new())))
+                                });
+                                drop(cur);
+                                drop(inv);
+                                drop(fs);
+                                if (0..39).contains(&slot) {
+                                    let mut sock = me.sock.lock().unwrap();
+                                    for (wsl, st) in slots.iter().enumerate() {
                                         let mut p = vec![2u8];
                                         write_varint(&mut p, 0);
-                                        p.extend_from_slice(&wsl.to_be_bytes());
-                                        p.extend_from_slice(&slot_wire(&st));
-                                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                                        p.extend_from_slice(&(wsl as i16).to_be_bytes());
+                                        p.extend_from_slice(&slot_wire(st));
+                                        let _ = send_packet(&mut sock, 0x15, p);
                                     }
-                                    if slot >= 3 {
-                                        let (it, c, _cc) = inv
-                                            .get(&(slot + 6))
-                                            .cloned()
-                                            .unwrap_or((0, 0, Vec::new()));
+                                    if let Some((slot, st)) = player_slot {
                                         let mut p = vec![2u8];
                                         write_varint(&mut p, 0);
                                         p.extend_from_slice(&slot.to_be_bytes());
-                                        p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                                        p.extend_from_slice(&slot_wire(&st));
+                                        let _ = send_packet(&mut sock, 0x15, p);
                                     }
                                 }
                                 continue;

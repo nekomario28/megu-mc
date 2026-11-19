@@ -1,6 +1,123 @@
 use super::*;
 use effect_tests::client_pair;
 
+/// Isolate the mutable entity and crop registries for round-trip regression tests.
+struct RuntimeRegistrySnapshot {
+    mobs: Vec<Arc<Mob>>,
+    crops: HashMap<DimBlockPos, u8>,
+    sheared: HashSet<i32>,
+    tags: HashMap<String, HashSet<String>>,
+    next_eid: i32,
+}
+
+impl RuntimeRegistrySnapshot {
+    fn take() -> Self {
+        Self {
+            mobs: std::mem::take(&mut *mobs().lock().unwrap()),
+            crops: std::mem::take(&mut *crops().lock().unwrap()),
+            sheared: std::mem::take(&mut *sheared().lock().unwrap()),
+            tags: std::mem::take(&mut *tags().lock().unwrap()),
+            next_eid: NEXT_EID.load(Ordering::SeqCst),
+        }
+    }
+}
+
+impl std::ops::Drop for RuntimeRegistrySnapshot {
+    fn drop(&mut self) {
+        *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
+        *crops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.crops);
+        *sheared().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.sheared);
+        *tags().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.tags);
+        NEXT_EID.store(self.next_eid, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn d1_nether_crop_growth_writes_only_its_dimension() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _world = WorldSnapshot::take();
+    let _runtime = RuntimeRegistrySnapshot::take();
+    let (x, y, z) = (0, 70, 0);
+    set_block_dim(DimId::Overworld, x, y, z, 1);
+    set_block_dim(DimId::Nether, x, y, z, 4278);
+    crops().lock().unwrap().insert((DimId::Nether, x, y, z), 0);
+
+    // y ^ tick is zero here, so this crop is due immediately.
+    grow_crops(y as u64, |_, _| true);
+
+    assert_eq!(block_at_dim(DimId::Nether, x, y, z), 4279);
+    assert_eq!(block_at_dim(DimId::Overworld, x, y, z), 1);
+    assert_eq!(crops().lock().unwrap().get(&(DimId::Nether, x, y, z)), Some(&1));
+}
+
+#[test]
+fn d1_reload_saved_drop_eid_does_not_collide_with_mob() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _world = WorldSnapshot::take();
+    let _runtime = RuntimeRegistrySnapshot::take();
+    NEXT_EID.store(1000, Ordering::SeqCst);
+    mobs().lock().unwrap().push(Arc::new(Mob {
+        eid: 1001,
+        uuid: [0; 16],
+        etype: 22,
+        pos: Mutex::new((0.5, 70.0, 0.5, 0.0, 0.0)),
+        hp: Mutex::new(10.0),
+        last_hit: Mutex::new(Instant::now()),
+        hurt_at: Mutex::new(Instant::now()),
+        last_hurt_tick: Mutex::new(None),
+        vel: Mutex::new([0.0; 3]),
+        fuse: Mutex::new(0),
+        love: Mutex::new(0),
+        air: Mutex::new(300),
+    }));
+    drops().lock().unwrap().push(Drop {
+        eid: 1000,
+        x: 0.5,
+        y: 70.0,
+        z: 0.5,
+        item: name_to_item("stone").unwrap(),
+        cnt: 1,
+        comps: Vec::new(),
+        age: 0,
+        target: None,
+        thrower: None,
+    });
+    let mut saved = Vec::new();
+    save_world_into(&mut saved);
+    mobs().lock().unwrap().clear();
+    drops().lock().unwrap().clear();
+    NEXT_EID.store(1000, Ordering::SeqCst);
+
+    load_world_from(&saved).unwrap();
+    let mob_ids: Vec<i32> = mobs().lock().unwrap().iter().map(|m| m.eid).collect();
+    let drop_ids: Vec<i32> = drops().lock().unwrap().iter().map(|d| d.eid).collect();
+    assert_eq!(mob_ids.len(), 1);
+    assert_eq!(drop_ids, [1000]);
+    assert_ne!(mob_ids[0], drop_ids[0]);
+    assert!(NEXT_EID.load(Ordering::SeqCst) > mob_ids[0].max(drop_ids[0]));
+}
+
+#[test]
+fn d1_player_fluid_checks_use_nether_blocks() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _world = WorldSnapshot::take();
+    let (y, z) = (60, 0);
+    // A crouched player's eyes at y+1.27 are below source water at y+1.
+    set_block_dim(DimId::Nether, 8, y + 1, z, 80);
+    set_block_dim(DimId::Overworld, 8, y + 1, z, 1);
+    // Lava intersects the player's feet in the Nether only.
+    set_block_dim(DimId::Nether, 16, y, z, 96);
+    set_block_dim(DimId::Overworld, 16, y, z, 1);
+
+    assert!(player_drowning_submerged(DimId::Nether, 8.5, y as f64, 0.5, true, false));
+    assert!(!player_drowning_submerged(DimId::Overworld, 8.5, y as f64, 0.5, true, false));
+    assert!(player_in_lava(DimId::Nether, 16.5, y as f64, 0.5, false, false));
+    assert!(!player_in_lava(DimId::Overworld, 16.5, y as f64, 0.5, false, false));
+}
+
 #[test]
 fn m2_crafting_log_to_planks_uses_item_registry_ids() {
     for (log, plank) in [
