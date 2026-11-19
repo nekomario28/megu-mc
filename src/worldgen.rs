@@ -521,6 +521,126 @@ enum DF {
     },
 }
 
+/// Density-function ids a node reads. Shared by the grid reachability walk and by
+/// [`compute_is_2d`]; nested spline points are flattened into the same `out`.
+fn df_kids(df: &DF, out: &mut Vec<usize>) {
+    fn spl_kids(s: &Spl, out: &mut Vec<usize>) {
+        out.push(s.coord);
+        for (_, v, _) in &s.pts {
+            if let SV::S(inner) = v {
+                spl_kids(inner, out);
+            }
+        }
+    }
+    match df {
+        DF::C(_)
+        | DF::EndIslands(_)
+        | DF::Zero
+        | DF::Beardifier
+        | DF::Grad { .. }
+        | DF::ShiftA(_)
+        | DF::ShiftB(_)
+        | DF::Blended(_) => {}
+        DF::WeirdScaledSampler { input, .. } => out.push(*input),
+        DF::Add(a, b)
+        | DF::Sub(a, b)
+        | DF::Mul(a, b)
+        | DF::Min(a, b)
+        | DF::Max(a, b)
+        | DF::Div(a, b) => {
+            out.push(*a);
+            out.push(*b);
+        }
+        DF::Neg(a)
+        | DF::Abs(a)
+        | DF::Sq(a)
+        | DF::Cube(a)
+        | DF::HNeg(a)
+        | DF::QNeg(a)
+        | DF::Squeeze(a)
+        | DF::Cache(a)
+        | DF::Interp(a)
+        | DF::BlendD(a) => out.push(*a),
+        DF::Clamp { i, .. } => out.push(*i),
+        DF::Lerp { a, f, s } => {
+            out.push(*a);
+            out.push(*f);
+            out.push(*s);
+        }
+        DF::Noise { sx, sy, sz, .. } => {
+            out.push(*sx);
+            out.push(*sy);
+            out.push(*sz);
+        }
+        DF::RangeChoice { i, wr, wo, .. } => {
+            out.push(*i);
+            out.push(*wr);
+            out.push(*wo);
+        }
+        DF::IntervalSelect { i, fns, .. } => {
+            out.push(*i);
+            out.extend(fns.iter().copied());
+        }
+        DF::Spline(s) => spl_kids(s, out),
+        DF::FindTopSurface { density, upper, .. } => {
+            out.push(*density);
+            out.push(*upper);
+        }
+    }
+}
+
+/// Classify every node as a pure function of `(x, z)` or not, with a memoized post-order
+/// DFS over the DAG (the id table is not in topological order — references can point
+/// forward — so a single forward pass would read uninitialised entries).
+/// `FindTopSurface` is 2D even though its inner scan touches many `y` values: its *result*
+/// depends only on `(x, z)`. A `Noise` node is 2D only when `ys == 0.0` and all three of its
+/// scale inputs are 2D; the `y as f64 * 0.0 + ysv` sign-of-zero difference that can arise for
+/// negative `y` is erased by `wrap(±0.0) + yo` (the noise's `yo` is finite and non-negative),
+/// which the bit-identity test checks across `-64..320`.
+fn compute_is_2d(dfs: &[DF]) -> Vec<bool> {
+    fn visit(id: usize, dfs: &[DF], is2: &mut [bool], state: &mut [u8]) -> bool {
+        if state[id] == 2 {
+            return is2[id];
+        }
+        if state[id] == 1 {
+            // A cycle is not a valid density DAG; be conservative rather than loop.
+            return false;
+        }
+        state[id] = 1;
+        let mut kids = Vec::new();
+        df_kids(&dfs[id], &mut kids);
+        let mut all_kids_2d = true;
+        for k in kids {
+            if !visit(k, dfs, is2, state) {
+                all_kids_2d = false;
+            }
+        }
+        let v = match &dfs[id] {
+            DF::C(_)
+            | DF::Zero
+            | DF::EndIslands(_)
+            | DF::ShiftA(_)
+            | DF::ShiftB(_)
+            | DF::FindTopSurface { .. } => true,
+            DF::Grad { .. } | DF::Beardifier | DF::Blended(_) | DF::WeirdScaledSampler { .. } => {
+                false
+            }
+            DF::Noise { ys, .. } => *ys == 0.0 && all_kids_2d,
+            _ => all_kids_2d,
+        };
+        is2[id] = v;
+        state[id] = 2;
+        v
+    }
+    let n = dfs.len();
+    let mut is2 = vec![false; n];
+    let mut state = vec![0u8; n];
+    for id in 0..n {
+        visit(id, dfs, &mut is2, &mut state);
+    }
+    is2
+}
+
 // ---------- vanilla surface (material_rule) ----------
 
 #[derive(Clone, Copy)]
@@ -785,6 +905,12 @@ pub struct GenData {
     depth_split: Option<(f64, f64, f64, f64, usize)>,
     // 1.21.1 ore veins: `ore_veins_enabled` plus the router's vein functions
     vein: Option<VeinCfg>,
+    /// One `bool` per node id: is this density function a pure function of `(x, z)`?
+    /// Computed once when the id table is final (post-order over the DAG). The corner-grid
+    /// fill memoizes every such node per `(x, z)` instead of re-evaluating it at all `ny`
+    /// vertical levels, which removes ~49x redundant work on the y-independent spline /
+    /// continentalness / erosion subtrees (Layer A2-a).
+    is_2d: Vec<bool>,
     btree: Option<BT>,
     leaf_ps: Vec<[[i32; 2]; 7]>,
     biome_names: Vec<String>,
@@ -954,6 +1080,43 @@ pub struct Gen {
     feat_hm: HashMap<(i32, i32), (i32, i32)>,
     // Each generator owns its pending ticks; only the active world's handles are published.
     generated_ticks: GeneratedTickQueues,
+}
+
+/// Generation-stamped, zero-allocation scratch memo for the corner-grid fill.
+///
+/// `val_2d[id]` holds the value of a y-independent node for the current `(x, z)`;
+/// `val_3d[id]` holds the value of a `Cache` node for the current `(x, y, z)`. The
+/// generation counters are bumped once per `(x, z)` and once per `(x, y, z)`
+/// respectively, so a stale value is rejected by one integer compare instead of a
+/// SipHash lookup into a `HashMap<(usize, i32, i32, i32), f64>`.
+struct FlatCornerMemo {
+    val_2d: Vec<f64>,
+    gen_2d: Vec<u32>,
+    cur_2d: u32,
+    val_3d: Vec<f64>,
+    gen_3d: Vec<u32>,
+    cur_3d: u32,
+}
+
+impl FlatCornerMemo {
+    fn new(n: usize) -> Self {
+        Self {
+            val_2d: vec![0.0; n],
+            gen_2d: vec![0; n],
+            cur_2d: 0,
+            val_3d: vec![0.0; n],
+            gen_3d: vec![0; n],
+            cur_3d: 0,
+        }
+    }
+    #[inline]
+    fn next_2d(&mut self) {
+        self.cur_2d = self.cur_2d.wrapping_add(1);
+    }
+    #[inline]
+    fn next_3d(&mut self) {
+        self.cur_3d = self.cur_3d.wrapping_add(1);
+    }
 }
 
 impl std::ops::Deref for Gen {
@@ -2156,6 +2319,7 @@ impl Gen {
                 bedrock_st: res("minecraft:bedrock").unwrap_or(1),
                 aq: None,
                 vein: None,
+                is_2d: Vec::new(),
                 world_seed: seed,
                 dfprog: None,
             }),
@@ -2519,6 +2683,7 @@ impl Gen {
             }
         }
         // Compile `final_density` once, now that the id table is final.
+        g.is_2d = compute_is_2d(&g.dfs);
         g.dfprog = DfProg::compile(&g);
         // Diagnostic counters sized to this generator's node table (WG_COUNT only).
         if std::env::var_os("WG_COUNT").is_some() {
@@ -3225,69 +3390,7 @@ impl Gen {
 
     /// Density-function ids a node reads, for the grid reachability walk.
     fn push_kids(&self, id: usize, out: &mut Vec<usize>) {
-        fn spl_kids(s: &Spl, out: &mut Vec<usize>) {
-            out.push(s.coord);
-            for (_, v, _) in &s.pts {
-                if let SV::S(inner) = v {
-                    spl_kids(inner, out);
-                }
-            }
-        }
-        match &self.dfs[id] {
-            DF::C(_)
-            | DF::EndIslands(_)
-            | DF::Zero
-            | DF::Beardifier
-            | DF::Grad { .. }
-            | DF::ShiftA(_)
-            | DF::ShiftB(_)
-            | DF::Blended(_) => {}
-            DF::WeirdScaledSampler { input, .. } => out.push(*input),
-            DF::Add(a, b)
-            | DF::Sub(a, b)
-            | DF::Mul(a, b)
-            | DF::Min(a, b)
-            | DF::Max(a, b)
-            | DF::Div(a, b) => {
-                out.push(*a);
-                out.push(*b);
-            }
-            DF::Neg(a)
-            | DF::Abs(a)
-            | DF::Sq(a)
-            | DF::Cube(a)
-            | DF::HNeg(a)
-            | DF::QNeg(a)
-            | DF::Squeeze(a)
-            | DF::Cache(a)
-            | DF::Interp(a)
-            | DF::BlendD(a) => out.push(*a),
-            DF::Clamp { i, .. } => out.push(*i),
-            DF::Lerp { a, f, s } => {
-                out.push(*a);
-                out.push(*f);
-                out.push(*s);
-            }
-            DF::Noise { sx, sy, sz, .. } => {
-                out.push(*sx);
-                out.push(*sy);
-                out.push(*sz);
-            }
-            DF::RangeChoice { i, wr, wo, .. } => {
-                out.push(*i);
-                out.push(*wr);
-                out.push(*wo);
-            }
-            DF::IntervalSelect { i, fns, .. } => {
-                out.push(*i);
-                out.extend(fns.iter().copied());
-            }
-            DF::Spline(s) => spl_kids(s, out),
-            DF::FindTopSurface { density, upper, .. } => {
-                out.push(*density);
-                out.push(*upper);
-            }
-        }
+        df_kids(&self.dfs[id], out);
     }
 
     /// `interpolated` nodes reachable from final_density.
@@ -3516,6 +3619,211 @@ impl Gen {
                 *lower as f64
             }
         }
+    }
+
+    /// The flat-memo counterpart of [`Gen::eval`]: bit-identical to `eval_c(_, _, _, _, None)`
+    /// but memoizes every y-independent node per `(x, z)` and every `Cache` node per
+    /// `(x, y, z)` in a generation-stamped array instead of a `HashMap`.
+    ///
+    /// Called only while filling the corner grids, where `cc` is always `None`, so the
+    /// `Interp`/`cc` special case in `eval_c` never applies. Diagnostics are deliberately
+    /// absent here: when `WG_COUNT` is set `build_cols_body` keeps the old `eval_c` path so
+    /// the counters describe the same visits as before.
+    fn eval_flat(&self, id: usize, x: i32, y: i32, z: i32, memo: &mut FlatCornerMemo) -> f64 {
+        if self.is_2d[id] {
+            if memo.gen_2d[id] == memo.cur_2d {
+                return memo.val_2d[id];
+            }
+            let v = self.eval0_flat(id, x, y, z, memo);
+            memo.gen_2d[id] = memo.cur_2d;
+            memo.val_2d[id] = v;
+            return v;
+        }
+        // Only `Cache` nodes are memoized in 3D: a plain shared subtree is re-evaluated
+        // by the reference path too, so memoizing it here would only waste memory.
+        if matches!(self.dfs[id], DF::Cache(_)) {
+            if memo.gen_3d[id] == memo.cur_3d {
+                return memo.val_3d[id];
+            }
+            let v = self.eval0_flat(id, x, y, z, memo);
+            memo.gen_3d[id] = memo.cur_3d;
+            memo.val_3d[id] = v;
+            return v;
+        }
+        self.eval0_flat(id, x, y, z, memo)
+    }
+
+    /// [`Gen::eval0_c`] with recursive calls routed to [`Gen::eval_flat`].
+    ///
+    /// The arithmetic is copied verbatim so every operation keeps its IEEE-754 order.
+    /// The one deliberate departure is `FindTopSurface`: it is classified 2D, but its
+    /// inner scan samples `density` at many `y` values. Those samples go through the
+    /// scalar `eval_c` with a fresh `HashMap` so they can never collide with the current
+    /// corner's `cur_3d` generation; the node's own result is still memoized in `val_2d`.
+    fn eval0_flat(&self, id: usize, x: i32, y: i32, z: i32, memo: &mut FlatCornerMemo) -> f64 {
+        match &self.dfs[id] {
+            DF::C(v) => *v,
+            DF::EndIslands(field) => field.density(x, z),
+            DF::Zero => 0.0,
+            DF::Beardifier => 0.0, // corner samples have no `cc` (vanilla marker)
+            DF::Add(a, b) => self.eval_flat(*a, x, y, z, memo) + self.eval_flat(*b, x, y, z, memo),
+            DF::Sub(a, b) => self.eval_flat(*a, x, y, z, memo) - self.eval_flat(*b, x, y, z, memo),
+            DF::Mul(a, b) => self.eval_flat(*a, x, y, z, memo) * self.eval_flat(*b, x, y, z, memo),
+            DF::Min(a, b) => df_min(
+                self.eval_flat(*a, x, y, z, memo),
+                self.eval_flat(*b, x, y, z, memo),
+            ),
+            DF::Max(a, b) => df_max(
+                self.eval_flat(*a, x, y, z, memo),
+                self.eval_flat(*b, x, y, z, memo),
+            ),
+            DF::Div(a, b) => {
+                let d = self.eval_flat(*b, x, y, z, memo);
+                if d == 0.0 {
+                    0.0
+                } else {
+                    self.eval_flat(*a, x, y, z, memo) / d
+                }
+            }
+            DF::Neg(a) => -self.eval_flat(*a, x, y, z, memo),
+            DF::Abs(a) => self.eval_flat(*a, x, y, z, memo).abs(),
+            DF::Sq(a) => {
+                let v = self.eval_flat(*a, x, y, z, memo);
+                v * v
+            }
+            DF::Cube(a) => {
+                let v = self.eval_flat(*a, x, y, z, memo);
+                v * v * v
+            }
+            DF::HNeg(a) => {
+                let v = self.eval_flat(*a, x, y, z, memo);
+                if v > 0.0 {
+                    v
+                } else {
+                    v * 0.5
+                }
+            }
+            DF::QNeg(a) => {
+                let v = self.eval_flat(*a, x, y, z, memo);
+                if v > 0.0 {
+                    v
+                } else {
+                    v * 0.25
+                }
+            }
+            DF::Squeeze(a) => {
+                let v = self.eval_flat(*a, x, y, z, memo).clamp(-1.0, 1.0);
+                v / 2.0 - v * v * v / 24.0
+            }
+            DF::Clamp { i, lo, hi } => self.eval_flat(*i, x, y, z, memo).clamp(*lo, *hi),
+            DF::Lerp { a, f, s } => {
+                let alpha = self.eval_flat(*a, x, y, z, memo);
+                let fv = self.eval_flat(*f, x, y, z, memo);
+                let sv = self.eval_flat(*s, x, y, z, memo);
+                fv + alpha * (sv - fv)
+            }
+            DF::Grad { fc, fv, tc, tv } => {
+                let t = ((y as f64) - fc) / (tc - fc);
+                fv + t.clamp(0.0, 1.0) * (tv - fv)
+            }
+            DF::Cache(a) => self.eval_flat(*a, x, y, z, memo),
+            DF::Interp(a) => self.eval_flat(*a, x, y, z, memo),
+            DF::Noise {
+                ni,
+                sx,
+                sy,
+                sz,
+                xzs,
+                ys,
+            } => {
+                let xs = self.eval_flat(*sx, x, y, z, memo);
+                let ysv = self.eval_flat(*sy, x, y, z, memo);
+                let zs = self.eval_flat(*sz, x, y, z, memo);
+                self.noises[*ni].get(
+                    x as f64 * xzs + xs,
+                    y as f64 * ys + ysv,
+                    z as f64 * xzs + zs,
+                )
+            }
+            DF::ShiftA(ni) => self.noises[*ni].get(x as f64 * 0.25, 0.0, z as f64 * 0.25) * 4.0,
+            DF::ShiftB(ni) => self.noises[*ni].get(z as f64 * 0.25, x as f64 * 0.25, 0.0) * 4.0,
+            DF::WeirdScaledSampler { input, ni, mapper } => {
+                let rarity = mapper.rarity(self.eval_flat(*input, x, y, z, memo));
+                let xd = x as f64 / rarity;
+                let yd = y as f64 / rarity;
+                let zd = z as f64 / rarity;
+                rarity * self.noises[*ni].get(xd, yd, zd).abs()
+            }
+            DF::RangeChoice { i, mi, ma, wr, wo } => {
+                let v = self.eval_flat(*i, x, y, z, memo);
+                self.eval_flat(if v >= *mi && v < *ma { *wr } else { *wo }, x, y, z, memo)
+            }
+            DF::IntervalSelect { i, th, fns } => {
+                let v = self.eval_flat(*i, x, y, z, memo);
+                let mut pick = fns.len() - 1;
+                for (k, t) in th.iter().enumerate() {
+                    if v < *t {
+                        pick = k;
+                        break;
+                    }
+                }
+                self.eval_flat(fns[pick.min(fns.len() - 1)], x, y, z, memo)
+            }
+            DF::Spline(s) => self.eval_spline_flat(s, x, y, z, memo),
+            DF::Blended(noise) => noise.get(x, y, z),
+            DF::BlendD(a) => self.eval_flat(*a, x, y, z, memo),
+            DF::FindTopSurface {
+                density,
+                lower,
+                upper,
+                cell_h,
+            } => {
+                // The inner scan evaluates `density` at other `yy` values; route it
+                // through the scalar interpreter with its own memo so those 3D `Cache`
+                // lookups cannot be mistaken for this corner's generation.
+                let mut sm = HashMap::new();
+                let ub = self.eval_c(*upper, x, 0, z, &mut sm, None) as i32;
+                let mut yy = ub.div_euclid(*cell_h) * *cell_h;
+                while yy >= *lower {
+                    if self.eval_c(*density, x, yy, z, &mut sm, None) > 0.0 {
+                        return yy as f64;
+                    }
+                    yy -= cell_h;
+                }
+                *lower as f64
+            }
+        }
+    }
+
+    /// [`Gen::eval_spline_c`] with recursive calls routed to [`Gen::eval_flat`].
+    fn eval_spline_flat(&self, s: &Spl, x: i32, y: i32, z: i32, memo: &mut FlatCornerMemo) -> f64 {
+        let loc = self.eval_flat(s.coord, x, y, z, memo) as f32;
+        let n = s.pts.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let mut sv = |sv: &SV| -> f32 {
+            match sv {
+                SV::V(v) => *v,
+                SV::S(sp) => self.eval_spline_flat(sp, x, y, z, memo) as f32,
+            }
+        };
+        let idx = s.pts.partition_point(|p| loc >= p.0) as isize - 1;
+        if idx < 0 || idx == n as isize - 1 {
+            let p = if idx < 0 { &s.pts[0] } else { &s.pts[n - 1] };
+            let v = sv(&p.1);
+            let out = if p.2 == 0.0 { v } else { v + p.2 * (loc - p.0) };
+            return out as f64;
+        }
+        let i = idx as usize;
+        let (x0, v0, d0) = (s.pts[i].0, sv(&s.pts[i].1), s.pts[i].2);
+        let (x1, v1, d1) = (s.pts[i + 1].0, sv(&s.pts[i + 1].1), s.pts[i + 1].2);
+        let t = (loc - x0) / (x1 - x0);
+        let dx = x1 - x0;
+        let d0t = d0 * dx - (v1 - v0);
+        let d1t = -d1 * dx + (v1 - v0);
+        let lerp = |delta: f32, start: f32, end: f32| start + delta * (end - start);
+        (lerp(t, v0, v1) + t * (1.0 - t) * lerp(t, d0t, d1t)) as f64
     }
 }
 
@@ -4365,65 +4673,61 @@ unsafe fn run4_avx2(
                     let (xs, ysv, zs) = lanes3!();
                     sp -= 2;
                     let noise = &g.noises[ni as usize];
-                    let mut r = [0.0f64; DF4];
-                    for k in 0..DF4 {
-                        r[k] = noise.get(
-                            lane_x[k] * xzs + xs[k],
-                            y as f64 * ys + ysv[k],
-                            lane_x[k] * xzs + zs[k],
-                        );
-                    }
+                    // The z coordinate is `z as f64 * xzs + zs[k]`, NOT another copy of
+                    // `lane_x[k] * xzs`; the four lanes differ in x only, so using the
+                    // lane's x for z silently sampled the wrong column whenever x != z.
+                    let nx: [f64; DF4] = std::array::from_fn(|k| lane_x[k] * xzs + xs[k]);
+                    let ny: [f64; DF4] = std::array::from_fn(|k| y as f64 * ys + ysv[k]);
+                    let nz: [f64; DF4] = std::array::from_fn(|k| z as f64 * xzs + zs[k]);
+                    let r = noise.get_4(nx, ny, nz);
                     wr!(sp - 1, v4_from_arr(r));
                     pc += 1;
                 }
                 Op::ShiftA(ni) => {
                     let noise = &g.noises[ni as usize];
-                    let mut r = [0.0f64; DF4];
-                    for k in 0..DF4 {
-                        r[k] = noise.get(lane_x[k] * 0.25, 0.0, z as f64 * 0.25) * 4.0;
-                    }
+                    let nx: [f64; DF4] = std::array::from_fn(|k| lane_x[k] * 0.25);
+                    let nz = [z as f64 * 0.25; DF4];
+                    let r = noise.get_4(nx, [0.0; DF4], nz).map(|v| v * 4.0);
                     wr!(sp, v4_from_arr(r));
                     sp += 1;
                     pc += 1;
                 }
                 Op::ShiftB(ni) => {
                     let noise = &g.noises[ni as usize];
-                    let mut r = [0.0f64; DF4];
-                    for k in 0..DF4 {
-                        r[k] = noise.get(z as f64 * 0.25, lane_x[k] * 0.25, 0.0) * 4.0;
-                    }
+                    let nx = [z as f64 * 0.25; DF4];
+                    let ny: [f64; DF4] = std::array::from_fn(|k| lane_x[k] * 0.25);
+                    let r = noise.get_4(nx, ny, [0.0; DF4]).map(|v| v * 4.0);
                     wr!(sp, v4_from_arr(r));
                     sp += 1;
                     pc += 1;
                 }
                 Op::Weird { ni, mapper } => {
-                    let rarity = v4_to_arr(rd!(sp - 1));
+                    let rarity_in = v4_to_arr(rd!(sp - 1));
                     let noise = &g.noises[ni as usize];
-                    let mut r = [0.0f64; DF4];
-                    for k in 0..DF4 {
-                        let rarity = mapper.rarity(rarity[k]);
-                        r[k] = rarity
-                            * noise
-                                .get(
-                                    lane_x[k] / rarity,
-                                    y as f64 / rarity,
-                                    z as f64 / rarity,
-                                )
-                                .abs();
-                    }
+                    let rarity: [f64; DF4] = std::array::from_fn(|k| mapper.rarity(rarity_in[k]));
+                    let nx: [f64; DF4] = std::array::from_fn(|k| lane_x[k] / rarity[k]);
+                    let ny: [f64; DF4] = std::array::from_fn(|k| y as f64 / rarity[k]);
+                    let nz: [f64; DF4] = std::array::from_fn(|k| z as f64 / rarity[k]);
+                    let nv = noise.get_4(nx, ny, nz);
+                    let r: [f64; DF4] = std::array::from_fn(|k| rarity[k] * nv[k].abs());
                     wr!(sp - 1, v4_from_arr(r));
                     pc += 1;
                 }
                 Op::Beardifier => {
                     let beard = cc.and_then(|cc| cc.beard.as_deref());
-                    let mut r = [0.0f64; DF4];
-                    for (k, o) in r.iter_mut().enumerate() {
-                        *o = match beard {
-                            Some(beard) => compute_beardifier(beard, x + k as i32, y, z),
-                            None => 0.0,
-                        };
+                    // The common case is no beardifier at all (or an empty one): the
+                    // marker evaluates to zero at every lane, so push one vector rather
+                    // than four scalar `compute_beardifier` calls.
+                    if beard.map_or(true, |b| b.is_empty()) {
+                        wr!(sp, _mm256_setzero_pd());
+                    } else {
+                        let beard = beard.unwrap();
+                        let mut r = [0.0f64; DF4];
+                        for (k, o) in r.iter_mut().enumerate() {
+                            *o = compute_beardifier(beard, x + k as i32, y, z);
+                        }
+                        wr!(sp, v4_from_arr(r));
                     }
-                    wr!(sp, v4_from_arr(r));
                     sp += 1;
                     pc += 1;
                 }
@@ -4464,51 +4768,44 @@ unsafe fn run4_avx2(
                     pc += 1;
                 }
                 Op::BranchOut { mi, ma, target } => {
-                    let v = v4_to_arr(rd!(sp - 1));
-                    let mut inside = 0usize;
-                    for t in v {
-                        if t >= mi && t < ma {
-                            inside += 1;
+                    // `t >= mi && t < ma` with ordered-quiet compares: NaN answers
+                    // false in both, exactly as the scalar `&&` does.
+                    let v = rd!(sp - 1);
+                    let lo = _mm256_cmp_pd(v, _mm256_set1_pd(mi), _CMP_GE_OQ);
+                    let hi = _mm256_cmp_pd(v, _mm256_set1_pd(ma), _CMP_LT_OQ);
+                    match _mm256_movemask_pd(_mm256_and_pd(lo, hi)) {
+                        m if m == 0xF => {
+                            sp -= 1;
+                            pc += 1;
                         }
-                    }
-                    if inside == DF4 {
-                        sp -= 1;
-                        pc += 1;
-                    } else if inside == 0 {
-                        sp -= 1;
-                        pc = target as usize;
-                    } else {
-                        return None;
+                        0 => {
+                            sp -= 1;
+                            pc = target as usize;
+                        }
+                        _ => return None, // lanes disagree: caller finishes scalar
                     }
                 }
                 Op::BranchLt { t, target } => {
-                    let v = v4_to_arr(rd!(sp - 1));
-                    let mut below = 0usize;
-                    for lane in v {
-                        if lane < t {
-                            below += 1;
-                        }
-                    }
+                    let v = rd!(sp - 1);
+                    let mask = _mm256_movemask_pd(_mm256_cmp_pd(v, _mm256_set1_pd(t), _CMP_LT_OQ));
                     sp -= 1;
-                    if below == DF4 {
+                    if mask == 0xF {
                         pc = target as usize;
-                    } else if below == 0 {
+                    } else if mask == 0 {
                         pc += 1;
                     } else {
                         return None;
                     }
                 }
                 Op::BranchZero { target } => {
-                    let v = v4_to_arr(rd!(sp - 1));
-                    let mut zero = 0usize;
-                    for lane in v {
-                        if lane == 0.0 {
-                            zero += 1;
-                        }
-                    }
-                    if zero == DF4 {
+                    let v = rd!(sp - 1);
+                    // `== 0.0` is true for both zeros and false for NaN, which is
+                    // what the ordered-equal compare answers too.
+                    let mask =
+                        _mm256_movemask_pd(_mm256_cmp_pd(v, _mm256_setzero_pd(), _CMP_EQ_OQ));
+                    if mask == 0xF {
                         pc = target as usize;
-                    } else if zero == 0 {
+                    } else if mask == 0 {
                         pc += 1;
                     } else {
                         return None;
@@ -6827,29 +7124,64 @@ impl Gen {
         let g = self;
         let ny = ((g.height / g.noise_cell_h) + 1) as usize;
         let nx = (16 / g.noise_cell_w + 1) as usize;
-        let mut memo = HashMap::new();
         // One corner grid per `interpolated` node on the final_density path. The
         // grid holds the node's input; the enclosing operators are evaluated per
         // block in block_density(). Interpolating final_density itself would
         // interpolate squeeze(), which is cubic and not vanilla.
         let mut grids: Vec<Option<Box<[f64]>>> = (0..g.dfs.len()).map(|_| None).collect();
+        let mut interp_ids = Vec::new();
+        let mut interp_inners = Vec::new();
         for iid in g.interp_ids() {
-            let inner = match g.dfs[iid] {
-                DF::Interp(i) => i,
-                _ => continue,
-            };
-            let mut cells = vec![0.0f64; nx * nx * ny];
+            if let DF::Interp(inner) = g.dfs[iid] {
+                interp_ids.push(iid);
+                interp_inners.push(inner);
+            }
+        }
+        // `WG_COUNT` counts visits through `eval_c`, so keep the original HashMap path
+        // when diagnostics are on; the flat path has no per-visit counter to update.
+        if std::env::var_os("WG_COUNT").is_some() {
+            let mut memo: HashMap<(usize, i32, i32, i32), f64> = HashMap::new();
+            for (k, &inner) in interp_inners.iter().enumerate() {
+                let mut cells = vec![0.0f64; nx * nx * ny];
+                for zi in 0..nx {
+                    for xi in 0..nx {
+                        for yi in 0..ny {
+                            let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
+                            let by = g.min_y + (yi as i32) * g.noise_cell_h;
+                            let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
+                            cells[(zi * nx + xi) * ny + yi] = g.eval(inner, bx, by, bz, &mut memo);
+                        }
+                    }
+                }
+                grids[interp_ids[k]] = Some(cells.into_boxed_slice());
+            }
+        } else {
+            // Flip the loops so both the 2D and the 3D memo are shared: `val_2d` across
+            // all `ny` levels, and both memos across every interpolated node at the
+            // same corner. Zero HashMap allocations, one generation bump per (x,z) and
+            // one per (x,y,z).
+            let mut flat = FlatCornerMemo::new(g.dfs.len());
+            let mut cells: Vec<Vec<f64>> = (0..interp_inners.len())
+                .map(|_| vec![0.0f64; nx * nx * ny])
+                .collect();
             for zi in 0..nx {
                 for xi in 0..nx {
+                    flat.next_2d();
+                    let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
+                    let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
                     for yi in 0..ny {
-                        let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
+                        flat.next_3d();
                         let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                        let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
-                        cells[(zi * nx + xi) * ny + yi] = g.eval(inner, bx, by, bz, &mut memo);
+                        for (k, &inner) in interp_inners.iter().enumerate() {
+                            cells[k][(zi * nx + xi) * ny + yi] =
+                                g.eval_flat(inner, bx, by, bz, &mut flat);
+                        }
                     }
                 }
             }
-            grids[iid] = Some(cells.into_boxed_slice());
+            for (k, &iid) in interp_ids.iter().enumerate() {
+                grids[iid] = Some(std::mem::take(&mut cells[k]).into_boxed_slice());
+            }
         }
         // Resolve the chunk's beardifier before `surf`, `wtop` and `mats`: vanilla's
         // `fillFromNoise` evaluates `final_density` with `Beardifier` active and only
@@ -6947,6 +7279,9 @@ impl Gen {
             // at a time, in the order they were walked before, so the aquifer, the surface
             // predicates and the per-column caches see exactly the sequence they saw.
             let mut dbuf: Vec<f64> = Vec::new();
+            // A2-a: one reusable buffer for the 256 per-column surface-cell scans; the
+            // previous `collect()` allocated a fresh Vec for every column.
+            let mut cells: Vec<SurfaceCell> = Vec::new();
             for lz in 0..16usize {
                 let z = cz * 16 + lz as i32;
                 let mut xb = 0usize;
@@ -6993,18 +7328,11 @@ impl Gen {
                             g.prelim_min(x, z)
                         };
                         c.est_min = est_min;
-                        let cells: Vec<SurfaceCell> = (g.min_y..=scan_top)
-                            .map(|y| {
-                                g.surface_cell_density(
-                                    dbuf[k * span + (y - g.min_y) as usize],
-                                    x,
-                                    y,
-                                    z,
-                                )
-                            })
-                            .collect();
-                        let column =
-                            g.scan_surface_column(root, &mut c, est_min, &cells, &cc.wtop);
+                        cells.clear();
+                        cells.extend((g.min_y..=scan_top).map(|y| {
+                            g.surface_cell_density(dbuf[k * span + (y - g.min_y) as usize], x, y, z)
+                        }));
+                        let column = g.scan_surface_column(root, &mut c, est_min, &cells, &cc.wtop);
                         mats[lz * 16 + lx] = column;
                     }
                     xb += DF4;
@@ -15173,6 +15501,200 @@ mod wg_tests {
             }
         }
         assert!(checked > 1000 && ties > 0, "sweep must include observable ties: {ties}");
+    }
+
+    /// Layer A2-a: the flat, generation-stamped corner memo must produce exactly the
+    /// same corner-grid bits as the original `eval_c` + `HashMap` walk, on all presets,
+    /// at negative chunk origins, and across the full negative-to-positive `y` range.
+    #[test]
+    fn a2a_flat_corner_memo_matches_hashmap_bit_for_bit() {
+        let _guard = lock_gen();
+        for (preset, seed) in [
+            (NoisePreset::Overworld, 0u64),
+            (NoisePreset::Overworld, 12345),
+            (NoisePreset::Nether, 4242),
+            (NoisePreset::End, 0),
+        ] {
+            let mut g = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            let nx = (16 / g.noise_cell_w + 1) as usize;
+            let ny = ((g.height / g.noise_cell_h) + 1) as usize;
+            let is2 = g.is_2d.clone();
+            for (cx, cz) in [(0i32, 0i32), (-17, -23), (5, -7)] {
+                let cc = g.build_cols_body(cx, cz, false).expect("cols");
+                let mut memo: HashMap<(usize, i32, i32, i32), f64> = HashMap::new();
+                let mut grids = 0usize;
+                for iid in g.interp_ids() {
+                    let inner = match g.dfs[iid] {
+                        DF::Interp(i) => i,
+                        _ => continue,
+                    };
+                    let have = cc.grids[iid].as_ref().expect("grid");
+                    assert_eq!(have.len(), nx * nx * ny, "grid length");
+                    for zi in 0..nx {
+                        for xi in 0..nx {
+                            for yi in 0..ny {
+                                let bx = cx * 16 + xi as i32 * g.noise_cell_w;
+                                let by = g.min_y + yi as i32 * g.noise_cell_h;
+                                let bz = cz * 16 + zi as i32 * g.noise_cell_w;
+                                let want = g.eval(inner, bx, by, bz, &mut memo);
+                                let got = have[(zi * nx + xi) * ny + yi];
+                                assert_eq!(
+                                    want.to_bits(),
+                                    got.to_bits(),
+                                    "{preset:?} seed {seed} chunk ({cx},{cz}) iid {iid} at ({bx},{by},{bz})"
+                                );
+                            }
+                        }
+                    }
+                    grids += 1;
+                }
+                assert!(grids > 0, "no interpolated grids were compared");
+
+                // Direct node-level check of the signed-zero hazard: a 2D node's value
+                // at the bottom (negative y) must be bit-identical to `eval_c` at any
+                // other y for the same (x, z). Both NaN results are treated as equal.
+                let mut flat = FlatCornerMemo::new(g.dfs.len());
+                let (bx, bz) = (cx * 16, cz * 16);
+                flat.next_2d();
+                for (id, &two_d) in is2.iter().enumerate() {
+                    if !two_d {
+                        continue;
+                    }
+                    flat.next_3d();
+                    let v0 = g.eval_flat(id, bx, g.min_y, bz, &mut flat);
+                    for by in [-64, -1, 0, 1, 63, 320] {
+                        let mut sm = HashMap::new();
+                        let want = g.eval_c(id, bx, by, bz, &mut sm, None);
+                        if want.is_nan() && v0.is_nan() {
+                            continue;
+                        }
+                        assert_eq!(
+                            want.to_bits(),
+                            v0.to_bits(),
+                            "2D node {id} at ({bx},{by},{bz}): y-independence / signed zero"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Layer A2-a: `run4_avx2`'s `Op::Noise` (with the fixed `z as f64 * xzs` coordinate),
+    /// `BranchOut`, `BranchLt` and `BranchZero` movemask branches must match the scalar
+    /// `DfProg::run` bit for bit, including NaN, `-0.0` and the branch boundaries.
+    #[test]
+    fn a2a_run4_avx2_shifted_noise_and_branches_match_scalar_bit_for_bit() {
+        let _guard = lock_gen();
+        let _measurement = M3_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        df4_test_force_scalar(false);
+        m3_test_force(true);
+        m3_reset_local();
+
+        let check = |ops: Vec<Op>, what: &str, x: i32, y: i32, z: i32| {
+            let prog = df4_prog(ops);
+            let want: [f64; DF4] = std::array::from_fn(|k| prog.eval(&g, None, x + k as i32, y, z));
+            let got = prog.eval_x4(&g, None, x, y, z);
+            for k in 0..DF4 {
+                assert_eq!(
+                    want[k].to_bits(),
+                    got[k].to_bits(),
+                    "{what} lane {k} at x={} y={y} z={z}",
+                    x + k as i32
+                );
+            }
+        };
+
+        // `Op::Noise` with x != z distinguishes the fixed z coordinate from the old
+        // (buggy) `lane_x[k] * xzs + zs[k]`. Include negative and mixed-sign x/z.
+        let mut noise_cases = 0usize;
+        for (xzs, ys) in [(1.0, 0.0), (0.25, 0.125), (0.0, 1.0), (-0.5, 0.0)] {
+            for (x, y, z) in [(3, 7, -2), (-9, -40, 11), (17, 63, -33)] {
+                for (xs, ysv, zs) in [(0.0, 0.0, 0.0), (1.25, -0.5, 2.75)] {
+                    check(
+                        vec![
+                            Op::Push(xs),
+                            Op::Push(ysv),
+                            Op::Push(zs),
+                            Op::Noise { ni: 0, xzs, ys },
+                            Op::Halt,
+                        ],
+                        "noise",
+                        x,
+                        y,
+                        z,
+                    );
+                    noise_cases += 1;
+                }
+            }
+        }
+        assert!(noise_cases >= 24, "noise cases did not run");
+
+        let mut branch_cases = 0usize;
+        for v in [f64::NAN, -0.0, 0.0, 1.0, -1.0, 0.5, f64::INFINITY] {
+            for (mi, ma) in [(-1.0, 1.0), (0.0, 0.0), (-0.0, 0.5)] {
+                check(
+                    vec![
+                        Op::Push(v),
+                        Op::BranchOut { mi, ma, target: 4 },
+                        Op::Push(1.0),
+                        Op::Halt,
+                        Op::Push(0.0),
+                        Op::Halt,
+                    ],
+                    "branch_out",
+                    0,
+                    7,
+                    3,
+                );
+                branch_cases += 1;
+            }
+        }
+        for v in [f64::NAN, -0.0, 0.0, -1.0, 1.0] {
+            for t in [0.0, -0.0, 1.0] {
+                check(
+                    vec![
+                        Op::Push(v),
+                        Op::BranchLt { t, target: 4 },
+                        Op::Push(1.0),
+                        Op::Halt,
+                        Op::Push(0.0),
+                        Op::Halt,
+                    ],
+                    "branch_lt",
+                    0,
+                    7,
+                    3,
+                );
+                branch_cases += 1;
+            }
+        }
+        for v in [f64::NAN, -0.0, 0.0, 1.0, -1.0] {
+            check(
+                vec![
+                    Op::Push(v),
+                    Op::BranchZero { target: 5 },
+                    Op::Drop,
+                    Op::Push(1.0),
+                    Op::Halt,
+                    Op::Drop,
+                    Op::Push(0.0),
+                    Op::Halt,
+                ],
+                "branch_zero",
+                0,
+                7,
+                3,
+            );
+            branch_cases += 1;
+        }
+        assert!(branch_cases >= 36, "branch cases did not run");
+
+        let vec = m3_local().get(M3_DF4_VEC);
+        m3_test_force(false);
+        if df4_avx2() {
+            assert!(vec > 0, "the vector arm never ran: {vec} groups");
+        }
     }
 }
 
