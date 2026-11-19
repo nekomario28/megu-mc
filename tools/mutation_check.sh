@@ -1291,7 +1291,7 @@ check "the heightmap a feature reads is the floor the blocks are at" \
   heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface
 
 check "a WG heightmap read is the carved top, not the uncarved terrain" \
-  src/generation_context.rs '            if let Some(v) = self.g.wg_after_carve_height(
+  src/generation_context.rs '            if let Some(v) = self.wg_after_carve_height(
                 matches!(kind, HeightmapKind::OceanFloorWg),
                 x,
                 z,
@@ -2053,7 +2053,7 @@ check "a jigsaw piece stages its container Items" \
 # earlier piece unconnected to a block a later piece writes beside it (measured on
 # seed 4242 chunk (-96,35): a mineshaft rail beside a trial-chamber wall).
 check "a jigsaw piece runs placeInWorld's shape passes" \
-  src/jigsaw_structures.rs '        let changed = crate::structure_template::apply_shape_passes(&written, &mut **ctx, reg);' \
+  src/jigsaw_structures.rs '        let changed = crate::structure_template::apply_shape_passes(&written, ctx, reg);' \
   '        let changed: Vec<(Pos, u32)> = Vec::new();' \
   jigsaw_piece_shape_pass_connects_an_earlier_fence_to_its_wall
 
@@ -2552,7 +2552,7 @@ check "basalt columns' clustered roll picks 50 attempts" \
   feature::generation_contract_tests::basalt_columns_matches_native_cells_and_rng
 
 check "feature context reads carver overrides" \
-  src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
+  src/generation_context.rs '        if let Some(st) = self.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \
   feature_context_sees_carver_writes
 
@@ -2640,7 +2640,14 @@ check "shared fastutil mix preserves scheduled chunk ordering" \
   scheduled_ticks::tests::native_collection_order_and_deduplication
 
 check "mineshaft structure dispatch is not gated by placed features" \
-  src/feature.rs 'order.len().max(structures.step_count())' 'order.len()' \
+  src/feature.rs '    for step in 0..order.len().max(structures.step_count()) {
+        // Structures have steps even when the biome has no placed features.
+        // Their registry slots and RNG streams are independent.
+        structures.place_step(&mut ctx, step, pop as u64, sx, sz);' \
+  '    for step in 0..order.len() {
+        // Structures have steps even when the biome has no placed features.
+        // Their registry slots and RNG streams are independent.
+        structures.place_step(&mut ctx, step, pop as u64, sx, sz);' \
   tests/mineshaft_dispatch_test.py 'mineshaft dispatch: FAIL structures without placed features'
 
 check "mineshaft spawner block stages its native block entity" \
@@ -3021,7 +3028,7 @@ check "a mineshaft fence is marked for the owning chunk's promotion" \
   worldgen::wg_tests::structure_chunk_matches_native_capture_state_for_state
 
 check "a shape pass waits for the whole 3x3, not just its own chunk" \
-  src/feature.rs '            if !ctx.g.shape_marks_ready(cx, cz) {
+  src/feature.rs '            if !ctx.g.promotion_window_ready(cx, cz) {
                 continue;
             }' \
   '            if false {
