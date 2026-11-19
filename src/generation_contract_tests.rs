@@ -937,12 +937,6 @@ fn huge_brown_mushroom_matches_native_cells_and_height() {
     let mycelium = reg.state_of("minecraft:mycelium", None);
     let stone = reg.state_of("minecraft:stone", None);
     let leaves = reg.state_of("minecraft:oak_leaves", None);
-    // The extended piston: its shape is the head and the base, so it occludes as a cube without
-    // being a solid render. The default (retracted) piston is a plain full cube.
-    let piston = reg.state_of(
-        "minecraft:piston",
-        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
-    );
     let cf = super::p_cf(
         &jparse(
             br#"{"type":"minecraft:huge_brown_mushroom","config":{"cap_provider":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:brown_mushroom_block","Properties":{"down":"false","east":"true","north":"true","south":"true","up":"true","west":"true"}}},"foliage_radius":3,"stem_provider":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:mushroom_stem","Properties":{"down":"false","east":"true","north":"true","south":"true","up":"true","west":"true"}}}}}"#,
@@ -1018,12 +1012,6 @@ fn huge_red_mushroom_matches_native_cells_and_layers() {
     let mycelium = reg.state_of("minecraft:mycelium", None);
     let stone = reg.state_of("minecraft:stone", None);
     let leaves = reg.state_of("minecraft:oak_leaves", None);
-    // The extended piston: its shape is the head and the base, so it occludes as a cube without
-    // being a solid render. The default (retracted) piston is a plain full cube.
-    let piston = reg.state_of(
-        "minecraft:piston",
-        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
-    );
     // the pinned pack's own red config: foliage_radius 2, and a stem whose `up` is false
     let cf = super::p_cf(
         &jparse(
@@ -3390,12 +3378,6 @@ fn multiface_cells_and_following_rng_match_native() {
     let water = reg.state_of("minecraft:water", None);
     let flowing = reg.with_prop(water, "level", "8");
     let leaves = reg.state_of("minecraft:oak_leaves", None);
-    // The extended piston: its shape is the head and the base, so it occludes as a cube without
-    // being a solid render. The default (retracted) piston is a plain full cube.
-    let piston = reg.state_of(
-        "minecraft:piston",
-        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
-    );
     let slab = reg.state_of("minecraft:oak_slab", None);
     let lichen = reg.state_of("minecraft:glow_lichen", None);
     let mut seen = std::collections::HashSet::new();
@@ -6254,12 +6236,6 @@ fn bonus_chest_places_chest_loot_seed_and_supported_torches() {
 fn bonus_chest_skips_a_collision_shape_and_accepts_a_plant() {
     let reg = breg().unwrap();
     let leaves = reg.state_of("minecraft:oak_leaves", None);
-    // The extended piston: its shape is the head and the base, so it occludes as a cube without
-    // being a solid render. The default (retracted) piston is a plain full cube.
-    let piston = reg.state_of(
-        "minecraft:piston",
-        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
-    );
     let grass = reg.state_of("minecraft:short_grass", None);
     let chest = reg.state_of("minecraft:chest", None);
     // A seed whose first two walked cells are not adjacent: the torch pass reads the four
@@ -6485,7 +6461,7 @@ fn count_on_every_layer_walks_motion_blocking_layers() {
     // modifier draws its candidate column from the RNG: stone at 55, 58, 61, 65 and
     // air elsewhere. Four "empty above non-empty" boundaries, top down.
     let boundaries = [66, 62, 59, 56];
-    let mut script = |ctx: &mut FC, cells: &[(i32, u32)]| {
+    let script = |ctx: &mut FC, cells: &[(i32, u32)]| {
         for lx in 0..16 {
             for lz in 0..16 {
                 for &(y, st) in cells {
@@ -6860,12 +6836,6 @@ fn live_heightmap_types_differ_on_leaves() {
     let reg = breg().unwrap();
     let stone = reg.state_of("minecraft:stone", None);
     let leaves = reg.state_of("minecraft:oak_leaves", None);
-    // The extended piston: its shape is the head and the base, so it occludes as a cube without
-    // being a solid render. The default (retracted) piston is a plain full cube.
-    let piston = reg.state_of(
-        "minecraft:piston",
-        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
-    );
     let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
     let (x, z) = (4, 4);
     let base = g.top_ws(x, z).max(g.top_oc(x, z)) + 2;

@@ -3356,7 +3356,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
-    let (oh, ow) = test_region();
+    let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
     set_test_region(warm.clone(), warm);
