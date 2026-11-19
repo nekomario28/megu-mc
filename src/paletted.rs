@@ -550,6 +550,18 @@ impl PalettedSection {
         }
     }
 
+    /// O(1) uniform-section query: `Some(state)` when the section is `Single(state)`
+    /// (all 4,096 cells share one state). Unlike `is_uniform`, never scans the packed
+    /// words of an `Indirect`/`Direct` section — the band and light fast paths match
+    /// only on the `Single` variant, so they cannot pay a scan per section.
+    #[inline]
+    pub(crate) fn uniform_state(&self) -> Option<u32> {
+        match &self.states {
+            SectionPalette::Single(st) => Some(*st),
+            SectionPalette::Indirect { .. } | SectionPalette::Direct { .. } => None,
+        }
+    }
+
     /// Whether `write_wire` still produces exactly what `section_encode` would for this
     /// section's cells. Only `set()` clears it; every constructor starts clean.
     #[inline]

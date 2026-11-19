@@ -8470,7 +8470,8 @@ fn hidden_filler_with<F: FnMut(i32, i32, i32) -> u32>(
     z: i32,
     h: i32,
 ) -> u32 {
-    let mut counts: HashMap<u32, u32> = HashMap::new();
+    let mut counts: [(u32, u32); 6] = [(0, 0); 6];
+    let mut len = 0usize;
     for (dx, dy, dz) in [
         (1, 0, 0),
         (-1, 0, 0),
@@ -8500,12 +8501,17 @@ fn hidden_filler_with<F: FnMut(i32, i32, i32) -> u32>(
             ns
         };
         if !exposes(w) {
-            *counts.entry(w).or_insert(0) += 1;
+            if let Some(entry) = counts[..len].iter_mut().find(|(st, _)| *st == w) {
+                entry.1 += 1;
+            } else {
+                counts[len] = (w, 1);
+                len += 1;
+            }
         }
     }
-    counts
+    counts[..len]
         .iter()
-        .max_by_key(|(_, n)| *n)
+        .max_by_key(|(st, n)| (*n, std::cmp::Reverse(*st)))
         .map(|(st, _)| *st)
         .unwrap_or_else(|| {
             let st = column_state(x, y, z, h);
@@ -19548,7 +19554,31 @@ fn chunk_data_opt(
                     // `any_palette_entry` avoids a 4096-cell scan in the vast majority of
                     // sections. When emitters exist, keep the exact (ly, lz, lx) order so
                     // `GenSources` (and therefore block light) is unchanged.
-                    if sec.any_palette_entry(|st| reg.luminance_of(st) > 0) {
+                    if let Some(st) = sec.uniform_state() {
+                        // M3 P2c: a `Single` section answers the emitter scan in O(1):
+                        // one `luminance_of` call replaces the per-cell `sec.get` +
+                        // `luminance_of` pair, and the whole 4,096-cell slice pushes its
+                        // emitters together when the light is non-zero. Identical to the
+                        // cell-by-cell path for uniform sections
+                        // (`p2_c_uniform_sections_emitters_match_cell_by_cell`).
+                        let lum = reg.luminance_of(st);
+                        if lum > 0 {
+                            for ly in 0..16i32 {
+                                for lz in 0..16usize {
+                                    for lx in 0..16usize {
+                                        gen_sources_here.push((
+                                            (
+                                                cx * 16 + lx as i32,
+                                                sy + ly,
+                                                cz * 16 + lz as i32,
+                                            ),
+                                            lum,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    } else if sec.any_palette_entry(|st| reg.luminance_of(st) > 0) {
                         for ly in 0..16usize {
                             for lz in 0..16usize {
                                 for lx in 0..16usize {
@@ -19835,7 +19865,206 @@ fn heightmaps_nbt_dim(tops: &[i32; 256], min_y: i32) -> Vec<u8> {
     v
 }
 
+/// Bounded cache of `map_chunk` payloads, keyed by `(dim, cx, cz)` (M3 P5).
+///
+/// Streaming the same chunk to a second player rebuilt the entire 0x27 payload —
+/// heightmaps, the terrain encode, the sign block entities, the light arrays — per
+/// player. Because block/sky light also read the 3x3 neighborhood (`world()`,
+/// `sky_floors`, and neighbor `GenSources`), a cached entry is keyed by `(dim, cx, cz)`
+/// and validated against:
+/// 1. the 3x3 `chunk_version_dim` tuple (catches block/torch/lava edits in the chunk or
+///    any of its 8 neighbors),
+/// 2. `map_chunk_sig(dim, cx, cz, gen)` (catches sign text edits, Overworld spawner
+///    changes, and differing neighbor generated-emitter sets in `gen`).
+///
+/// The entry also retains the chunk's own generated emitters (`own_emitters`) so a cache
+/// hit populates the caller's `GenSources` identically to `build_map_chunk` — required
+/// by `light_dirty_for_dim` and later `update_light_packet_dim` calls. Bounded to the
+/// last 512 chunks, like the band and section stores.
+struct MapChunkEntry {
+    versions: [u64; 9],
+    sig: u64,
+    own_emitters: Vec<((i32, i32, i32), u8)>,
+    payload: Vec<u8>,
+}
+
+#[derive(Default)]
+struct MapChunkCache {
+    map: HashMap<(DimId, i32, i32), MapChunkEntry>,
+    order: std::collections::VecDeque<(DimId, i32, i32)>,
+    generation: u64,
+}
+
+impl MapChunkCache {
+    /// Drop everything if the generator has been replaced since the last entry was stored.
+    fn sync_generation(&mut self) {
+        let seq = current_gen_seq();
+        if self.generation != seq {
+            self.map.clear();
+            self.order.clear();
+            self.generation = seq;
+        }
+    }
+}
+
+static MAP_CHUNK_CACHE: OnceLock<Mutex<MapChunkCache>> = OnceLock::new();
+
+/// Entries retained in the `map_chunk` cache; each payload is a full chunk packet.
+const MAP_CHUNK_CACHE_CAP: usize = 512;
+
+fn map_chunk_cache() -> &'static Mutex<MapChunkCache> {
+    MAP_CHUNK_CACHE.get_or_init(|| Mutex::new(MapChunkCache::default()))
+}
+
+/// Snapshot the 3x3 write versions around `(dim, cx, cz)` under a single lock.
+fn chunk_versions_3x3(dim: DimId, cx: i32, cz: i32) -> [u64; 9] {
+    let guard = chunk_versions().lock().unwrap();
+    let mut out = [0u64; 9];
+    let mut i = 0;
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            out[i] = guard.get(&(dim, cx + dx, cz + dz)).copied().unwrap_or(0);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Order-independent FNV-1a signature of the chunk's non-versioned payload inputs:
+/// signs in the chunk, Overworld generated spawners (pos + NBT), and the 8 neighbor
+/// chunks' generated light emitters in `gen`.
+fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut sign_acc = 0u64;
+    let mut sign_count = 0u64;
+    for (k, lines) in signs_in_chunk(dim, cx, cz) {
+        let mut h = OFFSET;
+        for v in [k.1, k.2, k.3] {
+            h = (h ^ v as u64).wrapping_mul(PRIME);
+        }
+        h = (h ^ k.4 as u64).wrapping_mul(PRIME);
+        for line in lines.iter() {
+            h = (h ^ 0xff).wrapping_mul(PRIME);
+            for b in line.bytes() {
+                h = (h ^ b as u64).wrapping_mul(PRIME);
+            }
+        }
+        sign_acc = sign_acc.wrapping_add(h);
+        sign_count += 1;
+    }
+    let mut spawner_acc = 0u64;
+    let mut spawner_count = 0u64;
+    if dim == DimId::Overworld {
+        for ((px, py, pz), ty, nbt) in generated_spawner_chunk_entities(cx, cz) {
+            let mut h = OFFSET;
+            for v in [px, py, pz] {
+                h = (h ^ v as u64).wrapping_mul(PRIME);
+            }
+            h = (h ^ ty as u64).wrapping_mul(PRIME);
+            for &b in &nbt {
+                h = (h ^ b as u64).wrapping_mul(PRIME);
+            }
+            spawner_acc = spawner_acc.wrapping_add(h);
+            spawner_count += 1;
+        }
+    }
+    let mut h = OFFSET;
+    for v in [sign_acc, sign_count, spawner_acc, spawner_count] {
+        h = (h ^ v).wrapping_mul(PRIME);
+    }
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            if dx == 0 && dz == 0 {
+                continue;
+            }
+            h = (h ^ ((dx + 2) as u64 * 7 + (dz + 2) as u64)).wrapping_mul(PRIME);
+            if let Some(list) = gen.get(&(cx + dx, cz + dz)) {
+                h = (h ^ list.len() as u64).wrapping_mul(PRIME);
+                for ((ex, ey, ez), lum) in list {
+                    for v in [*ex as u64, *ey as u64, *ez as u64, *lum as u64] {
+                        h = (h ^ v).wrapping_mul(PRIME);
+                    }
+                }
+            }
+        }
+    }
+    h
+}
+
+/// Drop every chunk-scoped cache so tests start cold.
+#[cfg(test)]
+fn clear_chunk_caches_for_tests() {
+    map_chunk_cache().lock().unwrap().map.clear();
+    map_chunk_cache().lock().unwrap().order.clear();
+    op_bands().lock().unwrap().map.clear();
+    op_bands().lock().unwrap().order.clear();
+    section_store().lock().unwrap().map.clear();
+    section_store().lock().unwrap().order.clear();
+    sky_floors_cache().lock().unwrap().map.clear();
+    sky_floors_cache().lock().unwrap().order.clear();
+}
+
 fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
+    // M3 P5: the 0x27 payload is shared by every player that loads the same chunk at
+    // matching 3x3 versions and entity/neighbor-light signatures; a hit also restores
+    // `(cx, cz)`'s generated emitters into `gen` so downstream light updates stay exact.
+    let key = (dim, cx, cz);
+    let versions = chunk_versions_3x3(dim, cx, cz);
+    let candidate_sig = {
+        let mut cache = map_chunk_cache().lock().unwrap();
+        cache.sync_generation();
+        cache
+            .map
+            .get(&key)
+            .and_then(|e| (e.versions == versions).then_some(e.sig))
+    };
+    if let Some(want_sig) = candidate_sig {
+        let sig = map_chunk_sig(dim, cx, cz, gen);
+        if sig == want_sig {
+            let mut cache = map_chunk_cache().lock().unwrap();
+            cache.sync_generation();
+            if let Some(e) = cache.map.get(&key) {
+                if e.versions == versions && e.sig == sig {
+                    gen.insert((cx, cz), e.own_emitters.clone());
+                    return e.payload.clone();
+                }
+            }
+        }
+    }
+    let payload = build_map_chunk(cx, cz, dim, gen);
+    if chunk_versions_3x3(dim, cx, cz) == versions {
+        let sig = map_chunk_sig(dim, cx, cz, gen);
+        let own_emitters = gen.get(&(cx, cz)).cloned().unwrap_or_default();
+        let mut cache = map_chunk_cache().lock().unwrap();
+        cache.sync_generation();
+        if cache
+            .map
+            .insert(
+                key,
+                MapChunkEntry {
+                    versions,
+                    sig,
+                    own_emitters,
+                    payload: payload.clone(),
+                },
+            )
+            .is_none()
+        {
+            cache.order.push_back(key);
+        }
+        while cache.order.len() > MAP_CHUNK_CACHE_CAP {
+            if let Some(old) = cache.order.pop_front() {
+                cache.map.remove(&old);
+            }
+        }
+    }
+    payload
+}
+
+/// The uncached `map_chunk` build: heightmaps, the terrain encode, the sign block
+/// entities and the light arrays, per player.
+fn build_map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     let __t = chunkprof::enabled().then(std::time::Instant::now);
     let mut p = Vec::new();
     p.extend_from_slice(&cx.to_be_bytes());

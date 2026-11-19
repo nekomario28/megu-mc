@@ -8607,3 +8607,202 @@ fn p2_3_s4_broadcast_chunk_dim_filters_other_dimensions() {
     assert!(ne_ids.contains(&0x49), "the Nether holder must see the edit: {ne_ids:?}");
     assert!(!ow_ids.contains(&0x49), "the Overworld holder must not: {ow_ids:?}");
 }
+
+#[test]
+fn m3_p5_map_chunk_cache_hit_and_invalidation() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    crate::test_support::require_vanilla_data();
+    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
+    assert!(worldgen::init(0, crate::name_to_state), "overworld");
+    let dim = DimId::Overworld;
+    let (cx, cz) = (0, 0);
+    let mut gen: GenSources = GenSources::new();
+    clear_chunk_caches_for_tests();
+    let p1 = map_chunk(cx, cz, dim, &mut gen);
+    let mut gen2: GenSources = GenSources::new();
+    let p2 = map_chunk(cx, cz, dim, &mut gen2);
+    assert_eq!(
+        p1, p2,
+        "repeated map_chunk at the same version must be a cache hit"
+    );
+    assert_eq!(
+        gen2.get(&(cx, cz)),
+        gen.get(&(cx, cz)),
+        "cache hit must populate caller GenSources with the chunk's own emitters"
+    );
+    let v0 = chunk_version_dim(dim, cx, cz);
+    let stone = name_to_state("stone").expect("stone in the pinned registry");
+    // Write a state that differs from the generated one, so the payload moves.
+    let cur = block_at_dim(dim, 8, 70, 8);
+    let st = if cur == stone { 12958 } else { stone };
+    assert_ne!(st, cur);
+    set_block_dim(dim, 8, 70, 8, st);
+    assert_ne!(
+        chunk_version_dim(dim, cx, cz),
+        v0,
+        "set_block_dim must move the chunk version"
+    );
+    let p3 = map_chunk(cx, cz, dim, &mut gen);
+    assert_ne!(
+        p3, p1,
+        "a block edit must invalidate the cached map_chunk payload"
+    );
+    // A torch placed on the border of neighbor chunk (1, 0) changes block light in (0, 0)
+    // without moving (0, 0)'s own version; the 3x3 version tuple must invalidate the cache.
+    // Touch (1, 0) before capturing the baseline so both snapshots share identical neighbor
+    // feature state and differ strictly by the placed torch.
+    let torch = name_to_state("torch").expect("torch in the pinned registry");
+    let nb_y = height_at_dim(dim, 16, 8) + 2;
+    let nb_cur = block_at_dim(dim, 16, nb_y, 8);
+    let _ = map_chunk(cx + 1, cz, dim, &mut gen);
+    clear_chunk_caches_for_tests();
+    let p3_base = map_chunk(cx, cz, dim, &mut gen);
+    set_block_dim(dim, 16, nb_y, 8, torch);
+    let p3_nb = map_chunk(cx, cz, dim, &mut gen);
+    assert_ne!(
+        p3_nb, p3_base,
+        "a neighbor-chunk light edit must invalidate the cached map_chunk payload"
+    );
+    set_block_dim(dim, 16, nb_y, 8, nb_cur);
+    let p3_restored = map_chunk(cx, cz, dim, &mut gen);
+    assert_eq!(
+        p3_restored, p3_base,
+        "restoring the neighbor cell must restore the payload"
+    );
+    // A sign edit goes through the sign registry without moving the version; the
+    // per-call signature must catch it.
+    let key: SignKey = (dim, 8, 70, 8, 1);
+    {
+        let mut sg = signs().lock().unwrap();
+        let mut lines: SignLines = Default::default();
+        lines[0] = "hello".to_string();
+        sg.insert(key, lines);
+    }
+    let p4 = map_chunk(cx, cz, dim, &mut gen);
+    assert_ne!(
+        p4, p3_restored,
+        "a sign edit must invalidate the cached map_chunk payload"
+    );
+    signs().lock().unwrap().remove(&key);
+    set_block_dim(dim, 8, 70, 8, cur);
+    clear_chunk_caches_for_tests();
+    let p5 = map_chunk(cx, cz, dim, &mut gen);
+    let p6 = map_chunk(cx, cz, dim, &mut gen);
+    assert_eq!(p5, p6, "a cleared cache rebuilds the same payload");
+}
+
+#[test]
+fn p2_c_uniform_sections_emitters_match_cell_by_cell() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    crate::test_support::require_vanilla_data();
+    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
+    assert!(worldgen::init(0, crate::name_to_state), "overworld");
+    assert!(worldgen::enabled(), "worldgen must be loaded");
+    let reg = crate::block_registry::breg().expect("block registry");
+    let dim = DimId::Overworld;
+    let (cx, cz) = (7, -3);
+    let mut gen: GenSources = GenSources::new();
+
+    // The same `hmax` `chunk_data_opt` computes: sections with `sy > hmax + 8`
+    // take the bare-air fast path and push no emitters (worldgen loaded).
+    let mut hmax = i32::MIN;
+    for lz in 0..16i32 {
+        for lx in 0..16i32 {
+            hmax = hmax.max(height_at_dim(dim, cx * 16 + lx, cz * 16 + lz));
+        }
+    }
+    let sections = dim.sections();
+    let min_y = dim.min_y();
+
+    // Publish `sec` for every section of the chunk and run the production encode
+    // (`chunk_data`): the emit list lands in `gen`.
+    let mut run = |sec: std::sync::Arc<PalettedSection>| -> Vec<((i32, i32, i32), u8)> {
+        for sec_idx in 0..sections {
+            publish_section(dim, cx, cz, sec_idx * 16 + min_y, sec.clone());
+        }
+        let _ = chunk_data(cx, cz, dim, &mut gen);
+        gen.get(&(cx, cz)).map(|v| v.clone()).unwrap_or_default()
+    };
+
+    let torch = name_to_state("torch").expect("torch in the pinned registry");
+    let lum = reg.luminance_of(torch);
+    assert!(lum > 0, "torch must be a light-emitting state");
+
+    // Uniform sections (`Single`): the fast path and the cell-by-cell reference
+    // must agree exactly, in order and in value.
+    for (st, expect) in [
+        (
+            torch,
+            {
+                let mut want = Vec::new();
+                for sec_idx in 0..sections {
+                    let sy = sec_idx * 16 + min_y;
+                    if sy > hmax + 8 {
+                        continue;
+                    }
+                    for ly in 0..16i32 {
+                        for lz in 0..16usize {
+                            for lx in 0..16usize {
+                                want.push((
+                                    (cx * 16 + lx as i32, sy + ly, cz * 16 + lz as i32),
+                                    lum,
+                                ));
+                            }
+                        }
+                    }
+                }
+                want
+            },
+        ),
+        (name_to_state("stone").expect("stone"), Vec::new()),
+        (name_to_state("netherrack").expect("netherrack"), Vec::new()),
+        (0, Vec::new()),
+    ] {
+        let states = [st; 4096];
+        let sec = PalettedSection::pack(&states, &|_| false, &|_| false);
+        assert_eq!(sec.uniform_state(), Some(st), "uniform_state on st={st}");
+        assert_eq!(
+            run(std::sync::Arc::new(sec)),
+            expect,
+            "emitters for st={st}"
+        );
+    }
+
+    // Mixed section: `uniform_state` is None, the cell-by-cell path runs, and the
+    // emit list still matches the cell-by-cell reference of the same states.
+    let mut mixed = [name_to_state("stone").expect("stone"); 4096];
+    for idx in 0..4096usize {
+        if idx % 3 == 0 {
+            mixed[idx] = torch;
+        }
+    }
+    let sec = PalettedSection::pack(&mixed, &|_| false, &|_| false);
+    assert_eq!(sec.uniform_state(), None);
+    let mut want = Vec::new();
+    for sec_idx in 0..sections {
+        let sy = sec_idx * 16 + min_y;
+        if sy > hmax + 8 {
+            continue;
+        }
+        for ly in 0..16usize {
+            for lz in 0..16usize {
+                for lx in 0..16usize {
+                    let lum = reg.luminance_of(mixed[(ly << 8) | (lz << 4) | lx]);
+                    if lum > 0 {
+                        want.push((
+                            (cx * 16 + lx as i32, sy + ly as i32, cz * 16 + lz as i32),
+                            lum,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(run(std::sync::Arc::new(sec)), want);
+}
