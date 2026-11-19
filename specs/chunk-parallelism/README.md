@@ -210,13 +210,26 @@ mutation check が緑であることを要求する。段 3 の perf 主張は `
 
 ### 5段階の実行計画（各段でバイト一致・`cargo test`・選択 mutation を必須とする）
 
-| Phase | 対象 | 内容と設計制約 | 出口・効果目標 |
-|---|---|---|---|
-| **P1** | Terrain Slice 2（`P1a` 計測＋`ChunkCols` / `BeardChunkData` 共有） | まず **P1a**（M1〜M5 カウンタ＋`TERRAIN_STORE_BOUND` `512→1536` A/B）で `+88%` の真因を確定し、続く **P1b–e** で round 単位 `TerrainShare`（`bases 64 / beards 128 / cols 128`）と `terr_c` の `Arc` 化を実装する（Nether seed -1 fixture の context 依存を壊さない） | `full` モード CPU +88% ペナルティ（特に feature 段の +156% 超過）を解消 |
-| **P2** | 常駐 `PalettedSection` ストア | **2026-10-20 の教訓**: 非圧縮 `16×16×384` 生配列の先行構築は 20.7 ms/chunk と RSS 147→242 MiB 増を招き棄却済み。Single-value（0 bit）/ Indirect（4–8 bit）/ Direct（15 bit）のパレット section（~48 KiB/chunk、保持上限 `≥ FEATURE_BUCKET_BOUND 384` の退避結合）を単一正本とし、P2a〜P2f で生成・配信（zero-repack）・ライト・anti-xray・feature 近傍読み・tick 書込み・保存/アンロード回収を統一 | `write_light_arrays` 27〜33 ms/chunk と `block_at` 再計算を大幅削減、RSS 低位維持（384 チャンク ≈ 18 MiB） |
-| **P3** | `CARVERS` / `FEATURES` の決定性並列化 | MIT `0564ab0` Horizon の `DecorationOrder` 概念（半径2ランクゲート＋3×3 move-handoff）を参考に、worker が読み取り専用スナップショット＋順序キー付き出力を返し、owner が規定順で確定させる | `CARVERS` / `FEATURES`（~56 ms/chunk）の wall-clock 並列化＋全 fixture バイト一致 |
-| **P4** | `DfProg` SIMD / バッチ評価と早期枝刈り | MIT `Soju06/hyperchunk`（`df_simd_avx2.c` 等）の先行実装を参照し、4×8 格子・垂直列バッチ（`x86_64` AVX2 等、スカラーフォールバック必須）と `material_rule` / `aquifer` の早期枝刈りを導入 | `terrain_section`（~41 ms/chunk）の CPU 単価削減＋`to_bits` 完全一致 |
-| **P5** | ライト・M2 物理・圧縮配信の仕上げ | Starlight 概念（全空気/不透明 section の O(1) スキップ、nibble 直接フラッド、heightmap 空光近道）、Lithium 概念（`VoxelShape` / AABB キャッシュ・ブロック状態インデックス）、`libdeflate`＋パレット直書き送信（配信経路の `MC_SPINE_GEN_JOBS` 有効化前に tick latency を実測） | `WARM=1` CPU で vanilla 同等以下、RSS 軽量性維持、20 TPS 維持 |
+> **進捗同期（2026-11-19, `2e95617` 時点）**: `P1a`（`3135354`）・`P1b`（`b588c03`、full CPU ペナルティ完全解消）・`P2a`（`43a463b`、`src/paletted.rs` 単体）・`P3a`（`1befd35`）・`P4`（`06abd5f`、AVX2 4-lane `DfProg`）・`P5-wire/light`（`ea59c4e`、section encode -89% / sky spill -52〜63%）まで統合済み。64 チャンク release dump（`CPUQuota=400%`）は `full`: `j=1 8.07s / j=8 5.48s`、`NOFEAT`: `j=1 3.84s / j=8 1.58s`、`terrain`: `j=1 2.24s / j=8 0.529s`。
+
+| Phase | 対象 | 状態（`2e95617`） | 内容と設計制約 | 出口・効果目標 |
+|---|---|---|---|---|
+| **P1** | Terrain Slice 2（`P1a` 計測＋`TerrainShare`） | **済** (`3135354`, `b588c03`) | M1〜M5 カウンタ＋round 単位 `TerrainShare`（`bases 64 / beards 128 / cols 128`）＋single-flight `starts`/`rings`＋`Arc` `terr_c` | `full` CPU +88% ペナルティ解消（達成: `j=1 9.78s → j=5 8.78s CPU`） |
+| **P2** | 常駐 `PalettedSection` ストア | **P2a 済** (`43a463b`) / **P2b–f 未** | Single/Indirect/Direct パレット section（~48 KiB/chunk）を `src/main.rs` へ接続し、配信（zero-repack）・ライト・anti-xray・feature 近傍読み・tick 書込み・保存/アンロード回収を単一正本化 | `write_light_arrays` 27〜33 ms/chunk と `block_at` 再計算を大幅削減、RSS 低位維持（384 チャンク ≈ 18 MiB） |
+| **P3** | `CARVERS` / `FEATURES` の決定性並列化 | **P3a 済** (`1befd35`) / **P3b 未** | P3a（dense `CarveRun` + 3×3 リング並列）は完了。残る P3b（Layer A3）で全バッチ Carver 並列＋Feature 色分け（チェッカーボード）並列を導入 | 直列テール解消・8 コア飽和＋全 fixture バイト一致 |
+| **P4** | `DfProg` SIMD / バッチ評価と早期枝刈り | **P4a 済** (`06abd5f`) / **Layer A1+A2 未** | P4a（AVX2 4-lane `DfProg`, full -16%, NOFEAT -29%）完了。残る Layer A1/A2 で Aquifer フラット化・`beard` 削減・SIMD `Perlin`/`NormalNoise`・2D/3D 分離 Corner Grid・AVX-512 8-lane を導入 | `full j=1` 8.07s → ~2.0s、全 arm `to_bits` 完全一致 |
+| **P5** | ライト・M2 物理・圧縮配信の仕上げ | **P5-wire 済** (`ea59c4e`) / **仕上げ未** | P5-wire/light 完了。残りは P2 接続後の O(1) 空光スキップ、共有圧縮キャッシュ（将来的に `zlib-rs`/`libdeflate` 任意切替）、大量 Mob SoA、PGO、`WARM=1` 代表負荷比較 | `WARM=1` CPU で vanilla 同等以下、RSS 軽量性維持、20 TPS 維持 |
+
+### 超高効率計算アーキテクチャ計画（Layer A1〜A4、2026-11-19 `2e95617` 基準）
+
+`2e95617` の `M5` 実測（64 チャンク `full j=1 = 8,070 ms`：`beard` 3,285 ms [40.7%]、`cols` 非 beard 2,200 ms [27.3%]、`fill`/Aquifer 1,423 ms [17.6%]、`carver` 1,854 ms [一部 `cols` 重複]、`feature` 595 ms [7.4%]）および Zen 5（Ryzen 7 9800X3D, フル 512-bit AVX-512, 96 MiB L3）の特性を踏まえ、以下の 4 層で**ビット完全一致のまま**計算効率を桁レベルで引き上げる。
+
+| Layer | 対象と具体施策 | 狙い（理論目標・全段 SHA-256 不変） |
+|---|---|---|
+| **A1: データ構造・アルゴリズム無駄の根絶** | ① **Aquifer `AqChunkGrid` 化**: `aq_rpos_c` の 6,300 万回 SipHash＋16,384 要素 `Vec::remove(0)` を廃止し、チャンク毎 `3×35×3` フラット配列＋`aq_near4` ベクトル化（`aq_lv_ins`/`col_ord` の `Vec::remove(0)` も撤去）。② **`beard` 4 点削減**: `ring_chunks` の `(world_seed, preset)` 純粋キャッシュ化、`beard_chunk_data` の前段 `frequency`/`exclusion` フィルタ＋`adapting_sets` 専用 start 経路、24×24×24 LUT、`rigids.is_empty()` 用 Beard 無し `DfProg`。③ **Biome `u64` ビットマスク化 & `SurfaceProg` コンパイル**: `populate_body` の `Vec<String>`/`HashSet<String>` 比較を `u64` 1 命令化し、`SurfaceRule` をフラット命令列へコンパイル | `full j=1`: **8.07s → ~3.5s**、`j=8`: **5.48s → ~2.0s** |
+| **A2: 2 階層 SIMD（AVX-512 8-lane + AVX2 4-lane）** | ① `src/generation_math.rs` に 4/8 レーン SIMD `Perlin` / `NormalNoise`（コーナーバッチ時は TLS `RefCell` `NCACHE` をバイパス、FMA 禁止で IEEE-754 厳密一致）。② `build_cols_body` の `5×5×49` コーナー格子を「2D ノード事前計算（列ごと 1 回）＋3D 本体（`y` 方向 8/4 点 SIMD 一括）」へ分離コンパイルし、インタプリタ＋`HashMap` memo を撤去。③ `DfProg` の AVX-512 8-lane (`__m512d`, `trilinear_x8`) 拡張（runtime dispatch、非対応環境は AVX2 / Scalar へ自動フォールバック） | `full j=1`: **~3.5s → ~1.8–2.2s**、`j=8`: **~2.0s → ~1.1–1.4s** |
+| **A3: ロックレス 3 段ウェーブフロント並列化** | ① **Carver 全バッチ並列化**: 3×3 リング（平均 1.6 並列）から脱却し、外周 `10×10` 全チャンクの Terrain 完了後に全チャンクを 8 コア完全並列 carve → 規定順一括コミット。② **Feature チェッカーボード（色分け）並列化**: 書込み半径 `±1` を利用して `(cx % 3, cz % 3)`（安全側 `% 4`）で非交差バッチを完全並列化（明示 `POP_ORDER` リプレイ時は従来の規定順を維持し parity 契約を不変に保つ） | `full j=8`: **~1.1–1.4s → 0.4–0.8s**（6〜12 ms/ch） |
+| **A4: ランタイム常駐・配信・大群 Mob・PGO** | ① `PalettedSection`（M3 P2b–f）単一正本配線。② 共有圧縮チャンクキャッシュ（複数プレイヤー再圧縮ゼロ）＋オンライン依存許可時の `zlib-rs`/`libdeflate` 任意切替境界。③ Mob/Entity SoA + 16×16 空間グリッド + 2 フェーズ並列 AI/A*。④ `llvm-profdata` PGO ビルドレシピ | `WARM=1` CPU <= vanilla、20 TPS、RSS ~1/8 維持 |
 
 ### OSS / Mod アルゴリズム参照のライセンス境界
 

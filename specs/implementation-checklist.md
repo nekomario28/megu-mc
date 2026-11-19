@@ -1,7 +1,7 @@
 # 実装・検証チェックリスト（`perf/worldgen-parallel`）
 
 作成: 2026-11-06。基点: `48dfe73b4e1db64d5ce295f0e533d30780a8fc37`。
-更新: 2026-11-13。状態: **部分実装・限定検証済み。上位P0〜P4の完了は別判定**。
+更新: 2026-11-19（同期基準: `2e95617`）。状態: **部分実装・限定検証済み。上位P0〜P4の完了は別判定**。
 作成時点の履歴と、下記の現行棚卸しを混同しない。
 
 この文書は**作業順、担当する既存owner、完了ゲートを一覧化する実行台帳**。
@@ -43,10 +43,10 @@
 
 - [ ] **P0-1 HEAD再現と失敗の基線固定** — これから検証する対象SHAのコード・入力資産・固定jarのdigestを紐付け、`tests/verify.sh`（serial / 8-thread×3 / wire / adapter / layers / debt / mutations）で現在の一次失敗を収集。テスト失敗をmutex poisonやCI課金停止と混同しない。各結果に実行環境・終了コード・省略項目を記録する。
 - [ ] **P0-2 1.21.1 density/surface/biomeの到達性監査** — `src/worldgen.rs` の未知density型の拒否、再帰用placeholderと明示ゼロ扱いノード、surface ruleの未対応を区別し、`spawn_costs` とNaturalSpawner等を分類。固定datapackの実際に到達する経路を列挙し、必須の未知ノードは黙ってゼロにせず拒否する。修正は実クラスfixtureと本番チャンク差分で確認。未到達な旧形式の互換性を推測して広げない。
-- [ ] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー — Stage F1）** — この枝は `datapacks/vanilla/`、1,180 NBTテンプレート、`config_packets.bin`、`assets/pblocks.json` 等を追跡しており、README/THIRD_PARTYの「jarからローカル生成・非コミット」という記述と矛盾する。以下の D1〜D5 で解消するまで `main` へマージ／外部公開しない（内部実装は並行可能）：
-  - [ ] **D1/D2 (`F1-1`)**: `tools/vanilla_data/gen_vanilla_data.sh` で `datapacks/vanilla/`（1,165 JSON + 1,180 `.nbt`）、構造物/バイオームタグ、`config_packets.bin`、`assets/*_1211.bin` を固定 1.21.1 `server.jar` から一括再生成・ハッシュ照合する。
-  - [ ] **D3/D4 (`F1-2`)**: Pumpkin (GPL-3.0) とバイト一致する旧 `assets/pblocks.json`・`assets/properties.json`・`datapacks/vanilla/multi_noise_biome_tree.json`、および出所不明の `resourcepack.zip` を消費者ごと自前生成物に切り替え、`git rm --cached` + 再混入防止 fail-closed ゲートを追加する。
-  - [ ] **D5 (`F1-3`)**: `LICENSE` / `NOTICE` / `THIRD_PARTY.md` / `README.md` を実ツリーと一致させ、旧データの履歴を含まない公開用クリーン基点（orphan/squash）を用意する。
+- [ ] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー — Stage F1）** — `762f312` で D1〜D4 を解消済み。残る D5（`--strict-public` の残 5 項目とクリーン公開基点）が閉じるまで `main` へマージ／外部公開しない（内部実装は並行可能）：
+  - [x] **D1/D2 (`F1-1`, `762f312`)**: `tools/vanilla_data/gen_vanilla_data.sh`（`--verify` 2,350 ファイル・SHA-256 照合）と `assets/block_states_1211.json` の jar 自前生成化を完了。
+  - [x] **D3/D4 (`F1-2`, `762f312`)**: Pumpkin (GPL-3.0) 同値の旧 `assets/pblocks.json`・`assets/properties.json` および出所不明の `resourcepack.zip` を消費者切替の上で削除し、`tools/provenance_check.py`（`--self-test` 11/11 PASS、`--strict-public` 対応）をゲート追加。
+  - [ ] **D5 (`F1-3`)**: `--strict-public` 残 5 項目（`datapacks/vanilla`, `assets/block_states_1211.json`, `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv`, `config_packets.bin`）の公開扱い整理、`LICENSE` / `NOTICE` / `THIRD_PARTY.md` / `README.md` の実ツリー完全一致、および旧データ履歴を含まない公開用クリーン基点（orphan/squash）手順の確定。
 - [ ] **P0-4 native比較契約の固定** — Fossilが**正に配置される**fixture、complete FULL chunks、必要halo、sourceの生成順、2回のnative採取の再現性を定義。artifactに入力・SHA・対象セル数・除外数・pending tick・writerを記録し、古い測定値の流用を防ぐ。
 
 ### P1 — Template finalization（**最優先の実装列**）
@@ -60,28 +60,30 @@
 ### P2 — 全WorldGenへ段階的拡張
 
 - [ ] **P2-1 汎用template / processor / structure starts** — [仕様](worldgen-parity/README.md)。**34定義・16アルゴリズム型**すべてが `src/structure_pipeline.rs` に dispatch 先と scripted oracle TSV を持つ。残る作業は：
-  - [x] **P2-1-T0**: `StructurePiece.placeBlock` の `SHAPE_CHECK_BLOCKS` マーク（template/jigsaw 経路）＋ `Feature.markAboveForPostProcessing` ＋ promotion 限定 `BushBlock` 除去（`2ee2560`, `village-taiga` 0 / 884,736 達成、promotable manifest 12行）。
-  - [ ] **P2-1-T1**: チャンク昇格時（`postProcessGeneration`）の非空流体セルに対する fluid tick 予約・配送接続。
-  - [ ] **P2-1-T2**: `structure_pipeline::load_defs_inner` で1つの不正な構造物 JSON が全パイプラインを `None` に落とす欠陥を要素単位の fail-skip + ログに修正。
-  - [ ] **P2-1-T3 & 残存構造物受入（進行中）**: 汎用構造物 capture レシピ整備、`ruined_portal` B-run、および未実チャンク受入の 24 定義（Batch B1: `igloo`/`shipwreck`/`ocean_ruin`/`ruined_portal_*`、B2: `village_*`/`pillager_outpost`、B3: `ancient_city`/`bastion_remnant`/`trail_ruins`/`trial_chambers`、B4: `mineshaft_mesa`/`buried_treasure`/`desert_pyramid`/`swamp_hut`/`monument`/`mansion`）の段階的受入。
-- [ ] **P2-2 残るconfigured featuresと実chunk差分** — `bonus_chest` は実装済み。End で唯一未実装の `minecraft:end_spike` を実装し native oracle と照合する。codecは外側のmatchだけでなく必須child/provider/modifierの実パースとRNG消費を検証。`sculk_patch` は最新HEAD・同一population順で再計測し `sculk_gate.py --require-match` で判断。
+  - [x] **P2-1-T0 (`2ee2560`)**: `StructurePiece.placeBlock` の `SHAPE_CHECK_BLOCKS` マーク（template/jigsaw 経路）＋ `Feature.markAboveForPostProcessing` ＋ promotion 限定 `BushBlock` 除去（`village-taiga` 0 / 884,736 達成）。
+  - [x] **P2-1-T1**: チャンク昇格時（`postProcessGeneration`）の非空流体セルに対する fluid tick 予約・配送接続（`src/main.rs` の `structure_template::register_fluid_ticker` / `promotion_fluid_tick` 登録済み）。
+  - [ ] **P2-1-T2（Wave 0 進行中）**: `structure_pipeline::load_defs_inner` で1つの不正な構造物 JSON が全パイプラインを `None` に落とす欠陥を要素単位の fail-skip + ログに修正。
+  - [ ] **P2-1-T3 & 残存構造物受入（進行中）**: `bb6ec7c` で汎用レシピ `tools/structure_capture.py` 整備＋`ruined_portal` B-run・`monument` を 0-diff 昇格（promotable manifest **14 行**）。残る HOLD（`igloo` 8セル差 = Wave 0 進行中、`village_plains` 159セル差）および未受入定義をバッチ受入工場（Wave 2〜3）で段階的受入。
+- [ ] **P2-2 残るconfigured featuresと実chunk差分** — `bonus_chest` および End の `minecraft:end_spike` は実装・native oracle 照合・4 mutation ゲート済み（`src/feature.rs`, `src/generation_contract_tests.rs`, `tools/mutation_check.sh`）。残る `sculk_patch` 等の最新HEAD・同一population順再計測と `sculk_gate.py --require-match` 判断を閉じる。
 - [ ] **P2-3 三dimensionの通常サーバー経路（Stage F2 の中核）** — `MC_SPINE_WG_PRESET=end|nether` は offline 診断限定のため、以下の S0〜S4 で通常サーバーの3次元生成・保存・配信・移動を完成させる：
-  - [x] **P2-3-S0**: `tests/protocol767.py` CLI ハーネスの次元対応（`ffb7a22`, `dimension_type` の `min_y`/`height`/`has_skylight` 動的解釈）。
-  - [ ] **P2-3-S1（進行中）**: `DimId` (`Overworld | Nether | End`) と次元別 `Gen` レジストリ（同一 seed 初期化）、`chunk_data` / `write_light_arrays` への `DimId` 配線。
-  - [ ] **P2-3-S2a〜d（重大欠陥修正）**: 9つのワールドストア（`S2a`: `WORLD` 40箇所 + 次元別セーブファイルと旧 `world_overlay.bin` 互換、`S2b`: `CHESTS`/`FURNACES`/`CROPS`、`S2c`: `SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`、`S2d`: `POS_STORE`）のキーへ `DimId` を導入し、異次元の同一座標が上書きし合う欠陥を解消する。
-  - [ ] **P2-3-S3**: Nether/End の 16 セクション（`0..256`）チャンク構築と `has_skylight == false` 時の `skyLightMask = 0` 配信。
-  - [ ] **P2-3-S4**: `0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン次元復元の wire 検証。
+  - [x] **P2-3-S0 (`ffb7a22`)**: `tests/protocol767.py` CLI ハーネスの次元対応（`dimension_type` の `min_y`/`height`/`has_skylight` 動的解釈）。
+  - [x] **P2-3-S1 (`71e96a5`)**: `DimId` (`Overworld | Nether | End`) と次元別 `Gen` レジストリ（同一 seed 初期化）、`chunk_data` / `write_light_arrays` への `DimId` 配線。
+  - [x] **P2-3-S2a (`2e95617`)**: `WORLD` オーバーレイの `DimChunkKey = (DimId, i32, i32)` 化・次元別コンパニオンセーブ・旧 `world_overlay.bin` 後方互換（選択 mutation 4/4 proved）。
+  - [ ] **P2-3-S2b〜d（Wave 1）**: 残り 8 ストア（`S2b`: `CHESTS`/`FURNACES`/`CROPS`、`S2c`: `SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`、`S2d`: `POS_STORE`）の `DimId` キー化。
+  - [ ] **P2-3-S3（Wave 1）**: Nether/End の 16 セクション（`0..256`）チャンク構築と `has_skylight == false` 時の `skyLightMask = 0` 配信。
+  - [ ] **P2-3-S4（Wave 3）**: `0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン次元復元の wire 検証。
 
 ### P3 — M2 gameplay / M3性能（WorldGenと証拠を混ぜない）
 
-- [ ] **P3-1 M2観測可能なゲーム操作** — [合格範囲](PLAN.md)・[Horizon計画](horizon-gameplay/README.md)。チェスト/樽/エンダーチェスト・遅延 LootTable・waterlogged chest（Slice 3a〜3d、`0fa6807`）、衝突/段差（Slice 4a）、流体高/水流押し/溶岩接触（Slice 4b）、押し合い/cramming/空間グリッド（Slice 4c）まで完了。残る作業：
-  - [ ] **Slice 4d（進行中）**: `LivingEntity.travel` の水中/溶岩移動・浮力・落下減衰と Nether `ultraWarm` 溶岩押し流し倍率（`0.0023333333333333335`）。
-  - [ ] **後続スライス**: 構造物 Entity スポーン初期化と `spawn_overrides`、戦闘・死亡/リスポーン・クラフト/精錬・天候/昼夜の CLI 実 wire 往復検査。
-- [ ] **P3-2 生成の並列化と性能gate（M3 P1〜P5）** — [仕様](chunk-parallelism/README.md)。Terrain Slice 1 で terrain-only は 3.7〜4.7x 高速化済みだが、feature 込み `full` で CPU が +88%（`full - NOFEAT` +156%）増加している欠陥を以下の順で解消する：
-  - [ ] **M3 P1a（進行中）**: 負荷非依存カウンタ（M1〜M5）＋ `TERRAIN_STORE_BOUND` (`512` vs `1536`) A/B 測定による原因特定。
-  - [ ] **M3 P1b〜e**: ラウンド単位 `TerrainShare`（`bases`/`beards`/`cols`）と `terr_c` の `Arc` 化。
-  - [ ] **M3 P2**: 常駐 `PalettedSection` ストアによる `write_light_arrays` / `block_at` 再計算の排除。
-  - [ ] **M3 P3〜P5**: `CARVERS`/`FEATURES` 決定性並列化、`DfProg` SIMD バッチ評価、ライト/配信仕上げと `WARM=1` 代表負荷比較。
+- [ ] **P3-1 M2観測可能なゲーム操作** — [合格範囲](PLAN.md)・[Horizon計画](horizon-gameplay/README.md)。Slice 3a〜3d（チェスト/樽/エンダーチェスト・遅延 LootTable・waterlogged chest、`0fa6807`）、Slice 4a〜4c（衝突・流体高/水流押し・押し合い/空間グリッド）完了。
+  - [x] **Slice 4d (`b822d99`)**: `LivingEntity.travel` の水中/溶岩移動・浮力・落下減衰と Nether `ultraWarm` 溶岩押し流し倍率（`0.0023333333333333335`）。
+  - [ ] **後続スライス（Wave 4）**: 構造物 Entity スポーン初期化と `spawn_overrides`、戦闘・死亡/リスポーン・クラフト/精錬・天候/昼夜の CLI 実 wire 往復検査。
+- [ ] **P3-2 生成の並列化と性能gate（M3 P1〜P5 + 超高効率計算 Layer A1〜A4）** — [仕様](chunk-parallelism/README.md)。
+  - [x] **M3 P1a (`3135354`) / P1b (`b588c03`)**: 負荷非依存カウンタ（M1〜M5）＋ラウンド単位 `TerrainShare`・single-flight `starts`/`rings`・`Arc` `terr_c` により、`full` CPU +88% ペナルティを完全解消。
+  - [x] **M3 P2a (`43a463b`)**: 常駐 `PalettedSection` 単体モジュール（`src/paletted.rs`）。 / [ ] **M3 P2b〜f（Wave 2）**: `src/main.rs` 単一正本配線（zero-repack・O(1) light・`block_at` 再計算排除）。
+  - [x] **M3 P3a (`1befd35`)**: Carver dense map + 3×3 リング並列。 / [ ] **M3 P3b / Layer A3（Wave 3）**: Carver 全バッチ並列＋Feature チェッカーボード並列。
+  - [x] **M3 P4a (`06abd5f`)**: `DfProg` AVX2 4-lane 評価（full -16%, NOFEAT -29%）。 / [ ] **Layer A1+A2（Wave 1〜2）**: Aquifer `AqChunkGrid` 化＋`beard` 4 点削減＋Biome `u64`/`SurfaceProg`＋SIMD `Perlin`/`NormalNoise`＋2D/3D 分離 Corner Grid＋AVX-512 8-lane。
+  - [x] **M3 P5-wire/light (`ea59c4e`)**: 配信パレット書込 -89%、sky spill -52〜63%、floor cache -88%。 / [ ] **M3 P5 仕上げ & Layer A4（Wave 4）**: 共有圧縮キャッシュ・Mob SoA・PGO・`WARM=1` 代表負荷比較。
 
 ### P4 — 統合前のゲート（自動ではmergeしない）
 

@@ -63,9 +63,8 @@ gate の配線と exit contract であって、実ツールの正しさではな
 [contributor-readiness-2026-11-16](../evidence/review/contributor-readiness-2026-11-16.md) にあり、
 このページには写しません。
 
-`assets/block_states_1211.json` のように、生成器の出力でも追跡されていないものがある
-（`git ls-files` が唯一の正）。無いと困るのは `tools/asset_coverage.py` と再生成だけで、
-ビルドと T0 は tracked のままで動く。
+`tests/data/biome_probe_1211.tsv` や `tests/data/vanilla_vectors_1211.tsv` のように、生成器の出力でも追跡されていないものがある
+（`git ls-files` と `tools/provenance_check.py --strict-public` が正）。`assets/block_states_1211.json` は `762f312` で jar 生成出力に切替済みで、ビルドと T0 は tracked のままで動く。
 
 ## 走らせるときの前提
 

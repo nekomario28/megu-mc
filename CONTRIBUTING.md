@@ -57,9 +57,9 @@ mc-spine は実験段階のサーバーで、完成品ではありません。�
 このHEADには、上の方針と**食い違う追跡データ**があります。分類・パス・確認した事実は
 [開発ガイド](docs/development.md#24-追跡データと方針文書の食い違い未解決) にまとめました。要点だけ:
 
-- Mojangのjar由来の生成データ（`datapacks/vanilla/`、`config_packets.bin`、`tests/data/` のfixture、`assets/*_1211.bin` など）が追跡されています。
-- `assets/pblocks.json` / `assets/properties.json` は、[THIRD_PARTY.md](THIRD_PARTY.md) §3 がPumpkinのファイルとバイト一致と記録したsha256のまま追跡されています。
-- 出所不明の `resourcepack.zip` や `datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` も追跡されています。
+- Mojangのjar由来の生成データ（`datapacks/vanilla/`、`assets/block_states_1211.json`、`config_packets.bin`、`tests/data/` のfixture、`assets/*_1211.bin` など）が追跡されています（残件は D5、`tools/provenance_check.py --strict-public` で一覧化）。
+- 旧 `assets/pblocks.json` / `assets/properties.json`（Pumpkin 同値）および出所不明の `resourcepack.zip` は `762f312` で削除し、`tools/provenance_check.py` で再混入を禁止しています。
+- テスト用パック `datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` 等は引き続き追跡されています。
 
 **貢献者へのお願い**: 追加しない、削除しない、公開しない。判断はオーナーと [LICENSING.md](LICENSING.md) §5／
 [THIRD_PARTY.md](THIRD_PARTY.md) §3・§9 に委ねます。食い違いを見つけたら、変更を混ぜずにissueで

@@ -48,31 +48,45 @@ Mineshaftのadmission・dispatcher・piece配置は [Rust接続checkpoint](../ev
 外部へ公開できるフォークを最短で作るため、**法的にクリーンな Alpha 公開（Stage F1）**と、**3次元・軽量性・主要ゲームプレイを揃えた実用公開（Stage F2）**の2段階に分け、現在解消すべき欠陥・不足を明示的なスライスとして実行順へ組み込む。
 
 #### Stage F1: 法的にクリーンな Experimental / Alpha 公開フォーク（P0-3 / D1〜D5 完結）
-- **F1-1 (`P0-3 D1/D2`: 公式 `server.jar` からの全資産ローカル生成化)**:
-  - `tools/vanilla_data/gen_vanilla_data.sh` を拡張し、現在 Git 追跡されている `datapacks/vanilla/`（JSON 1,165件＋構造物 `.nbt` 1,180件）、構造物/バイオームタグ、`assets/*_1211.bin`、`config_packets.bin` をすべて利用者の固定 1.21.1 `server.jar`（SHA-1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`）から1コマンドで決定論的に展開・生成できるようにする。
-- **F1-2 (`P0-3 D3/D4`: GPL 同値アセット・Mojang 派生物の追跡解除と fail-closed ゲート)**:
-  - Pumpkin (GPL-3.0) とバイト一致が報告されている旧 `assets/pblocks.json`・`assets/properties.json`・`datapacks/vanilla/multi_noise_biome_tree.json`、および `resourcepack.zip` 等の不要・未承認追跡ファイルを消費者ごと自前生成データへ切り替え、`git rm --cached` と `.gitignore` を一致させる（テスト入力を無条件削除してスイートを壊さない）。
-  - 追跡禁止パスが再度ステージングされたら赤になる検査スクリプトをゲートに追加する。
-- **F1-3 (`P0-3 D5 / P4-2`: クリーン履歴ブランチ・ライセンス表記の確定)**:
-  - `LICENSE`（Apache-2.0）・`NOTICE`・`THIRD_PARTY.md`・`README.md` の記述と実ツリーを完全一致させ、過去コミット履歴の Mojang/第三者データを含まないクリーンな公開用ブランチ（orphan / squash 基点）を切り出せる状態にする。
+- **F1-1 (`P0-3 D1/D2`: 公式 `server.jar` からの全資産ローカル生成化 — 完了 `762f312`)**:
+  - `tools/vanilla_data/gen_vanilla_data.sh`（＋`verify_pack.py`、`--verify` 2,350 ファイル照合）と `assets/block_states_1211.json` の jar 自前生成化を完了。
+- **F1-2 (`P0-3 D3/D4`: GPL 同値アセット・Mojang 派生物の追跡解除と fail-closed ゲート — 完了 `762f312`)**:
+  - Pumpkin (GPL-3.0) 同値の旧 `assets/pblocks.json`・`assets/properties.json` と出所不明の `resourcepack.zip` を消費者ごと切替・除去し、`tools/provenance_check.py`（`--self-test` 11/11 PASS、`--strict-public` モード付き）をゲートに追加済み。
+- **F1-3 (`P0-3 D5 / P4-2`: クリーン履歴ブランチ・ライセンス表記の確定 — 残件 1 スライス)**:
+  - `--strict-public` が指摘する残 5 項目（`datapacks/vanilla`, `assets/block_states_1211.json`, `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv`, `config_packets.bin`）の配布扱い整理、`LICENSE`（Apache-2.0）・`NOTICE`・`THIRD_PARTY.md`・`README.md` の実ツリー完全一致、および過去履歴を含まないクリーン公開用ブランチ（orphan / squash 基点）手順の確定。
 
 #### Stage F2: 3次元・構造物・M2/M3 軽量性を備えた実用公開フォーク
-- **F2-1 (`P2-3-S1〜S4`: 3次元サーバーの通常経路とワールドストア次元分離 — 重大欠陥の解消)**:
-  - `S1`（進行中）: `DimId` (`Overworld | Nether | End`) と次元別 `Gen` レジストリ、`chunk_data` / `write_light_arrays` への次元スレッド化。
-  - `S2a〜S2d`（必須欠陥修正）: 現在次元キーを持たない 9 つのワールドストア（`WORLD` 編集オーバーレイ、`CHESTS`、`FURNACES`、`CROPS`、`SIGNS`、`PENDING_BLOCKS`、`BACKOFF`、`PLUGIN_CELLS`、`POS_STORE`、計143箇所）に `DimId` を導入し、Nether/End のブロック編集やコンテナが Overworld `(0,0)` に混ざる欠陥を解消する。次元別保存と旧 `world_overlay.bin` の Overworld 後方互換読込を保証する。
-  - `S3`: Nether/End の 16 セクション（`min_y = 0`, `height = 256`）チャンク配信と `has_skylight = false` での `skyLightMask == 0`（空光配列0件）送信。
-  - `S4`: `0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン時次元復元。
-- **F2-2 (`M3 P1〜P2`: Feature 生成時の CPU `+88%`（`full - NOFEAT` `+156%`）欠陥の解消)**:
-  - `P1a`（進行中）: 負荷非依存カウンタ（M1〜M5）と `TERRAIN_STORE_BOUND` (`512` vs `1536`) A/B により、worker/owner 間の `cols`/beardifier 重複と `terr_c` 退避の寄与を確定する。
-  - `P1b〜e`: ラウンド単位の `TerrainShare`（`bases` / `beards` / `cols`）と `terr_c` の `Arc` 化で重複計算を排除する。
-  - `P2`: 常駐 `PalettedSection` ストア（~48 KiB/chunk）を導入し、`write_light_arrays`（27〜33 ms/chunk）や anti-xray の `block_at` 再計算を O(1) パレット参照へ置き換える。
+- **F2-1 (`P2-3-S1〜S4`: 3次元サーバーの通常経路とワールドストア次元分離)**:
+  - `S0`（済 `ffb7a22`）・`S1`（済 `71e96a5`：`DimId` と次元別 `Gen` レジストリ）・`S2a`（済 `2e95617`：`WORLD` オーバーレイ `DimChunkKey` 化と次元別セーブ互換）。
+  - `S2b〜S2d`（残）：残り 8 ストア（`CHESTS`/`FURNACES`/`CROPS`/`SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`/`POS_STORE`）の `DimId` 化。
+  - `S3`（残）：Nether/End の 16 セクション（`min_y = 0`, `height = 256`）チャンク配信と `has_skylight = false` での `skyLightMask == 0` 送信。
+  - `S4`（残）：`0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン時次元復元。
+- **F2-2 (`M3 P1〜P5` + 超高効率計算 Layer A1〜A4)**:
+  - `P1a`（済 `3135354`）・`P1b`（済 `b588c03`、full CPU ペナルティ解消）・`P2a`（済 `43a463b`）・`P3a`（済 `1befd35`）・`P4`（済 `06abd5f`、AVX2 4-lane）・`P5-wire/light`（済 `ea59c4e`）まで完了。
+  - 残る超高効率計算（詳細：[chunk-parallelism/README.md](chunk-parallelism/README.md#超高効率計算アーキテクチャ計画layer-a1a42026-11-19-2e95617-基準)）：**Layer A1**（Aquifer `AqChunkGrid` + `beard` 4 点削減 + Biome `u64`/`SurfaceProg`）、**Layer A2**（SIMD `Perlin`/`NormalNoise` + 2D/3D 分離 Corner Grid + AVX-512 8-lane）、**Layer A3**（Carver 全バッチ並列 + Feature チェッカーボード並列）、**Layer A4**（`PalettedSection` P2b–f 配線 + 共有圧縮キャッシュ + Mob SoA + PGO）。
 - **F2-3 (`P2-1 / P2-2`: 構造物実チャンク受入の拡大と残存 Feature / 境界の閉鎖)**:
-  - `P2-1-T3`（進行中）: 汎用構造物 capture レシピの確立、`ruined_portal` の独立 B-run、および Kernel A/B/C 代表構造物（`igloo`, `monument`, `village_plains` 等）から残る 24 定義の段階的受入。
-  - `P2-1-T1` / `P2-1-T2`: チャンク昇格時（`postProcessGeneration`）の非空流体セル tick 起動、および単一構造物 JSON 不良で全パイプラインが `None` になる脆弱性の解消。
-  - `P2-2`: End の `minecraft:end_spike` 実装＋native oracle 照合（Configured Feature 到達率 100% 化）。構造物 `spawn_overrides` は P3/M2 の構造物内スポーン契約として接続する。
+  - `P2-1-T0`（済 `2ee2560`）・`P2-1-T1`（済 `promotion_fluid_tick` 登録済み）・`P2-1-T3` 第 1 段（済 `bb6ec7c`：`tools/structure_capture.py` + `ruined_portal` B / `monument` 昇格で promotable 14 行）・`P2-2` `minecraft:end_spike`（済・oracle 検証＆4 mutation ゲート済み）。
+  - 残件：`P2-1-T2`（不正構造物 JSON の要素単位 fail-skip）、`igloo`（`SnowyDirtBlock`）・`village_plains` 等の HOLD 解消、および自動バッチ受入工場による残存 24 定義の段階的受入。
 - **F2-4 (`M2 Gameplay`: 流体 `travel` と残る操作契約の閉鎖)**:
-  - `Slice 4d`（進行中）: `LivingEntity.travel` の水中/溶岩浮力・水流減衰・落下速度調整と Nether `ultraWarm` 溶岩押し流し倍率（`0.0023333333333333335`）の接続。
-  - 後続スライス: 構造物 Entity スポーン初期化、プレイヤー操作・戦闘/死亡/リスポーン・精錬・天候等の CLI live wire 往復検査。
+  - `Slice 4d`（済 `b822d99`：`LivingEntity.travel` 流体浮力・減衰・Nether `ultraWarm` 溶岩押し流し）。
+  - 後続スライス：構造物 Entity スポーン初期化と `spawn_overrides`、戦闘/死亡/リスポーン・精錬・天候等の CLI live wire 往復検査。
+
+#### 超高効率計算＋収束加速の統合実行計画（Wave 0〜Wave 4、2026-11-19 承認）
+
+完成速度と並列スループットを最大化するため、**5 つの収束規律（B1〜B5）** を固定する：
+- **B1**: Stage F1（残 D5 のみ）を先行確定し、いつでも外部公開可能な Alpha ラインを確保する。
+- **B2 (`src/main.rs` 単一レーン規約)**: 31,219 行の `src/main.rs` 衝突を避けるため、ロジックは既存の専用モジュールへ厚く閉じ、**1 バッチ内で `src/main.rs` を編集するレーンは常に 1 つ**に固定して常時 3 並列をコンフリクトゼロで回す。
+- **B3 (構造物バッチ受入工場)**: `tools/structure_capture.py` をバッチ化し、未受入 24 定義を「0-diff 自動昇格」「共通カーネル原因クラスタ」「個別原因」に自動仕分けして波及の大きい 1 修正で複数構造物を同時 0-diff 化する。
+- **B4 (2 階層高速ゲート＋自動ベンチ)**: サブエージェントは対象フィルタ＋`layers_check`/`debt_ratchet`/`provenance_check`、インテグレータは `TMPDIR=target/tmp` 分割実行＋`tools/perf_bench.py`（SHA-256・M1–M6・wall/CPU 中央値自動計測）で 600s タイムアウトと手動計測ロスを根絶する。
+- **B5 (台帳同期)**: Wave 完了ごとに `specs/` と運用文書を実態へ同期し、陳腐化による再調査ロスをゼロにする。
+
+| Wave | Lane 1（`src/main.rs` 専任） | Lane 2（計算カーネル専任） | Lane 3（構造物 / ツール専任） | 出口マイルストーン |
+|---|---|---|---|---|
+| **Wave 0** | 文書同期＋計画反映＋Stage F1 D5 準備 | `tools/perf_bench.py` 自動計測器＋テスト | `igloo` (`SnowyDirtBlock`) + `P2-1-T2` fail-skip | 台帳同期、自動計測器稼働、`igloo` 0-diff 検証 |
+| **Wave 1** | `P2-3-S2b〜d` + `S3`（残 8 ストア次元分離 + Nether/End 16 セクション配信） | Layer A1-a: Aquifer `AqChunkGrid` 化 & `Vec::remove(0)` 根絶 (`src/worldgen.rs`) | Layer A1-b: `beard` 4 点削減 (`src/structure_pipeline.rs`) | 3 次元配信完成、`full j=1` 8.07s → ~3.5s |
+| **Wave 2** | `M3 P2b〜f`: `PalettedSection` 単一正本配線 (`src/paletted.rs` + `src/main.rs`) | Layer A2: SIMD `Perlin`/`NormalNoise` + 2D/3D 分離 Corner Grid + AVX-512 8-lane (`src/generation_math.rs`, `src/worldgen.rs`) | 構造物バッチ工場（B1/B2）＋`village_plains` 159 セル解消 (`tools/structure_capture.py`, `src/jigsaw_structures.rs`) | ライト/配信桁違い軽量化、`full j=1` ~2.0s、Jigsaw 群前進 |
+| **Wave 3** | `P2-3-S4`（`0x2b`/`0x47` 次元遷移・ポータル・ログイン復元 wire） | Layer A3 + A1-c: Carver 全バッチ並列 + Feature `u64` バイオーム + チェッカーボード並列 + `SurfaceProg` (`src/feature.rs`, `src/worldgen.rs`) | 構造物バッチ工場（B3/B4：`ancient_city`/`bastion`/`trial_chambers`/`mansion` 等） | 64ch `full j=8` 1s 未満、Stage F2 機能ライン到達 |
+| **Wave 4** | M2 残スライス（Entity スポーン・戦闘/死亡/精錬 live wire）＋ PGO 計測 | `WARM=1` vanilla 対照ベンチマーク証明（CPU <= vanilla, 20 TPS, RSS ~1/8） | 同一 SHA 全ゲート監査（`verify.sh` / mutation / `--strict-public` / D5 公開判定） | Stage F2 実用公開フォーク判定 |
 
 **原因記述の訂正:** 端のair差とsnowy差を位置の近さだけで同じ原因にまとめた推測は
 撤回する。訂正根拠・区別すべきlookup・次の反証は

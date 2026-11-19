@@ -19,9 +19,9 @@
 
 | 種類 | 例 | 現行HEADでの状態 |
 |---|---|---|
-| 追跡されている入力 | `assets/*.json`、`assets/*_1211.bin`、`datapacks/vanilla/`、`config_packets.bin`、`tests/data/` のfixture | クローンしただけでビルド・一部テストに使える。`include_bytes!` でコンパイル時に読むものもある |
-| 生成器が作るが、このHEADには無いもの | `assets/block_states_1211.json`、`tests/data/biome_probe_1211.tsv`、`tests/data/vanilla_vectors_1211.tsv` | 無い。`src/` から直接読む箇所は確認していない（`tools/` 側の生成・照合が対象） |
-| 利用者が任意で置くもの（任意機能の入力） | `resourcepack.zip` | 無ければリソースパックを配信しない。現行HEADでは追跡されている（2.4参照） |
+| 追跡されている入力 | `assets/block_states_1211.json`、`assets/*_1211.bin`、`datapacks/vanilla/`、`config_packets.bin`、`tests/data/` のfixture | クローンしただけでビルド・一部テストに使える。`include_bytes!` でコンパイル時に読むものもある（`assets/block_states_1211.json` は `762f312` で jar 生成出力へ切替済み） |
+| 生成器が作るが、このHEADには無いもの | `tests/data/biome_probe_1211.tsv`、`tests/data/vanilla_vectors_1211.tsv` | 無い。`tools/` 側の生成・照合が対象 |
+| 利用者が任意で置くもの（任意機能の入力） | `resourcepack.zip` | 無ければリソースパックを配信しない。`762f312` で追跡から削除し、`tools/provenance_check.py` で再混入を禁止している |
 
 `datapacks/vanilla/` はworldgenのJSON、block tag、構造物templateなどを含みます。`assets/blocks_1211.json` は
 PrismarineJS/minecraft-data（MIT）由来で、帰属は [NOTICE](../NOTICE) にあります。
@@ -67,9 +67,9 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-
 
 | 分類 | 現行HEADで追跡されているパス | 方針文書との差 |
 |---|---|---|
-| Mojangのjar由来の生成データ | `datapacks/vanilla/`（worldgen JSON・tag・構造物template）、`config_packets.bin`、`tests/data/*.tsv` / `*.tsv.gz`（native captureを含む）、`assets/*_1211.bin`、`assets/feature_order_1211.json` | LICENSING §2d・THIRD_PARTY §1/§5/§9・生成器のヘッダは「コミットしない・`.gitignore`・手元で生成」と記録する。実際は追跡されている |
-| THIRD_PARTY §3 が Pumpkin のファイルとバイト一致と記録するasset | `assets/pblocks.json`（sha256 `cc748df1…`）、`assets/properties.json`（`da8e0949…`） | §3 は「作業ツリーから削除済み」と記録するが、記録されたsha256と一致するバイトが追跡されている。`datapacks/vanilla/multi_noise_biome_tree.json` も追跡されているが、§3 の記録（1,827,624 bytes）とはサイズが異なる（2,059,828 bytes）ため、現在の出所は§3では説明できない |
-| 出所不明 | `resourcepack.zip`（345 bytes）、`*.storyboard.png`、`datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` | §1/§9 は削除済み・出所不明と記録する。現行HEADでは追跡されている |
+| Mojangのjar由来の生成データ | `datapacks/vanilla/`（worldgen JSON・tag・構造物template）、`assets/block_states_1211.json`、`config_packets.bin`、`tests/data/*.tsv` / `*.tsv.gz`（native captureを含む）、`assets/*_1211.bin`、`assets/feature_order_1211.json` | LICENSING §2d・THIRD_PARTY §1/§5/§9・生成器のヘッダは「コミットしない・`.gitignore`・手元で生成」と記録する。Stage F1 D5 の整理まで追跡が残る（`tools/provenance_check.py --strict-public` で一覧化） |
+| THIRD_PARTY §3 が Pumpkin 同値と記録していた旧 asset | **解消済み（`762f312`）** — `assets/pblocks.json`・`assets/properties.json` は追跡削除済み、`tools/provenance_check.py` が再混入を拒否 | `datapacks/vanilla/multi_noise_biome_tree.json` も jar 生成の `biome_climate_tree.json` へ切替済み |
+| 出所不明 / テストパック | `resourcepack.zip` は **`762f312` で削除済み**（再混入禁止）。`*.storyboard.png`、`datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` は残存 | §1/§9 と D5 で最終整理予定 |
 
 貢献者へのルール:
 
