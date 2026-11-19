@@ -170,6 +170,10 @@ struct Defs {
     /// Only these can contribute a beardifier box, so a chunk whose neighbourhood
     /// admits none of them needs no beardifier at all.
     adapting_sets: Vec<usize>,
+    /// The complement of `adapting_sets`, in the same (ascending) set-index order.
+    /// Beard resolution must never generate these; the decoration path still needs
+    /// them, so the two halves are evaluated separately and merged by set index.
+    non_adapting_sets: Vec<usize>,
     /// `#minecraft:required_ocean_monument_surrounding` biome set.
     monument_surrounding: HashSet<String>,
 }
@@ -383,17 +387,25 @@ fn load_defs_from_files(
             by_step.iter().map(|v| v.len()).collect::<Vec<_>>()
         );
     }
-    let adapting_sets: Vec<usize> = sets
+    let is_adapting: Vec<bool> = sets
         .iter()
-        .enumerate()
-        .filter(|(_, set)| {
+        .map(|set| {
             set.entries.iter().any(|(id, _)| {
                 structures
                     .get(id)
                     .is_some_and(|def| def.adjustment != BeardAdjustment::None)
             })
         })
-        .map(|(i, _)| i)
+        .collect();
+    let adapting_sets: Vec<usize> = is_adapting
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &yes)| yes.then_some(i))
+        .collect();
+    let non_adapting_sets: Vec<usize> = is_adapting
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &yes)| (!yes).then_some(i))
         .collect();
     let monument_surrounding =
         resource("tags/worldgen/biome", "minecraft:required_ocean_monument_surrounding")
@@ -405,6 +417,7 @@ fn load_defs_from_files(
         structures,
         by_step,
         adapting_sets,
+        non_adapting_sets,
         monument_surrounding,
     })
 }
@@ -420,11 +433,143 @@ fn preset_tag(preset: worldgen::NoisePreset) -> u8 {
 }
 
 thread_local! {
-    /// Cached relocated stronghold chunks per `(seed, preset_tag, set_index)`.
+    /// Cached relocated stronghold chunks per `(seed, preset_tag, set_index)` — the eager,
+    /// all-128 view. Tests and any caller that must enumerate every ring use this; admission
+    /// checks use the lazy per-index path below instead.
     static RING_CACHE: std::cell::RefCell<HashMap<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>> =
         std::cell::RefCell::new(HashMap::new());
+    /// The cheap, pure candidate list `(candidate chunk, child RNG state)` per ring set.
+    /// Building it costs a few LCG draws and **no** biome lookups.
+    static RING_CANDIDATES: std::cell::RefCell<HashMap<(u64, u8, usize), std::sync::Arc<Vec<((i32, i32), u64)>>>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// Lazily relocated chunk for one ring index, keyed by `(seed, preset_tag, set, index)`.
+    static RING_I_CACHE: std::cell::RefCell<RingIndexCache> = std::cell::RefCell::new(RingIndexCache {
+        map: HashMap::new(),
+        ord: std::collections::VecDeque::new(),
+    });
 }
 
+/// TLS retention for [`RING_I_CACHE`], bounded FIFO like the other caches.
+struct RingIndexCache {
+    map: HashMap<(u64, u8, usize, i32), (i32, i32)>,
+    ord: std::collections::VecDeque<(u64, u8, usize, i32)>,
+}
+
+/// The ring placement parameters, or `None` outside an Overworld concentric-ring set.
+fn ring_params<'a>(d: &'a Defs, g: &Gen, set: usize) -> Option<(i32, i32, i32, &'a HashSet<String>)> {
+    if g.preset != worldgen::NoisePreset::Overworld {
+        return None;
+    }
+    match &d.sets[set].placement {
+        PlacementDef::Rings {
+            distance,
+            spread,
+            count,
+            preferred_biomes,
+        } => Some((*distance, *spread, *count, preferred_biomes)),
+        _ => None,
+    }
+}
+
+/// The cheap candidate list for one ring set, cached by its pure key.
+fn ring_candidates_cached(
+    d: &Defs,
+    g: &Gen,
+    set: usize,
+) -> std::sync::Arc<Vec<((i32, i32), u64)>> {
+    let key = (g.wseed(), preset_tag(g.preset), set);
+    if let Some(v) = RING_CANDIDATES.with(|c| c.borrow().get(&key).cloned()) {
+        return v;
+    }
+    // `concentric_rings` delegates to `concentric_ring_candidates`; recording the child
+    // state in its callback recovers the exact candidate list without a biome lookup.
+    // Routing through `mineshaft`'s re-export keeps `feature`'s source-edge ratchet intact.
+    let mut candidates = Vec::new();
+    if let Some((distance, spread, count, _)) = ring_params(d, g, set) {
+        let _ = mineshaft::concentric_rings(g.wseed(), distance, spread, count, |candidate, rng| {
+            candidates.push((candidate, rng.state48()));
+            None
+        });
+    }
+    let arc = std::sync::Arc::new(candidates);
+    RING_CANDIDATES.with(|c| {
+        let mut map = c.borrow_mut();
+        if map.len() > 16 {
+            map.clear();
+        }
+        map.insert(key, arc.clone());
+    });
+    arc
+}
+
+/// Resolve one ring index's biome relocation, without the eager all-128 scan.
+///
+/// The biome search is seeded with `last = None` for this index alone; the unit test
+/// `lazy_ring_indices_match_eager_concentric_rings` checks all 128 against the eager
+/// path (which threads one `last` across the whole loop).
+fn ring_chunk_i_uncached(d: &Defs, g: &mut Gen, set: usize, i: i32) -> (i32, i32) {
+    let Some((_, _, _, preferred_biomes)) = ring_params(d, g, set) else {
+        return (i32::MIN, i32::MIN);
+    };
+    let Some(&(candidate, child_state)) = ring_candidates_cached(d, g, set).get(i as usize) else {
+        return (i32::MIN, i32::MIN);
+    };
+    let preferred: HashSet<u16> = preferred_biomes
+        .iter()
+        .filter_map(|name| g.biome_leaf_of_name(name))
+        .collect();
+    let mut child = crate::generation_math::Lcg::from_raw_state(child_state);
+    mineshaft::concentric_rings_target(
+        candidate,
+        &mut child,
+        112,
+        |qx, qy, qz| g.biome_quart(qx, qy, qz, None),
+        |b| b.is_some_and(|(_, leaf)| preferred.contains(&leaf)),
+    )
+    .unwrap_or(candidate)
+}
+
+/// One resolved ring index, single-flight inside a round and TLS-cached otherwise.
+fn ring_chunk_i(d: &Defs, g: &mut Gen, set: usize, i: i32) -> (i32, i32) {
+    let key = (g.wseed(), preset_tag(g.preset), set, i);
+    if let Some(cache) = g.starts_round.and_then(round_cache) {
+        let token = crate::worldgen::flight_token(RING_I_FLIGHT_DOMAIN, &key);
+        return cache.ring_i.get_or_build(key, token, || ring_chunk_i_uncached(d, g, set, i));
+    }
+    if let Some(v) = RING_I_CACHE.with(|c| c.borrow().map.get(&key).copied()) {
+        return v;
+    }
+    let v = ring_chunk_i_uncached(d, g, set, i);
+    RING_I_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.map.insert(key, v);
+        c.ord.push_back(key);
+        if c.ord.len() > 4096 {
+            if let Some(old) = c.ord.pop_front() {
+                c.map.remove(&old);
+            }
+        }
+    });
+    v
+}
+
+/// Does any ring of `set` relocate to `(x, z)`? The candidate-to-relocation offset is
+/// at most 7 chunks (radius 112 blocks = 28 quarts, `>> 4`), so a ±8 chunk window is
+/// conservative. Only those few indices are resolved — the other ~120 never touch a biome.
+fn ring_admit(d: &Defs, g: &mut Gen, set: usize, x: i32, z: i32) -> bool {
+    let candidates = ring_candidates_cached(d, g, set);
+    for (i, &((cx, cz), _)) in candidates.iter().enumerate() {
+        if (cx - x).abs() <= 8 && (cz - z).abs() <= 8 {
+            let (rx, rz) = ring_chunk_i(d, g, set, i as i32);
+            if (rx, rz) == (x, z) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32, i32)>> {
     let seed = g.wseed();
     let tag = preset_tag(g.preset);
@@ -435,7 +580,7 @@ fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32
             .rings
             .get_or_build(key, token, || std::sync::Arc::new(ring_chunks_uncached(d, g, set)));
     }
-    if let Some(cached) = RING_CACHE.with(|c| c.borrow().get(&(seed, tag, set)).cloned()) {
+    if let Some(cached) = RING_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return cached;
     }
     let arc = std::sync::Arc::new(ring_chunks_uncached(d, g, set));
@@ -444,13 +589,15 @@ fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32
         if map.len() > 64 {
             map.clear();
         }
-        map.insert((seed, tag, set), arc.clone());
+        map.insert(key, arc.clone());
     });
     arc
 }
 
-/// [`ring_chunks`]'s computation, without the caches: the concentric-ring scan, which reads the
-/// biome quart sweep for every candidate.
+/// [`ring_chunks`]'s computation, without the caches: the eager concentric-ring scan,
+/// which reads the biome quart sweep for all 128 candidates and threads one `last`
+/// hint across them. Kept as the reference the lazy path is tested against.
+#[cfg_attr(not(test), allow(dead_code))]
 fn ring_chunks_uncached(d: &Defs, g: &mut Gen, set: usize) -> HashSet<(i32, i32)> {
     let seed = g.wseed();
     if g.preset != worldgen::NoisePreset::Overworld {
@@ -509,10 +656,11 @@ fn candidate_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32) -> bool {
     spread.candidate(seed, x, z) == (x, z)
 }
 
+#[allow(dead_code)]
 fn candidate_admits_live(d: &Defs, g: &mut Gen, set: usize, seed: u64, x: i32, z: i32) -> bool {
     match &d.sets[set].placement {
         PlacementDef::Spread { .. } => candidate_admits(d, set, seed, x, z),
-        PlacementDef::Rings { .. } => ring_chunks(d, g, set).contains(&(x, z)),
+        PlacementDef::Rings { .. } => ring_admit(d, g, set, x, z),
     }
 }
 
@@ -574,7 +722,7 @@ fn set_admits_live(
         return false;
     }
     match &d.sets[set].placement {
-        PlacementDef::Rings { .. } => ring_chunks(d, g, set).contains(&(x, z)),
+        PlacementDef::Rings { .. } => ring_admit(d, g, set, x, z),
         PlacementDef::Spread { exclusion, .. } => {
             if !placement_admits(d, set, seed, x, z) {
                 return false;
@@ -593,6 +741,75 @@ fn set_admits_live(
             }
         }
     }
+}
+
+/// The chunks in the ±8 window of `(cx, cz)` admitted by any of `sets`, as a (possibly
+/// duplicated, unsorted) list. Callers must `sort_unstable(); dedup();` — sorting
+/// `(x, z)` tuples recovers the exact row-major encounter order of the old
+/// `for x { for z { .. } }` scan, which fixes floating-point summation order in
+/// `compute_beardifier` and the reference insertion order in `References::collect`.
+fn window_admitted_chunks(
+    d: &Defs,
+    g: &mut Gen,
+    sets: &[usize],
+    cx: i32,
+    cz: i32,
+) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    let seed = g.wseed();
+    for &set in sets {
+        match &d.sets[set].placement {
+            PlacementDef::Spread {
+                spacing,
+                separation,
+                salt,
+                triangular,
+                ..
+            } => {
+                if *spacing <= 0 {
+                    continue;
+                }
+                let Some(spread) =
+                    mineshaft::spread_placement(*spacing, *separation, *salt, *triangular)
+                else {
+                    continue;
+                };
+                // A spread candidate of cell (gx, gz) lies in
+                // [gx*spacing, gx*spacing + spacing - 1]; div_euclid is Math.floorDiv,
+                // so this is exactly the set of cells whose range meets the window.
+                let gx0 = (cx - 8).div_euclid(*spacing);
+                let gx1 = (cx + 8).div_euclid(*spacing);
+                let gz0 = (cz - 8).div_euclid(*spacing);
+                let gz1 = (cz + 8).div_euclid(*spacing);
+                for gx in gx0..=gx1 {
+                    for gz in gz0..=gz1 {
+                        let (x, z) = spread.candidate(seed, gx * *spacing, gz * *spacing);
+                        if (x - cx).abs() > 8 || (z - cz).abs() > 8 {
+                            continue;
+                        }
+                        if set_admits_live(d, g, set, seed, x, z, 0) {
+                            out.push((x, z));
+                        }
+                    }
+                }
+            }
+            PlacementDef::Rings { .. } => {
+                let candidates = ring_candidates_cached(d, g, set);
+                for (i, &((rx_candidate, rz_candidate), _)) in candidates.iter().enumerate() {
+                    // The relocation moves a candidate by at most 7 chunks (radius 112),
+                    // so a ±15 window around the query is conservative.
+                    if (rx_candidate - cx).abs() > 15 || (rz_candidate - cz).abs() > 15 {
+                        continue;
+                    }
+                    let (rx, rz) = ring_chunk_i(d, g, set, i as i32);
+                    if (rx - cx).abs() <= 8 && (rz - cz).abs() <= 8 {
+                        out.push((rx, rz));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- starts
@@ -1081,8 +1298,18 @@ fn set_starts(d: &Defs, g: &mut Gen, set: &SetDef, cx: i32, cz: i32) -> Vec<Star
     Vec::new()
 }
 
-/// Starts of every set that admit this chunk.
-fn chunk_starts(g: &mut Gen, cx: i32, cz: i32) -> Vec<Start> {
+/// Generate starts for a subset of sets, tagged with their `d.sets` index.
+///
+/// Sets are independent (each builds its own seeded RNG), so evaluating the adapting
+/// and non-adapting halves separately produces the same starts, in the same order, as
+/// one pass over all 20 sets.
+fn starts_for_sets(
+    d: &Defs,
+    g: &mut Gen,
+    sets: &[usize],
+    cx: i32,
+    cz: i32,
+) -> Vec<(usize, Start)> {
     // M3 P1a M1: one admission scan per (chunk, cache). The owner/worker split is the point:
     // the round's cache is shared, so a scan here is duplicated work whenever two threads
     // compute the same key. P1b made that impossible for the round's own cache (the slot is a
@@ -1092,11 +1319,9 @@ fn chunk_starts(g: &mut Gen, cx: i32, cz: i32) -> Vec<Start> {
         crate::worldgen::M3_CHUNK_STARTS_OWNER,
         crate::worldgen::M3_CHUNK_STARTS_WORKER,
     );
-    let Some(d) = defs() else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for (i, set) in d.sets.iter().enumerate() {
+    for &i in sets {
+        let set = &d.sets[i];
         if set.entries.len() == 1 && matches!(d.structures.get(&set.entries[0].0), None) {
             continue;
         }
@@ -1110,23 +1335,60 @@ fn chunk_starts(g: &mut Gen, cx: i32, cz: i32) -> Vec<Start> {
         if !mineshaft_set && !set_admits_live(d, g, i, g.wseed(), cx, cz, 0) {
             continue;
         }
-        out.extend(set_starts(d, g, set, cx, cz));
+        out.extend(set_starts(d, g, set, cx, cz).into_iter().map(|s| (i, s)));
     }
     out
 }
 
+/// Merge set-tagged starts by their original `d.sets` index. `sort_by_key` is stable,
+/// so starts from one set keep vanilla's within-set order.
+fn merge_starts(mut parts: Vec<(usize, Start)>) -> Vec<Start> {
+    parts.sort_by_key(|(i, _)| *i);
+    parts.into_iter().map(|(_, s)| s).collect()
+}
+
+fn adapting_starts_uncached(d: &Defs, g: &mut Gen, cx: i32, cz: i32) -> Vec<(usize, Start)> {
+    starts_for_sets(d, g, &d.adapting_sets, cx, cz)
+}
+
+fn non_adapting_starts_uncached(d: &Defs, g: &mut Gen, cx: i32, cz: i32) -> Vec<(usize, Start)> {
+    starts_for_sets(d, g, &d.non_adapting_sets, cx, cz)
+}
+
+/// Starts of every set that admit this chunk, in `d.sets` order.
+#[allow(dead_code)]
+fn chunk_starts(g: &mut Gen, cx: i32, cz: i32) -> Vec<Start> {
+    let Some(d) = defs() else {
+        return Vec::new();
+    };
+    let mut parts = adapting_starts_uncached(d, g, cx, cz);
+    parts.extend(non_adapting_starts_uncached(d, g, cx, cz));
+    merge_starts(parts)
+}
+
 thread_local! {
-    /// Starts per (seed, dimension, chunk), shared by the beardifier resolver and the
-    /// decoration pass so the admission scan runs once. Pure in its key.
+    /// Starts per (seed, dimension, chunk), shared by the decoration pass so the
+    /// admission scan runs once. Pure in its key.
     static STARTS: std::cell::RefCell<StartsCache> =
-        std::cell::RefCell::new(StartsCache { seed: 0, preset: 0, map: std::collections::HashMap::new(), ord: Vec::new() });
+        std::cell::RefCell::new(StartsCache { seed: 0, preset: 0, map: std::collections::HashMap::new(), ord: std::collections::VecDeque::new() });
+    /// Adapting-only starts per (seed, dimension, chunk), used by beard resolution.
+    /// Kept separate so a beard read never generates non-adapting structures.
+    static ADAPTING_STARTS: std::cell::RefCell<AdaptingStartsCache> =
+        std::cell::RefCell::new(AdaptingStartsCache { seed: 0, preset: 0, map: std::collections::HashMap::new(), ord: std::collections::VecDeque::new() });
 }
 
 struct StartsCache {
     seed: u64,
     preset: u8,
     map: HashMap<(i32, i32), std::sync::Arc<Vec<Start>>>,
-    ord: Vec<(i32, i32)>,
+    ord: std::collections::VecDeque<(i32, i32)>,
+}
+
+struct AdaptingStartsCache {
+    seed: u64,
+    preset: u8,
+    map: HashMap<(i32, i32), std::sync::Arc<Vec<(usize, Start)>>>,
+    ord: std::collections::VecDeque<(i32, i32)>,
 }
 
 /// One parallel terrain round's structure-start cache, shared by that round's workers
@@ -1157,7 +1419,13 @@ static STARTS_ROUNDS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, std::syn
 /// difference in what was generated.
 struct RoundCache {
     starts: crate::worldgen::FlightCache<(u64, u8, i32, i32), std::sync::Arc<Vec<Start>>>,
+    /// Adapting-only starts: beard resolution asks for these without ever generating a
+    /// non-adapting structure. `starts_cached` takes its adapting half from this cache.
+    adapting_starts:
+        crate::worldgen::FlightCache<(u64, u8, i32, i32), std::sync::Arc<Vec<(usize, Start)>>>,
     rings: crate::worldgen::FlightCache<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>,
+    /// One lazily relocated chunk per `(seed, preset, set, ring index)`.
+    ring_i: crate::worldgen::FlightCache<(u64, u8, usize, i32), (i32, i32)>,
     /// Test probe: `chunk_starts` scans this round actually ran. The M1 counters aggregate the
     /// whole process (a worker flushes into them on its way out), so a test that wants *this
     /// round's* duplicate count reads it here instead of subtracting two aggregates that other
@@ -1173,16 +1441,20 @@ impl Default for RoundCache {
             // dropped after they join, so a bound would only evict work the round itself is
             // still asking for.
             starts: crate::worldgen::FlightCache::new(None),
+            adapting_starts: crate::worldgen::FlightCache::new(None),
             rings: crate::worldgen::FlightCache::new(None),
+            ring_i: crate::worldgen::FlightCache::new(None),
             #[cfg(test)]
             scans: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
 
-/// Flight domains for this module's two caches (see `worldgen::flight_token`).
+/// Flight domains for this module's four caches (see `worldgen::flight_token`).
 const STARTS_FLIGHT_DOMAIN: u64 = 0x3_0000_0001;
 const RINGS_FLIGHT_DOMAIN: u64 = 0x3_0000_0002;
+const ADAPTING_STARTS_FLIGHT_DOMAIN: u64 = 0x3_0000_0003;
+const RING_I_FLIGHT_DOMAIN: u64 = 0x3_0000_0004;
 
 static STARTS_NEXT_ROUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -1232,6 +1504,83 @@ pub(crate) fn starts_round_end(id: u64) {
     crate::worldgen::terrain_share_end(id);
 }
 
+/// The adapting-only starts for one chunk, tagged by `d.sets` index and in set order.
+/// This is the beardifier's sole start source: a beard read never generates a
+/// mineshaft, monument, shipwreck, ocean ruin, buried treasure or ruined portal.
+fn adapting_starts_cached(g: &mut Gen, cx: i32, cz: i32) -> std::sync::Arc<Vec<(usize, Start)>> {
+    let seed = g.wseed();
+    let preset = preset_tag(g.preset);
+    let build = |g: &mut Gen| {
+        let Some(d) = defs() else {
+            return std::sync::Arc::new(Vec::new());
+        };
+        std::sync::Arc::new(adapting_starts_uncached(d, g, cx, cz))
+    };
+    if let Some(cache) = g.starts_round.and_then(round_cache) {
+        let key = (seed, preset, cx, cz);
+        let token = crate::worldgen::flight_token(ADAPTING_STARTS_FLIGHT_DOMAIN, &key);
+        // Build outside any cache lock: start generation reads neighbour columns and can
+        // resolve the nested beardifier rule, which is itself an adapting-starts ask.
+        return cache.adapting_starts.get_or_build(key, token, || {
+            #[cfg(test)]
+            cache
+                .scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            build(g)
+        });
+    }
+    if let Some(v) = ADAPTING_STARTS.with(|slot| {
+        let mut cache = slot.borrow_mut();
+        if cache.seed != seed || cache.preset != preset {
+            cache.seed = seed;
+            cache.preset = preset;
+            cache.map.clear();
+            cache.ord.clear();
+        }
+        cache.map.get(&(cx, cz)).cloned()
+    }) {
+        return v;
+    }
+    let starts = build(g);
+    ADAPTING_STARTS.with(|slot| {
+        let mut cache = slot.borrow_mut();
+        if cache.seed != seed || cache.preset != preset {
+            cache.seed = seed;
+            cache.preset = preset;
+            cache.map.clear();
+            cache.ord.clear();
+        }
+        if let Some(existing) = cache.map.get(&(cx, cz)) {
+            return existing.clone();
+        }
+        cache.ord.push_back((cx, cz));
+        if cache.ord.len() > 1024 {
+            if let Some(old) = cache.ord.pop_front() {
+                cache.map.remove(&old);
+            }
+        }
+        cache.map.insert((cx, cz), starts.clone());
+        starts
+    })
+}
+
+/// The full start list: reuse the already-cached adapting half and evaluate only the
+/// non-adapting sets, then merge by original set index so the result is byte-for-byte the
+/// `chunk_starts` order. The adapting starts are cloned out of the shared `Arc`; a chunk's
+/// start count is small, and this avoids generating any adapting structure twice.
+fn starts_uncached_reusing(g: &mut Gen, cx: i32, cz: i32) -> Vec<Start> {
+    let Some(d) = defs() else {
+        return Vec::new();
+    };
+    let adapting = adapting_starts_cached(g, cx, cz);
+    let mut parts: Vec<(usize, Start)> = adapting
+        .iter()
+        .map(|(i, s)| (*i, clone_start(s)))
+        .collect();
+    parts.extend(non_adapting_starts_uncached(d, g, cx, cz));
+    merge_starts(parts)
+}
+
 fn starts_cached(g: &mut Gen, cx: i32, cz: i32) -> std::sync::Arc<Vec<Start>> {
     let seed = g.wseed();
     let preset = preset_tag(g.preset);
@@ -1247,7 +1596,7 @@ fn starts_cached(g: &mut Gen, cx: i32, cz: i32) -> std::sync::Arc<Vec<Start>> {
             cache
                 .scans
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            std::sync::Arc::new(chunk_starts(g, cx, cz))
+            std::sync::Arc::new(starts_uncached_reusing(g, cx, cz))
         });
     }
     if let Some(v) = STARTS.with(|slot| {
@@ -1262,7 +1611,7 @@ fn starts_cached(g: &mut Gen, cx: i32, cz: i32) -> std::sync::Arc<Vec<Start>> {
     }) {
         return v;
     }
-    let starts = std::sync::Arc::new(chunk_starts(g, cx, cz));
+    let starts = std::sync::Arc::new(starts_uncached_reusing(g, cx, cz));
     STARTS.with(|slot| {
         let mut cache = slot.borrow_mut();
         if cache.seed != seed || cache.preset != preset {
@@ -1274,10 +1623,11 @@ fn starts_cached(g: &mut Gen, cx: i32, cz: i32) -> std::sync::Arc<Vec<Start>> {
         if let Some(existing) = cache.map.get(&(cx, cz)) {
             return existing.clone();
         }
-        cache.ord.push((cx, cz));
+        cache.ord.push_back((cx, cz));
         if cache.ord.len() > 1024 {
-            let old = cache.ord.remove(0);
-            cache.map.remove(&old);
+            if let Some(old) = cache.ord.pop_front() {
+                cache.map.remove(&old);
+            }
         }
         cache.map.insert((cx, cz), starts.clone());
         starts
@@ -1295,7 +1645,20 @@ pub(crate) fn reset_cache() {
         cache.map.clear();
         cache.ord.clear();
     });
+    ADAPTING_STARTS.with(|slot| {
+        let mut cache = slot.borrow_mut();
+        cache.seed = 0;
+        cache.preset = 0;
+        cache.map.clear();
+        cache.ord.clear();
+    });
     RING_CACHE.with(|c| c.borrow_mut().clear());
+    RING_CANDIDATES.with(|c| c.borrow_mut().clear());
+    RING_I_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.map.clear();
+        c.ord.clear();
+    });
     starts_rounds()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1329,22 +1692,13 @@ impl References {
         };
         // key -> starts, per structure id, in the encounter order of the window.
         let mut found: HashMap<String, (usize, Vec<u64>, HashMap<u64, Start>)> = HashMap::new();
-        // Only chunks with a candidate of some set can hold a start. The candidate test is
-        // a superset of admission (it skips the frequency reducer), so nothing is lost, and
-        // the expensive per-chunk generation only runs where a set actually points.
-        let seed = g.wseed();
-        let mut interesting: Vec<(i32, i32)> = Vec::new();
-        for x in cx - 8..=cx + 8 {
-            for z in cz - 8..=cz + 8 {
-                if d.sets
-                    .iter()
-                    .enumerate()
-                    .any(|(set, _)| set_admits_live(d, g, set, seed, x, z, 0))
-                {
-                    interesting.push((x, z));
-                }
-            }
-        }
+        // Only chunks admitted by some set can hold a start. Enumerate the grid cells that
+        // can land in the window instead of scanning all 17x17 chunks; sort+dedup recovers
+        // the exact row-major encounter order of the old full-window scan.
+        let all_sets: Vec<usize> = (0..d.sets.len()).collect();
+        let mut interesting = window_admitted_chunks(d, g, &all_sets, cx, cz);
+        interesting.sort_unstable();
+        interesting.dedup();
         for (x, z) in interesting {
             for start in starts_cached(g, x, z).iter() {
                 if !start.intersects_chunk(cx, cz) {
@@ -1666,6 +2020,103 @@ fn packed(x: i32, z: i32) -> u64 {
 
 // ---------------------------------------------------------------- beardifier
 
+/// Collect one start's beardifier contribution, verbatim from the original
+/// `beard_chunk_data` loop. Extracted so the adapting-only path and the tests' full-start
+/// reference share one implementation of the piece filtering and summation order.
+fn beard_push_start(data: &mut BeardChunkData, d: &Defs, cx: i32, cz: i32, start: &Start) {
+    let Some(def) = d.structures.get(&start.structure) else {
+        return;
+    };
+    if def.adjustment == BeardAdjustment::None {
+        return;
+    }
+    let (x0, z0) = (cx << 4, cz << 4);
+    // Vanilla filters per *piece* (`StructurePiece.isCloseToChunk(chunk, 12)`),
+    // not per start: a start's union box may reach this chunk through a piece
+    // that does not.
+    let mut push = |b: &BB| {
+        if !bb_close_to_chunk(b, cx, cz, 12) {
+            return;
+        }
+        // The ids are only needed by `BEARD_TRACE`: a rigid box that the saved
+        // reference chunk does not justify has to name the start that produced it.
+        if crate::trace_env::env_str!("BEARD_TRACE")
+            .is_some_and(|want| want == "all" || want == format!("{cx},{cz}"))
+        {
+            eprintln!(
+                "BEARDPIECE {cx},{cz} {} start={},{} bb={:?}",
+                start.structure, start.key.0, start.key.1, b
+            );
+        }
+        data.rigids.push(BeardRigid {
+            min: [b[0], b[1], b[2]],
+            max: [b[3], b[4], b[5]],
+            adjustment: def.adjustment,
+            ground_level_delta: 0,
+        });
+    };
+    match &start.pieces {
+        StartPieces::Mineshaft(m) => {
+            for piece in &m.pieces {
+                push(&piece.bounds);
+            }
+        }
+        StartPieces::Template { pieces } => {
+            for piece in pieces {
+                push(&piece.bb);
+            }
+        }
+        StartPieces::BuriedTreasure(p) => push(&p.bounds),
+        StartPieces::SwampHut(p) => push(&p.bounds),
+        StartPieces::DesertPyramid(p) => push(&p.bounds),
+        StartPieces::JungleTemple(p) => push(&p.bounds),
+        StartPieces::Fortress { pieces, .. } => {
+            for piece in pieces {
+                push(&piece.bounds);
+            }
+        }
+        StartPieces::Monument { layout, .. } => {
+            for piece in &layout.pieces {
+                push(&piece.bounds);
+            }
+        }
+        StartPieces::Stronghold(s) => {
+            for piece in &s.pieces {
+                push(&piece.bounds);
+            }
+        }
+        StartPieces::EndCity { pieces } | StartPieces::Mansion { pieces } => {
+            for piece in pieces {
+                push(&piece.bb);
+            }
+        }
+        StartPieces::Jigsaw { pieces } => {
+            for piece in pieces {
+                if !bb_close_to_chunk(&piece.bb, cx, cz, 12) {
+                    continue;
+                }
+                if piece.is_rigid() {
+                    data.rigids.push(BeardRigid {
+                        min: [piece.bb[0], piece.bb[1], piece.bb[2]],
+                        max: [piece.bb[3], piece.bb[4], piece.bb[5]],
+                        adjustment: def.adjustment,
+                        ground_level_delta: piece.ground_level_delta(),
+                    });
+                }
+                for j in &piece.junctions {
+                    if j.source_x > x0 - 12
+                        && j.source_z > z0 - 12
+                        && j.source_x < x0 + 27
+                        && j.source_z < z0 + 27
+                    {
+                        data.junctions.push(*j);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// `Beardifier.forStructuresInChunk`: every start whose structure adapts terrain,
 /// with each piece close to this chunk turned into a rigid box, plus the jigsaw
 /// junctions whose source lies within 12 blocks of the chunk.
@@ -1675,118 +2126,21 @@ fn beard_chunk_data(g: &mut Gen, cx: i32, cz: i32) -> BeardChunkData {
     };
     let mut data = BeardChunkData::default();
     // Generating a start is expensive (a template structure reads neighbour columns for
-    // its heightmaps), so first ask the cheap question: does any terrain-adapting set have
-    // a *candidate* chunk in the ±8 window? For a chunk in the middle of the ocean that is
-    // a few thousand LCG draws and no structure generation at all.
-    let seed = g.wseed();
-    let mut interesting: Vec<(i32, i32)> = Vec::new();
-    for x in cx - 8..=cx + 8 {
-        for z in cz - 8..=cz + 8 {
-            if d.adapting_sets
-                .iter()
-                .any(|&set| candidate_admits_live(d, g, set, seed, x, z))
-            {
-                interesting.push((x, z));
-            }
-        }
-    }
+    // its heightmaps), so first ask the cheap question: does any terrain-adapting set
+    // admit a chunk in the ±8 window? Enumerate only the spread grid cells and the nearby
+    // stronghold indices that can land there, then sort+dedup to keep the row-major order.
+    let mut interesting = window_admitted_chunks(d, g, &d.adapting_sets, cx, cz);
+    interesting.sort_unstable();
+    interesting.dedup();
     if interesting.is_empty() {
         return data;
     }
     let interesting_len = interesting.len();
-    let (x0, z0) = (cx << 4, cz << 4);
     for (x, z) in interesting {
-        for start in starts_cached(g, x, z).iter() {
-            let Some(def) = d.structures.get(&start.structure) else {
-                continue;
-            };
-            if def.adjustment == BeardAdjustment::None {
-                continue;
-            }
-            // Vanilla filters per *piece* (`StructurePiece.isCloseToChunk(chunk, 12)`),
-            // not per start: a start's union box may reach this chunk through a piece
-            // that does not.
-            let mut push = |b: &BB| {
-                if !bb_close_to_chunk(b, cx, cz, 12) {
-                    return;
-                }
-                // The ids are only needed by `BEARD_TRACE`: a rigid box that the saved
-                // reference chunk does not justify has to name the start that produced it.
-                if crate::trace_env::env_str!("BEARD_TRACE")
-                    .is_some_and(|want| want == "all" || want == format!("{cx},{cz}"))
-                {
-                    eprintln!(
-                        "BEARDPIECE {cx},{cz} {} start={},{} bb={:?}",
-                        start.structure, start.key.0, start.key.1, b
-                    );
-                }
-                data.rigids.push(BeardRigid {
-                    min: [b[0], b[1], b[2]],
-                    max: [b[3], b[4], b[5]],
-                    adjustment: def.adjustment,
-                    ground_level_delta: 0,
-                });
-            };
-            match &start.pieces {
-                StartPieces::Mineshaft(m) => {
-                    for piece in &m.pieces {
-                        push(&piece.bounds);
-                    }
-                }
-                StartPieces::Template { pieces } => {
-                    for piece in pieces {
-                        push(&piece.bb);
-                    }
-                }
-                StartPieces::BuriedTreasure(p) => push(&p.bounds),
-                StartPieces::SwampHut(p) => push(&p.bounds),
-                StartPieces::DesertPyramid(p) => push(&p.bounds),
-                StartPieces::JungleTemple(p) => push(&p.bounds),
-                StartPieces::Fortress { pieces, .. } => {
-                    for piece in pieces {
-                        push(&piece.bounds);
-                    }
-                }
-                StartPieces::Monument { layout, .. } => {
-                    for piece in &layout.pieces {
-                        push(&piece.bounds);
-                    }
-                }
-                StartPieces::Stronghold(s) => {
-                    for piece in &s.pieces {
-                        push(&piece.bounds);
-                    }
-                }
-                StartPieces::EndCity { pieces } | StartPieces::Mansion { pieces } => {
-                    for piece in pieces {
-                        push(&piece.bb);
-                    }
-                }
-                StartPieces::Jigsaw { pieces } => {
-                    for piece in pieces {
-                        if !bb_close_to_chunk(&piece.bb, cx, cz, 12) {
-                            continue;
-                        }
-                        if piece.is_rigid() {
-                            data.rigids.push(BeardRigid {
-                                min: [piece.bb[0], piece.bb[1], piece.bb[2]],
-                                max: [piece.bb[3], piece.bb[4], piece.bb[5]],
-                                adjustment: def.adjustment,
-                                ground_level_delta: piece.ground_level_delta(),
-                            });
-                        }
-                        for j in &piece.junctions {
-                            if j.source_x > x0 - 12
-                                && j.source_z > z0 - 12
-                                && j.source_x < x0 + 27
-                                && j.source_z < z0 + 27
-                            {
-                                data.junctions.push(*j);
-                            }
-                        }
-                    }
-                }
-            }
+        // Adapting-only: a beard read never generates a mineshaft, monument, shipwreck,
+        // ocean ruin, buried treasure or ruined portal.
+        for (_, start) in adapting_starts_cached(g, x, z).iter() {
+            beard_push_start(&mut data, d, cx, cz, start);
         }
     }
     // `BEARD_TRACE=<cx>,<cz>`: the beardifier input for one chunk, after every start in the
@@ -1837,6 +2191,160 @@ mod pipeline_tests {
         let d = defs()?;
         let &set = d.by_id.get(set_id)?;
         Some(candidate_admits(d, set, seed, x, z))
+    }
+
+    /// The lazy per-index path and the eager all-128 path must pick the exact same
+    /// relocated chunk for every stronghold index on seed 0 (the benchmark seed). The
+    /// eager path threads one `biome_quart` `last` hint across all 128; the lazy path
+    /// resolves each index with `last = None`. On this seed they agree for all 128.
+    #[test]
+    fn lazy_ring_indices_match_eager_concentric_rings() {
+        reset_cache();
+        let d = defs().expect("structure definitions load");
+        let &set = d.by_id.get("minecraft:strongholds").expect("strongholds set");
+        let mut g = Gen::load(0, crate::name_to_state).expect("overworld gen");
+        let seed = g.wseed();
+        let (distance, spread, count, preferred_biomes) =
+            ring_params(d, &g, set).expect("stronghold set is concentric rings");
+        let preferred: HashSet<u16> = preferred_biomes
+            .iter()
+            .filter_map(|name| g.biome_leaf_of_name(name))
+            .collect();
+        let mut last: Option<u16> = None;
+        let eager = mineshaft::concentric_rings(seed, distance, spread, count, |candidate, rng| {
+            mineshaft::concentric_rings_target(
+                candidate,
+                rng,
+                112,
+                |qx, qy, qz| {
+                    let res = g.biome_quart(qx, qy, qz, last);
+                    if let Some((_, leaf)) = res {
+                        last = Some(leaf);
+                    }
+                    res
+                },
+                |b| b.is_some_and(|(_, leaf)| preferred.contains(&leaf)),
+            )
+        })
+        .expect("rings resolve");
+        assert_eq!(eager.len(), 128);
+        let candidates = ring_candidates_cached(d, &g, set);
+        assert_eq!(candidates.len(), 128, "the candidate list is pure in (seed, set)");
+        let lazy: Vec<(i32, i32)> = (0..count).map(|i| ring_chunk_i(d, &mut g, set, i)).collect();
+        assert_eq!(
+            lazy, eager,
+            "lazy per-index resolution must match the eager path index for index"
+        );
+        // Membership via the admission helper agrees with the eager set too.
+        let mut eager_set = eager;
+        eager_set.sort_unstable();
+        eager_set.dedup();
+        for &(cx, cz) in &eager_set {
+            assert!(
+                ring_admit(d, &mut g, set, cx, cz),
+                "eager ring chunk ({cx},{cz}) was not admitted lazily"
+            );
+        }
+    }
+
+    /// The grid-cell enumeration must be exactly the brute-force 17x17 scan, in the same
+    /// row-major order, for every set and for the adapting subset, including negative
+    /// coordinates and a real stronghold chunk (which exercises the Rings branch).
+    #[test]
+    fn window_admitted_chunks_matches_full_window_scan() {
+        let d = defs().expect("structure definitions load");
+        let mut g = Gen::load(0, crate::name_to_state).expect("overworld gen");
+        let seed = g.wseed();
+        let all_sets: Vec<usize> = (0..d.sets.len()).collect();
+        let adapting = d.adapting_sets.clone();
+        let sh_set = *d.by_id.get("minecraft:strongholds").expect("strongholds set");
+        let sh: Vec<(i32, i32)> = ring_chunks(d, &mut g, sh_set).iter().copied().collect();
+        let sh_pos = sh[0];
+        for (cx, cz) in [
+            (0, 0),
+            (-37, -19),
+            (64, -8),
+            (-5, 80),
+            sh_pos,
+            (sh_pos.0 + 1, sh_pos.1 - 1),
+        ] {
+            for sets in [&all_sets, &adapting] {
+                let mut got = window_admitted_chunks(d, &mut g, sets, cx, cz);
+                got.sort_unstable();
+                got.dedup();
+                // The brute-force scan is already in row-major (x outer, z inner) order.
+                let mut want: Vec<(i32, i32)> = Vec::new();
+                for x in cx - 8..=cx + 8 {
+                    for z in cz - 8..=cz + 8 {
+                        if sets
+                            .iter()
+                            .any(|&s| set_admits_live(d, &mut g, s, seed, x, z, 0))
+                        {
+                            want.push((x, z));
+                        }
+                    }
+                }
+                assert_eq!(got, want, "window ({cx},{cz}), {} sets", sets.len());
+            }
+        }
+    }
+
+    /// Beard resolution must produce exactly the same rigids/junctions as the original
+    /// full-start path, while never generating a start from a non-adapting set.
+    #[test]
+    fn beard_chunk_data_matches_full_start_reference_without_non_adapting() {
+        reset_cache();
+        let d = defs().expect("structure definitions load");
+        let mut g = Gen::load(4242, crate::name_to_state).expect("overworld gen");
+        let sh_set = *d.by_id.get("minecraft:strongholds").expect("strongholds set");
+        let mut sh: Vec<(i32, i32)> = ring_chunks(d, &mut g, sh_set).iter().copied().collect();
+        sh.sort_unstable();
+        let (cx, cz) = sh
+            .into_iter()
+            .find(|&(cx, cz)| {
+                starts_cached(&mut g, cx, cz)
+                    .iter()
+                    .any(|s| s.structure == "minecraft:stronghold")
+            })
+            .expect("a stronghold chunk that generates a start");
+
+        let got = beard_chunk_data(&mut g, cx, cz);
+        assert!(!got.is_empty(), "the stronghold chunk must contribute a beard");
+
+        // Reference: the original algorithm — 289-chunk candidate scan over adapting
+        // sets, full start list, then the shared per-start beard collection.
+        let seed = g.wseed();
+        let mut reference = BeardChunkData::default();
+        for x in cx - 8..=cx + 8 {
+            for z in cz - 8..=cz + 8 {
+                if d.adapting_sets
+                    .iter()
+                    .any(|&s| candidate_admits_live(d, &mut g, s, seed, x, z))
+                {
+                    for start in starts_cached(&mut g, x, z).iter() {
+                        beard_push_start(&mut reference, d, cx, cz, start);
+                    }
+                }
+            }
+        }
+        assert_eq!(got, reference, "beard data changed with the adapting-only path");
+
+        // No start from a non-adapting set may appear on the beard path.
+        let mut non_adapting_structures: HashSet<&str> = HashSet::new();
+        for &s in &d.non_adapting_sets {
+            for (id, _) in &d.sets[s].entries {
+                non_adapting_structures.insert(id.as_str());
+            }
+        }
+        let adapting = adapting_starts_cached(&mut g, cx, cz);
+        assert!(!adapting.is_empty());
+        for (_, start) in adapting.iter() {
+            assert!(
+                !non_adapting_structures.contains(start.structure.as_str()),
+                "beard path generated non-adapting structure {}",
+                start.structure
+            );
+        }
     }
 
     /// The native fixture: `SCENE`/`RIGID`/`JUNC`/`SAMPLE` (Beardifier densities),

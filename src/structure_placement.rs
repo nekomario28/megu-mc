@@ -100,16 +100,20 @@ pub(crate) enum FrequencyReduction {
     LegacyType3,
 }
 
-/// ChunkGeneratorStructureState.generateRingPositions, before the caller's
-/// biome source relocates a candidate. Its fork consumes a nextLong on every
-/// position even when the preferred-biome search returns no match.
-pub(crate) fn concentric_rings(
+/// The cheap half of `generateRingPositions`: the candidate chunk and the child RNG
+/// state for every ring, with **no** biome lookup.
+///
+/// `candidate` depends only on `(seed, distance, initial_spread, count)` and the child
+/// state is a raw LCG state ([`Lcg::from_raw_state`] resumes it exactly). Keeping the
+/// two halves in one function is what lets a caller resolve a single ring index
+/// lazily without drifting from the eager [`concentric_rings`] path: the latter
+/// delegates here, so both consume the identical `next_f64`/`nextLong` stream.
+pub(crate) fn concentric_ring_candidates(
     seed: u64,
     distance: i32,
     initial_spread: i32,
     count: i32,
-    mut find_biome: impl FnMut((i32, i32), &mut Lcg) -> Option<(i32, i32)>,
-) -> Result<Vec<(i32, i32)>, &'static str> {
+) -> Result<Vec<((i32, i32), u64)>, &'static str> {
     if !(0..=1023).contains(&distance)
         || !(0..=1023).contains(&initial_spread)
         || !(0..=4095).contains(&count)
@@ -131,8 +135,8 @@ pub(crate) fn concentric_rings(
         let radius = f64::from(4 * distance + distance * ring * 6)
             + (random.next_f64() - 0.5) * (f64::from(distance) * 2.5);
         let candidate = (round(angle.cos() * radius), round(angle.sin() * radius));
-        let mut child = Lcg::new(random.next_i64() as u64);
-        result.push(find_biome(candidate, &mut child).unwrap_or(candidate));
+        let child = Lcg::new(random.next_i64() as u64);
+        result.push((candidate, child.state48()));
         angle += (std::f64::consts::PI * 2.0) / f64::from(spread);
         placed += 1;
         if placed == spread {
@@ -142,6 +146,25 @@ pub(crate) fn concentric_rings(
             spread = spread.min(count - i);
             angle += random.next_f64() * std::f64::consts::PI * 2.0;
         }
+    }
+    Ok(result)
+}
+
+/// ChunkGeneratorStructureState.generateRingPositions, before the caller's
+/// biome source relocates a candidate. Its fork consumes a nextLong on every
+/// position even when the preferred-biome search returns no match.
+pub(crate) fn concentric_rings(
+    seed: u64,
+    distance: i32,
+    initial_spread: i32,
+    count: i32,
+    mut find_biome: impl FnMut((i32, i32), &mut Lcg) -> Option<(i32, i32)>,
+) -> Result<Vec<(i32, i32)>, &'static str> {
+    let candidates = concentric_ring_candidates(seed, distance, initial_spread, count)?;
+    let mut result = Vec::with_capacity(candidates.len());
+    for (candidate, child_state) in candidates {
+        let mut child = Lcg::from_raw_state(child_state);
+        result.push(find_biome(candidate, &mut child).unwrap_or(candidate));
     }
     Ok(result)
 }
