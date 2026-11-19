@@ -134,7 +134,7 @@ def build_fixture(root, *, dirty=False, leftover=False, missing_anchor=False, sy
             "            if let Some(slots) = chests()\n"
             "                .lock()\n"
             "                .unwrap()\n"
-            "                .remove(&ContainerKey::Block((x, y, z)))"
+            "                .remove(&ContainerKey::ow((x, y, z)))"
         )
         assert text.count(anchor) == 1
         path.write_text(
