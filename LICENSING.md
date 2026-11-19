@@ -45,22 +45,25 @@
 - 開発ブランチ（`main` / `perf/worldgen-parallel`）は共同開発およびテスト高速化のため、1.21.1 `server.jar` 由来の datapack、状態表 (`assets/block_states_1211.json`)、テスト TSV、`config_packets.bin` を追跡しています。
 - 外部一般公開・配布用のクリーンな単一ルートコミット（Mojang 由来生成物と過去の履歴を一切含まないツリー）を作る場合は、`tools/export_public_branch.sh --out ../mc-spine-public --verify` を実行します。
 
-## 3. なぜ `GPL-3.0-or-later OR LGPL-3.0-or-later` か / Rationale for dual GPL-3.0 / LGPL-3.0
+## 3. `GPL-3.0-or-later` 本体 + 寄稿 `LGPL-3.0-or-later / GPL-3.0-or-later` デュアルライセンスの設計
 
-1. **過去の Pumpkin (`GPL-3.0`) 由来リスクの解消**:
-   - ツリー内の旧 `pblocks.json` / `properties.json` は削除済みで、49 箇所のコード一致もクリーンルームで書き換え済み（`THIRD_PARTY.md` §3, §8, §10）ですが、`GPL-3.0-or-later` を含むことで万が一構造的類似を指摘された場合でもライセンス上の衝突が発生しません。
-2. **後からいつでも `LGPL-3.0-or-later` に一本化できる柔軟性**:
-   - 単なる `GPL-3.0` だけで Collaborator の寄稿を受けると、後から `LGPL-3.0` に緩和する際に寄稿者全員の同意が必要になります。
-   - 最初から `GPL-3.0-or-later OR LGPL-3.0-or-later`（Inbound = Outbound）としておくことで、**普段は `GPL-3.0-or-later` として保護しつつ、将来いつでも Collaborator の追加同意なしに `LGPL-3.0-or-later` として提供・一本化**できます（ただし外部の GPL-3.0 専用コードを新たに取り込まない限りにおいて）。
-3. **外部 Mod JAR への非波及**:
+1. **本体は `GPL-3.0-or-later`（[LICENSE](LICENSE) / `Cargo.toml`）**:
+   - 過去の Pumpkin (`GPL-3.0`) 由来リスクを法的に 100% 解消し、クローズドな商用フォークによる持ち逃げも防ぎます。
+2. **寄稿コードは `LGPL-3.0-or-later` および `GPL-3.0-or-later` のデュアルライセンス（[CONTRIBUTING.md](CONTRIBUTING.md)）**:
+   - Collaborator からの寄稿を両ライセンスで受けておくことで、将来いつでも追加同意なしに本体またはライブラリ部分を `LGPL-3.0-or-later`（[COPYING.LESSER](COPYING.LESSER)）に切り替えられます。
+3. **C2ME (`MIT`)・Lithium (`LGPL-3.0`)・NeoForge (`LGPL-2.1`) との完全互換**:
+   - **C2ME (`MIT`)** や **Lithium (`LGPL-3.0`)**、**NeoForge (`LGPL-2.1`)**、**Fabric (`Apache-2.0`)** は、`GPL-3.0-or-later` と `LGPL-3.0-or-later` の**両方と完全互換**です。
+   - したがって、C2ME (`MIT`) や Lithium (`LGPL-3.0`) の手法・コードを取り込んだ場合でも（[THIRD_PARTY.md](THIRD_PARTY.md) と [NOTICE](NOTICE) に帰属とライセンスを明記すれば）、`GPL-3.0-or-later` としても `LGPL-3.0-or-later` としても合法的に配布できます。
+4. **外部 Mod JAR への非波及**:
    - `compat/`（Fabric / NeoForge 互換レイヤ）やプラグイン機構を通じて実行時にロードされる独立した 3rd-party Mod JAR は `mc-spine` の派生物とはみなさず、Mod 作者自身のライセンス（ARR / MIT / LGPL 等）のまま動作します。
 
-## 4. 確認・解消済み項目一覧 / Resolved items (2026-11-20)
+## 4. 確認・解消済み項目と履歴維持の方針 / Resolved items & history preservation (2026-11-20)
 
 1. **旧 Pumpkin 同値ファイルの削除と再混入防止**: `assets/pblocks.json`, `assets/properties.json`, `resourcepack.zip` を `git rm` で削除し、`tools/provenance_check.py` で常時ゲート化済み。
 2. **コード一致とテスト値表の置換**: `THIRD_PARTY.md` §8・§10 の通り書き換えおよび 1.21.1 jar 生成ベクタへの置換完了。
 3. **自作ファイルの確定と不要ファイルの削除**:
    - `datapacks/{modtest,rectest,spinetest,tagtest,testpack}` および `evidence/foundation/audit-snapshots` はオーナー自作（first-party）と確認済み。
    - リポジトリ直下の不要な `*.storyboard.png` 6 ファイルは削除済み。
-4. **開発履歴と公開エクスポートの分離**:
-   - Collaborator との共同開発では、履歴とテストデータが揃った開発ブランチ（`main` / `perf/worldgen-parallel`）をそのまま共有し、Mojang 生成物と過去履歴を除外したクリーンツリーが必要な場面では `tools/export_public_branch.sh` を使用する方針に決定。
+4. **誰がどのコミットを担当したか（`git log` / `git blame`）を消さない運用**:
+   - `tools/export_public_branch.sh`（単一ルートコミットへの潰し込み）は、ローカルでの `--strict-public` 監査や「履歴なしの配布スナップショット」を作りたいときだけ別ディレクトリに対して使います。**メインリポジトリ（`main`）に対して単一コミットで Force Push することはしません**（全員のコミット履歴・担当範囲・`git blame` が消えてしまうため）。
+   - もし将来、コミット履歴（誰がどこを書いたか）を 100% 残したまま過去の特定ファイル（旧 `pblocks.json` や `datapacks/vanilla/` 等）だけを Git 履歴から除去したくなった場合は、`git filter-repo --invert-paths --path assets/pblocks.json --path assets/properties.json --path resourcepack.zip ...` を使うことで、**全コミットの Author・メッセージ・担当行（`git blame`）を一切失わずに該当ファイルだけを履歴から消去**できます。
