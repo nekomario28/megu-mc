@@ -82,3 +82,14 @@
 この発見の意味: 参照世界は固定 jar が生成しているのに、port はその jar のデータを読んでいなかった。
 `feature_type_coverage.py` の「overworld 到達型 3」も pack 由来の数字で、うち `speleothem_cluster` は
 **1.21.1 の feature ではない**（変換で入ってきたもの）。真の未実装到達型は 2（`fossil` `sculk_patch`）。
+
+## 74. P0-2 到達性監査スナップショット（2026-11-19）
+
+`tools/p0_2_audit.py` / `tests/p0_2_audit_test.py` を `d918eaca`（`Cond::Biome` を `u128` に同期）に
+同期した後の、固定 jar 対象データパックでのたどり着ける領域（density functions / surface rules /
+placement modifiers / configured features / biome carvers+spawners+spawn_costs / structures +
+structure_set）と `Cond::Biome(u128)` アンカー確認の結果。
+
+| ファイル | 何か | sha256 |
+|---|---|---|
+| [p0-2-reachability-20261119.md](p0-2-reachability-20261119.md) | 2026-11-19 の `tools/p0_2_audit.py` 同期版監査結果: HEAD `d918eacaee795387031ef6446e68c685e59b9c11` で `python3 tools/p0_2_audit.py --json` → failures 0（bleaf_count: overworld 53、nether 5、end 5、すべて `< 128` `Cond::Biome(u128)`） | `bf0762e8cec386d09723ce258d1e6b891305369eff3992604f618c247eaff5a1` |

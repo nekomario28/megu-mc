@@ -9,13 +9,14 @@ parsers in `src/worldgen.rs`, `src/generation_providers.rs`, and `src/feature.rs
 
   1. Density functions reachable from `noise_settings/{overworld,nether,end}`:
      implemented vs explicitly constant/zero-folded vs unsupported/missing refs.
-  2. Surface rules & conditions + `biome_is` leaf coverage and `< 64` `u64` mask guard.
+  2. Surface rules & conditions + `biome_is` leaf coverage and `< 128` `Cond::Biome(u128)` mask guard.
   3. Placement modifiers (`p_mod`) & configured features (`p_cf`) reachable per dim.
   4. Biome `carvers`, `spawners`, `spawn_costs` and `structure` / `structure_set` totals.
 
 Exits 1 if any reachable `noise_router` density function, `surface_rule`,
-`surface_condition`, `biome_is`, `u64` mask bound, or `placement` modifier lacks
-a parser arm or target reference in the pinned datapack.
+`surface_condition`, `biome_is`, `Cond::Biome(u128)` mask bound, or `placement`
+modifier lacks a parser arm or target reference in the pinned datapack, or when
+the `Cond::Biome(u128)` type anchor is reverted or mismatched in src/worldgen.rs.
 """
 import argparse
 import json
@@ -96,6 +97,26 @@ def parse_rust_parsers(root=ROOT):
             feat_src, "fn p_cf(j: &J) -> Option<Cf> {", "\n}\n"
         ),
     }
+
+
+def parse_cond_biome_anchor(wg_src):
+    """Confirm the `Cond::Biome(u128)` type anchor exists in src/worldgen.rs.
+
+    Fail-closed: raises AuditError when `enum Cond` or the `Biome(u128)`
+    variant is missing or the variant type is not `u128`, so a revert of
+    `Biome(u128)` to an older mask type can't pass the u128 bound audit
+    silently. Returns the confirmed anchor type string ("u128").
+    """
+    m = re.search(r"enum\s+Cond\b", wg_src)
+    if not m:
+        raise AuditError("missing 'enum Cond' in src/worldgen.rs")
+    m2 = re.search(r"\bBiome\s*\(\s*([A-Za-z0-9_]+)\s*\)", wg_src[m.end():])
+    if not m2 or m2.group(1) != "u128":
+        raise AuditError(
+            f"Cond::Biome anchor is {m2.group(1) if m2 else 'missing'} in src/worldgen.rs; "
+            "the u128 mask bound audit requires Biome(u128)"
+        )
+    return m2.group(1)
 
 
 def load_json_dir(folder):
@@ -233,8 +254,8 @@ def audit_density_and_surface(noise_settings, df_files, noise_files, dim_biomes,
             failures.append(f"{dim}: unsupported surface_rule types {sr_unsupported}")
         if sc_unsupported:
             failures.append(f"{dim}: unsupported surface_condition types {sc_unsupported}")
-        if bleaf_count >= 64:
-            failures.append(f"{dim}: bleaf count {bleaf_count} overflows Cond::Biome(u64)")
+        if bleaf_count >= 128:
+            failures.append(f"{dim}: bleaf count {bleaf_count} overflows Cond::Biome(u128)")
         if missing_bleaf:
             failures.append(f"{dim}: surface biome_is missing from dim bleaf {missing_bleaf}")
 
@@ -382,6 +403,7 @@ def audit_biomes_and_structures(biomes, structures, structure_sets):
 
 def run_audit(root=ROOT):
     parsers = parse_rust_parsers(root)
+    anchor = parse_cond_biome_anchor((root / "src/worldgen.rs").read_text())
     noise_settings = load_json_dir("noise_settings")
     df_files = load_json_dir("density_function")
     noise_files = load_json_dir("noise")
@@ -398,6 +420,7 @@ def run_audit(root=ROOT):
 
     return {
         "parsers": {k: len(v) for k, v in parsers.items()},
+        "cond_biome_anchor": anchor,
         "density_and_surface": df_surf,
         "features_and_placements": feat_pm,
         "biomes_and_structures": bio_struct,
@@ -414,7 +437,7 @@ def format_report(report):
         ds = report["density_and_surface"][dim]
         fp = report["features_and_placements"][dim]
         lines.append(
-            f"[{dim}] bleaf={ds['bleaf_count']}/64 "
+            f"[{dim}] bleaf={ds['bleaf_count']}/128 "
             f"df_types={len(ds['df_types'])} (zero_folded={list(ds['df_zero_folded_reachable'])}, unsupported={ds['df_unsupported']}) "
             f"surface=({len(ds['surface_rule_types'])} rules, {len(ds['surface_cond_types'])} conds, "
             f"biome_is={ds['surface_biome_is_count']}, missing_bleaf={ds['surface_biome_is_missing_from_bleaf']})"

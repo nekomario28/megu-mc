@@ -16,18 +16,34 @@ class P02AuditTests(unittest.TestCase):
     def test_pinned_datapack_and_rust_parsers_pass_audit(self):
         report = audit.run_audit()
         self.assertEqual(report["failures"], [])
+        for dim in ("overworld", "nether", "end"):
+            self.assertFalse(
+                [f for f in report["failures"] if f.startswith(f"{dim}:")],
+                f"failures for {dim}: {report['failures']}",
+            )
+        self.assertEqual(report["cond_biome_anchor"], "u128")
         ow = report["density_and_surface"]["overworld"]
         self.assertEqual(
             ow["df_zero_folded_reachable"],
             {"blend_alpha": "DF::C(1.0)", "blend_offset": "DF::Zero"},
         )
         self.assertEqual(ow["surface_biome_is_missing_from_bleaf"], [])
-        self.assertLess(ow["bleaf_count"], 64)
+        self.assertLess(ow["bleaf_count"], 128)
         self.assertEqual(
             report["features_and_placements"]["end"]["configured_feature_unimplemented_reachable"],
             [],
         )
         self.assertEqual(report["biomes_and_structures"]["structures_total"], 34)
+
+    def test_cond_biome_anchor_fails_closed_on_revert_or_mismatch(self):
+        wg_src = (ROOT / "src/worldgen.rs").read_text()
+        self.assertEqual(audit.parse_cond_biome_anchor(wg_src), "u128")
+        with self.assertRaises(audit.AuditError):
+            audit.parse_cond_biome_anchor(wg_src.replace("Biome(u128)", "Biome(u64)"))
+        with self.assertRaises(audit.AuditError):
+            audit.parse_cond_biome_anchor(wg_src.replace("enum Cond", "enum CondRenamed"))
+        with self.assertRaises(audit.AuditError):
+            audit.parse_cond_biome_anchor("no Cond here")
 
     def test_unsupported_density_surface_or_bleaf_overflow_fails_closed(self):
         parsers = audit.parse_rust_parsers()
@@ -44,14 +60,14 @@ class P02AuditTests(unittest.TestCase):
             "then_run": {"type": "minecraft:unparsed_rule"},
         }
         dims_bad = {k: set(v) for k, v in dim_biomes.items()}
-        dims_bad["nether"] = {f"minecraft:fake_biome_{i}" for i in range(64)}
+        dims_bad["nether"] = {f"minecraft:fake_biome_{i}" for i in range(128)}
 
         _, failures = audit.audit_density_and_surface(ns_bad, df_files, noise_files, dims_bad, parsers)
         joined = "\n".join(failures)
         self.assertIn("unparsed_df_node", joined)
         self.assertIn("unparsed_rule", joined)
         self.assertIn("minecraft:nonexistent_biome", joined)
-        self.assertIn("overflows Cond::Biome(u64)", joined)
+        self.assertIn("overflows Cond::Biome(u128)", joined)
 
     def test_unsupported_placement_modifier_fails_closed(self):
         parsers = audit.parse_rust_parsers()
