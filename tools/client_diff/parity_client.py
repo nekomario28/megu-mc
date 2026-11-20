@@ -22,6 +22,7 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests"))
+from container_wire import stack, wire_stack  # noqa: E402
 from protocol767 import (Client, Reader, AIR_STATES, WIRE_BLOCKS, frame,  # noqa: E402
                          position, settings, string, vint)
 from wire_smoke import port, rcon_frame, rcon_response, recv_exact, recv_vint  # noqa: E402
@@ -30,7 +31,12 @@ SEED = 4242
 NAME = "ParityProbe"
 STONE = next(b["defaultState"] for b in WIRE_BLOCKS if b["name"] == "stone")
 WATER = next(b["defaultState"] for b in WIRE_BLOCKS if b["name"] == "water")
+BOTTOM_SLAB = next(b["defaultState"] for b in WIRE_BLOCKS if b["name"] == "stone_slab")
 STONE_ITEM = 1  # Protocol 767 minecraft:stone item registry ID.
+OAK_LOG = (132, 1)
+OAK_PLANKS = (36, 4)
+EMPTY_STACK = (0, 0)
+SLAB_END = (3.5, 240.5, 3.5)
 JAVA = Path("/usr/lib/jvm/java-21-openjdk/bin/java")
 JAR = Path("/home/yuu/tmpx/carverfresh/server.jar")
 JAR_SHA1 = "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
@@ -112,6 +118,13 @@ class ParityClient(Client):
         self.advancement_payload_sizes = []
         self.advancement_payload_hashes = []
         self.entity_id = None
+        self.inventory_state = 0
+        self.inventory_updates = []
+        self.health_updates = []
+        self.damage_events = []
+        self.hurt_angles = []
+        self.entity_events = []
+        self.velocities = []
         self.unmatched_unloads = 0
         self.errors = []
         self.socket.position_handler = self._position_frame
@@ -159,7 +172,37 @@ class ParityClient(Client):
         if phase == "play" and packet == 0x74:
             self.advancement_payload_sizes.append(len(body))
             self.advancement_payload_hashes.append(hashlib.sha256(body).hexdigest())
+        if phase == "play":
+            self.observe_gameplay(packet, body)
         return packet, body
+
+    def observe_gameplay(self, packet, body):
+        reader = Reader(body)
+        if packet == 0x13 and body[0] == 0:
+            reader.take(1)
+            self.inventory_state = reader.varint()
+            assert reader.varint() == 46, "player inventory slot count"
+            for slot in range(46):
+                self.inventory_updates.append(("0x13", slot, stack(reader)))
+            self.inventory_updates.append(("0x13", -1, stack(reader)))
+            assert reader.pos == len(body), "trailing container content fields"
+        elif packet == 0x15 and body[0] in (0, 255):
+            window = reader.number("B")
+            # The cursor update (-1) also advances the active menu's state ID.
+            self.inventory_state = reader.varint()
+            slot = reader.number(">h")
+            self.inventory_updates.append(("0x15", -1 if window == 255 else slot, stack(reader)))
+            assert reader.pos == len(body), "trailing set-slot fields"
+        elif packet == 0x5d:
+            self.health_updates.append(reader.number(">f"))
+        elif packet == 0x1a and reader.varint() == self.entity_id:
+            self.damage_events.append(reader.varint())  # Damage-type registry ID.
+        elif packet == 0x1f and reader.number(">i") == self.entity_id:
+            self.entity_events.append(reader.number("B"))
+        elif packet == 0x24 and reader.varint() == self.entity_id:
+            self.hurt_angles.append(reader.number(">f"))
+        elif packet == 0x5a and reader.varint() == self.entity_id:
+            self.velocities.append(struct.unpack(">hhh", reader.take(6)))
 
     def login(self, view=2):
         self.send(0, vint(767) + string("localhost") + struct.pack(">H", self.game) + vint(2))
@@ -279,6 +322,92 @@ def move_trace(client, steps, rcon_port):
             "max_server_offset": max(offsets, default=0),
             "server_positions": actual,
             "corrections_0x40": len(client.position_syncs) - start}
+
+
+def teleport(client, rcon_port, coords):
+    before = len(client.position_syncs)
+    command(rcon_port, f"tp {client.name} {' '.join(map(str, coords))}")
+    until(client, lambda: coords in client.position_syncs[before:], f"{client.name} arena teleport")
+
+
+def slab_step_up(client, rcon_port):
+    teleport(client, rcon_port, (1.5, 240.0, 3.5))
+    target = (3, 240, 3)
+    before = len(client.updates)
+    command(rcon_port, "setblock 3 240 3 minecraft:stone_slab[type=bottom,waterlogged=false]")
+    read_for(client, 0.6)
+    slab = cell(client, *target)
+    updates = [state for pos, state in client.updates[before:] if pos == target]
+
+    # The player's 0.3-block half-width first overlaps the slab at x=2.75.
+    steps = [(1.5 + 0.25 * i, 240.0 if i <= 4 else 240.5, 3.5, True)
+             for i in range(1, 9)]
+    result = move_trace(client, steps, rcon_port)
+    return {**result, "slab_state": slab, "slab_updates": updates,
+            "final_position": result["server_positions"][-1]}
+
+
+def crafting_planks(client, rcon_port):
+    # The preceding block tests used hotbar slot 36. Empty it before /give.
+    client.send(0x32, struct.pack(">h", 36) + wire_stack())
+    read_for(client, 0.4)
+    command(rcon_port, f"gamemode survival {client.name}")
+    before = len(client.inventory_updates)
+    command(rcon_port, f"give {client.name} minecraft:oak_log 1")
+    read_for(client, 0.6)
+    stages = {"given": [row for row in client.inventory_updates[before:] if row[1] == 36]}
+    for name, slot, watched in (
+        ("lift_log", 36, (-1, 36)),
+        ("place_ingredient", 1, (-1, 0, 1)),
+        ("take_result", 0, (-1, 0, 1)),
+        ("store_planks", 37, (-1, 37)),
+    ):
+        before = len(client.inventory_updates)
+        # Empty predicted changes let the server report its own slot values.
+        client.send(0x0e, b"\0" + vint(client.inventory_state) + struct.pack(">hB", slot, 0)
+                    + vint(0) + vint(0) + wire_stack())
+        read_for(client, 0.6)
+        stages[name] = [row for row in client.inventory_updates[before:] if row[1] in watched]
+    return {"slot_updates": stages}
+
+
+def combat_hit_or_damage(attacker, rcon_port):
+    command(rcon_port, "gamerule naturalRegeneration false")
+    with ParityClient(attacker.game, "ParityVictim") as victim:
+        victim.login()
+        until(victim, lambda: victim.entity_id is not None and victim.pos is not None,
+              "victim join and spawn")
+        command(rcon_port, f"gamemode survival {attacker.name}")
+        command(rcon_port, f"gamemode survival {victim.name}")
+        attacker.send(0x2f, struct.pack(">h", 8))  # Empty hotbar slot for a bare-hand hit.
+        for client, coords in ((attacker, (1.5, 240.0, 1.5)), (victim, (2.5, 240.0, 1.5))):
+            teleport(client, rcon_port, coords)
+            client.send(0x1a, struct.pack(">ddd?", *coords, True))
+        read_for(attacker, 0.35)
+        read_for(victim, 4.0)  # Vanilla's login invulnerability lasts 60 ticks at 20 TPS.
+        initial_health = victim.health_updates[-1] if victim.health_updates else None
+        health_start = len(victim.health_updates)
+        event_start = len(victim.entity_events)
+        damage_start = len(victim.damage_events)
+        hurt_start = len(victim.hurt_angles)
+        velocity_start = len(victim.velocities)
+        attacker.send(0x16, vint(victim.entity_id) + vint(1) + b"\0")
+        read_for(victim, 0.8)
+        result = {
+            "initial_health_0x5d": initial_health,
+            "hit_health_0x5d": victim.health_updates[health_start:],
+            "hit_entity_events_0x1f": victim.entity_events[event_start:],
+            "hit_damage_types_0x1a": victim.damage_events[damage_start:],
+            "hit_hurt_angles_0x24": victim.hurt_angles[hurt_start:],
+            "hit_velocity_0x5a": victim.velocities[velocity_start:],
+        }
+        health_start = len(victim.health_updates)
+        event_start = len(victim.entity_events)
+        command(rcon_port, f"kill {victim.name}")
+        read_for(victim, 0.8)
+        result.update(death_health_0x5d=victim.health_updates[health_start:],
+                      death_entity_events_0x1f=victim.entity_events[event_start:])
+        return result
 
 
 @contextmanager
@@ -461,6 +590,9 @@ def exercise(game, rcon_port):
             "last_y": water_steps[-1][1],
             "tick_tolerance": 0.03,
         })
+        result["slab_step_up"] = slab_step_up(client, rcon_port)
+        result["crafting_planks"] = crafting_planks(client, rcon_port)
+        result["combat_hit_or_damage"] = combat_hit_or_damage(client, rcon_port)
     return result
 
 

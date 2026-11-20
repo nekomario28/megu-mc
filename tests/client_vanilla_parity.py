@@ -10,18 +10,19 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/client_diff"))
-from parity_client import (AIR_STATES, JAR, ROOT as HARNESS_ROOT,  # noqa: E402
-                           STONE, WATER, run_target)
+from parity_client import (AIR_STATES, BOTTOM_SLAB, EMPTY_STACK, JAR, OAK_LOG,  # noqa: E402
+                           OAK_PLANKS, ROOT as HARNESS_ROOT, SLAB_END, STONE, WATER, run_target)
 
 SCENARIOS = (
     "bootstrap", "chunks", "grounded_walk", "sprint", "jump_arc",
     "block_place", "block_break", "fluid_entry", "submerged_ticks",
+    "slab_step_up", "crafting_planks", "combat_hit_or_damage",
 )
 
 
 MOVEMENT_STEPS = {
     "grounded_walk": 6, "sprint": 6, "jump_arc": 12,
-    "fluid_entry": 3, "submerged_ticks": 8,
+    "fluid_entry": 3, "submerged_ticks": 8, "slab_step_up": 8,
 }
 
 COMPARISON_FIELDS = {
@@ -40,6 +41,13 @@ COMPARISON_FIELDS = {
     "fluid_entry": ("sent", "accepted", "corrections_0x40", "max_server_offset", "water_state"),
     "submerged_ticks": ("sent", "accepted", "corrections_0x40", "max_server_offset",
                         "water_state", "first_y", "last_y", "tick_tolerance"),
+    "slab_step_up": ("sent", "accepted", "corrections_0x40", "max_server_offset",
+                     "slab_state", "slab_updates", "final_position"),
+    "crafting_planks": ("slot_updates",),
+    "combat_hit_or_damage": ("initial_health_0x5d", "hit_health_0x5d",
+                             "hit_entity_events_0x1f", "hit_damage_types_0x1a",
+                             "hit_hurt_angles_0x24", "hit_velocity_0x5a",
+                             "death_health_0x5d", "death_entity_events_0x1f"),
 }
 
 
@@ -89,7 +97,33 @@ def validate(name, observed):
             require(observed.get("tick_tolerance") == 0.03, "water tolerance unspecified")
             require(observed.get("first_y", 0) > observed.get("last_y", 0),
                     "submerged trace does not descend")
-    else:
+        if name == "slab_step_up":
+            require(observed.get("slab_state") == BOTTOM_SLAB, "dry bottom slab missing")
+            require(BOTTOM_SLAB in observed.get("slab_updates", []), "bottom slab update missing")
+            require(observed.get("final_position") == SLAB_END, "did not finish on the slab")
+    elif name == "crafting_planks":
+        stages = observed.get("slot_updates", {})
+        for phase, slot, value in (
+            ("given", 36, OAK_LOG),
+            ("lift_log", 36, EMPTY_STACK),
+            ("place_ingredient", 1, OAK_LOG),
+            ("place_ingredient", 0, OAK_PLANKS),
+            ("take_result", 1, EMPTY_STACK),
+            ("take_result", 0, EMPTY_STACK),
+            ("store_planks", 37, OAK_PLANKS),
+        ):
+            values = [item for packet, index, item in stages.get(phase, [])
+                      if packet in ("0x15", "0x13") and index == slot]
+            require(values[-1:] == [value], f"{phase}: expected slot {slot} to end as {value}")
+    elif name == "combat_hit_or_damage":
+        require(observed.get("initial_health_0x5d") == 20.0, "victim did not start at full health")
+        require(any(0 < hp < 20 for hp in observed.get("hit_health_0x5d", [])),
+                "attack did not reduce victim health")
+        require(bool(observed.get("hit_hurt_angles_0x24")), "victim hurt animation missing")
+        require(any(vx > 0 and vz == 0 for vx, _, vz in observed.get("hit_velocity_0x5a", [])),
+                "victim knockback away from attacker missing")
+        require(0.0 in observed.get("death_health_0x5d", []), "victim death health missing")
+    elif name in ("block_place", "block_break"):
         state = STONE if name == "block_place" else 0
         require(observed.get("state") == state, "incorrect final block state")
         require(observed.get("packet_0x09") is True, "block update 0x09 missing")
