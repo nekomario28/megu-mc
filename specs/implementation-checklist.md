@@ -118,7 +118,7 @@
 
 - [x] **GP-0（Entity Framework & 全 130 エンティティ型データ駆動レジストリ — エンジン＆主要配線完了 `89669a8`, `d6f17ac`）**: `src/entity_registry.rs` に protocol 767 全 130 `EntityType`（`0..=129`）を一元化し、`name_to_etype`・`mob_dimensions`・`default_mob_hp`・`/summon` 初期 HP を接続済み。
 - [x] **GP-1（1.21.1 `GoalSelector` & A* `PathNavigation` — live wiring `f218379`）**: `GoalSelector` とA* `WorldPathAdapter`を `mob_tick` で起動。
-- [ ] **GP-2（1.21.1 `NaturalSpawner`, Mob Cap, `SpawnCosts`, Despawn）**: pack spawning (`natural_spawner.rs`) と `mob_despawn.rs` を本番 `mob_tick` に接続済み（`67dae28`, `8acb6fe`）。PR `#55`/`#56`/`#57`/`#61` の距離・cap・配置・明暗も接続済み。未完了は `SpawnCosts` energy budget のみ。
+- [x] **GP-2（1.21.1 `NaturalSpawner`, Mob Cap, `SpawnCosts`, Despawn）**: Overworld の pack spawning と despawn を維持。Nether は次元別 Mob census、バイオーム／要塞の選択、配置・明暗、cap・距離および `SpawnCosts` を本番 tick に接続。[`gp2_nether_spawn_wire.py`](../tests/gp2_nether_spawn_wire.py) で soul sand valley の自然スポーンと予算による密度制限を確認。
 - [x] **GP-3（1.21.1 レッドストーン伝播エンジン — live wiring `e279113`）**: wire/torch/repeater/comparator/piston/lamp/door/hopper/dropperを `src/main.rs` に接続（`tests/gp3_gp4_gp5_wire.py` PASS）。
 - [x] **GP-4（村人 AI・職業 POI・取引・gossip・Raid — live wiring `e279113`）**: Villager profession POI、`0x2d` Merchant Offers / `0x2f` Select Trade、restock/demandを本番接続（wire suite PASS）。
 - [x] **GP-5（エンチャント台・金床・醸造・鍛冶・空腹・XP — `e279113`）**: 3-slot enchant options、Anvil repair/rename、Brewing stand tick、Smithing tableに加え `/xp set` と `FoodData::tick` を接続し、wire検証済み。

@@ -41,6 +41,7 @@ fn entity_angles_spawn_matches_native_constructors() {
     let (mut client, _reader) = effect_tests::client_pair();
     client.eid = 42;
     let mob = Mob {
+        dim: DimId::Overworld,
         eid: 42,
         uuid: [0; 16],
         etype: 124,

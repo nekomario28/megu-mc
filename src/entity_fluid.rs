@@ -1399,6 +1399,7 @@ mod entity_fluid_tests {
 
         // Mob fall-damage cancellation in water (mob_snap_y).
         let cow_water = Arc::new(Mob {
+            dim: DimId::Overworld,
             eid: 9501,
             uuid: [1u8; 16],
             etype: 22,
@@ -1430,6 +1431,7 @@ mod entity_fluid_tests {
 
         // Dry-land fall damage still works.
         let cow_dry = Arc::new(Mob {
+            dim: DimId::Overworld,
             eid: 9502,
             uuid: [2u8; 16],
             etype: 22,
@@ -1534,6 +1536,7 @@ mod entity_fluid_tests {
         // Submerged chicken (eyeHeight 0.644) in flowing water at (0,60,0) -> (0,61,0) drains air & gets pushed +X.
         set_block(0, 61, 0, 81);
         let chicken = Arc::new(Mob {
+            dim: DimId::Overworld,
             eid: 9503,
             uuid: [3u8; 16],
             etype: 19,
@@ -1552,6 +1555,7 @@ mod entity_fluid_tests {
         set_block(-3, 60, -3, 102); // flowing lava
         set_block(-3, 60, 3, 102);
         let pig_lava = Arc::new(Mob {
+            dim: DimId::Overworld,
             eid: 9504,
             uuid: [4u8; 16],
             etype: 77,
@@ -1567,6 +1571,7 @@ mod entity_fluid_tests {
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         });
         let blaze_lava = Arc::new(Mob {
+            dim: DimId::Overworld,
             eid: 9505,
             uuid: [5u8; 16],
             etype: 8,
@@ -1585,6 +1590,7 @@ mod entity_fluid_tests {
         set_block(2, 60, 3, 80);
         set_block(0, 60, 2, 80);
         let zombie_water = Arc::new(Mob {
+            dim: DimId::Overworld,
             eid: 9506,
             uuid: [6u8; 16],
             etype: 124,
@@ -1600,6 +1606,7 @@ mod entity_fluid_tests {
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         });
         let creeper_water = Arc::new(Mob {
+            dim: DimId::Overworld,
             eid: 9507,
             uuid: [7u8; 16],
             etype: 23,

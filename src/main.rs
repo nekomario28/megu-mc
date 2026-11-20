@@ -811,7 +811,7 @@ fn interest_tick() {
     let mut entity_dims = HashMap::new();
     for m in mobs().lock().unwrap().iter() {
         let p = *m.pos.lock().unwrap();
-        entity_dims.insert(m.eid, live_mob_dim(m.eid));
+        entity_dims.insert(m.eid, m.dim);
         let m = m.clone();
         ents.push((
             m.eid,
@@ -2630,6 +2630,7 @@ fn armor_pts_of(inv: &HashMap<i16, Stack>) -> i32 {
 
 // ---------- mobs ----------
 struct Mob {
+    dim: DimId,
     eid: i32,
     uuid: [u8; 16],
     etype: i64,
@@ -3526,7 +3527,7 @@ fn environment_time_tick() {
             }
         }
         {
-            for m in mobs().lock().unwrap().iter() {
+            for m in mobs().lock().unwrap().iter().filter(|mob| mob.dim == DimId::Overworld) {
                 let p = m.pos.lock().unwrap();
                 spots.push((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
             }
@@ -3618,12 +3619,17 @@ fn environment_time_tick() {
         }
         __t = __prof.then(std::time::Instant::now);
     }
-    if GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1
-        && DIFFICULTY.load(Ordering::Relaxed) != 0
-        && t % server_ticks(SPAWN_CYCLE_GT) == server_ticks(SPAWN_CYCLE_GT) / 2
-        && (13000..=23000).contains(&wt)
-    {
-        spawn_nightly_hostile(t);
+    if GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1 {
+        let cycle = server_ticks(SPAWN_CYCLE_GT);
+        if DIFFICULTY.load(Ordering::Relaxed) != 0
+            && t % cycle == cycle / 2
+            && (13000..=23000).contains(&wt)
+        {
+            spawn_nightly_hostile(t);
+        }
+        if t % nether_spawn_cycle() == 0 {
+            spawn_nether_natural(t);
+        }
     }
     {
         // fishing bobbers: fly, land on water, bite after 3-7 s
@@ -3730,7 +3736,7 @@ fn environment_time_tick() {
             let mut hit_mob: Option<i32> = None;
             {
                 let ms = mobs().lock().unwrap();
-                for m in ms.iter() {
+                for m in ms.iter().filter(|mob| mob.dim == DimId::Overworld) {
                     let mp = m.pos.lock().unwrap();
                     if (mp.0 - p0.x).abs() < 0.6
                         && (mp.2 - p0.z).abs() < 0.6
@@ -3774,6 +3780,7 @@ fn environment_time_tick() {
             // vanilla: an egg that lands has a 1/8 chance to hatch a chicken
             if is_egg && world_rng::next_u64().is_multiple_of(8) {
                 let m = Arc::new(Mob {
+                    dim: DimId::Overworld,
                     eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                     uuid: [0u8; 16],
                     etype: 19,
@@ -4097,7 +4104,7 @@ fn arrow_tick() {
                 // other players. The owner and last pierced target are skipped.
                 let ml = mobs().lock().unwrap();
                 'outer: for m in ml.iter() {
-                    if m.eid == a.last_hit || live_mob_dim(m.eid) != DimId::Overworld {
+                    if m.eid == a.last_hit || m.dim != DimId::Overworld {
                         continue;
                     }
                     let (mx, my, mz, ..) = *m.pos.lock().unwrap();
@@ -5298,16 +5305,14 @@ thread_local! {
 }
 
 struct LiveMobState {
-    dim: DimId,
     behavior: Option<MobBehaviorState>,
     blaze_charged: bool,
     potions: Vec<(WitchPotion, u64)>,
 }
 
 impl LiveMobState {
-    fn new(etype: i64, dim: DimId) -> Self {
+    fn new(etype: i64) -> Self {
         Self {
-            dim,
             behavior: MobBehaviorState::for_etype(etype),
             blaze_charged: false,
             potions: Vec::new(),
@@ -5318,14 +5323,6 @@ impl LiveMobState {
 fn live_mob_states() -> &'static Mutex<HashMap<i32, LiveMobState>> {
     static STATES: OnceLock<Mutex<HashMap<i32, LiveMobState>>> = OnceLock::new();
     STATES.get_or_init(Mutex::default)
-}
-
-fn live_mob_dim(eid: i32) -> DimId {
-    live_mob_states()
-        .lock()
-        .unwrap()
-        .get(&eid)
-        .map_or(DimId::Overworld, |state| state.dim)
 }
 
 fn insert_live_mob(
@@ -5352,13 +5349,13 @@ fn new_live_mob(
     slime_size: Option<SlimeSize>,
 ) -> Arc<Mob> {
     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-    let mut state = LiveMobState::new(etype, dim);
+    let mut state = LiveMobState::new(etype);
     if let (Some(MobBehaviorState::Slime { behavior, .. }), Some(size)) =
         (&mut state.behavior, slime_size)
     {
         behavior.size = size;
     }
-    if dim != DimId::Overworld || state.behavior.is_some() {
+    if state.behavior.is_some() {
         live_mob_states().lock().unwrap().insert(eid, state);
     }
     // Entity IDs are unique within the running world, including split children.
@@ -5366,6 +5363,7 @@ fn new_live_mob(
     uuid[12..].copy_from_slice(&eid.to_be_bytes());
     let last_action = Instant::now() - Duration::from_secs(10);
     Arc::new(Mob {
+        dim,
         eid,
         uuid,
         etype,
@@ -5412,7 +5410,7 @@ fn live_mob_hit_allowed(mob: &Mob, source: i32, hit: BossHit) -> bool {
     let mut states = live_mob_states().lock().unwrap();
     let state = states
         .entry(mob.eid)
-        .or_insert_with(|| LiveMobState::new(mob.etype, DimId::Overworld));
+        .or_insert_with(|| LiveMobState::new(mob.etype));
     match &mut state.behavior {
         Some(MobBehaviorState::Wither(wither)) => !wither.immune_to(hit),
         Some(MobBehaviorState::EnderDragon(dragon)) => {
@@ -5455,7 +5453,7 @@ fn live_mob_interact(client: &Client, target: i32, slot: i16) -> bool {
         let mut states = live_mob_states().lock().unwrap();
         let state = states
             .entry(target)
-            .or_insert_with(|| LiveMobState::new(mob.etype, DimId::Overworld));
+            .or_insert_with(|| LiveMobState::new(mob.etype));
         match &mut state.behavior {
             Some(MobBehaviorState::Piglin(piglin)) => piglin.offer(client.eid, item),
             Some(MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet)) => {
@@ -6288,7 +6286,7 @@ fn live_mob_behavior_step(
     let mut states = live_mob_states().lock().unwrap();
     let state = states
         .entry(mob.eid)
-        .or_insert_with(|| LiveMobState::new(mob.etype, ctx.dim));
+        .or_insert_with(|| LiveMobState::new(mob.etype));
     let Some(behavior) = &mut state.behavior else {
         return Vec::new();
     };
@@ -6647,10 +6645,10 @@ fn apply_live_mob_effects(
 }
 
 fn live_mob_death(mob: &Arc<Mob>, state: Option<LiveMobState>, pos: [f64; 3]) {
-    let state = state.unwrap_or_else(|| LiveMobState::new(mob.etype, DimId::Overworld));
+    let state = state.unwrap_or_else(|| LiveMobState::new(mob.etype));
     sitting_cats().lock().unwrap().remove(&mob.eid);
     if let Some(behavior) = state.behavior {
-        apply_live_mob_effects(mob, state.dim, pos, behavior.on_death(), &[]);
+        apply_live_mob_effects(mob, mob.dim, pos, behavior.on_death(), &[]);
     }
 }
 
@@ -6665,16 +6663,7 @@ fn mob_tick() {
         let alive: HashSet<_> = mobs.iter().map(|mob| mob.eid).collect();
         LIVE_MOB_AI.with(|ai| ai.borrow_mut().retain(|eid, _| alive.contains(eid)));
         states.retain(|eid, _| alive.contains(eid));
-        mobs.iter()
-            .map(|mob| {
-                (
-                    mob.clone(),
-                    states
-                        .get(&mob.eid)
-                        .map_or(DimId::Overworld, |state| state.dim),
-                )
-            })
-            .collect::<Vec<_>>()
+        mobs.clone()
     };
     if players.is_empty() {
         return;
@@ -6686,8 +6675,8 @@ fn mob_tick() {
     for dim in [DimId::Overworld, DimId::Nether, DimId::End] {
         let mobs: Vec<_> = mobs_snap
             .iter()
-            .filter(|(_, d)| *d == dim)
-            .map(|(mob, _)| mob.clone())
+            .filter(|mob| mob.dim == dim)
+            .cloned()
             .collect();
         if !mobs.is_empty() && players.iter().any(|player| player.dim == dim) {
             live_mob_tick_dimension(dim, reg, &mobs, &players);
@@ -7714,6 +7703,7 @@ fn materialize_generation_payloads_inner(
                         uuid[6] = (uuid[6] & 15) | 64;
                         uuid[8] = (uuid[8] & 63) | 128;
                         ms.push(Arc::new(Mob {
+                            dim: DimId::Overworld,
                             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                             uuid,
                             etype,
@@ -8415,17 +8405,24 @@ fn current_sky_darken() -> i32 {
     ((1.0 - rf * rd * re) * 11.0) as i32
 }
 fn nibble_at(sections: &[[u8; 2048]], x: i32, y: i32, z: i32) -> i32 {
-    if !(LIGHT_MIN_Y..LIGHT_MIN_Y + 26 * 16).contains(&y) {
+    nibble_at_dim(sections, DimId::Overworld, x, y, z)
+}
+
+fn nibble_at_dim(sections: &[[u8; 2048]], dim: DimId, x: i32, y: i32, z: i32) -> i32 {
+    let Some(relative_y) = y
+        .checked_sub(dim.light_min_y())
+        .and_then(|y| usize::try_from(y).ok())
+    else {
         return 0;
-    }
-    let relative_y = (y - LIGHT_MIN_Y) as usize;
+    };
+    let Some(section) = sections.get(relative_y / 16) else {
+        return 0;
+    };
     let lx = (x & 15) as usize;
     let lz = (z & 15) as usize;
-    i32::from(
-        (sections[relative_y / 16][(relative_y & 15) * 128 + lz * 8 + lx / 2] >> ((lx & 1) * 4))
-            & 15,
-    )
+    i32::from((section[(relative_y & 15) * 128 + lz * 8 + lx / 2] >> ((lx & 1) * 4)) & 15)
 }
+
 struct SpawnerRuntimeWorld<'a> {
     clients_snap: &'a [Arc<Client>],
     players: Vec<[f64; 3]>,
@@ -8479,6 +8476,9 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
             let mut merged: GenSources = HashMap::new();
             for c in self.clients_snap {
                 let g = c.gen_sources.lock().unwrap();
+                if *c.dim.lock().unwrap() != DimId::Overworld {
+                    continue;
+                }
                 for (&k, v) in g.iter() {
                     merged.entry(k).or_insert_with(|| v.clone());
                 }
@@ -8526,7 +8526,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
             .lock()
             .unwrap()
             .iter()
-            .filter(|m| m.etype == cave_spider && *m.hp.lock().unwrap() > 0.0)
+            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap() > 0.0)
             .filter(|m| {
                 let (mx, my, mz, ..) = *m.pos.lock().unwrap();
                 aabb_overlaps(Self::spider_aabb([mx, my, mz]), (box_min, box_max))
@@ -8548,7 +8548,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
             .lock()
             .unwrap()
             .iter()
-            .filter(|m| *m.hp.lock().unwrap() > 0.0)
+            .filter(|m| m.dim == DimId::Overworld && *m.hp.lock().unwrap() > 0.0)
             .any(|m| {
                 let (mx, my, mz, ..) = *m.pos.lock().unwrap();
                 let mb = if m.etype == cave_spider {
@@ -8590,6 +8590,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
             return false;
         }
         ms.push(Arc::new(Mob {
+            dim: DimId::Overworld,
             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
             uuid,
             etype: cave_spider,
@@ -8626,7 +8627,7 @@ fn spawner_tick() {
     let clients_snap = client_snapshot();
     let players: Vec<[f64; 3]> = clients_snap
         .iter()
-        .filter(|c| *c.gm.lock().unwrap() != 3)
+        .filter(|c| !c.is_spectator() && *c.dim.lock().unwrap() == DimId::Overworld)
         .map(|c| {
             let p = *c.pos.lock().unwrap();
             [p.0, p.1, p.2]
@@ -8662,6 +8663,9 @@ fn spawner_tick() {
         let oy = origin.1 as f64 + 0.5;
         let oz = origin.2 as f64 + 0.5;
         for c in &clients_snap {
+            if *c.dim.lock().unwrap() != DimId::Overworld {
+                continue;
+            }
             let (px, py, pz, ..) = *c.pos.lock().unwrap();
             let (dx, dy, dz) = (px - ox, py - oy, pz - oz);
             if dx * dx + dy * dy + dz * dz <= 64.0 * 64.0 {
@@ -8682,9 +8686,9 @@ static POS_STORE: Registry<String, DimPosRot> = OnceLock::new();
 /// fields. Both the logout write and the periodic world save call this, so a test can prove
 /// the persisted dimension comes from `Client::dim` rather than a hard-coded Overworld.
 fn client_dim_pos(c: &Client) -> DimPosRot {
+    let dim = c.dim.lock().unwrap();
     let p = *c.pos.lock().unwrap();
-    let d = *c.dim.lock().unwrap();
-    (d, p.0, p.1, p.2, p.3, p.4)
+    (*dim, p.0, p.1, p.2, p.3, p.4)
 }
 fn pos_store() -> &'static LockedMap<String, DimPosRot> {
     POS_STORE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -12896,8 +12900,10 @@ fn save_world_into(f: &mut Vec<u8>) {
         .map(|(pos, age)| (*pos, *age))
         .collect();
     (*f).extend_from_slice(b"MET4");
+    let mob_dimensions;
     {
         let ms = mobs().lock().unwrap();
+        mob_dimensions = ms.iter().map(|mob| mob.dim).collect::<Vec<_>>();
         write_varint(&mut *f, ms.len() as i64);
         for m in ms.iter() {
             let (x, y, z, ..) = {
@@ -13406,6 +13412,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         append_dim2_footer(f, &dim2);
     }
     append_brewing_footer(f);
+    append_mob_dimensions_footer(f, &mob_dimensions);
     append_world_seed_footer(f, WORLD_SEED.load(Ordering::Relaxed));
 }
 
@@ -13451,6 +13458,43 @@ fn resolve_world_seed(requested: Option<u64>, saved: Option<u64>) -> Result<u64,
         (None, Some(saved)) => Ok(saved),
         (None, None) => Ok(0),
     }
+}
+
+// One dimension byte per legacy mob record in the same ordinal order.
+const MOB_DIM_MAGIC: &[u8; 4] = b"MDM1";
+
+fn append_mob_dimensions_footer(out: &mut Vec<u8>, dimensions: &[DimId]) {
+    if dimensions.iter().all(|dim| *dim == DimId::Overworld) {
+        return;
+    }
+    out.extend(dimensions.iter().map(|dim| dim.index() as u8));
+    out.extend_from_slice(&(dimensions.len() as u64).to_be_bytes());
+    out.extend_from_slice(MOB_DIM_MAGIC);
+}
+
+fn read_mob_dimensions_footer(payload: &[u8]) -> Result<(&[u8], Vec<DimId>), &'static str> {
+    if !payload.ends_with(MOB_DIM_MAGIC) {
+        return Ok((payload, Vec::new()));
+    }
+    let end = payload
+        .len()
+        .checked_sub(12)
+        .ok_or("truncated mob dimension footer")?;
+    let size = usize::try_from(u64::from_be_bytes(
+        payload[end..end + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| "invalid mob dimension footer size")?;
+    if !(1..=MOB_CAP).contains(&size) {
+        return Err("invalid mob dimension footer size");
+    }
+    let start = end
+        .checked_sub(size)
+        .ok_or("invalid mob dimension footer size")?;
+    let dimensions = payload[start..end]
+        .iter()
+        .map(|byte| DimId::from_index(usize::from(*byte)).ok_or("invalid mob dimension"))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((&payload[..start], dimensions))
 }
 
 // Non-Overworld signs and player dimensions. The body is `[sign count][signs][player count][players]`,
@@ -14056,6 +14100,7 @@ fn load_dim_overlay_file(dir: &std::path::Path, dim: DimId) -> Result<(), &'stat
 fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     // Footers are stripped last-written-first.
     let (payload, _) = read_world_seed_footer(payload)?;
+    let (payload, mob_dimensions) = read_mob_dimensions_footer(payload)?;
     let (payload, brewing) = read_brewing_footer(payload)?;
     // A payload with no DIM2 footer is the legacy (or DIM1-only) form and parses exactly as before.
     let (payload, dim2) = read_dim2_footer(payload)?;
@@ -15068,11 +15113,15 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     }
     // Persisted drop, projectile, TNT and falling-block IDs must reserve their range
     // before mobs receive fresh IDs. Keep mob ordinals stable for shearing and tags.
+    if !mob_dimensions.is_empty() && mob_dimensions.len() != restored_mobs.len() {
+        return Err("mob dimension count does not match mob records");
+    }
     if !restored_mobs.is_empty() {
         let mut ms = mobs().lock().unwrap();
         let first = ms.len();
-        for (etype, x, y, z, hp) in restored_mobs {
+        for (index, (etype, x, y, z, hp)) in restored_mobs.into_iter().enumerate() {
             ms.push(Arc::new(Mob {
+                dim: mob_dimensions.get(index).copied().unwrap_or(DimId::Overworld),
                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                 uuid: [0u8; 16],
                 etype,
@@ -27939,6 +27988,41 @@ fn deliver_neoforge_messages(source: Option<&Client>, messages: Vec<(i32, String
 }
 
 #[cfg(feature = "neoforge-events")]
+fn run_neoforge_command(
+    runtime: &java_compat::NeoForgeRuntime,
+    ctx: &CmdCtx,
+    literal: &str,
+) -> Result<String, String> {
+    let source = ctx.me.as_deref();
+    let dim = cmd_dim(ctx);
+    let pos = (
+        ctx.x.floor() as i32,
+        ctx.y.floor() as i32,
+        ctx.z.floor() as i32,
+    );
+    check_modification_bounds(dim, pos)?;
+    let outcome = runtime.event(java_compat::S1Event::Command {
+        dim: dim.index() as u8,
+        pos,
+        name: source.map_or("Rcon", |client| client.name.as_str()).into(),
+        literal: literal.into(),
+    })?;
+    let report = java_compat::apply_s1_outcome(outcome)?;
+    let mut reply = Vec::new();
+    let mut messages = Vec::new();
+    for (eid, message) in report.system_messages {
+        // The Java shim creates its synthetic command sender with entity ID 0.
+        match (eid, source) {
+            (0, Some(client)) => messages.push((client.eid, message)),
+            (0, None) => reply.push(message),
+            _ => messages.push((eid, message)),
+        }
+    }
+    deliver_neoforge_messages(source, messages);
+    Ok(reply.join("\n"))
+}
+
+#[cfg(feature = "neoforge-events")]
 fn neoforge_player_tick() {
     use landing_types::{S3Activation, S3TickRequest, S3_MAX_RECORDS};
 
@@ -28618,17 +28702,28 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     let args: Vec<&str> = it.collect();
     let admin = me.is_none_or(|player| player_is_admin(&player.name));
     #[cfg(feature = "neoforge-events")]
-    let mod_literal = java_compat::NEOFORGE.get().is_some_and(|runtime| {
+    let mod_command = java_compat::NEOFORGE.get().filter(|runtime| {
         runtime.commands.binary_search_by(|name| name.as_str().cmp(cmd)).is_ok()
     });
-    #[cfg(not(feature = "neoforge-events"))]
-    let mod_literal = false;
-    if !admin && !command_allowed_for_player(cmd, &args) {
-        let reply = if mod_literal {
-            "The NeoForge shim exposes this command literal without a handler"
+    #[cfg(feature = "neoforge-events")]
+    if let Some(runtime) = mod_command {
+        let reply = if !args.is_empty() {
+            format!("usage: /{cmd}")
         } else {
-            "You do not have permission to run that command"
+            run_neoforge_command(runtime, ctx, cmd).unwrap_or_else(|error| {
+                eprintln!("[mod-compatibility] NeoForge command {cmd}: {error}");
+                format!("NeoForge command failed: {cmd}")
+            })
         };
+        if !reply.is_empty() {
+            if let Some(client) = s {
+                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&reply));
+            }
+        }
+        return reply;
+    }
+    if !admin && !command_allowed_for_player(cmd, &args) {
+        let reply = "You do not have permission to run that command";
         if let Some(client) = s {
             let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(reply));
         }
@@ -29908,7 +30003,6 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         }
         "seed" => WORLD_SEED.load(Ordering::Relaxed).to_string(),
         "" => "".into(),
-        _ if mod_literal => "The NeoForge shim exposes this command literal without a handler".into(),
         _ => format!("Unknown command: {}", cmd),
     };
     if !reply.is_empty() {
@@ -32186,7 +32280,7 @@ fn handle(mut s: TcpStream) {
                     {
                         let ms = mobs().lock().unwrap();
                         if let Some(m) = ms.iter().find(|m| m.eid == target) {
-                            if live_mob_dim(m.eid) != *me.dim.lock().unwrap() {
+                            if m.dim != *me.dim.lock().unwrap() {
                                 continue;
                             }
                             // vanilla hurtTime: 0.5s of invulnerability after a hit
@@ -35861,6 +35955,7 @@ fn main() {
         .enumerate()
         {
             ms.push(Arc::new(Mob {
+                dim: DimId::Overworld,
                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                 uuid: [i as u8; 16],
                 etype: *et,
@@ -37351,6 +37446,7 @@ mod mineshaft_runtime_tests {
         // MaxNearbyEntities=6 cap prevents spawning above 6 and resets Delay.
         for i in 0..6 {
             mobs().lock().unwrap().push(Arc::new(Mob {
+                dim: DimId::Overworld,
                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                 uuid: [i as u8 + 10; 16],
                 etype: cave_spider,
@@ -37790,6 +37886,7 @@ mod mineshaft_runtime_tests {
             let mut ms = mobs().lock().unwrap();
             while ms.len() < MOB_CAP {
                 ms.push(Arc::new(Mob {
+                    dim: DimId::Overworld,
                     eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                     uuid: [1u8; 16],
                     etype: 124,

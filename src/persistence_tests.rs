@@ -63,6 +63,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
         age: drop_age,
     });
     mobs().lock().unwrap().push(Arc::new(Mob {
+        dim: DimId::Overworld,
         eid: 778,
         uuid: [0u8; 16],
         etype: 124,

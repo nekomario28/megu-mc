@@ -1,4 +1,4 @@
-// Runtime state for the Overworld natural spawner's creepers, skeletons, spiders and zombies.
+// Runtime state for naturally spawned monsters in the Overworld and Nether.
 // See the pinned 1.21.1 server's Mob.checkDespawn, ServerLevel.tick and Monster.updateNoActionTime.
 
 use std::cell::{OnceCell, RefCell};
@@ -37,7 +37,6 @@ impl NaturalHostile {
     }
 }
 
-#[allow(dead_code)] // Used by the per-tick hook in main.rs.
 impl NaturalHostile {
     fn observe_hurt(&mut self, mob: &Mob, hp: f32) {
         let hurt_at = *mob.hurt_at.lock().unwrap();
@@ -56,7 +55,7 @@ impl NaturalHostile {
 
     fn check_despawn(&mut self, peaceful: bool, distance_sq: Option<f64>) -> bool {
         // Mob.checkDespawn draws before testing the inner radius, even after a far discard.
-        // The four registered Monster subclasses inherit both removal policies.
+        // These naturally spawned monsters inherit both removal policies.
         let roll = if !peaceful
             && !self.persistent_or_passenger
             && distance_sq.is_some()
@@ -103,7 +102,6 @@ fn push_natural_hostile(mobs: &mut Vec<Arc<Mob>>, mob: Arc<Mob>) {
     mobs.push(mob);
 }
 
-#[allow(dead_code)] // The main.rs owner will call this before the existing mob AI step.
 fn tick_natural_hostile_despawn() {
     NATURAL_HOSTILES.with(|hostiles| {
         let mut hostiles = hostiles.get_or_init(RefCell::default).borrow_mut();
@@ -128,7 +126,8 @@ fn tick_natural_hostile_despawn() {
             hostile.observe_hurt(&mob, hp);
 
             let (x, y, z, ..) = *mob.pos.lock().unwrap();
-            if hostile.check_despawn(peaceful, nearest_player_distance_sq(&players, [x, y, z])) {
+            let distance = nearest_player_distance_sq(&players[mob.dim.index()], [x, y, z]);
+            if hostile.check_despawn(peaceful, distance) {
                 discarded.insert(mob.eid, mob);
                 return false;
             }
@@ -142,8 +141,15 @@ fn tick_natural_hostile_despawn() {
                     z.floor() as i32,
                 );
                 let chunk = (bx >> 4, bz >> 4);
-                let light: &mut DespawnChunkLight = lighting.entry(chunk).or_default();
-                hostile.advance_ai_step(light.is_bright(&clients, sky_darken, bx, by, bz));
+                let bright = if mob.dim == DimId::Overworld {
+                    let light: &mut DespawnChunkLight = lighting.entry(chunk).or_default();
+                    light.is_bright(&clients, sky_darken, bx, by, bz)
+                } else {
+                    settled_live_light(mob.dim, chunk.0, chunk.1).is_some_and(|light| {
+                        nibble_at_dim(&light.block, mob.dim, bx, by, bz) >= 12
+                    })
+                };
+                hostile.advance_ai_step(bright);
             }
             true
         });
@@ -151,17 +157,13 @@ fn tick_natural_hostile_despawn() {
     });
 }
 
-fn despawn_players(clients: &[Arc<Client>]) -> Vec<[f64; 3]> {
-    clients
-        .iter()
-        .filter_map(|client| {
-            if client.is_spectator() || *client.dim.lock().unwrap() != DimId::Overworld {
-                return None;
-            }
-            let (x, y, z, ..) = *client.pos.lock().unwrap();
-            Some([x, y, z])
-        })
-        .collect()
+fn despawn_players(clients: &[Arc<Client>]) -> [Vec<[f64; 3]>; 3] {
+    let mut players = [Vec::new(), Vec::new(), Vec::new()];
+    for client in clients.iter().filter(|client| !client.is_spectator()) {
+        let (dim, x, y, z, ..) = client_dim_pos(client);
+        players[dim.index()].push([x, y, z]);
+    }
+    players
 }
 
 fn nearest_player_distance_sq(players: &[[f64; 3]], [x, y, z]: [f64; 3]) -> Option<f64> {
@@ -248,6 +250,7 @@ mod mob_despawn_tests {
     fn zombie(eid: i32, pos: (f64, f64, f64)) -> Arc<Mob> {
         let past = Instant::now() - Duration::from_secs(10);
         Arc::new(Mob {
+            dim: DimId::Overworld,
             eid,
             etype: name_to_etype("zombie").unwrap(),
             uuid: [0; 16],

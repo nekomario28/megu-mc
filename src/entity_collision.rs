@@ -660,6 +660,7 @@ mod entity_collision_tests {
 
         let make_mob = |eid: i32, etype: i64, x: f64, y: f64, z: f64| {
             Arc::new(Mob {
+                dim: DimId::Overworld,
                 eid,
                 uuid: [eid as u8; 16],
                 etype,

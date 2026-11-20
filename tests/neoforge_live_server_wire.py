@@ -75,7 +75,15 @@ public final class WireMod {
     }
 
     @SubscribeEvent public void commands(RegisterCommandsEvent event) {
-        event.getDispatcher().register(Commands.literal("wirefixture"));
+        event.getDispatcher().register(Commands.literal("wirefixture").executes(context -> {
+            var source = context.getSource();
+            var pos = source.getPosition();
+            source.getLevel().setBlock(new BlockPos(pos.getX(), pos.getY() + 2, pos.getZ()),
+                new BlockState(14), 3);
+            source.sendSuccess(Component.literal("fixture command at " + pos.getX() + " " + pos.getY()
+                + " " + pos.getZ()), false);
+            return 1;
+        }));
         event.getDispatcher().register(Commands.literal("stop"));
     }
 
@@ -215,9 +223,16 @@ def exercise(binary, root, jar):
             assert "stop" not in player.initial_tree, "mod literal must not expose operator command"
             await_message(player, "fixture login 0")
             await_message(player, "fixture S3 player tick")
-            assert "without a handler" in rcon_command(rcon, COMMAND)
+            assert rcon_command(rcon, COMMAND) == "fixture command at 0 16 0"
+            await_update(player, (0, 18, 0), 14)
+            rcon_command(rcon, "setblock 0 18 0 air")
+            await_update(player, (0, 18, 0), 0)
+            x, y, z = [math.floor(axis) for axis in player.pos]
+            seen = len(player.updates)
             player.send(0x04, string(COMMAND))
-            await_message(player, "The NeoForge shim exposes this command literal without a handler")
+            await_message(player, f"fixture command at {x} {y} {z}")
+            if ((x, y + 2, z), 14) not in player.updates[seen:]:
+                await_update(player, (x, y + 2, z), 14)
             assert rcon_command(rcon, "gamemode creative NeoWire")
 
             x, y, z = [math.floor(axis) for axis in player.pos]
@@ -300,4 +315,4 @@ if __name__ == "__main__":
         rejected_startup(binary, root / "rejected", rejected)
         exercise(binary, root / "live", good)
     print("NeoForge live wire PASS: admission, S1, S2 IDs, S3 player tick, S4 targeted/broadcast")
-    print("Pinned Java shim boundaries: canceled S1 batches are empty and commands expose literals")
+    print("NeoForge commands: Play and RCON handlers deliver feedback and commit block mutations")

@@ -1681,6 +1681,38 @@ pub(crate) struct References {
     rng_after: HashMap<(usize, usize), (u64, u64)>,
 }
 
+/// The structure and piece boxes of each fortress referenced by this chunk.
+pub(crate) fn fortress_spawn_bounds(g: &mut Gen, cx: i32, cz: i32) -> Vec<(BB, Vec<BB>)> {
+    let Some(d) = defs() else {
+        return Vec::new();
+    };
+    let sets: Vec<_> = d
+        .sets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, set)| {
+            set.entries
+                .iter()
+                .any(|(id, _)| id == "minecraft:fortress")
+                .then_some(index)
+        })
+        .collect();
+    let mut bounds = Vec::new();
+    for (x, z) in window_admitted_chunks(d, g, &sets, cx, cz) {
+        for start in starts_cached(g, x, z).iter() {
+            if let StartPieces::Fortress { pieces, .. } = &start.pieces {
+                if start.intersects_chunk(cx, cz) {
+                    bounds.push((
+                        start.bbox,
+                        pieces.iter().map(|piece| piece.bounds).collect(),
+                    ));
+                }
+            }
+        }
+    }
+    bounds
+}
+
 impl References {
     pub(crate) fn collect(g: &mut Gen, cx: i32, cz: i32) -> Self {
         let Some(d) = defs() else {

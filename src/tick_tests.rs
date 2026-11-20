@@ -90,6 +90,7 @@ fn d1_reload_saved_drop_eid_does_not_collide_with_mob() {
     let _runtime = RuntimeRegistrySnapshot::take();
     NEXT_EID.store(1000, Ordering::SeqCst);
     mobs().lock().unwrap().push(Arc::new(Mob {
+        dim: DimId::Overworld,
         eid: 1001,
         uuid: [0; 16],
         etype: 22,
@@ -129,6 +130,39 @@ fn d1_reload_saved_drop_eid_does_not_collide_with_mob() {
     assert_eq!(drop_ids, [1000]);
     assert_ne!(mob_ids[0], drop_ids[0]);
     assert!(NEXT_EID.load(Ordering::SeqCst) > mob_ids[0].max(drop_ids[0]));
+}
+
+#[test]
+fn gp2_saved_mob_dimensions_follow_legacy_record_order() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    WORLD_SEED.store(4242, Ordering::Relaxed);
+    WORLD_SPAWN.lock().unwrap().3 = 45.0;
+    world_border().lock().unwrap().center_x = 12.5;
+    let pos = (0.5, 70.0, 0.5, 0.0, 0.0);
+    for dim in DimId::ALL {
+        assert!(insert_live_mob(22, dim, pos, 10.0, None));
+    }
+    let mut saved = Vec::new();
+    save_world_into(&mut saved);
+    let (without_seed, seed) = read_world_seed_footer(&saved).unwrap();
+    assert_eq!(seed, Some(4242));
+    let (legacy, dimensions) = read_mob_dimensions_footer(without_seed).unwrap();
+    assert_eq!(dimensions, DimId::ALL);
+    for (payload, expected) in [
+        (saved.as_slice(), DimId::ALL),
+        (legacy, [DimId::Overworld; 3]),
+    ] {
+        mobs().lock().unwrap().clear();
+        WORLD_SPAWN.lock().unwrap().3 = 0.0;
+        *world_border().lock().unwrap() = WorldBorderState::default();
+        load_world_from(payload).unwrap();
+        let actual: Vec<_> = mobs().lock().unwrap().iter().map(|mob| mob.dim).collect();
+        assert_eq!(actual, expected);
+        assert_eq!(world_border().lock().unwrap().center_x, 12.5);
+        assert_eq!(WORLD_SPAWN.lock().unwrap().3, 45.0);
+    }
 }
 
 #[test]
@@ -2372,6 +2406,7 @@ fn profile_game_tick() {
                     .unwrap()
                     .insert(ow_block((x as i32, y as i32, z as i32)), (i % 7) as u8);
                 mobs().lock().unwrap().push(Arc::new(Mob {
+                    dim: DimId::Overworld,
                     eid: 22_000 + i,
                     uuid: [0u8; 16],
                     etype: 124,
@@ -4821,6 +4856,7 @@ fn arrow_sweep_outcome(target_x: f64, velocity: f64) -> (Option<f32>, Option<f64
     });
     // One target isolates intersection from entity ordering or block occlusion.
     mobs().lock().unwrap().push(Arc::new(Mob {
+        dim: DimId::Overworld,
         eid: 8101,
         uuid: [0u8; 16],
         etype: 124,
@@ -6953,6 +6989,7 @@ fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
     // Sitting cat (`etype == 15`) intersecting AABB(x, y+1, z, x+1, y+2, z+1) blocks either half.
     let cat_eid = 910_001;
     let cat = Arc::new(Mob {
+        dim: DimId::Overworld,
         eid: cat_eid,
         uuid: [0xCA; 16],
         etype: 15,
@@ -8021,6 +8058,7 @@ impl std::ops::Drop for Travel4dWorld {
 
 fn test_mob(eid: i32, etype: i64, pos: (f64, f64, f64), hp: f32) -> Arc<Mob> {
     Arc::new(Mob {
+        dim: DimId::Overworld,
         eid,
         uuid: [0u8; 16],
         etype,

@@ -124,6 +124,12 @@ pub(crate) enum S1Event<T> {
         player: (i32, T),
         raw_text: T,
     },
+    Command {
+        dim: u8,
+        pos: (i32, i32, i32),
+        name: T,
+        literal: T,
+    },
     RegisterCommands,
 }
 
@@ -219,6 +225,23 @@ pub(crate) fn dispatch_s1_event(
                         JValue::Int(eid),
                         JValue::Object(&name),
                         JValue::Object(&raw_text),
+                    ],
+                )
+            }
+            S1Event::Command { dim, pos: (x, y, z), name, literal } => {
+                let name = env.new_string(name.as_ref())?;
+                let literal = env.new_string(literal.as_ref())?;
+                env.call_static_method(
+                    hooks,
+                    "dispatchCommandEncoded",
+                    "(IIIILjava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    &[
+                        JValue::Int(i32::from(dim)),
+                        JValue::Int(x),
+                        JValue::Int(y),
+                        JValue::Int(z),
+                        JValue::Object(&name),
+                        JValue::Object(&literal),
                     ],
                 )
             }

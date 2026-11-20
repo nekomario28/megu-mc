@@ -432,6 +432,7 @@ mod entity_push_tests {
 
     fn spawn_test_mob(eid: i32, etype: i64, x: f64, y: f64, z: f64, hp: f32) -> Arc<Mob> {
         Arc::new(Mob {
+            dim: DimId::Overworld,
             eid,
             uuid: [eid as u8; 16],
             etype,

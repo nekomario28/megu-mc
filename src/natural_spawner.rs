@@ -579,7 +579,7 @@ fn has_room_for_nightly_monster(mobs: &[Arc<Mob>], monster_cap: usize) -> bool {
     mobs.len() < MOB_CAP
         && mobs
             .iter()
-            .filter(|mob| entity_category_1211(mob.etype) == EntityMobCategory::Monster)
+            .filter(|mob| mob.dim == DimId::Overworld && entity_category_1211(mob.etype) == EntityMobCategory::Monster)
             .take(monster_cap)
             .count()
             < monster_cap
@@ -632,11 +632,15 @@ impl OverworldMonsterLight {
 }
 
 fn nightly_spawn_light_sources(clients: &[Arc<Client>], cx: i32, cz: i32) -> GenSources {
+    natural_spawn_light_sources(clients, DimId::Overworld, cx, cz)
+}
+
+fn natural_spawn_light_sources(clients: &[Arc<Client>], dim: DimId, cx: i32, cz: i32) -> GenSources {
     let mut nearby = GenSources::new();
     for client in clients {
         // Chunk streaming takes these locks in this order.
         let sources = client.gen_sources.lock().unwrap();
-        if *client.dim.lock().unwrap() != DimId::Overworld {
+        if *client.dim.lock().unwrap() != dim {
             continue;
         }
         for dx in -1..=1 {
@@ -781,7 +785,7 @@ fn try_nightly_monster_at(
         if !has_room_for_nightly_monster(&current_mobs, cap) {
             return NightlySpawnAttempt::AtCap;
         }
-        if current_mobs.iter().any(|mob| {
+        if current_mobs.iter().filter(|mob| mob.dim == DimId::Overworld).any(|mob| {
             let (x, y, z, ..) = *mob.pos.lock().unwrap();
             let (width, height) = entity_dimensions_1211(mob.etype);
             bounds.intersects(EntityAabb::from_dimensions(x, y, z, width, height))
@@ -795,6 +799,7 @@ fn try_nightly_monster_at(
         uuid[6] = (uuid[6] & 15) | 64;
         uuid[8] = (uuid[8] & 63) | 128;
         push_natural_hostile(&mut current_mobs, Arc::new(Mob {
+            dim: DimId::Overworld,
             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
             uuid,
             etype,
@@ -1582,3 +1587,382 @@ mod natural_spawner_tests {
 }
 
 include!("nether_spawn_rules.rs");
+
+fn nether_spawn_cycle() -> u64 {
+    static EVERY_TICK: OnceLock<bool> = OnceLock::new();
+    if cfg!(debug_assertions)
+        && *EVERY_TICK.get_or_init(|| {
+            std::env::var("MC_SPINE_TEST_NETHER_SPAWN_EVERY_TICK").as_deref() == Ok("1")
+        })
+    {
+        1
+    } else {
+        server_ticks(20)
+    }
+}
+
+const NETHER_SPAWN_DIM: DimId = DimId::Nether;
+
+struct LiveNetherSpawnQueries<'a> {
+    reg: &'a BReg,
+    clients: &'a [Arc<Client>],
+    light: RefCell<HashMap<(i32, i32), Vec<[u8; 2048]>>>,
+}
+
+impl LiveNetherSpawnQueries<'_> {
+    fn state(&self, pos: NaturalSpawnPos) -> u32 {
+        if !(NETHER_SPAWN_DIM.min_y()..NETHER_SPAWN_DIM.height()).contains(&pos.y) {
+            return 0;
+        }
+        overlay_block_dim(NETHER_SPAWN_DIM, pos.x, pos.y, pos.z)
+            .or_else(|| stored_state(NETHER_SPAWN_DIM, pos.x, pos.y, pos.z))
+            .unwrap_or_else(|| base_state_dim(NETHER_SPAWN_DIM, pos.x, pos.y, pos.z))
+    }
+
+    fn placement_context(
+        &self,
+        pos: NaturalSpawnPos,
+        mob: NetherSpawnMob,
+    ) -> SpawnPlacementContext {
+        let clear = |state| {
+            !self.reg.is_collision_shape_full_block(state)
+                && !self.reg.is_redstone_conductor(state)
+                && !self.reg.is_liquid(state)
+                && !self
+                    .reg
+                    .in_tag(state, "minecraft:prevent_mob_spawning_inside")
+        };
+        SpawnPlacementContext {
+            ground_supports_spawn: self.is_valid_spawn(nether_spawn_below(pos), mob),
+            clear_here: clear(self.state(pos)),
+            clear_above: clear(self.state(NaturalSpawnPos {
+                y: pos.y + 1,
+                ..pos
+            })),
+            lava_here: self.is_lava(pos),
+            ..SpawnPlacementContext::default()
+        }
+    }
+}
+
+impl NetherSpawnQueries for LiveNetherSpawnQueries<'_> {
+    fn is_peaceful(&self) -> bool {
+        DIFFICULTY.load(Ordering::Relaxed) == 0
+    }
+
+    fn block_id(&self, pos: NaturalSpawnPos) -> &str {
+        self.reg.name_of(self.state(pos))
+    }
+
+    fn block_light(&self, pos: NaturalSpawnPos) -> i32 {
+        let chunk = (pos.x >> 4, pos.z >> 4);
+        let mut cache = self.light.borrow_mut();
+        let sections = cache.entry(chunk).or_insert_with(|| {
+            let sources =
+                natural_spawn_light_sources(self.clients, NETHER_SPAWN_DIM, chunk.0, chunk.1);
+            block_light_sections_dim(NETHER_SPAWN_DIM, chunk.0, chunk.1, &sources)
+        });
+        nibble_at_dim(sections, NETHER_SPAWN_DIM, pos.x, pos.y, pos.z)
+    }
+
+    fn is_valid_spawn(&self, pos: NaturalSpawnPos, _mob: NetherSpawnMob) -> bool {
+        let state = self.state(pos);
+        // BlockBehaviour.Properties defaults to a sturdy up face and emitted light below 14.
+        // Bedrock and barrier override that predicate for every Nether spawn type.
+        self.reg.side_solid(state, 1)
+            && self.reg.luminance_of(state) < 14
+            && !matches!(
+                self.reg.name_of(state),
+                "minecraft:bedrock" | "minecraft:barrier"
+            )
+    }
+
+    fn is_lava(&self, pos: NaturalSpawnPos) -> bool {
+        self.block_id(pos) == "minecraft:lava"
+    }
+
+    fn is_air(&self, pos: NaturalSpawnPos) -> bool {
+        self.reg.is_air(self.state(pos))
+    }
+}
+
+fn spawn_nether_natural(tick: u64) {
+    let clients = client_snapshot();
+    let players: Vec<_> = clients
+        .iter()
+        .filter_map(|client| {
+            if client.is_spectator() {
+                return None;
+            }
+            let (dim, x, y, z, ..) = client_dim_pos(client);
+            (dim == NETHER_SPAWN_DIM).then_some((client.eid as u64, [x, y, z]))
+        })
+        .collect();
+    let Some(reg) = breg().filter(|_| !players.is_empty()) else {
+        return;
+    };
+
+    let mut chunks = HashMap::<_, Vec<_>>::new();
+    let mut loaded = HashSet::new();
+    for client in &clients {
+        let held = client.chunks.lock().unwrap();
+        if *client.dim.lock().unwrap() == NETHER_SPAWN_DIM {
+            loaded.extend(held.iter().copied());
+        }
+    }
+    for &(eid, [x, _, z]) in &players {
+        let (cx, cz) = (x.floor() as i32 >> 4, z.floor() as i32 >> 4);
+        for dx in -NATURAL_SPAWN_CHUNK_RADIUS..=NATURAL_SPAWN_CHUNK_RADIUS {
+            for dz in -NATURAL_SPAWN_CHUNK_RADIUS..=NATURAL_SPAWN_CHUNK_RADIUS {
+                chunks.entry((cx + dx, cz + dz)).or_default().push(eid);
+            }
+        }
+    }
+    let mut caps = NaturalSpawnState::new(chunks.len() as u32, true);
+    let mut census = Vec::new();
+    {
+        let current = mobs().lock().unwrap();
+        if current.len() >= MOB_CAP {
+            return;
+        }
+        for mob in current.iter().filter(|mob| mob.dim == NETHER_SPAWN_DIM) {
+            let Some(spec) = entity_spec_by_id(mob.etype) else {
+                continue;
+            };
+            let category = match spec.category {
+                EntityMobCategory::Monster => MobCategory::Monster,
+                EntityMobCategory::Creature => MobCategory::Creature,
+                _ => continue,
+            };
+            if *mob.hp.lock().unwrap() <= 0.0 {
+                continue;
+            }
+            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            let pos = NaturalSpawnPos {
+                x: x.floor() as i32,
+                y: y.floor() as i32,
+                z: z.floor() as i32,
+            };
+            let chunk = (pos.x >> 4, pos.z >> 4);
+            caps.count_existing(
+                category,
+                pos,
+                None,
+                chunks.get(&chunk).map_or(&[], Vec::as_slice),
+            );
+            census.push((spec.name, pos));
+        }
+    }
+
+    // Seed this pass without advancing the existing Overworld spawn RNG.
+    let mut rng =
+        Lcg::new(WORLD_SEED.load(Ordering::Relaxed) ^ tick.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let [px, py, pz] = players[rng.next_bound(players.len() as i32) as usize].1;
+    let angle = f64::from(rng.next_f32()) * std::f64::consts::TAU;
+    let x = (px + angle.cos() * 32.0).floor() as i32;
+    let z = (pz + angle.sin() * 32.0).floor() as i32;
+    if !loaded.contains(&(x >> 4, z >> 4)) {
+        return;
+    }
+    let query = LiveNetherSpawnQueries {
+        reg,
+        clients: &clients,
+        light: RefCell::default(),
+    };
+    // The Nether has many floors below the roof. Sample a slice near the anchor,
+    // then look down for one open surface instead of using the column's top.
+    let top = (py.floor() as i32 + rng.next_bound(32) - 8).clamp(1, NETHER_SPAWN_DIM.height() - 2);
+    let Some(origin) = ((top - 15).max(1)..=top).rev().find_map(|y| {
+        let pos = NaturalSpawnPos { x, y, z };
+        let site = query.placement_context(pos, NetherSpawnMob::Skeleton);
+        (SpawnPlacementType::OnGround.allows(site) || site.lava_here).then_some(pos)
+    }) else {
+        return;
+    };
+    let mut costs = SpawnCostState::from_existing(census, |pos, chunk| {
+        if !loaded.contains(&chunk) {
+            return None;
+        }
+        worldgen::with_gen_dim(NETHER_SPAWN_DIM, |gen| {
+            gen.biome_name_at(pos.x, pos.y, pos.z)
+        })
+        .flatten()
+    });
+    static RULES: OnceLock<NetherSpawnRules> = OnceLock::new();
+    let rules = RULES.get_or_init(NetherSpawnRules::vanilla);
+    let (min_x, min_z, max_x, max_z) = world_border().lock().unwrap().bounds(border_now_ms());
+    // DerivedLevelData uses the same shared spawn position in the Nether.
+    let (sx, sy, sz, _) = *WORLD_SPAWN.lock().unwrap();
+    let mut fortresses = HashMap::new();
+    let inside = |bb: &[i32; 6], pos: NaturalSpawnPos| {
+        (bb[0]..=bb[3]).contains(&pos.x)
+            && (bb[1]..=bb[4]).contains(&pos.y)
+            && (bb[2]..=bb[5]).contains(&pos.z)
+    };
+    for category in [MobCategory::Monster, MobCategory::Creature] {
+        if (category == MobCategory::Monster && query.is_peaceful())
+            || (category == MobCategory::Creature && !tick.is_multiple_of(server_ticks(400)))
+        {
+            continue;
+        }
+        let mut spawned = 0;
+        'packs: for _ in 0..3 {
+            let mut pack = SpawnPack::new(origin, rng.next_f32());
+            let mut selected = None;
+            while let Some(pos) = pack.next_pos(|bound| rng.next_bound(bound)) {
+                let chunk = (pos.x >> 4, pos.z >> 4);
+                if !loaded.contains(&chunk)
+                    || !(min_x..max_x).contains(&f64::from(pos.x))
+                    || !(min_z..max_z).contains(&f64::from(pos.z))
+                {
+                    continue;
+                }
+                let Some(nearby) = chunks.get(&chunk) else {
+                    continue;
+                };
+                let (x, y, z) = (
+                    f64::from(pos.x) + 0.5,
+                    f64::from(pos.y),
+                    f64::from(pos.z) + 0.5,
+                );
+                let dist = players
+                    .iter()
+                    .map(|(_, [px, py, pz])| (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2))
+                    .fold(f64::INFINITY, f64::min);
+                let spawn_dist = (sx.floor() + 0.5 - x).powi(2)
+                    + (sy.floor() + 0.5 - y).powi(2)
+                    + (sz.floor() + 0.5 - z).powi(2);
+                if spawn_dist < SPAWN_MIN_PLAYER_DIST_SQ
+                    || !can_spawn_at_distance(dist, category)
+                    || !caps.can_spawn(category, pos, None, nearby)
+                {
+                    continue;
+                }
+                let Some(biome) = worldgen::with_gen_dim(NETHER_SPAWN_DIM, |gen| {
+                    let (_, leaf) = gen.biome_blended(pos.x, pos.y, pos.z)?;
+                    gen.biome_name_of_leaf(leaf)
+                })
+                .flatten() else {
+                    return;
+                };
+                let entries = rules.spawners_at(
+                    &biome,
+                    category,
+                    pos,
+                    |below| query.block_id(below) == "minecraft:nether_bricks",
+                    |pos, check| {
+                        let bounds = fortresses.entry(chunk).or_insert_with(|| {
+                            worldgen::with_gen_dim(NETHER_SPAWN_DIM, |gen| {
+                                feature::fortress_spawn_bounds(gen, chunk.0, chunk.1)
+                            })
+                            .unwrap_or_default()
+                        });
+                        bounds.iter().any(|(structure, pieces)| match check {
+                            NetherFortressBounds::Structure => inside(structure, pos),
+                            NetherFortressBounds::Piece => {
+                                pieces.iter().any(|piece| inside(piece, pos))
+                            }
+                        })
+                    },
+                );
+                let entry = match selected {
+                    Some(entry) => entry,
+                    None => {
+                        let Some(entry) =
+                            choose_nether_spawner(entries, |bound| rng.next_bound(bound))
+                        else {
+                            break;
+                        };
+                        pack.attempts =
+                            entry.min_count + rng.next_bound(entry.max_count - entry.min_count + 1);
+                        selected = Some(entry);
+                        entry
+                    }
+                };
+                let Some(mob) = NetherSpawnMob::from_id(&entry.kind) else {
+                    continue;
+                };
+                if !entries.iter().any(|current| std::ptr::eq(current, entry))
+                    || !mob.placement().0.allows(query.placement_context(pos, mob))
+                    || !rules.allows(mob, pos, &query, |bound| rng.next_bound(bound))
+                    || !costs.can_spawn(&entry.kind, pos, chunk)
+                {
+                    continue;
+                }
+                let spec = entity_spec_by_name(&entry.kind).expect("registered Nether spawn type");
+                let bounds = EntityAabb::from_dimensions(x, y, z, spec.width, spec.height);
+                let yaw = rng.next_f32() * 360.0;
+                let inserted = with_save_guard(|| {
+                    if !live_mob_block_boxes(NETHER_SPAWN_DIM, reg, bounds.min(), bounds.max())
+                        .is_empty()
+                        || nether_spawn_in_fluid(&query, bounds, mob)
+                    {
+                        return false;
+                    }
+                    let mut current = mobs().lock().unwrap();
+                    if current.len() >= MOB_CAP
+                        || current.iter().any(|other| {
+                            if other.dim != NETHER_SPAWN_DIM {
+                                return false;
+                            }
+                            let (x, y, z, ..) = *other.pos.lock().unwrap();
+                            let (w, h) = entity_dimensions_1211(other.etype);
+                            bounds.intersects(EntityAabb::from_dimensions(x, y, z, w, h))
+                        })
+                    {
+                        return false;
+                    }
+                    let mob = new_live_mob(
+                        spec.id,
+                        NETHER_SPAWN_DIM,
+                        (x, y, z, yaw, 0.0),
+                        spec.max_health,
+                        None,
+                    );
+                    if category == MobCategory::Monster {
+                        push_natural_hostile(&mut current, mob);
+                    } else {
+                        current.push(mob);
+                    }
+                    true
+                });
+                if inserted {
+                    costs.after_spawn(&entry.kind, pos, chunk);
+                    caps.record_success(category, pos, None, nearby);
+                    spawned += 1;
+                    if spawned
+                        >= if mob == NetherSpawnMob::Ghast {
+                            1
+                        } else {
+                            NIGHTLY_MONSTER_CLUSTER_LIMIT
+                        }
+                    {
+                        break 'packs;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn nether_spawn_in_fluid(
+    query: &LiveNetherSpawnQueries<'_>,
+    bounds: EntityAabb,
+    mob: NetherSpawnMob,
+) -> bool {
+    // Striders use their own obstruction check, permitting lava in the AABB.
+    if mob == NetherSpawnMob::Strider {
+        return false;
+    }
+    let [min_x, min_y, min_z] = bounds.min().map(|v| v.floor() as i32);
+    let [max_x, max_y, max_z] = bounds.max().map(|v| v.ceil() as i32);
+    (min_x..max_x).any(|x| {
+        (min_y..max_y).any(|y| {
+            (min_z..max_z).any(|z| {
+                query
+                    .reg
+                    .is_liquid(query.state(NaturalSpawnPos { x, y, z }))
+            })
+        })
+    })
+}
