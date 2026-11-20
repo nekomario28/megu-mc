@@ -66,6 +66,38 @@ enum PoiKind {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+fn poi_kind_from_block_name(block_name: &str) -> Option<PoiKind> {
+    let name = block_name.strip_prefix("minecraft:").unwrap_or(block_name);
+    if matches!(name, "bell") {
+        return Some(PoiKind::Bell);
+    }
+    if name.strip_suffix("_bed").is_some_and(|color| {
+        matches!(
+            color,
+            "white"
+                | "orange"
+                | "magenta"
+                | "light_blue"
+                | "yellow"
+                | "lime"
+                | "pink"
+                | "gray"
+                | "light_gray"
+                | "cyan"
+                | "purple"
+                | "blue"
+                | "brown"
+                | "green"
+                | "red"
+                | "black"
+        )
+    }) {
+        return Some(PoiKind::Bed);
+    }
+    VillagerProfession::from_job_site(block_name).map(PoiKind::JobSite)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 struct PoiRecord {
     kind: PoiKind,
     claimants: Vec<VillageUuid>,
@@ -136,6 +168,45 @@ impl PoiRegistry {
             (in_range && !poi.claimants.is_empty()).then_some(((x, y, z), poi.kind))
         })
     }
+}
+
+/// Reconcile an inclusive world-space box against BReg block states.
+/// Only a bed's head is a vanilla home POI. The caller supplies loaded states
+/// from one dimension; removed or changed sites invalidate their old claims.
+#[cfg_attr(not(test), allow(dead_code))]
+fn scan_poi_box(
+    pois: &mut PoiRegistry,
+    reg: &crate::block_registry::BReg,
+    min: BlockPos,
+    max: BlockPos,
+    mut state_at: impl FnMut(BlockPos) -> u32,
+) -> usize {
+    let mut found = 0;
+    for x in min.0..=max.0 {
+        for y in min.1..=max.1 {
+            for z in min.2..=max.2 {
+                let pos = (x, y, z);
+                let state = state_at(pos);
+                let mut kind = poi_kind_from_block_name(reg.name_of(state));
+                if kind == Some(PoiKind::Bed)
+                    && !reg.properties_of(state).is_some_and(|properties| {
+                        properties
+                            .iter()
+                            .any(|(key, value)| key == "part" && value == "head")
+                    })
+                {
+                    kind = None;
+                }
+                if let Some(kind) = kind {
+                    pois.register(pos, kind);
+                    found += 1;
+                } else {
+                    pois.remove(pos);
+                }
+            }
+        }
+    }
+    found
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -234,6 +305,280 @@ impl MerchantOffer {
         }
         self
     }
+}
+
+/// Protocol 767's MerchantOffer carries item identities in its ItemCosts.
+/// The village's offer model already owns the pricing, uses and result fields.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WireMerchantOffer {
+    offer: MerchantOffer,
+    base_cost_a_id: i32,
+    cost_b_id: Option<i32>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+struct DecodedMerchantOffers {
+    window_id: i32,
+    offers: Vec<WireMerchantOffer>,
+    villager_level: VillagerLevel,
+    villager_xp: i32,
+    show_progress: bool,
+    can_restock: bool,
+}
+
+/// Payload only. The packet dispatcher supplies clientbound play ID 0x2e.
+/// Plain ItemCosts have an empty data-components predicate, and result Slots
+/// have no added or removed components in this model.
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_merchant_offers_pkt(packet: &DecodedMerchantOffers) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_varint(&mut out, i64::from(packet.window_id));
+    write_varint(&mut out, packet.offers.len() as i64);
+    for entry in &packet.offers {
+        let offer = entry.offer;
+        write_varint(&mut out, i64::from(entry.base_cost_a_id));
+        write_varint(&mut out, i64::from(offer.base_cost_a_count));
+        write_varint(&mut out, 0); // ItemCost component predicate count
+
+        write_varint(&mut out, i64::from(offer.result_count));
+        if offer.result_count > 0 {
+            write_varint(&mut out, i64::from(offer.result_id));
+            write_varint(&mut out, 0); // added components
+            write_varint(&mut out, 0); // removed components
+        }
+
+        out.push(u8::from(entry.cost_b_id.is_some()));
+        if let Some(id) = entry.cost_b_id {
+            write_varint(&mut out, i64::from(id));
+            write_varint(&mut out, i64::from(offer.cost_b_count));
+            write_varint(&mut out, 0);
+        }
+        out.push(u8::from(offer.uses >= offer.max_uses));
+        out.extend_from_slice(&offer.uses.to_be_bytes());
+        out.extend_from_slice(&offer.max_uses.to_be_bytes());
+        out.extend_from_slice(&offer.xp_reward.to_be_bytes());
+        out.extend_from_slice(&offer.special_price_diff.to_be_bytes());
+        out.extend_from_slice(&offer.price_multiplier.to_be_bytes());
+        out.extend_from_slice(&offer.demand.to_be_bytes());
+    }
+    write_varint(&mut out, packet.villager_level as i64);
+    write_varint(&mut out, i64::from(packet.villager_xp));
+    out.push(u8::from(packet.show_progress));
+    out.push(u8::from(packet.can_restock));
+    out
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn decode_merchant_offers_pkt(data: &[u8]) -> Option<DecodedMerchantOffers> {
+    fn boolean(data: &mut &[u8]) -> Option<bool> {
+        let (&value, rest) = data.split_first()?;
+        *data = rest;
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    fn be_i32(data: &mut &[u8]) -> Option<i32> {
+        let (value, rest) = data.split_at_checked(4)?;
+        *data = rest;
+        Some(i32::from_be_bytes(value.try_into().ok()?))
+    }
+
+    let mut data = data;
+    let window_id = read_protocol_i32(&mut data)?;
+    let count = usize::try_from(read_protocol_i32(&mut data)?).ok()?;
+    if count > data.len() / 28 {
+        return None;
+    }
+    let mut offers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let base_cost_a_id = read_protocol_i32(&mut data)?;
+        let base_cost_a_count = read_protocol_i32(&mut data)?;
+        if base_cost_a_id <= 0 || base_cost_a_count <= 0 || read_protocol_i32(&mut data)? != 0 {
+            return None;
+        }
+        let result_count = read_protocol_i32(&mut data)?;
+        if result_count <= 0 || result_count > u8::MAX as i32 {
+            return None;
+        }
+        let result_id = read_protocol_i32(&mut data)?;
+        if result_id <= 0
+            || read_protocol_i32(&mut data)? != 0
+            || read_protocol_i32(&mut data)? != 0
+        {
+            return None;
+        }
+        let (cost_b_id, cost_b_count) = if boolean(&mut data)? {
+            let id = read_protocol_i32(&mut data)?;
+            let count = read_protocol_i32(&mut data)?;
+            if id <= 0 || count <= 0 || read_protocol_i32(&mut data)? != 0 {
+                return None;
+            }
+            (Some(id), count)
+        } else {
+            (None, 0)
+        };
+        let out_of_stock = boolean(&mut data)?;
+        let uses = be_i32(&mut data)?;
+        let max_uses = be_i32(&mut data)?;
+        let xp_reward = be_i32(&mut data)?;
+        let special_price_diff = be_i32(&mut data)?;
+        let (multiplier_bytes, rest) = data.split_at_checked(4)?;
+        data = rest;
+        let price_multiplier = f32::from_be_bytes(multiplier_bytes.try_into().ok()?);
+        let demand = be_i32(&mut data)?;
+        if uses < 0
+            || max_uses <= 0
+            || xp_reward < 0
+            || !price_multiplier.is_finite()
+            || out_of_stock != (uses >= max_uses)
+        {
+            return None;
+        }
+        offers.push(WireMerchantOffer {
+            offer: MerchantOffer {
+                base_cost_a_count,
+                cost_b_count,
+                result_id: result_id as u32,
+                result_count,
+                uses,
+                max_uses,
+                xp_reward,
+                price_multiplier,
+                demand,
+                special_price_diff,
+            },
+            base_cost_a_id,
+            cost_b_id,
+        });
+    }
+    let villager_level = match read_protocol_i32(&mut data)? {
+        1 => VillagerLevel::Novice,
+        2 => VillagerLevel::Apprentice,
+        3 => VillagerLevel::Journeyman,
+        4 => VillagerLevel::Expert,
+        5 => VillagerLevel::Master,
+        _ => return None,
+    };
+    let villager_xp = read_protocol_i32(&mut data)?;
+    if villager_xp < 0 {
+        return None;
+    }
+    let show_progress = boolean(&mut data)?;
+    let can_restock = boolean(&mut data)?;
+    data.is_empty().then_some(DecodedMerchantOffers {
+        window_id,
+        offers,
+        villager_level,
+        villager_xp,
+        show_progress,
+        can_restock,
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TradeRejection {
+    Unavailable,
+    StaleOffer,
+    OutOfStock,
+    InvalidOffer,
+    WrongItemA,
+    WrongItemB,
+    InsufficientPaymentA,
+    InsufficientPaymentB,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+struct TradeExecutionOutcome {
+    result: Stack,
+    consumed_a: u8,
+    consumed_b: u8,
+    villager_xp: i32,
+    level_before: VillagerLevel,
+    level_after: VillagerLevel,
+}
+
+/// Two mutable merchant input slots are the transaction boundary. Validation
+/// completes before either slot, offer usage or gossip is changed.
+#[cfg_attr(not(test), allow(dead_code))]
+fn execute_trade_transaction(
+    villager: &mut Villager,
+    pois: &PoiRegistry,
+    index: usize,
+    entry: &WireMerchantOffer,
+    player: VillageUuid,
+    hero_level: Option<u8>,
+    inputs: &mut [Stack; 2],
+) -> Result<TradeExecutionOutcome, TradeRejection> {
+    let offer = villager
+        .offer_for_customer(pois, index, player, hero_level)
+        .ok_or(TradeRejection::Unavailable)?;
+    if villager.offers[index] != entry.offer {
+        return Err(TradeRejection::StaleOffer);
+    }
+    if offer.uses >= offer.max_uses {
+        return Err(TradeRejection::OutOfStock);
+    }
+    if entry.base_cost_a_id <= 0
+        || offer.base_cost_a_count <= 0
+        || offer.max_uses <= 0
+        || offer.result_id == 0
+        || !(1..=u8::MAX as i32).contains(&offer.result_count)
+        || offer.xp_reward < 0
+        || entry.cost_b_id.is_some() != (offer.cost_b_count > 0)
+        || offer.cost_b_count < 0
+        || offer.cost_b_count > u8::MAX as i32
+        || offer.base_cost_a_count > u8::MAX as i32
+        || entry.cost_b_id.is_some_and(|id| id <= 0)
+    {
+        return Err(TradeRejection::InvalidOffer);
+    }
+    let required_a = u8::try_from(offer.cost_a()).map_err(|_| TradeRejection::InvalidOffer)?;
+    let required_b = offer.cost_b_count as u8;
+    if inputs[0].0 != i64::from(entry.base_cost_a_id) {
+        return Err(TradeRejection::WrongItemA);
+    }
+    if inputs[0].1 < required_a {
+        return Err(TradeRejection::InsufficientPaymentA);
+    }
+    if let Some(id) = entry.cost_b_id {
+        if inputs[1].0 != i64::from(id) {
+            return Err(TradeRejection::WrongItemB);
+        }
+        if inputs[1].1 < required_b {
+            return Err(TradeRejection::InsufficientPaymentB);
+        }
+    }
+
+    let level_before = villager.level();
+    inputs[0].1 -= required_a;
+    inputs[1].1 -= required_b;
+    for input in inputs.iter_mut() {
+        if input.1 == 0 {
+            *input = (0, 0, Vec::new());
+        }
+    }
+    villager.offers[index].uses += 1;
+    villager.villager_xp = villager.villager_xp.saturating_add(offer.xp_reward);
+    villager.gossip.add(player, GossipType::Trading, 2);
+    Ok(TradeExecutionOutcome {
+        result: (
+            i64::from(offer.result_id),
+            offer.result_count as u8,
+            Vec::new(),
+        ),
+        consumed_a: required_a,
+        consumed_b: required_b,
+        villager_xp: villager.villager_xp,
+        level_before,
+        level_after: villager.level(),
+    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -876,6 +1221,325 @@ mod villager_raid_tests {
             assert!(villager.claim_poi(&mut pois, pos));
         }
         (pois, villager)
+    }
+
+    fn wire_offer(with_b: bool) -> WireMerchantOffer {
+        WireMerchantOffer {
+            offer: MerchantOffer {
+                cost_b_count: if with_b { 2 } else { 0 },
+                ..offer()
+            },
+            base_cost_a_id: 13,
+            cost_b_id: with_b.then_some(42),
+        }
+    }
+
+    #[test]
+    fn merchant_offers_protocol_767_round_trip_all_fields() {
+        let mut sold_out = wire_offer(true);
+        sold_out.offer.uses = sold_out.offer.max_uses;
+        sold_out.offer.special_price_diff = -7;
+        sold_out.offer.demand = -21;
+        let packet = DecodedMerchantOffers {
+            window_id: 173,
+            offers: vec![wire_offer(false), sold_out],
+            villager_level: VillagerLevel::Journeyman,
+            villager_xp: 79,
+            show_progress: false,
+            can_restock: true,
+        };
+        let wire = encode_merchant_offers_pkt(&packet);
+        assert_eq!(&wire[..3], &[0xad, 0x01, 0x02]); // VarInt window + offer count
+        assert_eq!(decode_merchant_offers_pkt(&wire), Some(packet));
+
+        let one = DecodedMerchantOffers {
+            window_id: 4,
+            offers: vec![WireMerchantOffer {
+                offer: MerchantOffer {
+                    base_cost_a_count: 1,
+                    cost_b_count: 0,
+                    result_id: 2,
+                    result_count: 3,
+                    uses: 0,
+                    max_uses: 4,
+                    xp_reward: 5,
+                    price_multiplier: 0.5,
+                    demand: 6,
+                    special_price_diff: -1,
+                },
+                base_cost_a_id: 7,
+                cost_b_id: None,
+            }],
+            villager_level: VillagerLevel::Master,
+            villager_xp: 250,
+            show_progress: true,
+            can_restock: false,
+        };
+        let mut expected = vec![4, 1, 7, 1, 0, 3, 2, 0, 0, 0, 0];
+        expected.extend_from_slice(&0i32.to_be_bytes());
+        expected.extend_from_slice(&4i32.to_be_bytes());
+        expected.extend_from_slice(&5i32.to_be_bytes());
+        expected.extend_from_slice(&(-1i32).to_be_bytes());
+        expected.extend_from_slice(&0.5f32.to_be_bytes());
+        expected.extend_from_slice(&6i32.to_be_bytes());
+        expected.extend_from_slice(&[5, 0xfa, 0x01, 1, 0]);
+        assert_eq!(encode_merchant_offers_pkt(&one), expected);
+        assert_eq!(decode_merchant_offers_pkt(&expected), Some(one));
+    }
+
+    #[test]
+    fn merchant_offers_varint_list_length_and_malformed_payloads() {
+        let packet = DecodedMerchantOffers {
+            window_id: 1,
+            offers: vec![wire_offer(false); 130],
+            villager_level: VillagerLevel::Novice,
+            villager_xp: 0,
+            show_progress: true,
+            can_restock: true,
+        };
+        let wire = encode_merchant_offers_pkt(&packet);
+        assert_eq!(&wire[..3], &[1, 0x82, 0x01]);
+        assert_eq!(decode_merchant_offers_pkt(&wire), Some(packet));
+
+        let base = encode_merchant_offers_pkt(&DecodedMerchantOffers {
+            window_id: 1,
+            offers: vec![wire_offer(false)],
+            villager_level: VillagerLevel::Novice,
+            villager_xp: 0,
+            show_progress: true,
+            can_restock: true,
+        });
+        for cut in 0..base.len() {
+            assert!(
+                decode_merchant_offers_pkt(&base[..cut]).is_none(),
+                "cut={cut}"
+            );
+        }
+        let mut with_trailing = base.clone();
+        with_trailing.push(0);
+        assert!(decode_merchant_offers_pkt(&with_trailing).is_none());
+        let mut bad_predicate = base.clone();
+        bad_predicate[4] = 1;
+        assert!(decode_merchant_offers_pkt(&bad_predicate).is_none());
+        let mut bad_bool = base.clone();
+        bad_bool[9] = 2;
+        assert!(decode_merchant_offers_pkt(&bad_bool).is_none());
+        let mut bad_stock = base;
+        bad_stock[10] = 1;
+        assert!(decode_merchant_offers_pkt(&bad_stock).is_none());
+        assert!(decode_merchant_offers_pkt(&[1, 0xff, 0xff, 0xff, 0xff, 0x07]).is_none());
+    }
+
+    #[test]
+    fn trade_transaction_validates_items_discounts_and_levels() {
+        let (pois, mut villager) = village();
+        villager.offers.push(offer());
+        villager.gossip.cure(PLAYER);
+        let entry = WireMerchantOffer {
+            offer: offer(),
+            base_cost_a_id: 13,
+            cost_b_id: Some(42),
+        };
+        let mut inputs = [(13, 10, Vec::new()), (42, 3, Vec::new())];
+        let result = execute_trade_transaction(
+            &mut villager,
+            &pois,
+            0,
+            &entry,
+            PLAYER,
+            Some(2),
+            &mut inputs,
+        )
+        .unwrap();
+        assert_eq!(result.result, (42, 3, Vec::new()));
+        assert_eq!((result.consumed_a, result.consumed_b), (7, 2));
+        assert_eq!((inputs[0].1, inputs[1].1), (3, 1));
+        assert_eq!(result.villager_xp, 10);
+        assert_eq!(result.level_before, VillagerLevel::Novice);
+        assert_eq!(result.level_after, VillagerLevel::Apprentice);
+        assert_eq!(villager.offers[0].uses, 1);
+        assert_eq!(villager.gossip.reputation(PLAYER), 127);
+
+        let (pois, mut villager) = village();
+        villager.offers.push(wire_offer(false).offer);
+        let entry = wire_offer(false);
+        let mut inputs = [(13, 20, Vec::new()), (999, 8, Vec::new())];
+        let result =
+            execute_trade_transaction(&mut villager, &pois, 0, &entry, PLAYER, None, &mut inputs)
+                .unwrap();
+        assert_eq!(result.consumed_b, 0);
+        assert_eq!(inputs, [(0, 0, Vec::new()), (999, 8, Vec::new())]);
+    }
+
+    #[test]
+    fn rejected_trades_leave_inputs_usage_xp_and_gossip_intact() {
+        let (pois, mut villager) = village();
+        villager.offers.push(offer());
+        let entry = WireMerchantOffer {
+            offer: offer(),
+            base_cost_a_id: 13,
+            cost_b_id: Some(42),
+        };
+        for (inputs, expected) in [
+            (
+                [(99, 20, Vec::new()), (42, 2, Vec::new())],
+                TradeRejection::WrongItemA,
+            ),
+            (
+                [(13, 19, Vec::new()), (42, 2, Vec::new())],
+                TradeRejection::InsufficientPaymentA,
+            ),
+            (
+                [(13, 20, Vec::new()), (99, 2, Vec::new())],
+                TradeRejection::WrongItemB,
+            ),
+            (
+                [(13, 20, Vec::new()), (42, 1, Vec::new())],
+                TradeRejection::InsufficientPaymentB,
+            ),
+        ] {
+            let mut actual = inputs.clone();
+            assert_eq!(
+                execute_trade_transaction(
+                    &mut villager,
+                    &pois,
+                    0,
+                    &entry,
+                    PLAYER,
+                    None,
+                    &mut actual,
+                ),
+                Err(expected)
+            );
+            assert_eq!(actual, inputs);
+            assert_eq!(villager.offers[0].uses, 0);
+            assert_eq!(villager.villager_xp, 0);
+            assert_eq!(villager.gossip.reputation(PLAYER), 0);
+        }
+        let mut inputs = [(13, 20, Vec::new()), (42, 2, Vec::new())];
+        let mut stale = entry;
+        stale.offer.demand = 1;
+        assert_eq!(
+            execute_trade_transaction(&mut villager, &pois, 0, &stale, PLAYER, None, &mut inputs),
+            Err(TradeRejection::StaleOffer)
+        );
+        villager.offers[0].uses = 4;
+        assert_eq!(
+            execute_trade_transaction(&mut villager, &pois, 0, &entry, PLAYER, None, &mut inputs),
+            Err(TradeRejection::StaleOffer)
+        );
+        let mut sold_out = entry;
+        sold_out.offer.uses = 4;
+        assert_eq!(
+            execute_trade_transaction(
+                &mut villager,
+                &pois,
+                0,
+                &sold_out,
+                PLAYER,
+                None,
+                &mut inputs,
+            ),
+            Err(TradeRejection::OutOfStock)
+        );
+        assert_eq!(inputs, [(13, 20, Vec::new()), (42, 2, Vec::new())]);
+        assert_eq!(villager.offers[0].uses, 4);
+        assert_eq!(villager.gossip.reputation(PLAYER), 0);
+    }
+
+    #[test]
+    fn poi_classifier_covers_every_job_bed_color_and_cauldron() {
+        use VillagerProfession::*;
+        for (name, profession) in [
+            ("blast_furnace", Armorer),
+            ("smoker", Butcher),
+            ("cartography_table", Cartographer),
+            ("brewing_stand", Cleric),
+            ("composter", Farmer),
+            ("barrel", Fisherman),
+            ("fletching_table", Fletcher),
+            ("cauldron", Leatherworker),
+            ("water_cauldron", Leatherworker),
+            ("lava_cauldron", Leatherworker),
+            ("powder_snow_cauldron", Leatherworker),
+            ("lectern", Librarian),
+            ("stonecutter", Mason),
+            ("loom", Shepherd),
+            ("smithing_table", Toolsmith),
+            ("grindstone", Weaponsmith),
+        ] {
+            assert_eq!(
+                poi_kind_from_block_name(&format!("minecraft:{name}")),
+                Some(PoiKind::JobSite(profession))
+            );
+        }
+        for color in [
+            "white",
+            "orange",
+            "magenta",
+            "light_blue",
+            "yellow",
+            "lime",
+            "pink",
+            "gray",
+            "light_gray",
+            "cyan",
+            "purple",
+            "blue",
+            "brown",
+            "green",
+            "red",
+            "black",
+        ] {
+            assert_eq!(
+                poi_kind_from_block_name(&format!("minecraft:{color}_bed")),
+                Some(PoiKind::Bed)
+            );
+        }
+        assert_eq!(
+            poi_kind_from_block_name("minecraft:bell"),
+            Some(PoiKind::Bell)
+        );
+        for name in [
+            "minecraft:air",
+            "minecraft:furnace",
+            "minecraft:fake_bed",
+            "other:bell",
+            "other:blue_bed",
+        ] {
+            assert_eq!(poi_kind_from_block_name(name), Option::None, "{name}");
+        }
+    }
+
+    #[test]
+    fn poi_box_scanner_reconciles_head_and_deleted_sites() {
+        let reg = crate::block_registry::breg().expect("BReg");
+        let property = |part: &str| vec![("part".to_string(), part.to_string())];
+        let head = reg
+            .checked_state("minecraft:red_bed", &property("head"))
+            .unwrap();
+        let foot = reg
+            .checked_state("minecraft:red_bed", &property("foot"))
+            .unwrap();
+        let bell = reg.state_of("minecraft:bell", None);
+        let lectern = reg.state_of("minecraft:lectern", None);
+        let air = reg.state_of("minecraft:air", None);
+        let mut pois = PoiRegistry::default();
+        let scan = |pois: &mut PoiRegistry, states: [u32; 4]| {
+            scan_poi_box(pois, reg, (0, 64, 0), (3, 64, 0), |(x, _, _)| {
+                states[x as usize]
+            })
+        };
+        assert_eq!(scan(&mut pois, [head, foot, bell, lectern]), 3);
+        assert_eq!(pois.records.len(), 3);
+        assert!(!pois.records.contains_key(&(1, 64, 0)));
+        let owner = [7; 16];
+        assert!(pois.claim((0, 64, 0), owner));
+        assert_eq!(scan(&mut pois, [head, foot, bell, lectern]), 3);
+        assert!(pois.has_claim((0, 64, 0), PoiKind::Bed, owner));
+        assert_eq!(scan(&mut pois, [air, foot, bell, air]), 1);
+        assert!(!pois.records.contains_key(&(0, 64, 0)));
+        assert!(!pois.records.contains_key(&(3, 64, 0)));
     }
 
     #[test]
