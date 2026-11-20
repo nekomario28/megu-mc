@@ -805,16 +805,30 @@ fn interest_tick() {
             }),
         ));
     }
+    let mut entity_dims = HashMap::new();
     for m in mobs().lock().unwrap().iter() {
         let p = *m.pos.lock().unwrap();
+        entity_dims.insert(m.eid, live_mob_dim(m.eid));
         let m = m.clone();
         ents.push((
             m.eid,
             p.0,
             p.1,
             p.2,
-            Box::new(move || vec![(0x01, spawn_mob(&m))]),
+            Box::new(move || live_mob_spawn_packets(&m)),
         ));
+    }
+    for &projectile in live_mob_projectiles().lock().unwrap().iter() {
+        let [x, y, z] = projectile.pos;
+        entity_dims.insert(projectile.eid, projectile.dim);
+        ents.push((projectile.eid, x, y, z, Box::new(move || live_mob_projectile_packets(projectile))));
+    }
+    for cloud in live_dragon_clouds().lock().unwrap().iter() {
+        let (eid, [x, y, z]) = (cloud.eid, cloud.pos);
+        entity_dims.insert(eid, cloud.dim);
+        ents.push((eid, x, y, z, Box::new(move || {
+            vec![(0x01, spawn_typed_pkt(eid, 1, x, y, z))]
+        })));
     }
     for d in drops().lock().unwrap().iter() {
         let (eid, x, y, z, item, cnt, comps) =
@@ -934,10 +948,7 @@ fn interest_tick() {
     // P2-3-S4: a player is only interested in players sharing their dimension. Two players
     // at the same coordinates in different worlds must not spawn for one another; on a
     // dimension switch the 0x42 removals below retire the old-world players.
-    let player_dims: HashMap<i32, DimId> = cls
-        .iter()
-        .map(|o| (o.eid, *o.dim.lock().unwrap()))
-        .collect();
+    entity_dims.extend(cls.iter().map(|o| (o.eid, *o.dim.lock().unwrap())));
     for o in cls.iter() {
         let p = {
             let p = o.pos.lock().unwrap();
@@ -981,7 +992,7 @@ fn interest_tick() {
             if *eid == c.eid {
                 continue;
             }
-            if let Some(&edim) = player_dims.get(eid) {
+            if let Some(&edim) = entity_dims.get(eid) {
                 if edim != *c.dim.lock().unwrap() {
                     // crossing a dimension retires the other world's players immediately,
                     // even when their coordinates are still inside the interest radius.
@@ -2084,11 +2095,16 @@ fn velocity_pkt(eid: i32, vx: i16, vy: i16, vz: i16) -> Vec<u8> {
     p
 }
 fn explosion_pkt(x: f64, y: f64, z: f64, records: &[(i8, i8, i8)]) -> Vec<u8> {
+    explosion_pkt_with_power(x, y, z, 3.0, records)
+}
+fn explosion_pkt_with_power(
+    x: f64, y: f64, z: f64, power: f32, records: &[(i8, i8, i8)],
+) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
-    p.extend_from_slice(&3.0f32.to_be_bytes());
+    p.extend_from_slice(&power.to_be_bytes());
     write_varint(&mut p, records.len() as i64);
     for &(ox, oy, oz) in records {
         p.push(ox as u8);
@@ -2113,15 +2129,9 @@ fn mob_xp(etype: i64) -> i16 {
 // vanilla /kill applies void damage — the same loot+xp+cleanup path as
 // combat death, not a silent retain
 fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
-    // vanilla: a mob that dies while burning drops the cooked variant
-    let burning = mobs()
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|m| m.eid == deid)
-        .map(|m| *m.fuse.lock().unwrap() > 0)
-        .unwrap_or(false);
-    mobs().lock().unwrap().retain(|m| m.eid != deid);
+    let Some((mob, state)) = remove_live_mob(deid) else { return };
+    let burning = *mob.fuse.lock().unwrap() > 0;
+    live_mob_death(&mob, state, [mx, my, mz]);
     broadcast_seen_destroy(deid);
     let was_sheared = sheared().lock().unwrap().remove(&deid);
     for (item, cnt, comps) in mob_loot(etype, burning)
@@ -2212,7 +2222,8 @@ fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) -> Option<((i32,
 fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) {
     // environmental death (suffocation/drowning/fall): drops but no XP —
     // vanilla only drops XP when recently hurt by a player
-    mobs().lock().unwrap().retain(|m| m.eid != deid);
+    let Some((mob, state)) = remove_live_mob(deid) else { return };
+    live_mob_death(&mob, state, [mx, my, mz]);
     broadcast_seen_destroy(deid);
     sheared().lock().unwrap().remove(&deid);
     for (item, cnt, comps) in mob_loot(etype, burning)
@@ -4019,7 +4030,7 @@ fn arrow_tick() {
                 // other players. The owner and last pierced target are skipped.
                 let ml = mobs().lock().unwrap();
                 'outer: for m in ml.iter() {
-                    if m.eid == a.last_hit {
+                    if m.eid == a.last_hit || live_mob_dim(m.eid) != DimId::Overworld {
                         continue;
                     }
                     let (mx, my, mz, ..) = *m.pos.lock().unwrap();
@@ -4031,6 +4042,12 @@ fn arrow_tick() {
                         0.4,
                         2.1,
                     ) {
+                        let kind = if a.kind == 0 { BossHit::Arrow } else { BossHit::Other };
+                        if !live_mob_hit_allowed(m, a.owner, kind) {
+                            dead.push(eid);
+                            break;
+                        }
+                        *m.hurt_at.lock().unwrap() = Instant::now();
                         let mut h = m.hp.lock().unwrap();
                         *h -= a.dmg;
                         let dh = *h;
@@ -5209,660 +5226,1804 @@ fn drop_tick() {
         }
     }
 }
-fn mob_tick() {
-    let cls_snap = client_snapshot();
-    let cls: Vec<(i32, f64, f64, f64)> = cls_snap
-        .iter()
-        .map(|c| {
-            let p = c.pos.lock().unwrap();
-            (c.eid, p.0, p.1, p.2)
-        })
-        .collect();
-    let wheat_holders: Vec<(f64, f64, f64)> = cls_snap
-        .iter()
-        .filter(|c| {
-            let hs = 36 + *c.held.lock().unwrap();
-            c.inv.lock().unwrap().get(&hs).map(|v| v.0).unwrap_or(0) == 854
-        })
-        .map(|c| {
-            let p = c.pos.lock().unwrap();
-            (p.0, p.1, p.2)
-        })
-        .collect();
-    if cls.is_empty() {
+thread_local! {
+    // Goal trait objects stay on the server tick thread. Network handlers own
+    // interaction and death events, so the separate behavior store is shared.
+    static LIVE_MOB_AI: std::cell::RefCell<HashMap<i32, MobAiProfile>> = Default::default();
+}
+
+struct LiveMobState {
+    dim: DimId,
+    behavior: Option<MobBehaviorState>,
+    blaze_charged: bool,
+    potions: Vec<(WitchPotion, u64)>,
+}
+
+impl LiveMobState {
+    fn new(etype: i64, dim: DimId) -> Self {
+        Self {
+            dim,
+            behavior: MobBehaviorState::for_etype(etype),
+            blaze_charged: false,
+            potions: Vec::new(),
+        }
+    }
+}
+
+fn live_mob_states() -> &'static Mutex<HashMap<i32, LiveMobState>> {
+    static STATES: OnceLock<Mutex<HashMap<i32, LiveMobState>>> = OnceLock::new();
+    STATES.get_or_init(Mutex::default)
+}
+
+fn live_mob_dim(eid: i32) -> DimId {
+    live_mob_states()
+        .lock()
+        .unwrap()
+        .get(&eid)
+        .map_or(DimId::Overworld, |state| state.dim)
+}
+
+fn insert_live_mob(
+    etype: i64,
+    dim: DimId,
+    pos: (f64, f64, f64, f32, f32),
+    hp: f32,
+    slime_size: Option<SlimeSize>,
+) -> bool {
+    let mut mobs = mobs().lock().unwrap();
+    if mobs.len() >= MOB_CAP {
+        return false;
+    }
+    mobs.push(new_live_mob(etype, dim, pos, hp, slime_size));
+    true
+}
+
+// Caller holds the mob list lock so an entity and its state become visible together.
+fn new_live_mob(
+    etype: i64,
+    dim: DimId,
+    pos: (f64, f64, f64, f32, f32),
+    hp: f32,
+    slime_size: Option<SlimeSize>,
+) -> Arc<Mob> {
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    let mut state = LiveMobState::new(etype, dim);
+    if let (Some(MobBehaviorState::Slime { behavior, .. }), Some(size)) =
+        (&mut state.behavior, slime_size)
+    {
+        behavior.size = size;
+    }
+    if dim != DimId::Overworld || state.behavior.is_some() {
+        live_mob_states().lock().unwrap().insert(eid, state);
+    }
+    // Entity IDs are unique within the running world, including split children.
+    let mut uuid = [0; 16];
+    uuid[12..].copy_from_slice(&eid.to_be_bytes());
+    let last_action = Instant::now() - Duration::from_secs(10);
+    Arc::new(Mob {
+        eid,
+        uuid,
+        etype,
+        pos: Mutex::new(pos),
+        hp: Mutex::new(hp),
+        last_hit: Mutex::new(last_action),
+        hurt_at: Mutex::new(last_action),
+        last_hurt_tick: Mutex::new(None),
+        vel: Mutex::new([0.0; 3]),
+        fuse: Mutex::new(0),
+        love: Mutex::new(0),
+        air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+    })
+}
+
+fn remove_live_mob(eid: i32) -> Option<(Arc<Mob>, Option<LiveMobState>)> {
+    let mut mobs = mobs().lock().unwrap();
+    let index = mobs.iter().position(|mob| mob.eid == eid)?;
+    let state = live_mob_states().lock().unwrap().remove(&eid);
+    Some((mobs.remove(index), state))
+}
+
+fn convert_live_mob(mob: &Mob, dim: DimId, etype: i64) {
+    let pos = *mob.pos.lock().unwrap();
+    let mut mobs = mobs().lock().unwrap();
+    let Some(slot) = mobs.iter_mut().find(|entry| entry.eid == mob.eid) else {
+        return;
+    };
+    if *mob.hp.lock().unwrap() <= 0.0 {
         return;
     }
-    let mobs_snap: Vec<Arc<Mob>> = mobs().lock().unwrap().iter().cloned().collect();
-    let region = region_guard();
-    let grid = EntitySpatialGrid::build_mobs_and_clients(&mobs_snap, &cls_snap);
-    let dead_by_cramming = apply_entity_push_step(&mobs_snap, &cls_snap, &region, &grid);
+    let hp = default_mob_hp(entity_spec_by_id(etype).unwrap().name);
+    *slot = new_live_mob(etype, dim, pos, hp, None);
+    live_mob_states().lock().unwrap().remove(&mob.eid);
+    drop(mobs);
+    broadcast_seen_destroy(mob.eid);
+}
+
+fn live_mob_hit_allowed(mob: &Mob, source: i32, hit: BossHit) -> bool {
+    if !matches!(mob.etype, 31 | 88 | 116 | 119) {
+        return true;
+    }
+    let mut states = live_mob_states().lock().unwrap();
+    let state = states
+        .entry(mob.eid)
+        .or_insert_with(|| LiveMobState::new(mob.etype, DimId::Overworld));
+    match &mut state.behavior {
+        Some(MobBehaviorState::Wither(wither)) => !wither.immune_to(hit),
+        Some(MobBehaviorState::EnderDragon(dragon)) => {
+            !matches!(hit, BossHit::Arrow) || !dragon.is_sitting()
+        }
+        Some(MobBehaviorState::Shulker(shulker)) => {
+            !matches!(hit, BossHit::Arrow) || shulker.peek() != 0
+        }
+        Some(MobBehaviorState::Warden(warden)) => {
+            if source > 0 {
+                warden.anger.add_vibration(source);
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+fn live_mob_interact(client: &Client, target: i32, slot: i16) -> bool {
+    let gm = *client.gm.lock().unwrap();
+    if gm == 3 || !client.seen.lock().unwrap().contains(&target) {
+        return false;
+    }
+    let mob = mobs()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|mob| mob.eid == target && matches!(mob.etype, 15 | 78 | 122))
+        .cloned();
+    let Some(mob) = mob else { return false };
+    let mut inv = client.inv.lock().unwrap();
+    let item = inv
+        .get(&slot)
+        .and_then(|stack| item_to_name(stack.0))
+        .unwrap_or("");
+    let mut pet_update = None;
+    let mut tame_status = None;
+    let mut pet_hp = None;
+    let consumed = {
+        let mut states = live_mob_states().lock().unwrap();
+        let state = states
+            .entry(target)
+            .or_insert_with(|| LiveMobState::new(mob.etype, DimId::Overworld));
+        match &mut state.behavior {
+            Some(MobBehaviorState::Piglin(piglin)) => piglin.offer(client.eid, item),
+            Some(MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet)) => {
+                let result = pet.try_tame(client.uuid, item, &mut |bound| {
+                    (world_rng::next_u64() % u64::from(bound)) as u32
+                });
+                match result {
+                    PetTameResult::Tamed => {
+                        pet_hp = Some(pet.hp);
+                        pet_update = Some((pet.sitting, true));
+                        tame_status = Some(7);
+                    }
+                    PetTameResult::Consumed => tame_status = Some(6),
+                    PetTameResult::Pass => {
+                        if let Some(sitting) = pet.toggle_sitting(client.uuid) {
+                            pet_update = Some((sitting, true));
+                        }
+                    }
+                }
+                result != PetTameResult::Pass
+            }
+            _ => false,
+        }
+    };
+    if consumed && gm != 1 {
+        if let Some(stack) = inv.get_mut(&slot) {
+            stack.1 -= 1;
+            if stack.1 == 0 {
+                inv.remove(&slot);
+            }
+        }
+        let updated = inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+        drop(inv);
+        resync_slot(client, 0, slot, &updated);
+    } else {
+        drop(inv);
+    }
+    if let Some(hp) = pet_hp {
+        *mob.hp.lock().unwrap() = hp;
+    }
+    if let Some((sitting, tamed)) = pet_update {
+        if mob.etype == 15 {
+            let mut cats = sitting_cats().lock().unwrap();
+            if sitting {
+                cats.insert(target);
+            } else {
+                cats.remove(&target);
+            }
+        }
+        let flags = u8::from(sitting) | (u8::from(tamed) << 2);
+        broadcast_seen(target, |_| (0x58, live_mob_metadata(target, 17, 0, flags)));
+    }
+    if let Some(status) = tame_status {
+        let mut packet = target.to_be_bytes().to_vec();
+        packet.push(status);
+        broadcast_seen(target, |_| (0x1f, packet.clone()));
+    }
+    consumed || pet_update.is_some()
+}
+
+struct LiveMobPlayer<'a> {
+    client: &'a Arc<Client>,
+    pos: (f64, f64, f64),
+    dim: DimId,
+    held_item: Option<u32>,
+    attackable: bool,
+}
+
+impl<'a> LiveMobPlayer<'a> {
+    fn new(client: &'a Arc<Client>) -> Self {
+        let (x, y, z, ..) = *client.pos.lock().unwrap();
+        let slot = 36 + *client.held.lock().unwrap();
+        let held_item = client
+            .inv
+            .lock()
+            .unwrap()
+            .get(&slot)
+            .map(|stack| stack.0 as u32);
+        let gm = *client.gm.lock().unwrap();
+        Self {
+            client,
+            pos: (x, y, z),
+            dim: *client.dim.lock().unwrap(),
+            held_item,
+            attackable: matches!(gm, 0 | 2) && *client.hp.lock().unwrap() > 0.0,
+        }
+    }
+
+    fn perceive(&self) -> AiEntityPerception {
+        let mut player = AiEntityPerception::new(self.client.eid, self.pos);
+        player.held_item = self.held_item;
+        player
+    }
+}
+
+fn live_mob_block_boxes(
+    dim: DimId,
+    reg: &crate::block_registry::BReg,
+    min: [f64; 3],
+    max: [f64; 3],
+) -> Vec<([f64; 3], [f64; 3])> {
+    if dim == DimId::Overworld {
+        return collect_block_collision_boxes(min, max);
+    }
+    let low = min.map(|value| (value - 1e-7).floor() as i32 - 1);
+    let high = max.map(|value| (value + 1e-7).floor() as i32 + 1);
+    let mut boxes = Vec::new();
+    for x in low[0]..=high[0] {
+        for y in low[1]..=high[1] {
+            for z in low[2]..=high[2] {
+                let offset = [f64::from(x), f64::from(y), f64::from(z)];
+                for (lo, hi) in reg.collision_boxes(block_at_dim(dim, x, y, z)) {
+                    let world_box = (
+                        std::array::from_fn(|i| lo[i] + offset[i]),
+                        std::array::from_fn(|i| hi[i] + offset[i]),
+                    );
+                    if aabb_overlaps((min, max), world_box) {
+                        boxes.push(world_box);
+                    }
+                }
+            }
+        }
+    }
+    boxes
+}
+
+// Test the actual block shapes along the ray, including partial blocks.
+fn live_mob_block_hit(
+    dim: DimId,
+    reg: &crate::block_registry::BReg,
+    from: [f64; 3],
+    to: [f64; 3],
+) -> Option<[f64; 3]> {
+    let delta = mob_behavior_delta(from, to);
+    let steps = (mob_behavior_dot(delta, delta).sqrt() / 2.0)
+        .ceil()
+        .max(1.0) as u32;
+    for step in 0..steps {
+        let start =
+            std::array::from_fn(|i| from[i] + delta[i] * f64::from(step) / f64::from(steps));
+        let end =
+            std::array::from_fn(|i| from[i] + delta[i] * f64::from(step + 1) / f64::from(steps));
+        let lo = std::array::from_fn(|i| start[i].min(end[i]) - 1e-7);
+        let hi = std::array::from_fn(|i| start[i].max(end[i]) + 1e-7);
+        let distance_sq = |p| {
+            let d = mob_behavior_delta(start, p);
+            mob_behavior_dot(d, d)
+        };
+        if let Some(hit) = live_mob_block_boxes(dim, reg, lo, hi)
+            .into_iter()
+            .filter_map(|(min, max)| {
+                let shape = Aabb::new(min, max);
+                if shape.contains(start) {
+                    Some(start)
+                } else {
+                    shape.clip(start, end)
+                }
+            })
+            .min_by(|a, b| distance_sq(*a).total_cmp(&distance_sq(*b)))
+        {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+struct LiveSkeletonBowGoal;
+
+impl Goal for LiveSkeletonBowGoal {
+    fn priority(&self) -> i32 {
+        4
+    }
+    fn flags(&self) -> u8 {
+        GoalFlags::MOVE | GoalFlags::LOOK
+    }
+    fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
+        ctx.target.is_some()
+    }
+    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
+        self.can_use(ctx)
+    }
+    fn start(&mut self, _: &GoalContext<'_>) {}
+    fn stop(&mut self, _: &GoalContext<'_>) {}
+    fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
+        let target = ctx.target?;
+        let distance = entity_distance_sq(ctx.position, target.position);
+        let move_target = if !target.line_of_sight || distance > 12.0f64.powi(2) {
+            Some(target.position)
+        } else if distance < 5.0f64.powi(2) {
+            let (x, y, z) = ctx.position;
+            let (tx, _, tz) = target.position;
+            let [dx, _, dz] = mob_behavior_unit([x - tx, 0.0, z - tz]);
+            Some((x + 5.0 * dx, y, z + 5.0 * dz))
+        } else {
+            None
+        };
+        Some(GoalOutput {
+            move_target,
+            look_target: Some(target.position),
+            attack_target: (target.line_of_sight && distance < 16.0f64.powi(2))
+                .then_some(target.entity_id),
+            ..GoalOutput::default()
+        })
+    }
+}
+
+// The live passive tick has a rest interval between random walks. Without it
+// the standalone GP-1 stroll goal chooses a destination on every idle tick.
+struct LivePastureRest {
+    ticks: u64,
+    first_walk: u64,
+}
+
+impl Goal for LivePastureRest {
+    fn priority(&self) -> i32 {
+        5
+    }
+    fn flags(&self) -> u8 {
+        GoalFlags::MOVE
+    }
+    fn can_use(&self, _: &GoalContext<'_>) -> bool {
+        let interval = MOB_SPAWN_CHANCE_DENOMINATOR / 12;
+        self.ticks < self.first_walk || (self.ticks - self.first_walk) % interval >= 10
+    }
+    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
+        self.can_use(ctx)
+    }
+    fn start(&mut self, _: &GoalContext<'_>) {}
+    fn stop(&mut self, _: &GoalContext<'_>) {}
+    fn idle_tick(&mut self, _: &GoalContext<'_>) {
+        self.ticks += 1;
+    }
+    fn tick(&mut self, _: &GoalContext<'_>) -> Option<GoalOutput> {
+        self.ticks += 1;
+        None
+    }
+}
+
+fn new_live_mob_profile(mob: &Mob) -> MobAiProfile {
+    let etype = mob.etype;
+    let mut profile = MobAiProfile::new(etype);
+    if matches!(etype, 19 | 22 | 77 | 87) {
+        let interval = MOB_SPAWN_CHANCE_DENOMINATOR / 12;
+        profile.selector.add_goal(Box::new(LivePastureRest {
+            ticks: 0,
+            first_walk: interval + mob.eid as u64 % interval,
+        }));
+    }
+    if etype == 91 {
+        profile.selector = MobGoalPlan::for_entity(
+            etype,
+            MobGoalSettings {
+                skeleton_has_bow: true,
+                ..MobGoalSettings::default()
+            },
+        )
+        .unwrap()
+        .build_selector(etype as u64);
+        profile
+            .selector
+            .add_goal(Box::new(FloatGoal { priority: 0 }));
+        profile.selector.add_goal(Box::new(LiveSkeletonBowGoal));
+        profile.movement_speed = 0.22;
+    }
+    profile
+}
+
+fn live_mob_move(
+    mob: &Arc<Mob>,
+    waypoint_y: Option<f64>,
+    dim: DimId,
+    reg: &crate::block_registry::BReg,
+    result: MobAiStepResult,
+    in_fluid: bool,
+) {
+    let mut pos = mob.pos.lock().unwrap();
+    let old = *pos;
+    let (dx, _, dz) = result.movement_delta;
+    let (width, height) = entity_dimensions_1211(mob.etype);
+    let collides = |point: [f64; 3], delta, step| {
+        let bounds = EntityAabb::from_dimensions(point[0], point[1], point[2], width, height);
+        entity_collide(bounds, delta, true, step, &[], |sweep| {
+            live_mob_block_boxes(dim, reg, sweep.min(), sweep.max())
+        })
+    };
+    let flying = matches!(mob.etype, 6 | 8 | 31 | 45 | 119);
+    if !flying && !in_fluid {
+        let mut jumped = false;
+        if let Some(next_y) = waypoint_y.filter(|_| result.jump) {
+            let rise = next_y - pos.1;
+            if rise > 0.5 && rise <= 1.25 {
+                let start = [pos.0, pos.1, pos.2];
+                let step = collides(start, [dx, -1e-4, dz], rise as f32 + 1e-4);
+                if step.stepped_up && step.delta[1] > 0.5 {
+                    pos.0 += step.delta[0];
+                    pos.1 += step.delta[1];
+                    pos.2 += step.delta[2];
+                    jumped = true;
+                }
+            }
+        }
+        if !jumped && dim == DimId::Overworld {
+            if dx != 0.0 || dz != 0.0 {
+                mob_collide_move(mob, &mut pos, dx, dz);
+            } else if let Some((landing_pos, fall)) = mob_snap_y(mob, &mut pos) {
+                drop(pos);
+                let landed = landing::cow_land(mob, landing_pos, fall);
+                pos = mob.pos.lock().unwrap();
+                if landed {
+                    pos.1 += 1.0 / 16.0;
+                }
+            }
+        } else if !jumped {
+            let step = collides([pos.0, pos.1, pos.2], [dx, -0.25, dz], 0.6);
+            pos.0 += step.delta[0];
+            pos.1 += step.delta[1];
+            pos.2 += step.delta[2];
+        }
+    }
+    if let Some(yaw) = result.look_yaw {
+        pos.3 = yaw;
+    }
+    if let Some(pitch) = result.look_pitch {
+        pos.4 = pitch;
+    }
+    let (x, y, z, yaw, pitch) = *pos;
+    drop(pos);
+    if old != (x, y, z, yaw, pitch) {
+        let grounded = !flying
+            && if dim == DimId::Overworld {
+                mob_has_support(mob.etype, x, y, z)
+            } else {
+                collides([x, y, z], [0.0, -1e-4, 0.0], 0.0).vertical_collision_below
+            };
+        broadcast_seen(mob.eid, |_| {
+            (
+                0x70,
+                entity_teleport(mob.eid, x, y, z, yaw, pitch, grounded),
+            )
+        });
+        if old.3 != yaw {
+            broadcast_seen(mob.eid, |_| (0x48, head_rot(mob.eid, yaw)));
+        }
+    }
+}
+
+fn live_skeleton_shoot(mob: &Mob, pos: [f64; 3], target: (f64, f64, f64)) {
+    let mut last_hit = mob.last_hit.lock().unwrap();
+    if last_hit.elapsed() < Duration::from_secs(3) {
+        return;
+    }
+    *last_hit = Instant::now();
+    let [x, y, z] = [pos[0], pos[1] + 1.6, pos[2]];
+    let [dx, dy, dz] = mob_behavior_unit([target.0 - x, target.1 + 1.2 - y, target.2 - z]);
+    arrows().lock().unwrap().push(Arrow {
+        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+        owner: -1,
+        x,
+        y,
+        z,
+        dx,
+        dy,
+        dz,
+        ttl: server_ticks(MOB_ARROW_TTL_GT) as i32,
+        dmg: diff_mob_dmg(3.0),
+        fire: 0,
+        punch: 0,
+        kind: 0,
+        loy: 0,
+        ret_item: 0,
+        ret_comps: Vec::new(),
+        pierce: 0,
+        last_hit: -1,
+        stuck: false,
+    });
+}
+
+fn live_mob_damage_player(
+    player: &Arc<Client>,
+    origin: [f64; 3],
+    damage: f32,
+    protection_kind: Option<u8>,
+    knockback_y: Option<f64>,
+) -> bool {
+    if !matches!(*player.gm.lock().unwrap(), 0 | 2) || *player.hp.lock().unwrap() <= 0.0 {
+        return false;
+    }
+    if protection_kind == Some(0)
+        && *player.blocking.lock().unwrap()
+        && player.shield_cd.lock().unwrap().elapsed() > Duration::from_secs(5)
+    {
+        damage_shield(player, damage);
+        return false;
+    }
+    if damage <= 0.0 {
+        return false;
+    }
+    let Some(accepted) = damage_after_invulnerability(player, damage) else {
+        return false;
+    };
+    let damage_taken = protection_kind.map_or(accepted, |kind| dmg_after(player, accepted, kind));
+    {
+        let mut hp = player.hp.lock().unwrap();
+        *hp = (*hp - hurt_absorb(player, damage_taken)).max(0.0);
+    }
+    totem_check(player);
+    if protection_kind.is_some() {
+        damage_armor(player, damage);
+    }
+    let health = *player.hp.lock().unwrap();
+    let velocity = knockback_y.map(|up| {
+        let (x, _, z, ..) = *player.pos.lock().unwrap();
+        let [dx, _, dz] = mob_behavior_unit([x - origin[0], 0.0, z - origin[2]]);
+        velocity_pkt(
+            player.eid,
+            (dx * 3200.0) as i16,
+            (up * 8000.0) as i16,
+            (dz * 3200.0) as i16,
+        )
+    });
+    if let Ok(mut sock) = player.sock.lock() {
+        let _ = send_packet(&mut sock, 0x24, hurt_anim(player.eid));
+        let _ = send_packet(&mut sock, 0x5d, health_pkt_c(health, player));
+        if let Some(packet) = &velocity {
+            let _ = send_packet(&mut sock, 0x5a, packet.clone());
+        }
+    }
+    broadcast_seen_ex(player.eid, player.eid, |_| (0x24, hurt_anim(player.eid)));
+    if let Some(packet) = velocity {
+        broadcast_seen_ex(player.eid, player.eid, |_| (0x5a, packet.clone()));
+    }
+    true
+}
+
+fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, up: f64) {
+    if !live_mob_damage_player(player, pos, diff_mob_dmg(amount), Some(0), Some(up)) {
+        return;
+    }
+    let thorns = {
+        let inv = player.inv.lock().unwrap();
+        (5i16..=8)
+            .filter_map(|slot| inv.get(&slot))
+            .map(|stack| enchant_level(&stack.2, 38))
+            .sum::<i64>()
+    };
+    if thorns > 0 && world_rng::next_u64() % 100 < (thorns * 15) as u64 {
+        *mob.hp.lock().unwrap() -= (1 + world_rng::next_u64() % 4) as f32;
+        *mob.hurt_at.lock().unwrap() = Instant::now();
+        broadcast_seen(mob.eid, |_| (0x24, hurt_anim(mob.eid)));
+    }
+    if *player.hp.lock().unwrap() <= 0.0 {
+        let name = entity_spec_by_id(mob.etype).map_or("mob", |spec| {
+            spec.name.strip_prefix("minecraft:").unwrap_or(spec.name)
+        });
+        let line = system_chat(&format!("{} was slain by {}", player.name, name));
+        broadcast(-1, |_| (0x6c, line.clone()));
+    }
+}
+
+fn live_mob_explosion(dim: DimId, pos: [f64; 3], power: f32, players: &[LiveMobPlayer<'_>]) {
+    let [x, y, z] = pos;
+    let [bx, by, bz] = pos.map(|n| n.floor() as i32);
+    let mut records = Vec::new();
+    if GR_MOB_GRIEFING.load(Ordering::Relaxed) != 0 {
+        let radius = power.ceil() as i32;
+        for dx in -radius..=radius {
+            for dy in -radius..=radius {
+                for dz in -radius..=radius {
+                    if (dx * dx + dy * dy + dz * dz) as f32 > power * power {
+                        continue;
+                    }
+                    let (x, y, z) = (bx + dx, by + dy, bz + dz);
+                    let block = block_at_dim(dim, x, y, z);
+                    if block != 0 && block != 79 {
+                        set_block_dim(dim, x, y, z, 0);
+                        note_block_update_dim(dim, x, y, z, 0);
+                        records.push((dx as i8, dy as i8, dz as i8));
+                    }
+                }
+            }
+        }
+    }
+    let packet = explosion_pkt_with_power(x, y, z, power, &records);
+    for player in players.iter().filter(|player| player.dim == dim) {
+        if let Ok(mut sock) = player.client.sock.lock() {
+            let _ = send_packet(&mut sock, 0x20, packet.clone());
+        }
+        let distance = entity_distance_sq((x, y, z), player.pos).sqrt();
+        let damage = (power * 1.5 - distance as f32) * 3.0;
+        live_mob_damage_player(
+            player.client,
+            pos,
+            diff_expl_dmg(damage),
+            Some(2),
+            Some(0.3),
+        );
+    }
+}
+
+fn live_mob_metadata(eid: i32, index: u8, kind: u8, value: u8) -> Vec<u8> {
+    let mut packet = Vec::new();
+    write_varint(&mut packet, i64::from(eid));
+    packet.extend([index, kind, value, 0xff]);
+    packet
+}
+
+fn live_mob_spawn_packets(mob: &Mob) -> Vec<(i64, Vec<u8>)> {
+    let mut packets = vec![(0x01, spawn_mob(mob))];
+    if let Some(state) = live_mob_states().lock().unwrap().get(&mob.eid) {
+        match &state.behavior {
+            Some(MobBehaviorState::Slime { behavior, .. }) => {
+                packets.push((0x58, live_mob_metadata(mob.eid, 16, 1, behavior.size as u8)));
+            }
+            Some(MobBehaviorState::Blaze(_)) if state.blaze_charged => {
+                packets.push((0x58, live_mob_metadata(mob.eid, 16, 0, 1)));
+            }
+            Some(MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet)) => {
+                let flags = u8::from(pet.sitting) | (u8::from(pet.owner.is_some()) << 2);
+                packets.push((0x58, live_mob_metadata(mob.eid, 17, 0, flags)));
+            }
+            _ => {}
+        }
+        let now = TICK.load(Ordering::Relaxed);
+        for &(potion, until) in &state.potions {
+            if until > now {
+                packets.push((
+                    0x76,
+                    entity_effect_pkt(
+                        mob.eid,
+                        live_witch_effect_id(potion),
+                        0,
+                        (until - now) as i32,
+                    ),
+                ));
+            }
+        }
+    }
+    packets
+}
+
+fn live_witch_effect_id(potion: WitchPotion) -> i32 {
+    match potion {
+        WitchPotion::WaterBreathing => 12,
+        WitchPotion::FireResistance => 11,
+        WitchPotion::Healing => 5,
+        WitchPotion::Swiftness => 0,
+        WitchPotion::Slowness => 1,
+        WitchPotion::Poison => 18,
+        WitchPotion::Weakness => 17,
+        WitchPotion::Harming => 6,
+    }
+}
+
+fn live_mob_player_effect(client: &Client, id: i32, ticks: u16) {
+    if !matches!(*client.gm.lock().unwrap(), 0 | 2) || *client.hp.lock().unwrap() <= 0.0 {
+        return;
+    }
+    let ticks = server_ticks(u64::from(ticks)) as i32;
+    let mut effects = client.effs.lock().unwrap();
+    if effects
+        .iter()
+        .any(|effect| effect.id == id && effect.left >= ticks)
+    {
+        return;
+    }
+    effects.retain(|effect| effect.id != id);
+    effects.push(Eff {
+        id,
+        amp: 0,
+        left: ticks,
+    });
+    drop(effects);
+    let packet = entity_effect_pkt(client.eid, id, 0, ticks);
+    if let Ok(mut sock) = client.sock.lock() {
+        let _ = send_packet(&mut sock, 0x76, packet.clone());
+    }
+    broadcast_seen_ex(client.eid, client.eid, |_| (0x76, packet.clone()));
+}
+
+#[derive(Clone, Copy)]
+struct LiveMobProjectile {
+    eid: i32,
+    owner: i32,
+    dim: DimId,
+    kind: MobProjectileKind,
+    pos: [f64; 3],
+    velocity: [f64; 3],
+    power: f32,
+    age: u16,
+}
+
+impl LiveMobProjectile {
+    fn entity_type(self) -> i64 {
+        let name = match self.kind {
+            MobProjectileKind::SmallFireball => "small_fireball",
+            MobProjectileKind::GhastFireball => "fireball",
+            MobProjectileKind::ShulkerBullet { .. } => "shulker_bullet",
+            MobProjectileKind::DragonFireball => "dragon_fireball",
+            MobProjectileKind::WitchSplash(_) => "potion",
+            MobProjectileKind::WitherSkull { .. } => "wither_skull",
+        };
+        name_to_etype(name).expect("behavior projectile type in protocol registry")
+    }
+}
+
+fn live_mob_projectiles() -> &'static Mutex<Vec<LiveMobProjectile>> {
+    static PROJECTILES: OnceLock<Mutex<Vec<LiveMobProjectile>>> = OnceLock::new();
+    PROJECTILES.get_or_init(Mutex::default)
+}
+
+fn live_mob_projectile_packets(projectile: LiveMobProjectile) -> Vec<(i64, Vec<u8>)> {
+    let [x, y, z] = projectile.pos;
+    let [vx, vy, vz] = projectile.velocity.map(|axis| (axis * 8000.0) as i16);
+    let mut spawn = spawn_entity_pkt(
+        projectile.eid,
+        projectile.entity_type() as u32,
+        x,
+        y,
+        z,
+        0.0,
+        0.0,
+        i64::from(projectile.owner),
+    );
+    let offset = spawn.len() - 6;
+    spawn[offset..]
+        .copy_from_slice(&[vx.to_be_bytes(), vy.to_be_bytes(), vz.to_be_bytes()].concat());
+    let mut packets = vec![(0x01, spawn)];
+    if matches!(
+        projectile.kind,
+        MobProjectileKind::WitherSkull { blue: true }
+    ) {
+        packets.push((0x58, live_mob_metadata(projectile.eid, 8, 8, 1)));
+    }
+    packets
+}
+
+fn live_mob_projectile_impact(
+    projectile: LiveMobProjectile,
+    pos: [f64; 3],
+    hit: Option<&LiveMobPlayer<'_>>,
+    players: &[LiveMobPlayer<'_>],
+) {
+    use MobProjectileKind::*;
+    match projectile.kind {
+        SmallFireball => {
+            if let Some(player) = hit {
+                live_mob_damage_player(player.client, pos, diff_mob_dmg(5.0), Some(3), None);
+            } else if GR_MOB_GRIEFING.load(Ordering::Relaxed) != 0 {
+                let p = mob_behavior_delta(projectile.velocity.map(|axis| axis * 1e-4), pos);
+                let [x, y, z] = p.map(|axis| axis.floor() as i32);
+                if block_at_dim(projectile.dim, x, y, z) == 0 {
+                    place_block_dim(projectile.dim, x, y, z, name_to_state("fire").unwrap());
+                }
+            }
+        }
+        GhastFireball => {
+            if let Some(player) = hit {
+                live_mob_damage_player(player.client, pos, diff_mob_dmg(6.0), Some(3), None);
+            }
+            live_mob_explosion(projectile.dim, pos, projectile.power, players);
+        }
+        WitherSkull { .. } => {
+            if let Some(player) = hit {
+                if live_mob_damage_player(player.client, pos, diff_mob_dmg(8.0), Some(3), None) {
+                    let ticks = match DIFFICULTY.load(Ordering::Relaxed) {
+                        2 => 200,
+                        3 => 800,
+                        _ => 0,
+                    };
+                    if ticks > 0 {
+                        live_mob_player_effect(player.client, 19, ticks);
+                    }
+                }
+            }
+            live_mob_explosion(projectile.dim, pos, projectile.power, players);
+        }
+        ShulkerBullet { .. } => {
+            if let Some(player) = hit {
+                if live_mob_damage_player(player.client, pos, diff_mob_dmg(4.0), Some(3), None) {
+                    live_mob_player_effect(player.client, 24, 200);
+                }
+            }
+        }
+        WitchSplash(potion) => {
+            for player in players
+                .iter()
+                .filter(|player| player.dim == projectile.dim && player.attackable)
+            {
+                let distance = entity_distance_sq((pos[0], pos[1], pos[2]), player.pos).sqrt();
+                let scale = if hit.is_some_and(|hit| hit.client.eid == player.client.eid) {
+                    1.0
+                } else {
+                    (1.0 - distance / 4.0).max(0.0)
+                };
+                let ticks = match potion {
+                    WitchPotion::Slowness | WitchPotion::Weakness => 1800,
+                    WitchPotion::Poison => 900,
+                    _ => 0,
+                };
+                if potion == WitchPotion::Harming {
+                    live_mob_damage_player(player.client, pos, (6.0 * scale) as f32, None, None);
+                } else if scale * f64::from(ticks) > 20.0 {
+                    live_mob_player_effect(
+                        player.client,
+                        live_witch_effect_id(potion),
+                        (f64::from(ticks) * scale) as u16,
+                    );
+                }
+            }
+        }
+        DragonFireball => {
+            // The breath cloud lingers after its projectile is gone.
+            live_dragon_breath(projectile.dim, pos);
+        }
+    }
+}
+
+struct LiveDragonBreath {
+    eid: i32,
+    dim: DimId,
+    pos: [f64; 3],
+    left: u16,
+}
+
+fn live_dragon_clouds() -> &'static Mutex<Vec<LiveDragonBreath>> {
+    static CLOUDS: OnceLock<Mutex<Vec<LiveDragonBreath>>> = OnceLock::new();
+    CLOUDS.get_or_init(Mutex::default)
+}
+
+fn live_dragon_breath(dim: DimId, pos: [f64; 3]) {
+    let mut clouds = live_dragon_clouds().lock().unwrap();
+    if clouds.len() < MOB_CAP {
+        clouds.push(LiveDragonBreath {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            dim,
+            pos,
+            left: 200,
+        });
+    }
+}
+
+fn tick_live_mob_projectiles(reg: &crate::block_registry::BReg, players: &[LiveMobPlayer<'_>]) {
+    let mut projectiles = live_mob_projectiles().lock().unwrap();
+    projectiles.retain_mut(|projectile| {
+        let LiveMobProjectile { eid, dim, pos, .. } = *projectile;
+        projectile.age += 1;
+        if projectile.age > 200 {
+            broadcast_seen_destroy(eid);
+            return false;
+        }
+        if let MobProjectileKind::ShulkerBullet { target_eid } = projectile.kind {
+            if let Some(target) = players
+                .iter()
+                .find(|p| p.client.eid == target_eid && p.dim == dim)
+            {
+                let direction = mob_behavior_unit(mob_behavior_delta(
+                    pos,
+                    [target.pos.0, target.pos.1 + 0.9, target.pos.2],
+                ));
+                projectile.velocity =
+                    std::array::from_fn(|i| 0.7 * projectile.velocity[i] + 0.09 * direction[i]);
+            }
+        }
+        let next = std::array::from_fn(|i| pos[i] + projectile.velocity[i]);
+        let block = live_mob_block_hit(dim, reg, pos, next);
+        let end = block.unwrap_or(next);
+        let distance = |point| {
+            let d = mob_behavior_delta(pos, point);
+            mob_behavior_dot(d, d)
+        };
+        let hit = players
+            .iter()
+            .filter(|p| p.dim == dim && p.attackable)
+            .filter_map(|player| {
+                let (x, y, z) = player.pos;
+                let bounds = Aabb::new([x - 0.4, y - 0.1, z - 0.4], [x + 0.4, y + 1.9, z + 0.4]);
+                let point = if bounds.contains(pos) {
+                    Some(pos)
+                } else {
+                    bounds.clip(pos, end)
+                }?;
+                Some((player, point))
+            })
+            .min_by(|(_, a), (_, b)| distance(*a).total_cmp(&distance(*b)));
+        if let Some((player, point)) = hit {
+            live_mob_projectile_impact(*projectile, point, Some(player), players);
+        } else if let Some(point) = block {
+            live_mob_projectile_impact(*projectile, point, None, players);
+        } else {
+            projectile.pos = next;
+            if matches!(projectile.kind, MobProjectileKind::WitchSplash(_)) {
+                projectile.velocity[1] -= 0.05;
+            }
+            let [x, y, z] = next;
+            broadcast_seen(eid, |_| {
+                (0x70, entity_teleport(eid, x, y, z, 0.0, 0.0, false))
+            });
+            return true;
+        }
+        broadcast_seen_destroy(eid);
+        false
+    });
+    drop(projectiles);
+    live_dragon_clouds().lock().unwrap().retain_mut(|cloud| {
+        cloud.left -= 1;
+        if cloud.left == 0 {
+            broadcast_seen_destroy(cloud.eid);
+            return false;
+        }
+        if cloud.left.is_multiple_of(20) {
+            let [x, y, z] = cloud.pos;
+            for player in players
+                .iter()
+                .filter(|p| p.dim == cloud.dim && entity_distance_sq(p.pos, (x, y, z)) < 9.0)
+            {
+                live_mob_damage_player(player.client, cloud.pos, 6.0, None, None);
+            }
+        }
+        true
+    });
+}
+
+fn live_mob_behavior_step(
+    mob: &Arc<Mob>,
+    reg: &crate::block_registry::BReg,
+    mut ctx: MobBehaviorTickCtx,
+    target: Option<&LiveMobPlayer<'_>>,
+    crystals: &[DragonCrystal],
+) -> Vec<MobBehaviorEffect> {
+    let mut states = live_mob_states().lock().unwrap();
+    let state = states
+        .entry(mob.eid)
+        .or_insert_with(|| LiveMobState::new(mob.etype, ctx.dim));
+    let Some(behavior) = &mut state.behavior else {
+        return Vec::new();
+    };
+    let tick = TICK.load(Ordering::Relaxed);
+    state.potions.retain(|&(_, expiry)| expiry > tick);
+    let mut block_at = |[x, y, z]: [i32; 3]| {
+        let id = block_at_dim(ctx.dim, x, y, z);
+        EndermanTeleportBlock {
+            blocks_motion: reg.blocks_motion(id),
+            liquid: reg.fluid_name(id) != "minecraft:empty",
+        }
+    };
+    let mut can_occupy = |[x, y, z]: [f64; 3]| {
+        let (width, height) = entity_dimensions_1211(mob.etype);
+        let bounds = EntityAabb::from_dimensions(x, y, z, width, height);
+        live_mob_block_boxes(ctx.dim, reg, bounds.min(), bounds.max()).is_empty()
+    };
+    let active_effects: Vec<_> = state.potions.iter().map(|&(effect, _)| effect).collect();
+    let target_effects = if matches!(behavior, MobBehaviorState::Witch(_)) {
+        target.map_or_else(Vec::new, |target| {
+            let active = target.client.effs.lock().unwrap();
+            [
+                WitchPotion::Slowness,
+                WitchPotion::Poison,
+                WitchPotion::Weakness,
+            ]
+            .into_iter()
+            .filter(|potion| {
+                active
+                    .iter()
+                    .any(|eff| eff.id == live_witch_effect_id(*potion))
+            })
+            .collect()
+        })
+    } else {
+        Vec::new()
+    };
+    let shot_ready = || mob.last_hit.lock().unwrap().elapsed() >= Duration::from_secs(2);
+    let world = match behavior {
+        MobBehaviorState::Blaze(_) => {
+            ctx.on_fire = state.blaze_charged;
+            MobBehaviorWorldTick::Basic
+        }
+        MobBehaviorState::Enderman => MobBehaviorWorldTick::Enderman {
+            block_at: &mut block_at,
+            can_occupy: &mut can_occupy,
+        },
+        MobBehaviorState::Witch { .. } => MobBehaviorWorldTick::Witch {
+            eid: mob.eid,
+            active_effects: &active_effects,
+            target_effects: &target_effects,
+            throw_ready: shot_ready(),
+        },
+        MobBehaviorState::Wither(_) if shot_ready() => {
+            MobBehaviorWorldTick::WitherShot { force_blue: false }
+        }
+        MobBehaviorState::EnderDragon(dragon) => {
+            let portal_y = live_dragon_portal_y(ctx.dim);
+            let path_complete = match dragon.phase {
+                DragonPhase::HoldingPattern | DragonPhase::Takeoff => dragon.phase_ticks >= 60,
+                DragonPhase::LandingApproach => ctx.pos[0].hypot(ctx.pos[2]) <= 1.0,
+                _ => false,
+            };
+            MobBehaviorWorldTick::EnderDragon {
+                portal_y,
+                path_complete,
+                strafe_aligned: ctx.nearest_target.is_some_and(|target| target.visible),
+                crystals,
+            }
+        }
+        _ => MobBehaviorWorldTick::Basic,
+    };
+    let mut effects = behavior.step_with_world(&ctx, world);
+    if matches!(
+        behavior,
+        MobBehaviorState::Witch(_) | MobBehaviorState::Wither(_)
+    ) && effects
+        .iter()
+        .any(|effect| matches!(effect, MobBehaviorEffect::LaunchProjectile { .. }))
+    {
+        *mob.last_hit.lock().unwrap() = Instant::now();
+    }
+    if let MobBehaviorState::EnderDragon(dragon) = behavior {
+        if ctx.dim == DimId::End {
+            let perch = EnderDragonBehavior::perch(live_dragon_portal_y(ctx.dim));
+            let waypoint = match dragon.phase {
+                DragonPhase::LandingApproach => Some([perch[0], perch[1] + 12.0, perch[2]]),
+                DragonPhase::Landing | DragonPhase::Dying => Some(perch),
+                DragonPhase::HoldingPattern | DragonPhase::Takeoff => {
+                    let angle = f64::from(dragon.phase_ticks) * 0.035;
+                    Some([24.0 * angle.cos(), perch[1] + 16.0, 24.0 * angle.sin()])
+                }
+                DragonPhase::StrafePlayer => ctx
+                    .nearest_target
+                    .map(|target| [target.pos[0], target.pos[1] + 8.0, target.pos[2]]),
+                _ => None,
+            };
+            if let Some(waypoint) = waypoint {
+                let delta = mob_behavior_delta(ctx.pos, waypoint);
+                let length = mob_behavior_dot(delta, delta).sqrt();
+                if length > 0.05 {
+                    effects.push(MobBehaviorEffect::Teleport {
+                        to: std::array::from_fn(|i| ctx.pos[i] + delta[i] / length.max(1.0)),
+                    });
+                }
+            }
+        }
+    }
+    effects
+}
+
+fn live_dragon_portal_y(dim: DimId) -> i32 {
+    // The centre post of an active podium rises four blocks from the portal.
+    let surface = height_at_dim(dim, 0, 0);
+    if block_at_dim(dim, 0, surface - 1, 0) == name_to_state("bedrock").unwrap() {
+        surface - 4
+    } else {
+        surface
+    }
+}
+
+fn apply_live_mob_effects(
+    mob: &Arc<Mob>,
+    dim: DimId,
+    pos: [f64; 3],
+    effects: Vec<MobBehaviorEffect>,
+    players: &[LiveMobPlayer<'_>],
+) -> bool {
+    use MobBehaviorEffect::*;
+    let player = |eid| players.iter().find(|p| p.client.eid == eid && p.dim == dim);
+    for effect in effects {
+        match effect {
+            SetOnFire(charged) => {
+                if let Some(state) = live_mob_states().lock().unwrap().get_mut(&mob.eid) {
+                    state.blaze_charged = charged;
+                }
+                broadcast_seen(mob.eid, |_| {
+                    (0x58, live_mob_metadata(mob.eid, 16, 0, u8::from(charged)))
+                });
+            }
+            LaunchProjectile {
+                kind,
+                mut origin,
+                dir,
+                power,
+            } => {
+                // The behavior aims from feet to feet. Shift the shot to body height on both ends.
+                origin[1] += if mob.etype == 31 { 2.0 } else { 1.0 };
+                let speed = match kind {
+                    MobProjectileKind::WitchSplash(_) => 0.75,
+                    MobProjectileKind::ShulkerBullet { .. } => 0.15,
+                    _ => 0.5,
+                };
+                let mut dir = mob_behavior_unit(dir);
+                if matches!(kind, MobProjectileKind::WitchSplash(_)) {
+                    dir[1] += 0.25;
+                }
+                let mut projectiles = live_mob_projectiles().lock().unwrap();
+                if projectiles.len() < MOB_CAP {
+                    projectiles.push(LiveMobProjectile {
+                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        owner: mob.eid,
+                        dim,
+                        kind,
+                        pos: origin,
+                        velocity: dir.map(|axis| axis * speed),
+                        power,
+                        age: 0,
+                    });
+                }
+            }
+            MeleeDamage {
+                target_eid,
+                amount,
+                knockback_y,
+            } => {
+                if let Some(player) = player(target_eid) {
+                    live_mob_melee(mob, player.client, pos, amount, knockback_y.max(0.35));
+                }
+            }
+            SonicBoom { target_eid, damage } => {
+                if let Some(player) = player(target_eid) {
+                    live_mob_damage_player(
+                        player.client,
+                        pos,
+                        diff_mob_dmg(damage),
+                        None,
+                        Some(0.5),
+                    );
+                }
+            }
+            Explosion { pos, power } => live_mob_explosion(dim, pos, power, players),
+            Teleport { to: [x, y, z] } => {
+                let (yaw, pitch) = {
+                    let mut position = mob.pos.lock().unwrap();
+                    *position = (x, y, z, position.3, position.4);
+                    (position.3, position.4)
+                };
+                mob.vel.lock().unwrap().fill(0.0);
+                broadcast_seen(mob.eid, |_| {
+                    (
+                        0x70,
+                        entity_teleport(mob.eid, x, y, z, yaw, pitch, mob.etype == 33),
+                    )
+                });
+            }
+            ConvertEntity { target_etype } => {
+                convert_live_mob(mob, dim, target_etype);
+                return false;
+            }
+            DropItem { item, count } => {
+                if let Some(id) =
+                    name_to_item(item).filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) != 0)
+                {
+                    drop_live_stack((pos[0], pos[1], pos[2]), (id, count, Vec::new()));
+                }
+            }
+            SpawnSplitChildren { etype, size, count } => {
+                let hp = f32::from(size as u8).powi(2);
+                let offset = f64::from(size as u8) * 0.26;
+                for i in 0..count {
+                    let dx = if i % 2 == 0 { -offset } else { offset };
+                    let dz = if i < 2 { -offset } else { offset };
+                    insert_live_mob(
+                        etype,
+                        dim,
+                        (pos[0] + dx, pos[1] + 0.5, pos[2] + dz, 0.0, 0.0),
+                        hp,
+                        Some(size),
+                    );
+                }
+            }
+            ApplyPotion {
+                target_eid,
+                effect,
+                duration_ticks,
+            } => {
+                if target_eid == mob.eid {
+                    let ticks = server_ticks(u64::from(duration_ticks));
+                    if let Some(state) = live_mob_states().lock().unwrap().get_mut(&mob.eid) {
+                        state.potions.retain(|&(old, _)| old != effect);
+                        state
+                            .potions
+                            .push((effect, TICK.load(Ordering::Relaxed) + ticks));
+                    }
+                    broadcast_seen(mob.eid, |_| {
+                        (
+                            0x76,
+                            entity_effect_pkt(
+                                mob.eid,
+                                live_witch_effect_id(effect),
+                                0,
+                                ticks as i32,
+                            ),
+                        )
+                    });
+                } else if let Some(player) = player(target_eid) {
+                    live_mob_player_effect(
+                        player.client,
+                        live_witch_effect_id(effect),
+                        duration_ticks,
+                    );
+                }
+            }
+            HealSelf(amount) => {
+                let mut hp = mob.hp.lock().unwrap();
+                if *hp > 0.0 {
+                    let max_hp = entity_spec_by_id(mob.etype).unwrap().max_health;
+                    *hp = (*hp + amount).min(max_hp);
+                }
+            }
+            OpenEndExitPortal { spawn_egg, xp } if dim == DimId::End => {
+                let y = live_dragon_portal_y(dim);
+                let portal = name_to_state("end_portal").unwrap();
+                let first = block_at_dim(dim, 1, y, 0) != portal;
+                let rewards = DragonFightRewards {
+                    exit_portal_base: [0, y, 0],
+                    dragon_egg: (first && spawn_egg).then_some([0, y + 4, 0]),
+                    xp: if first { xp } else { 500 },
+                };
+                rewards.place_bedrock_exit_portal(|[x, y, z], name| {
+                    if let Some(state) = name_to_state(name) {
+                        set_block_dim(dim, x, y, z, state);
+                        note_block_update_dim(dim, x, y, z, state);
+                    }
+                });
+                xps().lock().unwrap().push(Xp {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: 0.5,
+                    y: f64::from(y + 1),
+                    z: 0.5,
+                    val: rewards.xp as i16,
+                    age: 0,
+                });
+            }
+            OpenEndExitPortal { .. } => {}
+            WarningSignal => {
+                let status = match mob.etype {
+                    116 => Some(62), // Warden sonic charge
+                    _ => None,
+                };
+                if let Some(status) = status {
+                    let mut packet = mob.eid.to_be_bytes().to_vec();
+                    packet.push(status);
+                    broadcast_seen(mob.eid, |_| (0x1f, packet.clone()));
+                } else {
+                    let packet = sound_pkt_named("entity.ghast.warn", pos[0], pos[1], pos[2]);
+                    broadcast_seen(mob.eid, |_| (0x68, packet.clone()));
+                }
+            }
+            PiglinBarter { player_eid, loot } => {
+                if let Some(id) = name_to_item(loot.item) {
+                    let comps = if let Some(potion) = loot.potion {
+                        parse_item_comps(&format!("{}[potion_contents={}]", loot.item, potion))
+                    } else if let Some(level) = loot.soul_speed {
+                        let component = if loot.item == "enchanted_book" {
+                            COMP_STORED_ENCHANTMENTS
+                        } else {
+                            COMP_ENCHANTMENTS
+                        };
+                        vec![(
+                            component,
+                            enchantments_data(&[(35, i64::from(level))], true),
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut drops = drops().lock().unwrap();
+                    if drops.len() < DROP_CAP {
+                        drops.push(Drop {
+                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                            x: pos[0],
+                            y: pos[1] + 0.5,
+                            z: pos[2],
+                            item: id,
+                            cnt: loot.count,
+                            comps,
+                            age: 0,
+                            target: player(player_eid).map(|p| p.client.uuid),
+                            thrower: None,
+                        });
+                    }
+                }
+            }
+            DragonFlameBreath => live_dragon_breath(dim, pos),
+            DragonPerchAttack => {
+                for player in players.iter().filter(|p| {
+                    p.dim == dim && entity_distance_sq(p.pos, (pos[0], pos[1], pos[2])) <= 16.0
+                }) {
+                    live_mob_melee(mob, player.client, pos, 10.0, 0.5);
+                }
+            }
+        }
+    }
+    true
+}
+
+fn live_mob_death(mob: &Arc<Mob>, state: Option<LiveMobState>, pos: [f64; 3]) {
+    let state = state.unwrap_or_else(|| LiveMobState::new(mob.etype, DimId::Overworld));
+    sitting_cats().lock().unwrap().remove(&mob.eid);
+    if let Some(behavior) = state.behavior {
+        apply_live_mob_effects(mob, state.dim, pos, behavior.on_death(), &[]);
+    }
+}
+
+fn mob_tick() {
+    let clients = client_snapshot();
+    let players: Vec<_> = clients.iter().map(LiveMobPlayer::new).collect();
+    // PR #66: despawn before taking the simulation snapshot.
+    tick_natural_hostile_despawn();
+    let mobs_snap = {
+        let mobs = mobs().lock().unwrap();
+        let states = &mut *live_mob_states().lock().unwrap();
+        let alive: HashSet<_> = mobs.iter().map(|mob| mob.eid).collect();
+        LIVE_MOB_AI.with(|ai| ai.borrow_mut().retain(|eid, _| alive.contains(eid)));
+        states.retain(|eid, _| alive.contains(eid));
+        mobs.iter()
+            .map(|mob| {
+                (
+                    mob.clone(),
+                    states
+                        .get(&mob.eid)
+                        .map_or(DimId::Overworld, |state| state.dim),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if players.is_empty() {
+        return;
+    }
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    tick_live_mob_projectiles(reg, &players);
+    for dim in [DimId::Overworld, DimId::Nether, DimId::End] {
+        let mobs: Vec<_> = mobs_snap
+            .iter()
+            .filter(|(_, d)| *d == dim)
+            .map(|(mob, _)| mob.clone())
+            .collect();
+        if !mobs.is_empty() && players.iter().any(|player| player.dim == dim) {
+            live_mob_tick_dimension(dim, reg, &mobs, &players);
+        }
+    }
+}
+
+fn live_mob_tick_dimension(
+    dim: DimId,
+    reg: &crate::block_registry::BReg,
+    mobs_snap: &[Arc<Mob>],
+    players: &[LiveMobPlayer<'_>],
+) {
+    let clients: Vec<_> = players
+        .iter()
+        .filter(|p| p.dim == dim)
+        .map(|p| p.client.clone())
+        .collect();
+    let grid = EntitySpatialGrid::build_mobs_and_clients(mobs_snap, &clients);
+    let (dead_by_cramming, hot) = {
+        let region = region_guard();
+        // The existing push and fluid owners use Overworld block lookups.
+        let dead = if dim == DimId::Overworld {
+            apply_entity_push_step(mobs_snap, &clients, &region, &grid)
+        } else {
+            vec![false; mobs_snap.len()]
+        };
+        let hot: Vec<_> = grid
+            .entities
+            .iter()
+            .take(mobs_snap.len())
+            .map(|entity| region.is_hot(entity.x.floor() as i32, entity.z.floor() as i32))
+            .collect();
+        (dead, hot)
+    };
     let mut breed_scratch = SpatialScratch::default();
     let mut breed_cands = Vec::new();
-
+    let world = LiveWorldPathAdapter::new(dim, reg);
+    let crystals: Vec<_> = mobs_snap
+        .iter()
+        .filter(|mob| mob.etype == 30)
+        .map(|mob| {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            DragonCrystal {
+                entity: mob.eid,
+                position: [x, y, z],
+            }
+        })
+        .collect();
+    let tick = TICK.load(Ordering::Relaxed);
     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
     let day = !(13000..=23000).contains(&wt);
+    let raining = dim == DimId::Overworld && RAINING.load(Ordering::Relaxed) != 0;
+    let hostile = DIFFICULTY.load(Ordering::Relaxed) != 0;
     for (mob_idx, m) in mobs_snap.iter().enumerate() {
         if dead_by_cramming[mob_idx] {
             continue;
         }
         let mut mp = m.pos.lock().unwrap();
-        // died from last tick's fall/environmental damage
         if *m.hp.lock().unwrap() <= 0.0 {
-            let (mx, my, mz) = (mp.0, mp.1, mp.2);
-            let (et, mburn) = (m.etype, *m.fuse.lock().unwrap() > 0);
+            let (mx, my, mz, ..) = *mp;
             drop(mp);
-            mob_env_die(m.eid, et, mx, my, mz, mburn);
+            mob_env_die(m.eid, m.etype, mx, my, mz, *m.fuse.lock().unwrap() > 0);
             continue;
         }
-        if !region.is_hot(mp.0 as i32, mp.2 as i32) {
+        if !hot[mob_idx] {
             continue;
         }
-        // suffocation: head cell buried in a solid block -> 1hp/0.5s (vanilla)
-        if TICK
-            .load(Ordering::Relaxed)
-            .is_multiple_of(server_ticks(10))
-            && mob_cell_solid(mp.0, mp.1 + 1.0, mp.2)
-        {
-            let mut hp = m.hp.lock().unwrap();
-            *hp -= 1.0;
-            let mdead = *hp <= 0.0;
-            drop(hp);
-            broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
-            if mdead {
-                let (mx, my, mz) = (mp.0, mp.1, mp.2);
-                let (et, mburn) = (m.etype, *m.fuse.lock().unwrap() > 0);
-                drop(mp);
-                mob_env_die(m.eid, et, mx, my, mz, mburn);
-                continue;
-            }
+        let Some(spec) = entity_spec_by_id(m.etype) else {
+            continue;
+        };
+        if spec.max_health <= 0.0 {
+            continue;
         }
-        let water_state = mob_water_state(m.etype, mp.0, mp.1, mp.2);
-        if water_state.in_fluid && matches!(m.etype, 124 | 91) {
+        let [bx, by, bz] = [mp.0, mp.1, mp.2].map(|value| value.floor() as i32);
+        let feet_state = block_at_dim(dim, bx, by, bz);
+        let (in_water, in_lava) = if dim == DimId::Overworld {
+            (
+                mob_in_water(m.etype, mp.0, mp.1, mp.2),
+                mob_in_lava(m.etype, mp.0, mp.1, mp.2),
+            )
+        } else {
+            (
+                reg.has_water(feet_state),
+                reg.fluid_name(feet_state) == "minecraft:lava",
+            )
+        };
+        if in_water && matches!(m.etype, 124 | 91) {
             *m.fuse.lock().unwrap() = 0;
         }
-        // `LivingEntity.travel` fluid branches (`btn.a(Lexc;)V`): the fluid current push
-        // (`Entity.baseTick`), buoyancy/sink, the `0.8F` water and `0.5` lava drag and
-        // `getFluidFallingAdjustedMovement` all live in `src/entity_fluid.rs`, and the move
-        // itself goes through the `Entity.move` owner in `src/entity_collision.rs`.
-        if let Some(travel) = mob_fluid_travel_tick(m, &mut mp) {
-            if travel.moved[0] != 0.0 || travel.moved[1] != 0.0 || travel.moved[2] != 0.0 {
-                let (x, y, z, yaw, pitch) = *mp;
-                let on_ground = mob_has_support(m.etype, x, y, z);
-                broadcast_seen(m.eid, |_c| {
-                    (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, on_ground))
-                });
+        // GP-1 hands vertical travel in fluids to LivingEntity.travel.
+        if dim == DimId::Overworld && (in_water || in_lava) {
+            if let Some(travel) = mob_fluid_travel_tick(m, &mut mp) {
+                if travel.moved != [0.0; 3] {
+                    let (x, y, z, yaw, pitch) = *mp;
+                    let grounded = mob_has_support(m.etype, x, y, z);
+                    broadcast_seen(m.eid, |_| {
+                        (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, grounded))
+                    });
+                }
+            }
+        } else {
+            m.vel.lock().unwrap().fill(0.0);
+        }
+        let submerged =
+            dim == DimId::Overworld && mob_drowning_submerged(m.etype, mp.0, mp.1, mp.2);
+        let mut damage = 0.0;
+        if tick.is_multiple_of(server_ticks(10)) {
+            if m.etype != 31
+                && if dim == DimId::Overworld {
+                    mob_cell_solid(mp.0, mp.1 + 1.0, mp.2)
+                } else {
+                    reg.blocks_motion(block_at_dim(dim, bx, by + 1, bz))
+                }
+            {
+                damage += 1.0;
+            }
+            if in_lava && !mob_fire_immune(m.etype) {
+                damage += 4.0;
             }
         }
-        // lava contact: 1.21.1 Entity.isInLava + EntityType$Builder.fireImmune
-        if !mob_fire_immune(m.etype)
-            && mob_in_lava(m.etype, mp.0, mp.1, mp.2)
-            && TICK
-                .load(Ordering::Relaxed)
-                .is_multiple_of(server_ticks(10))
-        {
-            let mut hp = m.hp.lock().unwrap();
-            *hp -= 4.0;
-            let dead = *hp <= 0.0;
-            drop(hp);
-            broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
-            if dead {
-                let (mx, my, mz) = (mp.0, mp.1, mp.2);
-                let et = m.etype;
-                drop(mp);
-                mob_env_die(m.eid, et, mx, my, mz, true);
-                continue;
-            }
-        }
-        // drowning: 1.21.1 Entity.updateFluidOnEyes + LivingEntity.baseTick (!bubble_column); undead don't drown
         if !matches!(m.etype, 124 | 91) {
-            let submerged = mob_drowning_submerged(m.etype, mp.0, mp.1, mp.2);
             let mut air = m.air.lock().unwrap();
             if !submerged {
                 *air = server_ticks(AIR_SUPPLY_GT) as i32;
             } else if *air > 0 {
                 *air -= 1;
-            } else if TICK
-                .load(Ordering::Relaxed)
-                .is_multiple_of(server_ticks(20))
-            {
-                drop(air);
-                let mut hp = m.hp.lock().unwrap();
-                *hp -= 2.0;
-                let dead = *hp <= 0.0;
-                drop(hp);
-                broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
-                if dead {
-                    let (mx, my, mz) = (mp.0, mp.1, mp.2);
-                    let (et, mburn) = (m.etype, *m.fuse.lock().unwrap() > 0);
-                    drop(mp);
-                    mob_env_die(m.eid, et, mx, my, mz, mburn);
-                    continue;
-                }
+            } else if tick.is_multiple_of(server_ticks(20)) {
+                damage += 2.0;
             }
         }
-        // undead burn in daylight with clear sky (suppressed in water: Entity.baseTick clearFire)
-        if day && matches!(m.etype, 124 | 91) && !water_state.in_fluid {
-            let (bx, by, bz) = (
-                mp.0.round() as i32,
-                mp.1.round() as i32,
-                mp.2.round() as i32,
-            );
-            let exposed = RAINING.load(Ordering::Relaxed) == 0
-                && by + 1 >= height_at(bx, bz)
-                && block_at(bx, by + 2, bz) == 0;
+        if matches!(m.etype, 124 | 91) {
             let mut burn = m.fuse.lock().unwrap();
-            if exposed {
+            if dim == DimId::Overworld
+                && day
+                && !in_water
+                && !raining
+                && by + 1 >= height_at(bx, bz)
+                && block_at(bx, by + 2, bz) == 0
+            {
                 *burn += 1;
                 if *burn >= server_ticks(MOB_BURN_TICK_GT) as i32 {
                     *burn = 0;
-                    drop(burn);
-                    drop(mp);
-                    // on-fire flag: entity flags byte idx0 bit0x01
-                    let mut md = Vec::new();
-                    write_varint(&mut md, m.eid as i64);
-                    md.push(0);
-                    md.push(0);
-                    md.push(1);
-                    md.push(0xff);
-                    // drop meta streams via interest_tick
-                    let mut hp = m.hp.lock().unwrap();
-                    *hp -= 1.0;
-                    let dead = *hp <= 0.0;
-                    drop(hp);
-                    broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
-                    if dead {
-                        let (mx, my, mz) = {
-                            let p = m.pos.lock().unwrap();
-                            (p.0, p.1, p.2)
-                        };
-                        mobs().lock().unwrap().retain(|x| x.eid != m.eid);
-                        broadcast_seen_destroy(m.eid);
-                        for (item, cnt, comps) in mob_loot(m.etype, true)
-                            .into_iter()
-                            .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
-                        {
-                            let d = Drop {
-                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                x: mx,
-                                y: my,
-                                z: mz,
-                                item,
-                                cnt,
-                                comps,
-                                age: 0,
-                                target: None,
-                                thrower: None,
-                            };
-                            drops().lock().unwrap().push(d);
-                        }
-                    }
-                    continue;
+                    damage += 1.0;
                 }
-            } else if *burn != 0 {
+            } else {
                 *burn = 0;
-                drop(burn);
+            }
+        }
+        if m.etype == 8 && in_water && tick.is_multiple_of(server_ticks(20)) {
+            damage += blaze_hazard_damage(BlazeHazard::Water);
+        }
+        if damage > 0.0 {
+            let hp = {
+                let mut hp = m.hp.lock().unwrap();
+                *hp -= damage;
+                *hp
+            };
+            *m.hurt_at.lock().unwrap() = Instant::now();
+            broadcast_seen(m.eid, |_| (0x24, hurt_anim(m.eid)));
+            if hp <= 0.0 {
+                let (x, y, z, ..) = *mp;
                 drop(mp);
-                let mut md = Vec::new();
-                write_varint(&mut md, m.eid as i64);
-                md.push(0);
-                md.push(0);
-                md.push(0);
-                md.push(0xff);
-                // drop meta streams via interest_tick
+                mob_env_die(
+                    m.eid,
+                    m.etype,
+                    x,
+                    y,
+                    z,
+                    in_lava || *m.fuse.lock().unwrap() > 0,
+                );
                 continue;
             }
         }
-        // creeper: approach then fuse+explode
-        if m.etype == 23 {
-            let mut best: Option<(f64, f64, f64)> = None;
-            let mut bd = f64::MAX;
-            for &(_eid, px, py, pz) in &cls {
-                let d = (px - mp.0).powi(2) + (pz - mp.2).powi(2);
-                if d < bd {
-                    bd = d;
-                    best = Some((px, py, pz));
-                }
-            }
-            if let Some((px, _py, pz)) = best {
-                let mut fuse = m.fuse.lock().unwrap();
-                if bd < 9.0 {
-                    *fuse += 1;
-                    if *fuse >= server_ticks(CREEPER_IGNITE_GT) as i32 {
-                        // explode: crater radius 3 (skip bedrock), damage nearby players
-                        let (cx, cy, cz) = (
-                            mp.0.round() as i32,
-                            mp.1.round() as i32,
-                            mp.2.round() as i32,
-                        );
-                        let (ex, ey, ez) = (mp.0, mp.1, mp.2);
-                        drop(mp);
-                        let mut recs: Vec<(i8, i8, i8)> = vec![];
-                        for dx in -3i32..=3 {
-                            for dy in -3i32..=3 {
-                                for dz in -3i32..=3 {
-                                    if dx * dx + dy * dy + dz * dz > 9 {
-                                        continue;
-                                    }
-                                    let (bx, by, bz) = (cx + dx, cy + dy, cz + dz);
-                                    let st = block_at(bx, by, bz);
-                                    if st == 0
-                                        || st == 79
-                                        || GR_MOB_GRIEFING.load(Ordering::Relaxed) == 0
-                                    {
-                                        continue;
-                                    }
-                                    set_block(bx, by, bz, 0);
-                                    recs.push((dx as i8, dy as i8, dz as i8));
-                                    note_block_update(bx, by, bz, 0);
-                                }
-                            }
+
+        let position = (mp.0, mp.1, mp.2);
+        let pos = [mp.0, mp.1, mp.2];
+        drop(mp);
+        let distance = |player: &&LiveMobPlayer<'_>| entity_distance_sq(position, player.pos);
+        let local = || players.iter().filter(|player| player.dim == dim);
+        let nearest = local()
+            .filter(|p| !p.client.is_spectator())
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)));
+        let target = local()
+            .filter(|p| p.attackable && hostile && distance(p) <= 64.0f64.powi(2))
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)));
+        let target = if matches!(
+            m.etype,
+            8 | 23 | 31 | 45 | 91 | 116 | 118 | 119 | 124 | 100 | 16 | 27 | 33 | 54 | 88 | 102
+        ) {
+            target
+        } else {
+            None
+        };
+        let perception = target.map(|target| {
+            let mut p = target.perceive();
+            p.line_of_sight = live_mob_block_hit(
+                dim,
+                reg,
+                [pos[0], pos[1] + f64::from(spec.eye_height), pos[2]],
+                [p.position.0, p.position.1 + 1.62, p.position.2],
+            )
+            .is_none();
+            p
+        });
+
+        if matches!(
+            m.etype,
+            8 | 15 | 31 | 33 | 45 | 51 | 67 | 78 | 88 | 93 | 116 | 118 | 119 | 122
+        ) {
+            let hp = *m.hp.lock().unwrap();
+            let effects = live_mob_behavior_step(
+                m,
+                reg,
+                MobBehaviorTickCtx {
+                    dim,
+                    pos,
+                    hp,
+                    max_hp: spec.max_health,
+                    in_water,
+                    in_rain: raining && by + 1 >= height_at(bx, bz),
+                    on_fire: reg.name_of(feet_state) == "minecraft:fire",
+                    nearest_target: target.zip(perception).map(|(target, seen)| {
+                        MobTargetSnapshot {
+                            eid: seen.entity_id,
+                            pos: [target.pos.0, target.pos.1, target.pos.2],
+                            hp: *target.client.hp.lock().unwrap(),
+                            visible: seen.line_of_sight,
                         }
-                        broadcast(-1, |_c| (0x20, explosion_pkt(ex, ey, ez, &recs)));
-                        for &(_eid, px, py, pz) in &cls {
-                            let dd =
-                                ((px - ex).powi(2) + (py - ey).powi(2) + (pz - ez).powi(2))
-                                    .sqrt();
-                            if dd < 5.0 {
-                                let c = clients().lock().unwrap();
-                                if let Some(cl) = c.iter().find(|c| c.eid == _eid) {
-                                    if *cl.gm.lock().unwrap() == 1 {
-                                        continue;
-                                    }
-                                    let raw = ((1.0 - dd / 6.5).max(0.0)
-                                        * diff_expl_dmg(43.0) as f64)
-                                        as f32;
-                                    let Some(accepted) = damage_after_invulnerability(cl, raw)
-                                    else {
-                                        continue;
-                                    };
-                                    let mut h = cl.hp.lock().unwrap();
-                                    *h =
-                                        (*h - hurt_absorb(cl, dmg_after(cl, accepted, 2))).max(0.0);
-                                    if *h <= 0.0 {
-                                        drop(h);
-                                        totem_check(cl);
-                                        h = cl.hp.lock().unwrap();
-                                    }
-                                    let hh = *h;
-                                    drop(h);
-                                    damage_armor(cl, raw);
-                                    if let Ok(mut w) = cl.sock.lock() {
-                                        let _ = send_packet(&mut w, 0x24, hurt_anim(cl.eid));
-                                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, cl));
-                                    }
-                                }
-                            }
-                        }
-                        drop(fuse);
-                        let deid = m.eid;
-                        mobs().lock().unwrap().retain(|m| m.eid != deid);
-                        broadcast_seen_destroy(deid);
-                        return;
-                    }
-                } else if bd < 24.0 * 24.0 {
-                    *fuse = 0;
-                    drop(fuse);
-                    let dx = px - mp.0;
-                    let dz = pz - mp.2;
-                    let len = (dx * dx + dz * dz).sqrt();
-                    mob_collide_move(m, &mut mp, dx / len * 0.25, dz / len * 0.25);
-                    mp.3 = (dx.atan2(dz) * 180.0 / std::f64::consts::PI) as f32 - 180.0;
-                    drop(mp);
-                    let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap();
-                    broadcast_seen(m.eid, |_c| {
-                        (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
-                    });
-                    broadcast_seen(m.eid, |_c| (0x48, head_rot(m.eid, yaw)));
-                } else {
-                    drop(fuse);
-                }
-            }
-            continue;
-        }
-        // sheared sheep regrow wool by eating grass
-        if m.etype == 87 && sheared().lock().unwrap().contains(&m.eid) {
-            let (bx, by, bz) = (
-                mp.0.round() as i32,
-                mp.1.round() as i32,
-                mp.2.round() as i32,
+                    }),
+                    rng_u64: world_rng::next_u64(),
+                },
+                target,
+                &crystals,
             );
-            if block_at(bx, by - 1, bz) == name_to_state("grass_block").unwrap_or(u32::MAX)
-                && ((m.eid as u64).wrapping_mul(1103515245) ^ TICK.load(Ordering::Relaxed))
-                    .is_multiple_of(MOB_SPAWN_CHANCE_DENOMINATOR)
-            {
-                drop(mp);
-                set_block(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
-                sheared().lock().unwrap().remove(&m.eid);
-                note_block_update(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
-                mp = m.pos.lock().unwrap();
+            let teleported = effects
+                .iter()
+                .any(|effect| matches!(effect, MobBehaviorEffect::Teleport { .. }));
+            if !apply_live_mob_effects(m, dim, pos, effects, players) || teleported {
+                continue;
             }
         }
-        // passive mobs: slow wander + breeding (two loved animals -> baby)
-        if matches!(m.etype, 22 | 77 | 87 | 19) {
-            let landing = mob_snap_y(m, &mut mp);
-            drop(mp);
-            if let Some((landing_pos, fall)) = landing {
-                if landing::cow_land(m, landing_pos, fall) {
-                    m.pos.lock().unwrap().1 += 1.0 / 16.0;
+
+        if m.etype == 87
+            && dim == DimId::Overworld
+            && sheared().lock().unwrap().contains(&m.eid)
+            && block_at(bx, by - 1, bz) == name_to_state("grass_block").unwrap_or(u32::MAX)
+            && ((m.eid as u64).wrapping_mul(1103515245) ^ tick)
+                .is_multiple_of(MOB_SPAWN_CHANCE_DENOMINATOR)
+        {
+            set_block(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
+            sheared().lock().unwrap().remove(&m.eid);
+            note_block_update(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
+        }
+
+        let in_love = {
+            let mut love = m.love.lock().unwrap();
+            *love = (*love - 1).max(0);
+            *love > 0
+        };
+        let mate = if in_love {
+            grid.query_radius_xz_into(
+                pos[0],
+                pos[2],
+                8.0,
+                m.eid,
+                &mut breed_scratch,
+                &mut breed_cands,
+            );
+            breed_cands.iter().find_map(|&slot| {
+                let entity = &grid.entities[slot as usize];
+                if !entity.is_mob || entity.etype != m.etype || dead_by_cramming[entity.idx] {
+                    return None;
                 }
+                let mate = &mobs_snap[entity.idx];
+                if *mate.love.lock().unwrap() <= 0 || *mate.hp.lock().unwrap() <= 0.0 {
+                    return None;
+                }
+                let (x, y, z, ..) = *mate.pos.lock().unwrap();
+                let mut p = AiEntityPerception::new(mate.eid, (x, y, z));
+                p.in_love = true;
+                p.compatible = true;
+                Some((mate, p))
+            })
+        } else {
+            None
+        };
+        // Keep immediate breeding for already-nearby animals, including cramming fixtures.
+        if let Some((mate, p)) = mate {
+            if entity_distance_sq(position, p.position) <= 9.0 {
+                live_mob_breed(m, mate, dim, position, p.position);
+                continue;
             }
-            let mut mp = m.pos.lock().unwrap();
-            let mut lov = m.love.lock().unwrap();
-            if *lov > 0 {
-                *lov -= 1;
-                grid.query_radius_xz_into(mp.0, mp.2, 4.0, m.eid, &mut breed_scratch, &mut breed_cands);
-                let partner = breed_cands.iter().find_map(|&slot| {
-                    let ent = &grid.entities[slot as usize];
-                    if !ent.is_mob || ent.etype != m.etype || dead_by_cramming[ent.idx] {
-                        return None;
-                    }
-                    let p = &mobs_snap[ent.idx];
-                    (*p.love.lock().unwrap() > 0).then_some(p)
-                });
-                if let Some(p) = partner {
-                    *lov = 0;
-                    *p.love.lock().unwrap() = 0;
-                    let q = *p.pos.lock().unwrap();
-                    let (bx, bz) = ((mp.0 + q.0) / 2.0, (mp.2 + q.2) / 2.0);
-                    let by = surface_y(bx.round() as i32, bz.round() as i32);
-                    drop(lov);
-                    drop(mp);
-                    let baby = Arc::new(Mob {
-                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                        uuid: [0u8; 16],
-                        etype: m.etype,
-                        pos: Mutex::new((bx, by, bz, 0.0, 0.0)),
-                        hp: Mutex::new(20.0),
-                        last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                        hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                        last_hurt_tick: Mutex::new(None),
-                        vel: Mutex::new([0.0; 3]),
-                        fuse: Mutex::new(0),
-                        love: Mutex::new(0),
-                        air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
-                    });
-                    if mobs().lock().unwrap().len() >= MOB_CAP {
-                        continue;
-                    }
-                    mobs().lock().unwrap().push(baby);
-                    let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                    xps().lock().unwrap().push(Xp {
-                        eid: xeid,
-                        x: bx,
-                        y: by,
-                        z: bz,
-                        val: (1 + world_rng::next_u64() % 7) as i16,
-                        age: 0,
-                    });
-                    // spawn streams via interest_tick
-                    continue;
+        }
+
+        let tempting = match m.etype {
+            19 => Some(853),
+            22 | 87 => Some(854),
+            77 => Some(1097),
+            _ => None,
+        };
+        let look = tempting
+            .and_then(|item| {
+                local()
+                    .filter(|p| {
+                        p.held_item == Some(item) && !p.client.is_spectator() && distance(p) < 100.0
+                    })
+                    .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+            })
+            .or(nearest);
+        let goal_ctx = GoalContext {
+            position,
+            width: spec.width,
+            height: f64::from(spec.height),
+            in_water,
+            in_lava,
+            on_fire: reg.name_of(feet_state) == "minecraft:fire",
+            recently_hurt: m.hurt_at.lock().unwrap().elapsed() < Duration::from_secs(2),
+            in_love,
+            target: perception
+                .filter(|p| entity_distance_sq(position, p.position) <= 24.0f64.powi(2)),
+            nearest_player: look.map(LiveMobPlayer::perceive),
+            mate: mate.map(|(_, p)| p),
+            world: Some(&world),
+        };
+        let (result, waypoint_y) = LIVE_MOB_AI.with(|ai| {
+            let mut ai = ai.borrow_mut();
+            let profile = ai.entry(m.eid).or_insert_with(|| new_live_mob_profile(m));
+            let result = tick_mob_ai_step(profile, &goal_ctx);
+            (
+                result,
+                profile.navigation.next_waypoint(&world).map(|p| p.1),
+            )
+        });
+        if m.etype == 23 {
+            // Water must not clear an already-active fuse.
+            let swell = result.swell.unwrap_or(false)
+                || (in_water
+                    && nearest.is_some_and(|p| {
+                        (p.pos.0 - pos[0]).powi(2) + (p.pos.2 - pos[2]).powi(2) < 9.0
+                    }));
+            let mut fuse = m.fuse.lock().unwrap();
+            *fuse = if swell { *fuse + 1 } else { (*fuse - 1).max(0) };
+            if *fuse >= server_ticks(CREEPER_IGNITE_GT) as i32 {
+                drop(fuse);
+                if remove_live_mob(m.eid).is_some() {
+                    live_mob_explosion(dim, pos, 3.0, players);
+                    broadcast_seen_destroy(m.eid);
                 }
+                continue;
             }
-            drop(lov);
-            // follow nearest player holding wheat within 9 blocks
-            let mut tgt: Option<(f64, f64)> = None;
-            let mut bd = f64::MAX;
-            for &(hx, _hy, hz) in &wheat_holders {
-                let d = (hx - mp.0).powi(2) + (hz - mp.2).powi(2);
-                if d < 81.0 && d < bd {
-                    bd = d;
-                    tgt = Some((hx, hz));
-                }
+        }
+        if let Some((mate, p)) = mate {
+            if result.breed_target == Some(p.entity_id) {
+                live_mob_breed(m, mate, dim, position, p.position);
             }
-            if let Some((tx, tz)) = tgt {
-                if bd > 2.0 {
-                    let dx = tx - mp.0;
-                    let dz = tz - mp.2;
-                    let len = (dx * dx + dz * dz).sqrt().max(0.01);
-                    mob_collide_move(m, &mut mp, dx / len * 0.28, dz / len * 0.28);
-                }
-                mp.3 = ((-((tx - mp.0).atan2(tz - mp.2))) as f32).to_degrees();
-                let (x, y, z, yaw, pitch) = *mp;
-                drop(mp);
-                broadcast_seen(m.eid, |_c| {
-                    (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
-                });
-            } else if (m.eid as i64 + TICK.load(Ordering::Relaxed) as i64)
-                % (MOB_SPAWN_CHANCE_DENOMINATOR / 12) as i64
-                == 0
-            {
-                let t = ((m.eid as u32).wrapping_mul(2654435761u32)
-                    ^ (TICK.load(Ordering::Relaxed) as u32)) as f64
-                    / 4294967295.0
-                    * std::f64::consts::TAU;
-                mob_collide_move(m, &mut mp, t.cos() * 2.0, t.sin() * 2.0);
-                drop(mp);
-                let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap();
-                broadcast_seen(m.eid, |_c| {
-                    (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
-                });
+        }
+        let sitting = matches!(m.etype, 15 | 122)
+            && live_mob_states().lock().unwrap().get(&m.eid).is_some_and(|state| {
+                matches!(&state.behavior, Some(MobBehaviorState::Cat(pet) | MobBehaviorState::Wolf(pet)) if pet.sitting)
+            });
+        live_mob_move(
+            m,
+            waypoint_y,
+            dim,
+            reg,
+            if sitting {
+                MobAiStepResult::default()
             } else {
-                drop(mp);
-            }
-            continue;
-        }
-        // skeleton: hold 6-12 b range, shoot arrows every ~3 s
-        if m.etype == 91 {
-            let mut best: Option<(f64, f64, f64)> = None;
-            let mut bd = f64::MAX;
-            for &(_eid, px, py, pz) in &cls {
-                let d = (px - mp.0).powi(2) + (pz - mp.2).powi(2);
-                if d < bd {
-                    bd = d;
-                    best = Some((px, py, pz));
-                }
-            }
-            if let Some((px, py, pz)) = best {
-                let dist = bd.sqrt();
-                // reposition: back off if <5, approach if >12
-                if dist > 12.0 || dist < 5.0 {
-                    let dir = if dist > 12.0 { 1.0 } else { -1.0 };
-                    let dx = px - mp.0;
-                    let dz = pz - mp.2;
-                    let len = (dx * dx + dz * dz).sqrt().max(0.01);
-                    mob_collide_move(m, &mut mp, dx / len * 0.22 * dir, dz / len * 0.22 * dir);
-                    let (x, y, z, yaw, pitch) = *mp;
-                    broadcast_seen(m.eid, |_c| {
-                        (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
-                    });
-                }
-                // fire every ~3 s when in range
-                let mut lh = m.last_hit.lock().unwrap();
-                if lh.elapsed() > Duration::from_millis(3000) && dist < 16.0 {
-                    *lh = Instant::now();
-                    drop(lh);
-                    let (sx, sy, sz) = (mp.0, mp.1 + 1.6, mp.2);
-                    drop(mp);
-                    let (tx, ty, tz) = (px, py + 1.2, pz);
-                    let (mut vx, mut vy, mut vz) = (tx - sx, ty - sy, tz - sz);
-                    let vl = (vx * vx + vy * vy + vz * vz).sqrt().max(0.01);
-                    vx /= vl;
-                    vy /= vl;
-                    vz /= vl;
-                    let a = Arrow {
-                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                        owner: -1,
-                        x: sx,
-                        y: sy,
-                        z: sz,
-                        dx: vx,
-                        dy: vy,
-                        dz: vz,
-                        ttl: server_ticks(MOB_ARROW_TTL_GT) as i32,
-                        dmg: diff_mob_dmg(3.0),
-                        fire: 0,
-                        punch: 0,
-                        kind: 0,
-                        loy: 0,
-                        ret_item: 0,
-                        ret_comps: Vec::new(),
-                        pierce: 0,
-                        last_hit: -1,
-                        stuck: false,
-                    };
-                    arrows().lock().unwrap().push(a);
-                    // spawn streams via interest_tick
-                }
-            }
-            continue;
-        }
-        // chase nearest player within 24 blocks (zombie=124 only)
-        if m.etype == 124 {
-            let mut best: Option<(f64, f64, f64)> = None;
-            let mut bd = f64::MAX;
-            for &(_eid, px, py, pz) in &cls {
-                let d = (px - mp.0).powi(2) + (pz - mp.2).powi(2);
-                if d < bd {
-                    bd = d;
-                    best = Some((px, py, pz));
-                }
-            }
-            if let Some((px, _py, pz)) = best {
-                // melee: within 2.5 blocks, 1s cooldown -> damage that player
-                if bd < 2.5 * 2.5 {
-                    let mut lh = m.last_hit.lock().unwrap();
-                    if lh.elapsed() > Duration::from_millis(1000) {
-                        *lh = Instant::now();
-                        drop(lh);
-                        drop(mp);
-                        // find which client is nearest & hurt them
-                        let mut hurt_eid = None;
-                        {
-                            let c = client_snapshot();
-                            for cl in c.iter() {
-                                let (cp0, _cp1, cp2) = {
-                                    let cp = cl.pos.lock().unwrap();
-                                    (cp.0, cp.1, cp.2)
-                                };
-                                let (mx, _my, mz) = {
-                                    let mp2 = m.pos.lock().unwrap();
-                                    (mp2.0, mp2.1, mp2.2)
-                                };
-                                let dd = (cp0 - mx).powi(2) + (cp2 - mz).powi(2);
-                                if dd < 6.0 && *cl.gm.lock().unwrap() != 1 {
-                                    let bl = *cl.blocking.lock().unwrap()
-                                        && cl.shield_cd.lock().unwrap().elapsed()
-                                            > Duration::from_secs(5);
-                                    let raw = if bl { 0.0 } else { diff_mob_dmg(3.0) };
-                                    let Some(accepted) = damage_after_invulnerability(cl, raw)
-                                    else {
-                                        continue;
-                                    };
-                                    if bl {
-                                        damage_shield(cl, 2.0);
-                                    }
-                                    let mut h = cl.hp.lock().unwrap();
-                                    let dmg = dmg_after(cl, accepted, 0);
-                                    *h = (*h - hurt_absorb(cl, dmg)).max(0.0);
-                                    if dmg > 0.0 {
-                                        damage_armor(cl, 2.0);
-                                    }
-                                    // thorns: lvl*15% chance to reflect 1-4 dmg to the attacker
-                                    // (vanilla only triggers when the hit lands, not when blocked)
-                                    {
-                                        let th: i64 = {
-                                            let iv = cl.inv.lock().unwrap();
-                                            [5i16, 6, 7, 8]
-                                                .iter()
-                                                .map(|s| {
-                                                    enchant_level(
-                                                        &iv.get(s)
-                                                            .map(|v| v.2.clone())
-                                                            .unwrap_or_default(),
-                                                        38,
-                                                    )
-                                                })
-                                                .sum()
-                                        };
-                                        if dmg > 0.0
-                                            && th > 0
-                                            && (world_rng::next_u64() % 100) < (th * 15) as u64
-                                        {
-                                            let refl = 1.0 + (world_rng::next_u64() % 4) as f32;
-                                            let mut mh = m.hp.lock().unwrap();
-                                            *mh -= refl;
-                                            let mdead = *mh <= 0.0;
-                                            drop(mh);
-                                            broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
-                                            if mdead {
-                                                let (mx, my, mz, ..) = {
-                                                    let mp2 = m.pos.lock().unwrap();
-                                                    (mp2.0, mp2.1, mp2.2)
-                                                };
-                                                mobs().lock().unwrap().retain(|x| x.eid != m.eid);
-                                                broadcast_seen_destroy(m.eid);
-                                                let mburn = *m.fuse.lock().unwrap() > 0;
-                                                for (item, cnt, comps) in mob_loot(m.etype, mburn)
-                                                    .into_iter()
-                                                    .filter(|_| {
-                                                        GR_MOB_LOOT.load(Ordering::Relaxed) == 1
-                                                    })
-                                                {
-                                                    drops().lock().unwrap().push(Drop {
-                                                        eid: NEXT_EID
-                                                            .fetch_add(1, Ordering::SeqCst),
-                                                        x: mx,
-                                                        y: my,
-                                                        z: mz,
-                                                        item,
-                                                        cnt,
-                                                        comps,
-                                                        age: 0,
-                                                        target: None,
-                                                        thrower: None,
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if *h <= 0.0 {
-                                        drop(h);
-                                        totem_check(cl);
-                                        h = cl.hp.lock().unwrap();
-                                    }
-                                    let hh = *h;
-                                    drop(h);
-                                    if let Ok(mut w) = cl.sock.lock() {
-                                        let _ = send_packet(&mut w, 0x24, hurt_anim(cl.eid));
-                                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, cl));
-                                    }
-                                    hurt_eid = Some((cl.eid, cl.name.clone(), hh));
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some((eid, vname, hh)) = hurt_eid {
-                            broadcast_seen_ex(eid, eid, |_c| (0x24, hurt_anim(eid)));
-                            if hh <= 0.0 {
-                                let mn = match m.etype {
-                                    124 => "Zombie",
-                                    91 => "Skeleton",
-                                    23 => "Creeper",
-                                    _ => "mob",
-                                };
-                                let line = system_chat(&format!("{} was slain by {}", vname, mn));
-                                broadcast(-1, |_c| (0x6c, line.clone()));
-                            }
-                        }
-                        continue;
-                    }
-                }
-                if bd < 24.0 * 24.0 && bd > 1.0 {
-                    let dx = px - mp.0;
-                    let dz = pz - mp.2;
-                    let len = (dx * dx + dz * dz).sqrt();
-                    mob_collide_move(m, &mut mp, dx / len * 0.25, dz / len * 0.25);
-                    mp.3 = (dx.atan2(dz) * 180.0 / std::f64::consts::PI) as f32 - 180.0;
-                    drop(mp);
-                    let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap();
-                    broadcast_seen(m.eid, |_c| {
-                        (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
-                    });
-                    broadcast_seen(m.eid, |_c| (0x48, head_rot(m.eid, yaw)));
-                    continue;
-                }
+                result
+            },
+            in_water || in_lava,
+        );
+        if let Some(player) = target.filter(|p| result.attack_target == Some(p.client.eid)) {
+            if m.etype == 91 && dim == DimId::Overworld {
+                live_skeleton_shoot(m, pos, player.pos);
+            } else if m.etype != 91 && perception.is_some_and(|p| p.line_of_sight) {
+                live_mob_melee(m, player.client, pos, 3.0, 0.35);
             }
         }
+    }
+}
+
+fn live_mob_breed(mob: &Mob, mate: &Mob, dim: DimId, a: (f64, f64, f64), b: (f64, f64, f64)) {
+    let (x, z) = ((a.0 + b.0) / 2.0, (a.2 + b.2) / 2.0);
+    let y = if dim == DimId::Overworld {
+        surface_y(x.floor() as i32, z.floor() as i32)
+    } else {
+        a.1
+    };
+    let hp = default_mob_hp(entity_spec_by_id(mob.etype).unwrap().name);
+    if insert_live_mob(mob.etype, dim, (x, y, z, 0.0, 0.0), hp, None) {
+        *mob.love.lock().unwrap() = 0;
+        *mate.love.lock().unwrap() = 0;
+        xps().lock().unwrap().push(Xp {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x,
+            y,
+            z,
+            val: (1 + world_rng::next_u64() % 7) as i16,
+            age: 0,
+        });
     }
 }
 
@@ -6561,15 +7722,19 @@ fn materialize_generation_payloads_inner(
 }
 fn default_mob_hp(id: &str) -> f32 {
     let short = id.strip_prefix("minecraft:").unwrap_or(id);
-    if short == "magma_cube" {
+    if matches!(short, "magma_cube" | "slime") {
         return 16.0;
+    }
+    if short == "wither" {
+        return WitherBehavior::MAX_HP / 3.0;
     }
     if matches!(
         short,
         "elder_guardian" | "witch" | "cat" | "cow" | "pig" | "shulker"
             | "evoker" | "vindicator" | "pillager" | "piglin" | "spider"
             | "piglin_brute" | "hoglin" | "iron_golem" | "cave_spider"
-            | "silverfish" | "sheep" | "camel"
+            | "silverfish" | "sheep" | "camel" | "ender_dragon" | "warden" | "wolf"
+            | "ghast" | "enderman"
     ) {
         return entity_spec_by_name(id)
             .map(|spec| spec.max_health)
@@ -16822,6 +17987,7 @@ fn particle_id(n: &str) -> Option<i32> {
 /// four types this runtime can simulate, and keep the old rotation only when the
 /// biome has no usable entry. This is not NaturalSpawner: placement, group size,
 /// difficulty and category caps are still the tick loop's own contract.
+#[cfg(test)]
 fn spawn_etype_for_biome(biome: Option<&str>, attempt: u64) -> i64 {
     biome
         .and_then(|b| feature::choose_supported_hostile(b, attempt))
@@ -25946,27 +27112,26 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             } else { "usage: /setblock x y z <block>".into() }
         }
         "summon" => {
-            if args.len() >= 4 {
-                let et = name_to_etype(args[0]).unwrap_or(124);
-                let (x, y, z) = (coord(args[1], ctx.x), coord(args[2], ctx.y), coord(args[3], ctx.z));
-                if args[0] == "tnt" {
-                    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                    primed().lock().unwrap().push(Primed { eid, x, y, z, left: server_ticks(TNT_FUSE_GT) as i32 });
-                    "Summoned tnt".to_string()
-                } else {
-                    let hp = default_mob_hp(args[0]);
-                    let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
-                        etype: et, pos: Mutex::new((x, y, z, 0.0, 0.0)), hp: Mutex::new(hp),
-                        last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                        last_hurt_tick: Mutex::new(None),
-                        vel: Mutex::new([0.0; 3]),
-                        fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
-                    if mobs().lock().unwrap().len() >= MOB_CAP { "mob cap reached".into() } else {
-                    mobs().lock().unwrap().push(m);
-                    format!("Summoned {}", args[0])
-                    }
-                }
-            } else { "usage: /summon <entity> x y z".into() }
+            if args.len() < 4 {
+                return "usage: /summon <entity> x y z".into();
+            }
+            let Some(etype) = name_to_etype(args[0]) else {
+                return format!("Unknown entity {}", args[0]);
+            };
+            let (x, y, z) = (coord(args[1], ctx.x), coord(args[2], ctx.y), coord(args[3], ctx.z));
+            if ![x, y, z].into_iter().all(f64::is_finite)
+                || x.abs() >= 30_000_000.0 || z.abs() >= 30_000_000.0 || y.abs() > 30_000_000.0
+            {
+                return "Invalid summon position".into();
+            }
+            let dim = cmd_dim(ctx);
+            if etype == 106 && dim == DimId::Overworld {
+                let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                primed().lock().unwrap().push(Primed { eid, x, y, z, left: server_ticks(TNT_FUSE_GT) as i32 });
+            } else if !insert_live_mob(etype, dim, (x, y, z, 0.0, 0.0), default_mob_hp(args[0]), None) {
+                return "mob cap reached".into();
+            }
+            format!("Summoned {}", args[0])
         }
         "give" => {
             // /give <target> <item>[comps] [count] — the item arg may carry a
@@ -26594,13 +27759,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     ms.iter().find(|m| m.eid == eid).map(|m| {
                         let mut h = m.hp.lock().unwrap(); *h -= amt; *h <= 0.0
                     }).unwrap_or(false) };
-                if let Some(m) = mobs().lock().unwrap().iter().find(|m| m.eid == eid).cloned() {
+                let mob = mobs().lock().unwrap().iter().find(|m| m.eid == eid).cloned();
+                if let Some(m) = mob {
+                    *m.hurt_at.lock().unwrap() = Instant::now();
                     broadcast_seen(eid, |_c| (0x24, hurt_anim(eid)));
                     if dead {
                         let (mx, my, mz) = { let p = m.pos.lock().unwrap(); (p.0, p.1, p.2) };
                         let et = m.etype;
-                        mobs().lock().unwrap().retain(|x| x.eid != eid);
-                        broadcast_seen_destroy(eid);
                         kill_mob(eid, et, mx, my, mz);
                     }
                     n += 1;
@@ -28540,6 +29705,9 @@ fn handle(mut s: TcpStream) {
                         }
                         continue;
                     }
+                    if live_mob_interact(&me, target, 36 + held_slot) {
+                        continue;
+                    }
                     // interact: villagers open trade UI; wheat breeds animals
                     let villager = mobs()
                         .lock()
@@ -28627,14 +29795,19 @@ fn handle(mut s: TcpStream) {
                             continue;
                         }
                     }
-                    if held_it == 854 && !is_villager {
-                        // wheat -> love mode on farm animals
+                    if matches!(held_it, 853 | 854 | 1097) && !is_villager {
+                        // Keep the legacy wheat interaction and accept the GP-1 temptation items.
                         let mut loved = false;
                         {
                             let ms = mobs().lock().unwrap();
                             if let Some(m) = ms
                                 .iter()
-                                .find(|m| m.eid == target && [19i64, 22, 77, 87].contains(&m.etype))
+                                .find(|m| m.eid == target && match m.etype {
+                                    19 => matches!(held_it, 853 | 854),
+                                    77 => matches!(held_it, 854 | 1097),
+                                    22 | 87 => held_it == 854,
+                                    _ => false,
+                                })
                             {
                                 *m.love.lock().unwrap() = 80;
                                 loved = true;
@@ -28857,10 +30030,16 @@ fn handle(mut s: TcpStream) {
                     {
                         let ms = mobs().lock().unwrap();
                         if let Some(m) = ms.iter().find(|m| m.eid == target) {
+                            if live_mob_dim(m.eid) != *me.dim.lock().unwrap() {
+                                continue;
+                            }
                             // vanilla hurtTime: 0.5s of invulnerability after a hit
                             let fresh =
                                 m.hurt_at.lock().unwrap().elapsed() >= Duration::from_millis(500);
                             if fresh {
+                                if !live_mob_hit_allowed(m, me.eid, BossHit::Other) {
+                                    continue;
+                                }
                                 *m.hurt_at.lock().unwrap() = Instant::now();
                             }
                             if fresh {
@@ -29044,14 +30223,9 @@ fn handle(mut s: TcpStream) {
                         };
                         let line = system_chat(&format!("{} was slain by {}", mn, me.name));
                         broadcast(-1, |_c| (0x6c, line.clone()));
-                        let burn_kill = mobs()
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .find(|m| m.eid == deid)
-                            .map(|m| *m.fuse.lock().unwrap() > 0)
-                            .unwrap_or(false);
-                        mobs().lock().unwrap().retain(|m| m.eid != deid);
+                        let Some((mob, state)) = remove_live_mob(deid) else { continue };
+                        let burn_kill = *mob.fuse.lock().unwrap() > 0;
+                        live_mob_death(&mob, state, [mx, my, mz]);
                         broadcast_seen_destroy(deid);
                         let was_sheared = sheared().lock().unwrap().remove(&deid);
                         // looting: +0..level extra count per drop
