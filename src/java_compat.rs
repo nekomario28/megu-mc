@@ -30,6 +30,9 @@ use std::{
     thread::{self, ThreadId},
 };
 
+#[cfg(all(unix, feature = "neoforge-events"))]
+use std::os::unix::fs::DirBuilderExt;
+
 static TRAMPLE: OnceLock<bool> = OnceLock::new();
 static OWNER: OnceLock<ThreadId> = OnceLock::new();
 static SERVER: OnceLock<bool> = OnceLock::new();
@@ -55,10 +58,11 @@ pub(crate) fn apply_s1_outcome(outcome: S1EventOutcome) -> Result<BatchCommitRep
     }
     // Validate typed callers as well as wire callers before changing any block.
     for mutation in &outcome.mutations {
-        if let MutationOp::SetBlockIf { dim, .. } = mutation {
-            if usize::from(*dim) >= super::DimId::ALL.len() {
-                return Err(format!("invalid S1 dimension slot {dim}"));
-            }
+        if let MutationOp::SetBlockIf { dim, pos, .. } = mutation {
+            let dim = super::DimId::ALL
+                .get(usize::from(*dim))
+                .ok_or_else(|| format!("invalid S1 dimension slot {dim}"))?;
+            super::check_modification_bounds(*dim, *pos)?;
         }
     }
     super::with_save_guard(|| {
@@ -72,6 +76,13 @@ pub(crate) fn apply_s1_outcome(outcome: S1EventOutcome) -> Result<BatchCommitRep
                 } => {
                     let dim = super::DimId::ALL[usize::from(dim)];
                     if super::set_block_if_dim(dim, x, y, z, new_state, expected_state) {
+                        super::note_block_update_dim(
+                            dim,
+                            x,
+                            y,
+                            z,
+                            super::block_at_dim(dim, x, y, z),
+                        );
                         report.applied_blocks += 1;
                     } else {
                         report.skipped_cas_blocks += 1;
@@ -90,13 +101,13 @@ pub(crate) fn apply_s1_outcome(outcome: S1EventOutcome) -> Result<BatchCommitRep
     Ok(report)
 }
 
-#[allow(dead_code)] // S1 requests will be routed by the server separately from trample.
-pub(crate) enum S1Event<'a> {
+#[cfg_attr(not(feature = "neoforge-events"), allow(dead_code))]
+pub(crate) enum S1Event<T> {
     BlockBreak {
         dim: u8,
         pos: (i32, i32, i32),
         state: u32,
-        player: (i32, &'a str),
+        player: (i32, T),
         exp_to_drop: i32,
     },
     BlockPlace {
@@ -105,24 +116,24 @@ pub(crate) enum S1Event<'a> {
         replaced: u32,
         placed: u32,
         against: u32,
-        player: (i32, &'a str),
+        player: (i32, T),
     },
-    PlayerLogin(i32, &'a str),
-    PlayerLogout(i32, &'a str),
+    PlayerLogin(i32, T),
+    PlayerLogout(i32, T),
     ServerChat {
-        player: (i32, &'a str),
-        raw_text: &'a str,
+        player: (i32, T),
+        raw_text: T,
     },
     RegisterCommands,
 }
 
 /// Dispatch a NeoForge S1 event on the JVM owner. This is staging only. A
 /// Java exception or an invalid wire batch returns no outcome to commit.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "neoforge-events"), allow(dead_code))]
 pub(crate) fn dispatch_s1_event(
     env: &mut JNIEnv,
     hooks: &JClass,
-    event: S1Event<'_>,
+    event: S1Event<impl AsRef<str>>,
 ) -> Result<S1EventOutcome, String> {
     if OWNER.get() != Some(&thread::current().id()) {
         return Err("S1 dispatch requires the JVM owner thread".into());
@@ -137,7 +148,7 @@ pub(crate) fn dispatch_s1_event(
                 player: (eid, name),
                 exp_to_drop,
             } => {
-                let name = env.new_string(name)?;
+                let name = env.new_string(name.as_ref())?;
                 env.call_static_method(
                     hooks,
                     "dispatchBlockBreakEncoded",
@@ -162,7 +173,7 @@ pub(crate) fn dispatch_s1_event(
                 against,
                 player: (eid, name),
             } => {
-                let name = env.new_string(name)?;
+                let name = env.new_string(name.as_ref())?;
                 env.call_static_method(
                     hooks,
                     "dispatchBlockPlaceEncoded",
@@ -180,8 +191,8 @@ pub(crate) fn dispatch_s1_event(
                     ],
                 )
             }
-            S1Event::PlayerLogin(eid, name) | S1Event::PlayerLogout(eid, name) => {
-                let name = env.new_string(name)?;
+            S1Event::PlayerLogin(eid, ref name) | S1Event::PlayerLogout(eid, ref name) => {
+                let name = env.new_string(name.as_ref())?;
                 let method = if matches!(event, S1Event::PlayerLogin(..)) {
                     "dispatchPlayerLoginEncoded"
                 } else {
@@ -198,8 +209,8 @@ pub(crate) fn dispatch_s1_event(
                 player: (eid, name),
                 raw_text,
             } => {
-                let name = env.new_string(name)?;
-                let raw_text = env.new_string(raw_text)?;
+                let name = env.new_string(name.as_ref())?;
+                let raw_text = env.new_string(raw_text.as_ref())?;
                 env.call_static_method(
                     hooks,
                     "dispatchServerChatEncoded",
@@ -270,7 +281,6 @@ impl<'local> S3DirectBuffer<'local> {
 
 /// One reusable request/response slot on the attached NeoForge JVM owner.
 #[cfg(feature = "neoforge-events")]
-#[allow(dead_code)] // The tick owner can use this once it supplies S3 activations.
 pub(crate) struct S3BatchBridge<'local> {
     class: AutoLocal<'local, JClass<'local>>,
     dispatch: JStaticMethodID,
@@ -282,7 +292,6 @@ pub(crate) struct S3BatchBridge<'local> {
 }
 
 #[cfg(feature = "neoforge-events")]
-#[allow(dead_code)]
 impl<'local> S3BatchBridge<'local> {
     pub(crate) fn bind(env: &mut JNIEnv<'local>) -> Result<Self, String> {
         if OWNER.get() != Some(&thread::current().id()) {
@@ -371,7 +380,6 @@ fn require_s4_owner() -> Result<(), String> {
 
 /// Dispatch one C2S payload and return its entire S2C batch in one Java invocation.
 #[cfg(feature = "neoforge-events")]
-#[allow(dead_code)] // Available to the host owner.
 pub(crate) fn dispatch_s4_payload(
     env: &mut JNIEnv,
     player_eid: i32,
@@ -761,6 +769,11 @@ pub fn serve(
         let classpath = std::fs::read_to_string(classpath_file)?;
         let jvm = create_jvm(&classpath)?;
         let mut env = jvm.attach_current_thread()?;
+        #[cfg(feature = "neoforge-events")]
+        let staged = match loader {
+            Loader::NeoForge => StagedMods::from_env()?,
+            Loader::Fabric => None,
+        };
         let setup = (|| -> Result<jni::objects::GlobalRef, Box<dyn std::error::Error>> {
             let bootstrap = match loader {
                 Loader::Fabric => {
@@ -768,8 +781,27 @@ pub fn serve(
                     "net/mcspine/probe/Bootstrap"
                 }
                 Loader::NeoForge => {
-                    let directory =
-                        JObject::from(env.new_string(std::env::current_dir()?.to_string_lossy())?);
+                    let version = env
+                        .call_static_method(
+                            "java/lang/Runtime",
+                            "version",
+                            "()Ljava/lang/Runtime$Version;",
+                            &[],
+                        )?
+                        .l()?;
+                    if env.call_method(&version, "feature", "()I", &[])?.i()? != 21 {
+                        return Err("NeoForge requires Java 21".into());
+                    }
+                    let directory = std::env::current_dir()?;
+                    #[cfg(feature = "neoforge-events")]
+                    let directory = staged.as_ref().map_or(directory, |staged| staged.0.clone());
+                    let directory = JObject::from(
+                        env.new_string(
+                            directory
+                                .to_str()
+                                .ok_or("Invalid NeoForge server directory")?,
+                        )?,
+                    );
                     let host = env
                         .call_static_method(
                             "net/mcspine/neoforge/Bootstrap",
@@ -778,8 +810,6 @@ pub fn serve(
                             &[JValue::Object(&directory)],
                         )?
                         .l()?;
-                    #[cfg(feature = "neoforge-events")]
-                    fetch_registry_snapshot(&mut env)?;
                     register_host(&mut env, host)?;
                     "net/mcspine/neoforge/Bootstrap"
                 }
@@ -798,40 +828,19 @@ pub fn serve(
                 return Err(error);
             }
         };
+        #[cfg(feature = "neoforge-events")]
+        if matches!(loader, Loader::NeoForge) {
+            return serve_neoforge(
+                &mut env,
+                <&JClass>::from(hooks.as_obj()),
+                receive,
+                &ready,
+                staged,
+            );
+        }
         ready.send(Ok(())).map_err(|_| "Server startup abandoned")?;
         for request in receive {
-            let input = request.trample;
-            COMMITTED.store(false, super::Ordering::Relaxed);
-            *ACTIVE.lock().unwrap() = Some(input);
-            let (x, y, z) = input.position;
-            let outcome = env.with_local_frame(16, |env| {
-                env.call_static_method(
-                    <&JClass>::from(hooks.as_obj()),
-                    "land",
-                    "(IIIF)V",
-                    &[
-                        JValue::Int(x),
-                        JValue::Int(y),
-                        JValue::Int(z),
-                        JValue::Float(input.distance),
-                    ],
-                )?;
-                Ok::<(), jni::errors::Error>(())
-            });
-            *ACTIVE.lock().unwrap() = None;
-            let result = match outcome {
-                Ok(()) => Ok(COMMITTED.load(super::Ordering::Relaxed)),
-                Err(error) => {
-                    if env.exception_check()? {
-                        env.exception_describe()?;
-                        env.exception_clear()?;
-                    }
-                    Err(error.to_string())
-                }
-            };
-            let failed = result.is_err();
-            let _ = request.reply.send(result);
-            if failed {
+            if !serve_trample(&mut env, <&JClass>::from(hooks.as_obj()), request) {
                 return Err("Java callback failed; owner stopped".into());
             }
         }
@@ -841,6 +850,261 @@ pub fn serve(
         let _ = ready.send(Err(error.to_string()));
         eprintln!("[mod-compatibility] {error}");
     }
+}
+
+fn serve_trample(env: &mut JNIEnv, hooks: &JClass, request: Request) -> bool {
+    let input = request.trample;
+    COMMITTED.store(false, super::Ordering::Relaxed);
+    *ACTIVE.lock().unwrap() = Some(input);
+    let (x, y, z) = input.position;
+    let outcome = env.with_local_frame(16, |env| {
+        env.call_static_method(
+            hooks,
+            "land",
+            "(IIIF)V",
+            &[
+                JValue::Int(x),
+                JValue::Int(y),
+                JValue::Int(z),
+                JValue::Float(input.distance),
+            ],
+        )?;
+        Ok::<(), jni::errors::Error>(())
+    });
+    *ACTIVE.lock().unwrap() = None;
+    let result = outcome
+        .map(|()| COMMITTED.load(super::Ordering::Relaxed))
+        .map_err(|error| java_error(env, error));
+    let succeeded = result.is_ok();
+    let _ = request.reply.send(result);
+    succeeded
+}
+
+#[cfg(feature = "neoforge-events")]
+struct StagedMods(std::path::PathBuf);
+
+#[cfg(feature = "neoforge-events")]
+impl StagedMods {
+    fn from_env() -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let Some(paths) = std::env::var_os("MC_SPINE_NEOFORGE_MODS") else {
+            return Ok(None);
+        };
+        let directory = std::env::temp_dir().join(format!("mc-spine-mods-{}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(&directory)?;
+        let staged = Self(directory);
+        let mods = staged.0.join("mods");
+        std::fs::create_dir(&mods)?;
+        if !paths.is_empty() {
+            for path in std::env::split_paths(&paths) {
+                let name = path.file_name().ok_or("Missing NeoForge mod JAR name")?;
+                if path.extension().and_then(|ext| ext.to_str()) != Some("jar") || !path.is_file() {
+                    return Err(format!("Invalid NeoForge mod JAR: {}", path.display()).into());
+                }
+                let mut source = std::fs::File::open(&path)?;
+                let mut destination = std::fs::File::create_new(mods.join(name))?;
+                std::io::copy(&mut source, &mut destination)?;
+            }
+        }
+        Ok(Some(staged))
+    }
+}
+
+#[cfg(feature = "neoforge-events")]
+impl Drop for StagedMods {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("[mod-compatibility] Could not remove staged NeoForge JARs: {error}");
+        }
+    }
+}
+
+#[cfg(feature = "neoforge-events")]
+type NeoForgeJob = Box<
+    dyn for<'local> FnOnce(&mut JNIEnv<'local>, &JClass, &mut S3BatchBridge<'local>) -> bool + Send,
+>;
+
+#[cfg(feature = "neoforge-events")]
+pub(crate) struct NeoForgeRuntime {
+    pub(crate) registry: ModRegistrySnapshot,
+    pub(crate) commands: Vec<String>,
+    jobs: std::sync::mpsc::SyncSender<NeoForgeJob>,
+    staged: std::sync::Mutex<Option<StagedMods>>,
+}
+
+#[cfg(feature = "neoforge-events")]
+pub(crate) static NEOFORGE: OnceLock<NeoForgeRuntime> = OnceLock::new();
+
+#[cfg(feature = "neoforge-events")]
+impl NeoForgeRuntime {
+    // Callers wait without holding world or socket locks. Java only stages
+    // outcomes here, so normal Rust commits and packet writes stay on callers.
+    fn call<T: Send + 'static>(
+        &self,
+        dispatch: impl for<'local> FnOnce(
+                &mut JNIEnv<'local>,
+                &JClass,
+                &mut S3BatchBridge<'local>,
+            ) -> Result<T, String>
+            + Send
+            + 'static,
+    ) -> Result<T, String> {
+        let (send, receive) = std::sync::mpsc::channel();
+        self.jobs
+            .send(Box::new(move |env, hooks, batch| {
+                let _ = send.send(dispatch(env, hooks, batch));
+                true
+            }))
+            .map_err(|_| "NeoForge JVM owner stopped")?;
+        receive.recv().map_err(|_| "NeoForge callback terminated")?
+    }
+
+    pub(crate) fn cleanup_staged_mods(&self) {
+        self.staged.lock().unwrap().take();
+    }
+
+    pub(crate) fn event(&self, event: S1Event<String>) -> Result<S1EventOutcome, String> {
+        let outcome = self.call(move |env, hooks, _| dispatch_s1_event(env, hooks, event))?;
+        validate_mod_block_states(&self.registry, &outcome)?;
+        Ok(outcome)
+    }
+
+    /// Live player activations support guarded block writes and system messages.
+    /// Scheduling and inventory proposals require a block owner and lifetime.
+    pub(crate) fn player_ticks(
+        &self,
+        requests: Vec<S3TickRequest>,
+    ) -> Result<S1EventOutcome, String> {
+        let mutations = self.call(move |env, _, batch| {
+            batch
+                .dispatch(env, &requests)?
+                .map(|op| match op {
+                    S3BatchOp::SetBlockIf {
+                        dim,
+                        pos,
+                        new_state,
+                        expected_state,
+                    } => Ok(MutationOp::SetBlockIf {
+                        dim,
+                        pos,
+                        new_state,
+                        expected_state: Some(expected_state),
+                    }),
+                    S3BatchOp::SendSystemMessage {
+                        player_eid,
+                        message,
+                    } => Ok(MutationOp::SendSystemMessage {
+                        player_eid,
+                        message: message.into(),
+                    }),
+                    S3BatchOp::ScheduleTick { .. } | S3BatchOp::ContainerSlotDelta { .. } => Err(
+                        "S3 player tick cannot schedule a block tick or write a container".into(),
+                    ),
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        let outcome = S1EventOutcome {
+            canceled: false,
+            break_exp: None,
+            chat_message: None,
+            mutations,
+        };
+        validate_mod_block_states(&self.registry, &outcome)?;
+        Ok(outcome)
+    }
+
+    pub(crate) fn payload(
+        &self,
+        eid: i32,
+        name: String,
+        payload: CustomPayloadEnvelope,
+    ) -> Result<Vec<CustomPayloadEnvelope>, String> {
+        self.call(move |env, _, _| dispatch_s4_payload(env, eid, &name, &payload))
+    }
+}
+
+#[cfg(feature = "neoforge-events")]
+fn validate_mod_block_states(
+    registry: &ModRegistrySnapshot,
+    outcome: &S1EventOutcome,
+) -> Result<(), String> {
+    use crate::landing_types::{ModRegistry, FIRST_MOD_BLOCK_STATE_ID};
+    for mutation in &outcome.mutations {
+        if let MutationOp::SetBlockIf { new_state, .. } = mutation {
+            if *new_state >= FIRST_MOD_BLOCK_STATE_ID
+                && !registry.entries().iter().any(|entry| {
+                    entry.registry == ModRegistry::Block && entry.runtime_id == *new_state
+                })
+            {
+                return Err(format!("Unknown NeoForge block state {new_state}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "neoforge-events")]
+fn serve_neoforge(
+    env: &mut JNIEnv,
+    hooks: &JClass,
+    trample: std::sync::mpsc::Receiver<Request>,
+    ready: &std::sync::mpsc::Sender<Result<(), String>>,
+    staged: Option<StagedMods>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = fetch_registry_snapshot(env)?;
+    let outcome = dispatch_s1_event(env, hooks, S1Event::<&str>::RegisterCommands)?;
+    validate_mod_block_states(&registry, &outcome)?;
+    let mut commands = apply_s1_outcome(outcome)?.registered_commands;
+    if commands.iter().any(|literal| {
+        literal.is_empty()
+            || literal.starts_with('/')
+            || literal
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+            || literal.len() > 32767
+    }) {
+        return Err("Invalid S1 command literal".into());
+    }
+    super::exclude_native_neoforge_literals(&mut commands);
+    commands.sort_unstable();
+    commands.dedup();
+    let mut batch = S3BatchBridge::bind(env)?;
+    let (send, receive) = std::sync::mpsc::sync_channel::<NeoForgeJob>(64);
+
+    // landing::initialize owns the legacy typed channel. Its relay joins the
+    // same queue as Play callbacks so only this thread enters JNI.
+    let trample_jobs = send.clone();
+    thread::Builder::new()
+        .name("neoforge-landing-relay".into())
+        .spawn(move || {
+            for request in trample {
+                if trample_jobs
+                    .send(Box::new(move |env, hooks, _| {
+                        serve_trample(env, hooks, request)
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })?;
+    NEOFORGE
+        .set(NeoForgeRuntime {
+            registry,
+            commands,
+            jobs: send,
+            staged: std::sync::Mutex::new(staged),
+        })
+        .map_err(|_| "NeoForge runtime already initialized")?;
+    ready.send(Ok(())).map_err(|_| "Server startup abandoned")?;
+    for job in receive {
+        if !job(env, hooks, &mut batch) {
+            return Err("Java callback failed; owner stopped".into());
+        }
+    }
+    Ok(())
 }
 
 fn register_host(env: &mut JNIEnv, host: JObject) -> Result<(), jni::errors::Error> {

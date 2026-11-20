@@ -471,6 +471,7 @@ impl Client {
     }
 }
 static CLIENTS: OnceLock<Mutex<Vec<Arc<Client>>>> = OnceLock::new();
+const PLAYER_ENTITY_TYPE: i64 = 128; // minecraft:player in 1.21.1
 static NEXT_EID: AtomicI32 = AtomicI32::new(1000);
 fn clients() -> &'static Mutex<Vec<Arc<Client>>> {
     CLIENTS.get_or_init(|| Mutex::new(Vec::new()))
@@ -672,7 +673,7 @@ fn spawn_player(c: &Client) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, c.eid as i64);
     p.extend_from_slice(&c.uuid);
-    write_varint(&mut p, 128); // entity_type minecraft:player (1.21.1)
+    write_varint(&mut p, PLAYER_ENTITY_TYPE);
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
@@ -10830,14 +10831,16 @@ fn pending_blocks() -> &'static LockedMap<DimBlockPos, HashMap<u16, u32>> {
 fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
     note_block_update_dim(DimId::Overworld, x, y, z, st)
 }
-fn note_block_update_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
-    // anti-xray invariant: a hidden block that is not exposed must never
-    // reach the wire as its true id, on ANY path — chunk send AND deltas.
-    let out = if is_hidden(st) && !block_exposed_dim(dim, x, y, z) {
+fn visible_block_update_state(dim: DimId, x: i32, y: i32, z: i32, st: u32) -> u32 {
+    // A hidden, unexposed block's true ID cannot reach the wire.
+    if is_hidden(st) && !block_exposed_dim(dim, x, y, z) {
         hidden_filler(x, y, z, height_at(x, z))
     } else {
         st
-    };
+    }
+}
+fn note_block_update_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    let out = visible_block_update_state(dim, x, y, z, st);
     pending_blocks()
         .lock()
         .unwrap()
@@ -11628,6 +11631,7 @@ fn try_live_block_placement(
     face: usize,
     held: i16,
     item: i64,
+    _against: u32,
 ) -> bool {
     let Some(reg) = breg() else { return false };
     let (_, _, _, yaw, pitch, _) = *c.pos.lock().unwrap();
@@ -11638,11 +11642,15 @@ fn try_live_block_placement(
     if game_mode == 3 {
         return true;
     }
+    let old = block_at_dim(dim, x, y, z);
+    if !reg.is_replaceable(old) {
+        return true;
+    }
+    #[cfg(feature = "neoforge-events")]
+    if !neoforge_place_allowed(c, (dim, x, y, z), old, state, _against) {
+        return true;
+    }
     with_save_guard(|| {
-        let old = block_at_dim(dim, x, y, z);
-        if !reg.is_replaceable(old) {
-            return;
-        }
         if set_block_if_inner_dim(dim, x, y, z, state, Some(old)) {
             note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
             if game_mode != 1 {
@@ -14892,6 +14900,10 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
 // ---------- name -> id tables (generated from minecraft-data 1.21.1) ----------
 
 fn state_from_arg(arg: &str) -> Option<u32> {
+    #[cfg(feature = "neoforge-events")]
+    if let Some(state) = neoforge_block_state(arg) {
+        return Some(state);
+    }
     let (name, props) = match arg.split_once('[') {
         Some((n, rest)) => (
             n.trim_start_matches("minecraft:").to_string(),
@@ -16017,6 +16029,12 @@ pub(crate) fn name_to_state(n: &str) -> Option<u32> {
 }
 
 fn name_to_item(n: &str) -> Option<i64> {
+    #[cfg(feature = "neoforge-events")]
+    if let Some(state) = java_compat::NEOFORGE.get().and_then(|runtime| {
+        runtime.registry.runtime_id(landing_types::ModRegistry::Item, n)
+    }) {
+        return Some(i64::from(state));
+    }
     let n = n.strip_prefix("minecraft:").unwrap_or(n);
     Some(match n {
         "air" => 0,
@@ -26669,11 +26687,23 @@ fn block_modification_error(error: BlockModificationError) -> String {
     }
 }
 
+#[cfg(feature = "neoforge-events")]
+fn neoforge_block_state(name: &str) -> Option<u32> {
+    java_compat::NEOFORGE
+        .get()?
+        .registry
+        .runtime_id(landing_types::ModRegistry::Block, name)
+}
+
 fn modification_block_state(argument: &str) -> Option<u32> {
     let Some(registry) = breg() else {
         return state_from_arg(argument);
     };
     let Some((name, properties)) = argument.split_once('[') else {
+        #[cfg(feature = "neoforge-events")]
+        if let Some(state) = neoforge_block_state(argument) {
+            return Some(state);
+        }
         return registry.checked_state(argument, &[]);
     };
     let properties = properties.strip_suffix(']')?;
@@ -26868,6 +26898,173 @@ fn in_range(v: i64, r: &str) -> bool {
     }
 }
 
+#[cfg(feature = "neoforge-events")]
+fn neoforge_event(
+    source: &Client,
+    event: java_compat::S1Event<String>,
+) -> Result<Option<String>, String> {
+    let Some(runtime) = java_compat::NEOFORGE.get() else {
+        return Ok(None);
+    };
+    let mut outcome = runtime.event(event).inspect_err(|error| {
+        eprintln!("[mod-compatibility] NeoForge S1 callback: {error}");
+    })?;
+    if outcome.canceled {
+        return Err("canceled".into());
+    }
+    let chat = outcome.chat_message.take();
+    let report = java_compat::apply_s1_outcome(outcome).inspect_err(|error| {
+        eprintln!("[mod-compatibility] NeoForge S1 outcome: {error}");
+    })?;
+    deliver_neoforge_messages(Some(source), report.system_messages);
+    Ok(chat)
+}
+
+#[cfg(feature = "neoforge-events")]
+fn deliver_neoforge_messages(source: Option<&Client>, messages: Vec<(i32, String)>) {
+    if !messages.is_empty() {
+        let audience = client_snapshot();
+        for (eid, text) in messages {
+            let recipient = source.filter(|client| client.eid == eid).or_else(|| {
+                audience
+                    .iter()
+                    .find(|client| client.eid == eid)
+                    .map(Arc::as_ref)
+            });
+            if let Some(client) = recipient {
+                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&text));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "neoforge-events")]
+fn neoforge_player_tick() {
+    use landing_types::{S3Activation, S3TickRequest, S3_MAX_RECORDS};
+
+    let Some(runtime) = java_compat::NEOFORGE.get() else {
+        return;
+    };
+    let requests: Vec<_> = client_snapshot()
+        .into_iter()
+        .filter_map(|client| {
+            let (dim, x, y, z, ..) = client_dim_pos(&client);
+            if ![x, y, z].into_iter().all(f64::is_finite) {
+                return None;
+            }
+            let pos = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+            check_modification_bounds(dim, pos).ok()?;
+            Some(S3TickRequest {
+                activation: S3Activation::EntityTick,
+                // This activation uses protocol 767 entity type IDs as kinds.
+                kind: PLAYER_ENTITY_TYPE as u16,
+                dim: dim.index() as u8,
+                id: client.eid,
+                // EIDs are allocated for the connection lifetime.
+                generation: u32::try_from(client.eid).ok()?,
+                pos,
+                state: block_at_dim(dim, pos.0, pos.1, pos.2),
+            })
+        })
+        .collect();
+    for chunk in requests.chunks(S3_MAX_RECORDS) {
+        match runtime
+            .player_ticks(chunk.to_vec())
+            .and_then(java_compat::apply_s1_outcome)
+        {
+            Ok(report) => deliver_neoforge_messages(None, report.system_messages),
+            Err(error) => eprintln!("[mod-compatibility] NeoForge player tick: {error}"),
+        }
+    }
+}
+
+#[cfg(feature = "neoforge-events")]
+fn neoforge_resync_block(client: &Client, dim: DimId, (x, y, z): BlockPos) {
+    let state = block_at_dim(dim, x, y, z);
+    let visible = visible_block_update_state(dim, x, y, z, state);
+    let mut body = Vec::new();
+    write_pos(&mut body, x, y, z);
+    write_varint(&mut body, i64::from(visible));
+    let _ = send_packet(&mut client.sock.lock().unwrap(), 0x09, body);
+}
+
+#[cfg(feature = "neoforge-events")]
+fn neoforge_place_allowed(
+    client: &Client,
+    (dim, x, y, z): DimBlockPos,
+    replaced: u32,
+    placed: u32,
+    against: u32,
+) -> bool {
+    if java_compat::NEOFORGE.get().is_none() {
+        return true;
+    }
+    if neoforge_event(
+        client,
+        java_compat::S1Event::BlockPlace {
+            dim: dim.index() as u8,
+            pos: (x, y, z),
+            replaced,
+            placed,
+            against,
+            player: (client.eid, client.name.clone()),
+        },
+    )
+    .is_err()
+    {
+        neoforge_resync_block(client, dim, (x, y, z));
+        return false;
+    }
+    true
+}
+
+// 1.21.1 GameProtocols registers Custom Payload at 0x12 C2S and 0x19 S2C.
+#[cfg(feature = "neoforge-events")]
+fn neoforge_payload(client: &Client, mut body: &[u8]) {
+    use landing_types::{CustomPayloadEnvelope, S4_MAX_CHANNEL, S4_MAX_PAYLOAD};
+    let Some(runtime) = java_compat::NEOFORGE.get() else {
+        return;
+    };
+    let Some(len) = read_protocol_i32(&mut body).and_then(|n| usize::try_from(n).ok()) else {
+        return;
+    };
+    if len > S4_MAX_CHANNEL || len > body.len() || body.len() - len > S4_MAX_PAYLOAD {
+        return;
+    }
+    let (channel, bytes) = body.split_at(len);
+    let Ok(channel) = std::str::from_utf8(channel) else {
+        return;
+    };
+    if channel.starts_with("minecraft:") {
+        return;
+    }
+    let Ok(outbound) = runtime.payload(
+        client.eid,
+        client.name.clone(),
+        CustomPayloadEnvelope {
+            channel: channel.into(),
+            bytes: bytes.to_vec(),
+            target_eid: None,
+        },
+    ) else {
+        return;
+    };
+    if outbound.is_empty() {
+        return;
+    }
+    let audience = client_snapshot();
+    for envelope in outbound {
+        let mut packet = Vec::new();
+        write_str(&mut packet, &envelope.channel);
+        packet.extend_from_slice(&envelope.bytes);
+        for recipient in &audience {
+            if envelope.target_eid.is_none_or(|eid| eid == recipient.eid) {
+                let _ = send_packet(&mut recipient.sock.lock().unwrap(), 0x19, packet.clone());
+            }
+        }
+    }
+}
+
 fn run_command(me: Option<&Arc<Client>>, msg: &str, s: &mut Option<&Client>) {
     let ctx = match me {
         Some(c) => {
@@ -27040,6 +27237,27 @@ fn command_tree(admin: bool) -> brigadier::CommandNode<()> {
 }
 
 fn command_dispatcher(
+    admin: bool,
+    completions: Option<&CommandCompletions>,
+) -> brigadier::CommandDispatcher<()> {
+    let dispatcher = native_command_dispatcher(admin, completions);
+    #[cfg(feature = "neoforge-events")]
+    if let Some(runtime) = java_compat::NEOFORGE.get() {
+        for name in &runtime.commands {
+            dispatcher.register(PlayCommandBuilder::literal(name))
+                .expect("validated NeoForge command literal");
+        }
+    }
+    dispatcher
+}
+
+#[cfg(feature = "neoforge-events")]
+fn exclude_native_neoforge_literals(literals: &mut Vec<String>) {
+    let dispatcher = native_command_dispatcher(true, None);
+    literals.retain(|name| dispatcher.root().child(name).is_none());
+}
+
+fn native_command_dispatcher(
     admin: bool,
     completions: Option<&CommandCompletions>,
 ) -> brigadier::CommandDispatcher<()> {
@@ -27282,8 +27500,18 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
 
     let args: Vec<&str> = it.collect();
     let admin = me.is_none_or(|player| player_is_admin(&player.name));
+    #[cfg(feature = "neoforge-events")]
+    let mod_literal = java_compat::NEOFORGE.get().is_some_and(|runtime| {
+        runtime.commands.binary_search_by(|name| name.as_str().cmp(cmd)).is_ok()
+    });
+    #[cfg(not(feature = "neoforge-events"))]
+    let mod_literal = false;
     if !admin && !command_allowed_for_player(cmd, &args) {
-        let reply = "You do not have permission to run that command";
+        let reply = if mod_literal {
+            "The NeoForge shim exposes this command literal without a handler"
+        } else {
+            "You do not have permission to run that command"
+        };
         if let Some(client) = s {
             let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(reply));
         }
@@ -27523,6 +27751,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             save_world();
             std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_millis(150)); // flush reply
+                #[cfg(feature = "neoforge-events")]
+                if let Some(runtime) = java_compat::NEOFORGE.get() {
+                    runtime.cleanup_staged_mods();
+                }
                 std::process::exit(0);
             });
             "Stopping the server".into()
@@ -28465,6 +28697,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         }
         "seed" => WORLD_SEED.load(Ordering::Relaxed).to_string(),
         "" => "".into(),
+        _ if mod_literal => "The NeoForge shim exposes this command literal without a handler".into(),
         _ => format!("Unknown command: {}", cmd),
     };
     if !reply.is_empty() {
@@ -28921,6 +29154,13 @@ fn handle(mut s: TcpStream) {
                 }),
             },
         );
+    }
+    // Java sees the login before the tick thread can snapshot this player.
+    #[cfg(feature = "neoforge-events")]
+    if java_compat::NEOFORGE.get().is_some() {
+        let _ = neoforge_event(&me, java_compat::S1Event::PlayerLogin(me.eid, me.name.clone()));
+    }
+    {
         let mut cls = clients().lock().unwrap();
         *me.chunks.lock().unwrap() = sent;
         for c in cls.iter() {
@@ -29585,6 +29825,24 @@ fn handle(mut s: TcpStream) {
                         note_block_update_dim(dim, x, y, z, old); // rejected: resync truth
                     }
                     if break_now {
+                        #[cfg(feature = "neoforge-events")]
+                        if java_compat::NEOFORGE.get().is_some() {
+                            let result = neoforge_event(&me, java_compat::S1Event::BlockBreak {
+                                dim: dim.index() as u8,
+                                pos: (x, y, z),
+                                state: old,
+                                player: (me.eid, me.name.clone()),
+                                exp_to_drop: 0,
+                            });
+                            if result.is_err() || !set_block_if_dim(dim, x, y, z, 0, Some(old)) {
+                                neoforge_resync_block(&me, dim, (x, y, z));
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                                continue;
+                            }
+                        } else {
+                            set_block_dim(dim, x, y, z, 0);
+                        }
+                        #[cfg(not(feature = "neoforge-events"))]
                         set_block_dim(dim, x, y, z, 0);
                         note_block_update_dim(dim, x, y, z, 0);
                         if *me.gm.lock().unwrap() != 1 {
@@ -29730,6 +29988,24 @@ fn handle(mut s: TcpStream) {
                 let (tx, ty, tz) = (x + dx, y + dy, z + dz);
                 let dim = *me.dim.lock().unwrap();
                 let clicked = block_at_dim(dim, x, y, z);
+                let place = |pos: BlockPos, state| {
+                    #[cfg(feature = "neoforge-events")]
+                    if java_compat::NEOFORGE.get().is_some() {
+                        let (x, y, z) = pos;
+                        let old = block_at_dim(dim, x, y, z);
+                        if !neoforge_place_allowed(&me, (dim, x, y, z), old, state, clicked) {
+                            return false;
+                        }
+                        if !set_block_if_dim(dim, x, y, z, state, Some(old)) {
+                            neoforge_resync_block(&me, dim, pos);
+                            return false;
+                        }
+                        note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
+                        return true;
+                    }
+                    place_block(pos.0, pos.1, pos.2, state);
+                    true
+                };
                 let sneaking = *me.sneaking.lock().unwrap();
                 if !sneaking
                     && (open_live_block_menu(&me, (dim, x, y, z), clicked)
@@ -29743,8 +30019,14 @@ fn handle(mut s: TcpStream) {
                 if dim != DimId::Overworld {
                     let held = me.inv.lock().unwrap().get(&(36 + held_slot)).map(|s| s.0);
                     if let Some(item) = held {
-                        if try_live_block_placement(&me, (dim, tx, ty, tz), face.clamp(0, 5) as usize, held_slot, item)
-                        {
+                        if try_live_block_placement(
+                            &me,
+                            (dim, tx, ty, tz),
+                            face.clamp(0, 5) as usize,
+                            held_slot,
+                            item,
+                            clicked,
+                        ) {
                             let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                             continue;
                         }
@@ -29926,7 +30208,10 @@ fn handle(mut s: TcpStream) {
                     );
                     if (item == 909 || item == 910) && replaceable {
                         let st = if item == 909 { 80 } else { 96 };
-                        place_block(tx, ty, tz, st);
+                        if !place((tx, ty, tz), st) {
+                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                            continue;
+                        }
                         if *me.gm.lock().unwrap() != 1 {
                             let mut inv = me.inv.lock().unwrap();
                             inv.insert(36 + held_slot, (908, 1, Vec::new()));
@@ -30024,8 +30309,10 @@ fn handle(mut s: TcpStream) {
                     let tillable = matches!(block_at(x, y, z), 9 | 10 | 12513);
                     if is_hoe && tillable && face == 1 {
                         let fm = name_to_state("farmland").unwrap_or(0);
-                        set_block(x, y, z, fm);
-                        note_block_update(x, y, z, fm);
+                        if !place((x, y, z), fm) {
+                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                            continue;
+                        }
                         let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
@@ -30033,9 +30320,11 @@ fn handle(mut s: TcpStream) {
                     if item == 853
                         && block_at(x, y, z) == name_to_state("farmland").unwrap_or(u32::MAX)
                     {
-                        set_block(tx, ty, tz, 4278);
+                        if !place((tx, ty, tz), 4278) {
+                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                            continue;
+                        }
                         crops().lock().unwrap().insert(ow_block((tx, ty, tz)), 0);
-                        note_block_update(tx, ty, tz, 4278);
                         if *me.gm.lock().unwrap() != 1 {
                             let mut inv = me.inv.lock().unwrap();
                             if let Some((it, c, _cc)) = inv.get(&(36 + held_slot)).cloned() {
@@ -30068,7 +30357,10 @@ fn handle(mut s: TcpStream) {
                         } as f64;
                         let rot = (((180.0 + yaw) * 16.0 / 360.0 + 0.5) as i64 & 15) as u32;
                         let st = sb + rot * 2 + 1;
-                        place_block(tx, ty, tz, st);
+                        if !place((tx, ty, tz), st) {
+                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                            continue;
+                        }
                         let mut op = Vec::new();
                         write_pos(&mut op, tx, ty, tz);
                         op.push(1);
@@ -30076,7 +30368,14 @@ fn handle(mut s: TcpStream) {
                         let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
-                    if try_live_block_placement(&me, (dim, tx, ty, tz), face.clamp(0, 5) as usize, held_slot, item) {
+                    if try_live_block_placement(
+                        &me,
+                        (dim, tx, ty, tz),
+                        face.clamp(0, 5) as usize,
+                        held_slot,
+                        item,
+                        clicked,
+                    ) {
                         let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
@@ -30099,7 +30398,7 @@ fn handle(mut s: TcpStream) {
                             }
                             None => st,
                         };
-                        place_block(tx, ty, tz, st);
+                        place((tx, ty, tz), st);
                     }
                 }
                 let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
@@ -30163,12 +30462,26 @@ fn handle(mut s: TcpStream) {
                         run_command(Some(&me), &m, &mut Some(&me));
                         continue;
                     }
+                    #[cfg(feature = "neoforge-events")]
+                    let m = if java_compat::NEOFORGE.get().is_some() {
+                        match neoforge_event(&me, java_compat::S1Event::ServerChat {
+                            player: (me.eid, me.name.clone()),
+                            raw_text: m.clone(),
+                        }) {
+                            Ok(rewritten) => rewritten.unwrap_or(m),
+                            Err(_) => continue,
+                        }
+                    } else {
+                        m
+                    };
                     let line = format!("<{}> {}", me.name, m);
                     let pl = system_chat(&line);
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x6c, pl.clone());
                     broadcast(me.eid, |_c| (0x6c, pl.clone()));
                 }
             }
+            #[cfg(feature = "neoforge-events")]
+            0x12 => neoforge_payload(&me, &b),
             0x16 => {
                 // use_entity: attack mobs
                 let mut sl = &b[..];
@@ -32295,6 +32608,13 @@ fn handle(mut s: TcpStream) {
             *me_cleanup.chest_sync.lock().unwrap() = None;
             sync_chest_openers(&audience, &before);
         }
+        #[cfg(feature = "neoforge-events")]
+        if java_compat::NEOFORGE.get().is_some() {
+            let _ = neoforge_event(
+                &me_cleanup,
+                java_compat::S1Event::PlayerLogout(me_cleanup.eid, me_cleanup.name.clone()),
+            );
+        }
         let mut cls = clients().lock().unwrap();
         cls.retain(|c| c.eid != me_cleanup.eid);
         drop(cls);
@@ -33111,6 +33431,8 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("player_menus", live_menu_tick);
     run("plugins", plugin_tick);
     run("actors", actor_tick);
+    #[cfg(feature = "neoforge-events")]
+    run("neoforge_player_tick", neoforge_player_tick);
     run("mobs", mob_tick);
     run("spawners", spawner_tick);
     run("carts", cart_tick);
@@ -34174,6 +34496,10 @@ fn main() {
         thread::spawn(move || {
             if sigs.forever().next().is_some() {
                 save_world();
+                #[cfg(feature = "neoforge-events")]
+                if let Some(runtime) = java_compat::NEOFORGE.get() {
+                    runtime.cleanup_staged_mods();
+                }
                 std::process::exit(0);
             }
         });

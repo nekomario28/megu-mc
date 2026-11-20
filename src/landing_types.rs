@@ -223,7 +223,19 @@ impl ModRegistrySnapshot {
         Err("missing S2 registry terminator".into())
     }
 
-    #[allow(dead_code)] // For the consumer of the validated startup table.
+    #[cfg(feature = "neoforge-events")]
+    pub(crate) fn runtime_id(&self, registry: ModRegistry, name: &str) -> Option<u32> {
+        let (namespace, path) = mod_name_parts(name).ok()?;
+        let index = self
+            .entries
+            .binary_search_by(|entry| {
+                let (entry_namespace, entry_path) = entry.name.split_once(':').unwrap();
+                (entry.registry, entry_namespace, entry_path).cmp(&(registry, namespace, path))
+            })
+            .ok()?;
+        Some(self.entries[index].runtime_id)
+    }
+
     pub(crate) fn entries(&self) -> &[ModRegistryEntry] {
         &self.entries
     }
@@ -467,7 +479,7 @@ mod tests {
 #[cfg(any(test, feature = "neoforge-events"))]
 pub(crate) const S3_CAPACITY: usize = 256 * 1024;
 #[cfg(any(test, feature = "neoforge-events"))]
-const S3_MAX_RECORDS: usize = 4096;
+pub(crate) const S3_MAX_RECORDS: usize = 4096;
 #[cfg(any(test, feature = "neoforge-events"))]
 const S3_MAX_MESSAGE: usize = 4096;
 #[cfg(any(test, feature = "neoforge-events"))]
