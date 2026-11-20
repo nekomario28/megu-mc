@@ -1,0 +1,10 @@
+[package]
+name = "mc-spine-kernel"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+description = "Standalone protocol-767 kernel and versioned C ABI for mc-spine"
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
