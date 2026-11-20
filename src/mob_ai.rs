@@ -30,6 +30,8 @@ pub(crate) enum BlockPathType {
     Leaves,
     StickyHoney,
     Cocoa,
+    DamageCautious,
+    DangerTrapdoor,
 }
 
 // PathType's default values are independent of a mob's per-type overrides.
@@ -42,9 +44,8 @@ pub(crate) fn default_malus(path_type: BlockPathType) -> f32 {
         Water | WaterBorder | DangerFire | DangerOther | StickyHoney => 8.0,
         DamageFire => 16.0,
         Breach => 4.0,
-        Open | Walkable | WalkableDoor | Trapdoor | DangerPowdersnow | Rail | DoorOpen | Cocoa => {
-            0.0
-        }
+        Open | Walkable | WalkableDoor | Trapdoor | DangerPowdersnow | Rail | DoorOpen | Cocoa
+        | DamageCautious | DangerTrapdoor => 0.0,
     }
 }
 
@@ -55,80 +56,122 @@ pub(crate) trait PathWorld {
     fn collision_height(&self, x: i32, y: i32, z: i32) -> f64;
     fn min_y(&self) -> i32;
     fn max_y(&self) -> i32;
+
+    fn waypoint_y(&self, _x: i32, y: i32, _z: i32) -> f64 {
+        f64::from(y)
+    }
 }
 
-// BlockState classification uses the actual 1.21.1 registry, including the
-// open property of doors/gates and the difference between fluid-bearing and
-// liquid blocks (waterlogged stairs still have solid collision geometry).
+/// Classifies a single state as in 1.21.1 WalkNodeEvaluator.getPathTypeFromState.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn classify_block_state_path_type(
     reg: &crate::block_registry::BReg,
     state: u32,
 ) -> BlockPathType {
     use BlockPathType::*;
-
     if reg.is_air(state) {
         return Open;
     }
-    let name = reg.name_of(state).strip_prefix("minecraft:").unwrap_or(reg.name_of(state));
-    match name {
-        "water" | "bubble_column" => return Water,
-        "lava" => return Lava,
-        "fire" | "soul_fire" | "campfire" | "soul_campfire" | "magma_block" => {
-            return DamageFire;
-        }
-        "cactus" | "sweet_berry_bush" | "wither_rose" => return DamageOther,
-        "powder_snow" => return PowderSnow,
-        "honey_block" => return StickyHoney,
-        _ => {}
-    }
-    if name.ends_with("_fence") || name.ends_with("_wall") {
-        return Fence;
-    }
-    if name.ends_with("_fence_gate") {
-        return if reg.get_prop(state, "open").as_deref() == Some("true") {
-            Open
-        } else {
-            Fence
-        };
-    }
-    if name.ends_with("_trapdoor") {
+    let name = reg.name_of(state);
+    if reg.in_tag(state, "minecraft:trapdoors") {
         return Trapdoor;
     }
-    if name.ends_with("_door") {
+    // These block-specific rules have no corresponding vanilla pathfinding tags.
+    match name {
+        "minecraft:lily_pad" | "minecraft:big_dripleaf" => return Trapdoor,
+        "minecraft:powder_snow" => return PowderSnow,
+        "minecraft:cactus" | "minecraft:sweet_berry_bush" => return DamageOther,
+        "minecraft:honey_block" => return StickyHoney,
+        "minecraft:cocoa" => return Cocoa,
+        "minecraft:wither_rose" | "minecraft:pointed_dripstone" => return DamageCautious,
+        _ => {}
+    }
+    let fluid = reg.fluid_name(state);
+    if matches!(fluid, "minecraft:lava" | "minecraft:flowing_lava") {
+        return Lava;
+    }
+    if reg.in_tag(state, "minecraft:fire")
+        || name == "minecraft:magma_block"
+        || name == "minecraft:lava_cauldron"
+        || (reg.in_tag(state, "minecraft:campfires")
+            && reg.get_prop(state, "lit").as_deref() == Some("true"))
+    {
+        return DamageFire;
+    }
+    if reg.in_tag(state, "minecraft:doors") {
         return if reg.get_prop(state, "open").as_deref() == Some("true") {
             DoorOpen
-        } else if name == "iron_door" {
-            DoorIronClosed
-        } else {
+        } else if reg.in_tag(state, "minecraft:mob_interactable_doors") {
             DoorWoodClosed
+        } else {
+            DoorIronClosed
         };
     }
-    if name == "rail" || name.ends_with("_rail") {
+    if reg.in_tag(state, "minecraft:rails") {
         return Rail;
     }
-    if name.ends_with("_leaves") {
+    if reg.in_tag(state, "minecraft:leaves") {
         return Leaves;
     }
-    if reg.is_liquid_block(state) {
-        return if reg.fluid_name(state).contains("lava") {
-            Lava
-        } else {
-            Water
-        };
+    if reg.in_tag(state, "minecraft:fences")
+        || reg.in_tag(state, "minecraft:walls")
+        || (reg.in_tag(state, "minecraft:fence_gates")
+            && reg.get_prop(state, "open").as_deref() == Some("false"))
+    {
+        return Fence;
     }
-    if reg.is_solid(state) || !reg.is_collision_empty(state) {
-        Blocked
+    if !land_pathfindable(reg, state, name) {
+        return Blocked;
+    }
+    if reg.has_water(state) {
+        Water
     } else {
         Open
     }
 }
 
+// LAND dispatch for the states which reach the fallback in getPathTypeFromState.
+// For those states, the pinned 1.21.1 collision-emptiness predicate agrees with
+// LAND except for moving pistons and the passable partial shapes below.
+#[cfg_attr(not(test), allow(dead_code))]
+fn land_pathfindable(reg: &crate::block_registry::BReg, state: u32, name: &str) -> bool {
+    if reg.is_collision_empty(state) {
+        return name != "minecraft:moving_piston";
+    }
+    if name == "minecraft:snow" {
+        return reg
+            .get_prop(state, "layers")
+            .and_then(|layers| layers.parse::<u8>().ok())
+            .is_some_and(|layers| layers < 5);
+    }
+    reg.in_tag(state, "minecraft:climbable")
+        || reg.in_tag(state, "minecraft:candles")
+        || reg.in_tag(state, "minecraft:wool_carpets")
+        || matches!(
+            name,
+            "minecraft:amethyst_cluster"
+                | "minecraft:azalea"
+                | "minecraft:comparator"
+                | "minecraft:daylight_detector"
+                | "minecraft:flowering_azalea"
+                | "minecraft:large_amethyst_bud"
+                | "minecraft:medium_amethyst_bud"
+                | "minecraft:moss_carpet"
+                | "minecraft:pitcher_crop"
+                | "minecraft:repeater"
+                | "minecraft:sculk_shrieker"
+                | "minecraft:small_amethyst_bud"
+                | "minecraft:turtle_egg"
+        )
+}
+
+/// Reads protocol block states from a dimension or a bounded snapshot.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct LiveWorldPathAdapter<'a> {
-    pub dimension: crate::worldgen::DimId,
-    pub reg: &'a crate::block_registry::BReg,
-    block_getter: Box<dyn Fn(crate::worldgen::DimId, i32, i32, i32) -> u32 + 'a>,
+    reg: &'a crate::block_registry::BReg,
+    min_y: i32,
+    max_y: i32,
+    block_getter: Box<dyn Fn(i32, i32, i32) -> u32 + 'a>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -138,54 +181,132 @@ impl<'a> LiveWorldPathAdapter<'a> {
         Self::with_block_getter(dimension, reg, block_at_dim)
     }
 
-    /// Allows tests and callers to provide a snapshot or synthetic block map.
     pub fn with_block_getter(
         dimension: crate::worldgen::DimId,
         reg: &'a crate::block_registry::BReg,
         getter: impl Fn(crate::worldgen::DimId, i32, i32, i32) -> u32 + 'a,
     ) -> Self {
-        Self {
-            dimension,
+        let min_y = dimension.min_y();
+        Self::with_bounds(
             reg,
+            min_y,
+            min_y + dimension.height() - 1,
+            move |x, y, z| getter(dimension, x, y, z),
+        )
+    }
+
+    /// Both build-height bounds are inclusive.
+    pub fn with_bounds(
+        reg: &'a crate::block_registry::BReg,
+        min_y: i32,
+        max_y: i32,
+        getter: impl Fn(i32, i32, i32) -> u32 + 'a,
+    ) -> Self {
+        Self {
+            reg,
+            min_y,
+            max_y,
             block_getter: Box::new(getter),
         }
     }
 
     fn state_at(&self, x: i32, y: i32, z: i32) -> Option<u32> {
-        (self.min_y()..=self.max_y())
+        // The world supplies air outside its build height. Keep the dimension
+        // reader inside its overlay index bounds.
+        (self.min_y..=self.max_y)
             .contains(&y)
-            .then(|| (self.block_getter)(self.dimension, x, y, z))
+            .then(|| (self.block_getter)(x, y, z))
+    }
+
+    fn collision_top(&self, state: u32) -> f64 {
+        self.reg
+            .collision_boxes(state)
+            .map(|(_, max)| max[1])
+            .reduce(f64::max)
+            .unwrap_or(0.0)
+    }
+
+    fn raw_path_type(&self, x: i32, y: i32, z: i32) -> BlockPathType {
+        self.state_at(x, y, z).map_or(BlockPathType::Open, |state| {
+            classify_block_state_path_type(self.reg, state)
+        })
+    }
+
+    // Vanilla returns the first matching neighbor in X/Y/Z order and skips
+    // the entire center column.
+    fn walking_hazard(&self, x: i32, y: i32, z: i32) -> BlockPathType {
+        use BlockPathType::*;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                let Some(neighbor_y) = y.checked_add(dy) else {
+                    continue;
+                };
+                for dz in -1..=1 {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    match self.raw_path_type(x.wrapping_add(dx), neighbor_y, z.wrapping_add(dz)) {
+                        DamageOther => return DangerOther,
+                        DamageFire | Lava => return DangerFire,
+                        Water => return WaterBorder,
+                        DamageCautious => return DamageCautious,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Walkable
     }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl PathWorld for LiveWorldPathAdapter<'_> {
     fn path_type(&self, x: i32, y: i32, z: i32) -> BlockPathType {
-        self.state_at(x, y, z).map_or(BlockPathType::Blocked, |state| {
-            classify_block_state_path_type(self.reg, state)
-        })
+        use BlockPathType::*;
+        let here = self.raw_path_type(x, y, z);
+        if here != Open || y <= self.min_y {
+            return here;
+        }
+        match self.raw_path_type(x, y - 1, z) {
+            Open | Water | Lava | Walkable => Open,
+            DamageFire => DamageFire,
+            DamageOther => DamageOther,
+            StickyHoney => StickyHoney,
+            PowderSnow => DangerPowdersnow,
+            DamageCautious => DamageCautious,
+            Trapdoor => DangerTrapdoor,
+            _ => self.walking_hazard(x, y, z),
+        }
     }
 
     fn is_solid(&self, x: i32, y: i32, z: i32) -> bool {
         self.state_at(x, y, z)
-            .is_none_or(|state| self.reg.is_solid(state))
+            .is_some_and(|state| self.reg.blocks_motion(state))
     }
 
     fn collision_height(&self, x: i32, y: i32, z: i32) -> f64 {
-        self.state_at(x, y, z).map_or(1.0, |state| {
-            self.reg
-                .collision_boxes(state)
-                .fold(0.0_f64, |height, (_, max)| height.max(max[1]))
-        })
+        self.state_at(x, y, z)
+            .map_or(0.0, |state| self.collision_top(state))
     }
 
     fn min_y(&self) -> i32 {
-        self.dimension.min_y()
+        self.min_y
     }
 
-    // PathWorld bounds are inclusive, unlike the dimension's exclusive end.
     fn max_y(&self) -> i32 {
-        self.dimension.min_y() + self.dimension.height() - 1
+        self.max_y
+    }
+
+    fn waypoint_y(&self, x: i32, y: i32, z: i32) -> f64 {
+        // PathNavigation.getGroundY keeps the node's Y when the block below is air.
+        let Some(below_y) = y.checked_sub(1) else {
+            return f64::from(y);
+        };
+        self.state_at(x, below_y, z)
+            .filter(|&state| !self.reg.is_air(state))
+            .map_or(f64::from(y), |state| {
+                f64::from(below_y) + self.collision_top(state)
+            })
     }
 }
 
@@ -230,8 +351,8 @@ impl WalkNodeEvaluator {
         self.mob_height.ceil().max(1.0) as i32
     }
 
-    // A clear body requires every occupied block to have nonnegative malus and
-    // no collision volume. The node's path type comes from the feet position.
+    // A clear body requires each occupied block to be passable. The node's
+    // path type comes from the feet position.
     fn clear_body(&self, world: &dyn PathWorld, pos: (i32, i32, i32)) -> bool {
         let (x, y, z) = pos;
         let Some(top) = y.checked_add(self.height_in_blocks() - 1) else {
@@ -241,7 +362,12 @@ impl WalkNodeEvaluator {
             return false;
         }
         for block_y in y..=top {
-            if default_malus(world.path_type(x, block_y, z)) < 0.0
+            let path_type = world.path_type(x, block_y, z);
+            // Ground navigation can pass the swung panel of an open door.
+            if path_type == BlockPathType::DoorOpen {
+                continue;
+            }
+            if default_malus(path_type) < 0.0
                 || world.is_solid(x, block_y, z)
                 || world.collision_height(x, block_y, z) > 0.0
             {
@@ -534,17 +660,22 @@ impl PathNavigation {
         reached
     }
 
-    pub fn next_waypoint(&self) -> Option<(f64, f64, f64)> {
+    pub fn next_waypoint(&self, world: &dyn PathWorld) -> Option<(f64, f64, f64)> {
         let node = self.path.as_ref()?.nodes.get(self.next_node)?;
         Some((
             f64::from(node.x) + 0.5,
-            f64::from(node.y),
+            world.waypoint_y(node.x, node.y, node.z),
             f64::from(node.z) + 0.5,
         ))
     }
 
-    pub fn advance_if_reached(&mut self, position: (f64, f64, f64), tolerance: f64) {
-        if let Some(waypoint) = self.next_waypoint() {
+    pub fn advance_if_reached(
+        &mut self,
+        world: &dyn PathWorld,
+        position: (f64, f64, f64),
+        tolerance: f64,
+    ) {
+        if let Some(waypoint) = self.next_waypoint(world) {
             let dx = position.0 - waypoint.0;
             let dy = position.1 - waypoint.1;
             let dz = position.2 - waypoint.2;
@@ -1334,41 +1465,190 @@ impl Goal for LookAtPlayerGoal {
     fn stop(&mut self, _: &GoalContext<'_>) {}
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MobGoalKind {
+    Float,
+    Swell,
+    MeleeAttack,
+    WaterAvoidingRandomStroll,
+    LookAtPlayer,
+    Unavailable(&'static str),
+}
+
+/// The equipment and door-breaking state that changes vanilla goal registration.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MobGoalSettings {
+    pub skeleton_has_bow: bool,
+    pub zombie_can_break_doors: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct MobGoalPlan {
+    /// Ordered by priority, preserving vanilla's registration order for ties.
+    pub goals: Vec<(i32, MobGoalKind)>,
+    /// Target goals need inputs the current engine does not supply.
+    pub missing_targets: &'static [(i32, &'static str)],
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MobGoalPlan {
+    pub fn for_entity(etype: i64, settings: MobGoalSettings) -> Option<Self> {
+        use MobGoalKind::*;
+        let entity = entity_spec_by_id(etype)?;
+        let (mut goals, missing_targets): (Vec<_>, &[_]) = match entity.name {
+            "minecraft:zombie" => (
+                vec![
+                    (2, Unavailable("ZombieAttackGoal")),
+                    (4, Unavailable("ZombieAttackTurtleEggGoal")),
+                    (6, Unavailable("MoveThroughVillageGoal")),
+                    (7, WaterAvoidingRandomStroll),
+                    (8, LookAtPlayer),
+                    (8, Unavailable("RandomLookAroundGoal")),
+                ],
+                &[
+                    (
+                        1,
+                        "HurtByTargetGoal (alerts allies, including zombified piglins)",
+                    ),
+                    (2, "NearestAttackableTargetGoal<Player>"),
+                    (3, "NearestAttackableTargetGoal<AbstractVillager>"),
+                    (3, "NearestAttackableTargetGoal<IronGolem>"),
+                    (5, "NearestAttackableTargetGoal<Turtle> (baby on land)"),
+                ],
+            ),
+            "minecraft:skeleton" => (
+                vec![
+                    (2, Unavailable("RestrictSunGoal")),
+                    (3, Unavailable("FleeSunGoal")),
+                    (3, Unavailable("AvoidEntityGoal<Wolf>")),
+                    (
+                        4,
+                        if settings.skeleton_has_bow {
+                            Unavailable("RangedBowAttackGoal")
+                        } else {
+                            MeleeAttack
+                        },
+                    ),
+                    (5, WaterAvoidingRandomStroll),
+                    (6, LookAtPlayer),
+                    (6, Unavailable("RandomLookAroundGoal")),
+                ],
+                &[
+                    (1, "HurtByTargetGoal"),
+                    (2, "NearestAttackableTargetGoal<Player>"),
+                    (3, "NearestAttackableTargetGoal<IronGolem>"),
+                    (3, "NearestAttackableTargetGoal<Turtle> (baby on land)"),
+                ],
+            ),
+            "minecraft:creeper" => (
+                vec![
+                    (1, Float),
+                    (2, Swell),
+                    (3, Unavailable("AvoidEntityGoal<Ocelot>")),
+                    (3, Unavailable("AvoidEntityGoal<Cat>")),
+                    (4, MeleeAttack),
+                    (5, WaterAvoidingRandomStroll),
+                    (6, LookAtPlayer),
+                    (6, Unavailable("RandomLookAroundGoal")),
+                ],
+                &[
+                    (1, "NearestAttackableTargetGoal<Player>"),
+                    (2, "HurtByTargetGoal"),
+                ],
+            ),
+            "minecraft:spider" => (
+                vec![
+                    (1, Float),
+                    (2, Unavailable("AvoidEntityGoal<Armadillo> (unscared)")),
+                    (3, Unavailable("LeapAtTargetGoal")),
+                    (4, Unavailable("SpiderAttackGoal")),
+                    (5, WaterAvoidingRandomStroll),
+                    (6, LookAtPlayer),
+                    (6, Unavailable("RandomLookAroundGoal")),
+                ],
+                &[
+                    (1, "HurtByTargetGoal"),
+                    (2, "SpiderTargetGoal<Player>"),
+                    (3, "SpiderTargetGoal<IronGolem>"),
+                ],
+            ),
+            _ => return None,
+        };
+        if entity.name == "minecraft:zombie" && settings.zombie_can_break_doors {
+            goals.insert(0, (1, Unavailable("BreakDoorGoal")));
+        }
+        Some(Self {
+            goals,
+            missing_targets,
+        })
+    }
+
+    pub fn build_selector(&self, seed: u64) -> GoalSelector {
+        let mut selector = GoalSelector::default();
+        for &(priority, kind) in &self.goals {
+            let goal: Box<dyn Goal> = match kind {
+                MobGoalKind::Float => Box::new(FloatGoal { priority }),
+                MobGoalKind::Swell => Box::new(SwellGoal::new(priority)),
+                MobGoalKind::MeleeAttack => Box::new(MeleeAttackGoal::new(priority)),
+                MobGoalKind::WaterAvoidingRandomStroll => {
+                    Box::new(WaterAvoidingRandomStrollGoal::new(priority, seed))
+                }
+                MobGoalKind::LookAtPlayer => Box::new(LookAtPlayerGoal {
+                    priority,
+                    look_distance: 8.0,
+                }),
+                MobGoalKind::Unavailable(_) => continue,
+            };
+            selector.add_goal(goal);
+        }
+        selector
+    }
+}
+
 /// Selects the goal schedule from the pinned protocol-767 entity registry.
 /// Goals are stateful, so a selector is constructed once for each mob.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_goal_selector_for_etype(etype: i64) -> GoalSelector {
-    let mut selector = GoalSelector::default();
     let Some(spec) = entity_spec_by_id(etype) else {
-        return selector;
+        return GoalSelector::default();
     };
-    if spec.max_health <= 0.0
-        || matches!(spec.name, "minecraft:player" | "minecraft:armor_stand")
-    {
+    if spec.max_health <= 0.0 || matches!(spec.name, "minecraft:player" | "minecraft:armor_stand") {
+        return GoalSelector::default();
+    }
+
+    let seed = (etype as u64) ^ 0x9e3779b97f4a7c15;
+    if let Some(plan) = MobGoalPlan::for_entity(etype, MobGoalSettings::default()) {
+        let mut selector = plan.build_selector(seed);
+        // The tick driver has fluid and target observations for these
+        // existing float and melee behaviors.
+        if matches!(spec.name, "minecraft:zombie" | "minecraft:skeleton") {
+            selector.add_goal(Box::new(FloatGoal { priority: 0 }));
+        }
+        if let Some((priority, _)) = plan.goals.iter().find(|(_, kind)| {
+            matches!(
+                kind,
+                MobGoalKind::Unavailable("ZombieAttackGoal" | "SpiderAttackGoal")
+            )
+        }) {
+            selector.add_goal(Box::new(MeleeAttackGoal::new(*priority)));
+        }
         return selector;
     }
 
+    let mut selector = GoalSelector::default();
     selector.add_goal(Box::new(FloatGoal { priority: 0 }));
     match spec.name {
-        "minecraft:creeper" => {
-            selector.add_goal(Box::new(SwellGoal::new(2)));
-            selector.add_goal(Box::new(MeleeAttackGoal::new(3)));
-        }
-        "minecraft:zombie"
-        | "minecraft:husk"
-        | "minecraft:drowned"
-        | "minecraft:spider"
-        | "minecraft:cave_spider"
-        | "minecraft:skeleton"
-        | "minecraft:stray" => {
+        "minecraft:husk" | "minecraft:drowned" | "minecraft:cave_spider" | "minecraft:stray" => {
             selector.add_goal(Box::new(MeleeAttackGoal::new(2)));
         }
         "minecraft:cow" | "minecraft:pig" | "minecraft:sheep" | "minecraft:chicken" => {
             // Item IDs are the existing 1.21.1 server item mappings.
             let tempting_item = match spec.name {
-                "minecraft:pig" => 1097,     // carrot
-                "minecraft:chicken" => 853,  // wheat_seeds
-                _ => 854,                     // wheat
+                "minecraft:pig" => 1097,    // carrot
+                "minecraft:chicken" => 853, // wheat_seeds
+                _ => 854,                   // wheat
             };
             selector.add_goal(Box::new(PanicGoal::new(1)));
             selector.add_goal(Box::new(BreedGoal::new(2)));
@@ -1376,10 +1656,7 @@ pub(crate) fn build_goal_selector_for_etype(etype: i64) -> GoalSelector {
         }
         _ => {}
     }
-    selector.add_goal(Box::new(WaterAvoidingRandomStrollGoal::new(
-        6,
-        (etype as u64) ^ 0x9e3779b97f4a7c15,
-    )));
+    selector.add_goal(Box::new(WaterAvoidingRandomStrollGoal::new(6, seed)));
     selector.add_goal(Box::new(LookAtPlayerGoal {
         priority: 7,
         look_distance: 8.0,
@@ -1462,11 +1739,15 @@ pub(crate) fn tick_mob_ai_step(
                 },
                 ..PathFinder::default()
             };
-            profile.navigation.navigate_to(&finder, world, start, destination);
+            profile
+                .navigation
+                .navigate_to(&finder, world, start, destination);
             profile.requested_target = Some(destination);
         }
-        profile.navigation.advance_if_reached(ctx.position, 0.45);
-        waypoint = profile.navigation.next_waypoint();
+        profile
+            .navigation
+            .advance_if_reached(world, ctx.position, 0.45);
+        waypoint = profile.navigation.next_waypoint(world);
     } else {
         profile.navigation.stop();
         profile.requested_target = None;
@@ -1586,73 +1867,237 @@ mod mob_ai_tests {
         AiEntityPerception::new(id, (x, y, z))
     }
 
+    fn state(name: &str, props: &[(&str, &str)]) -> u32 {
+        crate::block_registry::breg()
+            .unwrap()
+            .checked_state(
+                name,
+                &props
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|| panic!("missing block state {name} {props:?}"))
+    }
+
+    #[test]
+    fn world_path_raw_types_match_pinned_vanilla_digest() {
+        let registry = crate::block_registry::breg().unwrap();
+        // FNV-1a of one PascalCase PathType name plus newline per raw state ID.
+        // Captured from 1.21.1 WalkNodeEvaluator.getPathTypeFromState with vanilla tags bound.
+        assert_eq!(registry.state_count(), 26_684);
+        let mut digest = 0xcbf29ce484222325_u64;
+        for state in 0..registry.state_count() as u32 {
+            let path_type = classify_block_state_path_type(registry, state);
+            for byte in format!("{path_type:?}\n").bytes() {
+                digest = (digest ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+        assert_eq!(digest, 0x54a74560ce1a30cc);
+    }
+
     #[test]
     fn real_registry_block_path_types_and_properties() {
         use BlockPathType::*;
-        let reg = crate::block_registry::breg().expect("1.21.1 block registry");
-        for (name, expected) in [
-            ("stone", Blocked),
-            ("air", Open),
-            ("cave_air", Open),
-            ("short_grass", Open),
-            ("water", Water),
-            ("bubble_column", Water),
-            ("lava", Lava),
-            ("oak_fence", Fence),
-            ("cobblestone_wall", Fence),
-            ("cactus", DamageOther),
-            ("sweet_berry_bush", DamageOther),
-            ("wither_rose", DamageOther),
-            ("fire", DamageFire),
-            ("soul_fire", DamageFire),
-            ("campfire", DamageFire),
-            ("magma_block", DamageFire),
-            ("rail", Rail),
-            ("powered_rail", Rail),
-            ("oak_leaves", Leaves),
-            ("powder_snow", PowderSnow),
-            ("honey_block", StickyHoney),
-            ("oak_trapdoor", Trapdoor),
+        let registry = crate::block_registry::breg().unwrap();
+        for (name, props, expected) in [
+            ("air", &[][..], Open),
+            ("cave_air", &[], Open),
+            ("short_grass", &[], Open),
+            ("bubble_column", &[], Water),
+            ("oak_fence", &[], Fence),
+            ("cobblestone_wall", &[], Fence),
+            ("rail", &[], Rail),
+            ("oak_leaves", &[], Leaves),
+            ("oak_trapdoor", &[], Trapdoor),
+            ("stone", &[], Blocked),
+            ("nether_brick_fence", &[], Fence),
+            ("tuff_wall", &[], Fence),
+            ("oak_fence_gate", &[("open", "false")], Fence),
+            ("oak_fence_gate", &[("open", "true")], Open),
+            ("lava", &[("level", "7")], Lava),
+            ("water", &[("level", "7")], Water),
+            ("ladder", &[("waterlogged", "true")], Water),
+            ("oak_slab", &[("waterlogged", "true")], Blocked),
+            ("oak_stairs", &[("waterlogged", "true")], Blocked),
+            ("fire", &[], DamageFire),
+            ("soul_fire", &[], DamageFire),
+            ("lava_cauldron", &[], DamageFire),
+            ("magma_block", &[], DamageFire),
+            ("campfire", &[("lit", "true")], DamageFire),
+            ("campfire", &[("lit", "false")], Blocked),
+            ("soul_campfire", &[("lit", "true")], DamageFire),
+            ("soul_campfire", &[("lit", "false")], Blocked),
+            ("cactus", &[], DamageOther),
+            ("sweet_berry_bush", &[("age", "0")], DamageOther),
+            ("wither_rose", &[], DamageCautious),
+            ("pointed_dripstone", &[], DamageCautious),
+            ("iron_trapdoor", &[("open", "true")], Trapdoor),
+            ("lily_pad", &[], Trapdoor),
+            ("big_dripleaf", &[("tilt", "full")], Trapdoor),
+            ("oak_door", &[("open", "false")], DoorWoodClosed),
+            ("oak_door", &[("open", "true")], DoorOpen),
+            ("waxed_copper_door", &[("open", "false")], DoorWoodClosed),
+            ("iron_door", &[("open", "true")], DoorOpen),
+            ("iron_door", &[("open", "false")], DoorIronClosed),
+            ("powered_rail", &[], Rail),
+            ("flowering_azalea_leaves", &[], Leaves),
+            ("powder_snow", &[], PowderSnow),
+            ("cocoa", &[], Cocoa),
+            ("honey_block", &[], StickyHoney),
+            ("moving_piston", &[], Blocked),
+            ("snow", &[("layers", "4")], Open),
+            ("snow", &[("layers", "5")], Blocked),
+            ("white_carpet", &[], Open),
+            ("large_amethyst_bud", &[], Open),
+            ("pitcher_crop", &[("age", "3"), ("half", "lower")], Open),
         ] {
-            let state = reg.state_of(name, None);
-            assert_eq!(reg.name_of(state), format!("minecraft:{name}"));
-            assert_eq!(classify_block_state_path_type(reg, state), expected, "{name}");
+            let block = state(name, props);
+            assert_eq!(
+                classify_block_state_path_type(registry, block),
+                expected,
+                "{name} {props:?}"
+            );
+            let adapter = LiveWorldPathAdapter::with_bounds(registry, 0, 4, |_, y, _| match y {
+                1 => block,
+                _ => 0,
+            });
+            assert_eq!(adapter.path_type(0, 1, 0), expected, "{name} {props:?}");
         }
+    }
 
-        let gate = reg.state_of("oak_fence_gate", None);
-        let oak_door = reg.state_of("oak_door", None);
-        let iron_door = reg.state_of("iron_door", None);
-        assert_eq!(
-            classify_block_state_path_type(reg, reg.with_prop(gate, "open", "false")),
-            Fence
+    #[test]
+    fn world_path_classifies_support_and_neighbor_hazards() {
+        use BlockPathType::*;
+        let registry = crate::block_registry::breg().unwrap();
+        let stone = state("stone", &[]);
+        for (name, offset, expected) in [
+            ("air", (0, 0, 0), Open),
+            ("stone", (0, 0, 0), Walkable),
+            ("water", (0, 0, 0), Open),
+            ("lava", (0, 0, 0), Open),
+            ("redstone_torch", (0, 1, 0), Walkable),
+            ("fire", (0, 0, 0), DamageFire),
+            ("cactus", (0, 0, 0), DamageOther),
+            ("wither_rose", (0, 0, 0), DamageCautious),
+            ("honey_block", (0, 0, 0), StickyHoney),
+            ("powder_snow", (0, 0, 0), DangerPowdersnow),
+            ("lily_pad", (0, 0, 0), DangerTrapdoor),
+            ("lava", (-1, 1, 0), DangerFire),
+            ("fire", (1, 2, 1), DangerFire),
+            ("sweet_berry_bush", (1, 0, -1), DangerOther),
+            ("wither_rose", (0, 2, 1), DamageCautious),
+            ("water", (1, 1, 1), WaterBorder),
+            ("powder_snow", (-1, 1, 0), Walkable),
+            ("cactus", (0, 2, 0), Walkable),
+        ] {
+            let block = state(name, &[]);
+            let adapter = LiveWorldPathAdapter::with_bounds(registry, 0, 4, |x, y, z| {
+                if (x, y, z) == offset {
+                    block
+                } else if (x, y, z) == (0, 0, 0) {
+                    stone
+                } else {
+                    0
+                }
+            });
+            assert_eq!(adapter.path_type(0, 1, 0), expected, "{name} at {offset:?}");
+        }
+        let water = state("water", &[]);
+        let cactus = state("cactus", &[]);
+        let adapter =
+            LiveWorldPathAdapter::with_bounds(registry, 0, 4, |x, y, z| match (x, y, z) {
+                (0, 0, 0) => stone,
+                (-1, 2, 1) => water,
+                (1, 1, 0) => cactus,
+                _ => 0,
+            });
+        assert_eq!(adapter.path_type(0, 1, 0), WaterBorder);
+    }
+
+    #[test]
+    fn world_path_uses_collision_tops_for_floor_and_waypoints() {
+        let stone = state("stone", &[]);
+        let slab = state("oak_slab", &[("type", "bottom")]);
+        let fence = state("oak_fence", &[]);
+        let water = state("water", &[]);
+        let adapter = LiveWorldPathAdapter::with_bounds(
+            crate::block_registry::breg().unwrap(),
+            -8,
+            16,
+            |x, y, _| {
+                assert!((-8..=16).contains(&y));
+                match (x, y) {
+                    (0, -2) => stone,
+                    (1, -2) => slab,
+                    (2, -2) => fence,
+                    (3, -2) => water,
+                    (5, 16) => stone,
+                    _ => 0,
+                }
+            },
         );
-        assert_eq!(
-            classify_block_state_path_type(reg, reg.with_prop(gate, "open", "true")),
-            Open
-        );
-        assert_eq!(
-            classify_block_state_path_type(reg, reg.with_prop(oak_door, "open", "false")),
-            DoorWoodClosed
-        );
-        assert_eq!(
-            classify_block_state_path_type(reg, reg.with_prop(oak_door, "open", "true")),
-            DoorOpen
-        );
-        assert_eq!(
-            classify_block_state_path_type(reg, reg.with_prop(iron_door, "open", "false")),
-            DoorIronClosed
-        );
-        assert_eq!(
-            classify_block_state_path_type(reg, reg.with_prop(iron_door, "open", "true")),
-            DoorOpen
-        );
-        let wet_stairs = reg.with_prop(
-            reg.state_of("oak_stairs", None),
-            "waterlogged",
-            "true",
-        );
-        assert!(reg.is_liquid(wet_stairs));
-        assert_eq!(classify_block_state_path_type(reg, wet_stairs), Blocked);
+        assert_eq!(adapter.waypoint_y(0, -1, 0), -1.0);
+        assert_eq!(adapter.waypoint_y(1, -1, 0), -1.5);
+        assert_eq!(adapter.waypoint_y(2, -1, 0), -0.5);
+        assert_eq!(adapter.waypoint_y(3, -1, 0), -2.0);
+        assert_eq!(adapter.waypoint_y(4, -1, 0), -1.0);
+        assert_eq!(adapter.path_type(0, -9, 0), BlockPathType::Open);
+        assert_eq!(adapter.path_type(0, 17, 0), BlockPathType::Open);
+        assert_eq!(adapter.path_type(5, 17, 0), BlockPathType::Walkable);
+        assert!(!WalkNodeEvaluator::default().standable(&adapter, (5, 17, 0)));
+        let mut navigation = PathNavigation::default();
+        assert!(navigation.navigate_to(&PathFinder::default(), &adapter, (0, -1, 0), (1, -1, 0)));
+        assert_eq!(navigation.next_waypoint(&adapter), Some((1.5, -1.5, 0.5)));
+        navigation.advance_if_reached(&adapter, (1.5, -1.5, 0.5), 0.1);
+        assert!(navigation.is_done());
+    }
+
+    #[test]
+    fn world_path_routes_zombie_around_lava_and_through_open_door() {
+        let reg = crate::block_registry::breg().unwrap();
+        let stone = state("stone", &[]);
+        let lava = state("lava", &[]);
+        let door = |half, open| {
+            state(
+                "iron_door",
+                &[("half", half), ("open", open), ("powered", open)],
+            )
+        };
+        let corridor = |lower, upper| {
+            LiveWorldPathAdapter::with_bounds(reg, 0, 3, move |x, y, z| match (x, y, z) {
+                (2, 1, 1) => lava,
+                (4, 1, 1) => lower,
+                (4, 2, 1) => upper,
+                (4, _, _) => stone,
+                (0..=6, 1..=2, 0..=2) => 0,
+                _ => stone,
+            })
+        };
+        let opened = corridor(door("lower", "true"), door("upper", "true"));
+        let closed = corridor(door("lower", "false"), door("upper", "false"));
+        let zombie = entity_spec_by_name("zombie").unwrap();
+        let finder = PathFinder {
+            evaluator: WalkNodeEvaluator {
+                mob_height: f64::from(zombie.height),
+                ..WalkNodeEvaluator::default()
+            },
+            ..PathFinder::default()
+        };
+        let from = (0, 1, 1);
+        let target = (6, 1, 1);
+        assert_eq!(opened.collision_height(4, 1, 1), 1.0);
+        let path = finder.find_path(&opened, from, target);
+        assert!(path.reached);
+        assert!(path.nodes.iter().any(|node| {
+            (node.x, node.y, node.z) == (4, 1, 1) && node.path_type == BlockPathType::DoorOpen
+        }));
+        assert!(path.nodes.iter().any(|node| node.x == 2 && node.z != 1));
+        assert!(path
+            .nodes
+            .iter()
+            .all(|node| (node.x, node.y, node.z) != (2, 1, 1)));
+        assert!(!finder.find_path(&closed, from, target).reached);
     }
 
     #[test]
@@ -1691,7 +2136,9 @@ mod mob_ai_tests {
         assert!(world.collision_height(1, 1, 0) > 1.0);
         assert!(world.collision_height(3, 1, 0) > 0.0);
         assert_eq!(world.collision_height(2, 1, 0), 0.0);
-        assert_eq!(world.path_type(0, 320, 0), BlockPathType::Blocked);
+        assert_eq!(world.path_type(0, 320, 0), BlockPathType::Open);
+        assert!(!world.is_solid(0, 320, 0));
+        assert_eq!(world.collision_height(0, 320, 0), 0.0);
 
         let path = PathFinder::default().find_path(&world, (0, 1, 0), (4, 1, 0));
         assert!(path.reached, "{path:?}");
@@ -1705,6 +2152,128 @@ mod mob_ai_tests {
             let live = LiveWorldPathAdapter::new(dim, reg);
             assert_eq!((live.min_y(), live.max_y()), (0, 255));
         }
+    }
+
+    #[test]
+    fn mob_goal_factory_preserves_vanilla_priorities_and_tie_order() {
+        use MobGoalKind::*;
+        let cases: [(_, &[_], &[_], &[_]); 4] = [
+            (
+                "zombie",
+                &[
+                    (2, Unavailable("ZombieAttackGoal")),
+                    (4, Unavailable("ZombieAttackTurtleEggGoal")),
+                    (6, Unavailable("MoveThroughVillageGoal")),
+                    (7, WaterAvoidingRandomStroll),
+                    (8, LookAtPlayer),
+                    (8, Unavailable("RandomLookAroundGoal")),
+                ],
+                &[
+                    (
+                        1,
+                        "HurtByTargetGoal (alerts allies, including zombified piglins)",
+                    ),
+                    (2, "NearestAttackableTargetGoal<Player>"),
+                    (3, "NearestAttackableTargetGoal<AbstractVillager>"),
+                    (3, "NearestAttackableTargetGoal<IronGolem>"),
+                    (5, "NearestAttackableTargetGoal<Turtle> (baby on land)"),
+                ],
+                &[7, 8],
+            ),
+            (
+                "skeleton",
+                &[
+                    (2, Unavailable("RestrictSunGoal")),
+                    (3, Unavailable("FleeSunGoal")),
+                    (3, Unavailable("AvoidEntityGoal<Wolf>")),
+                    (4, Unavailable("RangedBowAttackGoal")),
+                    (5, WaterAvoidingRandomStroll),
+                    (6, LookAtPlayer),
+                    (6, Unavailable("RandomLookAroundGoal")),
+                ],
+                &[
+                    (1, "HurtByTargetGoal"),
+                    (2, "NearestAttackableTargetGoal<Player>"),
+                    (3, "NearestAttackableTargetGoal<IronGolem>"),
+                    (3, "NearestAttackableTargetGoal<Turtle> (baby on land)"),
+                ],
+                &[5, 6],
+            ),
+            (
+                "creeper",
+                &[
+                    (1, Float),
+                    (2, Swell),
+                    (3, Unavailable("AvoidEntityGoal<Ocelot>")),
+                    (3, Unavailable("AvoidEntityGoal<Cat>")),
+                    (4, MeleeAttack),
+                    (5, WaterAvoidingRandomStroll),
+                    (6, LookAtPlayer),
+                    (6, Unavailable("RandomLookAroundGoal")),
+                ],
+                &[
+                    (1, "NearestAttackableTargetGoal<Player>"),
+                    (2, "HurtByTargetGoal"),
+                ],
+                &[1, 2, 4, 5, 6],
+            ),
+            (
+                "spider",
+                &[
+                    (1, Float),
+                    (2, Unavailable("AvoidEntityGoal<Armadillo> (unscared)")),
+                    (3, Unavailable("LeapAtTargetGoal")),
+                    (4, Unavailable("SpiderAttackGoal")),
+                    (5, WaterAvoidingRandomStroll),
+                    (6, LookAtPlayer),
+                    (6, Unavailable("RandomLookAroundGoal")),
+                ],
+                &[
+                    (1, "HurtByTargetGoal"),
+                    (2, "SpiderTargetGoal<Player>"),
+                    (3, "SpiderTargetGoal<IronGolem>"),
+                ],
+                &[1, 5, 6],
+            ),
+        ];
+        for (name, goals, missing_targets, active_priorities) in cases {
+            let etype = entity_spec_by_name(name).unwrap().id;
+            let plan = MobGoalPlan::for_entity(
+                etype,
+                MobGoalSettings {
+                    skeleton_has_bow: true,
+                    zombie_can_break_doors: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(plan.goals, goals, "{name}");
+            assert_eq!(plan.missing_targets, missing_targets, "{name}");
+            let selector = plan.build_selector(0);
+            let installed: Vec<_> = selector.goals.iter().map(|g| g.goal.priority()).collect();
+            assert_eq!(installed, active_priorities, "{name}");
+        }
+    }
+
+    #[test]
+    fn mob_goal_factory_selects_skeleton_weapon_and_zombie_door_variant() {
+        let entity_id = |name| entity_spec_by_name(name).unwrap().id;
+        let unarmed =
+            MobGoalPlan::for_entity(entity_id("skeleton"), MobGoalSettings::default()).unwrap();
+        assert_eq!(unarmed.goals[3], (4, MobGoalKind::MeleeAttack));
+        assert_eq!(unarmed.build_selector(0).goals[0].goal.priority(), 4);
+        let breaking = MobGoalPlan::for_entity(
+            entity_id("zombie"),
+            MobGoalSettings {
+                zombie_can_break_doors: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            breaking.goals[0],
+            (1, MobGoalKind::Unavailable("BreakDoorGoal"))
+        );
+        assert!(MobGoalPlan::for_entity(entity_id("cow"), MobGoalSettings::default()).is_none());
     }
 
     #[test]
@@ -1753,6 +2322,41 @@ mod mob_ai_tests {
         assert_eq!(step.look_yaw, Some(-90.0));
         assert!(step.look_pitch.is_some());
         assert_eq!(step.attack_target, None);
+
+        let stone = state("stone", &[]);
+        let slab = state("oak_slab", &[("type", "bottom")]);
+        let world = LiveWorldPathAdapter::with_bounds(
+            crate::block_registry::breg().unwrap(),
+            0,
+            4,
+            |x, y, z| match (x, y, z) {
+                (1, 0, 0) => slab,
+                (_, 0, _) => stone,
+                _ => 0,
+            },
+        );
+        let view = GoalContext {
+            position: (0.5, 1.0, 0.5),
+            target: Some(target(42, 4.5, 1.0, 0.5)),
+            world: Some(&world),
+            ..GoalContext::default()
+        };
+        let step = tick_mob_ai_step(&mut profile, &view);
+        assert_eq!(step.movement_delta, (0.25, 0.0, 0.0));
+        assert_eq!(
+            profile.navigation.next_waypoint(&world),
+            Some((1.5, 0.5, 0.5))
+        );
+        let view = GoalContext {
+            position: (1.5, 0.5, 0.5),
+            ..view
+        };
+        let step = tick_mob_ai_step(&mut profile, &view);
+        assert_eq!(step.movement_delta, (0.25, 0.0, 0.0));
+        assert_eq!(
+            profile.navigation.next_waypoint(&world),
+            Some((2.5, 1.0, 0.5))
+        );
     }
 
     #[test]
@@ -1783,6 +2387,8 @@ mod mob_ai_tests {
             Leaves,
             StickyHoney,
             Cocoa,
+            DamageCautious,
+            DangerTrapdoor,
         ];
         for ty in all {
             let expected = match ty {
@@ -1955,19 +2561,15 @@ mod mob_ai_tests {
 
     #[test]
     fn path_navigation_advances_and_stops() {
+        let world = GridWorld::default();
         let mut nav = PathNavigation::default();
         assert!(nav.is_done());
-        assert!(nav.navigate_to(
-            &PathFinder::default(),
-            &GridWorld::default(),
-            (0, 1, 0),
-            (2, 1, 0)
-        ));
+        assert!(nav.navigate_to(&PathFinder::default(), &world, (0, 1, 0), (2, 1, 0)));
         assert_eq!(nav.path().unwrap().nodes.len(), 3);
-        assert_eq!(nav.next_waypoint(), Some((1.5, 1.0, 0.5)));
-        nav.advance_if_reached((1.5, 1.0, 0.5), 0.1);
-        assert_eq!(nav.next_waypoint(), Some((2.5, 1.0, 0.5)));
-        nav.advance_if_reached((2.5, 1.0, 0.5), 0.1);
+        assert_eq!(nav.next_waypoint(&world), Some((1.5, 1.0, 0.5)));
+        nav.advance_if_reached(&world, (1.5, 1.0, 0.5), 0.1);
+        assert_eq!(nav.next_waypoint(&world), Some((2.5, 1.0, 0.5)));
+        nav.advance_if_reached(&world, (2.5, 1.0, 0.5), 0.1);
         assert!(nav.is_done());
         nav.stop();
         assert!(nav.path().is_none());
