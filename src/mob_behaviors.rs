@@ -186,7 +186,7 @@ impl GhastBehavior {
         Self {
             entity,
             altitude,
-            attack_tick: -40,
+            attack_tick: 0,
         }
     }
 
@@ -195,19 +195,27 @@ impl GhastBehavior {
     }
 
     fn charging(&self) -> bool {
-        (-10..10).contains(&self.attack_tick)
+        self.attack_tick > 10
     }
 
-    // The lane specifies a 20-GT warning starting at -10 and a separate shot at +20.
-    // A missing or occluded target cancels the windup.
-    fn tick(&mut self, visible_target_delta: Option<[f64; 3]>) -> Option<GhastAttack> {
-        let Some(delta) = visible_target_delta else {
-            self.attack_tick = -40;
+    fn tick(
+        &mut self,
+        target_delta: Option<[f64; 3]>,
+        target_in_range_and_visible: bool,
+    ) -> Option<GhastAttack> {
+        let Some(delta) = target_delta else {
+            self.attack_tick = 0;
             return None;
         };
+        if !target_in_range_and_visible {
+            if self.attack_tick > 0 {
+                self.attack_tick -= 1;
+            }
+            return None;
+        }
         self.attack_tick += 1;
         match self.attack_tick {
-            -10 => Some(GhastAttack::Warning),
+            10 => Some(GhastAttack::Warning),
             20 => {
                 self.attack_tick = -40;
                 Some(GhastAttack::Fire(GhastFireball {
@@ -1526,14 +1534,14 @@ mod mob_behaviors_tests {
         assert!(ghast.hover_velocity(81.0, 0.0) < 0.0);
         assert_eq!(ghast.hover_velocity(80.0, 0.0), 0.0);
         let target = Some([0.0, 3.0, 4.0]);
-        for tick in -39..20 {
+        for tick in 1..20 {
             assert_eq!(
-                ghast.tick(target),
-                (tick == -10).then_some(GhastAttack::Warning)
+                ghast.tick(target, true),
+                (tick == 10).then_some(GhastAttack::Warning)
             );
-            assert_eq!(ghast.charging(), (-10..10).contains(&tick));
+            assert_eq!(ghast.charging(), tick > 10);
         }
-        let Some(GhastAttack::Fire(mut fireball)) = ghast.tick(target) else {
+        let Some(GhastAttack::Fire(mut fireball)) = ghast.tick(target, true) else {
             panic!("expected a shot at +20");
         };
         assert!(!ghast.charging());
@@ -1545,12 +1553,35 @@ mod mob_behaviors_tests {
         assert_eq!(fireball.owner, 23);
         assert!(fireball.returns_to_sender(10));
         assert!(!fireball.returns_to_sender(11));
-        for _ in 0..29 {
-            assert_eq!(ghast.tick(target), None);
+        assert_eq!(ghast.attack_tick, -40);
+        for _ in -39..10 {
+            assert_eq!(ghast.tick(target, true), None);
         }
-        assert_eq!(ghast.tick(target), Some(GhastAttack::Warning));
-        assert_eq!(ghast.tick(None), None);
+        assert_eq!(ghast.tick(target, true), Some(GhastAttack::Warning));
         assert!(!ghast.charging());
+        assert_eq!(ghast.tick(target, false), None);
+        assert_eq!(ghast.attack_tick, 9);
+        assert!(!ghast.charging());
+        assert_eq!(ghast.tick(target, true), Some(GhastAttack::Warning));
+        for _ in 0..9 {
+            assert_eq!(ghast.tick(target, true), None);
+        }
+        let Some(GhastAttack::Fire(_)) = ghast.tick(target, true) else {
+            panic!("expected second shot at +20");
+        };
+        assert_eq!(ghast.attack_tick, -40);
+        assert!(!ghast.charging());
+        assert_eq!(ghast.tick(target, false), None);
+        assert_eq!(ghast.attack_tick, -40);
+
+        for _ in -39..=19 {
+            ghast.tick(target, true);
+        }
+        assert!(ghast.charging());
+        assert_eq!(ghast.tick(None, false), None);
+        assert!(!ghast.charging());
+        assert_eq!(ghast.tick(target, true), None);
+        assert_eq!(ghast.attack_tick, 1);
     }
 
     #[test]
