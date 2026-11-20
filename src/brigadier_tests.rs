@@ -1276,3 +1276,582 @@ fn a_quoted_multi_byte_character_advances_the_cursor_by_its_utf8_length() {
     assert_eq!(reader.total_length(), 8);
     assert_eq!(reader.remaining(), "");
 }
+// ---------------------------------------------------------------------------------------
+// Vanilla command tokens and entity selectors
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn command_tokenizer_preserves_quoted_and_nested_argument_text() {
+    let selector = r#"@e[type=minecraft:cow, name="Bob Smith",nbt={Items:[{name:'A, B [C]'}]}]"#;
+    let message = r#""猫 \"says\" \\ hi""#;
+    let single = r#"'it\'s fine'"#;
+    let snbt = r#"{text:"a } b", list:[1, 2]}"#;
+    let input = format!(" \t/command {selector}\t{message} {single} {snbt}  last\n");
+    assert_eq!(
+        split_command_args_preserving_quotes(&input).unwrap(),
+        ["/command", selector, message, single, snbt, "last"]
+    );
+    assert_eq!(
+        split_command_args_preserving_quotes("say \"\"\u{a0}word [] {}").unwrap(),
+        ["say", "\"\"\u{a0}word", "[]", "{}"]
+    );
+    assert!(split_command_args_preserving_quotes(" \t\n")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn command_tokenizer_rejects_unclosed_or_crossed_delimiters() {
+    for (input, error) in [
+        ("say \"unfinished", "Unclosed quoted string"),
+        (r#"say 'unfinished\"#, "Unclosed quoted string"),
+        (r#"say "bad\q""#, "Invalid escape"),
+        ("kill @e[type=cow", "Expected ']'"),
+        ("data {foo:[1, 2]", "Expected '}'"),
+        ("data {[}]", "Unexpected '}'"),
+        ("kill @e]", "Unexpected ']'"),
+    ] {
+        let actual = split_command_args_preserving_quotes(input).unwrap_err();
+        assert!(actual.contains(error), "{input:?} returned {actual}");
+    }
+}
+
+fn parse_selector(input: &str) -> Result<SelectorSpec, String> {
+    SelectorSpec::parse(input, |id| {
+        matches!(
+            id,
+            "minecraft:player" | "minecraft:cow" | "minecraft:pig" | "minecraft:item"
+        )
+    })
+}
+
+fn selector_source() -> SelectorSource<'static> {
+    SelectorSource {
+        position: [0.0; 3],
+        dimension: "minecraft:overworld",
+        executor: None,
+    }
+}
+
+fn candidate(id: i32, entity_type: &'static str, position: [f64; 3]) -> SelectorCandidate<'static> {
+    SelectorCandidate {
+        id,
+        entity_type,
+        position,
+        bounds: Some([
+            [position[0] - 0.3, position[1], position[2] - 0.3],
+            [position[0] + 0.3, position[1] + 1.0, position[2] + 0.3],
+        ]),
+        dimension: "minecraft:overworld",
+        alive: true,
+        living: entity_type != "minecraft:item",
+        ..SelectorCandidate::default()
+    }
+}
+
+fn selector_ids<'a>(selected: Vec<&SelectorCandidate<'a>>) -> Vec<i32> {
+    selected.into_iter().map(|entity| entity.id).collect()
+}
+
+fn selected_ids(
+    selector: &str,
+    source: &SelectorSource<'_>,
+    candidates: &[SelectorCandidate<'_>],
+) -> Vec<i32> {
+    let selector = parse_selector(selector).unwrap();
+    selector_ids(select_entities(
+        &selector,
+        source,
+        candidates,
+        |_, _| None,
+        |end| end - 1,
+    ))
+}
+
+#[test]
+fn selector_variables_use_vanilla_defaults_and_executor() {
+    let mut source = selector_source();
+    source.executor = Some(4);
+    let mut candidates = [
+        candidate(1, "minecraft:player", [0.0, 9.0, 0.0]),
+        candidate(2, "minecraft:cow", [0.0, 0.0, 0.0]),
+        candidate(3, "minecraft:player", [2.0, 0.0, 0.0]),
+        candidate(4, "minecraft:cow", [1.0, 0.0, 0.0]),
+    ];
+    candidates[3].alive = false;
+    candidates[3].dimension = "minecraft:the_nether";
+    for (selector, expected) in [
+        ("@p", &[3][..]),
+        ("@a", &[1, 3]),
+        ("@r", &[1]),
+        ("@e", &[1, 2, 3]),
+        ("@n", &[2]),
+        ("@s", &[4]),
+        ("@s[x=1,dy=0,type=cow]", &[4]),
+        ("@s[type=!cow]", &[]),
+    ] {
+        assert_eq!(
+            selected_ids(selector, &source, &candidates),
+            expected,
+            "{selector}"
+        );
+    }
+    source.executor = None;
+    assert_eq!(selected_ids("@s", &source, &candidates), []);
+}
+
+#[test]
+fn selector_sorting_is_stable_and_limits_apply_after_ordering() {
+    let source = selector_source();
+    let candidates = [
+        candidate(1, "minecraft:player", [3.0, 0.0, 0.0]),
+        candidate(2, "minecraft:player", [0.0, -1.0, 0.0]),
+        candidate(3, "minecraft:player", [0.0, 0.0, 1.0]),
+        candidate(4, "minecraft:player", [0.0, 6.0, 0.0]),
+    ];
+    for (selector, expected) in [
+        ("@p[limit=2]", &[2, 3][..]),
+        ("@a[sort=nearest,limit=3]", &[2, 3, 1]),
+        ("@e[sort=furthest,limit=3]", &[4, 1, 2]),
+        ("@n[sort=arbitrary,limit=2]", &[1, 2]),
+        ("@e[sort=nearest,x=3,limit=1]", &[1]),
+        ("@a[sort=nearest,limit=100]", &[2, 3, 1, 4]),
+    ] {
+        assert_eq!(
+            selected_ids(selector, &source, &candidates),
+            expected,
+            "{selector}"
+        );
+    }
+
+    let mut draws = Vec::new();
+    let selector = parse_selector("@r[distance=..3,limit=2]").unwrap();
+    let selected = select_entities(
+        &selector,
+        &source,
+        &candidates,
+        |_, _| None,
+        |end| {
+            draws.push(end);
+            0
+        },
+    );
+    assert_eq!(draws, [3, 2]);
+    assert_eq!(selector_ids(selected), [2, 3]);
+    let only_candidate = &candidates[..1];
+    assert_eq!(
+        selector_ids(select_entities(
+            &selector,
+            &source,
+            only_candidate,
+            |_, _| None,
+            |_| { panic!("a one-element shuffle needs no draw") }
+        )),
+        [1]
+    );
+}
+
+#[test]
+fn selector_distance_ranges_include_bounds_and_use_all_axes() {
+    let source = selector_source();
+    let mut candidates = [
+        candidate(1, "minecraft:cow", [0.0, 0.0, 0.0]),
+        candidate(2, "minecraft:cow", [0.0, 3.0, 0.0]),
+        candidate(3, "minecraft:cow", [3.0, 0.0, 4.0]),
+        candidate(4, "minecraft:cow", [0.0, 0.0, 5.01]),
+        candidate(5, "minecraft:cow", [0.0, 2.0, 0.0]),
+    ];
+    candidates[4].dimension = "minecraft:the_nether";
+    for (selector, expected) in [
+        ("@e[distance=..5]", &[1, 2, 3][..]),
+        ("@e[distance=2..]", &[2, 3, 4]),
+        ("@e[distance=2..5]", &[2, 3]),
+        ("@e[distance=3]", &[2]),
+        ("@e[distance=0]", &[1]),
+        ("@e[distance=..5.01]", &[1, 2, 3, 4]),
+        ("@e[x=3,y=0,z=4,distance=0]", &[3]),
+        ("@e[x=0]", &[1, 2, 3, 4]),
+        ("@e", &[1, 2, 3, 4, 5]),
+    ] {
+        assert_eq!(
+            selected_ids(selector, &source, &candidates),
+            expected,
+            "{selector}"
+        );
+    }
+}
+
+#[test]
+fn selector_delta_volume_intersects_hitboxes_and_defaults_missing_axes_to_one_block() {
+    let mut source = selector_source();
+    source.position = [8.0, 6.0, 7.0];
+    let candidates = [
+        candidate(1, "minecraft:cow", [8.0, 6.0, 7.0]),
+        candidate(2, "minecraft:cow", [5.8, 6.0, 7.0]),
+        candidate(3, "minecraft:cow", [8.9, 6.0, 9.1]),
+        candidate(4, "minecraft:cow", [8.0, 7.0, 7.0]),
+        candidate(5, "minecraft:cow", [5.0, 6.0, 7.0]),
+    ];
+    assert_eq!(
+        selected_ids("@e[dx=-2,dz=1]", &source, &candidates),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        selected_ids("@e[dx=-2,dz=1,distance=..2]", &source, &candidates),
+        [1]
+    );
+    assert_eq!(
+        selected_ids("@e[x=8,y=7,z=7,dx=0,dy=-1,dz=0]", &source, &candidates),
+        [1, 4]
+    );
+    assert_eq!(selected_ids("@e[dx=0]", &source, &candidates), [1]);
+}
+
+#[test]
+fn selector_rotation_wraps_endpoints_and_open_ranges() {
+    let source = selector_source();
+    let mut candidates = [
+        candidate(1, "minecraft:cow", [0.0; 3]),
+        candidate(2, "minecraft:cow", [0.0; 3]),
+        candidate(3, "minecraft:cow", [0.0; 3]),
+        candidate(4, "minecraft:cow", [0.0; 3]),
+    ];
+    for (entity, (pitch, yaw)) in
+        candidates
+            .iter_mut()
+            .zip([(365.0, 175.0), (-2.0, -175.0), (5.0, 2.0), (10.0, 180.0)])
+    {
+        entity.pitch = pitch;
+        entity.yaw = yaw;
+    }
+    for (selector, expected) in [
+        ("@e[y_rotation=170..-170]", &[1, 2, 4][..]),
+        ("@e[y_rotation=0..360]", &[]),
+        ("@e[x_rotation=..5]", &[1, 3]),
+        ("@e[x_rotation=5..]", &[1, 2, 3, 4]),
+        ("@e[x_rotation=5,y_rotation=170..190]", &[1]),
+        ("@e[y_rotation=180]", &[4]),
+    ] {
+        assert_eq!(
+            selected_ids(selector, &source, &candidates),
+            expected,
+            "{selector}"
+        );
+    }
+}
+
+#[test]
+fn selector_player_fields_and_team_filters_respect_entity_kind() {
+    use SelectorGameMode::*;
+
+    let source = selector_source();
+    let mut candidates = [
+        candidate(1, "minecraft:player", [0.0; 3]),
+        candidate(2, "minecraft:player", [0.0; 3]),
+        candidate(3, "minecraft:player", [0.0; 3]),
+        candidate(4, "minecraft:player", [0.0; 3]),
+        candidate(5, "minecraft:cow", [0.0; 3]),
+        candidate(6, "minecraft:item", [0.0; 3]),
+    ];
+    for (entity, (mode, level)) in
+        candidates
+            .iter_mut()
+            .zip([(Survival, 0), (Creative, 3), (Adventure, 5), (Spectator, 6)])
+    {
+        entity.gamemode = Some(mode);
+        entity.level = Some(level);
+    }
+    candidates[0].team = Some("red");
+    candidates[1].team = Some("blue");
+    candidates[4].team = Some("red");
+    for (selector, expected) in [
+        ("@e[level=3..5]", &[2, 3][..]),
+        ("@a[level=3..,gamemode=!spectator,gamemode=!creative]", &[3]),
+        ("@e[gamemode=survival]", &[1]),
+        ("@e[gamemode=creative]", &[2]),
+        ("@e[gamemode=adventure]", &[3]),
+        ("@e[gamemode=spectator]", &[4]),
+        ("@e[team=red]", &[1, 5]),
+        ("@e[team=!red,team=blue]", &[2]),
+        ("@e[team=]", &[3, 4]),
+        ("@e[team=!]", &[1, 2, 5]),
+    ] {
+        assert_eq!(
+            selected_ids(selector, &source, &candidates),
+            expected,
+            "{selector}"
+        );
+    }
+}
+
+#[test]
+fn selector_names_types_and_tags_support_exclusions_and_empty_tag_checks() {
+    let source = selector_source();
+    let mut candidates = [
+        candidate(1, "minecraft:cow", [0.0; 3]),
+        candidate(2, "minecraft:pig", [0.0; 3]),
+        candidate(3, "minecraft:player", [0.0; 3]),
+        candidate(4, "minecraft:item", [0.0; 3]),
+    ];
+    candidates[0].name = "Bob \"Smith\"";
+    candidates[1].name = "Pig";
+    candidates[2].name = "Alice";
+    candidates[0].type_tags = &["minecraft:animals", "test:herd"];
+    candidates[1].type_tags = &["minecraft:animals"];
+    candidates[0].tags = &["a", "c"];
+    candidates[1].tags = &["a", "b"];
+    candidates[2].tags = &["b"];
+    for (selector, expected) in [
+        (r#"@e[name="Bob \"Smith\""]"#, &[1][..]),
+        ("@e[name='Bob \"Smith\"']", &[1]),
+        ("@e[name=Pig]", &[2]),
+        ("@e[name=!Pig,name=!Alice]", &[1, 4]),
+        ("@e[type=cow]", &[1]),
+        ("@e[type=minecraft:player]", &[3]),
+        ("@e[type=!cow,type=!pig]", &[3, 4]),
+        ("@e[type=#animals,type=#test:herd,type=cow]", &[1]),
+        ("@e[type=#animals,type=!#test:herd]", &[2]),
+        ("@e[type=!#test:missing]", &[1, 2, 3, 4]),
+        ("@e[tag=a,tag=!b]", &[1]),
+        ("@e[tag=]", &[4]),
+        ("@e[tag=!]", &[1, 2, 3]),
+    ] {
+        assert_eq!(
+            selected_ids(selector, &source, &candidates),
+            expected,
+            "{selector}"
+        );
+    }
+}
+
+#[test]
+fn selector_score_ranges_and_advancement_maps_require_present_entries() {
+    let source = selector_source();
+    let mut candidates = [
+        candidate(1, "minecraft:player", [0.0; 3]),
+        candidate(2, "minecraft:player", [0.0; 3]),
+        candidate(3, "minecraft:player", [0.0; 3]),
+        candidate(4, "minecraft:cow", [0.0; 3]),
+    ];
+    candidates[0].scores.extend([("points", 5), ("debt", -3)]);
+    candidates[1].scores.extend([("points", 1), ("debt", 0)]);
+    candidates[2].scores.insert("points", 4);
+    candidates[3].scores.extend([("points", 5), ("debt", -3)]);
+    candidates[0].advancements.insert(
+        "minecraft:story/root",
+        SelectorAdvancementProgress {
+            done: true,
+            criteria: [("ready", true)].into(),
+        },
+    );
+    candidates[0].advancements.insert(
+        "test:work",
+        SelectorAdvancementProgress {
+            done: false,
+            criteria: [("first", true), ("last", false)].into(),
+        },
+    );
+    candidates[1].advancements.insert(
+        "test:work",
+        SelectorAdvancementProgress {
+            done: false,
+            criteria: [("first", true)].into(),
+        },
+    );
+    for (selector, expected) in [
+        ("@e[scores={points=1..5,debt=-3}]", &[1, 4][..]),
+        ("@e[scores={points=..4 debt=0..}]", &[2]),
+        ("@e[scores={points=5,points=1}]", &[2]),
+        ("@e[scores={}]", &[1, 2, 3, 4]),
+        ("@e[advancements={}]", &[1, 2, 3, 4]),
+        (
+            "@e[advancements={story/root=true,test:work={first=true,last=false}}]",
+            &[1],
+        ),
+        ("@e[advancements={test:work=false}]", &[1, 2]),
+        ("@e[advancements={test:missing=false}]", &[]),
+        ("@e[advancements={test:work={missing=false}}]", &[]),
+    ] {
+        assert_eq!(
+            selected_ids(selector, &source, &candidates),
+            expected,
+            "{selector}"
+        );
+    }
+}
+
+#[test]
+fn selector_nbt_keeps_raw_text_and_matches_compounds_lists_and_typed_arrays() {
+    let source = selector_source();
+    let nbt = SelectorNbt::parse(
+        r#"{CustomName:"Bob Smith",data:{hp:10s, EXTRA:1d},Items:[{id:"a",count:2b},{id:"b"}],arr:[I;1,2],other:[]}"#,
+    )
+    .unwrap();
+    let mut candidates = [
+        candidate(1, "minecraft:cow", [0.0; 3]),
+        candidate(2, "minecraft:cow", [0.0; 3]),
+        candidate(3, "minecraft:cow", [0.0; 3]),
+    ];
+    let empty_nbt = SelectorNbt::parse("{}").unwrap();
+    candidates[0].nbt = Some(&nbt);
+    candidates[1].nbt = Some(&empty_nbt);
+    let raw = r#"{ CustomName : 'Bob Smith', data:{hp:10S},Items:[{id:b},{id:a}], arr:[I;1, 2] }"#;
+    let selector = format!("@e[nbt={raw},nbt=!{{other:[1]}}]");
+    let spec = parse_selector(&selector).unwrap();
+    match &spec.filters()[0] {
+        SelectorFilter::Nbt {
+            raw: actual,
+            negated,
+            ..
+        } => {
+            assert_eq!(actual, raw);
+            assert!(!negated);
+        }
+        filter => panic!("expected NBT, got {filter:?}"),
+    }
+    assert_eq!(selected_ids(&selector, &source, &candidates), [1]);
+    for (selector, expected) in [
+        ("@e[nbt={Items:[{id:a},{id:a}]}]", &[1][..]),
+        ("@e[nbt={Items:[{id:a},{id:a},{id:a}]}]", &[]),
+        ("@e[nbt={Items:[]}]", &[]),
+        ("@e[nbt={other:[]}]", &[1]),
+        ("@e[nbt={arr:[I;2,1]}]", &[]),
+        ("@e[nbt={arr:[1,2]}]", &[]),
+        ("@e[nbt={data:{hp:10}}]", &[]),
+        ("@e[nbt=!{arr:[I;1,2]}]", &[2]),
+    ] {
+        assert_eq!(
+            selected_ids(selector, &source, &candidates),
+            expected,
+            "{selector}"
+        );
+    }
+}
+
+#[test]
+fn selector_predicates_support_negation_and_missing_registry_entries() {
+    let candidates = [
+        candidate(1, "minecraft:cow", [0.0; 3]),
+        candidate(2, "minecraft:cow", [0.0; 3]),
+        candidate(3, "minecraft:cow", [0.0; 3]),
+        candidate(4, "minecraft:cow", [0.0; 3]),
+    ];
+    let spec = parse_selector("@e[predicate=ready,predicate=!test:blocked]").unwrap();
+    let matched = select_entities(
+        &spec,
+        &selector_source(),
+        &candidates,
+        |entity, id| match id {
+            "minecraft:ready" => Some(entity.id != 2),
+            "test:blocked" => match entity.id {
+                1 => Some(false),
+                3 => None,
+                _ => Some(true),
+            },
+            _ => panic!("unexpected resource location {id}"),
+        },
+        |_| panic!("arbitrary ordering needs no draw"),
+    );
+    assert_eq!(selector_ids(matched), [1]);
+}
+
+#[test]
+fn selector_parser_reports_invalid_variables_options_ranges_and_snbt() {
+    for (selector, message) in [
+        ("Bob", "Expected '@'"),
+        ("@q", "Expected one of"),
+        ("@", "Expected one of"),
+        ("@ex", "Unexpected selector input"),
+        ("@e[x=0] tail", "Unexpected selector input"),
+        ("@e[", "Expected ']'"),
+        ("@e[x=1 y=2]", "Expected ']'"),
+        ("@e[unknown=1]", "Unknown selector option"),
+        ("@e[sort=reverse]", "Unknown selector sort"),
+        ("@e[gamemode=unknown]", "Unknown selector gamemode"),
+        ("@e[type=missing]", "Unknown entity type"),
+        ("@e[type=foo/bar:cow]", "Invalid selector resource"),
+        ("@e[predicate=test:one:two]", "Invalid selector resource"),
+        ("@e[name='unfinished]", "Unclosed quoted string"),
+        ("@e[name=\"bad\\q\"]", "Invalid escape"),
+        ("@e[x=~]", "Expected double"),
+        ("@e[dx=+3]", "Expected double"),
+        ("@e[distance=..]", "Expected a range bound"),
+        ("@e[distance=5..2]", "Range bounds are reversed"),
+        ("@e[distance=-1..]", "Range must be non-negative"),
+        ("@e[level=..-1]", "Range must be non-negative"),
+        ("@e[level=1.5]", "Invalid range bound"),
+        ("@e[y_rotation=1..2..3]", "Expected ']'"),
+        ("@e[scores={points=3..2}]", "Range bounds are reversed"),
+        ("@e[scores={points=2147483648}]", "Invalid range bound"),
+        ("@e[scores={points=1]", "Expected '='"),
+        ("@e[advancements={test:a=maybe}]", "Invalid bool"),
+        ("@e[advancements={test:a={c=}}]", "Expected bool"),
+        ("@e[nbt=[1,2]]", "Expected '{'"),
+        ("@e[nbt={name}]", "Expected ':'"),
+        ("@e[nbt={name:}]", "Expected an SNBT value"),
+        ("@e[nbt={a:[1,2b]}]", "Mixed element types"),
+        ("@e[nbt={a:[I;1b]}]", "Mixed element types"),
+        ("@e[nbt={a:[X;1]}]", "Unknown SNBT array type"),
+        ("@e[limit=0]", "Selector limit must be positive"),
+        ("@e[limit=-2]", "Selector limit must be positive"),
+        ("@e[limit=2147483648]", "Invalid integer"),
+    ] {
+        let actual = parse_selector(selector).unwrap_err();
+        assert!(actual.contains(message), "{selector:?} returned {actual}");
+    }
+}
+
+#[test]
+fn selector_parser_enforces_vanilla_option_applicability() {
+    for selector in [
+        "@p[type=player]",
+        "@a[type=!cow]",
+        "@r[type=#animals]",
+        "@s[sort=nearest]",
+        "@s[limit=1]",
+        "@e[x=1,x=2]",
+        "@e[distance=1,distance=2]",
+        "@n[sort=nearest,sort=arbitrary]",
+        "@n[limit=3,limit=2]",
+        "@e[name=A,name=!B]",
+        "@e[name=!A,name=B]",
+        "@e[gamemode=creative,gamemode=!survival]",
+        "@e[gamemode=!creative,gamemode=survival]",
+        "@e[team=red,team=!blue]",
+        "@e[type=cow,type=!pig]",
+        "@e[type=!pig,type=#animals]",
+        "@e[scores={},scores={x=1}]",
+        "@e[advancements={},advancements={test:one=false}]",
+    ] {
+        let actual = parse_selector(selector).unwrap_err();
+        assert!(
+            actual.contains("Inapplicable selector option"),
+            "{selector:?} returned {actual}"
+        );
+    }
+    for selector in [
+        "@e[]",
+        "@n[ tag = a,tag=b,]",
+        "@e[\"name\"= ! 'Bob Smith',name=!Alice]",
+        "@e[type=#animals,type=!cow,type=!pig]",
+        "@e[nbt={a:[B;true,-2b],b:[L;3L],floats:[1e2f,2f]}]",
+    ] {
+        assert!(parse_selector(selector).is_ok(), "{selector}");
+    }
+}
+
+#[test]
+fn selector_point_candidates_obey_lower_inclusive_volume_bounds() {
+    let source = selector_source();
+    let mut candidates = [
+        candidate(1, "minecraft:cow", [0.0; 3]),
+        candidate(2, "minecraft:cow", [0.0, 1.0, 0.0]),
+        candidate(3, "minecraft:cow", [-1.0, 0.0, 0.0]),
+    ];
+    for candidate in &mut candidates {
+        candidate.bounds = None;
+    }
+    assert_eq!(selected_ids("@e[dx=0]", &source, &candidates), [1]);
+    assert_eq!(selected_ids("@e[distance=0]", &source, &candidates), [1]);
+    assert_eq!(selected_ids("@e[distance=1]", &source, &candidates), [2, 3]);
+}

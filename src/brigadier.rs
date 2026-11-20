@@ -20,7 +20,7 @@
 //! owns the handwritten parser, and no packet is built from this tree. The wire format of the
 //! Commands packet and of the suggestions exchange lives in `src/brigadier_wire.rs`, which reads
 //! this module and is read by nothing; sending either packet is still a later slice. Wiring,
-//! 1.21.1 argument types (selectors, `block_pos`, `vec3`, `resource_location`, NBT, components),
+//! the remaining 1.21.1 argument types,
 //! `.mcfunction` execution and the JVM-shim bridge are later slices too.
 //!
 //! # Deliberate deviations from the Java code
@@ -55,7 +55,7 @@
 
 use std::any::Any;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -427,6 +427,952 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+// ---------------------------------------------------------------------------------------
+// Vanilla command tokens and entity selectors
+// ---------------------------------------------------------------------------------------
+
+/// Split on whitespace at the top level, retaining the original quotes and escapes.
+pub(crate) fn split_command_args_preserving_quotes(input: &str) -> Result<Vec<String>, String> {
+    let mut reader = StringReader::new(input);
+    let mut args = Vec::new();
+    let mut delimiters = Vec::new();
+    reader.skip_whitespace();
+    let mut start = reader.cursor();
+
+    while let Some(c) = reader.peek() {
+        match c {
+            '"' | '\'' => {
+                reader.read_quoted_string().map_err(|err| err.to_string())?;
+            }
+            '[' | '{' => {
+                delimiters.push(if c == '[' { ']' } else { '}' });
+                reader.skip();
+            }
+            ']' | '}' => {
+                if delimiters.pop() != Some(c) {
+                    return Err(format!("Unexpected '{c}' at byte {}", reader.cursor()));
+                }
+                reader.skip();
+            }
+            c if delimiters.is_empty() && StringReader::is_whitespace(c) => {
+                args.push(input[start..reader.cursor()].to_owned());
+                reader.skip_whitespace();
+                start = reader.cursor();
+            }
+            _ => reader.skip(),
+        }
+    }
+
+    if let Some(end) = delimiters.pop() {
+        return Err(format!("Expected '{end}' at byte {}", reader.cursor()));
+    }
+    if start < reader.cursor() {
+        args.push(input[start..].to_owned());
+    }
+    Ok(args)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectorVariable {
+    NearestPlayer,
+    AllPlayers,
+    RandomPlayer,
+    AllEntities,
+    SelfEntity,
+    NearestEntity,
+}
+
+impl SelectorVariable {
+    fn players_only(self) -> bool {
+        matches!(
+            self,
+            Self::NearestPlayer | Self::AllPlayers | Self::RandomPlayer
+        )
+    }
+
+    fn requires_alive(self) -> bool {
+        matches!(self, Self::AllEntities | Self::NearestEntity)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectorSort {
+    Nearest,
+    Furthest,
+    Random,
+    Arbitrary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectorGameMode {
+    Survival,
+    Creative,
+    Adventure,
+    Spectator,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SelectorRange<T> {
+    pub min: Option<T>,
+    pub max: Option<T>,
+}
+
+impl<T: Copy + PartialOrd> SelectorRange<T> {
+    fn contains(&self, value: T) -> bool {
+        self.min.is_none_or(|min| value >= min) && self.max.is_none_or(|max| value <= max)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SelectorAdvancement {
+    Done(bool),
+    Criteria(HashMap<String, bool>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SelectorFilter {
+    Name(String, bool),
+    GameMode(SelectorGameMode, bool),
+    Team(String, bool),
+    Type {
+        id: String,
+        tag: bool,
+        negated: bool,
+    },
+    Tag(String, bool),
+    Nbt {
+        raw: String,
+        value: SelectorNbt,
+        negated: bool,
+    },
+    Scores(HashMap<String, SelectorRange<i32>>),
+    Advancements(HashMap<String, SelectorAdvancement>),
+    Predicate(String, bool),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SelectorSpec {
+    variable: SelectorVariable,
+    origin: [Option<f64>; 3],
+    delta: [Option<f64>; 3],
+    distance: Option<SelectorRange<f64>>,
+    level: Option<SelectorRange<i32>>,
+    pitch: Option<SelectorRange<f32>>,
+    yaw: Option<SelectorRange<f32>>,
+    limit: usize,
+    sort: SelectorSort,
+    filters: Vec<SelectorFilter>,
+}
+
+impl SelectorSpec {
+    /// Parse one complete selector. The caller provides the entity registry lookup for
+    /// canonical IDs such as `minecraft:cow`. Entity-type tags are resolved at match time.
+    pub(crate) fn parse(
+        input: &str,
+        entity_type_exists: impl Fn(&str) -> bool,
+    ) -> Result<Self, String> {
+        use SelectorVariable::*;
+
+        let mut reader = StringReader::new(input);
+        reader.expect('@').map_err(|err| err.to_string())?;
+        let variable = match reader.read() {
+            Some('p') => NearestPlayer,
+            Some('a') => AllPlayers,
+            Some('r') => RandomPlayer,
+            Some('e') => AllEntities,
+            Some('s') => SelfEntity,
+            Some('n') => NearestEntity,
+            _ => return Err("Expected one of @p, @a, @r, @e, @s, @n".into()),
+        };
+        let mut spec = Self {
+            variable,
+            origin: [None; 3],
+            delta: [None; 3],
+            distance: None,
+            level: None,
+            pitch: None,
+            yaw: None,
+            limit: if matches!(variable, AllPlayers | AllEntities) {
+                i32::MAX as usize
+            } else {
+                1
+            },
+            sort: match variable {
+                NearestPlayer | NearestEntity => SelectorSort::Nearest,
+                RandomPlayer => SelectorSort::Random,
+                _ => SelectorSort::Arbitrary,
+            },
+            filters: Vec::new(),
+        };
+        if selector_take(&mut reader, '[') {
+            spec.read_options(&mut reader, entity_type_exists)
+                .map_err(|err| err.to_string())?;
+        }
+        if reader.can_read() {
+            return Err(format!(
+                "Unexpected selector input at byte {}",
+                reader.cursor()
+            ));
+        }
+        Ok(spec)
+    }
+
+    fn read_options(
+        &mut self,
+        reader: &mut StringReader,
+        entity_type_exists: impl Fn(&str) -> bool,
+    ) -> Result<(), CommandSyntaxException> {
+        let mut locked = HashSet::new();
+        let mut exclusions = HashSet::new();
+        reader.skip_whitespace();
+        while reader.can_read() && reader.peek() != Some(']') {
+            reader.skip_whitespace();
+            let key = reader.read_string()?;
+            if locked.contains(&key)
+                || (key == "type" && self.variable.players_only())
+                || (matches!(key.as_str(), "limit" | "sort")
+                    && self.variable == SelectorVariable::SelfEntity)
+            {
+                return Err(selector_error(
+                    reader,
+                    format!("Inapplicable selector option '{key}'"),
+                ));
+            }
+
+            reader.skip_whitespace();
+            reader.expect('=')?;
+            reader.skip_whitespace();
+            let negated = matches!(
+                key.as_str(),
+                "name" | "gamemode" | "team" | "type" | "tag" | "nbt" | "predicate"
+            ) && selector_take(reader, '!');
+            reader.skip_whitespace();
+            if exclusions.contains(&key) && !negated {
+                return Err(selector_error(
+                    reader,
+                    format!("Inapplicable selector option '{key}'"),
+                ));
+            }
+
+            let mut repeatable = false;
+            match key.as_str() {
+                "x" => self.origin[0] = Some(reader.read_double()?),
+                "y" => self.origin[1] = Some(reader.read_double()?),
+                "z" => self.origin[2] = Some(reader.read_double()?),
+                "dx" => self.delta[0] = Some(reader.read_double()?),
+                "dy" => self.delta[1] = Some(reader.read_double()?),
+                "dz" => self.delta[2] = Some(reader.read_double()?),
+                "distance" => self.distance = Some(read_selector_range(reader, Some(0.0), false)?),
+                "level" => self.level = Some(read_selector_range(reader, Some(0), false)?),
+                "x_rotation" => self.pitch = Some(read_selector_range(reader, None, true)?),
+                "y_rotation" => self.yaw = Some(read_selector_range(reader, None, true)?),
+                "limit" => {
+                    let limit = reader.read_int()?;
+                    if limit < 1 {
+                        return Err(selector_error(reader, "Selector limit must be positive"));
+                    }
+                    self.limit = limit as usize;
+                }
+                "sort" => {
+                    self.sort = match reader.read_unquoted_string().as_str() {
+                        "nearest" => SelectorSort::Nearest,
+                        "furthest" => SelectorSort::Furthest,
+                        "random" => SelectorSort::Random,
+                        "arbitrary" => SelectorSort::Arbitrary,
+                        _ => return Err(selector_error(reader, "Unknown selector sort")),
+                    };
+                }
+                "name" | "gamemode" | "team" | "type" | "tag" | "nbt" | "scores"
+                | "advancements" | "predicate" => {
+                    let filter = read_selector_filter(reader, &key, negated, &entity_type_exists)?;
+                    if negated && matches!(key.as_str(), "name" | "gamemode" | "type") {
+                        exclusions.insert(key.clone());
+                        repeatable = true;
+                    } else {
+                        repeatable = matches!(
+                            filter,
+                            SelectorFilter::Tag(..)
+                                | SelectorFilter::Nbt { .. }
+                                | SelectorFilter::Predicate(..)
+                                | SelectorFilter::Team(_, true)
+                                | SelectorFilter::Type { tag: true, .. }
+                        );
+                    }
+                    self.filters.push(filter);
+                }
+                _ => {
+                    return Err(selector_error(
+                        reader,
+                        format!("Unknown selector option '{key}'"),
+                    ))
+                }
+            }
+            if !repeatable {
+                locked.insert(key);
+            }
+            reader.skip_whitespace();
+            if !selector_take(reader, ',') {
+                break;
+            }
+        }
+        reader.expect(']')
+    }
+
+    pub(crate) fn filters(&self) -> &[SelectorFilter] {
+        &self.filters
+    }
+}
+
+fn selector_error(reader: &StringReader, message: impl Into<String>) -> CommandSyntaxException {
+    CommandSyntaxException::with_context(
+        CommandExceptionType::DispatcherParseException,
+        message,
+        reader.string(),
+        reader.cursor(),
+    )
+}
+
+fn selector_take(reader: &mut StringReader, c: char) -> bool {
+    if reader.peek() == Some(c) {
+        reader.skip();
+        true
+    } else {
+        false
+    }
+}
+
+fn read_selector_range<T: Copy + PartialOrd + std::str::FromStr>(
+    reader: &mut StringReader,
+    floor: Option<T>,
+    wraps: bool,
+) -> Result<SelectorRange<T>, CommandSyntaxException> {
+    fn bound<T: std::str::FromStr>(
+        reader: &mut StringReader,
+    ) -> Result<Option<T>, CommandSyntaxException> {
+        let start = reader.cursor();
+        while reader.peek().is_some_and(StringReader::is_allowed_number)
+            && !reader.remaining().starts_with("..")
+        {
+            reader.skip();
+        }
+        if start == reader.cursor() {
+            return Ok(None);
+        }
+        let value = &reader.string()[start..reader.cursor()];
+        value
+            .parse()
+            .map(Some)
+            .map_err(|_| selector_error(reader, "Invalid range bound"))
+    }
+
+    let min = bound(reader)?;
+    let max = if reader.remaining().starts_with("..") {
+        reader.set_cursor(reader.cursor() + 2);
+        bound(reader)?
+    } else {
+        min
+    };
+    if min.is_none() && max.is_none() {
+        return Err(selector_error(reader, "Expected a range bound"));
+    }
+    if !wraps && min.zip(max).is_some_and(|(min, max)| min > max) {
+        return Err(selector_error(reader, "Range bounds are reversed"));
+    }
+    if floor.is_some_and(|floor| min.is_some_and(|v| v < floor) || max.is_some_and(|v| v < floor)) {
+        return Err(selector_error(reader, "Range must be non-negative"));
+    }
+    Ok(SelectorRange { min, max })
+}
+
+fn read_selector_resource(reader: &mut StringReader) -> Result<String, CommandSyntaxException> {
+    let resource_char =
+        |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-');
+    let start = reader.cursor();
+    while reader
+        .peek()
+        .is_some_and(|c| resource_char(c) || matches!(c, ':' | '/'))
+    {
+        reader.skip();
+    }
+    let resource = &reader.string()[start..reader.cursor()];
+    let (namespace, path) = resource.split_once(':').unwrap_or(("", resource));
+    if !namespace.chars().all(resource_char) || !path.chars().all(|c| resource_char(c) || c == '/')
+    {
+        return Err(selector_error(reader, "Invalid selector resource location"));
+    }
+    let namespace = if namespace.is_empty() {
+        "minecraft"
+    } else {
+        namespace
+    };
+    Ok(format!("{namespace}:{path}"))
+}
+
+fn read_selector_map<K: Eq + std::hash::Hash, V>(
+    reader: &mut StringReader,
+    read_key: impl Fn(&mut StringReader) -> Result<K, CommandSyntaxException>,
+    read_value: impl Fn(&mut StringReader) -> Result<V, CommandSyntaxException>,
+) -> Result<HashMap<K, V>, CommandSyntaxException> {
+    reader.expect('{')?;
+    reader.skip_whitespace();
+    let mut entries = HashMap::new();
+    while reader.can_read() && reader.peek() != Some('}') {
+        reader.skip_whitespace();
+        let key = read_key(reader)?;
+        reader.skip_whitespace();
+        reader.expect('=')?;
+        reader.skip_whitespace();
+        entries.insert(key, read_value(reader)?);
+        reader.skip_whitespace();
+        // Vanilla's score and advancement maps allow the comma to be omitted.
+        selector_take(reader, ',');
+    }
+    reader.expect('}')?;
+    Ok(entries)
+}
+
+fn read_selector_filter(
+    reader: &mut StringReader,
+    key: &str,
+    negated: bool,
+    entity_type_exists: &impl Fn(&str) -> bool,
+) -> Result<SelectorFilter, CommandSyntaxException> {
+    let word = |reader: &mut StringReader| Ok(reader.read_unquoted_string());
+    Ok(match key {
+        "name" => SelectorFilter::Name(reader.read_string()?, negated),
+        "gamemode" => {
+            let mode = match reader.read_unquoted_string().as_str() {
+                "survival" => SelectorGameMode::Survival,
+                "creative" => SelectorGameMode::Creative,
+                "adventure" => SelectorGameMode::Adventure,
+                "spectator" => SelectorGameMode::Spectator,
+                _ => return Err(selector_error(reader, "Unknown selector gamemode")),
+            };
+            SelectorFilter::GameMode(mode, negated)
+        }
+        "team" => SelectorFilter::Team(reader.read_unquoted_string(), negated),
+        "type" => {
+            let tag = selector_take(reader, '#');
+            reader.skip_whitespace();
+            let id = read_selector_resource(reader)?;
+            if !tag && !entity_type_exists(&id) {
+                return Err(selector_error(
+                    reader,
+                    format!("Unknown entity type '{id}'"),
+                ));
+            }
+            SelectorFilter::Type { id, tag, negated }
+        }
+        "tag" => SelectorFilter::Tag(reader.read_unquoted_string(), negated),
+        "nbt" => {
+            let start = reader.cursor();
+            let value = SelectorNbt(read_selector_snbt_compound(reader, 0)?);
+            SelectorFilter::Nbt {
+                raw: reader.string()[start..reader.cursor()].to_owned(),
+                value,
+                negated,
+            }
+        }
+        "scores" => SelectorFilter::Scores(read_selector_map(reader, word, |reader| {
+            read_selector_range(reader, None, false)
+        })?),
+        "advancements" => SelectorFilter::Advancements(read_selector_map(
+            reader,
+            read_selector_resource,
+            |reader| {
+                if reader.peek() == Some('{') {
+                    read_selector_map(reader, word, StringReader::read_boolean)
+                        .map(SelectorAdvancement::Criteria)
+                } else {
+                    reader.read_boolean().map(SelectorAdvancement::Done)
+                }
+            },
+        )?),
+        "predicate" => SelectorFilter::Predicate(read_selector_resource(reader)?, negated),
+        _ => unreachable!("non-filter selector option"),
+    })
+}
+
+/// A parsed SNBT compound for selector queries or entity snapshots.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SelectorNbt(SnbtValue);
+
+impl SelectorNbt {
+    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+        let mut reader = StringReader::new(text);
+        reader.skip_whitespace();
+        let value = read_selector_snbt_compound(&mut reader, 0).map_err(|err| err.to_string())?;
+        reader.skip_whitespace();
+        if reader.can_read() {
+            return Err(
+                selector_error(&reader, "Unexpected input after SNBT compound").to_string(),
+            );
+        }
+        Ok(Self(value))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SnbtValue {
+    Byte(i8),
+    Short(i16),
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    Text(String),
+    List(Vec<Self>),
+    Compound(HashMap<String, Self>),
+    Array(SnbtKind, Vec<Self>),
+}
+
+impl SnbtValue {
+    fn kind(&self) -> SnbtKind {
+        match self {
+            Self::Byte(_) => SnbtKind::Byte,
+            Self::Short(_) => SnbtKind::Short,
+            Self::Int(_) => SnbtKind::Int,
+            Self::Long(_) => SnbtKind::Long,
+            Self::Float(_) => SnbtKind::Float,
+            Self::Double(_) => SnbtKind::Double,
+            Self::Text(_) => SnbtKind::Text,
+            Self::List(_) => SnbtKind::List,
+            Self::Compound(_) => SnbtKind::Compound,
+            Self::Array(kind, _) => *kind,
+        }
+    }
+
+    // Vanilla compares compounds by subset. A list pattern is unordered, requires
+    // enough elements, and may reuse the same matching entry. Typed arrays are exact.
+    fn matches(&self, actual: &Self) -> bool {
+        match (self, actual) {
+            (Self::Compound(expected), Self::Compound(actual)) => expected
+                .iter()
+                .all(|(key, value)| actual.get(key).is_some_and(|actual| value.matches(actual))),
+            (Self::List(expected), Self::List(actual)) if expected.is_empty() => actual.is_empty(),
+            (Self::List(expected), Self::List(actual)) => {
+                expected.len() <= actual.len()
+                    && expected
+                        .iter()
+                        .all(|item| actual.iter().any(|actual| item.matches(actual)))
+            }
+            _ => self == actual,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnbtKind {
+    Byte,
+    Short,
+    Int,
+    Long,
+    Float,
+    Double,
+    Text,
+    List,
+    Compound,
+    ByteArray,
+    IntArray,
+    LongArray,
+}
+
+fn read_selector_snbt_compound(
+    reader: &mut StringReader,
+    depth: usize,
+) -> Result<SnbtValue, CommandSyntaxException> {
+    reader.expect('{')?;
+    reader.skip_whitespace();
+    let mut entries = HashMap::new();
+    while reader.can_read() && reader.peek() != Some('}') {
+        let key = reader.read_string()?;
+        if key.is_empty() {
+            return Err(selector_error(reader, "Expected an SNBT key"));
+        }
+        reader.skip_whitespace();
+        reader.expect(':')?;
+        entries.insert(key, read_selector_snbt_value(reader, depth + 1)?);
+        reader.skip_whitespace();
+        if !selector_take(reader, ',') {
+            break;
+        }
+        reader.skip_whitespace();
+    }
+    reader.expect('}')?;
+    Ok(SnbtValue::Compound(entries))
+}
+
+fn read_selector_snbt_value(
+    reader: &mut StringReader,
+    depth: usize,
+) -> Result<SnbtValue, CommandSyntaxException> {
+    if depth > 512 {
+        return Err(selector_error(reader, "SNBT nesting exceeds 512 levels"));
+    }
+    reader.skip_whitespace();
+    match reader.peek() {
+        Some('{') => read_selector_snbt_compound(reader, depth),
+        Some('[') => read_selector_snbt_list(reader, depth),
+        Some(c) if StringReader::is_quoted_string_start(c) => {
+            reader.read_quoted_string().map(SnbtValue::Text)
+        }
+        _ => {
+            let value = reader.read_unquoted_string();
+            if value.is_empty() {
+                return Err(selector_error(reader, "Expected an SNBT value"));
+            }
+            Ok(snbt_literal(value))
+        }
+    }
+}
+
+fn read_selector_snbt_list(
+    reader: &mut StringReader,
+    depth: usize,
+) -> Result<SnbtValue, CommandSyntaxException> {
+    use SnbtKind::*;
+
+    reader.expect('[')?;
+    let (kind, mut element_kind) = if reader.peek_at(1) == Some(';')
+        && !reader
+            .peek()
+            .is_some_and(StringReader::is_quoted_string_start)
+    {
+        let kinds = match reader.read() {
+            Some('B') => (ByteArray, Some(Byte)),
+            Some('I') => (IntArray, Some(Int)),
+            Some('L') => (LongArray, Some(Long)),
+            _ => return Err(selector_error(reader, "Unknown SNBT array type")),
+        };
+        reader.skip();
+        kinds
+    } else {
+        (List, None)
+    };
+    reader.skip_whitespace();
+    let mut entries = Vec::new();
+    while reader.can_read() && reader.peek() != Some(']') {
+        let item = read_selector_snbt_value(reader, depth + 1)?;
+        if *element_kind.get_or_insert(item.kind()) != item.kind() {
+            return Err(selector_error(
+                reader,
+                "Mixed element types in SNBT list or array",
+            ));
+        }
+        entries.push(item);
+        reader.skip_whitespace();
+        if !selector_take(reader, ',') {
+            break;
+        }
+        reader.skip_whitespace();
+    }
+    reader.expect(']')?;
+    Ok(if kind == List {
+        SnbtValue::List(entries)
+    } else {
+        SnbtValue::Array(kind, entries)
+    })
+}
+
+fn snbt_literal(value: String) -> SnbtValue {
+    use SnbtValue::*;
+
+    fn unsigned(text: &str) -> &str {
+        text.strip_prefix(['-', '+']).unwrap_or(text)
+    }
+
+    fn digits(text: &str) -> bool {
+        !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    fn integer(text: &str) -> bool {
+        let text = unsigned(text);
+        digits(text) && (text == "0" || !text.starts_with('0'))
+    }
+
+    fn decimal(text: &str, dot_required: bool) -> bool {
+        let (mantissa, exponent) = text
+            .split_once(['e', 'E'])
+            .map_or((text, None), |(base, exp)| (base, Some(exp)));
+        if exponent.is_some_and(|exp| !digits(unsigned(exp))) {
+            return false;
+        }
+        let mantissa = unsigned(mantissa);
+        if let Some((whole, fraction)) = mantissa.split_once('.') {
+            (digits(whole) && (fraction.is_empty() || digits(fraction)))
+                || (whole.is_empty() && digits(fraction))
+        } else {
+            !dot_required && digits(mantissa)
+        }
+    }
+
+    if value.eq_ignore_ascii_case("true") {
+        return Byte(1);
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return Byte(0);
+    }
+    let (number, suffix) = value.split_at(value.len() - 1);
+    let parsed = match suffix.as_bytes()[0].to_ascii_lowercase() {
+        b'b' if integer(number) => number.parse().ok().map(Byte),
+        b's' if integer(number) => number.parse().ok().map(Short),
+        b'l' if integer(number) => number.parse().ok().map(Long),
+        b'f' if decimal(number, false) => number.parse().ok().map(Float),
+        b'd' if decimal(number, false) => number.parse().ok().map(Double),
+        _ if integer(&value) => value.parse().ok().map(Int),
+        _ if decimal(&value, true) => value.parse().ok().map(Double),
+        _ => None,
+    };
+    parsed.unwrap_or(Text(value))
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SelectorSource<'a> {
+    pub position: [f64; 3],
+    pub dimension: &'a str,
+    pub executor: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SelectorCandidate<'a> {
+    pub id: i32,
+    pub name: &'a str,
+    /// Canonical resource location, including its namespace.
+    pub entity_type: &'a str,
+    pub position: [f64; 3],
+    pub dimension: &'a str,
+    /// Absolute hitbox corners in min/max order. Without a hitbox, test the position
+    /// against the volume's lower-inclusive, upper-exclusive bounds.
+    pub bounds: Option<[[f64; 3]; 2]>,
+    pub alive: bool,
+    pub living: bool,
+    pub pitch: f32,
+    pub yaw: f32,
+    pub level: Option<i32>,
+    pub gamemode: Option<SelectorGameMode>,
+    pub team: Option<&'a str>,
+    pub tags: &'a [&'a str],
+    /// Canonical type-tag IDs that contain this entity type.
+    pub type_tags: &'a [&'a str],
+    /// Entity save data used by NBT filters, including SelectedItem when applicable.
+    pub nbt: Option<&'a SelectorNbt>,
+    pub scores: HashMap<&'a str, i32>,
+    pub advancements: HashMap<&'a str, SelectorAdvancementProgress<'a>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SelectorAdvancementProgress<'a> {
+    pub done: bool,
+    pub criteria: HashMap<&'a str, bool>,
+}
+
+impl SelectorFilter {
+    fn matches(
+        &self,
+        candidate: &SelectorCandidate<'_>,
+        check_predicate: &mut impl FnMut(&SelectorCandidate<'_>, &str) -> Option<bool>,
+    ) -> bool {
+        use SelectorFilter::*;
+
+        let is_player = candidate.entity_type == "minecraft:player";
+        match self {
+            Name(name, negated) => (candidate.name == name) != *negated,
+            GameMode(mode, negated) => {
+                is_player
+                    && candidate
+                        .gamemode
+                        .is_some_and(|actual| (actual == *mode) != *negated)
+            }
+            Team(team, negated) => {
+                (candidate.living || is_player)
+                    && ((candidate.team.unwrap_or("") == team) != *negated)
+            }
+            Type { id, tag, negated } => {
+                let matches = if *tag {
+                    candidate.type_tags.contains(&id.as_str())
+                } else {
+                    candidate.entity_type == id
+                };
+                matches != *negated
+            }
+            Tag(tag, negated) => {
+                let matches = if tag.is_empty() {
+                    candidate.tags.is_empty()
+                } else {
+                    candidate.tags.contains(&tag.as_str())
+                };
+                matches != *negated
+            }
+            Nbt { value, negated, .. } => candidate
+                .nbt
+                .is_some_and(|actual| value.0.matches(&actual.0) != *negated),
+            Predicate(id, negated) => {
+                check_predicate(candidate, id).is_some_and(|matches| matches != *negated)
+            }
+            Scores(scores) => scores.iter().all(|(objective, range)| {
+                candidate
+                    .scores
+                    .get(objective.as_str())
+                    .is_some_and(|&score| range.contains(score))
+            }),
+            Advancements(advancements) => {
+                advancements.is_empty()
+                    || (is_player
+                        && advancements.iter().all(|(id, expected)| {
+                            candidate
+                                .advancements
+                                .get(id.as_str())
+                                .is_some_and(|actual| match expected {
+                                    SelectorAdvancement::Done(done) => actual.done == *done,
+                                    SelectorAdvancement::Criteria(criteria) => {
+                                        criteria.iter().all(|(name, done)| {
+                                            actual.criteria.get(name.as_str()) == Some(done)
+                                        })
+                                    }
+                                })
+                        }))
+            }
+        }
+    }
+}
+
+fn selector_angle_matches(range: &SelectorRange<f32>, angle: f32) -> bool {
+    fn wrap(angle: f32) -> f32 {
+        let angle = angle % 360.0;
+        if angle >= 180.0 {
+            angle - 360.0
+        } else if angle < -180.0 {
+            angle + 360.0
+        } else {
+            angle
+        }
+    }
+
+    let angle = wrap(angle);
+    let min = wrap(range.min.unwrap_or(0.0));
+    let max = wrap(range.max.unwrap_or(359.0));
+    if min > max {
+        angle >= min || angle <= max
+    } else {
+        angle >= min && angle <= max
+    }
+}
+
+fn selector_distance_squared(origin: [f64; 3], position: [f64; 3]) -> f64 {
+    let [x, y, z] = std::array::from_fn(|axis| position[axis] - origin[axis]);
+    x * x + y * y + z * z
+}
+
+/// Filter eligible candidates, order them, then apply the selector's maximum result count.
+/// Supply eligible candidates in world iteration order with globally unique IDs. Candidates
+/// without NBT or a predicate result also fail negated checks against that data.
+/// `random_index(end)` draws a uniform index in `0..end` from the caller's RNG.
+pub(crate) fn select_entities<'a, 'data>(
+    spec: &SelectorSpec,
+    source: &SelectorSource<'_>,
+    candidates: &'a [SelectorCandidate<'data>],
+    mut check_predicate: impl FnMut(&SelectorCandidate<'_>, &str) -> Option<bool>,
+    mut random_index: impl FnMut(usize) -> usize,
+) -> Vec<&'a SelectorCandidate<'data>> {
+    let origin = std::array::from_fn(|axis| spec.origin[axis].unwrap_or(source.position[axis]));
+    let local = spec.origin.iter().any(Option::is_some)
+        || spec.delta.iter().any(Option::is_some)
+        || spec.distance.is_some();
+    let current = spec.variable == SelectorVariable::SelfEntity;
+    let volume: Option<[[f64; 3]; 2]> = if spec.delta.iter().any(Option::is_some) {
+        let delta = spec.delta.map(|size| size.unwrap_or(0.0));
+        Some([
+            std::array::from_fn(|axis| origin[axis] + delta[axis].min(0.0)),
+            std::array::from_fn(|axis| origin[axis] + (delta[axis].max(0.0) + 1.0)),
+        ])
+    } else {
+        spec.distance
+            .as_ref()
+            .and_then(|range| range.max)
+            .map(|max| {
+                [
+                    origin.map(|coordinate| coordinate - max),
+                    origin.map(|coordinate| coordinate + (max + 1.0)),
+                ]
+            })
+    };
+    let distance = spec.distance.as_ref().map(|range| SelectorRange {
+        min: range.min.map(|bound| bound * bound),
+        max: range.max.map(|bound| bound * bound),
+    });
+
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        let is_player = candidate.entity_type == "minecraft:player";
+        if (current && source.executor != Some(candidate.id))
+            || (!current && local && candidate.dimension != source.dimension)
+            || (spec.variable.players_only() && !is_player)
+            || (spec.variable.requires_alive() && !candidate.alive)
+            || !spec
+                .filters
+                .iter()
+                .all(|filter| filter.matches(candidate, &mut check_predicate))
+            || spec
+                .pitch
+                .as_ref()
+                .is_some_and(|range| !selector_angle_matches(range, candidate.pitch))
+            || spec
+                .yaw
+                .as_ref()
+                .is_some_and(|range| !selector_angle_matches(range, candidate.yaw))
+            || spec.level.as_ref().is_some_and(|range| {
+                !is_player || !candidate.level.is_some_and(|level| range.contains(level))
+            })
+        {
+            continue;
+        }
+        if let Some([min, max]) = volume {
+            let intersects = match candidate.bounds {
+                Some([entity_min, entity_max]) => (0..3)
+                    .all(|axis| min[axis] < entity_max[axis] && max[axis] > entity_min[axis]),
+                None => (0..3).all(|axis| {
+                    min[axis] <= candidate.position[axis] && candidate.position[axis] < max[axis]
+                }),
+            };
+            if !intersects {
+                continue;
+            }
+        }
+        if distance.as_ref().is_some_and(|range| {
+            !range.contains(selector_distance_squared(origin, candidate.position))
+        }) {
+            continue;
+        }
+        selected.push(candidate);
+        if spec.sort == SelectorSort::Arbitrary && selected.len() == spec.limit {
+            break;
+        }
+    }
+
+    match spec.sort {
+        SelectorSort::Nearest => {
+            selected.sort_by(|a, b| {
+                selector_distance_squared(origin, a.position)
+                    .total_cmp(&selector_distance_squared(origin, b.position))
+            });
+        }
+        SelectorSort::Furthest => {
+            selected.sort_by(|a, b| {
+                selector_distance_squared(origin, b.position)
+                    .total_cmp(&selector_distance_squared(origin, a.position))
+            });
+        }
+        SelectorSort::Random => {
+            for end in (2..=selected.len()).rev() {
+                selected.swap(end - 1, random_index(end));
+            }
+        }
+        SelectorSort::Arbitrary => {}
+    }
+    selected.truncate(spec.limit);
+    selected
 }
 
 // ---------------------------------------------------------------------------------------
