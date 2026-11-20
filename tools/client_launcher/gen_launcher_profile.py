@@ -49,6 +49,7 @@ def main():
                         help="Minecraft directory or staging root for versions/ and libraries/")
     parser.add_argument("--version-id", default="mc-spine-1.21.1")
     parser.add_argument("--client-bin", type=Path, help="native client executable to pin in the profile")
+    parser.add_argument("--client-sha256", help="verify native client hash before bootstrapper launch")
     parser.add_argument("--build-jar", action="store_true")
     args = parser.parse_args()
     if not args.version_id or args.version_id in (".", "..") or any(
@@ -71,6 +72,14 @@ def main():
         if not path.is_file() or not path.stat().st_mode & 0o111:
             parser.error("--client-bin must point to an executable native client")
         game_profile["arguments"] = {"jvm": [f"-Dmc.spine.clientBin={path}"]}
+        if args.client_sha256 and hashlib.sha256(path.read_bytes()).hexdigest() != args.client_sha256.lower():
+            parser.error("native client SHA-256 mismatch")
+    if args.client_sha256:
+        if len(args.client_sha256) != 64 or any(char not in "0123456789abcdefABCDEF"
+                                                for char in args.client_sha256):
+            parser.error("--client-sha256 must be 64 hexadecimal characters")
+        game_profile.setdefault("arguments", {}).setdefault("jvm", []).append(
+            f"-Dmc.spine.clientSha256={args.client_sha256.lower()}")
     dest = out_dir / "versions" / args.version_id / (args.version_id + ".json")
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(game_profile, indent=2, ensure_ascii=False) + "\n")

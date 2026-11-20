@@ -1,7 +1,10 @@
-"""Real Java 21/bootstrapper and Prism wrapper integration checks."""
+"""Real Java 21/bootstrapper, Prism, Modrinth and native bridge checks."""
+import configparser
+import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -37,6 +40,10 @@ if os.environ.get('TEST_INTEGRATED_CONNECT'):
     host, port = endpoint.split(':')
     with socket.create_connection((host, int(port)), timeout=1):
         pass
+    if os.environ.get('TEST_INTEGRATED_PROTOCOL'):
+        sys.path.insert(0, os.environ['TEST_WIRE_MODULE'])
+        from wire_smoke import status
+        status(int(port))
 Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
 time.sleep(float(os.environ.get('TEST_NATIVE_SLEEP', '0')))
 sys.exit(int(os.environ.get('TEST_NATIVE_EXIT', '0')))
@@ -281,6 +288,219 @@ with socket.socket() as listener:
                                       extra_env={"TEST_NATIVE_EXIT": "9"})
         self.assertEqual(result.returncode, 9, result.stderr)
         self.assertEqual(json.loads(log.read_text()), ["--username", "Alex"])
+
+    def test_java_integrated_real_server_and_native_protocol_handshake(self):
+        server = ROOT / "target/debug/mc-spine"
+        if not server.is_file():
+            self.skipTest("cargo build --offline --locked required for real protocol handshake")
+        game = self.root / "cf4-real-integrated" / "game"
+        game.mkdir(parents=True)
+        env = {"MC_SPINE_SERVER_BIN": str(server), "MC_SPINE_SERVER_HOME": str(ROOT),
+               "TEST_INTEGRATED_CONNECT": "1", "TEST_INTEGRATED_PROTOCOL": "1",
+               "TEST_WIRE_MODULE": str(ROOT / "tests")}
+        result, log = self.java("--mc-spine-integrated", "--gameDir", str(game),
+                                "--username", "Steve", "--accessToken", "super-secret-token",
+                                "--version", "1.21.1", "--assetIndex", "17", extra_env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("super-secret-token", result.stderr or "")
+        args = json.loads(log.read_text())
+        self.assertIn("--quickPlayMultiplayer", args)
+        self.assertEqual(args[args.index("--accessToken") + 1], "super-secret-token")
+        world = game / "saves/mc-spine"
+        self.assertTrue((world / "config_packets.bin").is_symlink())
+        self.assertTrue((world / "assets").is_symlink())
+
+    def test_java_private_binary_flags_integrity_and_redaction(self):
+        expected = hashlib.sha256(self.stub.read_bytes()).hexdigest()
+        result, log = self.java("--client-bin", str(self.stub), "--client-sha256", expected,
+                                "--uuid", "1", "--accessToken=super-secret-token")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(log.read_text()), ["--uuid", "1",
+                                                       "--accessToken=super-secret-token"])
+        for flag, value, error in (
+            ("--client-bin", str(self.root / "absent"), "not found"),
+            ("--client-sha256", "0" * 64, "SHA-256 mismatch"),
+        ):
+            with self.subTest(flag=flag):
+                result, log = self.java(flag, value, "--accessToken", "super-secret-token")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(error, result.stderr)
+                self.assertNotIn("super-secret-token", result.stderr)
+                self.assertFalse(log.exists())
+        broken = self.root / "super-secret-token"
+        broken.write_text("#!/nonexistent/interpreter\n")
+        broken.chmod(0o755)
+        result, _ = self.java("--client-bin", str(broken),
+                              "--accessToken", "super-secret-token")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("<REDACTED>", result.stderr)
+        self.assertNotIn("super-secret-token", result.stderr)
+
+    def test_java_profile_sha256_pin_has_priority_over_environment(self):
+        valid_sha256 = hashlib.sha256(self.stub.read_bytes()).hexdigest()
+        result, log = self.invocation(
+            "/usr/lib/jvm/java-21-openjdk/bin/java",
+            "-Djava.io.tmpdir=" + tempfile.gettempdir(),
+            "-Dmc.spine.clientSha256=" + valid_sha256,
+            "-XX:-UsePerfData", "-jar",
+            str(self.jar_dir / "mc-spine-bootstrapper.jar"),
+            "--accessToken", "super-secret-token",
+            extra_env={"MC_SPINE_CLIENT_SHA256": "0" * 64})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("super-secret-token", result.stderr or "")
+        self.assertTrue(log.exists())
+
+        result, log = self.invocation(
+            "/usr/lib/jvm/java-21-openjdk/bin/java",
+            "-Djava.io.tmpdir=" + tempfile.gettempdir(),
+            "-Dmc.spine.clientSha256=" + "0" * 64,
+            "-XX:-UsePerfData", "-jar",
+            str(self.jar_dir / "mc-spine-bootstrapper.jar"),
+            "--accessToken", "super-secret-token",
+            extra_env={"MC_SPINE_CLIENT_SHA256": valid_sha256})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("SHA-256 mismatch", result.stderr)
+        self.assertNotIn("super-secret-token", result.stderr)
+        self.assertFalse(log.exists())
+
+
+class CF4ExportTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-cf4-export-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.root = Path(cls.temporary.name)
+        cls.native = cls.root / "fake native"
+        cls.native.write_text('''#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
+''')
+        cls.native.chmod(0o755)
+        cls.integrated = cls.root / "mc-spine-integrated.jar"
+        subprocess.run([sys.executable, str(TOOLS / "build_integrated_mod.py"),
+                        "--out-dir", str(cls.root)], check=True, capture_output=True)
+
+    def export(self, destination, *arguments, check=True):
+        return subprocess.run([sys.executable, str(TOOLS / "export_launcher_bundle.py"),
+                               "--out-dir", str(destination), *arguments],
+                              capture_output=True, text=True, check=check, timeout=25)
+
+    def test_prism_instance_and_native_wrapper_reproducible(self):
+        output = self.root / "Prism instance with spaces"
+        args = ("--format", "prism", "--loader", "fabric", "--loader-version", "0.16.10",
+                "--client-bin", str(self.native), "--integrated-jar", str(self.integrated))
+        self.export(output, *args)
+        original = {path.relative_to(output): path.read_bytes()
+                    for path in output.rglob("*") if path.is_file()}
+        self.export(output, *args)
+        self.assertEqual(original, {path.relative_to(output): path.read_bytes()
+                                    for path in output.rglob("*") if path.is_file()})
+        pack = json.loads((output / "mmc-pack.json").read_text())
+        self.assertEqual(pack["formatVersion"], 1)
+        self.assertEqual(pack["components"], [
+            {"uid": "net.minecraft", "version": "1.21.1", "important": True},
+            {"uid": "net.fabricmc.fabric-loader", "version": "0.16.10"}])
+        config = configparser.ConfigParser(interpolation=None)
+        config.read(output / "instance.cfg")
+        self.assertEqual(config["General"]["OverrideCommands"], "true")
+        command = shlex.split(config["General"]["WrapperCommand"])
+        self.assertEqual(command[0], str((output / "mc-spine-wrapper").resolve()))
+        self.assertTrue(os.access(command[0], os.X_OK))
+        self.assertEqual(command[1:], ["--client-sha256",
+                                       hashlib.sha256(self.native.read_bytes()).hexdigest()])
+        self.assertEqual((output / ".minecraft/mods/mc-spine-integrated.jar").read_bytes(),
+                         self.integrated.read_bytes())
+        log = self.root / "prism-native.json"
+        env = dict(os.environ, TEST_NATIVE_LOG=str(log))
+        env.pop("MC_SPINE_CLIENT_BIN", None)
+        result = subprocess.run([*command, "/usr/lib/jvm/java-21-openjdk/bin/java", "-Xmx2G",
+                                 "-cp", "minecraft.jar", "net.minecraft.client.main.Main",
+                                 "--username", "Steve", "--uuid", "test-uuid", "--accessToken",
+                                 "super-secret-token", "--assetIndex", "17", "--gameDir",
+                                 "/game with spaces", "--version", "1.21.1"],
+                                capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("super-secret-token", result.stderr + result.stdout)
+        self.assertEqual(json.loads(log.read_text()), ["--username", "Steve", "--uuid",
+                         "test-uuid", "--accessToken", "super-secret-token", "--assetIndex",
+                         "17", "--gameDir", "/game with spaces", "--version", "1.21.1"])
+
+    def test_mrpack_integrity_zip_metadata_and_reproducibility(self):
+        arguments = ("--format", "mrpack", "--loader", "neoforge",
+                     "--loader-version", "21.1.215", "--integrated-jar", str(self.integrated))
+        first, second = self.root / "mrpack-one", self.root / "mrpack-two"
+        self.export(first, *arguments)
+        self.export(second, *arguments)
+        name = "mc-spine-1.21.1.mrpack"
+        self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
+        with zipfile.ZipFile(first / name) as archive:
+            self.assertEqual(archive.namelist(), ["modrinth.index.json",
+                             "overrides/mods/mc-spine-integrated.jar"])
+            index = json.loads(archive.read("modrinth.index.json"))
+            self.assertEqual(index["formatVersion"], 1)
+            self.assertEqual(index["game"], "minecraft")
+            self.assertEqual(index["dependencies"], {"minecraft": "1.21.1",
+                                                       "neoforge": "21.1.215"})
+            self.assertEqual(index["files"], [])
+            contents = archive.read("overrides/mods/mc-spine-integrated.jar")
+            self.assertEqual(contents, self.integrated.read_bytes())
+            meta = index["mcSpine"]["bundledOverrides"]["mods/mc-spine-integrated.jar"]
+            self.assertEqual(meta["fileSize"], len(contents))
+            self.assertEqual(meta["hashes"], {
+                "sha1": hashlib.sha1(contents).hexdigest(),
+                "sha512": hashlib.sha512(contents).hexdigest()})
+            for item in archive.infolist():
+                self.assertEqual(item.date_time, (1980, 1, 1, 0, 0, 0))
+                self.assertEqual((item.external_attr >> 16) & 0o777, 0o644)
+                self.assertEqual(item.create_system, 3)
+
+    def test_wrapper_and_exporter_fail_closed(self):
+        wrapper = str(TOOLS / "mc-spine-wrapper")
+        env = dict(os.environ, MC_SPINE_CLIENT_BIN=str(self.root / "missing"))
+        test_args = ["java", "-jar", "minecraft.jar", "--accessToken", "super-secret-token"]
+        for commands, reason in (
+            ([wrapper, *test_args], "not found"),
+            ([wrapper, "--client-bin", str(self.native), "--client-sha256", "0" * 64,
+              *test_args], "SHA-256 mismatch"),
+        ):
+            with self.subTest(reason=reason):
+                result = subprocess.run(commands, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(reason, result.stderr)
+                self.assertNotIn("super-secret-token", result.stderr + result.stdout)
+        invalid = self.export(self.root / "invalid-sha", "--client-bin", str(self.native),
+                              "--client-sha256", "0" * 64, check=False)
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("SHA-256 mismatch", invalid.stderr)
+        missing_loader = self.export(self.root / "invalid-mrpack", "--format", "mrpack",
+                                     check=False)
+        self.assertNotEqual(missing_loader.returncode, 0)
+
+    def test_optional_mesh_library_abi_and_packaging(self):
+        mesh = ROOT / "client-port/target/release/libmc_spine_client_mesh.so"
+        if not mesh.is_file():
+            self.skipTest("build client-port release cdylib to test ABI packaging")
+        output = self.root / "mesh-bundle"
+        self.export(output, "--format", "all", "--loader", "fabric",
+                    "--loader-version", "0.16.10", "--integrated-jar",
+                    str(self.integrated), "--mesh-library", str(mesh))
+        self.assertEqual((output / "prism/native/libmc_spine_client_mesh.so").read_bytes(),
+                         mesh.read_bytes())
+        with zipfile.ZipFile(output / "mc-spine-1.21.1.mrpack") as archive:
+            content = archive.read("overrides/mc-spine/native/libmc_spine_client_mesh.so")
+            index = json.loads(archive.read("modrinth.index.json"))
+            expected = index["mcSpine"]["bundledOverrides"]["mc-spine/native/libmc_spine_client_mesh.so"]
+            self.assertEqual(expected["hashes"]["sha512"], hashlib.sha512(content).hexdigest())
+            self.assertEqual(content, mesh.read_bytes())
+        invalid_lib = self.root / "not-a-library.so"
+        invalid_lib.write_bytes(b"missing ABI")
+        invalid = self.export(self.root / "invalid-mesh", "--format", "prism",
+                              "--mesh-library", str(invalid_lib), check=False)
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("mc_spine_mesh_abi_version", invalid.stderr)
 
 
 class IntegratedModTest(unittest.TestCase):
