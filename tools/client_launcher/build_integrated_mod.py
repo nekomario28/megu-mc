@@ -91,16 +91,28 @@ def build_jar(out_dir):
             "-J-XX:-UsePerfData", "--release", "21", "-d", str(classes),
             *map(str, sorted(stubs.rglob("*.java"))),
         ], check=True)
+        sources = sorted(JAVA_PACKAGE.rglob("*.java"))
+        if not sources:
+            raise RuntimeError("no integrated mod Java sources found")
         subprocess.run([
             "javac", f"-J-Djava.io.tmpdir={tempfile.gettempdir()}",
             "-J-XX:-UsePerfData", "--release", "21", "-cp", str(classes),
-            "-d", str(output), *map(str, sorted(JAVA_PACKAGE.glob("*.java"))),
+            "-d", str(output), *map(str, sources),
         ], check=True)
-        entries = manifests()
-        entries.update({
-            path.relative_to(output).as_posix(): path.read_bytes()
+        # Include every compiled class, including nested records such as
+        # IntegratedServerBridge$DirectFrame.class. Sorted names plus the fixed
+        # ZIP timestamp make the archive byte-for-byte reproducible.
+        compiled = sorted(
+            path.relative_to(output).as_posix()
             for path in output.rglob("*.class")
-        })
+        )
+        if not compiled:
+            raise RuntimeError("javac produced no integrated mod classes")
+        if any(name.startswith(("net/fabricmc/", "net/neoforged/"))
+               for name in compiled):
+            raise RuntimeError("compile-only loader stubs leaked into the integrated jar")
+        entries = manifests()
+        entries.update({name: (output / name).read_bytes() for name in compiled})
         jar = out_dir / "mc-spine-integrated.jar"
         with zipfile.ZipFile(jar, "w") as archive:
             for name, data in sorted(entries.items()):

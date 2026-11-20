@@ -783,5 +783,298 @@ public final class ConfiguredBridgeHarness {
         self.assert_dead(pid)
 
 
+class DirectFrameBridgeTest(unittest.TestCase):
+    """CF-3b: direct ByteBuffer MCSI v1 framing, fail-closed rules and relay."""
+
+    HARNESS = r'''import java.io.DataInputStream;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.zip.CRC32;
+
+import net.mcspine.integrated.IntegratedServerBridge;
+import net.mcspine.integrated.IntegratedServerBridge.DirectFrame;
+
+public final class DirectFrameHarness {
+    private static int checks;
+
+    @FunctionalInterface
+    interface ThrowingAction { void run() throws Exception; }
+
+    private static void check(boolean condition, String message) {
+        if (!condition) {
+            throw new AssertionError(message);
+        }
+        checks++;
+    }
+
+    private static void expectIae(ThrowingAction action, String message) {
+        try {
+            action.run();
+            throw new AssertionError("expected IllegalArgumentException: " + message);
+        } catch (IllegalArgumentException expected) {
+            String actual = expected.getMessage();
+            if (actual == null || !actual.contains(message)) {
+                throw new AssertionError("unexpected IAE message: " + actual);
+            }
+            checks++;
+        } catch (Exception other) {
+            throw new AssertionError("wrong exception for " + message, other);
+        }
+    }
+
+    private static ByteBuffer direct(int capacity) {
+        return ByteBuffer.allocateDirect(capacity).order(ByteOrder.LITTLE_ENDIAN);
+    }
+
+    private static ByteBuffer view(ByteBuffer buf) {
+        ByteBuffer copy = buf.duplicate();
+        copy.order(ByteOrder.LITTLE_ENDIAN);
+        return copy;
+    }
+
+    private static byte[] sectionPayload(int length) {
+        byte[] payload = new byte[length];
+        for (int i = 0; i < length; i++) {
+            payload[i] = (byte) (i * 31 + 7);
+        }
+        return payload;
+    }
+
+    private static byte[] heartbeatPayload(long tick) {
+        return ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(tick).array();
+    }
+
+    private static void roundtrip() {
+        byte[][] payloads = {
+            {(byte) 0x00, (byte) 0xff, 0x05, 0x10, 0x00, 0x01, 0x02},
+            sectionPayload(4096),
+            heartbeatPayload(42L),
+        };
+        int[] kinds = {
+            IntegratedServerBridge.KIND_PROTOCOL767_PACKET,
+            IntegratedServerBridge.KIND_PALETTED_SECTION_SNAPSHOT,
+            IntegratedServerBridge.KIND_TICK_HEARTBEAT,
+        };
+        for (int i = 0; i < kinds.length; i++) {
+            ByteBuffer buf = direct(32 + payloads[i].length);
+            IntegratedServerBridge.writeDirectFrame(buf, kinds[i], payloads[i]);
+            check(buf.position() == 16 + payloads[i].length, "frame size");
+            buf.flip();
+            check(buf.order() == ByteOrder.LITTLE_ENDIAN, "byte order preserved");
+            DirectFrame frame = IntegratedServerBridge.readDirectFrame(buf);
+            check(frame.kind() == kinds[i], "frame kind");
+            check(Arrays.equals(frame.payload(), payloads[i]), "frame payload");
+            CRC32 crc = new CRC32();
+            crc.update(payloads[i]);
+            check(frame.crc32() == crc.getValue(), "frame crc32");
+            check(buf.position() == buf.limit(), "buffer consumed");
+        }
+    }
+
+    private static void failClosed() {
+        byte[] payload = {1, 2, 3, 4};
+        expectIae(() -> IntegratedServerBridge.writeDirectFrame(
+                ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN), 1, payload), "direct");
+        expectIae(() -> IntegratedServerBridge.readDirectFrame(null), "null");
+        expectIae(() -> IntegratedServerBridge.writeDirectFrame(
+                ByteBuffer.allocateDirect(64).order(ByteOrder.BIG_ENDIAN), 1, payload),
+                "LITTLE_ENDIAN");
+        expectIae(() -> IntegratedServerBridge.writeDirectFrame(direct(64), 1, null), "payload");
+        expectIae(() -> IntegratedServerBridge.writeDirectFrame(direct(64), 99, payload), "kind");
+        expectIae(() -> IntegratedServerBridge.writeDirectFrame(
+                direct(300_000), 1, new byte[262_145]), "exceeds");
+        expectIae(() -> IntegratedServerBridge.writeDirectFrame(direct(19), 1, payload), "too small");
+
+        ByteBuffer badMagic = direct(64);
+        IntegratedServerBridge.writeDirectFrame(badMagic, 1, payload);
+        badMagic.putInt(0, 0x12345678);
+        badMagic.flip();
+        expectIae(() -> IntegratedServerBridge.readDirectFrame(view(badMagic)), "magic");
+
+        ByteBuffer badVersion = direct(64);
+        IntegratedServerBridge.writeDirectFrame(badVersion, 1, payload);
+        badVersion.putShort(4, (short) 2);
+        badVersion.flip();
+        expectIae(() -> IntegratedServerBridge.readDirectFrame(view(badVersion)), "version");
+
+        ByteBuffer badKind = direct(64);
+        IntegratedServerBridge.writeDirectFrame(badKind, 1, payload);
+        badKind.putShort(6, (short) 9);
+        badKind.flip();
+        expectIae(() -> IntegratedServerBridge.readDirectFrame(view(badKind)), "kind");
+
+        ByteBuffer truncated = direct(64);
+        IntegratedServerBridge.writeDirectFrame(truncated, 1, payload);
+        truncated.flip();
+        truncated.limit(19);
+        expectIae(() -> IntegratedServerBridge.readDirectFrame(view(truncated)), "truncated");
+
+        ByteBuffer shortHeader = direct(64);
+        shortHeader.limit(10);
+        expectIae(() -> IntegratedServerBridge.readDirectFrame(view(shortHeader)), "truncated");
+
+        ByteBuffer oversized = direct(64);
+        IntegratedServerBridge.writeDirectFrame(oversized, 1, payload);
+        oversized.putInt(8, 262_145);
+        oversized.flip();
+        expectIae(() -> IntegratedServerBridge.readDirectFrame(view(oversized)), "length");
+
+        ByteBuffer badCrc = direct(64);
+        IntegratedServerBridge.writeDirectFrame(badCrc, 1, payload);
+        badCrc.put(16, (byte) (payload[0] ^ 0x55));
+        badCrc.flip();
+        expectIae(() -> IntegratedServerBridge.readDirectFrame(view(badCrc)), "CRC-32");
+    }
+
+    private static void loopback() throws Exception {
+        byte[] requestPayload = {(byte) 0x00, (byte) 0xff, 0x05, 0x02, 0x00};
+        byte[] responsePayload = sectionPayload(512);
+        AtomicReference<Throwable> serverError = new AtomicReference<>();
+        try (ServerSocket listener = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+            Thread server = new Thread(() -> {
+                try (Socket socket = listener.accept()) {
+                    socket.setSoTimeout(5000);
+                    DataInputStream in = new DataInputStream(socket.getInputStream());
+                    byte[] header = new byte[16];
+                    in.readFully(header);
+                    ByteBuffer fields = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
+                    if (fields.getInt(0) != 0x4D435349
+                            || Short.toUnsignedInt(fields.getShort(4)) != 1
+                            || Short.toUnsignedInt(fields.getShort(6)) != 1
+                            || fields.getInt(8) != requestPayload.length) {
+                        throw new AssertionError("server saw a bad request header");
+                    }
+                    byte[] got = new byte[requestPayload.length];
+                    in.readFully(got);
+                    if (!Arrays.equals(got, requestPayload)) {
+                        throw new AssertionError("server saw a bad request payload");
+                    }
+                    ByteBuffer response = direct(64 + responsePayload.length);
+                    IntegratedServerBridge.writeDirectFrame(
+                            response, IntegratedServerBridge.KIND_PALETTED_SECTION_SNAPSHOT,
+                            responsePayload);
+                    response.flip();
+                    byte[] wire = new byte[response.remaining()];
+                    response.get(wire);
+                    OutputStream out = socket.getOutputStream();
+                    out.write(wire);
+                    out.flush();
+                } catch (Throwable error) {
+                    serverError.set(error);
+                }
+            }, "mcdirect-test-server");
+            server.setDaemon(true);
+            server.start();
+            try (Socket client = new Socket("127.0.0.1", listener.getLocalPort())) {
+                client.setSoTimeout(5000);
+                ByteBuffer requestBuf = direct(64 + requestPayload.length);
+                IntegratedServerBridge.writeDirectFrame(
+                        requestBuf, IntegratedServerBridge.KIND_PROTOCOL767_PACKET,
+                        requestPayload);
+                ByteBuffer responseBuf = direct(64 + responsePayload.length);
+                DirectFrame frame = IntegratedServerBridge.exchangeFrameOverLoopback(
+                        requestBuf, client.getInputStream(), client.getOutputStream(), responseBuf);
+                check(frame.kind() == IntegratedServerBridge.KIND_PALETTED_SECTION_SNAPSHOT,
+                        "loopback response kind");
+                check(Arrays.equals(frame.payload(), responsePayload), "loopback response payload");
+                check(responseBuf.order() == ByteOrder.LITTLE_ENDIAN, "response byte order");
+                check(responseBuf.position() == 0, "response position reset");
+                check(responseBuf.limit() == 16 + responsePayload.length, "response limit");
+                byte[] raw = new byte[responseBuf.limit()];
+                responseBuf.get(raw);
+                ByteBuffer reread = direct(raw.length);
+                reread.put(raw);
+                reread.flip();
+                check(Arrays.equals(
+                        IntegratedServerBridge.readDirectFrame(reread).payload(), responsePayload),
+                        "response buffer holds a complete frame");
+                expectIae(() -> IntegratedServerBridge.exchangeFrameOverLoopback(
+                        ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN),
+                        client.getInputStream(), client.getOutputStream(), responseBuf), "direct");
+                expectIae(() -> IntegratedServerBridge.exchangeFrameOverLoopback(
+                        requestBuf, client.getInputStream(), client.getOutputStream(),
+                        ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN)), "direct");
+            }
+            server.join(5000);
+            check(!server.isAlive(), "server thread finished");
+            if (serverError.get() != null) {
+                throw new AssertionError("loopback server failed", serverError.get());
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        switch (args[0]) {
+            case "roundtrip" -> roundtrip();
+            case "failclosed" -> failClosed();
+            case "loopback" -> loopback();
+            default -> throw new IllegalArgumentException("unknown mode " + args[0]);
+        }
+        System.out.println(args[0].toUpperCase() + "_OK checks=" + checks);
+    }
+}
+'''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-direct-frame-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.root = Path(cls.temporary.name)
+        cls.build_a = cls.root / "build-a"
+        cls.build_b = cls.root / "build-b"
+        for folder in (cls.build_a, cls.build_b):
+            subprocess.run([sys.executable, str(TOOLS / "build_integrated_mod.py"),
+                            "--out-dir", str(folder)], check=True, capture_output=True)
+        cls.jar = cls.build_a / "mc-spine-integrated.jar"
+        cls.harness = cls.root / "DirectFrameHarness.java"
+        cls.harness.write_text(cls.HARNESS)
+        subprocess.run(["javac", "-J-Djava.io.tmpdir=" + tempfile.gettempdir(),
+                        "-J-XX:-UsePerfData", "--release", "21", "-cp", str(cls.jar),
+                        "-d", str(cls.root), str(cls.harness)], check=True, capture_output=True)
+
+    def run_harness(self, mode):
+        return subprocess.run(
+            ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+             "-cp", os.pathsep.join([str(self.root), str(self.jar)]),
+             "DirectFrameHarness", mode],
+            capture_output=True, text=True, timeout=30)
+
+    def test_direct_frame_roundtrip_all_kinds(self):
+        result = self.run_harness("roundtrip")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "ROUNDTRIP_OK checks=18")
+
+    def test_direct_frame_fail_closed(self):
+        result = self.run_harness("failclosed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "FAILCLOSED_OK checks=14")
+
+    def test_loopback_frame_exchange(self):
+        result = self.run_harness("loopback")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "LOOPBACK_OK checks=9")
+
+    def test_integrated_jar_rebuild_is_byte_identical(self):
+        first = self.jar
+        second = self.build_b / "mc-spine-integrated.jar"
+        digest = hashlib.sha256(first.read_bytes()).hexdigest()
+        self.assertEqual(digest, hashlib.sha256(second.read_bytes()).hexdigest())
+        with zipfile.ZipFile(first) as archive:
+            names = set(archive.namelist())
+            self.assertIn("net/mcspine/integrated/IntegratedServerBridge$DirectFrame.class", names)
+            self.assertFalse(any(name.startswith(("net/fabricmc/", "net/neoforged/"))
+                                 for name in names))
+            for item in archive.infolist():
+                self.assertEqual(item.date_time, (1980, 1, 1, 0, 0, 0))
+                self.assertEqual((item.external_attr >> 16) & 0o777, 0o644)
+                self.assertEqual(item.create_system, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

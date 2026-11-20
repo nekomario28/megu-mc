@@ -1,4 +1,4 @@
-# Client Fork Track CF-0 / CF-3 — shared kernel and integrated bridge
+# Client Fork Track CF-0 / CF-3 / CF-3b — shared kernel and integrated bridge
 
 Target is Minecraft **1.21.1 / protocol 767 / Java 21**. This document records
 the current source-level contracts and the planned extraction boundary. The
@@ -167,6 +167,82 @@ Minecraft client's integrated-world UI into mc-spine automatically.
 4. Only after in-game client lifecycle and rollback behavior are demonstrated,
    substitute FFI calls for eligible local kernel operations. Continue using
    transport for world authority and multiplayer semantics where necessary.
+
+## CF-3b — Direct `ByteBuffer` `MCSI` v1 frame bridge
+
+Lane `E4-30` extends `tools/client_launcher/net/mcspine/integrated/IntegratedServerBridge.java`
+with a deterministic, fail-closed direct-`ByteBuffer` frame codec for the
+single-player / LAN-host `CF-3` integrated server exchange. It does not replace
+the protocol-767 socket lifecycle bridge; it adds a framing layer that the
+integrated client mod can use to relay packets and paletted section snapshots
+without staging whole frames in heap stream objects.
+
+### Wire contract (all integers little-endian)
+
+| Offset | Bytes | Field | Constraint |
+| --- | --- | --- | --- |
+| 0 | 4 | magic | `0x4D435349` (`"MCSI"`) |
+| 4 | 2 | version | `1` |
+| 6 | 2 | kind | `1 = PROTOCOL767_PACKET`, `2 = PALETTED_SECTION_SNAPSHOT`, `3 = TICK_HEARTBEAT` |
+| 8 | 4 | payload length | `0..262144` |
+| 12 | 4 | CRC-32 | `java.util.zip.CRC32` of the payload bytes |
+| 16 | N | payload | `N` = payload length |
+
+The header is 16 bytes and the largest frame is 262160 bytes. Header and
+payload are read/written with absolute `ByteBuffer` accesses directly in the
+direct buffer; only the returned `DirectFrame.payload` is copied into a
+defensively cloned `byte[]`.
+
+### Public surface and fail-closed rules
+
+- `writeDirectFrame(ByteBuffer, int, byte[])` writes one frame at the buffer's
+  current position and advances it.
+- `readDirectFrame(ByteBuffer)` decodes one frame at the current position,
+  advances past it, and returns `DirectFrame(kind, payload, crc32)`.
+- `exchangeFrameOverLoopback(ByteBuffer requestBuf, InputStream in,
+  OutputStream out, ByteBuffer responseBuf)` writes the framed request region
+  `[0, requestBuf.position())` to `out`, flushes, then reads the response header
+  and payload straight into `responseBuf` (left little-endian, position reset to
+  `0`, limit set to the frame size), returning its decoded `DirectFrame`.
+
+Both buffers must be non-null, `ByteBuffer.isDirect() == true`, and
+`order() == ByteOrder.LITTLE_ENDIAN`. Null payloads, unknown kinds, payloads
+over 262144 bytes, insufficient capacity, bad magic, unsupported version,
+truncated header/payload, a request size inconsistent with its length field,
+and CRC-32 mismatch all throw `IllegalArgumentException` before a frame is
+accepted; short streams throw `EOFException`. The loopback read caps the buffer
+limit per field so a header read cannot swallow the payload.
+
+### Packaging and receipts
+
+`build_integrated_mod.py` packages every compiled class via a sorted `rglob`
+over `javac` output, so the nested
+`net/mcspine/integrated/IntegratedServerBridge$DirectFrame.class` is included.
+Entries use the fixed ZIP time `(1980, 1, 1, 0, 0, 0)`, mode `0644`, creator
+system `3`, and deterministic deflate; consecutive builds are byte-identical.
+Compile-only Fabric/NeoForge stubs are rejected if they leak into the archive.
+
+`tests/client_launcher_test.py::DirectFrameBridgeTest` compiles a generated
+`DirectFrameHarness.java` against the built jar and runs three JVM cases:
+`roundtrip` (18 checks, kinds 1/2/3), `failclosed` (14 checks: heap buffer,
+null buffer, big-endian order, null/oversized payload, bad kind, short capacity,
+bad magic/version/kind, truncated header/payload, oversized length, bad CRC-32),
+and `loopback` (9 checks: a real `127.0.0.1` socket request/response exchange
+plus heap-buffer rejection), plus a jar-reproducibility case.
+
+Receipt (2026-11-20, this worktree, OpenJDK 27 with `--release 21`,
+`TMPDIR=$PWD/target/tmp`):
+
+- `python3 tests/client_launcher_test.py` → `Ran 29 tests ... OK (skipped=3)`.
+- Mutation: disabling the CRC-32 comparison in a scratch copy makes the
+  `failclosed` harness case fail with
+  `expected IllegalArgumentException: CRC-32`.
+- `bash tools/layers_check.sh`, `bash tools/debt_ratchet.sh`,
+  `python3 tools/provenance_check.py`, `git diff --check` → pass.
+
+The direct frame bridge is a transport/framing capability. It is not evidence
+of in-game client lifecycle integration or of native-kernel FFI parity; those
+remain the CF-3 → FFI migration gates above.
 
 Source and generator code are first-party, with the repository's stated
 `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` contribution

@@ -9,8 +9,13 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -21,6 +26,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.zip.CRC32;
 import java.util.concurrent.TimeUnit;
 
 /** Owns a single local mc-spine process and verifies protocol-767 readiness. */
@@ -270,6 +276,212 @@ public final class IntegratedServerBridge implements AutoCloseable {
             }
         }
         throw new IOException("oversized VarInt");
+    }
+
+    // ---- CF-3b: direct ByteBuffer MCSI v1 frame bridge ------------------
+
+    /** Little-endian "MCSI" magic. */
+    public static final int DIRECT_FRAME_MAGIC = 0x4D435349;
+    public static final int DIRECT_FRAME_VERSION = 1;
+    public static final int KIND_PROTOCOL767_PACKET = 1;
+    public static final int KIND_PALETTED_SECTION_SNAPSHOT = 2;
+    public static final int KIND_TICK_HEARTBEAT = 3;
+    /** magic(4) | version(2) | kind(2) | payloadLength(4) | crc32(4). */
+    public static final int DIRECT_FRAME_HEADER_SIZE = 16;
+    public static final int DIRECT_FRAME_MAX_PAYLOAD = 262_144;
+
+    /** Immutable decoded CF-3b frame; payload is defensively copied. */
+    public record DirectFrame(int kind, byte[] payload, long crc32) {
+        public DirectFrame {
+            if (payload == null) {
+                throw new IllegalArgumentException("payload must not be null");
+            }
+            payload = payload.clone();
+        }
+
+        public int frameSize() {
+            return DIRECT_FRAME_HEADER_SIZE + payload.length;
+        }
+
+        @Override
+        public byte[] payload() {
+            return payload.clone();
+        }
+    }
+
+    private static void requireDirectFrameBuffer(ByteBuffer buf, String name) {
+        if (buf == null) {
+            throw new IllegalArgumentException(name + " must not be null");
+        }
+        if (!buf.isDirect()) {
+            throw new IllegalArgumentException(name + " must be a direct ByteBuffer");
+        }
+        if (buf.order() != ByteOrder.LITTLE_ENDIAN) {
+            throw new IllegalArgumentException(name + " must use ByteOrder.LITTLE_ENDIAN");
+        }
+    }
+
+    private static void validateDirectFrameKind(int kind) {
+        if (kind != KIND_PROTOCOL767_PACKET && kind != KIND_PALETTED_SECTION_SNAPSHOT
+                && kind != KIND_TICK_HEARTBEAT) {
+            throw new IllegalArgumentException("unsupported MCSI frame kind: " + kind);
+        }
+    }
+
+    /**
+     * Writes one MCSI v1 frame at {@code buf.position()} directly into the
+     * direct buffer (no intermediate heap frame) and advances the position.
+     */
+    public static void writeDirectFrame(ByteBuffer buf, int kind, byte[] payload) {
+        requireDirectFrameBuffer(buf, "buf");
+        validateDirectFrameKind(kind);
+        if (payload == null) {
+            throw new IllegalArgumentException("payload must not be null");
+        }
+        if (payload.length > DIRECT_FRAME_MAX_PAYLOAD) {
+            throw new IllegalArgumentException("MCSI frame payload exceeds "
+                    + DIRECT_FRAME_MAX_PAYLOAD + " bytes");
+        }
+        int base = buf.position();
+        int frameSize = DIRECT_FRAME_HEADER_SIZE + payload.length;
+        if (frameSize > buf.remaining()) {
+            throw new IllegalArgumentException("direct buffer too small for MCSI frame: need "
+                    + frameSize + ", remaining " + buf.remaining());
+        }
+        CRC32 crc = new CRC32();
+        crc.update(payload);
+        buf.putInt(base, DIRECT_FRAME_MAGIC);
+        buf.putShort(base + 4, (short) DIRECT_FRAME_VERSION);
+        buf.putShort(base + 6, (short) kind);
+        buf.putInt(base + 8, payload.length);
+        buf.putInt(base + 12, (int) crc.getValue());
+        for (int i = 0; i < payload.length; i++) {
+            buf.put(base + DIRECT_FRAME_HEADER_SIZE + i, payload[i]);
+        }
+        buf.position(base + frameSize);
+    }
+
+    private static int parseAndValidateHeader(ByteBuffer buf, int base) {
+        int magic = buf.getInt(base);
+        if (magic != DIRECT_FRAME_MAGIC) {
+            throw new IllegalArgumentException("bad MCSI frame magic: 0x"
+                    + Integer.toHexString(magic));
+        }
+        int version = Short.toUnsignedInt(buf.getShort(base + 4));
+        if (version != DIRECT_FRAME_VERSION) {
+            throw new IllegalArgumentException("unsupported MCSI frame version: " + version);
+        }
+        validateDirectFrameKind(Short.toUnsignedInt(buf.getShort(base + 6)));
+        int length = buf.getInt(base + 8);
+        if (length < 0 || length > DIRECT_FRAME_MAX_PAYLOAD) {
+            throw new IllegalArgumentException("invalid MCSI frame payload length: " + length);
+        }
+        return length;
+    }
+
+    private static DirectFrame decodeFrameAt(ByteBuffer buf, int base) {
+        if (buf.limit() - base < DIRECT_FRAME_HEADER_SIZE) {
+            throw new IllegalArgumentException("truncated MCSI frame header");
+        }
+        int length = parseAndValidateHeader(buf, base);
+        if (buf.limit() - base < DIRECT_FRAME_HEADER_SIZE + length) {
+            throw new IllegalArgumentException("truncated MCSI frame payload");
+        }
+        long expectedCrc = Integer.toUnsignedLong(buf.getInt(base + 12));
+        byte[] payload = new byte[length];
+        for (int i = 0; i < length; i++) {
+            payload[i] = buf.get(base + DIRECT_FRAME_HEADER_SIZE + i);
+        }
+        CRC32 crc = new CRC32();
+        crc.update(payload);
+        if (crc.getValue() != expectedCrc) {
+            throw new IllegalArgumentException("MCSI frame CRC-32 mismatch");
+        }
+        return new DirectFrame(Short.toUnsignedInt(buf.getShort(base + 6)), payload, expectedCrc);
+    }
+
+    /** Decodes one frame at {@code buf.position()} and advances past it. */
+    public static DirectFrame readDirectFrame(ByteBuffer buf) {
+        requireDirectFrameBuffer(buf, "buf");
+        int base = buf.position();
+        DirectFrame frame = decodeFrameAt(buf, base);
+        buf.position(base + frame.frameSize());
+        return frame;
+    }
+
+    private static void readFully(ReadableByteChannel channel, ByteBuffer target, int length)
+            throws IOException {
+        int end = target.position() + length;
+        if (end > target.limit()) {
+            throw new IllegalArgumentException("direct buffer too small for MCSI frame read");
+        }
+        // The channel reads up to remaining(), not to our logical frame end, so
+        // temporarily cap the limit or a header read would swallow the payload.
+        int savedLimit = target.limit();
+        target.limit(end);
+        try {
+            while (target.position() < end) {
+                if (channel.read(target) < 0) {
+                    throw new EOFException("short MCSI frame stream");
+                }
+            }
+        } finally {
+            target.limit(savedLimit);
+        }
+    }
+
+    private static void writeFully(WritableByteChannel channel, ByteBuffer source)
+            throws IOException {
+        while (source.hasRemaining()) {
+            if (channel.write(source) <= 0) {
+                throw new IOException("no progress writing MCSI frame");
+            }
+        }
+    }
+
+    /**
+     * Relays one framed request from {@code requestBuf} to the loopback
+     * {@code out} stream, then reads the framed response straight into
+     * {@code responseBuf}. The frame is never parsed as a heap stream; both
+     * buffers stay direct and little-endian.
+     */
+    public static DirectFrame exchangeFrameOverLoopback(ByteBuffer requestBuf, InputStream in,
+            OutputStream out, ByteBuffer responseBuf) throws IOException {
+        requireDirectFrameBuffer(requestBuf, "requestBuf");
+        requireDirectFrameBuffer(responseBuf, "responseBuf");
+        if (in == null || out == null) {
+            throw new IllegalArgumentException("loopback streams must not be null");
+        }
+        int requestSize = requestBuf.position();
+        if (requestSize < DIRECT_FRAME_HEADER_SIZE) {
+            throw new IllegalArgumentException("requestBuf has no complete MCSI frame");
+        }
+        ByteBuffer request = requestBuf.duplicate();
+        request.clear();
+        request.limit(requestSize);
+        request.order(ByteOrder.LITTLE_ENDIAN);
+        int requestPayload = parseAndValidateHeader(request, 0);
+        if (requestSize != DIRECT_FRAME_HEADER_SIZE + requestPayload) {
+            throw new IllegalArgumentException("requestBuf frame size does not match its header");
+        }
+
+        writeFully(Channels.newChannel(out), request);
+        out.flush();
+
+        responseBuf.clear();
+        if (responseBuf.capacity() < DIRECT_FRAME_HEADER_SIZE) {
+            throw new IllegalArgumentException("responseBuf cannot hold an MCSI frame header");
+        }
+        ReadableByteChannel source = Channels.newChannel(in);
+        readFully(source, responseBuf, DIRECT_FRAME_HEADER_SIZE);
+        int responsePayload = parseAndValidateHeader(responseBuf, 0);
+        if (responsePayload > responseBuf.capacity() - DIRECT_FRAME_HEADER_SIZE) {
+            throw new IllegalArgumentException("responseBuf too small for MCSI frame payload");
+        }
+        responseBuf.limit(DIRECT_FRAME_HEADER_SIZE + responsePayload);
+        readFully(source, responseBuf, responsePayload);
+        responseBuf.position(0);
+        return decodeFrameAt(responseBuf, 0);
     }
 
     private static void stopProcess(Process process) {
