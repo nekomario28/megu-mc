@@ -873,6 +873,7 @@ struct SC {
     sdb: i32,
     fluid: i32,
     est_min: i32,
+    biome: Option<((i32, i32, i32), u16)>,
     nt: HashMap<usize, bool>, // per-column memo for 2d noise_threshold
     memo: HashMap<(usize, i32, i32, i32), f64>,
 }
@@ -890,6 +891,7 @@ impl SC {
             sdb: 0,
             fluid: i32::MIN,
             est_min: i32::MAX,
+            biome: None,
             nt: HashMap::new(),
             memo: HashMap::new(),
         }
@@ -953,6 +955,7 @@ pub struct GenData {
     /// vertical levels, which removes ~49x redundant work on the y-independent spline /
     /// continentalness / erosion subtrees (Layer A2-a).
     is_2d: Vec<bool>,
+    biome_zoom: i64,
     btree: Option<BT>,
     leaf_ps: Vec<[[i32; 2]; 7]>,
     biome_names: Vec<String>,
@@ -995,6 +998,8 @@ pub struct GenData {
     // aquifer (vanilla NoiseBasedAquifer): DF ids + fluid states + caches
     aq: Option<Aqd>,
     world_seed: u64,
+    /// Interpolated nodes and their inputs, in the corner-grid evaluation order.
+    interp_nodes: Vec<(usize, usize)>,
     /// `final_density` compiled once into a flat post-order program (see
     /// `DfProg`). `None` keeps the interpreted evaluator (`MC_SPINE_DF_INTERP`).
     dfprog: Option<Box<DfProg>>,
@@ -1005,6 +1010,7 @@ pub struct Gen {
     pub(crate) data: std::sync::Arc<GenData>,
     // scratch memo for the vein sampler's density evaluations
     memo: HashMap<(usize, i32, i32, i32), f64>,
+    corner_memo: Option<FlatCornerMemo>,
     /// Chunk-local aquifer grids (see [`AqChunkCache`]). A small MRU ring rather than a
     /// single slot: carvers and features read neighbour chunks while a chunk is being
     /// filled, and a one-slot cache would recompute the same 12-cell neighbourhood.
@@ -1159,11 +1165,24 @@ impl FlatCornerMemo {
     #[inline]
     fn next_2d(&mut self) {
         self.cur_2d = self.cur_2d.wrapping_add(1);
+        if self.cur_2d == 0 {
+            self.gen_2d.fill(0);
+            self.cur_2d = 1;
+        }
     }
     #[inline]
     fn next_3d(&mut self) {
         self.cur_3d = self.cur_3d.wrapping_add(1);
+        if self.cur_3d == 0 {
+            self.gen_3d.fill(0);
+            self.cur_3d = 1;
+        }
     }
+}
+
+fn wg_count() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WG_COUNT").is_some())
 }
 
 impl std::ops::Deref for Gen {
@@ -2339,6 +2358,7 @@ impl Gen {
                 final_density: 0,
                 climate: None,
                 depth_split: None,
+                biome_zoom: crate::generation_math::biome_zoom_seed(seed),
                 btree: None,
                 leaf_ps: Vec::new(),
                 biome_names: Vec::new(),
@@ -2370,6 +2390,7 @@ impl Gen {
                 vein: None,
                 is_2d: Vec::new(),
                 world_seed: seed,
+                interp_nodes: Vec::new(),
                 dfprog: None,
             }),
             aq_chunk: std::array::from_fn(|_| None),
@@ -2421,6 +2442,7 @@ impl Gen {
             }),
             a3a_dispatch: None,
             memo: HashMap::new(),
+            corner_memo: None,
             mineshaft_spawners: HashSet::new(),
             payload_sources: HashSet::new(),
             feat_hm: HashMap::new(),
@@ -2734,6 +2756,14 @@ impl Gen {
         }
         // Compile `final_density` once, now that the id table is final.
         g.is_2d = compute_is_2d(&g.dfs);
+        g.interp_nodes = g
+            .interp_ids()
+            .into_iter()
+            .filter_map(|id| match g.dfs[id] {
+                DF::Interp(inner) => Some((id, inner)),
+                _ => None,
+            })
+            .collect();
         g.dfprog = DfProg::compile(&g);
         // Diagnostic counters sized to this generator's node table (WG_COUNT only).
         if std::env::var_os("WG_COUNT").is_some() {
@@ -3383,15 +3413,10 @@ impl Gen {
         memo: &mut HashMap<(usize, i32, i32, i32), f64>,
         cc: Option<&ChunkCols>,
     ) -> f64 {
-        {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *ON.get_or_init(|| std::env::var_os("WG_COUNT").is_some()) {
-                EVAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(hits) = DF_HITS.get() {
-                    if let Some(h) = hits.get(id) {
-                        h.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
+        if wg_count() {
+            EVAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = DF_HITS.get().and_then(|hits| hits.get(id)) {
+                h.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if let Some(cc) = cc {
@@ -3431,6 +3456,7 @@ impl Gen {
     /// blocks at a time. A generator that kept the interpreter
     /// (`MC_SPINE_DF_INTERP=1`) answers the four positions through it, so the A/B switch
     /// keeps meaning what it meant.
+    #[cfg(test)]
     pub(crate) fn block_density_x4(&self, cc: &ChunkCols, x: i32, y: i32, z: i32) -> [f64; DF4] {
         if let Some(prog) = self.dfprog.as_ref() {
             return prog.eval_x4(self, Some(cc), x, y, z);
@@ -3697,7 +3723,7 @@ impl Gen {
     /// but memoizes every y-independent node per `(x, z)` and every `Cache` node per
     /// `(x, y, z)` in a generation-stamped array instead of a `HashMap`.
     ///
-    /// Called only while filling the corner grids, where `cc` is always `None`, so the
+    /// Used for grid corners and preliminary surface scans, where `cc` is `None`, so the
     /// `Interp`/`cc` special case in `eval_c` never applies. Diagnostics are deliberately
     /// absent here: when `WG_COUNT` is set `build_cols_body` keeps the old `eval_c` path so
     /// the counters describe the same visits as before.
@@ -5745,12 +5771,20 @@ impl Gen {
     }
 
     fn leaf_at(&mut self, c: &mut SC) -> u16 {
+        // Several predicates can query the same cell during one rule evaluation.
+        let pos = (c.x, c.y, c.z);
+        if let Some((last, leaf)) = c.biome {
+            if last == pos {
+                return leaf;
+            }
+        }
         // SurfaceRules.Context uses BiomeManager to select a quart from the
         // already filled biome palettes, including those in adjacent chunks.
         let (qx, qy, qz) = self.fiddled_biome_quart(c.x, c.y, c.z);
         let qy = qy.clamp(self.world_min_y >> 2, (self.world_min_y + self.world_height - 1) >> 2);
         let key = (qx, qy, qz);
         if let Some(&leaf) = self.bioq.get(&key) {
+            c.biome = Some((pos, leaf));
             return leaf;
         }
         let (qx0, qy0, qz0) = (key.0 & !3, key.1 & !3, key.2 & !3);
@@ -5786,7 +5820,9 @@ impl Gen {
                 self.bioq.remove(&old);
             }
         }
-        self.bioq[&key]
+        let leaf = self.bioq[&key];
+        c.biome = Some((pos, leaf));
+        leaf
     }
 
     // find_top_surface of the preliminary_surface_level DF, cached per quart column
@@ -5818,43 +5854,40 @@ impl Gen {
         inc_if(m3_read, M3_PRELIM_MISS);
         let v = match self.prelim_df {
             Some(id) => {
-                let ax = (x >> 2) << 2;
-                let az = (z >> 2) << 2;
-                match self.dfs.get(id) {
+                let top = self.min_y + self.height;
+                let (density, start, step, threshold) = match self.dfs.get(id) {
                     // Converted dialect only: its node carries explicit bounds.
                     Some(DF::FindTopSurface {
                         density, cell_h, ..
                     }) => {
-                        let (density, step) = (*density, (*cell_h).max(1));
-                        let mut y = ((self.min_y + self.height) / step) * step;
-                        let mut found = i32::MAX;
-                        while y >= self.min_y {
-                            if self.eval(density, ax, y, az, &mut HashMap::new()) > 0.0 {
-                                found = y;
-                                break;
-                            }
-                            y -= step;
-                        }
-                        found
+                        let step = (*cell_h).max(1);
+                        (*density, (top / step) * step, step, 0.0)
                     }
                     // 1.21.1: scan initial_density_without_jaggedness from
                     // minY + height down to minY by the noise cell height and
                     // take the first value above 0.390625. The column is a
                     // QuartPos column, not a section column.
-                    _ => {
-                        let step = self.noise_cell_h.max(1);
-                        let mut y = self.min_y + self.height;
-                        let mut found = i32::MAX;
-                        while y >= self.min_y {
-                            if self.eval(id, ax, y, az, &mut HashMap::new()) > 0.390625 {
-                                found = y;
-                                break;
-                            }
-                            y -= step;
-                        }
-                        found
-                    }
-                }
+                    _ => (id, top, self.noise_cell_h.max(1), 0.390625),
+                };
+                let (ax, az) = (k.0 << 2, k.1 << 2);
+                let mut levels = (self.min_y..=start).rev().step_by(step as usize);
+                let found = if wg_count() {
+                    levels.find(|&y| {
+                        self.eval(density, ax, y, az, &mut HashMap::new()) > threshold
+                    })
+                } else {
+                    // The corner evaluator already separates values fixed for this
+                    // column from values that must be refreshed at every Y sample.
+                    let mut memo = self.take_corner_memo();
+                    memo.next_2d();
+                    let found = levels.find(|&y| {
+                        memo.next_3d();
+                        self.eval_flat(density, ax, y, az, &mut memo) > threshold
+                    });
+                    self.corner_memo = Some(memo);
+                    found
+                };
+                found.unwrap_or(i32::MAX)
             }
             None => i32::MAX,
         };
@@ -7237,6 +7270,7 @@ impl Gen {
         Gen {
             data,
             memo: HashMap::new(),
+            corner_memo: None,
             aq_chunk: std::array::from_fn(|_| None),
             aq_chunk_use: [0; AQ_CHUNK_SLOTS],
             aq_chunk_tick: 0,
@@ -7348,17 +7382,13 @@ impl Gen {
         cx: i32,
         sy: i32,
         cz: i32,
-    ) -> (std::sync::Arc<[u32; 4096]>, Vec<(u8, i32, i32, i32)>) {
+        arr: &mut [u32; 4096],
+    ) -> Vec<(u8, i32, i32, i32)> {
         // M3 P1a M4/M5: which thread filled this section, and what the fill cost. A worker
         // and the owner run this same function, so the split is decided by the thread the
         // caller marked (`m3_set_worker`), not by looking at the generator.
         m3_inc_split(M3_OWNER_SECTIONS, M3_WORKER_SECTIONS);
         let t0 = m3_start();
-        // P1b: filled in a `Box` (one mutable, uniquely-owned array) and handed over as an
-        // `Arc` - the store, every `BaseRow` clone and every prefetched-section read share the
-        // same 16 KiB instead of copying it. The one place that needs to *write* into a row
-        // (`terrain_section_at`'s feature pass) copies it out once.
-        let mut arr = Box::new([0u32; 4096]);
         let mut marks: Vec<(u8, i32, i32, i32)> = Vec::new();
         // M3 P4 / A2-c: the section's densities are asked for eight columns at a time
         // (`Gen::block_density_x8`, falling back to two `x4` calls where the 8-lane arm
@@ -7413,7 +7443,8 @@ impl Gen {
         //
         // Sorting here rather than at the consumer keeps the ordering decision next to the
         // two loops that produce it.
-        marks.sort_by_key(|&(kind, x, y, z)| {
+        // Each key includes the writer and all three coordinates, so there are no ties.
+        marks.sort_unstable_by_key(|&(kind, x, y, z)| {
             if kind & MARK_FILL != 0 {
                 (0u8, (x >> 2), (z >> 2), -y, (x & 3), (z & 3))
             } else {
@@ -7421,7 +7452,7 @@ impl Gen {
             }
         });
         m3_elapsed(M3_FILL_NS, M3_FILL_N, t0);
-        (std::sync::Arc::from(arr), marks)
+        marks
     }
 
     /// Fill every section of `[lo, hi]` for one chunk on this (scratch) generator.
@@ -7442,10 +7473,16 @@ impl Gen {
             Some(c) => c,
             None => self.cols(cx, cz)?,
         };
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(if lo <= hi {
+            ((i64::from(hi) - i64::from(lo)) / 16 + 1) as usize
+        } else {
+            0
+        });
         let mut sy = lo;
         while sy <= hi {
-            let (arr, marks) = self.base_section_rows(&cc, cx, sy, cz);
+            let mut arr = std::sync::Arc::new([0; 4096]);
+            let marks =
+                self.base_section_rows(&cc, cx, sy, cz, std::sync::Arc::get_mut(&mut arr).unwrap());
             rows.push(BaseRow {
                 key: (cx, sy, cz),
                 arr,
@@ -7797,6 +7834,12 @@ impl Gen {
         out
     }
 
+    fn take_corner_memo(&mut self) -> FlatCornerMemo {
+        self.corner_memo
+            .take()
+            .unwrap_or_else(|| FlatCornerMemo::new(self.dfs.len()))
+    }
+
     fn build_cols_body(&mut self, cx: i32, cz: i32, final_columns: bool) -> Option<ChunkCols> {
         let g = self;
         let ny = ((g.height / g.noise_cell_h) + 1) as usize;
@@ -7806,19 +7849,11 @@ impl Gen {
         // block in block_density(). Interpolating final_density itself would
         // interpolate squeeze(), which is cubic and not vanilla.
         let mut grids: Vec<Option<Box<[f64]>>> = (0..g.dfs.len()).map(|_| None).collect();
-        let mut interp_ids = Vec::new();
-        let mut interp_inners = Vec::new();
-        for iid in g.interp_ids() {
-            if let DF::Interp(inner) = g.dfs[iid] {
-                interp_ids.push(iid);
-                interp_inners.push(inner);
-            }
-        }
         // `WG_COUNT` counts visits through `eval_c`, so keep the original HashMap path
         // when diagnostics are on; the flat path has no per-visit counter to update.
-        if std::env::var_os("WG_COUNT").is_some() {
+        if wg_count() {
             let mut memo: HashMap<(usize, i32, i32, i32), f64> = HashMap::new();
-            for (k, &inner) in interp_inners.iter().enumerate() {
+            for &(iid, inner) in &g.interp_nodes {
                 let mut cells = vec![0.0f64; nx * nx * ny];
                 for zi in 0..nx {
                     for xi in 0..nx {
@@ -7830,17 +7865,17 @@ impl Gen {
                         }
                     }
                 }
-                grids[interp_ids[k]] = Some(cells.into_boxed_slice());
+                grids[iid] = Some(cells.into_boxed_slice());
             }
         } else {
             // Flip the loops so both the 2D and the 3D memo are shared: `val_2d` across
             // all `ny` levels, and both memos across every interpolated node at the
             // same corner. Zero HashMap allocations, one generation bump per (x,z) and
             // one per (x,y,z).
-            let mut flat = FlatCornerMemo::new(g.dfs.len());
-            let mut cells: Vec<Vec<f64>> = (0..interp_inners.len())
-                .map(|_| vec![0.0f64; nx * nx * ny])
-                .collect();
+            let mut flat = g.take_corner_memo();
+            for &(iid, _) in &g.interp_nodes {
+                grids[iid] = Some(vec![0.0; nx * nx * ny].into_boxed_slice());
+            }
             for zi in 0..nx {
                 for xi in 0..nx {
                     flat.next_2d();
@@ -7849,16 +7884,14 @@ impl Gen {
                     for yi in 0..ny {
                         flat.next_3d();
                         let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                        for (k, &inner) in interp_inners.iter().enumerate() {
-                            cells[k][(zi * nx + xi) * ny + yi] =
+                        for &(iid, inner) in &g.interp_nodes {
+                            grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
                                 g.eval_flat(inner, bx, by, bz, &mut flat);
                         }
                     }
                 }
             }
-            for (k, &iid) in interp_ids.iter().enumerate() {
-                grids[iid] = Some(std::mem::take(&mut cells[k]).into_boxed_slice());
-            }
+            g.corner_memo = Some(flat);
         }
         // Resolve the chunk's beardifier before `surf`, `wtop` and `mats`: vanilla's
         // `fillFromNoise` evaluates `final_density` with `Beardifier` active and only
@@ -7951,10 +7984,8 @@ impl Gen {
     }
 
     /// The eager `build_cols_body` surface-material scan, now the body of the lazy
-    /// `ChunkCols::surface_mats` cell. The loop is byte-for-byte the old one: four columns
-    /// of one `z` row share a density buffer, then each column is walked top-down in the
-    /// same order so the aquifer, the surface predicates and the per-column caches see
-    /// the same sequence as before (Layer A2-b is bit-identity by construction).
+    /// `ChunkCols::surface_mats` cell. Eight columns share a density buffer. The aquifer
+    /// and material rules still visit each column and each cell in their original order.
     fn build_surface_mats(&mut self, cx: i32, cz: i32, cc: &ChunkCols) -> SurfaceMats {
         let g = self;
         // vanilla surface material rules: per-column top-down scan over the
@@ -7964,11 +7995,10 @@ impl Gen {
         let mut rd = [0i16; 256];
         if let Some(root) = g.surface_rule {
             let mut c = SC::new();
-            // M3 P4: four columns of one `z` row at a time. The densities for the group's
-            // cells are asked for four at a time and buffered; the columns are then walked one
+            // Batch the densities in row order; the columns are still walked one
             // at a time, in the order they were walked before, so the aquifer, the surface
             // predicates and the per-column caches see exactly the sequence they saw.
-            let mut dbuf: Vec<f64> = Vec::new();
+            let mut dbuf: Vec<[f64; DF8]> = Vec::new();
             // A2-a: one reusable buffer for the 256 per-column surface-cell scans; the
             // previous `collect()` allocated a fresh Vec for every column.
             let mut cells: Vec<SurfaceCell> = Vec::new();
@@ -7977,23 +8007,19 @@ impl Gen {
                 let mut xb = 0usize;
                 while xb < 16 {
                     let mut span = 0i32;
-                    for k in 0..DF4 {
+                    for k in 0..DF8 {
                         let lx = xb + k;
                         let scan_top = (cc.surf[lz * 16 + lx] as i32).max(g.sea);
                         span = span.max(scan_top - g.min_y + 1);
                     }
                     let span = span.max(0) as usize;
                     dbuf.clear();
-                    dbuf.resize(DF4 * span, 0.0);
                     let gx = cx * 16 + xb as i32;
-                    for yi in 0..span {
+                    dbuf.extend((0..span).map(|yi| {
                         let y = g.min_y + yi as i32;
-                        let d = g.block_density_x4(cc, gx, y, z);
-                        for k in 0..DF4 {
-                            dbuf[k * span + yi] = d[k];
-                        }
-                    }
-                    for k in 0..DF4 {
+                        g.block_density_x8(cc, gx, y, z)
+                    }));
+                    for k in 0..DF8 {
                         let lx = xb + k;
                         let x = cx * 16 + lx as i32;
                         let surf_y = cc.surf[lz * 16 + lx] as i32;
@@ -8015,12 +8041,12 @@ impl Gen {
                         c.est_min = est_min;
                         cells.clear();
                         cells.extend((g.min_y..=scan_top).map(|y| {
-                            g.surface_cell_density(dbuf[k * span + (y - g.min_y) as usize], x, y, z)
+                            g.surface_cell_density(dbuf[(y - g.min_y) as usize][k], x, y, z)
                         }));
                         let column = g.scan_surface_column(root, &mut c, est_min, &cells, &cc.wtop);
                         mats[lz * 16 + lx] = column;
                     }
-                    xb += DF4;
+                    xb += DF8;
                 }
             }
         }
@@ -8227,13 +8253,6 @@ impl Gen {
                 (v - lo) / (hi - lo) * (to - from) + from
             }
         };
-        let mut memo = std::mem::take(&mut self.memo);
-        let t = self.eval_c(v.toggle, x, y, z, &mut memo, Some(cc));
-        let (min_y, max_y, ore, raw, fill) = if t > 0.0 {
-            (0i32, 50i32, v.copper_ore, v.copper_raw, v.copper_fill)
-        } else {
-            (-60i32, -8i32, v.iron_ore, v.iron_raw, v.iron_fill)
-        };
         // `MC_SPINE_VEINTRACE="x,y,z"`: parsed once.
         static VEIN_TRACE_AT: std::sync::OnceLock<Option<[i32; 3]>> = std::sync::OnceLock::new();
         let dbg = *VEIN_TRACE_AT.get_or_init(|| {
@@ -8241,6 +8260,18 @@ impl Gen {
             let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
             <[i32; 3]>::try_from(p).ok()
         }) == Some([x, y, z]);
+        // Outside both vertical ranges, either toggle sign rejects the cell
+        // before the sampler makes its first positional draw.
+        if !dbg && !wg_count() && !((-60..=-8).contains(&y) || (0..=50).contains(&y)) {
+            return st;
+        }
+        let mut memo = std::mem::take(&mut self.memo);
+        let t = self.eval_c(v.toggle, x, y, z, &mut memo, Some(cc));
+        let (min_y, max_y, ore, raw, fill) = if t > 0.0 {
+            (0i32, 50i32, v.copper_ore, v.copper_raw, v.copper_fill)
+        } else {
+            (-60i32, -8i32, v.iron_ore, v.iron_raw, v.iron_fill)
+        };
         if dbg {
             let inner = match self.dfs[v.toggle] {
                 DF::Interp(i) => i,
@@ -8352,8 +8383,8 @@ impl Gen {
     ///
     /// The only thing split off is the `block_density` call: the caller must have checked the
     /// generator's window (a cell outside it is air, not a density evaluation) and must pass
-    /// that cell's own density. That is what lets the section fill ask for four columns'
-    /// densities at once (`Gen::block_density_x4`) and still run vanilla's per-cell aquifer,
+    /// that cell's own density. That is what lets the section fill ask for eight columns'
+    /// densities at once (`Gen::block_density_x8`) and still run vanilla's per-cell aquifer,
     /// material and deep rules in the order it ran them.
     pub(crate) fn terrain_cell_density(
         &mut self,
@@ -8434,9 +8465,9 @@ impl Gen {
         self.preset.dim().has_skylight()
     }
     /// Single-column `surf` scan over an already-built chunk, top-down. This is the
-    /// one-column form of `build_cols_body`'s four-lane scan: the first `y` from the top
+    /// one-column form of `build_cols_body`'s eight-lane scan: the first `y` from the top
     /// whose density is positive, or `min_y - 1` when the column has no solid cell.
-    /// `block_density` at one column equals that lane's `block_density_x4` value bit for
+    /// `block_density` at one column equals that lane's `block_density_x8` value bit for
     /// bit, so the answer is the same cell the full column build would have filed.
     fn single_col_surf(&self, cc: &ChunkCols, x: i32, z: i32) -> i32 {
         let mut yy = self.min_y + self.height - 1;
@@ -9743,8 +9774,14 @@ impl Gen {
         victim
     }
     /// One cell's sample position, computed once per cell per chunk residency.
-    fn aq_cell_rpos(&mut self, slot: usize, gx: i32, gy: i32, gz: i32) -> (i32, i32, i32) {
-        let idx = self.aq_cache(slot).idx(gx, gy, gz);
+    fn aq_cell_rpos(
+        &mut self,
+        slot: usize,
+        idx: usize,
+        gx: i32,
+        gy: i32,
+        gz: i32,
+    ) -> (i32, i32, i32) {
         if let Some(p) = self.aq_cache(slot).rpos[idx] {
             return p;
         }
@@ -9802,7 +9839,7 @@ impl Gen {
                 for dz in 0..=1 {
                     let (gx, gy, gz) = (sx + dx, sy + dy, sz + dz);
                     let idx = self.aq_cache(slot).idx(gx, gy, gz);
-                    let (px, py, pz) = self.aq_cell_rpos(slot, gx, gy, gz);
+                    let (px, py, pz) = self.aq_cell_rpos(slot, idx, gx, gy, gz);
                     let (ex, ey, ez) = (px - x, py - y, pz - z);
                     let h = ex as i64 * ex as i64 + ey as i64 * ey as i64 + ez as i64 * ez as i64;
                     let p = ((px, py, pz), h, idx);
@@ -10105,19 +10142,41 @@ impl Gen {
                 m3_inc(M3_TERR_MISS);
                 match self.cols(cx, cz) {
                     Some(cc) => {
-                        let (arr, marks) = self.base_section_rows(&cc, cx, sy, cz);
+                        let mut arr = Box::new([0; 4096]);
+                        let marks = self.base_section_rows(&cc, cx, sy, cz, &mut arr);
                         self.file_terrain_marks(&(cx, sy, cz), &marks);
-                        match std::sync::Arc::try_unwrap(arr) {
-                            Ok(boxed) => Box::new(boxed),
-                            // A shipping store installs the row it just built, so the share is
-                            // normally observable here; copy only if something else holds it.
-                            Err(shared) => Box::new(*shared.as_ref()),
-                        }
+                        arr
                     }
                     None => Box::new([0u32; 4096]),
                 }
             }
         };
+        // Once population is settled, reading the section neither dispatches nor
+        // evicts anything. Apply the chunk's overrides without the per-cell lookups
+        // of the population latch and outer chunk map.
+        let key = (cx, cz);
+        if self.pop_region.is_none()
+            && self.pop_done.contains(&key)
+            && self.feat_ord.len() <= FEATURE_BUCKET_BOUND
+        {
+            if let Some(bucket) = self.feat_c.get(&key) {
+                let first = ((sy - self.min_y) as u32) << 8;
+                if bucket.capacity() < arr.len() {
+                    for (&k, &st) in bucket {
+                        if let Some(cell) = arr.get_mut(k.wrapping_sub(first) as usize) {
+                            *cell = st;
+                        }
+                    }
+                } else {
+                    for (i, cell) in arr.iter_mut().enumerate() {
+                        if let Some(&st) = bucket.get(&first.wrapping_add(i as u32)) {
+                            *cell = st;
+                        }
+                    }
+                }
+            }
+            return arr;
+        }
         for ly in 0..16i32 {
             let y = sy + ly;
             for lz in 0..16i32 {
@@ -10567,7 +10626,7 @@ impl Gen {
     }
 
     fn fiddled_biome_quart(&self, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
-        let zoom = crate::generation_math::biome_zoom_seed(self.world_seed);
+        let zoom = self.biome_zoom;
         let (x, y, z) = (x - 2, y - 2, z - 2);
         let (bx, by, bz) = (x >> 2, y >> 2, z >> 2);
         let (fx, fy, fz) = (
@@ -12040,7 +12099,8 @@ mod wg_tests {
         let cc = g.cols(cx, cz).expect("columns");
         let mut marks_seen = 0usize;
         for sy in [-64, 0, 48, 96, 240, 304] {
-            let (arr, marks) = g.base_section_rows(&cc, cx, sy, cz);
+            let mut arr = Box::new([0; 4096]);
+            let marks = g.base_section_rows(&cc, cx, sy, cz, &mut arr);
             let mut want = Box::new([0u32; 4096]);
             let mut want_marks: Vec<(u8, i32, i32, i32)> = Vec::new();
             for ly in 0..16i32 {

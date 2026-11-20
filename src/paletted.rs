@@ -195,19 +195,14 @@ impl PalettedSection {
         is_hidden: &impl Fn(u32) -> bool,
     ) -> Self {
         let first = states[0];
-        let mut i = 1usize;
-        while i < 4096 && states[i] == first {
-            i += 1;
-        }
-        if i == 4096 {
-            return Self {
-                states: SectionPalette::Single(first),
-                non_air: if is_air_state(first) { 0 } else { 4096 },
-                all_opaque: is_opaque(first),
-                has_hidden: is_hidden(first),
-                clean_wire: true,
-            };
-        }
+        // Compare runs of cells at once so uniform terrain needs one branch per
+        // 16 states. For mixed terrain, retain the exact first differing index.
+        let uniform = [first; 16];
+        let Some(row) = states.as_chunks::<16>().0.iter().position(|r| *r != uniform) else {
+            return Self::single(first, is_opaque(first), is_hidden(first));
+        };
+        let start = row * uniform.len();
+        let i = start + states[start..].iter().position(|&st| st != first).unwrap();
 
         let mut indices = [0u8; 4096];
         let mut entries = [0u32; 256];
