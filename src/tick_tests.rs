@@ -1,6 +1,37 @@
 use super::*;
 use effect_tests::client_pair;
 
+#[test]
+fn combat_enchantment_targets_and_critical_gates_follow_vanilla_sets() {
+    for name in ["husk", "drowned", "wither", "phantom", "zombie_horse"] {
+        assert!(enchantment_targets_undead(name_to_etype(name).unwrap()), "{name}");
+    }
+    for name in ["cave_spider", "silverfish", "endermite", "bee"] {
+        assert!(enchantment_targets_arthropod(name_to_etype(name).unwrap()), "{name}");
+    }
+    let cow = name_to_etype("cow").unwrap();
+    assert!(!enchantment_targets_undead(cow));
+    assert!(!enchantment_targets_arthropod(cow));
+
+    let can_crit = |charge, grounded, falling, elytra, sprinting, water, climbable, blind| {
+        melee_critical_allowed(
+            charge, grounded, falling, elytra, sprinting, water, climbable, blind,
+        )
+    };
+    assert!(can_crit(0.91, false, true, false, false, false, false, false));
+    assert!(!can_crit(0.90, false, true, false, false, false, false, false));
+    assert!(!can_crit(1.0, true, true, false, false, false, false, false));
+    assert!(!can_crit(1.0, false, true, false, true, false, false, false));
+    assert!(!can_crit(1.0, false, true, true, false, false, false, false));
+    assert!(!can_crit(1.0, false, true, false, false, true, false, false));
+    assert!(!can_crit(1.0, false, true, false, false, false, true, false));
+    assert!(!can_crit(1.0, false, true, false, false, false, false, true));
+    assert_eq!(fire_aspect_duration_ticks(1), server_ticks(80) as i32);
+    assert_eq!(fire_tick_update(80, 20, false), (79, true));
+    assert_eq!(fire_tick_update(80, 20, true), (79, false));
+    assert_eq!(fire_tick_update(0, 20, false), (0, false));
+}
+
 /// Isolate the mutable entity and crop registries for round-trip regression tests.
 struct RuntimeRegistrySnapshot {
     mobs: Vec<Arc<Mob>>,
@@ -69,6 +100,7 @@ fn d1_reload_saved_drop_eid_does_not_collide_with_mob() {
         last_hurt_tick: Mutex::new(None),
         vel: Mutex::new([0.0; 3]),
         fuse: Mutex::new(0),
+        fire_ticks: Mutex::new(0),
         love: Mutex::new(0),
         air: Mutex::new(300),
     }));
@@ -2155,14 +2187,11 @@ fn air_supply_is_derived_everywhere_a_creature_is_constructed() {
 
 #[test]
 fn projectile_lifetimes_keep_their_real_time_at_any_cadence() {
-    // These were bare tick counts written for 4TPS, so the 20TPS cutover silently
-    // shortened them fivefold: an arrow lived 12s instead of 60s. The cutover
-    // claimed TTLs kept their real time, which was wrong.
+    // AbstractArrow uses 1200 game ticks only after it is in the ground; it has
+    // no corresponding flying lifetime. Other projectiles retain their own TTLs.
     for (name, game_ticks, millis) in [
-        ("arrow", ARROW_TTL_GT, 60_000u64),
-        ("mob arrow", MOB_ARROW_TTL_GT, 40_000),
-        ("pearl", PEARL_TTL_GT, 12_500),
-        ("snowball", SNOWBALL_TTL_GT, 15_000u64),
+        ("pearl", PEARL_TTL_GT, 12_500u64),
+        ("snowball", SNOWBALL_TTL_GT, 15_000),
     ] {
         assert_eq!(
             server_ticks(game_ticks) * TICK_MS,
@@ -2170,8 +2199,10 @@ fn projectile_lifetimes_keep_their_real_time_at_any_cadence() {
             "{name} no longer spans {millis}ms"
         );
     }
-    // A bare tick count would fail this: at 20TPS, 240 ticks is 12s, not 60s.
-    assert!(server_ticks(ARROW_TTL_GT) != 240 || TICK_MS == 250);
+    assert_eq!(ARROW_TTL_GT, 1200);
+    assert_eq!(MOB_ARROW_TTL_GT, 1200);
+    assert_eq!(server_ticks(ARROW_TTL_GT) * TICK_MS, 60_000);
+    assert_eq!(server_ticks(MOB_ARROW_TTL_GT) * TICK_MS, 60_000);
 }
 
 #[test]
@@ -2363,6 +2394,7 @@ fn profile_game_tick() {
                     last_hurt_tick: Mutex::new(None),
                     vel: Mutex::new([0.0; 3]),
                     fuse: Mutex::new(0),
+                    fire_ticks: Mutex::new(0),
                     love: Mutex::new(0),
                     air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
                 }));
@@ -2473,7 +2505,8 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
         dx: 1.0,
         dy: 0.0,
         dz: 0.0,
-        ttl: server_ticks(ARROW_TTL_GT) as i32,
+        // A flying arrow with one ground tick left must keep flying.
+        ttl: 1,
         dmg: 6.0,
         fire: 0,
         punch: 0,
@@ -2498,12 +2531,41 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
         prev_x = x;
         prev_v = v;
     }
+    let survived_flight = steps.len() == 5;
+    {
+        let mut arrows = arrows().lock().unwrap();
+        if let Some(arrow) = arrows.iter_mut().find(|a| a.eid == 8001) {
+            arrow.stuck = true;
+            arrow.ttl = 2;
+        }
+    }
+    arrow_tick();
+    let stuck_ttl_after_one_tick = arrows()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|a| a.eid == 8001)
+        .map(|a| a.ttl);
+    arrow_tick();
+    let removed_after_two_ticks = arrows().lock().unwrap().iter().all(|a| a.eid != 8001);
     *arrows().lock().unwrap() = old_arrows;
     *forceloaded().lock().unwrap() = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
-    assert_eq!(steps.len(), 5, "the arrow left the hot set: {steps:?}");
+    assert!(
+        survived_flight,
+        "the flying arrow expired at its ground TTL"
+    );
+    assert_eq!(
+        stuck_ttl_after_one_tick,
+        Some(1),
+        "a stuck arrow counts down its in-ground lifetime"
+    );
+    assert!(
+        removed_after_two_ticks,
+        "a stuck arrow expires when its in-ground lifetime ends"
+    );
     // Horizontal velocity must shrink by the drag factor every tick, and the step
     // must equal the velocity rather than the velocity times the drag.
     let mut expected = 1.0f64;
@@ -3497,9 +3559,11 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _stop_guard = StopOnDrop(stop.clone());
     let snapshots_store = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let saves_during_fall = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let saver = {
         let stop = stop.clone();
         let snapshots_store = snapshots_store.clone();
+        let saves_during_fall = saves_during_fall.clone();
         std::thread::spawn(move || {
             let mut n = 0u32;
             while !stop.load(Ordering::Relaxed) {
@@ -3511,6 +3575,9 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
                     store.push(buf);
                 }
                 drop(store);
+                if !falling().lock().unwrap().is_empty() {
+                    saves_during_fall.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 n += 1;
             }
             n
@@ -3527,6 +3594,17 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
         expected,
         "every block becomes an entity"
     );
+    // Keep the fall active until the saver has completed a snapshot while the
+    // in-flight entities are present. This removes scheduler timing from the
+    // assertion and ensures the test actually covers the concurrent state.
+    let wait = std::time::Instant::now();
+    while saves_during_fall.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        assert!(
+            wait.elapsed().as_secs() < 10,
+            "the saver never captured a snapshot during the fall"
+        );
+        std::thread::yield_now();
+    }
     let mut ticks = 0;
     while !falling().lock().unwrap().is_empty() && ticks < 200 {
         falling_tick();
@@ -3535,7 +3613,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
     assert!(ticks < 200, "every entity must land");
     stop.store(true, Ordering::Relaxed);
     let saves = saver.join().expect("saver thread");
-    assert!(saves > 0, "a save must have run during the fall");
+    assert!(saves > 0, "the saver must complete at least one snapshot");
 
     let name = |x: i32, y: i32, z: i32| {
         crate::block_registry::breg()
@@ -4765,6 +4843,7 @@ fn arrow_sweep_outcome(target_x: f64, velocity: f64) -> (Option<f32>, Option<f64
         last_hurt_tick: Mutex::new(None),
         vel: Mutex::new([0.0; 3]),
         fuse: Mutex::new(0),
+        fire_ticks: Mutex::new(0),
         love: Mutex::new(0),
         air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
     }));
@@ -6902,6 +6981,7 @@ fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
         last_hurt_tick: Mutex::new(None),
         vel: Mutex::new([0.0; 3]),
         fuse: Mutex::new(0),
+        fire_ticks: Mutex::new(0),
         love: Mutex::new(0),
         air: Mutex::new(300),
     });
@@ -7375,7 +7455,8 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
     THUNDERING.store(old_weather.1, Ordering::Relaxed);
     world_rng::restore(old_rng);
     set_test_region(old_hot, old_warm);
-    assert_eq!(first, "54d762909d3321a41cfd670c7ff0baa9");
+    // includes the world-border footer (BRD1) appended by the save since #92
+    assert_eq!(first, "ccb95841c40f2d55ccd155989ad93fc8");
 }
 
 // ---------- chest world-side contract remainder (M2 slice 3d) ----------
@@ -7962,6 +8043,7 @@ fn test_mob(eid: i32, etype: i64, pos: (f64, f64, f64), hp: f32) -> Arc<Mob> {
         last_hurt_tick: Mutex::new(None),
         vel: Mutex::new([0.0; 3]),
         fuse: Mutex::new(0),
+        fire_ticks: Mutex::new(0),
         love: Mutex::new(0),
         air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
     })
@@ -9448,4 +9530,9 @@ fn p2_c_uniform_sections_emitters_match_cell_by_cell() {
         }
     }
     assert_eq!(run(std::sync::Arc::new(sec)), want);
+}
+#[test]
+fn sign_edit_distance_uses_eight_block_squared_limit() {
+    assert!(crate::sign_edit_in_range((0.5, 64.5, 0.5), 8, 64, 0));
+    assert!(!crate::sign_edit_in_range((0.5, 64.5, 0.5), 9, 64, 0));
 }

@@ -805,6 +805,7 @@ fn try_nightly_monster_at(
             last_hurt_tick: Mutex::new(None),
             vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         }));

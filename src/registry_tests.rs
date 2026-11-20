@@ -1,6 +1,16 @@
 use super::*;
 use crate::block_registry::breg;
 
+#[test]
+fn anti_xray_environment_switch_accepts_false_values_and_defaults_on() {
+    for value in ["0", "false", "OFF", " no "] {
+        assert!(!anti_xray_value_enabled(value), "{value}");
+    }
+    for value in ["1", "true", "on", "", "unexpected"] {
+        assert!(anti_xray_value_enabled(value), "{value}");
+    }
+}
+
 /// The block/item knowledge is spread across several hand-maintained tables, and
 /// the gate the registry slice needs is also the tool that says whether they agree
 /// today.

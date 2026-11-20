@@ -248,6 +248,32 @@ fn fuel_miss_does_not_delay_valid_fuel() {
     );
 }
 
+#[test]
+fn nether_furnace_ticks_and_keeps_its_dimension_key() {
+    let _world_guard = world_guard();
+    let dim = DimId::Nether;
+    let pos = (dim, 0, 70, 0);
+    let input = name_to_item("raw_iron").unwrap();
+    let coal = name_to_item("coal").unwrap();
+    test_region_warm_insert((0, 0));
+    furnaces().lock().unwrap().clear();
+    let mut furnace = new_furnace();
+    furnace.input = (input, 1, Vec::new());
+    furnace.fuel = (coal, 1, Vec::new());
+    furnaces().lock().unwrap().insert(pos, furnace);
+
+    furnace_tick();
+
+    let guard = furnaces().lock().unwrap();
+    let furnace = guard.get(&pos).unwrap();
+    assert_eq!(furnace.progress, 1);
+    assert_eq!(furnace.output, (0, 0, Vec::new()));
+    assert!(guard.get(&ow_block((0, 70, 0))).is_none());
+    drop(guard);
+    furnaces().lock().unwrap().clear();
+    super::test_region_warm_remove(&(0, 0));
+}
+
 /// The cache is keyed on the content revision, so a datapack reload must make it
 /// re-resolve. Without the revision in the key a reloaded recipe would keep
 /// returning the pre-reload answer forever, which is why the loader bumps it on

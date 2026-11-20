@@ -1409,6 +1409,7 @@ mod entity_fluid_tests {
             last_hurt_tick: Mutex::new(None),
             vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         });
@@ -1439,6 +1440,7 @@ mod entity_fluid_tests {
             last_hurt_tick: Mutex::new(None),
             vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         });
@@ -1541,6 +1543,7 @@ mod entity_fluid_tests {
             last_hurt_tick: Mutex::new(None),
             vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(10),
         });
@@ -1558,6 +1561,7 @@ mod entity_fluid_tests {
             last_hurt_tick: Mutex::new(None),
             vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         });
@@ -1572,10 +1576,11 @@ mod entity_fluid_tests {
             last_hurt_tick: Mutex::new(None),
             vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         });
-        // Zombie in daylight water clears burn fuse (124), whereas creeper in water keeps & advances its fuse (23).
+        // Zombie in daylight water clears its fire ticks (124), whereas creeper in water keeps & advances its fuse (23).
         set_block(2, 60, 3, 80);
         set_block(0, 60, 2, 80);
         let zombie_water = Arc::new(Mob {
@@ -1588,7 +1593,8 @@ mod entity_fluid_tests {
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
             last_hurt_tick: Mutex::new(None),
             vel: Mutex::new([0.0; 3]),
-            fuse: Mutex::new(5),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(5),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         });
@@ -1603,6 +1609,7 @@ mod entity_fluid_tests {
             last_hurt_tick: Mutex::new(None),
             vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(7),
+            fire_ticks: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         });
@@ -1638,7 +1645,7 @@ mod entity_fluid_tests {
             "fire-immune blaze must take 0 lava damage"
         );
         assert_eq!(
-            *zombie_water.fuse.lock().unwrap(),
+            *zombie_water.fire_ticks.lock().unwrap(),
             0,
             "zombie daylight burn counter must clear in water"
         );

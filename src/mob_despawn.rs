@@ -258,6 +258,7 @@ mod mob_despawn_tests {
             last_hurt_tick: Mutex::new(None),
             vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(300),
         })

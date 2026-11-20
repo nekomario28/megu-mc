@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{atomic::{AtomicU64, Ordering}, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -75,8 +75,21 @@ pub(crate) fn login_timeout() -> Duration {
     )
 }
 
+static IDLE_TIMEOUT_SECS: OnceLock<AtomicU64> = OnceLock::new();
+
+fn idle_timeout_secs() -> &'static AtomicU64 {
+    IDLE_TIMEOUT_SECS.get_or_init(|| {
+        AtomicU64::new(env_parse("MC_SPINE_IDLE_TIMEOUT_SECS").unwrap_or(60).max(1))
+    })
+}
+
 pub(crate) fn idle_timeout() -> Duration {
-    Duration::from_secs(env_parse("MC_SPINE_IDLE_TIMEOUT_SECS").unwrap_or(60).max(1))
+    Duration::from_secs(idle_timeout_secs().load(Ordering::Relaxed))
+}
+
+/// Set the play-state idle timeout. Zero disables idle disconnection.
+pub(crate) fn set_idle_timeout(timeout: Duration) {
+    idle_timeout_secs().store(timeout.as_secs(), Ordering::Relaxed);
 }
 
 pub(crate) fn backup_interval() -> Duration {
@@ -459,6 +472,16 @@ mod tests {
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn idle_timeout_can_be_changed_and_disabled() {
+        let previous = idle_timeout();
+        set_idle_timeout(Duration::from_secs(120));
+        assert_eq!(idle_timeout(), Duration::from_secs(120));
+        set_idle_timeout(Duration::ZERO);
+        assert!(idle_timeout().is_zero());
+        set_idle_timeout(previous);
     }
 
     #[test]

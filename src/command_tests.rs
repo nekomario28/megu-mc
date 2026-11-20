@@ -1,6 +1,133 @@
 use super::*;
 
 #[test]
+fn schedule_duration_suffixes_use_game_ticks() {
+    assert_eq!(TICKS_PER_SECOND, 20);
+    assert_eq!(schedule_delay_ticks("1s"), 20);
+    assert_eq!(schedule_delay_ticks("1d"), 24_000);
+    assert_eq!(schedule_delay_ticks("20"), 20);
+    assert_eq!(schedule_delay_ticks("20t"), 20);
+}
+
+#[test]
+fn weather_durations_use_seconds_and_vanilla_default() {
+    assert_eq!(weather_duration_ticks(Some("60")), 1200);
+    assert_eq!(weather_duration_ticks(None), 6000);
+}
+
+#[test]
+fn time_add_uses_signed_tick_arithmetic() {
+    assert_eq!(add_world_time(1000, 1000), 2000);
+}
+
+#[test]
+fn schedule_append_replace_and_clear_manage_matching_functions() {
+    let mut scheduled = vec![("pack:tick".to_string(), 10), ("pack:other".to_string(), 15)];
+    schedule_function(&mut scheduled, "pack:tick", 20, true);
+    assert_eq!(scheduled.len(), 3);
+    schedule_function(&mut scheduled, "pack:tick", 30, false);
+    assert_eq!(scheduled, vec![("pack:other".into(), 15), ("pack:tick".into(), 30)]);
+    assert_eq!(clear_scheduled_functions(&mut scheduled, Some("pack:tick")), 1);
+    assert_eq!(clear_scheduled_functions(&mut scheduled, None), 1);
+    assert!(scheduled.is_empty());
+}
+
+#[test]
+fn help_reports_specific_usage_and_alias_is_read_only() {
+    assert_eq!(
+        command_usage("setblock"),
+        "Usage: /setblock <x> <y> <z> <block> [replace|destroy|keep]"
+    );
+    assert!(!command_allowed_for_player("?", &[]));
+    let ctx = command_context(None);
+    assert_eq!(
+        run_command_ctx(&ctx, "/help setblock", &mut None),
+        "Usage: /setblock <x> <y> <z> <block> [replace|destroy|keep]"
+    );
+}
+
+#[test]
+fn forceload_can_query_negative_chunk_and_remove_all() {
+    let _world = world_guard();
+    let previous = std::mem::replace(&mut *forceloaded().lock().unwrap(), HashSet::new());
+    let ctx = command_context(None);
+    let added = run_command_ctx(&ctx, "/forceload add -1 -1", &mut None);
+    let queried = run_command_ctx(&ctx, "/forceload query -1 -1", &mut None);
+    let removed = run_command_ctx(&ctx, "/forceload remove all", &mut None);
+    *forceloaded().lock().unwrap() = previous;
+    assert!(added.contains("1 chunks"), "{added}");
+    assert!(queried.contains("Chunk -1, -1 is force loaded"), "{queried}");
+    assert!(removed.contains("Removed 1"), "{removed}");
+}
+
+#[test]
+fn entity_selectors_include_live_non_players_and_select_nearest_or_random() {
+    let _world = world_guard();
+    let (mut player, _hold) = crate::effect_tests::client_pair();
+    player.eid = 4244;
+    *player.pos.lock().unwrap() = (0.5, 16.0, 0.5, 0.0, 0.0, false);
+    let player_eid = player.eid;
+    clients().lock().unwrap().push(Arc::new(player));
+    drops().lock().unwrap().push(Drop {
+        eid: 4245,
+        x: 1.0,
+        y: 16.0,
+        z: 0.5,
+        item: name_to_item("stone").unwrap(),
+        cnt: 1,
+        comps: Vec::new(),
+        age: 0,
+        target: None,
+        thrower: None,
+    });
+    drops().lock().unwrap().push(Drop {
+        eid: 4246,
+        x: 4.0,
+        y: 16.0,
+        z: 0.5,
+        item: name_to_item("dirt").unwrap(),
+        cnt: 1,
+        comps: Vec::new(),
+        age: 0,
+        target: None,
+        thrower: None,
+    });
+    assert!(insert_live_mob(
+        name_to_etype("cow").unwrap(),
+        DimId::Overworld,
+        (2.0, 16.0, 0.5, 0.0, 0.0),
+        10.0,
+        None,
+    ));
+    let mob_eid = mobs().lock().unwrap().last().unwrap().eid;
+
+    let all_entities = resolve_selector("@e", None);
+    let all_players = resolve_selector("@a", None);
+    let nearest_item = resolve_selector("@n[type=item]", None);
+    let random_item = resolve_selector("@r[type=item]", None);
+
+    clients().lock().unwrap().retain(|c| c.eid != player_eid);
+    drops().lock().unwrap().retain(|d| d.eid != 4245 && d.eid != 4246);
+    remove_live_mob(mob_eid);
+
+    assert!(all_entities.contains(&player_eid.to_string()));
+    assert!(all_entities.contains(&"d:4245".to_string()));
+    assert!(all_entities.contains(&"d:4246".to_string()));
+    assert!(all_entities.contains(&format!("m:{mob_eid}")));
+    assert!(all_players.contains(&player_eid.to_string()));
+    assert!(all_players.iter().all(|eid| eid.parse::<i32>().is_ok()));
+    assert_eq!(nearest_item, vec!["d:4245".to_string()]);
+    assert_eq!(random_item.len(), 1);
+    assert!(random_item[0] == "d:4245" || random_item[0] == "d:4246");
+}
+
+#[test]
+fn unknown_setblock_name_does_not_resolve_to_air() {
+    assert!(state_from_arg("not_a_block").is_none());
+    assert_eq!(state_from_arg("minecraft:stone"), Some(1));
+}
+
+#[test]
 fn summon_uses_the_mobs_initial_health() {
     if crate::test_support::isolated_world_test() {
         return;
@@ -238,7 +365,9 @@ fn operators_persist_and_gate_player_commands() {
     let run = |ctx, msg| run_command_ctx(ctx, msg, &mut None);
 
     assert!(run(&player, "/time query daytime").starts_with("The time is "));
-    assert_eq!(run(&player, "/help"), "commands: help list time");
+    assert_eq!(run(&player, "/help"), "commands: help list time me msg tell w");
+    // vanilla TimeArgument has a minimum of 0, so negative /time add is rejected
+    assert_eq!(run(&console, "/time add -5"), "usage: /time add <ticks>");
     assert!(run(&player, "/op Fixture_Op").contains("permission"));
     assert!(run(&player, "/time set 123").contains("permission"));
     assert!(run(&console, "/op Fixture_Op").contains("a server operator"));
@@ -393,7 +522,7 @@ fn brigadier_play_tree_and_completion_respect_permissions() {
         .iter()
         .map(|node| node.name().to_owned())
         .collect();
-    assert_eq!(names, ["help", "list", "time"]);
+    assert_eq!(names, ["help", "list", "time", "me", "msg", "tell", "w"]);
     assert!(basic.child("time").unwrap().child("set").is_none());
     assert!(admin
         .child("time")

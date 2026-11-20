@@ -322,7 +322,7 @@ fn apply_entity_push_step(
             broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
             if dead {
                 let (mx, my, mz, _, _) = *m.pos.lock().unwrap();
-                mob_env_die(m.eid, m.etype, mx, my, mz, *m.fuse.lock().unwrap() > 0);
+                mob_env_die(m.eid, m.etype, mx, my, mz, *m.fire_ticks.lock().unwrap() > 0);
                 dead_by_cramming[idx] = true;
                 continue;
             }
@@ -442,6 +442,7 @@ mod entity_push_tests {
             last_hurt_tick: Mutex::new(None),
             vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         })
