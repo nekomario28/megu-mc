@@ -1,6 +1,6 @@
 //! Clean-room incremental block and sky lighting for loaded chunk windows.
 //!
-//! The game-state owner supplies emission and opacity from its own registry. Edits
+//! The game-state owner supplies emission, opacity, and occlusion shapes. Edits
 //! invalidate the 14-step influence region, darken it, and relight from live
 //! emitters, direct sky, and unchanged boundary light. Unloaded chunks are hard
 //! boundaries. This file is currently an independently tested integration seam.
@@ -25,15 +25,142 @@ impl Position {
         (self.x.div_euclid(16), self.z.div_euclid(16))
     }
 
-    fn adjacent(self) -> [Self; 6] {
-        [
-            Self::new(self.x + 1, self.y, self.z),
-            Self::new(self.x - 1, self.y, self.z),
-            Self::new(self.x, self.y + 1, self.z),
-            Self::new(self.x, self.y - 1, self.z),
-            Self::new(self.x, self.y, self.z + 1),
-            Self::new(self.x, self.y, self.z - 1),
-        ]
+    fn adjacent(self) -> impl Iterator<Item = (Face, Self)> {
+        Face::ALL.into_iter().map(move |face| {
+            let (dx, dy, dz) = face.offset();
+            (face, Self::new(self.x + dx, self.y + dy, self.z + dz))
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Face {
+    // Opposite pairs follow the x, z, y octant-bit order.
+    West,
+    East,
+    North,
+    South,
+    Down,
+    Up,
+}
+
+impl Face {
+    const ALL: [Self; 6] = [
+        Self::West,
+        Self::East,
+        Self::North,
+        Self::South,
+        Self::Down,
+        Self::Up,
+    ];
+
+    fn opposite(self) -> Self {
+        Self::ALL[self as usize ^ 1]
+    }
+
+    fn offset(self) -> (i32, i32, i32) {
+        match self {
+            Self::West => (-1, 0, 0),
+            Self::East => (1, 0, 0),
+            Self::North => (0, 0, -1),
+            Self::South => (0, 0, 1),
+            Self::Down => (0, -1, 0),
+            Self::Up => (0, 1, 0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Half {
+    Bottom,
+    Top,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Facing {
+    North,
+    East,
+    South,
+    West,
+}
+
+impl Facing {
+    fn quadrants(self) -> u8 {
+        match self {
+            Self::North => 0b0011,
+            Self::East => 0b1010,
+            Self::South => 0b1100,
+            Self::West => 0b0101,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StairShape {
+    Straight,
+    InnerLeft,
+    InnerRight,
+    OuterLeft,
+    OuterRight,
+}
+
+/// Occlusion at half-block resolution, sufficient for slab and stair shapes.
+/// Each face records four quadrants in the same world-axis order as its opposite.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FaceOcclusion([u8; 6]);
+
+impl FaceOcclusion {
+    const EMPTY: Self = Self([0; 6]);
+    pub const FULL: Self = Self([0xf; 6]);
+
+    /// Project occupied half-block octants onto the six outer faces. Octant
+    /// indices use the coordinate bits x, z, y from least to most significant.
+    pub fn from_octants(octants: u8) -> Self {
+        let mut faces = [0; 6];
+        for face in Face::ALL {
+            let index = face as usize;
+            let axis = index / 2;
+            let below_axis = (1 << axis) - 1;
+            for quadrant in 0..4 {
+                // Insert the face's fixed coordinate into the quadrant index.
+                let octant = (quadrant & below_axis)
+                    | ((index & 1) << axis)
+                    | ((quadrant & !below_axis) << 1);
+                faces[index] |= ((octants >> octant) & 1) << quadrant;
+            }
+        }
+        Self(faces)
+    }
+
+    pub fn slab(half: Half) -> Self {
+        Self::with_base(half, 0)
+    }
+
+    pub fn stairs(half: Half, facing: Facing, shape: StairShape) -> Self {
+        let sides = [Facing::North, Facing::East, Facing::South, Facing::West];
+        let back = facing.quadrants();
+        let left = sides[(facing as usize + 3) % 4].quadrants();
+        let right = sides[(facing as usize + 1) % 4].quadrants();
+        let step = match shape {
+            StairShape::Straight => back,
+            StairShape::InnerLeft => back | left,
+            StairShape::InnerRight => back | right,
+            StairShape::OuterLeft => back & left,
+            StairShape::OuterRight => back & right,
+        };
+        Self::with_base(half, step)
+    }
+
+    fn with_base(half: Half, step: u8) -> Self {
+        Self::from_octants(match half {
+            Half::Bottom => 0xf | (step << 4),
+            Half::Top => (0xf << 4) | step,
+        })
+    }
+
+    /// Vanilla's face union can cover the whole face even if both sides are partial.
+    pub fn seals(self, face: Face, neighbor: Self) -> bool {
+        self.0[face as usize] | neighbor.0[face.opposite() as usize] == 0xf
     }
 }
 
@@ -41,13 +168,28 @@ impl Position {
 pub struct LightBlock {
     opacity: u8,
     emission: u8,
+    occlusion: FaceOcclusion,
 }
 
 impl LightBlock {
-    pub fn new(opacity: u8, emission: u8) -> Self {
+    pub const fn new(opacity: u8, emission: u8) -> Self {
+        Self::with_occlusion(opacity, emission, FaceOcclusion::EMPTY)
+    }
+
+    pub const fn with_occlusion(opacity: u8, emission: u8, occlusion: FaceOcclusion) -> Self {
         Self {
-            opacity: opacity.min(15),
-            emission: emission.min(15),
+            opacity: if opacity > 15 { 15 } else { opacity },
+            emission: if emission > 15 { 15 } else { emission },
+            occlusion,
+        }
+    }
+
+    fn transmitted(self, face: Face, target: Self, level: u8) -> u8 {
+        let remaining = level.saturating_sub(target.opacity.max(1));
+        if remaining == 0 || self.occlusion.seals(face, target.occlusion) {
+            0
+        } else {
+            remaining
         }
     }
 }
@@ -59,7 +201,8 @@ pub enum LightKind {
 }
 
 /// Section payloads use the protocol's low-nibble-first layout. Only changed
-/// sections are present. An entirely dark section uses its empty mask bit.
+/// sections are present. An entirely dark section uses its empty mask bit,
+/// which clears the receiver's section without a zero-filled payload.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct ChunkLightUpdate {
     pub chunk: Chunk,
@@ -162,11 +305,12 @@ impl IncrementalLighting {
             if self.level(kind, p) != level || level <= 1 {
                 continue;
             }
-            for next in p.adjacent() {
+            let from = self.block_at(p);
+            for (face, next) in p.adjacent() {
                 if !self.valid(next) || patch.is_some_and(|area| !area.contains(&next)) {
                     continue;
                 }
-                let candidate = level.saturating_sub(self.block_at(next).opacity.max(1));
+                let candidate = from.transmitted(face, self.block_at(next), level);
                 if candidate > self.level(kind, next) {
                     self.set_level(kind, next, candidate);
                     queue.push_back((next, candidate));
@@ -211,13 +355,22 @@ impl IncrementalLighting {
     }
 
     /// Computes direct vertical skylight. Transparent air preserves level 15;
-    /// water, leaves, and ice attenuate by their registry-provided opacity.
+    /// scalar opacity attenuates it and a sealed vertical face stops it.
     fn refresh_column(&mut self, x: i32, z: i32) -> Vec<Position> {
         let mut changed = Vec::new();
         let mut level = 15u8;
+        let mut above = FaceOcclusion::EMPTY;
         for y in (self.min_y..=self.max_y).rev() {
             let p = Position::new(x, y, z);
-            level = level.saturating_sub(self.block_at(p).opacity);
+            if level > 0 {
+                let block = self.block_at(p);
+                level = if above.seals(Face::Down, block.occlusion) {
+                    0
+                } else {
+                    level.saturating_sub(block.opacity)
+                };
+                above = block.occlusion;
+            }
             let old = self.direct_sky.get(&p).copied().unwrap_or(0);
             if old != level {
                 changed.push(p);
@@ -274,7 +427,7 @@ impl IncrementalLighting {
             if distance == 14 {
                 continue;
             }
-            for n in p.adjacent() {
+            for (_, n) in p.adjacent() {
                 if self.valid(n) && patch.insert(n) {
                     frontier.push_back((n, distance + 1));
                 }
@@ -288,10 +441,17 @@ impl IncrementalLighting {
         let mut queue = VecDeque::new();
         for &p in &patch {
             let mut level = self.source(kind, p);
-            let cost = self.block_at(p).opacity.max(1);
-            for neighbor in p.adjacent() {
+            let target = self.block_at(p);
+            for (face, neighbor) in p.adjacent() {
                 if !patch.contains(&neighbor) {
-                    level = level.max(self.level(kind, neighbor).saturating_sub(cost));
+                    let incoming = self.level(kind, neighbor);
+                    if incoming > 1 {
+                        level = level.max(self.block_at(neighbor).transmitted(
+                            face.opposite(),
+                            target,
+                            incoming,
+                        ));
+                    }
                 }
             }
             if level > 0 {
@@ -335,7 +495,9 @@ impl IncrementalLighting {
         let mut sky_changes = self.refresh_column(p.x, p.z);
         // A lateral skylight path may change even when the direct vertical
         // column is already dark beneath a roof.
-        if old_block.opacity != block.opacity && !sky_changes.contains(&p) {
+        if (old_block.opacity != block.opacity || old_block.occlusion != block.occlusion)
+            && !sky_changes.contains(&p)
+        {
             sky_changes.push(p);
         }
         let work = self.relight_patch(LightKind::Sky, &sky_changes)
@@ -414,22 +576,10 @@ impl IncrementalLighting {
 mod tests {
     use super::*;
 
-    const AIR: LightBlock = LightBlock {
-        opacity: 0,
-        emission: 0,
-    };
-    const STONE: LightBlock = LightBlock {
-        opacity: 15,
-        emission: 0,
-    };
-    const TORCH: LightBlock = LightBlock {
-        opacity: 0,
-        emission: 14,
-    };
-    const LANTERN: LightBlock = LightBlock {
-        opacity: 0,
-        emission: 15,
-    };
+    const AIR: LightBlock = LightBlock::new(0, 0);
+    const STONE: LightBlock = LightBlock::new(15, 0);
+    const TORCH: LightBlock = LightBlock::new(0, 14);
+    const LANTERN: LightBlock = LightBlock::new(0, 15);
 
     fn p(x: i32, y: i32, z: i32) -> Position {
         Position::new(x, y, z)
@@ -518,6 +668,116 @@ mod tests {
         assert_eq!(cleared.chunks[0].empty_block_mask & 0b110, 0b110);
         assert!(cleared.chunks[0].block_sections.is_empty());
         assert_matches_full_rebuild(&engine);
+    }
+
+    #[test]
+    fn last_emitter_removal_clears_exactly_the_previously_lit_sections() {
+        let chunks = [(0, 0), (1, 0)];
+        let mut engine = world(48, &chunks);
+        let at = p(15, 20, 8);
+        let placed = engine.edit(at, LANTERN).unwrap();
+        let removed = engine.edit(at, AIR).unwrap();
+        assert_eq!(placed.chunks.len(), chunks.len());
+        assert_eq!(removed.chunks.len(), chunks.len());
+        for ((chunk, lit), cleared) in chunks.into_iter().zip(placed.chunks).zip(removed.chunks) {
+            assert_eq!(lit.chunk, chunk);
+            assert_eq!(lit.block_mask, 0b1110);
+            assert_eq!(lit.empty_block_mask, 0);
+            assert_eq!(
+                cleared,
+                ChunkLightUpdate {
+                    chunk,
+                    empty_block_mask: 0b1110,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(engine.sections(chunk, LightKind::Block), vec![[0; 2048]; 5]);
+        }
+    }
+
+    #[test]
+    fn slabs_seal_their_base_and_complementary_horizontal_faces() {
+        let bottom = FaceOcclusion::slab(Half::Bottom);
+        let top = FaceOcclusion::slab(Half::Top);
+        for face in Face::ALL {
+            assert_eq!(bottom.seals(face, FaceOcclusion::EMPTY), face == Face::Down);
+            assert_eq!(top.seals(face, FaceOcclusion::EMPTY), face == Face::Up);
+            assert!(FaceOcclusion::FULL.seals(face, FaceOcclusion::EMPTY));
+        }
+        for face in [Face::North, Face::East, Face::South, Face::West] {
+            assert!(!bottom.seals(face, bottom));
+            assert!(bottom.seals(face, top));
+            assert!(top.seals(face.opposite(), bottom));
+        }
+    }
+
+    #[test]
+    fn stair_full_faces_follow_half_facing_and_corner() {
+        let facings = [
+            (Facing::North, Face::North),
+            (Facing::East, Face::East),
+            (Facing::South, Face::South),
+            (Facing::West, Face::West),
+        ];
+        for (half, base) in [(Half::Bottom, Face::Down), (Half::Top, Face::Up)] {
+            for (index, (facing, back)) in facings.into_iter().enumerate() {
+                let left = facings[(index + 3) % 4].1;
+                let right = facings[(index + 1) % 4].1;
+                for (shape, full_faces) in [
+                    (StairShape::Straight, &[base, back][..]),
+                    (StairShape::InnerLeft, &[base, back, left][..]),
+                    (StairShape::InnerRight, &[base, back, right][..]),
+                    (StairShape::OuterLeft, &[base][..]),
+                    (StairShape::OuterRight, &[base][..]),
+                ] {
+                    let stairs = FaceOcclusion::stairs(half, facing, shape);
+                    for face in Face::ALL {
+                        assert_eq!(
+                            stairs.seals(face, FaceOcclusion::EMPTY),
+                            full_faces.contains(&face),
+                            "{half:?} {facing:?} {shape:?} {face:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shape_only_edits_relight_vertical_sky_and_lateral_light() {
+        let mut engine = world(32, &[(0, 0)]);
+        let center = p(8, 16, 8);
+        let below = p(8, 15, 8);
+        let torch = p(8, 16, 7);
+        engine.edit(torch, TORCH).unwrap();
+        let slab = |half| LightBlock::with_occlusion(0, 0, FaceOcclusion::slab(half));
+        let stairs = |facing| {
+            LightBlock::with_occlusion(
+                0,
+                0,
+                FaceOcclusion::stairs(Half::Bottom, facing, StairShape::Straight),
+            )
+        };
+        for (block, sky, under, block_at_center) in [
+            (slab(Half::Bottom), 15, 14, 13),
+            (slab(Half::Top), 14, 14, 13),
+            (
+                LightBlock::with_occlusion(15, 0, FaceOcclusion::FULL),
+                0,
+                14,
+                0,
+            ),
+            (stairs(Facing::North), 15, 14, 11),
+            (stairs(Facing::South), 15, 14, 13),
+            (AIR, 15, 15, 13),
+        ] {
+            let update = engine.edit(center, block).unwrap();
+            assert!(!update.chunks.is_empty());
+            expect_level(&engine, LightKind::Sky, center, sky);
+            expect_level(&engine, LightKind::Sky, below, under);
+            expect_level(&engine, LightKind::Block, center, block_at_center);
+            assert_matches_full_rebuild(&engine);
+        }
     }
 
     #[test]
