@@ -5709,6 +5709,7 @@ pub(crate) fn spawn_cost_for(biome: &str, entity: &str) -> Option<SpawnCost> {
 /// the pinned data's, so the nightly spawn path no longer rotates through a
 /// hard-coded type list irrespective of biome. Mob-specific spawn placement,
 /// group size, difficulty and per-category caps remain the caller's contract.
+#[cfg(test)]
 pub(crate) fn choose_supported_hostile(biome: &str, roll: u64) -> Option<&'static str> {
     const SUPPORTED: [&str; 4] = [
         "minecraft:zombie",
@@ -9322,7 +9323,12 @@ fn apply_carvers_body(g: &mut Gen, tx: i32, tz: i32, grid: Option<&OriginGrid>) 
 /// its own carver stage, so the ring is carved once and the claims are made in the order the
 /// serial loop made them — which is also the order the outputs are committed in.
 fn carve_ring(g: &mut Gen, sx: i32, sz: i32) {
-    carve_ring_with(g, sx, sz, crate::worldgen::terrain_jobs());
+    let jobs = if g.starts_round.is_some() {
+        crate::worldgen::terrain_jobs()
+    } else {
+        1
+    };
+    carve_ring_with(g, sx, sz, jobs);
 }
 
 /// [`carve_ring`] with the worker count passed in, so the serial and parallel arms are the same
