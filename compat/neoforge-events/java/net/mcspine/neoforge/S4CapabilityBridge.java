@@ -8,16 +8,19 @@ import java.util.Map;
 import java.util.Objects;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.Container;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.BlockEntityType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.neoforged.neoforge.capabilities.BlockCapability;
 import net.neoforged.neoforge.capabilities.Capabilities;
 import net.neoforged.neoforge.capabilities.IBlockCapabilityProvider;
+import net.neoforged.neoforge.capabilities.ICapabilityProvider;
 
 /** Resolves providers on the owner from a copied container and returns proposed slot replacements. */
 public final class S4CapabilityBridge {
@@ -27,6 +30,7 @@ public final class S4CapabilityBridge {
     private static final Direction[] DIRECTIONS = Direction.values();
 
     private static final Map<Integer, Block> BLOCKS = new HashMap<>();
+    private static final Map<ResourceLocation, Integer> BLOCK_IDS = new HashMap<>();
     private static final Map<Integer, Item> ITEMS = new HashMap<>();
     private static final Map<Item, Integer> ITEM_IDS = new IdentityHashMap<>();
     private static final Map<Block, List<IBlockCapabilityProvider<?, ?>>> PROVIDERS = new IdentityHashMap<>();
@@ -37,7 +41,10 @@ public final class S4CapabilityBridge {
 
     private S4CapabilityBridge() { }
 
-    static void bindBlock(int id, Block block) { BLOCKS.put(id, block); }
+    static void bindBlock(int id, ResourceLocation name, Block block) {
+        BLOCKS.put(id, block);
+        BLOCK_IDS.put(name, id);
+    }
     static Block blockForState(int state) { return BLOCKS.get(state); }
     static void bindItem(int id, Item item) {
         // S2 allows aliases; a stack cannot represent their distinct numeric IDs.
@@ -60,6 +67,7 @@ public final class S4CapabilityBridge {
         registering = false;
         registrationFailure = null;
         BLOCKS.clear();
+        BLOCK_IDS.clear();
         ITEMS.clear();
         ITEM_IDS.clear();
         PROVIDERS.clear();
@@ -74,6 +82,25 @@ public final class S4CapabilityBridge {
                 if (BLOCKS.values().stream().noneMatch(registered -> registered == block)) throw fail("S4 provider block is absent from the S2 registry");
                 PROVIDERS.computeIfAbsent(block, ignored -> new ArrayList<>()).add(provider);
             }
+        } catch (RuntimeException error) {
+            registrationFailure = error;
+            throw error;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <T, C, BE extends BlockEntity> void registerBlockEntity(BlockCapability<T, C> capability,
+            BlockEntityType<BE> type, ICapabilityProvider<? super BE, C, T> provider) {
+        checkRegistration(capability);
+        try {
+            Objects.requireNonNull(provider);
+            if (type == null) throw fail("Missing S4 block entity type");
+            Integer id = BLOCK_IDS.get(type.id());
+            if (id == null) throw fail("S4 block entity type is absent from the S2 registry");
+            // S2 aliases can share one Block instance, so match the snapshot's exact registered ID.
+            IBlockCapabilityProvider<T, C> adapted = (level, pos, state, be, context) ->
+                state.stateId() == id ? provider.getCapability((BE) be, context) : null;
+            PROVIDERS.computeIfAbsent(blockForState(id), ignored -> new ArrayList<>()).add(adapted);
         } catch (RuntimeException error) {
             registrationFailure = error;
             throw error;
@@ -174,6 +201,8 @@ public final class S4CapabilityBridge {
         void check() {
             if (ACTIVE.get() != this || failed) throw fail("S4 container snapshot expired");
         }
+
+        @Override protected void checkActivation() { check(); }
 
         void checkSlot(int slot) {
             check();

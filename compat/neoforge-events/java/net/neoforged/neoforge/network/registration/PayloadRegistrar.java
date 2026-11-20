@@ -1,6 +1,7 @@
 package net.neoforged.neoforge.network.registration;
 
 import net.mcspine.neoforge.S4NetworkBridge;
+import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
@@ -33,6 +34,18 @@ public class PayloadRegistrar {
     public <T extends CustomPacketPayload> PayloadRegistrar playBidirectional(CustomPacketPayload.Type<T> type,
             StreamCodec<? super RegistryFriendlyByteBuf, T> codec, IPayloadHandler<T> handler) {
         S4NetworkBridge.register(type, version, codec, handler, true, true);
+        return this;
+    }
+
+    public <T extends CustomPacketPayload> PayloadRegistrar configurationToClient(CustomPacketPayload.Type<T> type,
+            StreamCodec<? super FriendlyByteBuf, T> codec, IPayloadHandler<T> handler) {
+        S4NetworkBridge.registerConfiguration(type, version, codec, handler, false, true);
+        return this;
+    }
+
+    public <T extends CustomPacketPayload> PayloadRegistrar configurationToServer(CustomPacketPayload.Type<T> type,
+            StreamCodec<? super FriendlyByteBuf, T> codec, IPayloadHandler<T> handler) {
+        S4NetworkBridge.registerConfiguration(type, version, codec, handler, true, false);
         return this;
     }
 }

@@ -104,8 +104,8 @@ entry point with a mod loaded through the NeoForge bootstrap.
 
 After freezing the block and item registry, bootstrap posts
 `RegisterPayloadHandlersEvent` and `RegisterCapabilitiesEvent` on the mod buses.
-Payload registration takes an explicit version and a play direction. Each
-channel ID is unique across the mod set. The host supplies C2S payloads and
+Play payload registration takes an explicit version and a direction. Each
+channel ID is unique within its phase. The host supplies C2S payloads and
 sender identity on the JVM owner. `PacketDistributor.sendToPlayer` and
 `sendToAllPlayers` queue their S2C output during the callback. The dispatch
 returns that queue in the same JNI invocation. The registered
@@ -164,6 +164,28 @@ tick phase and its available-time flag, or the living entity and original and
 post-reduction damage amounts. Damage listeners can update the shared damage
 container. The hook returns the resulting finite, nonnegative amount and
 the S1 mutation batch, or discards the batch on failure. These entry points
-require explicit calls from the host. Production Rust tick and damage routing,
-block entity dirty tracking and arbitrary NeoForge tickers are outside this
-surface.
+require explicit calls from the host for production tick and damage routing.
+
+## NF-7 block entity views and configuration payloads
+
+`DirectBatchBridge.registerBlockEntityTicker` binds a ticker to an S3
+block-entity tick kind at bootstrap. Each activation supplies its level,
+position, block state and block entity view. `BlockEntity.setChanged()` marks
+that view dirty during an S3 tick, S3 container activation or S4 capability
+query. S3 callbacks can inspect the flag with `BlockEntityHandle.dirty()`.
+Each activation starts with a clean view, and retained views reject
+`setChanged()` after the activation ends. The flag is Java-local. The v1
+response formats carry the existing mutation proposals.
+
+`RegisterCapabilitiesEvent.registerBlockEntity` accepts a
+`BlockEntityType<BlockEntity>` keyed by the canonical S2 block ID. Typed and
+block-level providers run in registration order for the queried block.
+Typed providers receive the bridge's block entity snapshot for that ID.
+Registration requires a known S2 block during the capability event.
+
+`PayloadRegistrar.configurationToServer` and `configurationToClient` use
+`FriendlyByteBuf` codecs. The Java host entry point `dispatchConfiguration`
+uses the v1 payload frame and preserves the Configuration phase for nested
+handlers and replies. Play dispatch looks up only Play registrations.
+Both phases share the frame and depth limits. The Rust server Configuration
+loop still requires host routing for this entry point.

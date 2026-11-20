@@ -140,7 +140,7 @@ public final class Bootstrap {
             int id = key == Registries.BLOCK ? 26_684 : 1_333;
             for (ResourceLocation name : names) {
                 Object value = event.registeredValue(name);
-                if (key == Registries.BLOCK) S4CapabilityBridge.bindBlock(id, (Block) value);
+                if (key == Registries.BLOCK) S4CapabilityBridge.bindBlock(id, name, (Block) value);
                 else S4CapabilityBridge.bindItem(id, (Item) value);
                 wire.append(key.location()).append('\t').append(id++).append('\t').append(name).append('\n');
             }

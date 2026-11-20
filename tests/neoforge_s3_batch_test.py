@@ -27,6 +27,8 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LevelAccessor;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.BlockEntityTicker;
 import net.minecraft.world.level.block.state.BlockBehaviour;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
@@ -35,6 +37,7 @@ import net.neoforged.neoforge.registries.DeferredRegister;
 @Mod("nf4_fixture")
 public final class S3Mod {
     private BlockEntityHandle block;
+    private BlockEntity previousTick;
     private EntityHandle entity;
     private int depth;
 
@@ -108,6 +111,33 @@ public final class S3Mod {
         DirectBatchBridge.register(BLOCK_ENTITY_TICK, 20, context -> {
             throw new AssertionError("malformed input must fail before any callback runs");
         });
+        DirectBatchBridge.register(BLOCK_ENTITY_TICK, 22, context -> {
+            if (context.blockEntity().dirty()) throw new AssertionError("dirty flag leaked between activations");
+        });
+        BlockEntityTicker<BlockEntity> ticker = (level, pos, state, be) -> {
+            if (be.getLevel() != level || level.dimension() != Level.END
+                    || level.getBlockState(pos) != state || state.stateId() != 26684
+                    || pos.getY() != 70 || pos.getZ() != 18) {
+                throw new AssertionError("incorrect ticker inputs");
+            }
+            be.setChanged();
+            if (pos.getX() == -3) {
+                try {
+                    previousTick.setChanged();
+                    throw new AssertionError("stale block entity accepted setChanged");
+                } catch (IllegalStateException expected) {
+                    if (!expected.getMessage().contains("handle expired")) throw expected;
+                }
+            }
+            previousTick = be;
+        };
+        DirectBatchBridge.registerBlockEntityTicker(22, ticker);
+        DirectBatchBridge.register(BLOCK_ENTITY_TICK, 22, context -> {
+            if (previousTick != context.blockEntity() || !context.blockEntity().dirty()) {
+                throw new AssertionError("ticker did not mark the active view");
+            }
+            context.scheduleTick(context.x(), context.y(), context.z(), 12, 0);
+        });
     }
 
     private static void requireScheduleRejected(Runnable schedule) {
@@ -155,7 +185,7 @@ public final class S3Mod {
 }
 """
 
-SCHEDULE_RUNNER = """
+BATCH_RUNNER = """
 import java.lang.reflect.InvocationTargetException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
@@ -163,7 +193,7 @@ import java.nio.file.Path;
 import net.mcspine.neoforge.Bootstrap;
 import net.mcspine.neoforge.DirectBatchBridge;
 
-public class ScheduleCheck {
+public class BatchCheck {
     public static void main(String[] args) throws Exception {
         Bootstrap.initialize(args[0]);
         var dispatch = DirectBatchBridge.class.getDeclaredMethod("dispatch", ByteBuffer.class, int.class, ByteBuffer.class);
@@ -178,9 +208,9 @@ public class ScheduleCheck {
             response.get(output);
             Files.write(Path.of(args[2]), output);
         } catch (InvocationTargetException error) {
-            if (response.getInt(0) != 0) throw new AssertionError("partial schedule response published", error);
+            if (response.getInt(0) != 0) throw new AssertionError("partial S3 response published", error);
             if (error.getCause() instanceof IllegalStateException cause && cause.getMessage().equals("S3 batch failed")) {
-                System.out.println("schedule batch rolled back");
+                System.out.println("S3 batch rolled back");
             } else {
                 throw error;
             }
@@ -261,6 +291,9 @@ class NeoForgeS3BatchTests(unittest.TestCase):
         codec.write_text(f'#![allow(dead_code)]\n#[path = "{ROOT / "src/landing_types.rs"}"]\n'
                          f'mod landing_types;\n{DECODER}')
         cls.checked("rustc", "--edition=2021", "--cfg", 'feature="neoforge-events"', codec, "-o", cls.codec)
+        source = cls.root / "BatchCheck.java"
+        source.write_text(BATCH_RUNNER)
+        cls.checked(JAVA / "bin/javac", "--release", "21", "-cp", classpath.strip(), "-d", cls.root, source)
 
     @classmethod
     def pack_mod(cls, name, source):
@@ -342,27 +375,41 @@ class NeoForgeS3BatchTests(unittest.TestCase):
     def test_java_rejects_malformed_requests_and_rolls_back_at_output_limits(self):
         self.run_jni("bounds", "malformed input and invalid or oversized output rejected")
 
-    def test_level_schedule_tick_emits_s3_op_and_rolls_back_invalid_calls(self):
-        source = self.root / "ScheduleCheck.java"
-        source.write_text(SCHEDULE_RUNNER)
+    def dispatch_batch(self, *records):
         classpath = (self.root / "classpath.txt").read_text().strip()
-        self.checked(JAVA / "bin/javac", "--release", "21", "-cp", classpath, "-d", self.root, source)
-        request = self.root / "schedule-request"
-        response = self.root / "schedule-response"
+        request = self.root / "batch-request"
+        response = self.root / "batch-response"
+        response.unlink(missing_ok=True)
+        request.write_bytes(frame(*records, header=b"S3\x01\x00"))
+        stdout = self.checked(JAVA / "bin/java", "-cp", os.pathsep.join([str(self.root), classpath]),
+                              "BatchCheck", self.root, request, response)
+        return stdout, response
+
+    @staticmethod
+    def block_entity_record(kind, x, activation=1):
+        return struct.pack("<BBHiIiiiI", activation, 2, kind, -20, GENERATION, x, 70, 18, 26684)
+
+    def test_level_schedule_tick_emits_s3_op_and_rolls_back_invalid_calls(self):
         for x in (-4, -3, -2):
             with self.subTest(x=x):
-                record = struct.pack("<BBHiIiiiI", 1, 2, 21, -20, GENERATION, x, 70, 18, 26684)
-                request.write_bytes(frame(record, header=b"S3\x01\x00"))
-                result = self.checked(JAVA / "bin/java", "-cp", os.pathsep.join([str(self.root), classpath]),
-                                      "ScheduleCheck", self.root, request, response)
+                result, response = self.dispatch_batch(self.block_entity_record(21, x))
                 if x == -4:
                     payload = struct.pack("<Biiiib", 2, x, 70, 18, 12, 0)
                     self.assertEqual(response.read_bytes(), frame(op(2, payload)))
                     self.assertEqual(self.checked(self.codec, response).strip(), "accepted 1")
-                    response.unlink()
                 else:
-                    self.assertIn("schedule batch rolled back", result)
+                    self.assertIn("S3 batch rolled back", result)
                     self.assertFalse(response.exists())
+
+    def test_block_entity_ticker_marks_only_the_active_view(self):
+        record = self.block_entity_record(22, -4)
+        _, response = self.dispatch_batch(record, record, self.block_entity_record(22, -4, activation=0))
+        payload = struct.pack("<Biiiib", 2, -4, 70, 18, 12, 0)
+        self.assertEqual(response.read_bytes(), frame(op(2, payload), op(2, payload, source=1)))
+
+        stdout, response = self.dispatch_batch(record, self.block_entity_record(22, -3))
+        self.assertIn("S3 batch rolled back", stdout)
+        self.assertFalse(response.exists())
 
     def test_shimcheck_rejects_direct_calls_to_the_legacy_native_host(self):
         jar = self.pack_mod("HostCaller", """

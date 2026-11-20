@@ -189,6 +189,37 @@ import net.neoforged.neoforge.event.tick.ServerTickEvent;
   }
 }
 ''',
+            "testmod/BlockEntityConfigurationMod.java": '''package testmod;
+import net.minecraft.core.BlockPos;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.BlockEntityTicker;
+import net.minecraft.world.level.block.entity.BlockEntityType;
+import net.minecraft.world.level.block.state.BlockState;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.neoforge.capabilities.BlockCapability;
+import net.neoforged.neoforge.capabilities.ICapabilityProvider;
+import net.neoforged.neoforge.capabilities.RegisterCapabilitiesEvent;
+import net.neoforged.neoforge.network.handling.IPayloadHandler;
+import net.neoforged.neoforge.network.registration.PayloadRegistrar;
+@Mod("testmod") public class BlockEntityConfigurationMod {
+  void tick(BlockEntityTicker<BlockEntity> ticker, Level level, BlockPos pos, BlockState state, BlockEntity entity) {
+    ticker.tick(level, pos, state, entity);
+    entity.setChanged();
+  }
+  <T, C> void register(RegisterCapabilitiesEvent event, BlockCapability<T,C> cap, BlockEntityType<BlockEntity> type,
+      ICapabilityProvider<BlockEntity,C,T> provider) {
+    event.registerBlockEntity(cap, type, provider);
+  }
+  <T extends CustomPacketPayload> void configure(PayloadRegistrar registrar, CustomPacketPayload.Type<T> type,
+      StreamCodec<FriendlyByteBuf,T> codec, IPayloadHandler<T> handler) {
+    registrar.configurationToClient(type, codec, handler).configurationToServer(type, codec, handler);
+  }
+}
+''',
             "net/minecraft/unsupported/MissingApi.java": '''package net.minecraft.unsupported;
 public class MissingApi { public static void absent() {} }
 ''',
@@ -431,6 +462,28 @@ public @interface Redirect { String method(); At at(); }
         self.assertEqual(report["jars"][1]["unsupportedSymbols"], [
             "net/minecraft/world/level/Level#isOutsideBuildHeight(Lnet/minecraft/core/BlockPos;)Z",
         ])
+
+    def test_block_entity_and_configuration_entry_points_have_exact_descriptors(self):
+        proc, report = self.invoke(self.fixture(name="BlockEntityConfigurationMod"))
+        self.assertEqual(proc.returncode, 0, (proc.stderr, report))
+        row = report["jars"][0]
+        self.assertEqual(row["status"], "COMPATIBLE")
+        self.assertEqual(row["unsupportedSymbols"], [])
+        block_entity = "net/minecraft/world/level/block/entity/BlockEntity"
+        capabilities = "net/neoforged/neoforge/capabilities/"
+        registrar = "net/neoforged/neoforge/network/registration/PayloadRegistrar"
+        payload = ("(Lnet/minecraft/network/protocol/common/custom/CustomPacketPayload$Type;"
+                   "Lnet/minecraft/network/codec/StreamCodec;"
+                   "Lnet/neoforged/neoforge/network/handling/IPayloadHandler;)")
+        self.assertTrue({
+            f"{block_entity}#setChanged()V",
+            f"{block_entity}Ticker#tick(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;"
+            f"Lnet/minecraft/world/level/block/state/BlockState;L{block_entity};)V",
+            f"{capabilities}RegisterCapabilitiesEvent#registerBlockEntity("
+            f"L{capabilities}BlockCapability;L{block_entity}Type;L{capabilities}ICapabilityProvider;)V",
+            f"{registrar}#configurationToClient{payload}L{registrar};",
+            f"{registrar}#configurationToServer{payload}L{registrar};",
+        } <= set(row["supportedSymbols"]), row)
 
     def test_client_only_subscriber_is_excluded(self):
         proc, result = self.invoke(self.fixture(include_client=True))

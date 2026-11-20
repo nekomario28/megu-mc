@@ -12,6 +12,8 @@ import java.util.Objects;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.BlockEntityTicker;
 import net.minecraft.world.level.block.state.BlockState;
 
 /** Java endpoint of the S3 owner-thread tick batch. See the adapter README for the ABI. */
@@ -57,6 +59,16 @@ public final class DirectBatchBridge {
             .add(Objects.requireNonNull(callback));
     }
 
+    /** Register a ticker for the bridge's block entity view of an S3 kind. */
+    public static void registerBlockEntityTicker(int kind, BlockEntityTicker<? super BlockEntityHandle> ticker) {
+        Objects.requireNonNull(ticker);
+        register(Activation.BLOCK_ENTITY_TICK, kind, context -> {
+            Level level = context.level();
+            BlockPos pos = new BlockPos(context.x(), context.y(), context.z());
+            ticker.tick(level, pos, level.getBlockState(pos), context.blockEntity());
+        });
+    }
+
     static synchronized void freezeRegistration() {
         registrations.replaceAll((key, callbacks) -> List.copyOf(callbacks));
         registry = new Registry(registering, Map.copyOf(registrations));
@@ -98,9 +110,12 @@ public final class DirectBatchBridge {
         public int generation() { return context.checked().generation; }
     }
 
-    public static final class BlockEntityHandle {
+    public static final class BlockEntityHandle extends BlockEntity {
         private final TickContext context;
         private BlockEntityHandle(TickContext context) { this.context = context; }
+        @Override protected void checkActivation() { context.checked(); }
+        @Override public Level getLevel() { return context.level(); }
+        public boolean dirty() { return isDirty(); }
         public int dim() { return context.checked().dim; }
         public int kind() { return context.checked().kind; }
         public int id() { return context.checked().id; }
@@ -112,6 +127,7 @@ public final class DirectBatchBridge {
         private final Input input;
         private final int index;
         private Level level;
+        private BlockEntityHandle blockEntity;
 
         private TickContext(Batch batch, Input input, int index) {
             this.batch = batch;
@@ -155,7 +171,8 @@ public final class DirectBatchBridge {
             if (activation != Activation.BLOCK_ENTITY_TICK && activation != Activation.CONTAINER) {
                 throw fail(batch, "S3 activation has no block entity handle");
             }
-            return new BlockEntityHandle(this);
+            if (blockEntity == null) blockEntity = new BlockEntityHandle(this);
+            return blockEntity;
         }
 
         /** Invoke the current activation's callbacks again within the same batch. */

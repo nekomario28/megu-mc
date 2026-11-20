@@ -7,6 +7,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.RegistryFriendlyByteBuf;
@@ -27,11 +28,14 @@ public final class S4NetworkBridge {
     private static final int CAPACITY = 256 * 1024;
     private static final int MAX_DEPTH = 4;
 
-    private record Registration<T extends CustomPacketPayload>(CustomPacketPayload.Type<T> type,
-            String version, StreamCodec<? super RegistryFriendlyByteBuf, T> codec,
-            IPayloadHandler<T> handler, boolean inbound, boolean outbound) {
+    private enum Phase { PLAY, CONFIGURATION }
+    private record Channel(Phase phase, ResourceLocation id) { }
+
+    private record Registration<T extends CustomPacketPayload, B extends FriendlyByteBuf>(
+            CustomPacketPayload.Type<T> type, String version, StreamCodec<? super B, T> codec,
+            Function<byte[], B> bufferFactory, IPayloadHandler<T> handler, boolean inbound, boolean outbound) {
         T decode(byte[] bytes) {
-            var buffer = new RegistryFriendlyByteBuf(bytes);
+            var buffer = bufferFactory.apply(bytes);
             try {
                 T value = codec.decode(buffer);
                 buffer.finish();
@@ -44,7 +48,7 @@ public final class S4NetworkBridge {
 
         @SuppressWarnings("unchecked")
         byte[] encode(CustomPacketPayload payload) {
-            var buffer = new RegistryFriendlyByteBuf(null);
+            var buffer = bufferFactory.apply(null);
             try {
                 codec.encode(buffer, (T) payload);
                 return buffer.finish();
@@ -59,7 +63,7 @@ public final class S4NetworkBridge {
         }
     }
 
-    private static final Map<ResourceLocation, Registration<?>> CHANNELS = new HashMap<>();
+    private static final Map<Channel, Registration<?, ?>> CHANNELS = new HashMap<>();
     private static volatile Thread owner;
     private static boolean registering;
     private static RuntimeException registrationFailure;
@@ -75,16 +79,28 @@ public final class S4NetworkBridge {
     public static <T extends CustomPacketPayload> void register(CustomPacketPayload.Type<T> type, String version,
             StreamCodec<? super RegistryFriendlyByteBuf, T> codec, IPayloadHandler<T> handler,
             boolean inbound, boolean outbound) {
+        register(Phase.PLAY, type, version, codec, RegistryFriendlyByteBuf::new, handler, inbound, outbound);
+    }
+
+    public static <T extends CustomPacketPayload> void registerConfiguration(CustomPacketPayload.Type<T> type,
+            String version, StreamCodec<? super FriendlyByteBuf, T> codec, IPayloadHandler<T> handler,
+            boolean inbound, boolean outbound) {
+        register(Phase.CONFIGURATION, type, version, codec, FriendlyByteBuf::new, handler, inbound, outbound);
+    }
+
+    private static <T extends CustomPacketPayload, B extends FriendlyByteBuf> void register(
+            Phase phase, CustomPacketPayload.Type<T> type, String version, StreamCodec<? super B, T> codec,
+            Function<byte[], B> bufferFactory, IPayloadHandler<T> handler, boolean inbound, boolean outbound) {
         if (Thread.currentThread() != owner || !registering) throw fail("S4 payload registration is closed");
         try {
             var id = type.id();
             if (id.toString().length() > MAX_CHANNEL || id.getNamespace().equals("minecraft")) {
                 throw fail("Invalid S4 channel " + id);
             }
-            var entry = new Registration<>(type, version, Objects.requireNonNull(codec),
+            var entry = new Registration<>(type, version, Objects.requireNonNull(codec), bufferFactory,
                 Objects.requireNonNull(handler), inbound, outbound);
-            if (CHANNELS.putIfAbsent(id, entry) != null) {
-                throw fail("Duplicate S4 channel " + id + " (version " + version + ")");
+            if (CHANNELS.putIfAbsent(new Channel(phase, id), entry) != null) {
+                throw fail("Duplicate S4 channel " + id + " in " + phase + " (version " + version + ")");
             }
         } catch (RuntimeException error) {
             registrationFailure = error;
@@ -114,10 +130,10 @@ public final class S4NetworkBridge {
         return new IllegalStateException(message);
     }
 
-    private static Registration<?> registration(ResourceLocation id, boolean inbound) {
-        var registration = CHANNELS.get(id);
+    private static Registration<?, ?> registration(Phase phase, ResourceLocation id, boolean inbound) {
+        var registration = CHANNELS.get(new Channel(phase, id));
         if (registration == null || !(inbound ? registration.inbound : registration.outbound)) {
-            throw fail("Unregistered S4 " + (inbound ? "C2S" : "S2C") + " channel " + id);
+            throw fail("Unregistered S4 " + (inbound ? "C2S" : "S2C") + " channel " + id + " in " + phase);
         }
         return registration;
     }
@@ -142,6 +158,7 @@ public final class S4NetworkBridge {
     }
 
     private static final class Dispatch implements IPayloadContext {
+        final Phase phase;
         final ServerPlayer player;
         final ByteBuffer output = ByteBuffer.allocate(CAPACITY).order(ByteOrder.LITTLE_ENDIAN);
         int count;
@@ -149,7 +166,8 @@ public final class S4NetworkBridge {
         boolean encoding;
         boolean failed;
 
-        Dispatch(ServerPlayer player) {
+        Dispatch(Phase phase, ServerPlayer player) {
+            this.phase = phase;
             this.player = player;
             output.putInt(MAGIC).putShort((short) 0);
         }
@@ -159,7 +177,7 @@ public final class S4NetworkBridge {
         }
 
         void append(Integer target, CustomPacketPayload payload) {
-            var entry = registration(payload.type().id(), false);
+            var entry = registration(phase, payload.type().id(), false);
             if (!entry.type.equals(payload.type())) throw fail("S4 outgoing payload type mismatch");
             byte[] channel = entry.type.id().toString().getBytes(StandardCharsets.US_ASCII);
             byte[] bytes = entry.encode(payload);
@@ -176,7 +194,7 @@ public final class S4NetworkBridge {
             if (depth == MAX_DEPTH || encoding) throw fail("S4 payload dispatch depth exceeds 4 or codec is active");
             depth++;
             try {
-                registration(payload.type().id(), true).handle(payload, this);
+                registration(phase, payload.type().id(), true).handle(payload, this);
             } catch (RuntimeException | Error error) {
                 failed = true;
                 throw error;
@@ -211,6 +229,15 @@ public final class S4NetworkBridge {
     }
 
     private static byte[] dispatch(byte[] frame, int playerEid, String playerName) {
+        return dispatch(Phase.PLAY, frame, playerEid, playerName);
+    }
+
+    // The host selects the protocol phase. Payload frames carry no phase selector.
+    private static byte[] dispatchConfiguration(byte[] frame, int playerEid, String playerName) {
+        return dispatch(Phase.CONFIGURATION, frame, playerEid, playerName);
+    }
+
+    private static byte[] dispatch(Phase phase, byte[] frame, int playerEid, String playerName) {
         if (Thread.currentThread() != owner || registering || ACTIVE.get() != null) {
             throw fail("S4 dispatch requires the frozen JVM owner outside another dispatch");
         }
@@ -232,10 +259,10 @@ public final class S4NetworkBridge {
         if (length < 0 || length > FriendlyByteBuf.MAX_PAYLOAD || length != input.remaining()) {
             throw fail("Truncated or oversized S4 payload frame");
         }
-        var entry = registration(id, true);
+        var entry = registration(phase, id, true);
         byte[] bytes = new byte[length];
         input.get(bytes);
-        var dispatch = new Dispatch(new ServerPlayer(playerEid, playerName));
+        var dispatch = new Dispatch(phase, new ServerPlayer(playerEid, playerName));
         ACTIVE.set(dispatch);
         try {
             dispatch.invoke(entry.decode(bytes));

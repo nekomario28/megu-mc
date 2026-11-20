@@ -20,7 +20,7 @@ public class FriendlyByteBuf {
     private boolean failed;
     private boolean closed;
 
-    protected FriendlyByteBuf(byte[] input) {
+    public FriendlyByteBuf(byte[] input) {
         if (input != null && input.length > MAX_PAYLOAD) throw new IllegalArgumentException("Oversized S4 payload");
         this.input = input == null ? null : ByteBuffer.wrap(input);
         output = input == null ? new ByteArrayOutputStream() : null;

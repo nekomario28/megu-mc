@@ -30,6 +30,25 @@ class AuditTest(unittest.TestCase):
         self.assertIn(member, row[matching])
         self.assertNotIn(member, row[other])
 
+    def assert_diagnostics(self, fixture, expected):
+        self.assertCountEqual(
+            [(reason["code"], reason["symbol"], reason["detail"])
+             for reason in self.fixtures[fixture]["diagnostics"]],
+            expected,
+        )
+
+    def test_all_non_mixin_neoforge_patterns_are_compatible(self):
+        for name, members, classes in (("gameplay", 8, 9), ("content", 12, 14),
+                                       ("automation", 10, 17), ("network", 12, 16)):
+            with self.subTest(fixture=name):
+                row = self.fixtures[name]
+                self.assertEqual(row["status"], "COMPATIBLE")
+                self.assertEqual(len(row["supported_members"]), members)
+                self.assertEqual(len(row["supported_classes"]), classes)
+                self.assertEqual(row["unsupported_members"], [])
+                self.assertEqual(row["unsupported_classes"], [])
+                self.assertEqual(row["diagnostics"], [])
+
     def test_content_passes_with_exact_method_and_field_descriptors(self):
         content = self.fixtures["content"]
         self.assertEqual(content["status"], "COMPATIBLE")
@@ -76,35 +95,64 @@ class AuditTest(unittest.TestCase):
                                       "(Lnet/minecraft/resources/ResourceKey;)Lnet/minecraft/resources/ResourceKey;",
                                       supported=True)
 
-    def test_automation_and_network_keep_unbacked_entry_points_closed(self):
-        self.assertEqual(self.fixtures["automation"]["status"], "REJECTED")
-        self.assertEqual({member[1] for member in self.fixtures["automation"]["unsupported_members"]},
-                         {"setChanged", "tick", "registerBlockEntity"})
-        self.assertEqual(self.fixtures["network"]["status"], "REJECTED")
-        self.assertEqual([member[1] for member in self.fixtures["network"]["unsupported_members"]],
-                         ["configurationToClient"])
+    def test_block_entity_and_configuration_gaps_are_closed_at_exact_descriptors(self):
+        block_entity = "net/minecraft/world/level/block/entity/BlockEntity"
+        capabilities = "net/neoforged/neoforge/capabilities/"
+        registrar = "net/neoforged/neoforge/network/registration/PayloadRegistrar"
+        self.assert_method_classified("automation", block_entity, "setChanged", "()V", supported=True)
+        self.assert_method_classified(
+            "automation", block_entity + "Ticker", "tick",
+            "(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;"
+            f"Lnet/minecraft/world/level/block/state/BlockState;L{block_entity};)V",
+            supported=True,
+        )
+        self.assert_method_classified(
+            "automation", capabilities + "RegisterCapabilitiesEvent", "registerBlockEntity",
+            f"(L{capabilities}BlockCapability;L{block_entity}Type;L{capabilities}ICapabilityProvider;)V",
+            supported=True,
+        )
+        self.assert_method_classified(
+            "network", registrar, "configurationToClient",
+            "(Lnet/minecraft/network/protocol/common/custom/CustomPacketPayload$Type;"
+            "Lnet/minecraft/network/codec/StreamCodec;"
+            f"Lnet/neoforged/neoforge/network/handling/IPayloadHandler;)L{registrar};",
+            supported=True,
+        )
 
     def test_declared_transform_diagnostics_distinguish_config_injections_and_at(self):
-        transforms = self.fixtures["transforms"]
-        reasons = {(reason["code"], reason["symbol"]) for reason in transforms["diagnostics"]}
-        for injection in ("ModifyVariable", "Overwrite", "Redirect"):
-            self.assertIn(
-                ("UNSUPPORTED_MIXIN_INJECTION", f"auditfixture/transforms/WorldMixin @{injection}"), reasons,
-            )
-        self.assertEqual({symbol for code, symbol in reasons if code == "UNSUPPORTED_MIXIN_AT"},
-                         {f"auditfixture/transforms/WorldMixin @At({point})" for point in ("INVOKE", "STORE")})
-        self.assertIn(("UNSUPPORTED_MIXIN_CONFIG", "hooks.mixins.json"), reasons)
+        mixin = "auditfixture/transforms/WorldMixin"
+        self.assert_diagnostics("transforms", [
+            ("UNSUPPORTED_ACCESS_TRANSFORMER", "META-INF/accesstransformer.cfg",
+             "Access transformers are unsupported in S0"),
+            *(("UNSUPPORTED_MIXIN_AT", f"{mixin} @At({point})", "Unsupported injection point")
+              for point in ("INVOKE", "STORE")),
+            *(("UNSUPPORTED_MIXIN_CONFIG", config, "No mixin transformer in S0")
+              for config in ("hooks.mixins.json", "transforms.mixins.json")),
+            *(("UNSUPPORTED_MIXIN_INJECTION", f"{mixin} @{injection}", "Unsupported S0 injection")
+              for injection in ("ModifyVariable", "Overwrite", "Redirect")),
+        ])
 
     def test_fabric_reports_current_metadata_and_side_coverage_boundary(self):
         fabric = self.fixtures["fabric"]
+        self.assertEqual(fabric["status"], "REJECTED")
         self.assertIn("fabric.mod.json", fabric["resources"])
         self.assertIn("fabric.mixins.json", fabric["resources"])
-        self.assertIn("MISSING_METADATA", {reason["code"] for reason in fabric["diagnostics"]})
-        self.assertIn("net/minecraft/class_310", fabric["unsupported_classes"])
-        self.assertIn(
-            ["net/minecraft/class_1937", "method_27983", "()Lnet/minecraft/class_5321;"],
-            fabric["unsupported_members"],
-        )
+        self.assertEqual(fabric["client_classes"], [])
+        self.assertEqual(fabric["unsupported_classes"],
+                         ["net/minecraft/class_1937", "net/minecraft/class_310", "net/minecraft/class_5321"])
+        self.assertEqual(fabric["unsupported_members"],
+                         [["net/minecraft/class_1937", "method_27983", "()Lnet/minecraft/class_5321;"]])
+        self.assert_diagnostics("fabric", [
+            ("MISSING_METADATA", "META-INF/neoforge.mods.toml", "Missing NeoForge metadata"),
+            *(("UNSUPPORTED_SYMBOL", symbol, f"Referenced from auditfixture/fabric/{owner}")
+              for symbol, owner in [
+                  ("net/minecraft/class_1937", "FabricMixin"),
+                  ("net/minecraft/class_1937", "FabricServer"),
+                  ("net/minecraft/class_1937#method_27983()Lnet/minecraft/class_5321;", "FabricServer"),
+                  ("net/minecraft/class_310", "FabricClient"),
+                  ("net/minecraft/class_5321", "FabricServer"),
+              ]),
+        ])
 
     def test_reports_both_explicit_and_conventional_at_resources(self):
         for name in ("implicit_at", "transforms"):
@@ -114,6 +162,10 @@ class AuditTest(unittest.TestCase):
             self.assertEqual([reason["symbol"] for reason in row["diagnostics"]
                               if reason["code"] == "UNSUPPORTED_ACCESS_TRANSFORMER"],
                              ["META-INF/accesstransformer.cfg"])
+        self.assert_diagnostics("implicit_at", [
+            ("UNSUPPORTED_ACCESS_TRANSFORMER", "META-INF/accesstransformer.cfg",
+             "Access transformers are unsupported in S0"),
+        ])
 
     def test_member_totals_deduplicate_across_jars_without_losing_each_report(self):
         location = ["net/minecraft/resources/ResourceLocation", "fromNamespaceAndPath",
