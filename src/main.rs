@@ -3558,46 +3558,12 @@ fn keepalive_time_tick() {
         }
         __t = __prof.then(std::time::Instant::now);
     }
-    // night spawn cycle: dark hours -> hostiles near players (cap 12).
-    // The count must cover every spawned hostile etype — counting only
-    // zombies/creepers let skeletons and spiders accrete without bound
-    // (hostiles never despawn here).
     if GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1
         && DIFFICULTY.load(Ordering::Relaxed) != 0
         && t % server_ticks(SPAWN_CYCLE_GT) == server_ticks(SPAWN_CYCLE_GT) / 2
         && (13000..=23000).contains(&wt)
     {
-        let mcount = mobs()
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|m| matches!(m.etype, 124 | 23 | 91 | 100))
-            .count();
-        if mcount < 12 {
-            if let Some(((nx, ny, nz), attempt)) = nightly_hostile_spawn_position(t) {
-                let biome = worldgen::biome_name_at_block(
-                    nx.floor() as i32,
-                    ny.floor() as i32,
-                    nz.floor() as i32,
-                );
-                let et = spawn_etype_for_biome(biome.as_deref(), attempt);
-                let m = Arc::new(Mob {
-                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                    uuid: [0u8; 16],
-                    etype: et,
-                    pos: Mutex::new((nx, ny, nz, 0.0, 0.0)),
-                    hp: Mutex::new(20.0),
-                    last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                    hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                    last_hurt_tick: Mutex::new(None),
-                    vel: Mutex::new([0.0; 3]),
-                    fuse: Mutex::new(0),
-                    love: Mutex::new(0),
-                    air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
-                });
-                mobs().lock().unwrap().push(m);
-            }
-        }
+        spawn_nightly_hostile(t);
     }
     {
         // fishing bobbers: fly, land on water, bite after 3-7 s

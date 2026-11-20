@@ -4902,6 +4902,74 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
     assert_eq!(attempt(&[high_anchor, at_128]), Some(pos), "128 blocks is in range");
 }
 
+#[test]
+fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+
+    let y = surface_y(0, 0);
+    let host = (DimId::Overworld, false, 0.5);
+    let solo = [host];
+    let same_chunk = [host, (DimId::Overworld, false, 1.5)];
+    // Crossing the zero boundary puts these players in neighboring chunks
+    // without either player entering the other's 24-block exclusion radius.
+    let adjacent = [host, (DimId::Overworld, false, -0.5)];
+    let disjoint = [host, (DimId::Overworld, false, 272.5)];
+    let spectator = [host, (DimId::Overworld, true, 272.5)];
+    let nether = [host, (DimId::Nether, false, 272.5)];
+    let zombie = name_to_etype("zombie").unwrap();
+    let witch = name_to_etype("witch").unwrap();
+    let cow = name_to_etype("cow").unwrap();
+    let scenarios: [(&str, &[_], i64, usize, bool); 11] = [
+        ("one below the solo cap", &solo, zombie, 69, true),
+        ("solo cap counts witches", &solo, witch, 70, false),
+        ("same-chunk overlap keeps the solo cap", &same_chunk, witch, 70, false),
+        ("one below the adjacent cap", &adjacent, zombie, 73, true),
+        ("at the adjacent cap", &adjacent, witch, 74, false),
+        ("one below the disjoint cap", &disjoint, zombie, 139, true),
+        ("at the disjoint cap", &disjoint, witch, 140, false),
+        ("passive mobs leave room for monsters", &solo, cow, 70, true),
+        ("the hard runtime limit still applies", &solo, cow, MOB_CAP, false),
+        ("spectators do not expand the cap", &spectator, witch, 70, false),
+        ("Nether players do not expand the cap", &nether, witch, 70, false),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, audience, kind, existing, spawn) in scenarios {
+        let players: Vec<_> = audience
+            .iter()
+            .map(|&(dim, spectator, x)| {
+                let (client, peer) = client_pair();
+                *client.dim.lock().unwrap() = dim;
+                *client.gm.lock().unwrap() = if spectator { 3 } else { 0 };
+                *client.pos.lock().unwrap() = (x, y, 0.5, 0.0, 0.0, true);
+                (Arc::new(client), peer)
+            })
+            .collect();
+        *clients().lock().unwrap() = players.iter().map(|(client, _)| client.clone()).collect();
+        *mobs().lock().unwrap() = (0..existing)
+            .map(|i| test_mob(20_000 + i as i32, kind, (0.5, y, 0.5), 20.0))
+            .collect();
+        SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
+        TICK.store(server_ticks(SPAWN_CYCLE_GT) / 2, Ordering::Relaxed);
+        WORLD_TIME.store(13000, Ordering::Relaxed);
+        keepalive_time_tick();
+
+        let actual = mobs().lock().unwrap().len();
+        let expected = existing + usize::from(spawn);
+        if actual != expected {
+            failures.push(format!("{name}: expected {expected}, got {actual}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} live monster-cap scenarios failed: {failures:?}",
+        failures.len(),
+        scenarios.len(),
+    );
+}
+
 /// A deterministic yardstick for the chunk delivery path, with no socket in the loop.
 ///
 /// The end-to-end numbers on this host swing by 2-3x between runs (other lanes), and the
@@ -7536,7 +7604,7 @@ impl std::ops::Drop for Travel4dWorld {
     }
 }
 
-fn travel_4d_mob(eid: i32, etype: i64, pos: (f64, f64, f64), hp: f32) -> Arc<Mob> {
+fn test_mob(eid: i32, etype: i64, pos: (f64, f64, f64), hp: f32) -> Arc<Mob> {
     Arc::new(Mob {
         eid,
         uuid: [0u8; 16],
@@ -7945,8 +8013,8 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
     let (dummy, _rx) = client_pair();
     *clients().lock().unwrap() = vec![Arc::new(dummy)];
 
-    let spider = travel_4d_mob(9501, 100, (2.5, 64.0, 2.5), 16.0);
-    let blaze = travel_4d_mob(9502, 8, (6.5, 59.5, 6.5), 20.0);
+    let spider = test_mob(9501, 100, (2.5, 64.0, 2.5), 16.0);
+    let blaze = test_mob(9502, 8, (6.5, 59.5, 6.5), 20.0);
     mobs()
         .lock()
         .unwrap()
@@ -8031,7 +8099,7 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
 
     // Leaving the fluid clears the stored deltaMovement (the non-fluid branch's friction). A
     // high, dry column keeps this independent of whatever another test did to the overlay.
-    let dry = travel_4d_mob(9503, 8, (6.5, 120.0, 6.5), 20.0);
+    let dry = test_mob(9503, 8, (6.5, 120.0, 6.5), 20.0);
     *dry.vel.lock().unwrap() = [0.0, -0.025, 0.0];
     let mut dry_pos = *dry.pos.lock().unwrap();
     assert!(
