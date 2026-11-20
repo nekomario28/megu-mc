@@ -2,6 +2,24 @@
 # Everything that has to pass before a commit. This was six commands typed by hand
 # each time, which is six chances to skip one.
 set -euo pipefail
+
+without_mutations=0
+case "${1:-}" in
+  "") ;;
+  --without-mutations)
+    without_mutations=1
+    shift
+    ;;
+  *)
+    echo "usage: $0 [--without-mutations]" >&2
+    exit 2
+    ;;
+esac
+if (($# != 0)); then
+  echo "usage: $0 [--without-mutations]" >&2
+  exit 2
+fi
+
 cd "$(dirname "$0")/.."
 mkdir -p target/tmp
 export TMPDIR="${TMPDIR:-$PWD/target/tmp}"
@@ -134,6 +152,10 @@ cargo check --offline --locked -j 2 --features neoforge-events
 # not a gate). It costs one extra run per caught mutant. The campaign copies the tree into a
 # private snapshot and builds in a private target, so this stage no longer touches the working
 # tree other stages may be reading.
-MUTATION_STABILITY=1 bash tools/mutation_check.sh --offline || exit 1
-
-echo "verify: PASS"
+if ((without_mutations)); then
+  echo "== full mutation campaign (not run: --without-mutations)"
+  echo "verify: PASS (full mutation campaign not run)"
+else
+  MUTATION_STABILITY=1 bash tools/mutation_check.sh --offline || exit 1
+  echo "verify: PASS"
+fi
