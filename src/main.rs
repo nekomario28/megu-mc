@@ -45,6 +45,10 @@ include!("entity_registry.rs");
 include!("mob_ai.rs");
 include!("natural_spawner.rs");
 include!("redstone.rs");
+include!("villager_raid.rs");
+include!("player_mechanisms.rs");
+include!("mob_behaviors.rs");
+include!("world_mechanisms.rs");
 
 // ---------- varint / wire ----------
 fn read_varint(b: &mut &[u8]) -> Option<i64> {
