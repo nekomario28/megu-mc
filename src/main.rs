@@ -6684,21 +6684,21 @@ fn materialize_generation_payloads_inner(
 }
 fn default_mob_hp(id: &str) -> f32 {
     let short = id.strip_prefix("minecraft:").unwrap_or(id);
-    match short {
-        "elder_guardian" => 80.0,
-        "witch" => 26.0,
-        "cat" | "cow" | "pig" => 10.0,
-        "shulker" => 30.0,
-        "evoker" | "vindicator" | "pillager" => 24.0,
-        "piglin" | "spider" | "magma_cube" => 16.0,
-        "piglin_brute" => 50.0,
-        "hoglin" => 40.0,
-        "iron_golem" => 100.0,
-        "cave_spider" => 12.0,
-        "silverfish" | "sheep" => 8.0,
-        "camel" => 32.0,
-        _ => 20.0,
+    if short == "magma_cube" {
+        return 16.0;
     }
+    if matches!(
+        short,
+        "elder_guardian" | "witch" | "cat" | "cow" | "pig" | "shulker"
+            | "evoker" | "vindicator" | "pillager" | "piglin" | "spider"
+            | "piglin_brute" | "hoglin" | "iron_golem" | "cave_spider"
+            | "silverfish" | "sheep" | "camel"
+    ) {
+        return entity_spec_by_name(id)
+            .map(|spec| spec.max_health)
+            .unwrap_or(20.0);
+    }
+    20.0
 }
 fn chests() -> &'static LockedMap<ContainerKey, HashMap<i16, Stack>> {
     CHESTS.get_or_init(|| Mutex::new(HashMap::new()))
