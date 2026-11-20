@@ -8779,7 +8779,17 @@ impl Gen {
         // The type name is a dispatch gate only: a false negative costs a optimisation, never
         // correctness, and a false positive is ruled out by the explicit call sites.
         let is_feature_driver = std::any::type_name_of_val(&populate).contains("feature::populate");
-        let gate = jobs > 1 && self.pop_region.is_none() && is_feature_driver;
+        // A3-a scratch generators copy `owner.starts_round`. With parallel terrain jobs but no
+        // shared round cache (the delivery default: `terrain_jobs()` is 8 while
+        // `delivery_prefetch_jobs()` is 1), every worker rebuilds structure starts and terrain
+        // answers on its own thread-local cache; E4-12 measured ~58-63 s for the first 81-chunk
+        // window. Only dispatch in parallel when a round is open. Batch worldgen / `perf_bench`
+        // open one for `--jobs 5/8`, so those stay parallel; the round-less delivery path runs
+        // the serial arm and keeps its tick-latency contract.
+        let gate = jobs > 1
+            && self.starts_round.is_some()
+            && self.pop_region.is_none()
+            && is_feature_driver;
 
         if gate && list.len() >= 2 {
             let mut pending: Vec<(i32, i32)> = Vec::with_capacity(list.len());
@@ -10631,6 +10641,7 @@ pub fn biome_debug(qx: i32, qy: i32, qz: i32) -> Option<(i64, [i64; 7])> {
 }
 
 /// Block-space biome name through the same quart lookup as the feature layer.
+#[cfg(test)]
 pub fn biome_name_at_block(x: i32, y: i32, z: i32) -> Option<String> {
     gen_lock().as_mut()?.biome_name_at(x, y, z)
 }
