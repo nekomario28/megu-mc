@@ -1,5 +1,21 @@
 use super::*;
 
+// Peel the independently optional trailers written after dimension data. Legacy saves have
+// neither marker, so these readers leave their payload untouched.
+fn strip_seed_and_brewing_footers(payload: &[u8]) -> Result<&[u8], &'static str> {
+    let (payload, _) = read_world_seed_footer(payload)?;
+    let (payload, _) = read_brewing_footer(payload)?;
+    Ok(payload)
+}
+
+fn payload_through_drop_owners_footer(payload: &[u8]) -> Result<&[u8], &'static str> {
+    let payload = strip_seed_and_brewing_footers(payload)?;
+    let (payload, _) = read_dim2_footer(payload)?;
+    let (payload, _, _) = read_dim_footer(payload)?;
+    let (payload, _) = read_block_loot_footer(payload)?;
+    Ok(payload)
+}
+
 // Round-trip fixtures. No real saved world exists for this repository, so the
 // MET2/MET3 consequences are pinned against the production encoder instead of
 // being skipped for lack of data. Observations are returned and asserted after
@@ -730,7 +746,11 @@ fn dro1_round_trip_preserves_drop_target_and_thrower_uuids() {
 
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    assert!(payload.ends_with(b"DRO1"), "save with drop owners must carry DRO1 footer");
+    let drop_footer_payload = payload_through_drop_owners_footer(&payload).unwrap();
+    assert!(
+        drop_footer_payload.ends_with(DROP_OWNERS_MAGIC),
+        "save with drop owners must carry DRO1 footer"
+    );
 
     drops().lock().unwrap().clear();
     load_world_from(&payload).unwrap();
@@ -743,8 +763,9 @@ fn dro1_round_trip_preserves_drop_target_and_thrower_uuids() {
 
     // Corrupting the DRO1 footer must be rejected cleanly.
     let mut bad = payload.clone();
-    let len = bad.len();
-    bad[len - 12..len - 4].copy_from_slice(&0u64.to_be_bytes());
+    let footer_end = drop_footer_payload.len();
+    bad[footer_end - DROP_OWNERS_FOOTER_LEN..footer_end - 4]
+        .copy_from_slice(&0u64.to_be_bytes());
     let corrupt_err = load_world_from(&bad).is_err();
 
     *world().lock().unwrap() = old_world;
@@ -1119,9 +1140,12 @@ fn p2_3_s2c_signs_stay_isolated_per_dimension_and_round_trip() {
             .any(|w| w == DIM_MAGIC),
         "a non-Overworld sign must produce a footer"
     );
-    let (legacy_region, footer_signs, footer_players) = read_dim_footer(&with_dims).unwrap();
+    let without_seed_or_brewing = strip_seed_and_brewing_footers(&with_dims).unwrap();
+    let (without_dim2, _) = read_dim2_footer(without_seed_or_brewing).unwrap();
+    let (legacy_region, footer_signs, footer_players) = read_dim_footer(without_dim2).unwrap();
+    let overworld_legacy = strip_seed_and_brewing_footers(&overworld_only).unwrap();
     assert_eq!(
-        legacy_region, overworld_only.as_slice(),
+        legacy_region, overworld_legacy,
         "a non-Overworld sign changed a byte of the legacy save"
     );
     assert!(footer_players.is_empty());
@@ -1336,7 +1360,9 @@ fn p2_3_s2d_pos_store_preserves_dimension_and_defaults_legacy_to_overworld() {
         full.windows(DIM_MAGIC.len()).any(|w| w == DIM_MAGIC),
         "a non-Overworld player must produce a footer"
     );
-    let (legacy, footer_signs, footer_players) = read_dim_footer(&full).unwrap();
+    let without_seed_or_brewing = strip_seed_and_brewing_footers(&full).unwrap();
+    let (without_dim2, _) = read_dim2_footer(without_seed_or_brewing).unwrap();
+    let (legacy, footer_signs, footer_players) = read_dim_footer(without_dim2).unwrap();
     assert!(footer_signs.is_empty());
     assert_eq!(footer_players.len(), 2);
     assert!(footer_players.iter().all(|(_, d)| *d != DimId::Overworld));
@@ -1604,7 +1630,8 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
     let mut with_dims = Vec::new();
     save_world_into(&mut with_dims);
     assert!(with_dims.windows(4).any(|w| w == DIM2_MAGIC));
-    let (legacy, dim2) = read_dim2_footer(&with_dims).unwrap();
+    let without_seed_or_brewing = strip_seed_and_brewing_footers(&with_dims).unwrap();
+    let (legacy, dim2) = read_dim2_footer(without_seed_or_brewing).unwrap();
     assert_eq!(dim2.chests.len(), 2);
     assert_eq!(dim2.furnaces.len(), 2);
     assert_eq!(dim2.crops.len(), 2);
@@ -1628,9 +1655,10 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
             .any(|w| w == DIM2_MAGIC),
         "an Overworld-only save must contain no DIM2 bytes"
     );
+    let overworld_legacy = strip_seed_and_brewing_footers(&overworld_only).unwrap();
     assert_eq!(
         legacy,
-        overworld_only.as_slice(),
+        overworld_legacy,
         "a non-Overworld entry changed a byte of the legacy save"
     );
 

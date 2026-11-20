@@ -25688,18 +25688,8 @@ fn resolve_bounded_selector(kind: char, args: &str, ctx: Option<&Arc<Client>>) -
         found.sort_by(|a, b| a.1.total_cmp(&b.1));
     }
     if kind == 'r' {
-        static SELECTOR_RANDOM: OnceLock<AtomicU64> = OnceLock::new();
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
-        let mut state = SELECTOR_RANDOM
-            .get_or_init(|| AtomicU64::new(seed ^ 0x9e3779b97f4a7c15))
-            .fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
         if !found.is_empty() {
-            let index = state.wrapping_mul(0x2545f4914f6cdd1d) as usize % found.len();
+            let index = (world_rng::next_u64() % found.len() as u64) as usize;
             found.swap(0, index);
         }
     }
