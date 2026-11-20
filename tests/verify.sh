@@ -3,6 +3,9 @@
 # each time, which is six chances to skip one.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+mkdir -p target/tmp
+export TMPDIR="${TMPDIR:-$PWD/target/tmp}"
+export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:--Djava.io.tmpdir=$TMPDIR -XX:-UsePerfData}"
 export PYTHONDONTWRITEBYTECODE=1
 # The wire tests generate spawn chunks before the play phase. On a shared host the
 # 10s default can expire under load without a code failure (observed: the mutation
@@ -52,6 +55,15 @@ python3 tests/port_triage_test.py
 python3 tests/structure_capture_test.py
 python3 tests/p0_2_audit_test.py
 python3 tests/public_export_test.py
+python3 tests/shimcheck_test.py
+python3 tests/neoforge_bootstrap_test.py
+python3 tests/neoforge_s1_events_test.py
+python3 tests/neoforge_s2_registry_test.py
+python3 tests/neoforge_s3_batch_test.py
+python3 tests/neoforge_s4_network_test.py
+python3 tools/mod_compat_audit/test_audit.py
+python3 tests/fabric_shim_test.py
+python3 tests/client_launcher_test.py
 
 echo "== module layering"
 python3 tests/layers_gate_test.py
@@ -85,7 +97,11 @@ done
 
 echo "== wire smoke"
 build_manifest=$(mktemp)
-trap 'rm -f "$build_manifest"' EXIT
+cleanup_verify_artifacts() {
+  rm -f "$build_manifest"
+  rm -rf client-port/target client-kernel/target
+}
+trap cleanup_verify_artifacts EXIT
 cargo build --offline --locked -j 2 --message-format=json-render-diagnostics >"$build_manifest"
 binary=$(python3 tools/cargo_executable.py <"$build_manifest")
 timeout 180 python3 tests/wire_smoke.py "$binary"
@@ -96,6 +112,15 @@ timeout 180 python3 tests/m2_gameplay_wire.py "$binary"
 timeout 180 python3 tests/container_wire.py "$binary"
 timeout 180 python3 tests/population_plan_test.py "$binary"
 timeout 180 python3 tests/mineshaft_dispatch_test.py "$binary"
+timeout 180 python3 tests/gp5_gp7_wire.py "$binary"
+timeout 180 python3 tests/gp3_gp4_gp5_wire.py "$binary"
+timeout 180 python3 tests/gp1_gp6_wire.py "$binary"
+timeout 180 python3 tests/command_brigadier_ops_wire.py "$binary"
+timeout 180 python3 tests/command_datapack_wire.py
+timeout 180 python3 tests/client_prediction_wire.py --binary "$binary"
+timeout 180 python3 tests/client_kernel_wire.py "$binary"
+timeout 180 python3 tests/client_mesh_wire.py
+timeout 180 python3 tests/client_vanilla_parity.py
 
 echo "== adapter checks"
 cargo check --offline --locked -j 2 --features fabric-probe
