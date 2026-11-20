@@ -221,7 +221,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 7. **GP-6（残存 Mob 群のグループ別実装：Nether / End / 水棲 / 中立・ペット / ボス）**:
    - `GP-0` + `GP-1` の上に、Nether 系（Blaze・Ghast・Piglin 物々交換・Hoglin・Wither Skeleton・Strider）、End 系（Enderman テレポート・Shulker 浮遊弾・Ender Dragon 柱/第2形態）、水棲/空/ペット（Drowned・Guardian・Phantom・Wolf/Cat テイム・Horse 騎乗・Bee/Axolotl）、大型ボス（Wither・Warden 振動/Sonic Boom）および乗物（Boat / Minecart 物理拡張）をグループ単位で接続し、それぞれ 1.21.1 実クラスと挙動・ドロップを照合する。
 8. **GP-7（進捗 Advancements・スコアボード・ワールドボーダー・残存コマンド）**:
-   - `/fill`・`/clone`・`/execute`・`/scoreboard`・`/advancement`・`/worldborder`・`/locate`・`/spreadplayers`・`/damage` 等の未実装コマンド群、ワールドボーダー縮小・ダメージ、および進捗トリガ配信（`0x76` Update Advancements）を完成させる。
+   - `/fill`・`/clone`・`/execute`・`/scoreboard`・`/advancement`・`/worldborder`・`/locate`・`/spreadplayers`・`/damage` 等の未実装コマンド群、ワールドボーダー縮小・ダメージ、および進捗トリガ配信（`0x74` Update Advancements）を完成させる。
 
 **出口:** M2（遊べる基本セッション）から M4（準拠：全 130 エンティティ・レッドストーン回路・村人取引・高度プレイヤー機構・主要コマンド）までの機能ギャップがすべて R7 配下の検証付き実装で埋まり、同一入力の Vanilla 1.21.1 対照で一致を確認できる。
 
