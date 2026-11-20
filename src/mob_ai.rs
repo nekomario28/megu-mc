@@ -607,7 +607,7 @@ impl GoalSelector {
             }
         }
         for index in 0..self.goals.len() {
-            if self.goals[index].running || !self.goals[index].goal.can_use(ctx) {
+            if self.goals[index].running {
                 continue;
             }
             let priority = self.goals[index].goal.priority();
@@ -622,6 +622,9 @@ impl GoalSelector {
             if conflicting.iter().any(|&i| {
                 self.goals[i].goal.priority() <= priority || !self.goals[i].goal.is_interruptable()
             }) {
+                continue;
+            }
+            if !self.goals[index].goal.can_use(ctx) {
                 continue;
             }
             for i in conflicting {
@@ -1506,6 +1509,7 @@ mod mob_ai_tests {
             self.flags
         }
         fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
+            self.events.borrow_mut().push(format!("{} can_use", self.id));
             !self.needs_fire || ctx.on_fire
         }
         fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
@@ -1577,6 +1581,23 @@ mod mob_ai_tests {
         );
         selector.stop_all(&ctx);
         assert_eq!(selector.running_count(), 0);
+    }
+
+    #[test]
+    fn selector_does_not_evaluate_blocked_goal_can_use() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut selector = GoalSelector::default();
+        selector.add_goal(traced("blocking", 0, GoalFlags::MOVE, true, true, &events));
+        selector.add_goal(traced("waiting", 1, GoalFlags::MOVE, true, false, &events));
+        let mut ctx = GoalContext {
+            on_fire: true,
+            ..GoalContext::default()
+        };
+        selector.tick(&ctx);
+        assert!(!events.borrow().iter().any(|event| event == "waiting can_use"));
+        ctx.on_fire = false;
+        selector.tick(&ctx);
+        assert!(events.borrow().iter().any(|event| event == "waiting start"));
     }
 
     #[test]
