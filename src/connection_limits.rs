@@ -17,8 +17,130 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
-use std::sync::{atomic::{AtomicU64, Ordering}, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
 use std::time::{Duration, Instant};
+
+// ----------------------------------------------------------- protocol codecs
+
+/// Login packet 0x03 payload; send before enabling compressed framing.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn set_compression(threshold: i32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    crate::write_varint(&mut payload, i64::from(threshold));
+    payload
+}
+
+/// Frame a packet (including its packet ID) after compression is enabled.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn encode_compressed_frame(raw: &[u8], threshold: usize) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut body = Vec::new();
+    if raw.len() < threshold {
+        crate::write_varint(&mut body, 0);
+        body.extend_from_slice(raw);
+    } else {
+        crate::write_varint(&mut body, raw.len() as i64);
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(raw)
+            .expect("writing to a Vec cannot fail");
+        body.extend_from_slice(&encoder.finish().expect("writing to a Vec cannot fail"));
+    }
+    let mut frame = Vec::new();
+    crate::write_varint(&mut frame, body.len() as i64);
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// Decode the frame body after its outer packet length has been removed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_compressed_frame(
+    mut body: &[u8],
+    threshold: usize,
+    max_uncompressed: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let length = crate::read_protocol_i32(&mut body)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or("invalid data length")?;
+    if length == 0 {
+        if body.len() >= threshold || body.len() > max_uncompressed {
+            return Err("invalid uncompressed packet length".into());
+        }
+        return Ok(body.to_vec());
+    }
+    if length < threshold || length > max_uncompressed {
+        return Err("invalid compressed packet length".into());
+    }
+    let decoder = flate2::read::ZlibDecoder::new(body);
+    let mut decoded = Vec::new();
+    decoder
+        .take(length as u64 + 1)
+        .read_to_end(&mut decoded)
+        .map_err(|e| format!("invalid zlib data: {e}"))?;
+    if decoded.len() != length {
+        return Err("uncompressed length mismatch".into());
+    }
+    Ok(decoded)
+}
+
+/// Returns None when any rounded delta cannot be represented; use teleport then.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn relative_move_delta(old: [f64; 3], new: [f64; 3]) -> Option<[i16; 3]> {
+    let mut result = [0; 3];
+    for i in 0..3 {
+        let delta = ((new[i] - old[i]) * 4096.0).round();
+        if !delta.is_finite() || delta < f64::from(i16::MIN) || delta > f64::from(i16::MAX) {
+            return None;
+        }
+        result[i] = delta as i16;
+    }
+    Some(result)
+}
+
+/// Payload for 0x2e or, with angles, 0x2f. Angles are protocol bytes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn entity_relative_move(
+    entity_id: i32,
+    delta: [i16; 3],
+    rotation: Option<(u8, u8)>,
+    on_ground: bool,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    crate::write_varint(&mut payload, i64::from(entity_id));
+    for component in delta {
+        payload.extend_from_slice(&component.to_be_bytes());
+    }
+    if let Some((yaw, pitch)) = rotation {
+        payload.extend_from_slice(&[yaw, pitch]);
+    }
+    payload.push(u8::from(on_ground));
+    payload
+}
+
+/// Payload for 0x30.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn entity_rotation(entity_id: i32, yaw: u8, pitch: u8, on_ground: bool) -> Vec<u8> {
+    let mut payload = Vec::new();
+    crate::write_varint(&mut payload, i64::from(entity_id));
+    payload.extend_from_slice(&[yaw, pitch, u8::from(on_ground)]);
+    payload
+}
+
+/// Payload for 0x49.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn entity_head_rotation(entity_id: i32, yaw: u8) -> Vec<u8> {
+    let mut payload = Vec::new();
+    crate::write_varint(&mut payload, i64::from(entity_id));
+    payload.push(yaw);
+    payload
+}
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // The guarded state is plain counters; a poisoned lock is still usable.
@@ -469,6 +591,57 @@ pub(crate) fn catch_panic<F: FnOnce()>(f: F) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn compression_frames_round_trip_and_reject_forged_lengths() {
+        for (raw, threshold) in [
+            (b"\x01hello".as_slice(), 10),
+            (b"\x01hello".as_slice(), 6),
+            (b"\x01hello".as_slice(), 0),
+        ] {
+            let frame = encode_compressed_frame(raw, threshold);
+            let mut body = frame.as_slice();
+            let length = crate::read_protocol_i32(&mut body).unwrap() as usize;
+            assert_eq!(length, body.len());
+            assert_eq!(decode_compressed_frame(body, threshold, 100).unwrap(), raw);
+        }
+        assert_eq!(set_compression(256), [0x80, 0x02]);
+        let frame = encode_compressed_frame(b"\x01hello", 6);
+        let mut body = frame.as_slice();
+        crate::read_protocol_i32(&mut body).unwrap();
+        let mut forged = body.to_vec();
+        forged[0] = 7;
+        assert!(decode_compressed_frame(&forged, 6, 100).is_err());
+        forged[0] = 5;
+        assert!(decode_compressed_frame(&forged, 6, 100).is_err());
+        assert!(decode_compressed_frame(body, 6, 5).is_err());
+        assert!(decode_compressed_frame(&[0, 1, 2], 2, 100).is_err());
+        assert!(decode_compressed_frame(&[0, 1, 2], 3, 1).is_err());
+        assert!(decode_compressed_frame(&[0x80], 1, 100).is_err());
+        assert!(decode_compressed_frame(&body[..body.len() - 1], 6, 100).is_err());
+    }
+
+    #[test]
+    fn relative_movement_limits_and_payloads() {
+        let delta = relative_move_delta([0.0; 3], [-8.0, 1.5, 32767.0 / 4096.0]).unwrap();
+        assert_eq!(delta, [i16::MIN, 6144, i16::MAX]);
+        assert_eq!(relative_move_delta([0.0; 3], [8.0, 0.0, 0.0]), None);
+        assert_eq!(relative_move_delta([0.0; 3], [-8.001, 0.0, 0.0]), None);
+        assert_eq!(relative_move_delta([0.0; 3], [f64::NAN, 0.0, 0.0]), None);
+        assert_eq!(
+            entity_relative_move(300, delta, None, true),
+            [0xac, 0x02, 0x80, 0, 0x18, 0, 0x7f, 0xff, 1]
+        );
+        assert_eq!(
+            entity_relative_move(300, delta, Some((0xc0, 0x40)), false),
+            [0xac, 0x02, 0x80, 0, 0x18, 0, 0x7f, 0xff, 0xc0, 0x40, 0]
+        );
+        assert_eq!(
+            entity_rotation(300, 0xc0, 0x40, true),
+            [0xac, 0x02, 0xc0, 0x40, 1]
+        );
+        assert_eq!(entity_head_rotation(300, 0xc0), [0xac, 0x02, 0xc0]);
+    }
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
