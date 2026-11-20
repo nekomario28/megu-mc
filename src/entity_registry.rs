@@ -350,7 +350,7 @@ mod entity_registry_tests {
         ] {
             assert_eq!(spec(name).id, id);
         }
-        // The spawner allowlist has older, different dimensions for these mobs.
+        // These dimensions differed in the former spawner metadata table.
         for (name, size) in [
             ("blaze", (0.6, 1.8)),
             ("magma_cube", (0.52, 0.52)),

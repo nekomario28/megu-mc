@@ -43,53 +43,29 @@ fn limits(tag:&Tag,key:&str)->Result<[i32;2],&'static str>{
     if !(0..=15).contains(&min)||!(min..=15).contains(&max){return Err("invalid spawner custom light interval");}
     Ok([min,max])
 }
-/// One vanilla 1.21.1 spawner entity: the server's entity type, the
-/// `EntityType.<clinit>` bounding box, and the `MobCategory` serialized name
-/// the runtime gates natural spawning by. Insertion of the specific mob is the
-/// runtime world's `World::insert`; this table is the id allowlist and the
-/// dimensions/category reference.
-#[allow(dead_code)]
-struct SpawnerMob {
-    /// Mojang entity id, e.g. `minecraft:cave_spider`.
-    id: &'static str,
-    etype: i64,
-    width: f32,
-    height: f32,
-    category: &'static str,
-}
-
-/// Vanilla 1.21.1 mob ids a spawner may legally hold: the dungeon
-/// `monster_room` entries, the mineshaft cave-spider, the fortress blaze, the
-/// bastion magma cube, the stronghold silverfish, and the trial/general
-/// monsters. Anything outside this list is rejected, so an edited spawner can
-/// never resurrect an id the server cannot simulate.
-const SPAWNER_MOBS: &[SpawnerMob] = &[
-    SpawnerMob { id: "minecraft:zombie", etype: 124, width: 0.6, height: 1.95, category: "monster" },
-    SpawnerMob { id: "minecraft:skeleton", etype: 91, width: 0.6, height: 1.99, category: "monster" },
-    SpawnerMob { id: "minecraft:spider", etype: 100, width: 1.4, height: 0.9, category: "monster" },
-    SpawnerMob { id: "minecraft:cave_spider", etype: 16, width: 0.7, height: 0.5, category: "monster" },
-    SpawnerMob { id: "minecraft:blaze", etype: 8, width: 0.5, height: 1.7, category: "monster" },
-    SpawnerMob { id: "minecraft:magma_cube", etype: 67, width: 2.4, height: 0.9, category: "monster" },
-    SpawnerMob { id: "minecraft:silverfish", etype: 90, width: 0.3, height: 0.5, category: "monster" },
-    SpawnerMob { id: "minecraft:drowned", etype: 27, width: 0.6, height: 1.8, category: "monster" },
-    SpawnerMob { id: "minecraft:stray", etype: 102, width: 0.6, height: 1.99, category: "monster" },
-    SpawnerMob { id: "minecraft:husk", etype: 54, width: 0.6, height: 1.9, category: "monster" },
-    SpawnerMob { id: "minecraft:breeze", etype: 12, width: 0.7, height: 0.9, category: "monster" },
-    SpawnerMob { id: "minecraft:pig", etype: 77, width: 0.9, height: 0.9, category: "creature" },
+/// Namespaced entity IDs this port accepts in SpawnData.
+const SPAWNER_MOB_IDS: &[&str] = &[
+    "minecraft:zombie",
+    "minecraft:skeleton",
+    "minecraft:spider",
+    "minecraft:cave_spider",
+    "minecraft:blaze",
+    "minecraft:magma_cube",
+    "minecraft:silverfish",
+    "minecraft:drowned",
+    "minecraft:stray",
+    "minecraft:husk",
+    "minecraft:breeze",
+    "minecraft:pig",
 ];
 
 /// 1.21.1 `BaseSpawner` rejects edited spawners by id: this is the rejection
-/// for an entity id outside [`SPAWNER_MOBS`].
+/// for an entity id outside [`SPAWNER_MOB_IDS`].
 const UNSUPPORTED_SPAWN_ENTITY: &str = "unsupported spawner entity";
 
 /// 1.21.1 `BaseSpawner` rejects edited spawners by malformed potentials: this
 /// is the rejection for entries that are not valid weighted spawn data.
 const UNSUPPORTED_SPAWN_POTENTIALS: &str = "malformed spawner potentials";
-
-fn supported_spawner_mob(id: &NbtString) -> Option<&'static SpawnerMob> {
-    let name = id.to_utf8().ok()?;
-    SPAWNER_MOBS.iter().find(|m| m.id == name.as_str())
-}
 
 /// Validates the `entity` compound of a `SpawnData` entry: a supported 1.21.1
 /// mob id, and nothing but `id`/`Pos` fields in it.
@@ -97,7 +73,7 @@ fn validate_spawn_data_entity(entity: &Tag) -> Result<(), &'static str> {
     let Some(id) = entity.get("id").and_then(Tag::string) else {
         return Err("spawner entity id missing");
     };
-    if supported_spawner_mob(id).is_none() {
+    if !id.to_utf8().is_ok_and(|name| SPAWNER_MOB_IDS.contains(&name.as_str())) {
         return Err(UNSUPPORTED_SPAWN_ENTITY);
     }
     if let Tag::Compound(fields) = entity {
