@@ -21,18 +21,19 @@ chunk状態の整合性・操作から保存再開までの完成・統合を主
 - `main` ブランチは `perf/worldgen-parallel` と統合・同期済み。hosted CIは課金設定により未起動の場合があるため、ローカル実行結果とhosted CIを混同しない。
 - 全seed/biome/構造物の合格ではない。JVM identity-hashによるleaf tree-bin tieも明示した未対応境界に残る。
 
-**現在の作業:** [全worldgen](worldgen-parity/README.md)の残存構造物受入（Batch B4 / HOLD 解消）、Audit 1 ホットパス修正（Phase D-2）、NeoForge S1〜S3 拡張（R5 `NF-2`〜`NF-4`）、クライアントフォーク／ランチャー統合基盤（R6 `CF-0`〜`CF-4`）、およびゲームプレイ完全性・全Mob AI・Redstone拡張（R7 `GP-0`〜`GP-7`）。
+**現在の作業（Phase E：本番配線・Host Bridge・共有カーネル・収束）:** Phase D（`D-1` / `D-2a` / `D-2b`、`NF-2` Java 側、`CF-1` / `CF-4`、`R7 GP-0〜GP-7` 純粋エンジン 8 本＆パリティ修正、PR `#55`〜`#57` の GP-2 夜間スポーン配線）を `main` へ統合完了。次は Collaborator の GP-2 継続レーンと干渉しない独立ファイル境界のもとで、各エンジンのワールド／プロトコル 767 アダプタ実装、NeoForge S1 Rust Host Bridge（`NF-2b`）、Client Fork 共有カーネル（`CF-0`）、構造物 Batch B4、および薄い `src/main.rs` 実配線を進める。
 
-## 直近の実行順（2026-11-20 同期）
+## 直近の実行順（2026-11-20 Phase E 同期）
 
-長期の R0〜R7 は維持し、現在の並列トラック（[CONTRIBUTING.md](../CONTRIBUTING.md#並列開発のモジュール分担コンフリクト防止ルール) の Track 1〜3 ＋ R7 Gameplay 独立モジュール列）に沿って次の小さい出口で進める。[実行台帳](implementation-checklist.md)で実装済み・限定検証済み・未検証を分け、[調査手順](worldgen-parity/investigation-workflow.md)を各差分の着手前に確認する。
+長期の R0〜R7 は維持し、4 トラック＋独立ファイル所有境界に沿って最大並列で進める。[実行台帳](implementation-checklist.md)で「モデル実装済み」と「本番サーバー実配線・wire 検証済み」を厳密に区別する。
 
-| 優先トラック | 対象 | 次の出口 |
+| 優先トラック | 対象 | 次の出口（Phase E） |
 |---|---|---|
-| **Track 1 (Worldgen & Perf: `Phase D-2` / `P2-1-T3`)** | Audit 1 ホットパス修正（D-2a）＆ 残存構造物 Batch B4 | ① **D-2b 完了 (`d139913`)**：`valid_biome` の quart noise-biome 判定修正 ＆ Woodland Mansion 基礎の `world.min_y()` / 液体置換ガード確定、② **D-2a**：`Rule::Seq` ゼロアロケーション化・`gen_basalt_columns` の `ctx.g.sea` 参照・`OriginGrid` 疎バッチ保護、③ HOLD 2件（`buried_treasure`, `swamp_hut`）の 0-diff 昇格と残存構造物バッチ受入 |
-| **Track 2 (Mod 互換: `R5 NF-2〜NF-4`)** | NeoForge 1.21.1 S1〜S3 実装 | `NF-0` (`a42ebb2`) / `NF-1` (`6d3a03d`) の動的ブートストラップ＆Dual Event Bus 上に、S1 主要 6 イベント + `MutationBuffer` (`NF-2`) → S2 `DeferredRegister` + 名前ベース永続化 (`NF-3`) → S3 Direct `ByteBuffer` バッチ JNI (`NF-4`) を接続 |
-| **Track 3 (Client Fork & Runtime: `R6 CF-0〜CF-4` / `P1`)** | 共通カーネル・ランチャー統合 ＆ Template 最終化 | ① `tools/layers_check.sh` の 44 モジュールグラフを維持したまま共通カーネル（`CF-0`）とヘッドレス予測検証（`CF-1`）・`mods/` 投入型 Integrated Server（`CF-3`）・極薄 Bootstrapper JAR / Prism Wrapper（`CF-4`）を整備、② `P1-1〜P1-4` の実チャンク Fossil / 汎用 neighbor 最終化 |
-| **Track 4 (Gameplay Completeness: `R7 GP-0〜GP-7`)** | Entity 130種・AI経路探索・NaturalSpawner・Redstone・M4機構 | 規約 B2 に従い `src/main.rs` へ `include!` 済みの独立スロットへ並列実装：① `GP-0` 全 130 エンティティ データ駆動レジストリ（`src/entity_registry.rs`）、② `GP-1` `GoalSelector` & A* `PathNavigation`（`src/mob_ai.rs`）、③ `GP-2` `NaturalSpawner`・`mob_cap`・`spawn_costs`・`despawn`（`src/natural_spawner.rs`）、④ `GP-3` レッドストーン伝播・Wire/Torch/Repeater/Comparator（`src/redstone.rs`）→ 順次 `GP-4〜GP-7`（村人取引・Raid・エンチャ/金床/醸造・残りMob群・Advancements/コマンド）へ接続 |
+| **Collaborator 継続レーン (`GP-2` Live Wiring)** | `src/natural_spawner.rs` + `src/tick_tests.rs` | PR `#55`（距離）・`#56`（cap）・`#57`（配置）統合済み。続く明暗チェック・パック生成・despawn の本番配線（他レーンは `src/natural_spawner.rs` に触れない） |
+| **Track 1 (Worldgen & Perf: `P2-1-T3` / `P4-1`)** | 構造物 HOLD 再検証・Batch B4 ＆ M3 再測定 | ① `D-2a` (`f5c0e8e`) / `D-2b` (`d139913`) 完了済み、② `buried_treasure` / `swamp_hut` の再対照と Batch B4 昇格、③ 同一 SHA での `WARM=1` back-to-back M3 最終測定 |
+| **Track 2 (Mod 互換: `R5 NF-2b〜NF-4`)** | NeoForge 1.21.1 S1 Host Bridge → S2/S3 | `NF-0` (`a42ebb2`) / `NF-1` (`6d3a03d`) / `NF-2` Java S1 (`0ce02ac`, 50 tests PASS) 完了。次は **`NF-2b`（`src/landing_types.rs` / `src/java_compat.rs` で `MutationBuffer` を Rust 側へ返却・CAS 適用）** → `NF-3`（S2 `DeferredRegister` + 名前永続化）→ `NF-4`（S3 バッチ JNI） |
+| **Track 3 (Client Fork & Runtime: `R6 CF-0 / CF-3` / `P1`)** | 共有カーネル境界・Integrated Server・Template 最終化 | `CF-4`（ランチャー Bootstrapper/Wrapper）& `CF-1`（`client_prediction_wire.py`）完了 (`0ea0c3e`)。次は **`CF-0`（`layers_check.sh` 互換の Zero-Drift 共有カーネル契約・予測テスト拡充）** → **`CF-3`（`mods/` 投入型 Integrated Server プロトタイプ）**、および `P1-1〜P1-4` 実チャンク Fossil |
+| **Track 4 (Gameplay 本番アダプタ & 配線: `R7 GP-1 / GP-3〜GP-7`)** | 各専用モジュール内の実ワールド／プロトコル 767 アダプタ化 → 薄い `src/main.rs` 接続 | 全 8 純粋エンジン＋パリティ修正完了 (`d6f17ac`)。まず各独立ファイル内に BReg/プロトコル 767/コマンドパーサのブリッジを完全並列で整備（`GP-1` `WorldPathAdapter`、`GP-3` `BReg` ブロック状態ブリッジ、`GP-4` `0x2e` Merchant Offers エンコーダ＆取引ハンドラ、`GP-5` `/xp set` 残件＆4種ウィンドウ操作ハンドラ、`GP-6` 統一 `MobBehaviorState` ディスパッチャ、`GP-7` コマンドパーサ＆`0x74`/WorldBorder/Scoreboard パケットエンコーダ）し、続けて `src/main.rs` 単一レーンで順次開通 |
 | **Release Gate (`P4-1`)** | 同一 SHA での代表負荷 back-to-back 再測定と全体検証 | `tests/verify.sh` 完走、`tools/perf_bench.py` / `WARM=1` 代表負荷での M3 再測定、選択 mutation、layers/debt/provenance ゲートの同一 SHA 収集 |
 
 ### 公開可能フォーク（Public Fork Release）への収束実績と Phase D 計画（2026-11-20）
@@ -77,7 +78,8 @@ chunk状態の整合性・操作から保存再開までの完成・統合を主
 | **完了済 (Phase A: `04f61a7`〜`482e81b`)** | **A-1**: `P2-3-S4` (`c543c92`, `tests/dimension_wire.py` E2E) | **A-2**: `Layer A3-a` ワーカーキャッシュ共有 (`482e81b`) | **A-3**: Stage F1 `D5` (`04f61a7`, `export_public_branch.sh`) | Stage F1 完結、3 次元移動 E2E 完成、DAG 並列の実測高速化 |
 | **完了済 (Phase B: `0c88980`〜`d06032e`)** | **B-1**: `Layer A4` (`30d0346`: `uniform_state()` O(1) fast-path + 512-entry `MapChunkCache`) | **B-2**: `Layer A1-c` (`482e81b`: `Cond::Biome(u128)` + `Rule::Seq`) ＋ `P0-2` 監査 (`8d047a9`) | **B-3**: `BaseSpawner` + `EntitySpatialGrid` (`0c88980`), PGO & 計測記録 (`d06032e`) | M3 / Layer A1〜A4 完了（PGO `full j=8` -10.6%、全 dump SHA-256 一致） |
 | **完了済 (Phase C + NF-0/NF-1: `8f62f9f`〜`bd06c8a`)** | **C-1**: M2 残 wire 往復検査 (`2a68722`, `tests/m2_gameplay_wire.py`) | **C-2**: `P2-1-T3` Batch B3 (`ba6e2c3`: `desert_pyramid`, `shipwreck`, `ocean_ruin_cold` 0-diff 昇格、計 19 チャンク 0-diff) | **NF-0 & NF-1**: S0 `shimcheck` (`a42ebb2`) ＋ 動的 Bootstrap & Dual Event Bus (`6d3a03d`, 45 tests PASS) ／ **C-3**: 全モジュール警告 68→0 (`8f62f9f`..`ee2ff90`) ＋ トリプルライセンス & 過去履歴不純ファイル完全抹消 (`bd06c8a`) | Stage F2 実用公開フォーク到達 ＋ NeoForge S0/NF-1 動的ゲート確立 ＋ `main` 統合 |
-| **Phase D（Audit 1/2 修正 & Client Fork R6 / R7 基盤）** | **D-1**（済 `ff8addf`）: ランタイム Lock 逆転（Furnace/Crop/Mob）・`load_world` EID 衝突・次元別 `set_block_dim`/プレイヤー流体判定修正（3 tests + `m2_gameplay_wire.py` & `dimension_wire.py` PASS） | **D-2b**（済 `d139913`）: `valid_biome` quart noise-biome 判定修正 ＆ Mansion 基礎下限/液体判定修正（77+9 tests PASS）／ **D-2a**: `Rule::Seq` ゼロアロケーション化・`ctx.g.sea`・`OriginGrid` 疎バッチ保護 | **NF-2 / R6 / R7**: S1 6イベント & `MutationBuffer` ＋ R6 クライアント共通契約・ランチャー統合基盤（`CF-0`〜`CF-4`）＋ R7 Gameplay 独立カーネル（`GP-0`〜`GP-3`） | 全監査指摘の閉鎖 ＋ Server/Client・Gameplay 完全化への拡張 |
+| **完了済 (Phase D: `ff8addf`〜`5522bc2`)** | **D-1** (`ff8addf`: Lock 逆転・EID 衝突・次元流体修正) ＋ **PR `#55`/`#56`/`#57`** (`5522bc2`: GP-2 夜間スポーン距離・cap・地面配置の本番接続) ＋ `GP-0`/`GP-5` 部分接続 (`d6f17ac`) | **D-2b** (`d139913`: `valid_biome` quart 判定＆Mansion 基礎) ＋ **D-2a** (`f5c0e8e`: `Rule::Seq` ゼロアロク・`ctx.g.sea`・`OriginGrid` 疎バッチ保護) | **NF-2 Java S1** (`0ce02ac`, 50 tests PASS) ＋ **R6 CF-4/CF-1** (`0ea0c3e`) ＋ **R7 `GP-0〜GP-7` 全 8 純粋エンジン＆パリティ修正** (`d6f17ac`) | 全監査指摘閉鎖 ＋ R5 S1 / R6 ランチャー / R7 全 8 エンジン完了 |
+| **Phase E（本番アダプタ・Host Bridge・実配線・収束）** | **E-Main**（Collaborator GP-2 継続レーンと協調しつつ、`GP-1/3/4/5/6/7` の薄い 1 行実配線と実 wire 検証） | **E-WG**: HOLD 2件再検証・Batch B4 構造物昇格・`P4-1` `WARM=1` M3 計測 | **E-Adapters（最大並列・非競合）**: `NF-2b` Rust Host Bridge、`CF-0`/`CF-3` 共有カーネル＆Integrated Server、`GP-1/3/4/5/6/7` 各専用ファイル内の `BReg`/プロトコル 767/コマンドブリッジ | モデル単体から本番実動作への全面接続 ＋ Release Gate `P4-1` 到達 |
 
 **原因記述の訂正:** 端のair差とsnowy差を位置の近さだけで同じ原因にまとめた推測は
 撤回する。訂正根拠・区別すべきlookup・次の反証は

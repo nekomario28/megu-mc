@@ -92,26 +92,29 @@
 - [x] **NF-Arch（設計確定 `3efb811`）**: [neoforge-architecture.md](mod-compatibility/neoforge-architecture.md)（5 レイヤ構成・`DimId` 対応・バッチ JNI・`shimcheck` 起動前拒否）。
 - [x] **NF-0 (S0 `shimcheck` `a42ebb2`)**: `ShimCheck.java`（ASM `9.10.1` + `neoforge.mods.toml` 解析）＋ `tools/shimcheck.py` ＋ `tests/shimcheck_test.py`（33 tests PASS）。
 - [x] **NF-1 (動的 Bootstrap & Dual Event Bus `6d3a03d`)**: `ShimCheck` ゲート付き複数 Mod 動的ディスカバリ・コンストラクタ注入・`Bus.GAME` / `Bus.MOD` 振り分け・`Dist.CLIENT` 除外・`tests/neoforge_bootstrap_test.py`（計 45 tests PASS）。
-- [ ] **NF-2〜NF-4 (S1〜S3)**: S1 主要 6 イベント + `MutationBuffer` → S2 `DeferredRegister` + 名前ベース永続化 → S3 Direct `ByteBuffer` バッチ JNI。
+- [x] **NF-2 Java S1 6イベント & `MutationBuffer` (`0ce02ac`)**: `BreakEvent` / `EntityPlaceEvent` / `PlayerLoggedInEvent`・`OutEvent` / `ServerChatEvent` / `RegisterCommandsEvent` + 再入上限 4 の `MutationBuffer` + `ShimCheck` S1 面拡張（`tests/neoforge_s1_events_test.py` 含む 50 tests PASS）。
+- [ ] **NF-2b〜NF-4 (S1 Rust Host Bridge → S2/S3)**: `NF-2b`（`src/java_compat.rs` での `MutationBuffer` バッチ返却・CAS 適用）→ `NF-3`（S2 `DeferredRegister` + 名前ベース永続化）→ `NF-4`（S3 Direct `ByteBuffer` バッチ JNI）。
 
 ### R6 — クライアントフォーク計画と Server-Client 共通カーネル（`mc-spine-client`）
 
 - [ ] **CF-0（Server-Client 共有コアの公開 — `layers_check.sh` 互換）**: `tools/layers_check.sh`（44 modules / 111 edges）の静的モジュールグラフを維持したまま、`src/block_registry.rs` (`26,684` states / `FULL`/`CENTER`/`RIGID`)、`src/entity_collision.rs`、`src/entity_fluid.rs`、`src/paletted.rs`、`src/lighting.rs`、`src/nbt.rs`、`src/brigadier.rs` をライブラリ境界（`rlib` / `cdylib` Zero-Drift Shared Kernel）としてサーバー・クライアント間で共有する。
-- [ ] **CF-1（ヘッドレス 1.21.1 決定論的シミュレータ & E2E ボットクライアント）**: 受信チャンク (`0x27`)・ブロック更新 (`0x09`)・エンティティ移動 (`0x5a`) を共有カーネル上で毎 tick ローカル予測し、Vanilla 1.21.1 サーバーおよび `mc-spine` サーバーとの位置・流体・衝突誤差 0 を検証する。
+- [x] **CF-1（ヘッドレス 1.21.1 決定論的シミュレータ & E2E ボットクライアント — 第 1 段完了 `0ea0c3e`）**: [tests/client_prediction_wire.py](../tests/client_prediction_wire.py) で実 `mc-spine` サーバーから `0x27` チャンクを受信・復号し、重力・着地・壁衝突・ブロック状態変化の予測ドリフト 0 を検証済み（今後 Vanilla 1.21.1 サーバー対照・流体予測へ拡張）。
 - [ ] **CF-2（クライアント描画・増分ライティング・Greedy Meshing 接続）**: ファーストパーティファイルに外部 `AGPL-3.0-only` コードを混ぜず（トリプルライセンス双方向性を維持）、`PalettedSection` と `lighting.rs` から直接セクションメッシュを生成する描画パイプラインを接続（Issue `#43` と連携）。
 - [ ] **CF-3（`mods/` 投入型 Rust Integrated Server — `mc-spine-integrated.jar` / `cdylib`）**: 既存 Fabric/NeoForge クライアント（Sodium/Iris 等）の `mods/` に 1 個 JAR を入れるだけで、シングルプレイ／LAN ホストのサーバー処理を 100% Rust (`libmc_spine` + 共有メモリ / Direct `ByteBuffer` FFI) にオフロード。
-- [ ] **CF-4（Default Launcher / Prism Launcher ネイティブ起動パッケージ）**: Custom Version JSON + 極薄 Bootstrapper JAR（約 20 KB、起動 50ms 後に JVM 退場）および Prism `Wrapper command`（JVM 非起動で直接 Rust 起動）により、公式/Prism/Modrinth 全ランチャーで内部 100% Rust ネイティブ動作を実現。
+- [x] **CF-4（Default Launcher / Prism Launcher ネイティブ起動パッケージ — 完了 `0ea0c3e`）**: `tools/client_launcher/Main.java`（極薄 Bootstrapper JAR）・`tools/client_launcher/mc-spine-wrapper`（JVM 非起動の Prism `Wrapper command`）・`tools/client_launcher/gen_launcher_profile.py`（Custom Version JSON）を実装し `tests/client_launcher_test.py` 8/8 PASS。
 
 ### R7 — ゲームプレイ完全性（M2→M4：`GP-0`〜`GP-7`）
 
-- [ ] **GP-0（Entity Framework & 全 130 エンティティ型データ駆動レジストリ）**: `src/entity_registry.rs` に protocol 767 全 130 `EntityType`（`0..=129`、名前、幅・高さ・`eye_height`、`MobCategory`、既定 `max_health`、`fire_immune`、`pushable`、`client_tracking_range`、`update_interval`）を一元化し、`entity_collision` / `spawner` と整合。
-- [ ] **GP-1（1.21.1 `GoalSelector` & A* `PathNavigation`）**: `src/mob_ai.rs` に `WalkNodeEvaluator`（段差・落下 `<= 3`・対角線角切り防止・水/溶岩/炎回避）・A* `PathFinder`・排他フラグ付き `GoalSelector` / `TargetSelector` と主要 AI ゴールを実装し、段階的に `mob_tick` へ接続。
-- [ ] **GP-2（1.21.1 `NaturalSpawner`, Mob Cap, `SpawnCosts`, Despawn）**: `src/natural_spawner.rs` に `MobCategory` 7 分類 cap（`/ 289`）・エネルギー予算ポテンシャル計算・`24/32/128` 距離 despawn・明暗/設置条件・群れスポーンを実装。
-- [ ] **GP-3（1.21.1 レッドストーン伝播エンジン）**: `src/redstone.rs` に強/弱給電、`RedStoneWireBlock`（`0..=15` 減衰・段差/遮断）、`RedstoneTorchBlock`（2GT・burnout）、`RepeaterBlock`（遅延・横ロック）、`ComparatorBlock`（比較/減算・コンテナ充填信号）、ピストン QC 等を実装。
-- [ ] **GP-4（村人 AI・職業 POI・取引・ゴシップ・襲撃 Raid）**: 職業紐付け、Merchant 取引オファー・補充・価格変動、ゴシップ、襲撃フェーズを実装。
-- [ ] **GP-5（プレイヤー高度機構：エンチャント台・金床・醸造・鍛冶・空腹・XP）**: 3 択エンチャント生成、金床合成コスト、醸造/ポーション効果拡張、鍛冶台、経験値オーブ、空腹消耗度を実装。
-- [ ] **GP-6（残存 Mob 群のグループ別行動・戦闘実装）**: Nether 系（Blaze/Ghast/Piglin/Hoglin/Wither Skeleton/Strider）・End 系（Enderman/Shulker/Ender Dragon）・水棲/空/ペット（Drowned/Guardian/Phantom/Wolf/Cat/Horse/Bee/Axolotl）・ボス（Wither/Warden）・乗物（Boat/Minecart）をグループ別に実装・対照検証。
-- [ ] **GP-7（進捗 Advancements・スコアボード・ワールドボーダー・残存コマンド）**: `/fill`・`/clone`・`/execute`・`/scoreboard`・`/advancement`・`/worldborder`・`/locate` 等とワールドボーダー・進捗通知を完成。
+> 以下の各項目は「純粋エンジン＆単体パリティテスト（Phase D 完了）」と「本番サーバー実配線・wire 検証（Phase E）」を分けて管理する。
+
+- [x] **GP-0（Entity Framework & 全 130 エンティティ型データ駆動レジストリ — エンジン＆主要配線完了 `89669a8`, `d6f17ac`）**: `src/entity_registry.rs` に protocol 767 全 130 `EntityType`（`0..=129`）を一元化し、`name_to_etype`・`mob_dimensions`・`default_mob_hp`・`/summon` 初期 HP を接続済み。
+- [ ] **GP-1（1.21.1 `GoalSelector` & A* `PathNavigation`）**: 純粋エンジン実装＆パリティ修正完了（`ffac24b`, `d6f17ac`、`mob_ai_tests` 16+ PASS）。残件：`WorldPathAdapter`・Mob 別ゴールファクトリ整備と `mob_tick` 本番切替。
+- [ ] **GP-2（1.21.1 `NaturalSpawner`, Mob Cap, `SpawnCosts`, Despawn）**: 純粋エンジン完了＋PR `#55`（距離）・`#56`（monster cap）・`#57`（地面配置・衝突形状）本番配線済み（`5522bc2`）。残件：明暗・パック生成・`SpawnCosts`・despawn 本番配線（Collaborator 優先レーン）。
+- [ ] **GP-3（1.21.1 レッドストーン伝播エンジン）**: 純粋エンジン実装＆コンパレータ優先順位修正完了（`723cfd3`, `d6f17ac`、`redstone_tests` 15+ PASS）。残件：`BReg` ブロック状態ブリッジと `tick_queue` / ブロック更新への本番配線。
+- [ ] **GP-4（村人 AI・職業 POI・取引・ゴシップ・襲撃 Raid）**: 純粋エンジン実装＆整数丸め価格修正完了（`9fd1c56`, `d6f17ac`、`villager_raid_tests` 12+ PASS）。残件：protocol 767 `0x2e` Merchant Offers エンコーダ・POI スキャナと本番エンティティ接続。
+- [ ] **GP-5（プレイヤー高度機構：エンチャント台・金床・醸造・鍛冶・空腹・XP）**: 純粋エンジン実装＋XP 閾値・食事バウンド一部配線完了（`d6f17ac`、`player_mechanisms_tests` 15+ PASS）。残件：`/xp set` 進捗保持、4種ウィンドウ操作ハンドラ、`FoodData::tick` 消耗度/自然回復の本番配線。
+- [ ] **GP-6（残存 Mob 群のグループ別行動・戦闘実装）**: 純粋エンジン実装＆ガスト計時修正完了（`d6f17ac`、`mob_behaviors_tests` 21+ PASS）。残件：統一 `MobBehaviorState` ディスパッチャと本番 tick/エンティティ生成接続。
+- [ ] **GP-7（進捗 Advancements・スコアボード・ワールドボーダー・残存コマンド）**: 純粋エンジン実装＆`/fill keep` 全空気状態対応完了（`e839879`, `d6f17ac`、`world_mechanisms_tests` 14+ PASS）。残件：コマンドパーサ・`0x74`/WorldBorder/Scoreboard パケットエンコーダと本番コマンド接続。
 
 ### P4 — 統合前のゲート（自動ではmergeしない）
 
