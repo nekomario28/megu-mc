@@ -295,7 +295,7 @@ pub struct SectionView<'a> {
 }
 
 impl SectionView<'_> {
-    fn sample_local(&self, x: usize, y: usize, z: usize) -> Sample {
+    pub(crate) fn sample_local(&self, x: usize, y: usize, z: usize) -> Sample {
         let index = section_index(x, y, z);
         Sample::new(
             self.blocks[index],

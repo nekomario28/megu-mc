@@ -4,8 +4,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod cache;
+mod column;
 pub mod ffi;
 mod mesh;
+mod packed;
 mod section;
 
 #[cfg(test)]

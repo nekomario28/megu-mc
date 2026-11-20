@@ -349,7 +349,12 @@ fn mesh_fluid(view: &SectionView<'_>, p: [i32; 3], quads: &mut Vec<Quad>) {
 /// in section index order. All opaque, cutout and translucent models are unit cubes.
 pub fn mesh_section(view: &SectionView<'_>) -> Vec<Quad> {
     let mut quads = Vec::new();
-    mesh_cubes(view, &mut quads);
+    append_section(view, &mut quads);
+    quads
+}
+
+pub(crate) fn append_section(view: &SectionView<'_>, quads: &mut Vec<Quad>) {
+    mesh_cubes(view, quads);
     for (index, block) in view.blocks.iter().enumerate() {
         if block.fluid() != NO_FLUID {
             let p = [
@@ -357,8 +362,7 @@ pub fn mesh_section(view: &SectionView<'_>) -> Vec<Quad> {
                 (index / FACE_CELLS) as i32,
                 (index / EDGE % EDGE) as i32,
             ];
-            mesh_fluid(view, p, &mut quads);
+            mesh_fluid(view, p, quads);
         }
     }
-    quads
 }

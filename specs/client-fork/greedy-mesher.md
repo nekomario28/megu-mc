@@ -1,4 +1,4 @@
-# CF-2 section meshing
+# CF-2 section and column meshing
 
 Phase E Wave 3, lane E3-4a. The standalone `client-port/` Cargo package builds a Rust library and a C-compatible shared library with zero external crate dependencies. The implementation is original and available under LGPL-3.0-or-later, GPL-3.0-or-later, or AGPL-3.0-or-later at the recipient's choice. The repository carries the respective texts in [COPYING.LESSER](../../COPYING.LESSER), [LICENSE](../../LICENSE), and [COPYING.AGPL](../../COPYING.AGPL).
 
@@ -20,6 +20,18 @@ The water and lava level encoding follows the [server fluid state](../../src/ent
 
 The mesh is deterministic for the same cell data and halo. The zero-drift contract covers section order, registry state ID preservation, light packing, and equivalent results from the Rust and C entry points. The cube model and fluid interpolation define this mesh format. Arbitrary block models, renderer-specific shading, texture lookup, and vanilla pixel parity are outside its scope.
 
+## CF-2b chunk columns
+
+Phase E Wave 4, lane E4-23. Pass 1–32 contiguous sections to `mc_spine_client_mesh_column` in bottom-to-top order. An Overworld column has 24 sections starting at world Y=-64. A Nether or End column has 16 starting at Y=0. Output uses column-local Y, so add the dimension's minimum Y to obtain world Y. The mesher samples the touching cell and light planes directly from adjacent sections. Supplied cardinal neighbor columns also provide the vertical edges used for AO and fluid heights. The missing-neighbor policy supplies the column ends, missing cardinal neighbors, and halo cells that require diagonal columns.
+
+Set `MC_SPINE_MESH_COLUMN_UNIFORM_AIR` for known-air sections, with a null block pointer and both light arrays present. The mesher skips their block traversal and geometry generation in constant time. Adjacent occupied sections still read their boundary light. Output keeps the original section mesher's greedy rectangles and ordering within each section. A caller with a sufficiently sized quad buffer can mesh the entire column in one call.
+
+## Packed vertices and translucent drawing
+
+`mc_spine_client_mesh_pack_vertices` writes four 16-byte vertices per quad directly into caller-owned memory, including an aligned, writable mapped upload buffer. Each vertex includes integer X/Z, Y rounded to 1/1024 block, the full state ID, fluid kind, face direction, tint, corner AO and light, and the quad's diagonal and tiled UV extents. Each greedy rectangle uses its width and height along the existing U and V tangent axes. Fluids use unit UV extents and retain their fractional Y heights. The header specifies bit positions for integer vertex attributes. The original quads also carry face light and fluid flow.
+
+`mc_spine_client_mesh_sort_translucent` returns original quad indices for the translucent block layer and water. It sorts by decreasing squared camera distance from the four-vertex centroid, with ascending input index for ties. Supply the camera in section-local coordinates for section meshes and column-local coordinates for column meshes. The index list lets a renderer reorder translucent draws while reusing the packed vertex buffer.
+
 ## Incremental rebuilds
 
 `MeshCache` owns loaded section snapshots, a deduplicated queue, and the last assembled meshes. Use one cache per world or dimension. An interior edit queues its own section. An edit on a face also queues the loaded face neighbor. Edge and corner edits reach the loaded sections that sample those halo cells, up to seven neighbors at a corner. Insertions, replacements, and removals compare the affected boundary data, including both light channels. The cache builds borders and halo from loaded sections when it drains the queue. `rebuild_dirty(limit)` bounds the number of processed sections, and a dirty mesh is unavailable until rebuilt.
@@ -27,6 +39,8 @@ The mesh is deterministic for the same cell data and halo. The zero-drift contra
 ## C ABI
 
 Check `mc_spine_mesh_abi_version()` and initialize `mc_spine_mesh_input`. Call `mc_spine_mesh_section` with a null output and zero capacity to obtain the quad count, then call again with the same inputs and a caller-owned buffer. A short buffer returns the required count and leaves the output untouched. Each call performs a mesh pass and retains no pointers. The header specifies alignment, native byte order, statuses, and vertex/index conventions. A renderer can reconstruct repeating unit-cube UVs from the face direction and section-local positions. The C ABI exports stateless meshing for use by C, C++, or Java native interop. The incremental cache is a Rust API.
+
+The three CF-2b functions are additive ABI v1 symbols. Their capacities and counts are in quads, packed vertices, and quad indices respectively. Each supports the null-output size query. A required null pointer, an out-of-range section count, or a non-finite camera returns `MC_SPINE_MESH_INVALID_ARGUMENT` and zeroes the count when present.
 
 ## Verification
 
@@ -42,6 +56,9 @@ cargo build --offline --locked --lib
 cc -std=c11 -Wall -Wextra -Werror -pedantic -Iinclude tests/abi_smoke.c \
     -Ltarget/debug -lmc_spine_client_mesh -o "$TMPDIR/mesh_abi_smoke"
 LD_LIBRARY_PATH="$PWD/target/debug" "$TMPDIR/mesh_abi_smoke"
+g++ -fsyntax-only -Wall -Wextra -Werror -x c++ include/mc_spine_client_mesh.h
 ```
 
 The solid benchmark fixture begins with 24,576 block faces, exposes 1,536 unit faces after culling, and produces six quads after merging. The checkerboard fixture exposes 12,288 faces and produces 12,288 quads. The timing covers the CPU mesh pass, including output allocation, and excludes conversion, I/O, and rendering.
+
+The CF-2b release benchmark used a synthetic 24-section Overworld column spanning Y=-64 through 319, with stepped stone terrain, source water, nine expanded sections, and 15 known-air sections. On an AMD Ryzen 7 9800X3D (x86-64, rustc 1.98.0), 500 runs averaged **5,208.55 µs per column** and produced **2,037 quads and 8,148 packed vertices** per run. The timed region calls the column and packing ABI once each per run with reused output buffers. Fixture construction, the initial size query, translucent sorting, GPU upload, and rendering are outside the timed region.

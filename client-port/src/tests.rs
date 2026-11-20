@@ -464,3 +464,79 @@ fn cache_halo_matches_fluid_height_across_a_four_section_corner() {
         .iter()
         .any(|q| q.direction == Direction::Up));
 }
+
+#[test]
+fn column_stitches_solid_sections_and_preserves_sky_from_known_air() {
+    use crate::column::{mesh_column, ColumnSection};
+
+    let mut lower = Section::filled(Block::AIR, Light::new(0, 15));
+    lower.set(8, 15, 7, Block::opaque_cube(1), Light::new(0, 0));
+    let mut upper = Section::filled(Block::AIR, Light::new(0, 15));
+    upper.set(8, 0, 7, Block::opaque_cube(1), Light::new(0, 0));
+    upper.set(8, 15, 7, Block::opaque_cube(1), Light::new(3, 0));
+    let air = Section::filled(Block::AIR, Light::new(2, 9));
+
+    let quads = mesh_column(
+        &[
+            ColumnSection {
+                view: lower.view(),
+                uniform_air: false,
+            },
+            ColumnSection {
+                view: upper.view(),
+                uniform_air: false,
+            },
+            ColumnSection {
+                view: air.view(),
+                uniform_air: true,
+            },
+        ],
+        [None; 4],
+    );
+    assert_eq!(quads.len(), 16);
+    assert!(!quads.iter().any(|q| {
+        matches!(q.direction, Direction::Up | Direction::Down) && q.positions[0][1] == 16.0
+    }));
+    let top = quads
+        .iter()
+        .find(|q| q.direction == Direction::Up && q.positions[0][1] == 32.0)
+        .unwrap();
+    assert_eq!(top.face_light, Light::new(3, 9));
+    assert_eq!(top.sky_light, [9; 4]);
+}
+
+#[test]
+fn column_stitches_water_and_samples_cardinal_halo_across_y() {
+    use crate::column::{mesh_column, ColumnSection};
+
+    let water = fluid(WATER, 0);
+    let mut lower = air();
+    let mut upper = air();
+    lower.set(15, 15, 8, water, DAY);
+    upper.set(15, 0, 8, water, DAY);
+
+    let mut east = [[Sample::new(Block::AIR, DAY); FACE_CELLS]; 2];
+    east[1][Direction::East.border_index([0, 0, 7])] = Sample::new(STONE, DARK);
+    let quads = mesh_column(
+        &[
+            ColumnSection {
+                view: lower.view(),
+                uniform_air: false,
+            },
+            ColumnSection {
+                view: upper.view(),
+                uniform_air: false,
+            },
+        ],
+        [None, None, None, Some(&east)],
+    );
+    assert_eq!(quads.len(), 10);
+    assert!(!quads.iter().any(|q| {
+        matches!(q.direction, Direction::Up | Direction::Down) && q.positions[0][1] == 16.0
+    }));
+    let lower_side = face(&quads, Direction::East, water.state_id);
+    // The lower side reaches the join where the upper water column begins.
+    assert_eq!(lower_side.positions.map(|p| p[1]), [15.0, 16.0, 16.0, 15.0]);
+    // The stone one section up in the East neighbor shades one top corner.
+    assert_eq!(lower_side.ao, [3, 2, 3, 3]);
+}

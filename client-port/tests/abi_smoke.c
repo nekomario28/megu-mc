@@ -22,6 +22,80 @@ _Static_assert(offsetof(mc_spine_mesh_input, blocks) == 8, "block pointer offset
 _Static_assert(offsetof(mc_spine_mesh_input, borders) == 8 + 3 * sizeof(void *), "borders offset");
 _Static_assert(offsetof(mc_spine_mesh_input, edges_and_corners) == 8 + 9 * sizeof(void *), "halo offset");
 _Static_assert(sizeof(mc_spine_mesh_input) == 8 + 10 * sizeof(void *), "input size");
+_Static_assert(sizeof(mc_spine_mesh_packed_vertex) == 16, "packed GPU stride");
+_Static_assert(offsetof(mc_spine_mesh_packed_vertex, position) == 0, "packed position offset");
+_Static_assert(offsetof(mc_spine_mesh_packed_vertex, state_id) == 4, "packed state offset");
+_Static_assert(offsetof(mc_spine_mesh_packed_vertex, attributes) == 8, "packed attribute offset");
+_Static_assert(offsetof(mc_spine_mesh_packed_vertex, tint) == 12, "packed tint offset");
+
+static void column_roundtrip(void) {
+    static mc_spine_mesh_block blocks[2][MC_SPINE_MESH_SECTION_CELLS];
+    static uint8_t light[MC_SPINE_MESH_LIGHT_BYTES];
+    static mc_spine_mesh_sample east[2][MC_SPINE_MESH_FACE_CELLS];
+    const mc_spine_mesh_block glass = {
+        .state_id = 519, .flags = MC_SPINE_BLOCK_TRANSLUCENT | MC_SPINE_BLOCK_SAME_STATE_CULL,
+    };
+    blocks[0][15 * 256 + 8 * 16 + 15] = glass;
+    blocks[1][8 * 16 + 15] = glass;
+    east[1][8 * 16].block = (mc_spine_mesh_block){
+        .state_id = 1, .flags = MC_SPINE_BLOCK_OPAQUE, .occlusion = MC_SPINE_BLOCK_ALL_FACES,
+    };
+    mc_spine_mesh_column_section sections[2] = {
+        {.blocks = blocks[0], .block_light = light, .sky_light = light},
+        {.blocks = blocks[1], .block_light = light, .sky_light = light},
+    };
+    const mc_spine_mesh_column_input input = {
+        .abi_version = MC_SPINE_MESH_ABI_VERSION, .missing = MC_SPINE_MESH_MISSING_AIR,
+        .sections = sections, .section_count = 2, .borders = {[3] = east[0]},
+    };
+    size_t count = 99;
+    assert(mc_spine_client_mesh_column(NULL, NULL, 0, &count) == MC_SPINE_MESH_INVALID_ARGUMENT);
+    assert(count == 0);
+    sections[1].blocks = NULL;
+    assert(mc_spine_client_mesh_column(&input, NULL, 0, &count) == MC_SPINE_MESH_INVALID_ARGUMENT);
+    assert(count == 0);
+    sections[1].blocks = blocks[1];
+    assert(mc_spine_client_mesh_column(&input, NULL, 0, &count) == MC_SPINE_MESH_OK);
+    assert(count == 9);
+
+    mc_spine_mesh_quad quads[9] = {{.state_id = 54321}};
+    assert(mc_spine_client_mesh_column(&input, quads, 8, &count) == MC_SPINE_MESH_BUFFER_TOO_SMALL);
+    assert(count == 9 && quads[0].state_id == 54321);
+    assert(mc_spine_client_mesh_column(&input, quads, 9, &count) == MC_SPINE_MESH_OK);
+    assert(count == 9);
+    assert(quads[0].direction == MC_SPINE_MESH_DOWN && quads[0].positions[0][1] == 15);
+    assert(quads[4].direction == MC_SPINE_MESH_EAST);
+    assert(quads[5].direction == MC_SPINE_MESH_UP && quads[5].positions[0][1] == 17);
+
+    mc_spine_mesh_packed_vertex vertices[36] = {{.state_id = 54321}};
+    assert(mc_spine_client_mesh_pack_vertices(NULL, 0, NULL, 0, &count)
+           == MC_SPINE_MESH_INVALID_ARGUMENT && count == 0);
+    assert(mc_spine_client_mesh_pack_vertices(quads, 9, NULL, 0, &count) == MC_SPINE_MESH_OK);
+    assert(count == 36);
+    quads[8].direction = UINT8_MAX;
+    assert(mc_spine_client_mesh_pack_vertices(quads, 9, vertices, 36, &count)
+           == MC_SPINE_MESH_INVALID_ARGUMENT);
+    assert(count == 0 && vertices[0].state_id == 54321);
+    quads[8].direction = MC_SPINE_MESH_WEST;
+    assert(mc_spine_client_mesh_pack_vertices(quads, 9, vertices, 36, &count) == MC_SPINE_MESH_OK);
+    assert(count == 36);
+    assert(vertices[0].position == (15u | (8u << 5) | (15u * 1024u << 10)));
+    assert(vertices[0].state_id == 519);
+    assert(vertices[2].attributes >> 30 == 2);
+    assert((vertices[0].attributes >> 3 & 3) == quads[0].ao[0]);
+    assert((vertices[0].attributes >> 5 & 15) == quads[0].block_light[0]);
+    assert((vertices[0].attributes >> 9 & 15) == quads[0].sky_light[0]);
+    assert((vertices[0].attributes >> 13 & 3) == MC_SPINE_LAYER_TRANSLUCENT);
+    assert((vertices[0].attributes >> 20 & 31) == 1 && (vertices[0].attributes >> 25 & 31) == 1);
+
+    uint32_t indices[9];
+    assert(mc_spine_client_mesh_sort_translucent(NULL, 0, 0, 0, 0, NULL, 0, &count)
+           == MC_SPINE_MESH_INVALID_ARGUMENT && count == 0);
+    assert(mc_spine_client_mesh_sort_translucent(quads, 9, 15, 100, 8, indices, 9, &count)
+           == MC_SPINE_MESH_OK);
+    assert(count == 9 && indices[0] == 0 && indices[8] == 5);
+    puts("C ABI column roundtrip: 9 quads, 36 packed vertices, 9 sorted indices");
+}
 
 int main(void) {
     static mc_spine_mesh_block blocks[MC_SPINE_MESH_SECTION_CELLS];
@@ -62,5 +136,6 @@ int main(void) {
     assert(quads[1].positions[0][0] == 15 && quads[1].positions[0][1] == 5
            && quads[1].positions[0][2] == 7);
     puts("C ABI v1 roundtrip: 5 quads, border culling and block/sky nibbles verified");
+    column_roundtrip();
     return 0;
 }
