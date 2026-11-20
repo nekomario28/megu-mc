@@ -3,11 +3,13 @@
 // SignalGetter, RedStoneWireBlock, RedstoneTorchBlock, DiodeBlock and their subclasses.
 
 use std::cmp::Reverse;
-use crate::block_registry::BReg;
 use std::collections::{BTreeSet as RsBTreeSet, VecDeque};
+
+include!("redstone_world.rs");
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)] // Vanilla face indices.
 enum RsDir {
     Down,
     Up,
@@ -257,24 +259,29 @@ struct ComparatorBlock {
 impl ComparatorBlock {
     const DELAY_TICKS: u64 = 2;
 
-    fn evaluate(self, world: &impl RedstoneWorld, pos: RsPos) -> u8 {
+    fn evaluate(self, world: &impl RedstoneWorld, pos: RsPos) -> (u8, bool) {
         let rear_pos = pos.relative(self.facing.opposite());
         let mut rear = rs_diode_rear_input(world, pos, self.facing);
         if let Some(analog) = world.container_analog_signal(rear_pos) {
             rear = analog.min(15);
         } else if rear < 15 && world.is_redstone_conductor(rear_pos) {
-            if let Some(analog) =
-                world.container_analog_signal(rear_pos.relative(self.facing.opposite()))
+            let behind = rear_pos.relative(self.facing.opposite());
+            if let Some(analog) = world
+                .container_analog_signal(behind)
+                .max(world.item_frame_signal(behind, self.facing.opposite()))
             {
                 rear = analog.min(15);
             }
         }
         let side = rs_side_input(world, pos, self.facing, false);
-        match self.mode {
+        let output = match self.mode {
             RsComparatorMode::Compare if rear >= side => rear,
             RsComparatorMode::Compare => 0,
             RsComparatorMode::Subtract => rear.saturating_sub(side),
-        }
+        };
+        let powered =
+            rear > side || (rear != 0 && rear == side && self.mode == RsComparatorMode::Compare);
+        (output, powered)
     }
 }
 
@@ -314,13 +321,6 @@ impl RsMountFace {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RsButtonKind {
-    Stone,
-    Oak,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum RsBlock {
     #[default]
@@ -331,9 +331,29 @@ enum RsBlock {
     // Keep unmodelled states intact, including their precise 1.21.1 properties.
     RegistryState(u32),
     RedstoneBlock,
-    Lever { face: RsMountFace, facing: RsDir, powered: bool },
-    Button { kind: RsButtonKind, face: RsMountFace, facing: RsDir, powered: bool },
-    Piston { sticky: bool, facing: RsDir, extended: bool },
+    Lever {
+        face: RsMountFace,
+        facing: RsDir,
+        powered: bool,
+    },
+    Button {
+        block_id: u32,
+        face: RsMountFace,
+        facing: RsDir,
+        powered: bool,
+    },
+    Observer {
+        facing: RsDir,
+        powered: bool,
+    },
+    Target {
+        power: u8,
+    },
+    Piston {
+        sticky: bool,
+        facing: RsDir,
+        extended: bool,
+    },
     Source {
         weak: u8,
         strong: u8,
@@ -405,6 +425,8 @@ impl RsBlock {
                 | Self::RedstoneBlock
                 | Self::Lever { .. }
                 | Self::Button { .. }
+                | Self::Observer { .. }
+                | Self::Target { .. }
                 | Self::Source { .. }
         )
     }
@@ -414,11 +436,16 @@ impl RsBlock {
             Self::RedstoneBlock => 15,
             Self::Lever { powered: true, .. } | Self::Button { powered: true, .. } => 15,
             Self::Source { weak, strong } => weak.max(strong).min(15),
+            Self::Observer {
+                facing,
+                powered: true,
+            } if toward == facing.opposite() => 15,
+            Self::Target { power } => power,
             Self::Wire(wire) => wire.signal(toward),
             Self::Torch(torch) if torch.lit && toward != RsDir::Down => 15,
             Self::WallTorch(torch) if torch.lit && toward != torch.facing.opposite() => 15,
             Self::Repeater(repeater) if repeater.powered && toward == repeater.facing => 15,
-            Self::Comparator(comparator) if toward == comparator.facing => {
+            Self::Comparator(comparator) if comparator.powered && toward == comparator.facing => {
                 comparator.output.min(15)
             }
             _ => 0,
@@ -427,183 +454,25 @@ impl RsBlock {
 
     fn direct_signal(self, toward: RsDir) -> u8 {
         match self {
-            Self::RedstoneBlock => 15,
             Self::Source { strong, .. } => strong.min(15),
-            Self::Lever { face, facing, powered: true }
-            | Self::Button { face, facing, powered: true, .. }
-                if toward == face.attachment(facing) => 15,
-            Self::Wire(_) | Self::Repeater(_) | Self::Comparator(_) => self.weak_signal(toward),
+            Self::Lever {
+                face,
+                facing,
+                powered: true,
+            }
+            | Self::Button {
+                face,
+                facing,
+                powered: true,
+                ..
+            } if toward == face.attachment(facing) => 15,
+            Self::Wire(_) | Self::Repeater(_) | Self::Comparator(_) | Self::Observer { .. } => {
+                self.weak_signal(toward)
+            }
             Self::Torch(_) | Self::WallTorch(_) if toward == RsDir::Up => self.weak_signal(toward),
             _ => 0,
         }
     }
-}
-
-// The registry stores the canonical state properties. Keep comparator output separate:
-// its analog value lives in a block entity and cannot be recovered from a state ID.
-#[cfg_attr(not(test), allow(dead_code))]
-fn rs_block_from_state(reg: &BReg, state: u32) -> RsBlock {
-    let read = |key: &str| reg.get_prop(state, key);
-    let facing = || read("facing").and_then(|v| RsDir::from_property(&v));
-    let powered = || read("powered").as_deref() == Some("true");
-    let block = (|| -> Option<RsBlock> { match reg.name_of(state) {
-        "minecraft:air" if reg.is_air(state) => Some(RsBlock::Air),
-        "minecraft:redstone_wire" => Some(RsBlock::Wire(RedStoneWireBlock {
-            power: read("power")?.parse().ok()?,
-            connections: RsDir::HORIZONTAL.map(|dir| {
-                read(dir.property()).and_then(|v| RsWireConnection::from_property(&v))
-            }).into_iter().collect::<Option<Vec<_>>>()?.try_into().ok()?,
-        })),
-        "minecraft:redstone_torch" => Some(RsBlock::Torch(RedstoneTorchBlock {
-            lit: read("lit")?.as_str() == "true",
-        })),
-        "minecraft:redstone_wall_torch" => Some(RsBlock::WallTorch(RedstoneWallTorchBlock {
-            facing: facing()?,
-            lit: read("lit")?.as_str() == "true",
-        })),
-        "minecraft:repeater" => Some(RsBlock::Repeater(RepeaterBlock {
-            facing: facing()?,
-            delay: read("delay")?.parse().ok()?,
-            powered: powered(),
-            locked: read("locked")?.as_str() == "true",
-        })),
-        "minecraft:comparator" => {
-            let is_powered = powered();
-            Some(RsBlock::Comparator(ComparatorBlock {
-                facing: facing()?,
-                mode: match read("mode")?.as_str() {
-                    "compare" => RsComparatorMode::Compare,
-                    "subtract" => RsComparatorMode::Subtract,
-                    _ => return None,
-                },
-                powered: is_powered,
-                output: if is_powered { 15 } else { 0 },
-            }))
-        }
-        "minecraft:redstone_block" => Some(RsBlock::RedstoneBlock),
-        "minecraft:lever" | "minecraft:stone_button" | "minecraft:oak_button" => {
-            let face = read("face").and_then(|v| RsMountFace::from_property(&v))?;
-            let dir = facing()?;
-            let is_powered = powered();
-            Some(match reg.name_of(state) {
-                "minecraft:lever" => RsBlock::Lever { face, facing: dir, powered: is_powered },
-                "minecraft:stone_button" => RsBlock::Button {
-                    kind: RsButtonKind::Stone, face, facing: dir, powered: is_powered,
-                },
-                _ => RsBlock::Button {
-                    kind: RsButtonKind::Oak, face, facing: dir, powered: is_powered,
-                },
-            })
-        }
-        "minecraft:redstone_lamp" => Some(RsBlock::Lamp {
-            lit: read("lit")?.as_str() == "true",
-        }),
-        "minecraft:hopper" => Some(RsBlock::Hopper {
-            enabled: read("enabled")?.as_str() == "true",
-            facing: facing()?,
-        }),
-        "minecraft:piston" | "minecraft:sticky_piston" => Some(RsBlock::Piston {
-            sticky: reg.name_of(state) == "minecraft:sticky_piston",
-            facing: facing()?,
-            extended: read("extended")?.as_str() == "true",
-        }),
-        "minecraft:dispenser" => Some(RsBlock::Dispenser {
-            facing: facing()?,
-            triggered: read("triggered")?.as_str() == "true",
-        }),
-        "minecraft:dropper" => Some(RsBlock::Dropper {
-            facing: facing()?,
-            triggered: read("triggered")?.as_str() == "true",
-        }),
-        _ => None,
-    } })();
-    block.unwrap_or(RsBlock::RegistryState(state))
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn state_from_rs_block(reg: &BReg, block: &RsBlock) -> Option<u32> {
-    let mut properties = Vec::<(String, String)>::new();
-    let mut prop = |key: &str, value: String| properties.push((key.into(), value));
-    let name = match *block {
-        RsBlock::Air => "minecraft:air",
-        RsBlock::Solid => "minecraft:stone",
-        RsBlock::Glass => "minecraft:glass",
-        RsBlock::RegistryState(state) => return reg.properties_of(state).map(|_| state),
-        RsBlock::Container(_) | RsBlock::Source { .. } => return None,
-        RsBlock::RedstoneBlock => "minecraft:redstone_block",
-        RsBlock::Wire(wire) => {
-            prop("power", wire.power.to_string());
-            for (dir, connection) in RsDir::HORIZONTAL.into_iter().zip(wire.connections) {
-                prop(dir.property(), connection.property().into());
-            }
-            "minecraft:redstone_wire"
-        }
-        RsBlock::Torch(torch) => {
-            prop("lit", torch.lit.to_string());
-            "minecraft:redstone_torch"
-        }
-        RsBlock::WallTorch(torch) => {
-            prop("facing", torch.facing.property().into());
-            prop("lit", torch.lit.to_string());
-            "minecraft:redstone_wall_torch"
-        }
-        RsBlock::Repeater(repeater) => {
-            prop("facing", repeater.facing.property().into());
-            prop("delay", repeater.delay.to_string());
-            prop("powered", repeater.powered.to_string());
-            prop("locked", repeater.locked.to_string());
-            "minecraft:repeater"
-        }
-        RsBlock::Comparator(comparator) => {
-            prop("facing", comparator.facing.property().into());
-            prop("mode", match comparator.mode {
-                RsComparatorMode::Compare => "compare",
-                RsComparatorMode::Subtract => "subtract",
-            }.into());
-            prop("powered", comparator.powered.to_string());
-            "minecraft:comparator"
-        }
-        RsBlock::Lever { face, facing, powered } => {
-            prop("face", face.property().into());
-            prop("facing", facing.property().into());
-            prop("powered", powered.to_string());
-            "minecraft:lever"
-        }
-        RsBlock::Button { kind, face, facing, powered } => {
-            prop("face", face.property().into());
-            prop("facing", facing.property().into());
-            prop("powered", powered.to_string());
-            match kind {
-                RsButtonKind::Stone => "minecraft:stone_button",
-                RsButtonKind::Oak => "minecraft:oak_button",
-            }
-        }
-        RsBlock::Piston { sticky, facing, extended } => {
-            prop("facing", facing.property().into());
-            prop("extended", extended.to_string());
-            if sticky { "minecraft:sticky_piston" } else { "minecraft:piston" }
-        }
-        RsBlock::Lamp { lit } => {
-            prop("lit", lit.to_string());
-            "minecraft:redstone_lamp"
-        }
-        RsBlock::Hopper { enabled, facing } => {
-            prop("enabled", enabled.to_string());
-            prop("facing", facing.property().into());
-            "minecraft:hopper"
-        }
-        RsBlock::Dispenser { triggered, facing } => {
-            prop("triggered", triggered.to_string());
-            prop("facing", facing.property().into());
-            "minecraft:dispenser"
-        }
-        RsBlock::Dropper { triggered, facing } => {
-            prop("triggered", triggered.to_string());
-            prop("facing", facing.property().into());
-            "minecraft:dropper"
-        }
-    };
-    reg.checked_state(name, &properties)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -620,6 +489,14 @@ trait RedstoneWorld {
             || matches!(self.redstone_block(pos), RsBlock::Hopper { .. })
     }
 
+    fn allows_wire_step_up(&self, pos: RsPos) -> bool {
+        self.supports_wire_on_top(pos)
+    }
+
+    fn item_frame_signal(&self, _pos: RsPos, _facing: RsDir) -> Option<u8> {
+        None
+    }
+
     fn container_analog_signal(&self, pos: RsPos) -> Option<u8> {
         match self.redstone_block(pos) {
             RsBlock::Container(signal) => Some(signal),
@@ -628,15 +505,27 @@ trait RedstoneWorld {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_signal_source(
+    world: &impl RedstoneWorld,
+    pos: RsPos,
+    toward: RsDir,
+    include_wire: bool,
+) -> RsBlock {
+    match world.redstone_block(pos) {
+        RsBlock::Wire(_) if !include_wire => RsBlock::Air,
+        // Vanilla samples current geometry for horizontal dust output.
+        RsBlock::Wire(wire) if wire.power != 0 && toward.horizontal_index().is_some() => {
+            RsBlock::Wire(wire.with_connections(world, pos))
+        }
+        block => block,
+    }
+}
+
 // Signal directions point from the emitting block toward the receiver.
 #[cfg_attr(not(test), allow(dead_code))]
 fn rs_signal_from(world: &impl RedstoneWorld, pos: RsPos, toward: RsDir, include_wire: bool) -> u8 {
-    let block = world.redstone_block(pos);
-    let weak = if include_wire || !matches!(block, RsBlock::Wire(_)) {
-        block.weak_signal(toward)
-    } else {
-        0
-    };
+    let weak = rs_signal_source(world, pos, toward, include_wire).weak_signal(toward);
     if weak == 15 || !world.is_redstone_conductor(pos) {
         return weak;
     }
@@ -645,12 +534,11 @@ fn rs_signal_from(world: &impl RedstoneWorld, pos: RsPos, toward: RsDir, include
     // an effective signal. The lookup never walks through a second conductor.
     let mut signal = weak;
     for dir in RsDir::ALL {
-        let source = world.redstone_block(pos.relative(dir));
-        if include_wire || !matches!(source, RsBlock::Wire(_)) {
-            signal = signal.max(source.direct_signal(dir.opposite()));
-            if signal == 15 {
-                break;
-            }
+        let toward = dir.opposite();
+        let source = rs_signal_source(world, pos.relative(dir), toward, include_wire);
+        signal = signal.max(source.direct_signal(toward));
+        if signal == 15 {
+            break;
         }
     }
     signal
@@ -670,7 +558,7 @@ fn rs_wire_connection(world: &impl RedstoneWorld, pos: RsPos, dir: RsDir) -> RsW
     let side = pos.relative(dir);
     let block = world.redstone_block(side);
     if !world.is_redstone_conductor(pos.above())
-        && world.supports_wire_on_top(side)
+        && world.allows_wire_step_up(side)
         && matches!(world.redstone_block(side.above()), RsBlock::Wire(_))
     {
         return if world.is_face_sturdy(side, dir.opposite()) {
@@ -682,6 +570,7 @@ fn rs_wire_connection(world: &impl RedstoneWorld, pos: RsPos, dir: RsDir) -> RsW
 
     let connects = match block {
         RsBlock::Repeater(repeater) => repeater.facing == dir || repeater.facing == dir.opposite(),
+        RsBlock::Observer { facing, .. } => facing == dir,
         _ => block.is_signal_source(),
     };
     if connects
@@ -780,18 +669,18 @@ fn rs_dispenser_input(world: &impl RedstoneWorld, pos: RsPos) -> bool {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(i8)]
 enum RsTickPriority {
-    ExtremelyHigh,
-    VeryHigh,
-    High,
-    Normal,
+    ExtremelyHigh = -3,
+    VeryHigh = -2,
+    High = -1,
+    Normal = 0,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct RsTorchHistory {
     shutoffs: VecDeque<u64>,
-    cooldown_until: u64,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -811,12 +700,24 @@ impl RsTorchHistory {
             self.shutoffs.pop_front();
         }
         self.shutoffs.push_back(now);
-        if self.shutoffs.len() >= Self::BURNOUT_THRESHOLD {
-            self.cooldown_until = now + Self::COOLDOWN;
-            return true;
-        }
-        false
+        self.shutoffs.len() >= Self::BURNOUT_THRESHOLD
     }
+
+    fn is_burned_out(&self, now: u64) -> bool {
+        self.shutoffs
+            .iter()
+            .rev()
+            .nth(Self::BURNOUT_THRESHOLD - 1)
+            .is_some_and(|&tick| now - tick <= Self::BURNOUT_WINDOW)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+trait RedstoneUpdates: RedstoneWorld {
+    fn set_component(&mut self, pos: RsPos, block: RsBlock);
+    fn schedule(&mut self, pos: RsPos, delay: u64, priority: RsTickPriority);
+    fn torch_histories(&mut self) -> &mut BTreeMap<RsPos, RsTorchHistory>;
+    fn dispense(&mut self, pos: RsPos);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -885,7 +786,7 @@ impl RedstoneSimGrid {
             }
             self.pending.remove(&pos);
             self.now = due;
-            self.run_tick(pos);
+            rs_run_tick(self, pos, due);
             self.settle();
         }
         self.now = target;
@@ -893,6 +794,21 @@ impl RedstoneSimGrid {
 
     fn take_dispense_events(&mut self) -> Vec<RsPos> {
         std::mem::take(&mut self.dispense_events)
+    }
+
+    fn settle(&mut self) {
+        let positions: Vec<_> = self.blocks.keys().copied().collect();
+        rs_settle_wires(self, positions.iter().copied());
+        for pos in positions {
+            let block = self.redstone_block(pos);
+            rs_update_device(self, pos, block);
+        }
+    }
+}
+
+impl RedstoneUpdates for RedstoneSimGrid {
+    fn set_component(&mut self, pos: RsPos, block: RsBlock) {
+        self.blocks.insert(pos, block);
     }
 
     fn schedule(&mut self, pos: RsPos, delay: u64, priority: RsTickPriority) {
@@ -905,511 +821,207 @@ impl RedstoneSimGrid {
         }
     }
 
-    fn settle(&mut self) {
-        self.settle_wires();
-        let devices: Vec<_> = self
-            .blocks
-            .iter()
-            .filter_map(|(&pos, &block)| {
-                matches!(
-                    block,
-                    RsBlock::Torch(_)
-                        | RsBlock::WallTorch(_)
-                        | RsBlock::Repeater(_)
-                        | RsBlock::Comparator(_)
-                        | RsBlock::Lamp { .. }
-                        | RsBlock::Hopper { .. }
-                        | RsBlock::Dispenser { .. }
-                        | RsBlock::Dropper { .. }
-                )
-                .then_some((pos, block))
-            })
-            .collect();
-        for (pos, block) in devices {
-            self.update_device(pos, block);
+    fn torch_histories(&mut self) -> &mut BTreeMap<RsPos, RsTorchHistory> {
+        &mut self.torches
+    }
+
+    fn dispense(&mut self, pos: RsPos) {
+        self.dispense_events.push(pos);
+    }
+}
+
+// Seed with non-wire power only. Relaxing from zero clears disconnected cycles
+// and computes the final power before writing any wire to the host.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_settle_wires(world: &mut impl RedstoneUpdates, positions: impl IntoIterator<Item = RsPos>) {
+    let mut wires = BTreeMap::new();
+    let mut downstream: BTreeMap<RsPos, Vec<RsPos>> = BTreeMap::new();
+    let mut queue = VecDeque::new();
+    for pos in positions {
+        let RsBlock::Wire(wire) = world.redstone_block(pos) else {
+            continue;
+        };
+        let mut updated = wire.with_connections(world, pos);
+        updated.power = rs_neighbor_signal(world, pos, false);
+        if updated.power > 1 {
+            queue.push_back(pos);
+        }
+        wires.insert(pos, (wire, updated));
+        for input in rs_wire_inputs(world, pos) {
+            if matches!(world.redstone_block(input), RsBlock::Wire(_)) {
+                downstream.entry(input).or_default().push(pos);
+            }
         }
     }
 
-    fn settle_wires(&mut self) {
-        let mut wires = BTreeMap::new();
-        let mut downstream: BTreeMap<RsPos, Vec<RsPos>> = BTreeMap::new();
-        let mut queue = VecDeque::new();
-
-        // Seed with non-wire power only. Each relaxation raises a level by at
-        // least one, and an unpowered cycle cannot sustain its old levels.
-        for (&pos, &block) in &self.blocks {
-            let RsBlock::Wire(wire) = block else { continue };
-            let mut wire = wire.with_connections(self, pos);
-            wire.power = rs_neighbor_signal(self, pos, false);
-            if wire.power > 1 {
-                queue.push_back(pos);
-            }
-            wires.insert(pos, wire);
-            for input in rs_wire_inputs(self, pos) {
-                if matches!(self.redstone_block(input), RsBlock::Wire(_)) {
-                    downstream.entry(input).or_default().push(pos);
-                }
-            }
-        }
-
-        while let Some(pos) = queue.pop_front() {
-            let candidate = wires[&pos].power.saturating_sub(1);
-            if let Some(receivers) = downstream.get(&pos) {
-                for receiver in receivers {
-                    let wire = wires.get_mut(receiver).expect("wire receiver was indexed");
-                    if candidate > wire.power {
-                        wire.power = candidate;
-                        if candidate > 1 {
-                            queue.push_back(*receiver);
-                        }
+    while let Some(pos) = queue.pop_front() {
+        let power = wires[&pos].1.power.saturating_sub(1);
+        if let Some(receivers) = downstream.get(&pos) {
+            for &receiver in receivers {
+                let (_, wire) = wires.get_mut(&receiver).expect("wire receiver was indexed");
+                if power > wire.power {
+                    wire.power = power;
+                    if power > 1 {
+                        queue.push_back(receiver);
                     }
                 }
             }
         }
-
-        for (pos, wire) in wires {
-            self.blocks.insert(pos, RsBlock::Wire(wire));
-        }
     }
 
-    fn diode_in_front(&self, pos: RsPos, facing: RsDir) -> bool {
-        self.redstone_block(pos.relative(facing))
-            .diode_facing()
-            .is_some_and(|other| other != facing.opposite())
-    }
-
-    fn update_device(&mut self, pos: RsPos, block: RsBlock) {
-        if let Some((attachment, lit)) = block.torch_attachment() {
-            let powered =
-                rs_signal_from(self, pos.relative(attachment), attachment.opposite(), true) != 0;
-            let cooling = self
-                .torches
-                .get(&pos)
-                .is_some_and(|history| self.now < history.cooldown_until);
-            if powered == lit && !cooling {
-                self.schedule(pos, RsTorchHistory::DELAY, RsTickPriority::Normal);
-            }
-            return;
-        }
-
-        let updated = match block {
-            RsBlock::Repeater(mut repeater) => {
-                repeater.locked = repeater.is_locked(self, pos);
-                let powered = rs_diode_rear_input(self, pos, repeater.facing) != 0;
-                if !repeater.locked && repeater.powered != powered {
-                    let priority = if self.diode_in_front(pos, repeater.facing) {
-                        RsTickPriority::ExtremelyHigh
-                    } else if repeater.powered {
-                        RsTickPriority::VeryHigh
-                    } else {
-                        RsTickPriority::High
-                    };
-                    self.schedule(pos, repeater.delay_ticks(), priority);
-                }
-                RsBlock::Repeater(repeater)
-            }
-            RsBlock::Comparator(comparator) => {
-                if comparator.output != comparator.evaluate(self, pos) {
-                    let priority = if self.diode_in_front(pos, comparator.facing) {
-                        RsTickPriority::High
-                    } else {
-                        RsTickPriority::Normal
-                    };
-                    self.schedule(pos, ComparatorBlock::DELAY_TICKS, priority);
-                }
-                block
-            }
-            RsBlock::Lamp { lit } => {
-                let powered = rs_neighbor_signal(self, pos, true) != 0;
-                if lit && !powered {
-                    self.schedule(pos, 4, RsTickPriority::Normal);
-                }
-                RsBlock::Lamp {
-                    lit: lit || powered,
-                }
-            }
-            RsBlock::Hopper { facing, .. } => RsBlock::Hopper {
-                enabled: rs_neighbor_signal(self, pos, true) == 0,
-                facing,
-            },
-            RsBlock::Dispenser { triggered, .. } | RsBlock::Dropper { triggered, .. } => {
-                let powered = rs_dispenser_input(self, pos);
-                if !triggered && powered {
-                    self.schedule(pos, 4, RsTickPriority::Normal);
-                }
-                block.with_triggered(powered)
-            }
-            _ => block,
-        };
-        if updated != block {
-            self.blocks.insert(pos, updated);
+    for (pos, (wire, updated)) in wires {
+        if updated != wire {
+            world.set_component(pos, RsBlock::Wire(updated));
         }
     }
+}
 
-    fn run_tick(&mut self, pos: RsPos) {
-        let block = self.redstone_block(pos);
-        if let Some((attachment, lit)) = block.torch_attachment() {
-            let powered =
-                rs_signal_from(self, pos.relative(attachment), attachment.opposite(), true) != 0;
-            if lit && powered {
-                if self
-                    .torches
-                    .entry(pos)
-                    .or_default()
-                    .record_shutoff(self.now)
-                {
-                    self.schedule(pos, RsTorchHistory::COOLDOWN, RsTickPriority::Normal);
-                }
-                self.blocks.insert(pos, block.with_torch_lit(false));
-            } else if !lit
-                && !powered
-                && !self
-                    .torches
-                    .get(&pos)
-                    .is_some_and(|history| self.now < history.cooldown_until)
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_diode_in_front(world: &impl RedstoneWorld, pos: RsPos, facing: RsDir) -> bool {
+    world
+        .redstone_block(pos.relative(facing))
+        .diode_facing()
+        .is_some_and(|other| other != facing.opposite())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_update_device(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock) {
+    if let Some((attachment, lit)) = block.torch_attachment() {
+        let powered =
+            rs_signal_from(world, pos.relative(attachment), attachment.opposite(), true) != 0;
+        if powered == lit {
+            world.schedule(pos, RsTorchHistory::DELAY, RsTickPriority::Normal);
+        }
+        return;
+    }
+
+    let updated = match block {
+        RsBlock::Repeater(mut repeater) => {
+            repeater.locked = repeater.is_locked(world, pos);
+            let powered = rs_diode_rear_input(world, pos, repeater.facing) != 0;
+            if !repeater.locked && repeater.powered != powered {
+                let priority = if rs_diode_in_front(world, pos, repeater.facing) {
+                    RsTickPriority::ExtremelyHigh
+                } else if repeater.powered {
+                    RsTickPriority::VeryHigh
+                } else {
+                    RsTickPriority::High
+                };
+                world.schedule(pos, repeater.delay_ticks(), priority);
+            }
+            RsBlock::Repeater(repeater)
+        }
+        RsBlock::Comparator(comparator) => {
+            if (comparator.output, comparator.powered) != comparator.evaluate(world, pos) {
+                let priority = if rs_diode_in_front(world, pos, comparator.facing) {
+                    RsTickPriority::High
+                } else {
+                    RsTickPriority::Normal
+                };
+                world.schedule(pos, ComparatorBlock::DELAY_TICKS, priority);
+            }
+            block
+        }
+        RsBlock::Lamp { lit } => {
+            let powered = rs_neighbor_signal(world, pos, true) != 0;
+            if lit && !powered {
+                world.schedule(pos, 4, RsTickPriority::Normal);
+            }
+            RsBlock::Lamp {
+                lit: lit || powered,
+            }
+        }
+        RsBlock::Hopper { facing, .. } => RsBlock::Hopper {
+            enabled: rs_neighbor_signal(world, pos, true) == 0,
+            facing,
+        },
+        RsBlock::Dispenser { triggered, .. } | RsBlock::Dropper { triggered, .. } => {
+            let powered = rs_dispenser_input(world, pos);
+            if !triggered && powered {
+                world.schedule(pos, 4, RsTickPriority::Normal);
+            }
+            block.with_triggered(powered)
+        }
+        _ => block,
+    };
+    if updated != block {
+        world.set_component(pos, updated);
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
+    let block = world.redstone_block(pos);
+    if let Some((attachment, lit)) = block.torch_attachment() {
+        let powered =
+            rs_signal_from(world, pos.relative(attachment), attachment.opposite(), true) != 0;
+        if lit && powered {
+            if world
+                .torch_histories()
+                .entry(pos)
+                .or_default()
+                .record_shutoff(now)
             {
-                self.blocks.insert(pos, block.with_torch_lit(true));
+                world.schedule(pos, RsTorchHistory::COOLDOWN, RsTickPriority::Normal);
+            }
+            world.set_component(pos, block.with_torch_lit(false));
+        } else if !lit
+            && !powered
+            && !world
+                .torch_histories()
+                .get(&pos)
+                .is_some_and(|history| history.is_burned_out(now))
+        {
+            world.set_component(pos, block.with_torch_lit(true));
+        }
+        return;
+    }
+
+    let updated = match block {
+        RsBlock::Repeater(mut repeater) if !repeater.is_locked(world, pos) => {
+            let input = rs_diode_rear_input(world, pos, repeater.facing) != 0;
+            if !repeater.powered && !input {
+                // A queued rising edge still turns on after the input falls.
+                world.schedule(pos, repeater.delay_ticks(), RsTickPriority::VeryHigh);
+            }
+            repeater.powered = !repeater.powered || input;
+            RsBlock::Repeater(repeater)
+        }
+        RsBlock::Comparator(mut comparator) => {
+            let (output, powered) = comparator.evaluate(world, pos);
+            // In subtract mode a refresh only updates POWERED if the output changed.
+            if output != comparator.output || comparator.mode == RsComparatorMode::Compare {
+                comparator.powered = powered;
+                comparator.output = output;
+                world.set_component(pos, RsBlock::Comparator(comparator));
             }
             return;
         }
-
-        let updated = match block {
-            RsBlock::Repeater(mut repeater) if !repeater.is_locked(self, pos) => {
-                let input = rs_diode_rear_input(self, pos, repeater.facing) != 0;
-                if !repeater.powered && !input {
-                    // A queued rising edge still turns on after the input falls.
-                    self.schedule(pos, repeater.delay_ticks(), RsTickPriority::VeryHigh);
-                }
-                repeater.powered = !repeater.powered || input;
-                RsBlock::Repeater(repeater)
-            }
-            RsBlock::Comparator(mut comparator) => {
-                comparator.output = comparator.evaluate(self, pos);
-                comparator.powered = comparator.output > 0;
-                RsBlock::Comparator(comparator)
-            }
-            RsBlock::Lamp { lit: true } if rs_neighbor_signal(self, pos, true) == 0 => {
-                RsBlock::Lamp { lit: false }
-            }
-            RsBlock::Dispenser { .. } | RsBlock::Dropper { .. } => {
-                self.dispense_events.push(pos);
-                block
-            }
-            _ => block,
-        };
-        if updated != block {
-            self.blocks.insert(pos, updated);
+        RsBlock::Lamp { lit: true } if rs_neighbor_signal(world, pos, true) == 0 => {
+            RsBlock::Lamp { lit: false }
         }
+        RsBlock::Dispenser { .. } | RsBlock::Dropper { .. } => {
+            world.dispense(pos);
+            block
+        }
+        _ => block,
+    };
+    if updated != block {
+        world.set_component(pos, updated);
     }
-}
-
-/// A delayed Redstone transition. The caller owns the pending queue across world ticks.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ScheduledRsUpdate {
-    position: (i32, i32, i32),
-    due_tick: u64,
-    priority: RsTickPriority,
-}
-
-/// A read-through view of live 1.21.1 state IDs, with batched changes. Reads see
-/// pending writes, so wire propagation can settle before the world is notified.
-#[cfg_attr(not(test), allow(dead_code))]
-struct BRegRedstoneWorld<'a, GetState> {
-    reg: &'a BReg,
-    get_state: GetState,
-    changes: BTreeMap<RsPos, u32>,
-    now_tick: u64,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl<GetState: Fn((i32, i32, i32)) -> u32> BRegRedstoneWorld<'_, GetState> {
-    fn state(&self, pos: RsPos) -> u32 {
-        self.changes.get(&pos).copied().unwrap_or_else(|| {
-            (self.get_state)((pos.0, pos.1, pos.2))
-        })
-    }
-
-    fn change(&mut self, pos: RsPos, block: RsBlock) {
-        let Some(state) = state_from_rs_block(self.reg, &block) else { return };
-        let original = (self.get_state)((pos.0, pos.1, pos.2));
-        if state == original {
-            self.changes.remove(&pos);
-        } else {
-            self.changes.insert(pos, state);
-        }
-    }
-
-    fn commit(self, mut set_state: impl FnMut((i32, i32, i32), u32)) {
-        for (RsPos(x, y, z), state) in self.changes {
-            set_state((x, y, z), state);
-        }
-    }
-
-    // Follow the connected dust network in either direction, including elevation
-    // steps. A bounded seed neighborhood catches inputs through powered conductors.
-    fn wire_network(&self, origins: &[RsPos]) -> RsBTreeSet<RsPos> {
-        let mut network = RsBTreeSet::new();
-        let mut queue = VecDeque::new();
-        for &origin in origins {
-            for dx in -2..=2 {
-                for dy in -2..=2 {
-                    for dz in -2..=2 {
-                        let pos = RsPos(origin.0 + dx, origin.1 + dy, origin.2 + dz);
-                        if matches!(self.redstone_block(pos), RsBlock::Wire(_))
-                            && network.insert(pos)
-                        {
-                            queue.push_back(pos);
-                        }
-                    }
-                }
-            }
-        }
-        while let Some(pos) = queue.pop_front() {
-            let inputs: RsBTreeSet<_> = rs_wire_inputs(self, pos).collect();
-            for dir in RsDir::HORIZONTAL {
-                let side = pos.relative(dir);
-                for dy in -1..=1 {
-                    let neighbor = RsPos(side.0, side.1 + dy, side.2);
-                    if !matches!(self.redstone_block(neighbor), RsBlock::Wire(_))
-                        || network.contains(&neighbor)
-                    {
-                        continue;
-                    }
-                    if (inputs.contains(&neighbor)
-                        || rs_wire_inputs(self, neighbor).any(|input| input == pos))
-                        && network.insert(neighbor)
-                    {
-                        queue.push_back(neighbor);
-                    }
-                }
-            }
-        }
-        network
-    }
-
-    fn settle_wires(&mut self, network: &RsBTreeSet<RsPos>) {
-        let mut wires = BTreeMap::new();
-        for &pos in network {
-            let RsBlock::Wire(mut wire) = self.redstone_block(pos) else { continue };
-            wire.power = 0;
-            self.change(pos, RsBlock::Wire(wire));
-            wires.insert(pos, wire);
-        }
-
-        let mut downstream: BTreeMap<RsPos, Vec<RsPos>> = BTreeMap::new();
-        let mut queue = VecDeque::new();
-        for (&pos, wire) in &mut wires {
-            wire.connections = wire.with_connections(self, pos).connections;
-            wire.power = rs_neighbor_signal(self, pos, false);
-            if wire.power > 1 {
-                queue.push_back(pos);
-            }
-            for input in rs_wire_inputs(self, pos) {
-                if network.contains(&input) {
-                    downstream.entry(input).or_default().push(pos);
-                }
-            }
-        }
-        while let Some(pos) = queue.pop_front() {
-            let power = wires[&pos].power.saturating_sub(1);
-            if let Some(receivers) = downstream.get(&pos) {
-                for receiver in receivers {
-                    let wire = wires.get_mut(receiver).expect("registered wire input");
-                    if wire.power < power {
-                        wire.power = power;
-                        if power > 1 {
-                            queue.push_back(*receiver);
-                        }
-                    }
-                }
-            }
-        }
-        for (pos, wire) in wires {
-            self.change(pos, RsBlock::Wire(wire));
-        }
-    }
-
-    fn propagate(&mut self, origins: &[RsPos]) -> Vec<ScheduledRsUpdate> {
-        let network = self.wire_network(origins);
-        self.settle_wires(&network);
-        let mut inspect = RsBTreeSet::new();
-        for &origin in origins.iter().chain(network.iter()) {
-            for dx in -2..=2 {
-                for dy in -2..=2 {
-                    for dz in -2..=2 {
-                        inspect.insert(RsPos(origin.0 + dx, origin.1 + dy, origin.2 + dz));
-                    }
-                }
-            }
-        }
-
-        let mut scheduled = BTreeMap::<RsPos, (u64, RsTickPriority)>::new();
-        let now_tick = self.now_tick;
-        let mut schedule = |pos: RsPos, delay: u64, priority: RsTickPriority| {
-            scheduled.entry(pos).or_insert((now_tick.saturating_add(delay), priority));
-        };
-        for pos in inspect {
-            let block = self.redstone_block(pos);
-            if let Some((attachment, lit)) = block.torch_attachment() {
-                let powered = rs_signal_from(self, pos.relative(attachment), attachment.opposite(), true) != 0;
-                if lit == powered {
-                    schedule(pos, RsTorchHistory::DELAY, RsTickPriority::Normal);
-                }
-                continue;
-            }
-            match block {
-                RsBlock::Repeater(mut repeater) => {
-                    repeater.locked = repeater.is_locked(self, pos);
-                    if !repeater.locked
-                        && repeater.powered != (rs_diode_rear_input(self, pos, repeater.facing) > 0)
-                    {
-                        let priority = if self.redstone_block(pos.relative(repeater.facing))
-                            .diode_facing().is_some_and(|facing| facing != repeater.facing.opposite())
-                        {
-                            RsTickPriority::ExtremelyHigh
-                        } else if repeater.powered {
-                            RsTickPriority::VeryHigh
-                        } else {
-                            RsTickPriority::High
-                        };
-                        schedule(pos, repeater.delay_ticks(), priority);
-                    }
-                    self.change(pos, RsBlock::Repeater(repeater));
-                }
-                RsBlock::Comparator(comparator) => {
-                    if (comparator.evaluate(self, pos) > 0) != comparator.powered {
-                        schedule(pos, ComparatorBlock::DELAY_TICKS, RsTickPriority::Normal);
-                    }
-                }
-                RsBlock::Lamp { lit } => {
-                    let powered = rs_neighbor_signal(self, pos, true) != 0;
-                    if lit && !powered {
-                        schedule(pos, 4, RsTickPriority::Normal);
-                    } else if powered && !lit {
-                        self.change(pos, RsBlock::Lamp { lit: true });
-                    }
-                }
-                RsBlock::Hopper { facing, .. } => {
-                    let enabled = rs_neighbor_signal(self, pos, true) == 0;
-                    self.change(pos, RsBlock::Hopper {
-                        enabled, facing,
-                    });
-                }
-                RsBlock::Dispenser { triggered, .. } | RsBlock::Dropper { triggered, .. } => {
-                    let powered = rs_dispenser_input(self, pos);
-                    if powered && !triggered {
-                        schedule(pos, 4, RsTickPriority::Normal);
-                    }
-                    self.change(pos, block.with_triggered(powered));
-                }
-                _ => {}
-            }
-        }
-        scheduled.into_iter().map(|(pos, (due_tick, priority))| ScheduledRsUpdate {
-            position: (pos.0, pos.1, pos.2), due_tick, priority,
-        }).collect()
-    }
-}
-
-impl<GetState: Fn((i32, i32, i32)) -> u32> RedstoneWorld for BRegRedstoneWorld<'_, GetState> {
-    fn redstone_block(&self, pos: RsPos) -> RsBlock {
-        rs_block_from_state(self.reg, self.state(pos))
-    }
-
-    fn is_redstone_conductor(&self, pos: RsPos) -> bool {
-        self.reg.is_redstone_conductor(self.state(pos))
-    }
-
-    fn is_face_sturdy(&self, pos: RsPos, face: RsDir) -> bool {
-        let direction = RsDir::ALL.iter().position(|&dir| dir == face).expect("native direction") as u8;
-        self.reg.is_face_sturdy(self.state(pos), direction, crate::block_registry::Support::Full)
-    }
-}
-
-/// Propagate changes from block-state origins and return the delayed transitions
-/// to enqueue in the host tick scheduler. The reader must include the newly
-/// placed state at each origin. All writes are committed after signal evaluation.
-#[cfg_attr(not(test), allow(dead_code))]
-fn redstone_propagate_states(
-    reg: &BReg,
-    now_tick: u64,
-    origins: &[(i32, i32, i32)],
-    get_state: impl Fn((i32, i32, i32)) -> u32,
-    set_state: impl FnMut((i32, i32, i32), u32),
-) -> Vec<ScheduledRsUpdate> {
-    let mut world = BRegRedstoneWorld { reg, get_state, changes: BTreeMap::new(), now_tick };
-    let positions: Vec<_> = origins.iter().map(|&(x, y, z)| RsPos(x, y, z)).collect();
-    let updates = world.propagate(&positions);
-    world.commit(set_state);
-    updates
-}
-
-/// Apply due host-scheduled transitions and propagate their new block states.
-/// Future entries are returned alongside newly scheduled transitions. The host
-/// must retain this queue between calls, including pending dispenser/dropper events.
-#[cfg_attr(not(test), allow(dead_code))]
-fn redstone_apply_scheduled_states(
-    reg: &BReg,
-    now_tick: u64,
-    updates: &[ScheduledRsUpdate],
-    get_state: impl Fn((i32, i32, i32)) -> u32,
-    set_state: impl FnMut((i32, i32, i32), u32),
-) -> Vec<ScheduledRsUpdate> {
-    let mut world = BRegRedstoneWorld { reg, get_state, changes: BTreeMap::new(), now_tick };
-    let mut pending = Vec::new();
-    let mut due: Vec<_> = updates.iter().copied().filter(|tick| tick.due_tick <= now_tick).collect();
-    due.sort_by_key(|tick| (tick.due_tick, tick.priority, tick.position));
-    let mut changed = Vec::new();
-    for tick in due {
-        let (x, y, z) = tick.position;
-        let pos = RsPos(x, y, z);
-        let block = world.redstone_block(pos);
-        let updated = if let Some((attachment, _)) = block.torch_attachment() {
-            let powered = rs_signal_from(&world, pos.relative(attachment), attachment.opposite(), true) > 0;
-            block.with_torch_lit(!powered)
-        } else {
-            match block {
-                RsBlock::Repeater(mut repeater) if !repeater.is_locked(&world, pos) => {
-                    let input = rs_diode_rear_input(&world, pos, repeater.facing) > 0;
-                    repeater.powered = !repeater.powered || input;
-                    RsBlock::Repeater(repeater)
-                }
-                RsBlock::Comparator(mut comparator) => {
-                    comparator.output = comparator.evaluate(&world, pos);
-                    comparator.powered = comparator.output > 0;
-                    RsBlock::Comparator(comparator)
-                }
-                RsBlock::Lamp { lit: true } if rs_neighbor_signal(&world, pos, true) == 0 => {
-                    RsBlock::Lamp { lit: false }
-                }
-                _ => block,
-            }
-        };
-        if updated != block {
-            world.change(pos, updated);
-            changed.push(pos);
-        }
-    }
-    pending.extend(updates.iter().copied().filter(|tick| tick.due_tick > now_tick));
-    pending.extend(world.propagate(&changed));
-    pending.sort_by_key(|tick| (tick.due_tick, tick.priority, tick.position));
-    pending.dedup_by_key(|tick| (tick.position, tick.due_tick));
-    world.commit(set_state);
-    pending
 }
 
 #[cfg(test)]
 mod redstone_tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-    use std::rc::Rc;
+    use crate::json::jparse;
 
     const ORIGIN: RsPos = RsPos(0, 0, 0);
 
     fn registered(reg: &BReg, name: &str, properties: &[(&str, &str)]) -> u32 {
-        let properties = properties.iter().map(|&(key, value)| (key.into(), value.into()))
+        let properties = properties
+            .iter()
+            .map(|&(key, value)| (key.into(), value.into()))
             .collect::<Vec<_>>();
         reg.checked_state(name, &properties)
             .unwrap_or_else(|| panic!("missing 1.21.1 state {name} {properties:?}"))
@@ -1417,114 +1029,153 @@ mod redstone_tests {
 
     #[test]
     fn registry_codec_round_trips_every_supported_1211_state() {
-        let reg = crate::block_registry::breg().expect("1.21.1 block registry");
-        let names = [
-            "minecraft:redstone_wire", "minecraft:redstone_torch", "minecraft:redstone_wall_torch",
-            "minecraft:repeater", "minecraft:comparator", "minecraft:redstone_block",
-            "minecraft:lever", "minecraft:stone_button", "minecraft:oak_button",
-            "minecraft:redstone_lamp", "minecraft:hopper", "minecraft:piston",
-            "minecraft:sticky_piston", "minecraft:dispenser", "minecraft:dropper",
-        ];
-        let mut counts = [0usize; 15];
-        for raw in 0..reg.state_count() {
-            let state = raw as u32;
-            let Some(index) = names.iter().position(|&name| name == reg.name_of(state)) else {
-                continue;
-            };
-            let block = rs_block_from_state(reg, state);
-            assert!(!matches!(block, RsBlock::RegistryState(_)),
-                "{state} {} failed to decode", reg.name_of(state));
-            assert_eq!(state_from_rs_block(reg, &block), Some(state),
-                "{state} {} {:?}", reg.name_of(state), reg.properties_of(state));
-            counts[index] += 1;
+        let reg = breg().unwrap();
+        let asset = std::fs::read("assets/block_states_1211.json").unwrap();
+        let states = jparse(&asset).unwrap();
+        let mut count = 0;
+        for entry in states.get("blocks").unwrap().as_arr().unwrap() {
+            let row = entry.as_arr().unwrap();
+            let name = row[0].str();
+            let name = name.strip_prefix("minecraft:").unwrap_or(name);
+            let modeled = matches!(
+                name,
+                "air"
+                    | "redstone_wire"
+                    | "repeater"
+                    | "comparator"
+                    | "redstone_torch"
+                    | "redstone_wall_torch"
+                    | "lever"
+                    | "observer"
+                    | "target"
+                    | "redstone_block"
+                    | "redstone_lamp"
+                    | "hopper"
+                    | "piston"
+                    | "sticky_piston"
+                    | "dispenser"
+                    | "dropper"
+            ) || name.ends_with("_button");
+            let start = row[1].num() as u32;
+            let len = row[2].num() as u32;
+            if name == "redstone_wire" {
+                assert_eq!(len, 16 * 3u32.pow(4), "wire power and connection states");
+            }
+            for state in start..start + len {
+                let block = rs_block_from_state(reg, state);
+                assert_eq!(
+                    !matches!(block, RsBlock::RegistryState(_)),
+                    modeled,
+                    "{name} state {state}"
+                );
+                assert_eq!(
+                    state_from_rs_block(reg, &block),
+                    Some(state),
+                    "{name} state {state}"
+                );
+                count += 1;
+            }
         }
-        assert!(counts.iter().all(|&count| count != 0), "missing registry types: {counts:?}");
-        assert_eq!(counts[0], 16 * 3usize.pow(4), "wire power and connection states");
-
-        let arbitrary = registered(reg, "minecraft:oak_slab", &[("type", "top")]);
-        assert_eq!(rs_block_from_state(reg, arbitrary), RsBlock::RegistryState(arbitrary));
-        assert_eq!(state_from_rs_block(reg, &RsBlock::RegistryState(arbitrary)), Some(arbitrary));
-        assert_eq!(state_from_rs_block(reg, &RsBlock::RegistryState(u32::MAX)), None);
-        assert_eq!(state_from_rs_block(reg, &RsBlock::Wire(RedStoneWireBlock {
-            power: 16, ..RedStoneWireBlock::default()
-        })), None);
+        assert_eq!(count, reg.state_count());
+        let invalid = rs_block_from_state(reg, u32::MAX);
+        assert_eq!(invalid, RsBlock::RegistryState(u32::MAX));
+        assert_eq!(state_from_rs_block(reg, &invalid), None);
+        assert_eq!(
+            state_from_rs_block(
+                reg,
+                &RsBlock::Wire(RedStoneWireBlock {
+                    power: 16,
+                    ..RedStoneWireBlock::default()
+                })
+            ),
+            None
+        );
     }
 
     #[test]
     fn registry_conductor_and_support_use_native_state_flags() {
-        let reg = crate::block_registry::breg().expect("1.21.1 block registry");
-        let stone = registered(reg, "minecraft:stone", &[]);
-        let glass = registered(reg, "minecraft:glass", &[]);
-        let air = registered(reg, "minecraft:air", &[]);
-        let slab = registered(reg, "minecraft:oak_slab", &[("type", "bottom")]);
-        let states = HashMap::from([((0, 0, 0), stone), ((1, 0, 0), glass),
-            ((2, 0, 0), air), ((3, 0, 0), slab)]);
-        let world = BRegRedstoneWorld {
-            reg, get_state: |pos| *states.get(&pos).unwrap_or(&air),
-            changes: BTreeMap::new(), now_tick: 0,
-        };
-        assert!(world.is_redstone_conductor(RsPos(0, 0, 0)));
+        let reg = breg().unwrap();
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        world.states.extend([
+            (RsPos(0, 0, 0), registered(reg, "stone", &[])),
+            (RsPos(1, 0, 0), registered(reg, "glass", &[])),
+            (
+                RsPos(3, 0, 0),
+                registered(reg, "oak_slab", &[("type", "bottom")]),
+            ),
+        ]);
+        let adapter = RedstoneWorldAdapter::new(reg, &mut world, &mut torches);
+        assert!(adapter.is_redstone_conductor(ORIGIN));
         for x in 1..=3 {
-            assert!(!world.is_redstone_conductor(RsPos(x, 0, 0)), "x={x}");
+            assert!(!adapter.is_redstone_conductor(RsPos(x, 0, 0)), "x={x}");
         }
-        assert!(world.is_face_sturdy(RsPos(0, 0, 0), RsDir::Up));
-        assert!(world.is_face_sturdy(RsPos(1, 0, 0), RsDir::Up));
-        assert!(!world.is_face_sturdy(RsPos(2, 0, 0), RsDir::Up));
+        assert!(adapter.is_face_sturdy(ORIGIN, RsDir::Up));
+        assert!(adapter.is_face_sturdy(RsPos(1, 0, 0), RsDir::Up));
+        assert!(!adapter.is_face_sturdy(RsPos(2, 0, 0), RsDir::Up));
     }
 
     #[test]
     fn registry_states_drive_torch_wire_repeater_lamp_circuit() {
-        let reg = crate::block_registry::breg().expect("1.21.1 block registry");
-        let air = registered(reg, "minecraft:air", &[]);
-        let stone = registered(reg, "minecraft:stone", &[]);
-        let torch = registered(reg, "minecraft:redstone_torch", &[("lit", "true")]);
-        let wire = registered(reg, "minecraft:redstone_wire", &[("power", "0")]);
-        let repeater = registered(reg, "minecraft:repeater", &[
-            ("facing", "east"), ("delay", "1"), ("powered", "false"),
+        let reg = breg().unwrap();
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let [torch, wire, repeater, lamp] = [0, 1, 2, 3].map(|x| RsPos(x, 1, 0));
+        let stone = registered(reg, "stone", &[]);
+        world.states.extend([
+            (ORIGIN, stone),
+            (RsPos(1, 0, 0), stone),
+            (RsPos(2, 0, 0), stone),
+            (torch, registered(reg, "redstone_torch", &[("lit", "true")])),
+            (wire, registered(reg, "redstone_wire", &[("power", "0")])),
+            (
+                repeater,
+                registered(
+                    reg,
+                    "repeater",
+                    &[("facing", "west"), ("delay", "1"), ("powered", "false")],
+                ),
+            ),
+            (lamp, registered(reg, "redstone_lamp", &[("lit", "false")])),
         ]);
-        let lamp = registered(reg, "minecraft:redstone_lamp", &[("lit", "false")]);
-        let source = registered(reg, "minecraft:redstone_block", &[]);
-        let blocks = Rc::new(RefCell::new(HashMap::from([
-            ((0, 0, 0), stone), ((1, 0, 0), stone),
-            ((0, 1, 0), torch), ((1, 1, 0), wire),
-            ((2, 1, 0), repeater), ((3, 1, 0), lamp),
-        ])));
-        let propagate = |now_tick, origins: &[(i32, i32, i32)]| {
-            let reader = Rc::clone(&blocks);
-            let writer = Rc::clone(&blocks);
-            redstone_propagate_states(reg, now_tick, origins,
-                move |pos| reader.borrow().get(&pos).copied().unwrap_or(air),
-                move |pos, state| { writer.borrow_mut().insert(pos, state); })
-        };
-        let apply = |now_tick, updates: &[ScheduledRsUpdate]| {
-            let reader = Rc::clone(&blocks);
-            let writer = Rc::clone(&blocks);
-            redstone_apply_scheduled_states(reg, now_tick, updates,
-                move |pos| reader.borrow().get(&pos).copied().unwrap_or(air),
-                move |pos, state| { writer.borrow_mut().insert(pos, state); })
-        };
-        let at = |pos| blocks.borrow().get(&pos).copied().unwrap_or(air);
+        let prop = |world: &MemoryWorld, pos, key| reg.get_prop(world.state_at(pos), key);
 
-        let updates = propagate(0, &[(0, 1, 0), (1, 1, 0), (2, 1, 0), (3, 1, 0)]);
-        assert_eq!(reg.get_prop(at((1, 1, 0)), "power").as_deref(), Some("15"));
-        assert_eq!(reg.get_prop(at((2, 1, 0)), "powered").as_deref(), Some("false"));
-        assert!(updates.iter().any(|update| update.position == (2, 1, 0) && update.due_tick == 2));
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches)
+            .propagate(&[torch, wire, repeater, lamp]);
+        assert_eq!(prop(&world, wire, "power").as_deref(), Some("15"));
+        assert_eq!(prop(&world, repeater, "powered").as_deref(), Some("false"));
+        assert!(world
+            .pending
+            .iter()
+            .any(|&(due, tick)| due == 2 && tick.pos == repeater));
 
-        let updates = apply(2, &updates);
-        assert_eq!(reg.get_prop(at((2, 1, 0)), "powered").as_deref(), Some("true"));
-        assert_eq!(reg.get_prop(at((3, 1, 0)), "lit").as_deref(), Some("true"));
+        world.advance(2, &mut torches);
+        assert_eq!(prop(&world, repeater, "powered").as_deref(), Some("true"));
+        assert_eq!(prop(&world, lamp, "lit").as_deref(), Some("true"));
 
-        blocks.borrow_mut().insert((-1, 0, 0), source);
-        let updates = [updates, propagate(3, &[(-1, 0, 0)])].concat();
-        assert!(updates.iter().any(|update| update.position == (0, 1, 0) && update.due_tick == 5));
-        let updates = apply(5, &updates);
-        assert_eq!(reg.get_prop(at((0, 1, 0)), "lit").as_deref(), Some("false"));
-        assert_eq!(reg.get_prop(at((1, 1, 0)), "power").as_deref(), Some("0"));
-        let updates = apply(7, &updates);
-        assert_eq!(reg.get_prop(at((2, 1, 0)), "powered").as_deref(), Some("false"));
-        assert_eq!(reg.get_prop(at((3, 1, 0)), "lit").as_deref(), Some("true"));
-        let _updates = apply(11, &updates);
-        assert_eq!(reg.get_prop(at((3, 1, 0)), "lit").as_deref(), Some("false"));
+        world.advance(3, &mut torches);
+        let source = RsPos(-1, 0, 0);
+        world.states.insert(
+            source,
+            registered(
+                reg,
+                "lever",
+                &[("face", "wall"), ("facing", "west"), ("powered", "true")],
+            ),
+        );
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[source]);
+        assert!(world
+            .pending
+            .iter()
+            .any(|&(due, tick)| due == 5 && tick.pos == torch));
+        world.advance(5, &mut torches);
+        assert_eq!(prop(&world, torch, "lit").as_deref(), Some("false"));
+        assert_eq!(prop(&world, wire, "power").as_deref(), Some("0"));
+        world.advance(7, &mut torches);
+        assert_eq!(prop(&world, repeater, "powered").as_deref(), Some("false"));
+        assert_eq!(prop(&world, lamp, "lit").as_deref(), Some("true"));
+        world.advance(11, &mut torches);
+        assert_eq!(prop(&world, lamp, "lit").as_deref(), Some("false"));
     }
 
     fn wire() -> RsBlock {
@@ -1604,6 +1255,9 @@ mod redstone_tests {
         );
         assert_eq!(dust(&grid, output).power, 0);
         assert_eq!(rs_signal_from(&grid, ORIGIN, RsDir::East, true), 0);
+
+        grid.set_block(source, RsBlock::RedstoneBlock);
+        assert_eq!(dust(&grid, output).power, 0);
 
         grid.set_block(
             source,
@@ -2057,22 +1711,49 @@ mod redstone_tests {
         let dropper = RsPos(2, 0, 0);
         let qc = RsPos(1, 1, 0);
         let hopper_input = RsPos(0, 0, 2);
-        grid.set_block(ORIGIN, RsBlock::Dispenser { triggered: false, facing: RsDir::North });
-        grid.set_block(dropper, RsBlock::Dropper { triggered: false, facing: RsDir::North });
-        grid.set_block(hopper, RsBlock::Hopper { enabled: true, facing: RsDir::Down });
+        grid.set_block(
+            ORIGIN,
+            RsBlock::Dispenser {
+                triggered: false,
+                facing: RsDir::North,
+            },
+        );
+        grid.set_block(
+            dropper,
+            RsBlock::Dropper {
+                triggered: false,
+                facing: RsDir::North,
+            },
+        );
+        grid.set_block(
+            hopper,
+            RsBlock::Hopper {
+                enabled: true,
+                facing: RsDir::Down,
+            },
+        );
         grid.set_block(qc, RsBlock::RedstoneBlock);
         grid.set_block(hopper_input, RsBlock::RedstoneBlock);
         assert_eq!(
             grid.redstone_block(ORIGIN),
-            RsBlock::Dispenser { triggered: true, facing: RsDir::North }
+            RsBlock::Dispenser {
+                triggered: true,
+                facing: RsDir::North
+            }
         );
         assert_eq!(
             grid.redstone_block(dropper),
-            RsBlock::Dropper { triggered: true, facing: RsDir::North }
+            RsBlock::Dropper {
+                triggered: true,
+                facing: RsDir::North
+            }
         );
         assert_eq!(
             grid.redstone_block(hopper),
-            RsBlock::Hopper { enabled: false, facing: RsDir::Down }
+            RsBlock::Hopper {
+                enabled: false,
+                facing: RsDir::Down
+            }
         );
         grid.advance(3);
         assert!(grid.take_dispense_events().is_empty());
@@ -2085,11 +1766,17 @@ mod redstone_tests {
         grid.set_block(hopper_input, RsBlock::Air);
         assert_eq!(
             grid.redstone_block(hopper),
-            RsBlock::Hopper { enabled: true, facing: RsDir::Down }
+            RsBlock::Hopper {
+                enabled: true,
+                facing: RsDir::Down
+            }
         );
         assert_eq!(
             grid.redstone_block(ORIGIN),
-            RsBlock::Dispenser { triggered: false, facing: RsDir::North }
+            RsBlock::Dispenser {
+                triggered: false,
+                facing: RsDir::North
+            }
         );
         grid.set_block(qc, RsBlock::RedstoneBlock);
         grid.set_block(qc, RsBlock::Air);
@@ -2106,7 +1793,13 @@ mod redstone_tests {
         let third = RsPos(3, 0, 0);
         let removed = RsPos(4, 0, 0);
         for pos in [later, second, first, third, removed] {
-            grid.set_block(pos, RsBlock::Dispenser { triggered: false, facing: RsDir::North });
+            grid.set_block(
+                pos,
+                RsBlock::Dispenser {
+                    triggered: false,
+                    facing: RsDir::North,
+                },
+            );
         }
         grid.schedule(later, 3, RsTickPriority::ExtremelyHigh);
         grid.schedule(second, 2, RsTickPriority::Normal);
@@ -2114,8 +1807,490 @@ mod redstone_tests {
         grid.schedule(first, 2, RsTickPriority::High);
         grid.schedule(third, 2, RsTickPriority::Normal);
         grid.set_block(removed, RsBlock::Air);
-        grid.set_block(removed, RsBlock::Dispenser { triggered: false, facing: RsDir::North });
+        grid.set_block(
+            removed,
+            RsBlock::Dispenser {
+                triggered: false,
+                facing: RsDir::North,
+            },
+        );
         grid.advance(3);
         assert_eq!(grid.take_dispense_events(), [first, second, third, later]);
+    }
+
+    struct MemoryWorld<'a> {
+        reg: &'a BReg,
+        states: BTreeMap<RsPos, u32>,
+        comparator_outputs: BTreeMap<RsPos, u8>,
+        analog: BTreeMap<RsPos, u8>,
+        item_frames: BTreeMap<RsPos, (RsDir, u8)>,
+        dispensed: Vec<RsPos>,
+        updates: VecDeque<RsPos>,
+        pending: Vec<(u64, RsWorldTick)>,
+        now: u64,
+    }
+
+    impl<'a> MemoryWorld<'a> {
+        fn new(reg: &'a BReg) -> Self {
+            Self {
+                reg,
+                states: BTreeMap::new(),
+                comparator_outputs: BTreeMap::new(),
+                analog: BTreeMap::new(),
+                item_frames: BTreeMap::new(),
+                dispensed: Vec::new(),
+                updates: VecDeque::new(),
+                pending: Vec::new(),
+                now: 0,
+            }
+        }
+
+        fn drain_updates(&mut self, torches: &mut BTreeMap<RsPos, RsTorchHistory>) {
+            while let Some(pos) = self.updates.pop_front() {
+                RedstoneWorldAdapter::new(self.reg, self, torches).neighbor_changed(pos);
+            }
+        }
+
+        fn advance(&mut self, to: u64, torches: &mut BTreeMap<RsPos, RsTorchHistory>) {
+            assert!(to >= self.now);
+            while let Some((index, &(due, tick))) = self
+                .pending
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(due, _))| due <= to)
+                .min_by_key(|&(index, &(due, tick))| (due, tick.priority, index))
+            {
+                self.pending.remove(index);
+                self.now = due;
+                RedstoneWorldAdapter::new(self.reg, self, torches).run_scheduled_tick(
+                    tick.pos,
+                    tick.block_id,
+                    due,
+                );
+                self.drain_updates(torches);
+            }
+            self.now = to;
+        }
+    }
+
+    impl RedstoneBlockWorld for MemoryWorld<'_> {
+        fn state_at(&self, pos: RsPos) -> u32 {
+            self.states
+                .get(&pos)
+                .copied()
+                .unwrap_or_else(|| self.reg.state_of("air", None))
+        }
+
+        fn is_redstone_conductor(&self, pos: RsPos) -> bool {
+            self.reg.is_redstone_conductor(self.state_at(pos))
+        }
+
+        fn comparator_output(&self, pos: RsPos) -> u8 {
+            self.comparator_outputs.get(&pos).copied().unwrap_or(0)
+        }
+
+        fn analog_signal(&self, pos: RsPos) -> Option<u8> {
+            self.analog.get(&pos).copied()
+        }
+
+        fn item_frame_signal(&self, pos: RsPos, facing: RsDir) -> Option<u8> {
+            let &(direction, signal) = self.item_frames.get(&pos)?;
+            (direction == facing).then_some(signal)
+        }
+
+        fn apply_redstone_change(&mut self, pos: RsPos, state: u32, comparator_output: Option<u8>) {
+            self.states.insert(pos, state);
+            if let Some(output) = comparator_output {
+                self.comparator_outputs.insert(pos, output);
+            }
+            self.updates.extend(RsDir::ALL.map(|dir| pos.relative(dir)));
+        }
+
+        fn schedule_redstone_tick(&mut self, tick: RsWorldTick) {
+            if !self
+                .pending
+                .iter()
+                .any(|&(_, queued)| (queued.pos, queued.block_id) == (tick.pos, tick.block_id))
+            {
+                self.pending.push((self.now + tick.delay, tick));
+            }
+        }
+
+        fn dispense_redstone(&mut self, pos: RsPos) {
+            self.dispensed.push(pos);
+        }
+    }
+
+    #[test]
+    fn lever_wire_repeater_lamp_writes_vanilla_ids_at_the_due_ticks() {
+        let reg = breg().unwrap();
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let [lever, wire, repeater, lamp] = [0, 1, 2, 3].map(|x| RsPos(x, 0, 0));
+        let lever_id =
+            |powered| registered(reg, "lever", &[("face", "floor"), ("powered", powered)]);
+        let wire_id = |power| {
+            registered(
+                reg,
+                "redstone_wire",
+                &[
+                    ("east", "side"),
+                    ("west", "side"),
+                    ("north", "none"),
+                    ("south", "none"),
+                    ("power", power),
+                ],
+            )
+        };
+        let repeater_id = |powered| {
+            registered(
+                reg,
+                "repeater",
+                &[
+                    ("facing", "west"),
+                    ("delay", "3"),
+                    ("locked", "false"),
+                    ("powered", powered),
+                ],
+            )
+        };
+        let lamp_id = |lit| registered(reg, "redstone_lamp", &[("lit", lit)]);
+        for (pos, initial) in [
+            (lever, lever_id("false")),
+            (wire, registered(reg, "redstone_wire", &[])),
+            (repeater, repeater_id("false")),
+            (lamp, lamp_id("false")),
+        ] {
+            world.states.insert(pos, initial);
+            world
+                .states
+                .insert(pos.relative(RsDir::Down), registered(reg, "stone", &[]));
+        }
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).refresh_wire_shape(wire);
+        world.drain_updates(&mut torches);
+        assert_eq!(world.state_at(wire), wire_id("0"));
+        assert!(world.pending.is_empty());
+
+        world.apply_redstone_change(lever, lever_id("true"), None);
+        world.drain_updates(&mut torches);
+        assert_eq!(world.state_at(lever), lever_id("true"));
+        assert_eq!(world.state_at(wire), wire_id("15"));
+        let repeat = RsWorldTick {
+            pos: repeater,
+            block_id: reg.block_id_of(repeater_id("false")).unwrap() as u32,
+            delay: 6,
+            priority: RsTickPriority::High,
+        };
+        assert_eq!(world.pending, [(6, repeat)]);
+        world.advance(5, &mut torches);
+        assert_eq!(world.state_at(repeater), repeater_id("false"));
+        assert_eq!(world.state_at(lamp), lamp_id("false"));
+        world.advance(6, &mut torches);
+        assert_eq!(world.state_at(repeater), repeater_id("true"));
+        assert_eq!(world.state_at(lamp), lamp_id("true"));
+        assert!(world.pending.is_empty());
+
+        world.apply_redstone_change(lever, lever_id("false"), None);
+        world.drain_updates(&mut torches);
+        assert_eq!(world.state_at(wire), wire_id("0"));
+        assert_eq!(
+            world.pending,
+            [(
+                12,
+                RsWorldTick {
+                    priority: RsTickPriority::VeryHigh,
+                    ..repeat
+                }
+            )]
+        );
+        world.advance(12, &mut torches);
+        assert_eq!(world.state_at(repeater), repeater_id("false"));
+        assert_eq!(
+            world.pending,
+            [(
+                16,
+                RsWorldTick {
+                    pos: lamp,
+                    block_id: reg.block_id_of(lamp_id("true")).unwrap() as u32,
+                    delay: 4,
+                    priority: RsTickPriority::Normal,
+                }
+            )]
+        );
+        world.advance(15, &mut torches);
+        assert_eq!(world.state_at(lamp), lamp_id("true"));
+        world.advance(16, &mut torches);
+        assert_eq!(world.state_at(lamp), lamp_id("false"));
+        assert!(world.pending.is_empty());
+    }
+
+    #[test]
+    fn comparator_reads_and_updates_the_block_entity_independently_of_powered() {
+        let reg = breg().unwrap();
+        let pos = RsPos(0, 0, 0);
+        let rear = pos.relative(RsDir::West);
+        let front = pos.relative(RsDir::East);
+        let on = registered(
+            reg,
+            "comparator",
+            &[("facing", "west"), ("powered", "true")],
+        );
+        let off = registered(
+            reg,
+            "comparator",
+            &[("facing", "west"), ("powered", "false")],
+        );
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        world.states.insert(pos, off);
+        world
+            .states
+            .insert(front, registered(reg, "redstone_lamp", &[]));
+        world.comparator_outputs.insert(pos, 7);
+        world.analog.insert(rear, 7);
+        {
+            let mut adapter = RedstoneWorldAdapter::new(reg, &mut world, &mut torches);
+            assert_eq!(adapter.redstone_block(pos).weak_signal(RsDir::East), 0);
+            adapter.neighbor_changed(pos);
+        }
+        assert_eq!(world.pending.len(), 1);
+        assert_eq!(world.pending[0].0, 2);
+        world.advance(2, &mut torches);
+        assert_eq!(world.state_at(pos), on);
+        assert_eq!(world.comparator_output(pos), 7);
+        assert_eq!(
+            world.state_at(front),
+            registered(reg, "redstone_lamp", &[("lit", "true")])
+        );
+
+        world.analog.insert(rear, 11);
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).neighbor_changed(pos);
+        world.advance(4, &mut torches);
+        assert_eq!(world.state_at(pos), on);
+        assert_eq!(world.comparator_output(pos), 11);
+    }
+
+    #[test]
+    fn stepped_dust_reads_wire_power_and_uses_the_full_attachment_face() {
+        let reg = breg().unwrap();
+        let wire = RsPos(0, 0, 0);
+        let step = wire.relative(RsDir::East);
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        world
+            .states
+            .insert(wire, registered(reg, "redstone_wire", &[]));
+        world.states.insert(step, registered(reg, "stone", &[]));
+        world.states.insert(
+            step.above(),
+            registered(reg, "redstone_wire", &[("power", "12")]),
+        );
+        let expected = |east, power| {
+            registered(
+                reg,
+                "redstone_wire",
+                &[
+                    ("east", east),
+                    ("west", "side"),
+                    ("north", "none"),
+                    ("south", "none"),
+                    ("power", power),
+                ],
+            )
+        };
+        {
+            let mut adapter = RedstoneWorldAdapter::new(reg, &mut world, &mut torches);
+            adapter.refresh_wire_shape(wire);
+            adapter.neighbor_changed(wire);
+        }
+        assert_eq!(world.state_at(wire), expected("up", "11"));
+
+        world.states.insert(
+            step,
+            registered(
+                reg,
+                "oak_trapdoor",
+                &[("half", "bottom"), ("open", "false")],
+            ),
+        );
+        {
+            let mut adapter = RedstoneWorldAdapter::new(reg, &mut world, &mut torches);
+            adapter.refresh_wire_shape(wire);
+            adapter.neighbor_changed(wire);
+        }
+        assert_eq!(world.state_at(wire), expected("side", "0"));
+    }
+
+    #[test]
+    fn powered_dust_emits_using_live_geometry_before_its_stored_shape_is_refreshed() {
+        let reg = breg().unwrap();
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let dust = registered(
+            reg,
+            "redstone_wire",
+            &[
+                ("power", "11"),
+                ("north", "side"),
+                ("south", "side"),
+                ("west", "side"),
+                ("east", "side"),
+            ],
+        );
+        let side = ORIGIN.relative(RsDir::North);
+        world.states.extend([
+            (ORIGIN, dust),
+            (side, registered(reg, "stone", &[])),
+            (
+                ORIGIN.relative(RsDir::East),
+                registered(reg, "redstone_wire", &[]),
+            ),
+        ]);
+        let adapter = RedstoneWorldAdapter::new(reg, &mut world, &mut torches);
+        assert_eq!(rs_signal_from(&adapter, ORIGIN, RsDir::East, true), 11);
+        assert_eq!(rs_signal_from(&adapter, ORIGIN, RsDir::North, true), 0);
+        assert_eq!(rs_signal_from(&adapter, side, RsDir::North, true), 0);
+        assert_eq!(adapter.world.state_at(ORIGIN), dust);
+    }
+
+    #[test]
+    fn mounted_controls_observers_and_targets_emit_in_the_vanilla_directions() {
+        let reg = breg().unwrap();
+        for name in ["lever", "polished_blackstone_button"] {
+            for (face, attachment) in [
+                ("floor", RsDir::Down),
+                ("ceiling", RsDir::Up),
+                ("wall", RsDir::West),
+            ] {
+                let id = registered(
+                    reg,
+                    name,
+                    &[("face", face), ("facing", "east"), ("powered", "true")],
+                );
+                let block = rs_block_from_state(reg, id);
+                for dir in RsDir::ALL {
+                    assert_eq!(block.weak_signal(dir), 15, "{name} {face} {dir:?}");
+                    assert_eq!(
+                        block.direct_signal(dir),
+                        if dir == attachment { 15 } else { 0 },
+                        "{name} {face} {dir:?}"
+                    );
+                }
+            }
+        }
+
+        let observer = registered(reg, "observer", &[("facing", "east"), ("powered", "true")]);
+        let target = registered(reg, "target", &[("power", "9")]);
+        for dir in RsDir::ALL {
+            let observer = rs_block_from_state(reg, observer);
+            let expected = if dir == RsDir::West { 15 } else { 0 };
+            assert_eq!(observer.weak_signal(dir), expected);
+            assert_eq!(observer.direct_signal(dir), expected);
+            let target = rs_block_from_state(reg, target);
+            assert_eq!(target.weak_signal(dir), 9);
+            assert_eq!(target.direct_signal(dir), 0);
+        }
+
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let wire = RsPos(0, 0, 0);
+        world.states.insert(wire.relative(RsDir::East), observer);
+        world.states.insert(wire.relative(RsDir::West), observer);
+        let adapter = RedstoneWorldAdapter::new(reg, &mut world, &mut torches);
+        assert_eq!(
+            rs_wire_connection(&adapter, wire, RsDir::East),
+            RsWireConnection::Side
+        );
+        assert_eq!(
+            rs_wire_connection(&adapter, wire, RsDir::West),
+            RsWireConnection::None
+        );
+    }
+
+    #[test]
+    fn a_pending_tick_does_not_run_on_a_replacement_block() {
+        let reg = breg().unwrap();
+        let pos = RsPos(0, 0, 0);
+        let lamp_off = registered(reg, "redstone_lamp", &[("lit", "false")]);
+        let lamp_on = registered(reg, "redstone_lamp", &[("lit", "true")]);
+        let torch_off = registered(reg, "redstone_torch", &[("lit", "false")]);
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        world.states.insert(pos, lamp_on);
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).neighbor_changed(pos);
+        assert_eq!(world.pending.len(), 1);
+        assert_eq!(
+            world.pending[0].1.block_id,
+            reg.block_id_of(lamp_off).unwrap() as u32
+        );
+        world.states.insert(pos, torch_off);
+        world.advance(4, &mut torches);
+        assert_eq!(world.state_at(pos), torch_off);
+    }
+    #[test]
+    fn registry_batch_settles_dust_and_delivers_queued_ticks_after_power_falls() {
+        let reg = breg().unwrap();
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let wire = registered(reg, "redstone_wire", &[]);
+        let dispenser = RsPos(12, 0, 0);
+        let initial_dispenser = registered(
+            reg,
+            "dispenser",
+            &[("facing", "south"), ("triggered", "false")],
+        );
+        world.states.insert(dispenser, initial_dispenser);
+        world.states.extend((1..12).map(|x| (RsPos(x, 0, 0), wire)));
+        let target = registered(reg, "target", &[("power", "15")]);
+        world.states.insert(ORIGIN, target);
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[ORIGIN]);
+        assert_eq!(
+            reg.get_prop(world.state_at(RsPos(11, 0, 0)), "power")
+                .as_deref(),
+            Some("5")
+        );
+        assert_eq!(
+            world.state_at(dispenser),
+            reg.with_prop(initial_dispenser, "triggered", "true")
+        );
+
+        world.advance(1, &mut torches);
+        world.states.remove(&ORIGIN);
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[ORIGIN]);
+        for x in 1..12 {
+            assert_eq!(
+                reg.get_prop(world.state_at(RsPos(x, 0, 0)), "power")
+                    .as_deref(),
+                Some("0")
+            );
+        }
+        assert_eq!(world.state_at(dispenser), initial_dispenser);
+        world.advance(3, &mut torches);
+        assert!(world.dispensed.is_empty());
+        world.advance(4, &mut torches);
+        assert_eq!(world.dispensed, [dispenser]);
+        assert!(world.pending.is_empty());
+    }
+
+    #[test]
+    fn comparator_uses_the_stronger_analog_source_behind_a_conductor() {
+        let reg = breg().unwrap();
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let rear = ORIGIN.relative(RsDir::West);
+        let behind = rear.relative(RsDir::West);
+        let comparator = registered(reg, "comparator", &[("facing", "west")]);
+        world.states.insert(ORIGIN, comparator);
+        world.states.insert(rear, registered(reg, "stone", &[]));
+        world.analog.insert(behind, 3);
+        world.item_frames.insert(behind, (RsDir::West, 7));
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[behind]);
+        world.advance(2, &mut torches);
+        assert_eq!(world.comparator_output(ORIGIN), 7);
+
+        world.item_frames.insert(behind, (RsDir::East, 7));
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[behind]);
+        world.advance(4, &mut torches);
+        assert_eq!(world.comparator_output(ORIGIN), 3);
     }
 }
