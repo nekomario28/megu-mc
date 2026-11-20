@@ -13,3 +13,16 @@ For the selected existing Seed Protect contract, append `--seedprotect` to both 
 The same pinned original Seed Protect JAR now handles eligible player and adult-cow farmland conversion in normal server startup. Build `--features fabric-probe`; set `MC_SPINE_FABRIC_CLASSPATH` to the absolute path of `.build/classpath-seedprotect.txt` and use the supported original JAR alone in the server's `mods/`. Startup initializes actual Fabric Loader/Mixin and validates the required target before networking begins. Native callers synchronously wait for a dedicated JVM owner; the final Rust commit compares the initial farmland state under its world mutex. Existing fall damage stays separate from conversion cancellation.
 
 `server_verify.py` uses normal TCP play packets and cow ticks, then checks save/reload. Its `--neoforge` option adds the separately built actual NeoForge event adapter; it does not run the full FML loader. Real Vanilla/Fabric reference checks use an adult cow on dry farmland, verify the live result and decode the saved MCA block palette. Player/adult-cow conversion is the supported scope; crop/loot, complete collision and other entities remain open.
+
+## Static compatibility audit
+
+`fabric_shimcheck.py [--surface shim-surface.json] [--java-home PATH] MOD.jar...`
+audits only the declared server surface for Minecraft 1.21.1 and the pinned
+Fabric Loader 0.15.11/0.19.5 candidates. It reads the exact submitted JARs,
+parses their Fabric metadata and declared mixin configs, and scans class
+references with ASM. It prints deterministic JSON; exit 0 means every submitted
+JAR was admitted, exit 2 means at least one was rejected, and exit 1 means the
+gate could not process its inputs. This static gate does not prove loader
+startup, runtime callback behavior, or compatibility with Fabric API modules
+outside the declared surface. `python3 tests/fabric_shim_test.py` compiles
+synthetic JARs and exercises the admission and rejection cases.

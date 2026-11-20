@@ -1,0 +1,31 @@
+{
+  "schema": "mc-spine-fabric-s0",
+  "target": {
+    "minecraft": "1.21.1",
+    "fabric_loader": ["0.15.11", "0.19.5"],
+    "namespace": "intermediary"
+  },
+  "classes": {
+    "net/fabricmc/api/ModInitializer": {"methods": ["onInitialize()V"], "fields": []},
+    "net/fabricmc/api/DedicatedServerModInitializer": {"methods": ["onInitializeServer()V"], "fields": []},
+    "net/fabricmc/api/EnvType": {"methods": [], "fields": ["CLIENT:Lnet/fabricmc/api/EnvType;", "SERVER:Lnet/fabricmc/api/EnvType;"]},
+    "net/fabricmc/api/Environment": {"methods": ["value()Lnet/fabricmc/api/EnvType;"], "fields": []},
+    "net/fabricmc/fabric/api/event/Event": {"methods": ["invoker()Ljava/lang/Object;", "register(Ljava/lang/Object;)V"], "fields": []},
+    "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents": {"methods": [], "fields": ["SERVER_STARTING:Lnet/fabricmc/fabric/api/event/Event;", "SERVER_STARTED:Lnet/fabricmc/fabric/api/event/Event;", "SERVER_STOPPING:Lnet/fabricmc/fabric/api/event/Event;", "SERVER_STOPPED:Lnet/fabricmc/fabric/api/event/Event;"]},
+    "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents$ServerStarting": {"methods": [], "fields": []},
+    "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents$ServerStarted": {"methods": [], "fields": []},
+    "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents$ServerStopping": {"methods": [], "fields": []},
+    "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents$ServerStopped": {"methods": [], "fields": []},
+    "net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents": {"methods": [], "fields": ["INIT:Lnet/fabricmc/fabric/api/event/Event;", "JOIN:Lnet/fabricmc/fabric/api/event/Event;", "DISCONNECT:Lnet/fabricmc/fabric/api/event/Event;"]},
+    "net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents$Init": {"methods": [], "fields": []},
+    "net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents$Join": {"methods": [], "fields": []},
+    "net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents$Disconnect": {"methods": [], "fields": []},
+    "net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents": {"methods": [], "fields": ["BEFORE:Lnet/fabricmc/fabric/api/event/Event;", "AFTER:Lnet/fabricmc/fabric/api/event/Event;", "CANCELED:Lnet/fabricmc/fabric/api/event/Event;"]},
+    "net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents$Before": {"methods": [], "fields": []},
+    "net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents$After": {"methods": [], "fields": []},
+    "net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents$Canceled": {"methods": [], "fields": []},
+    "net/fabricmc/fabric/api/command/v2/CommandRegistrationCallback": {"methods": [], "fields": ["EVENT:Lnet/fabricmc/fabric/api/event/Event;"]},
+    "net/minecraft/class_1937": {"methods": ["method_27983()Lnet/minecraft/class_5321;"], "fields": []},
+    "net/minecraft/class_5321": {"methods": [], "fields": []}
+  }
+}
