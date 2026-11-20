@@ -37,6 +37,7 @@ mod tree;
 mod world_rng;
 mod worldgen;
 include!("paletted.rs");
+include!("lighting.rs");
 include!("entity_collision.rs");
 include!("entity_fluid.rs");
 include!("entity_spatial.rs");
@@ -1057,11 +1058,24 @@ fn broadcast_chunk_dim_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     cz: i32,
     mk: F,
 ) {
-    fanout_in(
-        audience,
-        |c| *c.dim.lock().unwrap() == dim && c.chunks.lock().unwrap().contains(&(cx, cz)),
-        mk,
-    )
+    for client in audience {
+        // Stream and unload take the chunk lock before the socket. Keep the
+        // audience check in that order so a delta cannot follow an unload.
+        let chunks = client.chunks.lock().unwrap();
+        if !chunks.contains(&(cx, cz)) {
+            continue;
+        }
+        let Ok(mut socket) = client.sock.lock() else {
+            continue;
+        };
+        if *client.dim.lock().unwrap() != dim {
+            continue;
+        }
+        let (id, packet) = mk(client);
+        if send_packet(&mut socket, id, packet).is_err() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 fn broadcast_seen_destroy(eid: i32) {
     let mut p = Vec::new();
@@ -10854,6 +10868,9 @@ fn note_block_update_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
         .insert((((x & 15) << 8) | ((z & 15) << 4) | (y & 15)) as u16, out);
 }
 fn apply_queued_block_updates() {
+    // The tick and connection threads can both flush. Publish batches in order.
+    static FLUSH: Mutex<()> = Mutex::new(());
+    let _flush = FLUSH.lock().unwrap();
     let map = std::mem::take(&mut *pending_blocks().lock().unwrap());
     for ((dim, sx, sy, sz), recs) in map {
         let mut p = Vec::with_capacity(9 + recs.len() * 5);
@@ -10866,6 +10883,7 @@ fn apply_queued_block_updates() {
         }
         broadcast_chunk_dim(dim, sx, sz, |_c| (0x49, p.clone()));
     }
+    apply_queued_light_updates();
 }
 
 fn local_idx(x: i32, y: i32, z: i32) -> u32 {
@@ -10999,6 +11017,7 @@ fn set_block_if_inner_dim(
     // dimensions), but pass `dim` so the patched store slot keeps its dimension key.
     store_patch(dim, x, y, z, st);
     bump_world_epoch_dim(dim, x, z);
+    note_light_edit(dim, Position::new(x, y, z), old, st);
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
         schedule_leaf_neighbors(x, y, z, st);
@@ -11174,6 +11193,7 @@ fn set_block_if_dim_edit(
     band_patch_dim(dim, x, y, z, st);
     store_patch(dim, x, y, z, st);
     bump_world_epoch_dim(dim, x, z);
+    note_light_edit(dim, Position::new(x, y, z), old, st);
     live_block_changed(dim, RsPos(x, y, z), old, st);
     true
 }
@@ -19523,6 +19543,9 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
 }
 
 fn block_light_sections_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
+    if let Some(light) = settled_live_light(dim, cx, cz) {
+        return light.block.clone();
+    }
     let light_sections = dim.light_sections();
     let Some(reg) = crate::block_registry::breg() else {
         return vec![[0u8; 2048]; light_sections];
@@ -20620,6 +20643,9 @@ fn sky_floors_dim(
 /// Sky light for a chunk, from the world: the per-column value, raised where light has arrived
 /// sideways.
 fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
+    if let Some(light) = settled_live_light(DimId::Overworld, cx, cz) {
+        return light.sky.clone();
+    }
     if crate::block_registry::breg().is_none() {
         return vec![[0u8; 2048]; 26];
     }
@@ -21364,7 +21390,8 @@ fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
         }
     }
     let mut h = OFFSET;
-    for v in [sign_acc, sign_count, spawner_acc, spawner_count] {
+    let light_revision = settled_live_light(dim, cx, cz).map_or(0, |light| light.revision);
+    for v in [sign_acc, sign_count, spawner_acc, spawner_count, light_revision] {
         h = (h ^ v).wrapping_mul(PRIME);
     }
     for dx in -1..=1 {
@@ -21397,6 +21424,8 @@ fn clear_chunk_caches_for_tests() {
     section_store().lock().unwrap().order.clear();
     sky_floors_cache().lock().unwrap().map.clear();
     sky_floors_cache().lock().unwrap().order.clear();
+    *live_light_cache().lock().unwrap() = LiveLightCache::default();
+    pending_light_edits().lock().unwrap().clear();
 }
 
 fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
@@ -21591,32 +21620,338 @@ fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
 }
 
 fn update_light_packet_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
-    let mut p = Vec::new();
-    write_varint(&mut p, cx as i64);
-    write_varint(&mut p, cz as i64);
     let block = block_light_sections_dim(dim, cx, cz, gen);
     let (mut mask, mut empty) = (0u64, 0u64);
-    for (i, sec) in block.iter().enumerate() {
-        if sec.iter().all(|b| *b == 0) {
+    let mut lit = Vec::new();
+    for (i, section) in block.iter().enumerate() {
+        if section.iter().all(|b| *b == 0) {
             empty |= 1 << i;
         } else {
             mask |= 1 << i;
+            lit.push(section);
         }
     }
-    write_varint(&mut p, 0); // skyLightMask: sky is unchanged
-    write_varint(&mut p, 1);
-    p.extend_from_slice(&mask.to_be_bytes());
-    write_varint(&mut p, 0); // emptySkyLightMask
-    write_varint(&mut p, 1);
-    p.extend_from_slice(&empty.to_be_bytes());
-    write_varint(&mut p, 0); // no sky updates
-    let lit: Vec<&[u8; 2048]> = block.iter().filter(|s| s.iter().any(|b| *b != 0)).collect();
-    write_varint(&mut p, lit.len() as i64);
-    for sec in lit {
-        write_varint(&mut p, 2048);
-        p.extend_from_slice(sec);
+    encode_light_update(
+        (cx, cz),
+        [0, mask, 0, empty],
+        [].into_iter(),
+        lit.into_iter(),
+    )
+}
+
+fn encode_light_update<'a>(
+    (cx, cz): Chunk,
+    masks: [u64; 4],
+    sky: impl ExactSizeIterator<Item = &'a [u8; 2048]>,
+    block: impl ExactSizeIterator<Item = &'a [u8; 2048]>,
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, cx as i64);
+    write_varint(&mut p, cz as i64);
+    for mask in masks {
+        write_varint(&mut p, i64::from(mask != 0));
+        if mask != 0 {
+            p.extend_from_slice(&mask.to_be_bytes());
+        }
+    }
+    write_varint(&mut p, sky.len() as i64);
+    for section in sky {
+        write_varint(&mut p, section.len() as i64);
+        p.extend_from_slice(section);
+    }
+    write_varint(&mut p, block.len() as i64);
+    for section in block {
+        write_varint(&mut p, section.len() as i64);
+        p.extend_from_slice(section);
     }
     p
+}
+
+// Live edits carry the previous light properties so a bounded light window can
+// be initialized from the actual pre-edit world, including generated emitters.
+type PendingLightEdits = HashMap<DimId, HashMap<Position, (LightBlock, LightBlock)>>;
+
+fn pending_light_edits() -> &'static Mutex<PendingLightEdits> {
+    static EDITS: OnceLock<Mutex<PendingLightEdits>> = OnceLock::new();
+    EDITS.get_or_init(Mutex::default)
+}
+
+fn light_properties(reg: &BReg, state: u32) -> LightBlock {
+    let opacity = reg.opacity_of(state);
+    let emission = reg.luminance_of(state);
+    let name = reg.name_of(state);
+    let half = |value: Option<String>| match value.as_deref() {
+        Some("top") => Some(Half::Top),
+        Some("bottom") => Some(Half::Bottom),
+        _ => None,
+    };
+    let shape = if name.ends_with("_slab") {
+        let kind = reg.get_prop(state, "type");
+        if kind.as_deref() == Some("double") {
+            FaceOcclusion::FULL
+        } else {
+            half(kind).map_or(FaceOcclusion::EMPTY, FaceOcclusion::slab)
+        }
+    } else if name.ends_with("_stairs") {
+        let facing = match reg.get_prop(state, "facing").as_deref() {
+            Some("north") => Facing::North,
+            Some("east") => Facing::East,
+            Some("south") => Facing::South,
+            Some("west") => Facing::West,
+            _ => return LightBlock::new(opacity, emission),
+        };
+        let shape = match reg.get_prop(state, "shape").as_deref() {
+            Some("inner_left") => StairShape::InnerLeft,
+            Some("inner_right") => StairShape::InnerRight,
+            Some("outer_left") => StairShape::OuterLeft,
+            Some("outer_right") => StairShape::OuterRight,
+            _ => StairShape::Straight,
+        };
+        half(reg.get_prop(state, "half")).map_or(FaceOcclusion::EMPTY, |half| {
+            FaceOcclusion::stairs(half, facing, shape)
+        })
+    } else {
+        FaceOcclusion::EMPTY
+    };
+    LightBlock::with_occlusion(opacity, emission, shape)
+}
+
+fn note_light_edit(dim: DimId, pos: Position, old: u32, new: u32) {
+    if old == new || !(dim.min_y()..dim.min_y() + dim.height()).contains(&pos.y) {
+        return;
+    }
+    let Some(reg) = breg() else { return };
+    let old = light_properties(reg, old);
+    let new = light_properties(reg, new);
+    if old != new {
+        pending_light_edits()
+            .lock()
+            .unwrap()
+            .entry(dim)
+            .or_default()
+            .entry(pos)
+            .and_modify(|edit| edit.1 = new)
+            .or_insert((old, new));
+    }
+}
+
+struct SettledLiveLight {
+    versions: [u64; 9],
+    revision: u64,
+    sky: Vec<[u8; 2048]>,
+    block: Vec<[u8; 2048]>,
+}
+
+#[derive(Default)]
+struct LiveLightCache {
+    generation: u64,
+    chunks: HashMap<DimChunkKey, Arc<SettledLiveLight>>,
+    order: VecDeque<DimChunkKey>,
+}
+
+fn live_light_cache() -> &'static Mutex<LiveLightCache> {
+    static LIGHT: OnceLock<Mutex<LiveLightCache>> = OnceLock::new();
+    LIGHT.get_or_init(Mutex::default)
+}
+
+fn settled_live_light(dim: DimId, cx: i32, cz: i32) -> Option<Arc<SettledLiveLight>> {
+    let light = {
+        let cache = live_light_cache().lock().unwrap();
+        if cache.generation != current_gen_seq() {
+            return None;
+        }
+        cache.chunks.get(&(dim, cx, cz))?.clone()
+    };
+    (light.versions == chunk_versions_3x3(dim, cx, cz)).then_some(light)
+}
+
+fn light_halo(chunks: impl IntoIterator<Item = Chunk>) -> impl Iterator<Item = Chunk> {
+    chunks.into_iter().flat_map(|(cx, cz)| {
+        (-1..=1).flat_map(move |dx| (-1..=1).map(move |dz| (cx + dx, cz + dz)))
+    })
+}
+
+fn chunk_in_light_reach((cx, cz): Chunk, p: Position) -> bool {
+    let x = cx * 16;
+    let z = cz * 16;
+    p.x.abs_diff(p.x.clamp(x, x + 15))
+        .saturating_add(p.z.abs_diff(p.z.clamp(z, z + 15)))
+        <= 14
+}
+
+fn pre_edit_light_chunk(
+    dim: DimId,
+    (cx, cz): Chunk,
+    reg: &BReg,
+    props: &mut HashMap<u32, LightBlock>,
+    previous: &HashMap<Position, LightBlock>,
+) -> Vec<LightBlock> {
+    let overlay = world()
+        .lock()
+        .unwrap()
+        .get(&(dim, cx, cz))
+        .cloned()
+        .unwrap_or_default();
+    let min_y = dim.min_y();
+    let mut blocks = Vec::with_capacity(dim.height() as usize * 256);
+    let flat_heights = (dim == DimId::Overworld && !worldgen::enabled()).then(|| {
+        std::array::from_fn::<_, 256, _>(|i| {
+            height_at(cx * 16 + (i & 15) as i32, cz * 16 + (i >> 4) as i32)
+        })
+    });
+    for sy in (min_y..min_y + dim.height()).step_by(16) {
+        let mut rows = [0u32; 4096];
+        if let Some(section) = stored_section(dim, cx, cz, sy) {
+            section.unpack_into(&mut rows);
+        } else if let Some(heights) = &flat_heights {
+            for (i, state) in rows.iter_mut().enumerate() {
+                let x = cx * 16 + (i & 15) as i32;
+                let z = cz * 16 + ((i >> 4) & 15) as i32;
+                *state = column_state(x, sy + (i >> 8) as i32, z, heights[i & 255]);
+            }
+        } else if let Some(terrain) =
+            worldgen::terrain_section_dim(dim, cx, sy, cz, feature::populate)
+        {
+            rows = *terrain;
+        }
+        for (i, state) in rows.into_iter().enumerate() {
+            let local = ((sy - MIN_Y) as u32) << 8 | i as u32;
+            let state = overlay.get(&local).copied().unwrap_or(state);
+            blocks.push(
+                *props
+                    .entry(state)
+                    .or_insert_with(|| light_properties(reg, state)),
+            );
+        }
+    }
+    for (pos, old) in previous {
+        if pos.chunk() == (cx, cz) {
+            let i = ((pos.y - min_y) as usize) << 8
+                | ((pos.z & 15) as usize) << 4
+                | (pos.x & 15) as usize;
+            blocks[i] = *old;
+        }
+    }
+    blocks
+}
+
+fn apply_queued_light_updates() {
+    if pending_light_edits().lock().unwrap().is_empty() {
+        return;
+    }
+    let audience = client_snapshot();
+    let mut held: HashMap<DimId, HashSet<Chunk>> = HashMap::new();
+    for client in &audience {
+        // Do not hold the dimension lock while waiting on a chunk stream.
+        let dim = *client.dim.lock().unwrap();
+        held.entry(dim)
+            .or_default()
+            .extend(client.chunks.lock().unwrap().iter().copied());
+    }
+    let Some(reg) = breg() else { return };
+    let (generation, work) = with_save_guard(|| {
+        let mut work = Vec::new();
+        let edits = std::mem::take(&mut *pending_light_edits().lock().unwrap());
+        let mut props = HashMap::new();
+        for (dim, edits) in edits {
+            let Some(held) = held.get(&dim) else { continue };
+            let (old, new): (HashMap<_, _>, Vec<_>) = edits
+                .into_iter()
+                .filter(|(_, (old, new))| old != new)
+                .map(|(pos, (old, new))| ((pos, old), (pos, new)))
+                .unzip();
+            let targets: Vec<_> = held
+                .iter()
+                .copied()
+                .filter(|chunk| {
+                    new.iter()
+                        .any(|(pos, _)| chunk_in_light_reach(*chunk, *pos))
+                })
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+            // Only visit terrain that streaming or a block write already
+            // opened. Lighting must not advance world generation at the border.
+            let edited: HashSet<_> = new.iter().map(|(pos, _)| pos.chunk()).collect();
+            let neighbors: HashSet<_> = light_halo(targets.iter().copied())
+                .filter(|chunk| held.contains(chunk) || edited.contains(chunk))
+                .collect();
+            let snapshots: Vec<_> = targets
+                .iter()
+                .copied()
+                .filter(|chunk| light_halo([*chunk]).all(|neighbor| neighbors.contains(&neighbor)))
+                .map(|(cx, cz)| ((cx, cz), chunk_versions_3x3(dim, cx, cz)))
+                .collect();
+            let terrain: Vec<_> = neighbors
+                .into_iter()
+                .map(|chunk| {
+                    (
+                        chunk,
+                        pre_edit_light_chunk(dim, chunk, reg, &mut props, &old),
+                    )
+                })
+                .collect();
+            work.push((dim, targets, snapshots, terrain, new));
+        }
+        (current_gen_seq(), work)
+    });
+
+    for (dim, targets, snapshots, terrain, new) in work {
+        let mut engine = IncrementalLighting::from_chunks(
+            dim.min_y(),
+            dim.height(),
+            worldgen::has_skylight(dim),
+            terrain,
+        );
+        let updates = engine.edit_batch(new, targets);
+        {
+            let mut cache = live_light_cache().lock().unwrap();
+            if cache.generation != generation {
+                *cache = LiveLightCache {
+                    generation,
+                    ..Default::default()
+                };
+            }
+            for (chunk @ (cx, cz), versions) in snapshots {
+                let key = (dim, cx, cz);
+                if !cache.chunks.contains_key(&key)
+                    && !updates.chunks.iter().any(|u| u.chunk == chunk)
+                {
+                    continue;
+                }
+                let light = SettledLiveLight {
+                    versions,
+                    revision: versions.into_iter().max().unwrap_or(0),
+                    sky: engine.sections(chunk, LightKind::Sky),
+                    block: engine.sections(chunk, LightKind::Block),
+                };
+                if cache.chunks.insert(key, Arc::new(light)).is_none() {
+                    cache.order.push_back(key);
+                }
+            }
+            while cache.order.len() > MAP_CHUNK_CACHE_CAP {
+                if let Some(chunk) = cache.order.pop_front() {
+                    cache.chunks.remove(&chunk);
+                }
+            }
+        }
+        for update in updates.chunks {
+            let (cx, cz) = update.chunk;
+            let packet = encode_light_update(
+                update.chunk,
+                [
+                    update.sky_mask,
+                    update.block_mask,
+                    update.empty_sky_mask,
+                    update.empty_block_mask,
+                ],
+                update.sky_sections.iter().map(|(_, array)| array),
+                update.block_sections.iter().map(|(_, array)| array),
+            );
+            broadcast_chunk_dim_in(dim, &audience, cx, cz, |_| (0x2a, packet.clone()));
+        }
+    }
 }
 
 /// Chunks already generated whose light the chunk at `(cx, cz)` can change. A neighbour is
@@ -33460,9 +33795,6 @@ fn main() {
         std::process::exit(2);
     }
     let probe_args: Vec<String> = std::env::args().skip(1).collect();
-    // main's diagnostics pass the same argument list by their own name
-    #[cfg(feature = "java-compat")]
-    let cli_args = &probe_args;
     if probe_args
         .first()
         .is_some_and(|arg| arg == "--worldgen-cell")
@@ -33711,7 +34043,7 @@ fn main() {
     {
         #[cfg(feature = "fabric-probe")]
         {
-            if let Err(error) = java_compat::run(cli_args) {
+            if let Err(error) = java_compat::run(&probe_args) {
                 eprintln!("[fabric-probe] {error}");
                 std::process::exit(1);
             }

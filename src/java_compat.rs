@@ -609,6 +609,7 @@ extern "system" fn get_block(mut env: JNIEnv, _class: JClass, x: jint, y: jint, 
     }
 }
 
+#[cfg_attr(not(feature = "fabric-probe"), allow(dead_code))]
 pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let trample = args[0].starts_with("--fabric-trample");
     let valid_expected = |state: u32| {

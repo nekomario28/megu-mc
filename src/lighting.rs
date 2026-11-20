@@ -1,11 +1,13 @@
-//! Clean-room incremental block and sky lighting for loaded chunk windows.
-//!
-//! The game-state owner supplies emission, opacity, and occlusion shapes. Edits
-//! invalidate the 14-step influence region, darken it, and relight from live
-//! emitters, direct sky, and unchanged boundary light. Unloaded chunks are hard
-//! boundaries. This file is currently an independently tested integration seam.
+// Clean-room incremental block and sky lighting for loaded chunk windows.
+//
+// The game-state owner supplies emission, opacity, and occlusion shapes. Edits
+// invalidate the 14-step influence region, darken it, and relight from live
+// emitters, direct sky, and unchanged boundary light. Unloaded chunks are hard
+// boundaries. The window owner supplies complete chunks before applying edits.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{
+    HashMap as LightingHashMap, HashSet as LightingHashSet, VecDeque as LightingVecDeque,
+};
 
 type Chunk = (i32, i32);
 
@@ -221,98 +223,153 @@ pub struct LightUpdate {
     pub invalidated_cells: usize,
 }
 
-/// The caller owns synchronization and must publish each update to clients that
-/// already hold the affected chunks. `load_chunk` rebuilds the window because a
-/// newly loaded edge changes the set of valid light propagation paths.
+/// The caller synchronizes block changes with the light window and publishes
+/// the changed sections to clients holding those chunks.
 #[derive(Clone, Debug)]
 pub struct IncrementalLighting {
     min_y: i32,
-    max_y: i32,
-    loaded: HashSet<Chunk>,
-    blocks: HashMap<Position, LightBlock>,
-    direct_sky: HashMap<Position, u8>,
-    sky: HashMap<Position, u8>,
-    block: HashMap<Position, u8>,
+    height: i32,
+    has_skylight: bool,
+    chunks: LightingHashMap<Chunk, LightingChunk>,
 }
 
-impl IncrementalLighting {
-    pub fn new(min_y: i32, height: i32) -> Self {
-        assert!(min_y % 16 == 0 && height > 0 && height % 16 == 0);
-        assert!(height / 16 + 2 <= 64, "section masks must fit in u64");
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LightingChunk {
+    blocks: Vec<LightBlock>,
+    direct_sky: Vec<u8>,
+    sky: Vec<u8>,
+    block: Vec<u8>,
+    // Highest cell in each column below full direct skylight. Used to skip
+    // the uniform sky over adjacent columns during initialization.
+    sky_top: [i32; 256],
+}
+
+impl LightingChunk {
+    fn new(min_y: i32, height: i32, blocks: Vec<LightBlock>) -> Self {
+        let len = height as usize * 256;
+        assert_eq!(blocks.len(), len);
         Self {
-            min_y,
-            max_y: min_y + height - 1,
-            loaded: HashSet::new(),
-            blocks: HashMap::new(),
-            direct_sky: HashMap::new(),
-            sky: HashMap::new(),
-            block: HashMap::new(),
+            blocks,
+            direct_sky: vec![0; len],
+            sky: vec![0; len],
+            block: vec![0; len],
+            sky_top: [min_y - 1; 256],
         }
     }
 
-    fn valid(&self, p: Position) -> bool {
-        (self.min_y..=self.max_y).contains(&p.y) && self.loaded.contains(&p.chunk())
+    fn clear_light(&mut self) {
+        self.direct_sky.fill(0);
+        self.sky.fill(0);
+        self.block.fill(0);
     }
 
-    fn block_at(&self, p: Position) -> LightBlock {
-        self.blocks.get(&p).copied().unwrap_or_default()
-    }
-
-    pub fn level(&self, kind: LightKind, p: Position) -> u8 {
-        if !self.valid(p) {
-            return 0;
-        }
-        self.light(kind).get(&p).copied().unwrap_or(0)
-    }
-
-    fn light(&self, kind: LightKind) -> &HashMap<Position, u8> {
+    fn light(&self, kind: LightKind) -> &[u8] {
         match kind {
             LightKind::Sky => &self.sky,
             LightKind::Block => &self.block,
         }
     }
 
-    fn light_mut(&mut self, kind: LightKind) -> &mut HashMap<Position, u8> {
+    fn light_mut(&mut self, kind: LightKind) -> &mut [u8] {
         match kind {
             LightKind::Sky => &mut self.sky,
             LightKind::Block => &mut self.block,
         }
     }
+}
+
+impl IncrementalLighting {
+    #[allow(dead_code)] // Also used by the standalone Vanilla probe.
+    pub fn new(min_y: i32, height: i32) -> Self {
+        Self::from_chunks(min_y, height, true, [])
+    }
+
+    /// Initialize together so a neighbor can contribute light without a
+    /// complete rebuild for every added chunk. Cells are ordered y, z, x.
+    pub fn from_chunks(
+        min_y: i32,
+        height: i32,
+        has_skylight: bool,
+        chunks: impl IntoIterator<Item = (Chunk, Vec<LightBlock>)>,
+    ) -> Self {
+        assert!(min_y % 16 == 0 && height > 0 && height % 16 == 0);
+        assert!(height / 16 + 2 <= 64, "section masks must fit in u64");
+        let mut engine = Self {
+            min_y,
+            height,
+            has_skylight,
+            chunks: chunks
+                .into_iter()
+                .map(|(key, blocks)| (key, LightingChunk::new(min_y, height, blocks)))
+                .collect(),
+        };
+        engine.rebuild();
+        engine
+    }
+
+    fn index(&self, p: Position) -> Option<usize> {
+        let dy = p.y - self.min_y;
+        (0..self.height)
+            .contains(&dy)
+            .then(|| (dy as usize) << 8 | ((p.z & 15) as usize) << 4 | (p.x & 15) as usize)
+    }
+
+    fn cell(&self, p: Position) -> Option<(&LightingChunk, usize)> {
+        Some((self.chunks.get(&p.chunk())?, self.index(p)?))
+    }
 
     fn source(&self, kind: LightKind, p: Position) -> u8 {
-        match kind {
-            LightKind::Sky => self.direct_sky.get(&p).copied().unwrap_or(0),
-            LightKind::Block => self.block_at(p).emission,
-        }
+        self.cell(p).map_or(0, |(chunk, index)| match kind {
+            LightKind::Sky => chunk.direct_sky[index],
+            LightKind::Block => chunk.blocks[index].emission,
+        })
+    }
+
+    #[allow(dead_code)] // Also used by the standalone Vanilla probe.
+    pub fn level(&self, kind: LightKind, p: Position) -> u8 {
+        self.cell(p)
+            .map_or(0, |(chunk, index)| chunk.light(kind)[index])
     }
 
     fn set_level(&mut self, kind: LightKind, p: Position, level: u8) {
-        let light = self.light_mut(kind);
-        if level == 0 {
-            light.remove(&p);
-        } else {
-            light.insert(p, level);
+        if let Some(index) = self.index(p) {
+            if let Some(chunk) = self.chunks.get_mut(&p.chunk()) {
+                chunk.light_mut(kind)[index] = level;
+            }
         }
     }
 
     fn propagate(
         &mut self,
         kind: LightKind,
-        mut queue: VecDeque<(Position, u8)>,
-        patch: Option<&HashSet<Position>>,
+        mut queue: LightingVecDeque<(Position, u8)>,
+        patch: Option<&LightingHashSet<Position>>,
     ) {
         while let Some((p, level)) = queue.pop_front() {
-            if self.level(kind, p) != level || level <= 1 {
+            if level <= 1 {
                 continue;
             }
-            let from = self.block_at(p);
+            let Some((chunk, index)) = self.cell(p) else {
+                continue;
+            };
+            if chunk.light(kind)[index] != level {
+                continue;
+            }
+            let from = chunk.blocks[index];
             for (face, next) in p.adjacent() {
-                if !self.valid(next) || patch.is_some_and(|area| !area.contains(&next)) {
+                if patch.is_some_and(|area| !area.contains(&next)) {
                     continue;
                 }
-                let candidate = from.transmitted(face, self.block_at(next), level);
-                if candidate > self.level(kind, next) {
-                    self.set_level(kind, next, candidate);
+                let Some(index) = self.index(next) else {
+                    continue;
+                };
+                let Some(chunk) = self.chunks.get_mut(&next.chunk()) else {
+                    continue;
+                };
+                let candidate = from.transmitted(face, chunk.blocks[index], level);
+                let light = &mut chunk.light_mut(kind)[index];
+                if candidate > *light {
+                    *light = candidate;
                     queue.push_back((next, candidate));
                 }
             }
@@ -320,50 +377,76 @@ impl IncrementalLighting {
     }
 
     fn rebuild(&mut self) {
-        self.direct_sky.clear();
-        let columns: Vec<_> = self.loaded.iter().copied().collect();
-        for (cx, cz) in columns {
-            for lx in 0..16 {
-                for lz in 0..16 {
-                    self.refresh_column(cx * 16 + lx, cz * 16 + lz);
+        let mut block = LightingVecDeque::new();
+        for (&(cx, cz), chunk) in &mut self.chunks {
+            chunk.clear_light();
+            if self.has_skylight {
+                for i in 0..256 {
+                    Self::refresh_column(self.min_y, self.height, chunk, i, &mut |_| {});
+                }
+                chunk.sky.copy_from_slice(&chunk.direct_sky);
+            }
+            for (i, state) in chunk.blocks.iter().enumerate() {
+                if state.emission > 0 {
+                    chunk.block[i] = state.emission;
+                    block.push_back((
+                        Position::new(
+                            cx * 16 + (i & 15) as i32,
+                            self.min_y + (i >> 8) as i32,
+                            cz * 16 + ((i >> 4) & 15) as i32,
+                        ),
+                        state.emission,
+                    ));
                 }
             }
         }
-        self.sky.clear();
-        self.block.clear();
-        for kind in [LightKind::Sky, LightKind::Block] {
-            let sources: Vec<_> = match kind {
-                LightKind::Sky => self
-                    .direct_sky
-                    .iter()
-                    .map(|(&p, &level)| (p, level))
-                    .collect(),
-                LightKind::Block => self
-                    .blocks
-                    .iter()
-                    .filter(|(p, b)| self.valid(**p) && b.emission > 0)
-                    .map(|(&p, b)| (p, b.emission))
-                    .collect(),
-            };
-            let mut queue = VecDeque::new();
-            for (p, level) in sources {
-                self.set_level(kind, p, level);
-                queue.push_back((p, level));
-            }
-            self.propagate(kind, queue, None);
+
+        self.propagate(LightKind::Block, block, None);
+        if !self.has_skylight {
+            return;
         }
+        // Direct light already handles vertical propagation. Seed the spread
+        // where a column can illuminate a less-lit horizontal neighbor.
+        let mut sky = LightingVecDeque::new();
+        for (&(cx, cz), chunk) in &self.chunks {
+            for i in 0..256 {
+                let x = cx * 16 + (i & 15) as i32;
+                let z = cz * 16 + (i >> 4) as i32;
+                for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nx = x + dx;
+                    let nz = z + dz;
+                    let Some(other) = self.chunks.get(&(nx >> 4, nz >> 4)) else {
+                        continue;
+                    };
+                    let ni = ((nz & 15) << 4 | (nx & 15)) as usize;
+                    for y in self.min_y..=other.sky_top[ni] {
+                        let offset = ((y - self.min_y) as usize) << 8;
+                        let from = chunk.direct_sky[offset | i];
+                        if from > other.direct_sky[offset | ni] + 1 {
+                            sky.push_back((Position::new(x, y, z), from));
+                        }
+                    }
+                }
+            }
+        }
+        self.propagate(LightKind::Sky, sky, None);
     }
 
-    /// Computes direct vertical skylight. Transparent air preserves level 15;
-    /// scalar opacity attenuates it and a sealed vertical face stops it.
-    fn refresh_column(&mut self, x: i32, z: i32) -> Vec<Position> {
-        let mut changed = Vec::new();
+    /// Computes direct skylight independently of the lateral light field.
+    fn refresh_column(
+        min_y: i32,
+        height: i32,
+        chunk: &mut LightingChunk,
+        column: usize,
+        changed: &mut impl FnMut(i32),
+    ) {
         let mut level = 15u8;
         let mut above = FaceOcclusion::EMPTY;
-        for y in (self.min_y..=self.max_y).rev() {
-            let p = Position::new(x, y, z);
+        let mut top = min_y - 1;
+        for dy in (0..height).rev() {
+            let i = ((dy as usize) << 8) | column;
             if level > 0 {
-                let block = self.block_at(p);
+                let block = chunk.blocks[i];
                 level = if above.seals(Face::Down, block.occlusion) {
                     0
                 } else {
@@ -371,40 +454,43 @@ impl IncrementalLighting {
                 };
                 above = block.occlusion;
             }
-            let old = self.direct_sky.get(&p).copied().unwrap_or(0);
-            if old != level {
-                changed.push(p);
-                if level == 0 {
-                    self.direct_sky.remove(&p);
-                } else {
-                    self.direct_sky.insert(p, level);
-                }
+            if level < 15 {
+                top = top.max(min_y + dy);
+            }
+            if chunk.direct_sky[i] != level {
+                chunk.direct_sky[i] = level;
+                changed(min_y + dy);
             }
         }
-        changed
+        chunk.sky_top[column] = top;
     }
 
-    /// Loads one complete chunk's non-air block properties. Generated emitters
-    /// must be supplied here as well as placed emitters on later edits.
+    /// Replaces one complete chunk for the standalone engine tests.
+    #[allow(dead_code)] // Also used by the standalone Vanilla probe.
     pub fn load_chunk(
         &mut self,
         cx: i32,
         cz: i32,
         cells: impl IntoIterator<Item = (Position, LightBlock)>,
     ) {
-        self.loaded.insert((cx, cz));
-        self.blocks.retain(|p, _| p.chunk() != (cx, cz));
+        let mut blocks = vec![LightBlock::default(); self.height as usize * 256];
         for (p, block) in cells {
-            if self.valid(p) && block != LightBlock::default() {
-                self.blocks.insert(p, block);
+            if p.chunk() == (cx, cz) {
+                if let Some(i) = self.index(p) {
+                    blocks[i] = block;
+                }
             }
         }
+        self.chunks.insert(
+            (cx, cz),
+            LightingChunk::new(self.min_y, self.height, blocks),
+        );
         self.rebuild();
     }
 
+    #[cfg(test)]
     pub fn unload_chunk(&mut self, cx: i32, cz: i32) {
-        if self.loaded.remove(&(cx, cz)) {
-            self.blocks.retain(|p, _| p.chunk() != (cx, cz));
+        if self.chunks.remove(&(cx, cz)).is_some() {
             self.rebuild();
         }
     }
@@ -416,10 +502,10 @@ impl IncrementalLighting {
         if changed.is_empty() {
             return 0;
         }
-        let mut patch = HashSet::new();
-        let mut frontier = VecDeque::new();
+        let mut patch = LightingHashSet::new();
+        let mut frontier = LightingVecDeque::new();
         for &p in changed {
-            if self.valid(p) && patch.insert(p) {
+            if self.cell(p).is_some() && patch.insert(p) {
                 frontier.push_back((p, 0u8));
             }
         }
@@ -428,7 +514,7 @@ impl IncrementalLighting {
                 continue;
             }
             for (_, n) in p.adjacent() {
-                if self.valid(n) && patch.insert(n) {
+                if self.cell(n).is_some() && patch.insert(n) {
                     frontier.push_back((n, distance + 1));
                 }
             }
@@ -438,15 +524,16 @@ impl IncrementalLighting {
         for &p in &patch {
             self.set_level(kind, p, 0);
         }
-        let mut queue = VecDeque::new();
+        let mut queue = LightingVecDeque::new();
         for &p in &patch {
             let mut level = self.source(kind, p);
-            let target = self.block_at(p);
+            let (chunk, index) = self.cell(p).expect("patch lies in the light window");
+            let target = chunk.blocks[index];
             for (face, neighbor) in p.adjacent() {
                 if !patch.contains(&neighbor) {
-                    let incoming = self.level(kind, neighbor);
-                    if incoming > 1 {
-                        level = level.max(self.block_at(neighbor).transmitted(
+                    if let Some((chunk, index)) = self.cell(neighbor) {
+                        let incoming = chunk.light(kind)[index];
+                        level = level.max(chunk.blocks[index].transmitted(
                             face.opposite(),
                             target,
                             incoming,
@@ -463,45 +550,53 @@ impl IncrementalLighting {
         patch.len()
     }
 
-    /// Applies a live edit. Unloaded positions are ignored. The return value
-    /// contains exact changed section masks and arrays for affected held chunks.
-    pub fn edit(&mut self, p: Position, block: LightBlock) -> Option<LightUpdate> {
-        if !self.valid(p) {
-            return None;
-        }
-        let old_block = self.block_at(p);
-        if old_block == block {
-            return Some(LightUpdate::default());
-        }
-        let (cx, cz) = p.chunk();
-        let mut before = Vec::new();
-        for dx in -1..=1 {
-            for dz in -1..=1 {
-                let chunk = (cx + dx, cz + dz);
-                if self.loaded.contains(&chunk) {
-                    before.push((
-                        chunk,
-                        self.sections(chunk, LightKind::Sky),
-                        self.sections(chunk, LightKind::Block),
-                    ));
-                }
+    /// Replays an edit batch against a complete pre-edit window. Each affected
+    /// light patch is settled once, even when several blocks change in a tick.
+    pub fn edit_batch(
+        &mut self,
+        edits: impl IntoIterator<Item = (Position, LightBlock)>,
+        targets: impl IntoIterator<Item = Chunk>,
+    ) -> LightUpdate {
+        let before: Vec<_> = targets
+            .into_iter()
+            .map(|chunk| {
+                (
+                    chunk,
+                    self.sections(chunk, LightKind::Sky),
+                    self.sections(chunk, LightKind::Block),
+                )
+            })
+            .collect();
+        let mut block_changes = Vec::new();
+        let mut sky_changes = Vec::new();
+        let mut columns = LightingHashSet::new();
+        for (p, block) in edits {
+            let Some(i) = self.index(p) else { continue };
+            let Some(chunk) = self.chunks.get_mut(&p.chunk()) else {
+                continue;
+            };
+            let old = std::mem::replace(&mut chunk.blocks[i], block);
+            if old == block {
+                continue;
+            }
+            block_changes.push(p);
+            if self.has_skylight
+                && (old.opacity != block.opacity || old.occlusion != block.occlusion)
+            {
+                columns.insert((p.x, p.z));
+                // The lateral path can change even below a roof with no direct sky.
+                sky_changes.push(p);
             }
         }
-        if block == LightBlock::default() {
-            self.blocks.remove(&p);
-        } else {
-            self.blocks.insert(p, block);
-        }
-        let mut sky_changes = self.refresh_column(p.x, p.z);
-        // A lateral skylight path may change even when the direct vertical
-        // column is already dark beneath a roof.
-        if (old_block.opacity != block.opacity || old_block.occlusion != block.occlusion)
-            && !sky_changes.contains(&p)
-        {
-            sky_changes.push(p);
+        for (x, z) in columns {
+            let chunk = self.chunks.get_mut(&(x >> 4, z >> 4)).unwrap();
+            let i = ((z & 15) << 4 | (x & 15)) as usize;
+            Self::refresh_column(self.min_y, self.height, chunk, i, &mut |y| {
+                sky_changes.push(Position::new(x, y, z));
+            });
         }
         let work = self.relight_patch(LightKind::Sky, &sky_changes)
-            + self.relight_patch(LightKind::Block, &[p]);
+            + self.relight_patch(LightKind::Block, &block_changes);
         let mut updates = Vec::new();
         for (chunk, sky_old, block_old) in before {
             let mut update = ChunkLightUpdate {
@@ -537,35 +632,41 @@ impl IncrementalLighting {
             }
         }
         updates.sort_by_key(|update| update.chunk);
-        Some(LightUpdate {
+        LightUpdate {
             chunks: updates,
             invalidated_cells: work,
-        })
+        }
+    }
+
+    #[allow(dead_code)] // Also used by the standalone Vanilla probe.
+    pub fn edit(&mut self, p: Position, block: LightBlock) -> Option<LightUpdate> {
+        self.cell(p)?;
+        let (cx, cz) = p.chunk();
+        let targets: Vec<_> = self
+            .chunks
+            .keys()
+            .copied()
+            .filter(|(x, z)| (x - cx).abs() <= 1 && (z - cz).abs() <= 1)
+            .collect();
+        Some(self.edit_batch([(p, block)], targets))
     }
 
     /// Packed 16x16x16 sections, including one guard section below and above
     /// the dimension. The section at index zero begins at `min_y - 16`.
     pub fn sections(&self, chunk: Chunk, kind: LightKind) -> Vec<[u8; 2048]> {
-        let count = ((self.max_y - self.min_y + 1) / 16 + 2) as usize;
+        let count = (self.height / 16 + 2) as usize;
         let mut out = vec![[0u8; 2048]; count];
-        if !self.loaded.contains(&chunk) {
-            return out;
-        }
-        for (section, array) in out.iter_mut().enumerate() {
-            for ly in 0..16 {
-                let y = self.min_y - 16 + section as i32 * 16 + ly;
-                for lz in 0..16 {
-                    for lx in 0..16 {
-                        let p = Position::new(chunk.0 * 16 + lx, y, chunk.1 * 16 + lz);
-                        let level = if y > self.max_y && kind == LightKind::Sky {
-                            15
-                        } else {
-                            self.level(kind, p)
-                        };
-                        let index = (ly as usize * 256 + lz as usize * 16 + lx as usize) / 2;
-                        array[index] |= level << ((lx as usize & 1) * 4);
-                    }
+        if let Some(chunk) = self.chunks.get(&chunk) {
+            for (array, levels) in out[1..count - 1]
+                .iter_mut()
+                .zip(chunk.light(kind).chunks_exact(4096))
+            {
+                for (byte, pair) in array.iter_mut().zip(levels.chunks_exact(2)) {
+                    *byte = pair[0] | (pair[1] << 4);
                 }
+            }
+            if self.has_skylight && kind == LightKind::Sky {
+                out[count - 1].fill(0xff);
             }
         }
         out
@@ -573,7 +674,7 @@ impl IncrementalLighting {
 }
 
 #[cfg(test)]
-mod tests {
+mod incremental_lighting_tests {
     use super::*;
 
     const AIR: LightBlock = LightBlock::new(0, 0);
@@ -600,22 +701,19 @@ mod tests {
     fn assert_matches_full_rebuild(engine: &IncrementalLighting) {
         let mut oracle = engine.clone();
         oracle.rebuild();
-        assert_eq!(
-            engine.block, oracle.block,
-            "incremental block light diverged"
-        );
-        if engine.sky != oracle.sky {
-            let mismatches: Vec<_> = engine
-                .sky
-                .keys()
-                .chain(oracle.sky.keys())
-                .filter(|&&p| engine.sky.get(&p) != oracle.sky.get(&p))
-                .take(8)
-                .map(|&p| (p, engine.sky.get(&p).copied(), oracle.sky.get(&p).copied()))
-                .collect();
-            panic!("incremental skylight diverged, examples {mismatches:?}");
+        for (key, chunk) in &engine.chunks {
+            let rebuilt = &oracle.chunks[key];
+            for (name, actual, expected) in [
+                ("block", &chunk.block, &rebuilt.block),
+                ("sky", &chunk.sky, &rebuilt.sky),
+                ("direct sky", &chunk.direct_sky, &rebuilt.direct_sky),
+            ] {
+                assert!(
+                    actual == expected,
+                    "incremental {name} light diverged in {key:?}"
+                );
+            }
         }
-        assert_eq!(engine.direct_sky, oracle.direct_sky, "direct sky diverged");
     }
 
     fn nibble(sections: &[[u8; 2048]], y: i32, x: usize, z: usize) -> u8 {
@@ -883,6 +981,33 @@ mod tests {
         expect_level(&engine, LightKind::Block, p(16, 12, 8), 14);
         engine.unload_chunk(1, 0);
         expect_level(&engine, LightKind::Block, p(16, 12, 8), 0);
+        assert_matches_full_rebuild(&engine);
+    }
+
+    #[test]
+    fn batched_emitter_move_in_dark_dimension_matches_settled_chunks() {
+        let chunks = [(0, 0), (1, 0)];
+        let before = p(15, 12, 8);
+        let after = p(16, 12, 8);
+        let mut left = vec![AIR; 32 * 256];
+        left[12 * 256 + 8 * 16 + 15] = TORCH;
+        let mut engine = IncrementalLighting::from_chunks(
+            0,
+            32,
+            false,
+            [(chunks[0], left), (chunks[1], vec![AIR; 32 * 256])],
+        );
+        let update = engine.edit_batch([(before, AIR), (after, TORCH)], chunks);
+        assert_eq!(
+            update.chunks.iter().map(|u| u.chunk).collect::<Vec<_>>(),
+            chunks
+        );
+        for chunk in update.chunks {
+            assert_eq!(chunk.sky_mask | chunk.empty_sky_mask, 0);
+        }
+        expect_level(&engine, LightKind::Sky, after, 0);
+        expect_level(&engine, LightKind::Block, before, 13);
+        expect_level(&engine, LightKind::Block, after, 14);
         assert_matches_full_rebuild(&engine);
     }
 

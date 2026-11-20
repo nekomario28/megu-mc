@@ -973,6 +973,7 @@ pub(crate) struct S4ItemStack {
 
 #[cfg(any(test, feature = "neoforge-events"))]
 impl S4ItemStack {
+    #[cfg(test)]
     pub(crate) const EMPTY: Self = Self {
         item_id: 0,
         count: 0,

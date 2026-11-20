@@ -2,6 +2,7 @@
 """Offline C ABI checks and loopback Protocol 767 to client-port E2E."""
 import os
 import math
+import struct
 import ctypes as C
 from pathlib import Path
 
@@ -12,10 +13,12 @@ os.environ.setdefault("TMPDIR", str(ROOT / "target/tmp"))
 
 import sys
 sys.path.insert(0, str(ROOT / "tools/client_mesh_wire"))
-from mesh_bridge import BlockCatalog, MeshWireClient, OPAQUE, WorldSections, load_library
+from mesh_bridge import (
+    BlockCatalog, MeshWireClient, OPAQUE, WorldSections, load_library, nibble, section_arrays,
+)
 
 sys.path.insert(0, str(ROOT / "tests"))
-from protocol767 import local_server
+from protocol767 import Client, WIRE_BLOCKS, local_server, position
 from client_prediction_wire import chat_command
 from wire_smoke import vint
 
@@ -100,6 +103,37 @@ def chunk_window(pos):
     return {(cx + dx, cz + dz) for dx in range(-2, 3) for dz in range(-2, 3)}
 
 
+def light_level(client, pos, *, sky=False, snapshot=False):
+    x, y, z = pos
+    cx, sy, cz = x // 16, (y - client.min_y) // 16, z // 16
+    index = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15)
+    if snapshot:
+        masks, sky_rows, block_rows = client.chunk_light[(cx, cz)]
+        mask, rows = (masks[0], sky_rows) if sky else (masks[1], block_rows)
+        light = section_arrays(mask, rows, client.section_count).get(sy)
+        return nibble(light, index) if light is not None else 0
+    section = client.world.sections[(cx, sy, cz)]
+    return nibble(section.sky_light if sky else section.block_light, index)
+
+
+def wait_torch_update(client, torch, east, start_light, torch_state, levels, contract):
+    owners = {(x // 16, z // 16) for x, _, z in (torch, east)}
+    client.until(lambda *_: client.block(*torch) == torch_state
+                 and owners <= set(client.light_updates[start_light:])
+                 and (light_level(client, torch), light_level(client, east)) == levels,
+                 contract)
+
+
+def check_torch_snapshot(game, torch, east, levels):
+    owners = {(x // 16, z // 16) for x, _, z in (torch, east)}
+    with Client(game, "TorchSnapshot") as observer:
+        observer.login(view=2)
+        if not owners <= observer.chunk_light.keys():
+            observer.until(lambda *_: owners <= observer.chunk_light.keys(), "fresh-torch-chunks")
+        actual = tuple(light_level(observer, pos, snapshot=True) for pos in (torch, east))
+        check(actual == levels, f"fresh 0x27 light {actual}, expected {levels}")
+
+
 def naive_unit_faces(world, catalog, key):
     section = world.sections[key]
     cx, sy, cz = key
@@ -158,13 +192,10 @@ def live_wire_e2e(lib):
             reduction,naive,quads,key=score
             check(reduction>=2.0, f"greedy reduction {naive} unit faces to {quads} quads")
 
-            # Place an isolated block well inside a loaded chunk so update packet
-            # routing and section-local invalidation are directly observable.
-            x=math.floor(client.pos[0])+5; z=math.floor(client.pos[2])+5
+            # Place at the east edge of a held chunk to exercise propagation across it.
+            x=math.floor(client.pos[0]/16)*16+15; z=math.floor(client.pos[2])+5
             y=max(client.min_y+2,min(client.max_y-3,math.floor(client.pos[1])-3))
             target=(x,y,z)
-            before=client.world.sections[(x//16,(y-client.min_y)//16,z//16)]
-            light_before=max((q.block_light[0] for q in client.world.mesh(lib,(x//16,(y-client.min_y)//16,z//16))),default=0)
             start_updates=len(client.updates)
             chat_command(client,f"setblock {x} {y} {z} minecraft:stone")
             client.until(lambda *_: len(client.updates)>start_updates and client.block(*target)==1,
@@ -173,27 +204,75 @@ def live_wire_e2e(lib):
             stone_quads=client.world.mesh(lib,stone_key)
             check(stone_quads, "stone update remeshed section")
 
-            # A torch uses the pinned cutout state and causes a server light update
-            # when the live lighting path publishes one; the packet decoder records
-            # 0x2a (Protocol 767 Update Light).
-            start_updates=len(client.updates)
-            chat_command(client,f"setblock {x} {y+1} {z} minecraft:torch")
-            client.until(lambda *_: len(client.updates)>start_updates and client.block(x,y+1,z)==2355,
-                         "live-torch-block-update")
-            torch_quads=client.world.mesh(lib,stone_key)
-            check(any(q.layer==1 and q.state_id==2355 for q in torch_quads), "torch cutout reaches mesh")
+            torch = (x, y+1, z)
+            east = (x+1, y+1, z)
+            torch_key = (x//16, (y+1-client.min_y)//16, z//16)
+            for pos in (torch, east):
+                if client.block(*pos) != 0:
+                    chat_command(client, f"setblock {pos[0]} {pos[1]} {pos[2]} minecraft:air")
+                    client.until(lambda *_: client.block(*pos) == 0, "clear-torch-light-path")
+            light_before = light_level(client, torch)
+            east_before = light_level(client, east)
+            start_light = len(client.light_updates)
+            chat_command(client, f"setblock {x} {y+1} {z} minecraft:torch")
+            wait_torch_update(client, torch, east, start_light, 2355, (14, 13),
+                              "live-torch-0x2a-reaches-both-chunks")
+            light_packets = len(client.light_updates) - start_light
+            check(light_packets > 0, "torch placement sends Update Light")
+            torch_quads = [q for q in client.world.mesh(lib, torch_key)
+                           if q.layer == 1 and q.state_id == 2355]
+            check(torch_quads, "torch cutout reaches mesh")
+            max_light = max(max(q.block_light) for q in torch_quads)
+            check(max_light > light_before, "greedy mesher receives live torch light")
+
+            check_torch_snapshot(game, torch, east, (14, 13))
+
+            start_light = len(client.light_updates)
+            chat_command(client, f"setblock {x} {y+1} {z} minecraft:air")
+            dark = (light_before, east_before)
+            wait_torch_update(client, torch, east, start_light, 0, dark,
+                              "setblock-torch-removal-clears-both-chunks")
+
+            # Exercise the placement and dig handlers with the same lit and dark cells.
+            chat_command(client, "gamemode creative")
+            near_torch = (x - 1.5, float(y + 2), z + 0.5)
+            chat_command(client, f"tp {near_torch[0]} {near_torch[1]} {near_torch[2]}")
+            client.until(lambda *_: client.pos == near_torch, "player-in-placement-range")
+            torch_item = next(block["drops"][0] for block in WIRE_BLOCKS if block["name"] == "torch")
+            client.send(0x32, struct.pack(">h", 36) + vint(1) + vint(torch_item) + vint(0) + vint(0))
+            start_light = len(client.light_updates)
+            client.send(0x38, vint(0) + position(*target) + vint(1)
+                        + struct.pack(">fff?", 0.5, 1.0, 0.5, False) + vint(1))
+            wait_torch_update(client, torch, east, start_light, 2355, (14, 13),
+                              "player-torch-placement-lights-both-chunks")
+            start_light = len(client.light_updates)
+            client.send(0x24, vint(0) + position(*torch) + b"\x01" + vint(2))
+            wait_torch_update(client, torch, east, start_light, 0, dark,
+                              "player-torch-break-clears-both-chunks")
+            check_torch_snapshot(game, torch, east, dark)
+
+            # An opaque block high in open air lowers the sky below it by one.
+            roof = (x, y + 32, z)
+            below_roof = (x, y + 31, z)
+            check(light_level(client, below_roof, sky=True) == 15, "sky fixture starts at full light")
+            for state, sky_level in (("stone", 14), ("air", 15)):
+                start_light = len(client.light_updates)
+                chat_command(client, f"setblock {roof[0]} {roof[1]} {roof[2]} minecraft:{state}")
+                client.until(lambda *_: (x//16, z//16) in client.light_updates[start_light:]
+                             and light_level(client, below_roof, sky=True) == sky_level,
+                             f"live-sky-light-{state}")
 
             # Glass must not hide adjacent opaque stone; water must use the fluid layer.
             start_updates=len(client.updates)
-            chat_command(client,f"setblock {x+1} {y} {z} minecraft:glass")
-            client.until(lambda *_: len(client.updates)>start_updates and client.block(x+1,y,z)==519,
+            chat_command(client,f"setblock {x-1} {y} {z} minecraft:glass")
+            client.until(lambda *_: len(client.updates)>start_updates and client.block(x-1,y,z)==519,
                          "live-glass-block-update")
             glass_mesh=client.world.mesh(lib,stone_key)
             check(any(q.state_id==1 for q in glass_mesh) and any(q.state_id==519 and q.layer==2 for q in glass_mesh),
                   "glass remains translucent and stone faces stay visible")
             start_updates=len(client.updates)
-            chat_command(client,f"setblock {x+2} {y} {z} minecraft:water")
-            client.until(lambda *_: len(client.updates)>start_updates and client.block(x+2,y,z)==80,
+            chat_command(client,f"setblock {x-2} {y} {z} minecraft:water")
+            client.until(lambda *_: len(client.updates)>start_updates and client.block(x-2,y,z)==80,
                          "live-water-block-update")
             water_mesh=client.world.mesh(lib,stone_key)
             check(any(q.state_id==80 and q.layer==3 for q in water_mesh), "water update reaches fluid mesh")
@@ -207,8 +286,6 @@ def live_wire_e2e(lib):
             after=client.world.mesh(lib,stone_key)
             check(len(after)!=before_count or any(q.state_id==1 for q in after),
                   "stone break regenerates affected geometry")
-            max_light=max((max(q.block_light) for q in torch_quads),default=0)
-            light_packets=sum(pid==0x2a for pid in client.packet_ids)
             return {"chunks":len(client.chunks),"sections":len(client.world.sections),
                     "quad_reduction":f"{naive}->{quads} ({reduction:.2f}x)",
                     "section":key,"stone_quads":len(stone_quads),"break_quads":len(after),

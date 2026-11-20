@@ -111,3 +111,81 @@ Rust suite and the Vanilla probe exercise the implementation directly. Wiring
 engine ownership, generated emitters, registry properties, chunk lifecycle, and
 client publication through the mc-spine server remains in the server integration
 lane. Its runtime wire behavior was **NOT RUN** in E4-25.
+
+## Live server integration (E4-31)
+
+Both dimension-aware block write paths in `src/main.rs` now queue changes to
+emission, opacity, or face occlusion. This covers `/setblock`, player placement,
+and player breaking. The block update flush reconstructs the pre-edit state from
+the live overlay and generated terrain, then applies edits together in
+`IncrementalLighting`. The solver includes the affected held columns and their
+available neighbors, including generated emitters and the pinned slab and stair
+properties. The packet encoder sends each affected held chunk's changed sky
+and block sections as Protocol 767 `0x2a`, using empty masks to clear dark
+sections. The chunk and dimension are checked while holding the socket's stream
+order so a delta cannot follow a chunk unload.
+
+A bounded cache retains the settled arrays for affected columns whose full
+neighborhood was available. The `0x27` writer and server light queries use
+those arrays while the generator and nearby terrain versions match. Initial
+and incomplete windows continue to use the generated-light snapshot path.
+The live flush avoids opening distant terrain solely for lighting.
+
+The root include follows the existing server pattern and keeps the source
+graph at 44 modules and 111 edges. The engine now loads the entire input window
+in one pass and uses contiguous per-chunk light arrays to keep initialization
+and section packing bounded. A local unoptimized 3×3 synthetic window with a
+flat opaque floor took 18.89 s to load one chunk at a time with the previous
+engine, and 28 ms to load as one batch with the updated engine. The subsequent
+torch edit took 421 ms and 20 ms respectively and affected four chunks in both
+runs. These single-run measurements cover the synthetic window only.
+
+### Loopback receipt
+
+`tests/client_mesh_wire.py` received six live `0x2a` packets for one
+`/setblock` torch placement. The decoded block-light nibbles were 14 at the
+torch and 13 on the other side of the chunk border. The client-port Greedy
+Mesher read the same packed section through its C ABI and produced a torch quad
+with block light 14, up from a pre-edit value of 0. The probe also checked
+player placement, player breaking, and removal by command. Fresh `0x27`
+snapshots carried levels (14, 13) while lit and (0, 0) after removal. Placing
+and removing an opaque block changed live skylight below it from 15 to 14 and
+back to 15.
+
+The same torch delivery assertion failed against the pre-wiring binary after
+it received the torch block state. The failure was
+`live-torch-0x2a-reaches-both-chunks`. This case exercises the real loopback
+server, the Protocol 767 decoder, and the client-port library. The pinned
+Vanilla probe exercises the standalone solver on its 15 fixtures.
+
+### Checks
+
+Run from the E4-31 checkout based on `68fa967`, with temporary files under
+`target/tmp` and OpenJDK 21 for the Vanilla comparison. The default server
+binary had SHA-256
+`ab271a9db022b31fd8bcf6884ea51ccea825882d162f600041f89ba48e975104`.
+The final warning builds reproduced that same default binary.
+
+| Command | Exit | Elapsed | Result |
+| --- | ---: | ---: | --- |
+| `cargo build --offline --locked` | 0 | 1.19 s | 0 warnings |
+| `cargo build --offline --locked --features neoforge-events` | 0 | 1.26 s | 0 warnings |
+| `cargo build --offline --locked --features fabric-probe,neoforge-events` | 0 | 1.25 s | 0 warnings |
+| `python3 tests/client_mesh_wire.py` | 0 | 5.80 s | 6 live torch light packets, mesh block light 14 |
+| `python3 tests/lighting_parity_test.py` | 0 | 71.55 s | 15 pinned Vanilla 1.21.1 fixtures |
+| `cargo test --offline --locked -- light --test-threads=1` | 0 | 21.38 s | 42 passed |
+| `python3 tests/m2_gameplay_wire.py` | 0 | 15.13 s | PASS |
+| `python3 tests/gp1_gp6_wire.py` | 0 | 50.17 s | PASS |
+| `python3 tests/gp3_gp4_gp5_wire.py` | 0 | 27.43 s | PASS |
+| `python3 tests/gp5_gp7_wire.py` | 0 | 19.31 s | PASS |
+| `python3 tests/dimension_wire.py target/debug/mc-spine` | 0 | 2.93 s | PASS |
+| `bash tools/layers_check.sh` | 0 | 2.68 s | 44 modules, 111 edges, 0 named errors |
+| `bash tools/debt_ratchet.sh` | 0 | 0.02 s | 0 over limit |
+| `python3 tools/provenance_check.py` | 0 | 0.12 s | Clean |
+| `git diff --check` | 0 | 0.01 s | Clean |
+
+The standalone `rustc --edition 2021 --test -D warnings src/lighting.rs` suite
+passed all 17 tests. The added batch case checks two neighboring chunks in a
+dimension without a sky layer. `rustfmt --check --edition 2021 src/lighting.rs`
+also passed. Full `tests/verify.sh` and live Vanilla comparison of the
+mc-spine wire fixture were outside this run.
