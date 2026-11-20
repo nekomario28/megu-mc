@@ -23962,8 +23962,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     primed().lock().unwrap().push(Primed { eid, x, y, z, left: server_ticks(TNT_FUSE_GT) as i32 });
                     "Summoned tnt".to_string()
                 } else {
+                    let hp = default_mob_hp(args[0]);
                     let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
-                        etype: et, pos: Mutex::new((x, y, z, 0.0, 0.0)), hp: Mutex::new(20.0),
+                        etype: et, pos: Mutex::new((x, y, z, 0.0, 0.0)), hp: Mutex::new(hp),
                         last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                         last_hurt_tick: Mutex::new(None),
                         vel: Mutex::new([0.0; 3]),

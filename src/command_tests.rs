@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn summon_uses_the_mobs_initial_health() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let ctx = CmdCtx {
+        me: None,
+        x: 0.0,
+        y: 64.0,
+        z: 0.0,
+    };
+    assert_eq!(
+        run_command_ctx(&ctx, "/summon minecraft:cow 0 64 0", &mut None),
+        "Summoned minecraft:cow"
+    );
+    let mobs = mobs().lock().unwrap();
+    let [cow] = mobs.as_slice() else {
+        panic!("expected exactly one summoned mob");
+    };
+    assert_eq!(cow.etype, name_to_etype("cow").unwrap());
+    assert_eq!(*cow.hp.lock().unwrap(), 10.0);
+}
+
 // `/tag <targets> list <tag>` is a console/RCON path: players may only run
 // help / list / time query (`command_allowed_for_player`). Vanilla reports one
 // line per matched target, so a loop that returns after the first target
