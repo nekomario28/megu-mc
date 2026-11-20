@@ -469,6 +469,24 @@ fn generated_dispatcher_fixture() {
         })
         .unwrap();
         let events = if fluid {
+            let pending = worldgen::with_gen(|g| g.generated_fluid_ticks()).unwrap();
+            assert!(!pending.is_empty());
+            for _ in 0..2 {
+                let mut payload = Vec::new();
+                with_save_guard(|| save_world_into(&mut payload));
+                let saved = tick_persistence::TickState::read(&payload)
+                    .expect("decode the tick footer")
+                    .expect("save includes a tick footer");
+                assert_eq!(
+                    saved.generated_fluids, pending,
+                    "save includes the pending fluids"
+                );
+                assert_eq!(
+                    worldgen::with_gen(|g| g.generated_fluid_ticks()).unwrap(),
+                    pending,
+                    "saving must leave generated fluids available for live intake"
+                );
+            }
             generated_fluid_tick();
             assert!(
                 worldgen::take_generated_fluid_ticks().is_empty(),

@@ -7166,7 +7166,7 @@ impl Gen {
         }
     }
 
-    #[cfg(test)]
+    /// Snapshot pending fluid ticks without transferring ownership, for saves.
     pub(crate) fn generated_fluid_ticks(&self) -> Vec<GeneratedTick> {
         self.generated_ticks.fluids.lock().unwrap().0.clone()
     }

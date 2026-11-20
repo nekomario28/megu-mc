@@ -13365,7 +13365,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         (
             g.tick_sources(),
             g.generated_leaf_ticks().to_vec(),
-            worldgen::take_generated_fluid_ticks(),
+            g.generated_fluid_ticks(),
         )
     })
     .unwrap_or_default();
