@@ -698,6 +698,508 @@ fn anvil_name_is_blank(name: &str) -> bool {
     !name.bytes().any(|byte| byte.is_ascii_graphic())
 }
 
+// Pure combat, enchantment, mining, and item durability mechanics for Java
+// Edition 1.21.1. These are kept independent from the server loop so callers
+// can supply world- and entity-specific facts without making this module stateful.
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlayerAabb {
+    min: [f64; 3],
+    max: [f64; 3],
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PlayerAabb {
+    fn inflate(self, horizontal: f64, vertical: f64) -> Self {
+        Self {
+            min: [
+                self.min[0] - horizontal,
+                self.min[1] - vertical,
+                self.min[2] - horizontal,
+            ],
+            max: [
+                self.max[0] + horizontal,
+                self.max[1] + vertical,
+                self.max[2] + horizontal,
+            ],
+        }
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        (0..3).all(|axis| self.max[axis] >= other.min[axis] && self.min[axis] <= other.max[axis])
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SweepAttack {
+    eligible: bool,
+    damage: f32,
+    search_box: PlayerAabb,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn sweeping_edge_damage(level: i32, base_attack_damage: f32) -> f32 {
+    let level = level.max(0) as f32;
+    1.0 + (level / (level + 1.0)) * base_attack_damage
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn sweeping_attack(
+    attack_strength: f32,
+    on_ground: bool,
+    sprinting: bool,
+    critical: bool,
+    attacker_position: [f64; 3],
+    target_box: PlayerAabb,
+    candidate_box: PlayerAabb,
+    base_attack_damage: f32,
+    sweeping_edge_level: i32,
+) -> SweepAttack {
+    let target_center = [
+        (target_box.min[0] + target_box.max[0]) * 0.5,
+        (target_box.min[1] + target_box.max[1]) * 0.5,
+        (target_box.min[2] + target_box.max[2]) * 0.5,
+    ];
+    let dx = attacker_position[0] - target_center[0];
+    let dz = attacker_position[2] - target_center[2];
+    let eligible = attack_strength >= 0.9
+        && on_ground
+        && !sprinting
+        && !critical
+        && dx * dx + dz * dz <= 9.0
+        && target_box.inflate(1.0, 0.25).intersects(candidate_box);
+    SweepAttack {
+        eligible,
+        damage: if eligible {
+            sweeping_edge_damage(sweeping_edge_level, base_attack_damage)
+        } else {
+            0.0
+        },
+        search_box: target_box.inflate(1.0, 0.25),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn sweeping_target_in_range(search_box: PlayerAabb, candidate_box: PlayerAabb) -> bool {
+    search_box.intersects(candidate_box)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn knockback_strength(base_strength: f32, knockback_level: i32) -> f32 {
+    base_strength + knockback_level.max(0) as f32 * 0.5
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn unbreaking_consumes_durability(level: i32, random_0_to_1: f32, is_armor: bool) -> bool {
+    let level = level.max(0) as f32;
+    let damage_chance = if is_armor {
+        0.6 + 0.4 / (level + 1.0)
+    } else {
+        1.0 / (level + 1.0)
+    };
+    random_0_to_1 >= 0.0 && random_0_to_1 < damage_chance
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn lure_wait_ticks(base_wait_ticks: i32, level: i32) -> i32 {
+    (base_wait_ticks - level.max(0).saturating_mul(100)).max(0)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FishingLootWeights {
+    treasure: i32,
+    junk: i32,
+    fish: i32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn luck_of_the_sea_weights(level: i32, base: FishingLootWeights) -> FishingLootWeights {
+    let luck = level.max(0);
+    FishingLootWeights {
+        treasure: (base.treasure + 2 * luck).max(0),
+        junk: (base.junk - luck).max(0),
+        fish: base.fish.max(0),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn thorns_triggers(level: i32, random_0_to_1: f32) -> bool {
+    let chance = (level.max(0) as f32 * 0.15).min(1.0);
+    random_0_to_1 >= 0.0 && random_0_to_1 < chance
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn thorns_damage(level: i32, random_1_to_4: u32) -> u32 {
+    if level <= 0 {
+        0
+    } else if level > 10 {
+        level as u32
+    } else {
+        random_1_to_4.clamp(1, 4)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn respiration_air_ticks(level: i32) -> i32 {
+    300_i32.saturating_mul(level.max(0).saturating_add(1))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn respiration_preserves_air(level: i32, random_0_to_1: f32) -> bool {
+    level > 0 && random_0_to_1 >= 0.0 && random_0_to_1 < level as f32 / (level as f32 + 1.0)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn depth_strider_underwater_factor(level: i32) -> f32 {
+    level.clamp(0, 3) as f32 / 3.0
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn soul_speed_multiplier(level: i32) -> f32 {
+    1.0 + level.max(0) as f32 * 0.03
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn swift_sneak_speed_multiplier(level: i32) -> f32 {
+    (0.3 + level.max(0) as f32 * 0.15).min(1.0)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn tool_base_mining_speed(item: &str) -> f32 {
+    let Some((tier, kind)) = tool_parts(item) else {
+        return 1.0;
+    };
+    if kind == "sword" {
+        return 1.5;
+    }
+    match tier {
+        "wooden" => 2.0,
+        "stone" => 4.0,
+        "iron" => 6.0,
+        "diamond" => 8.0,
+        "golden" => 12.0,
+        "netherite" => 9.0,
+        _ => 1.0,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn mining_speed_with_modifiers(
+    base_speed: f32,
+    effective_tool: bool,
+    efficiency_level: i32,
+    haste_amplifier: Option<i32>,
+    mining_fatigue_amplifier: Option<i32>,
+    in_water_without_aqua_affinity: bool,
+    on_ground: bool,
+) -> f32 {
+    let mut speed = base_speed.max(0.0);
+    if effective_tool && efficiency_level > 0 {
+        let level = efficiency_level as f32;
+        speed += level * level + 1.0;
+    }
+    if let Some(amplifier) = haste_amplifier {
+        speed *= 1.0 + 0.2 * (amplifier.max(0) as f32 + 1.0);
+    }
+    if let Some(amplifier) = mining_fatigue_amplifier {
+        let multiplier = if amplifier >= 3 {
+            0.00081
+        } else {
+            0.3_f32.powi(amplifier.max(0) + 1)
+        };
+        speed *= multiplier;
+    }
+    if in_water_without_aqua_affinity {
+        speed *= 0.2;
+    }
+    if !on_ground {
+        speed *= 0.2;
+    }
+    speed
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn mining_damage_per_tick(speed: f32, block_hardness: f32) -> f32 {
+    if block_hardness <= 0.0 {
+        return 1.0;
+    }
+    speed.max(0.0) / block_hardness / 30.0
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn instant_mining_break(speed: f32, block_hardness: f32) -> bool {
+    block_hardness <= 0.0 || mining_damage_per_tick(speed, block_hardness) >= 1.0
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn item_max_durability(item: &str) -> Option<u32> {
+    if let Some((tier, kind)) = tool_parts(item) {
+        return Some(match (tier, kind) {
+            ("wooden", _) => 59,
+            ("stone", _) => 131,
+            ("iron", _) => 250,
+            ("golden", _) => 32,
+            ("diamond", _) => 1_561,
+            ("netherite", _) => 2_031,
+            _ => return None,
+        });
+    }
+    if let Some((material, piece)) = armor_parts(item) {
+        let multiplier = match material {
+            "leather" => 5,
+            "chainmail" | "iron" | "golden" => 15,
+            "diamond" => 33,
+            "netherite" => 37,
+            "turtle" => return Some(275),
+            _ => return None,
+        };
+        let base = match piece {
+            "helmet" => 11,
+            "chestplate" => 16,
+            "leggings" => 15,
+            "boots" => 13,
+            _ => return None,
+        };
+        return Some(multiplier * base);
+    }
+    Some(match item {
+        "bow" => 384,
+        "crossbow" => 326,
+        "trident" => 250,
+        "elytra" => 432,
+        "shield" => 336,
+        "flint_and_steel" => 64,
+        "shears" => 238,
+        "brush" => 64,
+        "mace" => 500,
+        "wolf_armor" => 64,
+        "fishing_rod" => 64,
+        "carrot_on_a_stick" => 25,
+        "warped_fungus_on_a_stick" => 100,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod player_mechanisms_combat_mining_durability_tests {
+    use super::*;
+
+    fn box_at(x: f64, y: f64, z: f64) -> PlayerAabb {
+        PlayerAabb {
+            min: [x, y, z],
+            max: [x + 1.0, y + 1.0, z + 1.0],
+        }
+    }
+
+    #[test]
+    fn sweeping_attack_checks_conditions_damage_distance_and_aabb() {
+        let target = box_at(0.0, 0.0, 0.0);
+        let candidate = box_at(1.5, 0.0, 0.0);
+        let sweep = sweeping_attack(
+            0.9,
+            true,
+            false,
+            false,
+            [-2.0, 0.0, 0.5],
+            target,
+            candidate,
+            8.0,
+            3,
+        );
+        assert!(sweep.eligible);
+        assert!((sweep.damage - 7.0).abs() < 0.0001);
+        assert_eq!(sweep.search_box, target.inflate(1.0, 0.25));
+        assert!(sweeping_target_in_range(sweep.search_box, candidate));
+        assert!(
+            !sweeping_attack(
+                0.89,
+                true,
+                false,
+                false,
+                [-2.0, 0.0, 0.5],
+                target,
+                candidate,
+                8.0,
+                0
+            )
+            .eligible
+        );
+        assert!(
+            !sweeping_attack(
+                1.0,
+                true,
+                true,
+                false,
+                [-2.0, 0.0, 0.5],
+                target,
+                candidate,
+                8.0,
+                0
+            )
+            .eligible
+        );
+        assert!(
+            !sweeping_attack(
+                1.0,
+                false,
+                false,
+                false,
+                [-2.0, 0.0, 0.5],
+                target,
+                candidate,
+                8.0,
+                0
+            )
+            .eligible
+        );
+        assert!(
+            !sweeping_attack(
+                1.0,
+                true,
+                false,
+                true,
+                [-2.0, 0.0, 0.5],
+                target,
+                candidate,
+                8.0,
+                0
+            )
+            .eligible
+        );
+        assert!(
+            !sweeping_attack(
+                1.0,
+                true,
+                false,
+                false,
+                [-4.0, 0.0, 0.5],
+                target,
+                candidate,
+                8.0,
+                0
+            )
+            .eligible
+        );
+        assert_eq!(sweeping_edge_damage(0, 8.0), 1.0);
+        assert!((sweeping_edge_damage(1, 8.0) - 5.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn remaining_enchantment_calculations_match_requested_scaling() {
+        assert_eq!(knockback_strength(1.0, 2), 2.0);
+        assert!(unbreaking_consumes_durability(2, 0.32, false));
+        assert!(!unbreaking_consumes_durability(2, 0.34, false));
+        assert!(unbreaking_consumes_durability(3, 0.69, true));
+        assert!(!unbreaking_consumes_durability(3, 0.71, true));
+        assert_eq!(lure_wait_ticks(600, 2), 400);
+        assert_eq!(lure_wait_ticks(100, 2), 0);
+        assert_eq!(
+            luck_of_the_sea_weights(
+                2,
+                FishingLootWeights {
+                    treasure: 5,
+                    junk: 10,
+                    fish: 85
+                }
+            ),
+            FishingLootWeights {
+                treasure: 9,
+                junk: 8,
+                fish: 85
+            }
+        );
+        assert!(thorns_triggers(2, 0.29));
+        assert!(!thorns_triggers(2, 0.30));
+        assert_eq!(thorns_damage(3, 9), 4);
+        assert_eq!(thorns_damage(11, 9), 11);
+        assert_eq!(respiration_air_ticks(3), 1_200);
+        assert!(respiration_preserves_air(2, 0.66));
+        assert!(!respiration_preserves_air(2, 0.67));
+        assert_eq!(depth_strider_underwater_factor(2), 2.0 / 3.0);
+        assert_eq!(depth_strider_underwater_factor(9), 1.0);
+        assert!((soul_speed_multiplier(3) - 1.09).abs() < 0.0001);
+        assert!((swift_sneak_speed_multiplier(3) - 0.75).abs() < 0.0001);
+    }
+
+    #[test]
+    fn mining_speed_applies_tool_enchantments_effects_and_break_threshold() {
+        assert_eq!(tool_base_mining_speed("wooden_pickaxe"), 2.0);
+        assert_eq!(tool_base_mining_speed("diamond_sword"), 1.5);
+        assert_eq!(tool_base_mining_speed("golden_axe"), 12.0);
+        assert_eq!(tool_base_mining_speed("shears"), 1.0);
+        assert_eq!(
+            mining_speed_with_modifiers(6.0, true, 2, None, None, false, true),
+            11.0
+        );
+        assert_eq!(
+            mining_speed_with_modifiers(6.0, false, 2, None, None, false, true),
+            6.0
+        );
+        assert!(
+            (mining_speed_with_modifiers(6.0, false, 0, Some(1), None, false, true) - 8.4).abs()
+                < 0.0001
+        );
+        assert!(
+            (mining_speed_with_modifiers(6.0, false, 0, None, Some(1), true, false) - 0.0216).abs()
+                < 0.0001
+        );
+        assert!(
+            (mining_speed_with_modifiers(6.0, false, 0, None, Some(3), false, true) - 0.00486)
+                .abs()
+                < 0.00001
+        );
+        assert!(instant_mining_break(30.0, 1.0));
+        assert!(!instant_mining_break(29.9, 1.0));
+        assert!(instant_mining_break(0.0, 0.0));
+        assert!((mining_damage_per_tick(6.0, 2.0) - 0.1).abs() < 0.0001);
+    }
+
+    #[test]
+    fn durability_lookup_covers_every_damageable_item_family() {
+        for tier_and_expected in [
+            ("wooden", 59),
+            ("stone", 131),
+            ("iron", 250),
+            ("golden", 32),
+            ("diamond", 1_561),
+            ("netherite", 2_031),
+        ] {
+            for kind in ["sword", "pickaxe", "axe", "shovel", "hoe"] {
+                assert_eq!(
+                    item_max_durability(&format!("{}_{}", tier_and_expected.0, kind)),
+                    Some(tier_and_expected.1)
+                );
+            }
+        }
+        assert_eq!(item_max_durability("leather_helmet"), Some(55));
+        assert_eq!(item_max_durability("iron_chestplate"), Some(240));
+        assert_eq!(item_max_durability("diamond_leggings"), Some(495));
+        assert_eq!(item_max_durability("netherite_boots"), Some(481));
+        assert_eq!(item_max_durability("turtle_helmet"), Some(275));
+        for (item, durability) in [
+            ("bow", 384),
+            ("crossbow", 326),
+            ("trident", 250),
+            ("elytra", 432),
+            ("shield", 336),
+            ("flint_and_steel", 64),
+            ("shears", 238),
+            ("brush", 64),
+            ("mace", 500),
+            ("wolf_armor", 64),
+            ("fishing_rod", 64),
+            ("carrot_on_a_stick", 25),
+            ("warped_fungus_on_a_stick", 100),
+        ] {
+            assert_eq!(item_max_durability(item), Some(durability), "{item}");
+        }
+        assert_eq!(item_max_durability("stone"), None);
+    }
+}
+
 /// Preview a repair. A nonblank rename sets a custom name, and a blank rename clears it.
 #[cfg_attr(not(test), allow(dead_code))]
 fn anvil_result(
