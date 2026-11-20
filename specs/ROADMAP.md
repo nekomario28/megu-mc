@@ -29,7 +29,7 @@ chunk状態の整合性・操作から保存再開までの完成・統合を主
 
 | 優先トラック | 対象 | 次の出口（Phase E Wave 2） |
 |---|---|---|
-| **Collaborator 継続レーン (`GP-2` Live Wiring)** | `src/natural_spawner.rs` + `src/tick_tests.rs` | PR `#55`（距離）・`#56`（cap）・`#57`（配置）・`#61`（明暗 `577891f`）統合済み。続くパック生成・`SpawnCosts`・despawn の本番配線（他レーンは `src/natural_spawner.rs` に触れない） |
+| **Collaborator 継続レーン (`GP-2` Live Wiring)** | `src/natural_spawner.rs` + `src/tick_tests.rs` | PR `#55`（距離）・`#56`（cap）・`#57`（配置）・`#61`（明暗 `577891f`）統合済み。続くパック生成・`SpawnCosts`・despawn の本番配線（他レーンは `src/natural_spawner.rs` に触れない）。**[IN PROGRESS] Wave E3 (`raitoxlol`, 2026-11-20)**: パック生成（`src/natural_spawner.rs` + `src/tick_tests.rs`）と despawn 本番パス（新規 `src/mob_despawn.rs`）。`SpawnCosts` は Nether 本番スポーン経路が入るまで保留 |
 | **Track 1 (Worldgen & Perf: `P2-1-T3` / `P4-1`)** | 構造物 HOLD 再検証・Batch B4 ＆ M3 再測定 | ① `D-2a` (`f5c0e8e`) / `D-2b` (`d139913`) 完了済み、② `buried_treasure` / `swamp_hut` の再対照と Batch B4 昇格、③ 同一 SHA での `WARM=1` back-to-back M3 最終測定 |
 | **Track 2 (Mod 互換: `R5 NF-3〜NF-4`)** | NeoForge 1.21.1 S2 `DeferredRegister` → S3 バッチ JNI | `NF-0` (`a42ebb2`) / `NF-1` (`6d3a03d`) / `NF-2` Java S1 (`0ce02ac`) / **`NF-2b` Rust Host Bridge & CAS 適用 (`56d6f5e`, 51 Py + 5 Rust PASS)** 完了。次は **`NF-3`（S2 `DeferredRegister` + 名前ベース永続化）** → `NF-4`（S3 Direct `ByteBuffer` バッチ JNI） |
 | **Track 3 (Client Fork & Runtime: `R6 CF-0 / CF-3` / `P1`)** | 共有カーネル境界・Integrated Server パッケージ・Template 最終化 | `CF-4` (`0ea0c3e`)・**`CF-1`/`CF-3` 流体/次元予測＆`--mc-spine-integrated` ループバック基盤 (`153a0fd`, 12 launcher + prediction wire PASS)** 完了。次は **`CF-0`（`layers_check.sh` 互換の Zero-Drift 共有カーネル境界）** → **`CF-3`（`mods/` 投入型 JAR / `cdylib` パッケージ化）**、および `P1-1〜P1-4` 実チャンク Fossil |
