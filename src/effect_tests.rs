@@ -1,4 +1,5 @@
 use super::*;
+use crate::effects::*;
 
 pub(super) fn client_pair() -> (Client, TcpStream) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -294,4 +295,233 @@ fn a_rejected_hit_changes_nothing() {
     assert_eq!(damage_after_invulnerability(&c, 4.0), None);
     assert_eq!(*c.last_hurt.lock().unwrap(), 4.0);
     assert_eq!(*c.invulnerable.lock().unwrap(), 15);
+}
+
+#[test]
+fn vanilla_1211_effect_registry_names_and_ids_round_trip() {
+    let names = [
+        "speed",
+        "slowness",
+        "haste",
+        "mining_fatigue",
+        "strength",
+        "instant_health",
+        "instant_damage",
+        "jump_boost",
+        "nausea",
+        "regeneration",
+        "resistance",
+        "fire_resistance",
+        "water_breathing",
+        "invisibility",
+        "blindness",
+        "night_vision",
+        "hunger",
+        "weakness",
+        "poison",
+        "wither",
+        "health_boost",
+        "absorption",
+        "saturation",
+        "glowing",
+        "levitation",
+        "luck",
+        "unluck",
+        "slow_falling",
+        "conduit_power",
+        "dolphins_grace",
+        "bad_omen",
+        "hero_of_the_village",
+        "darkness",
+        "trial_omen",
+        "raid_omen",
+        "wind_charged",
+        "weaving",
+        "oozing",
+        "infested",
+    ];
+    assert_eq!(names.len(), 39);
+    for (index, name) in names.iter().enumerate() {
+        let id = index as i32 + 1;
+        assert_eq!(effect_registry_name(id), Some(*name));
+        assert_eq!(effect_registry_id(name), Some(id));
+    }
+    assert_eq!(effect_registry_name(0), None);
+    assert_eq!(effect_registry_name(40), None);
+    assert_eq!(effect_registry_id("minecraft:conduit_power"), Some(29));
+    assert_eq!(effect_registry_id("missing"), None);
+    assert_eq!(effect_internal_id(1), Some(0));
+    assert_eq!(effect_internal_id(17), Some(HUNGER_EFFECT));
+    assert_eq!(effect_internal_id(39), Some(38));
+}
+
+#[test]
+fn vanilla_attribute_modifiers_cover_each_effect_level() {
+    assert_eq!(
+        effect_attribute_modifier(1, 0, EffectAttribute::MovementSpeed),
+        1.2
+    );
+    assert_eq!(
+        effect_attribute_modifier(1, 1, EffectAttribute::MovementSpeed),
+        1.4
+    );
+    assert!((effect_attribute_modifier(2, 0, EffectAttribute::MovementSpeed) - 0.85).abs() < 1e-6);
+    assert_eq!(
+        effect_attribute_modifier(2, 8, EffectAttribute::MovementSpeed),
+        0.0,
+        "slowness cannot make the speed factor negative"
+    );
+    assert!((effect_attribute_modifier(3, 0, EffectAttribute::AttackSpeed) - 1.1).abs() < 1e-6);
+    assert_eq!(
+        effect_attribute_modifier(4, 0, EffectAttribute::AttackSpeed),
+        0.9
+    );
+    assert_eq!(
+        effect_attribute_modifier(5, 2, EffectAttribute::AttackDamage),
+        9.0
+    );
+    assert_eq!(
+        effect_attribute_modifier(18, 1, EffectAttribute::AttackDamage),
+        -8.0
+    );
+    assert_eq!(
+        effect_attribute_modifier(21, 3, EffectAttribute::MaxHealth),
+        16.0
+    );
+    assert_eq!(
+        effect_attribute_modifier(22, 1, EffectAttribute::MaxAbsorption),
+        8.0
+    );
+    assert_eq!(
+        effect_attribute_modifiers(23, 0),
+        EffectAttributeModifiers::default(),
+        "unrelated effects do not alter attributes"
+    );
+}
+
+#[test]
+fn vanilla_damage_mitigation_and_slow_falling_edges() {
+    assert!((resistance_multiplier(0) - 0.8).abs() < 1e-6);
+    assert!((resistance_multiplier(3) - 0.2).abs() < 1e-6);
+    assert_eq!(resistance_multiplier(4), 0.0, "level five is immune");
+    assert_eq!(
+        incoming_damage_after_effects(10.0, DamageKind::Ordinary, Some(0), false, false),
+        8.0
+    );
+    assert_eq!(
+        incoming_damage_after_effects(10.0, DamageKind::Ordinary, Some(4), false, false),
+        0.0
+    );
+    for kind in [DamageKind::Fire, DamageKind::Lava] {
+        assert_eq!(
+            incoming_damage_after_effects(10.0, kind, None, true, false),
+            0.0
+        );
+    }
+    assert_eq!(
+        incoming_damage_after_effects(10.0, DamageKind::Ordinary, None, true, false),
+        10.0,
+        "Fire Resistance does not block ordinary damage"
+    );
+    assert_eq!(
+        incoming_damage_after_effects(10.0, DamageKind::Fall, None, false, true),
+        0.0
+    );
+    for bypass in [DamageKind::Void, DamageKind::Kill] {
+        assert_eq!(
+            incoming_damage_after_effects(10.0, bypass, Some(8), true, true),
+            10.0,
+            "Resistance does not block void or kill damage"
+        );
+    }
+    assert_eq!(slow_falling_gravity_multiplier(true), 0.125);
+    assert_eq!(slow_falling_gravity_multiplier(false), 1.0);
+}
+
+#[test]
+fn vanilla_periodic_effect_rates_and_high_amplifiers() {
+    assert_eq!(periodic_effect_interval(50, 0), 50);
+    assert_eq!(periodic_effect_interval(50, 1), 25);
+    assert_eq!(periodic_effect_interval(25, 1), 12);
+    assert_eq!(periodic_effect_interval(40, 2), 10);
+    assert_eq!(periodic_effect_interval(25, 31), 1);
+    assert_eq!(periodic_effect_interval(50, 255), 1);
+    assert_eq!(regeneration_heal(4), 1.0);
+    assert_eq!(poison_damage(4), 1.0);
+    assert_eq!(wither_damage(4), 1.0);
+}
+
+#[test]
+fn vanilla_food_air_levitation_and_instant_effect_formulas() {
+    assert_eq!(hunger_exhaustion_per_tick(0), 0.005);
+    assert_eq!(hunger_exhaustion_per_tick(2), 0.015);
+    assert_eq!(saturation_tick(10, 3.0), (11, 5.0));
+    assert_eq!(saturation_tick(19, 19.0), (20, 20.0));
+    assert_eq!(saturation_tick(20, 20.0), (20, 20.0));
+    assert_eq!(saturation_tick(0, 0.0), (1, 1.0));
+    assert!(!effect_prevents_drowning(&[1, 12]));
+    assert!(effect_prevents_drowning(&[13]));
+    assert!(effect_prevents_drowning(&[29]));
+    assert!((levitation_velocity_delta(0.0, 0) - 0.01).abs() < 1e-12);
+    assert!((levitation_velocity_delta(0.2, 0) + 0.03).abs() < 1e-12);
+    assert_eq!(instant_effect_amount(true, 0), 4.0);
+    assert_eq!(instant_effect_amount(true, 2), 16.0);
+    assert_eq!(instant_effect_amount(false, 0), 6.0);
+    assert_eq!(instant_effect_amount(false, 2), 24.0);
+}
+
+#[test]
+fn tick_effects_apply_saturation_water_breathing_and_regeneration() {
+    let (client, _receiver) = client_pair();
+    *client.food.lock().unwrap() = 18;
+    *client.sat.lock().unwrap() = 4.0;
+    *client.air.lock().unwrap() = 3;
+    *client.hp.lock().unwrap() = 10.0;
+    *client.effs.lock().unwrap() = vec![
+        Eff {
+            id: 22,
+            amp: 0,
+            left: 20,
+        }, // Saturation
+        Eff {
+            id: 12,
+            amp: 0,
+            left: 20,
+        }, // Water Breathing
+        Eff {
+            id: 9,
+            amp: 0,
+            left: 51,
+        }, // Regeneration: remaining duration reaches 50
+    ];
+
+    effects::tick_effects(&client);
+
+    assert_eq!(*client.food.lock().unwrap(), 19);
+    assert_eq!(*client.sat.lock().unwrap(), 6.0);
+    assert_eq!(*client.air.lock().unwrap(), AIR_SUPPLY_GT as i32);
+    assert_eq!(*client.hp.lock().unwrap(), 11.0);
+}
+
+#[test]
+fn tick_effects_keep_poison_nonlethal_and_wither_lethal() {
+    let (client, _receiver) = client_pair();
+    *client.hp.lock().unwrap() = 1.0;
+    client.effs.lock().unwrap().push(Eff {
+        id: 18,
+        amp: 0,
+        left: 26,
+    });
+    effects::tick_effects(&client);
+    assert_eq!(*client.hp.lock().unwrap(), 1.0);
+
+    client.effs.lock().unwrap().clear();
+    *client.hp.lock().unwrap() = 1.0;
+    client.effs.lock().unwrap().push(Eff {
+        id: 19,
+        amp: 0,
+        left: 41,
+    });
+    effects::tick_effects(&client);
+    assert_eq!(*client.hp.lock().unwrap(), 0.0);
 }
