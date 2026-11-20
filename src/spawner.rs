@@ -13,6 +13,87 @@ pub(crate) trait World {
     fn insert(&mut self,pos:[f64;3],yaw:f32)->bool;
     fn effects(&mut self,origin:Pos,pos:[f64;3]);
 }
+
+/// Placement family used by `NaturalSpawner` when checking a generated creature.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreaturePlacement { Ground, Water, Air }
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreatureSpawnerData {
+    pub kind: String,
+    pub min_count: i32,
+    pub max_count: i32,
+    pub weight: i32,
+}
+
+/// World queries needed by the initial chunk-generation creature pass.
+pub(crate) trait ChunkGenerationWorld {
+    fn spawn_y(&mut self, x: i32, z: i32) -> i32;
+    fn ground_spawnable(&mut self, kind: &str, pos: Pos) -> bool;
+    fn water_spawnable(&mut self, kind: &str, pos: Pos) -> bool;
+    fn air_spawnable(&mut self, kind: &str, pos: Pos) -> bool;
+    fn add_creature(&mut self, kind: &str, pos: Pos);
+}
+
+fn creature_placement(kind: &str) -> CreaturePlacement {
+    match kind {
+        "minecraft:cod" | "minecraft:salmon" | "minecraft:tropical_fish"
+        | "minecraft:pufferfish" | "minecraft:squid" | "minecraft:glow_squid"
+        | "minecraft:dolphin" | "minecraft:turtle" | "minecraft:axolotl"
+        | "minecraft:guardian" | "minecraft:elder_guardian" => CreaturePlacement::Water,
+        "minecraft:bat" | "minecraft:parrot" => CreaturePlacement::Air,
+        _ => CreaturePlacement::Ground,
+    }
+}
+
+fn choose_creature<'a>(entries: &'a [CreatureSpawnerData], random: &mut Lcg) -> Option<&'a CreatureSpawnerData> {
+    let total = entries.iter().try_fold(0i32, |sum, entry| {
+        sum.checked_add(entry.weight).filter(|_| entry.weight >= 0)
+    })?;
+    if total <= 0 { return None; }
+    let mut roll = random.next_bound(total);
+    entries.iter().find(|entry| {
+        roll -= entry.weight;
+        roll < 0
+    })
+}
+
+/// 1.21.1 `NaturalSpawner.spawnMobsForChunkGeneration` for creature spawning.
+/// An omitted biome probability uses `MobSpawnSettings`' default of 0.1.
+/// The lookup callback supplies the biome's `creature` category without adding
+/// a dependency from this lower-level module to the feature registry.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn spawn_mobs_for_chunk_generation(
+    chunk_x: i32,
+    chunk_z: i32,
+    center_biome: &str,
+    creature_probability: Option<f32>,
+    mut spawners_for: impl FnMut(&str, &str) -> Vec<CreatureSpawnerData>,
+    world: &mut impl ChunkGenerationWorld,
+    random: &mut Lcg,
+) {
+    let probability = creature_probability.unwrap_or(0.1);
+    let entries = spawners_for(center_biome, "creature");
+    if entries.is_empty() { return; }
+    while random.next_f32() < probability {
+        let Some(entry) = choose_creature(&entries, random) else { return; };
+        let mut x = chunk_x * 16 + random.next_bound(16);
+        let mut z = chunk_z * 16 + random.next_bound(16);
+        let count = entry.min_count + random.next_bound((entry.max_count - entry.min_count + 1).max(1));
+        for _ in 0..count {
+            x += random.next_bound(5) - 2;
+            z += random.next_bound(5) - 2;
+            let pos = (x, world.spawn_y(x, z), z);
+            let accepted = match creature_placement(&entry.kind) {
+                CreaturePlacement::Ground => world.ground_spawnable(&entry.kind, pos),
+                CreaturePlacement::Water => world.water_spawnable(&entry.kind, pos),
+                CreaturePlacement::Air => world.air_spawnable(&entry.kind, pos),
+            };
+            if accepted { world.add_creature(&entry.kind, pos); }
+        }
+    }
+}
+
 fn int(tag:Option<&Tag>)->i32 {
     match tag {
         Some(Tag::Byte(v))=>i32::from(*v),Some(Tag::Short(v))=>i32::from(*v),Some(Tag::Int(v))=>*v,

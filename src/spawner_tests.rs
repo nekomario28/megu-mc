@@ -2,6 +2,74 @@ use super::*;
 use crate::nbt::Tag;
 use std::collections::BTreeMap;
 
+#[derive(Default)]
+struct ChunkCreatureScene {
+    spawned: Vec<(String, Pos)>,
+    checks: Vec<(CreaturePlacement, String, Pos)>,
+    accept: bool,
+}
+
+impl ChunkGenerationWorld for ChunkCreatureScene {
+    fn spawn_y(&mut self, _: i32, _: i32) -> i32 { 72 }
+    fn ground_spawnable(&mut self, kind: &str, pos: Pos) -> bool {
+        self.checks.push((CreaturePlacement::Ground, kind.to_owned(), pos)); self.accept
+    }
+    fn water_spawnable(&mut self, kind: &str, pos: Pos) -> bool {
+        self.checks.push((CreaturePlacement::Water, kind.to_owned(), pos)); self.accept
+    }
+    fn air_spawnable(&mut self, kind: &str, pos: Pos) -> bool {
+        self.checks.push((CreaturePlacement::Air, kind.to_owned(), pos)); self.accept
+    }
+    fn add_creature(&mut self, kind: &str, pos: Pos) { self.spawned.push((kind.to_owned(), pos)); }
+}
+
+fn seed_passing(probability: f32) -> u64 {
+    (0..10_000).find(|seed| { let mut rng = Lcg::new(*seed); rng.next_f32() < probability })
+        .expect("fixture seed passing probability")
+}
+
+fn plains_creature_spawners(biome: &str, category: &str) -> Vec<CreatureSpawnerData> {
+    assert_eq!(biome, "minecraft:plains");
+    assert_eq!(category, "creature");
+    ["sheep", "pig", "chicken", "cow"].into_iter().map(|name| CreatureSpawnerData {
+        kind: format!("minecraft:{name}"), min_count: 4, max_count: 4, weight: 10,
+    }).collect()
+}
+
+#[test]
+fn chunk_generation_creatures_use_deterministic_scatter_and_pack_bounds() {
+    let mut a = ChunkCreatureScene { accept: true, ..Default::default() };
+    let mut b = ChunkCreatureScene { accept: true, ..Default::default() };
+    let seed = seed_passing(0.2);
+    let mut rng_a = Lcg::new(seed);
+    let mut rng_b = Lcg::new(seed);
+    spawn_mobs_for_chunk_generation(3, -2, "minecraft:plains", Some(0.2), plains_creature_spawners, &mut a, &mut rng_a);
+    spawn_mobs_for_chunk_generation(3, -2, "minecraft:plains", Some(0.2), plains_creature_spawners, &mut b, &mut rng_b);
+    assert!(!a.spawned.is_empty());
+    assert_eq!(a.spawned, b.spawned);
+    assert_eq!(a.checks, b.checks);
+    assert_eq!(rng_a.state48(), rng_b.state48());
+    assert!(a.spawned.iter().all(|(_, (x, y, z))| (-40..-8).contains(z) && (40..72).contains(x) && *y == 72));
+    assert_eq!(a.spawned.len() % 4, 0, "plains packs contain four creatures");
+}
+
+#[test]
+fn chunk_generation_creature_probability_gates_and_checks_ground_placement() {
+    let mut scene = ChunkCreatureScene { accept: true, ..Default::default() };
+    let mut rng = Lcg::new(0x117);
+    let before = rng.state48();
+    spawn_mobs_for_chunk_generation(0, 0, "minecraft:plains", Some(0.0), plains_creature_spawners, &mut scene, &mut rng);
+    assert!(scene.spawned.is_empty() && scene.checks.is_empty());
+    assert_ne!(rng.state48(), before, "probability check consumes a float");
+
+    let mut rejected = ChunkCreatureScene { accept: false, ..Default::default() };
+    let mut rng = Lcg::new(seed_passing(0.2));
+    spawn_mobs_for_chunk_generation(3, -2, "minecraft:plains", Some(0.2), plains_creature_spawners, &mut rejected, &mut rng);
+    assert!(!rejected.checks.is_empty());
+    assert!(rejected.checks.iter().all(|(family, _, _)| *family == CreaturePlacement::Ground));
+    assert!(rejected.spawned.is_empty());
+}
+
 fn compound(values: impl IntoIterator<Item = (&'static str, Tag)>) -> Tag {
     Tag::Compound(
         values
