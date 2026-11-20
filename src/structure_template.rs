@@ -1368,13 +1368,40 @@ impl Template {
                           neighbor: u32,
                           direction: u8|
          -> Option<u32> {
+            // The registry already owns fragile attachment direction. Native
+            // canSupportCenter distinguishes top and bottom slab support.
+            if reg.fragile_loses_support(state, direction, reg.state_of("minecraft:air", None))
+                && !reg.is_face_sturdy(
+                    neighbor, direction ^ 1, crate::block_registry::Support::Center,
+                )
+            {
+                return Some(reg.state_of("minecraft:air", None));
+            }
             let name = reg.name_of(state);
             let above = if name.ends_with("_wall") {
                 ctx.get(pos.0, pos.1.wrapping_add(1), pos.2)
             } else {
                 0
             };
-            reg.connection_after_neighbor(state, neighbor, above, direction)
+            // Native slabs split into single slabs without a connecting side
+            // face and double slabs with full connecting faces. The registry
+            // already owns the corresponding air/full-cube transition rules.
+            let slab_type = reg.name_of(neighbor).ends_with("_slab")
+                .then(|| reg.get_prop(neighbor, "type"))
+                .flatten();
+            let connecting_neighbor = match slab_type.as_deref() {
+                Some("top" | "bottom") => reg.state_of("minecraft:air", None),
+                Some("double") => reg.state_of("minecraft:bone_block", None),
+                _ if reg.is_liquid_block(neighbor) => reg.state_of("minecraft:air", None),
+                _ => neighbor,
+            };
+            // The registry's generic fallback detaches an isolated low wall
+            // without checking its non-air neighbor. A full face must retain
+            // that side even if the dedicated wall rule has no state change.
+            if name.ends_with("_wall") && !reg.is_air(connecting_neighbor) {
+                return reg.wall_after_full_neighbor(state, connecting_neighbor, above, direction);
+            }
+            reg.connection_after_neighbor(state, connecting_neighbor, above, direction)
                 .or_else(|| {
                     if name.ends_with("_stairs") {
                         reg.stair_after_neighbors(state, pos, |cell| ctx.get(cell.0, cell.1, cell.2))
@@ -2444,6 +2471,231 @@ mod tests {
             vec![(west, 0)],
             "waterlogged bars reserve native water source via the proto queue"
         );
+    }
+
+    #[test]
+    fn template_air_and_water_edges_detach_connectors_and_break_fragile_supports() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+
+        let reg = crate::block_registry::breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let water = reg.state_of("minecraft:water", None);
+        let bone = reg.state_of("minecraft:bone_block", None);
+        let center = (8, 72, 8);
+        let north = (8, 72, 7);
+        let south = (8, 72, 9);
+        let east = (9, 72, 8);
+        let west = (7, 72, 8);
+        let above = (8, 73, 8);
+        let below = (8, 71, 8);
+
+        let wall = reg.with_prop(
+            reg.state_of("minecraft:cobblestone_wall", None), "south", "low",
+        );
+        let fence = reg.with_prop(reg.state_of("minecraft:oak_fence", None), "north", "true");
+        let bars = reg.with_prop(
+            reg.with_prop(reg.state_of("minecraft:iron_bars", None), "west", "true"),
+            "waterlogged", "true",
+        );
+        let pane = reg.with_prop(reg.state_of("minecraft:glass_pane", None), "east", "true");
+        let torch = reg.state_of("minecraft:torch", None);
+        let lantern = reg.with_prop(
+            reg.state_of("minecraft:lantern", None), "hanging", "true",
+        );
+
+        for replacement in [air, water] {
+            let template = Template {
+                size: (1, 1, 1),
+                palettes: vec![vec![BlockInfo {
+                    pos: (0, 0, 0), state: replacement, nbt: None,
+                }]],
+                entities: Vec::new(),
+            };
+            let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+            let mut ctx = FC::new(&mut g);
+            ctx.test_no_terrain = true;
+            ctx.test_default_air = true;
+            ctx.test_writes = Some(Vec::new());
+            for (pos, state) in [
+                (center, bone), (north, wall), (south, fence),
+                (east, bars), (west, pane), (above, torch), (below, lantern),
+            ] {
+                ctx.test_base_cell(pos, state);
+            }
+            let mut rng = Xor::seed_worldgen(7);
+            assert!(template.place_blocks(
+                &mut ctx, &mut rng,
+                Placement {
+                    origin: center, pivot: (0, 0, 0),
+                    mirror: Mirror::None, rotation: Rotation::None,
+                },
+                &[], [8, 72, 8, 8, 72, 8],
+            ).unwrap());
+
+            assert_eq!(ctx.get(center.0, center.1, center.2), replacement);
+            assert_eq!(reg.get_prop(ctx.get(north.0, north.1, north.2), "south").as_deref(), Some("none"));
+            assert_eq!(reg.get_prop(ctx.get(south.0, south.1, south.2), "north").as_deref(), Some("false"));
+            assert_eq!(reg.get_prop(ctx.get(east.0, east.1, east.2), "west").as_deref(), Some("false"));
+            assert_eq!(reg.get_prop(ctx.get(east.0, east.1, east.2), "waterlogged").as_deref(), Some("true"));
+            assert_eq!(reg.get_prop(ctx.get(west.0, west.1, west.2), "east").as_deref(), Some("false"));
+            assert_eq!(ctx.get(above.0, above.1, above.2), air);
+            assert_eq!(ctx.get(below.0, below.1, below.2), air);
+            assert_eq!(ctx.test_writes.as_ref().unwrap().len(), 7,
+                "one template write and exactly six neighboring shape updates");
+
+            let fluid_ticks = ctx.g.generated_fluid_ticks();
+            assert!(fluid_ticks.contains(&(east, 0)),
+                "the surviving waterlogged bars reserve native proto source water");
+            assert_eq!(fluid_ticks.contains(&(center, 0)), replacement == water,
+                "only an actual liquid center reserves its own generated fluid tick");
+        }
+    }
+
+    #[test]
+    fn template_slab_edges_follow_native_center_support_and_connection_faces() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+
+        let reg = crate::block_registry::breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let bone = reg.state_of("minecraft:bone_block", None);
+        let center = (8, 72, 8);
+        let north = (8, 72, 7);
+        let south = (8, 72, 9);
+        let east = (9, 72, 8);
+        let west = (7, 72, 8);
+        let above = (8, 73, 8);
+        let below = (8, 71, 8);
+        let wall = reg.with_prop(
+            reg.state_of("minecraft:cobblestone_wall", None), "south", "low",
+        );
+        let fence = reg.with_prop(reg.state_of("minecraft:oak_fence", None), "north", "true");
+        let bars = reg.with_prop(
+            reg.with_prop(reg.state_of("minecraft:iron_bars", None), "west", "true"),
+            "waterlogged", "true",
+        );
+        let pane = reg.with_prop(reg.state_of("minecraft:glass_pane", None), "east", "true");
+        let torch = reg.state_of("minecraft:torch", None);
+        let lantern = reg.with_prop(
+            reg.state_of("minecraft:lantern", None), "hanging", "true",
+        );
+
+        for (slab_type, torch_survives, lantern_survives) in [
+            ("bottom", false, true),
+            ("top", true, false),
+            ("double", true, true),
+        ] {
+            let slab = reg.with_prop(reg.state_of("minecraft:oak_slab", None), "type", slab_type);
+            let template = Template {
+                size: (1, 1, 1),
+                palettes: vec![vec![BlockInfo {
+                    pos: (0, 0, 0), state: slab, nbt: None,
+                }]],
+                entities: Vec::new(),
+            };
+            let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+            let mut ctx = FC::new(&mut g);
+            ctx.test_no_terrain = true;
+            ctx.test_default_air = true;
+            ctx.test_writes = Some(Vec::new());
+            for (pos, state) in [
+                (center, bone), (north, wall), (south, fence),
+                (east, bars), (west, pane), (above, torch), (below, lantern),
+            ] {
+                ctx.test_base_cell(pos, state);
+            }
+            let mut rng = Xor::seed_worldgen(7);
+            assert!(template.place_blocks(
+                &mut ctx, &mut rng,
+                Placement {
+                    origin: center, pivot: (0, 0, 0),
+                    mirror: Mirror::None, rotation: Rotation::None,
+                },
+                &[], [8, 72, 8, 8, 72, 8],
+            ).unwrap());
+
+            assert_eq!(ctx.get(center.0, center.1, center.2), slab);
+            let connected = slab_type == "double";
+            assert_eq!(reg.get_prop(ctx.get(north.0, north.1, north.2), "south").as_deref(),
+                Some(if connected { "low" } else { "none" }), "{slab_type}");
+            assert_eq!(reg.get_prop(ctx.get(south.0, south.1, south.2), "north").as_deref(),
+                Some(if connected { "true" } else { "false" }), "{slab_type}");
+            assert_eq!(reg.get_prop(ctx.get(east.0, east.1, east.2), "west").as_deref(),
+                Some(if connected { "true" } else { "false" }), "{slab_type}");
+            assert_eq!(reg.get_prop(ctx.get(east.0, east.1, east.2), "waterlogged").as_deref(),
+                Some("true"), "{slab_type}");
+            assert_eq!(reg.get_prop(ctx.get(west.0, west.1, west.2), "east").as_deref(),
+                Some(if connected { "true" } else { "false" }), "{slab_type}");
+            assert_eq!(ctx.get(above.0, above.1, above.2),
+                if torch_survives { torch } else { air }, "{slab_type}");
+            assert_eq!(ctx.get(below.0, below.1, below.2),
+                if lantern_survives { lantern } else { air }, "{slab_type}");
+            assert_eq!(ctx.test_writes.as_ref().unwrap().len(),
+                if connected { 1 } else { 6 }, "{slab_type}");
+            assert_eq!(ctx.g.generated_fluid_ticks(), vec![(east, 0)], "{slab_type}");
+        }
+    }
+
+    #[test]
+    fn template_double_slab_connects_disconnected_neighbors() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+
+        let reg = crate::block_registry::breg().unwrap();
+        let slab = reg.with_prop(reg.state_of("minecraft:oak_slab", None), "type", "double");
+        let template = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo {
+                pos: (0, 0, 0), state: slab, nbt: None,
+            }]],
+            entities: Vec::new(),
+        };
+        let center = (8, 72, 8);
+        let north = (8, 72, 7);
+        let south = (8, 72, 9);
+        let east = (9, 72, 8);
+        let west = (7, 72, 8);
+        let wall = reg.with_prop(
+            reg.state_of("minecraft:cobblestone_wall", None), "north", "low",
+        );
+        let fence = reg.state_of("minecraft:oak_fence", None);
+        let bars = reg.with_prop(reg.state_of("minecraft:iron_bars", None),
+            "waterlogged", "true");
+        let pane = reg.state_of("minecraft:glass_pane", None);
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        ctx.test_writes = Some(Vec::new());
+        for (pos, state) in [
+            (center, reg.state_of("minecraft:bone_block", None)),
+            (north, wall), (south, fence), (east, bars), (west, pane),
+        ] {
+            ctx.test_base_cell(pos, state);
+        }
+        let mut rng = Xor::seed_worldgen(7);
+        assert!(template.place_blocks(
+            &mut ctx, &mut rng,
+            Placement {
+                origin: center, pivot: (0, 0, 0),
+                mirror: Mirror::None, rotation: Rotation::None,
+            },
+            &[], [8, 72, 8, 8, 72, 8],
+        ).unwrap());
+
+        let wall_after = ctx.get(north.0, north.1, north.2);
+        assert_eq!(reg.get_prop(wall_after, "south").as_deref(), Some("low"));
+        assert_eq!(reg.get_prop(wall_after, "up").as_deref(), Some("false"));
+        assert_eq!(reg.get_prop(ctx.get(south.0, south.1, south.2), "north").as_deref(), Some("true"));
+        assert_eq!(reg.get_prop(ctx.get(east.0, east.1, east.2), "west").as_deref(), Some("true"));
+        assert_eq!(reg.get_prop(ctx.get(east.0, east.1, east.2), "waterlogged").as_deref(), Some("true"));
+        assert_eq!(reg.get_prop(ctx.get(west.0, west.1, west.2), "east").as_deref(), Some("true"));
+        assert_eq!(ctx.test_writes.as_ref().unwrap().len(), 5);
+        assert_eq!(ctx.g.generated_fluid_ticks(), vec![(east, 0)]);
     }
 
     #[test]
