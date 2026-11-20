@@ -211,7 +211,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 2. **GP-1（1.21.1 `GoalSelector` & `PathNavigation` / A* 経路探索 — `src/mob_ai.rs`）**:
    - `WalkNodeEvaluator` 準拠の `BlockPathTypes` 判定（固体・段差・落下 `<= 3` ブロック・対角線角切り防止・水/溶岩/炎/サボテン回避ペナルティ）、A* `PathFinder`、排他制御フラグ（`MOVE | LOOK | JUMP | TARGET`）を持つ `GoalSelector` / `TargetSelector`、代表ゴール群（`MeleeAttackGoal`, `RangedBowAttackGoal`, `SwellGoal`, `TemptGoal`, `BreedGoal`, `WaterAvoidingRandomStrollGoal`, `LookAtPlayerGoal`, `NearestAttackableTargetGoal`, `PanicGoal`）を実装する。
 3. **GP-2（1.21.1 `NaturalSpawner` 完成 — `src/natural_spawner.rs`）**:
-   - `MobCategory` 7 分類の `mob_cap = capacity * spawnable_chunks / 289` 計算、Soul Sand Valley / Warped Forest 等で使う `SpawnCosts` ポテンシャルエネルギー予算（`charge / energy_budget`）、プレイヤー距離帯（`< 24` スポーン拒否、`32..=128` `no_action_time > 600` かつ `1/800` ランダム despawn、`> 128` 即時 despawn）、ブロック光 `== 0` 等の条件と群れスポーンを実装する。
+   - `MobCategory` 7 分類の `mob_cap = capacity * spawnable_chunks / 289`、`SpawnCosts` のエネルギー予算、ディメンションごとの光条件、群れスポーンを実装する。最寄りプレイヤーから `<= 24` ブロックではスポーンを拒否する。despawn 対象はカテゴリ上限（通常128ブロック、`WATER_AMBIENT` は64ブロック）を超えれば即時、32ブロック超かつ上限以内では `no_action_time > 600` のとき `1/800` の確率で despawn する。
 4. **GP-3（1.21.1 レッドストーン伝播エンジン — `src/redstone.rs`）**:
    - 強電源（DirectSignal）／弱電源（Signal）モデル、`RedStoneWireBlock`（`0..=15` 減衰・4方向接続・段差昇降・上ブロック遮断）、`RedstoneTorchBlock`（反転・2GT 遅延・60GT 内 8 回反転の burnout 保護）、`RepeaterBlock`（2/4/6/8GT 遅延・横ロックダイオード）、`ComparatorBlock`（比較/減算モード・コンテナ充填率信号 `getAnalogOutputSignal`）、およびピストン（Quasi-Connectivity 含む）・ランプ・ドア/トラップドア・ホッパー・ディスペンサー/ドロッパーへの駆動接続を実装する。
 5. **GP-4（村人 AI・職業・取引・ゴシップ・襲撃）**:
