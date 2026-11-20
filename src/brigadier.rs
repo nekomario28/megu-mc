@@ -1376,6 +1376,757 @@ pub(crate) fn select_entities<'a, 'data>(
 }
 
 // ---------------------------------------------------------------------------------------
+// Vanilla 1.21.1 /execute subcommand AST and parser
+// ---------------------------------------------------------------------------------------
+
+// Grammar cross-checked against the bundled 1.21.1 server jar (the obfuscated class `amt`,
+// `javap -p -c amt.class`): `run` redirects to root, `if`/`unless` take the condition tree,
+// `positioned`/`rotated`/`facing` each have their `as`/`over`/`entity` children, and `store`
+// takes `result`/`success` before the data-holder tree. The data holders and the numeric NBT
+// type names come from `aph` and `fl$g` respectively.
+
+/// One numeric coordinate of an `/execute` position or rotation argument. `~` is relative to
+/// the execution origin and `^` is local to the executor's rotation, matching vanilla's
+/// `CoordinateArgument`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ExecuteCoordinate {
+    Absolute(f64),
+    Relative(f64),
+    Local(f64),
+}
+
+impl ExecuteCoordinate {
+    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+        let (kind, rest) = if let Some(rest) = text.strip_prefix('~') {
+            ("relative", rest)
+        } else if let Some(rest) = text.strip_prefix('^') {
+            ("local", rest)
+        } else {
+            ("absolute", text)
+        };
+        let value = if rest.is_empty() {
+            0.0
+        } else {
+            rest.parse::<f64>()
+                .map_err(|_| format!("Invalid {kind} coordinate '{text}'"))?
+        };
+        if !value.is_finite() {
+            return Err(format!("Non-finite coordinate '{text}'"));
+        }
+        Ok(match kind {
+            "relative" => Self::Relative(value),
+            "local" => Self::Local(value),
+            _ => Self::Absolute(value),
+        })
+    }
+}
+
+/// The three coordinates of an `/execute` position, rotation-vector or block-position argument.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ExecutePosition {
+    pub x: ExecuteCoordinate,
+    pub y: ExecuteCoordinate,
+    pub z: ExecuteCoordinate,
+}
+
+/// `eyes` or `feet`, used by `facing entity` and `anchored`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecuteAnchor {
+    Eyes,
+    Feet,
+}
+
+/// The command-legal heightmaps (`fj` in the jar filters out the `*_WG` generation variants).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecuteHeightmap {
+    WorldSurface,
+    OceanFloor,
+    MotionBlocking,
+    MotionBlockingNoLeaves,
+}
+
+/// The entity relationships accepted by `on <relation>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecuteRelation {
+    Attacker,
+    Controller,
+    Leasher,
+    Origin,
+    Owner,
+    Passengers,
+    Target,
+    Vehicle,
+}
+
+/// The axis mask accepted by `align <axes>`. Vanilla stores an `EnumSet`, so the spelling
+/// order is not significant but duplicate axes are rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExecuteAxes {
+    pub x: bool,
+    pub y: bool,
+    pub z: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecuteBlocksMode {
+    All,
+    Masked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecuteScoreComparison {
+    LessThan,
+    LessEquals,
+    Equals,
+    GreaterEquals,
+    GreaterThan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExecuteScoreSource {
+    pub target: String,
+    pub objective: String,
+}
+
+/// An inclusive integer range, as accepted by `if score ... matches <range>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExecuteRange<T> {
+    pub min: Option<T>,
+    pub max: Option<T>,
+}
+
+impl ExecuteRange<i32> {
+    fn parse(text: &str) -> Result<Self, String> {
+        let get = |value: &str| -> Result<i32, String> {
+            value
+                .parse::<i32>()
+                .map_err(|_| format!("Invalid integer range bound '{value}'"))
+        };
+        let (min, max) = match text.split_once("..") {
+            Some((low, high)) => (
+                if low.is_empty() { None } else { Some(get(low)?) },
+                if high.is_empty() {
+                    None
+                } else {
+                    Some(get(high)?)
+                },
+            ),
+            None => {
+                let value = get(text)?;
+                (Some(value), Some(value))
+            }
+        };
+        if matches!((min, max), (Some(low), Some(high)) if low > high) {
+            return Err(format!("Range minimum exceeds maximum in '{text}'"));
+        }
+        Ok(Self { min, max })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExecuteScoreTest {
+    Matches(ExecuteRange<i32>),
+    Compare(ExecuteScoreComparison, ExecuteScoreSource),
+}
+
+/// The data holder used by `if/unless data` and by `store <result|success>`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExecuteDataTarget {
+    Block(ExecutePosition),
+    Entity(String),
+    Storage(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExecuteConditionKind {
+    Block {
+        pos: ExecutePosition,
+        predicate: String,
+    },
+    Blocks {
+        start: ExecutePosition,
+        end: ExecutePosition,
+        destination: ExecutePosition,
+        mode: ExecuteBlocksMode,
+    },
+    Entity {
+        targets: String,
+    },
+    Score {
+        target: String,
+        objective: String,
+        test: ExecuteScoreTest,
+    },
+    Biome {
+        pos: ExecutePosition,
+        biome: String,
+    },
+    Dimension {
+        dimension: String,
+    },
+    Loaded {
+        pos: ExecutePosition,
+    },
+    Predicate {
+        id: String,
+    },
+    Data {
+        target: ExecuteDataTarget,
+        path: String,
+        nbt: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecuteCheck {
+    If,
+    Unless,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExecuteConditional {
+    pub check: ExecuteCheck,
+    pub kind: ExecuteConditionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecuteStoreKind {
+    Result,
+    Success,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecuteNbtType {
+    Byte,
+    Short,
+    Int,
+    Long,
+    Float,
+    Double,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecuteBossbarField {
+    Value,
+    Max,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExecuteStoreTarget {
+    Block {
+        pos: ExecutePosition,
+        path: String,
+        nbt_type: ExecuteNbtType,
+        scale: f64,
+    },
+    Bossbar {
+        id: String,
+        field: ExecuteBossbarField,
+    },
+    Entity {
+        target: String,
+        path: String,
+        nbt_type: ExecuteNbtType,
+        scale: f64,
+    },
+    Score {
+        targets: String,
+        objective: String,
+    },
+    Storage {
+        id: String,
+        path: String,
+        nbt_type: ExecuteNbtType,
+        scale: f64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExecuteStore {
+    pub kind: ExecuteStoreKind,
+    pub target: ExecuteStoreTarget,
+}
+
+/// A context-modifying, conditional or storing clause of an `/execute` pipeline.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExecuteClause {
+    Modifier(ExecuteModifier),
+    Condition(ExecuteConditional),
+    Store(ExecuteStore),
+}
+
+/// The non-terminal `/execute` subcommands, in the order they appear in the pipeline.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExecuteModifier {
+    As {
+        targets: String,
+    },
+    At {
+        targets: String,
+    },
+    Positioned {
+        pos: ExecutePosition,
+    },
+    PositionedAs {
+        targets: String,
+    },
+    PositionedOver {
+        heightmap: ExecuteHeightmap,
+    },
+    Rotated {
+        yaw: ExecuteCoordinate,
+        pitch: ExecuteCoordinate,
+    },
+    RotatedAs {
+        targets: String,
+    },
+    Facing {
+        pos: ExecutePosition,
+    },
+    FacingEntity {
+        targets: String,
+        anchor: ExecuteAnchor,
+    },
+    Align {
+        axes: ExecuteAxes,
+    },
+    Anchored {
+        anchor: ExecuteAnchor,
+    },
+    In {
+        dimension: String,
+    },
+    Summon {
+        entity: String,
+    },
+    On {
+        relation: ExecuteRelation,
+    },
+}
+
+/// A parsed `/execute` pipeline. `clauses` keeps source order; `run` is the verbatim command
+/// text after `run`. A pipeline that ends in `if`/`unless` without `run` has `run == None`
+/// and is a valid terminal check. The optional leading `/execute` of a chat command is
+/// accepted and stripped.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExecuteCommand {
+    pub clauses: Vec<ExecuteClause>,
+    pub run: Option<String>,
+}
+
+/// A command argument together with its end offset in the original input. The offset keeps the
+/// text after `run` byte-exact (including quotes and repeated spaces).
+#[derive(Clone, Debug)]
+struct ExecuteArg {
+    text: String,
+    end: usize,
+}
+
+fn split_execute_args(input: &str) -> Result<Vec<ExecuteArg>, String> {
+    let texts = split_command_args_preserving_quotes(input)?;
+    let mut cursor = 0usize;
+    let mut args = Vec::with_capacity(texts.len());
+    for text in texts {
+        let offset = input[cursor..]
+            .find(&text)
+            .ok_or_else(|| format!("Could not locate argument '{text}'"))?;
+        cursor += offset + text.len();
+        args.push(ExecuteArg {
+            text,
+            end: cursor,
+        });
+    }
+    Ok(args)
+}
+
+fn resource_id(raw: &str) -> String {
+    match raw.split_once(':') {
+        Some((namespace, path)) if !namespace.is_empty() => format!("{namespace}:{path}"),
+        _ => format!("minecraft:{raw}"),
+    }
+}
+
+struct ExecuteParser<'a> {
+    input: &'a str,
+    args: Vec<ExecuteArg>,
+    index: usize,
+}
+
+impl ExecuteParser<'_> {
+    fn peek(&self) -> Option<&str> {
+        self.args.get(self.index).map(|arg| arg.text.as_str())
+    }
+
+    fn take(&mut self, what: &str) -> Result<String, String> {
+        match self.args.get(self.index) {
+            Some(arg) => {
+                let text = arg.text.clone();
+                self.index += 1;
+                Ok(text)
+            }
+            None => Err(format!("Expected {what}")),
+        }
+    }
+
+    fn read_targets(&mut self) -> Result<String, String> {
+        self.take("entity targets")
+    }
+
+    fn read_position(&mut self) -> Result<ExecutePosition, String> {
+        let x = ExecuteCoordinate::parse(&self.take("x coordinate")?)?;
+        let y = ExecuteCoordinate::parse(&self.take("y coordinate")?)?;
+        let z = ExecuteCoordinate::parse(&self.take("z coordinate")?)?;
+        Ok(ExecutePosition { x, y, z })
+    }
+
+    fn read_rotation(&mut self) -> Result<(ExecuteCoordinate, ExecuteCoordinate), String> {
+        let yaw = ExecuteCoordinate::parse(&self.take("yaw")?)?;
+        let pitch = ExecuteCoordinate::parse(&self.take("pitch")?)?;
+        Ok((yaw, pitch))
+    }
+
+    fn read_anchor(&mut self) -> Result<ExecuteAnchor, String> {
+        match self.take("anchor")?.as_str() {
+            "eyes" => Ok(ExecuteAnchor::Eyes),
+            "feet" => Ok(ExecuteAnchor::Feet),
+            other => Err(format!("Invalid anchor '{other}'")),
+        }
+    }
+
+    fn read_heightmap(&mut self) -> Result<ExecuteHeightmap, String> {
+        match self.take("heightmap")?.to_ascii_lowercase().as_str() {
+            "world_surface" => Ok(ExecuteHeightmap::WorldSurface),
+            "ocean_floor" => Ok(ExecuteHeightmap::OceanFloor),
+            "motion_blocking" => Ok(ExecuteHeightmap::MotionBlocking),
+            "motion_blocking_no_leaves" => Ok(ExecuteHeightmap::MotionBlockingNoLeaves),
+            other => Err(format!("Invalid heightmap '{other}'")),
+        }
+    }
+
+    fn read_axes(&mut self) -> Result<ExecuteAxes, String> {
+        let text = self.take("axes")?;
+        let mut axes = ExecuteAxes {
+            x: false,
+            y: false,
+            z: false,
+        };
+        if text.is_empty() {
+            return Err("Expected at least one alignment axis".into());
+        }
+        for axis in text.chars() {
+            let slot = match axis {
+                'x' => &mut axes.x,
+                'y' => &mut axes.y,
+                'z' => &mut axes.z,
+                other => return Err(format!("Invalid alignment axis '{other}'")),
+            };
+            if *slot {
+                return Err(format!("Duplicate alignment axis '{axis}'"));
+            }
+            *slot = true;
+        }
+        Ok(axes)
+    }
+
+    fn read_relation(&mut self) -> Result<ExecuteRelation, String> {
+        use ExecuteRelation::*;
+        match self.take("entity relation")?.as_str() {
+            "attacker" => Ok(Attacker),
+            "controller" => Ok(Controller),
+            "leasher" => Ok(Leasher),
+            "origin" => Ok(Origin),
+            "owner" => Ok(Owner),
+            "passengers" => Ok(Passengers),
+            "target" => Ok(Target),
+            "vehicle" => Ok(Vehicle),
+            other => Err(format!("Invalid entity relation '{other}'")),
+        }
+    }
+
+    fn read_condition(&mut self, check: ExecuteCheck) -> Result<ExecuteConditional, String> {
+        let word = self.take("condition")?;
+        let kind = match word.as_str() {
+            "block" => ExecuteConditionKind::Block {
+                pos: self.read_position()?,
+                predicate: self.take("block predicate")?,
+            },
+            "blocks" => ExecuteConditionKind::Blocks {
+                start: self.read_position()?,
+                end: self.read_position()?,
+                destination: self.read_position()?,
+                mode: match self.take("mask mode")?.as_str() {
+                    "all" => ExecuteBlocksMode::All,
+                    "masked" => ExecuteBlocksMode::Masked,
+                    other => return Err(format!("Invalid mask mode '{other}'")),
+                },
+            },
+            "entity" => ExecuteConditionKind::Entity {
+                targets: self.read_targets()?,
+            },
+            "score" => {
+                let target = self.take("score target")?;
+                let objective = self.take("score objective")?;
+                let comparison = self.take("score comparison")?;
+                let test = if comparison == "matches" {
+                    ExecuteScoreTest::Matches(ExecuteRange::parse(&self.take("score range")?)?)
+                } else {
+                    let comparison = match comparison.as_str() {
+                        "<" => ExecuteScoreComparison::LessThan,
+                        "<=" => ExecuteScoreComparison::LessEquals,
+                        "=" => ExecuteScoreComparison::Equals,
+                        ">=" => ExecuteScoreComparison::GreaterEquals,
+                        ">" => ExecuteScoreComparison::GreaterThan,
+                        other => return Err(format!("Invalid score comparison '{other}'")),
+                    };
+                    ExecuteScoreTest::Compare(
+                        comparison,
+                        ExecuteScoreSource {
+                            target: self.take("source target")?,
+                            objective: self.take("source objective")?,
+                        },
+                    )
+                };
+                ExecuteConditionKind::Score {
+                    target,
+                    objective,
+                    test,
+                }
+            }
+            "biome" => ExecuteConditionKind::Biome {
+                pos: self.read_position()?,
+                biome: resource_id(&self.take("biome")?),
+            },
+            "dimension" => ExecuteConditionKind::Dimension {
+                dimension: resource_id(&self.take("dimension")?),
+            },
+            "loaded" => ExecuteConditionKind::Loaded {
+                pos: self.read_position()?,
+            },
+            "predicate" => ExecuteConditionKind::Predicate {
+                id: resource_id(&self.take("predicate id")?),
+            },
+            "data" => {
+                let source = self.take("data source")?;
+                let target = match source.as_str() {
+                    "block" => ExecuteDataTarget::Block(self.read_position()?),
+                    "entity" => ExecuteDataTarget::Entity(self.take("entity target")?),
+                    "storage" => ExecuteDataTarget::Storage(resource_id(&self.take("storage id")?)),
+                    other => return Err(format!("Invalid data source '{other}'")),
+                };
+                let path = self.take("data path")?;
+                let nbt = match self.peek() {
+                    Some(token) if token.starts_with('{') || token.starts_with("!{") => {
+                        Some(self.take("nbt predicate")?)
+                    }
+                    _ => None,
+                };
+                ExecuteConditionKind::Data { target, path, nbt }
+            }
+            other => return Err(format!("Unknown execute condition '{other}'")),
+        };
+        Ok(ExecuteConditional { check, kind })
+    }
+
+    fn read_nbt_type(&mut self) -> Result<ExecuteNbtType, String> {
+        match self.take("nbt type")?.as_str() {
+            "byte" => Ok(ExecuteNbtType::Byte),
+            "short" => Ok(ExecuteNbtType::Short),
+            "int" => Ok(ExecuteNbtType::Int),
+            "long" => Ok(ExecuteNbtType::Long),
+            "float" => Ok(ExecuteNbtType::Float),
+            "double" => Ok(ExecuteNbtType::Double),
+            other => Err(format!("Invalid numeric nbt type '{other}'")),
+        }
+    }
+
+    fn read_scale(&mut self) -> Result<f64, String> {
+        let text = self.take("scale")?;
+        let value = text
+            .parse::<f64>()
+            .map_err(|_| format!("Invalid scale '{text}'"))?;
+        if !value.is_finite() {
+            return Err(format!("Non-finite scale '{text}'"));
+        }
+        Ok(value)
+    }
+
+    fn read_store(&mut self) -> Result<ExecuteStore, String> {
+        let kind = match self.take("store kind")?.as_str() {
+            "result" => ExecuteStoreKind::Result,
+            "success" => ExecuteStoreKind::Success,
+            other => return Err(format!("Invalid store kind '{other}'")),
+        };
+        let source = self.take("store target")?;
+        let target = match source.as_str() {
+            "score" => ExecuteStoreTarget::Score {
+                targets: self.take("score targets")?,
+                objective: self.take("score objective")?,
+            },
+            "bossbar" => {
+                let id = self.take("bossbar id")?;
+                let field = match self.take("bossbar field")?.as_str() {
+                    "value" => ExecuteBossbarField::Value,
+                    "max" => ExecuteBossbarField::Max,
+                    other => return Err(format!("Invalid bossbar field '{other}'")),
+                };
+                ExecuteStoreTarget::Bossbar { id, field }
+            }
+            "block" => ExecuteStoreTarget::Block {
+                pos: self.read_position()?,
+                path: self.take("data path")?,
+                nbt_type: self.read_nbt_type()?,
+                scale: self.read_scale()?,
+            },
+            "entity" => ExecuteStoreTarget::Entity {
+                target: self.take("entity target")?,
+                path: self.take("data path")?,
+                nbt_type: self.read_nbt_type()?,
+                scale: self.read_scale()?,
+            },
+            "storage" => ExecuteStoreTarget::Storage {
+                id: resource_id(&self.take("storage id")?),
+                path: self.take("data path")?,
+                nbt_type: self.read_nbt_type()?,
+                scale: self.read_scale()?,
+            },
+            other => return Err(format!("Invalid store target '{other}'")),
+        };
+        Ok(ExecuteStore { kind, target })
+    }
+
+    fn read_modifier(&mut self, word: &str) -> Result<ExecuteModifier, String> {
+        match word {
+            "as" => Ok(ExecuteModifier::As {
+                targets: self.read_targets()?,
+            }),
+            "at" => Ok(ExecuteModifier::At {
+                targets: self.read_targets()?,
+            }),
+            "positioned" => match self.peek() {
+                Some("as") => {
+                    self.index += 1;
+                    Ok(ExecuteModifier::PositionedAs {
+                        targets: self.read_targets()?,
+                    })
+                }
+                Some("over") => {
+                    self.index += 1;
+                    Ok(ExecuteModifier::PositionedOver {
+                        heightmap: self.read_heightmap()?,
+                    })
+                }
+                _ => Ok(ExecuteModifier::Positioned {
+                    pos: self.read_position()?,
+                }),
+            },
+            "rotated" => match self.peek() {
+                Some("as") => {
+                    self.index += 1;
+                    Ok(ExecuteModifier::RotatedAs {
+                        targets: self.read_targets()?,
+                    })
+                }
+                _ => {
+                    let (yaw, pitch) = self.read_rotation()?;
+                    Ok(ExecuteModifier::Rotated { yaw, pitch })
+                }
+            },
+            "facing" => match self.peek() {
+                Some("entity") => {
+                    self.index += 1;
+                    Ok(ExecuteModifier::FacingEntity {
+                        targets: self.read_targets()?,
+                        anchor: self.read_anchor()?,
+                    })
+                }
+                _ => Ok(ExecuteModifier::Facing {
+                    pos: self.read_position()?,
+                }),
+            },
+            "align" => Ok(ExecuteModifier::Align {
+                axes: self.read_axes()?,
+            }),
+            "anchored" => Ok(ExecuteModifier::Anchored {
+                anchor: self.read_anchor()?,
+            }),
+            "in" => Ok(ExecuteModifier::In {
+                dimension: resource_id(&self.take("dimension")?),
+            }),
+            "summon" => Ok(ExecuteModifier::Summon {
+                entity: resource_id(&self.take("entity type")?),
+            }),
+            "on" => Ok(ExecuteModifier::On {
+                relation: self.read_relation()?,
+            }),
+            other => Err(format!("Unknown execute subcommand '{other}'")),
+        }
+    }
+}
+
+impl ExecuteCommand {
+    /// Parse a complete `/execute` command. Both `execute ...` and `/execute ...` are accepted;
+    /// the pipeline may end at `run <command>` or at a terminal `if`/`unless` check.
+    pub(crate) fn parse(input: &str) -> Result<Self, String> {
+        let mut parser = ExecuteParser {
+            input,
+            args: split_execute_args(input)?,
+            index: 0,
+        };
+        if let Some(first) = parser.peek() {
+            let first = first.strip_prefix('/').unwrap_or(first).to_owned();
+            if first == "execute" {
+                parser.index += 1;
+            }
+        }
+        let mut clauses = Vec::new();
+        while let Some(word) = parser.peek().map(str::to_owned) {
+            let clause = match word.as_str() {
+                "run" => {
+                    parser.index += 1;
+                    let command = parser.input[parser.args[parser.index - 1].end..]
+                        .trim()
+                        .to_owned();
+                    if command.is_empty() {
+                        return Err("Expected a command after 'run'".into());
+                    }
+                    return Ok(Self {
+                        clauses,
+                        run: Some(command),
+                    });
+                }
+                "if" | "unless" => {
+                    parser.index += 1;
+                    let check = if word == "if" {
+                        ExecuteCheck::If
+                    } else {
+                        ExecuteCheck::Unless
+                    };
+                    ExecuteClause::Condition(parser.read_condition(check)?)
+                }
+                "store" => {
+                    parser.index += 1;
+                    ExecuteClause::Store(parser.read_store()?)
+                }
+                other => {
+                    parser.index += 1;
+                    ExecuteClause::Modifier(parser.read_modifier(other)?)
+                }
+            };
+            clauses.push(clause);
+        }
+        // Vanilla's `execute` node is not executable on its own: a pipeline without `run`
+        // must end in a condition that acts as the terminal check.
+        if !matches!(clauses.last(), Some(ExecuteClause::Condition(_))) {
+            return Err("Expected 'run' or a terminal 'if'/'unless' condition".into());
+        }
+        Ok(Self {
+            clauses,
+            run: None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // StringRange
 // ---------------------------------------------------------------------------------------
 

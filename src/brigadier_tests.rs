@@ -1855,3 +1855,487 @@ fn selector_point_candidates_obey_lower_inclusive_volume_bounds() {
     assert_eq!(selected_ids("@e[distance=0]", &source, &candidates), [1]);
     assert_eq!(selected_ids("@e[distance=1]", &source, &candidates), [2, 3]);
 }
+
+// ---------------------------------------------------------------------------------------
+// Vanilla 1.21.1 /execute subcommand AST and parser
+// ---------------------------------------------------------------------------------------
+
+fn coord(text: &str) -> ExecuteCoordinate {
+    ExecuteCoordinate::parse(text).unwrap()
+}
+
+fn pos(x: &str, y: &str, z: &str) -> ExecutePosition {
+    ExecutePosition {
+        x: coord(x),
+        y: coord(y),
+        z: coord(z),
+    }
+}
+
+fn run_of(command: &str) -> String {
+    ExecuteCommand::parse(command).unwrap().run.unwrap()
+}
+
+#[test]
+fn execute_coordinates_distinguish_absolute_relative_and_local_forms() {
+    assert_eq!(coord("4"), ExecuteCoordinate::Absolute(4.0));
+    assert_eq!(coord("-1.5"), ExecuteCoordinate::Absolute(-1.5));
+    assert_eq!(coord("~"), ExecuteCoordinate::Relative(0.0));
+    assert_eq!(coord("~-2"), ExecuteCoordinate::Relative(-2.0));
+    assert_eq!(coord("^"), ExecuteCoordinate::Local(0.0));
+    assert_eq!(coord("^1.5"), ExecuteCoordinate::Local(1.5));
+    for bad in ["abc", "NaN", "inf", "~oops", "^oops"] {
+        assert!(
+            ExecuteCoordinate::parse(bad).is_err(),
+            "{bad} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn execute_context_modifiers_parse_into_distinct_clauses() {
+    let command = ExecuteCommand::parse(concat!(
+        "execute as @a at @s positioned ~1 ~2 ~3 positioned as @p ",
+        "positioned over motion_blocking rotated 90 -45 rotated as @e ",
+        "facing ^ ^ ^1 facing entity @p eyes align xz anchored feet ",
+        "in the_nether summon minecraft:cow on attacker run say hi"
+    ))
+    .unwrap();
+    assert_eq!(
+        command.clauses,
+        vec![
+            ExecuteClause::Modifier(ExecuteModifier::As {
+                targets: "@a".into()
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::At {
+                targets: "@s".into()
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::Positioned {
+                pos: pos("~1", "~2", "~3")
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::PositionedAs {
+                targets: "@p".into()
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::PositionedOver {
+                heightmap: ExecuteHeightmap::MotionBlocking
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::Rotated {
+                yaw: coord("90"),
+                pitch: coord("-45")
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::RotatedAs {
+                targets: "@e".into()
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::Facing {
+                pos: pos("^", "^", "^1")
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::FacingEntity {
+                targets: "@p".into(),
+                anchor: ExecuteAnchor::Eyes
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::Align {
+                axes: ExecuteAxes {
+                    x: true,
+                    y: false,
+                    z: true
+                }
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::Anchored {
+                anchor: ExecuteAnchor::Feet
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::In {
+                dimension: "minecraft:the_nether".into()
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::Summon {
+                entity: "minecraft:cow".into()
+            }),
+            ExecuteClause::Modifier(ExecuteModifier::On {
+                relation: ExecuteRelation::Attacker
+            }),
+        ]
+    );
+    assert_eq!(command.run.as_deref(), Some("say hi"));
+}
+
+#[test]
+fn execute_every_on_relation_and_heightmap_spelling_is_accepted() {
+    use ExecuteRelation::*;
+    for (relation, expected) in [
+        ("attacker", Attacker),
+        ("controller", Controller),
+        ("leasher", Leasher),
+        ("origin", Origin),
+        ("owner", Owner),
+        ("passengers", Passengers),
+        ("target", Target),
+        ("vehicle", Vehicle),
+    ] {
+        let command = ExecuteCommand::parse(&format!("execute on {relation} run say ok")).unwrap();
+        assert_eq!(
+            command.clauses,
+            vec![ExecuteClause::Modifier(ExecuteModifier::On { relation: expected })]
+        );
+    }
+    for (name, expected) in [
+        ("world_surface", ExecuteHeightmap::WorldSurface),
+        ("ocean_floor", ExecuteHeightmap::OceanFloor),
+        ("motion_blocking", ExecuteHeightmap::MotionBlocking),
+        (
+            "motion_blocking_no_leaves",
+            ExecuteHeightmap::MotionBlockingNoLeaves,
+        ),
+    ] {
+        let command =
+            ExecuteCommand::parse(&format!("execute positioned over {name} run say ok")).unwrap();
+        assert_eq!(
+            command.clauses,
+            vec![ExecuteClause::Modifier(
+                ExecuteModifier::PositionedOver { heightmap: expected }
+            )]
+        );
+    }
+}
+
+#[test]
+fn execute_every_condition_kind_parses_with_its_exact_argument_order() {
+    let cases: &[(&str, ExecuteConditionKind)] = &[
+        (
+            "if block ~ ~ ~ minecraft:stone",
+            ExecuteConditionKind::Block {
+                pos: pos("~", "~", "~"),
+                predicate: "minecraft:stone".into(),
+            },
+        ),
+        (
+            "unless blocks 0 0 0 1 1 1 2 2 2 all",
+            ExecuteConditionKind::Blocks {
+                start: pos("0", "0", "0"),
+                end: pos("1", "1", "1"),
+                destination: pos("2", "2", "2"),
+                mode: ExecuteBlocksMode::All,
+            },
+        ),
+        (
+            "if blocks ~ ~ ~ ~1 ~1 ~1 ~2 ~2 ~2 masked",
+            ExecuteConditionKind::Blocks {
+                start: pos("~", "~", "~"),
+                end: pos("~1", "~1", "~1"),
+                destination: pos("~2", "~2", "~2"),
+                mode: ExecuteBlocksMode::Masked,
+            },
+        ),
+        (
+            "if entity @a",
+            ExecuteConditionKind::Entity {
+                targets: "@a".into(),
+            },
+        ),
+        (
+            "if score @s kills matches 1..10",
+            ExecuteConditionKind::Score {
+                target: "@s".into(),
+                objective: "kills".into(),
+                test: ExecuteScoreTest::Matches(ExecuteRange {
+                    min: Some(1),
+                    max: Some(10),
+                }),
+            },
+        ),
+        (
+            "unless score @a deaths = @s kills",
+            ExecuteConditionKind::Score {
+                target: "@a".into(),
+                objective: "deaths".into(),
+                test: ExecuteScoreTest::Compare(
+                    ExecuteScoreComparison::Equals,
+                    ExecuteScoreSource {
+                        target: "@s".into(),
+                        objective: "kills".into(),
+                    },
+                ),
+            },
+        ),
+        (
+            "if biome ~ ~ ~ minecraft:forest",
+            ExecuteConditionKind::Biome {
+                pos: pos("~", "~", "~"),
+                biome: "minecraft:forest".into(),
+            },
+        ),
+        (
+            "if dimension minecraft:the_end",
+            ExecuteConditionKind::Dimension {
+                dimension: "minecraft:the_end".into(),
+            },
+        ),
+        (
+            "if loaded ~ ~ ~",
+            ExecuteConditionKind::Loaded {
+                pos: pos("~", "~", "~"),
+            },
+        ),
+        (
+            "unless predicate foo:bar",
+            ExecuteConditionKind::Predicate {
+                id: "foo:bar".into(),
+            },
+        ),
+        (
+            "if data block ~ ~ ~ Items",
+            ExecuteConditionKind::Data {
+                target: ExecuteDataTarget::Block(pos("~", "~", "~")),
+                path: "Items".into(),
+                nbt: None,
+            },
+        ),
+        (
+            "if data entity @s Inventory[0] {id:\"minecraft:stone\"}",
+            ExecuteConditionKind::Data {
+                target: ExecuteDataTarget::Entity("@s".into()),
+                path: "Inventory[0]".into(),
+                nbt: Some("{id:\"minecraft:stone\"}".into()),
+            },
+        ),
+        (
+            "unless data storage foo:bar path",
+            ExecuteConditionKind::Data {
+                target: ExecuteDataTarget::Storage("foo:bar".into()),
+                path: "path".into(),
+                nbt: None,
+            },
+        ),
+    ];
+    for (text, kind) in cases {
+        let command = ExecuteCommand::parse(&format!("execute {text} run say ok")).unwrap();
+        let expected_check = if text.starts_with("unless") {
+            ExecuteCheck::Unless
+        } else {
+            ExecuteCheck::If
+        };
+        assert_eq!(
+            command.clauses,
+            vec![ExecuteClause::Condition(ExecuteConditional {
+                check: expected_check,
+                kind: kind.clone(),
+            })],
+            "case {text}"
+        );
+    }
+}
+
+#[test]
+fn execute_score_comparisons_cover_all_six_forms_and_ranges() {
+    for (op, expected) in [
+        ("<", ExecuteScoreComparison::LessThan),
+        ("<=", ExecuteScoreComparison::LessEquals),
+        ("=", ExecuteScoreComparison::Equals),
+        (">=", ExecuteScoreComparison::GreaterEquals),
+        (">", ExecuteScoreComparison::GreaterThan),
+    ] {
+        let command =
+            ExecuteCommand::parse(&format!("execute if score @s obj {op} @p other run x")).unwrap();
+        match &command.clauses[0] {
+            ExecuteClause::Condition(ExecuteConditional {
+                kind: ExecuteConditionKind::Score { test, .. },
+                ..
+            }) => assert_eq!(
+                *test,
+                ExecuteScoreTest::Compare(
+                    expected,
+                    ExecuteScoreSource {
+                        target: "@p".into(),
+                        objective: "other".into(),
+                    }
+                )
+            ),
+            other => panic!("unexpected clause: {other:?}"),
+        }
+    }
+    for (range, min, max) in [
+        ("0", Some(0), Some(0)),
+        ("..3", None, Some(3)),
+        ("2..", Some(2), None),
+        ("..", None, None),
+    ] {
+        let command =
+            ExecuteCommand::parse(&format!("execute if score @s obj matches {range} run x"))
+                .unwrap();
+        match &command.clauses[0] {
+            ExecuteClause::Condition(ExecuteConditional {
+                kind: ExecuteConditionKind::Score { test, .. },
+                ..
+            }) => assert_eq!(
+                *test,
+                ExecuteScoreTest::Matches(ExecuteRange { min, max }),
+                "range {range}"
+            ),
+            other => panic!("unexpected clause: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn execute_every_store_target_parses_with_its_exact_argument_order() {
+    let cases: &[(&str, ExecuteStoreTarget)] = &[
+        (
+            "score @s objective",
+            ExecuteStoreTarget::Score {
+                targets: "@s".into(),
+                objective: "objective".into(),
+            },
+        ),
+        (
+            "bossbar foo:bar value",
+            ExecuteStoreTarget::Bossbar {
+                id: "foo:bar".into(),
+                field: ExecuteBossbarField::Value,
+            },
+        ),
+        (
+            "bossbar foo:bar max",
+            ExecuteStoreTarget::Bossbar {
+                id: "foo:bar".into(),
+                field: ExecuteBossbarField::Max,
+            },
+        ),
+        (
+            "block ~ ~ ~ path int 1.5",
+            ExecuteStoreTarget::Block {
+                pos: pos("~", "~", "~"),
+                path: "path".into(),
+                nbt_type: ExecuteNbtType::Int,
+                scale: 1.5,
+            },
+        ),
+        (
+            "entity @e path byte 0.5",
+            ExecuteStoreTarget::Entity {
+                target: "@e".into(),
+                path: "path".into(),
+                nbt_type: ExecuteNbtType::Byte,
+                scale: 0.5,
+            },
+        ),
+        (
+            "storage foo:bar path double -2",
+            ExecuteStoreTarget::Storage {
+                id: "foo:bar".into(),
+                path: "path".into(),
+                nbt_type: ExecuteNbtType::Double,
+                scale: -2.0,
+            },
+        ),
+    ];
+    for (text, target) in cases {
+        for (kind_text, kind) in [("result", ExecuteStoreKind::Result), ("success", ExecuteStoreKind::Success)] {
+            let command = ExecuteCommand::parse(&format!("execute store {kind_text} {text} run x"))
+                .unwrap();
+            assert_eq!(
+                command.clauses,
+                vec![ExecuteClause::Store(ExecuteStore {
+                    kind,
+                    target: target.clone(),
+                })],
+                "case {kind_text} {text}"
+            );
+        }
+    }
+    for nbt_type in ["byte", "short", "int", "long", "float", "double"] {
+        let command =
+            ExecuteCommand::parse(&format!("execute store result storage a:b p {nbt_type} 1 run x"))
+                .unwrap();
+        match &command.clauses[0] {
+            ExecuteClause::Store(ExecuteStore {
+                target: ExecuteStoreTarget::Storage { nbt_type: actual, .. },
+                ..
+            }) => assert_eq!(format!("{actual:?}").to_ascii_lowercase(), nbt_type),
+            other => panic!("unexpected clause: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn execute_chains_modifiers_conditions_and_stores_in_source_order() {
+    let command = ExecuteCommand::parse(concat!(
+        "execute as @a store success score @s c if entity @e ",
+        "positioned ~ ~ ~ unless block ~ ~ ~ air rotated as @p run ",
+        "  say   keep   spacing "
+    ))
+    .unwrap();
+    assert_eq!(
+        command.clauses.iter().map(|clause| match clause {
+            ExecuteClause::Modifier(ExecuteModifier::As { .. }) => "as",
+            ExecuteClause::Store(_) => "store",
+            ExecuteClause::Condition(ExecuteConditional { check: ExecuteCheck::If, .. }) => "if",
+            ExecuteClause::Modifier(ExecuteModifier::Positioned { .. }) => "positioned",
+            ExecuteClause::Condition(ExecuteConditional { check: ExecuteCheck::Unless, .. }) => "unless",
+            ExecuteClause::Modifier(ExecuteModifier::RotatedAs { .. }) => "rotated as",
+            other => panic!("unexpected clause: {other:?}"),
+        }).collect::<Vec<_>>(),
+        ["as", "store", "if", "positioned", "unless", "rotated as"]
+    );
+    assert_eq!(command.run.as_deref(), Some("say   keep   spacing"));
+}
+
+#[test]
+fn execute_terminal_check_without_run_is_valid() {
+    let command = ExecuteCommand::parse("execute if block ~ ~ ~ air").unwrap();
+    assert!(command.run.is_none());
+    assert_eq!(
+        command.clauses,
+        vec![ExecuteClause::Condition(ExecuteConditional {
+            check: ExecuteCheck::If,
+            kind: ExecuteConditionKind::Block {
+                pos: pos("~", "~", "~"),
+                predicate: "air".into(),
+            },
+        })]
+    );
+    let command = ExecuteCommand::parse("/execute unless entity @a").unwrap();
+    assert!(command.run.is_none());
+    assert_eq!(command.clauses.len(), 1);
+}
+
+#[test]
+fn execute_run_command_is_kept_byte_exact_including_quotes_and_delimiters() {
+    let command =
+        ExecuteCommand::parse("execute as @s run say \"hello world\" [a,b] {x:1}  tail").unwrap();
+    assert_eq!(
+        command.run.as_deref(),
+        Some("say \"hello world\" [a,b] {x:1}  tail")
+    );
+    assert_eq!(run_of("execute run execute as @p run tp @s ~ ~ ~"), "execute as @p run tp @s ~ ~ ~");
+}
+
+#[test]
+fn execute_parser_rejects_unknown_subcommands_and_malformed_arguments() {
+    for command in [
+        "execute bogus @s run say x",
+        "execute as @s",
+        "execute if bogus run x",
+        "execute if block ~ ~ ~",
+        "execute if blocks 0 0 0 1 1 1 2 2 2 nonsense",
+        "execute if score @s obj ~ @p obj run x",
+        "execute if score @s obj matches 10..1 run x",
+        "execute if data nonsense path",
+        "execute store maybe score @s obj run x",
+        "execute store result bossbar a:b nonsense run x",
+        "execute store result storage a:b p int nope run x",
+        "execute store result storage a:b p int NaN run x",
+        "execute positioned over not_a_heightmap run x",
+        "execute facing entity @p middle run x",
+        "execute on sibling run x",
+        "execute align xyx run x",
+        "execute align q run x",
+        "execute anchored side run x",
+        "execute rotated 90 run x",
+        "execute positioned ~ ~ run x",
+        "execute run",
+    ] {
+        let result = std::panic::catch_unwind(|| ExecuteCommand::parse(command));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "{command:?} should be rejected, got {result:?}"
+        );
+    }
+}
