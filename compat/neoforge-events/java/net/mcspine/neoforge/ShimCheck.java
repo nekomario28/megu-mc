@@ -576,12 +576,23 @@ public final class ShimCheck {
         }
         void signature(String signature) {
             if (signature == null) return;
+            class SignatureAudit extends org.objectweb.asm.signature.SignatureVisitor {
+                private String owner;
+                SignatureAudit() { super(Opcodes.ASM9); }
+                @Override public void visitClassType(String name) {
+                    owner = name;
+                    info.ref(owner);
+                }
+                @Override public void visitInnerClassType(String name) {
+                    owner += "$" + name;
+                    info.ref(owner);
+                }
+                @Override public org.objectweb.asm.signature.SignatureVisitor visitTypeArgument(char wildcard) {
+                    return new SignatureAudit();
+                }
+            }
             try {
-                new org.objectweb.asm.signature.SignatureReader(signature).accept(
-                    new org.objectweb.asm.signature.SignatureVisitor(Opcodes.ASM9) {
-                        @Override public void visitClassType(String name) { info.ref(name); }
-                        @Override public void visitInnerClassType(String name) { info.ref(name); }
-                    });
+                new org.objectweb.asm.signature.SignatureReader(signature).accept(new SignatureAudit());
             } catch (IllegalArgumentException ignored) { /* Malformed generics cannot confer support. */ }
         }
         AnnotationVisitor annotation(String desc) { return annotation(desc, false); }

@@ -11,10 +11,13 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.ResourceLocation;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.BusBuilder;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.registries.RegisterEvent;
 
 /** Static compatibility gate followed by the supported NeoForge event bootstrap. */
 public final class Bootstrap {
@@ -23,6 +26,7 @@ public final class Bootstrap {
     private static final Map<String, Object> instances = new LinkedHashMap<>();
     private static final Map<String, IEventBus> modBuses = new LinkedHashMap<>();
     private static final List<Class<?>> gameSubscribers = new ArrayList<>();
+    private static String frozenRegistry;
     private static boolean initialized;
 
     private Bootstrap() { }
@@ -41,6 +45,7 @@ public final class Bootstrap {
             }
         }
         if (jars.isEmpty()) {
+            frozenRegistry = freezeRegistries();
             NeoForge.EVENT_BUS.start();
             initialized = true;
             return net.mcspine.probe.Host.class;
@@ -88,13 +93,43 @@ public final class Bootstrap {
                 }
             }
             for (IEventBus bus : modBuses.values()) bus.start();
+            frozenRegistry = freezeRegistries();
             NeoForge.EVENT_BUS.start();
             initialized = true;
-        } catch (Exception | LinkageError error) {
-            close();
+        } catch (Exception | Error error) {
+            try { close(); }
+            catch (java.io.IOException cleanup) { error.addSuppressed(cleanup); }
             throw error;
         }
         return net.mcspine.probe.Host.class;
+    }
+
+    private static String freezeRegistries() {
+        var wire = new StringBuilder("S2\n");
+        // Registry keys are ordered block, item. Finish the block event on every
+        // mod bus first so item factories can resolve their deferred blocks.
+        for (var key : List.of(Registries.BLOCK, Registries.ITEM)) {
+            var event = new RegisterEvent(key);
+            try {
+                for (IEventBus bus : modBuses.values()) bus.post(event);
+            } finally {
+                event.closeRegistration();
+            }
+            var names = event.registeredNames().stream()
+                .sorted(Comparator.comparing(ResourceLocation::getNamespace).thenComparing(ResourceLocation::getPath))
+                .toList();
+            // First free IDs in the pinned 1.21.1 vanilla block-state and item tables.
+            long id = key == Registries.BLOCK ? 26_684 : 1_333;
+            for (ResourceLocation name : names) {
+                wire.append(key.location()).append('\t').append(id++).append('\t').append(name).append('\n');
+            }
+        }
+        return wire.append("end").toString();
+    }
+
+    public static synchronized String frozenRegistryEncoded() {
+        if (!initialized) throw new IllegalStateException("NeoForge registry is not frozen");
+        return frozenRegistry;
     }
 
     private static Object construct(Class<?> type, String modId, IEventBus modBus) throws Exception {
@@ -132,15 +167,17 @@ public final class Bootstrap {
 
     /** Release class-loader and event registrations for isolated runtimes/tests. */
     public static synchronized void close() throws java.io.IOException {
+        initialized = false;
+        frozenRegistry = null;
         for (Class<?> subscriber : gameSubscribers) NeoForge.EVENT_BUS.unregister(subscriber);
         gameSubscribers.clear();
         for (Object mod : instances.values()) NeoForge.EVENT_BUS.unregister(mod);
         instances.clear();
         modBuses.clear();
         instance = null;
-        if (modLoader != null) modLoader.close();
+        URLClassLoader loader = modLoader;
         modLoader = null;
-        initialized = false;
+        if (loader != null) loader.close();
     }
 
     public static Class<?> initializeServer() { return ServerHooks.class; }

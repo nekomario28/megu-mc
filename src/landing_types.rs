@@ -143,9 +143,236 @@ fn unescape(field: &str) -> Result<String, String> {
     Ok(decoded)
 }
 
+#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+pub(crate) const FIRST_MOD_BLOCK_STATE_ID: u32 = 26_684;
+#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+pub(crate) const FIRST_MOD_ITEM_ID: u32 = 1_333;
+
+#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ModRegistry {
+    Block,
+    Item,
+}
+
+#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ModRegistryEntry {
+    pub(crate) registry: ModRegistry,
+    pub(crate) name: String,
+    pub(crate) runtime_id: u32,
+}
+
+/// Validated, registry/name-ordered view of the current JVM's dynamic IDs.
+#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ModRegistrySnapshot {
+    entries: Vec<ModRegistryEntry>,
+}
+
+#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+impl ModRegistrySnapshot {
+    /// Decode the bootstrap's S2 table. The terminator, tuple order and
+    /// contiguous per-registry IDs are part of the wire contract.
+    pub(crate) fn from_wire(wire: &str) -> Result<Self, String> {
+        let mut lines = wire.split('\n');
+        if lines.next() != Some("S2") {
+            return Err("invalid S2 registry header".into());
+        }
+        let mut entries = Vec::new();
+        let mut previous = None;
+        let mut next_block = FIRST_MOD_BLOCK_STATE_ID;
+        let mut next_item = FIRST_MOD_ITEM_ID;
+        for line in lines.by_ref() {
+            if line == "end" {
+                return if lines.next().is_none() {
+                    Ok(Self { entries })
+                } else {
+                    Err("trailing records after S2 registry terminator".into())
+                };
+            }
+            let mut fields = line.split('\t');
+            let (registry, next_id) = match fields.next() {
+                Some("minecraft:block") => (ModRegistry::Block, &mut next_block),
+                Some("minecraft:item") => (ModRegistry::Item, &mut next_item),
+                _ => return Err(format!("unknown S2 registry record {line:?}")),
+            };
+            let (Some(id), Some(name), None) = (fields.next(), fields.next(), fields.next()) else {
+                return Err(format!("malformed S2 registry record {line:?}"));
+            };
+            let (namespace, path) = mod_name_parts(name)?;
+            let order = (registry, namespace, path);
+            if previous.is_some_and(|last| order <= last) {
+                return Err(format!(
+                    "duplicate or out-of-order S2 registry entry {name:?}"
+                ));
+            }
+            if id != next_id.to_string() {
+                return Err(format!(
+                    "invalid S2 registry ID {id:?} for {name:?}, expected {next_id}"
+                ));
+            }
+            entries.push(ModRegistryEntry {
+                registry,
+                name: name.into(),
+                runtime_id: *next_id,
+            });
+            *next_id = next_id.checked_add(1).ok_or("S2 registry ID overflow")?;
+            previous = Some(order);
+        }
+        Err("missing S2 registry terminator".into())
+    }
+
+    #[allow(dead_code)] // For the consumer of the validated startup table.
+    pub(crate) fn entries(&self) -> &[ModRegistryEntry] {
+        &self.entries
+    }
+
+    /// Encode the dynamic block-state portion of a palette. Each S2 block has
+    /// one state, so its canonical resource location fully identifies it.
+    #[allow(dead_code)] // The world-save integration consumes this codec separately.
+    pub(crate) fn encode_block_palette(&self, states: &[u32]) -> Result<Vec<&str>, String> {
+        states
+            .iter()
+            .map(|&id| {
+                id.checked_sub(FIRST_MOD_BLOCK_STATE_ID)
+                    .and_then(|index| self.entries.get(index as usize))
+                    .filter(|entry| entry.registry == ModRegistry::Block)
+                    .map(|entry| entry.name.as_str())
+                    .ok_or_else(|| format!("unknown dynamic block-state ID {id}"))
+            })
+            .collect()
+    }
+
+    /// Resolve names against this boot's snapshot. A missing block or an
+    /// invalid name fails the whole palette before the caller can use it.
+    #[allow(dead_code)]
+    pub(crate) fn decode_block_palette(
+        &self,
+        names: &[impl AsRef<str>],
+    ) -> Result<Vec<u32>, String> {
+        let block_count = self
+            .entries
+            .partition_point(|entry| entry.registry == ModRegistry::Block);
+        let blocks = &self.entries[..block_count];
+        names
+            .iter()
+            .map(|name| {
+                let name = name.as_ref();
+                let parts = mod_name_parts(name)?;
+                let index = blocks
+                    .binary_search_by_key(&parts, |entry| {
+                        entry.name.split_once(':').expect("validated S2 block name")
+                    })
+                    .map_err(|_| format!("missing dynamic block {name:?}"))?;
+                Ok(blocks[index].runtime_id)
+            })
+            .collect()
+    }
+}
+
+#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+fn mod_name_parts(name: &str) -> Result<(&str, &str), String> {
+    let common_char =
+        |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte);
+    if let Some((namespace, path)) = name.split_once(':') {
+        if !namespace.is_empty()
+            && namespace != "minecraft"
+            && namespace.bytes().all(common_char)
+            && !path.is_empty()
+            && path.bytes().all(|byte| common_char(byte) || byte == b'/')
+        {
+            return Ok((namespace, path));
+        }
+    }
+    Err(format!("invalid dynamic registry name {name:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s2_registry_uses_canonical_names_and_separate_id_spaces() {
+        assert_eq!(FIRST_MOD_ITEM_ID as usize, crate::ITEM_NAMES.len());
+        let snapshot = ModRegistrySnapshot::from_wire(concat!(
+            "S2\n",
+            "minecraft:block\t26684\tmod:stone\n",
+            "minecraft:block\t26685\tmod-x:sub/path\n",
+            "minecraft:item\t1333\tmod:stone\n",
+            "minecraft:item\t1334\tmod:item_only\n",
+            "end",
+        ));
+        // Within one namespace, paths are also ordered.
+        assert!(snapshot.is_err());
+        let snapshot = ModRegistrySnapshot::from_wire(concat!(
+            "S2\n",
+            "minecraft:block\t26684\tmod:stone\n",
+            "minecraft:block\t26685\tmod-x:sub/path\n",
+            "minecraft:item\t1333\tmod:item_only\n",
+            "minecraft:item\t1334\tmod:stone\n",
+            "end",
+        ))
+        .unwrap();
+        assert_eq!(
+            snapshot.entries()[3],
+            ModRegistryEntry {
+                registry: ModRegistry::Item,
+                name: "mod:stone".into(),
+                runtime_id: 1334,
+            },
+        );
+        let names = snapshot
+            .encode_block_palette(&[26685, 26684, 26685])
+            .unwrap();
+        assert_eq!(names, ["mod-x:sub/path", "mod:stone", "mod-x:sub/path"]);
+        assert_eq!(
+            snapshot.decode_block_palette(&names).unwrap(),
+            [26685, 26684, 26685]
+        );
+        assert!(snapshot.encode_block_palette(&[26684, 26686]).is_err());
+        assert!(snapshot.encode_block_palette(&[26683]).is_err());
+        assert!(snapshot
+            .decode_block_palette(&["mod:stone", "mod:item_only"])
+            .is_err());
+        assert!(snapshot
+            .decode_block_palette(&["mod:stone[age=1]"])
+            .is_err());
+        assert!(ModRegistrySnapshot::from_wire("S2\nend")
+            .unwrap()
+            .entries()
+            .is_empty());
+    }
+
+    #[test]
+    fn s2_registry_rejects_incomplete_or_corrupt_snapshots() {
+        for wire in [
+            "S1\nend",
+            "S2",
+            "S2\nend\n",
+            "S2\nminecraft:block\t26684\tmod:stone",
+            "S2\nminecraft:block\t26684\tmod:stone\tother\nend",
+            "S2\nminecraft:block\t26684\tmod:stone\nminecraft:block\t26685\tmod:stone\nend",
+            "S2\nminecraft:item\t1333\tmod:tool\nminecraft:block\t26684\tmod:stone\nend",
+            "S2\nminecraft:block\t26684\tmod:stone\nminecraft:block\t26684\tmod:wood\nend",
+            "S2\nminecraft:block\t26685\tmod:stone\nend",
+            "S2\nminecraft:block\t26683\tmod:stone\nend",
+            "S2\nminecraft:item\t+1333\tmod:tool\nend",
+            "S2\nminecraft:item\t01333\tmod:tool\nend",
+            "S2\nminecraft:item\t4294967296\tmod:tool\nend",
+            "S2\nminecraft:item\t1333\tminecraft:stick\nend",
+            "S2\nminecraft:item\t1333\tmod:\nend",
+            "S2\nminecraft:item\t1333\t:tool\nend",
+            "S2\nminecraft:item\t1333\tmod:TOOL\nend",
+            "S2\nminecraft:item\t1333\tmod/tool\nend",
+            "S2\nminecraft:fluid\t1333\tmod:fluid\nend",
+        ] {
+            assert!(
+                ModRegistrySnapshot::from_wire(wire).is_err(),
+                "accepted {wire:?}"
+            );
+        }
+    }
 
     #[test]
     fn decodes_ordered_mutations_and_event_changes() {

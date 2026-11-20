@@ -1,4 +1,6 @@
 //! One JVM owner and guarded Rust world ABI for pinned Fabric and NeoForge operations.
+#[cfg(feature = "neoforge-events")]
+use crate::landing_types::ModRegistrySnapshot;
 use crate::landing_types::{
     decode_mutation_batch, Loader, MutationOp, Request, S1EventOutcome, Trample,
 };
@@ -207,11 +209,32 @@ pub(crate) fn dispatch_s1_event(
         let wire = env.get_string(&encoded)?.into();
         Ok(wire)
     });
-    let wire = wire.map_err(|error| s1_dispatch_error(env, error))?;
+    let wire = wire.map_err(|error| java_error(env, error))?;
     decode_mutation_batch(&wire)
 }
 
-fn s1_dispatch_error(env: &mut JNIEnv, error: jni::errors::Error) -> String {
+#[cfg(feature = "neoforge-events")]
+pub(crate) fn fetch_registry_snapshot(env: &mut JNIEnv) -> Result<ModRegistrySnapshot, String> {
+    if OWNER.get() != Some(&thread::current().id()) {
+        return Err("S2 registry snapshot requires the JVM owner thread".into());
+    }
+    let wire = env.with_local_frame(4, |env| -> jni::errors::Result<String> {
+        let encoded = env
+            .call_static_method(
+                "net/mcspine/neoforge/Bootstrap",
+                "frozenRegistryEncoded",
+                "()Ljava/lang/String;",
+                &[],
+            )?
+            .l()?;
+        let encoded = JString::from(encoded);
+        let wire = env.get_string(&encoded)?.into();
+        Ok(wire)
+    });
+    ModRegistrySnapshot::from_wire(&wire.map_err(|error| java_error(env, error))?)
+}
+
+fn java_error(env: &mut JNIEnv, error: jni::errors::Error) -> String {
     let exception = env.exception_occurred();
     if let Err(clear_error) = env.exception_clear() {
         return format!("{error}; could not clear Java exception: {clear_error}");
@@ -527,6 +550,8 @@ pub fn serve(
                             &[JValue::Object(&directory)],
                         )?
                         .l()?;
+                    #[cfg(feature = "neoforge-events")]
+                    fetch_registry_snapshot(&mut env)?;
                     register_host(&mut env, host)?;
                     "net/mcspine/neoforge/Bootstrap"
                 }
