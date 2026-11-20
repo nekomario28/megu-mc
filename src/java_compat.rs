@@ -4,6 +4,15 @@ use crate::landing_types::ModRegistrySnapshot;
 use crate::landing_types::{
     decode_mutation_batch, Loader, MutationOp, Request, S1EventOutcome, Trample,
 };
+#[cfg(feature = "neoforge-events")]
+use crate::landing_types::{
+    decode_s3_response_batch, encode_s3_request_batch, S3BatchOp, S3TickRequest, S3_CAPACITY,
+};
+#[cfg(feature = "neoforge-events")]
+use jni::{
+    objects::{AutoLocal, JByteBuffer, JStaticMethodID},
+    signature::{Primitive, ReturnType},
+};
 use jni::{
     objects::{JClass, JObject, JString, JValue},
     sys::{jboolean, jint},
@@ -232,6 +241,120 @@ pub(crate) fn fetch_registry_snapshot(env: &mut JNIEnv) -> Result<ModRegistrySna
         Ok(wire)
     });
     ModRegistrySnapshot::from_wire(&wire.map_err(|error| java_error(env, error))?)
+}
+
+#[cfg(feature = "neoforge-events")]
+struct S3DirectBuffer<'local> {
+    java: AutoLocal<'local, JByteBuffer<'local>>,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "neoforge-events")]
+impl<'local> S3DirectBuffer<'local> {
+    fn bind(env: &mut JNIEnv<'local>) -> jni::errors::Result<Self> {
+        let mut bytes = vec![0; S3_CAPACITY];
+        // The private Java entry point borrows these views synchronously. It
+        // clears the response view from all callback state before returning.
+        // The allocation is never resized, and the Java reference drops first.
+        let java = unsafe { env.new_direct_byte_buffer(bytes.as_mut_ptr(), S3_CAPACITY)? };
+        Ok(Self {
+            java: env.auto_local(java),
+            bytes,
+        })
+    }
+}
+
+/// One reusable request/response slot on the attached NeoForge JVM owner.
+#[cfg(feature = "neoforge-events")]
+#[allow(dead_code)] // The tick owner can use this once it supplies S3 activations.
+pub(crate) struct S3BatchBridge<'local> {
+    class: AutoLocal<'local, JClass<'local>>,
+    dispatch: JStaticMethodID,
+    request: S3DirectBuffer<'local>,
+    response: S3DirectBuffer<'local>,
+    sequence: u64,
+    #[cfg(test)]
+    jni_crossings: usize,
+}
+
+#[cfg(feature = "neoforge-events")]
+#[allow(dead_code)]
+impl<'local> S3BatchBridge<'local> {
+    pub(crate) fn bind(env: &mut JNIEnv<'local>) -> Result<Self, String> {
+        if OWNER.get() != Some(&thread::current().id()) {
+            return Err("S3 bridge requires the JVM owner thread".into());
+        }
+        let bind = (|| -> jni::errors::Result<Self> {
+            let class = env.find_class("net/mcspine/neoforge/DirectBatchBridge")?;
+            let class = env.auto_local(class);
+            let dispatch = env.get_static_method_id(
+                &*class,
+                "dispatch",
+                "(Ljava/nio/ByteBuffer;ILjava/nio/ByteBuffer;)I",
+            )?;
+            Ok(Self {
+                class,
+                dispatch,
+                request: S3DirectBuffer::bind(env)?,
+                response: S3DirectBuffer::bind(env)?,
+                sequence: 0,
+                #[cfg(test)]
+                jni_crossings: 0,
+            })
+        })();
+        bind.map_err(|error| java_error(env, error))
+    }
+
+    pub(crate) fn dispatch<'wire>(
+        &'wire mut self,
+        env: &mut JNIEnv<'local>,
+        requests: &[S3TickRequest],
+    ) -> Result<impl ExactSizeIterator<Item = S3BatchOp<'wire>> + 'wire, String> {
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or("S3 sequence exhausted")?;
+        let request = self.request.bytes.as_mut_ptr();
+        // Rust only writes to the request before calling Java. No Rust slice
+        // into either buffer lives across the call.
+        let request = unsafe { std::slice::from_raw_parts_mut(request, S3_CAPACITY) };
+        let len = encode_s3_request_batch(request, sequence, requests)?;
+        self.sequence = sequence;
+        let len = self.invoke(env, len as jint)?;
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|&len| len <= S3_CAPACITY)
+            .ok_or("invalid S3 response size")?;
+        // The Java writer has returned. This borrow prevents reuse while
+        // decoded operations still reference the response bytes.
+        let response = unsafe { std::slice::from_raw_parts(self.response.bytes.as_ptr(), len) };
+        decode_s3_response_batch(response, sequence, requests).map_err(str::to_owned)
+    }
+
+    fn invoke(&mut self, env: &mut JNIEnv<'local>, len: jint) -> Result<jint, String> {
+        let args = [
+            JValue::Object(&*self.request.java).as_jni(),
+            JValue::Int(len).as_jni(),
+            JValue::Object(&*self.response.java).as_jni(),
+        ];
+        #[cfg(test)]
+        {
+            self.jni_crossings += 1;
+        }
+        // bind resolves this exact signature against the retained class. The
+        // two direct buffers and the Int argument match that signature.
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                &*self.class,
+                self.dispatch,
+                ReturnType::Primitive(Primitive::Int),
+                &args,
+            )
+        };
+        result
+            .and_then(|value| value.i())
+            .map_err(|error| java_error(env, error))
+    }
 }
 
 fn java_error(env: &mut JNIEnv, error: jni::errors::Error) -> String {
@@ -637,6 +760,230 @@ fn register_host(env: &mut JNIEnv, host: JObject) -> Result<(), jni::errors::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "neoforge-events")]
+    #[test]
+    fn s3_direct_jni_fixture() {
+        use crate::landing_types::S3Activation::*;
+
+        // The Python suite builds and supplies the audited mod and Java 21 classpath.
+        let Some(directory) = std::env::var_os("MC_SPINE_S3_FIXTURE") else {
+            return;
+        };
+        let directory = Path::new(&directory);
+        let classpath = std::fs::read_to_string(directory.join("classpath.txt")).unwrap();
+        let jvm = create_jvm(&classpath).unwrap();
+        let mut env = jvm.attach_current_thread().unwrap();
+        let path = JObject::from(env.new_string(directory.to_str().unwrap()).unwrap());
+        let host = env.call_static_method(
+            "net/mcspine/neoforge/Bootstrap",
+            "initialize",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&path)],
+        );
+        let host = host.unwrap_or_else(|error| panic!("{}", java_error(&mut env, error)));
+        register_host(&mut env, host.l().unwrap()).unwrap();
+        let mut bridge = S3BatchBridge::bind(&mut env).unwrap();
+
+        let request = |activation, kind, x| S3TickRequest {
+            activation,
+            dim: (x % 3) as u8,
+            kind,
+            id: x - 512,
+            generation: 0x8000_0000 + x as u32,
+            pos: (x, 64 + x, -x),
+            state: 0xfedc_0000 + x as u32,
+        };
+        let require_rollback = |bridge: &S3BatchBridge<'_>| {
+            // The Java entry point revokes the previous frame before it writes any operations.
+            let header = unsafe { std::slice::from_raw_parts(bridge.response.bytes.as_ptr(), 4) };
+            assert_eq!(header, [0; 4]);
+        };
+        let mode = std::env::var("MC_SPINE_S3_MODE").unwrap();
+        match mode.as_str() {
+            "stress" => {
+                let blocks: Vec<_> = (0..1024).map(|i| request(BlockEntityTick, 7, i)).collect();
+                let ops = bridge.dispatch(&mut env, &blocks).unwrap();
+                assert_eq!(ops.len(), 1024);
+                assert!(ops.eq(blocks.iter().map(|r| S3BatchOp::SetBlockIf {
+                    dim: r.dim,
+                    pos: r.pos,
+                    new_state: r.state + 1,
+                    expected_state: r.state,
+                })));
+                assert_eq!(bridge.jni_crossings, 1);
+                println!("validated=1024 jni_crossings={}", bridge.jni_crossings);
+
+                // Reuse the same direct views for a batch with every activation and opcode.
+                let requests: Vec<_> = (0..1024)
+                    .map(|i| {
+                        request(
+                            [BlockEntityTick, ScheduledBlockTick, Container, EntityTick][i % 4],
+                            7,
+                            i as i32,
+                        )
+                    })
+                    .collect();
+                let ops = bridge.dispatch(&mut env, &requests).unwrap();
+                assert_eq!(ops.len(), 1024);
+                for (r, actual) in requests.iter().zip(ops) {
+                    let x = r.pos.0;
+                    let message = format!("更新 📦 {x}");
+                    let expected = match r.activation {
+                        BlockEntityTick => S3BatchOp::SetBlockIf {
+                            dim: r.dim,
+                            pos: r.pos,
+                            new_state: r.state + 1,
+                            expected_state: r.state,
+                        },
+                        ScheduledBlockTick => S3BatchOp::ScheduleTick {
+                            dim: r.dim,
+                            pos: r.pos,
+                            delay: x * 4,
+                            priority: (x % 7 - 3) as i8,
+                        },
+                        Container => S3BatchOp::ContainerSlotDelta {
+                            dim: r.dim,
+                            pos: r.pos,
+                            slot: x as u16,
+                            item_id: 1400 + x as u32,
+                            count: (x % 99 + 1) as u8,
+                        },
+                        EntityTick => S3BatchOp::SendSystemMessage {
+                            player_eid: r.id,
+                            message: &message,
+                        },
+                    };
+                    assert_eq!(actual, expected);
+                }
+                assert_eq!(bridge.jni_crossings, 2);
+            }
+            "lifetime" => {
+                for activation in [BlockEntityTick, EntityTick] {
+                    let keep = request(activation, 11, 0);
+                    let access = S3TickRequest {
+                        generation: 1,
+                        pos: (1, 64, 0),
+                        ..keep
+                    };
+                    // Writing in the first activation succeeds, then use of the earlier
+                    // handle from the next generation invalidates all of those writes.
+                    let error = bridge.dispatch(&mut env, &[keep, access]).err().unwrap();
+                    assert!(
+                        error.contains("IllegalStateException: S3 batch failed"),
+                        "{error}"
+                    );
+                    require_rollback(&bridge);
+                    // The prior-generation handle must stay expired when a new, exact
+                    // copy of the original tuple is active in a different batch.
+                    assert_eq!(bridge.dispatch(&mut env, &[keep]).unwrap().len(), 1);
+                    let same_identity = S3TickRequest {
+                        generation: keep.generation,
+                        ..access
+                    };
+                    let error = bridge.dispatch(&mut env, &[same_identity]).err().unwrap();
+                    assert!(
+                        error.contains("IllegalStateException: S3 batch failed"),
+                        "{error}"
+                    );
+                    require_rollback(&bridge);
+                }
+                println!("expired entity and block entity handles rolled back");
+            }
+            "reentrancy" => {
+                let at_depth_four = request(BlockEntityTick, 12, 4);
+                let at_depth_five = request(BlockEntityTick, 12, 5);
+                let ops = bridge.dispatch(&mut env, &[at_depth_four]).unwrap();
+                assert!(ops.eq((1..=4).map(|delay| S3BatchOp::ScheduleTick {
+                    dim: at_depth_four.dim,
+                    pos: at_depth_four.pos,
+                    delay,
+                    priority: 0,
+                })));
+                let error = bridge
+                    .dispatch(&mut env, &[at_depth_four, at_depth_five])
+                    .err()
+                    .unwrap();
+                assert!(
+                    error.contains("IllegalStateException: S3 batch failed"),
+                    "{error}"
+                );
+                require_rollback(&bridge);
+                println!("depth 4 committed and depth 5 rolled back");
+            }
+            "bounds" => {
+                for (kind, x, error_text) in [
+                    (13, 65, "oversized S3 UTF-8 message"),
+                    (14, 4097, "response capacity exceeded"),
+                    (15, 0, "Invalid S3 tick delay or priority"),
+                    (16, 0, "Invalid S3 container slot or stack"),
+                    (17, 0, "Invalid or oversized S3 UTF-8 message"),
+                    (
+                        18,
+                        0,
+                        "Legacy native world access is unavailable during S3 dispatch",
+                    ),
+                ] {
+                    let valid = request(BlockEntityTick, 7, 3);
+                    assert_eq!(bridge.dispatch(&mut env, &[valid]).unwrap().len(), 1);
+                    let error = bridge
+                        .dispatch(&mut env, &[valid, request(BlockEntityTick, kind, x)])
+                        .err()
+                        .unwrap();
+                    assert!(error.contains(error_text), "{error}");
+                    require_rollback(&bridge);
+                }
+
+                let requests = [
+                    request(BlockEntityTick, 20, 0),
+                    request(BlockEntityTick, 20, 1),
+                ];
+                let pointer = bridge.request.bytes.as_mut_ptr();
+                let encode = |out: &mut [u8]| encode_s3_request_batch(out, 9, &requests).unwrap();
+                let len = encode(unsafe { std::slice::from_raw_parts_mut(pointer, S3_CAPACITY) });
+                for (len, error_text) in [
+                    (len - 1, "count or size"),
+                    (len + 1, "count or size"),
+                    (S3_CAPACITY + 1, "buffer or length"),
+                ] {
+                    let error = bridge.invoke(&mut env, len as jint).unwrap_err();
+                    assert!(error.contains(error_text), "{error}");
+                    require_rollback(&bridge);
+                }
+                for (offset, bytes, error_text) in [
+                    (2, &[2][..], "request header"),
+                    (44, &[0xff][..], "activation identity"),
+                    (45, &[3][..], "activation identity"),
+                    (52, &[0; 4][..], "activation identity"),
+                ] {
+                    let out = unsafe { std::slice::from_raw_parts_mut(pointer, S3_CAPACITY) };
+                    encode(out);
+                    out[offset..offset + bytes.len()].copy_from_slice(bytes);
+                    let error = bridge.invoke(&mut env, len as jint).unwrap_err();
+                    assert!(error.contains(error_text), "{error}");
+                    require_rollback(&bridge);
+                }
+                println!("malformed input and invalid or oversized output rejected");
+            }
+            _ => panic!("unknown S3 fixture mode {mode}"),
+        }
+        assert_eq!(bridge.dispatch(&mut env, &[]).unwrap().len(), 0);
+        assert_eq!(
+            bridge
+                .dispatch(&mut env, &[request(BlockEntityTick, 7, 3)])
+                .unwrap()
+                .len(),
+            1
+        );
+        env.call_static_method("net/mcspine/neoforge/Bootstrap", "close", "()V", &[])
+            .unwrap();
+        let error = bridge.dispatch(&mut env, &[]).err().unwrap();
+        assert!(
+            error.contains("S3 dispatch requires the bootstrap owner"),
+            "{error}"
+        );
+        require_rollback(&bridge);
+    }
 
     #[test]
     fn s1_commit_rolls_back_cancellation_and_rechecks_each_cas() {

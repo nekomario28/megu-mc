@@ -47,6 +47,8 @@ public final class Bootstrap {
         if (jars.isEmpty()) {
             frozenRegistry = freezeRegistries();
             NeoForge.EVENT_BUS.start();
+            DirectBatchBridge.beginRegistration();
+            DirectBatchBridge.freezeRegistration();
             initialized = true;
             return net.mcspine.probe.Host.class;
         }
@@ -68,6 +70,7 @@ public final class Bootstrap {
             catch (java.net.MalformedURLException error) { throw new IllegalArgumentException(error); }
         }).toArray(URL[]::new), Bootstrap.class.getClassLoader());
         try {
+            DirectBatchBridge.beginRegistration();
             for (ShimCheck.VerifiedJar jar : discovery.jars()) {
                 for (String id : jar.modIds()) {
                     modBuses.put(id, BusBuilder.builder().startShutdown().build());
@@ -95,6 +98,7 @@ public final class Bootstrap {
             for (IEventBus bus : modBuses.values()) bus.start();
             frozenRegistry = freezeRegistries();
             NeoForge.EVENT_BUS.start();
+            DirectBatchBridge.freezeRegistration();
             initialized = true;
         } catch (Exception | Error error) {
             try { close(); }
@@ -169,6 +173,7 @@ public final class Bootstrap {
     public static synchronized void close() throws java.io.IOException {
         initialized = false;
         frozenRegistry = null;
+        DirectBatchBridge.clearRegistration();
         for (Class<?> subscriber : gameSubscribers) NeoForge.EVENT_BUS.unregister(subscriber);
         gameSubscribers.clear();
         for (Object mod : instances.values()) NeoForge.EVENT_BUS.unregister(mod);

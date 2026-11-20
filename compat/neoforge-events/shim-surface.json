@@ -2,6 +2,12 @@
   "schema": "mc-spine-neoforge-s0",
   "target": {"minecraft": "1.21.1", "neoforge": "21.1.172", "fml": "4.0.39", "bus": "8.0.2"},
   "classes": {
+    "net/mcspine/neoforge/DirectBatchBridge": {"methods": ["register(Lnet/mcspine/neoforge/DirectBatchBridge$Activation;ILnet/mcspine/neoforge/DirectBatchBridge$Callback;)V"], "fields": []},
+    "net/mcspine/neoforge/DirectBatchBridge$Activation": {"methods": [], "fields": ["ENTITY_TICK:Lnet/mcspine/neoforge/DirectBatchBridge$Activation;", "BLOCK_ENTITY_TICK:Lnet/mcspine/neoforge/DirectBatchBridge$Activation;", "CONTAINER:Lnet/mcspine/neoforge/DirectBatchBridge$Activation;", "SCHEDULED_BLOCK_TICK:Lnet/mcspine/neoforge/DirectBatchBridge$Activation;"]},
+    "net/mcspine/neoforge/DirectBatchBridge$Callback": {"methods": ["tick(Lnet/mcspine/neoforge/DirectBatchBridge$TickContext;)V"], "fields": []},
+    "net/mcspine/neoforge/DirectBatchBridge$TickContext": {"methods": ["activation()Lnet/mcspine/neoforge/DirectBatchBridge$Activation;", "x()I", "y()I", "z()I", "state()I", "entity()Lnet/mcspine/neoforge/DirectBatchBridge$EntityHandle;", "blockEntity()Lnet/mcspine/neoforge/DirectBatchBridge$BlockEntityHandle;", "redispatch()V", "setBlockIf(IIIII)V", "scheduleTick(IIIII)V", "containerSlotDelta(IIIIII)V", "sendSystemMessage(ILjava/lang/String;)V"], "fields": []},
+    "net/mcspine/neoforge/DirectBatchBridge$EntityHandle": {"methods": ["dim()I", "kind()I", "id()I", "generation()I"], "fields": []},
+    "net/mcspine/neoforge/DirectBatchBridge$BlockEntityHandle": {"methods": ["dim()I", "kind()I", "id()I", "generation()I"], "fields": []},
     "net/minecraft/core/Holder": {"methods": ["value()Ljava/lang/Object;", "isBound()Z", "unwrapKey()Ljava/util/Optional;"], "fields": []},
     "net/minecraft/core/Registry": {"methods": [], "fields": []},
     "net/minecraft/core/registries/Registries": {"methods": [], "fields": ["BLOCK:Lnet/minecraft/resources/ResourceKey;", "ITEM:Lnet/minecraft/resources/ResourceKey;"]},

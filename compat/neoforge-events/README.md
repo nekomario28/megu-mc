@@ -64,3 +64,34 @@ save compatibility require further integration and verification.
 `tests/neoforge_s2_registry_test.py` builds synthetic JARs against the pinned
 NeoForge API and tests both load orders, palette remapping after a mod addition,
 and rejection of invalid registrations.
+
+## NF-4 direct tick batches
+
+The Rust JVM owner binds a reusable, fixed-capacity request and response pair.
+Rust writes directly into the request, Java invokes all matching callbacks in
+one JNI dispatch, and Rust validates the entire response before yielding
+mutations. Messages borrow UTF-8 from the response, so hold the decoded
+iterator only until the caller is ready to reuse the buffers.
+
+S3 v1 uses little-endian frames. The header carries the `S3` magic, version,
+direction, record count and nonzero batch sequence. Each request supplies an
+activation kind, dimension, handle identity and cell snapshot. Every mutation
+identifies its source by request index and generation. The decoder checks both
+against the original request and requires an exact frame length. See the
+[codec](../../src/landing_types.rs) for field layouts. Tick delays are
+nonnegative game ticks and priorities use the signed range −3 through 3.
+Container mutations replace slot contents, with item ID and count both zero
+for an empty slot.
+
+Mods use `DirectBatchBridge.register` during bootstrap. Each callback receives
+a context scoped to its activation on that thread. Handles expire as soon as
+the activation returns, even if a later activation has the same identity.
+`redispatch` shares the enclosing response and allows up to four callback
+frames. Stale handles, excess depth or invalid output invalidate the entire
+response, even if a mod catches the exception. Rollback covers response
+mutations. A mod can still change its own Java state.
+
+The bridge exchanges snapshots and mutations. The server tick owner needs to
+supply activations and apply the validated operations to world state. The
+[S3 test suite](../../tests/neoforge_s3_batch_test.py) exercises the actual JNI
+entry point with a mod loaded through the NeoForge bootstrap.

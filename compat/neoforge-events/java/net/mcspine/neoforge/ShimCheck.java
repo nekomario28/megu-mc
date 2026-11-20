@@ -40,6 +40,14 @@ public final class ShimCheck {
         "Redirect", "Overwrite", "ModifyVariable", "ModifyArg", "ModifyConstant", "ModifyExpressionValue",
         "WrapOperation", "ModifyReturnValue", "WrapWithCondition");
     private static final String[] PREFIXES = {"net/minecraft/", "net/neoforged/", "com/mojang/brigadier/"};
+    private static final String S3_BRIDGE = "net/mcspine/neoforge/DirectBatchBridge";
+    private static final String LEGACY_HOST = "net/mcspine/probe/Host";
+
+    private static boolean auditedClass(String owner) {
+        for (String prefix : PREFIXES) if (owner.startsWith(prefix)) return true;
+        return owner.equals(S3_BRIDGE) || owner.startsWith(S3_BRIDGE + "$")
+            || owner.equals(LEGACY_HOST);
+    }
     private static final int MAX_CLASS_BYTES = 16 * 1024 * 1024;
     private static final int MAX_METADATA_BYTES = 1024 * 1024;
 
@@ -525,14 +533,13 @@ public final class ShimCheck {
                 descriptor(owner);
                 return;
             }
-            for (String prefix : PREFIXES) if (owner.startsWith(prefix)) { symbols.add(owner); return; }
-            ownReferences.add(owner);
+            if (auditedClass(owner)) symbols.add(owner);
+            else ownReferences.add(owner);
         }
         void member(String owner, String name, String desc, boolean method) {
             ref(owner);
-            for (String prefix : PREFIXES) if (owner.startsWith(prefix)) {
+            if (auditedClass(owner)) {
                 symbols.add(owner + "#" + name + (method ? desc : ":" + desc));
-                break;
             }
             descriptor(desc);
         }
@@ -703,9 +710,7 @@ public final class ShimCheck {
             if (!"mc-spine-neoforge-s0".equals(data.get("schema"))) throw new IOException("Unsupported surface schema");
             Map<String, Object> classes = Json.object(data.get("classes"));
             for (var entry : classes.entrySet()) {
-                if (!entry.getKey().startsWith("net/minecraft/")
-                    && !entry.getKey().startsWith("net/neoforged/")
-                    && !entry.getKey().startsWith("com/mojang/brigadier/")) {
+                if (!auditedClass(entry.getKey()) || entry.getKey().equals(LEGACY_HOST)) {
                     throw new IOException("Invalid surface class: " + entry.getKey());
                 }
                 Map<String, Object> members = Json.object(entry.getValue());

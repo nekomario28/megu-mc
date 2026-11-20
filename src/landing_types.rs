@@ -463,3 +463,318 @@ mod tests {
         }
     }
 }
+
+#[cfg(any(test, feature = "neoforge-events"))]
+pub(crate) const S3_CAPACITY: usize = 256 * 1024;
+#[cfg(any(test, feature = "neoforge-events"))]
+const S3_MAX_RECORDS: usize = 4096;
+#[cfg(any(test, feature = "neoforge-events"))]
+const S3_MAX_MESSAGE: usize = 4096;
+#[cfg(any(test, feature = "neoforge-events"))]
+const S3_HEADER_SIZE: usize = 16;
+#[cfg(any(test, feature = "neoforge-events"))]
+const S3_REQUEST_SIZE: usize = 28;
+#[cfg(any(test, feature = "neoforge-events"))]
+const S3_REQUEST_HEADER: [u8; 4] = [b'S', b'3', 1, 0];
+#[cfg(any(test, feature = "neoforge-events"))]
+const S3_RESPONSE_HEADER: [u8; 4] = [b'S', b'3', 1, 1];
+
+// The production world owner supplies activations when it adopts the S3 adapter.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum S3Activation {
+    EntityTick = 0,
+    BlockEntityTick = 1,
+    Container = 2,
+    ScheduledBlockTick = 3,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct S3TickRequest {
+    pub(crate) activation: S3Activation,
+    pub(crate) dim: u8,
+    pub(crate) kind: u16,
+    pub(crate) id: i32,
+    pub(crate) generation: u32,
+    pub(crate) pos: (i32, i32, i32),
+    pub(crate) state: u32,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum S3BatchOp<'wire> {
+    SetBlockIf {
+        dim: u8,
+        pos: (i32, i32, i32),
+        new_state: u32,
+        expected_state: u32,
+    },
+    ScheduleTick {
+        dim: u8,
+        pos: (i32, i32, i32),
+        delay: i32,
+        priority: i8,
+    },
+    ContainerSlotDelta {
+        dim: u8,
+        pos: (i32, i32, i32),
+        slot: u16,
+        item_id: u32,
+        count: u8,
+    },
+    SendSystemMessage {
+        player_eid: i32,
+        message: &'wire str,
+    },
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+pub(crate) fn encode_s3_request_batch(
+    out: &mut [u8],
+    sequence: u64,
+    requests: &[S3TickRequest],
+) -> Result<usize, &'static str> {
+    if requests.len() > S3_MAX_RECORDS || out.len() > S3_CAPACITY {
+        return Err("S3 request exceeds capacity");
+    }
+    let len = S3_HEADER_SIZE + requests.len() * S3_REQUEST_SIZE;
+    if out.len() < len {
+        return Err("S3 request buffer too small");
+    }
+    if sequence == 0 || requests.iter().any(|r| r.dim > 2 || r.generation == 0) {
+        return Err("invalid S3 request identity");
+    }
+    out[..4].copy_from_slice(&S3_REQUEST_HEADER);
+    out[4..8].copy_from_slice(&(requests.len() as u32).to_le_bytes());
+    out[8..16].copy_from_slice(&sequence.to_le_bytes());
+    for (out, request) in out[S3_HEADER_SIZE..len]
+        .chunks_exact_mut(S3_REQUEST_SIZE)
+        .zip(requests)
+    {
+        out[0] = request.activation as u8;
+        out[1] = request.dim;
+        out[2..4].copy_from_slice(&request.kind.to_le_bytes());
+        out[4..8].copy_from_slice(&request.id.to_le_bytes());
+        out[8..12].copy_from_slice(&request.generation.to_le_bytes());
+        out[12..16].copy_from_slice(&request.pos.0.to_le_bytes());
+        out[16..20].copy_from_slice(&request.pos.1.to_le_bytes());
+        out[20..24].copy_from_slice(&request.pos.2.to_le_bytes());
+        out[24..28].copy_from_slice(&request.state.to_le_bytes());
+    }
+    Ok(len)
+}
+
+/// Validate every mutation before exposing any of them. Iteration reads the
+/// original immutable bytes again, so no mutation array or string is allocated.
+#[cfg(any(test, feature = "neoforge-events"))]
+pub(crate) fn decode_s3_response_batch<'wire>(
+    wire: &'wire [u8],
+    sequence: u64,
+    requests: &[S3TickRequest],
+) -> Result<impl ExactSizeIterator<Item = S3BatchOp<'wire>> + 'wire, &'static str> {
+    if wire.len() > S3_CAPACITY || requests.len() > S3_MAX_RECORDS {
+        return Err("S3 response exceeds capacity");
+    }
+    let mut reader = S3Reader(wire);
+    if reader.take::<4>()? != S3_RESPONSE_HEADER {
+        return Err("invalid S3 response header");
+    }
+    let count = reader.u32()? as usize;
+    if count > S3_MAX_RECORDS {
+        return Err("S3 response record limit exceeded");
+    }
+    if sequence == 0 || u64::from_le_bytes(reader.take()?) != sequence {
+        return Err("S3 response sequence mismatch");
+    }
+    let mut records = reader;
+    for _ in 0..count {
+        let (source, generation, op) = reader.record()?;
+        let request = requests.get(source).ok_or("unknown S3 mutation source")?;
+        if generation == 0 || generation != request.generation {
+            return Err("S3 mutation generation mismatch");
+        }
+        let dim = match op {
+            S3BatchOp::SetBlockIf { dim, .. }
+            | S3BatchOp::ScheduleTick { dim, .. }
+            | S3BatchOp::ContainerSlotDelta { dim, .. } => dim,
+            S3BatchOp::SendSystemMessage { .. } => request.dim,
+        };
+        if dim != request.dim || dim > 2 {
+            return Err("invalid S3 mutation dimension");
+        }
+    }
+    if !reader.0.is_empty() {
+        return Err("trailing bytes in S3 response");
+    }
+    Ok((0..count).map(move |_| records.record().expect("validated S3 response").2))
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[derive(Clone, Copy)]
+struct S3Reader<'wire>(&'wire [u8]);
+
+#[cfg(any(test, feature = "neoforge-events"))]
+impl<'wire> S3Reader<'wire> {
+    fn bytes(&mut self, len: usize) -> Result<&'wire [u8], &'static str> {
+        let (field, rest) = self
+            .0
+            .split_at_checked(len)
+            .ok_or("truncated S3 response")?;
+        self.0 = rest;
+        Ok(field)
+    }
+
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
+        Ok(self.bytes(N)?.try_into().expect("exact field length"))
+    }
+
+    fn u8(&mut self) -> Result<u8, &'static str> {
+        Ok(self.take::<1>()?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, &'static str> {
+        Ok(u32::from_le_bytes(self.take()?))
+    }
+
+    fn i32(&mut self) -> Result<i32, &'static str> {
+        Ok(i32::from_le_bytes(self.take()?))
+    }
+
+    fn pos(&mut self) -> Result<(i32, i32, i32), &'static str> {
+        Ok((self.i32()?, self.i32()?, self.i32()?))
+    }
+
+    fn record(&mut self) -> Result<(usize, u32, S3BatchOp<'wire>), &'static str> {
+        let tag = self.u8()?;
+        let source = self.u32()? as usize;
+        let generation = self.u32()?;
+        let op = match tag {
+            1 => S3BatchOp::SetBlockIf {
+                dim: self.u8()?,
+                pos: self.pos()?,
+                new_state: self.u32()?,
+                expected_state: self.u32()?,
+            },
+            2 => {
+                let dim = self.u8()?;
+                let pos = self.pos()?;
+                let delay = self.i32()?;
+                let priority = self.u8()? as i8;
+                if delay < 0 || !(-3..=3).contains(&priority) {
+                    return Err("invalid S3 tick delay or priority");
+                }
+                S3BatchOp::ScheduleTick {
+                    dim,
+                    pos,
+                    delay,
+                    priority,
+                }
+            }
+            3 => {
+                let dim = self.u8()?;
+                let pos = self.pos()?;
+                let slot = u16::from_le_bytes(self.take()?);
+                let item_id = self.u32()?;
+                let count = self.u8()?;
+                if count > 99 || (item_id == 0) != (count == 0) {
+                    return Err("invalid S3 container stack");
+                }
+                S3BatchOp::ContainerSlotDelta {
+                    dim,
+                    pos,
+                    slot,
+                    item_id,
+                    count,
+                }
+            }
+            4 => {
+                let player_eid = self.i32()?;
+                let len = u16::from_le_bytes(self.take()?) as usize;
+                if len > S3_MAX_MESSAGE {
+                    return Err("S3 message exceeds capacity");
+                }
+                let message = std::str::from_utf8(self.bytes(len)?)
+                    .map_err(|_| "invalid S3 message UTF-8")?;
+                S3BatchOp::SendSystemMessage {
+                    player_eid,
+                    message,
+                }
+            }
+            _ => return Err("unknown S3 mutation opcode"),
+        };
+        Ok((source, generation, op))
+    }
+}
+
+#[cfg(test)]
+mod s3_tests {
+    use super::*;
+
+    const REQUEST: S3TickRequest = S3TickRequest {
+        activation: S3Activation::BlockEntityTick,
+        dim: 2,
+        kind: 0x1234,
+        id: -2,
+        generation: 0x8000_0003,
+        pos: (1, 2, -3),
+        state: 0xffff_ffff,
+    };
+
+    #[test]
+    fn s3_request_encoding_is_little_endian_and_bounded() {
+        let mut out = [0u8; S3_HEADER_SIZE + S3_REQUEST_SIZE];
+        assert_eq!(encode_s3_request_batch(&mut out, 3, &[REQUEST]), Ok(44));
+        assert_eq!(
+            out,
+            *b"S3\x01\x00\x01\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\
+              \x01\x02\x34\x12\xfe\xff\xff\xff\x03\x00\x00\x80\x01\x00\x00\x00\
+              \x02\x00\x00\x00\xfd\xff\xff\xff\xff\xff\xff\xff"
+        );
+        assert!(encode_s3_request_batch(&mut out[..43], 3, &[REQUEST]).is_err());
+        assert!(encode_s3_request_batch(&mut out, 0, &[]).is_err());
+        assert!(
+            encode_s3_request_batch(&mut out, 3, &[S3TickRequest { dim: 3, ..REQUEST }]).is_err()
+        );
+        assert!(encode_s3_request_batch(
+            &mut out,
+            3,
+            &[S3TickRequest {
+                generation: 0,
+                ..REQUEST
+            }]
+        )
+        .is_err());
+        assert!(encode_s3_request_batch(&mut out, 3, &[REQUEST; S3_MAX_RECORDS + 1]).is_err());
+    }
+
+    #[test]
+    fn s3_decoder_borrows_utf8_and_rejects_a_trailing_partial_record() {
+        let mut wire = Vec::from(S3_RESPONSE_HEADER);
+        wire.extend(1u32.to_le_bytes());
+        wire.extend(3u64.to_le_bytes());
+        wire.push(4);
+        wire.extend(0u32.to_le_bytes());
+        wire.extend(REQUEST.generation.to_le_bytes());
+        wire.extend(REQUEST.id.to_le_bytes());
+        let text = "梱包 📦";
+        wire.extend((text.len() as u16).to_le_bytes());
+        wire.extend(text.as_bytes());
+        let mut ops = decode_s3_response_batch(&wire, 3, &[REQUEST]).unwrap();
+        let Some(S3BatchOp::SendSystemMessage {
+            player_eid,
+            message,
+        }) = ops.next()
+        else {
+            panic!("expected message");
+        };
+        assert_eq!((player_eid, message), (REQUEST.id, text));
+        assert_eq!(message.as_ptr(), wire[31..].as_ptr());
+        drop(ops);
+        wire[4] = 2;
+        wire.push(4);
+        assert!(decode_s3_response_batch(&wire, 3, &[REQUEST]).is_err());
+    }
+}
