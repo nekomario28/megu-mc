@@ -7,6 +7,10 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
+import tomllib
+
+from wire_smoke import status
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,6 +101,7 @@ with socket.socket() as listener:
 
     def java(self, *args, extra_env=None):
         return self.invocation("java", "-Djava.io.tmpdir=" + tempfile.gettempdir(),
+                               "-XX:-UsePerfData",
                                "-jar", str(self.jar_dir / "mc-spine-bootstrapper.jar"),
                                *args, extra_env=extra_env)
 
@@ -236,7 +241,7 @@ with socket.socket() as listener:
         env = dict(os.environ, **env, MC_SPINE_CLIENT_BIN=str(self.stub),
                    TEST_NATIVE_LOG=str(client_log), TEST_NATIVE_SLEEP="30", MC_SPINE_DETACH="0")
         env.pop("MC_SPINE_HANDOFF_MANIFEST", None)
-        command = ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-jar",
+        command = ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData", "-jar",
                    str(self.jar_dir / "mc-spine-bootstrapper.jar"),
                    "--mc-spine-integrated", "--gameDir", str(game)]
         with subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL,
@@ -276,6 +281,286 @@ with socket.socket() as listener:
                                       extra_env={"TEST_NATIVE_EXIT": "9"})
         self.assertEqual(result.returncode, 9, result.stderr)
         self.assertEqual(json.loads(log.read_text()), ["--username", "Alex"])
+
+
+class IntegratedModTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-integrated-test-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.root = Path(cls.temporary.name)
+        cls.output = cls.root / "build-a"
+        cls.jar = cls.output / "mc-spine-integrated.jar"
+        for folder in (cls.output, cls.root / "build-b"):
+            subprocess.run([sys.executable, str(TOOLS / "build_integrated_mod.py"),
+                            "--out-dir", str(folder)], check=True, capture_output=True)
+        cls.mock = cls.root / "mock-mc-spine"
+        cls.mock.write_text('''#!/usr/bin/env python3
+import json
+import os
+import signal
+import socket
+import sys
+from pathlib import Path
+
+def vint(sock):
+    value = 0
+    for shift in range(0, 35, 7):
+        byte = sock.recv(1)
+        if not byte:
+            raise EOFError()
+        value |= (byte[0] & 127) << shift
+        if byte[0] < 128:
+            return value
+    raise ValueError('oversized VarInt')
+
+def encode(value):
+    out = bytearray()
+    while True:
+        b = value & 127
+        value >>= 7
+        out.append(b | (128 if value else 0))
+        if not value:
+            return out
+
+def read(sock, length):
+    data = bytearray()
+    while len(data) < length:
+        part = sock.recv(length - len(data))
+        if not part:
+            raise EOFError()
+        data.extend(part)
+    return data
+
+def stop(*_):
+    Path('stopped').write_text(str(os.getpid()))
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+host = os.environ['MC_SPINE_BIND_ADDR']
+port = int(os.environ['MC_SPINE_PORT'])
+with socket.socket() as listener:
+    listener.bind((host, port))
+    listener.listen()
+    Path('server.json').write_text(json.dumps({
+        'pid': os.getpid(), 'host': host, 'port': port,
+        'cwd': os.getcwd(), 'world': os.environ['MC_SPINE_WORLD_DIR'],
+        'seed': os.environ['MC_SPINE_SEED'],
+        'rcon': os.getenv('MC_SPINE_RCON_PORT'),
+        'public': os.getenv('MC_SPINE_ALLOW_PUBLIC_BIND'),
+    }))
+    while True:
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(2)
+            if os.getenv('MOCK_NO_PROTOCOL'):
+                continue
+            try:
+                length = vint(conn)
+                packet = read(conn, length)
+                # First byte is handshake packet id 0, next two bytes encode 767.
+                if packet[:3] != b'\\x00\\xff\\x05':
+                    continue
+                if vint(conn) != 1 or read(conn, 1) != b'\\x00':
+                    continue
+                description = b'{"version":{"name":"1.21.1","protocol":767},"description":{"text":"mc-spine"}}'
+                body = encode(0) + encode(len(description)) + description
+                conn.sendall(encode(len(body)) + body)
+            except (OSError, EOFError, ValueError):
+                pass
+''')
+        cls.mock.chmod(0o755)
+        harness = cls.root / "ConfiguredBridgeHarness.java"
+        harness.write_text('''import net.mcspine.integrated.IntegratedServerBridge;
+public final class ConfiguredBridgeHarness {
+    public static void main(String[] args) throws Exception {
+        IntegratedServerBridge.startConfigured();
+        IntegratedServerBridge.startConfigured();
+        Thread.sleep(300);
+        IntegratedServerBridge.closeConfigured();
+    }
+}
+''')
+        subprocess.run(["javac", "-J-Djava.io.tmpdir=" + tempfile.gettempdir(),
+                        "-J-XX:-UsePerfData", "--release", "21", "-cp", str(cls.jar),
+                        "-d", str(cls.root), str(harness)], check=True, capture_output=True)
+
+    def command(self, binary, game, world="E2-4 world", seed="4242", *extra, jar_entry=False):
+        entry = (["-jar", str(self.jar)] if jar_entry else
+                 ["-cp", str(self.jar), "net.mcspine.integrated.IntegratedServerBridge"])
+        return ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+                *entry,
+                "--server-bin", str(binary), "--game-dir", str(game),
+                "--world", world, "--seed", seed, *extra]
+
+    def start(self, binary, game, world="E2-4 world", seed="4242", env=None, jar_entry=False):
+        from selectors import DefaultSelector, EVENT_READ
+
+        command = self.command(binary, game, world, seed, jar_entry=jar_entry)
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, env=env)
+        with DefaultSelector() as poller:
+            poller.register(process.stdout, EVENT_READ)
+            try:
+                self.assertTrue(poller.select(35), "Java bridge readiness timed out")
+                ready = process.stdout.readline().strip()
+                self.assertTrue(ready.startswith("READY 127.0.0.1:"), ready)
+                endpoint, pid = ready.split()[1:]
+                port = int(endpoint.rsplit(":", 1)[1])
+                server_pid = int(pid.removeprefix("pid="))
+                status(port)
+                return process, port, server_pid
+            except BaseException:
+                process.kill()
+                process.communicate(timeout=10)
+                raise
+
+    def assert_dead(self, pid):
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail(f"mc-spine server pid {pid} survived Java shutdown")
+
+    def test_manifest_both_loaders_and_reproducible(self):
+        self.assertEqual(self.jar.read_bytes(),
+                         (self.root / "build-b/mc-spine-integrated.jar").read_bytes())
+        with zipfile.ZipFile(self.jar) as archive:
+            entries = set(archive.namelist())
+            fabric = json.loads(archive.read("fabric.mod.json"))
+            neoforge = tomllib.loads(archive.read("META-INF/neoforge.mods.toml").decode())
+            self.assertEqual(fabric["id"], "mc_spine_integrated")
+            self.assertEqual(fabric["depends"]["minecraft"], "1.21.1")
+            self.assertEqual(fabric["depends"]["java"], ">=21")
+            self.assertEqual(fabric["environment"], "client")
+            self.assertEqual(fabric["entrypoints"]["client"],
+                             ["net.mcspine.integrated.FabricIntegratedMod"])
+            self.assertEqual(neoforge["modLoader"], "javafml")
+            self.assertEqual(neoforge["mods"][0]["modId"], "mc_spine_integrated")
+            self.assertEqual(neoforge["dependencies"]["mc_spine_integrated"][0]["modId"],
+                             "minecraft")
+            self.assertIn("net/mcspine/integrated/IntegratedServerBridge.class", entries)
+            self.assertIn("net/mcspine/integrated/FabricIntegratedMod.class", entries)
+            self.assertIn("net/mcspine/integrated/NeoForgeIntegratedMod.class", entries)
+            self.assertFalse(any(name.startswith("net/fabricmc/") or
+                                 name.startswith("net/neoforged/") for name in entries))
+
+    def test_mock_protocol_seed_world_and_explicit_close(self):
+        game = self.root / "mock-game"
+        game.mkdir(exist_ok=True)
+        env = dict(os.environ, MC_SPINE_RCON_PORT="25575", MC_SPINE_ALLOW_PUBLIC_BIND="1")
+        process, port, pid = self.start(self.mock, game, env=env)
+        world = game / "saves/E2-4 world"
+        try:
+            info = json.loads((world / "server.json").read_text())
+            self.assertEqual((info["host"], info["port"], info["pid"]),
+                             ("127.0.0.1", port, pid))
+            self.assertEqual(info["seed"], "4242")
+            self.assertEqual(info["world"], str(world))
+            self.assertEqual(info["cwd"], str(world))
+            self.assertIsNone(info["rcon"])
+            self.assertIsNone(info["public"])
+            process.stdin.write("close\n")
+            process.stdin.flush()
+            _, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual((world / "stopped").read_text(), str(pid))
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=10)
+        self.assert_dead(pid)
+
+    def test_configured_mod_lifecycle_starts_once_and_closes(self):
+        game = self.root / "configured-game"
+        game.mkdir(exist_ok=True)
+        command = ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+                   "-Dmc.spine.integrated.enabled=true",
+                   "-Dmc.spine.integrated.serverBin=" + str(self.mock),
+                   "-Dmc.spine.integrated.gameDir=" + str(game),
+                   "-Dmc.spine.integrated.world=Configured world",
+                   "-Dmc.spine.integrated.seed=123",
+                   "-cp", os.pathsep.join([str(self.jar), str(self.root)]),
+                   "ConfiguredBridgeHarness"]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        world = game / "saves/Configured world"
+        info = json.loads((world / "server.json").read_text())
+        self.assertEqual(info["seed"], "123")
+        self.assertEqual((world / "stopped").read_text(), str(info["pid"]))
+        self.assert_dead(info["pid"])
+
+    def test_shutdown_hook_and_world_lock(self):
+        game = self.root / "lock-game"
+        game.mkdir(exist_ok=True)
+        process, _, pid = self.start(self.mock, game)
+        try:
+            duplicate = subprocess.run(self.command(self.mock, game, "E2-4 world"),
+                                       capture_output=True, text=True, timeout=10)
+            self.assertEqual(duplicate.returncode, 2)
+            self.assertIn("already in use", duplicate.stderr)
+            process.terminate()
+            process.communicate(timeout=12)
+            self.assertEqual(process.returncode, 143)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+        self.assert_dead(pid)
+        self.assertEqual((game / "saves/E2-4 world/stopped").read_text(), str(pid))
+
+    def test_rejects_unsafe_options_and_non_protocol_server(self):
+        game = self.root / "invalid-game"
+        game.mkdir(exist_ok=True)
+        cases = (
+            (self.root / "missing", "E2-4 world", "4242", (), "not executable"),
+            (self.mock, "../escape", "4242", (), "safe single directory"),
+            (self.mock, "E2-4 world", "x", (), "seed must"),
+            (self.mock, "E2-4 world", "4242", ("--bind", "0.0.0.0"), "only 127.0.0.1"),
+            (self.mock, "E2-4 world", "4242", ("--port", "25565"), "ephemeral"),
+        )
+        for binary, world, seed, extra, reason in cases:
+            with self.subTest(reason=reason):
+                result = subprocess.run(self.command(binary, game, world, seed, *extra),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(reason, result.stderr)
+        env = dict(os.environ, MOCK_NO_PROTOCOL="1")
+        result = subprocess.run(self.command(self.mock, game, "timeout-world", "1",
+                                             "--timeout-ms", "700"),
+                                capture_output=True, text=True, timeout=10, env=env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("protocol 767 startup timeout", result.stderr)
+        world = game / "saves/timeout-world"
+        info = json.loads((world / "server.json").read_text())
+        self.assert_dead(info["pid"])
+        self.assertEqual((world / "stopped").read_text(), str(info["pid"]))
+
+    def test_real_protocol_767_and_clean_shutdown(self):
+        binary = ROOT / "target/debug/mc-spine"
+        if not binary.is_file():
+            self.skipTest("build target/debug/mc-spine to run the real binary integration test")
+        game = self.root / "real-game"
+        game.mkdir(exist_ok=True)
+        env = dict(os.environ, MC_SPINE_SERVER_HOME=str(ROOT))
+        process, port, pid = self.start(binary, game, env=env, jar_entry=True)
+        world = game / "saves/E2-4 world"
+        try:
+            self.assertGreater(port, 0)
+            self.assertTrue((world / "assets").is_symlink())
+            self.assertTrue((world / "config_packets.bin").is_symlink())
+            process.stdin.close()
+            process.stdin = None
+            _, stderr = process.communicate(timeout=12)
+            self.assertEqual(process.returncode, 0, stderr)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=10)
+        self.assert_dead(pid)
 
 
 if __name__ == "__main__":
