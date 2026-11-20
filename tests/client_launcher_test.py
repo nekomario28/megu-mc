@@ -786,7 +786,9 @@ public final class ConfiguredBridgeHarness {
 class DirectFrameBridgeTest(unittest.TestCase):
     """CF-3b: direct ByteBuffer MCSI v1 framing, fail-closed rules and relay."""
 
-    HARNESS = r'''import java.io.DataInputStream;
+    HARNESS = r'''import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
@@ -1009,11 +1011,59 @@ public final class DirectFrameHarness {
         }
     }
 
+    private static void outboundCrc() throws Exception {
+        byte[] payload = {1, 2, 3, 4, 5};
+        ByteBuffer request = direct(64 + payload.length);
+        IntegratedServerBridge.writeDirectFrame(request,
+                IntegratedServerBridge.KIND_PROTOCOL767_PACKET, payload);
+        int position = request.position();
+        int limit = request.limit();
+        ByteBuffer wireView = view(request);
+        wireView.flip();
+        byte[] expectedWire = new byte[position];
+        wireView.get(expectedWire);
+
+        ByteBuffer corrupt = direct(request.capacity());
+        corrupt.put(expectedWire);
+        corrupt.put(IntegratedServerBridge.DIRECT_FRAME_HEADER_SIZE, (byte) (payload[0] ^ 0x5a));
+        ByteArrayOutputStream corruptSink = new ByteArrayOutputStream();
+        expectIae(() -> IntegratedServerBridge.exchangeFrameOverLoopback(corrupt,
+                new ByteArrayInputStream(new byte[0]), corruptSink, direct(64)),
+                "CRC-32");
+        check(corruptSink.size() == 0, "corrupt outbound CRC wrote no bytes");
+        check(corrupt.position() == position, "corrupt request position preserved");
+        check(corrupt.limit() == limit, "corrupt request limit preserved");
+
+        ByteArrayOutputStream shortSink = new ByteArrayOutputStream();
+        expectIae(() -> IntegratedServerBridge.exchangeFrameOverLoopback(view(request),
+                new ByteArrayInputStream(new byte[0]), shortSink, direct(8)),
+                "responseBuf");
+        check(shortSink.size() == 0, "short response buffer wrote no bytes");
+
+        byte[] reply = sectionPayload(256);
+        ByteBuffer replyFrame = direct(64 + reply.length);
+        IntegratedServerBridge.writeDirectFrame(replyFrame,
+                IntegratedServerBridge.KIND_TICK_HEARTBEAT, reply);
+        replyFrame.flip();
+        byte[] replyWire = new byte[replyFrame.remaining()];
+        replyFrame.get(replyWire);
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        ByteBuffer responseTarget = direct(64 + reply.length);
+        DirectFrame decoded = IntegratedServerBridge.exchangeFrameOverLoopback(
+                view(request), new ByteArrayInputStream(replyWire), sink, responseTarget);
+        check(Arrays.equals(sink.toByteArray(), expectedWire), "valid outbound bytes written");
+        check(decoded.kind() == IntegratedServerBridge.KIND_TICK_HEARTBEAT,
+                "in-memory response kind");
+        check(Arrays.equals(decoded.payload(), reply), "in-memory response payload");
+        check(responseTarget.position() == 0, "in-memory response position reset");
+    }
+
     public static void main(String[] args) throws Exception {
         switch (args[0]) {
             case "roundtrip" -> roundtrip();
             case "failclosed" -> failClosed();
             case "loopback" -> loopback();
+            case "outboundcrc" -> outboundCrc();
             default -> throw new IllegalArgumentException("unknown mode " + args[0]);
         }
         System.out.println(args[0].toUpperCase() + "_OK checks=" + checks);
@@ -1059,6 +1109,11 @@ public final class DirectFrameHarness {
         result = self.run_harness("loopback")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "LOOPBACK_OK checks=9")
+
+    def test_outbound_crc_rejected_before_write(self):
+        result = self.run_harness("outboundcrc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "OUTBOUNDCRC_OK checks=10")
 
     def test_integrated_jar_rebuild_is_byte_identical(self):
         first = self.jar

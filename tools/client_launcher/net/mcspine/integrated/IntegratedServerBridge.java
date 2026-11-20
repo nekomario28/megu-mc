@@ -464,14 +464,27 @@ public final class IntegratedServerBridge implements AutoCloseable {
         if (requestSize != DIRECT_FRAME_HEADER_SIZE + requestPayload) {
             throw new IllegalArgumentException("requestBuf frame size does not match its header");
         }
+        // Fail closed before the outbound write: a corrupt request must never
+        // reach the wire. Reuse the decode CRC comparison over a read-only
+        // payload view so no heap payload array is allocated and the caller's
+        // position/limit stay untouched.
+        long requestCrc = Integer.toUnsignedLong(request.getInt(12));
+        ByteBuffer requestPayloadView = request.asReadOnlyBuffer();
+        requestPayloadView.order(ByteOrder.LITTLE_ENDIAN);
+        requestPayloadView.position(DIRECT_FRAME_HEADER_SIZE);
+        CRC32 crc = new CRC32();
+        crc.update(requestPayloadView);
+        if (crc.getValue() != requestCrc) {
+            throw new IllegalArgumentException("MCSI frame CRC-32 mismatch");
+        }
+        if (responseBuf.capacity() < DIRECT_FRAME_HEADER_SIZE) {
+            throw new IllegalArgumentException("responseBuf cannot hold an MCSI frame header");
+        }
 
         writeFully(Channels.newChannel(out), request);
         out.flush();
 
         responseBuf.clear();
-        if (responseBuf.capacity() < DIRECT_FRAME_HEADER_SIZE) {
-            throw new IllegalArgumentException("responseBuf cannot hold an MCSI frame header");
-        }
         ReadableByteChannel source = Channels.newChannel(in);
         readFully(source, responseBuf, DIRECT_FRAME_HEADER_SIZE);
         int responsePayload = parseAndValidateHeader(responseBuf, 0);
