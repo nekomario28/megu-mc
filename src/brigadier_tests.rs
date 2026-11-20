@@ -2339,3 +2339,246 @@ fn execute_parser_rejects_unknown_subcommands_and_malformed_arguments() {
         );
     }
 }
+
+fn execute_console(command: &str) -> String {
+    let source = crate::CmdCtx {
+        me: None,
+        x: 0.5,
+        y: 80.0,
+        z: 0.5,
+    };
+    crate::run_command_ctx(&source, command, &mut None)
+}
+
+#[test]
+fn execute_pipeline_forks_and_carries_each_entity_position_and_rotation() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let mut peers = Vec::new();
+    for (index, (name, x, yaw)) in [("ExecuteA", 10.5, 0.0), ("ExecuteB", 20.5, 90.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let (mut player, peer) = crate::effect_tests::client_pair();
+        player.name = name.into();
+        player.eid += index as i32;
+        *player.pos.lock().unwrap() = (x, 80.0, 30.5, yaw, 0.0, true);
+        crate::clients()
+            .lock()
+            .unwrap()
+            .push(std::sync::Arc::new(player));
+        peers.push(peer);
+    }
+
+    assert_eq!(
+        execute_console("/execute as @a at @s anchored eyes if entity @s[distance=..0.1] run setblock ^ ^ ^2 glass"),
+        "executed 2 command(s)"
+    );
+    assert_eq!(
+        execute_console("/execute if entity @a"),
+        "Test passed, count: 2"
+    );
+    let glass = crate::name_to_state("glass").unwrap();
+    assert_eq!(crate::block_at(10, 81, 32), glass);
+    assert_eq!(crate::block_at(18, 81, 30), glass);
+    assert_eq!(
+        execute_console("/execute positioned -0.1 80 0.5 align x rotated as ExecuteB positioned ^ ^ ^2 if entity @a unless entity Missing run setblock ~ ~ ~ stone"),
+        "executed 1 command(s)"
+    );
+    assert_eq!(crate::block_at(-3, 80, 0), 1);
+
+    assert_eq!(
+        execute_console(
+            "/execute positioned as ExecuteA facing entity ExecuteB feet run setblock ^ ^ ^2 stone"
+        ),
+        "executed 1 command(s)"
+    );
+    assert_eq!(crate::block_at(12, 80, 30), 1);
+    assert_eq!(
+        execute_console("/execute as @e[type=pig] run setblock 40 80 40 stone"),
+        "executed 0 command(s)"
+    );
+    assert_eq!(crate::block_at(40, 80, 40), 0);
+
+    execute_console("/scoreboard objectives add exec dummy");
+    execute_console("/scoreboard players set ExecuteA exec 4");
+    execute_console("/scoreboard players set ExecuteB exec 7");
+    assert_eq!(
+        execute_console("/execute store result score Last exec run execute as @a run scoreboard players get @s exec"),
+        "executed 2 command(s)"
+    );
+    assert_eq!(
+        crate::scoreboard().lock().unwrap().get("Last", "exec"),
+        Some(7)
+    );
+
+    crate::pearls().lock().unwrap().push(crate::Pearl {
+        eid: 9000,
+        owner: 4242,
+        x: 0.5,
+        y: 80.0,
+        z: 0.5,
+        dx: 0.0,
+        dy: 0.0,
+        dz: 0.0,
+        ttl: 1,
+    });
+    assert_eq!(
+        execute_console("/execute as @e[type=ender_pearl] on origin if entity @s[name=ExecuteA]"),
+        "Test passed"
+    );
+    assert_eq!(
+        execute_console("/execute as ExecuteA on vehicle run say skipped"),
+        "executed 0 command(s)"
+    );
+}
+
+#[test]
+fn execute_pipeline_runs_in_selected_dimension_and_evaluates_world_conditions() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let dim = crate::DimId::Nether;
+    assert_eq!(
+        execute_console("/execute positioned 64 80 -64 in the_nether if dimension the_nether run setblock ~ ~ ~ stone"),
+        "executed 1 command(s)"
+    );
+    assert_eq!(crate::block_at_dim(dim, 8, 80, -8), 1);
+    assert_eq!(crate::block_at(8, 80, -8), 0);
+    assert_eq!(
+        execute_console("/execute in the_nether if block 8 80 -8 stone"),
+        "Test passed"
+    );
+    assert_eq!(
+        execute_console(
+            "/execute positioned 12 80 12 rotated 180 0 facing 12 81 12 run setblock ^ ^ ^3 stone"
+        ),
+        "executed 1 command(s)"
+    );
+    assert_eq!(crate::block_at(12, 83, 12), 1);
+    crate::forceloaded().lock().unwrap().insert((2, 2));
+    assert_eq!(
+        execute_console("/execute positioned 32.5 90 32.5 if loaded ~ ~ ~ if biome ~ ~ ~ plains run setblock ~ ~ ~ stone"),
+        "executed 1 command(s)"
+    );
+    assert_eq!(
+        execute_console("/execute positioned 32.5 0 32.5 positioned over world_surface if block ~ ~-1 ~ stone if blocks 32 90 32 32 90 32 ~ ~-1 ~ all"),
+        "Test passed"
+    );
+    crate::predicates().lock().unwrap().insert(
+        "test:always".into(),
+        r#"{"condition":"minecraft:time_check","period":1,"value":0}"#.into(),
+    );
+    assert_eq!(
+        execute_console("/execute if predicate test:always unless loaded 10000 80 10000"),
+        "Test passed"
+    );
+}
+
+#[test]
+fn execute_pipeline_runs_nested_commands_and_stores_result_and_success_separately() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    execute_console("/scoreboard objectives add exec dummy");
+    execute_console("/scoreboard players set initial exec 6");
+    execute_console("/bossbar add test:execute Result");
+
+    assert_eq!(
+        execute_console("/execute if score initial exec matches 1..10 store result score result exec store success score success exec store result bossbar test:execute value store result storage test:execute results.scaled double 0.5 run scoreboard players add initial exec 2"),
+        "Stored 8 in exec for result"
+    );
+    assert_eq!(
+        execute_console("/bossbar get test:execute value"),
+        "Bossbar test:execute value is 8"
+    );
+    assert_eq!(
+        execute_console("/execute if score initial exec = result exec if score success exec matches 1 if data storage test:execute results{scaled:4.0d}"),
+        "Test passed"
+    );
+    assert_eq!(
+        execute_console("/execute store result score nested exec run execute if score initial exec > success exec"),
+        "Stored 1 in exec for nested"
+    );
+    assert_eq!(
+        execute_console("/execute store success score failure exec run execute unless score initial exec matches 8"),
+        "Test failed"
+    );
+    assert_eq!(
+        execute_console(
+            "/execute store success score zero exec run scoreboard players get failure exec"
+        ),
+        "executed 1 command(s)"
+    );
+    assert_eq!(
+        execute_console("/execute if score failure exec matches 0 if score zero exec matches 1"),
+        "Test passed"
+    );
+    assert_eq!(
+        execute_console("/execute store success score unknown exec run missing_command"),
+        "Unknown command: missing_command"
+    );
+    assert_eq!(
+        crate::scoreboard().lock().unwrap().get("unknown", "exec"),
+        Some(0)
+    );
+    assert_eq!(
+        execute_console("/execute store success score untouched exec unless score initial exec matches 8 run say skipped"),
+        "Test failed"
+    );
+    assert_eq!(
+        crate::scoreboard().lock().unwrap().get("untouched", "exec"),
+        None
+    );
+    assert_eq!(
+        execute_console("/execute if score initial exec matches 8 run say It's [fine"),
+        "executed 1 command(s)"
+    );
+}
+
+#[test]
+fn execute_pipeline_summons_and_stores_in_live_entity_and_block_data() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    execute_console("/scoreboard objectives add exec dummy");
+    execute_console("/scoreboard players set number exec 4");
+    assert_eq!(
+        execute_console("/execute positioned 12.5 80 16.5 summon cow store result entity @s Health float 2 run scoreboard players get number exec"),
+        "executed 1 command(s)"
+    );
+    assert_eq!(
+        execute_console(
+            "/execute as @e[type=cow] if data entity @s {Health:8f} run tag @s add tested"
+        ),
+        "executed 1 command(s)"
+    );
+    assert_eq!(
+        execute_console("/execute if entity @e[type=cow,tag=tested,nbt={Health:8f}]"),
+        "Test passed"
+    );
+
+    let pos = (50, 80, 50);
+    crate::set_block(pos.0, pos.1, pos.2, crate::name_to_state("chest").unwrap());
+    let item = crate::name_to_item("stone").unwrap();
+    let components = vec![(crate::COMP_CUSTOM_DATA, vec![10, 0])];
+    crate::chests().lock().unwrap().insert(
+        crate::ContainerKey::ow(pos),
+        [(0, (item, 1, components.clone()))].into(),
+    );
+    assert_eq!(
+        execute_console("/execute store result block 50 80 50 Items[0].count int 2 run scoreboard players get number exec"),
+        "executed 1 command(s)"
+    );
+    assert_eq!(
+        execute_console(
+            r#"/execute if data block 50 80 50 Items[{id:"minecraft:stone", count:8}]"#
+        ),
+        "Test passed"
+    );
+    assert_eq!(
+        crate::chests().lock().unwrap()[&crate::ContainerKey::ow(pos)][&0],
+        (item, 8, components)
+    );
+}
