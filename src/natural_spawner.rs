@@ -536,8 +536,19 @@ pub(crate) fn try_spawn_mob_group(
     spawned
 }
 
-// R7 GP-2: player-distance rules for the Overworld's nightly spawn cycle.
-fn nightly_hostile_spawn_position(tick: u64) -> Option<((f64, f64, f64), u64)> {
+const NATURAL_SPAWN_CHUNK_RADIUS: i32 = 8;
+
+fn has_room_for_nightly_monster(mobs: &[Arc<Mob>], monster_cap: usize) -> bool {
+    mobs.len() < MOB_CAP
+        && mobs
+            .iter()
+            .filter(|mob| entity_category_1211(mob.etype) == EntityMobCategory::Monster)
+            .take(monster_cap)
+            .count()
+            < monster_cap
+}
+
+fn spawn_nightly_hostile(tick: u64) {
     let players: Vec<_> = client_snapshot()
         .into_iter()
         .filter_map(|client| {
@@ -553,7 +564,20 @@ fn nightly_hostile_spawn_position(tick: u64) -> Option<((f64, f64, f64), u64)> {
         })
         .collect();
     if players.is_empty() {
-        return None;
+        return;
+    }
+
+    let mut spawn_chunks = HashSet::new();
+    for &(x, _, z) in &players {
+        let center = (
+            (x.floor() as i32).div_euclid(16),
+            (z.floor() as i32).div_euclid(16),
+        );
+        extend_chunk_square(&mut spawn_chunks, center, NATURAL_SPAWN_CHUNK_RADIUS);
+    }
+    let cap = MobCategory::Monster.global_cap(spawn_chunks.len() as u32) as usize;
+    if !has_room_for_nightly_monster(&mobs().lock().unwrap(), cap) {
+        return;
     }
 
     // Rotate eligible anchors on attempts, independently of the tick cadence.
@@ -567,8 +591,30 @@ fn nightly_hostile_spawn_position(tick: u64) -> Option<((f64, f64, f64), u64)> {
         .iter()
         .map(|&(px, py, pz)| (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2))
         .fold(f64::INFINITY, f64::min);
-    can_spawn_at_distance(nearest_squared, MobCategory::Monster)
-        .then_some(((x, y, z), attempt))
+    if !can_spawn_at_distance(nearest_squared, MobCategory::Monster) {
+        return;
+    }
+
+    let biome = worldgen::biome_name_at_block(bx, y.floor() as i32, bz);
+    let etype = spawn_etype_for_biome(biome.as_deref(), attempt);
+    let mut current_mobs = mobs().lock().unwrap();
+    // A concurrent writer can fill a slot while terrain and biome are read.
+    if has_room_for_nightly_monster(&current_mobs, cap) {
+        current_mobs.push(Arc::new(Mob {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            uuid: [0u8; 16],
+            etype,
+            pos: Mutex::new((x, y, z, 0.0, 0.0)),
+            hp: Mutex::new(20.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
+            fuse: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+        }));
+    }
 }
 
 #[cfg(test)]
