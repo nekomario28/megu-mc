@@ -296,7 +296,7 @@ fn player_enchantments_conflict(a: i64, b: i64) -> bool {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct EnchantmentOffer {
     required_level: i32,
     enchantments: Vec<(i64, i64)>,
@@ -317,7 +317,7 @@ fn enchanting_offers(stack: &Stack, seed: i32, bookshelves: i32) -> [Enchantment
         if required_level < slot as i32 + 1 {
             required_level = 0;
         }
-        let mut rng = generation_math::Lcg::new(i64::from(seed.wrapping_add(slot as i32)) as u64);
+        let mut rng = enchantment_slot_rng(seed, slot);
         let enchantments = if required_level > 0 {
             roll_table_enchantments(&mut rng, item, enchantability, required_level)
         } else {
@@ -336,73 +336,93 @@ fn enchanting_offers(stack: &Stack, seed: i32, bookshelves: i32) -> [Enchantment
     })
 }
 
-/// Server-side enchanting slots and the player's random source. The random source
-/// advances only when an enchantment is successfully applied.
 #[cfg_attr(not(test), allow(dead_code))]
-struct EnchantmentMenu<'a> {
-    stack: Stack,
+#[derive(Default)]
+struct EnchantmentMenu {
+    item: Stack,
+    lapis: Stack,
     enchantment_seed: i32,
-    bookshelves: i32,
-    player_rng: &'a mut generation_math::Lcg,
+    offers: [EnchantmentOffer; 3],
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct EnchantTakeResult {
-    output: Stack,
-    enchantment_seed: i32,
-    levels_deducted: i32,
-    lapis_consumed: i32,
-    enchantments: Vec<(i64, i64)>,
+#[derive(Debug, PartialEq, Eq)]
+enum EnchantingClick {
+    Rejected,
+    Accepted,
+    Enchanted,
 }
 
-/// Commit a table selection only when the server-side offer is affordable.
 #[cfg_attr(not(test), allow(dead_code))]
-fn handle_enchant_button_click(
-    menu: &mut EnchantmentMenu<'_>,
-    button_id: u8,
-    player_level: i32,
-    lapis_count: i32,
-    is_creative: bool,
-) -> Option<EnchantTakeResult> {
-    let slot = usize::from(button_id);
-    if slot >= 3 {
-        return None;
-    }
-    let offer = &enchanting_offers(&menu.stack, menu.enchantment_seed, menu.bookshelves)[slot];
-    if offer.enchantments.is_empty() {
-        return None;
-    }
-    let price = i32::from(button_id) + 1;
-    if !is_creative
-        && (player_level < offer.required_level || player_level < price || lapis_count < price)
-    {
-        return None;
+impl EnchantmentMenu {
+    fn refresh_offers(&mut self, seed: i32, bookshelves: i32) {
+        self.enchantment_seed = seed;
+        self.offers = enchanting_offers(&self.item, seed, bookshelves);
     }
 
-    let mut player = EnchantingPlayer {
-        level: player_level.max(0),
-        lapis: lapis_count.clamp(0, 3) as u8,
-        enchantment_seed: menu.enchantment_seed,
-    };
-    if !player.enchant(
-        &mut menu.stack,
-        slot,
-        menu.bookshelves,
-        is_creative,
-        menu.player_rng,
-    ) {
-        return None;
+    /// Handle a button against the offers last sent for the current slots.
+    fn click_button(
+        &mut self,
+        button: i32,
+        xp: &mut PlayerXpState,
+        seed: &mut i32,
+        creative: bool,
+        player_rng: &mut generation_math::Lcg,
+    ) -> EnchantingClick {
+        let Ok(slot @ 0..=2) = usize::try_from(button) else {
+            return EnchantingClick::Rejected;
+        };
+        let price = slot as u8 + 1;
+        let offer = &self.offers[slot];
+        if self.item.1 == 0 || self.item.0 == 0 || offer.required_level <= 0 {
+            return EnchantingClick::Rejected;
+        }
+        let has_lapis = self.lapis.1 >= price && item_to_name(self.lapis.0) == Some("lapis_lazuli");
+        if !creative
+            && (!has_lapis || xp.level < offer.required_level || xp.level < i32::from(price))
+        {
+            return EnchantingClick::Rejected;
+        }
+        // Vanilla rolls the current item at the cost already shown by the menu.
+        let item = item_to_name(self.item.0).unwrap_or_default();
+        let mut rng = enchantment_slot_rng(self.enchantment_seed, slot);
+        let rolled = roll_table_enchantments(
+            &mut rng,
+            item,
+            item_enchantability(item),
+            offer.required_level,
+        );
+        if rolled.is_empty() {
+            return EnchantingClick::Accepted;
+        }
+
+        xp.give_experience_levels(-i32::from(price));
+        *seed = player_rng.next_i32();
+        if item == "book" {
+            self.item.0 = name_to_item("enchanted_book").expect("vanilla enchanted book");
+        }
+        let component = crafting_enchantment_component(&self.item);
+        let mut applied = crafting_enchantments(&self.item);
+        for (id, level) in rolled {
+            if let Some((_, current)) = applied.iter_mut().find(|(existing, _)| *existing == id) {
+                *current = (*current).max(level);
+            } else {
+                applied.push((id, level));
+            }
+        }
+        let show = comp_get(&self.item.2, component).and_then(|data| data.last()) != Some(&0);
+        comp_set(
+            &mut self.item.2,
+            component,
+            enchantments_data(&applied, show),
+        );
+        if !creative {
+            consume_menu_stack(&mut self.lapis, price);
+        }
+        self.enchantment_seed = *seed;
+        self.offers = Default::default();
+        EnchantingClick::Enchanted
     }
-    menu.enchantment_seed = player.enchantment_seed;
-    Some(EnchantTakeResult {
-        output: menu.stack.clone(),
-        enchantment_seed: player.enchantment_seed,
-        // Player.applyEnchantmentCosts subtracts levels even in creative mode.
-        levels_deducted: player_level.max(0) - player.level,
-        lapis_consumed: if is_creative { 0 } else { price },
-        enchantments: offer.enchantments.clone(),
-    })
 }
 
 /// The property payload is window ID (u8), property (i16 BE), value (i16 BE).
@@ -423,14 +443,16 @@ impl WindowPropertyUpdate {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn enchanting_window_properties(menu: &EnchantmentMenu<'_>) -> [WindowPropertyUpdate; 10] {
-    let offers = enchanting_offers(&menu.stack, menu.enchantment_seed, menu.bookshelves);
+fn enchanting_window_properties(menu: &EnchantmentMenu) -> [WindowPropertyUpdate; 10] {
+    let offers = &menu.offers;
     std::array::from_fn(|property| {
         let value = match property {
             0..=2 => offers[property].required_level as i16,
             3 => (menu.enchantment_seed & 0xffff) as i16,
             4..=6 => offers[property - 4].clue.map_or(-1, |(id, _)| id as i16),
-            _ => offers[property - 7].clue.map_or(-1, |(_, level)| level as i16),
+            _ => offers[property - 7]
+                .clue
+                .map_or(-1, |(_, level)| level as i16),
         };
         WindowPropertyUpdate {
             property: property as i16,
@@ -440,12 +462,20 @@ fn enchanting_window_properties(menu: &EnchantmentMenu<'_>) -> [WindowPropertyUp
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+fn enchantment_slot_rng(seed: i32, slot: usize) -> generation_math::Lcg {
+    generation_math::Lcg::new(i64::from(seed.wrapping_add(slot as i32)) as u64)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn roll_table_enchantments(
     rng: &mut generation_math::Lcg,
     item: &str,
     enchantability: i32,
     required_level: i32,
 ) -> Vec<(i64, i64)> {
+    if enchantability <= 0 {
+        return Vec::new();
+    }
     let bonus_bound = enchantability / 4 + 1;
     let adjusted = required_level + 1 + rng.next_bound(bonus_bound) + rng.next_bound(bonus_bound);
     let spread = (rng.next_f32() + rng.next_f32() - 1.0) * 0.15;
@@ -493,58 +523,6 @@ fn roll_table_enchantments(
         selected.remove(index);
     }
     selected
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, PartialEq, Eq)]
-struct EnchantingPlayer {
-    level: i32,
-    lapis: u8,
-    enchantment_seed: i32,
-}
-
-impl EnchantingPlayer {
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn enchant(
-        &mut self,
-        stack: &mut Stack,
-        slot: usize,
-        bookshelves: i32,
-        creative: bool,
-        player_rng: &mut generation_math::Lcg,
-    ) -> bool {
-        if slot >= 3 {
-            return false;
-        }
-        let offers = enchanting_offers(stack, self.enchantment_seed, bookshelves);
-        let offer = &offers[slot];
-        let price = slot as u8 + 1;
-        if offer.enchantments.is_empty()
-            || (!creative
-                && (self.level < offer.required_level
-                    || self.level < i32::from(price)
-                    || self.lapis < price))
-        {
-            return false;
-        }
-        self.level = self.level.saturating_sub(i32::from(price)).max(0);
-        self.enchantment_seed = player_rng.next_i32();
-        if !creative {
-            self.lapis -= price;
-        }
-        let component = if item_to_name(stack.0) == Some("book") {
-            stack.0 = name_to_item("enchanted_book").expect("vanilla enchanted book");
-            COMP_STORED_ENCHANTMENTS
-        } else {
-            COMP_ENCHANTMENTS
-        };
-        comp_set(
-            &mut stack.2,
-            component,
-            enchantments_data(&offer.enchantments, true),
-        );
-        true
-    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -607,8 +585,17 @@ fn is_anvil_repair_material(item: &str, material: &str) -> bool {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn anvil_enchantments(stack: &Stack) -> Vec<(i64, i64)> {
-    if item_to_name(stack.0) != Some("enchanted_book") {
+fn crafting_enchantment_component(stack: &Stack) -> i64 {
+    if item_to_name(stack.0) == Some("enchanted_book") {
+        COMP_STORED_ENCHANTMENTS
+    } else {
+        COMP_ENCHANTMENTS
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn crafting_enchantments(stack: &Stack) -> Vec<(i64, i64)> {
+    if crafting_enchantment_component(stack) == COMP_ENCHANTMENTS {
         return enchantments_get(&stack.2);
     }
     let Some(mut data) = comp_get(&stack.2, COMP_STORED_ENCHANTMENTS) else {
@@ -643,11 +630,11 @@ fn merge_anvil_enchantments(
     from_book: bool,
     creative: bool,
 ) -> Result<i64, AnvilError> {
-    let mut enchantments = anvil_enchantments(output);
+    let mut enchantments = crafting_enchantments(output);
     let mut cost = 0;
     let mut accepted = false;
     let mut rejected = false;
-    for (incoming, incoming_level) in anvil_enchantments(sacrifice) {
+    for (incoming, incoming_level) in crafting_enchantments(sacrifice) {
         let conflicts = enchantments
             .iter()
             .filter(|(existing, _)| player_enchantments_conflict(*existing, incoming))
@@ -691,11 +678,7 @@ fn merge_anvil_enchantments(
         return Err(AnvilError::InvalidInput);
     }
     if accepted {
-        let component = if item == "enchanted_book" {
-            COMP_STORED_ENCHANTMENTS
-        } else {
-            COMP_ENCHANTMENTS
-        };
+        let component = crafting_enchantment_component(output);
         let show = comp_get(&output.2, component).and_then(|data| data.last()) != Some(&0);
         comp_set(
             &mut output.2,
@@ -707,6 +690,12 @@ fn merge_anvil_enchantments(
         }
     }
     Ok(cost)
+}
+
+// StringUtil.isBlank treats only printable, non-space ASCII as nonblank.
+#[cfg_attr(not(test), allow(dead_code))]
+fn anvil_name_is_blank(name: &str) -> bool {
+    !name.bytes().any(|byte| byte.is_ascii_graphic())
 }
 
 /// Preview a repair. A nonblank rename sets a custom name, and a blank rename clears it.
@@ -744,7 +733,7 @@ fn anvil_result(
             right_consumed = units as u8;
         } else {
             let from_book = material == "enchanted_book"
-                && comp_get(&right.2, COMP_STORED_ENCHANTMENTS).is_some();
+                || comp_get(&right.2, COMP_STORED_ENCHANTMENTS).is_some();
             if !from_book && (left.0 != right.0 || max_damage == 0) {
                 return Err(AnvilError::InvalidInput);
             }
@@ -769,7 +758,7 @@ fn anvil_result(
 
     let mut rename_cost = 0;
     if let Some(name) = rename {
-        let new_name = (!name.trim().is_empty()).then(|| nbt_string(name));
+        let new_name = (!anvil_name_is_blank(name)).then(|| nbt_string(name));
         if comp_get(&output.2, COMP_CUSTOM_NAME) != new_name.as_deref() {
             rename_cost = 1;
             if let Some(name) = new_name {
@@ -798,7 +787,14 @@ fn anvil_result(
     } else {
         next_repair_cost(left_work, right_work)
     };
-    comp_set_varint(&mut output.2, COMP_PRIOR_WORK, i64::from(repair_cost));
+    if repair_cost != 0 {
+        comp_set_varint(&mut output.2, COMP_PRIOR_WORK, i64::from(repair_cost));
+    } else {
+        // A zero repair cost belongs to the default component map.
+        output
+            .2
+            .retain(|(component, _)| *component != COMP_PRIOR_WORK);
+    }
     Ok(AnvilResult {
         stack: output,
         level_cost,
@@ -807,41 +803,76 @@ fn anvil_result(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, PartialEq)]
-struct AnvilTakeInput {
-    preview: AnvilResult,
-    /// A player RNG nextFloat() sample in [0, 1).
-    damage_roll: f32,
+#[derive(Default)]
+struct AnvilMenu {
+    left: Stack,
+    right: Stack,
+    rename: Option<String>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl AnvilMenu {
+    fn rename(&mut self, text: &str) -> bool {
+        let filtered: String = text
+            .chars()
+            .filter(|&ch| ch >= ' ' && ch != '\u{7f}' && ch != '§')
+            .collect();
+        if filtered.encode_utf16().count() > 50 || self.rename.as_ref() == Some(&filtered) {
+            return false;
+        }
+        self.rename = Some(filtered);
+        true
+    }
+
+    /// `left_name` is the plain hover name of the left input, including custom
+    /// styles flattened to text or the server's translation of its item name.
+    fn result(&self, left_name: &str, creative: bool) -> Result<AnvilResult, AnvilError> {
+        let text = self.rename.as_deref().unwrap_or_default();
+        let rename = (anvil_name_is_blank(text) || text != left_name).then_some(text);
+        anvil_result(&self.left, Some(&self.right), rename, creative)
+    }
+
+    /// The destination preflight must cover the entire result. The wear callback
+    /// supplies a player RNG sample in [0, 1) if the block is still an anvil.
+    fn take_result(
+        &mut self,
+        left_name: &str,
+        xp: &mut PlayerXpState,
+        creative: bool,
+        can_receive: impl FnOnce(&Stack) -> bool,
+        anvil_damage_roll: impl FnOnce() -> Option<f32>,
+    ) -> Option<AnvilTakeResult> {
+        let result = self.result(left_name, creative).ok()?;
+        if result.level_cost <= 0
+            || (!creative && xp.level < result.level_cost)
+            || !can_receive(&result.stack)
+        {
+            return None;
+        }
+        let mut damage_anvil = false;
+        if !creative {
+            if let Some(roll) = anvil_damage_roll() {
+                if !(0.0..1.0).contains(&roll) {
+                    return None;
+                }
+                damage_anvil = roll < 0.12;
+            }
+            xp.give_experience_levels(-result.level_cost);
+        }
+        self.left = Stack::default();
+        consume_menu_stack(&mut self.right, result.right_consumed);
+        Some(AnvilTakeResult {
+            output: result.stack,
+            damage_anvil,
+        })
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
 struct AnvilTakeResult {
     output: Stack,
-    levels_deducted: i32,
-    right_consumed: u8,
     damage_anvil: bool,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn handle_anvil_take_result(
-    input: &AnvilTakeInput,
-    player_level: i32,
-    is_creative: bool,
-) -> Option<AnvilTakeResult> {
-    let cost = input.preview.level_cost;
-    if cost <= 0 || (!is_creative && (cost >= 40 || player_level < cost)) {
-        return None;
-    }
-    if !(0.0..1.0).contains(&input.damage_roll) {
-        return None;
-    }
-    Some(AnvilTakeResult {
-        output: input.preview.stack.clone(),
-        levels_deducted: if is_creative { 0 } else { cost },
-        right_consumed: input.preview.right_consumed,
-        damage_anvil: !is_creative && input.damage_roll < 0.12,
-    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -943,6 +974,38 @@ enum BrewingIngredient {
     Gunpowder,
     DragonBreath,
     GlassBottle,
+}
+
+impl BrewingIngredient {
+    // PotionBrewing bootstraps these mixes in code in 1.21.1. GlassBottle
+    // represents the dragon-breath remainder and cannot be placed here.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn from_item(name: &str) -> Option<Self> {
+        Some(match name {
+            "nether_wart" => Self::NetherWart,
+            "fermented_spider_eye" => Self::FermentedSpiderEye,
+            "golden_carrot" => Self::GoldenCarrot,
+            "rabbit_foot" => Self::RabbitFoot,
+            "magma_cream" => Self::MagmaCream,
+            "sugar" => Self::Sugar,
+            "turtle_helmet" => Self::TurtleHelmet,
+            "pufferfish" => Self::Pufferfish,
+            "glistering_melon_slice" => Self::GlisteringMelonSlice,
+            "spider_eye" => Self::SpiderEye,
+            "ghast_tear" => Self::GhastTear,
+            "blaze_powder" => Self::BlazePowder,
+            "phantom_membrane" => Self::PhantomMembrane,
+            "breeze_rod" => Self::BreezeRod,
+            "slime_block" => Self::SlimeBlock,
+            "stone" => Self::Stone,
+            "cobweb" => Self::Cobweb,
+            "redstone" => Self::Redstone,
+            "glowstone_dust" => Self::GlowstoneDust,
+            "gunpowder" => Self::Gunpowder,
+            "dragon_breath" => Self::DragonBreath,
+            _ => return None,
+        })
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1097,13 +1160,90 @@ fn brewing_window_properties(stand: &BrewingStand) -> [WindowPropertyUpdate; 2] 
     [
         WindowPropertyUpdate {
             property: 0,
-            value: stand.brew_time.min(BREW_TIME_TICKS) as i16,
+            value: stand.brew_time as i16,
         },
         WindowPropertyUpdate {
             property: 1,
-            value: stand.fuel.min(BREW_FUEL_PER_POWDER) as i16,
+            value: i16::from(stand.fuel),
         },
     ]
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Default)]
+struct BrewingMenu {
+    slots: [Stack; 5],
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl BrewingMenu {
+    /// Handle a primary or secondary pickup click on a stand slot. The
+    /// stand's block entity owns these five stacks when a menu is open.
+    fn click_slot(&mut self, slot: i16, button: i8, cursor: &mut Stack) -> bool {
+        let Ok(slot) = usize::try_from(slot) else {
+            return false;
+        };
+        let Some(target) = self.slots.get_mut(slot) else {
+            return false;
+        };
+        if !matches!(button, 0 | 1) {
+            return false;
+        }
+
+        if cursor.1 == 0 {
+            if target.1 == 0 {
+                return false;
+            }
+            let count = if button == 0 {
+                target.1
+            } else {
+                target.1.div_ceil(2)
+            };
+            *cursor = (target.0, count, target.2.clone());
+            consume_menu_stack(target, count);
+            return true;
+        }
+
+        let same_item = target.0 == cursor.0
+            && target.2.len() == cursor.2.len()
+            && target
+                .2
+                .iter()
+                .all(|(id, data)| comp_get(&cursor.2, *id) == Some(data.as_slice()));
+        let maximum = stack_max_of(cursor) as u8;
+        let limit = match (slot, item_to_name(cursor.0)) {
+            (0..=2, Some("potion" | "splash_potion" | "lingering_potion" | "glass_bottle")) => 1,
+            (3, Some(name)) if BrewingIngredient::from_item(name).is_some() => maximum,
+            (4, Some("blaze_powder")) => maximum,
+            _ => {
+                // A returned glass bottle cannot be placed in the ingredient
+                // slot, but its contents can refill a matching carried stack.
+                let moved = target.1.min(maximum.saturating_sub(cursor.1));
+                if !same_item || moved == 0 {
+                    return false;
+                }
+                cursor.1 += moved;
+                consume_menu_stack(target, moved);
+                return true;
+            }
+        };
+
+        if target.1 == 0 || same_item {
+            let requested = if button == 0 { cursor.1 } else { 1 };
+            let moved = requested.min(limit.saturating_sub(target.1));
+            if moved == 0 {
+                return false;
+            }
+            *target = (cursor.0, target.1 + moved, cursor.2.clone());
+            consume_menu_stack(cursor, moved);
+            true
+        } else if cursor.1 <= limit {
+            std::mem::swap(cursor, target);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1183,26 +1323,34 @@ fn smithing_result(template: &Stack, base: &Stack, addition: &Stack) -> Option<S
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SmithingTakeResult {
-    output: Stack,
-    template_consumed: u8,
-    base_consumed: u8,
-    addition_consumed: u8,
+#[derive(Default)]
+struct SmithingMenu {
+    template: Stack,
+    base: Stack,
+    addition: Stack,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn handle_smithing_take_result(
-    template: &Stack,
-    base: &Stack,
-    addition: &Stack,
-) -> Option<SmithingTakeResult> {
-    Some(SmithingTakeResult {
-        output: smithing_result(template, base, addition)?,
-        template_consumed: 1,
-        base_consumed: 1,
-        addition_consumed: 1,
-    })
+impl SmithingMenu {
+    fn result(&self) -> Option<Stack> {
+        smithing_result(&self.template, &self.base, &self.addition)
+    }
+
+    fn take_result(&mut self, can_receive: impl FnOnce(&Stack) -> bool) -> Option<Stack> {
+        let result = self.result().filter(can_receive)?;
+        for stack in [&mut self.template, &mut self.base, &mut self.addition] {
+            consume_menu_stack(stack, 1);
+        }
+        Some(result)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn consume_menu_stack(stack: &mut Stack, count: u8) {
+    stack.1 = stack.1.saturating_sub(count);
+    if stack.1 == 0 {
+        *stack = Stack::default();
+    }
 }
 
 fn xp_needed_for_next_level(level: i32) -> i64 {
@@ -1227,59 +1375,81 @@ struct PlayerXpState {
     pub total_experience: i32,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+enum ExperienceUnit {
+    Levels,
+    Points,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum ExperienceSetError {
+    NegativeAmount,
+    PointsOutOfRange,
+}
+
 impl PlayerXpState {
+    // Player#getXpNeededForNextLevel uses Java int arithmetic.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn points_to_next_level(&self) -> i32 {
+        xp_needed_for_next_level(self.level) as i32
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     fn give_experience_points(&mut self, pts: i32) {
-        self.progress += pts as f32 / xp_needed_for_next_level(self.level) as f32;
-        self.total_experience = self.total_experience.saturating_add(pts).max(0);
+        self.progress += pts as f32 / self.points_to_next_level() as f32;
+        self.total_experience = self.total_experience.wrapping_add(pts).max(0);
         while self.progress < 0.0 {
-            let below = self.progress * xp_needed_for_next_level(self.level) as f32;
+            let below = self.progress * self.points_to_next_level() as f32;
             if self.level > 0 {
                 self.give_experience_levels(-1);
-                self.progress = 1.0 + below / xp_needed_for_next_level(self.level) as f32;
+                self.progress = 1.0 + below / self.points_to_next_level() as f32;
             } else {
                 self.give_experience_levels(-1);
                 self.progress = 0.0;
             }
         }
         while self.progress >= 1.0 {
-            let excess = (self.progress - 1.0) * xp_needed_for_next_level(self.level) as f32;
+            self.progress = (self.progress - 1.0) * self.points_to_next_level() as f32;
             self.give_experience_levels(1);
-            self.progress = excess / xp_needed_for_next_level(self.level) as f32;
+            self.progress /= self.points_to_next_level() as f32;
         }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn give_experience_levels(&mut self, delta: i32) {
-        let new_level = i64::from(self.level) + i64::from(delta);
+        let new_level = self.level.wrapping_add(delta);
         if new_level < 0 {
             self.level = 0;
             self.progress = 0.0;
             self.total_experience = 0;
         } else {
-            self.level = new_level.min(i64::from(i32::MAX)) as i32;
+            self.level = new_level;
         }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn set_experience_levels(&mut self, level: i32) {
-        self.level = level.max(0);
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn set_experience_points(&mut self, pts: i32) -> Result<(), &'static str> {
-        let needed = xp_needed_for_next_level(self.level) as f32;
-        // ExperienceCommand rejects >= needed, and ServerPlayer caps at needed-1.
-        if pts < 0 || i64::from(pts) >= xp_needed_for_next_level(self.level) {
-            return Err("points outside current level bar");
+    fn set(&mut self, amount: i32, unit: ExperienceUnit) -> Result<(), ExperienceSetError> {
+        if amount < 0 {
+            return Err(ExperienceSetError::NegativeAmount);
         }
-        self.progress = (pts as f32 / needed).clamp(0.0, (needed - 1.0) / needed);
+        match unit {
+            ExperienceUnit::Levels => self.level = amount,
+            ExperienceUnit::Points => {
+                let needed = self.points_to_next_level();
+                if amount >= needed {
+                    return Err(ExperienceSetError::PointsOutOfRange);
+                }
+                let needed = needed as f32;
+                self.progress = (amount as f32 / needed).clamp(0.0, (needed - 1.0) / needed);
+            }
+        }
         Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn query_experience_points(&self) -> i32 {
-        (self.progress * xp_needed_for_next_level(self.level) as f32).floor() as i32
+        (self.progress * self.points_to_next_level() as f32).floor() as i32
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1300,11 +1470,19 @@ enum HungerDifficulty {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct FoodData {
-    food_level: u8,
-    last_food_level: u8,
+    food_level: i32,
+    last_food_level: i32,
     saturation: f32,
     exhaustion: f32,
-    tick_timer: u8,
+    tick_timer: i32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FoodTick {
+    None,
+    Heal(f32),
+    Starve,
 }
 
 impl Default for FoodData {
@@ -1334,57 +1512,64 @@ impl FoodData {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn add_exhaustion(&mut self, amount: f32) {
-        self.exhaustion = (self.exhaustion + amount).min(40.0);
+        self.exhaustion += amount;
+        if self.exhaustion > 40.0 {
+            self.exhaustion = 40.0;
+        }
     }
 
+    /// Run once per game tick after adding movement and Hunger effect exhaustion.
+    /// Apply the returned healing or starvation damage through the player before
+    /// the next tick, then synchronize food, saturation and health.
     #[cfg_attr(not(test), allow(dead_code))]
     fn tick(
         &mut self,
-        health: &mut f32,
+        health: f32,
         max_health: f32,
         difficulty: HungerDifficulty,
         natural_regeneration: bool,
-    ) {
+    ) -> FoodTick {
         self.last_food_level = self.food_level;
         if self.exhaustion > 4.0 {
             self.exhaustion -= 4.0;
             if self.saturation > 0.0 {
                 self.saturation = (self.saturation - 1.0).max(0.0);
             } else if difficulty != HungerDifficulty::Peaceful {
-                self.food_level = self.food_level.saturating_sub(1);
+                self.food_level = self.food_level.wrapping_sub(1).max(0);
             }
         }
 
-        let can_heal = natural_regeneration && *health > 0.0 && *health < max_health;
+        let can_heal = natural_regeneration && health > 0.0 && health < max_health;
         if can_heal && self.food_level >= 20 && self.saturation > 0.0 {
-            self.tick_timer += 1;
+            self.tick_timer = self.tick_timer.wrapping_add(1);
             if self.tick_timer >= 10 {
                 let spent = self.saturation.min(6.0);
-                *health = (*health + spent / 6.0).min(max_health);
                 self.add_exhaustion(spent);
                 self.tick_timer = 0;
+                return FoodTick::Heal(spent / 6.0);
             }
         } else if can_heal && self.food_level >= 18 {
-            self.tick_timer += 1;
+            self.tick_timer = self.tick_timer.wrapping_add(1);
             if self.tick_timer >= 80 {
-                *health = (*health + 1.0).min(max_health);
                 self.add_exhaustion(6.0);
                 self.tick_timer = 0;
+                return FoodTick::Heal(1.0);
             }
-        } else if self.food_level == 0 {
-            self.tick_timer += 1;
+        } else if self.food_level <= 0 {
+            self.tick_timer = self.tick_timer.wrapping_add(1);
             if self.tick_timer >= 80 {
-                if *health > 10.0
-                    || difficulty == HungerDifficulty::Hard
-                    || (*health > 1.0 && difficulty == HungerDifficulty::Normal)
-                {
-                    *health = (*health - 1.0).max(0.0);
-                }
                 self.tick_timer = 0;
+                if health > 10.0
+                    || difficulty == HungerDifficulty::Hard
+                    || (health > 1.0 && difficulty == HungerDifficulty::Normal)
+                {
+                    return FoodTick::Starve;
+                }
             }
         } else {
             self.tick_timer = 0;
         }
+        FoodTick::None
     }
 }
 
@@ -1413,11 +1598,7 @@ mod player_mechanisms_tests {
             .iter()
             .map(|&(name, level)| (enchant_id(name).unwrap(), level))
             .collect();
-        let component = if item == "enchanted_book" {
-            COMP_STORED_ENCHANTMENTS
-        } else {
-            COMP_ENCHANTMENTS
-        };
+        let component = crafting_enchantment_component(&result);
         comp_set(&mut result.2, component, enchantments_data(&list, true));
         result
     }
@@ -1484,65 +1665,6 @@ mod player_mechanisms_tests {
             enchanting_offers(&stack("dirt", 1), 12345, 15).map(|offer| offer.required_level),
             [0; 3]
         );
-    }
-
-    #[test]
-    fn enchanting_charges_the_slot_price_and_refreshes_the_seed_only_on_success() {
-        let mut sword = stack("diamond_sword", 1);
-        let mut player_rng = generation_math::Lcg::new(12345);
-        let mut player = EnchantingPlayer {
-            level: 29,
-            lapis: 3,
-            enchantment_seed: 12345,
-        };
-        let rng_before = player_rng.state48();
-        assert!(!player.enchant(&mut sword, 2, 15, false, &mut player_rng));
-        player.level = 30;
-        player.lapis = 2;
-        assert!(!player.enchant(&mut sword, 2, 15, false, &mut player_rng));
-        assert_eq!(
-            player,
-            EnchantingPlayer {
-                level: 30,
-                lapis: 2,
-                enchantment_seed: 12345
-            }
-        );
-        assert_eq!(player_rng.state48(), rng_before);
-        assert!(sword.2.is_empty());
-
-        player.lapis = 4;
-        let offer = enchanting_offers(&sword, 12345, 15);
-        assert!(player.enchant(&mut sword, 2, 15, false, &mut player_rng));
-        assert_eq!(
-            player,
-            EnchantingPlayer {
-                level: 27,
-                lapis: 1,
-                enchantment_seed: 1_553_932_502
-            }
-        );
-        assert_eq!(enchantments_get(&sword.2), offer[2].enchantments);
-        assert!(!player.enchant(&mut sword, 0, 15, false, &mut player_rng));
-
-        for slot in 0..2 {
-            let mut book = stack("book", 1);
-            comp_set(&mut book.2, COMP_CUSTOM_NAME, nbt_string("Field Notes"));
-            let mut player = EnchantingPlayer {
-                level: 30,
-                lapis: 3,
-                enchantment_seed: 12345,
-            };
-            assert!(player.enchant(&mut book, slot, 15, false, &mut player_rng));
-            assert_eq!(player.level, 29 - slot as i32);
-            assert_eq!(player.lapis, 2 - slot as u8);
-            assert_eq!(item_to_name(book.0), Some("enchanted_book"));
-            assert!(comp_get(&book.2, COMP_STORED_ENCHANTMENTS).is_some());
-            assert_eq!(
-                comp_get(&book.2, COMP_CUSTOM_NAME),
-                Some(nbt_string("Field Notes").as_slice())
-            );
-        }
     }
 
     #[test]
@@ -1959,14 +2081,30 @@ mod player_mechanisms_tests {
             progress: 0.75,
             total_experience: 1300,
         };
-        xp.set_experience_levels(31);
-        assert_eq!(xp, PlayerXpState { level: 31, progress: 0.75, total_experience: 1300 });
+        xp.set(31, ExperienceUnit::Levels).unwrap();
+        assert_eq!(
+            xp,
+            PlayerXpState {
+                level: 31,
+                progress: 0.75,
+                total_experience: 1300
+            }
+        );
         assert_eq!(xp.query_experience_levels(), 31);
         assert_eq!(xp.query_experience_points(), 90);
-        xp.set_experience_levels(0);
-        assert_eq!(xp.progress, 0.75);
-        xp.set_experience_levels(-10);
-        assert_eq!((xp.level, xp.progress, xp.total_experience), (0, 0.75, 1300));
+        xp.set(0, ExperienceUnit::Levels).unwrap();
+        assert_eq!(
+            (xp.level, xp.progress, xp.total_experience),
+            (0, 0.75, 1300)
+        );
+        assert_eq!(
+            xp.set(-10, ExperienceUnit::Levels),
+            Err(ExperienceSetError::NegativeAmount)
+        );
+        assert_eq!(
+            (xp.level, xp.progress, xp.total_experience),
+            (0, 0.75, 1300)
+        );
     }
 
     #[test]
@@ -1976,17 +2114,33 @@ mod player_mechanisms_tests {
             progress: 0.5,
             total_experience: 1395,
         };
-        assert_eq!(xp.set_experience_points(113), Err("points outside current level bar"));
+        assert_eq!(
+            xp.set(113, ExperienceUnit::Points),
+            Err(ExperienceSetError::PointsOutOfRange)
+        );
         // 1.21.1 ExperienceCommand also rejects exactly the next-level cost.
-        assert_eq!(xp.set_experience_points(112), Err("points outside current level bar"));
-        assert_eq!(xp.set_experience_points(-1), Err("points outside current level bar"));
-        assert_eq!(xp, PlayerXpState { level: 30, progress: 0.5, total_experience: 1395 });
-        assert_eq!(xp.set_experience_points(111), Ok(()));
+        assert_eq!(
+            xp.set(112, ExperienceUnit::Points),
+            Err(ExperienceSetError::PointsOutOfRange)
+        );
+        assert_eq!(
+            xp.set(-1, ExperienceUnit::Points),
+            Err(ExperienceSetError::NegativeAmount)
+        );
+        assert_eq!(
+            xp,
+            PlayerXpState {
+                level: 30,
+                progress: 0.5,
+                total_experience: 1395
+            }
+        );
+        assert_eq!(xp.set(111, ExperienceUnit::Points), Ok(()));
         assert_eq!(xp.progress, 111.0 / 112.0);
         assert_eq!(xp.query_experience_points(), 111);
         assert_eq!(xp.total_experience, 1395);
-        xp.set_experience_levels(0);
-        xp.set_experience_points(6).unwrap();
+        xp.set(0, ExperienceUnit::Levels).unwrap();
+        xp.set(6, ExperienceUnit::Points).unwrap();
         assert_eq!(xp.query_experience_points(), 6);
         assert_eq!(xp.progress, 6.0 / 7.0);
     }
@@ -1999,9 +2153,15 @@ mod player_mechanisms_tests {
             total_experience: 1500,
         };
         xp.give_experience_points(56);
-        assert_eq!((xp.level, xp.progress, xp.total_experience), (31, 0.0, 1556));
+        assert_eq!(
+            (xp.level, xp.progress, xp.total_experience),
+            (31, 0.0, 1556)
+        );
         xp.give_experience_points(121);
-        assert_eq!((xp.level, xp.progress, xp.total_experience), (32, 0.0, 1677));
+        assert_eq!(
+            (xp.level, xp.progress, xp.total_experience),
+            (32, 0.0, 1677)
+        );
         xp.give_experience_points(-122);
         assert_eq!(xp.level, 30);
         let expected_progress = 111.0 / 112.0;
@@ -2026,15 +2186,13 @@ mod player_mechanisms_tests {
 
     #[test]
     fn window_properties_encode_protocol_767_menu_slots() {
-        let mut rng = generation_math::Lcg::new(4242);
-        let menu = EnchantmentMenu {
-            stack: stack("diamond_sword", 1),
-            enchantment_seed: 12345,
-            bookshelves: 15,
-            player_rng: &mut rng,
+        let mut menu = EnchantmentMenu {
+            item: stack("diamond_sword", 1),
+            ..EnchantmentMenu::default()
         };
+        menu.refresh_offers(12345, 15);
         let props = enchanting_window_properties(&menu);
-        let offers = enchanting_offers(&menu.stack, 12345, 15);
+        let offers = &menu.offers;
         assert_eq!(props.map(|p| p.property), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert_eq!(props[0].value, 6);
         assert_eq!(props[1].value, 20);
@@ -2044,104 +2202,218 @@ mod player_mechanisms_tests {
             assert_eq!(props[4 + slot].value, offers[slot].clue.unwrap().0 as i16);
             assert_eq!(props[7 + slot].value, offers[slot].clue.unwrap().1 as i16);
         }
-        let empty = EnchantmentMenu { stack: stack("dirt", 1), enchantment_seed: -1, bookshelves: 0, player_rng: menu.player_rng };
-        let props = enchanting_window_properties(&empty);
+        menu.item = stack("dirt", 1);
+        menu.refresh_offers(-1, 0);
+        let props = enchanting_window_properties(&menu);
         assert_eq!(props[3].value, -1);
-        assert_eq!(props[4..7].iter().map(|p| p.value).collect::<Vec<_>>(), [-1; 3]);
-        assert_eq!(props[7..10].iter().map(|p| p.value).collect::<Vec<_>>(), [-1; 3]);
+        assert_eq!(
+            props[4..7].iter().map(|p| p.value).collect::<Vec<_>>(),
+            [-1; 3]
+        );
+        assert_eq!(
+            props[7..10].iter().map(|p| p.value).collect::<Vec<_>>(),
+            [-1; 3]
+        );
 
-        let mut stand = BrewingStand { brew_time: 400, fuel: 20, ..BrewingStand::default() };
-        assert_eq!(brewing_window_properties(&stand), [WindowPropertyUpdate { property: 0, value: 400 }, WindowPropertyUpdate { property: 1, value: 20 }]);
+        let mut stand = BrewingStand {
+            brew_time: 400,
+            fuel: 20,
+            ..BrewingStand::default()
+        };
+        assert_eq!(
+            brewing_window_properties(&stand),
+            [
+                WindowPropertyUpdate {
+                    property: 0,
+                    value: 400
+                },
+                WindowPropertyUpdate {
+                    property: 1,
+                    value: 20
+                }
+            ]
+        );
         stand.brew_time = 600;
         stand.fuel = 100;
-        assert_eq!(brewing_window_properties(&stand)[0].value, 400);
-        assert_eq!(brewing_window_properties(&stand)[1].value, 20);
-        assert_eq!(brewing_window_properties(&BrewingStand::default())[0].encode(4), [4, 0, 0, 0, 0]);
-        assert_eq!(anvil_window_properties(39), [WindowPropertyUpdate { property: 0, value: 39 }]);
+        assert_eq!(brewing_window_properties(&stand)[0].value, 600);
+        assert_eq!(brewing_window_properties(&stand)[1].value, 100);
+        assert_eq!(
+            brewing_window_properties(&BrewingStand::default())[0].encode(4),
+            [4, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            anvil_window_properties(39),
+            [WindowPropertyUpdate {
+                property: 0,
+                value: 39
+            }]
+        );
         assert_eq!(anvil_window_properties(40)[0].encode(9), [9, 0, 0, 0, 40]);
     }
 
     #[test]
-    fn enchant_click_enforces_costs_and_mutates_only_after_success() {
-        let mut rng = generation_math::Lcg::new(12345);
-        let mut menu = EnchantmentMenu {
-            stack: stack("diamond_sword", 1),
-            enchantment_seed: 12345,
-            bookshelves: 15,
-            player_rng: &mut rng,
-        };
-        let before = menu.player_rng.state48();
-        for (button, level, lapis) in [(3, 30, 3), (2, 29, 3), (2, 30, 2)] {
-            assert_eq!(handle_enchant_button_click(&mut menu, button, level, lapis, false), None);
-        }
-        assert_eq!(menu.player_rng.state48(), before);
-        assert!(menu.stack.2.is_empty());
-
-        let selected = enchanting_offers(&menu.stack, 12345, 15)[2].enchantments.clone();
-        let result = handle_enchant_button_click(&mut menu, 2, 30, 3, false).unwrap();
-        assert_eq!(result.enchantments, selected);
-        assert_eq!(result.levels_deducted, 3);
-        assert_eq!(result.lapis_consumed, 3);
-        assert_eq!(result.enchantment_seed, 1_553_932_502);
-        assert_eq!(result.output, menu.stack);
-        assert_eq!(enchantments_get(&result.output.2), selected);
-        assert_eq!(handle_enchant_button_click(&mut menu, 0, 30, 3, false), None);
-
-        let mut creative_rng = generation_math::Lcg::new(12345);
-        let mut creative = EnchantmentMenu { stack: stack("book", 1), enchantment_seed: 12345, bookshelves: 15, player_rng: &mut creative_rng };
-        let result = handle_enchant_button_click(&mut creative, 2, 0, 0, true).unwrap();
-        assert_eq!(result.levels_deducted, 0);
-        assert_eq!(result.lapis_consumed, 0);
-        assert_eq!(item_to_name(result.output.0), Some("enchanted_book"));
-        assert_eq!(anvil_enchantments(&result.output), result.enchantments);
-    }
-
-    #[test]
     fn anvil_take_checks_costs_and_damage_chance() {
-        let mut sword = stack("diamond_sword", 1);
-        comp_set_varint(&mut sword.2, COMP_DAMAGE, 100);
-        let diamond = stack("diamond", 2);
-        let preview = anvil_result(&sword, Some(&diamond), None, false).unwrap();
-        assert_eq!(preview.right_consumed, 1);
-        let mut input = AnvilTakeInput { preview, damage_roll: 0.1199 };
-        assert_eq!(handle_anvil_take_result(&input, 0, false), None);
-        let taken = handle_anvil_take_result(&input, 10, false).unwrap();
-        assert_eq!(taken.output, input.preview.stack);
-        assert_eq!(taken.levels_deducted, input.preview.level_cost);
-        assert_eq!(taken.right_consumed, 1);
-        assert!(taken.damage_anvil);
-        input.damage_roll = 0.12;
-        assert!(!handle_anvil_take_result(&input, 10, false).unwrap().damage_anvil);
-        input.damage_roll = 0.1199;
-        let creative = handle_anvil_take_result(&input, 0, true).unwrap();
-        assert_eq!(creative.levels_deducted, 0);
-        assert!(!creative.damage_anvil);
+        let repair = || {
+            let mut left = stack("diamond_sword", 1);
+            comp_set_varint(&mut left.2, COMP_DAMAGE, 100);
+            AnvilMenu {
+                left,
+                right: stack("diamond", 2),
+                ..AnvilMenu::default()
+            }
+        };
+        let mut menu = repair();
+        let mut xp = experience(0);
+        assert!(menu
+            .take_result(
+                "Diamond Sword",
+                &mut xp,
+                false,
+                |_| true,
+                || panic!("unaffordable")
+            )
+            .is_none());
+        xp.level = 10;
+        assert!(menu
+            .take_result(
+                "Diamond Sword",
+                &mut xp,
+                false,
+                |_| false,
+                || panic!("destination full")
+            )
+            .is_none());
+        assert!(menu
+            .take_result("Diamond Sword", &mut xp, false, |_| true, || Some(f32::NAN))
+            .is_none());
+        assert_eq!(xp, experience(10));
+        assert_eq!(menu.right, stack("diamond", 2));
 
-        input.preview.level_cost = 40;
-        assert_eq!(handle_anvil_take_result(&input, 40, false), None);
-        assert_eq!(handle_anvil_take_result(&input, 0, true).unwrap().levels_deducted, 0);
-        input.preview.level_cost = 0;
-        assert_eq!(handle_anvil_take_result(&input, 40, true), None);
-        input.preview.level_cost = 1;
-        input.damage_roll = f32::NAN;
-        assert_eq!(handle_anvil_take_result(&input, 40, false), None);
+        let preview = menu.result("Diamond Sword", false).unwrap();
+        let taken = menu
+            .take_result("Diamond Sword", &mut xp, false, |_| true, || Some(0.1199))
+            .unwrap();
+        assert_eq!(taken.output, preview.stack);
+        assert_eq!(menu.right, stack("diamond", 1));
+        assert_eq!(xp, experience(9));
+        assert!(taken.damage_anvil);
+        assert!(
+            !repair()
+                .take_result("Diamond Sword", &mut xp, false, |_| true, || Some(0.12))
+                .unwrap()
+                .damage_anvil
+        );
+
+        let mut menu = repair();
+        comp_set_varint(&mut menu.left.2, COMP_PRIOR_WORK, 39);
+        xp.level = 40;
+        assert_eq!(
+            menu.result("Diamond Sword", false),
+            Err(AnvilError::TooExpensive(40))
+        );
+        assert!(menu
+            .take_result(
+                "Diamond Sword",
+                &mut xp,
+                false,
+                |_| true,
+                || panic!("too expensive")
+            )
+            .is_none());
+        xp.level = 0;
+        let taken = menu
+            .take_result(
+                "Diamond Sword",
+                &mut xp,
+                true,
+                |_| true,
+                || panic!("creative"),
+            )
+            .unwrap();
+        assert_eq!(xp, experience(0));
+        assert!(!taken.damage_anvil);
+        assert!(menu
+            .take_result("Diamond Sword", &mut xp, true, |_| true, || None)
+            .is_none());
     }
 
     #[test]
-    fn smithing_take_requires_recipe_and_consumes_each_input_once() {
-        let template = stack("netherite_upgrade_smithing_template", 4);
-        let mut base = enchanted_stack("diamond_sword", &[("sharpness", 3)]);
-        comp_set_varint(&mut base.2, COMP_DAMAGE, 40);
-        let addition = stack("netherite_ingot", 9);
-        let result = handle_smithing_take_result(&template, &base, &addition).unwrap();
-        assert_eq!(item_to_name(result.output.0), Some("netherite_sword"));
-        assert_eq!(result.output.1, 1);
-        assert_eq!(result.output.2, base.2);
-        assert_eq!((result.template_consumed, result.base_consumed, result.addition_consumed), (1, 1, 1));
-        assert_eq!(handle_smithing_take_result(&stack("netherite_upgrade_smithing_template", 0), &base, &addition), None);
-        assert_eq!(handle_smithing_take_result(&template, &base, &stack("diamond", 1)), None);
-        let trimmed = handle_smithing_take_result(&stack("bolt_armor_trim_smithing_template", 1), &stack("iron_chestplate", 1), &stack("amethyst_shard", 1)).unwrap();
-        assert_eq!(comp_get(&trimmed.output.2, COMP_ARMOR_TRIM), Some([1, 1, 1].as_slice()));
+    fn smithing_take_preserves_components_and_supports_trims() {
+        let mut menu = SmithingMenu {
+            template: stack("netherite_upgrade_smithing_template", 4),
+            base: enchanted_stack("diamond_sword", &[("sharpness", 3)]),
+            addition: stack("netherite_ingot", 9),
+        };
+        comp_set_varint(&mut menu.base.2, COMP_DAMAGE, 40);
+        let components = menu.base.2.clone();
+        let result = menu.take_result(|_| true).unwrap();
+        assert_eq!(item_to_name(result.0), Some("netherite_sword"));
+        assert_eq!(result.1, 1);
+        assert_eq!(result.2, components);
+        assert_eq!((menu.template.1, menu.base.1, menu.addition.1), (3, 0, 8));
+        menu.template.1 = 0;
+        menu.base = stack("diamond_sword", 1);
+        assert_eq!(menu.take_result(|_| true), None);
+
+        let mut trim = SmithingMenu {
+            template: stack("bolt_armor_trim_smithing_template", 1),
+            base: stack("iron_chestplate", 1),
+            addition: stack("amethyst_shard", 1),
+        };
+        let result = trim.take_result(|_| true).unwrap();
+        assert_eq!(
+            comp_get(&result.2, COMP_ARMOR_TRIM),
+            Some([1, 1, 1].as_slice())
+        );
+    }
+
+    #[test]
+    fn xp_set_points_checks_the_current_level_and_only_changes_progress() {
+        for level in [0, 14, 15, 29, 30, 1_000_000] {
+            let mut xp = PlayerXpState {
+                level,
+                progress: 0.25,
+                total_experience: 726,
+            };
+            let needed = xp_needed_for_next_level(level) as i32;
+            xp.set(30, ExperienceUnit::Levels).unwrap();
+            assert_eq!(
+                (xp.level, xp.progress, xp.total_experience),
+                (30, 0.25, 726)
+            );
+            xp.set(level, ExperienceUnit::Levels).unwrap();
+            let original = xp;
+            assert_eq!(
+                xp.set(needed, ExperienceUnit::Points),
+                Err(ExperienceSetError::PointsOutOfRange)
+            );
+            assert_eq!(
+                xp.set(-1, ExperienceUnit::Points),
+                Err(ExperienceSetError::NegativeAmount)
+            );
+            assert_eq!(xp, original);
+            xp.set(needed - 1, ExperienceUnit::Points).unwrap();
+            assert_eq!(xp.progress, (needed - 1) as f32 / needed as f32);
+            xp.set(0, ExperienceUnit::Points).unwrap();
+            assert_eq!(
+                xp,
+                PlayerXpState {
+                    progress: 0.0,
+                    ..original
+                }
+            );
+        }
+
+        let mut xp = PlayerXpState {
+            level: 300_000_000,
+            progress: 0.5,
+            total_experience: 7,
+        };
+        assert_eq!(
+            xp.set(0, ExperienceUnit::Points),
+            Err(ExperienceSetError::PointsOutOfRange)
+        );
+        assert_eq!(xp.progress, 0.5);
     }
 
     #[test]
@@ -2151,19 +2423,19 @@ mod player_mechanisms_tests {
             saturation: 0.5,
             ..FoodData::default()
         };
-        let mut health = 20.0;
-        food.tick(&mut health, 20.0, HungerDifficulty::Normal, true);
+        let health = 20.0;
+        food.tick(health, 20.0, HungerDifficulty::Normal, true);
         assert_eq!(
             (food.exhaustion, food.saturation, food.food_level),
             (4.0, 0.5, 20)
         );
         food.add_exhaustion(5.0);
-        food.tick(&mut health, 20.0, HungerDifficulty::Normal, true);
+        food.tick(health, 20.0, HungerDifficulty::Normal, true);
         assert_eq!(
             (food.exhaustion, food.saturation, food.food_level),
             (5.0, 0.0, 20)
         );
-        food.tick(&mut health, 20.0, HungerDifficulty::Normal, true);
+        food.tick(health, 20.0, HungerDifficulty::Normal, true);
         assert_eq!(
             (food.exhaustion, food.food_level, food.last_food_level),
             (1.0, 19, 20)
@@ -2171,7 +2443,7 @@ mod player_mechanisms_tests {
 
         food.add_exhaustion(100.0);
         assert_eq!(food.exhaustion, 40.0);
-        food.tick(&mut health, 20.0, HungerDifficulty::Peaceful, true);
+        food.tick(health, 20.0, HungerDifficulty::Peaceful, true);
         assert_eq!(
             (food.exhaustion, food.food_level, food.last_food_level),
             (36.0, 19, 19)
@@ -2189,62 +2461,414 @@ mod player_mechanisms_tests {
             saturation: 0.0,
             ..FoodData::default()
         };
-        let mut health = 10.0;
         for _ in 0..9 {
-            rapid.tick(&mut health, 20.0, HungerDifficulty::Normal, true);
+            assert_eq!(
+                rapid.tick(10.0, 20.0, HungerDifficulty::Normal, true),
+                FoodTick::None
+            );
         }
-        assert_eq!(health, 10.0);
-        rapid.tick(&mut health, 20.0, HungerDifficulty::Normal, true);
         assert_eq!(
-            (health, rapid.exhaustion, rapid.saturation),
-            (10.5, 3.0, 3.0)
+            rapid.tick(10.0, 20.0, HungerDifficulty::Normal, true),
+            FoodTick::Heal(0.5)
         );
+        assert_eq!((rapid.exhaustion, rapid.saturation), (3.0, 3.0));
 
         for _ in 0..79 {
-            standard.tick(&mut health, 20.0, HungerDifficulty::Easy, true);
+            assert_eq!(
+                standard.tick(10.5, 20.0, HungerDifficulty::Easy, true),
+                FoodTick::None
+            );
         }
-        assert_eq!(health, 10.5);
-        standard.tick(&mut health, 20.0, HungerDifficulty::Easy, false);
+        assert_eq!(
+            standard.tick(10.5, 20.0, HungerDifficulty::Easy, false),
+            FoodTick::None
+        );
         assert_eq!(standard.tick_timer, 0);
-        for _ in 0..80 {
-            standard.tick(&mut health, 20.0, HungerDifficulty::Easy, true);
+        for _ in 0..79 {
+            assert_eq!(
+                standard.tick(10.5, 20.0, HungerDifficulty::Easy, true),
+                FoodTick::None
+            );
         }
-        assert_eq!((health, standard.exhaustion), (11.5, 6.0));
+        assert_eq!(
+            standard.tick(10.5, 20.0, HungerDifficulty::Easy, true),
+            FoodTick::Heal(1.0)
+        );
+        assert_eq!(standard.exhaustion, 6.0);
 
-        let mut shared = FoodData::default();
-        shared.food_level = 18;
+        let mut shared = FoodData {
+            food_level: 18,
+            ..FoodData::default()
+        };
         for _ in 0..9 {
-            shared.tick(&mut health, 20.0, HungerDifficulty::Normal, true);
+            assert_eq!(
+                shared.tick(11.5, 20.0, HungerDifficulty::Normal, true),
+                FoodTick::None
+            );
         }
         shared.food_level = 20;
         shared.saturation = 8.0;
-        shared.tick(&mut health, 20.0, HungerDifficulty::Normal, true);
-        assert_eq!((health, shared.exhaustion), (12.5, 6.0));
+        assert_eq!(
+            shared.tick(11.5, 20.0, HungerDifficulty::Normal, true),
+            FoodTick::Heal(1.0)
+        );
+        assert_eq!(shared.exhaustion, 6.0);
+    }
+
+    #[test]
+    fn hunger_uses_post_exhaustion_saturation_and_requests_unclipped_healing() {
+        let mut food = FoodData {
+            saturation: 4.0,
+            exhaustion: 4.5,
+            tick_timer: 9,
+            ..FoodData::default()
+        };
+        assert_eq!(
+            food.tick(19.75, 20.0, HungerDifficulty::Peaceful, true),
+            FoodTick::Heal(0.5)
+        );
+        assert_eq!(
+            (food.exhaustion, food.saturation, food.food_level),
+            (3.5, 3.0, 20)
+        );
+
+        food.tick_timer = 9;
+        assert_eq!(
+            food.tick(20.0, 20.0, HungerDifficulty::Normal, true),
+            FoodTick::None
+        );
+        assert_eq!(food.tick_timer, 0);
     }
 
     #[test]
     fn hunger_starves_every_eighty_ticks_with_difficulty_limits() {
-        for (difficulty, starting, minimum) in [
-            (HungerDifficulty::Easy, 11.0, 10.0),
-            (HungerDifficulty::Normal, 2.0, 1.0),
-            (HungerDifficulty::Hard, 1.0, 0.0),
+        for (difficulty, health, blocked) in [
+            (HungerDifficulty::Peaceful, 10.25, Some(10.0)),
+            (HungerDifficulty::Easy, 10.25, Some(10.0)),
+            (HungerDifficulty::Normal, 1.25, Some(1.0)),
+            (HungerDifficulty::Hard, 1.0, None),
         ] {
             let mut food = FoodData {
-                food_level: 0,
+                food_level: 1,
                 saturation: 0.0,
+                exhaustion: 5.0,
                 ..FoodData::default()
             };
-            let mut health = starting;
+            // Exhaustion can start the starvation timer on this same tick.
+            if difficulty == HungerDifficulty::Peaceful {
+                food.food_level = 0;
+            }
             for _ in 0..79 {
-                food.tick(&mut health, 20.0, difficulty, false);
+                assert_eq!(food.tick(health, 20.0, difficulty, false), FoodTick::None);
             }
-            assert_eq!(health, starting);
-            food.tick(&mut health, 20.0, difficulty, false);
-            assert_eq!(health, minimum);
-            for _ in 0..80 {
-                food.tick(&mut health, 20.0, difficulty, true);
+            assert_eq!(food.food_level, 0);
+            assert_eq!(food.tick(health, 20.0, difficulty, false), FoodTick::Starve);
+            assert_eq!(food.tick_timer, 0);
+            if let Some(health) = blocked {
+                food.tick_timer = 79;
+                assert_eq!(food.tick(health, 20.0, difficulty, true), FoodTick::None);
+                assert_eq!(food.tick_timer, 0);
             }
-            assert_eq!(health, minimum);
         }
+    }
+
+    fn experience(level: i32) -> PlayerXpState {
+        PlayerXpState {
+            level,
+            progress: 0.5,
+            total_experience: 42,
+        }
+    }
+
+    #[test]
+    fn enchanting_menu_uses_displayed_offer_and_charges_the_selected_price() {
+        let mut menu = EnchantmentMenu {
+            item: stack("diamond_sword", 1),
+            lapis: stack("lapis_lazuli", 2),
+            ..EnchantmentMenu::default()
+        };
+        let mut seed = 12345;
+        let mut rng = generation_math::Lcg::new(12345);
+        let rng_before = rng.state48();
+        menu.refresh_offers(seed, 15);
+        let mut xp = experience(menu.offers[2].required_level);
+        let before = xp;
+        let selected = menu.offers[2].enchantments.clone();
+        for invalid in [-1, 3, 2] {
+            assert_eq!(
+                menu.click_button(invalid, &mut xp, &mut seed, false, &mut rng),
+                EnchantingClick::Rejected
+            );
+        }
+        assert_eq!((xp, seed, rng.state48()), (before, 12345, rng_before));
+
+        assert!(menu.item.2.is_empty());
+        menu.lapis = stack("redstone", 4);
+        assert_eq!(
+            menu.click_button(2, &mut xp, &mut seed, false, &mut rng),
+            EnchantingClick::Rejected
+        );
+        menu.lapis = stack("lapis_lazuli", 4);
+        xp.level -= 1;
+        assert_eq!(
+            menu.click_button(2, &mut xp, &mut seed, false, &mut rng),
+            EnchantingClick::Rejected
+        );
+        xp.level += 1;
+        assert_eq!(
+            menu.click_button(2, &mut xp, &mut seed, false, &mut rng),
+            EnchantingClick::Enchanted
+        );
+        assert_eq!(xp.level, before.level - 3);
+        assert_eq!((xp.progress, xp.total_experience), (0.5, 42));
+        assert_eq!(seed, 1_553_932_502);
+        assert_eq!(menu.lapis, stack("lapis_lazuli", 1));
+        assert_eq!(enchantments_get(&menu.item.2), selected);
+        assert_eq!(menu.enchantment_seed, seed);
+        assert_eq!(
+            menu.click_button(0, &mut xp, &mut seed, false, &mut rng),
+            EnchantingClick::Rejected
+        );
+        assert!(menu.offers.iter().all(|offer| offer.required_level == 0));
+    }
+
+    #[test]
+    fn enchanting_menu_creative_uses_no_lapis_and_resets_xp_below_the_price() {
+        let mut menu = EnchantmentMenu {
+            item: stack("book", 1),
+            ..EnchantmentMenu::default()
+        };
+        let mut xp = experience(0);
+        let mut seed = 12345;
+        let mut rng = generation_math::Lcg::new(5678);
+        menu.refresh_offers(seed, 15);
+        assert_eq!(
+            menu.click_button(1, &mut xp, &mut seed, true, &mut rng),
+            EnchantingClick::Enchanted
+        );
+        assert_eq!(
+            xp,
+            PlayerXpState {
+                level: 0,
+                progress: 0.0,
+                total_experience: 0
+            }
+        );
+        assert_eq!(item_to_name(menu.item.0), Some("enchanted_book"));
+        assert_eq!(menu.lapis, Stack::default());
+    }
+
+    #[test]
+    fn enchanting_menu_converts_a_book_and_preserves_its_custom_name() {
+        for slot in 0..2 {
+            let mut menu = EnchantmentMenu {
+                item: stack("book", 1),
+                lapis: stack("lapis_lazuli", 3),
+                ..EnchantmentMenu::default()
+            };
+            let name = nbt_string("Field Notes");
+            comp_set(&mut menu.item.2, COMP_CUSTOM_NAME, name.clone());
+            let mut xp = experience(30);
+            let mut seed = 12345;
+            let mut rng = generation_math::Lcg::new(12345);
+            menu.refresh_offers(seed, 15);
+            assert_eq!(
+                menu.click_button(slot, &mut xp, &mut seed, false, &mut rng),
+                EnchantingClick::Enchanted
+            );
+            assert_eq!(xp.level, 29 - slot);
+            assert_eq!(menu.lapis.1, 2 - slot as u8);
+            assert_eq!(item_to_name(menu.item.0), Some("enchanted_book"));
+            assert!(comp_get(&menu.item.2, COMP_STORED_ENCHANTMENTS).is_some());
+            assert_eq!(
+                comp_get(&menu.item.2, COMP_CUSTOM_NAME),
+                Some(name.as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn enchanting_menu_accepts_an_empty_roll_without_spending_or_advancing_rng() {
+        let mut menu = EnchantmentMenu {
+            item: stack("dirt", 1),
+            ..EnchantmentMenu::default()
+        };
+        menu.offers[0].required_level = 1;
+        let mut xp = experience(30);
+        let mut seed = 12345;
+        let mut rng = generation_math::Lcg::new(5678);
+        let before = rng.state48();
+        assert_eq!(
+            menu.click_button(0, &mut xp, &mut seed, true, &mut rng),
+            EnchantingClick::Accepted
+        );
+        assert_eq!(xp, experience(30));
+        assert_eq!((seed, rng.state48()), (12345, before));
+        assert_eq!(menu.item, stack("dirt", 1));
+    }
+
+    #[test]
+    fn anvil_menu_filters_rename_and_preserves_the_prior_work_of_rename_only() {
+        let mut menu = AnvilMenu {
+            left: stack("diamond_sword", 1),
+            ..AnvilMenu::default()
+        };
+        comp_set_varint(&mut menu.left.2, COMP_PRIOR_WORK, 63);
+
+        assert!(menu.rename("Diamond Sword"));
+        assert_eq!(
+            menu.result("Diamond Sword", false),
+            Err(AnvilError::InvalidInput)
+        );
+        assert!(menu.rename(&format!("R{}", "🗡".repeat(24))));
+        assert!(!menu.rename(&format!("R{}", "🗡".repeat(25))));
+        assert!(menu.rename("N§a\nme\u{7f}"));
+        assert!(!menu.rename("Name"));
+
+        let result = menu.result("Diamond Sword", false).unwrap();
+        assert_eq!(result.level_cost, 39);
+        assert_eq!(comp_varint(&result.stack.2, COMP_PRIOR_WORK), Some(63));
+        assert_eq!(
+            comp_get(&result.stack.2, COMP_CUSTOM_NAME),
+            Some(nbt_string("Name").as_slice())
+        );
+        let mut xp = experience(38);
+        assert!(menu
+            .take_result("Diamond Sword", &mut xp, false, |_| true, || None)
+            .is_none());
+        xp.level = 39;
+        assert!(menu
+            .take_result("Diamond Sword", &mut xp, false, |_| false, || None)
+            .is_none());
+        assert_eq!(xp.level, 39);
+        assert_eq!(
+            menu.take_result("Diamond Sword", &mut xp, false, |_| true, || None),
+            Some(AnvilTakeResult {
+                output: result.stack,
+                damage_anvil: false
+            })
+        );
+        assert_eq!(xp.level, 0);
+        assert_eq!((xp.progress, xp.total_experience), (0.5, 42));
+        assert!(menu
+            .take_result("Diamond Sword", &mut xp, false, |_| true, || None)
+            .is_none());
+    }
+
+    #[test]
+    fn anvil_menu_takes_only_material_used_and_advances_the_repair_cost() {
+        let mut menu = AnvilMenu {
+            left: stack("diamond_sword", 1),
+            right: stack("diamond", 6),
+            ..AnvilMenu::default()
+        };
+        comp_set_varint(&mut menu.left.2, COMP_DAMAGE, 600);
+        comp_set_varint(&mut menu.left.2, COMP_PRIOR_WORK, 3);
+        comp_set(&mut menu.left.2, COMP_CUSTOM_NAME, nbt_string("Old"));
+        assert!(menu.rename("é"));
+        let mut xp = experience(6);
+        let result = menu
+            .take_result("Old", &mut xp, false, |_| true, || None)
+            .unwrap();
+        assert_eq!(xp.level, 0);
+        assert_eq!(menu.left, Stack::default());
+        assert_eq!(menu.right, stack("diamond", 4));
+        assert_eq!(comp_varint(&result.output.2, COMP_PRIOR_WORK), Some(7));
+        assert_eq!(comp_get(&result.output.2, COMP_CUSTOM_NAME), None);
+    }
+
+    #[test]
+    fn anvil_menu_does_not_add_prior_work_to_fresh_rename() {
+        let mut menu = AnvilMenu {
+            left: stack("diamond_sword", 1),
+            ..AnvilMenu::default()
+        };
+        assert!(menu.rename("Field Sword"));
+        let result = menu.result("Diamond Sword", false).unwrap();
+        assert_eq!(result.level_cost, 1);
+        assert_eq!(comp_get(&result.stack.2, COMP_PRIOR_WORK), None);
+        comp_set_varint(&mut menu.left.2, COMP_PRIOR_WORK, 0);
+        assert_eq!(menu.result("Diamond Sword", false).unwrap(), result);
+    }
+
+    #[test]
+    fn smithing_menu_rechecks_three_inputs_and_consumes_one_each_on_take() {
+        let mut menu = SmithingMenu {
+            template: stack("netherite_upgrade_smithing_template", 2),
+            base: stack("diamond_pickaxe", 1),
+            addition: stack("netherite_ingot", 2),
+        };
+        comp_set_varint(&mut menu.base.2, COMP_DAMAGE, 100);
+        let preview = menu.result().unwrap();
+        assert_eq!(item_to_name(preview.0), Some("netherite_pickaxe"));
+        assert_eq!(comp_varint(&preview.2, COMP_DAMAGE), Some(100));
+        assert!(menu.take_result(|_| false).is_none());
+        menu.addition = stack("diamond", 2);
+        assert!(menu.take_result(|_| true).is_none());
+        assert_eq!((menu.template.1, menu.base.1, menu.addition.1), (2, 1, 2));
+
+        menu.addition = stack("netherite_ingot", 2);
+        assert_eq!(menu.take_result(|_| true), Some(preview));
+        assert_eq!((menu.template.1, menu.base.1, menu.addition.1), (1, 0, 1));
+        assert!(menu.take_result(|_| true).is_none());
+    }
+
+    #[test]
+    fn brewing_menu_enforces_bottle_limits_and_ingredient_and_fuel_roles() {
+        let mut menu = BrewingMenu::default();
+        let mut cursor = stack("glass_bottle", 3);
+        assert!(!menu.click_slot(-1, 0, &mut cursor));
+        assert!(!menu.click_slot(5, 0, &mut cursor));
+        assert!(!menu.click_slot(3, 0, &mut cursor));
+        assert!(menu.click_slot(0, 0, &mut cursor));
+        assert_eq!(cursor.1, 2);
+        assert!(!menu.click_slot(0, 0, &mut cursor));
+        assert_eq!(menu.slots[0], stack("glass_bottle", 1));
+
+        for (slot, bottle) in [(0, "potion"), (1, "splash_potion"), (2, "lingering_potion")] {
+            cursor = stack(bottle, 1);
+            assert!(menu.click_slot(slot, 1, &mut cursor));
+            assert_eq!(menu.slots[slot as usize], stack(bottle, 1));
+        }
+
+        cursor = stack("breeze_rod", 4);
+        assert!(!menu.click_slot(4, 0, &mut cursor));
+        assert!(!menu.click_slot(0, 0, &mut cursor));
+        assert!(menu.click_slot(3, 1, &mut cursor));
+        assert_eq!(cursor.1, 3);
+        cursor = stack("blaze_powder", 2);
+        assert!(menu.click_slot(3, 0, &mut cursor));
+        assert_eq!(cursor, stack("breeze_rod", 1));
+        cursor = stack("blaze_powder", 4);
+        assert!(menu.click_slot(4, 0, &mut cursor));
+        assert_eq!(menu.slots[4], stack("blaze_powder", 4));
+        assert_eq!(cursor, Stack::default());
+        assert!(menu.click_slot(4, 1, &mut cursor));
+        assert_eq!((cursor.1, menu.slots[4].1), (2, 2));
+
+        menu.slots[3] = stack("glass_bottle", 1);
+        cursor = stack("glass_bottle", 2);
+        assert!(menu.click_slot(3, 0, &mut cursor));
+        assert_eq!(cursor.1, 3);
+        assert_eq!(menu.slots[3], Stack::default());
+
+        // Vanilla pulls only what fits, even on a secondary click.
+        menu.slots[3] = stack("glass_bottle", 4);
+        cursor.1 = (stack_max_of(&cursor) - 1) as u8;
+        assert!(menu.click_slot(3, 1, &mut cursor));
+        assert_eq!(i64::from(cursor.1), stack_max_of(&cursor));
+        assert_eq!(menu.slots[3], stack("glass_bottle", 3));
+    }
+
+    #[test]
+    fn brewing_menu_merges_equal_components_and_respects_their_stack_limit() {
+        let mut menu = BrewingMenu::default();
+        let mut cursor = stack("blaze_powder", 3);
+        comp_set_varint(&mut cursor.2, 1, 3);
+        comp_set(&mut cursor.2, COMP_CUSTOM_NAME, nbt_string("Fuel"));
+        menu.slots[4] = (cursor.0, 1, cursor.2.iter().rev().cloned().collect());
+        assert!(menu.click_slot(4, 0, &mut cursor));
+        assert_eq!((menu.slots[4].1, cursor.1), (3, 1));
+        assert!(!menu.click_slot(4, 1, &mut cursor));
     }
 }
