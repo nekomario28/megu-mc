@@ -151,9 +151,10 @@ What changed to contain that, without pretending it is authentication:
   the real save" race. It does **not** stop someone from logging in as a player
   who is currently offline.
 - **Optional allowlist**: `MC_SPINE_ALLOWLIST="Steve,Alex,01234567-89ab-..."`
-  (comma/space separated names and/or UUIDs; default unset = off). Since
-  identities are unauthenticated, an allowlist of *names* is a speed bump, not
-  a lock; it is useful together with a firewall.
+  (comma/space separated names and/or UUIDs, unset by default). UUID entries
+  match the server-derived `OfflinePlayer:<name>` UUID. Update any entries
+  recorded from older client-supplied UUIDs. Offline identities remain
+  unauthenticated, so use the allowlist together with a firewall.
 
 ### Limits and their knobs (defaults are invisible on loopback)
 

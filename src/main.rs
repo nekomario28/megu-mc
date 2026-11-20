@@ -29767,8 +29767,8 @@ fn handshake_parts(hs: &[u8]) -> Option<(i64, i64)> {
     matches!(next, 1 | 2).then_some((protocol, next))
 }
 
-// This is an offline-mode prototype; client-provided identities are NOT
-// authenticated. Reject malformed and unbounded names and UUIDs.
+// Protocol 767 includes a UUID in Login Start. In offline mode the server
+// derives the UUID from the validated name, as Java nameUUIDFromBytes does.
 fn login_identity(body: &[u8]) -> Option<(String, [u8; 16])> {
     let mut p = body;
     let name_len = usize::try_from(read_varint(&mut p)?).ok()?;
@@ -29779,8 +29779,10 @@ fn login_identity(body: &[u8]) -> Option<(String, [u8; 16])> {
     if !valid_player_name(name) {
         return None;
     }
-    let mut uuid = [0u8; 16];
-    uuid.copy_from_slice(&p[name_len..name_len + 16]);
+    let material = format!("OfflinePlayer:{name}");
+    let mut uuid = generation_math::md5(material.as_bytes());
+    uuid[6] = (uuid[6] & 0x0f) | 0x30;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
     Some((name.to_owned(), uuid))
 }
 
@@ -35871,10 +35873,11 @@ mod handshake_security_tests {
         let mut login = Vec::new();
         write_str(&mut login, "Test_Player");
         login.extend_from_slice(&[7u8; 16]);
-        assert_eq!(
-            login_identity(&login),
-            Some(("Test_Player".into(), [7; 16]))
-        );
+        let expected = [
+            0xa3, 0x3a, 0xc9, 0xaa, 0x13, 0xa8, 0x30, 0x09, 0xa0, 0x68, 0xbb, 0x13, 0x80,
+            0xa2, 0xd0, 0xb0,
+        ];
+        assert_eq!(login_identity(&login), Some(("Test_Player".into(), expected)));
     }
     #[test]
     fn malformed_handshake_is_rejected_without_panicking() {
