@@ -2007,6 +2007,339 @@ fn eval_clone(
     Ok(changes)
 }
 
+// Pure 1.21.1 random-tick evaluators. These are kept independent of the server's
+// world storage and RNG so callers can supply snapshots and apply returned changes.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum CropKind {
+    Wheat,
+    Carrots,
+    Potatoes,
+    Beetroots,
+    NetherWart,
+    MelonStem,
+    PumpkinStem,
+    SweetBerryBush,
+    Cocoa,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct CropTickInput {
+    kind: CropKind,
+    age: u8,
+    light: u8,
+    farmland_below: bool,
+    /// Moisture values for farmland, `None` for any other block; row-major by z then x.
+    farmland_3x3: [[Option<u8>; 3]; 3],
+    same_crop_north_south: bool,
+    same_crop_east_west: bool,
+    /// Raw caller-provided random value; modulo the species-specific bound chooses growth.
+    random_value: u32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn crop_growth_speed(
+    farmland_3x3: [[Option<u8>; 3]; 3],
+    same_crop_north_south: bool,
+    same_crop_east_west: bool,
+) -> f32 {
+    let mut speed = 1.0_f32;
+    for (z, row) in farmland_3x3.iter().enumerate() {
+        for (x, moisture) in row.iter().enumerate() {
+            let mut contribution = match moisture {
+                Some(moisture) if *moisture > 0 => 3.0,
+                Some(_) => 1.0,
+                None => 0.0,
+            };
+            if x != 1 || z != 1 {
+                contribution /= 4.0;
+            }
+            speed += contribution;
+        }
+    }
+    // CropBlock halves growth speed only when the same crop borders on both axes.
+    if same_crop_north_south && same_crop_east_west {
+        speed /= 2.0;
+    }
+    speed
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_crop_random_tick(input: CropTickInput) -> Option<u8> {
+    let max_age = match input.kind {
+        CropKind::Beetroots | CropKind::NetherWart | CropKind::SweetBerryBush => 3,
+        CropKind::Cocoa => 2,
+        _ => 7,
+    };
+    if input.age >= max_age {
+        return None;
+    }
+    let grows = match input.kind {
+        CropKind::NetherWart => input.random_value % 10 == 0,
+        CropKind::Cocoa | CropKind::SweetBerryBush => input.random_value % 5 == 0,
+        CropKind::Wheat
+        | CropKind::Carrots
+        | CropKind::Potatoes
+        | CropKind::Beetroots
+        | CropKind::MelonStem
+        | CropKind::PumpkinStem => {
+            if input.light < 9 || !input.farmland_below {
+                return None;
+            }
+            let speed = crop_growth_speed(
+                input.farmland_3x3,
+                input.same_crop_north_south,
+                input.same_crop_east_west,
+            );
+            let bound = (25.0_f32 / speed) as u32 + 1;
+            input.random_value % bound == 0
+        }
+    };
+    grows.then_some(input.age + 1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct RandomTickSection {
+    chunk_x: i32,
+    section_y: i32,
+    chunk_z: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum RandomTickDispatch {
+    Crop,
+    Fire,
+    Leaves,
+    Snow,
+    Ice,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct RandomTickSample {
+    pos: BlockPos,
+    dispatch: RandomTickDispatch,
+}
+
+/// Java's 48-bit LCG, locally seeded for reproducible section sampling.
+#[cfg_attr(not(test), allow(dead_code))]
+struct WorldMechanismLcg(u64);
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WorldMechanismLcg {
+    fn new(seed: u64) -> Self {
+        Self((seed ^ 0x5deece66d) & ((1_u64 << 48) - 1))
+    }
+    fn next_bits(&mut self, bits: u32) -> u32 {
+        self.0 = self.0.wrapping_mul(0x5deece66d).wrapping_add(0xb) & ((1_u64 << 48) - 1);
+        (self.0 >> (48 - bits)) as u32
+    }
+    fn next_int(&mut self, bound: u32) -> u32 {
+        assert!(bound > 0);
+        if bound.is_power_of_two() {
+            return ((u64::from(bound) * u64::from(self.next_bits(31))) >> 31) as u32;
+        }
+        loop {
+            let bits = self.next_bits(31);
+            let value = bits % bound;
+            if bits.wrapping_sub(value).wrapping_add(bound - 1) < (1 << 31) {
+                return value;
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_random_ticks(
+    sections: &[RandomTickSection],
+    random_tick_speed: u32,
+    seed: u64,
+    mut block_name: impl FnMut(BlockPos) -> String,
+) -> Vec<RandomTickSample> {
+    let mut rng = WorldMechanismLcg::new(seed);
+    let mut samples = Vec::new();
+    for section in sections {
+        for _ in 0..random_tick_speed {
+            let pos = (
+                section.chunk_x * 16 + rng.next_int(16) as i32,
+                section.section_y * 16 + rng.next_int(16) as i32,
+                section.chunk_z * 16 + rng.next_int(16) as i32,
+            );
+            let name = block_name(pos);
+            let dispatch = if matches!(
+                name.as_str(),
+                "minecraft:wheat"
+                    | "minecraft:carrots"
+                    | "minecraft:potatoes"
+                    | "minecraft:beetroots"
+                    | "minecraft:nether_wart"
+                    | "minecraft:melon_stem"
+                    | "minecraft:pumpkin_stem"
+                    | "minecraft:sweet_berry_bush"
+                    | "minecraft:cocoa"
+            ) {
+                RandomTickDispatch::Crop
+            } else if name == "minecraft:fire" || name == "minecraft:soul_fire" {
+                RandomTickDispatch::Fire
+            } else if name.ends_with("_leaves") {
+                RandomTickDispatch::Leaves
+            } else if name == "minecraft:snow" {
+                RandomTickDispatch::Snow
+            } else if name == "minecraft:ice" {
+                RandomTickDispatch::Ice
+            } else {
+                RandomTickDispatch::Other
+            };
+            samples.push(RandomTickSample { pos, dispatch });
+        }
+    }
+    samples
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+const DEFAULT_RANDOM_TICK_SPEED: u32 = 3;
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_random_ticks_default(
+    sections: &[RandomTickSection],
+    seed: u64,
+    block_name: impl FnMut(BlockPos) -> String,
+) -> Vec<RandomTickSample> {
+    eval_random_ticks(sections, DEFAULT_RANDOM_TICK_SPEED, seed, block_name)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct FireTickInput {
+    age: u8,
+    rain_exposed: bool,
+    soul_fire: bool,
+    /// Adjacent cells in a fixed caller-defined order; true means flammable.
+    flammable_neighbors: [bool; 6],
+    /// A 0..15 roll for each adjacent cell, where 0 means a spread attempt.
+    spread_rolls: [u8; 6],
+    /// The 0..2 random value used for vanilla's one-in-three age increment.
+    age_roll: u8,
+    /// A 0..15 roll for the fire's random burnout check.
+    burnout_roll: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct FireTickResult {
+    extinguished: bool,
+    age: Option<u8>,
+    spread: [bool; 6],
+    burned_out: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_fire_tick(input: FireTickInput) -> FireTickResult {
+    let mut result = FireTickResult {
+        extinguished: false,
+        age: Some(input.age.min(15)),
+        spread: [false; 6],
+        burned_out: false,
+    };
+    if input.rain_exposed && !input.soul_fire {
+        result.extinguished = true;
+        result.age = None;
+        return result;
+    }
+    if input.soul_fire {
+        return result;
+    }
+    let age = input.age.min(15);
+    result.age = Some(if input.age_roll % 3 == 2 {
+        age.saturating_add(1).min(15)
+    } else {
+        age
+    });
+    for index in 0..6 {
+        result.spread[index] = input.flammable_neighbors[index] && input.spread_rolls[index] == 0;
+    }
+    result.burned_out =
+        input.burnout_roll % 4 == 0 && !input.flammable_neighbors.iter().any(|v| *v);
+    if result.burned_out {
+        result.age = None;
+    }
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct LeafDecayInput {
+    persistent: bool,
+    distance: u8,
+    random_roll: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct LeafDecayResult {
+    decay: bool,
+    drop_item: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_leaf_decay(input: LeafDecayInput) -> LeafDecayResult {
+    let decay = !input.persistent && input.distance >= 7;
+    LeafDecayResult {
+        decay,
+        drop_item: decay && input.random_roll % 20 == 0,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct SnowIceTickInput {
+    cold_biome: bool,
+    sky_exposed: bool,
+    light: u8,
+    support_is_full_solid: bool,
+    water_source: bool,
+    random_roll: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum SnowIceTickResult {
+    NoChange,
+    AccumulateSnow,
+    FreezeWater,
+    MeltIce,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_snow_accumulation(input: SnowIceTickInput) -> SnowIceTickResult {
+    if input.cold_biome
+        && input.sky_exposed
+        && !input.support_is_full_solid
+        && input.light < 10
+        && input.random_roll % 16 == 0
+    {
+        SnowIceTickResult::AccumulateSnow
+    } else {
+        SnowIceTickResult::NoChange
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_ice_freeze_melt(input: SnowIceTickInput, is_ice: bool) -> SnowIceTickResult {
+    if is_ice && input.light >= 11 {
+        return SnowIceTickResult::MeltIce;
+    }
+    if !is_ice && input.water_source && input.cold_biome && input.sky_exposed {
+        return SnowIceTickResult::FreezeWater;
+    }
+    SnowIceTickResult::NoChange
+}
+
 #[cfg(test)]
 mod world_mechanisms_tests {
     use super::*;
@@ -2019,6 +2352,229 @@ mod world_mechanisms_tests {
     const NETHER: &str = "minecraft:story/enter_the_nether";
     const END: &str = "minecraft:story/enter_the_end";
     const DRAGON: &str = "minecraft:end/kill_dragon";
+
+    #[test]
+    fn crop_growth_uses_vanilla_farmland_moisture_and_canopy_penalties() {
+        let dry = [[Some(0); 3]; 3];
+        let wet = [[Some(7); 3]; 3];
+        let empty = [[None; 3]; 3];
+        assert_eq!(crop_growth_speed(dry, false, false), 4.0);
+        assert_eq!(crop_growth_speed(wet, false, false), 10.0);
+        assert_eq!(crop_growth_speed(wet, true, false), 10.0);
+        assert_eq!(crop_growth_speed(wet, true, true), 5.0);
+        assert_eq!(crop_growth_speed(empty, false, false), 1.0);
+
+        let input = CropTickInput {
+            kind: CropKind::Wheat,
+            age: 2,
+            light: 9,
+            farmland_below: true,
+            farmland_3x3: wet,
+            same_crop_north_south: false,
+            same_crop_east_west: false,
+            random_value: 0,
+        };
+        assert_eq!(eval_crop_random_tick(input), Some(3));
+        assert_eq!(
+            eval_crop_random_tick(CropTickInput { light: 8, ..input }),
+            None
+        );
+        assert_eq!(
+            eval_crop_random_tick(CropTickInput {
+                farmland_below: false,
+                ..input
+            }),
+            None
+        );
+        assert_eq!(
+            eval_crop_random_tick(CropTickInput { age: 7, ..input }),
+            None
+        );
+
+        for (kind, age, roll, expected) in [
+            (CropKind::NetherWart, 0, 9, None),
+            (CropKind::NetherWart, 0, 10, Some(1)),
+            (CropKind::Cocoa, 1, 5, Some(2)),
+            (CropKind::SweetBerryBush, 2, 10, Some(3)),
+            (CropKind::Beetroots, 2, 0, Some(3)),
+            (CropKind::Carrots, 2, 0, Some(3)),
+            (CropKind::Potatoes, 2, 0, Some(3)),
+            (CropKind::MelonStem, 2, 0, Some(3)),
+            (CropKind::PumpkinStem, 2, 0, Some(3)),
+        ] {
+            let input = CropTickInput {
+                kind,
+                age,
+                light: 15,
+                farmland_below: true,
+                farmland_3x3: wet,
+                same_crop_north_south: false,
+                same_crop_east_west: false,
+                random_value: roll,
+            };
+            assert_eq!(eval_crop_random_tick(input), expected);
+        }
+    }
+
+    #[test]
+    fn random_tick_samples_are_seeded_section_local_and_dispatch_by_name() {
+        let sections = [
+            RandomTickSection {
+                chunk_x: -2,
+                section_y: 4,
+                chunk_z: 3,
+            },
+            RandomTickSection {
+                chunk_x: 1,
+                section_y: -1,
+                chunk_z: -3,
+            },
+        ];
+        let run = |seed| {
+            eval_random_ticks_default(&sections, seed, |pos| match pos.0.rem_euclid(6) {
+                0 => "minecraft:wheat".to_owned(),
+                1 => "minecraft:oak_leaves".to_owned(),
+                2 => "minecraft:fire".to_owned(),
+                3 => "minecraft:snow".to_owned(),
+                4 => "minecraft:ice".to_owned(),
+                _ => "minecraft:stone".to_owned(),
+            })
+        };
+        let first = run(1234);
+        assert_eq!(first, run(1234));
+        assert_ne!(first, run(1235));
+        assert_eq!(first.len(), 6);
+        assert!(first.iter().all(|tick| {
+            let (cx, sy, cz) = (
+                tick.pos.0.div_euclid(16),
+                tick.pos.1.div_euclid(16),
+                tick.pos.2.div_euclid(16),
+            );
+            sections.contains(&RandomTickSection {
+                chunk_x: cx,
+                section_y: sy,
+                chunk_z: cz,
+            })
+        }));
+        let crops = eval_random_ticks_default(&sections, 1234, |_| "minecraft:wheat".to_owned());
+        assert!(crops
+            .iter()
+            .all(|tick| tick.dispatch == RandomTickDispatch::Crop));
+    }
+
+    #[test]
+    fn fire_age_spread_rain_burnout_and_soul_fire_are_evaluated() {
+        let mut input = FireTickInput {
+            age: 14,
+            rain_exposed: false,
+            soul_fire: false,
+            flammable_neighbors: [true, false, true, false, false, false],
+            spread_rolls: [0, 0, 1, 0, 0, 0],
+            age_roll: 2,
+            burnout_roll: 2,
+        };
+        let result = eval_fire_tick(input);
+        assert_eq!(result.age, Some(15));
+        assert_eq!(result.spread, [true, false, false, false, false, false]);
+        assert!(!result.extinguished && !result.burned_out);
+        input.burnout_roll = 0;
+        input.flammable_neighbors = [false; 6];
+        let result = eval_fire_tick(input);
+        assert_eq!(result.age, None);
+        assert!(result.burned_out);
+        input.rain_exposed = true;
+        assert!(eval_fire_tick(input).extinguished);
+        input.soul_fire = true;
+        let soul = eval_fire_tick(input);
+        assert!(!soul.extinguished);
+        assert_eq!(soul.age, Some(14));
+    }
+
+    #[test]
+    fn only_nonpersistent_distance_seven_leaves_decay_and_drop_at_one_in_twenty() {
+        for persistent in [true, false] {
+            for distance in 1..=7 {
+                let result = eval_leaf_decay(LeafDecayInput {
+                    persistent,
+                    distance,
+                    random_roll: 0,
+                });
+                assert_eq!(result.decay, !persistent && distance == 7);
+                assert_eq!(result.drop_item, !persistent && distance == 7);
+            }
+        }
+        assert!(
+            !eval_leaf_decay(LeafDecayInput {
+                persistent: false,
+                distance: 7,
+                random_roll: 1
+            })
+            .drop_item
+        );
+    }
+
+    #[test]
+    fn snow_ice_freezing_and_melting_obey_climate_exposure_and_light() {
+        let base = SnowIceTickInput {
+            cold_biome: true,
+            sky_exposed: true,
+            light: 9,
+            support_is_full_solid: false,
+            water_source: true,
+            random_roll: 0,
+        };
+        assert_eq!(
+            eval_snow_accumulation(base),
+            SnowIceTickResult::AccumulateSnow
+        );
+        assert_eq!(
+            eval_ice_freeze_melt(base, false),
+            SnowIceTickResult::FreezeWater
+        );
+        assert_eq!(
+            eval_ice_freeze_melt(SnowIceTickInput { light: 10, ..base }, true),
+            SnowIceTickResult::NoChange
+        );
+        assert_eq!(
+            eval_ice_freeze_melt(SnowIceTickInput { light: 11, ..base }, true),
+            SnowIceTickResult::MeltIce
+        );
+        assert_eq!(
+            eval_snow_accumulation(SnowIceTickInput { light: 10, ..base }),
+            SnowIceTickResult::NoChange
+        );
+        assert_eq!(
+            eval_snow_accumulation(SnowIceTickInput {
+                sky_exposed: false,
+                ..base
+            }),
+            SnowIceTickResult::NoChange
+        );
+        assert_eq!(
+            eval_snow_accumulation(SnowIceTickInput {
+                cold_biome: false,
+                ..base
+            }),
+            SnowIceTickResult::NoChange
+        );
+        assert_eq!(
+            eval_snow_accumulation(SnowIceTickInput {
+                support_is_full_solid: true,
+                ..base
+            }),
+            SnowIceTickResult::NoChange
+        );
+        assert_eq!(
+            eval_ice_freeze_melt(
+                SnowIceTickInput {
+                    water_source: false,
+                    ..base
+                },
+                false
+            ),
+            SnowIceTickResult::NoChange
+        );
+    }
 
     fn command_block(name: &str) -> Option<u32> {
         match name {
