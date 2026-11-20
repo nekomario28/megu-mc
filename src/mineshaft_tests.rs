@@ -621,6 +621,17 @@ fn stage_native_case(g: &mut Gen, case: &J) {
     g.stage_payloads((int(case, "cx"), int(case, "cz")), &mut payloads);
 }
 
+fn strip_outer_footers(payload: &[u8]) -> &[u8] {
+    let (payload, _) = crate::read_world_seed_footer(payload).unwrap();
+    let (payload, _) = crate::read_mob_dimensions_footer(payload).unwrap();
+    let (payload, _) = crate::read_brewing_footer(payload).unwrap();
+    let (payload, _) = crate::read_dim2_footer(payload).unwrap();
+    let (payload, _, _) = crate::read_dim_footer(payload).unwrap();
+    let (payload, _) = crate::read_block_loot_footer(payload).unwrap();
+    let (payload, _) = crate::read_drop_owners_footer(payload).unwrap();
+    payload
+}
+
 #[test]
 fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
     if crate::test_support::isolated_world_test() {
@@ -644,7 +655,7 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
         let raw = std::fs::read(path).unwrap();
         let payload = crate::unwrap_world_payload(raw).unwrap();
         let saved = crate::generated_content::Snapshot::read(
-            crate::tick_persistence::prefix(&payload).unwrap(),
+            crate::tick_persistence::prefix(strip_outer_footers(&payload)).unwrap(),
         )
         .unwrap()
         .unwrap();
@@ -721,7 +732,7 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
         let mut deleted = Vec::new();
         crate::save_world_into(&mut deleted);
         let deleted = crate::generated_content::Snapshot::read(
-            crate::tick_persistence::prefix(&deleted).unwrap(),
+            crate::tick_persistence::prefix(strip_outer_footers(&deleted)).unwrap(),
         )
         .unwrap()
         .unwrap();
