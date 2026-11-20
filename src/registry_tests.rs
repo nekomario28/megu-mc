@@ -2032,3 +2032,435 @@ fn m3_p5_hot_path_ab_bench() {
         (new_lookup / old_lookup - 1.0) * 100.0
     );
 }
+
+// ---------- W4-B1: pack.mcmeta format validation (vanilla 1.21.1 = 48) ----------
+//
+// The datapack loader currently decides a directory is a pack from the mere presence of
+// `pack.mcmeta`, then reads its content whatever format it declares. Vanilla 1.21.1 instead
+// ignores packs whose format does not match. `validate_pack_mcmeta_format` is the pure
+// decision that check needs: bytes in, an interpreted supported-format interval or a concrete
+// reason for rejection out. It does no I/O and touches no global state, so the caller can own
+// the file read and the logging.
+//
+// The `supported_formats` field, when present, is authoritative: a pack made for a newer
+// format can still declare compatibility back down to 48. With the field absent, only the
+// point format 48 is compatible.
+
+/// The datapack format vanilla 1.21.1 speaks.
+pub(crate) const VANILLA_1211_PACK_FORMAT: i64 = 48;
+
+/// The supported format interval a pack declares after interpretation. A pack with no
+/// `supported_formats` is the single point `[pack_format, pack_format]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PackFormatRange {
+    pub min: i64,
+    pub max: i64,
+}
+
+impl PackFormatRange {
+    fn contains(self, format: i64) -> bool {
+        self.min <= format && format <= self.max
+    }
+}
+
+/// Why a `pack.mcmeta` was rejected, kept as a typed reason so a loader can log it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackFormatError {
+    /// The bytes are not JSON at all.
+    MalformedJson,
+    /// The top-level `pack` object is missing or is not a JSON object.
+    MissingPackObject,
+    /// `pack.pack_format` is absent.
+    MissingPackFormat,
+    /// `pack.pack_format` is present but not a whole, in-range number.
+    InvalidPackFormat,
+    /// No `supported_formats` declared, and `pack_format` is not the 1.21.1 format.
+    WrongPackFormat(i64),
+    /// `supported_formats` is not an integer, a two-element integer array, or an
+    /// integer `{min_inclusive, max_inclusive}` object.
+    MalformedSupportedFormats,
+    /// `supported_formats` declares a range whose lower bound exceeds its upper bound.
+    InvertedSupportedRange { min: i64, max: i64 },
+    /// `supported_formats` is well formed but does not include format 48.
+    FormatNotSupported { min: i64, max: i64 },
+}
+
+/// Extract a whole number from the shared JSON value type. Formats are whole, finite
+/// numbers inside the `i64` range; a fractional value, a string or a boolean is not one.
+fn json_whole_number(j: &crate::json::J) -> Option<i64> {
+    match j {
+        crate::json::J::Num(n)
+            if n.is_finite()
+                && n.fract() == 0.0
+                && *n >= i64::MIN as f64
+                && *n < i64::MAX as f64 =>
+        {
+            Some(*n as i64)
+        }
+        _ => None,
+    }
+}
+
+/// Interpret the three shapes vanilla accepts for `supported_formats`:
+/// an integer (a point), `[min, max]`, or `{"min_inclusive": a, "max_inclusive": b}`.
+fn interpret_supported_formats(j: &crate::json::J) -> Result<PackFormatRange, PackFormatError> {
+    use crate::json::J;
+    match j {
+        J::Num(_) => {
+            let n = json_whole_number(j).ok_or(PackFormatError::MalformedSupportedFormats)?;
+            Ok(PackFormatRange { min: n, max: n })
+        }
+        J::Arr(a) => {
+            if a.len() != 2 {
+                return Err(PackFormatError::MalformedSupportedFormats);
+            }
+            let min = json_whole_number(&a[0]).ok_or(PackFormatError::MalformedSupportedFormats)?;
+            let max = json_whole_number(&a[1]).ok_or(PackFormatError::MalformedSupportedFormats)?;
+            if min > max {
+                return Err(PackFormatError::InvertedSupportedRange { min, max });
+            }
+            Ok(PackFormatRange { min, max })
+        }
+        J::Obj(_) => {
+            let min = j
+                .get("min_inclusive")
+                .and_then(json_whole_number)
+                .ok_or(PackFormatError::MalformedSupportedFormats)?;
+            let max = j
+                .get("max_inclusive")
+                .and_then(json_whole_number)
+                .ok_or(PackFormatError::MalformedSupportedFormats)?;
+            if min > max {
+                return Err(PackFormatError::InvertedSupportedRange { min, max });
+            }
+            Ok(PackFormatRange { min, max })
+        }
+        _ => Err(PackFormatError::MalformedSupportedFormats),
+    }
+}
+
+/// The shared `jparse` stops at the end of the first value and accepts bare `true`/`false`/
+/// `null`-like tokens as values without checking the rest of the token. A `pack.mcmeta` must be
+/// one complete JSON object, so check the byte structure before interpreting it. This only
+/// checks completeness and a single object root - `jparse` still enforces the value grammar.
+fn json_is_one_complete_object(bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'{') {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut prev: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+        } else {
+            match c {
+                b'"' => in_string = true,
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    // The shared parser tolerates a trailing comma before a closing bracket;
+                    // strict JSON does not.
+                    if prev == Some(b',') {
+                        return false;
+                    }
+                    match depth.checked_sub(1) {
+                        Some(d) => depth = d,
+                        None => return false,
+                    }
+                }
+                _ => {}
+            }
+            prev = Some(c);
+            if depth == 0 {
+                return bytes[i + 1..]
+                    .iter()
+                    .all(|b| b.is_ascii_whitespace());
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Validate a `pack.mcmeta` file's bytes against the vanilla 1.21.1 datapack format (48).
+/// Returns the supported-format interval on success, or the concrete reason for rejection.
+/// Pure: no file reads, no globals, no logging.
+pub(crate) fn validate_pack_mcmeta_format(
+    bytes: &[u8],
+) -> Result<PackFormatRange, PackFormatError> {
+    if !json_is_one_complete_object(bytes) {
+        return Err(PackFormatError::MalformedJson);
+    }
+    let root = crate::json::jparse(bytes).ok_or(PackFormatError::MalformedJson)?;
+    let pack = root
+        .get("pack")
+        .ok_or(PackFormatError::MissingPackObject)?;
+    if !matches!(pack, crate::json::J::Obj(_)) {
+        return Err(PackFormatError::MissingPackObject);
+    }
+    let raw_format = pack
+        .get("pack_format")
+        .ok_or(PackFormatError::MissingPackFormat)?;
+    let pack_format = json_whole_number(raw_format).ok_or(PackFormatError::InvalidPackFormat)?;
+
+    match pack.get("supported_formats") {
+        None => {
+            if pack_format != VANILLA_1211_PACK_FORMAT {
+                return Err(PackFormatError::WrongPackFormat(pack_format));
+            }
+            Ok(PackFormatRange {
+                min: pack_format,
+                max: pack_format,
+            })
+        }
+        Some(sf) => {
+            let range = interpret_supported_formats(sf)?;
+            if !range.contains(VANILLA_1211_PACK_FORMAT) {
+                return Err(PackFormatError::FormatNotSupported {
+                    min: range.min,
+                    max: range.max,
+                });
+            }
+            Ok(range)
+        }
+    }
+}
+
+#[test]
+fn pack_mcmeta_accepts_the_vanilla_1211_point_format() {
+    let range = validate_pack_mcmeta_format(
+        br#"{"pack":{"pack_format":48,"description":"vanilla worldgen data"}}"#,
+    )
+    .expect("a bare 1.21.1 pack must be accepted");
+    assert_eq!(range, PackFormatRange { min: 48, max: 48 });
+
+    // Other keys in the object and the root are irrelevant to the decision.
+    let range = validate_pack_mcmeta_format(
+        br#"{"other":1,"pack":{"description":"d","pack_format":48,"extra":[1,2]}}"#,
+    )
+    .expect("extra keys must not change the verdict");
+    assert_eq!(range, PackFormatRange { min: 48, max: 48 });
+}
+
+#[test]
+fn pack_mcmeta_accepts_every_supported_formats_shape() {
+    // Integer point at 48.
+    let point = validate_pack_mcmeta_format(
+        br#"{"pack":{"pack_format":48,"supported_formats":48}}"#,
+    )
+    .expect("an integer supported_formats of 48 must be accepted");
+    assert_eq!(point, PackFormatRange { min: 48, max: 48 });
+
+    // [min, max] array containing 48.
+    let array = validate_pack_mcmeta_format(
+        br#"{"pack":{"pack_format":48,"supported_formats":[46,50]}}"#,
+    )
+    .expect("an array range containing 48 must be accepted");
+    assert_eq!(array, PackFormatRange { min: 46, max: 50 });
+
+    // {min_inclusive, max_inclusive} object containing 48.
+    let object = validate_pack_mcmeta_format(
+        br#"{"pack":{"pack_format":48,"supported_formats":{"min_inclusive":47,"max_inclusive":49}}}"#,
+    )
+    .expect("an object range containing 48 must be accepted");
+    assert_eq!(object, PackFormatRange { min: 47, max: 49 });
+
+    // A degenerate range whose two ends are both 48 is still a point.
+    let collapsed = validate_pack_mcmeta_format(
+        br#"{"pack":{"pack_format":48,"supported_formats":[48,48]}}"#,
+    )
+    .expect("a collapsed range at 48 must be accepted");
+    assert_eq!(collapsed, PackFormatRange { min: 48, max: 48 });
+}
+
+#[test]
+fn pack_mcmeta_accepts_a_newer_pack_that_declares_backward_compatibility() {
+    // `supported_formats` is authoritative: a pack made for a newer format may declare that
+    // it also works down to 48, and vanilla would load it on a 1.21.1 server.
+    let range = validate_pack_mcmeta_format(
+        br#"{"pack":{"pack_format":61,"supported_formats":[48,61]}}"#,
+    )
+    .expect("a newer pack declaring 48 in its range must be accepted");
+    assert_eq!(range, PackFormatRange { min: 48, max: 61 });
+
+    let range = validate_pack_mcmeta_format(
+        br#"{"pack":{"pack_format":61,"supported_formats":{"min_inclusive":44,"max_inclusive":61}}}"#,
+    )
+    .expect("the object form of the same backcompat range must be accepted");
+    assert_eq!(range, PackFormatRange { min: 44, max: 61 });
+}
+
+#[test]
+fn pack_mcmeta_rejects_malformed_json() {
+    for bytes in [
+        &b""[..],
+        b"not json",
+        b"{",
+        b"{\"pack\":",
+        b"{\"pack\": {\"pack_format\": 48,}}",
+        br#"{"pack":{"pack_format":48,"supported_formats":[48,]}}"#,
+        b"[1, 2,",
+    ] {
+        assert_eq!(
+            validate_pack_mcmeta_format(bytes),
+            Err(PackFormatError::MalformedJson),
+            "input {bytes:?} must be rejected as malformed"
+        );
+    }
+}
+
+#[test]
+fn pack_mcmeta_rejects_a_missing_or_non_object_pack_field() {
+    for bytes in [
+        &b"{}"[..],
+        b"{\"other\":{}}",
+        br#"{"pack":null}"#,
+        br#"{"pack":"48"}"#,
+        br#"{"pack":48}"#,
+    ] {
+        assert_eq!(
+            validate_pack_mcmeta_format(bytes),
+            Err(PackFormatError::MissingPackObject),
+            "input {bytes:?} has no pack object"
+        );
+    }
+}
+
+#[test]
+fn pack_mcmeta_rejects_a_missing_or_invalid_pack_format() {
+    assert_eq!(
+        validate_pack_mcmeta_format(br#"{"pack":{"description":"d"}}"#),
+        Err(PackFormatError::MissingPackFormat)
+    );
+    for bytes in [
+        &br#"{"pack":{"pack_format":"48"}}"#[..],
+        br#"{"pack":{"pack_format":48.5}}"#,
+        br#"{"pack":{"pack_format":null}}"#,
+        br#"{"pack":{"pack_format":[48]}}"#,
+    ] {
+        assert_eq!(
+            validate_pack_mcmeta_format(bytes),
+            Err(PackFormatError::InvalidPackFormat),
+            "input {bytes:?} has a non-integer pack_format"
+        );
+    }
+    // The shared parser maps a bare `true`/`false` to 1/0, so it cannot make a valid format.
+    // They must still be rejected, even though the reported reason is a wrong point format.
+    for bytes in [
+        &br#"{"pack":{"pack_format":true}}"#[..],
+        br#"{"pack":{"pack_format":false}}"#,
+    ] {
+        assert_ne!(
+            validate_pack_mcmeta_format(bytes),
+            Ok(PackFormatRange { min: 48, max: 48 }),
+            "input {bytes:?} must never be accepted as format 48"
+        );
+    }
+}
+
+#[test]
+fn pack_mcmeta_rejects_a_wrong_bare_pack_format() {
+    // Too old and too new alike: with no supported_formats the format must be exactly 48.
+    for format in [1i64, 4, 47, 49, 61] {
+        let bytes = format!(r#"{{"pack":{{"pack_format":{format}}}}}"#);
+        assert_eq!(
+            validate_pack_mcmeta_format(bytes.as_bytes()),
+            Err(PackFormatError::WrongPackFormat(format)),
+            "bare format {format} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn pack_mcmeta_rejects_malformed_supported_formats() {
+    for bytes in [
+        &br#"{"pack":{"pack_format":48,"supported_formats":"48"}}"#[..],
+        br#"{"pack":{"pack_format":48,"supported_formats":null}}"#,
+        br#"{"pack":{"pack_format":48,"supported_formats":[]}}"#,
+        br#"{"pack":{"pack_format":48,"supported_formats":[48]}}"#,
+        br#"{"pack":{"pack_format":48,"supported_formats":[48,49,50]}}"#,
+        br#"{"pack":{"pack_format":48,"supported_formats":[48,"49"]}}"#,
+        br#"{"pack":{"pack_format":48,"supported_formats":48.5}}"#,
+        br#"{"pack":{"pack_format":48,"supported_formats":{"min_inclusive":48}}}"#,
+        br#"{"pack":{"pack_format":48,"supported_formats":{"max_inclusive":50}}}"#,
+        br#"{"pack":{"pack_format":48,"supported_formats":{"min_inclusive":"48","max_inclusive":50}}}"#,
+    ] {
+        assert_eq!(
+            validate_pack_mcmeta_format(bytes),
+            Err(PackFormatError::MalformedSupportedFormats),
+            "input {bytes:?} has a malformed supported_formats"
+        );
+    }
+}
+
+#[test]
+fn pack_mcmeta_rejects_inverted_supported_ranges() {
+    assert_eq!(
+        validate_pack_mcmeta_format(br#"{"pack":{"pack_format":48,"supported_formats":[50,48]}}"#),
+        Err(PackFormatError::InvertedSupportedRange { min: 50, max: 48 })
+    );
+    assert_eq!(
+        validate_pack_mcmeta_format(
+            br#"{"pack":{"pack_format":48,"supported_formats":{"min_inclusive":50,"max_inclusive":48}}}"#
+        ),
+        Err(PackFormatError::InvertedSupportedRange { min: 50, max: 48 })
+    );
+}
+
+#[test]
+fn pack_mcmeta_rejects_well_formed_ranges_that_exclude_48() {
+    for bytes in [
+        &br#"{"pack":{"pack_format":48,"supported_formats":61}}"#[..],
+        br#"{"pack":{"pack_format":48,"supported_formats":[50,60]}}"#,
+        br#"{"pack":{"pack_format":48,"supported_formats":[1,47]}}"#,
+        br#"{"pack":{"pack_format":48,"supported_formats":{"min_inclusive":50,"max_inclusive":60}}}"#,
+    ] {
+        match validate_pack_mcmeta_format(bytes) {
+            Err(PackFormatError::FormatNotSupported { min, max }) => {
+                assert!(
+                    min > VANILLA_1211_PACK_FORMAT || max < VANILLA_1211_PACK_FORMAT,
+                    "input {bytes:?}: range [{min}, {max}] must exclude 48"
+                );
+            }
+            other => panic!("input {bytes:?} must be rejected as out of range, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn bundled_datapacks_all_declare_a_format_compatible_with_1211() {
+    let base = std::path::Path::new("datapacks");
+    let mut checked = 0usize;
+    for entry in std::fs::read_dir(base).expect("datapacks/ must be readable") {
+        let entry = entry.expect("a datapack directory entry must be readable");
+        let meta = entry.path().join("pack.mcmeta");
+        if !meta.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&meta).expect("a bundled pack.mcmeta must be readable");
+        let range = validate_pack_mcmeta_format(&bytes)
+            .unwrap_or_else(|err| panic!("{} is invalid: {err:?}", meta.display()));
+        assert!(
+            range.contains(VANILLA_1211_PACK_FORMAT),
+            "{} does not support format 48: {range:?}",
+            meta.display()
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 6,
+        "the bundled datapacks must be checked, but only {checked} were"
+    );
+}
