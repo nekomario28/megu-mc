@@ -3579,24 +3579,12 @@ fn keepalive_time_tick() {
             .iter()
             .filter(|m| matches!(m.etype, 124 | 23 | 91 | 100))
             .count();
-        let cls: Vec<Arc<Client>> = client_snapshot();
-        if mcount < 12 && !cls.is_empty() {
-            // The spawn attempt count, not the world tick, drives the rotation.
-            // Deriving it from t made the cadence change collapse the choice to a
-            // single etype: at 20TPS every attempt lands on the same t/40 residue.
-            let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-            if let Some(c) = cls.get(attempt as usize % cls.len()) {
-                let (px, _py, pz, ..) = {
-                    let p = c.pos.lock().unwrap();
-                    *p
-                };
-                let ang = (t as f64) * 2.399;
-                let (nx, nz) = (px + ang.cos() * 14.0, pz + ang.sin() * 14.0);
-                let ny = surface_y(nx.round() as i32, nz.round() as i32);
+        if mcount < 12 {
+            if let Some(((nx, ny, nz), attempt)) = nightly_hostile_spawn_position(t) {
                 let biome = worldgen::biome_name_at_block(
-                    nx.round() as i32,
-                    ny.round() as i32,
-                    nz.round() as i32,
+                    nx.floor() as i32,
+                    ny.floor() as i32,
+                    nz.floor() as i32,
                 );
                 let et = spawn_etype_for_biome(biome.as_deref(), attempt);
                 let m = Arc::new(Mob {
@@ -3614,12 +3602,7 @@ fn keepalive_time_tick() {
                     air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
                 });
                 mobs().lock().unwrap().push(m);
-                drop(cls);
-            } else {
-                drop(cls);
             }
-        } else {
-            drop(cls);
         }
     }
     {
@@ -20661,12 +20644,14 @@ fn switch_client_dimension(
         me.chunks.lock().unwrap().clear();
         me.gen_sources.lock().unwrap().clear();
     }
-    *me.dim.lock().unwrap() = new_dim;
-    *me.in_portal.lock().unwrap() = false;
     {
+        // Spawn eligibility reads this pair in the same lock order.
+        let mut dim = me.dim.lock().unwrap();
         let mut p = me.pos.lock().unwrap();
+        *dim = new_dim;
         *p = (target.0, target.1, target.2, target.3, target.4, true);
     }
+    *me.in_portal.lock().unwrap() = false;
     *me.fall_from.lock().unwrap() = target.1;
     {
         let mut ack = me.chunk_ack.lock().unwrap();
