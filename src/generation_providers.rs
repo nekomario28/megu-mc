@@ -969,48 +969,6 @@ pub(crate) fn is_dirtish(reg: &BReg, st: u32) -> bool {
             | "minecraft:coarse_dirt"
     ) || reg.in_tag(st, "minecraft:dirt")
 }
-/// `LevelReader.getRawBrightness(pos, 0)` for a chunk whose light has not been
-/// initialized yet, which is the state every feature runs in (`INITIALIZE_LIGHT` comes
-/// after `FEATURES`).
-///
-/// The pinned 1.21.1 server answers **0**, in every dimension. `WorldGenRegion` does not
-/// carry the level's light engine: it is built with `useUninitializedLightEngine`, so the
-/// `LightLayer.SKY` term of `getRawBrightness` is the uninitialized 0 rather than
-/// "sees the sky straight up". `-Dmushroomchunk=<cx>,<cz>` measures it directly: it hooks
-/// `MushroomBlock.canSurvive` (`dla.a(dtc,dcz,jd)`) and logs the int the method reads from
-/// `dcz.b(pos, 0)` while preserving it (`tools/carve-agent/Agent.java`,
-/// `CarveLog.mushroomLight`). Measured on captures bound to this tree:
-///
-/// | capture (seed 4242, frozen, structures) | reads | values |
-/// |---|---|---|
-/// | Nether `(-25,19)+3x3` | 464 | 464 x `0` |
-/// | Overworld `(4,-32)+3x3` (village taiga) | 403 | 401 x `0`, 1 x `1`, 1 x `2` |
-///
-/// So an Overworld feature sees `0` too, including under open sky and under a canopy: the
-/// 15 this function used to answer was the port's own model. Landing the measured value was
-/// gated on the *other* half of the mechanism it feeds, because the reference also removes
-/// what it places here: the promotion pass (`LevelChunk.postProcessGeneration`) re-asks
-/// `canSurvive` against a lit engine and turns the extra mushroom into air. Both halves are
-/// now in (`src/template_structures.rs::postprocess_shape_marks`), and the two measurements
-/// that adjudicate the value are:
-///
-/// * 34 moved cells on the seed-4242 64-chunk dump, all `snow[layers=1] -> air` plus the
-///   `grass_block[snowy=true] -> [snowy=false]` cell under it, in `(6,0)`. A native capture
-///   of that window agrees with this arm on **34 / 34** and with the 15 arm on 0 / 34
-///   (`mc-spine-local/audit/brightness-verdict-20261118T110138`).
-/// * the seed-**0** identity dump does not move at all: an instrumented build counts **0**
-///   skylight-brightness consultations in that window at seed 0 against 237 at seed 4242.
-///
-/// See `evidence/gameplay/feature-parity/village-taiga-promotion-pass-20261118.md` and
-/// `light-and-lost-writes-20261116.md`.
-fn uninitialized_raw_brightness(ctx: &FC) -> u8 {
-    // Dimension-independent, and not "15 under open sky": `FEATURES` runs on a
-    // `WorldGenRegion`, whose light engine is uninitialized in every dimension, so only the
-    // block-light term is left. Keeping it (rather than a constant 0) is what makes the
-    // Nether/End answer the chunk's own lights instead of a guess.
-    ctx.block_light(0, 0, 0)
-}
-
 pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z: i32) -> bool {
     let below = ctx.get(x, y - 1, z);
     let at = ctx.get(x, y, z);
@@ -1098,6 +1056,13 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
             is_water_st(reg, at)
                 && (reg.side_solid(below, 1) || reg.name_of(below) == "minecraft:magma_block")
         }
+        // WaterlilyBlock.mayPlaceOn checks the source-water fluid type or an
+        // IceBlock instance. Frosted ice extends IceBlock. Packed and blue ice do not.
+        "minecraft:lily_pad" => {
+            !has_fluid_state(reg, at)
+                && (reg.fluid_name(below) == "minecraft:water"
+                    || matches!(reg.name_of(below), "minecraft:ice" | "minecraft:frosted_ice"))
+        }
         "minecraft:sea_pickle" => is_water_st(reg, at) && reg.is_solid(below),
         // `SmallDripleafBlock.canSurvive` (`dne.a(dtc,dcz,jd)`), measured against the pinned
         // jar by running the native `BlockState.canSurvive` itself: the support is either a
@@ -1155,12 +1120,8 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
             // `(-25,19)+3x3`): the `#minecraft:dirt` reading refuses 24 `brown/red_mushroom_nether`
             // cells the reference places on netherrack, so the solid-render reading is the one the
             // reference implements.
-            //
-            // The brightness half is measured too, and it contradicts the model above; see
-            // `uninitialized_raw_brightness` and
-            // `evidence/gameplay/feature-parity/light-and-lost-writes-20261116.md`.
             reg.in_tag(below, "minecraft:mushroom_grow_block")
-                || (uninitialized_raw_brightness(ctx) < 13 && reg.is_solid_render(below))
+                || (ctx.feature_brightness(x, y, z) < 13 && reg.is_solid_render(below))
         }
         // `BaseFireBlock.canSurvive`: the block below has a sturdy up face (or the cell
         // is a portal, which a patch cannot be). Not the BushBlock rule: `patch_fire`

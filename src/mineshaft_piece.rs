@@ -489,7 +489,7 @@ pub(crate) fn place(
         if !intersects(&piece.bounds, &clip) {
             continue;
         }
-        let previous = ctx.g.mineshaft_spawners.contains(&(sx, sz, i));
+        let previous = ctx.has_mineshaft_spawner((sx, sz, i));
         let mut w = Writer {
             ctx,
             reg,

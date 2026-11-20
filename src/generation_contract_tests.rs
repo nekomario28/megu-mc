@@ -2771,40 +2771,65 @@ fn simple_block_places_both_halves_or_neither() {
 }
 
 #[test]
-fn mushrooms_in_fresh_generation_need_the_special_substrate() {
+fn mushroom_survival_uses_feature_time_light_and_support() {
     let reg = breg().unwrap();
     let mut g = Gen::load(0, crate::name_to_state).unwrap();
     let mut ctx = context(&mut g);
-    // The measurement the write-time gate has to reproduce: at `FEATURES` time the chunk's
-    // light engine is uninitialized and `getRawBrightness(pos, 0)` answers **0 in every
-    // dimension** (`-Dmushroomchunk` on the pinned capture: 403 Overworld reads, 401 x 0 and
-    // two small positives; 464 Nether reads, 464 x 0). So the brightness half of
-    // `MushroomBlock.canSurvive` (`lit < 13`) is *satisfied* at write time and the substrate
-    // half is what decides: a solid-render support is placeable whether or not it is dirt.
-    // Removing the ones a light later reaches is the promotion pass' job
-    // (`postprocess_shape_marks`), not this gate's.
-    ctx.set(0, 202, 0, reg.state_of("minecraft:oak_leaves", None));
-    for (soil, expected) in [
-        // solid render -> the brightness half passes, so the substrate is enough
-        ("dirt", true),
-        ("grass_block", true),
-        ("stone", true),
-        ("basalt", true),
-        ("netherrack", true),
-        ("podzol", true),
-        ("mycelium", true),
-        // not a solid render -> the only false half, and the reason the gate is not "always
-        // place on any block". (`glass` is not a solid *render* either: its occlusion shape is
-        // a full cube but `isSolidRender` is false, so it belongs on this side.)
-        ("oak_leaves", false),
-        ("glass", false),
+    let y = 65;
+    ctx.set(0, y + 2, 0, reg.state_of("minecraft:spruce_planks", None));
+    for (soil, cold, dark) in [
+        ("spruce_planks", false, true),
+        ("dirt", false, true),
+        ("podzol", true, true),
+        ("mycelium", true, true),
+        ("oak_leaves", false, false),
+        ("glass", false, false),
     ] {
-        ctx.set(0, 199, 0, reg.state_of(&format!("minecraft:{soil}"), None));
-        for mushroom in ["minecraft:brown_mushroom", "minecraft:red_mushroom"] {
+        ctx.set(0, y - 1, 0, reg.state_of(&format!("minecraft:{soil}"), None));
+        for (light_ready, expected) in [(false, cold), (true, dark)] {
+            ctx.g.pop_done.clear();
+            if light_ready {
+                // A completed LIGHT dependency window next to the placement column.
+                ctx.g.pop_done.extend((-3..=-1).flat_map(|x| (-1..=1).map(move |z| (x, z))));
+            }
+            for mushroom in ["minecraft:brown_mushroom", "minecraft:red_mushroom"] {
+                assert_eq!(
+                    super::can_place(reg, &mut ctx, mushroom, 0, y, 0),
+                    expected,
+                    "{soil} {mushroom} light_ready={light_ready}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn lily_pads_require_source_water_or_ice_below_empty_fluid() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    let water = reg.state_of("minecraft:water", None);
+    let slab = reg.state_of("minecraft:oak_slab", None);
+    let waterlogged = reg.with_prop(slab, "waterlogged", "true");
+    for (support, allowed) in [
+        (water, true),
+        (reg.with_prop(water, "level", "1"), false),
+        (waterlogged, true),
+        (reg.state_of("minecraft:ice", None), true),
+        (reg.state_of("minecraft:frosted_ice", None), true),
+        (reg.state_of("minecraft:packed_ice", None), false),
+        (reg.state_of("minecraft:blue_ice", None), false),
+        (reg.state_of("minecraft:dirt", None), false),
+    ] {
+        ctx.set(0, 64, 0, support);
+        for (at, empty) in [(0, true), (water, false), (waterlogged, false)] {
+            ctx.set(0, 65, 0, at);
             assert_eq!(
-                super::can_place(reg, &mut ctx, mushroom, 0, 200, 0),
-                expected,
-                "{soil} {mushroom}"
+                super::can_place(reg, &mut ctx, "minecraft:lily_pad", 0, 65, 0),
+                allowed && empty,
+                "below={} at={}",
+                reg.canonical_state(support),
+                reg.canonical_state(at)
             );
         }
     }
@@ -2828,11 +2853,8 @@ fn mushrooms_in_fresh_generation_need_the_special_substrate() {
 /// `(-25,19)+3x3`) that reading refuses 24 `brown/red_mushroom_nether` cells the reference places
 /// on netherrack.
 ///
-/// The Overworld fixture cannot see this either way: `uninitialized_raw_brightness` answers 0 there
-/// too (measured, see `mushrooms_in_fresh_generation_need_the_special_substrate`), so the support
-/// test is the gate in both dimensions. The Nether preset is kept as the table's home because it
-/// has no sky light layer at all, which makes the block-light term exactly 0 by construction
-/// rather than by measurement.
+/// The Nether has no skylight layer, so with zero block light the support
+/// predicate alone decides these placements.
 #[test]
 fn nether_mushrooms_survive_a_solid_render_support() {
     let reg = breg().unwrap();
@@ -7197,7 +7219,7 @@ fn attached_to_leaves_draws_its_probability_before_the_required_empty_check() {
     g.feat_write(cell.0, cell.1, cell.2, stone);
     let mut ctx = context(&mut g);
     let mut rng = Xor::seed_worldgen(seed);
-    deco.run(&mut ctx, &mut rng, &[], &[], &[leaf]);
+    deco.run(&mut ctx, &mut rng, &[], &[], &[leaf], &mut Vec::new());
     let mut want = Xor::seed_worldgen(seed);
     want.next_bound(1); // `Util.getRandom(directions)`, one entry
     want.next_f32(); // probability
@@ -7223,7 +7245,7 @@ fn attached_to_leaves_draws_its_probability_before_the_required_empty_check() {
     let mut g = Gen::load(0, crate::name_to_state).unwrap();
     let mut ctx = context(&mut g);
     let mut rng = Xor::seed_worldgen(seed);
-    deco.run(&mut ctx, &mut rng, &[], &[], &[leaf]);
+    deco.run(&mut ctx, &mut rng, &[], &[], &[leaf], &mut Vec::new());
     let mut want = Xor::seed_worldgen(seed);
     want.next_bound(1);
     want.next_f32();
@@ -7392,7 +7414,7 @@ fn cocoa_binds_its_four_probability_draws_to_north_east_south_west() {
     let mut ctx = context(&mut g);
     ctx.test_writes = Some(Vec::new());
     let mut rng = Xor::seed_worldgen(seed);
-    crate::tree::Deco::Cocoa(prob).run(&mut ctx, &mut rng, &[], &[log], &[]);
+    crate::tree::Deco::Cocoa(prob).run(&mut ctx, &mut rng, &[], &[log], &[], &mut Vec::new());
     let writes: Vec<_> = ctx
         .test_writes
         .as_ref()

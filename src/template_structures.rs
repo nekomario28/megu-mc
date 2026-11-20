@@ -1452,12 +1452,9 @@ fn update_shape<W: TemplateWorld>(
     //    || (level.getRawBrightness(pos, 0) < 13 && isSolidRender(support, below))
     // ```
     //
-    // This is the rule the promotion pass exists for. At `FEATURES` time the brightness is
-    // the *uninitialized* value, so a Nether mushroom on netherrack is written; at
-    // `postProcessGeneration` the same check reads the lit engine and removes the ones a
-    // nearby light source lit, which is how a write the feature layer made disappears from
-    // the saved chunk. With no lit engine to ask (`None`) the state is left alone: guessing
-    // here is exactly the mistake `uninitialized_raw_brightness` records.
+    // At promotion the survival check reads the lit engine, so a nearby light
+    // source can remove a mushroom that survived feature placement. A world
+    // without a promotion light sample keeps the placed state.
     if matches!(bare, "brown_mushroom" | "red_mushroom") {
         let below = world.get(pos.0, pos.1 - 1, pos.2);
         if reg.in_tag(below, "minecraft:mushroom_grow_block") {

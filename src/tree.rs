@@ -1538,8 +1538,13 @@ impl Deco {
         roots: &[P3],
         logs: &[P3],
         foliage: &[P3],
+        decorations: &mut Vec<P3>,
     ) {
         let Some(reg) = breg() else { return };
+        let mut set = |ctx: &mut FC, p: P3, st| {
+            decorations.push(p);
+            ctx.set(p.0, p.1, p.2, st);
+        };
         match self {
             Deco::TrunkVine => {
                 for &p in logs {
@@ -1549,7 +1554,7 @@ impl Deco {
                             let t = (p.0 + ox, p.1, p.2 + oz);
                             if ctx.is_air(t.0, t.1, t.2) {
                                 let base = reg.state_of("minecraft:vine", None);
-                                ctx.set(t.0, t.1, t.2, reg.with_prop(base, face, "true"));
+                                set(ctx, t, reg.with_prop(base, face, "true"));
                             }
                         }
                     }
@@ -1564,13 +1569,13 @@ impl Deco {
                             if ctx.is_air(t.0, t.1, t.2) {
                                 let base = reg.state_of("minecraft:vine", None);
                                 let st = reg.with_prop(base, face, "true");
-                                ctx.set(t.0, t.1, t.2, st);
+                                set(ctx, t, st);
                                 let mut cur = (t.0, t.1 - 1, t.2);
                                 for _ in 0..4 {
                                     if !ctx.is_air(cur.0, cur.1, cur.2) {
                                         break;
                                     }
-                                    ctx.set(cur.0, cur.1, cur.2, st);
+                                    set(ctx, cur, st);
                                     cur.1 -= 1;
                                 }
                             }
@@ -1606,7 +1611,7 @@ impl Deco {
                 for p in places {
                     let front = (p.0, p.1, p.2 + 1); // south
                     if ctx.is_air(p.0, p.1, p.2) && ctx.is_air(front.0, front.1, front.2) {
-                        ctx.set(p.0, p.1, p.2, nest);
+                        set(ctx, p, nest);
                         break;
                     }
                 }
@@ -1639,7 +1644,7 @@ impl Deco {
                                         ("facing", fdir),
                                     ])),
                                 );
-                                ctx.set(cp.0, cp.1, cp.2, st);
+                                set(ctx, cp, st);
                             }
                         }
                     }
@@ -1656,13 +1661,19 @@ impl Deco {
                         (pos.0 - 1, pos.2 + 2),
                         (pos.0 + 2, pos.2 + 2),
                     ] {
-                        self_circle(ctx, rng, bsp, (c.0, pos.1, c.1));
+                        self_circle(ctx, rng, bsp, (c.0, pos.1, c.1), &mut set);
                     }
                     for _ in 0..5 {
                         let pl = rng.next_bound(64);
                         let (xx, zz) = (pl % 8, pl / 8);
                         if xx == 0 || xx == 7 || zz == 0 || zz == 7 {
-                            self_circle(ctx, rng, bsp, (pos.0 - 3 + xx, pos.1, pos.2 - 3 + zz));
+                            self_circle(
+                                ctx,
+                                rng,
+                                bsp,
+                                (pos.0 - 3 + xx, pos.1, pos.2 - 3 + zz),
+                                &mut set,
+                            );
                         }
                     }
                 }
@@ -1704,7 +1715,7 @@ impl Deco {
                         && !reg.in_tag(below, "minecraft:leaves")
                     {
                         let st = bsp.get(ctx, rng, p.0, p.1, p.2);
-                        ctx.set(p.0, p.1, p.2, st);
+                        set(ctx, p, st);
                     }
                 }
             }
@@ -1756,7 +1767,7 @@ impl Deco {
                             }
                         }
                         let st = bsp.get(ctx, rng, pp.0, pp.1, pp.2);
-                        ctx.set(pp.0, pp.1, pp.2, st);
+                        set(ctx, pp, st);
                     }
                 }
             }
@@ -1775,7 +1786,7 @@ impl Deco {
                     let pp = (lp.0 + ox, lp.1 + oy, lp.2 + oz);
                     if rng.next_f32() <= *prob && ctx.is_air(pp.0, pp.1, pp.2) {
                         let st = bsp.get(ctx, rng, pp.0, pp.1, pp.2);
-                        ctx.set(pp.0, pp.1, pp.2, st);
+                        set(ctx, pp, st);
                     }
                 }
             }
@@ -1791,13 +1802,13 @@ impl Deco {
                     "minecraft:pale_hanging_moss",
                     Some(&mkprops(&[("tip", "true")])),
                 );
-                let hanger = |ctx: &mut FC, rng: &mut Xor, mut p: P3| {
+                let mut hanger = |ctx: &mut FC, rng: &mut Xor, mut p: P3| {
                     while ctx.is_air(p.0, p.1 - 1, p.2) && rng.next_f32() >= 0.5 {
-                        ctx.set(p.0, p.1, p.2, moss);
+                        set(ctx, p, moss);
                         p.1 -= 1;
                     }
                     if ctx.is_air(p.0, p.1, p.2) {
-                        ctx.set(p.0, p.1, p.2, moss_tip);
+                        set(ctx, p, moss_tip);
                     }
                 };
                 for &p in logs {
@@ -1845,7 +1856,7 @@ impl Deco {
                                 ("natural", "true"),
                             ])),
                         );
-                        ctx.set(p.0, p.1, p.2, st);
+                        set(ctx, p, st);
                         break;
                     }
                 }
@@ -1870,7 +1881,7 @@ impl Deco {
                             } else {
                                 "minecraft:red_mushroom"
                             };
-                            ctx.set(t.0, t.1, t.2, reg.state_of(n, None));
+                            set(ctx, t, reg.state_of(n, None));
                         }
                     }
                 }
@@ -1878,23 +1889,35 @@ impl Deco {
         }
     }
 }
-fn self_circle(ctx: &mut FC, rng: &mut Xor, bsp: &Bsp, p: P3) {
+fn self_circle(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    bsp: &Bsp,
+    p: P3,
+    set: &mut impl FnMut(&mut FC, P3, u32),
+) {
     for xx in -2..=2i32 {
         for zz in -2..=2i32 {
             if xx.abs() != 2 || zz.abs() != 2 {
-                place_block_at(ctx, rng, bsp, (p.0 + xx, p.1, p.2 + zz));
+                place_block_at(ctx, rng, bsp, (p.0 + xx, p.1, p.2 + zz), set);
             }
         }
     }
 }
-fn place_block_at(ctx: &mut FC, rng: &mut Xor, bsp: &Bsp, p: P3) {
+fn place_block_at(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    bsp: &Bsp,
+    p: P3,
+    set: &mut impl FnMut(&mut FC, P3, u32),
+) {
     for dy in (-3..=2).rev() {
         let c = (p.0, p.1 + dy, p.2);
         let cur = ctx.get(c.0, c.1, c.2);
         if let Some(reg) = breg() {
             if reg.is_air(cur) || reg.in_tag(cur, "minecraft:replaceable_by_trees") {
                 let st = bsp.get(ctx, rng, c.0, c.1, c.2);
-                ctx.set(c.0, c.1, c.2, st);
+                set(ctx, c, st);
                 break;
             }
             if !reg.is_air(cur) && dy < 0 {
@@ -2209,17 +2232,19 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
         decorator_list(&foliage),
         decorator_list(&root_positions),
     );
+    let mut decorations = Vec::new();
     for d in &t.decorators {
-        d.run(ctx, rng, &dec_roots, &dec_logs, &dec_foliage);
+        d.run(ctx, rng, &dec_roots, &dec_logs, &dec_foliage, &mut decorations);
     }
-    if let Some(shape) = update_leaves(ctx, &logs, &root_positions, &foliage) {
+    if let Some(shape) = update_leaves(ctx, &logs, &root_positions, &foliage, &decorations) {
         apply_edge_shape_updates(ctx, &shape);
     }
     true
 }
 /// Native TreeFeature.updateLeaves, not a global shortest-path relaxation.
-/// Only this tree's trunk writes seed bucket zero. Roots are already visited;
-/// foreign logs/leaves are discovered through neighbours, not independently seeded.
+/// Only this tree's trunk writes seed bucket zero. Roots and decorator writes
+/// are already visited and extend the box used for the walk and edge updates.
+/// Foreign logs/leaves are discovered through neighbours, not independently seeded.
 struct LeafShape {
     min: P3,
     filled: Vec<bool>,
@@ -2241,14 +2266,20 @@ impl LeafShape {
     }
 }
 
-fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) -> Option<LeafShape> {
+fn update_leaves(
+    ctx: &mut FC,
+    logs: &[P3],
+    roots: &[P3],
+    foliage: &[P3],
+    decorations: &[P3],
+) -> Option<LeafShape> {
     if logs.is_empty() && foliage.is_empty() {
         return None;
     }
     let reg = breg()?;
     let mut min = (i32::MAX, i32::MAX, i32::MAX);
     let mut max = (i32::MIN, i32::MIN, i32::MIN);
-    for p in logs.iter().chain(roots).chain(foliage) {
+    for p in logs.iter().chain(roots).chain(foliage).chain(decorations) {
         min.0 = min.0.min(p.0);
         min.1 = min.1.min(p.1);
         min.2 = min.2.min(p.2);
@@ -2271,7 +2302,7 @@ fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) -> Opt
         Some(((p.0 - min.0) as usize * ys + (p.1 - min.1) as usize) * zs + (p.2 - min.2) as usize)
     };
     let mut visited = vec![false; xs * ys * zs];
-    for &p in roots {
+    for &p in roots.iter().chain(decorations) {
         if let Some(i) = idx(p) {
             visited[i] = true;
         }
@@ -2783,7 +2814,7 @@ mod tests {
             let mut ctx = FC::new(&mut g);
             // updateLeaves receives this exact box; the two foliage boundary
             // positions only define its extent and are not placements.
-            let _ = update_leaves(&mut ctx, &logs, &blocked, &[min, max]);
+            let _ = update_leaves(&mut ctx, &logs, &blocked, &[min, max], &[]);
             for cell in f[7].split(';') {
                 let (pos, kind) = cell.split_once(':').unwrap();
                 let p = positions(pos, origin)[0];
@@ -2878,7 +2909,7 @@ mod tests {
                 g.feat_write(p.0, p.1, p.2, st);
             }
             let mut ctx = FC::new(&mut g);
-            let shape = update_leaves(&mut ctx, &logs, &blocked, &[min, max]).unwrap();
+            let shape = update_leaves(&mut ctx, &logs, &blocked, &[min, max], &[]).unwrap();
             apply_edge_shape_updates(&mut ctx, &shape);
             let got = ctx.g.generated_leaf_ticks();
             let want: Vec<_> = f[8]

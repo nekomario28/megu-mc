@@ -9646,6 +9646,7 @@ struct PopulateWorkerResult {
     shape_marks: Vec<(i32, i32, i32)>,
     direct_marks: Vec<((i32, i32), Vec<(i32, i32, i32)>)>,
     payloads: crate::generation_context::StagedPayloads,
+    mineshaft_spawners: HashSet<(i32, i32, usize)>,
     feat_hm: HashMap<(i32, i32), (i32, i32)>,
     leaves: Vec<GeneratedTick>,
     fluids: Vec<GeneratedTick>,
@@ -9660,7 +9661,13 @@ struct PopulateWorkerResult {
 /// The worker half of a feature pass: biome union, `References::collect` and the placement
 /// loop. It deliberately omits `carve_ring` (already claimed by `precarve_order`) and the
 /// promotion boundary (an owner-only operation, because it reads `pop_done`).
-fn populate_worker(scratch: &mut Gen, owner: &Gen, sx: i32, sz: i32) -> PopulateWorkerResult {
+fn populate_worker(
+    scratch: &mut Gen,
+    owner: &Gen,
+    (sx, sz): (i32, i32),
+    population_order: &HashMap<(i32, i32), usize>,
+    index: usize,
+) -> PopulateWorkerResult {
     #[cfg(test)]
     POPULATE_WORKERS.fetch_add(1, Ordering::Relaxed);
 
@@ -9669,6 +9676,7 @@ fn populate_worker(scratch: &mut Gen, owner: &Gen, sx: i32, sz: i32) -> Populate
         shape_marks: Vec::new(),
         direct_marks: Vec::new(),
         payloads: Vec::new(),
+        mineshaft_spawners: HashSet::new(),
         feat_hm: HashMap::new(),
         leaves: Vec::new(),
         fluids: Vec::new(),
@@ -9715,7 +9723,7 @@ fn populate_worker(scratch: &mut Gen, owner: &Gen, sx: i32, sz: i32) -> Populate
     }
     let pop = pop_seed(owner.wseed(), sx * 16, sz * 16);
     let mut structures = References::collect(&mut gen, sx, sz);
-    let mut ctx = FC::new_worker(&mut gen, owner);
+    let mut ctx = FC::new_worker(&mut gen, owner, population_order, index);
     LEAF_BITS.with(|c| {
         let mut c = c.borrow_mut();
         c.active = true;
@@ -9771,6 +9779,7 @@ fn populate_worker(scratch: &mut Gen, owner: &Gen, sx: i32, sz: i32) -> Populate
     let shape_marks = std::mem::take(&mut ctx.shape_marks);
     let payloads = std::mem::take(&mut ctx.payloads);
     let direct_marks = gen.take_all_shape_marks();
+    let mineshaft_spawners = std::mem::take(&mut gen.mineshaft_spawners);
     let feat_hm = std::mem::take(&mut gen.feat_hm_for_worker());
     let (leaves, fluids) = gen.take_generated_ticks();
     // A3-a: snapshot the worker's resident terrain answers (its built columns and the
@@ -9782,6 +9791,7 @@ fn populate_worker(scratch: &mut Gen, owner: &Gen, sx: i32, sz: i32) -> Populate
         shape_marks,
         direct_marks,
         payloads,
+        mineshaft_spawners,
         feat_hm,
         leaves,
         fluids,
@@ -9806,6 +9816,7 @@ fn commit_populate(g: &mut Gen, sx: i32, sz: i32, res: PopulateWorkerResult) -> 
         shape_marks,
         direct_marks,
         payloads,
+        mineshaft_spawners,
         feat_hm,
         leaves,
         fluids,
@@ -9821,6 +9832,7 @@ fn commit_populate(g: &mut Gen, sx: i32, sz: i32, res: PopulateWorkerResult) -> 
     g.suppress_generated_ticks = g.restores_ticks_for((sx, sz));
     g.merge_shape_marks(direct_marks);
     g.merge_feat_hm(feat_hm);
+    g.mineshaft_spawners.extend(mineshaft_spawners);
 
     let mut ctx = FC::new_commit(g, wr, shape_marks, payloads);
     promote_full_chunks(&mut ctx, sx, sz);
@@ -9841,6 +9853,9 @@ fn commit_populate(g: &mut Gen, sx: i32, sz: i32, res: PopulateWorkerResult) -> 
 
 /// Run the feature placement of a multi-chunk population in dependency-DAG waves.
 pub(crate) fn populate_parallel(g: &mut Gen, pending: &[(i32, i32)], jobs: usize) -> usize {
+    // Feature-time lighting sees the caller's order even when distant waves
+    // run ahead of one another.
+    let order: HashMap<_, _> = pending.iter().copied().zip(0..).collect();
     let levels = wave_levels(pending, pop_wave_spacing());
     let wave_count = levels.iter().copied().max().unwrap_or(0) + 1;
     let mut results: Vec<Option<PopulateWorkerResult>> = (0..pending.len()).map(|_| None).collect();
@@ -9859,14 +9874,13 @@ pub(crate) fn populate_parallel(g: &mut Gen, pending: &[(i32, i32)], jobs: usize
             // A one-chunk wave has nothing to overlap: a thread and a channel would cost more
             // than the placement itself.
             let i = idxs[0];
-            let (sx, sz) = pending[i];
             let mut scratch = Gen::fresh_scratch(g.data.clone());
             scratch.starts_round = g.starts_round;
             if let Some(resolver) = g.beard_resolver() {
                 scratch.set_beard_resolver(resolver);
             }
             let owner: &Gen = &*g;
-            results[i] = Some(populate_worker(&mut scratch, owner, sx, sz));
+            results[i] = Some(populate_worker(&mut scratch, owner, pending[i], &order, i));
             let (sx, sz) = pending[i];
             let res = results[i].take().expect("just stored");
             ticks[i] = Some(commit_populate(g, sx, sz, res));
@@ -9879,6 +9893,7 @@ pub(crate) fn populate_parallel(g: &mut Gen, pending: &[(i32, i32)], jobs: usize
                 for slice in idxs.chunks(per) {
                     let coords: Vec<usize> = slice.to_vec();
                     let tx = tx.clone();
+                    let order = &order;
                     s.spawn(move || {
                         crate::worldgen::m3_set_worker(true);
                         // One scratch generator per worker (not per chunk): the structure
@@ -9890,10 +9905,10 @@ pub(crate) fn populate_parallel(g: &mut Gen, pending: &[(i32, i32)], jobs: usize
                             scratch.set_beard_resolver(resolver);
                         }
                         for &i in &coords {
-                            let (sx, sz) = pending[i];
                             // Results are indexed by the chunk's place in `pending`, so a
                             // worker finishing early cannot change the commit order.
-                            let _ = tx.send((i, populate_worker(&mut scratch, owner, sx, sz)));
+                            let result = populate_worker(&mut scratch, owner, pending[i], order, i);
+                            let _ = tx.send((i, result));
                         }
                         crate::worldgen::m3_flush();
                     });

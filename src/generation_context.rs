@@ -69,6 +69,8 @@ pub(crate) struct FC<'a> {
     /// serial path has no owner. Every fallback here is read-only: a worker never mutates the
     /// owner, it only commits its own results when the wave ends.
     owner: Option<&'a Gen>,
+    /// Population indices before wave scheduling reorders independent chunks.
+    worker_order: Option<(&'a HashMap<(i32, i32), usize>, usize)>,
     pub(crate) wr: HashMap<(i32, i32, i32), u32>,
     /// `ChunkAccess.postProcessing` as it stands after this chunk's own generation:
     /// the write positions `StructurePiece.placeBlock` marked, in mark order. They
@@ -116,6 +118,7 @@ impl<'a> FC<'a> {
         FC {
             g,
             owner: None,
+            worker_order: None,
             wr: HashMap::new(),
             shape_marks: Vec::new(),
             rc: HashMap::new(),
@@ -139,9 +142,15 @@ impl<'a> FC<'a> {
 
     /// A wave worker's context: its own scratch generator for writes, the owner for the
     /// read-only cross-chunk state the placement loop needs.
-    pub(crate) fn new_worker(g: &'a mut Gen, owner: &'a Gen) -> Self {
+    pub(crate) fn new_worker(
+        g: &'a mut Gen,
+        owner: &'a Gen,
+        order: &'a HashMap<(i32, i32), usize>,
+        index: usize,
+    ) -> Self {
         let mut ctx = FC::new(g);
         ctx.owner = Some(owner);
+        ctx.worker_order = Some((order, index));
         ctx
     }
 
@@ -167,6 +176,13 @@ impl<'a> FC<'a> {
         self.g
             .feature_override(x, y, z)
             .or_else(|| self.owner.and_then(|o| o.feature_override(x, y, z)))
+    }
+
+    pub(crate) fn has_mineshaft_spawner(&self, key: (i32, i32, usize)) -> bool {
+        self.g.mineshaft_spawners.contains(&key)
+            || self
+                .owner
+                .is_some_and(|o| o.mineshaft_spawners.contains(&key))
     }
 
     fn wg_after_carve_height(&self, ocean_floor: bool, x: i32, z: i32) -> Option<i32> {
@@ -595,7 +611,39 @@ impl<'a> FC<'a> {
         0
     }
 
-    /// The chunk-promotion boundary: sample the light the pass reads, once.    ///
+    /// At FEATURES, a cold sky column reads 15 from SkyLightSectionStorage.
+    /// LIGHT requires INITIALIZE_LIGHT in a 3x3, and section storage allocates
+    /// a one-chunk halo around those initialized columns. Model that halo as
+    /// zero-filled until the port has a FEATURES-time light field.
+    pub(crate) fn feature_brightness(&self, x: i32, y: i32, z: i32) -> u8 {
+        if !self.g.has_skylight() {
+            return self.block_light(x, y, z);
+        }
+        let active = self.g.pop_active;
+        let world = self.owner.unwrap_or(self.g);
+        let completed = |chunk| {
+            if let Some((order, index)) = self.worker_order {
+                if let Some(&previous) = order.get(&chunk) {
+                    return previous < index;
+                }
+            }
+            Some(chunk) != active && world.pop_done.contains(&chunk)
+        };
+        let (cx, cz) = (x >> 4, z >> 4);
+        for sx in cx - 2..=cx + 2 {
+            for sz in cz - 2..=cz + 2 {
+                if completed((sx, sz))
+                    && (-1..=1).all(|dx| (-1..=1).all(|dz| completed((sx + dx, sz + dz))))
+                {
+                    return self.block_light(x, y, z);
+                }
+            }
+        }
+        15
+    }
+
+    /// The chunk-promotion boundary: sample the light the pass reads once.
+    ///
     /// 1.21.1 consumes `postProcessGeneration`'s marks when the proto chunk is promoted
     /// (`ChunkMap`'s `prepareTickingChunk` lambda, its first statement), which is after
     /// `INITIALIZE_LIGHT`/`LIGHT` have run - so `BushBlock.updateShape` there re-asks
@@ -705,9 +753,8 @@ impl<'a> FC<'a> {
     /// `LevelReader.getRawBrightness(pos, 0)` (`dcz.b(jd,int)`) as of the promotion boundary,
     /// i.e. `max(blockLight, skyLight - 0)`.
     ///
-    /// `None` outside a promotion pass. A feature-time caller has no `INITIALIZE_LIGHT`/`LIGHT`
-    /// result to read - the uninitialized answer is `generation_providers::uninitialized_raw_brightness`
-    /// - and a shape rule must say "no lit engine here" rather than invent one.
+    /// `None` outside a promotion pass. Feature placement uses
+    /// [`FC::feature_brightness`] for the earlier light-storage state.
     pub(crate) fn raw_brightness(&mut self, x: i32, y: i32, z: i32) -> Option<u8> {
         let block = match &self.promo_light {
             Some(field) => field.block.get(&(x, y, z)).copied().unwrap_or(0),

@@ -1019,7 +1019,7 @@ pub struct Gen {
     prelim_ord: std::collections::VecDeque<(i32, i32)>,
     clim_c: HashMap<(i32, i32), ([i64; 5], f64)>,
     clim_ord: std::collections::VecDeque<(i32, i32)>,
-    // Surface-rule biome leaf cache; Nether's fuzzy source keys actual blocks.
+    // Paletted biome IDs by quart position for surface rules.
     bioq: HashMap<(i32, i32, i32), u16>,
     bioq_ord: std::collections::VecDeque<(i32, i32, i32)>,
     col_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
@@ -5745,34 +5745,48 @@ impl Gen {
     }
 
     fn leaf_at(&mut self, c: &mut SC) -> u16 {
-        let (qx, qy, qz) = (c.x >> 2, c.y >> 2, c.z >> 2);
-        // SurfaceRules.Context uses BiomeManager at the actual block position.
-        // Fuzzy biome boundaries are per block, not uniform inside a quart.
-        let key = if self.preset == NoisePreset::Nether {
-            (c.x, c.y, c.z)
-        } else {
-            (qx, qy, qz)
-        };
-        // Share the lookup across surface contexts. The Nether cache must retain
-        // block coordinates because fuzzy selection can vary inside one quart.
-        if let Some(&l) = self.bioq.get(&key) {
-            return l;
+        // SurfaceRules.Context uses BiomeManager to select a quart from the
+        // already filled biome palettes, including those in adjacent chunks.
+        let (qx, qy, qz) = self.fiddled_biome_quart(c.x, c.y, c.z);
+        let qy = qy.clamp(self.world_min_y >> 2, (self.world_min_y + self.world_height - 1) >> 2);
+        let key = (qx, qy, qz);
+        if let Some(&leaf) = self.bioq.get(&key) {
+            return leaf;
         }
-        let l = if self.preset == NoisePreset::Nether {
-            self.biome_blended(c.x, c.y, c.z)
-        } else {
-            self.biome_quart(qx, qy, qz, None)
+        let (qx0, qy0, qz0) = (key.0 & !3, key.1 & !3, key.2 & !3);
+        let mut last = None;
+        // LevelChunkSection.fillBiomesFromNoise walks X, then Y, then Z.
+        // Retain the preceding R-tree entry and its bounds across this section.
+        for qx in qx0..qx0 + 4 {
+            for qy in qy0..qy0 + 4 {
+                for qz in qz0..qz0 + 4 {
+                    let pos = (qx, qy, qz);
+                    let leaf = if self.preset == NoisePreset::End {
+                        self.biome_quart(qx, qy, qz, None).map(|(_, leaf)| leaf)
+                    } else if let Some(target) = self.target7(qx, qy, qz) {
+                        self.btree.as_ref().map(|tree| {
+                            let mut best = last.as_ref().map_or((i64::MAX, 0), |(id, bounds)| {
+                                (ps_dist(bounds, &target), *id)
+                            });
+                            if let Some(bounds) = tree.search(&target, &mut best) {
+                                last = Some((best.1, *bounds));
+                            }
+                            best.1
+                        })
+                    } else {
+                        None
+                    };
+                    self.bioq.insert(pos, leaf.unwrap_or(u16::MAX));
+                    self.bioq_ord.push_back(pos);
+                }
+            }
         }
-        .map(|(_, l)| l)
-        .unwrap_or(u16::MAX);
-        self.bioq.insert(key, l);
-        self.bioq_ord.push_back(key);
-        if self.bioq_ord.len() > BIO_CAP {
+        while self.bioq_ord.len() > BIO_CAP {
             if let Some(old) = self.bioq_ord.pop_front() {
                 self.bioq.remove(&old);
             }
         }
-        l
+        self.bioq[&key]
     }
 
     // find_top_surface of the preliminary_surface_level DF, cached per quart column
@@ -8415,8 +8429,7 @@ impl Gen {
         }
     }
     /// `DimensionType.hasSkyLight()` for this preset. Only the Overworld has a sky
-    /// light layer, which is what decides the brightness a feature sees before
-    /// `INITIALIZE_LIGHT` (see `generation_providers::uninitialized_raw_brightness`).
+    /// light layer.
     pub(crate) fn has_skylight(&self) -> bool {
         self.preset.dim().has_skylight()
     }
@@ -10469,20 +10482,24 @@ impl BT {
     /// wins, then the one reached first in array order - which is why the order must not be
     /// changed (sorting the children by distance reaches a different leaf on ties, and also
     /// prunes differently).
-    fn search(&self, t: &[i64; 7], best: &mut (i64, u16)) {
+    fn search(&self, t: &[i64; 7], best: &mut (i64, u16)) -> Option<&[[i32; 2]; 7]> {
         match self {
-            BT::Leaf(_, id) => {
+            BT::Leaf(bounds, id) => {
                 let d = self.dist(t);
                 if d < best.0 {
                     *best = (d, *id);
+                    return Some(bounds);
                 }
+                None
             }
-            BT::Sub(_, ch) => {
-                for c in ch {
-                    if best.0 > c.dist(t) {
-                        c.search(t, best);
+            BT::Sub(_, children) => {
+                let mut selected = None;
+                for child in children {
+                    if best.0 > child.dist(t) {
+                        selected = child.search(t, best).or(selected);
                     }
                 }
+                selected
             }
         }
     }
@@ -10545,6 +10562,11 @@ impl Gen {
     /// container: the eight neighbouring noise samples are ranked by
     /// `getFiddledDistance`, so at a biome boundary the two disagree.
     pub(crate) fn biome_blended(&mut self, x: i32, y: i32, z: i32) -> Option<(i64, u16)> {
+        let (qx, qy, qz) = self.fiddled_biome_quart(x, y, z);
+        self.biome_quart(qx, qy, qz, None)
+    }
+
+    fn fiddled_biome_quart(&self, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
         let zoom = crate::generation_math::biome_zoom_seed(self.world_seed);
         let (x, y, z) = (x - 2, y - 2, z - 2);
         let (bx, by, bz) = (x >> 2, y >> 2, z >> 2);
@@ -10573,14 +10595,7 @@ impl Gen {
         }
         let i = best.0;
         let (px, py, pz) = ((i & 4) == 0, (i & 2) == 0, (i & 1) == 0);
-        // the winner is looked up in the noise source at its own quart corner,
-        // which is exactly what this port's biome tree answers
-        self.biome_quart(
-            if px { bx } else { bx + 1 },
-            if py { by } else { by + 1 },
-            if pz { bz } else { bz + 1 },
-            None,
-        )
+        (bx + i32::from(!px), by + i32::from(!py), bz + i32::from(!pz))
     }
 
     pub(crate) fn biome_quart(
@@ -12440,7 +12455,7 @@ mod wg_tests {
             // Exercise the actual condition dispatch, with an explicit biome
             // leaf. This does not claim that the world biome lookup is correct.
             g.biome_weather[0] = weather;
-            g.bioq.insert((x >> 2, y >> 2, z >> 2), 0);
+            g.bioq.insert(g.fiddled_biome_quart(x, y, z), 0);
             let mut c = SC::new();
             (c.x, c.y, c.z) = (x, y, z);
             assert_eq!(g.test_cond(cid, &mut c, &[64; 256]), is_cold, "{id}");
@@ -15832,31 +15847,23 @@ mod wg_tests {
     }
 
     #[test]
-    fn the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart() {
-        let _guard = lock_gen();
-        // The deep material rule asks for the biome once per block; the answer only depends on the
-        // quart, so one shared cache replaced millions of B-tree searches. Pin that a repeat query
-        // returns what the first one computed and what a direct lookup gives.
-        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    fn surface_biomes_follow_fuzzy_palettes_and_preserve_climate_ties() {
+        let mut g = Gen::load(4242, crate::name_to_state).expect("datapack");
         let mut c = SC::new();
-        for (qx, qy, qz) in [(0i32, 24, 0), (1, 25, 2), (-3, -8, 5), (7, 60, -8)] {
-            c.x = qx << 2;
-            c.y = qy << 2;
-            c.z = qz << 2;
-            let first = g.leaf_at(&mut c);
-            let second = g.leaf_at(&mut c);
-            assert_eq!(
-                first, second,
-                "the shared cache changed the leaf for {qx},{qy},{qz}"
-            );
-            let direct = g
-                .biome_quart(qx, qy, qz, None)
-                .map(|(_, l)| l)
-                .unwrap_or(u16::MAX);
-            assert_eq!(
-                second, direct,
-                "the shared cache disagrees with a direct lookup at {qx},{qy},{qz}"
-            );
+        // Native SurfaceRules.Context samples two biomes inside one raw quart.
+        // The sand floor at each position uses the chosen biome's material rule.
+        for (pos, expected) in [
+            ((2016, 45, -2901), "minecraft:beach"),
+            ((2016, 46, -2901), "minecraft:lukewarm_ocean"),
+            // River and beach have equal climate distance. The preceding beach
+            // leaf's own bounds let it retain the tie.
+            ((2029, 51, -2912), "minecraft:beach"),
+        ] {
+            (c.x, c.y, c.z) = pos;
+            for _ in 0..2 {
+                let leaf = g.leaf_at(&mut c);
+                assert_eq!(g.biome_names[leaf as usize], expected, "{pos:?}");
+            }
         }
     }
 
