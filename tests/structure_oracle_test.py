@@ -205,17 +205,27 @@ class StructureOracleTests(unittest.TestCase):
         def runtime(_jar):
             with tempfile.TemporaryDirectory() as tmp:
                 yield Path(tmp), 'controlled classpath', b''
+        stages = []
         def probe(work, cp, source, main, *args, **kwargs):
-            self.assertEqual(source.name, 'ScheduledTickOracle.java')
-            self.assertEqual(len(args), 2)
-            self.assertTrue(all(isinstance(p, Path) for p in args))
-            self.assertNotEqual(args[0], scheduled.VECTORS)
-            self.assertNotEqual(args[1], scheduled.PROTO_VECTORS)
-            args[0].write_bytes(scheduled.VECTORS.read_bytes())
-            args[1].write_bytes(scheduled.PROTO_VECTORS.read_bytes())
+            self.assertEqual(cp, 'controlled classpath')
+            self.assertEqual(kwargs, {})
+            self.assertTrue(all(isinstance(path, Path) for path in args))
+            if source.name == 'ScheduledTickOracle.java':
+                self.assertEqual(main, 'dev.mcspine.tools.ScheduledTickOracle')
+                self.assertEqual(args, (work / 'scheduled.tsv', work / 'proto.tsv'))
+                args[0].write_bytes(scheduled.VECTORS.read_bytes())
+                args[1].write_bytes(scheduled.PROTO_VECTORS.read_bytes())
+                stages.append('collection')
+            else:
+                self.assertEqual(source.name, 'ScheduledTickDeliveryOracle.java')
+                self.assertEqual(main, 'dev.mcspine.tools.ScheduledTickDeliveryOracle')
+                self.assertEqual(args, (work / 'delivery.tsv',))
+                args[0].write_bytes(scheduled.DELIVERY_VECTORS.read_bytes())
+                stages.append('delivery')
         with patch.object(scheduled, 'pinned_runtime', runtime), patch.object(scheduled, 'run_probe', probe), \
                 patch.object(sys, 'argv', ['scheduled_tick_oracle']), redirect_stdout(io.StringIO()):
             self.assertIsNone(scheduled.main())
+        self.assertEqual(stages, ['collection', 'delivery'])
 
     def test_scheduled_native_failure_or_missing_callbacks_preserves_both_vectors(self):
         @contextmanager
