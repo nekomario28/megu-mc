@@ -155,6 +155,9 @@ pub(crate) struct PotentialCalculator {
 #[cfg_attr(not(test), allow(dead_code))]
 impl PotentialCalculator {
     pub(crate) fn get_potential_energy_change(&self, pos: NaturalSpawnPos, mass: f64) -> f64 {
+        if mass == 0.0 {
+            return 0.0;
+        }
         self.charges
             .iter()
             .map(|point| {
@@ -162,7 +165,7 @@ impl PotentialCalculator {
                 let dy = pos.y as f64 - point.y;
                 let dz = pos.z as f64 - point.z;
                 let distance = (dx * dx + dy * dy + dz * dz).sqrt();
-                if distance == 0.0 && point.charge > 0.0 {
+                if distance == 0.0 {
                     f64::INFINITY
                 } else {
                     point.charge / distance
@@ -177,7 +180,9 @@ impl PotentialCalculator {
     }
 
     pub(crate) fn add_charge(&mut self, pos: NaturalSpawnPos, charge: f64) {
-        self.charges.push(PointCharge::new(pos, charge));
+        if charge != 0.0 {
+            self.charges.push(PointCharge::new(pos, charge));
+        }
     }
 }
 
@@ -616,6 +621,20 @@ mod natural_spawner_tests {
                 charge: 0.7
             }
         );
+    }
+
+    #[test]
+    fn potential_ignores_zero_charges_and_zero_candidate_mass() {
+        let start = pos(0, 64, 0);
+        let mut potential = PotentialCalculator::default();
+        potential.add_charge(start, 0.0);
+        potential.add_charge(start, -0.0);
+        assert!(potential.charges.is_empty());
+        assert_eq!(potential.get_potential_energy_change(start, 1.0), 0.0);
+
+        potential.add_charge(start, -1.0);
+        assert_eq!(potential.get_potential_energy_change(start, -0.0), 0.0);
+        assert_eq!(potential.get_potential_energy_change(start, 1.0), f64::INFINITY);
     }
 
     #[test]
