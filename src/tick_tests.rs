@@ -4825,6 +4825,9 @@ fn nightly_hostile_type_uses_the_pinned_biome_spawners() {
     assert_eq!(spawn_etype_for_biome(None, 1), 91);
 }
 
+// The world RNG rolls 15 for sky and 4 for raw brightness, so clear midnight passes.
+const CLEAR_MIDNIGHT_LIGHT_SEED: u64 = 4194;
+
 #[test]
 fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
     if crate::test_support::isolated_world_test() {
@@ -4840,9 +4843,10 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
     let attempt = |players: &[(Arc<Client>, TcpStream)]| {
         *clients().lock().unwrap() = players.iter().map(|(client, _)| client.clone()).collect();
         mobs().lock().unwrap().clear();
+        world_rng::seed(CLEAR_MIDNIGHT_LIGHT_SEED);
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(server_ticks(SPAWN_CYCLE_GT) / 2, Ordering::Relaxed);
-        WORLD_TIME.store(13000, Ordering::Relaxed);
+        WORLD_TIME.store(18000, Ordering::Relaxed);
         keepalive_time_tick();
         let spawned = mobs().lock().unwrap();
         assert!(spawned.len() <= 1);
@@ -4951,9 +4955,10 @@ fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
         *mobs().lock().unwrap() = (0..existing)
             .map(|i| test_mob(20_000 + i as i32, kind, (0.5, y, 0.5), 20.0))
             .collect();
+        world_rng::seed(CLEAR_MIDNIGHT_LIGHT_SEED);
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(server_ticks(SPAWN_CYCLE_GT) / 2, Ordering::Relaxed);
-        WORLD_TIME.store(13000, Ordering::Relaxed);
+        WORLD_TIME.store(18000, Ordering::Relaxed);
         keepalive_time_tick();
 
         let actual = mobs().lock().unwrap().len();
@@ -5021,9 +5026,10 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
         }
         assert_eq!(surface_y(x, z), 100.0);
         mobs().lock().unwrap().clear();
+        world_rng::seed(CLEAR_MIDNIGHT_LIGHT_SEED);
         SPAWN_ATTEMPT.store(attempt, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
-        WORLD_TIME.store(13000, Ordering::Relaxed);
+        WORLD_TIME.store(18000, Ordering::Relaxed);
         keepalive_time_tick();
 
         let actual: Vec<_> = mobs().lock().unwrap().iter().map(|mob| mob.etype).collect();
@@ -5037,6 +5043,85 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
         failures.len(),
         cases.len(),
     );
+}
+
+#[test]
+fn gp2_nightly_hostiles_respect_spawn_light() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let glowstone = reg.state_of("minecraft:glowstone", None);
+    let (client, _peer) = client_pair();
+    *client.pos.lock().unwrap() = (0.5, 100.0, 0.5, 0.0, 0.0, true);
+    clients().lock().unwrap().push(Arc::new(client));
+    let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
+    let angle = tick as f64 * 2.399;
+    let x = (0.5 + angle.cos() * 32.0).floor() as i32;
+    let z = (0.5 + angle.sin() * 32.0).floor() as i32;
+    let y = 100;
+    set_block(x, y - 1, z, stone);
+    assert_eq!(surface_y(x, z), f64::from(y));
+    let (cx, cz) = (x >> 4, z >> 4);
+    assert_eq!(nibble_at(&sky_light_sections_world(cx, cz), x, y, z), 15);
+    GR_DAYLIGHT_CYCLE.store(0, Ordering::Relaxed);
+    GR_WEATHER_CYCLE.store(0, Ordering::Relaxed);
+    WORLD_TIME.store(18000, Ordering::Relaxed);
+
+    // Clear midnight leaves raw sky brightness 4. Thunder uses a sky subtraction of 10,
+    // leaving 5. The dim emitter's level 1 would pass the combined brightness check.
+    // Seeds pin the sky roll first and the raw-brightness roll second.
+    let cutoff_seed = CLEAR_MIDNIGHT_LIGHT_SEED;
+    let cases = [
+        ("clear midnight", cutoff_seed, false, 0, true, 2),
+        ("block light of one", cutoff_seed, false, 1, false, 1),
+        ("sky roll of 14", 263, false, 0, false, 1),
+        ("brightness roll of 3", 268, false, 0, false, 2),
+        ("thunder with a roll of 4", cutoff_seed, true, 0, false, 2),
+        ("thunder with a roll of 5", 257, true, 0, true, 2),
+    ];
+    let mut failures = Vec::new();
+    let mut rng_failures = Vec::new();
+    for (name, seed, thunder, block_light, expected, draws) in cases {
+        set_block(x + 14, y, z, if block_light == 0 { 0 } else { glowstone });
+        assert_eq!(
+            nibble_at(&block_light_sections(cx, cz, &HashMap::new()), x, y, z),
+            block_light,
+            "{name}"
+        );
+        RAINING.store(if thunder { 100 } else { 0 }, Ordering::Relaxed);
+        THUNDERING.store(if thunder { 100 } else { 0 }, Ordering::Relaxed);
+        world_rng::seed(seed);
+        for _ in 0..draws {
+            world_rng::next_u64();
+        }
+        let expected_rng = world_rng::saved_state();
+        world_rng::seed(seed);
+        mobs().lock().unwrap().clear();
+        SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
+        TICK.store(tick, Ordering::Relaxed);
+        keepalive_time_tick();
+
+        let actual = mobs().lock().unwrap().len();
+        if actual != usize::from(expected) {
+            failures.push(format!(
+                "{name}: expected {} mobs, got {actual}",
+                usize::from(expected),
+            ));
+        }
+        if world_rng::saved_state() != expected_rng {
+            rng_failures.push(format!("{name}: expected {draws} RNG draws"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} spawn-light cases passed: {failures:?}",
+        cases.len() - failures.len(),
+        cases.len(),
+    );
+    assert!(rng_failures.is_empty(), "{rng_failures:?}");
 }
 
 /// A deterministic yardstick for the chunk delivery path, with no socket in the loop.

@@ -390,23 +390,37 @@ pub(crate) struct MonsterLightSample {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_dark_enough_to_spawn(light: MonsterLightSample, sky_roll_0_to_31: i32) -> bool {
-    if i32::from(light.sky_light) > sky_roll_0_to_31 {
-        return false;
-    }
-    if light.monster_spawn_block_light_limit < 15
-        && light.block_light > light.monster_spawn_block_light_limit
-    {
-        return false;
-    }
-    let darken = if light.thundering {
+    let sky_darken = if light.thundering {
         10
     } else {
-        light.sky_darken
+        i32::from(light.sky_darken)
     };
-    light
-        .block_light
-        .max(light.sky_light.saturating_sub(darken))
-        <= light.sampled_spawn_light_limit
+    monster_spawn_light_allows(
+        i32::from(light.sky_light),
+        sky_roll_0_to_31,
+        i32::from(light.monster_spawn_block_light_limit),
+        || i32::from(light.block_light),
+        sky_darken,
+        || i32::from(light.sampled_spawn_light_limit),
+    )
+}
+
+fn monster_spawn_light_allows(
+    sky_light: i32,
+    sky_roll: i32,
+    block_light_limit: i32,
+    read_block_light: impl FnOnce() -> i32,
+    sky_darken: i32,
+    sample_spawn_light_limit: impl FnOnce() -> i32,
+) -> bool {
+    if sky_light > sky_roll {
+        return false;
+    }
+    let block_light = read_block_light();
+    if block_light_limit < 15 && block_light > block_light_limit {
+        return false;
+    }
+    block_light.max(sky_light - sky_darken) <= sample_spawn_light_limit()
 }
 
 /// Selected biome spawner entry, with type-specific darkness and cluster rules.
@@ -548,11 +562,10 @@ fn has_room_for_nightly_monster(mobs: &[Arc<Mob>], monster_cap: usize) -> bool {
             < monster_cap
 }
 
-fn nightly_spawn_fits(etype: i64, x: f64, y: f64, z: f64) -> bool {
+fn nightly_spawn_placement_allows(bx: i32, by: i32, bz: i32) -> bool {
     let Some(reg) = crate::block_registry::breg() else {
         return false;
     };
-    let (bx, by, bz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
     let clear = |state| {
         !reg.is_collision_shape_full_block(state)
             && !reg.is_liquid(state)
@@ -564,17 +577,87 @@ fn nightly_spawn_fits(etype: i64, x: f64, y: f64, z: f64) -> bool {
         clear_above: clear(block_at(bx, by + 1, bz)),
         ..SpawnPlacementContext::default()
     };
-    if !SpawnPlacementType::OnGround.allows(site) {
-        return false;
+    SpawnPlacementType::OnGround.allows(site)
+}
+
+struct OverworldMonsterLight {
+    block_limit: i32,
+    min: i32,
+    max: i32,
+}
+
+impl OverworldMonsterLight {
+    fn from_dimension_type(data: &[u8]) -> Option<Self> {
+        let dimension = jparse(data)?;
+        let level = |object: &J, key| match object.get(key) {
+            Some(J::Num(n)) if (0.0..=15.0).contains(n) && n.fract() == 0.0 => Some(*n as i32),
+            _ => None,
+        };
+        let block_limit = level(&dimension, "monster_spawn_block_light_limit")?;
+        let provider = dimension.get("monster_spawn_light_level")?;
+        if provider.get("type")?.str() != "minecraft:uniform" {
+            return None;
+        }
+        let min = level(provider, "min_inclusive")?;
+        let max = level(provider, "max_inclusive")?;
+        (min <= max).then_some(Self {
+            block_limit,
+            min,
+            max,
+        })
     }
-    let (width, height) = mob_dimensions(etype);
-    let bounds = EntityAabb::from_dimensions(x, y, z, width, height);
-    !aabb_collides_blocks(bounds.min(), bounds.max())
+}
+
+fn nightly_spawn_light_sources(clients: &[Arc<Client>], cx: i32, cz: i32) -> GenSources {
+    let mut nearby = GenSources::new();
+    for client in clients {
+        // Chunk streaming takes these locks in this order.
+        let sources = client.gen_sources.lock().unwrap();
+        if *client.dim.lock().unwrap() != DimId::Overworld {
+            continue;
+        }
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let key = (cx + dx, cz + dz);
+                if let Some(chunk) = sources.get(&key) {
+                    nearby.entry(key).or_insert_with(|| chunk.clone());
+                }
+            }
+        }
+    }
+    nearby
+}
+
+fn nightly_spawn_is_dark(x: i32, y: i32, z: i32, sources: &GenSources) -> bool {
+    static RULES: OnceLock<OverworldMonsterLight> = OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        OverworldMonsterLight::from_dimension_type(include_bytes!(
+            "../datapacks/vanilla/data/minecraft/dimension_type/overworld.json"
+        ))
+        .expect("pinned Overworld dimension type must have valid monster spawn light rules")
+    });
+    let (cx, cz) = (x >> 4, z >> 4);
+    let sky_light = nibble_at(&sky_light_sections_world(cx, cz), x, y, z);
+    let sky_roll = world_rng::next_below(32) as i32;
+    let sky_darken = if THUNDERING.load(Ordering::Relaxed) > 0 {
+        10
+    } else {
+        current_sky_darken()
+    };
+    monster_spawn_light_allows(
+        sky_light,
+        sky_roll,
+        rules.block_limit,
+        || nibble_at(&block_light_sections(cx, cz, sources), x, y, z),
+        sky_darken,
+        || rules.min + world_rng::next_below((rules.max - rules.min + 1) as u32) as i32,
+    )
 }
 
 fn spawn_nightly_hostile(tick: u64) {
-    let players: Vec<_> = client_snapshot()
-        .into_iter()
+    let clients = client_snapshot();
+    let players: Vec<_> = clients
+        .iter()
         .filter_map(|client| {
             if client.is_spectator() {
                 return None;
@@ -619,11 +702,22 @@ fn spawn_nightly_hostile(tick: u64) {
         return;
     }
 
-    let biome = worldgen::biome_name_at_block(bx, y.floor() as i32, bz);
+    let by = y.floor() as i32;
+    let biome = worldgen::biome_name_at_block(bx, by, bz);
     let etype = spawn_etype_for_biome(biome.as_deref(), attempt);
+    // Streaming can generate chunks while it holds the client cache lock.
+    let light_sources = nightly_spawn_light_sources(&clients, bx >> 4, bz >> 4);
     // Block edits and spawn insertion share the world-write guard.
     with_save_guard(|| {
-        if !nightly_spawn_fits(etype, x, y, z) {
+        // Creeper, skeleton, spider and zombie all use Monster.checkMonsterSpawnRules.
+        if !nightly_spawn_placement_allows(bx, by, bz)
+            || !nightly_spawn_is_dark(bx, by, bz, &light_sources)
+        {
+            return;
+        }
+        let (width, height) = mob_dimensions(etype);
+        let bounds = EntityAabb::from_dimensions(x, y, z, width, height);
+        if aabb_collides_blocks(bounds.min(), bounds.max()) {
             return;
         }
         let mut current_mobs = mobs().lock().unwrap();
