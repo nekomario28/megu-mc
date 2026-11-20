@@ -1,6 +1,6 @@
-# ゲーム要素の実装計画（完全版・R7 GP-0〜GP-7 対応同期済み）
+# ゲーム要素の実装計画
 
-Status: `perf/worldgen-parallel` / `main` 同期（2026-11-20）。**Worldgen / 3ディメンション / 基本照明 / 基本戦闘・コンテナ・流体物理までは実装済み**、残る M2→M4 完全ゲームプレイ領域は [ROADMAP R7 (`GP-0`〜`GP-7`)](../ROADMAP.md#r7--ゲームプレイ完全性と全エンティティ機構拡張m2m4gp-0gp-7) としてトラック化した。
+Worldgen、3ディメンション、基本照明・戦闘・コンテナ・流体物理に続く機能は [ROADMAP R7 (`GP-0`〜`GP-7`)](../ROADMAP.md#r7--ゲームプレイ完全性と全エンティティ機構拡張m2m4gp-0gp-7) で扱う。R7 はレーンごとに、ロジックの実装、通常サーバーへの接続、Vanilla 1.21.1 との挙動照合を確認する。
 
 ## 目標と3つの制約
 
@@ -13,18 +13,16 @@ Status: `perf/worldgen-parallel` / `main` 同期（2026-11-20）。**Worldgen / 
 
 ## 現状の棚卸し（2026-11-20 実ソース照合済み）
 
-| 領域 | 実装済み・検証済み | ギャップ（`R7 GP-0〜GP-7` で解決対象） |
+| 領域 | 現在の実装と検証範囲 | ギャップ（`R7 GP-0〜GP-7` で解決対象） |
 |---|---|---|
-| **エンティティ型 (`GP-0`)** | 名前・protocol ID は `name_to_etype` で 130 種（`0..=129`）解決済み。寸法定義は約 11 種（`src/entity_collision.rs`）、HP テーブル一部、`BaseSpawner` 12 種（`src/spawner.rs`） | `src/entity_registry.rs` へ全 130 種のメタデータ（`MobCategory`・幅高・`eye_height`・`fire_immune`・追従/更新間隔）を統合しデータ駆動化 |
-| **Mob AI・自然スポーン (`GP-1` / `GP-2` / `GP-6`)** | 接近・Creeper 着火爆発・繁殖・日光燃焼・溺水・溶岩接触・流体 `travel`・窒息・`maxEntityCramming`（`EntitySpatialGrid`）、バイオームスポーン表対照まで実装 | **`GoalSelector` / A* `PathNavigation` が未実装**。**`NaturalSpawner`（`mob_cap`・`spawn_costs` エネルギー予算・`24/32/128` despawn）** および Nether/End/水棲/ボス Mob 固有 AI が未実装 |
+| **エンティティ型 (`GP-0`)** | [130 型レジストリ](../../src/entity_registry.rs)と既存の Mob 処理 | 衝突寸法、HP、スポーナーの参照を順にレジストリへ接続 |
+| **Mob AI・自然スポーン (`GP-1` / `GP-2` / `GP-6`)** | 基本 Mob の移動・戦闘・環境挙動が稼働。経路探索、自然スポーン、一部の個別 Mob はモジュールと単体テストあり | ワールドや tick への接続、未対応ゴールと Mob の実装、挙動対照 |
 | **光エンジン** | **実装済み**（`0x27`/`0x2a` で実計算の空光・ブロック光を送信・伝播、`src/light_pack_tests.rs` 等で検証済み） | Torch 増分最適化の比較検証のみ残存（Issue `#43`） |
 | **衝突・流体・耕地・落下** | 流体 `travel`・水浮力・溶岩押し流し（Nether `ultraWarm` 含む）・`Entity.move` 衝突解決・耕地 `trample`・落下ブロック実装済み | 階段/ハーフ/フェンス等の任意非フルブロック精密形状（`Extract.java` 拡張＋[horizon-gameplay](../horizon-gameplay/README.md)）を順次拡大 |
-| **レッドストーン (`GP-3`)** | ピストン・オブザーバー・ホッパー・ディスペンサー等の個別動作は一部存在 | **ワイヤ信号伝播（0..=15・段差昇降・遮断）・トーチ（2GT・burnout）・リピータ（遅延・横ロック）・コンパレータ（比較/減算・コンテナ充填信号）・Quasi-Connectivity が未実装** |
-| **プレイヤー機構 (`GP-4` / `GP-5`)** | 移動・破壊/設置・2×2 クラフト・精錬・チェスト/樽/エンダーチェスト（遅延 LootTable/水没含む）・戦闘/死亡/リスポーン・盾・釣り・基本エンチャント/空腹/XP（`tests/m2_gameplay_wire.py` PASS） | 村人 AI/職業/取引・レイド、エンチャントテーブル 3 択、金床合成、醸造台/ポーション拡張、鍛冶台、経験値オーブ吸収、空腹消耗度精密化 |
+| **レッドストーン (`GP-3`)** | 既存の隣接給電・個別ブロック動作と、[伝播シミュレーション](../../src/redstone.rs)の単体テスト | ワールドのブロック状態と tick へ接続し、回路で照合 |
+| **プレイヤー機構 (`GP-4` / `GP-5`)** | 基本操作・収納・戦闘・空腹・XP 回収が稼働。村人取引・襲撃と高度プレイヤー機構はモジュールと単体テストあり | 村人、メニュー、醸造 tick、効果適用、空腹処理へ接続 |
 | **ディメンション・構造物** | **実装済み**（`P2-3-S0〜S4` で Overworld/Nether/End 全ストア分離・`0x2b`/`0x47` ポータル遷移完了、`tests/dimension_wire.py` PASS。構造物 19 チャンク 0-diff 昇格済み） | 残存 HOLD/未検証構造物（Batch B4）、エンドラ討伐フロー・ワールドボーダー |
-| **コマンド・進捗 (`GP-7`)** | Brigadier ツリー（`src/brigadier.rs`）・約 25 コマンドディスパッチ | `/fill`, `/clone`, `/execute`, `/scoreboard`, `/advancement`, `/worldborder`, `/locate` 等の残存コマンドと進捗通知 |
-
-**つまり「基盤（3ディメンション・光・流体・衝突コア・NBT・wire 経路）と名前表（1,061 ブロック / 1,333 アイテム / 130 エンティティ）は揃っており、次の主戦場が `R7 (GP-0〜GP-7)` のゲームプレイ振る舞い実装」という段階にある。**
+| **コマンド・進捗 (`GP-7`)** | 既存の `/fill`、`/execute`、`/scoreboard`、`/advancement` 等が部分動作。[新しい評価器](../../src/world_mechanisms.rs)は単体テストあり | 既存コマンドの拡張、新規コマンドの接続、進捗パケット配信 |
 
 ## 支配的な教訓
 
@@ -61,19 +59,18 @@ Status: `perf/worldgen-parallel` / `main` 同期（2026-11-20）。**Worldgen / 
 | **ベッド・火・音符・爆発抵抗・滑り** | `blast_resistance` / `slipperiness` 等 | `R7 GP-3 / GP-5 / GP-6` で段階接続 |
 | **感圧板・ボタン・レバー** | 名前 | レッドストーン伝播（`R7 GP-3`） |
 
-### B. レッドストーン（`R7 GP-3` — ワイヤ伝播・各種ゲートが未実装）
+### B. レッドストーン（`R7 GP-3`）
 
-ピストン・ディスペンサー・ホッパー・オブザーバーの基本枠はあるが、
-**ワイヤ（0..=15 減衰・段差）・トーチ（2GT・burnout）・リピータ（遅延・横ロック）・コンパレータ（比較/減算・充填率）・Quasi-Connectivity の伝播エンジン**が未実装（`R7 GP-3`）。
+通常サーバーの隣接給電を入口に、伝播、遅延、受け手への状態反映を接続する。回路の合否は入力操作から更新 tick、最終ブロック状態まで追う。
 
 ### C. エンティティ & AI（`R7 GP-0` / `GP-1` / `GP-2` / `GP-6`）
 
-130 種（`0..=129`）の protocol ID は `name_to_etype` で定義済みだが、メタデータのデータ駆動レジストリ（`GP-0`）、A* 経路探索と `GoalSelector`（`GP-1`）、`NaturalSpawner`（`GP-2`）、および Nether / End / 水棲 / 中立・ペット / 村人 / ボス / 乗物の固有行動（`GP-4` / `GP-6`）が未実装。
+Mob の種類を解決するレジストリ（`GP-0`）から既存の参照を順に切り替える。経路探索とゴール（`GP-1`）、自然スポーンと despawn（`GP-2`）はそれぞれ tick に接続し、個別 Mob（`GP-6`）は小さなグループごとに挙動を照合する。
 
 ### D. プレイヤー機構（`R7 GP-4` / `GP-5`）
 
 基本の移動・クラフト・精錬・チェスト・盾・釣り・戦闘/死亡・基本食料/XP は `tests/m2_gameplay_wire.py` で動作確認済み。
-残件：**エンチャントテーブル 3 択生成・金床・醸造台・ポーション拡張・鍛冶台・村人取引・襲撃・ベッドリスポーン・経験値オーブ・空腹消耗度**。
+高度プレイヤー機構はメニューの入力から結果・消費・保存まで照合する。村人取引と襲撃は、実体の状態更新とプレイヤーから見える結果を確認する。ベッドリスポーンと空腹の精密化も残る。
 
 ### E. ディメンション（`P2-3` 実装済み ／ 残件は `GP-6` エンドラ等）
 
@@ -85,9 +82,9 @@ Status: `perf/worldgen-parallel` / `main` 同期（2026-11-20）。**Worldgen / 
 
 ### G. コマンド・進捗（`R7 GP-7`）
 
-`clone` `fill` `execute` `data`（一部）`scoreboard` `tag`（一部）`team` `bossbar`
-`particle` `worldborder` `forceload` `locate` `recipe` `advancement` `attribute`
-`damage` `place` `random` `reload` `spectate` `spreadplayers` `trigger`。
+既存のコマンド処理へ対象の評価器を接続し、権限、コマンド結果、世界やプレイヤー状態への反映を確認する。進捗は達成判定に加えてクライアントへの配信を確認する。対象コマンドは [ROADMAP の GP-7](../ROADMAP.md#r7--ゲームプレイ完全性と全エンティティ機構拡張m2m4gp-0gp-7) を参照。
+
+残件の棚卸しには、計画に挙げたものに加え、`data`、`tag`、`team`、`bossbar`、`particle`、`forceload`、`recipe`、`attribute`、`place`、`random`、`reload`、`spectate`、`trigger` の未対応範囲を含める。
 
 ## 順序（`R7` 並列トラック対応）
 
@@ -98,15 +95,15 @@ Status: `perf/worldgen-parallel` / `main` 同期（2026-11-20）。**Worldgen / 
 | 03 | **[光エンジン](slices/03-light-engine.md)**（luminance + opacity） | **実装済み**（Issue `#43` で増分最適化比較のみ残存） | **大** |
 | 04 | **衝突形状** | 基本 AABB/`entity_collision` 完了、任意形状は `Extract.java` 拡張予定 | **最大** |
 | 05 | 落下ブロック・流体 `travel` | **実装済み**（残ギャップは [falling-blocks](../../evidence/gameplay/falling-blocks/README.md)） | 中 |
-| 06 (`GP-0`) | Entity Framework & 130種レジストリ（`src/entity_registry.rs`） | **R7 で着手** | 土台 |
-| 07 (`GP-1/2/6`) | `GoalSelector` / A* 経路探索・`NaturalSpawner`・残存 Mob 群 | **R7 で着手** | **大** |
+| 06 (`GP-0`) | Entity Framework & 130種レジストリ（`src/entity_registry.rs`） | レジストリあり、実行時参照を段階移行 | 土台 |
+| 07 (`GP-1/2/6`) | `GoalSelector` / A* 経路探索・`NaturalSpawner`・残存 Mob 群 | ロジックあり、tick 接続と対応範囲の拡大が残る | **大** |
 | 08 | コンテナ/メニューの共通化 | 主要コンテナ完了、メニュー共通化継続 | 中 |
-| 09 (`GP-3`) | **レッドストーン伝播**（`src/redstone.rs`） | **R7 で着手** | **大** |
-| 10 (`GP-4`) | 村人 AI・POI・取引・襲撃 | 未着手 | 中 |
+| 09 (`GP-3`) | **レッドストーン伝播**（`src/redstone.rs`） | シミュレーションあり、ワールド未接続 | **大** |
+| 10 (`GP-4`) | 村人 AI・POI・取引・襲撃 | ロジックあり、通常サーバー未接続 | 中 |
 | 11 (`P2-3`) | **ディメンション（Overworld/Nether/End）** | **基盤実装済み**（固有 Mob は `GP-6`） | **大** |
-| 12 (`GP-5`) | プレイヤー高度機構（エンチャ台・金床・醸造・ポーション） | 未着手 | 中 |
-| 13 (`GP-7`) | ワールドボーダー・進捗・残余世界機構 | 未着手 | 小 |
-| 14 (`GP-7`) | 残存コマンド | 未着手 | 小 |
+| 12 (`GP-5`) | プレイヤー高度機構（エンチャ台・金床・醸造・ポーション） | ロジックあり、メニュー・tick 未接続 | 中 |
+| 13 (`GP-7`) | ワールドボーダー・進捗・残余世界機構 | ロジックあり、適用・配信が残る | 小 |
+| 14 (`GP-7`) | 残存コマンド | 既存コマンドは一部稼働、新しい評価器の接続が残る | 小 |
 | 15 (`P2-1`) | full chunk / 全構造物 worldgen 一致 | 19 構造物チャンク 0-diff 昇格済み（Batch B4 進行中） | 目標 |
 
 ## 各 slice の合格条件（この枝の標準）
