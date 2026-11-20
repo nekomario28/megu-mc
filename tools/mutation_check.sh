@@ -1187,10 +1187,14 @@ check "play information reaches the live chunk window" \
   '                let effective = view;' \
   tests/client_settings_wire.py 'client settings wire: FAIL play-view-3'
 check "breaking changes server state, not only the predicted wire update" \
-  src/main.rs '                    if break_now {
-                        set_block_dim(dim, x, y, z, 0);' \
-  '                    if break_now {
-                        let _ = old;' \
+  src/main.rs '                        } else {
+                            set_block_dim(dim, x, y, z, 0);
+                        }
+                        #[cfg(not(feature = "neoforge-events"))]
+                        set_block_dim(dim, x, y, z, 0);
+                        note_block_update_dim(dim, x, y, z, 0);' \
+  '                        }
+                        note_block_update_dim(dim, x, y, z, 0);' \
   tests/gameplay_wire.py 'gameplay wire: FAIL fresh-reader-block'
 check "chat returns the actual sender and message" \
   src/main.rs '                    let line = format!("<{}> {}", me.name, m);' \
@@ -1202,8 +1206,8 @@ check "light arrays agree with their section masks" \
   '    p.extend_from_slice(&(sky_mask - 1).to_be_bytes()); // skyLightMask' \
   tests/gameplay_wire.py 'gameplay wire: FAIL light-mask-count'
 check "an update packet sends block light only" \
-  src/main.rs '    write_varint(&mut p, 0); // skyLightMask: sky is unchanged' \
-  '    write_varint(&mut p, 1); // skyLightMask: sky is unchanged' \
+  src/main.rs '        [0, mask, 0, empty],' \
+  '        [0, mask, 1, empty],' \
   update_light_packet_sends_block_light_only
 
 check "a large dripstone body is built in the empty cells" \
@@ -1431,8 +1435,12 @@ check "a full nearby player does not monopolize the drop" \
   pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack
 
 check "the pickup tick forwards infinite materials to inventory insertion" \
-  src/main.rs '        let creative = *c.gm.lock().unwrap() == 1;' \
-  '        let creative = false;' \
+  src/main.rs '    for (deid, c) in taken {
+        let selected = *c.held.lock().unwrap();
+        let creative = *c.gm.lock().unwrap() == 1;' \
+  '    for (deid, c) in taken {
+        let selected = *c.held.lock().unwrap();
+        let creative = false;' \
   pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack
 
 check "a real client observes the pickup delay the actor path already enforced" \
@@ -3896,15 +3904,21 @@ check "p2_3_s4_logout_saves_the_live_dimension" \
   tick_tests::p2_3_s4_logout_persists_the_clients_live_dimension
 
 check "p2_3_s4_chunk_deltas_respect_the_dimension_filter" \
-  src/main.rs '        |c| *c.dim.lock().unwrap() == dim && c.chunks.lock().unwrap().contains(&(cx, cz)),' \
-  '        |c| c.chunks.lock().unwrap().contains(&(cx, cz)),' \
+  src/main.rs '        if *client.dim.lock().unwrap() != dim {
+            continue;
+        }
+        let (id, packet) = mk(client);' \
+  '        let (id, packet) = mk(client);' \
   tick_tests::p2_3_s4_broadcast_chunk_dim_filters_other_dimensions
 
 # The same filter, observed end-to-end with two live clients on the wire. This gate is not
 # selected by MUTATION_FILTER=p2_3_s4 (its filter names the script), but the full campaign runs it.
 check "p2_3_s4_block_deltas_are_dimension_scoped" \
-  src/main.rs '        |c| *c.dim.lock().unwrap() == dim && c.chunks.lock().unwrap().contains(&(cx, cz)),' \
-  '        |c| c.chunks.lock().unwrap().contains(&(cx, cz)),' \
+  src/main.rs '        if *client.dim.lock().unwrap() != dim {
+            continue;
+        }
+        let (id, packet) = mk(client);' \
+  '        let (id, packet) = mk(client);' \
   tests/dimension_wire.py 'dimension wire: FAIL nether-edit-leaked-to-overworld'
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
