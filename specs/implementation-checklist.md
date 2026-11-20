@@ -63,7 +63,7 @@
   - [x] **P2-1-T0 (`35cf12c`)**: `StructurePiece.placeBlock` の `SHAPE_CHECK_BLOCKS` マーク（template/jigsaw 経路）＋ `Feature.markAboveForPostProcessing` ＋ promotion 限定 `BushBlock` 除去（`village-taiga` 0 / 884,736 達成）。
   - [x] **P2-1-T1**: チャンク昇格時（`postProcessGeneration`）の非空流体セルに対する fluid tick 予約・配送接続（`src/main.rs` の `structure_template::register_fluid_ticker` / `promotion_fluid_tick` 登録済み）。
   - [x] **P2-1-T2 (`5fb816b`)**: `structure_pipeline::load_defs_inner` で1つの不正な構造物 JSON が全パイプラインを `None` に落とす欠陥を要素単位の fail-skip + ログに修正。
-  - [ ] **P2-1-T3 & 残存構造物受入（Phase C-2 Batch B3 完了 `ba6e2c3`）**: `ruined_portal` B-run・`monument`、`5fb816b`（`igloo`）、`b1beec5`（`village_plains`）に加え、`ba6e2c3`（[evidence/gameplay/feature-parity/structure-batch-b3-20261120.md](../evidence/gameplay/feature-parity/structure-batch-b3-20261120.md)）で `desert_pyramid`・`shipwreck`・`ocean_ruin_cold`（tall seagrass 更新修正）を 0-diff 昇格（計 **19 チャンク 0-diff**）。残る HOLD（`buried_treasure`, `swamp_hut`：Audit 1 で特定された `valid_biome` quart 座標 noise biome 判定への修正対象）と Batch B4 を段階的受入。
+  - [x] **P2-1-T3 Phase C-2 & Phase D-2b 構造物受入拡大 (`ba6e2c3`, `d139913`)**: `ruined_portal` B-run・`monument`、`5fb816b`（`igloo`）、`b1beec5`（`village_plains`）、`ba6e2c3`（[evidence/gameplay/feature-parity/structure-batch-b3-20261120.md](../evidence/gameplay/feature-parity/structure-batch-b3-20261120.md)：`desert_pyramid`・`shipwreck`・`ocean_ruin_cold` 0-diff、計 **19 チャンク 0-diff**）に加え、`d139913` で `valid_biome` quart noise-biome 判定＆Woodland Mansion 基礎下限/液体置換を修正（77 structure + 9 mansion tests PASS）。残る HOLD（`buried_treasure`, `swamp_hut`）の統合再検証と Batch B4 を段階的受入。
 - [ ] **P2-2 残るconfigured featuresと実chunk差分** — `bonus_chest` および End の `minecraft:end_spike` は実装・native oracle 照合・4 mutation ゲート済み（`src/feature.rs`, `src/generation_contract_tests.rs`, `tools/mutation_check.sh`）。残る `sculk_patch` 等の最新HEAD・同一population順再計測と `sculk_gate.py --require-match` 判断を閉じる。
 - [x] **P2-3 三dimensionの通常サーバー経路（Stage F2 の中核）** — `MC_SPINE_WG_PRESET=end|nether` は offline 診断限定のため、以下の S0〜S4 で通常サーバーの3次元生成・保存・配信・移動を完成済み：
   - [x] **P2-3-S0 (`b38aa75`)**: `tests/protocol767.py` CLI ハーネスの次元対応（`dimension_type` の `min_y`/`height`/`has_skylight` 動的解釈）。
@@ -102,6 +102,17 @@
 - [ ] **CF-3（`mods/` 投入型 Rust Integrated Server — `mc-spine-integrated.jar` / `cdylib`）**: 既存 Fabric/NeoForge クライアント（Sodium/Iris 等）の `mods/` に 1 個 JAR を入れるだけで、シングルプレイ／LAN ホストのサーバー処理を 100% Rust (`libmc_spine` + 共有メモリ / Direct `ByteBuffer` FFI) にオフロード。
 - [ ] **CF-4（Default Launcher / Prism Launcher ネイティブ起動パッケージ）**: Custom Version JSON + 極薄 Bootstrapper JAR（約 20 KB、起動 50ms 後に JVM 退場）および Prism `Wrapper command`（JVM 非起動で直接 Rust 起動）により、公式/Prism/Modrinth 全ランチャーで内部 100% Rust ネイティブ動作を実現。
 
+### R7 — ゲームプレイ完全性（M2→M4：`GP-0`〜`GP-7`）
+
+- [ ] **GP-0（Entity Framework & 全 130 エンティティ型データ駆動レジストリ）**: `src/entity_registry.rs` に protocol 767 全 130 `EntityType`（`0..=129`、名前、幅・高さ・`eye_height`、`MobCategory`、既定 `max_health`、`fire_immune`、`pushable`、`client_tracking_range`、`update_interval`）を一元化し、`entity_collision` / `spawner` と整合。
+- [ ] **GP-1（1.21.1 `GoalSelector` & A* `PathNavigation`）**: `src/mob_ai.rs` に `WalkNodeEvaluator`（段差・落下 `<= 3`・対角線角切り防止・水/溶岩/炎回避）・A* `PathFinder`・排他フラグ付き `GoalSelector` / `TargetSelector` と主要 AI ゴールを実装し、段階的に `mob_tick` へ接続。
+- [ ] **GP-2（1.21.1 `NaturalSpawner`, Mob Cap, `SpawnCosts`, Despawn）**: `src/natural_spawner.rs` に `MobCategory` 7 分類 cap（`/ 289`）・エネルギー予算ポテンシャル計算・`24/32/128` 距離 despawn・明暗/設置条件・群れスポーンを実装。
+- [ ] **GP-3（1.21.1 レッドストーン伝播エンジン）**: `src/redstone.rs` に強/弱給電、`RedStoneWireBlock`（`0..=15` 減衰・段差/遮断）、`RedstoneTorchBlock`（2GT・burnout）、`RepeaterBlock`（遅延・横ロック）、`ComparatorBlock`（比較/減算・コンテナ充填信号）、ピストン QC 等を実装。
+- [ ] **GP-4（村人 AI・職業 POI・取引・ゴシップ・襲撃 Raid）**: 職業紐付け、Merchant 取引オファー・補充・価格変動、ゴシップ、襲撃フェーズを実装。
+- [ ] **GP-5（プレイヤー高度機構：エンチャント台・金床・醸造・鍛冶・空腹・XP）**: 3 択エンチャント生成、金床合成コスト、醸造/ポーション効果拡張、鍛冶台、経験値オーブ、空腹消耗度を実装。
+- [ ] **GP-6（残存 Mob 群のグループ別行動・戦闘実装）**: Nether 系（Blaze/Ghast/Piglin/Hoglin/Wither Skeleton/Strider）・End 系（Enderman/Shulker/Ender Dragon）・水棲/空/ペット（Drowned/Guardian/Phantom/Wolf/Cat/Horse/Bee/Axolotl）・ボス（Wither/Warden）・乗物（Boat/Minecart）をグループ別に実装・対照検証。
+- [ ] **GP-7（進捗 Advancements・スコアボード・ワールドボーダー・残存コマンド）**: `/fill`・`/clone`・`/execute`・`/scoreboard`・`/advancement`・`/worldborder`・`/locate` 等とワールドボーダー・進捗通知を完成。
+
 ### P4 — 統合前のゲート（自動ではmergeしない）
 
 - [ ] **P4-1 同一SHAの全gateと独立レビュー** — `tests/verify.sh` 完走、native oracle、本番wire、mutation、serial/parallel、adapter、layers/debt、Fossil/structure/feature・dimension回帰の結果を同一revisionで収集。hosted CIを使えない場合は未実行と明記。過去の[Issue #7](https://github.com/nekomario28/mc-spine/issues/7)はクローズ済み。
@@ -109,7 +120,7 @@
 
 ## 次の着手
 
-[ROADMAPの直近の実行順](ROADMAP.md#直近の実行順2026-11-20-同期)（Track 1: Phase D-2 ホットパス修正＆残存構造物 Batch B4、Track 2: NeoForge S1 `NF-2`、Track 3: Client Fork `CF-0`〜`CF-4` ＆ Template 最終化 `P1`）を参照する。
+[ROADMAPの直近の実行順](ROADMAP.md#直近の実行順2026-11-20-同期)（Track 1: Phase D-2a ＆ Batch B4、Track 2: NeoForge S1 `NF-2`、Track 3: Client Fork `CF-0`〜`CF-4` ＆ `P1`、Track 4: `R7 GP-0〜GP-7`）を参照する。
 下記の作成時点の「未実行」を、現在の未実装一覧や最新gate結果に読み替えない。
 
 ## 履歴: 作成時点の作業実績（2026-11-06〜07）

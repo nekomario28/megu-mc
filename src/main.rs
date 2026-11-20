@@ -41,6 +41,10 @@ include!("entity_collision.rs");
 include!("entity_fluid.rs");
 include!("entity_spatial.rs");
 include!("entity_push.rs");
+include!("entity_registry.rs");
+include!("mob_ai.rs");
+include!("natural_spawner.rs");
+include!("redstone.rs");
 
 // ---------- varint / wire ----------
 fn read_varint(b: &mut &[u8]) -> Option<i64> {
