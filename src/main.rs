@@ -322,8 +322,6 @@ type SpawnJob = (
 type ThrowHit = (i32, Option<i32>, f64, f64, bool, f64, f64, f64);
 /// A smelting recipe from a datapack: ingredient, result, count, experience.
 type SmeltRecipe = (Ingr, i64, u8, f32);
-/// A merchant's trade row: buy, buy count, optional second buy, sell, sell count.
-type TradeRow = (i64, u8, Option<(i64, u8)>, i64, u8);
 /// The advancement tree: player -> advancement -> finished criteria.
 type Advancements = HashMap<String, HashMap<String, HashSet<String>>>;
 /// The chunks a client has loaded, as (hot, warm) - the region snapshot.
@@ -354,8 +352,15 @@ struct Client {
     craft: Mutex<HashMap<i16, Stack>>,
     craft9: Mutex<HashMap<i16, Stack>>,
     open_table: Mutex<bool>,
+    // Legacy fields still initialized by the synthetic client fixtures.
+    #[cfg(test)]
+    #[allow(dead_code)]
     open_merchant: Mutex<bool>,
+    #[cfg(test)]
+    #[allow(dead_code)]
     trade_sel: Mutex<i32>,
+    #[cfg(test)]
+    #[allow(dead_code)]
     merchant_in: Mutex<[Stack; 2]>,
     bow_draw: Mutex<Option<Instant>>,
     dig: Mutex<Option<(i32, i32, i32, Instant)>>,
@@ -1683,6 +1688,16 @@ fn parse_item_comps(arg: &str) -> Comps {
             "custom_name" => {
                 let t = v.trim().trim_matches('\'').trim_matches('"');
                 comp_set(&mut out, COMP_CUSTOM_NAME, nbt_string(t));
+            }
+            "potion_contents" => {
+                let potion = v.trim().trim_matches(['\'', '"']);
+                let potion = potion.strip_prefix("minecraft:").unwrap_or(potion);
+                if let Some(id) = LIVE_POTIONS.iter().position(|&(name, _)| name == potion) {
+                    let mut data = vec![1];
+                    write_varint(&mut data, id as i64);
+                    data.extend([0, 0]); // no custom color or custom effects
+                    comp_set(&mut out, COMP_POTION_CONTENTS, data);
+                }
             }
             "lore" => {
                 // ['a','b',...] — list of anonymous-NBT string elements
@@ -4817,42 +4832,6 @@ fn water_tick() {
         }
         sched_result(x, y, z, spread);
         requeue_water(x, y, z);
-    }
-}
-static OBS_UNPOWER: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn obs_unpower() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
-    OBS_UNPOWER.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-}
-fn observer_tick() {
-    let region = region_guard();
-    // phase 1: unpower last tick's pulsers
-    let ups: Vec<(i32, i32, i32)> = obs_unpower().lock().unwrap().drain().collect();
-    for (bx, by, bz) in ups {
-        if !region.is_hot(bx, bz) {
-            continue;
-        }
-        let st = block_at(bx, by, bz);
-        if (12550..=12561).contains(&st) && (st - 12550) / 6 == 1 {
-            let nst = st - 6;
-            set_block(bx, by, bz, nst);
-            note_block_update(bx, by, bz, nst);
-        }
-    }
-    // phase 2: this tick's detections -> power on (the powered state IS the output)
-    let ps: Vec<(i32, i32, i32)> = obs_pulse().lock().unwrap().drain().collect();
-    for (bx, by, bz) in ps {
-        if !region.is_hot(bx, bz) {
-            continue;
-        }
-        let st = block_at(bx, by, bz);
-        if !(12550..=12561).contains(&st) || (st - 12550) / 6 == 1 {
-            continue;
-        }
-        let fi = (st - 12550) % 6;
-        let nst = 12550 + 6 + fi;
-        set_block(bx, by, bz, nst);
-        note_block_update(bx, by, bz, nst);
-        obs_unpower().lock().unwrap().insert((bx, by, bz));
     }
 }
 fn hopper_tick() {
@@ -9809,14 +9788,10 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
     set_block_if_dim(DimId::Overworld, x, y, z, st, expected)
 }
 
-/// [`set_block_if`] for one dimension.
+/// Apply a block edit and notify the subsystems for its dimension.
 ///
-/// Only the Overworld's write path exists yet. It is a transaction across subsystems that are
-/// keyed by world position alone — the scheduled-tick queue, the state band, the section store,
-/// the water/lava/hopper/crop indexes, spawner flags, chest pairing, `bump_world_epoch` — and
-/// none of them is dimension-aware (S3). A non-Overworld write therefore records its own overlay
-/// edit and nothing else, rather than patching an Overworld band cell or an Overworld chunk's
-/// epoch with a Nether block.
+/// The Overworld additionally owns the legacy position-only registries for
+/// scheduled blocks, fluids, hoppers, crops, spawners, and chest pairing.
 fn set_block_if_inner_dim(
     dim: DimId,
     x: i32,
@@ -9933,8 +9908,6 @@ fn set_block_if_inner_dim(
             if (7513..=7520).contains(&old) {
                 invalidate_ender_chest_windows(&audience, (x, y, z));
             }
-            disp_power().lock().unwrap().remove(&(x, y, z));
-            obs_unpower().lock().unwrap().remove(&(x, y, z));
             if !(4278..=4285).contains(&st) {
                 crops().lock().unwrap().remove(&ow_block((x, y, z)));
             }
@@ -9994,16 +9967,12 @@ fn set_block_if_inner_dim(
     }
     refresh_hidden_neighbors(x, y, z);
     block_updated(x, y, z);
+    live_block_changed(dim, RsPos(x, y, z), old, st);
     true
 }
 
-/// A non-Overworld block write: this dimension's overlay edit, and only that.
-///
-/// The predicate is `set_block_if_inner`'s, cell for cell — the overlay wins, a write equal to the
-/// dimension's own generated state removes the entry instead of shadowing it with a copy, and an
-/// `expected` that does not match refuses — but nothing else is touched. See
-/// [`set_block_if_inner_dim`] for why the Overworld's subsystem transaction cannot run for
-/// another dimension yet.
+/// A non-Overworld block write updates its overlay, caches, and dimension-aware
+/// mechanisms. The overlay wins, and writing the generated state erases its edit.
 fn set_block_if_dim_edit(
     dim: DimId,
     x: i32,
@@ -10037,16 +10006,505 @@ fn set_block_if_dim_edit(
     band_patch_dim(dim, x, y, z, st);
     store_patch(dim, x, y, z, st);
     bump_world_epoch_dim(dim, x, z);
+    live_block_changed(dim, RsPos(x, y, z), old, st);
+    true
+}
+
+type LiveRedstoneTick = Reverse<(u64, RsTickPriority, u64, RsPos, u32)>;
+
+#[derive(Default)]
+struct LiveRedstoneState {
+    comparator_outputs: BTreeMap<RsPos, u8>,
+    torches: BTreeMap<RsPos, RsTorchHistory>,
+    ticks: BinaryHeap<LiveRedstoneTick>,
+    pending: BTreeMap<(RsPos, u32), u64>,
+    sequence: u64,
+}
+
+fn live_redstone() -> &'static LockedMap<DimId, LiveRedstoneState> {
+    static STATE: Registry<DimId, LiveRedstoneState> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct LiveRedstoneWorld<'a> {
+    dim: DimId,
+    reg: &'static BReg,
+    state: &'a mut LiveRedstoneState,
+    now: u64,
+    reads: std::cell::RefCell<BTreeMap<RsPos, u32>>,
+    writes: BTreeMap<RsPos, u32>,
+    dispensers: Vec<RsPos>,
+}
+
+impl LiveRedstoneWorld<'_> {
+    fn schedule_component(&mut self, pos: RsPos, delay: u64) {
+        if let Some(block_id) = self.reg.block_id_of(self.state_at(pos)) {
+            self.schedule_redstone_tick(RsWorldTick {
+                pos,
+                block_id: block_id as u32,
+                delay,
+                priority: RsTickPriority::Normal,
+            });
+        }
+    }
+
+    fn notify_observers(&mut self, origin: RsPos) {
+        for dir in RsDir::ALL {
+            let pos = origin.relative(dir);
+            if matches!(
+                rs_block_from_state(self.reg, self.state_at(pos)),
+                RsBlock::Observer { facing, powered: false } if facing == dir.opposite()
+            ) {
+                self.schedule_component(pos, 2);
+            }
+        }
+    }
+
+    fn run_host_tick(&mut self, pos: RsPos, block_id: u32) {
+        let state = self.state_at(pos);
+        if self.reg.block_id_of(state).map(|id| id as u32) != Some(block_id) {
+            return;
+        }
+        // These two devices have externally triggered edges. The shared device
+        // scheduler handles their downstream effects once the host flips POWERED.
+        match rs_block_from_state(self.reg, state) {
+            RsBlock::Observer { powered, .. } => {
+                let next =
+                    self.reg
+                        .with_prop(state, "powered", if powered { "false" } else { "true" });
+                self.apply_redstone_change(pos, next, None);
+                if !powered {
+                    self.schedule_component(pos, 2);
+                }
+            }
+            RsBlock::Button { powered: true, .. } => {
+                self.apply_redstone_change(
+                    pos,
+                    self.reg.with_prop(state, "powered", "false"),
+                    None,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+impl RedstoneBlockWorld for LiveRedstoneWorld<'_> {
+    fn state_at(&self, pos @ RsPos(x, y, z): RsPos) -> u32 {
+        if let Some(&state) = self.writes.get(&pos) {
+            return state;
+        }
+        *self.reads.borrow_mut().entry(pos).or_insert_with(|| {
+            band_state_dim(self.dim, x, y, z).unwrap_or_else(|| block_at_dim(self.dim, x, y, z))
+        })
+    }
+
+    fn is_redstone_conductor(&self, pos: RsPos) -> bool {
+        self.reg.is_redstone_conductor(self.state_at(pos))
+    }
+
+    fn comparator_output(&self, pos: RsPos) -> u8 {
+        self.state
+            .comparator_outputs
+            .get(&pos)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn analog_signal(&self, pos @ RsPos(x, y, z): RsPos) -> Option<u8> {
+        let state = self.state_at(pos);
+        let fullness = |stack: &Stack| (u32::from(stack.1), stack_max_of(stack) as u32);
+        if self.reg.name_of(state) == "minecraft:brewing_stand" {
+            let stands = live_brewing_stands().lock().unwrap();
+            let slots = stands
+                .get(&(self.dim, x, y, z))
+                .map(|entry| entry.menu.slots.iter().map(fullness).collect::<Vec<_>>())
+                .unwrap_or_default();
+            return Some(container_analog_output_signal(&slots, 5));
+        }
+        if self.dim != DimId::Overworld {
+            return None;
+        }
+        let size = match self.reg.name_of(state) {
+            "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => 27,
+            "minecraft:dispenser" | "minecraft:dropper" => 9,
+            "minecraft:hopper" => 5,
+            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
+                let furnaces = furnaces().lock().unwrap();
+                let slots = furnaces
+                    .get(&ow_block((x, y, z)))
+                    .map(|f| [&f.input, &f.fuel, &f.output].map(fullness));
+                return Some(container_analog_output_signal(
+                    slots.as_ref().map_or(&[], |s| &s[..]),
+                    3,
+                ));
+            }
+            _ => return None,
+        };
+        let chests = chests().lock().unwrap();
+        let window = chest_window(x, y, z);
+        let containers = [Some(window.0), window.1];
+        let slots = containers
+            .into_iter()
+            .flatten()
+            .flat_map(|key| {
+                chests
+                    .get(&key)
+                    .into_iter()
+                    .flat_map(|slots| slots.values())
+            })
+            .map(fullness)
+            .collect::<Vec<_>>();
+        Some(container_analog_output_signal(
+            &slots,
+            size * if window.1.is_some() { 2 } else { 1 },
+        ))
+    }
+
+    fn apply_redstone_change(&mut self, pos: RsPos, state: u32, comparator_output: Option<u8>) {
+        if let Some(output) = comparator_output {
+            self.state.comparator_outputs.insert(pos, output);
+        }
+        if self.state_at(pos) != state {
+            self.writes.insert(pos, state);
+        }
+    }
+
+    fn schedule_redstone_tick(&mut self, tick: RsWorldTick) {
+        let key = (tick.pos, tick.block_id);
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.state.pending.entry(key) {
+            let sequence = self.state.sequence;
+            self.state.sequence += 1;
+            entry.insert(sequence);
+            self.state.ticks.push(Reverse((
+                self.now + server_ticks(tick.delay),
+                tick.priority,
+                sequence,
+                tick.pos,
+                tick.block_id,
+            )));
+        }
+    }
+
+    fn dispense_redstone(&mut self, pos: RsPos) {
+        self.dispensers.push(pos);
+    }
+}
+
+fn redstone_component(reg: &BReg, state: u32) -> bool {
+    matches!(
+        reg.name_of(state),
+        "minecraft:redstone_wire"
+            | "minecraft:redstone_block"
+            | "minecraft:redstone_torch"
+            | "minecraft:redstone_wall_torch"
+            | "minecraft:lever"
+            | "minecraft:repeater"
+            | "minecraft:comparator"
+            | "minecraft:redstone_lamp"
+            | "minecraft:observer"
+            | "minecraft:target"
+            | "minecraft:hopper"
+            | "minecraft:dispenser"
+            | "minecraft:dropper"
+    ) || reg.in_tag(state, "minecraft:buttons")
+}
+
+fn nearby_redstone(reg: &BReg, dim: DimId, RsPos(x, y, z): RsPos) -> bool {
+    // Live devices are in the edit overlay. Check that small neighborhood
+    // before asking the generator for conductor and support states.
+    let edits = world().lock().unwrap();
+    for dx in -2..=2 {
+        for dz in -2..=2 {
+            let (x, z) = (x + dx, z + dz);
+            if let Some(chunk) = edits.get(&(dim, x >> 4, z >> 4)) {
+                if (-2..=2).any(|dy| {
+                    chunk
+                        .get(&local_idx(x, y + dy, z))
+                        .is_some_and(|&state| redstone_component(reg, state))
+                }) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+thread_local! {
+    // Block writes can cascade through the legacy neighbor handlers. Queue those
+    // origins until the current pass has committed its writes and released its locks.
+    static LIVE_REDSTONE_ORIGINS: std::cell::RefCell<Option<VecDeque<(DimId, RsPos)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_redstone_origins(work: impl FnOnce()) {
+    LIVE_REDSTONE_ORIGINS.with(|origins| *origins.borrow_mut() = Some(VecDeque::new()));
+    work();
+    while let Some((dim, pos)) =
+        LIVE_REDSTONE_ORIGINS.with(|origins| origins.borrow_mut().as_mut().unwrap().pop_front())
+    {
+        run_redstone_pass(dim, pos, None);
+    }
+    LIVE_REDSTONE_ORIGINS.with(|origins| *origins.borrow_mut() = None);
+}
+
+fn live_block_changed(dim: DimId, pos @ RsPos(x, y, z): RsPos, old: u32, new: u32) {
+    if old == new {
+        return;
+    }
+    let Some(reg) = breg() else { return };
+    if reg.block_id_of(old) != reg.block_id_of(new) {
+        if let Some(state) = live_redstone().lock().unwrap().get_mut(&dim) {
+            state.comparator_outputs.remove(&pos);
+            state.torches.remove(&pos);
+            if let Some(id) = reg.block_id_of(old) {
+                state.pending.remove(&(pos, id as u32));
+            }
+        }
+        if reg.name_of(old) == "minecraft:brewing_stand" {
+            remove_live_brewing_stand((dim, x, y, z));
+        }
+    }
+    if !redstone_component(reg, old)
+        && !redstone_component(reg, new)
+        && !nearby_redstone(reg, dim, pos)
+    {
+        return;
+    }
+    let queued = LIVE_REDSTONE_ORIGINS.with(|origins| {
+        if let Some(queue) = origins.borrow_mut().as_mut() {
+            queue.push_back((dim, pos));
+            true
+        } else {
+            false
+        }
+    });
+    if !queued {
+        with_redstone_origins(|| run_redstone_pass(dim, pos, None));
+    }
+}
+
+fn run_redstone_pass(dim: DimId, origin: RsPos, scheduled: Option<u32>) {
+    let Some(reg) = breg() else { return };
+    let (writes, dispensers) = {
+        let mut dimensions = live_redstone().lock().unwrap();
+        let state = dimensions.entry(dim).or_default();
+        let mut torches = std::mem::take(&mut state.torches);
+        let now = TICK_IDX.load(Ordering::Relaxed);
+        let mut world = LiveRedstoneWorld {
+            dim,
+            reg,
+            state,
+            now,
+            reads: Default::default(),
+            writes: Default::default(),
+            dispensers: Vec::new(),
+        };
+        if let Some(block_id) = scheduled {
+            world.run_host_tick(origin, block_id);
+        } else {
+            world.notify_observers(origin);
+            let state = world.state_at(origin);
+            if let RsBlock::Button { powered: true, .. } = rs_block_from_state(reg, state) {
+                let delay = if reg.in_tag(state, "minecraft:wooden_buttons") {
+                    30
+                } else {
+                    20
+                };
+                world.schedule_component(origin, delay);
+            }
+        }
+        let mut adapter = RedstoneWorldAdapter::new(reg, &mut world, &mut torches);
+        if let Some(block_id) = scheduled {
+            adapter.run_scheduled_tick(origin, block_id, now * u64::from(GAME_TICKS_PER_TICK));
+        } else {
+            let mut nearby = RsBTreeSet::new();
+            rs_extend_neighborhood(&mut nearby, [origin]);
+            for pos in nearby {
+                adapter.refresh_wire_shape(pos);
+            }
+        }
+        adapter.propagate(&[origin]);
+        world.state.torches = torches;
+        (world.writes, world.dispensers)
+    };
+    for (RsPos(x, y, z), state) in writes {
+        set_block_if_inner_dim(dim, x, y, z, state, None);
+        note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
+    }
+    if dim == DimId::Overworld {
+        for RsPos(x, y, z) in dispensers {
+            fire_dispenser(x, y, z, block_at(x, y, z));
+        }
+    }
+}
+
+fn live_redstone_tick() {
+    with_save_guard(|| {
+        let now = TICK_IDX.load(Ordering::Relaxed);
+        let mut due = Vec::new();
+        for (&dim, state) in live_redstone().lock().unwrap().iter_mut() {
+            while let Some(&Reverse((when, _, _, _, _))) = state.ticks.peek() {
+                if when > now {
+                    break;
+                }
+                let Reverse((_, _, sequence, pos, id)) = state.ticks.pop().unwrap();
+                due.push((dim, sequence, pos, id));
+            }
+        }
+        for (dim, sequence, pos, id) in due {
+            let pending = {
+                let mut dimensions = live_redstone().lock().unwrap();
+                let pending = &mut dimensions.get_mut(&dim).unwrap().pending;
+                if pending.get(&(pos, id)) == Some(&sequence) {
+                    pending.remove(&(pos, id));
+                    true
+                } else {
+                    false
+                }
+            };
+            if pending {
+                with_redstone_origins(|| run_redstone_pass(dim, pos, Some(id)));
+            }
+        }
+    });
+}
+
+fn use_redstone_component(c: &Client, (dim, x, y, z): DimBlockPos, state: u32) -> bool {
+    let Some(reg) = breg() else { return false };
+    let (property, value) = match rs_block_from_state(reg, state) {
+        RsBlock::Lever { powered, .. } => ("powered", if powered { "false" } else { "true" }),
+        RsBlock::Button { powered: true, .. } => return true,
+        RsBlock::Button { .. } => ("powered", "true"),
+        RsBlock::Repeater(repeater) => ("delay", ["1", "2", "3", "4"][repeater.delay as usize % 4]),
+        RsBlock::Comparator(comparator) => (
+            "mode",
+            match comparator.mode {
+                RsComparatorMode::Compare => "subtract",
+                RsComparatorMode::Subtract => "compare",
+            },
+        ),
+        _ => return false,
+    };
+    if !c.is_spectator() {
+        let updated = reg.with_prop(state, property, value);
+        if set_block_if_dim(dim, x, y, z, updated, Some(state)) {
+            note_block_update_dim(dim, x, y, z, updated);
+            if dim == DimId::Overworld && reg.name_of(state) == "minecraft:lever" {
+                redstone_update(x, y, z, value == "true");
+            }
+        }
+    }
+    true
+}
+
+fn live_placement_state(reg: &BReg, item: i64, face: RsDir, yaw: f32, pitch: f32) -> Option<u32> {
+    let item_name = item_to_name(item)?;
+    let block_name = match item_name {
+        "redstone" => "redstone_wire",
+        "redstone_torch" if RsDir::HORIZONTAL.contains(&face) => "redstone_wall_torch",
+        other => other,
+    };
+    let state = reg.state_of(&format!("minecraft:{block_name}"), None);
+    if !matches!(
+        block_name,
+        "anvil"
+            | "chipped_anvil"
+            | "damaged_anvil"
+            | "enchanting_table"
+            | "brewing_stand"
+            | "smithing_table"
+            | "bookshelf"
+    ) && !redstone_component(reg, state)
+    {
+        return None;
+    }
+    let look = [RsDir::South, RsDir::West, RsDir::North, RsDir::East]
+        [((yaw / 90.0).round() as i32).rem_euclid(4) as usize];
+    let updated = match rs_block_from_state(reg, state) {
+        RsBlock::Lever { .. } | RsBlock::Button { .. } => {
+            let (mount, facing) = match face {
+                RsDir::Up => ("floor", look),
+                RsDir::Down => ("ceiling", look),
+                wall => ("wall", wall),
+            };
+            reg.with_prop(
+                reg.with_prop(state, "face", mount),
+                "facing",
+                facing.property(),
+            )
+        }
+        RsBlock::WallTorch(_) => reg.with_prop(state, "facing", face.property()),
+        RsBlock::Repeater(_) | RsBlock::Comparator(_) => {
+            reg.with_prop(state, "facing", look.opposite().property())
+        }
+        RsBlock::Observer { .. } => {
+            let direction = if pitch > 45.0 {
+                RsDir::Down
+            } else if pitch < -45.0 {
+                RsDir::Up
+            } else {
+                look
+            };
+            reg.with_prop(state, "facing", direction.opposite().property())
+        }
+        _ if matches!(block_name, "anvil" | "chipped_anvil" | "damaged_anvil") => {
+            reg.with_prop(state, "facing", look.right().property())
+        }
+        _ => state,
+    };
+    Some(updated)
+}
+
+fn try_live_block_placement(
+    c: &Client,
+    (dim, x, y, z): DimBlockPos,
+    face: usize,
+    held: i16,
+    item: i64,
+) -> bool {
+    let Some(reg) = breg() else { return false };
+    let (_, _, _, yaw, pitch, _) = *c.pos.lock().unwrap();
+    let Some(state) = live_placement_state(reg, item, RsDir::ALL[face], yaw, pitch) else {
+        return false;
+    };
+    let game_mode = *c.gm.lock().unwrap();
+    if game_mode == 3 {
+        return true;
+    }
+    with_save_guard(|| {
+        let old = block_at_dim(dim, x, y, z);
+        if !reg.is_replaceable(old) {
+            return;
+        }
+        if set_block_if_inner_dim(dim, x, y, z, state, Some(old)) {
+            note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
+            if game_mode != 1 {
+                let mut inventory = c.inv.lock().unwrap();
+                map_take(&mut inventory, 36 + held, 1);
+                let mut packet = vec![0];
+                write_varint(&mut packet, 0);
+                packet.extend_from_slice(&(36 + held).to_be_bytes());
+                packet.extend_from_slice(&slot_wire(
+                    inventory.get(&(36 + held)).unwrap_or(&Stack::default()),
+                ));
+                let _ = send_packet(&mut c.sock.lock().unwrap(), 0x15, packet);
+            }
+        }
+    });
     true
 }
 
 // ---------- neighbor-update engine (vanilla-ish: piston QC, tnt ignite, observer, dispenser, gravity) ----------
 fn is_power_source(x: i32, y: i32, z: i32) -> bool {
     let st = block_at(x, y, z);
-    st == 9223 // redstone_block
-        || ((5626..=5649).contains(&st) && (st - 5626) & 1 == 0) // powered lever
-        || ((12550..=12561).contains(&st) && (st - 12550) / 6 == 1) // powered observer
-        || plate_powered(st)
+    plate_powered(st)
+        || breg().is_some_and(|reg| matches!(
+            rs_block_from_state(reg, st),
+            RsBlock::RedstoneBlock | RsBlock::Lever { powered: true, .. }
+                | RsBlock::Observer { powered: true, .. } | RsBlock::Button { powered: true, .. }
+        ))
 }
 fn piston_powered(px: i32, py: i32, pz: i32) -> bool {
     for (dx, dy, dz) in [
@@ -10129,20 +10587,12 @@ fn piston_set_extended(bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
     }
 }
 fn fire_dispenser(dx: i32, dy: i32, dz: i32, st: u32) {
-    let lo = if (523..=534).contains(&st) {
-        523u32
-    } else {
-        9345
+    let Some(reg) = breg() else { return };
+    let facing = match rs_block_from_state(reg, st) {
+        RsBlock::Dispenser { facing, .. } | RsBlock::Dropper { facing, .. } => facing,
+        _ => return,
     };
-    let fi = ((st - lo) / 2) % 6;
-    let (fx, fy, fz) = match fi {
-        0 => (0, 0, -1),
-        1 => (1, 0, 0),
-        2 => (0, 0, 1),
-        3 => (-1, 0, 0),
-        4 => (0, 1, 0),
-        _ => (0, -1, 0),
-    };
+    let (fx, fy, fz) = facing.offset();
     let (tx, ty, tz) = (dx + fx, dy + fy, dz + fz);
     unpack_block_loot_if_needed(ow_block((dx, dy, dz)));
     let first = chests().lock().unwrap().get(&ContainerKey::ow((dx, dy, dz))).and_then(|m| {
@@ -10185,14 +10635,6 @@ fn fire_dispenser(dx: i32, dy: i32, dz: i32, st: u32) {
         }
         _ => {}
     }
-}
-static OBS_PULSE: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn obs_pulse() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
-    OBS_PULSE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-}
-static DISP_POWER: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn disp_power() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
-    DISP_POWER.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 static WATERS: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
 fn waters() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
@@ -10580,42 +11022,6 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
                 left: server_ticks(TNT_FUSE_GT) as i32,
             });
             // interest_tick delivers the arrow spawn to trackers
-        }
-        // observer: watched cell changed -> pulse next tick
-        if (12550..=12561).contains(&st) {
-            let fi = ((st - 12550) % 6) as i32;
-            let (fx, fy, fz) = match fi {
-                0 => (0, 0, -1),
-                1 => (1, 0, 0),
-                2 => (0, 0, 1),
-                3 => (-1, 0, 0),
-                4 => (0, 1, 0),
-                _ => (0, -1, 0),
-            };
-            if (bx + fx, by + fy, bz + fz) == (x, y, z) && (st - 12550) / 6 == 0 {
-                obs_pulse().lock().unwrap().insert((bx, by, bz));
-            }
-        }
-        // dispenser/dropper edge: fire on power rising
-        if (523..=534).contains(&st) || (9345..=9356).contains(&st) {
-            let powered = [
-                (1, 0, 0),
-                (-1, 0, 0),
-                (0, 1, 0),
-                (0, -1, 0),
-                (0, 0, 1),
-                (0, 0, -1),
-            ]
-            .iter()
-            .any(|(ddx, ddy, ddz)| is_power_source(bx + ddx, by + ddy, bz + ddz));
-            let mut dp = disp_power().lock().unwrap();
-            if powered && !dp.contains(&(bx, by, bz)) {
-                dp.insert((bx, by, bz));
-                drop(dp);
-                fire_dispenser(bx, by, bz, st);
-            } else if !powered {
-                dp.remove(&(bx, by, bz));
-            }
         }
     }
 }
@@ -11698,6 +12104,7 @@ fn save_world_into(f: &mut Vec<u8>) {
     if !dim2.is_empty() {
         append_dim2_footer(f, &dim2);
     }
+    append_brewing_footer(f);
 }
 
 // Non-Overworld signs and player dimensions. The body is `[sign count][signs][player count][players]`,
@@ -12301,7 +12708,8 @@ fn load_dim_overlay_file(dir: &std::path::Path, dim: DimId) -> Result<(), &'stat
 }
 
 fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
-    // Footers are stripped last-written-first: DIM2, then DIM1, then block loot, then drop owners.
+    // Footers are stripped last-written-first.
+    let (payload, brewing) = read_brewing_footer(payload)?;
     // A payload with no DIM2 footer is the legacy (or DIM1-only) form and parses exactly as before.
     let (payload, dim2) = read_dim2_footer(payload)?;
     let (payload, dim_signs, dim_players) = read_dim_footer(payload)?;
@@ -13311,6 +13719,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
     }
+    *live_brewing_stands().lock().unwrap() = brewing;
     rebuild_derived_indexes();
     Ok(())
 }
@@ -13327,6 +13736,9 @@ fn state_from_arg(arg: &str) -> Option<u32> {
     };
     let name: &str = &name;
     let base = name_to_state(name)?;
+    if breg().is_some_and(|reg| redstone_component(reg, base)) {
+        return modification_block_state(arg);
+    }
     let get = |k: &str| -> Option<String> {
         props.split(',').find_map(|kv| {
             kv.trim()
@@ -13358,58 +13770,6 @@ fn state_from_arg(arg: &str) -> Option<u32> {
                 .unwrap_or(0)
                 .min(7),
         );
-    }
-    if name == "observer" {
-        let fi = get("facing").map(|f| facing_idx(&f)).unwrap_or(5);
-        let pw = match get("powered").as_deref() {
-            Some("true") => 1,
-            _ => 0,
-        };
-        return Some(12550 + pw * 6 + fi);
-    }
-    if name == "dispenser" || name == "dropper" {
-        let lo = if name == "dispenser" { 523u32 } else { 9345 };
-        let fi = get("facing").map(|f| facing_idx(&f)).unwrap_or(0);
-        let tr = match get("triggered").as_deref() {
-            Some("true") => 1,
-            _ => 0,
-        };
-        return Some(lo + fi * 2 + tr);
-    }
-    if name == "lever" {
-        let mut face = 1u32;
-        let mut face_i = 0u32;
-        let mut pow = 1u32; // defaults: wall,north,unpowered
-        if let Some(v) = get("face") {
-            face_i = ["floor", "wall", "ceiling"]
-                .iter()
-                .position(|&x| x == v)
-                .unwrap_or(1) as u32;
-        }
-        if let Some(v) = get("facing") {
-            face = ["north", "south", "west", "east"]
-                .iter()
-                .position(|&x| x == v)
-                .unwrap_or(0) as u32;
-        }
-        if let Some(v) = get("powered") {
-            pow = if v == "true" { 0 } else { 1 };
-        }
-        return Some(5626 + face_i * 8 + face * 2 + pow);
-    }
-    if name == "hopper" {
-        let mut fi = 0u32;
-        let mut en = 0u32; // defaults: down, enabled
-        if let Some(v) = get("facing") {
-            fi = ["down", "north", "south", "west", "east"]
-                .iter()
-                .position(|&x| x == v)
-                .unwrap_or(0) as u32;
-        }
-        if let Some(v) = get("enabled") {
-            en = if v == "false" { 1 } else { 0 };
-        }
-        return Some(9225 + en * 5 + fi);
     }
     if door_base(base).is_some() {
         let mut st = base;
@@ -20436,6 +20796,7 @@ fn switch_client_dimension(
     view: i32,
 ) {
     let old_dim = *me.dim.lock().unwrap();
+    close_live_menu(me, true, true);
     // Retire everything the old world was tracking before the client drops its chunks.
     {
         let mut seen = me.seen.lock().unwrap();
@@ -20672,26 +21033,6 @@ fn slot_wire(s: &Stack) -> Vec<u8> {
     }
     p
 }
-// villager trades: (input item name, count, optional second input, output name, count)
-fn trades() -> Vec<TradeRow> {
-    let mut v = Vec::new();
-    for (a, ac, b, c, cc) in [
-        ("wheat", 20u8, None, "emerald", 1u8),
-        ("rotten_flesh", 22, None, "emerald", 1),
-        ("coal", 15, None, "emerald", 1),
-        ("emerald", 1, None, "bread", 1),
-        ("emerald", 3, None, "iron_ingot", 1),
-        ("emerald", 5, None, "diamond", 1),
-        ("iron_ingot", 4, None, "emerald", 1),
-        ("emerald", 1, None, "arrow", 8),
-    ] {
-        let (ai, ci) = (name_to_item(a), name_to_item(c));
-        if let (Some(ai), Some(ci)) = (ai, ci) {
-            v.push((ai, ac, b.and_then(name_to_item).map(|i| (i, 1u8)), ci, cc));
-        }
-    }
-    v
-}
 // wire-format slot decode (1.21.1 structured components). Unknown comp
 // ids abort the component loop — safe because slot data always ends a
 // packet here, so no framing desync.
@@ -20713,7 +21054,7 @@ fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
         let ty = rv_varint(b, &mut p);
         let start = p;
         match ty {
-            1..=3 => {
+            1..=3 | 16 => {
                 rv_varint(b, &mut p);
             } // varint payload
             4 => {
@@ -20755,6 +21096,31 @@ fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
                     p += 1;
                 }
             }
+            COMP_POTION_CONTENTS => {
+                let mut payload = b.get(p..)?;
+                if read_merchant_bool(&mut payload)? {
+                    read_protocol_i32(&mut payload)?;
+                }
+                if read_merchant_bool(&mut payload)? {
+                    payload = payload.get(4..)?;
+                }
+                let effects = read_protocol_i32(&mut payload)?;
+                if !(0..=256).contains(&effects) {
+                    return None;
+                }
+                for _ in 0..effects {
+                    read_protocol_i32(&mut payload)?; // effect registry id
+                    read_live_potion_effect_details(&mut payload, 0)?;
+                }
+                p = b.len() - payload.len();
+            }
+            COMP_ARMOR_TRIM => {
+                // The smithing menu emits registry-backed holders.
+                if rv_varint(b, &mut p) == 0 || rv_varint(b, &mut p) == 0 {
+                    return None;
+                }
+                p += 1;
+            }
             _ => break, // unknown: keep prefix
         }
         if p <= b.len() && p > start {
@@ -20768,73 +21134,6 @@ fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
         rv_varint(b, &mut p);
     }
     Some((slot, (item, cnt as u8, comps)))
-}
-fn reduced_slot(p: &mut Vec<u8>, item: i64, cnt: u8) {
-    write_varint(p, item);
-    write_varint(p, cnt as i64);
-    write_varint(p, 0);
-}
-fn inv_consume(inv: &mut HashMap<i16, Stack>, item: i64, need: i64) -> bool {
-    // vanilla trade costs have an empty component predicate — any stack of
-    // that item type is spendable (enchanted/renamed accepted); prefer
-    // plain stacks first to preserve valuable components
-    let have: i64 = inv
-        .values()
-        .filter(|(it, _, _)| *it == item)
-        .map(|(_, c, _)| *c as i64)
-        .sum();
-    if have < need {
-        return false;
-    }
-    let mut left = need;
-    let mut keys: Vec<i16> = inv
-        .iter()
-        .filter(|(_, (it, _, _))| *it == item)
-        .map(|(&k, _)| k)
-        .collect();
-    keys.sort_by_key(|k| if inv[k].2.is_empty() { 0 } else { 1 });
-    for k in keys {
-        if left <= 0 {
-            break;
-        }
-        let (it, c, _cc) = inv[&k].clone();
-        let take = (c as i64).min(left);
-        left -= take;
-        if take >= c as i64 {
-            inv.remove(&k);
-        } else {
-            inv.insert(k, (it, c - take as u8, _cc));
-        }
-    }
-    true
-}
-fn trade_list_pkt(wid: u8) -> Vec<u8> {
-    let mut p = vec![wid];
-    let ts = trades();
-    write_varint(&mut p, ts.len() as i64);
-    for (a, ac, b, c, cc) in ts {
-        reduced_slot(&mut p, a, ac);
-        p.extend_from_slice(&slot_wire(&(c, cc, Vec::new())));
-        match b {
-            Some((bi, bc)) => {
-                p.push(1);
-                reduced_slot(&mut p, bi, bc);
-            }
-            None => p.push(0),
-        }
-        p.push(0); // tradeDisabled
-        p.extend_from_slice(&0i32.to_be_bytes()); // uses
-        p.extend_from_slice(&12i32.to_be_bytes()); // max uses
-        p.extend_from_slice(&1i32.to_be_bytes()); // xp
-        p.extend_from_slice(&0i32.to_be_bytes()); // specialPrice
-        p.extend_from_slice(&0.0f32.to_be_bytes()); // priceMultiplier
-        p.extend_from_slice(&0i32.to_be_bytes()); // demand
-    }
-    write_varint(&mut p, 1); // villagerLevel
-    write_varint(&mut p, 0); // experience
-    p.push(1);
-    p.push(1); // regular + canRestock
-    p
 }
 fn write_open_chest_packets(
     s: &mut TcpStream,
@@ -21716,10 +22015,10 @@ fn craft3_result(g: &HashMap<i16, Stack>) -> Option<Stack> {
     None
 }
 // Runtime state attached to the connection, alongside the legacy health and XP fields.
-#[derive(Default)]
 struct PlayerMechanismSession {
     xp_bar: (i32, f32),
     food_timer: i32,
+    menus: Arc<LiveMenuConnection>,
 }
 
 fn player_mechanism_sessions() -> &'static LockedMap<i32, PlayerMechanismSession> {
@@ -21864,6 +22163,1146 @@ fn send_player_xp(
         let _ = send_packet(&mut w, 0x5c, p);
     }
     Ok(())
+}
+
+enum LiveMenu {
+    Anvil(AnvilMenu),
+    Enchanting(EnchantmentMenu),
+    Brewing,
+    Smithing(SmithingMenu),
+    Merchant(i32, MerchantMenu),
+}
+
+impl LiveMenu {
+    fn screen(&self) -> (i64, &'static str) {
+        match self {
+            Self::Anvil(_) => (8, "Repair & Name"),
+            Self::Brewing => (11, "Brewing Stand"),
+            Self::Enchanting(_) => (13, "Enchant"),
+            Self::Merchant(..) => (19, "Villager"),
+            Self::Smithing(_) => (21, "Upgrade Gear"),
+        }
+    }
+
+    fn input_slots(&mut self) -> Vec<&mut Stack> {
+        match self {
+            Self::Anvil(menu) => vec![&mut menu.left, &mut menu.right],
+            Self::Enchanting(menu) => vec![&mut menu.item, &mut menu.lapis],
+            Self::Smithing(menu) => vec![&mut menu.template, &mut menu.base, &mut menu.addition],
+            Self::Merchant(_, menu) => menu.payments.iter_mut().collect(),
+            Self::Brewing => Vec::new(),
+        }
+    }
+}
+
+struct LiveMenuSession {
+    id: u8,
+    state_id: i32,
+    anchor: Option<DimBlockPos>,
+    menu: LiveMenu,
+}
+
+struct LiveMenuConnection {
+    active: Mutex<Option<LiveMenuSession>>,
+    next_id: std::sync::atomic::AtomicU8,
+    enchantment_seed: Mutex<i32>,
+}
+
+fn live_menu_connection(c: &Client) -> Option<Arc<LiveMenuConnection>> {
+    // Release the player-state registry before locking a menu. Menu actions
+    // can update XP, which briefly reacquires the registry.
+    player_mechanism_sessions()
+        .lock()
+        .unwrap()
+        .get(&c.eid)
+        .map(|session| Arc::clone(&session.menus))
+}
+
+fn live_menu_id(c: &Client) -> Option<u8> {
+    live_menu_connection(c)?
+        .active
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|menu| menu.id)
+}
+
+fn live_villagers() -> &'static LockedMap<i32, Villager> {
+    static VILLAGERS: Registry<i32, Villager> = OnceLock::new();
+    VILLAGERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn farmer_merchant(mob: &Mob) -> Villager {
+    let mut villager = Villager::new(mob.uuid, VillagerProfession::Farmer);
+    villager.offers = [
+        ("wheat", 20, "emerald", 1, 2),
+        ("emerald", 1, "bread", 6, 1),
+    ]
+    .into_iter()
+    .filter_map(|(buy, count, sell, result_count, xp_reward)| {
+        Some(MerchantOffer {
+            cost_a: ItemCost {
+                item: name_to_item(buy)?,
+                count,
+                components: Vec::new(),
+            },
+            cost_b: None,
+            result: (name_to_item(sell)?, result_count, Vec::new()),
+            uses: 0,
+            max_uses: 16,
+            xp_reward,
+            price_multiplier: 0.05,
+            demand: 0,
+            special_price_diff: 0,
+        })
+    })
+    .collect();
+    villager
+}
+
+fn merchant_item_prototype(item: i64) -> &'static Comps {
+    static PROTOTYPES: OnceLock<[Comps; 100]> = OnceLock::new();
+    let prototypes = PROTOTYPES.get_or_init(|| {
+        std::array::from_fn(|count| {
+            let mut components = Vec::new();
+            comp_set_varint(&mut components, MERCHANT_MAX_STACK_SIZE, count as i64);
+            components
+        })
+    });
+    &prototypes[item_stack_max(item, &Vec::new()) as usize]
+}
+
+fn live_offers_payload(window: u8, merchant: &Villager) -> Vec<u8> {
+    let packet = MerchantOffersPacket {
+        window_id: i32::from(window),
+        offers: merchant.offers.clone(),
+        villager_level: merchant.level() as i32,
+        villager_xp: merchant.villager_xp,
+        show_progress: true,
+        can_restock: false,
+    };
+    encode_merchant_offers_pkt(&packet)
+}
+
+fn open_live_merchant(c: &Client, mob: &Mob) {
+    if c.is_spectator() || *c.dim.lock().unwrap() != DimId::Overworld {
+        return;
+    }
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    if matches!(connection.active.lock().unwrap().as_ref().map(|s| &s.menu),
+                Some(LiveMenu::Merchant(id, _)) if *id == mob.eid)
+    {
+        return;
+    }
+    let opened = live_villagers()
+        .lock()
+        .unwrap()
+        .entry(mob.eid)
+        .or_insert_with(|| farmer_merchant(mob))
+        .start_trading(&PoiRegistry::default(), c.uuid, None);
+    if opened {
+        open_live_menu(
+            c,
+            None,
+            LiveMenu::Merchant(mob.eid, MerchantMenu::default()),
+        );
+    }
+}
+
+fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u32) -> bool {
+    let Some(reg) = breg() else { return false };
+    let menu = match reg.name_of(state) {
+        "minecraft:anvil" | "minecraft:chipped_anvil" | "minecraft:damaged_anvil" => {
+            LiveMenu::Anvil(AnvilMenu::default())
+        }
+        "minecraft:enchanting_table" => LiveMenu::Enchanting(EnchantmentMenu::default()),
+        "minecraft:brewing_stand" => LiveMenu::Brewing,
+        "minecraft:smithing_table" => LiveMenu::Smithing(SmithingMenu::default()),
+        _ => return false,
+    };
+    if !c.is_spectator() {
+        // Recheck under the block transaction lock before creating the stand entity.
+        with_save_guard(|| {
+            if block_at_dim(dim, x, y, z) != state {
+                return;
+            }
+            if matches!(menu, LiveMenu::Brewing) {
+                live_brewing_stands()
+                    .lock()
+                    .unwrap()
+                    .entry(key)
+                    .or_default();
+            }
+            open_live_menu(c, Some(key), menu);
+        });
+    }
+    true
+}
+
+fn open_live_menu(c: &Client, anchor: Option<DimBlockPos>, menu: LiveMenu) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    close_live_menu(c, false, false);
+    if let Some((window, old_anchor)) = client_open_window_and_anchor(c) {
+        let audience = client_snapshot();
+        let before = chest_opener_snapshot(&audience, &client_window_halves(window, old_anchor));
+        *c.open_chest.lock().unwrap() = None;
+        *c.chest_sync.lock().unwrap() = None;
+        sync_chest_openers(&audience, &before);
+    }
+    *c.open_furnace.lock().unwrap() = None;
+    if std::mem::take(&mut *c.open_table.lock().unwrap()) {
+        let grid = std::mem::take(&mut *c.craft9.lock().unwrap());
+        return_live_inputs(c, grid.into_values());
+    }
+
+    // The older windows reserve IDs 1–3. A new ID lets clicks from a replaced
+    // menu be rejected even if the next menu has the same layout.
+    let id = connection
+        .next_id
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            Some(if id == 100 { 4 } else { id + 1 })
+        })
+        .unwrap();
+    let mut active = connection.active.lock().unwrap();
+    let session = active.insert(LiveMenuSession {
+        id,
+        state_id: 0,
+        anchor,
+        menu,
+    });
+    refresh_live_enchanting(&connection, session);
+    let (kind, title) = session.menu.screen();
+    let mut packet = Vec::new();
+    write_varint(&mut packet, i64::from(id));
+    write_varint(&mut packet, kind);
+    packet.extend_from_slice(&chat_nbt(title));
+    let _ = send_packet(&mut c.sock.lock().unwrap(), 0x33, packet);
+    sync_live_menu(c, session, true);
+}
+
+fn send_live_contents(
+    sock: &mut TcpStream,
+    id: u8,
+    state_id: i32,
+    slots: &[Stack],
+    inventory: &HashMap<i16, Stack>,
+    player_slots: std::ops::Range<i16>,
+    cursor: &Stack,
+) {
+    let mut packet = vec![id];
+    write_varint(&mut packet, i64::from(state_id));
+    write_varint(&mut packet, (slots.len() + player_slots.len()) as i64);
+    for stack in slots {
+        packet.extend_from_slice(&slot_wire(stack));
+    }
+    let empty = Stack::default();
+    for slot in player_slots {
+        packet.extend_from_slice(&slot_wire(inventory.get(&slot).unwrap_or(&empty)));
+    }
+    packet.extend_from_slice(&slot_wire(cursor));
+    let _ = send_packet(sock, 0x13, packet);
+}
+
+fn anvil_hover_name(stack: &Stack) -> &str {
+    if let Some([8, hi, lo, text @ ..]) = comp_get(&stack.2, COMP_CUSTOM_NAME) {
+        if let Some(name) = text.get(..u16::from_be_bytes([*hi, *lo]) as usize) {
+            return std::str::from_utf8(name).unwrap_or_default();
+        }
+    }
+    item_to_name(stack.0).unwrap_or_default()
+}
+
+fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) {
+    let mut properties = Vec::new();
+    let mut offers = None;
+    let slots = match &session.menu {
+        LiveMenu::Anvil(menu) => {
+            let result = menu.result(anvil_hover_name(&menu.left), *c.gm.lock().unwrap() == 1);
+            properties.extend(anvil_window_properties(
+                result.as_ref().map_or(0, |r| r.level_cost),
+            ));
+            vec![
+                menu.left.clone(),
+                menu.right.clone(),
+                result.map_or_else(|_| Stack::default(), |r| r.stack),
+            ]
+        }
+        LiveMenu::Enchanting(menu) => {
+            properties.extend(enchanting_window_properties(menu));
+            vec![menu.item.clone(), menu.lapis.clone()]
+        }
+        LiveMenu::Brewing => {
+            let stands = live_brewing_stands().lock().unwrap();
+            let Some(entry) = stands.get(&session.anchor.unwrap()) else {
+                return;
+            };
+            properties.extend(brewing_window_properties(&entry.stand));
+            entry.menu.slots.to_vec()
+        }
+        LiveMenu::Smithing(menu) => {
+            vec![
+                menu.template.clone(),
+                menu.base.clone(),
+                menu.addition.clone(),
+                menu.result().unwrap_or_default(),
+            ]
+        }
+        LiveMenu::Merchant(id, menu) => {
+            let merchants = live_villagers().lock().unwrap();
+            let Some(villager) = merchants.get(id) else {
+                return;
+            };
+            let output = menu
+                .active_offer(&villager.offers, &MerchantItems(&merchant_item_prototype))
+                .map(|i| villager.offers[i].result.clone())
+                .unwrap_or_default();
+            if send_offers {
+                offers = Some(live_offers_payload(session.id, villager));
+            }
+            vec![menu.payments[0].clone(), menu.payments[1].clone(), output]
+        }
+    };
+    session.state_id = (session.state_id + 1) & 0x7fff;
+    let inventory = c.inv.lock().unwrap();
+    let cursor = c.cursor.lock().unwrap();
+    let mut sock = c.sock.lock().unwrap();
+    if let Some(payload) = offers {
+        let _ = send_packet(&mut sock, 0x2d, payload);
+    }
+    send_live_contents(
+        &mut sock,
+        session.id,
+        session.state_id,
+        &slots,
+        &inventory,
+        9..45,
+        &cursor,
+    );
+    for property in properties {
+        let _ = send_packet(&mut sock, 0x14, property.encode(session.id).to_vec());
+    }
+}
+
+fn drop_live_stack((x, y, z): (f64, f64, f64), stack: Stack) {
+    if stack.1 == 0 {
+        return;
+    }
+    drops().lock().unwrap().push(Drop {
+        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+        x,
+        y,
+        z,
+        item: stack.0,
+        cnt: stack.1,
+        comps: stack.2,
+        age: -(server_ticks(30) as i32),
+        target: None,
+        thrower: None,
+    });
+}
+
+fn return_live_inputs(c: &Client, stacks: impl IntoIterator<Item = Stack>) {
+    let (x, y, z, ..) = *c.pos.lock().unwrap();
+    let selected = *c.held.lock().unwrap();
+    let mut inventory = c.inv.lock().unwrap();
+    for mut stack in stacks {
+        pickup_into_inventory(&mut inventory, selected, false, &mut stack);
+        drop_live_stack((x, y + 1.3, z), stack);
+    }
+}
+
+fn close_live_menu(c: &Client, send_close: bool, sync: bool) {
+    close_live_menu_id(c, None, send_close, sync);
+}
+
+fn close_live_menu_id(c: &Client, id: Option<u8>, send_close: bool, sync: bool) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    let mut active = connection.active.lock().unwrap();
+    if id.is_some_and(|id| active.as_ref().is_none_or(|s| s.id != id)) {
+        return;
+    }
+    let Some(mut session) = active.take() else {
+        return;
+    };
+    if let LiveMenu::Merchant(id, _) = session.menu {
+        if let Some(villager) = live_villagers().lock().unwrap().get_mut(&id) {
+            if villager.trading_player == Some(c.uuid) {
+                villager.stop_trading();
+            }
+        }
+    }
+    let cursor = std::mem::take(&mut *c.cursor.lock().unwrap());
+    return_live_inputs(
+        c,
+        session
+            .menu
+            .input_slots()
+            .into_iter()
+            .map(std::mem::take)
+            .chain([cursor]),
+    );
+    if sync {
+        let inventory = c.inv.lock().unwrap();
+        let mut sock = c.sock.lock().unwrap();
+        if send_close {
+            let _ = send_packet(&mut sock, 0x12, vec![session.id]);
+        }
+        send_live_contents(&mut sock, 0, 0, &[], &inventory, 0..46, &Stack::default());
+    }
+}
+
+fn refresh_live_enchanting(connection: &LiveMenuConnection, session: &mut LiveMenuSession) {
+    if let (LiveMenu::Enchanting(menu), Some((dim, x, y, z)), Some(reg)) =
+        (&mut session.menu, session.anchor, breg())
+    {
+        let shelves = count_enchanting_bookshelves(
+            (x, y, z),
+            |x, y, z| reg.name_of(block_at_dim(dim, x, y, z)) == "minecraft:bookshelf",
+            |x, y, z| {
+                reg.in_tag(
+                    block_at_dim(dim, x, y, z),
+                    "minecraft:enchantment_power_transmitter",
+                )
+            },
+        );
+        menu.refresh_offers(*connection.enchantment_seed.lock().unwrap(), shelves);
+    }
+}
+
+fn live_anvil_rename(c: &Client, text: &str) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    let mut active = connection.active.lock().unwrap();
+    if let Some(session) = active.as_mut() {
+        if let LiveMenu::Anvil(menu) = &mut session.menu {
+            if menu.rename(text) {
+                sync_live_menu(c, session, false);
+            }
+        }
+    }
+}
+
+fn live_enchant_button(c: &Client, window: i32, button: i32) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    let mut active = connection.active.lock().unwrap();
+    let Some(session) = active.as_mut().filter(|s| i32::from(s.id) == window) else {
+        return;
+    };
+    if let LiveMenu::Enchanting(menu) = &mut session.menu {
+        let creative = *c.gm.lock().unwrap() == 1;
+        let mut seed = connection.enchantment_seed.lock().unwrap();
+        let mut rng = generation_math::Lcg::new(i64::from(*seed) as u64);
+        let _ = send_player_xp(c, |xp| {
+            menu.click_button(button, xp, &mut seed, creative, &mut rng);
+            Ok(())
+        });
+        drop(seed);
+        sync_live_menu(c, session, false);
+    }
+}
+
+fn live_select_trade(c: &Client, index: i32) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    let mut active = connection.active.lock().unwrap();
+    if let Some(session) = active.as_mut() {
+        if let LiveMenu::Merchant(id, menu) = &mut session.menu {
+            if let Some(villager) = live_villagers().lock().unwrap().get(id) {
+                menu.select_trade(
+                    index,
+                    &villager.offers,
+                    &mut c.inv.lock().unwrap(),
+                    &MerchantItems(&merchant_item_prototype),
+                );
+            }
+            sync_live_menu(c, session, false);
+        }
+    }
+}
+
+fn live_input_limit(menu: &LiveMenu, slot: usize, stack: &Stack) -> u8 {
+    let item = item_to_name(stack.0).unwrap_or_default();
+    match menu {
+        LiveMenu::Enchanting(_) if slot == 0 => 1,
+        LiveMenu::Enchanting(_) if item != "lapis_lazuli" => 0,
+        LiveMenu::Smithing(_) if slot == 0 && !item.ends_with("_smithing_template") => 0,
+        LiveMenu::Smithing(_)
+            if slot == 1 && tool_parts(item).is_none() && armor_parts(item).is_none() =>
+        {
+            0
+        }
+        LiveMenu::Smithing(_) if slot == 2 && !TRIM_MATERIAL_ITEMS.contains(&item) => 0,
+        _ => stack_max_of(stack) as u8,
+    }
+}
+
+fn click_live_input(target: &mut Stack, cursor: &mut Stack, button: i8, limit: u8) {
+    if cursor.1 == 0 || limit == stack_max_of(cursor) as u8 {
+        let mut slot = HashMap::from([(0, std::mem::take(target))]);
+        click_slot(&mut slot, cursor, 0, button);
+        *target = slot.remove(&0).unwrap_or_default();
+    } else if limit != 0 && target.1 == 0 {
+        *target = (cursor.0, 1, cursor.2.clone());
+        consume_menu_stack(cursor, 1);
+    } else if limit != 0 && cursor.1 <= limit {
+        std::mem::swap(target, cursor);
+    }
+}
+
+fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    let mut active = connection.active.lock().unwrap();
+    let Some(session) = active.as_mut().filter(|s| s.id == window) else {
+        return;
+    };
+    if !live_menu_valid(c, session) {
+        drop(active);
+        close_live_menu(c, true, true);
+        return;
+    }
+    if !matches!(button, 0 | 1) || !matches!(mode, 0 | 1) {
+        sync_live_menu(c, session, false);
+        return;
+    }
+    let slots = match session.menu {
+        LiveMenu::Anvil(_) | LiveMenu::Merchant(..) => 3,
+        LiveMenu::Enchanting(_) => 2,
+        LiveMenu::Brewing => 5,
+        LiveMenu::Smithing(_) => 4,
+    };
+    let output_slot = match session.menu {
+        LiveMenu::Anvil(_) | LiveMenu::Merchant(..) | LiveMenu::Smithing(_) => slots - 1,
+        _ => -1,
+    };
+    let mut inventory = c.inv.lock().unwrap();
+    let mut cursor = c.cursor.lock().unwrap();
+    let mut offer_changed = false;
+    let mut wear_anvil = false;
+    let mut brewing_changed = false;
+
+    if slot == output_slot && slot >= 0 {
+        let mut quick_move_inventory = None;
+        let selected = *c.held.lock().unwrap();
+        let mut receive = |result: &Stack| {
+            if mode == 1 {
+                let mut trial = inventory.clone();
+                let mut remainder = result.clone();
+                pickup_into_inventory(&mut trial, selected, false, &mut remainder);
+                if remainder.1 == 0 {
+                    quick_move_inventory = Some(trial);
+                    return true;
+                }
+                return false;
+            }
+            cursor.1 == 0
+                || (cursor.0 == result.0
+                    && cursor.2 == result.2
+                    && i64::from(cursor.1) + i64::from(result.1) <= stack_max_of(result))
+        };
+        let result = match &mut session.menu {
+            LiveMenu::Anvil(menu) => {
+                let name = anvil_hover_name(&menu.left).to_owned();
+                let creative = *c.gm.lock().unwrap() == 1;
+                let mut output = None;
+                let _ = send_player_xp(c, |xp| {
+                    if let Some(result) = menu.take_result(&name, xp, creative, receive, || {
+                        // Use 24 random bits so the sample fits in f32's [0, 1).
+                        Some((world_rng::next_u64() >> 40) as f32 / 16_777_216.0)
+                    }) {
+                        wear_anvil = result.damage_anvil;
+                        output = Some(result.output);
+                    }
+                    Ok(())
+                });
+                output
+            }
+            LiveMenu::Smithing(menu) => menu.take_result(receive),
+            LiveMenu::Merchant(id, menu) => {
+                let mut villagers = live_villagers().lock().unwrap();
+                let items = MerchantItems(&merchant_item_prototype);
+                let result = villagers.get_mut(id).and_then(|villager| {
+                    let index = menu.active_offer(&villager.offers, &items)?;
+                    receive(&villager.offers[index].result).then_some(())?;
+                    villager
+                        .trade(c.uuid, menu, &items)
+                        .map(|trade| trade.result)
+                });
+                offer_changed = result.is_some();
+                result
+            }
+            _ => None,
+        };
+        if let Some(mut result) = result {
+            if let Some(updated) = quick_move_inventory {
+                *inventory = updated;
+            } else {
+                result.1 += cursor.1;
+                *cursor = result;
+            }
+        }
+    } else if (0..slots).contains(&slot) {
+        if let LiveMenu::Brewing = session.menu {
+            let mut stands = live_brewing_stands().lock().unwrap();
+            if let Some(entry) = stands.get_mut(&session.anchor.unwrap()) {
+                brewing_changed = if mode == 0 {
+                    entry.menu.click_slot(slot, button, &mut cursor)
+                } else {
+                    let stack = &mut entry.menu.slots[slot as usize];
+                    let before = stack.1;
+                    pickup_into_inventory(&mut inventory, *c.held.lock().unwrap(), false, stack);
+                    before != stack.1
+                };
+            }
+        } else {
+            let limit = live_input_limit(&session.menu, slot as usize, &cursor);
+            let mut inputs = session.menu.input_slots();
+            let target = &mut inputs[slot as usize];
+            if mode == 0 {
+                click_live_input(target, &mut cursor, button, limit);
+            } else {
+                pickup_into_inventory(&mut inventory, *c.held.lock().unwrap(), false, target);
+            }
+        }
+    } else if (slots..slots + 36).contains(&slot) {
+        let inv_slot = slot - slots + 9;
+        if mode == 0 {
+            click_slot(&mut inventory, &mut cursor, inv_slot, button);
+        } else if let Some(mut source) = inventory.remove(&inv_slot) {
+            if let LiveMenu::Brewing = session.menu {
+                let mut stands = live_brewing_stands().lock().unwrap();
+                if let Some(entry) = stands.get_mut(&session.anchor.unwrap()) {
+                    // Only merge or use an empty slot during shift-click.
+                    for target in [4, 3, 0, 1, 2] {
+                        let placed = &entry.menu.slots[target as usize];
+                        if source.1 != 0
+                            && (placed.1 == 0 || (placed.0 == source.0 && placed.2 == source.2))
+                        {
+                            brewing_changed |= entry.menu.click_slot(target, 0, &mut source);
+                        }
+                    }
+                }
+            } else if !matches!(session.menu, LiveMenu::Merchant(..)) {
+                // Lapis belongs in the second slot, even when the first is empty.
+                let first = usize::from(
+                    matches!(session.menu, LiveMenu::Enchanting(_))
+                        && item_to_name(source.0) == Some("lapis_lazuli"),
+                );
+                for index in first..session.menu.input_slots().len() {
+                    let limit = live_input_limit(&session.menu, index, &source);
+                    let mut inputs = session.menu.input_slots();
+                    let target = &mut inputs[index];
+                    if source.1 != 0
+                        && (target.1 == 0 || (target.0 == source.0 && target.2 == source.2))
+                    {
+                        click_live_input(target, &mut source, 0, limit);
+                    }
+                }
+            }
+            if source.1 != 0 {
+                inventory.insert(inv_slot, source);
+            }
+        }
+    } else if slot == -999 && mode == 0 && cursor.1 != 0 {
+        let (x, y, z, ..) = *c.pos.lock().unwrap();
+        let count = if button == 0 { cursor.1 } else { 1 };
+        drop_live_stack((x, y + 1.3, z), (cursor.0, count, cursor.2.clone()));
+        consume_menu_stack(&mut cursor, count);
+    }
+
+    drop(cursor);
+    drop(inventory);
+    if (0..2).contains(&slot) || mode == 1 {
+        refresh_live_enchanting(&connection, session);
+    }
+    sync_live_menu(c, session, offer_changed);
+    let anchor = session.anchor;
+    drop(active);
+    if wear_anvil {
+        if let Some((dim, x, y, z)) = anchor {
+            wear_live_anvil(dim, x, y, z);
+        }
+    }
+    if brewing_changed {
+        if let Some(key) = anchor {
+            update_brewing_bottles(key);
+            for viewer in client_snapshot() {
+                if viewer.eid == c.eid {
+                    continue;
+                }
+                let Some(connection) = live_menu_connection(&viewer) else {
+                    continue;
+                };
+                let mut active = connection.active.lock().unwrap();
+                if let Some(session) = active
+                    .as_mut()
+                    .filter(|s| matches!(s.menu, LiveMenu::Brewing) && s.anchor == Some(key))
+                {
+                    sync_live_menu(&viewer, session, false);
+                }
+            }
+        }
+    }
+    if offer_changed {
+        let (x, y, z, ..) = *c.pos.lock().unwrap();
+        xps().lock().unwrap().push(Xp {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x,
+            y: y + 1.0,
+            z,
+            val: (3 + world_rng::next_u64() % 4) as i16,
+            age: 0,
+        });
+    }
+}
+
+fn wear_live_anvil(dim: DimId, x: i32, y: i32, z: i32) {
+    let Some(reg) = breg() else { return };
+    let state = block_at_dim(dim, x, y, z);
+    let next = match reg.name_of(state) {
+        "minecraft:anvil" => "minecraft:chipped_anvil",
+        "minecraft:chipped_anvil" => "minecraft:damaged_anvil",
+        "minecraft:damaged_anvil" => "minecraft:air",
+        _ => return,
+    };
+    let mut updated = reg.state_of(next, None);
+    if let Some(facing) = reg.get_prop(state, "facing") {
+        updated = reg.with_prop(updated, "facing", &facing);
+    }
+    if set_block_if_dim(dim, x, y, z, updated, Some(state)) {
+        note_block_update_dim(dim, x, y, z, updated);
+    }
+}
+
+fn live_menu_valid(c: &Client, session: &LiveMenuSession) -> bool {
+    let dim = *c.dim.lock().unwrap();
+    let (px, py, pz, ..) = *c.pos.lock().unwrap();
+    let close_to =
+        |x: f64, y: f64, z: f64| (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2) <= 64.0;
+    if let LiveMenu::Merchant(eid, _) = session.menu {
+        return dim == DimId::Overworld
+            && mobs().lock().unwrap().iter().any(|mob| {
+                if mob.eid != eid {
+                    return false;
+                }
+                let (x, y, z, ..) = *mob.pos.lock().unwrap();
+                close_to(x, y, z)
+            });
+    }
+    let Some((anchor_dim, x, y, z)) = session.anchor else {
+        return false;
+    };
+    if dim != anchor_dim || !close_to(f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5) {
+        return false;
+    }
+    let Some(reg) = breg() else { return false };
+    matches!(
+        (&session.menu, reg.name_of(block_at_dim(dim, x, y, z))),
+        (
+            LiveMenu::Anvil(_),
+            "minecraft:anvil" | "minecraft:chipped_anvil" | "minecraft:damaged_anvil"
+        ) | (LiveMenu::Enchanting(_), "minecraft:enchanting_table")
+            | (LiveMenu::Brewing, "minecraft:brewing_stand")
+            | (LiveMenu::Smithing(_), "minecraft:smithing_table")
+    )
+}
+
+fn live_menu_tick() {
+    for c in client_snapshot() {
+        let Some(connection) = live_menu_connection(&c) else {
+            continue;
+        };
+        let active = connection.active.lock().unwrap();
+        if active.as_ref().is_some_and(|s| !live_menu_valid(&c, s)) {
+            // Hold the session through validation. The close then checks the
+            // same ID, since the connection can open a new menu between them.
+            let id = active.as_ref().unwrap().id;
+            drop(active);
+            close_live_menu_id(&c, Some(id), true, true);
+        }
+    }
+    if TICK_IDX
+        .load(Ordering::Relaxed)
+        .is_multiple_of(server_ticks(20))
+        && !live_villagers().lock().unwrap().is_empty()
+    {
+        let mobs = mobs().lock().unwrap();
+        let alive: HashSet<_> = mobs.iter().map(|mob| mob.eid).collect();
+        live_villagers()
+            .lock()
+            .unwrap()
+            .retain(|id, _| alive.contains(id));
+    }
+}
+
+const COMP_POTION_CONTENTS: i64 = 31;
+
+// The built-in potion registry follows Potions.<clinit> in the 1.21.1 server.
+const LIVE_POTIONS: &[(&str, PotionKind)] = &[
+    ("water", PotionKind::Water),
+    ("mundane", PotionKind::Mundane),
+    ("thick", PotionKind::Thick),
+    ("awkward", PotionKind::Awkward),
+    ("night_vision", PotionKind::NightVision),
+    ("long_night_vision", PotionKind::LongNightVision),
+    ("invisibility", PotionKind::Invisibility),
+    ("long_invisibility", PotionKind::LongInvisibility),
+    ("leaping", PotionKind::Leaping),
+    ("long_leaping", PotionKind::LongLeaping),
+    ("strong_leaping", PotionKind::StrongLeaping),
+    ("fire_resistance", PotionKind::FireResistance),
+    ("long_fire_resistance", PotionKind::LongFireResistance),
+    ("swiftness", PotionKind::Swiftness),
+    ("long_swiftness", PotionKind::LongSwiftness),
+    ("strong_swiftness", PotionKind::StrongSwiftness),
+    ("slowness", PotionKind::Slowness),
+    ("long_slowness", PotionKind::LongSlowness),
+    ("strong_slowness", PotionKind::StrongSlowness),
+    ("turtle_master", PotionKind::TurtleMaster),
+    ("long_turtle_master", PotionKind::LongTurtleMaster),
+    ("strong_turtle_master", PotionKind::StrongTurtleMaster),
+    ("water_breathing", PotionKind::WaterBreathing),
+    ("long_water_breathing", PotionKind::LongWaterBreathing),
+    ("healing", PotionKind::Healing),
+    ("strong_healing", PotionKind::StrongHealing),
+    ("harming", PotionKind::Harming),
+    ("strong_harming", PotionKind::StrongHarming),
+    ("poison", PotionKind::Poison),
+    ("long_poison", PotionKind::LongPoison),
+    ("strong_poison", PotionKind::StrongPoison),
+    ("regeneration", PotionKind::Regeneration),
+    ("long_regeneration", PotionKind::LongRegeneration),
+    ("strong_regeneration", PotionKind::StrongRegeneration),
+    ("strength", PotionKind::Strength),
+    ("long_strength", PotionKind::LongStrength),
+    ("strong_strength", PotionKind::StrongStrength),
+    ("weakness", PotionKind::Weakness),
+    ("long_weakness", PotionKind::LongWeakness),
+    ("luck", PotionKind::Luck),
+    ("slow_falling", PotionKind::SlowFalling),
+    ("long_slow_falling", PotionKind::LongSlowFalling),
+    ("wind_charged", PotionKind::WindCharged),
+    ("weaving", PotionKind::Weaving),
+    ("oozing", PotionKind::Oozing),
+    ("infested", PotionKind::Infested),
+];
+
+fn live_potion_stack(stack: &Stack) -> Option<BrewingPotion> {
+    let form = match item_to_name(stack.0)? {
+        "potion" => PotionForm::Drinkable,
+        "splash_potion" => PotionForm::Splash,
+        "lingering_potion" => PotionForm::Lingering,
+        _ => return None,
+    };
+    let mut contents = comp_get(&stack.2, COMP_POTION_CONTENTS)?.strip_prefix(&[1])?;
+    let id = usize::try_from(read_protocol_i32(&mut contents)?).ok()?;
+    Some(BrewingPotion {
+        form,
+        kind: LIVE_POTIONS.get(id)?.1,
+    })
+}
+
+fn read_live_potion_effect_details(data: &mut &[u8], depth: usize) -> Option<()> {
+    if depth == 16 {
+        return None;
+    }
+    read_protocol_i32(data)?; // amplifier
+    read_protocol_i32(data)?; // duration
+    for _ in 0..3 {
+        read_merchant_bool(data)?; // ambient, visible, icon
+    }
+    if read_merchant_bool(data)? {
+        read_live_potion_effect_details(data, depth + 1)?;
+    }
+    Some(())
+}
+
+fn update_live_potion(stack: &mut Stack, potion: BrewingPotion) {
+    let name = match potion.form {
+        PotionForm::Drinkable => "potion",
+        PotionForm::Splash => "splash_potion",
+        PotionForm::Lingering => "lingering_potion",
+    };
+    let id = LIVE_POTIONS
+        .iter()
+        .position(|&(_, kind)| kind == potion.kind)
+        .unwrap();
+    let mut previous = comp_get(&stack.2, COMP_POTION_CONTENTS).unwrap_or(&[1, 0, 0, 0]);
+    previous = &previous[1..];
+    read_varint(&mut previous);
+    let mut contents = vec![1];
+    write_varint(&mut contents, id as i64);
+    contents.extend_from_slice(previous);
+    stack.0 = name_to_item(name).unwrap();
+    comp_set(&mut stack.2, COMP_POTION_CONTENTS, contents);
+}
+
+#[derive(Default)]
+struct LiveBrewingStand {
+    stand: BrewingStand,
+    menu: BrewingMenu,
+}
+
+impl LiveBrewingStand {
+    fn tick(&mut self) -> (bool, bool, bool) {
+        let [first, second, third, ingredient, powder] = &mut self.menu.slots;
+        self.stand.bottles = [first, second, third].map(|stack| live_potion_stack(stack));
+        self.stand.ingredient = item_to_name(ingredient.0)
+            .and_then(BrewingIngredient::from_item)
+            .map(|item| (item, ingredient.1));
+        self.stand.blaze_powder = powder.1;
+        let before = (self.stand.brew_time, self.stand.fuel, powder.1);
+        let tick = self.stand.tick();
+        consume_menu_stack(powder, powder.1 - self.stand.blaze_powder);
+        let mut slots_changed = before.2 != powder.1;
+        let mut eject = false;
+        if let BrewingTick::Completed {
+            ejected_glass_bottle,
+        } = tick
+        {
+            for (stack, potion) in self.menu.slots[..3].iter_mut().zip(self.stand.bottles) {
+                if let Some(potion) = potion.filter(|p| Some(*p) != live_potion_stack(stack)) {
+                    update_live_potion(stack, potion);
+                }
+            }
+            let ingredient = &mut self.menu.slots[3];
+            consume_menu_stack(ingredient, 1);
+            if self
+                .stand
+                .ingredient
+                .is_some_and(|(item, _)| item == BrewingIngredient::GlassBottle)
+            {
+                *ingredient = (name_to_item("glass_bottle").unwrap(), 1, Vec::new());
+            }
+            slots_changed = true;
+            eject = ejected_glass_bottle;
+        }
+        let properties_changed = (before.0, before.1) != (self.stand.brew_time, self.stand.fuel);
+        (slots_changed, properties_changed, eject)
+    }
+}
+
+fn live_brewing_stands() -> &'static LockedMap<DimBlockPos, LiveBrewingStand> {
+    static STANDS: Registry<DimBlockPos, LiveBrewingStand> = OnceLock::new();
+    STANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const BREWING_SAVE_MAGIC: &[u8; 4] = b"BRS1";
+
+fn append_brewing_footer(out: &mut Vec<u8>) {
+    let stands = live_brewing_stands().lock().unwrap();
+    let mut entries: Vec<_> = stands
+        .iter()
+        .filter(|(_, stand)| {
+            stand.stand.fuel > 0 || stand.menu.slots.iter().any(|stack| stack.1 > 0)
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_by_key(|(&(dim, x, y, z), _)| (dim.index(), x, y, z));
+    let start = out.len();
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (&(dim, x, y, z), entry) in entries {
+        out.push(dim.index() as u8);
+        for coordinate in [x, y, z] {
+            out.extend_from_slice(&coordinate.to_be_bytes());
+        }
+        let slots = entry
+            .menu
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, stack)| stack.1 > 0)
+            .map(|(i, stack)| (i as i16, stack.clone()))
+            .collect();
+        write_stack_table(out, &slots);
+        out.push(entry.stand.fuel);
+        // If the ingredient was swapped since the last tick, the outstanding
+        // recipe is already invalid. The loaded entity can start a new one.
+        let current = item_to_name(entry.menu.slots[3].0).and_then(BrewingIngredient::from_item);
+        let remaining = if current == entry.stand.active_ingredient {
+            entry.stand.brew_time
+        } else {
+            0
+        };
+        out.extend_from_slice(&remaining.to_be_bytes());
+    }
+    out.extend_from_slice(&((out.len() - start) as u64).to_be_bytes());
+    out.extend_from_slice(BREWING_SAVE_MAGIC);
+}
+
+fn read_brewing_footer(
+    payload: &[u8],
+) -> Result<(&[u8], HashMap<DimBlockPos, LiveBrewingStand>), &'static str> {
+    let mut stands = HashMap::new();
+    if !payload.ends_with(BREWING_SAVE_MAGIC) {
+        return Ok((payload, stands));
+    }
+    let end = payload
+        .len()
+        .checked_sub(12)
+        .ok_or("truncated brewing footer")?;
+    let size = usize::try_from(u64::from_be_bytes(
+        payload[end..end + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| "invalid brewing footer size")?;
+    let start = end.checked_sub(size).ok_or("invalid brewing footer size")?;
+    let body = &payload[start..end];
+    let mut p = 0;
+    let count = read_dim2_count(body, &mut p, 17).map_err(|_| "invalid brewing stand count")?;
+    for _ in 0..count {
+        let header = body
+            .get(p..p + 13)
+            .ok_or("truncated brewing stand position")?;
+        p += header.len();
+        let dim = DimId::from_index(header[0] as usize).ok_or("invalid brewing dimension")?;
+        let coordinate = |i| i32::from_be_bytes(header[i..i + 4].try_into().unwrap());
+        let key = (dim, coordinate(1), coordinate(5), coordinate(9));
+        let slots = read_stack_table(body, &mut p, true);
+        let timers = body.get(p..p + 3).ok_or("truncated brewing stand timers")?;
+        p += timers.len();
+        let mut entry = LiveBrewingStand::default();
+        for (index, stack) in slots {
+            *entry
+                .menu
+                .slots
+                .get_mut(index as usize)
+                .ok_or("invalid brewing slot")? = stack;
+        }
+        entry.stand.fuel = timers[0];
+        entry.stand.brew_time = u16::from_be_bytes(timers[1..3].try_into().unwrap());
+        if entry.stand.fuel > BREW_FUEL_PER_POWDER || entry.stand.brew_time > BREW_TIME_TICKS {
+            return Err("invalid brewing stand timers");
+        }
+        if entry.stand.brew_time > 0 {
+            entry.stand.active_ingredient =
+                item_to_name(entry.menu.slots[3].0).and_then(BrewingIngredient::from_item);
+            if entry.stand.active_ingredient.is_none() {
+                return Err("brewing stand has a timer without an ingredient");
+            }
+        }
+        if stands.insert(key, entry).is_some() {
+            return Err("duplicate brewing stand position");
+        }
+    }
+    if p != body.len() {
+        return Err("trailing bytes in brewing footer");
+    }
+    Ok((&payload[..start], stands))
+}
+
+fn update_brewing_bottles(key @ (dim, x, y, z): DimBlockPos) {
+    let Some(reg) = breg() else { return };
+    let bottles = live_brewing_stands()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|entry| std::array::from_fn::<_, 3, _>(|i| entry.menu.slots[i].1 != 0));
+    let Some(bottles) = bottles else { return };
+    let state = block_at_dim(dim, x, y, z);
+    if reg.name_of(state) != "minecraft:brewing_stand" {
+        return;
+    }
+    let mut updated = state;
+    for (prop, occupied) in ["has_bottle_0", "has_bottle_1", "has_bottle_2"]
+        .into_iter()
+        .zip(bottles)
+    {
+        updated = reg.with_prop(updated, prop, if occupied { "true" } else { "false" });
+    }
+    if updated != state && set_block_if_dim(dim, x, y, z, updated, Some(state)) {
+        note_block_update_dim(dim, x, y, z, updated);
+    } else if nearby_redstone(reg, dim, RsPos(x, y, z)) {
+        with_redstone_origins(|| run_redstone_pass(dim, RsPos(x, y, z), None));
+    }
+}
+
+fn remove_live_brewing_stand(key @ (dim, x, y, z): DimBlockPos) {
+    if let Some(entry) = live_brewing_stands().lock().unwrap().remove(&key) {
+        // Item entities currently live in the Overworld simulation.
+        if dim == DimId::Overworld {
+            for stack in entry.menu.slots {
+                drop_live_stack(
+                    (f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5),
+                    stack,
+                );
+            }
+        }
+    }
+}
+
+fn live_brewing_tick() {
+    with_save_guard(|| {
+        let mut updates = HashMap::new();
+        for (&key, entry) in live_brewing_stands().lock().unwrap().iter_mut() {
+            let (mut slots_changed, mut properties_changed, mut eject) = (false, false, false);
+            for _ in 0..GAME_TICKS_PER_TICK {
+                let (slots, properties, bottle) = entry.tick();
+                slots_changed |= slots;
+                properties_changed |= properties;
+                eject |= bottle;
+            }
+            if slots_changed || properties_changed {
+                updates.insert(
+                    key,
+                    (
+                        slots_changed,
+                        brewing_window_properties(&entry.stand),
+                        eject,
+                    ),
+                );
+            }
+        }
+        if updates.is_empty() {
+            return;
+        }
+        for (&key @ (dim, x, y, z), &(slots, _, eject)) in &updates {
+            if slots {
+                update_brewing_bottles(key);
+            }
+            if eject && dim == DimId::Overworld {
+                let stack = (name_to_item("glass_bottle").unwrap(), 1, Vec::new());
+                drop_live_stack(
+                    (f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5),
+                    stack,
+                );
+            }
+        }
+        for client in client_snapshot() {
+            let Some(connection) = live_menu_connection(&client) else {
+                continue;
+            };
+            let mut active = connection.active.lock().unwrap();
+            let Some(session) = active.as_mut() else {
+                continue;
+            };
+            if !matches!(session.menu, LiveMenu::Brewing) {
+                continue;
+            }
+            if let Some((slots, properties, _)) = session.anchor.and_then(|key| updates.get(&key)) {
+                if *slots {
+                    sync_live_menu(&client, session, false);
+                } else {
+                    let mut sock = client.sock.lock().unwrap();
+                    for property in properties {
+                        let _ = send_packet(&mut sock, 0x14, property.encode(session.id).to_vec());
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn player_command_targets(target: &str, source: Option<&Arc<Client>>) -> Vec<Arc<Client>> {
@@ -25707,9 +27146,12 @@ fn handle(mut s: TcpStream) {
         craft: Mutex::new(HashMap::new()),
         craft9: Mutex::new(HashMap::new()),
         open_table: Mutex::new(false),
+        #[cfg(test)]
         open_merchant: Mutex::new(false),
+        #[cfg(test)]
         trade_sel: Mutex::new(-1),
-        merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
+        #[cfg(test)]
+        merchant_in: Mutex::new(Default::default()),
         bow_draw: Mutex::new(None),
         dig: Mutex::new(None),
         eat_start: Mutex::new(None),
@@ -25761,7 +27203,18 @@ fn handle(mut s: TcpStream) {
             let _ = sync_scoreboard(&mut w, &board);
         }
         send_advancement_delta(&mut tracker, &me, true);
-        player_mechanism_sessions().lock().unwrap().insert(me.eid, PlayerMechanismSession::default());
+        player_mechanism_sessions().lock().unwrap().insert(
+            me.eid,
+            PlayerMechanismSession {
+                xp_bar: (0, 0.0),
+                food_timer: 0,
+                menus: Arc::new(LiveMenuConnection {
+                    active: Mutex::new(None),
+                    next_id: std::sync::atomic::AtomicU8::new(4),
+                    enchantment_seed: Mutex::new(i32::from_be_bytes(me.uuid[..4].try_into().unwrap())),
+                }),
+            },
+        );
         let mut cls = clients().lock().unwrap();
         *me.chunks.lock().unwrap() = sent;
         for c in cls.iter() {
@@ -26561,6 +28014,28 @@ fn handle(mut s: TcpStream) {
                 }
                 let (dx, dy, dz) = FACE_OFF[(face.clamp(0, 5)) as usize];
                 let (tx, ty, tz) = (x + dx, y + dy, z + dz);
+                let dim = *me.dim.lock().unwrap();
+                let clicked = block_at_dim(dim, x, y, z);
+                let sneaking = *me.sneaking.lock().unwrap();
+                if !sneaking
+                    && (open_live_block_menu(&me, (dim, x, y, z), clicked)
+                        || use_redstone_component(&me, (dim, x, y, z), clicked))
+                {
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    continue;
+                }
+                // The older right-click handlers use Overworld-only block state.
+                // In another dimension, route the newly supported items before them.
+                if dim != DimId::Overworld {
+                    let held = me.inv.lock().unwrap().get(&(36 + held_slot)).map(|s| s.0);
+                    if let Some(item) = held {
+                        if try_live_block_placement(&me, (dim, tx, ty, tz), face.clamp(0, 5) as usize, held_slot, item)
+                        {
+                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                            continue;
+                        }
+                    }
+                }
                 // existing sign: right-click reopens the editor (front text)
                 if (4302..=4589).contains(&block_at(x, y, z))
                     || (19276..=19339).contains(&block_at(x, y, z))
@@ -26598,6 +28073,7 @@ fn handle(mut s: TcpStream) {
                         }
                     }
                     let before = chest_opener_snapshot(&audience, &halves);
+                    close_live_menu(&me, false, true);
                     let inv = me.inv.lock().unwrap().clone();
                     open_chest_for_client(&me, window, None, &inv, kind);
                     // `ContainerOpenersCounter.incrementOpeners` -> openerCountChanged
@@ -26624,6 +28100,7 @@ fn handle(mut s: TcpStream) {
                     }
                     let before = chest_opener_snapshot(&audience, &halves);
                     let key = ender_container_key(&me.uuid);
+                    close_live_menu(&me, false, true);
                     let inv = me.inv.lock().unwrap().clone();
                     open_chest_for_client(&me, (key, None), Some((x, y, z)), &inv, "Ender Chest");
                     sync_chest_openers(&audience, &before);
@@ -26655,6 +28132,7 @@ fn handle(mut s: TcpStream) {
                     continue;
                 }
                 if block_at(x, y, z) == name_to_state("crafting_table").unwrap_or(u32::MAX) {
+                    close_live_menu(&me, false, true);
                     *me.open_table.lock().unwrap() = true;
                     let mut p = Vec::new();
                     write_varint(&mut p, 3); // windowId 3
@@ -26688,6 +28166,7 @@ fn handle(mut s: TcpStream) {
                     continue;
                 }
                 if block_at(x, y, z) == name_to_state("furnace").unwrap_or(u32::MAX) {
+                    close_live_menu(&me, false, true);
                     *me.open_furnace.lock().unwrap() = Some((x, y, z));
                     let inv = me.inv.lock().unwrap().clone();
                     let slots = furnace_slot_snapshot((x, y, z));
@@ -26775,17 +28254,6 @@ fn handle(mut s: TcpStream) {
                             note_block_update(x, y + dy, z, st ^ 2);
                         }
                     }
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
-                    continue;
-                }
-                // lever toggle: flip powered bit, then update neighbors
-                if (5626..=5649).contains(&block_at(x, y, z)) {
-                    let st = block_at(x, y, z);
-                    let nst = st ^ 1; // powered is stride1 (true=0, false=1)
-                    set_block(x, y, z, nst);
-                    note_block_update(x, y, z, nst);
-                    let powered = (nst - 5626) & 1 == 0;
-                    redstone_update(x, y, z, powered);
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
@@ -26891,6 +28359,10 @@ fn handle(mut s: TcpStream) {
                         write_pos(&mut op, tx, ty, tz);
                         op.push(1);
                         let _ = send_packet(&mut me.sock.lock().unwrap(), 0x34, op);
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        continue;
+                    }
+                    if try_live_block_placement(&me, (dim, tx, ty, tz), face.clamp(0, 5) as usize, held_slot, item) {
                         let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
@@ -27053,6 +28525,7 @@ fn handle(mut s: TcpStream) {
                                 } else {
                                     (Vec::new(), Vec::new())
                                 };
+                            close_live_menu(&me, false, true);
                             let inv = me.inv.lock().unwrap().clone();
                             open_chest_for_client(
                                 &me,
@@ -27068,10 +28541,13 @@ fn handle(mut s: TcpStream) {
                         continue;
                     }
                     // interact: villagers open trade UI; wheat breeds animals
-                    let is_villager = {
-                        let ms = mobs().lock().unwrap();
-                        ms.iter().any(|m| m.eid == target && m.etype == 113)
-                    };
+                    let villager = mobs()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|m| m.eid == target && Some(m.etype) == name_to_etype("villager"))
+                        .cloned();
+                    let is_villager = villager.is_some();
                     let held_it = me
                         .inv
                         .lock()
@@ -27187,30 +28663,8 @@ fn handle(mut s: TcpStream) {
                             continue;
                         }
                     }
-                    if is_villager {
-                        *me.open_merchant.lock().unwrap() = true;
-                        *me.trade_sel.lock().unwrap() = 0;
-                        let mut p = Vec::new();
-                        write_varint(&mut p, 4); // windowId 4
-                        write_varint(&mut p, 19); // merchant menu
-                        p.extend_from_slice(&chat_nbt("Villager"));
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x33, p);
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x2d, trade_list_pkt(4));
-                        // window items: 3 trade slots + inv (wslot 3..39 -> inv 9..44)
-                        let inv = me.inv.lock().unwrap().clone();
-                        let mut q = vec![4u8];
-                        write_varint(&mut q, 0);
-                        write_varint(&mut q, 39);
-                        for _ in 0..3 {
-                            q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                        }
-                        for wsl in 3..39i16 {
-                            let (it, c, _cc) =
-                                inv.get(&(wsl + 6)).cloned().unwrap_or((0, 0, Vec::new()));
-                            q.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                        }
-                        q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x13, q);
+                    if let Some(villager) = villager {
+                        open_live_merchant(&me, &villager);
                         continue;
                     }
                 }
@@ -27649,6 +29103,7 @@ fn handle(mut s: TcpStream) {
                 // client_command: perform_respawn
                 let mut sl = &b[..];
                 if read_varint(&mut sl) == Some(0) {
+                    close_live_menu(&me, true, true);
                     *me.hp.lock().unwrap() = max_hp_of(&me.name);
                     // vanilla death drops the inventory at the death
                     // location (keepInventory=false) — the player's pos
@@ -27808,73 +29263,41 @@ fn handle(mut s: TcpStream) {
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                 }
             }
-            0x2d => {
-                // select_trade: echo input/output into merchant slots 0/1/2
-                let mut sl = &b[..];
-                let sel = read_varint(&mut sl).unwrap_or(0) as i32;
-
-                *me.trade_sel.lock().unwrap() = sel;
-                if *me.open_merchant.lock().unwrap() {
-                    let ts = trades();
-                    if sel >= 0 && (sel as usize) < ts.len() {
-                        let (ai, ac, bin, ci, cc) = &ts[sel as usize];
-                        let (ai, ac, ci, cc) = (*ai, *ac, *ci, *cc);
-                        // move inputs from inventory into trade slots 0/1
-                        let mut inv = me.inv.lock().unwrap();
-                        let mut ok = inv_consume(&mut inv, ai, ac as i64);
-                        if ok {
-                            if let Some((bi, bc)) = bin {
-                                ok = inv_consume(&mut inv, *bi, *bc as i64);
-                            }
-                        }
-                        if ok {
-                            let mut mi = me.merchant_in.lock().unwrap();
-                            mi[0] = (ai, ac, Vec::new());
-                            mi[1] =
-                                bin.map(|(b, c)| (b, c, Vec::new()))
-                                    .unwrap_or((0, 0, Vec::new()));
-                            drop(mi);
-                            let snap = inv.clone();
-                            drop(inv);
-                            for wsl in 3..39i16 {
-                                let (it, c, _sc) =
-                                    snap.get(&(wsl + 6)).cloned().unwrap_or((0, 0, Vec::new()));
-                                let mut p = vec![4u8];
-                                write_varint(&mut p, 0);
-                                p.extend_from_slice(&wsl.to_be_bytes());
-                                p.extend_from_slice(&slot_wire(&(it, c, _sc)));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
-                            }
-                            for (wsl, it, c) in [
-                                (0i16, ai, ac),
-                                (
-                                    1,
-                                    bin.map(|b| b.0).unwrap_or(0),
-                                    bin.map(|b| b.1).unwrap_or(0),
-                                ),
-                                (2, ci, cc),
-                            ] {
-                                let mut p = vec![4u8];
-                                write_varint(&mut p, 0);
-                                p.extend_from_slice(&wsl.to_be_bytes());
-                                p.extend_from_slice(&slot_wire(&(it, c, Vec::new())));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
-                            }
-                        } else {
-                            drop(inv);
-                            // can't afford: clear the trade slots
-                            for wsl in 0..3i16 {
-                                let mut p = vec![4u8];
-                                write_varint(&mut p, 0);
-                                p.extend_from_slice(&wsl.to_be_bytes());
-                                p.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
-                            }
+            0x0d => {
+                let mut payload = b.as_slice();
+                if let (Some(window), Some(button)) =
+                    (read_protocol_i32(&mut payload), read_protocol_i32(&mut payload))
+                {
+                    if payload.is_empty() {
+                        with_save_guard(|| live_enchant_button(&me, window, button));
+                    }
+                }
+            }
+            0x2a => {
+                let mut payload = b.as_slice();
+                if let Some(length) = read_protocol_i32(&mut payload) {
+                    if (0..=150).contains(&length) && payload.len() == length as usize {
+                        if let Ok(name) = std::str::from_utf8(payload) {
+                            with_save_guard(|| live_anvil_rename(&me, name));
                         }
                     }
                 }
             }
+            0x2d => {
+                if let Some(index) = decode_select_trade(&b) {
+                    with_save_guard(|| live_select_trade(&me, index));
+                }
+            }
             0x0f => {
+                if let Some(id) = live_menu_id(&me) {
+                    if b.as_slice() == [id] {
+                        close_live_menu_id(&me, Some(id), false, true);
+                    }
+                    continue;
+                }
+                if b.first().is_some_and(|&id| id >= 4) {
+                    continue;
+                }
                 // close_window
                 // `AbstractContainerMenu.removed` -> `Container.stopOpen`: the opener
                 // counters drop and each half that moved broadcasts its BlockEvent.
@@ -27889,8 +29312,7 @@ fn handle(mut s: TcpStream) {
                 }
                 let had_container = chest_window.is_some()
                     || me.open_furnace.lock().unwrap().is_some()
-                    || *me.open_table.lock().unwrap()
-                    || *me.open_merchant.lock().unwrap();
+                    || *me.open_table.lock().unwrap();
                 *me.open_chest.lock().unwrap() = None;
                 *me.chest_sync.lock().unwrap() = None;
                 *me.open_furnace.lock().unwrap() = None;
@@ -27927,26 +29349,12 @@ fn handle(mut s: TcpStream) {
                     drop(inv);
                     *me.drag.lock().unwrap() = (-1, Vec::new());
                 }
-                if *me.open_merchant.lock().unwrap() {
-                    let mi = me.merchant_in.lock().unwrap().clone();
-                    let mut inv = me.inv.lock().unwrap();
-                    for (it, c, _mc) in mi.iter().cloned() {
-                        if c > 0 {
-                            let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
-                            inv.insert(slot, (it, c, _mc));
-                        }
-                    }
-                    *me.merchant_in.lock().unwrap() = [(0, 0, Vec::new()), (0, 0, Vec::new())];
-                    drop(inv);
-                }
-                *me.open_merchant.lock().unwrap() = false;
-                *me.trade_sel.lock().unwrap() = -1;
             }
             0x0e
                 // window_click: window u8, stateId varint, slot i16, button i8, mode varint, ...
                 if b.len() >= 6 => {
                     let mut sl = &b[..];
-                    let _wid = sl[0];
+                    let wid = sl[0];
                     sl = &sl[1..];
                     let _st = read_varint(&mut sl);
                     if sl.len() >= 4 {
@@ -27954,6 +29362,15 @@ fn handle(mut s: TcpStream) {
                         let btn = sl[2];
                         sl = &sl[3..];
                         let mode = read_varint(&mut sl).unwrap_or(0);
+                        if live_menu_id(&me).is_some() {
+                            if wid >= 4 {
+                                with_save_guard(|| live_menu_click(&me, wid, slot, btn as i8, mode));
+                            }
+                            continue;
+                        }
+                        if wid >= 4 {
+                            continue;
+                        }
                         if mode == 0 {
                             let chest_pos = *me.open_chest.lock().unwrap();
                             if let Some((cp, cp2)) = chest_pos {
@@ -28168,127 +29585,6 @@ fn handle(mut s: TcpStream) {
                                         p.extend_from_slice(&slot_wire(&st));
                                         let _ = send_packet(&mut sock, 0x15, p);
                                     }
-                                }
-                                continue;
-                            }
-                            if *me.open_merchant.lock().unwrap() {
-                                let sel = *me.trade_sel.lock().unwrap() as usize;
-                                let ts = trades();
-                                if slot == 2 && sel < ts.len() {
-                                    let (ai, ac, bin, ci, cc) = ts[sel];
-                                    let mut cur = me.cursor.lock().unwrap();
-                                    let mut mi = me.merchant_in.lock().unwrap();
-                                    let have1 = mi[0].0 == ai && mi[0].1 >= ac;
-                                    let have2 = bin
-                                        .map(|(bi, bc)| mi[1].0 == bi && mi[1].1 >= bc)
-                                        .unwrap_or(true);
-                                    if have1
-                                        && have2
-                                        && (cur.1 == 0
-                                            || (cur.0 == ci
-                                                && cur.2.is_empty()
-                                                && cur.1 + cc
-                                                    <= item_stack_max(ci, &Vec::new()) as u8))
-                                    {
-                                        *cur = (ci, cur.1 + cc, Vec::new());
-                                        mi[0].1 -= ac;
-                                        if mi[0].1 == 0 {
-                                            mi[0] = (0, 0, Vec::new());
-                                        }
-                                        if let Some((_, bc)) = bin {
-                                            if mi[1].1 >= bc {
-                                                mi[1].1 -= bc;
-                                                if mi[1].1 == 0 {
-                                                    mi[1] = (0, 0, Vec::new());
-                                                }
-                                            }
-                                        }
-                                        let (s0, s1) = (mi[0].clone(), mi[1].clone());
-                                        drop(mi);
-                                        drop(cur);
-                                        // vanilla: each completed trade grants 3-6 xp to the player
-                                        let (px, py, pz, ..) = {
-                                            let p = me.pos.lock().unwrap();
-                                            *p
-                                        };
-                                        xps().lock().unwrap().push(Xp {
-                                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                            x: px,
-                                            y: py + 1.0,
-                                            z: pz,
-                                            val: (3 + world_rng::next_u64() % 4) as i16,
-                                            age: 0,
-                                        });
-                                        // auto-refill from inventory
-                                        let mut inv = me.inv.lock().unwrap();
-                                        if s0.1 == 0 && inv_consume(&mut inv, ai, ac as i64) {
-                                            let mut mi = me.merchant_in.lock().unwrap();
-                                            mi[0] = (ai, ac, Vec::new());
-                                        }
-                                        if s1.1 == 0 {
-                                            if let Some((bi, bc)) = bin {
-                                                if inv_consume(&mut inv, bi, bc as i64) {
-                                                    let mut mi = me.merchant_in.lock().unwrap();
-                                                    mi[1] = (bi, bc, Vec::new());
-                                                }
-                                            }
-                                        }
-                                        let mi2 = me.merchant_in.lock().unwrap().clone();
-                                        let can2 = bin
-                                            .map(|(bi, bc)| mi2[1].0 == bi && mi2[1].1 >= bc)
-                                            .unwrap_or(true);
-                                        let snap = inv.clone();
-                                        drop(inv);
-                                        for wsl in 3..39i16 {
-                                            let (it, c, _sc) = snap
-                                                .get(&(wsl + 6))
-                                                .cloned()
-                                                .unwrap_or((0, 0, Vec::new()));
-                                            let mut p = vec![4u8];
-                                            write_varint(&mut p, 0);
-                                            p.extend_from_slice(&wsl.to_be_bytes());
-                                            p.extend_from_slice(&slot_wire(&(it, c, _sc)));
-                                            let _ =
-                                                send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
-                                        }
-                                        let out2 = if mi2[0].0 == ai && mi2[0].1 >= ac && can2 {
-                                            (cc, ci)
-                                        } else {
-                                            (0, 0)
-                                        };
-                                        for (wsl, stx) in [
-                                            (0i16, mi2[0].clone()),
-                                            (1, mi2[1].clone()),
-                                            (
-                                                2,
-                                                if out2.1 > 0 {
-                                                    (out2.1, out2.0, Vec::new())
-                                                } else {
-                                                    (0, 0, Vec::new())
-                                                },
-                                            ),
-                                        ] {
-                                            let mut p = vec![4u8];
-                                            write_varint(&mut p, 0);
-                                            p.extend_from_slice(&wsl.to_be_bytes());
-                                            p.extend_from_slice(&slot_wire(&stx));
-                                            let _ =
-                                                send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
-                                        }
-                                    }
-                                } else if (3..=38).contains(&slot) {
-                                    let mut inv = me.inv.lock().unwrap();
-                                    let mut cur = me.cursor.lock().unwrap();
-                                    click_slot(&mut inv, &mut cur, slot + 6, btn as i8);
-                                    let (it, c, _cc) =
-                                        inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new()));
-                                    drop(cur);
-                                    drop(inv);
-                                    let mut p = vec![4u8];
-                                    write_varint(&mut p, 0);
-                                    p.extend_from_slice(&slot.to_be_bytes());
-                                    p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                 }
                                 continue;
                             }
@@ -29192,9 +30488,10 @@ fn handle(mut s: TcpStream) {
                 broadcast_seen_destroy(*eid);
             }
         }
+        close_live_menu(&me_cleanup, false, false);
         {
-            // vanilla containerMenu.removed: cursor, crafting grid and
-            // merchant inputs are placed back into the inventory (the
+            // vanilla containerMenu.removed: cursor and crafting grid
+            // are placed back into the inventory (the
             // overflow falls on the ground as item entities)
             let mut back: Vec<Stack> = Vec::new();
             let cur = std::mem::take(&mut *me_cleanup.cursor.lock().unwrap());
@@ -29206,11 +30503,6 @@ fn handle(mut s: TcpStream) {
                     if st.1 > 0 {
                         back.push(st);
                     }
-                }
-            }
-            for st in me_cleanup.merchant_in.lock().unwrap().iter().cloned() {
-                if st.1 > 0 {
-                    back.push(st);
                 }
             }
             let mut inv = me_cleanup.inv.lock().unwrap();
@@ -30091,7 +31383,9 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     if TICK_IDX.load(Ordering::Relaxed).is_multiple_of(lava_period) {
         run("lava", lava_tick);
     }
-    run("observers", observer_tick);
+    run("redstone", live_redstone_tick);
+    run("brewing", live_brewing_tick);
+    run("player_menus", live_menu_tick);
     run("plugins", plugin_tick);
     run("actors", actor_tick);
     run("mobs", mob_tick);
