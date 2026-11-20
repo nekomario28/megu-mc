@@ -360,7 +360,7 @@ pub(crate) struct SpawnPlacementContext {
     pub clear_here: bool,
     pub clear_above: bool,
     pub water_here: bool,
-    pub water_below: bool,
+    pub above_redstone_conductor: bool,
     pub lava_here: bool,
 }
 
@@ -369,7 +369,7 @@ impl SpawnPlacementType {
     pub(crate) fn allows(self, site: SpawnPlacementContext) -> bool {
         match self {
             Self::OnGround => site.ground_supports_spawn && site.clear_here && site.clear_above,
-            Self::InWater => site.water_here && site.water_below && site.clear_above,
+            Self::InWater => site.water_here && !site.above_redstone_conductor,
             Self::InLava => site.lava_here,
             Self::NoRestrictions => true,
         }
@@ -838,13 +838,12 @@ mod natural_spawner_tests {
         }));
         assert!(SpawnPlacementType::InWater.allows(SpawnPlacementContext {
             water_here: true,
-            water_below: true,
-            clear_above: true,
+            clear_above: false,
             ..Default::default()
         }));
         assert!(!SpawnPlacementType::InWater.allows(SpawnPlacementContext {
             water_here: true,
-            clear_above: true,
+            above_redstone_conductor: true,
             ..Default::default()
         }));
         assert!(SpawnPlacementType::InLava.allows(SpawnPlacementContext {
