@@ -1,8 +1,8 @@
 package net.neoforged.neoforge.registries;
 
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import net.minecraft.core.Registry;
@@ -17,7 +17,7 @@ import net.neoforged.fml.event.IModBusEvent;
 public class RegisterEvent extends Event implements IModBusEvent {
     private final ResourceKey<? extends Registry<?>> registry;
     private final Thread owner = Thread.currentThread();
-    private final Set<ResourceLocation> registered = new HashSet<>();
+    private final Map<ResourceLocation, Object> registered = new HashMap<>();
     private boolean open = true;
     private Throwable failure;
 
@@ -56,13 +56,15 @@ public class RegisterEvent extends Event implements IModBusEvent {
             if (name == null || name.getNamespace().equals("minecraft")) {
                 throw new IllegalArgumentException("Invalid dynamic registry name: " + name);
             }
-            if (!registered.add(name)) {
+            if (registered.containsKey(name)) {
                 throw new IllegalStateException("Duplicate registry entry " + key.location() + " " + name);
             }
+            registered.put(name, null);
             I value = factory.get();
             if (!valueType(key).isInstance(value)) {
                 throw new IllegalArgumentException("Invalid registry value for " + key.location() + " " + name);
             }
+            registered.put(name, value);
             return value;
         } catch (RuntimeException | Error error) {
             failure = error;
@@ -82,7 +84,13 @@ public class RegisterEvent extends Event implements IModBusEvent {
     public final List<ResourceLocation> registeredNames() {
         if (open) throw new IllegalStateException("Registration phase still open");
         if (failure != null) throw new IllegalStateException("Registration failed", failure);
-        return List.copyOf(registered);
+        return List.copyOf(registered.keySet());
+    }
+
+    public final Object registeredValue(ResourceLocation name) {
+        if (open) throw new IllegalStateException("Registration phase still open");
+        if (failure != null) throw new IllegalStateException("Registration failed", failure);
+        return registered.get(name);
     }
 
     static Class<?> valueType(ResourceKey<?> key) {

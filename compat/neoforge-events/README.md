@@ -58,8 +58,8 @@ owner. Records sort by registry, namespace, then path. The first dynamic block
 state ID is 26,684 and the first dynamic item ID is 1,333. Each custom block
 has one state. The Rust palette codec saves its canonical `namespace:path`
 and resolves that name against the current table on load. Chunk and overlay
-save integration, protocol registry synchronization, and reference-server
-save compatibility require further integration and verification.
+save integration and reference-server save compatibility require further
+integration and verification.
 
 `tests/neoforge_s2_registry_test.py` builds synthetic JARs against the pinned
 NeoForge API and tests both load orders, palette remapping after a mod addition,
@@ -95,3 +95,45 @@ The bridge exchanges snapshots and mutations. The server tick owner needs to
 supply activations and apply the validated operations to world state. The
 [S3 test suite](../../tests/neoforge_s3_batch_test.py) exercises the actual JNI
 entry point with a mod loaded through the NeoForge bootstrap.
+
+## NF-5 payloads, item capabilities and registry packets
+
+After freezing the block and item registry, bootstrap posts
+`RegisterPayloadHandlersEvent` and `RegisterCapabilitiesEvent` on the mod buses.
+Payload registration takes an explicit version and a play direction. Each
+channel ID is unique across the mod set. The host supplies C2S payloads and
+sender identity on the JVM owner. `PacketDistributor.sendToPlayer` and
+`sendToAllPlayers` queue their S2C output during the callback. The dispatch
+returns that queue in the same JNI invocation. The registered
+versions are retained locally. Peer negotiation is a transport concern.
+
+The S4 payload frame starts with the bytes `53 34 01 00` and a little-endian
+`u16` envelope count. Each entry has a `u16` byte length and ASCII channel,
+a target tag (zero absent, one followed by an `i32` entity ID), then a
+`u32` byte length and payload. C2S takes one entry without a target. S2C
+entries without a target are broadcasts. The frame permits up to 64 entries,
+32 KiB per payload, and 256 KiB total. A wrong direction, malformed codec
+input, exceeded limit, or fifth nested callback aborts publication.
+
+`RegisterCapabilitiesEvent.registerBlock` accepts
+`Capabilities.ItemHandler.BLOCK` providers for S2-registered blocks. A query
+supplies one cell, the side, the slot limit, and a copy of the inventory.
+A provider can wrap the supplied snapshot block entity with
+`new InvWrapper((Container) blockEntity)`. Slots carry a protocol item ID
+and count. Vanilla item IDs are opaque, and the host supplies the slot
+limit for the snapshot. Reads and simulations cannot write the snapshot.
+Insertion and extraction can update the copy during one query batch.
+Rust receives the results and conditional slot replacements with their
+expected block state and prior stacks. The owner must apply those proposals against the
+same cell before exposing changes. Retained snapshot containers expire at
+the end of the query.
+
+`build_config_registry_sync_packets` produces protocol 767 Configuration
+Registry Data packet bodies for the S2 block and item names, in runtime-ID
+order within each registry, with absent optional NBT. The bodies include
+packet ID `0x07`. Client negotiation, client installation of these static
+registries, and routing these bodies from the server configuration loop
+require host integration.
+
+`tests/neoforge_s4_network_test.py` validates the exact shim surface and
+exercises the new bridge through real Rust JNI with a synthetic mod.

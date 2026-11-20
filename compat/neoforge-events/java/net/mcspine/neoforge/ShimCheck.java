@@ -41,12 +41,19 @@ public final class ShimCheck {
         "WrapOperation", "ModifyReturnValue", "WrapWithCondition");
     private static final String[] PREFIXES = {"net/minecraft/", "net/neoforged/", "com/mojang/brigadier/"};
     private static final String S3_BRIDGE = "net/mcspine/neoforge/DirectBatchBridge";
+    private static final String S4_NETWORK = "net/mcspine/neoforge/S4NetworkBridge";
+    private static final String S4_CAPABILITY = "net/mcspine/neoforge/S4CapabilityBridge";
     private static final String LEGACY_HOST = "net/mcspine/probe/Host";
 
     private static boolean auditedClass(String owner) {
         for (String prefix : PREFIXES) if (owner.startsWith(prefix)) return true;
         return owner.equals(S3_BRIDGE) || owner.startsWith(S3_BRIDGE + "$")
-            || owner.equals(LEGACY_HOST);
+            || internalBridge(owner);
+    }
+    private static boolean internalBridge(String owner) {
+        return owner.equals(LEGACY_HOST)
+            || owner.equals(S4_NETWORK) || owner.startsWith(S4_NETWORK + "$")
+            || owner.equals(S4_CAPABILITY) || owner.startsWith(S4_CAPABILITY + "$");
     }
     private static final int MAX_CLASS_BYTES = 16 * 1024 * 1024;
     private static final int MAX_METADATA_BYTES = 1024 * 1024;
@@ -710,7 +717,7 @@ public final class ShimCheck {
             if (!"mc-spine-neoforge-s0".equals(data.get("schema"))) throw new IOException("Unsupported surface schema");
             Map<String, Object> classes = Json.object(data.get("classes"));
             for (var entry : classes.entrySet()) {
-                if (!auditedClass(entry.getKey()) || entry.getKey().equals(LEGACY_HOST)) {
+                if (!auditedClass(entry.getKey()) || internalBridge(entry.getKey())) {
                     throw new IOException("Invalid surface class: " + entry.getKey());
                 }
                 Map<String, Object> members = Json.object(entry.getValue());

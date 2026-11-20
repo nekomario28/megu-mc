@@ -1,6 +1,4 @@
 //! One JVM owner and guarded Rust world ABI for pinned Fabric and NeoForge operations.
-#[cfg(feature = "neoforge-events")]
-use crate::landing_types::ModRegistrySnapshot;
 use crate::landing_types::{
     decode_mutation_batch, Loader, MutationOp, Request, S1EventOutcome, Trample,
 };
@@ -9,8 +7,14 @@ use crate::landing_types::{
     decode_s3_response_batch, encode_s3_request_batch, S3BatchOp, S3TickRequest, S3_CAPACITY,
 };
 #[cfg(feature = "neoforge-events")]
+use crate::landing_types::{
+    decode_s4_payload_batch, encode_s4_payload_batch, CustomPayloadEnvelope, ModRegistrySnapshot,
+    S4ContainerOp, S4ContainerOutcome, S4ContainerSnapshot, S4_MAX_CHANNEL, S4_MAX_PAYLOAD,
+    S4_PAYLOAD_CAPACITY,
+};
+#[cfg(feature = "neoforge-events")]
 use jni::{
-    objects::{AutoLocal, JByteBuffer, JStaticMethodID},
+    objects::{AutoLocal, JByteArray, JByteBuffer, JIntArray, JStaticMethodID},
     signature::{Primitive, ReturnType},
 };
 use jni::{
@@ -355,6 +359,107 @@ impl<'local> S3BatchBridge<'local> {
             .and_then(|value| value.i())
             .map_err(|error| java_error(env, error))
     }
+}
+
+#[cfg(feature = "neoforge-events")]
+fn require_s4_owner() -> Result<(), String> {
+    if OWNER.get() != Some(&thread::current().id()) {
+        return Err("S4 requires the JVM owner thread".into());
+    }
+    Ok(())
+}
+
+/// Dispatch one C2S payload and return its entire S2C batch in one Java invocation.
+#[cfg(feature = "neoforge-events")]
+#[allow(dead_code)] // Available to the host owner.
+pub(crate) fn dispatch_s4_payload(
+    env: &mut JNIEnv,
+    player_eid: i32,
+    player_name: &str,
+    inbound: &CustomPayloadEnvelope,
+) -> Result<Vec<CustomPayloadEnvelope>, String> {
+    if inbound.target_eid.is_some() {
+        return Err("S4 C2S payload has a target".into());
+    }
+    let frame = encode_s4_payload_batch(std::slice::from_ref(inbound))?;
+    dispatch_s4_payload_frame(env, player_eid, player_name, &frame)
+}
+
+#[cfg(feature = "neoforge-events")]
+fn dispatch_s4_payload_frame(
+    env: &mut JNIEnv,
+    player_eid: i32,
+    player_name: &str,
+    frame: &[u8],
+) -> Result<Vec<CustomPayloadEnvelope>, String> {
+    require_s4_owner()?;
+    if frame.len() > 13 + S4_MAX_CHANNEL + S4_MAX_PAYLOAD {
+        return Err("oversized S4 inbound frame".into());
+    }
+    let result = env
+        .with_local_frame(8, |env| -> jni::errors::Result<_> {
+            let input = env.byte_array_from_slice(frame)?;
+            let name = env.new_string(player_name)?;
+            let out = env
+                .call_static_method(
+                    "net/mcspine/neoforge/S4NetworkBridge",
+                    "dispatch",
+                    "([BILjava/lang/String;)[B",
+                    &[
+                        JValue::Object(&input),
+                        JValue::Int(player_eid),
+                        JValue::Object(&name),
+                    ],
+                )?
+                .l()?;
+            let out = JByteArray::from(out);
+            if env.get_array_length(&out)? as usize > S4_PAYLOAD_CAPACITY {
+                return Ok(None);
+            }
+            Ok(Some(env.convert_byte_array(&out)?))
+        })
+        .map_err(|error| java_error(env, error))?;
+    let wire = result.ok_or("oversized S4 outbound frame")?;
+    decode_s4_payload_batch(&wire).map_err(str::to_owned)
+}
+
+#[cfg(feature = "neoforge-events")]
+#[allow(dead_code)] // Available to the host owner.
+pub(crate) fn query_s4_block_items(
+    env: &mut JNIEnv,
+    snapshot: &S4ContainerSnapshot,
+    ops: &[S4ContainerOp],
+) -> Result<Option<S4ContainerOutcome>, String> {
+    require_s4_owner()?;
+    let input = snapshot.encode_query(ops)?;
+    let expected = snapshot.response_len(ops);
+    let result = env
+        .with_local_frame(8, |env| -> jni::errors::Result<_> {
+            let frame = env.new_int_array(input.len() as i32)?;
+            env.set_int_array_region(&frame, 0, &input)?;
+            let out = env
+                .call_static_method(
+                    "net/mcspine/neoforge/S4CapabilityBridge",
+                    "query",
+                    "([I)[I",
+                    &[JValue::Object(&frame)],
+                )?
+                .l()?;
+            let out = JIntArray::from(out);
+            let len = env.get_array_length(&out)? as usize;
+            if len == 0 {
+                return Ok(Some(Vec::new()));
+            }
+            if len != expected {
+                return Ok(None);
+            }
+            let mut wire = vec![0; len];
+            env.get_int_array_region(&out, 0, &mut wire)?;
+            Ok(Some(wire))
+        })
+        .map_err(|error| java_error(env, error))?;
+    let wire = result.ok_or("invalid S4 capability response size")?;
+    snapshot.decode_response(ops, &wire).map_err(str::to_owned)
 }
 
 fn java_error(env: &mut JNIEnv, error: jni::errors::Error) -> String {
@@ -760,6 +865,233 @@ fn register_host(env: &mut JNIEnv, host: JObject) -> Result<(), jni::errors::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "neoforge-events")]
+    #[test]
+    fn s4_jni_fixture() {
+        use crate::landing_types::build_config_registry_sync_packets;
+        use crate::landing_types::{S4BlockSide, S4ItemStack, S4SlotMutation, S4SlotResult};
+
+        let Some(directory) = std::env::var_os("MC_SPINE_S4_FIXTURE") else {
+            return;
+        };
+        let directory = Path::new(&directory);
+        let classpath = std::fs::read_to_string(directory.join("classpath.txt")).unwrap();
+        let jvm = create_jvm(&classpath).unwrap();
+        let mut env = jvm.attach_current_thread().unwrap();
+        let path = env.new_string(directory.to_str().unwrap()).unwrap();
+        let initialized = env.call_static_method(
+            "net/mcspine/neoforge/Bootstrap",
+            "initialize",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&path)],
+        );
+        initialized.unwrap_or_else(|error| panic!("{}", java_error(&mut env, error)));
+
+        let envelope = |channel: &str, bytes: Vec<u8>| CustomPayloadEnvelope {
+            channel: format!("nf5_fixture:{channel}"),
+            target_eid: None,
+            bytes,
+        };
+        let dispatch = |env: &mut JNIEnv, channel, bytes| {
+            dispatch_s4_payload(env, -1025, "Rust owner", &envelope(channel, bytes))
+        };
+        let expected = [
+            CustomPayloadEnvelope {
+                target_eid: Some(-1025),
+                ..envelope("echo", vec![42, 17, 0])
+            },
+            envelope("out", vec![43, 17, 0]),
+        ];
+        assert_eq!(dispatch(&mut env, "in", vec![0, 17, 0]).unwrap(), expected);
+
+        // An exactly 32 KiB packet can traverse both directions. The final
+        // field has a three-byte VarInt prefix for its 32763-byte content.
+        let mut max = vec![5, 0, 0xfb, 0xff, 0x01];
+        max.resize(S4_MAX_PAYLOAD, 0x9b);
+        assert_eq!(
+            dispatch(&mut env, "echo", max.clone()).unwrap(),
+            [CustomPayloadEnvelope {
+                target_eid: Some(-1025),
+                ..envelope("out", max)
+            }]
+        );
+        println!("S4 targeted and broadcast payloads round-tripped");
+
+        assert_eq!(dispatch(&mut env, "echo", vec![1, 4, 0]).unwrap().len(), 4);
+        for (channel, bytes, reason) in [
+            ("unknown", vec![0, 17, 0], "Unregistered S4 C2S"),
+            ("out", vec![0, 17, 0], "Unregistered S4 C2S"),
+            ("echo", vec![0, 17], "Truncated S4 payload"),
+            ("echo", vec![0, 17, 0, 99], "Trailing S4 payload"),
+            ("echo", vec![0; S4_MAX_PAYLOAD + 1], "oversized S4 payload"),
+            ("echo", vec![1, 5, 0], "S4 payload dispatch failed"),
+            ("echo", vec![2, 0, 0], "S4 payload dispatch failed"),
+            ("echo", vec![3, 0, 0], "Oversized S4 payload"),
+            ("echo", vec![4, 0, 0], "batch record limit"),
+            ("echo", vec![6, 0, 0], "Unregistered S4 S2C"),
+            ("echo", vec![7, 0, 0], "batch capacity"),
+        ] {
+            let error = dispatch(&mut env, channel, bytes).unwrap_err();
+            assert!(
+                error.contains(reason),
+                "{channel} expected {reason:?}: {error}"
+            );
+            assert_eq!(
+                dispatch(&mut env, "echo", vec![0, 17, 0]).unwrap(),
+                expected
+            );
+        }
+
+        let frame = encode_s4_payload_batch(&[envelope("echo", vec![0, 17, 0])]).unwrap();
+        for len in 0..frame.len() {
+            assert!(dispatch_s4_payload_frame(&mut env, 1, "Rust owner", &frame[..len]).is_err());
+        }
+        let mut oversized =
+            encode_s4_payload_batch(&[envelope("echo", vec![0; S4_MAX_PAYLOAD])]).unwrap();
+        let header = oversized.len() - S4_MAX_PAYLOAD;
+        oversized[header - 4..header].copy_from_slice(&((S4_MAX_PAYLOAD + 1) as u32).to_le_bytes());
+        oversized.push(0);
+        assert!(
+            dispatch_s4_payload_frame(&mut env, 1, "Rust owner", &oversized)
+                .unwrap_err()
+                .contains("oversized S4 payload frame")
+        );
+        println!("S4 invalid, oversized and depth-five payloads rejected");
+
+        let item = |count| S4ItemStack {
+            item_id: 1333,
+            count,
+        };
+        let vanilla = S4ItemStack {
+            item_id: 1,
+            count: 3,
+        };
+        let mut snapshot = S4ContainerSnapshot {
+            dim: 2,
+            pos: (-28, 65, 42),
+            state: 26685,
+            side: Some(S4BlockSide::Up),
+            slot_limit: 16,
+            slots: vec![item(12), vanilla, S4ItemStack::EMPTY],
+        };
+        let read = S4ContainerOp::Read { slot: 0 };
+        let simulate = [
+            S4ContainerOp::Insert {
+                slot: 0,
+                stack: item(7),
+                simulate: true,
+            },
+            S4ContainerOp::Extract {
+                slot: 0,
+                amount: 8,
+                simulate: true,
+            },
+            read,
+        ];
+        let result = query_s4_block_items(&mut env, &snapshot, &simulate)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.handler_slots, 3);
+        assert_eq!(
+            result.results,
+            [item(3), item(8), item(12)].map(|stack| S4SlotResult { limit: 16, stack })
+        );
+        assert!(result.mutations.is_empty());
+
+        let ops = [
+            S4ContainerOp::Insert {
+                slot: 0,
+                stack: item(7),
+                simulate: false,
+            },
+            S4ContainerOp::Insert {
+                slot: 1,
+                stack: item(5),
+                simulate: false,
+            },
+            S4ContainerOp::Extract {
+                slot: 0,
+                amount: 6,
+                simulate: false,
+            },
+            read,
+            S4ContainerOp::Read { slot: 2 },
+            S4ContainerOp::Extract {
+                slot: 1,
+                amount: 100,
+                simulate: false,
+            },
+        ];
+        let result = query_s4_block_items(&mut env, &snapshot, &ops)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.results,
+            [
+                item(3),
+                item(5),
+                item(6),
+                item(10),
+                S4ItemStack::EMPTY,
+                vanilla
+            ]
+            .map(|stack| S4SlotResult { limit: 16, stack })
+        );
+        assert_eq!(
+            result.mutations,
+            [
+                S4SlotMutation {
+                    dim: 2,
+                    pos: snapshot.pos,
+                    slot: 0,
+                    expected_state: 26685,
+                    expected: item(12),
+                    replacement: item(10)
+                },
+                S4SlotMutation {
+                    dim: 2,
+                    pos: snapshot.pos,
+                    slot: 1,
+                    expected_state: 26685,
+                    expected: vanilla,
+                    replacement: S4ItemStack::EMPTY
+                },
+            ]
+        );
+        // A caller applies the proposals separately. Reusing the pre-call
+        // snapshot must return the original stack, including after a failure.
+        let mut invalid = ops.to_vec();
+        invalid.push(S4ContainerOp::Read { slot: 99 });
+        assert!(query_s4_block_items(&mut env, &snapshot, &invalid).is_err());
+        let result = query_s4_block_items(&mut env, &snapshot, &[read])
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.results[0].stack, item(12));
+        snapshot.side = Some(S4BlockSide::Down);
+        assert!(query_s4_block_items(&mut env, &snapshot, &[read])
+            .unwrap()
+            .is_none());
+        snapshot.side = None;
+        snapshot.state = 26684;
+        assert!(query_s4_block_items(&mut env, &snapshot, &[read])
+            .unwrap()
+            .is_none());
+        println!("S4 capability results and conditional mutations verified");
+
+        let registry = fetch_registry_snapshot(&mut env).unwrap();
+        let packets = build_config_registry_sync_packets(&registry).unwrap();
+        assert_eq!(packets, [
+            b"\x07\x0fminecraft:block\x02\x13nf5_fixture:a_other\x00\x17nf5_fixture:z_container\x00".to_vec(),
+            b"\x07\x0eminecraft:item\x02\x12nf5_fixture:a_item\x00\x12nf5_fixture:z_item\x00".to_vec(),
+        ]);
+        assert_eq!(
+            packets,
+            build_config_registry_sync_packets(&fetch_registry_snapshot(&mut env).unwrap())
+                .unwrap()
+        );
+        println!("S4 deterministic Registry Data packet bodies verified");
+    }
 
     #[cfg(feature = "neoforge-events")]
     #[test]

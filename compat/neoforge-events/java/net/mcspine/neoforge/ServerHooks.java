@@ -26,6 +26,8 @@ import net.neoforged.neoforge.event.level.BlockEvent;
 public final class ServerHooks {
     public static void land(int x, int y, int z, float distance) {
         DirectBatchBridge.requireOutsideBatch();
+        S4NetworkBridge.requireOutsideDispatch();
+        S4CapabilityBridge.requireOutsideQuery();
         var event = new FarmlandTrampleEvent(new Level(), new BlockPos(x,y,z),
             new BlockState(), distance, new Entity());
         NeoForge.EVENT_BUS.post(event);

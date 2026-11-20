@@ -13,10 +13,14 @@ import java.util.List;
 import java.util.Map;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.BusBuilder;
 import net.neoforged.bus.api.IEventBus;
+import net.neoforged.neoforge.capabilities.RegisterCapabilitiesEvent;
 import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.registries.RegisterEvent;
 
 /** Static compatibility gate followed by the supported NeoForge event bootstrap. */
@@ -45,10 +49,8 @@ public final class Bootstrap {
             }
         }
         if (jars.isEmpty()) {
-            frozenRegistry = freezeRegistries();
-            NeoForge.EVENT_BUS.start();
             DirectBatchBridge.beginRegistration();
-            DirectBatchBridge.freezeRegistration();
+            finishRegistration();
             initialized = true;
             return net.mcspine.probe.Host.class;
         }
@@ -96,9 +98,7 @@ public final class Bootstrap {
                 }
             }
             for (IEventBus bus : modBuses.values()) bus.start();
-            frozenRegistry = freezeRegistries();
-            NeoForge.EVENT_BUS.start();
-            DirectBatchBridge.freezeRegistration();
+            finishRegistration();
             initialized = true;
         } catch (Exception | Error error) {
             try { close(); }
@@ -106,6 +106,20 @@ public final class Bootstrap {
             throw error;
         }
         return net.mcspine.probe.Host.class;
+    }
+
+    private static void finishRegistration() {
+        frozenRegistry = freezeRegistries();
+        S4NetworkBridge.beginRegistration();
+        S4CapabilityBridge.beginRegistration();
+        var payloads = new RegisterPayloadHandlersEvent();
+        var capabilities = new RegisterCapabilitiesEvent();
+        for (IEventBus bus : modBuses.values()) bus.post(payloads);
+        S4NetworkBridge.freezeRegistration();
+        for (IEventBus bus : modBuses.values()) bus.post(capabilities);
+        S4CapabilityBridge.freezeRegistration();
+        NeoForge.EVENT_BUS.start();
+        DirectBatchBridge.freezeRegistration();
     }
 
     private static String freezeRegistries() {
@@ -123,8 +137,11 @@ public final class Bootstrap {
                 .sorted(Comparator.comparing(ResourceLocation::getNamespace).thenComparing(ResourceLocation::getPath))
                 .toList();
             // First free IDs in the pinned 1.21.1 vanilla block-state and item tables.
-            long id = key == Registries.BLOCK ? 26_684 : 1_333;
+            int id = key == Registries.BLOCK ? 26_684 : 1_333;
             for (ResourceLocation name : names) {
+                Object value = event.registeredValue(name);
+                if (key == Registries.BLOCK) S4CapabilityBridge.bindBlock(id, (Block) value);
+                else S4CapabilityBridge.bindItem(id, (Item) value);
                 wire.append(key.location()).append('\t').append(id++).append('\t').append(name).append('\n');
             }
         }
@@ -174,6 +191,8 @@ public final class Bootstrap {
         initialized = false;
         frozenRegistry = null;
         DirectBatchBridge.clearRegistration();
+        S4NetworkBridge.clearRegistration();
+        S4CapabilityBridge.clearRegistration();
         for (Class<?> subscriber : gameSubscribers) NeoForge.EVENT_BUS.unregister(subscriber);
         gameSubscribers.clear();
         for (Object mod : instances.values()) NeoForge.EVENT_BUS.unregister(mod);

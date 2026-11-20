@@ -778,3 +778,525 @@ mod s3_tests {
         assert!(decode_s3_response_batch(&wire, 3, &[REQUEST]).is_err());
     }
 }
+
+/// Protocol 767 Configuration Registry Data bodies, including packet ID and
+/// excluding transport length/compression framing. Entries carry names in S2
+/// runtime-ID order with an absent optional NBT value.
+#[allow(dead_code)] // The configuration owner decides where to send these packets.
+pub(crate) fn build_config_registry_sync_packets(
+    snapshot: &ModRegistrySnapshot,
+) -> Result<Vec<Vec<u8>>, &'static str> {
+    fn varint(out: &mut Vec<u8>, mut value: usize) {
+        while value >= 128 {
+            out.push((value as u8 & 127) | 128);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    fn string(out: &mut Vec<u8>, value: &str) {
+        varint(out, value.len());
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    let (blocks, items) = snapshot.entries.split_at(
+        snapshot
+            .entries
+            .partition_point(|entry| entry.registry == ModRegistry::Block),
+    );
+    [("minecraft:block", blocks), ("minecraft:item", items)]
+        .into_iter()
+        .filter(|(_, entries)| !entries.is_empty())
+        .map(|(registry, entries)| {
+            let mut packet = vec![0x07];
+            string(&mut packet, registry);
+            if entries.len() > i32::MAX as usize {
+                return Err("too many Configuration Registry Data entries");
+            }
+            varint(&mut packet, entries.len());
+            for entry in entries {
+                // Snapshot names contain only ASCII. The ResourceLocation
+                // codec decodes them using Minecraft's default string limit.
+                if entry.name.len() > 32767 {
+                    return Err("oversized Configuration Registry Data entry name");
+                }
+                string(&mut packet, &entry.name);
+                packet.push(0);
+            }
+            Ok(packet)
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+pub(crate) const S4_MAX_PAYLOAD: usize = 32 * 1024;
+#[cfg(any(test, feature = "neoforge-events"))]
+pub(crate) const S4_MAX_CHANNEL: usize = 256;
+#[cfg(any(test, feature = "neoforge-events"))]
+pub(crate) const S4_PAYLOAD_CAPACITY: usize = 256 * 1024;
+#[cfg(any(test, feature = "neoforge-events"))]
+const S4_MAX_ENVELOPES: usize = 64;
+#[cfg(any(test, feature = "neoforge-events"))]
+const S4_PAYLOAD_MAGIC: [u8; 4] = [b'S', b'4', 1, 0];
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CustomPayloadEnvelope {
+    pub(crate) channel: String,
+    /// None broadcasts for S2C and is mandatory on C2S.
+    pub(crate) target_eid: Option<i32>,
+    pub(crate) bytes: Vec<u8>,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+fn valid_s4_channel(channel: &str) -> bool {
+    channel.len() <= S4_MAX_CHANNEL && mod_name_parts(channel).is_ok()
+}
+
+/// v1: magic, u16 envelope count, then length-prefixed channel, optional
+/// target tag and EID, and length-prefixed payload, all little-endian.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)] // Available to the host owner.
+pub(crate) fn encode_s4_payload_batch(
+    envelopes: &[CustomPayloadEnvelope],
+) -> Result<Vec<u8>, &'static str> {
+    if envelopes.len() > S4_MAX_ENVELOPES {
+        return Err("too many S4 envelopes");
+    }
+    let mut out = Vec::from(S4_PAYLOAD_MAGIC);
+    out.extend_from_slice(&(envelopes.len() as u16).to_le_bytes());
+    for envelope in envelopes {
+        let channel = envelope.channel.as_bytes();
+        if !valid_s4_channel(&envelope.channel) {
+            return Err("invalid S4 channel");
+        }
+        if envelope.bytes.len() > S4_MAX_PAYLOAD {
+            return Err("oversized S4 payload");
+        }
+        let target_size = usize::from(envelope.target_eid.is_some()) * 4;
+        if out.len() + 2 + channel.len() + 1 + target_size + 4 + envelope.bytes.len()
+            > S4_PAYLOAD_CAPACITY
+        {
+            return Err("oversized S4 payload batch");
+        }
+        out.extend_from_slice(&(channel.len() as u16).to_le_bytes());
+        out.extend_from_slice(channel);
+        out.push(envelope.target_eid.is_some().into());
+        if let Some(target) = envelope.target_eid {
+            out.extend_from_slice(&target.to_le_bytes());
+        }
+        out.extend_from_slice(&(envelope.bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&envelope.bytes);
+    }
+    Ok(out)
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)] // Available to the host owner.
+pub(crate) fn decode_s4_payload_batch(
+    mut bytes: &[u8],
+) -> Result<Vec<CustomPayloadEnvelope>, &'static str> {
+    fn take<'a>(input: &mut &'a [u8], size: usize) -> Result<&'a [u8], &'static str> {
+        let (field, rest) = input
+            .split_at_checked(size)
+            .ok_or("truncated S4 payload frame")?;
+        *input = rest;
+        Ok(field)
+    }
+
+    fn number<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], &'static str> {
+        Ok(take(input, N)?.try_into().expect("exact field length"))
+    }
+
+    if bytes.len() > S4_PAYLOAD_CAPACITY || number::<4>(&mut bytes)? != S4_PAYLOAD_MAGIC {
+        return Err("invalid S4 payload frame");
+    }
+    let count = u16::from_le_bytes(number(&mut bytes)?) as usize;
+    if count > S4_MAX_ENVELOPES {
+        return Err("too many S4 envelopes");
+    }
+    let mut envelopes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length = u16::from_le_bytes(number(&mut bytes)?) as usize;
+        if length > S4_MAX_CHANNEL {
+            return Err("oversized S4 channel");
+        }
+        let channel = std::str::from_utf8(take(&mut bytes, length)?)
+            .map_err(|_| "invalid S4 channel UTF-8")?;
+        if !valid_s4_channel(channel) {
+            return Err("invalid S4 channel");
+        }
+        let target_eid = match take(&mut bytes, 1)?[0] {
+            0 => None,
+            1 => Some(i32::from_le_bytes(number(&mut bytes)?)),
+            _ => return Err("invalid S4 target tag"),
+        };
+        let length = u32::from_le_bytes(number(&mut bytes)?) as usize;
+        if length > S4_MAX_PAYLOAD {
+            return Err("oversized S4 payload");
+        }
+        envelopes.push(CustomPayloadEnvelope {
+            channel: channel.into(),
+            target_eid,
+            bytes: take(&mut bytes, length)?.to_vec(),
+        });
+    }
+    if !bytes.is_empty() {
+        return Err("trailing bytes in S4 payload frame");
+    }
+    Ok(envelopes)
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+const S4_MAX_SLOTS: usize = 256;
+#[cfg(any(test, feature = "neoforge-events"))]
+const S4_MAX_CONTAINER_OPS: usize = 256;
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct S4ItemStack {
+    pub(crate) item_id: u32,
+    pub(crate) count: u8,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+impl S4ItemStack {
+    pub(crate) const EMPTY: Self = Self {
+        item_id: 0,
+        count: 0,
+    };
+
+    fn validate(self, limit: u8) -> Result<(), &'static str> {
+        if self.count > limit || (self.item_id == 0) != (self.count == 0) {
+            return Err("invalid S4 item stack");
+        }
+        Ok(())
+    }
+
+    fn decode(wire: &[i32], limit: u8) -> Result<Self, &'static str> {
+        let stack = Self {
+            item_id: wire[0] as u32,
+            count: u8::try_from(wire[1]).map_err(|_| "invalid S4 stack count")?,
+        };
+        stack.validate(limit)?;
+        Ok(stack)
+    }
+
+    fn encode(self, limit: u8) -> Result<[i32; 2], &'static str> {
+        self.validate(limit)?;
+        Ok([self.item_id as i32, self.count.into()])
+    }
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)] // Available to the host owner.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum S4BlockSide {
+    Down,
+    Up,
+    North,
+    South,
+    West,
+    East,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)] // Available to the host owner.
+#[derive(Debug)]
+pub(crate) struct S4ContainerSnapshot {
+    pub(crate) dim: u8,
+    pub(crate) pos: (i32, i32, i32),
+    pub(crate) state: u32,
+    pub(crate) side: Option<S4BlockSide>,
+    pub(crate) slot_limit: u8,
+    pub(crate) slots: Vec<S4ItemStack>,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)] // Available to the host owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum S4ContainerOp {
+    Read {
+        slot: u16,
+    },
+    Insert {
+        slot: u16,
+        stack: S4ItemStack,
+        simulate: bool,
+    },
+    Extract {
+        slot: u16,
+        amount: u32,
+        simulate: bool,
+    },
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+impl S4ContainerOp {
+    fn slot(self) -> u16 {
+        match self {
+            Self::Read { slot } | Self::Insert { slot, .. } | Self::Extract { slot, .. } => slot,
+        }
+    }
+
+    fn writes(self) -> bool {
+        matches!(
+            self,
+            Self::Insert {
+                simulate: false,
+                ..
+            } | Self::Extract {
+                simulate: false,
+                ..
+            }
+        )
+    }
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct S4SlotResult {
+    pub(crate) limit: u8,
+    pub(crate) stack: S4ItemStack,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct S4SlotMutation {
+    pub(crate) dim: u8,
+    pub(crate) pos: (i32, i32, i32),
+    pub(crate) slot: u16,
+    pub(crate) expected_state: u32,
+    pub(crate) expected: S4ItemStack,
+    pub(crate) replacement: S4ItemStack,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct S4ContainerOutcome {
+    pub(crate) handler_slots: u16,
+    pub(crate) results: Vec<S4SlotResult>,
+    pub(crate) mutations: Vec<S4SlotMutation>,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)] // Available to the host owner.
+impl S4ContainerSnapshot {
+    pub(crate) fn encode_query(&self, ops: &[S4ContainerOp]) -> Result<Vec<i32>, &'static str> {
+        if self.dim > 2
+            || !(1..=99).contains(&self.slot_limit)
+            || self.slots.len() > S4_MAX_SLOTS
+            || ops.len() > S4_MAX_CONTAINER_OPS
+        {
+            return Err("invalid S4 container snapshot or operation count");
+        }
+        let (x, y, z) = self.pos;
+        let mut wire = Vec::with_capacity(9 + 2 * self.slots.len() + 4 * ops.len());
+        wire.extend([
+            self.dim.into(),
+            x,
+            y,
+            z,
+            self.state as i32,
+            self.side.map_or(-1, |side| side as i32),
+            self.slot_limit.into(),
+            self.slots.len() as i32,
+            ops.len() as i32,
+        ]);
+        for stack in &self.slots {
+            wire.extend(stack.encode(self.slot_limit)?);
+        }
+        for op in ops {
+            let (tag, item, count) = match *op {
+                S4ContainerOp::Read { .. } => (0, 0, 0),
+                S4ContainerOp::Insert {
+                    stack, simulate, ..
+                } => {
+                    let [item, count] = stack.encode(99)?;
+                    (1 + i32::from(simulate), item, count)
+                }
+                S4ContainerOp::Extract {
+                    amount, simulate, ..
+                } => (
+                    3 + i32::from(simulate),
+                    0,
+                    i32::try_from(amount).map_err(|_| "invalid S4 extraction amount")?,
+                ),
+            };
+            wire.extend([tag, op.slot().into(), item, count]);
+        }
+        Ok(wire)
+    }
+
+    pub(crate) fn response_len(&self, ops: &[S4ContainerOp]) -> usize {
+        1 + 3 * ops.len() + 2 * self.slots.len()
+    }
+
+    pub(crate) fn decode_response(
+        &self,
+        ops: &[S4ContainerOp],
+        mut wire: &[i32],
+    ) -> Result<Option<S4ContainerOutcome>, &'static str> {
+        let Some((&handler_slots, rest)) = wire.split_first() else {
+            return Ok(None);
+        };
+        wire = rest;
+        if !(0..=S4_MAX_SLOTS as i32).contains(&handler_slots)
+            || wire.len() + 1 != self.response_len(ops)
+            || ops.iter().any(|op| i32::from(op.slot()) >= handler_slots)
+        {
+            return Err("invalid S4 capability response");
+        }
+        let (results, slots) = wire.split_at(3 * ops.len());
+        let results = results
+            .chunks_exact(3)
+            .map(|value| {
+                Ok(S4SlotResult {
+                    limit: u8::try_from(value[0])
+                        .ok()
+                        .filter(|limit| *limit <= 99)
+                        .ok_or("invalid S4 result slot limit")?,
+                    stack: S4ItemStack::decode(&value[1..], 99)?,
+                })
+            })
+            .collect::<Result<Vec<_>, &'static str>>()?;
+        let mut mutations = Vec::new();
+        let writes = ops.iter().any(|op| op.writes());
+        for (slot, (wire, &expected)) in slots.chunks_exact(2).zip(&self.slots).enumerate() {
+            let replacement = S4ItemStack::decode(wire, self.slot_limit)?;
+            if replacement != expected {
+                if !writes {
+                    return Err("mutation in read-only S4 capability response");
+                }
+                mutations.push(S4SlotMutation {
+                    dim: self.dim,
+                    pos: self.pos,
+                    slot: slot as u16,
+                    expected_state: self.state,
+                    expected,
+                    replacement,
+                });
+            }
+        }
+        Ok(Some(S4ContainerOutcome {
+            handler_slots: handler_slots as u16,
+            results,
+            mutations,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod s4_tests {
+    use super::*;
+
+    #[test]
+    fn payload_batch_rejects_every_truncation_and_invalid_fields() {
+        let channel = "fixture:echo";
+        let envelopes = [
+            CustomPayloadEnvelope {
+                channel: channel.into(),
+                target_eid: Some(i32::MIN),
+                bytes: vec![0xda, 0xff],
+            },
+            CustomPayloadEnvelope {
+                channel: "fixture:empty".into(),
+                target_eid: None,
+                bytes: vec![],
+            },
+        ];
+        let encoded = encode_s4_payload_batch(&envelopes).unwrap();
+        assert_eq!(decode_s4_payload_batch(&encoded).unwrap(), envelopes);
+        for end in 0..encoded.len() {
+            assert!(decode_s4_payload_batch(&encoded[..end]).is_err());
+        }
+        let target = 8 + channel.len();
+        let payload_len = target + 5;
+        let mut invalid = encoded.clone();
+        invalid[target] = 2;
+        assert_eq!(
+            decode_s4_payload_batch(&invalid),
+            Err("invalid S4 target tag")
+        );
+        invalid = encoded.clone();
+        invalid[payload_len..payload_len + 4]
+            .copy_from_slice(&((S4_MAX_PAYLOAD + 1) as u32).to_le_bytes());
+        assert_eq!(
+            decode_s4_payload_batch(&invalid),
+            Err("oversized S4 payload")
+        );
+        invalid = encoded;
+        invalid.push(0);
+        assert_eq!(
+            decode_s4_payload_batch(&invalid),
+            Err("trailing bytes in S4 payload frame")
+        );
+    }
+
+    #[test]
+    fn capability_response_rejects_mutations_in_a_read_only_batch() {
+        let snapshot = S4ContainerSnapshot {
+            dim: 0,
+            pos: (1, 2, 3),
+            state: FIRST_MOD_BLOCK_STATE_ID,
+            side: None,
+            slot_limit: 16,
+            slots: vec![S4ItemStack::EMPTY],
+        };
+        let ops = [S4ContainerOp::Read { slot: 0 }];
+        let with_mutation = [1, 16, 0, 0, 1, 4];
+        assert_eq!(
+            snapshot.decode_response(&ops, &with_mutation),
+            Err("mutation in read-only S4 capability response")
+        );
+        assert!(snapshot.decode_response(&ops, &with_mutation[..5]).is_err());
+        assert_eq!(snapshot.decode_response(&ops, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn registry_packet_rejects_names_beyond_the_protocol_string_limit() {
+        let wire = |length: usize| {
+            format!(
+                "S2\nminecraft:item\t1333\tfixture:{}\nend",
+                "x".repeat(length - 8)
+            )
+        };
+        let max = ModRegistrySnapshot::from_wire(&wire(32767)).unwrap();
+        assert!(build_config_registry_sync_packets(&max).is_ok());
+        let oversized = ModRegistrySnapshot::from_wire(&wire(32768)).unwrap();
+        assert_eq!(
+            build_config_registry_sync_packets(&oversized),
+            Err("oversized Configuration Registry Data entry name"),
+        );
+    }
+
+    #[test]
+    fn registry_packet_uses_multibyte_count_and_entry_length() {
+        let mut wire = String::from("S2\n");
+        for index in 0..128 {
+            use std::fmt::Write;
+            writeln!(
+                wire,
+                "minecraft:item\t{}\tfixture:{index:03}_{}",
+                FIRST_MOD_ITEM_ID + index,
+                "x".repeat(116),
+            )
+            .unwrap();
+        }
+        wire.push_str("end");
+        let snapshot = ModRegistrySnapshot::from_wire(&wire).unwrap();
+        let packets = build_config_registry_sync_packets(&snapshot).unwrap();
+        let [packet] = packets.as_slice() else {
+            panic!("expected one item packet")
+        };
+        let first = b"\x07\x0eminecraft:item\x80\x01\x80\x01fixture:000_";
+        assert!(packet.starts_with(first));
+        assert_eq!(&packet[first.len()..first.len() + 116], &[b'x'; 116]);
+        assert_eq!(packet[first.len() + 116], 0);
+        assert!(build_config_registry_sync_packets(
+            &ModRegistrySnapshot::from_wire("S2\nend").unwrap()
+        )
+        .unwrap()
+        .is_empty());
+    }
+}

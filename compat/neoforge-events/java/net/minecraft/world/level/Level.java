@@ -4,7 +4,9 @@ import java.util.HashMap;
 import java.util.Map;
 import net.mcspine.neoforge.MutationBuffer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.neoforged.neoforge.capabilities.BlockCapability;
 
 /** Immutable input snapshot for mods. Writes are conditional host mutations. */
 public class Level implements LevelAccessor {
@@ -20,6 +22,15 @@ public class Level implements LevelAccessor {
 
     /** Populate an input snapshot from the Rust owner before dispatch. */
     public void snapshotBlock(BlockPos pos, BlockState state) { blocks.put(pos, state); }
+
+    public <T, C> T getCapability(BlockCapability<T, C> capability, BlockPos pos, C context) {
+        return getCapability(capability, pos, null, null, context);
+    }
+
+    public <T, C> T getCapability(BlockCapability<T, C> capability, BlockPos pos, BlockState state,
+            BlockEntity blockEntity, C context) {
+        return capability.getCapability(this, pos, state, blockEntity, context);
+    }
 
     public boolean setBlock(BlockPos pos, BlockState state, int flags) {
         MutationBuffer.append(new MutationBuffer.SetBlockIf(dim, pos.x(), pos.y(), pos.z(),
