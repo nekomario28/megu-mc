@@ -8,7 +8,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Launcher entry point. Minecraft's arguments are opaque to this bridge. */
+/** Launcher entry point for the native client and its optional loopback server. */
 public final class Main {
     private Main() {}
 
@@ -20,10 +20,15 @@ public final class Main {
         List<String> gameArgs = new ArrayList<>();
         String gameDir = null;
         boolean detach = "1".equals(System.getenv("MC_SPINE_DETACH"));
+        boolean integrated = false;
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
             if ("--mc-spine-detach".equals(arg)) {
                 detach = true;
+                continue;
+            }
+            if ("--mc-spine-integrated".equals(arg)) {
+                integrated = true;
                 continue;
             }
             gameArgs.add(arg);
@@ -34,6 +39,10 @@ public final class Main {
             }
         }
 
+        if (integrated && (detach || gameDir == null || gameDir.isBlank())) {
+            System.err.println("mc-spine launcher: --mc-spine-integrated requires --gameDir and wait mode");
+            return 2;
+        }
         Path binary = resolveBinary(gameDir);
         if (binary == null) {
             System.err.println("mc-spine launcher: native client not found or not executable "
@@ -46,6 +55,9 @@ public final class Main {
         command.add(binary.toString());
         command.addAll(gameArgs);
         try {
+            if (integrated) {
+                return runIntegrated(gameDir, command);
+            }
             Process process = new ProcessBuilder(command).inheritIO().start();
             writeManifest(detach, process.pid(), gameArgs.size());
             if (detach) {
@@ -59,6 +71,29 @@ public final class Main {
             Thread.currentThread().interrupt();
             System.err.println("mc-spine launcher: interrupted while waiting for native client");
             return 1;
+        }
+    }
+
+    private static int runIntegrated(String gameDir, List<String> client)
+            throws IOException, InterruptedException {
+        List<String> command;
+        try (var source = Main.class.getResourceAsStream("/integrated_bridge.py")) {
+            if (source == null) {
+                throw new IOException("integrated_bridge.py missing from bootstrapper jar");
+            }
+            command = new ArrayList<>(List.of("python3", "-c",
+                    new String(source.readAllBytes(), StandardCharsets.UTF_8),
+                    "--parent-stdin", "--game-dir", gameDir, "--"));
+        }
+        command.addAll(client);
+
+        // The child watches stdin for EOF, including if the JVM exits abruptly.
+        Process bridge = new ProcessBuilder(command)
+                .redirectOutput(ProcessBuilder.Redirect.INHERIT)
+                .redirectError(ProcessBuilder.Redirect.INHERIT)
+                .start();
+        try (var parentPipe = bridge.getOutputStream()) {
+            return bridge.waitFor();
         }
     }
 

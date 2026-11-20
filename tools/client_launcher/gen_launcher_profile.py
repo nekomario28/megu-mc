@@ -19,10 +19,12 @@ ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 def build_jar(out_dir):
     with tempfile.TemporaryDirectory(prefix="mc-spine-javac-") as build:
         compiled = Path(build)
-        subprocess.run(["javac", "--release", "21", "-d", str(compiled),
+        subprocess.run(["javac", f"-J-Djava.io.tmpdir={tempfile.gettempdir()}",
+                        "--release", "21", "-d", str(compiled),
                         str(ROOT / "Main.java")], check=True)
         entries = [("META-INF/MANIFEST.MF",
-                    b"Manifest-Version: 1.0\r\nMain-Class: net.mcspine.launcher.Main\r\n\r\n")]
+                    b"Manifest-Version: 1.0\r\nMain-Class: net.mcspine.launcher.Main\r\n\r\n"),
+                   ("integrated_bridge.py", (ROOT / "integrated_bridge.py").read_bytes())]
         entries.extend((str(path.relative_to(compiled)).replace("\\", "/"), path.read_bytes())
                        for path in sorted(compiled.rglob("*.class")))
         jar = out_dir / "mc-spine-bootstrapper.jar"

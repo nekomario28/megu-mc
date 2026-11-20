@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Run mc-spine for a local client and inject its Quick Play multiplayer address.
+
+Usage: python3 integrated_bridge.py --game-dir DIR [--world NAME] -- CLIENT [ARGS...]
+The default world is mc-spine, overridable with MC_SPINE_INTEGRATED_WORLD.
+Set MC_SPINE_SERVER_BIN for an explicit server executable and MC_SPINE_SERVER_HOME
+for its runtime data (config_packets.bin, assets, and optional datapacks/vanilla).
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+
+LOOPBACK = "127.0.0.1"
+QUICK_PLAY_TARGETS = {"--quickPlayMultiplayer", "--quickPlaySingleplayer", "--quickPlayRealms"}
+
+
+def server_binary(game_dir):
+    configured = os.environ.get("MC_SPINE_SERVER_BIN")
+    candidates = [configured] if configured else [
+        str(game_dir / "mc-spine"), str(game_dir / "bin" / "mc-spine"), "mc-spine",
+    ]
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found:
+            return Path(found).resolve()
+    raise ValueError("mc-spine server not found or not executable (MC_SPINE_SERVER_BIN, --gameDir, PATH)")
+
+
+def link_runtime_data(world, binary, game_dir):
+    configured = os.environ.get("MC_SPINE_SERVER_HOME")
+    candidates = [Path(configured).resolve()] if configured else [
+        game_dir, Path.cwd(), *binary.parents,
+    ]
+    home = next((root for root in candidates
+                 if (root / "config_packets.bin").is_file() and (root / "assets").is_dir()), None)
+    if home is None and configured:
+        raise ValueError("MC_SPINE_SERVER_HOME must contain config_packets.bin and assets")
+    if home is not None:
+        for name in ("config_packets.bin", "assets", "datapacks/vanilla"):
+            source, target = home / name, world / name
+            if (source.exists() and not target.exists() and not target.is_symlink()
+                    and not target.parent.is_symlink()):
+                target.parent.mkdir(exist_ok=True)
+                target.symlink_to(source, target_is_directory=source.is_dir())
+
+
+def client_command(client, endpoint):
+    # Minecraft launchers may already supply a Quick Play target. Keep its path
+    # and other game arguments unchanged and give it a single loopback target.
+    args = iter(client[1:])
+    command = [client[0]]
+    for arg in args:
+        if arg in QUICK_PLAY_TARGETS:
+            next(args, None)
+        elif arg.partition("=")[0] not in QUICK_PLAY_TARGETS:
+            command.append(arg)
+    return [*command, "--quickPlayMultiplayer", endpoint]
+
+
+def stop_process(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def log_server(server, endpoint, ready):
+    banner = f" listening {endpoint} "
+    with server.stdout:
+        for line in server.stdout:
+            if line.startswith("mc-spine ") and banner in line:
+                ready.set()
+            print(line, end="", file=sys.stderr, flush=True)
+
+
+def write_manifest(client, command, endpoint):
+    destination = os.environ.get("MC_SPINE_HANDOFF_MANIFEST")
+    if destination:
+        path = Path(destination).absolute()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(dir=path.parent, prefix=".mc-spine-handoff-")
+        temp = Path(name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump({"mode": "integrated", "pid": client.pid,
+                           "argumentCount": len(command) - 1, "endpoint": endpoint}, stream)
+                stream.write("\n")
+            temp.replace(path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+def run_server(binary, world, client, stopping):
+    # The server announces its configured port, so select a free one ourselves.
+    # Waiting for this child's banner avoids handing off to a different process
+    # if it binds the port in the gap between selection and server startup.
+    with socket.socket() as reserved:
+        reserved.bind((LOOPBACK, 0))
+        port = reserved.getsockname()[1]
+    endpoint = f"{LOOPBACK}:{port}"
+    env = dict(os.environ, MC_SPINE_BIND_ADDR=LOOPBACK, MC_SPINE_PORT=str(port),
+               MC_SPINE_WORLD_DIR=str(world), MC_SPINE_RESOURCE_PACK_URL="",
+               MC_SPINE_MAX_CONN_PER_IP="1")
+    env.pop("MC_SPINE_RCON_PORT", None)
+    server = subprocess.Popen([str(binary)], cwd=world, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              encoding="utf-8", errors="replace")
+    ready = threading.Event()
+    logs = threading.Thread(target=log_server, args=(server, endpoint, ready), daemon=True)
+    try:
+        logs.start()
+        deadline = time.monotonic() + 30
+        while not stopping():
+            if server.poll() is not None:
+                raise ValueError(f"server exited during startup ({server.returncode})")
+            if ready.wait(0.05):
+                break
+            if time.monotonic() >= deadline:
+                raise ValueError(f"server did not become ready at {endpoint}")
+        if stopping():
+            return 1
+        if server.poll() is not None:
+            raise ValueError(f"server exited during startup ({server.returncode})")
+        command = client_command(client, endpoint)
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+        try:
+            write_manifest(process, command, endpoint)
+            while not stopping():
+                try:
+                    result = process.wait(timeout=0.1)
+                    return result if result >= 0 else 128 - result
+                except subprocess.TimeoutExpired:
+                    if server.poll() is not None:
+                        raise ValueError(f"server exited while client was running ({server.returncode})")
+            return 1
+        finally:
+            stop_process(process)
+    finally:
+        stop_process(server)
+        if logs.ident is not None:
+            logs.join(timeout=1)
+
+
+def lock_world(lock):
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        raise ValueError("this integrated world is already in use") from error
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--game-dir", type=Path, required=True)
+    parser.add_argument("--world", default=os.environ.get("MC_SPINE_INTEGRATED_WORLD", "mc-spine"))
+    parser.add_argument("--parent-stdin", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("client", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    client = args.client[1:] if args.client[:1] == ["--"] else args.client
+    if not client:
+        parser.error("a client command is required")
+    if args.world in ("", ".", "..") or any(char in args.world for char in "/\\:"):
+        parser.error("--world must be a single directory name")
+
+    stopped = False
+
+    def stop(*_):
+        nonlocal stopped
+        stopped = True
+
+    def watch_parent():
+        os.read(sys.stdin.fileno(), 1)
+        stop()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    if args.parent_stdin:
+        threading.Thread(target=watch_parent, daemon=True).start()
+    try:
+        game_dir = args.game_dir.resolve()
+        binary = server_binary(game_dir)
+        saves = (game_dir / "saves").resolve()
+        world = (saves / args.world).resolve()
+        if world.parent != saves:
+            raise ValueError("integrated world must be inside the saves directory")
+        world.mkdir(parents=True, exist_ok=True)
+        with (world / ".mc-spine-integrated.lock").open("ab") as lock:
+            lock_world(lock)
+            link_runtime_data(world, binary, game_dir)
+            return run_server(binary, world, client, lambda: stopped)
+    except (OSError, ValueError) as error:
+        print(f"mc-spine integrated: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

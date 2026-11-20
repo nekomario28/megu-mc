@@ -19,21 +19,57 @@ class LauncherTest(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-client-launcher-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
-        cls.temp_java = cls.root / "java-tmp"
-        cls.temp_java.mkdir()
         cls.jar_dir = cls.root / "profile-one"
         cls.stub = cls.root / "native-client"
         cls.stub.write_text("""#!/usr/bin/env python3
 import json
 import os
+import socket
 import sys
 import time
 from pathlib import Path
+if os.environ.get('TEST_INTEGRATED_CONNECT'):
+    endpoint = sys.argv[sys.argv.index('--quickPlayMultiplayer') + 1]
+    host, port = endpoint.split(':')
+    with socket.create_connection((host, int(port)), timeout=1):
+        pass
 Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
 time.sleep(float(os.environ.get('TEST_NATIVE_SLEEP', '0')))
 sys.exit(int(os.environ.get('TEST_NATIVE_EXIT', '0')))
 """)
         cls.stub.chmod(0o755)
+        cls.server = cls.root / "native-server"
+        cls.server.write_text("""#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import sys
+import time
+
+def stop(*_):
+    Path('stopped').write_text(str(os.getpid()))
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+host = os.environ['MC_SPINE_BIND_ADDR']
+port = int(os.environ['MC_SPINE_PORT'])
+with socket.socket() as listener:
+    time.sleep(0.2)
+    listener.bind((host, port))
+    listener.listen()
+    Path('server.json').write_text(json.dumps({
+        'pid': os.getpid(), 'port': port, 'bind': host, 'cwd': os.getcwd(),
+        'world': os.environ['MC_SPINE_WORLD_DIR'],
+        'rcon': os.environ.get('MC_SPINE_RCON_PORT'),
+    }))
+    print(f'mc-spine stub listening {host}:{port} (test)', flush=True)
+    while True:
+        conn, _ = listener.accept()
+        conn.close()
+""")
+        cls.server.chmod(0o755)
         cls.generate(cls.jar_dir, "--build-jar")
 
     @classmethod
@@ -60,9 +96,27 @@ sys.exit(int(os.environ.get('TEST_NATIVE_EXIT', '0')))
         return result, log
 
     def java(self, *args, extra_env=None):
-        return self.invocation("java", "-Djava.io.tmpdir=" + str(self.temp_java),
+        return self.invocation("java", "-Djava.io.tmpdir=" + tempfile.gettempdir(),
                                "-jar", str(self.jar_dir / "mc-spine-bootstrapper.jar"),
                                *args, extra_env=extra_env)
+
+    def integrated_fixture(self):
+        game = self.root / self._testMethodName / "game with spaces"
+        env = {"MC_SPINE_SERVER_BIN": str(self.server), "MC_SPINE_RCON_PORT": "25575",
+               "MC_SPINE_INTEGRATED_WORLD": "Loopback World", "TEST_INTEGRATED_CONNECT": "1"}
+        return game, game / "saves" / env["MC_SPINE_INTEGRATED_WORLD"], env
+
+    def assert_server_stopped(self, world):
+        info = json.loads((world / "server.json").read_text())
+        self.assertEqual(info["world"], str(world))
+        self.assertEqual(info["cwd"], str(world))
+        self.assertEqual(info["bind"], "127.0.0.1")
+        self.assertIsNone(info["rcon"])
+        self.assertGreater(info["port"], 0)
+        self.assertEqual((world / "stopped").read_text(), str(info["pid"]))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(info["pid"], 0)
+        return f"127.0.0.1:{info['port']}"
 
     def test_jar_reproducible_and_profile_installable(self):
         other = self.root / "profile-two"
@@ -134,6 +188,77 @@ sys.exit(int(os.environ.get('TEST_NATIVE_EXIT', '0')))
                               extra_env={"MC_SPINE_CLIENT_BIN": str(self.root / "absent")})
         self.assertEqual(result.returncode, 2)
         self.assertIn("not found", result.stderr)
+
+    def test_integrated_injects_loopback_and_stops_on_client_exit(self):
+        game, world, env = self.integrated_fixture()
+        manifest = game / "handoff.json"
+        env.update(MC_SPINE_HANDOFF_MANIFEST=str(manifest), TEST_NATIVE_EXIT="37")
+        result, log = self.java("--mc-spine-integrated", "--gameDir", str(game),
+                                "--quickPlaySingleplayer=stale", "--quickPlayMultiplayer",
+                                "example.invalid:25565", "--accessToken", "private-secret",
+                                extra_env=env)
+        self.assertEqual(result.returncode, 37, result.stderr)
+        endpoint = self.assert_server_stopped(world)
+        self.assertEqual(json.loads(log.read_text()),
+                         ["--gameDir", str(game), "--accessToken", "private-secret",
+                          "--quickPlayMultiplayer", endpoint])
+        summary = json.loads(manifest.read_text())
+        self.assertEqual(summary["endpoint"], endpoint)
+        self.assertEqual(summary["mode"], "integrated")
+        self.assertNotIn("private-secret", manifest.read_text())
+
+    def test_integrated_stops_when_client_spawn_fails(self):
+        game, world, env = self.integrated_fixture()
+        broken = game.parent / "broken-client"
+        game.parent.mkdir()
+        broken.write_text("#!/nonexistent/interpreter\n")
+        broken.chmod(0o755)
+        env["MC_SPINE_CLIENT_BIN"] = str(broken)
+        result, log = self.java("--mc-spine-integrated", f"--gameDir={game}", extra_env=env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("broken-client", result.stderr)
+        self.assertFalse(log.exists())
+        self.assert_server_stopped(world)
+
+    def test_integrated_cli_accepts_a_client_command(self):
+        game, world, env = self.integrated_fixture()
+        result, log = self.invocation(sys.executable, str(TOOLS / "integrated_bridge.py"),
+                                      "--game-dir", str(game), "--world", world.name,
+                                      "--", str(self.stub), "--username", "Alex", extra_env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(log.read_text()),
+                         ["--username", "Alex", "--quickPlayMultiplayer",
+                          self.assert_server_stopped(world)])
+
+    def test_integrated_stops_when_java_wrapper_exits_abruptly(self):
+        game, world, env = self.integrated_fixture()
+        client_log = game.parent / "client.json"
+        env = dict(os.environ, **env, MC_SPINE_CLIENT_BIN=str(self.stub),
+                   TEST_NATIVE_LOG=str(client_log), TEST_NATIVE_SLEEP="30", MC_SPINE_DETACH="0")
+        env.pop("MC_SPINE_HANDOFF_MANIFEST", None)
+        command = ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-jar",
+                   str(self.jar_dir / "mc-spine-bootstrapper.jar"),
+                   "--mc-spine-integrated", "--gameDir", str(game)]
+        with subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL) as java:
+            try:
+                deadline = time.monotonic() + 10
+                while not client_log.is_file() and java.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(client_log.is_file())
+            finally:
+                java.kill()
+                java.wait(timeout=5)
+
+        info = json.loads((world / "server.json").read_text())
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            try:
+                os.kill(info["pid"], 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        self.assert_server_stopped(world)
 
     def test_wrapper_removes_jvm_arguments_and_execs_native(self):
         wrapper = str(TOOLS / "mc-spine-wrapper")
