@@ -243,7 +243,7 @@ impl NetherConversion {
     }
 
     fn converted(&self) -> bool {
-        self.unsafe_ticks == 300
+        self.unsafe_ticks > 300
     }
 }
 
@@ -1643,13 +1643,13 @@ mod mob_behaviors_tests {
     }
 
     #[test]
-    fn piglin_zombification_requires_300_consecutive_unsafe_ticks() {
+    fn piglin_zombification_happens_on_unsafe_tick_301() {
         let mut piglin = PiglinBehavior::default();
         for _ in 0..299 {
             assert_eq!(piglin.tick(false, &mut no_draw), None);
         }
         assert_eq!(piglin.tick(true, &mut no_draw), None);
-        for _ in 0..299 {
+        for _ in 0..300 {
             assert_eq!(piglin.tick(false, &mut no_draw), None);
         }
         assert_eq!(
@@ -1683,7 +1683,7 @@ mod mob_behaviors_tests {
         assert_eq!(impulse[1], 0.2);
         assert_eq!(impulse[2], 0.0);
         assert_eq!(hoglin.fling([1.0; 3], 1.0, 1.0, &mut no_draw), [0.0; 3]);
-        for _ in 0..299 {
+        for _ in 0..300 {
             assert_eq!(hoglin.tick(false), None);
         }
         assert_eq!(hoglin.tick(false), Some(HoglinEvent::ConvertToZoglin));
