@@ -31426,7 +31426,10 @@ fn handle(mut s: TcpStream) {
                     }
                 }
                 // bed: right-click at night skips to morning
-                if (1688..=1943).contains(&block_at_dim(dim, x, y, z)) {
+                if block_registry::breg().is_some_and(|registry| {
+                    let name = registry.name_of(clicked);
+                    name.starts_with("minecraft:") && name.ends_with("_bed")
+                }) {
                     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
                     if dim == DimId::Overworld && (13000..=23500).contains(&wt) {
                         WORLD_TIME.store(0, Ordering::Relaxed);
