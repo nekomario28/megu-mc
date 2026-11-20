@@ -1,0 +1,11 @@
+[package]
+name = "offload-ffi-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mod_offload = { package = "mod-offload", path = "../../mod-offload" }
