@@ -4,14 +4,17 @@
 const WORLD_BORDER_MAX_SIZE: f64 = 59_999_968.0;
 
 #[cfg_attr(not(test), allow(dead_code))]
+const WORLD_BORDER_MAX_CENTER: i32 = 29_999_984;
+
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct WorldBorderState {
     center_x: f64,
     center_z: f64,
     old_size: f64,
     new_size: f64,
-    lerp_start_tick: u64,
-    lerp_duration_ticks: u64,
+    lerp_start_ms: u64,
+    lerp_duration_ms: i64,
     damage_per_block: f64,
     damage_safe_zone: f64,
     warning_blocks: i32,
@@ -26,47 +29,67 @@ impl Default for WorldBorderState {
             center_z: 0.0,
             old_size: WORLD_BORDER_MAX_SIZE,
             new_size: WORLD_BORDER_MAX_SIZE,
-            lerp_start_tick: 0,
-            lerp_duration_ticks: 0,
+            lerp_start_ms: 0,
+            lerp_duration_ms: 0,
             damage_per_block: 0.2,
             damage_safe_zone: 5.0,
             warning_blocks: 5,
             warning_time_secs: 15,
-            absolute_max_size: 29_999_984,
+            absolute_max_size: WORLD_BORDER_MAX_CENTER,
         }
     }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl WorldBorderState {
-    fn lerp_to(&mut self, new_size: f64, now_tick: u64, duration_ticks: u64) {
+    // The caller supplies monotonic milliseconds so interpolation is independent of tick rate.
+    fn lerp_to(&mut self, new_size: f64, now_ms: u64, duration_ms: i64) {
         if new_size.is_nan() {
             return;
         }
-        self.old_size = self.current_size(now_tick);
+        self.old_size = self.current_size(now_ms);
         self.new_size = new_size.clamp(1.0, WORLD_BORDER_MAX_SIZE);
-        self.lerp_start_tick = now_tick;
-        self.lerp_duration_ticks = duration_ticks;
+        self.lerp_start_ms = now_ms;
+        self.lerp_duration_ms = if self.old_size == self.new_size {
+            0
+        } else {
+            duration_ms.max(0)
+        };
     }
 
-    fn current_size(&self, now_tick: u64) -> f64 {
-        let elapsed = now_tick.saturating_sub(self.lerp_start_tick);
+    fn elapsed_ms(&self, now_ms: u64) -> i64 {
+        now_ms
+            .saturating_sub(self.lerp_start_ms)
+            .min(i64::MAX as u64) as i64
+    }
+
+    fn lerp_remaining_ms(&self, now_ms: u64) -> i64 {
+        if self.lerp_duration_ms == 0 {
+            return 0;
+        }
+        self.lerp_duration_ms - self.elapsed_ms(now_ms)
+    }
+
+    // Vanilla keeps the moving extent until the next border tick, even after its deadline.
+    fn finish_lerp(&mut self, now_ms: u64) {
+        if self.lerp_remaining_ms(now_ms) <= 0 {
+            self.lerp_duration_ms = 0;
+        }
+    }
+
+    fn current_size(&self, now_ms: u64) -> f64 {
+        let elapsed = self.elapsed_ms(now_ms);
         let target = self.new_size.clamp(1.0, WORLD_BORDER_MAX_SIZE);
-        if elapsed >= self.lerp_duration_ticks {
+        if elapsed >= self.lerp_duration_ms {
             return target;
         }
         let start = self.old_size.clamp(1.0, WORLD_BORDER_MAX_SIZE);
-        let fraction = elapsed as f64 / self.lerp_duration_ticks as f64;
+        let fraction = elapsed as f64 / self.lerp_duration_ms as f64;
         start + (target - start) * fraction
     }
 
-    fn remaining_lerp_ticks(&self, now_tick: u64) -> u64 {
-        self.lerp_duration_ticks
-            .saturating_sub(now_tick.saturating_sub(self.lerp_start_tick))
-    }
-
-    fn bounds(&self, now_tick: u64) -> (f64, f64, f64, f64) {
-        let radius = self.current_size(now_tick) * 0.5;
+    fn bounds(&self, now_ms: u64) -> (f64, f64, f64, f64) {
+        let radius = self.current_size(now_ms) * 0.5;
         let limit = f64::from(self.absolute_max_size.max(0));
         (
             (self.center_x - radius).clamp(-limit, limit),
@@ -76,13 +99,13 @@ impl WorldBorderState {
         )
     }
 
-    fn distance_to_border(&self, x: f64, z: f64, now_tick: u64) -> f64 {
-        let (min_x, min_z, max_x, max_z) = self.bounds(now_tick);
+    fn distance_to_border(&self, x: f64, z: f64, now_ms: u64) -> f64 {
+        let (min_x, min_z, max_x, max_z) = self.bounds(now_ms);
         (x - min_x).min(max_x - x).min(z - min_z).min(max_z - z)
     }
 
-    fn border_damage_for_pos(&self, x: f64, z: f64, now_tick: u64) -> f32 {
-        let distance = self.distance_to_border(x, z, now_tick);
+    fn border_damage_for_pos(&self, x: f64, z: f64, now_ms: u64) -> f32 {
+        let distance = self.distance_to_border(x, z, now_ms);
         if distance < -self.damage_safe_zone && self.damage_per_block > 0.0 {
             let damage = (-distance - self.damage_safe_zone) * self.damage_per_block;
             (damage.floor() as i32).max(1) as f32
@@ -90,6 +113,469 @@ impl WorldBorderState {
             0.0
         }
     }
+}
+
+// Protocol 767 clientbound IDs follow the vanilla 1.21.1 GameProtocols registration.
+
+#[cfg_attr(not(test), allow(dead_code))]
+type WorldMechanismsPacket = (i64, Vec<u8>);
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WorldBorderState {
+    fn initialize_packet(&self, now_ms: u64) -> WorldMechanismsPacket {
+        let mut out = Vec::new();
+        write_doubles(&mut out, [self.center_x, self.center_z]);
+        write_doubles(&mut out, [self.current_size(now_ms), self.new_size]);
+        write_border_duration(&mut out, self.lerp_remaining_ms(now_ms));
+        write_varint(&mut out, i64::from(self.absolute_max_size));
+        write_varint(&mut out, i64::from(self.warning_blocks));
+        write_varint(&mut out, i64::from(self.warning_time_secs));
+        (0x25, out)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+enum WorldBorderUpdate {
+    Center(f64, f64),
+    LerpSize {
+        from: f64,
+        to: f64,
+        duration_ms: i64,
+    },
+    Size(f64),
+    WarningDelay(i32),
+    WarningDistance(i32),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WorldBorderUpdate {
+    fn into_packet(self) -> WorldMechanismsPacket {
+        let mut out = Vec::new();
+        let id = match self {
+            Self::Center(x, z) => {
+                write_doubles(&mut out, [x, z]);
+                0x4d
+            }
+            Self::LerpSize {
+                from,
+                to,
+                duration_ms,
+            } => {
+                write_doubles(&mut out, [from, to]);
+                write_border_duration(&mut out, duration_ms);
+                0x4e
+            }
+            Self::Size(size) => {
+                out.extend_from_slice(&size.to_be_bytes());
+                0x4f
+            }
+            Self::WarningDelay(seconds) => {
+                write_varint(&mut out, i64::from(seconds));
+                0x50
+            }
+            Self::WarningDistance(blocks) => {
+                write_varint(&mut out, i64::from(blocks));
+                0x51
+            }
+        };
+        (id, out)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_border_duration(out: &mut Vec<u8>, ms: i64) {
+    if ms < 0 {
+        // write_varint uses five bytes for i32-range negatives. VarLong retains all 64 bits.
+        out.push((ms as u8 & 0x7f) | 0x80);
+        write_varint(out, ((ms as u64) >> 7) as i64);
+    } else {
+        write_varint(out, ms);
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_doubles(out: &mut Vec<u8>, values: [f64; 2]) {
+    for value in values {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct WorldBorderFeedback {
+    key: &'static str,
+    arguments: Vec<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WorldBorderFeedback {
+    fn new(key: &'static str, arguments: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            key,
+            arguments: arguments.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum WorldBorderCommandError {
+    Syntax,
+    MixedCoordinates,
+    ExpectedNumber(&'static str),
+    InvalidNumber(&'static str, String),
+    NumberTooLow {
+        kind: &'static str,
+        minimum: String,
+        found: String,
+    },
+    NumberTooHigh {
+        kind: &'static str,
+        maximum: String,
+        found: String,
+    },
+    Rejected(WorldBorderFeedback),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct WorldBorderCommandResult {
+    result: i32,
+    feedback: WorldBorderFeedback,
+    broadcast_feedback: bool,
+    packet: Option<WorldMechanismsPacket>,
+}
+
+#[derive(Debug, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum WorldBorderCommand {
+    Set(f64, i32),
+    Add(f64, Option<i32>),
+    Center(f64, f64),
+    DamageAmount(f32),
+    DamageBuffer(f32),
+    WarningDistance(i32),
+    WarningTime(i32),
+    Get,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WorldBorderCommand {
+    /// Parse the arguments following the worldborder literal, using the command source's X/Z.
+    fn parse(args: &[&str], source_x: f64, source_z: f64) -> Result<Self, WorldBorderCommandError> {
+        let distance_range = -WORLD_BORDER_MAX_SIZE..=WORLD_BORDER_MAX_SIZE;
+        let nonnegative_int = |arg| border_number(arg, "integer", Some(0..=i32::MAX));
+        let nonnegative_float = |arg| border_number(arg, "float", Some(0.0..=f32::MAX));
+        Ok(match args {
+            ["set", size] => Self::Set(border_number(size, "double", Some(distance_range))?, 0),
+            ["set", size, time] => Self::Set(
+                border_number(size, "double", Some(distance_range))?,
+                nonnegative_int(time)?,
+            ),
+            ["add", distance] => Self::Add(
+                border_number(distance, "double", Some(distance_range))?,
+                None,
+            ),
+            ["add", distance, time] => Self::Add(
+                border_number(distance, "double", Some(distance_range))?,
+                Some(nonnegative_int(time)?),
+            ),
+            ["center", x, z] => Self::Center(
+                border_coordinate(x, source_x)?,
+                border_coordinate(z, source_z)?,
+            ),
+            ["damage", "amount", amount] => Self::DamageAmount(nonnegative_float(amount)?),
+            ["damage", "buffer", buffer] => Self::DamageBuffer(nonnegative_float(buffer)?),
+            ["warning", "distance", distance] => Self::WarningDistance(nonnegative_int(distance)?),
+            ["warning", "time", time] => Self::WarningTime(nonnegative_int(time)?),
+            ["get"] => Self::Get,
+            _ => return Err(WorldBorderCommandError::Syntax),
+        })
+    }
+
+    /// Apply to the overworld border. Supply a source border for add in another dimension.
+    fn execute(
+        self,
+        border: &mut WorldBorderState,
+        source_border: Option<&WorldBorderState>,
+        now_ms: u64,
+    ) -> Result<WorldBorderCommandResult, WorldBorderCommandError> {
+        let (result, feedback, update) = match self {
+            Self::Set(size, seconds) => {
+                return set_border_size(border, size, now_ms, i64::from(seconds) * 1_000)
+            }
+            Self::Add(distance, seconds) => {
+                let source = source_border.unwrap_or(border);
+                let size = source.current_size(now_ms) + distance;
+                let duration = seconds.map_or(0, |seconds| {
+                    source
+                        .lerp_remaining_ms(now_ms)
+                        .wrapping_add(i64::from(seconds) * 1_000)
+                });
+                return set_border_size(border, size, now_ms, duration);
+            }
+            Self::Center(x, z) => {
+                if (x, z) == (border.center_x, border.center_z) {
+                    return Err(border_rejected("commands.worldborder.center.failed", []));
+                }
+                let limit = f64::from(WORLD_BORDER_MAX_CENTER);
+                if x.abs() > limit || z.abs() > limit {
+                    return Err(border_rejected(
+                        "commands.worldborder.set.failed.far",
+                        [format!("{limit:E}")],
+                    ));
+                }
+                border.center_x = x;
+                border.center_z = z;
+                (
+                    0,
+                    WorldBorderFeedback::new(
+                        "commands.worldborder.center.success",
+                        [border_decimal(x, 2), border_decimal(z, 2)],
+                    ),
+                    Some(WorldBorderUpdate::Center(x, z)),
+                )
+            }
+            Self::DamageAmount(value) => {
+                if border.damage_per_block == f64::from(value) {
+                    return Err(border_rejected(
+                        "commands.worldborder.damage.amount.failed",
+                        [],
+                    ));
+                }
+                border.damage_per_block = f64::from(value);
+                (
+                    value as i32,
+                    WorldBorderFeedback::new(
+                        "commands.worldborder.damage.amount.success",
+                        [border_decimal(f64::from(value), 2)],
+                    ),
+                    None,
+                )
+            }
+            Self::DamageBuffer(value) => {
+                if border.damage_safe_zone == f64::from(value) {
+                    return Err(border_rejected(
+                        "commands.worldborder.damage.buffer.failed",
+                        [],
+                    ));
+                }
+                border.damage_safe_zone = f64::from(value);
+                (
+                    value as i32,
+                    WorldBorderFeedback::new(
+                        "commands.worldborder.damage.buffer.success",
+                        [border_decimal(f64::from(value), 2)],
+                    ),
+                    None,
+                )
+            }
+            Self::WarningDistance(value) => {
+                if border.warning_blocks == value {
+                    return Err(border_rejected(
+                        "commands.worldborder.warning.distance.failed",
+                        [],
+                    ));
+                }
+                border.warning_blocks = value;
+                (
+                    value,
+                    WorldBorderFeedback::new(
+                        "commands.worldborder.warning.distance.success",
+                        [value.to_string()],
+                    ),
+                    Some(WorldBorderUpdate::WarningDistance(value)),
+                )
+            }
+            Self::WarningTime(value) => {
+                if border.warning_time_secs == value {
+                    return Err(border_rejected(
+                        "commands.worldborder.warning.time.failed",
+                        [],
+                    ));
+                }
+                border.warning_time_secs = value;
+                (
+                    value,
+                    WorldBorderFeedback::new(
+                        "commands.worldborder.warning.time.success",
+                        [value.to_string()],
+                    ),
+                    Some(WorldBorderUpdate::WarningDelay(value)),
+                )
+            }
+            Self::Get => {
+                let size = border.current_size(now_ms);
+                return Ok(WorldBorderCommandResult {
+                    result: (size + 0.5).floor() as i32,
+                    feedback: WorldBorderFeedback::new(
+                        "commands.worldborder.get",
+                        [border_decimal(size, 0)],
+                    ),
+                    broadcast_feedback: false,
+                    packet: None,
+                });
+            }
+        };
+        Ok(WorldBorderCommandResult {
+            result,
+            feedback,
+            broadcast_feedback: true,
+            packet: update.map(WorldBorderUpdate::into_packet),
+        })
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn border_rejected(
+    key: &'static str,
+    arguments: impl IntoIterator<Item = String>,
+) -> WorldBorderCommandError {
+    WorldBorderCommandError::Rejected(WorldBorderFeedback::new(key, arguments))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn set_border_size(
+    border: &mut WorldBorderState,
+    size: f64,
+    now_ms: u64,
+    duration_ms: i64,
+) -> Result<WorldBorderCommandResult, WorldBorderCommandError> {
+    let previous = border.current_size(now_ms);
+    if size == previous {
+        return Err(border_rejected(
+            "commands.worldborder.set.failed.nochange",
+            [],
+        ));
+    }
+    if size < 1.0 {
+        return Err(border_rejected("commands.worldborder.set.failed.small", []));
+    }
+    if size > WORLD_BORDER_MAX_SIZE {
+        return Err(border_rejected(
+            "commands.worldborder.set.failed.big",
+            [format!("{WORLD_BORDER_MAX_SIZE:E}")],
+        ));
+    }
+
+    border.lerp_to(size, now_ms, duration_ms);
+    let mut arguments = vec![border_decimal(size, 1)];
+    let (key, update) = if duration_ms > 0 {
+        arguments.push((duration_ms / 1_000).to_string());
+        let key = if size > previous {
+            "commands.worldborder.set.grow"
+        } else {
+            "commands.worldborder.set.shrink"
+        };
+        (
+            key,
+            WorldBorderUpdate::LerpSize {
+                from: previous,
+                to: size,
+                duration_ms,
+            },
+        )
+    } else {
+        (
+            "commands.worldborder.set.immediate",
+            WorldBorderUpdate::Size(size),
+        )
+    };
+    Ok(WorldBorderCommandResult {
+        result: (size - previous) as i32,
+        feedback: WorldBorderFeedback::new(key, arguments),
+        broadcast_feedback: true,
+        packet: Some(update.into_packet()),
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn border_number<T: std::str::FromStr + PartialOrd + std::fmt::Display>(
+    token: &str,
+    kind: &'static str,
+    range: Option<std::ops::RangeInclusive<T>>,
+) -> Result<T, WorldBorderCommandError> {
+    // Brigadier's numeric reader consumes only decimal digits, dots and minus signs.
+    let numeric_len = token
+        .bytes()
+        .take_while(|&byte| matches!(byte, b'0'..=b'9' | b'.' | b'-'))
+        .count();
+    if numeric_len == 0 {
+        return Err(WorldBorderCommandError::ExpectedNumber(kind));
+    }
+    let found = token[..numeric_len]
+        .parse::<T>()
+        .map_err(|_| WorldBorderCommandError::InvalidNumber(kind, token[..numeric_len].into()))?;
+    if let Some(range) = range {
+        if &found < range.start() {
+            return Err(WorldBorderCommandError::NumberTooLow {
+                kind,
+                minimum: range.start().to_string(),
+                found: found.to_string(),
+            });
+        }
+        if &found > range.end() {
+            return Err(WorldBorderCommandError::NumberTooHigh {
+                kind,
+                maximum: range.end().to_string(),
+                found: found.to_string(),
+            });
+        }
+    }
+    if numeric_len != token.len() {
+        return Err(WorldBorderCommandError::Syntax);
+    }
+    Ok(found)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn border_coordinate(token: &str, origin: f64) -> Result<f64, WorldBorderCommandError> {
+    if token.starts_with('^') {
+        return Err(WorldBorderCommandError::MixedCoordinates);
+    }
+    let coord = match token.strip_prefix('~') {
+        Some("") => 0.0 + origin,
+        Some(offset) => border_number::<f64>(offset, "double", None)? + origin,
+        None => {
+            let absolute = border_number::<f64>(token, "double", None)?;
+            if token.contains('.') {
+                absolute
+            } else {
+                absolute + 0.5
+            }
+        }
+    };
+    // The 2D command argument resolves world coordinates as a Vec2 of Java floats.
+    Ok(f64::from(coord as f32))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn border_decimal(value: f64, places: usize) -> String {
+    // Vanilla uses Java Formatter with a fixed precision and decimal half-up rounding.
+    let decimal = value.abs().to_string();
+    let (whole, fraction) = decimal.split_once('.').unwrap_or((&decimal, ""));
+    let mut digits = whole.as_bytes().to_vec();
+    digits.extend(fraction.bytes().chain(std::iter::repeat(b'0')).take(places));
+    if fraction
+        .as_bytes()
+        .get(places)
+        .is_some_and(|&digit| digit >= b'5')
+    {
+        if let Some(index) = digits.iter().rposition(|&digit| digit != b'9') {
+            digits[index] += 1;
+            digits[index + 1..].fill(b'0');
+        } else {
+            digits.fill(b'0');
+            digits.insert(0, b'1');
+        }
+    }
+    if places != 0 {
+        digits.insert(digits.len() - places, b'.');
+    }
+    if value.is_sign_negative() {
+        digits.insert(0, b'-');
+    }
+    String::from_utf8(digits).expect("ASCII decimal")
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -112,157 +598,6 @@ fn parse_nonnegative_mechanism_int(token: &str, field: &str) -> Result<i32, Stri
         return Err(format!("{field} must be nonnegative"));
     }
     Ok(value)
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn execute_worldborder_command(
-    state: &mut WorldBorderState,
-    args: &[&str],
-    now_tick: u64,
-) -> Result<String, String> {
-    match args {
-        ["get"] => Ok(format!(
-            "World border is {} blocks wide",
-            state.current_size(now_tick).round()
-        )),
-        [command @ ("set" | "add"), distance, time @ ..] if time.len() <= 1 => {
-            let distance = parse_mechanism_number::<f64>(distance, "distance")?;
-            let current = state.current_size(now_tick);
-            let (target, remaining) = if *command == "add" {
-                (current + distance, state.remaining_lerp_ticks(now_tick))
-            } else {
-                (distance, 0)
-            };
-            if !(1.0..=WORLD_BORDER_MAX_SIZE).contains(&target) {
-                return Err(format!(
-                    "Border size must be between 1 and {WORLD_BORDER_MAX_SIZE}"
-                ));
-            }
-            if target == current {
-                return Err("World border size is already at the requested distance".into());
-            }
-            // In 1.21.1 an explicit /worldborder add time extends the current transition.
-            let duration = if let [seconds] = time {
-                let seconds = parse_nonnegative_mechanism_int(seconds, "time")? as u64;
-                remaining.saturating_add(seconds * u64::from(TICKS_PER_SECOND))
-            } else {
-                0
-            };
-            state.lerp_to(target, now_tick, duration);
-            Ok(format!("Set world border size to {target:.1} blocks"))
-        }
-        ["center", x, z] => {
-            let center_coordinate = |token: &str| {
-                let value = parse_mechanism_number::<f64>(token, "center coordinate")?;
-                // Bare integer coordinates refer to the center of the block.
-                let coordinate = if token.contains('.') {
-                    value
-                } else {
-                    value + 0.5
-                };
-                // Vanilla's two-dimensional command position is stored as a float pair.
-                let coordinate = f64::from(coordinate as f32);
-                let limit = WORLD_BORDER_MAX_SIZE / 2.0;
-                if !(-limit..=limit).contains(&coordinate) {
-                    return Err(format!("Center coordinate must be within ±{limit}"));
-                }
-                Ok(coordinate)
-            };
-            let (x, z) = (center_coordinate(x)?, center_coordinate(z)?);
-            if (x, z) == (state.center_x, state.center_z) {
-                return Err("World border center is already at the requested position".into());
-            }
-            (state.center_x, state.center_z) = (x, z);
-            Ok(format!("Set world border center to {x:.2}, {z:.2}"))
-        }
-        ["damage", kind @ ("amount" | "buffer"), value] => {
-            let value = parse_mechanism_number::<f32>(value, kind)?;
-            if !(0.0..=f32::MAX).contains(&value) {
-                return Err(format!(
-                    "World border damage {kind} must be a finite nonnegative value"
-                ));
-            }
-            let value = f64::from(value);
-            let setting = if *kind == "amount" {
-                &mut state.damage_per_block
-            } else {
-                &mut state.damage_safe_zone
-            };
-            if *setting == value {
-                return Err(format!("World border damage {kind} is already {value}"));
-            }
-            *setting = value;
-            Ok(format!("Set world border damage {kind} to {value:.2}"))
-        }
-        ["warning", kind @ ("distance" | "time"), value] => {
-            let value = parse_nonnegative_mechanism_int(value, kind)?;
-            let setting = if *kind == "distance" {
-                &mut state.warning_blocks
-            } else {
-                &mut state.warning_time_secs
-            };
-            if *setting == value {
-                return Err(format!("World border warning {kind} is already {value}"));
-            }
-            *setting = value;
-            Ok(format!("Set world border warning {kind} to {value}"))
-        }
-        _ => Err("Usage: /worldborder get|set|add|center|damage|warning".into()),
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn encode_worldborder_initialize(state: &WorldBorderState, now_tick: u64) -> (i64, Vec<u8>) {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&state.center_x.to_be_bytes());
-    payload.extend_from_slice(&state.center_z.to_be_bytes());
-    write_worldborder_lerp(
-        &mut payload,
-        state.current_size(now_tick),
-        state.new_size,
-        state.remaining_lerp_ticks(now_tick),
-    );
-    write_varint(&mut payload, i64::from(state.absolute_max_size));
-    write_varint(&mut payload, i64::from(state.warning_blocks));
-    write_varint(&mut payload, i64::from(state.warning_time_secs));
-    (0x25, payload)
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn encode_worldborder_center(x: f64, z: f64) -> (i64, Vec<u8>) {
-    let mut payload = x.to_be_bytes().to_vec();
-    payload.extend_from_slice(&z.to_be_bytes());
-    (0x4d, payload)
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn encode_worldborder_lerp_size(
-    old_size: f64,
-    new_size: f64,
-    duration_ticks: u64,
-) -> (i64, Vec<u8>) {
-    let mut payload = Vec::new();
-    write_worldborder_lerp(&mut payload, old_size, new_size, duration_ticks);
-    (0x4e, payload)
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn write_worldborder_lerp(
-    payload: &mut Vec<u8>,
-    old_size: f64,
-    new_size: f64,
-    duration_ticks: u64,
-) {
-    payload.extend_from_slice(&old_size.to_be_bytes());
-    payload.extend_from_slice(&new_size.to_be_bytes());
-    // Nonnegative VarLong is the same encoding as the shared writer's unsigned path.
-    let millis = duration_ticks.saturating_mul(TICK_MS).min(i64::MAX as u64);
-    write_varint(payload, millis as i64);
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn encode_worldborder_size(size: f64) -> (i64, Vec<u8>) {
-    (0x4f, size.to_be_bytes().to_vec())
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -611,7 +946,7 @@ impl AdvancementTracker {
             if current != previous {
                 delta
                     .progress
-                    .push((definition.id, current.cloned().unwrap_or_default()));
+                    .push((definition, current.cloned().unwrap_or_default()));
             }
             if let Some(criteria) = current {
                 visible.insert(definition.id, criteria.clone());
@@ -712,7 +1047,7 @@ const UPDATE_ADVANCEMENTS_PACKET_ID: i64 = 0x74;
 struct AdvancementDelta {
     reset: bool,
     added: &'static [AdvancementDefinition],
-    progress: Vec<(&'static str, AdvancementCriteriaProgress)>,
+    progress: Vec<(&'static AdvancementDefinition, AdvancementCriteriaProgress)>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -738,13 +1073,24 @@ impl AdvancementDelta {
         }
         write_varint(&mut out, 0); // The built-in definition set is fixed.
         write_varint(&mut out, self.progress.len() as i64);
-        for (id, criteria) in self.progress {
-            write_str(&mut out, id);
+        for (definition, earned) in self.progress {
+            write_str(&mut out, definition.id);
+            // The progress codec writes every criterion, with an optional Instant for each.
+            let criteria: std::collections::BTreeSet<_> = definition
+                .requirements
+                .iter()
+                .copied()
+                .flatten()
+                .copied()
+                .collect();
             write_varint(&mut out, criteria.len() as i64);
-            for (criterion, time_ms) in criteria {
+            for criterion in criteria {
                 write_str(&mut out, criterion);
-                out.push(1);
-                out.extend_from_slice(&time_ms.to_be_bytes());
+                let time_ms = earned.get(criterion);
+                out.push(u8::from(time_ms.is_some()));
+                if let Some(time_ms) = time_ms {
+                    out.extend_from_slice(&time_ms.to_be_bytes());
+                }
             }
         }
         (UPDATE_ADVANCEMENTS_PACKET_ID, out)
@@ -1230,42 +1576,64 @@ fn execute_scoreboard_command(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(test), allow(dead_code))]
-enum ScoreboardObjectivePacket<'a> {
-    Create(&'a ScoreboardObjective),
-    Remove(&'a str),
-    Update(&'a ScoreboardObjective),
+enum ScoreboardNumberFormat<'a> {
+    Blank,
+    Styled(&'a [u8]), // Anonymous NBT for a Style.
+    Fixed(&'a [u8]),  // Anonymous NBT for a text component.
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn encode_scoreboard_objective(packet: ScoreboardObjectivePacket<'_>) -> (i64, Vec<u8>) {
-    let mut payload = Vec::new();
-    match packet {
-        ScoreboardObjectivePacket::Remove(name) => {
-            write_str(&mut payload, name);
-            payload.push(1);
+fn write_number_format(out: &mut Vec<u8>, format: Option<ScoreboardNumberFormat<'_>>) {
+    out.push(u8::from(format.is_some()));
+    // Number format type IDs are from the vanilla 1.21.1 registry report.
+    match format {
+        None => {}
+        Some(ScoreboardNumberFormat::Blank) => write_varint(out, 0),
+        Some(ScoreboardNumberFormat::Styled(style)) => {
+            write_varint(out, 1);
+            out.extend_from_slice(style);
         }
-        ScoreboardObjectivePacket::Create(objective)
-        | ScoreboardObjectivePacket::Update(objective) => {
-            write_str(&mut payload, &objective.name);
-            payload.push(if matches!(packet, ScoreboardObjectivePacket::Create(_)) {
-                0
-            } else {
-                2
-            });
-            payload.extend(nbt_string(&objective.display_name));
-            write_varint(&mut payload, objective.render_type as i64);
-            payload.push(0); // Optional number format is absent.
+        Some(ScoreboardNumberFormat::Fixed(component)) => {
+            write_varint(out, 2);
+            out.extend_from_slice(component);
         }
     }
-    (0x5e, payload)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+enum ScoreboardObjectivePacket<'a> {
+    Create(&'a ScoreboardObjective, Option<ScoreboardNumberFormat<'a>>),
+    Remove(&'a str),
+    Update(&'a ScoreboardObjective, Option<ScoreboardNumberFormat<'a>>),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_scoreboard_objective(packet: ScoreboardObjectivePacket<'_>) -> WorldMechanismsPacket {
+    let mut out = Vec::new();
+    let (objective, format, mode) = match packet {
+        ScoreboardObjectivePacket::Create(objective, format) => (objective, format, 0),
+        ScoreboardObjectivePacket::Update(objective, format) => (objective, format, 2),
+        ScoreboardObjectivePacket::Remove(name) => {
+            write_str(&mut out, name);
+            out.push(1);
+            return (0x5e, out);
+        }
+    };
+    write_str(&mut out, &objective.name);
+    out.push(mode);
+    out.extend_from_slice(&nbt_string(&objective.display_name));
+    write_varint(&mut out, objective.render_type as i64);
+    write_number_format(&mut out, format);
+    (0x5e, out)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn encode_scoreboard_display(
     slot: ScoreboardDisplaySlot,
     objective: Option<&str>,
-) -> (i64, Vec<u8>) {
+) -> WorldMechanismsPacket {
     (
         0x57,
         display_pkt(slot as i64, objective.unwrap_or_default()),
@@ -1274,32 +1642,33 @@ fn encode_scoreboard_display(
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn encode_scoreboard_score(
-    holder: &str,
+    owner: &str,
     objective: &str,
-    value: i32,
-    display_name: Option<&str>,
-) -> (i64, Vec<u8>) {
-    let mut payload = Vec::new();
-    write_str(&mut payload, holder);
-    write_str(&mut payload, objective);
-    write_varint(&mut payload, i64::from(value));
-    payload.push(u8::from(display_name.is_some()));
-    if let Some(name) = display_name {
-        payload.extend(nbt_string(name));
+    score: i32,
+    display: Option<&[u8]>, // Anonymous NBT for a text component.
+    format: Option<ScoreboardNumberFormat<'_>>,
+) -> WorldMechanismsPacket {
+    let mut out = Vec::new();
+    write_str(&mut out, owner);
+    write_str(&mut out, objective);
+    write_varint(&mut out, i64::from(score));
+    out.push(u8::from(display.is_some()));
+    if let Some(component) = display {
+        out.extend_from_slice(component);
     }
-    payload.push(0); // Optional number format is absent.
-    (0x61, payload)
+    write_number_format(&mut out, format);
+    (0x61, out)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn encode_scoreboard_reset(holder: &str, objective: Option<&str>) -> (i64, Vec<u8>) {
-    let mut payload = Vec::new();
-    write_str(&mut payload, holder);
-    payload.push(u8::from(objective.is_some()));
-    if let Some(objective) = objective {
-        write_str(&mut payload, objective);
+fn encode_scoreboard_reset(owner: &str, objective: Option<&str>) -> WorldMechanismsPacket {
+    let mut out = Vec::new();
+    write_str(&mut out, owner);
+    out.push(u8::from(objective.is_some()));
+    if let Some(name) = objective {
+        write_str(&mut out, name);
     }
-    (0x44, payload)
+    (0x44, out)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1767,25 +2136,358 @@ mod world_mechanisms_tests {
         assert!(parse_clone_command(&args, origin, command_block).is_err());
     }
 
+    fn run_border_command(
+        border: &mut WorldBorderState,
+        args: &[&str],
+        now_ms: u64,
+    ) -> Result<WorldBorderCommandResult, WorldBorderCommandError> {
+        WorldBorderCommand::parse(args, 0.0, 0.0)?.execute(border, None, now_ms)
+    }
+
+    #[test]
+    fn border_commands_encode_all_six_packets() {
+        let mut border = WorldBorderState {
+            absolute_max_size: 300,
+            ..WorldBorderState::default()
+        };
+        assert_eq!(
+            run_border_command(&mut border, &["center", "1", "-2.0"], 0)
+                .unwrap()
+                .packet,
+            Some((
+                0x4d,
+                vec![
+                    0x3f, 0xf8, 0, 0, 0, 0, 0, 0, // X = 1.5, centered absolute integer.
+                    0xc0, 0x00, 0, 0, 0, 0, 0, 0, // Z = -2, explicit decimal.
+                ]
+            )),
+        );
+        assert_eq!(
+            run_border_command(&mut border, &["set", "8"], 0)
+                .unwrap()
+                .packet,
+            Some((0x4f, vec![0x40, 0x20, 0, 0, 0, 0, 0, 0])), // Diameter 8.
+        );
+        assert_eq!(
+            run_border_command(&mut border, &["set", "4", "1"], 10)
+                .unwrap()
+                .packet,
+            Some((
+                0x4e,
+                vec![
+                    0x40, 0x20, 0, 0, 0, 0, 0, 0, // Old diameter 8.
+                    0x40, 0x10, 0, 0, 0, 0, 0, 0, // New diameter 4.
+                    0xe8, 0x07, // VarLong 1000 ms.
+                ]
+            )),
+        );
+        assert_eq!(
+            run_border_command(&mut border, &["warning", "time", "200"], 510)
+                .unwrap()
+                .packet,
+            Some((0x50, vec![0xc8, 0x01])), // VarInt 200 seconds.
+        );
+        assert_eq!(
+            run_border_command(&mut border, &["warning", "distance", "150"], 510)
+                .unwrap()
+                .packet,
+            Some((0x51, vec![0x96, 0x01])), // VarInt 150 blocks.
+        );
+        assert_eq!(
+            border.initialize_packet(510),
+            (
+                0x25,
+                vec![
+                    0x3f, 0xf8, 0, 0, 0, 0, 0, 0, // X = 1.5.
+                    0xc0, 0x00, 0, 0, 0, 0, 0, 0, // Z = -2.
+                    0x40, 0x18, 0, 0, 0, 0, 0, 0, // Current diameter 6.
+                    0x40, 0x10, 0, 0, 0, 0, 0, 0, // Target diameter 4.
+                    0xf4, 0x03, // Remaining time 500 ms.
+                    0xac, 0x02, // Absolute coordinate limit 300.
+                    0x96, 0x01, // Warning blocks 150.
+                    0xc8, 0x01, // Warning time 200 seconds.
+                ]
+            )
+        );
+
+        let expired = border.initialize_packet(1_011);
+        assert_eq!(
+            &expired.1[32..42],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01], // VarLong -1 ms.
+        );
+        border.finish_lerp(1_011);
+        assert_eq!(
+            border.initialize_packet(1_011),
+            (
+                0x25,
+                vec![
+                    0x3f, 0xf8, 0, 0, 0, 0, 0, 0, // X.
+                    0xc0, 0x00, 0, 0, 0, 0, 0, 0, // Z.
+                    0x40, 0x10, 0, 0, 0, 0, 0, 0, // Diameter 4.
+                    0x40, 0x10, 0, 0, 0, 0, 0, 0,    // Static target is also 4.
+                    0x00, // Border tick replaces the elapsed lerp with a static extent.
+                    0xac, 0x02, 0x96, 0x01, 0xc8, 0x01, // Unchanged limit and warnings.
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn border_commands_enforce_ranges_before_mutation() {
+        use WorldBorderCommandError::*;
+        let mut border = WorldBorderState::default();
+        let original = border;
+        for (args, error) in [
+            (
+                &["set", "59999969"][..],
+                NumberTooHigh {
+                    kind: "double",
+                    maximum: "59999968".into(),
+                    found: "59999969".into(),
+                },
+            ),
+            (
+                &["set", "-59999969"],
+                NumberTooLow {
+                    kind: "double",
+                    minimum: "-59999968".into(),
+                    found: "-59999969".into(),
+                },
+            ),
+            (
+                &["set", "0.999"],
+                border_rejected("commands.worldborder.set.failed.small", []),
+            ),
+            (
+                &["add", "1"],
+                border_rejected(
+                    "commands.worldborder.set.failed.big",
+                    ["5.9999968E7".into()],
+                ),
+            ),
+            (
+                &["set", "59999968"],
+                border_rejected("commands.worldborder.set.failed.nochange", []),
+            ),
+            (
+                &["set", "10", "-1"],
+                NumberTooLow {
+                    kind: "integer",
+                    minimum: "0".into(),
+                    found: "-1".into(),
+                },
+            ),
+            (
+                &["add", "0", "2147483648"],
+                InvalidNumber("integer", "2147483648".into()),
+            ),
+            (
+                &["warning", "distance", "-1"],
+                NumberTooLow {
+                    kind: "integer",
+                    minimum: "0".into(),
+                    found: "-1".into(),
+                },
+            ),
+            (
+                &["warning", "time", "15"],
+                border_rejected("commands.worldborder.warning.time.failed", []),
+            ),
+            (
+                &["damage", "buffer", "-0.5"],
+                NumberTooLow {
+                    kind: "float",
+                    minimum: "0".into(),
+                    found: "-0.5".into(),
+                },
+            ),
+            (&["damage", "amount", "NaN"], ExpectedNumber("float")),
+            (&["set", "1e3"], Syntax),
+            (
+                &["center", "29999986", "0"],
+                border_rejected(
+                    "commands.worldborder.set.failed.far",
+                    ["2.9999984E7".into()],
+                ),
+            ),
+            (&["center", "^1", "~"], MixedCoordinates),
+            (
+                &["center", "~", "~"],
+                border_rejected("commands.worldborder.center.failed", []),
+            ),
+            (&["get", "extra"], Syntax),
+        ] {
+            assert_eq!(
+                run_border_command(&mut border, args, 0),
+                Err(error),
+                "{args:?}"
+            );
+            assert_eq!(border, original, "{args:?}");
+        }
+        assert_eq!(
+            run_border_command(&mut border, &["set", "1"], 0)
+                .unwrap()
+                .result,
+            -59_999_967,
+        );
+        assert_eq!(border.current_size(0), 1.0);
+        assert_eq!(
+            run_border_command(&mut border, &["set", "59999968", "2147483647"], 0)
+                .unwrap()
+                .packet
+                .unwrap()
+                .1[16..],
+            [0x98, 0xf8, 0xff, 0xff, 0xbf, 0x3e], // 2,147,483,647,000 ms as a six-byte VarLong.
+        );
+        assert_eq!(border.lerp_remaining_ms(0), 2_147_483_647_000);
+    }
+
+    #[test]
+    fn border_commands_restart_lerp_and_extend_time_only_for_timed_add() {
+        let mut border = WorldBorderState::default();
+        border.lerp_to(100.0, 0, 0);
+        let shrink = run_border_command(&mut border, &["set", "20", "2"], 1_000).unwrap();
+        assert_eq!(shrink.result, -80);
+        assert_eq!(
+            shrink.feedback,
+            WorldBorderFeedback::new(
+                "commands.worldborder.set.shrink",
+                ["20.0".into(), "2".into()]
+            )
+        );
+        assert!(shrink.broadcast_feedback);
+        assert_eq!(border.current_size(1_500), 80.0);
+
+        let grow = run_border_command(&mut border, &["add", "20", "3"], 1_500).unwrap();
+        assert_eq!(grow.result, 20);
+        assert_eq!(
+            grow.feedback,
+            WorldBorderFeedback::new(
+                "commands.worldborder.set.grow",
+                ["100.0".into(), "4".into()]
+            )
+        );
+        assert_eq!(border.lerp_remaining_ms(1_500), 4_500);
+        assert_eq!(border.current_size(3_750), 90.0);
+        let immediate = run_border_command(&mut border, &["add", "10"], 3_750).unwrap();
+        assert_eq!(immediate.feedback.key, "commands.worldborder.set.immediate");
+        assert_eq!(immediate.result, 10);
+        assert_eq!(border.lerp_remaining_ms(3_750), 0);
+        assert_eq!(border.current_size(3_750), 100.0);
+
+        // The size and remaining duration for add come from the source dimension.
+        let mut source = WorldBorderState::default();
+        source.lerp_to(50.0, 0, 0);
+        source.lerp_to(30.0, 4_000, 2_000);
+        let add = WorldBorderCommand::parse(&["add", "5", "0"], 0.0, 0.0).unwrap();
+        assert_eq!(
+            add.execute(&mut border, Some(&source), 5_000)
+                .unwrap()
+                .result,
+            -55
+        );
+        assert_eq!(border.lerp_remaining_ms(5_000), 1_000);
+        assert_eq!(border.current_size(5_500), 72.5);
+        assert_eq!(border.current_size(6_000), 45.0);
+    }
+
+    #[test]
+    fn border_commands_return_vanilla_feedback_and_server_only_damage_changes() {
+        let mut border = WorldBorderState::default();
+        let center = WorldBorderCommand::parse(&["center", "~0.125", "~-0.125"], 0.0, 0.0).unwrap();
+        let centered = center.execute(&mut border, None, 0).unwrap();
+        assert_eq!(centered.result, 0);
+        assert_eq!(
+            centered.feedback,
+            WorldBorderFeedback::new(
+                "commands.worldborder.center.success",
+                ["0.13".into(), "-0.13".into()]
+            )
+        );
+
+        let set = run_border_command(&mut border, &["set", "2.25"], 0).unwrap();
+        assert_eq!(set.feedback.arguments, ["2.3"]);
+        assert_eq!(set.result, -59_999_965);
+        run_border_command(&mut border, &["set", "2.5"], 0).unwrap();
+        let get = run_border_command(&mut border, &["get"], 0).unwrap();
+        assert_eq!(
+            get,
+            WorldBorderCommandResult {
+                result: 3,
+                feedback: WorldBorderFeedback::new("commands.worldborder.get", ["3".into()]),
+                broadcast_feedback: false,
+                packet: None,
+            }
+        );
+
+        let amount = run_border_command(&mut border, &["damage", "amount", "0.2"], 0).unwrap();
+        // The default is double 0.2, while commands widen float 0.2 to double.
+        assert_eq!(border.damage_per_block, f64::from(0.2f32));
+        assert_eq!(
+            amount.feedback,
+            WorldBorderFeedback::new(
+                "commands.worldborder.damage.amount.success",
+                ["0.20".into()]
+            )
+        );
+        assert!(amount.broadcast_feedback);
+        assert_eq!(amount.packet, None);
+        assert_eq!(
+            run_border_command(&mut border, &["damage", "amount", "0.2"], 0),
+            Err(border_rejected(
+                "commands.worldborder.damage.amount.failed",
+                []
+            )),
+        );
+        let buffer = run_border_command(&mut border, &["damage", "buffer", "2.125"], 0).unwrap();
+        assert_eq!(border.damage_safe_zone, 2.125);
+        assert_eq!(buffer.result, 2);
+        assert_eq!(
+            buffer.feedback,
+            WorldBorderFeedback::new(
+                "commands.worldborder.damage.buffer.success",
+                ["2.13".into()]
+            )
+        );
+        assert_eq!(buffer.packet, None);
+        let time = run_border_command(&mut border, &["warning", "time", "0"], 0).unwrap();
+        assert_eq!(
+            time.feedback,
+            WorldBorderFeedback::new("commands.worldborder.warning.time.success", ["0".into()])
+        );
+        let distance = run_border_command(&mut border, &["warning", "distance", "0"], 0).unwrap();
+        assert_eq!(
+            distance.feedback,
+            WorldBorderFeedback::new(
+                "commands.worldborder.warning.distance.success",
+                ["0".into()]
+            )
+        );
+    }
+
     #[test]
     fn worldborder_command_updates_size_center_damage_and_warnings() {
         let mut border = WorldBorderState::default();
-        execute_worldborder_command(&mut border, &["set", "100"], 0).unwrap();
+        run_border_command(&mut border, &["set", "100"], 0).unwrap();
         assert_eq!(border.current_size(0), 100.0);
-        execute_worldborder_command(&mut border, &["set", "60", "2"], 10).unwrap();
+        run_border_command(&mut border, &["set", "60", "2"], 500).unwrap();
         assert_eq!(
-            execute_worldborder_command(&mut border, &["get"], 30).unwrap(),
-            "World border is 80 blocks wide"
+            run_border_command(&mut border, &["get"], 1_500)
+                .unwrap()
+                .result,
+            80
         );
-        execute_worldborder_command(&mut border, &["add", "-20", "3"], 30).unwrap();
-        assert_eq!(border.lerp_duration_ticks, 80);
-        assert_eq!(border.current_size(70), 70.0);
-        execute_worldborder_command(&mut border, &["add", "4.5"], 70).unwrap();
-        assert_eq!(border.lerp_duration_ticks, 0);
-        assert_eq!(border.current_size(70), 74.5);
+        run_border_command(&mut border, &["add", "-20", "3"], 1_500).unwrap();
+        assert_eq!(border.lerp_duration_ms, 4_000);
+        assert_eq!(border.current_size(3_500), 70.0);
+        run_border_command(&mut border, &["add", "4.5"], 3_500).unwrap();
+        assert_eq!(border.lerp_duration_ms, 0);
+        assert_eq!(border.current_size(3_500), 74.5);
         assert_eq!(
-            execute_worldborder_command(&mut border, &["get"], 70).unwrap(),
-            "World border is 75 blocks wide"
+            run_border_command(&mut border, &["get"], 3_500)
+                .unwrap()
+                .result,
+            75
         );
         for args in [
             &["center", "10", "-4.25"][..],
@@ -1794,7 +2496,7 @@ mod world_mechanisms_tests {
             &["warning", "distance", "12"][..],
             &["warning", "time", "25"][..],
         ] {
-            execute_worldborder_command(&mut border, args, 70).unwrap();
+            run_border_command(&mut border, args, 3_500).unwrap();
         }
         assert_eq!((border.center_x, border.center_z), (10.5, -4.25));
         assert_eq!(border.damage_per_block, 1.5);
@@ -1823,7 +2525,7 @@ mod world_mechanisms_tests {
             &["get", "extra"][..],
         ] {
             assert!(
-                execute_worldborder_command(&mut border, args, 0).is_err(),
+                run_border_command(&mut border, args, 0).is_err(),
                 "{args:?}"
             );
             assert_eq!(border, original);
@@ -2026,12 +2728,12 @@ mod world_mechanisms_tests {
         assert_eq!(border.warning_time_secs, 15);
         border.lerp_to(100.0, 0, 0);
         border.lerp_to(20.0, 10, 20);
-        for (tick, expected) in [(0, 100.0), (10, 100.0), (20, 60.0), (30, 20.0), (40, 20.0)] {
-            assert_eq!(border.current_size(tick), expected);
+        for (now_ms, expected) in [(0, 100.0), (10, 100.0), (20, 60.0), (30, 20.0), (40, 20.0)] {
+            assert_eq!(border.current_size(now_ms), expected);
         }
         border.lerp_to(100.0, 30, 20);
-        for (tick, expected) in [(30, 20.0), (40, 60.0), (50, 100.0)] {
-            assert_eq!(border.current_size(tick), expected);
+        for (now_ms, expected) in [(30, 20.0), (40, 60.0), (50, 100.0)] {
+            assert_eq!(border.current_size(now_ms), expected);
         }
         border.lerp_to(0.0, 40, 10);
         assert_eq!(border.current_size(40), 60.0);
@@ -2171,7 +2873,7 @@ mod world_mechanisms_tests {
         assert!(revoked
             .progress
             .iter()
-            .any(|(id, c)| *id == END && c.is_empty()));
+            .any(|(definition, c)| definition.id == END && c.is_empty()));
         assert!(tracker.take_delta("Steve", false).is_none());
 
         assert!(tracker.grant_criterion("Alex", IRON, "iron", 15));
@@ -2180,7 +2882,7 @@ mod world_mechanisms_tests {
         assert!(restored
             .progress
             .iter()
-            .any(|(id, c)| *id == END && c.get("entered_end") == Some(&10)));
+            .any(|(definition, c)| definition.id == END && c.get("entered_end") == Some(&10)));
         assert!(tracker.grant_everything("Steve", 16) > 0);
         for definition in CORE_ADVANCEMENTS {
             assert!(
@@ -2245,9 +2947,9 @@ mod world_mechanisms_tests {
             ..WorldBorderState::default()
         };
         border.lerp_to(100.0, 0, 0);
-        border.lerp_to(180.0, 10, 20);
-        for (tick, expected) in [(20, (140.0, 180.0, 500)), (30, (180.0, 180.0, 0))] {
-            let (id, payload) = encode_worldborder_initialize(&border, tick);
+        border.lerp_to(180.0, 500, 1_000);
+        for (now_ms, expected) in [(1_000, (140.0, 180.0, 500)), (1_500, (180.0, 180.0, 0))] {
+            let (id, payload) = border.initialize_packet(now_ms);
             assert_eq!(id, 0x25);
             let mut packet = payload.as_slice();
             assert_eq!(read_packet_double(&mut packet), -15.5);
@@ -2259,20 +2961,25 @@ mod world_mechanisms_tests {
             assert!(packet.is_empty());
         }
 
-        let (id, payload) = encode_worldborder_center(-15.5, 33.25);
+        let (id, payload) = WorldBorderUpdate::Center(-15.5, 33.25).into_packet();
         assert_eq!(id, 0x4d);
         let mut packet = payload.as_slice();
         assert_eq!(read_packet_double(&mut packet), -15.5);
         assert_eq!(read_packet_double(&mut packet), 33.25);
         assert!(packet.is_empty());
 
-        let (id, payload) = encode_worldborder_size(1.5);
+        let (id, payload) = WorldBorderUpdate::Size(1.5).into_packet();
         assert_eq!(id, 0x4f);
         let mut packet = payload.as_slice();
         assert_eq!(read_packet_double(&mut packet), 1.5);
         assert!(packet.is_empty());
 
-        let (id, payload) = encode_worldborder_lerp_size(100.0, 29.5, 1_000_000_000);
+        let (id, payload) = WorldBorderUpdate::LerpSize {
+            from: 100.0,
+            to: 29.5,
+            duration_ms: 50_000_000_000,
+        }
+        .into_packet();
         assert_eq!(id, 0x4e);
         let mut packet = payload.as_slice();
         assert_eq!(read_packet_lerp(&mut packet), (100.0, 29.5, 50_000_000_000));
@@ -2281,13 +2988,93 @@ mod world_mechanisms_tests {
     }
 
     #[test]
+    fn scoreboard_objective_packets_encode_display_modes_and_number_formats() {
+        let objective = ScoreboardObjective {
+            name: "o".into(),
+            criteria: ScoreboardCriteria::Health,
+            display_name: "HP".into(),
+            render_type: ScoreboardRenderType::Hearts,
+        };
+        assert_eq!(
+            encode_scoreboard_display(ScoreboardDisplaySlot::Sidebar, Some("o")),
+            (0x57, b"\x01\x01o".to_vec()), // Sidebar enum, objective name.
+        );
+        assert_eq!(
+            encode_scoreboard_display(ScoreboardDisplaySlot::BelowName, None),
+            (0x57, vec![2, 0]), // Below-name enum, empty string clears the slot.
+        );
+        assert_eq!(
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Create(&objective, None)),
+            (0x5e, b"\x01o\x00\x08\x00\x02HP\x01\x00".to_vec()), // Name, create, TAG_String, hearts, absent format.
+        );
+        assert_eq!(
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Update(
+                &objective,
+                Some(ScoreboardNumberFormat::Blank)
+            )),
+            (0x5e, b"\x01o\x02\x08\x00\x02HP\x01\x01\x00".to_vec()), // Change, hearts, present blank format ID 0.
+        );
+        let bold_style = b"\x0a\x01\x00\x04bold\x01\x00";
+        assert_eq!(
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Update(
+                &objective,
+                Some(ScoreboardNumberFormat::Styled(bold_style))
+            )),
+            (
+                0x5e,
+                b"\x01o\x02\x08\x00\x02HP\x01\x01\x01\x0a\x01\x00\x04bold\x01\x00".to_vec()
+            ), // Present styled ID 1, compound {bold:1b}.
+        );
+        assert_eq!(
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Remove("o")),
+            (0x5e, b"\x01o\x01".to_vec()), // Removal has only name and mode.
+        );
+    }
+
+    #[test]
+    fn scoreboard_score_packets_encode_optional_components_and_objectives() {
+        assert_eq!(
+            encode_scoreboard_score("P", "o", -1, None, None),
+            (0x61, b"\x01P\x01o\xff\xff\xff\xff\x0f\x00\x00".to_vec()), // Owner, objective, signed VarInt -1, both options absent.
+        );
+        let display = nbt_string("P2");
+        let fixed = nbt_string("X");
+        assert_eq!(
+            encode_scoreboard_score(
+                "P",
+                "o",
+                130,
+                Some(&display),
+                Some(ScoreboardNumberFormat::Fixed(&fixed))
+            ),
+            (
+                0x61,
+                [
+                    &b"\x01P\x01o\x82\x01"[..], // Owner, objective, VarInt 130.
+                    b"\x01\x08\x00\x02P2",      // Present display name, TAG_String "P2".
+                    b"\x01\x02\x08\x00\x01X",   // Present fixed format ID 2, TAG_String "X".
+                ]
+                .concat()
+            ),
+        );
+        assert_eq!(
+            encode_scoreboard_reset("P", Some("o")),
+            (0x44, b"\x01P\x01\x01o".to_vec()), // Owner, present objective name.
+        );
+        assert_eq!(
+            encode_scoreboard_reset("P", None),
+            (0x44, b"\x01P\x00".to_vec()), // Owner, absent objective resets every score.
+        );
+    }
+
+    #[test]
     fn scoreboard_objective_and_display_packets_round_trip_protocol_767_payloads() {
         let mut objective = objective("life", ScoreboardCriteria::Health);
         objective.display_name = "Vie ❤️".to_owned();
         for (mode, packet) in [
-            (0, ScoreboardObjectivePacket::Create(&objective)),
+            (0, ScoreboardObjectivePacket::Create(&objective, None)),
             (1, ScoreboardObjectivePacket::Remove(&objective.name)),
-            (2, ScoreboardObjectivePacket::Update(&objective)),
+            (2, ScoreboardObjectivePacket::Update(&objective, None)),
         ] {
             let (id, payload) = encode_scoreboard_objective(packet);
             assert_eq!(id, 0x5e);
@@ -2321,7 +3108,9 @@ mod world_mechanisms_tests {
     #[test]
     fn scoreboard_score_and_reset_packets_round_trip_protocol_767_payloads() {
         for (value, display_name) in [(-1, None), (i32::MIN, Some("🔔")), (130, Some(""))] {
-            let (id, payload) = encode_scoreboard_score("Alex", "life", value, display_name);
+            let display = display_name.map(nbt_string);
+            let (id, payload) =
+                encode_scoreboard_score("Alex", "life", value, display.as_deref(), None);
             assert_eq!(id, 0x61);
             let mut packet = payload.as_slice();
             assert_eq!(read_packet_string(&mut packet), "Alex");
@@ -2406,7 +3195,51 @@ mod world_mechanisms_tests {
         assert_eq!(&revoke[..4], &[0, 0, 0, 1]);
         let mut packet = &revoke[4..];
         assert_eq!(read_packet_string(&mut packet), ROOT);
-        assert_eq!(packet, &[0]);
+        assert_eq!(read_varint(&mut packet), Some(1));
+        assert_eq!(read_packet_string(&mut packet), "crafting_table");
+        assert_eq!(packet, &[0]); // Criterion present, timestamp absent.
+    }
+
+    #[test]
+    fn advancements_encode_partial_progress_and_revocation_byte_for_byte() {
+        const DEFINITIONS: &[AdvancementDefinition] = &[AdvancementDefinition {
+            id: "test:root",
+            parent: None,
+            requirements: &[&["a", "b"], &["b", "c"]],
+        }];
+        let mut tracker = AdvancementTracker {
+            definitions: DEFINITIONS,
+            ..AdvancementTracker::default()
+        };
+        assert!(tracker.grant_criterion("Alex", "test:root", "a", 0x01_02_03_04_05_06_07_08));
+        assert_eq!(
+            tracker.take_delta("Alex", true).unwrap().into_packet(),
+            (
+                0x74,
+                [
+                    &b"\x01\x01"[..],                             // Reset, one added advancement.
+                    b"\x09test:root\x00\x00",                     // ID, no parent or display.
+                    b"\x02\x02\x01a\x01b\x02\x01b\x01c\x01",      // Requirement groups, telemetry.
+                    b"\x00\x01\x09test:root\x03", // No removals, one progress entry, three distinct criteria.
+                    b"\x01a\x01\x01\x02\x03\x04\x05\x06\x07\x08", // Earned, epoch milliseconds as a Long.
+                    b"\x01b\x00\x01c\x00",                        // Unobtained criteria.
+                ]
+                .concat()
+            ),
+        );
+
+        assert!(tracker.revoke_criterion("Alex", "test:root", "a"));
+        assert_eq!(
+            tracker.take_delta("Alex", false).unwrap().into_packet(),
+            (
+                0x74,
+                [
+                    &b"\x00\x00\x00\x01\x09test:root\x03"[..], // Delta, no definition changes, three criteria.
+                    b"\x01a\x00\x01b\x00\x01c\x00",            // All unobtained.
+                ]
+                .concat()
+            ),
+        );
     }
 
     fn objective(name: &str, criteria: ScoreboardCriteria) -> ScoreboardObjective {
