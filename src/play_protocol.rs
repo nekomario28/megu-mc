@@ -75,9 +75,18 @@ fn read_before(s: &mut TcpStream, mut out: &mut [u8], deadline: Instant) -> Opti
     Some(())
 }
 fn read_packet(s: &mut TcpStream, deadline: Instant) -> Option<(i64, Vec<u8>)> {
+    read_login_frame(s, deadline, None)
+}
+
+fn read_login_frame(
+    s: &mut TcpStream,
+    deadline: Instant,
+    compression: Option<usize>,
+) -> Option<(i64, Vec<u8>)> {
+    const MAX_LOGIN_FRAME: usize = 64 * 1024;
     let mut len = 0u64;
     let mut done = false;
-    for i in 0..5 {
+    for i in 0..3 {
         let mut b = [0u8; 1];
         read_before(s, &mut b, deadline)?;
         len |= ((b[0] & 0x7f) as u64) << (7 * i);
@@ -87,21 +96,36 @@ fn read_packet(s: &mut TcpStream, deadline: Instant) -> Option<(i64, Vec<u8>)> {
         }
     }
     // Pre-play packets are small; reject large declared allocations.
-    if !done || len == 0 || len > 64 * 1024 {
+    if !done || len == 0 || len > MAX_LOGIN_FRAME as u64 {
         let _ = s.shutdown(std::net::Shutdown::Both);
         return None;
     }
     let mut body = vec![0u8; len as usize];
     read_before(s, &mut body, deadline)?;
-    let mut sl = &body[..];
-    let id = read_varint(&mut sl)?;
-    Some((id, sl.to_vec()))
+    decode_packet(body, compression, MAX_LOGIN_FRAME)
+}
+
+fn decode_packet(
+    body: Vec<u8>,
+    compression: Option<usize>,
+    max_size: usize,
+) -> Option<(i64, Vec<u8>)> {
+    let body = match compression {
+        Some(threshold) => {
+            connection_limits::decode_compressed_frame(&body, threshold, max_size).ok()?
+        }
+        None => body,
+    };
+    let mut payload = body.as_slice();
+    let id = read_protocol_i32(&mut payload)?;
+    (id >= 0).then(|| (i64::from(id), payload.to_vec()))
 }
 // Buffered frame reader for the consume loop: a mid-frame timeout must NOT
 // drop already-read bytes. Dropped length bytes desync the stream -> garbage
 // length fields -> repeated <=16MiB allocs -> allocator arena churn -> the OOM.
 struct RxBuf {
     buf: std::collections::VecDeque<u8>,
+    compression: Option<usize>,
 }
 enum RxOut {
     Closed,
@@ -109,9 +133,10 @@ enum RxOut {
     Frame(i64, Vec<u8>),
 }
 impl RxBuf {
-    fn new() -> Self {
+    fn new(compression: Option<usize>) -> Self {
         RxBuf {
             buf: std::collections::VecDeque::new(),
+            compression,
         }
     }
     fn try_frame(&mut self) -> Option<Option<RxOut>> {
@@ -128,13 +153,13 @@ impl RxBuf {
             if b & 0x80 == 0 {
                 break;
             }
-            if i > 5 {
+            if i == 3 {
                 return None;
             }
         }
         // vanilla's Varint21FrameDecoder bound: a three-byte length prefix cannot
         // describe more, so a larger frame is not something a 1.21.1 client sends.
-        if len < 0 || len as usize > ingress_guard::MAX_PLAY_FRAME {
+        if len == 0 || len as usize > ingress_guard::MAX_PLAY_FRAME {
             return None;
         }
         let total = i + len as usize;
@@ -149,11 +174,8 @@ impl RxBuf {
             .copied()
             .collect();
         self.buf.drain(..total);
-        let mut sl = &body[..];
-        match read_varint(&mut sl) {
-            Some(id) => Some(Some(RxOut::Frame(id, sl.to_vec()))),
-            None => Some(Some(RxOut::Idle)),
-        }
+        let (id, payload) = decode_packet(body, self.compression, ingress_guard::MAX_PLAY_FRAME)?;
+        Some(Some(RxOut::Frame(id, payload)))
     }
     fn next(&mut self, s: &mut TcpStream) -> RxOut {
         match self.try_frame() {
@@ -181,20 +203,217 @@ impl RxBuf {
         }
     }
 }
-fn send_packet(s: &mut TcpStream, id: i64, payload: Vec<u8>) -> std::io::Result<()> {
+#[cfg(unix)]
+fn socket_key(socket: &TcpStream) -> u64 {
+    use std::os::fd::AsRawFd;
+    socket.as_raw_fd() as u64
+}
+
+#[cfg(windows)]
+fn socket_key(socket: &TcpStream) -> u64 {
+    use std::os::windows::io::AsRawSocket;
+    socket.as_raw_socket() as u64
+}
+
+#[derive(Default)]
+struct SocketWireState {
+    compression: Option<usize>,
+    play: Option<PlayWireState>,
+}
+
+#[derive(Default)]
+struct PlayWireState {
+    poses: HashMap<i32, EntityWirePose>,
+    window: Option<ChunkWindow>,
+}
+
+#[derive(Clone, Copy)]
+struct EntityWirePose {
+    pos: [f64; 3],
+    yaw: u8,
+    pitch: u8,
+    on_ground: Option<bool>,
+}
+
+impl EntityWirePose {
+    fn read(payload: &[u8], spawn: bool) -> Option<Self> {
+        let mut fields = payload;
+        if spawn {
+            fields = fields.get(16..)?; // UUID
+            read_protocol_i32(&mut fields)?; // entity type
+        }
+        let pos = [
+            f64::from_be_bytes(fields.get(..8)?.try_into().ok()?),
+            f64::from_be_bytes(fields.get(8..16)?.try_into().ok()?),
+            f64::from_be_bytes(fields.get(16..24)?.try_into().ok()?),
+        ];
+        let [a, b, tail] = fields.get(24..27)?.try_into().ok()?;
+        let (yaw, pitch, on_ground) = if spawn {
+            (b, a, None)
+        } else {
+            (a, b, Some(tail != 0))
+        };
+        Some(Self {
+            pos,
+            yaw,
+            pitch,
+            on_ground,
+        })
+    }
+
+    fn relative_packet(self, eid: i32, next: Self) -> Option<(i64, Vec<u8>)> {
+        let delta = connection_limits::relative_move_delta(self.pos, next.pos)?;
+        let rotation = (next.yaw, next.pitch);
+        let rotated = (self.yaw, self.pitch) != rotation;
+        let grounded = next.on_ground?;
+        if delta == [0; 3] && rotated {
+            Some((
+                0x30,
+                connection_limits::entity_rotation(eid, next.yaw, next.pitch, grounded),
+            ))
+        } else {
+            Some((
+                if rotated { 0x2f } else { 0x2e },
+                connection_limits::entity_relative_move(
+                    eid,
+                    delta,
+                    rotated.then_some(rotation),
+                    grounded,
+                ),
+            ))
+        }
+    }
+}
+
+impl PlayWireState {
+    fn remember_spawn(&mut self, mut payload: &[u8]) {
+        let Some(eid) = read_protocol_i32(&mut payload) else {
+            return;
+        };
+        if let Some(pose) = EntityWirePose::read(payload, true) {
+            self.poses.insert(eid, pose);
+        }
+    }
+
+    fn update_packet(&mut self, id: &mut i64, payload: &mut Vec<u8>) {
+        let mut fields = payload.as_slice();
+        match *id {
+            0x70 => {
+                let Some(eid) = read_protocol_i32(&mut fields) else {
+                    return;
+                };
+                let Some(previous) = self.poses.get_mut(&eid) else {
+                    return;
+                };
+                let Some(next) = EntityWirePose::read(fields, false) else {
+                    return;
+                };
+                if let Some(packet) = previous.relative_packet(eid, next) {
+                    (*id, *payload) = packet;
+                }
+                *previous = next;
+            }
+            0x42 => {
+                let Some(count) = read_protocol_i32(&mut fields) else {
+                    return;
+                };
+                for _ in 0..count {
+                    let Some(eid) = read_protocol_i32(&mut fields) else {
+                        return;
+                    };
+                    self.poses.remove(&eid);
+                }
+            }
+            0x47 => {
+                self.poses.clear();
+                self.window = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+// Existing packet producers share TcpStream, including the cloned Play writer.
+// Store framing against each owned handle until its owner drops, before the OS
+// can reuse the handle. The registry lock is released before compression or I/O.
+static SOCKET_WIRE: OnceLock<Mutex<HashMap<u64, SocketWireState>>> = OnceLock::new();
+
+fn socket_wire() -> &'static Mutex<HashMap<u64, SocketWireState>> {
+    SOCKET_WIRE.get_or_init(Mutex::default)
+}
+
+fn with_play_wire<T>(socket: &TcpStream, f: impl FnOnce(&mut PlayWireState) -> T) -> Option<T> {
+    let mut states = SOCKET_WIRE.get()?.lock().unwrap();
+    states.get_mut(&socket_key(socket))?.play.as_mut().map(f)
+}
+
+fn unregister_socket_wire(key: u64) {
+    if let Some(states) = SOCKET_WIRE.get() {
+        states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+    }
+}
+
+struct LoginCompression(u64);
+
+impl std::ops::Drop for LoginCompression {
+    fn drop(&mut self) {
+        unregister_socket_wire(self.0);
+    }
+}
+
+fn negotiate_compression(
+    s: &mut TcpStream,
+    threshold: i32,
+) -> std::io::Result<Option<LoginCompression>> {
+    let Ok(size) = usize::try_from(threshold) else {
+        return Ok(None);
+    };
+    send_packet(s, 0x03, connection_limits::set_compression(threshold))?;
+    let key = socket_key(s);
+    socket_wire().lock().unwrap().insert(
+        key,
+        SocketWireState {
+            compression: Some(size),
+            play: None,
+        },
+    );
+    Ok(Some(LoginCompression(key)))
+}
+
+fn send_packet(s: &mut TcpStream, mut id: i64, mut payload: Vec<u8>) -> std::io::Result<()> {
+    let compression = SOCKET_WIRE.get().and_then(|states| {
+        let mut states = states.lock().unwrap();
+        let state = states.get_mut(&socket_key(s))?;
+        if let Some(play) = &mut state.play {
+            play.update_packet(&mut id, &mut payload);
+        }
+        state.compression
+    });
     let mut body = Vec::new();
     write_varint(&mut body, id);
     body.extend_from_slice(&payload);
-    let mut out = Vec::new();
-    write_varint(&mut out, body.len() as i64);
-    out.extend_from_slice(&body);
-    s.write_all(&out)
+    write_frame(s, &body, compression)
 }
-fn send_raw(s: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
-    let mut out = Vec::new();
-    write_varint(&mut out, body.len() as i64);
-    out.extend_from_slice(body);
-    s.write_all(&out)
+
+fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> std::io::Result<()> {
+    let frame = match compression {
+        Some(threshold) => connection_limits::encode_compressed_frame(body, threshold),
+        None => {
+            let mut frame = Vec::new();
+            write_varint(&mut frame, body.len() as i64);
+            frame.extend_from_slice(body);
+            frame
+        }
+    };
+    let result = s.write_all(&frame);
+    if result.is_err() {
+        // A partial write invalidates both the frame boundary and entity baselines.
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+    result
 }
 
 struct Client {
@@ -273,6 +492,20 @@ struct Client {
 }
 
 impl Client {
+    fn enter_play_wire(&self, compression: Option<usize>, window: ChunkWindow) {
+        let key = socket_key(&self.sock.lock().unwrap());
+        socket_wire().lock().unwrap().insert(
+            key,
+            SocketWireState {
+                compression,
+                play: Some(PlayWireState {
+                    window: Some(window),
+                    ..PlayWireState::default()
+                }),
+            },
+        );
+    }
+
     fn is_spectator(&self) -> bool {
         *self.gm.lock().unwrap() == 3
     }
@@ -281,6 +514,13 @@ impl Client {
         let sneaking = *self.sneaking.lock().unwrap();
         let fall_fly = *self.fall_fly.lock().unwrap();
         player_touch_aabb(px, py, pz, sneaking, fall_fly)
+    }
+}
+
+impl std::ops::Drop for Client {
+    fn drop(&mut self) {
+        let socket = self.sock.get_mut().unwrap_or_else(|e| e.into_inner());
+        unregister_socket_wire(socket_key(socket));
     }
 }
 static CLIENTS: OnceLock<Mutex<Vec<Arc<Client>>>> = OnceLock::new();
@@ -514,10 +754,7 @@ fn entity_teleport(eid: i32, x: f64, y: f64, z: f64, yaw: f32, pitch: f32, g: bo
     p
 }
 fn head_rot(eid: i32, yaw: f32) -> Vec<u8> {
-    let mut p = Vec::new();
-    write_varint(&mut p, eid as i64);
-    p.push(angle(yaw) as u8);
-    p
+    connection_limits::entity_head_rotation(eid, angle(yaw) as u8)
 }
 // LOCK ORDER: acquires clients() internally — the caller must NOT
 // hold clients().lock() (self-deadlock). Per-client field locks are
@@ -550,14 +787,7 @@ where
         }
         let pl = mk(c);
         if let Ok(mut w) = c.sock.lock() {
-            if send_packet(&mut w, pl.0, pl.1).is_err() {
-                // A write that timed out or failed leaves the stream at an unknown
-                // frame boundary and the client behind; it is not coming back. Shut
-                // the socket so its own thread sees the close and logs it out, and
-                // so every later broadcast fails at once instead of waiting out the
-                // write timeout again (each one stalled the tick thread).
-                let _ = w.shutdown(std::net::Shutdown::Both);
-            }
+            let _ = send_packet(&mut w, pl.0, pl.1);
         }
     }
 }
@@ -568,94 +798,159 @@ fn broadcast<F: Fn(&Client) -> (i64, Vec<u8>)>(me_eid: i32, mk: F) {
 fn broadcast_in<F: Fn(&Client) -> (i64, Vec<u8>)>(audience: &[Arc<Client>], me_eid: i32, mk: F) {
     fanout_in(audience, |c| c.eid != me_eid, mk)
 }
-// distance-gated broadcast: only clients within VIS_R2 of (x,y,z) get the
-// packet — "don't send what isn't visible" (bandwidth + anti-ESP)
-// entity interest radius must stay inside the streamed chunk window
-// (+-4 chunks ~ 72..80b); spawning an entity in an unloaded chunk is a
-// protocol violation vanilla never emits.
-const VIS_R2: f64 = 80.0 * 80.0;
+struct TrackedSpawn {
+    dim: DimId,
+    range: u32,
+    job: SpawnJob,
+}
 
-// entity interest management (vanilla EntityTracker analogue):
-// clients only know entities within VIS_R2 — spawn on approach,
-// destroy on leave, prune dead. Server never streams far entities.
+fn entity_tracking_range(etype: i64) -> u32 {
+    static RANGES: OnceLock<Vec<u32>> = OnceLock::new();
+    let ranges = RANGES.get_or_init(|| {
+        ENTITY_REGISTRY_1211
+            .iter()
+            .map(|spec| client_tracking_range_chunks(spec.name))
+            .collect()
+    });
+    usize::try_from(etype)
+        .ok()
+        .and_then(|id| ranges.get(id))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn entity_in_tracking_range(player: (f64, f64), target: (f64, f64), range: u32, view: i32) -> bool {
+    let distance = f64::from(range.min(view as u32)) * 16.0;
+    let dx = player.0 - target.0;
+    let dz = player.1 - target.1;
+    range > 0 && dx * dx + dz * dz <= distance * distance
+}
+
 fn interest_tick() {
     let cls = client_snapshot();
     if cls.is_empty() {
         return;
     }
-    // spawn payloads are built lazily on the visible-transition only —
-    // steady-state cost is one distance check per entity per client.
-    let mut ents: Vec<SpawnJob> = Vec::new();
+    // Build spawn payloads only when an observer starts tracking the entity.
+    let mut ents = Vec::new();
+    let mut queue = |dim, etype, job| {
+        ents.push(TrackedSpawn {
+            dim,
+            range: entity_tracking_range(etype),
+            job,
+        });
+    };
     for cart in generated_content().lock().unwrap().carts.iter() {
         let cart = cart.clone();
-        let [x,y,z] = cart.pos().expect("validated generated cart");
-        ents.push((cart.eid, x, y, z, Box::new(move || vec![(0x01, spawn_generated_cart(&cart))])));
+        let [x, y, z] = cart.pos().expect("validated generated cart");
+        queue(
+            DimId::Overworld,
+            name_to_etype("chest_minecart").unwrap(),
+            (
+                cart.eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x01, spawn_generated_cart(&cart))]),
+            ),
+        );
     }
     for frame in generated_content().lock().unwrap().frames.iter() {
         let frame = frame.clone();
         let [x, y, z] = frame.pos().expect("validated generated frame");
-        ents.push((
-            frame.eid,
-            x,
-            y,
-            z,
-            Box::new(move || {
-                vec![
-                    (0x01, spawn_generated_frame(&frame)),
-                    (0x58, frame_meta_pkt(&frame)),
-                ]
-            }),
-        ));
+        queue(
+            DimId::Overworld,
+            name_to_etype(if frame.glow() {
+                "glow_item_frame"
+            } else {
+                "item_frame"
+            })
+            .unwrap(),
+            (
+                frame.eid,
+                x,
+                y,
+                z,
+                Box::new(move || {
+                    vec![
+                        (0x01, spawn_generated_frame(&frame)),
+                        (0x58, frame_meta_pkt(&frame)),
+                    ]
+                }),
+            ),
+        );
     }
-    let mut entity_dims = HashMap::new();
     for m in mobs().lock().unwrap().iter() {
         let p = *m.pos.lock().unwrap();
-        entity_dims.insert(m.eid, m.dim);
         let m = m.clone();
-        ents.push((
-            m.eid,
-            p.0,
-            p.1,
-            p.2,
-            Box::new(move || live_mob_spawn_packets(&m)),
-        ));
+        queue(
+            m.dim,
+            m.etype,
+            (
+                m.eid,
+                p.0,
+                p.1,
+                p.2,
+                Box::new(move || live_mob_spawn_packets(&m)),
+            ),
+        );
     }
     for &projectile in live_mob_projectiles().lock().unwrap().iter() {
         let [x, y, z] = projectile.pos;
-        entity_dims.insert(projectile.eid, projectile.dim);
-        ents.push((projectile.eid, x, y, z, Box::new(move || live_mob_projectile_packets(projectile))));
+        queue(
+            projectile.dim,
+            projectile.entity_type(),
+            (
+                projectile.eid,
+                x,
+                y,
+                z,
+                Box::new(move || live_mob_projectile_packets(projectile)),
+            ),
+        );
     }
     for cloud in live_dragon_clouds().lock().unwrap().iter() {
         let (eid, [x, y, z]) = (cloud.eid, cloud.pos);
-        entity_dims.insert(eid, cloud.dim);
-        ents.push((eid, x, y, z, Box::new(move || {
-            vec![(0x01, spawn_typed_pkt(eid, 1, x, y, z))]
-        })));
+        queue(
+            cloud.dim,
+            1,
+            (
+                eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 1, x, y, z))]),
+            ),
+        );
     }
     for d in drops().lock().unwrap().iter() {
         let (eid, x, y, z, item, cnt, comps) =
             (d.eid, d.x, d.y, d.z, d.item, d.cnt, d.comps.clone());
-        ents.push((
-            eid,
-            x,
-            y,
-            z,
-            Box::new(move || {
-                let d = Drop {
-                    eid,
-                    x,
-                    y,
-                    z,
-                    item,
-                    cnt,
-                    comps: comps.clone(),
-                    age: 0,
-                    target: None,
-                    thrower: None,
-                };
-                vec![(0x01, spawn_drop_pkt(&d)), (0x58, drop_meta_pkt(&d))]
-            }),
-        ));
+        queue(
+            DimId::Overworld,
+            name_to_etype("item").unwrap(),
+            (
+                eid,
+                x,
+                y,
+                z,
+                Box::new(move || {
+                    let d = Drop {
+                        eid,
+                        x,
+                        y,
+                        z,
+                        item,
+                        cnt,
+                        comps: comps.clone(),
+                        age: 0,
+                        target: None,
+                        thrower: None,
+                    };
+                    vec![(0x01, spawn_drop_pkt(&d)), (0x58, drop_meta_pkt(&d))]
+                }),
+            ),
+        );
     }
     for a in arrows().lock().unwrap().iter() {
         let a2 = Arrow {
@@ -679,155 +974,182 @@ fn interest_tick() {
             last_hit: -1,
             stuck: false,
         };
-        ents.push((
-            a.eid,
-            a.x,
-            a.y,
-            a.z,
-            Box::new(move || vec![(0x01, spawn_arrow_pkt(&a2))]),
-        ));
+        queue(
+            DimId::Overworld,
+            4,
+            (
+                a.eid,
+                a.x,
+                a.y,
+                a.z,
+                Box::new(move || vec![(0x01, spawn_arrow_pkt(&a2))]),
+            ),
+        );
     }
     for b in bobbers().lock().unwrap().iter() {
         let (eid, x, y, z) = (b.eid, b.x, b.y, b.z);
-        ents.push((
-            eid,
-            x,
-            y,
-            z,
-            Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 129, x, y, z))]),
-        ));
+        queue(
+            DimId::Overworld,
+            129,
+            (
+                eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 129, x, y, z))]),
+            ),
+        );
     }
     for p in pearls().lock().unwrap().iter() {
         let (eid, x, y, z) = (p.eid, p.x, p.y, p.z);
-        ents.push((
-            eid,
-            x,
-            y,
-            z,
-            Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 32, x, y, z))]),
-        ));
+        queue(
+            DimId::Overworld,
+            32,
+            (
+                eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 32, x, y, z))]),
+            ),
+        );
     }
     for sb in snowballs().lock().unwrap().iter() {
         let (eid, x, y, z) = (sb.eid, sb.x, sb.y, sb.z);
-        ents.push((
-            eid,
-            x,
-            y,
-            z,
-            Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 97, x, y, z))]),
-        ));
+        queue(
+            DimId::Overworld,
+            97,
+            (
+                eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 97, x, y, z))]),
+            ),
+        );
     }
     for t in primed().lock().unwrap().iter() {
         let (eid, x, y, z) = (t.eid, t.x, t.y, t.z);
-        ents.push((
-            eid,
-            x,
-            y,
-            z,
-            Box::new(move || vec![(0x01, spawn_entity_pkt(eid, 106, x, y, z, 0.0, 0.0, 0))]),
-        ));
+        queue(
+            DimId::Overworld,
+            106,
+            (
+                eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x01, spawn_entity_pkt(eid, 106, x, y, z, 0.0, 0.0, 0))]),
+            ),
+        );
     }
     for f in falling().lock().unwrap().iter() {
         let (eid, x, y, z, state) = (f.eid, f.x, f.y, f.z, f.state);
-        ents.push((
-            eid,
-            x,
-            y,
-            z,
-            Box::new(move || vec![(0x01, spawn_falling_pkt(eid, state, x, y, z))]),
-        ));
+        queue(
+            DimId::Overworld,
+            name_to_etype("falling_block").unwrap(),
+            (
+                eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x01, spawn_falling_pkt(eid, state, x, y, z))]),
+            ),
+        );
     }
     for o in xps().lock().unwrap().iter() {
         let (eid, x, y, z, val) = (o.eid, o.x, o.y, o.z, o.val);
-        ents.push((
-            eid,
-            x,
-            y,
-            z,
-            Box::new(move || vec![(0x02, xp_orb_pkt(eid, x, y, z, val))]),
-        ));
+        queue(
+            DimId::Overworld,
+            name_to_etype("experience_orb").unwrap(),
+            (
+                eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x02, xp_orb_pkt(eid, x, y, z, val))]),
+            ),
+        );
     }
     // P2-3-S4: a player is only interested in players sharing their dimension. Two players
     // at the same coordinates in different worlds must not spawn for one another; on a
     // dimension switch the 0x42 removals below retire the old-world players.
-    entity_dims.extend(cls.iter().map(|o| (o.eid, *o.dim.lock().unwrap())));
     for o in cls.iter() {
-        let p = {
-            let p = o.pos.lock().unwrap();
-            *p
-        };
+        let (dim, x, y, z, _, _) = client_dim_pos(o);
         let o2 = o.clone();
-        ents.push((
-            o.eid,
-            p.0,
-            p.1,
-            p.2,
-            Box::new(move || vec![(0x01, spawn_player(&o2))]),
-        ));
+        queue(
+            dim,
+            PLAYER_ENTITY_TYPE,
+            (
+                o.eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x01, spawn_player(&o2))]),
+            ),
+        );
     }
-    let alive: HashSet<i32> = ents.iter().map(|e| e.0).collect();
-    for c in cls.iter() {
-        let (px, py, pz) = {
-            let p = c.pos.lock().unwrap();
-            (p.0, p.1, p.2)
-        };
-        let mut seen = c.seen.lock().unwrap();
-        let gone: Vec<i32> = seen
-            .iter()
-            .copied()
-            .filter(|e| !alive.contains(e))
-            .collect();
-        if !gone.is_empty() {
-            let mut p = Vec::new();
-            write_varint(&mut p, gone.len() as i64);
-            for e in &gone {
-                write_varint(&mut p, *e as i64);
-            }
-            if let Ok(mut w) = c.sock.lock() {
-                let _ = send_packet(&mut w, 0x42, p);
-            }
-            for e in gone {
-                seen.remove(&e);
-            }
-        }
-        for (eid, x, y, z, mkpkts) in ents.iter() {
-            if *eid == c.eid {
-                continue;
-            }
-            if let Some(&edim) = entity_dims.get(eid) {
-                if edim != *c.dim.lock().unwrap() {
-                    // crossing a dimension retires the other world's players immediately,
-                    // even when their coordinates are still inside the interest radius.
-                    if seen.remove(eid) {
-                        let mut p = Vec::new();
-                        write_varint(&mut p, 1);
-                        write_varint(&mut p, *eid as i64);
-                        if let Ok(mut w) = c.sock.lock() {
-                            let _ = send_packet(&mut w, 0x42, p);
-                        }
-                    }
-                    continue;
-                }
-            }
-            let d2 = (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2);
-            if d2 <= VIS_R2 {
-                if seen.insert(*eid) {
-                    if let Ok(mut w) = c.sock.lock() {
-                        for (pid, pkt) in mkpkts() {
-                            let _ = send_packet(&mut w, pid, pkt);
-                        }
-                    }
-                }
-            } else if seen.remove(eid) {
-                let mut p = Vec::new();
-                write_varint(&mut p, 1);
-                write_varint(&mut p, *eid as i64);
-                if let Ok(mut w) = c.sock.lock() {
-                    let _ = send_packet(&mut w, 0x42, p);
-                }
-            }
+    for client in &cls {
+        sync_entity_interest(client, &ents);
+    }
+}
+
+fn sync_entity_interest(client: &Client, entities: &[TrackedSpawn]) {
+    let mut seen = client.seen.lock().unwrap();
+    let chunks = client.chunks.lock().unwrap();
+    let (dim, px, _, pz, _, _) = client_dim_pos(client);
+    let view = *client.view.lock().unwrap();
+    let mut eligible = HashMap::new();
+    for TrackedSpawn {
+        dim: entity_dim,
+        range,
+        job: (eid, x, _, z, spawn),
+    } in entities
+    {
+        if *eid != client.eid
+            && *entity_dim == dim
+            && entity_in_tracking_range((px, pz), (*x, *z), *range, view)
+            && chunks.contains(&(spatial_chunk_coord(*x), spatial_chunk_coord(*z)))
+        {
+            eligible.insert(*eid, spawn);
         }
     }
+    let previous: Vec<_> = seen.iter().copied().collect();
+    let next: Vec<_> = eligible.keys().copied().collect();
+    let (added, _, removed) = compute_tracking_diff(&previous, &next);
+    if added.is_empty() && removed.is_empty() {
+        return;
+    }
+    let Ok(mut socket) = client.sock.lock() else {
+        return;
+    };
+    if !removed.is_empty() {
+        if send_packet(&mut socket, 0x42, remove_entities_payload(&removed)).is_err() {
+            return;
+        }
+        for eid in removed {
+            seen.remove(&eid);
+        }
+    }
+    for eid in added {
+        for (id, body) in eligible[&eid]() {
+            if id == 0x01 {
+                with_play_wire(&socket, |play| play.remember_spawn(&body));
+            }
+            if send_packet(&mut socket, id, body).is_err() {
+                return;
+            }
+        }
+        seen.insert(eid);
+    }
+}
+
+fn remove_entities_payload(entities: &[i32]) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, entities.len() as i64);
+    for &eid in entities {
+        write_varint(&mut p, i64::from(eid));
+    }
+    p
 }
 
 // entity-scoped broadcast: only clients currently tracking <eid> —
@@ -876,9 +1198,7 @@ fn broadcast_chunk_dim_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     }
 }
 fn broadcast_seen_destroy(eid: i32) {
-    let mut p = Vec::new();
-    write_varint(&mut p, 1);
-    write_varint(&mut p, eid as i64);
+    let p = remove_entities_payload(&[eid]);
     broadcast_seen(eid, |_c| (0x42, p.clone()));
 }
 // LOCK ORDER: these helpers acquire clients() internally — never call
@@ -897,11 +1217,16 @@ fn broadcast_seen_ex_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     excl: i32,
     mk: F,
 ) {
-    fanout_in(
-        audience,
-        |c| c.eid != excl && c.seen.lock().unwrap().contains(&eid),
-        mk,
-    )
+    for client in audience.iter().filter(|c| c.eid != excl) {
+        // Serialize updates with the tracking sweep's spawn and remove packets.
+        let seen = client.seen.lock().unwrap();
+        if seen.contains(&eid) {
+            let (id, packet) = mk(client);
+            if let Ok(mut socket) = client.sock.lock() {
+                let _ = send_packet(&mut socket, id, packet);
+            }
+        }
+    }
 }
 
 // broadcast helpers return (packet_id, payload)
@@ -1115,83 +1440,297 @@ fn resource_pack_required() -> bool {
 }
 
 // ---------- config blob replay ----------
-fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
-    let data = match std::fs::read("config_packets.bin") {
-        Ok(d) => d,
-        Err(_) => {
-            eprintln!(
-                "[spine] config_packets.bin is missing: clients get no registries. {}",
-                worldgen::VANILLA_DATA_MISSING
-            );
-            return vec![];
+// Registry packet order in the vanilla 1.21.1 configuration capture.
+const SYNCED_REGISTRIES: [&str; 11] = [
+    "worldgen/biome",
+    "chat_type",
+    "trim_pattern",
+    "trim_material",
+    "wolf_variant",
+    "painting_variant",
+    "dimension_type",
+    "damage_type",
+    "banner_pattern",
+    "enchantment",
+    "jukebox_song",
+];
+
+/// Build Configuration 0x07 payloads (starting at the registry ID) from pack
+/// files in low-to-high priority order. Directory and ZIP readers supply paths
+/// relative to the pack root. A partial input emits only its populated registries.
+fn build_registry_data_payloads<'a>(
+    packs: impl IntoIterator<Item = impl IntoIterator<Item = (&'a str, &'a [u8])>>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut registries = std::collections::BTreeMap::<_, std::collections::BTreeMap<_, _>>::new();
+    for (priority, files) in packs.into_iter().enumerate() {
+        for (file, json) in files {
+            let Some((namespace, relative)) = file
+                .strip_prefix("data/")
+                .and_then(|path| path.split_once('/'))
+            else {
+                continue;
+            };
+            let Some(relative) = relative.strip_suffix(".json") else {
+                continue;
+            };
+            let Some((kind, path)) = SYNCED_REGISTRIES.iter().find_map(|&kind| {
+                let path = relative.strip_prefix(kind)?.strip_prefix('/')?;
+                Some((kind, path))
+            }) else {
+                continue;
+            };
+            // Vanilla ResourceLocation orders by path, then by namespace.
+            let previous = registries
+                .entry(kind)
+                .or_default()
+                .insert((path, namespace), (priority, file, json));
+            if previous.is_some_and(|(previous_priority, _, _)| previous_priority == priority) {
+                return Err(format!("duplicate registry file {file} in one datapack"));
+            }
         }
-    };
-    let mut out = Vec::new();
-    let mut sl = &data[..];
-    while !sl.is_empty() {
-        let len = match read_varint(&mut sl) {
-            Some(l) => l as usize,
-            None => break,
-        };
-        if sl.len() < len {
-            break;
-        }
-        let pkt = sl[..len].to_vec();
-        sl = &sl[len..];
-        let mut p2 = &pkt[..];
-        let id = read_varint(&mut p2).unwrap_or(-1);
-        out.push((id, pkt));
     }
-    out
+
+    let mut payloads = Vec::new();
+    for kind in SYNCED_REGISTRIES {
+        let Some(entries) = registries.remove(kind) else {
+            continue;
+        };
+        let mut payload = Vec::new();
+        write_str(&mut payload, &format!("minecraft:{kind}"));
+        let count = i32::try_from(entries.len()).map_err(|_| "too many registry entries")?;
+        write_varint(&mut payload, i64::from(count));
+        for ((path, namespace), (_, file, json)) in entries {
+            let location = brigadier_wire::ResourceLocation::new(namespace, path)
+                .map_err(|_| format!("invalid registry entry path {file}"))?;
+            let id = location.to_string();
+            if id.len() > 32_767 || path.split('/').any(|part| matches!(part, "" | "." | "..")) {
+                return Err(format!("invalid registry entry path {file}"));
+            }
+            let mut tag =
+                nbt::registry_json_to_nbt(json).map_err(|err| format!("{file}: {err}"))?;
+            if kind == "worldgen/biome" {
+                // Biome's network codec carries only the climate and effects.
+                if let nbt::Tag::Compound(fields) = &mut tag {
+                    for field in [
+                        "carvers",
+                        "features",
+                        "spawn_costs",
+                        "spawners",
+                        "creature_spawn_probability",
+                    ] {
+                        fields.remove(&nbt::NbtString::text(field));
+                    }
+                }
+            }
+            write_str(&mut payload, &id);
+            payload.push(1); // Optional NBT is present for every entry.
+            payload.extend(nbt::write_network_nbt(&tag).map_err(|err| format!("{file}: {err}"))?);
+        }
+        payloads.push(payload);
+    }
+    Ok(payloads)
 }
 
-fn player_attack_damage_wire_id(config: &[(i64, Vec<u8>)]) -> Option<i32> {
-    fn name<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
-        let len = usize::try_from(read_protocol_i32(input)?).ok()?;
-        let (name, rest) = input.split_at_checked(len)?;
-        *input = rest;
-        Some(name)
+fn registry_pack_files(
+    base: &std::path::Path,
+    zip: bool,
+) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    if zip {
+        let mut bytes = Vec::new();
+        std::fs::File::open(base)?
+            .take(ZIP_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        return (bytes.len() <= ZIP_MAX_BYTES)
+            .then(|| zip_datapack_entries(&bytes))
+            .flatten()
+            .ok_or_else(|| std::io::Error::other("invalid or unsupported registry datapack ZIP"));
     }
+    let data = base.join("data");
+    let namespaces = match std::fs::read_dir(data) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut files = Vec::new();
+    for namespace in namespaces {
+        let namespace = namespace?;
+        if !namespace.file_type()?.is_dir() {
+            continue;
+        }
+        for kind in SYNCED_REGISTRIES {
+            let mut dirs = vec![namespace.path().join(kind)];
+            while let Some(dir) = dirs.pop() {
+                let entries = match std::fs::read_dir(dir) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                for entry in entries {
+                    let entry = entry?;
+                    let file_type = entry.file_type()?;
+                    let path = entry.path();
+                    if file_type.is_dir() {
+                        dirs.push(path);
+                    } else if file_type.is_file() && path.extension().is_some_and(|e| e == "json") {
+                        if let Some(name) = path.strip_prefix(base).ok().and_then(|p| p.to_str()) {
+                            files.push((name.replace('\\', "/"), std::fs::read(path)?));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(files)
+}
 
-    let mut registry = None;
-    for (_, packet) in config.iter().filter(|(id, _)| *id == 0x07) {
-        let mut input = packet.as_slice();
-        if read_protocol_i32(&mut input)? != 0x07 {
-            return None;
-        }
-        if name(&mut input)? == b"minecraft:damage_type" && registry.replace(input).is_some() {
-            return None;
+fn load_registry_overlays(base: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
+    let mut sources = datapack_sources(base);
+    // The built-in pack is the base. User packs follow in the server's pack order.
+    sources.sort_by_key(|(name, _, _)| name != "vanilla");
+    let disabled = disabled_datapacks().lock().unwrap().clone();
+    let mut packs = Vec::new();
+    for (name, path, zip) in sources {
+        if !disabled.contains(&name) {
+            packs
+                .push(registry_pack_files(&path, zip).map_err(|error| format!("{name}: {error}"))?);
         }
     }
-    let mut input = registry?;
+    build_registry_data_payloads(packs.iter().map(|files| {
+        files
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+    }))
+}
+
+fn captured_config_packets() -> Option<Vec<(i64, Vec<u8>)>> {
+    let data = std::fs::read("config_packets.bin").ok()?;
+    let mut packets = Vec::new();
+    let mut input = data.as_slice();
+    while !input.is_empty() {
+        let len = usize::try_from(read_protocol_i32(&mut input)?).ok()?;
+        let (packet, rest) = input.split_at_checked(len)?;
+        let id = read_protocol_i32(&mut &packet[..])?;
+        packets.push((i64::from(id), packet.to_vec()));
+        input = rest;
+    }
+    Some(packets)
+}
+
+fn registry_wire_name<'a>(input: &mut &'a [u8]) -> Option<&'a str> {
+    let len = usize::try_from(read_protocol_i32(input)?).ok()?;
+    let (name, rest) = input.split_at_checked(len)?;
+    *input = rest;
+    std::str::from_utf8(name).ok()
+}
+
+fn config_registry_header(packet: &[u8]) -> Option<(&str, &[u8])> {
+    let mut input = packet;
+    (read_protocol_i32(&mut input)? == 0x07).then_some(())?;
+    let name = registry_wire_name(&mut input)?;
+    Some((name, input))
+}
+
+fn registry_wire_entries(mut input: &[u8]) -> Option<Vec<(&str, &[u8])>> {
     let count = read_protocol_i32(&mut input)?;
     if !(0..=4096).contains(&count) {
         return None;
     }
-    let mut found = None;
-    for id in 0..count {
-        let entry = name(&mut input)?;
-        let (&has_nbt, payload) = input.split_first()?;
-        input = payload;
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let name = registry_wire_name(&mut input)?;
+        let entry = input;
+        let (&has_nbt, body) = input.split_first()?;
+        let mut end = 0;
         match has_nbt {
             0 => {}
-            1 => {
-                let mut end = 0;
-                if !nbt_wire_skip(input, &mut end, 0) {
-                    return None;
-                }
-                input = &input[end..];
-            }
+            1 if nbt_wire_skip(body, &mut end, 0) => {}
             _ => return None,
         }
-        if entry == b"minecraft:player_attack" && found.replace(id).is_some() {
+        let (entry, rest) = entry.split_at_checked(1 + end)?;
+        entries.push((name, entry));
+        input = rest;
+    }
+    input.is_empty().then_some(entries)
+}
+
+fn merge_registry_overlays(config: &mut [(i64, Vec<u8>)], overlays: &[Vec<u8>]) -> Option<()> {
+    let mut pending = HashMap::new();
+    for payload in overlays {
+        let mut body = payload.as_slice();
+        let name = registry_wire_name(&mut body)?;
+        pending.insert(name, registry_wire_entries(body)?);
+    }
+    let mut replacements = Vec::new();
+    for (index, (_, packet)) in config.iter().enumerate().filter(|(_, (id, _))| *id == 0x07) {
+        let (name, body) = config_registry_header(packet)?;
+        let Some(entries) = pending.remove(name) else {
+            continue;
+        };
+        let mut overrides: HashMap<_, _> = entries.iter().copied().collect();
+        let mut ordered = registry_wire_entries(body)?;
+        for (id, payload) in &mut ordered {
+            if let Some(replacement) = overrides.remove(id) {
+                *payload = replacement;
+            }
+        }
+        // Keep baseline numeric IDs stable for Update Tags, chunk biome IDs and
+        // dimension IDs. New entries are appended in the builder's order.
+        ordered.extend(
+            entries
+                .into_iter()
+                .filter(|(id, _)| overrides.contains_key(id)),
+        );
+        let mut merged = vec![0x07];
+        write_str(&mut merged, name);
+        write_varint(&mut merged, ordered.len() as i64);
+        for (id, payload) in ordered {
+            write_str(&mut merged, id);
+            merged.extend_from_slice(payload);
+        }
+        replacements.push((index, merged));
+    }
+    if !pending.is_empty() {
+        return None;
+    }
+    for (index, packet) in replacements {
+        config[index].1 = packet;
+    }
+    Some(())
+}
+
+fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
+    let Some(mut config) = captured_config_packets() else {
+        eprintln!(
+            "[spine] missing or invalid config_packets.bin. {}",
+            worldgen::VANILLA_DATA_MISSING
+        );
+        return Vec::new();
+    };
+    match load_registry_overlays(std::path::Path::new(DATAPACK_DIRECTORY)) {
+        Ok(overlays) => {
+            if merge_registry_overlays(&mut config, &overlays).is_none() {
+                eprintln!("[spine] unable to merge datapack registries into config_packets.bin");
+            }
+        }
+        Err(error) => eprintln!("[spine] unable to load datapack registries: {error}"),
+    }
+    config
+}
+
+fn player_attack_damage_wire_id(config: &[(i64, Vec<u8>)]) -> Option<i32> {
+    let mut registry = None;
+    for (_, packet) in config.iter().filter(|(id, _)| *id == 0x07) {
+        let (name, body) = config_registry_header(packet)?;
+        if name == "minecraft:damage_type" && registry.replace(body).is_some() {
             return None;
         }
     }
-    if !input.is_empty() {
-        return None;
-    }
-    found
+    let mut matches = registry_wire_entries(registry?)?
+        .into_iter()
+        .enumerate()
+        .filter(|(_, (name, _))| *name == "minecraft:player_attack");
+    let (index, _) = matches.next()?;
+    matches.next().is_none().then_some(index as i32)
 }
 
 const SERVER_VIEW_DISTANCE: i32 = 8;
@@ -1234,29 +1773,143 @@ fn window_batch(view: i32) -> usize {
     side * side
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ChunkWindow {
+    center: (i32, i32),
+    radius: i32,
+}
+
+impl ChunkWindow {
+    fn at(x: f64, z: f64, radius: i32) -> Self {
+        Self {
+            center: (spatial_chunk_coord(x), spatial_chunk_coord(z)),
+            radius,
+        }
+    }
+
+    fn contains(self, (x, z): (i32, i32)) -> bool {
+        x.abs_diff(self.center.0).max(z.abs_diff(self.center.1)) <= self.radius as u32
+    }
+
+    fn leaving(self, previous: Option<Self>, sent: &HashSet<(i32, i32)>) -> Vec<(i32, i32)> {
+        if let Some(old) = previous.filter(|old| old.radius == self.radius) {
+            let (_, removed) = chunk_view_diff(old.center, self.center, self.radius as u32);
+            return removed.into_iter().filter(|c| sent.contains(c)).collect();
+        }
+        sent.iter()
+            .copied()
+            .filter(|&c| !self.contains(c))
+            .collect()
+    }
+
+    fn pending(self, sent: &HashSet<(i32, i32)>, yaw: f32) -> Vec<(i32, i32)> {
+        let (cx, cz) = self.center;
+        let r = self.radius;
+        let mut chunks: Vec<_> = (cx.saturating_sub(r)..=cx.saturating_add(r))
+            .flat_map(|x| (cz.saturating_sub(r)..=cz.saturating_add(r)).map(move |z| (x, z)))
+            .filter(|c| !sent.contains(c))
+            .collect();
+        let (sin, cos) = f64::from(yaw).to_radians().sin_cos();
+        prioritize_chunks(&mut chunks, self.center, (-sin, cos));
+        chunks
+    }
+}
+
+/// Replace the full light lists from map_chunk's cached payload with sparse
+/// lists. Block and biome palettes still carry one record per vertical section.
+fn cull_chunk_light(packet: &mut Vec<u8>, dim: DimId) {
+    const ARRAY_WIRE_SIZE: usize = 2 + 2048;
+    const MASK_WIRE_SIZE: usize = 2 * (1 + 8) + 2; // two one-long and two empty bitsets
+    let block_count = dim.light_sections();
+    let sky_count = if worldgen::has_skylight(dim) {
+        block_count
+    } else {
+        0
+    };
+    let suffix_size = MASK_WIRE_SIZE + 2 + (sky_count + block_count) * ARRAY_WIRE_SIZE;
+    let Some(start) = packet.len().checked_sub(suffix_size) else {
+        return;
+    };
+    let mut light = &packet[start..];
+    for expected in [
+        if sky_count == 0 { 0 } else { dim.light_mask() },
+        dim.light_mask(),
+    ] {
+        if read_protocol_i32(&mut light) != Some(1) || !light.starts_with(&expected.to_be_bytes()) {
+            return;
+        }
+        light = &light[8..];
+    }
+    if !light.starts_with(&[0, 0]) {
+        return;
+    }
+    light = &light[2..];
+    let mut lists = [
+        Vec::<[u8; 2048]>::with_capacity(sky_count),
+        Vec::with_capacity(block_count),
+    ];
+    for (arrays, count) in lists.iter_mut().zip([sky_count, block_count]) {
+        if read_protocol_i32(&mut light) != Some(count as i32) {
+            return;
+        }
+        for _ in 0..count {
+            if read_protocol_i32(&mut light) != Some(2048) || light.len() < 2048 {
+                return;
+            }
+            let (array, rest) = light.split_at(2048);
+            arrays.push(array.try_into().unwrap());
+            light = rest;
+        }
+    }
+    if !light.is_empty() {
+        return;
+    }
+    let [sky, block] = lists.each_ref().map(|arrays| {
+        let (_, nonempty) = section_nonempty_masks(&[], arrays);
+        let mut present = 0u64;
+        for (i, lit) in nonempty.into_iter().enumerate() {
+            if lit {
+                present |= 1 << i;
+            }
+        }
+        (present, ((1 << arrays.len()) - 1) ^ present)
+    });
+    packet.truncate(start);
+    for mask in [sky.0, block.0, sky.1, block.1] {
+        write_varint(packet, i64::from(mask != 0));
+        if mask != 0 {
+            packet.extend_from_slice(&mask.to_be_bytes());
+        }
+    }
+    for (mask, arrays) in [sky.0, block.0].into_iter().zip(&lists) {
+        write_varint(packet, i64::from(mask.count_ones()));
+        for (i, section) in arrays.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                write_varint(packet, section.len() as i64);
+                packet.extend_from_slice(section);
+            }
+        }
+    }
+}
+
 fn stream_chunks(
     s: &mut TcpStream,
     sent: &mut std::collections::HashSet<(i32, i32)>,
     gen: &mut GenSources,
     ack: &mut ChunkFeedback,
     dim: DimId,
-    ccx: i32,
-    ccz: i32,
-    view: i32,
+    window: ChunkWindow,
+    yaw: f32,
     // the centre is announced when the window moves (spawn, view request,
     // player crossing a chunk) - not on every batch, or a client pacing its own
     // batches would see the centre move while nothing did
     announce_center: bool,
 ) {
+    let previous = with_play_wire(s, |play| play.window.replace(window)).flatten();
     // chunks leaving the window get an explicit unload — vanilla keeps
     // client memory bounded and the set now means exactly "chunks the
     // client holds" (updates must only target holders).
-    let gone: Vec<(i32, i32)> = sent
-        .iter()
-        .copied()
-        .filter(|c| (c.0 - ccx).abs() > view || (c.1 - ccz).abs() > view)
-        .collect();
-    for c in gone {
+    for c in window.leaving(previous, sent) {
         let mut p = Vec::with_capacity(8);
         p.extend_from_slice(&c.1.to_be_bytes()); // wire order: chunkZ, chunkX
         p.extend_from_slice(&c.0.to_be_bytes());
@@ -1268,11 +1921,13 @@ fn stream_chunks(
     }
     // The centre update is not part of a batch, but it is the answer a view
     // request waits for even when nothing new is to be sent.
-    if announce_center {
+    if announce_center || previous.is_some_and(|old| old != window) {
         let mut vp = Vec::new();
-        write_varint(&mut vp, ccx as i64);
-        write_varint(&mut vp, ccz as i64);
-        let _ = send_packet(s, 0x54, vp);
+        write_varint(&mut vp, i64::from(window.center.0));
+        write_varint(&mut vp, i64::from(window.center.1));
+        if send_packet(s, 0x54, vp).is_err() {
+            return;
+        }
     }
     // A batch is already in flight: vanilla waits for the client's Chunk Batch
     // Received before starting the next one, and so does this. The chunks that
@@ -1281,35 +1936,20 @@ fn stream_chunks(
     if ack.awaiting() {
         return;
     }
-    let mut news = Vec::new();
-    for dx in -view..=view {
-        for dz in -view..=view {
-            let c = (ccx + dx, ccz + dz);
-            if !sent.contains(&c) {
-                news.push(c);
-            }
-        }
-    }
+    let mut news = window.pending(sent, yaw);
     // The client's requested chunks/tick bounds this batch.
-    //
-    // Ordering the batch outermost-first was tried here, so that a chunk finds its 3x3
-    // neighbours' bands and floors already cached (they are installed when the neighbour
-    // is delivered). The deterministic bench (`chunk_delivery_path_bench`, cold cache per
-    // pass) shows no difference: 30.2/31.0 natural vs 30.3/31.0 outer-first ms/chunk. The
-    // natural order stays.
     news.truncate(ack.batch_size());
     if news.is_empty() {
         return;
     }
     let batch = news.len();
-    for c in &news {
-        sent.insert(*c);
-    }
     // Terrain is pure per chunk, so a group of the batch is built off the lock before the
     // send loop touches it; everything after it (features, overlays, encoding) stays
     // sequential in the order the client is served. The group size is bounded so the base
     // rows in `terr_c` cannot outgrow their store.
-    let _ = send_packet(s, 0x0d, vec![]);
+    if send_packet(s, 0x0d, vec![]).is_err() {
+        return;
+    }
     let mut dirty: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     let delivery_workers = delivery_prefetch_jobs();
     let delivery_round = (delivery_workers > 1).then(crate::feature::starts_round_begin);
@@ -1319,12 +1959,17 @@ fn stream_chunks(
     // The terrain rows stop one section below the dimension's own ceiling: a Nether/End
     // window is 0..256 (16 sections), not the Overworld's -64..320.
     let (lo, hi) = (dim.min_y(), dim.min_y() + dim.height() - 16);
-    for chunk_group in news.chunks(terrain_group(delivery_workers)) {
+    let mut failed = false;
+    'delivery: for chunk_group in news.chunks(terrain_group(delivery_workers)) {
         prefetch_terrain_group_dim(dim, chunk_group, lo, hi, delivery_workers, delivery_round);
         for (cx, cz) in chunk_group {
-            if send_packet(s, 0x27, map_chunk(*cx, *cz, dim, gen)).is_err() {
-                return;
+            let mut packet = map_chunk(*cx, *cz, dim, gen);
+            cull_chunk_light(&mut packet, dim);
+            if send_packet(s, 0x27, packet).is_err() {
+                failed = true;
+                break 'delivery;
             }
+            sent.insert((*cx, *cz));
             for n in light_dirty_for_dim(dim, gen, *cx, *cz) {
                 dirty.insert(n);
             }
@@ -1337,6 +1982,9 @@ fn stream_chunks(
     if let Some(round) = delivery_round {
         let _ = worldgen::with_gen(|g| g.starts_round = None);
         crate::feature::starts_round_end(round);
+    }
+    if failed {
+        return;
     }
     // A neighbour lit before this batch could not see the emitters generated now, so its light is
     // recomputed and re-sent. `light_dirty_for` limits this to held chunks a new emitter can
@@ -1358,8 +2006,9 @@ fn stream_chunks(
     }
     let mut bf = Vec::new();
     write_varint(&mut bf, batch as i64);
-    let _ = send_packet(s, 0x0c, bf);
-    ack.sent_batch(Instant::now(), batch);
+    if send_packet(s, 0x0c, bf).is_ok() {
+        ack.sent_batch(Instant::now(), batch);
+    }
 }
 
 /// Skip one **unnamed-root** network NBT value (the shape carried inside a
@@ -1444,56 +2093,21 @@ fn nbt_wire_value(data: &[u8], p: &mut usize, tag: u8, depth: usize) -> bool {
 /// never sends a player to). Reading the blob keeps the wire id and the 0x2b/0x47 payload in
 /// agreement if the blob is ever regenerated with a different order.
 fn parse_dim_type_wire_ids() -> Option<[i32; 3]> {
-    let data = std::fs::read("config_packets.bin").ok()?;
-    let mut sl = &data[..];
-    while !sl.is_empty() {
-        let len = read_varint(&mut sl)? as usize;
-        if sl.len() < len {
-            return None;
-        }
-        let pkt = &sl[..len];
-        sl = &sl[len..];
-        let mut p = &pkt[..];
-        if read_varint(&mut p)? != 7 {
+    for (id, packet) in captured_config_packets()? {
+        if id != 0x07 {
             continue;
         }
-        let nlen = read_varint(&mut p)? as usize;
-        if p.len() < nlen {
-            return None;
-        }
-        let registry = std::str::from_utf8(&p[..nlen]).ok()?;
-        p = &p[nlen..];
-        if registry != "minecraft:dimension_type" {
+        let (name, body) = config_registry_header(&packet)?;
+        if name != "minecraft:dimension_type" {
             continue;
-        }
-        let count = read_varint(&mut p)? as usize;
-        if count > 4096 {
-            return None;
         }
         let mut ids = [-1i32; 3];
-        for idx in 0..count {
-            let l = read_varint(&mut p)? as usize;
-            if p.len() < l + 1 {
-                return None;
-            }
-            let entry = std::str::from_utf8(&p[..l]).ok()?;
-            p = &p[l..];
-            let has_nbt = p[0];
-            p = &p[1..];
-            if has_nbt != 0 {
-                let mut off = 0usize;
-                if !nbt_wire_skip(p, &mut off, 0) {
-                    return None;
-                }
-                p = &p[off..];
-            }
+        for (index, (entry, _)) in registry_wire_entries(body)?.into_iter().enumerate() {
             if let Some(dim) = DimId::parse_dimension_id(entry) {
-                ids[dim.index()] = idx as i32;
+                ids[dim.index()] = index as i32;
             }
         }
-        if ids.iter().all(|v| *v >= 0) {
-            return Some(ids);
-        }
+        return ids.iter().all(|&id| id >= 0).then_some(ids);
     }
     None
 }
@@ -1570,17 +2184,14 @@ fn switch_client_dimension(
         let _ = send_packet(&mut me.sock.lock().unwrap(), 0x12, vec![2]);
     }
     // Retire everything the old world was tracking before the client drops its chunks.
-    {
-        let mut seen = me.seen.lock().unwrap();
-        if !seen.is_empty() {
-            let mut p = Vec::new();
-            write_varint(&mut p, seen.len() as i64);
-            for e in seen.iter() {
-                write_varint(&mut p, *e as i64);
-            }
-            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x42, p);
-            seen.clear();
-        }
+    let mut seen = me.seen.lock().unwrap();
+    if !seen.is_empty() {
+        let removed: Vec<_> = seen.drain().collect();
+        let _ = send_packet(
+            &mut me.sock.lock().unwrap(),
+            0x42,
+            remove_entities_payload(&removed),
+        );
     }
     if old_dim != new_dim {
         me.chunks.lock().unwrap().clear();
@@ -1596,6 +2207,7 @@ fn switch_client_dimension(
         *p = (target.0, target.1, target.2, target.3, target.4, true);
         id
     };
+    drop(seen);
     *me.in_portal.lock().unwrap() = false;
     *me.fall_from.lock().unwrap() = target.1;
     {
@@ -1609,10 +2221,6 @@ fn switch_client_dimension(
     let mut ge = vec![13u8]; // START_WAITING_CHUNKS
     ge.extend_from_slice(&0f32.to_be_bytes());
     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x22, ge);
-    let (ccx, ccz) = (
-        (target.0 / 16.0).floor() as i32,
-        (target.2 / 16.0).floor() as i32,
-    );
     {
         let mut ack = me.chunk_ack.lock().unwrap();
         let mut ch = me.chunks.lock().unwrap();
@@ -1623,9 +2231,8 @@ fn switch_client_dimension(
             &mut gen,
             &mut ack,
             new_dim,
-            ccx,
-            ccz,
-            view,
+            ChunkWindow::at(target.0, target.2, view),
+            target.3,
             true,
         );
     }
@@ -2317,6 +2924,15 @@ fn handle(mut s: TcpStream) {
             return;
         }
     };
+    // Keep the existing uncompressed default. Zero compresses every packet.
+    let threshold = std::env::var("MC_SPINE_COMPRESSION_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(-1);
+    let Ok(_compression_registration) = negotiate_compression(&mut s, threshold) else {
+        return;
+    };
+    let compression = usize::try_from(threshold).ok();
     let mut ls = Vec::new();
     ls.extend_from_slice(&uuid);
     write_str(&mut ls, &name);
@@ -2325,30 +2941,29 @@ fn handle(mut s: TcpStream) {
     if send_packet(&mut s, 2, ls).is_err() {
         return;
     }
-    match read_packet(&mut s, login_deadline) {
+    match read_login_frame(&mut s, login_deadline, compression) {
         Some((3, _)) => {}
         _ => return,
     }
     // ---- config ----
     let mut client_view: i32 = 8;
     let cfg = load_config_packets();
-    let mut sent_selpacks = false;
     for (pid, pkt) in &cfg {
+        if write_frame(&mut s, pkt, compression).is_err() {
+            return;
+        }
         if *pid == 0x0e {
-            let _ = send_raw(&mut s, pkt);
-            sent_selpacks = true;
             break;
         }
-        let _ = send_raw(&mut s, pkt);
     }
-    if !sent_selpacks {
+    if !cfg.iter().any(|(id, _)| *id == 0x0e) {
         return;
     }
     s.set_read_timeout(Some(Duration::from_millis(200))).ok();
     let t0 = Instant::now();
     let mut got_selpacks = false;
     while Instant::now() - t0 < Duration::from_secs(15) {
-        match read_packet(&mut s, login_deadline) {
+        match read_login_frame(&mut s, login_deadline, compression) {
             Some((0x00, b)) => {
                 let Some(v) = client_info_view_distance(&b) else {
                     return;
@@ -2372,7 +2987,9 @@ fn handle(mut s: TcpStream) {
         if matches!(*pid, 0x01 | 0x0c | 0x0e | 0x03) {
             continue;
         }
-        let _ = send_raw(&mut s, pkt);
+        if write_frame(&mut s, pkt, compression).is_err() {
+            return;
+        }
     }
     if send_packet(&mut s, 0x03, vec![]).is_err() {
         return;
@@ -2382,7 +2999,7 @@ fn handle(mut s: TcpStream) {
         if Instant::now() - t0 > Duration::from_secs(15) {
             return;
         }
-        match read_packet(&mut s, login_deadline) {
+        match read_login_frame(&mut s, login_deadline, compression) {
             Some((0x00, b)) => {
                 let Some(v) = client_info_view_distance(&b) else {
                     return;
@@ -2441,6 +3058,7 @@ fn handle(mut s: TcpStream) {
     let mut view = client_view.clamp(2, SERVER_VIEW_DISTANCE);
     // the window is the ceiling; the client's first acknowledgement lowers the pace
     let mut chunk_ack = ChunkFeedback::new(window_batch(view));
+    let initial_window = ChunkWindow::at(sx, sz, view);
     // vanilla: a returning player resumes where they logged out — the chunk window,
     // spawn teleport and authoritative pos all agree. The dimension was read above,
     // before Join Game, and is threaded through the first stream as well.
@@ -2450,9 +3068,8 @@ fn handle(mut s: TcpStream) {
         &mut gen,
         &mut chunk_ack,
         saved_dim,
-        (sx / 16.0).floor() as i32,
-        (sz / 16.0).floor() as i32,
-        view,
+        initial_window,
+        syaw,
         true,
     );
     let mut tm = Vec::new();
@@ -2493,6 +3110,7 @@ fn handle(mut s: TcpStream) {
         hex(&uuid)
     );
     // ---- multiplayer: register self, tell others, learn others ----
+    let Ok(writer) = s.try_clone() else { return };
     let me = Arc::new(Client {
         eid: player_eid,
         uuid: {
@@ -2505,7 +3123,7 @@ fn handle(mut s: TcpStream) {
         pos: Mutex::new((sx, sy, sz, syaw, spitch, true)),
         teleport: Mutex::new(teleport),
         hp: Mutex::new(20.0),
-        sock: Mutex::new(s.try_clone().unwrap()),
+        sock: Mutex::new(writer),
         inv: Mutex::new(saved_inv.unwrap_or_default()),
         cursor: Mutex::new((0, 0, Vec::new())),
         drag: Mutex::new((-1, Vec::new())),
@@ -2557,6 +3175,7 @@ fn handle(mut s: TcpStream) {
         held: Mutex::new(0),
         effs: Mutex::new(Vec::new()),
     });
+    me.enter_play_wire(compression, initial_window);
     {
         let border = world_border().lock().unwrap();
         let board = scoreboard().lock().unwrap();
@@ -2647,11 +3266,7 @@ fn handle(mut s: TcpStream) {
     let mut next_keepalive_id = 1i64;
     let mut held_slot: i16 = 0;
 
-    // Start from the saved column, not (0,0): a Nether login at x=800 would otherwise
-    // stream a second, Overworld-keyed window on the first movement frame.
-    let mut player_chunk: (i32, i32) =
-        ((sx / 16.0).floor() as i32, (sz / 16.0).floor() as i32);
-    let mut rx = RxBuf::new();
+    let mut rx = RxBuf::new(compression);
     // Play-state packet inactivity is tracked separately from the keep-alive deadline.
     let mut last_rx = Instant::now();
     let mut chat_throttle = connection_limits::ChatThrottle::new(Instant::now());
@@ -2740,8 +3355,7 @@ fn handle(mut s: TcpStream) {
                 }
                 // nothing else pumps the queue when the player stands still, so
                 // the next batch goes out from here
-                let (px, _, pz, _, _, _) = *me.pos.lock().unwrap();
-                let (ccx, ccz) = ((px / 16.0).floor() as i32, (pz / 16.0).floor() as i32);
+                let (dim, px, _, pz, yaw, _) = client_dim_pos(&me);
                 let mut ack = me.chunk_ack.lock().unwrap();
                 let mut ch = me.chunks.lock().unwrap();
                 let mut gen = me.gen_sources.lock().unwrap();
@@ -2751,10 +3365,9 @@ fn handle(mut s: TcpStream) {
                     &mut ch,
                     &mut gen,
                     &mut ack,
-                    *me.dim.lock().unwrap(),
-                    ccx,
-                    ccz,
-                    view,
+                    dim,
+                    ChunkWindow::at(px, pz, view),
+                    yaw,
                     false,
                 );
             }
@@ -2766,7 +3379,7 @@ fn handle(mut s: TcpStream) {
                 if effective != view {
                     view = effective;
                     *me.view.lock().unwrap() = view;
-                    let (x, _, z, _, _, _) = *me.pos.lock().unwrap();
+                    let (dim, x, _, z, yaw, _) = client_dim_pos(&me);
                     let mut ack = me.chunk_ack.lock().unwrap();
                     ack.set_window(window_batch(view));
                     let mut chunks = me.chunks.lock().unwrap();
@@ -2776,10 +3389,9 @@ fn handle(mut s: TcpStream) {
                         &mut chunks,
                         &mut gen,
                         &mut ack,
-                        *me.dim.lock().unwrap(),
-                        (x / 16.0).floor() as i32,
-                        (z / 16.0).floor() as i32,
-                        view,
+                        dim,
+                        ChunkWindow::at(x, z, view),
+                        yaw,
                         true,
                     );
                 }
@@ -2815,14 +3427,11 @@ fn handle(mut s: TcpStream) {
                     // lives on the player, so arriving in a destination portal does not
                     // immediately trigger the return trip.
                     if tick_portal(&me, view) {
-                        let (nx, _, nz, _, _, _) = *me.pos.lock().unwrap();
-                        player_chunk = ((nx / 16.0).floor() as i32, (nz / 16.0).floor() as i32);
                         continue;
                     }
-                    let (ccx, ccz) = ((px / 16.0).floor() as i32, (pz / 16.0).floor() as i32);
-                    if (ccx, ccz) != player_chunk {
-                        player_chunk = (ccx, ccz);
-
+                    let window = ChunkWindow::at(px, pz, view);
+                    let current = with_play_wire(&me.sock.lock().unwrap(), |play| play.window).flatten();
+                    if current != Some(window) {
                         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let mut ack = me.chunk_ack.lock().unwrap();
                             let mut ch = me.chunks.lock().unwrap();
@@ -2833,9 +3442,8 @@ fn handle(mut s: TcpStream) {
                                 &mut gen,
                                 &mut ack,
                                 *me.dim.lock().unwrap(),
-                                ccx,
-                                ccz,
-                                view,
+                                window,
+                                yaw,
                                 true,
                             )
                         }))
@@ -6407,5 +7015,269 @@ mod skin_cache_tests {
         assert_eq!(held.len(), SKIN_LOOKUPS_MAX);
         drop(held);
         assert!(SkinLookupSlot::try_acquire().is_some());
+    }
+}
+
+#[cfg(test)]
+mod connection_limits_wire_tests {
+    use super::*;
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(2)
+    }
+
+    #[test]
+    fn login_negotiation_and_play_framing_use_the_same_threshold() {
+        for threshold in [-1, 0, 256] {
+            let (client, mut peer) = effect_tests::client_pair();
+            let mut login_socket = client.sock.lock().unwrap().try_clone().unwrap();
+            let registration = negotiate_compression(&mut login_socket, threshold).unwrap();
+            let compression = usize::try_from(threshold).ok();
+            if compression.is_some() {
+                assert_eq!(
+                    read_packet(&mut peer, deadline()),
+                    Some((3, connection_limits::set_compression(threshold)))
+                );
+            }
+            send_packet(&mut login_socket, 2, vec![42]).unwrap();
+            assert_eq!(
+                read_login_frame(&mut peer, deadline(), compression),
+                Some((2, vec![42]))
+            );
+            drop(registration); // Login framing and the Play writer have separate owners.
+
+            client.enter_play_wire(compression, ChunkWindow::at(0.0, 0.0, 2));
+            let mut rx = RxBuf::new(compression);
+            for payload in [vec![0x12], vec![0x34; 512]] {
+                send_packet(&mut client.sock.lock().unwrap(), 0x26, payload.clone()).unwrap();
+                let end = deadline();
+                loop {
+                    assert!(Instant::now() < end, "Play frame did not arrive");
+                    match rx.next(&mut peer) {
+                        RxOut::Frame(id, body) => {
+                            assert_eq!((id, body), (0x26, payload));
+                            break;
+                        }
+                        RxOut::Idle => {}
+                        RxOut::Closed => panic!("Play frame failed to decode"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tracking_spawn_delta_and_removal_follow_the_observers_loaded_chunks() {
+        let (client, mut peer) = effect_tests::client_pair();
+        let client = Arc::new(client);
+        client.enter_play_wire(None, ChunkWindow::at(0.0, 0.0, 8));
+        let eid = 77;
+        let x = 16.0;
+        let y = 70.0;
+        let z = 0.0;
+        let arrow = TrackedSpawn {
+            dim: DimId::Overworld,
+            range: entity_tracking_range(4),
+            job: (
+                eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 4, x, y, z))]),
+            ),
+        };
+        let entities = [arrow];
+        sync_entity_interest(&client, &entities);
+        assert!(!client.seen.lock().unwrap().contains(&eid));
+        client.chunks.lock().unwrap().insert((1, 0));
+        sync_entity_interest(&client, &entities);
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x01, spawn_typed_pkt(eid, 4, x, y, z)))
+        );
+        assert!(client.seen.lock().unwrap().contains(&eid));
+
+        let upper = x + f64::from(i16::MAX) / 4096.0;
+        let next = upper + 1.5;
+        let moves = [
+            (upper, 0.0, 0x2e, vec![77, 0x7f, 0xff, 0, 0, 0, 0, 1]),
+            (next, 90.0, 0x2f, vec![77, 0x18, 0, 0, 0, 0, 0, 64, 0, 1]),
+            (next, 180.0, 0x30, vec![77, 128, 0, 1]),
+            (
+                next + 8.0,
+                180.0,
+                0x70,
+                entity_teleport(eid, next + 8.0, y, z, 180.0, 0.0, true),
+            ),
+        ];
+        for (position, yaw, id, expected) in moves {
+            broadcast_seen_ex_in(std::slice::from_ref(&client), eid, 0, |_| {
+                (0x70, entity_teleport(eid, position, y, z, yaw, 0.0, true))
+            });
+            assert_eq!(read_packet(&mut peer, deadline()), Some((id, expected)));
+        }
+        broadcast_seen_ex_in(std::slice::from_ref(&client), eid, 0, |_| {
+            (0x48, head_rot(eid, 90.0))
+        });
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x48, vec![77, 64]))
+        );
+        assert!(entity_in_tracking_range((0.0, 0.0), (64.0, 0.0), 4, 8));
+        assert!(!entity_in_tracking_range((0.0, 0.0), (64.0, 64.0), 4, 8));
+        assert!(!entity_in_tracking_range((0.0, 0.0), (64.01, 0.0), 4, 8));
+        assert!(!entity_in_tracking_range((0.0, 0.0), (33.0, 0.0), 4, 2));
+        client.chunks.lock().unwrap().clear();
+        sync_entity_interest(&client, &entities);
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x42, vec![1, 77]))
+        );
+        assert!(!client.seen.lock().unwrap().contains(&eid));
+    }
+
+    #[test]
+    fn moved_chunk_window_unloads_only_sent_chunks_and_prioritizes_the_look_direction() {
+        let previous = ChunkWindow {
+            center: (0, 0),
+            radius: 2,
+        };
+        let window = ChunkWindow {
+            center: (1, 0),
+            radius: 2,
+        };
+        let mut sent = HashSet::from([(-2, -2), (-2, 2), (1, 1), (2, 0)]);
+        assert_eq!(window.leaving(Some(previous), &sent), [(-2, -2), (-2, 2)]);
+        sent.retain(|&c| window.contains(c));
+        let south = window.pending(&sent, 0.0);
+        assert_eq!(south.len(), 23);
+        assert_eq!(south[0], (1, 0));
+        assert!(south[1].1 > 0);
+        assert_eq!(
+            south.iter().copied().collect::<HashSet<_>>().len(),
+            south.len()
+        );
+        assert!(south.iter().all(|c| !sent.contains(c)));
+        assert_eq!(window.leaving(Some(window), &sent), []);
+        let smaller = ChunkWindow {
+            center: (1, 0),
+            radius: 0,
+        };
+        assert_eq!(smaller.leaving(Some(window), &sent).len(), 2);
+    }
+
+    #[test]
+    fn chunk_light_uses_empty_bits_and_keeps_only_nonzero_section_arrays() {
+        for dim in [DimId::Overworld, DimId::Nether] {
+            let sky_count = if dim.has_skylight() {
+                dim.light_sections()
+            } else {
+                0
+            };
+            let mut payload = vec![0x11, 0x22]; // all preceding chunk fields
+            for mask in [
+                if sky_count == 0 { 0 } else { dim.light_mask() },
+                dim.light_mask(),
+            ] {
+                payload.push(1);
+                payload.extend(mask.to_be_bytes());
+            }
+            payload.extend([0, 0]);
+            for (count, lit) in [(sky_count, 3), (dim.light_sections(), 1)] {
+                write_varint(&mut payload, count as i64);
+                for idx in 0..count {
+                    write_varint(&mut payload, 2048);
+                    let mut section = [0; 2048];
+                    if idx == lit {
+                        section[512] = 0x0e;
+                    }
+                    payload.extend(section);
+                }
+            }
+            cull_chunk_light(&mut payload, dim);
+            let sky_lit = if sky_count == 0 { 0 } else { 1u64 << 3 };
+            let block_lit = 1u64 << 1;
+            let all = dim.light_mask() as u64;
+            let expected = [
+                sky_lit,
+                block_lit,
+                if sky_count == 0 { 0 } else { all ^ sky_lit },
+                all ^ block_lit,
+            ];
+            assert_eq!(&payload[..2], &[0x11, 0x22]);
+            let mut light = &payload[2..];
+            for mask in expected {
+                assert_eq!(read_protocol_i32(&mut light), Some(i32::from(mask != 0)));
+                if mask != 0 {
+                    assert_eq!(light[..8], mask.to_be_bytes());
+                    light = &light[8..];
+                }
+            }
+            let sky = i32::from(sky_count > 0);
+            for count in [sky, 1] {
+                assert_eq!(read_protocol_i32(&mut light), Some(count));
+                if count == 1 {
+                    assert_eq!(read_protocol_i32(&mut light), Some(2048));
+                    assert_eq!(light[512], 0x0e);
+                    light = &light[2048..];
+                }
+            }
+            assert!(light.is_empty());
+        }
+    }
+
+    #[test]
+    fn config_sends_datapack_nbt_under_0x07_with_stable_vanilla_ids() {
+        let mut config = captured_config_packets().unwrap();
+        let damage_id = player_attack_damage_wire_id(&config).unwrap();
+        let files = [
+            (
+                "data/minecraft/damage_type/player_attack.json",
+                br#"{"message_id":"changed","scaling":"never","exhaustion":0.1}"#.as_slice(),
+            ),
+            (
+                "data/custom/damage_type/first.json",
+                br#"{"message_id":"first","scaling":"never","exhaustion":0.0}"#.as_slice(),
+            ),
+        ];
+        let overlays = build_registry_data_payloads([files]).unwrap();
+        assert_eq!(
+            overlays,
+            registry_tests::build_registry_data_payloads([files]).unwrap()
+        );
+        merge_registry_overlays(&mut config, &overlays).unwrap();
+        assert_eq!(player_attack_damage_wire_id(&config), Some(damage_id));
+        let (_, packet) = config
+            .iter()
+            .find(|(pid, packet)| {
+                *pid == 0x07 && config_registry_header(packet).unwrap().0 == "minecraft:damage_type"
+            })
+            .unwrap();
+        let (client, mut peer) = effect_tests::client_pair();
+        write_frame(&mut client.sock.lock().unwrap(), packet, Some(256)).unwrap();
+        let (id, body) = read_login_frame(&mut peer, deadline(), Some(256)).unwrap();
+        assert_eq!(id, 0x07);
+        let mut body = body.as_slice();
+        assert_eq!(registry_wire_name(&mut body), Some("minecraft:damage_type"));
+        let entries = registry_wire_entries(body).unwrap();
+        assert_eq!(entries[damage_id as usize].0, "minecraft:player_attack");
+        assert!(entries[damage_id as usize]
+            .1
+            .windows(7)
+            .any(|window| window == b"changed"));
+        assert_eq!(entries.last().unwrap().0, "custom:first");
+
+        let bundled = load_registry_overlays(std::path::Path::new(DATAPACK_DIRECTORY)).unwrap();
+        assert!(!bundled.is_empty());
+        let config = load_config_packets();
+        let names: Vec<_> = config
+            .iter()
+            .filter(|(id, _)| *id == 0x07)
+            .map(|(_, packet)| config_registry_header(packet).unwrap().0)
+            .collect();
+        assert_eq!(
+            names,
+            SYNCED_REGISTRIES.map(|name| format!("minecraft:{name}"))
+        );
     }
 }

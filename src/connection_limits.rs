@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 // ----------------------------------------------------------- protocol codecs
 
 /// Login packet 0x03 payload; send before enabling compressed framing.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn set_compression(threshold: i32) -> Vec<u8> {
     let mut payload = Vec::new();
     crate::write_varint(&mut payload, i64::from(threshold));
@@ -34,7 +33,6 @@ pub(crate) fn set_compression(threshold: i32) -> Vec<u8> {
 }
 
 /// Frame a packet (including its packet ID) after compression is enabled.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn encode_compressed_frame(raw: &[u8], threshold: usize) -> Vec<u8> {
     use std::io::Write;
 
@@ -58,13 +56,12 @@ pub(crate) fn encode_compressed_frame(raw: &[u8], threshold: usize) -> Vec<u8> {
 }
 
 /// Decode the frame body after its outer packet length has been removed.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_compressed_frame(
     mut body: &[u8],
     threshold: usize,
     max_uncompressed: usize,
 ) -> Result<Vec<u8>, String> {
-    use std::io::Read;
+    use flate2::{Decompress, FlushDecompress, Status};
 
     let length = crate::read_protocol_i32(&mut body)
         .and_then(|n| usize::try_from(n).ok())
@@ -78,24 +75,32 @@ pub(crate) fn decode_compressed_frame(
     if length < threshold || length > max_uncompressed {
         return Err("invalid compressed packet length".into());
     }
-    let decoder = flate2::read::ZlibDecoder::new(body);
-    let mut decoded = Vec::new();
-    decoder
-        .take(length as u64 + 1)
-        .read_to_end(&mut decoded)
+    let mut decoder = Decompress::new(true);
+    let mut decoded = vec![0; length + 1];
+    let status = decoder
+        .decompress(body, &mut decoded, FlushDecompress::Finish)
         .map_err(|e| format!("invalid zlib data: {e}"))?;
-    if decoded.len() != length {
-        return Err("uncompressed length mismatch".into());
+    if status != Status::StreamEnd
+        || decoder.total_out() != length as u64
+        || decoder.total_in() != body.len() as u64
+    {
+        return Err("zlib stream does not match the frame length".into());
     }
+    decoded.truncate(length);
     Ok(decoded)
 }
 
-/// Returns None when any rounded delta cannot be represented; use teleport then.
-#[cfg_attr(not(test), allow(dead_code))]
+/// VecDeltaCodec subtracts separately rounded 1/4096-block positions.
+/// Use teleport when any component does not fit in a signed short.
 pub(crate) fn relative_move_delta(old: [f64; 3], new: [f64; 3]) -> Option<[i16; 3]> {
+    let encode = |position: f64| {
+        let scaled = position * 4096.0;
+        let floor = scaled.floor();
+        floor + f64::from(scaled - floor >= 0.5)
+    };
     let mut result = [0; 3];
     for i in 0..3 {
-        let delta = ((new[i] - old[i]) * 4096.0).round();
+        let delta = encode(new[i]) - encode(old[i]);
         if !delta.is_finite() || delta < f64::from(i16::MIN) || delta > f64::from(i16::MAX) {
             return None;
         }
@@ -105,7 +110,6 @@ pub(crate) fn relative_move_delta(old: [f64; 3], new: [f64; 3]) -> Option<[i16; 
 }
 
 /// Payload for 0x2e or, with angles, 0x2f. Angles are protocol bytes.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn entity_relative_move(
     entity_id: i32,
     delta: [i16; 3],
@@ -125,7 +129,6 @@ pub(crate) fn entity_relative_move(
 }
 
 /// Payload for 0x30.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn entity_rotation(entity_id: i32, yaw: u8, pitch: u8, on_ground: bool) -> Vec<u8> {
     let mut payload = Vec::new();
     crate::write_varint(&mut payload, i64::from(entity_id));
@@ -133,8 +136,7 @@ pub(crate) fn entity_rotation(entity_id: i32, yaw: u8, pitch: u8, on_ground: boo
     payload
 }
 
-/// Payload for 0x49.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Payload for 0x48.
 pub(crate) fn entity_head_rotation(entity_id: i32, yaw: u8) -> Vec<u8> {
     let mut payload = Vec::new();
     crate::write_varint(&mut payload, i64::from(entity_id));
@@ -774,6 +776,9 @@ mod tests {
         assert!(decode_compressed_frame(&[0, 1, 2], 3, 1).is_err());
         assert!(decode_compressed_frame(&[0x80], 1, 100).is_err());
         assert!(decode_compressed_frame(&body[..body.len() - 1], 6, 100).is_err());
+        let mut trailing = body.to_vec();
+        trailing.push(0);
+        assert!(decode_compressed_frame(&trailing, 6, 100).is_err());
     }
 
     #[test]
@@ -783,6 +788,15 @@ mod tests {
         assert_eq!(relative_move_delta([0.0; 3], [8.0, 0.0, 0.0]), None);
         assert_eq!(relative_move_delta([0.0; 3], [-8.001, 0.0, 0.0]), None);
         assert_eq!(relative_move_delta([0.0; 3], [f64::NAN, 0.0, 0.0]), None);
+        // Crossing a quantization boundary can advance by one step even for
+        // a change under half a step. Java rounds negative ties toward +∞.
+        assert_eq!(
+            relative_move_delta(
+                [0.49 / 4096.0, 0.0, 0.0],
+                [0.51 / 4096.0, -0.5 / 4096.0, 0.0]
+            ),
+            Some([1, 0, 0])
+        );
         assert_eq!(
             entity_relative_move(300, delta, None, true),
             [0xac, 0x02, 0x80, 0, 0x18, 0, 0x7f, 0xff, 1]
