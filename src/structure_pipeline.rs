@@ -922,6 +922,14 @@ fn valid_biome(g: &mut Gen, allowed: &HashSet<String>, pos: (i32, i32, i32)) -> 
     if allowed.is_empty() {
         return true;
     }
+    // Structure.isValidBiome samples the noise source at QuartPos.fromBlock,
+    // without the Voronoi zoom used by LevelReader.getBiome.
+    if let Some((_, leaf)) = g.biome_quart(pos.0 >> 2, pos.1 >> 2, pos.2 >> 2, None) {
+        return g
+            .biome_name_of_leaf(leaf)
+            .is_some_and(|name| allowed.contains(&name));
+    }
+    // Synthetic generators may have no noise-biome source.
     let Some(biome) = FC::new(g).biome(pos.0, pos.1, pos.2) else {
         return false;
     };
@@ -1024,11 +1032,7 @@ fn try_generate(
             // centre (-376,64,360) is `soul_sand_valley`. `#has_structure/nether_fossil`
             // holds only soul_sand_valley, so vanilla refuses the start and the port
             // used to place it (spurious beard at bb=[-384,88,366,-382,91,367]).
-            if !def.biomes.is_empty()
-                && !fc
-                    .biome(stub.0, stub.1, stub.2)
-                    .is_some_and(|biome| def.biomes.contains(&biome))
-            {
+            if !valid_biome(fc.g, &def.biomes, stub) {
                 return None;
             }
             let pieces = with_templates(|templates| build(&mut fc, templates, &mut gen, reg).ok())?;
@@ -1213,11 +1217,7 @@ fn try_generate(
                 let mut fc = FC::new(g);
                 let (stub, build) =
                     structure_template::find_mansion_pieces(&mut fc, cx, cz, &mut gen)?;
-                if !def.biomes.is_empty()
-                    && !fc
-                        .biome(stub.0, stub.1, stub.2)
-                        .is_some_and(|b| def.biomes.contains(&b))
-                {
+                if !valid_biome(fc.g, &def.biomes, stub) {
                     return None;
                 }
                 let pieces = with_templates(|templates| build(&mut fc, templates, &mut gen, reg));
@@ -2178,6 +2178,27 @@ pub(crate) fn register_beard_resolver() {
 #[cfg(test)]
 mod pipeline_tests {
     use super::*;
+
+    #[test]
+    fn valid_biome_samples_noise_quarts_without_voronoi_zoom() {
+        let mut g = Gen::load_preset(4242, crate::name_to_state, worldgen::NoisePreset::Nether)
+            .expect("nether gen");
+        // A biome boundary distinguishes the structure's quart lookup from the
+        // LevelReader lookup. Include negative coordinates to exercise >> 2.
+        let (pos, noise, blended) = (-392..=-360)
+            .find_map(|x| {
+                (340..=380).find_map(|z| {
+                    let pos = (x, 88, z);
+                    let (_, leaf) = g.biome_quart(x >> 2, 88 >> 2, z >> 2, None)?;
+                    let noise = g.biome_name_of_leaf(leaf)?;
+                    let blended = FC::new(&mut g).biome(x, 88, z)?;
+                    (noise != blended).then_some((pos, noise, blended))
+                })
+            })
+            .expect("nether boundary with differing quart and blended biomes");
+        assert!(valid_biome(&mut g, &HashSet::from([noise]), pos));
+        assert!(!valid_biome(&mut g, &HashSet::from([blended]), pos));
+    }
 
     /// `isStructureChunk` for a set id (null when the set did not load).
     fn admits(set_id: &str, seed: u64, x: i32, z: i32) -> Option<bool> {

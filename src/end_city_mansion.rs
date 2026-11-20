@@ -3089,13 +3089,13 @@ pub(crate) fn mansion_after_place<W: TemplateWorld>(
             {
                 continue;
             }
-            let mut y = min_y - 1;
-            while y > sea_level {
-                let inside = y >= world.min_y() && y < world.min_y() + world.height();
-                if inside && !is_air_state(reg, world.get(x, y, z)) {
-                    if !reg.is_liquid(world.get(x, y, z)) {
-                        break;
-                    }
+            let Some(mut y) = min_y.checked_sub(1) else {
+                continue;
+            };
+            while y > sea_level.max(world.min_y()) {
+                let state = world.get(x, y, z);
+                if !is_air_state(reg, state) && !reg.is_liquid(state) {
+                    break;
                 }
                 if world.set(x, y, z, cobblestone) {
                     written += 1;
@@ -4091,5 +4091,69 @@ mod end_city_mansion_tests {
             !world.writes.contains_key(&(2, 65, 2)),
             "a column outside the pieces is left alone"
         );
+    }
+
+    #[test]
+    fn mansion_foundation_stops_at_world_bottom_when_sea_is_lower() {
+        let reg = breg().expect("block registry");
+        let mut scene = flat_scene(reg, -64, -100);
+        scene.height = 16;
+        let mut world = TestWorld::new(scene);
+        let cobblestone = reg.state_of("minecraft:cobblestone", None);
+        world.set(0, -60, 0, cobblestone);
+        let pieces = vec![TemplatePiece {
+            template: "minecraft:woodland_mansion/wall_flat".to_string(),
+            pos: (0, -60, 0),
+            bb: [0, -60, 0, 0, -60, 0],
+            rotation: Rotation::None,
+            mirror: Mirror::None,
+            ignore_air: false,
+            gen_depth: 0,
+        }];
+        let chunk_bb: BB = [0, -64, 0, 15, -49, 15];
+        assert_eq!(mansion_after_place(&mut world, &pieces, &chunk_bb, reg), 3);
+        for y in -63..=-61 {
+            assert_eq!(world.writes[&(0, y, 0)], cobblestone);
+        }
+        assert!(!world.writes.contains_key(&(0, -64, 0)));
+
+        // Starting at the world's lowest block leaves no room for a foundation.
+        let bottom_piece = [TemplatePiece {
+            pos: (0, -64, 0),
+            bb: [0, -64, 0, 0, -64, 0],
+            ..pieces[0].clone()
+        }];
+        world.set(0, -64, 0, cobblestone);
+        assert_eq!(mansion_after_place(&mut world, &bottom_piece, &chunk_bb, reg), 0);
+    }
+
+    #[test]
+    fn mansion_foundation_replaces_water_and_lava_but_stops_on_solid() {
+        let reg = breg().expect("block registry");
+        let mut scene = flat_scene(reg, 60, 63);
+        scene.cells.insert((0, 68, 0), reg.state_of("minecraft:water", None));
+        scene.cells.insert((0, 67, 0), reg.state_of("minecraft:lava", None));
+        scene.cells.insert((1, 68, 0), reg.state_of("minecraft:stone", None));
+        let mut world = TestWorld::new(scene);
+        let cobblestone = reg.state_of("minecraft:cobblestone", None);
+        world.set(0, 70, 0, cobblestone);
+        world.set(1, 70, 0, cobblestone);
+        let pieces = vec![TemplatePiece {
+            template: "minecraft:woodland_mansion/wall_flat".to_string(),
+            pos: (0, 70, 0),
+            bb: [0, 70, 0, 1, 70, 0],
+            rotation: Rotation::None,
+            mirror: Mirror::None,
+            ignore_air: false,
+            gen_depth: 0,
+        }];
+        let chunk_bb: BB = [0, -64, 0, 15, 319, 15];
+        assert_eq!(mansion_after_place(&mut world, &pieces, &chunk_bb, reg), 7);
+        for y in 64..=69 {
+            assert_eq!(world.writes[&(0, y, 0)], cobblestone);
+        }
+        assert_eq!(world.writes[&(1, 69, 0)], cobblestone);
+        assert!(!world.writes.contains_key(&(1, 68, 0)));
+        assert!(!world.writes.contains_key(&(0, 63, 0)));
     }
 }
