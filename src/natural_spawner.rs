@@ -1,6 +1,7 @@
 // Minecraft 1.21.1 NaturalSpawner primitives. Included directly in main.rs.
 // The world adapter owns actual entities, block queries and spawned-chunk selection.
 use crate::generation_math::Lcg;
+include!("mob_despawn.rs");
 
 #[cfg_attr(not(test), allow(dead_code))]
 const SPAWN_CAP_MAGIC_NUMBER: u64 = 17 * 17;
@@ -723,7 +724,7 @@ fn spawn_nightly_hostile(tick: u64) {
         let mut current_mobs = mobs().lock().unwrap();
         // A concurrent writer can fill a slot while terrain and biome are read.
         if has_room_for_nightly_monster(&current_mobs, cap) {
-            current_mobs.push(Arc::new(Mob {
+            push_natural_hostile(&mut current_mobs, Arc::new(Mob {
                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                 uuid: [0u8; 16],
                 etype,
