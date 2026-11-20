@@ -7186,7 +7186,7 @@ fn furnace_slots(pos: (i32, i32, i32)) -> HashMap<i16, Stack> {
 /// anything caching an answer derived from them must key on this.
 static CONTENT_REVISION: AtomicU64 = AtomicU64::new(0);
 fn content_revision() -> u64 {
-    CONTENT_REVISION.load(Ordering::Relaxed)
+    CONTENT_REVISION.load(Ordering::Acquire)
 }
 
 /// The smelting result, independent of which furnace is asking. Datapack recipes
@@ -18143,7 +18143,7 @@ fn resource_pack_pkt() -> Option<Vec<u8>> {
     Some(p)
 }
 
-// ---------- datapacks (folder packs under datapacks/) ----------
+// ---------- datapacks (directories and ZIP files under datapacks/) ----------
 struct Datapack {
     name: String,
     functions: HashMap<String, Vec<String>>,
@@ -18155,613 +18155,755 @@ fn packs() -> &'static Mutex<Vec<Datapack>> {
     PACKS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn load_datapacks() {
-    let base = std::path::Path::new("datapacks");
-    let Ok(rd) = std::fs::read_dir(base) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let dir = e.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let mut pk = Datapack {
-            name: e.file_name().to_string_lossy().into(),
-            functions: HashMap::new(),
-            load: vec![],
-            tick: vec![],
+#[derive(Default)]
+struct DatapackContent {
+    packs: Vec<Datapack>,
+    recipes: Vec<JsonRecipe>,
+    smelts: Vec<SmeltRecipe>,
+    block_tags: HashMap<String, Vec<String>>,
+    item_tags: HashMap<String, Vec<String>>,
+    loot: HashMap<String, Vec<LootPool>>,
+    mob_loot: HashMap<i64, Vec<LootPool>>,
+    item_mods: HashMap<String, Vec<LootFunc>>,
+    advancements: HashMap<String, Advancement>,
+    predicates: HashMap<String, String>,
+}
+
+impl DatapackContent {
+    fn publish(self) {
+        // Recipes consult item tags while holding their own locks. Counts also
+        // reads block tags under the recipe lock. Publish in that lock order.
+        let mut recipes = json_recipes().lock().unwrap();
+        let mut smelts = json_smelts().lock().unwrap();
+        let mut blocks = block_tags().lock().unwrap();
+        let mut items = item_tags().lock().unwrap();
+        let mut loot = loot_tables().lock().unwrap();
+        let mut mob_loot = mob_loot_tables().lock().unwrap();
+        let mut mods = item_mods().lock().unwrap();
+        let mut advs = advancements().lock().unwrap();
+        let mut conditions = predicates().lock().unwrap();
+        let mut active = packs().lock().unwrap();
+        *recipes = self.recipes;
+        *smelts = self.smelts;
+        *blocks = self.block_tags;
+        *items = self.item_tags;
+        *loot = self.loot;
+        *mob_loot = self.mob_loot;
+        *mods = self.item_mods;
+        *advs = self.advancements;
+        *conditions = self.predicates;
+        *active = self.packs;
+        CONTENT_REVISION.fetch_add(1, Ordering::Release);
+    }
+
+    fn read_entry(&mut self, pack: &mut Datapack, path: &str, body: &str) {
+        let Some(("data", path)) = path.split_once('/') else {
+            return;
         };
-        // functions: data/<ns>/function/**/*.mcfunction (1.21 layout: 'function' singular)
-        if let Ok(data) = std::fs::read_dir(dir.join("data")) {
-            for ns in data.flatten() {
-                let nsn = ns.file_name().to_string_lossy().to_string();
-                for tag in ["function", "functions"] {
-                    let fdir = ns.path().join(tag);
-                    let mut stack = vec![fdir];
-                    while let Some(d) = stack.pop() {
-                        if let Ok(rr) = std::fs::read_dir(&d) {
-                            for f in rr.flatten() {
-                                let p = f.path();
-                                if p.is_dir() {
-                                    stack.push(p);
-                                    continue;
-                                }
-                                if p.extension().map(|x| x == "mcfunction").unwrap_or(false) {
-                                    let rel = p
-                                        .strip_prefix(ns.path().join(tag))
-                                        .unwrap()
-                                        .to_string_lossy()
-                                        .replace('\\', "/");
-                                    let key =
-                                        format!("{}:{}", nsn, rel.trim_end_matches(".mcfunction"));
-                                    if let Ok(body) = std::fs::read_to_string(&p) {
-                                        pk.functions.insert(
-                                            key,
-                                            body.lines()
-                                                .map(|l| l.trim().to_string())
-                                                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                                                .collect(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // block/item tag members: data/<ns>/tags/{block,blocks,item,items}/**.json
-                for kind in ["block", "blocks", "item", "items"] {
-                    let tdir = ns.path().join("tags").join(kind);
-                    if !tdir.exists() {
-                        continue;
-                    }
-                    let mut stack = vec![tdir.clone()];
-                    while let Some(dir) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else {
-                            continue;
+        let Some((ns, path)) = path.split_once('/') else {
+            return;
+        };
+        let Some((kind, rel)) = path.split_once('/') else {
+            return;
+        };
+        if let "function" | "functions" = kind {
+            if let Some(name) = rel.strip_suffix(".mcfunction") {
+                pack.functions.insert(
+                    format!("{ns}:{name}"),
+                    body.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                        .map(str::to_owned)
+                        .collect(),
+                );
+            }
+            return;
+        }
+        let Some(rel) = rel.strip_suffix(".json") else {
+            return;
+        };
+        let key = format!("{ns}:{rel}");
+        match kind {
+            "tags" => {
+                let Some((tag, name)) = rel.split_once('/') else {
+                    return;
+                };
+                match tag {
+                    "block" | "blocks" | "item" | "items" => {
+                        let dst = if tag.starts_with('b') {
+                            &mut self.block_tags
+                        } else {
+                            &mut self.item_tags
                         };
-                        for e in rd.flatten() {
-                            let p = e.path();
-                            if p.is_dir() {
-                                stack.push(p);
-                                continue;
-                            }
-                            if p.extension().map(|x| x == "json").unwrap_or(false) {
-                                let rel = p
-                                    .strip_prefix(&tdir)
-                                    .unwrap()
-                                    .to_string_lossy()
-                                    .replace('\\', "/");
-                                let key = format!("{}:{}", nsn, rel.trim_end_matches(".json"));
-                                if let Ok(body) = std::fs::read_to_string(&p) {
-                                    if let Some(va) = body.split("\"values\"").nth(1) {
-                                        let mut vals: Vec<String> = Vec::new();
-                                        for m in va.split('"').skip(1).step_by(2) {
-                                            let m = m.trim();
-                                            if m.is_empty()
-                                                || m.starts_with(']')
-                                                || m.starts_with('{')
-                                            {
-                                                continue;
-                                            }
-                                            vals.push(if m.contains(':') || m.starts_with('#') {
-                                                m.to_string()
-                                            } else {
-                                                format!("minecraft:{}", m)
-                                            });
-                                        }
-                                        if kind.starts_with('b') {
-                                            block_tags()
-                                                .lock()
-                                                .unwrap()
-                                                .entry(key)
-                                                .or_default()
-                                                .extend(vals);
+                        if let Some(values) = body.split("\"values\"").nth(1) {
+                            dst.entry(format!("{ns}:{name}")).or_default().extend(
+                                values
+                                    .split('"')
+                                    .skip(1)
+                                    .step_by(2)
+                                    .map(str::trim)
+                                    .filter(|m| !m.is_empty() && !m.starts_with([']', '{']))
+                                    .map(|m| {
+                                        if m.contains(':') || m.starts_with('#') {
+                                            m.to_owned()
                                         } else {
-                                            item_tags()
-                                                .lock()
-                                                .unwrap()
-                                                .entry(key)
-                                                .or_default()
-                                                .extend(vals);
+                                            format!("minecraft:{m}")
                                         }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // crafting recipes: data/<ns>/recipe/**.json (shaped+shapeless)
-                for kind in ["recipe", "recipes"] {
-                    let rdir = ns.path().join(kind);
-                    if !rdir.exists() {
-                        continue;
-                    }
-                    let mut stack = vec![rdir.clone()];
-                    while let Some(dir) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else {
-                            continue;
-                        };
-                        for e in rd.flatten() {
-                            let p = e.path();
-                            if p.is_dir() {
-                                stack.push(p);
-                                continue;
-                            }
-                            if !p.extension().map(|x| x == "json").unwrap_or(false) {
-                                continue;
-                            }
-                            let Ok(body) = std::fs::read_to_string(&p) else {
-                                continue;
-                            };
-                            let mk_ingr = |spec: &str| -> Option<Ingr> {
-                                if let Some(t) = jstr(spec, "tag") {
-                                    let t = t.trim_start_matches('#');
-                                    Some(Ingr::Tag(if t.contains(':') {
-                                        t.to_string()
-                                    } else {
-                                        format!("minecraft:{}", t)
-                                    }))
-                                } else if let Some(n) = jstr(spec, "item") {
-                                    name_to_item(n.trim_start_matches("minecraft:")).map(Ingr::Item)
-                                } else {
-                                    jstr(spec, "").and(None)
-                                } // object-less spec unsupported
-                            };
-                            let (out_id, out_cnt) = {
-                                let rblk = jblock(&body, "result");
-                                let id = rblk
-                                    .and_then(|b| jstr(b, "id"))
-                                    .or_else(|| jstr(&body, "result"));
-                                let cnt = rblk
-                                    .and_then(|b| jnum(b, "count"))
-                                    .or_else(|| jnum(&body, "count"))
-                                    .unwrap_or(1)
-                                    .clamp(1, 64) as u8;
-                                (
-                                    id.and_then(|i| {
-                                        name_to_item(i.trim_start_matches("minecraft:"))
                                     }),
-                                    cnt,
-                                )
-                            };
-                            let Some(out) = out_id else { continue };
-                            if body.contains("crafting_shaped") {
-                                let mut rows: Vec<String> = Vec::new();
-                                if let Some(pa) = jarray(&body, "pattern") {
-                                    for m in pa.split('"').skip(1).step_by(2) {
-                                        if !m.is_empty() {
-                                            rows.push(m.to_string())
-                                        }
-                                    }
-                                }
-                                let mut key: HashMap<char, Ingr> = HashMap::new();
-                                if let Some(kb) = jblock(&body, "key") {
-                                    let inner = &kb[1..kb.len() - 1];
-                                    for entry in inner.split(',') {
-                                        let Some(col) = entry.find(':') else { continue };
-                                        let ch = entry[..col]
-                                            .trim()
-                                            .trim_matches('"')
-                                            .chars()
-                                            .next()
-                                            .unwrap_or(' ');
-                                        let spec = entry[col..].trim();
-                                        if let Some(ig) = mk_ingr(spec) {
-                                            key.insert(ch, ig);
-                                        }
-                                    }
-                                }
-                                if !rows.is_empty() {
-                                    json_recipes().lock().unwrap().push(JsonRecipe {
-                                        shaped: true,
-                                        rows,
-                                        key,
-                                        ing: Vec::new(),
-                                        out,
-                                        out_cnt,
-                                    });
-                                }
-                            } else if body.contains("crafting_shapeless") {
-                                let mut ing: Vec<Ingr> = Vec::new();
-                                if let Some(ia) = jarray(&body, "ingredients") {
-                                    for spec in ia.split('{').skip(1) {
-                                        if let Some(ig) = mk_ingr(spec) {
-                                            ing.push(ig)
-                                        }
-                                    }
-                                    if ing.is_empty() {
-                                        // bare form: ["minecraft:x","minecraft:y"]
-                                        for m in ia.split('"').skip(1).step_by(2) {
-                                            if let Some(i) =
-                                                name_to_item(m.trim_start_matches("minecraft:"))
-                                            {
-                                                ing.push(Ingr::Item(i));
-                                            }
-                                        }
-                                    }
-                                }
-                                if !ing.is_empty() {
-                                    json_recipes().lock().unwrap().push(JsonRecipe {
-                                        shaped: false,
-                                        rows: Vec::new(),
-                                        key: HashMap::new(),
-                                        ing,
-                                        out,
-                                        out_cnt,
-                                    });
-                                }
-                            } else if ["smelting", "blasting", "smoking", "campfire_cooking"]
-                                .iter()
-                                .any(|k| body.contains(k))
-                            {
-                                // "ingredient": {"item"|"tag":...} or bare "minecraft:x"
-                                let ig =
-                                    jblock(&body, "ingredient").and_then(mk_ingr).or_else(|| {
-                                        jstr(&body, "ingredient").and_then(|n| {
-                                            name_to_item(n.trim_start_matches("minecraft:"))
-                                                .map(Ingr::Item)
-                                        })
-                                    });
-                                if let Some(ig) = ig {
-                                    let xp = jstr(&body, "experience")
-                                        .and_then(|v| v.parse::<f32>().ok())
-                                        .unwrap_or(0.0);
-                                    json_smelts().lock().unwrap().push((ig, out, out_cnt, xp));
-                                }
-                            }
+                            );
                         }
                     }
-                }
-                // loot tables: data/<ns>/loot_table[s]/**.json (entities/* also key by mob)
-                for kind in ["loot_table", "loot_tables"] {
-                    let ldir = ns.path().join(kind);
-                    if !ldir.exists() {
-                        continue;
-                    }
-                    let lbase = ldir.clone();
-                    let mut stack = vec![ldir.clone()];
-                    while let Some(dir) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else {
-                            continue;
+                    "function" | "functions" => {
+                        let dst = match name {
+                            "load" => &mut pack.load,
+                            "tick" => &mut pack.tick,
+                            _ => return,
                         };
-                        for e in rd.flatten() {
-                            let p = e.path();
-                            if p.is_dir() {
-                                stack.push(p);
-                                continue;
-                            }
-                            if !p.extension().map(|x| x == "json").unwrap_or(false) {
-                                continue;
-                            }
-                            let Ok(body) = std::fs::read_to_string(&p) else {
-                                continue;
-                            };
-                            let relp = p
-                                .strip_prefix(&lbase)
-                                .unwrap()
-                                .to_string_lossy()
-                                .replace('\\', "/")
-                                .trim_end_matches(".json")
-                                .to_string();
-                            let lkey = format!("{}:{}", nsn, relp);
-                            let mut pools: Vec<LootPool> = Vec::new();
-                            if let Some(pa) = jarray(&body, "pools") {
-                                for pb in jobjects(pa) {
-                                    let rolls = jnum(pb, "rolls")
-                                        .or_else(|| {
-                                            jblock(pb, "rolls").and_then(|b| jnum(b, "max"))
-                                        })
-                                        .unwrap_or(1)
-                                        .clamp(1, 64)
-                                        as u8;
-                                    let mut chance = 1.0f32;
-                                    if let Some(ca) = jarray(pb, "conditions") {
-                                        for cb in jobjects(ca) {
-                                            if cb.contains("random_chance") {
-                                                if let Some(c) = jnum(cb, "chance") {
-                                                    chance *= c as f32 / 100.0;
-                                                } else if let Some(c) = jstr(cb, "chance")
-                                                    .and_then(|x| x.parse::<f32>().ok())
-                                                {
-                                                    chance *= c;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let mut entries: Vec<LootEntry> = Vec::new();
-                                    if let Some(ea) = jarray(pb, "entries") {
-                                        for eb in jobjects(ea) {
-                                            if !eb.contains("\"item\"") && !eb.contains("item") {
-                                                continue;
-                                            }
-                                            let Some(n) = jstr(eb, "name") else { continue };
-                                            let Some(item) =
-                                                name_to_item(n.trim_start_matches("minecraft:"))
-                                            else {
-                                                continue;
-                                            };
-                                            let (mut lo, mut hi) = (1u8, 1u8);
-                                            let mut efuncs: Vec<LootFunc> = Vec::new();
-                                            if let Some(fa) = jarray(eb, "functions") {
-                                                for fb in jobjects(fa) {
-                                                    if fb.contains("set_count") {
-                                                        if let Some(cb) = jblock(fb, "count") {
-                                                            lo = jnum(cb, "min")
-                                                                .unwrap_or(1)
-                                                                .clamp(0, 64)
-                                                                as u8;
-                                                            hi = jnum(cb, "max")
-                                                                .unwrap_or(lo as i64)
-                                                                .clamp(0, 64)
-                                                                as u8;
-                                                        } else if let Some(c) = jnum(fb, "count") {
-                                                            lo = c.clamp(0, 64) as u8;
-                                                            hi = lo;
-                                                        }
-                                                    } else {
-                                                        efuncs.extend(parse_loot_funcs(fb));
-                                                    }
-                                                }
-                                            }
-                                            entries.push(LootEntry {
-                                                item,
-                                                min: lo,
-                                                max: hi.max(lo),
-                                                funcs: efuncs,
-                                            });
-                                        }
-                                    }
-                                    let pfuncs: Vec<LootFunc> = jarray(pb, "functions")
-                                        .map(parse_loot_funcs)
-                                        .unwrap_or_default();
-                                    if !entries.is_empty() {
-                                        pools.push(LootPool {
-                                            rolls,
-                                            chance,
-                                            entries,
-                                            funcs: pfuncs,
-                                        });
-                                    }
-                                }
-                            }
-                            if !pools.is_empty() {
-                                // later packs override the same table (vanilla pack order)
-                                loot_tables().lock().unwrap().insert(lkey, pools);
-                                if relp.starts_with("entities/") {
-                                    if let Some(mob) = p
-                                        .file_stem()
-                                        .and_then(|s| s.to_str())
-                                        .and_then(name_to_etype)
-                                    {
-                                        if let Some(pl) = loot_tables()
-                                            .lock()
-                                            .unwrap()
-                                            .get(&format!("{}:{}", nsn, relp))
-                                        {
-                                            let cloned: Vec<LootPool> = pl
-                                                .iter()
-                                                .map(|p| LootPool {
-                                                    rolls: p.rolls,
-                                                    chance: p.chance,
-                                                    funcs: p.funcs.clone(),
-                                                    entries: p
-                                                        .entries
-                                                        .iter()
-                                                        .map(|e| LootEntry {
-                                                            item: e.item,
-                                                            min: e.min,
-                                                            max: e.max,
-                                                            funcs: e.funcs.clone(),
-                                                        })
-                                                        .collect(),
-                                                })
-                                                .collect();
-                                            mob_loot_tables().lock().unwrap().insert(mob, cloned);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // item modifiers: data/<ns>/item_modifier/*.json
-                for kind in ["item_modifier", "item_modifiers"] {
-                    let idir = ns.path().join(kind);
-                    if !idir.exists() {
-                        continue;
-                    }
-                    let ibase = idir.clone();
-                    let mut stack = vec![idir.clone()];
-                    while let Some(dir) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else {
-                            continue;
-                        };
-                        for e in rd.flatten() {
-                            let p = e.path();
-                            if p.is_dir() {
-                                stack.push(p);
-                                continue;
-                            }
-                            if !p.extension().map(|x| x == "json").unwrap_or(false) {
-                                continue;
-                            }
-                            let Ok(body) = std::fs::read_to_string(&p) else {
-                                continue;
-                            };
-                            let relp = p
-                                .strip_prefix(&ibase)
-                                .unwrap()
-                                .to_string_lossy()
-                                .replace('\\', "/")
-                                .trim_end_matches(".json")
-                                .to_string();
-                            let fns = parse_loot_funcs(&body);
-                            if !fns.is_empty() {
-                                item_mods()
-                                    .lock()
-                                    .unwrap()
-                                    .insert(format!("{}:{}", nsn, relp), fns);
-                            }
-                        }
-                    }
-                }
-                // advancements: data/<ns>/advancement/**.json -> id ns:relpath
-                for kind in ["advancement", "advancements"] {
-                    let adir = ns.path().join(kind);
-                    if !adir.exists() {
-                        continue;
-                    }
-                    let abase = adir.clone();
-                    let mut stack = vec![adir.clone()];
-                    while let Some(dir) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else {
-                            continue;
-                        };
-                        for e in rd.flatten() {
-                            let p = e.path();
-                            if p.is_dir() {
-                                stack.push(p);
-                                continue;
-                            }
-                            if !p.extension().map(|x| x == "json").unwrap_or(false) {
-                                continue;
-                            }
-                            let Ok(body) = std::fs::read_to_string(&p) else {
-                                continue;
-                            };
-                            let rel = p
-                                .strip_prefix(&abase)
-                                .unwrap()
-                                .to_string_lossy()
-                                .replace('\\', "/")
-                                .trim_end_matches(".json")
-                                .to_string();
-                            let Some(cb) = jblock(&body, "criteria") else {
-                                continue;
-                            };
-                            let inner = &cb[1..cb.len() - 1];
-                            let mut criteria: Vec<(String, String, Option<i64>)> = Vec::new();
-                            for co in jobjects(inner) {
-                                // criterion key precedes the object: find its name backwards
-                                let Some(cpos) = inner.find(co) else { continue };
-                                let pre = &inner[..cpos];
-                                let cn = pre
-                                    .rfind('"')
-                                    .and_then(|e2| pre[..e2].rfind('"').map(|s2| &pre[s2 + 1..e2]))
-                                    .unwrap_or("")
-                                    .to_string();
-                                let tr = jstr(co, "trigger")
-                                    .unwrap_or("")
-                                    .trim_start_matches("minecraft:")
-                                    .to_string();
-                                let want = jblock(co, "conditions")
-                                    .and_then(|cd| jblock(cd, "entity"))
-                                    .and_then(|en| jstr(en, "type"))
-                                    .and_then(|t| {
-                                        name_to_etype(t.trim_start_matches("minecraft:"))
-                                    });
-                                criteria.push((cn, tr, want));
-                            }
-                            let title = jblock(&body, "display")
-                                .and_then(|d| {
-                                    jblock(d, "title")
-                                        .and_then(|t| jstr(t, "text").map(|x| x.to_string()))
-                                        .or_else(|| jstr(d, "title").map(|x| x.to_string()))
-                                })
-                                .unwrap_or_else(|| rel.clone());
-                            if !criteria.is_empty() {
-                                advancements().lock().unwrap().insert(
-                                    format!("{}:{}", nsn, rel),
-                                    Advancement { title, criteria },
-                                );
-                            }
-                        }
-                    }
-                }
-                // predicates: data/<ns>/predicate/**.json -> id ns:relpath
-                for kind in ["predicate", "predicates"] {
-                    let pdir = ns.path().join(kind);
-                    if !pdir.exists() {
-                        continue;
-                    }
-                    let mut stack = vec![(pdir.clone(), String::new())];
-                    while let Some((dir, rel)) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else {
-                            continue;
-                        };
-                        for e in rd.flatten() {
-                            let p = e.path();
-                            let name = e.file_name().to_string_lossy().to_string();
-                            if p.is_dir() {
-                                stack.push((
-                                    p,
-                                    if rel.is_empty() {
-                                        name
-                                    } else {
-                                        format!("{}/{}", rel, name)
-                                    },
-                                ));
-                                continue;
-                            }
-                            if !name.ends_with(".json") {
-                                continue;
-                            }
-                            if let Ok(body) = std::fs::read_to_string(&p) {
-                                let rel = if rel.is_empty() {
-                                    name.trim_end_matches(".json").to_string()
-                                } else {
-                                    format!("{}/{}", rel, name.trim_end_matches(".json"))
-                                };
-                                predicates()
-                                    .lock()
-                                    .unwrap()
-                                    .insert(format!("{}:{}", nsn, rel), body);
-                            }
-                        }
-                    }
-                }
-                // tags: data/<ns>/tags/function/{load,tick}.json
-                for tag in ["function", "functions"] {
-                    for (jf, dst) in [("load", &mut pk.load), ("tick", &mut pk.tick)] {
-                        let jp = ns
-                            .path()
-                            .join("tags")
-                            .join(tag)
-                            .join(format!("{}.json", jf));
-                        if let Ok(body) = std::fs::read_to_string(&jp) {
-                            // tiny json: grab quoted strings inside "values" array
-                            if let Some(va) = body.split("\"values\"").nth(1) {
-                                for m in va.split('"').skip(1).step_by(2) {
-                                    if m.starts_with('#') || m.contains(':') {
+                        if let Some(values) = body.split("\"values\"").nth(1) {
+                            dst.extend(
+                                values
+                                    .split('"')
+                                    .skip(1)
+                                    .step_by(2)
+                                    .filter(|m| m.starts_with('#') || m.contains(':'))
+                                    .map(|m| {
                                         let m = m.trim_start_matches('#');
-                                        let m = if m.contains(':') {
-                                            m.to_string()
+                                        if m.contains(':') {
+                                            m.to_owned()
                                         } else {
-                                            format!("minecraft:{}", m)
-                                        };
-                                        dst.push(m);
-                                    }
-                                }
-                            }
+                                            format!("minecraft:{m}")
+                                        }
+                                    }),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "recipe" | "recipes" => self.read_recipe(body),
+            "loot_table" | "loot_tables" => self.read_loot(key, rel, body),
+            "item_modifier" | "item_modifiers" => {
+                let funcs = parse_loot_funcs(body);
+                if !funcs.is_empty() {
+                    self.item_mods.insert(key, funcs);
+                }
+            }
+            "advancement" | "advancements" => self.read_advancement(key, rel, body),
+            "predicate" | "predicates" => {
+                self.predicates.insert(key, body.to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    fn read_recipe(&mut self, body: &str) {
+        let mk_ingr = |spec: &str| -> Option<Ingr> {
+            if let Some(t) = jstr(spec, "tag") {
+                let t = t.trim_start_matches('#');
+                Some(Ingr::Tag(if t.contains(':') {
+                    t.to_string()
+                } else {
+                    format!("minecraft:{}", t)
+                }))
+            } else if let Some(n) = jstr(spec, "item") {
+                name_to_item(n.trim_start_matches("minecraft:")).map(Ingr::Item)
+            } else {
+                jstr(spec, "").and(None)
+            } // object-less spec unsupported
+        };
+        let (out_id, out_cnt) = {
+            let rblk = jblock(body, "result");
+            let id = rblk
+                .and_then(|b| jstr(b, "id"))
+                .or_else(|| jstr(body, "result"));
+            let cnt = rblk
+                .and_then(|b| jnum(b, "count"))
+                .or_else(|| jnum(body, "count"))
+                .unwrap_or(1)
+                .clamp(1, 64) as u8;
+            (
+                id.and_then(|i| name_to_item(i.trim_start_matches("minecraft:"))),
+                cnt,
+            )
+        };
+        let Some(out) = out_id else { return };
+        if body.contains("crafting_shaped") {
+            let mut rows: Vec<String> = Vec::new();
+            if let Some(pa) = jarray(body, "pattern") {
+                for m in pa.split('"').skip(1).step_by(2) {
+                    if !m.is_empty() {
+                        rows.push(m.to_string())
+                    }
+                }
+            }
+            let mut key: HashMap<char, Ingr> = HashMap::new();
+            if let Some(kb) = jblock(body, "key") {
+                let inner = &kb[1..kb.len() - 1];
+                for entry in inner.split(',') {
+                    let Some(col) = entry.find(':') else { continue };
+                    let ch = entry[..col]
+                        .trim()
+                        .trim_matches('"')
+                        .chars()
+                        .next()
+                        .unwrap_or(' ');
+                    let spec = entry[col..].trim();
+                    if let Some(ig) = mk_ingr(spec) {
+                        key.insert(ch, ig);
+                    }
+                }
+            }
+            if !rows.is_empty() {
+                self.recipes.push(JsonRecipe {
+                    shaped: true,
+                    rows,
+                    key,
+                    ing: Vec::new(),
+                    out,
+                    out_cnt,
+                });
+            }
+        } else if body.contains("crafting_shapeless") {
+            let mut ing: Vec<Ingr> = Vec::new();
+            if let Some(ia) = jarray(body, "ingredients") {
+                for spec in ia.split('{').skip(1) {
+                    if let Some(ig) = mk_ingr(spec) {
+                        ing.push(ig)
+                    }
+                }
+                if ing.is_empty() {
+                    // bare form: ["minecraft:x","minecraft:y"]
+                    for m in ia.split('"').skip(1).step_by(2) {
+                        if let Some(i) = name_to_item(m.trim_start_matches("minecraft:")) {
+                            ing.push(Ingr::Item(i));
                         }
                     }
                 }
             }
-        }
-        if !pk.functions.is_empty() || !pk.load.is_empty() {
-            eprintln!(
-                "[spine] datapack {}: {} fn, load={:?}, tick={:?}",
-                pk.name,
-                pk.functions.len(),
-                pk.load,
-                pk.tick
-            );
-            packs().lock().unwrap().push(pk);
+            if !ing.is_empty() {
+                self.recipes.push(JsonRecipe {
+                    shaped: false,
+                    rows: Vec::new(),
+                    key: HashMap::new(),
+                    ing,
+                    out,
+                    out_cnt,
+                });
+            }
+        } else if ["smelting", "blasting", "smoking", "campfire_cooking"]
+            .iter()
+            .any(|k| body.contains(k))
+        {
+            // "ingredient": {"item"|"tag":...} or bare "minecraft:x"
+            let ig = jblock(body, "ingredient").and_then(mk_ingr).or_else(|| {
+                jstr(body, "ingredient")
+                    .and_then(|n| name_to_item(n.trim_start_matches("minecraft:")).map(Ingr::Item))
+            });
+            if let Some(ig) = ig {
+                let xp = jstr(body, "experience")
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                self.smelts.push((ig, out, out_cnt, xp));
+            }
         }
     }
-    // Single exit, so the revision cannot be forgotten on one path: everything
-    // cached against the recipes and tags above is now stale.
-    CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
+
+    fn read_loot(&mut self, key: String, rel: &str, body: &str) {
+        let mut pools: Vec<LootPool> = Vec::new();
+        if let Some(pa) = jarray(body, "pools") {
+            for pb in jobjects(pa) {
+                let rolls = jnum(pb, "rolls")
+                    .or_else(|| jblock(pb, "rolls").and_then(|b| jnum(b, "max")))
+                    .unwrap_or(1)
+                    .clamp(1, 64) as u8;
+                let mut chance = 1.0f32;
+                if let Some(ca) = jarray(pb, "conditions") {
+                    for cb in jobjects(ca) {
+                        if cb.contains("random_chance") {
+                            if let Some(c) = jnum(cb, "chance") {
+                                chance *= c as f32 / 100.0;
+                            } else if let Some(c) =
+                                jstr(cb, "chance").and_then(|x| x.parse::<f32>().ok())
+                            {
+                                chance *= c;
+                            }
+                        }
+                    }
+                }
+                let mut entries: Vec<LootEntry> = Vec::new();
+                if let Some(ea) = jarray(pb, "entries") {
+                    for eb in jobjects(ea) {
+                        if !eb.contains("\"item\"") && !eb.contains("item") {
+                            continue;
+                        }
+                        let Some(n) = jstr(eb, "name") else { continue };
+                        let Some(item) = name_to_item(n.trim_start_matches("minecraft:")) else {
+                            continue;
+                        };
+                        let (mut lo, mut hi) = (1u8, 1u8);
+                        let mut efuncs: Vec<LootFunc> = Vec::new();
+                        if let Some(fa) = jarray(eb, "functions") {
+                            for fb in jobjects(fa) {
+                                if fb.contains("set_count") {
+                                    if let Some(cb) = jblock(fb, "count") {
+                                        lo = jnum(cb, "min").unwrap_or(1).clamp(0, 64) as u8;
+                                        hi =
+                                            jnum(cb, "max").unwrap_or(lo as i64).clamp(0, 64) as u8;
+                                    } else if let Some(c) = jnum(fb, "count") {
+                                        lo = c.clamp(0, 64) as u8;
+                                        hi = lo;
+                                    }
+                                } else {
+                                    efuncs.extend(parse_loot_funcs(fb));
+                                }
+                            }
+                        }
+                        entries.push(LootEntry {
+                            item,
+                            min: lo,
+                            max: hi.max(lo),
+                            funcs: efuncs,
+                        });
+                    }
+                }
+                let pfuncs: Vec<LootFunc> = jarray(pb, "functions")
+                    .map(parse_loot_funcs)
+                    .unwrap_or_default();
+                if !entries.is_empty() {
+                    pools.push(LootPool {
+                        rolls,
+                        chance,
+                        entries,
+                        funcs: pfuncs,
+                    });
+                }
+            }
+        }
+        if !pools.is_empty() {
+            if let Some(mob) = rel
+                .strip_prefix("entities/")
+                .and_then(|name| name.rsplit('/').next())
+                .and_then(name_to_etype)
+            {
+                self.mob_loot.insert(
+                    mob,
+                    pools
+                        .iter()
+                        .map(|pool| LootPool {
+                            rolls: pool.rolls,
+                            chance: pool.chance,
+                            funcs: pool.funcs.clone(),
+                            entries: pool
+                                .entries
+                                .iter()
+                                .map(|entry| LootEntry {
+                                    item: entry.item,
+                                    min: entry.min,
+                                    max: entry.max,
+                                    funcs: entry.funcs.clone(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                );
+            }
+            self.loot.insert(key, pools);
+        }
+    }
+
+    fn read_advancement(&mut self, key: String, rel: &str, body: &str) {
+        let Some(cb) = jblock(body, "criteria") else {
+            return;
+        };
+        let inner = &cb[1..cb.len() - 1];
+        let mut criteria: Vec<(String, String, Option<i64>)> = Vec::new();
+        for co in jobjects(inner) {
+            // criterion key precedes the object: find its name backwards
+            let Some(cpos) = inner.find(co) else { continue };
+            let pre = &inner[..cpos];
+            let cn = pre
+                .rfind('"')
+                .and_then(|e2| pre[..e2].rfind('"').map(|s2| &pre[s2 + 1..e2]))
+                .unwrap_or("")
+                .to_string();
+            let tr = jstr(co, "trigger")
+                .unwrap_or("")
+                .trim_start_matches("minecraft:")
+                .to_string();
+            let want = jblock(co, "conditions")
+                .and_then(|cd| jblock(cd, "entity"))
+                .and_then(|en| jstr(en, "type"))
+                .and_then(|t| name_to_etype(t.trim_start_matches("minecraft:")));
+            criteria.push((cn, tr, want));
+        }
+        let title = jblock(body, "display")
+            .and_then(|d| {
+                jblock(d, "title")
+                    .and_then(|t| jstr(t, "text").map(|x| x.to_string()))
+                    .or_else(|| jstr(d, "title").map(|x| x.to_string()))
+            })
+            .unwrap_or_else(|| rel.to_owned());
+        if !criteria.is_empty() {
+            self.advancements
+                .insert(key, Advancement { title, criteria });
+        }
+    }
+}
+
+const ZIP_MAX_BYTES: usize = 64 * 1024 * 1024;
+const ZIP_MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+const ZIP_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const ZIP_MAX_ENTRIES: usize = 4096;
+
+fn zip_u16(bytes: &[u8], offset: usize) -> usize {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize
+}
+
+fn zip_u32(bytes: &[u8], offset: usize) -> usize {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize
+}
+
+// ZIP32, single disk. Validate the entire archive before exposing any resources.
+fn zip_datapack_entries(bytes: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+    let end = bytes.len().checked_sub(22)?;
+    let eocd = (end.saturating_sub(u16::MAX as usize)..=end)
+        .rev()
+        .find(|&pos| {
+            bytes[pos..].starts_with(b"PK\x05\x06") && zip_u16(bytes, pos + 20) == end - pos
+        })?;
+    let footer = &bytes[eocd..];
+    let count = zip_u16(footer, 10);
+    let central_start = zip_u32(footer, 16);
+    let mut central = bytes.get(central_start..eocd)?;
+    if zip_u32(footer, 4) != 0
+        || zip_u16(footer, 8) != count
+        || count > ZIP_MAX_ENTRIES
+        || zip_u32(footer, 12) != central.len()
+    {
+        return None;
+    }
+
+    let mut total = 0;
+    let mut records = Vec::with_capacity(count);
+    let mut ranges = Vec::with_capacity(count);
+    let mut paths = HashSet::with_capacity(count);
+    for _ in 0..count {
+        let record = central.get(..46)?;
+        if !record.starts_with(b"PK\x01\x02") || zip_u16(record, 34) != 0 {
+            return None;
+        }
+        let flags = zip_u16(record, 8);
+        let method = zip_u16(record, 10);
+        let crc = zip_u32(record, 16);
+        let compressed = zip_u32(record, 20);
+        let size = zip_u32(record, 24);
+        let name_end = 46 + zip_u16(record, 28);
+        let name = central.get(46..name_end)?;
+        central = central.get(name_end + zip_u16(record, 30) + zip_u16(record, 32)..)?;
+        if !matches!(method, 0 | 8)
+            || flags & !(0x0808 | if method == 8 { 6 } else { 0 }) != 0
+            || size > ZIP_MAX_ENTRY_BYTES
+            || size > ZIP_MAX_TOTAL_BYTES - total
+        {
+            return None;
+        }
+        total += size;
+
+        let path = std::str::from_utf8(name).ok()?.replace('\\', "/");
+        let plain_path = path.strip_suffix('/').unwrap_or(&path);
+        let directory = plain_path.len() != path.len();
+        if plain_path.contains(['\0', ':'])
+            || plain_path
+                .split('/')
+                .any(|part| matches!(part, "" | "." | ".."))
+            || !paths.insert(plain_path.to_owned())
+            || (directory && size != 0)
+        {
+            return None;
+        }
+
+        let offset = zip_u32(record, 42);
+        let local = bytes.get(offset..central_start)?;
+        let header = local.get(..30)?;
+        let local_name_end = 30 + zip_u16(header, 26);
+        let data_start = local_name_end + zip_u16(header, 28);
+        if !header.starts_with(b"PK\x03\x04")
+            || zip_u16(header, 6) != flags
+            || zip_u16(header, 8) != method
+            || local.get(30..local_name_end)? != name
+        {
+            return None;
+        }
+        let descriptor = flags & 8 != 0;
+        for (field, value) in [(14, crc), (18, compressed), (22, size)] {
+            let local_value = zip_u32(header, field);
+            if local_value != value && !(descriptor && local_value == 0) {
+                return None;
+            }
+        }
+        let data = local.get(data_start..)?.get(..compressed)?;
+        let mut record_end = offset + data_start + compressed;
+        if descriptor {
+            let tail = bytes.get(record_end..central_start)?;
+            let matches = |fields: &[u8]| {
+                fields.len() >= 12
+                    && zip_u32(fields, 0) == crc
+                    && zip_u32(fields, 4) == compressed
+                    && zip_u32(fields, 8) == size
+            };
+            record_end += if tail.strip_prefix(b"PK\x07\x08").is_some_and(matches) {
+                16
+            } else if matches(tail) {
+                12
+            } else {
+                return None;
+            };
+        }
+        ranges.push((offset, record_end));
+        records.push((path, directory, method, crc, size, data));
+    }
+    ranges.sort_unstable();
+    let mut next = 0;
+    for (start, end) in ranges {
+        if start != next {
+            return None;
+        }
+        next = end;
+    }
+    if next != central_start || !central.is_empty() {
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    for (path, directory, method, crc, size, data) in records {
+        let body = if method == 0 {
+            if data.len() != size {
+                return None;
+            }
+            data.to_vec()
+        } else {
+            let mut decoder = flate2::read::DeflateDecoder::new(data);
+            let mut body = Vec::new();
+            (&mut decoder)
+                .take(size as u64 + 1)
+                .read_to_end(&mut body)
+                .ok()?;
+            if body.len() != size || decoder.total_in() != data.len() as u64 {
+                return None;
+            }
+            body
+        };
+        let mut checksum = flate2::Crc::new();
+        checksum.update(&body);
+        if checksum.sum() as usize != crc {
+            return None;
+        }
+        if !directory {
+            entries.push((path, body));
+        }
+    }
+    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    Some(entries)
+}
+
+fn datapack_sources(base: &std::path::Path) -> Vec<(String, std::path::PathBuf, bool)> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut sources = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let zip = kind.is_file() && path.extension().is_some_and(|ext| ext == "zip");
+        if zip
+            || (kind.is_dir() && (path.join("pack.mcmeta").is_file() || path.join("data").is_dir()))
+        {
+            sources.push((name, path, zip));
+        }
+    }
+    sources.sort_unstable_by(|(a, _, _), (b, _, _)| a.cmp(b));
+    sources
+}
+
+fn read_directory_datapack(
+    base: &std::path::Path,
+    pack: &mut Datapack,
+    content: &mut DatapackContent,
+) {
+    let mut dirs = vec![base.join("data")];
+    let mut files = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if kind.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext == "json" || ext == "mcfunction")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort_unstable();
+    for file in files {
+        let Ok(path) = file.strip_prefix(base) else {
+            continue;
+        };
+        if let (Some(path), Ok(body)) = (path.to_str(), std::fs::read_to_string(&file)) {
+            content.read_entry(pack, &path.replace('\\', "/"), &body);
+        }
+    }
+}
+
+const DATAPACK_DIRECTORY: &str = "datapacks";
+static DATAPACK_RELOAD: Mutex<()> = Mutex::new(());
+static DISABLED_DATAPACKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn disabled_datapacks() -> &'static Mutex<HashSet<String>> {
+    DISABLED_DATAPACKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(test)]
+fn load_datapacks() {
+    reload_datapacks(std::path::Path::new(DATAPACK_DIRECTORY), None, false).unwrap();
+}
+
+fn reload_datapacks(
+    base: &std::path::Path,
+    change: Option<(&str, bool)>,
+    run_load_functions: bool,
+) -> Result<usize, String> {
+    // Load functions can invoke commands, including another reload. Refuse an
+    // overlapping reload while the current one publishes and runs its hooks.
+    let _reload = DATAPACK_RELOAD
+        .try_lock()
+        .map_err(|_| "Datapack reload already in progress")?;
+    let sources = datapack_sources(base);
+    let mut disabled = disabled_datapacks().lock().unwrap().clone();
+    if let Some((name, enable)) = change {
+        if !sources.iter().any(|(candidate, _, _)| candidate == name) {
+            return Err(format!("Unknown datapack '{name}'"));
+        }
+        if enable && !disabled.remove(name) {
+            return Err(format!("Datapack '{name}' is already enabled"));
+        }
+        if !enable && !disabled.insert(name.to_owned()) {
+            return Err(format!("Datapack '{name}' is already disabled"));
+        }
+    }
+    let mut content = DatapackContent {
+        block_tags: builtin_block_tags(),
+        item_tags: builtin_item_tags(),
+        ..DatapackContent::default()
+    };
+    for (name, path, zip) in sources {
+        if disabled.contains(&name) {
+            continue;
+        }
+        let mut pack = Datapack {
+            name,
+            functions: HashMap::new(),
+            load: Vec::new(),
+            tick: Vec::new(),
+        };
+        if zip {
+            let mut bytes = Vec::new();
+            let entries = std::fs::File::open(&path)
+                .and_then(|file| file.take(ZIP_MAX_BYTES as u64 + 1).read_to_end(&mut bytes))
+                .ok()
+                .filter(|&len| len <= ZIP_MAX_BYTES)
+                .and_then(|_| zip_datapack_entries(&bytes));
+            let Some(entries) = entries else {
+                eprintln!(
+                    "[spine] rejecting invalid or unsupported datapack {}",
+                    path.display()
+                );
+                continue;
+            };
+            for (path, body) in entries {
+                if let Ok(body) = std::str::from_utf8(&body) {
+                    content.read_entry(&mut pack, &path, body);
+                }
+            }
+        } else {
+            read_directory_datapack(&path, &mut pack, &mut content);
+        }
+        eprintln!(
+            "[spine] datapack {}: {} fn, load={:?}, tick={:?}",
+            pack.name,
+            pack.functions.len(),
+            pack.load,
+            pack.tick
+        );
+        content.packs.push(pack);
+    }
+    if let Some((name, true)) = change {
+        if !content.packs.iter().any(|pack| pack.name == name) {
+            return Err(format!("Could not load datapack '{name}'"));
+        }
+    }
+    let count = content.packs.len();
+    let loads: Vec<String> = content
+        .packs
+        .iter()
+        .flat_map(|pack| pack.load.iter().cloned())
+        .collect();
+    {
+        let mut disabled_packs = disabled_datapacks().lock().unwrap();
+        content.publish();
+        *disabled_packs = disabled;
+    }
+    if run_load_functions {
+        for function in loads {
+            run_function(&function, None, &mut None);
+        }
+    }
+    Ok(count)
+}
+
+fn run_datapack_command(args: &[&str]) -> String {
+    let base = std::path::Path::new(DATAPACK_DIRECTORY);
+    let names: Vec<String> = match args {
+        ["list"] | ["list", "enabled"] => packs()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect(),
+        ["list", "available"] => {
+            let disabled = disabled_datapacks().lock().unwrap();
+            datapack_sources(base)
+                .into_iter()
+                .filter_map(|(name, _, _)| disabled.contains(&name).then_some(name))
+                .collect()
+        }
+        [action @ ("enable" | "disable"), name] => {
+            let name = name.strip_prefix("file/").unwrap_or(name);
+            let enable = *action == "enable";
+            return match reload_datapacks(base, Some((name, enable)), true) {
+                Ok(count) => format!(
+                    "{} datapack '{name}'. Reloading! ({count} pack(s))",
+                    if enable { "Enabled" } else { "Disabled" }
+                ),
+                Err(error) => error,
+            };
+        }
+        _ => return "usage: /datapack list [enabled|available] | enable|disable <name>".into(),
+    };
+    format!("{} packs: {}", names.len(), names.join(", "))
 }
 
 // tiny json helpers for datapack files (no serde — dep-free loader)
@@ -18850,13 +18992,13 @@ fn lookup_function(name: &str) -> Option<Vec<String>> {
         .iter()
         .find_map(|p| p.functions.get(&name).cloned())
 }
-fn run_function(name: &str, me: Option<Arc<Client>>, s: &mut Option<&mut TcpStream>) -> usize {
+fn run_function(name: &str, me: Option<Arc<Client>>, s: &mut Option<&Client>) -> usize {
     run_function_depth(name, me, s, 0)
 }
 fn run_function_depth(
     name: &str,
     me: Option<Arc<Client>>,
-    s: &mut Option<&mut TcpStream>,
+    s: &mut Option<&Client>,
     depth: usize,
 ) -> usize {
     if depth > 16 {
@@ -25382,7 +25524,7 @@ fn exec_result(ctx: &CmdCtx, cmd: &str) -> i64 {
 // re-parses args and holds a stream borrow — uncapped nesting exhausts the
 // stack before any reply (audit: no bound on the recurse via run_command_ctx).
 thread_local! { static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) } }
-fn run_execute(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>) -> String {
+fn run_execute(ctx: &CmdCtx, args: &[&str], s: &mut Option<&Client>) -> String {
     let depth = EXEC_DEPTH.get();
     if depth >= 16 {
         return "execute depth limit".into();
@@ -25394,7 +25536,7 @@ fn run_execute(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>) -> S
     EXEC_DEPTH.set(depth);
     r
 }
-fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>) -> String {
+fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&Client>) -> String {
     let mut i = 0;
     let mut cur = ctx.clone();
     let mut targets: Vec<String> = vec![]; // empty = self/console
@@ -25728,198 +25870,197 @@ fn prop_match(name: &str, st: u32, k: &str, v: &str) -> bool {
 // semantics default to merging for non-vanilla namespaces)
 fn block_tags() -> &'static Mutex<HashMap<String, Vec<String>>> {
     static T: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
-    T.get_or_init(|| {
-        Mutex::new(
-            [
-                (
-                    "logs",
-                    &[
-                        "oak_log",
-                        "spruce_log",
-                        "birch_log",
-                        "jungle_log",
-                        "acacia_log",
-                        "dark_oak_log",
-                        "mangrove_log",
-                        "cherry_log",
-                        "crimson_stem",
-                        "warped_stem",
-                        "oak_wood",
-                        "spruce_wood",
-                        "birch_wood",
-                        "jungle_wood",
-                        "acacia_wood",
-                        "dark_oak_wood",
-                        "mangrove_wood",
-                        "cherry_wood",
-                        "crimson_hyphae",
-                        "warped_hyphae",
-                    ][..],
-                ),
-                (
-                    "planks",
-                    &[
-                        "oak_planks",
-                        "spruce_planks",
-                        "birch_planks",
-                        "jungle_planks",
-                        "acacia_planks",
-                        "dark_oak_planks",
-                        "mangrove_planks",
-                        "cherry_planks",
-                        "crimson_planks",
-                        "warped_planks",
-                    ][..],
-                ),
-                (
-                    "leaves",
-                    &[
-                        "oak_leaves",
-                        "spruce_leaves",
-                        "birch_leaves",
-                        "jungle_leaves",
-                        "acacia_leaves",
-                        "dark_oak_leaves",
-                        "mangrove_leaves",
-                        "cherry_leaves",
-                        "azalea_leaves",
-                    ][..],
-                ),
-                (
-                    "wool",
-                    &[
-                        "white_wool",
-                        "orange_wool",
-                        "magenta_wool",
-                        "light_blue_wool",
-                        "yellow_wool",
-                        "lime_wool",
-                        "pink_wool",
-                        "gray_wool",
-                        "light_gray_wool",
-                        "cyan_wool",
-                        "purple_wool",
-                        "blue_wool",
-                        "brown_wool",
-                        "green_wool",
-                        "red_wool",
-                        "black_wool",
-                    ][..],
-                ),
-                ("sand", &["sand", "red_sand"][..]),
-                (
-                    "dirt",
-                    &[
-                        "dirt",
-                        "grass_block",
-                        "podzol",
-                        "mycelium",
-                        "coarse_dirt",
-                        "rooted_dirt",
-                        "dirt_path",
-                        "farmland",
-                        "mud",
-                        "muddy_mangrove_roots",
-                    ][..],
-                ),
-                (
-                    "flowers",
-                    &[
-                        "dandelion",
-                        "poppy",
-                        "allium",
-                        "cornflower",
-                        "torchflower",
-                        "sunflower",
-                        "lilac",
-                        "peony",
-                        "red_tulip",
-                        "orange_tulip",
-                        "white_tulip",
-                        "pink_tulip",
-                    ][..],
-                ),
-                ("crops", &["wheat", "carrots", "potatoes", "beetroots"][..]),
-            ]
-            .iter()
-            .map(|(k, v)| {
-                (
-                    format!("minecraft:{}", k),
-                    v.iter().map(|s| s.to_string()).collect(),
-                )
-            })
-            .collect(),
+    T.get_or_init(|| Mutex::new(builtin_block_tags()))
+}
+fn builtin_block_tags() -> HashMap<String, Vec<String>> {
+    [
+        (
+            "logs",
+            &[
+                "oak_log",
+                "spruce_log",
+                "birch_log",
+                "jungle_log",
+                "acacia_log",
+                "dark_oak_log",
+                "mangrove_log",
+                "cherry_log",
+                "crimson_stem",
+                "warped_stem",
+                "oak_wood",
+                "spruce_wood",
+                "birch_wood",
+                "jungle_wood",
+                "acacia_wood",
+                "dark_oak_wood",
+                "mangrove_wood",
+                "cherry_wood",
+                "crimson_hyphae",
+                "warped_hyphae",
+            ][..],
+        ),
+        (
+            "planks",
+            &[
+                "oak_planks",
+                "spruce_planks",
+                "birch_planks",
+                "jungle_planks",
+                "acacia_planks",
+                "dark_oak_planks",
+                "mangrove_planks",
+                "cherry_planks",
+                "crimson_planks",
+                "warped_planks",
+            ][..],
+        ),
+        (
+            "leaves",
+            &[
+                "oak_leaves",
+                "spruce_leaves",
+                "birch_leaves",
+                "jungle_leaves",
+                "acacia_leaves",
+                "dark_oak_leaves",
+                "mangrove_leaves",
+                "cherry_leaves",
+                "azalea_leaves",
+            ][..],
+        ),
+        (
+            "wool",
+            &[
+                "white_wool",
+                "orange_wool",
+                "magenta_wool",
+                "light_blue_wool",
+                "yellow_wool",
+                "lime_wool",
+                "pink_wool",
+                "gray_wool",
+                "light_gray_wool",
+                "cyan_wool",
+                "purple_wool",
+                "blue_wool",
+                "brown_wool",
+                "green_wool",
+                "red_wool",
+                "black_wool",
+            ][..],
+        ),
+        ("sand", &["sand", "red_sand"][..]),
+        (
+            "dirt",
+            &[
+                "dirt",
+                "grass_block",
+                "podzol",
+                "mycelium",
+                "coarse_dirt",
+                "rooted_dirt",
+                "dirt_path",
+                "farmland",
+                "mud",
+                "muddy_mangrove_roots",
+            ][..],
+        ),
+        (
+            "flowers",
+            &[
+                "dandelion",
+                "poppy",
+                "allium",
+                "cornflower",
+                "torchflower",
+                "sunflower",
+                "lilac",
+                "peony",
+                "red_tulip",
+                "orange_tulip",
+                "white_tulip",
+                "pink_tulip",
+            ][..],
+        ),
+        ("crops", &["wheat", "carrots", "potatoes", "beetroots"][..]),
+    ]
+    .iter()
+    .map(|(k, v)| {
+        (
+            format!("minecraft:{}", k),
+            v.iter().map(|s| s.to_string()).collect(),
         )
     })
+    .collect()
 }
 fn item_tags() -> &'static Mutex<HashMap<String, Vec<String>>> {
     static T: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
-    T.get_or_init(|| {
-        Mutex::new(
-            [
-                (
-                    "planks",
-                    &[
-                        "oak_planks",
-                        "spruce_planks",
-                        "birch_planks",
-                        "jungle_planks",
-                        "acacia_planks",
-                        "dark_oak_planks",
-                        "mangrove_planks",
-                        "cherry_planks",
-                        "crimson_planks",
-                        "warped_planks",
-                    ][..],
-                ),
-                (
-                    "logs",
-                    &[
-                        "oak_log",
-                        "spruce_log",
-                        "birch_log",
-                        "jungle_log",
-                        "acacia_log",
-                        "dark_oak_log",
-                        "mangrove_log",
-                        "cherry_log",
-                        "crimson_stem",
-                        "warped_stem",
-                    ][..],
-                ),
-                (
-                    "wool",
-                    &[
-                        "white_wool",
-                        "orange_wool",
-                        "magenta_wool",
-                        "light_blue_wool",
-                        "yellow_wool",
-                        "lime_wool",
-                        "pink_wool",
-                        "gray_wool",
-                        "light_gray_wool",
-                        "cyan_wool",
-                        "purple_wool",
-                        "blue_wool",
-                        "brown_wool",
-                        "green_wool",
-                        "red_wool",
-                        "black_wool",
-                    ][..],
-                ),
-            ]
-            .iter()
-            .map(|(k, v)| {
-                (
-                    format!("minecraft:{}", k),
-                    v.iter().map(|s| s.to_string()).collect(),
-                )
-            })
-            .collect(),
+    T.get_or_init(|| Mutex::new(builtin_item_tags()))
+}
+fn builtin_item_tags() -> HashMap<String, Vec<String>> {
+    [
+        (
+            "planks",
+            &[
+                "oak_planks",
+                "spruce_planks",
+                "birch_planks",
+                "jungle_planks",
+                "acacia_planks",
+                "dark_oak_planks",
+                "mangrove_planks",
+                "cherry_planks",
+                "crimson_planks",
+                "warped_planks",
+            ][..],
+        ),
+        (
+            "logs",
+            &[
+                "oak_log",
+                "spruce_log",
+                "birch_log",
+                "jungle_log",
+                "acacia_log",
+                "dark_oak_log",
+                "mangrove_log",
+                "cherry_log",
+                "crimson_stem",
+                "warped_stem",
+            ][..],
+        ),
+        (
+            "wool",
+            &[
+                "white_wool",
+                "orange_wool",
+                "magenta_wool",
+                "light_blue_wool",
+                "yellow_wool",
+                "lime_wool",
+                "pink_wool",
+                "gray_wool",
+                "light_gray_wool",
+                "cyan_wool",
+                "purple_wool",
+                "blue_wool",
+                "brown_wool",
+                "green_wool",
+                "red_wool",
+                "black_wool",
+            ][..],
+        ),
+    ]
+    .iter()
+    .map(|(k, v)| {
+        (
+            format!("minecraft:{}", k),
+            v.iter().map(|s| s.to_string()).collect(),
         )
     })
+    .collect()
 }
+
 // datapack crafting recipes (data/<ns>/recipe/**.json)
 enum Ingr {
     Item(i64),
@@ -26397,38 +26538,32 @@ fn adv_prog() -> &'static Mutex<Advancements> {
 ///
 /// The rest of the scan only exists to find advancements whose criteria all hold; an
 /// advancement can only newly complete on an event that matches one of its criteria, so
-/// visiting the matching ones is equivalent. Built once: the advancement map is filled
-/// at startup from the datapack and never mutated afterwards.
-fn adv_event_index() -> &'static HashMap<String, Vec<(String, String)>> {
-    static IDX: OnceLock<HashMap<String, Vec<(String, String)>>> = OnceLock::new();
-    IDX.get_or_init(|| {
-        let advs = advancements().lock().unwrap();
-        let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        for (id, a) in advs.iter() {
-            for (cn, tr, _) in &a.criteria {
-                idx.entry(tr.clone())
-                    .or_default()
-                    .push((id.clone(), cn.clone()));
-            }
-        }
-        idx
-    })
-}
+/// visiting the matching ones is equivalent. The index follows the datapack revision.
+type AdvancementEventIndex = HashMap<String, Vec<(String, String)>>;
 
 fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
+    static INDEX: Mutex<Option<(u64, AdvancementEventIndex)>> = Mutex::new(None);
     let __t = tickprof::enabled().then(std::time::Instant::now);
-    // Build the index *before* taking `advancements()`: its initializer locks that same
-    // mutex, so calling it from inside the guard below is a self-deadlock on a
-    // non-reentrant mutex. That is what this did when the index was introduced — the
-    // first `adv_event` wedged the server, and the chunk stream stopped after eight
-    // packets (found by the capture harness, not by the suite, which was not re-run).
-    let index = adv_event_index();
-    if index.is_empty() {
-        return;
-    }
     let mut grants: Vec<String> = Vec::new();
     {
         let advs = advancements().lock().unwrap();
+        let revision = content_revision();
+        let mut index = INDEX.lock().unwrap();
+        if index.as_ref().is_none_or(|(cached, _)| *cached != revision) {
+            let mut by_event = AdvancementEventIndex::new();
+            for (id, advancement) in advs.iter() {
+                for (criterion, trigger, _) in &advancement.criteria {
+                    by_event
+                        .entry(trigger.clone())
+                        .or_default()
+                        .push((id.clone(), criterion.clone()));
+                }
+            }
+            *index = Some((revision, by_event));
+        }
+        let Some(candidates) = index.as_ref().and_then(|(_, by_event)| by_event.get(event)) else {
+            return;
+        };
         if adv_done()
             .lock()
             .unwrap()
@@ -26446,12 +26581,6 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
         // Only the advancements that can fire on this event: their criteria are the
         // only ones this call can complete. The completion test still walks *all* of an
         // advancement's criteria, so a partially satisfied one is judged as before.
-        let Some(candidates) = index.get(event) else {
-            if let Some(t) = __t {
-                tickprof::add("adv/total", t.elapsed());
-            }
-            return;
-        };
         let done = adv_done().lock().unwrap();
         let granted = done.get(pname);
         // (advancement id -> the criteria this event satisfied), so an advancement
@@ -26516,6 +26645,7 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
         broadcast(-1, |_c| (0x6c, line.clone()));
     }
 }
+
 fn check_modification_bounds(dim: DimId, (x, y, z): BlockPos) -> Result<(), String> {
     if (-30_000_000..30_000_000).contains(&x)
         && (-30_000_000..30_000_000).contains(&z)
@@ -26738,8 +26868,7 @@ fn in_range(v: i64, r: &str) -> bool {
     }
 }
 
-// minimal brigadier seed: /time /tp /say /kill /gamemode /list /seed
-fn run_command(me: Option<&Arc<Client>>, msg: &str, s: &mut Option<&mut TcpStream>) {
+fn run_command(me: Option<&Arc<Client>>, msg: &str, s: &mut Option<&Client>) {
     let ctx = match me {
         Some(c) => {
             let p = *c.pos.lock().unwrap();
@@ -26759,9 +26888,6 @@ fn run_command(me: Option<&Arc<Client>>, msg: &str, s: &mut Option<&mut TcpStrea
     };
     run_command_ctx(&ctx, msg, s);
 }
-// Client chat commands are not a trusted administrator channel.
-// RCON/console calls have no player context; the explicit unsafe override is
-// reserved for local compatibility testing, not public/LAN deployments.
 fn command_allowed_for_player(cmd: &str, args: &[&str]) -> bool {
     matches!(cmd, "help" | "list")
         || (cmd == "time" && matches!(args.first().copied(), Some("query" | "get")))
@@ -26772,14 +26898,396 @@ fn allow_unsafe_player_admin() -> bool {
         .as_deref()
         == Some("1")
 }
-fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> String {
+
+const OPS_FILE: &str = "ops.json";
+type Operators = std::collections::BTreeSet<String>;
+static OPERATORS: Mutex<Operators> = Mutex::new(Operators::new());
+
+fn valid_player_name(name: &str) -> bool {
+    (1..=16).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn player_is_admin(name: &str) -> bool {
+    // The server's offline login claims a name. The same case folding is used
+    // by the login reservation and operator list.
+    allow_unsafe_player_admin()
+        || OPERATORS
+            .lock()
+            .unwrap()
+            .contains(&name.to_ascii_lowercase())
+}
+
+fn read_operators(path: &std::path::Path) -> std::io::Result<Operators> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Operators::new()),
+        Err(error) => return Err(error),
+    };
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected a JSON array of player names",
+        )
+    };
+    let entries = text
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(invalid)?
+        .trim();
+    if entries.is_empty() {
+        return Ok(Operators::new());
+    }
+    entries
+        .split(',')
+        .map(|entry| {
+            let name = entry
+                .trim()
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .filter(|s| valid_player_name(s))
+                .ok_or_else(invalid)?;
+            Ok(name.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn load_operators(path: &std::path::Path) -> std::io::Result<()> {
+    let mut operators = OPERATORS.lock().unwrap();
+    match read_operators(path) {
+        Ok(names) => {
+            *operators = names;
+            Ok(())
+        }
+        Err(error) => {
+            operators.clear();
+            Err(error)
+        }
+    }
+}
+
+fn set_operator(path: &std::path::Path, name: &str, enable: bool) -> std::io::Result<bool> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let mut operators = OPERATORS.lock().unwrap();
+    let mut proposed = operators.clone();
+    let name = name.to_ascii_lowercase();
+    let changed = if enable {
+        proposed.insert(name)
+    } else {
+        proposed.remove(&name)
+    };
+    if !changed {
+        return Ok(false);
+    }
+    let temp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let body = proposed
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let written = writeln!(file, "[{body}]").and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(error) = written.and_then(|_| std::fs::rename(&temp, path)) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    *operators = proposed;
+    Ok(true)
+}
+
+type PlayCommandBuilder = brigadier::ArgumentBuilder<()>;
+
+#[derive(Default)]
+struct CommandCompletions {
+    players: Vec<String>,
+    operators: Vec<String>,
+    enabled_packs: Vec<String>,
+    disabled_packs: Vec<String>,
+}
+
+fn completion_argument(
+    name: &str,
+    parser: brigadier::StringArgumentType,
+    candidates: Option<&[String]>,
+) -> PlayCommandBuilder {
+    let argument = PlayCommandBuilder::argument(name, Box::new(parser)).executes(|_| Ok(0));
+    if let Some(candidates) = candidates {
+        let names = candidates.to_vec();
+        argument.suggests(Arc::new(move |_, builder| {
+            let prefix = builder.remaining().to_ascii_lowercase();
+            for name in &names {
+                if name.to_ascii_lowercase().starts_with(&prefix) {
+                    builder.suggest(name);
+                }
+            }
+            Ok(builder.build())
+        }))
+    } else {
+        argument
+    }
+}
+
+fn command_tree(admin: bool) -> brigadier::CommandNode<()> {
+    command_dispatcher(admin, None).root().clone()
+}
+
+fn command_dispatcher(
+    admin: bool,
+    completions: Option<&CommandCompletions>,
+) -> brigadier::CommandDispatcher<()> {
+    // Execution remains in run_command_ctx. Executable nodes describe the
+    // syntax and allow the client to distinguish complete from partial input.
+    let dispatcher = brigadier::CommandDispatcher::new();
+    let literal = |name: &str| PlayCommandBuilder::literal(name);
+    let done = |name: &str| literal(name).executes(|_| Ok(0));
+    let choices = |node: PlayCommandBuilder, names: &[&str]| {
+        names
+            .iter()
+            .fold(node, |parent, name| parent.then(done(name)))
+    };
+    let word = brigadier::StringArgumentType::word;
+    let greedy = brigadier::StringArgumentType::greedy_string;
+    let args = |name: &str| completion_argument(name, greedy(), None);
+    let player =
+        || completion_argument("player", word(), completions.map(|c| c.players.as_slice()));
+    let mut time = literal("time");
+    for query in ["query", "get"] {
+        time = time.then(choices(done(query), &["daytime", "gametime", "day"]));
+    }
+    if admin {
+        let ticks = PlayCommandBuilder::argument(
+            "ticks",
+            Box::new(brigadier::LongArgumentType::long_at_least(0)),
+        )
+        .executes(|_| Ok(0));
+        time =
+            time.then(choices(literal("set"), &["day", "night", "noon", "midnight"]).then(ticks));
+    }
+    let register = |node| {
+        dispatcher
+            .register(node)
+            .expect("play command is a literal");
+    };
+    for node in [done("help"), done("list"), time] {
+        register(node);
+    }
+    if !admin {
+        return dispatcher;
+    }
+    for name in ["counts", "reload", "save", "save-all", "seed", "stop"] {
+        register(done(name));
+    }
+    register(literal("op").then(player()));
+    register(literal("deop").then(completion_argument(
+        "player",
+        word(),
+        completions.map(|c| c.operators.as_slice()),
+    )));
+    register(
+        literal("datapack")
+            .then(choices(done("list"), &["enabled", "available"]))
+            .then(literal("enable").then(completion_argument(
+                "name",
+                greedy(),
+                completions.map(|c| c.disabled_packs.as_slice()),
+            )))
+            .then(literal("disable").then(completion_argument(
+                "name",
+                greedy(),
+                completions.map(|c| c.enabled_packs.as_slice()),
+            ))),
+    );
+    register(choices(
+        done("difficulty"),
+        &["peaceful", "easy", "normal", "hard"],
+    ));
+    register(
+        done("weather")
+            .then(done("clear"))
+            .then(
+                done("rain").then(
+                    PlayCommandBuilder::argument(
+                        "duration",
+                        Box::new(brigadier::IntegerArgumentType::integer()),
+                    )
+                    .executes(|_| Ok(0)),
+                ),
+            )
+            .then(
+                done("thunder").then(
+                    PlayCommandBuilder::argument(
+                        "duration",
+                        Box::new(brigadier::IntegerArgumentType::integer()),
+                    )
+                    .executes(|_| Ok(0)),
+                ),
+            ),
+    );
+    register(
+        [
+            "survival",
+            "creative",
+            "adventure",
+            "spectator",
+            "0",
+            "1",
+            "2",
+            "3",
+        ]
+        .iter()
+        .fold(literal("gamemode"), |node, mode| {
+            node.then(done(mode).then(player()))
+        }),
+    );
+    register(done("kill").then(completion_argument(
+        "targets",
+        greedy(),
+        completions.map(|c| c.players.as_slice()),
+    )));
+    register(
+        literal("give")
+            .then(player().then(args("item and count")))
+            .then(args("targets, item and count")),
+    );
+    register(literal("say").then(args("message")));
+    register(literal("function").then(args("function")));
+    // The remaining legacy handlers accept shapes such as selectors, relative
+    // coordinates and NBT which the protocol module cannot serialize as types.
+    for name in [
+        "advancement",
+        "attribute",
+        "bossbar",
+        "clone",
+        "damage",
+        "data",
+        "effect",
+        "enchant",
+        "execute",
+        "experience",
+        "fill",
+        "forceload",
+        "item",
+        "loot",
+        "particle",
+        "player",
+        "playsound",
+        "schedule",
+        "scoreboard",
+        "setblock",
+        "stopsound",
+        "summon",
+        "tag",
+        "teleport",
+        "tellraw",
+        "title",
+        "tp",
+        "trigger",
+        "worldborder",
+        "xp",
+    ] {
+        register(literal(name).then(args("arguments")));
+    }
+    for name in ["clear", "gamerule", "setworldspawn", "spawnpoint"] {
+        register(done(name).then(args("arguments")));
+    }
+    dispatcher
+}
+
+fn send_commands(socket: &mut TcpStream, admin: bool) -> std::io::Result<()> {
+    let payload =
+        brigadier_wire::commands_payload(&command_tree(admin)).map_err(std::io::Error::other)?;
+    send_packet(
+        socket,
+        i64::from(brigadier_wire::CLIENTBOUND_COMMANDS),
+        payload,
+    )
+}
+
+fn update_client_commands(client: &Client) {
+    let mut socket = client.sock.lock().unwrap();
+    let _ = send_commands(&mut socket, player_is_admin(&client.name));
+}
+
+fn command_suggestion_response(
+    request: &brigadier_wire::CommandSuggestionsRequest,
+    admin: bool,
+    completions: &CommandCompletions,
+) -> brigadier_wire::CommandSuggestionsResponse {
+    let dispatcher = command_dispatcher(admin, Some(completions));
+    let mut reader = brigadier::StringReader::new(&request.text);
+    if request.text.starts_with('/') {
+        reader.skip();
+    }
+    let parse = dispatcher.parse_reader(reader, ());
+    let suggestions = dispatcher.get_completion_suggestions(&parse);
+    let mut response = brigadier_wire::CommandSuggestionsResponse::from_suggestions(
+        request.transaction_id,
+        &suggestions,
+    );
+    // Brigadier uses UTF-8 byte offsets internally. The client replaces a
+    // substring of a Java String using UTF-16 indices.
+    let end = response.start + response.length;
+    response.length = request.text[response.start..end].encode_utf16().count();
+    response.start = request.text[..response.start].encode_utf16().count();
+    response
+}
+
+fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
+    let Ok(request) = brigadier_wire::parse_command_suggestions_request(body) else {
+        return;
+    };
+    let admin = player_is_admin(&client.name);
+    let completions = if admin {
+        CommandCompletions {
+            players: client_snapshot().iter().map(|c| c.name.clone()).collect(),
+            operators: OPERATORS.lock().unwrap().iter().cloned().collect(),
+            enabled_packs: packs()
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| p.name.clone())
+                .collect(),
+            disabled_packs: disabled_datapacks()
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    } else {
+        CommandCompletions::default()
+    };
+    let response = command_suggestion_response(&request, admin, &completions);
+    if let Ok(payload) = brigadier_wire::command_suggestions_response_payload(&response) {
+        let _ = send_packet(
+            &mut client.sock.lock().unwrap(),
+            i64::from(brigadier_wire::CLIENTBOUND_COMMAND_SUGGESTIONS),
+            payload,
+        );
+    }
+}
+
+fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     let me = ctx.me.as_ref();
     let mut it = msg[1..].split_whitespace();
     let cmd = it.next().unwrap_or("");
 
     let args: Vec<&str> = it.collect();
-    if me.is_some() && !allow_unsafe_player_admin() && !command_allowed_for_player(cmd, &args) {
-        return "You do not have permission to run that command".into();
+    let admin = me.is_none_or(|player| player_is_admin(&player.name));
+    if !admin && !command_allowed_for_player(cmd, &args) {
+        let reply = "You do not have permission to run that command";
+        if let Some(client) = s {
+            let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(reply));
+        }
+        return reply.into();
     }
     let reply = match cmd {
         "execute" => run_execute(ctx, &args, s),
@@ -26844,8 +27352,43 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             format!("Set the world spawn point to {}, {}, {}", x, y, z)
         }
         "help" => {
-            "commands: execute time tp say kill gamemode difficulty stop clear xp effect setblock summon give weather function datapack worldborder scoreboard advancement fill clone forceload item player data list seed spawnpoint setworldspawn gamerule counts help".into()
+            let names = command_tree(admin).children().into_iter()
+                .map(|node| node.name().to_owned()).collect::<Vec<_>>();
+            format!("commands: {}", names.join(" "))
         }
+        "op" | "deop" => match args.as_slice() {
+            [name] if valid_player_name(name) => {
+                match set_operator(std::path::Path::new(OPS_FILE), name, cmd == "op") {
+                    Ok(true) => {
+                        for client in client_snapshot().iter().filter(|c| c.name.eq_ignore_ascii_case(name)) {
+                            update_client_commands(client);
+                        }
+                        if cmd == "op" { format!("Made {name} a server operator") }
+                        else { format!("Made {name} no longer a server operator") }
+                    }
+                    Ok(false) if cmd == "op" => format!("{name} is already a server operator"),
+                    Ok(false) => format!("{name} is not a server operator"),
+                    Err(error) => format!("Could not save {OPS_FILE}: {error}"),
+                }
+            }
+            _ => format!("usage: /{cmd} <player>"),
+        },
+        "reload" if args.is_empty() => {
+            match reload_datapacks(std::path::Path::new(DATAPACK_DIRECTORY), None, true) {
+                Ok(count) => {
+                    let ops = load_operators(std::path::Path::new(OPS_FILE));
+                    for client in client_snapshot() {
+                        update_client_commands(&client);
+                    }
+                    match ops {
+                        Ok(()) => format!("Reloading! ({count} pack(s))"),
+                        Err(error) => format!("Reloading! ({count} pack(s)); could not load {OPS_FILE}: {error}"),
+                    }
+                }
+                Err(error) => error,
+            }
+        }
+        "reload" => "usage: /reload".into(),
         "tp" | "teleport" => {
             let mut actor_tgt: Option<String> = None;
             let (targets, xyz): (Vec<String>, &[&str]) = if args.first().map(|a| a.starts_with('@')).unwrap_or(false) {
@@ -27591,13 +28134,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             }
         }
         "advancement" => run_advancement_command(&args, me),
-        "datapack" => {
-            if args.first() == Some(&"list") {
-                let ps = packs().lock().unwrap();
-                let names: Vec<String> = ps.iter().map(|p| p.name.clone()).collect();
-                format!("{} packs: {}", names.len(), names.join(", "))
-            } else { "usage: /datapack list".into() }
-        }
+        "datapack" => run_datapack_command(&args),
         "worldborder" => run_world_border_command(ctx, &args),
         "scoreboard" => run_scoreboard_command(&args, me),
         "fill" | "clone" => run_block_modification(ctx, cmd, &args).unwrap_or_else(|error| error),
@@ -27931,8 +28468,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
         _ => format!("Unknown command: {}", cmd),
     };
     if !reply.is_empty() {
-        if let Some(s) = s.as_deref_mut() {
-            let _ = send_packet(s, 0x6c, system_chat(&reply));
+        if let Some(client) = s {
+            let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&reply));
         } else {
             eprintln!("[cmd] {}", reply);
         }
@@ -28015,11 +28552,11 @@ fn handshake_next_state(hs: &[u8]) -> Option<i64> {
 fn login_identity(body: &[u8]) -> Option<(String, [u8; 16])> {
     let mut p = body;
     let name_len = usize::try_from(read_varint(&mut p)?).ok()?;
-    if !(1..=16).contains(&name_len) || p.len() < name_len + 16 {
+    if name_len > 16 || p.len() < name_len + 16 {
         return None;
     }
     let name = std::str::from_utf8(&p[..name_len]).ok()?;
-    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if !valid_player_name(name) {
         return None;
     }
     let mut uuid = [0u8; 16];
@@ -28210,6 +28747,10 @@ fn handle(mut s: TcpStream) {
     if send_packet(&mut s, 0x2b, join_game(saved_dim, 1, player_eid)).is_err() {
         return;
     }
+    let login_admin = player_is_admin(&name);
+    if send_commands(&mut s, login_admin).is_err() {
+        return;
+    }
     let _ = send_packet(&mut s, 0x53, vec![0]); // held slot 0
     let mut vp = Vec::new();
     write_varint(&mut vp, 0);
@@ -28394,6 +28935,11 @@ fn handle(mut s: TcpStream) {
         }
         cls.push(me.clone());
     }
+    // An operator change can happen during the initial chunk stream, before
+    // the client is present in the online list used by /op and /reload.
+    if login_admin != player_is_admin(&me.name) {
+        update_client_commands(&me);
+    }
     kick_skin(name.clone(), &me);
     // refresh armor points from restored inventory
     {
@@ -28536,6 +29082,9 @@ fn handle(mut s: TcpStream) {
                         true,
                     );
                 }
+            }
+            id if id == i64::from(brigadier_wire::SERVERBOUND_COMMAND_SUGGESTION) => {
+                reply_to_command_suggestion(&me, &b);
             }
             0x1a | 0x1b => {
                 // position / position_look: f64 x,y,z first
@@ -29590,7 +30139,7 @@ fn handle(mut s: TcpStream) {
                         break 'conn;
                     }
 
-                    run_command(Some(&me), &format!("/{}", m), &mut Some(&mut s));
+                    run_command(Some(&me), &format!("/{}", m), &mut Some(&me));
                 }
             }
             0x06 => {
@@ -29611,7 +30160,7 @@ fn handle(mut s: TcpStream) {
                         break 'conn;
                     }
                     if m.starts_with('/') {
-                        run_command(Some(&me), &m, &mut Some(&mut s));
+                        run_command(Some(&me), &m, &mut Some(&me));
                         continue;
                     }
                     let line = format!("<{}> {}", me.name, m);
@@ -33540,20 +34089,14 @@ fn main() {
         eprintln!("[security] {why}");
         std::process::exit(2);
     }
+    if let Err(error) = load_operators(std::path::Path::new(OPS_FILE)) {
+        eprintln!("[spine] could not load {OPS_FILE}: {error}");
+    }
+    if let Err(error) = reload_datapacks(std::path::Path::new(DATAPACK_DIRECTORY), None, true) {
+        eprintln!("[spine] {error}");
+    }
     std::thread::spawn(rcon_listener);
     http_server();
-    load_datapacks();
-    {
-        let loads: Vec<String> = packs()
-            .lock()
-            .unwrap()
-            .iter()
-            .flat_map(|p| p.load.clone())
-            .collect();
-        for f in loads {
-            run_function(&f, None, &mut None);
-        }
-    }
     // seed a few mobs near spawn (only if none restored from save)
     if mobs().lock().unwrap().is_empty() {
         let mut ms = mobs().lock().unwrap();
