@@ -5081,7 +5081,7 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
     let at_128 = player(DimId::Overworld, false, (pos.0, pos.1 + 128.0, pos.2));
     assert_eq!(attempt(&[high_anchor, at_128]), Some(pos), "128 blocks is in range");
     let default_spawn = *WORLD_SPAWN.lock().unwrap();
-    *WORLD_SPAWN.lock().unwrap() = pos;
+    *WORLD_SPAWN.lock().unwrap() = (pos.0, pos.1, pos.2, 0.0);
     assert!(
         attempt(&[overworld()]).is_none(),
         "world spawn excludes the site"

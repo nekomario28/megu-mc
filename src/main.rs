@@ -391,7 +391,7 @@ struct Client {
     sat: Mutex<f32>,
     walk_acc: Mutex<f64>,
     lastp: Mutex<(f64, f64, f64)>,
-    spawn_pt: Mutex<Option<(f64, f64, f64)>>,
+    spawn_pt: Mutex<Option<(f64, f64, f64, f32)>>,
     // P2-3-S4: a player lives in one dimension at a time. Every dimension-scoped
     // audience filter (chunks, block deltas, entity visibility) reads this, and a
     // 0x47 Respawn flips it together with the chunk window. The saved spawn point
@@ -2892,7 +2892,7 @@ static GR_NATURAL_REGEN: AtomicU8 = AtomicU8::new(1);
 static GR_MOB_LOOT: AtomicU8 = AtomicU8::new(1);
 static GR_MAX_ENTITY_CRAMMING: AtomicI32 = AtomicI32::new(ENTITY_CRAMMING_DEFAULT);
 // world spawn (vanilla /setworldspawn) + difficulty — both persisted
-static WORLD_SPAWN: Mutex<(f64, f64, f64)> = Mutex::new((0.5, 16.0, 0.5));
+static WORLD_SPAWN: Mutex<(f64, f64, f64, f32)> = Mutex::new((0.5, 16.0, 0.5, 0.0));
 static WORLD_SEED: AtomicU64 = AtomicU64::new(0);
 // 0=peaceful 1=easy 2=normal 3=hard; gates hostile night spawns
 static DIFFICULTY: AtomicU8 = AtomicU8::new(2);
@@ -12849,6 +12849,7 @@ fn write_world_file(
 // Caller owns SAVE_LOCK (or is a single-threaded fixture). Some existing
 // callers hold the mutex directly, without the re-entrant thread-local guard.
 fn save_world_into(f: &mut Vec<u8>) {
+    let world_spawn = *WORLD_SPAWN.lock().unwrap();
     let (pending, sources, spider_flags) = worldgen::with_gen(|g| (
         g.take_staged_payloads(), g.payload_sources.clone(), g.mineshaft_spawners.clone()
     )).unwrap_or_default();
@@ -13207,12 +13208,9 @@ fn save_world_into(f: &mut Vec<u8>) {
         ] {
             (*f).push(r.load(Ordering::Relaxed));
         }
-        {
-            let ws = WORLD_SPAWN.lock().unwrap();
-            (*f).extend_from_slice(&ws.0.to_be_bytes());
-            (*f).extend_from_slice(&ws.1.to_be_bytes());
-            (*f).extend_from_slice(&ws.2.to_be_bytes());
-        }
+        (*f).extend_from_slice(&world_spawn.0.to_be_bytes());
+        (*f).extend_from_slice(&world_spawn.1.to_be_bytes());
+        (*f).extend_from_slice(&world_spawn.2.to_be_bytes());
         (*f).push(DIFFICULTY.load(Ordering::Relaxed));
         // entity tags: players by name, mobs by ordinal (eids re-issue)
         {
@@ -13347,6 +13345,11 @@ fn save_world_into(f: &mut Vec<u8>) {
         (*f).extend_from_slice(&border.warning_blocks.to_be_bytes());
         (*f).extend_from_slice(&border.warning_time_secs.to_be_bytes());
         (*f).extend_from_slice(&border.absolute_max_size.to_be_bytes());
+    }
+    // Legacy world records have no orientation and default to zero.
+    if world_spawn.3 != 0.0 {
+        f.extend_from_slice(b"SPA1");
+        f.extend_from_slice(&world_spawn.3.to_be_bytes());
     }
     generated.append(f);
     let (sources, generated_blocks, generated_fluids) = worldgen::with_gen(|g| {
@@ -14636,7 +14639,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                 f64::from_be_bytes(b[p + 8..p + 16].try_into().unwrap()),
                 f64::from_be_bytes(b[p + 16..p + 24].try_into().unwrap()),
             );
-            *WORLD_SPAWN.lock().unwrap() = (x, y, z);
+            *WORLD_SPAWN.lock().unwrap() = (x, y, z, 0.0);
             p += 24;
             DIFFICULTY.store(b[p], Ordering::Relaxed);
             p += 1;
@@ -14965,6 +14968,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             let warning_blocks = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
             let warning_time_secs = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
             let absolute_max_size = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            p += 4;
             if [center_x, center_z, old_size, new_size, damage_per_block, damage_safe_zone]
                 .iter().all(|value| value.is_finite())
             {
@@ -14976,6 +14980,12 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                     warning_time_secs, absolute_max_size,
                 };
             }
+        }
+    }
+    if let Some(bytes) = payload.get(p..p + 8).filter(|bytes| &bytes[..4] == b"SPA1") {
+        let angle = f32::from_be_bytes(bytes[4..].try_into().unwrap());
+        if angle.is_finite() {
+            WORLD_SPAWN.lock().unwrap().3 = angle;
         }
     }
     if let Some(state) = tick_state {
@@ -22818,7 +22828,7 @@ fn enter_portal(
                 let sdim = *me.spawn_dim.lock().unwrap();
                 let pos = me.spawn_pt.lock().unwrap().unwrap_or_else(|| {
                     let w = *WORLD_SPAWN.lock().unwrap();
-                    (w.0, w.1, w.2)
+                    (w.0, w.1, w.2, w.3)
                 });
                 (sdim, pos.0, pos.1, pos.2)
             };
@@ -25955,6 +25965,45 @@ fn coord(tok: &str, base: f64) -> f64 {
     }
 }
 
+fn spawn_yaw(token: Option<&str>, source: Option<&Arc<Client>>) -> Option<f32> {
+    let Some(token) = token else {
+        return Some(0.0);
+    };
+    let angle = if let Some(relative) = token.strip_prefix('~') {
+        let yaw = source.map_or(0.0, |player| player.pos.lock().unwrap().3);
+        yaw + if relative.is_empty() {
+            0.0
+        } else {
+            relative.parse::<f32>().ok()?
+        }
+    } else {
+        token.parse::<f32>().ok()?
+    };
+    if !angle.is_finite() {
+        return None;
+    }
+    let angle = angle % 360.0;
+    Some(if angle >= 180.0 {
+        angle - 360.0
+    } else if angle < -180.0 {
+        angle + 360.0
+    } else {
+        angle
+    })
+}
+
+fn spawn_position_packet((x, y, z, yaw): (f64, f64, f64, f32)) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(12);
+    write_pos(
+        &mut payload,
+        x.floor() as i32,
+        y.floor() as i32,
+        z.floor() as i32,
+    );
+    payload.extend_from_slice(&yaw.to_be_bytes());
+    payload
+}
+
 // ---------- scoreboard ----------
 fn scoreboard_criterion_name(criterion: ScoreboardCriteria) -> &'static str {
     match criterion {
@@ -28091,8 +28140,8 @@ fn command_usage(name: &str) -> String {
         "defaultgamemode" => "/defaultgamemode <survival|creative|adventure|spectator>",
         "save-on" | "save-off" => "no arguments",
         "save-all" | "save" => "no arguments; force a world save",
-        "spawnpoint" => "/spawnpoint [player] [x y z]",
-        "setworldspawn" => "/setworldspawn [x y z]",
+        "spawnpoint" => "/spawnpoint [player] [x y z] [angle]",
+        "setworldspawn" => "/setworldspawn [x y z] [angle]",
         "forceload" => "/forceload add|remove <x> <z> [<x2> <z2>] | remove all | query [<x> <z>]",
         "bossbar" => "/bossbar add|remove|set|list|get ...",
         "time" => "/time set <day|noon|night|ticks> | query <day|daytime|gametime>",
@@ -28651,7 +28700,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             format!("commands: {}", names.join(" "))
         }
         "spawnpoint" => {
-            // spawnpoint [player] [x y z]
+            if !matches!(args.len(), 0 | 1 | 3..=5) {
+                return command_usage(cmd);
+            }
             let (nm, xyz): (String, &[&str]) = if args.len() >= 4 {
                 (args[0].to_string(), &args[1..])
             } else if args.len() >= 3 { (ctx.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(), &args[0..]) }
@@ -28664,18 +28715,38 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     let (x, y, z) = if xyz.len() >= 3 {
                         (coord(xyz[0], ctx.x), coord(xyz[1], ctx.y), coord(xyz[2], ctx.z))
                     } else { let p = c.pos.lock().unwrap(); (p.0, p.1, p.2) };
-                    *c.spawn_pt.lock().unwrap() = Some((x, y, z));
-                    *c.spawn_dim.lock().unwrap() = cmd_dim(ctx);
-                    format!("Set spawn point to {}, {}, {} for {}", x, y, z, c.name)
+                    let Some(yaw) = spawn_yaw(xyz.get(3).copied(), me) else {
+                        return "Invalid spawn angle".into();
+                    };
+                    let dim = cmd_dim(ctx);
+                    let mut spawn_dim = c.spawn_dim.lock().unwrap();
+                    *c.spawn_pt.lock().unwrap() = Some((x, y, z, yaw));
+                    *spawn_dim = dim;
+                    format!("Set spawn point to {x}, {y}, {z} facing {yaw} for {}", c.name)
                 }
             }
         }
         "setworldspawn" => {
+            if cmd_dim(ctx) != DimId::Overworld {
+                return "World spawn can only be set in the Overworld".into();
+            }
+            if !matches!(args.len(), 0 | 3 | 4) {
+                return command_usage(cmd);
+            }
             let (x, y, z) = if args.len() >= 3 {
                 (coord(args[0], ctx.x), coord(args[1], ctx.y), coord(args[2], ctx.z))
             } else { (ctx.x, ctx.y, ctx.z) };
-            *WORLD_SPAWN.lock().unwrap() = (x, y, z);
-            format!("Set the world spawn point to {}, {}, {}", x, y, z)
+            let Some(yaw) = spawn_yaw(args.get(3).copied(), me) else {
+                return "Invalid spawn angle".into();
+            };
+            let spawn = (x, y, z, yaw);
+            *WORLD_SPAWN.lock().unwrap() = spawn;
+            fanout_in(
+                &client_snapshot(),
+                |player| *player.dim.lock().unwrap() == DimId::Overworld,
+                |_| (0x56, spawn_position_packet(spawn)),
+            );
+            format!("Set the world spawn point to {x}, {y}, {z} facing {yaw}")
         }
         "op" | "deop" => match args.as_slice() {
             [name] if valid_player_name(name) => {
@@ -30135,7 +30206,7 @@ fn handle(mut s: TcpStream) {
         .copied()
         .unwrap_or_else(|| {
             let w = *WORLD_SPAWN.lock().unwrap();
-            (DimId::Overworld, w.0, w.1, w.2, 0.0, 0.0)
+            (DimId::Overworld, w.0, w.1, w.2, w.3, 0.0)
         });
     let player_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
     let initial_gm = DEFAULT_GAME_MODE.load(Ordering::Relaxed);
@@ -30151,10 +30222,8 @@ fn handle(mut s: TcpStream) {
     write_varint(&mut vp, 0);
     write_varint(&mut vp, 0);
     let _ = send_packet(&mut s, 0x54, vp);
-    let mut sp = Vec::new();
-    write_pos(&mut sp, 0, 16, 0);
-    sp.extend_from_slice(&0f32.to_be_bytes());
-    let _ = send_packet(&mut s, 0x56, sp);
+    let spawn = *WORLD_SPAWN.lock().unwrap();
+    let _ = send_packet(&mut s, 0x56, spawn_position_packet(spawn));
     let mut gs = vec![13u8];
     gs.extend_from_slice(&0f32.to_be_bytes());
     let _ = send_packet(&mut s, 0x22, gs);
@@ -31439,9 +31508,12 @@ fn handle(mut s: TcpStream) {
                     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
                     if dim == DimId::Overworld && (13000..=23500).contains(&wt) {
                         WORLD_TIME.store(0, Ordering::Relaxed);
-                        *me.spawn_pt.lock().unwrap() =
-                            Some((x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5));
-                        *me.spawn_dim.lock().unwrap() = *me.dim.lock().unwrap();
+                        {
+                            let mut spawn_dim = me.spawn_dim.lock().unwrap();
+                            *me.spawn_pt.lock().unwrap() =
+                                Some((x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5, 0.0));
+                            *spawn_dim = dim;
+                        }
                         let mut sp = Vec::new();
                         write_pos(&mut sp, x, y, z);
                         sp.extend_from_slice(&0.0f32.to_be_bytes());
@@ -32489,15 +32561,15 @@ fn handle(mut s: TcpStream) {
                     // P2-3-S4: respawn in the dimension the spawn point belongs to. A
                     // death in the Nether returns to the Overworld bed/world spawn when that
                     // is where the spawn point was set, with a full window rebuild.
-                    let (sdim, rx, ry, rz) = {
-                        let sdim = *me.spawn_dim.lock().unwrap();
-                        let pos = me.spawn_pt.lock().unwrap().unwrap_or_else(|| {
-                            let w = *WORLD_SPAWN.lock().unwrap();
-                            (w.0, w.1, w.2)
-                        });
-                        (sdim, pos.0, pos.1, pos.2)
+                    let (sdim, (rx, ry, rz, yaw)) = {
+                        let sdim = me.spawn_dim.lock().unwrap();
+                        let point = *me.spawn_pt.lock().unwrap();
+                        match point {
+                            Some(point) => (*sdim, point),
+                            None => (DimId::Overworld, *WORLD_SPAWN.lock().unwrap()),
+                        }
                     };
-                    switch_client_dimension(&me, sdim, (rx, ry, rz, 0.0, 0.0), view);
+                    switch_client_dimension(&me, sdim, (rx, ry, rz, yaw, 0.0), view);
                     reset_player_food(&me);
                     let _ = send_player_xp(&me, |_| Ok(()));
                     {
@@ -35732,7 +35804,7 @@ fn main() {
                     );
                 }
             }
-            *WORLD_SPAWN.lock().unwrap() = (0.5, worldgen::surface_of(0, 0) as f64 + 0.5, 0.5);
+            *WORLD_SPAWN.lock().unwrap() = (0.5, worldgen::surface_of(0, 0) as f64 + 0.5, 0.5, 0.0);
             eprintln!("[wg] vanilla datapack worldgen active (seed {})", wg_seed);
             if let Ok(spec) = std::env::var("MC_SPINE_DFDUMP") {
                 worldgen::dfdump(&spec);
@@ -36333,7 +36405,7 @@ mod mineshaft_runtime_tests {
         difficulty: u8,
         tick_idx: u64,
         rng: u64,
-        spawn: (f64, f64, f64),
+        spawn: (f64, f64, f64, f32),
     }
 
     impl RuntimeSnapshot {
@@ -36543,7 +36615,7 @@ mod mineshaft_runtime_tests {
         crate::test_support::require_vanilla_data();
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
-        *WORLD_SPAWN.lock().unwrap() = (0.5, 70.0, 1.5);
+        *WORLD_SPAWN.lock().unwrap() = (0.5, 70.0, 1.5, 0.0);
         forceloaded().lock().unwrap().insert((0, 0));
         refresh_hot();
 
@@ -36770,7 +36842,7 @@ mod mineshaft_runtime_tests {
         crate::test_support::require_vanilla_data();
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
-        *WORLD_SPAWN.lock().unwrap() = (0.5, 70.0, 0.5);
+        *WORLD_SPAWN.lock().unwrap() = (0.5, 70.0, 0.5, 0.0);
         forceloaded().lock().unwrap().insert((0, 0));
         refresh_hot();
 
@@ -36974,7 +37046,7 @@ mod mineshaft_runtime_tests {
         crate::test_support::require_vanilla_data();
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
-        *WORLD_SPAWN.lock().unwrap() = (0.5, 70.0, 0.5);
+        *WORLD_SPAWN.lock().unwrap() = (0.5, 70.0, 0.5, 0.0);
         forceloaded().lock().unwrap().insert((0, 0));
         refresh_hot();
 

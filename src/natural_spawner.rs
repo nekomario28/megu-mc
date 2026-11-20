@@ -867,7 +867,7 @@ fn spawn_nightly_hostile(tick: u64) {
         y: by,
         z: bz,
     };
-    let (sx, sy, sz) = *WORLD_SPAWN.lock().unwrap();
+    let (sx, sy, sz, _) = *WORLD_SPAWN.lock().unwrap();
     let spawn_point_sq = |x: f64, y: f64, z: f64| {
         (sx.floor() + 0.5 - x).powi(2)
             + (sy.floor() + 0.5 - y).powi(2)

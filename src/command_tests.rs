@@ -10,6 +10,17 @@ fn schedule_duration_suffixes_use_game_ticks() {
 }
 
 #[test]
+fn spawn_packet_uses_wrapped_command_yaw() {
+    let angle = spawn_yaw(Some("270.5"), None).unwrap();
+    assert_eq!(angle, -89.5);
+    assert_eq!(spawn_yaw(Some("~45"), None), Some(45.0));
+    assert_eq!(spawn_yaw(Some("NaN"), None), None);
+    let payload = spawn_position_packet((4.0, 64.0, -3.0, angle));
+    assert_eq!(read_pos(&payload[..8]), (4, 64, -3));
+    assert_eq!(&payload[8..], &(-89.5f32).to_be_bytes());
+}
+
+#[test]
 fn weather_durations_use_seconds_and_vanilla_default() {
     assert_eq!(weather_duration_ticks(Some("60")), 1200);
     assert_eq!(weather_duration_ticks(None), 6000);
