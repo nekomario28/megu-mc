@@ -57,6 +57,138 @@ pub(crate) trait PathWorld {
     fn max_y(&self) -> i32;
 }
 
+// BlockState classification uses the actual 1.21.1 registry, including the
+// open property of doors/gates and the difference between fluid-bearing and
+// liquid blocks (waterlogged stairs still have solid collision geometry).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn classify_block_state_path_type(
+    reg: &crate::block_registry::BReg,
+    state: u32,
+) -> BlockPathType {
+    use BlockPathType::*;
+
+    if reg.is_air(state) {
+        return Open;
+    }
+    let name = reg.name_of(state).strip_prefix("minecraft:").unwrap_or(reg.name_of(state));
+    match name {
+        "water" | "bubble_column" => return Water,
+        "lava" => return Lava,
+        "fire" | "soul_fire" | "campfire" | "soul_campfire" | "magma_block" => {
+            return DamageFire;
+        }
+        "cactus" | "sweet_berry_bush" | "wither_rose" => return DamageOther,
+        "powder_snow" => return PowderSnow,
+        "honey_block" => return StickyHoney,
+        _ => {}
+    }
+    if name.ends_with("_fence") || name.ends_with("_wall") {
+        return Fence;
+    }
+    if name.ends_with("_fence_gate") {
+        return if reg.get_prop(state, "open").as_deref() == Some("true") {
+            Open
+        } else {
+            Fence
+        };
+    }
+    if name.ends_with("_trapdoor") {
+        return Trapdoor;
+    }
+    if name.ends_with("_door") {
+        return if reg.get_prop(state, "open").as_deref() == Some("true") {
+            DoorOpen
+        } else if name == "iron_door" {
+            DoorIronClosed
+        } else {
+            DoorWoodClosed
+        };
+    }
+    if name == "rail" || name.ends_with("_rail") {
+        return Rail;
+    }
+    if name.ends_with("_leaves") {
+        return Leaves;
+    }
+    if reg.is_liquid_block(state) {
+        return if reg.fluid_name(state).contains("lava") {
+            Lava
+        } else {
+            Water
+        };
+    }
+    if reg.is_solid(state) || !reg.is_collision_empty(state) {
+        Blocked
+    } else {
+        Open
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LiveWorldPathAdapter<'a> {
+    pub dimension: crate::worldgen::DimId,
+    pub reg: &'a crate::block_registry::BReg,
+    block_getter: Box<dyn Fn(crate::worldgen::DimId, i32, i32, i32) -> u32 + 'a>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<'a> LiveWorldPathAdapter<'a> {
+    /// Uses the same dimension-aware block lookup as the live mob tick.
+    pub fn new(dimension: crate::worldgen::DimId, reg: &'a crate::block_registry::BReg) -> Self {
+        Self::with_block_getter(dimension, reg, block_at_dim)
+    }
+
+    /// Allows tests and callers to provide a snapshot or synthetic block map.
+    pub fn with_block_getter(
+        dimension: crate::worldgen::DimId,
+        reg: &'a crate::block_registry::BReg,
+        getter: impl Fn(crate::worldgen::DimId, i32, i32, i32) -> u32 + 'a,
+    ) -> Self {
+        Self {
+            dimension,
+            reg,
+            block_getter: Box::new(getter),
+        }
+    }
+
+    fn state_at(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        (self.min_y()..=self.max_y())
+            .contains(&y)
+            .then(|| (self.block_getter)(self.dimension, x, y, z))
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PathWorld for LiveWorldPathAdapter<'_> {
+    fn path_type(&self, x: i32, y: i32, z: i32) -> BlockPathType {
+        self.state_at(x, y, z).map_or(BlockPathType::Blocked, |state| {
+            classify_block_state_path_type(self.reg, state)
+        })
+    }
+
+    fn is_solid(&self, x: i32, y: i32, z: i32) -> bool {
+        self.state_at(x, y, z)
+            .is_none_or(|state| self.reg.is_solid(state))
+    }
+
+    fn collision_height(&self, x: i32, y: i32, z: i32) -> f64 {
+        self.state_at(x, y, z).map_or(1.0, |state| {
+            self.reg
+                .collision_boxes(state)
+                .fold(0.0_f64, |height, (_, max)| height.max(max[1]))
+        })
+    }
+
+    fn min_y(&self) -> i32 {
+        self.dimension.min_y()
+    }
+
+    // PathWorld bounds are inclusive, unlike the dimension's exclusive end.
+    fn max_y(&self) -> i32 {
+        self.dimension.min_y() + self.dimension.height() - 1
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PathNode {
@@ -1202,6 +1334,186 @@ impl Goal for LookAtPlayerGoal {
     fn stop(&mut self, _: &GoalContext<'_>) {}
 }
 
+/// Selects the goal schedule from the pinned protocol-767 entity registry.
+/// Goals are stateful, so a selector is constructed once for each mob.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn build_goal_selector_for_etype(etype: i64) -> GoalSelector {
+    let mut selector = GoalSelector::default();
+    let Some(spec) = entity_spec_by_id(etype) else {
+        return selector;
+    };
+    if spec.max_health <= 0.0
+        || matches!(spec.name, "minecraft:player" | "minecraft:armor_stand")
+    {
+        return selector;
+    }
+
+    selector.add_goal(Box::new(FloatGoal { priority: 0 }));
+    match spec.name {
+        "minecraft:creeper" => {
+            selector.add_goal(Box::new(SwellGoal::new(2)));
+            selector.add_goal(Box::new(MeleeAttackGoal::new(3)));
+        }
+        "minecraft:zombie"
+        | "minecraft:husk"
+        | "minecraft:drowned"
+        | "minecraft:spider"
+        | "minecraft:cave_spider"
+        | "minecraft:skeleton"
+        | "minecraft:stray" => {
+            selector.add_goal(Box::new(MeleeAttackGoal::new(2)));
+        }
+        "minecraft:cow" | "minecraft:pig" | "minecraft:sheep" | "minecraft:chicken" => {
+            // Item IDs are the existing 1.21.1 server item mappings.
+            let tempting_item = match spec.name {
+                "minecraft:pig" => 1097,     // carrot
+                "minecraft:chicken" => 853,  // wheat_seeds
+                _ => 854,                     // wheat
+            };
+            selector.add_goal(Box::new(PanicGoal::new(1)));
+            selector.add_goal(Box::new(BreedGoal::new(2)));
+            selector.add_goal(Box::new(TemptGoal::new(3, tempting_item)));
+        }
+        _ => {}
+    }
+    selector.add_goal(Box::new(WaterAvoidingRandomStrollGoal::new(
+        6,
+        (etype as u64) ^ 0x9e3779b97f4a7c15,
+    )));
+    selector.add_goal(Box::new(LookAtPlayerGoal {
+        priority: 7,
+        look_distance: 8.0,
+    }));
+    selector
+}
+
+/// Per-entity persistent AI state. Keep one profile across ticks so attack
+/// cooldowns, breeding progress and navigation waypoints are retained.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct MobAiProfile {
+    pub etype: i64,
+    pub selector: GoalSelector,
+    pub navigation: PathNavigation,
+    pub movement_speed: f64,
+    pub eye_height: f64,
+    requested_target: Option<(i32, i32, i32)>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MobAiProfile {
+    pub fn new(etype: i64) -> Self {
+        let spec = entity_spec_by_id(etype);
+        let movement_speed = if matches!(etype, 19 | 22 | 77 | 87) {
+            0.2
+        } else {
+            0.25
+        };
+        Self {
+            etype,
+            selector: build_goal_selector_for_etype(etype),
+            navigation: PathNavigation::default(),
+            movement_speed,
+            eye_height: spec.map_or(1.53, |spec| f64::from(spec.eye_height)),
+            requested_target: None,
+        }
+    }
+}
+
+/// Intent to be applied by the live mob physics and interaction code.
+/// Movement is an X/Z displacement per tick; Y movement stays with physics.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct MobAiStepResult {
+    pub move_target: Option<(f64, f64, f64)>,
+    pub movement_delta: (f64, f64, f64),
+    pub look_yaw: Option<f32>,
+    pub look_pitch: Option<f32>,
+    pub jump: bool,
+    pub attack_target: Option<i32>,
+    pub swell: Option<bool>,
+    pub breed_target: Option<i32>,
+}
+
+/// One tick of scheduling, path-following and intent generation. The caller
+/// supplies observations and a PathWorld, then applies the returned actions.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn tick_mob_ai_step(
+    profile: &mut MobAiProfile,
+    ctx: &GoalContext<'_>,
+) -> MobAiStepResult {
+    let goal = profile.selector.tick(ctx);
+    let mut waypoint = goal.move_target;
+    if let (Some(world), Some(target)) = (ctx.world, goal.move_target) {
+        let destination = (
+            target.0.floor() as i32,
+            target.1.floor() as i32,
+            target.2.floor() as i32,
+        );
+        if profile.requested_target != Some(destination) || profile.navigation.is_done() {
+            let start = (
+                ctx.position.0.floor() as i32,
+                ctx.position.1.floor() as i32,
+                ctx.position.2.floor() as i32,
+            );
+            let finder = PathFinder {
+                evaluator: WalkNodeEvaluator {
+                    mob_height: ctx.height,
+                    ..WalkNodeEvaluator::default()
+                },
+                ..PathFinder::default()
+            };
+            profile.navigation.navigate_to(&finder, world, start, destination);
+            profile.requested_target = Some(destination);
+        }
+        profile.navigation.advance_if_reached(ctx.position, 0.45);
+        waypoint = profile.navigation.next_waypoint();
+    } else {
+        profile.navigation.stop();
+        profile.requested_target = None;
+    }
+
+    let mut movement_delta = (0.0, 0.0, 0.0);
+    let mut jump = goal.jump;
+    if let Some(point) = waypoint {
+        let dx = point.0 - ctx.position.0;
+        let dz = point.2 - ctx.position.2;
+        let distance = dx.hypot(dz);
+        if distance > 0.05 {
+            let step = profile.movement_speed.max(0.0).min(distance);
+            movement_delta = (dx / distance * step, 0.0, dz / distance * step);
+        }
+        jump |= point.1 > ctx.position.1 + 0.5;
+    }
+
+    let (look_yaw, look_pitch) = if let Some(point) = goal.look_target {
+        let dx = point.0 - ctx.position.0;
+        let dz = point.2 - ctx.position.2;
+        let dy = point.1 - (ctx.position.1 + profile.eye_height);
+        let horizontal_distance = dx.hypot(dz);
+        if horizontal_distance > 0.0 || dy != 0.0 {
+            (
+                Some((-dx.atan2(dz)).to_degrees() as f32),
+                Some((-dy.atan2(horizontal_distance)).to_degrees() as f32),
+            )
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    MobAiStepResult {
+        move_target: goal.move_target,
+        movement_delta,
+        look_yaw,
+        look_pitch,
+        jump,
+        attack_target: goal.attack_target,
+        swell: goal.swell,
+        breed_target: goal.breed_target,
+    }
+}
+
 #[cfg(test)]
 mod mob_ai_tests {
     use super::*;
@@ -1272,6 +1584,175 @@ mod mob_ai_tests {
 
     fn target(id: i32, x: f64, y: f64, z: f64) -> AiEntityPerception {
         AiEntityPerception::new(id, (x, y, z))
+    }
+
+    #[test]
+    fn real_registry_block_path_types_and_properties() {
+        use BlockPathType::*;
+        let reg = crate::block_registry::breg().expect("1.21.1 block registry");
+        for (name, expected) in [
+            ("stone", Blocked),
+            ("air", Open),
+            ("cave_air", Open),
+            ("short_grass", Open),
+            ("water", Water),
+            ("bubble_column", Water),
+            ("lava", Lava),
+            ("oak_fence", Fence),
+            ("cobblestone_wall", Fence),
+            ("cactus", DamageOther),
+            ("sweet_berry_bush", DamageOther),
+            ("wither_rose", DamageOther),
+            ("fire", DamageFire),
+            ("soul_fire", DamageFire),
+            ("campfire", DamageFire),
+            ("magma_block", DamageFire),
+            ("rail", Rail),
+            ("powered_rail", Rail),
+            ("oak_leaves", Leaves),
+            ("powder_snow", PowderSnow),
+            ("honey_block", StickyHoney),
+            ("oak_trapdoor", Trapdoor),
+        ] {
+            let state = reg.state_of(name, None);
+            assert_eq!(reg.name_of(state), format!("minecraft:{name}"));
+            assert_eq!(classify_block_state_path_type(reg, state), expected, "{name}");
+        }
+
+        let gate = reg.state_of("oak_fence_gate", None);
+        let oak_door = reg.state_of("oak_door", None);
+        let iron_door = reg.state_of("iron_door", None);
+        assert_eq!(
+            classify_block_state_path_type(reg, reg.with_prop(gate, "open", "false")),
+            Fence
+        );
+        assert_eq!(
+            classify_block_state_path_type(reg, reg.with_prop(gate, "open", "true")),
+            Open
+        );
+        assert_eq!(
+            classify_block_state_path_type(reg, reg.with_prop(oak_door, "open", "false")),
+            DoorWoodClosed
+        );
+        assert_eq!(
+            classify_block_state_path_type(reg, reg.with_prop(oak_door, "open", "true")),
+            DoorOpen
+        );
+        assert_eq!(
+            classify_block_state_path_type(reg, reg.with_prop(iron_door, "open", "false")),
+            DoorIronClosed
+        );
+        assert_eq!(
+            classify_block_state_path_type(reg, reg.with_prop(iron_door, "open", "true")),
+            DoorOpen
+        );
+        let wet_stairs = reg.with_prop(
+            reg.state_of("oak_stairs", None),
+            "waterlogged",
+            "true",
+        );
+        assert!(reg.is_liquid(wet_stairs));
+        assert_eq!(classify_block_state_path_type(reg, wet_stairs), Blocked);
+    }
+
+    #[test]
+    fn live_adapter_dimension_bounds_and_real_collision_shapes() {
+        let reg = crate::block_registry::breg().expect("1.21.1 block registry");
+        let stone = reg.state_of("stone", None);
+        let air = reg.state_of("air", None);
+        let fence = reg.state_of("oak_fence", None);
+        let lava = reg.state_of("lava", None);
+        let stairs = reg.state_of("oak_stairs", None);
+        let blocks = BTreeMap::from([
+            ((1, 1, 0), fence),
+            ((2, 1, 0), lava),
+            ((3, 1, 0), stairs),
+            ((1, 2, 0), stone),
+            ((2, 2, 0), stone),
+            ((3, 2, 0), stone),
+        ]);
+        let world = LiveWorldPathAdapter::with_block_getter(
+            crate::worldgen::DimId::Overworld,
+            reg,
+            |dim, x, y, z| {
+                assert_eq!(dim, crate::worldgen::DimId::Overworld);
+                blocks
+                    .get(&(x, y, z))
+                    .copied()
+                    .unwrap_or(if y == 0 { stone } else { air })
+            },
+        );
+
+        assert_eq!((world.min_y(), world.max_y()), (-64, 319));
+        assert_eq!(world.path_type(1, 1, 0), BlockPathType::Fence);
+        assert_eq!(world.path_type(2, 1, 0), BlockPathType::Lava);
+        assert_eq!(world.path_type(3, 1, 0), BlockPathType::Blocked);
+        assert!(world.is_solid(1, 1, 0));
+        assert!(world.collision_height(1, 1, 0) > 1.0);
+        assert!(world.collision_height(3, 1, 0) > 0.0);
+        assert_eq!(world.collision_height(2, 1, 0), 0.0);
+        assert_eq!(world.path_type(0, 320, 0), BlockPathType::Blocked);
+
+        let path = PathFinder::default().find_path(&world, (0, 1, 0), (4, 1, 0));
+        assert!(path.reached, "{path:?}");
+        assert!(path.nodes.iter().any(|node| node.z != 0));
+        assert!(path.nodes.iter().all(|node| {
+            !matches!(node.path_type, BlockPathType::Fence | BlockPathType::Lava)
+                && !(node.z == 0 && (1..=3).contains(&node.x))
+        }));
+
+        for dim in [crate::worldgen::DimId::Nether, crate::worldgen::DimId::End] {
+            let live = LiveWorldPathAdapter::new(dim, reg);
+            assert_eq!((live.min_y(), live.max_y()), (0, 255));
+        }
+    }
+
+    #[test]
+    fn mob_goal_factories_and_tick_driver() {
+        let mut creeper = build_goal_selector_for_etype(23);
+        let mut zombie = build_goal_selector_for_etype(124);
+        let mut cow = build_goal_selector_for_etype(22);
+        assert_eq!(creeper.goals.len(), 5);
+        assert_eq!(zombie.goals.len(), 4);
+        assert_eq!(cow.goals.len(), 6);
+        assert_eq!(build_goal_selector_for_etype(-1).goals.len(), 0);
+        assert_eq!(build_goal_selector_for_etype(128).goals.len(), 0);
+        assert_eq!(build_goal_selector_for_etype(53).goals.len(), 3);
+
+        let close_target = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            target: Some(target(15, 2.0, 1.0, 0.0)),
+            ..GoalContext::default()
+        };
+        assert_eq!(creeper.tick(&close_target).swell, Some(true));
+        let close_target = GoalContext {
+            target: Some(target(15, 1.0, 0.0, 0.0)),
+            ..GoalContext::default()
+        };
+        assert_eq!(zombie.tick(&close_target).attack_target, Some(15));
+
+        let mut player = target(12, 5.0, 1.0, 0.0);
+        player.held_item = Some(854);
+        let tempted = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            nearest_player: Some(player),
+            ..GoalContext::default()
+        };
+        assert_eq!(cow.tick(&tempted).move_target, Some(player.position));
+
+        let mut profile = MobAiProfile::new(124);
+        assert_eq!(profile.etype, 124);
+        let view = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            target: Some(target(42, 5.0, 1.0, 0.0)),
+            ..GoalContext::default()
+        };
+        let step = tick_mob_ai_step(&mut profile, &view);
+        assert_eq!(step.move_target, Some((5.0, 1.0, 0.0)));
+        assert_eq!(step.movement_delta, (0.25, 0.0, 0.0));
+        assert_eq!(step.look_yaw, Some(-90.0));
+        assert!(step.look_pitch.is_some());
+        assert_eq!(step.attack_target, None);
     }
 
     #[test]
