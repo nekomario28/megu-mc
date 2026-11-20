@@ -32232,9 +32232,16 @@ fn handle(mut s: TcpStream) {
             0x09 => {
                 // client_command: perform_respawn
                 let mut sl = &b[..];
-                if read_varint(&mut sl) == Some(0) {
+                if read_varint(&mut sl) == Some(0) && sl.is_empty() {
+                    let restored_health = max_hp_of(&me.name);
+                    {
+                        let mut health = me.hp.lock().unwrap();
+                        if *health > 0.0 {
+                            continue;
+                        }
+                        *health = restored_health;
+                    }
                     close_live_menu(&me, true, true);
-                    *me.hp.lock().unwrap() = max_hp_of(&me.name);
                     // vanilla death drops the inventory at the death
                     // location (keepInventory=false) — the player's pos
                     // is still the death site at this point
