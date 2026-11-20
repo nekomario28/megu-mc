@@ -115,6 +115,7 @@ timeout 180 python3 tests/mineshaft_dispatch_test.py "$binary"
 timeout 180 python3 tests/gp5_gp7_wire.py "$binary"
 timeout 180 python3 tests/gp3_gp4_gp5_wire.py "$binary"
 timeout 180 python3 tests/gp1_gp6_wire.py "$binary"
+timeout 180 python3 tests/gp2_nether_spawn_wire.py "$binary"
 timeout 180 python3 tests/command_brigadier_ops_wire.py "$binary"
 timeout 180 python3 tests/command_datapack_wire.py
 timeout 180 python3 tests/client_prediction_wire.py --binary "$binary"

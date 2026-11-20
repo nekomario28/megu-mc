@@ -137,7 +137,20 @@ def exercise(game, rcon):
         client.observe(0.5)
         assert set(client.spawns) == seeds, "natural spawn despite the soul_sand_valley budget"
         command("kill @e[type=minecraft:strider]", "Killed 24")
+        command("difficulty peaceful", "peaceful")
         command("gamerule doMobSpawning true", "true")
+        start = game_tick()
+        deadline = time.monotonic() + 45
+        while game_tick() - start < 100:
+            assert time.monotonic() < deadline, "insufficient live peaceful spawn cycles"
+            client.observe(2)
+        assert not any(
+            eid not in seeds and kind in VALLEY_MONSTERS
+            for eid, (kind, _) in client.spawns.items()
+        ), "natural Nether monster on Peaceful"
+
+        seeds = set(client.spawns)
+        command("difficulty normal", "normal")
         client.until(lambda *_: bool(set(client.spawns) - seeds), "natural Add Entity after removing charges")
         client.observe(5)
         natural = [spawn for eid, spawn in client.spawns.items() if eid not in seeds]

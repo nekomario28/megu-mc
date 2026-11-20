@@ -2737,8 +2737,8 @@ check "cave-spider spawner light check rejects lit blocks" \
   mineshaft_runtime_tests::spawner_runtime_tick_light_cap_break_and_persistence
 
 check "cave-spider spawner counts living nearby spiders for MaxNearbyEntities" \
-  src/main.rs '            .filter(|m| m.etype == cave_spider && *m.hp.lock().unwrap() > 0.0)' \
-  '            .filter(|m| m.etype == cave_spider && *m.hp.lock().unwrap() < 0.0)' \
+  src/main.rs '            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap() > 0.0)' \
+  '            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap() < 0.0)' \
   mineshaft_runtime_tests::spawner_runtime_tick_light_cap_break_and_persistence
 
 check "breaking a spawner block removes its owned NBT entry" \
@@ -3774,8 +3774,8 @@ check "p2_3_s2a_a_miss_reads_the_dimensions_own_generator" \
 # A companion file's table must load into its own dimension. Read into the Overworld's key, a Nether
 # save restores nothing in the Nether and overwrites the Overworld chunk of the same coordinate.
 check "p2_3_s2a_a_companion_table_loads_into_its_own_dimension" \
-  src/main.rs '        let c = w.entry((dim, cx, cz)).or_default();' \
-  '        let c = w.entry((DimId::Overworld, cx, cz)).or_default();' \
+  src/main.rs '        let mut c = w.as_mut().map(|world| world.entry((dim, cx, cz)).or_default());' \
+  '        let mut c = w.as_mut().map(|world| world.entry((DimId::Overworld, cx, cz)).or_default());' \
   persistence_tests::p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip
 
 # P2-3-S2c: the legacy sign section must hold the Overworld's signs only. Dropping the filter puts
@@ -3897,10 +3897,12 @@ check "p2_3_s4_portal_horizontal_scaling" \
   tick_tests::p2_3_s4_portal_scaling_clamps_y_and_the_arrival_guard_blocks_bounce
 
 check "p2_3_s4_logout_saves_the_live_dimension" \
-  src/main.rs '    let d = *c.dim.lock().unwrap();
-    (d, p.0, p.1, p.2, p.3, p.4)' \
-  '    let d = DimId::Overworld;
-    (d, p.0, p.1, p.2, p.3, p.4)' \
+  src/main.rs '    let dim = c.dim.lock().unwrap();
+    let p = *c.pos.lock().unwrap();
+    (*dim, p.0, p.1, p.2, p.3, p.4)' \
+  '    let _dim = c.dim.lock().unwrap();
+    let p = *c.pos.lock().unwrap();
+    (DimId::Overworld, p.0, p.1, p.2, p.3, p.4)' \
   tick_tests::p2_3_s4_logout_persists_the_clients_live_dimension
 
 check "p2_3_s4_chunk_deltas_respect_the_dimension_filter" \
