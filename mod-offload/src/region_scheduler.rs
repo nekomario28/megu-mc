@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
 //! Region-local simulation and little-endian, direct-buffer-friendly delta batches.
-//! Transport wakes are scheduled work. Kinetic topology and contraption edits are
-//! explicit synchronous operations on the owning region's kernels.
+//! Fluid edits and transport/recipe wakes are scheduled work. Kinetic topology
+//! and contraption edits are synchronous.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::contraption::Contraption;
+use crate::fluid_network::{FluidError, FluidNetwork, TankState};
 use crate::kinetic_graph::KineticGraph;
+use crate::recipe_processor::{Drive, Recipe, RecipeError, RecipeProcessor, Stack};
 use crate::sleeping_transport::{SleepingTransport, TransportDelta, TransportError};
 
 pub const REGION_SIDE_BLOCKS: i32 = 32;
@@ -17,10 +19,14 @@ pub const MAX_BATCH_RECORDS: usize = 4096;
 pub const BATCH_HEADER_BYTES: usize = 32;
 pub const RECORD_HEADER_BYTES: usize = 16;
 pub const TRANSPORT_TRANSFER: u16 = 1;
+pub const FLUID_TANK_UPDATE: u16 = 2;
+pub const RECIPE_EVENT: u16 = 3;
 pub const FIRST_ADAPTER_KIND: u16 = 0x100;
 
 const FRAME_MAGIC: [u8; 4] = [b'S', b'5', 1, 1];
 const TRANSFER_PAYLOAD_BYTES: usize = 9;
+const TANK_PAYLOAD_BYTES: usize = 9;
+const RECIPE_PAYLOAD_BYTES: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RegionKey {
@@ -42,7 +48,7 @@ impl RegionKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegionBudget {
     pub max_steps: usize,
-    /// Checked between completed transfers. A started transfer is atomic.
+    /// Checked between atomic units of kernel work.
     pub max_time: Option<Duration>,
 }
 
@@ -91,6 +97,9 @@ pub struct Region {
     pub kinetic: KineticGraph,
     pub contraptions: BTreeMap<u32, Contraption>,
     transport: SleepingTransport,
+    fluid: FluidNetwork,
+    recipes: RecipeProcessor,
+    fluid_updates: std::vec::IntoIter<(u32, TankState)>,
     pending: VecDeque<Delta>,
     pending_bytes: usize,
     sequence: u64,
@@ -110,12 +119,15 @@ impl Delta {
 }
 
 impl Region {
-    fn new(key: RegionKey) -> Self {
+    pub fn new(key: RegionKey) -> Self {
         Self {
             key,
             kinetic: KineticGraph::default(),
             contraptions: BTreeMap::new(),
             transport: SleepingTransport::default(),
+            fluid: FluidNetwork::default(),
+            recipes: RecipeProcessor::default(),
+            fluid_updates: Vec::new().into_iter(),
             pending: VecDeque::new(),
             pending_bytes: 0,
             sequence: 0,
@@ -124,6 +136,63 @@ impl Region {
 
     pub fn transport(&self) -> &SleepingTransport {
         &self.transport
+    }
+
+    pub fn fluid(&self) -> &FluidNetwork {
+        &self.fluid
+    }
+
+    pub fn add_tank(&mut self, id: u32, capacity: u32, elevation: i32) -> Result<(), FluidError> {
+        self.fluid.add_tank(id, capacity, elevation)
+    }
+
+    pub fn set_tank(&mut self, id: u32, capacity: u32, elevation: i32) -> Result<(), FluidError> {
+        self.fluid.set_tank(id, capacity, elevation)
+    }
+
+    pub fn set_fluid_link(&mut self, a: u32, b: u32, head: Option<i32>) -> Result<(), FluidError> {
+        self.fluid.set_link(a, b, head)
+    }
+
+    pub fn insert_fluid(&mut self, id: u32, fluid: u32, amount: u32) -> Result<u32, FluidError> {
+        self.fluid.insert(id, fluid, amount)
+    }
+
+    pub fn extract_fluid(&mut self, id: u32, amount: u32) -> Result<u32, FluidError> {
+        self.fluid.extract(id, amount)
+    }
+
+    pub fn add_processor(
+        &mut self,
+        id: u32,
+        input_capacity: u32,
+        output_capacity: u32,
+        recipes: Vec<Recipe>,
+        drive: Drive,
+    ) -> Result<(), RecipeError> {
+        self.recipes
+            .add_machine(id, input_capacity, output_capacity, recipes, drive)
+    }
+
+    pub fn set_processor_drive(&mut self, id: u32, drive: Drive) -> Result<(), RecipeError> {
+        self.recipes.set_drive(id, drive)
+    }
+
+    pub fn insert_ingredient(&mut self, id: u32, stack: Stack) -> Result<u32, RecipeError> {
+        self.recipes.insert(id, stack)
+    }
+
+    pub fn extract_product(&mut self, id: u32, stack: Stack) -> Result<u32, RecipeError> {
+        self.recipes.extract(id, stack)
+    }
+
+    pub fn distribute_product(
+        &mut self,
+        id: u32,
+        stack: Stack,
+        destinations: &[u32],
+    ) -> Result<u32, RecipeError> {
+        self.recipes.distribute(id, stack, destinations)
     }
 
     pub fn add_machine(
@@ -147,8 +216,8 @@ impl Region {
         self.transport.extract_output(id)
     }
 
-    /// Advance this region's ready work. Due transfers are held until the
-    /// caller drains batch output when space runs out.
+    /// Advance this region's ready work in timestamp order. Fluid edits run
+    /// at the current clock and transport precedes recipes on equal deadlines.
     pub fn advance_to(
         &mut self,
         tick: u64,
@@ -157,13 +226,11 @@ impl Region {
         self.transport.check_time(tick)?;
         let time_limit = budget.max_time.map(|limit| (Instant::now(), limit));
         let mut report = RegionReport::default();
-        while report.processed < budget.max_steps
-            && self
-                .transport
-                .next_wake_tick()
-                .is_some_and(|next| next <= tick)
-        {
-            if !self.has_room(TRANSFER_PAYLOAD_BYTES) {
+        while let Some((due, work)) = self.next_work().filter(|(due, _)| *due <= tick) {
+            if report.processed == budget.max_steps {
+                break;
+            }
+            if !self.has_room(work.payload_bytes()) {
                 report.output_blocked = true;
                 break;
             }
@@ -171,12 +238,54 @@ impl Region {
                 report.time_exhausted = true;
                 break;
             }
-            let delta = self.transport.step(tick).unwrap();
-            self.queue_transfer(delta);
+            self.transport.advance_clock_to(due);
+            self.recipes.advance_idle_to(due);
+            match work {
+                Work::Fluid => {
+                    if self.fluid_updates.len() == 0 {
+                        self.fluid_updates = self.fluid.step().unwrap().changes.into_iter();
+                    }
+                    if let Some((id, state)) = self.fluid_updates.next() {
+                        self.queue_tank(due, id, state);
+                    }
+                }
+                Work::Transport => {
+                    let delta = self.transport.step(due).unwrap();
+                    self.queue_transfer(delta);
+                }
+                Work::Recipe => {
+                    let event = self.recipes.step().unwrap();
+                    let mut payload = [0; RECIPE_PAYLOAD_BYTES];
+                    payload[0] = u8::from(event.recipe.is_some());
+                    payload[1..].copy_from_slice(&event.recipe.unwrap_or(0).to_le_bytes());
+                    self.push_delta(event.tick, event.machine, RECIPE_EVENT, &payload);
+                }
+            }
             report.processed += 1;
         }
-        report.backlog = self.transport.finish_advance(tick);
+        report.backlog = self
+            .next_work()
+            .map(|(due, _)| due)
+            .filter(|&due| due <= tick);
+        if report.backlog.is_none() {
+            self.transport.advance_clock_to(tick);
+            self.recipes.advance_idle_to(tick);
+        }
         Ok(report)
+    }
+
+    fn next_work(&self) -> Option<(u64, Work)> {
+        if self.fluid_updates.len() != 0 || self.fluid.has_pending() {
+            return Some((self.transport.now(), Work::Fluid));
+        }
+        match (self.transport.next_wake_tick(), self.recipes.next_due()) {
+            (Some(transport), Some(recipe)) if transport <= recipe => {
+                Some((transport, Work::Transport))
+            }
+            (_, Some(recipe)) => Some((recipe, Work::Recipe)),
+            (Some(transport), None) => Some((transport, Work::Transport)),
+            (None, None) => None,
+        }
     }
 
     /// Queue an adapter-defined snapshot delta at the region's logical tick.
@@ -207,6 +316,19 @@ impl Region {
         buffer: &mut [u8],
         max_records: usize,
     ) -> Result<BatchReport, BatchError> {
+        self.export_with(buffer.len(), max_records, |offset, bytes| {
+            buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
+        })
+    }
+
+    /// Writes wire bytes directly to a caller-provided sink. Offsets and
+    /// lengths always fall within the supplied capacity.
+    pub(crate) fn export_with(
+        &mut self,
+        capacity: usize,
+        max_records: usize,
+        mut write: impl FnMut(usize, &[u8]),
+    ) -> Result<BatchReport, BatchError> {
         let empty = BatchReport {
             bytes: 0,
             records: 0,
@@ -218,7 +340,7 @@ impl Region {
         let Some(first) = self.pending.front() else {
             return Ok(empty);
         };
-        let limit = buffer.len().min(MAX_BATCH_BYTES);
+        let limit = capacity.min(MAX_BATCH_BYTES);
         let needed = BATCH_HEADER_BYTES + first.bytes();
         if needed > limit {
             return Err(BatchError::BufferTooSmall { needed });
@@ -238,23 +360,25 @@ impl Region {
                 break;
             }
             let delta = self.pending.pop_front().unwrap();
-            let record = &mut buffer[offset..offset + bytes];
+            let mut record = [0; RECORD_HEADER_BYTES];
             record[..8].copy_from_slice(&delta.tick.to_le_bytes());
             record[8..12].copy_from_slice(&delta.source.to_le_bytes());
             record[12..14].copy_from_slice(&delta.kind.to_le_bytes());
             record[14..16].copy_from_slice(&(delta.payload.len() as u16).to_le_bytes());
-            record[16..].copy_from_slice(&delta.payload);
+            write(offset, &record);
+            write(offset + RECORD_HEADER_BYTES, &delta.payload);
             offset += bytes;
             count += 1;
             self.pending_bytes -= bytes;
         }
-        buffer[..4].copy_from_slice(&FRAME_MAGIC);
-        buffer[4..8].copy_from_slice(&count.to_le_bytes());
-        buffer[8..16].copy_from_slice(&sequence.to_le_bytes());
-        buffer[16..20].copy_from_slice(&self.key.dimension.to_le_bytes());
-        buffer[20..24].copy_from_slice(&self.key.x.to_le_bytes());
-        buffer[24..28].copy_from_slice(&self.key.z.to_le_bytes());
-        buffer[28..32].fill(0);
+        let mut header = [0; BATCH_HEADER_BYTES];
+        header[..4].copy_from_slice(&FRAME_MAGIC);
+        header[4..8].copy_from_slice(&count.to_le_bytes());
+        header[8..16].copy_from_slice(&sequence.to_le_bytes());
+        header[16..20].copy_from_slice(&self.key.dimension.to_le_bytes());
+        header[20..24].copy_from_slice(&self.key.x.to_le_bytes());
+        header[24..28].copy_from_slice(&self.key.z.to_le_bytes());
+        write(0, &header);
         self.sequence = sequence;
         Ok(BatchReport {
             bytes: offset,
@@ -277,6 +401,14 @@ impl Region {
         self.push_delta(delta.tick, delta.source, TRANSPORT_TRANSFER, &payload);
     }
 
+    fn queue_tank(&mut self, tick: u64, id: u32, state: TankState) {
+        let mut payload = [0; TANK_PAYLOAD_BYTES];
+        payload[0] = u8::from(state.fluid.is_some());
+        payload[1..5].copy_from_slice(&state.fluid.unwrap_or(0).to_le_bytes());
+        payload[5..9].copy_from_slice(&state.amount.to_le_bytes());
+        self.push_delta(tick, id, FLUID_TANK_UPDATE, &payload);
+    }
+
     fn push_delta(&mut self, tick: u64, source: u32, kind: u16, payload: &[u8]) {
         self.pending_bytes += RECORD_HEADER_BYTES + payload.len();
         self.pending.push_back(Delta {
@@ -285,6 +417,23 @@ impl Region {
             kind,
             payload: payload.into(),
         });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Work {
+    Fluid,
+    Transport,
+    Recipe,
+}
+
+impl Work {
+    fn payload_bytes(self) -> usize {
+        match self {
+            Self::Fluid => TANK_PAYLOAD_BYTES,
+            Self::Transport => TRANSFER_PAYLOAD_BYTES,
+            Self::Recipe => RECIPE_PAYLOAD_BYTES,
+        }
     }
 }
 

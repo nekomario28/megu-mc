@@ -4,6 +4,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use mod_offload::kinetic_graph::{KineticGraph, KineticNode, NetworkStatus};
+use mod_offload::recipe_processor::{Drive, Recipe, Resource, ResourceKind, Stack};
+use mod_offload::region_scheduler::{Region, RegionBudget, RegionKey, MAX_BATCH_BYTES};
 use mod_offload::sleeping_transport::{MachineStatus, SleepingTransport};
 
 const MACHINES: u32 = 10_000;
@@ -12,6 +14,26 @@ const NODES_PER_NETWORK: u32 = 100;
 const OFFLOAD_TICKS: u64 = 2_000_000;
 const NAIVE_TICKS: u64 = 100_000;
 const WARMUP_TICKS: u64 = 1_000;
+const DORMANT_CHAINS: u32 = 5_000;
+const ACTIVE_CHAINS: u32 = 500;
+const FACTORY_WARMUP: u64 = 20;
+const FACTORY_CYCLES: u64 = 250;
+const FACTORY_BUDGET: RegionBudget = RegionBudget {
+    max_steps: 2_000,
+    max_time: None,
+};
+
+const fn stack(kind: ResourceKind, id: u32) -> Stack {
+    Stack {
+        resource: Resource { kind, id },
+        amount: 1,
+    }
+}
+
+const ORE: Stack = stack(ResourceKind::Item, 1);
+const WATER: Stack = stack(ResourceKind::Fluid, 1);
+const PRODUCT: Stack = stack(ResourceKind::Item, 2);
+const BYPRODUCT: Stack = stack(ResourceKind::Fluid, 2);
 
 struct NaiveMachine {
     input: u32,
@@ -163,4 +185,144 @@ fn main() {
     } else {
         println!("thread CPU: unavailable (requires Linux thread schedstat)");
     }
+    mixed_factory();
+}
+
+fn mixed_factory() {
+    let mut region = Region::new(RegionKey::for_block(0, 0, 0));
+    let recipe = Recipe {
+        id: 1,
+        base_ticks: 2,
+        inputs: vec![ORE, WATER],
+        outputs: vec![PRODUCT, BYPRODUCT],
+    };
+    for id in 0..ACTIVE_CHAINS + DORMANT_CHAINS {
+        let source = id * 2;
+        let sink = source + 1;
+        region
+            .kinetic
+            .add_node(
+                source,
+                KineticNode {
+                    capacity: 2.0,
+                    load: 0.0,
+                    driven_speed: Some(32.0),
+                },
+            )
+            .unwrap();
+        region
+            .kinetic
+            .add_node(
+                sink,
+                KineticNode {
+                    load: 1.0,
+                    ..KineticNode::default()
+                },
+            )
+            .unwrap();
+        region.kinetic.connect(source, sink, 1.0).unwrap();
+        region.add_machine(id, 1, 1).unwrap();
+        region.add_tank(source, 2, 0).unwrap();
+        region.add_tank(sink, 2, 0).unwrap();
+        region.set_fluid_link(source, sink, Some(0)).unwrap();
+        region
+            .add_processor(id, 2, 2, vec![recipe.clone()], factory_drive(&region, sink))
+            .unwrap();
+    }
+    while region
+        .advance_to(0, FACTORY_BUDGET)
+        .unwrap()
+        .backlog
+        .is_some()
+    {}
+    let mut frame = vec![0; MAX_BATCH_BYTES];
+    assert_eq!(
+        region.export_into(&mut frame, usize::MAX).unwrap().records,
+        0
+    );
+    for cycle in 0..FACTORY_WARMUP {
+        factory_cycle(&mut region, &mut frame, cycle);
+    }
+
+    let cpu_start = thread_cpu_ns();
+    let start = Instant::now();
+    for cycle in FACTORY_WARMUP..FACTORY_WARMUP + FACTORY_CYCLES {
+        factory_cycle(&mut region, &mut frame, cycle);
+    }
+    let micros = start.elapsed().as_secs_f64() * 1e6 / FACTORY_CYCLES as f64;
+    let cpu = thread_cpu_ns()
+        .zip(cpu_start)
+        .and_then(|(end, start)| end.checked_sub(start));
+    println!("mixed factory: {DORMANT_CHAINS} dormant + {ACTIVE_CHAINS} active chains, {FACTORY_CYCLES} cycles, 2 ticks/cycle");
+    println!("mixed factory work/cycle: {ACTIVE_CHAINS} belt transfers, {} fluid solves, {ACTIVE_CHAINS} recipes, {} S5 records", ACTIVE_CHAINS * 2, ACTIVE_CHAINS * 4);
+    println!(
+        "mixed factory wall: {micros:.2} us/cycle, {:.2} us/tick",
+        micros / 2.0
+    );
+    if let Some(cpu) = cpu {
+        let micros = cpu as f64 / (1000.0 * FACTORY_CYCLES as f64);
+        println!(
+            "mixed factory thread CPU: {micros:.2} us/cycle, {:.2} us/tick",
+            micros / 2.0
+        );
+    }
+}
+
+fn factory_drive(region: &Region, node: u32) -> Drive {
+    let solution = region.kinetic.solution(node).unwrap();
+    assert_eq!(solution.status, NetworkStatus::Running);
+    // This fixture uses only whole RPM values representable as u32.
+    Drive::Mechanical {
+        rpm: solution.speed.abs() as u32,
+        overstressed: false,
+    }
+}
+
+fn factory_cycle(region: &mut Region, frame: &mut [u8], cycle: u64) {
+    for id in 0..ACTIVE_CHAINS {
+        let source = id * 2;
+        if cycle.is_multiple_of(8) {
+            let speed = if cycle.is_multiple_of(16) { 64.0 } else { 32.0 };
+            assert_eq!(
+                region
+                    .kinetic
+                    .update_node(
+                        source,
+                        KineticNode {
+                            capacity: 2.0,
+                            load: 0.0,
+                            driven_speed: Some(speed),
+                        }
+                    )
+                    .unwrap(),
+                2
+            );
+            region
+                .set_processor_drive(id, factory_drive(region, source + 1))
+                .unwrap();
+        }
+        region.insert_item(id, ORE.resource.id).unwrap();
+        assert_eq!(region.insert_fluid(source, WATER.resource.id, 2), Ok(2));
+    }
+    let belt = region.advance_to(cycle * 2 + 1, FACTORY_BUDGET).unwrap();
+    assert_eq!(belt.processed, 3 * ACTIVE_CHAINS as usize);
+    assert_eq!(belt.backlog, None);
+    for id in 0..ACTIVE_CHAINS {
+        let source = id * 2;
+        assert_eq!(region.extract_output(id), Ok(Some(ORE.resource.id)));
+        assert_eq!(region.extract_fluid(source, 2), Ok(1));
+        assert_eq!(region.extract_fluid(source + 1, 2), Ok(1));
+        assert_eq!(region.insert_ingredient(id, ORE), Ok(1));
+        assert_eq!(region.insert_ingredient(id, WATER), Ok(1));
+    }
+    let recipe = region.advance_to(cycle * 2 + 2, FACTORY_BUDGET).unwrap();
+    assert_eq!(recipe.processed, 2 * ACTIVE_CHAINS as usize);
+    assert_eq!(recipe.backlog, None);
+    for id in 0..ACTIVE_CHAINS {
+        assert_eq!(region.extract_product(id, PRODUCT), Ok(1));
+        assert_eq!(region.extract_product(id, BYPRODUCT), Ok(1));
+    }
+    let batch = region.export_into(black_box(frame), usize::MAX).unwrap();
+    assert_eq!(batch.records, 4 * ACTIVE_CHAINS as usize);
+    assert_eq!(batch.bytes, 32 + 96 * ACTIVE_CHAINS as usize);
 }

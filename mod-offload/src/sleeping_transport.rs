@@ -209,6 +209,11 @@ impl SleepingTransport {
         Ok(())
     }
 
+    pub(crate) fn advance_clock_to(&mut self, tick: u64) {
+        debug_assert!(tick >= self.now && self.next_wake_tick().is_none_or(|due| due >= tick));
+        self.now = tick;
+    }
+
     pub(crate) fn finish_advance(&mut self, tick: u64) -> Option<u64> {
         let backlog = self.next_wake_tick().filter(|&due| due <= tick);
         if backlog.is_none() {
