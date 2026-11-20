@@ -32518,19 +32518,32 @@ fn handle(mut s: TcpStream) {
                     let mut sl = &b[..];
                     let wid = sl[0];
                     sl = &sl[1..];
-                    let _st = read_varint(&mut sl);
+                    if read_protocol_i32(&mut sl).is_none() {
+                        continue;
+                    }
                     if sl.len() >= 4 {
                         let slot = i16::from_be_bytes(sl[..2].try_into().unwrap());
                         let btn = sl[2];
                         sl = &sl[3..];
-                        let mode = read_varint(&mut sl).unwrap_or(0);
-                        if live_menu_id(&me).is_some() {
-                            if wid >= 4 {
+                        let Some(mode) = read_protocol_i32(&mut sl).map(i64::from) else {
+                            continue;
+                        };
+                        if let Some(active) = live_menu_id(&me) {
+                            if wid == active {
                                 with_save_guard(|| live_menu_click(&me, wid, slot, btn as i8, mode));
                             }
                             continue;
                         }
-                        if wid >= 4 {
+                        let active = if me.open_chest.lock().unwrap().is_some() {
+                            1
+                        } else if me.open_furnace.lock().unwrap().is_some() {
+                            2
+                        } else if *me.open_table.lock().unwrap() {
+                            3
+                        } else {
+                            0
+                        };
+                        if wid != active {
                             continue;
                         }
                         if mode == 0 {
