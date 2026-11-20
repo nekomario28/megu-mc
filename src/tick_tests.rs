@@ -4825,6 +4825,83 @@ fn nightly_hostile_type_uses_the_pinned_biome_spawners() {
     assert_eq!(spawn_etype_for_biome(None, 1), 91);
 }
 
+#[test]
+fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let player = |dim, spectator, (x, y, z)| {
+        let (client, peer) = client_pair();
+        *client.dim.lock().unwrap() = dim;
+        *client.gm.lock().unwrap() = if spectator { 3 } else { 0 };
+        *client.pos.lock().unwrap() = (x, y, z, 0.0, 0.0, true);
+        (Arc::new(client), peer)
+    };
+    let attempt = |players: &[(Arc<Client>, TcpStream)]| {
+        *clients().lock().unwrap() = players.iter().map(|(client, _)| client.clone()).collect();
+        mobs().lock().unwrap().clear();
+        SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
+        TICK.store(server_ticks(SPAWN_CYCLE_GT) / 2, Ordering::Relaxed);
+        WORLD_TIME.store(13000, Ordering::Relaxed);
+        keepalive_time_tick();
+        let spawned = mobs().lock().unwrap();
+        assert!(spawned.len() <= 1);
+        spawned.first().map(|mob| {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            (x, y, z)
+        })
+    };
+    let origin = (0.0, surface_y(0, 0), 0.0);
+    let overworld = || player(DimId::Overworld, false, origin);
+    let pos = attempt(&[overworld()]).expect("one eligible player should get a hostile");
+    let distance = (pos.0 - origin.0)
+        .hypot(pos.1 - origin.1)
+        .hypot(pos.2 - origin.2);
+    let scenarios = [
+        ("night spawn is in the player distance band", distance > 24.0 && distance <= 128.0),
+        (
+            "nearby Overworld player blocks the spawn",
+            attempt(&[overworld(), player(DimId::Overworld, false, pos)]).is_none(),
+        ),
+        (
+            "spectator cannot anchor the spawn",
+            attempt(&[player(DimId::Overworld, true, origin)]).is_none(),
+        ),
+        (
+            "Nether player cannot anchor an Overworld spawn",
+            attempt(&[player(DimId::Nether, false, origin)]).is_none(),
+        ),
+        (
+            "nearby spectator does not block the spawn",
+            attempt(&[overworld(), player(DimId::Overworld, true, pos)]) == Some(pos),
+        ),
+        (
+            "nearby Nether player does not block the spawn",
+            attempt(&[overworld(), player(DimId::Nether, false, pos)]) == Some(pos),
+        ),
+        (
+            "a player too far above the surface cannot anchor the spawn",
+            attempt(&[player(DimId::Overworld, false, (0.0, origin.1 + 140.0, 0.0))]).is_none(),
+        ),
+    ];
+    let failures: Vec<_> = scenarios
+        .iter()
+        .filter_map(|&(name, pass)| (!pass).then_some(name))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} spawn contracts failed: {failures:?}",
+        failures.len(),
+        scenarios.len(),
+    );
+    let at_24 = player(DimId::Overworld, false, (pos.0 + 24.0, pos.1, pos.2));
+    assert!(attempt(&[overworld(), at_24]).is_none(), "24 blocks is too close");
+
+    let high_anchor = player(DimId::Overworld, false, (origin.0, origin.1 + 140.0, origin.2));
+    let at_128 = player(DimId::Overworld, false, (pos.0, pos.1 + 128.0, pos.2));
+    assert_eq!(attempt(&[high_anchor, at_128]), Some(pos), "128 blocks is in range");
+}
+
 /// A deterministic yardstick for the chunk delivery path, with no socket in the loop.
 ///
 /// The end-to-end numbers on this host swing by 2-3x between runs (other lanes), and the
