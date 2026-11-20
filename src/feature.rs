@@ -11921,10 +11921,14 @@ mod a3a_tests {
         let a = state(&mut a, 0, 0, 5);
         super::POPULATE_WORKERS.store(0, Ordering::Relaxed);
         let mut b = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        let round = super::starts_round_begin();
+        b.starts_round = Some(round);
         assert_eq!(
             b.populate_in_order(order.iter().copied(), super::populate),
             25
         );
+        b.starts_round = None;
+        super::starts_round_end(round);
         let workers = super::populate_workers();
         let b = state(&mut b, 0, 0, 5);
         assert_same(&a, &b, "populate_in_order dispatch");
