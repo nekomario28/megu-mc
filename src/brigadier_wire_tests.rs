@@ -289,11 +289,12 @@ fn the_packet_is_the_body_with_the_protocol_prefixes_and_nothing_else() {
     let root = tree(vec![test]);
     let payload = commands_payload(&root).unwrap();
 
-    // body = VarInt id 0x10 + 31 payload bytes = 32 bytes, so the frame starts with 0x20.
-    let mut expected = hex("20 10");
+    // body = VarInt id 0x11 (CLIENTBOUND_COMMANDS) + 31 payload bytes = 32 bytes, so the frame
+    // starts with 0x20.
+    let mut expected = hex("20 11");
     expected.extend(payload.iter().copied());
     assert_eq!(commands_packet(&root).unwrap(), expected);
-    assert_eq!(&expected[..2], &[0x20, 0x10]);
+    assert_eq!(&expected[..2], &[0x20, 0x11]);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -452,7 +453,7 @@ fn the_response_serializes_to_id_start_length_count_and_entries() {
     );
     assert_eq!(
         command_suggestions_response_packet(&response).unwrap(),
-        hex("12 0f 2a 01 03 02 04 68 65 6c 70 00 05 68 65 6c 6c 6f 00")
+        hex("12 10 2a 01 03 02 04 68 65 6c 70 00 05 68 65 6c 6c 6f 00")
     );
 }
 
