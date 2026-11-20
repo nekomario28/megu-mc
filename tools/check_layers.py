@@ -10,11 +10,14 @@ import sys
 from rust_module_graph import ROOT, POLICY, source_graph
 
 DIR = ROOT / "evidence/foundation/module-layers"
+# The limit only stops a hung inspector. On a loaded host the pinned inspector takes over
+# 30 s, which used to fail the gate for timing alone. The env var overrides the default.
+INSPECT_TIMEOUT = float(os.environ.get("MC_SPINE_LAYERS_INSPECT_TIMEOUT", "180"))
 
 
 def inspect(executable, name):
     result = subprocess.run([executable, "inspect", str(DIR / name), "--json", "--no-storyboard"],
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, timeout=INSPECT_TIMEOUT)
     try:
         report = json.loads(result.stdout)
         errors = [p for p in report["problems"] if p["severity"] == "error"]
