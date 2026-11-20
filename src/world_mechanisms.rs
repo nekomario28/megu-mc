@@ -919,7 +919,11 @@ fn eval_fill(
             FillMode::Replace {
                 filter: Some(filter),
             } if previous != filter => continue,
-            FillMode::Keep if previous != COMMAND_AIR_STATE => continue,
+            FillMode::Keep
+                if !breg().map_or(previous == COMMAND_AIR_STATE, |reg| reg.is_air(previous)) =>
+            {
+                continue;
+            }
             _ => {}
         }
         let destroyed =
@@ -1446,6 +1450,32 @@ mod world_mechanisms_tests {
             [None, Some(1), Some(2)]
         );
         assert!(destroyed.iter().all(|change| change.state == 1));
+    }
+
+    #[test]
+    fn fill_keep_accepts_all_registered_air_states() {
+        let reg = breg().expect("block registry");
+        let air = reg.state_of("minecraft:air", None);
+        let cave_air = reg.state_of("minecraft:cave_air", None);
+        let void_air = reg.state_of("minecraft:void_air", None);
+        assert_ne!(cave_air, air);
+        assert_ne!(void_air, air);
+        assert_ne!(cave_air, void_air);
+        let stone = reg.state_of("minecraft:stone", None);
+        let dirt = reg.state_of("minecraft:dirt", None);
+        let existing = [air, cave_air, void_air, stone];
+        let changes = eval_fill((0, 0, 0), (3, 0, 0), dirt, FillMode::Keep, 4, |(x, _, _)| {
+            existing[x as usize]
+        })
+        .unwrap();
+        assert_eq!(
+            changes,
+            [0, 1, 2].map(|x| BlockModification {
+                pos: (x, 0, 0),
+                state: dirt,
+                destroyed: None,
+            })
+        );
     }
 
     #[test]
