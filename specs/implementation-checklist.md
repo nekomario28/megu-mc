@@ -93,28 +93,29 @@
 - [x] **NF-0 (S0 `shimcheck` `a42ebb2`)**: `ShimCheck.java`（ASM `9.10.1` + `neoforge.mods.toml` 解析）＋ `tools/shimcheck.py` ＋ `tests/shimcheck_test.py`（33 tests PASS）。
 - [x] **NF-1 (動的 Bootstrap & Dual Event Bus `6d3a03d`)**: `ShimCheck` ゲート付き複数 Mod 動的ディスカバリ・コンストラクタ注入・`Bus.GAME` / `Bus.MOD` 振り分け・`Dist.CLIENT` 除外・`tests/neoforge_bootstrap_test.py`（計 45 tests PASS）。
 - [x] **NF-2 Java S1 6イベント & `MutationBuffer` (`0ce02ac`)**: `BreakEvent` / `EntityPlaceEvent` / `PlayerLoggedInEvent`・`OutEvent` / `ServerChatEvent` / `RegisterCommandsEvent` + 再入上限 4 の `MutationBuffer` + `ShimCheck` S1 面拡張（`tests/neoforge_s1_events_test.py` 含む 50 tests PASS）。
-- [ ] **NF-2b〜NF-4 (S1 Rust Host Bridge → S2/S3)**: `NF-2b`（`src/java_compat.rs` での `MutationBuffer` バッチ返却・CAS 適用）→ `NF-3`（S2 `DeferredRegister` + 名前ベース永続化）→ `NF-4`（S3 Direct `ByteBuffer` バッチ JNI）。
+- [x] **NF-2b (S1 Rust Host Bridge & CAS 適用 `56d6f5e`)**: `src/landing_types.rs`（`MutationOp` / `S1EventOutcome` / `decode_mutation_batch`）および `src/java_compat.rs`（`apply_s1_outcome` & エンコード済み JNI ヘルパ）で Java 側 `MutationBuffer` を Rust 側へ返却・CAS 適用（`tests/neoforge_s1_events_test.py` 51 tests + Rust 5 tests PASS）。
+- [ ] **NF-3〜NF-4 (S2/S3)**: `NF-3`（S2 `DeferredRegister` + 名前ベース永続化）→ `NF-4`（S3 Direct `ByteBuffer` バッチ JNI）。
 
 ### R6 — クライアントフォーク計画と Server-Client 共通カーネル（`mc-spine-client`）
 
 - [ ] **CF-0（Server-Client 共有コアの公開 — `layers_check.sh` 互換）**: `tools/layers_check.sh`（44 modules / 111 edges）の静的モジュールグラフを維持したまま、`src/block_registry.rs` (`26,684` states / `FULL`/`CENTER`/`RIGID`)、`src/entity_collision.rs`、`src/entity_fluid.rs`、`src/paletted.rs`、`src/lighting.rs`、`src/nbt.rs`、`src/brigadier.rs` をライブラリ境界（`rlib` / `cdylib` Zero-Drift Shared Kernel）としてサーバー・クライアント間で共有する。
-- [x] **CF-1（ヘッドレス 1.21.1 決定論的シミュレータ & E2E ボットクライアント — 第 1 段完了 `0ea0c3e`）**: [tests/client_prediction_wire.py](../tests/client_prediction_wire.py) で実 `mc-spine` サーバーから `0x27` チャンクを受信・復号し、重力・着地・壁衝突・ブロック状態変化の予測ドリフト 0 を検証済み（今後 Vanilla 1.21.1 サーバー対照・流体予測へ拡張）。
+- [x] **CF-1（ヘッドレス 1.21.1 決定論的シミュレータ & E2E ボットクライアント — 第 2 段完了 `0ea0c3e`, `153a0fd`）**: [tests/client_prediction_wire.py](../tests/client_prediction_wire.py) で実 `mc-spine` サーバーから `0x27` チャンクを受信・復号し、重力・着地・壁衝突・ブロック状態変化・水中浮力/減衰・Nether↔Overworld `0x47` Respawn（16/24 セクション復号）の予測ドリフト 0 を検証済み。
 - [ ] **CF-2（クライアント描画・増分ライティング・Greedy Meshing 接続）**: ファーストパーティファイルに外部 `AGPL-3.0-only` コードを混ぜず（トリプルライセンス双方向性を維持）、`PalettedSection` と `lighting.rs` から直接セクションメッシュを生成する描画パイプラインを接続（Issue `#43` と連携）。
-- [ ] **CF-3（`mods/` 投入型 Rust Integrated Server — `mc-spine-integrated.jar` / `cdylib`）**: 既存 Fabric/NeoForge クライアント（Sodium/Iris 等）の `mods/` に 1 個 JAR を入れるだけで、シングルプレイ／LAN ホストのサーバー処理を 100% Rust (`libmc_spine` + 共有メモリ / Direct `ByteBuffer` FFI) にオフロード。
-- [x] **CF-4（Default Launcher / Prism Launcher ネイティブ起動パッケージ — 完了 `0ea0c3e`）**: `tools/client_launcher/Main.java`（極薄 Bootstrapper JAR）・`tools/client_launcher/mc-spine-wrapper`（JVM 非起動の Prism `Wrapper command`）・`tools/client_launcher/gen_launcher_profile.py`（Custom Version JSON）を実装し `tests/client_launcher_test.py` 8/8 PASS。
+- [ ] **CF-3（`mods/` 投入型 Rust Integrated Server — `mc-spine-integrated.jar` / `cdylib`）**: ループバック起動ブリッジ（`tools/client_launcher/integrated_bridge.py` & `Main.java --mc-spine-integrated`, `153a0fd`, 12 launcher tests PASS）完了。残件：既存 Fabric/NeoForge クライアント（Sodium/Iris 等）の `mods/` に 1 個 JAR を入れるだけでシングルプレイ／LAN ホストを 100% Rust (`libmc_spine` + 共有メモリ / Direct `ByteBuffer` FFI) にオフロードするパッケージ化。
+- [x] **CF-4（Default Launcher / Prism Launcher ネイティブ起動パッケージ — 完了 `0ea0c3e`, `153a0fd`）**: `tools/client_launcher/Main.java`（極薄 Bootstrapper JAR）・`tools/client_launcher/mc-spine-wrapper`（JVM 非起動の Prism `Wrapper command`）・`tools/client_launcher/gen_launcher_profile.py`（Custom Version JSON）を実装し `tests/client_launcher_test.py` 12/12 PASS。
 
 ### R7 — ゲームプレイ完全性（M2→M4：`GP-0`〜`GP-7`）
 
-> 以下の各項目は「純粋エンジン＆単体パリティテスト（Phase D 完了）」と「本番サーバー実配線・wire 検証（Phase E）」を分けて管理する。
+> 以下の各項目は「純粋エンジン＆ワールド／プロトコル 767 アダプタ（Phase D / E Wave 1 完了）」と「本番 `src/main.rs` 実配線・wire 検証（Phase E Wave 2）」を分けて管理する。
 
 - [x] **GP-0（Entity Framework & 全 130 エンティティ型データ駆動レジストリ — エンジン＆主要配線完了 `89669a8`, `d6f17ac`）**: `src/entity_registry.rs` に protocol 767 全 130 `EntityType`（`0..=129`）を一元化し、`name_to_etype`・`mob_dimensions`・`default_mob_hp`・`/summon` 初期 HP を接続済み。
-- [ ] **GP-1（1.21.1 `GoalSelector` & A* `PathNavigation`）**: 純粋エンジン実装＆パリティ修正完了（`ffac24b`, `d6f17ac`、`mob_ai_tests` 16+ PASS）。残件：`WorldPathAdapter`・Mob 別ゴールファクトリ整備と `mob_tick` 本番切替。
-- [ ] **GP-2（1.21.1 `NaturalSpawner`, Mob Cap, `SpawnCosts`, Despawn）**: 純粋エンジン完了＋PR `#55`（距離）・`#56`（monster cap）・`#57`（地面配置・衝突形状）本番配線済み（`5522bc2`）。残件：明暗・パック生成・`SpawnCosts`・despawn 本番配線（Collaborator 優先レーン）。
-- [ ] **GP-3（1.21.1 レッドストーン伝播エンジン）**: 純粋エンジン実装＆コンパレータ優先順位修正完了（`723cfd3`, `d6f17ac`、`redstone_tests` 15+ PASS）。残件：`BReg` ブロック状態ブリッジと `tick_queue` / ブロック更新への本番配線。
-- [ ] **GP-4（村人 AI・職業 POI・取引・ゴシップ・襲撃 Raid）**: 純粋エンジン実装＆整数丸め価格修正完了（`9fd1c56`, `d6f17ac`、`villager_raid_tests` 12+ PASS）。残件：protocol 767 `0x2e` Merchant Offers エンコーダ・POI スキャナと本番エンティティ接続。
-- [ ] **GP-5（プレイヤー高度機構：エンチャント台・金床・醸造・鍛冶・空腹・XP）**: 純粋エンジン実装＋XP 閾値・食事バウンド一部配線完了（`d6f17ac`、`player_mechanisms_tests` 15+ PASS）。残件：`/xp set` 進捗保持、4種ウィンドウ操作ハンドラ、`FoodData::tick` 消耗度/自然回復の本番配線。
-- [ ] **GP-6（残存 Mob 群のグループ別行動・戦闘実装）**: 純粋エンジン実装＆ガスト計時修正完了（`d6f17ac`、`mob_behaviors_tests` 21+ PASS）。残件：統一 `MobBehaviorState` ディスパッチャと本番 tick/エンティティ生成接続。
-- [ ] **GP-7（進捗 Advancements・スコアボード・ワールドボーダー・残存コマンド）**: 純粋エンジン実装＆`/fill keep` 全空気状態対応完了（`e839879`, `d6f17ac`、`world_mechanisms_tests` 14+ PASS）。残件：コマンドパーサ・`0x74`/WorldBorder/Scoreboard パケットエンコーダと本番コマンド接続。
+- [ ] **GP-1（1.21.1 `GoalSelector` & A* `PathNavigation`）**: エンジン＆実ワールド `WorldPathAdapter`・26,684 状態分類・敵対/中立ゴールファクトリ統合完了（`c71b6ca`, PR `#59` 統合、`mob_ai_tests` 26/26 PASS）。残件：`src/main.rs` `mob_tick` 本番切替。
+- [ ] **GP-2（1.21.1 `NaturalSpawner`, Mob Cap, `SpawnCosts`, Despawn）**: 純粋エンジン完了＋PR `#55`（距離）・`#56`（monster cap）・`#57`（地面配置・衝突形状）・`#61`（明暗チェック `577891f`）本番配線済み。残件：パック生成・`SpawnCosts`・despawn 本番配線（Collaborator 優先レーン）。
+- [ ] **GP-3（1.21.1 レッドストーン伝播エンジン）**: エンジン＆`BReg` ブロック状態ブリッジ（`src/redstone.rs` + `src/redstone_world.rs`）統合完了（`9889a5c`, PR `#62` 統合、`redstone_tests` 26/26 PASS）。残件：`src/main.rs` `tick_queue` / ブロック更新への本番配線。
+- [ ] **GP-4（村人 AI・職業 POI・取引・ゴシップ・襲撃 Raid）**: エンジン＆protocol 767 `0x2d` Merchant Offers / Select Trade コーデック・POI スキャナ・取引検証統合完了（`eb4eb8b`, PR `#58` 統合、`villager_raid_tests` 29/29 PASS）。残件：`src/main.rs` 村人エンティティ・パケットハンドラ本番接続。
+- [ ] **GP-5（プレイヤー高度機構：エンチャント台・金床・醸造・鍛冶・空腹・XP）**: エンジン＆`/xp set`・4種ウィンドウ操作・`FoodData::tick` 署名付き消耗/回復・50 UTF-16 金床リネーム統合完了（`a66e388`, PR `#60` 統合、`player_mechanisms_tests` 33/33 PASS）。残件：`src/main.rs` コマンド・ウィンドウ・tick への本番配線。
+- [ ] **GP-6（残存 Mob 群のグループ別行動・戦闘実装）**: エンジン＆13 行動バリアント／14 protocol 767 ID 統一 `MobBehaviorState` ディスパッチャ完了（`8c2271d`, `mob_behaviors_tests` 33/33 PASS）。残件：`src/main.rs` `mob_tick` / エンティティ生成への本番接続。
+- [ ] **GP-7（進捗 Advancements・スコアボード・ワールドボーダー・残存コマンド）**: エンジン＆コマンドパーサ・WorldBorder 6 パケット・Scoreboard 数値書式・`0x74` Advancements パケットエンコーダ統合完了（`1ac8b7e`, PR `#64` 統合、`world_mechanisms_tests` 34/34 PASS）。残件：`src/main.rs` コマンド＆パケット送信への本番接続。
 
 ### P4 — 統合前のゲート（自動ではmergeしない）
 
@@ -123,7 +124,7 @@
 
 ## 次の着手
 
-[ROADMAPの直近の実行順](ROADMAP.md#直近の実行順2026-11-20-同期)（Track 1: Phase D-2a ＆ Batch B4、Track 2: NeoForge S1 `NF-2`、Track 3: Client Fork `CF-0`〜`CF-4` ＆ `P1`、Track 4: `R7 GP-0〜GP-7`）を参照する。
+[ROADMAPの直近の実行順](ROADMAP.md#直近の実行順2026-11-20-phase-e-wave-2-同期)（Track 1: HOLD 再検証＆Batch B4・`P4-1`、Track 2: NeoForge S2 `NF-3`、Track 3: Client Fork `CF-0`・`CF-3` ＆ `P1`、Track 4: `R7 GP-1/3〜7` `src/main.rs` 本番実配線）を参照する。
 下記の作成時点の「未実行」を、現在の未実装一覧や最新gate結果に読み替えない。
 
 ## 履歴: 作成時点の作業実績（2026-11-06〜07）

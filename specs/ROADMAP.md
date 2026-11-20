@@ -21,20 +21,20 @@ chunk状態の整合性・操作から保存再開までの完成・統合を主
 - `main` ブランチは `perf/worldgen-parallel` と統合・同期済み。hosted CIは課金設定により未起動の場合があるため、ローカル実行結果とhosted CIを混同しない。
 - 全seed/biome/構造物の合格ではない。JVM identity-hashによるleaf tree-bin tieも明示した未対応境界に残る。
 
-**現在の作業（Phase E：本番配線・Host Bridge・共有カーネル・収束）:** Phase D（`D-1` / `D-2a` / `D-2b`、`NF-2` Java 側、`CF-1` / `CF-4`、`R7 GP-0〜GP-7` 純粋エンジン 8 本＆パリティ修正、PR `#55`〜`#57` の GP-2 夜間スポーン配線）を `main` へ統合完了。次は Collaborator の GP-2 継続レーンと干渉しない独立ファイル境界のもとで、各エンジンのワールド／プロトコル 767 アダプタ実装、NeoForge S1 Rust Host Bridge（`NF-2b`）、Client Fork 共有カーネル（`CF-0`）、構造物 Batch B4、および薄い `src/main.rs` 実配線を進める。
+**現在の作業（Phase E Wave 2：本番 `src/main.rs` 薄い実配線・NeoForge S2・Client Fork 統合・Batch B4・収束）:** Phase D および **Phase E Wave 1**（`NF-2b` Rust↔Java S1 Host Bridge `56d6f5e`、`CF-1`/`CF-3` 流体・次元予測＆`--mc-spine-integrated` ブリッジ `153a0fd`、GP-2 PR `#55`〜`#57`・`#61`、および `GP-1`/`GP-3`/`GP-4`/`GP-5`/`GP-6`/`GP-7` の全ワールド／BReg／プロトコル 767 アダプタ＆コラボレータ PR `#58`〜`#64` の完全統合 `9889a5c`）を `main` へ統合完了。次は Collaborator の GP-2 継続レーン（`src/natural_spawner.rs`）と干渉しない境界のもとで、Wave 2（`src/main.rs` 単一レーンでのコマンド／パケット／tick 実配線、NeoForge `NF-3` S2 `DeferredRegister`、Client Fork `CF-0`/`CF-3`、構造物 HOLD 再検証＆Batch B4、`P4-1` Release Gate）を進める。
 
-## 直近の実行順（2026-11-20 Phase E 同期）
+## 直近の実行順（2026-11-20 Phase E Wave 2 同期）
 
-長期の R0〜R7 は維持し、4 トラック＋独立ファイル所有境界に沿って最大並列で進める。[実行台帳](implementation-checklist.md)で「モデル実装済み」と「本番サーバー実配線・wire 検証済み」を厳密に区別する。
+長期の R0〜R7 は維持し、4 トラック＋独立ファイル所有境界に沿って最大並列で進める。[実行台帳](implementation-checklist.md)で「アダプタ実装済み」と「本番サーバー実配線・wire 検証済み」を厳密に区別する。
 
-| 優先トラック | 対象 | 次の出口（Phase E） |
+| 優先トラック | 対象 | 次の出口（Phase E Wave 2） |
 |---|---|---|
-| **Collaborator 継続レーン (`GP-2` Live Wiring)** | `src/natural_spawner.rs` + `src/tick_tests.rs` | PR `#55`（距離）・`#56`（cap）・`#57`（配置）統合済み。続く明暗チェック・パック生成・despawn の本番配線（他レーンは `src/natural_spawner.rs` に触れない） |
+| **Collaborator 継続レーン (`GP-2` Live Wiring)** | `src/natural_spawner.rs` + `src/tick_tests.rs` | PR `#55`（距離）・`#56`（cap）・`#57`（配置）・`#61`（明暗 `577891f`）統合済み。続くパック生成・`SpawnCosts`・despawn の本番配線（他レーンは `src/natural_spawner.rs` に触れない） |
 | **Track 1 (Worldgen & Perf: `P2-1-T3` / `P4-1`)** | 構造物 HOLD 再検証・Batch B4 ＆ M3 再測定 | ① `D-2a` (`f5c0e8e`) / `D-2b` (`d139913`) 完了済み、② `buried_treasure` / `swamp_hut` の再対照と Batch B4 昇格、③ 同一 SHA での `WARM=1` back-to-back M3 最終測定 |
-| **Track 2 (Mod 互換: `R5 NF-2b〜NF-4`)** | NeoForge 1.21.1 S1 Host Bridge → S2/S3 | `NF-0` (`a42ebb2`) / `NF-1` (`6d3a03d`) / `NF-2` Java S1 (`0ce02ac`, 50 tests PASS) 完了。次は **`NF-2b`（`src/landing_types.rs` / `src/java_compat.rs` で `MutationBuffer` を Rust 側へ返却・CAS 適用）** → `NF-3`（S2 `DeferredRegister` + 名前永続化）→ `NF-4`（S3 バッチ JNI） |
-| **Track 3 (Client Fork & Runtime: `R6 CF-0 / CF-3` / `P1`)** | 共有カーネル境界・Integrated Server・Template 最終化 | `CF-4`（ランチャー Bootstrapper/Wrapper）& `CF-1`（`client_prediction_wire.py`）完了 (`0ea0c3e`)。次は **`CF-0`（`layers_check.sh` 互換の Zero-Drift 共有カーネル契約・予測テスト拡充）** → **`CF-3`（`mods/` 投入型 Integrated Server プロトタイプ）**、および `P1-1〜P1-4` 実チャンク Fossil |
-| **Track 4 (Gameplay 本番アダプタ & 配線: `R7 GP-1 / GP-3〜GP-7`)** | 各専用モジュール内の実ワールド／プロトコル 767 アダプタ化 → 薄い `src/main.rs` 接続 | 全 8 純粋エンジン＋パリティ修正完了 (`d6f17ac`)。まず各独立ファイル内に BReg/プロトコル 767/コマンドパーサのブリッジを完全並列で整備（`GP-1` `WorldPathAdapter`、`GP-3` `BReg` ブロック状態ブリッジ、`GP-4` `0x2e` Merchant Offers エンコーダ＆取引ハンドラ、`GP-5` `/xp set` 残件＆4種ウィンドウ操作ハンドラ、`GP-6` 統一 `MobBehaviorState` ディスパッチャ、`GP-7` コマンドパーサ＆`0x74`/WorldBorder/Scoreboard パケットエンコーダ）し、続けて `src/main.rs` 単一レーンで順次開通 |
-| **Release Gate (`P4-1`)** | 同一 SHA での代表負荷 back-to-back 再測定と全体検証 | `tests/verify.sh` 完走、`tools/perf_bench.py` / `WARM=1` 代表負荷での M3 再測定、選択 mutation、layers/debt/provenance ゲートの同一 SHA 収集 |
+| **Track 2 (Mod 互換: `R5 NF-3〜NF-4`)** | NeoForge 1.21.1 S2 `DeferredRegister` → S3 バッチ JNI | `NF-0` (`a42ebb2`) / `NF-1` (`6d3a03d`) / `NF-2` Java S1 (`0ce02ac`) / **`NF-2b` Rust Host Bridge & CAS 適用 (`56d6f5e`, 51 Py + 5 Rust PASS)** 完了。次は **`NF-3`（S2 `DeferredRegister` + 名前ベース永続化）** → `NF-4`（S3 Direct `ByteBuffer` バッチ JNI） |
+| **Track 3 (Client Fork & Runtime: `R6 CF-0 / CF-3` / `P1`)** | 共有カーネル境界・Integrated Server パッケージ・Template 最終化 | `CF-4` (`0ea0c3e`)・**`CF-1`/`CF-3` 流体/次元予測＆`--mc-spine-integrated` ループバック基盤 (`153a0fd`, 12 launcher + prediction wire PASS)** 完了。次は **`CF-0`（`layers_check.sh` 互換の Zero-Drift 共有カーネル境界）** → **`CF-3`（`mods/` 投入型 JAR / `cdylib` パッケージ化）**、および `P1-1〜P1-4` 実チャンク Fossil |
+| **Track 4 (Gameplay 本番実配線: `R7 GP-1 / GP-3〜GP-7`)** | `src/main.rs` 単一レーンでの実接続＋実 wire 検証 | 全 6 独立モジュール内の BReg／プロトコル 767（`0x2d` Merchant Offers / `0x74` Advancements / WorldBorder 6種 / Scoreboard 等）／コマンドパーサブリッジを完全統合済み（`9889a5c`, 148 tests PASS）。次は **`src/main.rs` 単一レーンで順次開通**（`GP-7` コマンド＆パケット、`GP-5` `/xp set` & `FoodData::tick` & ウィンドウ操作、`GP-1`/`GP-6` `mob_tick`、`GP-3` `tick_queue`、`GP-4` 取引ハンドラ）＋実 wire 回帰テスト追加 |
+| **Release Gate (`P4-1`)** | 同一 SHA での代表負荷 back-to-back 再測定と全体検証 | `tests/verify.sh` 完走、`tools/perf_bench.py` / `WARM=1` 代表負荷での M3 再測定、選択 mutation、`layers_check`/`debt_ratchet`/`provenance_check` ゲートの同一 SHA 収集 |
 
 ### 公開可能フォーク（Public Fork Release）への収束実績と Phase D 計画（2026-11-20）
 
@@ -79,7 +79,8 @@ chunk状態の整合性・操作から保存再開までの完成・統合を主
 | **完了済 (Phase B: `0c88980`〜`d06032e`)** | **B-1**: `Layer A4` (`30d0346`: `uniform_state()` O(1) fast-path + 512-entry `MapChunkCache`) | **B-2**: `Layer A1-c` (`482e81b`: `Cond::Biome(u128)` + `Rule::Seq`) ＋ `P0-2` 監査 (`8d047a9`) | **B-3**: `BaseSpawner` + `EntitySpatialGrid` (`0c88980`), PGO & 計測記録 (`d06032e`) | M3 / Layer A1〜A4 完了（PGO `full j=8` -10.6%、全 dump SHA-256 一致） |
 | **完了済 (Phase C + NF-0/NF-1: `8f62f9f`〜`bd06c8a`)** | **C-1**: M2 残 wire 往復検査 (`2a68722`, `tests/m2_gameplay_wire.py`) | **C-2**: `P2-1-T3` Batch B3 (`ba6e2c3`: `desert_pyramid`, `shipwreck`, `ocean_ruin_cold` 0-diff 昇格、計 19 チャンク 0-diff) | **NF-0 & NF-1**: S0 `shimcheck` (`a42ebb2`) ＋ 動的 Bootstrap & Dual Event Bus (`6d3a03d`, 45 tests PASS) ／ **C-3**: 全モジュール警告 68→0 (`8f62f9f`..`ee2ff90`) ＋ トリプルライセンス & 過去履歴不純ファイル完全抹消 (`bd06c8a`) | Stage F2 実用公開フォーク到達 ＋ NeoForge S0/NF-1 動的ゲート確立 ＋ `main` 統合 |
 | **完了済 (Phase D: `ff8addf`〜`5522bc2`)** | **D-1** (`ff8addf`: Lock 逆転・EID 衝突・次元流体修正) ＋ **PR `#55`/`#56`/`#57`** (`5522bc2`: GP-2 夜間スポーン距離・cap・地面配置の本番接続) ＋ `GP-0`/`GP-5` 部分接続 (`d6f17ac`) | **D-2b** (`d139913`: `valid_biome` quart 判定＆Mansion 基礎) ＋ **D-2a** (`f5c0e8e`: `Rule::Seq` ゼロアロク・`ctx.g.sea`・`OriginGrid` 疎バッチ保護) | **NF-2 Java S1** (`0ce02ac`, 50 tests PASS) ＋ **R6 CF-4/CF-1** (`0ea0c3e`) ＋ **R7 `GP-0〜GP-7` 全 8 純粋エンジン＆パリティ修正** (`d6f17ac`) | 全監査指摘閉鎖 ＋ R5 S1 / R6 ランチャー / R7 全 8 エンジン完了 |
-| **Phase E（本番アダプタ・Host Bridge・実配線・収束）** | **E-Main**（Collaborator GP-2 継続レーンと協調しつつ、`GP-1/3/4/5/6/7` の薄い 1 行実配線と実 wire 検証） | **E-WG**: HOLD 2件再検証・Batch B4 構造物昇格・`P4-1` `WARM=1` M3 計測 | **E-Adapters（最大並列・非競合）**: `NF-2b` Rust Host Bridge、`CF-0`/`CF-3` 共有カーネル＆Integrated Server、`GP-1/3/4/5/6/7` 各専用ファイル内の `BReg`/プロトコル 767/コマンドブリッジ | モデル単体から本番実動作への全面接続 ＋ Release Gate `P4-1` 到達 |
+| **完了済 (Phase E Wave 1: `56d6f5e`〜`9889a5c`)** | **PR `#61`** (`577891f`: GP-2 夜間スポーン明暗チェック統合) ＋ **PR `#63`** (`013fcd0`: `layers_check` timeout 引上げ) | **E1 並列アダプタ完全統合 (`9889a5c`)**: `GP-1` (`c71b6ca`, PR `#59`), `GP-3` (`9889a5c`, PR `#62`), `GP-4` (`eb4eb8b`, PR `#58`), `GP-5` (`a66e388`, PR `#60`), `GP-6` (`8c2271d`), `GP-7` (`1ac8b7e`, PR `#64`) — 計 181 単体テスト全 PASS | **NF-2b** (`56d6f5e`: Rust↔Java S1 Host Bridge & CAS 適用, 51 Py + 5 Rust PASS) ＋ **CF-1/CF-3** (`153a0fd`: 流体/次元予測 & `--mc-spine-integrated` ループバック基盤, 12 launcher + prediction wire PASS) | 全 6 Gameplay アダプタ＆PR `#58〜#64` 完全統合・NeoForge S1 Rust 往復完結・Client 予測拡張完了 |
+| **Phase E Wave 2（本番実配線・S2・共有カーネル・収束）** | **E2-Main**（Collaborator GP-2 レーンと非競合で `GP-7`→`GP-5`→`GP-1/3/4/6` を `src/main.rs` へ実配線＋実 wire 検証） | **E2-WG**: HOLD 2件再検証・Batch B4 構造物昇格・`P4-1` `WARM=1` M3 計測 | **E2-Track2/3（並列・非競合）**: `NF-3`（S2 `DeferredRegister` + 名前ベース永続化）、`CF-0`/`CF-3`（共有カーネル境界＆`mods/` 投入型 JAR / `cdylib` パッケージ化） | アダプタ単体から本番実動作への全面接続 ＋ Release Gate `P4-1` 到達 |
 
 **原因記述の訂正:** 端のair差とsnowy差を位置の近さだけで同じ原因にまとめた推測は
 撤回する。訂正根拠・区別すべきlookup・次の反証は
