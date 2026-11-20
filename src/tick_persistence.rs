@@ -165,9 +165,9 @@ impl TickState {
         Ok(Some(Self {
             now,
             block_order,
-            blocks,
+            blocks: blocks.unpack_saved(now as i64),
             fluid_order,
-            fluids,
+            fluids: fluids.unpack_saved(now as i64),
             owned,
             sources,
             generated_blocks,
@@ -181,7 +181,7 @@ mod tests {
     use super::*;
     use crate::scheduled_ticks::ScheduledTick;
     #[test]
-    fn restart_preserves_pending_collection_order_and_rejects_truncation() {
+    fn queue_snapshot_preserves_order_and_tick_state_rejects_truncation() {
         let mut blocks = ScheduledTicks::new();
         for x in -3..=3 {
             for z in -3..=3 {
@@ -210,16 +210,23 @@ mod tests {
         };
         let mut payload = Vec::new();
         state.append(&mut payload);
-        let mut restored = TickState::read(&payload).unwrap().unwrap();
+        let restored = TickState::read(&payload).unwrap().unwrap();
         let mut original = state.blocks.clone();
         assert_eq!(restored.now, 10);
         assert_eq!(restored.owned, state.owned);
         assert_eq!(restored.sources, state.sources);
         assert_eq!(restored.generated_blocks, state.generated_blocks);
         assert_eq!(restored.generated_fluids, state.generated_fluids);
+        // The raw heap and deadline-table codec retains exact in-memory state.
+        // TickState::read separately applies native SavedTick unpack on restart.
+        let mut snapshot = Vec::new();
+        state.blocks.encode(&mut snapshot);
+        let mut input = snapshot.as_slice();
+        let mut restored_queue = ScheduledTicks::decode(&mut input).unwrap();
+        assert!(input.is_empty());
         for time in 10..15 {
             assert_eq!(
-                restored.blocks.collect(time, 17, |_| true),
+                restored_queue.collect(time, 17, |_| true),
                 original.collect(time, 17, |_| true)
             );
         }
@@ -240,6 +247,31 @@ mod tests {
             generated_blocks: Vec::new(),
             generated_fluids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn native_callback_metadata_after_block_and_fluid_reload() {
+        use crate::scheduled_ticks::delivery_fixture;
+
+        let cases = delivery_fixture::replay(true, |now, blocks, fluids| {
+            let state = TickState {
+                now: now as u64,
+                block_order: 16,
+                blocks: blocks.clone(),
+                fluid_order: 16,
+                fluids: fluids.clone(),
+                ..empty_state()
+            };
+            let mut payload = Vec::new();
+            state.append(&mut payload);
+            let restored = TickState::read(&payload).unwrap().unwrap();
+            assert_eq!(restored.now, state.now);
+            assert_eq!(restored.block_order, state.block_order);
+            assert_eq!(restored.fluid_order, state.fluid_order);
+            *blocks = restored.blocks;
+            *fluids = restored.fluids;
+        });
+        assert_eq!(cases, 1);
     }
 
     /// The footer boundary has one owner: the two consumers of it cannot hold

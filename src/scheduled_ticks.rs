@@ -107,12 +107,11 @@ impl NextChunks {
             }
         }
         if self.len > self.slots.len() * 3 / 4 {
-            self.grow();
+            self.resize(self.slots.len() * 2);
         }
     }
 
-    fn grow(&mut self) {
-        let new_len = self.slots.len() * 2;
+    fn resize(&mut self, new_len: usize) {
         let old = std::mem::replace(&mut self.slots, vec![None; new_len]);
         // Fastutil rehash scans the previous table from high to low.
         for (key, due) in old.into_iter().rev().flatten() {
@@ -121,21 +120,10 @@ impl NextChunks {
         }
     }
 
-    fn remove(&mut self, key: u64) {
-        if key == 0 {
-            if self.zero.take().is_some() {
-                self.len -= 1;
-            }
-            return;
-        }
-        let i = self.slot(key);
-        if self.slots[i].is_none() {
-            return;
-        }
+    fn remove_slot(&mut self, mut hole: usize, mut on_wrap: impl FnMut(u64)) {
         self.len -= 1;
         let mask = self.slots.len() - 1;
-        let mut hole = i;
-        let mut scan = (i + 1) & mask;
+        let mut scan = (hole + 1) & mask;
         while let Some((other, due)) = self.slots[scan] {
             let home = fastutil_mix64(other) as usize & mask;
             let move_here = if hole <= scan {
@@ -144,6 +132,9 @@ impl NextChunks {
                 hole >= home && home > scan
             };
             if move_here {
+                if scan < hole {
+                    on_wrap(other);
+                }
                 self.slots[hole] = Some((other, due));
                 hole = scan;
             }
@@ -152,12 +143,32 @@ impl NextChunks {
         self.slots[hole] = None;
     }
 
-    fn ordered(&self) -> Vec<(u64, i64)> {
-        self.zero
-            .map(|due| (0, due))
-            .into_iter()
-            .chain(self.slots.iter().rev().flatten().copied())
-            .collect()
+    fn take_ready(&mut self, mut ready: impl FnMut(u64, i64) -> bool) {
+        if self.zero.is_some_and(|due| ready(0, due)) {
+            self.zero = None;
+            self.len -= 1;
+        }
+        // The native iterator removes in place. Keys shifted across slot zero
+        // are visited in shift order after the descending table scan.
+        let mut wrapped = Vec::new();
+        for i in (0..self.slots.len()).rev() {
+            if self.slots[i].is_some_and(|(key, due)| ready(key, due)) {
+                self.remove_slot(i, |key| wrapped.push(key));
+            }
+        }
+        for key in wrapped {
+            let i = self.slot(key);
+            let (_, due) = self.slots[i].unwrap();
+            if ready(key, due) {
+                self.remove_slot(i, |_| {});
+                // Fastutil's iterator uses regular map removal for wrapped
+                // keys, which can shrink a previously grown table.
+                let size = self.slots.len();
+                if size > 32 && self.len < size * 3 / 16 {
+                    self.resize(size / 2);
+                }
+            }
+        }
     }
 }
 
@@ -251,6 +262,125 @@ mod tests {
         }
         assert_eq!(cases, 48);
     }
+
+    #[test]
+    fn native_callback_metadata_for_block_and_fluid_delivery() {
+        let cases = delivery_fixture::replay(false, |_, _, _| unreachable!());
+        assert_eq!(cases, 5);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod delivery_fixture {
+    use super::*;
+
+    fn ticks(text: &str) -> impl Iterator<Item = ScheduledTick> + '_ {
+        text.split(';').filter(|&v| v != "-").map(|entry| {
+            let fields: Vec<_> = entry.split(',').collect();
+            let [block, x, y, z, due, priority, sub_order] = fields.as_slice() else {
+                panic!("invalid tick: {entry}");
+            };
+            ScheduledTick {
+                pos: (x.parse().unwrap(), y.parse().unwrap(), z.parse().unwrap()),
+                block: block.parse().unwrap(),
+                due: due.parse().unwrap(),
+                priority: match *priority {
+                    "EXTREMELY_HIGH" => -3,
+                    "VERY_HIGH" => -2,
+                    "HIGH" => -1,
+                    "NORMAL" => 0,
+                    "LOW" => 1,
+                    "VERY_LOW" => 2,
+                    "EXTREMELY_LOW" => 3,
+                    _ => panic!("invalid priority: {priority}"),
+                },
+                sub_order: sub_order.parse().unwrap(),
+            }
+        })
+    }
+
+    fn queue<'a>(
+        phase: &str,
+        blocks: &'a mut ScheduledTicks,
+        fluids: &'a mut ScheduledTicks,
+    ) -> &'a mut ScheduledTicks {
+        match phase {
+            "B" => blocks,
+            "F" => fluids,
+            _ => panic!("invalid phase: {phase}"),
+        }
+    }
+
+    pub(crate) fn replay(
+        with_reload: bool,
+        mut reload: impl FnMut(i64, &mut ScheduledTicks, &mut ScheduledTicks),
+    ) -> usize {
+        let fixture = include_str!("../tests/data/scheduled_tick_delivery_1211.tsv");
+        let mut cases = 0;
+        for scenario in fixture.strip_prefix("case\t").unwrap().split("\ncase\t") {
+            let (name, operations) = scenario.split_once('\n').unwrap();
+            if operations.lines().any(|line| line.starts_with("reload\t")) != with_reload {
+                continue;
+            }
+            cases += 1;
+            let mut blocks = ScheduledTicks::new();
+            let mut fluids = ScheduledTicks::new();
+            for operation in operations.lines() {
+                let fields: Vec<_> = operation.split('\t').collect();
+                match fields.as_slice() {
+                    ["unpack", phase, now, input] => {
+                        let generated = ticks(input)
+                            .map(|t| {
+                                assert_eq!((t.due, t.priority), (0, 0));
+                                (t.pos, t.block)
+                            })
+                            .collect();
+                        queue(phase, &mut blocks, &mut fluids)
+                            .unpack_generated(generated, now.parse().unwrap());
+                    }
+                    ["schedule", phase, input] => {
+                        let queue = queue(phase, &mut blocks, &mut fluids);
+                        for tick in ticks(input) {
+                            assert!(queue.schedule(tick), "{name}: {tick:?}");
+                        }
+                    }
+                    ["reload", now] => reload(now.parse().unwrap(), &mut blocks, &mut fluids),
+                    ["tick", now, limit, cold, expected_blocks, expected_fluids] => {
+                        let now = now.parse().unwrap();
+                        let limit = limit.parse().unwrap();
+                        let cold: HashSet<_> = cold
+                            .split(';')
+                            .filter(|v| !v.is_empty())
+                            .map(|v| {
+                                let (x, z) = v.split_once(',').unwrap();
+                                (x.parse().unwrap(), z.parse().unwrap())
+                            })
+                            .collect();
+                        for (phase, queue, expected) in [
+                            ("block", &mut blocks, *expected_blocks),
+                            ("fluid", &mut fluids, *expected_fluids),
+                        ] {
+                            assert_eq!(
+                                queue.collect(now, limit, |chunk| !cold.contains(&chunk)),
+                                ticks(expected).collect::<Vec<_>>(),
+                                "{name}, {phase} callbacks at game tick {now}",
+                            );
+                        }
+                    }
+                    _ => panic!("invalid operation: {operation}"),
+                }
+            }
+            assert!(
+                !blocks.has_pending_matching(|_| true),
+                "{name}: extra blocks"
+            );
+            assert!(
+                !fluids.has_pending_matching(|_| true),
+                "{name}: extra fluids"
+            );
+        }
+        cases
+    }
 }
 
 #[derive(Clone)]
@@ -287,7 +417,11 @@ impl ScheduledTicks {
     /// Generator queues represent zero-delay, normal-priority proto ticks.
     /// Native unpack starts each chunk at minus its own pending-list length;
     /// ordinary runtime schedules retain their separate nonnegative counter.
-    pub(crate) fn unpack_generated(&mut self, pending: Vec<(Pos, u32)>, now: i64) {
+    pub(crate) fn unpack_generated(&mut self, mut pending: Vec<(Pos, u32)>, now: i64) {
+        // ProtoChunkTicks deduplicates before LevelChunkTicks uses the list
+        // length to assign sub-orders.
+        let mut seen = HashSet::new();
+        pending.retain(|entry| seen.insert(*entry));
         let mut counts: HashMap<ChunkPos, i64> = HashMap::new();
         for (pos, _) in &pending {
             *counts.entry((pos.0 >> 4, pos.2 >> 4)).or_default() += 1;
@@ -303,6 +437,24 @@ impl ScheduledTicks {
             });
             *remaining -= 1;
         }
+    }
+
+    /// Save lists follow the heap's iteration order. Native unpack discards
+    /// the old sub-orders and inflates the saved delays at the load game time.
+    pub(crate) fn unpack_saved(self, now: i64) -> Self {
+        let mut chunks: Vec<_> = self.chunks.into_iter().collect();
+        chunks.sort_unstable_by_key(|(chunk, _)| *chunk);
+        let mut loaded = Self::new();
+        for (_, chunk) in chunks {
+            let start = -(chunk.heap.len() as i64);
+            for (index, mut tick) in chunk.heap.into_iter().enumerate() {
+                let delay = tick.due.wrapping_sub(now) as i32;
+                tick.due = now.wrapping_add(i64::from(delay));
+                tick.sub_order = start + index as i64;
+                loaded.schedule(tick);
+            }
+        }
+        loaded
     }
 
     // Keep the native heap and fastutil table layout: reconstructing only the
@@ -458,16 +610,16 @@ impl ScheduledTicks {
         eligible: impl Fn(ChunkPos) -> bool,
     ) -> Vec<ScheduledTick> {
         let mut containers = Vec::new();
-        for (key, due) in self.next.ordered() {
+        self.next.take_ready(|key, due| {
             let chunk = chunk_from_key(key);
             if due > now || !eligible(chunk) {
-                continue;
+                return false;
             }
-            self.next.remove(key);
             heap_push(&mut containers, chunk, |a, b| {
                 within_tick(&self.chunks[a].heap[0], &self.chunks[b].heap[0])
             });
-        }
+            true
+        });
         let mut result = Vec::new();
         while result.len() < limit && !containers.is_empty() {
             let chunk = heap_pop(&mut containers, |a, b| {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture LevelTicks ordering and deduplication from the pinned native jar."""
+"""Capture native scheduled tick collection, delivery and reload from the pinned jar."""
 import argparse
 from pathlib import Path
 from vanilla_java import DEFAULT_JAR, pinned_runtime, run_probe
@@ -7,6 +7,7 @@ from vanilla_java import DEFAULT_JAR, pinned_runtime, run_probe
 ROOT = Path(__file__).resolve().parent.parent
 VECTORS = ROOT / "tests/data/scheduled_tick_1211.tsv"
 PROTO_VECTORS = ROOT / "tests/data/proto_tick_1211.tsv"
+DELIVERY_VECTORS = ROOT / "tests/data/scheduled_tick_delivery_1211.tsv"
 
 
 def validate_proto(data):
@@ -54,6 +55,7 @@ def main():
     with pinned_runtime(args.jar) as (work, classpath, _):
         out = work / "scheduled.tsv"
         proto = work / "proto.tsv"
+        delivery = work / "delivery.tsv"
         run_probe(work, classpath, ROOT / "tools/leaf-distance-oracle/ScheduledTickOracle.java",
                   "dev.mcspine.tools.ScheduledTickOracle", out, proto)
         actual = out.read_bytes()
@@ -61,11 +63,18 @@ def main():
         if len(actual.splitlines()) != 48:
             raise ValueError("native scheduled collection omitted cases")
         validate_proto(generated)
-    if args.write:
-        VECTORS.write_bytes(actual)
-        PROTO_VECTORS.write_bytes(generated)
-    elif actual != VECTORS.read_bytes() or generated != PROTO_VECTORS.read_bytes():
-        raise SystemExit("scheduled tick oracle: native vectors differ")
+        run_probe(work, classpath, DELIVERY_VECTORS.with_name("ScheduledTickDeliveryOracle.java"),
+                  "dev.mcspine.tools.ScheduledTickDeliveryOracle", delivery)
+        delivered = delivery.read_bytes()
+        operations = [row.split(b"\t", 1)[0] for row in delivered.splitlines()]
+        print(f"native delivery cases: {operations.count(b'case')}"
+              f", game ticks: {operations.count(b'tick')}"
+              f", reloads: {operations.count(b'reload')}")
+    for path, data in ((VECTORS, actual), (PROTO_VECTORS, generated), (DELIVERY_VECTORS, delivered)):
+        if args.write:
+            path.write_bytes(data)
+        elif data != path.read_bytes():
+            raise SystemExit(f"scheduled tick oracle: native vectors differ for {path.name}")
     print("scheduled tick oracle: vectors " + ("written" if args.write else "match"))
 
 
