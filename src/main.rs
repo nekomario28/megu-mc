@@ -12461,14 +12461,14 @@ fn save_dim_overlay_into(dim: DimId, f: &mut Vec<u8>) -> usize {
     count
 }
 
-/// Read one dimension's chunk table into that dimension's overlay, starting at `p`.
+/// Read one dimension's chunk table, starting at `p`, and apply its edits when requested.
 ///
 /// The cursor form exists because the legacy file carries META sections after this table, so
 /// `load_world_from` has to continue parsing where the table ended. A companion file is only the
 /// table, which is what [`load_dim_overlay_from`] reads.
-fn load_dim_overlay_at(dim: DimId, payload: &[u8], p: &mut usize) {
+fn read_dim_overlay_at(dim: DimId, payload: &[u8], p: &mut usize, apply: bool) {
     let n = rv_varint(payload, p);
-    let mut w = world().lock().unwrap();
+    let mut w = apply.then(|| world().lock().unwrap());
     for _ in 0..n {
         if *p + 8 > payload.len() {
             break;
@@ -12478,7 +12478,7 @@ fn load_dim_overlay_at(dim: DimId, payload: &[u8], p: &mut usize) {
         let cz = i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap());
         *p += 4;
         let m = rv_varint(payload, p);
-        let c = w.entry((dim, cx, cz)).or_default();
+        let mut c = w.as_mut().map(|world| world.entry((dim, cx, cz)).or_default());
         for _ in 0..m {
             if *p + 4 > payload.len() {
                 break;
@@ -12486,11 +12486,13 @@ fn load_dim_overlay_at(dim: DimId, payload: &[u8], p: &mut usize) {
             let idx = u32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap());
             *p += 4;
             let st = rv_varint(payload, p) as u32;
-            c.insert(idx, st);
+            if let Some(c) = c.as_deref_mut() {
+                c.insert(idx, st);
+            }
         }
         // `bump_world_epoch` moves the Overworld chunk's band/section caches, so only an
         // Overworld chunk may move it: a Nether cell is not part of what they describe.
-        if dim == DimId::Overworld {
+        if apply && dim == DimId::Overworld {
             bump_world_epoch(cx << 4, cz << 4);
         }
     }
@@ -12499,7 +12501,7 @@ fn load_dim_overlay_at(dim: DimId, payload: &[u8], p: &mut usize) {
 /// A companion file's payload: exactly one dimension's chunk table, nothing after it.
 fn load_dim_overlay_from(dim: DimId, payload: &[u8]) -> Result<(), &'static str> {
     let mut p = 0usize;
-    load_dim_overlay_at(dim, payload, &mut p);
+    read_dim_overlay_at(dim, payload, &mut p, true);
     if p != payload.len() {
         return Err("trailing bytes after a dimension's overlay table");
     }
@@ -14126,16 +14128,18 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     let rv = rv_varint;
     // The leading table is the Overworld's: the legacy file stores `(cx, cz)` chunks, and they
     // load into `(DimId::Overworld, cx, cz)`. `p` continues past the table into the META tail.
-    load_dim_overlay_at(DimId::Overworld, payload, &mut p);
-    eprintln!(
-        "[spine] loaded {} dirty chunks",
-        world().lock().unwrap().len()
-    );
+    let has_mob_dimensions = !mob_dimensions.is_empty();
+    // When the footer links to legacy mob ordinals, check the link before publishing any edits.
+    read_dim_overlay_at(DimId::Overworld, payload, &mut p, !has_mob_dimensions);
+    let has_meta = matches!(payload.get(p..p + 4), Some(b"MET2" | b"MET3" | b"MET4"));
+    if has_mob_dimensions && !has_meta {
+        return Err("mob dimension count does not match mob records");
+    }
     // optional META tail
     let mut restored_mobs = Vec::new();
     let mut restored_sheared = Vec::new();
     let mut restored_mob_tags = Vec::new();
-    if p + 4 <= payload.len() && matches!(&payload[p..p + 4], b"MET2" | b"MET3" | b"MET4") {
+    if has_meta {
         let magic = &payload[p..p + 4];
         let has_comps = magic != b"MET2";
         // MET4 stores entity ages as server ticks. MET2 and MET3 stored them as
@@ -14145,10 +14149,10 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
         p += 4;
         let mn = rv(payload, &mut p);
         for _ in 0..mn {
+            let et = rv(payload, &mut p);
             if p + 28 > payload.len() {
                 break;
             }
-            let et = rv(payload, &mut p);
             let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
             p += 8;
             let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
@@ -14158,6 +14162,12 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             let hp = f32::from_be_bytes(b[p..p + 4].try_into().unwrap());
             p += 4;
             restored_mobs.push((et, x, y, z, hp));
+        }
+        if has_mob_dimensions {
+            if restored_mobs.len() != mob_dimensions.len() {
+                return Err("mob dimension count does not match mob records");
+            }
+            read_dim_overlay_at(DimId::Overworld, payload, &mut 0, true);
         }
         if p + 8 <= payload.len() {
             WORLD_TIME.store(
@@ -15113,9 +15123,6 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     }
     // Persisted drop, projectile, TNT and falling-block IDs must reserve their range
     // before mobs receive fresh IDs. Keep mob ordinals stable for shearing and tags.
-    if !mob_dimensions.is_empty() && mob_dimensions.len() != restored_mobs.len() {
-        return Err("mob dimension count does not match mob records");
-    }
     if !restored_mobs.is_empty() {
         let mut ms = mobs().lock().unwrap();
         let first = ms.len();
@@ -15152,6 +15159,10 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
         }
     }
     *live_brewing_stands().lock().unwrap() = brewing;
+    eprintln!(
+        "[spine] loaded {} dirty chunks",
+        world().lock().unwrap().len()
+    );
     rebuild_derived_indexes();
     Ok(())
 }
@@ -28701,6 +28712,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
 
     let args: Vec<&str> = it.collect();
     let admin = me.is_none_or(|player| player_is_admin(&player.name));
+    if !admin && !command_allowed_for_player(cmd, &args) {
+        let reply = "You do not have permission to run that command";
+        if let Some(client) = s {
+            let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(reply));
+        }
+        return reply.into();
+    }
     #[cfg(feature = "neoforge-events")]
     let mod_command = java_compat::NEOFORGE.get().filter(|runtime| {
         runtime.commands.binary_search_by(|name| name.as_str().cmp(cmd)).is_ok()
@@ -28721,13 +28739,6 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             }
         }
         return reply;
-    }
-    if !admin && !command_allowed_for_player(cmd, &args) {
-        let reply = "You do not have permission to run that command";
-        if let Some(client) = s {
-            let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(reply));
-        }
-        return reply.into();
     }
     let reply = match cmd {
         "execute" => run_execute(ctx, &args, s),

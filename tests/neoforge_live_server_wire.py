@@ -230,6 +230,10 @@ def exercise(binary, root, jar):
             x, y, z = [math.floor(axis) for axis in player.pos]
             seen = len(player.updates)
             player.send(0x04, string(COMMAND))
+            await_message(player, "You do not have permission to run that command")
+            assert ((x, y + 2, z), 14) not in player.updates[seen:]
+            assert rcon_command(rcon, "op NeoWire") == "Made NeoWire a server operator"
+            player.send(0x04, string(COMMAND))
             await_message(player, f"fixture command at {x} {y} {z}")
             if ((x, y + 2, z), 14) not in player.updates[seen:]:
                 await_update(player, (x, y + 2, z), 14)

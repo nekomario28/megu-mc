@@ -166,6 +166,32 @@ fn gp2_saved_mob_dimensions_follow_legacy_record_order() {
 }
 
 #[test]
+fn gp2_mismatched_mob_dimension_footer_does_not_apply_overlay() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+
+    let chunk: DimChunkKey = (DimId::Overworld, 2, 3);
+    let cell = local_idx(32, 70, 48);
+    let mut payload = Vec::new();
+    write_varint(&mut payload, 1);
+    payload.extend_from_slice(&chunk.1.to_be_bytes());
+    payload.extend_from_slice(&chunk.2.to_be_bytes());
+    write_varint(&mut payload, 1);
+    payload.extend_from_slice(&cell.to_be_bytes());
+    write_varint(&mut payload, 1);
+    payload.extend_from_slice(b"MET4");
+    write_varint(&mut payload, 0);
+    append_mob_dimensions_footer(&mut payload, &[DimId::Nether]);
+
+    assert_eq!(
+        load_world_from(&payload),
+        Err("mob dimension count does not match mob records")
+    );
+    assert!(!world().lock().unwrap().contains_key(&chunk));
+}
+
+#[test]
 fn d1_player_fluid_checks_use_nether_blocks() {
     crate::test_support::require_vanilla_data();
     let _guard = world_guard();
