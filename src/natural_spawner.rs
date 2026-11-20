@@ -290,15 +290,16 @@ pub(crate) fn evaluate_despawn(
     no_despawn_distance: f64,
     rng_next_800: i32,
 ) -> DespawnDecision {
-    if !remove_when_far_away || persistent_or_passenger {
-        return DespawnDecision::Keep;
+    if persistent_or_passenger {
+        return DespawnDecision::ResetNoActionTime;
     }
     let Some(dist_sq) = dist_sq_nearest_non_spectator else {
         return DespawnDecision::Keep;
     };
-    if dist_sq > despawn_distance * despawn_distance {
+    if remove_when_far_away && dist_sq > despawn_distance * despawn_distance {
         DespawnDecision::DespawnNow
-    } else if no_action_time > 600
+    } else if remove_when_far_away
+        && no_action_time > 600
         && rng_next_800 == 0
         && dist_sq > no_despawn_distance * no_despawn_distance
     {
@@ -697,11 +698,21 @@ mod natural_spawner_tests {
         );
         assert_eq!(
             check(Some(129.0 * 129.0), 601, true, true, 0),
-            DespawnDecision::Keep
+            DespawnDecision::ResetNoActionTime
+        );
+        assert_eq!(
+            check(None, 601, true, false, 1),
+            DespawnDecision::ResetNoActionTime
         );
         assert_eq!(
             check(Some(129.0 * 129.0), 601, false, false, 0),
             DespawnDecision::Keep
+        );
+        // removeWhenFarAway gates removal, but vanilla still resets idle time
+        // inside the no-despawn radius when a player is present.
+        assert_eq!(
+            check(Some(31.0 * 31.0), 601, false, false, 0),
+            DespawnDecision::ResetNoActionTime
         );
         assert_eq!(
             evaluate_despawn_with_peaceful(
