@@ -214,14 +214,16 @@ impl ComparatorBlock {
 
     fn evaluate(self, world: &impl RedstoneWorld, pos: RsPos) -> u8 {
         let rear_pos = pos.relative(self.facing.opposite());
-        let analog = world.container_analog_signal(rear_pos).or_else(|| {
-            if world.is_redstone_conductor(rear_pos) {
+        let mut rear = rs_diode_rear_input(world, pos, self.facing);
+        if let Some(analog) = world.container_analog_signal(rear_pos) {
+            rear = analog.min(15);
+        } else if rear < 15 && world.is_redstone_conductor(rear_pos) {
+            if let Some(analog) =
                 world.container_analog_signal(rear_pos.relative(self.facing.opposite()))
-            } else {
-                None
+            {
+                rear = analog.min(15);
             }
-        });
-        let rear = rs_diode_rear_input(world, pos, self.facing).max(analog.unwrap_or(0).min(15));
+        }
         let side = rs_side_input(world, pos, self.facing, false);
         match self.mode {
             RsComparatorMode::Compare if rear >= side => rear,
@@ -1278,7 +1280,17 @@ mod redstone_tests {
             },
         );
         grid.advance(2);
-        assert_eq!(grid.redstone_block(ORIGIN).direct_signal(RsDir::East), 6);
+        assert_eq!(grid.redstone_block(ORIGIN).direct_signal(RsDir::East), 3);
+
+        grid.set_block(
+            rear.relative(RsDir::Down),
+            RsBlock::Source {
+                weak: 15,
+                strong: 15,
+            },
+        );
+        grid.advance(2);
+        assert_eq!(grid.redstone_block(ORIGIN).direct_signal(RsDir::East), 9);
 
         grid.set_block(rear, RsBlock::Container(6));
         grid.set_block(
