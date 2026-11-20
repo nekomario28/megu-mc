@@ -27188,9 +27188,19 @@ struct Bossbar {
     name: String,
     color: u8,
     style: u8,
-    val: f32,
-    max: f32,
+    value: i32,
+    max: i32,
     visible: bool,
+    players: HashSet<[u8; 16]>,
+}
+impl Bossbar {
+    fn progress(&self) -> f32 {
+        (self.value as f32 / self.max as f32).clamp(0.0, 1.0)
+    }
+
+    fn shown_to(&self, player: &Client) -> bool {
+        self.visible && self.players.contains(&player.uuid)
+    }
 }
 fn bossbars() -> &'static Mutex<HashMap<String, Bossbar>> {
     static R: OnceLock<Mutex<HashMap<String, Bossbar>>> = OnceLock::new();
@@ -27217,12 +27227,12 @@ fn bossbar_pkt(id: &str, action: u8, bar: Option<&Bossbar>) -> Vec<u8> {
         (0, Some(b)) => {
             // add: title, health, color, dividers, flags
             p.extend_from_slice(&chat_nbt(&b.name));
-            p.extend_from_slice(&b.val.to_be_bytes());
+            p.extend_from_slice(&b.progress().to_be_bytes());
             write_varint(&mut p, b.color as i64);
             write_varint(&mut p, b.style as i64);
             p.push(0);
         }
-        (2, Some(b)) => p.extend_from_slice(&b.val.to_be_bytes()),
+        (2, Some(b)) => p.extend_from_slice(&b.progress().to_be_bytes()),
         (3, Some(b)) => p.extend_from_slice(&chat_nbt(&b.name)),
         (4, Some(b)) => {
             write_varint(&mut p, b.color as i64);
@@ -27232,6 +27242,168 @@ fn bossbar_pkt(id: &str, action: u8, bar: Option<&Bossbar>) -> Vec<u8> {
     }
     p
 }
+fn run_bossbar_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    const USAGE: &str = "usage: /bossbar add|remove|set|list|get";
+    let mut bars = bossbars().lock().unwrap();
+    if args == ["list"] {
+        let mut ids: Vec<_> = bars.keys().cloned().collect();
+        ids.sort();
+        return format!("{} bossbars: {}", ids.len(), ids.join(", "));
+    }
+    let [operation, raw_id, rest @ ..] = args else {
+        return USAGE.into();
+    };
+    let id = if raw_id.contains(':') {
+        raw_id.to_string()
+    } else {
+        format!("minecraft:{raw_id}")
+    };
+    if *operation == "add" && !rest.is_empty() {
+        if bars.contains_key(&id) {
+            return format!("Bossbar '{id}' already exists");
+        }
+        bars.insert(
+            id.clone(),
+            Bossbar {
+                name: rest.join(" "),
+                color: 6,
+                style: 0,
+                value: 0,
+                max: 100,
+                visible: true,
+                players: HashSet::new(),
+            },
+        );
+        return format!("Created bossbar {id}");
+    }
+    let Some(bar) = bars.get_mut(&id) else {
+        return format!("Unknown bossbar '{id}'");
+    };
+    let online = client_snapshot();
+    let send = |player: &Client, action, bar: Option<&Bossbar>| {
+        let _ = send_packet(
+            &mut player.sock.lock().unwrap(),
+            0x0a,
+            bossbar_pkt(&id, action, bar),
+        );
+    };
+    match (*operation, rest) {
+        ("remove", []) => {
+            for player in online.iter().filter(|p| bar.shown_to(p)) {
+                send(player, 1, None);
+            }
+            bars.remove(&id);
+            return format!("Removed bossbar {id}");
+        }
+        ("get", ["max"]) => return format!("Bossbar {id} max is {}", bar.max),
+        ("get", ["value"]) => return format!("Bossbar {id} value is {}", bar.value),
+        ("get", ["visible"]) => return format!("Bossbar {id} visible is {}", bar.visible),
+        ("get", ["players"]) => {
+            let mut names: Vec<_> = online
+                .iter()
+                .filter(|p| bar.players.contains(&p.uuid))
+                .map(|p| p.name.as_str())
+                .collect();
+            names.sort_unstable();
+            return format!(
+                "Bossbar {id} has {} player(s): {}",
+                names.len(),
+                names.join(", ")
+            );
+        }
+        ("set", ["players", targets @ ..]) if targets.len() <= 1 => {
+            let players = if let Some(selector) = targets.first() {
+                let selected = resolve_selector(selector, source);
+                let players: HashSet<_> = online
+                    .iter()
+                    .filter(|p| selected.iter().any(|eid| *eid == p.eid.to_string()))
+                    .map(|p| p.uuid)
+                    .collect();
+                if players.is_empty() {
+                    return "No players found".into();
+                }
+                players
+            } else {
+                HashSet::new()
+            };
+            let old = std::mem::replace(&mut bar.players, players);
+            if bar.visible {
+                for player in &online {
+                    match (
+                        old.contains(&player.uuid),
+                        bar.players.contains(&player.uuid),
+                    ) {
+                        (false, true) => send(player, 0, Some(bar)),
+                        (true, false) => send(player, 1, None),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        ("set", ["visible", "true" | "false"]) => {
+            let visible = rest[1] == "true";
+            if bar.visible != visible {
+                bar.visible = visible;
+                for player in online.iter().filter(|p| bar.players.contains(&p.uuid)) {
+                    send(player, if visible { 0 } else { 1 }, Some(bar));
+                }
+            }
+        }
+        ("set", [field @ ("value" | "max"), number]) => {
+            let min = i32::from(*field == "max");
+            let Ok(number) = number.parse::<i32>() else {
+                return format!("{field} must be an integer of at least {min}");
+            };
+            if number < min {
+                return format!("{field} must be an integer of at least {min}");
+            }
+            let previous = bar.progress();
+            if *field == "max" {
+                bar.max = number;
+            } else {
+                bar.value = number;
+            }
+            if bar.progress() != previous {
+                for player in online.iter().filter(|p| bar.shown_to(p)) {
+                    send(player, 2, Some(bar));
+                }
+            }
+        }
+        ("set", ["name", name @ ..]) if !name.is_empty() => {
+            bar.name = name.join(" ");
+            for player in online.iter().filter(|p| bar.shown_to(p)) {
+                send(player, 3, Some(bar));
+            }
+        }
+        ("set", [field @ ("color" | "style"), value]) => {
+            if *field == "color" {
+                let colors = ["pink", "blue", "red", "green", "yellow", "purple", "white"];
+                let Some(color) = colors.iter().position(|name| name == value) else {
+                    return "Unknown bossbar color".into();
+                };
+                bar.color = color as u8;
+            } else {
+                let styles = [
+                    "progress",
+                    "notched_6",
+                    "notched_10",
+                    "notched_12",
+                    "notched_20",
+                ];
+                let Some(style) = styles.iter().position(|name| name == value) else {
+                    return "Unknown bossbar style".into();
+                };
+                bar.style = style as u8;
+            }
+            for player in online.iter().filter(|p| bar.shown_to(p)) {
+                send(player, 4, Some(bar));
+            }
+        }
+        _ => return USAGE.into(),
+    }
+    format!("Updated bossbar {id}")
+}
+
 // entity attributes: p:<player-name> persistent | e:<eid> transient
 fn attrs() -> &'static Mutex<HashMap<String, HashMap<String, f64>>> {
     static R: OnceLock<Mutex<HashMap<String, HashMap<String, f64>>>> = OnceLock::new();
@@ -27916,7 +28088,7 @@ fn command_usage(name: &str) -> String {
         "spawnpoint" => "/spawnpoint [player] [x y z]",
         "setworldspawn" => "/setworldspawn [x y z]",
         "forceload" => "/forceload add|remove <x> <z> [<x2> <z2>] | remove all | query [<x> <z>]",
-        "bossbar" => "/bossbar add|remove|set|list ...",
+        "bossbar" => "/bossbar add|remove|set|list|get ...",
         "time" => "/time set <day|noon|night|ticks> | query <day|daytime|gametime>",
         "difficulty" => "/difficulty [peaceful|easy|normal|hard]",
         "help" => "/help [command]",
@@ -29297,51 +29469,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             }
             format!("Stopped sound for {} player(s)", n)
         }
-        "bossbar" => {
-            match args.first().copied().unwrap_or("") {
-                "add" => {
-                    let (id, name) = (args.get(1).copied().unwrap_or(""), args.get(2).copied().unwrap_or("Bossbar"));
-                    let id = if id.contains(':') { id.to_string() } else { format!("minecraft:{}", id) };
-                    let bar = Bossbar { name: name.to_string(), color: 0, style: 0, val: 1.0, max: 1.0, visible: true };
-                    let pkt = bossbar_pkt(&id, 0, Some(&bar));
-                    broadcast(-1, |_c| (0x0a, pkt.clone()));
-                    bossbars().lock().unwrap().insert(id.clone(), bar);
-                    format!("Created bossbar {}", id)
-                }
-                "remove" => {
-                    let id = args.get(1).copied().unwrap_or("");
-                    let id = if id.contains(':') { id.to_string() } else { format!("minecraft:{}", id) };
-                    bossbars().lock().unwrap().remove(&id);
-                    broadcast(-1, |_c| (0x0a, bossbar_pkt(&id, 1, None)));
-                    format!("Removed bossbar {}", id)
-                }
-                "set" => {
-                    let id = args.get(1).copied().unwrap_or("");
-                    let id = if id.contains(':') { id.to_string() } else { format!("minecraft:{}", id) };
-                    let what = args.get(2).copied().unwrap_or("");
-                    let mut bs = bossbars().lock().unwrap();
-                    let Some(b) = bs.get_mut(&id) else { return format!("Unknown bossbar '{}'", id) };
-                    match what {
-                        "value" => { b.val = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(1.0); }
-                        "max" => { let m: f32 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(1.0); b.max = m; b.val /= m; }
-                        "name" => { b.name = args[3..].join(" "); }
-                        "visible" => { b.visible = args.get(3).copied() == Some("true"); }
-                        "color" => { b.color = match args.get(3).copied().unwrap_or("") { "blue"=>1,"green"=>2,"pink"=>3,"purple"=>4,"red"=>5,"yellow"=>6,_=>0 }; }
-                        "style" => { b.style = match args.get(3).copied().unwrap_or("") { "notched_6"=>1,"notched_10"=>2,"notched_12"=>3,"notched_20"=>4,_=>0 }; }
-                        _ => return "usage: /bossbar set <id> name|value|max|visible|color|style".into(),
-                    }
-                    let action = match what { "value" => 2, "name" => 3, "color" | "style" => 4, _ => 255 };
-                    if action != 255 { let pkt = bossbar_pkt(&id, action, Some(b));
-                        drop(bs); broadcast(-1, |_c| (0x0a, pkt.clone())); }
-                    return format!("Updated bossbar {}", id);
-                }
-                "list" => {
-                    let bs = bossbars().lock().unwrap();
-                    format!("{} bossbars: {}", bs.len(), bs.keys().cloned().collect::<Vec<_>>().join(", "))
-                }
-                _ => "usage: /bossbar add|remove|set|list".into(),
-            }
-        }
+        "bossbar" => run_bossbar_command(&args, me),
         "advancement" => run_advancement_command(&args, me),
         "datapack" => run_datapack_command(&args),
         "worldborder" => run_world_border_command(ctx, &args),
@@ -30188,6 +30316,8 @@ fn handle(mut s: TcpStream) {
         let _ = neoforge_event(&me, java_compat::S1Event::PlayerLogin(me.eid, me.name.clone()));
     }
     {
+        // Match bossbar command lock order so a joining member receives one Add.
+        let bars = bossbars().lock().unwrap();
         let mut cls = clients().lock().unwrap();
         *me.chunks.lock().unwrap() = sent;
         for c in cls.iter() {
@@ -30201,6 +30331,9 @@ fn handle(mut s: TcpStream) {
             }
         }
         cls.push(me.clone());
+        for (id, bar) in bars.iter().filter(|(_, bar)| bar.shown_to(&me)) {
+            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x0a, bossbar_pkt(id, 0, Some(bar)));
+        }
     }
     // An operator change can happen during the initial chunk stream, before
     // the client is present in the online list used by /op and /reload.
