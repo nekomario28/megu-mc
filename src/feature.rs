@@ -3733,18 +3733,65 @@ fn spc_can_spread_from(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
     if spc_kind(reg, st) != SpcKind::Other {
         return true;
     }
-    let water_source = reg.name_of(st) == "minecraft:water";
+    let water_source = reg.name_of(st) == "minecraft:water"
+        && reg.fluid_name(st) == "minecraft:water";
     if !reg.is_air(st) && !water_source {
         return false;
     }
     for d in 0..6u8 {
         let (dx, dy, dz) = dir_off(d);
         let nb = ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz);
-        if face_sturdy(reg, nb, d ^ 1, Support::Full) {
+        if reg.is_collision_shape_full_block(nb) {
             return true;
         }
     }
     false
+}
+
+#[cfg(test)]
+mod sculk_patch_entry_tests {
+    use super::*;
+
+    #[test]
+    fn sculk_patch_entry_requires_full_collision_shape() {
+        let reg = breg().expect("block registry");
+        let path = reg.state_of("minecraft:dirt_path", None);
+        assert!(reg.is_face_sturdy(path, 0, Support::Full));
+        assert!(!reg.is_collision_shape_full_block(path));
+
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let mut ctx = FC::new(&mut g);
+        ctx.test_default_air = true;
+        let origin = (0, 64, 0);
+        ctx.set(0, 65, 0, path);
+        assert!(!spc_can_spread_from(&mut ctx, reg, origin));
+
+        ctx.set(0, 65, 0, reg.state_of("minecraft:stone", None));
+        assert!(spc_can_spread_from(&mut ctx, reg, origin));
+
+        ctx.set(0, 65, 0, reg.state_of("minecraft:air", None));
+        ctx.set(0, 64, 0, reg.state_of("minecraft:sculk_vein", None));
+        assert!(spc_can_spread_from(&mut ctx, reg, origin));
+    }
+
+    #[test]
+    fn sculk_patch_entry_rejects_flowing_water() {
+        let reg = breg().expect("block registry");
+        let source = reg.with_prop(reg.state_of("minecraft:water", None), "level", "0");
+        let flowing = reg.with_prop(source, "level", "4");
+        assert_eq!(reg.fluid_name(source), "minecraft:water");
+        assert_eq!(reg.fluid_name(flowing), "minecraft:flowing_water");
+
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let mut ctx = FC::new(&mut g);
+        ctx.test_default_air = true;
+        let origin = (0, 64, 0);
+        ctx.set(0, 63, 0, reg.state_of("minecraft:stone", None));
+        ctx.set(0, 64, 0, flowing);
+        assert!(!spc_can_spread_from(&mut ctx, reg, origin));
+        ctx.set(0, 64, 0, source);
+        assert!(spc_can_spread_from(&mut ctx, reg, origin));
+    }
 }
 
 /// `SculkPatchFeature.place` (`edi.a(ecg)`).
