@@ -33,9 +33,11 @@
 //!
 //! | packet | class | registration index |
 //! |---|---|---|
-//! | clientbound command suggestions response | `acm` | 15 = `0x0f` |
-//! | clientbound commands | `acn` | 16 = `0x10` |
+//! | clientbound command suggestions response | `acm` | 16 = `0x10` |
+//! | clientbound commands | `acn` | 17 = `0x11` |
 //! | serverbound command suggestion | `agu` | 11 = `0x0b` |
+//!
+//! The clientbound ID immediately before these is `minecraft:clear_titles` at `0x0f`.
 //!
 //! ## Parser ids
 //!
@@ -101,10 +103,10 @@ use std::collections::HashMap;
 use std::fmt;
 
 /// `minecraft:commands`, clientbound play, protocol 767. Provenance: module docs.
-pub const CLIENTBOUND_COMMANDS: i32 = 0x10;
+pub const CLIENTBOUND_COMMANDS: i32 = 0x11;
 
 /// `minecraft:command_suggestions`, clientbound play, protocol 767. Provenance: module docs.
-pub const CLIENTBOUND_COMMAND_SUGGESTIONS: i32 = 0x0f;
+pub const CLIENTBOUND_COMMAND_SUGGESTIONS: i32 = 0x10;
 
 /// `minecraft:command_suggestion`, serverbound play, protocol 767. Provenance: module docs.
 pub const SERVERBOUND_COMMAND_SUGGESTION: i32 = 0x0b;

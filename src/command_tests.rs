@@ -383,9 +383,9 @@ fn datapack_reload_replaces_caches_and_replays_the_load_hook() {
 
 #[test]
 fn brigadier_play_tree_and_completion_respect_permissions() {
-    assert_eq!(brigadier_wire::CLIENTBOUND_COMMANDS, 0x10);
+    assert_eq!(brigadier_wire::CLIENTBOUND_COMMANDS, 0x11);
     assert_eq!(brigadier_wire::SERVERBOUND_COMMAND_SUGGESTION, 0x0b);
-    assert_eq!(brigadier_wire::CLIENTBOUND_COMMAND_SUGGESTIONS, 0x0f);
+    assert_eq!(brigadier_wire::CLIENTBOUND_COMMAND_SUGGESTIONS, 0x10);
     let basic = command_tree(false);
     let admin = command_tree(true);
     let names: Vec<_> = basic
