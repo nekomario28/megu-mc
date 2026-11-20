@@ -102,64 +102,12 @@ fn comp_set_varint(c: &mut Comps, ty: i64, v: i64) {
     write_varint(&mut d, v);
     comp_set(c, ty, d);
 }
-// vanilla armor durability per piece slot (5=helmet..8=boots)
+// Use the shared 1.21.1 durability registry for equipment and tools.
 fn armor_max_damage(item: i64) -> Option<i64> {
-    let pairs: &[(&str, i64)] = &[
-        ("leather_helmet", 55),
-        ("golden_helmet", 77),
-        ("chainmail_helmet", 165),
-        ("iron_helmet", 165),
-        ("diamond_helmet", 363),
-        ("netherite_helmet", 407),
-        ("turtle_helmet", 275),
-        ("leather_chestplate", 80),
-        ("golden_chestplate", 112),
-        ("chainmail_chestplate", 240),
-        ("iron_chestplate", 240),
-        ("diamond_chestplate", 528),
-        ("netherite_chestplate", 592),
-        ("elytra", 432),
-        ("leather_leggings", 75),
-        ("golden_leggings", 105),
-        ("chainmail_leggings", 225),
-        ("iron_leggings", 225),
-        ("diamond_leggings", 495),
-        ("netherite_leggings", 555),
-        ("leather_boots", 65),
-        ("golden_boots", 91),
-        ("chainmail_boots", 195),
-        ("iron_boots", 195),
-        ("diamond_boots", 429),
-        ("netherite_boots", 481),
-    ];
-    pairs
-        .iter()
-        .find(|(n, _)| name_to_item(n) == Some(item))
-        .map(|(_, m)| *m)
+    item_to_name(item).and_then(item_max_durability).map(i64::from)
 }
-// vanilla max_damage by item id (tools/weapons/some utilities; armor omitted)
 fn tool_max_damage(item: i64) -> Option<i64> {
-    // tool groups are consecutive 5-id bands starting 818:
-    // sword,shovel,pickaxe,axe,hoe x wooden,stone,golden,iron,diamond,netherite
-    if (818..=847).contains(&item) {
-        let band = (item - 818) / 5;
-        return Some([59, 131, 32, 250, 1561, 2031][band as usize]);
-    }
-    Some(match item {
-        i if i == name_to_item("bow").unwrap_or(-1) => 384,
-        i if i == name_to_item("crossbow").unwrap_or(-2) => 465,
-        i if i == name_to_item("trident").unwrap_or(-3) => 250,
-        i if i == name_to_item("fishing_rod").unwrap_or(-4) => 64,
-        i if i == name_to_item("flint_and_steel").unwrap_or(-5) => 64,
-        i if i == name_to_item("shears").unwrap_or(-6) => 238,
-        i if i == name_to_item("shield").unwrap_or(-7) => 336,
-        i if i == name_to_item("carrot_on_a_stick").unwrap_or(-8) => 25,
-        i if i == name_to_item("warped_fungus_on_a_stick").unwrap_or(-9) => 100,
-        i if i == name_to_item("elytra").unwrap_or(-10) => 432,
-        i if i == name_to_item("mace").unwrap_or(-11) => 500,
-        i if i == name_to_item("brush").unwrap_or(-12) => 64,
-        _ => return None,
-    })
+    item_to_name(item).and_then(item_max_durability).map(i64::from)
 }
 fn enchant_id(name: &str) -> Option<i64> {
     Some(match name.trim_start_matches("minecraft:") {
@@ -321,25 +269,26 @@ fn can_harvest(block: i64, held_item: i64) -> bool {
 }
 // tool dig speed; kind order in band: sword,shovel,pick,axe,hoe; tier: wood,stone,gold,iron,diamond,netherite
 fn tool_dig_speed(held: &Stack, block: i64) -> f32 {
-    let (kind, band) = if (818..=847).contains(&held.0) {
-        ((held.0 - 818) % 5, (held.0 - 818) / 5)
+    let kind = if (818..=847).contains(&held.0) {
+        (held.0 - 818) % 5
     } else {
-        (-1, 0)
+        -1
     };
-    let tier_speed = [2.0f32, 4.0, 12.0, 6.0, 8.0, 9.0];
-    // The correct tool type comes from the block asset, not from id ranges: the hand
-    // ranges answered for 16 percent of the states.
     let right_tool = kind >= 0 && kind == i64::from(tool_kind(block));
-    let mut speed = if right_tool {
-        tier_speed[band.clamp(0, 5) as usize]
+    let base = if right_tool {
+        item_to_name(held.0).map(tool_base_mining_speed).unwrap_or(1.0)
     } else {
         1.0
     };
-    let eff = enchant_level(&held.2, 8);
-    if eff > 0 && speed > 1.0 {
-        speed += (eff * eff + 1) as f32;
-    }
-    speed
+    mining_speed_with_modifiers(
+        base,
+        right_tool && base > 1.0,
+        enchant_level(&held.2, 8).clamp(0, i32::MAX as i64) as i32,
+        None,
+        None,
+        false,
+        true,
+    )
 }
 
 fn dig_seconds(block: i64, held: &Stack) -> Option<f32> {
@@ -420,60 +369,44 @@ fn enchant_applicable(item: i64, eid: i64) -> bool {
         _ => true,
     }
 }
-// damage the held item by 1 point (unbreaking roll applied); returns
-// true if the item broke. Vanilla: tools pay 1 per block broken /
-// melee hit; unbreaking gives 1/(level+1) chance of actual damage.
-fn damage_held(me: &Arc<Client>) -> bool {
-    let hs = *me.held.lock().unwrap();
-    let mut inv = me.inv.lock().unwrap();
-    let slot = 36 + hs;
-    let Some(st) = inv.get_mut(&slot) else {
-        return false;
-    };
-    let Some(maxd) = tool_max_damage(st.0).or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE)) else {
-        return false;
-    };
-    if comp_get(&st.2, COMP_UNBREAKABLE).is_some() {
-        return false;
-    }
-    let unb = enchant_level(&st.2, 39); // unbreaking
-    if unb > 0 && !world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
-        return false;
-    }
-    let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
-    if dmg >= maxd {
-        inv.remove(&slot);
-        return true;
-    }
-    comp_set_varint(&mut st.2, COMP_DAMAGE, dmg);
-    false
-}
-// same durability tick on an arbitrary inventory slot (elytra wear, etc)
-fn damage_inv_slot(me: &Arc<Client>, slot: i16) -> bool {
-    let mut inv = me.inv.lock().unwrap();
-    let Some(st) = inv.get_mut(&slot) else {
-        return false;
-    };
-    let Some(maxd) = tool_max_damage(st.0)
-        .or_else(|| armor_max_damage(st.0))
-        .or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE))
+// Apply one point of durability damage to an inventory stack.
+fn damage_stack(st: &mut Stack, random: f32) -> bool {
+    let Some(maxd) = comp_varint(&st.2, COMP_MAX_DAMAGE)
+        .or_else(|| item_to_name(st.0).and_then(item_max_durability).map(i64::from))
     else {
         return false;
     };
     if comp_get(&st.2, COMP_UNBREAKABLE).is_some() {
         return false;
     }
-    let unb = enchant_level(&st.2, 39);
-    if unb > 0 && !world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
+    let level = enchant_level(&st.2, 39).clamp(0, i32::MAX as i64) as i32;
+    let armor = item_to_name(st.0).and_then(armor_parts).is_some();
+    if !unbreaking_consumes_durability(level, random, armor) {
         return false;
     }
     let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
     if dmg >= maxd {
-        inv.remove(&slot);
         return true;
     }
     comp_set_varint(&mut st.2, COMP_DAMAGE, dmg);
     false
+}
+fn damage_held(me: &Arc<Client>) -> bool {
+    let slot = 36 + *me.held.lock().unwrap();
+    damage_inv_slot(me, slot)
+}
+fn damage_inv_slot(me: &Arc<Client>, slot: i16) -> bool {
+    let mut inv = me.inv.lock().unwrap();
+    let Some(st) = inv.get_mut(&slot) else {
+        return false;
+    };
+    let random = (world_rng::next_u64() >> 40) as f32 / (1u32 << 24) as f32;
+    if damage_stack(st, random) {
+        inv.remove(&slot);
+        true
+    } else {
+        false
+    }
 }
 
 // resend the held slot to the owner after damage/break so the client

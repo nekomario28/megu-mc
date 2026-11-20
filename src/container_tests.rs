@@ -348,3 +348,22 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
     furnaces().lock().unwrap().remove(&ow_block(furnace_pos));
     loot_tables().lock().unwrap().remove(table);
 }
+
+#[test]
+fn mining_efficiency_and_durability_use_shared_mechanics() {
+    let stone = name_to_state("stone").unwrap() as i64;
+    let pick = name_to_item("iron_pickaxe").unwrap();
+    let plain = (pick, 1, vec![]);
+    let enchanted = (pick, 1, vec![(COMP_ENCHANTMENTS, enchantments_data(&[(8, 2)], true))]);
+    assert_eq!(tool_dig_speed(&plain, stone), 6.0);
+    assert_eq!(tool_dig_speed(&enchanted, stone), 11.0);
+    assert!(dig_seconds(stone, &enchanted).unwrap() < dig_seconds(stone, &plain).unwrap());
+    assert_eq!(tool_max_damage(name_to_item("crossbow").unwrap()), Some(326));
+    let mut worn = plain;
+    comp_set_varint(&mut worn.2, COMP_DAMAGE, 249);
+    assert!(damage_stack(&mut worn, 0.0));
+    let mut protected = enchanted;
+    comp_set(&mut protected.2, COMP_UNBREAKABLE, vec![1]);
+    assert!(!damage_stack(&mut protected, 0.0));
+    assert_eq!(comp_varint(&protected.2, COMP_DAMAGE), None);
+}
