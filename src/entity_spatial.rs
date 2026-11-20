@@ -311,9 +311,145 @@ impl EntitySpatialGrid {
     }
 }
 
+// Vanilla 1.21.1 bsx.<clinit> / bsx$a.a(int), verified against the
+// bundled server jar. Unknown IDs use the builder's default of five chunks;
+// callers must validate modded or otherwise unknown IDs before using it for culling.
+#[allow(dead_code)]
+fn client_tracking_range_chunks(entity_id: &str) -> u32 {
+    let name = entity_id.strip_prefix("minecraft:").unwrap_or(entity_id);
+    ENTITY_REGISTRY_1211.iter()
+        .find(|spec| spec.name.strip_prefix("minecraft:") == Some(name))
+        .map_or(5, |spec| spec.client_tracking_range as u32)
+}
+
+/// Inputs are the actual per-player tracked and eligible sets, after all Vanilla
+/// distance, passenger, visibility, and chunk-tracking checks have been applied.
+#[allow(dead_code)]
+fn compute_tracking_diff(previous: &[i32], eligible: &[i32]) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    let old: std::collections::BTreeSet<_> = previous.iter().copied().collect();
+    let new: std::collections::BTreeSet<_> = eligible.iter().copied().collect();
+    (new.difference(&old).copied().collect(),
+     new.intersection(&old).copied().collect(),
+     old.difference(&new).copied().collect())
+}
+
+/// A square Chebyshev window. This is a scheduling primitive, not Vanilla's
+/// chunk-tracking shape; callers must supply the appropriate actual tracked set.
+#[allow(dead_code)]
+fn chunk_view_diff(old: (i32, i32), new: (i32, i32), radius: u32)
+    -> (Vec<(i32, i32)>, Vec<(i32, i32)>)
+{
+    fn window(center: (i32, i32), radius: u32) -> std::collections::BTreeSet<(i32, i32)> {
+        let r = i64::from(radius);
+        let (x, z) = (i64::from(center.0), i64::from(center.1));
+        let lo = i64::from(i32::MIN);
+        let hi = i64::from(i32::MAX);
+        (x.saturating_sub(r).max(lo)..=x.saturating_add(r).min(hi))
+            .flat_map(|cx| (z.saturating_sub(r).max(lo)..=z.saturating_add(r).min(hi))
+                .map(move |cz| (cx as i32, cz as i32)))
+            .collect()
+    }
+    if old == new { return (Vec::new(), Vec::new()); }
+    let before = window(old, radius);
+    let after = window(new, radius);
+    (after.difference(&before).copied().collect(), before.difference(&after).copied().collect())
+}
+
+/// Reorder the complete queue by horizontal look direction, keeping every entry.
+/// Center first, then forward/side/behind; ties use distance and coordinates.
+#[allow(dead_code)]
+fn prioritize_chunks(chunks: &mut [(i32, i32)], center: (i32, i32), look: (f64, f64)) {
+    let valid = look.0.is_finite() && look.1.is_finite();
+    // Scale first to avoid overflow with large finite look vectors.
+    let scale = if valid { look.0.abs().max(look.1.abs()) } else { 0.0 };
+    let direction = if scale > 0.0 { (look.0 / scale, look.1 / scale) } else { (0.0, 0.0) };
+    chunks.sort_by(|a, b| {
+        let key = |&(x, z): &(i32, i32)| {
+            let dx = i64::from(x) - i64::from(center.0);
+            let dz = i64::from(z) - i64::from(center.1);
+            let dot = dx as f64 * direction.0 + dz as f64 * direction.1;
+            let rank = if dx == 0 && dz == 0 { 0 } else if dot > 0.0 { 1 }
+                else if dot == 0.0 { 2 } else { 3 };
+            let distance = i128::from(dx) * i128::from(dx) + i128::from(dz) * i128::from(dz);
+            (rank, distance, x, z)
+        };
+        key(a).cmp(&key(b))
+    });
+}
+
+/// Block emptiness and light emptiness are independent. `air` must describe all
+/// 4096 block states (including cave/void air); each light array is 2048 bytes.
+/// The returned booleans mark sections requiring block data and light arrays,
+/// respectively. A false light bit means a known all-zero array, not absent data.
+#[allow(dead_code)]
+fn section_nonempty_masks(air: &[[bool; 4096]], light: &[[u8; 2048]]) -> (Vec<bool>, Vec<bool>) {
+    (air.iter().map(|section| section.iter().any(|&is_air| !is_air)).collect(),
+     light.iter().map(|section| section.iter().any(|&byte| byte != 0)).collect())
+}
+
 #[cfg(test)]
 mod entity_spatial_tests {
     use super::*;
+
+    #[test]
+    fn entity_spatial_tracking_ranges_and_diffs() {
+        for (name, range) in [("minecraft:marker", 0), ("arrow", 4), ("bat", 5),
+            ("item", 6), ("zombie", 8), ("cow", 10), ("end_crystal", 16),
+            ("minecraft:player", 32), ("other:cow", 5)] {
+            assert_eq!(client_tracking_range_chunks(name), range, "{name}");
+        }
+        assert_eq!(compute_tracking_diff(&[1, 2, 2, 4], &[2, 3, 3, 4]),
+            (vec![3], vec![2, 4], vec![1]));
+        assert_eq!(compute_tracking_diff(&[2, 1], &[1, 2]), (vec![], vec![1, 2], vec![]));
+        assert_eq!(compute_tracking_diff(&[], &[7]), (vec![7], vec![], vec![]));
+        assert_eq!(compute_tracking_diff(&[7], &[]), (vec![], vec![], vec![7]));
+    }
+
+    #[test]
+    fn entity_spatial_chunk_views_diff_at_borders() {
+        let (load, unload) = chunk_view_diff((-1, 0), (0, 0), 1);
+        assert_eq!(load, vec![(1, -1), (1, 0), (1, 1)]);
+        assert_eq!(unload, vec![(-2, -1), (-2, 0), (-2, 1)]);
+        assert_eq!(chunk_view_diff((0, 0), (0, 0), 3), (vec![], vec![]));
+        let (load, unload) = chunk_view_diff((0, 0), (1, 1), 1);
+        assert_eq!(load.len(), 5);
+        assert_eq!(unload.len(), 5);
+        assert!(load.contains(&(2, 2)) && unload.contains(&(-1, -1)));
+        assert_eq!(chunk_view_diff((i32::MAX, 0), (i32::MAX - 1, 0), 1).0,
+            vec![(i32::MAX - 2, -1), (i32::MAX - 2, 0), (i32::MAX - 2, 1)]);
+    }
+
+    #[test]
+    fn entity_spatial_chunk_priority_keeps_all_chunks() {
+        let mut chunks: Vec<_> = (-2..=2).flat_map(|x| (-2..=2).map(move |z| (x, z))).collect();
+        let original = chunks.clone();
+        prioritize_chunks(&mut chunks, (0, 0), (1.0, 0.0));
+        assert_eq!(chunks[0], (0, 0));
+        assert!(chunks[1..11].iter().all(|&(x, _)| x > 0));
+        assert!(chunks[15..].iter().all(|&(x, _)| x < 0));
+        let mut sorted = chunks.clone(); sorted.sort_unstable();
+        assert_eq!(sorted, original);
+        chunks.reverse();
+        prioritize_chunks(&mut chunks, (0, 0), (1.0, 0.0));
+        assert_ne!(chunks, original);
+        let mut repeated = original.clone();
+        prioritize_chunks(&mut repeated, (0, 0), (1.0, 0.0));
+        assert_eq!(chunks, repeated);
+        prioritize_chunks(&mut chunks, (0, 0), (f64::NAN, 0.0));
+        assert_eq!(chunks[0], (0, 0));
+    }
+
+    #[test]
+    fn entity_spatial_section_masks_keep_light_in_air() {
+        let mut air = vec![[true; 4096]; 3];
+        air[1][4095] = false;
+        let mut light = vec![[0; 2048]; 4];
+        light[0][0] = 0xff;
+        light[2][2047] = 1;
+        assert_eq!(section_nonempty_masks(&air, &light),
+            (vec![false, true, false], vec![true, false, true, false]));
+        assert_eq!(section_nonempty_masks(&[], &[]), (vec![], vec![]));
+    }
 
     fn make_test_entity(idx: usize, eid: i32, x: f64, y: f64, z: f64, w: f32, h: f32) -> SpatialEntity {
         SpatialEntity {
