@@ -1,6 +1,44 @@
 use super::*;
 use crate::effects::*;
 
+#[test]
+fn player_attack_damage_id_uses_the_replayed_registry_order() {
+    fn registry(entries: &[&str]) -> (i64, Vec<u8>) {
+        fn name(packet: &mut Vec<u8>, value: &str) {
+            write_varint(packet, value.len() as i64);
+            packet.extend_from_slice(value.as_bytes());
+        }
+        let mut packet = vec![0x07];
+        name(&mut packet, "minecraft:damage_type");
+        write_varint(&mut packet, entries.len() as i64);
+        for entry in entries {
+            name(&mut packet, entry);
+            packet.extend_from_slice(&[1, 10, 0]); // present, empty unnamed compound
+        }
+        (0x07, packet)
+    }
+
+    let attack = "minecraft:player_attack";
+    let generic = "minecraft:generic";
+    assert_eq!(
+        player_attack_damage_wire_id(&[registry(&[attack, generic])]),
+        Some(0)
+    );
+    assert_eq!(
+        player_attack_damage_wire_id(&[registry(&[generic, attack])]),
+        Some(1)
+    );
+    assert_eq!(player_attack_damage_wire_id(&[registry(&[generic])]), None);
+    assert_eq!(
+        player_attack_damage_wire_id(&[registry(&[attack, attack])]),
+        None
+    );
+
+    let (id, mut truncated) = registry(&[attack, generic]);
+    truncated.pop();
+    assert_eq!(player_attack_damage_wire_id(&[(id, truncated)]), None);
+}
+
 pub(super) fn client_pair() -> (Client, TcpStream) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let receiver = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -13,6 +51,7 @@ pub(super) fn client_pair() -> (Client, TcpStream) {
         eid: 4242,
         uuid: [0; 16],
         name: "totem-test".into(),
+        player_attack_damage_id: None,
         pos: Mutex::new((0.0, 70.0, 0.0, 0.0, 0.0, true)),
         teleport: Mutex::new(Default::default()),
         hp: Mutex::new(20.0),
@@ -247,7 +286,7 @@ fn vulnerability_follows_vanillas_invulnerable_time_rule() {
     let (c, _sock) = client_pair();
 
     // a first hit applies in full and arms the twenty-tick window
-    assert_eq!(damage_after_invulnerability(&c, 5.0), Some(5.0));
+    assert_eq!(damage_after_invulnerability(&c, 5.0), Some((5.0, true)));
     assert_eq!(*c.invulnerable.lock().unwrap(), 20);
     assert_eq!(*c.last_hurt.lock().unwrap(), 5.0);
 
@@ -265,8 +304,8 @@ fn vulnerability_follows_vanillas_invulnerable_time_rule() {
     );
     assert_eq!(
         damage_after_invulnerability(&c, 8.0),
-        Some(3.0),
-        "a stronger hit applies only the difference"
+        Some((3.0, false)),
+        "a stronger hit applies only the difference without a new hurt event"
     );
     assert_eq!(
         *c.invulnerable.lock().unwrap(),
@@ -281,7 +320,7 @@ fn vulnerability_follows_vanillas_invulnerable_time_rule() {
 
     // at ten ticks the full-immunity window is over
     *c.invulnerable.lock().unwrap() = 10;
-    assert_eq!(damage_after_invulnerability(&c, 1.0), Some(1.0));
+    assert_eq!(damage_after_invulnerability(&c, 1.0), Some((1.0, true)));
     assert_eq!(*c.invulnerable.lock().unwrap(), 20);
     assert_eq!(*c.last_hurt.lock().unwrap(), 1.0);
 }
@@ -291,7 +330,7 @@ fn vulnerability_follows_vanillas_invulnerable_time_rule() {
 #[test]
 fn a_rejected_hit_changes_nothing() {
     let (c, _sock) = client_pair();
-    assert_eq!(damage_after_invulnerability(&c, 4.0), Some(4.0));
+    assert_eq!(damage_after_invulnerability(&c, 4.0), Some((4.0, true)));
     *c.invulnerable.lock().unwrap() = 15;
     assert_eq!(damage_after_invulnerability(&c, 4.0), None);
     assert_eq!(*c.last_hurt.lock().unwrap(), 4.0);

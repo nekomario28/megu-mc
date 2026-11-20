@@ -460,6 +460,7 @@ mod entity_push_tests {
             eid,
             uuid: [9u8; 16],
             name: format!("push_tester_{eid}"),
+            player_attack_damage_id: None,
             pos: Mutex::new((x, y, z, 0.0, 0.0, true)),
             teleport: Mutex::new(Default::default()),
             hp: Mutex::new(20.0),

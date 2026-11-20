@@ -341,6 +341,7 @@ struct Client {
     eid: i32,
     uuid: [u8; 16],
     name: String,
+    player_attack_damage_id: Option<i32>,
     pos: Mutex<(f64, f64, f64, f32, f32, bool)>,
     teleport: Mutex<connection_limits::TeleportSync>,
     hp: Mutex<f32>,
@@ -4306,7 +4307,7 @@ fn arrow_tick() {
             let blocked_ar = *c.blocking.lock().unwrap()
                 && c.shield_cd.lock().unwrap().elapsed() > Duration::from_secs(5);
             // a rejected hit must not cost shield durability (vanilla returns before that)
-            let Some(ad) = damage_after_invulnerability(c, if blocked_ar { 0.0 } else { admg })
+            let Some((ad, _)) = damage_after_invulnerability(c, if blocked_ar { 0.0 } else { admg })
             else {
                 continue;
             };
@@ -4383,7 +4384,7 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
         let dd = ((px - ex).powi(2) + (py - ey).powi(2) + (pz - ez).powi(2)).sqrt();
         if dd < power * 1.5 && *cl.gm.lock().unwrap() != 1 {
             let raw = ((power * 1.5 - dd) * 3.0) as f32;
-            let Some(accepted) = damage_after_invulnerability(&cl, raw) else {
+            let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) else {
                 continue;
             };
             let mut h = cl.hp.lock().unwrap();
@@ -5851,7 +5852,7 @@ fn live_mob_damage_player(
     if damage <= 0.0 {
         return false;
     }
-    let Some(accepted) = damage_after_invulnerability(player, damage) else {
+    let Some((accepted, _)) = damage_after_invulnerability(player, damage) else {
         return false;
     };
     let damage_taken = protection_kind.map_or(accepted, |kind| dmg_after(player, accepted, kind));
@@ -19379,6 +19380,55 @@ fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
     out
 }
 
+fn player_attack_damage_wire_id(config: &[(i64, Vec<u8>)]) -> Option<i32> {
+    fn name<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
+        let len = usize::try_from(read_protocol_i32(input)?).ok()?;
+        let (name, rest) = input.split_at_checked(len)?;
+        *input = rest;
+        Some(name)
+    }
+
+    let mut registry = None;
+    for (_, packet) in config.iter().filter(|(id, _)| *id == 0x07) {
+        let mut input = packet.as_slice();
+        if read_protocol_i32(&mut input)? != 0x07 {
+            return None;
+        }
+        if name(&mut input)? == b"minecraft:damage_type" && registry.replace(input).is_some() {
+            return None;
+        }
+    }
+    let mut input = registry?;
+    let count = read_protocol_i32(&mut input)?;
+    if !(0..=4096).contains(&count) {
+        return None;
+    }
+    let mut found = None;
+    for id in 0..count {
+        let entry = name(&mut input)?;
+        let (&has_nbt, payload) = input.split_first()?;
+        input = payload;
+        match has_nbt {
+            0 => {}
+            1 => {
+                let mut end = 0;
+                if !nbt_wire_skip(input, &mut end, 0) {
+                    return None;
+                }
+                input = &input[end..];
+            }
+            _ => return None,
+        }
+        if entry == b"minecraft:player_attack" && found.replace(id).is_some() {
+            return None;
+        }
+    }
+    if !input.is_empty() {
+        return None;
+    }
+    found
+}
+
 // ---------- chunks ----------
 /// Slots in the palette writer's stack hash table: a power of two above twice the largest
 /// palette a call can build (256 entries), so the probe run at a 50% load factor is short.
@@ -22950,6 +23000,30 @@ fn hurt_anim(eid: i32) -> Vec<u8> {
     p.extend_from_slice(&0f32.to_be_bytes());
     p
 }
+fn broadcast_player_attack_damage(victim: i32, attacker: i32, dim: DimId) {
+    fanout_in(
+        &client_snapshot(),
+        |client| {
+            if client.player_attack_damage_id.is_none() || *client.dim.lock().unwrap() != dim {
+                return false;
+            }
+            client.eid == victim || client.seen.lock().unwrap().contains(&victim)
+        },
+        |client| {
+            let mut body = Vec::new();
+            write_varint(&mut body, i64::from(victim));
+            write_varint(
+                &mut body,
+                i64::from(client.player_attack_damage_id.unwrap()),
+            );
+            // Minecraft's optional entity IDs encode the ID plus one, reserving zero for None.
+            write_varint(&mut body, i64::from(attacker) + 1);
+            write_varint(&mut body, i64::from(attacker) + 1);
+            body.push(0); // No explicit source position for an entity attack.
+            (0x1a, body)
+        },
+    );
+}
 fn health_pkt(hp: f32, food: i32, sat: f32) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&hp.to_be_bytes());
@@ -25421,11 +25495,10 @@ fn food_effects(item: i64) -> &'static [(u64, i32, i32, i32)] {
 /// ticks after the hit that started it. Otherwise the hit applies in full and
 /// the timer is set to 20 ticks.
 ///
-/// Returns the damage the caller should apply (before armour, absorption and
-/// effects, which vanilla also applies to this number), or `None` for a hit
-/// that is rejected outright - the caller must then leave health, armour and
-/// the shield alone.
-fn damage_after_invulnerability(c: &Client, amount: f32) -> Option<f32> {
+/// Returns accepted damage before armour, absorption and effects, plus whether
+/// this starts a new hurt window. Vanilla sends Damage Event on that new window.
+/// A rejected hit leaves health, armour and the shield alone.
+fn damage_after_invulnerability(c: &Client, amount: f32) -> Option<(f32, bool)> {
     let mut invulnerable = c.invulnerable.lock().unwrap();
     let mut last_hurt = c.last_hurt.lock().unwrap();
     if *invulnerable > 10 {
@@ -25434,11 +25507,11 @@ fn damage_after_invulnerability(c: &Client, amount: f32) -> Option<f32> {
         }
         let difference = amount - *last_hurt;
         *last_hurt = amount;
-        return Some(difference);
+        return Some((difference, false));
     }
     *last_hurt = amount;
     *invulnerable = server_ticks(20) as i32;
-    Some(amount)
+    Some((amount, true))
 }
 
 fn hurt_absorb(c: &Client, dmg: f32) -> f32 {
@@ -30407,6 +30480,7 @@ fn handle(mut s: TcpStream) {
             u
         },
         name: name.clone(),
+        player_attack_damage_id: player_attack_damage_wire_id(&cfg),
         pos: Mutex::new((sx, sy, sz, syaw, spitch, true)),
         teleport: Mutex::new(teleport),
         hp: Mutex::new(20.0),
@@ -32200,7 +32274,8 @@ fn handle(mut s: TcpStream) {
                                         .max(0.0)
                                         * (0.2 + 0.8 * chg * chg)
                                         * if crt { 1.5 } else { 1.0 };
-                                    let Some(accepted) = damage_after_invulnerability(v, dmg)
+                                    let Some((accepted, starts_hurt_window)) =
+                                        damage_after_invulnerability(v, dmg)
                                     else {
                                         continue;
                                     };
@@ -32246,6 +32321,15 @@ fn handle(mut s: TcpStream) {
                                         broadcast(-1, |_c| (0x68, snd.clone()));
                                     }
                                     held_slot_resync(&me);
+                                    if starts_hurt_window && !vb && dmg > 0.0 {
+                                        let attacker_dim = *me.dim.lock().unwrap();
+                                        let victim_dim = *v.dim.lock().unwrap();
+                                        if attacker_dim == victim_dim {
+                                            broadcast_player_attack_damage(
+                                                v.eid, me.eid, victim_dim,
+                                            );
+                                        }
+                                    }
                                     if let Ok(mut w) = v.sock.lock() {
                                         let _ = send_packet(&mut w, 0x24, hurt_anim(v.eid));
                                         let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, v));
