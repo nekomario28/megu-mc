@@ -125,7 +125,15 @@ fn attack_cooldown(item: i64) -> f64 {
 }
 
 fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
-    let cd = attack_cooldown(item);
+    let speed = me.effs.lock().unwrap().iter().fold(1.0_f32, |speed, effect| {
+        match effect.id {
+            2 | 3 => speed * effects::effect_attribute_modifier(
+                effect.id + 1, effect.amp, effects::EffectAttribute::AttackSpeed,
+            ),
+            _ => speed,
+        }
+    });
+    let cd = attack_cooldown(item) / f64::from(speed.max(0.001));
     let mut lm = me.last_melee.lock().unwrap();
     let c = (lm.elapsed().as_secs_f64() / cd).min(1.0) as f32;
     *lm = Instant::now();
@@ -233,7 +241,7 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
             let Some(st) = inv.get_mut(&slot) else {
                 continue;
             };
-            let Some(maxd) = armor_max_damage(st.0).or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE))
+            let Some(maxd) = comp_varint(&st.2, COMP_MAX_DAMAGE).or_else(|| armor_max_damage(st.0))
             else {
                 continue;
             };
@@ -243,7 +251,8 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
             let unb = enchant_level(&st.2, 39);
             let mut add = 0i64;
             for _ in 0..per {
-                if unb == 0 || world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
+                let roll = (world_rng::next_u64() >> 40) as f32 / (1u32 << 24) as f32;
+                if unbreaking_consumes_durability(unb as i32, roll, true) {
                     add += 1
                 }
             }
@@ -1684,6 +1693,22 @@ fn tick_player_food(c: &Client, hp: &mut f32, max_hp: f32, exhaustion: f32, t: u
 }
 
 fn reset_player_food(c: &Client) {
+    let effects = std::mem::take(&mut *c.effs.lock().unwrap());
+    for effect in effects {
+        let packet = remove_effect_pkt(c.eid, effect.id);
+        if let Ok(mut sock) = c.sock.lock() {
+            let _ = send_packet(&mut sock, 0x43, packet.clone());
+        }
+        broadcast_seen(c.eid, |_| (0x43, packet.clone()));
+    }
+    *c.absorb.lock().unwrap() = 0.0;
+    *c.air.lock().unwrap() = server_ticks(AIR_SUPPLY_GT) as i32;
+    *c.invulnerable.lock().unwrap() = 0;
+    *c.last_hurt.lock().unwrap() = 0.0;
+    *c.blocking.lock().unwrap() = false;
+    *c.sprinting.lock().unwrap() = false;
+    *c.sneaking.lock().unwrap() = false;
+    *c.fall_fly.lock().unwrap() = false;
     let mut sessions = player_mechanism_sessions().lock().unwrap();
     if let Some(session) = sessions.get_mut(&c.eid) {
         session.food_timer = 0;

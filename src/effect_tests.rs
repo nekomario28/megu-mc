@@ -2,6 +2,54 @@ use super::*;
 use crate::effects::*;
 
 #[test]
+fn respawn_reset_clears_transient_state_and_retains_inventory() {
+    let (client, _receiver) = client_pair();
+    client.inv.lock().unwrap().insert(45, (1, 1, Vec::new()));
+    client.effs.lock().unwrap().push(Eff { id: 1, amp: 0, left: 100 });
+    *client.absorb.lock().unwrap() = 4.0;
+    *client.air.lock().unwrap() = 0;
+    *client.invulnerable.lock().unwrap() = 10;
+    *client.last_hurt.lock().unwrap() = 5.0;
+    *client.blocking.lock().unwrap() = true;
+    *client.food.lock().unwrap() = 2;
+    reset_player_food(&client);
+    assert!(client.effs.lock().unwrap().is_empty());
+    assert_eq!(*client.absorb.lock().unwrap(), 0.0);
+    assert_eq!(*client.air.lock().unwrap(), AIR_SUPPLY_GT as i32);
+    assert_eq!(*client.invulnerable.lock().unwrap(), 0);
+    assert_eq!(*client.last_hurt.lock().unwrap(), 0.0);
+    assert!(!*client.blocking.lock().unwrap());
+    assert_eq!(*client.food.lock().unwrap(), 20);
+    assert!(client.inv.lock().unwrap().contains_key(&45));
+}
+
+#[test]
+fn attack_speed_effects_change_live_melee_charge() {
+    let (client, _receiver) = client_pair();
+    let client = Arc::new(client);
+    let sword = name_to_item("diamond_sword").unwrap();
+    *client.last_melee.lock().unwrap() = Instant::now() - Duration::from_millis(300);
+    let normal = melee_charge(&client, sword);
+    client.effs.lock().unwrap().push(Eff { id: 2, amp: 1, left: 100 });
+    *client.last_melee.lock().unwrap() = Instant::now() - Duration::from_millis(300);
+    let haste = melee_charge(&client, sword);
+    assert!(haste > normal * 1.1 && haste < 1.0);
+}
+
+#[test]
+fn armor_damage_honors_custom_maximum_and_breaks() {
+    let (client, _receiver) = client_pair();
+    let client = Arc::new(client);
+    let mut comps = Vec::new();
+    comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 2);
+    client.inv.lock().unwrap().insert(5, (name_to_item("iron_helmet").unwrap(), 1, comps));
+    damage_armor(&client, 4.0);
+    assert_eq!(comp_varint(&client.inv.lock().unwrap()[&5].2, COMP_DAMAGE), Some(1));
+    damage_armor(&client, 4.0);
+    assert!(!client.inv.lock().unwrap().contains_key(&5));
+}
+
+#[test]
 fn player_attack_damage_id_uses_the_replayed_registry_order() {
     fn registry(entries: &[&str]) -> (i64, Vec<u8>) {
         fn name(packet: &mut Vec<u8>, value: &str) {
