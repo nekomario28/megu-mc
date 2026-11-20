@@ -1791,20 +1791,17 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     let old_actors = std::mem::take(&mut *actors().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (old_hot, old_warm) = test_region();
-    let old_anchors: Vec<_> = [&KEEPALIVE_AT, &TIME_NOTIFY_AT, &SIZE_LOG_AT]
+    let old_anchors: Vec<_> = [&TIME_NOTIFY_AT, &SIZE_LOG_AT]
         .iter()
         .map(|cell| *wall_anchor(cell).lock().unwrap())
         .collect();
     // Re-anchor every period so this test starts from a known wall clock and
     // cannot inherit an anchor another test initialized long ago.
-    for cell in [&KEEPALIVE_AT, &TIME_NOTIFY_AT, &SIZE_LOG_AT] {
+    for cell in [&TIME_NOTIFY_AT, &SIZE_LOG_AT] {
         *wall_anchor(cell).lock().unwrap() = Instant::now();
     }
     clients().lock().unwrap().push(Arc::new(client));
-    // 40 is the old keepalive divisor and 4 the old time-notify divisor, so a
-    // tick-count implementation would have fired both within these 40 ticks.
-    // 40 ticks cost microseconds against a 1s period, so elapsed time cannot
-    // legitimately reach it here.
+    // Neither packet should originate from the fresh timing anchors.
     let mut seen = Vec::new();
     while let Some((packet, _)) =
         read_packet(&mut receiver, Instant::now() + Duration::from_secs(1))
@@ -1815,8 +1812,6 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     }
     // Rewinding an anchor past its period must make the next tick fire it,
     // which is what proves the mechanism is a wall clock and not a counter.
-    *wall_anchor(&KEEPALIVE_AT).lock().unwrap() =
-        Instant::now() - Duration::from_millis(KEEPALIVE_MS + 1);
     *wall_anchor(&TIME_NOTIFY_AT).lock().unwrap() =
         Instant::now() - Duration::from_millis(TIME_NOTIFY_MS + 1);
     game_tick(|_, tick| tick());
@@ -1836,21 +1831,14 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     *actors().lock().unwrap() = old_actors;
     *forceloaded().lock().unwrap() = old_forced;
     set_test_region(old_hot, old_warm);
-    for (cell, anchor) in [&KEEPALIVE_AT, &TIME_NOTIFY_AT, &SIZE_LOG_AT]
-        .iter()
-        .zip(old_anchors)
-    {
+    for (cell, anchor) in [&TIME_NOTIFY_AT, &SIZE_LOG_AT].iter().zip(old_anchors) {
         *wall_anchor(cell).lock().unwrap() = anchor;
     }
     assert!(
         seen.is_empty(),
         "tick-count boundaries fired immediately: {seen:?}"
     );
-    assert_eq!(
-        fired.len(),
-        2,
-        "expected exactly one keepalive and one time notify: {fired:?}"
-    );
+    assert_eq!(fired, [0x64], "environment tick only sends time notifications");
     assert_eq!(TICKS_PER_SECOND as u64 * TICK_MS, 1000);
 }
 
@@ -4957,7 +4945,7 @@ fn gp2_nightly_hostiles_spawn_packs_and_stop_at_the_cap() {
             .collect();
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
-        keepalive_time_tick();
+        environment_time_tick();
 
         let mobs = mobs().lock().unwrap();
         let new_mobs = &mobs[existing..];
@@ -5015,7 +5003,7 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
         WORLD_TIME.store(18000, Ordering::Relaxed);
-        keepalive_time_tick();
+        environment_time_tick();
         let spawned = mobs().lock().unwrap();
         assert!(spawned.len() <= 1);
         spawned.first().map(|mob| {
@@ -5167,7 +5155,7 @@ fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
         WORLD_TIME.store(18000, Ordering::Relaxed);
-        keepalive_time_tick();
+        environment_time_tick();
 
         let actual = mobs().lock().unwrap().len();
         let expected = existing + usize::from(spawn);
@@ -5282,7 +5270,7 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
         WORLD_TIME.store(18000, Ordering::Relaxed);
-        keepalive_time_tick();
+        environment_time_tick();
 
         let actual: Vec<_> = mobs().lock().unwrap().iter().map(|mob| mob.etype).collect();
         if actual.as_slice() != expected.as_slice() {
@@ -5299,7 +5287,7 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
     SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
     TICK.store(tick, Ordering::Relaxed);
     WORLD_TIME.store(18000, Ordering::Relaxed);
-    keepalive_time_tick();
+    environment_time_tick();
     let mob_count = mobs().lock().unwrap().len();
     if mob_count != 1 {
         failures.push(format!(
@@ -5373,7 +5361,7 @@ fn gp2_nightly_hostiles_respect_spawn_light() {
         mobs().lock().unwrap().clear();
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
-        keepalive_time_tick();
+        environment_time_tick();
 
         let actual = mobs().lock().unwrap().len();
         if actual != usize::from(expected) {

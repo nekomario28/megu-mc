@@ -3155,7 +3155,7 @@ fn merge_xp_orbs(xl: &mut [Xp]) -> Vec<i32> {
     }
     merged
 }
-fn keepalive_time_tick() {
+fn environment_time_tick() {
     // One region borrow for the stage. A static scan confirmed that nothing this
     // stage calls re-enters the region lock.
     //
@@ -34826,7 +34826,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
             step(name, f);
         }
     };
-    run("environment", keepalive_time_tick);
+    run("environment", environment_time_tick);
     TICK_IDX.fetch_add(1, Ordering::Relaxed);
     run("hot_regions", refresh_hot);
     run("scheduled_blocks", scheduled_block_tick);
