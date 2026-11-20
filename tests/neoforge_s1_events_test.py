@@ -30,7 +30,9 @@ import net.neoforged.fml.common.Mod;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.level.BlockEvent;
+import net.neoforged.neoforge.event.entity.living.LivingDamageEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.event.ServerChatEvent;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.minecraft.commands.Commands;
@@ -39,11 +41,12 @@ import net.mcspine.neoforge.ServerHooks;
 @Mod("s1fixture")
 public class FixtureMod {
   public static int breakCount, placeCount, logoutCount, farmlandCount;
+  public static String tickPhases = "";
   public FixtureMod() { NeoForge.EVENT_BUS.register(this); }
 
   @SubscribeEvent public void onBreak(BlockEvent.BreakEvent event) {
     breakCount++;
-    if (event.getPos().x() == 100) {
+    if (event.getPos().getX() == 100) {
       event.getPlayer().sendSystemMessage(Component.literal("reverted break"));
       event.setCanceled(true);
       return;
@@ -73,6 +76,24 @@ public class FixtureMod {
   @SubscribeEvent public void onLogout(PlayerEvent.PlayerLoggedOutEvent event) {
     logoutCount++;
     event.getEntity().sendSystemMessage(Component.literal("bye"));
+  }
+
+  @SubscribeEvent public void onTickPre(ServerTickEvent.Pre event) {
+    tickPhases += event.hasTime() ? "pre/" : "bad/";
+  }
+
+  @SubscribeEvent public void onTickPost(ServerTickEvent.Post event) {
+    tickPhases += event.hasTime() ? "bad" : "post";
+  }
+
+  @SubscribeEvent public void onDamage(LivingDamageEvent.Pre event) {
+    var player = (net.minecraft.world.entity.player.Player) event.getEntity();
+    player.sendSystemMessage(Component.literal("damage callback"));
+    var container = event.getContainer();
+    if (event.getOriginalDamage() != container.getOriginalDamage() || event.getNewDamage() != container.getNewDamage())
+      throw new AssertionError("damage container input");
+    container.setNewDamage(container.getNewDamage() - 1);
+    event.setNewDamage(event.getOriginalDamage() == 100 ? Float.NaN : event.getNewDamage() / 2);
   }
 
   @SubscribeEvent public void onFarmland(BlockEvent.FarmlandTrampleEvent event) {
@@ -284,6 +305,24 @@ public class S1Checks {
     checkOverflow(player, () -> ServerHooks.onServerChat(player, "loop"));
     System.out.println("PASS real event bus reentrancy depth >4 rollback and subsequent recovery");
   }
+  static void hostEvents(ServerPlayer player) {
+    check(ServerHooks.onServerTickPre(true).mutations().isEmpty(), "pre tick outcome");
+    check(ServerHooks.onServerTickPost(false).mutations().isEmpty(), "post tick outcome");
+    check(FixtureMod.tickPhases.equals("pre/post"), "tick phases and budgets");
+
+    var damage = ServerHooks.onLivingDamagePre(player, 20, 7);
+    check(damage.damage() == 3 && damage.mutations().equals(List.of(
+        new MutationBuffer.SendSystemMessage(42, "damage callback"))), "damage and buffered effects");
+    try {
+      ServerHooks.onLivingDamagePre(player, 100, 7);
+      throw new AssertionError("invalid damage committed");
+    } catch (IllegalArgumentException expected) {
+      check(expected.getMessage().equals("Invalid host damage amount"), "damage validation");
+    }
+    check(MutationBuffer.depth() == 0 && MutationBuffer.commitBatch().isEmpty(), "damage rollback");
+    check(ServerHooks.onLivingDamagePre(player, 15, 5).damage() == 2, "damage dispatch recovery");
+    System.out.println("PASS host tick phases and pre-absorption damage");
+  }
   static void checkOverflow(ServerPlayer player, Runnable dispatch) {
     boolean failedClosed = false;
     try {
@@ -311,6 +350,7 @@ public class S1Checks {
       case "encoded" -> encoded(player);
       case "scopes" -> scopes();
       case "overflow" -> overflow(player);
+      case "host-events" -> hostEvents(player);
       default -> throw new AssertionError(args[0]);
     }
     Bootstrap.close();
@@ -411,6 +451,11 @@ class NeoForgeS1EventsTests(unittest.TestCase):
         result = self.run_java("net.mcspine.neoforge.S1Checks", "overflow", self.mod_dir.parent)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("PASS real event bus reentrancy", result.stdout)
+
+    def test_host_tick_phases_and_damage_round_trip(self):
+        result = self.run_java("net.mcspine.neoforge.S1Checks", "host-events", self.mod_dir.parent)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("PASS host tick phases and pre-absorption damage", result.stdout)
 
 
 if __name__ == "__main__":

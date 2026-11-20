@@ -5,6 +5,11 @@ import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.level.Level;
 
 /** Bounded, single-use payload codec view. */
 public class FriendlyByteBuf {
@@ -104,6 +109,24 @@ public class FriendlyByteBuf {
         } catch (CharacterCodingException error) {
             throw fail("Invalid S4 UTF-8");
         }
+    }
+
+    public <T> ResourceKey<T> readResourceKey(ResourceKey<? extends Registry<T>> registry) {
+        if (!Registries.DIMENSION.equals(registry)) throw fail("Unsupported S4 resource key registry");
+        String encoded = readUtf();
+        ResourceLocation location;
+        try {
+            location = ResourceLocation.parse(encoded);
+        } catch (IllegalArgumentException error) {
+            throw fail("Invalid S4 resource location");
+        }
+        if (!Level.supportsDimension(location)) throw fail("Unsupported S4 dimension: " + location);
+        return ResourceKey.create(registry, location);
+    }
+
+    public FriendlyByteBuf writeResourceLocation(ResourceLocation location) {
+        if (location == null) throw fail("Missing S4 resource location");
+        return writeUtf(location.toString());
     }
 
     public byte[] readByteArray() { return readByteArray(MAX_PAYLOAD); }

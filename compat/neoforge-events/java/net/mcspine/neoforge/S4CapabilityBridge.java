@@ -38,6 +38,7 @@ public final class S4CapabilityBridge {
     private S4CapabilityBridge() { }
 
     static void bindBlock(int id, Block block) { BLOCKS.put(id, block); }
+    static Block blockForState(int state) { return BLOCKS.get(state); }
     static void bindItem(int id, Item item) {
         // S2 allows aliases; a stack cannot represent their distinct numeric IDs.
         ITEM_IDS.merge(item, id, (first, second) -> -1);
@@ -112,7 +113,7 @@ public final class S4CapabilityBridge {
         if (state != null && !snapshot.state.equals(state) || blockEntity != null && blockEntity != snapshot) {
             throw fail("S4 capability lookup has inconsistent snapshot input");
         }
-        var providers = PROVIDERS.get(BLOCKS.get(snapshot.state.stateId()));
+        var providers = PROVIDERS.get(blockForState(snapshot.state.stateId()));
         if (providers == null) return null;
         if (snapshot.depth == 4) throw fail("S4 capability dispatch depth exceeds 4");
         snapshot.depth++;
@@ -179,6 +180,7 @@ public final class S4CapabilityBridge {
             if (slot < 0 || slot >= slots.length) throw fail("Invalid S4 snapshot slot");
         }
 
+        @Override public Level getLevel() { check(); return level; }
         public int getContainerSize() { check(); return slots.length; }
         public int getMaxStackSize() { check(); return limit; }
         public ItemStack getItem(int slot) { checkSlot(slot); return slots[slot].copy(); }

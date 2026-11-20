@@ -42,7 +42,11 @@ coverage, client-side exclusions, annotations, rejected symbols and precise
 reason codes. Exit 0 means `COMPATIBLE`, exit 2 means `REJECTED`, and exit 1
 means command or I/O failure. The check is static and does not start a server.
 Mixin transformations and access transformers are unsupported in S0 and fail
-closed. `COMPATIBLE` describes the pinned shim surface, not arbitrary Mod
+closed. Mixin injection points are inspected in both scalar annotations and
+annotation arrays. Access-transformer detection covers TOML declarations,
+manifest attributes, and matching config names under `META-INF/`. A config
+found through multiple routes produces one diagnostic for its resource path.
+`COMPATIBLE` describes the pinned shim surface, not arbitrary Mod
 runtime behavior. For tight `/tmp` environments the wrapper uses `target/tmp`.
 
 ## NF-3 block and item registration
@@ -137,3 +141,29 @@ require host integration.
 
 `tests/neoforge_s4_network_test.py` validates the exact shim surface and
 exercises the new bridge through real Rust JNI with a synthetic mod.
+
+## NF-6 bounded facade additions
+
+`Level.dimension()` maps host slots 0, 1 and 2 to the interned Overworld,
+Nether and End keys. The legacy farmland JNI callback has no dimension input,
+so its level refuses `dimension()` access. S4 resource-key decoding accepts
+only `Registries.DIMENSION` and those three locations. S4 capability providers
+can access their query's level through `BlockEntity.getLevel()` while the
+query is active.
+
+Inside an S3 activation, `TickContext.level()` exposes the cell snapshot.
+`LevelAccessor.scheduleTick` on that level emits an S3 schedule operation
+for the same cell and its S2-registered block, at normal priority. A stale
+snapshot, mismatched cell or block, or negative delay fails the batch. The
+S3 v1 frame uses the source activation to identify the block. The host owns
+consumption of these proposals and the live schedule.
+
+`ServerHooks` provides owner-only entry points for `ServerTickEvent.Pre`,
+`ServerTickEvent.Post` and `LivingDamageEvent.Pre`. The caller supplies each
+tick phase and its available-time flag, or the living entity and original and
+post-reduction damage amounts. Damage listeners can update the shared damage
+container. The hook returns the resulting finite, nonnegative amount and
+the S1 mutation batch, or discards the batch on failure. These entry points
+require explicit calls from the host. Production Rust tick and damage routing,
+block entity dirty tracking and arbitrary NeoForge tickers are outside this
+surface.

@@ -2,9 +2,9 @@ package net.minecraft.world.entity.player;
 
 import net.mcspine.neoforge.MutationBuffer;
 import net.minecraft.network.chat.Component;
-import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
 
-public class Player extends Entity {
+public class Player extends LivingEntity {
     private final int eid;
     private final Component name;
 

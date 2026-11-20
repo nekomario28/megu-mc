@@ -25,6 +25,7 @@ import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.Container;
+import net.minecraft.world.level.Level;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.capabilities.Capabilities;
@@ -55,6 +56,9 @@ public final class S4Mod {
         bus.addListener(RegisterCapabilitiesEvent.class, event -> {
             event.registerBlock(Capabilities.ItemHandler.BLOCK, (level, pos, state, be, side) -> {
                 if (level.getBlockState(pos) != state || state.stateId() != 26685) throw new AssertionError("bad snapshot");
+                if (be.getLevel() != level || be.getLevel().dimension() != Level.END) {
+                    throw new AssertionError("wrong block entity level or dimension");
+                }
                 if (side == Direction.DOWN) return null;
                 return new InvWrapper((Container) be);
             }, container.get());
@@ -76,8 +80,8 @@ public final class S4Mod {
     }
 
     private static StreamCodec<RegistryFriendlyByteBuf, Message> codec(CustomPacketPayload.Type<Message> type) {
-        return StreamCodec.of(
-            (buf, msg) -> buf.writeVarInt(msg.command()).writeVarInt(msg.depth()).writeByteArray(msg.data()),
+        return CustomPacketPayload.codec(
+            (msg, buf) -> buf.writeVarInt(msg.command()).writeVarInt(msg.depth()).writeByteArray(msg.data()),
             buf -> new Message(type, buf.readVarInt(), buf.readVarInt(), buf.readByteArray()));
     }
 
@@ -127,6 +131,58 @@ public final class S4Mod {
                 for (int i = 0; i < 8; i++) context.reply(new Message(OUT, 7, 0, new byte[32763]));
             }
             default -> throw new AssertionError("unexpected command");
+        }
+    }
+}
+"""
+
+DIMENSION_CODEC = """
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.level.Level;
+
+public record DimensionCheck(ResourceKey<Level> dimension) implements CustomPacketPayload {
+    private static final Type<DimensionCheck> TYPE = new Type<>(ResourceLocation.parse("nf5_fixture:dimension"));
+    private static final StreamCodec<RegistryFriendlyByteBuf, DimensionCheck> CODEC = CustomPacketPayload.codec(
+        (msg, buffer) -> buffer.writeResourceLocation(msg.dimension().location()),
+        buffer -> new DimensionCheck(buffer.readResourceKey(Registries.DIMENSION)));
+
+    public Type<DimensionCheck> type() { return TYPE; }
+
+    public static void main(String[] args) {
+        ResourceKey<?>[] keys = {Level.OVERWORLD, Level.NETHER, Level.END};
+        String[] names = {"minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"};
+        for (int slot = 0; slot < keys.length; slot++) {
+            var key = new Level(slot).dimension();
+            var output = new RegistryFriendlyByteBuf(null);
+            CODEC.encode(output, new DimensionCheck(key));
+            byte[] name = names[slot].getBytes(StandardCharsets.UTF_8);
+            byte[] wire = new byte[name.length + 1];
+            wire[0] = (byte) name.length;
+            System.arraycopy(name, 0, wire, 1, name.length);
+            if (key != keys[slot] || !Arrays.equals(output.finish(), wire)) throw new AssertionError("dimension wire or slot");
+            var input = new RegistryFriendlyByteBuf(wire);
+            if (CODEC.decode(input).dimension() != key) throw new AssertionError("dimension key identity");
+            input.finish();
+        }
+        var invalid = new RegistryFriendlyByteBuf(new byte[] {3, 'b', 'a', 'd'});
+        try {
+            CODEC.decode(invalid);
+            throw new AssertionError("accepted an unknown world key");
+        } catch (IllegalArgumentException expected) {
+            if (!expected.getMessage().contains("Unsupported S4 dimension")) throw expected;
+        }
+        try {
+            invalid.finish();
+            throw new AssertionError("published a failed codec view");
+        } catch (IllegalArgumentException expected) {
+            if (!expected.getMessage().contains("buffer unavailable")) throw expected;
         }
     }
 }
@@ -220,6 +276,12 @@ class NeoForgeS4NetworkTests(unittest.TestCase):
         result = self.shimcheck(jar)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("S4NetworkBridge#send(", result.stdout)
+
+    def test_dimension_codec_uses_exact_keys_and_rejects_unknown_worlds(self):
+        source = self.root / "DimensionCheck.java"
+        source.write_text(DIMENSION_CODEC)
+        self.checked(JAVA / "bin/javac", "--release", "21", "-cp", self.classpath, "-d", self.root, source)
+        self.checked(JAVA / "bin/java", "-cp", os.pathsep.join([str(self.root), self.classpath]), "DimensionCheck")
 
     def test_rust_jni_payloads_capabilities_and_frozen_registry(self):
         output = self.checked(

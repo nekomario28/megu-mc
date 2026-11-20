@@ -14,20 +14,17 @@ class AuditTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         result = subprocess.run(
-            [sys.executable, str(HERE / "audit.py"), "--format", "json"],
+            [sys.executable, str(HERE / "audit.py"), "--java-home", "/usr/lib/jvm/java-21-openjdk", "--format", "json"],
             capture_output=True, text=True,
         )
         if result.returncode:
             raise AssertionError(f"audit failed ({result.returncode}): {result.stderr}")
         cls.audit = json.loads(result.stdout)
         cls.fixtures = {fixture["fixture"]: fixture for fixture in cls.audit["fixtures"]}
-        surface = HERE.parents[1] / "compat/neoforge-events/shim-surface.json"
-        cls.surface = json.loads(surface.read_text())["classes"]
 
-    def assert_method_classified(self, fixture, owner, name, descriptor):
+    def assert_method_classified(self, fixture, owner, name, descriptor, *, supported):
         row = self.fixtures[fixture]
         member = [owner, name, descriptor]
-        supported = name + descriptor in self.surface.get(owner, {}).get("methods", [])
         matching = "supported_members" if supported else "unsupported_members"
         other = "unsupported_members" if supported else "supported_members"
         self.assertIn(member, row[matching])
@@ -48,35 +45,44 @@ class AuditTest(unittest.TestCase):
             content["supported_members"],
         )
 
-    def test_gameplay_does_not_conflate_event_coverage_with_jar_admission(self):
+    def test_gameplay_accepts_coordinates_and_owner_driven_damage_surface(self):
         gameplay = self.fixtures["gameplay"]
-        self.assertEqual(gameplay["status"], "REJECTED")
-        self.assertIn(
-            ["net/neoforged/neoforge/event/level/BlockEvent$BreakEvent", "setCanceled", "(Z)V"],
-            gameplay["supported_members"],
-        )
-        self.assertIn(
-            ["net/neoforged/neoforge/event/entity/living/LivingDamageEvent$Pre", "setNewDamage", "(F)V"],
-            gameplay["unsupported_members"],
-        )
+        self.assertEqual(gameplay["status"], "COMPATIBLE")
+        self.assert_method_classified("gameplay", "net/minecraft/core/BlockPos", "getY", "()I", supported=True)
+        event = "net/neoforged/neoforge/event/entity/living/LivingDamageEvent$Pre"
+        self.assert_method_classified("gameplay", event, "setNewDamage", "(F)V", supported=True)
+        self.assert_method_classified("gameplay", event, "getNewDamage", "()F", supported=True)
 
     def test_automation_and_network_preserve_erased_jvm_descriptors(self):
         self.assert_method_classified(
             "automation", "net/minecraft/world/level/LevelAccessor", "scheduleTick",
-            "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/Block;I)V",
+            "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/Block;I)V", supported=True,
         )
         self.assert_method_classified(
             "automation", "net/neoforged/neoforge/items/IItemHandler", "insertItem",
-            "(ILnet/minecraft/world/item/ItemStack;Z)Lnet/minecraft/world/item/ItemStack;",
+            "(ILnet/minecraft/world/item/ItemStack;Z)Lnet/minecraft/world/item/ItemStack;", supported=True,
         )
         self.assert_method_classified(
             "network", "net/minecraft/resources/ResourceKey", "location",
-            "()Lnet/minecraft/resources/ResourceLocation;",
+            "()Lnet/minecraft/resources/ResourceLocation;", supported=True,
         )
         self.assert_method_classified(
             "network", "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent", "registrar",
-            "(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
+            "(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;", supported=True,
         )
+        self.assert_method_classified("network", "net/minecraft/world/level/Level", "dimension",
+                                      "()Lnet/minecraft/resources/ResourceKey;", supported=True)
+        self.assert_method_classified("network", "net/minecraft/network/FriendlyByteBuf", "readResourceKey",
+                                      "(Lnet/minecraft/resources/ResourceKey;)Lnet/minecraft/resources/ResourceKey;",
+                                      supported=True)
+
+    def test_automation_and_network_keep_unbacked_entry_points_closed(self):
+        self.assertEqual(self.fixtures["automation"]["status"], "REJECTED")
+        self.assertEqual({member[1] for member in self.fixtures["automation"]["unsupported_members"]},
+                         {"setChanged", "tick", "registerBlockEntity"})
+        self.assertEqual(self.fixtures["network"]["status"], "REJECTED")
+        self.assertEqual([member[1] for member in self.fixtures["network"]["unsupported_members"]],
+                         ["configurationToClient"])
 
     def test_declared_transform_diagnostics_distinguish_config_injections_and_at(self):
         transforms = self.fixtures["transforms"]
@@ -85,10 +91,9 @@ class AuditTest(unittest.TestCase):
             self.assertIn(
                 ("UNSUPPORTED_MIXIN_INJECTION", f"auditfixture/transforms/WorldMixin @{injection}"), reasons,
             )
-        for point in ("HEAD", "TAIL"):
-            self.assertNotIn(("UNSUPPORTED_MIXIN_AT", f"auditfixture/transforms/WorldMixin @At({point})"), reasons)
+        self.assertEqual({symbol for code, symbol in reasons if code == "UNSUPPORTED_MIXIN_AT"},
+                         {f"auditfixture/transforms/WorldMixin @At({point})" for point in ("INVOKE", "STORE")})
         self.assertIn(("UNSUPPORTED_MIXIN_CONFIG", "hooks.mixins.json"), reasons)
-        self.assertIn(("UNSUPPORTED_ACCESS_TRANSFORMER", "META-INF/accesstransformer.cfg"), reasons)
 
     def test_fabric_reports_current_metadata_and_side_coverage_boundary(self):
         fabric = self.fixtures["fabric"]
@@ -103,7 +108,12 @@ class AuditTest(unittest.TestCase):
 
     def test_reports_both_explicit_and_conventional_at_resources(self):
         for name in ("implicit_at", "transforms"):
-            self.assertIn("META-INF/accesstransformer.cfg", self.fixtures[name]["resources"])
+            row = self.fixtures[name]
+            self.assertEqual(row["status"], "REJECTED")
+            self.assertIn("META-INF/accesstransformer.cfg", row["resources"])
+            self.assertEqual([reason["symbol"] for reason in row["diagnostics"]
+                              if reason["code"] == "UNSUPPORTED_ACCESS_TRANSFORMER"],
+                             ["META-INF/accesstransformer.cfg"])
 
     def test_member_totals_deduplicate_across_jars_without_losing_each_report(self):
         location = ["net/minecraft/resources/ResourceLocation", "fromNamespaceAndPath",

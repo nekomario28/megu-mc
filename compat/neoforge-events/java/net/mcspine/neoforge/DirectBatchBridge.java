@@ -9,6 +9,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
 
 /** Java endpoint of the S3 owner-thread tick batch. See the adapter README for the ABI. */
 public final class DirectBatchBridge {
@@ -71,6 +75,13 @@ public final class DirectBatchBridge {
         if (active != null) throw fail(active, "Legacy native world access is unavailable during S3 dispatch");
     }
 
+    static void requireOwner() {
+        Registry activeRegistry = registry;
+        if (activeRegistry == null || activeRegistry.owner != Thread.currentThread()) {
+            throw new IllegalStateException("NeoForge dispatch requires the bootstrap owner");
+        }
+    }
+
     private static int key(Activation activation, int kind) {
         return (activation.ordinal() << 16) | kind;
     }
@@ -100,6 +111,7 @@ public final class DirectBatchBridge {
         private final Batch batch;
         private final Input input;
         private final int index;
+        private Level level;
 
         private TickContext(Batch batch, Input input, int index) {
             this.batch = batch;
@@ -120,6 +132,16 @@ public final class DirectBatchBridge {
         public int y() { return checked().y; }
         public int z() { return checked().z; }
         public int state() { return checked().state; }
+
+        public Level level() {
+            Input activation = checked();
+            if (level == null) {
+                level = new Level(activation.dim, this);
+                level.snapshotBlock(new BlockPos(activation.x, activation.y, activation.z),
+                    new BlockState(activation.state));
+            }
+            return level;
+        }
 
         public EntityHandle entity() {
             if (checked().activation != Activation.ENTITY_TICK) {
@@ -189,6 +211,21 @@ public final class DirectBatchBridge {
             return batch.beginOp(this, tag, payload)
                 .put((byte) input.dim).putInt(x).putInt(y).putInt(z);
         }
+    }
+
+    /** The v1 wire implies the block identity from the source activation's cell. */
+    public static void scheduleBlockTick(TickContext context, Level level, BlockPos pos, Block block, int delay) {
+        if (context == null) {
+            String message = "scheduleTick requires an active S3 level snapshot";
+            Batch active = ACTIVE.get();
+            throw active == null ? new IllegalStateException(message) : fail(active, message);
+        }
+        Input input = context.checked();
+        if (context.level != level || pos == null || pos.x() != input.x || pos.y() != input.y || pos.z() != input.z
+                || block == null || S4CapabilityBridge.blockForState(input.state) != block) {
+            throw fail(context.batch, "scheduleTick requires the current cell and its registered block");
+        }
+        context.scheduleTick(input.x, input.y, input.z, delay, 0);
     }
 
     private static IllegalStateException fail(Batch batch, String message) {

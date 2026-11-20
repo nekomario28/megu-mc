@@ -23,7 +23,14 @@ import net.mcspine.neoforge.DirectBatchBridge.BlockEntityHandle;
 import net.mcspine.neoforge.DirectBatchBridge.EntityHandle;
 import net.mcspine.neoforge.DirectBatchBridge.TickContext;
 import static net.mcspine.neoforge.DirectBatchBridge.Activation.*;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.LevelAccessor;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
+import net.neoforged.neoforge.registries.DeferredRegister;
 
 @Mod("nf4_fixture")
 public final class S3Mod {
@@ -31,7 +38,24 @@ public final class S3Mod {
     private EntityHandle entity;
     private int depth;
 
-    public S3Mod() {
+    public S3Mod(IEventBus bus) {
+        var blocks = DeferredRegister.createBlocks("nf4_fixture");
+        var scheduledBlock = blocks.registerSimpleBlock("scheduled");
+        blocks.register(bus);
+        DirectBatchBridge.register(BLOCK_ENTITY_TICK, 21, context -> {
+            var level = context.level();
+            var pos = new BlockPos(context.x(), context.y(), context.z());
+            if (level.dimension() != Level.END || level.getBlockState(pos).stateId() != 26684) {
+                throw new AssertionError("incorrect S3 level snapshot");
+            }
+            LevelAccessor scheduler = level;
+            scheduler.scheduleTick(pos, scheduledBlock.get(), 12);
+            if (pos.getX() == -3) {
+                requireScheduleRejected(() -> scheduler.scheduleTick(new BlockPos(0, 70, 18), scheduledBlock.get(), 2));
+            } else if (pos.getX() == -2) {
+                requireScheduleRejected(() -> level.scheduleTick(pos, new Block(BlockBehaviour.Properties.of()), 2));
+            }
+        });
         DirectBatchBridge.register(BLOCK_ENTITY_TICK, 7, context -> {
             var handle = context.blockEntity();
             checkIdentity(context, handle.kind(), handle.id(), handle.generation(), handle.dim());
@@ -86,6 +110,15 @@ public final class S3Mod {
         });
     }
 
+    private static void requireScheduleRejected(Runnable schedule) {
+        try {
+            schedule.run();
+            throw new AssertionError("out-of-snapshot schedule accepted");
+        } catch (IllegalStateException expected) {
+            if (!expected.getMessage().contains("current cell and its registered block")) throw expected;
+        }
+    }
+
     private static void checkIdentity(TickContext context, int kind, int id, int generation, int dim) {
         int x = context.x();
         if (kind != 7 || id != x - 512 || generation != 0x80000000 + x || dim != x % 3) {
@@ -122,6 +155,42 @@ public final class S3Mod {
 }
 """
 
+SCHEDULE_RUNNER = """
+import java.lang.reflect.InvocationTargetException;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import net.mcspine.neoforge.Bootstrap;
+import net.mcspine.neoforge.DirectBatchBridge;
+
+public class ScheduleCheck {
+    public static void main(String[] args) throws Exception {
+        Bootstrap.initialize(args[0]);
+        var dispatch = DirectBatchBridge.class.getDeclaredMethod("dispatch", ByteBuffer.class, int.class, ByteBuffer.class);
+        dispatch.setAccessible(true);
+        var request = ByteBuffer.allocateDirect(256 * 1024);
+        var response = ByteBuffer.allocateDirect(256 * 1024);
+        byte[] wire = Files.readAllBytes(Path.of(args[1]));
+        request.put(wire);
+        try {
+            int length = (int) dispatch.invoke(null, request, wire.length, response);
+            byte[] output = new byte[length];
+            response.get(output);
+            Files.write(Path.of(args[2]), output);
+        } catch (InvocationTargetException error) {
+            if (response.getInt(0) != 0) throw new AssertionError("partial schedule response published", error);
+            if (error.getCause() instanceof IllegalStateException cause && cause.getMessage().equals("S3 batch failed")) {
+                System.out.println("schedule batch rolled back");
+            } else {
+                throw error;
+            }
+        } finally {
+            Bootstrap.close();
+        }
+    }
+}
+"""
+
 DECODER = """
 use landing_types::{decode_s3_response_batch, S3Activation, S3TickRequest};
 
@@ -129,11 +198,11 @@ fn main() {
     let input = S3TickRequest {
         activation: S3Activation::BlockEntityTick,
         dim: 2,
-        kind: 7,
+        kind: 21,
         id: -20,
         generation: 0x8000_0003,
         pos: (-4, 70, 18),
-        state: 0,
+        state: 26684,
     };
     let path = std::env::args_os().nth(1).unwrap();
     let wire = std::fs::read(path).unwrap();
@@ -272,6 +341,28 @@ class NeoForgeS3BatchTests(unittest.TestCase):
 
     def test_java_rejects_malformed_requests_and_rolls_back_at_output_limits(self):
         self.run_jni("bounds", "malformed input and invalid or oversized output rejected")
+
+    def test_level_schedule_tick_emits_s3_op_and_rolls_back_invalid_calls(self):
+        source = self.root / "ScheduleCheck.java"
+        source.write_text(SCHEDULE_RUNNER)
+        classpath = (self.root / "classpath.txt").read_text().strip()
+        self.checked(JAVA / "bin/javac", "--release", "21", "-cp", classpath, "-d", self.root, source)
+        request = self.root / "schedule-request"
+        response = self.root / "schedule-response"
+        for x in (-4, -3, -2):
+            with self.subTest(x=x):
+                record = struct.pack("<BBHiIiiiI", 1, 2, 21, -20, GENERATION, x, 70, 18, 26684)
+                request.write_bytes(frame(record, header=b"S3\x01\x00"))
+                result = self.checked(JAVA / "bin/java", "-cp", os.pathsep.join([str(self.root), classpath]),
+                                      "ScheduleCheck", self.root, request, response)
+                if x == -4:
+                    payload = struct.pack("<Biiiib", 2, x, 70, 18, 12, 0)
+                    self.assertEqual(response.read_bytes(), frame(op(2, payload)))
+                    self.assertEqual(self.checked(self.codec, response).strip(), "accepted 1")
+                    response.unlink()
+                else:
+                    self.assertIn("schedule batch rolled back", result)
+                    self.assertFalse(response.exists())
 
     def test_shimcheck_rejects_direct_calls_to_the_legacy_native_host(self):
         jar = self.pack_mod("HostCaller", """

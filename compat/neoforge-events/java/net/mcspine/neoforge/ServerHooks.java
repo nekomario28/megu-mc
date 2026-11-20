@@ -7,6 +7,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.core.BlockPos;
 import net.mcspine.probe.Host;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.Function;
 import com.mojang.brigadier.CommandDispatcher;
 import net.minecraft.commands.CommandBuildContext;
@@ -14,21 +15,26 @@ import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
 import net.neoforged.bus.api.Event;
 import net.neoforged.bus.api.ICancellableEvent;
 import net.neoforged.neoforge.common.util.BlockSnapshot;
+import net.neoforged.neoforge.common.damagesource.DamageContainer;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.neoforged.neoforge.event.ServerChatEvent;
+import net.neoforged.neoforge.event.entity.living.LivingDamageEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.level.BlockEvent;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
 /** Dispatches events against Java snapshots and returns mutations for the Rust host. */
 public final class ServerHooks {
     public static void land(int x, int y, int z, float distance) {
         DirectBatchBridge.requireOutsideBatch();
         S4NetworkBridge.requireOutsideDispatch();
         S4CapabilityBridge.requireOutsideQuery();
-        var event = new FarmlandTrampleEvent(new Level(), new BlockPos(x,y,z),
+        // This legacy JNI entry point has no dimension argument.
+        var event = new FarmlandTrampleEvent(new Level(-1), new BlockPos(x,y,z),
             new BlockState(), distance, new Entity());
         NeoForge.EVENT_BUS.post(event);
         if (!event.isCanceled()) Host.setBlock(x,y,z,10);
@@ -36,6 +42,8 @@ public final class ServerHooks {
 
     /** The host applies each eligible block write with its own CAS guard. */
     public record DispatchResult(boolean canceled, List<MutationBuffer.Mutation> mutations) { }
+
+    record DamageResult(float damage, List<MutationBuffer.Mutation> mutations) { }
 
     private record PostedEvent(DispatchResult result, MutationBuffer.Mutation response) {
         String encode() {
@@ -99,6 +107,41 @@ public final class ServerHooks {
 
     public static DispatchResult onPlayerLoggedOut(Player player) {
         return dispatch(new PlayerEvent.PlayerLoggedOutEvent(player)).result();
+    }
+
+    static DispatchResult onServerTickPre(boolean hasTime) {
+        requireHostDispatch();
+        return dispatch(new ServerTickEvent.Pre(hasTime)).result();
+    }
+
+    static DispatchResult onServerTickPost(boolean hasTime) {
+        requireHostDispatch();
+        return dispatch(new ServerTickEvent.Post(hasTime)).result();
+    }
+
+    static DamageResult onLivingDamagePre(LivingEntity entity, float originalDamage, float reducedDamage) {
+        requireHostDispatch();
+        requireDamage(originalDamage);
+        requireDamage(reducedDamage);
+        var container = new DamageContainer(originalDamage, reducedDamage);
+        var event = new LivingDamageEvent.Pre(Objects.requireNonNull(entity), container);
+        var result = dispatch(event, posted -> {
+            requireDamage(posted.getNewDamage());
+            return null;
+        }).result();
+        return new DamageResult(container.getNewDamage(), result.mutations());
+    }
+
+    private static void requireHostDispatch() {
+        DirectBatchBridge.requireOwner();
+        DirectBatchBridge.requireOutsideBatch();
+        S4NetworkBridge.requireOutsideDispatch();
+        S4CapabilityBridge.requireOutsideQuery();
+        if (MutationBuffer.depth() != 0) throw new IllegalStateException("Host dispatch requires an outermost event");
+    }
+
+    private static void requireDamage(float damage) {
+        if (!Float.isFinite(damage) || damage < 0) throw new IllegalArgumentException("Invalid host damage amount");
     }
 
     public static DispatchResult onServerChat(ServerPlayer player, String rawText) {

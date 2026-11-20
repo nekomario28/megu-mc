@@ -1,5 +1,6 @@
 package net.mcspine.neoforge;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -12,6 +13,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -192,7 +194,7 @@ public final class ShimCheck {
                     result.reject("MALFORMED_CLASS", entry.getName(), error.getMessage());
                 }
             }
-            checkMixins(zip, result);
+            checkTransformations(zip, entries, result);
             if (result.metadata != null) validateMetadata(result);
             Set<String> ownClasses = result.classes.keySet();
             for (ClassInfo info : result.classes.values()) {
@@ -401,8 +403,10 @@ public final class ShimCheck {
         path.remove(path.size() - 1);
     }
 
-    private static void checkMixins(ZipFile zip, JarReport result) throws IOException {
+    private static void checkTransformations(ZipFile zip, List<? extends ZipEntry> entries,
+                                             JarReport result) throws IOException {
         Set<String> configs = new TreeSet<>();
+        Set<String> transformers = new TreeSet<>();
         if (result.metadata != null) {
             for (Map<String, Object> declaration : result.metadata.mixins) {
                 String config = string(declaration, "config");
@@ -410,15 +414,27 @@ public final class ShimCheck {
                 else configs.add(config);
             }
             for (Map<String, Object> declaration : result.metadata.accessTransformers) {
-                result.reject("UNSUPPORTED_ACCESS_TRANSFORMER", String.valueOf(declaration.getOrDefault("file", "[[accessTransformers]]")), "Access transformers are unsupported in S0");
+                String file = string(declaration, "file");
+                transformers.add(file == null || file.isBlank() ? "[[accessTransformers]]" : file.trim());
+            }
+        }
+        for (ZipEntry entry : entries) {
+            String name = entry.getName().toLowerCase(Locale.ROOT);
+            if (name.startsWith("meta-inf/") && name.endsWith(".cfg")
+                    && name.substring(name.lastIndexOf('/') + 1).contains("accesstransformer")) {
+                transformers.add(entry.getName());
             }
         }
         ZipEntry manifestEntry = zip.getEntry("META-INF/MANIFEST.MF");
         if (manifestEntry != null) {
-            try (InputStream stream = zip.getInputStream(manifestEntry)) {
-                String value = new Manifest(stream).getMainAttributes().getValue("MixinConfigs");
-                if (value != null) for (String config : value.split(",")) if (!config.isBlank()) configs.add(config.trim());
-            }
+            Manifest manifest = new Manifest(new ByteArrayInputStream(read(zip, manifestEntry, MAX_METADATA_BYTES)));
+            String value = manifest.getMainAttributes().getValue("MixinConfigs");
+            if (value != null) for (String config : value.split(",")) if (!config.isBlank()) configs.add(config.trim());
+            manifestTransformers(zip, manifest.getMainAttributes(), transformers);
+            for (Attributes section : manifest.getEntries().values()) manifestTransformers(zip, section, transformers);
+        }
+        for (String transformer : transformers) {
+            result.reject("UNSUPPORTED_ACCESS_TRANSFORMER", transformer, "Access transformers are unsupported in S0");
         }
         for (ClassInfo info : result.classes.values()) {
             for (String injection : info.injections) {
@@ -462,6 +478,21 @@ public final class ShimCheck {
                 result.reject("INVALID_MIXIN_CONFIG", config, error.getMessage());
             }
         }
+    }
+
+    private static void manifestTransformers(ZipFile zip, Attributes attributes, Set<String> transformers) {
+        attributes.forEach((key, value) -> {
+            String name = key.toString().toLowerCase(Locale.ROOT).replace("-", "");
+            if (!Set.of("accesstransformer", "accesstransformers", "fmlat").contains(name)) return;
+            String files = value.toString().trim();
+            if (files.matches("[,\\s]*")) transformers.add("META-INF/MANIFEST.MF#" + name);
+            for (String file : files.split("fmlat".equals(name) ? "[,\\s]+" : ",")) {
+                String path = file.trim();
+                if (path.isEmpty()) continue;
+                String metaInfPath = "META-INF/" + path;
+                transformers.add(!path.contains("/") && zip.getEntry(metaInfPath) != null ? metaInfPath : path);
+            }
+        });
     }
 
     private record Dependency(String owner, String id, String range, boolean required, String side) { }
@@ -633,6 +664,11 @@ public final class ShimCheck {
                 @Override public AnnotationVisitor visitArray(String key) {
                     if (MOD.equals(desc) && "dist".equals(key)) info.modDistExplicit = true;
                     return new AnnotationVisitor(Opcodes.ASM9) {
+                        @Override public void visit(String ignored, Object value) { info.constant(value); }
+                        @Override public AnnotationVisitor visitAnnotation(String ignored, String nested) {
+                            return annotation(nested);
+                        }
+                        @Override public AnnotationVisitor visitArray(String ignored) { return this; }
                         @Override public void visitEnum(String ignored, String enumDesc, String value) {
                             info.descriptor(enumDesc);
                             if (SUBSCRIBER.equals(desc) && "value".equals(key) && enumDesc.endsWith("/Dist;")) {

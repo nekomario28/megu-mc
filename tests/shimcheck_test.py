@@ -150,6 +150,45 @@ import org.spongepowered.asm.mixin.injection.Redirect;
   private void redirect() {}
 }
 ''',
+            "testmod/ArrayMixin.java": '''package testmod;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+@Mixin(targets="net.minecraft.world.level.Level") public class ArrayMixin {
+  @Inject(method="tick", at={@At("HEAD"), @At("INVOKE")}) private void invoke() {}
+  @Inject(method="tick", at={@At("STORE"), @At("TAIL")}) private void store() {}
+}
+''',
+            "testmod/BoundedFacadeMod.java": '''package testmod;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.LevelAccessor;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.neoforged.neoforge.event.entity.living.LivingDamageEvent;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
+@net.neoforged.fml.common.Mod("testmod") public class BoundedFacadeMod {
+  int coordinate(BlockPos pos) { return pos.getX() + pos.getY() + pos.getZ(); }
+  void schedule(Level level, LevelAccessor world, BlockPos pos, Block block) {
+    world.scheduleTick(pos, block, 2);
+    level.scheduleTick(pos, block, 3);
+  }
+  Object dimension(BlockEntity entity) { return entity.getLevel().dimension(); }
+  void limit(LivingDamageEvent.Pre event) {
+    event.setNewDamage(Math.min(event.getContainer().getNewDamage(), 8));
+  }
+  boolean time(ServerTickEvent event, ServerTickEvent.Pre pre, ServerTickEvent.Post post) {
+    return event.hasTime() && pre.hasTime() && post.hasTime();
+  }
+}
+''',
+            "testmod/UnsupportedLevelMod.java": '''package testmod;
+@net.neoforged.fml.common.Mod("testmod") public class UnsupportedLevelMod {
+  boolean check(net.minecraft.world.level.Level level, net.minecraft.core.BlockPos pos) {
+    return level.isOutsideBuildHeight(pos);
+  }
+}
+''',
             "net/minecraft/unsupported/MissingApi.java": '''package net.minecraft.unsupported;
 public class MissingApi { public static void absent() {} }
 ''',
@@ -157,7 +196,15 @@ public class MissingApi { public static void absent() {} }
 public class Minecraft { public static Minecraft getInstance() { return null; } }
 ''',
             "net/minecraft/world/level/Level.java": '''package net.minecraft.world.level;
-public class Level implements LevelAccessor { public void missingApi() {} }
+import net.minecraft.core.BlockPos;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.level.block.Block;
+public class Level implements LevelAccessor {
+  public void missingApi() {}
+  public native boolean isOutsideBuildHeight(BlockPos pos);
+  public native void scheduleTick(BlockPos pos, Block block, int delay);
+  public native ResourceKey<Level> dimension();
+}
 ''',
             "org/spongepowered/asm/mixin/Mixin.java": '''package org.spongepowered.asm.mixin;
 @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.CLASS)
@@ -167,7 +214,12 @@ public @interface Mixin { String[] targets(); }
             "org/spongepowered/asm/mixin/injection/At.java": '''package org.spongepowered.asm.mixin.injection;
 @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.CLASS)
 @java.lang.annotation.Target(java.lang.annotation.ElementType.ANNOTATION_TYPE)
-public @interface At { String value(); String target(); }
+public @interface At { String value(); String target() default ""; }
+''',
+            "org/spongepowered/asm/mixin/injection/Inject.java": '''package org.spongepowered.asm.mixin.injection;
+@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.CLASS)
+@java.lang.annotation.Target(java.lang.annotation.ElementType.METHOD)
+public @interface Inject { String method(); At[] at(); }
 ''',
             "org/spongepowered/asm/mixin/injection/Redirect.java": '''package org.spongepowered.asm.mixin.injection;
 @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.CLASS)
@@ -330,7 +382,26 @@ public @interface Redirect { String method(); At at(); }
 
     def test_access_transformers_rejected(self):
         toml = MODS_TOML + '\n[[accessTransformers]]\nfile="META-INF/accesstransformer.cfg"\n'
-        self.assert_rejected(self.fixture(toml=toml), "UNSUPPORTED_ACCESS_TRANSFORMER", "accesstransformer.cfg")
+        config = "META-INF/accesstransformer.cfg"
+        jar = self.fixture(toml=toml, extra={config: "public net.minecraft.world.level.Level\n",
+            "META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\nAccessTransformer: accesstransformer.cfg\r\n\r\n"})
+        report = self.assert_rejected(jar, "UNSUPPORTED_ACCESS_TRANSFORMER", config)
+        self.assertEqual([item["symbol"] for item in report["unsupportedAccessTransformers"]], [config])
+
+    def test_undeclared_access_transformer_configs_rejected(self):
+        names = ["META-INF/accesstransformer.cfg", "META-INF/extra/CUSTOM-AccessTransformer-2.cfg"]
+        jar = self.fixture(extra={names[0]: "", names[1]: "public net.minecraft.world.level.Level\n",
+                                  "META-INF/settings.cfg": "unrelated"})
+        report = self.assert_rejected(jar, "UNSUPPORTED_ACCESS_TRANSFORMER", names[0])
+        self.assertEqual({item["symbol"] for item in report["unsupportedAccessTransformers"]}, set(names))
+
+    def test_manifest_only_transformer_rejected(self):
+        jar = self.fixture(extra={
+            "META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\naccesstransformer: META-INF/patch.cfg\r\n\r\n",
+            "META-INF/patch.cfg": "public net.minecraft.world.level.Level\n",
+        })
+        report = self.assert_rejected(jar, "UNSUPPORTED_ACCESS_TRANSFORMER", "META-INF/patch.cfg")
+        self.assertEqual(len(report["unsupportedAccessTransformers"]), 1)
 
     def test_redirect_mixin_and_invoke_rejected(self):
         toml = MODS_TOML + '\n[[mixins]]\nconfig="bad.mixins.json"\n'
@@ -342,6 +413,24 @@ public @interface Redirect { String method(); At at(); }
         reasons = {reason["code"] for reason in report["reasons"]}
         self.assertIn("UNSUPPORTED_MIXIN_AT", reasons)
         self.assertIn("UNSUPPORTED_MIXIN_CONFIG", reasons)
+
+    def test_inject_at_array_reports_only_unsupported_points(self):
+        jar = self.fixture(name="ArrayMixin", extra_classes=("SimpleMod",))
+        report = self.assert_rejected(jar, "UNSUPPORTED_MIXIN_AT")
+        self.assertEqual([(item["code"], item["symbol"]) for item in report["reasons"]], [
+            ("UNSUPPORTED_MIXIN_AT", "testmod/ArrayMixin @At(INVOKE)"),
+            ("UNSUPPORTED_MIXIN_AT", "testmod/ArrayMixin @At(STORE)"),
+        ])
+
+    def test_bounded_facades_leave_unimplemented_members_rejected(self):
+        ok = self.fixture(name="BoundedFacadeMod")
+        unsupported = self.fixture(name="UnsupportedLevelMod", toml=MODS_TOML.replace("testmod", "secondmod"))
+        proc, report = self.invoke(ok, unsupported)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(report["jars"][0]["status"], "COMPATIBLE")
+        self.assertEqual(report["jars"][1]["unsupportedSymbols"], [
+            "net/minecraft/world/level/Level#isOutsideBuildHeight(Lnet/minecraft/core/BlockPos;)Z",
+        ])
 
     def test_client_only_subscriber_is_excluded(self):
         proc, result = self.invoke(self.fixture(include_client=True))
