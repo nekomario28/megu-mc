@@ -1019,13 +1019,17 @@ fn smithing_result(template: &Stack, base: &Stack, addition: &Stack) -> Option<S
     Some(result)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn xp_needed_for_next_level(level: i32) -> i32 {
+fn xp_needed_for_next_level(level: i32) -> i64 {
+    let level = i64::from(level);
     match level {
-        30.. => (level - 30).wrapping_mul(9).wrapping_add(112),
+        30.. => 112 + (level - 30) * 9,
         15..=29 => 37 + (level - 15) * 5,
-        _ => level.wrapping_mul(2).wrapping_add(7),
+        _ => 7 + level * 2,
     }
+}
+
+fn xp_points_for_level(level: i32) -> i64 {
+    (0..level).map(xp_needed_for_next_level).sum()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1686,6 +1690,10 @@ mod player_mechanisms_tests {
             std::array::from_fn(|level| xp_needed_for_next_level(level as i32)),
             expected
         );
+        for (level, total) in [(30, 1395), (31, 1507), (32, 1628)] {
+            assert_eq!(xp_points_for_level(level), total);
+            assert_eq!(xp_level(total), (level, 0.0));
+        }
     }
 
     #[test]

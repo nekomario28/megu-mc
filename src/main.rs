@@ -2046,13 +2046,7 @@ fn xp_level(total: i64) -> (i32, f32) {
     while total >= acc + next {
         acc += next;
         l += 1;
-        next = if l < 16 {
-            2 * l as i64 + 7
-        } else if l < 31 {
-            5 * l as i64 - 38
-        } else {
-            9 * l as i64 - 158
-        };
+        next = xp_needed_for_next_level(l);
     }
     (l, ((total - acc) as f32 / next as f32).clamp(0.0, 1.0))
 }
@@ -23928,14 +23922,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
                     let mut xp = c.xp.lock().unwrap();
                     if unit == "levels" {
-                        // store xp as total points; levels add via xp_level inverse (approx)
+                        // store xp as total points; levels add via xp_level inverse
                         let (lvl, _) = xp_level(*xp);
                         let target = lvl + amount as i32;
-                        // points to reach target level from 0 (vanilla table approx)
-                        let mut acc = 0i64; let mut l = 0i32; let mut next = 7i64;
-                        while l < target { acc += next; l += 1;
-                            next = if l >= 30 { 9 * l as i64 - 121 } else if l >= 15 { 5 * l as i64 - 38 } else { 2 * l as i64 + 7 }; }
-                        *xp = acc.max(0);
+                        *xp = xp_points_for_level(target);
                     } else {
                         match sub { "set" => *xp = amount.max(0), _ => *xp = (*xp + amount).max(0) }
                     }
