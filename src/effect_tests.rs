@@ -14,6 +14,7 @@ pub(super) fn client_pair() -> (Client, TcpStream) {
         uuid: [0; 16],
         name: "totem-test".into(),
         pos: Mutex::new((0.0, 70.0, 0.0, 0.0, 0.0, true)),
+        teleport: Mutex::new(Default::default()),
         hp: Mutex::new(20.0),
         sock: Mutex::new(sender),
         inv: Mutex::new(HashMap::new()),

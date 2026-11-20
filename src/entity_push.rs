@@ -460,6 +460,7 @@ mod entity_push_tests {
             uuid: [9u8; 16],
             name: format!("push_tester_{eid}"),
             pos: Mutex::new((x, y, z, 0.0, 0.0, true)),
+            teleport: Mutex::new(Default::default()),
             hp: Mutex::new(20.0),
             sock: Mutex::new(stream),
             inv: Mutex::new(HashMap::new()),

@@ -231,7 +231,7 @@ mod keepalive_tests {
         assert_eq!(state.tick(sent, 1), KeepaliveAction::Send(1));
         for second in 1..15 {
             assert_eq!(
-                state.tick(sent + Duration::from_secs(second), second),
+                state.tick(sent + Duration::from_secs(second), 2),
                 KeepaliveAction::Wait
             );
         }
@@ -239,6 +239,67 @@ mod keepalive_tests {
         assert!(!state.reply(deadline, &1i64.to_be_bytes()));
         assert_eq!(state.tick(deadline, 2), KeepaliveAction::TimedOut);
     }
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum TeleportPhase {
+    #[default]
+    Idle,
+    Preparing,
+    Sent,
+}
+
+#[derive(Default)]
+pub(crate) struct TeleportSync {
+    id: i32,
+    phase: TeleportPhase,
+}
+
+impl TeleportSync {
+    pub(crate) fn begin(&mut self) -> i32 {
+        self.id = (self.id + 1) % i32::MAX;
+        self.phase = TeleportPhase::Preparing;
+        self.id
+    }
+
+    pub(crate) fn preparing(&self, id: i32) -> bool {
+        self.phase == TeleportPhase::Preparing && self.id == id
+    }
+
+    pub(crate) fn sent(&mut self) {
+        self.phase = TeleportPhase::Sent;
+    }
+
+    pub(crate) fn confirm(&mut self, id: i32) {
+        if self.phase == TeleportPhase::Sent && self.id == id {
+            self.phase = TeleportPhase::Idle;
+        }
+    }
+
+    pub(crate) fn movement_allowed(&self) -> bool {
+        self.phase == TeleportPhase::Idle
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn teleport_only_accepts_the_current_sent_id() {
+    let mut sync = TeleportSync::default();
+    assert!(sync.movement_allowed());
+    let first = sync.begin();
+    sync.sent();
+    let current = sync.begin();
+    assert_ne!(first, current);
+    assert!(sync.preparing(current));
+    sync.confirm(current);
+    assert!(!sync.movement_allowed());
+    sync.sent();
+    sync.confirm(first);
+    assert!(!sync.movement_allowed());
+    sync.confirm(current);
+    assert!(sync.movement_allowed());
+    sync.id = i32::MAX - 1;
+    assert_eq!(sync.begin(), 0);
 }
 
 fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {

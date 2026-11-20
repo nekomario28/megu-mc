@@ -1473,6 +1473,7 @@ mod entity_fluid_tests {
             uuid: [9u8; 16],
             name: "fluid_tester".to_string(),
             pos: Mutex::new((0.5, 65.0, 0.5, 0.0, 0.0, true)),
+            teleport: Mutex::new(Default::default()),
             hp: Mutex::new(20.0),
             sock: Mutex::new(stream),
             inv: Mutex::new(HashMap::new()),

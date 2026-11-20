@@ -342,6 +342,7 @@ struct Client {
     uuid: [u8; 16],
     name: String,
     pos: Mutex<(f64, f64, f64, f32, f32, bool)>,
+    teleport: Mutex<connection_limits::TeleportSync>,
     hp: Mutex<f32>,
     sock: Mutex<TcpStream>,
     inv: Mutex<HashMap<i16, Stack>>,
@@ -3700,12 +3701,9 @@ fn keepalive_time_tick() {
             }
             let cls: Vec<Arc<Client>> = client_snapshot();
             if let Some(c) = cls.iter().find(|c| c.eid == owner) {
-                {
-                    let mut p = c.pos.lock().unwrap();
-                    *p = (tx, ty, tz, p.3, p.4, true);
-                }
+                let (_, _, _, yaw, pitch, _) = *c.pos.lock().unwrap();
                 if let Ok(mut w) = c.sock.lock() {
-                    let _ = send_packet(&mut w, 0x40, teleport_pkt(tx, ty, tz, 0.0, 0.0, 100));
+                    teleport_in_dimension(c, &mut w, (tx, ty, tz, yaw, pitch));
                     let mut h = c.hp.lock().unwrap();
                     *h = (*h - dmg_after(c, 5.0, 0)).max(0.0);
                     if *h <= 0.0 {
@@ -22681,13 +22679,16 @@ fn switch_client_dimension(
         me.chunks.lock().unwrap().clear();
         me.gen_sources.lock().unwrap().clear();
     }
-    {
+    let teleport_id = {
+        let mut teleport = me.teleport.lock().unwrap();
+        let id = teleport.begin();
         // Spawn eligibility reads this pair in the same lock order.
         let mut dim = me.dim.lock().unwrap();
         let mut p = me.pos.lock().unwrap();
         *dim = new_dim;
         *p = (target.0, target.1, target.2, target.3, target.4, true);
-    }
+        id
+    };
     *me.in_portal.lock().unwrap() = false;
     *me.fall_from.lock().unwrap() = target.1;
     {
@@ -22721,11 +22722,11 @@ fn switch_client_dimension(
             true,
         );
     }
-    let _ = send_packet(
-        &mut me.sock.lock().unwrap(),
-        0x40,
-        teleport_pkt(target.0, target.1, target.2, target.3, target.4, 0),
-    );
+    let mut sock = me.sock.lock().unwrap();
+    let mut teleport = me.teleport.lock().unwrap();
+    if teleport.preparing(teleport_id) {
+        send_prepared_teleport(&mut sock, &mut teleport, target, teleport_id);
+    }
 }
 
 /// The portal block states this port recognises (`assets/blocks_1211.json`). The nether
@@ -25575,6 +25576,28 @@ fn chat_nbt(text: &str) -> Vec<u8> {
     v.push(0);
     v
 }
+fn teleport_in_dimension(
+    c: &Client,
+    sock: &mut TcpStream,
+    (x, y, z, yaw, pitch): (f64, f64, f64, f32, f32),
+) {
+    let mut teleport = c.teleport.lock().unwrap();
+    let id = teleport.begin();
+    *c.pos.lock().unwrap() = (x, y, z, yaw, pitch, true);
+    send_prepared_teleport(sock, &mut teleport, (x, y, z, yaw, pitch), id);
+}
+
+fn send_prepared_teleport(
+    sock: &mut TcpStream,
+    teleport: &mut connection_limits::TeleportSync,
+    (x, y, z, yaw, pitch): (f64, f64, f64, f32, f32),
+    id: i32,
+) {
+    if send_packet(sock, 0x40, teleport_pkt(x, y, z, yaw, pitch, i64::from(id))).is_ok() {
+        teleport.sent();
+    }
+}
+
 fn teleport_pkt(x: f64, y: f64, z: f64, yaw: f32, pitch: f32, tid: i64) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&x.to_be_bytes());
@@ -28539,8 +28562,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                             let view = *c.view.lock().unwrap();
                             switch_client_dimension(c, cmd_dim(ctx), (x, y, z, yaw, pitch), view);
                         } else {
-                            { let mut p = c.pos.lock().unwrap(); *p = (x, y, z, yaw, pitch, true); }
-                            let _ = send_packet(&mut c.sock.lock().unwrap(), 0x40, teleport_pkt(x, y, z, yaw, pitch, 100));
+                            teleport_in_dimension(c, &mut c.sock.lock().unwrap(), (x, y, z, yaw, pitch));
                         }
                         n += 1;
                     }
@@ -30035,15 +30057,9 @@ fn handle(mut s: TcpStream) {
     tm.extend_from_slice(&0i64.to_be_bytes());
     tm.extend_from_slice(&6000i64.to_be_bytes());
     let _ = send_packet(&mut s, 0x64, tm);
-    let mut ps = Vec::new();
-    ps.extend_from_slice(&sx.to_be_bytes());
-    ps.extend_from_slice(&sy.to_be_bytes());
-    ps.extend_from_slice(&sz.to_be_bytes());
-    ps.extend_from_slice(&syaw.to_be_bytes());
-    ps.extend_from_slice(&spitch.to_be_bytes());
-    ps.push(0);
-    write_varint(&mut ps, 1);
-    let _ = send_packet(&mut s, 0x40, ps);
+    let mut teleport = connection_limits::TeleportSync::default();
+    let initial_id = teleport.begin();
+    send_prepared_teleport(&mut s, &mut teleport, (sx, sy, sz, syaw, spitch), initial_id);
     let mut ab = vec![0x0du8];
     ab.extend_from_slice(&0.05f32.to_be_bytes());
     ab.extend_from_slice(&0.1f32.to_be_bytes());
@@ -30084,6 +30100,7 @@ fn handle(mut s: TcpStream) {
         },
         name: name.clone(),
         pos: Mutex::new((sx, sy, sz, syaw, spitch, true)),
+        teleport: Mutex::new(teleport),
         hp: Mutex::new(20.0),
         sock: Mutex::new(s.try_clone().unwrap()),
         inv: Mutex::new(saved_inv.unwrap_or_default()),
@@ -30284,6 +30301,12 @@ fn handle(mut s: TcpStream) {
         }
 
         match pid {
+            0x00 => {
+                let mut payload = b.as_slice();
+                if let Some(id) = read_protocol_i32(&mut payload).filter(|_| payload.is_empty()) {
+                    me.teleport.lock().unwrap().confirm(id);
+                }
+            }
             0x18 => {
                 if !keepalive.reply(Instant::now(), &b) {
                     play_disconnect(&mut me.sock.lock().unwrap(), "Timed out");
@@ -30362,10 +30385,12 @@ fn handle(mut s: TcpStream) {
                     let px = f64::from_be_bytes(b[..8].try_into().unwrap());
                     let py = f64::from_be_bytes(b[8..16].try_into().unwrap());
                     let pz = f64::from_be_bytes(b[16..24].try_into().unwrap());
-                    let (mut yaw, mut pitch, mut gnd) = {
-                        let p = me.pos.lock().unwrap();
-                        (p.3, p.4, p.5)
-                    };
+                    let teleport = me.teleport.lock().unwrap();
+                    if !teleport.movement_allowed() {
+                        continue;
+                    }
+                    let mut p = me.pos.lock().unwrap();
+                    let (mut yaw, mut pitch, mut gnd) = (p.3, p.4, p.5);
                     if pid == 0x1b && b.len() >= 33 {
                         yaw = f32::from_be_bytes(b[24..28].try_into().unwrap());
                         pitch = f32::from_be_bytes(b[28..32].try_into().unwrap());
@@ -30373,14 +30398,11 @@ fn handle(mut s: TcpStream) {
                     } else if pid == 0x1a && b.len() >= 25 {
                         gnd = b[24] != 0;
                     }
-                    {
-                        let prev_gnd = {
-                            let p = me.pos.lock().unwrap();
-                            p.5
-                        };
-                        *me.pos.lock().unwrap() = (px, py, pz, yaw, pitch, gnd);
-                        landing::player_move(&me, prev_gnd);
-                    }
+                    let prev_gnd = p.5;
+                    *p = (px, py, pz, yaw, pitch, gnd);
+                    drop(p);
+                    drop(teleport);
+                    landing::player_move(&me, prev_gnd);
                     // P2-3-S4: standing in a portal resps the dimension switch. The guard
                     // lives on the player, so arriving in a destination portal does not
                     // immediately trigger the return trip.
@@ -30426,6 +30448,10 @@ fn handle(mut s: TcpStream) {
                 if b.len() >= 9 {
                     let yaw = f32::from_be_bytes(b[..4].try_into().unwrap());
                     let pitch = f32::from_be_bytes(b[4..8].try_into().unwrap());
+                    let teleport = me.teleport.lock().unwrap();
+                    if !teleport.movement_allowed() {
+                        continue;
+                    }
                     let mut p = me.pos.lock().unwrap();
                     let prev_gnd = p.5;
                     p.3 = yaw;
@@ -30433,6 +30459,7 @@ fn handle(mut s: TcpStream) {
                     p.5 = b[8] != 0;
                     let (px, py, pz, g) = (p.0, p.1, p.2, p.5);
                     drop(p);
+                    drop(teleport);
                     landing::player_move(&me, prev_gnd);
                     broadcast_seen(me.eid, |_c| {
                         (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, g))
@@ -30489,10 +30516,15 @@ fn handle(mut s: TcpStream) {
             0x1d => {
                 // flying: onGround only
                 if !b.is_empty() {
+                    let teleport = me.teleport.lock().unwrap();
+                    if !teleport.movement_allowed() {
+                        continue;
+                    }
                     let mut p = me.pos.lock().unwrap();
                     let prev_gnd = p.5;
                     p.5 = b[0] != 0;
                     drop(p);
+                    drop(teleport);
                     landing::player_move(&me, prev_gnd);
                 }
             }
@@ -34136,14 +34168,11 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     let nz = pz + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
                     let ny = surface_y(nx.round() as i32, nz.round() as i32);
                     if (ny - py).abs() < 8.0 {
-                        {
-                            let mut p = me.pos.lock().unwrap();
-                            *p = (nx, ny, nz, p.3, p.4, true);
-                        }
-                        let _ = send_packet(
+                        let (_, _, _, yaw, pitch, _) = *me.pos.lock().unwrap();
+                        teleport_in_dimension(
+                            me,
                             &mut me.sock.lock().unwrap(),
-                            0x40,
-                            teleport_pkt(nx, ny, nz, 0.0, 0.0, 100),
+                            (nx, ny, nz, yaw, pitch),
                         );
                         break;
                     }
@@ -36271,8 +36300,9 @@ mod mineshaft_runtime_tests {
 
         // Play: wait until Synchronize Player Position (0x40), then wait briefly until handle() pushes Client.
         loop {
-            let (pid, _) = read_server_packet(&mut cli, deadline).expect("play initial position");
+            let (pid, body) = read_server_packet(&mut cli, deadline).expect("play initial position");
             if pid == 0x40 {
+                send_packet(&mut cli, 0x00, body[33..].to_vec()).unwrap();
                 break;
             }
         }
