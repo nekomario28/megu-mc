@@ -78,8 +78,9 @@ impl WorldBorderState {
 
     fn border_damage_for_pos(&self, x: f64, z: f64, now_tick: u64) -> f32 {
         let distance = self.distance_to_border(x, z, now_tick);
-        if distance < -self.damage_safe_zone {
-            ((-distance - self.damage_safe_zone) * self.damage_per_block).max(1.0) as f32
+        if distance < -self.damage_safe_zone && self.damage_per_block > 0.0 {
+            let damage = (-distance - self.damage_safe_zone) * self.damage_per_block;
+            (damage.floor() as i32).max(1) as f32
         } else {
             0.0
         }
@@ -1037,6 +1038,12 @@ mod world_mechanisms_tests {
         assert_eq!(border.border_damage_for_pos(25.0, -10.0, 0), 0.0);
         assert_eq!(border.border_damage_for_pos(26.0, -10.0, 0), 1.0);
         assert_eq!(border.border_damage_for_pos(35.0, -10.0, 0), 2.0);
+        border.damage_per_block = 0.1;
+        assert_eq!(border.border_damage_for_pos(35.0, -10.0, 0), 1.0);
+        assert_eq!(border.border_damage_for_pos(40.0, -10.0, 0), 1.0);
+        assert_eq!(border.border_damage_for_pos(45.0, -10.0, 0), 2.0);
+        border.damage_per_block = 0.0;
+        assert_eq!(border.border_damage_for_pos(45.0, -10.0, 0), 0.0);
         border.absolute_max_size = 12;
         assert_eq!(border.bounds(0), (0.0, -12.0, 12.0, 0.0));
         border.center_x = 100.0;
