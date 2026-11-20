@@ -1,7 +1,9 @@
 //! One JVM owner and guarded Rust world ABI for pinned Fabric and NeoForge operations.
-use crate::landing_types::{Loader, Request, Trample};
+use crate::landing_types::{
+    decode_mutation_batch, Loader, MutationOp, Request, S1EventOutcome, Trample,
+};
 use jni::{
-    objects::{JClass, JObject, JValue},
+    objects::{JClass, JObject, JString, JValue},
     sys::{jboolean, jint},
     InitArgsBuilder, JNIEnv, JNIVersion, JavaVM, NativeMethod,
 };
@@ -18,6 +20,222 @@ static OWNER: OnceLock<ThreadId> = OnceLock::new();
 static SERVER: OnceLock<bool> = OnceLock::new();
 static COMMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ACTIVE: std::sync::Mutex<Option<Trample>> = std::sync::Mutex::new(None);
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct BatchCommitReport {
+    pub(crate) applied_blocks: usize,
+    pub(crate) skipped_cas_blocks: usize,
+    pub(crate) system_messages: Vec<(i32, String)>,
+    pub(crate) registered_commands: Vec<String>,
+}
+
+/// Commit in batch order. Each block write rechecks its own guard, and a save
+/// waits for the whole batch. The caller delivers the returned side effects.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn apply_s1_outcome(outcome: S1EventOutcome) -> Result<BatchCommitReport, String> {
+    let mut report = BatchCommitReport::default();
+    if outcome.canceled {
+        return Ok(report);
+    }
+    // Validate typed callers as well as wire callers before changing any block.
+    for mutation in &outcome.mutations {
+        if let MutationOp::SetBlockIf { dim, .. } = mutation {
+            if usize::from(*dim) >= super::DimId::ALL.len() {
+                return Err(format!("invalid S1 dimension slot {dim}"));
+            }
+        }
+    }
+    super::with_save_guard(|| {
+        for mutation in outcome.mutations {
+            match mutation {
+                MutationOp::SetBlockIf {
+                    dim,
+                    pos: (x, y, z),
+                    new_state,
+                    expected_state,
+                } => {
+                    let dim = super::DimId::ALL[usize::from(dim)];
+                    if super::set_block_if_dim(dim, x, y, z, new_state, expected_state) {
+                        report.applied_blocks += 1;
+                    } else {
+                        report.skipped_cas_blocks += 1;
+                    }
+                }
+                MutationOp::SendSystemMessage {
+                    player_eid,
+                    message,
+                } => {
+                    report.system_messages.push((player_eid, message));
+                }
+                MutationOp::RegisterCommand { literal } => report.registered_commands.push(literal),
+            }
+        }
+    });
+    Ok(report)
+}
+
+#[allow(dead_code)] // S1 requests will be routed by the server separately from trample.
+pub(crate) enum S1Event<'a> {
+    BlockBreak {
+        dim: u8,
+        pos: (i32, i32, i32),
+        state: u32,
+        player: (i32, &'a str),
+        exp_to_drop: i32,
+    },
+    BlockPlace {
+        dim: u8,
+        pos: (i32, i32, i32),
+        replaced: u32,
+        placed: u32,
+        against: u32,
+        player: (i32, &'a str),
+    },
+    PlayerLogin(i32, &'a str),
+    PlayerLogout(i32, &'a str),
+    ServerChat {
+        player: (i32, &'a str),
+        raw_text: &'a str,
+    },
+    RegisterCommands,
+}
+
+/// Dispatch a NeoForge S1 event on the JVM owner. This is staging only. A
+/// Java exception or an invalid wire batch returns no outcome to commit.
+#[allow(dead_code)]
+pub(crate) fn dispatch_s1_event(
+    env: &mut JNIEnv,
+    hooks: &JClass,
+    event: S1Event<'_>,
+) -> Result<S1EventOutcome, String> {
+    if OWNER.get() != Some(&thread::current().id()) {
+        return Err("S1 dispatch requires the JVM owner thread".into());
+    }
+    let wire = env.with_local_frame(16, |env| -> jni::errors::Result<String> {
+        // Java's int carries the same 32 bits as each u32 block state ID.
+        let result = match event {
+            S1Event::BlockBreak {
+                dim,
+                pos: (x, y, z),
+                state,
+                player: (eid, name),
+                exp_to_drop,
+            } => {
+                let name = env.new_string(name)?;
+                env.call_static_method(
+                    hooks,
+                    "dispatchBlockBreakEncoded",
+                    "(IIIIIILjava/lang/String;I)Ljava/lang/String;",
+                    &[
+                        JValue::Int(i32::from(dim)),
+                        JValue::Int(x),
+                        JValue::Int(y),
+                        JValue::Int(z),
+                        JValue::Int(state as i32),
+                        JValue::Int(eid),
+                        JValue::Object(&name),
+                        JValue::Int(exp_to_drop),
+                    ],
+                )
+            }
+            S1Event::BlockPlace {
+                dim,
+                pos: (x, y, z),
+                replaced,
+                placed,
+                against,
+                player: (eid, name),
+            } => {
+                let name = env.new_string(name)?;
+                env.call_static_method(
+                    hooks,
+                    "dispatchBlockPlaceEncoded",
+                    "(IIIIIIIILjava/lang/String;)Ljava/lang/String;",
+                    &[
+                        JValue::Int(i32::from(dim)),
+                        JValue::Int(x),
+                        JValue::Int(y),
+                        JValue::Int(z),
+                        JValue::Int(replaced as i32),
+                        JValue::Int(placed as i32),
+                        JValue::Int(against as i32),
+                        JValue::Int(eid),
+                        JValue::Object(&name),
+                    ],
+                )
+            }
+            S1Event::PlayerLogin(eid, name) | S1Event::PlayerLogout(eid, name) => {
+                let name = env.new_string(name)?;
+                let method = if matches!(event, S1Event::PlayerLogin(..)) {
+                    "dispatchPlayerLoginEncoded"
+                } else {
+                    "dispatchPlayerLogoutEncoded"
+                };
+                env.call_static_method(
+                    hooks,
+                    method,
+                    "(ILjava/lang/String;)Ljava/lang/String;",
+                    &[JValue::Int(eid), JValue::Object(&name)],
+                )
+            }
+            S1Event::ServerChat {
+                player: (eid, name),
+                raw_text,
+            } => {
+                let name = env.new_string(name)?;
+                let raw_text = env.new_string(raw_text)?;
+                env.call_static_method(
+                    hooks,
+                    "dispatchServerChatEncoded",
+                    "(ILjava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    &[
+                        JValue::Int(eid),
+                        JValue::Object(&name),
+                        JValue::Object(&raw_text),
+                    ],
+                )
+            }
+            S1Event::RegisterCommands => env.call_static_method(
+                hooks,
+                "dispatchRegisterCommandsEncoded",
+                "()Ljava/lang/String;",
+                &[],
+            ),
+        }?;
+        let encoded = JString::from(result.l()?);
+        let wire = env.get_string(&encoded)?.into();
+        Ok(wire)
+    });
+    let wire = wire.map_err(|error| s1_dispatch_error(env, error))?;
+    decode_mutation_batch(&wire)
+}
+
+fn s1_dispatch_error(env: &mut JNIEnv, error: jni::errors::Error) -> String {
+    let exception = env.exception_occurred();
+    if let Err(clear_error) = env.exception_clear() {
+        return format!("{error}; could not clear Java exception: {clear_error}");
+    }
+    let Ok(exception) = exception else {
+        return error.to_string();
+    };
+    if exception.is_null() {
+        return error.to_string();
+    }
+    let exception = env.auto_local(exception);
+    let description = env.with_local_frame(4, |env| -> jni::errors::Result<String> {
+        let text = env.call_method(&exception, "toString", "()Ljava/lang/String;", &[])?;
+        let text = JString::from(text.l()?);
+        let description = env.get_string(&text)?.into();
+        Ok(description)
+    });
+    // Throwable.toString itself can throw. Keep the owner usable in that case.
+    if description.is_err() {
+        let _ = env.exception_clear();
+    }
+    description.unwrap_or_else(|_| error.to_string())
+}
+
 fn on_owner(env: &mut JNIEnv) -> bool {
     if OWNER.get() == Some(&thread::current().id()) {
         return true;
@@ -389,4 +607,85 @@ fn register_host(env: &mut JNIEnv, host: JObject) -> Result<(), jni::errors::Err
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s1_commit_rolls_back_cancellation_and_rechecks_each_cas() {
+        let _world = super::super::world_guard();
+        let (x, y, z) = (3203, 88, -3207);
+        let end = super::super::DimId::End;
+        let nether = super::super::DimId::Nether;
+        let state = |dim| super::super::block_at_dim(dim, x, y, z);
+        let end_before = state(end);
+        let nether_before = state(nether);
+        let first = if end_before == 1 { 2 } else { 1 };
+        let final_state = 10;
+        let nether_state = if nether_before == 1 { 2 } else { 1 };
+        let block = |dim, new_state, expected_state| MutationOp::SetBlockIf {
+            dim,
+            pos: (x, y, z),
+            new_state,
+            expected_state,
+        };
+        let batch = |canceled| S1EventOutcome {
+            canceled,
+            break_exp: None,
+            chat_message: None,
+            mutations: vec![
+                block(2, first, Some(end_before)),
+                block(2, 11, Some(end_before)), // stale after the first write
+                block(2, final_state, Some(first)),
+                block(1, nether_state, None),
+                MutationOp::SendSystemMessage {
+                    player_eid: 42,
+                    message: "updated".into(),
+                },
+                MutationOp::RegisterCommand {
+                    literal: "greet".into(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            apply_s1_outcome(batch(true)),
+            Ok(BatchCommitReport::default())
+        );
+        assert_eq!((state(end), state(nether)), (end_before, nether_before));
+
+        let mut invalid = batch(false);
+        invalid.mutations.push(block(3, 1, None));
+        assert!(apply_s1_outcome(invalid).is_err());
+        assert_eq!((state(end), state(nether)), (end_before, nether_before));
+
+        assert_eq!(
+            apply_s1_outcome(batch(false)),
+            Ok(BatchCommitReport {
+                applied_blocks: 3,
+                skipped_cas_blocks: 1,
+                system_messages: vec![(42, "updated".into())],
+                registered_commands: vec!["greet".into()],
+            })
+        );
+        assert_eq!((state(end), state(nether)), (final_state, nether_state));
+        assert!(super::super::set_block_if_dim(
+            end,
+            x,
+            y,
+            z,
+            end_before,
+            Some(final_state)
+        ));
+        assert!(super::super::set_block_if_dim(
+            nether,
+            x,
+            y,
+            z,
+            nether_before,
+            Some(nether_state)
+        ));
+    }
 }

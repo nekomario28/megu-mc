@@ -22,7 +22,7 @@ version="1.0.0"
 displayName="S1 test"
 '''
 
-MOD = """package nf2;
+MOD = r"""package nf2;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
@@ -90,6 +90,11 @@ public class FixtureMod {
     } else if (event.getRawText().equals("outer")) {
       ServerHooks.onServerChat(event.getPlayer(), "inner");
       event.setMessage(Component.literal("outer rewritten"));
+    } else if (event.getRawText().equals("nested-rewrite")) {
+      ServerHooks.onServerChat(event.getPlayer(), "hello");
+    } else if (event.getRawText().equals("escape")) {
+      event.getPlayer().sendSystemMessage(Component.literal("line\nnext\\tab\treturn\r🌍"));
+      event.setMessage(Component.literal("new\nchat\\text\t\r🌍"));
     } else if (event.getRawText().equals("loop")) {
       ServerHooks.onServerChat(event.getPlayer(), "loop");
     }
@@ -131,7 +136,7 @@ UNKNOWN_CLASS = """package com.mojang.brigadier.unknown;
 public class Unavailable { public static void invoke() {} }
 """
 
-RUNNER = """package net.mcspine.neoforge;
+RUNNER = r"""package net.mcspine.neoforge;
 import java.util.List;
 import com.mojang.brigadier.CommandDispatcher;
 import net.minecraft.core.BlockPos;
@@ -202,6 +207,44 @@ public class S1Checks {
     check(trample.isCanceled() && FixtureMod.farmlandCount == 1, "farmland legacy event");
     System.out.println("PASS S1 six events, subscriber, chat rewrite, scoped cancel, CAS batch, command, farmland");
   }
+  static void checkWire(String actual, String... records) {
+    String expected = String.join("\n", records);
+    check(actual.equals(expected), "expected wire [" + expected + "] but got [" + actual + "]");
+  }
+  static void encoded(ServerPlayer player) {
+    checkWire(ServerHooks.dispatchBlockBreakEncoded(2, 2, 70, 3, 11, 42, "Alex", 1),
+      "S1\t0", "message\t42\tbroke", "block\t2\t2\t70\t3\t88\t11", "exp\t7", "end");
+    checkWire(ServerHooks.dispatchBlockBreakEncoded(2, 100, 70, 3, 11, 42, "Alex", 1),
+      "S1\t1", "end");
+    checkWire(ServerHooks.dispatchBlockPlaceEncoded(2, 5, 70, 3, 33, 65, 9, 42, "Alex"),
+      "S1\t0", "block\t2\t5\t70\t3\t65\t33", "end");
+    checkWire(ServerHooks.dispatchBlockPlaceEncoded(2, 200, 70, 3, 33, 65, 9, 42, "Alex"),
+      "S1\t1", "end");
+    checkWire(ServerHooks.dispatchPlayerLoginEncoded(42, "Alex"), "S1\t0", "message\t42\twelcome", "end");
+    checkWire(ServerHooks.dispatchPlayerLogoutEncoded(42, "Alex"), "S1\t0", "message\t42\tbye", "end");
+    checkWire(ServerHooks.dispatchServerChatEncoded(42, "Alex", "escape"), "S1\t0", "message\t42\tchat fired",
+      "message\t42\tline\\nnext\\\\tab\\treturn\\r🌍", "chat\tnew\\nchat\\\\text\\t\\r🌍", "end");
+    checkWire(ServerHooks.dispatchServerChatEncoded(42, "Alex", "reject"), "S1\t1", "end");
+    checkWire(ServerHooks.dispatchServerChatEncoded(42, "Alex", "outer"),
+      "S1\t0", "message\t42\tchat fired", "chat\touter rewritten", "end");
+    checkWire(ServerHooks.dispatchServerChatEncoded(42, "Alex", "nested-rewrite"),
+      "S1\t0", "message\t42\tchat fired", "message\t42\tchat fired", "end");
+    checkWire(ServerHooks.dispatchRegisterCommandsEncoded(), "S1\t0", "command\tgreet", "end");
+    checkWire(MutationBuffer.encode(false, List.of(new MutationBuffer.SetBlockIf(1, -1, 0, 1, -1, -2)), null),
+      "S1\t0", "block\t1\t-1\t0\t1\t4294967295\t4294967294", "end");
+    try {
+      MutationBuffer.encode(false, List.of(new MutationBuffer.SetBlockIf(3, 0, 0, 0, 2, 1)), null);
+      throw new AssertionError("invalid dimension encoded");
+    } catch (IllegalArgumentException expected) { }
+    try {
+      MutationBuffer.encode(false, List.of(new MutationBuffer.SendSystemMessage(42, "\uD800")), null);
+      throw new AssertionError("unpaired surrogate encoded");
+    } catch (IllegalArgumentException expected) { }
+    checkOverflow(player, () -> ServerHooks.dispatchServerChatEncoded(42, "Alex", "loop"));
+    checkWire(ServerHooks.dispatchServerChatEncoded(42, "Alex", "hello"),
+      "S1\t0", "message\t42\tchat fired", "chat\tHELLO", "end");
+    System.out.println("PASS encoded S1 six events, escaping, scoped responses, cancellation and overflow recovery");
+  }
   static void scopes() {
     MutationBuffer.beginEvent();
     MutationBuffer.append(new MutationBuffer.RegisterCommand("outer"));
@@ -238,9 +281,13 @@ public class S1Checks {
     System.out.println("PASS scoped mutation rollback and depth 5 fail-closed");
   }
   static void overflow(ServerPlayer player) {
+    checkOverflow(player, () -> ServerHooks.onServerChat(player, "loop"));
+    System.out.println("PASS real event bus reentrancy depth >4 rollback and subsequent recovery");
+  }
+  static void checkOverflow(ServerPlayer player, Runnable dispatch) {
     boolean failedClosed = false;
     try {
-      ServerHooks.onServerChat(player, "loop");
+      dispatch.run();
     } catch (Throwable error) {
       for (Throwable cause = error; cause != null; cause = cause.getCause()) {
         if (cause instanceof IllegalStateException
@@ -253,7 +300,6 @@ public class S1Checks {
       "overflow leaked pending mutations or scopes");
     check(!ServerHooks.onServerChat(player, "reject").mutations().iterator().hasNext(),
       "next event after overflow not reset");
-    System.out.println("PASS real event bus reentrancy depth >4 rollback and subsequent recovery");
   }
   public static void main(String[] args) throws Exception {
     Bootstrap.initialize(args[1]);
@@ -262,6 +308,7 @@ public class S1Checks {
     check(player.getEid() == 42 && player.getName().getString().equals("Alex"), "player facade");
     switch (args[0]) {
       case "batch" -> batch(player);
+      case "encoded" -> encoded(player);
       case "scopes" -> scopes();
       case "overflow" -> overflow(player);
       default -> throw new AssertionError(args[0]);
@@ -349,6 +396,11 @@ class NeoForgeS1EventsTests(unittest.TestCase):
         result = self.run_java("net.mcspine.neoforge.S1Checks", "batch", self.mod_dir.parent)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("PASS S1 six events", result.stdout)
+
+    def test_six_events_encoded_batch(self):
+        result = self.run_java("net.mcspine.neoforge.S1Checks", "encoded", self.mod_dir.parent)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("PASS encoded S1 six events", result.stdout)
 
     def test_mutation_scopes_and_overflow(self):
         result = self.run_java("net.mcspine.neoforge.S1Checks", "scopes", self.mod_dir.parent)

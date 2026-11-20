@@ -80,4 +80,63 @@ public final class MutationBuffer {
     }
 
     public static void discardAll() { STATE.remove(); }
+
+    static int requireDimension(int dim) {
+        if (dim < 0 || dim > 2) throw new IllegalArgumentException("Invalid S1 dimension slot " + dim);
+        return dim;
+    }
+
+    /** Versioned, tab-delimited records shared with Rust's decode_mutation_batch. */
+    static String encode(boolean canceled, List<Mutation> batch, Mutation response) {
+        if (canceled) {
+            if (!batch.isEmpty() || response != null) {
+                throw new IllegalStateException("Canceled S1 batch must be empty");
+            }
+            return "S1\t1\nend";
+        }
+        StringBuilder wire = new StringBuilder("S1\t0\n");
+        for (Mutation mutation : batch) {
+            switch (mutation) {
+                case SetBlockIf block -> wire.append("block\t").append(requireDimension(block.dim()))
+                    .append('\t').append(block.x()).append('\t').append(block.y()).append('\t').append(block.z())
+                    .append('\t').append(Integer.toUnsignedString(block.newState()))
+                    .append('\t').append(Integer.toUnsignedString(block.expectedState())).append('\n');
+                case SendSystemMessage message -> {
+                    wire.append("message\t").append(message.playerEid()).append('\t');
+                    appendText(wire, message.text());
+                }
+                case RegisterCommand command -> appendText(wire.append("command\t"), command.literal());
+                // Only the outermost event can change the host's XP or chat payload.
+                case BreakExp ignored -> { }
+                case ChatMessage ignored -> { }
+            }
+        }
+        switch (response) {
+            case null -> { }
+            case BreakExp exp -> wire.append("exp\t").append(exp.exp()).append('\n');
+            case ChatMessage chat -> appendText(wire.append("chat\t"), chat.text());
+            default -> throw new IllegalArgumentException("Invalid S1 event response " + response);
+        }
+        return wire.append("end").toString();
+    }
+
+    private static void appendText(StringBuilder wire, String text) {
+        for (int offset = 0; offset < text.length();) {
+            int ch = text.codePointAt(offset);
+            switch (ch) {
+                case '\\' -> wire.append("\\\\");
+                case '\n' -> wire.append("\\n");
+                case '\r' -> wire.append("\\r");
+                case '\t' -> wire.append("\\t");
+                default -> {
+                    if (ch >= Character.MIN_SURROGATE && ch <= Character.MAX_SURROGATE) {
+                        throw new IllegalArgumentException("Unpaired surrogate in S1 text");
+                    }
+                    wire.appendCodePoint(ch);
+                }
+            }
+            offset += Character.charCount(ch);
+        }
+        wire.append('\n');
+    }
 }
