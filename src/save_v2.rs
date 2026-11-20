@@ -51,6 +51,877 @@ fn pos_store() -> &'static LockedMap<String, DimPosRot> {
     POS_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Fixed-width signed values and IEEE floats are always big endian.
+macro_rules! save_numbers {
+    ($out:expr, $($value:expr),+ $(,)?) => {
+        $($out.extend_from_slice(&$value.to_be_bytes());)+
+    };
+}
+
+// The live respawn point currently exposes only a destination and angle. Keep
+// that representation distinct from targets with explicit bed/anchor semantics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SpawnTargetKind {
+    Legacy,
+    Bed,
+    Anchor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SpawnTarget {
+    kind: SpawnTargetKind,
+    dim: DimId,
+    position: (f64, f64, f64),
+    angle: f32,
+    forced: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PlayerSave {
+    position: DimPosRot,
+    inventory: HashMap<i16, Stack>,
+    ender_chest: HashMap<i16, Stack>,
+    held: i16,
+    health: f32,
+    absorption: f32,
+    food: i32,
+    saturation: f32,
+    exhaustion: f64,
+    xp_level: i32,
+    xp_progress: f32,
+    xp_total: i64,
+    gamemode: u8,
+    effects: Vec<(i32, i32, i32)>,
+    respawn: Option<SpawnTarget>,
+}
+
+// WORLD_SPAWN and the default spawn packet carry yaw. Keep pitch with the save.
+static WORLD_SPAWN_PITCH: Mutex<f32> = Mutex::new(0.0);
+
+fn saved_players() -> &'static LockedMap<[u8; 16], PlayerSave> {
+    static PLAYERS: Registry<[u8; 16], PlayerSave> = OnceLock::new();
+    PLAYERS.get_or_init(Mutex::default)
+}
+
+fn saved_value<T: Copy>(value: &Mutex<T>) -> T {
+    *value.lock().unwrap()
+}
+
+impl PlayerSave {
+    fn capture(client: &Client, position: DimPosRot, inventory: &HashMap<i16, Stack>) -> Self {
+        let (xp_total, (xp_level, xp_progress)) = {
+            let total = client.xp.lock().unwrap();
+            let sessions = player_mechanism_sessions().lock().unwrap();
+            (
+                *total,
+                sessions.get(&client.eid).map_or((0, 0.0), |s| s.xp_bar),
+            )
+        };
+        let respawn = {
+            let dim = client.spawn_dim.lock().unwrap();
+            saved_value(&client.spawn_pt).map(|(x, y, z, angle)| SpawnTarget {
+                kind: SpawnTargetKind::Legacy,
+                dim: *dim,
+                position: (x, y, z),
+                angle,
+                forced: false,
+            })
+        };
+        let ender_chest = chests()
+            .lock()
+            .unwrap()
+            .get(&ender_container_key(&client.uuid))
+            .map(|slots| saved_slots(slots, 0..27))
+            .unwrap_or_default();
+        let effects = client
+            .effs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|effect| (effect.id, effect.amp, effect.left))
+            .collect();
+        Self {
+            position,
+            // Window 0 slots 5–8 are armor, 9–44 inventory, and 45 offhand.
+            inventory: saved_slots(inventory, 5..46),
+            ender_chest,
+            held: saved_value(&client.held),
+            health: saved_value(&client.hp),
+            absorption: saved_value(&client.absorb),
+            food: saved_value(&client.food),
+            saturation: saved_value(&client.sat),
+            exhaustion: saved_value(&client.walk_acc),
+            xp_level,
+            xp_progress,
+            xp_total,
+            gamemode: saved_value(&client.gm),
+            effects,
+            respawn,
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        let (dim, x, y, z, yaw, pitch) = self.position;
+        out.push(dim.index() as u8);
+        save_numbers!(out, x, y, z, yaw, pitch);
+        write_saved_slots(out, &self.inventory);
+        write_saved_slots(out, &self.ender_chest);
+        save_numbers!(
+            out,
+            self.held,
+            self.health,
+            self.absorption,
+            self.food,
+            self.saturation,
+            self.exhaustion,
+            self.xp_level,
+            self.xp_progress,
+            self.xp_total
+        );
+        out.push(self.gamemode);
+        write_varint(out, self.effects.len() as i64);
+        for &(id, amp, left) in &self.effects {
+            save_numbers!(out, id, amp, left);
+        }
+        if let Some(point) = self.respawn {
+            out.push(match point.kind {
+                SpawnTargetKind::Legacy => 1,
+                SpawnTargetKind::Bed => 2,
+                SpawnTargetKind::Anchor => 3,
+            });
+            out.push(point.dim.index() as u8);
+            let (x, y, z) = point.position;
+            save_numbers!(out, x, y, z, point.angle);
+            out.push(u8::from(point.forced));
+        } else {
+            out.push(0);
+        }
+    }
+
+    fn read(input: &mut SaveInput<'_>) -> Result<Self, &'static str> {
+        let dim = input.dim()?;
+        let (x, y, z) = input.position()?;
+        let yaw = input.f32()?;
+        let pitch = input.f32()?;
+        let inventory = input.slots(5..46)?;
+        let ender_chest = input.slots(0..27)?;
+        let held = i16::from_be_bytes(input.take()?);
+        let health = input.f32()?;
+        let absorption = input.f32()?;
+        let food = i32::from_be_bytes(input.take()?);
+        let saturation = input.f32()?;
+        let exhaustion = input.f64()?;
+        let xp_level = i32::from_be_bytes(input.take()?);
+        let xp_progress = input.f32()?;
+        let xp_total = i64::from_be_bytes(input.take()?);
+        let gamemode = input.byte()?;
+        if !(0..=8).contains(&held) || gamemode > 3 {
+            return Err("invalid saved player slot or game mode");
+        }
+        let count = input.var_count(12)?;
+        let mut effects = Vec::new();
+        for _ in 0..count {
+            effects.push((
+                i32::from_be_bytes(input.take()?),
+                i32::from_be_bytes(input.take()?),
+                i32::from_be_bytes(input.take()?),
+            ));
+        }
+        let respawn = match input.byte()? {
+            0 => None,
+            tag @ 1..=3 => Some(SpawnTarget {
+                kind: [
+                    SpawnTargetKind::Legacy,
+                    SpawnTargetKind::Bed,
+                    SpawnTargetKind::Anchor,
+                ][usize::from(tag - 1)],
+                dim: input.dim()?,
+                position: input.position()?,
+                angle: input.f32()?,
+                forced: input.flag()?,
+            }),
+            _ => return Err("invalid saved respawn target"),
+        };
+        Ok(Self {
+            position: (dim, x, y, z, yaw, pitch),
+            inventory,
+            ender_chest,
+            held,
+            health,
+            absorption,
+            food,
+            saturation,
+            exhaustion,
+            xp_level,
+            xp_progress,
+            xp_total,
+            gamemode,
+            effects,
+            respawn,
+        })
+    }
+}
+
+fn saved_slots(slots: &HashMap<i16, Stack>, range: std::ops::Range<i16>) -> HashMap<i16, Stack> {
+    range
+        .filter_map(|slot| {
+            slots
+                .get(&slot)
+                .filter(|stack| stack.1 != 0)
+                .map(|s| (slot, s.clone()))
+        })
+        .collect()
+}
+
+fn write_saved_slots(out: &mut Vec<u8>, slots: &HashMap<i16, Stack>) {
+    let mut entries: Vec<_> = slots.iter().collect();
+    entries.sort_unstable_by_key(|(&slot, _)| slot);
+    write_varint(out, entries.len() as i64);
+    for (&slot, stack) in entries {
+        save_numbers!(out, slot);
+        write_saved_stack(out, stack);
+    }
+}
+
+fn write_saved_stack(out: &mut Vec<u8>, (item, count, comps): &Stack) {
+    write_varint(out, *item);
+    out.push(*count);
+    write_saved_components(out, comps);
+}
+
+fn write_saved_components(out: &mut Vec<u8>, comps: &Comps) {
+    write_varint(out, comps.len() as i64);
+    for (ty, data) in comps {
+        write_varint(out, *ty);
+        write_varint(out, data.len() as i64);
+        out.extend_from_slice(data);
+    }
+}
+
+// Mob records follow the MET4 ordinals. IDs visible to clients are re-issued
+// on load, so none of the serialized state may refer to an old runtime ID.
+struct MobSave {
+    uuid: [u8; 16],
+    etype: i64,
+    yaw: f32,
+    pitch: f32,
+    vel: [f64; 3],
+    fuse: i32,
+    fire_ticks: i32,
+    love: i32,
+    air: i32,
+    state: LiveMobState,
+    villager: Option<Villager>,
+    sitting_cat: bool,
+}
+
+const SAVED_WITCH_POTIONS: [WitchPotion; 8] = [
+    WitchPotion::WaterBreathing,
+    WitchPotion::FireResistance,
+    WitchPotion::Healing,
+    WitchPotion::Swiftness,
+    WitchPotion::Slowness,
+    WitchPotion::Poison,
+    WitchPotion::Weakness,
+    WitchPotion::Harming,
+];
+
+fn write_saved_potion(out: &mut Vec<u8>, potion: WitchPotion) {
+    let index = SAVED_WITCH_POTIONS
+        .iter()
+        .position(|&p| p == potion)
+        .unwrap();
+    out.push(index as u8);
+}
+
+fn read_saved_potion(input: &mut SaveInput<'_>) -> Result<WitchPotion, &'static str> {
+    SAVED_WITCH_POTIONS
+        .get(usize::from(input.byte()?))
+        .copied()
+        .ok_or("invalid saved mob potion")
+}
+
+impl MobSave {
+    fn write(out: &mut Vec<u8>, mob: &Mob, yaw: f32, pitch: f32, now: u64) {
+        out.extend_from_slice(&mob.uuid);
+        write_varint(out, mob.etype);
+        let [dx, dy, dz] = saved_value(&mob.vel);
+        save_numbers!(
+            out,
+            yaw,
+            pitch,
+            dx,
+            dy,
+            dz,
+            saved_value(&mob.fuse),
+            saved_value(&mob.fire_ticks),
+            saved_value(&mob.love),
+            saved_value(&mob.air)
+        );
+        out.push(u8::from(sitting_cats().lock().unwrap().contains(&mob.eid)));
+        Self::write_behavior(out, live_mob_states().lock().unwrap().get(&mob.eid), now);
+        let villagers = live_villagers().lock().unwrap();
+        let villager = villagers.get(&mob.eid);
+        out.push(u8::from(villager.is_some()));
+        if let Some(villager) = villager {
+            write_saved_villager(out, villager);
+        }
+    }
+
+    fn write_behavior(out: &mut Vec<u8>, state: Option<&LiveMobState>, now: u64) {
+        if let Some(state) = state {
+            out.push(1);
+            out.push(u8::from(state.blaze_charged));
+            let effects: Vec<_> = state
+                .potions
+                .iter()
+                .filter(|(_, until)| *until > now)
+                .collect();
+            write_varint(out, effects.len() as i64);
+            for &(potion, until) in effects {
+                write_saved_potion(out, potion);
+                save_numbers!(out, until - now);
+            }
+            match &state.behavior {
+                Some(MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet)) => {
+                    write_optional_uuid(out, pet.owner);
+                    save_numbers!(out, pet.hp);
+                    out.extend([u8::from(pet.sitting), pet.collar_color]);
+                }
+                Some(MobBehaviorState::Slime {
+                    behavior,
+                    split_roll,
+                }) => {
+                    out.extend([behavior.size as u8, *split_roll]);
+                }
+                Some(MobBehaviorState::Piglin(piglin)) => {
+                    save_numbers!(out, piglin.conversion.unsafe_ticks);
+                }
+                Some(MobBehaviorState::Hoglin(hoglin)) => {
+                    save_numbers!(out, hoglin.conversion.unsafe_ticks);
+                }
+                Some(MobBehaviorState::Blaze(blaze)) => {
+                    let (phase, ticks, shots) = match blaze.phase {
+                        BlazePhase::Idle(ticks) => (0, ticks, 0),
+                        BlazePhase::Charging(ticks) => (1, ticks, 0),
+                        BlazePhase::Burst { ticks, shots } => (2, ticks, shots),
+                        BlazePhase::Cooldown(ticks) => (3, ticks, 0),
+                    };
+                    out.extend([phase, ticks, shots, blaze.melee_cooldown]);
+                }
+                Some(MobBehaviorState::Ghast(ghast)) => {
+                    save_numbers!(out, ghast.altitude, ghast.attack_tick);
+                }
+                Some(MobBehaviorState::Shulker(shulker)) => {
+                    out.extend([shulker.open_ticks, shulker.shot_ticks]);
+                }
+                Some(MobBehaviorState::Witch(witch)) => {
+                    out.push(u8::from(witch.drinking.is_some()));
+                    if let Some((ticks, potion)) = witch.drinking {
+                        out.push(ticks);
+                        write_saved_potion(out, potion);
+                    }
+                }
+                Some(MobBehaviorState::Wither(wither)) => {
+                    save_numbers!(out, wither.hp, wither.spawn_ticks);
+                }
+                Some(MobBehaviorState::Warden(warden)) => {
+                    save_numbers!(out, warden.hp);
+                    out.push(warden.sonic_cooldown);
+                }
+                _ => {}
+            }
+        } else {
+            out.push(0);
+        }
+    }
+
+    fn read(input: &mut SaveInput<'_>) -> Result<Self, &'static str> {
+        let uuid = input.take()?;
+        let etype = input.varint()?;
+        let yaw = input.f32()?;
+        let pitch = input.f32()?;
+        let vel = [input.f64()?, input.f64()?, input.f64()?];
+        let fuse = i32::from_be_bytes(input.take()?);
+        let fire_ticks = i32::from_be_bytes(input.take()?);
+        let love = i32::from_be_bytes(input.take()?);
+        let air = i32::from_be_bytes(input.take()?);
+        let sitting_cat = input.flag()?;
+        let mut state = LiveMobState::new(etype);
+        if input.flag()? {
+            state.blaze_charged = input.flag()?;
+            let effects = input.var_count(9)?;
+            for _ in 0..effects {
+                let potion = read_saved_potion(input)?;
+                let remaining = u64::from_be_bytes(input.take()?);
+                if !(1..=i32::MAX as u64).contains(&remaining) {
+                    return Err("invalid saved mob effect duration");
+                }
+                state.potions.push((potion, remaining));
+            }
+            match &mut state.behavior {
+                Some(MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet)) => {
+                    pet.owner = input.optional_uuid()?;
+                    pet.hp = input.f32()?;
+                    pet.sitting = input.flag()?;
+                    pet.collar_color = input.byte()?;
+                    if pet.collar_color > 15 {
+                        return Err("invalid saved pet collar");
+                    }
+                }
+                Some(MobBehaviorState::Slime {
+                    behavior,
+                    split_roll,
+                }) => {
+                    behavior.size = match input.byte()? {
+                        1 => SlimeSize::Small,
+                        2 => SlimeSize::Medium,
+                        4 => SlimeSize::Large,
+                        _ => return Err("invalid saved slime size"),
+                    };
+                    *split_roll = input.byte()?;
+                }
+                Some(MobBehaviorState::Piglin(piglin)) => {
+                    piglin.conversion.unsafe_ticks = u16::from_be_bytes(input.take()?);
+                }
+                Some(MobBehaviorState::Hoglin(hoglin)) => {
+                    hoglin.conversion.unsafe_ticks = u16::from_be_bytes(input.take()?);
+                }
+                Some(MobBehaviorState::Blaze(blaze)) => {
+                    let [phase, ticks, shots, cooldown] = input.take()?;
+                    blaze.phase = match phase {
+                        0 if ticks > 0 => BlazePhase::Idle(ticks),
+                        1 if ticks > 0 => BlazePhase::Charging(ticks),
+                        2 if ticks > 0 && (1..=3).contains(&shots) => {
+                            BlazePhase::Burst { ticks, shots }
+                        }
+                        3 if ticks > 0 => BlazePhase::Cooldown(ticks),
+                        _ => return Err("invalid saved blaze phase"),
+                    };
+                    blaze.melee_cooldown = cooldown;
+                }
+                Some(MobBehaviorState::Ghast(ghast)) => {
+                    ghast.altitude = input.f64()?;
+                    ghast.attack_tick = i8::from_be_bytes(input.take()?);
+                    if !(-40..20).contains(&ghast.attack_tick) {
+                        return Err("invalid saved ghast attack tick");
+                    }
+                }
+                Some(MobBehaviorState::Shulker(shulker)) => {
+                    let [open, shot] = input.take()?;
+                    shulker.open_ticks = open;
+                    shulker.shot_ticks = shot;
+                }
+                Some(MobBehaviorState::Witch(witch)) => {
+                    if input.flag()? {
+                        let ticks = input.byte()?;
+                        if !(1..=32).contains(&ticks) {
+                            return Err("invalid saved witch drinking time");
+                        }
+                        witch.drinking = Some((ticks, read_saved_potion(input)?));
+                    }
+                }
+                Some(MobBehaviorState::Wither(wither)) => {
+                    wither.hp = input.f32()?;
+                    wither.spawn_ticks = u16::from_be_bytes(input.take()?);
+                }
+                Some(MobBehaviorState::Warden(warden)) => {
+                    warden.hp = input.f32()?;
+                    warden.sonic_cooldown = input.byte()?;
+                }
+                _ => {}
+            }
+        }
+        let villager = if input.flag()? {
+            Some(read_saved_villager(input)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            uuid,
+            etype,
+            yaw,
+            pitch,
+            vel,
+            fuse,
+            fire_ticks,
+            love,
+            air,
+            state,
+            villager,
+            sitting_cat,
+        })
+    }
+}
+
+fn write_optional_uuid(out: &mut Vec<u8>, uuid: Option<[u8; 16]>) {
+    out.push(u8::from(uuid.is_some()));
+    if let Some(uuid) = uuid {
+        out.extend_from_slice(&uuid);
+    }
+}
+
+const SAVED_PROFESSIONS: [VillagerProfession; 15] = {
+    use VillagerProfession::*;
+    [
+        None,
+        Armorer,
+        Butcher,
+        Cartographer,
+        Cleric,
+        Farmer,
+        Fisherman,
+        Fletcher,
+        Leatherworker,
+        Librarian,
+        Mason,
+        Nitwit,
+        Shepherd,
+        Toolsmith,
+        Weaponsmith,
+    ]
+};
+
+fn write_saved_block_pos(out: &mut Vec<u8>, (x, y, z): BlockPos) {
+    save_numbers!(out, x, y, z);
+}
+
+fn write_saved_villager(out: &mut Vec<u8>, villager: &Villager) {
+    out.extend_from_slice(&villager.id);
+    let profession = SAVED_PROFESSIONS
+        .iter()
+        .position(|&p| p == villager.profession)
+        .unwrap();
+    out.push(profession as u8);
+    // The level is derived from XP in the live merchant.
+    save_numbers!(out, villager.villager_xp);
+    for pos in [villager.home, villager.job_site, villager.meeting_point] {
+        out.push(u8::from(pos.is_some()));
+        if let Some(pos) = pos {
+            write_saved_block_pos(out, pos);
+        }
+    }
+    out.extend([u8::from(villager.sleeping), villager.restocks_today]);
+    for tick in [villager.day, villager.last_restock, villager.last_gossip] {
+        out.push(u8::from(tick.is_some()));
+        if let Some(tick) = tick {
+            save_numbers!(out, tick);
+        }
+    }
+    let write_cost = |out: &mut Vec<u8>, cost: &ItemCost| {
+        write_varint(out, cost.item);
+        save_numbers!(out, cost.count);
+        write_saved_components(out, &cost.components);
+    };
+    write_varint(out, villager.offers.len() as i64);
+    for offer in &villager.offers {
+        write_cost(out, &offer.cost_a);
+        out.push(u8::from(offer.cost_b.is_some()));
+        if let Some(cost) = &offer.cost_b {
+            write_cost(out, cost);
+        }
+        write_saved_stack(out, &offer.result);
+        save_numbers!(
+            out,
+            offer.uses,
+            offer.max_uses,
+            offer.xp_reward,
+            offer.price_multiplier,
+            offer.demand,
+            offer.special_price_diff
+        );
+    }
+    let mut gossip: Vec<_> = villager.gossip.by_player.iter().collect();
+    gossip.sort_unstable_by_key(|&(&uuid, _)| uuid);
+    write_varint(out, gossip.len() as i64);
+    for (uuid, values) in gossip {
+        out.extend_from_slice(uuid);
+        for value in values {
+            save_numbers!(out, value);
+        }
+    }
+}
+
+fn read_saved_villager(input: &mut SaveInput<'_>) -> Result<Villager, &'static str> {
+    let id = input.take()?;
+    let profession = *SAVED_PROFESSIONS
+        .get(usize::from(input.byte()?))
+        .ok_or("invalid saved villager profession")?;
+    let villager_xp = i32::from_be_bytes(input.take()?);
+    let home = input.optional_block_pos()?;
+    let job_site = input.optional_block_pos()?;
+    let meeting_point = input.optional_block_pos()?;
+    let sleeping = input.flag()?;
+    let restocks_today = input.byte()?;
+    let day = input.optional_tick()?;
+    let last_restock = input.optional_tick()?;
+    let last_gossip = input.optional_tick()?;
+    let read_cost = |input: &mut SaveInput<'_>| {
+        let item = input.varint()?;
+        let count = i32::from_be_bytes(input.take()?);
+        if item <= 0 || count <= 0 {
+            return Err("invalid saved villager trade cost");
+        }
+        Ok(ItemCost {
+            item,
+            count,
+            components: input.components()?,
+        })
+    };
+    let count = input.var_count(34)?;
+    let mut offers = Vec::new();
+    for _ in 0..count {
+        let cost_a = read_cost(input)?;
+        let cost_b = if input.flag()? {
+            Some(read_cost(input)?)
+        } else {
+            None
+        };
+        offers.push(MerchantOffer {
+            cost_a,
+            cost_b,
+            result: input.stack()?,
+            uses: i32::from_be_bytes(input.take()?),
+            max_uses: i32::from_be_bytes(input.take()?),
+            xp_reward: i32::from_be_bytes(input.take()?),
+            price_multiplier: input.f32()?,
+            demand: i32::from_be_bytes(input.take()?),
+            special_price_diff: i32::from_be_bytes(input.take()?),
+        });
+    }
+    let count = input.var_count(16 + 4 * GossipType::ALL.len())?;
+    let mut gossip = VillagerGossip::default();
+    for _ in 0..count {
+        let uuid = input.take()?;
+        let mut values = [0; GossipType::ALL.len()];
+        for (value, kind) in values.iter_mut().zip(GossipType::ALL) {
+            *value = i32::from_be_bytes(input.take()?);
+            if !(0..=kind.rules().1).contains(value) {
+                return Err("invalid saved gossip value");
+            }
+        }
+        if gossip.by_player.insert(uuid, values).is_some() {
+            return Err("duplicate saved gossip player");
+        }
+    }
+    Ok(Villager {
+        id,
+        profession,
+        villager_xp,
+        home,
+        job_site,
+        meeting_point,
+        sleeping,
+        offers,
+        trading_player: None,
+        gossip,
+        day,
+        restocks_today,
+        last_restock,
+        last_gossip,
+    })
+}
+
+fn saved_raids() -> &'static Mutex<Vec<(DimId, Raid)>> {
+    static RAIDS: OnceLock<Mutex<Vec<(DimId, Raid)>>> = OnceLock::new();
+    RAIDS.get_or_init(Mutex::default)
+}
+
+const SAVED_RAID_STATES: [RaidState; 5] = [
+    RaidState::Celebrating,
+    RaidState::InProgress,
+    RaidState::Victory,
+    RaidState::Loss,
+    RaidState::Stopped,
+];
+
+fn write_saved_raid(out: &mut Vec<u8>, dim: DimId, raid: &Raid) {
+    out.push(dim.index() as u8);
+    write_saved_block_pos(out, raid.center);
+    write_saved_block_pos(out, raid.origin);
+    let state = SAVED_RAID_STATES
+        .iter()
+        .position(|&s| s == raid.state)
+        .unwrap();
+    out.extend([
+        state as u8,
+        raid.regular_waves,
+        raid.total_waves,
+        raid.waves_spawned,
+        raid.omen_level,
+    ]);
+    save_numbers!(out, raid.countdown, raid.ticks_elapsed);
+    let mut remaining: Vec<_> = raid.remaining.iter().collect();
+    remaining.sort_unstable_by_key(|r| (r.wave, r.slot));
+    write_varint(out, remaining.len() as i64);
+    for raider in remaining {
+        out.push(raider.wave);
+        write_varint(out, raider.slot as i64);
+    }
+    write_varint(out, raid.participants.len() as i64);
+    for uuid in &raid.participants {
+        out.extend_from_slice(uuid);
+    }
+}
+
+fn read_saved_raid(input: &mut SaveInput<'_>) -> Result<(DimId, Raid), &'static str> {
+    let dim = input.dim()?;
+    let center = input.block_pos()?;
+    let origin = input.block_pos()?;
+    let [state, regular_waves, total_waves, waves_spawned, omen_level] = input.take()?;
+    let state = *SAVED_RAID_STATES
+        .get(usize::from(state))
+        .ok_or("invalid saved raid state")?;
+    let countdown = u16::from_be_bytes(input.take()?);
+    let ticks_elapsed = u32::from_be_bytes(input.take()?);
+    if !matches!(regular_waves, 3 | 5 | 7)
+        || !(1..=5).contains(&omen_level)
+        || total_waves != regular_waves + u8::from(omen_level > 1)
+        || waves_spawned > total_waves
+        || (countdown == 0 && state != RaidState::Stopped)
+        || countdown > RAID_CELEBRATION_TICKS
+    {
+        return Err("invalid saved raid progress");
+    }
+    let count = input.var_count(2)?;
+    let mut remaining = HashSet::new();
+    for _ in 0..count {
+        let wave = input.byte()?;
+        let slot = usize::try_from(input.varint()?).map_err(|_| "invalid saved raider slot")?;
+        if wave == 0 || wave != waves_spawned || state != RaidState::InProgress {
+            return Err("invalid saved raider wave");
+        }
+        let row = RAID_BASE_WAVES[usize::from(wave.min(regular_waves) - 1)];
+        let slots = row.into_iter().map(usize::from).sum();
+        if slot >= slots || !remaining.insert(RaidRaiderId { wave, slot }) {
+            return Err("invalid or duplicate saved raider");
+        }
+    }
+    let count = input.var_count(16)?;
+    let mut participants = std::collections::BTreeSet::new();
+    for _ in 0..count {
+        if !participants.insert(input.take()?) {
+            return Err("duplicate saved raid participant");
+        }
+    }
+    Ok((
+        dim,
+        Raid {
+            center,
+            origin,
+            state,
+            regular_waves,
+            total_waves,
+            waves_spawned,
+            countdown,
+            ticks_elapsed,
+            remaining,
+            participants,
+            omen_level,
+        },
+    ))
+}
+
+// The new extension sits between the legacy BRD1/SPA1 region and GEN1.
+// Outer readers still peel the same SED1, MDM1, BRS1 and dimension footers.
+const SAVE_STATE_MAGIC: &[u8; 4] = b"SVP1";
+
+fn split_save_footer<'a>(
+    payload: &'a [u8],
+    magic: &[u8; 4],
+) -> Result<(&'a [u8], Option<&'a [u8]>), &'static str> {
+    if !payload.ends_with(magic) {
+        return Ok((payload, None));
+    }
+    let end = payload
+        .len()
+        .checked_sub(12)
+        .ok_or("truncated save footer")?;
+    let size = usize::try_from(u64::from_be_bytes(
+        payload[end..end + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| "invalid save footer size")?;
+    let start = end.checked_sub(size).ok_or("invalid save footer size")?;
+    Ok((&payload[..start], Some(&payload[start..end])))
+}
+
+fn append_save_state(
+    out: &mut Vec<u8>,
+    players: &HashMap<[u8; 16], PlayerSave>,
+    spawn_pitch: f32,
+    mob_count: usize,
+    mob_data: &[u8],
+) {
+    let raids = saved_raids().lock().unwrap();
+    if players.is_empty() && spawn_pitch == 0.0 && mob_count == 0 && raids.is_empty() {
+        return;
+    }
+    let start = out.len();
+    save_numbers!(out, spawn_pitch);
+    let mut players: Vec<_> = players.iter().collect();
+    players.sort_unstable_by_key(|&(&uuid, _)| uuid);
+    write_varint(out, players.len() as i64);
+    for (uuid, state) in players {
+        out.extend_from_slice(uuid);
+        state.write(out);
+    }
+    write_varint(out, mob_count as i64);
+    out.extend_from_slice(mob_data);
+    write_varint(out, raids.len() as i64);
+    for (dim, raid) in raids.iter() {
+        write_saved_raid(out, *dim, raid);
+    }
+    let size = (out.len() - start) as u64;
+    save_numbers!(out, size);
+    out.extend_from_slice(SAVE_STATE_MAGIC);
+}
+
+#[derive(Default)]
+struct SaveState {
+    spawn_pitch: f32,
+    players: HashMap<[u8; 16], PlayerSave>,
+    mobs: Vec<MobSave>,
+    raids: Vec<(DimId, Raid)>,
+}
+
+impl SaveState {
+    fn read(body: &[u8]) -> Result<Self, &'static str> {
+        let mut input = SaveInput(body);
+        let spawn_pitch = input.f32()?;
+        let mut players = HashMap::new();
+        for _ in 0..input.var_count(16)? {
+            let uuid = input.take()?;
+            if players
+                .insert(uuid, PlayerSave::read(&mut input)?)
+                .is_some()
+            {
+                return Err("duplicate saved player UUID");
+            }
+        }
+        let mob_count = input.var_count(60)?;
+        if mob_count > MOB_CAP {
+            return Err("too many saved mobs");
+        }
+        let mut mobs = Vec::new();
+        for _ in 0..mob_count {
+            mobs.push(MobSave::read(&mut input)?);
+        }
+        let mut raids = Vec::new();
+        for _ in 0..input.var_count(38)? {
+            raids.push(read_saved_raid(&mut input)?);
+        }
+        if !input.0.is_empty() {
+            return Err("trailing bytes in save state");
+        }
+        Ok(Self {
+            spawn_pitch,
+            players,
+            mobs,
+            raids,
+        })
+    }
+}
+
 fn rebuild_derived_indexes() {
     // Restart continuity: waters/hoppers/crops/plugin-cells are indexes OF
     // block state — a restart must rebuild them from the overlay exactly
@@ -172,52 +1043,49 @@ fn save_dim_overlay_into(dim: DimId, f: &mut Vec<u8>) -> usize {
     count
 }
 
-/// Read one dimension's chunk table, starting at `p`, and apply its edits when requested.
-///
-/// The cursor form exists because the legacy file carries META sections after this table, so
-/// `load_world_from` has to continue parsing where the table ended. A companion file is only the
-/// table, which is what [`load_dim_overlay_from`] reads.
-fn read_dim_overlay_at(dim: DimId, payload: &[u8], p: &mut usize, apply: bool) {
-    let n = rv_varint(payload, p);
-    let mut w = apply.then(|| world().lock().unwrap());
-    for _ in 0..n {
-        if *p + 8 > payload.len() {
-            break;
+/// Parse the chunk table into owned edits before applying any of it.
+fn read_dim_overlay(
+    dim: DimId,
+    input: &mut SaveInput<'_>,
+) -> Result<HashMap<DimChunkKey, HashMap<u32, u32>>, &'static str> {
+    let count = input.var_count(9)?;
+    let mut chunks = HashMap::new();
+    for _ in 0..count {
+        let cx = i32::from_be_bytes(input.take()?);
+        let cz = i32::from_be_bytes(input.take()?);
+        let count = input.var_count(5)?;
+        let mut edits = HashMap::new();
+        for _ in 0..count {
+            let index = u32::from_be_bytes(input.take()?);
+            let state = u32::try_from(input.varint()?).map_err(|_| "invalid overlay state")?;
+            edits.insert(index, state);
         }
-        let cx = i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap());
-        *p += 4;
-        let cz = i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap());
-        *p += 4;
-        let m = rv_varint(payload, p);
-        let mut c = w.as_mut().map(|world| world.entry((dim, cx, cz)).or_default());
-        for _ in 0..m {
-            if *p + 4 > payload.len() {
-                break;
-            }
-            let idx = u32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap());
-            *p += 4;
-            let st = rv_varint(payload, p) as u32;
-            if let Some(c) = c.as_deref_mut() {
-                c.insert(idx, st);
-            }
-        }
-        // `bump_world_epoch` moves the Overworld chunk's band/section caches, so only an
-        // Overworld chunk may move it: a Nether cell is not part of what they describe.
-        if apply && dim == DimId::Overworld {
+        chunks.insert((dim, cx, cz), edits);
+    }
+    Ok(chunks)
+}
+
+fn apply_dim_overlay(chunks: HashMap<DimChunkKey, HashMap<u32, u32>>) {
+    let mut world = world().lock().unwrap();
+    for (key @ (dim, cx, cz), edits) in chunks {
+        world.entry(key).or_default().extend(edits);
+        // Only Overworld edits can invalidate the Overworld band/section caches.
+        if dim == DimId::Overworld {
             bump_world_epoch(cx << 4, cz << 4);
         }
     }
 }
 
-/// A companion file's payload: exactly one dimension's chunk table, nothing after it.
 fn load_dim_overlay_from(dim: DimId, payload: &[u8]) -> Result<(), &'static str> {
-    let mut p = 0usize;
-    read_dim_overlay_at(dim, payload, &mut p, true);
-    if p != payload.len() {
+    let mut input = SaveInput(payload);
+    let chunks = read_dim_overlay(dim, &mut input)?;
+    if !input.0.is_empty() {
         return Err("trailing bytes after a dimension's overlay table");
     }
+    apply_dim_overlay(chunks);
     Ok(())
 }
+
 fn write_comps(f: &mut Vec<u8>, c: &Comps) {
     write_varint(f, c.len() as i64);
     for (ty, d) in c {
@@ -383,6 +1251,124 @@ fn rv_varint(b: &[u8], p: &mut usize) -> i64 {
     }
     v
 }
+struct SaveInput<'a>(&'a [u8]);
+
+impl<'a> SaveInput<'a> {
+    fn bytes(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
+        let (value, rest) = self.0.split_at_checked(len).ok_or("truncated save data")?;
+        self.0 = rest;
+        Ok(value)
+    }
+
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
+        Ok(self.bytes(N)?.try_into().unwrap())
+    }
+
+    fn byte(&mut self) -> Result<u8, &'static str> {
+        Ok(self.take::<1>()?[0])
+    }
+
+    fn varint(&mut self) -> Result<i64, &'static str> {
+        read_varint(&mut self.0).ok_or("invalid save VarInt")
+    }
+
+    fn var_count(&mut self, min_entry_size: usize) -> Result<usize, &'static str> {
+        let count = usize::try_from(self.varint()?).map_err(|_| "invalid save count")?;
+        if count > self.0.len() / min_entry_size {
+            return Err("invalid save count");
+        }
+        Ok(count)
+    }
+    fn flag(&mut self) -> Result<bool, &'static str> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err("invalid save flag"),
+        }
+    }
+
+    fn dim(&mut self) -> Result<DimId, &'static str> {
+        DimId::from_index(usize::from(self.byte()?)).ok_or("invalid save dimension")
+    }
+
+    fn f32(&mut self) -> Result<f32, &'static str> {
+        let value = f32::from_be_bytes(self.take()?);
+        value
+            .is_finite()
+            .then_some(value)
+            .ok_or("non-finite save float")
+    }
+
+    fn f64(&mut self) -> Result<f64, &'static str> {
+        let value = f64::from_be_bytes(self.take()?);
+        value
+            .is_finite()
+            .then_some(value)
+            .ok_or("non-finite save double")
+    }
+
+    fn position(&mut self) -> Result<(f64, f64, f64), &'static str> {
+        Ok((self.f64()?, self.f64()?, self.f64()?))
+    }
+
+    fn slots(&mut self, range: std::ops::Range<i16>) -> Result<HashMap<i16, Stack>, &'static str> {
+        let count = self.var_count(5)?;
+        if count > range.len() {
+            return Err("too many saved slots");
+        }
+        let mut slots = HashMap::new();
+        for _ in 0..count {
+            let slot = i16::from_be_bytes(self.take()?);
+            if !range.contains(&slot) || slots.insert(slot, self.stack()?).is_some() {
+                return Err("invalid or duplicate saved slot");
+            }
+        }
+        Ok(slots)
+    }
+
+    fn stack(&mut self) -> Result<Stack, &'static str> {
+        let item = self.varint()?;
+        let count = self.byte()?;
+        if item <= 0 || count == 0 {
+            return Err("invalid saved item stack");
+        }
+        Ok((item, count, self.components()?))
+    }
+
+    fn components(&mut self) -> Result<Comps, &'static str> {
+        let count = self.var_count(2)?;
+        let mut components = Vec::new();
+        for _ in 0..count {
+            let ty = self.varint()?;
+            let length = usize::try_from(self.varint()?).map_err(|_| "invalid component length")?;
+            components.push((ty, self.bytes(length)?.to_vec()));
+        }
+        Ok(components)
+    }
+
+    fn optional_uuid(&mut self) -> Result<Option<[u8; 16]>, &'static str> {
+        self.flag()?.then(|| self.take()).transpose()
+    }
+
+    fn block_pos(&mut self) -> Result<BlockPos, &'static str> {
+        Ok((
+            i32::from_be_bytes(self.take()?),
+            i32::from_be_bytes(self.take()?),
+            i32::from_be_bytes(self.take()?),
+        ))
+    }
+
+    fn optional_block_pos(&mut self) -> Result<Option<BlockPos>, &'static str> {
+        self.flag()?.then(|| self.block_pos()).transpose()
+    }
+
+    fn optional_tick(&mut self) -> Result<Option<u64>, &'static str> {
+        self.flag()?
+            .then(|| self.take().map(u64::from_be_bytes))
+            .transpose()
+    }
+}
+
 // Envelope protects new saves from silent partial-load and overwrite after a
 // truncated or torn write. Legacy MET2/MET3 files remain readable for migration.
 // SHA-1 detects accidental damage; it does not authenticate untrusted files.
@@ -414,10 +1400,10 @@ fn unwrap_world_payload(raw: Vec<u8>) -> Result<Vec<u8>, &'static str> {
     }
     Ok(raw) // existing unwrapped v2.37 format
 }
-/// Serialises saves. The tick autosave and the SIGTERM/SIGINT handler both call `save_world`,
-/// and they share one temporary path; two writers would interleave in it and the envelope would
-/// reject the result.
+// Separate ownership transitions from file writers. Writers serialize before
+// taking their snapshots so an older snapshot cannot overtake a newer one.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
+static SAVE_WRITER: Mutex<()> = Mutex::new(());
 thread_local! { static SAVE_GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) } }
 /// Run a world/entity ownership transition under `SAVE_LOCK`, so the signal-thread save cannot
 /// observe the block removed but the entity not yet added, or a landing placed but its entity
@@ -438,60 +1424,80 @@ fn with_save_guard<R>(f: impl FnOnce() -> R) -> R {
     let _reset = Reset;
     f()
 }
-fn save_world() {
-    with_save_guard(save_world_guarded);
+fn persistence_boundary<T>(
+    message: &'static str,
+    run: impl FnOnce() -> Result<T, &'static str>,
+) -> Result<T, &'static str> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).map_err(|_| message)?
 }
-fn save_world_guarded() {
+
+fn save_world() {
     save_world_guarded_in(&world_save_dir());
 }
-/// [`save_world_guarded`] against one directory: the legacy Overworld file, then one companion
-/// per dimension that has edits.
-///
-/// Caller owns `SAVE_LOCK` (or is a single-threaded fixture), exactly as for `save_world_into`.
+
 fn save_world_guarded_in(dir: &std::path::Path) {
-    // save_world_into only builds the payload; the write happens here so the
-    // snapshot stays observational and there is exactly one disk path.
-    let mut f = Vec::new();
-    save_world_into(&mut f);
-    // The envelope lets load reject a torn or truncated write, and writing via a
-    // temporary file plus a retained backup means a failed write cannot destroy
-    // the previous save.
-    let framed = wrap_world_payload(&f);
-    if let Err(error) = write_world_file(
-        &dim_overlay_path(dir, DimId::Overworld),
-        &framed,
-        connection_limits::backup_interval(),
-    ) {
+    if let Err(error) = save_world_guarded(|snapshot| snapshot.write(dir)) {
         eprintln!("[spine] WORLD SAVE FAILED: {error}");
-    }
-    for dim in [DimId::Nether, DimId::End] {
-        if let Err(error) = save_dim_overlay_file(dir, dim) {
-            eprintln!("[spine] WORLD SAVE FAILED: {error}");
-        }
     }
 }
 
-/// Write one dimension's companion overlay, or remove the stale file when it has no edits.
-///
-/// A dimension with no overlay chunks must leave nothing behind: an Overworld-only server would
-/// otherwise grow a pair of files on its first save, and a dimension whose last edit was undone
-/// would keep a file that resurrects that edit on the next load.
-fn save_dim_overlay_file(dir: &std::path::Path, dim: DimId) -> Result<(), String> {
-    if dim == DimId::Overworld {
-        // The Overworld's file is the whole save — chunk table plus META — written by the caller.
-        return Ok(());
+/// Only capture needs the world transition guard. The writer flushes owned
+/// bytes without blocking other threads that need the world guard.
+fn save_world_guarded(
+    write: impl FnOnce(WorldSaveSnapshot) -> Result<(), String>,
+) -> Result<(), String> {
+    if SAVE_GUARD.with(|guard| guard.get()) {
+        return Err("world save called inside an ownership transition".into());
     }
-    let mut f = Vec::new();
-    let chunks = save_dim_overlay_into(dim, &mut f);
-    let path = dim_overlay_path(dir, dim);
-    if chunks == 0 {
-        return remove_world_save(&path);
+    let _writer = SAVE_WRITER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let snapshot = with_save_guard(|| {
+        persistence_boundary("world snapshot panicked", || {
+            Ok(WorldSaveSnapshot::capture())
+        })
+    })?;
+    write(snapshot)
+}
+
+struct WorldSaveSnapshot {
+    overworld: Vec<u8>,
+    companions: [(DimId, Option<Vec<u8>>); 2],
+}
+
+impl WorldSaveSnapshot {
+    fn capture() -> Self {
+        let mut overworld = Vec::new();
+        save_world_into(&mut overworld);
+        let companions = [DimId::Nether, DimId::End].map(|dim| {
+            let mut payload = Vec::new();
+            let count = save_dim_overlay_into(dim, &mut payload);
+            (dim, (count != 0).then_some(payload))
+        });
+        Self {
+            overworld,
+            companions,
+        }
     }
-    write_world_file(
-        &path,
-        &wrap_world_payload(&f),
-        connection_limits::backup_interval(),
-    )
+
+    fn write(self, dir: &std::path::Path) -> Result<(), String> {
+        let interval = connection_limits::backup_interval();
+        write_world_file(
+            &dim_overlay_path(dir, DimId::Overworld),
+            &wrap_world_payload(&self.overworld),
+            interval,
+        )?;
+        // Attempt both companions even if either one fails. Empty dimensions
+        // drop their old overlays so a restart cannot resurrect removed edits.
+        let results = self.companions.map(|(dim, payload)| {
+            let path = dim_overlay_path(dir, dim);
+            match payload {
+                Some(payload) => write_world_file(&path, &wrap_world_payload(&payload), interval),
+                None => remove_world_save(&path),
+            }
+        });
+        results.into_iter().collect()
+    }
 }
 
 /// Remove a save and every sibling `write_world_file` may have left beside it.
@@ -529,9 +1535,11 @@ fn write_world_file(
     {
         let mut f = std::fs::File::create(&tmp)
             .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
-        f.write_all(framed)
-            .and_then(|_| f.sync_all())
-            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        if let Err(error) = f.write_all(framed).and_then(|_| f.sync_all()) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("cannot write {}: {error}", tmp.display()));
+        }
     }
     if path.exists() {
         // Backup trouble is reported but never blocks the save itself.
@@ -556,6 +1564,7 @@ fn write_world_file(
         }
     }
     std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
         format!(
             "cannot rename {} over {}: {e}",
             tmp.display(),
@@ -566,7 +1575,8 @@ fn write_world_file(
 // Caller owns SAVE_LOCK (or is a single-threaded fixture). Some existing
 // callers hold the mutex directly, without the re-entrant thread-local guard.
 fn save_world_into(f: &mut Vec<u8>) {
-    let world_spawn = *WORLD_SPAWN.lock().unwrap();
+    let world_spawn = saved_value(&WORLD_SPAWN);
+    let spawn_pitch = saved_value(&WORLD_SPAWN_PITCH);
     let (pending, sources, spider_flags) = worldgen::with_gen(|g| (
         g.take_staged_payloads(), g.payload_sources.clone(), g.mineshaft_spawners.clone()
     )).unwrap_or_default();
@@ -588,6 +1598,19 @@ fn save_world_into(f: &mut Vec<u8>) {
     let generated = generated_content::Snapshot {
         content, sources, spider_flags,
     };
+    let active_players: Vec<_> = client_snapshot()
+        .into_iter()
+        .map(|client| {
+            let position = client_dim_pos(&client);
+            let inventory = client.inv.lock().unwrap().clone();
+            let state = PlayerSave::capture(&client, position, &inventory);
+            (client.uuid, client.name.clone(), inventory, state)
+        })
+        .collect();
+    let mut players = saved_players().lock().unwrap().clone();
+    for (uuid, _, _, state) in &active_players {
+        players.insert(*uuid, state.clone());
+    }
     // The leading chunk table is the Overworld's, which is what the legacy file has always held:
     // its count, its keys and its bytes are unchanged, and another dimension's edits go to that
     // dimension's own companion file (`save_world_guarded_in`).
@@ -613,16 +1636,14 @@ fn save_world_into(f: &mut Vec<u8>) {
         .map(|(pos, age)| (*pos, *age))
         .collect();
     (*f).extend_from_slice(b"MET4");
-    let mob_dimensions;
+    let ms = mobs().lock().unwrap().clone();
+    let mob_dimensions = ms.iter().map(|mob| mob.dim).collect::<Vec<_>>();
+    let mut mob_data = Vec::new();
     {
-        let ms = mobs().lock().unwrap();
-        mob_dimensions = ms.iter().map(|mob| mob.dim).collect::<Vec<_>>();
+        let now = TICK.load(Ordering::Relaxed);
         write_varint(&mut *f, ms.len() as i64);
-        for m in ms.iter() {
-            let (x, y, z, ..) = {
-                let p = m.pos.lock().unwrap();
-                *p
-            };
+        for m in &ms {
+            let (x, y, z, yaw, pitch) = saved_value(&m.pos);
             write_varint(&mut *f, m.etype);
             (*f).extend_from_slice(&x.to_be_bytes());
             (*f).extend_from_slice(&y.to_be_bytes());
@@ -634,13 +1655,14 @@ fn save_world_into(f: &mut Vec<u8>) {
                 }
                 .to_be_bytes(),
             );
+            MobSave::write(&mut mob_data, m, yaw, pitch, now);
         }
     }
     (*f).extend_from_slice(&WORLD_TIME.load(Ordering::Relaxed).to_be_bytes());
     {
         let mut all: HashMap<String, HashMap<i16, Stack>> = inv_store().lock().unwrap().clone();
-        for c in clients().lock().unwrap().iter() {
-            all.insert(c.name.clone(), c.inv.lock().unwrap().clone());
+        for (_, name, slots, _) in &active_players {
+            all.insert(name.clone(), slots.clone());
         }
         write_varint(&mut *f, all.len() as i64);
         for (name, inv) in all.iter() {
@@ -711,12 +1733,12 @@ fn save_world_into(f: &mut Vec<u8>) {
             (*f).extend_from_slice(&cx.to_be_bytes());
             (*f).extend_from_slice(&cz.to_be_bytes());
         }
-        // player positions — vanilla respawns you where you logged out. The legacy six fields are
+        // Players log back in where they left. The legacy six fields are
         // written for every player (so an Overworld-only save is byte-identical); the dimension of
         // a player who logged out elsewhere is corrected from the footer on load.
         let mut allp: HashMap<String, DimPosRot> = pos_store().lock().unwrap().clone();
-        for c in clients().lock().unwrap().iter() {
-            allp.insert(c.name.clone(), client_dim_pos(c));
+        for (_, name, _, state) in &active_players {
+            allp.insert(name.clone(), state.position);
         }
         write_varint(&mut *f, allp.len() as i64);
         for (name, &(dim, x, y, z, yaw, pitch)) in allp.iter() {
@@ -800,7 +1822,6 @@ fn save_world_into(f: &mut Vec<u8>) {
         // sheared-mob indices (eids are re-issued on load — persist by
         // mob order, not eid)
         {
-            let ms = mobs().lock().unwrap();
             let sh = sheared().lock().unwrap();
             let idx: Vec<i64> = ms
                 .iter()
@@ -947,7 +1968,6 @@ fn save_world_into(f: &mut Vec<u8>) {
                     (*f).extend_from_slice(t.as_bytes());
                 }
             }
-            let ms = mobs().lock().unwrap();
             let mobe: Vec<(i64, &HashSet<String>)> = ms
                 .iter()
                 .enumerate()
@@ -1070,6 +2090,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         f.extend_from_slice(b"SPA1");
         f.extend_from_slice(&world_spawn.3.to_be_bytes());
     }
+    append_save_state(f, &players, spawn_pitch, ms.len(), &mob_data);
     generated.append(f);
     let (sources, generated_blocks, generated_fluids) = worldgen::with_gen(|g| {
         (
@@ -1127,6 +2148,8 @@ fn save_world_into(f: &mut Vec<u8>) {
     append_brewing_footer(f);
     append_mob_dimensions_footer(f, &mob_dimensions);
     append_world_seed_footer(f, WORLD_SEED.load(Ordering::Relaxed));
+    // Keep full UUID records for players who go offline before the next save.
+    *saved_players().lock().unwrap() = players;
 }
 
 fn append_world_seed_footer(out: &mut Vec<u8>, seed: u64) {
@@ -1807,10 +2830,16 @@ fn load_dim_overlay_file(dir: &std::path::Path, dim: DimId) -> Result<(), &'stat
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err("failed to read world save"),
     };
-    load_dim_overlay_from(dim, &unwrap_world_payload(raw)?)
+    persistence_boundary("dimension load panicked", || {
+        load_dim_overlay_from(dim, &unwrap_world_payload(raw)?)
+    })
 }
 
 fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
+    persistence_boundary("world load panicked", || decode_world_payload(payload))
+}
+
+fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     // Footers are stripped last-written-first.
     let (payload, _) = read_world_seed_footer(payload)?;
     let (payload, mob_dimensions) = read_mob_dimensions_footer(payload)?;
@@ -1821,7 +2850,11 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     let (payload, block_loot) = read_block_loot_footer(payload)?;
     let (payload, drop_owners) = read_drop_owners_footer(payload)?;
     let tick_state = tick_persistence::TickState::read(payload)?;
-    let generated = generated_content::Snapshot::read(tick_persistence::prefix(payload)?)?;
+    let before_ticks = tick_persistence::prefix(payload)?;
+    let generated = generated_content::Snapshot::read(before_ticks)?;
+    let (before_generated, _) = split_save_footer(before_ticks, b"GEN1")?;
+    let (payload, body) = split_save_footer(before_generated, SAVE_STATE_MAGIC)?;
+    let mut state = body.map(SaveState::read).transpose()?;
     if generated.as_ref().is_some_and(|s| (!s.sources.is_empty() || !s.spider_flags.is_empty())
         && worldgen::with_gen(|_| ()).is_none()) {
         return Err("generated content requires initialized world generator");
@@ -1832,18 +2865,14 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     }) {
         return Err("tick state requires initialized world generator");
     }
-    let mut p = 0usize;
+    let mut overlay = SaveInput(payload);
+    let chunks = read_dim_overlay(DimId::Overworld, &mut overlay)?;
+    let mut p = payload.len() - overlay.0.len();
     let b = payload;
-    // bounds-safe varint read: truncated input stops the parse instead of
-    // panicking; continuation bytes beyond i64's 70 bits are ignored.
     let rv = rv_varint;
-    // The leading table is the Overworld's: the legacy file stores `(cx, cz)` chunks, and they
-    // load into `(DimId::Overworld, cx, cz)`. `p` continues past the table into the META tail.
     let has_mob_dimensions = !mob_dimensions.is_empty();
-    // When the footer links to legacy mob ordinals, check the link before publishing any edits.
-    read_dim_overlay_at(DimId::Overworld, payload, &mut p, !has_mob_dimensions);
     let has_meta = matches!(payload.get(p..p + 4), Some(b"MET2" | b"MET3" | b"MET4"));
-    if has_mob_dimensions && !has_meta {
+    if (has_mob_dimensions || state.is_some()) && !has_meta {
         return Err("mob dimension count does not match mob records");
     }
     // optional META tail
@@ -1857,28 +2886,31 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
         // milliseconds, and one millisecond is not one tick, so a legacy file
         // read as ticks would despawn its drops immediately.
         let legacy_ms_ages = magic != b"MET4";
-        p += 4;
-        let mn = rv(payload, &mut p);
-        for _ in 0..mn {
-            let et = rv(payload, &mut p);
-            if p + 28 > payload.len() {
-                break;
-            }
-            let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
-            p += 8;
-            let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
-            p += 8;
-            let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
-            p += 8;
-            let hp = f32::from_be_bytes(b[p..p + 4].try_into().unwrap());
-            p += 4;
-            restored_mobs.push((et, x, y, z, hp));
+        let mut mob_input = SaveInput(&b[p + 4..]);
+        let mn = mob_input.var_count(29)?;
+        if mn > MOB_CAP {
+            return Err("invalid mob count");
         }
-        if has_mob_dimensions {
-            if restored_mobs.len() != mob_dimensions.len() {
-                return Err("mob dimension count does not match mob records");
-            }
-            read_dim_overlay_at(DimId::Overworld, payload, &mut 0, true);
+        if has_mob_dimensions && mn != mob_dimensions.len() {
+            return Err("mob dimension count does not match mob records");
+        }
+        for _ in 0..mn {
+            let etype = mob_input.varint()?;
+            let (x, y, z) = mob_input.position()?;
+            let hp = mob_input.f32()?;
+            restored_mobs.push((etype, x, y, z, hp));
+        }
+        p = b.len() - mob_input.0.len();
+        if state.as_ref().is_some_and(|state| {
+            magic != b"MET4"
+                || state.mobs.len() != mn
+                || state
+                    .mobs
+                    .iter()
+                    .zip(&restored_mobs)
+                    .any(|(extra, legacy)| extra.etype != legacy.0)
+        }) {
+            return Err("saved mob state does not match mob records");
         }
         if p + 8 <= payload.len() {
             WORLD_TIME.store(
@@ -2594,6 +3626,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                         if p + sl <= payload.len() && sl > 0 {
                             let obj = String::from_utf8_lossy(&payload[p..p + sl]);
                             let _ = board.set_display(ScoreboardDisplaySlot::Sidebar, Some(&obj));
+                            p += sl;
                         }
                     }
                 }
@@ -2606,6 +3639,8 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             chests().lock().unwrap().len()
         );
     }
+
+    apply_dim_overlay(chunks);
 
     // Apply the non-Overworld overrides after the legacy sections have loaded. A sign whose key
     // already exists in the Overworld section stays independent: the footer's key names its own
@@ -2835,24 +3870,69 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     // Persisted drop, projectile, TNT and falling-block IDs must reserve their range
     // before mobs receive fresh IDs. Keep mob ordinals stable for shearing and tags.
     if !restored_mobs.is_empty() {
+        let extra = state
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.mobs))
+            .unwrap_or_default();
+        // Live-created mobs derive their UUID from the entity ID. Keep new
+        // spawns from reusing a UUID already present in the loaded world.
+        for mob in &extra {
+            if let [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, a, b, c, d] = mob.uuid {
+                let id = i32::from_be_bytes([a, b, c, d]);
+                if let Some(next) = id.checked_add(1) {
+                    NEXT_EID.fetch_max(next, Ordering::SeqCst);
+                }
+            }
+        }
+        let mut extra = extra.into_iter();
         let mut ms = mobs().lock().unwrap();
         let first = ms.len();
         for (index, (etype, x, y, z, hp)) in restored_mobs.into_iter().enumerate() {
+            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+            let mut uuid = [0; 16];
+            uuid[12..].copy_from_slice(&eid.to_be_bytes());
+            let mut rotation = (0.0, 0.0);
+            let mut vel = [0.0; 3];
+            let (mut fuse, mut fire_ticks, mut love) = (0, 0, 0);
+            let mut air = server_ticks(AIR_SUPPLY_GT) as i32;
+            if let Some(mut saved) = extra.next() {
+                uuid = saved.uuid;
+                rotation = (saved.yaw, saved.pitch);
+                vel = saved.vel;
+                (fuse, fire_ticks, love, air) = (saved.fuse, saved.fire_ticks, saved.love, saved.air);
+                let now = TICK.load(Ordering::Relaxed);
+                for (_, until) in &mut saved.state.potions {
+                    *until = now.saturating_add(*until);
+                }
+                if saved.state.behavior.is_some()
+                    || saved.state.blaze_charged
+                    || !saved.state.potions.is_empty()
+                {
+                    live_mob_states().lock().unwrap().insert(eid, saved.state);
+                }
+                if saved.sitting_cat {
+                    sitting_cats().lock().unwrap().insert(eid);
+                }
+                if let Some(villager) = saved.villager {
+                    live_villagers().lock().unwrap().insert(eid, villager);
+                }
+            }
+            let last_action = Instant::now() - Duration::from_secs(10);
             ms.push(Arc::new(Mob {
                 dim: mob_dimensions.get(index).copied().unwrap_or(DimId::Overworld),
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                uuid: [0u8; 16],
+                eid,
+                uuid,
                 etype,
-                pos: Mutex::new((x, y, z, 0.0, 0.0)),
+                pos: Mutex::new((x, y, z, rotation.0, rotation.1)),
                 hp: Mutex::new(hp),
-                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                last_hit: Mutex::new(last_action),
+                hurt_at: Mutex::new(last_action),
                 last_hurt_tick: Mutex::new(None),
-                vel: Mutex::new([0.0; 3]),
-                fuse: Mutex::new(0),
-                fire_ticks: Mutex::new(0),
-                love: Mutex::new(0),
-                air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+                vel: Mutex::new(vel),
+                fuse: Mutex::new(fuse),
+                fire_ticks: Mutex::new(fire_ticks),
+                love: Mutex::new(love),
+                air: Mutex::new(air),
             }));
         }
         let mut sh = sheared().lock().unwrap();
@@ -2869,6 +3949,10 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
     }
+    let state = state.unwrap_or_default();
+    *WORLD_SPAWN_PITCH.lock().unwrap() = state.spawn_pitch;
+    *saved_players().lock().unwrap() = state.players;
+    *saved_raids().lock().unwrap() = state.raids;
     *live_brewing_stands().lock().unwrap() = brewing;
     eprintln!(
         "[spine] loaded {} dirty chunks",

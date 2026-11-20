@@ -16,6 +16,18 @@ fn payload_through_drop_owners_footer(payload: &[u8]) -> Result<&[u8], &'static 
     Ok(payload)
 }
 
+fn full_state_frame(payload: &[u8]) -> std::ops::Range<usize> {
+    let (legacy, _) = read_world_seed_footer(payload).unwrap();
+    let (legacy, _) = read_mob_dimensions_footer(legacy).unwrap();
+    let legacy = payload_through_drop_owners_footer(legacy).unwrap();
+    let (legacy, _) = read_drop_owners_footer(legacy).unwrap();
+    let legacy = tick_persistence::prefix(legacy).unwrap();
+    let (legacy, _) = split_save_footer(legacy, b"GEN1").unwrap();
+    let (before, footer) = split_save_footer(legacy, SAVE_STATE_MAGIC).unwrap();
+    assert!(footer.is_some());
+    before.len()..legacy.len()
+}
+
 // Round-trip fixtures. No real saved world exists for this repository, so the
 // MET2/MET3 consequences are pinned against the production encoder instead of
 // being skipped for lack of data. Observations are returned and asserted after
@@ -87,6 +99,8 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
         *mobs().lock().unwrap() = Vec::new();
         WORLD_TIME.store(0, Ordering::Relaxed);
         if let Some(magic) = legacy_tail {
+            let frame = full_state_frame(&payload);
+            payload.drain(frame);
             // Emulate an older writer: MET2 never carried the mob air field, and
             // MET3 stored entity ages in milliseconds rather than server ticks.
             let at = payload
@@ -152,8 +166,7 @@ fn met4_round_trip_preserves_drop_components_age_and_mob_air() {
             mobs: 1,
             mob_etype: 124,
             mob_hp: 12.5,
-            // The MET3 tail has no air field, so a reloaded mob gets a full supply.
-            mob_air: full_air,
+            mob_air: 150,
         }
     );
     // The default air supply is the vanilla 300 game ticks, not a bare literal.
@@ -1754,4 +1767,495 @@ fn p2_3_s2b_dim2_footer_rejects_unknown_dimension_and_truncation() {
         read_dim2_footer(&short).is_err(),
         "a truncated crop entry must fail closed"
     );
+}
+
+#[test]
+fn save_v2_keeps_complete_live_player_records_by_uuid_after_they_go_offline() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let (mut client, _peer) = effect_tests::client_pair();
+    client.uuid = [11; 16];
+    client.name = "resume-player".into();
+    let slots: HashMap<_, _> = (5..46)
+        .map(|slot| {
+            (
+                slot,
+                (
+                    850 + i64::from(slot),
+                    1 + slot as u8,
+                    vec![(2, vec![slot as u8])],
+                ),
+            )
+        })
+        .collect();
+    let ender: HashMap<_, _> = (0..27)
+        .map(|slot| (slot, (904, 1 + slot as u8, vec![])))
+        .collect();
+    *client.inv.lock().unwrap() = slots.clone();
+    chests()
+        .lock()
+        .unwrap()
+        .insert(ender_container_key(&client.uuid), ender.clone());
+    *client.dim.lock().unwrap() = DimId::End;
+    *client.pos.lock().unwrap() = (12.75, 156.5, -43.25, 52.0, -27.0, true);
+    *client.held.lock().unwrap() = 8;
+    *client.hp.lock().unwrap() = 12.5;
+    *client.absorb.lock().unwrap() = 3.5;
+    *client.food.lock().unwrap() = 15;
+    *client.sat.lock().unwrap() = 4.75;
+    *client.walk_acc.lock().unwrap() = 3.875;
+    *client.xp.lock().unwrap() = 219;
+    *client.gm.lock().unwrap() = 2;
+    *client.effs.lock().unwrap() = vec![Eff {
+        id: 1,
+        amp: 2,
+        left: 97,
+    }];
+    *client.spawn_dim.lock().unwrap() = DimId::Nether;
+    *client.spawn_pt.lock().unwrap() = Some((8.5, 61.0, -19.5, 74.0));
+    player_mechanism_sessions().lock().unwrap().insert(
+        client.eid,
+        PlayerMechanismSession {
+            xp_bar: (11, 0.375),
+            food_timer: 0,
+            menus: Arc::new(LiveMenuConnection {
+                active: Mutex::new(None),
+                next_id: AtomicU8::new(4),
+                enchantment_seed: Mutex::new(0),
+            }),
+        },
+    );
+    let (mut other, _other_peer) = effect_tests::client_pair();
+    other.uuid = [12; 16];
+    other.eid += 1;
+    other.name = "other-player".into();
+    let player_id = client.uuid;
+    let other_id = other.uuid;
+    clients()
+        .lock()
+        .unwrap()
+        .extend([Arc::new(client), Arc::new(other)]);
+
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    clients().lock().unwrap().clear();
+    saved_players().lock().unwrap().clear();
+    inv_store().lock().unwrap().clear();
+    pos_store().lock().unwrap().clear();
+    chests().lock().unwrap().clear();
+    load_world_from(&payload).unwrap();
+    let expected = PlayerSave {
+        position: (DimId::End, 12.75, 156.5, -43.25, 52.0, -27.0),
+        inventory: slots.clone(),
+        ender_chest: ender.clone(),
+        held: 8,
+        health: 12.5,
+        absorption: 3.5,
+        food: 15,
+        saturation: 4.75,
+        exhaustion: 3.875,
+        xp_level: 11,
+        xp_progress: 0.375,
+        xp_total: 219,
+        gamemode: 2,
+        effects: vec![(1, 2, 97)],
+        respawn: Some(SpawnTarget {
+            kind: SpawnTargetKind::Legacy,
+            dim: DimId::Nether,
+            position: (8.5, 61.0, -19.5),
+            angle: 74.0,
+            forced: false,
+        }),
+    };
+    assert_eq!(
+        saved_players().lock().unwrap().get(&player_id),
+        Some(&expected)
+    );
+    assert_eq!(saved_players().lock().unwrap()[&other_id].health, 20.0);
+    assert_eq!(inv_store().lock().unwrap()["resume-player"], slots);
+    assert_eq!(
+        pos_store().lock().unwrap()["resume-player"],
+        expected.position
+    );
+    assert_eq!(
+        chests().lock().unwrap()[&ender_container_key(&player_id)],
+        ender
+    );
+
+    let mut offline = Vec::new();
+    save_world_into(&mut offline);
+    saved_players().lock().unwrap().clear();
+    load_world_from(&offline).unwrap();
+    assert_eq!(
+        saved_players().lock().unwrap().get(&player_id),
+        Some(&expected)
+    );
+    assert!(saved_players().lock().unwrap().contains_key(&other_id));
+}
+
+#[test]
+fn save_v2_world_spawn_keeps_packet_angle_and_old_footer_order() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let world_spawn = (-10.5, 72.0, 5.5, 113.25);
+    *WORLD_SPAWN.lock().unwrap() = world_spawn;
+    *WORLD_SPAWN_PITCH.lock().unwrap() = -18.5;
+    WORLD_SEED.store(56412, Ordering::Relaxed);
+    world_border().lock().unwrap().center_z = 14.25;
+    {
+        let mut board = scoreboard().lock().unwrap();
+        execute_scoreboard_command(&mut board, &["objectives", "add", "saved", "dummy"]).unwrap();
+        board.set_display(ScoreboardDisplaySlot::Sidebar, Some("saved")).unwrap();
+    }
+
+
+    let anchor = SpawnTarget {
+        kind: SpawnTargetKind::Anchor,
+        dim: DimId::Nether,
+        position: (5.5, 63.0, -1.5),
+        angle: -163.5,
+        forced: false,
+    };
+    let bed = SpawnTarget {
+        kind: SpawnTargetKind::Bed,
+        dim: DimId::Overworld,
+        forced: true,
+        ..anchor
+    };
+    for (uuid, point) in [([1; 16], anchor), ([2; 16], bed)] {
+        let (client, _peer) = effect_tests::client_pair();
+        let mut state = PlayerSave::capture(&client, client_dim_pos(&client), &HashMap::new());
+        state.respawn = Some(point);
+        saved_players().lock().unwrap().insert(uuid, state);
+    }
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    assert!(payload.ends_with(b"SED1"));
+    let (before_seed, seed) = read_world_seed_footer(&payload).unwrap();
+    assert_eq!(seed, Some(56412));
+    let frame = full_state_frame(&payload);
+    assert!(frame.end <= before_seed.len());
+    let before_state = &payload[..frame.start];
+    assert_eq!(&before_state[before_state.len() - 8..][..4], b"SPA1");
+    assert_eq!(&before_state[before_state.len() - 8 - 72..][..4], b"BRD1");
+
+    let mut legacy = payload.clone();
+    legacy.drain(frame);
+    for (bytes, pitch, has_players) in [
+        (payload.as_slice(), -18.5, true),
+        (legacy.as_slice(), 0.0, false),
+    ] {
+        *WORLD_SPAWN.lock().unwrap() = (0.0, 0.0, 0.0, 0.0);
+        *WORLD_SPAWN_PITCH.lock().unwrap() = 99.0;
+        *world_border().lock().unwrap() = WorldBorderState::default();
+        *scoreboard().lock().unwrap() = ScoreboardEngine::default();
+        load_world_from(bytes).unwrap();
+        assert_eq!(saved_value(&WORLD_SPAWN), world_spawn);
+        assert_eq!(saved_value(&WORLD_SPAWN_PITCH), pitch);
+        assert_eq!(world_border().lock().unwrap().center_z, 14.25);
+        let board = scoreboard().lock().unwrap();
+        assert_eq!(board.display(ScoreboardDisplaySlot::Sidebar), Some("saved"));
+        drop(board);
+        let packet = spawn_position_packet(saved_value(&WORLD_SPAWN));
+        assert_eq!(read_pos(&packet[..8]), (-11, 72, 5));
+        assert_eq!(&packet[8..], &world_spawn.3.to_be_bytes());
+        let players = saved_players().lock().unwrap();
+        assert_eq!(
+            players.get(&[1; 16]).and_then(|p| p.respawn),
+            has_players.then_some(anchor)
+        );
+        assert_eq!(
+            players.get(&[2; 16]).and_then(|p| p.respawn),
+            has_players.then_some(bed)
+        );
+    }
+}
+
+#[test]
+fn save_v2_restores_mob_behavior_merchant_and_raid_progress() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let owner = [77; 16];
+    let pos = (2.5, 70.0, -8.25, 60.0, -15.0);
+    assert!(insert_live_mob(122, DimId::Nether, pos, 33.5, None));
+    assert!(insert_live_mob(113, DimId::Overworld, pos, 15.25, None));
+    assert!(insert_live_mob(118, DimId::End, pos, 18.75, None));
+    let original = mobs().lock().unwrap().clone();
+    let [wolf, merchant, witch] = original.as_slice() else {
+        unreachable!()
+    };
+    {
+        let mut states = live_mob_states().lock().unwrap();
+        let Some(MobBehaviorState::Wolf(pet)) = &mut states.get_mut(&wolf.eid).unwrap().behavior
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            pet.try_tame(owner, "bone", &mut |_| 0),
+            PetTameResult::Tamed
+        );
+        assert!(pet.dye_collar(owner, 6));
+        assert!(pet.sitting);
+        let state = states.get_mut(&witch.eid).unwrap();
+        let Some(MobBehaviorState::Witch(witch)) = &mut state.behavior else {
+            unreachable!()
+        };
+        witch.drinking = Some((13, WitchPotion::Healing));
+        state.potions = vec![(WitchPotion::Swiftness, 125)];
+    }
+    TICK.store(100, Ordering::Relaxed);
+    *wolf.vel.lock().unwrap() = [0.25, -0.125, 0.5];
+    *wolf.fire_ticks.lock().unwrap() = 45;
+    *wolf.fuse.lock().unwrap() = 7;
+    *wolf.love.lock().unwrap() = 22;
+    *wolf.air.lock().unwrap() = 199;
+    sheared().lock().unwrap().insert(witch.eid);
+    tags()
+        .lock()
+        .unwrap()
+        .insert(format!("e:{}", merchant.eid), ["trader".into()].into());
+
+    let home = (2, 70, -8);
+    let mut trader = farmer_merchant(merchant);
+    trader.profession = VillagerProfession::Librarian;
+    trader.villager_xp = 74;
+    trader.home = Some(home);
+    trader.job_site = Some((4, 70, -8));
+    trader.day = Some(2);
+    trader.last_restock = Some(48008);
+    trader.last_gossip = Some(49001);
+    trader.restocks_today = 1;
+    trader.trading_player = Some(owner);
+    trader.gossip.add(owner, GossipType::Trading, 24);
+    trader.offers[0].cost_b = Some(ItemCost {
+        item: name_to_item("paper").unwrap(),
+        count: 5,
+        components: vec![(2, vec![7, 8])],
+    });
+    trader.offers[0].uses = 5;
+    trader.offers[0].demand = 4;
+    trader.offers[0].special_price_diff = -2;
+    trader.offers[0].result.2.push((2, vec![1, 2, 3]));
+    let expected_offers = trader.offers.clone();
+    live_villagers()
+        .lock()
+        .unwrap()
+        .insert(merchant.eid, trader);
+
+    let mut pois = PoiRegistry::default();
+    pois.register(home, PoiKind::Bed);
+    assert!(pois.claim(home, merchant.uuid));
+    let mut omen = Some(RaidOmen {
+        bad_omen_level: 2,
+        countdown: 0,
+    });
+    let mut raid = Raid::try_start(&pois, home, owner, &mut omen, RaidDifficulty::Normal).unwrap();
+    for _ in 1..RAID_WAVE_COUNTDOWN {
+        assert_eq!(raid.tick(&pois, 1), None);
+    }
+    let Some(RaidEvent::SpawnWave(wave)) = raid.tick(&pois, 1) else {
+        unreachable!()
+    };
+    let mut raiders = wave.raiders();
+    let first = raiders.next().unwrap().0;
+    let second_player = [78; 16];
+    assert!(raid.record_defeat(first, Some(second_player)));
+    let expected_remaining = raiders.map(|(raider, _)| raider).collect::<HashSet<_>>();
+    saved_raids().lock().unwrap().push((DimId::Overworld, raid));
+
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    mobs().lock().unwrap().clear();
+    live_mob_states().lock().unwrap().clear();
+    live_villagers().lock().unwrap().clear();
+    saved_raids().lock().unwrap().clear();
+    sheared().lock().unwrap().clear();
+    tags().lock().unwrap().clear();
+    TICK.store(900, Ordering::Relaxed);
+    load_world_from(&payload).unwrap();
+
+    let restored = mobs().lock().unwrap().clone();
+    let [saved_wolf, saved_merchant, saved_witch] = restored.as_slice() else {
+        unreachable!()
+    };
+    for (before, after) in original.iter().zip(&restored) {
+        assert_eq!(before.uuid, after.uuid);
+        assert_eq!(before.dim, after.dim);
+        assert_ne!(before.eid, after.eid);
+    }
+    assert_eq!(saved_value(&saved_wolf.pos), pos);
+    assert_eq!(saved_value(&saved_wolf.hp), 33.5);
+    assert_eq!(saved_value(&saved_wolf.vel), [0.25, -0.125, 0.5]);
+    assert_eq!(saved_value(&saved_wolf.fire_ticks), 45);
+    assert_eq!(saved_value(&saved_wolf.fuse), 7);
+    assert_eq!(saved_value(&saved_wolf.love), 22);
+    assert_eq!(saved_value(&saved_wolf.air), 199);
+    assert!(sheared().lock().unwrap().contains(&saved_witch.eid));
+    assert!(tags().lock().unwrap()[&format!("e:{}", saved_merchant.eid)].contains("trader"));
+    {
+        let states = live_mob_states().lock().unwrap();
+        let Some(MobBehaviorState::Wolf(pet)) = &states[&saved_wolf.eid].behavior else {
+            unreachable!()
+        };
+        assert_eq!(pet.owner, Some(owner));
+        assert!(pet.sitting);
+        assert_eq!(pet.collar_color, 6);
+        let state = &states[&saved_witch.eid];
+        let Some(MobBehaviorState::Witch(witch)) = &state.behavior else {
+            unreachable!()
+        };
+        assert_eq!(witch.drinking, Some((13, WitchPotion::Healing)));
+        assert_eq!(state.potions, [(WitchPotion::Swiftness, 925)]);
+    }
+    {
+        let villagers = live_villagers().lock().unwrap();
+        let trader = &villagers[&saved_merchant.eid];
+        assert_eq!(trader.id, merchant.uuid);
+        assert_eq!(trader.profession, VillagerProfession::Librarian);
+        assert_eq!(trader.level(), VillagerLevel::Journeyman);
+        assert_eq!(trader.villager_xp, 74);
+        assert_eq!(trader.offers, expected_offers);
+        assert_eq!(
+            trader.gossip.by_player[&owner][GossipType::Trading as usize],
+            24
+        );
+        assert_eq!(trader.trading_player, None);
+        assert_eq!(trader.home, Some(home));
+        assert_eq!(trader.job_site, Some((4, 70, -8)));
+        assert_eq!(trader.last_restock, Some(48008));
+        assert_eq!(trader.last_gossip, Some(49001));
+    }
+    let mut raids = saved_raids().lock().unwrap();
+    let [(dim, raid)] = raids.as_mut_slice() else {
+        unreachable!()
+    };
+    assert_eq!(*dim, DimId::Overworld);
+    assert_eq!(raid.center, home);
+    assert_eq!(raid.state, RaidState::InProgress);
+    assert_eq!(raid.countdown, RAID_WAVE_COUNTDOWN);
+    assert_eq!(raid.ticks_elapsed, u32::from(RAID_WAVE_COUNTDOWN));
+    assert_eq!(raid.remaining, expected_remaining);
+    assert_eq!(raid.participants, [owner, second_player].into());
+    assert!(!raid.record_defeat(first, Some(owner)));
+    for id in expected_remaining {
+        assert!(raid.record_defeat(id, None));
+    }
+    for _ in 1..RAID_WAVE_COUNTDOWN {
+        assert_eq!(raid.tick(&pois, 1), None);
+    }
+    assert!(matches!(
+        raid.tick(&pois, 1),
+        Some(RaidEvent::SpawnWave(RaidWave { number: 2, .. }))
+    ));
+}
+
+#[test]
+fn save_v2_releases_world_ownership_before_writing_and_keeps_previous_file_on_failure() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("spine-snapshot-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join(WORLD_FILE);
+    let temp = dir.join(format!("{WORLD_FILE}.tmp"));
+    set_block(2, 64, 3, 4);
+    save_world_guarded(|snapshot| {
+        // A world transition must be able to run before the captured bytes
+        // are flushed. Its edit belongs to the next save.
+        assert!(SAVE_LOCK.try_lock().is_ok());
+        assert!(world().try_lock().is_ok());
+        set_block(2, 64, 3, 8);
+        snapshot.write(&dir)
+    })
+    .unwrap();
+    let original = std::fs::read(&path).unwrap();
+    std::fs::create_dir(&temp).unwrap();
+    let error = save_world_guarded(|snapshot| snapshot.write(&dir)).unwrap_err();
+    assert!(error.contains(&format!("{WORLD_FILE}.tmp")));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    std::fs::remove_dir(&temp).unwrap();
+
+    world().lock().unwrap().clear();
+    load_world_in(&dir).unwrap();
+    assert_eq!(overlay_block(2, 64, 3), Some(4));
+    set_block(2, 64, 3, 8);
+    save_world_guarded_in(&dir);
+    assert!(!temp.exists());
+    assert_eq!(
+        std::fs::read(dir.join(format!("{WORLD_FILE}.bak"))).unwrap(),
+        original
+    );
+    world().lock().unwrap().clear();
+    load_world_in(&dir).unwrap();
+    assert_eq!(overlay_block(2, 64, 3), Some(8));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn save_v2_panics_abort_the_boundary_and_corruption_cannot_apply_the_new_state() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    set_block(2, 64, 3, 4);
+    *WORLD_SPAWN_PITCH.lock().unwrap() = 15.0;
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    let frame = full_state_frame(&payload);
+    payload[frame.start..frame.start + 4].copy_from_slice(&f32::NAN.to_be_bytes());
+    world().lock().unwrap().clear();
+    assert_eq!(load_world_from(&payload), Err("non-finite save float"));
+    assert_eq!(overlay_block(2, 64, 3), None);
+    assert_eq!(saved_value(&WORLD_SPAWN_PITCH), 15.0);
+
+    // Inject a panic in a real dependency of snapshot capture. The writer
+    // must never run and the ownership guard must be available again.
+    assert!(thread::spawn(|| {
+        let _pitch = WORLD_SPAWN_PITCH.lock().unwrap();
+        panic!("snapshot fixture");
+    })
+    .join()
+    .is_err());
+    assert_eq!(
+        save_world_guarded(|_| panic!("writer was called")),
+        Err("world snapshot panicked".into())
+    );
+    assert!(SAVE_LOCK.try_lock().is_ok());
+    WORLD_SPAWN_PITCH.clear_poison();
+    save_world_guarded(|_| Ok(())).unwrap();
+
+    assert!(thread::spawn(|| {
+        let _world = world().lock().unwrap();
+        panic!("loader fixture");
+    })
+    .join()
+    .is_err());
+    assert_eq!(load_world_from(&[0]), Err("world load panicked"));
+    world().clear_poison();
+    load_world_from(&[0]).unwrap();
+}
+
+#[test]
+fn save_v2_rejects_a_truncated_companion_before_publishing_any_of_its_edits() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let mut payload = Vec::new();
+    world()
+        .lock()
+        .unwrap()
+        .insert((DimId::Nether, 0, 0), [(3, 501)].into());
+    assert_eq!(save_dim_overlay_into(DimId::Nether, &mut payload), 1);
+    world().lock().unwrap().clear();
+    for cut in 0..payload.len() {
+        assert!(
+            load_dim_overlay_from(DimId::Nether, &payload[..cut]).is_err(),
+            "cut={cut}"
+        );
+        assert!(world().lock().unwrap().is_empty());
+    }
+    load_dim_overlay_from(DimId::Nether, &payload).unwrap();
+    assert_eq!(world().lock().unwrap()[&(DimId::Nether, 0, 0)][&3], 501);
 }
