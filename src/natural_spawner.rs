@@ -1579,3 +1579,5 @@ mod natural_spawner_tests {
         );
     }
 }
+
+include!("nether_spawn_rules.rs");
