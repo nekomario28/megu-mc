@@ -1,0 +1,5774 @@
+// parse the [k=v,...] suffix of a /give item argument; supported subset:
+// enchantments={a:lvl,...}, damage, max_damage, unbreakable, custom_name,
+// lore, max_stack_size, repair_cost. Unknown/unsupported keys are ignored
+// (bounded: no silent half-support claims).
+fn parse_item_comps(arg: &str) -> Comps {
+    let Some(lb) = arg.find('[') else {
+        return Vec::new();
+    };
+    let Some(rb) = arg.rfind(']') else {
+        return Vec::new();
+    };
+    if rb <= lb {
+        return Vec::new();
+    }
+    let mut out: Comps = Vec::new();
+    // split on top-level commas only — {}, [], '' nesting must not break
+    let body = &arg[lb + 1..rb];
+    let mut kvs: Vec<String> = Vec::new();
+    {
+        let mut depth = 0i32;
+        let mut q = '\0';
+        let mut cur = String::new();
+        for ch in body.chars() {
+            if q != '\0' {
+                cur.push(ch);
+                if ch == q {
+                    q = '\0';
+                }
+                continue;
+            }
+            match ch {
+                '\'' | '"' => {
+                    q = ch;
+                    cur.push(ch)
+                }
+                '{' | '[' | '(' => {
+                    depth += 1;
+                    cur.push(ch)
+                }
+                '}' | ']' | ')' => {
+                    depth -= 1;
+                    cur.push(ch)
+                }
+                ',' if depth == 0 => {
+                    kvs.push(std::mem::take(&mut cur));
+                }
+                _ => cur.push(ch),
+            }
+        }
+        if !cur.is_empty() {
+            kvs.push(cur);
+        }
+    }
+    for kv in &kvs {
+        let kv = kv.trim();
+        let (k, v) = match kv.split_once('=') {
+            Some(t) => t,
+            None => (kv, ""),
+        };
+        let kn = k.trim().trim_start_matches("minecraft:");
+        match kn {
+            "enchantments" => {
+                // {name:lvl,...} — vanilla 1.21.1 map form
+                let inner = v.trim().trim_start_matches('{').trim_end_matches('}');
+                let mut list: Vec<(i64, i64)> = enchantments_get(&out);
+                for e in inner.split(',') {
+                    if let Some((en, lv)) = e.rsplit_once(':') {
+                        let en = en.trim().trim_matches('"').trim_matches('\'');
+                        if let (Some(id), Ok(l)) = (enchant_id(en), lv.trim().parse::<i64>()) {
+                            list.retain(|(x, _)| *x != id);
+                            list.push((id, l.max(1)));
+                        }
+                    }
+                }
+                comp_set(&mut out, COMP_ENCHANTMENTS, enchantments_data(&list, true));
+            }
+            "damage" => {
+                if let Ok(n) = v.parse() {
+                    comp_set_varint(&mut out, COMP_DAMAGE, n)
+                }
+            }
+            "max_damage" => {
+                if let Ok(n) = v.parse() {
+                    comp_set_varint(&mut out, COMP_MAX_DAMAGE, n)
+                }
+            }
+            "max_stack_size" => {
+                if let Ok(n) = v.parse() {
+                    comp_set_varint(&mut out, 1, n)
+                }
+            }
+            "repair_cost" => {
+                if let Ok(n) = v.parse() {
+                    comp_set_varint(&mut out, 16, n)
+                }
+            }
+            "unbreakable" => comp_set(&mut out, COMP_UNBREAKABLE, vec![1u8]),
+            "custom_name" => {
+                let t = v.trim().trim_matches('\'').trim_matches('"');
+                comp_set(&mut out, COMP_CUSTOM_NAME, nbt_string(t));
+            }
+            "potion_contents" => {
+                let potion = v.trim().trim_matches(['\'', '"']);
+                let potion = potion.strip_prefix("minecraft:").unwrap_or(potion);
+                if let Some(id) = LIVE_POTIONS.iter().position(|&(name, _)| name == potion) {
+                    let mut data = vec![1];
+                    write_varint(&mut data, id as i64);
+                    data.extend([0, 0]); // no custom color or custom effects
+                    comp_set(&mut out, COMP_POTION_CONTENTS, data);
+                }
+            }
+            "lore" => {
+                // ['a','b',...] — list of anonymous-NBT string elements
+                let inner = v.trim().trim_start_matches('[').trim_end_matches(']');
+                let mut d = Vec::new();
+                let parts: Vec<String> = inner
+                    .split(',')
+                    .map(|x| x.trim().trim_matches('\'').trim_matches('"').to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect();
+                write_varint(&mut d, parts.len() as i64);
+                for t in parts {
+                    d.extend_from_slice(&nbt_string(&t));
+                }
+                comp_set(&mut out, COMP_LORE, d);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+// /schedule: pending (function, due server-tick) — vanilla keeps
+// scheduled functions in world data; persisted in the meta tail.
+fn sched_fns() -> &'static Mutex<Vec<(String, u64)>> {
+    static S: OnceLock<Mutex<Vec<(String, u64)>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(Vec::new()))
+}
+// entity tags for /tag + selector tag=: keyed "p:<playername>" for
+// players (persisted by name) and "e:<eid>" for mobs (persisted by
+// mob ordinal, same scheme as sheared — eids are re-issued on load).
+fn tags() -> &'static Mutex<HashMap<String, HashSet<String>>> {
+    static T: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static FORCELOADED: OnceLock<Mutex<HashSet<(i32, i32)>>> = OnceLock::new();
+fn forceloaded() -> &'static Mutex<HashSet<(i32, i32)>> {
+    FORCELOADED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+// ---------- name -> id tables (generated from minecraft-data 1.21.1) ----------
+
+fn state_from_arg(arg: &str) -> Option<u32> {
+    #[cfg(feature = "neoforge-events")]
+    if let Some(state) = neoforge_block_state(arg) {
+        return Some(state);
+    }
+    let (name, props) = match arg.split_once('[') {
+        Some((n, rest)) => (
+            n.trim_start_matches("minecraft:").to_string(),
+            rest.trim_end_matches(']').to_string(),
+        ),
+        None => return name_to_state(arg),
+    };
+    let name: &str = &name;
+    let base = name_to_state(name)?;
+    if breg().is_some_and(|reg| redstone_component(reg, base)) {
+        return modification_block_state(arg);
+    }
+    let get = |k: &str| -> Option<String> {
+        props.split(',').find_map(|kv| {
+            kv.trim()
+                .strip_prefix(k)
+                .and_then(|v| v.strip_prefix('=').map(|s| s.to_string()))
+        })
+    };
+    if name == "piston" || name == "sticky_piston" {
+        let lo = if name == "piston" { 2011u32 } else { 1992u32 };
+        let fi = get("facing").map(|f| facing_idx(&f)).unwrap_or(0);
+        let ext = match get("extended").as_deref() {
+            Some("true") => 0,
+            _ => 6,
+        };
+        return Some(lo + ext + fi);
+    }
+    if name == "piston_head" {
+        let fi = get("facing").map(|f| facing_idx(&f)).unwrap_or(0);
+        let ty = match get("type").as_deref() {
+            Some("sticky") => 1,
+            _ => 0,
+        };
+        return Some(2023 + fi * 4 + ty * 2);
+    }
+    if name == "wheat" {
+        return Some(
+            4278 + get("age")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(7),
+        );
+    }
+    if door_base(base).is_some() {
+        let mut st = base;
+        if let Some(v) = get("open") {
+            st = if v == "true" { st & !2 } else { st | 2 };
+        }
+        if let Some(v) = get("half") {
+            st = if v == "upper" { st | 8 } else { st & !8 };
+        }
+        return Some(st);
+    }
+    if breg().is_some_and(|reg| reg.name_of(base).ends_with("_trapdoor")) {
+        let mut st = base;
+        if let Some(v) = get("open") {
+            st = breg()?.with_prop(st, "open", &v);
+        }
+        if let Some(v) = get("facing") {
+            st = breg()?.with_prop(st, "facing", &v);
+        }
+        if let Some(v) = get("half") {
+            st = breg()?.with_prop(st, "half", &v);
+        }
+        if let Some(v) = get("waterlogged") {
+            st = breg()?.with_prop(st, "waterlogged", &v);
+        }
+        return Some(st);
+    }
+    Some(base)
+}
+pub(crate) fn name_to_state(n: &str) -> Option<u32> {
+    let n = n.strip_prefix("minecraft:").unwrap_or(n);
+    Some(match n {
+        "air" => 0,
+        "stone" => 1,
+        "granite" => 2,
+        "polished_granite" => 3,
+        "diorite" => 4,
+        "polished_diorite" => 5,
+        "andesite" => 6,
+        "polished_andesite" => 7,
+        "grass_block" => 9,
+        "dirt" => 10,
+        "coarse_dirt" => 11,
+        "podzol" => 13,
+        "cobblestone" => 14,
+        "oak_planks" => 15,
+        "spruce_planks" => 16,
+        "birch_planks" => 17,
+        "jungle_planks" => 18,
+        "acacia_planks" => 19,
+        "cherry_planks" => 20,
+        "dark_oak_planks" => 21,
+        "mangrove_planks" => 22,
+        "bamboo_planks" => 23,
+        "bamboo_mosaic" => 24,
+        "oak_sapling" => 25,
+        "spruce_sapling" => 27,
+        "birch_sapling" => 29,
+        "jungle_sapling" => 31,
+        "acacia_sapling" => 33,
+        "cherry_sapling" => 35,
+        "dark_oak_sapling" => 37,
+        "mangrove_propagule" => 44,
+        "bedrock" => 79,
+        "water" => 80,
+        "lava" => 96,
+        "sand" => 112,
+        "suspicious_sand" => 113,
+        "red_sand" => 117,
+        "gravel" => 118,
+        "suspicious_gravel" => 119,
+        "gold_ore" => 123,
+        "deepslate_gold_ore" => 124,
+        "iron_ore" => 125,
+        "deepslate_iron_ore" => 126,
+        "coal_ore" => 127,
+        "deepslate_coal_ore" => 128,
+        "nether_gold_ore" => 129,
+        "oak_log" => 131,
+        "spruce_log" => 134,
+        "birch_log" => 137,
+        "jungle_log" => 140,
+        "acacia_log" => 143,
+        "cherry_log" => 146,
+        "dark_oak_log" => 149,
+        "mangrove_log" => 152,
+        "mangrove_roots" => 155,
+        "muddy_mangrove_roots" => 157,
+        "bamboo_block" => 160,
+        "stripped_spruce_log" => 163,
+        "stripped_birch_log" => 166,
+        "stripped_jungle_log" => 169,
+        "stripped_acacia_log" => 172,
+        "stripped_cherry_log" => 175,
+        "stripped_dark_oak_log" => 178,
+        "stripped_oak_log" => 181,
+        "stripped_mangrove_log" => 184,
+        "stripped_bamboo_block" => 187,
+        "oak_wood" => 190,
+        "spruce_wood" => 193,
+        "birch_wood" => 196,
+        "jungle_wood" => 199,
+        "acacia_wood" => 202,
+        "cherry_wood" => 205,
+        "dark_oak_wood" => 208,
+        "mangrove_wood" => 211,
+        "stripped_oak_wood" => 214,
+        "stripped_spruce_wood" => 217,
+        "stripped_birch_wood" => 220,
+        "stripped_jungle_wood" => 223,
+        "stripped_acacia_wood" => 226,
+        "stripped_cherry_wood" => 229,
+        "stripped_dark_oak_wood" => 232,
+        "stripped_mangrove_wood" => 235,
+        "oak_leaves" => 264,
+        "spruce_leaves" => 292,
+        "birch_leaves" => 320,
+        "jungle_leaves" => 348,
+        "acacia_leaves" => 376,
+        "cherry_leaves" => 404,
+        "dark_oak_leaves" => 432,
+        "mangrove_leaves" => 460,
+        "azalea_leaves" => 488,
+        "flowering_azalea_leaves" => 516,
+        "sponge" => 517,
+        "wet_sponge" => 518,
+        "glass" => 519,
+        "lapis_ore" => 520,
+        "deepslate_lapis_ore" => 521,
+        "lapis_block" => 522,
+        "dispenser" => 524,
+        "sandstone" => 535,
+        "chiseled_sandstone" => 536,
+        "cut_sandstone" => 537,
+        "note_block" => 539,
+        "white_bed" => 1691,
+        "orange_bed" => 1707,
+        "magenta_bed" => 1723,
+        "light_blue_bed" => 1739,
+        "yellow_bed" => 1755,
+        "lime_bed" => 1771,
+        "pink_bed" => 1787,
+        "gray_bed" => 1803,
+        "light_gray_bed" => 1819,
+        "cyan_bed" => 1835,
+        "purple_bed" => 1851,
+        "blue_bed" => 1867,
+        "brown_bed" => 1883,
+        "green_bed" => 1899,
+        "red_bed" => 1915,
+        "black_bed" => 1931,
+        "powered_rail" => 1957,
+        "detector_rail" => 1981,
+        "sticky_piston" => 1998,
+        "cobweb" => 2004,
+        "short_grass" => 2005,
+        "fern" => 2006,
+        "dead_bush" => 2007,
+        "seagrass" => 2008,
+        "tall_seagrass" => 2010,
+        "piston" => 2017,
+        "piston_head" => 2025,
+        "white_wool" => 2047,
+        "orange_wool" => 2048,
+        "magenta_wool" => 2049,
+        "light_blue_wool" => 2050,
+        "yellow_wool" => 2051,
+        "lime_wool" => 2052,
+        "pink_wool" => 2053,
+        "gray_wool" => 2054,
+        "light_gray_wool" => 2055,
+        "cyan_wool" => 2056,
+        "purple_wool" => 2057,
+        "blue_wool" => 2058,
+        "brown_wool" => 2059,
+        "green_wool" => 2060,
+        "red_wool" => 2061,
+        "black_wool" => 2062,
+        "moving_piston" => 2063,
+        "dandelion" => 2075,
+        "torchflower" => 2076,
+        "poppy" => 2077,
+        "blue_orchid" => 2078,
+        "allium" => 2079,
+        "azure_bluet" => 2080,
+        "red_tulip" => 2081,
+        "orange_tulip" => 2082,
+        "white_tulip" => 2083,
+        "pink_tulip" => 2084,
+        "oxeye_daisy" => 2085,
+        "cornflower" => 2086,
+        "wither_rose" => 2087,
+        "lily_of_the_valley" => 2088,
+        "brown_mushroom" => 2089,
+        "red_mushroom" => 2090,
+        "gold_block" => 2091,
+        "iron_block" => 2092,
+        "bricks" => 2093,
+        "tnt" => 2095,
+        "bookshelf" => 2096,
+        "chiseled_bookshelf" => 2160,
+        "mossy_cobblestone" => 2353,
+        "obsidian" => 2354,
+        "torch" => 2355,
+        "wall_torch" => 2356,
+        "fire" => 2391,
+        "soul_fire" => 2872,
+        "spawner" => 2873,
+        "oak_stairs" => 2885,
+        "chest" => 2955,
+        "redstone_wire" => 4138,
+        "diamond_ore" => 4274,
+        "deepslate_diamond_ore" => 4275,
+        "diamond_block" => 4276,
+        "crafting_table" => 4277,
+        "wheat" => 4278,
+        "growth_lamp" => ST_GROWTH_LAMP,
+        "farmland" => 4286,
+        "furnace" => 4295,
+        "oak_sign" => 4303,
+        "spruce_sign" => 4335,
+        "birch_sign" => 4367,
+        "acacia_sign" => 4399,
+        "cherry_sign" => 4431,
+        "jungle_sign" => 4463,
+        "dark_oak_sign" => 4495,
+        "mangrove_sign" => 4527,
+        "bamboo_sign" => 4559,
+        "oak_door" => 4601,
+        "ladder" => 4655,
+        "rail" => 4663,
+        "cobblestone_stairs" => 4693,
+        "oak_wall_sign" => 4763,
+        "spruce_wall_sign" => 4771,
+        "birch_wall_sign" => 4779,
+        "acacia_wall_sign" => 4787,
+        "cherry_wall_sign" => 4795,
+        "jungle_wall_sign" => 4803,
+        "dark_oak_wall_sign" => 4811,
+        "mangrove_wall_sign" => 4819,
+        "bamboo_wall_sign" => 4827,
+        "oak_hanging_sign" => 4867,
+        "spruce_hanging_sign" => 4931,
+        "birch_hanging_sign" => 4995,
+        "acacia_hanging_sign" => 5059,
+        "cherry_hanging_sign" => 5123,
+        "jungle_hanging_sign" => 5187,
+        "dark_oak_hanging_sign" => 5251,
+        "crimson_hanging_sign" => 5315,
+        "warped_hanging_sign" => 5379,
+        "mangrove_hanging_sign" => 5443,
+        "bamboo_hanging_sign" => 5507,
+        "oak_wall_hanging_sign" => 5539,
+        "spruce_wall_hanging_sign" => 5547,
+        "birch_wall_hanging_sign" => 5555,
+        "acacia_wall_hanging_sign" => 5563,
+        "cherry_wall_hanging_sign" => 5571,
+        "jungle_wall_hanging_sign" => 5579,
+        "dark_oak_wall_hanging_sign" => 5587,
+        "mangrove_wall_hanging_sign" => 5595,
+        "crimson_wall_hanging_sign" => 5603,
+        "warped_wall_hanging_sign" => 5611,
+        "bamboo_wall_hanging_sign" => 5619,
+        "lever" => 5635,
+        "stone_pressure_plate" => 5651,
+        "iron_door" => 5663,
+        "oak_pressure_plate" => 5717,
+        "spruce_pressure_plate" => 5719,
+        "birch_pressure_plate" => 5721,
+        "jungle_pressure_plate" => 5723,
+        "acacia_pressure_plate" => 5725,
+        "cherry_pressure_plate" => 5727,
+        "dark_oak_pressure_plate" => 5729,
+        "mangrove_pressure_plate" => 5731,
+        "bamboo_pressure_plate" => 5733,
+        "redstone_ore" => 5735,
+        "deepslate_redstone_ore" => 5737,
+        "redstone_torch" => 5738,
+        "redstone_wall_torch" => 5740,
+        "stone_button" => 5757,
+        "snow" => 5772,
+        "ice" => 5780,
+        "snow_block" => 5781,
+        "cactus" => 5782,
+        "clay" => 5798,
+        "sugar_cane" => 5799,
+        "jukebox" => 5816,
+        "oak_fence" => 5848,
+        "netherrack" => 5849,
+        "soul_sand" => 5850,
+        "soul_soil" => 5851,
+        "basalt" => 5853,
+        "polished_basalt" => 5856,
+        "soul_torch" => 5858,
+        "soul_wall_torch" => 5859,
+        "glowstone" => 5863,
+        "nether_portal" => 5864,
+        "carved_pumpkin" => 5866,
+        "jack_o_lantern" => 5870,
+        "cake" => 5874,
+        "repeater" => 5884,
+        "white_stained_glass" => 5945,
+        "orange_stained_glass" => 5946,
+        "magenta_stained_glass" => 5947,
+        "light_blue_stained_glass" => 5948,
+        "yellow_stained_glass" => 5949,
+        "lime_stained_glass" => 5950,
+        "pink_stained_glass" => 5951,
+        "gray_stained_glass" => 5952,
+        "light_gray_stained_glass" => 5953,
+        "cyan_stained_glass" => 5954,
+        "purple_stained_glass" => 5955,
+        "blue_stained_glass" => 5956,
+        "brown_stained_glass" => 5957,
+        "green_stained_glass" => 5958,
+        "red_stained_glass" => 5959,
+        "black_stained_glass" => 5960,
+        "oak_trapdoor" => 5976,
+        "spruce_trapdoor" => 6040,
+        "birch_trapdoor" => 6104,
+        "jungle_trapdoor" => 6168,
+        "acacia_trapdoor" => 6232,
+        "cherry_trapdoor" => 6296,
+        "dark_oak_trapdoor" => 6360,
+        "mangrove_trapdoor" => 6424,
+        "bamboo_trapdoor" => 6488,
+        "stone_bricks" => 6537,
+        "mossy_stone_bricks" => 6538,
+        "cracked_stone_bricks" => 6539,
+        "chiseled_stone_bricks" => 6540,
+        "packed_mud" => 6541,
+        "mud_bricks" => 6542,
+        "infested_stone" => 6543,
+        "infested_cobblestone" => 6544,
+        "infested_stone_bricks" => 6545,
+        "infested_mossy_stone_bricks" => 6546,
+        "infested_cracked_stone_bricks" => 6547,
+        "infested_chiseled_stone_bricks" => 6548,
+        "brown_mushroom_block" => 6549,
+        "red_mushroom_block" => 6613,
+        "mushroom_stem" => 6677,
+        "iron_bars" => 6772,
+        "chain" => 6776,
+        "glass_pane" => 6810,
+        "pumpkin" => 6811,
+        "melon" => 6812,
+        "attached_pumpkin_stem" => 6813,
+        "attached_melon_stem" => 6817,
+        "pumpkin_stem" => 6821,
+        "melon_stem" => 6829,
+        "vine" => 6868,
+        "glow_lichen" => 6996,
+        "oak_fence_gate" => 7004,
+        "brick_stairs" => 7040,
+        "stone_brick_stairs" => 7120,
+        "mud_brick_stairs" => 7200,
+        "mycelium" => 7270,
+        "lily_pad" => 7271,
+        "nether_bricks" => 7272,
+        "nether_brick_fence" => 7304,
+        "nether_brick_stairs" => 7316,
+        "nether_wart" => 7385,
+        "enchanting_table" => 7389,
+        "brewing_stand" => 7397,
+        "cauldron" => 7398,
+        "water_cauldron" => 7399,
+        "lava_cauldron" => 7402,
+        "powder_snow_cauldron" => 7403,
+        "end_portal" => 7406,
+        "end_portal_frame" => 7411,
+        "end_stone" => 7415,
+        "dragon_egg" => 7416,
+        "redstone_lamp" => 7418,
+        "cocoa" => 7419,
+        "sandstone_stairs" => 7442,
+        "emerald_ore" => 7511,
+        "deepslate_emerald_ore" => 7512,
+        "ender_chest" => 7514,
+        "tripwire_hook" => 7530,
+        "tripwire" => 7664,
+        "emerald_block" => 7665,
+        "spruce_stairs" => 7677,
+        "birch_stairs" => 7757,
+        "jungle_stairs" => 7837,
+        "command_block" => 7912,
+        "beacon" => 7918,
+        "cobblestone_wall" => 7922,
+        "mossy_cobblestone_wall" => 8246,
+        "flower_pot" => 8567,
+        "potted_torchflower" => 8568,
+        "potted_oak_sapling" => 8569,
+        "potted_spruce_sapling" => 8570,
+        "potted_birch_sapling" => 8571,
+        "potted_jungle_sapling" => 8572,
+        "potted_acacia_sapling" => 8573,
+        "potted_cherry_sapling" => 8574,
+        "potted_dark_oak_sapling" => 8575,
+        "potted_mangrove_propagule" => 8576,
+        "potted_fern" => 8577,
+        "potted_dandelion" => 8578,
+        "potted_poppy" => 8579,
+        "potted_blue_orchid" => 8580,
+        "potted_allium" => 8581,
+        "potted_azure_bluet" => 8582,
+        "potted_red_tulip" => 8583,
+        "potted_orange_tulip" => 8584,
+        "potted_white_tulip" => 8585,
+        "potted_pink_tulip" => 8586,
+        "potted_oxeye_daisy" => 8587,
+        "potted_cornflower" => 8588,
+        "potted_lily_of_the_valley" => 8589,
+        "potted_wither_rose" => 8590,
+        "potted_red_mushroom" => 8591,
+        "potted_brown_mushroom" => 8592,
+        "potted_dead_bush" => 8593,
+        "potted_cactus" => 8594,
+        "carrots" => 8595,
+        "potatoes" => 8603,
+        "oak_button" => 8620,
+        "spruce_button" => 8644,
+        "birch_button" => 8668,
+        "jungle_button" => 8692,
+        "acacia_button" => 8716,
+        "cherry_button" => 8740,
+        "dark_oak_button" => 8764,
+        "mangrove_button" => 8788,
+        "bamboo_button" => 8812,
+        "skeleton_skull" => 8843,
+        "skeleton_wall_skull" => 8860,
+        "wither_skeleton_skull" => 8883,
+        "wither_skeleton_wall_skull" => 8900,
+        "zombie_head" => 8923,
+        "zombie_wall_head" => 8940,
+        "player_head" => 8963,
+        "player_wall_head" => 8980,
+        "creeper_head" => 9003,
+        "creeper_wall_head" => 9020,
+        "dragon_head" => 9043,
+        "dragon_wall_head" => 9060,
+        "piglin_head" => 9083,
+        "piglin_wall_head" => 9100,
+        "anvil" => 9107,
+        "chipped_anvil" => 9111,
+        "damaged_anvil" => 9115,
+        "trapped_chest" => 9120,
+        "light_weighted_pressure_plate" => 9143,
+        "heavy_weighted_pressure_plate" => 9159,
+        "comparator" => 9176,
+        "daylight_detector" => 9207,
+        "redstone_block" => 9223,
+        "nether_quartz_ore" => 9224,
+        "hopper" => 9225,
+        "quartz_block" => 9235,
+        "chiseled_quartz_block" => 9236,
+        "quartz_pillar" => 9238,
+        "quartz_stairs" => 9251,
+        "activator_rail" => 9333,
+        "dropper" => 9345,
+        "white_terracotta" => 9356,
+        "orange_terracotta" => 9357,
+        "magenta_terracotta" => 9358,
+        "light_blue_terracotta" => 9359,
+        "yellow_terracotta" => 9360,
+        "lime_terracotta" => 9361,
+        "pink_terracotta" => 9362,
+        "gray_terracotta" => 9363,
+        "light_gray_terracotta" => 9364,
+        "cyan_terracotta" => 9365,
+        "purple_terracotta" => 9366,
+        "blue_terracotta" => 9367,
+        "brown_terracotta" => 9368,
+        "green_terracotta" => 9369,
+        "red_terracotta" => 9370,
+        "black_terracotta" => 9371,
+        "white_stained_glass_pane" => 9403,
+        "orange_stained_glass_pane" => 9435,
+        "magenta_stained_glass_pane" => 9467,
+        "light_blue_stained_glass_pane" => 9499,
+        "yellow_stained_glass_pane" => 9531,
+        "lime_stained_glass_pane" => 9563,
+        "pink_stained_glass_pane" => 9595,
+        "gray_stained_glass_pane" => 9627,
+        "light_gray_stained_glass_pane" => 9659,
+        "cyan_stained_glass_pane" => 9691,
+        "purple_stained_glass_pane" => 9723,
+        "blue_stained_glass_pane" => 9755,
+        "brown_stained_glass_pane" => 9787,
+        "green_stained_glass_pane" => 9819,
+        "red_stained_glass_pane" => 9851,
+        "black_stained_glass_pane" => 9883,
+        "acacia_stairs" => 9895,
+        "cherry_stairs" => 9975,
+        "dark_oak_stairs" => 10055,
+        "mangrove_stairs" => 10135,
+        "bamboo_stairs" => 10215,
+        "bamboo_mosaic_stairs" => 10295,
+        "slime_block" => 10364,
+        "barrier" => 10366,
+        "light" => 10398,
+        "iron_trapdoor" => 10414,
+        "prismarine" => 10463,
+        "prismarine_bricks" => 10464,
+        "dark_prismarine" => 10465,
+        "prismarine_stairs" => 10477,
+        "prismarine_brick_stairs" => 10557,
+        "dark_prismarine_stairs" => 10637,
+        "prismarine_slab" => 10709,
+        "prismarine_brick_slab" => 10715,
+        "dark_prismarine_slab" => 10721,
+        "sea_lantern" => 10724,
+        "hay_block" => 10726,
+        "white_carpet" => 10728,
+        "orange_carpet" => 10729,
+        "magenta_carpet" => 10730,
+        "light_blue_carpet" => 10731,
+        "yellow_carpet" => 10732,
+        "lime_carpet" => 10733,
+        "pink_carpet" => 10734,
+        "gray_carpet" => 10735,
+        "light_gray_carpet" => 10736,
+        "cyan_carpet" => 10737,
+        "purple_carpet" => 10738,
+        "blue_carpet" => 10739,
+        "brown_carpet" => 10740,
+        "green_carpet" => 10741,
+        "red_carpet" => 10742,
+        "black_carpet" => 10743,
+        "terracotta" => 10744,
+        "coal_block" => 10745,
+        "packed_ice" => 10746,
+        "sunflower" => 10748,
+        "lilac" => 10750,
+        "rose_bush" => 10752,
+        "peony" => 10754,
+        "tall_grass" => 10756,
+        "large_fern" => 10758,
+        "white_banner" => 10759,
+        "orange_banner" => 10775,
+        "magenta_banner" => 10791,
+        "light_blue_banner" => 10807,
+        "yellow_banner" => 10823,
+        "lime_banner" => 10839,
+        "pink_banner" => 10855,
+        "gray_banner" => 10871,
+        "light_gray_banner" => 10887,
+        "cyan_banner" => 10903,
+        "purple_banner" => 10919,
+        "blue_banner" => 10935,
+        "brown_banner" => 10951,
+        "green_banner" => 10967,
+        "red_banner" => 10983,
+        "black_banner" => 10999,
+        "white_wall_banner" => 11015,
+        "orange_wall_banner" => 11019,
+        "magenta_wall_banner" => 11023,
+        "light_blue_wall_banner" => 11027,
+        "yellow_wall_banner" => 11031,
+        "lime_wall_banner" => 11035,
+        "pink_wall_banner" => 11039,
+        "gray_wall_banner" => 11043,
+        "light_gray_wall_banner" => 11047,
+        "cyan_wall_banner" => 11051,
+        "purple_wall_banner" => 11055,
+        "blue_wall_banner" => 11059,
+        "brown_wall_banner" => 11063,
+        "green_wall_banner" => 11067,
+        "red_wall_banner" => 11071,
+        "black_wall_banner" => 11075,
+        "red_sandstone" => 11079,
+        "chiseled_red_sandstone" => 11080,
+        "cut_red_sandstone" => 11081,
+        "red_sandstone_stairs" => 11093,
+        "oak_slab" => 11165,
+        "spruce_slab" => 11171,
+        "birch_slab" => 11177,
+        "jungle_slab" => 11183,
+        "acacia_slab" => 11189,
+        "cherry_slab" => 11195,
+        "dark_oak_slab" => 11201,
+        "mangrove_slab" => 11207,
+        "bamboo_slab" => 11213,
+        "bamboo_mosaic_slab" => 11219,
+        "stone_slab" => 11225,
+        "smooth_stone_slab" => 11231,
+        "sandstone_slab" => 11237,
+        "cut_sandstone_slab" => 11243,
+        "petrified_oak_slab" => 11249,
+        "cobblestone_slab" => 11255,
+        "brick_slab" => 11261,
+        "stone_brick_slab" => 11267,
+        "mud_brick_slab" => 11273,
+        "nether_brick_slab" => 11279,
+        "quartz_slab" => 11285,
+        "red_sandstone_slab" => 11291,
+        "cut_red_sandstone_slab" => 11297,
+        "purpur_slab" => 11303,
+        "smooth_stone" => 11306,
+        "smooth_sandstone" => 11307,
+        "smooth_quartz" => 11308,
+        "smooth_red_sandstone" => 11309,
+        "spruce_fence_gate" => 11317,
+        "birch_fence_gate" => 11349,
+        "jungle_fence_gate" => 11381,
+        "acacia_fence_gate" => 11413,
+        "cherry_fence_gate" => 11445,
+        "dark_oak_fence_gate" => 11477,
+        "mangrove_fence_gate" => 11509,
+        "bamboo_fence_gate" => 11541,
+        "spruce_fence" => 11597,
+        "birch_fence" => 11629,
+        "jungle_fence" => 11661,
+        "acacia_fence" => 11693,
+        "cherry_fence" => 11725,
+        "dark_oak_fence" => 11757,
+        "mangrove_fence" => 11789,
+        "bamboo_fence" => 11821,
+        "spruce_door" => 11833,
+        "birch_door" => 11897,
+        "jungle_door" => 11961,
+        "acacia_door" => 12025,
+        "cherry_door" => 12089,
+        "dark_oak_door" => 12153,
+        "mangrove_door" => 12217,
+        "bamboo_door" => 12281,
+        "end_rod" => 12338,
+        "chorus_plant" => 12403,
+        "chorus_flower" => 12404,
+        "purpur_block" => 12410,
+        "purpur_pillar" => 12412,
+        "purpur_stairs" => 12425,
+        "end_stone_bricks" => 12494,
+        "torchflower_crop" => 12495,
+        "pitcher_crop" => 12498,
+        "pitcher_plant" => 12508,
+        "beetroots" => 12509,
+        "dirt_path" => 12513,
+        "end_gateway" => 12514,
+        "repeating_command_block" => 12521,
+        "chain_command_block" => 12533,
+        "frosted_ice" => 12539,
+        "magma_block" => 12543,
+        "nether_wart_block" => 12544,
+        "red_nether_bricks" => 12545,
+        "bone_block" => 12547,
+        "structure_void" => 12549,
+        "observer" => 12555,
+        "shulker_box" => 12566,
+        "white_shulker_box" => 12572,
+        "orange_shulker_box" => 12578,
+        "magenta_shulker_box" => 12584,
+        "light_blue_shulker_box" => 12590,
+        "yellow_shulker_box" => 12596,
+        "lime_shulker_box" => 12602,
+        "pink_shulker_box" => 12608,
+        "gray_shulker_box" => 12614,
+        "light_gray_shulker_box" => 12620,
+        "cyan_shulker_box" => 12626,
+        "purple_shulker_box" => 12632,
+        "blue_shulker_box" => 12638,
+        "brown_shulker_box" => 12644,
+        "green_shulker_box" => 12650,
+        "red_shulker_box" => 12656,
+        "black_shulker_box" => 12662,
+        "white_glazed_terracotta" => 12664,
+        "orange_glazed_terracotta" => 12668,
+        "magenta_glazed_terracotta" => 12672,
+        "light_blue_glazed_terracotta" => 12676,
+        "yellow_glazed_terracotta" => 12680,
+        "lime_glazed_terracotta" => 12684,
+        "pink_glazed_terracotta" => 12688,
+        "gray_glazed_terracotta" => 12692,
+        "light_gray_glazed_terracotta" => 12696,
+        "cyan_glazed_terracotta" => 12700,
+        "purple_glazed_terracotta" => 12704,
+        "blue_glazed_terracotta" => 12708,
+        "brown_glazed_terracotta" => 12712,
+        "green_glazed_terracotta" => 12716,
+        "red_glazed_terracotta" => 12720,
+        "black_glazed_terracotta" => 12724,
+        "white_concrete" => 12728,
+        "orange_concrete" => 12729,
+        "magenta_concrete" => 12730,
+        "light_blue_concrete" => 12731,
+        "yellow_concrete" => 12732,
+        "lime_concrete" => 12733,
+        "pink_concrete" => 12734,
+        "gray_concrete" => 12735,
+        "light_gray_concrete" => 12736,
+        "cyan_concrete" => 12737,
+        "purple_concrete" => 12738,
+        "blue_concrete" => 12739,
+        "brown_concrete" => 12740,
+        "green_concrete" => 12741,
+        "red_concrete" => 12742,
+        "black_concrete" => 12743,
+        "white_concrete_powder" => 12744,
+        "orange_concrete_powder" => 12745,
+        "magenta_concrete_powder" => 12746,
+        "light_blue_concrete_powder" => 12747,
+        "yellow_concrete_powder" => 12748,
+        "lime_concrete_powder" => 12749,
+        "pink_concrete_powder" => 12750,
+        "gray_concrete_powder" => 12751,
+        "light_gray_concrete_powder" => 12752,
+        "cyan_concrete_powder" => 12753,
+        "purple_concrete_powder" => 12754,
+        "blue_concrete_powder" => 12755,
+        "brown_concrete_powder" => 12756,
+        "green_concrete_powder" => 12757,
+        "red_concrete_powder" => 12758,
+        "black_concrete_powder" => 12759,
+        "kelp" => 12760,
+        "kelp_plant" => 12786,
+        "dried_kelp_block" => 12787,
+        "turtle_egg" => 12788,
+        "sniffer_egg" => 12800,
+        "dead_tube_coral_block" => 12803,
+        "dead_brain_coral_block" => 12804,
+        "dead_bubble_coral_block" => 12805,
+        "dead_fire_coral_block" => 12806,
+        "dead_horn_coral_block" => 12807,
+        "tube_coral_block" => 12808,
+        "brain_coral_block" => 12809,
+        "bubble_coral_block" => 12810,
+        "fire_coral_block" => 12811,
+        "horn_coral_block" => 12812,
+        "dead_tube_coral" => 12813,
+        "dead_brain_coral" => 12815,
+        "dead_bubble_coral" => 12817,
+        "dead_fire_coral" => 12819,
+        "dead_horn_coral" => 12821,
+        "tube_coral" => 12823,
+        "brain_coral" => 12825,
+        "bubble_coral" => 12827,
+        "fire_coral" => 12829,
+        "horn_coral" => 12831,
+        "dead_tube_coral_fan" => 12833,
+        "dead_brain_coral_fan" => 12835,
+        "dead_bubble_coral_fan" => 12837,
+        "dead_fire_coral_fan" => 12839,
+        "dead_horn_coral_fan" => 12841,
+        "tube_coral_fan" => 12843,
+        "brain_coral_fan" => 12845,
+        "bubble_coral_fan" => 12847,
+        "fire_coral_fan" => 12849,
+        "horn_coral_fan" => 12851,
+        "dead_tube_coral_wall_fan" => 12853,
+        "dead_brain_coral_wall_fan" => 12861,
+        "dead_bubble_coral_wall_fan" => 12869,
+        "dead_fire_coral_wall_fan" => 12877,
+        "dead_horn_coral_wall_fan" => 12885,
+        "tube_coral_wall_fan" => 12893,
+        "brain_coral_wall_fan" => 12901,
+        "bubble_coral_wall_fan" => 12909,
+        "fire_coral_wall_fan" => 12917,
+        "horn_coral_wall_fan" => 12925,
+        "sea_pickle" => 12933,
+        "blue_ice" => 12941,
+        "conduit" => 12942,
+        "bamboo_sapling" => 12944,
+        "bamboo" => 12945,
+        "potted_bamboo" => 12957,
+        "void_air" => 12958,
+        "cave_air" => 12959,
+        "bubble_column" => 12960,
+        "polished_granite_stairs" => 12973,
+        "smooth_red_sandstone_stairs" => 13053,
+        "mossy_stone_brick_stairs" => 13133,
+        "polished_diorite_stairs" => 13213,
+        "mossy_cobblestone_stairs" => 13293,
+        "end_stone_brick_stairs" => 13373,
+        "stone_stairs" => 13453,
+        "smooth_sandstone_stairs" => 13533,
+        "smooth_quartz_stairs" => 13613,
+        "granite_stairs" => 13693,
+        "andesite_stairs" => 13773,
+        "red_nether_brick_stairs" => 13853,
+        "polished_andesite_stairs" => 13933,
+        "diorite_stairs" => 14013,
+        "polished_granite_slab" => 14085,
+        "smooth_red_sandstone_slab" => 14091,
+        "mossy_stone_brick_slab" => 14097,
+        "polished_diorite_slab" => 14103,
+        "mossy_cobblestone_slab" => 14109,
+        "end_stone_brick_slab" => 14115,
+        "smooth_sandstone_slab" => 14121,
+        "smooth_quartz_slab" => 14127,
+        "granite_slab" => 14133,
+        "andesite_slab" => 14139,
+        "red_nether_brick_slab" => 14145,
+        "polished_andesite_slab" => 14151,
+        "diorite_slab" => 14157,
+        "brick_wall" => 14163,
+        "prismarine_wall" => 14487,
+        "red_sandstone_wall" => 14811,
+        "mossy_stone_brick_wall" => 15135,
+        "granite_wall" => 15459,
+        "stone_brick_wall" => 15783,
+        "mud_brick_wall" => 16107,
+        "nether_brick_wall" => 16431,
+        "andesite_wall" => 16755,
+        "red_nether_brick_wall" => 17079,
+        "sandstone_wall" => 17403,
+        "end_stone_brick_wall" => 17727,
+        "diorite_wall" => 18051,
+        "scaffolding" => 18403,
+        "loom" => 18404,
+        "barrel" => 18409,
+        "smoker" => 18421,
+        "blast_furnace" => 18429,
+        "cartography_table" => 18436,
+        "fletching_table" => 18437,
+        "grindstone" => 18442,
+        "lectern" => 18453,
+        "smithing_table" => 18466,
+        "stonecutter" => 18467,
+        "bell" => 18472,
+        "lantern" => 18506,
+        "soul_lantern" => 18510,
+        "campfire" => 18514,
+        "soul_campfire" => 18546,
+        "sweet_berry_bush" => 18575,
+        "warped_stem" => 18580,
+        "stripped_warped_stem" => 18583,
+        "warped_hyphae" => 18586,
+        "stripped_warped_hyphae" => 18589,
+        "warped_nylium" => 18591,
+        "warped_fungus" => 18592,
+        "warped_wart_block" => 18593,
+        "warped_roots" => 18594,
+        "nether_sprouts" => 18595,
+        "crimson_stem" => 18597,
+        "stripped_crimson_stem" => 18600,
+        "crimson_hyphae" => 18603,
+        "stripped_crimson_hyphae" => 18606,
+        "crimson_nylium" => 18608,
+        "crimson_fungus" => 18609,
+        "shroomlight" => 18610,
+        "weeping_vines" => 18611,
+        "weeping_vines_plant" => 18637,
+        "twisting_vines" => 18638,
+        "twisting_vines_plant" => 18664,
+        "crimson_roots" => 18665,
+        "crimson_planks" => 18666,
+        "warped_planks" => 18667,
+        "crimson_slab" => 18671,
+        "warped_slab" => 18677,
+        "crimson_pressure_plate" => 18681,
+        "warped_pressure_plate" => 18683,
+        "crimson_fence" => 18715,
+        "warped_fence" => 18747,
+        "crimson_trapdoor" => 18763,
+        "warped_trapdoor" => 18827,
+        "crimson_fence_gate" => 18883,
+        "warped_fence_gate" => 18915,
+        "crimson_stairs" => 18951,
+        "warped_stairs" => 19031,
+        "crimson_button" => 19109,
+        "warped_button" => 19133,
+        "crimson_door" => 19159,
+        "warped_door" => 19223,
+        "crimson_sign" => 19277,
+        "warped_sign" => 19309,
+        "crimson_wall_sign" => 19341,
+        "warped_wall_sign" => 19349,
+        "structure_block" => 19357,
+        "jigsaw" => 19370,
+        "composter" => 19372,
+        "target" => 19381,
+        "bee_nest" => 19397,
+        "beehive" => 19421,
+        "honey_block" => 19445,
+        "honeycomb_block" => 19446,
+        "netherite_block" => 19447,
+        "ancient_debris" => 19448,
+        "crying_obsidian" => 19449,
+        "respawn_anchor" => 19450,
+        "potted_crimson_fungus" => 19455,
+        "potted_warped_fungus" => 19456,
+        "potted_crimson_roots" => 19457,
+        "potted_warped_roots" => 19458,
+        "lodestone" => 19459,
+        "blackstone" => 19460,
+        "blackstone_stairs" => 19472,
+        "blackstone_wall" => 19544,
+        "blackstone_slab" => 19868,
+        "polished_blackstone" => 19871,
+        "polished_blackstone_bricks" => 19872,
+        "cracked_polished_blackstone_bricks" => 19873,
+        "chiseled_polished_blackstone" => 19874,
+        "polished_blackstone_brick_slab" => 19878,
+        "polished_blackstone_brick_stairs" => 19892,
+        "polished_blackstone_brick_wall" => 19964,
+        "gilded_blackstone" => 20285,
+        "polished_blackstone_stairs" => 20297,
+        "polished_blackstone_slab" => 20369,
+        "polished_blackstone_pressure_plate" => 20373,
+        "polished_blackstone_button" => 20383,
+        "polished_blackstone_wall" => 20401,
+        "chiseled_nether_bricks" => 20722,
+        "cracked_nether_bricks" => 20723,
+        "quartz_bricks" => 20724,
+        "candle" => 20728,
+        "white_candle" => 20744,
+        "orange_candle" => 20760,
+        "magenta_candle" => 20776,
+        "light_blue_candle" => 20792,
+        "yellow_candle" => 20808,
+        "lime_candle" => 20824,
+        "pink_candle" => 20840,
+        "gray_candle" => 20856,
+        "light_gray_candle" => 20872,
+        "cyan_candle" => 20888,
+        "purple_candle" => 20904,
+        "blue_candle" => 20920,
+        "brown_candle" => 20936,
+        "green_candle" => 20952,
+        "red_candle" => 20968,
+        "black_candle" => 20984,
+        "candle_cake" => 20998,
+        "white_candle_cake" => 21000,
+        "orange_candle_cake" => 21002,
+        "magenta_candle_cake" => 21004,
+        "light_blue_candle_cake" => 21006,
+        "yellow_candle_cake" => 21008,
+        "lime_candle_cake" => 21010,
+        "pink_candle_cake" => 21012,
+        "gray_candle_cake" => 21014,
+        "light_gray_candle_cake" => 21016,
+        "cyan_candle_cake" => 21018,
+        "purple_candle_cake" => 21020,
+        "blue_candle_cake" => 21022,
+        "brown_candle_cake" => 21024,
+        "green_candle_cake" => 21026,
+        "red_candle_cake" => 21028,
+        "black_candle_cake" => 21030,
+        "amethyst_block" => 21031,
+        "budding_amethyst" => 21032,
+        "amethyst_cluster" => 21042,
+        "large_amethyst_bud" => 21054,
+        "medium_amethyst_bud" => 21066,
+        "small_amethyst_bud" => 21078,
+        "tuff" => 21081,
+        "tuff_slab" => 21085,
+        "tuff_stairs" => 21099,
+        "tuff_wall" => 21171,
+        "polished_tuff" => 21492,
+        "polished_tuff_slab" => 21496,
+        "polished_tuff_stairs" => 21510,
+        "polished_tuff_wall" => 21582,
+        "chiseled_tuff" => 21903,
+        "tuff_bricks" => 21904,
+        "tuff_brick_slab" => 21908,
+        "tuff_brick_stairs" => 21922,
+        "tuff_brick_wall" => 21994,
+        "chiseled_tuff_bricks" => 22315,
+        "calcite" => 22316,
+        "tinted_glass" => 22317,
+        "powder_snow" => 22318,
+        "sculk_sensor" => 22320,
+        "calibrated_sculk_sensor" => 22416,
+        "sculk" => 22799,
+        "sculk_vein" => 22927,
+        "sculk_catalyst" => 22929,
+        "sculk_shrieker" => 22937,
+        "copper_block" => 22938,
+        "exposed_copper" => 22939,
+        "weathered_copper" => 22940,
+        "oxidized_copper" => 22941,
+        "copper_ore" => 22942,
+        "deepslate_copper_ore" => 22943,
+        "oxidized_cut_copper" => 22944,
+        "weathered_cut_copper" => 22945,
+        "exposed_cut_copper" => 22946,
+        "cut_copper" => 22947,
+        "oxidized_chiseled_copper" => 22948,
+        "weathered_chiseled_copper" => 22949,
+        "exposed_chiseled_copper" => 22950,
+        "chiseled_copper" => 22951,
+        "waxed_oxidized_chiseled_copper" => 22952,
+        "waxed_weathered_chiseled_copper" => 22953,
+        "waxed_exposed_chiseled_copper" => 22954,
+        "waxed_chiseled_copper" => 22955,
+        "oxidized_cut_copper_stairs" => 22967,
+        "weathered_cut_copper_stairs" => 23047,
+        "exposed_cut_copper_stairs" => 23127,
+        "cut_copper_stairs" => 23207,
+        "oxidized_cut_copper_slab" => 23279,
+        "weathered_cut_copper_slab" => 23285,
+        "exposed_cut_copper_slab" => 23291,
+        "cut_copper_slab" => 23297,
+        "waxed_copper_block" => 23300,
+        "waxed_weathered_copper" => 23301,
+        "waxed_exposed_copper" => 23302,
+        "waxed_oxidized_copper" => 23303,
+        "waxed_oxidized_cut_copper" => 23304,
+        "waxed_weathered_cut_copper" => 23305,
+        "waxed_exposed_cut_copper" => 23306,
+        "waxed_cut_copper" => 23307,
+        "waxed_oxidized_cut_copper_stairs" => 23319,
+        "waxed_weathered_cut_copper_stairs" => 23399,
+        "waxed_exposed_cut_copper_stairs" => 23479,
+        "waxed_cut_copper_stairs" => 23559,
+        "waxed_oxidized_cut_copper_slab" => 23631,
+        "waxed_weathered_cut_copper_slab" => 23637,
+        "waxed_exposed_cut_copper_slab" => 23643,
+        "waxed_cut_copper_slab" => 23649,
+        "copper_door" => 23663,
+        "exposed_copper_door" => 23727,
+        "oxidized_copper_door" => 23791,
+        "weathered_copper_door" => 23855,
+        "waxed_copper_door" => 23919,
+        "waxed_exposed_copper_door" => 23983,
+        "waxed_oxidized_copper_door" => 24047,
+        "waxed_weathered_copper_door" => 24111,
+        "copper_trapdoor" => 24179,
+        "exposed_copper_trapdoor" => 24243,
+        "oxidized_copper_trapdoor" => 24307,
+        "weathered_copper_trapdoor" => 24371,
+        "waxed_copper_trapdoor" => 24435,
+        "waxed_exposed_copper_trapdoor" => 24499,
+        "waxed_oxidized_copper_trapdoor" => 24563,
+        "waxed_weathered_copper_trapdoor" => 24627,
+        "copper_grate" => 24677,
+        "exposed_copper_grate" => 24679,
+        "weathered_copper_grate" => 24681,
+        "oxidized_copper_grate" => 24683,
+        "waxed_copper_grate" => 24685,
+        "waxed_exposed_copper_grate" => 24687,
+        "waxed_weathered_copper_grate" => 24689,
+        "waxed_oxidized_copper_grate" => 24691,
+        "copper_bulb" => 24695,
+        "exposed_copper_bulb" => 24699,
+        "weathered_copper_bulb" => 24703,
+        "oxidized_copper_bulb" => 24707,
+        "waxed_copper_bulb" => 24711,
+        "waxed_exposed_copper_bulb" => 24715,
+        "waxed_weathered_copper_bulb" => 24719,
+        "waxed_oxidized_copper_bulb" => 24723,
+        "lightning_rod" => 24743,
+        "pointed_dripstone" => 24753,
+        "dripstone_block" => 24768,
+        "cave_vines" => 24770,
+        "cave_vines_plant" => 24822,
+        "spore_blossom" => 24823,
+        "azalea" => 24824,
+        "flowering_azalea" => 24825,
+        "moss_carpet" => 24826,
+        "pink_petals" => 24827,
+        "moss_block" => 24843,
+        "big_dripleaf" => 24845,
+        "big_dripleaf_stem" => 24877,
+        "small_dripleaf" => 24887,
+        "hanging_roots" => 24901,
+        "rooted_dirt" => 24902,
+        "mud" => 24903,
+        "deepslate" => 24905,
+        "cobbled_deepslate" => 24907,
+        "cobbled_deepslate_stairs" => 24919,
+        "cobbled_deepslate_slab" => 24991,
+        "cobbled_deepslate_wall" => 24997,
+        "polished_deepslate" => 25318,
+        "polished_deepslate_stairs" => 25330,
+        "polished_deepslate_slab" => 25402,
+        "polished_deepslate_wall" => 25408,
+        "deepslate_tiles" => 25729,
+        "deepslate_tile_stairs" => 25741,
+        "deepslate_tile_slab" => 25813,
+        "deepslate_tile_wall" => 25819,
+        "deepslate_bricks" => 26140,
+        "deepslate_brick_stairs" => 26152,
+        "deepslate_brick_slab" => 26224,
+        "deepslate_brick_wall" => 26230,
+        "chiseled_deepslate" => 26551,
+        "cracked_deepslate_bricks" => 26552,
+        "cracked_deepslate_tiles" => 26553,
+        "infested_deepslate" => 26555,
+        "smooth_basalt" => 26557,
+        "raw_iron_block" => 26558,
+        "raw_copper_block" => 26559,
+        "raw_gold_block" => 26560,
+        "potted_azalea_bush" => 26561,
+        "potted_flowering_azalea_bush" => 26562,
+        "ochre_froglight" => 26564,
+        "verdant_froglight" => 26567,
+        "pearlescent_froglight" => 26570,
+        "frogspawn" => 26572,
+        "reinforced_deepslate" => 26573,
+        "decorated_pot" => 26583,
+        "crafter" => 26635,
+        "trial_spawner" => 26644,
+        "vault" => 26654,
+        "heavy_core" => 26683,
+        _ => return None,
+    })
+}
+
+// ---------- datapacks (directories and ZIP files under datapacks/) ----------
+struct Datapack {
+    name: String,
+    functions: HashMap<String, Vec<String>>,
+    load: Vec<String>,
+    tick: Vec<String>,
+}
+static PACKS: OnceLock<Mutex<Vec<Datapack>>> = OnceLock::new();
+fn packs() -> &'static Mutex<Vec<Datapack>> {
+    PACKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[derive(Default)]
+struct DatapackContent {
+    packs: Vec<Datapack>,
+    recipes: Vec<JsonRecipe>,
+    smelts: Vec<SmeltRecipe>,
+    block_tags: HashMap<String, Vec<String>>,
+    item_tags: HashMap<String, Vec<String>>,
+    loot: HashMap<String, Vec<LootPool>>,
+    mob_loot: HashMap<i64, Vec<LootPool>>,
+    item_mods: HashMap<String, Vec<LootFunc>>,
+    advancements: HashMap<String, Advancement>,
+    predicates: HashMap<String, String>,
+}
+
+impl DatapackContent {
+    fn publish(self) {
+        // Recipes consult item tags while holding their own locks. Counts also
+        // reads block tags under the recipe lock. Publish in that lock order.
+        let mut recipes = json_recipes().lock().unwrap();
+        let mut smelts = json_smelts().lock().unwrap();
+        let mut blocks = block_tags().lock().unwrap();
+        let mut items = item_tags().lock().unwrap();
+        let mut loot = loot_tables().lock().unwrap();
+        let mut mob_loot = mob_loot_tables().lock().unwrap();
+        let mut mods = item_mods().lock().unwrap();
+        let mut advs = advancements().lock().unwrap();
+        let mut conditions = predicates().lock().unwrap();
+        let mut active = packs().lock().unwrap();
+        *recipes = self.recipes;
+        *smelts = self.smelts;
+        *blocks = self.block_tags;
+        *items = self.item_tags;
+        *loot = self.loot;
+        *mob_loot = self.mob_loot;
+        *mods = self.item_mods;
+        *advs = self.advancements;
+        *conditions = self.predicates;
+        *active = self.packs;
+        CONTENT_REVISION.fetch_add(1, Ordering::Release);
+    }
+
+    fn read_entry(&mut self, pack: &mut Datapack, path: &str, body: &str) {
+        let Some(("data", path)) = path.split_once('/') else {
+            return;
+        };
+        let Some((ns, path)) = path.split_once('/') else {
+            return;
+        };
+        let Some((kind, rel)) = path.split_once('/') else {
+            return;
+        };
+        if let "function" | "functions" = kind {
+            if let Some(name) = rel.strip_suffix(".mcfunction") {
+                pack.functions.insert(
+                    format!("{ns}:{name}"),
+                    body.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                        .map(str::to_owned)
+                        .collect(),
+                );
+            }
+            return;
+        }
+        let Some(rel) = rel.strip_suffix(".json") else {
+            return;
+        };
+        let key = format!("{ns}:{rel}");
+        match kind {
+            "tags" => {
+                let Some((tag, name)) = rel.split_once('/') else {
+                    return;
+                };
+                match tag {
+                    "block" | "blocks" | "item" | "items" => {
+                        let dst = if tag.starts_with('b') {
+                            &mut self.block_tags
+                        } else {
+                            &mut self.item_tags
+                        };
+                        if let Some(values) = body.split("\"values\"").nth(1) {
+                            dst.entry(format!("{ns}:{name}")).or_default().extend(
+                                values
+                                    .split('"')
+                                    .skip(1)
+                                    .step_by(2)
+                                    .map(str::trim)
+                                    .filter(|m| !m.is_empty() && !m.starts_with([']', '{']))
+                                    .map(|m| {
+                                        if m.contains(':') || m.starts_with('#') {
+                                            m.to_owned()
+                                        } else {
+                                            format!("minecraft:{m}")
+                                        }
+                                    }),
+                            );
+                        }
+                    }
+                    "function" | "functions" => {
+                        let dst = match name {
+                            "load" => &mut pack.load,
+                            "tick" => &mut pack.tick,
+                            _ => return,
+                        };
+                        if let Some(values) = body.split("\"values\"").nth(1) {
+                            dst.extend(
+                                values
+                                    .split('"')
+                                    .skip(1)
+                                    .step_by(2)
+                                    .filter(|m| m.starts_with('#') || m.contains(':'))
+                                    .map(|m| {
+                                        let m = m.trim_start_matches('#');
+                                        if m.contains(':') {
+                                            m.to_owned()
+                                        } else {
+                                            format!("minecraft:{m}")
+                                        }
+                                    }),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "recipe" | "recipes" => self.read_recipe(body),
+            "loot_table" | "loot_tables" => self.read_loot(key, rel, body),
+            "item_modifier" | "item_modifiers" => {
+                let funcs = parse_loot_funcs(body);
+                if !funcs.is_empty() {
+                    self.item_mods.insert(key, funcs);
+                }
+            }
+            "advancement" | "advancements" => self.read_advancement(key, rel, body),
+            "predicate" | "predicates" => {
+                self.predicates.insert(key, body.to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    fn read_recipe(&mut self, body: &str) {
+        let mk_ingr = |spec: &str| -> Option<Ingr> {
+            if let Some(t) = jstr(spec, "tag") {
+                let t = t.trim_start_matches('#');
+                Some(Ingr::Tag(if t.contains(':') {
+                    t.to_string()
+                } else {
+                    format!("minecraft:{}", t)
+                }))
+            } else if let Some(n) = jstr(spec, "item") {
+                name_to_item(n.trim_start_matches("minecraft:")).map(Ingr::Item)
+            } else {
+                jstr(spec, "").and(None)
+            } // object-less spec unsupported
+        };
+        let (out_id, out_cnt) = {
+            let rblk = jblock(body, "result");
+            let id = rblk
+                .and_then(|b| jstr(b, "id"))
+                .or_else(|| jstr(body, "result"));
+            let cnt = rblk
+                .and_then(|b| jnum(b, "count"))
+                .or_else(|| jnum(body, "count"))
+                .unwrap_or(1)
+                .clamp(1, 64) as u8;
+            (
+                id.and_then(|i| name_to_item(i.trim_start_matches("minecraft:"))),
+                cnt,
+            )
+        };
+        let Some(out) = out_id else { return };
+        if body.contains("crafting_shaped") {
+            let mut rows: Vec<String> = Vec::new();
+            if let Some(pa) = jarray(body, "pattern") {
+                for m in pa.split('"').skip(1).step_by(2) {
+                    if !m.is_empty() {
+                        rows.push(m.to_string())
+                    }
+                }
+            }
+            let mut key: HashMap<char, Ingr> = HashMap::new();
+            if let Some(kb) = jblock(body, "key") {
+                let inner = &kb[1..kb.len() - 1];
+                for entry in inner.split(',') {
+                    let Some(col) = entry.find(':') else { continue };
+                    let ch = entry[..col]
+                        .trim()
+                        .trim_matches('"')
+                        .chars()
+                        .next()
+                        .unwrap_or(' ');
+                    let spec = entry[col..].trim();
+                    if let Some(ig) = mk_ingr(spec) {
+                        key.insert(ch, ig);
+                    }
+                }
+            }
+            if !rows.is_empty() {
+                self.recipes.push(JsonRecipe {
+                    shaped: true,
+                    rows,
+                    key,
+                    ing: Vec::new(),
+                    out,
+                    out_cnt,
+                });
+            }
+        } else if body.contains("crafting_shapeless") {
+            let mut ing: Vec<Ingr> = Vec::new();
+            if let Some(ia) = jarray(body, "ingredients") {
+                for spec in ia.split('{').skip(1) {
+                    if let Some(ig) = mk_ingr(spec) {
+                        ing.push(ig)
+                    }
+                }
+                if ing.is_empty() {
+                    // bare form: ["minecraft:x","minecraft:y"]
+                    for m in ia.split('"').skip(1).step_by(2) {
+                        if let Some(i) = name_to_item(m.trim_start_matches("minecraft:")) {
+                            ing.push(Ingr::Item(i));
+                        }
+                    }
+                }
+            }
+            if !ing.is_empty() {
+                self.recipes.push(JsonRecipe {
+                    shaped: false,
+                    rows: Vec::new(),
+                    key: HashMap::new(),
+                    ing,
+                    out,
+                    out_cnt,
+                });
+            }
+        } else if ["smelting", "blasting", "smoking", "campfire_cooking"]
+            .iter()
+            .any(|k| body.contains(k))
+        {
+            // "ingredient": {"item"|"tag":...} or bare "minecraft:x"
+            let ig = jblock(body, "ingredient").and_then(mk_ingr).or_else(|| {
+                jstr(body, "ingredient")
+                    .and_then(|n| name_to_item(n.trim_start_matches("minecraft:")).map(Ingr::Item))
+            });
+            if let Some(ig) = ig {
+                let xp = jstr(body, "experience")
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                self.smelts.push((ig, out, out_cnt, xp));
+            }
+        }
+    }
+
+    fn read_loot(&mut self, key: String, rel: &str, body: &str) {
+        let mut pools: Vec<LootPool> = Vec::new();
+        if let Some(pa) = jarray(body, "pools") {
+            for pb in jobjects(pa) {
+                let rolls = jnum(pb, "rolls")
+                    .or_else(|| jblock(pb, "rolls").and_then(|b| jnum(b, "max")))
+                    .unwrap_or(1)
+                    .clamp(1, 64) as u8;
+                let mut chance = 1.0f32;
+                if let Some(ca) = jarray(pb, "conditions") {
+                    for cb in jobjects(ca) {
+                        if cb.contains("random_chance") {
+                            if let Some(c) = jnum(cb, "chance") {
+                                chance *= c as f32 / 100.0;
+                            } else if let Some(c) =
+                                jstr(cb, "chance").and_then(|x| x.parse::<f32>().ok())
+                            {
+                                chance *= c;
+                            }
+                        }
+                    }
+                }
+                let mut entries: Vec<LootEntry> = Vec::new();
+                if let Some(ea) = jarray(pb, "entries") {
+                    for eb in jobjects(ea) {
+                        if !eb.contains("\"item\"") && !eb.contains("item") {
+                            continue;
+                        }
+                        let Some(n) = jstr(eb, "name") else { continue };
+                        let Some(item) = name_to_item(n.trim_start_matches("minecraft:")) else {
+                            continue;
+                        };
+                        let (mut lo, mut hi) = (1u8, 1u8);
+                        let mut efuncs: Vec<LootFunc> = Vec::new();
+                        if let Some(fa) = jarray(eb, "functions") {
+                            for fb in jobjects(fa) {
+                                if fb.contains("set_count") {
+                                    if let Some(cb) = jblock(fb, "count") {
+                                        lo = jnum(cb, "min").unwrap_or(1).clamp(0, 64) as u8;
+                                        hi =
+                                            jnum(cb, "max").unwrap_or(lo as i64).clamp(0, 64) as u8;
+                                    } else if let Some(c) = jnum(fb, "count") {
+                                        lo = c.clamp(0, 64) as u8;
+                                        hi = lo;
+                                    }
+                                } else {
+                                    efuncs.extend(parse_loot_funcs(fb));
+                                }
+                            }
+                        }
+                        entries.push(LootEntry {
+                            item,
+                            min: lo,
+                            max: hi.max(lo),
+                            funcs: efuncs,
+                        });
+                    }
+                }
+                let pfuncs: Vec<LootFunc> = jarray(pb, "functions")
+                    .map(parse_loot_funcs)
+                    .unwrap_or_default();
+                if !entries.is_empty() {
+                    pools.push(LootPool {
+                        rolls,
+                        chance,
+                        entries,
+                        funcs: pfuncs,
+                    });
+                }
+            }
+        }
+        if !pools.is_empty() {
+            if let Some(mob) = rel
+                .strip_prefix("entities/")
+                .and_then(|name| name.rsplit('/').next())
+                .and_then(name_to_etype)
+            {
+                self.mob_loot.insert(
+                    mob,
+                    pools
+                        .iter()
+                        .map(|pool| LootPool {
+                            rolls: pool.rolls,
+                            chance: pool.chance,
+                            funcs: pool.funcs.clone(),
+                            entries: pool
+                                .entries
+                                .iter()
+                                .map(|entry| LootEntry {
+                                    item: entry.item,
+                                    min: entry.min,
+                                    max: entry.max,
+                                    funcs: entry.funcs.clone(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                );
+            }
+            self.loot.insert(key, pools);
+        }
+    }
+
+    fn read_advancement(&mut self, key: String, rel: &str, body: &str) {
+        let Some(cb) = jblock(body, "criteria") else {
+            return;
+        };
+        let inner = &cb[1..cb.len() - 1];
+        let mut criteria: Vec<(String, String, Option<i64>)> = Vec::new();
+        for co in jobjects(inner) {
+            // criterion key precedes the object: find its name backwards
+            let Some(cpos) = inner.find(co) else { continue };
+            let pre = &inner[..cpos];
+            let cn = pre
+                .rfind('"')
+                .and_then(|e2| pre[..e2].rfind('"').map(|s2| &pre[s2 + 1..e2]))
+                .unwrap_or("")
+                .to_string();
+            let tr = jstr(co, "trigger")
+                .unwrap_or("")
+                .trim_start_matches("minecraft:")
+                .to_string();
+            let want = jblock(co, "conditions")
+                .and_then(|cd| jblock(cd, "entity"))
+                .and_then(|en| jstr(en, "type"))
+                .and_then(|t| name_to_etype(t.trim_start_matches("minecraft:")));
+            criteria.push((cn, tr, want));
+        }
+        let title = jblock(body, "display")
+            .and_then(|d| {
+                jblock(d, "title")
+                    .and_then(|t| jstr(t, "text").map(|x| x.to_string()))
+                    .or_else(|| jstr(d, "title").map(|x| x.to_string()))
+            })
+            .unwrap_or_else(|| rel.to_owned());
+        if !criteria.is_empty() {
+            self.advancements
+                .insert(key, Advancement { title, criteria });
+        }
+    }
+}
+
+const ZIP_MAX_BYTES: usize = 64 * 1024 * 1024;
+const ZIP_MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+const ZIP_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const ZIP_MAX_ENTRIES: usize = 4096;
+
+fn zip_u16(bytes: &[u8], offset: usize) -> usize {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize
+}
+
+fn zip_u32(bytes: &[u8], offset: usize) -> usize {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize
+}
+
+// ZIP32, single disk. Validate the entire archive before exposing any resources.
+fn zip_datapack_entries(bytes: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+    let end = bytes.len().checked_sub(22)?;
+    let eocd = (end.saturating_sub(u16::MAX as usize)..=end)
+        .rev()
+        .find(|&pos| {
+            bytes[pos..].starts_with(b"PK\x05\x06") && zip_u16(bytes, pos + 20) == end - pos
+        })?;
+    let footer = &bytes[eocd..];
+    let count = zip_u16(footer, 10);
+    let central_start = zip_u32(footer, 16);
+    let mut central = bytes.get(central_start..eocd)?;
+    if zip_u32(footer, 4) != 0
+        || zip_u16(footer, 8) != count
+        || count > ZIP_MAX_ENTRIES
+        || zip_u32(footer, 12) != central.len()
+    {
+        return None;
+    }
+
+    let mut total = 0;
+    let mut records = Vec::with_capacity(count);
+    let mut ranges = Vec::with_capacity(count);
+    let mut paths = HashSet::with_capacity(count);
+    for _ in 0..count {
+        let record = central.get(..46)?;
+        if !record.starts_with(b"PK\x01\x02") || zip_u16(record, 34) != 0 {
+            return None;
+        }
+        let flags = zip_u16(record, 8);
+        let method = zip_u16(record, 10);
+        let crc = zip_u32(record, 16);
+        let compressed = zip_u32(record, 20);
+        let size = zip_u32(record, 24);
+        let name_end = 46 + zip_u16(record, 28);
+        let name = central.get(46..name_end)?;
+        central = central.get(name_end + zip_u16(record, 30) + zip_u16(record, 32)..)?;
+        if !matches!(method, 0 | 8)
+            || flags & !(0x0808 | if method == 8 { 6 } else { 0 }) != 0
+            || size > ZIP_MAX_ENTRY_BYTES
+            || size > ZIP_MAX_TOTAL_BYTES - total
+        {
+            return None;
+        }
+        total += size;
+
+        let path = std::str::from_utf8(name).ok()?.replace('\\', "/");
+        let plain_path = path.strip_suffix('/').unwrap_or(&path);
+        let directory = plain_path.len() != path.len();
+        if plain_path.contains(['\0', ':'])
+            || plain_path
+                .split('/')
+                .any(|part| matches!(part, "" | "." | ".."))
+            || !paths.insert(plain_path.to_owned())
+            || (directory && size != 0)
+        {
+            return None;
+        }
+
+        let offset = zip_u32(record, 42);
+        let local = bytes.get(offset..central_start)?;
+        let header = local.get(..30)?;
+        let local_name_end = 30 + zip_u16(header, 26);
+        let data_start = local_name_end + zip_u16(header, 28);
+        if !header.starts_with(b"PK\x03\x04")
+            || zip_u16(header, 6) != flags
+            || zip_u16(header, 8) != method
+            || local.get(30..local_name_end)? != name
+        {
+            return None;
+        }
+        let descriptor = flags & 8 != 0;
+        for (field, value) in [(14, crc), (18, compressed), (22, size)] {
+            let local_value = zip_u32(header, field);
+            if local_value != value && !(descriptor && local_value == 0) {
+                return None;
+            }
+        }
+        let data = local.get(data_start..)?.get(..compressed)?;
+        let mut record_end = offset + data_start + compressed;
+        if descriptor {
+            let tail = bytes.get(record_end..central_start)?;
+            let matches = |fields: &[u8]| {
+                fields.len() >= 12
+                    && zip_u32(fields, 0) == crc
+                    && zip_u32(fields, 4) == compressed
+                    && zip_u32(fields, 8) == size
+            };
+            record_end += if tail.strip_prefix(b"PK\x07\x08").is_some_and(matches) {
+                16
+            } else if matches(tail) {
+                12
+            } else {
+                return None;
+            };
+        }
+        ranges.push((offset, record_end));
+        records.push((path, directory, method, crc, size, data));
+    }
+    ranges.sort_unstable();
+    let mut next = 0;
+    for (start, end) in ranges {
+        if start != next {
+            return None;
+        }
+        next = end;
+    }
+    if next != central_start || !central.is_empty() {
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    for (path, directory, method, crc, size, data) in records {
+        let body = if method == 0 {
+            if data.len() != size {
+                return None;
+            }
+            data.to_vec()
+        } else {
+            let mut decoder = flate2::read::DeflateDecoder::new(data);
+            let mut body = Vec::new();
+            (&mut decoder)
+                .take(size as u64 + 1)
+                .read_to_end(&mut body)
+                .ok()?;
+            if body.len() != size || decoder.total_in() != data.len() as u64 {
+                return None;
+            }
+            body
+        };
+        let mut checksum = flate2::Crc::new();
+        checksum.update(&body);
+        if checksum.sum() as usize != crc {
+            return None;
+        }
+        if !directory {
+            entries.push((path, body));
+        }
+    }
+    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    Some(entries)
+}
+
+fn datapack_sources(base: &std::path::Path) -> Vec<(String, std::path::PathBuf, bool)> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut sources = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let zip = kind.is_file() && path.extension().is_some_and(|ext| ext == "zip");
+        if zip
+            || (kind.is_dir() && (path.join("pack.mcmeta").is_file() || path.join("data").is_dir()))
+        {
+            sources.push((name, path, zip));
+        }
+    }
+    sources.sort_unstable_by(|(a, _, _), (b, _, _)| a.cmp(b));
+    sources
+}
+
+fn read_directory_datapack(
+    base: &std::path::Path,
+    pack: &mut Datapack,
+    content: &mut DatapackContent,
+) {
+    let mut dirs = vec![base.join("data")];
+    let mut files = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if kind.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext == "json" || ext == "mcfunction")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort_unstable();
+    for file in files {
+        let Ok(path) = file.strip_prefix(base) else {
+            continue;
+        };
+        if let (Some(path), Ok(body)) = (path.to_str(), std::fs::read_to_string(&file)) {
+            content.read_entry(pack, &path.replace('\\', "/"), &body);
+        }
+    }
+}
+
+const DATAPACK_DIRECTORY: &str = "datapacks";
+static DATAPACK_RELOAD: Mutex<()> = Mutex::new(());
+static DISABLED_DATAPACKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn disabled_datapacks() -> &'static Mutex<HashSet<String>> {
+    DISABLED_DATAPACKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(test)]
+fn load_datapacks() {
+    reload_datapacks(std::path::Path::new(DATAPACK_DIRECTORY), None, false).unwrap();
+}
+
+fn reload_datapacks(
+    base: &std::path::Path,
+    change: Option<(&str, bool)>,
+    run_load_functions: bool,
+) -> Result<usize, String> {
+    // Load functions can invoke commands, including another reload. Refuse an
+    // overlapping reload while the current one publishes and runs its hooks.
+    let _reload = DATAPACK_RELOAD
+        .try_lock()
+        .map_err(|_| "Datapack reload already in progress")?;
+    let sources = datapack_sources(base);
+    let mut disabled = disabled_datapacks().lock().unwrap().clone();
+    if let Some((name, enable)) = change {
+        if !sources.iter().any(|(candidate, _, _)| candidate == name) {
+            return Err(format!("Unknown datapack '{name}'"));
+        }
+        if enable && !disabled.remove(name) {
+            return Err(format!("Datapack '{name}' is already enabled"));
+        }
+        if !enable && !disabled.insert(name.to_owned()) {
+            return Err(format!("Datapack '{name}' is already disabled"));
+        }
+    }
+    let mut content = DatapackContent {
+        block_tags: builtin_block_tags(),
+        item_tags: builtin_item_tags(),
+        ..DatapackContent::default()
+    };
+    for (name, path, zip) in sources {
+        if disabled.contains(&name) {
+            continue;
+        }
+        let mut pack = Datapack {
+            name,
+            functions: HashMap::new(),
+            load: Vec::new(),
+            tick: Vec::new(),
+        };
+        if zip {
+            let mut bytes = Vec::new();
+            let entries = std::fs::File::open(&path)
+                .and_then(|file| file.take(ZIP_MAX_BYTES as u64 + 1).read_to_end(&mut bytes))
+                .ok()
+                .filter(|&len| len <= ZIP_MAX_BYTES)
+                .and_then(|_| zip_datapack_entries(&bytes));
+            let Some(entries) = entries else {
+                eprintln!(
+                    "[spine] rejecting invalid or unsupported datapack {}",
+                    path.display()
+                );
+                continue;
+            };
+            for (path, body) in entries {
+                if let Ok(body) = std::str::from_utf8(&body) {
+                    content.read_entry(&mut pack, &path, body);
+                }
+            }
+        } else {
+            read_directory_datapack(&path, &mut pack, &mut content);
+        }
+        eprintln!(
+            "[spine] datapack {}: {} fn, load={:?}, tick={:?}",
+            pack.name,
+            pack.functions.len(),
+            pack.load,
+            pack.tick
+        );
+        content.packs.push(pack);
+    }
+    if let Some((name, true)) = change {
+        if !content.packs.iter().any(|pack| pack.name == name) {
+            return Err(format!("Could not load datapack '{name}'"));
+        }
+    }
+    let count = content.packs.len();
+    let loads: Vec<String> = content
+        .packs
+        .iter()
+        .flat_map(|pack| pack.load.iter().cloned())
+        .collect();
+    {
+        let mut disabled_packs = disabled_datapacks().lock().unwrap();
+        content.publish();
+        *disabled_packs = disabled;
+    }
+    if run_load_functions {
+        for function in loads {
+            run_function(&function, None, &mut None);
+        }
+    }
+    Ok(count)
+}
+
+fn run_datapack_command(args: &[&str]) -> String {
+    let base = std::path::Path::new(DATAPACK_DIRECTORY);
+    let names: Vec<String> = match args {
+        ["list"] | ["list", "enabled"] => packs()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect(),
+        ["list", "available"] => {
+            let disabled = disabled_datapacks().lock().unwrap();
+            datapack_sources(base)
+                .into_iter()
+                .filter_map(|(name, _, _)| disabled.contains(&name).then_some(name))
+                .collect()
+        }
+        [action @ ("enable" | "disable"), name] => {
+            let name = name.strip_prefix("file/").unwrap_or(name);
+            let enable = *action == "enable";
+            return match reload_datapacks(base, Some((name, enable)), true) {
+                Ok(count) => format!(
+                    "{} datapack '{name}'. Reloading! ({count} pack(s))",
+                    if enable { "Enabled" } else { "Disabled" }
+                ),
+                Err(error) => error,
+            };
+        }
+        _ => return "usage: /datapack list [enabled|available] | enable|disable <name>".into(),
+    };
+    format!("{} packs: {}", names.len(), names.join(", "))
+}
+
+// tiny json helpers for datapack files (no serde — dep-free loader)
+fn jstr<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    // value of "key": "..." or bare token
+    let rest = body.split(&format!("\"{}\"", key)).nth(1)?;
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    if let Some(q) = rest.strip_prefix('"') {
+        return Some(&q[..q.find('"')?]);
+    }
+    Some(rest.split([',', '}', ']']).next()?.trim())
+}
+fn jnum(body: &str, key: &str) -> Option<i64> {
+    jstr(body, key)?.parse().ok()
+}
+fn jblock<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    // balanced-brace block after "key":
+    let rest = body.split(&format!("\"{}\"", key)).nth(1)?;
+    let start = rest.find('{')?;
+    let mut d = 0i32;
+    for (i, ch) in rest[start..].char_indices() {
+        match ch {
+            '{' => d += 1,
+            '}' => {
+                d -= 1;
+                if d == 0 {
+                    return Some(&rest[start..start + i + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+// yields each top-level {...} object inside an array body
+fn jobjects(arr: &str) -> Vec<&str> {
+    let mut v = Vec::new();
+    let mut d = 0i32;
+    let mut st = 0usize;
+    for (i, ch) in arr.char_indices() {
+        match ch {
+            '{' => {
+                if d == 0 {
+                    st = i
+                }
+                d += 1
+            }
+            '}' => {
+                d -= 1;
+                if d == 0 {
+                    v.push(&arr[st..i + 1])
+                }
+            }
+            _ => {}
+        }
+    }
+    v
+}
+fn jarray<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let rest = body.split(&format!("\"{}\"", key)).nth(1)?;
+    let start = rest.find('[')?;
+    let mut d = 0i32;
+    for (i, ch) in rest[start..].char_indices() {
+        match ch {
+            '[' => d += 1,
+            ']' => {
+                d -= 1;
+                if d == 0 {
+                    return Some(&rest[start + 1..start + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+fn lookup_function(name: &str) -> Option<Vec<String>> {
+    let name = if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("minecraft:{}", name)
+    };
+    packs()
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|p| p.functions.get(&name).cloned())
+}
+fn run_function(name: &str, me: Option<Arc<Client>>, s: &mut Option<&Client>) -> usize {
+    run_function_depth(name, me, s, 0)
+}
+fn run_function_depth(
+    name: &str,
+    me: Option<Arc<Client>>,
+    s: &mut Option<&Client>,
+    depth: usize,
+) -> usize {
+    if depth > 16 {
+        return 0;
+    }
+    let Some(lines) = lookup_function(name) else {
+        return 0;
+    };
+    let mut n = 0;
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("function ") {
+            n += run_function_depth(rest.trim(), me.clone(), s, depth + 1);
+        } else {
+            run_command(me.as_ref(), &format!("/{}", line), s);
+            n += 1;
+        }
+    }
+    n
+}
+
+fn player_command_targets(target: &str, source: Option<&Arc<Client>>) -> Vec<Arc<Client>> {
+    let ids: HashSet<i32> = resolve_selector(target, source)
+        .into_iter()
+        .filter_map(|id| id.parse().ok())
+        .collect();
+    client_snapshot()
+        .into_iter()
+        .filter(|c| ids.contains(&c.eid))
+        .collect()
+}
+
+fn run_experience_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    let [action @ ("add" | "set"), target, amount, units @ ..] = args else {
+        return "Usage: /xp add|set <target> <amount> [points|levels]".into();
+    };
+    let Ok(amount) = amount.parse::<i32>() else {
+        return "Invalid experience amount".into();
+    };
+    let levels = match units {
+        [] | ["points"] => false,
+        ["levels"] => true,
+        _ => return "Expected points or levels".into(),
+    };
+    if *action == "set" && amount < 0 {
+        return "Experience amount must be nonnegative".into();
+    }
+    let targets = player_command_targets(target, source);
+    if targets.is_empty() {
+        return "No player found".into();
+    }
+    let mut changed = 0;
+    for c in targets {
+        let result = send_player_xp(&c, |xp| {
+            if *action == "set" {
+                xp.set(
+                    amount,
+                    if levels {
+                        ExperienceUnit::Levels
+                    } else {
+                        ExperienceUnit::Points
+                    },
+                )
+            } else {
+                if levels {
+                    xp.give_experience_levels(amount);
+                    Ok(())
+                } else {
+                    add_player_xp_points(xp, amount)
+                }
+            }
+        });
+        changed += usize::from(result.is_ok());
+    }
+    if changed == 0 && *action == "set" {
+        "Experience points must be below the amount required for the next level".into()
+    } else if changed == 0 {
+        "Experience level is too large to add points".into()
+    } else {
+        format!("{action} xp for {changed} target(s)")
+    }
+}
+
+// resolve @selector -> player eids or mob eids ("m:<eid>" prefixed for mobs)
+fn selector_entities() -> Vec<(String, String, (f64, f64, f64))> {
+    let mut entities = Vec::new();
+    for c in client_snapshot() {
+        let p = *c.pos.lock().unwrap();
+        entities.push((c.eid.to_string(), "player".to_string(), (p.0, p.1, p.2)));
+    }
+    for m in mobs().lock().unwrap().iter() {
+        let p = *m.pos.lock().unwrap();
+        let name = entity_spec_by_id(m.etype)
+            .map_or("unknown", |spec| spec.name)
+            .to_string();
+        entities.push((format!("m:{}", m.eid), name, (p.0, p.1, p.2)));
+    }
+    for d in drops().lock().unwrap().iter() {
+        entities.push((format!("d:{}", d.eid), "item".into(), (d.x, d.y, d.z)));
+    }
+    for t in primed().lock().unwrap().iter() {
+        entities.push((format!("t:{}", t.eid), "tnt".into(), (t.x, t.y, t.z)));
+    }
+    for a in arrows().lock().unwrap().iter() {
+        entities.push((format!("a:{}", a.eid), "arrow".into(), (a.x, a.y, a.z)));
+    }
+    for p in pearls().lock().unwrap().iter() {
+        entities.push((format!("p:{}", p.eid), "ender_pearl".into(), (p.x, p.y, p.z)));
+    }
+    for b in bobbers().lock().unwrap().iter() {
+        entities.push((format!("b:{}", b.eid), "fishing_bobber".into(), (b.x, b.y, b.z)));
+    }
+    for x in xps().lock().unwrap().iter() {
+        entities.push((format!("x:{}", x.eid), "experience_orb".into(), (x.x, x.y, x.z)));
+    }
+    entities
+}
+
+fn resolve_bounded_selector(kind: char, args: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
+    let (mut x, mut y, mut z) = ctx.map(|c| {
+        let p = *c.pos.lock().unwrap();
+        (p.0, p.1, p.2)
+    })
+    .unwrap_or((0.5, 16.0, 0.5));
+    let (mut typ, mut max_distance, mut min_distance, mut limit) =
+        (None, f64::INFINITY, 0.0, None);
+    for kv in args.split(',').filter(|s| !s.trim().is_empty()) {
+        let Some((key, value)) = kv.trim().split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "type" => {
+                let (negated, value) = (value.starts_with('!'), value.trim_start_matches('!'));
+                let value = value.trim_start_matches("minecraft:");
+                typ = Some(if negated {
+                    format!("!{value}")
+                } else {
+                    value.to_string()
+                });
+            }
+            "x" => x = value.parse().unwrap_or(x),
+            "y" => y = value.parse().unwrap_or(y),
+            "z" => z = value.parse().unwrap_or(z),
+            "distance" => {
+                if let Some((lo, hi)) = value.split_once("..") {
+                    min_distance = lo.parse().unwrap_or(0.0);
+                    max_distance = hi.parse().unwrap_or(f64::INFINITY);
+                } else if let Ok(exact) = value.parse() {
+                    min_distance = exact;
+                    max_distance = exact;
+                }
+            }
+            "limit" => limit = value.parse::<usize>().ok(),
+            _ => {}
+        }
+    }
+    let random_players_only = kind == 'r' && typ.is_none();
+    let mut found: Vec<_> = selector_entities()
+        .into_iter()
+        .filter_map(|(id, entity_type, pos)| {
+            if random_players_only && entity_type != "player" {
+                return None;
+            }
+            if let Some(filter) = typ.as_deref() {
+                let (negated, filter) = (filter.starts_with('!'), filter.trim_start_matches('!'));
+                if (entity_type == filter) == negated {
+                    return None;
+                }
+            }
+            let distance =
+                ((pos.0 - x).powi(2) + (pos.1 - y).powi(2) + (pos.2 - z).powi(2)).sqrt();
+            (distance >= min_distance && distance <= max_distance).then_some((id, distance))
+        })
+        .collect();
+    if kind == 'n' {
+        found.sort_by(|a, b| a.1.total_cmp(&b.1));
+    }
+    if kind == 'r' {
+        if !found.is_empty() {
+            let index = (world_rng::next_u64() % found.len() as u64) as usize;
+            found.swap(0, index);
+        }
+    }
+    let default_limit = if matches!(kind, 'r' | 'n') { 1 } else { usize::MAX };
+    found
+        .into_iter()
+        .take(limit.unwrap_or(default_limit))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
+    for kind in ['e', 'r', 'n'] {
+        let prefix = format!("@{kind}");
+        if sel == prefix {
+            return resolve_bounded_selector(kind, "", ctx);
+        }
+        if let Some(args) = sel
+            .strip_prefix(&format!("{prefix}["))
+            .and_then(|s| s.strip_suffix(']'))
+        {
+            if kind != 'e' || args.trim().is_empty() {
+                return resolve_bounded_selector(kind, args, ctx);
+            }
+        }
+    }
+    if let Some(inner) = sel.strip_prefix("@e[").and_then(|x| x.strip_suffix(']')) {
+        let mut typ: Option<String> = None;
+        let (mut cx, mut cy, mut cz) = ctx
+            .map(|c| {
+                let p = *c.pos.lock().unwrap();
+                (p.0, p.1, p.2)
+            })
+            .unwrap_or((0.5, 16.0, 0.5));
+        let mut dist: Option<f64> = None;
+        let mut item_filter: Option<i64> = None;
+        let mut tag_filt: Option<(String, bool)> = None;
+        for kv in inner.split(',') {
+            if let Some((k, v)) = kv.trim().split_once('=') {
+                match k.trim() {
+                    "type" => {
+                        typ = Some(
+                            v.trim_start_matches("minecraft:")
+                                .trim_start_matches('!')
+                                .to_string(),
+                        )
+                    }
+                    "x" => cx = v.parse().unwrap_or(cx),
+                    "y" => cy = v.parse().unwrap_or(cy),
+                    "z" => cz = v.parse().unwrap_or(cz),
+                    "nbt" => {
+                        item_filter = v
+                            .split("id:\"")
+                            .nth(1)
+                            .and_then(|r| r.split('\"').next())
+                            .and_then(|id| name_to_item(id.trim_start_matches("minecraft:")));
+                    }
+                    "tag" => {
+                        tag_filt = Some((
+                            v.trim().trim_start_matches('!').to_string(),
+                            v.trim().starts_with('!'),
+                        ))
+                    }
+                    "distance" => {
+                        let v = v.trim();
+                        dist = Some(if let Some(hi) = v.strip_prefix("..") {
+                            hi.parse().unwrap_or(f64::MAX)
+                        } else {
+                            v.parse().unwrap_or(0.0)
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let near = |x: f64, y: f64, z: f64| {
+            let d = ((x - cx).powi(2) + (y - cy).powi(2) + (z - cz).powi(2)).sqrt();
+            dist.map(|dd| d <= dd + 1e-6).unwrap_or(true)
+        };
+        return match typ.as_deref() {
+            Some("player") => {
+                let tm = tags().lock().unwrap();
+                clients()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| {
+                        let p = *c.pos.lock().unwrap();
+                        near(p.0, p.1, p.2)
+                    })
+                    .filter(|c| {
+                        tag_filt
+                            .as_ref()
+                            .map(|(tg, neg)| {
+                                *neg != tm
+                                    .get(&format!("p:{}", c.name))
+                                    .map(|st| st.contains(tg))
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(true)
+                    })
+                    .map(|c| c.eid.to_string())
+                    .collect()
+            }
+            Some("item") => drops()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|d| near(d.x, d.y, d.z) && item_filter.map(|f| d.item == f).unwrap_or(true))
+                .map(|d| format!("d:{}", d.eid))
+                .collect(),
+            Some("tnt") => primed()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| near(t.x, t.y, t.z))
+                .map(|t| format!("t:{}", t.eid))
+                .collect(),
+            Some("arrow") => arrows()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| near(a.x, a.y, a.z))
+                .map(|a| format!("a:{}", a.eid))
+                .collect(),
+            Some("ender_pearl") => pearls()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| near(a.x, a.y, a.z))
+                .map(|a| format!("p:{}", a.eid))
+                .collect(),
+            Some("fishing_bobber") => bobbers()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| near(a.x, a.y, a.z))
+                .map(|a| format!("b:{}", a.eid))
+                .collect(),
+            Some("experience_orb") => xps()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| near(a.x, a.y, a.z))
+                .map(|a| format!("x:{}", a.eid))
+                .collect(),
+            t => {
+                let et = t.and_then(name_to_etype).unwrap_or(-1);
+                {
+                    let tm = tags().lock().unwrap();
+                    mobs()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|m| {
+                            (t.is_none() || m.etype == et) && {
+                                let p = *m.pos.lock().unwrap();
+                                near(p.0, p.1, p.2)
+                            }
+                        })
+                        .filter(|m| {
+                            tag_filt
+                                .as_ref()
+                                .map(|(tg, neg)| {
+                                    *neg != tm
+                                        .get(&format!("e:{}", m.eid))
+                                        .map(|st| st.contains(tg))
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(true)
+                        })
+                        .map(|m| format!("m:{}", m.eid))
+                        .collect()
+                }
+            }
+        };
+    }
+    let cls: Vec<Arc<Client>> = client_snapshot();
+    if sel == "@p" {
+        if let Some(c) = ctx {
+            let pp = *c.pos.lock().unwrap();
+            let mut best: Option<(f64, i32)> = None;
+            for cl in cls.iter() {
+                let cp = *cl.pos.lock().unwrap();
+                let d = (cp.0 - pp.0).powi(2) + (cp.2 - pp.2).powi(2);
+                if best.map(|b| d < b.0).unwrap_or(true) {
+                    best = Some((d, cl.eid));
+                }
+            }
+            if let Some((_, e)) = best {
+                return vec![e.to_string()];
+            }
+        }
+        return cls
+            .first()
+            .map(|c| vec![c.eid.to_string()])
+            .unwrap_or_default();
+    }
+    if sel == "@a" || sel == "@e" {
+        return cls.iter().map(|c| c.eid.to_string()).collect();
+    }
+    if sel == "@s" {
+        return ctx.map(|c| vec![c.eid.to_string()]).unwrap_or_default();
+    }
+    // bare player name resolves to that player (vanilla target syntax)
+    if !sel.starts_with('@') {
+        if let Some(c) = cls.iter().find(|c| c.name == sel) {
+            return vec![c.eid.to_string()];
+        }
+    }
+    vec![]
+}
+
+// execution context: who + where (for ~ coords)
+#[derive(Clone)]
+struct CmdCtx {
+    me: Option<Arc<Client>>,
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+fn coord(tok: &str, base: f64) -> f64 {
+    if let Some(off) = tok.strip_prefix('~') {
+        base + off.parse::<f64>().unwrap_or(0.0)
+    } else {
+        tok.parse::<f64>().unwrap_or(0.0)
+    }
+}
+
+fn spawn_yaw(token: Option<&str>, source: Option<&Arc<Client>>) -> Option<f32> {
+    let Some(token) = token else {
+        return Some(0.0);
+    };
+    let angle = if let Some(relative) = token.strip_prefix('~') {
+        let yaw = source.map_or(0.0, |player| player.pos.lock().unwrap().3);
+        yaw + if relative.is_empty() {
+            0.0
+        } else {
+            relative.parse::<f32>().ok()?
+        }
+    } else {
+        token.parse::<f32>().ok()?
+    };
+    if !angle.is_finite() {
+        return None;
+    }
+    let angle = angle % 360.0;
+    Some(if angle >= 180.0 {
+        angle - 360.0
+    } else if angle < -180.0 {
+        angle + 360.0
+    } else {
+        angle
+    })
+}
+
+// ---------- scoreboard ----------
+fn scoreboard_criterion_name(criterion: ScoreboardCriteria) -> &'static str {
+    match criterion {
+        ScoreboardCriteria::Dummy => "dummy",
+        ScoreboardCriteria::Trigger => "trigger",
+        ScoreboardCriteria::DeathCount => "deathCount",
+        ScoreboardCriteria::PlayerKillCount => "playerKillCount",
+        ScoreboardCriteria::TotalKillCount => "totalKillCount",
+        ScoreboardCriteria::Health => "health",
+    }
+}
+
+fn scoreboard() -> &'static Mutex<ScoreboardEngine> {
+    static SCORES: OnceLock<Mutex<ScoreboardEngine>> = OnceLock::new();
+    SCORES.get_or_init(|| Mutex::new(ScoreboardEngine::default()))
+}
+
+fn world_border() -> &'static Mutex<WorldBorderState> {
+    static BORDER: OnceLock<Mutex<WorldBorderState>> = OnceLock::new();
+    BORDER.get_or_init(|| Mutex::new(WorldBorderState::default()))
+}
+
+fn border_now_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn run_world_border_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    let mut border = world_border().lock().unwrap();
+    let result = WorldBorderCommand::parse(args, ctx.x, ctx.z)
+        .and_then(|cmd| cmd.execute(&mut border, None, border_now_ms()));
+    let feedback = match result {
+        Ok(result) => {
+            if let Some((id, body)) = result.packet {
+                broadcast(-1, |_| (id, body.clone()));
+            }
+            result.feedback
+        }
+        Err(WorldBorderCommandError::Rejected(feedback)) => feedback,
+        Err(WorldBorderCommandError::Syntax) => {
+            return "Usage: /worldborder add|center|damage|get|set|warning".into()
+        }
+        Err(error) => return format!("Invalid world border argument: {error:?}"),
+    };
+    match (feedback.key, feedback.arguments.as_slice()) {
+        ("commands.worldborder.set.immediate", [size]) => {
+            format!("Set the world border to {size} blocks wide")
+        }
+        ("commands.worldborder.set.grow" | "commands.worldborder.set.shrink", [size, seconds]) => {
+            format!("Resizing the world border to {size} blocks over {seconds} seconds")
+        }
+        ("commands.worldborder.get", [size]) => format!("The world border is {size} blocks wide"),
+        ("commands.worldborder.center.success", [x, z]) => {
+            format!("Set the world border center to {x}, {z}")
+        }
+        ("commands.worldborder.warning.distance.success", [blocks]) => {
+            format!("Set the world border warning distance to {blocks} blocks")
+        }
+        ("commands.worldborder.warning.time.success", [seconds]) => {
+            format!("Set the world border warning time to {seconds} seconds")
+        }
+        ("commands.worldborder.damage.amount.success", [amount]) => {
+            format!("Set the world border damage to {amount} per block")
+        }
+        ("commands.worldborder.damage.buffer.success", [blocks]) => {
+            format!("Set the world border damage buffer to {blocks} blocks")
+        }
+        (key, arguments) => [key, &arguments.join(" ")].join(" ").trim_end().into(),
+    }
+}
+
+// Also used by the GP-7 packet encoder.
+fn display_pkt(slot: i64, obj: &str) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, slot);
+    write_str(&mut p, obj);
+    p
+}
+
+fn sync_scoreboard(w: &mut TcpStream, board: &ScoreboardEngine) -> std::io::Result<()> {
+    for objective in board.objectives.values() {
+        let (id, body) =
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Create(objective, None));
+        send_packet(w, id, body)?;
+    }
+    for (objective, scores) in &board.scores {
+        for (owner, score) in scores {
+            let (id, body) = encode_scoreboard_score(owner, objective, score.value, None, None);
+            send_packet(w, id, body)?;
+        }
+    }
+    for (slot, objective) in board.display_slots.iter().enumerate() {
+        if let Some(objective) = objective {
+            send_packet(w, 0x57, display_pkt(slot as i64, objective))?;
+        }
+    }
+    Ok(())
+}
+
+fn broadcast_score(board: &ScoreboardEngine, owner: &str, objective: &str) {
+    if let Some(score) = board.get(owner, objective) {
+        let (id, body) = encode_scoreboard_score(owner, objective, score, None, None);
+        broadcast(-1, |_| (id, body.clone()));
+    }
+}
+
+const SCOREBOARD_ENTRY_LIMIT: usize = 4096;
+
+fn scoreboard_entry_available(board: &ScoreboardEngine, owner: &str, objective: &str) -> bool {
+    board
+        .scores
+        .get(objective)
+        .is_none_or(|scores| scores.len() < SCOREBOARD_ENTRY_LIMIT || scores.contains_key(owner))
+}
+
+fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Result<String, String> {
+    let entries = match args {
+        ["players", "operation", owner, objective, _, source, source_objective] => {
+            &[(*owner, *objective), (*source, *source_objective)][..]
+        }
+        ["players", "set" | "add" | "remove" | "enable", owner, objective, ..] => {
+            &[(*owner, *objective)][..]
+        }
+        _ => &[],
+    };
+    if entries
+        .iter()
+        .any(|&(owner, objective)| !scoreboard_entry_available(board, owner, objective))
+    {
+        return Err("Too many scores for objective".into());
+    }
+    if let [(first, objective), (second, other)] = entries {
+        if objective == other
+            && first != second
+            && board.scores.get(*objective).is_some_and(|scores| {
+                scores.len() == SCOREBOARD_ENTRY_LIMIT - 1
+                    && !scores.contains_key(*first)
+                    && !scores.contains_key(*second)
+            })
+        {
+            return Err("Too many scores for objective".into());
+        }
+    }
+    let reply = execute_scoreboard_command(board, args)?;
+    for &(owner, objective) in entries {
+        broadcast_score(board, owner, objective);
+    }
+    let packet = match args {
+        ["objectives", "add", name, ..] => {
+            let objective = board.objective(name).unwrap();
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Create(objective, None))
+        }
+        ["objectives", "remove", name] => {
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Remove(name))
+        }
+        ["objectives", "setdisplay", slot, ..] => {
+            let slot = ScoreboardDisplaySlot::parse(slot).unwrap();
+            encode_scoreboard_display(slot, board.display(slot))
+        }
+        ["players", "reset", owner, objective @ ..] => {
+            encode_scoreboard_reset(owner, objective.first().copied())
+        }
+        _ => return Ok(reply),
+    };
+    broadcast(-1, |_| (packet.0, packet.1.clone()));
+    Ok(reply)
+}
+
+fn scoreboard_holders(holder: &str, source: Option<&Arc<Client>>) -> Vec<String> {
+    if holder.starts_with('@') {
+        player_command_targets(holder, source)
+            .into_iter()
+            .map(|c| c.name.clone())
+            .collect()
+    } else {
+        vec![holder.chars().take(64).collect()]
+    }
+}
+
+fn run_scoreboard_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    let ["players", _, holder, ..] = args else {
+        return apply_scoreboard_command(&mut scoreboard().lock().unwrap(), args)
+            .unwrap_or_else(|err| err);
+    };
+    let holders = scoreboard_holders(holder, source);
+    let mut args = args.to_vec();
+    let sources = if let ["players", "operation", _, _, _, from, _] = args.as_slice() {
+        scoreboard_holders(from, source)
+            .into_iter()
+            .map(Some)
+            .collect()
+    } else {
+        vec![None]
+    };
+    if holders.is_empty() || sources.is_empty() {
+        return "No score holders found".into();
+    }
+    let mut replies = Vec::new();
+    let mut board = scoreboard().lock().unwrap();
+    for holder in &holders {
+        args[2] = holder;
+        for from in &sources {
+            if let Some(from) = from {
+                args[5] = from;
+            }
+            replies.push(apply_scoreboard_command(&mut board, &args).unwrap_or_else(|err| err));
+        }
+    }
+    replies.join("; ")
+}
+
+fn run_trigger_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    let Some(player) = source else {
+        return "trigger: player only".into();
+    };
+    let (objective, set, amount) = match args {
+        [objective] => (*objective, false, 1),
+        [objective, op @ ("set" | "add"), amount] => {
+            let Ok(amount) = amount.parse::<i32>() else {
+                return "Invalid trigger amount".into();
+            };
+            (*objective, *op == "set", amount)
+        }
+        _ => return "Usage: /trigger <objective> [add|set <amount>]".into(),
+    };
+    let mut board = scoreboard().lock().unwrap();
+    let delta = if set {
+        amount.wrapping_sub(board.get(&player.name, objective).unwrap_or(0))
+    } else {
+        amount
+    };
+    match board.trigger_add(&player.name, objective, delta) {
+        Ok(value) => {
+            broadcast_score(&board, &player.name, objective);
+            format!("Triggered {objective}: now {value}")
+        }
+        Err(error) => scoreboard_command_error(error),
+    }
+}
+
+fn facing_idx(v: &str) -> u32 {
+    ["north", "east", "south", "west", "up", "down"]
+        .iter()
+        .position(|&x| x == v)
+        .unwrap_or(0) as u32
+}
+fn block_family_range(name: &str) -> Option<(u32, u32)> {
+    Some(match name {
+        "water" => (80, 95),
+        "lava" => (96, 111),
+        "wheat" => (4278, 4285),
+        "farmland" => (4286, 4293),
+        "carrots" => (4294, 4301),
+        "piston" => (2011, 2022),
+        "sticky_piston" => (1992, 2003),
+        "piston_head" => (2023, 2046),
+        "tnt" => (2094, 2095),
+        "lever" => (5626, 5649),
+        "observer" => (12550, 12561),
+        "dispenser" => (523, 534),
+        "hopper" => (9225, 9234),
+        "redstone_block" => (9223, 9223),
+        "redstone_wire" => (2978, 4273),
+        "iron_door" => (5652, 5715),
+        "oak_sign" => (4302, 4333),
+        "chest" => (2954, 2977),
+        "barrel" => (18408, 18419),
+        _ => return None,
+    })
+}
+fn prop_match(name: &str, st: u32, k: &str, v: &str) -> bool {
+    match name {
+        _ if matches!(name, "wheat" | "carrots") => true, // age handled inline by caller
+        "piston" => match k {
+            "extended" => ((st - 2011) < 6) == (v == "true"),
+            "facing" => (st - 2011) % 6 == facing_idx(v),
+            _ => true,
+        },
+        "sticky_piston" => match k {
+            "extended" => ((st - 1992) < 6) == (v == "true"),
+            "facing" => (st - 1992) % 6 == facing_idx(v),
+            _ => true,
+        },
+        "piston_head" => match k {
+            "facing" => (st - 2023) / 4 == facing_idx(v),
+            _ => true,
+        },
+        "water" => match k {
+            "level" => (st - 80) == v.parse().unwrap_or(99),
+            _ => true,
+        },
+        "lever" => match k {
+            "powered" => ((st - 5626) & 1 == 0) == (v == "true"),
+            _ => true,
+        },
+        "observer" => match k {
+            "facing" => (st - 12550) % 6 == facing_idx(v),
+            "powered" => ((st - 12550) / 6) == (v == "true") as u32,
+            _ => true,
+        },
+        "hopper" => match k {
+            "enabled" => (st < 9230) == (v == "true"),
+            "facing" => {
+                (st - 9225) % 5
+                    == ["down", "north", "south", "west", "east"]
+                        .iter()
+                        .position(|&x| x == v)
+                        .unwrap_or(0) as u32
+            }
+            _ => true,
+        },
+        _ => true,
+    }
+}
+// block tags: vanilla `#namespace:tag` predicates — datapack-loaded
+// members merge onto a small built-in set (vanilla replace:false
+// semantics default to merging for non-vanilla namespaces)
+fn block_tags() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static T: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(builtin_block_tags()))
+}
+fn builtin_block_tags() -> HashMap<String, Vec<String>> {
+    [
+        (
+            "logs",
+            &[
+                "oak_log",
+                "spruce_log",
+                "birch_log",
+                "jungle_log",
+                "acacia_log",
+                "dark_oak_log",
+                "mangrove_log",
+                "cherry_log",
+                "crimson_stem",
+                "warped_stem",
+                "oak_wood",
+                "spruce_wood",
+                "birch_wood",
+                "jungle_wood",
+                "acacia_wood",
+                "dark_oak_wood",
+                "mangrove_wood",
+                "cherry_wood",
+                "crimson_hyphae",
+                "warped_hyphae",
+            ][..],
+        ),
+        (
+            "planks",
+            &[
+                "oak_planks",
+                "spruce_planks",
+                "birch_planks",
+                "jungle_planks",
+                "acacia_planks",
+                "dark_oak_planks",
+                "mangrove_planks",
+                "cherry_planks",
+                "crimson_planks",
+                "warped_planks",
+            ][..],
+        ),
+        (
+            "leaves",
+            &[
+                "oak_leaves",
+                "spruce_leaves",
+                "birch_leaves",
+                "jungle_leaves",
+                "acacia_leaves",
+                "dark_oak_leaves",
+                "mangrove_leaves",
+                "cherry_leaves",
+                "azalea_leaves",
+            ][..],
+        ),
+        (
+            "wool",
+            &[
+                "white_wool",
+                "orange_wool",
+                "magenta_wool",
+                "light_blue_wool",
+                "yellow_wool",
+                "lime_wool",
+                "pink_wool",
+                "gray_wool",
+                "light_gray_wool",
+                "cyan_wool",
+                "purple_wool",
+                "blue_wool",
+                "brown_wool",
+                "green_wool",
+                "red_wool",
+                "black_wool",
+            ][..],
+        ),
+        ("sand", &["sand", "red_sand"][..]),
+        (
+            "dirt",
+            &[
+                "dirt",
+                "grass_block",
+                "podzol",
+                "mycelium",
+                "coarse_dirt",
+                "rooted_dirt",
+                "dirt_path",
+                "farmland",
+                "mud",
+                "muddy_mangrove_roots",
+            ][..],
+        ),
+        (
+            "flowers",
+            &[
+                "dandelion",
+                "poppy",
+                "allium",
+                "cornflower",
+                "torchflower",
+                "sunflower",
+                "lilac",
+                "peony",
+                "red_tulip",
+                "orange_tulip",
+                "white_tulip",
+                "pink_tulip",
+            ][..],
+        ),
+        ("crops", &["wheat", "carrots", "potatoes", "beetroots"][..]),
+    ]
+    .iter()
+    .map(|(k, v)| {
+        (
+            format!("minecraft:{}", k),
+            v.iter().map(|s| s.to_string()).collect(),
+        )
+    })
+    .collect()
+}
+
+// datapack entity loot tables: data/<ns>/loot_table[s]/entities/<mob>.json
+// loot functions / item modifiers: the bounded subset with a real
+// consumer here. set_count folds into min/max at parse time.
+#[derive(Clone)]
+// the variants are the vanilla loot-function ids (set_name, set_lore, set_enchantments,
+// set_damage); shortening them would hide which function each one is
+#[allow(clippy::enum_variant_names)]
+enum LootFunc {
+    SetName(String),
+    SetLore(Vec<String>, bool),        // replace | append
+    SetEnchant(Vec<(i64, i64)>, bool), // entries, add?
+    SetDamage(f32),                    // fraction of max damage
+}
+struct LootEntry {
+    item: i64,
+    min: u8,
+    max: u8,
+    funcs: Vec<LootFunc>,
+}
+struct LootPool {
+    rolls: u8,
+    chance: f32,
+    entries: Vec<LootEntry>,
+    funcs: Vec<LootFunc>,
+}
+fn parse_loot_funcs(json: &str) -> Vec<LootFunc> {
+    // accepts an object {"function":...} or an array of them
+    let t = json.trim();
+    let objs: Vec<&str> = if t.starts_with('[') {
+        jobjects(t)
+    } else {
+        vec![t]
+    };
+    let mut out = Vec::new();
+    for o in objs {
+        let Some(f) = jstr(o, "function") else {
+            continue;
+        };
+        match f.trim_start_matches("minecraft:") {
+            "set_name" => {
+                let n = jblock(o, "name")
+                    .and_then(|b| jstr(b, "text"))
+                    .or_else(|| jstr(o, "name"))
+                    .unwrap_or_default();
+                if !n.is_empty() {
+                    out.push(LootFunc::SetName(n.to_string()))
+                }
+            }
+            "set_lore" => {
+                let append = jstr(o, "mode")
+                    .map(|m| m.contains("append"))
+                    .unwrap_or(false);
+                let mut ls = Vec::new();
+                if let Some(la) = jarray(o, "lore") {
+                    for lb2 in jobjects(la) {
+                        let t = jstr(lb2, "text")
+                            .map(|x| x.to_string())
+                            .unwrap_or_else(|| lb2.trim_matches('"').to_string());
+                        if !t.is_empty() {
+                            ls.push(t)
+                        }
+                    }
+                }
+                out.push(LootFunc::SetLore(ls, append));
+            }
+            "set_enchantments" => {
+                let add = o.contains("\"add\":true") || o.contains("\"add\": true");
+                let mut ls = Vec::new();
+                if let Some(eb) = jblock(o, "enchantments") {
+                    let eb = eb.trim_start_matches('{').trim_end_matches('}');
+                    for kv in eb.split(',') {
+                        if let Some((en, lv)) = kv.rsplit_once(':') {
+                            let en = en.trim().trim_matches('"').trim_start_matches("minecraft:");
+                            if let (Some(id), Ok(l)) = (enchant_id(en), lv.trim().parse::<i64>()) {
+                                ls.push((id, l.max(1)));
+                            }
+                        }
+                    }
+                }
+                out.push(LootFunc::SetEnchant(ls, add));
+            }
+            "set_damage" => {
+                // damage is a float fraction of max durability
+                let mut val = jnum(o, "damage").map(|d| d as f32);
+                if val.is_none() {
+                    if let Some(ki) = o.find("\"damage\":") {
+                        let tail = &o[ki + 9..];
+                        let num: String = tail
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                            .collect();
+                        val = num.parse::<f32>().ok();
+                    }
+                }
+                if let Some(d) = val {
+                    out.push(LootFunc::SetDamage(d))
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+fn apply_loot_funcs(st: &mut Stack, funcs: &[LootFunc]) {
+    for f in funcs {
+        match f {
+            LootFunc::SetName(t) => comp_set(&mut st.2, COMP_CUSTOM_NAME, nbt_string(t)),
+            LootFunc::SetLore(ls, append) => {
+                let mut elems: Vec<Vec<u8>> = Vec::new();
+                if *append {
+                    if let Some(d) = comp_get(&st.2, COMP_LORE) {
+                        let (n, mut p) = read_varint_at(d, 0);
+                        for _ in 0..n.min(64) {
+                            if p + 3 > d.len() || d[p] != 8 {
+                                break;
+                            }
+                            let ln = u16::from_be_bytes([d[p + 1], d[p + 2]]) as usize;
+                            let end = p + 3 + ln;
+                            if end > d.len() {
+                                break;
+                            }
+                            // Existing StringTag bytes may contain Java lone surrogates.
+                            // Appending lore must not round-trip them through Rust String.
+                            elems.push(d[p..end].to_vec());
+                            p = end;
+                        }
+                    }
+                }
+                elems.extend(ls.iter().map(|text| nbt_string(text)));
+                let mut d = Vec::new();
+                write_varint(&mut d, elems.len() as i64);
+                for tag in &elems {
+                    d.extend_from_slice(tag);
+                }
+                comp_set(&mut st.2, COMP_LORE, d);
+            }
+            LootFunc::SetEnchant(ls, add) => {
+                let mut cur = if *add {
+                    enchantments_get(&st.2)
+                } else {
+                    Vec::new()
+                };
+                for (id, lv) in ls {
+                    cur.retain(|(x, _)| x != id);
+                    cur.push((*id, *lv));
+                }
+                comp_set(&mut st.2, COMP_ENCHANTMENTS, enchantments_data(&cur, true));
+            }
+            LootFunc::SetDamage(frac) => {
+                if let Some(maxd) = tool_max_damage(st.0)
+                    .or_else(|| armor_max_damage(st.0))
+                    .or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE))
+                {
+                    comp_set_varint(&mut st.2, COMP_DAMAGE, (frac * maxd as f32) as i64);
+                }
+            }
+        }
+    }
+}
+// path-keyed tables for /loot (entities/* also mirror into mob_loot_tables)
+fn loot_tables() -> &'static Mutex<HashMap<String, Vec<LootPool>>> {
+    static R: OnceLock<Mutex<HashMap<String, Vec<LootPool>>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn mob_loot_tables() -> &'static Mutex<HashMap<i64, Vec<LootPool>>> {
+    static R: OnceLock<Mutex<HashMap<i64, Vec<LootPool>>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+// item modifiers: data/<ns>/item_modifier/*.json -> parsed func list
+fn item_mods() -> &'static Mutex<HashMap<String, Vec<LootFunc>>> {
+    static R: OnceLock<Mutex<HashMap<String, Vec<LootFunc>>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// datapack advancements: id -> criteria set (name -> trigger[, entity type])
+struct Advancement {
+    title: String,
+    criteria: Vec<(String, String, Option<i64>)>,
+}
+fn advancements() -> &'static Mutex<HashMap<String, Advancement>> {
+    static R: OnceLock<Mutex<HashMap<String, Advancement>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+// player -> granted adv ids (persisted); player -> adv -> completed criteria
+fn adv_done() -> &'static Mutex<HashMap<String, HashSet<String>>> {
+    static R: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn player_advancements() -> &'static Mutex<AdvancementTracker> {
+    static TRACKER: OnceLock<Mutex<AdvancementTracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(AdvancementTracker::default()))
+}
+
+fn advancement_time_ms() -> i64 {
+    // This is the protocol's earned-at timestamp, independent of simulation time.
+    std::time::UNIX_EPOCH
+        .elapsed()
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn send_advancement_delta(tracker: &mut AdvancementTracker, c: &Client, reset: bool) {
+    if let Some(delta) = tracker.take_delta(&c.name, reset) {
+        let (id, body) = delta.into_packet();
+        let mut socket = c.sock.lock().unwrap();
+        if send_packet(&mut socket, id, body).is_err() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+fn restore_player_advancements(tracker: &mut AdvancementTracker, name: &str) {
+    if let Some(earned) = adv_done().lock().unwrap().get(name) {
+        let now = advancement_time_ms();
+        for id in earned {
+            // A legacy save records only completed IDs. Preserve precise criteria
+            // and timestamps when this tracker already has progress for the ID.
+            if !tracker
+                .progress
+                .get(name)
+                .is_some_and(|rows| rows.contains_key(id.as_str()))
+            {
+                tracker.grant_only(name, id, now);
+            }
+        }
+    }
+}
+
+fn run_advancement_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    let [action @ ("grant" | "revoke"), target, scope @ ..] = args else {
+        return "Usage: /advancement grant|revoke <target> <scope>".into();
+    };
+    let targets = player_command_targets(target, source);
+    if targets.is_empty() {
+        return "No player found".into();
+    }
+    let mut tracker = player_advancements().lock().unwrap();
+    let now = advancement_time_ms();
+    let mut replies = Vec::new();
+    let mut resolved = args.to_vec();
+    for c in targets.iter() {
+        resolved[1] = &c.name;
+        let reply = execute_advancement_command(&mut tracker, &resolved, now);
+        let datapack_ids = match scope {
+            ["everything"] => advancements()
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|id| tracker.definition(id).is_none())
+                .cloned()
+                .collect(),
+            ["only", id] => {
+                let id = if id.contains(':') {
+                    (*id).into()
+                } else {
+                    format!("minecraft:{id}")
+                };
+                if tracker.definition(&id).is_none()
+                    && advancements().lock().unwrap().contains_key(&id)
+                {
+                    vec![id]
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        };
+        {
+            let mut done = adv_done().lock().unwrap();
+            let earned = done.entry(c.name.clone()).or_default();
+            if reply.is_ok() {
+                let progress = tracker.progress.get(&c.name);
+                for definition in tracker.definitions {
+                    // The legacy save records completion independently of parent visibility.
+                    let complete = progress
+                        .and_then(|rows| rows.get(definition.id))
+                        .is_some_and(|criteria| {
+                            definition
+                                .requirements
+                                .iter()
+                                .all(|group| group.iter().any(|name| criteria.contains_key(name)))
+                        });
+                    if complete {
+                        earned.insert(definition.id.to_owned());
+                    } else {
+                        earned.remove(definition.id);
+                    }
+                }
+            }
+            for id in &datapack_ids {
+                if *action == "grant" {
+                    earned.insert(id.clone());
+                } else {
+                    earned.remove(id);
+                }
+            }
+        }
+        send_advancement_delta(&mut tracker, c, false);
+        replies.push(match reply {
+            Err(_) if !datapack_ids.is_empty() => format!("{action} applied for {}", c.name),
+            Ok(text) | Err(text) => text,
+        });
+    }
+    replies.join("; ")
+}
+
+struct Bossbar {
+    name: String,
+    color: u8,
+    style: u8,
+    value: i32,
+    max: i32,
+    visible: bool,
+    players: HashSet<[u8; 16]>,
+}
+impl Bossbar {
+    fn progress(&self) -> f32 {
+        (self.value as f32 / self.max as f32).clamp(0.0, 1.0)
+    }
+
+    fn shown_to(&self, player: &Client) -> bool {
+        self.visible && self.players.contains(&player.uuid)
+    }
+}
+fn bossbars() -> &'static Mutex<HashMap<String, Bossbar>> {
+    static R: OnceLock<Mutex<HashMap<String, Bossbar>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn bossbar_uuid(id: &str) -> [u8; 16] {
+    // stable uuid: double FNV-ish hash of the id string
+    let mut a: u64 = 0xcbf29ce484222325;
+    let mut b: u64 = 0x9e3779b97f4a7c15;
+    for ch in id.bytes() {
+        a = (a ^ ch as u64).wrapping_mul(0x100000001b3);
+        b = (b ^ ch as u64).wrapping_mul(0xc6a4a7935bd1e995);
+    }
+    let mut u = [0u8; 16];
+    u[..8].copy_from_slice(&a.to_be_bytes());
+    u[8..].copy_from_slice(&b.to_be_bytes());
+    u
+}
+fn bossbar_pkt(id: &str, action: u8, bar: Option<&Bossbar>) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&bossbar_uuid(id));
+    write_varint(&mut p, action as i64);
+    match (action, bar) {
+        (0, Some(b)) => {
+            // add: title, health, color, dividers, flags
+            p.extend_from_slice(&chat_nbt(&b.name));
+            p.extend_from_slice(&b.progress().to_be_bytes());
+            write_varint(&mut p, b.color as i64);
+            write_varint(&mut p, b.style as i64);
+            p.push(0);
+        }
+        (2, Some(b)) => p.extend_from_slice(&b.progress().to_be_bytes()),
+        (3, Some(b)) => p.extend_from_slice(&chat_nbt(&b.name)),
+        (4, Some(b)) => {
+            write_varint(&mut p, b.color as i64);
+            write_varint(&mut p, b.style as i64);
+        }
+        _ => {}
+    }
+    p
+}
+fn run_bossbar_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    const USAGE: &str = "usage: /bossbar add|remove|set|list|get";
+    let mut bars = bossbars().lock().unwrap();
+    if args == ["list"] {
+        let mut ids: Vec<_> = bars.keys().cloned().collect();
+        ids.sort();
+        return format!("{} bossbars: {}", ids.len(), ids.join(", "));
+    }
+    let [operation, raw_id, rest @ ..] = args else {
+        return USAGE.into();
+    };
+    let id = if raw_id.contains(':') {
+        raw_id.to_string()
+    } else {
+        format!("minecraft:{raw_id}")
+    };
+    if *operation == "add" && !rest.is_empty() {
+        if bars.contains_key(&id) {
+            return format!("Bossbar '{id}' already exists");
+        }
+        bars.insert(
+            id.clone(),
+            Bossbar {
+                name: rest.join(" "),
+                color: 6,
+                style: 0,
+                value: 0,
+                max: 100,
+                visible: true,
+                players: HashSet::new(),
+            },
+        );
+        return format!("Created bossbar {id}");
+    }
+    let Some(bar) = bars.get_mut(&id) else {
+        return format!("Unknown bossbar '{id}'");
+    };
+    let online = client_snapshot();
+    let send = |player: &Client, action, bar: Option<&Bossbar>| {
+        let _ = send_packet(
+            &mut player.sock.lock().unwrap(),
+            0x0a,
+            bossbar_pkt(&id, action, bar),
+        );
+    };
+    match (*operation, rest) {
+        ("remove", []) => {
+            for player in online.iter().filter(|p| bar.shown_to(p)) {
+                send(player, 1, None);
+            }
+            bars.remove(&id);
+            return format!("Removed bossbar {id}");
+        }
+        ("get", ["max"]) => return format!("Bossbar {id} max is {}", bar.max),
+        ("get", ["value"]) => return format!("Bossbar {id} value is {}", bar.value),
+        ("get", ["visible"]) => return format!("Bossbar {id} visible is {}", bar.visible),
+        ("get", ["players"]) => {
+            let mut names: Vec<_> = online
+                .iter()
+                .filter(|p| bar.players.contains(&p.uuid))
+                .map(|p| p.name.as_str())
+                .collect();
+            names.sort_unstable();
+            return format!(
+                "Bossbar {id} has {} player(s): {}",
+                names.len(),
+                names.join(", ")
+            );
+        }
+        ("set", ["players", targets @ ..]) if targets.len() <= 1 => {
+            let players = if let Some(selector) = targets.first() {
+                let selected = resolve_selector(selector, source);
+                let players: HashSet<_> = online
+                    .iter()
+                    .filter(|p| selected.iter().any(|eid| *eid == p.eid.to_string()))
+                    .map(|p| p.uuid)
+                    .collect();
+                if players.is_empty() {
+                    return "No players found".into();
+                }
+                players
+            } else {
+                HashSet::new()
+            };
+            let old = std::mem::replace(&mut bar.players, players);
+            if bar.visible {
+                for player in &online {
+                    match (
+                        old.contains(&player.uuid),
+                        bar.players.contains(&player.uuid),
+                    ) {
+                        (false, true) => send(player, 0, Some(bar)),
+                        (true, false) => send(player, 1, None),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        ("set", ["visible", "true" | "false"]) => {
+            let visible = rest[1] == "true";
+            if bar.visible != visible {
+                bar.visible = visible;
+                for player in online.iter().filter(|p| bar.players.contains(&p.uuid)) {
+                    send(player, if visible { 0 } else { 1 }, Some(bar));
+                }
+            }
+        }
+        ("set", [field @ ("value" | "max"), number]) => {
+            let min = i32::from(*field == "max");
+            let Ok(number) = number.parse::<i32>() else {
+                return format!("{field} must be an integer of at least {min}");
+            };
+            if number < min {
+                return format!("{field} must be an integer of at least {min}");
+            }
+            let previous = bar.progress();
+            if *field == "max" {
+                bar.max = number;
+            } else {
+                bar.value = number;
+            }
+            if bar.progress() != previous {
+                for player in online.iter().filter(|p| bar.shown_to(p)) {
+                    send(player, 2, Some(bar));
+                }
+            }
+        }
+        ("set", ["name", name @ ..]) if !name.is_empty() => {
+            bar.name = name.join(" ");
+            for player in online.iter().filter(|p| bar.shown_to(p)) {
+                send(player, 3, Some(bar));
+            }
+        }
+        ("set", [field @ ("color" | "style"), value]) => {
+            if *field == "color" {
+                let colors = ["pink", "blue", "red", "green", "yellow", "purple", "white"];
+                let Some(color) = colors.iter().position(|name| name == value) else {
+                    return "Unknown bossbar color".into();
+                };
+                bar.color = color as u8;
+            } else {
+                let styles = [
+                    "progress",
+                    "notched_6",
+                    "notched_10",
+                    "notched_12",
+                    "notched_20",
+                ];
+                let Some(style) = styles.iter().position(|name| name == value) else {
+                    return "Unknown bossbar style".into();
+                };
+                bar.style = style as u8;
+            }
+            for player in online.iter().filter(|p| bar.shown_to(p)) {
+                send(player, 4, Some(bar));
+            }
+        }
+        _ => return USAGE.into(),
+    }
+    format!("Updated bossbar {id}")
+}
+
+fn adv_prog() -> &'static Mutex<Advancements> {
+    static R: OnceLock<Mutex<Advancements>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+// event -> mark matching criteria, grant when ALL criteria done, announce
+/// Event name → the (advancement id, criterion name) pairs that can fire on it.
+///
+/// `adv_event` used to scan every loaded advancement (and every criterion of each) on
+/// every event, and the tick loop fires the `tick` event once per player per tick.
+/// Measured: `env/effects` — which is `effects::tick_effects` → `adv_event(name,
+/// "tick")` — was 8.87 ms of a 9.3 ms tick body under one moving viewer, i.e. most of
+/// the tick thread's CPU, for a lookup that can be a map hit.
+///
+/// The rest of the scan only exists to find advancements whose criteria all hold; an
+/// advancement can only newly complete on an event that matches one of its criteria, so
+/// visiting the matching ones is equivalent. The index follows the datapack revision.
+type AdvancementEventIndex = HashMap<String, Vec<(String, String)>>;
+
+fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
+    static INDEX: Mutex<Option<(u64, AdvancementEventIndex)>> = Mutex::new(None);
+    let __t = tickprof::enabled().then(std::time::Instant::now);
+    let mut grants: Vec<String> = Vec::new();
+    {
+        let advs = advancements().lock().unwrap();
+        let revision = content_revision();
+        let mut index = INDEX.lock().unwrap();
+        if index.as_ref().is_none_or(|(cached, _)| *cached != revision) {
+            let mut by_event = AdvancementEventIndex::new();
+            for (id, advancement) in advs.iter() {
+                for (criterion, trigger, _) in &advancement.criteria {
+                    by_event
+                        .entry(trigger.clone())
+                        .or_default()
+                        .push((id.clone(), criterion.clone()));
+                }
+            }
+            *index = Some((revision, by_event));
+        }
+        let Some(candidates) = index.as_ref().and_then(|(_, by_event)| by_event.get(event)) else {
+            return;
+        };
+        if adv_done()
+            .lock()
+            .unwrap()
+            .get(pname)
+            .map(|g| g.len() >= advs.len() && advs.keys().all(|id| g.contains(id)))
+            .unwrap_or(false)
+        {
+            if let Some(t) = __t {
+                tickprof::add("adv/total", t.elapsed());
+            }
+            return;
+        }
+        let mut prog = adv_prog().lock().unwrap();
+        let pp = prog.entry(pname.to_string()).or_default();
+        // Only the advancements that can fire on this event: their criteria are the
+        // only ones this call can complete. The completion test still walks *all* of an
+        // advancement's criteria, so a partially satisfied one is judged as before.
+        let done = adv_done().lock().unwrap();
+        let granted = done.get(pname);
+        // (advancement id -> the criteria this event satisfied), so an advancement
+        // reached by several criteria is only walked once.
+        let mut touched: HashMap<&str, ()> = HashMap::new();
+        for (id, cn) in candidates {
+            if granted.is_some_and(|g| g.contains(id)) {
+                continue;
+            }
+            let Some(a) = advs.get(id) else { continue };
+            if a.criteria
+                .iter()
+                .any(|(_, tr, want)| tr == event && (want.is_none() || *want == etype))
+            {
+                let p = pp.entry(id.clone()).or_default();
+                for (cn2, tr, want) in &a.criteria {
+                    if tr == event && (want.is_none() || *want == etype) {
+                        p.insert(cn2.clone());
+                    }
+                }
+                touched.insert(id.as_str(), ());
+                let _ = cn;
+            }
+        }
+        drop(done);
+        for id in touched.keys() {
+            let Some(a) = advs.get(*id) else { continue };
+            let p = pp.entry((*id).to_string()).or_default();
+            if !a.criteria.is_empty() && a.criteria.iter().all(|(cn, _, _)| p.contains(cn)) {
+                grants.push((*id).to_string());
+            }
+        }
+    }
+    if let Some(t) = __t {
+        tickprof::add("adv/total", t.elapsed());
+    }
+    for id in grants {
+        {
+            let mut tracker = player_advancements().lock().unwrap();
+            let inserted = adv_done()
+                .lock()
+                .unwrap()
+                .entry(pname.to_string())
+                .or_default()
+                .insert(id.clone());
+            if !inserted {
+                continue;
+            }
+            if tracker.grant_only(pname, &id, advancement_time_ms()) > 0 {
+                for c in client_snapshot().iter().filter(|c| c.name == pname) {
+                    send_advancement_delta(&mut tracker, c, false);
+                }
+            }
+        }
+        let t = advancements()
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|a| a.title.clone())
+            .unwrap_or(id.clone());
+        let line = system_chat(&format!("{} has made the advancement [{}]", pname, t));
+        broadcast(-1, |_c| (0x6c, line.clone()));
+    }
+}
+
+fn check_modification_bounds(dim: DimId, (x, y, z): BlockPos) -> Result<(), String> {
+    if (-30_000_000..30_000_000).contains(&x)
+        && (-30_000_000..30_000_000).contains(&z)
+        && (dim.min_y()..dim.min_y() + dim.height()).contains(&y)
+    {
+        Ok(())
+    } else {
+        Err("Block position is outside the world".into())
+    }
+}
+
+fn block_modification_error(error: BlockModificationError) -> String {
+    match error {
+        BlockModificationError::VolumeLimit { volume, limit } => {
+            format!("Too many blocks ({volume}, maximum {limit})")
+        }
+        BlockModificationError::DestinationOverflow => {
+            "Clone destination is outside the world".into()
+        }
+        BlockModificationError::OverlappingClone => "Clone regions overlap".into(),
+    }
+}
+
+#[cfg(feature = "neoforge-events")]
+fn neoforge_block_state(name: &str) -> Option<u32> {
+    java_compat::NEOFORGE
+        .get()?
+        .registry
+        .runtime_id(landing_types::ModRegistry::Block, name)
+}
+
+fn modification_block_state(argument: &str) -> Option<u32> {
+    let Some(registry) = breg() else {
+        return state_from_arg(argument);
+    };
+    let Some((name, properties)) = argument.split_once('[') else {
+        #[cfg(feature = "neoforge-events")]
+        if let Some(state) = neoforge_block_state(argument) {
+            return Some(state);
+        }
+        return registry.checked_state(argument, &[]);
+    };
+    let properties = properties.strip_suffix(']')?;
+    if properties.is_empty() {
+        return registry.checked_state(name, &[]);
+    }
+    let properties = properties
+        .split(',')
+        .map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            Some((key.to_owned(), value.to_owned()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    registry.checked_state(name, &properties)
+}
+
+fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<String, String> {
+    let origin = (
+        ctx.x.floor() as i32,
+        ctx.y.floor() as i32,
+        ctx.z.floor() as i32,
+    );
+    let dim = cmd_dim(ctx);
+    let read = |(x, y, z)| block_at_dim(dim, x, y, z);
+    with_save_guard(|| {
+        let changes = if cmd == "fill" {
+            let fill = parse_fill_command(args, origin, modification_block_state)?;
+            check_modification_bounds(dim, fill.from)?;
+            check_modification_bounds(dim, fill.to)?;
+            eval_fill(
+                fill.from,
+                fill.to,
+                fill.state,
+                fill.mode,
+                MODIFICATION_BLOCK_LIMIT,
+                read,
+            )
+        } else {
+            let clone = parse_clone_command(args, origin, modification_block_state)?;
+            check_modification_bounds(dim, clone.from)?;
+            check_modification_bounds(dim, clone.to)?;
+            check_modification_bounds(dim, clone.destination)?;
+            let source = ModificationBox::between(clone.from, clone.to);
+            let destination = ModificationBox::between(clone.destination, clone.destination);
+            let far_corner = destination
+                .at_offset(source.offset(source.max))
+                .ok_or_else(|| {
+                    block_modification_error(BlockModificationError::DestinationOverflow)
+                })?;
+            check_modification_bounds(dim, far_corner)?;
+            eval_clone(
+                clone.from,
+                clone.to,
+                clone.destination,
+                clone.filter,
+                clone.mode,
+                MODIFICATION_BLOCK_LIMIT,
+                |pos| {
+                    let state = read(pos);
+                    if clone.filter == CloneFilter::Masked
+                        && breg().is_some_and(|reg| reg.is_air(state))
+                    {
+                        COMMAND_AIR_STATE
+                    } else {
+                        state
+                    }
+                },
+            )
+        }
+        .map_err(block_modification_error)?;
+        let count = changes.len();
+        for BlockModification {
+            pos: (x, y, z),
+            state,
+            destroyed,
+        } in changes
+        {
+            if let Some(previous) = destroyed {
+                set_block_dim(dim, x, y, z, COMMAND_AIR_STATE);
+                // Item entities currently belong to the Overworld item simulation.
+                if dim == DimId::Overworld {
+                    let mut drops = drops().lock().unwrap();
+                    let remaining = DROP_CAP.saturating_sub(drops.len());
+                    drops.extend(
+                        block_drops(previous)
+                            .into_iter()
+                            .take(remaining)
+                            .map(|item| Drop {
+                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                x: f64::from(x) + 0.5,
+                                y: f64::from(y) + 0.5,
+                                z: f64::from(z) + 0.5,
+                                item,
+                                cnt: 1,
+                                comps: Vec::new(),
+                                age: 0,
+                                target: None,
+                                thrower: None,
+                            }),
+                    );
+                }
+            }
+            place_block_dim(dim, x, y, z, state);
+        }
+        let action = if cmd == "fill" { "Filled" } else { "Cloned" };
+        Ok(format!("{action} {count} blocks"))
+    })
+}
+
+#[cfg(feature = "neoforge-events")]
+fn run_neoforge_command(
+    runtime: &java_compat::NeoForgeRuntime,
+    ctx: &CmdCtx,
+    literal: &str,
+) -> Result<String, String> {
+    let source = ctx.me.as_deref();
+    let dim = cmd_dim(ctx);
+    let pos = (
+        ctx.x.floor() as i32,
+        ctx.y.floor() as i32,
+        ctx.z.floor() as i32,
+    );
+    check_modification_bounds(dim, pos)?;
+    let outcome = runtime.event(java_compat::S1Event::Command {
+        dim: dim.index() as u8,
+        pos,
+        name: source.map_or("Rcon", |client| client.name.as_str()).into(),
+        literal: literal.into(),
+    })?;
+    let report = java_compat::apply_s1_outcome(outcome)?;
+    let mut reply = Vec::new();
+    let mut messages = Vec::new();
+    for (eid, message) in report.system_messages {
+        // The Java shim creates its synthetic command sender with entity ID 0.
+        match (eid, source) {
+            (0, Some(client)) => messages.push((client.eid, message)),
+            (0, None) => reply.push(message),
+            _ => messages.push((eid, message)),
+        }
+    }
+    deliver_neoforge_messages(source, messages);
+    Ok(reply.join("\n"))
+}
+
+fn schedule_delay_ticks(time: &str) -> u64 {
+    let (num, mult) = time
+        .strip_suffix('t')
+        .map(|n| (n, 1.0f64))
+        .or_else(|| time.strip_suffix('s').map(|n| (n, TICKS_PER_SECOND as f64)))
+        .or_else(|| time.strip_suffix('d').map(|n| (n, 24_000.0)))
+        .unwrap_or((time, 1.0));
+    (num.parse::<f64>().unwrap_or(1.0) * mult) as u64
+}
+
+fn weather_duration_ticks(seconds: Option<&str>) -> i32 {
+    seconds
+        .and_then(|value| value.parse::<i32>().ok())
+        .and_then(|value| value.checked_mul(TICKS_PER_SECOND as i32))
+        .unwrap_or(6000)
+}
+
+fn add_world_time(current: u64, ticks: i64) -> u64 {
+    current.wrapping_add(ticks as u64)
+}
+
+fn schedule_function(
+    scheduled: &mut Vec<(String, u64)>,
+    function: &str,
+    due_tick: u64,
+    append: bool,
+) {
+    if !append {
+        scheduled.retain(|(name, _)| name != function);
+    }
+    scheduled.push((function.to_string(), due_tick));
+}
+
+fn clear_scheduled_functions(scheduled: &mut Vec<(String, u64)>, function: Option<&str>) -> usize {
+    let before = scheduled.len();
+    if let Some(function) = function {
+        scheduled.retain(|(name, _)| name != function);
+    } else {
+        scheduled.clear();
+    }
+    before - scheduled.len()
+}
+
+fn run_command(me: Option<&Arc<Client>>, msg: &str, s: &mut Option<&Client>) {
+    let ctx = match me {
+        Some(c) => {
+            let p = *c.pos.lock().unwrap();
+            CmdCtx {
+                me: Some(c.clone()),
+                x: p.0,
+                y: p.1,
+                z: p.2,
+            }
+        }
+        None => CmdCtx {
+            me: None,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        },
+    };
+    run_command_ctx(&ctx, msg, s);
+}
+fn command_allowed_for_player(cmd: &str, args: &[&str]) -> bool {
+    matches!(cmd, "help" | "list" | "me" | "msg" | "tell" | "w")
+        || (cmd == "time" && matches!(args.first().copied(), Some("query" | "get")))
+}
+fn command_usage(name: &str) -> String {
+    let usage = match name.trim_start_matches('/') {
+        "setblock" => "/setblock <x> <y> <z> <block> [replace|destroy|keep]",
+        "fill" => "/fill <from> <to> <block> [replace|destroy|keep|hollow|outline]",
+        "gamemode" => "/gamemode <survival|creative|adventure|spectator> [player]",
+        "defaultgamemode" => "/defaultgamemode <survival|creative|adventure|spectator>",
+        "save-on" | "save-off" => "no arguments",
+        "save-all" | "save" => "no arguments; force a world save",
+        "spawnpoint" => "/spawnpoint [player] [x y z] [angle]",
+        "setworldspawn" => "/setworldspawn [x y z] [angle]",
+        "forceload" => "/forceload add|remove <x> <z> [<x2> <z2>] | remove all | query [<x> <z>]",
+        "bossbar" => "/bossbar add|remove|set|list|get ...",
+        "time" => "/time set <day|noon|night|ticks> | query <day|daytime|gametime>",
+        "difficulty" => "/difficulty [peaceful|easy|normal|hard]",
+        "help" => "/help [command]",
+        "list" => "no arguments; list online players",
+        _ => return format!("No detailed help available for /{}", name.trim_start_matches('/')),
+    };
+    if usage.starts_with('/') {
+        format!("Usage: {usage}")
+    } else {
+        format!("Usage: /{} {usage}", name.trim_start_matches('/'))
+    }
+}
+fn allow_unsafe_player_admin() -> bool {
+    std::env::var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+const OPS_FILE: &str = "ops.json";
+type Operators = std::collections::BTreeSet<String>;
+static OPERATORS: Mutex<Operators> = Mutex::new(Operators::new());
+
+fn valid_player_name(name: &str) -> bool {
+    (1..=16).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn player_is_admin(name: &str) -> bool {
+    // The server's offline login claims a name. The same case folding is used
+    // by the login reservation and operator list.
+    allow_unsafe_player_admin()
+        || OPERATORS
+            .lock()
+            .unwrap()
+            .contains(&name.to_ascii_lowercase())
+}
+
+fn set_difficulty(difficulty: u8) {
+    if difficulty > 3 {
+        return;
+    }
+    DIFFICULTY.store(difficulty, Ordering::Relaxed);
+    if difficulty == 0 {
+        let gone: Vec<i32> = {
+            let mut mobs = mobs().lock().unwrap();
+            let gone: Vec<i32> = mobs
+                .iter()
+                .filter(|mob| {
+                    entity_category_1211(mob.etype) == EntityMobCategory::Monster
+                        && !matches!(mob.etype, 31 | 119) // Ender Dragon and Wither persist in Peaceful.
+                })
+                .map(|mob| mob.eid)
+                .collect();
+            mobs.retain(|mob| !gone.contains(&mob.eid));
+            gone
+        };
+        for eid in gone {
+            broadcast_seen_destroy(eid);
+        }
+    }
+    let packet = vec![difficulty, 0]; // difficulty, difficulty-locked
+    for client in client_snapshot() {
+        if let Ok(mut sock) = client.sock.lock() {
+            let _ = send_packet(&mut sock, 0x0b, packet.clone());
+        }
+    }
+}
+
+fn read_operators(path: &std::path::Path) -> std::io::Result<Operators> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Operators::new()),
+        Err(error) => return Err(error),
+    };
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected a JSON array of player names",
+        )
+    };
+    let entries = text
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(invalid)?
+        .trim();
+    if entries.is_empty() {
+        return Ok(Operators::new());
+    }
+    entries
+        .split(',')
+        .map(|entry| {
+            let name = entry
+                .trim()
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .filter(|s| valid_player_name(s))
+                .ok_or_else(invalid)?;
+            Ok(name.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn load_operators(path: &std::path::Path) -> std::io::Result<()> {
+    let mut operators = OPERATORS.lock().unwrap();
+    match read_operators(path) {
+        Ok(names) => {
+            *operators = names;
+            Ok(())
+        }
+        Err(error) => {
+            operators.clear();
+            Err(error)
+        }
+    }
+}
+
+fn set_operator(path: &std::path::Path, name: &str, enable: bool) -> std::io::Result<bool> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let mut operators = OPERATORS.lock().unwrap();
+    let mut proposed = operators.clone();
+    let name = name.to_ascii_lowercase();
+    let changed = if enable {
+        proposed.insert(name)
+    } else {
+        proposed.remove(&name)
+    };
+    if !changed {
+        return Ok(false);
+    }
+    let temp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let body = proposed
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let written = writeln!(file, "[{body}]").and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(error) = written.and_then(|_| std::fs::rename(&temp, path)) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    *operators = proposed;
+    Ok(true)
+}
+
+type PlayCommandBuilder = brigadier::ArgumentBuilder<()>;
+
+#[derive(Default)]
+struct CommandCompletions {
+    players: Vec<String>,
+    operators: Vec<String>,
+    enabled_packs: Vec<String>,
+    disabled_packs: Vec<String>,
+}
+
+fn completion_argument(
+    name: &str,
+    parser: brigadier::StringArgumentType,
+    candidates: Option<&[String]>,
+) -> PlayCommandBuilder {
+    let argument = PlayCommandBuilder::argument(name, Box::new(parser)).executes(|_| Ok(0));
+    if let Some(candidates) = candidates {
+        let names = candidates.to_vec();
+        argument.suggests(Arc::new(move |_, builder| {
+            let prefix = builder.remaining().to_ascii_lowercase();
+            for name in &names {
+                if name.to_ascii_lowercase().starts_with(&prefix) {
+                    builder.suggest(name);
+                }
+            }
+            Ok(builder.build())
+        }))
+    } else {
+        argument
+    }
+}
+
+fn command_tree(admin: bool) -> brigadier::CommandNode<()> {
+    command_dispatcher(admin, None).root().clone()
+}
+
+fn command_dispatcher(
+    admin: bool,
+    completions: Option<&CommandCompletions>,
+) -> brigadier::CommandDispatcher<()> {
+    let dispatcher = native_command_dispatcher(admin, completions);
+    #[cfg(feature = "neoforge-events")]
+    if let Some(runtime) = java_compat::NEOFORGE.get() {
+        for name in &runtime.commands {
+            dispatcher.register(PlayCommandBuilder::literal(name))
+                .expect("validated NeoForge command literal");
+        }
+    }
+    dispatcher
+}
+
+#[cfg(feature = "neoforge-events")]
+fn exclude_native_neoforge_literals(literals: &mut Vec<String>) {
+    let dispatcher = native_command_dispatcher(true, None);
+    literals.retain(|name| dispatcher.root().child(name).is_none());
+}
+
+fn native_command_dispatcher(
+    admin: bool,
+    completions: Option<&CommandCompletions>,
+) -> brigadier::CommandDispatcher<()> {
+    // Execution remains in run_command_ctx. Executable nodes describe the
+    // syntax and allow the client to distinguish complete from partial input.
+    let dispatcher = brigadier::CommandDispatcher::new();
+    let literal = |name: &str| PlayCommandBuilder::literal(name);
+    let done = |name: &str| literal(name).executes(|_| Ok(0));
+    let choices = |node: PlayCommandBuilder, names: &[&str]| {
+        names
+            .iter()
+            .fold(node, |parent, name| parent.then(done(name)))
+    };
+    let word = brigadier::StringArgumentType::word;
+    let greedy = brigadier::StringArgumentType::greedy_string;
+    let args = |name: &str| completion_argument(name, greedy(), None);
+    let message = || completion_argument("message", greedy(), None);
+    let player =
+        || completion_argument("player", word(), completions.map(|c| c.players.as_slice()));
+    let mut time = literal("time");
+    for query in ["query", "get"] {
+        time = time.then(choices(done(query), &["daytime", "gametime", "day"]));
+    }
+    if admin {
+        let ticks = PlayCommandBuilder::argument(
+            "ticks",
+            Box::new(brigadier::LongArgumentType::long_at_least(0)),
+        )
+        .executes(|_| Ok(0));
+        time =
+            time.then(choices(literal("set"), &["day", "night", "noon", "midnight"]).then(ticks));
+        time = time.then(
+            literal("add")
+                .then(PlayCommandBuilder::argument(
+                    "amount",
+                    Box::new(brigadier::LongArgumentType::long_arg()),
+                ).executes(|_| Ok(0))),
+        );
+    }
+    let register = |node| {
+        dispatcher
+            .register(node)
+            .expect("play command is a literal");
+    };
+    let help = literal("help").executes(|_| Ok(0)).then(completion_argument("command", word(), None));
+    for node in [help, done("list"), time] {
+        register(node);
+    }
+    register(done("me").then(message()));
+    for name in ["msg", "tell", "w"] {
+        register(literal(name).then(player().then(message())));
+    }
+    if !admin {
+        return dispatcher;
+    }
+    for name in ["counts", "reload", "save", "save-all", "save-on", "save-off", "seed", "stop"] {
+        register(done(name));
+    }
+    register(literal("kick").then(player().executes(|_| Ok(0)).then(message())));
+    register(literal("setidletimeout").then(PlayCommandBuilder::argument(
+        "minutes",
+        Box::new(brigadier::IntegerArgumentType::integer_at_least(0)),
+    ).executes(|_| Ok(0))));
+    register(["survival", "creative", "adventure", "spectator", "0", "1", "2", "3"]
+        .iter().fold(literal("defaultgamemode"), |node, mode| node.then(done(mode))));
+    register(literal("op").then(player()));
+    register(literal("deop").then(completion_argument(
+        "player",
+        word(),
+        completions.map(|c| c.operators.as_slice()),
+    )));
+    register(
+        literal("datapack")
+            .then(choices(done("list"), &["enabled", "available"]))
+            .then(literal("enable").then(completion_argument(
+                "name",
+                greedy(),
+                completions.map(|c| c.disabled_packs.as_slice()),
+            )))
+            .then(literal("disable").then(completion_argument(
+                "name",
+                greedy(),
+                completions.map(|c| c.enabled_packs.as_slice()),
+            ))),
+    );
+    register(choices(
+        done("difficulty"),
+        &["peaceful", "easy", "normal", "hard"],
+    ));
+    register(
+        done("weather")
+            .then(done("clear"))
+            .then(
+                done("rain").then(
+                    PlayCommandBuilder::argument(
+                        "duration",
+                        Box::new(brigadier::IntegerArgumentType::integer()),
+                    )
+                    .executes(|_| Ok(0)),
+                ),
+            )
+            .then(
+                done("thunder").then(
+                    PlayCommandBuilder::argument(
+                        "duration",
+                        Box::new(brigadier::IntegerArgumentType::integer()),
+                    )
+                    .executes(|_| Ok(0)),
+                ),
+            ),
+    );
+    register(
+        [
+            "survival",
+            "creative",
+            "adventure",
+            "spectator",
+            "0",
+            "1",
+            "2",
+            "3",
+        ]
+        .iter()
+        .fold(literal("gamemode"), |node, mode| {
+            node.then(done(mode).then(player()))
+        }),
+    );
+    register(done("kill").then(completion_argument(
+        "targets",
+        greedy(),
+        completions.map(|c| c.players.as_slice()),
+    )));
+    register(
+        literal("give")
+            .then(player().then(args("item and count")))
+            .then(args("targets, item and count")),
+    );
+    register(literal("say").then(args("message")));
+    register(literal("function").then(args("function")));
+    // The remaining legacy handlers accept shapes such as selectors, relative
+    // coordinates and NBT which the protocol module cannot serialize as types.
+    for name in [
+        "advancement",
+        "attribute",
+        "bossbar",
+        "clone",
+        "damage",
+        "data",
+        "effect",
+        "enchant",
+        "execute",
+        "experience",
+        "fill",
+        "forceload",
+        "item",
+        "loot",
+        "particle",
+        "player",
+        "playsound",
+        "schedule",
+        "scoreboard",
+        "setblock",
+        "stopsound",
+        "summon",
+        "tag",
+        "teleport",
+        "tellraw",
+        "title",
+        "tp",
+        "trigger",
+        "worldborder",
+        "xp",
+    ] {
+        register(literal(name).then(args("arguments")));
+    }
+    for name in ["clear", "gamerule", "setworldspawn", "spawnpoint"] {
+        register(done(name).then(args("arguments")));
+    }
+    dispatcher
+}
+
+fn send_commands(socket: &mut TcpStream, admin: bool) -> std::io::Result<()> {
+    let payload =
+        brigadier_wire::commands_payload(&command_tree(admin)).map_err(std::io::Error::other)?;
+    send_packet(
+        socket,
+        i64::from(brigadier_wire::CLIENTBOUND_COMMANDS),
+        payload,
+    )
+}
+
+fn update_client_commands(client: &Client) {
+    let mut socket = client.sock.lock().unwrap();
+    let _ = send_commands(&mut socket, player_is_admin(&client.name));
+}
+
+fn command_suggestion_response(
+    request: &brigadier_wire::CommandSuggestionsRequest,
+    admin: bool,
+    completions: &CommandCompletions,
+) -> brigadier_wire::CommandSuggestionsResponse {
+    let dispatcher = command_dispatcher(admin, Some(completions));
+    let mut reader = brigadier::StringReader::new(&request.text);
+    if request.text.starts_with('/') {
+        reader.skip();
+    }
+    let parse = dispatcher.parse_reader(reader, ());
+    let suggestions = dispatcher.get_completion_suggestions(&parse);
+    let mut response = brigadier_wire::CommandSuggestionsResponse::from_suggestions(
+        request.transaction_id,
+        &suggestions,
+    );
+    // Brigadier uses UTF-8 byte offsets internally. The client replaces a
+    // substring of a Java String using UTF-16 indices.
+    let end = response.start + response.length;
+    response.length = request.text[response.start..end].encode_utf16().count();
+    response.start = request.text[..response.start].encode_utf16().count();
+    response
+}
+
+fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
+    let Ok(request) = brigadier_wire::parse_command_suggestions_request(body) else {
+        return;
+    };
+    let admin = player_is_admin(&client.name);
+    let mut completions = CommandCompletions {
+        players: client_snapshot().iter().map(|c| c.name.clone()).collect(),
+        ..CommandCompletions::default()
+    };
+    if admin {
+        completions.operators = OPERATORS.lock().unwrap().iter().cloned().collect();
+        completions.enabled_packs = packs()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        completions.disabled_packs = disabled_datapacks()
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+    }
+    let response = command_suggestion_response(&request, admin, &completions);
+    if let Ok(payload) = brigadier_wire::command_suggestions_response_payload(&response) {
+        let _ = send_packet(
+            &mut client.sock.lock().unwrap(),
+            i64::from(brigadier_wire::CLIENTBOUND_COMMAND_SUGGESTIONS),
+            payload,
+        );
+    }
+}
+
+fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
+    let me = ctx.me.as_ref();
+    let mut it = msg[1..].split_whitespace();
+    let cmd = it.next().unwrap_or("");
+
+    let args: Vec<&str> = it.collect();
+    let admin = me.is_none_or(|player| player_is_admin(&player.name));
+    if !admin && !command_allowed_for_player(cmd, &args) {
+        let reply = "You do not have permission to run that command";
+        if let Some(client) = s {
+            let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(reply));
+        }
+        return reply.into();
+    }
+    #[cfg(feature = "neoforge-events")]
+    let mod_command = java_compat::NEOFORGE.get().filter(|runtime| {
+        runtime.commands.binary_search_by(|name| name.as_str().cmp(cmd)).is_ok()
+    });
+    #[cfg(feature = "neoforge-events")]
+    if let Some(runtime) = mod_command {
+        let reply = if !args.is_empty() {
+            format!("usage: /{cmd}")
+        } else {
+            run_neoforge_command(runtime, ctx, cmd).unwrap_or_else(|error| {
+                eprintln!("[mod-compatibility] NeoForge command {cmd}: {error}");
+                format!("NeoForge command failed: {cmd}")
+            })
+        };
+        if !reply.is_empty() {
+            if let Some(client) = s {
+                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&reply));
+            }
+        }
+        return reply;
+    }
+    let reply = match cmd {
+        "execute" => run_execute(ctx, &args, s),
+        "time" => {
+            if args.first() == Some(&"add") {
+                if let Some(ticks) = args.get(1).and_then(|n| n.parse::<i64>().ok()).filter(|t| *t >= 0) {
+                    let current = WORLD_TIME.load(Ordering::Relaxed);
+                    let updated = add_world_time(current, ticks);
+                    WORLD_TIME.store(updated, Ordering::Relaxed);
+                    format!("Added {} ticks to the time", ticks)
+                } else {
+                    "usage: /time add <ticks>".into()
+                }
+            } else if args.first() == Some(&"set") {
+                let v = match args.get(1).copied().unwrap_or("") {
+                    "day" => 1000, "night" => 13000, "noon" => 6000, "midnight" => 18000,
+                    n => n.parse::<u64>().unwrap_or(1000),
+                };
+                WORLD_TIME.store(v, Ordering::Relaxed);
+                format!("Set time to {}", v)
+            } else if matches!(args.first().copied(), Some("query") | Some("get")) {
+                match args.get(1).copied().unwrap_or("daytime") {
+                    "daytime" => format!("The time is {}", WORLD_TIME.load(Ordering::Relaxed) % 24000),
+                    "day" => format!("The day is {}", WORLD_TIME.load(Ordering::Relaxed) / 24000),
+                    _ => format!("The gametime is {}", WORLD_TIME.load(Ordering::Relaxed)),
+                }
+            } else { "usage: /time add <ticks> | set <n|day|night> | query daytime|gametime|day".into() }
+        }
+        "difficulty" => {
+            match args.first().copied().unwrap_or("") {
+                "peaceful" | "easy" | "normal" | "hard" => {
+                    let d = match args[0] { "peaceful" => 0u8, "easy" => 1, "hard" => 3, _ => 2 };
+                    set_difficulty(d);
+                    format!("Set difficulty to {}", args[0])
+                }
+                "" => format!("The difficulty is {}", ["peaceful","easy","normal","hard"][DIFFICULTY.load(Ordering::Relaxed) as usize]),
+                _ => "usage: /difficulty [peaceful|easy|normal|hard]".into(),
+            }
+        }
+        "save-off" => {
+            let was_enabled = AUTOSAVE_ENABLED.swap(false, Ordering::Relaxed);
+            if was_enabled { "Automatic saving is now disabled".into() }
+            else { "Automatic saving is already disabled".into() }
+        }
+        "save-on" => {
+            let was_enabled = AUTOSAVE_ENABLED.swap(true, Ordering::Relaxed);
+            if was_enabled { "Automatic saving is already enabled".into() }
+            else { "Automatic saving is now enabled".into() }
+        }
+        "defaultgamemode" => {
+            let (mode, value) = match args.first().copied().unwrap_or("") {
+                "survival" | "0" => ("survival", 0),
+                "creative" | "1" => ("creative", 1),
+                "adventure" | "2" => ("adventure", 2),
+                "spectator" | "3" => ("spectator", 3),
+                _ => return "usage: /defaultgamemode survival|creative|adventure|spectator".into(),
+            };
+            DEFAULT_GAME_MODE.store(value, Ordering::Relaxed);
+            format!("The default game mode is now {mode}")
+        }
+        "help" if !args.is_empty() => command_usage(args[0]),
+        "help" => {
+            let names = command_tree(admin).children().into_iter()
+                .map(|node| node.name().to_owned()).collect::<Vec<_>>();
+            format!("commands: {}", names.join(" "))
+        }
+        "spawnpoint" => {
+            if !matches!(args.len(), 0 | 1 | 3..=5) {
+                return command_usage(cmd);
+            }
+            let (nm, xyz): (String, &[&str]) = if args.len() >= 4 {
+                (args[0].to_string(), &args[1..])
+            } else if args.len() >= 3 { (ctx.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(), &args[0..]) }
+              else { (args.first().copied().unwrap_or("").to_string(), &args[0..0]) };
+            let t: Option<Arc<Client>> = if nm.is_empty() { ctx.me.clone() }
+                else { clients().lock().unwrap().iter().find(|c| c.name == nm).cloned() };
+            match t {
+                None => format!("unknown player '{nm}'"),
+                Some(c) => {
+                    let (x, y, z) = if xyz.len() >= 3 {
+                        (coord(xyz[0], ctx.x), coord(xyz[1], ctx.y), coord(xyz[2], ctx.z))
+                    } else { let p = c.pos.lock().unwrap(); (p.0, p.1, p.2) };
+                    let Some(yaw) = spawn_yaw(xyz.get(3).copied(), me) else {
+                        return "Invalid spawn angle".into();
+                    };
+                    let dim = cmd_dim(ctx);
+                    let mut spawn_dim = c.spawn_dim.lock().unwrap();
+                    *c.spawn_pt.lock().unwrap() = Some((x, y, z, yaw));
+                    *spawn_dim = dim;
+                    format!("Set spawn point to {x}, {y}, {z} facing {yaw} for {}", c.name)
+                }
+            }
+        }
+        "setworldspawn" => {
+            if cmd_dim(ctx) != DimId::Overworld {
+                return "World spawn can only be set in the Overworld".into();
+            }
+            if !matches!(args.len(), 0 | 3 | 4) {
+                return command_usage(cmd);
+            }
+            let (x, y, z) = if args.len() >= 3 {
+                (coord(args[0], ctx.x), coord(args[1], ctx.y), coord(args[2], ctx.z))
+            } else { (ctx.x, ctx.y, ctx.z) };
+            let Some(yaw) = spawn_yaw(args.get(3).copied(), me) else {
+                return "Invalid spawn angle".into();
+            };
+            let spawn = (x, y, z, yaw);
+            *WORLD_SPAWN.lock().unwrap() = spawn;
+            fanout_in(
+                &client_snapshot(),
+                |player| *player.dim.lock().unwrap() == DimId::Overworld,
+                |_| (0x56, spawn_position_packet(spawn)),
+            );
+            format!("Set the world spawn point to {x}, {y}, {z} facing {yaw}")
+        }
+        "op" | "deop" => match args.as_slice() {
+            [name] if valid_player_name(name) => {
+                match set_operator(std::path::Path::new(OPS_FILE), name, cmd == "op") {
+                    Ok(true) => {
+                        for client in client_snapshot().iter().filter(|c| c.name.eq_ignore_ascii_case(name)) {
+                            update_client_commands(client);
+                        }
+                        if cmd == "op" { format!("Made {name} a server operator") }
+                        else { format!("Made {name} no longer a server operator") }
+                    }
+                    Ok(false) if cmd == "op" => format!("{name} is already a server operator"),
+                    Ok(false) => format!("{name} is not a server operator"),
+                    Err(error) => format!("Could not save {OPS_FILE}: {error}"),
+                }
+            }
+            _ => format!("usage: /{cmd} <player>"),
+        },
+        "reload" if args.is_empty() => {
+            match reload_datapacks(std::path::Path::new(DATAPACK_DIRECTORY), None, true) {
+                Ok(count) => {
+                    let ops = load_operators(std::path::Path::new(OPS_FILE));
+                    for client in client_snapshot() {
+                        update_client_commands(&client);
+                    }
+                    match ops {
+                        Ok(()) => format!("Reloading! ({count} pack(s))"),
+                        Err(error) => format!("Reloading! ({count} pack(s)); could not load {OPS_FILE}: {error}"),
+                    }
+                }
+                Err(error) => error,
+            }
+        }
+        "reload" => "usage: /reload".into(),
+        "tp" | "teleport" => {
+            let mut actor_tgt: Option<String> = None;
+            let (targets, xyz): (Vec<String>, &[&str]) = if args.first().map(|a| a.starts_with('@')).unwrap_or(false) {
+                (resolve_selector(args[0], me), &args[1..])
+            } else if args.len() >= 4 && args[0].parse::<f64>().is_err() && !args[0].starts_with('~') {
+                let nm = args[0];
+                let t = { clients().lock().unwrap().iter().find(|c| c.name == nm).map(|c| c.eid.to_string()) };
+                if t.is_none() && actors().lock().unwrap().contains_key(nm) { actor_tgt = Some(nm.to_string()); }
+                (t.into_iter().collect(), &args[1..])
+            } else if let Some(me) = me { (vec![me.eid.to_string()], &args[..]) } else { (vec![], &args[..]) };
+            if xyz.len() < 3 { "usage: /tp [@target] x y z".into() } else {
+                let (x, y, z) = (coord(xyz[0], ctx.x), coord(xyz[1], ctx.y), coord(xyz[2], ctx.z));
+                let mut n = 0;
+                if let Some(nm) = &actor_tgt {
+                    if let Some(a) = actors().lock().unwrap().get(nm) { *a.pos.lock().unwrap() = (x, y, z); n += 1; }
+                }
+                let cls: Vec<Arc<Client>> = client_snapshot();
+                for t in &targets {
+                    if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
+                        let (yaw, pitch) = {
+                            let p = c.pos.lock().unwrap();
+                            (p.3, p.4)
+                        };
+                        let cur_dim = *c.dim.lock().unwrap();
+                        if cur_dim != cmd_dim(ctx) {
+                            // A cross-dimension /tp is a real respawn, not a coordinate patch:
+                            // the client needs 0x47 and a whole new window before 0x40.
+                            let view = *c.view.lock().unwrap();
+                            switch_client_dimension(c, cmd_dim(ctx), (x, y, z, yaw, pitch), view);
+                        } else {
+                            teleport_in_dimension(c, &mut c.sock.lock().unwrap(), (x, y, z, yaw, pitch));
+                        }
+                        n += 1;
+                    }
+                }
+                format!("Teleported {} target(s)", n)
+            }
+        }
+        "say" => {
+            let line = format!("[Server] {}", args.join(" "));
+            let pl = system_chat(&line);
+            broadcast(-1, |_c| (0x6c, pl.clone()));
+            return String::new();
+        }
+        "me" => {
+            if args.is_empty() {
+                return "usage: /me <action>".into();
+            }
+            let sender = me.map(|client| client.name.as_str()).unwrap_or("Server");
+            let payload = system_chat(&format!("* {sender} {}", args.join(" ")));
+            broadcast(-1, |_c| (0x6c, payload.clone()));
+            return String::new();
+        }
+        "msg" | "tell" | "w" => {
+            let Some((target_name, words)) = args.split_first() else {
+                return "usage: /msg <player> <message>".into();
+            };
+            if words.is_empty() {
+                return "usage: /msg <player> <message>".into();
+            }
+            let target = client_snapshot()
+                .into_iter()
+                .find(|client| client.name.eq_ignore_ascii_case(target_name));
+            let Some(target) = target else {
+                return format!("That player does not exist: {target_name}");
+            };
+            let sender = me.map(|client| client.name.as_str()).unwrap_or("Server");
+            let text = words.join(" ");
+            let target_message = system_chat(&format!("{sender} whispers to you: {text}"));
+            let _ = send_packet(&mut target.sock.lock().unwrap(), 0x6c, target_message);
+            let reply = format!("You whisper to {}: {}", target.name, text);
+            if let Some(client) = *s {
+                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&reply));
+            }
+            return String::new();
+        }
+        "kill" => {
+            let mut killed = 0;
+            let targets = match args.first() {
+                Some(sel) if sel.starts_with('@') => resolve_selector(sel, me),
+                Some(nm) => clients().lock().unwrap().iter()
+                    .find(|c| c.name == *nm).map(|c| vec![c.eid.to_string()])
+                    .unwrap_or_else(|| me.map(|c| vec![c.eid.to_string()]).unwrap_or_default()),
+                _ => me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(),
+            };
+            for t in targets {
+                if let Some(eid) = t.strip_prefix("m:").and_then(|e| e.parse::<i32>().ok()) {
+                    let info = mobs().lock().unwrap().iter()
+                        .find(|m| m.eid == eid)
+                        .map(|m| (m.etype, *m.pos.lock().unwrap()));
+                    if let Some((et, (mx, my, mz, ..))) = info { kill_mob(eid, et, mx, my, mz); }
+                    killed += 1;
+                } else if let Some(eid) = t.strip_prefix("d:").and_then(|e| e.parse::<i32>().ok()) {
+                    drops().lock().unwrap().retain(|d| d.eid != eid);
+                    broadcast_seen_destroy(eid);
+                    killed += 1;
+                } else if let Some(eid) = t.strip_prefix("t:").and_then(|e| e.parse::<i32>().ok()) {
+                    primed().lock().unwrap().retain(|t2| t2.eid != eid);
+                    broadcast_seen_destroy(eid);
+                    killed += 1;
+                } else if let Some(eid) = t.strip_prefix("a:").and_then(|e| e.parse::<i32>().ok()) {
+                    arrows().lock().unwrap().retain(|x| x.eid != eid);
+                    broadcast_seen_destroy(eid);
+                    killed += 1;
+                } else if let Some(eid) = t.strip_prefix("p:").and_then(|e| e.parse::<i32>().ok()) {
+                    pearls().lock().unwrap().retain(|x| x.eid != eid);
+                    broadcast_seen_destroy(eid);
+                    killed += 1;
+                } else if let Some(eid) = t.strip_prefix("b:").and_then(|e| e.parse::<i32>().ok()) {
+                    bobbers().lock().unwrap().retain(|x| x.eid != eid);
+                    broadcast_seen_destroy(eid);
+                    killed += 1;
+                } else if let Some(eid) = t.strip_prefix("x:").and_then(|e| e.parse::<i32>().ok()) {
+                    xps().lock().unwrap().retain(|x| x.eid != eid);
+                    broadcast_seen_destroy(eid);
+                    killed += 1;
+                } else if let Ok(eid) = t.parse::<i32>() {
+                    let cls: Vec<Arc<Client>> = client_snapshot();
+                    if let Some(c) = cls.iter().find(|c| c.eid == eid) {
+                        *c.hp.lock().unwrap() = 0.0;
+                        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(0.0, c)); }
+                        killed += 1;
+                    }
+                }
+            }
+            format!("Killed {}", killed)
+        }
+        "gamemode" => {
+            let gm = args.first().copied().unwrap_or("");
+            let (v, flags) = match gm {
+                "survival"|"0" => (0f32, 0x00u8), "creative"|"1" => (1.0, 0x0f),
+                "adventure"|"2" => (2.0, 0x00), "spectator"|"3" => (3.0, 0x00),
+                _ => return "usage: /gamemode survival|creative|adventure|spectator [player]".into() };
+            // optional second arg: another player (or actor record)
+            let target: Option<Arc<Client>> = if args.len() >= 2 {
+                if actors().lock().unwrap().contains_key(args[1]) {
+                    return format!("Set gamemode of {} to {}", args[1], args[0])
+                }
+                match clients().lock().unwrap().iter().find(|c| c.name == args[1]).cloned() {
+                    Some(c) => Some(c),
+                    None => return format!("unknown player '{}'", args[1]),
+                }
+            } else { me.cloned() };
+            match target {
+                Some(c) => {
+                    *c.gm.lock().unwrap() = v as u8;
+                    let mut g = vec![3u8]; g.extend_from_slice(&v.to_be_bytes());
+                    let mut ab = vec![flags]; ab.extend_from_slice(&0.05f32.to_be_bytes()); ab.extend_from_slice(&0.1f32.to_be_bytes());
+                    if let Ok(mut w) = c.sock.lock() {
+                        let _ = send_packet(&mut w, 0x22, g);
+                        let _ = send_packet(&mut w, 0x38, ab);
+                    }
+                    format!("Set {}'s gamemode to {}", c.name, gm)
+                }
+                None => "player only".into(),
+            }
+        }
+        "save-all" | "save" => {
+            save_world();
+            "Saved the world".into()
+        }
+        "kick" => {
+            let Some(target_name) = args.first() else {
+                return "usage: /kick <player> [reason]".into();
+            };
+            let target = client_snapshot()
+                .into_iter()
+                .find(|client| client.name.eq_ignore_ascii_case(target_name));
+            let Some(target) = target else {
+                return format!("That player does not exist: {target_name}");
+            };
+            let reason = if args.len() > 1 {
+                args[1..].join(" ")
+            } else {
+                "Kicked by an operator.".to_owned()
+            };
+            let mut socket = target.sock.lock().unwrap();
+            play_disconnect(&mut socket, &reason);
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+            format!("Kicked {}: {}", target.name, reason)
+        }
+        "setidletimeout" => {
+            let Some(minutes) = args.first().and_then(|value| value.parse::<u32>().ok()) else {
+                return "usage: /setidletimeout <minutes>".into();
+            };
+            connection_limits::set_idle_timeout(Duration::from_secs(u64::from(minutes) * 60));
+            format!("Set idle timeout to {minutes} minutes")
+        }
+        "stop" => {
+            save_world();
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(150)); // flush reply
+                disconnect_all_clients("Server closed");
+                std::thread::sleep(Duration::from_millis(100));
+                #[cfg(feature = "neoforge-events")]
+                if let Some(runtime) = java_compat::NEOFORGE.get() {
+                    runtime.cleanup_staged_mods();
+                }
+                std::process::exit(0);
+            });
+            "Stopping the server".into()
+        }
+        "clear" => {
+            // /clear [target] [item] [maxCount]
+            let targets = match args.first() {
+                Some(sel) if sel.starts_with('@') => resolve_selector(sel, me),
+                Some(n) if name_to_item(n).is_none() => {
+                    clients().lock().unwrap().iter().find(|c| c.name == *n)
+                        .map(|c| vec![c.eid.to_string()]).unwrap_or_default()
+                }
+                _ => me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(),
+            };
+            let want = args.iter().skip(1).find(|a| name_to_item(a).is_some())
+                .and_then(|a| name_to_item(a));
+            let max = args.iter().rev().find_map(|a| a.parse::<u8>().ok());
+            let mut removed = 0i64;
+            let cls: Vec<Arc<Client>> = client_snapshot();
+            for t in &targets {
+                if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
+                    let mut inv = c.inv.lock().unwrap();
+                    let keys: Vec<i16> = inv.iter()
+                        .filter(|(_, (it, _, _))| want.map(|w| w == *it).unwrap_or(true))
+                        .map(|(&k, _)| k).collect();
+                    for k in keys {
+                        let (it, cnt, _cc) = inv[&k].clone();
+                        let take = max.map(|m| cnt.min(m - removed.min(255) as u8)).unwrap_or(cnt);
+                        if take == 0 { break }
+                        removed += take as i64;
+                        if take >= cnt { inv.remove(&k); } else { inv.insert(k, (it, cnt - take, _cc)); }
+                    }
+                    // resync window 0 so the client drops the cleared items
+                    let mut q = vec![0u8];
+                    write_varint(&mut q, 0);
+                    write_varint(&mut q, 46);
+                    for i in 0..46i16 {
+                        let (it2, c2, _cc) = inv.get(&i).cloned().unwrap_or((0, 0, Vec::new()));
+                        q.extend_from_slice(&slot_wire(&(it2, c2, _cc)));
+                    }
+                    q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x13, q); }
+                }
+            }
+            format!("Cleared {} item(s)", removed)
+        }
+        "effect" => {
+            // /effect give <target> <effect> [seconds] [amplifier]
+            // /effect clear <target> [effect]
+            let sub = args.first().copied().unwrap_or("");
+            let sel = args.get(1).copied().unwrap_or("@s");
+            let targets = if sel.starts_with('@') { resolve_selector(sel, me) }
+                else { clients().lock().unwrap().iter().find(|c| c.name == sel)
+                    .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
+            // hold a snapshot of client Arcs, not the clients() mutex —
+            // broadcast_seen re-locks clients() internally.
+            let cls_snap: Vec<Arc<Client>> = client_snapshot();
+            let mut touched = 0;
+            let mut fx: Vec<(Arc<Client>, Vec<u8>)> = Vec::new(); // (target, entity_effect pkt)
+            let mut rx: Vec<(Arc<Client>, Vec<u8>)> = Vec::new(); // (target, remove_effect pkt)
+            let reply2 = match sub {
+                "give" => {
+                    let ename = args.get(2).copied().unwrap_or("");
+                    let Some(eid2) = name_to_effect(ename) else {
+                        return format!("unknown effect '{ename}'")
+                    };
+                    let secs = args.get(3).and_then(|a| a.parse::<i32>().ok()).unwrap_or(30);
+                    let amp = args.get(4).and_then(|a| a.parse::<i32>().ok()).unwrap_or(0);
+                    for t in &targets {
+                        if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
+                            match eid2 {
+                                // instant effects apply once, not stored
+                                5 => { let mut h = c.hp.lock().unwrap();
+                                    *h = (*h + 4.0 * (amp + 1) as f32).min(20.0);
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c)); } }
+                                6 => { let mut h = c.hp.lock().unwrap();
+                                    *h = (*h - 6.0 * (amp + 1) as f32).max(0.0);
+                                    if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); }
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c)); } }
+                                22 => { let mut f = c.food.lock().unwrap();
+                                    *f = (*f + amp + 1).min(20); drop(f);
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*c.hp.lock().unwrap(), c)); } }
+                                _ => {
+                                    let ticks = secs * TICKS_PER_SECOND as i32; // server ticks
+                                    { let mut ef = c.effs.lock().unwrap();
+                                      ef.retain(|e| e.id != eid2);
+                                      ef.push(Eff { id: eid2, amp, left: ticks }); }
+                                    fx.push(((*c).clone(), entity_effect_pkt(c.eid, eid2, amp, ticks)));
+                                }
+                            }
+                            touched += 1;
+                        }
+                    }
+                    format!("Applied effect to {} target(s)", touched)
+                }
+                "clear" => {
+                    let ename = args.get(2).copied().unwrap_or("");
+                    let want: Option<i32> = if ename.is_empty() { None } else { name_to_effect(ename) };
+                    for t in &targets {
+                        if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
+                            let gone: Vec<i32> = { let mut ef = c.effs.lock().unwrap();
+                                let g: Vec<i32> = ef.iter().filter(|e| want.map(|w| w == e.id).unwrap_or(true)).map(|e| e.id).collect();
+                                ef.retain(|e| want.map(|w| w != e.id).unwrap_or(false)); g };
+                            for id in gone { rx.push(((*c).clone(), remove_effect_pkt(c.eid, id))); }
+                            touched += 1;
+                        }
+                    }
+                    format!("Cleared effects from {} target(s)", touched)
+                }
+                _ => "usage: /effect give|clear <target> [effect] [seconds] [amplifier]".into(),
+            };
+            // send outside any clients() lock
+            for (c, pk) in &fx {
+                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x76, pk.clone()); }
+            }
+            for (c, pk) in &rx {
+                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x43, pk.clone()); }
+            }
+            for (_c, pk) in &fx { broadcast_seen(_c.eid, |_o| (0x76, pk.clone())); }
+            for (_c, pk) in &rx { broadcast_seen(_c.eid, |_o| (0x43, pk.clone())); }
+            reply2
+        }
+        "xp" | "experience" => run_experience_command(&args, me),
+        "setblock" => {
+            if args.len() >= 4 {
+                let (x, y, z) = (coord(args[0], ctx.x) as i32, coord(args[1], ctx.y) as i32, coord(args[2], ctx.z) as i32);
+                let Some(st) = state_from_arg(args[3]) else {
+                    return format!("Unknown block '{}'", args[3]);
+                };
+                place_block_dim(cmd_dim(ctx), x, y, z, st);
+                format!("Set block at {} {} {} in {}", x, y, z, cmd_dim(ctx).dimension_id())
+            } else { "usage: /setblock x y z <block>".into() }
+        }
+        "summon" => {
+            if args.len() < 4 {
+                return "usage: /summon <entity> x y z".into();
+            }
+            let Some(etype) = name_to_etype(args[0]) else {
+                return format!("Unknown entity {}", args[0]);
+            };
+            let (x, y, z) = (coord(args[1], ctx.x), coord(args[2], ctx.y), coord(args[3], ctx.z));
+            if ![x, y, z].into_iter().all(f64::is_finite)
+                || x.abs() >= 30_000_000.0 || z.abs() >= 30_000_000.0 || y.abs() > 30_000_000.0
+            {
+                return "Invalid summon position".into();
+            }
+            let dim = cmd_dim(ctx);
+            if etype == 106 && dim == DimId::Overworld {
+                let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                primed().lock().unwrap().push(Primed { eid, x, y, z, left: server_ticks(TNT_FUSE_GT) as i32 });
+            } else if !insert_live_mob(etype, dim, (x, y, z, 0.0, 0.0), default_mob_hp(args[0]), None) {
+                return "mob cap reached".into();
+            }
+            format!("Summoned {}", args[0])
+        }
+        "give" => {
+            // /give <target> <item>[comps] [count] — the item arg may carry a
+            // [k=v,...] component suffix (supported subset in parse_item_comps)
+            let (targets, item_arg) = if args.first().map(|a| a.starts_with('@')).unwrap_or(false) {
+                (resolve_selector(args[0], me), args.get(1).copied().unwrap_or(""))
+            } else if args.first().map(|a| name_to_item(a.split('[').next().unwrap_or(a)).is_some()).unwrap_or(false) {
+                (me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(), args.first().copied().unwrap_or(""))
+            } else {
+                let name = args.first().copied().unwrap_or("");
+                let t = { clients().lock().unwrap().iter().find(|c| c.name == name).map(|c| c.eid.to_string()) };
+                (t.into_iter().collect(), args.get(1).copied().unwrap_or(""))
+            };
+            {
+            let item_name = item_arg.split('[').next().unwrap_or(item_arg);
+            let comps = parse_item_comps(item_arg);
+            let mut gave_names: Vec<String> = Vec::new();
+            {
+            let cls: Vec<Arc<Client>> = client_snapshot();
+            let mut gave = 0;
+            for t in &targets {
+                if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
+                if let Some(item) = name_to_item(item_name) {
+                    let cnt = args.iter().rev().find_map(|a| a.parse::<u8>().ok()).unwrap_or(1);
+                    gave_names.push(c.name.clone());
+                    let st: Stack = (item, cnt, comps.clone());
+                    let mut inv = c.inv.lock().unwrap();
+                    // vanilla fills hotbar (36-44) before main inv (9-35), and
+                    // merges into a matching partial stack first
+                    let slot: i16 = (36..=44i16).chain(9..=35)
+                        .find(|sl| inv.get(sl).map(|(it, cn, cc)| *it == item
+                            && *cc == comps && (*cn as i64 + cnt as i64) <= item_stack_max(item, &comps) as i64).unwrap_or(false))
+                        .or_else(|| (36..=44).chain(9..=35).find(|sl| !inv.contains_key(sl)))
+                        .unwrap_or(36);
+                    let st = if let Some(st0) = inv.get_mut(&slot) { st0.1 = st0.1.saturating_add(cnt); st0.clone() } else { inv.insert(slot, st.clone()); st };
+                    let mut p = vec![0u8]; write_varint(&mut p, 0);
+                    p.extend_from_slice(&slot.to_be_bytes());
+                    p.extend_from_slice(&slot_wire(&st));
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x15, p); }
+                    gave += 1;
+                }
+                }
+            }
+            drop(cls);
+            for n in &gave_names { adv_event(n, "inventory_changed", None); }
+            format!("Gave {} x{} to {} target(s)", item_name,
+                args.iter().rev().find_map(|a| a.parse::<u8>().ok()).unwrap_or(1), gave)
+            }
+            }
+        }
+        "enchant" => {
+            // /enchant <target> <enchantment> [level] — enchants the held item
+            let (targets, en_name) = if args.first().map(|a| a.starts_with('@')).unwrap_or(false) {
+                (resolve_selector(args[0], me), args.get(1).copied().unwrap_or(""))
+            } else {
+                let name = args.first().copied().unwrap_or("");
+                let t = { clients().lock().unwrap().iter().find(|c| c.name == name).map(|c| c.eid.to_string()) };
+                (t.into_iter().collect(), args.get(1).copied().unwrap_or(""))
+            };
+            let Some(eid) = enchant_id(en_name) else {
+                return format!("Unknown enchantment: {}", en_name)
+            };
+            let lvl = args.iter().rev().find_map(|a| a.parse::<i64>().ok()).unwrap_or(1);
+            if lvl < 1 || lvl > enchant_max_level(eid) {
+                return format!("Level {} not supported for {} (max {})", lvl, en_name, enchant_max_level(eid))
+            }
+            let mut resync: Vec<Arc<Client>> = Vec::new();
+            let mut done = 0;
+            {
+                let cls: Vec<Arc<Client>> = client_snapshot();
+                for t in &targets {
+                    let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) else { continue };
+                    let slot = 36 + *c.held.lock().unwrap();
+                    let mut inv = c.inv.lock().unwrap();
+                    let Some(st) = inv.get_mut(&slot) else { continue };
+                    if !enchant_applicable(st.0, eid) { continue }
+                    let cur = enchantments_get(&st.2);
+                    if cur.iter().any(|(o, _)| enchant_conflicts(eid, *o)) { continue }
+                    let mut list = cur; list.retain(|(x, _)| *x != eid); list.push((eid, lvl));
+                    comp_set(&mut st.2, COMP_ENCHANTMENTS, enchantments_data(&list, true));
+                    drop(inv);
+                    resync.push(c.clone()); done += 1;
+                }
+            }
+            for c in &resync { held_slot_resync(c); }
+            format!("Enchanted {} item(s)", done)
+        }
+        "item" => {
+            // /item modify|replace entity <sel> <slot> <modifier|with item>
+            //            block <x> <y> <z> <slot> ...
+            // slots (window-0 keys): weapon.mainhand, weapon.offhand,
+            // armor.head|chest|legs|feet, hotbar.N, inventory.N, container.N
+            let slot_of = |sp: &str, held: i16| -> Option<i16> {
+                Some(match sp {
+                    "weapon.mainhand" => 36 + held,
+                    "weapon.offhand" => 45,
+                    "armor.head" => 5, "armor.chest" => 6,
+                    "armor.legs" => 7, "armor.feet" => 8,
+                    _ => {
+                        {
+                            let n = sp.strip_prefix("hotbar.").or_else(|| sp.strip_prefix("inventory.")).or_else(|| sp.strip_prefix("container."))?;
+                            n.parse::<i16>().ok().map(|x| 9 + x)?
+                        }
+                    }
+                })
+            };
+            let Some(action) = args.first().copied() else { return "usage: /item modify|replace ...".into() };
+            match action {
+                "replace" => {
+                    // carpet-actor held-item fast path: replace entity
+                    // <actor> weapon.mainhand with <item> [count]
+                    if args.get(1) == Some(&"entity") && args.len() >= 6
+                        && !clients().lock().unwrap().iter().any(|c| c.name == args[2])
+                        && actors().lock().unwrap().contains_key(args[2]) {
+                        let a = actors().lock().unwrap();
+                        let a = a.get(args[2]).unwrap();
+                        let it = name_to_item(args.get(5).copied().unwrap_or("")
+                            .split('[').next().unwrap_or("")).unwrap_or(0);
+                        let cnt = args.get(6).and_then(|v| v.parse::<u8>().ok()).unwrap_or(1);
+                        *a.held.lock().unwrap() = (it, cnt, parse_item_comps(args[5]));
+                        return "ok".into();
+                    }
+                    if args.get(1) == Some(&"entity") && args.len() >= 6 {
+                        let tgts = resolve_selector(args[2], me);
+                        let (slot_sp, item_arg) = (args[3], args[5]);
+                        let cnt = args.get(6).and_then(|a| a.parse::<u8>().ok()).unwrap_or(1);
+                        let item_name = item_arg.split('[').next().unwrap_or(item_arg);
+                        let comps = parse_item_comps(item_arg);
+                        let Some(item) = name_to_item(item_name) else {
+                            return format!("Unknown item: {}", item_name)
+                        };
+                        let mut done = 0;
+                        {
+                            let cls: Vec<Arc<Client>> = client_snapshot();
+                            for t in &tgts {
+                                let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) else { continue };
+                                let Some(slot) = slot_of(slot_sp, *c.held.lock().unwrap()) else { continue };
+                                {
+                                    let mut inv = c.inv.lock().unwrap();
+                                    inv.insert(slot, (item, cnt, comps.clone()));
+                                    *c.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+                                }
+                                {   // resync the touched slot (held fast path + generic)
+                                    let mut p = vec![0u8]; write_varint(&mut p, 0);
+                                    p.extend_from_slice(&slot.to_be_bytes());
+                                    p.extend_from_slice(&slot_wire(&(item, cnt, comps.clone())));
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x15, p); }
+                                }
+                                done += 1;
+                            }
+                        }
+                        format!("Replaced item on {} target(s)", done)
+                    } else if args.get(1) == Some(&"block") && args.len() >= 8 {
+                        // item replace block x y z container.N with <item>[comps] [count]
+                        let (bx, by, bz) = (coord(args[2], ctx.x) as i32, coord(args[3], ctx.y) as i32, coord(args[4], ctx.z) as i32);
+                        let slot: i16 = args[5].strip_prefix("container.").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let item_arg = args.get(7).copied().unwrap_or("");
+                        let comps = parse_item_comps(item_arg);
+                        let item = name_to_item(item_arg.split('[').next().unwrap_or(item_arg)).unwrap_or(0);
+                        let cnt = args.get(8).and_then(|v| v.parse::<u8>().ok()).unwrap_or(1);
+                        let key = (bx, by, bz);
+                        if is_furnace_at(bx, by, bz) && slot <= 2 {
+                            let mut fs = furnaces().lock().unwrap();
+                            let f = fs.entry(ow_block(key)).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
+                            let cell = match slot { 0 => &mut f.input, 1 => &mut f.fuel, _ => &mut f.output };
+                            *cell = (item, cnt, comps); f.dirty = true;
+                        } else {
+                            unpack_block_loot_if_needed(ow_block(key));
+                            let mut ch = chests().lock().unwrap();
+                            let m = ch.entry(ContainerKey::ow(key)).or_default();
+                            if item == 0 { m.remove(&slot); } else { m.insert(slot, (item, cnt, comps)); }
+                        }
+                        format!("Replaced slot {} in block", slot)
+                    } else { "usage: /item replace entity|block ... with <item>[comps] [count]".into() }
+                }
+                "modify" => {
+                    if args.get(1) == Some(&"entity") && args.len() >= 5 {
+                        let tgts = resolve_selector(args[2], me);
+                        let (slot_sp, mod_id) = (args[3], args[4]);
+                        let fns = item_mods().lock().unwrap().get(mod_id).cloned();
+                        let Some(fns) = fns else { return format!("Unknown item modifier: {}", mod_id) };
+                        let mut done = 0;
+                        {
+                            let cls: Vec<Arc<Client>> = client_snapshot();
+                            for t in &tgts {
+                                let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) else { continue };
+                                let Some(slot) = slot_of(slot_sp, *c.held.lock().unwrap()) else { continue };
+                                let mut inv = c.inv.lock().unwrap();
+                                if let Some(st) = inv.get_mut(&slot) { apply_loot_funcs(st, &fns); done += 1; }
+                                let ns = inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+                                drop(inv);
+                                {   let mut p = vec![0u8]; write_varint(&mut p, 0);
+                                    p.extend_from_slice(&slot.to_be_bytes());
+                                    p.extend_from_slice(&slot_wire(&ns));
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x15, p); } }
+                            }
+                        }
+                        format!("Modified item on {} target(s)", done)
+                    } else if args.get(1) == Some(&"block") && args.len() >= 7 {
+                        let (bx, by, bz) = (coord(args[2], ctx.x) as i32, coord(args[3], ctx.y) as i32, coord(args[4], ctx.z) as i32);
+                        let mod_id = args[6];
+                        let fns = item_mods().lock().unwrap().get(mod_id).cloned();
+                        let Some(fns) = fns else { return format!("Unknown item modifier: {}", mod_id) };
+                        let cslot: i16 = args[5].trim_start_matches("container.").parse().unwrap_or(-1);
+                        unpack_block_loot_if_needed(ow_block((bx, by, bz)));
+                        let mut ch = chests().lock().unwrap();
+                        let ok = ch.get_mut(&ContainerKey::ow((bx, by, bz))).and_then(|m| m.get_mut(&cslot))
+                            .map(|st| { apply_loot_funcs(st, &fns); }).is_some();
+                        (if ok { "Modified item".to_string() } else { "No item in slot".to_string() }).to_string()
+                    } else { "usage: /item modify entity|block ... <modifier>".into() }
+                }
+                _ => "usage: /item modify|replace ...".into(),
+            }
+        }
+        "weather" => {
+            let w = args.first().copied().unwrap_or("clear");
+            let dur = weather_duration_ticks(args.get(1).copied());
+            let (code, ticks) = match w { "rain" => (1u8, dur), "thunder" => (1, dur), _ => (2u8, 0) };
+            RAINING.store(ticks.max(0) as u64, Ordering::Relaxed);
+            THUNDERING.store(if w == "thunder" { ticks.max(0) as u64 } else { 0 }, Ordering::Relaxed);
+            broadcast(-1, move |_c| { let mut p = vec![8u8]; p.extend_from_slice(&(if w == "thunder" { 1f32 } else { 0f32 }).to_be_bytes()); (0x22, p.clone()) });
+            broadcast(-1, move |_c| { let mut p = vec![code]; p.extend_from_slice(&ticks.to_be_bytes()); (0x22, p.clone()) });
+            format!("Weather: {}", w)
+        }
+        "function" => {
+            if let Some(name) = args.first() {
+                format!("ran {} commands", run_function(name, me.cloned(), s))
+            } else { "usage: /function <ns:name>".into() }
+        }
+        "loot" => {
+            // subset: loot spawn <x> <y> <z> loot <table> | kill <entity-type>
+            if args.first() == Some(&"spawn") && args.len() >= 6 {
+                let (lx, ly, lz) = (coord(args[1], ctx.x), coord(args[2], ctx.y), coord(args[3], ctx.z));
+                let items: Vec<Stack> = match args[4] {
+                    "loot" => {
+                        let id = args.get(5).copied().unwrap_or("");
+                        let id = if id.contains(':') { id.to_string() } else { format!("minecraft:{}", id) };
+                        match loot_tables().lock().unwrap().get(&id).map(|p| p.iter().map(|pl| LootPool { rolls: pl.rolls, chance: pl.chance, funcs: pl.funcs.clone(),
+                            entries: pl.entries.iter().map(|e| LootEntry { item: e.item, min: e.min, max: e.max, funcs: e.funcs.clone() }).collect() }).collect::<Vec<_>>()) {
+                            Some(p) => roll_loot(&p),
+                            None => return format!("Unknown loot table '{}'", args.get(5).copied().unwrap_or("")),
+                        }
+                    }
+                    "kill" => {
+                        let et = name_to_etype(args.get(5).copied().unwrap_or("").trim_start_matches("minecraft:"));
+                        match et { Some(t) => mob_loot(t, false),
+                                   None => return "usage: /loot spawn x y z loot <table>|kill <entity>".into() }
+                    }
+                    _ => return "usage: /loot spawn x y z loot <table>|kill <entity>".into(),
+                };
+                let n = items.len();
+                for (item, cnt, ic) in items {
+                    drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        x: lx, y: ly, z: lz, item, cnt, comps: ic, age: 0, target: None, thrower: None });
+                }
+                format!("Dropped {} item stack(s)", n)
+            } else { "usage: /loot spawn x y z loot <table>|kill <entity>".into() }
+        }
+        "playsound" => {
+            // /playsound <sound> [source] [targets] — sound subset
+            let snd = args.first().copied().unwrap_or("");
+            let sid = match sound_id(snd.trim_start_matches("minecraft:")) {
+                Some(i) => i, None => return format!("Unknown sound '{}'", snd) };
+            let cat = args.get(1).copied().unwrap_or("master");
+            let cat_id = match cat { "music"=>1,"record"=>2,"weather"=>3,"block"=>4,"hostile"=>5,
+                "neutral"=>6,"player"=>7,"ambient"=>8,"voice"=>9,_=>0 };
+            let targets = if args.len() > 2 { resolve_selector(args[2], me) }
+                else { me.map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
+            let mut n = 0;
+            let cls: Vec<Arc<Client>> = client_snapshot();
+            for t in &targets {
+                if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
+                    let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
+                    let mut p2 = Vec::new();
+                    write_varint(&mut p2, sid as i64 + 1); // holder: registry id
+                    write_varint(&mut p2, cat_id);
+                    p2.extend_from_slice(&((px * 8.0) as i32).to_be_bytes());
+                    p2.extend_from_slice(&((py * 8.0) as i32).to_be_bytes());
+                    p2.extend_from_slice(&((pz * 8.0) as i32).to_be_bytes());
+                    p2.extend_from_slice(&1.0f32.to_be_bytes());
+                    p2.extend_from_slice(&1.0f32.to_be_bytes());
+                    p2.extend_from_slice(&0i64.to_be_bytes()); // seed
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x68, p2); n += 1; }
+                }
+            }
+            format!("Played sound to {} player(s)", n)
+        }
+        "title" => {
+            // /title <targets> title|subtitle|actionbar|times <text|i s o>
+            let targets = resolve_selector(args.first().copied().unwrap_or(""), me);
+            let mode = args.get(1).copied().unwrap_or("title");
+            let text = args[2..].join(" ");
+            let pkt_id: i64 = match mode { "title" => 0x65, "subtitle" => 0x63, "actionbar" => 0x4c, _ => -1 };
+            if mode == "times" {
+                let (a, b, c): (i32, i32, i32) = (args.get(2).and_then(|v| v.parse().ok()).unwrap_or(10),
+                                 args.get(3).and_then(|v| v.parse().ok()).unwrap_or(70),
+                                 args.get(4).and_then(|v| v.parse().ok()).unwrap_or(20));
+                let mut p = Vec::new();
+                p.extend_from_slice(&a.to_be_bytes()); p.extend_from_slice(&b.to_be_bytes()); p.extend_from_slice(&c.to_be_bytes());
+                let mut n = 0;
+                for e in &targets {
+                    let found = clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned();
+                    if let Some(c2) = found {
+                        if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, 0x66, p.clone()); n += 1; }
+                    }
+                }
+                return format!("Set title times for {} player(s)", n);
+            }
+            if pkt_id < 0 { return "usage: /title <targets> title|subtitle|actionbar|times <text>".into() }
+            // accept raw json {"text":".."} or plain text
+            let txt = if text.starts_with('{') {
+                jstr(&text, "text").unwrap_or(&text).to_string() } else { text };
+            let payload = chat_nbt(&txt);
+            let mut n = 0;
+            for e in &targets {
+                let found = clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned();
+                    if let Some(c2) = found {
+                    if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, pkt_id, payload.clone()); n += 1; }
+                }
+            }
+            format!("Title {} to {} player(s)", mode, n)
+        }
+        "particle" => {
+            // /particle <name> [x y z [dx dy dz speed count]] — world_particles 0x29
+            let nm = args.first().copied().unwrap_or("");
+            let Some(pid) = particle_id(nm.trim_start_matches("minecraft:")) else {
+                return format!("Unknown particle '{}'", nm) };
+            let (px, py, pz) = (coord(args.get(1).copied().unwrap_or("~"), ctx.x),
+                                coord(args.get(2).copied().unwrap_or("~"), ctx.y),
+                                coord(args.get(3).copied().unwrap_or("~"), ctx.z));
+            let cnt: i32 = args.get(8).and_then(|v| v.parse().ok()).unwrap_or(10);
+            let mut p = Vec::new();
+            p.push(0); // longDistance
+            p.extend_from_slice(&px.to_be_bytes());
+            p.extend_from_slice(&py.to_be_bytes());
+            p.extend_from_slice(&pz.to_be_bytes());
+            p.extend_from_slice(&0.2f32.to_be_bytes());
+            p.extend_from_slice(&0.2f32.to_be_bytes());
+            p.extend_from_slice(&0.2f32.to_be_bytes());
+            p.extend_from_slice(&0.0f32.to_be_bytes()); // speed
+            p.extend_from_slice(&cnt.to_be_bytes());
+            write_varint(&mut p, pid as i64);
+            broadcast(-1, |_c| (0x29, p.clone()));
+            format!("Displayed {} {}", cnt, nm)
+        }
+        "trigger" => run_trigger_command(&args, me),
+        "attribute" => {
+            // /attribute <target> <attr> base get|set <v>
+            let sel = args.first().copied().unwrap_or("");
+            let aname = args.get(1).copied().unwrap_or("");
+            if attr_key_id(aname).is_none() { return format!("Unknown attribute '{}'", aname) }
+            if args.get(2).copied() != Some("base") { return "usage: /attribute <target> <attr> base get|set <v>".into() }
+            let eids = resolve_selector(sel, me);
+            let mut out = String::new();
+            for e in &eids {
+                // resolve key: player name (persistent) or mob eid (transient)
+                let key = {
+                    let cls: Vec<Arc<Client>> = client_snapshot();
+                    cls.iter().find(|c| c.eid.to_string() == *e)
+                        .map(|c| format!("p:{}", c.name))
+                        .unwrap_or_else(|| format!("e:{}", e))
+                };
+                match args.get(3).copied().unwrap_or("get") {
+                    "get" => { out += &format!("{} = {}; ", e, attr_of(&key, aname)); }
+                    "set" => {
+                        let v: f64 = args.get(4).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+                        attrs().lock().unwrap().entry(key.clone()).or_default()
+                            .insert(aname.trim_start_matches("minecraft:").to_string(), v);
+                        let eid: i32 = e.parse().unwrap_or(0);
+                        let mut m = HashMap::new();
+                        m.insert(aname.trim_start_matches("minecraft:").to_string(), v);
+                        let pk = attrs_pkt(eid, &m);
+                        // vanilla pushes attribute updates to every client tracking the entity
+                        broadcast(-1, |_c| (0x75, pk.clone()));
+                        out += &format!("{} = {}; ", e, v);
+                    }
+                    _ => return "usage: /attribute <t> <a> base get|set <v>".into(),
+                }
+            }
+            if out.is_empty() { "No entity found".into() } else { out.trim_end().into() }
+        }
+        "tellraw" => {
+            // /tellraw <targets> <json-component>
+            let targets = resolve_selector(args.first().copied().unwrap_or(""), me);
+            let payload = json_component_nbt(&args[1..].join(" "));
+            let mut n = 0;
+            for e in &targets {
+                let found = clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned();
+                if let Some(c) = found {
+                    let mut p = payload.clone(); p.push(0);
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x6c, p); n += 1; }
+                }
+            }
+            format!("Sent to {} player(s)", n)
+        }
+        "stopsound" => {
+            // /stopsound <targets> [source] [sound]
+            let targets = resolve_selector(args.first().copied().unwrap_or(""), me);
+            let snd = args.get(2).copied().unwrap_or("");
+            let mut n = 0;
+            for e in &targets {
+                let found = clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned();
+                if let Some(c) = found {
+                    let mut p = Vec::new();
+                    if snd.is_empty() { p.push(0u8); }
+                    else { p.push(2u8);
+                        let sn = if snd.contains(':') { snd.to_string() } else { format!("minecraft:{}", snd) };
+                        write_str(&mut p, &sn); }
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x6a, p); n += 1; }
+                }
+            }
+            format!("Stopped sound for {} player(s)", n)
+        }
+        "bossbar" => run_bossbar_command(&args, me),
+        "advancement" => run_advancement_command(&args, me),
+        "datapack" => run_datapack_command(&args),
+        "worldborder" => run_world_border_command(ctx, &args),
+        "scoreboard" => run_scoreboard_command(&args, me),
+        "fill" | "clone" => run_block_modification(ctx, cmd, &args).unwrap_or_else(|error| error),
+        "forceload" => {
+            // forceload add|remove <x1> <z1> [x2 z2] | query — keeps chunks ticking with no players online
+            match args.first().copied().unwrap_or("") {
+                "remove" if args.get(1) == Some(&"all") => {
+                    let mut forced = forceloaded().lock().unwrap();
+                    let removed = forced.len();
+                    forced.clear();
+                    format!("Removed {} forceloaded chunk(s)", removed)
+                }
+                "add" | "remove" if args.len() >= 3 => {
+                    let add = args[0] == "add";
+                    let (x1, z1) = (coord(args[1], ctx.x) as i32, coord(args[2], ctx.z) as i32);
+                    let (x2, z2) = if args.len() >= 5 { (coord(args[3], ctx.x) as i32, coord(args[4], ctx.z) as i32) } else { (x1, z1) };
+                    let (cx1, cx2) = (x1.div_euclid(16).min(x2.div_euclid(16)), x1.div_euclid(16).max(x2.div_euclid(16)));
+                    let (cz1, cz2) = (z1.div_euclid(16).min(z2.div_euclid(16)), z1.div_euclid(16).max(z2.div_euclid(16)));
+                    let mut f = forceloaded().lock().unwrap();
+                    let mut n = 0;
+                    for cx in cx1..=cx2 { for cz in cz1..=cz2 {
+                        if add { n += f.insert((cx, cz)) as usize } else { n += f.remove(&(cx, cz)) as usize }
+                    }}
+                    format!("Marked chunk for forceload ({} chunks)", n)
+                }
+                "query" if args.len() >= 3 => {
+                    let (x, z) = (coord(args[1], ctx.x) as i32, coord(args[2], ctx.z) as i32);
+                    let chunk = (x.div_euclid(16), z.div_euclid(16));
+                    if forceloaded().lock().unwrap().contains(&chunk) {
+                        format!("Chunk {}, {} is force loaded", chunk.0, chunk.1)
+                    } else {
+                        format!("Chunk {}, {} is not force loaded", chunk.0, chunk.1)
+                    }
+                }
+                "query" => format!("{} forceloaded chunk(s)", forceloaded().lock().unwrap().len()),
+                _ => "usage: /forceload add|remove x z [x2 z2] | query".into(),
+            }
+        }
+        "gamerule" => {
+            // gamerule <rule> [true|false|<int>] — subset wired to real systems
+            let rules: &[(&str, &AtomicU8)] = &[
+                ("keepInventory", &GR_KEEP_INVENTORY),
+                ("doDaylightCycle", &GR_DAYLIGHT_CYCLE),
+                ("doWeatherCycle", &GR_WEATHER_CYCLE),
+                ("doMobSpawning", &GR_MOB_SPAWNING),
+                ("mobGriefing", &GR_MOB_GRIEFING),
+                ("naturalRegeneration", &GR_NATURAL_REGEN),
+                ("doMobLoot", &GR_MOB_LOOT),
+            ];
+            let int_rules: &[(&str, &AtomicI32)] = &[
+                ("maxEntityCramming", &GR_MAX_ENTITY_CRAMMING),
+            ];
+            match args.first().copied() {
+                None => {
+                    let mut list: Vec<String> = rules
+                        .iter()
+                        .map(|(n, r)| format!("{}={}", n, r.load(Ordering::Relaxed) == 1))
+                        .collect();
+                    list.extend(
+                        int_rules
+                            .iter()
+                            .map(|(n, r)| format!("{}={}", n, r.load(Ordering::Relaxed))),
+                    );
+                    list.join(", ")
+                }
+                Some(name) => {
+                    if let Some((n, r)) = rules.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                        if args.len() >= 2 {
+                            let v = match args[1] {
+                                "true" => 1u8,
+                                "false" => 0,
+                                _ => return format!("usage: /gamerule {name} true|false"),
+                            };
+                            r.store(v, Ordering::Relaxed);
+                            format!("Gamerule {name} is now set to: {}", v == 1)
+                        } else {
+                            format!("{n} = {}", r.load(Ordering::Relaxed) == 1)
+                        }
+                    } else if let Some((n, r)) =
+                        int_rules.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    {
+                        if args.len() >= 2 {
+                            let Ok(v) = args[1].parse::<i32>() else {
+                                return format!("usage: /gamerule {name} <int>");
+                            };
+                            r.store(v, Ordering::Relaxed);
+                            format!("Gamerule {n} is now set to: {v}")
+                        } else {
+                            format!("{n} = {}", r.load(Ordering::Relaxed))
+                        }
+                    } else {
+                        let mut names: Vec<&str> = rules.iter().map(|r| r.0).collect();
+                        names.extend(int_rules.iter().map(|r| r.0));
+                        format!("unknown gamerule '{name}' (have: {})", names.join(", "))
+                    }
+                }
+            }
+        }
+        "tag" => {
+            // tag <target> add|remove|list <tag>
+            let sel = args.first().copied().unwrap_or("");
+            let sub = args.get(1).copied().unwrap_or("");
+            let tg = args.get(2).copied().unwrap_or("");
+            let tgts = if sel.starts_with('@') { resolve_selector(sel, me) }
+                else { clients().lock().unwrap().iter().find(|c| c.name == sel)
+                    .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
+            let tm = tags().lock().unwrap();
+            match sub {
+                "add" | "remove" if !tg.is_empty() => {
+                    let mut tm = tm; let mut n = 0;
+                    for t in &tgts {
+                        let key = if let Some(e) = t.strip_prefix("m:") { format!("e:{}", e) }
+                            else if t.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+                                && t.contains(':') { t.clone() }
+                            else { clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *t)
+                                .map(|c| format!("p:{}", c.name)).unwrap_or_default() };
+                        if key.is_empty() { continue }
+                        match sub { "add" => { tm.entry(key).or_default().insert(tg.to_string()); },
+                                    _ => { if let Some(st) = tm.get_mut(&key) { st.remove(tg); } } }
+                        n += 1;
+                    }
+                    format!("{}ed {} target(s)", if sub=="add" {"tagg"} else {"untagg"}, n)
+                }
+                "list" => {
+                    // one report per matched target: a `return` inside the loop
+                    // answered only for the first one and named the selector
+                    // (`@a`) instead of the target it was reporting.
+                    let mut lines: Vec<String> = Vec::new();
+                    for t in &tgts {
+                        let key = if let Some(e) = t.strip_prefix("m:") { format!("e:{}", e) }
+                            else { clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *t)
+                                .map(|c| format!("p:{}", c.name)).unwrap_or_default() };
+                        if key.is_empty() { continue }
+                        let who = key.strip_prefix("p:").unwrap_or(t).to_string();
+                        let st = tm.get(&key);
+                        let mut tags: Vec<String> = st.map(|s| s.iter().cloned().collect()).unwrap_or_default();
+                        tags.sort();
+                        lines.push(format!("{} has {} tag(s): {}", who,
+                            tags.len(), tags.join(", ")));
+                    }
+                    if lines.is_empty() { "no targets".into() } else { lines.join(", ") }
+                }
+                _ => "usage: /tag <target> add|remove|list [tag]".into(),
+            }
+        }
+        "damage" => {
+            // damage <target> <amount> [type] — vanilla 1.20.2+
+            let sel = args.first().copied().unwrap_or("");
+            let amt = args.get(1).and_then(|a| a.parse::<f32>().ok()).unwrap_or(0.0);
+            let tgts = if sel.starts_with('@') { resolve_selector(sel, me) }
+                else { clients().lock().unwrap().iter().find(|c| c.name == sel)
+                    .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
+            let mut n = 0;
+            let cls_snap: Vec<Arc<Client>> = client_snapshot();
+            let mut mob_hits: Vec<(i32, f32)> = Vec::new();
+            for t in &tgts {
+                if let Some(e) = t.strip_prefix("m:").and_then(|e| e.parse::<i32>().ok()) {
+                    mob_hits.push((e, amt));
+                } else if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
+                    if *c.gm.lock().unwrap() == 1 { continue }
+                    let mut h = c.hp.lock().unwrap();
+                    *h = (*h - hurt_absorb(c, dmg_after(c, amt, 0))).max(0.0); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); }
+                    let hh = *h; drop(h);
+                    damage_armor(c, amt);
+                    if let Ok(mut w) = c.sock.lock() {
+                        let _ = send_packet(&mut w, 0x24, hurt_anim(c.eid));
+                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
+                    }
+                    n += 1;
+                }
+            }
+            for (eid, amt) in mob_hits {
+                let dead = { let ms = mobs().lock().unwrap();
+                    ms.iter().find(|m| m.eid == eid).map(|m| {
+                        let mut h = m.hp.lock().unwrap(); *h -= amt; *h <= 0.0
+                    }).unwrap_or(false) };
+                let mob = mobs().lock().unwrap().iter().find(|m| m.eid == eid).cloned();
+                if let Some(m) = mob {
+                    *m.hurt_at.lock().unwrap() = Instant::now();
+                    broadcast_seen(eid, |_c| (0x24, hurt_anim(eid)));
+                    if dead {
+                        let (mx, my, mz) = { let p = m.pos.lock().unwrap(); (p.0, p.1, p.2) };
+                        let et = m.etype;
+                        kill_mob(eid, et, mx, my, mz);
+                    }
+                    n += 1;
+                }
+            }
+            format!("Applied {} damage to {} target(s)", amt, n)
+        }
+        "schedule" => {
+            // schedule function <fn> <time>[t|s|d] — t=game ticks(20/s), s=seconds
+            if args.first().copied() == Some("clear") {
+                if args.len() == 1 {
+                    let mut scheduled = sched_fns().lock().unwrap();
+                    let removed = clear_scheduled_functions(&mut scheduled, None);
+                    format!("Removed {} scheduled function(s)", removed)
+                } else if args.len() == 2 {
+                    let mut scheduled = sched_fns().lock().unwrap();
+                    let removed = clear_scheduled_functions(&mut scheduled, Some(args[1]));
+                    format!("Removed {} scheduled function(s)", removed)
+                } else {
+                    "usage: /schedule clear [<function>]".into()
+                }
+            } else if args.first().copied() == Some("function") && (args.len() == 3 || args.len() == 4) {
+                let f = args[1];
+                let off = schedule_delay_ticks(args[2]);
+                let t2 = TICK.load(Ordering::Relaxed);
+                let replace = match args.get(3).copied().unwrap_or("replace") {
+                    "append" => false,
+                    "replace" => true,
+                    _ => return "usage: /schedule function <fn> <time>[t|s|d] [append|replace]".into(),
+                };
+                let mut scheduled = sched_fns().lock().unwrap();
+                schedule_function(&mut scheduled, f, t2 + off.max(1), !replace);
+                format!("Scheduled function '{}' in {} ticks", f, { off.max(1) })
+            } else { "usage: /schedule clear [<function>] | function <fn> <time>[t|s|d] [append|replace]".into() }
+        }
+        "counts" => {
+            // debug: live entity/store census (non-vanilla, fixture aid)
+            format!("mobs={} drops={} xps={} arrows={} bobbers={} pearls={} primed={} chests={} furnaces={} signs={}",
+                mobs().lock().unwrap().len(), drops().lock().unwrap().len(),
+                xps().lock().unwrap().len(), arrows().lock().unwrap().len(),
+                bobbers().lock().unwrap().len(), pearls().lock().unwrap().len(),
+                primed().lock().unwrap().len(), chests().lock().unwrap().len(),
+                furnaces().lock().unwrap().len(), signs().lock().unwrap().len())
+                + &format!(" recipes={} tags={}", json_recipes().lock().unwrap().len(),
+                    block_tags().lock().unwrap().len())
+        }
+                "player" => {
+            // carpet-actor subset: spawn / look at / attack|use continuous / stop / kill
+            let name = args.first().copied().unwrap_or("").to_string();
+            let sub = args.get(1).copied().unwrap_or("");
+            match sub {
+                "spawn" => {
+                    let mut acts = actors().lock().unwrap();
+                    if acts.len() < 64 && !acts.contains_key(&name) {
+                        acts.insert(name.clone(), Arc::new(Actor {
+                            name: name.clone(), eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                            pos: Mutex::new((ctx.x, ctx.y, ctx.z)), look: Mutex::new(None),
+                            action: Mutex::new(""), held: Mutex::new((0, 0, Vec::new())), inv: Mutex::new(HashMap::new()),
+                        }));
+                        format!("Spawned {}", name)
+                    } else { format!("{} already spawned", name) }
+                }
+                "look" => {
+                    if let Some(a) = actors().lock().unwrap().get(&name) {
+                        *a.look.lock().unwrap() = Some((coord(args.get(3).copied().unwrap_or("~"), ctx.x) as i32,
+                            coord(args.get(4).copied().unwrap_or("~"), ctx.y) as i32,
+                            coord(args.get(5).copied().unwrap_or("~"), ctx.z) as i32));
+                        format!("{} looking", name)
+                    } else { format!("no actor {}", name) }
+                }
+                "attack" | "use" => {
+                    if let Some(a) = actors().lock().unwrap().get(&name) {
+                        *a.action.lock().unwrap() = if sub == "attack" { "attack" } else { "use" };
+                        format!("{} -> {}", name, sub)
+                    } else { format!("no actor {}", name) }
+                }
+                "stop" => { if let Some(a) = actors().lock().unwrap().get(&name) { *a.action.lock().unwrap() = ""; } format!("{} stopped", name) }
+                "kill" => { actors().lock().unwrap().remove(&name); format!("Killed {}", name) }
+                _ => format!("player: unknown subcommand {}", sub),
+            }
+        }
+        "data" => {
+            // data remove|get block x y z <path>
+            if args.get(1).copied() == Some("block") && args.len() >= 6 {
+                let (bx, by, bz) = (coord(args[2], ctx.x) as i32, coord(args[3], ctx.y) as i32, coord(args[4], ctx.z) as i32);
+                let path = args.get(5).copied().unwrap_or("");
+                match args[0] {
+                    "remove" => {
+                        if path == "Items" {
+                            chests().lock().unwrap().remove(&ContainerKey::ow((bx, by, bz)));
+                            if let Some(f) = furnaces().lock().unwrap().get_mut(&ow_block((bx, by, bz))) {
+                                f.input = (0, 0, Vec::new()); f.fuel = (0, 0, Vec::new()); f.output = (0, 0, Vec::new());
+                            }
+                        }
+                        "Removed data from block".into()
+                    }
+                    "get" => {
+                        if path == "Items" || path.is_empty() {
+                            let mut slots = if is_furnace_at(bx, by, bz) { furnace_slots((bx, by, bz)) }
+                                else { chests().lock().unwrap().get(&ContainerKey::ow((bx, by, bz))).cloned().unwrap_or_default() };
+                            let mut v: Vec<(i16, Stack)> = slots.drain().collect();
+                            v.sort_by_key(|(k, _)| *k);
+                            let items: Vec<String> = v.iter()
+                                .map(|(k, (it, c, _))| format!("{{Slot:{}b,id:{},count:{}}}", k, it, c))
+                                .collect();
+                            format!("Storage has the following contents: [Items:[{}]]", items.join(","))
+                        } else { "unsupported path (have: Items)".into() }
+                    }
+                    _ => "usage: /data get|remove block x y z Items".into(),
+                }
+            } else if args.get(1).copied() == Some("entity") && args.len() >= 4 {
+                // data get entity <selector> <path>: Pos|Health|Inventory[<...>]
+                if args[0] != "get" { return "usage: /data get entity <sel> <path>".into() }
+                let sel = args[2];
+                let path = args.get(3).copied().unwrap_or("");
+                let eids = resolve_selector(sel, me);
+                let mut out = String::new();
+                // players first
+                let cls: Vec<Arc<Client>> = client_snapshot();
+                for e in &eids {
+                    if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *e) {
+                        let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
+                        let v = match path {
+                            "Pos" => format!("[{}d,{}d,{}d]", px, py, pz),
+                            "Health" => format!("{}", *c.hp.lock().unwrap()),
+                            p if p.starts_with("Inventory") => {
+                                let inv = c.inv.lock().unwrap();
+                                let mut v: Vec<(i16,Stack)> = inv.iter().map(|(k,v)|(*k,v.clone())).collect();
+                                v.sort_by_key(|(k,_)| *k);
+                                format!("[{}]", v.iter().map(|(k,(it,c,_))| format!("{{Slot:{}b,id:{},count:{}}}",k,it,c)).collect::<Vec<_>>().join(","))
+                            }
+                            _ => format!("unsupported path '{}'", path),
+                        };
+                        out += &format!("{} has: {}; ", c.name, v);
+                    }
+                }
+                drop(cls);
+                // item drops
+                let dps = drops().lock().unwrap();
+                for e in &eids {
+                    if let Some(deid) = e.strip_prefix("d:").and_then(|x| x.parse::<i32>().ok()) {
+                        if let Some(d) = dps.iter().find(|d| d.eid == deid) {
+                            let v = match path {
+                                "Pos" => format!("[{}d,{}d,{}d]", d.x, d.y, d.z),
+                                "Item" => format!("{{id:{},count:{}}}", d.item, d.cnt),
+                                _ => format!("unsupported path '{}'", path),
+                            };
+                            out += &format!("entity {} has: {}; ", e, v);
+                        }
+                    }
+                }
+                drop(dps);
+                // mobs
+                let ms = mobs().lock().unwrap();
+                for e in &eids {
+                    let meid = e.strip_prefix("m:").unwrap_or(e);
+                    if let Some(m) = ms.iter().find(|m| m.eid.to_string() == meid) {
+                        let (px, py, pz, ..) = { let p = m.pos.lock().unwrap(); *p };
+                        let v = match path {
+                            "Pos" => format!("[{}d,{}d,{}d]", px, py, pz),
+                            "Health" => format!("{}", *m.hp.lock().unwrap()),
+                            _ => format!("unsupported path '{}'", path),
+                        };
+                        out += &format!("entity {} has: {}; ", e, v);
+                    }
+                }
+                if out.is_empty() { "No entity found".into() } else { out.trim_end().into() }
+            } else { "usage: /data get|remove block x y z Items | get entity <sel> <path>".into() }
+        }
+        "list" => {
+            let c = clients().lock().unwrap();
+            let names: Vec<String> = c.iter().map(|x| x.name.clone()).collect();
+            format!("{} players: {}", names.len(), names.join(", "))
+        }
+        "seed" => WORLD_SEED.load(Ordering::Relaxed).to_string(),
+        "" => "".into(),
+        _ => format!("Unknown command: {}", cmd),
+    };
+    if !reply.is_empty() {
+        if let Some(client) = s {
+            let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&reply));
+        } else {
+            eprintln!("[cmd] {}", reply);
+        }
+    }
+    reply
+}
+
+#[cfg(test)]
+mod security_command_tests {
+    use super::command_allowed_for_player;
+    #[test]
+    fn clients_can_run_social_and_read_only_commands() {
+        for cmd in ["help", "list"] {
+            assert!(command_allowed_for_player(cmd, &[]), "{cmd}");
+        }
+        for cmd in ["me", "msg", "tell", "w"] {
+            assert!(command_allowed_for_player(cmd, &[]), "{cmd}");
+        }
+        assert!(command_allowed_for_player("time", &["query", "daytime"]));
+        for (cmd, args) in [
+            ("stop", vec![]),
+            ("give", vec!["Steve", "diamond"]),
+            ("gamemode", vec!["creative"]),
+            ("setblock", vec!["0", "64", "0", "stone"]),
+            ("execute", vec!["run", "stop"]),
+            ("function", vec!["spine:hello"]),
+            ("time", vec!["set", "night"]),
+            ("scoreboard", vec!["players", "set"]),
+            ("seed", vec![]),
+            ("", vec![]),
+        ] {
+            assert!(!command_allowed_for_player(cmd, &args), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn privileged_commands_are_advertised_only_to_operators() {
+        let regular = super::command_tree(false);
+        let operator = super::command_tree(true);
+        for name in ["me", "msg", "tell", "w"] {
+            assert!(regular.child(name).is_some(), "{name}");
+        }
+        for name in ["kick", "setidletimeout"] {
+            assert!(regular.child(name).is_none(), "{name}");
+            assert!(operator.child(name).is_some(), "{name}");
+        }
+    }
+}

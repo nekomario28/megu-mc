@@ -775,18 +775,18 @@ check "a falling tick leaves the queue visible to a save" \
   beginning_a_falling_tick_leaves_the_queue_visible
 
 check "a save is serialized with the falling transition" \
-  src/main.rs '    let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());' \
+  src/save_v2.rs '    let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());' \
   '    let _save = ();' \
   a_save
 
 echo
 check "the falling entities are written into the save" \
-  src/main.rs '(*f).extend_from_slice(b"FAL2");' \
+  src/save_v2.rs '(*f).extend_from_slice(b"FAL2");' \
   '(*f).extend_from_slice(b"XXXX");' \
   the_falling_entities_survive_a_save_and_load_round_trip
 
 check "a migrated legacy cell is explicitly air" \
-  src/main.rs '                .insert(local_idx(fx, fy, fz), 0);' \
+  src/save_v2.rs '                .insert(local_idx(fx, fy, fz), 0);' \
   '                .insert(local_idx(fx, fy, fz), 1);' \
   a_legacy_fal1_save_converts_its_blocks_to_entities
 
@@ -806,7 +806,7 @@ check "a falling block does not move in a cold chunk" \
             }' \
   a_falling_entity_stops_moving_when_its_chunk_goes_cold
 check "a save carries the falling entities it reloads" \
-  src/main.rs '    write_varint(&mut *f, in_flight.len() as i64);' \
+  src/save_v2.rs '    write_varint(&mut *f, in_flight.len() as i64);' \
   '    write_varint(&mut *f, 0i64);' \
   a_support_placed_under_a_falling_entity_is_landed_on
 
@@ -850,12 +850,12 @@ check "a state whose metadata row cannot be matched is reported as unpaired" \
   every_wire_state_has_complete_metadata
 
 check "the client's view distance is read from its packet" \
-  src/main.rs '    let view = *p.first()? as i8 as i32;' \
+  src/play_protocol.rs '    let view = *p.first()? as i8 as i32;' \
   '    let view = *p.get(1)? as i8 as i32;' \
   client_information_carries_the_view_distance_after_the_locale
 
 check "containers must be decoded, not merely remain absent" \
-  src/main.rs 'fn load_world_from(payload: &[u8]) -> Result<(), &'"'"'static str> {' \
+  src/save_v2.rs 'fn load_world_from(payload: &[u8]) -> Result<(), &'"'"'static str> {' \
   'fn load_world_from(payload: &[u8]) -> Result<(), &'"'"'static str> { return Ok(());' \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
@@ -1150,7 +1150,7 @@ check "the queue cap cannot visit a cell before its real backoff" \
         .unwrap_or(true)' \
   a_backoff_past_the_queue_cap_waits_for_its_real_deadline
 check "a reload continues the world random stream" \
-  src/main.rs '            world_rng::restore(u64::from_be_bytes(payload[p..p + 8].try_into().unwrap()));' \
+  src/save_v2.rs '            world_rng::restore(u64::from_be_bytes(payload[p..p + 8].try_into().unwrap()));' \
   '            let _ = &payload[p..p + 8];' \
   persistence_tests::the_world_rng_stream_continues_across_a_save_and_load_round_trip
 
@@ -1165,7 +1165,7 @@ check "a footer that frames no body is refused by both of its consumers" \
   tick_persistence::tests::a_footer_that_frames_no_body_is_refused_by_both_consumers
 
 check "configuration information before known packs reaches chunk streaming" \
-  src/main.rs '                client_view = v;
+  src/play_protocol.rs '                client_view = v;
             }
             Some((0x07, _))' \
   '                let _ = v;
@@ -1174,7 +1174,7 @@ check "configuration information before known packs reaches chunk streaming" \
   tests/client_settings_wire.py 'client settings wire: FAIL config-early-window'
 
 check "configuration information after known packs reaches chunk streaming" \
-  src/main.rs '                client_view = v;
+  src/play_protocol.rs '                client_view = v;
             }
             Some((0x03, _))' \
   '                let _ = v;
@@ -1183,11 +1183,11 @@ check "configuration information after known packs reaches chunk streaming" \
   tests/client_settings_wire.py 'client settings wire: FAIL config-late-window'
 
 check "play information reaches the live chunk window" \
-  src/main.rs '                let effective = requested.clamp(2, SERVER_VIEW_DISTANCE);' \
+  src/play_protocol.rs '                let effective = requested.clamp(2, SERVER_VIEW_DISTANCE);' \
   '                let effective = view;' \
   tests/client_settings_wire.py 'client settings wire: FAIL play-view-3'
 check "breaking changes server state, not only the predicted wire update" \
-  src/main.rs '                        } else {
+  src/play_protocol.rs '                        } else {
                             set_block_dim(dim, x, y, z, 0);
                         }
                         #[cfg(not(feature = "neoforge-events"))]
@@ -1197,7 +1197,7 @@ check "breaking changes server state, not only the predicted wire update" \
                         note_block_update_dim(dim, x, y, z, 0);' \
   tests/gameplay_wire.py 'gameplay wire: FAIL fresh-reader-block'
 check "chat returns the actual sender and message" \
-  src/main.rs '                    let line = format!("<{}> {}", me.name, m);' \
+  src/play_protocol.rs '                    let line = format!("<{}> {}", me.name, m);' \
   '                    let line = format!("<{}> {}", me.name, "");' \
   tests/gameplay_wire.py 'gameplay wire: FAIL chat-echo'
 
@@ -1307,32 +1307,32 @@ check "a WG heightmap read is the carved top, not the uncarved terrain" \
   feature::generation_contract_tests::wg_heightmap_keeps_the_carved_top_and_ignores_the_feature_layer
 
 check "the projectile sweep retains start-inside contact" \
-  src/main.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
+  src/combat_and_health.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
   '    bounds.clip(start, end).is_some()' \
   the_projectile_sweep_covers_the_whole_tick
 
 check "an arrow hits the target it crosses on its first tick" \
-  src/main.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
+  src/combat_and_health.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
   '    bounds.clip(start, end).is_some()' \
   the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside
 
 check "a container transfer fills only the room in a matching stack" \
-  src/main.rs '    let moved = amount.min(source.1).min(room);' \
+  src/menus_and_items.rs '    let moved = amount.min(source.1).min(room);' \
   '    let moved = amount.min(source.1).min(room).min(0);' \
   container_transfers_match_real_1_21_1_classes
 
 check "a chest quick move searches the player inventory in reverse" \
-  src/main.rs '            let rem = move_to_slots(inv, (9..=44).rev(), st);' \
+  src/menus_and_items.rs '            let rem = move_to_slots(inv, (9..=44).rev(), st);' \
   '            let rem = move_to_slots(inv, 9..=44, st);' \
   container_transfers_match_real_1_21_1_classes
 
 check "a chest item reaches the placement path" \
-  src/main.rs '        299 => 2955,' \
+  src/menus_and_items.rs '        299 => 2955,' \
   '        299 => return None,' \
   container_chest_item_reaches_the_placed_default_state
 
 check "the real chest click dispatch preserves the mouse button" \
-  src/main.rs '                                    click_slot(gmap, &mut cur, gslot, btn as i8);' \
+  src/play_protocol.rs '                                    click_slot(gmap, &mut cur, gslot, btn as i8);' \
   '                                    click_slot(gmap, &mut cur, gslot, 0);' \
   tests/container_wire.py 'containers wire: FAIL chest-half-pickup'
 
@@ -1352,7 +1352,7 @@ check "a chest state change does not destroy the container" \
   a_chest_state_change_keeps_its_contents
 
 check "a chest pairs only with a chest of its own kind" \
-  src/main.rs '    let st = block_at(pos.0, pos.1, pos.2);
+  src/menus_and_items.rs '    let st = block_at(pos.0, pos.1, pos.2);
     if breg()?.name_of(st) != name {
         return None;
     }
@@ -1362,7 +1362,7 @@ check "a chest pairs only with a chest of its own kind" \
   chest_placement_pairs_only_with_a_matching_single_chest
 
 check "breaking one half reverts the survivor to single" \
-  src/main.rs '    if chest_connected_direction(own)? == dir {
+  src/menus_and_items.rs '    if chest_connected_direction(own)? == dir {
         return Some(reg.with_prop(own, "type", "single"));
     }' \
   '    if chest_connected_direction(own)? == dir.opposite() {
@@ -1371,7 +1371,7 @@ check "breaking one half reverts the survivor to single" \
   breaking_a_half_reverts_the_survivor_to_single
 
 check "the combined container puts the right half in slots 0..=26" \
-  src/main.rs '    match own {
+  src/menus_and_items.rs '    match own {
         "right" => Some((pos, other)),
         _ => Some((other, pos)),
     }' \
@@ -1382,12 +1382,12 @@ check "the combined container puts the right half in slots 0..=26" \
   a_double_chest_window_opens_right_half_first
 
 check "the lid broadcast carries the new opener count" \
-  src/main.rs '            broadcast_block_event(audience, pos, 1, now as u8);' \
+  src/menus_and_items.rs '            broadcast_block_event(audience, pos, 1, now as u8);' \
   '            broadcast_block_event(audience, pos, 1, previous as u8);' \
   two_viewers_move_the_opener_count_and_broadcast_it
 
 check "a removed container closes its window on windowId 1" \
-  src/main.rs '        if had {
+  src/menus_and_items.rs '        if had {
             *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         if had {
@@ -1406,36 +1406,36 @@ check "a removed container closes its window on windowId 1" \
   a_removed_container_closes_the_window_built_on_it
 
 check "a block container stops existing when its block does" \
-  src/main.rs '            is_ender_key((pos.1, pos.2, pos.3))
+  src/menus_and_items.rs '            is_ender_key((pos.1, pos.2, pos.3))
                 || container_kind(block_at_dim(pos.0, pos.1, pos.2, pos.3)).is_some()' \
   '            true' \
   breaking_a_chest_drops_each_stack_once_and_leaves_no_entry
 
 # Inventory pickup: prove the native loop AND its actual tick caller.
 check "pickup drains beyond the first partially filled slot" \
-  src/main.rs '        if source.1 == 0 || source.1 == before {' \
+  src/menus_and_items.rs '        if source.1 == 0 || source.1 == before {' \
   '        if true {' \
   pickup_inventory_matches_real_1_21_1_classes
 
 check "the pickup tick forwards the selected hotbar slot" \
-  src/main.rs '            let accepted = pickup_into_inventory(&mut inv, selected, creative, &mut source);' \
+  src/menus_and_items.rs '            let accepted = pickup_into_inventory(&mut inv, selected, creative, &mut source);' \
   '            let accepted = pickup_into_inventory(&mut inv, 0, creative, &mut source);' \
   pickup_tick_drains_across_selected_offhand_then_hotbar
 
 check "partial insertion is not a successful ItemEntity take callback" \
-  src/main.rs '        if accepted {
+  src/menus_and_items.rs '        if accepted {
             broadcast_seen(deid, |_c| (0x6f, collect_pkt(deid, c.eid, original)));' \
   '        if original > 0 {
             broadcast_seen(deid, |_c| (0x6f, collect_pkt(deid, c.eid, original)));' \
   pickup_tick_keeps_the_partial_entity_without_a_take_event
 
 check "a full nearby player does not monopolize the drop" \
-  src/main.rs '                    taken.push((*d_eid, c.clone()));' \
+  src/menus_and_items.rs '                    taken.push((*d_eid, c.clone()));' \
   '                    taken.push((*d_eid, c.clone())); break;' \
   pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack
 
 check "the pickup tick forwards infinite materials to inventory insertion" \
-  src/main.rs '    for (deid, c) in taken {
+  src/menus_and_items.rs '    for (deid, c) in taken {
         let selected = *c.held.lock().unwrap();
         let creative = *c.gm.lock().unwrap() == 1;' \
   '    for (deid, c) in taken {
@@ -1444,7 +1444,7 @@ check "the pickup tick forwards infinite materials to inventory insertion" \
   pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack
 
 check "a real client observes the pickup delay the actor path already enforced" \
-  src/main.rs '            if !d.pickup_delay_elapsed() {
+  src/menus_and_items.rs '            if !d.pickup_delay_elapsed() {
                 continue;
             }
             let mut source = (d.item, d.cnt, d.comps.clone());' \
@@ -1452,17 +1452,17 @@ check "a real client observes the pickup delay the actor path already enforced" 
   pickup_tick_refuses_a_drop_inside_its_pickup_delay
 
 check "a targeted drop refuses a closer non-target player" \
-  src/main.rs '            (Some(owner), Some(uuid)) => owner == uuid,' \
+  src/menus_and_items.rs '            (Some(owner), Some(uuid)) => owner == uuid,' \
   '            (Some(_owner), Some(_uuid)) => true,' \
   pickup_tick_enforces_target_uuid_over_closer_non_target
 
 check "spectator and dead players do not pick up drops" \
-  src/main.rs '        if spectator || !alive {' \
+  src/menus_and_items.rs '        if spectator || !alive {' \
   '        if false && (spectator || !alive) {' \
   pickup_tick_excludes_spectator_and_dead_players
 
 check "player pickup uses the 1.21.1 inflated touch AABB" \
-  src/main.rs '    player_bounding_box(x, y, z, sneaking, fall_fly).inflate(1.0, 0.5, 1.0)' \
+  src/menus_and_items.rs '    player_bounding_box(x, y, z, sneaking, fall_fly).inflate(1.0, 0.5, 1.0)' \
   '    player_bounding_box(x, y, z, sneaking, fall_fly)' \
   pickup_tick_matches_1_21_1_player_touch_aabb_boundaries
 
@@ -1501,27 +1501,27 @@ check "a surface sequence cannot silently discard an undecoded child" \
 
 # Entity angle bytes: different constructors intentionally have different policies.
 check "entity angles narrow through int before wrapping to a byte" \
-  src/main.rs '    value as i8 // Java int -> byte wraps; a direct Rust float -> i8 saturates.' \
+  src/play_protocol.rs '    value as i8 // Java int -> byte wraps; a direct Rust float -> i8 saturates.' \
   '    scaled as i8 // broken: saturation instead of byte wrapping' \
   entity_angles_head_update_matches_native_floor
 
 check "entity head updates use floor rather than truncation" \
-  src/main.rs '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Floor)' \
+  src/play_protocol.rs '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Floor)' \
   '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Truncate)' \
   entity_angles_head_update_matches_native_floor
 
 check "entity rotations multiply before division even at subnormal inputs" \
-  src/main.rs '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Floor)' \
+  src/play_protocol.rs '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Floor)' \
   '    angle_byte(f64::from(deg / 360.0 * 256.0), AngleRounding::Floor)' \
   entity_angles_head_update_matches_native_floor
 
 check "entity teleports truncate rather than sharing spawn rounding" \
-  src/main.rs '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Truncate)' \
+  src/play_protocol.rs '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Truncate)' \
   '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Floor)' \
   entity_angles_teleport_matches_native_constructor
 
 check "entity spawn head angles keep the constructor double precision" \
-  src/main.rs '        angle_byte(f64::from(yaw) * 256.0 / 360.0, AngleRounding::Floor) as u8,' \
+  src/play_protocol.rs '        angle_byte(f64::from(yaw) * 256.0 / 360.0, AngleRounding::Floor) as u8,' \
   '        angle(yaw) as u8,' \
   entity_angles_spawn_matches_native_constructors
 
@@ -1552,22 +1552,22 @@ check "NBT astral scalars retain both UTF-16 surrogates" \
   primitives_nbt_writers_match_native_modified_utf8
 
 check "lore append preserves opaque modified UTF-8 bytes" \
-  src/main.rs '                            elems.push(d[p..end].to_vec());' \
+  src/commands_core.rs '                            elems.push(d[p..end].to_vec());' \
   '                            elems.push(nbt_string(&String::from_utf8_lossy(&d[p + 3..end])));' \
   primitives_nbt_lore_append_preserves_java_string_bytes
 
 check "AABB clip excludes the finite segment endpoint" \
-  src/main.rs '                && t < nearest' \
+  src/combat_and_health.rs '                && t < nearest' \
   '                && t <= nearest' \
   primitives_aabb_clip_matches_native_finite_segments
 
 check "AABB clip keeps the pinned epsilon" \
-  src/main.rs '        const EPSILON: f64 = 1.0e-7;' \
+  src/combat_and_health.rs '        const EPSILON: f64 = 1.0e-7;' \
   '        const EPSILON: f64 = 0.0;' \
   primitives_aabb_clip_matches_native_finite_segments
 
 check "arrow tick uses the continuous segment rather than just its end" \
-  src/main.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
+  src/combat_and_health.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
   '    bounds.contains(end)' \
   primitives_arrow_tick_hits_between_the_old_samples
 
@@ -1935,15 +1935,15 @@ check "fluid handoff does not consume the ordinary runtime counter" \
   tick_tests::generated_fluid_handoff_matches_native_proto_unpack
 
 check "a sign message is a JSON string component" \
-  src/main.rs "    o.push('\"');" "    o.push(' ');" \
+  src/play_protocol.rs "    o.push('\"');" "    o.push(' ');" \
   sign_side_nbt_matches_the_shape_the_game_writes
 
 check "a sign side carries filtered_messages" \
-  src/main.rs '    for list in ["filtered_messages", "messages"] {' '    for list in ["messages"] {' \
+  src/play_protocol.rs '    for list in ["filtered_messages", "messages"] {' '    for list in ["messages"] {' \
   sign_side_nbt_matches_the_shape_the_game_writes
 
 check "the open window reads the live store, not a copy" \
-  src/main.rs '    let ch = all.get(&first).cloned().unwrap_or_default();' '    let ch: HashMap<i16, Stack> = HashMap::new();' \
+  src/menus_and_items.rs '    let ch = all.get(&first).cloned().unwrap_or_default();' '    let ch: HashMap<i16, Stack> = HashMap::new();' \
   a_placed_chest_shows_its_staged_contents_in_the_open_window
 
 check "staged containers reach the live store" \
@@ -2071,7 +2071,7 @@ check "a jungle temple dispenser is staged as a dispenser, not a chest" \
   single_piece_container_loot_is_staged_and_archaeology_is_not
 
 check "a small container rolls only into its own slots" \
-  src/main.rs '                                        ContainerKind::BlockContainer(size) => {
+  src/menus_and_items.rs '                                        ContainerKind::BlockContainer(size) => {
                                             i16::from(size)
                                         }' '                                        ContainerKind::BlockContainer(_) => 27i16,' \
   container_loot_roll_stays_inside_the_block_its_table_came_from
@@ -2312,7 +2312,7 @@ check "template placement passes decorative block entities through without stagi
   structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
 
 check "template loot container materialization rolls mineshaft cart loot" \
-  src/main.rs 'if loot_table == "minecraft:chests/abandoned_mineshaft" {' \
+  src/menus_and_items.rs 'if loot_table == "minecraft:chests/abandoned_mineshaft" {' \
   'if false {' \
   structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
 
@@ -2672,15 +2672,15 @@ check "structure types own independent native reference containers" \
   mineshaft::tests::native_reference_containers_do_not_share_capacity_between_types
 
 check "generated objects are serialized before scheduled ticks" \
-  src/main.rs '    generated.append(f);' '    let _ = &generated;' \
+  src/save_v2.rs '    generated.append(f);' '    let _ = &generated;' \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "generated object source claims survive restart" \
-  src/main.rs '            g.payload_sources = generated.sources;' '            g.payload_sources.clear();' \
+  src/save_v2.rs '            g.payload_sources = generated.sources;' '            g.payload_sources.clear();' \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "mineshaft one-shot piece flags survive restart" \
-  src/main.rs '            g.mineshaft_spawners = generated.spider_flags;' '            g.mineshaft_spawners.clear();' \
+  src/save_v2.rs '            g.mineshaft_spawners = generated.spider_flags;' '            g.mineshaft_spawners.clear();' \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "regenerating cached blocks cannot recreate generated entities" \
@@ -2688,7 +2688,7 @@ check "regenerating cached blocks cannot recreate generated entities" \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "generated chest minecarts reach the actual entity tracker" \
-  src/main.rs '    for cart in generated_content().lock().unwrap().carts.iter() {' '    for cart in Vec::<generated_content::Cart>::new().iter() {' \
+  src/play_protocol.rs '    for cart in generated_content().lock().unwrap().carts.iter() {' '    for cart in Vec::<generated_content::Cart>::new().iter() {' \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "generated spawner packets use the native registry type" \
@@ -2722,7 +2722,7 @@ check "deferred cart loot unpacks its seeded abandoned_mineshaft table" \
   mineshaft_runtime_tests::cart_deferred_loot_window_click_persistence_and_break_over_packets
 
 check "unpacked empty chest minecarts persist their empty container without re-rolling" \
-  src/main.rs '                        fields.insert(crate::nbt::NbtString::text("Items"), stacks_to_items_nbt(&slots));' \
+  src/save_v2.rs '                        fields.insert(crate::nbt::NbtString::text("Items"), stacks_to_items_nbt(&slots));' \
   '                        if !slots.is_empty() { fields.insert(crate::nbt::NbtString::text("Items"), stacks_to_items_nbt(&slots)); }' \
   mineshaft_runtime_tests::cart_deferred_loot_window_click_persistence_and_break_over_packets
 
@@ -3314,7 +3314,7 @@ check "a suggestion answer keeps start and length in their own fields" \
 # against a verbatim copy of the full pairwise scan, and a bucket that quietly loses a
 # neighbour - or that keeps the wrong one of two equally old orbs - must go red there.
 check "an xp orb merge searches the whole 26-cell neighbourhood, not just upward" \
-  src/main.rs '        for dx in -1..=1i32 {
+  src/combat_and_health.rs '        for dx in -1..=1i32 {
             for dy in -1..=1i32 {
                 for dz in -1..=1i32 {
                     let key = (
@@ -3327,7 +3327,7 @@ check "an xp orb merge searches the whole 26-cell neighbourhood, not just upward
   merge_tests::xp_merge_absorbs_exactly_what_the_full_pairwise_scan_absorbs
 
 check "two equally old xp orbs keep the lower index" \
-  src/main.rs '                let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
+  src/combat_and_health.rs '                let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
                 xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);' \
   '                let (keep, eat) = if aage < bage { (i, j) } else { (j, i) };
                 xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);' \
@@ -3507,17 +3507,17 @@ check "entity_fluid_eye_immersion_respects_pose_and_surface" \
 # Chest world-side contract (M2 Gameplay Slice 3c):
 # `ChestBlock.isChestBlockedAt` on both halves, multi-viewer `broadcastChanges`, and `recheckOpeners`.
 check "chest_contract_double_chest_blocks_when_either_half_blocked" \
-  src/main.rs '        .any(is_chest_blocked_at)' \
+  src/menus_and_items.rs '        .any(is_chest_blocked_at)' \
   '        .all(is_chest_blocked_at)' \
   tick_tests::chest_contract_blocked_single_double_cat_and_unblocked_barrel
 
 check "chest_contract_broadcast_changes_diffs_both_halves" \
-  src/main.rs '                if sync.last_slots[idx] != *stack {' \
+  src/menus_and_items.rs '                if sync.last_slots[idx] != *stack {' \
   '                if idx < 27 && sync.last_slots[idx] != *stack {' \
   tick_tests::chest_contract_multi_viewer_broadcast_changes
 
 check "chest_contract_recheck_openers_enforces_reach" \
-  src/main.rs '        if !chest_still_valid(c, win, anchor) {' \
+  src/menus_and_items.rs '        if !chest_still_valid(c, win, anchor) {' \
   '        if !window_live(win) {' \
   tick_tests::chest_contract_recheck_openers_reach_and_lid_close
 
@@ -3626,7 +3626,7 @@ check "chest_contract_3d_block_loot_lazy_defers_materialization" \
   tick_tests::chest_contract_3d_block_loot_stays_lazy_until_first_open
 
 check "chest_contract_3d_block_loot_spectator_gate_unpacks_for_viewers" \
-  src/main.rs '    if !me.is_spectator() {
+  src/menus_and_items.rs '    if !me.is_spectator() {
         unpack_window_loot_if_needed(window);
     }
     let initial = chest_window_slots(window);' \
@@ -3637,7 +3637,7 @@ check "chest_contract_3d_block_loot_spectator_gate_unpacks_for_viewers" \
   tick_tests::chest_contract_3d_block_loot_stays_lazy_until_first_open
 
 check "chest_contract_3d_barrel_toggles_open_without_lid_event" \
-  src/main.rs '            if let Some(reg) = breg().filter(|reg| reg.name_of(st) == "minecraft:barrel") {' \
+  src/menus_and_items.rs '            if let Some(reg) = breg().filter(|reg| reg.name_of(st) == "minecraft:barrel") {' \
   '            if let Some(reg) = breg().filter(|_| false) {' \
   tick_tests::chest_contract_3d_barrel_toggles_open_property_without_block_event
 
@@ -3653,7 +3653,7 @@ check "chest_contract_3d_dry_chest_is_solid_for_fluid" \
   tick_tests::chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_partner_error
 
 check "chest_contract_3d_ender_chest_counts_anchor_openers" \
-  src/main.rs '            if matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {' \
+  src/menus_and_items.rs '            if matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {' \
   '            if false && matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {' \
   tick_tests::chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break
 
@@ -3774,28 +3774,28 @@ check "p2_3_s2a_a_miss_reads_the_dimensions_own_generator" \
 # A companion file's table must load into its own dimension. Read into the Overworld's key, a Nether
 # save restores nothing in the Nether and overwrites the Overworld chunk of the same coordinate.
 check "p2_3_s2a_a_companion_table_loads_into_its_own_dimension" \
-  src/main.rs '        let mut c = w.as_mut().map(|world| world.entry((dim, cx, cz)).or_default());' \
+  src/save_v2.rs '        let mut c = w.as_mut().map(|world| world.entry((dim, cx, cz)).or_default());' \
   '        let mut c = w.as_mut().map(|world| world.entry((DimId::Overworld, cx, cz)).or_default());' \
   persistence_tests::p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip
 
 # P2-3-S2c: the legacy sign section must hold the Overworld's signs only. Dropping the filter puts
 # Nether and End signs in the legacy bytes, so a non-Overworld edit shifts the Overworld save.
 check "p2_3_s2c_legacy_sign_section_is_overworld_only" \
-  src/main.rs 'let ow_signs: Vec<_> = sg.iter().filter(|(k, _)| k.0 == DimId::Overworld).collect();' \
+  src/save_v2.rs 'let ow_signs: Vec<_> = sg.iter().filter(|(k, _)| k.0 == DimId::Overworld).collect();' \
   'let ow_signs: Vec<_> = sg.iter().collect();' \
   persistence_tests::p2_3_s2c_signs_stay_isolated_per_dimension_and_round_trip
 
 # The footer must fail closed on a dimension tag it does not know. Mapping unknown bytes to the
 # Overworld would silently relocate a sign or a player from a dimension this build cannot name.
 check "p2_3_s2_dim_footer_rejects_unknown_dimension" \
-  src/main.rs 'DimId::from_index(b as usize).ok_or("invalid dimension tag")' \
+  src/save_v2.rs 'DimId::from_index(b as usize).ok_or("invalid dimension tag")' \
   'Ok(DimId::from_index(b as usize).unwrap_or(DimId::Overworld))' \
   persistence_tests::p2_3_s2_dim_footer_rejects_unknown_dimension_and_truncation
 
 # P2-3-S2d: a player's saved dimension comes from the footer. Writing Overworld there makes a
 # Nether or End login point at the Overworld after reload.
 check "p2_3_s2d_footer_carries_the_players_real_dimension" \
-  src/main.rs 'dim_players.push((name.clone(), dim));' \
+  src/save_v2.rs 'dim_players.push((name.clone(), dim));' \
   'dim_players.push((name.clone(), DimId::Overworld));' \
   persistence_tests::p2_3_s2d_pos_store_preserves_dimension_and_defaults_legacy_to_overworld
 
@@ -3803,21 +3803,21 @@ check "p2_3_s2d_footer_carries_the_players_real_dimension" \
 # puts Nether and End chests in the old wire layout, shifting the Overworld-only bytes and leaving
 # DIM2 without the chests that should have gone there.
 check "p2_3_s2b_legacy_chest_section_is_overworld_only" \
-  src/main.rs 'ContainerKey::Block((DimId::Overworld, x, y, z)) => Some(((*x, *y, *z), slots)),' \
+  src/save_v2.rs 'ContainerKey::Block((DimId::Overworld, x, y, z)) => Some(((*x, *y, *z), slots)),' \
   'ContainerKey::Block((_, x, y, z)) => Some(((*x, *y, *z), slots)),' \
   persistence_tests::p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overworld
 
 # A footer entry whose dimension byte names no known dimension must fail closed. Mapping it to a
 # real dimension instead relocates the entry and hides the corrupt tag.
 check "p2_3_s2b_dim2_footer_rejects_unknown_dimension" \
-  src/main.rs 'let dim = DimId::from_index(b as usize).ok_or("invalid DIM2 dimension tag")?;' \
+  src/save_v2.rs 'let dim = DimId::from_index(b as usize).ok_or("invalid DIM2 dimension tag")?;' \
   'let dim = DimId::from_index(b as usize).unwrap_or(DimId::End);' \
   persistence_tests::p2_3_s2b_dim2_footer_rejects_unknown_dimension_and_truncation
 
 # DIM2 furnaces must restore into the dimension they were saved from. Filing them under Overworld
 # both loses the Nether/End state and overwrites the Overworld furnace at the same coordinate.
 check "p2_3_s2b_dim2_furnace_loads_into_its_own_dimension" \
-  src/main.rs '            for (pos, fr) in dim2.furnaces {
+  src/save_v2.rs '            for (pos, fr) in dim2.furnaces {
                 fs.insert(pos, fr);
             }' \
   '            for (pos, fr) in dim2.furnaces {
@@ -3865,39 +3865,39 @@ check "p2_3_s3_band_cache_is_keyed_by_dimension" \
 # chunk window, the block-delta audience and the persisted position. Each mutant below
 # breaks one of those links and leaves the rest of the Overworld path identical.
 check "p2_3_s4_wire_id_is_the_registry_id" \
-  src/main.rs '    dim_type_wire_ids()[dim.index()]' \
+  src/play_protocol.rs '    dim_type_wire_ids()[dim.index()]' \
   '    dim.index() as i32' \
   tick_tests::p2_3_s4_dimension_type_wire_ids_come_from_the_pinned_registry
 
 check "p2_3_s4_join_game_declares_every_dimension" \
-  src/main.rs '    write_varint(&mut p, 3);
+  src/play_protocol.rs '    write_varint(&mut p, 3);
     for d in DimId::ALL {' \
   '    write_varint(&mut p, 1);
     for d in DimId::ALL {' \
   tick_tests::p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim
 
 check "p2_3_s4_spawn_info_uses_wire_id" \
-  src/main.rs '    write_varint(&mut p, dim_type_wire_id(dim) as i64);' \
+  src/play_protocol.rs '    write_varint(&mut p, dim_type_wire_id(dim) as i64);' \
   '    write_varint(&mut p, dim.index() as i64);' \
   tick_tests::p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim
 
 check "p2_3_s4_switch_clears_the_old_window" \
-  src/main.rs '        me.chunks.lock().unwrap().clear();' \
+  src/play_protocol.rs '        me.chunks.lock().unwrap().clear();' \
   '        me.chunks.lock().unwrap().insert((9999, 9999));' \
   tick_tests::p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_position
 
 check "p2_3_s4_respawn_names_the_destination" \
-  src/main.rs '    let mut rp = spawn_info_dim(new_dim, gm);' \
+  src/play_protocol.rs '    let mut rp = spawn_info_dim(new_dim, gm);' \
   '    let mut rp = spawn_info_dim(DimId::Overworld, gm);' \
   tick_tests::p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_position
 
 check "p2_3_s4_portal_horizontal_scaling" \
-  src/main.rs '        (DimId::Nether, bx as f64 / 8.0, bz as f64 / 8.0)' \
+  src/play_protocol.rs '        (DimId::Nether, bx as f64 / 8.0, bz as f64 / 8.0)' \
   '        (DimId::Nether, bx as f64, bz as f64)' \
   tick_tests::p2_3_s4_portal_scaling_clamps_y_and_the_arrival_guard_blocks_bounce
 
 check "p2_3_s4_logout_saves_the_live_dimension" \
-  src/main.rs '    let dim = c.dim.lock().unwrap();
+  src/save_v2.rs '    let dim = c.dim.lock().unwrap();
     let p = *c.pos.lock().unwrap();
     (*dim, p.0, p.1, p.2, p.3, p.4)' \
   '    let _dim = c.dim.lock().unwrap();
@@ -3906,7 +3906,7 @@ check "p2_3_s4_logout_saves_the_live_dimension" \
   tick_tests::p2_3_s4_logout_persists_the_clients_live_dimension
 
 check "p2_3_s4_chunk_deltas_respect_the_dimension_filter" \
-  src/main.rs '        if *client.dim.lock().unwrap() != dim {
+  src/play_protocol.rs '        if *client.dim.lock().unwrap() != dim {
             continue;
         }
         let (id, packet) = mk(client);' \
@@ -3916,7 +3916,7 @@ check "p2_3_s4_chunk_deltas_respect_the_dimension_filter" \
 # The same filter, observed end-to-end with two live clients on the wire. This gate is not
 # selected by MUTATION_FILTER=p2_3_s4 (its filter names the script), but the full campaign runs it.
 check "p2_3_s4_block_deltas_are_dimension_scoped" \
-  src/main.rs '        if *client.dim.lock().unwrap() != dim {
+  src/play_protocol.rs '        if *client.dim.lock().unwrap() != dim {
             continue;
         }
         let (id, packet) = mk(client);' \

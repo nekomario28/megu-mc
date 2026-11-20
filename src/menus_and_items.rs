@@ -1,0 +1,6929 @@
+/// Unified key for chests/barrels/hoppers/dispensers and chest-minecarts.
+///
+/// A block container names its dimension: a Nether chest and an Overworld chest at the same
+/// coordinates are different block entities. A minecart keeps its UUID (the same cart is the
+/// same cart in every dimension). Ender-chest storage is the one exception to the block rule:
+/// it is per-player and cross-dimension in vanilla, so `ender_container_key` always files it
+/// under the Overworld even when the chest was opened in the Nether or the End.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ContainerKey {
+    Block(DimBlockPos),
+    Cart([u8; 16]),
+}
+impl ContainerKey {
+    /// The Overworld block key every dimension-less caller means until S3 threads a dimension
+    /// through it.
+    fn ow(pos: BlockPos) -> Self {
+        ContainerKey::Block(ow_block(pos))
+    }
+}
+
+/// A smelting recipe from a datapack: ingredient, result, count, experience.
+type SmeltRecipe = (Ingr, i64, u8, f32);
+
+#[derive(Clone, Debug)]
+struct ChestSyncState {
+    window: (ContainerKey, Option<ContainerKey>),
+    anchor: Option<BlockPos>,
+    state_id: i32,
+    last_slots: Vec<Stack>,
+}
+
+/// 1.21.1 `Player.aiStep()` (`cmx.m_()`): `player.getBoundingBox().inflate(1.0, 0.5, 1.0)`.
+/// `Player` (`cmx.<clinit>`) has `0.6f x 1.8f` standing, `0.6f x 1.5f` crouching,
+/// `0.6f x 0.6f` fall-flying.
+fn player_touch_aabb(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> EntityAabb {
+    player_bounding_box(x, y, z, sneaking, fall_fly).inflate(1.0, 0.5, 1.0)
+}
+
+// ---------- item drops ----------
+// item stack components: (type_id, serialized_data) — vanilla 1.21.1
+// structured components (SlotComponent). data is the pre-encoded payload.
+type Comps = Vec<(i64, Vec<u8>)>;
+type Stack = (i64, u8, Comps);
+// component type ids (SlotComponentType mapper)
+#[allow(dead_code)]
+const COMP_CUSTOM_DATA: i64 = 0;
+const COMP_MAX_DAMAGE: i64 = 2;
+const COMP_DAMAGE: i64 = 3;
+const COMP_UNBREAKABLE: i64 = 4;
+const COMP_CUSTOM_NAME: i64 = 5;
+const COMP_LORE: i64 = 7;
+const COMP_ENCHANTMENTS: i64 = 9;
+const COMP_STORED_ENCHANTMENTS: i64 = 23;
+// max stack size: explicit component wins, else vanilla defaults
+// (1.21.1 minecraft-data: unstackable ids and the 16-stack ids)
+fn item_stack_max(item: i64, comps: &Comps) -> i64 {
+    if let Some(n) = comp_varint(comps, 1) {
+        return n.clamp(1, 99);
+    }
+    // A block's item stacks to what the asset says the block stacks to. The ranges
+    // below cover only items that place no block, so they are reached for tools,
+    // buckets, potions and the like.
+    if let Some(st) = item_to_state(item) {
+        if let Some(reg) = crate::block_registry::breg() {
+            return reg.stack_size_of(st);
+        }
+    }
+    if matches!(item,
+        522..=538 | 765..=791 | 794 | 797..=798 | 801 | 818..=847 | 849
+        | 856..=879 | 909..=911 | 914..=920 | 930..=931 | 933 | 963..=979
+        | 983 | 998 | 1091 | 1093 | 1114 | 1120 | 1124..=1127 | 1130
+        | 1156 | 1158 | 1161..=1163 | 1166..=1186 | 1188 | 1192..=1193
+        | 1195..=1203 | 1268)
+    {
+        1
+    } else if matches!(item,
+        886..=908 | 912 | 927 | 993 | 1092 | 1123 | 1133..=1148 | 1224)
+    {
+        16
+    } else {
+        64
+    }
+}
+fn stack_max_of(st: &Stack) -> i64 {
+    item_stack_max(st.0, &st.2)
+}
+fn comp_get(c: &Comps, ty: i64) -> Option<&[u8]> {
+    c.iter().find(|(t, _)| *t == ty).map(|(_, d)| d.as_slice())
+}
+fn comp_set(c: &mut Comps, ty: i64, data: Vec<u8>) {
+    if let Some(e) = c.iter_mut().find(|(t, _)| *t == ty) {
+        e.1 = data;
+    } else {
+        c.push((ty, data));
+    }
+}
+fn comp_varint(c: &Comps, ty: i64) -> Option<i64> {
+    comp_get(c, ty).map(|d| read_varint_at(d, 0).0)
+}
+fn comp_set_varint(c: &mut Comps, ty: i64, v: i64) {
+    let mut d = Vec::new();
+    write_varint(&mut d, v);
+    comp_set(c, ty, d);
+}
+// vanilla armor durability per piece slot (5=helmet..8=boots)
+fn armor_max_damage(item: i64) -> Option<i64> {
+    let pairs: &[(&str, i64)] = &[
+        ("leather_helmet", 55),
+        ("golden_helmet", 77),
+        ("chainmail_helmet", 165),
+        ("iron_helmet", 165),
+        ("diamond_helmet", 363),
+        ("netherite_helmet", 407),
+        ("turtle_helmet", 275),
+        ("leather_chestplate", 80),
+        ("golden_chestplate", 112),
+        ("chainmail_chestplate", 240),
+        ("iron_chestplate", 240),
+        ("diamond_chestplate", 528),
+        ("netherite_chestplate", 592),
+        ("elytra", 432),
+        ("leather_leggings", 75),
+        ("golden_leggings", 105),
+        ("chainmail_leggings", 225),
+        ("iron_leggings", 225),
+        ("diamond_leggings", 495),
+        ("netherite_leggings", 555),
+        ("leather_boots", 65),
+        ("golden_boots", 91),
+        ("chainmail_boots", 195),
+        ("iron_boots", 195),
+        ("diamond_boots", 429),
+        ("netherite_boots", 481),
+    ];
+    pairs
+        .iter()
+        .find(|(n, _)| name_to_item(n) == Some(item))
+        .map(|(_, m)| *m)
+}
+// vanilla max_damage by item id (tools/weapons/some utilities; armor omitted)
+fn tool_max_damage(item: i64) -> Option<i64> {
+    // tool groups are consecutive 5-id bands starting 818:
+    // sword,shovel,pickaxe,axe,hoe x wooden,stone,golden,iron,diamond,netherite
+    if (818..=847).contains(&item) {
+        let band = (item - 818) / 5;
+        return Some([59, 131, 32, 250, 1561, 2031][band as usize]);
+    }
+    Some(match item {
+        i if i == name_to_item("bow").unwrap_or(-1) => 384,
+        i if i == name_to_item("crossbow").unwrap_or(-2) => 465,
+        i if i == name_to_item("trident").unwrap_or(-3) => 250,
+        i if i == name_to_item("fishing_rod").unwrap_or(-4) => 64,
+        i if i == name_to_item("flint_and_steel").unwrap_or(-5) => 64,
+        i if i == name_to_item("shears").unwrap_or(-6) => 238,
+        i if i == name_to_item("shield").unwrap_or(-7) => 336,
+        i if i == name_to_item("carrot_on_a_stick").unwrap_or(-8) => 25,
+        i if i == name_to_item("warped_fungus_on_a_stick").unwrap_or(-9) => 100,
+        i if i == name_to_item("elytra").unwrap_or(-10) => 432,
+        i if i == name_to_item("mace").unwrap_or(-11) => 500,
+        i if i == name_to_item("brush").unwrap_or(-12) => 64,
+        _ => return None,
+    })
+}
+fn enchant_id(name: &str) -> Option<i64> {
+    Some(match name.trim_start_matches("minecraft:") {
+        "aqua_affinity" => 0,
+        "bane_of_arthropods" => 1,
+        "binding_curse" => 2,
+        "blast_protection" => 3,
+        "breach" => 4,
+        "channeling" => 5,
+        "density" => 6,
+        "depth_strider" => 7,
+        "efficiency" => 8,
+        "feather_falling" => 9,
+        "fire_aspect" => 10,
+        "fire_protection" => 11,
+        "flame" => 12,
+        "fortune" => 13,
+        "frost_walker" => 14,
+        "impaling" => 15,
+        "infinity" => 16,
+        "knockback" => 17,
+        "looting" => 18,
+        "loyalty" => 19,
+        "luck_of_the_sea" => 20,
+        "lure" => 21,
+        "mending" => 22,
+        "multishot" => 23,
+        "piercing" => 24,
+        "power" => 25,
+        "projectile_protection" => 26,
+        "protection" => 27,
+        "punch" => 28,
+        "quick_charge" => 29,
+        "respiration" => 30,
+        "riptide" => 31,
+        "sharpness" => 32,
+        "silk_touch" => 33,
+        "smite" => 34,
+        "soul_speed" => 35,
+        "sweeping_edge" => 36,
+        "swift_sneak" => 37,
+        "thorns" => 38,
+        "unbreaking" => 39,
+        "vanishing_curse" => 40,
+        "wind_burst" => 41,
+        _ => return None,
+    })
+}
+fn enchant_name(id: i64) -> Option<&'static str> {
+    Some(match id {
+        0 => "minecraft:aqua_affinity",
+        1 => "minecraft:bane_of_arthropods",
+        2 => "minecraft:binding_curse",
+        3 => "minecraft:blast_protection",
+        4 => "minecraft:breach",
+        5 => "minecraft:channeling",
+        6 => "minecraft:density",
+        7 => "minecraft:depth_strider",
+        8 => "minecraft:efficiency",
+        9 => "minecraft:feather_falling",
+        10 => "minecraft:fire_aspect",
+        11 => "minecraft:fire_protection",
+        12 => "minecraft:flame",
+        13 => "minecraft:fortune",
+        14 => "minecraft:frost_walker",
+        15 => "minecraft:impaling",
+        16 => "minecraft:infinity",
+        17 => "minecraft:knockback",
+        18 => "minecraft:looting",
+        19 => "minecraft:loyalty",
+        20 => "minecraft:luck_of_the_sea",
+        21 => "minecraft:lure",
+        22 => "minecraft:mending",
+        23 => "minecraft:multishot",
+        24 => "minecraft:piercing",
+        25 => "minecraft:power",
+        26 => "minecraft:projectile_protection",
+        27 => "minecraft:protection",
+        28 => "minecraft:punch",
+        29 => "minecraft:quick_charge",
+        30 => "minecraft:respiration",
+        31 => "minecraft:riptide",
+        32 => "minecraft:sharpness",
+        33 => "minecraft:silk_touch",
+        34 => "minecraft:smite",
+        35 => "minecraft:soul_speed",
+        36 => "minecraft:sweeping_edge",
+        37 => "minecraft:swift_sneak",
+        38 => "minecraft:thorns",
+        39 => "minecraft:unbreaking",
+        40 => "minecraft:vanishing_curse",
+        41 => "minecraft:wind_burst",
+        _ => return None,
+    })
+}
+// enchantments component blob: {ench:[{id,lvl}], showTooltip bool}
+fn enchantments_data(list: &[(i64, i64)], show_tip: bool) -> Vec<u8> {
+    let mut d = Vec::new();
+    write_varint(&mut d, list.len() as i64);
+    for (id, lv) in list {
+        write_varint(&mut d, *id);
+        write_varint(&mut d, *lv);
+    }
+    d.push(show_tip as u8);
+    d
+}
+fn enchantments_get(c: &Comps) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    if let Some(d) = comp_get(c, COMP_ENCHANTMENTS) {
+        let (n, mut p) = read_varint_at(d, 0);
+        for _ in 0..n.min(64) {
+            if p + 2 > d.len() {
+                break;
+            }
+            let (id, p2) = read_varint_at(d, p);
+            let (lv, p3) = read_varint_at(d, p2);
+            p = p3;
+            out.push((id, lv));
+        }
+    }
+    out
+}
+
+// Vanilla destroy time: damage/tick = speed/hardness/(canHarvest?30:100), so
+// seconds = hardness*1.5/speed when harvestable and hardness*5.0/speed when not.
+// hardness < 0 means unbreakable, 0 means instantaneous. `canHarvest` comes from
+// the registry's harvestTools data; the tool *speed* side is still a hand table.
+/// Vanilla destroy time, owned by the block registry, which reads it from the same
+/// asset it reads everything else from. The fallback only applies if the registry
+/// failed to load at all.
+fn block_hardness(b: i64) -> f32 {
+    match crate::block_registry::breg() {
+        Some(reg) => reg.hardness_of(b as u32),
+        None => 0.6,
+    }
+}
+/// Whether this tool harvests this block, owned by the registry's `harvestTools`
+/// data. It decides both the drop and the fast/slow mining multiplier, so the two
+/// call sites must ask the same question.
+/// Test-only: production goes through item_stack_max, which resolves the item to its
+/// block first.
+#[cfg(test)]
+fn stack_size_of(st: u32) -> i64 {
+    crate::block_registry::breg()
+        .map(|reg| reg.stack_size_of(st))
+        .unwrap_or(64)
+}
+fn tool_kind(block: i64) -> i8 {
+    match crate::block_registry::breg() {
+        Some(reg) => reg.tool_kind_of(block as u32),
+        None => -1,
+    }
+}
+fn can_harvest(block: i64, held_item: i64) -> bool {
+    match crate::block_registry::breg() {
+        Some(reg) => reg.can_harvest(block as u32, held_item),
+        None => true,
+    }
+}
+// tool dig speed; kind order in band: sword,shovel,pick,axe,hoe; tier: wood,stone,gold,iron,diamond,netherite
+fn tool_dig_speed(held: &Stack, block: i64) -> f32 {
+    let (kind, band) = if (818..=847).contains(&held.0) {
+        ((held.0 - 818) % 5, (held.0 - 818) / 5)
+    } else {
+        (-1, 0)
+    };
+    let tier_speed = [2.0f32, 4.0, 12.0, 6.0, 8.0, 9.0];
+    // The correct tool type comes from the block asset, not from id ranges: the hand
+    // ranges answered for 16 percent of the states.
+    let right_tool = kind >= 0 && kind == i64::from(tool_kind(block));
+    let mut speed = if right_tool {
+        tier_speed[band.clamp(0, 5) as usize]
+    } else {
+        1.0
+    };
+    let eff = enchant_level(&held.2, 8);
+    if eff > 0 && speed > 1.0 {
+        speed += (eff * eff + 1) as f32;
+    }
+    speed
+}
+
+fn dig_seconds(block: i64, held: &Stack) -> Option<f32> {
+    let h = block_hardness(block);
+    if h < 0.0 {
+        return None;
+    }
+    if h == 0.0 {
+        return Some(0.0);
+    }
+    let speed = tool_dig_speed(held, block);
+    let can = can_harvest(block, held.0);
+    Some(h * if can { 1.5 } else { 5.0 } / speed)
+}
+
+fn enchant_level(c: &Comps, id: i64) -> i64 {
+    enchantments_get(c)
+        .iter()
+        .find(|(e, _)| *e == id)
+        .map(|(_, l)| *l)
+        .unwrap_or(0)
+}
+fn enchant_max_level(id: i64) -> i64 {
+    match id {
+        0 | 2 | 12 | 16 | 22 | 23 | 33 | 40 => 1, // aqua..infinity,mending,multishot,silk,vanishing
+        14 | 17 | 10 | 28 => 2,                   // frost, knockback, fire_aspect, punch
+        7 | 13 | 18 | 19 | 20 | 21 | 29 | 30 | 31 | 35 | 36 | 37 | 38 | 39 | 41 => 3,
+        3 | 4 | 9 | 11 | 24 | 26 | 27 => 4, // protection family, feather, breach, piercing
+        _ => 5,                             // damage/efficiency/power/impaling/density
+    }
+}
+// vanilla mutually-exclusive groups; some/any overlap forbids
+fn enchant_conflicts(a: i64, b: i64) -> bool {
+    const GROUPS: &[&[i64]] = &[
+        &[27, 3, 11, 26],   // protection family
+        &[32, 34, 1, 6, 4], // sharpness/smite/bane/density/breach
+        &[33, 13],          // silk_touch vs fortune
+        &[16, 22],          // infinity vs mending
+        &[31, 19, 5],       // riptide vs loyalty/channeling
+        &[7, 14],           // depth_strider vs frost_walker
+        &[23, 24],          // multishot vs piercing
+    ];
+    a != b && GROUPS.iter().any(|g| g.contains(&a) && g.contains(&b))
+}
+// TAG_String anonymous-NBT payload: type byte + modified-UTF-8 string.
+fn nbt_string(text: &str) -> Vec<u8> {
+    let mut d = vec![8u8];
+    nbt_str(&mut d, text);
+    d
+}
+
+// vanilla enchantability, approximated: damageable items accept
+// unbreaking/mending always; weapons/tools/armor accept their usual sets.
+fn enchant_applicable(item: i64, eid: i64) -> bool {
+    let band = if (818..=847).contains(&item) {
+        Some(((item - 818) / 5, (item - 818) % 5))
+    } else {
+        None
+    };
+    let bow = item == name_to_item("bow").unwrap_or(-1);
+    let xbow = item == name_to_item("crossbow").unwrap_or(-2);
+    let trident = item == name_to_item("trident").unwrap_or(-3);
+    let rod = item == name_to_item("fishing_rod").unwrap_or(-4);
+    let mace = item == name_to_item("mace").unwrap_or(-5);
+    let armor = (1064..=1115).contains(&item); // leather..netherite armor band
+    match eid {
+        39 | 22 => tool_max_damage(item).is_some() || band.is_some() || armor, // unbreaking/mending
+        32 | 34 | 1 | 17 | 10 | 18 | 36 => {
+            band.map(|(_, k)| k == 0 || k == 3).unwrap_or(false) || mace
+        } // melee
+        8 | 13 | 33 => band.map(|(_, k)| (1..=4).contains(&k)).unwrap_or(false), // efficiency/fortune/silk
+        25 | 28 | 12 | 16 => bow,    // power/punch/flame/infinity
+        29 | 23 | 24 => xbow,        // quick_charge/multishot/piercing
+        19 | 31 | 5 | 15 => trident, // loyalty/riptide/channeling/impaling
+        20 | 21 => rod,              // luck_of_the_sea/lure
+        27 | 3 | 11 | 26 | 38 | 0 | 7 | 9 | 14 | 30 | 35 | 37 | 2 | 40 => armor, // armor enchants+curses
+        6 | 4 | 41 => mace, // density/breach/wind_burst
+        _ => true,
+    }
+}
+// damage the held item by 1 point (unbreaking roll applied); returns
+// true if the item broke. Vanilla: tools pay 1 per block broken /
+// melee hit; unbreaking gives 1/(level+1) chance of actual damage.
+fn damage_held(me: &Arc<Client>) -> bool {
+    let hs = *me.held.lock().unwrap();
+    let mut inv = me.inv.lock().unwrap();
+    let slot = 36 + hs;
+    let Some(st) = inv.get_mut(&slot) else {
+        return false;
+    };
+    let Some(maxd) = tool_max_damage(st.0).or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE)) else {
+        return false;
+    };
+    if comp_get(&st.2, COMP_UNBREAKABLE).is_some() {
+        return false;
+    }
+    let unb = enchant_level(&st.2, 39); // unbreaking
+    if unb > 0 && !world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
+        return false;
+    }
+    let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
+    if dmg >= maxd {
+        inv.remove(&slot);
+        return true;
+    }
+    comp_set_varint(&mut st.2, COMP_DAMAGE, dmg);
+    false
+}
+// same durability tick on an arbitrary inventory slot (elytra wear, etc)
+fn damage_inv_slot(me: &Arc<Client>, slot: i16) -> bool {
+    let mut inv = me.inv.lock().unwrap();
+    let Some(st) = inv.get_mut(&slot) else {
+        return false;
+    };
+    let Some(maxd) = tool_max_damage(st.0)
+        .or_else(|| armor_max_damage(st.0))
+        .or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE))
+    else {
+        return false;
+    };
+    if comp_get(&st.2, COMP_UNBREAKABLE).is_some() {
+        return false;
+    }
+    let unb = enchant_level(&st.2, 39);
+    if unb > 0 && !world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
+        return false;
+    }
+    let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
+    if dmg >= maxd {
+        inv.remove(&slot);
+        return true;
+    }
+    comp_set_varint(&mut st.2, COMP_DAMAGE, dmg);
+    false
+}
+
+// resend the held slot to the owner after damage/break so the client
+// model stays honest
+fn held_slot_resync(me: &Arc<Client>) {
+    let hs = *me.held.lock().unwrap();
+    let slot = 36 + hs;
+    let st = me
+        .inv
+        .lock()
+        .unwrap()
+        .get(&slot)
+        .cloned()
+        .unwrap_or((0, 0, Vec::new()));
+    let mut p = vec![0u8];
+    write_varint(&mut p, 0);
+    p.extend_from_slice(&slot.to_be_bytes());
+    p.extend_from_slice(&slot_wire(&st));
+    if let Ok(mut w) = me.sock.lock() {
+        let _ = send_packet(&mut w, 0x15, p);
+    }
+}
+
+struct Drop {
+    eid: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    item: i64,
+    cnt: u8,
+    comps: Comps,
+    age: i32,
+    target: Option<[u8; 16]>,
+    thrower: Option<[u8; 16]>,
+}
+impl Drop {
+    /// Vanilla keeps an ItemEntity out of reach for its pickup delay. Both collectors of a
+    /// drop ask this one question: the fake-actor absorb and the real client's take. The
+    /// client path did not ask it, so a player standing on a drop collected it on the tick
+    /// it spawned while the actor path refused the same entity. The age read here is the
+    /// live entity's, counted in server ticks by the pass that also expires it, so the
+    /// delay keeps its existing cadence instead of gaining a second clock.
+    fn pickup_delay_elapsed(&self) -> bool {
+        self.age >= server_ticks(PICKUP_DELAY_GT) as i32
+    }
+
+    /// 1.21.1 `EntityType.ITEM` (`bsx.ag`): `sized(0.25f, 0.25f)` via `EntityDimensions.makeBoundingBox`
+    /// (`bsu.a(DDD)`): `[x - 0.125, x + 0.125] x [y, y + 0.25] x [z - 0.125, z + 0.125]`.
+    fn bounding_box(&self) -> EntityAabb {
+        EntityAabb::from_dimensions(self.x, self.y, self.z, 0.25, 0.25)
+    }
+
+    /// 1.21.1 `Player.aiStep()` (`cmx.m_()`) + `ItemEntity.playerTouch(Player)` (`cjh.b_(Lcmx;)V`):
+    /// alive non-spectator whose inflated bounding box intersects the drop's bounding box, and
+    /// `target == null || target.equals(player.getUUID())`. `thrower` (`cjh.l`) is not gated here.
+    fn can_be_picked_up_by_parts(
+        target: Option<[u8; 16]>,
+        drop_aabb: EntityAabb,
+        collector_uuid: Option<[u8; 16]>,
+        spectator: bool,
+        alive: bool,
+        player_aabb: EntityAabb,
+    ) -> bool {
+        if spectator || !alive {
+            return false;
+        }
+        let target_ok = match (target, collector_uuid) {
+            (None, _) => true,
+            (Some(owner), Some(uuid)) => owner == uuid,
+            (Some(_), None) => false,
+        };
+        target_ok && player_aabb.intersects(drop_aabb)
+    }
+
+    fn can_be_picked_up_by(
+        &self,
+        uuid: Option<[u8; 16]>,
+        spectator: bool,
+        alive: bool,
+        player_aabb: EntityAabb,
+    ) -> bool {
+        Self::can_be_picked_up_by_parts(
+            self.target,
+            self.bounding_box(),
+            uuid,
+            spectator,
+            alive,
+            player_aabb,
+        )
+    }
+}
+static DROPS: OnceLock<Mutex<Vec<Drop>>> = OnceLock::new();
+fn drops() -> &'static Mutex<Vec<Drop>> {
+    DROPS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// blockstate -> dropped item id (vanilla: stone->cobblestone, grass->dirt)
+/// The item a block drops, owned by the block registry, which reads it from the same
+/// asset everything else comes from. The hand table this replaced listed 13 states out
+/// of the 23364 the asset gives a drop, so granite, the stairs and the slabs dropped
+/// nothing at all, and glass dropped itself where vanilla drops nothing without silk
+/// touch. The fallback only applies if the registry failed to load.
+fn block_drop(st: u32) -> Option<i64> {
+    crate::block_registry::breg().and_then(|reg| reg.block_drop(st))
+}
+/// The second drop, for the blocks whose asset entry lists two. Nothing is lost when a block has
+/// only one: the list is filtered to the entries that exist.
+fn block_drops(st: u32) -> Vec<i64> {
+    let reg = crate::block_registry::breg();
+    let first = reg.and_then(|r| r.block_drop(st));
+    let second = reg.and_then(|r| r.block_drop_second(st));
+    [first, second].into_iter().flatten().collect()
+}
+fn spawn_drop_pkt(d: &Drop) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, d.eid as i64);
+    p.extend_from_slice(&[0u8; 16]);
+    write_varint(&mut p, 58); // item entity
+    p.extend_from_slice(&d.x.to_be_bytes());
+    p.extend_from_slice(&d.y.to_be_bytes());
+    p.extend_from_slice(&d.z.to_be_bytes());
+    p.extend_from_slice(&[0u8; 3]);
+    write_varint(&mut p, 0);
+    p.extend_from_slice(&[0u8; 6]);
+    p
+}
+fn drop_meta_pkt(d: &Drop) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, d.eid as i64);
+    p.push(8); // metadata key 8 = item
+    write_varint(&mut p, 7); // type 7 = item_stack
+    write_varint(&mut p, d.cnt as i64); // slot: count
+    write_varint(&mut p, d.item); // item id
+    write_varint(&mut p, d.comps.len() as i64);
+    write_varint(&mut p, 0);
+    for (ty, data) in &d.comps {
+        write_varint(&mut p, *ty);
+        p.extend_from_slice(data);
+    }
+    p.push(0xff);
+    p
+}
+fn collect_pkt(drop_eid: i32, collector: i32, count: u8) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, drop_eid as i64);
+    write_varint(&mut p, collector as i64);
+    write_varint(&mut p, count as i64);
+    p
+}
+
+/// The cell -> member index both merge scans use, sized once from the item count.
+///
+/// A `HashMap` is the wrong shape for this: there are no removals, the key is three
+/// integers, every bucket is a short list, and the scan probes the own cell plus its
+/// 26 neighbours for every item (16,200 probes for 600 entities). Measured on the
+/// entity-heavy fixture, the SipHash probe was the whole cost of the merge - 84 us of
+/// walking the neighbourhood plus 25 us of building the map, in a 127 us `drops` stage,
+/// and 105 us of a 135 us `environment` stage - while the distance test it guards is
+/// under a nanosecond. This is a chained table over pre-sized arrays: no
+/// resizing, no per-cell allocation, a probe that is three multiplies and a mask, and
+/// an exact key comparison so a collision changes speed and nothing else.
+struct CellBuckets {
+    cell: Vec<(i32, i32, i32)>,
+    used: Vec<bool>,
+    head: Vec<u32>,
+    next: Vec<u32>,
+    mask: usize,
+}
+
+const NO_MEMBER: u32 = u32::MAX;
+
+impl CellBuckets {
+    fn new(items: usize) -> Self {
+        // At most `items` distinct cells, and a load factor of at most one half.
+        let cap = (items.max(4) * 2).next_power_of_two();
+        CellBuckets {
+            cell: vec![(0, 0, 0); cap],
+            used: vec![false; cap],
+            head: vec![NO_MEMBER; cap],
+            next: vec![NO_MEMBER; items],
+            mask: cap - 1,
+        }
+    }
+
+    #[inline]
+    fn slot(&self, cell: (i32, i32, i32)) -> usize {
+        let h = (cell.0 as u32)
+            .wrapping_mul(0x9E37_79B1)
+            .wrapping_add((cell.1 as u32).wrapping_mul(0x85EB_CA77))
+            .wrapping_add((cell.2 as u32).wrapping_mul(0xC2B2_AE3D));
+        // xorshift mix: the multiply chain alone leaves low-bit structure that a mask
+        // and a linear probe would turn into long clusters.
+        let h = h ^ (h >> 15) ^ (h >> 7);
+        (h as usize) & self.mask
+    }
+
+    /// Link `idx` into `cell`'s bucket. The chain runs newest first, so a bucket is
+    /// walked in descending index order; both callers sort their candidates before
+    /// comparing, because the merge contract is ascending index order.
+    fn push(&mut self, cell: (i32, i32, i32), idx: u32) {
+        let mut at = self.slot(cell);
+        while self.used[at] && self.cell[at] != cell {
+            at = (at + 1) & self.mask;
+        }
+        if !self.used[at] {
+            self.used[at] = true;
+            self.cell[at] = cell;
+        }
+        self.next[idx as usize] = self.head[at];
+        self.head[at] = idx;
+    }
+
+    /// The members of `cell`, in no particular order; `None` when no item is there.
+    #[inline]
+    fn members(&self, cell: (i32, i32, i32)) -> Option<u32> {
+        let mut at = self.slot(cell);
+        while self.used[at] {
+            if self.cell[at] == cell {
+                return Some(self.head[at]);
+            }
+            at = (at + 1) & self.mask;
+        }
+        None
+    }
+}
+
+/// Walk one cell's members into `out`, keeping only indices past `after`.
+fn collect_members(
+    buckets: &CellBuckets,
+    cell: (i32, i32, i32),
+    after: usize,
+    out: &mut Vec<usize>,
+) {
+    let Some(mut member) = buckets.members(cell) else {
+        return;
+    };
+    while member != NO_MEMBER {
+        let idx = member as usize;
+        if idx > after {
+            out.push(idx);
+        }
+        member = buckets.next[idx];
+    }
+}
+
+/// Vanilla merges same-item drops within ~0.5 blocks into one stack (fits <=64); the
+/// merged entity keeps the fresher age.
+///
+/// Returns the absorbed eids in merge order, which is the order the destroy packet goes
+/// out in.
+///
+/// Bucket drops by integer cell. A pair within 0.5 blocks differs by at most one on each
+/// axis, so only the own cell and its 26 neighbours can satisfy the distance test.
+/// Iterating i in order and candidates in ascending index order keeps the first match
+/// identical to scanning every pair, so which drop is absorbed does not change.
+fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
+    // Nothing to pair, and the index below allocates: an idle world must not pay for a
+    // merge it cannot perform.
+    if dp.len() < 2 {
+        return Vec::new();
+    }
+    let __prof = tickprof::enabled();
+    let mut __t = __prof.then(std::time::Instant::now);
+    let mut buckets = CellBuckets::new(dp.len());
+    for (idx, d) in dp.iter().enumerate() {
+        buckets.push(
+            (d.x.floor() as i32, d.y.floor() as i32, d.z.floor() as i32),
+            idx as u32,
+        );
+    }
+    if let Some(t) = __t {
+        tickprof::add("drops/merge_cells", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
+    let mut merged: Vec<i32> = Vec::new();
+    let mut candidates: Vec<usize> = Vec::new();
+    for i in 0..dp.len() {
+        let (cx, cy, cz) = (
+            dp[i].x.floor() as i32,
+            dp[i].y.floor() as i32,
+            dp[i].z.floor() as i32,
+        );
+        candidates.clear();
+        // checked arithmetic: a drop whose cell is at the i32 limit has no neighbour
+        // there, and wrapping would invent a cell that aliases.
+        for dx in -1..=1i32 {
+            for dy in -1..=1i32 {
+                for dz in -1..=1i32 {
+                    let key = (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz));
+                    if let (Some(kx), Some(ky), Some(kz)) = key {
+                        collect_members(&buckets, (kx, ky, kz), i, &mut candidates);
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable();
+        for &j in candidates.iter() {
+            let (ax, ay, az, ait, acnt, aage) = {
+                let a = &dp[i];
+                (a.x, a.y, a.z, a.item, a.cnt, a.age)
+            };
+            let (bx, by, bz, bit, bcnt, bage) = {
+                let b = &dp[j];
+                (b.x, b.y, b.z, b.item, b.cnt, b.age)
+            };
+            // Cheap integer and distance tests first; the component blobs are a Vec
+            // comparison, so they run only for a real candidate.
+            if ait == bit
+                && dp[i].target == dp[j].target
+                && (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 0.25
+                && dp[i].comps == dp[j].comps
+                && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16
+            {
+                let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
+                dp[keep].cnt = dp[keep].cnt.saturating_add(dp[eat].cnt);
+                merged.push(dp[eat].eid);
+                break;
+            }
+        }
+    }
+    if let Some(t) = __t {
+        tickprof::add("drops/merge_scan", t.elapsed());
+    }
+    merged
+}
+
+fn furnace_tick() {
+    let mut fs = furnaces().lock().unwrap();
+    if fs.is_empty() {
+        return;
+    }
+    let mut dirty_pos: Vec<DimBlockPos> = Vec::new();
+    // One region borrow for the whole loop. Acquiring the mutex per furnace was
+    // what dominated this stage, not the set lookup itself.
+    let region = region_guard();
+    for (pos, f) in fs.iter_mut() {
+        if !region.is_warm(pos.1, pos.3) {
+            continue;
+        }
+        // The recipe result is only ever read behind `input.1 > 0`, so an empty
+        // input skips the lookup instead of hashing an item it cannot smelt.
+        let out = if f.input.1 > 0 {
+            // Keyed on the content revision as well as the item, so the answer is
+            // resolved once per revision instead of scanning every datapack recipe
+            // for every furnace on every tick.
+            let rev = content_revision();
+            f.recipe_cache
+                .get_or_compute((f.input.0, rev), || smelt_out(f.input.0))
+        } else {
+            None
+        };
+        // A smelt output never carries components, so an output stack holding any
+        // cannot be merged with one.
+        let can_smelt = f.input.1 > 0
+            && out
+                .as_ref()
+                .map(|o| {
+                    f.output.1 == 0
+                        || (f.output.0 == o.0
+                            && f.output.2.is_empty()
+                            && f.output.1 as i64 + o.1 as i64 <= stack_max_of(&f.output))
+                })
+                .unwrap_or(false);
+        if f.burn_left <= 0 && can_smelt && f.fuel.1 > 0 {
+            let t = f
+                .fuel_cache
+                .get_or_compute(f.fuel.0, || fuel_ticks(f.fuel.0));
+            if t > 0 {
+                f.burn_left = t;
+                f.fuel.1 -= 1;
+                if f.fuel.1 == 0 {
+                    f.fuel = (0, 0, Vec::new());
+                }
+                f.dirty = true;
+            }
+        }
+        if f.burn_left > 0 && can_smelt {
+            f.burn_left -= 1;
+            f.progress += 1;
+            if f.progress >= server_ticks(200) as i32 {
+                f.progress = 0;
+                let r = out.unwrap();
+                f.xp += smelt_xp(f.input.0);
+                f.output = (r.0, f.output.1 + r.1, f.output.2.clone());
+                f.input.1 -= 1;
+                if f.input.1 == 0 {
+                    f.input = (0, 0, Vec::new());
+                }
+                f.dirty = true;
+            }
+        } else if f.progress > 0 {
+            f.progress -= 1;
+        }
+        if f.dirty {
+            f.dirty = false;
+            dirty_pos.push(*pos);
+        }
+    }
+    drop(region);
+    drop(fs);
+    if dirty_pos.is_empty() {
+        return;
+    }
+    let cs: Vec<Arc<Client>> = client_snapshot();
+    for c in cs {
+        let fp = *c.open_furnace.lock().unwrap();
+        if let Some((dim, x, y, z)) = fp {
+            if dirty_pos.contains(&(dim, x, y, z)) {
+                let inv = c.inv.lock().unwrap().clone();
+                let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
+                if let Ok(mut w) = c.sock.lock() {
+                    furnace_push_items_snap(&mut w, &inv, &slots);
+                }
+            }
+        }
+    }
+}
+
+static HOPPERS: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
+fn hoppers() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
+    HOPPERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+/// Where the synthetic per-player ender-chest key starts: far outside the world, so
+/// `ContainerKey::Block` can carry it like any container without colliding with a
+/// real block position.
+const ENDER_KEY_X: i32 = 20_000_000;
+const ENDER_KEY_Y: i32 = 310;
+fn ender_key(uuid: &[u8; 16]) -> (i32, i32, i32) {
+    (
+        ENDER_KEY_X + (u32::from_be_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]) & 0xfffff) as i32,
+        ENDER_KEY_Y,
+        (u32::from_be_bytes([uuid[4], uuid[5], uuid[6], uuid[7]]) & 0xfffff) as i32,
+    )
+}
+/// Is this the synthetic ender-chest key rather than a world block? The key has to be
+/// distinguishable, because "the world still holds this container" is false for it by
+/// construction: there is no block entity behind an ender chest's per-player storage.
+fn is_ender_key(pos: (i32, i32, i32)) -> bool {
+    pos.0 >= ENDER_KEY_X && pos.1 == ENDER_KEY_Y
+}
+/// The storage key for one player's Ender chest. Vanilla Ender chests are per-player and shared
+/// across every dimension, so the synthetic position is always filed under the Overworld: opening
+/// one from the Nether or the End reaches this exact entry, and its bytes stay in the legacy
+/// section where an old build expects them.
+fn ender_container_key(uuid: &[u8; 16]) -> ContainerKey {
+    let ek = ender_key(uuid);
+    ContainerKey::Block((DimId::Overworld, ek.0, ek.1, ek.2))
+}
+
+fn hopper_tick() {
+    // Only the hoppers that come due are visited, so a tick costs the hoppers
+    // that need work rather than every hopper that exists. Every exit re-queues
+    // except removal from the registry.
+    let due = {
+        let mut q = hopper_queue().lock().unwrap();
+        q.due()
+    };
+    if due.is_empty() {
+        return;
+    }
+    let region = region_guard();
+    for (hx, hy, hz) in due {
+        if !region.is_warm(hx, hz) || !sched_ready(hx, hy, hz) {
+            requeue_hopper(hx, hy, hz);
+            continue;
+        }
+        let st = block_at(hx, hy, hz);
+        if !(9225..=9234).contains(&st) {
+            hoppers().lock().unwrap().remove(&(hx, hy, hz));
+            continue;
+        }
+        if st >= 9230 {
+            sched_result(hx, hy, hz, false);
+            requeue_hopper(hx, hy, hz);
+            continue;
+        } // powered(disabled) hopper holds items
+        let facing = st - 9225; // 0 down,1 n,2 s,3 w,4 e
+        let (dx, dy, dz) = match facing {
+            0 => (0, -1, 0),
+            1 => (0, 0, -1),
+            2 => (0, 0, 1),
+            3 => (-1, 0, 0),
+            _ => (1, 0, 0),
+        };
+        let dst = (hx + dx, hy + dy, hz + dz);
+        if container_kind(block_at(dst.0, dst.1, dst.2)).is_none() {
+            sched_result(hx, hy, hz, false);
+            requeue_hopper(hx, hy, hz);
+            continue;
+        }
+        let mut did = false;
+        // push one item from the hopper's own inventory toward facing container
+        unpack_block_loot_if_needed(ow_block((hx, hy, hz)));
+        unpack_block_loot_if_needed(ow_block(dst));
+        if let Some(partner) = chest_partner(dst.0, dst.1, dst.2) {
+            unpack_block_loot_if_needed(ow_block(partner));
+        }
+        {
+            let mut all = chests().lock().unwrap();
+            let own = all.get(&ContainerKey::ow((hx, hy, hz))).and_then(|m| {
+                m.iter()
+                    .find(|(_, v)| v.1 > 0)
+                    .map(|(k, v)| (*k, v.clone()))
+            });
+            if let Some((k, (it, _, _cc))) = own {
+                let smax = item_stack_max(it, &_cc) as u8;
+                // vanilla merges double chests — push spills to the
+                // partner half when the facing half is full
+                let dsts = [dst, chest_partner(dst.0, dst.1, dst.2).unwrap_or(dst)];
+                for dp in dsts {
+                    let dstm = all.entry(ContainerKey::ow(dp)).or_default();
+                    let slot = dstm
+                        .iter()
+                        .find(|(_, v)| v.0 == it && v.2 == _cc && v.1 < smax)
+                        .map(|(s2, _)| *s2)
+                        .or_else(|| (0..27i16).find(|sl| !dstm.contains_key(sl)));
+                    let Some(slot) = slot else { continue }; // full -> try partner
+                    let cur = dstm.get(&slot).map(|v| v.1).unwrap_or(0);
+                    dstm.insert(slot, (it, cur + 1, _cc.clone()));
+                    if let Some(sm) = all.get_mut(&ContainerKey::ow((hx, hy, hz))) {
+                        if let Some(v) = sm.get_mut(&k) {
+                            v.1 -= 1;
+                            if v.1 == 0 {
+                                sm.remove(&k);
+                            }
+                        }
+                    }
+                    did = true;
+                    break;
+                }
+            }
+        }
+        if !did {
+            // pull one item from the chest above into the destination chest
+            let src = (hx, hy + 1, hz);
+            if container_kind(block_at(src.0, src.1, src.2)).is_some() {
+                unpack_block_loot_if_needed(ow_block(src));
+                if let Some(partner) = chest_partner(src.0, src.1, src.2) {
+                    unpack_block_loot_if_needed(ow_block(partner));
+                }
+                let mut all = chests().lock().unwrap();
+                // vanilla merges double chests into one container — a
+                // hopper under either half can pull from both
+                let srcs: [(i32, i32, i32); 2] =
+                    [src, chest_partner(src.0, src.1, src.2).unwrap_or(src)];
+                let item = srcs
+                    .iter()
+                    .filter_map(|sp| {
+                        all.get(&ContainerKey::ow(*sp)).and_then(|ch| {
+                            ch.iter()
+                                .find(|(_, v)| v.1 > 0)
+                                .map(|(k, v)| (*k, v.clone()))
+                                .map(|kv| (*sp, kv))
+                        })
+                    })
+                    .next();
+                if let Some((srcp, (k, (it, c, _xc)))) = item {
+                    let smax = item_stack_max(it, &_xc) as u8;
+                    let dstm = all.entry(ContainerKey::ow(dst)).or_default();
+                    let slot = dstm
+                        .iter()
+                        .find(|(_, v)| v.0 == it && v.2 == _xc && v.1 < smax)
+                        .map(|(s, _)| *s)
+                        .unwrap_or_else(|| {
+                            (0..27i16).find(|sl| !dstm.contains_key(sl)).unwrap_or(0)
+                        });
+                    let nc = dstm.get(&slot).map(|v| v.1).unwrap_or(0) + 1;
+                    if nc <= smax {
+                        dstm.insert(slot, (it, nc, _xc.clone()));
+                        if let Some(srcm) = all.get_mut(&ContainerKey::ow(srcp)) {
+                            if c <= 1 {
+                                srcm.remove(&k);
+                            } else {
+                                srcm.insert(k, (it, c - 1, _xc.clone()));
+                            }
+                        }
+                        did = true;
+                    }
+                }
+            }
+            // absorb drop entities resting on the hopper into the destination chest
+            let absorbed: Vec<(i32, i64, Comps)> = {
+                let dl = drops().lock().unwrap();
+                dl.iter()
+                    .filter(|d| {
+                        (d.x - (hx as f64 + 0.5)).abs() < 0.7
+                            && d.y > hy as f64 + 0.4
+                            && d.y < hy as f64 + 1.6
+                            && (d.z - (hz as f64 + 0.5)).abs() < 0.7
+                    })
+                    .map(|d| (d.eid, d.item, d.comps.clone()))
+                    .collect()
+            };
+            for (deid, item, dcp) in absorbed {
+                {
+                    let mut all = chests().lock().unwrap();
+                    let smax = item_stack_max(item, &dcp) as u8;
+                    let dstm = all.entry(ContainerKey::ow(dst)).or_default();
+                    let slot = dstm
+                        .iter()
+                        .find(|(_, v)| v.0 == item && v.2 == dcp && v.1 < smax)
+                        .map(|(s, _)| *s)
+                        .unwrap_or_else(|| {
+                            (0..27i16).find(|sl| !dstm.contains_key(sl)).unwrap_or(0)
+                        });
+                    let nc = dstm.get(&slot).map(|v| v.1).unwrap_or(0) + 1;
+                    if nc <= smax {
+                        dstm.insert(slot, (item, nc, dcp));
+                    } else {
+                        continue;
+                    }
+                }
+                drops().lock().unwrap().retain(|d| d.eid != deid);
+                let mut p = Vec::new();
+                write_varint(&mut p, 1);
+                write_varint(&mut p, deid as i64);
+                broadcast_seen(deid, |_c| (0x42, p.clone()));
+                did = true;
+            }
+        }
+        sched_result(hx, hy, hz, did);
+        requeue_hopper(hx, hy, hz);
+    }
+}
+fn drop_tick() {
+    // Split under `MC_SPINE_TICK_PROFILE=1`. The bucketed merge landed without a
+    // split, so `drops` could not say whether the residual is the pickup scan, the
+    // cell build, the neighbourhood walk or the despawn pass.
+    let __prof = tickprof::enabled();
+    let mut __t = __prof.then(std::time::Instant::now);
+    let region = region_guard();
+    // 1.21.1 Player.aiStep() touch box + !isSpectator() + ItemEntity.target match
+    let mut taken: Vec<(i32, Arc<Client>)> = vec![];
+    {
+        let ds: Vec<(i32, f64, f64, Option<[u8; 16]>, EntityAabb)> = drops()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| (d.eid, d.x, d.z, d.target, d.bounding_box()))
+            .collect();
+        let cls: Vec<Arc<Client>> = client_snapshot();
+        let touches: Vec<(bool, bool, EntityAabb)> = cls
+            .iter()
+            .map(|c| (c.is_spectator(), *c.hp.lock().unwrap() > 0.0, c.touch_aabb()))
+            .collect();
+        for (d_eid, dx, dz, d_target, d_aabb) in ds.iter() {
+            if !region.is_hot(*dx as i32, *dz as i32) {
+                continue;
+            }
+            for (c, &(spectator, alive, player_aabb)) in cls.iter().zip(touches.iter()) {
+                if Drop::can_be_picked_up_by_parts(
+                    *d_target,
+                    *d_aabb,
+                    Some(c.uuid),
+                    spectator,
+                    alive,
+                    player_aabb,
+                ) {
+                    taken.push((*d_eid, c.clone()));
+                }
+            }
+        }
+    }
+    if let Some(t) = __t {
+        tickprof::add("drops/pickup", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
+    // xp orbs float to nearby players and grant xp
+    {
+        let mut collected: Vec<(i32, i32, i16)> = vec![];
+        {
+            let xs = xps().lock().unwrap();
+            let cls: Vec<Arc<Client>> = client_snapshot();
+            for x in xs.iter() {
+                for c in cls.iter() {
+                    let (px, py, pz, ..) = {
+                        let p = c.pos.lock().unwrap();
+                        *p
+                    };
+                    if (px - x.x).powi(2) + (py - x.y).powi(2) + (pz - x.z).powi(2) < 2.56 {
+                        collected.push((x.eid, c.eid, x.val));
+                        break;
+                    }
+                }
+            }
+        }
+        for (xeid, ceid, val) in collected {
+            xps().lock().unwrap().retain(|x| x.eid != xeid);
+            let cls: Vec<Arc<Client>> = client_snapshot();
+            if let Some(c) = cls.iter().find(|c| c.eid == ceid) {
+                // mending: xp first repairs damaged mending gear (2 dur per xp)
+                let mut val = val as i64;
+                {
+                    let mut inv = c.inv.lock().unwrap();
+                    let cands: Vec<i16> = inv
+                        .iter()
+                        .filter(|(_, (it, _, cc))| {
+                            *it > 0
+                                && enchant_level(cc, 22) > 0
+                                && comp_varint(cc, COMP_DAMAGE).unwrap_or(0) > 0
+                        })
+                        .map(|(&k, _)| k)
+                        .collect();
+                    for k in cands {
+                        if val <= 0 {
+                            break;
+                        }
+                        let (it, cnt, mut cc) = inv.remove(&k).unwrap();
+                        let cur = comp_varint(&cc, COMP_DAMAGE).unwrap_or(0);
+                        let heal = (val * 2).min(cur);
+                        comp_set_varint(&mut cc, COMP_DAMAGE, cur - heal);
+                        inv.insert(k, (it, cnt, cc));
+                        val -= (heal + 1) / 2;
+                    }
+                }
+                let _ = send_player_xp(c, |xp| add_player_xp_points(xp, val as i32));
+                drop(cls);
+                broadcast_seen_destroy(xeid);
+            }
+        }
+    }
+    if let Some(t) = __t {
+        tickprof::add("drops/xp_pickup", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
+    for (deid, c) in taken {
+        let selected = *c.held.lock().unwrap();
+        let creative = *c.gm.lock().unwrap() == 1;
+        let spectator = c.is_spectator();
+        let alive = *c.hp.lock().unwrap() > 0.0;
+        let player_aabb = c.touch_aabb();
+        let (accepted, original, changed, remaining) = {
+            // Same inventory -> drops lock order as actor_tick. Read the live
+            // entity, not a stack snapshot another collector may have consumed.
+            let mut inv = c.inv.lock().unwrap();
+            let mut ds = drops().lock().unwrap();
+            let Some(d) = ds.iter_mut().find(|d| d.eid == deid) else {
+                continue;
+            };
+            if !d.can_be_picked_up_by(Some(c.uuid), spectator, alive, player_aabb) {
+                continue;
+            }
+            // The delay belongs to the take, not to the candidate scan: it is judged on
+            // the live entity under the same locks the insertion uses, so a drop spawned
+            // after the snapshot above, or merged into a fresher age, is still too young
+            // to collect on this tick.
+            if !d.pickup_delay_elapsed() {
+                continue;
+            }
+            let mut source = (d.item, d.cnt, d.comps.clone());
+            let original = source.1;
+            let before = inv.clone();
+            let accepted = pickup_into_inventory(&mut inv, selected, creative, &mut source);
+            if source.1 == original {
+                continue;
+            }
+            d.cnt = source.1;
+            let remaining = (d.cnt > 0).then(|| drop_meta_pkt(d));
+            if d.cnt == 0 {
+                ds.retain(|d| d.eid != deid);
+            }
+            let changed: Vec<_> = (9..=45)
+                .filter_map(|slot| {
+                    inv.get(&slot)
+                        .filter(|st| before.get(&slot) != Some(st))
+                        .map(|st| (slot, st.clone()))
+                })
+                .collect();
+            (accepted, original, changed, remaining)
+        };
+        for (slot, st) in changed {
+            let mut p = vec![0u8];
+            write_varint(&mut p, 0);
+            p.extend_from_slice(&slot.to_be_bytes());
+            p.extend_from_slice(&slot_wire(&st));
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x15, p);
+            }
+        }
+        // ItemEntity.playerTouch uses add's boolean, NOT the number inserted;
+        // its take callback receives the original entity count (cjh.b_(cmx)).
+        if accepted {
+            broadcast_seen(deid, |_c| (0x6f, collect_pkt(deid, c.eid, original)));
+        }
+        if let Some(pkt) = remaining {
+            broadcast_seen(deid, move |_c| (0x58, pkt.clone()));
+        } else {
+            broadcast_seen_destroy(deid);
+        }
+    }
+    {
+        // despawn drops after 300s (vanilla); a hard cap bounds the flood
+        // inside any one despawn window — oldest lose first.
+        let mut dp = drops().lock().unwrap();
+        let life = server_ticks(DROP_LIFE_GT) as i32;
+        for d in dp.iter_mut() {
+            if region.is_hot(d.x as i32, d.z as i32) {
+                d.age += 1;
+            }
+        }
+        let exp: Vec<i32> = dp.iter().filter(|d| d.age >= life).map(|d| d.eid).collect();
+        for eid in &exp {
+            dp.retain(|d| d.eid != *eid);
+            broadcast_seen_destroy(*eid);
+        }
+        while dp.len() > DROP_CAP {
+            let d = dp.remove(0);
+            broadcast_seen_destroy(d.eid);
+        }
+        if let Some(t) = __t {
+            tickprof::add("drops/despawn", t.elapsed());
+        }
+        __t = __prof.then(std::time::Instant::now);
+        let merged = merge_drops(&mut dp);
+        __t = __prof.then(std::time::Instant::now);
+        for eid in &merged {
+            dp.retain(|d| d.eid != *eid);
+            broadcast_seen_destroy(*eid);
+        }
+        if let Some(t) = __t {
+            tickprof::add("drops/merge_destroy", t.elapsed());
+        }
+    }
+}
+
+struct Furnace {
+    input: Stack,
+    fuel: Stack,
+    output: Stack,
+    burn_left: i32,
+    progress: i32,
+    dirty: bool,
+    xp: f32,
+    recipe_cache: CachedLookup<(i64, u64), Option<(i64, u8)>>,
+    fuel_cache: CachedLookup<i64, i32>,
+}
+static FURNACES: Registry<DimBlockPos, Furnace> = OnceLock::new();
+
+fn furnaces() -> &'static LockedMap<DimBlockPos, Furnace> {
+    FURNACES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+// furnace block states 4295..=4302 (facing x lit); one store for
+// containers regardless of which interface touched them
+fn is_furnace_at(x: i32, y: i32, z: i32) -> bool {
+    (4295..=4302).contains(&block_at(x, y, z))
+}
+fn furnace_slots(pos: (i32, i32, i32)) -> HashMap<i16, Stack> {
+    let fs = furnaces().lock().unwrap();
+    fs.get(&ow_block(pos))
+        .map(|f| {
+            let mut m = HashMap::new();
+            if f.input.1 > 0 {
+                m.insert(0i16, f.input.clone());
+            }
+            if f.fuel.1 > 0 {
+                m.insert(1i16, f.fuel.clone());
+            }
+            if f.output.1 > 0 {
+                m.insert(2i16, f.output.clone());
+            }
+            m
+        })
+        .unwrap_or_default()
+}
+/// Bumped by the datapack loader. Recipes and ingredient tags are mutable, so
+/// anything caching an answer derived from them must key on this.
+static CONTENT_REVISION: AtomicU64 = AtomicU64::new(0);
+fn content_revision() -> u64 {
+    CONTENT_REVISION.load(Ordering::Acquire)
+}
+
+/// The smelting result, independent of which furnace is asking. Datapack recipes
+/// and tags are mutable, so a caller that caches this must include
+/// `content_revision()` in the key. The result never carries components, which is
+/// why the cache can hold a plain pair rather than a whole stack.
+fn smelt_out(item: i64) -> Option<(i64, u8)> {
+    for (ig, o, c, _) in json_smelts().lock().unwrap().iter() {
+        if ingr_match(ig, item, 0) {
+            return Some((*o, *c));
+        }
+    }
+    smelt_result(item).map(|o| (o, 1))
+}
+fn smelt_result(item: i64) -> Option<i64> {
+    for (a, b) in [
+        ("beef", "cooked_beef"),
+        ("porkchop", "cooked_porkchop"),
+        ("chicken", "cooked_chicken"),
+        ("mutton", "cooked_mutton"),
+        ("sand", "glass"),
+        ("cobblestone", "stone"),
+        ("potato", "baked_potato"),
+        ("oak_log", "charcoal"),
+        ("raw_iron", "iron_ingot"),
+        ("raw_copper", "copper_ingot"),
+        ("raw_gold", "gold_ingot"),
+        ("rabbit", "cooked_rabbit"),
+        ("cod", "cooked_cod"),
+    ] {
+        if name_to_item(a) == Some(item) {
+            return name_to_item(b);
+        }
+    }
+    None
+}
+fn smelt_xp(item: i64) -> f32 {
+    for (ig, _, _, xp) in json_smelts().lock().unwrap().iter() {
+        if ingr_match(ig, item, 0) {
+            return *xp;
+        }
+    }
+    for (n, x) in [
+        ("raw_gold", 1.0f32),
+        ("raw_iron", 0.7),
+        ("raw_copper", 0.7),
+        ("beef", 0.35),
+        ("porkchop", 0.35),
+        ("chicken", 0.35),
+        ("mutton", 0.35),
+        ("rabbit", 0.35),
+        ("cod", 0.35),
+        ("salmon", 0.35),
+        ("potato", 0.35),
+        ("kelp", 0.35),
+        ("oak_log", 0.15),
+    ] {
+        if name_to_item(n) == Some(item) {
+            return x;
+        }
+    }
+    if smelt_result(item).is_some() {
+        0.1
+    } else {
+        0.0
+    }
+}
+// grant accumulated smelting xp: floor + fractional chance (vanilla), as orbs at (px,py,pz)
+fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
+    if f.xp <= 0.0 {
+        return;
+    }
+    let whole = f.xp.floor() as i16
+        + if (world_rng::next_u64() % 1024) as f32 / 1024.0 < f.xp.fract() {
+            1
+        } else {
+            0
+        };
+    f.xp = 0.0;
+    if whole > 0 {
+        xps().lock().unwrap().push(Xp {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x: px,
+            y: py + 1.0,
+            z: pz,
+            val: whole,
+            age: 0,
+        });
+    }
+}
+fn fuel_ticks(item: i64) -> i32 {
+    for (n, t) in [
+        ("coal", 1600),
+        ("charcoal", 1600),
+        ("oak_log", 300),
+        ("oak_planks", 300),
+        ("stick", 100),
+        ("coal_block", 16000),
+    ] {
+        if name_to_item(n) == Some(item) {
+            return server_ticks(t) as i32;
+        }
+    }
+    0
+}
+static CHESTS: Registry<ContainerKey, HashMap<i16, Stack>> = OnceLock::new();
+
+fn roll_loot_container_slots(
+    kind: crate::generation_payload::ContainerKind,
+    loot_table: &str,
+    loot_seed: Option<i64>,
+) -> HashMap<i16, Stack> {
+    use crate::generation_payload::ContainerKind;
+    // 1.21.1 `RandomizableContainer.unpackLootTable` treats seed 0 as unseeded (`RandomSource.create()`).
+    let seed = loot_seed
+        .filter(|&s| s != 0)
+        .unwrap_or_else(|| world_rng::next_u64() as i64);
+    if loot_table == "minecraft:chests/abandoned_mineshaft" {
+        roll_cart_loot(seed)
+    } else {
+        let pools = loot_tables().lock().unwrap().get(loot_table).map(|p| {
+            p.iter()
+                .map(|pl| LootPool {
+                    rolls: pl.rolls,
+                    chance: pl.chance,
+                    funcs: pl.funcs.clone(),
+                    entries: pl
+                        .entries
+                        .iter()
+                        .map(|e| LootEntry {
+                            item: e.item,
+                            min: e.min,
+                            max: e.max,
+                            funcs: e.funcs.clone(),
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut out = HashMap::new();
+        if let Some(pools) = pools {
+            let items = roll_loot_seeded(&pools, seed);
+            // `LootTable.fill` fills `container.getContainerSize()`
+            // slots, so the native menu size bounds the roll.
+            let slot_limit = match kind {
+                ContainerKind::Chest => 27i16,
+                ContainerKind::Furnace => 3i16,
+                                        ContainerKind::BlockContainer(size) => {
+                                            i16::from(size)
+                                        }
+            };
+            let mut slot_order: Vec<i16> = (0..slot_limit).collect();
+            if kind != ContainerKind::Furnace {
+                let mut shuffle_rng = crate::generation_math::Lcg::new(seed as u64);
+                for i in (2..=slot_order.len()).rev() {
+                    let j = shuffle_rng.next_bound(i as i32) as usize;
+                    slot_order.swap(i - 1, j);
+                }
+            }
+            for (idx, stack) in items.into_iter().take(slot_limit as usize).enumerate() {
+                out.insert(slot_order[idx], stack);
+            }
+        }
+        out
+    }
+}
+fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
+    with_save_guard(|| {
+        let pending = pending_block_loot().lock().unwrap().remove(&pos);
+        let Some(entry) = pending else {
+            return false;
+        };
+        let rolled = roll_loot_container_slots(entry.kind, &entry.loot_table, entry.loot_seed);
+        let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let slots = store.entry(ContainerKey::Block(pos)).or_default();
+        for (slot, stack) in rolled {
+            slots.insert(slot, stack);
+        }
+        true
+    })
+}
+fn window_has_pending_loot(window: (ContainerKey, Option<ContainerKey>)) -> bool {
+    let map = pending_block_loot().lock().unwrap();
+    [Some(window.0), window.1]
+        .into_iter()
+        .flatten()
+        .any(|key| matches!(key, ContainerKey::Block(pos) if !is_ender_key((pos.1, pos.2, pos.3)) && map.contains_key(&pos)))
+}
+fn unpack_window_loot_if_needed(window: (ContainerKey, Option<ContainerKey>)) {
+    for key in [Some(window.0), window.1].into_iter().flatten() {
+        if let ContainerKey::Block(pos) = key {
+            if !is_ender_key((pos.1, pos.2, pos.3)) {
+                unpack_block_loot_if_needed(pos);
+            }
+        }
+    }
+}
+
+fn chests() -> &'static LockedMap<ContainerKey, HashMap<i16, Stack>> {
+    CHESTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Is the container a menu was opened on still there? A block container is gone the
+/// moment the world block it was built on is gone: vanilla's chunk stops holding the
+/// block entity, so there is nothing left for a click to reach.
+fn container_exists(key: ContainerKey) -> bool {
+    match key {
+        ContainerKey::Block(pos) => {
+            is_ender_key((pos.1, pos.2, pos.3))
+                || container_kind(block_at_dim(pos.0, pos.1, pos.2, pos.3)).is_some()
+        }
+        ContainerKey::Cart(uuid) => generated_content()
+            .lock()
+            .unwrap()
+            .carts
+            .iter()
+            .any(|c| c.uuid().ok() == Some(uuid)),
+    }
+}
+
+// ---------- container openers and lid sync (ContainerOpenersCounter, 1.21.1) ----------
+//
+// `dqu` (ContainerOpenersCounter) keeps one `openCount` per block entity and calls
+// `openerCountChanged(level, pos, state, previous, count)` on *every* change; `dqo`
+// (ChestBlockEntity) implements that as `level.blockEvent(pos, block, 1, count)`, i.e.
+// one `ClientboundBlockEventPacket(id=1, param=count)` per half. Each half of a double
+// chest has its own counter (the combined `Container.startOpen` reaches both), so both
+// halves emit. The client lerps the lid from that packet (`getOpenNess`), and a double
+// chest renders `max(left, right)` (`dhb$3`).
+//
+// The port derives the count from the live windows instead of storing it. A stored count
+// would be a second copy of "who has this open" that has to be kept true on open, close,
+// disconnect, break and reload; vanilla's own counter is per block entity and deliberately
+// not serialised, so nothing about it belongs in the save.
+
+/// `ContainerOpenersCounter.getOpenerCount` for one half: how many clients in
+/// `audience` hold a menu built on it. A paired window contains both halves, so both
+/// halves see the same viewers - which is what `CompoundContainer.startOpen` does.
+fn half_openers(audience: &[Arc<Client>], pos: BlockPos) -> u32 {
+    let key = ContainerKey::ow(pos);
+    audience
+        .iter()
+        .filter(|c| {
+            if c.is_spectator() {
+                return false;
+            }
+            let open = match c.open_chest.lock() {
+                Ok(g) => *g,
+                Err(_) => return false,
+            };
+            let Some((a, b)) = open else {
+                return false;
+            };
+            if a == key || b == Some(key) {
+                return true;
+            }
+            if matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {
+                return c
+                    .chest_sync
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.as_ref().filter(|st| st.window == (a, b)).and_then(|st| st.anchor))
+                    == Some(pos);
+            }
+            false
+        })
+        .count() as u32
+}
+
+/// The opener count of every half before a window change, so the change can be
+/// diffed rather than assumed.
+fn chest_opener_snapshot(audience: &[Arc<Client>], halves: &[BlockPos]) -> Vec<(BlockPos, u32)> {
+    halves
+        .iter()
+        .map(|&pos| (pos, half_openers(audience, pos)))
+        .collect()
+}
+
+/// 1.21.1 play clientbound 0x09 `ClientboundBlockUpdatePacket` (`acd`): BlockPos, VarInt block state.
+fn broadcast_block_update(audience: &[Arc<Client>], pos: BlockPos, state: u32) {
+    let mut body = Vec::with_capacity(12);
+    write_pos(&mut body, pos.0, pos.1, pos.2);
+    write_varint(&mut body, i64::from(state));
+    let chunk = (pos.0 >> 4, pos.2 >> 4);
+    fanout_in(
+        audience,
+        |c| {
+            if c.chunks.lock().unwrap().contains(&chunk) {
+                return true;
+            }
+            let at = *c.pos.lock().unwrap();
+            let (dx, dy, dz) = (
+                at.0 - f64::from(pos.0),
+                at.1 - f64::from(pos.1),
+                at.2 - f64::from(pos.2),
+            );
+            dx * dx + dy * dy + dz * dz <= 64.0 * 64.0
+        },
+        |_| (0x09, body.clone()),
+    );
+}
+
+/// `ContainerOpenersCounter.openerCountChanged`: one block event, carrying the new
+/// count, for each chest/ender-chest half whose count actually moved.
+/// `BarrelBlockEntity` (`dqa$1`) overrides `onOpen`/`onClose` to toggle `open` and
+/// broadcast a block update (`0x09`), and leaves `openerCountChanged` empty (no `0x08`).
+fn sync_chest_openers(audience: &[Arc<Client>], before: &[(BlockPos, u32)]) {
+    for &(pos, previous) in before {
+        let now = half_openers(audience, pos);
+        if now != previous {
+            let st = block_at(pos.0, pos.1, pos.2);
+            if let Some(reg) = breg().filter(|reg| reg.name_of(st) == "minecraft:barrel") {
+                if (previous == 0) != (now == 0) {
+                    let next = reg.with_prop(st, "open", if now > 0 { "true" } else { "false" });
+                    if next != st {
+                        set_block(pos.0, pos.1, pos.2, next);
+                        broadcast_block_update(audience, pos, next);
+                    }
+                }
+            } else {
+                // vanilla writes the count with `writeByte`: the wire field is a byte.
+                broadcast_block_event(audience, pos, 1, now as u8);
+            }
+        }
+    }
+}
+
+/// 1.21.1 play clientbound 0x08 `ClientboundBlockEventPacket`: BlockPos, unsigned
+/// byte action id, unsigned byte action param, VarInt **block** id. Verified against
+/// the jar: `agh.a` registers `agg.a` (bundle, 0x00) then `agg.c..agg.j` in order, and
+/// `agg.j` is `acc` = `ClientboundBlockEventPacket`, the ninth entry = 0x08; the
+/// neighbouring entries land where the port's other ids do (0x07 block entity data,
+/// 0x09 block update, 0x12 close container as `agg.t`).
+fn broadcast_block_event(audience: &[Arc<Client>], pos: BlockPos, action: u8, param: u8) {
+    let Some(block) = breg().and_then(|reg| reg.block_id_of(block_at(pos.0, pos.1, pos.2))) else {
+        return;
+    };
+    let mut body = Vec::with_capacity(12);
+    write_pos(&mut body, pos.0, pos.1, pos.2);
+    body.push(action);
+    body.push(param);
+    write_varint(&mut body, i64::from(block));
+    // vanilla `Level.blockEvent` reaches every player within 64 blocks of the cell.
+    fanout_in(
+        audience,
+        |c| {
+            let at = *c.pos.lock().unwrap();
+            let (dx, dy, dz) = (
+                at.0 - f64::from(pos.0),
+                at.1 - f64::from(pos.1),
+                at.2 - f64::from(pos.2),
+            );
+            dx * dx + dy * dy + dz * dz <= 64.0 * 64.0
+        },
+        |_| (0x08, body.clone()),
+    );
+}
+
+/// Is the menu a client opened still backed by the world? A block window needs its
+/// block container (`container_exists`), and a paired one additionally needs both
+/// halves to still name each other: the pair *is* block state, so a broken half, a
+/// `/setblock` or a re-pairing invalidates the window.
+fn window_live(open: (ContainerKey, Option<ContainerKey>)) -> bool {
+    let (first, second) = open;
+    if !container_exists(first) || second.is_some_and(|key| !container_exists(key)) {
+        return false;
+    }
+    let (
+        ContainerKey::Block((rdim, rx, ry, rz)),
+        Some(ContainerKey::Block((ldim, lx, ly, lz))),
+    ) = (first, second)
+    else {
+        return true;
+    };
+    // A pair is block state, so both halves must be in the same dimension.
+    rdim == ldim && chest_pair(rx, ry, rz) == Some(((rx, ry, rz), (lx, ly, lz)))
+}
+fn window_live_for(
+    c: &Client,
+    open: (ContainerKey, Option<ContainerKey>),
+) -> bool {
+    if !window_live(open) {
+        return false;
+    }
+    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key((ek.1, ek.2, ek.3))) {
+        let anchor = c
+            .chest_sync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|s| s.window == open)
+            .and_then(|s| s.anchor);
+        return anchor.is_some_and(|pos| (7513..=7520).contains(&block_at(pos.0, pos.1, pos.2)));
+    }
+    true
+}
+
+/// The world no longer holds the container behind `key`: every menu built on it dies
+/// (`ClientboundContainerClosePacket` on windowId 1, the only id `open_chest_window`
+/// allocates) and the opener counts of `halves` drop. Returns how many windows closed.
+fn invalidate_container_windows(
+    audience: &[Arc<Client>],
+    key: ContainerKey,
+    halves: &[BlockPos],
+) -> usize {
+    let before = chest_opener_snapshot(audience, halves);
+    let mut closed = 0;
+    for c in audience {
+        let had = {
+            let mut open = c.open_chest.lock().unwrap_or_else(|e| e.into_inner());
+            if open.is_some_and(|(a, b)| a == key || b == Some(key)) {
+                *open = None;
+                true
+            } else {
+                false
+            }
+        };
+        if had {
+            *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        if had {
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x12, vec![1u8]);
+            }
+            closed += 1;
+        }
+    }
+    sync_chest_openers(audience, &before);
+    closed
+}
+fn invalidate_ender_chest_windows(audience: &[Arc<Client>], pos: BlockPos) -> usize {
+    let mut closed = 0;
+    for c in audience {
+        let had = {
+            let mut open = c.open_chest.lock().unwrap_or_else(|e| e.into_inner());
+            let mut sync = c.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
+            let matches_anchor = open.is_some_and(|(a, b)| {
+                matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none()
+            }) && sync.as_ref().and_then(|s| s.anchor) == Some(pos);
+            if matches_anchor {
+                *open = None;
+                *sync = None;
+                true
+            } else {
+                false
+            }
+        };
+        if had {
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x12, vec![1u8]);
+            }
+            closed += 1;
+        }
+    }
+    closed
+}
+fn invalidate_client_chest_window(
+    audience: &[Arc<Client>],
+    me: &Client,
+    open: (ContainerKey, Option<ContainerKey>),
+) {
+    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key((ek.1, ek.2, ek.3))) {
+        if let Some((_, Some(pos))) = client_open_window_and_anchor(me) {
+            invalidate_ender_chest_windows(audience, pos);
+            return;
+        }
+    }
+    invalidate_container_windows(audience, open.0, &chest_window_halves(open));
+}
+
+fn container_kind(st: u32) -> Option<&'static str> {
+    // 27-slot generic container blocks
+    if (2954..=2977).contains(&st) {
+        return Some("Chest");
+    }
+    if (9119..=9142).contains(&st) {
+        return Some("Chest");
+    } // trapped_chest
+    if (18408..=18419).contains(&st) {
+        return Some("Barrel");
+    }
+    if (12562..=12663).contains(&st) {
+        return Some("Shulker Box");
+    }
+    None
+}
+// ---------- chest world state (ChestBlock / ChestBlockEntity, 1.21.1) ----------
+//
+// A chest is not "a container at a position": its block state says whether this cell
+// is the `left` or `right` half of a pair and which way it faces, and that state is
+// the only definition of its partner. None of the functions below infer a pair from
+// raw adjacency, because adjacency cannot tell a real pair from two chests that
+// happen to touch.
+//
+// Read from `javap -p -c` on server-1.21.1.jar (mappings from /var/tmp/mcm/server.txt):
+//   dhb.g(dtc)      state TYPE -> DoubleBlockCombiner.BlockType: single->SINGLE,
+//                   right->FIRST, left->SECOND (`dif$a.a/b/c`)
+//   dif.a(..)       own FIRST keeps own BE first, own SECOND puts the neighbour
+//                   first: `CompoundContainer(first, second)`
+//   bqj.a(int)      slot < first.size ? first.a(slot) : second.a(slot - first.size)
+// so the combined container is slots 0..=26 = the RIGHT half and 27..=53 = the LEFT,
+// whichever half the player clicked.
+
+/// The horizontal half of vanilla's `Direction`, in 2D data-value order
+/// (`Direction.from2DDataValue`: south, west, north, east). Chest pairing only asks
+/// horizontal questions, and this order is what `getClockWise()` means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HFace {
+    South,
+    West,
+    North,
+    East,
+}
+
+impl HFace {
+    /// `Direction.fromYaw` = `Mth.floor(yaw / 90 + 0.5) & 3`; the port's yaw is in
+    /// degrees with 0 = south, which is the convention `getRotation()` uses.
+    fn from_yaw(yaw: f32) -> HFace {
+        match ((yaw / 90.0 + 0.5).floor() as i64) & 3 {
+            0 => HFace::South,
+            1 => HFace::West,
+            2 => HFace::North,
+            _ => HFace::East,
+        }
+    }
+    /// `Direction.from3DDataValue` for the four horizontal values (DOWN 0, UP 1,
+    /// NORTH 2, SOUTH 3, WEST 4, EAST 5).
+    fn from_face(face: u8) -> Option<HFace> {
+        match face {
+            2 => Some(HFace::North),
+            3 => Some(HFace::South),
+            4 => Some(HFace::West),
+            5 => Some(HFace::East),
+            _ => None,
+        }
+    }
+    fn opposite(self) -> HFace {
+        match self {
+            HFace::South => HFace::North,
+            HFace::West => HFace::East,
+            HFace::North => HFace::South,
+            HFace::East => HFace::West,
+        }
+    }
+    /// `Direction.getClockWise()`: north->east, east->south, south->west, west->north.
+    fn clock_wise(self) -> HFace {
+        match self {
+            HFace::North => HFace::East,
+            HFace::East => HFace::South,
+            HFace::South => HFace::West,
+            HFace::West => HFace::North,
+        }
+    }
+    /// `Direction.getCounterClockWise()`: north->west, west->south, south->east,
+    /// east->north.
+    fn counter_clock_wise(self) -> HFace {
+        match self {
+            HFace::North => HFace::West,
+            HFace::West => HFace::South,
+            HFace::South => HFace::East,
+            HFace::East => HFace::North,
+        }
+    }
+    /// `Direction.getAxis()`: west/east are the x axis, north/south the z axis.
+    fn axis(self) -> u8 {
+        match self {
+            HFace::West | HFace::East => 0,
+            HFace::North | HFace::South => 1,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            HFace::South => "south",
+            HFace::West => "west",
+            HFace::North => "north",
+            HFace::East => "east",
+        }
+    }
+    fn parse(name: &str) -> Option<HFace> {
+        match name {
+            "south" => Some(HFace::South),
+            "west" => Some(HFace::West),
+            "north" => Some(HFace::North),
+            "east" => Some(HFace::East),
+            _ => None,
+        }
+    }
+    /// `BlockPos.relative(self)` in x/z.
+    fn step(self) -> (i32, i32) {
+        match self {
+            HFace::South => (0, 1),
+            HFace::West => (-1, 0),
+            HFace::North => (0, -1),
+            HFace::East => (1, 0),
+        }
+    }
+}
+
+/// The chest block this state belongs to. `chest` and `trapped_chest` are different
+/// `Block` instances in vanilla, and `BlockState.is(this)` in `candidatePartnerFacing`
+/// compares instances, so the two kinds never pair.
+fn chest_kind(st: u32) -> Option<&'static str> {
+    match breg()?.name_of(st) {
+        "minecraft:chest" => Some("minecraft:chest"),
+        "minecraft:trapped_chest" => Some("minecraft:trapped_chest"),
+        _ => None,
+    }
+}
+fn chest_named(st: u32) -> bool {
+    chest_kind(st).is_some()
+}
+fn chest_facing(st: u32) -> Option<HFace> {
+    HFace::parse(&breg()?.get_prop(st, "facing")?)
+}
+/// `ChestType`: `single`, `left`, `right` (dtu field order a/b/c).
+fn chest_type(st: u32) -> Option<&'static str> {
+    match breg()?.get_prop(st, "type")?.as_str() {
+        "single" => Some("single"),
+        "left" => Some("left"),
+        "right" => Some("right"),
+        _ => None,
+    }
+}
+/// `ChestBlock.getConnectedDirection`: the cell this half is connected to. A `single`
+/// chest points at nothing, which is why it cannot be half of a pair.
+fn chest_connected_direction(st: u32) -> Option<HFace> {
+    let facing = chest_facing(st)?;
+    match chest_type(st)? {
+        "left" => Some(facing.clock_wise()),
+        "right" => Some(facing.counter_clock_wise()),
+        _ => None,
+    }
+}
+/// The pair the half at `pos` belongs to, ordered the way `DoubleBlockCombiner`
+/// orders it: `(right, left)`. `None` for a `single` state, for two chests that merely
+/// touch, for the two kinds mixed, and for a half whose partner does not point back.
+fn chest_pair(x: i32, y: i32, z: i32) -> Option<(BlockPos, BlockPos)> {
+    chest_pair_of(block_at(x, y, z), (x, y, z))
+}
+fn chest_pair_of(st: u32, pos: BlockPos) -> Option<(BlockPos, BlockPos)> {
+    chest_pair_of_dim(DimId::Overworld, st, pos)
+}
+fn chest_pair_of_dim(dim: DimId, st: u32, pos: BlockPos) -> Option<(BlockPos, BlockPos)> {
+    let facing = chest_facing(st)?;
+    let own = chest_type(st)?;
+    let dir = chest_connected_direction(st)?;
+    let (dx, dz) = dir.step();
+    let other = (pos.0 + dx, pos.1, pos.2 + dz);
+    let ost = block_at_dim(dim, other.0, other.1, other.2);
+    // `BlockState.is(this)`: a trapped chest beside a chest is a different block.
+    if breg()?.name_of(ost) != breg()?.name_of(st) {
+        return None;
+    }
+    if chest_facing(ost)? != facing {
+        return None;
+    }
+    // The partner must point back: with equal facings that is exactly "opposite TYPE".
+    if chest_connected_direction(ost)? != dir.opposite() {
+        return None;
+    }
+    match own {
+        "right" => Some((pos, other)),
+        _ => Some((other, pos)),
+    }
+}
+/// The other half, or `None` when this chest is `single`.
+fn chest_partner(x: i32, y: i32, z: i32) -> Option<BlockPos> {
+    chest_pair(x, y, z).map(|(right, left)| if (x, y, z) == right { left } else { right })
+}
+/// The halves the crate at `pos` occupied while it still had state `st`: both halves
+/// of its pair, or just the cell when it was `single`. Read from the *old* state, so a
+/// removal can still tell which counters to drop. Empty for a non-chest.
+fn chest_halves_of(st: u32, pos: BlockPos) -> Vec<BlockPos> {
+    if !chest_named(st) {
+        return Vec::new();
+    }
+    match chest_pair_of(st, pos) {
+        Some((right, left)) => vec![right, left],
+        None => vec![pos],
+    }
+}
+/// The window a container at `pos` opens, in `DoubleBlockCombiner` order: the first key
+/// owns slots 0..=26. A barrel, a shulker box or a `single` chest is its own window.
+fn chest_window(x: i32, y: i32, z: i32) -> (ContainerKey, Option<ContainerKey>) {
+    match chest_pair(x, y, z) {
+        Some((right, left)) => (ContainerKey::ow(right), Some(ContainerKey::ow(left))),
+        None => (ContainerKey::ow((x, y, z)), None),
+    }
+}
+fn chest_window_dim(dim: DimId, x: i32, y: i32, z: i32) -> (ContainerKey, Option<ContainerKey>) {
+    match chest_pair_of_dim(dim, block_at_dim(dim, x, y, z), (x, y, z)) {
+        Some((right, left)) => (
+            ContainerKey::Block((dim, right.0, right.1, right.2)),
+            Some(ContainerKey::Block((dim, left.0, left.1, left.2))),
+        ),
+        None => (ContainerKey::Block((dim, x, y, z)), None),
+    }
+}
+/// Which cells a window's opener counters live on. The synthetic ender-chest key has
+/// no fixed block pos in the key itself; callers with a client anchor use
+/// `client_window_halves` to include the clicked ender chest cell.
+fn chest_window_halves(open: (ContainerKey, Option<ContainerKey>)) -> Vec<BlockPos> {
+    let mut out: Vec<BlockPos> = Vec::new();
+    for key in [Some(open.0), open.1].into_iter().flatten() {
+        if let ContainerKey::Block((_dim, x, y, z)) = key {
+            let pos = (x, y, z);
+            if !is_ender_key(pos) && !out.contains(&pos) {
+                out.push(pos);
+            }
+        }
+    }
+    out
+}
+fn client_window_halves(
+    open: (ContainerKey, Option<ContainerKey>),
+    anchor: Option<BlockPos>,
+) -> Vec<BlockPos> {
+    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key((ek.1, ek.2, ek.3))) {
+        return anchor.into_iter().collect();
+    }
+    chest_window_halves(open)
+}
+fn client_open_window_and_anchor(
+    c: &Client,
+) -> Option<((ContainerKey, Option<ContainerKey>), Option<BlockPos>)> {
+    let open = (*c.open_chest.lock().unwrap())?;
+    let anchor = c
+        .chest_sync
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|s| s.window == open)
+        .and_then(|s| s.anchor);
+    Some((open, anchor))
+}
+/// `ChestBlock.isBlockedChestByBlock` (`dhb.a(Ldcc;Ljd;)Z`): true when `pos.above()`
+/// `isRedstoneConductor`. Shared by `ChestBlock` and `EnderChestBlock.useWithoutItem`.
+fn is_blocked_chest_by_block(pos: BlockPos) -> bool {
+    let above = block_at(pos.0, pos.1 + 1, pos.2);
+    breg().is_some_and(|reg| reg.is_redstone_conductor(above))
+}
+/// `ChestBlock.isCatSittingOnChest` (`dhb.b(Ldcx;Ljd;)Z`): true when a sitting `Cat`
+/// (`etype == 15`, dimensions `0.6 x 0.7`) intersects `AABB(x, y+1, z, x+1, y+2, z+1)`.
+fn is_cat_sitting_on_chest(pos: BlockPos) -> bool {
+    let sitting = sitting_cats().lock().unwrap();
+    if sitting.is_empty() {
+        return false;
+    }
+    let min = [f64::from(pos.0), f64::from(pos.1 + 1), f64::from(pos.2)];
+    let max = [
+        f64::from(pos.0 + 1),
+        f64::from(pos.1 + 2),
+        f64::from(pos.2 + 1),
+    ];
+    let ms = mobs().lock().unwrap();
+    ms.iter().any(|m| {
+        if m.etype != 15 || !sitting.contains(&m.eid) || *m.hp.lock().unwrap() <= 0.0 {
+            return false;
+        }
+        let (mx, my, mz, ..) = *m.pos.lock().unwrap();
+        aabb_overlaps(
+            (min, max),
+            ([mx - 0.3, my, mz - 0.3], [mx + 0.3, my + 0.7, mz + 0.3]),
+        )
+    })
+}
+/// `ChestBlock.isChestBlockedAt` (`dhb.a(Ldcx;Ljd;)Z`): blocked if the block above is
+/// a redstone conductor or a cat is sitting on top.
+fn is_chest_blocked_at(pos: BlockPos) -> bool {
+    is_blocked_chest_by_block(pos) || is_cat_sitting_on_chest(pos)
+}
+/// `ChestBlock.getMenuProvider` (`dhb.b` -> `dif.a` with `dhb::isChestBlockedAt`):
+/// a single chest is blocked if its cell is blocked; a double chest is blocked if EITHER
+/// half is blocked. Barrels and minecart chests never use this predicate.
+fn chest_window_blocked(window: (ContainerKey, Option<ContainerKey>)) -> bool {
+    chest_window_halves(window)
+        .into_iter()
+        .any(is_chest_blocked_at)
+}
+fn client_eye_pos(c: &Client) -> (f64, f64, f64) {
+    let (px, py, pz, ..) = *c.pos.lock().unwrap();
+    // 1.21.1 `Player` pose eye heights (`cmx.<clinit>`): standing 1.62f, crouching 1.27f.
+    let eye_h = if *c.sneaking.lock().unwrap() {
+        1.27
+    } else {
+        1.62
+    };
+    (px, py + eye_h, pz)
+}
+fn aabb_dist_sq_to_point(min: [f64; 3], max: [f64; 3], pt: (f64, f64, f64)) -> f64 {
+    // 1.21.1 `AABB.distanceToSqr(Vec3)` (`ewx.e(Lexc;)D`).
+    let dx = (min[0] - pt.0).max(pt.0 - max[0]).max(0.0);
+    let dy = (min[1] - pt.1).max(pt.1 - max[1]).max(0.0);
+    let dz = (min[2] - pt.2).max(pt.2 - max[2]).max(0.0);
+    dx * dx + dy * dy + dz * dz
+}
+fn can_interact_with_block(c: &Client, pos: BlockPos, extra: f64) -> bool {
+    // 1.21.1 `Player.canInteractWithBlock(BlockPos, double)` (`cmx.a(Ljd;D)Z`):
+    // `double d = this.blockInteractionRange() + distance;`
+    // `return new AABB(pos).distanceToSqr(this.getEyePosition()) < d * d;`
+    // `Attributes.BLOCK_INTERACTION_RANGE` = 4.5, creative modifier `+0.5` -> 5.0.
+    let base = if *c.gm.lock().unwrap() == 1 {
+        5.0
+    } else {
+        4.5
+    };
+    let d = base + extra;
+    let min = [f64::from(pos.0), f64::from(pos.1), f64::from(pos.2)];
+    let max = [
+        f64::from(pos.0 + 1),
+        f64::from(pos.1 + 1),
+        f64::from(pos.2 + 1),
+    ];
+    aabb_dist_sq_to_point(min, max, client_eye_pos(c)) < d * d
+}
+/// 1.21.1 `ChestMenu.stillValid` (`cqc.b`) -> `Container.stillValidBlockEntity`
+/// (`bqk.a(Ldqh;Lcmx;F)` with `4.0f`) / `CompoundContainer.stillValid` (`bqj.a` checks
+/// both halves) / `ContainerEntity.isChestVehicleStillValid` (`cox.g`).
+fn chest_still_valid(
+    c: &Client,
+    open: (ContainerKey, Option<ContainerKey>),
+    anchor: Option<BlockPos>,
+) -> bool {
+    if !window_live(open) {
+        return false;
+    }
+    match open {
+        (ContainerKey::Block((_dim, x, y, z)), second) => {
+            let first = (x, y, z);
+            let first_ok = if is_ender_key(first) {
+                anchor.is_some_and(|pos| {
+                    (7513..=7520).contains(&block_at(pos.0, pos.1, pos.2))
+                        && can_interact_with_block(c, pos, 4.0)
+                })
+            } else {
+                can_interact_with_block(c, first, 4.0)
+            };
+            if !first_ok {
+                return false;
+            }
+            match second {
+                Some(ContainerKey::Block((_, x2, y2, z2))) => {
+                    can_interact_with_block(c, (x2, y2, z2), 4.0)
+                }
+                _ => true,
+            }
+        }
+        (ContainerKey::Cart(uuid), _) => {
+            let cart_pos = generated_content()
+                .lock()
+                .unwrap()
+                .carts
+                .iter()
+                .find(|cart| cart.uuid().ok() == Some(uuid))
+                .and_then(|cart| cart.pos().ok());
+            let Some(pos) = cart_pos else {
+                return false;
+            };
+            // `Attributes.ENTITY_INTERACTION_RANGE` = 3.0, creative modifier `+2.0` -> 5.0.
+            let base = if *c.gm.lock().unwrap() == 1 {
+                5.0
+            } else {
+                3.0
+            };
+            let d = base + 4.0;
+            let min = [pos[0] - 0.49, pos[1], pos[2] - 0.49];
+            let max = [pos[0] + 0.49, pos[1] + 0.7, pos[2] + 0.49];
+            aabb_dist_sq_to_point(min, max, client_eye_pos(c)) < d * d
+        }
+    }
+}
+fn chest_window_slots(window: (ContainerKey, Option<ContainerKey>)) -> Vec<Stack> {
+    let first = window.0;
+    let rows = if window.1.is_some() { 54usize } else { 27usize };
+    let mut out = vec![(0, 0, Vec::new()); rows];
+    let all = chests().lock().unwrap();
+    let ch = all.get(&first).cloned().unwrap_or_default();
+    for i in 0..27i16 {
+        if let Some(st) = ch.get(&i) {
+            if st.1 > 0 {
+                out[i as usize] = st.clone();
+            }
+        }
+    }
+    if let Some(second) = window.1 {
+        if let Some(ch2) = all.get(&second) {
+            for i in 0..27i16 {
+                if let Some(st) = ch2.get(&i) {
+                    if st.1 > 0 {
+                        out[27 + i as usize] = st.clone();
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+/// Per-tick `ServerPlayer.tick` (`aqv.l`) container maintenance: closes viewers that
+/// fail `stillValid` (emitting `0x12` and updating opener counts via `0x08`) and runs
+/// `AbstractContainerMenu.broadcastChanges` (`cpu.d`) for remaining viewers by diffing
+/// container slots `0..rows` and sending `0x15` (`ClientboundContainerSetSlotPacket`)
+/// with incremented `stateId` (`(stateId + 1) & 32767`).
+fn chest_viewer_tick_on(audience: &[Arc<Client>]) {
+    if audience.is_empty() {
+        return;
+    }
+    for c in audience {
+        let open = *c.open_chest.lock().unwrap();
+        let Some(win) = open else {
+            *c.chest_sync.lock().unwrap() = None;
+            continue;
+        };
+        let anchor = c
+            .chest_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|s| s.window == win)
+            .and_then(|s| s.anchor);
+        if !chest_still_valid(c, win, anchor) {
+            let halves = client_window_halves(win, anchor);
+            let before = chest_opener_snapshot(audience, &halves);
+            *c.open_chest.lock().unwrap() = None;
+            *c.chest_sync.lock().unwrap() = None;
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x12, vec![1u8]);
+            }
+            sync_chest_openers(audience, &before);
+            continue;
+        }
+        let current = chest_window_slots(win);
+        let updates: Vec<(i16, i32, Stack)> = {
+            let mut sync_guard = c.chest_sync.lock().unwrap();
+            let sync = sync_guard.get_or_insert_with(|| ChestSyncState {
+                window: win,
+                anchor,
+                state_id: 0,
+                last_slots: vec![(0, 0, Vec::new()); current.len()],
+            });
+            if sync.window != win || sync.last_slots.len() != current.len() {
+                sync.window = win;
+                sync.anchor = anchor;
+                sync.state_id = 0;
+                sync.last_slots = vec![(0, 0, Vec::new()); current.len()];
+            }
+            let mut out = Vec::new();
+            for (idx, stack) in current.iter().enumerate() {
+                if sync.last_slots[idx] != *stack {
+                    sync.state_id = (sync.state_id + 1) & 0x7fff;
+                    sync.last_slots[idx] = stack.clone();
+                    out.push((idx as i16, sync.state_id, stack.clone()));
+                }
+            }
+            out
+        };
+        if !updates.is_empty() {
+            if let Ok(mut w) = c.sock.lock() {
+                for (slot, state_id, stack) in updates {
+                    let mut p = vec![1u8];
+                    write_varint(&mut p, i64::from(state_id));
+                    p.extend_from_slice(&slot.to_be_bytes());
+                    p.extend_from_slice(&slot_wire(&stack));
+                    let _ = send_packet(&mut w, 0x15, p);
+                }
+            }
+        }
+    }
+}
+fn chest_viewer_tick() {
+    let audience = client_snapshot();
+    chest_viewer_tick_on(&audience);
+}
+/// `ChestBlock.candidatePartnerFacing`: the facing of the chest at `pos` if a new one
+/// could pair with it. `is(this)` plus `TYPE == SINGLE` is the whole gate, so an
+/// already-paired half is never a candidate.
+fn chest_candidate_partner_facing(pos: BlockPos, name: &str) -> Option<HFace> {
+    let st = block_at(pos.0, pos.1, pos.2);
+    if breg()?.name_of(st) != name {
+        return None;
+    }
+    if chest_type(st)? != "single" {
+        return None;
+    }
+    chest_facing(st)
+}
+/// `ChestBlock.getStateForPlacement`: facing from the player (opposite of the way they
+/// look), `type` from the neighbour this placement may pair with, `waterlogged` from
+/// the fluid state of the cell being replaced.
+fn chest_placement_state(
+    name: &str,
+    pos: BlockPos,
+    yaw: f32,
+    sneaking: bool,
+    face: u8,
+) -> u32 {
+    let Some(reg) = breg() else { return 0 };
+    let mut facing = HFace::from_yaw(yaw).opposite();
+    let mut kind = "single";
+    // Sneaking against a horizontal face claims that side: only the clicked block may
+    // become the partner, and only when its facing is on the other axis.
+    if sneaking {
+        if let Some(clicked) = HFace::from_face(face) {
+            let back = clicked.opposite();
+            let (bx, bz) = back.step();
+            let behind = (pos.0 + bx, pos.1, pos.2 + bz);
+            if let Some(candidate) = chest_candidate_partner_facing(behind, name) {
+                if candidate.axis() != clicked.axis() {
+                    facing = candidate;
+                    kind = if candidate.counter_clock_wise() == back {
+                        "right"
+                    } else {
+                        "left"
+                    };
+                }
+            }
+        }
+    }
+    // Otherwise the pair axis is perpendicular to facing: clockwise is LEFT, then
+    // counter-clockwise is RIGHT (vanilla checks them in that order, first match wins).
+    if kind == "single" && !sneaking {
+        let (cx, cz) = facing.clock_wise().step();
+        let clockwise = (pos.0 + cx, pos.1, pos.2 + cz);
+        if chest_candidate_partner_facing(clockwise, name) == Some(facing) {
+            kind = "left";
+        } else {
+            let (cx, cz) = facing.counter_clock_wise().step();
+            let counter = (pos.0 + cx, pos.1, pos.2 + cz);
+            if chest_candidate_partner_facing(counter, name) == Some(facing) {
+                kind = "right";
+            }
+        }
+    }
+    let waterlogged = reg.fluid_name(block_at(pos.0, pos.1, pos.2)) == "minecraft:water";
+    let st = reg.state_of(name, None);
+    let st = reg.with_prop(st, "facing", facing.name());
+    let st = reg.with_prop(st, "type", kind);
+    reg.with_prop(st, "waterlogged", if waterlogged { "true" } else { "false" })
+}
+/// `ChestBlock.updateShape`: the state this chest should take now that its neighbour in
+/// direction `dir` changed. The `else` is vanilla's and is load-bearing: when the
+/// neighbour *is* the same chest block only the pairing branch may change us, so a half
+/// left facing a chest that no longer points back keeps its stale `left`/`right` rather
+/// than unpairing.
+fn chest_shape_after(own: u32, own_pos: BlockPos, dir: HFace) -> Option<u32> {
+    let reg = breg()?;
+    let (dx, dz) = dir.step();
+    let nst = block_at(own_pos.0 + dx, own_pos.1, own_pos.2 + dz);
+    if reg.name_of(nst) == reg.name_of(own) {
+        let own_type = chest_type(own)?;
+        let ntype = chest_type(nst)?;
+        if own_type == "single"
+            && ntype != "single"
+            && chest_facing(own)? == chest_facing(nst)?
+            && chest_connected_direction(nst)? == dir.opposite()
+        {
+            let opposite = if ntype == "left" { "right" } else { "left" };
+            return Some(reg.with_prop(own, "type", opposite));
+        }
+        return None;
+    }
+    if chest_connected_direction(own)? == dir {
+        return Some(reg.with_prop(own, "type", "single"));
+    }
+    None
+}
+/// `Block.updateNeighbourShapes` for chests: after a write, each chest beside the cell
+/// re-derives its own state. The written cell is deliberately not repaired - vanilla
+/// only ever calls a block's own `updateShape` from its neighbours, so a `/setblock`ed
+/// ghost half stays a ghost half in both implementations.
+fn repair_chest_neighbours(pos: BlockPos) {
+    for dir in [HFace::South, HFace::West, HFace::North, HFace::East] {
+        let (dx, dz) = dir.step();
+        let np = (pos.0 + dx, pos.1, pos.2 + dz);
+        let own = block_at(np.0, np.1, np.2);
+        if !chest_named(own) {
+            continue;
+        }
+        // `dir` from the neighbour's own point of view is the direction it looks back.
+        if let Some(next) = chest_shape_after(own, np, dir.opposite()) {
+            if next != own {
+                set_block(np.0, np.1, np.2, next);
+                note_block_update(np.0, np.1, np.2, next);
+            }
+        }
+    }
+}
+/// Does a write at `pos` have to repair chest pairing? True when the cell itself is (or
+/// was) a chest, or when a horizontal neighbour is one.
+fn chest_touches(pos: BlockPos, before: u32, after: u32) -> bool {
+    if chest_named(before) || chest_named(after) {
+        return true;
+    }
+    [HFace::South, HFace::West, HFace::North, HFace::East]
+        .iter()
+        .any(|dir| {
+            let (dx, dz) = dir.step();
+            chest_named(block_at(pos.0 + dx, pos.1, pos.2 + dz))
+        })
+}
+
+fn name_to_item(n: &str) -> Option<i64> {
+    #[cfg(feature = "neoforge-events")]
+    if let Some(state) = java_compat::NEOFORGE.get().and_then(|runtime| {
+        runtime.registry.runtime_id(landing_types::ModRegistry::Item, n)
+    }) {
+        return Some(i64::from(state));
+    }
+    let n = n.strip_prefix("minecraft:").unwrap_or(n);
+    Some(match n {
+        "air" => 0,
+        "stone" => 1,
+        "granite" => 2,
+        "polished_granite" => 3,
+        "diorite" => 4,
+        "polished_diorite" => 5,
+        "andesite" => 6,
+        "polished_andesite" => 7,
+        "deepslate" => 8,
+        "cobbled_deepslate" => 9,
+        "polished_deepslate" => 10,
+        "calcite" => 11,
+        "tuff" => 12,
+        "tuff_slab" => 13,
+        "tuff_stairs" => 14,
+        "tuff_wall" => 15,
+        "chiseled_tuff" => 16,
+        "polished_tuff" => 17,
+        "polished_tuff_slab" => 18,
+        "polished_tuff_stairs" => 19,
+        "polished_tuff_wall" => 20,
+        "tuff_bricks" => 21,
+        "tuff_brick_slab" => 22,
+        "tuff_brick_stairs" => 23,
+        "tuff_brick_wall" => 24,
+        "chiseled_tuff_bricks" => 25,
+        "dripstone_block" => 26,
+        "grass_block" => 27,
+        "dirt" => 28,
+        "coarse_dirt" => 29,
+        "podzol" => 30,
+        "rooted_dirt" => 31,
+        "mud" => 32,
+        "crimson_nylium" => 33,
+        "warped_nylium" => 34,
+        "cobblestone" => 35,
+        "oak_planks" => 36,
+        "spruce_planks" => 37,
+        "birch_planks" => 38,
+        "jungle_planks" => 39,
+        "acacia_planks" => 40,
+        "cherry_planks" => 41,
+        "dark_oak_planks" => 42,
+        "mangrove_planks" => 43,
+        "bamboo_planks" => 44,
+        "crimson_planks" => 45,
+        "warped_planks" => 46,
+        "bamboo_mosaic" => 47,
+        "oak_sapling" => 48,
+        "spruce_sapling" => 49,
+        "birch_sapling" => 50,
+        "jungle_sapling" => 51,
+        "acacia_sapling" => 52,
+        "cherry_sapling" => 53,
+        "dark_oak_sapling" => 54,
+        "mangrove_propagule" => 55,
+        "bedrock" => 56,
+        "sand" => 57,
+        "suspicious_sand" => 58,
+        "suspicious_gravel" => 59,
+        "red_sand" => 60,
+        "gravel" => 61,
+        "coal_ore" => 62,
+        "deepslate_coal_ore" => 63,
+        "iron_ore" => 64,
+        "deepslate_iron_ore" => 65,
+        "copper_ore" => 66,
+        "deepslate_copper_ore" => 67,
+        "gold_ore" => 68,
+        "deepslate_gold_ore" => 69,
+        "redstone_ore" => 70,
+        "deepslate_redstone_ore" => 71,
+        "emerald_ore" => 72,
+        "deepslate_emerald_ore" => 73,
+        "lapis_ore" => 74,
+        "deepslate_lapis_ore" => 75,
+        "diamond_ore" => 76,
+        "deepslate_diamond_ore" => 77,
+        "nether_gold_ore" => 78,
+        "nether_quartz_ore" => 79,
+        "ancient_debris" => 80,
+        "coal_block" => 81,
+        "raw_iron_block" => 82,
+        "raw_copper_block" => 83,
+        "raw_gold_block" => 84,
+        "heavy_core" => 85,
+        "amethyst_block" => 86,
+        "budding_amethyst" => 87,
+        "iron_block" => 88,
+        "copper_block" => 89,
+        "gold_block" => 90,
+        "diamond_block" => 91,
+        "netherite_block" => 92,
+        "exposed_copper" => 93,
+        "weathered_copper" => 94,
+        "oxidized_copper" => 95,
+        "chiseled_copper" => 96,
+        "exposed_chiseled_copper" => 97,
+        "weathered_chiseled_copper" => 98,
+        "oxidized_chiseled_copper" => 99,
+        "cut_copper" => 100,
+        "exposed_cut_copper" => 101,
+        "weathered_cut_copper" => 102,
+        "oxidized_cut_copper" => 103,
+        "cut_copper_stairs" => 104,
+        "exposed_cut_copper_stairs" => 105,
+        "weathered_cut_copper_stairs" => 106,
+        "oxidized_cut_copper_stairs" => 107,
+        "cut_copper_slab" => 108,
+        "exposed_cut_copper_slab" => 109,
+        "weathered_cut_copper_slab" => 110,
+        "oxidized_cut_copper_slab" => 111,
+        "waxed_copper_block" => 112,
+        "waxed_exposed_copper" => 113,
+        "waxed_weathered_copper" => 114,
+        "waxed_oxidized_copper" => 115,
+        "waxed_chiseled_copper" => 116,
+        "waxed_exposed_chiseled_copper" => 117,
+        "waxed_weathered_chiseled_copper" => 118,
+        "waxed_oxidized_chiseled_copper" => 119,
+        "waxed_cut_copper" => 120,
+        "waxed_exposed_cut_copper" => 121,
+        "waxed_weathered_cut_copper" => 122,
+        "waxed_oxidized_cut_copper" => 123,
+        "waxed_cut_copper_stairs" => 124,
+        "waxed_exposed_cut_copper_stairs" => 125,
+        "waxed_weathered_cut_copper_stairs" => 126,
+        "waxed_oxidized_cut_copper_stairs" => 127,
+        "waxed_cut_copper_slab" => 128,
+        "waxed_exposed_cut_copper_slab" => 129,
+        "waxed_weathered_cut_copper_slab" => 130,
+        "waxed_oxidized_cut_copper_slab" => 131,
+        "oak_log" => 132,
+        "spruce_log" => 133,
+        "birch_log" => 134,
+        "jungle_log" => 135,
+        "acacia_log" => 136,
+        "cherry_log" => 137,
+        "dark_oak_log" => 138,
+        "mangrove_log" => 139,
+        "mangrove_roots" => 140,
+        "muddy_mangrove_roots" => 141,
+        "crimson_stem" => 142,
+        "warped_stem" => 143,
+        "bamboo_block" => 144,
+        "stripped_oak_log" => 145,
+        "stripped_spruce_log" => 146,
+        "stripped_birch_log" => 147,
+        "stripped_jungle_log" => 148,
+        "stripped_acacia_log" => 149,
+        "stripped_cherry_log" => 150,
+        "stripped_dark_oak_log" => 151,
+        "stripped_mangrove_log" => 152,
+        "stripped_crimson_stem" => 153,
+        "stripped_warped_stem" => 154,
+        "stripped_oak_wood" => 155,
+        "stripped_spruce_wood" => 156,
+        "stripped_birch_wood" => 157,
+        "stripped_jungle_wood" => 158,
+        "stripped_acacia_wood" => 159,
+        "stripped_cherry_wood" => 160,
+        "stripped_dark_oak_wood" => 161,
+        "stripped_mangrove_wood" => 162,
+        "stripped_crimson_hyphae" => 163,
+        "stripped_warped_hyphae" => 164,
+        "stripped_bamboo_block" => 165,
+        "oak_wood" => 166,
+        "spruce_wood" => 167,
+        "birch_wood" => 168,
+        "jungle_wood" => 169,
+        "acacia_wood" => 170,
+        "cherry_wood" => 171,
+        "dark_oak_wood" => 172,
+        "mangrove_wood" => 173,
+        "crimson_hyphae" => 174,
+        "warped_hyphae" => 175,
+        "oak_leaves" => 176,
+        "spruce_leaves" => 177,
+        "birch_leaves" => 178,
+        "jungle_leaves" => 179,
+        "acacia_leaves" => 180,
+        "cherry_leaves" => 181,
+        "dark_oak_leaves" => 182,
+        "mangrove_leaves" => 183,
+        "azalea_leaves" => 184,
+        "flowering_azalea_leaves" => 185,
+        "sponge" => 186,
+        "wet_sponge" => 187,
+        "glass" => 188,
+        "tinted_glass" => 189,
+        "lapis_block" => 190,
+        "sandstone" => 191,
+        "chiseled_sandstone" => 192,
+        "cut_sandstone" => 193,
+        "cobweb" => 194,
+        "short_grass" => 195,
+        "fern" => 196,
+        "azalea" => 197,
+        "flowering_azalea" => 198,
+        "dead_bush" => 199,
+        "seagrass" => 200,
+        "sea_pickle" => 201,
+        "white_wool" => 202,
+        "orange_wool" => 203,
+        "magenta_wool" => 204,
+        "light_blue_wool" => 205,
+        "yellow_wool" => 206,
+        "lime_wool" => 207,
+        "pink_wool" => 208,
+        "gray_wool" => 209,
+        "light_gray_wool" => 210,
+        "cyan_wool" => 211,
+        "purple_wool" => 212,
+        "blue_wool" => 213,
+        "brown_wool" => 214,
+        "green_wool" => 215,
+        "red_wool" => 216,
+        "black_wool" => 217,
+        "dandelion" => 218,
+        "poppy" => 219,
+        "blue_orchid" => 220,
+        "allium" => 221,
+        "azure_bluet" => 222,
+        "red_tulip" => 223,
+        "orange_tulip" => 224,
+        "white_tulip" => 225,
+        "pink_tulip" => 226,
+        "oxeye_daisy" => 227,
+        "cornflower" => 228,
+        "lily_of_the_valley" => 229,
+        "wither_rose" => 230,
+        "torchflower" => 231,
+        "pitcher_plant" => 232,
+        "spore_blossom" => 233,
+        "brown_mushroom" => 234,
+        "red_mushroom" => 235,
+        "crimson_fungus" => 236,
+        "warped_fungus" => 237,
+        "crimson_roots" => 238,
+        "warped_roots" => 239,
+        "nether_sprouts" => 240,
+        "weeping_vines" => 241,
+        "twisting_vines" => 242,
+        "sugar_cane" => 243,
+        "kelp" => 244,
+        "moss_carpet" => 245,
+        "pink_petals" => 246,
+        "moss_block" => 247,
+        "hanging_roots" => 248,
+        "big_dripleaf" => 249,
+        "small_dripleaf" => 250,
+        "bamboo" => 251,
+        "oak_slab" => 252,
+        "spruce_slab" => 253,
+        "birch_slab" => 254,
+        "jungle_slab" => 255,
+        "acacia_slab" => 256,
+        "cherry_slab" => 257,
+        "dark_oak_slab" => 258,
+        "mangrove_slab" => 259,
+        "bamboo_slab" => 260,
+        "bamboo_mosaic_slab" => 261,
+        "crimson_slab" => 262,
+        "warped_slab" => 263,
+        "stone_slab" => 264,
+        "smooth_stone_slab" => 265,
+        "sandstone_slab" => 266,
+        "cut_sandstone_slab" => 267,
+        "petrified_oak_slab" => 268,
+        "cobblestone_slab" => 269,
+        "brick_slab" => 270,
+        "stone_brick_slab" => 271,
+        "mud_brick_slab" => 272,
+        "nether_brick_slab" => 273,
+        "quartz_slab" => 274,
+        "red_sandstone_slab" => 275,
+        "cut_red_sandstone_slab" => 276,
+        "purpur_slab" => 277,
+        "prismarine_slab" => 278,
+        "prismarine_brick_slab" => 279,
+        "dark_prismarine_slab" => 280,
+        "smooth_quartz" => 281,
+        "smooth_red_sandstone" => 282,
+        "smooth_sandstone" => 283,
+        "smooth_stone" => 284,
+        "bricks" => 285,
+        "bookshelf" => 286,
+        "chiseled_bookshelf" => 287,
+        "decorated_pot" => 288,
+        "mossy_cobblestone" => 289,
+        "obsidian" => 290,
+        "torch" => 291,
+        "end_rod" => 292,
+        "chorus_plant" => 293,
+        "chorus_flower" => 294,
+        "purpur_block" => 295,
+        "purpur_pillar" => 296,
+        "purpur_stairs" => 297,
+        "spawner" => 298,
+        "chest" => 299,
+        "crafting_table" => 300,
+        "farmland" => 301,
+        "furnace" => 302,
+        "ladder" => 303,
+        "cobblestone_stairs" => 304,
+        "snow" => 305,
+        "ice" => 306,
+        "snow_block" => 307,
+        "cactus" => 308,
+        "clay" => 309,
+        "jukebox" => 310,
+        "oak_fence" => 311,
+        "spruce_fence" => 312,
+        "birch_fence" => 313,
+        "jungle_fence" => 314,
+        "acacia_fence" => 315,
+        "cherry_fence" => 316,
+        "dark_oak_fence" => 317,
+        "mangrove_fence" => 318,
+        "bamboo_fence" => 319,
+        "crimson_fence" => 320,
+        "warped_fence" => 321,
+        "pumpkin" => 322,
+        "carved_pumpkin" => 323,
+        "jack_o_lantern" => 324,
+        "netherrack" => 325,
+        "soul_sand" => 326,
+        "soul_soil" => 327,
+        "basalt" => 328,
+        "polished_basalt" => 329,
+        "smooth_basalt" => 330,
+        "soul_torch" => 331,
+        "glowstone" => 332,
+        "infested_stone" => 333,
+        "infested_cobblestone" => 334,
+        "infested_stone_bricks" => 335,
+        "infested_mossy_stone_bricks" => 336,
+        "infested_cracked_stone_bricks" => 337,
+        "infested_chiseled_stone_bricks" => 338,
+        "infested_deepslate" => 339,
+        "stone_bricks" => 340,
+        "mossy_stone_bricks" => 341,
+        "cracked_stone_bricks" => 342,
+        "chiseled_stone_bricks" => 343,
+        "packed_mud" => 344,
+        "mud_bricks" => 345,
+        "deepslate_bricks" => 346,
+        "cracked_deepslate_bricks" => 347,
+        "deepslate_tiles" => 348,
+        "cracked_deepslate_tiles" => 349,
+        "chiseled_deepslate" => 350,
+        "reinforced_deepslate" => 351,
+        "brown_mushroom_block" => 352,
+        "red_mushroom_block" => 353,
+        "mushroom_stem" => 354,
+        "iron_bars" => 355,
+        "chain" => 356,
+        "glass_pane" => 357,
+        "melon" => 358,
+        "vine" => 359,
+        "glow_lichen" => 360,
+        "brick_stairs" => 361,
+        "stone_brick_stairs" => 362,
+        "mud_brick_stairs" => 363,
+        "mycelium" => 364,
+        "lily_pad" => 365,
+        "nether_bricks" => 366,
+        "cracked_nether_bricks" => 367,
+        "chiseled_nether_bricks" => 368,
+        "nether_brick_fence" => 369,
+        "nether_brick_stairs" => 370,
+        "sculk" => 371,
+        "sculk_vein" => 372,
+        "sculk_catalyst" => 373,
+        "sculk_shrieker" => 374,
+        "enchanting_table" => 375,
+        "end_portal_frame" => 376,
+        "end_stone" => 377,
+        "end_stone_bricks" => 378,
+        "dragon_egg" => 379,
+        "sandstone_stairs" => 380,
+        "ender_chest" => 381,
+        "emerald_block" => 382,
+        "oak_stairs" => 383,
+        "spruce_stairs" => 384,
+        "birch_stairs" => 385,
+        "jungle_stairs" => 386,
+        "acacia_stairs" => 387,
+        "cherry_stairs" => 388,
+        "dark_oak_stairs" => 389,
+        "mangrove_stairs" => 390,
+        "bamboo_stairs" => 391,
+        "bamboo_mosaic_stairs" => 392,
+        "crimson_stairs" => 393,
+        "warped_stairs" => 394,
+        "command_block" => 395,
+        "beacon" => 396,
+        "cobblestone_wall" => 397,
+        "mossy_cobblestone_wall" => 398,
+        "brick_wall" => 399,
+        "prismarine_wall" => 400,
+        "red_sandstone_wall" => 401,
+        "mossy_stone_brick_wall" => 402,
+        "granite_wall" => 403,
+        "stone_brick_wall" => 404,
+        "mud_brick_wall" => 405,
+        "nether_brick_wall" => 406,
+        "andesite_wall" => 407,
+        "red_nether_brick_wall" => 408,
+        "sandstone_wall" => 409,
+        "end_stone_brick_wall" => 410,
+        "diorite_wall" => 411,
+        "blackstone_wall" => 412,
+        "polished_blackstone_wall" => 413,
+        "polished_blackstone_brick_wall" => 414,
+        "cobbled_deepslate_wall" => 415,
+        "polished_deepslate_wall" => 416,
+        "deepslate_brick_wall" => 417,
+        "deepslate_tile_wall" => 418,
+        "anvil" => 419,
+        "chipped_anvil" => 420,
+        "damaged_anvil" => 421,
+        "chiseled_quartz_block" => 422,
+        "quartz_block" => 423,
+        "quartz_bricks" => 424,
+        "quartz_pillar" => 425,
+        "quartz_stairs" => 426,
+        "white_terracotta" => 427,
+        "orange_terracotta" => 428,
+        "magenta_terracotta" => 429,
+        "light_blue_terracotta" => 430,
+        "yellow_terracotta" => 431,
+        "lime_terracotta" => 432,
+        "pink_terracotta" => 433,
+        "gray_terracotta" => 434,
+        "light_gray_terracotta" => 435,
+        "cyan_terracotta" => 436,
+        "purple_terracotta" => 437,
+        "blue_terracotta" => 438,
+        "brown_terracotta" => 439,
+        "green_terracotta" => 440,
+        "red_terracotta" => 441,
+        "black_terracotta" => 442,
+        "barrier" => 443,
+        "light" => 444,
+        "hay_block" => 445,
+        "white_carpet" => 446,
+        "orange_carpet" => 447,
+        "magenta_carpet" => 448,
+        "light_blue_carpet" => 449,
+        "yellow_carpet" => 450,
+        "lime_carpet" => 451,
+        "pink_carpet" => 452,
+        "gray_carpet" => 453,
+        "light_gray_carpet" => 454,
+        "cyan_carpet" => 455,
+        "purple_carpet" => 456,
+        "blue_carpet" => 457,
+        "brown_carpet" => 458,
+        "green_carpet" => 459,
+        "red_carpet" => 460,
+        "black_carpet" => 461,
+        "terracotta" => 462,
+        "packed_ice" => 463,
+        "dirt_path" => 464,
+        "sunflower" => 465,
+        "lilac" => 466,
+        "rose_bush" => 467,
+        "peony" => 468,
+        "tall_grass" => 469,
+        "large_fern" => 470,
+        "white_stained_glass" => 471,
+        "orange_stained_glass" => 472,
+        "magenta_stained_glass" => 473,
+        "light_blue_stained_glass" => 474,
+        "yellow_stained_glass" => 475,
+        "lime_stained_glass" => 476,
+        "pink_stained_glass" => 477,
+        "gray_stained_glass" => 478,
+        "light_gray_stained_glass" => 479,
+        "cyan_stained_glass" => 480,
+        "purple_stained_glass" => 481,
+        "blue_stained_glass" => 482,
+        "brown_stained_glass" => 483,
+        "green_stained_glass" => 484,
+        "red_stained_glass" => 485,
+        "black_stained_glass" => 486,
+        "white_stained_glass_pane" => 487,
+        "orange_stained_glass_pane" => 488,
+        "magenta_stained_glass_pane" => 489,
+        "light_blue_stained_glass_pane" => 490,
+        "yellow_stained_glass_pane" => 491,
+        "lime_stained_glass_pane" => 492,
+        "pink_stained_glass_pane" => 493,
+        "gray_stained_glass_pane" => 494,
+        "light_gray_stained_glass_pane" => 495,
+        "cyan_stained_glass_pane" => 496,
+        "purple_stained_glass_pane" => 497,
+        "blue_stained_glass_pane" => 498,
+        "brown_stained_glass_pane" => 499,
+        "green_stained_glass_pane" => 500,
+        "red_stained_glass_pane" => 501,
+        "black_stained_glass_pane" => 502,
+        "prismarine" => 503,
+        "prismarine_bricks" => 504,
+        "dark_prismarine" => 505,
+        "prismarine_stairs" => 506,
+        "prismarine_brick_stairs" => 507,
+        "dark_prismarine_stairs" => 508,
+        "sea_lantern" => 509,
+        "red_sandstone" => 510,
+        "chiseled_red_sandstone" => 511,
+        "cut_red_sandstone" => 512,
+        "red_sandstone_stairs" => 513,
+        "repeating_command_block" => 514,
+        "chain_command_block" => 515,
+        "magma_block" => 516,
+        "nether_wart_block" => 517,
+        "warped_wart_block" => 518,
+        "red_nether_bricks" => 519,
+        "bone_block" => 520,
+        "structure_void" => 521,
+        "shulker_box" => 522,
+        "white_shulker_box" => 523,
+        "orange_shulker_box" => 524,
+        "magenta_shulker_box" => 525,
+        "light_blue_shulker_box" => 526,
+        "yellow_shulker_box" => 527,
+        "lime_shulker_box" => 528,
+        "pink_shulker_box" => 529,
+        "gray_shulker_box" => 530,
+        "light_gray_shulker_box" => 531,
+        "cyan_shulker_box" => 532,
+        "purple_shulker_box" => 533,
+        "blue_shulker_box" => 534,
+        "brown_shulker_box" => 535,
+        "green_shulker_box" => 536,
+        "red_shulker_box" => 537,
+        "black_shulker_box" => 538,
+        "white_glazed_terracotta" => 539,
+        "orange_glazed_terracotta" => 540,
+        "magenta_glazed_terracotta" => 541,
+        "light_blue_glazed_terracotta" => 542,
+        "yellow_glazed_terracotta" => 543,
+        "lime_glazed_terracotta" => 544,
+        "pink_glazed_terracotta" => 545,
+        "gray_glazed_terracotta" => 546,
+        "light_gray_glazed_terracotta" => 547,
+        "cyan_glazed_terracotta" => 548,
+        "purple_glazed_terracotta" => 549,
+        "blue_glazed_terracotta" => 550,
+        "brown_glazed_terracotta" => 551,
+        "green_glazed_terracotta" => 552,
+        "red_glazed_terracotta" => 553,
+        "black_glazed_terracotta" => 554,
+        "white_concrete" => 555,
+        "orange_concrete" => 556,
+        "magenta_concrete" => 557,
+        "light_blue_concrete" => 558,
+        "yellow_concrete" => 559,
+        "lime_concrete" => 560,
+        "pink_concrete" => 561,
+        "gray_concrete" => 562,
+        "light_gray_concrete" => 563,
+        "cyan_concrete" => 564,
+        "purple_concrete" => 565,
+        "blue_concrete" => 566,
+        "brown_concrete" => 567,
+        "green_concrete" => 568,
+        "red_concrete" => 569,
+        "black_concrete" => 570,
+        "white_concrete_powder" => 571,
+        "orange_concrete_powder" => 572,
+        "magenta_concrete_powder" => 573,
+        "light_blue_concrete_powder" => 574,
+        "yellow_concrete_powder" => 575,
+        "lime_concrete_powder" => 576,
+        "pink_concrete_powder" => 577,
+        "gray_concrete_powder" => 578,
+        "light_gray_concrete_powder" => 579,
+        "cyan_concrete_powder" => 580,
+        "purple_concrete_powder" => 581,
+        "blue_concrete_powder" => 582,
+        "brown_concrete_powder" => 583,
+        "green_concrete_powder" => 584,
+        "red_concrete_powder" => 585,
+        "black_concrete_powder" => 586,
+        "turtle_egg" => 587,
+        "sniffer_egg" => 588,
+        "dead_tube_coral_block" => 589,
+        "dead_brain_coral_block" => 590,
+        "dead_bubble_coral_block" => 591,
+        "dead_fire_coral_block" => 592,
+        "dead_horn_coral_block" => 593,
+        "tube_coral_block" => 594,
+        "brain_coral_block" => 595,
+        "bubble_coral_block" => 596,
+        "fire_coral_block" => 597,
+        "horn_coral_block" => 598,
+        "tube_coral" => 599,
+        "brain_coral" => 600,
+        "bubble_coral" => 601,
+        "fire_coral" => 602,
+        "horn_coral" => 603,
+        "dead_brain_coral" => 604,
+        "dead_bubble_coral" => 605,
+        "dead_fire_coral" => 606,
+        "dead_horn_coral" => 607,
+        "dead_tube_coral" => 608,
+        "tube_coral_fan" => 609,
+        "brain_coral_fan" => 610,
+        "bubble_coral_fan" => 611,
+        "fire_coral_fan" => 612,
+        "horn_coral_fan" => 613,
+        "dead_tube_coral_fan" => 614,
+        "dead_brain_coral_fan" => 615,
+        "dead_bubble_coral_fan" => 616,
+        "dead_fire_coral_fan" => 617,
+        "dead_horn_coral_fan" => 618,
+        "blue_ice" => 619,
+        "conduit" => 620,
+        "polished_granite_stairs" => 621,
+        "smooth_red_sandstone_stairs" => 622,
+        "mossy_stone_brick_stairs" => 623,
+        "polished_diorite_stairs" => 624,
+        "mossy_cobblestone_stairs" => 625,
+        "end_stone_brick_stairs" => 626,
+        "stone_stairs" => 627,
+        "smooth_sandstone_stairs" => 628,
+        "smooth_quartz_stairs" => 629,
+        "granite_stairs" => 630,
+        "andesite_stairs" => 631,
+        "red_nether_brick_stairs" => 632,
+        "polished_andesite_stairs" => 633,
+        "diorite_stairs" => 634,
+        "cobbled_deepslate_stairs" => 635,
+        "polished_deepslate_stairs" => 636,
+        "deepslate_brick_stairs" => 637,
+        "deepslate_tile_stairs" => 638,
+        "polished_granite_slab" => 639,
+        "smooth_red_sandstone_slab" => 640,
+        "mossy_stone_brick_slab" => 641,
+        "polished_diorite_slab" => 642,
+        "mossy_cobblestone_slab" => 643,
+        "end_stone_brick_slab" => 644,
+        "smooth_sandstone_slab" => 645,
+        "smooth_quartz_slab" => 646,
+        "granite_slab" => 647,
+        "andesite_slab" => 648,
+        "red_nether_brick_slab" => 649,
+        "polished_andesite_slab" => 650,
+        "diorite_slab" => 651,
+        "cobbled_deepslate_slab" => 652,
+        "polished_deepslate_slab" => 653,
+        "deepslate_brick_slab" => 654,
+        "deepslate_tile_slab" => 655,
+        "scaffolding" => 656,
+        "redstone" => 657,
+        "redstone_torch" => 658,
+        "redstone_block" => 659,
+        "repeater" => 660,
+        "comparator" => 661,
+        "piston" => 662,
+        "sticky_piston" => 663,
+        "slime_block" => 664,
+        "honey_block" => 665,
+        "observer" => 666,
+        "hopper" => 667,
+        "dispenser" => 668,
+        "dropper" => 669,
+        "lectern" => 670,
+        "target" => 671,
+        "lever" => 672,
+        "lightning_rod" => 673,
+        "daylight_detector" => 674,
+        "sculk_sensor" => 675,
+        "calibrated_sculk_sensor" => 676,
+        "tripwire_hook" => 677,
+        "trapped_chest" => 678,
+        "tnt" => 679,
+        "redstone_lamp" => 680,
+        "note_block" => 681,
+        "stone_button" => 682,
+        "polished_blackstone_button" => 683,
+        "oak_button" => 684,
+        "spruce_button" => 685,
+        "birch_button" => 686,
+        "jungle_button" => 687,
+        "acacia_button" => 688,
+        "cherry_button" => 689,
+        "dark_oak_button" => 690,
+        "mangrove_button" => 691,
+        "bamboo_button" => 692,
+        "crimson_button" => 693,
+        "warped_button" => 694,
+        "stone_pressure_plate" => 695,
+        "polished_blackstone_pressure_plate" => 696,
+        "light_weighted_pressure_plate" => 697,
+        "heavy_weighted_pressure_plate" => 698,
+        "oak_pressure_plate" => 699,
+        "spruce_pressure_plate" => 700,
+        "birch_pressure_plate" => 701,
+        "jungle_pressure_plate" => 702,
+        "acacia_pressure_plate" => 703,
+        "cherry_pressure_plate" => 704,
+        "dark_oak_pressure_plate" => 705,
+        "mangrove_pressure_plate" => 706,
+        "bamboo_pressure_plate" => 707,
+        "crimson_pressure_plate" => 708,
+        "warped_pressure_plate" => 709,
+        "iron_door" => 710,
+        "oak_door" => 711,
+        "spruce_door" => 712,
+        "birch_door" => 713,
+        "jungle_door" => 714,
+        "acacia_door" => 715,
+        "cherry_door" => 716,
+        "dark_oak_door" => 717,
+        "mangrove_door" => 718,
+        "bamboo_door" => 719,
+        "crimson_door" => 720,
+        "warped_door" => 721,
+        "copper_door" => 722,
+        "exposed_copper_door" => 723,
+        "weathered_copper_door" => 724,
+        "oxidized_copper_door" => 725,
+        "waxed_copper_door" => 726,
+        "waxed_exposed_copper_door" => 727,
+        "waxed_weathered_copper_door" => 728,
+        "waxed_oxidized_copper_door" => 729,
+        "iron_trapdoor" => 730,
+        "oak_trapdoor" => 731,
+        "spruce_trapdoor" => 732,
+        "birch_trapdoor" => 733,
+        "jungle_trapdoor" => 734,
+        "acacia_trapdoor" => 735,
+        "cherry_trapdoor" => 736,
+        "dark_oak_trapdoor" => 737,
+        "mangrove_trapdoor" => 738,
+        "bamboo_trapdoor" => 739,
+        "crimson_trapdoor" => 740,
+        "warped_trapdoor" => 741,
+        "copper_trapdoor" => 742,
+        "exposed_copper_trapdoor" => 743,
+        "weathered_copper_trapdoor" => 744,
+        "oxidized_copper_trapdoor" => 745,
+        "waxed_copper_trapdoor" => 746,
+        "waxed_exposed_copper_trapdoor" => 747,
+        "waxed_weathered_copper_trapdoor" => 748,
+        "waxed_oxidized_copper_trapdoor" => 749,
+        "oak_fence_gate" => 750,
+        "spruce_fence_gate" => 751,
+        "birch_fence_gate" => 752,
+        "jungle_fence_gate" => 753,
+        "acacia_fence_gate" => 754,
+        "cherry_fence_gate" => 755,
+        "dark_oak_fence_gate" => 756,
+        "mangrove_fence_gate" => 757,
+        "bamboo_fence_gate" => 758,
+        "crimson_fence_gate" => 759,
+        "warped_fence_gate" => 760,
+        "powered_rail" => 761,
+        "detector_rail" => 762,
+        "rail" => 763,
+        "activator_rail" => 764,
+        "saddle" => 765,
+        "minecart" => 766,
+        "chest_minecart" => 767,
+        "furnace_minecart" => 768,
+        "tnt_minecart" => 769,
+        "hopper_minecart" => 770,
+        "carrot_on_a_stick" => 771,
+        "warped_fungus_on_a_stick" => 772,
+        "elytra" => 773,
+        "oak_boat" => 774,
+        "oak_chest_boat" => 775,
+        "spruce_boat" => 776,
+        "spruce_chest_boat" => 777,
+        "birch_boat" => 778,
+        "birch_chest_boat" => 779,
+        "jungle_boat" => 780,
+        "jungle_chest_boat" => 781,
+        "acacia_boat" => 782,
+        "acacia_chest_boat" => 783,
+        "cherry_boat" => 784,
+        "cherry_chest_boat" => 785,
+        "dark_oak_boat" => 786,
+        "dark_oak_chest_boat" => 787,
+        "mangrove_boat" => 788,
+        "mangrove_chest_boat" => 789,
+        "bamboo_raft" => 790,
+        "bamboo_chest_raft" => 791,
+        "structure_block" => 792,
+        "jigsaw" => 793,
+        "turtle_helmet" => 794,
+        "turtle_scute" => 795,
+        "armadillo_scute" => 796,
+        "wolf_armor" => 797,
+        "flint_and_steel" => 798,
+        "bowl" => 799,
+        "apple" => 800,
+        "bow" => 801,
+        "arrow" => 802,
+        "coal" => 803,
+        "charcoal" => 804,
+        "diamond" => 805,
+        "emerald" => 806,
+        "lapis_lazuli" => 807,
+        "quartz" => 808,
+        "amethyst_shard" => 809,
+        "raw_iron" => 810,
+        "iron_ingot" => 811,
+        "raw_copper" => 812,
+        "copper_ingot" => 813,
+        "raw_gold" => 814,
+        "gold_ingot" => 815,
+        "netherite_ingot" => 816,
+        "netherite_scrap" => 817,
+        "wooden_sword" => 818,
+        "wooden_shovel" => 819,
+        "wooden_pickaxe" => 820,
+        "wooden_axe" => 821,
+        "wooden_hoe" => 822,
+        "stone_sword" => 823,
+        "stone_shovel" => 824,
+        "stone_pickaxe" => 825,
+        "stone_axe" => 826,
+        "stone_hoe" => 827,
+        "golden_sword" => 828,
+        "golden_shovel" => 829,
+        "golden_pickaxe" => 830,
+        "golden_axe" => 831,
+        "golden_hoe" => 832,
+        "iron_sword" => 833,
+        "iron_shovel" => 834,
+        "iron_pickaxe" => 835,
+        "iron_axe" => 836,
+        "iron_hoe" => 837,
+        "diamond_sword" => 838,
+        "diamond_shovel" => 839,
+        "diamond_pickaxe" => 840,
+        "diamond_axe" => 841,
+        "diamond_hoe" => 842,
+        "netherite_sword" => 843,
+        "netherite_shovel" => 844,
+        "netherite_pickaxe" => 845,
+        "netherite_axe" => 846,
+        "netherite_hoe" => 847,
+        "stick" => 848,
+        "mushroom_stew" => 849,
+        "string" => 850,
+        "feather" => 851,
+        "gunpowder" => 852,
+        "wheat_seeds" => 853,
+        "wheat" => 854,
+        "bread" => 855,
+        "leather_helmet" => 856,
+        "leather_chestplate" => 857,
+        "leather_leggings" => 858,
+        "leather_boots" => 859,
+        "chainmail_helmet" => 860,
+        "chainmail_chestplate" => 861,
+        "chainmail_leggings" => 862,
+        "chainmail_boots" => 863,
+        "iron_helmet" => 864,
+        "iron_chestplate" => 865,
+        "iron_leggings" => 866,
+        "iron_boots" => 867,
+        "diamond_helmet" => 868,
+        "diamond_chestplate" => 869,
+        "diamond_leggings" => 870,
+        "diamond_boots" => 871,
+        "golden_helmet" => 872,
+        "golden_chestplate" => 873,
+        "golden_leggings" => 874,
+        "golden_boots" => 875,
+        "netherite_helmet" => 876,
+        "netherite_chestplate" => 877,
+        "netherite_leggings" => 878,
+        "netherite_boots" => 879,
+        "flint" => 880,
+        "porkchop" => 881,
+        "cooked_porkchop" => 882,
+        "painting" => 883,
+        "golden_apple" => 884,
+        "enchanted_golden_apple" => 885,
+        "oak_sign" => 886,
+        "spruce_sign" => 887,
+        "birch_sign" => 888,
+        "jungle_sign" => 889,
+        "acacia_sign" => 890,
+        "cherry_sign" => 891,
+        "dark_oak_sign" => 892,
+        "mangrove_sign" => 893,
+        "bamboo_sign" => 894,
+        "crimson_sign" => 895,
+        "warped_sign" => 896,
+        "oak_hanging_sign" => 897,
+        "spruce_hanging_sign" => 898,
+        "birch_hanging_sign" => 899,
+        "jungle_hanging_sign" => 900,
+        "acacia_hanging_sign" => 901,
+        "cherry_hanging_sign" => 902,
+        "dark_oak_hanging_sign" => 903,
+        "mangrove_hanging_sign" => 904,
+        "bamboo_hanging_sign" => 905,
+        "crimson_hanging_sign" => 906,
+        "warped_hanging_sign" => 907,
+        "bucket" => 908,
+        "water_bucket" => 909,
+        "lava_bucket" => 910,
+        "powder_snow_bucket" => 911,
+        "snowball" => 912,
+        "leather" => 913,
+        "milk_bucket" => 914,
+        "pufferfish_bucket" => 915,
+        "salmon_bucket" => 916,
+        "cod_bucket" => 917,
+        "tropical_fish_bucket" => 918,
+        "axolotl_bucket" => 919,
+        "tadpole_bucket" => 920,
+        "brick" => 921,
+        "clay_ball" => 922,
+        "dried_kelp_block" => 923,
+        "paper" => 924,
+        "book" => 925,
+        "slime_ball" => 926,
+        "egg" => 927,
+        "compass" => 928,
+        "recovery_compass" => 929,
+        "bundle" => 930,
+        "fishing_rod" => 931,
+        "clock" => 932,
+        "spyglass" => 933,
+        "glowstone_dust" => 934,
+        "cod" => 935,
+        "salmon" => 936,
+        "tropical_fish" => 937,
+        "pufferfish" => 938,
+        "cooked_cod" => 939,
+        "cooked_salmon" => 940,
+        "ink_sac" => 941,
+        "glow_ink_sac" => 942,
+        "cocoa_beans" => 943,
+        "white_dye" => 944,
+        "orange_dye" => 945,
+        "magenta_dye" => 946,
+        "light_blue_dye" => 947,
+        "yellow_dye" => 948,
+        "lime_dye" => 949,
+        "pink_dye" => 950,
+        "gray_dye" => 951,
+        "light_gray_dye" => 952,
+        "cyan_dye" => 953,
+        "purple_dye" => 954,
+        "blue_dye" => 955,
+        "brown_dye" => 956,
+        "green_dye" => 957,
+        "red_dye" => 958,
+        "black_dye" => 959,
+        "bone_meal" => 960,
+        "bone" => 961,
+        "sugar" => 962,
+        "cake" => 963,
+        "white_bed" => 964,
+        "orange_bed" => 965,
+        "magenta_bed" => 966,
+        "light_blue_bed" => 967,
+        "yellow_bed" => 968,
+        "lime_bed" => 969,
+        "pink_bed" => 970,
+        "gray_bed" => 971,
+        "light_gray_bed" => 972,
+        "cyan_bed" => 973,
+        "purple_bed" => 974,
+        "blue_bed" => 975,
+        "brown_bed" => 976,
+        "green_bed" => 977,
+        "red_bed" => 978,
+        "black_bed" => 979,
+        "cookie" => 980,
+        "crafter" => 981,
+        "filled_map" => 982,
+        "shears" => 983,
+        "melon_slice" => 984,
+        "dried_kelp" => 985,
+        "pumpkin_seeds" => 986,
+        "melon_seeds" => 987,
+        "beef" => 988,
+        "cooked_beef" => 989,
+        "chicken" => 990,
+        "cooked_chicken" => 991,
+        "rotten_flesh" => 992,
+        "ender_pearl" => 993,
+        "blaze_rod" => 994,
+        "ghast_tear" => 995,
+        "gold_nugget" => 996,
+        "nether_wart" => 997,
+        "potion" => 998,
+        "glass_bottle" => 999,
+        "spider_eye" => 1000,
+        "fermented_spider_eye" => 1001,
+        "blaze_powder" => 1002,
+        "magma_cream" => 1003,
+        "brewing_stand" => 1004,
+        "cauldron" => 1005,
+        "ender_eye" => 1006,
+        "glistering_melon_slice" => 1007,
+        "armadillo_spawn_egg" => 1008,
+        "allay_spawn_egg" => 1009,
+        "axolotl_spawn_egg" => 1010,
+        "bat_spawn_egg" => 1011,
+        "bee_spawn_egg" => 1012,
+        "blaze_spawn_egg" => 1013,
+        "bogged_spawn_egg" => 1014,
+        "breeze_spawn_egg" => 1015,
+        "cat_spawn_egg" => 1016,
+        "camel_spawn_egg" => 1017,
+        "cave_spider_spawn_egg" => 1018,
+        "chicken_spawn_egg" => 1019,
+        "cod_spawn_egg" => 1020,
+        "cow_spawn_egg" => 1021,
+        "creeper_spawn_egg" => 1022,
+        "dolphin_spawn_egg" => 1023,
+        "donkey_spawn_egg" => 1024,
+        "drowned_spawn_egg" => 1025,
+        "elder_guardian_spawn_egg" => 1026,
+        "ender_dragon_spawn_egg" => 1027,
+        "enderman_spawn_egg" => 1028,
+        "endermite_spawn_egg" => 1029,
+        "evoker_spawn_egg" => 1030,
+        "fox_spawn_egg" => 1031,
+        "frog_spawn_egg" => 1032,
+        "ghast_spawn_egg" => 1033,
+        "glow_squid_spawn_egg" => 1034,
+        "goat_spawn_egg" => 1035,
+        "guardian_spawn_egg" => 1036,
+        "hoglin_spawn_egg" => 1037,
+        "horse_spawn_egg" => 1038,
+        "husk_spawn_egg" => 1039,
+        "iron_golem_spawn_egg" => 1040,
+        "llama_spawn_egg" => 1041,
+        "magma_cube_spawn_egg" => 1042,
+        "mooshroom_spawn_egg" => 1043,
+        "mule_spawn_egg" => 1044,
+        "ocelot_spawn_egg" => 1045,
+        "panda_spawn_egg" => 1046,
+        "parrot_spawn_egg" => 1047,
+        "phantom_spawn_egg" => 1048,
+        "pig_spawn_egg" => 1049,
+        "piglin_spawn_egg" => 1050,
+        "piglin_brute_spawn_egg" => 1051,
+        "pillager_spawn_egg" => 1052,
+        "polar_bear_spawn_egg" => 1053,
+        "pufferfish_spawn_egg" => 1054,
+        "rabbit_spawn_egg" => 1055,
+        "ravager_spawn_egg" => 1056,
+        "salmon_spawn_egg" => 1057,
+        "sheep_spawn_egg" => 1058,
+        "shulker_spawn_egg" => 1059,
+        "silverfish_spawn_egg" => 1060,
+        "skeleton_spawn_egg" => 1061,
+        "skeleton_horse_spawn_egg" => 1062,
+        "slime_spawn_egg" => 1063,
+        "sniffer_spawn_egg" => 1064,
+        "snow_golem_spawn_egg" => 1065,
+        "spider_spawn_egg" => 1066,
+        "squid_spawn_egg" => 1067,
+        "stray_spawn_egg" => 1068,
+        "strider_spawn_egg" => 1069,
+        "tadpole_spawn_egg" => 1070,
+        "trader_llama_spawn_egg" => 1071,
+        "tropical_fish_spawn_egg" => 1072,
+        "turtle_spawn_egg" => 1073,
+        "vex_spawn_egg" => 1074,
+        "villager_spawn_egg" => 1075,
+        "vindicator_spawn_egg" => 1076,
+        "wandering_trader_spawn_egg" => 1077,
+        "warden_spawn_egg" => 1078,
+        "witch_spawn_egg" => 1079,
+        "wither_spawn_egg" => 1080,
+        "wither_skeleton_spawn_egg" => 1081,
+        "wolf_spawn_egg" => 1082,
+        "zoglin_spawn_egg" => 1083,
+        "zombie_spawn_egg" => 1084,
+        "zombie_horse_spawn_egg" => 1085,
+        "zombie_villager_spawn_egg" => 1086,
+        "zombified_piglin_spawn_egg" => 1087,
+        "experience_bottle" => 1088,
+        "fire_charge" => 1089,
+        "wind_charge" => 1090,
+        "writable_book" => 1091,
+        "written_book" => 1092,
+        "mace" => 1093,
+        "item_frame" => 1094,
+        "glow_item_frame" => 1095,
+        "flower_pot" => 1096,
+        "carrot" => 1097,
+        "potato" => 1098,
+        "baked_potato" => 1099,
+        "poisonous_potato" => 1100,
+        "map" => 1101,
+        "golden_carrot" => 1102,
+        "skeleton_skull" => 1103,
+        "wither_skeleton_skull" => 1104,
+        "player_head" => 1105,
+        "zombie_head" => 1106,
+        "creeper_head" => 1107,
+        "dragon_head" => 1108,
+        "piglin_head" => 1109,
+        "nether_star" => 1110,
+        "pumpkin_pie" => 1111,
+        "firework_rocket" => 1112,
+        "firework_star" => 1113,
+        "enchanted_book" => 1114,
+        "nether_brick" => 1115,
+        "prismarine_shard" => 1116,
+        "prismarine_crystals" => 1117,
+        "rabbit" => 1118,
+        "cooked_rabbit" => 1119,
+        "rabbit_stew" => 1120,
+        "rabbit_foot" => 1121,
+        "rabbit_hide" => 1122,
+        "armor_stand" => 1123,
+        "iron_horse_armor" => 1124,
+        "golden_horse_armor" => 1125,
+        "diamond_horse_armor" => 1126,
+        "leather_horse_armor" => 1127,
+        "lead" => 1128,
+        "name_tag" => 1129,
+        "command_block_minecart" => 1130,
+        "mutton" => 1131,
+        "cooked_mutton" => 1132,
+        "white_banner" => 1133,
+        "orange_banner" => 1134,
+        "magenta_banner" => 1135,
+        "light_blue_banner" => 1136,
+        "yellow_banner" => 1137,
+        "lime_banner" => 1138,
+        "pink_banner" => 1139,
+        "gray_banner" => 1140,
+        "light_gray_banner" => 1141,
+        "cyan_banner" => 1142,
+        "purple_banner" => 1143,
+        "blue_banner" => 1144,
+        "brown_banner" => 1145,
+        "green_banner" => 1146,
+        "red_banner" => 1147,
+        "black_banner" => 1148,
+        "end_crystal" => 1149,
+        "chorus_fruit" => 1150,
+        "popped_chorus_fruit" => 1151,
+        "torchflower_seeds" => 1152,
+        "pitcher_pod" => 1153,
+        "beetroot" => 1154,
+        "beetroot_seeds" => 1155,
+        "beetroot_soup" => 1156,
+        "dragon_breath" => 1157,
+        "splash_potion" => 1158,
+        "spectral_arrow" => 1159,
+        "tipped_arrow" => 1160,
+        "lingering_potion" => 1161,
+        "shield" => 1162,
+        "totem_of_undying" => 1163,
+        "shulker_shell" => 1164,
+        "iron_nugget" => 1165,
+        "knowledge_book" => 1166,
+        "debug_stick" => 1167,
+        "music_disc_13" => 1168,
+        "music_disc_cat" => 1169,
+        "music_disc_blocks" => 1170,
+        "music_disc_chirp" => 1171,
+        "music_disc_creator" => 1172,
+        "music_disc_creator_music_box" => 1173,
+        "music_disc_far" => 1174,
+        "music_disc_mall" => 1175,
+        "music_disc_mellohi" => 1176,
+        "music_disc_stal" => 1177,
+        "music_disc_strad" => 1178,
+        "music_disc_ward" => 1179,
+        "music_disc_11" => 1180,
+        "music_disc_wait" => 1181,
+        "music_disc_otherside" => 1182,
+        "music_disc_relic" => 1183,
+        "music_disc_5" => 1184,
+        "music_disc_pigstep" => 1185,
+        "music_disc_precipice" => 1186,
+        "disc_fragment_5" => 1187,
+        "trident" => 1188,
+        "phantom_membrane" => 1189,
+        "nautilus_shell" => 1190,
+        "heart_of_the_sea" => 1191,
+        "crossbow" => 1192,
+        "suspicious_stew" => 1193,
+        "loom" => 1194,
+        "flower_banner_pattern" => 1195,
+        "creeper_banner_pattern" => 1196,
+        "skull_banner_pattern" => 1197,
+        "mojang_banner_pattern" => 1198,
+        "globe_banner_pattern" => 1199,
+        "piglin_banner_pattern" => 1200,
+        "flow_banner_pattern" => 1201,
+        "guster_banner_pattern" => 1202,
+        "goat_horn" => 1203,
+        "composter" => 1204,
+        "barrel" => 1205,
+        "smoker" => 1206,
+        "blast_furnace" => 1207,
+        "cartography_table" => 1208,
+        "fletching_table" => 1209,
+        "grindstone" => 1210,
+        "smithing_table" => 1211,
+        "stonecutter" => 1212,
+        "bell" => 1213,
+        "lantern" => 1214,
+        "soul_lantern" => 1215,
+        "sweet_berries" => 1216,
+        "glow_berries" => 1217,
+        "campfire" => 1218,
+        "soul_campfire" => 1219,
+        "shroomlight" => 1220,
+        "honeycomb" => 1221,
+        "bee_nest" => 1222,
+        "beehive" => 1223,
+        "honey_bottle" => 1224,
+        "honeycomb_block" => 1225,
+        "lodestone" => 1226,
+        "crying_obsidian" => 1227,
+        "blackstone" => 1228,
+        "blackstone_slab" => 1229,
+        "blackstone_stairs" => 1230,
+        "gilded_blackstone" => 1231,
+        "polished_blackstone" => 1232,
+        "polished_blackstone_slab" => 1233,
+        "polished_blackstone_stairs" => 1234,
+        "chiseled_polished_blackstone" => 1235,
+        "polished_blackstone_bricks" => 1236,
+        "polished_blackstone_brick_slab" => 1237,
+        "polished_blackstone_brick_stairs" => 1238,
+        "cracked_polished_blackstone_bricks" => 1239,
+        "respawn_anchor" => 1240,
+        "candle" => 1241,
+        "white_candle" => 1242,
+        "orange_candle" => 1243,
+        "magenta_candle" => 1244,
+        "light_blue_candle" => 1245,
+        "yellow_candle" => 1246,
+        "lime_candle" => 1247,
+        "pink_candle" => 1248,
+        "gray_candle" => 1249,
+        "light_gray_candle" => 1250,
+        "cyan_candle" => 1251,
+        "purple_candle" => 1252,
+        "blue_candle" => 1253,
+        "brown_candle" => 1254,
+        "green_candle" => 1255,
+        "red_candle" => 1256,
+        "black_candle" => 1257,
+        "small_amethyst_bud" => 1258,
+        "medium_amethyst_bud" => 1259,
+        "large_amethyst_bud" => 1260,
+        "amethyst_cluster" => 1261,
+        "pointed_dripstone" => 1262,
+        "ochre_froglight" => 1263,
+        "verdant_froglight" => 1264,
+        "pearlescent_froglight" => 1265,
+        "frogspawn" => 1266,
+        "echo_shard" => 1267,
+        "brush" => 1268,
+        "netherite_upgrade_smithing_template" => 1269,
+        "sentry_armor_trim_smithing_template" => 1270,
+        "dune_armor_trim_smithing_template" => 1271,
+        "coast_armor_trim_smithing_template" => 1272,
+        "wild_armor_trim_smithing_template" => 1273,
+        "ward_armor_trim_smithing_template" => 1274,
+        "eye_armor_trim_smithing_template" => 1275,
+        "vex_armor_trim_smithing_template" => 1276,
+        "tide_armor_trim_smithing_template" => 1277,
+        "snout_armor_trim_smithing_template" => 1278,
+        "rib_armor_trim_smithing_template" => 1279,
+        "spire_armor_trim_smithing_template" => 1280,
+        "wayfinder_armor_trim_smithing_template" => 1281,
+        "shaper_armor_trim_smithing_template" => 1282,
+        "silence_armor_trim_smithing_template" => 1283,
+        "raiser_armor_trim_smithing_template" => 1284,
+        "host_armor_trim_smithing_template" => 1285,
+        "flow_armor_trim_smithing_template" => 1286,
+        "bolt_armor_trim_smithing_template" => 1287,
+        "angler_pottery_sherd" => 1288,
+        "archer_pottery_sherd" => 1289,
+        "arms_up_pottery_sherd" => 1290,
+        "blade_pottery_sherd" => 1291,
+        "brewer_pottery_sherd" => 1292,
+        "burn_pottery_sherd" => 1293,
+        "danger_pottery_sherd" => 1294,
+        "explorer_pottery_sherd" => 1295,
+        "flow_pottery_sherd" => 1296,
+        "friend_pottery_sherd" => 1297,
+        "guster_pottery_sherd" => 1298,
+        "heart_pottery_sherd" => 1299,
+        "heartbreak_pottery_sherd" => 1300,
+        "howl_pottery_sherd" => 1301,
+        "miner_pottery_sherd" => 1302,
+        "mourner_pottery_sherd" => 1303,
+        "plenty_pottery_sherd" => 1304,
+        "prize_pottery_sherd" => 1305,
+        "scrape_pottery_sherd" => 1306,
+        "sheaf_pottery_sherd" => 1307,
+        "shelter_pottery_sherd" => 1308,
+        "skull_pottery_sherd" => 1309,
+        "snort_pottery_sherd" => 1310,
+        "copper_grate" => 1311,
+        "exposed_copper_grate" => 1312,
+        "weathered_copper_grate" => 1313,
+        "oxidized_copper_grate" => 1314,
+        "waxed_copper_grate" => 1315,
+        "waxed_exposed_copper_grate" => 1316,
+        "waxed_weathered_copper_grate" => 1317,
+        "waxed_oxidized_copper_grate" => 1318,
+        "copper_bulb" => 1319,
+        "exposed_copper_bulb" => 1320,
+        "weathered_copper_bulb" => 1321,
+        "oxidized_copper_bulb" => 1322,
+        "waxed_copper_bulb" => 1323,
+        "waxed_exposed_copper_bulb" => 1324,
+        "waxed_weathered_copper_bulb" => 1325,
+        "waxed_oxidized_copper_bulb" => 1326,
+        "trial_spawner" => 1327,
+        "trial_key" => 1328,
+        "ominous_trial_key" => 1329,
+        "vault" => 1330,
+        "ominous_bottle" => 1331,
+        "breeze_rod" => 1332,
+        _ => return None,
+    })
+}
+const ITEM_NAMES: [&str; 1333] = [
+    "air", "stone", "granite", "polished_granite", "diorite", "polished_diorite",
+    "andesite", "polished_andesite", "deepslate", "cobbled_deepslate", "polished_deepslate", "calcite",
+    "tuff", "tuff_slab", "tuff_stairs", "tuff_wall", "chiseled_tuff", "polished_tuff",
+    "polished_tuff_slab", "polished_tuff_stairs", "polished_tuff_wall", "tuff_bricks", "tuff_brick_slab", "tuff_brick_stairs",
+    "tuff_brick_wall", "chiseled_tuff_bricks", "dripstone_block", "grass_block", "dirt", "coarse_dirt",
+    "podzol", "rooted_dirt", "mud", "crimson_nylium", "warped_nylium", "cobblestone",
+    "oak_planks", "spruce_planks", "birch_planks", "jungle_planks", "acacia_planks", "cherry_planks",
+    "dark_oak_planks", "mangrove_planks", "bamboo_planks", "crimson_planks", "warped_planks", "bamboo_mosaic",
+    "oak_sapling", "spruce_sapling", "birch_sapling", "jungle_sapling", "acacia_sapling", "cherry_sapling",
+    "dark_oak_sapling", "mangrove_propagule", "bedrock", "sand", "suspicious_sand", "suspicious_gravel",
+    "red_sand", "gravel", "coal_ore", "deepslate_coal_ore", "iron_ore", "deepslate_iron_ore",
+    "copper_ore", "deepslate_copper_ore", "gold_ore", "deepslate_gold_ore", "redstone_ore", "deepslate_redstone_ore",
+    "emerald_ore", "deepslate_emerald_ore", "lapis_ore", "deepslate_lapis_ore", "diamond_ore", "deepslate_diamond_ore",
+    "nether_gold_ore", "nether_quartz_ore", "ancient_debris", "coal_block", "raw_iron_block", "raw_copper_block",
+    "raw_gold_block", "heavy_core", "amethyst_block", "budding_amethyst", "iron_block", "copper_block",
+    "gold_block", "diamond_block", "netherite_block", "exposed_copper", "weathered_copper", "oxidized_copper",
+    "chiseled_copper", "exposed_chiseled_copper", "weathered_chiseled_copper", "oxidized_chiseled_copper", "cut_copper", "exposed_cut_copper",
+    "weathered_cut_copper", "oxidized_cut_copper", "cut_copper_stairs", "exposed_cut_copper_stairs", "weathered_cut_copper_stairs", "oxidized_cut_copper_stairs",
+    "cut_copper_slab", "exposed_cut_copper_slab", "weathered_cut_copper_slab", "oxidized_cut_copper_slab", "waxed_copper_block", "waxed_exposed_copper",
+    "waxed_weathered_copper", "waxed_oxidized_copper", "waxed_chiseled_copper", "waxed_exposed_chiseled_copper", "waxed_weathered_chiseled_copper", "waxed_oxidized_chiseled_copper",
+    "waxed_cut_copper", "waxed_exposed_cut_copper", "waxed_weathered_cut_copper", "waxed_oxidized_cut_copper", "waxed_cut_copper_stairs", "waxed_exposed_cut_copper_stairs",
+    "waxed_weathered_cut_copper_stairs", "waxed_oxidized_cut_copper_stairs", "waxed_cut_copper_slab", "waxed_exposed_cut_copper_slab", "waxed_weathered_cut_copper_slab", "waxed_oxidized_cut_copper_slab",
+    "oak_log", "spruce_log", "birch_log", "jungle_log", "acacia_log", "cherry_log",
+    "dark_oak_log", "mangrove_log", "mangrove_roots", "muddy_mangrove_roots", "crimson_stem", "warped_stem",
+    "bamboo_block", "stripped_oak_log", "stripped_spruce_log", "stripped_birch_log", "stripped_jungle_log", "stripped_acacia_log",
+    "stripped_cherry_log", "stripped_dark_oak_log", "stripped_mangrove_log", "stripped_crimson_stem", "stripped_warped_stem", "stripped_oak_wood",
+    "stripped_spruce_wood", "stripped_birch_wood", "stripped_jungle_wood", "stripped_acacia_wood", "stripped_cherry_wood", "stripped_dark_oak_wood",
+    "stripped_mangrove_wood", "stripped_crimson_hyphae", "stripped_warped_hyphae", "stripped_bamboo_block", "oak_wood", "spruce_wood",
+    "birch_wood", "jungle_wood", "acacia_wood", "cherry_wood", "dark_oak_wood", "mangrove_wood",
+    "crimson_hyphae", "warped_hyphae", "oak_leaves", "spruce_leaves", "birch_leaves", "jungle_leaves",
+    "acacia_leaves", "cherry_leaves", "dark_oak_leaves", "mangrove_leaves", "azalea_leaves", "flowering_azalea_leaves",
+    "sponge", "wet_sponge", "glass", "tinted_glass", "lapis_block", "sandstone",
+    "chiseled_sandstone", "cut_sandstone", "cobweb", "short_grass", "fern", "azalea",
+    "flowering_azalea", "dead_bush", "seagrass", "sea_pickle", "white_wool", "orange_wool",
+    "magenta_wool", "light_blue_wool", "yellow_wool", "lime_wool", "pink_wool", "gray_wool",
+    "light_gray_wool", "cyan_wool", "purple_wool", "blue_wool", "brown_wool", "green_wool",
+    "red_wool", "black_wool", "dandelion", "poppy", "blue_orchid", "allium",
+    "azure_bluet", "red_tulip", "orange_tulip", "white_tulip", "pink_tulip", "oxeye_daisy",
+    "cornflower", "lily_of_the_valley", "wither_rose", "torchflower", "pitcher_plant", "spore_blossom",
+    "brown_mushroom", "red_mushroom", "crimson_fungus", "warped_fungus", "crimson_roots", "warped_roots",
+    "nether_sprouts", "weeping_vines", "twisting_vines", "sugar_cane", "kelp", "moss_carpet",
+    "pink_petals", "moss_block", "hanging_roots", "big_dripleaf", "small_dripleaf", "bamboo",
+    "oak_slab", "spruce_slab", "birch_slab", "jungle_slab", "acacia_slab", "cherry_slab",
+    "dark_oak_slab", "mangrove_slab", "bamboo_slab", "bamboo_mosaic_slab", "crimson_slab", "warped_slab",
+    "stone_slab", "smooth_stone_slab", "sandstone_slab", "cut_sandstone_slab", "petrified_oak_slab", "cobblestone_slab",
+    "brick_slab", "stone_brick_slab", "mud_brick_slab", "nether_brick_slab", "quartz_slab", "red_sandstone_slab",
+    "cut_red_sandstone_slab", "purpur_slab", "prismarine_slab", "prismarine_brick_slab", "dark_prismarine_slab", "smooth_quartz",
+    "smooth_red_sandstone", "smooth_sandstone", "smooth_stone", "bricks", "bookshelf", "chiseled_bookshelf",
+    "decorated_pot", "mossy_cobblestone", "obsidian", "torch", "end_rod", "chorus_plant",
+    "chorus_flower", "purpur_block", "purpur_pillar", "purpur_stairs", "spawner", "chest",
+    "crafting_table", "farmland", "furnace", "ladder", "cobblestone_stairs", "snow",
+    "ice", "snow_block", "cactus", "clay", "jukebox", "oak_fence",
+    "spruce_fence", "birch_fence", "jungle_fence", "acacia_fence", "cherry_fence", "dark_oak_fence",
+    "mangrove_fence", "bamboo_fence", "crimson_fence", "warped_fence", "pumpkin", "carved_pumpkin",
+    "jack_o_lantern", "netherrack", "soul_sand", "soul_soil", "basalt", "polished_basalt",
+    "smooth_basalt", "soul_torch", "glowstone", "infested_stone", "infested_cobblestone", "infested_stone_bricks",
+    "infested_mossy_stone_bricks", "infested_cracked_stone_bricks", "infested_chiseled_stone_bricks", "infested_deepslate", "stone_bricks", "mossy_stone_bricks",
+    "cracked_stone_bricks", "chiseled_stone_bricks", "packed_mud", "mud_bricks", "deepslate_bricks", "cracked_deepslate_bricks",
+    "deepslate_tiles", "cracked_deepslate_tiles", "chiseled_deepslate", "reinforced_deepslate", "brown_mushroom_block", "red_mushroom_block",
+    "mushroom_stem", "iron_bars", "chain", "glass_pane", "melon", "vine",
+    "glow_lichen", "brick_stairs", "stone_brick_stairs", "mud_brick_stairs", "mycelium", "lily_pad",
+    "nether_bricks", "cracked_nether_bricks", "chiseled_nether_bricks", "nether_brick_fence", "nether_brick_stairs", "sculk",
+    "sculk_vein", "sculk_catalyst", "sculk_shrieker", "enchanting_table", "end_portal_frame", "end_stone",
+    "end_stone_bricks", "dragon_egg", "sandstone_stairs", "ender_chest", "emerald_block", "oak_stairs",
+    "spruce_stairs", "birch_stairs", "jungle_stairs", "acacia_stairs", "cherry_stairs", "dark_oak_stairs",
+    "mangrove_stairs", "bamboo_stairs", "bamboo_mosaic_stairs", "crimson_stairs", "warped_stairs", "command_block",
+    "beacon", "cobblestone_wall", "mossy_cobblestone_wall", "brick_wall", "prismarine_wall", "red_sandstone_wall",
+    "mossy_stone_brick_wall", "granite_wall", "stone_brick_wall", "mud_brick_wall", "nether_brick_wall", "andesite_wall",
+    "red_nether_brick_wall", "sandstone_wall", "end_stone_brick_wall", "diorite_wall", "blackstone_wall", "polished_blackstone_wall",
+    "polished_blackstone_brick_wall", "cobbled_deepslate_wall", "polished_deepslate_wall", "deepslate_brick_wall", "deepslate_tile_wall", "anvil",
+    "chipped_anvil", "damaged_anvil", "chiseled_quartz_block", "quartz_block", "quartz_bricks", "quartz_pillar",
+    "quartz_stairs", "white_terracotta", "orange_terracotta", "magenta_terracotta", "light_blue_terracotta", "yellow_terracotta",
+    "lime_terracotta", "pink_terracotta", "gray_terracotta", "light_gray_terracotta", "cyan_terracotta", "purple_terracotta",
+    "blue_terracotta", "brown_terracotta", "green_terracotta", "red_terracotta", "black_terracotta", "barrier",
+    "light", "hay_block", "white_carpet", "orange_carpet", "magenta_carpet", "light_blue_carpet",
+    "yellow_carpet", "lime_carpet", "pink_carpet", "gray_carpet", "light_gray_carpet", "cyan_carpet",
+    "purple_carpet", "blue_carpet", "brown_carpet", "green_carpet", "red_carpet", "black_carpet",
+    "terracotta", "packed_ice", "dirt_path", "sunflower", "lilac", "rose_bush",
+    "peony", "tall_grass", "large_fern", "white_stained_glass", "orange_stained_glass", "magenta_stained_glass",
+    "light_blue_stained_glass", "yellow_stained_glass", "lime_stained_glass", "pink_stained_glass", "gray_stained_glass", "light_gray_stained_glass",
+    "cyan_stained_glass", "purple_stained_glass", "blue_stained_glass", "brown_stained_glass", "green_stained_glass", "red_stained_glass",
+    "black_stained_glass", "white_stained_glass_pane", "orange_stained_glass_pane", "magenta_stained_glass_pane", "light_blue_stained_glass_pane", "yellow_stained_glass_pane",
+    "lime_stained_glass_pane", "pink_stained_glass_pane", "gray_stained_glass_pane", "light_gray_stained_glass_pane", "cyan_stained_glass_pane", "purple_stained_glass_pane",
+    "blue_stained_glass_pane", "brown_stained_glass_pane", "green_stained_glass_pane", "red_stained_glass_pane", "black_stained_glass_pane", "prismarine",
+    "prismarine_bricks", "dark_prismarine", "prismarine_stairs", "prismarine_brick_stairs", "dark_prismarine_stairs", "sea_lantern",
+    "red_sandstone", "chiseled_red_sandstone", "cut_red_sandstone", "red_sandstone_stairs", "repeating_command_block", "chain_command_block",
+    "magma_block", "nether_wart_block", "warped_wart_block", "red_nether_bricks", "bone_block", "structure_void",
+    "shulker_box", "white_shulker_box", "orange_shulker_box", "magenta_shulker_box", "light_blue_shulker_box", "yellow_shulker_box",
+    "lime_shulker_box", "pink_shulker_box", "gray_shulker_box", "light_gray_shulker_box", "cyan_shulker_box", "purple_shulker_box",
+    "blue_shulker_box", "brown_shulker_box", "green_shulker_box", "red_shulker_box", "black_shulker_box", "white_glazed_terracotta",
+    "orange_glazed_terracotta", "magenta_glazed_terracotta", "light_blue_glazed_terracotta", "yellow_glazed_terracotta", "lime_glazed_terracotta", "pink_glazed_terracotta",
+    "gray_glazed_terracotta", "light_gray_glazed_terracotta", "cyan_glazed_terracotta", "purple_glazed_terracotta", "blue_glazed_terracotta", "brown_glazed_terracotta",
+    "green_glazed_terracotta", "red_glazed_terracotta", "black_glazed_terracotta", "white_concrete", "orange_concrete", "magenta_concrete",
+    "light_blue_concrete", "yellow_concrete", "lime_concrete", "pink_concrete", "gray_concrete", "light_gray_concrete",
+    "cyan_concrete", "purple_concrete", "blue_concrete", "brown_concrete", "green_concrete", "red_concrete",
+    "black_concrete", "white_concrete_powder", "orange_concrete_powder", "magenta_concrete_powder", "light_blue_concrete_powder", "yellow_concrete_powder",
+    "lime_concrete_powder", "pink_concrete_powder", "gray_concrete_powder", "light_gray_concrete_powder", "cyan_concrete_powder", "purple_concrete_powder",
+    "blue_concrete_powder", "brown_concrete_powder", "green_concrete_powder", "red_concrete_powder", "black_concrete_powder", "turtle_egg",
+    "sniffer_egg", "dead_tube_coral_block", "dead_brain_coral_block", "dead_bubble_coral_block", "dead_fire_coral_block", "dead_horn_coral_block",
+    "tube_coral_block", "brain_coral_block", "bubble_coral_block", "fire_coral_block", "horn_coral_block", "tube_coral",
+    "brain_coral", "bubble_coral", "fire_coral", "horn_coral", "dead_brain_coral", "dead_bubble_coral",
+    "dead_fire_coral", "dead_horn_coral", "dead_tube_coral", "tube_coral_fan", "brain_coral_fan", "bubble_coral_fan",
+    "fire_coral_fan", "horn_coral_fan", "dead_tube_coral_fan", "dead_brain_coral_fan", "dead_bubble_coral_fan", "dead_fire_coral_fan",
+    "dead_horn_coral_fan", "blue_ice", "conduit", "polished_granite_stairs", "smooth_red_sandstone_stairs", "mossy_stone_brick_stairs",
+    "polished_diorite_stairs", "mossy_cobblestone_stairs", "end_stone_brick_stairs", "stone_stairs", "smooth_sandstone_stairs", "smooth_quartz_stairs",
+    "granite_stairs", "andesite_stairs", "red_nether_brick_stairs", "polished_andesite_stairs", "diorite_stairs", "cobbled_deepslate_stairs",
+    "polished_deepslate_stairs", "deepslate_brick_stairs", "deepslate_tile_stairs", "polished_granite_slab", "smooth_red_sandstone_slab", "mossy_stone_brick_slab",
+    "polished_diorite_slab", "mossy_cobblestone_slab", "end_stone_brick_slab", "smooth_sandstone_slab", "smooth_quartz_slab", "granite_slab",
+    "andesite_slab", "red_nether_brick_slab", "polished_andesite_slab", "diorite_slab", "cobbled_deepslate_slab", "polished_deepslate_slab",
+    "deepslate_brick_slab", "deepslate_tile_slab", "scaffolding", "redstone", "redstone_torch", "redstone_block",
+    "repeater", "comparator", "piston", "sticky_piston", "slime_block", "honey_block",
+    "observer", "hopper", "dispenser", "dropper", "lectern", "target",
+    "lever", "lightning_rod", "daylight_detector", "sculk_sensor", "calibrated_sculk_sensor", "tripwire_hook",
+    "trapped_chest", "tnt", "redstone_lamp", "note_block", "stone_button", "polished_blackstone_button",
+    "oak_button", "spruce_button", "birch_button", "jungle_button", "acacia_button", "cherry_button",
+    "dark_oak_button", "mangrove_button", "bamboo_button", "crimson_button", "warped_button", "stone_pressure_plate",
+    "polished_blackstone_pressure_plate", "light_weighted_pressure_plate", "heavy_weighted_pressure_plate", "oak_pressure_plate", "spruce_pressure_plate", "birch_pressure_plate",
+    "jungle_pressure_plate", "acacia_pressure_plate", "cherry_pressure_plate", "dark_oak_pressure_plate", "mangrove_pressure_plate", "bamboo_pressure_plate",
+    "crimson_pressure_plate", "warped_pressure_plate", "iron_door", "oak_door", "spruce_door", "birch_door",
+    "jungle_door", "acacia_door", "cherry_door", "dark_oak_door", "mangrove_door", "bamboo_door",
+    "crimson_door", "warped_door", "copper_door", "exposed_copper_door", "weathered_copper_door", "oxidized_copper_door",
+    "waxed_copper_door", "waxed_exposed_copper_door", "waxed_weathered_copper_door", "waxed_oxidized_copper_door", "iron_trapdoor", "oak_trapdoor",
+    "spruce_trapdoor", "birch_trapdoor", "jungle_trapdoor", "acacia_trapdoor", "cherry_trapdoor", "dark_oak_trapdoor",
+    "mangrove_trapdoor", "bamboo_trapdoor", "crimson_trapdoor", "warped_trapdoor", "copper_trapdoor", "exposed_copper_trapdoor",
+    "weathered_copper_trapdoor", "oxidized_copper_trapdoor", "waxed_copper_trapdoor", "waxed_exposed_copper_trapdoor", "waxed_weathered_copper_trapdoor", "waxed_oxidized_copper_trapdoor",
+    "oak_fence_gate", "spruce_fence_gate", "birch_fence_gate", "jungle_fence_gate", "acacia_fence_gate", "cherry_fence_gate",
+    "dark_oak_fence_gate", "mangrove_fence_gate", "bamboo_fence_gate", "crimson_fence_gate", "warped_fence_gate", "powered_rail",
+    "detector_rail", "rail", "activator_rail", "saddle", "minecart", "chest_minecart",
+    "furnace_minecart", "tnt_minecart", "hopper_minecart", "carrot_on_a_stick", "warped_fungus_on_a_stick", "elytra",
+    "oak_boat", "oak_chest_boat", "spruce_boat", "spruce_chest_boat", "birch_boat", "birch_chest_boat",
+    "jungle_boat", "jungle_chest_boat", "acacia_boat", "acacia_chest_boat", "cherry_boat", "cherry_chest_boat",
+    "dark_oak_boat", "dark_oak_chest_boat", "mangrove_boat", "mangrove_chest_boat", "bamboo_raft", "bamboo_chest_raft",
+    "structure_block", "jigsaw", "turtle_helmet", "turtle_scute", "armadillo_scute", "wolf_armor",
+    "flint_and_steel", "bowl", "apple", "bow", "arrow", "coal",
+    "charcoal", "diamond", "emerald", "lapis_lazuli", "quartz", "amethyst_shard",
+    "raw_iron", "iron_ingot", "raw_copper", "copper_ingot", "raw_gold", "gold_ingot",
+    "netherite_ingot", "netherite_scrap", "wooden_sword", "wooden_shovel", "wooden_pickaxe", "wooden_axe",
+    "wooden_hoe", "stone_sword", "stone_shovel", "stone_pickaxe", "stone_axe", "stone_hoe",
+    "golden_sword", "golden_shovel", "golden_pickaxe", "golden_axe", "golden_hoe", "iron_sword",
+    "iron_shovel", "iron_pickaxe", "iron_axe", "iron_hoe", "diamond_sword", "diamond_shovel",
+    "diamond_pickaxe", "diamond_axe", "diamond_hoe", "netherite_sword", "netherite_shovel", "netherite_pickaxe",
+    "netherite_axe", "netherite_hoe", "stick", "mushroom_stew", "string", "feather",
+    "gunpowder", "wheat_seeds", "wheat", "bread", "leather_helmet", "leather_chestplate",
+    "leather_leggings", "leather_boots", "chainmail_helmet", "chainmail_chestplate", "chainmail_leggings", "chainmail_boots",
+    "iron_helmet", "iron_chestplate", "iron_leggings", "iron_boots", "diamond_helmet", "diamond_chestplate",
+    "diamond_leggings", "diamond_boots", "golden_helmet", "golden_chestplate", "golden_leggings", "golden_boots",
+    "netherite_helmet", "netherite_chestplate", "netherite_leggings", "netherite_boots", "flint", "porkchop",
+    "cooked_porkchop", "painting", "golden_apple", "enchanted_golden_apple", "oak_sign", "spruce_sign",
+    "birch_sign", "jungle_sign", "acacia_sign", "cherry_sign", "dark_oak_sign", "mangrove_sign",
+    "bamboo_sign", "crimson_sign", "warped_sign", "oak_hanging_sign", "spruce_hanging_sign", "birch_hanging_sign",
+    "jungle_hanging_sign", "acacia_hanging_sign", "cherry_hanging_sign", "dark_oak_hanging_sign", "mangrove_hanging_sign", "bamboo_hanging_sign",
+    "crimson_hanging_sign", "warped_hanging_sign", "bucket", "water_bucket", "lava_bucket", "powder_snow_bucket",
+    "snowball", "leather", "milk_bucket", "pufferfish_bucket", "salmon_bucket", "cod_bucket",
+    "tropical_fish_bucket", "axolotl_bucket", "tadpole_bucket", "brick", "clay_ball", "dried_kelp_block",
+    "paper", "book", "slime_ball", "egg", "compass", "recovery_compass",
+    "bundle", "fishing_rod", "clock", "spyglass", "glowstone_dust", "cod",
+    "salmon", "tropical_fish", "pufferfish", "cooked_cod", "cooked_salmon", "ink_sac",
+    "glow_ink_sac", "cocoa_beans", "white_dye", "orange_dye", "magenta_dye", "light_blue_dye",
+    "yellow_dye", "lime_dye", "pink_dye", "gray_dye", "light_gray_dye", "cyan_dye",
+    "purple_dye", "blue_dye", "brown_dye", "green_dye", "red_dye", "black_dye",
+    "bone_meal", "bone", "sugar", "cake", "white_bed", "orange_bed",
+    "magenta_bed", "light_blue_bed", "yellow_bed", "lime_bed", "pink_bed", "gray_bed",
+    "light_gray_bed", "cyan_bed", "purple_bed", "blue_bed", "brown_bed", "green_bed",
+    "red_bed", "black_bed", "cookie", "crafter", "filled_map", "shears",
+    "melon_slice", "dried_kelp", "pumpkin_seeds", "melon_seeds", "beef", "cooked_beef",
+    "chicken", "cooked_chicken", "rotten_flesh", "ender_pearl", "blaze_rod", "ghast_tear",
+    "gold_nugget", "nether_wart", "potion", "glass_bottle", "spider_eye", "fermented_spider_eye",
+    "blaze_powder", "magma_cream", "brewing_stand", "cauldron", "ender_eye", "glistering_melon_slice",
+    "armadillo_spawn_egg", "allay_spawn_egg", "axolotl_spawn_egg", "bat_spawn_egg", "bee_spawn_egg", "blaze_spawn_egg",
+    "bogged_spawn_egg", "breeze_spawn_egg", "cat_spawn_egg", "camel_spawn_egg", "cave_spider_spawn_egg", "chicken_spawn_egg",
+    "cod_spawn_egg", "cow_spawn_egg", "creeper_spawn_egg", "dolphin_spawn_egg", "donkey_spawn_egg", "drowned_spawn_egg",
+    "elder_guardian_spawn_egg", "ender_dragon_spawn_egg", "enderman_spawn_egg", "endermite_spawn_egg", "evoker_spawn_egg", "fox_spawn_egg",
+    "frog_spawn_egg", "ghast_spawn_egg", "glow_squid_spawn_egg", "goat_spawn_egg", "guardian_spawn_egg", "hoglin_spawn_egg",
+    "horse_spawn_egg", "husk_spawn_egg", "iron_golem_spawn_egg", "llama_spawn_egg", "magma_cube_spawn_egg", "mooshroom_spawn_egg",
+    "mule_spawn_egg", "ocelot_spawn_egg", "panda_spawn_egg", "parrot_spawn_egg", "phantom_spawn_egg", "pig_spawn_egg",
+    "piglin_spawn_egg", "piglin_brute_spawn_egg", "pillager_spawn_egg", "polar_bear_spawn_egg", "pufferfish_spawn_egg", "rabbit_spawn_egg",
+    "ravager_spawn_egg", "salmon_spawn_egg", "sheep_spawn_egg", "shulker_spawn_egg", "silverfish_spawn_egg", "skeleton_spawn_egg",
+    "skeleton_horse_spawn_egg", "slime_spawn_egg", "sniffer_spawn_egg", "snow_golem_spawn_egg", "spider_spawn_egg", "squid_spawn_egg",
+    "stray_spawn_egg", "strider_spawn_egg", "tadpole_spawn_egg", "trader_llama_spawn_egg", "tropical_fish_spawn_egg", "turtle_spawn_egg",
+    "vex_spawn_egg", "villager_spawn_egg", "vindicator_spawn_egg", "wandering_trader_spawn_egg", "warden_spawn_egg", "witch_spawn_egg",
+    "wither_spawn_egg", "wither_skeleton_spawn_egg", "wolf_spawn_egg", "zoglin_spawn_egg", "zombie_spawn_egg", "zombie_horse_spawn_egg",
+    "zombie_villager_spawn_egg", "zombified_piglin_spawn_egg", "experience_bottle", "fire_charge", "wind_charge", "writable_book",
+    "written_book", "mace", "item_frame", "glow_item_frame", "flower_pot", "carrot",
+    "potato", "baked_potato", "poisonous_potato", "map", "golden_carrot", "skeleton_skull",
+    "wither_skeleton_skull", "player_head", "zombie_head", "creeper_head", "dragon_head", "piglin_head",
+    "nether_star", "pumpkin_pie", "firework_rocket", "firework_star", "enchanted_book", "nether_brick",
+    "prismarine_shard", "prismarine_crystals", "rabbit", "cooked_rabbit", "rabbit_stew", "rabbit_foot",
+    "rabbit_hide", "armor_stand", "iron_horse_armor", "golden_horse_armor", "diamond_horse_armor", "leather_horse_armor",
+    "lead", "name_tag", "command_block_minecart", "mutton", "cooked_mutton", "white_banner",
+    "orange_banner", "magenta_banner", "light_blue_banner", "yellow_banner", "lime_banner", "pink_banner",
+    "gray_banner", "light_gray_banner", "cyan_banner", "purple_banner", "blue_banner", "brown_banner",
+    "green_banner", "red_banner", "black_banner", "end_crystal", "chorus_fruit", "popped_chorus_fruit",
+    "torchflower_seeds", "pitcher_pod", "beetroot", "beetroot_seeds", "beetroot_soup", "dragon_breath",
+    "splash_potion", "spectral_arrow", "tipped_arrow", "lingering_potion", "shield", "totem_of_undying",
+    "shulker_shell", "iron_nugget", "knowledge_book", "debug_stick", "music_disc_13", "music_disc_cat",
+    "music_disc_blocks", "music_disc_chirp", "music_disc_creator", "music_disc_creator_music_box", "music_disc_far", "music_disc_mall",
+    "music_disc_mellohi", "music_disc_stal", "music_disc_strad", "music_disc_ward", "music_disc_11", "music_disc_wait",
+    "music_disc_otherside", "music_disc_relic", "music_disc_5", "music_disc_pigstep", "music_disc_precipice", "disc_fragment_5",
+    "trident", "phantom_membrane", "nautilus_shell", "heart_of_the_sea", "crossbow", "suspicious_stew",
+    "loom", "flower_banner_pattern", "creeper_banner_pattern", "skull_banner_pattern", "mojang_banner_pattern", "globe_banner_pattern",
+    "piglin_banner_pattern", "flow_banner_pattern", "guster_banner_pattern", "goat_horn", "composter", "barrel",
+    "smoker", "blast_furnace", "cartography_table", "fletching_table", "grindstone", "smithing_table",
+    "stonecutter", "bell", "lantern", "soul_lantern", "sweet_berries", "glow_berries",
+    "campfire", "soul_campfire", "shroomlight", "honeycomb", "bee_nest", "beehive",
+    "honey_bottle", "honeycomb_block", "lodestone", "crying_obsidian", "blackstone", "blackstone_slab",
+    "blackstone_stairs", "gilded_blackstone", "polished_blackstone", "polished_blackstone_slab", "polished_blackstone_stairs", "chiseled_polished_blackstone",
+    "polished_blackstone_bricks", "polished_blackstone_brick_slab", "polished_blackstone_brick_stairs", "cracked_polished_blackstone_bricks", "respawn_anchor", "candle",
+    "white_candle", "orange_candle", "magenta_candle", "light_blue_candle", "yellow_candle", "lime_candle",
+    "pink_candle", "gray_candle", "light_gray_candle", "cyan_candle", "purple_candle", "blue_candle",
+    "brown_candle", "green_candle", "red_candle", "black_candle", "small_amethyst_bud", "medium_amethyst_bud",
+    "large_amethyst_bud", "amethyst_cluster", "pointed_dripstone", "ochre_froglight", "verdant_froglight", "pearlescent_froglight",
+    "frogspawn", "echo_shard", "brush", "netherite_upgrade_smithing_template", "sentry_armor_trim_smithing_template", "dune_armor_trim_smithing_template",
+    "coast_armor_trim_smithing_template", "wild_armor_trim_smithing_template", "ward_armor_trim_smithing_template", "eye_armor_trim_smithing_template", "vex_armor_trim_smithing_template", "tide_armor_trim_smithing_template",
+    "snout_armor_trim_smithing_template", "rib_armor_trim_smithing_template", "spire_armor_trim_smithing_template", "wayfinder_armor_trim_smithing_template", "shaper_armor_trim_smithing_template", "silence_armor_trim_smithing_template",
+    "raiser_armor_trim_smithing_template", "host_armor_trim_smithing_template", "flow_armor_trim_smithing_template", "bolt_armor_trim_smithing_template", "angler_pottery_sherd", "archer_pottery_sherd",
+    "arms_up_pottery_sherd", "blade_pottery_sherd", "brewer_pottery_sherd", "burn_pottery_sherd", "danger_pottery_sherd", "explorer_pottery_sherd",
+    "flow_pottery_sherd", "friend_pottery_sherd", "guster_pottery_sherd", "heart_pottery_sherd", "heartbreak_pottery_sherd", "howl_pottery_sherd",
+    "miner_pottery_sherd", "mourner_pottery_sherd", "plenty_pottery_sherd", "prize_pottery_sherd", "scrape_pottery_sherd", "sheaf_pottery_sherd",
+    "shelter_pottery_sherd", "skull_pottery_sherd", "snort_pottery_sherd", "copper_grate", "exposed_copper_grate", "weathered_copper_grate",
+    "oxidized_copper_grate", "waxed_copper_grate", "waxed_exposed_copper_grate", "waxed_weathered_copper_grate", "waxed_oxidized_copper_grate", "copper_bulb",
+    "exposed_copper_bulb", "weathered_copper_bulb", "oxidized_copper_bulb", "waxed_copper_bulb", "waxed_exposed_copper_bulb", "waxed_weathered_copper_bulb",
+    "waxed_oxidized_copper_bulb", "trial_spawner", "trial_key", "ominous_trial_key", "vault", "ominous_bottle",
+    "breeze_rod",
+];
+fn item_to_name(id: i64) -> Option<&'static str> {
+    usize::try_from(id).ok().and_then(|i| ITEM_NAMES.get(i).copied())
+}
+fn read_nbt_string_bytes(data: &[u8], p: &mut usize) -> Option<String> {
+    if *p + 3 > data.len() || data[*p] != 8 {
+        return None;
+    }
+    let len = u16::from_be_bytes([data[*p + 1], data[*p + 2]]) as usize;
+    if *p + 3 + len > data.len() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&data[*p + 3..*p + 3 + len]).into_owned();
+    *p += 3 + len;
+    Some(text)
+}
+fn nbt_int_val(tag: &crate::nbt::Tag) -> Option<i64> {
+    match tag {
+        crate::nbt::Tag::Byte(v) => Some(i64::from(*v)),
+        crate::nbt::Tag::Short(v) => Some(i64::from(*v)),
+        crate::nbt::Tag::Int(v) => Some(i64::from(*v)),
+        crate::nbt::Tag::Long(v) => Some(*v),
+        _ => None,
+    }
+}
+fn stack_to_nbt(slot: i16, (item, count, comps): &Stack) -> Option<crate::nbt::Tag> {
+    use crate::nbt::{NbtString, Tag};
+    if *item <= 0 || *count == 0 {
+        return None;
+    }
+    let name = item_to_name(*item)?;
+    let mut entry = std::collections::BTreeMap::new();
+    entry.insert(NbtString::text("Slot"), Tag::Byte(slot as i8));
+    entry.insert(
+        NbtString::text("id"),
+        Tag::String(NbtString::text(&format!("minecraft:{name}"))),
+    );
+    entry.insert(NbtString::text("count"), Tag::Int(i32::from(*count)));
+    if !comps.is_empty() {
+        let mut comp_map = std::collections::BTreeMap::new();
+        for (ty, data) in comps {
+            match *ty {
+                1 => {
+                    comp_map.insert(
+                        NbtString::text("minecraft:max_stack_size"),
+                        Tag::Int(read_varint_at(data, 0).0 as i32),
+                    );
+                }
+                COMP_MAX_DAMAGE => {
+                    comp_map.insert(
+                        NbtString::text("minecraft:max_damage"),
+                        Tag::Int(read_varint_at(data, 0).0 as i32),
+                    );
+                }
+                COMP_DAMAGE => {
+                    comp_map.insert(
+                        NbtString::text("minecraft:damage"),
+                        Tag::Int(read_varint_at(data, 0).0 as i32),
+                    );
+                }
+                COMP_UNBREAKABLE => {
+                    let show = data.first().copied().unwrap_or(1) != 0;
+                    let mut inner = std::collections::BTreeMap::new();
+                    inner.insert(NbtString::text("show_in_tooltip"), Tag::Byte(i8::from(show)));
+                    comp_map.insert(
+                        NbtString::text("minecraft:unbreakable"),
+                        Tag::Compound(inner),
+                    );
+                }
+                COMP_CUSTOM_NAME => {
+                    let mut p = 0;
+                    if let Some(text) = read_nbt_string_bytes(data, &mut p) {
+                        comp_map.insert(
+                            NbtString::text("minecraft:custom_name"),
+                            Tag::String(NbtString::text(&text)),
+                        );
+                    }
+                }
+                COMP_LORE => {
+                    let (n, mut p) = read_varint_at(data, 0);
+                    let mut list = Vec::new();
+                    for _ in 0..n.min(128) {
+                        if let Some(line) = read_nbt_string_bytes(data, &mut p) {
+                            list.push(Tag::String(NbtString::text(&line)));
+                        }
+                    }
+                    let kind = if list.is_empty() { 0 } else { 8 };
+                    comp_map.insert(NbtString::text("minecraft:lore"), Tag::List(kind, list));
+                }
+                COMP_ENCHANTMENTS | COMP_STORED_ENCHANTMENTS => {
+                    let (n, mut p) = read_varint_at(data, 0);
+                    let mut levels = std::collections::BTreeMap::new();
+                    for _ in 0..n.min(64) {
+                        if p + 2 > data.len() {
+                            break;
+                        }
+                        let (id, p2) = read_varint_at(data, p);
+                        let (lvl, p3) = read_varint_at(data, p2);
+                        p = p3;
+                        if let Some(ename) = enchant_name(id) {
+                            levels.insert(NbtString::text(ename), Tag::Int(lvl as i32));
+                        }
+                    }
+                    let show = data.get(p).copied().unwrap_or(1) != 0;
+                    let mut inner = std::collections::BTreeMap::new();
+                    inner.insert(NbtString::text("levels"), Tag::Compound(levels));
+                    inner.insert(NbtString::text("show_in_tooltip"), Tag::Byte(i8::from(show)));
+                    let key = if *ty == COMP_STORED_ENCHANTMENTS {
+                        "minecraft:stored_enchantments"
+                    } else {
+                        "minecraft:enchantments"
+                    };
+                    comp_map.insert(NbtString::text(key), Tag::Compound(inner));
+                }
+                16 => {
+                    comp_map.insert(
+                        NbtString::text("minecraft:repair_cost"),
+                        Tag::Int(read_varint_at(data, 0).0 as i32),
+                    );
+                }
+                _ => {}
+            }
+        }
+        if !comp_map.is_empty() {
+            entry.insert(NbtString::text("components"), Tag::Compound(comp_map));
+        }
+    }
+    Some(Tag::Compound(entry))
+}
+fn stacks_to_items_nbt(slots: &HashMap<i16, Stack>) -> crate::nbt::Tag {
+    let mut keys: Vec<i16> = slots.keys().copied().collect();
+    keys.sort_unstable();
+    let items: Vec<crate::nbt::Tag> = keys
+        .into_iter()
+        .filter_map(|slot| slots.get(&slot).and_then(|st| stack_to_nbt(slot, st)))
+        .collect();
+    crate::nbt::Tag::List(if items.is_empty() { 0 } else { 10 }, items)
+}
+fn items_nbt_to_stacks(tag: &crate::nbt::Tag) -> Result<HashMap<i16, Stack>, &'static str> {
+    use crate::nbt::Tag;
+    let list = tag.list().ok_or("cart Items is not a list")?;
+    let mut out = HashMap::new();
+    for entry in list {
+        let slot = match entry.get("Slot") {
+            Some(Tag::Byte(b)) => i16::from(*b),
+            Some(Tag::Short(s)) => *s,
+            Some(Tag::Int(i)) => *i as i16,
+            _ => return Err("cart item Slot missing"),
+        };
+        let id = entry
+            .get("id")
+            .and_then(Tag::string)
+            .ok_or("cart item id missing")?
+            .to_utf8()
+            .map_err(|_| "invalid cart item id")?;
+        let item = name_to_item(&id).ok_or("unknown cart item id")?;
+        let count_i = entry
+            .get("count")
+            .or_else(|| entry.get("Count"))
+            .and_then(nbt_int_val)
+            .unwrap_or(1);
+        if count_i <= 0 {
+            continue;
+        }
+        let count = u8::try_from(count_i).map_err(|_| "cart item count out of range")?;
+        let mut comps: Comps = Vec::new();
+        if let Some(Tag::Compound(cfields)) = entry.get("components") {
+            for (k, v) in cfields {
+                let Ok(key_str) = k.to_utf8() else {
+                    continue;
+                };
+                match key_str.trim_start_matches("minecraft:") {
+                    "max_stack_size" => {
+                        if let Some(n) = nbt_int_val(v) {
+                            comp_set_varint(&mut comps, 1, n);
+                        }
+                    }
+                    "max_damage" => {
+                        if let Some(n) = nbt_int_val(v) {
+                            comp_set_varint(&mut comps, COMP_MAX_DAMAGE, n);
+                        }
+                    }
+                    "damage" => {
+                        if let Some(n) = nbt_int_val(v) {
+                            comp_set_varint(&mut comps, COMP_DAMAGE, n);
+                        }
+                    }
+                    "repair_cost" => {
+                        if let Some(n) = nbt_int_val(v) {
+                            comp_set_varint(&mut comps, 16, n);
+                        }
+                    }
+                    "unbreakable" => {
+                        let show = v
+                            .get("show_in_tooltip")
+                            .and_then(|t| match t {
+                                Tag::Byte(b) => Some(*b != 0),
+                                _ => None,
+                            })
+                            .unwrap_or(true);
+                        comp_set(&mut comps, COMP_UNBREAKABLE, vec![u8::from(show)]);
+                    }
+                    "custom_name" => {
+                        if let Some(text) = v.string().and_then(|s| s.to_utf8().ok()) {
+                            comp_set(&mut comps, COMP_CUSTOM_NAME, nbt_string(&text));
+                        }
+                    }
+                    "lore" => {
+                        if let Some(lines) = v.list() {
+                            let mut d = Vec::new();
+                            write_varint(&mut d, lines.len() as i64);
+                            for line in lines {
+                                if let Some(s) = line.string().and_then(|s| s.to_utf8().ok()) {
+                                    d.extend_from_slice(&nbt_string(&s));
+                                }
+                            }
+                            comp_set(&mut comps, COMP_LORE, d);
+                        }
+                    }
+                    name @ ("enchantments" | "stored_enchantments") => {
+                        let comp_ty = if name == "stored_enchantments" {
+                            COMP_STORED_ENCHANTMENTS
+                        } else {
+                            COMP_ENCHANTMENTS
+                        };
+                        let show = v
+                            .get("show_in_tooltip")
+                            .and_then(|t| match t {
+                                Tag::Byte(b) => Some(*b != 0),
+                                _ => None,
+                            })
+                            .unwrap_or(true);
+                        let levels_tag = v.get("levels").unwrap_or(v);
+                        if let Tag::Compound(lmap) = levels_tag {
+                            let mut list = Vec::new();
+                            for (ek, ev) in lmap {
+                                if let (Ok(ename), Some(lvl)) = (ek.to_utf8(), nbt_int_val(ev)) {
+                                    if let Some(eid) = enchant_id(&ename) {
+                                        list.push((eid, lvl));
+                                    }
+                                }
+                            }
+                            comp_set(&mut comps, comp_ty, enchantments_data(&list, show));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.insert(slot, (item, count, comps));
+    }
+    Ok(out)
+}
+
+// ---------- item -> blockstate (1.21.1 ids) ----------
+fn item_to_state(item: i64) -> Option<u32> {
+    Some(match item {
+        1 => 1,
+        27 => 9,
+        28 => 10,
+        35 => 14,
+        36 => 15,
+        57 => 112,
+        88 => 2092,
+        91 => 4276,
+        132 => 131,
+        188 => 519,
+        290 => 2354,
+        291 => 2355,
+        299 => 2955, // chest's 1.21.1 default state (single, north, dry)
+        678 => 9120, // trapped_chest's default state (single, north, dry)
+        _ => return None,
+    })
+}
+
+fn slot_wire(s: &Stack) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, s.1 as i64);
+    if s.1 > 0 {
+        write_varint(&mut p, s.0);
+        write_varint(&mut p, s.2.len() as i64);
+        write_varint(&mut p, 0);
+        for (ty, data) in &s.2 {
+            write_varint(&mut p, *ty);
+            p.extend_from_slice(data);
+        }
+    }
+    p
+}
+// wire-format slot decode (1.21.1 structured components). Unknown comp
+// ids are rejected because their payload boundary is type-specific.
+fn slot_read_varint(b: &[u8], p: &mut usize) -> Option<i64> {
+    let mut rest = b.get(*p..)?;
+    let value = read_protocol_i32(&mut rest)?;
+    *p = b.len() - rest.len();
+    Some(i64::from(value))
+}
+
+fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
+    if b.len() < 2 {
+        return None;
+    }
+    let slot = i16::from_be_bytes(b[..2].try_into().unwrap());
+    let mut p = 2usize;
+    let cnt = slot_read_varint(b, &mut p)?;
+    if cnt == 0 {
+        return (p == b.len()).then_some((slot, (0, 0, Vec::new())));
+    }
+    if !(1..=127).contains(&cnt) {
+        return None;
+    }
+    let item = slot_read_varint(b, &mut p)?;
+    let nadd = slot_read_varint(b, &mut p)?;
+    let nrem = slot_read_varint(b, &mut p)?;
+    let mut comps: Comps = Vec::new();
+    if nadd < 0 || nadd > 128 || nrem < 0 || nrem > 128 {
+        return None;
+    }
+    // This stack representation has no removed-component set. Accepting one while
+    // silently discarding it would change the item; reject the slot atomically.
+    if nrem != 0 {
+        return None;
+    }
+    for _ in 0..nadd {
+        let ty = slot_read_varint(b, &mut p)?;
+        let start = p;
+        match ty {
+            1..=3 | 16 => {
+                slot_read_varint(b, &mut p)?;
+            } // varint payload
+            4 => {
+                let value = *b.get(p)?;
+                if value > 1 {
+                    return None;
+                }
+                p += 1;
+            } // unbreakable: bool
+            5 => {
+                if p + 3 <= b.len() && b[p] == 8 {
+                    // nbt_string
+                    let l = u16::from_be_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
+                    p += 3;
+                    p = p.checked_add(l).filter(|end| *end <= b.len())?;
+                } else {
+                    return None;
+                }
+            }
+            7 => {
+                let n = slot_read_varint(b, &mut p)?; // lore: n strings
+                if !(0..=128).contains(&n) {
+                    return None;
+                }
+                for _ in 0..n {
+                    if p + 3 <= b.len() && b[p] == 8 {
+                        let l = u16::from_be_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
+                        p += 3;
+                        p = p.checked_add(l).filter(|end| *end <= b.len())?;
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            9 | 23 => {
+                let n = slot_read_varint(b, &mut p)?; // enchantments / stored_enchantments
+                if !(0..=256).contains(&n) {
+                    return None;
+                }
+                for _ in 0..n {
+                    slot_read_varint(b, &mut p)?;
+                    slot_read_varint(b, &mut p)?;
+                }
+                let value = *b.get(p)?;
+                if value > 1 {
+                    return None;
+                }
+                p += 1;
+            }
+            COMP_POTION_CONTENTS => {
+                let mut payload = b.get(p..)?;
+                if read_merchant_bool(&mut payload)? {
+                    read_protocol_i32(&mut payload)?;
+                }
+                if read_merchant_bool(&mut payload)? {
+                    payload = payload.get(4..)?;
+                }
+                let effects = read_protocol_i32(&mut payload)?;
+                if !(0..=256).contains(&effects) {
+                    return None;
+                }
+                for _ in 0..effects {
+                    read_protocol_i32(&mut payload)?; // effect registry id
+                    read_live_potion_effect_details(&mut payload, 0)?;
+                }
+                p = b.len() - payload.len();
+            }
+            COMP_ARMOR_TRIM => {
+                // The smithing menu emits registry-backed holders.
+                if slot_read_varint(b, &mut p)? == 0 || slot_read_varint(b, &mut p)? == 0 {
+                    return None;
+                }
+                let value = *b.get(p)?;
+                if value > 1 {
+                    return None;
+                }
+                p += 1;
+            }
+            // Component payloads are not length-prefixed. Without a type-aware
+            // decoder their boundary cannot be recovered, so reject the whole
+            // stack rather than returning a truncated item as if it were valid.
+            _ => return None,
+        }
+        if p <= b.len() && p > start {
+            comps.push((ty, b[start..p].to_vec()));
+        } else {
+            return None;
+        }
+    }
+    (p == b.len() && (0..=i32::MAX as i64).contains(&item))
+        .then_some((slot, (item, cnt as u8, comps)))
+}
+
+fn creative_inventory_slot(slot: i16) -> bool {
+    (0..=45).contains(&slot)
+}
+
+#[cfg(test)]
+mod creative_slot_wire_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_component_rejects_entire_stack() {
+        let mut packet = 0i16.to_be_bytes().to_vec();
+        write_varint(&mut packet, 1); // count
+        write_varint(&mut packet, 1); // item
+        write_varint(&mut packet, 1); // added components
+        write_varint(&mut packet, 0); // removed components
+        write_varint(&mut packet, 200); // unknown component id
+        packet.push(0xaa);
+        assert_eq!(slot_read_wire(&packet), None);
+    }
+
+    #[test]
+    fn malformed_creative_stack_is_rejected() {
+        let mut packet = 0i16.to_be_bytes().to_vec();
+        write_varint(&mut packet, 1);
+        write_varint(&mut packet, 1);
+        write_varint(&mut packet, 1);
+        write_varint(&mut packet, 0);
+        write_varint(&mut packet, COMP_DAMAGE);
+        assert_eq!(slot_read_wire(&packet), None);
+    }
+
+    #[test]
+    fn creative_slot_range_matches_player_menu() {
+        assert!(!creative_inventory_slot(-1));
+        assert!(creative_inventory_slot(0));
+        assert!(creative_inventory_slot(45));
+        assert!(!creative_inventory_slot(46));
+    }
+}
+fn write_open_chest_packets(
+    s: &mut TcpStream,
+    wide: bool,
+    initial: &[Stack],
+    inv: &HashMap<i16, Stack>,
+    title: &str,
+) {
+    // `first` owns window slots 0..=26 and `second` 27..=53. For a chest pair that is
+    // `DoubleBlockCombiner`'s order (`CompoundContainer(right, left)`), not a click
+    // order: the caller passes the right half first.
+    let rows = initial.len() as i16;
+    let mut p = Vec::new();
+    write_varint(&mut p, 1); // windowId
+    write_varint(&mut p, if wide { 5 } else { 2 }); // generic_9x6 / generic_9x3
+    p.extend_from_slice(&chat_nbt(if wide { "Large Chest" } else { title }));
+    let _ = send_packet(s, 0x33, p);
+    let mut q = vec![1u8];
+    write_varint(&mut q, 0);
+    write_varint(&mut q, (rows + 36) as i64);
+    for norm in initial {
+        q.extend_from_slice(&slot_wire(norm));
+    }
+    for wsl in rows..(rows + 36) {
+        let islot = wsl - rows + 9; // window inv section -> inv slots 9..44
+        let (it, c, _cc) = inv.get(&islot).cloned().unwrap_or((0, 0, Vec::new()));
+        q.extend_from_slice(&slot_wire(&(it, c, _cc)));
+    }
+    q.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); // carried
+    let _ = send_packet(s, 0x13, q);
+}
+#[cfg(test)]
+fn open_chest_window(
+    s: &mut TcpStream,
+    first: ContainerKey,
+    second: Option<ContainerKey>,
+    inv: &HashMap<i16, Stack>,
+    title: &str,
+) {
+    let initial = chest_window_slots((first, second));
+    write_open_chest_packets(s, second.is_some(), &initial, inv, title);
+}
+fn open_chest_for_client(
+    me: &Client,
+    window: (ContainerKey, Option<ContainerKey>),
+    anchor: Option<BlockPos>,
+    inv: &HashMap<i16, Stack>,
+    title: &str,
+) {
+    if !me.is_spectator() {
+        unpack_window_loot_if_needed(window);
+    }
+    let initial = chest_window_slots(window);
+    *me.open_chest.lock().unwrap() = Some(window);
+    *me.chest_sync.lock().unwrap() = Some(ChestSyncState {
+        window,
+        anchor,
+        state_id: 0,
+        last_slots: initial.clone(),
+    });
+    if let Ok(mut w) = me.sock.lock() {
+        write_open_chest_packets(&mut w, window.1.is_some(), &initial, inv, title);
+    }
+}
+fn armor_removal_blocked(slot: i16, stack: Option<&Stack>, creative: bool) -> bool {
+    !creative
+        && (5..=8).contains(&slot)
+        && stack.is_some_and(|stack| stack.1 > 0 && enchant_level(&stack.2, 2) > 0)
+}
+
+// which armor slot (5=helm..8=boots) an item equips into, or -1
+fn armor_slot_for(it: i64) -> i16 {
+    let n = |x: &str| name_to_item(x).unwrap_or(-1);
+    if [
+        n("leather_helmet"),
+        n("golden_helmet"),
+        n("chainmail_helmet"),
+        n("iron_helmet"),
+        n("diamond_helmet"),
+        n("netherite_helmet"),
+        n("turtle_helmet"),
+    ]
+    .contains(&it)
+    {
+        return 5;
+    }
+    if [
+        n("leather_chestplate"),
+        n("golden_chestplate"),
+        n("chainmail_chestplate"),
+        n("iron_chestplate"),
+        n("diamond_chestplate"),
+        n("netherite_chestplate"),
+        n("elytra"),
+    ]
+    .contains(&it)
+    {
+        return 6;
+    }
+    if [
+        n("leather_leggings"),
+        n("golden_leggings"),
+        n("chainmail_leggings"),
+        n("iron_leggings"),
+        n("diamond_leggings"),
+        n("netherite_leggings"),
+    ]
+    .contains(&it)
+    {
+        return 7;
+    }
+    if [
+        n("leather_boots"),
+        n("golden_boots"),
+        n("chainmail_boots"),
+        n("iron_boots"),
+        n("diamond_boots"),
+        n("netherite_boots"),
+    ]
+    .contains(&it)
+    {
+        return 8;
+    }
+    -1
+}
+// remove up to n items of the stack at k (n>=stack size takes all);
+// returns what was removed
+fn map_take(map: &mut HashMap<i16, Stack>, k: i16, n: u8) -> Option<Stack> {
+    let st = map.get(&k).cloned()?;
+    if st.1 == 0 {
+        return None;
+    }
+    let take = n.min(st.1);
+    if take >= st.1 {
+        map.remove(&k);
+    } else {
+        map.get_mut(&k).unwrap().1 -= take;
+    }
+    Some((st.0, take, st.2))
+}
+// Slot.safeInsert for an unrestricted slot: compatible components, bounded count.
+fn insert_into_slot(map: &mut HashMap<i16, Stack>, slot: i16, source: &mut Stack, amount: u8) {
+    let target = map.get(&slot).filter(|st| st.1 > 0);
+    if target.is_some_and(|st| st.0 != source.0 || st.2 != source.2) {
+        return;
+    }
+    let count = target.map_or(0, |st| st.1);
+    let room = (stack_max_of(source) - i64::from(count)).max(0) as u8;
+    let moved = amount.min(source.1).min(room);
+    if moved > 0 {
+        map.insert(slot, (source.0, count + moved, source.2.clone()));
+        source.1 -= moved;
+        if source.1 == 0 {
+            *source = (0, 0, Vec::new());
+        }
+    }
+}
+// Inventory pickup uses hotbar-first native indices, not menu traversal order.
+fn pickup_inventory_order() -> impl Iterator<Item = i16> + Clone {
+    (36..=44).chain(9..=35)
+}
+fn pickup_is_damaged(st: &Stack) -> bool {
+    comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) > 0
+        && comp_get(&st.2, COMP_UNBREAKABLE).is_none()
+        && comp_varint(&st.2, COMP_MAX_DAMAGE)
+            .or_else(|| tool_max_damage(st.0))
+            .or_else(|| armor_max_damage(st.0))
+            .is_some_and(|max| max > 0)
+}
+fn pickup_slot_with_space(map: &HashMap<i16, Stack>, selected: i16, source: &Stack) -> Option<i16> {
+    [36 + selected, 45]
+        .into_iter()
+        .chain(pickup_inventory_order())
+        .find(|key| {
+            map.get(key).is_some_and(|st| {
+                st.1 > 0
+                    && st.0 == source.0
+                    && st.2 == source.2
+                    && stack_max_of(st) > 1
+                    && !pickup_is_damaged(st)
+                    && i64::from(st.1) < stack_max_of(st)
+            })
+        })
+}
+// 1.21.1 Inventory.add (cmw.f/c): selected -> offhand -> hotbar/main
+// merges, then hotbar/main empties, repeated until exhausted or no progress.
+// Horizon inventory_pickup informed the port; actual-class vectors pin this version.
+fn pickup_into_inventory(
+    map: &mut HashMap<i16, Stack>,
+    selected: i16,
+    creative: bool,
+    source: &mut Stack,
+) -> bool {
+    if source.0 == 0 || source.1 == 0 {
+        return false;
+    }
+    let damaged = pickup_is_damaged(source);
+    loop {
+        let before = source.1;
+        let free = || pickup_inventory_order().find(|key| map.get(key).is_none_or(|st| st.1 == 0));
+        let slot = if damaged {
+            free()
+        } else {
+            pickup_slot_with_space(map, selected, source).or_else(free)
+        };
+        if let Some(slot) = slot {
+            if damaged {
+                map.insert(slot, std::mem::take(source));
+            } else {
+                insert_into_slot(map, slot, source, source.1);
+            }
+        }
+        if source.1 == 0 || source.1 == before {
+            // Java compares with the LAST iteration's count. A partial insert
+            // that subsequently stalls returns false, despite changing slots.
+            if creative && source.1 == before {
+                *source = (0, 0, vec![]);
+                return true;
+            }
+            return source.1 < before;
+        }
+    }
+}
+fn merge_into_slots(
+    map: &mut HashMap<i16, Stack>,
+    order: impl Iterator<Item = i16>,
+    source: &mut Stack,
+) {
+    if stack_max_of(source) <= 1 {
+        return;
+    }
+    for slot in order {
+        if source.1 == 0 {
+            break;
+        }
+        if map.get(&slot).is_some_and(|st| st.1 > 0) {
+            insert_into_slot(map, slot, source, source.1);
+        }
+    }
+}
+// Horizon menu::move_to's two phases (MIT): merge first, then one empty slot.
+// The order is supplied by the menu; a chest sends items to inventory in reverse.
+fn move_to_slots(
+    map: &mut HashMap<i16, Stack>,
+    order: impl Iterator<Item = i16> + Clone,
+    mut source: Stack,
+) -> Stack {
+    merge_into_slots(map, order.clone(), &mut source);
+    if source.1 > 0 {
+        for slot in order {
+            if map.get(&slot).is_none_or(|st| st.1 == 0) {
+                let amount = source.1;
+                insert_into_slot(map, slot, &mut source, amount);
+                break;
+            }
+        }
+    }
+    source
+}
+// The single/double chest menu shares one transfer owner; storage remains per container.
+fn quick_move_chest(
+    all: &mut HashMap<ContainerKey, HashMap<i16, Stack>>,
+    inv: &mut HashMap<i16, Stack>,
+    cp: ContainerKey,
+    cp2: Option<ContainerKey>,
+    slot: i16,
+) {
+    let rows = if cp2.is_some() { 54 } else { 27 };
+    if !(0..rows + 36).contains(&slot) {
+        return;
+    }
+    if slot < rows {
+        let (pos, key) = if slot < 27 {
+            (cp, slot)
+        } else {
+            (cp2.unwrap(), slot - 27)
+        };
+        if let Some(st) = map_take(all.entry(pos).or_default(), key, u8::MAX) {
+            let rem = move_to_slots(inv, (9..=44).rev(), st);
+            if rem.1 > 0 {
+                all.get_mut(&pos).unwrap().insert(key, rem);
+            }
+        }
+    } else if let Some(mut rem) = map_take(inv, slot - rows + 9, u8::MAX) {
+        // Merge across BOTH halves before considering any empty slot.
+        for pos in [cp].into_iter().chain(cp2) {
+            merge_into_slots(all.entry(pos).or_default(), 0..27, &mut rem);
+        }
+        'empty: for pos in [cp].into_iter().chain(cp2) {
+            if rem.1 == 0 {
+                break;
+            }
+            let map = all.entry(pos).or_default();
+            for key in 0..27 {
+                if map.get(&key).is_none_or(|st| st.1 == 0) {
+                    let amount = rem.1;
+                    insert_into_slot(map, key, &mut rem, amount);
+                    break 'empty;
+                }
+            }
+        }
+        if rem.1 > 0 {
+            inv.insert(slot - rows + 9, rem);
+        }
+    }
+}
+// drag-paint one slot: place `per` items of the cursor stack into the
+// resolved window slot (merging if compatible), then resync
+fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
+    let chest_pos = *me.open_chest.lock().unwrap();
+    let furnace_pos = *me.open_furnace.lock().unwrap();
+    if let Some((cp, cp2)) = chest_pos {
+        if !window_live_for(me, (cp, cp2)) {
+            invalidate_client_chest_window(&client_snapshot(), me, (cp, cp2));
+            return;
+        }
+        let rows = if cp2.is_some() { 54i16 } else { 27i16 };
+        let mut all = chests().lock().unwrap();
+        let mut inv = me.inv.lock().unwrap();
+        if wsl < 0 || wsl >= rows + 36 {
+            return;
+        }
+        let (m, gslot) = if wsl < 27 {
+            (all.entry(cp).or_default(), wsl)
+        } else if wsl < rows {
+            (all.entry(cp2.unwrap()).or_default(), wsl - 27)
+        } else {
+            (&mut *inv, wsl - rows + 9)
+        };
+        let st = m.entry(gslot).or_insert((0, 0, Vec::new()));
+        if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
+            && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
+        {
+            if st.1 == 0 {
+                *st = (cur.0, per, cur.2.clone());
+            } else {
+                st.1 += per;
+            }
+            cur.1 -= per;
+            resync_slot(me, 1, wsl, st);
+        }
+    } else if furnace_pos.is_some() {
+        // vanilla doesn't allow painting into furnace input/fuel/output;
+        // only inventory slots 3..38 (key = wsl+6)
+        if (3..39).contains(&wsl) {
+            let mut inv = me.inv.lock().unwrap();
+            let k = wsl + 6;
+            let st = inv.entry(k).or_insert((0, 0, Vec::new()));
+            if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
+                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
+            {
+                if st.1 == 0 {
+                    *st = (cur.0, per, cur.2.clone());
+                } else {
+                    st.1 += per;
+                }
+                cur.1 -= per;
+                resync_slot(me, 2, wsl, st);
+            }
+        }
+    } else {
+        // inventory window: paintable slots are 9-44 (inv keys) + craft 1-4
+        if (9..=44).contains(&wsl) {
+            let mut inv = me.inv.lock().unwrap();
+            let st = inv.entry(wsl).or_insert((0, 0, Vec::new()));
+            if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
+                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
+            {
+                if st.1 == 0 {
+                    *st = (cur.0, per, cur.2.clone());
+                } else {
+                    st.1 += per;
+                }
+                cur.1 -= per;
+                resync_slot(me, 0, wsl, st);
+            }
+        } else if (1..=4).contains(&wsl) {
+            let mut grid = me.craft.lock().unwrap();
+            let st = grid.entry(wsl).or_insert((0, 0, Vec::new()));
+            if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
+                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
+            {
+                if st.1 == 0 {
+                    *st = (cur.0, per, cur.2.clone());
+                } else {
+                    st.1 += per;
+                }
+                cur.1 -= per;
+                resync_slot(me, 0, wsl, st);
+            }
+        }
+    }
+}
+fn dr_btn_right(btn: i32) -> bool {
+    btn >= 4
+}
+fn send_chest_slot(me: &Client, wslot: i16, st: &Stack) {
+    let norm = if st.1 > 0 {
+        st.clone()
+    } else {
+        (0, 0, Vec::new())
+    };
+    let state_id = {
+        let mut sync_guard = me.chest_sync.lock().unwrap();
+        if let Some(sync) = sync_guard.as_mut() {
+            sync.state_id = (sync.state_id + 1) & 0x7fff;
+            if wslot >= 0 {
+                if let Some(slot_ref) = sync.last_slots.get_mut(wslot as usize) {
+                    *slot_ref = norm.clone();
+                }
+            }
+            sync.state_id
+        } else {
+            0
+        }
+    };
+    let mut p = vec![1u8];
+    write_varint(&mut p, i64::from(state_id));
+    p.extend_from_slice(&wslot.to_be_bytes());
+    p.extend_from_slice(&slot_wire(&norm));
+    if let Ok(mut w) = me.sock.lock() {
+        let _ = send_packet(&mut w, 0x15, p);
+    }
+}
+// re-send one window slot so the client can't drift
+fn resync_slot(me: &Client, wid: u8, wslot: i16, st: &Stack) {
+    if wid == 1 {
+        send_chest_slot(me, wslot, st);
+        return;
+    }
+    let mut p = vec![wid];
+    write_varint(&mut p, 0);
+    p.extend_from_slice(&wslot.to_be_bytes());
+    p.extend_from_slice(&slot_wire(st));
+    if let Ok(mut w) = me.sock.lock() {
+        let _ = send_packet(&mut w, 0x15, p);
+    }
+}
+// Plain, unrestricted slots only; result/equipment slots retain their own policy.
+// Adapted from Horizon menu::pickup_inner (MIT; third_party/licenses/horizon.txt),
+// checked against 1.21.1 AbstractContainerMenu.doClick / Slot.safeInsert.
+fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) {
+    if !matches!(btn, 0 | 1) {
+        return;
+    }
+    if cur.1 == 0 {
+        if let Some(st) = m.get(&slot) {
+            let amount = if btn == 0 { st.1 } else { st.1.div_ceil(2) };
+            if let Some(taken) = map_take(m, slot, amount) {
+                *cur = taken;
+            }
+        }
+        return;
+    }
+    let target = m.get(&slot).filter(|st| st.1 > 0).cloned();
+    if target
+        .as_ref()
+        .is_none_or(|st| st.0 == cur.0 && st.2 == cur.2)
+    {
+        let amount = if btn == 0 { cur.1 } else { 1 };
+        insert_into_slot(m, slot, cur, amount);
+    } else if i64::from(cur.1) <= stack_max_of(cur) {
+        // Both mouse buttons swap unlike stacks, but never bypass the slot limit.
+        *cur = m.insert(slot, cur.clone()).unwrap();
+    }
+}
+// vanilla item tags used by recipes
+fn tag_planks(it: i64) -> bool {
+    (36..=46).contains(&it)
+}
+// log id -> its own plank item (vanilla: oak_log->oak_planks, not oak for all)
+fn planks_for_log(it: i64) -> Option<i64> {
+    Some(match it {
+        132 => 36,
+        133 => 37,
+        134 => 38,
+        135 => 39,
+        136 => 40,
+        137 => 41,
+        138 => 42,
+        139 => 43,
+        144 => 44, // logs + bamboo_block
+        142 => 45,
+        143 => 46, // crimson/warped stems
+        _ => return None,
+    })
+}
+fn craft_result(grid: &HashMap<i16, Stack>) -> Option<Stack> {
+    if let Some(r) = json_craft_match(grid, 2) {
+        return Some(r);
+    }
+    let stick = name_to_item("stick")?;
+    let table = name_to_item("crafting_table")?;
+    let vals: Vec<(i16, i64)> = (1..=4)
+        .filter_map(|i| grid.get(&i).map(|(it, _, _)| (i, *it)))
+        .collect();
+    if vals.len() == 1 {
+        if let Some(p) = planks_for_log(vals[0].1) {
+            return Some((p, 4, Vec::new()));
+        }
+    }
+    if vals.len() == 4 && vals.iter().all(|v| tag_planks(v.1)) {
+        return Some((table, 1, Vec::new()));
+    }
+    // sticks: two planks vertical (1&3 or 2&4)
+    if vals.len() == 2
+        && vals.iter().all(|v| tag_planks(v.1))
+        && ((vals[0].0 == 1 && vals[1].0 == 3) || (vals[0].0 == 2 && vals[1].0 == 4))
+    {
+        return Some((stick, 4, Vec::new()));
+    }
+    None
+}
+fn open_furnace_window(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: &[Stack; 3]) {
+    let mut p = Vec::new();
+    write_varint(&mut p, 2); // windowId 2 (chest uses 1)
+    write_varint(&mut p, 14); // furnace menu
+    p.extend_from_slice(&chat_nbt("Furnace"));
+    let _ = send_packet(s, 0x33, p);
+    furnace_push_items_snap(s, inv, slots);
+}
+fn furnace_slot_snapshot_dim(dim: DimId, pos: (i32, i32, i32)) -> [Stack; 3] {
+    let fs = furnaces().lock().unwrap();
+    let f = fs.get(&(dim, pos.0, pos.1, pos.2));
+    [
+        f.map(|f| f.input.clone()).unwrap_or((0, 0, Vec::new())),
+        f.map(|f| f.fuel.clone()).unwrap_or((0, 0, Vec::new())),
+        f.map(|f| f.output.clone()).unwrap_or((0, 0, Vec::new())),
+    ]
+}
+fn furnace_push_items_snap(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: &[Stack; 3]) {
+    let mut q = vec![2u8];
+    write_varint(&mut q, 0);
+    write_varint(&mut q, 39);
+    for slot in slots {
+        q.extend_from_slice(&slot_wire(slot));
+    }
+    for wsl in 3..39i16 {
+        let (it, c, _cc) = inv.get(&(wsl + 6)).cloned().unwrap_or((0, 0, Vec::new()));
+        q.extend_from_slice(&slot_wire(&(it, c, _cc)));
+    }
+    q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+    let _ = send_packet(s, 0x13, q);
+}
+// The frozen reference in furnace_cache_tests still exercises the original signature.
+#[cfg(test)]
+fn furnace_push_items(s: &mut TcpStream, pos: (i32, i32, i32), inv: &HashMap<i16, Stack>) {
+    let slots = furnace_slot_snapshot_dim(DimId::Overworld, pos);
+    furnace_push_items_snap(s, inv, &slots);
+}
+fn ingr_match(ig: &Ingr, item: i64, depth: usize) -> bool {
+    match ig {
+        Ingr::Item(i) => *i == item,
+        Ingr::Tag(t) => {
+            if depth > 8 {
+                return false;
+            }
+            let members = item_tags()
+                .lock()
+                .unwrap()
+                .get(t)
+                .cloned()
+                .unwrap_or_default();
+            members.iter().any(|m| {
+                if let Some(inner) = m.strip_prefix('#') {
+                    ingr_match(&Ingr::Tag(inner.to_string()), item, depth + 1)
+                } else {
+                    name_to_item(m).map(|i| i == item).unwrap_or(false)
+                }
+            })
+        }
+    }
+}
+fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
+    // vanilla translation: the pattern's bounding box may sit at any
+    // offset inside the grid; cells outside it must be air
+    let at = |x: i16, y: i16| g.get(&(y * dim + x + 1)).map(|e| e.0).unwrap_or(0);
+    for r in json_recipes().lock().unwrap().iter() {
+        if !r.shaped {
+            // shapeless: multiset of ingredients == multiset of grid items
+            let mut items: Vec<i64> = (1..=(dim * dim))
+                .filter_map(|i| {
+                    let v = g.get(&i).map(|e| e.0).unwrap_or(0);
+                    if v > 0 && g.get(&i).map(|e| e.1).unwrap_or(0) > 0 {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if items.len() != r.ing.len() {
+                continue;
+            }
+            let mut ok = true;
+            for ig in &r.ing {
+                if let Some(p) = items.iter().position(|i| ingr_match(ig, *i, 0)) {
+                    items.remove(p);
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return Some((r.out, r.out_cnt, Vec::new()));
+            }
+            continue;
+        }
+        // bounding box of non-space cells
+        let (mut x0, mut y0, mut x1, mut y1) = (99i16, 99i16, -1i16, -1i16);
+        for (ry, row) in r.rows.iter().enumerate() {
+            for (rx, ch) in row.chars().enumerate() {
+                if ch != ' ' {
+                    x0 = x0.min(rx as i16);
+                    x1 = x1.max(rx as i16);
+                    y0 = y0.min(ry as i16);
+                    y1 = y1.max(ry as i16);
+                }
+            }
+        }
+        if x1 < 0 {
+            continue;
+        }
+        let (pw, ph) = (x1 - x0 + 1, y1 - y0 + 1);
+        if pw > dim || ph > dim {
+            continue;
+        }
+        for oy in 0..=(dim - ph) {
+            for ox in 0..=(dim - pw) {
+                let mut ok = true;
+                for gy in 0..dim {
+                    for gx in 0..dim {
+                        let need: Option<char> =
+                            if gx >= ox && gx < ox + pw && gy >= oy && gy < oy + ph {
+                                r.rows[(y0 + gy - oy) as usize]
+                                    .chars()
+                                    .nth((x0 + gx - ox) as usize)
+                            } else {
+                                Some(' ')
+                            };
+                        let cell = at(gx, gy);
+                        match need {
+                            Some(' ') | None => {
+                                if cell != 0 {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            Some(ch) => match r.key.get(&ch) {
+                                Some(ig) => {
+                                    if !ingr_match(ig, cell, 0) {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    if cell != 0 {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+                if ok {
+                    return Some((r.out, r.out_cnt, Vec::new()));
+                }
+                // this offset failed: try the next one. The label used to point
+                // at the outer loop, so only ox = 0 was ever tried and a pattern
+                // that needed a horizontal shift never matched.
+                continue;
+            }
+        }
+    }
+    None
+}
+fn craft3_result(g: &HashMap<i16, Stack>) -> Option<Stack> {
+    if let Some(r) = json_craft_match(g, 3) {
+        return Some(r);
+    }
+    let at = |i: i16| g.get(&i).map(|e| e.0).unwrap_or(0);
+    let is = |i: i16, n: &str| name_to_item(n) == Some(at(i));
+    let planks = |i: i16| tag_planks(at(i)); // #minecraft:planks — any wood
+    let air = |i: i16| at(i) == 0;
+    // chest / furnace: full ring around empty center
+    for (mat, res) in [("oak_planks", "chest"), ("cobblestone", "furnace")] {
+        let ok = if mat == "oak_planks" {
+            [1, 2, 3, 4, 6, 7, 8, 9].iter().all(|&i| planks(i)) && air(5)
+        } else {
+            [1, 2, 3, 4, 6, 7, 8, 9].iter().all(|&i| is(i, mat)) && air(5)
+        };
+        if ok {
+            return name_to_item(res).map(|r| (r, 1, Vec::new()));
+        }
+    }
+    // torch: coal directly above stick
+    for (c, st) in [(1, 4), (2, 5), (3, 6), (4, 7), (5, 8), (6, 9)] {
+        if is(c, "coal") && is(st, "stick") && (1..=9).filter(|&i| !air(i)).count() == 2 {
+            return name_to_item("torch").map(|r| (r, 4, Vec::new()));
+        }
+    }
+    // bread: 3 wheat in a row
+    for (a, b, c) in [(1i16, 2, 3), (4, 5, 6), (7, 8, 9)] {
+        if is(a, "wheat")
+            && is(b, "wheat")
+            && is(c, "wheat")
+            && (1..=9).filter(|&i| !air(i)).count() == 3
+        {
+            return name_to_item("bread").map(|r| (r, 1, Vec::new()));
+        }
+    }
+    // generic tool/armor recipes per material
+    for (mat, prefix) in [
+        ("oak_planks", "wooden"),
+        ("cobblestone", "stone"),
+        ("iron_ingot", "iron"),
+        ("gold_ingot", "golden"),
+        ("diamond", "diamond"),
+    ] {
+        let stick = |i: i16| is(i, "stick");
+        let m = |i: i16| {
+            if mat == "oak_planks" {
+                planks(i)
+            } else {
+                is(i, mat)
+            }
+        };
+        // pickaxe: mat mat mat / _ stick _ / _ stick _
+        if m(1) && m(2) && m(3) && stick(5) && stick(8) && air(4) && air(6) && air(7) && air(9) {
+            return name_to_item(&format!("{}_pickaxe", prefix)).map(|r| (r, 1, Vec::new()));
+        }
+        // axe: mat mat / mat stick / _ stick (either column)
+        if (m(1) && m(2) && m(4) && stick(5) && stick(8) && air(3) && air(6) && air(7) && air(9))
+            || (m(2)
+                && m(3)
+                && m(6)
+                && stick(5)
+                && stick(8)
+                && air(1)
+                && air(4)
+                && air(7)
+                && air(9))
+        {
+            return name_to_item(&format!("{}_axe", prefix)).map(|r| (r, 1, Vec::new()));
+        }
+        // shovel: mat / stick / stick, any column
+        for col in [0i16, 1, 2] {
+            if m(1 + col)
+                && stick(4 + col)
+                && stick(7 + col)
+                && (1..=9).filter(|&i| !air(i)).count() == 3
+            {
+                return name_to_item(&format!("{}_shovel", prefix)).map(|r| (r, 1, Vec::new()));
+            }
+        }
+        // sword: mat / mat / stick, any column
+        for col in [0i16, 1, 2] {
+            if m(1 + col)
+                && m(4 + col)
+                && stick(7 + col)
+                && (1..=9).filter(|&i| !air(i)).count() == 3
+            {
+                return name_to_item(&format!("{}_sword", prefix)).map(|r| (r, 1, Vec::new()));
+            }
+        }
+        // hoe: mat mat / _ stick / _ stick (or mirrored)
+        if (m(1) && m(2) && stick(5) && stick(8) && air(3) && air(4) && air(6) && air(7) && air(9))
+            || (m(2)
+                && m(3)
+                && stick(5)
+                && stick(8)
+                && air(1)
+                && air(4)
+                && air(6)
+                && air(7)
+                && air(9))
+        {
+            return name_to_item(&format!("{}_hoe", prefix)).map(|r| (r, 1, Vec::new()));
+        }
+        // armor: helmet=5, chest=8, leggings=7, boots=4
+        if mat != "cobblestone" {
+            if m(1) && m(2) && m(3) && m(4) && m(6) && air(5) && air(7) && air(8) && air(9) {
+                return name_to_item(&format!("{}_helmet", prefix)).map(|r| (r, 1, Vec::new()));
+            }
+            if m(1) && m(3) && m(4) && m(5) && m(6) && m(7) && m(8) && m(9) && air(2) {
+                return name_to_item(&format!("{}_chestplate", prefix)).map(|r| (r, 1, Vec::new()));
+            }
+            if m(1) && m(2) && m(3) && m(4) && m(6) && m(7) && m(9) && air(5) && air(8) {
+                return name_to_item(&format!("{}_leggings", prefix)).map(|r| (r, 1, Vec::new()));
+            }
+            if m(4) && m(6) && m(7) && m(9) && (1..=9).filter(|&i| !air(i)).count() == 4 {
+                return name_to_item(&format!("{}_boots", prefix)).map(|r| (r, 1, Vec::new()));
+            }
+        }
+    }
+    // leather armor pieces on their own
+    {
+        let l = |i: i16| is(i, "leather");
+        if l(1) && l(2) && l(3) && l(4) && l(6) && air(5) && air(7) && air(8) && air(9) {
+            return name_to_item("leather_helmet").map(|r| (r, 1, Vec::new()));
+        }
+        if l(1) && l(3) && l(4) && l(5) && l(6) && l(7) && l(8) && l(9) && air(2) {
+            return name_to_item("leather_chestplate").map(|r| (r, 1, Vec::new()));
+        }
+        if l(1) && l(2) && l(3) && l(4) && l(6) && l(7) && l(9) && air(5) && air(8) {
+            return name_to_item("leather_leggings").map(|r| (r, 1, Vec::new()));
+        }
+        if l(4) && l(6) && l(7) && l(9) && (1..=9).filter(|&i| !air(i)).count() == 4 {
+            return name_to_item("leather_boots").map(|r| (r, 1, Vec::new()));
+        }
+    }
+    // bucket: iron V-shape
+    if is(4, "iron_ingot")
+        && is(6, "iron_ingot")
+        && is(8, "iron_ingot")
+        && (1..=9).filter(|&i| !air(i)).count() == 3
+    {
+        return name_to_item("bucket").map(|r| (r, 1, Vec::new()));
+    }
+    // shears: 2 iron diagonal-ish
+    if ((is(5, "iron_ingot") && is(8, "iron_ingot"))
+        || (is(5, "iron_ingot") && is(9, "iron_ingot")))
+        && (1..=9).filter(|&i| !air(i)).count() == 2
+    {
+        return name_to_item("shears").map(|r| (r, 1, Vec::new()));
+    }
+    // shield: planks across + iron center-top
+    if planks(1)
+        && is(2, "iron_ingot")
+        && planks(3)
+        && planks(4)
+        && planks(5)
+        && planks(6)
+        && planks(8)
+        && air(7)
+        && air(9)
+    {
+        return name_to_item("shield").map(|r| (r, 1, Vec::new()));
+    }
+    // fishing rod: 3 sticks diagonal + 2 string
+    if is(3, "stick")
+        && is(5, "stick")
+        && is(7, "stick")
+        && is(6, "string")
+        && is(9, "string")
+        && (1..=9).filter(|&i| !air(i)).count() == 5
+    {
+        return name_to_item("fishing_rod").map(|r| (r, 1, Vec::new()));
+    }
+    // bow: sticks + strings
+    if is(2, "stick")
+        && is(4, "stick")
+        && is(8, "stick")
+        && is(3, "string")
+        && is(6, "string")
+        && is(9, "string")
+        && air(1)
+        && air(5)
+        && air(7)
+    {
+        return name_to_item("bow").map(|r| (r, 1, Vec::new()));
+    }
+    // also accept 2x2-style recipes in the big grid
+    let g2: HashMap<i16, Stack> = g.clone();
+    // single log -> its own planks (vanilla #minecraft:logs, type-preserving)
+    if (1..=9).filter(|&i| !air(i)).count() == 1 {
+        if let Some(it) = (1..=9).find(|&i| !air(i)).map(at) {
+            if let Some(p) = planks_for_log(it) {
+                return Some((p, 4, Vec::new()));
+            }
+        }
+    }
+    if (1..=9).filter(|&i| !air(i)).count() == 4 {
+        // any 2x2 block of planks -> crafting_table
+        for (a, b, c, d) in [(1i16, 2, 4, 5), (2, 3, 5, 6), (4, 5, 7, 8), (5, 6, 8, 9)] {
+            if planks(a) && planks(b) && planks(c) && planks(d) {
+                return name_to_item("crafting_table").map(|r| (r, 1, Vec::new()));
+            }
+        }
+    }
+    let _ = g2;
+    None
+}
+
+enum LiveMenu {
+    Anvil(AnvilMenu),
+    Enchanting(EnchantmentMenu),
+    Brewing,
+    Smithing(SmithingMenu),
+    Merchant(i32, MerchantMenu),
+}
+
+impl LiveMenu {
+    fn screen(&self) -> (i64, &'static str) {
+        match self {
+            Self::Anvil(_) => (8, "Repair & Name"),
+            Self::Brewing => (11, "Brewing Stand"),
+            Self::Enchanting(_) => (13, "Enchant"),
+            Self::Merchant(..) => (19, "Villager"),
+            Self::Smithing(_) => (21, "Upgrade Gear"),
+        }
+    }
+
+    fn input_slots(&mut self) -> Vec<&mut Stack> {
+        match self {
+            Self::Anvil(menu) => vec![&mut menu.left, &mut menu.right],
+            Self::Enchanting(menu) => vec![&mut menu.item, &mut menu.lapis],
+            Self::Smithing(menu) => vec![&mut menu.template, &mut menu.base, &mut menu.addition],
+            Self::Merchant(_, menu) => menu.payments.iter_mut().collect(),
+            Self::Brewing => Vec::new(),
+        }
+    }
+}
+
+struct LiveMenuSession {
+    id: u8,
+    state_id: i32,
+    anchor: Option<DimBlockPos>,
+    menu: LiveMenu,
+}
+
+struct LiveMenuConnection {
+    active: Mutex<Option<LiveMenuSession>>,
+    next_id: std::sync::atomic::AtomicU8,
+    enchantment_seed: Mutex<i32>,
+}
+
+fn live_menu_connection(c: &Client) -> Option<Arc<LiveMenuConnection>> {
+    // Release the player-state registry before locking a menu. Menu actions
+    // can update XP, which briefly reacquires the registry.
+    player_mechanism_sessions()
+        .lock()
+        .unwrap()
+        .get(&c.eid)
+        .map(|session| Arc::clone(&session.menus))
+}
+
+fn live_menu_id(c: &Client) -> Option<u8> {
+    live_menu_connection(c)?
+        .active
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|menu| menu.id)
+}
+
+fn live_villagers() -> &'static LockedMap<i32, Villager> {
+    static VILLAGERS: Registry<i32, Villager> = OnceLock::new();
+    VILLAGERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn farmer_merchant(mob: &Mob) -> Villager {
+    let mut villager = Villager::new(mob.uuid, VillagerProfession::Farmer);
+    villager.offers = [
+        ("wheat", 20, "emerald", 1, 2),
+        ("emerald", 1, "bread", 6, 1),
+    ]
+    .into_iter()
+    .filter_map(|(buy, count, sell, result_count, xp_reward)| {
+        Some(MerchantOffer {
+            cost_a: ItemCost {
+                item: name_to_item(buy)?,
+                count,
+                components: Vec::new(),
+            },
+            cost_b: None,
+            result: (name_to_item(sell)?, result_count, Vec::new()),
+            uses: 0,
+            max_uses: 16,
+            xp_reward,
+            price_multiplier: 0.05,
+            demand: 0,
+            special_price_diff: 0,
+        })
+    })
+    .collect();
+    villager
+}
+
+fn merchant_item_prototype(item: i64) -> &'static Comps {
+    static PROTOTYPES: OnceLock<[Comps; 100]> = OnceLock::new();
+    let prototypes = PROTOTYPES.get_or_init(|| {
+        std::array::from_fn(|count| {
+            let mut components = Vec::new();
+            comp_set_varint(&mut components, MERCHANT_MAX_STACK_SIZE, count as i64);
+            components
+        })
+    });
+    &prototypes[item_stack_max(item, &Vec::new()) as usize]
+}
+
+fn live_offers_payload(window: u8, merchant: &Villager) -> Vec<u8> {
+    let packet = MerchantOffersPacket {
+        window_id: i32::from(window),
+        offers: merchant.offers.clone(),
+        villager_level: merchant.level() as i32,
+        villager_xp: merchant.villager_xp,
+        show_progress: true,
+        can_restock: false,
+    };
+    encode_merchant_offers_pkt(&packet)
+}
+
+fn open_live_merchant(c: &Client, mob: &Mob) {
+    if c.is_spectator() || *c.dim.lock().unwrap() != DimId::Overworld {
+        return;
+    }
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    if matches!(connection.active.lock().unwrap().as_ref().map(|s| &s.menu),
+                Some(LiveMenu::Merchant(id, _)) if *id == mob.eid)
+    {
+        return;
+    }
+    let opened = live_villagers()
+        .lock()
+        .unwrap()
+        .entry(mob.eid)
+        .or_insert_with(|| farmer_merchant(mob))
+        .start_trading(&PoiRegistry::default(), c.uuid, None);
+    if opened {
+        open_live_menu(
+            c,
+            None,
+            LiveMenu::Merchant(mob.eid, MerchantMenu::default()),
+        );
+    }
+}
+
+fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u32) -> bool {
+    let Some(reg) = breg() else { return false };
+    let menu = match reg.name_of(state) {
+        "minecraft:anvil" | "minecraft:chipped_anvil" | "minecraft:damaged_anvil" => {
+            LiveMenu::Anvil(AnvilMenu::default())
+        }
+        "minecraft:enchanting_table" => LiveMenu::Enchanting(EnchantmentMenu::default()),
+        "minecraft:brewing_stand" => LiveMenu::Brewing,
+        "minecraft:smithing_table" => LiveMenu::Smithing(SmithingMenu::default()),
+        _ => return false,
+    };
+    if !c.is_spectator() {
+        // Recheck under the block transaction lock before creating the stand entity.
+        with_save_guard(|| {
+            if block_at_dim(dim, x, y, z) != state {
+                return;
+            }
+            if matches!(menu, LiveMenu::Brewing) {
+                live_brewing_stands()
+                    .lock()
+                    .unwrap()
+                    .entry(key)
+                    .or_default();
+            }
+            open_live_menu(c, Some(key), menu);
+        });
+    }
+    true
+}
+
+fn open_live_menu(c: &Client, anchor: Option<DimBlockPos>, menu: LiveMenu) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    close_live_menu(c, false, false);
+    if let Some((window, old_anchor)) = client_open_window_and_anchor(c) {
+        let audience = client_snapshot();
+        let before = chest_opener_snapshot(&audience, &client_window_halves(window, old_anchor));
+        *c.open_chest.lock().unwrap() = None;
+        *c.chest_sync.lock().unwrap() = None;
+        sync_chest_openers(&audience, &before);
+    }
+    *c.open_furnace.lock().unwrap() = None;
+    if std::mem::take(&mut *c.open_table.lock().unwrap()) {
+        let grid = std::mem::take(&mut *c.craft9.lock().unwrap());
+        return_live_inputs(c, grid.into_values());
+    }
+
+    // The older windows reserve IDs 1–3. A new ID lets clicks from a replaced
+    // menu be rejected even if the next menu has the same layout.
+    let id = connection
+        .next_id
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            Some(if id == 100 { 4 } else { id + 1 })
+        })
+        .unwrap();
+    let mut active = connection.active.lock().unwrap();
+    let session = active.insert(LiveMenuSession {
+        id,
+        state_id: 0,
+        anchor,
+        menu,
+    });
+    refresh_live_enchanting(&connection, session);
+    let (kind, title) = session.menu.screen();
+    let mut packet = Vec::new();
+    write_varint(&mut packet, i64::from(id));
+    write_varint(&mut packet, kind);
+    packet.extend_from_slice(&chat_nbt(title));
+    let _ = send_packet(&mut c.sock.lock().unwrap(), 0x33, packet);
+    sync_live_menu(c, session, true);
+}
+
+fn send_live_contents(
+    sock: &mut TcpStream,
+    id: u8,
+    state_id: i32,
+    slots: &[Stack],
+    inventory: &HashMap<i16, Stack>,
+    player_slots: std::ops::Range<i16>,
+    cursor: &Stack,
+) {
+    let mut packet = vec![id];
+    write_varint(&mut packet, i64::from(state_id));
+    write_varint(&mut packet, (slots.len() + player_slots.len()) as i64);
+    for stack in slots {
+        packet.extend_from_slice(&slot_wire(stack));
+    }
+    let empty = Stack::default();
+    for slot in player_slots {
+        packet.extend_from_slice(&slot_wire(inventory.get(&slot).unwrap_or(&empty)));
+    }
+    packet.extend_from_slice(&slot_wire(cursor));
+    let _ = send_packet(sock, 0x13, packet);
+}
+
+fn anvil_hover_name(stack: &Stack) -> &str {
+    if let Some([8, hi, lo, text @ ..]) = comp_get(&stack.2, COMP_CUSTOM_NAME) {
+        if let Some(name) = text.get(..u16::from_be_bytes([*hi, *lo]) as usize) {
+            return std::str::from_utf8(name).unwrap_or_default();
+        }
+    }
+    item_to_name(stack.0).unwrap_or_default()
+}
+
+fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) {
+    let mut properties = Vec::new();
+    let mut offers = None;
+    let slots = match &session.menu {
+        LiveMenu::Anvil(menu) => {
+            let result = menu.result(anvil_hover_name(&menu.left), *c.gm.lock().unwrap() == 1);
+            properties.extend(anvil_window_properties(
+                result.as_ref().map_or(0, |r| r.level_cost),
+            ));
+            vec![
+                menu.left.clone(),
+                menu.right.clone(),
+                result.map_or_else(|_| Stack::default(), |r| r.stack),
+            ]
+        }
+        LiveMenu::Enchanting(menu) => {
+            properties.extend(enchanting_window_properties(menu));
+            vec![menu.item.clone(), menu.lapis.clone()]
+        }
+        LiveMenu::Brewing => {
+            let stands = live_brewing_stands().lock().unwrap();
+            let Some(entry) = stands.get(&session.anchor.unwrap()) else {
+                return;
+            };
+            properties.extend(brewing_window_properties(&entry.stand));
+            entry.menu.slots.to_vec()
+        }
+        LiveMenu::Smithing(menu) => {
+            vec![
+                menu.template.clone(),
+                menu.base.clone(),
+                menu.addition.clone(),
+                menu.result().unwrap_or_default(),
+            ]
+        }
+        LiveMenu::Merchant(id, menu) => {
+            let merchants = live_villagers().lock().unwrap();
+            let Some(villager) = merchants.get(id) else {
+                return;
+            };
+            let output = menu
+                .active_offer(&villager.offers, &MerchantItems(&merchant_item_prototype))
+                .map(|i| villager.offers[i].result.clone())
+                .unwrap_or_default();
+            if send_offers {
+                offers = Some(live_offers_payload(session.id, villager));
+            }
+            vec![menu.payments[0].clone(), menu.payments[1].clone(), output]
+        }
+    };
+    session.state_id = (session.state_id + 1) & 0x7fff;
+    let inventory = c.inv.lock().unwrap();
+    let cursor = c.cursor.lock().unwrap();
+    let mut sock = c.sock.lock().unwrap();
+    if let Some(payload) = offers {
+        let _ = send_packet(&mut sock, 0x2d, payload);
+    }
+    send_live_contents(
+        &mut sock,
+        session.id,
+        session.state_id,
+        &slots,
+        &inventory,
+        9..45,
+        &cursor,
+    );
+    for property in properties {
+        let _ = send_packet(&mut sock, 0x14, property.encode(session.id).to_vec());
+    }
+}
+
+fn drop_live_stack((x, y, z): (f64, f64, f64), stack: Stack) {
+    if stack.1 == 0 {
+        return;
+    }
+    drops().lock().unwrap().push(Drop {
+        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+        x,
+        y,
+        z,
+        item: stack.0,
+        cnt: stack.1,
+        comps: stack.2,
+        age: -(server_ticks(30) as i32),
+        target: None,
+        thrower: None,
+    });
+}
+
+fn return_live_inputs(c: &Client, stacks: impl IntoIterator<Item = Stack>) {
+    let (x, y, z, ..) = *c.pos.lock().unwrap();
+    let selected = *c.held.lock().unwrap();
+    let mut inventory = c.inv.lock().unwrap();
+    for mut stack in stacks {
+        pickup_into_inventory(&mut inventory, selected, false, &mut stack);
+        drop_live_stack((x, y + 1.3, z), stack);
+    }
+}
+
+fn close_live_menu(c: &Client, send_close: bool, sync: bool) {
+    close_live_menu_id(c, None, send_close, sync);
+}
+
+fn close_live_menu_id(c: &Client, id: Option<u8>, send_close: bool, sync: bool) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    let mut active = connection.active.lock().unwrap();
+    if id.is_some_and(|id| active.as_ref().is_none_or(|s| s.id != id)) {
+        return;
+    }
+    let Some(mut session) = active.take() else {
+        return;
+    };
+    if let LiveMenu::Merchant(id, _) = session.menu {
+        if let Some(villager) = live_villagers().lock().unwrap().get_mut(&id) {
+            if villager.trading_player == Some(c.uuid) {
+                villager.stop_trading();
+            }
+        }
+    }
+    let cursor = std::mem::take(&mut *c.cursor.lock().unwrap());
+    return_live_inputs(
+        c,
+        session
+            .menu
+            .input_slots()
+            .into_iter()
+            .map(std::mem::take)
+            .chain([cursor]),
+    );
+    if sync {
+        let inventory = c.inv.lock().unwrap();
+        let mut sock = c.sock.lock().unwrap();
+        if send_close {
+            let _ = send_packet(&mut sock, 0x12, vec![session.id]);
+        }
+        send_live_contents(&mut sock, 0, 0, &[], &inventory, 0..46, &Stack::default());
+    }
+}
+
+fn refresh_live_enchanting(connection: &LiveMenuConnection, session: &mut LiveMenuSession) {
+    if let (LiveMenu::Enchanting(menu), Some((dim, x, y, z)), Some(reg)) =
+        (&mut session.menu, session.anchor, breg())
+    {
+        let shelves = count_enchanting_bookshelves(
+            (x, y, z),
+            |x, y, z| reg.name_of(block_at_dim(dim, x, y, z)) == "minecraft:bookshelf",
+            |x, y, z| {
+                reg.in_tag(
+                    block_at_dim(dim, x, y, z),
+                    "minecraft:enchantment_power_transmitter",
+                )
+            },
+        );
+        menu.refresh_offers(*connection.enchantment_seed.lock().unwrap(), shelves);
+    }
+}
+
+fn live_anvil_rename(c: &Client, text: &str) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    let mut active = connection.active.lock().unwrap();
+    if let Some(session) = active.as_mut() {
+        if let LiveMenu::Anvil(menu) = &mut session.menu {
+            if menu.rename(text) {
+                sync_live_menu(c, session, false);
+            }
+        }
+    }
+}
+
+fn live_enchant_button(c: &Client, window: i32, button: i32) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    let mut active = connection.active.lock().unwrap();
+    let Some(session) = active.as_mut().filter(|s| i32::from(s.id) == window) else {
+        return;
+    };
+    if let LiveMenu::Enchanting(menu) = &mut session.menu {
+        let creative = *c.gm.lock().unwrap() == 1;
+        let mut seed = connection.enchantment_seed.lock().unwrap();
+        let mut rng = generation_math::Lcg::new(i64::from(*seed) as u64);
+        let _ = send_player_xp(c, |xp| {
+            menu.click_button(button, xp, &mut seed, creative, &mut rng);
+            Ok(())
+        });
+        drop(seed);
+        sync_live_menu(c, session, false);
+    }
+}
+
+fn live_select_trade(c: &Client, index: i32) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    let mut active = connection.active.lock().unwrap();
+    if let Some(session) = active.as_mut() {
+        if let LiveMenu::Merchant(id, menu) = &mut session.menu {
+            if let Some(villager) = live_villagers().lock().unwrap().get(id) {
+                menu.select_trade(
+                    index,
+                    &villager.offers,
+                    &mut c.inv.lock().unwrap(),
+                    &MerchantItems(&merchant_item_prototype),
+                );
+            }
+            sync_live_menu(c, session, false);
+        }
+    }
+}
+
+fn live_input_limit(menu: &LiveMenu, slot: usize, stack: &Stack) -> u8 {
+    let item = item_to_name(stack.0).unwrap_or_default();
+    match menu {
+        LiveMenu::Enchanting(_) if slot == 0 => 1,
+        LiveMenu::Enchanting(_) if item != "lapis_lazuli" => 0,
+        LiveMenu::Smithing(_) if slot == 0 && !item.ends_with("_smithing_template") => 0,
+        LiveMenu::Smithing(_)
+            if slot == 1 && tool_parts(item).is_none() && armor_parts(item).is_none() =>
+        {
+            0
+        }
+        LiveMenu::Smithing(_) if slot == 2 && !TRIM_MATERIAL_ITEMS.contains(&item) => 0,
+        _ => stack_max_of(stack) as u8,
+    }
+}
+
+fn click_live_input(target: &mut Stack, cursor: &mut Stack, button: i8, limit: u8) {
+    if cursor.1 == 0 || limit == stack_max_of(cursor) as u8 {
+        let mut slot = HashMap::from([(0, std::mem::take(target))]);
+        click_slot(&mut slot, cursor, 0, button);
+        *target = slot.remove(&0).unwrap_or_default();
+    } else if limit != 0 && target.1 == 0 {
+        *target = (cursor.0, 1, cursor.2.clone());
+        consume_menu_stack(cursor, 1);
+    } else if limit != 0 && cursor.1 <= limit {
+        std::mem::swap(target, cursor);
+    }
+}
+
+fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
+    let Some(connection) = live_menu_connection(c) else {
+        return;
+    };
+    let mut active = connection.active.lock().unwrap();
+    let Some(session) = active.as_mut().filter(|s| s.id == window) else {
+        return;
+    };
+    if !live_menu_valid(c, session) {
+        drop(active);
+        close_live_menu(c, true, true);
+        return;
+    }
+    if !matches!(button, 0 | 1) || !matches!(mode, 0 | 1) {
+        sync_live_menu(c, session, false);
+        return;
+    }
+    let slots = match session.menu {
+        LiveMenu::Anvil(_) | LiveMenu::Merchant(..) => 3,
+        LiveMenu::Enchanting(_) => 2,
+        LiveMenu::Brewing => 5,
+        LiveMenu::Smithing(_) => 4,
+    };
+    let output_slot = match session.menu {
+        LiveMenu::Anvil(_) | LiveMenu::Merchant(..) | LiveMenu::Smithing(_) => slots - 1,
+        _ => -1,
+    };
+    let mut inventory = c.inv.lock().unwrap();
+    let mut cursor = c.cursor.lock().unwrap();
+    let mut offer_changed = false;
+    let mut wear_anvil = false;
+    let mut brewing_changed = false;
+
+    if slot == output_slot && slot >= 0 {
+        let mut quick_move_inventory = None;
+        let selected = *c.held.lock().unwrap();
+        let mut receive = |result: &Stack| {
+            if mode == 1 {
+                let mut trial = inventory.clone();
+                let mut remainder = result.clone();
+                pickup_into_inventory(&mut trial, selected, false, &mut remainder);
+                if remainder.1 == 0 {
+                    quick_move_inventory = Some(trial);
+                    return true;
+                }
+                return false;
+            }
+            cursor.1 == 0
+                || (cursor.0 == result.0
+                    && cursor.2 == result.2
+                    && i64::from(cursor.1) + i64::from(result.1) <= stack_max_of(result))
+        };
+        let result = match &mut session.menu {
+            LiveMenu::Anvil(menu) => {
+                let name = anvil_hover_name(&menu.left).to_owned();
+                let creative = *c.gm.lock().unwrap() == 1;
+                let mut output = None;
+                let _ = send_player_xp(c, |xp| {
+                    if let Some(result) = menu.take_result(&name, xp, creative, receive, || {
+                        // Use 24 random bits so the sample fits in f32's [0, 1).
+                        Some((world_rng::next_u64() >> 40) as f32 / 16_777_216.0)
+                    }) {
+                        wear_anvil = result.damage_anvil;
+                        output = Some(result.output);
+                    }
+                    Ok(())
+                });
+                output
+            }
+            LiveMenu::Smithing(menu) => menu.take_result(receive),
+            LiveMenu::Merchant(id, menu) => {
+                let mut villagers = live_villagers().lock().unwrap();
+                let items = MerchantItems(&merchant_item_prototype);
+                let result = villagers.get_mut(id).and_then(|villager| {
+                    let index = menu.active_offer(&villager.offers, &items)?;
+                    receive(&villager.offers[index].result).then_some(())?;
+                    villager
+                        .trade(c.uuid, menu, &items)
+                        .map(|trade| trade.result)
+                });
+                offer_changed = result.is_some();
+                result
+            }
+            _ => None,
+        };
+        if let Some(mut result) = result {
+            if let Some(updated) = quick_move_inventory {
+                *inventory = updated;
+            } else {
+                result.1 += cursor.1;
+                *cursor = result;
+            }
+        }
+    } else if (0..slots).contains(&slot) {
+        if let LiveMenu::Brewing = session.menu {
+            let mut stands = live_brewing_stands().lock().unwrap();
+            if let Some(entry) = stands.get_mut(&session.anchor.unwrap()) {
+                brewing_changed = if mode == 0 {
+                    entry.menu.click_slot(slot, button, &mut cursor)
+                } else {
+                    let stack = &mut entry.menu.slots[slot as usize];
+                    let before = stack.1;
+                    pickup_into_inventory(&mut inventory, *c.held.lock().unwrap(), false, stack);
+                    before != stack.1
+                };
+            }
+        } else {
+            let limit = live_input_limit(&session.menu, slot as usize, &cursor);
+            let mut inputs = session.menu.input_slots();
+            let target = &mut inputs[slot as usize];
+            if mode == 0 {
+                click_live_input(target, &mut cursor, button, limit);
+            } else {
+                pickup_into_inventory(&mut inventory, *c.held.lock().unwrap(), false, target);
+            }
+        }
+    } else if (slots..slots + 36).contains(&slot) {
+        let inv_slot = slot - slots + 9;
+        if mode == 0 {
+            click_slot(&mut inventory, &mut cursor, inv_slot, button);
+        } else if let Some(mut source) = inventory.remove(&inv_slot) {
+            if let LiveMenu::Brewing = session.menu {
+                let mut stands = live_brewing_stands().lock().unwrap();
+                if let Some(entry) = stands.get_mut(&session.anchor.unwrap()) {
+                    // Only merge or use an empty slot during shift-click.
+                    for target in [4, 3, 0, 1, 2] {
+                        let placed = &entry.menu.slots[target as usize];
+                        if source.1 != 0
+                            && (placed.1 == 0 || (placed.0 == source.0 && placed.2 == source.2))
+                        {
+                            brewing_changed |= entry.menu.click_slot(target, 0, &mut source);
+                        }
+                    }
+                }
+            } else if !matches!(session.menu, LiveMenu::Merchant(..)) {
+                // Lapis belongs in the second slot, even when the first is empty.
+                let first = usize::from(
+                    matches!(session.menu, LiveMenu::Enchanting(_))
+                        && item_to_name(source.0) == Some("lapis_lazuli"),
+                );
+                for index in first..session.menu.input_slots().len() {
+                    let limit = live_input_limit(&session.menu, index, &source);
+                    let mut inputs = session.menu.input_slots();
+                    let target = &mut inputs[index];
+                    if source.1 != 0
+                        && (target.1 == 0 || (target.0 == source.0 && target.2 == source.2))
+                    {
+                        click_live_input(target, &mut source, 0, limit);
+                    }
+                }
+            }
+            if source.1 != 0 {
+                inventory.insert(inv_slot, source);
+            }
+        }
+    } else if slot == -999 && mode == 0 && cursor.1 != 0 {
+        let (x, y, z, ..) = *c.pos.lock().unwrap();
+        let count = if button == 0 { cursor.1 } else { 1 };
+        drop_live_stack((x, y + 1.3, z), (cursor.0, count, cursor.2.clone()));
+        consume_menu_stack(&mut cursor, count);
+    }
+
+    drop(cursor);
+    drop(inventory);
+    if (0..2).contains(&slot) || mode == 1 {
+        refresh_live_enchanting(&connection, session);
+    }
+    sync_live_menu(c, session, offer_changed);
+    let anchor = session.anchor;
+    drop(active);
+    if wear_anvil {
+        if let Some((dim, x, y, z)) = anchor {
+            wear_live_anvil(dim, x, y, z);
+        }
+    }
+    if brewing_changed {
+        if let Some(key) = anchor {
+            update_brewing_bottles(key);
+            for viewer in client_snapshot() {
+                if viewer.eid == c.eid {
+                    continue;
+                }
+                let Some(connection) = live_menu_connection(&viewer) else {
+                    continue;
+                };
+                let mut active = connection.active.lock().unwrap();
+                if let Some(session) = active
+                    .as_mut()
+                    .filter(|s| matches!(s.menu, LiveMenu::Brewing) && s.anchor == Some(key))
+                {
+                    sync_live_menu(&viewer, session, false);
+                }
+            }
+        }
+    }
+    if offer_changed {
+        let (x, y, z, ..) = *c.pos.lock().unwrap();
+        xps().lock().unwrap().push(Xp {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x,
+            y: y + 1.0,
+            z,
+            val: (3 + world_rng::next_u64() % 4) as i16,
+            age: 0,
+        });
+    }
+}
+
+fn wear_live_anvil(dim: DimId, x: i32, y: i32, z: i32) {
+    let Some(reg) = breg() else { return };
+    let state = block_at_dim(dim, x, y, z);
+    let next = match reg.name_of(state) {
+        "minecraft:anvil" => "minecraft:chipped_anvil",
+        "minecraft:chipped_anvil" => "minecraft:damaged_anvil",
+        "minecraft:damaged_anvil" => "minecraft:air",
+        _ => return,
+    };
+    let mut updated = reg.state_of(next, None);
+    if let Some(facing) = reg.get_prop(state, "facing") {
+        updated = reg.with_prop(updated, "facing", &facing);
+    }
+    if set_block_if_dim(dim, x, y, z, updated, Some(state)) {
+        note_block_update_dim(dim, x, y, z, updated);
+    }
+}
+
+fn live_menu_valid(c: &Client, session: &LiveMenuSession) -> bool {
+    let dim = *c.dim.lock().unwrap();
+    let (px, py, pz, ..) = *c.pos.lock().unwrap();
+    let close_to =
+        |x: f64, y: f64, z: f64| (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2) <= 64.0;
+    if let LiveMenu::Merchant(eid, _) = session.menu {
+        return dim == DimId::Overworld
+            && mobs().lock().unwrap().iter().any(|mob| {
+                if mob.eid != eid {
+                    return false;
+                }
+                let (x, y, z, ..) = *mob.pos.lock().unwrap();
+                close_to(x, y, z)
+            });
+    }
+    let Some((anchor_dim, x, y, z)) = session.anchor else {
+        return false;
+    };
+    if dim != anchor_dim || !close_to(f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5) {
+        return false;
+    }
+    let Some(reg) = breg() else { return false };
+    matches!(
+        (&session.menu, reg.name_of(block_at_dim(dim, x, y, z))),
+        (
+            LiveMenu::Anvil(_),
+            "minecraft:anvil" | "minecraft:chipped_anvil" | "minecraft:damaged_anvil"
+        ) | (LiveMenu::Enchanting(_), "minecraft:enchanting_table")
+            | (LiveMenu::Brewing, "minecraft:brewing_stand")
+            | (LiveMenu::Smithing(_), "minecraft:smithing_table")
+    )
+}
+
+fn live_menu_tick() {
+    for c in client_snapshot() {
+        let Some(connection) = live_menu_connection(&c) else {
+            continue;
+        };
+        let active = connection.active.lock().unwrap();
+        if active.as_ref().is_some_and(|s| !live_menu_valid(&c, s)) {
+            // Hold the session through validation. The close then checks the
+            // same ID, since the connection can open a new menu between them.
+            let id = active.as_ref().unwrap().id;
+            drop(active);
+            close_live_menu_id(&c, Some(id), true, true);
+        }
+    }
+    if TICK_IDX
+        .load(Ordering::Relaxed)
+        .is_multiple_of(server_ticks(20))
+        && !live_villagers().lock().unwrap().is_empty()
+    {
+        let mobs = mobs().lock().unwrap();
+        let alive: HashSet<_> = mobs.iter().map(|mob| mob.eid).collect();
+        live_villagers()
+            .lock()
+            .unwrap()
+            .retain(|id, _| alive.contains(id));
+    }
+}
+
+const COMP_POTION_CONTENTS: i64 = 31;
+
+// The built-in potion registry follows Potions.<clinit> in the 1.21.1 server.
+const LIVE_POTIONS: &[(&str, PotionKind)] = &[
+    ("water", PotionKind::Water),
+    ("mundane", PotionKind::Mundane),
+    ("thick", PotionKind::Thick),
+    ("awkward", PotionKind::Awkward),
+    ("night_vision", PotionKind::NightVision),
+    ("long_night_vision", PotionKind::LongNightVision),
+    ("invisibility", PotionKind::Invisibility),
+    ("long_invisibility", PotionKind::LongInvisibility),
+    ("leaping", PotionKind::Leaping),
+    ("long_leaping", PotionKind::LongLeaping),
+    ("strong_leaping", PotionKind::StrongLeaping),
+    ("fire_resistance", PotionKind::FireResistance),
+    ("long_fire_resistance", PotionKind::LongFireResistance),
+    ("swiftness", PotionKind::Swiftness),
+    ("long_swiftness", PotionKind::LongSwiftness),
+    ("strong_swiftness", PotionKind::StrongSwiftness),
+    ("slowness", PotionKind::Slowness),
+    ("long_slowness", PotionKind::LongSlowness),
+    ("strong_slowness", PotionKind::StrongSlowness),
+    ("turtle_master", PotionKind::TurtleMaster),
+    ("long_turtle_master", PotionKind::LongTurtleMaster),
+    ("strong_turtle_master", PotionKind::StrongTurtleMaster),
+    ("water_breathing", PotionKind::WaterBreathing),
+    ("long_water_breathing", PotionKind::LongWaterBreathing),
+    ("healing", PotionKind::Healing),
+    ("strong_healing", PotionKind::StrongHealing),
+    ("harming", PotionKind::Harming),
+    ("strong_harming", PotionKind::StrongHarming),
+    ("poison", PotionKind::Poison),
+    ("long_poison", PotionKind::LongPoison),
+    ("strong_poison", PotionKind::StrongPoison),
+    ("regeneration", PotionKind::Regeneration),
+    ("long_regeneration", PotionKind::LongRegeneration),
+    ("strong_regeneration", PotionKind::StrongRegeneration),
+    ("strength", PotionKind::Strength),
+    ("long_strength", PotionKind::LongStrength),
+    ("strong_strength", PotionKind::StrongStrength),
+    ("weakness", PotionKind::Weakness),
+    ("long_weakness", PotionKind::LongWeakness),
+    ("luck", PotionKind::Luck),
+    ("slow_falling", PotionKind::SlowFalling),
+    ("long_slow_falling", PotionKind::LongSlowFalling),
+    ("wind_charged", PotionKind::WindCharged),
+    ("weaving", PotionKind::Weaving),
+    ("oozing", PotionKind::Oozing),
+    ("infested", PotionKind::Infested),
+];
+
+fn live_potion_stack(stack: &Stack) -> Option<BrewingPotion> {
+    let form = match item_to_name(stack.0)? {
+        "potion" => PotionForm::Drinkable,
+        "splash_potion" => PotionForm::Splash,
+        "lingering_potion" => PotionForm::Lingering,
+        _ => return None,
+    };
+    let mut contents = comp_get(&stack.2, COMP_POTION_CONTENTS)?.strip_prefix(&[1])?;
+    let id = usize::try_from(read_protocol_i32(&mut contents)?).ok()?;
+    Some(BrewingPotion {
+        form,
+        kind: LIVE_POTIONS.get(id)?.1,
+    })
+}
+
+fn read_live_potion_effect_details(data: &mut &[u8], depth: usize) -> Option<()> {
+    if depth == 16 {
+        return None;
+    }
+    read_protocol_i32(data)?; // amplifier
+    read_protocol_i32(data)?; // duration
+    for _ in 0..3 {
+        read_merchant_bool(data)?; // ambient, visible, icon
+    }
+    if read_merchant_bool(data)? {
+        read_live_potion_effect_details(data, depth + 1)?;
+    }
+    Some(())
+}
+
+fn update_live_potion(stack: &mut Stack, potion: BrewingPotion) {
+    let name = match potion.form {
+        PotionForm::Drinkable => "potion",
+        PotionForm::Splash => "splash_potion",
+        PotionForm::Lingering => "lingering_potion",
+    };
+    let id = LIVE_POTIONS
+        .iter()
+        .position(|&(_, kind)| kind == potion.kind)
+        .unwrap();
+    let mut previous = comp_get(&stack.2, COMP_POTION_CONTENTS).unwrap_or(&[1, 0, 0, 0]);
+    previous = &previous[1..];
+    read_varint(&mut previous);
+    let mut contents = vec![1];
+    write_varint(&mut contents, id as i64);
+    contents.extend_from_slice(previous);
+    stack.0 = name_to_item(name).unwrap();
+    comp_set(&mut stack.2, COMP_POTION_CONTENTS, contents);
+}
+
+#[derive(Default)]
+struct LiveBrewingStand {
+    stand: BrewingStand,
+    menu: BrewingMenu,
+}
+
+impl LiveBrewingStand {
+    fn tick(&mut self) -> (bool, bool, bool) {
+        let [first, second, third, ingredient, powder] = &mut self.menu.slots;
+        self.stand.bottles = [first, second, third].map(|stack| live_potion_stack(stack));
+        self.stand.ingredient = item_to_name(ingredient.0)
+            .and_then(BrewingIngredient::from_item)
+            .map(|item| (item, ingredient.1));
+        self.stand.blaze_powder = powder.1;
+        let before = (self.stand.brew_time, self.stand.fuel, powder.1);
+        let tick = self.stand.tick();
+        consume_menu_stack(powder, powder.1 - self.stand.blaze_powder);
+        let mut slots_changed = before.2 != powder.1;
+        let mut eject = false;
+        if let BrewingTick::Completed {
+            ejected_glass_bottle,
+        } = tick
+        {
+            for (stack, potion) in self.menu.slots[..3].iter_mut().zip(self.stand.bottles) {
+                if let Some(potion) = potion.filter(|p| Some(*p) != live_potion_stack(stack)) {
+                    update_live_potion(stack, potion);
+                }
+            }
+            let ingredient = &mut self.menu.slots[3];
+            consume_menu_stack(ingredient, 1);
+            if self
+                .stand
+                .ingredient
+                .is_some_and(|(item, _)| item == BrewingIngredient::GlassBottle)
+            {
+                *ingredient = (name_to_item("glass_bottle").unwrap(), 1, Vec::new());
+            }
+            slots_changed = true;
+            eject = ejected_glass_bottle;
+        }
+        let properties_changed = (before.0, before.1) != (self.stand.brew_time, self.stand.fuel);
+        (slots_changed, properties_changed, eject)
+    }
+}
+
+fn live_brewing_stands() -> &'static LockedMap<DimBlockPos, LiveBrewingStand> {
+    static STANDS: Registry<DimBlockPos, LiveBrewingStand> = OnceLock::new();
+    STANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn update_brewing_bottles(key @ (dim, x, y, z): DimBlockPos) {
+    let Some(reg) = breg() else { return };
+    let bottles = live_brewing_stands()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|entry| std::array::from_fn::<_, 3, _>(|i| entry.menu.slots[i].1 != 0));
+    let Some(bottles) = bottles else { return };
+    let state = block_at_dim(dim, x, y, z);
+    if reg.name_of(state) != "minecraft:brewing_stand" {
+        return;
+    }
+    let mut updated = state;
+    for (prop, occupied) in ["has_bottle_0", "has_bottle_1", "has_bottle_2"]
+        .into_iter()
+        .zip(bottles)
+    {
+        updated = reg.with_prop(updated, prop, if occupied { "true" } else { "false" });
+    }
+    if updated != state && set_block_if_dim(dim, x, y, z, updated, Some(state)) {
+        note_block_update_dim(dim, x, y, z, updated);
+    } else if nearby_redstone(reg, dim, RsPos(x, y, z)) {
+        with_redstone_origins(|| run_redstone_pass(dim, RsPos(x, y, z), None));
+    }
+}
+
+fn remove_live_brewing_stand(key @ (dim, x, y, z): DimBlockPos) {
+    if let Some(entry) = live_brewing_stands().lock().unwrap().remove(&key) {
+        // Item entities currently live in the Overworld simulation.
+        if dim == DimId::Overworld {
+            for stack in entry.menu.slots {
+                drop_live_stack(
+                    (f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5),
+                    stack,
+                );
+            }
+        }
+    }
+}
+
+fn live_brewing_tick() {
+    with_save_guard(|| {
+        let mut updates = HashMap::new();
+        for (&key, entry) in live_brewing_stands().lock().unwrap().iter_mut() {
+            let (mut slots_changed, mut properties_changed, mut eject) = (false, false, false);
+            for _ in 0..GAME_TICKS_PER_TICK {
+                let (slots, properties, bottle) = entry.tick();
+                slots_changed |= slots;
+                properties_changed |= properties;
+                eject |= bottle;
+            }
+            if slots_changed || properties_changed {
+                updates.insert(
+                    key,
+                    (
+                        slots_changed,
+                        brewing_window_properties(&entry.stand),
+                        eject,
+                    ),
+                );
+            }
+        }
+        if updates.is_empty() {
+            return;
+        }
+        for (&key @ (dim, x, y, z), &(slots, _, eject)) in &updates {
+            if slots {
+                update_brewing_bottles(key);
+            }
+            if eject && dim == DimId::Overworld {
+                let stack = (name_to_item("glass_bottle").unwrap(), 1, Vec::new());
+                drop_live_stack(
+                    (f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5),
+                    stack,
+                );
+            }
+        }
+        for client in client_snapshot() {
+            let Some(connection) = live_menu_connection(&client) else {
+                continue;
+            };
+            let mut active = connection.active.lock().unwrap();
+            let Some(session) = active.as_mut() else {
+                continue;
+            };
+            if !matches!(session.menu, LiveMenu::Brewing) {
+                continue;
+            }
+            if let Some((slots, properties, _)) = session.anchor.and_then(|key| updates.get(&key)) {
+                if *slots {
+                    sync_live_menu(&client, session, false);
+                } else {
+                    let mut sock = client.sock.lock().unwrap();
+                    for property in properties {
+                        let _ = send_packet(&mut sock, 0x14, property.encode(session.id).to_vec());
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn always_edible(item: i64) -> bool {
+    [
+        name_to_item("golden_apple"),
+        name_to_item("enchanted_golden_apple"),
+        name_to_item("chorus_fruit"),
+        name_to_item("honey_bottle"),
+    ]
+    .contains(&Some(item))
+}
+fn sat_value(item: i64) -> f32 {
+    for (n, v) in [
+        ("cooked_beef", 12.8f32),
+        ("cooked_porkchop", 12.8),
+        ("cooked_mutton", 9.6),
+        ("cooked_rabbit", 10.0),
+        ("cooked_chicken", 7.2),
+        ("golden_apple", 9.6),
+        ("enchanted_golden_apple", 9.6),
+        ("bread", 6.0),
+        ("baked_potato", 6.0),
+        ("carrot", 3.6),
+        ("apple", 2.4),
+        ("chorus_fruit", 2.4),
+        ("honey_bottle", 1.2),
+        ("melon_slice", 1.2),
+        ("beef", 1.8),
+        ("porkchop", 1.8),
+        ("mutton", 1.2),
+        ("rabbit", 1.8),
+        ("chicken", 1.2),
+        ("potato", 0.6),
+        ("beetroot", 1.2),
+        ("rotten_flesh", 0.8),
+        ("cookie", 0.4),
+        ("dried_kelp", 0.2),
+    ] {
+        if name_to_item(n) == Some(item) {
+            return v;
+        }
+    }
+    0.0
+}
+
+fn food_value(item: i64) -> i32 {
+    for (n, v) in [
+        ("cooked_beef", 8),
+        ("cooked_porkchop", 8),
+        ("cooked_chicken", 6),
+        ("cooked_mutton", 6),
+        ("bread", 5),
+        ("baked_potato", 5),
+        ("cooked_rabbit", 5),
+        ("apple", 4),
+        ("rotten_flesh", 4),
+        ("carrot", 3),
+        ("beef", 3),
+        ("porkchop", 3),
+        ("rabbit", 3),
+        ("mutton", 2),
+        ("melon_slice", 2),
+        ("cookie", 2),
+        ("chicken", 1),
+        ("potato", 1),
+        ("beetroot", 1),
+        ("dried_kelp", 1),
+        ("honey_bottle", 6),
+        ("chorus_fruit", 4),
+        ("golden_apple", 4),
+        ("enchanted_golden_apple", 4),
+    ] {
+        if name_to_item(n) == Some(item) {
+            return v;
+        }
+    }
+    0
+}
+
+fn item_tags() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static T: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(builtin_item_tags()))
+}
+fn builtin_item_tags() -> HashMap<String, Vec<String>> {
+    [
+        (
+            "planks",
+            &[
+                "oak_planks",
+                "spruce_planks",
+                "birch_planks",
+                "jungle_planks",
+                "acacia_planks",
+                "dark_oak_planks",
+                "mangrove_planks",
+                "cherry_planks",
+                "crimson_planks",
+                "warped_planks",
+            ][..],
+        ),
+        (
+            "logs",
+            &[
+                "oak_log",
+                "spruce_log",
+                "birch_log",
+                "jungle_log",
+                "acacia_log",
+                "dark_oak_log",
+                "mangrove_log",
+                "cherry_log",
+                "crimson_stem",
+                "warped_stem",
+            ][..],
+        ),
+        (
+            "wool",
+            &[
+                "white_wool",
+                "orange_wool",
+                "magenta_wool",
+                "light_blue_wool",
+                "yellow_wool",
+                "lime_wool",
+                "pink_wool",
+                "gray_wool",
+                "light_gray_wool",
+                "cyan_wool",
+                "purple_wool",
+                "blue_wool",
+                "brown_wool",
+                "green_wool",
+                "red_wool",
+                "black_wool",
+            ][..],
+        ),
+    ]
+    .iter()
+    .map(|(k, v)| {
+        (
+            format!("minecraft:{}", k),
+            v.iter().map(|s| s.to_string()).collect(),
+        )
+    })
+    .collect()
+}
+
+// datapack crafting recipes (data/<ns>/recipe/**.json)
+enum Ingr {
+    Item(i64),
+    Tag(String),
+}
+struct JsonRecipe {
+    shaped: bool,
+    rows: Vec<String>,        // shaped pattern rows (' '=air)
+    key: HashMap<char, Ingr>, // shaped ingredient map
+    ing: Vec<Ingr>,           // shapeless ingredients
+    out: i64,
+    out_cnt: u8,
+}
+fn json_recipes() -> &'static Mutex<Vec<JsonRecipe>> {
+    static R: OnceLock<Mutex<Vec<JsonRecipe>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(Vec::new()))
+}
+// datapack furnace recipes: smelting/blasting/smoking/campfire_cooking
+fn json_smelts() -> &'static Mutex<Vec<SmeltRecipe>> {
+    static R: OnceLock<Mutex<Vec<SmeltRecipe>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// air-use of the held item — shared by use_item (0x39) and the 1.21+
+// block_place form ({-1,255,-1}, face -1) that the protocol emits when a
+// usable item is activated in the air (bow draw, crossbow load, throws,
+// food, shield). seq is acked here; callers must not ack again.
+fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat_release: bool) {
+    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+    {
+        let inv = me.inv.lock().unwrap();
+        let main = inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0);
+        if main == 931 {
+            // fishing rod: cast or reel
+            drop(inv);
+            let mut fb = bobbers().lock().unwrap();
+            if let Some(ix) = fb.iter().position(|b| b.owner == me.eid) {
+                let b = fb.remove(ix);
+                broadcast_seen_destroy(b.eid);
+                if b.bit {
+                    // catch!
+                    // datapack gameplay/fishing table wins; fallback raw fish
+                    let table: Option<Vec<LootPool>> = loot_tables()
+                        .lock()
+                        .unwrap()
+                        .get("minecraft:gameplay/fishing")
+                        .map(|p| {
+                            p.iter()
+                                .map(|pl| LootPool {
+                                    rolls: pl.rolls,
+                                    chance: pl.chance,
+                                    funcs: pl.funcs.clone(),
+                                    entries: pl
+                                        .entries
+                                        .iter()
+                                        .map(|e| LootEntry {
+                                            item: e.item,
+                                            min: e.min,
+                                            max: e.max,
+                                            funcs: e.funcs.clone(),
+                                        })
+                                        .collect(),
+                                })
+                                .collect()
+                        });
+                    let (fish, fcnt, fcomps) = table
+                        .and_then(|p| roll_loot(&p).into_iter().next())
+                        .unwrap_or((
+                            if (b.age as u64).is_multiple_of(5) {
+                                936
+                            } else {
+                                935
+                            },
+                            1,
+                            Vec::new(),
+                        ));
+                    let mut inv = me.inv.lock().unwrap();
+                    let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
+                    inv.insert(slot, (fish, fcnt, fcomps.clone()));
+                    let mut p = vec![4u8];
+                    write_varint(&mut p, 0);
+                    p.extend_from_slice(&slot.to_be_bytes());
+                    p.extend_from_slice(&slot_wire(&(fish, fcnt, fcomps)));
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                }
+            } else {
+                let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+                let yr = (yaw as f64).to_radians();
+                let pr = (pitch as f64).to_radians();
+                let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                let b = Bobber {
+                    eid,
+                    owner: me.eid,
+                    x,
+                    y: y + 1.5,
+                    z,
+                    dx: -yr.sin() * pr.cos() * 1.2,
+                    dy: -pr.sin() * 1.2 + 0.2,
+                    dz: yr.cos() * pr.cos() * 1.2,
+                    age: 0,
+                    bit: false,
+                };
+                fb.push(b);
+                // spawn streams via interest_tick
+            }
+            return;
+        }
+        if main == 993 {
+            // ender pearl: throw (vanilla 20t cooldown)
+            if me.pearl_cd.lock().unwrap().elapsed() < Duration::from_secs(1) {
+                return;
+            }
+            *me.pearl_cd.lock().unwrap() = Instant::now();
+            {
+                let mut cp = Vec::new();
+                write_varint(&mut cp, 993); // itemID
+                write_varint(&mut cp, 20); // cooldownTicks
+                if let Ok(mut w) = me.sock.lock() {
+                    let _ = send_packet(&mut w, 0x17, cp);
+                }
+            }
+            drop(inv);
+            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+            let yr = (yaw as f64).to_radians();
+            let pr = (pitch as f64).to_radians();
+            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+            let pe = Pearl {
+                eid,
+                owner: me.eid,
+                x,
+                y: y + 1.5,
+                z,
+                dx: -yr.sin() * pr.cos() * 2.0,
+                dy: -pr.sin() * 2.0 + 0.3,
+                dz: yr.cos() * pr.cos() * 2.0,
+                ttl: server_ticks(PEARL_TTL_GT) as i32,
+            };
+            pearls().lock().unwrap().push(pe);
+            // spawn streams via interest_tick
+            if *me.gm.lock().unwrap() != 1 {
+                let mut inv = me.inv.lock().unwrap();
+                let hs = 36 + held_slot;
+                if let Some((it, c, _cc)) = inv.get(&hs).cloned() {
+                    if it == 993 {
+                        if c <= 1 {
+                            inv.remove(&hs);
+                        } else {
+                            inv.insert(hs, (it, c - 1, _cc));
+                        }
+                    }
+                }
+                drop(inv);
+                held_slot_resync(me);
+            }
+            return;
+        }
+        if main == 912 || main == 927 {
+            // snowball/egg: throw (egg may hatch a chicken)
+            drop(inv);
+            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+            let yr = (yaw as f64).to_radians();
+            let pr = (pitch as f64).to_radians();
+            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+            let sb = Snowball {
+                eid,
+                owner: me.eid,
+                x,
+                y: y + 1.5,
+                z,
+                dx: -yr.sin() * pr.cos() * 1.5,
+                dy: -pr.sin() * 1.5 + 0.25,
+                dz: yr.cos() * pr.cos() * 1.5,
+                ttl: server_ticks(SNOWBALL_TTL_GT) as i32,
+                egg: main == 927,
+            };
+            snowballs().lock().unwrap().push(sb);
+            // spawn streams via interest_tick
+            if *me.gm.lock().unwrap() != 1 {
+                let mut inv2 = me.inv.lock().unwrap();
+                let hs = 36 + held_slot;
+                if let Some((it, c, _cc)) = inv2.get(&hs).cloned() {
+                    if it == 912 || it == 927 {
+                        if c <= 1 {
+                            inv2.remove(&hs);
+                        } else {
+                            inv2.insert(hs, (it, c - 1, _cc));
+                        }
+                    }
+                }
+                drop(inv2);
+                held_slot_resync(me);
+            }
+            return;
+        }
+        if main == 1162 || (_h == Some(1) && inv.get(&45).map(|v| v.0).unwrap_or(0) == 1162) {
+            *me.blocking.lock().unwrap() = true;
+            return;
+        }
+        let asl = armor_slot_for(main);
+        if asl > 0 {
+            // vanilla: right-click equips armor into its slot (swaps)
+            drop(inv);
+            let hs = 36 + held_slot;
+            let creative = *me.gm.lock().unwrap() == 1;
+            let mut inv2 = me.inv.lock().unwrap();
+            if armor_removal_blocked(asl, inv2.get(&asl), creative) {
+                drop(inv2);
+                held_slot_resync(me);
+                return;
+            }
+            if let Some(st) = inv2.get(&hs).cloned() {
+                let cur = inv2.get(&asl).cloned().unwrap_or((0, 0, Vec::new()));
+                inv2.insert(asl, (st.0, 1, st.2.clone()));
+                let leftover = st.1 - 1;
+                if cur.0 != 0 {
+                    if leftover > 0 {
+                        inv2.insert(hs, (st.0, leftover, st.2));
+                        let free = (9..=44i16).find(|sl| !inv2.contains_key(sl)).unwrap_or(9);
+                        inv2.insert(free, cur);
+                    } else {
+                        inv2.insert(hs, cur);
+                    }
+                } else if leftover > 0 {
+                    inv2.insert(hs, (st.0, leftover, st.2));
+                } else {
+                    inv2.remove(&hs);
+                }
+            }
+            drop(inv2);
+            held_slot_resync(me);
+            {
+                let st = me
+                    .inv
+                    .lock()
+                    .unwrap()
+                    .get(&asl)
+                    .cloned()
+                    .unwrap_or((0, 0, Vec::new()));
+                let mut p = vec![0u8];
+                write_varint(&mut p, 0);
+                p.extend_from_slice(&asl.to_be_bytes());
+                p.extend_from_slice(&slot_wire(&st));
+                if let Ok(mut w) = me.sock.lock() {
+                    let _ = send_packet(&mut w, 0x15, p);
+                }
+            }
+            return;
+        }
+        if main == 914 {
+            // milk_bucket: clears all effects, leaves a bucket
+            if !eat_release {
+                // vanilla: milk is a 32-tick drink like food
+                *me.eat_start.lock().unwrap() = Some(Instant::now());
+                return;
+            }
+            drop(inv);
+            let gone: Vec<i32> = {
+                let mut ef = me.effs.lock().unwrap();
+                let g: Vec<i32> = ef.iter().map(|e| e.id).collect();
+                ef.clear();
+                g
+            };
+            for id in &gone {
+                let pk = remove_effect_pkt(me.eid, *id);
+                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x43, pk.clone());
+                broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
+            }
+            if *me.gm.lock().unwrap() != 1 {
+                let mut iv = me.inv.lock().unwrap();
+                let hs = 36 + held_slot;
+                iv.insert(hs, (name_to_item("bucket").unwrap_or(0), 1, Vec::new()));
+            }
+            held_slot_resync(me);
+            return;
+        }
+        if main == 801 || main == 1192 || main == name_to_item("trident").unwrap_or(-9) {
+            *me.bow_draw.lock().unwrap() = Some(Instant::now());
+            return;
+        }
+    }
+    if *me.gm.lock().unwrap() != 1 {
+        // prefer held slot; fall back to first food item in inventory
+        let (slot, it) = {
+            let inv = me.inv.lock().unwrap();
+            let hs = 36 + held_slot;
+            match inv.get(&hs) {
+                Some((it, _, _)) if food_value(*it) > 0 => (hs, *it),
+                _ => inv
+                    .iter()
+                    .find(|(_, (i, _, _))| food_value(*i) > 0)
+                    .map(|(&sl, (i, _, _))| (sl, *i))
+                    .unwrap_or((hs, 0)),
+            }
+        };
+        let fv = food_value(it);
+        let cur_food = *me.food.lock().unwrap();
+        let edible = fv > 0 && (cur_food < 20 || always_edible(it));
+        if edible && !eat_release {
+            // vanilla: eating holds use for 32 ticks; nothing consumed yet
+            *me.eat_start.lock().unwrap() = Some(Instant::now());
+        }
+        if edible && eat_release {
+            let mut f = me.food.lock().unwrap();
+            let mut st = me.sat.lock().unwrap();
+            (*f, *st) = FoodData::values_after_eating(*f, *st, fv, sat_value(it));
+            drop(st);
+            drop(f);
+            let ncnt = {
+                let mut inv = me.inv.lock().unwrap();
+                let (nc, cc2) = inv
+                    .get(&slot)
+                    .map(|e| (e.1.saturating_sub(1), e.2.clone()))
+                    .unwrap_or((0, Vec::new()));
+                if nc == 0 {
+                    inv.remove(&slot);
+                } else {
+                    inv.insert(slot, (it, nc, cc2));
+                }
+                nc
+            };
+            let mut p = vec![0u8];
+            write_varint(&mut p, 0);
+            p.extend_from_slice(&slot.to_be_bytes());
+            write_varint(&mut p, ncnt as i64);
+            if ncnt > 0 {
+                write_varint(&mut p, it);
+                write_varint(&mut p, 0);
+                write_varint(&mut p, 0);
+            }
+            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+            let hh = *me.hp.lock().unwrap();
+            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x5d, health_pkt_c(hh, me));
+            // vanilla food side-effects (golden apple, pufferfish, ...)
+            for &(ch, eid2, amp, ticks) in food_effects(it) {
+                if (world_rng::next_u64() % 100) < ch {
+                    {
+                        let mut ef = me.effs.lock().unwrap();
+                        ef.retain(|e| e.id != eid2);
+                        ef.push(Eff {
+                            id: eid2,
+                            amp,
+                            left: ticks,
+                        });
+                    }
+                    if eid2 == 21 {
+                        *me.absorb.lock().unwrap() = (amp + 1) as f32 * 4.0;
+                    }
+                    let pk = entity_effect_pkt(me.eid, eid2, amp, ticks);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x76, pk.clone());
+                    broadcast_seen(me.eid, |_c| (0x76, pk.clone()));
+                }
+            }
+            // honey bottle clears poison only
+            if it == name_to_item("honey_bottle").unwrap_or(-9) {
+                let had = {
+                    let mut ef = me.effs.lock().unwrap();
+                    let h = ef.iter().any(|e| e.id == 18);
+                    ef.retain(|e| e.id != 18);
+                    h
+                };
+                if had {
+                    let pk = remove_effect_pkt(me.eid, 18);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x43, pk.clone());
+                    broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
+                }
+            }
+            // chorus fruit: random teleport within +-8 blocks
+            if it == name_to_item("chorus_fruit").unwrap_or(-9) {
+                let (px, py, pz, ..) = {
+                    let p = me.pos.lock().unwrap();
+                    *p
+                };
+                for _ in 0..16 {
+                    let nx = px + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
+                    let nz = pz + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
+                    let ny = surface_y(nx.round() as i32, nz.round() as i32);
+                    if (ny - py).abs() < 8.0 {
+                        let (_, _, _, yaw, pitch, _) = *me.pos.lock().unwrap();
+                        teleport_in_dimension(
+                            me,
+                            &mut me.sock.lock().unwrap(),
+                            (nx, ny, nz, yaw, pitch),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}

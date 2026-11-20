@@ -4,12 +4,12 @@
 The properties every case asserts from what the fake backend saw, not from "the bytes came back":
 
 * the campaign mutates a *private copy*. The fake cargo journals its own cwd, that cwd's
-  `src/main.rs` hash, `CARGO_TARGET_DIR`, the wire config's hash and the presence of a probe list,
+  mutated source file's hash, `CARGO_TARGET_DIR`, the wire config's hash and the presence of a probe list,
   so a run that mutated the fixture tree itself, built in the caller's target, or copied a file it
   said it excludes shows up as a journal entry.
 * the tree being measured is the working tree as it is: an uncommitted edit travels with the copy,
   and a source that changes while it is being copied stops the run.
-* the copy carries what the *server* reads from its cwd. `src/main.rs::load_config_packets` reads
+* the copy carries what the *server* reads from its cwd. `src/play_protocol.rs::load_config_packets` reads
   `config_packets.bin` from the working directory and the wire helper's `local_server` symlinks the
   repository's copy into a temporary server cwd, so a copy without it starts a server with empty
   registries and every wire gate measures different inputs. The fake wire backend resolves the
@@ -79,7 +79,7 @@ def assert_private_copy(root, before, journal, log, dirty):
         assert runs, "an entry was reported proved without any mutant run reaching the backend"
     for entry in runs:
         assert Path(entry["cwd"]).name.startswith("run."), entry
-        assert entry["main"] != before["main.rs"], (
+        assert entry["mutation_sha"] != before[entry["mutation_file"]], (
             f"the mutant bytes are not in the private copy: {entry}")
         assert entry["dirty_marker"] is dirty, (
             f"the copy does not carry the source's uncommitted state: {entry}")
@@ -209,7 +209,10 @@ def sha(path):
     return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
 
 probe = [line for line in Path({str(probe)!r}).read_text().splitlines() if line]
-mutated = bool(list(Path("src").glob("*.mutation-backup")))
+backups = list(Path("src").glob("*.mutation-backup"))
+assert len(backups) <= 1, backups
+mutation = backups[0].with_suffix("") if backups else None
+mutated = mutation is not None
 seen = Path(".mutation-seen")
 if mutated:
     seen.touch()
@@ -225,7 +228,8 @@ if os.environ.get("GATE_JOURNAL"):
             "cwd": os.getcwd(),
             "mutated": mutated,
             "target": os.environ.get("CARGO_TARGET_DIR"),
-            "main": sha(main),
+            "mutation_file": mutation.name if mutated else None,
+            "mutation_sha": sha(mutation) if mutated else None,
             "dirty_marker": ({DIRTY!r} in main.read_text()) if main.exists() else None,
             "probe": {{p: Path(p).exists() for p in probe}},
             "wire_sha": sha("config_packets.bin"),
@@ -359,9 +363,10 @@ def run_case(cargo_output, cargo_status, *, script=None, missing_anchor=False, l
             assert not list((root / "src").glob("*.mutation-backup"))
             kept = sorted(snapshot_parent.glob("run.*"))
             assert kept, "no private snapshot was retained to inspect"
-            residue = kept[0] / "src/main.rs.mutation-backup"
-            assert residue.exists(), f"the killed run should leave its residue here: {kept[0]}"
-            assert (kept[0] / "src/main.rs").read_bytes() != (root / "src/main.rs").read_bytes(), \
+            residues = list((kept[0] / "src").glob("*.mutation-backup"))
+            assert len(residues) == 1, f"the killed run should leave its residue here: {kept[0]}"
+            mutant = residues[0].with_suffix("")
+            assert mutant.read_bytes() != (root / "src" / mutant.name).read_bytes(), \
                 "the retained copy should hold the mutant"
             return proc.returncode, log, journal_entries(journal)
 
