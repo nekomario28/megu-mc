@@ -349,7 +349,7 @@ struct Client {
     drag: Mutex<(i32, Vec<i16>)>, // (button, painted window slots) for click-mode 5
     open_chest: Mutex<Option<(ContainerKey, Option<ContainerKey>)>>, // (key, double-chest partner)
     chest_sync: Mutex<Option<ChestSyncState>>,
-    open_furnace: Mutex<Option<(i32, i32, i32)>>,
+    open_furnace: Mutex<Option<DimBlockPos>>,
     craft: Mutex<HashMap<i16, Stack>>,
     craft9: Mutex<HashMap<i16, Stack>>,
     open_table: Mutex<bool>,
@@ -4504,11 +4504,10 @@ fn furnace_tick() {
     let cs: Vec<Arc<Client>> = client_snapshot();
     for c in cs {
         let fp = *c.open_furnace.lock().unwrap();
-        if let Some(fp) = fp {
-            let dim = *c.dim.lock().unwrap();
-            if dirty_pos.contains(&(dim, fp.0, fp.1, fp.2)) {
+        if let Some((dim, x, y, z)) = fp {
+            if dirty_pos.contains(&(dim, x, y, z)) {
                 let inv = c.inv.lock().unwrap().clone();
-                let slots = furnace_slot_snapshot_dim(dim, fp);
+                let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
                 if let Ok(mut w) = c.sock.lock() {
                     furnace_push_items_snap(&mut w, &inv, &slots);
                 }
@@ -22661,6 +22660,10 @@ fn switch_client_dimension(
 ) {
     let old_dim = *me.dim.lock().unwrap();
     close_live_menu(me, true, true);
+    let had_furnace = me.open_furnace.lock().unwrap().take().is_some();
+    if had_furnace {
+        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x12, vec![2]);
+    }
     // Retire everything the old world was tracking before the client drops its chunks.
     {
         let mut seen = me.seen.lock().unwrap();
@@ -23582,9 +23585,6 @@ fn open_furnace_window(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: &[St
     let _ = send_packet(s, 0x33, p);
     furnace_push_items_snap(s, inv, slots);
 }
-fn furnace_slot_snapshot(pos: (i32, i32, i32)) -> [Stack; 3] {
-    furnace_slot_snapshot_dim(DimId::Overworld, pos)
-}
 fn furnace_slot_snapshot_dim(dim: DimId, pos: (i32, i32, i32)) -> [Stack; 3] {
     let fs = furnaces().lock().unwrap();
     let f = fs.get(&(dim, pos.0, pos.1, pos.2));
@@ -23611,7 +23611,7 @@ fn furnace_push_items_snap(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: 
 // The frozen reference in furnace_cache_tests still exercises the original signature.
 #[cfg(test)]
 fn furnace_push_items(s: &mut TcpStream, pos: (i32, i32, i32), inv: &HashMap<i16, Stack>) {
-    let slots = furnace_slot_snapshot(pos);
+    let slots = furnace_slot_snapshot_dim(DimId::Overworld, pos);
     furnace_push_items_snap(s, inv, &slots);
 }
 fn ingr_match(ig: &Ingr, item: i64, depth: usize) -> bool {
@@ -31197,9 +31197,9 @@ fn handle(mut s: TcpStream) {
                 }
                 if block_at_dim(dim, x, y, z) == name_to_state("furnace").unwrap_or(u32::MAX) {
                     close_live_menu(&me, false, true);
-                    *me.open_furnace.lock().unwrap() = Some((x, y, z));
+                    *me.open_furnace.lock().unwrap() = Some((dim, x, y, z));
                     let inv = me.inv.lock().unwrap().clone();
-                    let slots = furnace_slot_snapshot((x, y, z));
+                    let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
                     open_furnace_window(&mut me.sock.lock().unwrap(), &inv, &slots);
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
@@ -32598,7 +32598,7 @@ fn handle(mut s: TcpStream) {
                             let furnace_pos = *me.open_furnace.lock().unwrap();
                             if let Some(fp) = furnace_pos {
                                 let mut fs = furnaces().lock().unwrap();
-                                let f = fs.entry(ow_block(fp)).or_insert(Furnace {
+                                let f = fs.entry(fp).or_insert(Furnace {
                                     input: (0, 0, Vec::new()),
                                     fuel: (0, 0, Vec::new()),
                                     output: (0, 0, Vec::new()),
@@ -33098,7 +33098,7 @@ fn handle(mut s: TcpStream) {
                                             }
                                             resync_slot(&me, 2, slot, &hst);
                                         } else {
-                                            let f = fs.entry(ow_block(fp)).or_insert(Furnace {
+                                            let f = fs.entry(fp).or_insert(Furnace {
                                                 input: (0, 0, Vec::new()),
                                                 fuel: (0, 0, Vec::new()),
                                                 output: (0, 0, Vec::new()),
@@ -33121,7 +33121,7 @@ fn handle(mut s: TcpStream) {
                                                     furnace_xp_pop(f, px, py, pz);
                                                     let rem = move_to_slots(&mut inv, 9..=44, st);
                                                     if rem.1 > 0 {
-                                                        fs.get_mut(&ow_block(fp)).unwrap().output = rem;
+                                                        fs.get_mut(&fp).unwrap().output = rem;
                                                     }
                                                 }
                                             } else {
@@ -33369,7 +33369,7 @@ fn handle(mut s: TcpStream) {
                                                 throw!(st);
                                             }
                                         } else {
-                                            let f = fs.entry(ow_block(fp)).or_insert(Furnace {
+                                            let f = fs.entry(fp).or_insert(Furnace {
                                                 input: (0, 0, Vec::new()),
                                                 fuel: (0, 0, Vec::new()),
                                                 output: (0, 0, Vec::new()),
@@ -33407,7 +33407,7 @@ fn handle(mut s: TcpStream) {
                                         }
                                     } else if slot == 2 {
                                         // shift-take output into inventory
-                                        let f = fs.entry(ow_block(fp)).or_insert(Furnace {
+                                        let f = fs.entry(fp).or_insert(Furnace {
                                             input: (0, 0, Vec::new()),
                                             fuel: (0, 0, Vec::new()),
                                             output: (0, 0, Vec::new()),
@@ -33428,12 +33428,12 @@ fn handle(mut s: TcpStream) {
                                             furnace_xp_pop(f, px, py, pz);
                                             let rem = move_to_slots(&mut inv, 9..=44, st);
                                             if rem.1 > 0 {
-                                                fs.get_mut(&ow_block(fp)).unwrap().output = rem;
+                                                fs.get_mut(&fp).unwrap().output = rem;
                                             }
                                         }
                                     } else if slot <= 1 {
                                         // shift input/fuel -> inv
-                                        let f = fs.entry(ow_block(fp)).or_insert(Furnace {
+                                        let f = fs.entry(fp).or_insert(Furnace {
                                             input: (0, 0, Vec::new()),
                                             fuel: (0, 0, Vec::new()),
                                             output: (0, 0, Vec::new()),
@@ -33450,7 +33450,7 @@ fn handle(mut s: TcpStream) {
                                             f.dirty = true;
                                             let rem = move_to_slots(&mut inv, 9..=44, st);
                                             if rem.1 > 0 {
-                                                let f2 = fs.get_mut(&ow_block(fp)).unwrap();
+                                                let f2 = fs.get_mut(&fp).unwrap();
                                                 if slot == 0 {
                                                     f2.input = rem
                                                 } else {
@@ -33461,7 +33461,7 @@ fn handle(mut s: TcpStream) {
                                     } else {
                                         // shift inv -> furnace input/fuel by type, else stays
                                         if let Some(st) = inv.get(&(slot + 6)).cloned() {
-                                            let f = fs.entry(ow_block(fp)).or_insert(Furnace {
+                                            let f = fs.entry(fp).or_insert(Furnace {
                                                 input: (0, 0, Vec::new()),
                                                 fuel: (0, 0, Vec::new()),
                                                 output: (0, 0, Vec::new()),
@@ -33519,7 +33519,7 @@ fn handle(mut s: TcpStream) {
                                     let cur_st = if slot >= 3 {
                                         inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new()))
                                     } else {
-                                        let f2 = fs.get(&ow_block(fp)).unwrap();
+                                        let f2 = fs.get(&fp).unwrap();
                                         match slot {
                                             0 => f2.input.clone(),
                                             1 => f2.fuel.clone(),

@@ -73,7 +73,8 @@ fn reference_tick() {
     let cs: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
     for c in cs {
         let fp = *c.open_furnace.lock().unwrap();
-        if let Some(fp) = fp {
+        if let Some((DimId::Overworld, x, y, z)) = fp {
+            let fp = (x, y, z);
             if dirty_pos.contains(&fp) {
                 let inv = c.inv.lock().unwrap().clone();
                 if let Ok(mut w) = c.sock.lock() {
