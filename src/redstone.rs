@@ -3,7 +3,8 @@
 // SignalGetter, RedStoneWireBlock, RedstoneTorchBlock, DiodeBlock and their subclasses.
 
 use std::cmp::Reverse;
-use std::collections::VecDeque;
+use crate::block_registry::BReg;
+use std::collections::{BTreeSet as RsBTreeSet, VecDeque};
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +71,29 @@ impl RsDir {
     fn horizontal_index(self) -> Option<usize> {
         Self::HORIZONTAL.iter().position(|&dir| dir == self)
     }
+
+    fn from_property(value: &str) -> Option<Self> {
+        Some(match value {
+            "down" => Self::Down,
+            "up" => Self::Up,
+            "north" => Self::North,
+            "south" => Self::South,
+            "west" => Self::West,
+            "east" => Self::East,
+            _ => return None,
+        })
+    }
+
+    fn property(self) -> &'static str {
+        match self {
+            Self::Down => "down",
+            Self::Up => "up",
+            Self::North => "north",
+            Self::South => "south",
+            Self::West => "west",
+            Self::East => "east",
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -94,6 +118,25 @@ enum RsWireConnection {
     None,
     Side,
     Up,
+}
+
+impl RsWireConnection {
+    fn from_property(value: &str) -> Option<Self> {
+        Some(match value {
+            "none" => Self::None,
+            "side" => Self::Side,
+            "up" => Self::Up,
+            _ => return None,
+        })
+    }
+
+    fn property(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Side => "side",
+            Self::Up => "up",
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -205,6 +248,8 @@ enum RsComparatorMode {
 struct ComparatorBlock {
     facing: RsDir,
     mode: RsComparatorMode,
+    powered: bool,
+    // The analog output is runtime data, separate from the `powered` block-state property.
     output: u8,
 }
 
@@ -234,6 +279,48 @@ impl ComparatorBlock {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RsMountFace {
+    Floor,
+    Wall,
+    Ceiling,
+}
+
+impl RsMountFace {
+    fn attachment(self, facing: RsDir) -> RsDir {
+        match self {
+            Self::Floor => RsDir::Down,
+            Self::Wall => facing.opposite(),
+            Self::Ceiling => RsDir::Up,
+        }
+    }
+
+    fn from_property(value: &str) -> Option<Self> {
+        Some(match value {
+            "floor" => Self::Floor,
+            "wall" => Self::Wall,
+            "ceiling" => Self::Ceiling,
+            _ => return None,
+        })
+    }
+
+    fn property(self) -> &'static str {
+        match self {
+            Self::Floor => "floor",
+            Self::Wall => "wall",
+            Self::Ceiling => "ceiling",
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RsButtonKind {
+    Stone,
+    Oak,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum RsBlock {
     #[default]
@@ -241,7 +328,12 @@ enum RsBlock {
     Solid,
     Glass,
     Container(u8),
+    // Keep unmodelled states intact, including their precise 1.21.1 properties.
+    RegistryState(u32),
     RedstoneBlock,
+    Lever { face: RsMountFace, facing: RsDir, powered: bool },
+    Button { kind: RsButtonKind, face: RsMountFace, facing: RsDir, powered: bool },
+    Piston { sticky: bool, facing: RsDir, extended: bool },
     Source {
         weak: u8,
         strong: u8,
@@ -256,12 +348,15 @@ enum RsBlock {
     },
     Hopper {
         enabled: bool,
+        facing: RsDir,
     },
     Dispenser {
         triggered: bool,
+        facing: RsDir,
     },
     Dropper {
         triggered: bool,
+        facing: RsDir,
     },
 }
 
@@ -293,8 +388,8 @@ impl RsBlock {
 
     fn with_triggered(self, triggered: bool) -> Self {
         match self {
-            Self::Dispenser { .. } => Self::Dispenser { triggered },
-            Self::Dropper { .. } => Self::Dropper { triggered },
+            Self::Dispenser { facing, .. } => Self::Dispenser { triggered, facing },
+            Self::Dropper { facing, .. } => Self::Dropper { triggered, facing },
             _ => self,
         }
     }
@@ -308,6 +403,8 @@ impl RsBlock {
                 | Self::Repeater(_)
                 | Self::Comparator(_)
                 | Self::RedstoneBlock
+                | Self::Lever { .. }
+                | Self::Button { .. }
                 | Self::Source { .. }
         )
     }
@@ -315,6 +412,7 @@ impl RsBlock {
     fn weak_signal(self, toward: RsDir) -> u8 {
         match self {
             Self::RedstoneBlock => 15,
+            Self::Lever { powered: true, .. } | Self::Button { powered: true, .. } => 15,
             Self::Source { weak, strong } => weak.max(strong).min(15),
             Self::Wire(wire) => wire.signal(toward),
             Self::Torch(torch) if torch.lit && toward != RsDir::Down => 15,
@@ -329,12 +427,183 @@ impl RsBlock {
 
     fn direct_signal(self, toward: RsDir) -> u8 {
         match self {
+            Self::RedstoneBlock => 15,
             Self::Source { strong, .. } => strong.min(15),
+            Self::Lever { face, facing, powered: true }
+            | Self::Button { face, facing, powered: true, .. }
+                if toward == face.attachment(facing) => 15,
             Self::Wire(_) | Self::Repeater(_) | Self::Comparator(_) => self.weak_signal(toward),
             Self::Torch(_) | Self::WallTorch(_) if toward == RsDir::Up => self.weak_signal(toward),
             _ => 0,
         }
     }
+}
+
+// The registry stores the canonical state properties. Keep comparator output separate:
+// its analog value lives in a block entity and cannot be recovered from a state ID.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_block_from_state(reg: &BReg, state: u32) -> RsBlock {
+    let read = |key: &str| reg.get_prop(state, key);
+    let facing = || read("facing").and_then(|v| RsDir::from_property(&v));
+    let powered = || read("powered").as_deref() == Some("true");
+    let block = (|| -> Option<RsBlock> { match reg.name_of(state) {
+        "minecraft:air" if reg.is_air(state) => Some(RsBlock::Air),
+        "minecraft:redstone_wire" => Some(RsBlock::Wire(RedStoneWireBlock {
+            power: read("power")?.parse().ok()?,
+            connections: RsDir::HORIZONTAL.map(|dir| {
+                read(dir.property()).and_then(|v| RsWireConnection::from_property(&v))
+            }).into_iter().collect::<Option<Vec<_>>>()?.try_into().ok()?,
+        })),
+        "minecraft:redstone_torch" => Some(RsBlock::Torch(RedstoneTorchBlock {
+            lit: read("lit")?.as_str() == "true",
+        })),
+        "minecraft:redstone_wall_torch" => Some(RsBlock::WallTorch(RedstoneWallTorchBlock {
+            facing: facing()?,
+            lit: read("lit")?.as_str() == "true",
+        })),
+        "minecraft:repeater" => Some(RsBlock::Repeater(RepeaterBlock {
+            facing: facing()?,
+            delay: read("delay")?.parse().ok()?,
+            powered: powered(),
+            locked: read("locked")?.as_str() == "true",
+        })),
+        "minecraft:comparator" => {
+            let is_powered = powered();
+            Some(RsBlock::Comparator(ComparatorBlock {
+                facing: facing()?,
+                mode: match read("mode")?.as_str() {
+                    "compare" => RsComparatorMode::Compare,
+                    "subtract" => RsComparatorMode::Subtract,
+                    _ => return None,
+                },
+                powered: is_powered,
+                output: if is_powered { 15 } else { 0 },
+            }))
+        }
+        "minecraft:redstone_block" => Some(RsBlock::RedstoneBlock),
+        "minecraft:lever" | "minecraft:stone_button" | "minecraft:oak_button" => {
+            let face = read("face").and_then(|v| RsMountFace::from_property(&v))?;
+            let dir = facing()?;
+            let is_powered = powered();
+            Some(match reg.name_of(state) {
+                "minecraft:lever" => RsBlock::Lever { face, facing: dir, powered: is_powered },
+                "minecraft:stone_button" => RsBlock::Button {
+                    kind: RsButtonKind::Stone, face, facing: dir, powered: is_powered,
+                },
+                _ => RsBlock::Button {
+                    kind: RsButtonKind::Oak, face, facing: dir, powered: is_powered,
+                },
+            })
+        }
+        "minecraft:redstone_lamp" => Some(RsBlock::Lamp {
+            lit: read("lit")?.as_str() == "true",
+        }),
+        "minecraft:hopper" => Some(RsBlock::Hopper {
+            enabled: read("enabled")?.as_str() == "true",
+            facing: facing()?,
+        }),
+        "minecraft:piston" | "minecraft:sticky_piston" => Some(RsBlock::Piston {
+            sticky: reg.name_of(state) == "minecraft:sticky_piston",
+            facing: facing()?,
+            extended: read("extended")?.as_str() == "true",
+        }),
+        "minecraft:dispenser" => Some(RsBlock::Dispenser {
+            facing: facing()?,
+            triggered: read("triggered")?.as_str() == "true",
+        }),
+        "minecraft:dropper" => Some(RsBlock::Dropper {
+            facing: facing()?,
+            triggered: read("triggered")?.as_str() == "true",
+        }),
+        _ => None,
+    } })();
+    block.unwrap_or(RsBlock::RegistryState(state))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn state_from_rs_block(reg: &BReg, block: &RsBlock) -> Option<u32> {
+    let mut properties = Vec::<(String, String)>::new();
+    let mut prop = |key: &str, value: String| properties.push((key.into(), value));
+    let name = match *block {
+        RsBlock::Air => "minecraft:air",
+        RsBlock::Solid => "minecraft:stone",
+        RsBlock::Glass => "minecraft:glass",
+        RsBlock::RegistryState(state) => return reg.properties_of(state).map(|_| state),
+        RsBlock::Container(_) | RsBlock::Source { .. } => return None,
+        RsBlock::RedstoneBlock => "minecraft:redstone_block",
+        RsBlock::Wire(wire) => {
+            prop("power", wire.power.to_string());
+            for (dir, connection) in RsDir::HORIZONTAL.into_iter().zip(wire.connections) {
+                prop(dir.property(), connection.property().into());
+            }
+            "minecraft:redstone_wire"
+        }
+        RsBlock::Torch(torch) => {
+            prop("lit", torch.lit.to_string());
+            "minecraft:redstone_torch"
+        }
+        RsBlock::WallTorch(torch) => {
+            prop("facing", torch.facing.property().into());
+            prop("lit", torch.lit.to_string());
+            "minecraft:redstone_wall_torch"
+        }
+        RsBlock::Repeater(repeater) => {
+            prop("facing", repeater.facing.property().into());
+            prop("delay", repeater.delay.to_string());
+            prop("powered", repeater.powered.to_string());
+            prop("locked", repeater.locked.to_string());
+            "minecraft:repeater"
+        }
+        RsBlock::Comparator(comparator) => {
+            prop("facing", comparator.facing.property().into());
+            prop("mode", match comparator.mode {
+                RsComparatorMode::Compare => "compare",
+                RsComparatorMode::Subtract => "subtract",
+            }.into());
+            prop("powered", comparator.powered.to_string());
+            "minecraft:comparator"
+        }
+        RsBlock::Lever { face, facing, powered } => {
+            prop("face", face.property().into());
+            prop("facing", facing.property().into());
+            prop("powered", powered.to_string());
+            "minecraft:lever"
+        }
+        RsBlock::Button { kind, face, facing, powered } => {
+            prop("face", face.property().into());
+            prop("facing", facing.property().into());
+            prop("powered", powered.to_string());
+            match kind {
+                RsButtonKind::Stone => "minecraft:stone_button",
+                RsButtonKind::Oak => "minecraft:oak_button",
+            }
+        }
+        RsBlock::Piston { sticky, facing, extended } => {
+            prop("facing", facing.property().into());
+            prop("extended", extended.to_string());
+            if sticky { "minecraft:sticky_piston" } else { "minecraft:piston" }
+        }
+        RsBlock::Lamp { lit } => {
+            prop("lit", lit.to_string());
+            "minecraft:redstone_lamp"
+        }
+        RsBlock::Hopper { enabled, facing } => {
+            prop("enabled", enabled.to_string());
+            prop("facing", facing.property().into());
+            "minecraft:hopper"
+        }
+        RsBlock::Dispenser { triggered, facing } => {
+            prop("triggered", triggered.to_string());
+            prop("facing", facing.property().into());
+            "minecraft:dispenser"
+        }
+        RsBlock::Dropper { triggered, facing } => {
+            prop("triggered", triggered.to_string());
+            prop("facing", facing.property().into());
+            "minecraft:dropper"
+        }
+    };
+    reg.checked_state(name, &properties)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -759,10 +1028,11 @@ impl RedstoneSimGrid {
                     lit: lit || powered,
                 }
             }
-            RsBlock::Hopper { .. } => RsBlock::Hopper {
+            RsBlock::Hopper { facing, .. } => RsBlock::Hopper {
                 enabled: rs_neighbor_signal(self, pos, true) == 0,
+                facing,
             },
-            RsBlock::Dispenser { triggered } | RsBlock::Dropper { triggered } => {
+            RsBlock::Dispenser { triggered, .. } | RsBlock::Dropper { triggered, .. } => {
                 let powered = rs_dispenser_input(self, pos);
                 if !triggered && powered {
                     self.schedule(pos, 4, RsTickPriority::Normal);
@@ -815,6 +1085,7 @@ impl RedstoneSimGrid {
             }
             RsBlock::Comparator(mut comparator) => {
                 comparator.output = comparator.evaluate(self, pos);
+                comparator.powered = comparator.output > 0;
                 RsBlock::Comparator(comparator)
             }
             RsBlock::Lamp { lit: true } if rs_neighbor_signal(self, pos, true) == 0 => {
@@ -832,11 +1103,429 @@ impl RedstoneSimGrid {
     }
 }
 
+/// A delayed Redstone transition. The caller owns the pending queue across world ticks.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScheduledRsUpdate {
+    position: (i32, i32, i32),
+    due_tick: u64,
+    priority: RsTickPriority,
+}
+
+/// A read-through view of live 1.21.1 state IDs, with batched changes. Reads see
+/// pending writes, so wire propagation can settle before the world is notified.
+#[cfg_attr(not(test), allow(dead_code))]
+struct BRegRedstoneWorld<'a, GetState> {
+    reg: &'a BReg,
+    get_state: GetState,
+    changes: BTreeMap<RsPos, u32>,
+    now_tick: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<GetState: Fn((i32, i32, i32)) -> u32> BRegRedstoneWorld<'_, GetState> {
+    fn state(&self, pos: RsPos) -> u32 {
+        self.changes.get(&pos).copied().unwrap_or_else(|| {
+            (self.get_state)((pos.0, pos.1, pos.2))
+        })
+    }
+
+    fn change(&mut self, pos: RsPos, block: RsBlock) {
+        let Some(state) = state_from_rs_block(self.reg, &block) else { return };
+        let original = (self.get_state)((pos.0, pos.1, pos.2));
+        if state == original {
+            self.changes.remove(&pos);
+        } else {
+            self.changes.insert(pos, state);
+        }
+    }
+
+    fn commit(self, mut set_state: impl FnMut((i32, i32, i32), u32)) {
+        for (RsPos(x, y, z), state) in self.changes {
+            set_state((x, y, z), state);
+        }
+    }
+
+    // Follow the connected dust network in either direction, including elevation
+    // steps. A bounded seed neighborhood catches inputs through powered conductors.
+    fn wire_network(&self, origins: &[RsPos]) -> RsBTreeSet<RsPos> {
+        let mut network = RsBTreeSet::new();
+        let mut queue = VecDeque::new();
+        for &origin in origins {
+            for dx in -2..=2 {
+                for dy in -2..=2 {
+                    for dz in -2..=2 {
+                        let pos = RsPos(origin.0 + dx, origin.1 + dy, origin.2 + dz);
+                        if matches!(self.redstone_block(pos), RsBlock::Wire(_))
+                            && network.insert(pos)
+                        {
+                            queue.push_back(pos);
+                        }
+                    }
+                }
+            }
+        }
+        while let Some(pos) = queue.pop_front() {
+            let inputs: RsBTreeSet<_> = rs_wire_inputs(self, pos).collect();
+            for dir in RsDir::HORIZONTAL {
+                let side = pos.relative(dir);
+                for dy in -1..=1 {
+                    let neighbor = RsPos(side.0, side.1 + dy, side.2);
+                    if !matches!(self.redstone_block(neighbor), RsBlock::Wire(_))
+                        || network.contains(&neighbor)
+                    {
+                        continue;
+                    }
+                    if (inputs.contains(&neighbor)
+                        || rs_wire_inputs(self, neighbor).any(|input| input == pos))
+                        && network.insert(neighbor)
+                    {
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+        network
+    }
+
+    fn settle_wires(&mut self, network: &RsBTreeSet<RsPos>) {
+        let mut wires = BTreeMap::new();
+        for &pos in network {
+            let RsBlock::Wire(mut wire) = self.redstone_block(pos) else { continue };
+            wire.power = 0;
+            self.change(pos, RsBlock::Wire(wire));
+            wires.insert(pos, wire);
+        }
+
+        let mut downstream: BTreeMap<RsPos, Vec<RsPos>> = BTreeMap::new();
+        let mut queue = VecDeque::new();
+        for (&pos, wire) in &mut wires {
+            wire.connections = wire.with_connections(self, pos).connections;
+            wire.power = rs_neighbor_signal(self, pos, false);
+            if wire.power > 1 {
+                queue.push_back(pos);
+            }
+            for input in rs_wire_inputs(self, pos) {
+                if network.contains(&input) {
+                    downstream.entry(input).or_default().push(pos);
+                }
+            }
+        }
+        while let Some(pos) = queue.pop_front() {
+            let power = wires[&pos].power.saturating_sub(1);
+            if let Some(receivers) = downstream.get(&pos) {
+                for receiver in receivers {
+                    let wire = wires.get_mut(receiver).expect("registered wire input");
+                    if wire.power < power {
+                        wire.power = power;
+                        if power > 1 {
+                            queue.push_back(*receiver);
+                        }
+                    }
+                }
+            }
+        }
+        for (pos, wire) in wires {
+            self.change(pos, RsBlock::Wire(wire));
+        }
+    }
+
+    fn propagate(&mut self, origins: &[RsPos]) -> Vec<ScheduledRsUpdate> {
+        let network = self.wire_network(origins);
+        self.settle_wires(&network);
+        let mut inspect = RsBTreeSet::new();
+        for &origin in origins.iter().chain(network.iter()) {
+            for dx in -2..=2 {
+                for dy in -2..=2 {
+                    for dz in -2..=2 {
+                        inspect.insert(RsPos(origin.0 + dx, origin.1 + dy, origin.2 + dz));
+                    }
+                }
+            }
+        }
+
+        let mut scheduled = BTreeMap::<RsPos, (u64, RsTickPriority)>::new();
+        let now_tick = self.now_tick;
+        let mut schedule = |pos: RsPos, delay: u64, priority: RsTickPriority| {
+            scheduled.entry(pos).or_insert((now_tick.saturating_add(delay), priority));
+        };
+        for pos in inspect {
+            let block = self.redstone_block(pos);
+            if let Some((attachment, lit)) = block.torch_attachment() {
+                let powered = rs_signal_from(self, pos.relative(attachment), attachment.opposite(), true) != 0;
+                if lit == powered {
+                    schedule(pos, RsTorchHistory::DELAY, RsTickPriority::Normal);
+                }
+                continue;
+            }
+            match block {
+                RsBlock::Repeater(mut repeater) => {
+                    repeater.locked = repeater.is_locked(self, pos);
+                    if !repeater.locked
+                        && repeater.powered != (rs_diode_rear_input(self, pos, repeater.facing) > 0)
+                    {
+                        let priority = if self.redstone_block(pos.relative(repeater.facing))
+                            .diode_facing().is_some_and(|facing| facing != repeater.facing.opposite())
+                        {
+                            RsTickPriority::ExtremelyHigh
+                        } else if repeater.powered {
+                            RsTickPriority::VeryHigh
+                        } else {
+                            RsTickPriority::High
+                        };
+                        schedule(pos, repeater.delay_ticks(), priority);
+                    }
+                    self.change(pos, RsBlock::Repeater(repeater));
+                }
+                RsBlock::Comparator(comparator) => {
+                    if (comparator.evaluate(self, pos) > 0) != comparator.powered {
+                        schedule(pos, ComparatorBlock::DELAY_TICKS, RsTickPriority::Normal);
+                    }
+                }
+                RsBlock::Lamp { lit } => {
+                    let powered = rs_neighbor_signal(self, pos, true) != 0;
+                    if lit && !powered {
+                        schedule(pos, 4, RsTickPriority::Normal);
+                    } else if powered && !lit {
+                        self.change(pos, RsBlock::Lamp { lit: true });
+                    }
+                }
+                RsBlock::Hopper { facing, .. } => {
+                    let enabled = rs_neighbor_signal(self, pos, true) == 0;
+                    self.change(pos, RsBlock::Hopper {
+                        enabled, facing,
+                    });
+                }
+                RsBlock::Dispenser { triggered, .. } | RsBlock::Dropper { triggered, .. } => {
+                    let powered = rs_dispenser_input(self, pos);
+                    if powered && !triggered {
+                        schedule(pos, 4, RsTickPriority::Normal);
+                    }
+                    self.change(pos, block.with_triggered(powered));
+                }
+                _ => {}
+            }
+        }
+        scheduled.into_iter().map(|(pos, (due_tick, priority))| ScheduledRsUpdate {
+            position: (pos.0, pos.1, pos.2), due_tick, priority,
+        }).collect()
+    }
+}
+
+impl<GetState: Fn((i32, i32, i32)) -> u32> RedstoneWorld for BRegRedstoneWorld<'_, GetState> {
+    fn redstone_block(&self, pos: RsPos) -> RsBlock {
+        rs_block_from_state(self.reg, self.state(pos))
+    }
+
+    fn is_redstone_conductor(&self, pos: RsPos) -> bool {
+        self.reg.is_redstone_conductor(self.state(pos))
+    }
+
+    fn is_face_sturdy(&self, pos: RsPos, face: RsDir) -> bool {
+        let direction = RsDir::ALL.iter().position(|&dir| dir == face).expect("native direction") as u8;
+        self.reg.is_face_sturdy(self.state(pos), direction, crate::block_registry::Support::Full)
+    }
+}
+
+/// Propagate changes from block-state origins and return the delayed transitions
+/// to enqueue in the host tick scheduler. The reader must include the newly
+/// placed state at each origin. All writes are committed after signal evaluation.
+#[cfg_attr(not(test), allow(dead_code))]
+fn redstone_propagate_states(
+    reg: &BReg,
+    now_tick: u64,
+    origins: &[(i32, i32, i32)],
+    get_state: impl Fn((i32, i32, i32)) -> u32,
+    set_state: impl FnMut((i32, i32, i32), u32),
+) -> Vec<ScheduledRsUpdate> {
+    let mut world = BRegRedstoneWorld { reg, get_state, changes: BTreeMap::new(), now_tick };
+    let positions: Vec<_> = origins.iter().map(|&(x, y, z)| RsPos(x, y, z)).collect();
+    let updates = world.propagate(&positions);
+    world.commit(set_state);
+    updates
+}
+
+/// Apply due host-scheduled transitions and propagate their new block states.
+/// Future entries are returned alongside newly scheduled transitions. The host
+/// must retain this queue between calls, including pending dispenser/dropper events.
+#[cfg_attr(not(test), allow(dead_code))]
+fn redstone_apply_scheduled_states(
+    reg: &BReg,
+    now_tick: u64,
+    updates: &[ScheduledRsUpdate],
+    get_state: impl Fn((i32, i32, i32)) -> u32,
+    set_state: impl FnMut((i32, i32, i32), u32),
+) -> Vec<ScheduledRsUpdate> {
+    let mut world = BRegRedstoneWorld { reg, get_state, changes: BTreeMap::new(), now_tick };
+    let mut pending = Vec::new();
+    let mut due: Vec<_> = updates.iter().copied().filter(|tick| tick.due_tick <= now_tick).collect();
+    due.sort_by_key(|tick| (tick.due_tick, tick.priority, tick.position));
+    let mut changed = Vec::new();
+    for tick in due {
+        let (x, y, z) = tick.position;
+        let pos = RsPos(x, y, z);
+        let block = world.redstone_block(pos);
+        let updated = if let Some((attachment, _)) = block.torch_attachment() {
+            let powered = rs_signal_from(&world, pos.relative(attachment), attachment.opposite(), true) > 0;
+            block.with_torch_lit(!powered)
+        } else {
+            match block {
+                RsBlock::Repeater(mut repeater) if !repeater.is_locked(&world, pos) => {
+                    let input = rs_diode_rear_input(&world, pos, repeater.facing) > 0;
+                    repeater.powered = !repeater.powered || input;
+                    RsBlock::Repeater(repeater)
+                }
+                RsBlock::Comparator(mut comparator) => {
+                    comparator.output = comparator.evaluate(&world, pos);
+                    comparator.powered = comparator.output > 0;
+                    RsBlock::Comparator(comparator)
+                }
+                RsBlock::Lamp { lit: true } if rs_neighbor_signal(&world, pos, true) == 0 => {
+                    RsBlock::Lamp { lit: false }
+                }
+                _ => block,
+            }
+        };
+        if updated != block {
+            world.change(pos, updated);
+            changed.push(pos);
+        }
+    }
+    pending.extend(updates.iter().copied().filter(|tick| tick.due_tick > now_tick));
+    pending.extend(world.propagate(&changed));
+    pending.sort_by_key(|tick| (tick.due_tick, tick.priority, tick.position));
+    pending.dedup_by_key(|tick| (tick.position, tick.due_tick));
+    world.commit(set_state);
+    pending
+}
+
 #[cfg(test)]
 mod redstone_tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
 
     const ORIGIN: RsPos = RsPos(0, 0, 0);
+
+    fn registered(reg: &BReg, name: &str, properties: &[(&str, &str)]) -> u32 {
+        let properties = properties.iter().map(|&(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        reg.checked_state(name, &properties)
+            .unwrap_or_else(|| panic!("missing 1.21.1 state {name} {properties:?}"))
+    }
+
+    #[test]
+    fn registry_codec_round_trips_every_supported_1211_state() {
+        let reg = crate::block_registry::breg().expect("1.21.1 block registry");
+        let names = [
+            "minecraft:redstone_wire", "minecraft:redstone_torch", "minecraft:redstone_wall_torch",
+            "minecraft:repeater", "minecraft:comparator", "minecraft:redstone_block",
+            "minecraft:lever", "minecraft:stone_button", "minecraft:oak_button",
+            "minecraft:redstone_lamp", "minecraft:hopper", "minecraft:piston",
+            "minecraft:sticky_piston", "minecraft:dispenser", "minecraft:dropper",
+        ];
+        let mut counts = [0usize; 15];
+        for raw in 0..reg.state_count() {
+            let state = raw as u32;
+            let Some(index) = names.iter().position(|&name| name == reg.name_of(state)) else {
+                continue;
+            };
+            let block = rs_block_from_state(reg, state);
+            assert!(!matches!(block, RsBlock::RegistryState(_)),
+                "{state} {} failed to decode", reg.name_of(state));
+            assert_eq!(state_from_rs_block(reg, &block), Some(state),
+                "{state} {} {:?}", reg.name_of(state), reg.properties_of(state));
+            counts[index] += 1;
+        }
+        assert!(counts.iter().all(|&count| count != 0), "missing registry types: {counts:?}");
+        assert_eq!(counts[0], 16 * 3usize.pow(4), "wire power and connection states");
+
+        let arbitrary = registered(reg, "minecraft:oak_slab", &[("type", "top")]);
+        assert_eq!(rs_block_from_state(reg, arbitrary), RsBlock::RegistryState(arbitrary));
+        assert_eq!(state_from_rs_block(reg, &RsBlock::RegistryState(arbitrary)), Some(arbitrary));
+        assert_eq!(state_from_rs_block(reg, &RsBlock::RegistryState(u32::MAX)), None);
+        assert_eq!(state_from_rs_block(reg, &RsBlock::Wire(RedStoneWireBlock {
+            power: 16, ..RedStoneWireBlock::default()
+        })), None);
+    }
+
+    #[test]
+    fn registry_conductor_and_support_use_native_state_flags() {
+        let reg = crate::block_registry::breg().expect("1.21.1 block registry");
+        let stone = registered(reg, "minecraft:stone", &[]);
+        let glass = registered(reg, "minecraft:glass", &[]);
+        let air = registered(reg, "minecraft:air", &[]);
+        let slab = registered(reg, "minecraft:oak_slab", &[("type", "bottom")]);
+        let states = HashMap::from([((0, 0, 0), stone), ((1, 0, 0), glass),
+            ((2, 0, 0), air), ((3, 0, 0), slab)]);
+        let world = BRegRedstoneWorld {
+            reg, get_state: |pos| *states.get(&pos).unwrap_or(&air),
+            changes: BTreeMap::new(), now_tick: 0,
+        };
+        assert!(world.is_redstone_conductor(RsPos(0, 0, 0)));
+        for x in 1..=3 {
+            assert!(!world.is_redstone_conductor(RsPos(x, 0, 0)), "x={x}");
+        }
+        assert!(world.is_face_sturdy(RsPos(0, 0, 0), RsDir::Up));
+        assert!(world.is_face_sturdy(RsPos(1, 0, 0), RsDir::Up));
+        assert!(!world.is_face_sturdy(RsPos(2, 0, 0), RsDir::Up));
+    }
+
+    #[test]
+    fn registry_states_drive_torch_wire_repeater_lamp_circuit() {
+        let reg = crate::block_registry::breg().expect("1.21.1 block registry");
+        let air = registered(reg, "minecraft:air", &[]);
+        let stone = registered(reg, "minecraft:stone", &[]);
+        let torch = registered(reg, "minecraft:redstone_torch", &[("lit", "true")]);
+        let wire = registered(reg, "minecraft:redstone_wire", &[("power", "0")]);
+        let repeater = registered(reg, "minecraft:repeater", &[
+            ("facing", "east"), ("delay", "1"), ("powered", "false"),
+        ]);
+        let lamp = registered(reg, "minecraft:redstone_lamp", &[("lit", "false")]);
+        let source = registered(reg, "minecraft:redstone_block", &[]);
+        let blocks = Rc::new(RefCell::new(HashMap::from([
+            ((0, 0, 0), stone), ((1, 0, 0), stone),
+            ((0, 1, 0), torch), ((1, 1, 0), wire),
+            ((2, 1, 0), repeater), ((3, 1, 0), lamp),
+        ])));
+        let propagate = |now_tick, origins: &[(i32, i32, i32)]| {
+            let reader = Rc::clone(&blocks);
+            let writer = Rc::clone(&blocks);
+            redstone_propagate_states(reg, now_tick, origins,
+                move |pos| reader.borrow().get(&pos).copied().unwrap_or(air),
+                move |pos, state| { writer.borrow_mut().insert(pos, state); })
+        };
+        let apply = |now_tick, updates: &[ScheduledRsUpdate]| {
+            let reader = Rc::clone(&blocks);
+            let writer = Rc::clone(&blocks);
+            redstone_apply_scheduled_states(reg, now_tick, updates,
+                move |pos| reader.borrow().get(&pos).copied().unwrap_or(air),
+                move |pos, state| { writer.borrow_mut().insert(pos, state); })
+        };
+        let at = |pos| blocks.borrow().get(&pos).copied().unwrap_or(air);
+
+        let updates = propagate(0, &[(0, 1, 0), (1, 1, 0), (2, 1, 0), (3, 1, 0)]);
+        assert_eq!(reg.get_prop(at((1, 1, 0)), "power").as_deref(), Some("15"));
+        assert_eq!(reg.get_prop(at((2, 1, 0)), "powered").as_deref(), Some("false"));
+        assert!(updates.iter().any(|update| update.position == (2, 1, 0) && update.due_tick == 2));
+
+        let updates = apply(2, &updates);
+        assert_eq!(reg.get_prop(at((2, 1, 0)), "powered").as_deref(), Some("true"));
+        assert_eq!(reg.get_prop(at((3, 1, 0)), "lit").as_deref(), Some("true"));
+
+        blocks.borrow_mut().insert((-1, 0, 0), source);
+        let updates = [updates, propagate(3, &[(-1, 0, 0)])].concat();
+        assert!(updates.iter().any(|update| update.position == (0, 1, 0) && update.due_tick == 5));
+        let updates = apply(5, &updates);
+        assert_eq!(reg.get_prop(at((0, 1, 0)), "lit").as_deref(), Some("false"));
+        assert_eq!(reg.get_prop(at((1, 1, 0)), "power").as_deref(), Some("0"));
+        let updates = apply(7, &updates);
+        assert_eq!(reg.get_prop(at((2, 1, 0)), "powered").as_deref(), Some("false"));
+        assert_eq!(reg.get_prop(at((3, 1, 0)), "lit").as_deref(), Some("true"));
+        let _updates = apply(11, &updates);
+        assert_eq!(reg.get_prop(at((3, 1, 0)), "lit").as_deref(), Some("false"));
+    }
 
     fn wire() -> RsBlock {
         RsBlock::Wire(RedStoneWireBlock::default())
@@ -869,6 +1558,7 @@ mod redstone_tests {
         RsBlock::Comparator(ComparatorBlock {
             facing,
             mode,
+            powered: output > 0,
             output,
         })
     }
@@ -1367,22 +2057,22 @@ mod redstone_tests {
         let dropper = RsPos(2, 0, 0);
         let qc = RsPos(1, 1, 0);
         let hopper_input = RsPos(0, 0, 2);
-        grid.set_block(ORIGIN, RsBlock::Dispenser { triggered: false });
-        grid.set_block(dropper, RsBlock::Dropper { triggered: false });
-        grid.set_block(hopper, RsBlock::Hopper { enabled: true });
+        grid.set_block(ORIGIN, RsBlock::Dispenser { triggered: false, facing: RsDir::North });
+        grid.set_block(dropper, RsBlock::Dropper { triggered: false, facing: RsDir::North });
+        grid.set_block(hopper, RsBlock::Hopper { enabled: true, facing: RsDir::Down });
         grid.set_block(qc, RsBlock::RedstoneBlock);
         grid.set_block(hopper_input, RsBlock::RedstoneBlock);
         assert_eq!(
             grid.redstone_block(ORIGIN),
-            RsBlock::Dispenser { triggered: true }
+            RsBlock::Dispenser { triggered: true, facing: RsDir::North }
         );
         assert_eq!(
             grid.redstone_block(dropper),
-            RsBlock::Dropper { triggered: true }
+            RsBlock::Dropper { triggered: true, facing: RsDir::North }
         );
         assert_eq!(
             grid.redstone_block(hopper),
-            RsBlock::Hopper { enabled: false }
+            RsBlock::Hopper { enabled: false, facing: RsDir::Down }
         );
         grid.advance(3);
         assert!(grid.take_dispense_events().is_empty());
@@ -1395,11 +2085,11 @@ mod redstone_tests {
         grid.set_block(hopper_input, RsBlock::Air);
         assert_eq!(
             grid.redstone_block(hopper),
-            RsBlock::Hopper { enabled: true }
+            RsBlock::Hopper { enabled: true, facing: RsDir::Down }
         );
         assert_eq!(
             grid.redstone_block(ORIGIN),
-            RsBlock::Dispenser { triggered: false }
+            RsBlock::Dispenser { triggered: false, facing: RsDir::North }
         );
         grid.set_block(qc, RsBlock::RedstoneBlock);
         grid.set_block(qc, RsBlock::Air);
@@ -1416,7 +2106,7 @@ mod redstone_tests {
         let third = RsPos(3, 0, 0);
         let removed = RsPos(4, 0, 0);
         for pos in [later, second, first, third, removed] {
-            grid.set_block(pos, RsBlock::Dispenser { triggered: false });
+            grid.set_block(pos, RsBlock::Dispenser { triggered: false, facing: RsDir::North });
         }
         grid.schedule(later, 3, RsTickPriority::ExtremelyHigh);
         grid.schedule(second, 2, RsTickPriority::Normal);
@@ -1424,7 +2114,7 @@ mod redstone_tests {
         grid.schedule(first, 2, RsTickPriority::High);
         grid.schedule(third, 2, RsTickPriority::Normal);
         grid.set_block(removed, RsBlock::Air);
-        grid.set_block(removed, RsBlock::Dispenser { triggered: false });
+        grid.set_block(removed, RsBlock::Dispenser { triggered: false, facing: RsDir::North });
         grid.advance(3);
         assert_eq!(grid.take_dispense_events(), [first, second, third, later]);
     }
