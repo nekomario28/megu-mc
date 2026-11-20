@@ -5988,13 +5988,13 @@ impl Gen {
                 Some(bands[((c.y + off).rem_euclid(192)) as usize])
             }
             Rule::Seq(v) => {
-                // The sequence's index slice is copied out of `self.rules` once per visit:
-                // the loop below recurses with `&mut self`, so it cannot hold a borrow of
-                // `self.rules` across a step. Iterating the local copy visits the same
-                // elements in the same order as the old re-index loop (`self.rules[rid]`
-                // again on every step) and returns the same first `Some`.
-                let subs: Box<[usize]> = (*v).clone();
-                for &sub in subs.iter() {
+                let len = v.len();
+                for i in 0..len {
+                    // Release the rules borrow before recursive evaluation.
+                    let Rule::Seq(seq) = &self.rules[rid] else {
+                        unreachable!();
+                    };
+                    let sub = seq[i];
                     if let Some(st) = self.eval_rule(sub, c, heightmap) {
                         return Some(st);
                     }
@@ -10753,6 +10753,53 @@ pub(crate) fn lock_gen_for_tests() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod wg_tests {
     use super::*;
+
+    #[test]
+    fn rule_seq_preserves_order_fallback_and_nested_conditions() {
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let false_cond = g.conds.len();
+        g.conds.push(Cond::False);
+        let hole_cond = g.conds.len();
+        g.conds.push(Cond::Hole);
+        let prelim_cond = g.conds.len();
+        g.conds.push(Cond::Prelim);
+
+        let first = g.rules.len();
+        g.rules.push(Rule::Block(11));
+        let second = g.rules.len();
+        g.rules.push(Rule::Block(22));
+        let fallback = g.rules.len();
+        g.rules.push(Rule::Block(33));
+        let never = g.rules.len();
+        g.rules.push(Rule::Cond(false_cond, first));
+        let maybe = g.rules.len();
+        g.rules.push(Rule::Cond(hole_cond, second));
+        let inner = g.rules.len();
+        g.rules.push(Rule::Seq(vec![never, maybe].into_boxed_slice()));
+        let guarded = g.rules.len();
+        g.rules.push(Rule::Cond(prelim_cond, inner));
+        let outer = g.rules.len();
+        g.rules.push(Rule::Seq(vec![guarded, fallback].into_boxed_slice()));
+        let direct = g.rules.len();
+        g.rules.push(Rule::Seq(vec![first, second].into_boxed_slice()));
+        let empty = g.rules.len();
+        g.rules.push(Rule::Seq(Box::new([])));
+
+        let mut c = SC::new();
+        c.y = 64;
+        c.est_min = 0;
+        let heightmap = [0i16; 256];
+        assert_eq!(g.eval_rule(direct, &mut c, &heightmap), Some(11));
+        assert_eq!(g.eval_rule(outer, &mut c, &heightmap), Some(22));
+        c.run_depth = 1;
+        assert_eq!(g.eval_rule(outer, &mut c, &heightmap), Some(33));
+        c.run_depth = 0;
+        c.est_min = 100;
+        assert_eq!(g.eval_rule(outer, &mut c, &heightmap), Some(33));
+        assert_eq!(g.eval_rule(inner, &mut c, &heightmap), Some(22));
+        assert_eq!(g.eval_rule(never, &mut c, &heightmap), None);
+        assert_eq!(g.eval_rule(empty, &mut c, &heightmap), None);
+    }
 
     #[test]
     fn datapack_resources_respect_priority_and_confine_id_paths() {

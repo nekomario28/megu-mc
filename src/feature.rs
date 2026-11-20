@@ -2691,7 +2691,7 @@ fn gen_basalt_columns(
     reach_ip: &IP,
 ) {
     let Some(reg) = breg() else { return };
-    let sea = crate::worldgen::sea_level();
+    let sea = ctx.g.sea;
     // the guard is the *mutable* overload: air (or ocean lava) here and a buildable block below
     if !bc_can_start(ctx, reg, sea, pos) {
         return;
@@ -2836,6 +2836,39 @@ fn bc_find_air(
         m.1 += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod basalt_sea_tests {
+    use super::*;
+
+    #[test]
+    fn basalt_columns_use_the_generators_sea_level() {
+        let reg = breg().expect("block registry");
+        let lava = reg.state_of("minecraft:lava", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        let basalt = reg.state_of("minecraft:basalt", None);
+
+        let placed = |sea, y| {
+            let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+            g.sea = sea;
+            let mut ctx = FC::new(&mut g);
+            ctx.test_default_air = true;
+            for x in 0..=16 {
+                for z in 0..=16 {
+                    ctx.set(x, y - 1, z, stone);
+                    ctx.set(x, y, z, lava);
+                }
+            }
+            let mut rng = Xor::seed_worldgen(42);
+            gen_basalt_columns(&mut ctx, &mut rng, (8, y, 8), &IP::Const(4), &IP::Const(1));
+            ctx.wr.values().filter(|&&st| st == basalt).count()
+        };
+
+        assert_eq!(placed(31, 40), 0, "lava above Nether sea must reject columns");
+        assert!(placed(31, 28) > 0, "lava below Nether sea must admit columns");
+        assert!(placed(45, 40) > 0, "the generator's sea level controls lava");
+    }
 }
 
 /// `SculkPatchConfiguration` (`eez`).
@@ -8801,34 +8834,48 @@ fn origin_carvers(g: &mut Gen, ox: i32, oz: i32) -> OriginCarvers {
     })
 }
 
-/// A rectangular grid of resolved origin-carver lists over
-/// `[ox0..ox0+w) x [oz0..oz0+h)`, shared read-only by every carve worker so each origin is
-/// sampled once per batch instead of `jobs` times. All its contents borrow from `creg()` (and
-/// are `Send + Sync`), so no lock is needed to read a cell.
+/// Resolved origin-carver lists shared read-only by every carve worker. Contiguous batches
+/// use a flat rectangle; distant batches keep only origins within reach of a claim.
+/// All values borrow from `creg()` and are `Send + Sync`.
 struct OriginGrid {
     ox0: i32,
     oz0: i32,
     w: usize,
     h: usize,
     cells: Vec<OriginCarvers>,
+    sparse: Option<HashMap<(i32, i32), OriginCarvers>>,
 }
 
 impl OriginGrid {
     /// The union bounding box of the claims plus each carver's `+/-8` origin reach.
     fn new(order: &[(i32, i32)]) -> Self {
+        if order.is_empty() {
+            return Self {
+                ox0: 0,
+                oz0: 0,
+                w: 0,
+                h: 0,
+                cells: Vec::new(),
+                sparse: None,
+            };
+        }
         let min_tx = order.iter().map(|p| p.0).min().unwrap_or(0);
         let max_tx = order.iter().map(|p| p.0).max().unwrap_or(0);
         let min_tz = order.iter().map(|p| p.1).min().unwrap_or(0);
         let max_tz = order.iter().map(|p| p.1).max().unwrap_or(0);
         let (ox0, oz0) = (min_tx - 8, min_tz - 8);
-        let w = (max_tx - min_tx + 17) as usize;
-        let h = (max_tz - min_tz + 17) as usize;
+        let w = (i64::from(max_tx) - i64::from(min_tx) + 17) as usize;
+        let h = (i64::from(max_tz) - i64::from(min_tz) + 17) as usize;
+        let sparse = order.len() > 1
+            && (w as u64).saturating_mul(h as u64)
+                > (order.len() as u64).saturating_mul(289 * 2);
         Self {
             ox0,
             oz0,
             w,
             h,
-            cells: vec![None; w * h],
+            cells: if sparse { Vec::new() } else { vec![None; w * h] },
+            sparse: sparse.then(HashMap::new),
         }
     }
     #[inline]
@@ -8839,10 +8886,17 @@ impl OriginGrid {
     }
     #[inline]
     fn get(&self, ox: i32, oz: i32) -> OriginCarvers {
+        if let Some(sparse) = &self.sparse {
+            return sparse.get(&(ox, oz)).copied().flatten();
+        }
         self.idx(ox, oz).map_or(None, |i| self.cells[i])
     }
     #[inline]
     fn set(&mut self, ox: i32, oz: i32, v: OriginCarvers) {
+        if let Some(sparse) = &mut self.sparse {
+            sparse.insert((ox, oz), v);
+            return;
+        }
         if let Some(i) = self.idx(ox, oz) {
             self.cells[i] = v;
         }
@@ -8853,6 +8907,9 @@ impl OriginGrid {
 /// (in parallel when there are enough of them), then record the new answers back in the cache.
 fn build_origin_grid(g: &mut Gen, claims: &[(i32, i32)], jobs: usize) -> OriginGrid {
     let mut grid = OriginGrid::new(claims);
+    if claims.is_empty() {
+        return grid;
+    }
     let ctx = (crate::worldgen::generation_seq(), g.wseed(), g.preset);
     let mut missing: Vec<(i32, i32)> = Vec::new();
     ORIGIN_CARVERS.with(|cache| {
@@ -8862,13 +8919,27 @@ fn build_origin_grid(g: &mut Gen, claims: &[(i32, i32)], jobs: usize) -> OriginG
             cache.map.clear();
             cache.order.clear();
         }
+        let is_sparse = grid.sparse.is_some();
         let (ox0, oz0, w, h) = (grid.ox0, grid.oz0, grid.w, grid.h);
-        for ix in 0..w {
-            for iz in 0..h {
-                let (ox, oz) = (ox0 + ix as i32, oz0 + iz as i32);
-                match cache.map.get(&(ox, oz)) {
-                    Some(&v) => grid.set(ox, oz, v),
-                    None => missing.push((ox, oz)),
+        let mut visit = |ox, oz| match cache.map.get(&(ox, oz)) {
+            Some(&v) => grid.set(ox, oz, v),
+            None => missing.push((ox, oz)),
+        };
+        if is_sparse {
+            let mut seen = HashSet::new();
+            for &(tx, tz) in claims {
+                for ox in tx - 8..=tx + 8 {
+                    for oz in tz - 8..=tz + 8 {
+                        if seen.insert((ox, oz)) {
+                            visit(ox, oz);
+                        }
+                    }
+                }
+            }
+        } else {
+            for ix in 0..w {
+                for iz in 0..h {
+                    visit(ox0 + ix as i32, oz0 + iz as i32);
                 }
             }
         }
@@ -11129,7 +11200,7 @@ mod mark_above_tests {
 
 #[cfg(test)]
 mod carver_parity_tests {
-    use super::{apply_carvers, carve_ring_with};
+    use super::{apply_carvers, build_origin_grid, carve_ring_with, resolve_origin, OriginGrid};
     use crate::worldgen::{lock_gen_for_tests, Gen, ChunkCols};
 
     /// Everything the carver stage hands an owner for one chunk: the block writes, both WG
@@ -11434,6 +11505,40 @@ mod carver_parity_tests {
                 x.0, x.1
             );
         }
+    }
+
+    #[test]
+    fn origin_grid_empty_and_distant_claims_are_bounded() {
+        let empty = OriginGrid::new(&[]);
+        assert_eq!((empty.w, empty.h), (0, 0));
+        assert!(empty.cells.is_empty());
+        assert!(empty.get(0, 0).is_none());
+
+        crate::test_support::require_vanilla_data();
+        let _gen = lock_gen_for_tests();
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let built_empty = build_origin_grid(&mut g, &[], 4);
+        assert!(built_empty.cells.is_empty());
+        assert!(built_empty.sparse.is_none());
+
+        let claims = [(0, 0), (10_000, 10_000)];
+        let grid = build_origin_grid(&mut g, &claims, 4);
+        assert!(grid.cells.is_empty(), "distant batches must skip the rectangle");
+        let sparse = grid.sparse.as_ref().expect("sparse origin lookup");
+        assert_eq!(sparse.len(), 2 * 17 * 17);
+        for &(tx, tz) in &claims {
+            for ox in tx - 8..=tx + 8 {
+                for oz in tz - 8..=tz + 8 {
+                    assert!(sparse.contains_key(&(ox, oz)));
+                }
+            }
+            for (ox, oz) in [(tx - 8, tz - 8), (tx, tz), (tx + 8, tz + 8)] {
+                let direct = resolve_origin(&mut g, ox, oz).map(|(name, list)| (name, list.len()));
+                let prefetched = grid.get(ox, oz).map(|(name, list)| (name, list.len()));
+                assert_eq!(prefetched, direct, "origin ({ox},{oz}) differs");
+            }
+        }
+        assert!(grid.get(5_000, 5_000).is_none());
     }
 
     /// Reusing one `CarveScratch` over consecutive chunks must not leak a written cell, a mask
