@@ -39,7 +39,7 @@ public final class ShimCheck {
     private static final Set<String> REJECTED_INJECTIONS = Set.of(
         "Redirect", "Overwrite", "ModifyVariable", "ModifyArg", "ModifyConstant", "ModifyExpressionValue",
         "WrapOperation", "ModifyReturnValue", "WrapWithCondition");
-    private static final String[] PREFIXES = {"net/minecraft/", "net/neoforged/"};
+    private static final String[] PREFIXES = {"net/minecraft/", "net/neoforged/", "com/mojang/brigadier/"};
     private static final int MAX_CLASS_BYTES = 16 * 1024 * 1024;
     private static final int MAX_METADATA_BYTES = 1024 * 1024;
 
@@ -692,7 +692,9 @@ public final class ShimCheck {
             if (!"mc-spine-neoforge-s0".equals(data.get("schema"))) throw new IOException("Unsupported surface schema");
             Map<String, Object> classes = Json.object(data.get("classes"));
             for (var entry : classes.entrySet()) {
-                if (!entry.getKey().startsWith("net/minecraft/") && !entry.getKey().startsWith("net/neoforged/")) {
+                if (!entry.getKey().startsWith("net/minecraft/")
+                    && !entry.getKey().startsWith("net/neoforged/")
+                    && !entry.getKey().startsWith("com/mojang/brigadier/")) {
                     throw new IOException("Invalid surface class: " + entry.getKey());
                 }
                 Map<String, Object> members = Json.object(entry.getValue());
