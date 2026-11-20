@@ -2039,6 +2039,7 @@ fn collect_pkt(drop_eid: i32, collector: i32, count: u8) -> Vec<u8> {
     write_varint(&mut p, count as i64);
     p
 }
+#[cfg(test)]
 fn xp_level(total: i64) -> (i32, f32) {
     let mut l = 0i32;
     let mut acc = 0i64;
@@ -2694,6 +2695,7 @@ const SNOWBALL_TTL_GT: u64 = 300; // 15s
 const BOBBER_BITE_GT: u64 = 75; // 3.75s, bobber settles before biting
 const MOB_BURN_TICK_GT: u64 = 40; // 2s, burn damage interval
 const CREEPER_IGNITE_GT: u64 = 30; // 1.5s, creeper fuse before igniting
+#[cfg(test)]
 const STARVE_GT: u64 = 80; // 4s, starvation damage interval
 const FLUID_TICK_GT: u64 = 30; // 1.5s, scheduled lava/fluid tick
                                // Per-tick probabilities, not intervals: the denominator scales WITH ticks per
@@ -3070,6 +3072,7 @@ fn keepalive_time_tick() {
     }
     __t = __prof.then(std::time::Instant::now);
     let t = TICK.fetch_add(1, Ordering::Relaxed);
+    world_border().lock().unwrap().finish_lerp(border_now_ms());
     {
         if let Some(t) = __t {
             tickprof::add("env/clock", t.elapsed());
@@ -3165,11 +3168,12 @@ fn keepalive_time_tick() {
             }
         }
     }
-    // hunger: drain by distance, regen at high food, starve at 0
+    // Player hunger and environmental damage.
     {
         let cls: Vec<Arc<Client>> = client_snapshot();
         for c in cls.iter() {
-            if *c.gm.lock().unwrap() == 1 {
+            let gm = *c.gm.lock().unwrap();
+            if matches!(gm, 1 | 3) || *c.hp.lock().unwrap() <= 0.0 {
                 continue;
             }
             let (px, py, pz, ..) = {
@@ -3226,59 +3230,18 @@ fn keepalive_time_tick() {
                     broadcast_seen(c.eid, |_c| (0x58, p.clone()));
                 }
             }
-            let mut lp = c.lastp.lock().unwrap();
-            let d = ((px - lp.0).powi(2) + (pz - lp.2).powi(2)).sqrt();
-            *lp = (px, py, pz);
-            let mut dirty = false;
-            let mut ex = c.walk_acc.lock().unwrap(); // vanilla exhaustion accumulator
-            if d < 10.0 {
-                *ex += d * if *c.sprinting.lock().unwrap() {
-                    0.1
-                } else if *c.sneaking.lock().unwrap() {
-                    0.005
-                } else {
-                    0.0
-                };
-            }
-            // hunger effect (internal id 16): +0.005/lvl per game tick
-            if let Some(e) = c.effs.lock().unwrap().iter().find(|e| e.id == 16) {
-                *ex += 0.005 * (e.amp as f64 + 1.0) * GAME_TICKS_PER_TICK as f64;
-            }
-            let food = *c.food.lock().unwrap();
+            // ServerPlayer decrements the damage cooldown on its own tick.
             {
-                // vanilla: ServerPlayer decrements invulnerableTime once per tick
-                // (LivingEntity.tick skips players, ServerPlayer.tick does not)
                 let mut invulnerable = c.invulnerable.lock().unwrap();
-                if *invulnerable > 0 {
-                    *invulnerable -= 1;
-                }
+                *invulnerable = (*invulnerable - 1).max(0);
             }
+            let exhaustion = player_movement_exhaustion(c, (px, py, pz));
             let mut h = c.hp.lock().unwrap();
-            let mh = max_hp_of(&c.name);
-            if GR_NATURAL_REGEN.load(Ordering::Relaxed) == 1 && food >= 18 && *h < mh && *h > 0.0 {
-                // vanilla: fast heal 1hp/10t while food==20&&sat>0, else 1hp/80t; +6 exh per hp
-                let fast = food >= 20 && *c.sat.lock().unwrap() > 0.0;
-                if t.is_multiple_of(server_ticks(if fast { 10 } else { 80 })) {
-                    *h = (*h + 1.0).min(mh);
-                    dirty = true;
-                    *ex += 6.0;
-                }
-            }
-            if *ex >= 4.0 {
-                *ex -= 4.0;
-                dirty = true;
-                let mut st = c.sat.lock().unwrap();
-                if *st > 0.0 {
-                    *st = (*st - 1.0).max(0.0);
-                } else {
-                    let mut f = c.food.lock().unwrap();
-                    *f = (*f - 1).max(0);
-                }
-            }
-            drop(ex);
-            if food <= 0 && *h > 1.0 && t % server_ticks(STARVE_GT) == server_ticks(STARVE_GT) / 2 {
-                *h = (*h - 1.0).max(1.0);
-                dirty = true;
+            let mut dirty = tick_player_food(c, &mut h, max_hp_of(&c.name), exhaustion, t);
+            if *h <= 0.0 {
+                drop(h);
+                totem_check(c);
+                h = c.hp.lock().unwrap();
             }
             let player_dim = *c.dim.lock().unwrap();
             let sneaking = *c.sneaking.lock().unwrap();
@@ -3441,8 +3404,11 @@ fn keepalive_time_tick() {
                 }
             }
             if dirty {
+                let health = *h;
+                drop(h);
+                let packet = health_pkt_c(health, c);
                 if let Ok(mut w) = c.sock.lock() {
-                    let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c));
+                    let _ = send_packet(&mut w, 0x5d, packet);
                 }
             }
         }
@@ -5155,18 +5121,7 @@ fn drop_tick() {
                         val -= (heal + 1) / 2;
                     }
                 }
-                let mut xp = c.xp.lock().unwrap();
-                *xp += val;
-                let total = *xp;
-                drop(xp);
-                let (lvl, bar) = xp_level(total);
-                let mut p = Vec::new();
-                p.extend_from_slice(&bar.to_be_bytes());
-                write_varint(&mut p, lvl as i64);
-                write_varint(&mut p, total);
-                if let Ok(mut w) = c.sock.lock() {
-                    let _ = send_packet(&mut w, 0x5c, p);
-                }
+                let _ = send_player_xp(c, |xp| add_player_xp_points(xp, val as i32));
                 drop(cls);
                 broadcast_seen_destroy(xeid);
             }
@@ -11451,21 +11406,26 @@ fn save_world_into(f: &mut Vec<u8>) {
                 write_varint(&mut *f, i);
             }
         }
-        // scoreboard — vanilla stores objectives under data storage
-        {
-            let sc = scores().lock().unwrap();
-            write_varint(&mut *f, sc.len() as i64);
-            for (obj, entries) in sc.iter() {
+        // Keep the legacy scoreboard layout. Both pieces describe one snapshot.
+        let (scoreboard_objectives, scoreboard_sidebar) = {
+            let board = scoreboard().lock().unwrap();
+            write_varint(&mut *f, board.objectives.len() as i64);
+            for obj in board.objectives.keys() {
                 (*f).extend_from_slice(&(obj.len() as u16).to_be_bytes());
                 (*f).extend_from_slice(obj.as_bytes());
-                write_varint(&mut *f, entries.len() as i64);
-                for (entry, val) in entries.iter() {
+                let entries = board.scores.get(obj);
+                write_varint(&mut *f, entries.map_or(0, HashMap::len) as i64);
+                for (entry, score) in entries.into_iter().flatten() {
                     (*f).extend_from_slice(&(entry.len() as u16).to_be_bytes());
                     (*f).extend_from_slice(entry.as_bytes());
-                    (*f).extend_from_slice(&val.to_be_bytes());
+                    (*f).extend_from_slice(&i64::from(score.value).to_be_bytes());
                 }
             }
-        }
+            (
+                board.objectives.values().map(|obj| (obj.name.clone(), obj.criteria)).collect::<Vec<_>>(),
+                board.display(ScoreboardDisplaySlot::Sidebar).unwrap_or_default().to_string(),
+            )
+        };
         // XP orbs are world entities too — same persistence class as drops
         {
             let xs = xps().lock().unwrap();
@@ -11638,18 +11598,17 @@ fn save_world_into(f: &mut Vec<u8>) {
                     (*f).extend_from_slice(&v.to_be_bytes());
                 }
             }
-            // scoreboard objective types + sidebar selection
-            let ot = obj_types().lock().unwrap();
-            write_varint(&mut *f, ot.len() as i64);
-            for (o, t) in ot.iter() {
-                (*f).extend_from_slice(&(o.len() as u16).to_be_bytes());
-                (*f).extend_from_slice(o.as_bytes());
-                (*f).extend_from_slice(&(t.len() as u16).to_be_bytes());
-                (*f).extend_from_slice(t.as_bytes());
+            // Legacy objective criteria and sidebar selection.
+            write_varint(&mut *f, scoreboard_objectives.len() as i64);
+            for (obj, criterion) in scoreboard_objectives {
+                let name = scoreboard_criterion_name(criterion);
+                (*f).extend_from_slice(&(obj.len() as u16).to_be_bytes());
+                (*f).extend_from_slice(obj.as_bytes());
+                (*f).extend_from_slice(&(name.len() as u16).to_be_bytes());
+                (*f).extend_from_slice(name.as_bytes());
             }
-            let sb = sidebar_obj().lock().unwrap().clone().unwrap_or_default();
-            (*f).extend_from_slice(&(sb.len() as u16).to_be_bytes());
-            (*f).extend_from_slice(sb.as_bytes());
+            (*f).extend_from_slice(&(scoreboard_sidebar.len() as u16).to_be_bytes());
+            (*f).extend_from_slice(scoreboard_sidebar.as_bytes());
         }
     }
 
@@ -12618,7 +12577,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
         }
         if p < payload.len() {
             let on = rv(payload, &mut p);
-            let mut sc = scores().lock().unwrap();
+            let mut board = scoreboard().lock().unwrap();
             for _ in 0..on {
                 if p + 2 > payload.len() {
                     break;
@@ -12645,9 +12604,18 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                     p += el;
                     let val = i64::from_be_bytes(b[p..p + 8].try_into().unwrap());
                     p += 8;
-                    entries.insert(entry, val);
+                    entries.insert(entry, ScoreboardScore {
+                        value: val.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                        trigger_enabled: false,
+                    });
                 }
-                sc.insert(obj, entries);
+                board.scores.insert(obj.clone(), entries);
+                board.objectives.insert(obj.clone(), ScoreboardObjective {
+                    display_name: obj.clone(),
+                    name: obj,
+                    criteria: ScoreboardCriteria::Dummy,
+                    render_type: ScoreboardRenderType::Integer,
+                });
             }
         }
         if p + 1 < payload.len() {
@@ -13071,7 +13039,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                 // objective types + sidebar
                 if p < payload.len() {
                     let oc = rv(payload, &mut p);
-                    let mut ot = obj_types().lock().unwrap();
+                    let mut board = scoreboard().lock().unwrap();
                     for _ in 0..oc {
                         if p + 2 > payload.len() {
                             break;
@@ -13088,15 +13056,23 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                         if p + tl > payload.len() {
                             break;
                         }
-                        ot.insert(on, String::from_utf8_lossy(&payload[p..p + tl]).to_string());
+                        let criterion = String::from_utf8_lossy(&payload[p..p + tl]);
+                        if let (Some(objective), Some(criterion)) =
+                            (board.objectives.get_mut(&on), ScoreboardCriteria::parse(&criterion))
+                        {
+                            objective.criteria = criterion;
+                            if criterion == ScoreboardCriteria::Health {
+                                objective.render_type = ScoreboardRenderType::Hearts;
+                            }
+                        }
                         p += tl;
                     }
                     if p + 2 <= payload.len() {
                         let sl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
                         p += 2;
                         if p + sl <= payload.len() && sl > 0 {
-                            *sidebar_obj().lock().unwrap() =
-                                Some(String::from_utf8_lossy(&payload[p..p + sl]).to_string());
+                            let obj = String::from_utf8_lossy(&payload[p..p + sl]);
+                            let _ = board.set_display(ScoreboardDisplaySlot::Sidebar, Some(&obj));
                         }
                     }
                 }
@@ -16351,7 +16327,7 @@ fn name_to_effect(n: &str) -> Option<i32> {
         "invisibility" => 13,
         "blindness" => 14,
         "night_vision" => 15,
-        "hunger" => 16,
+        "hunger" => HUNGER_EFFECT,
         "weakness" => 17,
         "poison" => 18,
         "wither" => 19,
@@ -16371,10 +16347,16 @@ fn name_to_effect(n: &str) -> Option<i32> {
         _ => return None,
     })
 }
+// The live Hunger effect is consumed by FoodData. The legacy effect tick's
+// direct food decrement is keyed to 16, which remains the protocol registry ID.
+const HUNGER_EFFECT: i32 = -16;
+fn effect_wire_id(id: i32) -> i64 {
+    i64::from(if id == HUNGER_EFFECT { 16 } else { id })
+}
 fn entity_effect_pkt(eid: i32, id: i32, amp: i32, ticks: i32) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, eid as i64);
-    write_varint(&mut p, id as i64);
+    write_varint(&mut p, effect_wire_id(id));
     write_varint(&mut p, amp as i64);
     write_varint(&mut p, ticks as i64);
     p.push(0x06); // particles+icon
@@ -16383,7 +16365,7 @@ fn entity_effect_pkt(eid: i32, id: i32, amp: i32, ticks: i32) -> Vec<u8> {
 fn remove_effect_pkt(eid: i32, id: i32) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, eid as i64);
-    write_varint(&mut p, id as i64);
+    write_varint(&mut p, effect_wire_id(id));
     p
 }
 // sound/particle id subsets (minecraft-data 1.21.1 registries, unnamespaced)
@@ -21733,6 +21715,219 @@ fn craft3_result(g: &HashMap<i16, Stack>) -> Option<Stack> {
     let _ = g2;
     None
 }
+// Runtime state attached to the connection, alongside the legacy health and XP fields.
+#[derive(Default)]
+struct PlayerMechanismSession {
+    xp_bar: (i32, f32),
+    food_timer: i32,
+}
+
+fn player_mechanism_sessions() -> &'static LockedMap<i32, PlayerMechanismSession> {
+    static SESSIONS: Registry<i32, PlayerMechanismSession> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn player_movement_exhaustion(c: &Client, (x, y, z): (f64, f64, f64)) -> f32 {
+    let (last_x, _, last_z) = std::mem::replace(&mut *c.lastp.lock().unwrap(), (x, y, z));
+    let distance = (x - last_x).hypot(z - last_z);
+    let movement = if distance >= 10.0 {
+        0.0
+    } else if *c.sprinting.lock().unwrap() {
+        distance as f32 * 0.1
+    } else if *c.sneaking.lock().unwrap() {
+        distance as f32 * 0.005
+    } else {
+        0.0
+    };
+    let hunger = c
+        .effs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|effect| effect.id == HUNGER_EFFECT)
+        .map_or(0.0, |effect| 0.005 * (effect.amp as f32 + 1.0));
+    movement + hunger * GAME_TICKS_PER_TICK as f32
+}
+
+fn tick_player_food(c: &Client, hp: &mut f32, max_hp: f32, exhaustion: f32, t: u64) -> bool {
+    let difficulty = match DIFFICULTY.load(Ordering::Relaxed) {
+        0 => HungerDifficulty::Peaceful,
+        1 => HungerDifficulty::Easy,
+        3 => HungerDifficulty::Hard,
+        _ => HungerDifficulty::Normal,
+    };
+    let natural_regeneration = GR_NATURAL_REGEN.load(Ordering::Relaxed) != 0;
+    let mut sessions = player_mechanism_sessions().lock().unwrap();
+    let Some(session) = sessions.get_mut(&c.eid) else {
+        return false;
+    };
+    let (mut food, mut sat, mut acc) = (
+        c.food.lock().unwrap(),
+        c.sat.lock().unwrap(),
+        c.walk_acc.lock().unwrap(),
+    );
+    let before = (*hp, *food, *sat);
+    let mut data = FoodData {
+        food_level: *food,
+        last_food_level: *food,
+        saturation: *sat,
+        exhaustion: *acc as f32,
+        tick_timer: session.food_timer,
+    };
+    data.add_exhaustion(exhaustion);
+    // Peaceful recovery is separate from FoodData's exhaustion and food-based healing.
+    if difficulty == HungerDifficulty::Peaceful && natural_regeneration {
+        if t.is_multiple_of(server_ticks(20)) {
+            *hp = (*hp + 1.0).min(max_hp);
+            data.saturation = (data.saturation + 1.0).min(20.0);
+        }
+        if t.is_multiple_of(server_ticks(10)) {
+            data.food_level = (data.food_level + 1).min(20);
+        }
+    }
+    for _ in 0..GAME_TICKS_PER_TICK {
+        match data.tick(*hp, max_hp, difficulty, natural_regeneration) {
+            FoodTick::Heal(amount) => *hp = (*hp + amount).min(max_hp),
+            FoodTick::Starve => {
+                *hp = (*hp - 1.0).max(0.0);
+            }
+            FoodTick::None => {}
+        }
+    }
+    *food = data.food_level;
+    *sat = data.saturation;
+    *acc = f64::from(data.exhaustion);
+    session.food_timer = data.tick_timer;
+    before != (*hp, *food, *sat)
+}
+
+fn reset_player_food(c: &Client) {
+    let mut sessions = player_mechanism_sessions().lock().unwrap();
+    if let Some(session) = sessions.get_mut(&c.eid) {
+        session.food_timer = 0;
+    }
+    let data = FoodData::default();
+    *c.food.lock().unwrap() = data.food_level;
+    *c.sat.lock().unwrap() = data.saturation;
+    *c.walk_acc.lock().unwrap() = 0.0;
+}
+
+fn add_player_xp_points(xp: &mut PlayerXpState, points: i32) -> Result<(), ExperienceSetError> {
+    // The adapter uses the Java i32 threshold when adding points. A level set by
+    // a command can exceed the range in which both it and the next level fit.
+    if xp_needed_for_next_level(xp.level) > i64::from(i32::MAX) - 9 {
+        return Err(ExperienceSetError::PointsOutOfRange);
+    }
+    xp.give_experience_points(points);
+    Ok(())
+}
+
+fn take_dropped_experience(c: &Client) -> i64 {
+    let mut total = c.xp.lock().unwrap();
+    let previous_total = std::mem::take(&mut *total);
+    let mut sessions = player_mechanism_sessions().lock().unwrap();
+    let Some(session) = sessions.get_mut(&c.eid) else {
+        return previous_total.clamp(0, 100);
+    };
+    let (level, progress) = std::mem::take(&mut session.xp_bar);
+    // Preserve the existing 100-point drop cap using the player's current bar.
+    // By level 8 the starting XP alone already exceeds the cap.
+    let level = level.min(8);
+    let points = xp_points_for_level(level)
+        + (progress * xp_needed_for_next_level(level) as f32).round() as i64;
+    points.clamp(0, 100)
+}
+
+fn send_player_xp(
+    c: &Client,
+    update: impl FnOnce(&mut PlayerXpState) -> Result<(), ExperienceSetError>,
+) -> Result<(), ExperienceSetError> {
+    // Serialize changes and their packets for this player, including concurrent orb pickups.
+    let mut total = c.xp.lock().unwrap();
+    let mut sessions = player_mechanism_sessions().lock().unwrap();
+    let Some(session) = sessions.get_mut(&c.eid) else {
+        return Ok(());
+    };
+    let mut xp = PlayerXpState {
+        level: session.xp_bar.0,
+        progress: session.xp_bar.1,
+        total_experience: *total as i32,
+    };
+    update(&mut xp)?;
+    session.xp_bar = (xp.level, xp.progress);
+    *total = i64::from(xp.total_experience);
+    drop(sessions);
+    let mut p = xp.progress.to_be_bytes().to_vec();
+    write_varint(&mut p, i64::from(xp.level));
+    write_varint(&mut p, *total);
+    if let Ok(mut w) = c.sock.lock() {
+        let _ = send_packet(&mut w, 0x5c, p);
+    }
+    Ok(())
+}
+
+fn player_command_targets(target: &str, source: Option<&Arc<Client>>) -> Vec<Arc<Client>> {
+    let ids: HashSet<i32> = resolve_selector(target, source)
+        .into_iter()
+        .filter_map(|id| id.parse().ok())
+        .collect();
+    client_snapshot()
+        .into_iter()
+        .filter(|c| ids.contains(&c.eid))
+        .collect()
+}
+
+fn run_experience_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    let [action @ ("add" | "set"), target, amount, units @ ..] = args else {
+        return "Usage: /xp add|set <target> <amount> [points|levels]".into();
+    };
+    let Ok(amount) = amount.parse::<i32>() else {
+        return "Invalid experience amount".into();
+    };
+    let levels = match units {
+        [] | ["points"] => false,
+        ["levels"] => true,
+        _ => return "Expected points or levels".into(),
+    };
+    if *action == "set" && amount < 0 {
+        return "Experience amount must be nonnegative".into();
+    }
+    let targets = player_command_targets(target, source);
+    if targets.is_empty() {
+        return "No player found".into();
+    }
+    let mut changed = 0;
+    for c in targets {
+        let result = send_player_xp(&c, |xp| {
+            if *action == "set" {
+                xp.set(
+                    amount,
+                    if levels {
+                        ExperienceUnit::Levels
+                    } else {
+                        ExperienceUnit::Points
+                    },
+                )
+            } else {
+                if levels {
+                    xp.give_experience_levels(amount);
+                    Ok(())
+                } else {
+                    add_player_xp_points(xp, amount)
+                }
+            }
+        });
+        changed += usize::from(result.is_ok());
+    }
+    if changed == 0 && *action == "set" {
+        "Experience points must be below the amount required for the next level".into()
+    } else if changed == 0 {
+        "Experience level is too large to add points".into()
+    } else {
+        format!("{action} xp for {changed} target(s)")
+    }
+}
+
 fn health_pkt_c(hp: f32, c: &Client) -> Vec<u8> {
     health_pkt(hp, *c.food.lock().unwrap(), *c.sat.lock().unwrap())
 }
@@ -21753,10 +21948,10 @@ fn food_effects(item: i64) -> &'static [(u64, i32, i32, i32)] {
         ];
     }
     if item == g("rotten_flesh") {
-        return &[(80, 16, 0, 600)];
+        return &[(80, HUNGER_EFFECT, 0, 600)];
     }
     if item == g("chicken") {
-        return &[(30, 16, 0, 600)];
+        return &[(30, HUNGER_EFFECT, 0, 600)];
     }
     if item == g("pufferfish") {
         return &[(100, 16, 2, 300), (100, 8, 0, 300), (100, 18, 2, 1200)];
@@ -22217,76 +22412,243 @@ fn coord(tok: &str, base: f64) -> f64 {
 }
 
 // ---------- scoreboard ----------
-static SCORES: OnceLock<Mutex<HashMap<String, HashMap<String, i64>>>> = OnceLock::new();
-fn obj_types() -> &'static Mutex<HashMap<String, String>> {
-    static R: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(HashMap::new()))
+fn scoreboard_criterion_name(criterion: ScoreboardCriteria) -> &'static str {
+    match criterion {
+        ScoreboardCriteria::Dummy => "dummy",
+        ScoreboardCriteria::Trigger => "trigger",
+        ScoreboardCriteria::DeathCount => "deathCount",
+        ScoreboardCriteria::PlayerKillCount => "playerKillCount",
+        ScoreboardCriteria::TotalKillCount => "totalKillCount",
+        ScoreboardCriteria::Health => "health",
+    }
 }
-fn sidebar_obj() -> &'static Mutex<Option<String>> {
-    static R: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(None))
+
+fn scoreboard() -> &'static Mutex<ScoreboardEngine> {
+    static SCORES: OnceLock<Mutex<ScoreboardEngine>> = OnceLock::new();
+    SCORES.get_or_init(|| Mutex::new(ScoreboardEngine::default()))
 }
-fn trig_enabled() -> &'static Mutex<HashSet<(String, String)>> {
-    // (player, objective)
-    static R: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(HashSet::new()))
+
+fn world_border() -> &'static Mutex<WorldBorderState> {
+    static BORDER: OnceLock<Mutex<WorldBorderState>> = OnceLock::new();
+    BORDER.get_or_init(|| Mutex::new(WorldBorderState::default()))
 }
-// wire: create/update objective (action 0), place at sidebar (pos 1)
-fn obj_create_pkt(obj: &str) -> Vec<u8> {
-    let mut p = Vec::new();
-    write_str(&mut p, obj);
-    p.push(0u8); // create
-    p.extend_from_slice(&chat_nbt(obj));
-    write_varint(&mut p, 0); // integer criterion
-    p.push(0); // number_format absent
-    p
+
+fn border_now_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
+
+fn run_world_border_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    let mut border = world_border().lock().unwrap();
+    let result = WorldBorderCommand::parse(args, ctx.x, ctx.z)
+        .and_then(|cmd| cmd.execute(&mut border, None, border_now_ms()));
+    let feedback = match result {
+        Ok(result) => {
+            if let Some((id, body)) = result.packet {
+                broadcast(-1, |_| (id, body.clone()));
+            }
+            result.feedback
+        }
+        Err(WorldBorderCommandError::Rejected(feedback)) => feedback,
+        Err(WorldBorderCommandError::Syntax) => {
+            return "Usage: /worldborder add|center|damage|get|set|warning".into()
+        }
+        Err(error) => return format!("Invalid world border argument: {error:?}"),
+    };
+    match (feedback.key, feedback.arguments.as_slice()) {
+        ("commands.worldborder.set.immediate", [size]) => {
+            format!("Set the world border to {size} blocks wide")
+        }
+        ("commands.worldborder.set.grow" | "commands.worldborder.set.shrink", [size, seconds]) => {
+            format!("Resizing the world border to {size} blocks over {seconds} seconds")
+        }
+        ("commands.worldborder.get", [size]) => format!("The world border is {size} blocks wide"),
+        ("commands.worldborder.center.success", [x, z]) => {
+            format!("Set the world border center to {x}, {z}")
+        }
+        ("commands.worldborder.warning.distance.success", [blocks]) => {
+            format!("Set the world border warning distance to {blocks} blocks")
+        }
+        ("commands.worldborder.warning.time.success", [seconds]) => {
+            format!("Set the world border warning time to {seconds} seconds")
+        }
+        ("commands.worldborder.damage.amount.success", [amount]) => {
+            format!("Set the world border damage to {amount} per block")
+        }
+        ("commands.worldborder.damage.buffer.success", [blocks]) => {
+            format!("Set the world border damage buffer to {blocks} blocks")
+        }
+        (key, arguments) => [key, &arguments.join(" ")].join(" ").trim_end().into(),
+    }
+}
+
+// Also used by the GP-7 packet encoder.
 fn display_pkt(slot: i64, obj: &str) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, slot);
     write_str(&mut p, obj);
     p
 }
-fn score_pkt(name: &str, obj: &str, v: i64) -> Vec<u8> {
-    let mut p = Vec::new();
-    write_str(&mut p, name);
-    write_str(&mut p, obj);
-    write_varint(&mut p, v);
-    p.push(0);
-    p.push(0); // no display_name, no number_format
-    p
-}
-// push the displayed objective's current scores to one client (join / setdisplay)
-fn sidebar_push(c: &Arc<Client>) {
-    let Some(obj) = sidebar_obj().lock().unwrap().clone() else {
-        return;
-    };
-    let oc = obj_create_pkt(&obj);
-    let dp = display_pkt(1, &obj);
-    let scores_list: Vec<(String, i64)> = scores()
-        .lock()
-        .unwrap()
-        .get(&obj)
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        .unwrap_or_default();
-    if let Ok(mut w) = c.sock.lock() {
-        let _ = send_packet(&mut w, 0x5e, oc);
-        let _ = send_packet(&mut w, 0x57, dp);
-        for (n, v) in scores_list {
-            let _ = send_packet(&mut w, 0x61, score_pkt(&n, &obj, v));
+
+fn sync_scoreboard(w: &mut TcpStream, board: &ScoreboardEngine) -> std::io::Result<()> {
+    for objective in board.objectives.values() {
+        let (id, body) =
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Create(objective, None));
+        send_packet(w, id, body)?;
+    }
+    for (objective, scores) in &board.scores {
+        for (owner, score) in scores {
+            let (id, body) = encode_scoreboard_score(owner, objective, score.value, None, None);
+            send_packet(w, id, body)?;
         }
     }
+    for (slot, objective) in board.display_slots.iter().enumerate() {
+        if let Some(objective) = objective {
+            send_packet(w, 0x57, display_pkt(slot as i64, objective))?;
+        }
+    }
+    Ok(())
 }
-// broadcast a score change iff the objective is on the sidebar
-fn score_broadcast(obj: &str, name: &str, v: i64) {
-    let shown = sidebar_obj().lock().unwrap().as_deref() == Some(obj);
-    if shown {
-        let pk = score_pkt(name, obj, v);
-        broadcast(-1, |_c| (0x61, pk.clone()));
+
+fn broadcast_score(board: &ScoreboardEngine, owner: &str, objective: &str) {
+    if let Some(score) = board.get(owner, objective) {
+        let (id, body) = encode_scoreboard_score(owner, objective, score, None, None);
+        broadcast(-1, |_| (id, body.clone()));
     }
 }
-fn scores() -> &'static Mutex<HashMap<String, HashMap<String, i64>>> {
-    SCORES.get_or_init(|| Mutex::new(HashMap::new()))
+
+const SCOREBOARD_ENTRY_LIMIT: usize = 4096;
+
+fn scoreboard_entry_available(board: &ScoreboardEngine, owner: &str, objective: &str) -> bool {
+    board
+        .scores
+        .get(objective)
+        .is_none_or(|scores| scores.len() < SCOREBOARD_ENTRY_LIMIT || scores.contains_key(owner))
+}
+
+fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Result<String, String> {
+    let entries = match args {
+        ["players", "operation", owner, objective, _, source, source_objective] => {
+            &[(*owner, *objective), (*source, *source_objective)][..]
+        }
+        ["players", "set" | "add" | "remove" | "enable", owner, objective, ..] => {
+            &[(*owner, *objective)][..]
+        }
+        _ => &[],
+    };
+    if entries
+        .iter()
+        .any(|&(owner, objective)| !scoreboard_entry_available(board, owner, objective))
+    {
+        return Err("Too many scores for objective".into());
+    }
+    if let [(first, objective), (second, other)] = entries {
+        if objective == other
+            && first != second
+            && board.scores.get(*objective).is_some_and(|scores| {
+                scores.len() == SCOREBOARD_ENTRY_LIMIT - 1
+                    && !scores.contains_key(*first)
+                    && !scores.contains_key(*second)
+            })
+        {
+            return Err("Too many scores for objective".into());
+        }
+    }
+    let reply = execute_scoreboard_command(board, args)?;
+    for &(owner, objective) in entries {
+        broadcast_score(board, owner, objective);
+    }
+    let packet = match args {
+        ["objectives", "add", name, ..] => {
+            let objective = board.objective(name).unwrap();
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Create(objective, None))
+        }
+        ["objectives", "remove", name] => {
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Remove(name))
+        }
+        ["objectives", "setdisplay", slot, ..] => {
+            let slot = ScoreboardDisplaySlot::parse(slot).unwrap();
+            encode_scoreboard_display(slot, board.display(slot))
+        }
+        ["players", "reset", owner, objective @ ..] => {
+            encode_scoreboard_reset(owner, objective.first().copied())
+        }
+        _ => return Ok(reply),
+    };
+    broadcast(-1, |_| (packet.0, packet.1.clone()));
+    Ok(reply)
+}
+
+fn scoreboard_holders(holder: &str, source: Option<&Arc<Client>>) -> Vec<String> {
+    if holder.starts_with('@') {
+        player_command_targets(holder, source)
+            .into_iter()
+            .map(|c| c.name.clone())
+            .collect()
+    } else {
+        vec![holder.chars().take(64).collect()]
+    }
+}
+
+fn run_scoreboard_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    let ["players", _, holder, ..] = args else {
+        return apply_scoreboard_command(&mut scoreboard().lock().unwrap(), args)
+            .unwrap_or_else(|err| err);
+    };
+    let holders = scoreboard_holders(holder, source);
+    let mut args = args.to_vec();
+    let sources = if let ["players", "operation", _, _, _, from, _] = args.as_slice() {
+        scoreboard_holders(from, source)
+            .into_iter()
+            .map(Some)
+            .collect()
+    } else {
+        vec![None]
+    };
+    if holders.is_empty() || sources.is_empty() {
+        return "No score holders found".into();
+    }
+    let mut replies = Vec::new();
+    let mut board = scoreboard().lock().unwrap();
+    for holder in &holders {
+        args[2] = holder;
+        for from in &sources {
+            if let Some(from) = from {
+                args[5] = from;
+            }
+            replies.push(apply_scoreboard_command(&mut board, &args).unwrap_or_else(|err| err));
+        }
+    }
+    replies.join("; ")
+}
+
+fn run_trigger_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    let Some(player) = source else {
+        return "trigger: player only".into();
+    };
+    let (objective, set, amount) = match args {
+        [objective] => (*objective, false, 1),
+        [objective, op @ ("set" | "add"), amount] => {
+            let Ok(amount) = amount.parse::<i32>() else {
+                return "Invalid trigger amount".into();
+            };
+            (*objective, *op == "set", amount)
+        }
+        _ => return "Usage: /trigger <objective> [add|set <amount>]".into(),
+    };
+    let mut board = scoreboard().lock().unwrap();
+    let delta = if set {
+        amount.wrapping_sub(board.get(&player.name, objective).unwrap_or(0))
+    } else {
+        amount
+    };
+    match board.trigger_add(&player.name, objective, delta) {
+        Ok(value) => {
+            broadcast_score(&board, &player.name, objective);
+            format!("Triggered {objective}: now {value}")
+        }
+        Err(error) => scoreboard_command_error(error),
+    }
 }
 
 // datapack predicate eval — subset: random_chance, inverted, any_of/all_of
@@ -22613,14 +22975,8 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
                                 "@s" => cur.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(),
                                 n => n.to_string(),
                             };
-                            let v = scores()
-                                .lock()
-                                .unwrap()
-                                .get(obj)
-                                .and_then(|m| m.get(&entry))
-                                .copied()
-                                .unwrap_or(0);
-                            in_range(v, range)
+                            let value = scoreboard().lock().unwrap().get(&entry, obj).unwrap_or(0);
+                            in_range(i64::from(value), range)
                         } else {
                             false
                         }
@@ -22652,12 +23008,14 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
             "@s" => cur.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(),
             n => n.to_string(),
         };
-        scores()
-            .lock()
-            .unwrap()
-            .entry(ob.clone())
-            .or_default()
-            .insert(entry.clone(), r);
+        let mut board = scoreboard().lock().unwrap();
+        if !scoreboard_entry_available(&board, &entry, ob) {
+            return "Too many scores for objective".into();
+        }
+        if let Err(error) = board.set(&entry, ob, r as i32) {
+            return scoreboard_command_error(error);
+        }
+        broadcast_score(&board, &entry, ob);
         return format!("Stored {} in {} for {}", r, ob, entry);
     }
     let mut n = 0;
@@ -23171,6 +23529,124 @@ fn adv_done() -> &'static Mutex<HashMap<String, HashSet<String>>> {
     static R: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
+fn player_advancements() -> &'static Mutex<AdvancementTracker> {
+    static TRACKER: OnceLock<Mutex<AdvancementTracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(AdvancementTracker::default()))
+}
+
+fn advancement_time_ms() -> i64 {
+    // This is the protocol's earned-at timestamp, independent of simulation time.
+    std::time::UNIX_EPOCH
+        .elapsed()
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn send_advancement_delta(tracker: &mut AdvancementTracker, c: &Client, reset: bool) {
+    if let Some(delta) = tracker.take_delta(&c.name, reset) {
+        let (id, body) = delta.into_packet();
+        let mut socket = c.sock.lock().unwrap();
+        if send_packet(&mut socket, id, body).is_err() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+fn restore_player_advancements(tracker: &mut AdvancementTracker, name: &str) {
+    if let Some(earned) = adv_done().lock().unwrap().get(name) {
+        let now = advancement_time_ms();
+        for id in earned {
+            // A legacy save records only completed IDs. Preserve precise criteria
+            // and timestamps when this tracker already has progress for the ID.
+            if !tracker
+                .progress
+                .get(name)
+                .is_some_and(|rows| rows.contains_key(id.as_str()))
+            {
+                tracker.grant_only(name, id, now);
+            }
+        }
+    }
+}
+
+fn run_advancement_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    let [action @ ("grant" | "revoke"), target, scope @ ..] = args else {
+        return "Usage: /advancement grant|revoke <target> <scope>".into();
+    };
+    let targets = player_command_targets(target, source);
+    if targets.is_empty() {
+        return "No player found".into();
+    }
+    let mut tracker = player_advancements().lock().unwrap();
+    let now = advancement_time_ms();
+    let mut replies = Vec::new();
+    let mut resolved = args.to_vec();
+    for c in targets.iter() {
+        resolved[1] = &c.name;
+        let reply = execute_advancement_command(&mut tracker, &resolved, now);
+        let datapack_ids = match scope {
+            ["everything"] => advancements()
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|id| tracker.definition(id).is_none())
+                .cloned()
+                .collect(),
+            ["only", id] => {
+                let id = if id.contains(':') {
+                    (*id).into()
+                } else {
+                    format!("minecraft:{id}")
+                };
+                if tracker.definition(&id).is_none()
+                    && advancements().lock().unwrap().contains_key(&id)
+                {
+                    vec![id]
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        };
+        {
+            let mut done = adv_done().lock().unwrap();
+            let earned = done.entry(c.name.clone()).or_default();
+            if reply.is_ok() {
+                let progress = tracker.progress.get(&c.name);
+                for definition in tracker.definitions {
+                    // The legacy save records completion independently of parent visibility.
+                    let complete = progress
+                        .and_then(|rows| rows.get(definition.id))
+                        .is_some_and(|criteria| {
+                            definition
+                                .requirements
+                                .iter()
+                                .all(|group| group.iter().any(|name| criteria.contains_key(name)))
+                        });
+                    if complete {
+                        earned.insert(definition.id.to_owned());
+                    } else {
+                        earned.remove(definition.id);
+                    }
+                }
+            }
+            for id in &datapack_ids {
+                if *action == "grant" {
+                    earned.insert(id.clone());
+                } else {
+                    earned.remove(id);
+                }
+            }
+        }
+        send_advancement_delta(&mut tracker, c, false);
+        replies.push(match reply {
+            Err(_) if !datapack_ids.is_empty() => format!("{action} applied for {}", c.name),
+            Ok(text) | Err(text) => text,
+        });
+    }
+    replies.join("; ")
+}
+
 struct Bossbar {
     name: String,
     color: u8,
@@ -23352,7 +23828,7 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
             .lock()
             .unwrap()
             .get(pname)
-            .map(|g| g.len() >= advs.len())
+            .map(|g| g.len() >= advs.len() && advs.keys().all(|id| g.contains(id)))
             .unwrap_or(false)
         {
             if let Some(t) = __t {
@@ -23408,12 +23884,23 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
         tickprof::add("adv/total", t.elapsed());
     }
     for id in grants {
-        adv_done()
-            .lock()
-            .unwrap()
-            .entry(pname.to_string())
-            .or_default()
-            .insert(id.clone());
+        {
+            let mut tracker = player_advancements().lock().unwrap();
+            let inserted = adv_done()
+                .lock()
+                .unwrap()
+                .entry(pname.to_string())
+                .or_default()
+                .insert(id.clone());
+            if !inserted {
+                continue;
+            }
+            if tracker.grant_only(pname, &id, advancement_time_ms()) > 0 {
+                for c in client_snapshot().iter().filter(|c| c.name == pname) {
+                    send_advancement_delta(&mut tracker, c, false);
+                }
+            }
+        }
         let t = advancements()
             .lock()
             .unwrap()
@@ -23424,6 +23911,143 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
         broadcast(-1, |_c| (0x6c, line.clone()));
     }
 }
+fn check_modification_bounds(dim: DimId, (x, y, z): BlockPos) -> Result<(), String> {
+    if (-30_000_000..30_000_000).contains(&x)
+        && (-30_000_000..30_000_000).contains(&z)
+        && (dim.min_y()..dim.min_y() + dim.height()).contains(&y)
+    {
+        Ok(())
+    } else {
+        Err("Block position is outside the world".into())
+    }
+}
+
+fn block_modification_error(error: BlockModificationError) -> String {
+    match error {
+        BlockModificationError::VolumeLimit { volume, limit } => {
+            format!("Too many blocks ({volume}, maximum {limit})")
+        }
+        BlockModificationError::DestinationOverflow => {
+            "Clone destination is outside the world".into()
+        }
+        BlockModificationError::OverlappingClone => "Clone regions overlap".into(),
+    }
+}
+
+fn modification_block_state(argument: &str) -> Option<u32> {
+    let Some(registry) = breg() else {
+        return state_from_arg(argument);
+    };
+    let Some((name, properties)) = argument.split_once('[') else {
+        return registry.checked_state(argument, &[]);
+    };
+    let properties = properties.strip_suffix(']')?;
+    if properties.is_empty() {
+        return registry.checked_state(name, &[]);
+    }
+    let properties = properties
+        .split(',')
+        .map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            Some((key.to_owned(), value.to_owned()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    registry.checked_state(name, &properties)
+}
+
+fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<String, String> {
+    let origin = (
+        ctx.x.floor() as i32,
+        ctx.y.floor() as i32,
+        ctx.z.floor() as i32,
+    );
+    let dim = cmd_dim(ctx);
+    let read = |(x, y, z)| block_at_dim(dim, x, y, z);
+    with_save_guard(|| {
+        let changes = if cmd == "fill" {
+            let fill = parse_fill_command(args, origin, modification_block_state)?;
+            check_modification_bounds(dim, fill.from)?;
+            check_modification_bounds(dim, fill.to)?;
+            eval_fill(
+                fill.from,
+                fill.to,
+                fill.state,
+                fill.mode,
+                MODIFICATION_BLOCK_LIMIT,
+                read,
+            )
+        } else {
+            let clone = parse_clone_command(args, origin, modification_block_state)?;
+            check_modification_bounds(dim, clone.from)?;
+            check_modification_bounds(dim, clone.to)?;
+            check_modification_bounds(dim, clone.destination)?;
+            let source = ModificationBox::between(clone.from, clone.to);
+            let destination = ModificationBox::between(clone.destination, clone.destination);
+            let far_corner = destination
+                .at_offset(source.offset(source.max))
+                .ok_or_else(|| {
+                    block_modification_error(BlockModificationError::DestinationOverflow)
+                })?;
+            check_modification_bounds(dim, far_corner)?;
+            eval_clone(
+                clone.from,
+                clone.to,
+                clone.destination,
+                clone.filter,
+                clone.mode,
+                MODIFICATION_BLOCK_LIMIT,
+                |pos| {
+                    let state = read(pos);
+                    if clone.filter == CloneFilter::Masked
+                        && breg().is_some_and(|reg| reg.is_air(state))
+                    {
+                        COMMAND_AIR_STATE
+                    } else {
+                        state
+                    }
+                },
+            )
+        }
+        .map_err(block_modification_error)?;
+        let count = changes.len();
+        for BlockModification {
+            pos: (x, y, z),
+            state,
+            destroyed,
+        } in changes
+        {
+            if let Some(previous) = destroyed {
+                set_block_dim(dim, x, y, z, COMMAND_AIR_STATE);
+                // Item entities currently belong to the Overworld item simulation.
+                if dim == DimId::Overworld {
+                    let mut drops = drops().lock().unwrap();
+                    let remaining = DROP_CAP.saturating_sub(drops.len());
+                    drops.extend(
+                        block_drops(previous)
+                            .into_iter()
+                            .take(remaining)
+                            .map(|item| Drop {
+                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                x: f64::from(x) + 0.5,
+                                y: f64::from(y) + 0.5,
+                                z: f64::from(z) + 0.5,
+                                item,
+                                cnt: 1,
+                                comps: Vec::new(),
+                                age: 0,
+                                target: None,
+                                thrower: None,
+                            }),
+                    );
+                }
+            }
+            place_block_dim(dim, x, y, z, state);
+        }
+        let action = if cmd == "fill" { "Filled" } else { "Cloned" };
+        Ok(format!("{action} {count} blocks"))
+    })
+}
+
 fn block_tag_has(tag: &str, st: u32, depth: usize) -> bool {
     if depth > 8 {
         return false;
@@ -23615,7 +24239,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             format!("Set the world spawn point to {}, {}, {}", x, y, z)
         }
         "help" => {
-            "commands: execute time tp say kill gamemode difficulty stop clear xp effect setblock summon give weather function datapack scoreboard fill forceload item player data list seed spawnpoint setworldspawn gamerule counts help".into()
+            "commands: execute time tp say kill gamemode difficulty stop clear xp effect setblock summon give weather function datapack worldborder scoreboard advancement fill clone forceload item player data list seed spawnpoint setworldspawn gamerule counts help".into()
         }
         "tp" | "teleport" => {
             let mut actor_tgt: Option<String> = None;
@@ -23873,44 +24497,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             for (_c, pk) in &rx { broadcast_seen(_c.eid, |_o| (0x43, pk.clone())); }
             reply2
         }
-        "xp" | "experience" => {
-            // /xp add|set <targets> <n> [points|levels]
-            let sub = args.first().copied().unwrap_or("");
-            let sel = args.get(1).copied().unwrap_or("@s");
-            let targets = if sel.starts_with('@') { resolve_selector(sel, me) }
-                else { clients().lock().unwrap().iter().find(|c| c.name == sel)
-                    .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
-            let amount = args.get(2).and_then(|a| a.parse::<i64>().ok()).unwrap_or(0);
-            let unit = args.get(3).copied().unwrap_or("points");
-            let cls: Vec<Arc<Client>> = client_snapshot();
-            let mut touched = 0;
-            for t in &targets {
-                if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
-                    let mut xp = c.xp.lock().unwrap();
-                    if unit == "levels" {
-                        // store xp as total points; levels add via xp_level inverse
-                        let (lvl, _) = xp_level(*xp);
-                        let target = lvl + amount as i32;
-                        *xp = xp_points_for_level(target);
-                    } else {
-                        match sub { "set" => *xp = amount.max(0), _ => *xp = (*xp + amount).max(0) }
-                    }
-                    if unit == "levels" && sub == "add" {
-                        // handled above via target
-                    } else if unit == "levels" { /* set via computed acc */ }
-                    let total = *xp;
-                    drop(xp);
-                    let (lvl, bar) = xp_level(total);
-                    let mut p = Vec::new();
-                    p.extend_from_slice(&bar.to_be_bytes());
-                    write_varint(&mut p, lvl as i64);
-                    write_varint(&mut p, total);
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5c, p); }
-                    touched += 1;
-                }
-            }
-            format!("{} xp for {} target(s)", sub, touched)
-        }
+        "xp" | "experience" => run_experience_command(&args, me),
         "setblock" => {
             if args.len() >= 4 {
                 let (x, y, z) = (coord(args[0], ctx.x) as i32, coord(args[1], ctx.y) as i32, coord(args[2], ctx.z) as i32);
@@ -24286,27 +24873,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             broadcast(-1, |_c| (0x29, p.clone()));
             format!("Displayed {} {}", cnt, nm)
         }
-        "trigger" => {
-            // /trigger <obj> [set <v>|add <v>] — requires trigger-type + enabled
-            let obj = args.first().copied().unwrap_or("");
-            let Some(pname) = me.map(|c| c.name.clone()) else {
-                return "trigger: player only".into() };
-            let is_trig = obj_types().lock().unwrap().get(obj).map(|t| t == "trigger").unwrap_or(false);
-            if !is_trig { return format!("Cannot trigger '{}'", obj) }
-            let mut te = trig_enabled().lock().unwrap();
-            if !te.remove(&(pname.clone(), obj.to_string())) {
-                return format!("Trigger {} is not enabled", obj) }
-            drop(te);
-            let v = args.get(2).and_then(|x| x.parse::<i64>().ok()).unwrap_or(1);
-            let mut sc = scores().lock().unwrap();
-            let e = sc.entry(obj.to_string()).or_default().entry(pname.clone()).or_insert(0);
-            match args.get(1).copied().unwrap_or("add") {
-                "set" => *e = v,
-                _ => *e += v,
-            }
-            let nv = *e; drop(sc); score_broadcast(obj, &pname, nv);
-            format!("Triggered {}: now {}", obj, nv)
-        }
+        "trigger" => run_trigger_command(&args, me),
         "attribute" => {
             // /attribute <target> <attr> base get|set <v>
             let sel = args.first().copied().unwrap_or("");
@@ -24419,40 +24986,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 _ => "usage: /bossbar add|remove|set|list".into(),
             }
         }
-        "advancement" => {
-            // grant|revoke <target> only|everything <id?>
-            let (verb, target) = (args.first().copied().unwrap_or(""), args.get(1).copied().unwrap_or(""));
-            let who = resolve_selector(target, me).into_iter().next()
-                .or_else(|| clients().lock().unwrap().iter().find(|c| c.name == target).map(|c| c.eid.to_string()))
-                .unwrap_or_default();
-            let pname = clients().lock().unwrap().iter().find(|c| c.eid.to_string() == who).map(|c| c.name.clone()).unwrap_or_default();
-            if pname.is_empty() { return "No player found".into() }
-            match (verb, args.get(2).copied().unwrap_or("")) {
-                ("grant", "only") => {
-                    let id = args.get(3).copied().unwrap_or("");
-                    let id = if id.contains(':') { id.to_string() } else { format!("minecraft:{}", id) };
-                    if !advancements().lock().unwrap().contains_key(&id) { return format!("Unknown advancement '{}'", args.get(3).copied().unwrap_or("")) }
-                    adv_done().lock().unwrap().entry(pname.clone()).or_default().insert(id);
-                    format!("Granted advancement to {}", pname)
-                }
-                ("grant", "everything") => {
-                    let ids: Vec<String> = advancements().lock().unwrap().keys().cloned().collect();
-                    adv_done().lock().unwrap().entry(pname.clone()).or_default().extend(ids);
-                    format!("Granted every advancement to {}", pname)
-                }
-                ("revoke", "only") => {
-                    let id = args.get(3).copied().unwrap_or("");
-                    let id = if id.contains(':') { id.to_string() } else { format!("minecraft:{}", id) };
-                    adv_done().lock().unwrap().entry(pname.clone()).or_default().remove(&id);
-                    format!("Revoked advancement from {}", pname)
-                }
-                ("revoke", "everything") => {
-                    adv_done().lock().unwrap().insert(pname.clone(), HashSet::new());
-                    format!("Revoked every advancement from {}", pname)
-                }
-                _ => "usage: /advancement grant|revoke <player> only <id>|everything".into(),
-            }
-        }
+        "advancement" => run_advancement_command(&args, me),
         "datapack" => {
             if args.first() == Some(&"list") {
                 let ps = packs().lock().unwrap();
@@ -24460,109 +24994,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 format!("{} packs: {}", names.len(), names.join(", "))
             } else { "usage: /datapack list".into() }
         }
-        "scoreboard" => {
-            match args.first().copied().unwrap_or("") {
-                "objectives" => {
-                    match args.get(1).copied().unwrap_or("") {
-                        "add" => {
-                            let obj: String = args.get(2).copied().unwrap_or("obj").chars().take(64).collect();
-                            let crit = args.get(3).copied().unwrap_or("dummy");
-                            let mut sc = scores().lock().unwrap();
-                            if sc.len() < 1024 || sc.contains_key(&obj) { sc.entry(obj.clone()).or_default(); }
-                            obj_types().lock().unwrap().insert(obj.clone(), crit.to_string());
-                            format!("Added objective {}", obj)
-                        }
-                        "setdisplay" => {
-                            let slot = args.get(2).copied().unwrap_or("");
-                            let obj = args.get(3).copied().unwrap_or("");
-                            if slot != "sidebar" { return "usage: /scoreboard objectives setdisplay sidebar [obj]".into() }
-                            if obj.is_empty() {
-                                *sidebar_obj().lock().unwrap() = None;
-                                broadcast(-1, |_c| (0x57, display_pkt(1, "")));
-                                "Cleared sidebar".into()
-                            } else {
-                                *sidebar_obj().lock().unwrap() = Some(obj.to_string());
-                                let oc = obj_create_pkt(obj); let dp = display_pkt(1, obj);
-                                broadcast(-1, |_c| (0x5e, oc.clone()));
-                                broadcast(-1, |_c| (0x57, dp.clone()));
-                                let lst: Vec<(String, i64)> = scores().lock().unwrap().get(obj)
-                                    .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default();
-                                for (n, v) in lst { let pk = score_pkt(&n, obj, v); broadcast(-1, |_c| (0x61, pk.clone())); }
-                                format!("Displaying {} on sidebar", obj)
-                            }
-                        }
-                        "remove" => {
-                            let obj: String = args.get(2).copied().unwrap_or("").chars().take(64).collect();
-                            scores().lock().unwrap().remove(&obj);
-                            format!("Removed {}", obj)
-                        }
-                        "list" => {
-                            let sc = scores().lock().unwrap();
-                            format!("{} objectives: {}", sc.len(), sc.keys().cloned().collect::<Vec<_>>().join(", "))
-                        }
-                        _ => "usage: /scoreboard objectives add|remove|list".into(),
-                    }
-                }
-                "players" => {
-                    let op = args.get(1).copied().unwrap_or("");
-                    let entry = args.get(2).copied().unwrap_or("");
-                    let obj = args.get(3).copied().unwrap_or("");
-                    let name: String = match entry { "@s" => ctx.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(), "@p" => ctx.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(), n => n.chars().take(64).collect() };
-                    let obj: String = obj.chars().take(64).collect();
-                    let mut sc = scores().lock().unwrap();
-                    match op {
-                        "set" => { let v = args.get(4).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
-                            let full = sc.get(&obj).map(|m| m.len()).unwrap_or(0) >= 4096 && sc.get(&obj).and_then(|m| m.get(&name)).is_none();
-                            if !full { sc.entry(obj.clone()).or_default().insert(name.clone(), v); }
-                            drop(sc); score_broadcast(&obj, &name, v);
-                            format!("Set {} = {}", name, v) }
-                        "add" => { let v = args.get(4).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
-                            let full = sc.get(&obj).map(|m| m.len()).unwrap_or(0) >= 4096 && sc.get(&obj).and_then(|m| m.get(&name)).is_none();
-                            if full { format!("{} = (cap)", name) } else {
-                            let e = sc.entry(obj.clone()).or_default().entry(name.clone()).or_insert(0); *e += v;
-                            let nv = *e; drop(sc); score_broadcast(&obj, &name, nv); format!("{} = {}", name, nv) } }
-                        "get" => { let v = sc.get(&obj).and_then(|m| m.get(&name)).copied().unwrap_or(0); format!("{} = {}", name, v) }
-                        "reset" => { if let Some(m) = sc.get_mut(&obj) { m.remove(&name); } format!("Reset {}", name) }
-                        "enable" => {
-                            // vanilla: only trigger objectives accept enable
-                            let is_trig = obj_types().lock().unwrap().get(&obj).map(|t| t == "trigger").unwrap_or(false);
-                            if !is_trig { return format!("{} is not a trigger objective", obj) }
-                            let names: Vec<String> = resolve_selector(entry, me).iter()
-                                .filter_map(|e| e.parse::<i32>().ok())
-                                .filter_map(|eid| clients().lock().unwrap().iter().find(|c| c.eid == eid).map(|c| c.name.clone()))
-                                .collect();
-                            if names.is_empty() && !entry.starts_with('@') {
-                                trig_enabled().lock().unwrap().insert((name.clone(), obj.clone()));
-                                return format!("Enabled {} for {}", obj, name)
-                            }
-                            let mut te = trig_enabled().lock().unwrap();
-                            for n in &names { te.insert((n.clone(), obj.clone())); }
-                            format!("Enabled {} for {} player(s)", obj, names.len())
-                        }
-                        _ => "usage: /scoreboard players set|add|get|reset|enable".into(),
-                    }
-                }
-                _ => "usage: /scoreboard objectives|players".into(),
-            }
-        }
-        "fill" => {
-            if args.len() >= 7 {
-                let (x1, y1, z1) = (coord(args[0], ctx.x) as i32, coord(args[1], ctx.y) as i32, coord(args[2], ctx.z) as i32);
-                let (x2, y2, z2) = (coord(args[3], ctx.x) as i32, coord(args[4], ctx.y) as i32, coord(args[5], ctx.z) as i32);
-                let st = state_from_arg(args[6]).unwrap_or(0);
-                let (xa, xb) = (x1.min(x2), x1.max(x2));
-                let (ya, yb) = (y1.min(y2), y1.max(y2));
-                let (za, zb) = (z1.min(z2), z1.max(z2));
-                let total = (xb-xa+1) as i64 * (yb-ya+1) as i64 * (zb-za+1) as i64;
-                if total > 32768 { "fill too large".into() } else {
-                    let mut n = 0;
-                    for x in xa..=xb { for y in ya..=yb { for z in za..=zb {
-                        place_block(x, y, z, st); n += 1;
-                    }}}
-                    format!("Filled {} blocks", n)
-                }
-            } else { "usage: /fill x1 y1 z1 x2 y2 z2 <block>".into() }
-        }
+        "worldborder" => run_world_border_command(ctx, &args),
+        "scoreboard" => run_scoreboard_command(&args, me),
+        "fill" | "clone" => run_block_modification(ctx, cmd, &args).unwrap_or_else(|error| error),
         "forceload" => {
             // forceload add|remove <x1> <z1> [x2 z2] | query — keeps chunks ticking with no players online
             match args.first().copied().unwrap_or("") {
@@ -25301,7 +25735,7 @@ fn handle(mut s: TcpStream) {
         armor_pts: Mutex::new(0),
         sat: Mutex::new(5.0),
         walk_acc: Mutex::new(0.0),
-        lastp: Mutex::new((0.0, 0.0, 0.0)),
+        lastp: Mutex::new((sx, sy, sz)),
         spawn_pt: Mutex::new(None),
         dim: Mutex::new(saved_dim),
         view: Mutex::new(view),
@@ -25313,9 +25747,23 @@ fn handle(mut s: TcpStream) {
         effs: Mutex::new(Vec::new()),
     });
     {
+        let border = world_border().lock().unwrap();
+        let board = scoreboard().lock().unwrap();
+        let mut tracker = player_advancements().lock().unwrap();
+        restore_player_advancements(&mut tracker, &me.name);
+        {
+            let mut w = me.sock.lock().unwrap();
+            let now = border_now_ms();
+            let mut snapshot = *border;
+            snapshot.finish_lerp(now);
+            let (id, body) = snapshot.initialize_packet(now);
+            let _ = send_packet(&mut w, id, body);
+            let _ = sync_scoreboard(&mut w, &board);
+        }
+        send_advancement_delta(&mut tracker, &me, true);
+        player_mechanism_sessions().lock().unwrap().insert(me.eid, PlayerMechanismSession::default());
         let mut cls = clients().lock().unwrap();
         *me.chunks.lock().unwrap() = sent;
-        // deferred sends (attrs/sidebar) happen after registration below
         for c in cls.iter() {
             // tab-list info is global (vanilla keeps it world-wide);
             // the ENTITY spawn is interest-gated — the sweep sends it
@@ -25335,7 +25783,6 @@ fn handle(mut s: TcpStream) {
         *me.armor_pts.lock().unwrap() = armor_pts_of(&iv);
     }
     send_attrs(&me);
-    sidebar_push(&me);
     // echo restored inventory slots so the client sees them
     {
         let inv = me.inv.lock().unwrap();
@@ -27256,15 +27703,9 @@ fn handle(mut s: TcpStream) {
                                 });
                             }
                         }
-                        // player xp scatters as orbs (~7*level, cap 100)
-                        let tot = {
-                            let mut x = me.xp.lock().unwrap();
-                            let v = *x;
-                            *x = 0;
-                            v
-                        };
+                        // Scatter the XP represented by the player's bar.
+                        let mut rem = take_dropped_experience(&me);
                         let mut xs = xps().lock().unwrap();
-                        let mut rem = tot.clamp(0, 100);
                         while rem > 0 {
                             let v = rem.min(10) as i16;
                             rem -= v as i64;
@@ -27291,8 +27732,8 @@ fn handle(mut s: TcpStream) {
                         (sdim, pos.0, pos.1, pos.2)
                     };
                     switch_client_dimension(&me, sdim, (rx, ry, rz, 0.0, 0.0), view);
-                    *me.food.lock().unwrap() = 20;
-                    *me.sat.lock().unwrap() = 5.0;
+                    reset_player_food(&me);
+                    let _ = send_player_xp(&me, |_| Ok(()));
                     {
                         let iv = me.inv.lock().unwrap();
                         *me.armor_pts.lock().unwrap() = armor_pts_of(&iv);
@@ -28842,6 +29283,7 @@ fn handle(mut s: TcpStream) {
         let mut cls = clients().lock().unwrap();
         cls.retain(|c| c.eid != me_cleanup.eid);
         drop(cls);
+        player_mechanism_sessions().lock().unwrap().remove(&me_cleanup.eid);
         broadcast(me_cleanup.eid, |_c| {
             (0x42, {
                 let mut p = Vec::new();
