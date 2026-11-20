@@ -147,6 +147,100 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// ---------------------------------------------------------- play keepalive
+
+/// Vanilla 1.21.1 sends a keepalive every 15 seconds and expects the matching
+/// response within the same interval. This state is owned by one connection.
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeepaliveAction {
+    Wait,
+    Send(i64),
+    TimedOut,
+}
+
+#[derive(Debug)]
+pub(crate) struct KeepaliveState {
+    last_sent: Instant,
+    pending: Option<i64>,
+}
+
+impl KeepaliveState {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            last_sent: now,
+            pending: None,
+        }
+    }
+
+    /// `id` is used only when the next challenge is due.
+    pub(crate) fn tick(&mut self, now: Instant, id: i64) -> KeepaliveAction {
+        if now.saturating_duration_since(self.last_sent) < KEEPALIVE_INTERVAL {
+            return KeepaliveAction::Wait;
+        }
+        if self.pending.is_some() {
+            return KeepaliveAction::TimedOut;
+        }
+        self.last_sent = now;
+        self.pending = Some(id);
+        KeepaliveAction::Send(id)
+    }
+
+    pub(crate) fn reply(&mut self, now: Instant, payload: &[u8]) -> bool {
+        let Ok(bytes) = <[u8; 8]>::try_from(payload) else {
+            return false;
+        };
+        if now.saturating_duration_since(self.last_sent) >= KEEPALIVE_INTERVAL
+            || self.pending != Some(i64::from_be_bytes(bytes))
+        {
+            return false;
+        }
+        self.pending = None;
+        true
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+
+    #[test]
+    fn keepalive_waits_and_accepts_the_exact_outstanding_id() {
+        let start = Instant::now();
+        let sent = start + KEEPALIVE_INTERVAL;
+        let mut state = KeepaliveState::new(start);
+        assert_eq!(state.tick(start, -9), KeepaliveAction::Wait);
+        assert_eq!(state.tick(sent, -9), KeepaliveAction::Send(-9));
+        let reply = sent + Duration::from_secs(1);
+        assert_eq!(state.tick(reply, 4), KeepaliveAction::Wait);
+        assert!(!state.reply(reply, &4i64.to_be_bytes()));
+        assert!(!state.reply(reply, &(-9i64).to_be_bytes()[..7]));
+        assert!(state.reply(reply, &(-9i64).to_be_bytes()));
+        assert_eq!(
+            state.tick(sent + KEEPALIVE_INTERVAL, 4),
+            KeepaliveAction::Send(4)
+        );
+    }
+
+    #[test]
+    fn challenge_deadline_expires_despite_other_traffic() {
+        let start = Instant::now();
+        let sent = start + KEEPALIVE_INTERVAL;
+        let mut state = KeepaliveState::new(start);
+        assert_eq!(state.tick(sent, 1), KeepaliveAction::Send(1));
+        for second in 1..15 {
+            assert_eq!(
+                state.tick(sent + Duration::from_secs(second), second),
+                KeepaliveAction::Wait
+            );
+        }
+        let deadline = sent + KEEPALIVE_INTERVAL;
+        assert!(!state.reply(deadline, &1i64.to_be_bytes()));
+        assert_eq!(state.tick(deadline, 2), KeepaliveAction::TimedOut);
+    }
+}
+
 fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok()?.trim().parse().ok()
 }

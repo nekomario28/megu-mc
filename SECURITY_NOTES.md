@@ -162,7 +162,7 @@ What changed to contain that, without pretending it is authentication:
 |---|---|---|
 | `MC_SPINE_MAX_CONN_PER_IP` | 4 for non-loopback peers; loopback unlimited unless the variable is set (then it applies everywhere); `0` = unlimited | concurrent connections per remote IP, in addition to the global 64 |
 | `MC_SPINE_LOGIN_TIMEOUT_SECS` | 15 (was a fixed 30) | one wall-clock budget for handshake + login + configuration |
-| `MC_SPINE_IDLE_TIMEOUT_SECS` | 60 | play state: no *complete* packet for this long drops the client (vanilla clients answer the 8 s keepalive and send movement) |
+| `MC_SPINE_IDLE_TIMEOUT_SECS` | 60 | play state: no *complete* packet for this long drops the client (keep-alive challenges have a separate 15 s deadline) |
 | `MC_SPINE_RCON_MAX_FAILURES` | 5 | wrong RCON passwords from one IP before lockout |
 | `MC_SPINE_RCON_LOCKOUT_SECS` | 30 | first lockout; doubles per further failure, max 15 min; locked-out IPs are dropped at accept |
 | `MC_SPINE_BACKUP_INTERVAL_SECS` | 600 | see persistence below |

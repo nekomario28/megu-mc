@@ -2809,10 +2809,8 @@ const fn chain_fuse_left(jitter: u64) -> u64 {
 }
 // Wall-clock owners. Vanilla defines these in real time, not in game ticks, so
 // they anchor on Instants: changing the simulation cadence must not shift them.
-const KEEPALIVE_MS: u64 = 15_000; // ServerCommonPacketListenerImpl
 const TIME_NOTIFY_MS: u64 = 1_000; // day/night display sync
 const SIZE_LOG_MS: u64 = 5_000; // container-count watch (diagnostic)
-static KEEPALIVE_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 static TIME_NOTIFY_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 static SIZE_LOG_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 /// The tick loop's pacing rule, extracted so it can be held to a contract.
@@ -3190,9 +3188,6 @@ fn keepalive_time_tick() {
             p.extend_from_slice(&(wt as i64).to_be_bytes());
             (0x64, p)
         });
-    });
-    every_ms(&KEEPALIVE_AT, KEEPALIVE_MS, || {
-        broadcast(0, |_c| (0x26, t.to_be_bytes().to_vec()));
     });
     every_ms(&SIZE_LOG_AT, SIZE_LOG_MS, || {
         let rss = std::fs::read_to_string("/proc/self/status")
@@ -30223,7 +30218,8 @@ fn handle(mut s: TcpStream) {
     // ---- consume loop ----
     s.set_read_timeout(Some(Duration::from_secs(2))).ok();
     s.set_write_timeout(Some(Duration::from_secs(2))).ok();
-    let mut last_ka = Instant::now();
+    let mut keepalive = connection_limits::KeepaliveState::new(Instant::now());
+    let mut next_keepalive_id = 1i64;
     let mut held_slot: i16 = 0;
 
     // Start from the saved column, not (0,0): a Nether login at x=800 would otherwise
@@ -30231,18 +30227,25 @@ fn handle(mut s: TcpStream) {
     let mut player_chunk: (i32, i32) =
         ((sx / 16.0).floor() as i32, (sz / 16.0).floor() as i32);
     let mut rx = RxBuf::new();
-    // play-state liveness: a client that stops sending complete packets (it
-    // answers our 8 s keepalive and moves, so this is never quiet for long)
+    // Play-state packet inactivity is tracked separately from the keep-alive deadline.
     let mut last_rx = Instant::now();
     let mut chat_throttle = connection_limits::ChatThrottle::new(Instant::now());
     'conn: loop {
-        if last_ka.elapsed() > Duration::from_secs(8) {
-            let mut ka = Vec::new();
-            ka.extend_from_slice(&1i64.to_be_bytes());
-            if send_packet(&mut me.sock.lock().unwrap(), 0x26, ka).is_err() {
+        use connection_limits::KeepaliveAction;
+        match keepalive.tick(Instant::now(), next_keepalive_id) {
+            KeepaliveAction::Send(id) => {
+                if send_packet(&mut me.sock.lock().unwrap(), 0x26, id.to_be_bytes().to_vec())
+                    .is_err()
+                {
+                    break 'conn;
+                }
+                next_keepalive_id = next_keepalive_id.wrapping_add(1);
+            }
+            KeepaliveAction::TimedOut => {
+                play_disconnect(&mut me.sock.lock().unwrap(), "Timed out");
                 break 'conn;
             }
-            last_ka = Instant::now();
+            KeepaliveAction::Wait => {}
         }
         let (pid, b) = match rx.next(&mut s) {
             RxOut::Closed => break 'conn,
@@ -30281,6 +30284,12 @@ fn handle(mut s: TcpStream) {
         }
 
         match pid {
+            0x18 => {
+                if !keepalive.reply(Instant::now(), &b) {
+                    play_disconnect(&mut me.sock.lock().unwrap(), "Timed out");
+                    break 'conn;
+                }
+            }
             0x02 => {
                 // Serverbound change difficulty: difficulty byte + locked flag.
                 if b.len() == 2 && b[0] <= 3 && b[1] <= 1 && player_is_admin(&me.name) {
