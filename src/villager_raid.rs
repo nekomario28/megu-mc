@@ -200,8 +200,10 @@ struct MerchantOffer {
 impl MerchantOffer {
     #[cfg_attr(not(test), allow(dead_code))]
     fn update_demand(&mut self) {
-        let demand = i64::from(self.demand) + 2 * i64::from(self.uses) - i64::from(self.max_uses);
-        self.demand = demand.clamp(0, i64::from(i32::MAX)) as i32;
+        self.demand = self
+            .demand
+            .wrapping_add(self.uses)
+            .wrapping_sub(self.max_uses.wrapping_sub(self.uses));
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1019,6 +1021,11 @@ mod villager_raid_tests {
                 ..offer()
             },
             MerchantOffer {
+                uses: 0,
+                demand: 0,
+                ..offer()
+            },
+            MerchantOffer {
                 demand: 5,
                 ..offer()
             },
@@ -1035,9 +1042,10 @@ mod villager_raid_tests {
                 .iter()
                 .map(|offer| (offer.demand, offer.uses))
                 .collect::<Vec<_>>(),
-            [(7, 0), (1, 0), (0, 0)]
+            [(7, 0), (-4, 0), (1, 0), (-2, 0)]
         );
         assert_eq!(villager.offers[0].cost_a(), 27);
+        assert_eq!(villager.offers[1].cost_a(), 20);
         assert_eq!(villager.restocks_today, 1);
         villager.tick(&pois, AT_WORK, 4_000);
         assert_eq!(villager.offers[0].demand, 7);

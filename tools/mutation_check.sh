@@ -2884,12 +2884,14 @@ check "preliminary (structure-free) columns stay out of the column cache" \
 # mutant restores the pre-fix chunk-centre read, which in the Nether answers a different
 # biome (seed 4242 (-24,22): centre soul_sand_valley, scan position basalt_deltas).
 check "a template structure's biome gate reads the start, not the chunk centre" \
-  src/structure_pipeline.rs '            if !def.biomes.is_empty()
-                && !fc
-                    .biome(stub.0, stub.1, stub.2)' \
-  '            if !def.biomes.is_empty()
-                && !fc
-                    .biome(cx * 16 + 8, 64, cz * 16 + 8)' \
+  src/structure_pipeline.rs '            if !valid_biome(fc.g, &def.biomes, stub) {
+                return None;
+            }
+            let pieces = with_templates(|templates| build(&mut fc, templates, &mut gen, reg).ok())?;' \
+  '            if !valid_biome(fc.g, &def.biomes, (cx * 16 + 8, 64, cz * 16 + 8)) {
+                return None;
+            }
+            let pieces = with_templates(|templates| build(&mut fc, templates, &mut gen, reg).ok())?;' \
   feature::pipeline_tests::nether_fossil_biome_gate_reads_the_start_not_the_chunk_centre
 
 check "fortress fillColumnDown stops above the build floor" \
@@ -2943,9 +2945,9 @@ check "mansion 2x2 room mirror is the front-back flip only for the west-south en
   '            (Dir::West, Dir::South) => (15, 0, rotation, Mirror::from_index(1).unwrap()),' \
   structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
 
-check "mansion foundation stops at the first non-air cell above sea level" \
-  src/end_city_mansion.rs '                if inside && !is_air_state(reg, world.get(x, y, z)) {' \
-  '                if false && inside && !is_air_state(reg, world.get(x, y, z)) {' \
+check "mansion foundation stops at the first solid cell above sea level" \
+  src/end_city_mansion.rs '                if !is_air_state(reg, state) && !reg.is_liquid(state) {' \
+  '                if !is_air_state(reg, state) && reg.is_liquid(state) {' \
   structure_template::end_city_mansion_tests::mansion_foundation_fills_air_columns_above_sea_level
 # The piece stream is `Lcg`, seeded with `seed + attempt`; the chunk-position mix lives
 # in `Lcg::for_large_feature` and is mutated by the "large feature seeding" entry above.

@@ -326,20 +326,12 @@ fn step_entity_move(
     )
 }
 
-/// 1.21.1 `EntityType.<clinit>` (`bsx.javap`) bounding-box `(width, height)`.
+/// Registry bounds for the mob types with explicit collision support.
 fn mob_dimensions(etype: i64) -> (f32, f32) {
     match etype {
-        3 => (0.5, 1.975),  // armor_stand
-        6 => (0.5, 0.9),    // bat
-        16 => (0.7, 0.5),   // cave_spider
-        19 => (0.4, 0.7),   // chicken
-        22 => (0.9, 1.4),   // cow
-        23 => (0.6, 1.7),   // creeper
-        77 => (0.9, 0.9),   // pig
-        87 => (0.9, 1.3),   // sheep
-        91 => (0.6, 1.99),  // skeleton
-        100 => (1.4, 0.9),  // spider
-        124 => (0.6, 1.95), // zombie
+        3 | 6 | 16 | 19 | 22 | 23 | 77 | 87 | 91 | 100 | 124 => {
+            crate::entity_dimensions_1211(etype)
+        }
         _ => (0.6, 1.8),
     }
 }

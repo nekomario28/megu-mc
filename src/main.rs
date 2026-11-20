@@ -6667,21 +6667,21 @@ fn materialize_generation_payloads_inner(
 }
 fn default_mob_hp(id: &str) -> f32 {
     let short = id.strip_prefix("minecraft:").unwrap_or(id);
-    match short {
-        "elder_guardian" => 80.0,
-        "witch" => 26.0,
-        "cat" | "cow" | "pig" => 10.0,
-        "shulker" => 30.0,
-        "evoker" | "vindicator" | "pillager" => 24.0,
-        "piglin" | "spider" | "magma_cube" => 16.0,
-        "piglin_brute" => 50.0,
-        "hoglin" => 40.0,
-        "iron_golem" => 100.0,
-        "cave_spider" => 12.0,
-        "silverfish" | "sheep" => 8.0,
-        "camel" => 32.0,
-        _ => 20.0,
+    if short == "magma_cube" {
+        return 16.0;
     }
+    if matches!(
+        short,
+        "elder_guardian" | "witch" | "cat" | "cow" | "pig" | "shulker"
+            | "evoker" | "vindicator" | "pillager" | "piglin" | "spider"
+            | "piglin_brute" | "hoglin" | "iron_golem" | "cave_spider"
+            | "silverfish" | "sheep" | "camel"
+    ) {
+        return entity_spec_by_name(id)
+            .map(|spec| spec.max_health)
+            .unwrap_or(20.0);
+    }
+    20.0
 }
 fn chests() -> &'static LockedMap<ContainerKey, HashMap<i16, Stack>> {
     CHESTS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -16534,140 +16534,7 @@ fn spawn_etype_for_biome(biome: Option<&str>, attempt: u64) -> i64 {
 }
 
 fn name_to_etype(n: &str) -> Option<i64> {
-    let n = n.strip_prefix("minecraft:").unwrap_or(n);
-    Some(match n {
-        "allay" => 0,
-        "area_effect_cloud" => 1,
-        "armadillo" => 2,
-        "armor_stand" => 3,
-        "arrow" => 4,
-        "axolotl" => 5,
-        "bat" => 6,
-        "bee" => 7,
-        "blaze" => 8,
-        "block_display" => 9,
-        "boat" => 10,
-        "bogged" => 11,
-        "breeze" => 12,
-        "breeze_wind_charge" => 13,
-        "camel" => 14,
-        "cat" => 15,
-        "cave_spider" => 16,
-        "chest_boat" => 17,
-        "chest_minecart" => 18,
-        "chicken" => 19,
-        "cod" => 20,
-        "command_block_minecart" => 21,
-        "cow" => 22,
-        "creeper" => 23,
-        "dolphin" => 24,
-        "donkey" => 25,
-        "dragon_fireball" => 26,
-        "drowned" => 27,
-        "egg" => 28,
-        "elder_guardian" => 29,
-        "end_crystal" => 30,
-        "ender_dragon" => 31,
-        "ender_pearl" => 32,
-        "enderman" => 33,
-        "endermite" => 34,
-        "evoker" => 35,
-        "evoker_fangs" => 36,
-        "experience_bottle" => 37,
-        "experience_orb" => 38,
-        "eye_of_ender" => 39,
-        "falling_block" => 40,
-        "firework_rocket" => 41,
-        "fox" => 42,
-        "frog" => 43,
-        "furnace_minecart" => 44,
-        "ghast" => 45,
-        "giant" => 46,
-        "glow_item_frame" => 47,
-        "glow_squid" => 48,
-        "goat" => 49,
-        "guardian" => 50,
-        "hoglin" => 51,
-        "hopper_minecart" => 52,
-        "horse" => 53,
-        "husk" => 54,
-        "illusioner" => 55,
-        "interaction" => 56,
-        "iron_golem" => 57,
-        "item" => 58,
-        "item_display" => 59,
-        "item_frame" => 60,
-        "ominous_item_spawner" => 61,
-        "fireball" => 62,
-        "leash_knot" => 63,
-        "lightning_bolt" => 64,
-        "llama" => 65,
-        "llama_spit" => 66,
-        "magma_cube" => 67,
-        "marker" => 68,
-        "minecart" => 69,
-        "mooshroom" => 70,
-        "mule" => 71,
-        "ocelot" => 72,
-        "painting" => 73,
-        "panda" => 74,
-        "parrot" => 75,
-        "phantom" => 76,
-        "pig" => 77,
-        "piglin" => 78,
-        "piglin_brute" => 79,
-        "pillager" => 80,
-        "polar_bear" => 81,
-        "potion" => 82,
-        "pufferfish" => 83,
-        "rabbit" => 84,
-        "ravager" => 85,
-        "salmon" => 86,
-        "sheep" => 87,
-        "shulker" => 88,
-        "shulker_bullet" => 89,
-        "silverfish" => 90,
-        "skeleton" => 91,
-        "skeleton_horse" => 92,
-        "slime" => 93,
-        "small_fireball" => 94,
-        "sniffer" => 95,
-        "snow_golem" => 96,
-        "snowball" => 97,
-        "spawner_minecart" => 98,
-        "spectral_arrow" => 99,
-        "spider" => 100,
-        "squid" => 101,
-        "stray" => 102,
-        "strider" => 103,
-        "tadpole" => 104,
-        "text_display" => 105,
-        "tnt" => 106,
-        "tnt_minecart" => 107,
-        "trader_llama" => 108,
-        "trident" => 109,
-        "tropical_fish" => 110,
-        "turtle" => 111,
-        "vex" => 112,
-        "villager" => 113,
-        "vindicator" => 114,
-        "wandering_trader" => 115,
-        "warden" => 116,
-        "wind_charge" => 117,
-        "witch" => 118,
-        "wither" => 119,
-        "wither_skeleton" => 120,
-        "wither_skull" => 121,
-        "wolf" => 122,
-        "zoglin" => 123,
-        "zombie" => 124,
-        "zombie_horse" => 125,
-        "zombie_villager" => 126,
-        "zombified_piglin" => 127,
-        "player" => 128,
-        "fishing_bobber" => 129,
-        _ => return None,
-    })
+    entity_spec_by_name(n).map(|spec| spec.id)
 }
 
 // ---------- resource pack (embedded http + sha1) ----------
@@ -29307,10 +29174,8 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
         }
         if edible && eat_release {
             let mut f = me.food.lock().unwrap();
-            *f = (*f + fv).min(20);
-            let nf = *f as f32;
             let mut st = me.sat.lock().unwrap();
-            *st = (*st + sat_value(it)).min(nf);
+            (*f, *st) = FoodData::values_after_eating(*f, *st, fv, sat_value(it));
             drop(st);
             drop(f);
             let ncnt = {

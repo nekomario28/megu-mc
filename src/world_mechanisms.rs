@@ -78,8 +78,9 @@ impl WorldBorderState {
 
     fn border_damage_for_pos(&self, x: f64, z: f64, now_tick: u64) -> f32 {
         let distance = self.distance_to_border(x, z, now_tick);
-        if distance < -self.damage_safe_zone {
-            ((-distance - self.damage_safe_zone) * self.damage_per_block).max(1.0) as f32
+        if distance < -self.damage_safe_zone && self.damage_per_block > 0.0 {
+            let damage = (-distance - self.damage_safe_zone) * self.damage_per_block;
+            (damage.floor() as i32).max(1) as f32
         } else {
             0.0
         }
@@ -296,6 +297,21 @@ impl AdvancementTracker {
 
     fn grant_through(&mut self, player: &str, id: &str, time_ms: i64) -> usize {
         let mut granted = self.grant_from(player, id, time_ms);
+        granted += self.grant_parents(player, id, time_ms);
+        granted
+    }
+
+    fn grant_until(&mut self, player: &str, id: &str, time_ms: i64) -> usize {
+        let Some(definition) = self.definition(id) else {
+            return 0;
+        };
+        let mut granted = self.grant_parents(player, id, time_ms);
+        granted += self.grant_definition(player, definition, time_ms);
+        granted
+    }
+
+    fn grant_parents(&mut self, player: &str, id: &str, time_ms: i64) -> usize {
+        let mut granted = 0;
         let mut parent = self.definition(id).and_then(|definition| definition.parent);
         while let Some(definition) = parent.and_then(|id| self.definition(id)) {
             granted += self.grant_definition(player, definition, time_ms);
@@ -1037,6 +1053,12 @@ mod world_mechanisms_tests {
         assert_eq!(border.border_damage_for_pos(25.0, -10.0, 0), 0.0);
         assert_eq!(border.border_damage_for_pos(26.0, -10.0, 0), 1.0);
         assert_eq!(border.border_damage_for_pos(35.0, -10.0, 0), 2.0);
+        border.damage_per_block = 0.1;
+        assert_eq!(border.border_damage_for_pos(35.0, -10.0, 0), 1.0);
+        assert_eq!(border.border_damage_for_pos(40.0, -10.0, 0), 1.0);
+        assert_eq!(border.border_damage_for_pos(45.0, -10.0, 0), 2.0);
+        border.damage_per_block = 0.0;
+        assert_eq!(border.border_damage_for_pos(45.0, -10.0, 0), 0.0);
         border.absolute_max_size = 12;
         assert_eq!(border.bounds(0), (0.0, -12.0, 12.0, 0.0));
         border.center_x = 100.0;
@@ -1104,6 +1126,21 @@ mod world_mechanisms_tests {
             Some("minecraft:end/root")
         );
         assert!(!tracker.completed("Alex", "minecraft:nether/root"));
+    }
+
+    #[test]
+    fn advancements_grant_until_awards_only_the_selected_ancestor_chain() {
+        let mut tracker = AdvancementTracker::default();
+        let selected = "minecraft:story/lava_bucket";
+        assert_eq!(tracker.grant_until("Alex", "minecraft:unknown", 1), 0);
+        assert!(!tracker.progress.contains_key("Alex"));
+        assert_eq!(tracker.grant_until("Alex", selected, 2), 5);
+        for id in [ROOT, STONE, TOOLS, IRON, selected] {
+            assert!(tracker.completed("Alex", id), "{id}");
+        }
+        assert!(!tracker.completed("Alex", ARMOR));
+        assert!(!tracker.completed("Alex", "minecraft:story/form_obsidian"));
+        assert_eq!(tracker.grant_until("Alex", selected, 3), 0);
     }
 
     #[test]
