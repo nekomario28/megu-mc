@@ -1060,6 +1060,18 @@ impl Default for FoodData {
 }
 
 impl FoodData {
+    /// The saturation argument is the food's absolute saturation gain.
+    fn values_after_eating(
+        food_level: i32,
+        saturation: f32,
+        nutrition: i32,
+        saturation_gain: f32,
+    ) -> (i32, f32) {
+        let food_level = food_level.wrapping_add(nutrition).clamp(0, 20);
+        let saturation = (saturation + saturation_gain).clamp(0.0, food_level as f32);
+        (food_level, saturation)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     fn add_exhaustion(&mut self, amount: f32) {
         self.exhaustion = (self.exhaustion + amount).min(40.0);
@@ -1119,6 +1131,13 @@ impl FoodData {
 #[cfg(test)]
 mod player_mechanisms_tests {
     use super::*;
+
+    #[test]
+    fn eating_clamps_saturation_to_the_updated_food_level() {
+        assert_eq!(FoodData::values_after_eating(4, 3.0, 2, 4.0), (6, 6.0));
+        assert_eq!(FoodData::values_after_eating(17, 5.0, 8, 12.0), (20, 17.0));
+        assert_eq!(FoodData::values_after_eating(2, 1.0, -3, -2.0), (0, 0.0));
+    }
 
     fn stack(item: &str, count: u8) -> Stack {
         (

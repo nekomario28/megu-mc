@@ -29189,10 +29189,8 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
         }
         if edible && eat_release {
             let mut f = me.food.lock().unwrap();
-            *f = (*f + fv).min(20);
-            let nf = *f as f32;
             let mut st = me.sat.lock().unwrap();
-            *st = (*st + sat_value(it)).min(nf);
+            (*f, *st) = FoodData::values_after_eating(*f, *st, fv, sat_value(it));
             drop(st);
             drop(f);
             let ncnt = {
