@@ -13,15 +13,40 @@ def jar(path, entries):
             info.compress_type = zipfile.ZIP_DEFLATED
             output.writestr(info, data)
 
+
+def build_runtime(build, sources, javac, java, legacy_classes, libraries):
+    named = build / 'runtime-named'
+    named.mkdir()
+    subprocess.run([javac, '-J-Xmx128m', '--release', '21', '-proc:none', '-d', str(named),
+                    *map(str, sources)], check=True)
+    intermediary = build / 'runtime-intermediary'
+    subprocess.run([java, '-Xmx128m', '-cp', os.pathsep.join(map(str, [legacy_classes, *libraries])),
+                    'net.mcspine.probe.RemapFacade', str(ROOT / 'runtime-intermediary.properties'),
+                    str(named), str(intermediary)], check=True)
+    manifest = b'Manifest-Version: 1.0\r\nMain-Class: net.mcspine.probe.FabricRuntimeAdapter\r\n\r\n'
+    surface = (ROOT / 'shim-surface.json').read_bytes()
+    for classes, filename, namespace in ((named, 'fabric-runtime.jar', 'named'),
+                                         (intermediary, 'fabric-runtime-intermediary.jar', 'intermediary')):
+        entries = {str(p.relative_to(classes)): p.read_bytes() for p in classes.rglob('*.class')}
+        entries['META-INF/MANIFEST.MF'] = manifest
+        entries['fabric-runtime-namespace'] = (namespace + '\n').encode()
+        entries['fabric-runtime-surface.json'] = surface
+        jar(build / filename, entries)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--java-home', default=os.environ.get('JAVA_HOME'))
+    parser.add_argument('--build-dir', type=pathlib.Path, help='new output directory (default: .build)')
     parser.add_argument('--seedprotect', action='store_true')
     args = parser.parse_args()
     javac = str(pathlib.Path(args.java_home) / 'bin/javac') if args.java_home else 'javac'
-    cache, build = ROOT / '.cache', ROOT / '.build'
+    java = str(pathlib.Path(args.java_home) / 'bin/java') if args.java_home else 'java'
+    cache = ROOT / '.cache'
+    build = args.build_dir.resolve() if args.build_dir else ROOT / '.build'
     cache.mkdir(exist_ok=True)
-    if build.exists(): shutil.rmtree(build)
+    if args.build_dir is None and build.exists():
+        shutil.rmtree(build)
     build.mkdir()
     libraries = []
     for lib in json.loads((ROOT / 'dependencies.json').read_text())['libraries']:
@@ -38,8 +63,12 @@ def main():
     classes = build / 'classes'
     if classes.exists(): shutil.rmtree(classes)
     classes.mkdir()
-    sources = sorted((ROOT / 'java').rglob('*.java')) + sorted((ROOT / 'fixtures').rglob('*.java'))
+    runtime = ROOT / 'java/runtime'
+    sources = sorted(p for p in (ROOT / 'java').rglob('*.java') if not p.is_relative_to(runtime))
+    sources += sorted((ROOT / 'fixtures').rglob('*.java'))
+    runtime_sources = sorted(runtime.rglob('*.java'))
     subprocess.run([javac, '-J-Xmx128m', '--release', '21', '-proc:none', '-cp', os.pathsep.join(map(str, libraries)), '-d', str(classes), *map(str, sources)], check=True)
+    build_runtime(build, runtime_sources, javac, java, classes, libraries)
     app = {str(p.relative_to(classes)): p.read_bytes() for p in (classes / 'net/mcspine/probe').rglob('*.class')}
     app['META-INF/services/net.fabricmc.loader.impl.game.GameProvider'] = b'net.mcspine.probe.SpineGameProvider\n'
     jar(build / 'game.jar', app)
@@ -63,13 +92,13 @@ def main():
     (build / 'classpath.txt').write_text(os.pathsep.join(map(str, [build / 'game.jar', *libraries])))
     if args.seedprotect:
         from seedprotect_build import prepare
-        java = pathlib.Path(args.java_home) / 'bin/java' if args.java_home else pathlib.Path(shutil.which('java'))
         entries, broken_entries, slf4j = prepare(ROOT, build, classes, libraries, java)
         jar(build / 'game-seedprotect.jar', entries)
         jar(build / 'game-seedprotect-missing-invoke.jar', broken_entries)
         (build / 'classpath-seedprotect-missing-invoke.txt').write_text(os.pathsep.join(map(str, [build / 'game-seedprotect-missing-invoke.jar', *libraries, slf4j])))
         (build / 'classpath-seedprotect.txt').write_text(os.pathsep.join(map(str, [build / 'game-seedprotect.jar', *libraries, slf4j])))
-    (build / 'build-receipt.json').write_text(json.dumps({'java_home': args.java_home, 'sources': {str(p.relative_to(ROOT)): sha(p) for p in sources}, 'jars': {p.name: sha(p) for p in sorted(build.glob('*.jar'))}}, indent=2) + '\n')
+    runtime_inputs = [ROOT / 'runtime-intermediary.properties', ROOT / 'shim-surface.json']
+    (build / 'build-receipt.json').write_text(json.dumps({'java_home': args.java_home, 'sources': {str(p.relative_to(ROOT)): sha(p) for p in [*sources, *runtime_sources]}, 'runtime_inputs': {p.name: sha(p) for p in runtime_inputs}, 'jars': {p.name: sha(p) for p in sorted(build.glob('*.jar'))}}, indent=2) + '\n')
     print(build / 'classpath.txt')
 
 if __name__ == '__main__':

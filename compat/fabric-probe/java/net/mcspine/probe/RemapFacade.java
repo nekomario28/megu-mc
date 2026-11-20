@@ -13,6 +13,9 @@ public final class RemapFacade {
             public String mapMethodName(String owner, String name, String descriptor) {
                 return mappings.getProperty("method." + owner + "." + name + descriptor, name);
             }
+            public String mapFieldName(String owner, String name, String descriptor) {
+                return mappings.getProperty("field." + owner + "." + name + ":" + descriptor, name);
+            }
         };
         Path source = Path.of(args[1]), output = Path.of(args[2]);
         try (var paths = Files.walk(source)) {

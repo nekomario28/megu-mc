@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 from urllib.request import urlopen
 from zipfile import ZipFile
 
@@ -67,15 +68,12 @@ def deps():
     return paths
 
 
-def scanner(java_home, asm, tmpdir):
-    build = ROOT / ".shimcheck-build"
-    classes = build / "classes"
-    classes.mkdir(parents=True, exist_ok=True)
+def scanner(java_home, asm, tmpdir, classes):
     cp = os.pathsep.join(map(str, asm))
     javac = str(java_home / "bin/javac") if java_home else "javac"
     command = [javac, "-J-Djava.io.tmpdir=" + str(tmpdir), "-J-XX:-UsePerfData", "--release", "21", "-proc:none", "-cp", cp, "-d", str(classes), str(SCANNER)]
     subprocess.run(command, check=True, env={**os.environ, "TMPDIR": str(tmpdir)})
-    return classes, cp
+    return cp
 
 
 def metadata_for(path, zf, names):
@@ -175,80 +173,197 @@ def metadata_for(path, zf, names):
     return raw, reasons, client_mixins
 
 
-def run(args):
-    surface = json.loads(args.surface.read_text())
-    classes_surface = surface.get("classes", {})
+PLATFORM_PREFIXES = ("net/minecraft/", "net/fabricmc/", "com/mojang/brigadier/")
+RUNTIME_RESERVED = (*PLATFORM_PREFIXES, "net/mcspine/probe/", "java/",
+                    "org/spongepowered/asm/", "org/objectweb/asm/")
+ENTRY_CLASS = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*")
+
+
+def runtime_metadata(raw, names, reasons, jar):
+    if raw.get("mixins"):
+        reasons.append(fail("UNSUPPORTED_RUNTIME_MIXIN", "runtime has no Mixin transformer", jar, "fabric.mod.json"))
+    if raw.get("jars") or any(n.lower().endswith(".jar") for n in names):
+        reasons.append(fail("UNVERIFIED_NESTED_JAR", "runtime loads only submitted JARs", jar))
+    if "META-INF/INDEX.LIST" in names or any(n.startswith("META-INF/versions/") for n in names):
+        reasons.append(fail("UNSUPPORTED_ARCHIVE_LAYOUT", "indexed and multi-release JARs are unsupported", jar))
+    if "META-INF/neoforge.mods.toml" in names or "META-INF/mods.toml" in names:
+        reasons.append(fail("CONFLICTING_METADATA", "JAR also declares another mod loader", jar))
+    if isinstance(raw.get("depends"), dict):
+        for dependency in sorted(set(raw["depends"]) - {"fabricloader", "minecraft", "java"}):
+            reasons.append(fail("UNSUPPORTED_RUNTIME_DEPENDENCY", dependency, jar, "fabric.mod.json"))
+        predicates = raw["depends"].get("java", "*")
+        predicates = predicates if isinstance(predicates, list) else [predicates]
+        if predicates and all(isinstance(p, str) for p in predicates):
+            try:
+                if not any(satisfies(p, "21") for p in predicates):
+                    reasons.append(fail("UNSATISFIED_DEPENDENCY", "requires a different Java version", jar))
+            except ValueError:
+                pass  # metadata_for already reports unsupported predicates.
+    entries = {"main": [], "server": [], "client": []}
+    if isinstance(raw.get("entrypoints"), dict):
+        for kind, result in entries.items():
+            configured = raw["entrypoints"].get(kind, [])
+            if isinstance(configured, list):
+                for name in configured:
+                    if isinstance(name, str) and ENTRY_CLASS.fullmatch(name):
+                        result.append(name.replace(".", "/"))
+                    elif kind != "client":
+                        reasons.append(fail("UNSUPPORTED_ENTRYPOINT", "expected a Java class name", jar, kind))
+    return entries
+
+
+def runtime_classes(rows, entries, reasons, jar):
+    server_entries = set(entries["main"] + entries["server"])
+    excluded = {row["class"] for row in rows if row["client"]}
+    excluded.update(set(entries["client"]) - server_entries)
+    classes = {row["class"] for row in rows}
+    for name in sorted(server_entries):
+        if name not in classes:
+            reasons.append(fail("MISSING_ENTRYPOINT_CLASS", "entrypoint is absent from its JAR", jar, name))
+        elif name in excluded:
+            reasons.append(fail("CLIENT_ONLY_ENTRYPOINT", "server entrypoint is client-only", jar, name))
+    for row in rows:
+        owner = row["class"]
+        if (row["entry"] != owner + ".class" or
+                any(ord(ch) < 32 for ch in owner) or not 45 <= row["version"] <= 65):
+            reasons.append(fail("INVALID_CLASS_ENTRY", "invalid class entry name or Java version", jar, row["entry"]))
+        if owner.startswith(RUNTIME_RESERVED):
+            reasons.append(fail("RESERVED_CLASS", "mod defines a class in a host package", jar, owner))
+        if any(ref.startswith("org/spongepowered/asm/") for ref in row["refs"]):
+            reasons.append(fail("UNSUPPORTED_RUNTIME_MIXIN", "class references Mixin", jar, owner))
+        if owner in excluded:
+            continue
+        if row["client_member"]:
+            reasons.append(fail("CLIENT_ONLY_MEMBER", "runtime cannot strip client-only members", jar, owner))
+        for ref in sorted(set(row["refs"]) & excluded):
+            reasons.append(fail("CLIENT_ONLY_REFERENCE", "server class references " + ref, jar, owner))
+        if any(ref.startswith("net/mcspine/probe/") for ref in row["refs"]):
+            reasons.append(fail("INTERNAL_RUNTIME_REFERENCE", "class references probe internals", jar, owner))
+    return sorted(excluded & classes)
+
+
+def audit(args, classes_surface, tmp, classes, cp):
     methods = {owner: set(spec.get("methods", [])) for owner, spec in classes_surface.items()}
     fields = {owner: set(spec.get("fields", [])) for owner, spec in classes_surface.items()}
-    jars = [Path(p).resolve() for p in args.jars]
-    records = []
-    tmp = Path(os.environ.get("TMPDIR", str(ROOT.parent.parent / "target/tmp"))).resolve()
-    tmp.mkdir(parents=True, exist_ok=True)
-    asm = deps()
-    classes, cp = scanner(args.java_home, asm, tmp)
-    for path in jars:
-        reasons, supported, unsupported, client_classes, refs = [], [], [], [], []
+    java = str(args.java_home / "bin/java") if args.java_home else "java"
+    records, plan, mod_ids = [], [], set()
+    for index, path in enumerate(args.jars):
+        path = path.resolve()
+        jar = f"{index}.jar" if args.runtime_plan else str(path)
+        record = {"jar": jar, "sha256": None, "status": "REJECTED", "supported_classes": [],
+                  "unsupported_classes": [], "supported_members": [], "unsupported_members": [],
+                  "client_classes": [], "diagnostics": []}
+        records.append(record)
+        reasons = record["diagnostics"]
         if not path.is_file() or path.stat().st_size > MAX_JAR:
-            records.append({"jar": str(path), "sha256": None, "status": "REJECTED", "supported_classes": [], "unsupported_classes": [], "supported_members": [], "unsupported_members": [], "client_classes": [], "diagnostics": [fail("INVALID_JAR", "missing or exceeds size limit", str(path))]}); continue
-        payload = path.read_bytes()
+            reasons.append(fail("INVALID_JAR", "missing or exceeds size limit", jar))
+            continue
+        record["sha256"] = digest(path.read_bytes())
         try:
             with ZipFile(path) as zf:
-                names = zf.namelist(); _, reasons, client_mixins = metadata_for(path, zf, names)
+                names = zf.namelist()
+                raw, metadata_reasons, client_mixins = metadata_for(jar, zf, names)
         except Exception as exc:
-            records.append({"jar": str(path), "sha256": digest(payload), "status": "REJECTED", "supported_classes": [], "unsupported_classes": [], "supported_members": [], "unsupported_members": [], "client_classes": [], "diagnostics": [fail("INVALID_JAR", str(exc), str(path))]}); continue
+            reasons.append(fail("INVALID_JAR", str(exc), jar))
+            continue
+        reasons.extend(metadata_reasons)
+        if args.runtime_plan:
+            entries = runtime_metadata(raw, names, reasons, jar)
+            mod_id = raw.get("id")
+            if isinstance(mod_id, str) and re.fullmatch(r"[a-z][a-z0-9_-]{1,63}", mod_id):
+                if mod_id in mod_ids:
+                    reasons.append(fail("DUPLICATE_MOD_ID", mod_id, jar))
+                mod_ids.add(mod_id)
+            else:
+                reasons.append(fail("INVALID_MOD_ID", "expected a Fabric mod identifier", jar))
         jar_classes = {n[:-6] for n in names if n.endswith(".class")}
-        command = [str((args.java_home / "bin/java") if args.java_home else Path("java")), "-Djava.io.tmpdir=" + str(tmp), "-XX:-UsePerfData", "-cp", os.pathsep.join([str(classes), cp]), "net.mcspine.probe.FabricShimCheck", str(path)]
-        scan = subprocess.run(command, check=True, text=True, capture_output=True, env={**os.environ, "TMPDIR": str(tmp)})
-        jar_rows = [json.loads(line) for line in scan.stdout.splitlines()]
-        for row in sorted((r for r in jar_rows if r["class"] in jar_classes), key=lambda r: r["class"]):
+        command = [java, "-Djava.io.tmpdir=" + str(tmp), "-XX:-UsePerfData", "-cp",
+                   os.pathsep.join([str(classes), cp]), "net.mcspine.probe.FabricShimCheck", str(path)]
+        scan = subprocess.run(command, text=True, capture_output=True)
+        if scan.returncode != 0:
+            reasons.append(fail("INVALID_CLASS_FILE", "ASM could not scan archive class entries", jar))
+            continue
+        rows = sorted((json.loads(line) for line in scan.stdout.splitlines()), key=lambda r: r["class"])
+        if args.runtime_plan:
+            excluded = runtime_classes(rows, entries, reasons, jar)
+            plan.append(f"jar\t{mod_id}\t{record['sha256']}")
+            plan.extend(f"skip\t{name.replace('/', '.')}" for name in excluded)
+            for kind in ("main", "server"):
+                plan.extend(f"{kind}\t{name.replace('/', '.')}" for name in entries[kind])
+        else:
+            excluded = sorted({r["class"] for r in rows if r["client"]} | client_mixins)
+        record["client_classes"] = excluded
+        excluded = set(excluded)
+        supported, unsupported, refs = set(), set(), set()
+        for row in rows:
             owner = row["class"]
-            if row["client"] or owner in client_mixins:
-                client_classes.append(owner)
+            if owner in excluded or owner not in jar_classes:
                 continue
             for ref in row["refs"]:
-                if ref.startswith("net/minecraft/class_") or ref.startswith("net/fabricmc/"):
-                    refs.append(ref)
+                if ref.startswith(PLATFORM_PREFIXES):
+                    refs.add(ref)
                     if ref not in classes_surface and ref not in jar_classes:
-                        unsupported.append({"owner": ref, "name": "<class>", "descriptor": ""})
+                        unsupported.add((ref, "<class>", ""))
             for annotation in row["annotations"]:
-                if "Lorg/spongepowered/asm/mixin/injection/Redirect;" in annotation:
-                    reasons.append(fail("UNSUPPORTED_MIXIN_INJECTION", "@Redirect is unsupported", str(path), owner))
-                if "Lorg/spongepowered/asm/mixin/injection/ModifyVariable;" in annotation:
-                    reasons.append(fail("UNSUPPORTED_MIXIN_INJECTION", "@ModifyVariable is unsupported", str(path), owner))
-                if "Lorg/spongepowered/asm/mixin/Overwrite;" in annotation:
-                    reasons.append(fail("UNSUPPORTED_MIXIN_INJECTION", "@Overwrite is unsupported", str(path), owner))
+                for injection in ("Redirect", "ModifyVariable", "Overwrite"):
+                    package = "" if injection == "Overwrite" else "injection/"
+                    if f"Lorg/spongepowered/asm/mixin/{package}{injection};" in annotation:
+                        reasons.append(fail("UNSUPPORTED_MIXIN_INJECTION", f"@{injection} is unsupported", jar, owner))
                 if ("Lorg/spongepowered/asm/mixin/injection/At;" in annotation and
-                    ("INVOKE" in annotation or "STORE" in annotation)):
-                    reasons.append(fail("UNSUPPORTED_MIXIN_AT", "nested @At(INVOKE/STORE) is unsupported", str(path), owner))
-                if annotation.startswith("MEMBER|"):
-                    _, sym_owner, name, desc = annotation.split("|", 3)
-                    if sym_owner.startswith("net/minecraft/class_") or sym_owner.startswith("net/fabricmc/"):
-                        triple = {"owner": sym_owner, "name": name, "descriptor": desc}
-                        (supported if name + desc in methods.get(sym_owner, set()) else unsupported).append(triple)
-                elif annotation.startswith("FIELD|"):
-                    _, sym_owner, name, desc = annotation.split("|", 3)
-                    if sym_owner.startswith("net/minecraft/class_") or sym_owner.startswith("net/fabricmc/"):
-                        triple = {"owner": sym_owner, "name": name, "descriptor": desc}
-                        (supported if name + ":" + desc in fields.get(sym_owner, set()) else unsupported).append(triple)
-        for ref in sorted(set(refs)):
-            if ref in classes_surface: supported.append({"owner": ref, "name": "<class>", "descriptor": ""})
-        if unsupported:
-            for symbol in sorted({(x["owner"], x["name"], x["descriptor"]) for x in unsupported}):
-                reasons.append(fail("UNSUPPORTED_SYMBOL", "symbol absent from declared shim surface", str(path), "|".join(symbol)))
-        records.append({"jar": str(path), "sha256": digest(payload), "status": "REJECTED" if reasons else "COMPATIBLE",
-                        "supported_classes": sorted({x["owner"] for x in supported if x["name"] == "<class>"}),
-                        "unsupported_classes": sorted({x["owner"] for x in unsupported if x["name"] == "<class>"}),
-                        "supported_members": sorted([x for x in supported if x["name"] != "<class>"], key=lambda x: (x["owner"],x["name"],x["descriptor"])),
-                        "unsupported_members": sorted([x for x in unsupported if x["name"] != "<class>"], key=lambda x: (x["owner"],x["name"],x["descriptor"])),
-                        "client_classes": sorted(set(client_classes)), "diagnostics": sorted(reasons, key=lambda x: (x.get("code", ""), x.get("resource", ""), x.get("message", "")))})
-    status = "REJECTED" if any(r["status"] == "REJECTED" for r in records) else "COMPATIBLE"
-    return {"schema": "mc-spine-fabric-shimcheck-v1", "minecraft": "1.21.1", "status": status, "jars": records}
+                        ("INVOKE" in annotation or "STORE" in annotation)):
+                    reasons.append(fail("UNSUPPORTED_MIXIN_AT", "nested @At(INVOKE/STORE) is unsupported", jar, owner))
+                if annotation.startswith(("MEMBER|", "FIELD|")):
+                    kind, sym_owner, name, desc = annotation.split("|", 3)
+                    if sym_owner.startswith(PLATFORM_PREFIXES):
+                        triple = (sym_owner, name, desc)
+                        allowed = (name + desc in methods.get(sym_owner, set()) if kind == "MEMBER"
+                                   else name + ":" + desc in fields.get(sym_owner, set()))
+                        (supported if allowed else unsupported).add(triple)
+        for symbol in sorted(unsupported):
+            reasons.append(fail("UNSUPPORTED_SYMBOL", "symbol absent from declared shim surface", jar, "|".join(symbol)))
+
+        def members(symbols):
+            return [{"owner": owner, "name": name, "descriptor": desc}
+                    for owner, name, desc in sorted(symbols) if name != "<class>"]
+
+        record.update(status="REJECTED" if reasons else "COMPATIBLE",
+                      supported_classes=sorted(refs & classes_surface.keys()),
+                      unsupported_classes=sorted(owner for owner, name, _ in unsupported if name == "<class>"),
+                      supported_members=members(supported), unsupported_members=members(unsupported))
+        reasons.sort(key=lambda d: (d["code"], d.get("resource", ""), d["message"]))
+    rejected = any(r["status"] == "REJECTED" for r in records)
+    if args.runtime_plan and not rejected:
+        args.runtime_plan.write_text("\n".join(plan) + "\n", encoding="utf-8")
+    return {"schema": "mc-spine-fabric-shimcheck-v1", "minecraft": "1.21.1",
+            "status": "REJECTED" if rejected else "COMPATIBLE", "jars": records}
+
+
+def run(args):
+    surface = json.loads(args.surface.read_text())
+    profiles = surface.get("runtime", {})
+    if args.runtime_plan:
+        classes_surface = profiles[args.namespace]
+    else:
+        classes_surface = {}
+        for profile in (surface.get("classes", {}), *profiles.values()):
+            for owner, spec in profile.items():
+                merged = classes_surface.setdefault(owner, {"methods": set(), "fields": set()})
+                for kind in merged:
+                    merged[kind].update(spec.get(kind, []))
+    tmp = Path(os.environ.get("TMPDIR", str(ROOT.parent.parent / "target/tmp"))).resolve()
+    tmp.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="fabric-shimcheck-", dir=tmp) as work:
+        classes = Path(work)
+        cp = scanner(args.java_home, deps(), tmp, classes)
+        return audit(args, classes_surface, tmp, classes, cp)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--surface", type=Path, default=ROOT / "shim-surface.json")
     p.add_argument("--java-home", type=Path)
+    p.add_argument("--runtime-plan", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--namespace", choices=["named", "intermediary"], help=argparse.SUPPRESS)
     p.add_argument("jars", nargs="+", type=Path)
     args = p.parse_args()
     try:

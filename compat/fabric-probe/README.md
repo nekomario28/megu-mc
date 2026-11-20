@@ -26,3 +26,9 @@ gate could not process its inputs. This static gate does not prove loader
 startup, runtime callback behavior, or compatibility with Fabric API modules
 outside the declared surface. `python3 tests/fabric_shim_test.py` compiles
 synthetic JARs and exercises the admission and rejection cases.
+
+## Synthetic S1/S2 runtime
+
+The build also produces standalone Java 21 adapters for the named and
+intermediary callback ABIs. See the [Fabric S1/S2 runtime spec](../../specs/mod-compatibility/fabric-s1-s2.md)
+for the admission rules, batch format, and verification commands.
