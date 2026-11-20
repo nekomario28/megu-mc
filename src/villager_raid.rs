@@ -1287,12 +1287,52 @@ const RAID_BASE_WAVES: [[u8; RaiderType::ALL.len()]; 7] = [
 #[cfg_attr(not(test), allow(dead_code))]
 const RAID_WAVE_COUNTDOWN: u16 = 300;
 #[cfg_attr(not(test), allow(dead_code))]
+const RAID_OMEN_TICKS: u16 = 600;
+#[cfg_attr(not(test), allow(dead_code))]
 const RAID_CELEBRATION_TICKS: u16 = 600;
+#[cfg_attr(not(test), allow(dead_code))]
+const RAID_TIMEOUT_TICKS: u32 = 48_000;
+#[cfg_attr(not(test), allow(dead_code))]
+const BAD_OMEN_TICKS: u32 = 120_000;
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RaidOmen {
     bad_omen_level: u8,
+    countdown: u16,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BadOmen {
+    level: u8,
+    duration_ticks: u32,
+}
+
+impl BadOmen {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn from_ominous_bottle(amplifier: u8) -> Self {
+        Self {
+            level: amplifier.saturating_add(1).clamp(1, 5),
+            duration_ticks: BAD_OMEN_TICKS,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn enter_village(self) -> RaidOmen {
+        RaidOmen {
+            bad_omen_level: self.level.clamp(1, 5),
+            countdown: RAID_OMEN_TICKS,
+        }
+    }
+}
+
+impl RaidOmen {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn tick(&mut self) -> bool {
+        self.countdown = self.countdown.saturating_sub(1);
+        self.countdown == 0
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1314,6 +1354,7 @@ struct RaidRaiderId {
 struct RaidWave {
     number: u8,
     counts: [u8; RaiderType::ALL.len()],
+    captain: Option<RaidRaiderId>,
 }
 
 impl RaidWave {
@@ -1356,6 +1397,7 @@ struct Raid {
     total_waves: u8,
     waves_spawned: u8,
     countdown: u16,
+    ticks_elapsed: u32,
     remaining: HashSet<RaidRaiderId>,
     participants: std::collections::BTreeSet<VillageUuid>,
     omen_level: u8,
@@ -1371,6 +1413,9 @@ impl Raid {
         difficulty: RaidDifficulty,
     ) -> Option<Self> {
         let omen_level = omen.as_ref()?.bad_omen_level;
+        if omen.as_ref()?.countdown > 0 {
+            return None;
+        }
         let regular_waves = difficulty.regular_waves();
         if omen_level == 0 || regular_waves == 0 {
             return None;
@@ -1395,6 +1440,7 @@ impl Raid {
             total_waves: regular_waves + u8::from(omen_level > 1),
             waves_spawned: 0,
             countdown: RAID_WAVE_COUNTDOWN,
+            ticks_elapsed: 0,
             remaining: HashSet::new(),
             participants: [player].into(),
             omen_level: omen_level.min(5),
@@ -1433,7 +1479,10 @@ impl Raid {
             RaidState::InProgress => {}
         }
 
+        self.ticks_elapsed = self.ticks_elapsed.saturating_add(1);
+
         if living_villagers == 0
+            || self.ticks_elapsed >= RAID_TIMEOUT_TICKS
             || !pois
                 .claimed_near(self.origin)
                 .any(|(_, kind)| kind == PoiKind::Bed)
@@ -1465,9 +1514,26 @@ impl Raid {
         self.waves_spawned += 1;
         self.countdown = RAID_WAVE_COUNTDOWN;
         let row = usize::from(self.waves_spawned.min(self.regular_waves) - 1);
+        let counts = RAID_BASE_WAVES[row];
+        let captain = RaiderType::ALL
+            .into_iter()
+            .take(3)
+            .find(|kind| counts[*kind as usize] > 0)
+            .map(|kind| {
+                let slot = RaiderType::ALL
+                    .into_iter()
+                    .take_while(|candidate| *candidate != kind)
+                    .map(|candidate| usize::from(counts[candidate as usize]))
+                    .sum();
+                RaidRaiderId {
+                    wave: self.waves_spawned,
+                    slot,
+                }
+            });
         let wave = RaidWave {
             number: self.waves_spawned,
-            counts: RAID_BASE_WAVES[row],
+            counts,
+            captain,
         };
         self.remaining.extend(wave.raiders().map(|(id, _)| id));
         Some(RaidEvent::SpawnWave(wave))
@@ -2505,6 +2571,7 @@ mod villager_raid_tests {
     fn start_raid(pois: &PoiRegistry, difficulty: RaidDifficulty, level: u8) -> Raid {
         let mut omen = Some(RaidOmen {
             bad_omen_level: level,
+            countdown: 0,
         });
         let raid = Raid::try_start(pois, BED, PLAYER, &mut omen, difficulty).unwrap();
         assert!(omen.is_none());
@@ -2529,7 +2596,10 @@ mod villager_raid_tests {
         let far = (48, 64, -1);
         let pos = (-1, 64, -1);
         let mut villager = Villager::new([3; 16], VillagerProfession::None);
-        let mut omen = Some(RaidOmen { bad_omen_level: 2 });
+        let mut omen = Some(RaidOmen {
+            bad_omen_level: 2,
+            countdown: 0,
+        });
         for (spot, kind) in [
             (west, PoiKind::Bed),
             (east, PoiKind::Bell),
@@ -2538,7 +2608,13 @@ mod villager_raid_tests {
             pois.register(spot, kind);
         }
         assert!(Raid::try_start(&pois, pos, PLAYER, &mut omen, RaidDifficulty::Hard).is_none());
-        assert_eq!(omen, Some(RaidOmen { bad_omen_level: 2 }));
+        assert_eq!(
+            omen,
+            Some(RaidOmen {
+                bad_omen_level: 2,
+                countdown: 0
+            })
+        );
         for spot in [west, east, far] {
             assert!(villager.claim_poi(&mut pois, spot));
         }
@@ -2548,6 +2624,38 @@ mod villager_raid_tests {
         assert_eq!(raid.center, (-8, 65, -1));
         assert_eq!(raid.state, RaidState::InProgress);
         assert_eq!(omen, None);
+    }
+
+    #[test]
+    fn ominous_bottle_bad_omen_and_village_raid_omen_count_down_for_600_ticks() {
+        let (pois, _) = village();
+        for amplifier in [0, 1, 2, 3, 4, 255] {
+            let bad_omen = BadOmen::from_ominous_bottle(amplifier);
+            assert_eq!(bad_omen.duration_ticks, 120_000);
+            assert_eq!(bad_omen.level, amplifier.saturating_add(1).clamp(1, 5));
+
+            let mut raid_omen = bad_omen.enter_village();
+            assert_eq!(raid_omen.countdown, 600);
+            let mut active_omen = Some(raid_omen);
+            assert!(
+                Raid::try_start(&pois, BED, PLAYER, &mut active_omen, RaidDifficulty::Normal)
+                    .is_none()
+            );
+            assert!(active_omen.is_some());
+            for _ in 0..599 {
+                assert!(!raid_omen.tick());
+            }
+            assert_eq!(raid_omen.countdown, 1);
+            assert!(raid_omen.tick());
+            assert_eq!(raid_omen.countdown, 0);
+
+            active_omen = Some(raid_omen);
+            let raid =
+                Raid::try_start(&pois, BED, PLAYER, &mut active_omen, RaidDifficulty::Normal)
+                    .expect("raid begins when Raid Omen expires");
+            assert_eq!(raid.omen_level, bad_omen.level);
+            assert!(active_omen.is_none());
+        }
     }
 
     #[test]
@@ -2573,6 +2681,8 @@ mod villager_raid_tests {
                     let wave = next_wave(&mut raid, &pois);
                     assert_eq!(wave.number, number);
                     assert_eq!(wave.counts, expected[usize::from(number.min(regular) - 1)]);
+                    let captain = wave.captain.expect("each wave has a banner captain");
+                    assert!(wave.raiders().any(|(id, _)| id == captain));
                     for _ in 0..301 {
                         assert_eq!(raid.tick(&pois, 1), None);
                     }
@@ -2628,5 +2738,14 @@ mod villager_raid_tests {
         assert!(!no_beds.record_defeat(wave.raiders().next().unwrap().0, Some(PLAYER)));
         assert_eq!(no_beds.tick(&pois, 1), None);
         assert_eq!(no_beds.state, RaidState::Celebrating);
+    }
+
+    #[test]
+    fn a_raid_loses_after_the_vanilla_timeout() {
+        let (pois, _) = village();
+        let mut raid = start_raid(&pois, RaidDifficulty::Easy, 1);
+        raid.ticks_elapsed = RAID_TIMEOUT_TICKS - 1;
+        assert_eq!(raid.tick(&pois, 1), Some(RaidEvent::Loss));
+        assert_eq!(raid.state, RaidState::Loss);
     }
 }
