@@ -1,0 +1,7 @@
+[package]
+name = "mod-offload"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+description = "Standalone factory simulation kernel prototypes for mc-spine"
+publish = false
