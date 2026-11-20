@@ -1042,6 +1042,136 @@ impl SlimeBehavior {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+fn spider_is_hostile(daytime: bool, brightness: u8, provoked: bool) -> bool {
+    provoked || !daytime || brightness < 12
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn spider_leap_velocity(from: [f64; 3], target: [f64; 3]) -> [f64; 3] {
+    let horizontal = mob_behavior_unit([target[0] - from[0], 0.0, target[2] - from[2]]);
+    [horizontal[0] * 0.4, 0.4, horizontal[2] * 0.4]
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CreeperBehavior {
+    fuse: i16,
+    ignited: bool,
+    charged: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CreeperBehavior {
+    fn new() -> Self {
+        Self {
+            fuse: -1,
+            ignited: false,
+            charged: false,
+        }
+    }
+
+    fn tick(&mut self, target_distance: Option<f64>) -> Option<f32> {
+        if self.ignited || target_distance.is_some_and(|distance| distance <= 3.0) {
+            self.fuse = (self.fuse + 1).max(0);
+            if self.fuse >= 30 {
+                return Some(self.explosion_power());
+            }
+        } else if target_distance.map_or(true, |distance| distance > 7.0) {
+            self.fuse = (self.fuse - 1).max(-1);
+        }
+        None
+    }
+
+    fn ignite(&mut self, ignited: bool) {
+        self.ignited = ignited;
+        if ignited && self.fuse < 0 {
+            self.fuse = 0;
+        } else if !ignited {
+            self.fuse = -1;
+        }
+    }
+
+    fn explosion_power(self) -> f32 {
+        if self.charged {
+            6.0
+        } else {
+            3.0
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn skeleton_bow_charge_interval(hard_difficulty: bool) -> u8 {
+    if hard_difficulty {
+        20
+    } else {
+        40
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn skeleton_strafe_velocity(distance: f64, clockwise: bool, forward: bool) -> [f64; 3] {
+    if distance < 5.0 || distance > 15.0 {
+        return [0.0; 3];
+    }
+    let direction = if clockwise { 1.0 } else { -1.0 };
+    let ahead = if forward { 1.0 } else { -1.0 };
+    [direction * 0.25, 0.0, ahead * 0.25]
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn skeleton_burns_in_sun(daytime: bool, sky_visible: bool, brightness: f32, helmet: bool) -> bool {
+    daytime && sky_visible && brightness > 0.5 && !helmet
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn phantom_circle_velocity(pos: [f64; 3], center: [f64; 3], clockwise: bool) -> [f64; 3] {
+    let radial = mob_behavior_unit([pos[0] - center[0], 0.0, pos[2] - center[2]]);
+    let sign = if clockwise { 1.0 } else { -1.0 };
+    [
+        radial[0] * -0.1 - radial[2] * sign * 0.2,
+        0.0,
+        radial[2] * -0.1 + radial[0] * sign * 0.2,
+    ]
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn phantom_swoop_velocity(pos: [f64; 3], target: [f64; 3]) -> [f64; 3] {
+    let delta = mob_behavior_delta(pos, target);
+    mob_behavior_unit([delta[0], delta[1] - 1.0, delta[2]])
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn phantom_burns_in_sun(daytime: bool, sky_visible: bool, brightness: f32) -> bool {
+    daytime && sky_visible && brightness > 0.5
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn drowned_should_hide_in_water(daytime: bool, in_water: bool) -> bool {
+    daytime && in_water
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn drowned_swim_chase_velocity(pos: [f64; 3], target: [f64; 3]) -> [f64; 3] {
+    mob_behavior_unit(mob_behavior_delta(pos, target)).map(|component| component * 0.1)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn iron_golem_provoked(village_threat: bool, player_attack: bool) -> bool {
+    village_threat || player_attack
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn iron_golem_fling_velocity(target_pos: [f64; 3], golem_pos: [f64; 3]) -> [f64; 3] {
+    let horizontal = mob_behavior_unit([
+        target_pos[0] - golem_pos[0],
+        0.0,
+        target_pos[2] - golem_pos[2],
+    ]);
+    [horizontal[0] * 0.4, 0.4, horizontal[2] * 0.4]
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WitchPotion {
     WaterBreathing,
@@ -1058,7 +1188,7 @@ enum WitchPotion {
 #[derive(Clone, Copy, Default)]
 struct WitchNeeds {
     underwater: bool,
-    burning: bool,
+    in_fire_or_lava: bool,
     hurt: bool,
     chase_distance: Option<f64>,
 }
@@ -1099,7 +1229,7 @@ impl WitchBehavior {
         }
         let choices = [
             (WitchPotion::WaterBreathing, needs.underwater, 15),
-            (WitchPotion::FireResistance, needs.burning, 15),
+            (WitchPotion::FireResistance, needs.in_fire_or_lava, 15),
             (WitchPotion::Healing, needs.hurt, 5),
             (
                 WitchPotion::Swiftness,
@@ -1830,8 +1960,8 @@ impl MobBehaviorState {
                 };
                 let needs = WitchNeeds {
                     underwater: ctx.in_water,
-                    burning: ctx.on_fire,
-                    hurt: ctx.hp < ctx.max_hp,
+                    in_fire_or_lava: ctx.on_fire,
+                    hurt: ctx.hp <= ctx.max_hp * 0.5,
                     chase_distance: target.map(|target| {
                         let delta = mob_behavior_delta(ctx.pos, target.pos);
                         mob_behavior_dot(delta, delta).sqrt()
@@ -2945,7 +3075,7 @@ mod mob_behaviors_tests {
         let mut witch = WitchBehavior::default();
         let needs = WitchNeeds {
             underwater: true,
-            burning: true,
+            in_fire_or_lava: true,
             hurt: true,
             chase_distance: Some(12.0),
         };
@@ -2975,6 +3105,98 @@ mod mob_behaviors_tests {
             );
         }
         assert_eq!(witch.tick_drinking(needs, &[], &mut highest), None);
+    }
+
+    #[test]
+    fn spider_hostility_and_leap_cover_daylight_threshold_and_provocation() {
+        assert!(!spider_is_hostile(true, 12, false));
+        assert!(!spider_is_hostile(true, 15, false));
+        assert!(spider_is_hostile(true, 11, false));
+        assert!(spider_is_hostile(true, 15, true));
+        assert!(spider_is_hostile(false, 15, false));
+        assert_eq!(
+            spider_leap_velocity([0.0; 3], [0.0, 20.0, 4.0]),
+            [0.0, 0.4, 0.4]
+        );
+        assert_eq!(spider_leap_velocity([1.0; 3], [1.0; 3]), [0.0, 0.4, 0.0]);
+    }
+
+    #[test]
+    fn creeper_swell_decays_outside_cancel_range_and_charged_power_doubles() {
+        let mut creeper = CreeperBehavior::new();
+        for _ in 0..10 {
+            assert_eq!(creeper.tick(Some(2.0)), None);
+        }
+        assert_eq!(creeper.fuse, 9);
+        assert_eq!(creeper.tick(Some(5.0)), None); // Inside swell range, outside cancel distance.
+        assert_eq!(creeper.fuse, 9);
+        assert_eq!(creeper.tick(Some(8.0)), None);
+        assert_eq!(creeper.fuse, 8);
+        creeper.ignite(true);
+        for _ in 0..21 {
+            assert_eq!(creeper.tick(None), None);
+        }
+        assert_eq!(creeper.tick(None), Some(3.0));
+
+        let mut charged = CreeperBehavior {
+            charged: true,
+            ..CreeperBehavior::new()
+        };
+        charged.ignite(true);
+        for _ in 0..29 {
+            assert_eq!(charged.tick(None), None);
+        }
+        assert_eq!(charged.tick(None), Some(6.0));
+        charged.ignite(false);
+        assert_eq!(charged.fuse, -1);
+    }
+
+    #[test]
+    fn skeleton_variants_share_bow_strafe_and_sunlight_rules() {
+        for _variant in ["skeleton", "stray", "bogged"] {
+            assert_eq!(skeleton_bow_charge_interval(false), 40);
+            assert_eq!(skeleton_bow_charge_interval(true), 20);
+        }
+        assert_eq!(
+            skeleton_strafe_velocity(10.0, true, true),
+            [0.25, 0.0, 0.25]
+        );
+        assert_eq!(skeleton_strafe_velocity(4.99, true, true), [0.0; 3]);
+        assert_eq!(skeleton_strafe_velocity(15.01, false, true), [0.0; 3]);
+        assert!(skeleton_burns_in_sun(true, true, 0.51, false));
+        assert!(!skeleton_burns_in_sun(true, true, 0.5, false));
+        assert!(!skeleton_burns_in_sun(true, false, 1.0, false));
+        assert!(!skeleton_burns_in_sun(true, true, 1.0, true));
+    }
+
+    #[test]
+    fn phantom_dive_and_circle_are_directional_and_sunlight_sensitive() {
+        let circle = phantom_circle_velocity([4.0, 0.0, 0.0], [0.0; 3], true);
+        assert!(circle[2] > 0.0);
+        let dive = phantom_swoop_velocity([0.0; 3], [0.0, 0.0, 0.0]);
+        assert!(dive[1] < 0.0);
+        assert!((mob_behavior_dot(dive, dive) - 1.0).abs() < 1e-9);
+        assert!(phantom_burns_in_sun(true, true, 0.6));
+        assert!(!phantom_burns_in_sun(false, true, 1.0));
+        assert!(!phantom_burns_in_sun(true, false, 1.0));
+    }
+
+    #[test]
+    fn drowned_chases_through_water_hides_by_day_and_golem_provokes_and_flings_upward() {
+        let swim = drowned_swim_chase_velocity([0.0; 3], [0.0, 3.0, 4.0]);
+        for (actual, expected) in swim.into_iter().zip([0.0, 0.06, 0.08]) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+        assert!(drowned_should_hide_in_water(true, true));
+        assert!(!drowned_should_hide_in_water(true, false));
+        assert!(!drowned_should_hide_in_water(false, true));
+        assert!(iron_golem_provoked(true, false));
+        assert!(iron_golem_provoked(false, true));
+        assert!(!iron_golem_provoked(false, false));
+        assert_eq!(
+            iron_golem_fling_velocity([0.0, 10.0, 4.0], [0.0; 3]),
+            [0.0, 0.4, 0.4]
+        );
     }
 
     #[test]
