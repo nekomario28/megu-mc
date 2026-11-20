@@ -124,7 +124,12 @@ public class FixtureMod {
   @SubscribeEvent public void onCommands(RegisterCommandsEvent event) {
     if (event.getCommandSelection() != Commands.CommandSelection.DEDICATED
         || event.getBuildContext() == null) throw new AssertionError("command context");
-    if (!event.getDispatcher().register(Commands.literal("greet")).getLiteral().equals("greet"))
+    if (!event.getDispatcher().register(Commands.literal("greet").executes(ctx -> {
+      var source = ctx.getSource();
+      source.getLevel().setBlock(source.getPosition(), new BlockState(77), 3);
+      source.sendSuccess(Component.literal("painted"), false);
+      return 1;
+    })).getLiteral().equals("greet"))
       throw new AssertionError("command literal");
   }
 }
@@ -222,6 +227,10 @@ public class S1Checks {
     result = ServerHooks.onRegisterCommands();
     check(result.mutations().equals(List.of(new MutationBuffer.RegisterCommand("greet"))),
       "literal registration " + result);
+    result = ServerHooks.onExecuteCommand(level, player, "greet");
+    check(result.mutations().equals(List.of(
+      new MutationBuffer.SetBlockIf(2, 0, 0, 0, 77, 0),
+      new MutationBuffer.SendSystemMessage(42, "painted"))), "command callback batch " + result);
     var trample = new FarmlandTrampleEvent(level, new BlockPos(99, 70, 3),
       new BlockState(11), 2.0f, player);
     NeoForge.EVENT_BUS.post(trample);
@@ -251,6 +260,8 @@ public class S1Checks {
     checkWire(ServerHooks.dispatchServerChatEncoded(42, "Alex", "nested-rewrite"),
       "S1\t0", "message\t42\tchat fired", "message\t42\tchat fired", "end");
     checkWire(ServerHooks.dispatchRegisterCommandsEncoded(), "S1\t0", "command\tgreet", "end");
+    checkWire(ServerHooks.dispatchCommandEncoded(2, 4, 71, 6, "Alex", "greet"),
+      "S1\t0", "block\t2\t4\t71\t6\t77\t0", "message\t0\tpainted", "end");
     checkWire(MutationBuffer.encode(false, List.of(new MutationBuffer.SetBlockIf(1, -1, 0, 1, -1, -2)), null),
       "S1\t0", "block\t1\t-1\t0\t1\t4294967295\t4294967294", "end");
     try {

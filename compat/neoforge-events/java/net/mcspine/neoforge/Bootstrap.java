@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceLocation;
+import com.mojang.brigadier.CommandDispatcher;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.level.block.Block;
 import net.neoforged.api.distmarker.Dist;
@@ -37,6 +38,7 @@ public final class Bootstrap {
 
     public static synchronized Class<?> initialize(String directory) throws Exception {
         if (initialized) throw new IllegalStateException("NeoForge bootstrap already initialized");
+        CommandDispatcher.clearRegisteredCommands();
         Path mods = Path.of(directory).resolve("mods");
         Files.createDirectories(mods);
         List<Path> jars;
@@ -191,6 +193,7 @@ public final class Bootstrap {
         initialized = false;
         frozenRegistry = null;
         DirectBatchBridge.clearRegistration();
+        CommandDispatcher.clearRegisteredCommands();
         S4NetworkBridge.clearRegistration();
         S4CapabilityBridge.clearRegistration();
         for (Class<?> subscriber : gameSubscribers) NeoForge.EVENT_BUS.unregister(subscriber);
@@ -205,4 +208,6 @@ public final class Bootstrap {
     }
 
     public static Class<?> initializeServer() { return ServerHooks.class; }
+
+    public static synchronized void resetForTesting() throws java.io.IOException { close(); }
 }

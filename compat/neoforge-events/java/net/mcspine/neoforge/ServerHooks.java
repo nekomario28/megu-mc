@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.function.Function;
 import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.Command;
+import com.mojang.brigadier.context.CommandContext;
 import net.minecraft.commands.CommandBuildContext;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -161,8 +163,47 @@ public final class ServerHooks {
     }
 
     private static PostedEvent registerCommands() {
-        return dispatch(new RegisterCommandsEvent(new CommandDispatcher<CommandSourceStack>(),
-            Commands.CommandSelection.DEDICATED, new CommandBuildContext()));
+        CommandDispatcher.clearRegisteredCommands();
+        try {
+            PostedEvent posted = dispatch(new RegisterCommandsEvent(new CommandDispatcher<CommandSourceStack>(),
+                Commands.CommandSelection.DEDICATED, new CommandBuildContext()));
+            if (posted.result().canceled()) CommandDispatcher.clearRegisteredCommands();
+            return posted;
+        } catch (RuntimeException | Error error) {
+            CommandDispatcher.clearRegisteredCommands();
+            throw error;
+        }
+    }
+
+    public static DispatchResult onExecuteCommand(Level level, ServerPlayer player, String literal) {
+        return executeCommand(level, player, new BlockPos(0, 0, 0), literal);
+    }
+
+    private static DispatchResult executeCommand(Level level, ServerPlayer player, BlockPos position, String literal) {
+        Objects.requireNonNull(level);
+        Objects.requireNonNull(player);
+        @SuppressWarnings("unchecked")
+        Command<CommandSourceStack> command = (Command<CommandSourceStack>)
+            CommandDispatcher.getRegisteredCommand(Objects.requireNonNull(literal));
+        if (command == null) throw new IllegalArgumentException("Unknown command: " + literal);
+        MutationBuffer.beginEvent();
+        try {
+            command.run(new CommandContext<>(new CommandSourceStack(level, player, position)));
+            MutationBuffer.endEvent();
+            if (MutationBuffer.depth() != 0) return new DispatchResult(false, List.of());
+            return new DispatchResult(false, MutationBuffer.commitBatch());
+        } catch (RuntimeException | Error error) {
+            MutationBuffer.discardAll();
+            throw error;
+        }
+    }
+
+    public static String dispatchCommandEncoded(int dimension, int x, int y, int z,
+                                                String playerName, String literal) {
+        var player = new ServerPlayer(0, playerName);
+        var result = executeCommand(new Level(MutationBuffer.requireDimension(dimension)), player,
+            new BlockPos(x, y, z), literal);
+        return MutationBuffer.encode(result.canceled(), result.mutations(), null);
     }
 
     public static String dispatchBlockBreakEncoded(int dim, int x, int y, int z, int state,
