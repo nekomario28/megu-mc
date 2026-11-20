@@ -555,3 +555,207 @@ fn brigadier_play_tree_and_completion_respect_permissions() {
     assert!(brigadier_wire::command_suggestions_response_payload(&response).is_ok());
     assert!(brigadier_wire::parse_command_suggestions_request(&[0, 5, b'/']).is_err());
 }
+
+// --- Canonical vanilla 1.21.1 GameRule inventory (issue #169) ----------------
+//
+// Transcribed from `net.minecraft.world.level.GameRules` in the 1.21.1 dedicated
+// server jar (obfuscated class `dcs`, sha256
+// e3bc55693e93cda0188f2e60aea28113fc647c5e85a15fa3d1b347349231b4bb), method
+// `<clinit>`. Every `register(...)` call there supplies a camelCase id, a
+// category and a typed default built by `BooleanValue.create` (Bool; 0/1 below)
+// or `IntegerValue.create` (Int). The ids are listed alphabetically for review.
+//
+// This is the *full vanilla inventory*, not the subset currently attached to
+// live systems. The test below checks it against independently written
+// bool/int oracles so a dropped rule, typo, or changed default fails closed.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GameRuleKind {
+    Bool,
+    Int,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VanillaGameRule {
+    name: &'static str,
+    kind: GameRuleKind,
+    default: i32,
+}
+
+const VANILLA_1211_GAMERULES: &[VanillaGameRule] = &[
+    VanillaGameRule { name: "announceAdvancements", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "blockExplosionDropDecay", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "commandBlockOutput", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "commandModificationBlockLimit", kind: GameRuleKind::Int, default: 32768 },
+    VanillaGameRule { name: "disableElytraMovementCheck", kind: GameRuleKind::Bool, default: 0 },
+    VanillaGameRule { name: "disableRaids", kind: GameRuleKind::Bool, default: 0 },
+    VanillaGameRule { name: "doDaylightCycle", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doEntityDrops", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doFireTick", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doImmediateRespawn", kind: GameRuleKind::Bool, default: 0 },
+    VanillaGameRule { name: "doInsomnia", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doLimitedCrafting", kind: GameRuleKind::Bool, default: 0 },
+    VanillaGameRule { name: "doMobLoot", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doMobSpawning", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doPatrolSpawning", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doTileDrops", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doTraderSpawning", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doVinesSpread", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doWardenSpawning", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "doWeatherCycle", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "drowningDamage", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "enderPearlsVanishOnDeath", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "fallDamage", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "fireDamage", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "forgiveDeadPlayers", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "freezeDamage", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "globalSoundEvents", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "keepInventory", kind: GameRuleKind::Bool, default: 0 },
+    VanillaGameRule { name: "lavaSourceConversion", kind: GameRuleKind::Bool, default: 0 },
+    VanillaGameRule { name: "logAdminCommands", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "maxCommandChainLength", kind: GameRuleKind::Int, default: 65536 },
+    VanillaGameRule { name: "maxCommandForkCount", kind: GameRuleKind::Int, default: 65536 },
+    VanillaGameRule { name: "maxEntityCramming", kind: GameRuleKind::Int, default: 24 },
+    VanillaGameRule { name: "mobExplosionDropDecay", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "mobGriefing", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "naturalRegeneration", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "playersNetherPortalCreativeDelay", kind: GameRuleKind::Int, default: 1 },
+    VanillaGameRule { name: "playersNetherPortalDefaultDelay", kind: GameRuleKind::Int, default: 80 },
+    VanillaGameRule { name: "playersSleepingPercentage", kind: GameRuleKind::Int, default: 100 },
+    VanillaGameRule { name: "projectilesCanBreakBlocks", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "randomTickSpeed", kind: GameRuleKind::Int, default: 3 },
+    VanillaGameRule { name: "reducedDebugInfo", kind: GameRuleKind::Bool, default: 0 },
+    VanillaGameRule { name: "sendCommandFeedback", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "showDeathMessages", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "snowAccumulationHeight", kind: GameRuleKind::Int, default: 1 },
+    VanillaGameRule { name: "spawnChunkRadius", kind: GameRuleKind::Int, default: 2 },
+    VanillaGameRule { name: "spawnRadius", kind: GameRuleKind::Int, default: 10 },
+    VanillaGameRule { name: "spectatorsGenerateChunks", kind: GameRuleKind::Bool, default: 1 },
+    VanillaGameRule { name: "tntExplosionDropDecay", kind: GameRuleKind::Bool, default: 0 },
+    VanillaGameRule { name: "universalAnger", kind: GameRuleKind::Bool, default: 0 },
+    VanillaGameRule { name: "waterSourceConversion", kind: GameRuleKind::Bool, default: 1 },
+];
+
+// Independent double-entry oracle, written by kind with real booleans rather
+// than the table's 0/1 integers so a transcription slip is unlikely to repeat.
+const EXPECTED_1211_BOOL_RULES: &[(&str, bool)] = &[
+    ("announceAdvancements", true),
+    ("blockExplosionDropDecay", true),
+    ("commandBlockOutput", true),
+    ("disableElytraMovementCheck", false),
+    ("disableRaids", false),
+    ("doDaylightCycle", true),
+    ("doEntityDrops", true),
+    ("doFireTick", true),
+    ("doImmediateRespawn", false),
+    ("doInsomnia", true),
+    ("doLimitedCrafting", false),
+    ("doMobLoot", true),
+    ("doMobSpawning", true),
+    ("doPatrolSpawning", true),
+    ("doTileDrops", true),
+    ("doTraderSpawning", true),
+    ("doVinesSpread", true),
+    ("doWardenSpawning", true),
+    ("doWeatherCycle", true),
+    ("drowningDamage", true),
+    ("enderPearlsVanishOnDeath", true),
+    ("fallDamage", true),
+    ("fireDamage", true),
+    ("forgiveDeadPlayers", true),
+    ("freezeDamage", true),
+    ("globalSoundEvents", true),
+    ("keepInventory", false),
+    ("lavaSourceConversion", false),
+    ("logAdminCommands", true),
+    ("mobExplosionDropDecay", true),
+    ("mobGriefing", true),
+    ("naturalRegeneration", true),
+    ("projectilesCanBreakBlocks", true),
+    ("reducedDebugInfo", false),
+    ("sendCommandFeedback", true),
+    ("showDeathMessages", true),
+    ("spectatorsGenerateChunks", true),
+    ("tntExplosionDropDecay", false),
+    ("universalAnger", false),
+    ("waterSourceConversion", true),
+];
+
+const EXPECTED_1211_INT_RULES: &[(&str, i32)] = &[
+    ("commandModificationBlockLimit", 32768),
+    ("maxCommandChainLength", 65536),
+    ("maxCommandForkCount", 65536),
+    ("maxEntityCramming", 24),
+    ("playersNetherPortalCreativeDelay", 1),
+    ("playersNetherPortalDefaultDelay", 80),
+    ("playersSleepingPercentage", 100),
+    ("randomTickSpeed", 3),
+    ("snowAccumulationHeight", 1),
+    ("spawnChunkRadius", 2),
+    ("spawnRadius", 10),
+];
+
+#[test]
+fn vanilla_1211_gamerule_registry_inventory() {
+    assert_eq!(
+        VANILLA_1211_GAMERULES.len(),
+        51,
+        "vanilla 1.21.1 registers exactly 51 game rules"
+    );
+
+    let mut names = HashSet::new();
+    for rule in VANILLA_1211_GAMERULES {
+        assert!(names.insert(rule.name), "duplicate game rule id: {}", rule.name);
+        assert!(
+            rule.name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase())
+                && rule.name.chars().all(|c| c.is_ascii_alphanumeric()),
+            "game rule ids are camelCase: {}",
+            rule.name
+        );
+        match rule.kind {
+            GameRuleKind::Bool => assert!(
+                rule.default == 0 || rule.default == 1,
+                "{} must have a boolean default",
+                rule.name
+            ),
+            GameRuleKind::Int => assert!(
+                rule.default >= 0,
+                "{} must have a non-negative integer default",
+                rule.name
+            ),
+        }
+    }
+    assert!(
+        VANILLA_1211_GAMERULES
+            .windows(2)
+            .all(|pair| pair[0].name < pair[1].name),
+        "the canonical inventory is sorted by id"
+    );
+
+    let mut bools: Vec<(&str, bool)> = VANILLA_1211_GAMERULES
+        .iter()
+        .filter(|rule| rule.kind == GameRuleKind::Bool)
+        .map(|rule| (rule.name, rule.default == 1))
+        .collect();
+    bools.sort_unstable();
+    assert_eq!(
+        bools.as_slice(),
+        EXPECTED_1211_BOOL_RULES,
+        "Bool game rules and their vanilla 1.21.1 defaults"
+    );
+
+    let mut ints: Vec<(&str, i32)> = VANILLA_1211_GAMERULES
+        .iter()
+        .filter(|rule| rule.kind == GameRuleKind::Int)
+        .map(|rule| (rule.name, rule.default))
+        .collect();
+    ints.sort_unstable();
+    assert_eq!(
+        ints.as_slice(),
+        EXPECTED_1211_INT_RULES,
+        "Int game rules and their vanilla 1.21.1 defaults"
+    );
+}
