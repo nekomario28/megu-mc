@@ -5697,7 +5697,6 @@ pub(crate) fn spawners_for(biome: &str, category: &str) -> Option<&'static [Spaw
 }
 
 /// The pinned biome's spawn cost for an entity id, if the data declares one.
-#[cfg(test)]
 pub(crate) fn spawn_cost_for(biome: &str, entity: &str) -> Option<SpawnCost> {
     freg().spawn_costs.get(biome)?.get(entity).copied()
 }

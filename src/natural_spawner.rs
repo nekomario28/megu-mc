@@ -2,6 +2,7 @@
 // The world adapter owns actual entities, block queries and spawned-chunk selection.
 use crate::generation_math::Lcg;
 include!("mob_despawn.rs");
+include!("spawn_costs.rs");
 
 #[cfg_attr(not(test), allow(dead_code))]
 const SPAWN_CAP_MAGIC_NUMBER: u64 = 17 * 17;
