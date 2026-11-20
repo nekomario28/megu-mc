@@ -770,3 +770,31 @@ fn vanilla_1211_gamerule_registry_inventory() {
         "Int game rules and their vanilla 1.21.1 defaults"
     );
 }
+
+#[test]
+fn gamerule_commands_query_and_set_all_vanilla_rules() {
+    let _world = world_guard();
+    let ctx = command_context(None);
+    for rule in VANILLA_1211_GAMERULES {
+        let query = |command: &str| run_command_ctx(&ctx, command, &mut None);
+        let original = query(&format!("/gamerule {}", rule.name));
+        let (_, previous) = original.split_once(" = ").expect(&original);
+        let new_value = match rule.kind {
+            GameRuleKind::Bool => if previous == "true" { "false" } else { "true" },
+            GameRuleKind::Int => "17",
+        };
+        let result = query(&format!("/gamerule {} {}", rule.name, new_value));
+        assert!(result.ends_with(new_value), "{result}");
+        assert_eq!(query(&format!("/gamerule {}", rule.name)), format!("{} = {}", rule.name, new_value));
+        query(&format!("/gamerule {} {}", rule.name, previous));
+    }
+}
+
+#[test]
+fn command_dispatch_rejects_unclosed_quotes_and_incomplete_title() {
+    let ctx = command_context(None);
+    assert!(run_command_ctx(&ctx, "/say \"unclosed", &mut None).starts_with("Invalid command:"));
+    assert!(run_command_ctx(&ctx, "/title", &mut None).starts_with("usage:"));
+    assert_eq!(run_command_ctx(&ctx, r#"/title @a title {"text": "hello world"}"#, &mut None), "Title title to 0 player(s)");
+    assert!(run_command_ctx(&ctx, "/gamerule randomTickSpeed 1 extra", &mut None).starts_with("usage:"));
+}

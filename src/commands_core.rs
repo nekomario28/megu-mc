@@ -2234,6 +2234,67 @@ fn run_experience_command(args: &[&str], source: Option<&Arc<Client>>) -> String
     }
 }
 
+// Rules without a dedicated runtime consumer are kept in process-local world state.
+const COMMAND_GAMERULE_DEFAULTS: &[(&str, bool, i32)] = &[
+    ("announceAdvancements", true, 1),
+    ("blockExplosionDropDecay", true, 1),
+    ("commandBlockOutput", true, 1),
+    ("commandModificationBlockLimit", false, 32768),
+    ("disableElytraMovementCheck", true, 0),
+    ("disableRaids", true, 0),
+    ("doDaylightCycle", true, 1),
+    ("doEntityDrops", true, 1),
+    ("doFireTick", true, 1),
+    ("doImmediateRespawn", true, 0),
+    ("doInsomnia", true, 1),
+    ("doLimitedCrafting", true, 0),
+    ("doMobLoot", true, 1),
+    ("doMobSpawning", true, 1),
+    ("doPatrolSpawning", true, 1),
+    ("doTileDrops", true, 1),
+    ("doTraderSpawning", true, 1),
+    ("doVinesSpread", true, 1),
+    ("doWardenSpawning", true, 1),
+    ("doWeatherCycle", true, 1),
+    ("drowningDamage", true, 1),
+    ("enderPearlsVanishOnDeath", true, 1),
+    ("fallDamage", true, 1),
+    ("fireDamage", true, 1),
+    ("forgiveDeadPlayers", true, 1),
+    ("freezeDamage", true, 1),
+    ("globalSoundEvents", true, 1),
+    ("keepInventory", true, 0),
+    ("lavaSourceConversion", true, 0),
+    ("logAdminCommands", true, 1),
+    ("maxCommandChainLength", false, 65536),
+    ("maxCommandForkCount", false, 65536),
+    ("maxEntityCramming", false, 24),
+    ("mobExplosionDropDecay", true, 1),
+    ("mobGriefing", true, 1),
+    ("naturalRegeneration", true, 1),
+    ("playersNetherPortalCreativeDelay", false, 1),
+    ("playersNetherPortalDefaultDelay", false, 80),
+    ("playersSleepingPercentage", false, 100),
+    ("projectilesCanBreakBlocks", true, 1),
+    ("randomTickSpeed", false, 3),
+    ("reducedDebugInfo", true, 0),
+    ("sendCommandFeedback", true, 1),
+    ("showDeathMessages", true, 1),
+    ("snowAccumulationHeight", false, 1),
+    ("spawnChunkRadius", false, 2),
+    ("spawnRadius", false, 10),
+    ("spectatorsGenerateChunks", true, 1),
+    ("tntExplosionDropDecay", true, 0),
+    ("universalAnger", true, 0),
+    ("waterSourceConversion", true, 1),
+];
+
+fn command_gamerules() -> &'static Mutex<HashMap<&'static str, i32>> {
+    static RULES: OnceLock<Mutex<HashMap<&'static str, i32>>> = OnceLock::new();
+    RULES.get_or_init(|| Mutex::new(COMMAND_GAMERULE_DEFAULTS.iter()
+        .map(|&(name, _, default)| (name, default)).collect()))
+}
+
 // resolve @selector -> player eids or mob eids ("m:<eid>" prefixed for mobs)
 fn selector_entities() -> Vec<(String, String, (f64, f64, f64))> {
     let mut entities = Vec::new();
@@ -4412,10 +4473,13 @@ fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
 
 fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     let me = ctx.me.as_ref();
-    let mut it = msg[1..].split_whitespace();
-    let cmd = it.next().unwrap_or("");
-
-    let args: Vec<&str> = it.collect();
+    let Some(input) = msg.strip_prefix('/') else { return "Expected a command starting with /".into() };
+    let tokens = match crate::brigadier::split_command_args_preserving_quotes(input) {
+        Ok(tokens) => tokens,
+        Err(error) => return format!("Invalid command: {error}"),
+    };
+    let cmd = tokens.first().map(String::as_str).unwrap_or("");
+    let args: Vec<&str> = tokens.iter().skip(1).map(String::as_str).collect();
     let admin = me.is_none_or(|player| player_is_admin(&player.name));
     if !admin && !command_allowed_for_player(cmd, &args) {
         let reply = "You do not have permission to run that command";
@@ -4674,7 +4738,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 Some(sel) if sel.starts_with('@') => resolve_selector(sel, me),
                 Some(nm) => clients().lock().unwrap().iter()
                     .find(|c| c.name == *nm).map(|c| vec![c.eid.to_string()])
-                    .unwrap_or_else(|| me.map(|c| vec![c.eid.to_string()]).unwrap_or_default()),
+                    .unwrap_or_default(),
                 _ => me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(),
             };
             for t in targets {
@@ -5232,10 +5296,11 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             format!("Played sound to {} player(s)", n)
         }
         "title" => {
+            if args.len() < 3 { return "usage: /title <targets> title|subtitle|actionbar|times <text>".into(); }
             // /title <targets> title|subtitle|actionbar|times <text|i s o>
             let targets = resolve_selector(args.first().copied().unwrap_or(""), me);
             let mode = args.get(1).copied().unwrap_or("title");
-            let text = args[2..].join(" ");
+            let text = args.get(2..).unwrap_or_default().join(" ");
             let pkt_id: i64 = match mode { "title" => 0x65, "subtitle" => 0x63, "actionbar" => 0x4c, _ => -1 };
             if mode == "times" {
                 let (a, b, c): (i32, i32, i32) = (args.get(2).and_then(|v| v.parse().ok()).unwrap_or(10),
@@ -5399,64 +5464,67 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             }
         }
         "gamerule" => {
-            // gamerule <rule> [true|false|<int>] — subset wired to real systems
-            let rules: &[(&str, &AtomicU8)] = &[
-                ("keepInventory", &GR_KEEP_INVENTORY),
-                ("doDaylightCycle", &GR_DAYLIGHT_CYCLE),
-                ("doWeatherCycle", &GR_WEATHER_CYCLE),
-                ("doMobSpawning", &GR_MOB_SPAWNING),
-                ("mobGriefing", &GR_MOB_GRIEFING),
-                ("naturalRegeneration", &GR_NATURAL_REGEN),
-                ("doMobLoot", &GR_MOB_LOOT),
-            ];
-            let int_rules: &[(&str, &AtomicI32)] = &[
-                ("maxEntityCramming", &GR_MAX_ENTITY_CRAMMING),
-            ];
-            match args.first().copied() {
-                None => {
-                    let mut list: Vec<String> = rules
-                        .iter()
-                        .map(|(n, r)| format!("{}={}", n, r.load(Ordering::Relaxed) == 1))
-                        .collect();
-                    list.extend(
-                        int_rules
-                            .iter()
-                            .map(|(n, r)| format!("{}={}", n, r.load(Ordering::Relaxed))),
-                    );
-                    list.join(", ")
+            let Some(name) = args.first() else {
+                let rules = command_gamerules().lock().unwrap();
+                return COMMAND_GAMERULE_DEFAULTS.iter().map(|&(name, is_bool, _)| {
+                    let value = match name {
+                        "keepInventory" => GR_KEEP_INVENTORY.load(Ordering::Relaxed) as i32,
+                        "doDaylightCycle" => GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) as i32,
+                        "doWeatherCycle" => GR_WEATHER_CYCLE.load(Ordering::Relaxed) as i32,
+                        "doMobSpawning" => GR_MOB_SPAWNING.load(Ordering::Relaxed) as i32,
+                        "mobGriefing" => GR_MOB_GRIEFING.load(Ordering::Relaxed) as i32,
+                        "naturalRegeneration" => GR_NATURAL_REGEN.load(Ordering::Relaxed) as i32,
+                        "doMobLoot" => GR_MOB_LOOT.load(Ordering::Relaxed) as i32,
+                        "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed),
+                        _ => rules[name],
+                    };
+                    let value = if is_bool { (value != 0).to_string() } else { value.to_string() };
+                    format!("{name}={value}")
+                }).collect::<Vec<_>>().join(", ");
+            };
+            let Some(&(canonical, is_bool, _)) = COMMAND_GAMERULE_DEFAULTS.iter()
+                .find(|(rule, _, _)| rule.eq_ignore_ascii_case(name)) else {
+                return format!("unknown gamerule '{name}'");
+            };
+            if args.len() > 2 { return format!("usage: /gamerule {name} [value]"); }
+            let mut rules = command_gamerules().lock().unwrap();
+            let value = if let Some(raw) = args.get(1) {
+                let value = if is_bool {
+                    match *raw { "true" => 1, "false" => 0,
+                        _ => return format!("usage: /gamerule {name} true|false") }
+                } else {
+                    match raw.parse::<i32>() { Ok(value) => value,
+                        Err(_) => return format!("usage: /gamerule {name} <int>") }
+                };
+                match canonical {
+                        "keepInventory" => GR_KEEP_INVENTORY.store(value as u8, Ordering::Relaxed),
+                        "doDaylightCycle" => GR_DAYLIGHT_CYCLE.store(value as u8, Ordering::Relaxed),
+                        "doWeatherCycle" => GR_WEATHER_CYCLE.store(value as u8, Ordering::Relaxed),
+                        "doMobSpawning" => GR_MOB_SPAWNING.store(value as u8, Ordering::Relaxed),
+                        "mobGriefing" => GR_MOB_GRIEFING.store(value as u8, Ordering::Relaxed),
+                        "naturalRegeneration" => GR_NATURAL_REGEN.store(value as u8, Ordering::Relaxed),
+                        "doMobLoot" => GR_MOB_LOOT.store(value as u8, Ordering::Relaxed),
+                        "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.store(value as i32, Ordering::Relaxed),
+                    _ => {}
                 }
-                Some(name) => {
-                    if let Some((n, r)) = rules.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
-                        if args.len() >= 2 {
-                            let v = match args[1] {
-                                "true" => 1u8,
-                                "false" => 0,
-                                _ => return format!("usage: /gamerule {name} true|false"),
-                            };
-                            r.store(v, Ordering::Relaxed);
-                            format!("Gamerule {name} is now set to: {}", v == 1)
-                        } else {
-                            format!("{n} = {}", r.load(Ordering::Relaxed) == 1)
-                        }
-                    } else if let Some((n, r)) =
-                        int_rules.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))
-                    {
-                        if args.len() >= 2 {
-                            let Ok(v) = args[1].parse::<i32>() else {
-                                return format!("usage: /gamerule {name} <int>");
-                            };
-                            r.store(v, Ordering::Relaxed);
-                            format!("Gamerule {n} is now set to: {v}")
-                        } else {
-                            format!("{n} = {}", r.load(Ordering::Relaxed))
-                        }
-                    } else {
-                        let mut names: Vec<&str> = rules.iter().map(|r| r.0).collect();
-                        names.extend(int_rules.iter().map(|r| r.0));
-                        format!("unknown gamerule '{name}' (have: {})", names.join(", "))
-                    }
+                rules.insert(canonical, value);
+                value
+            } else {
+                match canonical {
+                    "keepInventory" => GR_KEEP_INVENTORY.load(Ordering::Relaxed) as i32,
+                    "doDaylightCycle" => GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) as i32,
+                    "doWeatherCycle" => GR_WEATHER_CYCLE.load(Ordering::Relaxed) as i32,
+                    "doMobSpawning" => GR_MOB_SPAWNING.load(Ordering::Relaxed) as i32,
+                    "mobGriefing" => GR_MOB_GRIEFING.load(Ordering::Relaxed) as i32,
+                    "naturalRegeneration" => GR_NATURAL_REGEN.load(Ordering::Relaxed) as i32,
+                    "doMobLoot" => GR_MOB_LOOT.load(Ordering::Relaxed) as i32,
+                    "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed) as i32,
+                    _ => rules[canonical],
                 }
-            }
+            };
+            let value = if is_bool { (value != 0).to_string() } else { value.to_string() };
+            if args.len() == 2 { format!("Gamerule {canonical} is now set to: {value}") }
+            else { format!("{canonical} = {value}") }
         }
         "tag" => {
             // tag <target> add|remove|list <tag>
