@@ -505,6 +505,214 @@ trait RedstoneWorld {
     }
 }
 
+// These evaluators intentionally take the environmental observations as inputs. The
+// world adapter owns storage and event/entity queries; keeping the math here makes
+// the 1.21.1 state transitions deterministic and independently testable.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_daylight_detector_signal(
+    sky_light: u8,
+    day_time: i64,
+    raining: bool,
+    thundering: bool,
+    inverted: bool,
+) -> u8 {
+    let time = day_time.rem_euclid(24_000) as f32 / 24_000.0 - 0.25;
+    let time = time.rem_euclid(1.0);
+    let eased_time = time + (0.5 - (std::f32::consts::PI * time).cos() / 2.0 - time) / 3.0;
+    let sun = ((eased_time * std::f32::consts::TAU).cos() * 2.0 + 0.2).clamp(0.0, 1.0);
+    let mut signal = (sun * 15.0 + 0.5).floor() as u8;
+    if raining {
+        signal = (f32::from(signal) * 0.9) as u8;
+    }
+    if thundering {
+        signal = (f32::from(signal) * 0.9) as u8;
+    }
+    let sky_darken = (((1.0 - sun) * 11.0).floor() as u8
+        + if raining { 5 } else { 0 }
+        + if thundering { 5 } else { 0 })
+    .min(15);
+    signal = signal.max(sky_light.saturating_sub(sky_darken));
+    if inverted {
+        15 - signal.min(15)
+    } else {
+        signal.min(15)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RsTripwireCell {
+    Wire {
+        powered: bool,
+        disarmed: bool,
+        entity_intersects: bool,
+    },
+    Hook {
+        facing: RsDir,
+        attached: bool,
+    },
+    Other,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RsTripwireWireResult {
+    attached: bool,
+    powered: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RsTripwireResult {
+    attached: bool,
+    powered: bool,
+    wire_count: u8,
+    wires: Vec<RsTripwireWireResult>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RsAabb {
+    min: [f64; 3],
+    max: [f64; 3],
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_tripwire_entity_intersects(wire: RsAabb, entities: &[RsAabb]) -> bool {
+    entities.iter().any(|entity| {
+        (0..3).all(|axis| wire.min[axis] < entity.max[axis] && wire.max[axis] > entity.min[axis])
+    })
+}
+
+/// `cells` starts immediately beyond the near hook and advances along its facing.
+/// At most 40 wire blocks may occur before the opposing hook. Each wire input carries
+/// the result of the entity AABB intersection check for that wire.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_tripwire_line(facing: RsDir, cells: &[RsTripwireCell]) -> RsTripwireResult {
+    let mut wire_states = Vec::new();
+    let mut powered = false;
+    for cell in cells.iter().take(41) {
+        match *cell {
+            RsTripwireCell::Wire {
+                powered: wire_powered,
+                disarmed,
+                entity_intersects,
+            } if wire_states.len() < 40 => {
+                let wire_powered = wire_powered || (entity_intersects && !disarmed);
+                powered |= wire_powered;
+                wire_states.push(RsTripwireWireResult {
+                    attached: false,
+                    powered: wire_powered,
+                });
+            }
+            RsTripwireCell::Hook {
+                facing: other_facing,
+                attached,
+            } => {
+                let connected =
+                    other_facing == facing.opposite() && attached && !wire_states.is_empty();
+                for wire in &mut wire_states {
+                    wire.attached = connected;
+                }
+                return RsTripwireResult {
+                    attached: connected,
+                    powered: connected && powered,
+                    wire_count: wire_states.len() as u8,
+                    wires: wire_states,
+                };
+            }
+            _ => {
+                return RsTripwireResult {
+                    attached: false,
+                    powered: false,
+                    wire_count: wire_states.len() as u8,
+                    wires: wire_states,
+                };
+            }
+        }
+    }
+    RsTripwireResult {
+        attached: false,
+        powered: false,
+        wire_count: wire_states.len() as u8,
+        wires: wire_states,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_sculk_frequency(event: &str) -> Option<u8> {
+    Some(match event.strip_prefix("minecraft:").unwrap_or(event) {
+        "step" | "swim" | "flap" => 1,
+        "projectile_land" | "hit_ground" => 2,
+        "splash" | "fluid_pickup" | "fluid_place" => 3,
+        "item_interact_start" | "item_interact_finish" | "projectile_shoot" => 4,
+        "block_destroy" => 5,
+        "dispense_fail" => 6,
+        "block_place" | "entity_place" => 7,
+        "entity_damage" => 8,
+        "eat" | "drink" => 9,
+        "container_open" | "container_close" => 10,
+        "block_open" | "block_close" | "block_activate" | "block_deactivate" | "block_attach"
+        | "block_detach" | "block_change" => 11,
+        "entity_roar" | "entity_shake" | "equip" | "unequip" => 12,
+        "entity_die" | "teleport" => 13,
+        "explode" => 14,
+        "lightning_strike" => 15,
+        _ => return None,
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RsSculkPhase {
+    Inactive,
+    Active,
+    Cooldown,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RsSculkEvaluation {
+    phase: RsSculkPhase,
+    power: u8,
+}
+
+/// Compute event power and the elapsed-tick phase. `distance` is Euclidean block
+/// distance; the native listener rejects wool-occluded events before this stage.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_sculk_sensor_evaluate(
+    event: &str,
+    distance: f64,
+    range: u8,
+    wool_occluded: bool,
+    calibrated_frequency: Option<u8>,
+    calibrated: bool,
+    elapsed_ticks: Option<u8>,
+) -> RsSculkEvaluation {
+    let frequency = rs_sculk_frequency(event).unwrap_or(0);
+    let in_range = !wool_occluded && range > 0 && distance <= f64::from(range);
+    let matches_calibration = !calibrated || calibrated_frequency == Some(frequency);
+    let power = if in_range && matches_calibration && frequency > 0 {
+        15 - ((distance * 15.0 / f64::from(range)).floor() as u8).min(15)
+    } else {
+        0
+    };
+    let active_ticks = if calibrated { 10 } else { 30 };
+    let phase = match elapsed_ticks {
+        Some(ticks) if ticks < active_ticks => RsSculkPhase::Active,
+        Some(ticks) if ticks < active_ticks + 10 => RsSculkPhase::Cooldown,
+        _ => RsSculkPhase::Inactive,
+    };
+    RsSculkEvaluation {
+        phase,
+        power: if phase == RsSculkPhase::Active {
+            power
+        } else {
+            0
+        },
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn rs_signal_source(
     world: &impl RedstoneWorld,
@@ -2292,5 +2500,346 @@ mod redstone_tests {
         RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[behind]);
         world.advance(4, &mut torches);
         assert_eq!(world.comparator_output(ORIGIN), 3);
+    }
+
+    #[test]
+    fn daylight_detector_tracks_solar_cycle_weather_and_inversion() {
+        let noon = rs_daylight_detector_signal(0, 6_000, false, false, false);
+        let midnight = rs_daylight_detector_signal(0, 18_000, false, false, false);
+        assert_eq!(noon, 15);
+        assert_eq!(midnight, 0);
+        assert_eq!(
+            rs_daylight_detector_signal(0, 30_000, false, false, false),
+            noon
+        );
+        assert_eq!(rs_daylight_detector_signal(0, 6_000, false, false, true), 0);
+        assert_eq!(
+            rs_daylight_detector_signal(0, 18_000, false, false, true),
+            15
+        );
+        let clear = rs_daylight_detector_signal(0, 6_000, false, false, false);
+        let rain = rs_daylight_detector_signal(0, 6_000, true, false, false);
+        let storm = rs_daylight_detector_signal(0, 6_000, true, true, false);
+        assert!(rain < clear);
+        assert!(storm < rain);
+        assert_eq!(
+            rs_daylight_detector_signal(15, 18_000, false, false, false),
+            4
+        );
+        assert_eq!(
+            rs_daylight_detector_signal(255, 6_000, false, false, false),
+            15
+        );
+    }
+
+    #[test]
+    fn tripwire_requires_opposed_attached_hooks_and_respects_shears() {
+        use RsTripwireCell::{Hook, Other, Wire};
+        let clear_wire = Wire {
+            powered: false,
+            disarmed: false,
+            entity_intersects: false,
+        };
+        let connected = rs_tripwire_line(
+            RsDir::East,
+            &[
+                clear_wire,
+                Hook {
+                    facing: RsDir::West,
+                    attached: true,
+                },
+            ],
+        );
+        assert_eq!(
+            connected,
+            RsTripwireResult {
+                attached: true,
+                powered: false,
+                wire_count: 1,
+                wires: vec![RsTripwireWireResult {
+                    attached: true,
+                    powered: false
+                }],
+            }
+        );
+
+        let intersecting_wire = Wire {
+            powered: false,
+            disarmed: false,
+            entity_intersects: true,
+        };
+        let triggered = rs_tripwire_line(
+            RsDir::East,
+            &[
+                intersecting_wire,
+                Hook {
+                    facing: RsDir::West,
+                    attached: true,
+                },
+            ],
+        );
+        assert!(triggered.attached && triggered.powered);
+        assert_eq!(
+            triggered.wires,
+            [RsTripwireWireResult {
+                attached: true,
+                powered: true
+            }]
+        );
+        let disarmed = rs_tripwire_line(
+            RsDir::East,
+            &[
+                Wire {
+                    powered: false,
+                    disarmed: true,
+                    entity_intersects: true,
+                },
+                Hook {
+                    facing: RsDir::West,
+                    attached: true,
+                },
+            ],
+        );
+        assert!(disarmed.attached && !disarmed.powered);
+        let wire_box = RsAabb {
+            min: [0.1, 0.1, 0.1],
+            max: [0.9, 0.2, 0.9],
+        };
+        assert!(rs_tripwire_entity_intersects(
+            wire_box,
+            &[RsAabb {
+                min: [0.5, 0.15, 0.5],
+                max: [1.5, 1.5, 1.5],
+            }]
+        ));
+        assert!(!rs_tripwire_entity_intersects(
+            wire_box,
+            &[RsAabb {
+                min: [1.0, 0.0, 0.0],
+                max: [2.0, 1.0, 1.0],
+            }]
+        ));
+        for cells in [
+            vec![
+                Wire {
+                    powered: false,
+                    disarmed: false,
+                    entity_intersects: true,
+                },
+                Hook {
+                    facing: RsDir::East,
+                    attached: true,
+                },
+            ],
+            vec![
+                Wire {
+                    powered: false,
+                    disarmed: false,
+                    entity_intersects: false,
+                },
+                Hook {
+                    facing: RsDir::West,
+                    attached: false,
+                },
+            ],
+            vec![
+                Wire {
+                    powered: false,
+                    disarmed: false,
+                    entity_intersects: false,
+                },
+                Other,
+                Hook {
+                    facing: RsDir::West,
+                    attached: true,
+                },
+            ],
+        ] {
+            assert!(!rs_tripwire_line(RsDir::East, &cells).attached);
+            assert!(!rs_tripwire_line(RsDir::East, &cells).powered);
+        }
+        let forty = vec![
+            Wire {
+                powered: false,
+                disarmed: false,
+                entity_intersects: false,
+            };
+            40
+        ]
+        .into_iter()
+        .chain([Hook {
+            facing: RsDir::West,
+            attached: true,
+        }])
+        .collect::<Vec<_>>();
+        assert!(rs_tripwire_line(RsDir::East, &forty).attached);
+        let forty_one = vec![
+            Wire {
+                powered: false,
+                disarmed: false,
+                entity_intersects: false,
+            };
+            41
+        ]
+        .into_iter()
+        .chain([Hook {
+            facing: RsDir::West,
+            attached: true,
+        }])
+        .collect::<Vec<_>>();
+        assert!(!rs_tripwire_line(RsDir::East, &forty_one).attached);
+    }
+
+    #[test]
+    fn sculk_sensor_frequency_attenuation_occlusion_and_phases() {
+        let frequencies = [
+            ("step", 1),
+            ("swim", 1),
+            ("flap", 1),
+            ("projectile_land", 2),
+            ("hit_ground", 2),
+            ("splash", 3),
+            ("fluid_pickup", 3),
+            ("fluid_place", 3),
+            ("item_interact_start", 4),
+            ("projectile_shoot", 4),
+            ("block_destroy", 5),
+            ("dispense_fail", 6),
+            ("block_place", 7),
+            ("entity_place", 7),
+            ("entity_damage", 8),
+            ("eat", 9),
+            ("drink", 9),
+            ("container_open", 10),
+            ("block_activate", 11),
+            ("block_attach", 11),
+            ("block_detach", 11),
+            ("entity_roar", 12),
+            ("equip", 12),
+            ("entity_die", 13),
+            ("teleport", 13),
+            ("explode", 14),
+            ("lightning_strike", 15),
+        ];
+        for (event, expected) in frequencies {
+            assert_eq!(rs_sculk_frequency(event), Some(expected), "{event}");
+        }
+        assert_eq!(rs_sculk_frequency("minecraft:step"), Some(1));
+        assert_eq!(rs_sculk_frequency("unknown_event"), None);
+
+        let sensor = |distance, occluded, filter, calibrated, elapsed| {
+            rs_sculk_sensor_evaluate("step", distance, 8, occluded, filter, calibrated, elapsed)
+        };
+        assert_eq!(sensor(0.0, false, None, false, Some(0)).power, 15);
+        assert_eq!(sensor(4.0, false, None, false, Some(0)).power, 8);
+        assert_eq!(sensor(8.0, false, None, false, Some(0)).power, 0);
+        assert_eq!(sensor(2.0, true, None, false, Some(0)).power, 0);
+        assert_eq!(sensor(2.0, false, Some(2), true, Some(0)).power, 0);
+        assert_eq!(sensor(2.0, false, Some(1), true, Some(0)).power, 12);
+        assert_eq!(
+            sensor(2.0, false, None, false, Some(29)).phase,
+            RsSculkPhase::Active
+        );
+        assert_eq!(
+            sensor(2.0, false, None, false, Some(30)).phase,
+            RsSculkPhase::Cooldown
+        );
+        assert_eq!(
+            sensor(2.0, false, None, false, Some(39)).phase,
+            RsSculkPhase::Cooldown
+        );
+        assert_eq!(
+            sensor(2.0, false, None, false, Some(40)).phase,
+            RsSculkPhase::Inactive
+        );
+        assert_eq!(
+            sensor(2.0, false, None, true, Some(9)).phase,
+            RsSculkPhase::Active
+        );
+        assert_eq!(
+            sensor(2.0, false, None, true, Some(10)).phase,
+            RsSculkPhase::Cooldown
+        );
+        assert_eq!(
+            sensor(2.0, false, None, true, Some(20)).phase,
+            RsSculkPhase::Inactive
+        );
+    }
+
+    #[test]
+    fn redstone_world_decodes_sensor_state_properties() {
+        let reg = breg().unwrap();
+        let daylight = registered(reg, "daylight_detector", &[("inverted", "true")]);
+        assert_eq!(
+            rs_daylight_detector_state(reg, daylight),
+            Some(RsDaylightDetectorState { inverted: true })
+        );
+        let wire = registered(
+            reg,
+            "tripwire",
+            &[
+                ("attached", "true"),
+                ("disarmed", "true"),
+                ("powered", "false"),
+            ],
+        );
+        assert_eq!(
+            rs_tripwire_cell_from_state(reg, wire),
+            Some(RsTripwireCell::Wire {
+                powered: false,
+                disarmed: true,
+                entity_intersects: false,
+            })
+        );
+        let hook = registered(
+            reg,
+            "tripwire_hook",
+            &[
+                ("attached", "true"),
+                ("facing", "east"),
+                ("powered", "true"),
+            ],
+        );
+        assert_eq!(
+            rs_tripwire_cell_from_state(reg, hook),
+            Some(RsTripwireCell::Hook {
+                facing: RsDir::East,
+                attached: true
+            })
+        );
+        assert_eq!(
+            rs_tripwire_hook_state(reg, hook),
+            Some(RsTripwireHookState {
+                facing: RsDir::East,
+                attached: true,
+                powered: true
+            })
+        );
+        let sensor = registered(
+            reg,
+            "sculk_sensor",
+            &[("power", "0"), ("sculk_sensor_phase", "inactive")],
+        );
+        assert_eq!(
+            rs_sculk_sensor_state(reg, sensor),
+            Some(RsSculkSensorState {
+                calibrated: false,
+                phase: RsSculkPhase::Inactive,
+                power: 0
+            })
+        );
+        let calibrated = registered(
+            reg,
+            "calibrated_sculk_sensor",
+            &[("power", "12"), ("sculk_sensor_phase", "active")],
+        );
+        assert_eq!(
+            rs_sculk_sensor_state(reg, calibrated),
+            Some(RsSculkSensorState {
+                calibrated: true,
+                phase: RsSculkPhase::Active,
+                power: 12
+            })
+        );
     }
 }

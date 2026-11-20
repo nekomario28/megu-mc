@@ -1,5 +1,82 @@
 use crate::block_registry::{BReg, Support};
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RsDaylightDetectorState {
+    inverted: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RsTripwireHookState {
+    facing: RsDir,
+    attached: bool,
+    powered: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RsSculkSensorState {
+    calibrated: bool,
+    phase: RsSculkPhase,
+    power: u8,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_daylight_detector_state(reg: &BReg, state: u32) -> Option<RsDaylightDetectorState> {
+    (reg.name_of(state) == "minecraft:daylight_detector").then(|| RsDaylightDetectorState {
+        inverted: reg.get_prop(state, "inverted").as_deref() == Some("true"),
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_tripwire_cell_from_state(reg: &BReg, state: u32) -> Option<RsTripwireCell> {
+    match reg.name_of(state) {
+        "minecraft:tripwire" => Some(RsTripwireCell::Wire {
+            powered: reg.get_prop(state, "powered").as_deref() == Some("true"),
+            disarmed: reg.get_prop(state, "disarmed").as_deref() == Some("true"),
+            entity_intersects: false,
+        }),
+        "minecraft:tripwire_hook" => Some(RsTripwireCell::Hook {
+            facing: RsDir::from_property(&reg.get_prop(state, "facing")?)?,
+            attached: reg.get_prop(state, "attached").as_deref() == Some("true"),
+        }),
+        _ => Some(RsTripwireCell::Other),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_tripwire_hook_state(reg: &BReg, state: u32) -> Option<RsTripwireHookState> {
+    if reg.name_of(state) != "minecraft:tripwire_hook" {
+        return None;
+    }
+    Some(RsTripwireHookState {
+        facing: RsDir::from_property(&reg.get_prop(state, "facing")?)?,
+        attached: reg.get_prop(state, "attached").as_deref() == Some("true"),
+        powered: reg.get_prop(state, "powered").as_deref() == Some("true"),
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_sculk_sensor_state(reg: &BReg, state: u32) -> Option<RsSculkSensorState> {
+    let name = reg.name_of(state);
+    let calibrated = match name {
+        "minecraft:sculk_sensor" => false,
+        "minecraft:calibrated_sculk_sensor" => true,
+        _ => return None,
+    };
+    Some(RsSculkSensorState {
+        calibrated,
+        phase: match reg.get_prop(state, "sculk_sensor_phase")?.as_str() {
+            "inactive" => RsSculkPhase::Inactive,
+            "active" => RsSculkPhase::Active,
+            "cooldown" => RsSculkPhase::Cooldown,
+            _ => return None,
+        },
+        power: reg.get_prop(state, "power")?.parse().ok()?,
+    })
+}
+
 // The registry stores the canonical state properties. Keep comparator output separate:
 // its analog value lives in a block entity and cannot be recovered from a state ID.
 #[cfg_attr(not(test), allow(dead_code))]
