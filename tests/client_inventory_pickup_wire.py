@@ -11,6 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/client_diff"))
+from command_brigadier_ops_wire import SUGGEST, SUGGESTIONS  # noqa: E402
 from parity_client import (EMPTY_STACK, JAR, OAK_LOG, ParityClient, Reader,  # noqa: E402
                            command, live_server, stack, string, until, vint, wire_stack)
 
@@ -42,8 +43,8 @@ def click(client, slot, changes, carried, barrier):
             + vint(len(changes)) + changed + wire_stack(*carried))
     start = len(client.slot_trace)
     client.send(0x0e, body)
-    client.send(0x0b, vint(barrier) + string("/time "))
-    client.until(lambda pid, payload: pid == 0x0f and Reader(payload).varint() == barrier,
+    client.send(SUGGEST, vint(barrier) + string("/time "))
+    client.until(lambda pid, payload: pid == SUGGESTIONS and Reader(payload).varint() == barrier,
                  "Play suggestion reply after inventory click")
     return {"request_hex": (b"\x0e" + body).hex(), "menu_state": state,
             "updates": client.slot_trace[start:]}

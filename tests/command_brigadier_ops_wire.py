@@ -17,9 +17,10 @@ from pathlib import Path
 from protocol767 import ROOT, Client, Reader, string, vint
 from wire_smoke import port, rcon_frame, rcon_response, status
 
-COMMANDS = 0x10
+COMMANDS = 0x11
 SUGGEST = 0x0B
-SUGGESTIONS = 0x0F
+SUGGESTIONS = 0x10
+PUBLIC_COMMANDS = {"help", "list", "me", "msg", "tell", "time", "w"}
 PLAYER = "BrigadierProbe"
 SECRET = "local-brigadier-wire-test"
 
@@ -201,13 +202,13 @@ def assert_tree(tree, admin):
         assert set(tree["datapack"][3]) == {"list", "enable", "disable"}
         assert time_subcommands["set"][3]["ticks"][:3] == (2, True, 4)
     else:
-        assert set(tree) == {"help", "list", "time"}
+        assert set(tree) == PUBLIC_COMMANDS, tree.keys()
         assert set(time_subcommands) == {"query", "get"}
 
 
 def assert_initial_permissions(client, rcon):
     assert_tree(client.initial_tree, False)
-    assert client.suggest(1, "/") == (1, 0, {"help", "list", "time"})
+    assert client.suggest(1, "/") == (1, 0, PUBLIC_COMMANDS)
     assert client.suggest(2, "time q") == (5, 1, {"query"})
     assert client.suggest(3, "/time s")[2] == set()
     client.send(SUGGEST, vint(4) + string("/op ") + b"\0")

@@ -81,6 +81,7 @@ def exercise(binary, root):
                 traveller.until_chunks(square(*chunk_of(spawn)))
 
                 # ---- (1) Overworld -> Nether through a real nether_portal block ----
+                command(traveller, "gamemode creative")
                 bx, by, bz = block_of(spawn)
                 command(traveller, f"setblock {bx} {by} {bz} minecraft:nether_portal")
                 traveller.move(*spawn)

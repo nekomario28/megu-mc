@@ -157,6 +157,7 @@ def time_weather(game):
 def crafting_and_furnace(game):
     with M2Client(game, "M2Crafter") as client:
         login(client)
+        command(client, "gamemode creative")
         set_creative(client, 36, OAK_LOG, 1)
         click(client, 0, 36)  # lift actual log stack into the cursor
         await_slot(client, 0, 36, (0, 0), "craft-lift-log")

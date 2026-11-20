@@ -474,7 +474,8 @@ fn generated_dispatcher_fixture() {
             for _ in 0..2 {
                 let mut payload = Vec::new();
                 with_save_guard(|| save_world_into(&mut payload));
-                let saved = tick_persistence::TickState::read(&payload)
+                let (payload, _) = read_world_seed_footer(&payload).expect("decode the seed footer");
+                let saved = tick_persistence::TickState::read(payload)
                     .expect("decode the tick footer")
                     .expect("save includes a tick footer");
                 assert_eq!(
@@ -7524,8 +7525,11 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
     THUNDERING.store(old_weather.1, Ordering::Relaxed);
     world_rng::restore(old_rng);
     set_test_region(old_hot, old_warm);
-    // includes the world-border footer (BRD1) appended by the save since #92
-    assert_eq!(first, "ccb95841c40f2d55ccd155989ad93fc8");
+    // Pin the legacy payload (including BRD1) and the payload with the SED1 suffix.
+    let (before_seed, seed) = read_world_seed_footer(&first_payload).unwrap();
+    assert_eq!(seed, Some(0));
+    assert_eq!(payload_digest(before_seed), "ccb95841c40f2d55ccd155989ad93fc8");
+    assert_eq!(first, "298e3a9e54bfb08500015ce6ebfa6bfb");
 }
 
 // ---------- chest world-side contract remainder (M2 slice 3d) ----------
