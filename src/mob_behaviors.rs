@@ -887,6 +887,14 @@ impl EnderDragonBehavior {
         [0.0, f64::from(portal_y), 0.0]
     }
 
+    fn death_rewards(&self) -> (bool, u32) {
+        if self.previously_killed {
+            (false, 500)
+        } else {
+            (true, 12_000)
+        }
+    }
+
     fn tick(&mut self, input: DragonTick<'_>) -> Option<DragonEvent> {
         if self.phase == DragonPhase::Dead {
             return None;
@@ -899,10 +907,11 @@ impl EnderDragonBehavior {
                 self.phase_ticks += 1;
                 if self.phase_ticks == 200 {
                     self.set_phase(DragonPhase::Dead);
+                    let (spawn_egg, xp) = self.death_rewards();
                     return Some(DragonEvent::CompleteFight(DragonFightRewards {
                         exit_portal_base: [0, input.portal_y, 0],
-                        dragon_egg: (!self.previously_killed).then_some([0, input.portal_y + 4, 0]),
-                        xp: if self.previously_killed { 500 } else { 12_000 },
+                        dragon_egg: spawn_egg.then_some([0, input.portal_y + 4, 0]),
+                        xp,
                     }));
                 }
             }
@@ -1260,6 +1269,7 @@ struct WitherBehavior {
 #[cfg_attr(not(test), allow(dead_code))]
 impl WitherBehavior {
     const MAX_HP: f32 = 300.0;
+    const DEATH_DROP: &'static str = "nether_star";
 
     fn new() -> Self {
         Self {
@@ -1309,7 +1319,7 @@ impl WitherBehavior {
         }
         self.hp = (self.hp - damage).max(0.0);
         (self.hp == 0.0).then_some(WitherEvent::Drop {
-            item: "nether_star",
+            item: Self::DEATH_DROP,
         })
     }
 }
@@ -1460,9 +1470,900 @@ impl WardenBehavior {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+struct MobTargetSnapshot {
+    eid: i32,
+    pos: [f64; 3],
+    hp: f32,
+    visible: bool,
+}
+
+/// One game tick of observations and one draw from the caller's world RNG.
+#[cfg_attr(not(test), allow(dead_code))]
+struct MobBehaviorTickCtx {
+    dim: DimId,
+    pos: [f64; 3],
+    hp: f32,
+    max_hp: f32,
+    in_water: bool,
+    in_rain: bool,
+    // For Blazes this is the currently applied attack-charge flag.
+    on_fire: bool,
+    nearest_target: Option<MobTargetSnapshot>,
+    rng_u64: u64,
+}
+
+/// World observations needed by behaviors that cannot decide from the basic snapshot.
+#[cfg_attr(not(test), allow(dead_code))]
+enum MobBehaviorWorldTick<'a> {
+    Basic,
+    Enderman {
+        block_at: &'a mut dyn FnMut([i32; 3]) -> EndermanTeleportBlock,
+        can_occupy: &'a mut dyn FnMut([f64; 3]) -> bool,
+    },
+    EnderDragon {
+        portal_y: i32,
+        path_complete: bool,
+        strafe_aligned: bool,
+        crystals: &'a [DragonCrystal],
+    },
+    Witch {
+        eid: i32,
+        active_effects: &'a [WitchPotion],
+        target_effects: &'a [WitchPotion],
+        throw_ready: bool,
+    },
+    WitherShot {
+        force_blue: bool,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MobProjectileKind {
+    SmallFireball,
+    GhastFireball,
+    ShulkerBullet { target_eid: i32 },
+    DragonFireball,
+    WitchSplash(WitchPotion),
+    WitherSkull { blue: bool },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum MobBehaviorEffect {
+    SetOnFire(bool),
+    /// Direction is a unit vector (or zero at coincident positions). Power is explosive strength.
+    LaunchProjectile {
+        kind: MobProjectileKind,
+        origin: [f64; 3],
+        dir: [f64; 3],
+        power: f32,
+    },
+    MeleeDamage {
+        target_eid: i32,
+        amount: f32,
+        knockback_y: f64,
+    },
+    /// The existing sonic attack bypasses armor and shields.
+    SonicBoom {
+        target_eid: i32,
+        damage: f32,
+    },
+    Explosion {
+        pos: [f64; 3],
+        power: f32,
+    },
+    Teleport {
+        to: [f64; 3],
+    },
+    ConvertEntity {
+        target_etype: i64,
+    },
+    DropItem {
+        item: &'static str,
+        count: u8,
+    },
+    SpawnSplitChildren {
+        etype: i64,
+        size: SlimeSize,
+        count: u8,
+    },
+    ApplyPotion {
+        target_eid: i32,
+        effect: WitchPotion,
+        duration_ticks: u16,
+    },
+    HealSelf(f32),
+    OpenEndExitPortal {
+        spawn_egg: bool,
+        xp: u32,
+    },
+    WarningSignal,
+    PiglinBarter {
+        player_eid: i32,
+        loot: PiglinBarterLoot,
+    },
+    DragonFlameBreath,
+    DragonPerchAttack,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+enum MobBehaviorState {
+    Blaze(BlazeBehavior),
+    Ghast(GhastBehavior),
+    Piglin(PiglinBehavior),
+    Hoglin(HoglinBehavior),
+    Enderman,
+    Shulker(ShulkerBehavior),
+    EnderDragon(EnderDragonBehavior),
+    Slime {
+        behavior: SlimeBehavior,
+        split_roll: u8,
+    },
+    Witch(WitchBehavior),
+    Wolf(PetBehavior),
+    Cat(PetBehavior),
+    Wither(WitherBehavior),
+    Warden(WardenBehavior),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MobBehaviorState {
+    fn for_etype(etype: i64) -> Option<Self> {
+        Some(match etype {
+            8 => Self::Blaze(BlazeBehavior::new()),
+            // The effect consumer supplies projectile ownership from the ticking entity.
+            45 => Self::Ghast(GhastBehavior::new(0, 0.0)),
+            78 => Self::Piglin(PiglinBehavior::default()),
+            51 => Self::Hoglin(HoglinBehavior::default()),
+            33 => Self::Enderman,
+            88 => Self::Shulker(ShulkerBehavior::new(0)),
+            31 => Self::EnderDragon(EnderDragonBehavior::new(false)),
+            67 | 93 => Self::Slime {
+                behavior: SlimeBehavior {
+                    kind: if etype == 67 {
+                        SlimeKind::MagmaCube
+                    } else {
+                        SlimeKind::Slime
+                    },
+                    // The generic spawner gives these mobs at least the large size's health.
+                    // A size-aware caller can set this from the actual entity size.
+                    size: SlimeSize::Large,
+                },
+                split_roll: 0,
+            },
+            118 => Self::Witch(WitchBehavior::default()),
+            122 => Self::Wolf(PetBehavior::new(PetKind::Wolf)),
+            15 => Self::Cat(PetBehavior::new(PetKind::Cat)),
+            119 => Self::Wither(WitherBehavior::new()),
+            116 => Self::Warden(WardenBehavior::new()),
+            _ => return None,
+        })
+    }
+
+    fn step(&mut self, ctx: &MobBehaviorTickCtx) -> Vec<MobBehaviorEffect> {
+        self.step_with_world(ctx, MobBehaviorWorldTick::Basic)
+    }
+
+    fn step_with_world(
+        &mut self,
+        ctx: &MobBehaviorTickCtx,
+        world: MobBehaviorWorldTick<'_>,
+    ) -> Vec<MobBehaviorEffect> {
+        use MobBehaviorEffect::*;
+
+        if ctx.hp <= 0.0 && !matches!(self, Self::EnderDragon(_)) {
+            return Vec::new();
+        }
+        let target = ctx.nearest_target;
+        let visible_target = target.filter(|target| target.visible);
+        let launch = |kind, target: MobTargetSnapshot, power| LaunchProjectile {
+            kind,
+            origin: ctx.pos,
+            dir: mob_behavior_unit(mob_behavior_delta(ctx.pos, target.pos)),
+            power,
+        };
+        let mut rng = ctx.rng_u64;
+        let mut draw = |bound| {
+            let value = (rng % u64::from(bound)) as u32;
+            // Advance a local xorshift stream for behaviors that need multiple draws.
+            if rng == 0 {
+                rng = 0x9E37_79B9_7F4A_7C15;
+            }
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            value
+        };
+        let mut effects = Vec::new();
+        let effect = match self {
+            Self::Blaze(blaze) => {
+                let attack = blaze.tick(visible_target.map(|target| {
+                    let delta = mob_behavior_delta(ctx.pos, target.pos);
+                    (target.eid, mob_behavior_dot(delta, delta).sqrt())
+                }));
+                if blaze.on_fire() != ctx.on_fire {
+                    effects.push(SetOnFire(blaze.on_fire()));
+                }
+                match attack {
+                    Some(BlazeAttack::Melee { target, damage }) => Some(MeleeDamage {
+                        target_eid: target,
+                        amount: damage,
+                        knockback_y: 0.0,
+                    }),
+                    Some(BlazeAttack::SmallFireball { .. }) => visible_target
+                        .map(|target| launch(MobProjectileKind::SmallFireball, target, 0.0)),
+                    None => None,
+                }
+            }
+            Self::Ghast(ghast) => {
+                let delta = target.map(|target| mob_behavior_delta(ctx.pos, target.pos));
+                let can_fire = visible_target.is_some()
+                    && delta.is_some_and(|delta| mob_behavior_dot(delta, delta) < 64.0 * 64.0);
+                match ghast.tick(delta, can_fire) {
+                    Some(GhastAttack::Warning) => Some(WarningSignal),
+                    Some(GhastAttack::Fire(fireball)) => Some(LaunchProjectile {
+                        kind: MobProjectileKind::GhastFireball,
+                        origin: ctx.pos,
+                        dir: fireball.velocity,
+                        power: f32::from(fireball.explosion_power),
+                    }),
+                    None => None,
+                }
+            }
+            Self::Piglin(piglin) => match piglin.tick(ctx.dim == DimId::Nether, &mut draw) {
+                Some(PiglinEvent::ConvertToZombifiedPiglin) => {
+                    Some(ConvertEntity { target_etype: 127 })
+                }
+                Some(PiglinEvent::Barter { player, loot }) => Some(PiglinBarter {
+                    player_eid: player,
+                    loot,
+                }),
+                None => None,
+            },
+            Self::Hoglin(hoglin) => hoglin
+                .tick(ctx.dim == DimId::Nether)
+                .map(|HoglinEvent::ConvertToZoglin| ConvertEntity { target_etype: 123 }),
+            Self::Enderman => {
+                let MobBehaviorWorldTick::Enderman {
+                    block_at,
+                    can_occupy,
+                } = world
+                else {
+                    return effects;
+                };
+                let hazard = if ctx.in_water {
+                    EndermanHazard::Water
+                } else if ctx.in_rain {
+                    EndermanHazard::Rain
+                } else {
+                    return effects;
+                };
+                let bottom = ctx.dim.min_y();
+                enderman_escape(
+                    hazard,
+                    ctx.pos,
+                    bottom..bottom + ctx.dim.height(),
+                    block_at,
+                    can_occupy,
+                    &mut draw,
+                )
+                .destination
+                .map(|to| Teleport { to })
+            }
+            Self::Shulker(shulker) => {
+                if visible_target.is_some() {
+                    shulker.open(&mut draw);
+                }
+                shulker
+                    .tick(ctx.pos, visible_target.map(|target| target.eid), &mut draw)
+                    .and_then(|bullet| {
+                        visible_target.map(|target| {
+                            launch(
+                                MobProjectileKind::ShulkerBullet {
+                                    target_eid: bullet.target,
+                                },
+                                target,
+                                0.0,
+                            )
+                        })
+                    })
+            }
+            Self::EnderDragon(dragon) => {
+                let MobBehaviorWorldTick::EnderDragon {
+                    portal_y,
+                    path_complete,
+                    strafe_aligned,
+                    crystals,
+                } = world
+                else {
+                    return effects;
+                };
+                if !matches!(dragon.phase, DragonPhase::Dying | DragonPhase::Dead) {
+                    if ctx.hp <= 0.0 {
+                        dragon.hurt(BossHit::Other, dragon.hp);
+                    } else {
+                        dragon.hp = ctx.hp;
+                    }
+                }
+                let hp_before = dragon.hp;
+                let event = dragon.tick(DragonTick {
+                    position: ctx.pos,
+                    portal_y,
+                    path_complete,
+                    strafe_target: target.map(|target| target.eid),
+                    strafe_aligned,
+                    crystals,
+                });
+                let healed = dragon.hp.min(ctx.max_hp) - hp_before;
+                if healed > 0.0 {
+                    effects.push(HealSelf(healed));
+                }
+                match event {
+                    Some(DragonEvent::StrafeFireball { target: eid }) => target
+                        .filter(|target| target.eid == eid)
+                        .map(|target| launch(MobProjectileKind::DragonFireball, target, 0.0)),
+                    Some(DragonEvent::FlameBreath) => Some(DragonFlameBreath),
+                    Some(DragonEvent::PerchAttack) => Some(DragonPerchAttack),
+                    Some(DragonEvent::CompleteFight(rewards)) => Some(OpenEndExitPortal {
+                        spawn_egg: rewards.dragon_egg.is_some(),
+                        xp: rewards.xp,
+                    }),
+                    None => None,
+                }
+            }
+            Self::Slime { split_roll, .. } => {
+                *split_roll = draw(3) as u8;
+                None
+            }
+            Self::Witch(witch) => {
+                let MobBehaviorWorldTick::Witch {
+                    eid,
+                    active_effects,
+                    target_effects,
+                    throw_ready,
+                } = world
+                else {
+                    return effects;
+                };
+                let needs = WitchNeeds {
+                    underwater: ctx.in_water,
+                    burning: ctx.on_fire,
+                    hurt: ctx.hp < ctx.max_hp,
+                    chase_distance: target.map(|target| {
+                        let delta = mob_behavior_delta(ctx.pos, target.pos);
+                        mob_behavior_dot(delta, delta).sqrt()
+                    }),
+                };
+                match witch.tick_drinking(needs, active_effects, &mut draw) {
+                    Some(WitchAction::FinishDrinking(WitchPotion::Healing)) => {
+                        let amount = (ctx.max_hp - ctx.hp).min(4.0);
+                        (amount > 0.0).then_some(HealSelf(amount))
+                    }
+                    Some(WitchAction::FinishDrinking(effect)) => Some(ApplyPotion {
+                        target_eid: eid,
+                        effect,
+                        duration_ticks: 3600,
+                    }),
+                    None if throw_ready => visible_target.and_then(|target| {
+                        let [x, _, z] = mob_behavior_delta(ctx.pos, target.pos);
+                        let action = witch.splash(
+                            WitchTarget {
+                                entity: target.eid,
+                                horizontal_distance: x.hypot(z),
+                                hp: target.hp,
+                                effects: target_effects,
+                            },
+                            &mut draw,
+                        );
+                        match action {
+                            Some(WitchAction::Splash { potion, .. }) => {
+                                Some(launch(MobProjectileKind::WitchSplash(potion), target, 0.0))
+                            }
+                            _ => None,
+                        }
+                    }),
+                    _ => None,
+                }
+            }
+            Self::Wolf(_) | Self::Cat(_) => None, // Pet interactions are event-driven.
+            Self::Wither(wither) => {
+                wither.hp = ctx.hp;
+                let event = wither.tick();
+                let healed = wither.hp.min(ctx.max_hp) - ctx.hp;
+                if healed > 0.0 {
+                    effects.push(HealSelf(healed));
+                }
+                match event {
+                    Some(WitherEvent::SpawnExplosion { power }) => Some(Explosion {
+                        pos: ctx.pos,
+                        power,
+                    }),
+                    _ => {
+                        let (Some(target), MobBehaviorWorldTick::WitherShot { force_blue }) =
+                            (visible_target, world)
+                        else {
+                            return effects;
+                        };
+                        wither
+                            .shoot(target.eid, force_blue, &mut draw)
+                            .map(|skull| {
+                                let blue = matches!(skull, WitherSkull::Blue { .. });
+                                launch(MobProjectileKind::WitherSkull { blue }, target, 1.0)
+                            })
+                    }
+                }
+            }
+            Self::Warden(warden) => {
+                warden.hp = ctx.hp;
+                let observed = target.map(|target| WardenTarget {
+                    entity: target.eid,
+                    offset: mob_behavior_delta(ctx.pos, target.pos),
+                });
+                match warden.tick(observed) {
+                    Some(WardenEvent::Roar { .. } | WardenEvent::ChargeSonicBoom { .. }) => {
+                        Some(WarningSignal)
+                    }
+                    Some(WardenEvent::SonicBoom { target, damage, .. }) => Some(SonicBoom {
+                        target_eid: target,
+                        damage,
+                    }),
+                    None => None,
+                }
+            }
+        };
+        effects.extend(effect);
+        effects
+    }
+
+    /// Call once when removing the dead entity. A Dragon fight completed by the
+    /// world-aware tick already emitted its portal and rewards.
+    fn on_death(&self) -> Vec<MobBehaviorEffect> {
+        use MobBehaviorEffect::*;
+
+        let effect = match self {
+            Self::Slime {
+                behavior,
+                split_roll,
+            } => {
+                let children = behavior.split_on_death(&mut |_| u32::from(*split_roll));
+                children.first().map(|child| SpawnSplitChildren {
+                    etype: match child.kind {
+                        SlimeKind::Slime => 93,
+                        SlimeKind::MagmaCube => 67,
+                    },
+                    size: child.size,
+                    count: children.len() as u8,
+                })
+            }
+            Self::Wither(_) => Some(DropItem {
+                item: WitherBehavior::DEATH_DROP,
+                count: 1,
+            }),
+            Self::EnderDragon(dragon) if dragon.phase != DragonPhase::Dead => {
+                let (spawn_egg, xp) = dragon.death_rewards();
+                Some(OpenEndExitPortal { spawn_egg, xp })
+            }
+            _ => None,
+        };
+        effect.into_iter().collect()
+    }
+}
+
 #[cfg(test)]
 mod mob_behaviors_tests {
     use super::*;
+
+    #[test]
+    fn dispatch_selects_the_protocol_767_behavior() {
+        for etype in [8, 45, 78, 51, 33, 88, 31, 93, 67, 118, 122, 15, 119, 116] {
+            let name = match MobBehaviorState::for_etype(etype).unwrap() {
+                MobBehaviorState::Blaze(_) => "minecraft:blaze",
+                MobBehaviorState::Ghast(_) => "minecraft:ghast",
+                MobBehaviorState::Piglin(_) => "minecraft:piglin",
+                MobBehaviorState::Hoglin(_) => "minecraft:hoglin",
+                MobBehaviorState::Enderman => "minecraft:enderman",
+                MobBehaviorState::Shulker(_) => "minecraft:shulker",
+                MobBehaviorState::EnderDragon(_) => "minecraft:ender_dragon",
+                MobBehaviorState::Slime { behavior, .. } => match behavior.kind {
+                    SlimeKind::Slime => "minecraft:slime",
+                    SlimeKind::MagmaCube => "minecraft:magma_cube",
+                },
+                MobBehaviorState::Witch(_) => "minecraft:witch",
+                MobBehaviorState::Wolf(pet) if pet.kind == PetKind::Wolf => "minecraft:wolf",
+                MobBehaviorState::Cat(pet) if pet.kind == PetKind::Cat => "minecraft:cat",
+                MobBehaviorState::Wither(_) => "minecraft:wither",
+                MobBehaviorState::Warden(_) => "minecraft:warden",
+                _ => panic!("incorrect pet behavior for entity type {etype}"),
+            };
+            assert_eq!(entity_spec_by_id(etype).unwrap().name, name);
+        }
+        for etype in [-1, 79, 123, 124, 127, 130] {
+            assert!(MobBehaviorState::for_etype(etype).is_none(), "type {etype}");
+        }
+    }
+
+    fn dispatch_ctx() -> MobBehaviorTickCtx {
+        MobBehaviorTickCtx {
+            dim: DimId::Overworld,
+            pos: [10.0, 80.0, -5.0],
+            hp: 20.0,
+            max_hp: 20.0,
+            in_water: false,
+            in_rain: false,
+            on_fire: false,
+            nearest_target: Some(MobTargetSnapshot {
+                eid: 7,
+                pos: [10.0, 83.0, -1.0],
+                hp: 20.0,
+                visible: true,
+            }),
+            rng_u64: 0,
+        }
+    }
+
+    #[test]
+    fn dispatch_blaze_emits_charge_flag_and_three_fireballs() {
+        use MobBehaviorEffect::*;
+
+        let mut state = MobBehaviorState::for_etype(8).unwrap();
+        let mut ctx = dispatch_ctx();
+        let shot = || LaunchProjectile {
+            kind: MobProjectileKind::SmallFireball,
+            origin: [10.0, 80.0, -5.0],
+            dir: [0.0, 0.6, 0.8],
+            power: 0.0,
+        };
+        for tick in 1..=233 {
+            let expected = match tick {
+                60 => vec![SetOnFire(true)],
+                121 | 127 => vec![shot()],
+                133 => vec![SetOnFire(false), shot()],
+                _ => vec![],
+            };
+            assert_eq!(state.step(&ctx), expected, "tick {tick}");
+            if tick == 60 || tick == 133 {
+                ctx.on_fire = tick == 60;
+            }
+        }
+        ctx.nearest_target.as_mut().unwrap().pos = [10.0, 80.0, -4.0];
+        assert_eq!(
+            state.step(&ctx),
+            [MeleeDamage {
+                target_eid: 7,
+                amount: 6.0,
+                knockback_y: 0.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn dispatch_ghast_warns_and_fires_only_at_a_visible_target_in_range() {
+        use MobBehaviorEffect::*;
+
+        let mut state = MobBehaviorState::for_etype(45).unwrap();
+        let mut ctx = dispatch_ctx();
+        let target = ctx.nearest_target.unwrap();
+        for unavailable in [
+            MobTargetSnapshot {
+                visible: false,
+                ..target
+            },
+            MobTargetSnapshot {
+                pos: [74.0, 80.0, -5.0],
+                ..target
+            },
+        ] {
+            ctx.nearest_target = Some(unavailable);
+            for _ in 0..20 {
+                assert!(state.step(&ctx).is_empty());
+            }
+        }
+        ctx.nearest_target = Some(target);
+        for tick in 1..=20 {
+            let expected = match tick {
+                10 => vec![WarningSignal],
+                20 => vec![LaunchProjectile {
+                    kind: MobProjectileKind::GhastFireball,
+                    origin: [10.0, 80.0, -5.0],
+                    dir: [0.0, 0.6, 0.8],
+                    power: 1.0,
+                }],
+                _ => vec![],
+            };
+            assert_eq!(state.step(&ctx), expected, "tick {tick}");
+        }
+        assert!(state.step(&ctx).is_empty());
+    }
+
+    #[test]
+    fn dispatch_nether_mob_conversions_require_301_consecutive_unsafe_ticks() {
+        for (etype, converted_etype, converted_name) in [
+            (78, 127, "minecraft:zombified_piglin"),
+            (51, 123, "minecraft:zoglin"),
+        ] {
+            assert_eq!(
+                entity_spec_by_id(converted_etype).unwrap().name,
+                converted_name
+            );
+            let mut state = MobBehaviorState::for_etype(etype).unwrap();
+            let mut ctx = dispatch_ctx();
+            ctx.nearest_target = None;
+            for (dim, ticks) in [
+                (DimId::Overworld, 300),
+                (DimId::Nether, 400),
+                (DimId::Overworld, 300),
+            ] {
+                ctx.dim = dim;
+                for _ in 0..ticks {
+                    assert!(state.step(&ctx).is_empty(), "type {etype} in {dim:?}");
+                }
+            }
+            assert_eq!(
+                state.step(&ctx),
+                [MobBehaviorEffect::ConvertEntity {
+                    target_etype: converted_etype
+                }]
+            );
+            assert!(state.step(&ctx).is_empty());
+        }
+    }
+
+    #[test]
+    fn dispatch_piglin_barter_preserves_the_potion_in_the_loot() {
+        let mut state = MobBehaviorState::for_etype(78).unwrap();
+        let mut ctx = dispatch_ctx();
+        ctx.dim = DimId::Nether;
+        ctx.rng_u64 = 13;
+        let MobBehaviorState::Piglin(piglin) = &mut state else {
+            panic!("expected Piglin behavior");
+        };
+        assert!(piglin.offer(7, "gold_ingot"));
+        for _ in 0..119 {
+            assert!(state.step(&ctx).is_empty());
+        }
+        assert_eq!(
+            state.step(&ctx),
+            [MobBehaviorEffect::PiglinBarter {
+                player_eid: 7,
+                loot: PiglinBarterLoot {
+                    item: "potion",
+                    count: 1,
+                    potion: Some("fire_resistance"),
+                    soul_speed: None,
+                },
+            }]
+        );
+        assert!(state.step(&ctx).is_empty());
+    }
+
+    #[test]
+    fn dispatch_shulker_launches_a_bullet_bound_to_its_target() {
+        let mut state = MobBehaviorState::for_etype(88).unwrap();
+        let ctx = dispatch_ctx();
+        for _ in 0..19 {
+            assert!(state.step(&ctx).is_empty());
+        }
+        assert_eq!(
+            state.step(&ctx),
+            [MobBehaviorEffect::LaunchProjectile {
+                kind: MobProjectileKind::ShulkerBullet { target_eid: 7 },
+                origin: [10.0, 80.0, -5.0],
+                dir: [0.0, 0.6, 0.8],
+                power: 0.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn dispatch_wither_heals_during_invulnerability_then_explodes_at_tick_220() {
+        use MobBehaviorEffect::*;
+
+        let mut state = MobBehaviorState::for_etype(119).unwrap();
+        let mut ctx = dispatch_ctx();
+        ctx.hp = 100.0;
+        ctx.max_hp = 300.0;
+        for tick in 1..220 {
+            if tick % 10 == 0 && ctx.hp < ctx.max_hp {
+                assert_eq!(state.step(&ctx), [HealSelf(10.0)], "tick {tick}");
+                ctx.hp += 10.0;
+            } else {
+                assert!(state.step(&ctx).is_empty(), "tick {tick}");
+            }
+        }
+        assert_eq!(ctx.hp, 300.0);
+        assert_eq!(
+            state.step(&ctx),
+            [Explosion {
+                pos: [10.0, 80.0, -5.0],
+                power: 7.0
+            }]
+        );
+        assert!(state.step(&ctx).is_empty());
+
+        let world = MobBehaviorWorldTick::WitherShot { force_blue: true };
+        assert_eq!(
+            state.step_with_world(&ctx, world),
+            [LaunchProjectile {
+                kind: MobProjectileKind::WitherSkull { blue: true },
+                origin: [10.0, 80.0, -5.0],
+                dir: [0.0, 0.6, 0.8],
+                power: 1.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn dispatch_warden_sonic_boom_targets_the_mob_that_triggered_its_anger() {
+        use MobBehaviorEffect::*;
+
+        let mut state = MobBehaviorState::for_etype(116).unwrap();
+        let mut ctx = dispatch_ctx();
+        let MobBehaviorState::Warden(warden) = &mut state else {
+            panic!("expected Warden behavior");
+        };
+        for _ in 0..5 {
+            warden.anger.add_vibration(7);
+        }
+        assert_eq!(state.step(&ctx), [WarningSignal]);
+        ctx.nearest_target.as_mut().unwrap().eid = 8;
+        assert!(state.step(&ctx).is_empty());
+        let target = ctx.nearest_target.as_mut().unwrap();
+        target.eid = 7;
+        target.visible = false; // The sonic attack can pass through blocks.
+        assert_eq!(state.step(&ctx), [WarningSignal]);
+        for _ in 0..33 {
+            assert!(state.step(&ctx).is_empty());
+        }
+        assert_eq!(
+            state.step(&ctx),
+            [SonicBoom {
+                target_eid: 7,
+                damage: 10.0
+            }]
+        );
+        assert!(state.step(&ctx).is_empty());
+    }
+
+    #[test]
+    fn dispatch_death_effects_preserve_slime_kind_and_boss_rewards() {
+        use MobBehaviorEffect::*;
+
+        for etype in [93, 67] {
+            let mut slime = MobBehaviorState::for_etype(etype).unwrap();
+            let mut ctx = dispatch_ctx();
+            ctx.rng_u64 = 2;
+            assert!(slime.step(&ctx).is_empty());
+            assert_eq!(
+                slime.on_death(),
+                [SpawnSplitChildren {
+                    etype,
+                    size: SlimeSize::Medium,
+                    count: 4
+                }]
+            );
+            let MobBehaviorState::Slime { behavior, .. } = &mut slime else {
+                panic!("expected Slime behavior");
+            };
+            behavior.size = SlimeSize::Small;
+            assert!(slime.on_death().is_empty());
+        }
+        assert_eq!(
+            MobBehaviorState::for_etype(119).unwrap().on_death(),
+            [DropItem {
+                item: "nether_star",
+                count: 1
+            }]
+        );
+        assert_eq!(
+            MobBehaviorState::for_etype(31).unwrap().on_death(),
+            [OpenEndExitPortal {
+                spawn_egg: true,
+                xp: 12_000
+            }]
+        );
+        let repeat_kill = MobBehaviorState::EnderDragon(EnderDragonBehavior::new(true));
+        assert_eq!(
+            repeat_kill.on_death(),
+            [OpenEndExitPortal {
+                spawn_egg: false,
+                xp: 500
+            }]
+        );
+        assert!(MobBehaviorState::for_etype(8)
+            .unwrap()
+            .on_death()
+            .is_empty());
+    }
+
+    #[test]
+    fn dispatch_enderman_emits_only_a_checked_teleport_destination() {
+        let mut state = MobBehaviorState::for_etype(33).unwrap();
+        let mut ctx = dispatch_ctx();
+        ctx.in_rain = true;
+        let mut block_at = |[_, y, _]: [i32; 3]| EndermanTeleportBlock {
+            blocks_motion: y == 48,
+            liquid: false,
+        };
+        let mut can_occupy = |_| false;
+        assert!(state.step(&ctx).is_empty());
+        assert!(state
+            .step_with_world(
+                &ctx,
+                MobBehaviorWorldTick::Enderman {
+                    block_at: &mut block_at,
+                    can_occupy: &mut can_occupy,
+                }
+            )
+            .is_empty());
+        let mut can_occupy = |[_, y, _]: [f64; 3]| y == 49.0;
+        assert!(matches!(
+            state
+                .step_with_world(
+                    &ctx,
+                    MobBehaviorWorldTick::Enderman {
+                        block_at: &mut block_at,
+                        can_occupy: &mut can_occupy,
+                    }
+                )
+                .as_slice(),
+            [MobBehaviorEffect::Teleport { to: [_, 49.0, _] }]
+        ));
+    }
+
+    #[test]
+    fn dispatch_dragon_animation_awards_the_portal_only_once() {
+        let mut state = MobBehaviorState::for_etype(31).unwrap();
+        let mut ctx = dispatch_ctx();
+        ctx.dim = DimId::End;
+        ctx.pos = [0.0, 80.0, 0.0];
+        ctx.hp = 0.0;
+        ctx.max_hp = 200.0;
+        let world = || MobBehaviorWorldTick::EnderDragon {
+            portal_y: 80,
+            path_complete: false,
+            strafe_aligned: false,
+            crystals: &[],
+        };
+        for _ in 0..199 {
+            assert!(state.step_with_world(&ctx, world()).is_empty());
+        }
+        assert_eq!(
+            state.step_with_world(&ctx, world()),
+            [MobBehaviorEffect::OpenEndExitPortal {
+                spawn_egg: true,
+                xp: 12_000
+            }]
+        );
+        assert!(state.step_with_world(&ctx, world()).is_empty());
+        assert!(state.on_death().is_empty());
+    }
+
+    #[test]
+    fn dispatch_witch_finishes_drinking_before_applying_a_potion() {
+        let mut state = MobBehaviorState::for_etype(118).unwrap();
+        let mut ctx = dispatch_ctx();
+        ctx.in_water = true;
+        let world = || MobBehaviorWorldTick::Witch {
+            eid: 42,
+            active_effects: &[],
+            target_effects: &[],
+            throw_ready: true,
+        };
+        for _ in 0..32 {
+            assert!(state.step_with_world(&ctx, world()).is_empty());
+        }
+        assert_eq!(
+            state.step_with_world(&ctx, world()),
+            [MobBehaviorEffect::ApplyPotion {
+                target_eid: 42,
+                effect: WitchPotion::WaterBreathing,
+                duration_ticks: 3600,
+            }]
+        );
+    }
 
     fn zero(_: u32) -> u32 {
         0
