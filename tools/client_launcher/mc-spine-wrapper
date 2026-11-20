@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Prism Wrapper command: exec the native client with Minecraft game arguments."""
+import os
+from pathlib import Path
+import shutil
+import sys
+
+
+WITH_VALUE = {
+    "-cp", "-classpath", "--class-path", "-p", "--module-path", "--upgrade-module-path",
+    "--add-modules", "--limit-modules", "--add-exports", "--add-opens", "--add-reads",
+    "--patch-module", "--enable-native-access", "--source", "-splash",
+}
+
+
+def game_arguments(argv):
+    if not argv:
+        raise ValueError("missing Java invocation")
+    executable = Path(argv[0]).name.lower()
+    if executable not in ("java", "java.exe", "javaw", "javaw.exe"):
+        raise ValueError("expected java executable as the first wrapper argument")
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg in ("-jar", "-m", "--module"):
+            if index + 1 >= len(argv):
+                raise ValueError(f"missing target after {arg}")
+            return argv[index + 2:]
+        if arg in WITH_VALUE:
+            if index + 1 >= len(argv):
+                raise ValueError(f"missing JVM option value after {arg}")
+            index += 2
+        elif arg.startswith("-"):
+            index += 1
+        elif arg.startswith("@"):
+            raise ValueError("Java @argument files are not supported in wrapper mode")
+        else:
+            # First non-option token is Java's main class.
+            return argv[index + 1:]
+    raise ValueError("missing Minecraft main class")
+
+
+def main():
+    try:
+        args = game_arguments(sys.argv[1:])
+    except ValueError as error:
+        print(f"mc-spine wrapper: {error}", file=sys.stderr)
+        return 2
+    configured = os.environ.get("MC_SPINE_CLIENT_BIN")
+    if configured:
+        binary = configured if os.access(configured, os.X_OK) and os.path.isfile(configured) else None
+    else:
+        binary = shutil.which("mc-spine-client")
+    if binary is None:
+        print("mc-spine wrapper: native client not found or not executable "
+              "(MC_SPINE_CLIENT_BIN or mc-spine-client on PATH)", file=sys.stderr)
+        return 2
+    try:
+        os.execv(binary, [binary, *args])
+    except OSError as error:
+        print(f"mc-spine wrapper: exec failed: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
