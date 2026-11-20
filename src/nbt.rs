@@ -1,4 +1,4 @@
-//! Named big-endian NBT, preserving Java UTF-16 strings and every value type.
+//! Java big-endian NBT, preserving UTF-16 strings and every value type.
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -341,6 +341,243 @@ pub(crate) fn write_named(name: &NbtString, tag: &Tag) -> Result<Vec<u8>, &'stat
     }
     write_payload(tag, &mut out, 0)?;
     Ok(out)
+}
+
+/// Read one Protocol 767 registry compound, leaving subsequent packet bytes unread.
+#[allow(dead_code)] // The configuration handler will call this codec separately.
+pub(crate) fn read_network_nbt(input: &mut &[u8]) -> Result<Tag, &'static str> {
+    let Some((&10, rest)) = input.split_first() else {
+        return Err("network registry NBT root must be a compound");
+    };
+    let mut reader = Reader { input: rest };
+    let tag = reader.tag(10, 0)?;
+    *input = reader.input;
+    Ok(tag)
+}
+
+/// Protocol 767 omits the root name and its length. Child tags use normal Java NBT.
+#[allow(dead_code)] // The configuration handler will call this codec separately.
+pub(crate) fn write_network_nbt(tag: &Tag) -> Result<Vec<u8>, &'static str> {
+    if !matches!(tag, Tag::Compound(_)) {
+        return Err("network registry NBT root must be a compound");
+    }
+    let mut out = vec![10];
+    write_payload(tag, &mut out, 0)?;
+    Ok(out)
+}
+
+/// Parse a complete datapack JSON object into NBT. The shared asset parser
+/// collapses booleans into numbers and parses all numbers through f64.
+#[allow(dead_code)] // Used by the standalone registry packet builder.
+pub(crate) fn registry_json_to_nbt(bytes: &[u8]) -> Result<Tag, &'static str> {
+    let input = std::str::from_utf8(bytes).map_err(|_| "registry JSON must be UTF-8")?;
+    let mut json = RegistryJson { input };
+    json.whitespace();
+    if !json.take('{') {
+        return Err("registry JSON root must be an object");
+    }
+    let tag = json.compound(1)?;
+    json.whitespace();
+    if !json.input.is_empty() {
+        return Err("trailing bytes after registry JSON");
+    }
+    Ok(tag)
+}
+
+struct RegistryJson<'a> {
+    input: &'a str,
+}
+
+impl RegistryJson<'_> {
+    fn whitespace(&mut self) {
+        self.input = self.input.trim_start_matches([' ', '\t', '\r', '\n']);
+    }
+
+    fn take(&mut self, ch: char) -> bool {
+        if let Some(rest) = self.input.strip_prefix(ch) {
+            self.input = rest;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn next_char(&mut self) -> Result<char, &'static str> {
+        let ch = self.input.chars().next().ok_or("truncated registry JSON")?;
+        self.input = &self.input[ch.len_utf8()..];
+        Ok(ch)
+    }
+
+    fn string(&mut self) -> Result<NbtString, &'static str> {
+        if !self.take('"') {
+            return Err("expected registry JSON string");
+        }
+        let mut units = Vec::new();
+        loop {
+            match self.next_char()? {
+                '"' => return Ok(NbtString(units)),
+                '\\' => units.push(match self.next_char()? {
+                    '"' => 0x22,
+                    '\\' => 0x5c,
+                    '/' => 0x2f,
+                    'b' => 0x08,
+                    'f' => 0x0c,
+                    'n' => 0x0a,
+                    'r' => 0x0d,
+                    't' => 0x09,
+                    'u' => {
+                        let (digits, rest) = self
+                            .input
+                            .split_at_checked(4)
+                            .filter(|(digits, _)| digits.bytes().all(|b| b.is_ascii_hexdigit()))
+                            .ok_or("invalid registry JSON Unicode escape")?;
+                        self.input = rest;
+                        u16::from_str_radix(digits, 16).unwrap()
+                    }
+                    _ => return Err("invalid registry JSON escape"),
+                }),
+                '\0'..='\u{1f}' => return Err("unescaped control character in registry JSON"),
+                ch => units.extend_from_slice(ch.encode_utf16(&mut [0; 2])),
+            }
+        }
+    }
+
+    fn digits(&mut self) -> Result<(), &'static str> {
+        let rest = self
+            .input
+            .trim_start_matches(|ch: char| ch.is_ascii_digit());
+        if rest.len() == self.input.len() {
+            return Err("expected registry JSON number digits");
+        }
+        self.input = rest;
+        Ok(())
+    }
+
+    fn number(&mut self) -> Result<Tag, &'static str> {
+        let start = self.input;
+        self.take('-');
+        if !self.take('0') {
+            self.digits()?;
+        }
+        let fractional = self.take('.');
+        if fractional {
+            self.digits()?;
+        }
+        let exponent = self.take('e') || self.take('E');
+        if exponent {
+            if !self.take('+') {
+                self.take('-');
+            }
+            self.digits()?;
+        }
+        let number = &start[..start.len() - self.input.len()];
+        if fractional || exponent {
+            let value: f64 = number.parse().map_err(|_| "invalid registry JSON number")?;
+            if !value.is_finite() {
+                return Err("registry JSON number exceeds NBT double range");
+            }
+            Ok(Tag::Double(value.to_bits()))
+        } else {
+            let value: i64 = number
+                .parse()
+                .map_err(|_| "registry JSON integer exceeds NBT long range")?;
+            Ok(i32::try_from(value).map_or(Tag::Long(value), Tag::Int))
+        }
+    }
+
+    fn more(&mut self, end: char) -> Result<bool, &'static str> {
+        self.whitespace();
+        if self.take(end) {
+            Ok(false)
+        } else if self.take(',') {
+            self.whitespace();
+            Ok(true)
+        } else {
+            Err("expected comma or closing delimiter in registry JSON")
+        }
+    }
+
+    fn compound(&mut self, depth: usize) -> Result<Tag, &'static str> {
+        let mut values = BTreeMap::new();
+        self.whitespace();
+        if !self.take('}') {
+            loop {
+                let key = self.string()?;
+                self.whitespace();
+                if !self.take(':') {
+                    return Err("expected colon after registry JSON object key");
+                }
+                let value = self.value(depth)?;
+                if values.insert(key, value).is_some() {
+                    return Err("duplicate registry JSON object key");
+                }
+                if !self.more('}')? {
+                    break;
+                }
+            }
+        }
+        Ok(Tag::Compound(values))
+    }
+
+    fn list(&mut self, depth: usize) -> Result<Tag, &'static str> {
+        let mut values = Vec::new();
+        self.whitespace();
+        if !self.take(']') {
+            loop {
+                values.push(self.value(depth)?);
+                if !self.more(']')? {
+                    break;
+                }
+            }
+        }
+        let mut kind = values.first().map_or(0, Tag::id);
+        if values.iter().any(|value| value.id() != kind) {
+            kind = 10;
+        }
+        if kind == 10 {
+            // NbtOps reads a heterogeneous list as compounds, using a singleton
+            // empty key to wrap non-compounds or escape a compound with that shape.
+            let wrapper = NbtString(Vec::new());
+            for value in &mut values {
+                if matches!(value, Tag::Compound(fields) if fields.len() != 1 || !fields.contains_key(&wrapper))
+                {
+                    continue;
+                }
+                let inner = std::mem::replace(value, Tag::End);
+                *value = Tag::Compound(BTreeMap::from([(wrapper.clone(), inner)]));
+            }
+        }
+        Ok(Tag::List(kind, values))
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Tag, &'static str> {
+        self.whitespace();
+        if depth >= 512 {
+            return Err("registry JSON exceeds NBT container depth");
+        }
+        match self.input.as_bytes().first() {
+            Some(b'{') => {
+                self.input = &self.input[1..];
+                self.compound(depth + 1)
+            }
+            Some(b'[') => {
+                self.input = &self.input[1..];
+                self.list(depth + 1)
+            }
+            Some(b'"') => self.string().map(Tag::String),
+            Some(b't') if self.input.starts_with("true") => {
+                self.input = &self.input[4..];
+                Ok(Tag::Byte(1))
+            }
+            Some(b'f') if self.input.starts_with("false") => {
+                self.input = &self.input[5..];
+                Ok(Tag::Byte(0))
+            }
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            Some(b'n') if self.input.starts_with("null") => Err("NBT has no JSON null value"),
+            _ => Err("invalid registry JSON value"),
+        }
+    }
 }
 
 #[cfg(test)]

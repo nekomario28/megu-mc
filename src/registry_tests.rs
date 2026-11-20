@@ -1,5 +1,328 @@
 use super::*;
 use crate::block_registry::breg;
+use std::collections::BTreeMap;
+
+// Registry packet order in the vanilla 1.21.1 configuration capture.
+const SYNCED_REGISTRIES: [&str; 11] = [
+    "worldgen/biome",
+    "chat_type",
+    "trim_pattern",
+    "trim_material",
+    "wolf_variant",
+    "painting_variant",
+    "dimension_type",
+    "damage_type",
+    "banner_pattern",
+    "enchantment",
+    "jukebox_song",
+];
+
+/// Build Configuration 0x07 payloads (starting at the registry ID) from pack
+/// files in low-to-high priority order. Directory and ZIP readers supply paths
+/// relative to the pack root. A partial input emits only its populated registries.
+pub(crate) fn build_registry_data_payloads<'a>(
+    packs: impl IntoIterator<Item = impl IntoIterator<Item = (&'a str, &'a [u8])>>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut registries = BTreeMap::<_, BTreeMap<_, _>>::new();
+    for (priority, files) in packs.into_iter().enumerate() {
+        for (file, json) in files {
+            let Some((namespace, relative)) = file
+                .strip_prefix("data/")
+                .and_then(|path| path.split_once('/'))
+            else {
+                continue;
+            };
+            let Some(relative) = relative.strip_suffix(".json") else {
+                continue;
+            };
+            let Some((kind, path)) = SYNCED_REGISTRIES.iter().find_map(|&kind| {
+                let path = relative.strip_prefix(kind)?.strip_prefix('/')?;
+                Some((kind, path))
+            }) else {
+                continue;
+            };
+            // Vanilla ResourceLocation orders by path, then by namespace.
+            let previous = registries
+                .entry(kind)
+                .or_default()
+                .insert((path, namespace), (priority, file, json));
+            if previous.is_some_and(|(previous_priority, _, _)| previous_priority == priority) {
+                return Err(format!("duplicate registry file {file} in one datapack"));
+            }
+        }
+    }
+
+    let mut payloads = Vec::new();
+    for kind in SYNCED_REGISTRIES {
+        let Some(entries) = registries.remove(kind) else {
+            continue;
+        };
+        let mut payload = Vec::new();
+        write_str(&mut payload, &format!("minecraft:{kind}"));
+        let count = i32::try_from(entries.len()).map_err(|_| "too many registry entries")?;
+        write_varint(&mut payload, i64::from(count));
+        for ((path, namespace), (_, file, json)) in entries {
+            let location = brigadier_wire::ResourceLocation::new(namespace, path)
+                .map_err(|_| format!("invalid registry entry path {file}"))?;
+            let id = location.to_string();
+            if id.len() > 32_767 || path.split('/').any(|part| matches!(part, "" | "." | "..")) {
+                return Err(format!("invalid registry entry path {file}"));
+            }
+            let mut tag =
+                nbt::registry_json_to_nbt(json).map_err(|err| format!("{file}: {err}"))?;
+            if kind == "worldgen/biome" {
+                // Biome's network codec carries only the climate and effects.
+                if let nbt::Tag::Compound(fields) = &mut tag {
+                    for field in [
+                        "carvers",
+                        "features",
+                        "spawn_costs",
+                        "spawners",
+                        "creature_spawn_probability",
+                    ] {
+                        fields.remove(&nbt::NbtString::text(field));
+                    }
+                }
+            }
+            write_str(&mut payload, &id);
+            payload.push(1); // Optional NBT is present for every entry.
+            payload.extend(nbt::write_network_nbt(&tag).map_err(|err| format!("{file}: {err}"))?);
+        }
+        payloads.push(payload);
+    }
+    Ok(payloads)
+}
+
+fn read_registry_string<'a>(input: &mut &'a [u8]) -> &'a str {
+    let len = usize::try_from(read_protocol_i32(input).unwrap()).unwrap();
+    std::str::from_utf8(input.split_off(..len).unwrap()).unwrap()
+}
+
+#[test]
+fn network_nbt_uses_a_compound_type_without_root_name_bytes() {
+    let tag = nbt::Tag::Compound(std::collections::BTreeMap::from([(
+        nbt::NbtString::text("s"),
+        nbt::Tag::String(nbt::NbtString::text("\0😀")),
+    )]));
+    let wire = b"\x0a\x08\x00\x01s\x00\x08\xc0\x80\xed\xa0\xbd\xed\xb8\x80\x00";
+    assert_eq!(nbt::write_network_nbt(&tag).unwrap(), wire);
+    for end in 0..wire.len() {
+        assert!(nbt::read_network_nbt(&mut &wire[..end]).is_err());
+    }
+    let framed = [wire.as_slice(), &[0x7f]].concat();
+    let mut input = framed.as_slice();
+    assert_eq!(nbt::read_network_nbt(&mut input).unwrap(), tag);
+    assert_eq!(input, [0x7f]);
+    assert!(nbt::read_network_nbt(&mut &[0u8][..]).is_err());
+    assert!(nbt::write_network_nbt(&nbt::Tag::Int(1)).is_err());
+}
+
+#[test]
+fn registry_json_preserves_datapack_value_types() {
+    let tag = nbt::registry_json_to_nbt(
+        r#"{
+            "enabled": true,
+            "number": 1,
+            "fixed_time": 9007199254740993,
+            "scale": 1.25e1,
+            "name": "洞窟 \ud83d\ude00",
+            "parameters": ["sender", "content"],
+            "empty": [],
+            "extra": ["go ", {"text": "north", "italic": false}, {"": "literal key"}]
+        }"#
+        .as_bytes(),
+    )
+    .unwrap();
+    let string = |text| nbt::Tag::String(nbt::NbtString::text(text));
+    assert_eq!(tag.get("enabled"), Some(&nbt::Tag::Byte(1)));
+    assert_eq!(tag.get("number"), Some(&nbt::Tag::Int(1)));
+    assert_eq!(
+        tag.get("fixed_time"),
+        Some(&nbt::Tag::Long(9_007_199_254_740_993))
+    );
+    assert_eq!(
+        tag.get("scale"),
+        Some(&nbt::Tag::Double(12.5_f64.to_bits()))
+    );
+    assert_eq!(tag.get("name"), Some(&string("洞窟 😀")));
+    assert_eq!(
+        tag.get("parameters"),
+        Some(&nbt::Tag::List(
+            8,
+            vec![string("sender"), string("content")]
+        ))
+    );
+    assert_eq!(tag.get("empty"), Some(&nbt::Tag::List(0, Vec::new())));
+    let extra = tag.get("extra").unwrap();
+    let nbt::Tag::List(10, extra) = extra else {
+        panic!("mixed component array must use a compound list");
+    };
+    assert_eq!(extra[0].get(""), Some(&string("go ")));
+    assert_eq!(extra[1].get("text"), Some(&string("north")));
+    assert_eq!(extra[1].get("italic"), Some(&nbt::Tag::Byte(0)));
+    assert_eq!(
+        extra[2].get("").and_then(|field| field.get("")),
+        Some(&string("literal key"))
+    );
+}
+
+#[test]
+fn registry_json_rejects_malformed_or_unrepresentable_values() {
+    for bytes in [
+        br#"[]"#.as_slice(),
+        br#"{} {}"#,
+        br#"{"a": false,}"#,
+        br#"{"a": 01}"#,
+        br#"{"a": 1e+-2}"#,
+        br#"{"a": 1e1000}"#,
+        br#"{"a": 9223372036854775808}"#,
+        br#"{"a": "\u0x12"}"#,
+        br#"{"a": [1,]}"#,
+        br#"{"a": null}"#,
+        br#"{"a": false, "a": true}"#,
+    ] {
+        assert!(nbt::registry_json_to_nbt(bytes).is_err(), "{bytes:?}");
+    }
+}
+
+#[test]
+fn registry_data_0x07_payload_matches_the_wire_layout() {
+    let payloads = build_registry_data_payloads([[(
+        "data/example/damage_type/custom.json",
+        br#"{"message_id":"custom","scaling":"never","exhaustion":0.5}"#.as_slice(),
+    )]])
+    .unwrap();
+    let expected = b"\x15minecraft:damage_type\x01\x0eexample:custom\x01\
+                     \x0a\x06\x00\x0aexhaustion\x3f\xe0\x00\x00\x00\x00\x00\x00\
+                     \x08\x00\x0amessage_id\x00\x06custom\
+                     \x08\x00\x07scaling\x00\x05never\x00";
+    assert_eq!(payloads, [expected.to_vec()]);
+}
+
+#[test]
+fn registry_data_loads_every_synced_registry_from_datapack_paths() {
+    let kinds = [
+        "banner_pattern",
+        "chat_type",
+        "damage_type",
+        "dimension_type",
+        "enchantment",
+        "jukebox_song",
+        "painting_variant",
+        "trim_material",
+        "trim_pattern",
+        "wolf_variant",
+        "worldgen/biome",
+    ];
+    let files: Vec<_> = kinds
+        .iter()
+        .map(|kind| format!("data/example/{kind}/nested/custom.json"))
+        .collect();
+    let payloads = build_registry_data_payloads([files
+        .iter()
+        .map(|path| (path.as_str(), br#"{"fixture":true}"#.as_slice()))])
+    .unwrap();
+    let mut actual = Vec::new();
+    for payload in &payloads {
+        let mut input = payload.as_slice();
+        actual.push(read_registry_string(&mut input));
+        assert_eq!(read_protocol_i32(&mut input), Some(1));
+        assert_eq!(read_registry_string(&mut input), "example:nested/custom");
+        assert_eq!(input.split_off(..1), Some(&[1u8][..]));
+        let tag = nbt::read_network_nbt(&mut input).unwrap();
+        assert_eq!(tag.get("fixture"), Some(&nbt::Tag::Byte(1)));
+        assert!(input.is_empty());
+    }
+    actual.sort_unstable();
+    assert!(actual
+        .into_iter()
+        .eq(kinds.map(|kind| format!("minecraft:{kind}"))));
+}
+
+#[test]
+fn registry_data_is_deterministic_and_later_packs_override_entries() {
+    let files = [
+        (
+            "data/example/damage_type/z.json",
+            br#"{"message_id":"z"}"#.as_slice(),
+        ),
+        ("data/other/damage_type/a.json", br#"{"message_id":"a"}"#),
+        (
+            "data/example/damage_type/a.json",
+            b"overridden before decoding",
+        ),
+        ("data/example/tags/damage_type/a.json", b"ignored tag file"),
+    ];
+    let patch = [(
+        "data/example/damage_type/a.json",
+        br#"{"message_id":"override"}"#.as_slice(),
+    )];
+    let payloads = build_registry_data_payloads(
+        [files.as_slice(), patch.as_slice()].map(|p| p.iter().copied()),
+    )
+    .unwrap();
+    let mut reversed = files;
+    reversed.reverse();
+    assert_eq!(
+        build_registry_data_payloads(
+            [reversed.as_slice(), patch.as_slice()].map(|p| p.iter().copied())
+        )
+        .unwrap(),
+        payloads
+    );
+    let [payload] = payloads.as_slice() else {
+        panic!("expected a single populated registry");
+    };
+    let mut input = payload.as_slice();
+    assert_eq!(read_registry_string(&mut input), "minecraft:damage_type");
+    assert_eq!(read_protocol_i32(&mut input), Some(3));
+    for (id, message) in [
+        ("example:a", "override"),
+        ("other:a", "a"),
+        ("example:z", "z"),
+    ] {
+        assert_eq!(read_registry_string(&mut input), id);
+        assert_eq!(input.split_off(..1), Some(&[1u8][..]));
+        let entry = nbt::read_network_nbt(&mut input).unwrap();
+        assert_eq!(
+            entry.get("message_id"),
+            Some(&nbt::Tag::String(nbt::NbtString::text(message)))
+        );
+    }
+    assert!(input.is_empty());
+}
+
+#[test]
+fn registry_data_sends_biome_climate_and_effects() {
+    let payloads = build_registry_data_payloads([[(
+        "data/example/worldgen/biome/custom.json",
+        br#"{
+            "has_precipitation": true, "downfall": 0.4, "temperature": 0.6,
+            "effects": {"fog_color": 2, "water_color": 5, "water_fog_color": 3, "sky_color": 4},
+            "carvers": {}, "features": [], "spawn_costs": {}, "spawners": {},
+            "creature_spawn_probability": 0.1
+        }"#
+        .as_slice(),
+    )]])
+    .unwrap();
+    let mut input = payloads[0].as_slice();
+    assert_eq!(read_registry_string(&mut input), "minecraft:worldgen/biome");
+    assert_eq!(read_protocol_i32(&mut input), Some(1));
+    assert_eq!(read_registry_string(&mut input), "example:custom");
+    assert_eq!(input.split_off(..1), Some(&[1u8][..]));
+    let tag = nbt::read_network_nbt(&mut input).unwrap();
+    let nbt::Tag::Compound(fields) = tag else {
+        panic!("expected a biome NBT compound");
+    };
+    assert_eq!(
+        fields
+            .keys()
+            .map(|key| key.to_utf8().unwrap())
+            .collect::<Vec<_>>(),
+        ["downfall", "effects", "has_precipitation", "temperature"]
+    );
+    assert!(input.is_empty());
+}
 
 #[test]
 fn anti_xray_environment_switch_accepts_false_values_and_defaults_on() {
