@@ -60,6 +60,11 @@ impl WorldBorderState {
         start + (target - start) * fraction
     }
 
+    fn remaining_lerp_ticks(&self, now_tick: u64) -> u64 {
+        self.lerp_duration_ticks
+            .saturating_sub(now_tick.saturating_sub(self.lerp_start_tick))
+    }
+
     fn bounds(&self, now_tick: u64) -> (f64, f64, f64, f64) {
         let radius = self.current_size(now_tick) * 0.5;
         let limit = f64::from(self.absolute_max_size.max(0));
@@ -85,6 +90,179 @@ impl WorldBorderState {
             0.0
         }
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_mechanism_number<T: std::str::FromStr>(token: &str, field: &str) -> Result<T, String> {
+    if token
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'.'))
+    {
+        if let Ok(value) = token.parse() {
+            return Ok(value);
+        }
+    }
+    Err(format!("Invalid {field}: {token}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_nonnegative_mechanism_int(token: &str, field: &str) -> Result<i32, String> {
+    let value = parse_mechanism_number(token, field)?;
+    if value < 0 {
+        return Err(format!("{field} must be nonnegative"));
+    }
+    Ok(value)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn execute_worldborder_command(
+    state: &mut WorldBorderState,
+    args: &[&str],
+    now_tick: u64,
+) -> Result<String, String> {
+    match args {
+        ["get"] => Ok(format!(
+            "World border is {} blocks wide",
+            state.current_size(now_tick).round()
+        )),
+        [command @ ("set" | "add"), distance, time @ ..] if time.len() <= 1 => {
+            let distance = parse_mechanism_number::<f64>(distance, "distance")?;
+            let current = state.current_size(now_tick);
+            let (target, remaining) = if *command == "add" {
+                (current + distance, state.remaining_lerp_ticks(now_tick))
+            } else {
+                (distance, 0)
+            };
+            if !(1.0..=WORLD_BORDER_MAX_SIZE).contains(&target) {
+                return Err(format!(
+                    "Border size must be between 1 and {WORLD_BORDER_MAX_SIZE}"
+                ));
+            }
+            if target == current {
+                return Err("World border size is already at the requested distance".into());
+            }
+            // In 1.21.1 an explicit /worldborder add time extends the current transition.
+            let duration = if let [seconds] = time {
+                let seconds = parse_nonnegative_mechanism_int(seconds, "time")? as u64;
+                remaining.saturating_add(seconds * u64::from(TICKS_PER_SECOND))
+            } else {
+                0
+            };
+            state.lerp_to(target, now_tick, duration);
+            Ok(format!("Set world border size to {target:.1} blocks"))
+        }
+        ["center", x, z] => {
+            let center_coordinate = |token: &str| {
+                let value = parse_mechanism_number::<f64>(token, "center coordinate")?;
+                // Bare integer coordinates refer to the center of the block.
+                let coordinate = if token.contains('.') {
+                    value
+                } else {
+                    value + 0.5
+                };
+                // Vanilla's two-dimensional command position is stored as a float pair.
+                let coordinate = f64::from(coordinate as f32);
+                let limit = WORLD_BORDER_MAX_SIZE / 2.0;
+                if !(-limit..=limit).contains(&coordinate) {
+                    return Err(format!("Center coordinate must be within ±{limit}"));
+                }
+                Ok(coordinate)
+            };
+            let (x, z) = (center_coordinate(x)?, center_coordinate(z)?);
+            if (x, z) == (state.center_x, state.center_z) {
+                return Err("World border center is already at the requested position".into());
+            }
+            (state.center_x, state.center_z) = (x, z);
+            Ok(format!("Set world border center to {x:.2}, {z:.2}"))
+        }
+        ["damage", kind @ ("amount" | "buffer"), value] => {
+            let value = parse_mechanism_number::<f32>(value, kind)?;
+            if !(0.0..=f32::MAX).contains(&value) {
+                return Err(format!(
+                    "World border damage {kind} must be a finite nonnegative value"
+                ));
+            }
+            let value = f64::from(value);
+            let setting = if *kind == "amount" {
+                &mut state.damage_per_block
+            } else {
+                &mut state.damage_safe_zone
+            };
+            if *setting == value {
+                return Err(format!("World border damage {kind} is already {value}"));
+            }
+            *setting = value;
+            Ok(format!("Set world border damage {kind} to {value:.2}"))
+        }
+        ["warning", kind @ ("distance" | "time"), value] => {
+            let value = parse_nonnegative_mechanism_int(value, kind)?;
+            let setting = if *kind == "distance" {
+                &mut state.warning_blocks
+            } else {
+                &mut state.warning_time_secs
+            };
+            if *setting == value {
+                return Err(format!("World border warning {kind} is already {value}"));
+            }
+            *setting = value;
+            Ok(format!("Set world border warning {kind} to {value}"))
+        }
+        _ => Err("Usage: /worldborder get|set|add|center|damage|warning".into()),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_worldborder_initialize(state: &WorldBorderState, now_tick: u64) -> (i64, Vec<u8>) {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&state.center_x.to_be_bytes());
+    payload.extend_from_slice(&state.center_z.to_be_bytes());
+    write_worldborder_lerp(
+        &mut payload,
+        state.current_size(now_tick),
+        state.new_size,
+        state.remaining_lerp_ticks(now_tick),
+    );
+    write_varint(&mut payload, i64::from(state.absolute_max_size));
+    write_varint(&mut payload, i64::from(state.warning_blocks));
+    write_varint(&mut payload, i64::from(state.warning_time_secs));
+    (0x25, payload)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_worldborder_center(x: f64, z: f64) -> (i64, Vec<u8>) {
+    let mut payload = x.to_be_bytes().to_vec();
+    payload.extend_from_slice(&z.to_be_bytes());
+    (0x4d, payload)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_worldborder_lerp_size(
+    old_size: f64,
+    new_size: f64,
+    duration_ticks: u64,
+) -> (i64, Vec<u8>) {
+    let mut payload = Vec::new();
+    write_worldborder_lerp(&mut payload, old_size, new_size, duration_ticks);
+    (0x4e, payload)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_worldborder_lerp(
+    payload: &mut Vec<u8>,
+    old_size: f64,
+    new_size: f64,
+    duration_ticks: u64,
+) {
+    payload.extend_from_slice(&old_size.to_be_bytes());
+    payload.extend_from_slice(&new_size.to_be_bytes());
+    // Nonnegative VarLong is the same encoding as the shared writer's unsigned path.
+    let millis = duration_ticks.saturating_mul(TICK_MS).min(i64::MAX as u64);
+    write_varint(payload, millis as i64);
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_worldborder_size(size: f64) -> (i64, Vec<u8>) {
+    (0x4f, size.to_be_bytes().to_vec())
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -279,6 +457,31 @@ impl AdvancementTracker {
         revoked
     }
 
+    fn revoke_matching(
+        &mut self,
+        player: &str,
+        mut matches: impl FnMut(&Self, &str) -> bool,
+    ) -> usize {
+        let Some(progress) = self.progress.get(player) else {
+            return 0;
+        };
+        let ids: Vec<_> = progress
+            .keys()
+            .copied()
+            .filter(|id| matches(self, id))
+            .collect();
+        let progress = self.progress.get_mut(player).unwrap();
+        let revoked = ids
+            .into_iter()
+            .filter_map(|id| progress.remove(id))
+            .map(|criteria| criteria.len())
+            .sum();
+        if progress.is_empty() {
+            self.progress.remove(player);
+        }
+        revoked
+    }
+
     fn grant_only(&mut self, player: &str, id: &str, time_ms: i64) -> usize {
         self.definition(id).map_or(0, |definition| {
             self.grant_definition(player, definition, time_ms)
@@ -423,6 +626,84 @@ impl AdvancementTracker {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn resolve_command_advancement(
+    tracker: &AdvancementTracker,
+    id: &str,
+) -> Result<&'static AdvancementDefinition, String> {
+    let default_id = (!id.contains(':')).then(|| format!("minecraft:{id}"));
+    tracker
+        .definition(default_id.as_deref().unwrap_or(id))
+        .ok_or_else(|| format!("Unknown advancement: {id}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn execute_advancement_command(
+    tracker: &mut AdvancementTracker,
+    args: &[&str],
+    now_ms: i64,
+) -> Result<String, String> {
+    let [action @ ("grant" | "revoke"), target, scope @ ..] = args else {
+        return Err("Usage: /advancement grant|revoke <target> <scope>".into());
+    };
+    let grant = *action == "grant";
+    let changed = match scope {
+        ["everything"] if grant => tracker.grant_everything(target, now_ms),
+        ["everything"] => tracker.revoke_matching(target, |_, _| true),
+        ["only", id, criterion] => {
+            let definition = resolve_command_advancement(tracker, id)?;
+            if !definition
+                .requirements
+                .iter()
+                .any(|group| group.contains(criterion))
+            {
+                return Err(format!(
+                    "Unknown criterion {criterion} for {}",
+                    definition.id
+                ));
+            }
+            let changed = if grant {
+                tracker.grant_criterion(target, definition.id, criterion, now_ms)
+            } else {
+                tracker.revoke_criterion(target, definition.id, criterion)
+            };
+            usize::from(changed)
+        }
+        [mode @ ("only" | "from" | "through" | "until"), id] => {
+            let id = resolve_command_advancement(tracker, id)?.id;
+            if grant {
+                match *mode {
+                    "from" => tracker.grant_from(target, id, now_ms),
+                    "through" => tracker.grant_through(target, id, now_ms),
+                    "until" => tracker.grant_until(target, id, now_ms),
+                    _ => tracker.grant_only(target, id, now_ms),
+                }
+            } else {
+                tracker.revoke_matching(target, |tracker, candidate| match *mode {
+                    "from" => tracker.has_ancestor(candidate, id),
+                    "through" => {
+                        tracker.has_ancestor(candidate, id) || tracker.has_ancestor(id, candidate)
+                    }
+                    "until" => tracker.has_ancestor(id, candidate),
+                    _ => candidate == id,
+                })
+            }
+        }
+        _ => {
+            return Err(
+                "Usage: everything | only <id> [criterion] | from|through|until <id>".into(),
+            )
+        }
+    };
+    if changed == 0 {
+        return Err(format!("No advancement criteria changed for {target}"));
+    }
+    let verb = if grant { "Granted" } else { "Revoked" };
+    Ok(format!(
+        "{verb} {changed} advancement criteria for {target}"
+    ))
+}
+
 // Protocol 767 clientbound Update Advancements.
 #[cfg_attr(not(test), allow(dead_code))]
 const UPDATE_ADVANCEMENTS_PACKET_ID: i64 = 0x74;
@@ -515,9 +796,54 @@ struct ScoreboardObjective {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScoreboardDisplaySlot {
+    // Declaration order is the protocol 767 display slot ID.
     List,
     Sidebar,
     BelowName,
+    TeamBlack,
+    TeamDarkBlue,
+    TeamDarkGreen,
+    TeamDarkAqua,
+    TeamDarkRed,
+    TeamDarkPurple,
+    TeamGold,
+    TeamGray,
+    TeamDarkGray,
+    TeamBlue,
+    TeamGreen,
+    TeamAqua,
+    TeamRed,
+    TeamLightPurple,
+    TeamYellow,
+    TeamWhite,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ScoreboardDisplaySlot {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "list" => Self::List,
+            "sidebar" => Self::Sidebar,
+            "below_name" => Self::BelowName,
+            "sidebar.team.black" => Self::TeamBlack,
+            "sidebar.team.dark_blue" => Self::TeamDarkBlue,
+            "sidebar.team.dark_green" => Self::TeamDarkGreen,
+            "sidebar.team.dark_aqua" => Self::TeamDarkAqua,
+            "sidebar.team.dark_red" => Self::TeamDarkRed,
+            "sidebar.team.dark_purple" => Self::TeamDarkPurple,
+            "sidebar.team.gold" => Self::TeamGold,
+            "sidebar.team.gray" => Self::TeamGray,
+            "sidebar.team.dark_gray" => Self::TeamDarkGray,
+            "sidebar.team.blue" => Self::TeamBlue,
+            "sidebar.team.green" => Self::TeamGreen,
+            "sidebar.team.aqua" => Self::TeamAqua,
+            "sidebar.team.red" => Self::TeamRed,
+            "sidebar.team.light_purple" => Self::TeamLightPurple,
+            "sidebar.team.yellow" => Self::TeamYellow,
+            "sidebar.team.white" => Self::TeamWhite,
+            _ => return None,
+        })
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -574,7 +900,7 @@ struct ScoreboardScore {
 #[derive(Default)]
 struct ScoreboardEngine {
     objectives: HashMap<String, ScoreboardObjective>,
-    display_slots: [Option<String>; 3],
+    display_slots: [Option<String>; ScoreboardDisplaySlot::TeamWhite as usize + 1],
     scores: HashMap<String, HashMap<String, ScoreboardScore>>,
 }
 
@@ -781,6 +1107,202 @@ impl ScoreboardEngine {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+fn scoreboard_command_error(error: ScoreboardError) -> String {
+    match error {
+        ScoreboardError::DuplicateObjective => "Objective already exists",
+        ScoreboardError::UnknownObjective => "Unknown objective",
+        ScoreboardError::ReadOnlyObjective => "Objective is read-only",
+        ScoreboardError::NotTrigger => "Objective is not a trigger",
+        ScoreboardError::TriggerLocked => "Trigger is locked",
+        ScoreboardError::DivisionByZero => "Cannot divide by zero",
+    }
+    .into()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn execute_scoreboard_command(
+    engine: &mut ScoreboardEngine,
+    args: &[&str],
+) -> Result<String, String> {
+    match args {
+        ["objectives", "add", name, criteria, display @ ..] => {
+            let criteria = ScoreboardCriteria::parse(criteria)
+                .ok_or_else(|| format!("Unknown scoreboard criterion: {criteria}"))?;
+            let display_name = if display.is_empty() {
+                (*name).to_owned()
+            } else {
+                display.join(" ")
+            };
+            let render_type = if criteria == ScoreboardCriteria::Health {
+                ScoreboardRenderType::Hearts
+            } else {
+                ScoreboardRenderType::Integer
+            };
+            engine
+                .add_objective(ScoreboardObjective {
+                    name: (*name).into(),
+                    criteria,
+                    display_name,
+                    render_type,
+                })
+                .map_err(scoreboard_command_error)?;
+            Ok(format!("Added objective {name}"))
+        }
+        ["objectives", "remove", name] => {
+            if !engine.remove_objective(name) {
+                return Err(format!("Unknown objective: {name}"));
+            }
+            Ok(format!("Removed objective {name}"))
+        }
+        ["objectives", "list"] => {
+            let mut names: Vec<_> = engine.objectives.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            Ok(format!("{} objectives: {}", names.len(), names.join(", ")))
+        }
+        ["objectives", "setdisplay", slot, objective @ ..] if objective.len() <= 1 => {
+            let display_slot = ScoreboardDisplaySlot::parse(slot)
+                .ok_or_else(|| format!("Unknown scoreboard display slot: {slot}"))?;
+            let objective = objective.first().copied();
+            engine
+                .set_display(display_slot, objective)
+                .map_err(scoreboard_command_error)?;
+            Ok(match objective {
+                Some(name) => format!("Displaying {name} in {slot}"),
+                None => format!("Cleared display slot {slot}"),
+            })
+        }
+        ["players", command @ ("set" | "add" | "remove"), player, objective, value] => {
+            let score = match *command {
+                "set" => {
+                    let value = parse_mechanism_number(value, "score")?;
+                    engine
+                        .set(player, objective, value)
+                        .map_err(scoreboard_command_error)?;
+                    value
+                }
+                "add" => engine
+                    .add(
+                        player,
+                        objective,
+                        parse_nonnegative_mechanism_int(value, "amount")?,
+                    )
+                    .map_err(scoreboard_command_error)?,
+                _ => engine
+                    .remove(
+                        player,
+                        objective,
+                        parse_nonnegative_mechanism_int(value, "amount")?,
+                    )
+                    .map_err(scoreboard_command_error)?,
+            };
+            Ok(format!("{player} has {score} in {objective}"))
+        }
+        ["players", "reset", player, objective @ ..] if objective.len() <= 1 => {
+            let count = engine
+                .reset(player, objective.first().copied())
+                .map_err(scoreboard_command_error)?;
+            Ok(format!("Reset {count} scores for {player}"))
+        }
+        ["players", "get", player, objective] => {
+            engine
+                .criteria(objective)
+                .map_err(scoreboard_command_error)?;
+            let score = engine
+                .get(player, objective)
+                .ok_or_else(|| format!("{player} has no score in {objective}"))?;
+            Ok(format!("{player} has {score} in {objective}"))
+        }
+        ["players", "enable", player, objective] => {
+            engine
+                .enable_trigger(player, objective)
+                .map_err(scoreboard_command_error)?;
+            Ok(format!("Enabled {objective} for {player}"))
+        }
+        ["players", "operation", target, target_obj, symbol, source, source_obj] => {
+            let operation = ScoreboardOperation::parse(symbol)
+                .ok_or_else(|| format!("Unknown scoreboard operation: {symbol}"))?;
+            let score = engine
+                .operation((target, target_obj), operation, (source, source_obj))
+                .map_err(scoreboard_command_error)?;
+            Ok(format!("{target} has {score} in {target_obj}"))
+        }
+        _ => Err("Usage: /scoreboard objectives|players <subcommand>".into()),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+enum ScoreboardObjectivePacket<'a> {
+    Create(&'a ScoreboardObjective),
+    Remove(&'a str),
+    Update(&'a ScoreboardObjective),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_scoreboard_objective(packet: ScoreboardObjectivePacket<'_>) -> (i64, Vec<u8>) {
+    let mut payload = Vec::new();
+    match packet {
+        ScoreboardObjectivePacket::Remove(name) => {
+            write_str(&mut payload, name);
+            payload.push(1);
+        }
+        ScoreboardObjectivePacket::Create(objective)
+        | ScoreboardObjectivePacket::Update(objective) => {
+            write_str(&mut payload, &objective.name);
+            payload.push(if matches!(packet, ScoreboardObjectivePacket::Create(_)) {
+                0
+            } else {
+                2
+            });
+            payload.extend(nbt_string(&objective.display_name));
+            write_varint(&mut payload, objective.render_type as i64);
+            payload.push(0); // Optional number format is absent.
+        }
+    }
+    (0x5e, payload)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_scoreboard_display(
+    slot: ScoreboardDisplaySlot,
+    objective: Option<&str>,
+) -> (i64, Vec<u8>) {
+    (
+        0x57,
+        display_pkt(slot as i64, objective.unwrap_or_default()),
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_scoreboard_score(
+    holder: &str,
+    objective: &str,
+    value: i32,
+    display_name: Option<&str>,
+) -> (i64, Vec<u8>) {
+    let mut payload = Vec::new();
+    write_str(&mut payload, holder);
+    write_str(&mut payload, objective);
+    write_varint(&mut payload, i64::from(value));
+    payload.push(u8::from(display_name.is_some()));
+    if let Some(name) = display_name {
+        payload.extend(nbt_string(name));
+    }
+    payload.push(0); // Optional number format is absent.
+    (0x61, payload)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_scoreboard_reset(holder: &str, objective: Option<&str>) -> (i64, Vec<u8>) {
+    let mut payload = Vec::new();
+    write_str(&mut payload, holder);
+    payload.push(u8::from(objective.is_some()));
+    if let Some(objective) = objective {
+        write_str(&mut payload, objective);
+    }
+    (0x44, payload)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 const MODIFICATION_BLOCK_LIMIT: usize = 32_768;
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -810,6 +1332,116 @@ enum CloneMode {
     Normal,
     Force,
     Move,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedFillCommand {
+    from: BlockPos,
+    to: BlockPos,
+    state: u32,
+    mode: FillMode,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedCloneCommand {
+    from: BlockPos,
+    to: BlockPos,
+    destination: BlockPos,
+    filter: CloneFilter,
+    mode: CloneMode,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_mechanism_block_pos([x, y, z]: [&str; 3], origin: BlockPos) -> Result<BlockPos, String> {
+    let coordinate = |token: &str, base: i32| {
+        let Some(offset) = token.strip_prefix('~') else {
+            return parse_mechanism_number(token, "block coordinate");
+        };
+        if offset.is_empty() {
+            return Ok(base);
+        }
+        // A relative block coordinate is floored after adding the executor's origin.
+        let resolved = (f64::from(base) + parse_mechanism_number::<f64>(offset, "offset")?).floor();
+        if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&resolved) {
+            return Err(format!("Block coordinate out of range: {token}"));
+        }
+        Ok(resolved as i32)
+    };
+    Ok((
+        coordinate(x, origin.0)?,
+        coordinate(y, origin.1)?,
+        coordinate(z, origin.2)?,
+    ))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_fill_command(
+    args: &[&str],
+    origin: (i32, i32, i32),
+    resolve_block: impl Fn(&str) -> Option<u32>,
+) -> Result<ParsedFillCommand, String> {
+    let [x1, y1, z1, x2, y2, z2, block, mode @ ..] = args else {
+        return Err("Usage: /fill <from> <to> <block> [mode]".into());
+    };
+    let from = parse_mechanism_block_pos([x1, y1, z1], origin)?;
+    let to = parse_mechanism_block_pos([x2, y2, z2], origin)?;
+    let state = resolve_block(block).ok_or_else(|| format!("Unknown block: {block}"))?;
+    let mode = match mode {
+        [] | ["replace"] => FillMode::Replace { filter: None },
+        ["replace", block] => FillMode::Replace {
+            filter: Some(resolve_block(block).ok_or_else(|| format!("Unknown block: {block}"))?),
+        },
+        ["outline"] => FillMode::Outline,
+        ["hollow"] => FillMode::Hollow,
+        ["keep"] => FillMode::Keep,
+        ["destroy"] => FillMode::Destroy,
+        _ => return Err("Expected replace [filter], outline, hollow, keep or destroy".into()),
+    };
+    Ok(ParsedFillCommand {
+        from,
+        to,
+        state,
+        mode,
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_clone_command(
+    args: &[&str],
+    origin: (i32, i32, i32),
+    resolve_block: impl Fn(&str) -> Option<u32>,
+) -> Result<ParsedCloneCommand, String> {
+    let [x1, y1, z1, x2, y2, z2, dx, dy, dz, options @ ..] = args else {
+        return Err("Usage: /clone <from> <to> <destination> [filter [mode]]".into());
+    };
+    let from = parse_mechanism_block_pos([x1, y1, z1], origin)?;
+    let to = parse_mechanism_block_pos([x2, y2, z2], origin)?;
+    let destination = parse_mechanism_block_pos([dx, dy, dz], origin)?;
+    let (filter, mode) = match options {
+        [] => (CloneFilter::Replace, &[][..]),
+        ["replace", mode @ ..] => (CloneFilter::Replace, mode),
+        ["masked", mode @ ..] => (CloneFilter::Masked, mode),
+        ["filtered", block, mode @ ..] => {
+            let state = resolve_block(block).ok_or_else(|| format!("Unknown block: {block}"))?;
+            (CloneFilter::Filtered(state), mode)
+        }
+        _ => return Err("Expected replace, masked or filtered <block>".into()),
+    };
+    let mode = match mode {
+        [] | ["normal"] => CloneMode::Normal,
+        ["force"] => CloneMode::Force,
+        ["move"] => CloneMode::Move,
+        _ => return Err("Expected clone mode normal, force or move".into()),
+    };
+    Ok(ParsedCloneCommand {
+        from,
+        to,
+        destination,
+        filter,
+        mode,
+    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1019,6 +1651,373 @@ mod world_mechanisms_tests {
     const END: &str = "minecraft:story/enter_the_end";
     const DRAGON: &str = "minecraft:end/kill_dragon";
 
+    fn command_block(name: &str) -> Option<u32> {
+        match name {
+            "minecraft:stone" => Some(1),
+            "glass" => Some(2),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn fill_command_parses_relative_coordinates_and_every_mode() {
+        let origin = (10, -20, 30);
+        let coords = ["~", "~-2.5", "42", "~-3", "~4", "~-0.1", "glass"];
+        for (suffix, mode) in [
+            (&[][..], FillMode::Replace { filter: None }),
+            (&["replace"][..], FillMode::Replace { filter: None }),
+            (
+                &["replace", "minecraft:stone"][..],
+                FillMode::Replace { filter: Some(1) },
+            ),
+            (&["outline"][..], FillMode::Outline),
+            (&["hollow"][..], FillMode::Hollow),
+            (&["keep"][..], FillMode::Keep),
+            (&["destroy"][..], FillMode::Destroy),
+        ] {
+            let args = [coords.as_slice(), suffix].concat();
+            assert_eq!(
+                parse_fill_command(&args, origin, command_block).unwrap(),
+                ParsedFillCommand {
+                    from: (10, -23, 42),
+                    to: (7, -16, 29),
+                    state: 2,
+                    mode,
+                }
+            );
+        }
+        for suffix in [
+            &["outline", "glass"][..],
+            &["replace", "missing"][..],
+            &["destroy", "extra"][..],
+        ] {
+            assert!(parse_fill_command(
+                &[coords.as_slice(), suffix].concat(),
+                origin,
+                command_block
+            )
+            .is_err());
+        }
+        for token in ["2147483648", "~2147483647", "~NaN", "^1", "1.5"] {
+            let mut args = coords;
+            args[0] = token;
+            assert!(
+                parse_fill_command(&args, origin, command_block).is_err(),
+                "{token}"
+            );
+        }
+        assert!(parse_fill_command(&coords[..6], origin, command_block).is_err());
+        let mut args = coords;
+        args[6] = "missing";
+        assert!(parse_fill_command(&args, origin, command_block).is_err());
+    }
+
+    #[test]
+    fn clone_command_parses_relative_coordinates_filters_and_modes() {
+        let origin = (-10, 20, -30);
+        let coords = ["~", "~-2", "0", "~-3", "~4", "~-1", "~0.5", "64", "~9"];
+        for (suffix, filter, mode) in [
+            (&[][..], CloneFilter::Replace, CloneMode::Normal),
+            (
+                &["replace", "move"][..],
+                CloneFilter::Replace,
+                CloneMode::Move,
+            ),
+            (&["masked"][..], CloneFilter::Masked, CloneMode::Normal),
+            (
+                &["masked", "force"][..],
+                CloneFilter::Masked,
+                CloneMode::Force,
+            ),
+            (
+                &["filtered", "minecraft:stone", "normal"][..],
+                CloneFilter::Filtered(1),
+                CloneMode::Normal,
+            ),
+        ] {
+            let args = [coords.as_slice(), suffix].concat();
+            assert_eq!(
+                parse_clone_command(&args, origin, command_block).unwrap(),
+                ParsedCloneCommand {
+                    from: (-10, 18, 0),
+                    to: (-13, 24, -31),
+                    destination: (-10, 64, -21),
+                    filter,
+                    mode,
+                }
+            );
+        }
+        for suffix in [
+            &["filtered"][..],
+            &["filtered", "missing"][..],
+            &["force"][..],
+            &["replace", "normal", "extra"][..],
+            &["masked", "unknown"][..],
+        ] {
+            assert!(parse_clone_command(
+                &[coords.as_slice(), suffix].concat(),
+                origin,
+                command_block
+            )
+            .is_err());
+        }
+        assert!(parse_clone_command(&coords[..8], origin, command_block).is_err());
+        let mut args = coords;
+        args[8] = "~-2147483648";
+        assert!(parse_clone_command(&args, origin, command_block).is_err());
+    }
+
+    #[test]
+    fn worldborder_command_updates_size_center_damage_and_warnings() {
+        let mut border = WorldBorderState::default();
+        execute_worldborder_command(&mut border, &["set", "100"], 0).unwrap();
+        assert_eq!(border.current_size(0), 100.0);
+        execute_worldborder_command(&mut border, &["set", "60", "2"], 10).unwrap();
+        assert_eq!(
+            execute_worldborder_command(&mut border, &["get"], 30).unwrap(),
+            "World border is 80 blocks wide"
+        );
+        execute_worldborder_command(&mut border, &["add", "-20", "3"], 30).unwrap();
+        assert_eq!(border.lerp_duration_ticks, 80);
+        assert_eq!(border.current_size(70), 70.0);
+        execute_worldborder_command(&mut border, &["add", "4.5"], 70).unwrap();
+        assert_eq!(border.lerp_duration_ticks, 0);
+        assert_eq!(border.current_size(70), 74.5);
+        assert_eq!(
+            execute_worldborder_command(&mut border, &["get"], 70).unwrap(),
+            "World border is 75 blocks wide"
+        );
+        for args in [
+            &["center", "10", "-4.25"][..],
+            &["damage", "amount", "1.5"][..],
+            &["damage", "buffer", "0"][..],
+            &["warning", "distance", "12"][..],
+            &["warning", "time", "25"][..],
+        ] {
+            execute_worldborder_command(&mut border, args, 70).unwrap();
+        }
+        assert_eq!((border.center_x, border.center_z), (10.5, -4.25));
+        assert_eq!(border.damage_per_block, 1.5);
+        assert_eq!(border.damage_safe_zone, 0.0);
+        assert_eq!(border.warning_blocks, 12);
+        assert_eq!(border.warning_time_secs, 25);
+    }
+
+    #[test]
+    fn worldborder_command_rejects_invalid_or_redundant_changes() {
+        let mut border = WorldBorderState::default();
+        let original = border;
+        for args in [
+            &["set", "0"][..],
+            &["set", "60000000"][..],
+            &["set", "50", "-1"][..],
+            &["set", "50", "0.5"][..],
+            &["add", "1"][..],
+            &["add", "0"][..],
+            &["center", "30000000", "0"][..],
+            &["center", "0.0", "0.0"][..],
+            &["damage", "amount", "NaN"][..],
+            &["damage", "buffer", "-1"][..],
+            &["warning", "distance", "-1"][..],
+            &["warning", "time", "15"][..],
+            &["get", "extra"][..],
+        ] {
+            assert!(
+                execute_worldborder_command(&mut border, args, 0).is_err(),
+                "{args:?}"
+            );
+            assert_eq!(border, original);
+        }
+    }
+
+    #[test]
+    fn scoreboard_command_updates_objectives_display_and_player_scores() {
+        let mut board = ScoreboardEngine::default();
+        for args in [
+            &["objectives", "add", "points", "dummy", "Match", "points"][..],
+            &["objectives", "add", "ready", "trigger"][..],
+            &["objectives", "add", "life", "health"][..],
+            &["objectives", "setdisplay", "sidebar", "points"][..],
+            &["objectives", "setdisplay", "sidebar.team.red", "life"][..],
+            &["players", "set", "Alex", "points", "-9"][..],
+            &["players", "add", "Alex", "points", "6"][..],
+            &["players", "remove", "Alex", "points", "4"][..],
+            &["players", "set", "Pat", "points", "3"][..],
+            &[
+                "players",
+                "operation",
+                "Alex",
+                "points",
+                "/=",
+                "Pat",
+                "points",
+            ][..],
+            &["players", "enable", "Alex", "ready"][..],
+        ] {
+            execute_scoreboard_command(&mut board, args).unwrap();
+        }
+        assert_eq!(
+            board.objective("points").unwrap().display_name,
+            "Match points"
+        );
+        assert_eq!(board.objective("ready").unwrap().display_name, "ready");
+        assert_eq!(
+            board.objective("life").unwrap().render_type,
+            ScoreboardRenderType::Hearts
+        );
+        assert_eq!(
+            board.display(ScoreboardDisplaySlot::Sidebar),
+            Some("points")
+        );
+        assert_eq!(board.display(ScoreboardDisplaySlot::TeamRed), Some("life"));
+        assert_eq!(
+            execute_scoreboard_command(&mut board, &["objectives", "list"]).unwrap(),
+            "3 objectives: life, points, ready"
+        );
+        assert_eq!(
+            execute_scoreboard_command(&mut board, &["players", "get", "Alex", "points"]).unwrap(),
+            "Alex has -3 in points"
+        );
+        assert_eq!(board.trigger_add("Alex", "ready", 1), Ok(1));
+        execute_scoreboard_command(&mut board, &["players", "reset", "Alex", "points"]).unwrap();
+        assert_eq!(board.get("Alex", "points"), None);
+        assert_eq!(board.get("Alex", "ready"), Some(1));
+        execute_scoreboard_command(&mut board, &["players", "reset", "Alex"]).unwrap();
+        assert_eq!(board.get("Alex", "ready"), None);
+        assert_eq!(board.get("Pat", "points"), Some(3));
+        execute_scoreboard_command(&mut board, &["objectives", "setdisplay", "sidebar"]).unwrap();
+        assert_eq!(board.display(ScoreboardDisplaySlot::Sidebar), None);
+        execute_scoreboard_command(&mut board, &["objectives", "remove", "life"]).unwrap();
+        assert_eq!(board.display(ScoreboardDisplaySlot::TeamRed), None);
+        assert!(board.objective("life").is_none());
+    }
+
+    #[test]
+    fn scoreboard_command_reports_invalid_arguments_and_engine_errors() {
+        let mut board = ScoreboardEngine::default();
+        execute_scoreboard_command(&mut board, &["objectives", "add", "points", "dummy"]).unwrap();
+        execute_scoreboard_command(&mut board, &["objectives", "add", "life", "health"]).unwrap();
+        execute_scoreboard_command(&mut board, &["players", "set", "Alex", "points", "9"]).unwrap();
+        for args in [
+            &["objectives", "add", "points", "trigger"][..],
+            &["objectives", "add", "extra", "unknown"][..],
+            &["objectives", "setdisplay", "invalid", "points"][..],
+            &["objectives", "setdisplay", "sidebar", "unknown"][..],
+            &["objectives", "remove", "unknown"][..],
+            &["players", "get", "Pat", "points"][..],
+            &["players", "set", "Alex", "life", "1"][..],
+            &["players", "set", "Alex", "points", "2147483648"][..],
+            &["players", "add", "Alex", "points", "-1"][..],
+            &["players", "remove", "Alex", "points", "-1"][..],
+            &["players", "enable", "Alex", "points"][..],
+            &[
+                "players",
+                "operation",
+                "Alex",
+                "points",
+                "/=",
+                "Pat",
+                "points",
+            ][..],
+            &[
+                "players",
+                "operation",
+                "Alex",
+                "points",
+                "?",
+                "Pat",
+                "points",
+            ][..],
+            &["players", "reset", "Alex", "points", "extra"][..],
+        ] {
+            assert!(
+                execute_scoreboard_command(&mut board, args).is_err(),
+                "{args:?}"
+            );
+            assert_eq!(board.get("Alex", "points"), Some(9));
+            assert_eq!(board.get("Alex", "life"), None);
+            assert_eq!(board.display(ScoreboardDisplaySlot::Sidebar), None);
+        }
+    }
+
+    #[test]
+    fn advancement_command_grants_and_revokes_each_scope() {
+        let shield = "minecraft:story/deflect_arrow";
+        let scopes = [
+            ("only", &[ARMOR][..]),
+            ("from", &[ARMOR, shield][..]),
+            ("until", &[ROOT, STONE, TOOLS, IRON, ARMOR][..]),
+            ("through", &[ROOT, STONE, TOOLS, IRON, ARMOR, shield][..]),
+        ];
+        for (scope, selected) in scopes {
+            let mut tracker = AdvancementTracker::default();
+            execute_advancement_command(
+                &mut tracker,
+                &["grant", "Alex", scope, "story/obtain_armor"],
+                777,
+            )
+            .unwrap();
+            let progress = &tracker.progress["Alex"];
+            assert_eq!(progress.len(), selected.len(), "{scope}");
+            for id in selected {
+                assert!(progress[id].values().all(|&time| time == 777));
+            }
+            execute_advancement_command(&mut tracker, &["grant", "Alex", "everything"], 888)
+                .unwrap();
+            execute_advancement_command(&mut tracker, &["grant", "Pat", "everything"], 888)
+                .unwrap();
+            execute_advancement_command(&mut tracker, &["revoke", "Alex", scope, ARMOR], 999)
+                .unwrap();
+            for definition in CORE_ADVANCEMENTS {
+                assert_eq!(
+                    tracker.progress["Alex"].contains_key(definition.id),
+                    !selected.contains(&definition.id),
+                    "{scope} {}",
+                    definition.id,
+                );
+            }
+            execute_advancement_command(&mut tracker, &["revoke", "Alex", "everything"], 999)
+                .unwrap();
+            assert!(!tracker.progress.contains_key("Alex"));
+            assert_eq!(tracker.progress["Pat"].len(), CORE_ADVANCEMENTS.len());
+        }
+    }
+
+    #[test]
+    fn advancement_command_changes_a_single_criterion_and_validates_arguments() {
+        let mut tracker = AdvancementTracker::default();
+        for (criterion, time) in [("iron_helmet", 10), ("iron_boots", 20)] {
+            execute_advancement_command(
+                &mut tracker,
+                &["grant", "Alex", "only", ARMOR, criterion],
+                time,
+            )
+            .unwrap();
+        }
+        execute_advancement_command(
+            &mut tracker,
+            &["revoke", "Alex", "only", ARMOR, "iron_helmet"],
+            30,
+        )
+        .unwrap();
+        for args in [
+            &["grant", "Alex", "only", "unknown"][..],
+            &["grant", "Alex", "only", ARMOR, "unknown"][..],
+            &["grant", "Alex", "only", ARMOR, "iron_boots"][..],
+            &["grant", "Alex", "from", ARMOR, "iron_helmet"][..],
+            &["revoke", "Alex", "only", ARMOR, "iron_helmet"][..],
+            &["revoke", "Alex", "everything", ARMOR][..],
+        ] {
+            assert!(
+                execute_advancement_command(&mut tracker, args, 40).is_err(),
+                "{args:?}"
+            );
+            let criteria = &tracker.progress["Alex"][ARMOR];
+            assert_eq!(criteria.len(), 1);
+            assert_eq!(criteria.get("iron_boots"), Some(&20));
+        }
+    }
+
     #[test]
     fn world_border_shrinks_expands_and_restarts_from_current_size() {
         let mut border = WorldBorderState::default();
@@ -1193,11 +2192,163 @@ mod world_mechanisms_tests {
         assert_eq!(tracker.grant_everything("Steve", 17), 0);
     }
 
-    fn read_advancement_string<'a>(packet: &mut &'a [u8]) -> &'a str {
-        let len = read_varint(packet).unwrap() as usize;
-        let (string, remaining) = packet.split_at(len);
+    fn take_packet_bytes<'a>(packet: &mut &'a [u8], len: usize) -> &'a [u8] {
+        let (bytes, remaining) = packet.split_at(len);
         *packet = remaining;
-        std::str::from_utf8(string).unwrap()
+        bytes
+    }
+
+    fn read_packet_string<'a>(packet: &mut &'a [u8]) -> &'a str {
+        let len = read_protocol_i32(packet).unwrap().try_into().unwrap();
+        std::str::from_utf8(take_packet_bytes(packet, len)).unwrap()
+    }
+
+    fn read_packet_bool(packet: &mut &[u8]) -> bool {
+        match take_packet_bytes(packet, 1)[0] {
+            0 => false,
+            1 => true,
+            byte => panic!("Invalid wire boolean: {byte}"),
+        }
+    }
+
+    fn read_packet_double(packet: &mut &[u8]) -> f64 {
+        f64::from_be_bytes(take_packet_bytes(packet, 8).try_into().unwrap())
+    }
+
+    fn read_packet_lerp(packet: &mut &[u8]) -> (f64, f64, i64) {
+        let old_size = read_packet_double(packet);
+        let new_size = read_packet_double(packet);
+        let duration_ms = read_varint(packet).unwrap();
+        (old_size, new_size, duration_ms)
+    }
+
+    fn read_packet_literal_component(packet: &mut &[u8]) -> String {
+        assert_eq!(take_packet_bytes(packet, 1), &[8]); // Anonymous TAG_String.
+        let length = take_packet_bytes(packet, 2);
+        let size = u16::from_be_bytes(length.try_into().unwrap()) as usize;
+        // Give the anonymous tag an empty root name for the named NBT decoder.
+        let mut named = vec![8, 0, 0];
+        named.extend_from_slice(length);
+        named.extend_from_slice(take_packet_bytes(packet, size));
+        let (root, tag) = crate::nbt::read_named(&named).unwrap();
+        assert_eq!(root.to_utf8().unwrap(), "");
+        tag.string().unwrap().to_utf8().unwrap()
+    }
+
+    #[test]
+    fn border_packets_round_trip_protocol_767_payloads() {
+        let mut border = WorldBorderState {
+            center_x: -15.5,
+            center_z: 33.25,
+            warning_blocks: 130,
+            warning_time_secs: 10,
+            ..WorldBorderState::default()
+        };
+        border.lerp_to(100.0, 0, 0);
+        border.lerp_to(180.0, 10, 20);
+        for (tick, expected) in [(20, (140.0, 180.0, 500)), (30, (180.0, 180.0, 0))] {
+            let (id, payload) = encode_worldborder_initialize(&border, tick);
+            assert_eq!(id, 0x25);
+            let mut packet = payload.as_slice();
+            assert_eq!(read_packet_double(&mut packet), -15.5);
+            assert_eq!(read_packet_double(&mut packet), 33.25);
+            assert_eq!(read_packet_lerp(&mut packet), expected);
+            assert_eq!(read_protocol_i32(&mut packet), Some(29_999_984));
+            assert_eq!(read_protocol_i32(&mut packet), Some(130));
+            assert_eq!(read_protocol_i32(&mut packet), Some(10));
+            assert!(packet.is_empty());
+        }
+
+        let (id, payload) = encode_worldborder_center(-15.5, 33.25);
+        assert_eq!(id, 0x4d);
+        let mut packet = payload.as_slice();
+        assert_eq!(read_packet_double(&mut packet), -15.5);
+        assert_eq!(read_packet_double(&mut packet), 33.25);
+        assert!(packet.is_empty());
+
+        let (id, payload) = encode_worldborder_size(1.5);
+        assert_eq!(id, 0x4f);
+        let mut packet = payload.as_slice();
+        assert_eq!(read_packet_double(&mut packet), 1.5);
+        assert!(packet.is_empty());
+
+        let (id, payload) = encode_worldborder_lerp_size(100.0, 29.5, 1_000_000_000);
+        assert_eq!(id, 0x4e);
+        let mut packet = payload.as_slice();
+        assert_eq!(read_packet_lerp(&mut packet), (100.0, 29.5, 50_000_000_000));
+        assert_eq!(payload.len(), 16 + 6); // VarLong needs more than five bytes.
+        assert!(packet.is_empty());
+    }
+
+    #[test]
+    fn scoreboard_objective_and_display_packets_round_trip_protocol_767_payloads() {
+        let mut objective = objective("life", ScoreboardCriteria::Health);
+        objective.display_name = "Vie ❤️".to_owned();
+        for (mode, packet) in [
+            (0, ScoreboardObjectivePacket::Create(&objective)),
+            (1, ScoreboardObjectivePacket::Remove(&objective.name)),
+            (2, ScoreboardObjectivePacket::Update(&objective)),
+        ] {
+            let (id, payload) = encode_scoreboard_objective(packet);
+            assert_eq!(id, 0x5e);
+            let mut packet = payload.as_slice();
+            assert_eq!(read_packet_string(&mut packet), "life");
+            assert_eq!(take_packet_bytes(&mut packet, 1), &[mode]);
+            if mode != 1 {
+                assert_eq!(read_packet_literal_component(&mut packet), "Vie ❤️");
+                assert_eq!(read_protocol_i32(&mut packet), Some(1)); // Hearts.
+                assert!(!read_packet_bool(&mut packet)); // No number format.
+            }
+            assert!(packet.is_empty());
+        }
+
+        for (slot, index, name) in [
+            (ScoreboardDisplaySlot::List, 0, Some("life")),
+            (ScoreboardDisplaySlot::Sidebar, 1, None),
+            (ScoreboardDisplaySlot::BelowName, 2, Some("life")),
+            (ScoreboardDisplaySlot::TeamRed, 15, Some("life")),
+            (ScoreboardDisplaySlot::TeamWhite, 18, None),
+        ] {
+            let (id, payload) = encode_scoreboard_display(slot, name);
+            assert_eq!(id, 0x57);
+            let mut packet = payload.as_slice();
+            assert_eq!(read_protocol_i32(&mut packet), Some(index));
+            assert_eq!(read_packet_string(&mut packet), name.unwrap_or_default());
+            assert!(packet.is_empty());
+        }
+    }
+
+    #[test]
+    fn scoreboard_score_and_reset_packets_round_trip_protocol_767_payloads() {
+        for (value, display_name) in [(-1, None), (i32::MIN, Some("🔔")), (130, Some(""))] {
+            let (id, payload) = encode_scoreboard_score("Alex", "life", value, display_name);
+            assert_eq!(id, 0x61);
+            let mut packet = payload.as_slice();
+            assert_eq!(read_packet_string(&mut packet), "Alex");
+            assert_eq!(read_packet_string(&mut packet), "life");
+            if value == -1 {
+                assert_eq!(&packet[..5], &[0xff, 0xff, 0xff, 0xff, 0x0f]);
+            }
+            assert_eq!(read_protocol_i32(&mut packet), Some(value));
+            assert_eq!(read_packet_bool(&mut packet), display_name.is_some());
+            if let Some(display_name) = display_name {
+                assert_eq!(read_packet_literal_component(&mut packet), display_name);
+            }
+            assert!(!read_packet_bool(&mut packet)); // No number format.
+            assert!(packet.is_empty());
+        }
+
+        for name in [None, Some("life")] {
+            let (id, payload) = encode_scoreboard_reset("Alex", name);
+            assert_eq!(id, 0x44);
+            let mut packet = payload.as_slice();
+            assert_eq!(read_packet_string(&mut packet), "Alex");
+            assert_eq!(read_packet_bool(&mut packet), name.is_some());
+            if let Some(name) = name {
+                assert_eq!(read_packet_string(&mut packet), name);
+            }
+            assert!(packet.is_empty());
+        }
     }
 
     #[test]
@@ -1209,12 +2360,12 @@ mod world_mechanisms_tests {
         let mut packet = &reset[1..];
         assert_eq!(read_varint(&mut packet), Some(19));
         for definition in CORE_ADVANCEMENTS {
-            assert_eq!(read_advancement_string(&mut packet), definition.id);
+            assert_eq!(read_packet_string(&mut packet), definition.id);
             let (has_parent, remaining) = packet.split_at(1);
             packet = remaining;
             assert_eq!(has_parent, &[u8::from(definition.parent.is_some())]);
             if let Some(parent) = definition.parent {
-                assert_eq!(read_advancement_string(&mut packet), parent);
+                assert_eq!(read_packet_string(&mut packet), parent);
             }
             assert_eq!(packet[0], 0);
             packet = &packet[1..];
@@ -1225,7 +2376,7 @@ mod world_mechanisms_tests {
             for group in definition.requirements {
                 assert_eq!(read_varint(&mut packet), Some(group.len() as i64));
                 for criterion in *group {
-                    assert_eq!(read_advancement_string(&mut packet), *criterion);
+                    assert_eq!(read_packet_string(&mut packet), *criterion);
                 }
             }
             assert_eq!(packet[0], 1);
@@ -1233,22 +2384,28 @@ mod world_mechanisms_tests {
         }
         assert_eq!(packet, &[0, 0]);
 
-        tracker.grant_only("Alex", ROOT, 1_234_567);
+        execute_advancement_command(&mut tracker, &["grant", "Alex", "only", ROOT], 1_234_567)
+            .unwrap();
         let (id, progress) = tracker.take_delta("Alex", false).unwrap().into_packet();
         assert_eq!(id, 0x74);
         assert_eq!(&progress[..4], &[0, 0, 0, 1]);
         let mut packet = &progress[4..];
-        assert_eq!(read_advancement_string(&mut packet), ROOT);
+        assert_eq!(read_packet_string(&mut packet), ROOT);
         assert_eq!(read_varint(&mut packet), Some(1));
-        assert_eq!(read_advancement_string(&mut packet), "crafting_table");
+        assert_eq!(read_packet_string(&mut packet), "crafting_table");
         assert_eq!(packet[0], 1);
         assert_eq!(&packet[1..], &1_234_567i64.to_be_bytes());
 
-        tracker.revoke_criterion("Alex", ROOT, "crafting_table");
+        execute_advancement_command(
+            &mut tracker,
+            &["revoke", "Alex", "only", ROOT, "crafting_table"],
+            0,
+        )
+        .unwrap();
         let (_, revoke) = tracker.take_delta("Alex", false).unwrap().into_packet();
         assert_eq!(&revoke[..4], &[0, 0, 0, 1]);
         let mut packet = &revoke[4..];
-        assert_eq!(read_advancement_string(&mut packet), ROOT);
+        assert_eq!(read_packet_string(&mut packet), ROOT);
         assert_eq!(packet, &[0]);
     }
 
