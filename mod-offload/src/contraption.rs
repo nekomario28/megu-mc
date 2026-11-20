@@ -61,6 +61,21 @@ impl Default for Pose {
 }
 
 impl Pose {
+    /// Rotate about the local X axis (pitch), then the world Y axis (yaw).
+    /// Both angles are right-handed degrees around the local-origin pivot.
+    pub fn from_yaw_pitch(translation: Vec3, yaw: f32, pitch: f32) -> Option<Self> {
+        let (sy, cy) = f64::from(yaw).to_radians().sin_cos();
+        let (sp, cp) = f64::from(pitch).to_radians().sin_cos();
+        Self::new(
+            [
+                [cy, sy * sp, sy * cp],
+                [0.0, cp, -sp],
+                [-sy, cy * sp, cy * cp],
+            ],
+            translation,
+        )
+    }
+
     /// Construct a proper rigid transform from a row-major rotation matrix
     /// and a world-space translation. The pivot is the local origin.
     pub fn new(rotation: [Vec3; 3], translation: Vec3) -> Option<Self> {
@@ -90,6 +105,25 @@ impl Pose {
         self.translation
     }
 
+    /// World-space displacement of a point attached to the previous pose.
+    pub fn carried_delta(self, previous: Self, anchor: Vec3) -> Option<Vec3> {
+        if !anchor.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        if self.rotation == previous.rotation {
+            let delta = std::array::from_fn(|i| self.translation[i] - previous.translation[i]);
+            return delta.iter().all(|value| value.is_finite()).then_some(delta);
+        }
+        let relative = std::array::from_fn(|i| anchor[i] - previous.translation[i]);
+        let local = std::array::from_fn(|i| dot(previous.rotation.map(|row| row[i]), relative));
+        let delta = std::array::from_fn(|i| {
+            let rotation_change =
+                std::array::from_fn(|j| self.rotation[i][j] - previous.rotation[i][j]);
+            self.translation[i] - previous.translation[i] + dot(rotation_change, local)
+        });
+        delta.iter().all(|value| value.is_finite()).then_some(delta)
+    }
+
     fn cell_center(self, position: BlockPos) -> Vec3 {
         let local = position.map(|value| f64::from(value) + 0.5);
         std::array::from_fn(|i| dot(self.rotation[i], local) + self.translation[i])
@@ -113,6 +147,12 @@ impl BlockCluster {
     /// leaving every u32 state (including zero) available to the adapter.
     pub fn new(mut blocks: Vec<(BlockPos, u32)>) -> Result<Self, ClusterError> {
         blocks.sort_unstable_by_key(|&(position, _)| position);
+        Self::from_sorted(blocks)
+    }
+
+    fn from_sorted(
+        blocks: impl IntoIterator<Item = (BlockPos, u32)>,
+    ) -> Result<Self, ClusterError> {
         let mut cluster = Self::default();
         let mut indices = BTreeMap::new();
         for (position, state) in blocks {
@@ -199,6 +239,34 @@ impl Contraption {
         self.pose = pose;
         self.bounds = cluster_bounds(&self.cluster, pose);
         Some(pose)
+    }
+
+    /// Merge sorted, unique edits into the local palette in one pass.
+    pub(crate) fn apply_deltas(&mut self, edits: &[BlockDelta]) -> Result<(), ClusterError> {
+        let mut blocks = self.cluster.blocks().peekable();
+        let mut edits = edits.iter().peekable();
+        let merged = std::iter::from_fn(move || loop {
+            let Some(edit) = edits.peek() else {
+                return blocks.next();
+            };
+            if let Some(&(pos, _)) = blocks.peek() {
+                match pos.cmp(&edit.position) {
+                    Ordering::Less => return blocks.next(),
+                    Ordering::Equal => {
+                        blocks.next();
+                    }
+                    Ordering::Greater => {}
+                }
+            }
+            let edit = edits.next().unwrap();
+            if let Some(state) = edit.state {
+                return Some((edit.position, state));
+            }
+        });
+        let next = BlockCluster::from_sorted(merged)?;
+        self.bounds = cluster_bounds(&next, self.pose);
+        self.cluster = next;
+        Ok(())
     }
 
     /// Diff by local position and state so palette reindexing stays internal.

@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 typedef struct mso_region mso_region;
+typedef struct mso_contraption mso_contraption;
 typedef int32_t mso_status;
 
 enum {
@@ -37,7 +38,9 @@ enum {
     MSO_S5_TRANSPORT_TRANSFER = 1,
     MSO_S5_FLUID_TANK_UPDATE = 2,
     MSO_S5_RECIPE_EVENT = 3,
-    MSO_S5_FIRST_ADAPTER_KIND = 0x100
+    MSO_S5_FIRST_ADAPTER_KIND = 0x100,
+    MSO_S5_CONTRAPTION_POSE = 0x101,
+    MSO_S5_CONTRAPTION_BLOCK_DIFFS = 0x102
 };
 
 typedef struct {
@@ -89,6 +92,33 @@ typedef struct {
     uint64_t sequence;
 } mso_batch_report;
 
+typedef struct {
+    int32_t position[3];
+    uint32_t state;
+    uint8_t present;
+} mso_block_diff;
+
+typedef struct {
+    double position[3];
+    float yaw, pitch;
+    float linear_velocity[3], angular_velocity[3];
+} mso_contraption_pose;
+
+typedef struct {
+    double min[3], max[3];
+} mso_aabb;
+
+typedef struct {
+    mso_aabb bounds;
+    double previous_anchor[3];
+    uint8_t carried;
+} mso_actor;
+
+typedef struct {
+    double delta[3];
+    uint8_t intersects;
+} mso_actor_collision;
+
 /*
  * Serialize calls on each live handle and free it once. Distinct handles are
  * independent. A null handle is accepted by free. Arrays may be null for a
@@ -120,6 +150,48 @@ mso_status mso_region_export(mso_region *region, uint8_t *buffer, size_t capacit
                              size_t record_limit, mso_batch_report *out);
 mso_status mso_region_queue_delta(mso_region *region, uint16_t kind, uint32_t source,
                                   const uint8_t *payload, size_t length);
+
+/*
+ * Copy the initial occupied local cells (present must be 1). A new handle
+ * starts at tick zero with an identity pose and an empty export queue. The
+ * region key and id identify its independent S5 stream.
+ */
+mso_status mso_contraption_create(int32_t dimension, int32_t x, int32_t z, uint32_t id,
+                                 const mso_block_diff *blocks, size_t count, mso_contraption **out);
+mso_status mso_contraption_free(mso_contraption *contraption);
+
+/*
+ * Upsert a block with present=1 or delete it with present=0 (state ignored).
+ * State zero is valid. Duplicate positions are invalid. Unchanged cells are
+ * omitted. At most 3855 actual changes fit one call's S5 record. Split larger
+ * updates across calls. Ticks may repeat and must not go backwards. A full
+ * queue rejects an update atomically so it can be retried after export.
+ */
+mso_status mso_contraption_apply_diffs(mso_contraption *contraption, uint64_t tick,
+                                      const mso_block_diff *diffs, size_t count);
+
+/*
+ * Set the absolute pose. Pitch about local X is applied before yaw about
+ * world Y, in right-handed degrees about the local origin. Position is in
+ * blocks. Velocities are world-space metadata in blocks/tick and degrees/tick.
+ * All values must be finite. Each successful call replaces the motion sample.
+ */
+mso_status mso_contraption_set_pose(mso_contraption *contraption, uint64_t tick,
+                                   mso_contraption_pose pose);
+
+/*
+ * Test the world-space AABB at the current pose (touching counts as contact).
+ * For a host-designated passenger (carried=1), also return the rigid motion
+ * of previous_anchor from the last set_pose call, independent of intersection.
+ * The anchor is in previous-pose world coordinates. Other actors get zero
+ * delta. Repeated queries return the same motion until the next set_pose.
+ */
+mso_status mso_contraption_collide_actor(mso_contraption *contraption, mso_actor actor,
+                                        mso_actor_collision *out);
+
+/* S5 v1 FIFO export with the same buffer and report rules as region export. */
+mso_status mso_contraption_export_delta(mso_contraption *contraption, uint8_t *buffer,
+                                        size_t capacity, size_t record_limit, mso_batch_report *out);
 
 /* Kinetic edits solve synchronously and return before region stepping. */
 mso_status mso_kinetic_add(mso_region *region, uint32_t id, mso_node node);

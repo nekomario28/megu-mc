@@ -3,6 +3,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use mod_offload::contraption::{Aabb, BlockCluster, Contraption, Pose};
 use mod_offload::kinetic_graph::{KineticGraph, KineticNode, NetworkStatus};
 use mod_offload::recipe_processor::{Drive, Recipe, Resource, ResourceKind, Stack};
 use mod_offload::region_scheduler::{Region, RegionBudget, RegionKey, MAX_BATCH_BYTES};
@@ -18,6 +19,7 @@ const DORMANT_CHAINS: u32 = 5_000;
 const ACTIVE_CHAINS: u32 = 500;
 const FACTORY_WARMUP: u64 = 20;
 const FACTORY_CYCLES: u64 = 250;
+const CONTRAPTION_TICKS: u64 = 2_000;
 const FACTORY_BUDGET: RegionBudget = RegionBudget {
     max_steps: 2_000,
     max_time: None,
@@ -81,7 +83,7 @@ fn measure(ticks: u64, mut run_tick: impl FnMut(u64) -> usize) -> Timing {
         .zip(cpu_start)
         .and_then(|(end, start)| end.checked_sub(start))
         .filter(|&elapsed| elapsed != 0);
-    assert_eq!(changed, 0, "timed workload must stay settled");
+    assert_eq!(changed, 0, "unexpected timed workload result");
     Timing {
         wall_ns_per_tick: wall.as_nanos() as f64 / ticks as f64,
         cpu_ns_per_tick: cpu.map(|ns| ns as f64 / ticks as f64),
@@ -186,6 +188,57 @@ fn main() {
         println!("thread CPU: unavailable (requires Linux thread schedstat)");
     }
     mixed_factory();
+    moving_contraption();
+}
+
+fn moving_contraption() {
+    let blocks = (0..16)
+        .flat_map(|x| (0..16).map(move |z| ([2 * x, 0, 2 * z], 1)))
+        .collect();
+    let mut body = Contraption::new(BlockCluster::new(blocks).unwrap(), Pose::default());
+    let actors = [
+        (0.5, 0.5, true),
+        (8.5, 6.5, true),
+        (18.5, 20.5, true),
+        (30.5, 30.5, true),
+        (1.5, 0.5, false),
+        (16.5, 7.5, false),
+        (30.5, 29.5, false),
+        (32.5, 32.5, false),
+    ];
+    let mut run_tick = |tick: u64| {
+        let previous = body.pose();
+        let offset = 1.0 + (tick % 16) as f64;
+        let turned = !tick.is_multiple_of(2);
+        let pose =
+            Pose::from_yaw_pitch([offset, 1.0, 0.0], if turned { 90.0 } else { 0.0 }, 0.0).unwrap();
+        assert!(body.set_pose(pose).is_some());
+        let passenger = [previous.translation()[0] + 0.5, 1.5, 0.5];
+        black_box(pose.carried_delta(previous, black_box(passenger)).unwrap());
+        actors
+            .iter()
+            .filter(|&&(x, z, expected)| {
+                let (x, z) = if turned { (z, -x) } else { (x, z) };
+                let center = [offset + x, 1.5, z];
+                let bounds = Aabb::new(center.map(|v| v - 0.2), center.map(|v| v + 0.2)).unwrap();
+                black_box(body.intersects(black_box(bounds))) != expected
+            })
+            .count()
+    };
+    for tick in 0..WARMUP_TICKS {
+        assert_eq!(run_tick(tick), 0);
+    }
+    let timing = measure(CONTRAPTION_TICKS, |tick| run_tick(tick + WARMUP_TICKS));
+    println!(
+        "contraption: 256 blocks, {WARMUP_TICKS} warmup ticks, {CONTRAPTION_TICKS} measured ticks, 1 pose + 1 passenger delta + 8 actor queries/tick"
+    );
+    println!(
+        "contraption wall: {:.2} us/tick",
+        timing.wall_ns_per_tick / 1000.0
+    );
+    if let Some(cpu) = timing.cpu_ns_per_tick {
+        println!("contraption thread CPU: {:.2} us/tick", cpu / 1000.0);
+    }
 }
 
 fn mixed_factory() {

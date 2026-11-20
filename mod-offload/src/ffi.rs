@@ -10,10 +10,11 @@ use std::ptr;
 use std::slice;
 use std::time::Duration;
 
+use crate::contraption::{Aabb, BlockCluster, BlockDelta, ClusterError, Contraption, Pose};
 use crate::fluid_network::FluidError;
 use crate::kinetic_graph::{GraphError, KineticNode, NetworkStatus};
 use crate::recipe_processor::{Drive, Recipe, RecipeError, Resource, ResourceKind, Stack};
-use crate::region_scheduler::{BatchError, Region, RegionBudget, RegionKey};
+use crate::region_scheduler::{BatchError, BatchQueue, Region, RegionBudget, RegionKey};
 use crate::sleeping_transport::TransportError;
 
 #[repr(i32)]
@@ -82,6 +83,15 @@ impl From<BatchError> for MsoStatus {
             BatchError::BufferTooSmall { .. } => Self::BufferTooSmall,
             BatchError::SequenceExhausted => Self::SequenceExhausted,
             _ => Self::InvalidArgument,
+        }
+    }
+}
+
+impl From<ClusterError> for MsoStatus {
+    fn from(error: ClusterError) -> Self {
+        match error {
+            ClusterError::DuplicatePosition(_) => Self::InvalidArgument,
+            ClusterError::PaletteFull => Self::Full,
         }
     }
 }
@@ -212,6 +222,102 @@ pub struct MsoBatchReport {
     pub sequence: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MsoBlockDiff {
+    pub position: [i32; 3],
+    pub state: u32,
+    pub present: u8,
+}
+
+impl TryFrom<MsoBlockDiff> for BlockDelta {
+    type Error = MsoStatus;
+
+    fn try_from(diff: MsoBlockDiff) -> Result<Self> {
+        Ok(Self {
+            position: diff.position,
+            state: flag(diff.present)?.then_some(diff.state),
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MsoContraptionPose {
+    pub position: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub linear_velocity: [f32; 3],
+    pub angular_velocity: [f32; 3],
+}
+
+impl MsoContraptionPose {
+    fn payload(self) -> [u8; 56] {
+        let mut payload = [0; 56];
+        for (out, value) in payload[..24]
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(self.position)
+        {
+            *out = value.to_le_bytes();
+        }
+        let motion = [self.yaw, self.pitch]
+            .into_iter()
+            .chain(self.linear_velocity)
+            .chain(self.angular_velocity);
+        for (out, value) in payload[24..].as_chunks_mut::<4>().0.iter_mut().zip(motion) {
+            *out = value.to_le_bytes();
+        }
+        payload
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MsoAabb {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MsoActor {
+    pub bounds: MsoAabb,
+    pub previous_anchor: [f64; 3],
+    pub carried: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MsoActorCollision {
+    pub delta: [f64; 3],
+    pub intersects: u8,
+}
+
+pub const CONTRAPTION_POSE: u16 = 0x101;
+pub const CONTRAPTION_BLOCK_DIFFS: u16 = 0x102;
+const BLOCK_DIFF_BYTES: usize = 17;
+
+/// Opaque to C. Each handle owns its simulation state and S5 stream.
+pub struct MsoContraption {
+    id: u32,
+    tick: u64,
+    body: Contraption,
+    previous: Pose,
+    pose: MsoContraptionPose,
+    batch: BatchQueue,
+}
+
+impl MsoContraption {
+    fn check_tick(&self, tick: u64) -> Result {
+        if tick < self.tick {
+            return Err(MsoStatus::TimeWentBackwards);
+        }
+        Ok(())
+    }
+}
+
 /// Opaque to C. Only this module can access the owned region.
 pub struct MsoRegion(Region);
 
@@ -234,19 +340,32 @@ fn flag(value: u8) -> Result<bool> {
 }
 
 fn validate_ptr<T>(ptr: *const T) -> Result {
-    if ptr.is_null() || !ptr.addr().is_multiple_of(align_of::<T>()) {
+    if ptr.is_null()
+        || !ptr.addr().is_multiple_of(align_of::<T>())
+        || ptr.addr().checked_add(size_of::<T>()).is_none()
+    {
         return Err(MsoStatus::InvalidArgument);
     }
     Ok(())
 }
 
-unsafe fn read_array<'a, T>(data: *const T, count: usize) -> Result<&'a [T]> {
+fn validate_array<T>(data: *const T, count: usize) -> Result {
     if count == 0 {
-        return Ok(&[]);
+        return Ok(());
     }
     validate_ptr(data)?;
-    if count > isize::MAX as usize / size_of::<T>() {
-        return Err(MsoStatus::InvalidArgument);
+    match count.checked_mul(size_of::<T>()) {
+        Some(bytes) if bytes <= isize::MAX as usize && data.addr().checked_add(bytes).is_some() => {
+            Ok(())
+        }
+        _ => Err(MsoStatus::InvalidArgument),
+    }
+}
+
+unsafe fn read_array<'a, T>(data: *const T, count: usize) -> Result<&'a [T]> {
+    validate_array(data, count)?;
+    if count == 0 {
+        return Ok(&[]);
     }
     // SAFETY: The header requires initialized arrays in a single allocation
     // that remain readable and unmodified throughout the call.
@@ -258,6 +377,44 @@ unsafe fn write_result<T>(out: *mut T, produce: impl FnOnce() -> Result<T>) -> R
     // SAFETY: The caller supplies writable, aligned storage for one T.
     unsafe { out.write(produce()?) };
     Ok(())
+}
+
+unsafe fn export_batch(
+    batch: &mut BatchQueue,
+    buffer: *mut u8,
+    capacity: usize,
+    record_limit: usize,
+    out: *mut MsoBatchReport,
+) -> Result {
+    validate_ptr(out)?;
+    validate_array(buffer, capacity)?;
+    let result = batch.export_with(capacity, record_limit, |offset, bytes| {
+        // SAFETY: export_with bounds every write by capacity. The caller
+        // supplies a disjoint writable buffer, which may be uninitialized.
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.add(offset), bytes.len()) };
+    });
+    let (report, status) = match result {
+        Ok(report) => (
+            MsoBatchReport {
+                bytes: report.bytes,
+                records: report.records,
+                required_bytes: 0,
+                sequence: report.sequence.unwrap_or(0),
+            },
+            Ok(()),
+        ),
+        Err(BatchError::BufferTooSmall { needed }) => (
+            MsoBatchReport {
+                required_bytes: needed,
+                ..MsoBatchReport::default()
+            },
+            Err(MsoStatus::BufferTooSmall),
+        ),
+        Err(error) => return Err(error.into()),
+    };
+    // SAFETY: The caller provides one writable report.
+    unsafe { out.write(report) };
+    status
 }
 
 /// Create a region at the given region coordinates.
@@ -300,6 +457,218 @@ pub unsafe extern "C" fn mso_region_free(handle: *mut MsoRegion) -> MsoStatus {
     })
 }
 
+/// Create an independent contraption at the identity pose.
+///
+/// # Safety
+///
+/// The input array and writable handle output must satisfy the C header.
+#[no_mangle]
+pub unsafe extern "C" fn mso_contraption_create(
+    dimension: i32,
+    x: i32,
+    z: i32,
+    id: u32,
+    blocks: *const MsoBlockDiff,
+    count: usize,
+    out: *mut *mut MsoContraption,
+) -> MsoStatus {
+    boundary(|| unsafe {
+        write_result(out, || {
+            let blocks = read_array(blocks, count)?
+                .iter()
+                .map(|&block| {
+                    let block = BlockDelta::try_from(block)?;
+                    Ok((
+                        block.position,
+                        block.state.ok_or(MsoStatus::InvalidArgument)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let previous = Pose::default();
+            let body = Contraption::new(BlockCluster::new(blocks)?, previous);
+            Ok(Box::into_raw(Box::new(MsoContraption {
+                id,
+                tick: 0,
+                body,
+                previous,
+                pose: MsoContraptionPose::default(),
+                batch: BatchQueue::new(RegionKey { dimension, x, z }),
+            })))
+        })
+    })
+}
+
+/// Free a contraption. A null handle succeeds.
+///
+/// # Safety
+///
+/// Any non-null handle must be live, exclusively owned and returned by create.
+#[no_mangle]
+pub unsafe extern "C" fn mso_contraption_free(handle: *mut MsoContraption) -> MsoStatus {
+    boundary(|| {
+        if !handle.is_null() {
+            validate_ptr(handle)?;
+            // SAFETY: The caller transfers ownership of a live Box handle.
+            drop(unsafe { Box::from_raw(handle) });
+        }
+        Ok(())
+    })
+}
+
+unsafe fn with_contraption(
+    handle: *mut MsoContraption,
+    operation: impl FnOnce(&mut MsoContraption) -> Result,
+) -> MsoStatus {
+    boundary(|| {
+        validate_ptr(handle)?;
+        // SAFETY: The caller exclusively borrows the live handle.
+        operation(unsafe { &mut *handle })
+    })
+}
+
+/// Apply one array of incremental local block edits.
+///
+/// # Safety
+///
+/// The live handle and input array must satisfy the C header.
+#[no_mangle]
+pub unsafe extern "C" fn mso_contraption_apply_diffs(
+    handle: *mut MsoContraption,
+    tick: u64,
+    diffs: *const MsoBlockDiff,
+    count: usize,
+) -> MsoStatus {
+    unsafe {
+        with_contraption(handle, |state| {
+            state.check_tick(tick)?;
+            let mut edits = read_array(diffs, count)?
+                .iter()
+                .copied()
+                .map(BlockDelta::try_from)
+                .collect::<Result<Vec<_>>>()?;
+            edits.sort_unstable_by_key(|edit| edit.position);
+            if edits
+                .windows(2)
+                .any(|pair| pair[0].position == pair[1].position)
+            {
+                return Err(MsoStatus::InvalidArgument);
+            }
+            edits.retain(|edit| state.body.cluster().state_at(edit.position) != edit.state);
+            if !edits.is_empty() {
+                let length = edits.len() * BLOCK_DIFF_BYTES;
+                state.batch.check_room(length)?;
+                let mut payload = Vec::with_capacity(length);
+                for edit in &edits {
+                    for coord in edit.position {
+                        payload.extend_from_slice(&coord.to_le_bytes());
+                    }
+                    payload.push(u8::from(edit.state.is_some()));
+                    payload.extend_from_slice(&edit.state.unwrap_or(0).to_le_bytes());
+                }
+                state.body.apply_deltas(&edits)?;
+                state
+                    .batch
+                    .push(tick, state.id, CONTRAPTION_BLOCK_DIFFS, &payload);
+            }
+            state.tick = tick;
+            Ok(())
+        })
+    }
+}
+
+/// Set the absolute pose and velocity metadata.
+///
+/// # Safety
+///
+/// The live handle must satisfy the C header.
+#[no_mangle]
+pub unsafe extern "C" fn mso_contraption_set_pose(
+    handle: *mut MsoContraption,
+    tick: u64,
+    pose: MsoContraptionPose,
+) -> MsoStatus {
+    unsafe {
+        with_contraption(handle, |state| {
+            state.check_tick(tick)?;
+            let transform = Pose::from_yaw_pitch(pose.position, pose.yaw, pose.pitch)
+                .ok_or(MsoStatus::InvalidArgument)?;
+            if !pose
+                .linear_velocity
+                .iter()
+                .chain(&pose.angular_velocity)
+                .all(|v| v.is_finite())
+            {
+                return Err(MsoStatus::InvalidArgument);
+            }
+            let previous = state.body.pose();
+            if pose != state.pose {
+                let payload = pose.payload();
+                state.batch.check_room(payload.len())?;
+                state.body.set_pose(transform);
+                state.batch.push(tick, state.id, CONTRAPTION_POSE, &payload);
+                state.pose = pose;
+            }
+            state.previous = previous;
+            state.tick = tick;
+            Ok(())
+        })
+    }
+}
+
+/// Query the current shape and the most recent accepted rigid motion.
+///
+/// # Safety
+///
+/// The live handle and writable report must satisfy the C header.
+#[no_mangle]
+pub unsafe extern "C" fn mso_contraption_collide_actor(
+    handle: *mut MsoContraption,
+    actor: MsoActor,
+    out: *mut MsoActorCollision,
+) -> MsoStatus {
+    unsafe {
+        with_contraption(handle, |state| {
+            write_result(out, || {
+                let bounds = Aabb::new(actor.bounds.min, actor.bounds.max)
+                    .ok_or(MsoStatus::InvalidArgument)?;
+                let delta = if flag(actor.carried)? {
+                    state
+                        .body
+                        .pose()
+                        .carried_delta(state.previous, actor.previous_anchor)
+                        .ok_or(MsoStatus::InvalidArgument)?
+                } else {
+                    [0.0; 3]
+                };
+                Ok(MsoActorCollision {
+                    delta,
+                    intersects: u8::from(state.body.intersects(bounds)),
+                })
+            })
+        })
+    }
+}
+
+/// Export queued contraption records in an S5 frame.
+///
+/// # Safety
+///
+/// The live handle, buffer and writable report must satisfy the C header.
+#[no_mangle]
+pub unsafe extern "C" fn mso_contraption_export_delta(
+    handle: *mut MsoContraption,
+    buffer: *mut u8,
+    capacity: usize,
+    record_limit: usize,
+    out: *mut MsoBatchReport,
+) -> MsoStatus {
+    unsafe {
+        with_contraption(handle, |state| {
+            export_batch(&mut state.batch, buffer, capacity, record_limit, out)
+        })
+    }
+}
+
 macro_rules! region_api {
     ($(fn $name:ident($region:ident $(, $arg:ident: $ty:ty)*) $body:block)*) => {$(
         /// See the matching declaration in `include/mc_spine_mod_offload.h`.
@@ -339,33 +708,7 @@ region_api! {
     }
 
     fn mso_region_export(region, buffer: *mut u8, capacity: usize, record_limit: usize, out: *mut MsoBatchReport) {
-        validate_ptr(out)?;
-        if capacity != 0 {
-            validate_ptr(buffer)?;
-        }
-        let result = region.export_with(capacity, record_limit, |offset, bytes| {
-            // SAFETY: export_with bounds every write by capacity. The caller
-            // supplies a disjoint writable buffer, which may be uninitialized.
-            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.add(offset), bytes.len()) };
-        });
-        match result {
-            Ok(report) => {
-                // SAFETY: The caller provides one writable report.
-                unsafe { out.write(MsoBatchReport {
-                    bytes: report.bytes,
-                    records: report.records,
-                    required_bytes: 0,
-                    sequence: report.sequence.unwrap_or(0),
-                }) };
-                Ok(())
-            }
-            Err(BatchError::BufferTooSmall { needed }) => {
-                // SAFETY: The caller provides one writable report.
-                unsafe { out.write(MsoBatchReport { required_bytes: needed, ..MsoBatchReport::default() }) };
-                Err(MsoStatus::BufferTooSmall)
-            }
-            Err(error) => Err(error.into()),
-        }
+        unsafe { export_batch(&mut region.batch, buffer, capacity, record_limit, out) }
     }
 
     fn mso_region_queue_delta(region, kind: u16, source: u32, payload: *const u8, length: usize) {

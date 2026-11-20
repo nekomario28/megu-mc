@@ -93,13 +93,17 @@ impl RegionScheduler {
 }
 
 pub struct Region {
-    key: RegionKey,
     pub kinetic: KineticGraph,
     pub contraptions: BTreeMap<u32, Contraption>,
     transport: SleepingTransport,
     fluid: FluidNetwork,
     recipes: RecipeProcessor,
     fluid_updates: std::vec::IntoIter<(u32, TankState)>,
+    pub(crate) batch: BatchQueue,
+}
+
+pub(crate) struct BatchQueue {
+    key: RegionKey,
     pending: VecDeque<Delta>,
     pending_bytes: usize,
     sequence: u64,
@@ -121,16 +125,13 @@ impl Delta {
 impl Region {
     pub fn new(key: RegionKey) -> Self {
         Self {
-            key,
             kinetic: KineticGraph::default(),
             contraptions: BTreeMap::new(),
             transport: SleepingTransport::default(),
             fluid: FluidNetwork::default(),
             recipes: RecipeProcessor::default(),
             fluid_updates: Vec::new().into_iter(),
-            pending: VecDeque::new(),
-            pending_bytes: 0,
-            sequence: 0,
+            batch: BatchQueue::new(key),
         }
     }
 
@@ -230,7 +231,7 @@ impl Region {
             if report.processed == budget.max_steps {
                 break;
             }
-            if !self.has_room(work.payload_bytes()) {
+            if !self.batch.has_room(work.payload_bytes()) {
                 report.output_blocked = true;
                 break;
             }
@@ -258,7 +259,8 @@ impl Region {
                     let mut payload = [0; RECIPE_PAYLOAD_BYTES];
                     payload[0] = u8::from(event.recipe.is_some());
                     payload[1..].copy_from_slice(&event.recipe.unwrap_or(0).to_le_bytes());
-                    self.push_delta(event.tick, event.machine, RECIPE_EVENT, &payload);
+                    self.batch
+                        .push(event.tick, event.machine, RECIPE_EVENT, &payload);
                 }
             }
             report.processed += 1;
@@ -299,13 +301,8 @@ impl Region {
         if kind < FIRST_ADAPTER_KIND {
             return Err(BatchError::ReservedKind);
         }
-        if payload.len() > u16::MAX as usize {
-            return Err(BatchError::OversizedRecord);
-        }
-        if !self.has_room(payload.len()) {
-            return Err(BatchError::QueueFull);
-        }
-        self.push_delta(self.transport.now(), source, kind, payload);
+        self.batch.check_room(payload.len())?;
+        self.batch.push(self.transport.now(), source, kind, payload);
         Ok(())
     }
 
@@ -316,9 +313,48 @@ impl Region {
         buffer: &mut [u8],
         max_records: usize,
     ) -> Result<BatchReport, BatchError> {
-        self.export_with(buffer.len(), max_records, |offset, bytes| {
-            buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
-        })
+        self.batch
+            .export_with(buffer.len(), max_records, |offset, bytes| {
+                buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
+            })
+    }
+
+    fn queue_transfer(&mut self, delta: TransportDelta) {
+        let mut payload = [0; TRANSFER_PAYLOAD_BYTES];
+        payload[0] = u8::from(delta.destination.is_some());
+        payload[1..5].copy_from_slice(&delta.destination.unwrap_or(0).to_le_bytes());
+        payload[5..9].copy_from_slice(&delta.item.to_le_bytes());
+        self.batch
+            .push(delta.tick, delta.source, TRANSPORT_TRANSFER, &payload);
+    }
+
+    fn queue_tank(&mut self, tick: u64, id: u32, state: TankState) {
+        let mut payload = [0; TANK_PAYLOAD_BYTES];
+        payload[0] = u8::from(state.fluid.is_some());
+        payload[1..5].copy_from_slice(&state.fluid.unwrap_or(0).to_le_bytes());
+        payload[5..9].copy_from_slice(&state.amount.to_le_bytes());
+        self.batch.push(tick, id, FLUID_TANK_UPDATE, &payload);
+    }
+}
+
+impl BatchQueue {
+    pub(crate) fn new(key: RegionKey) -> Self {
+        Self {
+            key,
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            sequence: 0,
+        }
+    }
+
+    pub(crate) fn check_room(&self, payload_len: usize) -> Result<(), BatchError> {
+        if payload_len > u16::MAX as usize {
+            return Err(BatchError::OversizedRecord);
+        }
+        if !self.has_room(payload_len) {
+            return Err(BatchError::QueueFull);
+        }
+        Ok(())
     }
 
     /// Writes wire bytes directly to a caller-provided sink. Offsets and
@@ -393,23 +429,7 @@ impl Region {
                 <= MAX_BATCH_BYTES
     }
 
-    fn queue_transfer(&mut self, delta: TransportDelta) {
-        let mut payload = [0; TRANSFER_PAYLOAD_BYTES];
-        payload[0] = u8::from(delta.destination.is_some());
-        payload[1..5].copy_from_slice(&delta.destination.unwrap_or(0).to_le_bytes());
-        payload[5..9].copy_from_slice(&delta.item.to_le_bytes());
-        self.push_delta(delta.tick, delta.source, TRANSPORT_TRANSFER, &payload);
-    }
-
-    fn queue_tank(&mut self, tick: u64, id: u32, state: TankState) {
-        let mut payload = [0; TANK_PAYLOAD_BYTES];
-        payload[0] = u8::from(state.fluid.is_some());
-        payload[1..5].copy_from_slice(&state.fluid.unwrap_or(0).to_le_bytes());
-        payload[5..9].copy_from_slice(&state.amount.to_le_bytes());
-        self.push_delta(tick, id, FLUID_TANK_UPDATE, &payload);
-    }
-
-    fn push_delta(&mut self, tick: u64, source: u32, kind: u16, payload: &[u8]) {
+    pub(crate) fn push(&mut self, tick: u64, source: u32, kind: u16, payload: &[u8]) {
         self.pending_bytes += RECORD_HEADER_BYTES + payload.len();
         self.pending.push_back(Delta {
             tick,

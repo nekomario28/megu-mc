@@ -17,7 +17,69 @@ static void record(const uint8_t *p, uint32_t tick, uint32_t source, uint16_t ki
     assert(p[16] == present && read32(p + 17) == id);
 }
 
+static void contraption_smoke(void) {
+    mso_contraption *body = NULL;
+    const mso_block_diff blocks[] = {{{0, 0, 0}, 0, 1}, {{3, 0, 0}, 7, 1}};
+    assert(mso_contraption_create(-2, 3, -4, 42, blocks, 2, NULL) == MSO_INVALID_ARGUMENT);
+    assert(mso_contraption_create(-2, 3, -4, 42, NULL, 1, &body) == MSO_INVALID_ARGUMENT);
+    assert(mso_contraption_create(-2, 3, -4, 42, blocks, SIZE_MAX, &body) == MSO_INVALID_ARGUMENT);
+    assert(body == NULL);
+    assert(mso_contraption_create(-2, 3, -4, 42, blocks, 2, &body) == MSO_OK && body);
+
+    mso_actor actor = {.bounds = {{1.25, 0, 0}, {1.75, 1, 1}}};
+    mso_actor_collision contact;
+    assert(mso_contraption_collide_actor(body, actor, &contact) == MSO_OK && !contact.intersects);
+    const mso_block_diff invalid[] = {{{0, 0, 0}, 0, 0}, {{1, 0, 0}, 1, 2}};
+    assert(mso_contraption_apply_diffs(body, 4, invalid, 2) == MSO_INVALID_ARGUMENT);
+    actor.bounds = (mso_aabb){{0.25, 0.25, 0.25}, {0.75, 0.75, 0.75}};
+    assert(mso_contraption_collide_actor(body, actor, &contact) == MSO_OK && contact.intersects);
+    const mso_block_diff edits[] = {
+        {{3, 0, 0}, 7, 0}, {{0, 0, 0}, 0, 1}, {{-2, 0, 0}, UINT32_MAX, 1}
+    };
+    assert(mso_contraption_apply_diffs(body, 4, edits, 3) == MSO_OK);
+    actor.bounds = (mso_aabb){{3.25, 0.25, 0.25}, {3.75, 0.75, 0.75}};
+    assert(mso_contraption_collide_actor(body, actor, &contact) == MSO_OK && !contact.intersects);
+
+    const mso_contraption_pose pose = {{10, 2, -4}, 90, 0, {1, 2, 3}, {4, 5, 6}};
+    assert(mso_contraption_set_pose(NULL, 5, pose) == MSO_INVALID_ARGUMENT);
+    assert(mso_contraption_set_pose(body, 3, pose) == MSO_TIME_WENT_BACKWARDS);
+    assert(mso_contraption_set_pose(body, 5, pose) == MSO_OK);
+    actor = (mso_actor){.bounds = {{10.25, 2.25, -4.75}, {10.75, 2.75, -4.25}},
+                        .previous_anchor = {0.5, 0.5, 0.5}, .carried = 1};
+    assert(mso_contraption_collide_actor(body, actor, &contact) == MSO_OK && contact.intersects);
+    assert(contact.delta[0] == 10 && contact.delta[1] == 2 && contact.delta[2] == -5);
+    actor.bounds.max[0] = 0;
+    assert(mso_contraption_collide_actor(body, actor, &contact) == MSO_INVALID_ARGUMENT);
+    assert(contact.intersects && contact.delta[0] == 10);
+
+    uint8_t buffer[155];
+    memset(buffer, 0xa5, sizeof buffer);
+    mso_batch_report batch;
+    assert(mso_contraption_export_delta(body, buffer, SIZE_MAX, 2, &batch) == MSO_INVALID_ARGUMENT);
+    assert(mso_contraption_export_delta(body, buffer, 81, 2, &batch) == MSO_BUFFER_TOO_SMALL);
+    assert(batch.required_bytes == 82 && batch.records == 0 && batch.sequence == 0);
+    for (size_t i = 0; i < sizeof buffer; ++i) {
+        assert(buffer[i] == 0xa5);
+    }
+    assert(mso_contraption_export_delta(body, buffer, sizeof buffer, 2, &batch) == MSO_OK);
+    assert(batch.bytes == 154 && batch.records == 2 && batch.sequence == 1 && buffer[154] == 0xa5);
+    assert(memcmp(buffer, "S5\x01\x01", 4) == 0);
+    assert(read32(buffer + 4) == 2 && read32(buffer + 8) == 1 && read32(buffer + 12) == 0);
+    assert(read32(buffer + 16) == (uint32_t)-2 && read32(buffer + 20) == 3);
+    assert(read32(buffer + 24) == (uint32_t)-4 && read32(buffer + 28) == 0);
+    assert(read32(buffer + 32) == 4 && read32(buffer + 40) == 42);
+    assert(read32(buffer + 44) == (34u << 16 | MSO_S5_CONTRAPTION_BLOCK_DIFFS));
+    assert(read32(buffer + 48) == (uint32_t)-2 && buffer[60] == 1 && read32(buffer + 61) == UINT32_MAX);
+    assert(read32(buffer + 65) == 3 && buffer[77] == 0 && read32(buffer + 78) == 0);
+    assert(read32(buffer + 82) == 5 && read32(buffer + 90) == 42);
+    assert(read32(buffer + 94) == (56u << 16 | MSO_S5_CONTRAPTION_POSE));
+    assert(read32(buffer + 122) == 0x42b40000 && read32(buffer + 150) == 0x40c00000);
+    assert(mso_contraption_export_delta(body, NULL, 0, 2, &batch) == MSO_OK && batch.bytes == 0);
+    assert(mso_contraption_free(body) == MSO_OK && mso_contraption_free(NULL) == MSO_OK);
+}
+
 int main(void) {
+    contraption_smoke();
     mso_region *region = NULL;
     assert(mso_region_create(-1, 2, -3, &region) == MSO_OK && region != NULL);
     assert(mso_region_create(0, 0, 0, NULL) == MSO_INVALID_ARGUMENT);
