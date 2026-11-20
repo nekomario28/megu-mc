@@ -462,6 +462,32 @@ pub(crate) trait SpawnWorld {
     ) -> bool;
 }
 
+struct SpawnPack {
+    pos: NaturalSpawnPos,
+    attempts: i32,
+    tried: i32,
+}
+
+impl SpawnPack {
+    fn new(origin: NaturalSpawnPos, roll: f32) -> Self {
+        Self {
+            pos: origin,
+            attempts: (roll * 4.0).ceil() as i32,
+            tried: 0,
+        }
+    }
+
+    fn next_pos(&mut self, mut next_below: impl FnMut(i32) -> i32) -> Option<NaturalSpawnPos> {
+        if self.tried >= self.attempts {
+            return None;
+        }
+        self.tried += 1;
+        self.pos.x += next_below(6) - next_below(6);
+        self.pos.z += next_below(6) - next_below(6);
+        Some(self.pos)
+    }
+}
+
 /// Up to three groups, with biome-selected attempt counts, jittered on the same Y slice
 /// by nextInt(6)-nextInt(6).
 /// Rechecks the global cap for each insertion so a pack cannot overshoot it.
@@ -481,15 +507,9 @@ pub(crate) fn try_spawn_mob_group(
 
     let mut spawned = 0;
     for _ in 0..3 {
-        let (mut x, mut z) = (origin.x, origin.z);
-        let mut attempts = (rng.next_f32() * 4.0).ceil() as i32;
+        let mut pack = SpawnPack::new(origin, rng.next_f32());
         let mut selected: Option<NaturalSpawnCandidate> = None;
-        let mut trial = 0;
-        while trial < attempts {
-            trial += 1;
-            x += rng.next_bound(6) - rng.next_bound(6);
-            z += rng.next_bound(6) - rng.next_bound(6);
-            let pos = NaturalSpawnPos { x, y: origin.y, z };
+        while let Some(pos) = pack.next_pos(|bound| rng.next_bound(bound)) {
             let Some(dist_sq) = world.nearest_non_spectator_dist_sq(pos) else {
                 continue;
             };
@@ -510,7 +530,7 @@ pub(crate) fn try_spawn_mob_group(
                     break;
                 }
                 let span = i32::from(candidate.max_group_size - candidate.min_group_size) + 1;
-                attempts = i32::from(candidate.min_group_size) + rng.next_bound(span);
+                pack.attempts = i32::from(candidate.min_group_size) + rng.next_bound(span);
                 selected = Some(candidate);
             }
             let candidate = selected.as_ref().expect("candidate selected above");
@@ -551,6 +571,7 @@ pub(crate) fn try_spawn_mob_group(
 }
 
 const NATURAL_SPAWN_CHUNK_RADIUS: i32 = 8;
+const NIGHTLY_MONSTER_CLUSTER_LIMIT: u32 = 4;
 
 fn has_room_for_nightly_monster(mobs: &[Arc<Mob>], monster_cap: usize) -> bool {
     mobs.len() < MOB_CAP
@@ -654,6 +675,144 @@ fn nightly_spawn_is_dark(x: i32, y: i32, z: i32, sources: &GenSources) -> bool {
     )
 }
 
+fn nightly_monster_spawners(pos: NaturalSpawnPos) -> &'static [feature::SpawnerData] {
+    let biome = worldgen::with_gen_dim(DimId::Overworld, |gen| {
+        let (_, leaf) = gen.biome_blended(pos.x, pos.y, pos.z)?;
+        gen.biome_name_of_leaf(leaf)
+    })
+    .flatten();
+    // The flat runtime sends plains in chunks without a generator.
+    feature::spawners_for(biome.as_deref().unwrap_or("minecraft:plains"), "monster")
+        .unwrap_or_default()
+}
+
+fn choose_nightly_spawner(entries: &[feature::SpawnerData]) -> Option<&feature::SpawnerData> {
+    let weight = entries.iter().try_fold(0i32, |total, entry| {
+        total
+            .checked_add(entry.weight)
+            .filter(|_| entry.weight >= 0)
+    })?;
+    if weight == 0 {
+        return None;
+    }
+    let mut roll = world_rng::next_below(weight as u32) as i32;
+    entries.iter().find(|entry| {
+        roll -= entry.weight;
+        roll < 0
+    })
+}
+
+fn nightly_spawn_float() -> f32 {
+    (world_rng::next_u64() >> 40) as f32 / (1 << 24) as f32
+}
+
+fn nightly_spawn_obstructed(bounds: EntityAabb) -> bool {
+    // Mob.checkSpawnObstruction first rejects any nonempty fluid state in the AABB.
+    let reg = crate::block_registry::breg().unwrap();
+    let [min_x, min_y, min_z] = bounds.min().map(|edge| edge.floor() as i32);
+    let [max_x, max_y, max_z] = bounds.max().map(|edge| edge.ceil() as i32);
+    for x in min_x..max_x {
+        for y in min_y..max_y {
+            for z in min_z..max_z {
+                if reg.is_liquid(block_at(x, y, z)) {
+                    return true;
+                }
+            }
+        }
+    }
+    let cart_type = entity_spec_by_name("chest_minecart").expect("registered chest minecart");
+    generated_content()
+        .lock()
+        .unwrap()
+        .carts
+        .iter()
+        .filter_map(|cart| cart.pos().ok())
+        .any(|[x, y, z]| {
+            bounds.intersects(EntityAabb::from_dimensions(
+                x,
+                y,
+                z,
+                cart_type.width,
+                cart_type.height,
+            ))
+        })
+}
+
+enum NightlySpawnAttempt {
+    Rejected,
+    Spawned,
+    AtCap,
+}
+
+fn try_nightly_monster_at(
+    pos: NaturalSpawnPos,
+    etype: i64,
+    cap: usize,
+    light_sources: &GenSources,
+) -> NightlySpawnAttempt {
+    // Block edits and spawn insertion share the world-write guard.
+    with_save_guard(|| {
+        let NaturalSpawnPos { x, y, z } = pos;
+        if !has_room_for_nightly_monster(&mobs().lock().unwrap(), cap) {
+            return NightlySpawnAttempt::AtCap;
+        }
+        // These four types use Monster.checkMonsterSpawnRules. The tick has
+        // already checked difficulty, and the placement gate checked support.
+        if !nightly_spawn_placement_allows(x, y, z)
+            || !nightly_spawn_is_dark(x, y, z, light_sources)
+        {
+            return NightlySpawnAttempt::Rejected;
+        }
+        let (x, y, z) = (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5);
+        let (width, height) = mob_dimensions(etype);
+        let bounds = EntityAabb::from_dimensions(x, y, z, width, height);
+        if aabb_collides_blocks(bounds.min(), bounds.max()) {
+            return NightlySpawnAttempt::Rejected;
+        }
+        // Vanilla moves the new mob into place and rolls yaw before instance
+        // checks. Mob.checkSpawnRules is true for these four types.
+        let yaw = nightly_spawn_float() * 360.0;
+        if nightly_spawn_obstructed(bounds) {
+            return NightlySpawnAttempt::Rejected;
+        }
+        let mut current_mobs = mobs().lock().unwrap();
+        if !has_room_for_nightly_monster(&current_mobs, cap) {
+            return NightlySpawnAttempt::AtCap;
+        }
+        if current_mobs.iter().any(|mob| {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            let (width, height) = entity_dimensions_1211(mob.etype);
+            bounds.intersects(EntityAabb::from_dimensions(x, y, z, width, height))
+        }) {
+            return NightlySpawnAttempt::Rejected;
+        }
+        let mut uuid = [0; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut uuid))
+            .expect("entity UUID entropy");
+        uuid[6] = (uuid[6] & 15) | 64;
+        uuid[8] = (uuid[8] & 63) | 128;
+        current_mobs.push(Arc::new(Mob {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            uuid,
+            etype,
+            pos: Mutex::new((x, y, z, yaw, 0.0)),
+            hp: Mutex::new(20.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
+            fuse: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+        }));
+        if !has_room_for_nightly_monster(&current_mobs, cap) {
+            return NightlySpawnAttempt::AtCap;
+        }
+        NightlySpawnAttempt::Spawned
+    })
+}
+
 fn spawn_nightly_hostile(tick: u64) {
     let clients = client_snapshot();
     let players: Vec<_> = clients
@@ -693,52 +852,98 @@ fn spawn_nightly_hostile(tick: u64) {
     let angle = tick as f64 * 2.399;
     let bx = (px + angle.cos() * 32.0).floor() as i32;
     let bz = (pz + angle.sin() * 32.0).floor() as i32;
-    let (x, y, z) = (f64::from(bx) + 0.5, surface_y(bx, bz), f64::from(bz) + 0.5);
-    let nearest_squared = players
-        .iter()
-        .map(|&(px, py, pz)| (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2))
-        .fold(f64::INFINITY, f64::min);
-    if !can_spawn_at_distance(nearest_squared, MobCategory::Monster) {
+    let by = surface_y(bx, bz).floor() as i32;
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    if by <= MIN_Y || reg.is_redstone_conductor(block_at(bx, by, bz)) {
         return;
     }
+    let origin = NaturalSpawnPos {
+        x: bx,
+        y: by,
+        z: bz,
+    };
+    let (sx, sy, sz) = *WORLD_SPAWN.lock().unwrap();
+    let spawn_point_sq = |x: f64, y: f64, z: f64| {
+        (sx.floor() + 0.5 - x).powi(2)
+            + (sy.floor() + 0.5 - y).powi(2)
+            + (sz.floor() + 0.5 - z).powi(2)
+    };
+    let mut sources = HashMap::new();
+    let mut spawned = 0;
+    for _ in 0..3 {
+        let mut pack = SpawnPack::new(origin, nightly_spawn_float());
+        let mut selected = None;
+        while let Some(pos) = pack.next_pos(|bound| world_rng::next_below(bound as u32) as i32) {
+            let (x, y, z) = (
+                f64::from(pos.x) + 0.5,
+                f64::from(pos.y),
+                f64::from(pos.z) + 0.5,
+            );
+            let nearest_squared = players
+                .iter()
+                .map(|&(px, py, pz)| (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2))
+                .fold(f64::INFINITY, f64::min);
+            let chunk = (pos.x >> 4, pos.z >> 4);
+            if nearest_squared <= SPAWN_MIN_PLAYER_DIST_SQ
+                || spawn_point_sq(x, y, z) < SPAWN_MIN_PLAYER_DIST_SQ
+                || !spawn_chunks.contains(&chunk)
+            {
+                continue;
+            }
 
-    let by = y.floor() as i32;
-    let biome = worldgen::biome_name_at_block(bx, by, bz);
-    let etype = spawn_etype_for_biome(biome.as_deref(), attempt);
-    // Streaming can generate chunks while it holds the client cache lock.
-    let light_sources = nightly_spawn_light_sources(&clients, bx >> 4, bz >> 4);
-    // Block edits and spawn insertion share the world-write guard.
-    with_save_guard(|| {
-        // Creeper, skeleton, spider and zombie all use Monster.checkMonsterSpawnRules.
-        if !nightly_spawn_placement_allows(bx, by, bz)
-            || !nightly_spawn_is_dark(bx, by, bz, &light_sources)
-        {
-            return;
+            let entries = nightly_monster_spawners(pos);
+            let entry = match selected {
+                Some(entry) => entry,
+                None => {
+                    let Some(entry) = choose_nightly_spawner(entries) else {
+                        break;
+                    };
+                    if entry.min_count < 1 || entry.max_count < entry.min_count {
+                        break;
+                    }
+                    let span = (entry.max_count - entry.min_count + 1) as u32;
+                    pack.attempts = entry.min_count + world_rng::next_below(span) as i32;
+                    selected = Some(entry);
+                    entry
+                }
+            };
+            let (min_x, min_z, max_x, max_z) =
+                world_border().lock().unwrap().bounds(border_now_ms());
+            // Vanilla tests membership of the selected SpawnerData object in
+            // the current position's list, including after crossing a biome edge.
+            if !(min_x..max_x).contains(&f64::from(pos.x))
+                || !(min_z..max_z).contains(&f64::from(pos.z))
+                || !can_spawn_at_distance(nearest_squared, MobCategory::Monster)
+                || !matches!(
+                    entry.kind.as_str(),
+                    "minecraft:creeper"
+                        | "minecraft:skeleton"
+                        | "minecraft:spider"
+                        | "minecraft:zombie"
+                )
+                || !entries.iter().any(|current| std::ptr::eq(current, entry))
+            {
+                continue;
+            }
+            let etype = name_to_etype(&entry.kind).expect("registered nightly monster");
+            // Streaming can generate chunks while holding the client cache
+            // lock. Copy the light sources before taking the world-write guard.
+            let light_sources = sources
+                .entry(chunk)
+                .or_insert_with(|| nightly_spawn_light_sources(&clients, chunk.0, chunk.1));
+            match try_nightly_monster_at(pos, etype, cap, light_sources) {
+                NightlySpawnAttempt::Rejected => continue,
+                NightlySpawnAttempt::AtCap => return,
+                NightlySpawnAttempt::Spawned => spawned += 1,
+            }
+            // getMaxSpawnClusterSize counts successes across all three packs.
+            if spawned >= NIGHTLY_MONSTER_CLUSTER_LIMIT {
+                return;
+            }
         }
-        let (width, height) = mob_dimensions(etype);
-        let bounds = EntityAabb::from_dimensions(x, y, z, width, height);
-        if aabb_collides_blocks(bounds.min(), bounds.max()) {
-            return;
-        }
-        let mut current_mobs = mobs().lock().unwrap();
-        // A concurrent writer can fill a slot while terrain and biome are read.
-        if has_room_for_nightly_monster(&current_mobs, cap) {
-            current_mobs.push(Arc::new(Mob {
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                uuid: [0u8; 16],
-                etype,
-                pos: Mutex::new((x, y, z, 0.0, 0.0)),
-                hp: Mutex::new(20.0),
-                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                last_hurt_tick: Mutex::new(None),
-                vel: Mutex::new([0.0; 3]),
-                fuse: Mutex::new(0),
-                love: Mutex::new(0),
-                air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
-            }));
-        }
-    });
+    }
 }
 
 #[cfg(test)]
