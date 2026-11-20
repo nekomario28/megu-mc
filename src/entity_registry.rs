@@ -1,7 +1,7 @@
 // Protocol 767, Minecraft Java 1.21.1. Values are extracted from the vanilla
 // server EntityType registration and DefaultAttributes, including EntityDimensions
 // eye heights, tracking ranges, update intervals, and fire immunity.
-// Rows follow the protocol order in `name_to_etype` exactly.
+// Rows are indexed by protocol ID.
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -222,7 +222,6 @@ pub(crate) fn entity_spec_by_id(id: i64) -> Option<&'static EntitySpec> {
     ENTITY_REGISTRY_1211.get(usize::try_from(id).ok()?)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn entity_spec_by_name(name: &str) -> Option<&'static EntitySpec> {
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
     ENTITY_REGISTRY_1211
@@ -405,8 +404,15 @@ mod entity_registry_tests {
             assert_eq!(entity_category_1211(invalid), EntityMobCategory::Misc);
             assert!(!entity_is_fire_immune_1211(invalid));
         }
-        for name in ["minecraft:not_an_entity", "", "unknown", "other:zombie"] {
+        for name in [
+            "minecraft:not_an_entity",
+            "",
+            "unknown",
+            "other:zombie",
+            "minecraft:minecraft:zombie",
+        ] {
             assert!(entity_spec_by_name(name).is_none());
+            assert!(super::name_to_etype(name).is_none());
         }
         for name in [
             "armor_stand", "bat", "marker", "interaction", "block_display",
