@@ -208,14 +208,19 @@ impl MerchantOffer {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn cost_a(&self) -> i32 {
-        let demand_diff = ((self.base_cost_a_count as f32)
-            * (self.demand as f32)
-            * self.price_multiplier)
-            .floor() as i32;
-        let total = i64::from(self.base_cost_a_count)
-            + i64::from(demand_diff.max(0))
-            + i64::from(self.special_price_diff);
-        total.clamp(1, 64) as i32
+        let demand_product = self.base_cost_a_count.wrapping_mul(self.demand);
+        let scaled = demand_product as f32 * self.price_multiplier;
+        let truncated = scaled as i32;
+        // Mth.floor casts to a Java int before its corrective decrement.
+        let demand_diff = if scaled < truncated as f32 {
+            truncated.wrapping_sub(1)
+        } else {
+            truncated
+        };
+        self.base_cost_a_count
+            .wrapping_add(demand_diff.max(0))
+            .wrapping_add(self.special_price_diff)
+            .clamp(1, 64)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1050,6 +1055,27 @@ mod villager_raid_tests {
         villager.tick(&pois, AT_WORK, 4_000);
         assert_eq!(villager.offers[0].demand, 7);
         assert_eq!(villager.restocks_today, 1);
+    }
+
+    #[test]
+    fn persisted_large_demand_uses_wrapping_java_int_product() {
+        let offer = MerchantOffer {
+            base_cost_a_count: 4,
+            demand: 1 << 30,
+            price_multiplier: 0.05,
+            special_price_diff: 0,
+            ..offer()
+        };
+        assert_eq!(offer.cost_a(), 4);
+        assert_eq!(
+            MerchantOffer {
+                demand: -(1 << 28),
+                price_multiplier: 4.0,
+                ..offer
+            }
+            .cost_a(),
+            1
+        );
     }
 
     #[test]
