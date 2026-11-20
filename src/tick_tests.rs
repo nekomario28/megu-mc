@@ -4825,14 +4825,103 @@ fn nightly_hostile_type_uses_the_pinned_biome_spawners() {
     assert_eq!(spawn_etype_for_biome(None, 1), 91);
 }
 
-// The world RNG rolls 15 for sky and 4 for raw brightness, so clear midnight passes.
-const CLEAR_MIDNIGHT_LIGHT_SEED: u64 = 4194;
+// The first pack steps to the origin and picks a creeper. Its sky roll is 30
+// and its brightness roll is 4, so an isolated platform passes at clear midnight.
+const CLEAR_MIDNIGHT_PACK_SEED: u64 = 1176;
+
+#[test]
+fn gp2_nightly_hostiles_spawn_packs_and_stop_at_the_cap() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+
+    let (client, _peer) = client_pair();
+    *client.pos.lock().unwrap() = (0.5, 100.0, 0.5, 0.0, 0.0, true);
+    clients().lock().unwrap().push(Arc::new(client));
+    let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
+    let angle = tick as f64 * 2.399;
+    let x = (0.5 + angle.cos() * 32.0).floor() as i32;
+    let z = (0.5 + angle.sin() * 32.0).floor() as i32;
+    let stone = crate::block_registry::breg()
+        .unwrap()
+        .state_of("minecraft:stone", None);
+    for dx in -10..=10 {
+        for dz in -10..=10 {
+            set_block(x + dx, 99, z + dz, stone);
+        }
+    }
+    GR_DAYLIGHT_CYCLE.store(0, Ordering::Relaxed);
+    GR_WEATHER_CYCLE.store(0, Ordering::Relaxed);
+    WORLD_TIME.store(18000, Ordering::Relaxed);
+
+    let creeper = name_to_etype("creeper").unwrap();
+    let zombie = name_to_etype("zombie").unwrap();
+    // Seed 41 picks creepers for the first pack and zombies for the second.
+    // Both walks start at (x, z). The first starts with three tries and
+    // extends to four once it selects the creeper entry.
+    let pack = [
+        (3, 0, creeper),
+        (-4, -1, creeper),
+        (0, 3, zombie),
+        (3, -2, zombie),
+    ];
+    let mut failures = Vec::new();
+    for (existing, expected, draws) in [(0, &pack[..], 55), (68, &pack[..2], 27)] {
+        world_rng::seed(41);
+        for _ in 0..draws {
+            world_rng::next_u64();
+        }
+        let expected_rng = world_rng::saved_state();
+        world_rng::seed(41);
+        *mobs().lock().unwrap() = (0..existing)
+            .map(|i| test_mob(20_000 + i as i32, zombie, (0.5, 100.0, 0.5), 20.0))
+            .collect();
+        SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
+        TICK.store(tick, Ordering::Relaxed);
+        keepalive_time_tick();
+
+        let mobs = mobs().lock().unwrap();
+        let new_mobs = &mobs[existing..];
+        let actual: Vec<_> = new_mobs
+            .iter()
+            .map(|mob| {
+                let (mx, my, mz, ..) = *mob.pos.lock().unwrap();
+                assert_eq!(my, 100.0);
+                assert_eq!(mx.fract(), 0.5);
+                assert_eq!(mz.fract(), 0.5);
+                (mx.floor() as i32 - x, mz.floor() as i32 - z, mob.etype)
+            })
+            .collect();
+        let unique_uuids = new_mobs.iter().map(|mob| mob.uuid).collect::<HashSet<_>>();
+        if actual != expected
+            || world_rng::saved_state() != expected_rng
+            || unique_uuids.len() != new_mobs.len()
+        {
+            failures.push(format!(
+                "{existing} existing monsters: expected {expected:?} and {draws} RNG draws, got {actual:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of 2 pack spawning cases passed: {failures:?}",
+        2 - failures.len(),
+    );
+}
 
 #[test]
 fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
     if crate::test_support::isolated_world_test() {
         return;
     }
+    let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
+    let angle = tick as f64 * 2.399;
+    let bx = (0.5 + angle.cos() * 32.0).floor() as i32;
+    let bz = (0.5 + angle.sin() * 32.0).floor() as i32;
+    let stone = crate::block_registry::breg()
+        .unwrap()
+        .state_of("minecraft:stone", None);
+    set_block(bx, 99, bz, stone);
     let player = |dim, spectator, (x, y, z)| {
         let (client, peer) = client_pair();
         *client.dim.lock().unwrap() = dim;
@@ -4843,9 +4932,9 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
     let attempt = |players: &[(Arc<Client>, TcpStream)]| {
         *clients().lock().unwrap() = players.iter().map(|(client, _)| client.clone()).collect();
         mobs().lock().unwrap().clear();
-        world_rng::seed(CLEAR_MIDNIGHT_LIGHT_SEED);
+        world_rng::seed(CLEAR_MIDNIGHT_PACK_SEED);
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
-        TICK.store(server_ticks(SPAWN_CYCLE_GT) / 2, Ordering::Relaxed);
+        TICK.store(tick, Ordering::Relaxed);
         WORLD_TIME.store(18000, Ordering::Relaxed);
         keepalive_time_tick();
         let spawned = mobs().lock().unwrap();
@@ -4855,14 +4944,17 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
             (x, y, z)
         })
     };
-    let origin = (0.0, surface_y(0, 0), 0.0);
+    let origin = (0.5, 100.0, 0.5);
     let overworld = || player(DimId::Overworld, false, origin);
     let pos = attempt(&[overworld()]).expect("one eligible player should get a hostile");
     let distance = (pos.0 - origin.0)
         .hypot(pos.1 - origin.1)
         .hypot(pos.2 - origin.2);
     let scenarios = [
-        ("night spawn is in the player distance band", distance > 24.0 && distance <= 128.0),
+        (
+            "night spawn is in the player distance band",
+            distance > 24.0 && distance <= 128.0,
+        ),
         (
             "nearby Overworld player blocks the spawn",
             attempt(&[overworld(), player(DimId::Overworld, false, pos)]).is_none(),
@@ -4885,7 +4977,12 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
         ),
         (
             "a player too far above the surface cannot anchor the spawn",
-            attempt(&[player(DimId::Overworld, false, (0.0, origin.1 + 140.0, 0.0))]).is_none(),
+            attempt(&[player(
+                DimId::Overworld,
+                false,
+                (0.0, origin.1 + 140.0, 0.0),
+            )])
+            .is_none(),
         ),
     ];
     let failures: Vec<_> = scenarios
@@ -4904,6 +5001,30 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
     let high_anchor = player(DimId::Overworld, false, (origin.0, origin.1 + 140.0, origin.2));
     let at_128 = player(DimId::Overworld, false, (pos.0, pos.1 + 128.0, pos.2));
     assert_eq!(attempt(&[high_anchor, at_128]), Some(pos), "128 blocks is in range");
+    let default_spawn = *WORLD_SPAWN.lock().unwrap();
+    *WORLD_SPAWN.lock().unwrap() = pos;
+    assert!(
+        attempt(&[overworld()]).is_none(),
+        "world spawn excludes the site"
+    );
+    *WORLD_SPAWN.lock().unwrap() = default_spawn;
+
+    // The candidate block is excluded at the maximum edge and included at the minimum.
+    let size = f64::from(bz) * 2.0;
+    world_border()
+        .lock()
+        .unwrap()
+        .lerp_to(size, border_now_ms(), 0);
+    assert!(
+        attempt(&[overworld()]).is_none(),
+        "maximum border edge excludes the site"
+    );
+    world_border().lock().unwrap().center_z = size;
+    assert_eq!(
+        attempt(&[overworld()]),
+        Some(pos),
+        "minimum border edge includes the site"
+    );
 }
 
 #[test]
@@ -4912,7 +5033,15 @@ fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
         return;
     }
 
-    let y = surface_y(0, 0);
+    let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
+    let angle = tick as f64 * 2.399;
+    let x = (0.5 + angle.cos() * 32.0).floor() as i32;
+    let z = (0.5 + angle.sin() * 32.0).floor() as i32;
+    let stone = crate::block_registry::breg()
+        .unwrap()
+        .state_of("minecraft:stone", None);
+    set_block(x, 99, z, stone);
+    let y = 100.0;
     let host = (DimId::Overworld, false, 0.5);
     let solo = [host];
     let same_chunk = [host, (DimId::Overworld, false, 1.5)];
@@ -4955,9 +5084,9 @@ fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
         *mobs().lock().unwrap() = (0..existing)
             .map(|i| test_mob(20_000 + i as i32, kind, (0.5, y, 0.5), 20.0))
             .collect();
-        world_rng::seed(CLEAR_MIDNIGHT_LIGHT_SEED);
+        world_rng::seed(CLEAR_MIDNIGHT_PACK_SEED);
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
-        TICK.store(server_ticks(SPAWN_CYCLE_GT) / 2, Ordering::Relaxed);
+        TICK.store(tick, Ordering::Relaxed);
         WORLD_TIME.store(18000, Ordering::Relaxed);
         keepalive_time_tick();
 
@@ -5001,19 +5130,63 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
     // The fallback surface scan starts at 100. A platform at 99 pins the
     // candidate while the body and neighboring cells change.
     let platform = [(0, 99, stone), (0, 100, 0), (0, 101, 0), (1, 100, 0)];
-    let cases: [(&str, u64, &[(i32, i32, u32)], Option<i64>); 9] = [
-        ("clear stone supports a creeper", 0, &[], Some(creeper)),
-        ("clear stone supports a spider", 2, &[], Some(spider)),
-        ("blocked feet", 0, &[(0, 100, stone)], None),
-        ("blocked head above a short spider", 2, &[(0, 101, stone)], None),
-        ("water at feet", 0, &[(0, 100, water)], None),
-        ("one-layer snow support", 0, &[(0, 99, snow)], None),
-        ("rail in the spawn cell", 0, &[(0, 100, rail)], None),
-        ("neighbor blocks a spider", 2, &[(1, 100, stone)], None),
-        ("neighbor leaves room for a creeper", 0, &[(1, 100, stone)], Some(creeper)),
+    let creeper_seed = CLEAR_MIDNIGHT_PACK_SEED;
+    // The spider seed also steps straight to the isolated supported column.
+    let spider_seed = 1629;
+    let cases: [(&str, u64, &[(i32, i32, u32)], Option<i64>); 10] = [
+        (
+            "clear stone supports a creeper",
+            creeper_seed,
+            &[],
+            Some(creeper),
+        ),
+        (
+            "clear stone supports a spider",
+            spider_seed,
+            &[],
+            Some(spider),
+        ),
+        ("blocked feet", creeper_seed, &[(0, 100, stone)], None),
+        (
+            "blocked head above a short spider",
+            spider_seed,
+            &[(0, 101, stone)],
+            None,
+        ),
+        ("water at feet", creeper_seed, &[(0, 100, water)], None),
+        (
+            "one-layer snow support",
+            creeper_seed,
+            &[(0, 99, snow)],
+            None,
+        ),
+        (
+            "rail in the spawn cell",
+            creeper_seed,
+            &[(0, 100, rail)],
+            None,
+        ),
+        (
+            "neighbor blocks a spider",
+            spider_seed,
+            &[(1, 100, stone)],
+            None,
+        ),
+        (
+            "neighbor fluid obstructs a spider",
+            spider_seed,
+            &[(1, 100, water)],
+            None,
+        ),
+        (
+            "neighbor leaves room for a creeper",
+            creeper_seed,
+            &[(1, 100, stone)],
+            Some(creeper),
+        ),
     ];
     let mut failures = Vec::new();
-    for (name, attempt, changes, expected) in cases {
+    for (name, seed, changes, expected) in cases {
         {
             let mut world = world().lock().unwrap();
             for (dx, y, state) in platform.into_iter().chain(changes.iter().copied()) {
@@ -5026,8 +5199,8 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
         }
         assert_eq!(surface_y(x, z), 100.0);
         mobs().lock().unwrap().clear();
-        world_rng::seed(CLEAR_MIDNIGHT_LIGHT_SEED);
-        SPAWN_ATTEMPT.store(attempt, Ordering::Relaxed);
+        world_rng::seed(seed);
+        SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
         WORLD_TIME.store(18000, Ordering::Relaxed);
         keepalive_time_tick();
@@ -5037,11 +5210,28 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
             failures.push(format!("{name}: expected {expected:?}, got {actual:?}"));
         }
     }
+    *mobs().lock().unwrap() = vec![test_mob(
+        20_000,
+        creeper,
+        (f64::from(x) + 0.5, 100.0, f64::from(z) + 0.5),
+        20.0,
+    )];
+    world_rng::seed(creeper_seed);
+    SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
+    TICK.store(tick, Ordering::Relaxed);
+    WORLD_TIME.store(18000, Ordering::Relaxed);
+    keepalive_time_tick();
+    let mob_count = mobs().lock().unwrap().len();
+    if mob_count != 1 {
+        failures.push(format!(
+            "occupied site: expected one existing mob, got {mob_count}"
+        ));
+    }
     assert!(
         failures.is_empty(),
         "{} of {} nightly placement cases failed: {failures:?}",
         failures.len(),
-        cases.len(),
+        cases.len() + 1,
     );
 }
 
@@ -5072,15 +5262,17 @@ fn gp2_nightly_hostiles_respect_spawn_light() {
 
     // Clear midnight leaves raw sky brightness 4. Thunder uses a sky subtraction of 10,
     // leaving 5. The dim emitter's level 1 would pass the combined brightness check.
-    // Seeds pin the sky roll first and the raw-brightness roll second.
-    let cutoff_seed = CLEAR_MIDNIGHT_LIGHT_SEED;
+    // The chosen seeds try this single supported column once. For these
+    // streams all three packs select an entry and walk four steps, accounting
+    // for 57 draws before counting sky, brightness and yaw at the platform.
+    let cutoff_seed = CLEAR_MIDNIGHT_PACK_SEED;
     let cases = [
-        ("clear midnight", cutoff_seed, false, 0, true, 2),
-        ("block light of one", cutoff_seed, false, 1, false, 1),
-        ("sky roll of 14", 263, false, 0, false, 1),
-        ("brightness roll of 3", 268, false, 0, false, 2),
-        ("thunder with a roll of 4", cutoff_seed, true, 0, false, 2),
-        ("thunder with a roll of 5", 257, true, 0, true, 2),
+        ("clear midnight", cutoff_seed, false, 0, true, 60),
+        ("block light of one", cutoff_seed, false, 1, false, 58),
+        ("sky roll of 14", 709, false, 0, false, 58),
+        ("brightness roll of 3", 18, false, 0, false, 59),
+        ("thunder with a roll of 4", cutoff_seed, true, 0, false, 59),
+        ("thunder with a roll of 5", 434, true, 0, true, 60),
     ];
     let mut failures = Vec::new();
     let mut rng_failures = Vec::new();
