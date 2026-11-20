@@ -548,6 +548,30 @@ fn has_room_for_nightly_monster(mobs: &[Arc<Mob>], monster_cap: usize) -> bool {
             < monster_cap
 }
 
+fn nightly_spawn_fits(etype: i64, x: f64, y: f64, z: f64) -> bool {
+    let Some(reg) = crate::block_registry::breg() else {
+        return false;
+    };
+    let (bx, by, bz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+    let clear = |state| {
+        !reg.is_collision_shape_full_block(state)
+            && !reg.is_liquid(state)
+            && !reg.in_tag(state, "minecraft:prevent_mob_spawning_inside")
+    };
+    let site = SpawnPlacementContext {
+        ground_supports_spawn: reg.side_solid(block_at(bx, by - 1, bz), 1),
+        clear_here: clear(block_at(bx, by, bz)),
+        clear_above: clear(block_at(bx, by + 1, bz)),
+        ..SpawnPlacementContext::default()
+    };
+    if !SpawnPlacementType::OnGround.allows(site) {
+        return false;
+    }
+    let (width, height) = mob_dimensions(etype);
+    let bounds = EntityAabb::from_dimensions(x, y, z, width, height);
+    !aabb_collides_blocks(bounds.min(), bounds.max())
+}
+
 fn spawn_nightly_hostile(tick: u64) {
     let players: Vec<_> = client_snapshot()
         .into_iter()
@@ -597,24 +621,30 @@ fn spawn_nightly_hostile(tick: u64) {
 
     let biome = worldgen::biome_name_at_block(bx, y.floor() as i32, bz);
     let etype = spawn_etype_for_biome(biome.as_deref(), attempt);
-    let mut current_mobs = mobs().lock().unwrap();
-    // A concurrent writer can fill a slot while terrain and biome are read.
-    if has_room_for_nightly_monster(&current_mobs, cap) {
-        current_mobs.push(Arc::new(Mob {
-            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            uuid: [0u8; 16],
-            etype,
-            pos: Mutex::new((x, y, z, 0.0, 0.0)),
-            hp: Mutex::new(20.0),
-            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
-            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-            last_hurt_tick: Mutex::new(None),
-            vel: Mutex::new([0.0; 3]),
-            fuse: Mutex::new(0),
-            love: Mutex::new(0),
-            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
-        }));
-    }
+    // Block edits and spawn insertion share the world-write guard.
+    with_save_guard(|| {
+        if !nightly_spawn_fits(etype, x, y, z) {
+            return;
+        }
+        let mut current_mobs = mobs().lock().unwrap();
+        // A concurrent writer can fill a slot while terrain and biome are read.
+        if has_room_for_nightly_monster(&current_mobs, cap) {
+            current_mobs.push(Arc::new(Mob {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                uuid: [0u8; 16],
+                etype,
+                pos: Mutex::new((x, y, z, 0.0, 0.0)),
+                hp: Mutex::new(20.0),
+                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                last_hurt_tick: Mutex::new(None),
+                vel: Mutex::new([0.0; 3]),
+                fuse: Mutex::new(0),
+                love: Mutex::new(0),
+                air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            }));
+        }
+    });
 }
 
 #[cfg(test)]

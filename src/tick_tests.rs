@@ -4970,6 +4970,75 @@ fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
     );
 }
 
+#[test]
+fn gp2_nightly_placement_respects_support_and_entity_collision() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let water = reg.state_of("minecraft:water", None);
+    let snow = reg.with_prop(reg.state_of("minecraft:snow", None), "layers", "1");
+    let rail = reg.state_of("minecraft:rail", None);
+    assert!(reg.in_tag(rail, "minecraft:prevent_mob_spawning_inside"));
+    let creeper = name_to_etype("creeper").unwrap();
+    let spider = name_to_etype("spider").unwrap();
+
+    let (client, _peer) = client_pair();
+    *client.pos.lock().unwrap() = (0.5, 70.0, 0.5, 0.0, 0.0, true);
+    clients().lock().unwrap().push(Arc::new(client));
+    let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
+    let angle = tick as f64 * 2.399;
+    let x = (0.5 + angle.cos() * 32.0).floor() as i32;
+    let z = (0.5 + angle.sin() * 32.0).floor() as i32;
+
+    // The fallback surface scan starts at 100. A platform at 99 pins the
+    // candidate while the body and neighboring cells change.
+    let platform = [(0, 99, stone), (0, 100, 0), (0, 101, 0), (1, 100, 0)];
+    let cases: [(&str, u64, &[(i32, i32, u32)], Option<i64>); 9] = [
+        ("clear stone supports a creeper", 0, &[], Some(creeper)),
+        ("clear stone supports a spider", 2, &[], Some(spider)),
+        ("blocked feet", 0, &[(0, 100, stone)], None),
+        ("blocked head above a short spider", 2, &[(0, 101, stone)], None),
+        ("water at feet", 0, &[(0, 100, water)], None),
+        ("one-layer snow support", 0, &[(0, 99, snow)], None),
+        ("rail in the spawn cell", 0, &[(0, 100, rail)], None),
+        ("neighbor blocks a spider", 2, &[(1, 100, stone)], None),
+        ("neighbor leaves room for a creeper", 0, &[(1, 100, stone)], Some(creeper)),
+    ];
+    let mut failures = Vec::new();
+    for (name, attempt, changes, expected) in cases {
+        {
+            let mut world = world().lock().unwrap();
+            for (dx, y, state) in platform.into_iter().chain(changes.iter().copied()) {
+                let bx = x + dx;
+                world
+                    .entry((DimId::Overworld, bx >> 4, z >> 4))
+                    .or_default()
+                    .insert(local_idx(bx, y, z), state);
+            }
+        }
+        assert_eq!(surface_y(x, z), 100.0);
+        mobs().lock().unwrap().clear();
+        SPAWN_ATTEMPT.store(attempt, Ordering::Relaxed);
+        TICK.store(tick, Ordering::Relaxed);
+        WORLD_TIME.store(13000, Ordering::Relaxed);
+        keepalive_time_tick();
+
+        let actual: Vec<_> = mobs().lock().unwrap().iter().map(|mob| mob.etype).collect();
+        if actual.as_slice() != expected.as_slice() {
+            failures.push(format!("{name}: expected {expected:?}, got {actual:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} nightly placement cases failed: {failures:?}",
+        failures.len(),
+        cases.len(),
+    );
+}
+
 /// A deterministic yardstick for the chunk delivery path, with no socket in the loop.
 ///
 /// The end-to-end numbers on this host swing by 2-3x between runs (other lanes), and the
