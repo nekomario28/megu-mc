@@ -23135,6 +23135,12 @@ fn open_chest_for_client(
         write_open_chest_packets(&mut w, window.1.is_some(), &initial, inv, title);
     }
 }
+fn armor_removal_blocked(slot: i16, stack: Option<&Stack>, creative: bool) -> bool {
+    !creative
+        && (5..=8).contains(&slot)
+        && stack.is_some_and(|stack| stack.1 > 0 && enchant_level(&stack.2, 2) > 0)
+}
+
 // which armor slot (5=helm..8=boots) an item equips into, or -1
 fn armor_slot_for(it: i64) -> i16 {
     let n = |x: &str| name_to_item(x).unwrap_or(-1);
@@ -32714,6 +32720,16 @@ fn handle(mut s: TcpStream) {
                         if wid != active {
                             continue;
                         }
+                        let creative = *me.gm.lock().unwrap() == 1;
+                        if wid == 0 && (5..=8).contains(&slot) && matches!(mode, 0 | 1 | 4) {
+                            let stack = me.inv.lock().unwrap().get(&slot).cloned();
+                            if armor_removal_blocked(slot, stack.as_ref(), creative) {
+                                resync_slot(&me, 0, slot, &stack.unwrap());
+                                let cursor = me.cursor.lock().unwrap().clone();
+                                resync_slot(&me, 0, -1, &cursor);
+                                continue;
+                            }
+                        }
                         if mode == 0 {
                             let chest_pos = *me.open_chest.lock().unwrap();
                             if let Some((cp, cp2)) = chest_pos {
@@ -33390,7 +33406,11 @@ fn handle(mut s: TcpStream) {
                                 if (cur.1 as i64) < cap {
                                     let ks: Vec<i16> = inv
                                         .iter()
-                                        .filter(|(_, v)| v.0 == cur.0 && v.2 == cur.2)
+                                        .filter(|(&slot, stack)| {
+                                            stack.0 == cur.0
+                                                && stack.2 == cur.2
+                                                && !armor_removal_blocked(slot, Some(stack), creative)
+                                        })
                                         .map(|(&k, _)| k)
                                         .collect();
                                     for k in ks {
@@ -34136,7 +34156,13 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             // vanilla: right-click equips armor into its slot (swaps)
             drop(inv);
             let hs = 36 + held_slot;
+            let creative = *me.gm.lock().unwrap() == 1;
             let mut inv2 = me.inv.lock().unwrap();
+            if armor_removal_blocked(asl, inv2.get(&asl), creative) {
+                drop(inv2);
+                held_slot_resync(me);
+                return;
+            }
             if let Some(st) = inv2.get(&hs).cloned() {
                 let cur = inv2.get(&asl).cloned().unwrap_or((0, 0, Vec::new()));
                 inv2.insert(asl, (st.0, 1, st.2.clone()));
