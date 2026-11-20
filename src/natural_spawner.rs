@@ -442,7 +442,8 @@ pub(crate) trait SpawnWorld {
     ) -> bool;
 }
 
-/// Up to three groups of four, jittered on the same Y slice by nextInt(6)-nextInt(6).
+/// Up to three groups, with biome-selected attempt counts, jittered on the same Y slice
+/// by nextInt(6)-nextInt(6).
 /// Rechecks the global cap for each insertion so a pack cannot overshoot it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_spawn_mob_group(
@@ -489,7 +490,7 @@ pub(crate) fn try_spawn_mob_group(
                     break;
                 }
                 let span = i32::from(candidate.max_group_size - candidate.min_group_size) + 1;
-                attempts = (i32::from(candidate.min_group_size) + rng.next_bound(span)).min(4);
+                attempts = i32::from(candidate.min_group_size) + rng.next_bound(span);
                 selected = Some(candidate);
             }
             let candidate = selected.as_ref().expect("candidate selected above");
@@ -848,6 +849,7 @@ mod natural_spawner_tests {
         rules_ok: bool,
         spawnable: bool,
         excluded: bool,
+        candidate_choices: usize,
         inserted: Vec<NaturalSpawnPos>,
     }
 
@@ -871,6 +873,7 @@ mod natural_spawner_tests {
                 rules_ok: true,
                 spawnable: true,
                 excluded: false,
+                candidate_choices: 0,
                 inserted: Vec::new(),
             }
         }
@@ -898,6 +901,7 @@ mod natural_spawner_tests {
             _: NaturalSpawnPos,
             _: &mut Lcg,
         ) -> Option<NaturalSpawnCandidate> {
+            self.candidate_choices += 1;
             Some(self.candidate.clone())
         }
         fn placement_context(&self, _: NaturalSpawnPos) -> SpawnPlacementContext {
@@ -918,6 +922,28 @@ mod natural_spawner_tests {
             }
             self.inserted_ok
         }
+    }
+
+    #[test]
+    fn pack_uses_five_attempts_for_soul_sand_valley_skeleton() {
+        let mut world = MockWorld::new();
+        world.candidate.min_group_size = 5;
+        world.candidate.max_group_size = 5;
+        world.candidate.max_cluster_size = 5;
+        let mut state = NaturalSpawnState::new(289, false);
+
+        let spawned = try_spawn_mob_group(
+            &mut world,
+            &mut state,
+            MobCategory::Monster,
+            pos(0, 65, 0),
+            &mut Lcg::new(17),
+        );
+
+        assert_eq!(spawned, 5);
+        assert_eq!(world.inserted.len(), 5);
+        assert_eq!(state.count(MobCategory::Monster), 5);
+        assert_eq!(world.candidate_choices, 1, "all five must spawn in the first group");
     }
 
     #[test]
