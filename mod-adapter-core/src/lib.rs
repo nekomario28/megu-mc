@@ -79,6 +79,10 @@
 //!   item-conservation invariant, and a
 //!   [`world_extensions::BiomeRegionBlender`] TerraBlender-style weighted
 //!   Voronoi multi-region biome composer.
+//! - [`mine_cut_all`]: strictly opt-in MineAll/CutAll planner — deterministic
+//!   26-neighbor 3D BFS over ore veins and log/tree trunks with data-driven
+//!   block/item tags, claim protection, exact exhaustion, and a durability
+//!   budget that preserves the tool's last point by default.
 //! - [`bytecode_subset_vm`]: pure-`std` bounded `.class` bytecode subset
 //!   evaluator — zero-JVM execution of safe mod event/logic methods with
 //!   a fail-closed static verifier (opcode allowlist, instruction-boundary
@@ -114,6 +118,7 @@ pub mod dimension_mod;
 pub mod ecosystem_compat;
 pub mod fallback;
 pub mod mixin_lifter;
+pub mod mine_cut_all;
 pub mod modpack;
 pub mod mod_sync;
 pub mod neoforge_wire;
