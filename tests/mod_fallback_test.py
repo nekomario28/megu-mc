@@ -54,6 +54,7 @@ Path(sys.argv[1]).write_text(json.dumps({
     "needs_bounded_jvm": os.environ.get("MC_SPINE_NEEDS_BOUNDED_JVM"),
     "quarantined": os.environ.get("MC_SPINE_QUARANTINED_MODS"),
     "tier3": os.environ.get("MC_SPINE_TIER3_MODS"),
+    "superseded": os.environ.get("MC_SPINE_SUPERSEDED_PERF_MODS"),
 }), encoding="utf-8")
 sys.exit(int(sys.argv[2]) if len(sys.argv) > 2 else 0)
 '''
@@ -237,6 +238,57 @@ class ClassifierUnitTests(unittest.TestCase):
         self.assertEqual(tier, 1)
         self.assertEqual(reasons,
                          ["handled by zero-JVM universal adapter / offload profile"])
+
+    def test_builtin_perf_mods_are_superseded_never_fallback(self):
+        """Modpack [create, aether_datapack, sodium, lithium, modernfix]: the
+        three mixin-heavy perf mods are BuiltInSuperseded under every policy
+        and the pack launches 100% pure native with zero Tier 3."""
+        heavy = lambda mod_id: _fake_mod(
+            mod_id, shimcheck_compatible=False,
+            has_unsupported_mixin_or_at=True,
+            reasons=["UNSUPPORTED_MIXIN_INJECTION"])
+        mods = [
+            heavy("create"),
+            _fake_mod("aether_datapack", has_java_bytecode=False),
+            heavy("sodium"),
+            heavy("lithium"),
+            heavy("modernfix"),
+        ]
+        for policy in ("strict", "quarantine", "delegate"):
+            plan = self.plan(mods, flagship=["create"], policy=policy)
+            self.assertEqual(plan["plan"], "RunNative", policy)
+            self.assertFalse(plan["needs_bounded_jvm"], policy)
+            self.assertEqual(plan["superseded_perf_mods"],
+                             ["lithium", "modernfix", "sodium"], policy)
+            tiers = {a.mod_id: a.tier for a in plan["assignments"]}
+            self.assertEqual(tiers, {
+                "create": 0,
+                "aether_datapack": 1,
+                "sodium": mod_launcher.TIER_SUPERSEDED,
+                "lithium": mod_launcher.TIER_SUPERSEDED,
+                "modernfix": mod_launcher.TIER_SUPERSEDED,
+            }, policy)
+            for a in plan["assignments"]:
+                if a.tier == mod_launcher.TIER_SUPERSEDED:
+                    self.assertEqual(
+                        a.reasons,
+                        ["already covered by mc-spine built-in optimizations"])
+
+    def test_superseded_match_is_case_insensitive_multi_id(self):
+        # Any declared id (Fabric or NeoForge) hits the catalog, whatever case.
+        mod = _fake_mod("perfpack", mod_ids=["perfpack", "EmbeDDium_Extra"])
+        tier, reasons = mod_launcher.classify(mod, set(), set())
+        self.assertEqual(tier, mod_launcher.TIER_SUPERSEDED)
+        self.assertTrue(mod_launcher.is_builtin_superseded(mod))
+        self.assertFalse(
+            mod_launcher.is_builtin_superseded(_fake_mod("create")))
+        # Required catalog coverage (mirrors fallback.rs 1:1).
+        for mod_id in ("sodium", "embeddium", "immediatelyfast", "entityculling",
+                       "moreculling", "distanthorizons", "voxy", "krypton",
+                       "lazydfu", "memoryleakfix", "alternate-current", "clumps",
+                       "lithium", "starlight", "ferritecore", "modernfix",
+                       "noisium", "c2me"):
+            self.assertIn(mod_id, mod_launcher.BUILTIN_SUPERSEDED_PERF_MODS)
 
 
 class LauncherIntegrationTests(unittest.TestCase):
@@ -617,6 +669,114 @@ class LauncherIntegrationTests(unittest.TestCase):
                          ["deepdim:echoing_void_gen"])
         self.assertFalse(mc_marker.exists(), "mc-spine ran during delegation")
         self.assertTrue(neo_marker.is_file(), "NeoForge fallback never ran")
+
+    def test_builtin_perf_modpack_launches_pure_native_zero_fallback(self):
+        """Real modpack shape: content mods + sodium/lithium/modernfix whose
+        ShimCheck-visible Mixins must be superseded — never Tier 3.
+
+        Every policy launches pure native mc-spine; the NeoForge fallback
+        command is never executed and the operator line names the 3 skipped
+        mods.
+        """
+        create = self.mods / "create.jar"
+        _jar(create, "create")
+        aether = self.mods / "aether_datapack.zip"
+        _data_zip(aether, [("data/aether/dimension/the_aether.json", "{}"),
+                           ("pack.mcmeta", '{"pack":{"pack_format":48}}')])
+        for mod_id in ("sodium", "lithium", "modernfix"):
+            _jar(self.mods / f"{mod_id}.jar", mod_id)
+        # Perf jars are skipped before ShimCheck, so the canned report only
+        # covers create; its own (ignored) Mixin verdict proves the flagship
+        # adapter path is unaffected by superseding.
+        shim = self.write_shim(
+            (create, "REJECTED",
+             [("UNSUPPORTED_MIXIN_INJECTION", "c.Mix @Redirect",
+               "Unsupported S0 injection")]))
+        for policy in ("strict", "quarantine", "delegate"):
+            mc_marker = self.tmp / f"mc-{policy}.json"
+            neo_marker = self.tmp / f"neo-{policy}.json"
+            proc, report = self.invoke(
+                "--fallback", policy,
+                "--shimcheck-json", str(shim),
+                "--mc-spine-cmd", self.cmd(mc_marker),
+                "--neoforge-fallback-cmd", self.cmd(neo_marker),
+                "--world-namespaces", "create,minecraft",
+                "--json")
+            self.assertEqual(proc.returncode, 0, (policy, proc.stderr))
+            self.assertEqual(report["plan"], "RunNative", policy)
+            self.assertFalse(report["needs_bounded_jvm"], policy)
+            self.assertEqual(report["superseded_perf_mods"],
+                             ["lithium", "modernfix", "sodium"], policy)
+            tiers = {a["mod_id"]: a["tier_name"]
+                     for a in report["assignments"]}
+            self.assertEqual(tiers, {
+                "create": "NativeFlagship",
+                "aether": "UniversalNative",
+                "sodium": "BuiltInSuperseded",
+                "lithium": "BuiltInSuperseded",
+                "modernfix": "BuiltInSuperseded",
+            }, policy)
+            self.assertEqual(report["launch"]["kind"], "mc_spine", policy)
+            self.assertTrue(mc_marker.is_file(),
+                            f"mc-spine stub never ran under {policy}")
+            marker = json.loads(mc_marker.read_text())
+            self.assertEqual(marker["plan"], "RunNative")
+            self.assertEqual(marker["superseded"],
+                             "lithium,modernfix,sodium")
+            self.assertEqual(marker["tier3"], "")
+            self.assertFalse(neo_marker.exists(),
+                             f"NeoForge ran under {policy} despite 0 Tier 3")
+            self.assertIn(
+                "Built-in optimizations replace 3 mod(s) "
+                "(skipped automatically): lithium, modernfix, sodium",
+                proc.stderr)
+            # Perf jars carry no ShimCheck verdict and no rejection reasons:
+            # the launcher never scanned them.
+            for a in report["assignments"]:
+                if a["tier_name"] == "BuiltInSuperseded":
+                    self.assertEqual(
+                        a["reasons"],
+                        ["already covered by mc-spine built-in optimizations"])
+
+    def test_quarantine_never_stages_superseded_perf_mods(self):
+        """Quarantine staging copies active + tier3-adjacent data only —
+        superseded perf jars are never copied into staging/mods."""
+        create = self.mods / "create.jar"
+        _jar(create, "create")
+        sodium = self.mods / "sodium.jar"
+        _jar(sodium, "sodium")
+        bad = self.mods / "badmixin.jar"
+        _jar(bad, "badmixin",
+             entries=[("data/badmixin/recipes/thing.json",
+                       '{"type":"minecraft:crafting_shaped"}')])
+        shim = self.write_shim(
+            (create, "COMPATIBLE", []),
+            (bad, "REJECTED",
+             [("UNSUPPORTED_MIXIN_INJECTION", "badmixin.Mix @Redirect",
+               "Unsupported S0 injection")]))
+        mc_marker = self.tmp / "mc.json"
+        proc, report = self.invoke(
+            "--fallback", "quarantine",
+            "--shimcheck-json", str(shim),
+            "--world-namespaces", "create,minecraft",
+            "--quarantine-load-data",
+            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["plan"], "RunNative")
+        self.assertEqual(report["superseded_perf_mods"], ["sodium"])
+        self.assertEqual([a["mod_id"] for a in report["quarantined_mods"]],
+                         ["badmixin"])
+        staged = {p.name for p in (self.staging / "mods").iterdir()}
+        self.assertEqual(staged, {"create.jar"})
+        self.assertFalse((self.staging / "mods" / "sodium.jar").exists(),
+                         "superseded perf jar was staged")
+        marker = json.loads(mc_marker.read_text())
+        self.assertEqual(marker["superseded"], "sodium")
+        self.assertEqual(marker["quarantined"], "badmixin")
+        self.assertIn(
+            "Built-in optimizations replace 1 mod(s) "
+            "(skipped automatically): sodium", proc.stderr)
 
     def test_human_report_prints_tier_table(self):
         create = self.mods / "create.jar"

@@ -7,5 +7,6 @@ pub mod integrated;
 pub mod lod;
 pub mod protocol;
 pub mod render;
+pub mod settings;
 pub mod sim;
 pub mod world;

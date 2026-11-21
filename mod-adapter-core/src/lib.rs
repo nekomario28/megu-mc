@@ -19,7 +19,9 @@
 //!   blocks), per-dimension environment profiles, and >64-section light
 //!   masks for tall custom dimensions.
 //! - [`fallback`]: 4-tier mod execution classifier and safe fallback planner
-//!   (`Strict`, `Quarantine` with Save v2 block-loss guard, `DelegateNeoForge`).
+//!   (`Strict`, `Quarantine` with Save v2 block-loss guard, `DelegateNeoForge`),
+//!   plus [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`] superseding of redundant
+//!   optimization mods (skipped before any Tier 3 check).
 
 #![deny(unsafe_code)]
 

@@ -15,6 +15,16 @@ pinned upstream NeoForge 1.21.1 runtime.
   Tier 3 RequiresFallback : Java mod rejected by ShimCheck (Mixin/AT/missing API)
                             or any `data/*/dimension/*.json` declaring a custom
                             Java ChunkGenerator (CUSTOM_CHUNK_GENERATOR)
+  BuiltInSuperseded       : optimization mod whose function mc-spine already
+                            implements natively (BUILTIN_SUPERSEDED_PERF_MODS);
+                            checked before every other step, skipped
+                            automatically, never ShimCheck-scanned, never
+                            staged, never counted toward Tier 3 fallback
+
+Clean-room note: matching a mod id against BUILTIN_SUPERSEDED_PERF_MODS only
+*skips loading* a user-supplied JAR — it copies, links, bundles, or derives
+nothing from that mod. All built-in optimizations in mc-spine, client-port,
+and client-app are 100% clean-room original Rust implementations.
 
 Dimension-adding mods shipping `data/<ns>/dimension_type/*.json` plus
 `data/<ns>/dimension/*.json` are summarised under `dimension_mods` in the
@@ -61,7 +71,10 @@ TIER_NAMES = {
     1: "UniversalNative",
     2: "BoundedJvmShim",
     3: "RequiresFallback",
+    -1: "BuiltInSuperseded",
 }
+# Sentinel tier for mods skipped as built-in-superseded (not a JVM tier).
+TIER_SUPERSEDED = -1
 
 # Exact strings from mod-adapter-core/src/fallback.rs so CLI output matches
 # the Rust startup report 1:1.
@@ -69,6 +82,25 @@ REASON_FLAGSHIP = "handled by flagship native Rust adapter"
 REASON_UNIVERSAL = "handled by zero-JVM universal adapter / offload profile"
 REASON_SHIM = "verified compatible with bounded S0-S4 JVM shim"
 REASON_FALLBACK_DEFAULT = "unsupported Mixin/AT or Minecraft API surface"
+REASON_SUPERSEDED = "already covered by mc-spine built-in optimizations"
+
+# Exact mirror of BUILTIN_SUPERSEDED_PERF_MODS in
+# mod-adapter-core/src/fallback.rs: mod ids whose optimization surface
+# mc-spine already implements natively (both Fabric and NeoForge/Forge ids,
+# compared case-insensitively). These jars are skipped before ShimCheck so
+# their heavy Mixins can never force Tier 3 NeoForge fallback.
+BUILTIN_SUPERSEDED_PERF_MODS = frozenset({
+    # Rendering / mesh / LOD.
+    "sodium", "embeddium", "rubidium", "xenon", "magnesium",
+    "immediatelyfast", "entityculling", "moreculling", "distanthorizons",
+    "voxy", "bobby", "farsight", "indium", "reeses-sodium-options",
+    "sodium-extra", "embeddium_extra",
+    # Server tick / lighting / memory / startup.
+    "lithium", "radium", "canary", "starlight", "phosphor", "scalpel",
+    "ferritecore", "modernfix", "noisium", "c2me", "krypton", "lazydfu",
+    "memoryleakfix", "alternate-current", "clumps", "saturn", "smoothboot",
+    "fastload", "dashloader", "servercore",
+})
 REASON_REFUSE_STRICT = "strict policy rejected unsupported Tier 3 mod(s)"
 REASON_REFUSE_QUARANTINE = (
     "refusing to quarantine mod(s) whose blocks exist in the saved world; "
@@ -414,10 +446,17 @@ def _report_for(reports, path):
     )
 
 
+def is_builtin_superseded(mod):
+    """Whether any declared mod id is a built-in-superseded optimization."""
+    return bool({m.lower() for m in mod.mod_ids} & BUILTIN_SUPERSEDED_PERF_MODS)
+
+
 def apply_shimcheck(mods, reports):
     """Fill ShimCheck verdicts into bytecode mods; fail closed when absent."""
     for mod in mods:
-        if not mod.has_java_bytecode:
+        if not mod.has_java_bytecode or is_builtin_superseded(mod):
+            # Superseded perf mods are skipped before ShimCheck entirely:
+            # their Mixins can never attach a Tier 3 rejection reason.
             continue
         if mod.source.is_dir():
             mod.reject(CODE_UNSCANNABLE, str(mod.source),
@@ -460,6 +499,10 @@ class Assignment:
 
 def classify(mod, flagship_ids, profile_ids):
     """Exact port of the tier cascade in fallback.rs `plan_mod_startup`."""
+    if is_builtin_superseded(mod):
+        # Checked before flagship/ShimCheck/Tier 3: a superseded perf mod's
+        # Mixins must never reach the fallback cascade.
+        return TIER_SUPERSEDED, [REASON_SUPERSEDED]
     owned = set(mod.mod_ids)
     if owned & flagship_ids:
         return 0, [REASON_FLAGSHIP]
@@ -480,6 +523,7 @@ def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
     """Exact port of `plan_mod_startup`; returns a dict plan."""
     assignments = []
     tier3 = []
+    superseded = []
     needs_bounded_jvm = False
     for mod in mods:
         tier, reasons = classify(mod, flagship_ids, profile_ids)
@@ -489,6 +533,9 @@ def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
         assignments.append(assignment)
         if tier == 3:
             tier3.append(assignment)
+        elif tier == TIER_SUPERSEDED:
+            superseded.append(assignment)
+    superseded_ids = sorted({a.mod_id for a in superseded})
 
     if not tier3:
         return {
@@ -497,6 +544,7 @@ def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
             "needs_bounded_jvm": needs_bounded_jvm,
             "quarantined_mods": [],
             "load_quarantined_data_only": False,
+            "superseded_perf_mods": superseded_ids,
         }
     if policy == "strict":
         return {
@@ -504,6 +552,7 @@ def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
             "reason": REASON_REFUSE_STRICT,
             "blocking_mods": tier3,
             "assignments": assignments,
+            "superseded_perf_mods": superseded_ids,
         }
     if policy == "quarantine":
         if not force_drop_saved_blocks:
@@ -514,6 +563,7 @@ def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
                     "reason": REASON_REFUSE_QUARANTINE,
                     "blocking_mods": endangered,
                     "assignments": assignments,
+                    "superseded_perf_mods": superseded_ids,
                 }
         return {
             "plan": "RunNative",
@@ -521,12 +571,14 @@ def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
             "needs_bounded_jvm": needs_bounded_jvm,
             "quarantined_mods": tier3,
             "load_quarantined_data_only": load_safe_data_only,
+            "superseded_perf_mods": superseded_ids,
         }
     if policy == "delegate":
         return {
             "plan": "DelegateToNeoForge",
             "triggering_mods": tier3,
             "assignments": assignments,
+            "superseded_perf_mods": superseded_ids,
         }
     raise LauncherError(f"unknown fallback policy: {policy}")
 
@@ -558,6 +610,9 @@ def stage_mods(plan, staging_dir, mods_dir, log):
     active_dir = staging_dir / "mods"
     active_dir.mkdir(parents=True, exist_ok=True)
     for assignment in plan["assignments"]:
+        if assignment.tier == TIER_SUPERSEDED:
+            # Superseded perf mods are never staged.
+            continue
         source = Path(assignment.source)
         target = active_dir / source.name
         if source.is_dir():
@@ -613,6 +668,8 @@ def _child_env(plan, mods_dir, staging_dir, policy):
         a.mod_id for a in plan.get("quarantined_mods", []))
     env["MC_SPINE_TIER3_MODS"] = ",".join(
         a.mod_id for a in plan.get("triggering_mods", []))
+    env["MC_SPINE_SUPERSEDED_PERF_MODS"] = ",".join(
+        plan.get("superseded_perf_mods", []))
     return env
 
 
@@ -635,6 +692,7 @@ def build_report(args, plan, launch):
         "quarantined_mods": [a.as_dict() for a in plan.get("quarantined_mods", [])],
         "triggering_mods": [a.as_dict() for a in plan.get("triggering_mods", [])],
         "blocking_mods": [a.as_dict() for a in plan.get("blocking_mods", [])],
+        "superseded_perf_mods": plan.get("superseded_perf_mods", []),
         "refusal_reason": plan.get("reason"),
         "dimension_mods": plan.get("dimension_mods", []),
         "saved_world_namespaces": sorted(plan.get("saved_namespaces", [])),
@@ -645,7 +703,9 @@ def build_report(args, plan, launch):
 
 
 def _print_table(assignments):
-    rows = [(a["mod_id"], f"Tier {a['tier']} {a['tier_name']}",
+    rows = [(a["mod_id"],
+             a["tier_name"] if a["tier"] == TIER_SUPERSEDED
+             else f"Tier {a['tier']} {a['tier_name']}",
              Path(a["source"]).name, "; ".join(a["reasons"]))
             for a in assignments]
     width = [max(len(r[i]) for r in rows + [("mod_id", "tier", "source", "reasons")])
@@ -737,8 +797,11 @@ def main():
             saved |= saved_namespaces_from_path(args.save_file)
         flagship_ids = {s for s in args.flagship_mods.split(",") if s}
 
+        # Superseded perf mods are skipped before ShimCheck: scanning them
+        # would only surface the heavy Mixins we intentionally ignore.
         bytecode_jars = [m.source for m in mods
-                         if m.has_java_bytecode and m.source.is_file()]
+                         if m.has_java_bytecode and m.source.is_file()
+                         and not is_builtin_superseded(m)]
         reports = run_shimcheck(bytecode_jars, args)
         apply_shimcheck(mods, reports)
 
@@ -747,6 +810,11 @@ def main():
             load_safe_data_only=args.quarantine_load_data,
             force_drop_saved_blocks=args.force_drop_saved_blocks)
         plan["saved_namespaces"] = saved
+        if plan["superseded_perf_mods"]:
+            log("Built-in optimizations replace {} mod(s) "
+                "(skipped automatically): {}".format(
+                    len(plan["superseded_perf_mods"]),
+                    ", ".join(plan["superseded_perf_mods"])))
         plan["dimension_mods"] = [
             m.dimension_report() for m in mods if m.is_dimension_mod]
 
