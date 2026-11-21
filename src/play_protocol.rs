@@ -1913,7 +1913,7 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
             };
             (it, n)
         };
-        crops().lock().unwrap().remove(&ow_block((x, y, z)));
+        crops().lock().unwrap().remove(&(dim, x, y, z));
         if old == 4285 && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
             // ripe: extra wheat drop
             let d = Drop {
@@ -2408,9 +2408,19 @@ fn resource_pack_pkt() -> Option<Vec<u8>> {
     p.push(0); // no prompt
     Some(p)
 }
+/// Whether the configured resource pack is mandatory. The server config's
+/// `resource_pack_required` key boots into `MC_SPINE_RESOURCE_PACK_REQUIRED`;
+/// a Vanilla `server.properties` says `require-resource-pack`. Either marks the
+/// pack required.
 fn resource_pack_required() -> bool {
-    std::env::var("MC_SPINE_RESOURCE_PACK_REQUIRED")
-        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    fn truthy(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    }
+    std::env::var("MC_SPINE_RESOURCE_PACK_REQUIRED").is_ok_and(|v| truthy(&v))
+        || server_properties_lookup("require-resource-pack").is_some_and(|v| truthy(&v))
 }
 
 // ---------- config blob replay ----------
@@ -6924,33 +6934,33 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if let Some(kind) = container_kind(block_at_dim(dim, x, y, z)) {
                     // The window is `DoubleBlockCombiner` order, not click order: the
                     // right half owns slots 0..=26 whichever half was right-clicked.
-                    let window = chest_window(x, y, z);
+                    let window = chest_window_for_player(dim, x, y, z);
                     // `ChestBlock.getMenuProvider` (`dhb.b`): refuses single or double
                     // chest if either half has a redstone conductor or sitting cat above.
                     // `BarrelBlock` (`dfe.a`) does not check `isBlockedChestByBlock`.
-                    if (kind == "Chest" && chest_window_blocked(window))
+                    if (kind == "Chest" && chest_window_blocked_dim(dim, window))
                         || (me.is_spectator() && window_has_pending_loot(window))
                     {
                         let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
                     let audience = client_snapshot();
-                    let mut halves = chest_window_halves(window);
+                    let mut halves = chest_window_halves_dim(window);
                     // A second container opening on the same client closes the first,
                     // which drops the first one's opener count too.
                     if let Some((previous, prev_anchor)) = client_open_window_and_anchor(&me) {
-                        for half in client_window_halves(previous, prev_anchor) {
+                        for half in client_window_halves_dim(previous, prev_anchor, dim) {
                             if !halves.contains(&half) {
                                 halves.push(half);
                             }
                         }
                     }
-                    let before = chest_opener_snapshot(&audience, &halves);
+                    let before = chest_opener_snapshot_dim(&audience, &halves);
                     close_live_menu(&me, false, true);
                     let inv = me.inv.lock().unwrap().clone();
                     open_chest_for_client(&me, window, None, &inv, kind);
                     // `ContainerOpenersCounter.incrementOpeners` -> openerCountChanged
-                    sync_chest_openers(&audience, &before);
+                    sync_chest_openers_dim(&audience, &before);
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
@@ -6958,25 +6968,25 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if (7513..=7520).contains(&block_at_dim(dim, x, y, z)) {
                     // `EnderChestBlock.useWithoutItem` (`dip.a`): refuses when the cell
                     // above `isRedstoneConductor`.
-                    if is_blocked_chest_by_block((x, y, z)) {
+                    if is_blocked_chest_by_block_dim(dim, (x, y, z)) {
                         let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
                     let audience = client_snapshot();
-                    let mut halves = vec![(x, y, z)];
+                    let mut halves = vec![(dim, x, y, z)];
                     if let Some((previous, prev_anchor)) = client_open_window_and_anchor(&me) {
-                        for half in client_window_halves(previous, prev_anchor) {
+                        for half in client_window_halves_dim(previous, prev_anchor, dim) {
                             if !halves.contains(&half) {
                                 halves.push(half);
                             }
                         }
                     }
-                    let before = chest_opener_snapshot(&audience, &halves);
+                    let before = chest_opener_snapshot_dim(&audience, &halves);
                     let key = ender_container_key(&me.uuid);
                     close_live_menu(&me, false, true);
                     let inv = me.inv.lock().unwrap().clone();
                     open_chest_for_client(&me, (key, None), Some((x, y, z)), &inv, "Ender Chest");
-                    sync_chest_openers(&audience, &before);
+                    sync_chest_openers_dim(&audience, &before);
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
@@ -7188,7 +7198,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         let bump = 2 + ((x.wrapping_mul(7) ^ z.wrapping_mul(13) ^ y) & 1) as u8;
                         let nage = (age + bump).min(7);
                         set_block_dim(dim, x, y, z, 4278 + nage as u32);
-                        crops().lock().unwrap().insert(ow_block((x, y, z)), nage);
+                        crops().lock().unwrap().insert((dim, x, y, z), nage);
                         note_block_update_dim(dim, x, y, z, 4278 + nage as u32);
                         if *me.gm.lock().unwrap() != 1 {
                             let mut inv = me.inv.lock().unwrap();
@@ -7235,7 +7245,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                             continue;
                         }
-                        crops().lock().unwrap().insert(ow_block((tx, ty, tz)), 0);
+                        crops().lock().unwrap().insert((dim, tx, ty, tz), 0);
                         if *me.gm.lock().unwrap() != 1 {
                             let mut inv = me.inv.lock().unwrap();
                             if let Some((it, c, _cc)) = inv.get(&(36 + held_slot)).cloned() {
@@ -7300,7 +7310,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             Some(name) => {
                                 let yaw = me.pos.lock().unwrap().3;
                                 let sneaking = *me.sneaking.lock().unwrap();
-                                chest_placement_state(
+                                chest_placement_state_dim(
+                                    dim,
                                     name,
                                     (tx, ty, tz),
                                     yaw,
@@ -7459,8 +7470,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 if let Some((prev, prev_anchor)) = client_open_window_and_anchor(&me)
                                 {
                                     let aud = client_snapshot();
-                                    let halves = client_window_halves(prev, prev_anchor);
-                                    let snap = chest_opener_snapshot(&aud, &halves);
+                                    let cdim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                                    let halves =
+                                        client_window_halves_dim(prev, prev_anchor, cdim);
+                                    let snap = chest_opener_snapshot_dim(&aud, &halves);
                                     (aud, snap)
                                 } else {
                                     (Vec::new(), Vec::new())
@@ -7475,7 +7488,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 "Minecart with Chest",
                             );
                             if !before.is_empty() {
-                                sync_chest_openers(&audience, &before);
+                                sync_chest_openers_dim(&audience, &before);
                             }
                         }
                         continue;
@@ -8284,7 +8297,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let mut sl = &b[..];
                 let status = read_varint(&mut sl);
                 eprintln!("[spine] resource_pack status {status:?}");
-                if resource_pack_required() && matches!(status, Some(1 | 2 | 5 | 6)) {
+                if resource_pack_status_disconnects(status) {
                     play_disconnect(
                         &mut me.sock.lock().unwrap(),
                         "This server requires the configured resource pack.",
@@ -8467,11 +8480,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let chest_window = client_open_window_and_anchor(&me);
                 if let Some((open, anchor)) = chest_window {
                     let audience = client_snapshot();
-                    let halves = client_window_halves(open, anchor);
-                    let before = chest_opener_snapshot(&audience, &halves);
+                    let cdim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    let halves = client_window_halves_dim(open, anchor, cdim);
+                    let before = chest_opener_snapshot_dim(&audience, &halves);
                     *me.open_chest.lock().unwrap() = None;
                     *me.chest_sync.lock().unwrap() = None;
-                    sync_chest_openers(&audience, &before);
+                    sync_chest_openers_dim(&audience, &before);
                 }
                 let had_container = chest_window.is_some()
                     || me.open_furnace.lock().unwrap().is_some()
@@ -9802,11 +9816,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         // the lock for the whole body, and the body locks it again to clear it.
         if let Some((open, anchor)) = client_open_window_and_anchor(&me_cleanup) {
             let audience = client_snapshot();
-            let halves = client_window_halves(open, anchor);
-            let before = chest_opener_snapshot(&audience, &halves);
+            let cdim = *me_cleanup.dim.lock().unwrap_or_else(|e| e.into_inner());
+            let halves = client_window_halves_dim(open, anchor, cdim);
+            let before = chest_opener_snapshot_dim(&audience, &halves);
             *me_cleanup.open_chest.lock().unwrap() = None;
             *me_cleanup.chest_sync.lock().unwrap() = None;
-            sync_chest_openers(&audience, &before);
+            sync_chest_openers_dim(&audience, &before);
         }
         #[cfg(feature = "neoforge-events")]
         if java_compat::NEOFORGE.get().is_some() {
@@ -9876,6 +9891,299 @@ impl std::ops::Drop for ConnectionSlot<'_> {
 }
 static IP_CONNS: connection_limits::IpConnections = connection_limits::IpConnections::new();
 static LOGINS: connection_limits::LoginRegistry = connection_limits::LoginRegistry::new();
+
+// ---------------- Lane P8a: dimension-scoped interact helpers ----------------
+// The legacy interact helpers in `menus_and_items.rs` read `block_at` and key
+// containers with `ContainerKey::ow` — Overworld only. These variants thread
+// the interacting player's dimension through every world read and container
+// key, so a chest clicked in the Nether resolves Nether blocks and Nether
+// storage.
+
+/// `chest_window_halves` that keeps each half's dimension from its key.
+fn chest_window_halves_dim(open: (ContainerKey, Option<ContainerKey>)) -> Vec<DimBlockPos> {
+    let mut out: Vec<DimBlockPos> = Vec::new();
+    for key in [Some(open.0), open.1].into_iter().flatten() {
+        if let ContainerKey::Block((dim, x, y, z)) = key {
+            if !is_ender_key((x, y, z)) && !out.contains(&(dim, x, y, z)) {
+                out.push((dim, x, y, z));
+            }
+        }
+    }
+    out
+}
+/// `client_window_halves` keeping dimensions: an ender window exposes only its
+/// anchor half, which lives in the clicking client's dimension.
+fn client_window_halves_dim(
+    open: (ContainerKey, Option<ContainerKey>),
+    anchor: Option<BlockPos>,
+    client_dim: DimId,
+) -> Vec<DimBlockPos> {
+    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key((ek.1, ek.2, ek.3))) {
+        return anchor
+            .into_iter()
+            .map(|p| (client_dim, p.0, p.1, p.2))
+            .collect();
+    }
+    chest_window_halves_dim(open)
+}
+/// `ChestBlock.isBlockedChestByBlock` in `dim`: true when `pos.above()` is a
+/// redstone conductor in that dimension.
+fn is_blocked_chest_by_block_dim(dim: DimId, pos: BlockPos) -> bool {
+    if dim == DimId::Overworld {
+        return is_blocked_chest_by_block(pos);
+    }
+    let above = block_at_dim(dim, pos.0, pos.1 + 1, pos.2);
+    breg().is_some_and(|reg| reg.is_redstone_conductor(above))
+}
+/// `ChestBlock.isChestBlockedAt` in `dim`.
+fn is_chest_blocked_at_dim(dim: DimId, pos: BlockPos) -> bool {
+    is_blocked_chest_by_block_dim(dim, pos) || is_cat_sitting_on_chest(pos)
+}
+/// `ChestBlock.getMenuProvider` in `dim`: a single chest is blocked when its
+/// cell is, a double chest when EITHER half is.
+fn chest_window_blocked_dim(dim: DimId, open: (ContainerKey, Option<ContainerKey>)) -> bool {
+    if dim == DimId::Overworld {
+        return chest_window_blocked(open);
+    }
+    chest_window_halves(open)
+        .into_iter()
+        .any(|pos| is_chest_blocked_at_dim(dim, pos))
+}
+/// `half_openers` in `dim`: openers whose window carries this dimensioned block
+/// key, plus the ender-chest anchor match.
+fn half_openers_dim(dim: DimId, audience: &[Arc<Client>], pos: BlockPos) -> u32 {
+    let key = ContainerKey::Block((dim, pos.0, pos.1, pos.2));
+    audience
+        .iter()
+        .filter(|c| {
+            if c.is_spectator() {
+                return false;
+            }
+            let open = match c.open_chest.lock() {
+                Ok(g) => *g,
+                Err(_) => return false,
+            };
+            let Some((a, b)) = open else {
+                return false;
+            };
+            if a == key || b == Some(key) {
+                return true;
+            }
+            if matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {
+                // An ender window only opens the block in the client's own
+                // dimension: same coordinates elsewhere are a different chest.
+                if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+                    return false;
+                }
+                return c
+                    .chest_sync
+                    .lock()
+                    .ok()
+                    .and_then(|s| {
+                        s.as_ref()
+                            .filter(|st| st.window == (a, b))
+                            .and_then(|st| st.anchor)
+                    })
+                    == Some(pos);
+            }
+            false
+        })
+        .count() as u32
+}
+/// `chest_opener_snapshot` over dimensioned halves: the count of every half
+/// before a window change, so the change can be diffed rather than assumed.
+fn chest_opener_snapshot_dim(
+    audience: &[Arc<Client>],
+    halves: &[DimBlockPos],
+) -> Vec<(DimBlockPos, u32)> {
+    halves
+        .iter()
+        .map(|&(d, x, y, z)| ((d, x, y, z), half_openers_dim(d, audience, (x, y, z))))
+        .collect()
+}
+/// The `Level.blockEvent` fanout for one dimension: `Level.blockEvent` is
+/// per-level, so a chest's opener-count event never reaches clients in another
+/// dimension even when their coordinates are within earshot.
+fn broadcast_block_event_dim(
+    audience: &[Arc<Client>],
+    dim: DimId,
+    pos: BlockPos,
+    action: u8,
+    param: u8,
+) {
+    let Some(block) =
+        breg().and_then(|reg| reg.block_id_of(block_at_dim(dim, pos.0, pos.1, pos.2)))
+    else {
+        return;
+    };
+    let mut body = Vec::with_capacity(12);
+    write_pos(&mut body, pos.0, pos.1, pos.2);
+    body.push(action);
+    body.push(param);
+    write_varint(&mut body, i64::from(block));
+    fanout_in(
+        audience,
+        |c| {
+            if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+                return false;
+            }
+            let at = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let (dx, dy, dz) = (
+                at.0 - f64::from(pos.0),
+                at.1 - f64::from(pos.1),
+                at.2 - f64::from(pos.2),
+            );
+            dx * dx + dy * dy + dz * dz <= 64.0 * 64.0
+        },
+        |_| (0x08, body.clone()),
+    );
+}
+/// The `0x09` block-update fanout for one dimension, the counterpart of
+/// `broadcast_block_event_dim` for the barrel `open` toggle.
+fn broadcast_block_update_dim(audience: &[Arc<Client>], dim: DimId, pos: BlockPos, state: u32) {
+    let mut body = Vec::with_capacity(12);
+    write_pos(&mut body, pos.0, pos.1, pos.2);
+    write_varint(&mut body, i64::from(state));
+    let chunk = (pos.0 >> 4, pos.2 >> 4);
+    fanout_in(
+        audience,
+        |c| {
+            if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+                return false;
+            }
+            if c.chunks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&chunk)
+            {
+                return true;
+            }
+            let at = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let (dx, dy, dz) = (
+                at.0 - f64::from(pos.0),
+                at.1 - f64::from(pos.1),
+                at.2 - f64::from(pos.2),
+            );
+            dx * dx + dy * dy + dz * dz <= 64.0 * 64.0
+        },
+        |_| (0x09, body.clone()),
+    );
+}
+/// `sync_chest_openers` over dimensioned halves: each half's block reads and
+/// `openedBy` writes stay inside the half's own dimension.
+fn sync_chest_openers_dim(audience: &[Arc<Client>], before: &[(DimBlockPos, u32)]) {
+    for &((dim, x, y, z), previous) in before {
+        let pos = (x, y, z);
+        let now = half_openers_dim(dim, audience, pos);
+        if now != previous {
+            let st = block_at_dim(dim, x, y, z);
+            if let Some(reg) = breg().filter(|reg| reg.name_of(st) == "minecraft:barrel") {
+                if (previous == 0) != (now == 0) {
+                    let next = reg.with_prop(st, "open", if now > 0 { "true" } else { "false" });
+                    if next != st {
+                        set_block_dim(dim, x, y, z, next);
+                        broadcast_block_update_dim(audience, dim, pos, next);
+                    }
+                }
+            } else {
+                // vanilla writes the count with `writeByte`: the wire field is a byte.
+                broadcast_block_event_dim(audience, dim, pos, 1, now as u8);
+            }
+        }
+    }
+}
+/// `chest_window` in `dim`: the Overworld keeps the legacy helper, other
+/// dimensions resolve through the dimension-aware twin.
+fn chest_window_for_player(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> (ContainerKey, Option<ContainerKey>) {
+    if dim == DimId::Overworld {
+        chest_window(x, y, z)
+    } else {
+        chest_window_dim(dim, x, y, z)
+    }
+}
+/// `ChestBlock.candidatePartnerFacing` in `dim`.
+fn chest_candidate_partner_facing_dim(dim: DimId, pos: BlockPos, name: &str) -> Option<HFace> {
+    if dim == DimId::Overworld {
+        return chest_candidate_partner_facing(pos, name);
+    }
+    let st = block_at_dim(dim, pos.0, pos.1, pos.2);
+    if breg()?.name_of(st) != name {
+        return None;
+    }
+    if chest_type(st)? != "single" {
+        return None;
+    }
+    chest_facing(st)
+}
+/// `ChestBlock.getStateForPlacement` in `dim`: the same facing and pairing
+/// rules, but every neighbour read lands in the placing player's dimension.
+fn chest_placement_state_dim(
+    dim: DimId,
+    name: &str,
+    pos: BlockPos,
+    yaw: f32,
+    sneaking: bool,
+    face: u8,
+) -> u32 {
+    if dim == DimId::Overworld {
+        return chest_placement_state(name, pos, yaw, sneaking, face);
+    }
+    let Some(reg) = breg() else { return 0 };
+    let mut facing = HFace::from_yaw(yaw).opposite();
+    let mut kind = "single";
+    // Sneaking against a horizontal face claims that side: only the clicked
+    // block may become the partner, and only when its facing is on the other axis.
+    if sneaking {
+        if let Some(clicked) = HFace::from_face(face) {
+            let back = clicked.opposite();
+            let (bx, bz) = back.step();
+            let behind = (pos.0 + bx, pos.1, pos.2 + bz);
+            if let Some(candidate) = chest_candidate_partner_facing_dim(dim, behind, name) {
+                if candidate.axis() != clicked.axis() {
+                    facing = candidate;
+                    kind = if candidate.counter_clock_wise() == back {
+                        "right"
+                    } else {
+                        "left"
+                    };
+                }
+            }
+        }
+    }
+    // Otherwise the pair axis is perpendicular to facing: clockwise is LEFT,
+    // then counter-clockwise is RIGHT (vanilla order, first match wins).
+    if kind == "single" && !sneaking {
+        let (cx, cz) = facing.clock_wise().step();
+        let clockwise = (pos.0 + cx, pos.1, pos.2 + cz);
+        if chest_candidate_partner_facing_dim(dim, clockwise, name) == Some(facing) {
+            kind = "left";
+        } else {
+            let (cx, cz) = facing.counter_clock_wise().step();
+            let counter = (pos.0 + cx, pos.1, pos.2 + cz);
+            if chest_candidate_partner_facing_dim(dim, counter, name) == Some(facing) {
+                kind = "right";
+            }
+        }
+    }
+    let waterlogged =
+        reg.fluid_name(block_at_dim(dim, pos.0, pos.1, pos.2)) == "minecraft:water";
+    let st = reg.state_of(name, None);
+    let st = reg.with_prop(st, "facing", facing.name());
+    let st = reg.with_prop(st, "type", kind);
+    reg.with_prop(st, "waterlogged", if waterlogged { "true" } else { "false" })
+}
+/// `ServerboundResourcePackPacket` statuses that end the connection when the
+/// pack is required (`handleResourcePack` disconnects on Declined,
+/// FailedDownload, InvalidUrl and FailedReload). Optional packs — and
+/// successful or progress statuses — never disconnect.
+fn resource_pack_status_disconnects(status: Option<i64>) -> bool {
+    resource_pack_required() && matches!(status, Some(1 | 2 | 5 | 6))
+}
 
 #[cfg(test)]
 mod connection_slot_tests {
@@ -12001,5 +12309,229 @@ mod wire_ops_fair_play_tests {
         assert!(!map_fair_play_policy().allow_entity_radar);
 
         restore_env(saved);
+    }
+}
+
+// ---------------- Lane P8a: parity tests ----------------
+
+#[cfg(test)]
+mod p8a_parity_protocol_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Restores `world()` overlay cells in a given dimension on drop.
+    struct DimCells(Vec<(DimId, i32, i32, i32, Option<u32>)>);
+    impl DimCells {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+        fn set(&mut self, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+            let key = (dim, x >> 4, z >> 4);
+            let cell = local_idx(x, y, z);
+            let prev = {
+                let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+                let chunk = w.entry(key).or_default();
+                let prev = chunk.get(&cell).copied();
+                chunk.insert(cell, st);
+                prev
+            };
+            self.0.push((dim, x, y, z, prev));
+        }
+    }
+    impl std::ops::Drop for DimCells {
+        fn drop(&mut self) {
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            for (dim, x, y, z, prev) in self.0.drain(..).rev() {
+                if let Some(chunk) = w.get_mut(&(dim, x >> 4, z >> 4)) {
+                    match prev {
+                        Some(st) => {
+                            chunk.insert(local_idx(x, y, z), st);
+                        }
+                        None => {
+                            chunk.remove(&local_idx(x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A loopback client for opener-count tests: `me.sock` is the end the
+    /// server writes to; the returned peer reads exactly those bytes.
+    fn p8a_loopback_client(name: &str, eid: i32) -> (Arc<Client>, std::net::TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let me = Arc::new(Client {
+            eid,
+            uuid: [0x8au8; 16],
+            name: name.to_string(),
+            player_attack_damage_id: None,
+            pos: Mutex::new((0.5, 65.0, 0.5, 0.0, 0.0, true)),
+            teleport: Mutex::new(Default::default()),
+            hp: Mutex::new(20.0),
+            sock: Mutex::new(stream),
+            inv: Mutex::new(HashMap::new()),
+            cursor: Mutex::new((0, 0, Vec::new())),
+            drag: Mutex::new((0, Vec::new())),
+            open_chest: Mutex::new(None),
+            chest_sync: Mutex::new(None),
+            open_furnace: Mutex::new(None),
+            craft: Mutex::new(HashMap::new()),
+            craft9: Mutex::new(HashMap::new()),
+            open_table: Mutex::new(false),
+            open_merchant: Mutex::new(false),
+            trade_sel: Mutex::new(0),
+            merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
+            bow_draw: Mutex::new(None),
+            dig: Mutex::new(None),
+            eat_start: Mutex::new(None),
+            blocking: Mutex::new(false),
+            sprinting: Mutex::new(false),
+            sneaking: Mutex::new(false),
+            last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            fall_fly: Mutex::new(false),
+            invulnerable: Mutex::new(0),
+            last_hurt: Mutex::new(0.0),
+            shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            absorb: Mutex::new(0.0),
+            pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            xp: Mutex::new(0),
+            skin: Mutex::new(None),
+            seen: Mutex::new(HashSet::new()),
+            chunks: Mutex::new(HashSet::from([(-1, -1), (-1, 0), (0, -1), (0, 0)])),
+            chunk_ack: Mutex::new(ChunkFeedback::new(1)),
+            gen_sources: Mutex::new(GenSources::default()),
+            gm: Mutex::new(0),
+            fall_from: Mutex::new(65.0),
+            food: Mutex::new(20),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            armor_pts: Mutex::new(0),
+            sat: Mutex::new(5.0),
+            walk_acc: Mutex::new(0.0),
+            lastp: Mutex::new((0.5, 65.0, 0.5)),
+            spawn_pt: Mutex::new(None),
+            dim: Mutex::new(DimId::Nether),
+            spawn_dim: Mutex::new(DimId::Overworld),
+            view: Mutex::new(2),
+            in_portal: Mutex::new(false),
+            portal_at: Mutex::new(None),
+            held: Mutex::new(0),
+            effs: Mutex::new(Vec::new()),
+            lod_v1_enabled: AtomicBool::new(false),
+            underground_revealed: AtomicBool::new(false),
+            sleeping: Mutex::new(None),
+            inv_state_id: AtomicI32::new(0),
+        });
+        (me, peer)
+    }
+
+    /// #87: the right-click chest path resolves the window's keys, its
+    /// `isBlockedChestByBlock` gate and its opener counts in the clicking
+    /// player's dimension — never the Overworld.
+    #[test]
+    fn p8a_parity_chest_interact_uses_player_dimension() {
+        crate::test_support::require_vanilla_data();
+        let Some(reg) = breg() else { return };
+        let _guard = world_guard();
+        let dim = DimId::Nether;
+        let (x, y, z) = (2_500_005, 200, 2_500_007);
+        let chest = reg.state_of("minecraft:chest", None);
+        let conductor = reg.state_of("minecraft:stone", None);
+        let glass = reg.state_of("minecraft:glass", None);
+        if reg.name_of(chest) != "minecraft:chest"
+            || reg.name_of(conductor) != "minecraft:stone"
+            || reg.name_of(glass) != "minecraft:glass"
+        {
+            return;
+        }
+        let mut cells = DimCells::new();
+        cells.set(dim, x, y, z, chest);
+        // A conductor above the Nether chest, a non-conductor at the same cell
+        // in the Overworld: the gate must read the Nether cell only.
+        cells.set(dim, x, y + 1, z, conductor);
+        cells.set(DimId::Overworld, x, y + 1, z, glass);
+
+        let window = chest_window_dim(dim, x, y, z);
+        assert_eq!(
+            window,
+            (ContainerKey::Block((dim, x, y, z)), None),
+            "the window key must carry the player's dimension"
+        );
+        assert!(
+            is_blocked_chest_by_block_dim(dim, (x, y, z)),
+            "a conductor above the Nether chest blocks it"
+        );
+        assert!(
+            !is_blocked_chest_by_block_dim(DimId::Overworld, (x, y, z)),
+            "the Overworld cell holds glass, not a conductor"
+        );
+        assert!(chest_window_blocked_dim(dim, window));
+        assert!(!chest_window_blocked_dim(DimId::Overworld, window));
+    }
+
+    /// #87: `ContainerOpenersCounter` counts per dimension — a Nether chest
+    /// window counts as an opener of the Nether half only, never the
+    /// Overworld cell at the same coordinates.
+    #[test]
+    fn p8a_parity_chest_opener_count_is_dimension_scoped() {
+        let _guard = world_guard();
+        let (x, y, z) = (2_500_009, 201, 2_500_011);
+        let (client, _peer) = p8a_loopback_client("P8aOpener", -770001);
+        *client.open_chest.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((ContainerKey::Block((DimId::Nether, x, y, z)), None));
+        let audience = vec![Arc::clone(&client)];
+        assert_eq!(half_openers_dim(DimId::Nether, &audience, (x, y, z)), 1);
+        assert_eq!(half_openers_dim(DimId::Overworld, &audience, (x, y, z)), 0);
+        // The snapshot carries each half's dimension through to the sync.
+        let halves = vec![(DimId::Nether, x, y, z)];
+        let before = chest_opener_snapshot_dim(&audience, &halves);
+        assert_eq!(before, vec![((DimId::Nether, x, y, z), 1)]);
+    }
+
+    /// #109: a required resource pack disconnects on Declined, FailedDownload,
+    /// InvalidUrl and FailedReload — and only on those, and only when required.
+    #[test]
+    fn p8a_parity_resource_pack_statuses_disconnect_only_when_required() {
+        let _guard = world_guard();
+        let saved_pack = std::env::var("MC_SPINE_RESOURCE_PACK_REQUIRED").ok();
+        let saved_config = std::env::var_os("MC_SPINE_CONFIG");
+        // Point the config lookup at a path that cannot exist so only the env
+        // variable drives `resource_pack_required` here.
+        std::env::set_var(
+            "MC_SPINE_CONFIG",
+            std::env::temp_dir().join("mc-spine-p8a-no-such-config.toml"),
+        );
+        std::env::set_var("MC_SPINE_RESOURCE_PACK_REQUIRED", "1");
+        for status in [1i64, 2, 5, 6] {
+            assert!(
+                resource_pack_status_disconnects(Some(status)),
+                "required pack must disconnect on status {status}"
+            );
+        }
+        for status in [0i64, 3, 4, 7] {
+            assert!(
+                !resource_pack_status_disconnects(Some(status)),
+                "status {status} is not a refusal"
+            );
+        }
+        std::env::set_var("MC_SPINE_RESOURCE_PACK_REQUIRED", "0");
+        for status in [1i64, 2, 5, 6] {
+            assert!(
+                !resource_pack_status_disconnects(Some(status)),
+                "optional pack never disconnects on status {status}"
+            );
+        }
+        std::env::remove_var("MC_SPINE_RESOURCE_PACK_REQUIRED");
+        assert!(!resource_pack_status_disconnects(Some(1)));
+        match saved_pack {
+            Some(v) => std::env::set_var("MC_SPINE_RESOURCE_PACK_REQUIRED", v),
+            None => std::env::remove_var("MC_SPINE_RESOURCE_PACK_REQUIRED"),
+        }
+        match saved_config {
+            Some(v) => std::env::set_var("MC_SPINE_CONFIG", v),
+            None => std::env::remove_var("MC_SPINE_CONFIG"),
+        }
     }
 }

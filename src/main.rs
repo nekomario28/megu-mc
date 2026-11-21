@@ -11131,11 +11131,12 @@ fn nbt_str(v: &mut Vec<u8>, s: &str) {
     let length = (v.len() - start - 2) as u16;
     v[start..start + 2].copy_from_slice(&length.to_be_bytes());
 }
-fn heightmaps_nbt_dim(tops: &[i32; 256], min_y: i32) -> Vec<u8> {
-    let mut v = Vec::new();
-    v.push(10); // TAG_Compound — anonymousNbt: contents directly, no root name
+/// Serialize one `Heightmap.Types` array the way `ChunkSerializer` writes it:
+/// 256 nine-bit entries, seven per long, zero-padded to 37 longs, stored
+/// relative to the dimension's `min_y`.
+fn heightmap_pack_longs(v: &mut Vec<u8>, name: &str, tops: &[i32; 256], min_y: i32) {
     v.push(12); // TAG_Long_Array
-    nbt_str(&mut v, "MOTION_BLOCKING");
+    nbt_str(v, name);
     v.extend_from_slice(&37i32.to_be_bytes());
     let per = 64 / 9;
     let mut longs = vec![0u64; 37];
@@ -11152,6 +11153,14 @@ fn heightmaps_nbt_dim(tops: &[i32; 256], min_y: i32) -> Vec<u8> {
     for l in longs {
         v.extend_from_slice(&l.to_be_bytes());
     }
+}
+/// The chunk packet's heightmaps compound: 1.21.1 carries both `MOTION_BLOCKING`
+/// (motion-blocking or fluid) and `WORLD_SURFACE` (any non-air state).
+fn heightmaps_nbt_dim(tops: &[i32; 256], ws_tops: &[i32; 256], min_y: i32) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.push(10); // TAG_Compound — anonymousNbt: contents directly, no root name
+    heightmap_pack_longs(&mut v, "MOTION_BLOCKING", tops, min_y);
+    heightmap_pack_longs(&mut v, "WORLD_SURFACE", ws_tops, min_y);
     v.push(0);
     v
 }
@@ -11388,15 +11397,69 @@ fn build_map_chunk_lane(
     p.extend_from_slice(&cx.to_be_bytes());
     p.extend_from_slice(&cz.to_be_bytes());
     let mut tops = [0i32; 256];
+    let mut ws_tops = [0i32; 256];
     if let Some(c) = worldgen::chunk_cols_dim(dim, cx, cz) {
+        // WORLD_SURFACE bounds, per column: `wtop` only tracks solid-or-fluid
+        // terrain, so the scan start must also cover the feature layer's
+        // highest non-air write (`feature_height(x,z,0)` is that write's y+1)
+        // and any live edit that raised the column — both are scan bounds,
+        // not answers, because an overlay air cell may sit above them.
+        let feature = worldgen::with_gen_dim(dim, |g| {
+            // `feat_hm` fills when pending writers flush, so the bound is only
+            // complete after this chunk is decorated: `ensure_populated` runs
+            // the 3x3 writer box that can touch these cells, otherwise the
+            // first packet build scans from `wtop` alone and misses canopies.
+            g.ensure_populated(cx, cz, crate::feature::populate);
+            let mut v = [i32::MIN; 256];
+            for lz in 0..16usize {
+                for lx in 0..16usize {
+                    let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+                    v[lz * 16 + lx] = g.feature_height(x, z, 0);
+                }
+            }
+            v
+        })
+        .unwrap_or([i32::MIN; 256]);
+        let mut edit_tops = [i32::MIN; 256];
+        if let Some(reg) = breg() {
+            let w = timed_world();
+            if let Some(edits) = w.get(&(dim, cx, cz)) {
+                for (&cell, &st) in edits {
+                    if reg.heightmap_counts(st, HeightmapKind::WorldSurface) {
+                        let (ex, ez) = ((cell & 15) as usize, ((cell >> 4) & 15) as usize);
+                        let ey = MIN_Y + (cell >> 8) as i32;
+                        let i = ez * 16 + ex;
+                        edit_tops[i] = edit_tops[i].max(ey);
+                    }
+                }
+            }
+        }
         for lz in 0..16usize {
             for lx in 0..16usize {
+                let i = lz * 16 + lx;
                 // MOTION_BLOCKING is the top of the fluid-inclusive surface, not the density top.
-                tops[lz * 16 + lx] = c.wtop(lx, lz) + 1;
+                tops[i] = c.wtop(lx, lz) + 1;
+                let (bx, bz) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+                let mut y = c
+                    .wtop(lx, lz)
+                    .max(feature[i].saturating_sub(1))
+                    .max(edit_tops[i])
+                    .min(dim.min_y() + dim.height() - 1);
+                while y >= dim.min_y()
+                    && !breg().is_some_and(|reg| {
+                        reg.heightmap_counts(
+                            block_at_dim(dim, bx, y, bz),
+                            HeightmapKind::WorldSurface,
+                        )
+                    })
+                {
+                    y -= 1;
+                }
+                ws_tops[i] = y + 1;
             }
         }
     }
-    p.extend_from_slice(&heightmaps_nbt_dim(&tops, dim.min_y()));
+    p.extend_from_slice(&heightmaps_nbt_dim(&tops, &ws_tops, dim.min_y()));
     let __td = chunkprof::enabled().then(std::time::Instant::now);
     let data = chunk_data_lane(cx, cz, dim, gen, chunk_prefetch_enabled(), occluded);
     if let Some(t) = __td {
@@ -13317,14 +13380,10 @@ fn compute_safe_initial_world_spawn() -> (f64, f64, f64) {
     find_safe_world_spawn(DimId::Overworld)
 }
 
-/// The live hotspot profiler fed by every real `game_tick`: one shared ring
-/// for the operator `/tick`-style readouts (`operator_ux` renders it). Lock
-/// poisoning degrades to `into_inner` rather than panicking the tick loop.
-fn live_server_profiler() -> &'static Mutex<ServerHotspotProfiler> {
-    static PROFILER: OnceLock<Mutex<ServerHotspotProfiler>> = OnceLock::new();
-    PROFILER.get_or_init(|| Mutex::new(ServerHotspotProfiler::default()))
-}
-
+/// The live hotspot profiler fed by every real `game_tick` is the SAME
+/// `OnceLock` `/profile` reads (`live_hotspot_profiler` in
+/// `teams_and_commands.rs`) — a second instance would record tick timings a
+/// command can never see.
 fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     // `/tick freeze` skips world ticks unless `/tick step` or `/tick sprint`
     // queued budget; a sprint always runs. The default is unfrozen, so callers
@@ -13358,40 +13417,44 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("environment", environment_time_tick);
     TICK_IDX.fetch_add(1, Ordering::Relaxed);
     run("hot_regions", refresh_hot);
+    // Vanilla 1.21.1 `ServerLevel.tick` phase order: scheduled block ticks,
+    // fluid ticks, raids, then the chunk-source pass (entities, block entities,
+    // `tickChunk` random ticks), then pending block events. The subsystem
+    // buckets below follow that layout.
     run("scheduled_blocks", scheduled_block_tick);
+    run("redstone", live_redstone_tick);
     run("generated_fluids", generated_fluid_tick);
-    run("generated_content", materialize_pending_generation);
-    run("interest", interest_tick);
-    run("drops", drop_tick);
-    run("arrows", arrow_tick);
-    run("tnt", primed_tick);
-    run("furnaces", furnace_tick);
-    run("hoppers", hopper_tick);
     run("water", water_tick);
     let lava_period = server_ticks(FLUID_TICK_GT);
     if TICK_IDX.load(Ordering::Relaxed).is_multiple_of(lava_period) {
         run("lava", lava_tick);
     }
-    run("redstone", live_redstone_tick);
+    run("villager_raid", villager_raid_tick);
+    run("generated_content", materialize_pending_generation);
+    run("interest", interest_tick);
+    run("drops", drop_tick);
+    run("arrows", arrow_tick);
+    run("tnt", primed_tick);
+    run("carts", cart_tick);
+    run("falling", falling_tick);
+    run("mobs", mob_tick);
+    run("furnaces", furnace_tick);
+    run("hoppers", hopper_tick);
     run("brewing", live_brewing_tick);
+    run("spawners", spawner_tick);
+    run("random_ticks", random_tick_pass);
     run("player_menus", live_menu_tick);
     run("plugins", plugin_tick);
     run("actors", actor_tick);
     #[cfg(feature = "neoforge-events")]
     run("neoforge_player_tick", neoforge_player_tick);
-    run("mobs", mob_tick);
-    run("spawners", spawner_tick);
-    run("villager_raid", villager_raid_tick);
-    run("carts", cart_tick);
-    run("falling", falling_tick);
-    run("random_ticks", random_tick_pass);
     run("block_updates", apply_queued_block_updates);
     run("chest_viewers", chest_viewer_tick);
     #[cfg(feature = "create-offload")]
     run("mod_offload", mod_offload_tick);
     run("live_mods", live_mod_tick);
     let wire_us = wire_tick_start.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
-    live_server_profiler()
+    live_hotspot_profiler()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .record_tick_us(wire_us);
@@ -16588,11 +16651,16 @@ mod wire_ops_tests {
             ctl.step_remaining = 0;
             ctl.sprint_remaining = 0;
         }
-        let before = wire_lock(live_server_profiler()).summary(0).ticks_recorded;
+        // `ring_len` saturates at capacity once the shared ring fills, so the
+        // signal a tick landed is `ring_next` advancing by exactly one slot.
+        let before = wire_lock(live_hotspot_profiler()).ring_next;
         game_tick(|_, tick| tick());
         let last_us = {
-            let profiler = wire_lock(live_server_profiler());
-            assert!(profiler.summary(0).ticks_recorded > before);
+            let profiler = wire_lock(live_hotspot_profiler());
+            assert_eq!(
+                profiler.ring_next,
+                (before + 1) % PROFILER_RING_CAPACITY
+            );
             profiler.ring[(profiler.ring_next + PROFILER_RING_CAPACITY - 1)
                 % PROFILER_RING_CAPACITY]
         };
@@ -16686,5 +16754,264 @@ mod wire_ops_tests {
             None => std::env::remove_var("MC_SPINE_WAL_PATH"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------- Lane P8a: parity tests ----------------
+
+#[cfg(test)]
+mod p8a_parity_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Poison-tolerant lock: the ratchet forbids growing `.lock().unwrap()`,
+    /// tests included.
+    fn p8a_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Writes `st` into the live overlay for `dim` at `(x, y, z)`, restoring the
+    /// previous cell (or its absence) on drop.
+    struct DimCells(Vec<(DimId, i32, i32, i32, Option<u32>)>);
+    impl DimCells {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+        fn set(&mut self, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+            let key = (dim, x >> 4, z >> 4);
+            let cell = local_idx(x, y, z);
+            let prev = {
+                let mut w = p8a_lock(world());
+                let chunk = w.entry(key).or_default();
+                let prev = chunk.get(&cell).copied();
+                chunk.insert(cell, st);
+                prev
+            };
+            self.0.push((dim, x, y, z, prev));
+        }
+    }
+    impl std::ops::Drop for DimCells {
+        fn drop(&mut self) {
+            let mut w = p8a_lock(world());
+            for (dim, x, y, z, prev) in self.0.drain(..).rev() {
+                if let Some(chunk) = w.get_mut(&(dim, x >> 4, z >> 4)) {
+                    match prev {
+                        Some(st) => {
+                            chunk.insert(local_idx(x, y, z), st);
+                        }
+                        None => {
+                            chunk.remove(&local_idx(x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// #86: a comparator analog read resolves the container in the comparator's
+    /// own dimension — same coordinates, different contents per dimension, and
+    /// the Nether world view must see the Nether chest.
+    #[test]
+    fn p8a_parity_comparator_container_read_uses_own_dimension() {
+        crate::test_support::require_vanilla_data();
+        let Some(reg) = breg() else { return };
+        let _guard = world_guard();
+        let (x, y, z) = (2_500_003, 70, -2_500_001);
+        let chest = reg.state_of("minecraft:chest", None);
+        if reg.name_of(chest) != "minecraft:chest" {
+            return;
+        }
+        let mut cells = DimCells::new();
+        cells.set(DimId::Nether, x, y, z, chest);
+        cells.set(DimId::Overworld, x, y, z, chest);
+        let stack: Stack = (803, 64, Vec::new());
+        let key_nether = ContainerKey::Block((DimId::Nether, x, y, z));
+        let key_ow = ContainerKey::Block((DimId::Overworld, x, y, z));
+        let prev_nether = {
+            let mut chests = p8a_lock(chests());
+            chests.insert(
+                key_nether,
+                HashMap::from([
+                    (0i16, stack.clone()),
+                    (1, stack.clone()),
+                    (2, stack),
+                ]),
+            )
+        };
+        let prev_ow = p8a_lock(chests()).insert(key_ow, HashMap::new());
+        let mut state = LiveRedstoneState {
+            comparator_outputs: BTreeMap::new(),
+            torches: BTreeMap::new(),
+            ticks: BinaryHeap::new(),
+            pending: BTreeMap::new(),
+            sequence: 0,
+        };
+        // Three full stacks in 27 slots: floor(14 * (3 / 27)) + 1 = 2.
+        let nether_signal = {
+            let world = LiveRedstoneWorld {
+                dim: DimId::Nether,
+                reg,
+                state: &mut state,
+                now: 0,
+                reads: std::cell::RefCell::new(BTreeMap::new()),
+                writes: BTreeMap::new(),
+                dispensers: Vec::new(),
+            };
+            world.analog_signal(RsPos(x, y, z))
+        };
+        // The empty Overworld chest at the same coordinates reads 0 — only a
+        // dimension-scoped lookup keeps the two apart.
+        let ow_signal = {
+            let world = LiveRedstoneWorld {
+                dim: DimId::Overworld,
+                reg,
+                state: &mut state,
+                now: 0,
+                reads: std::cell::RefCell::new(BTreeMap::new()),
+                writes: BTreeMap::new(),
+                dispensers: Vec::new(),
+            };
+            world.analog_signal(RsPos(x, y, z))
+        };
+        {
+            let mut chests = p8a_lock(chests());
+            match prev_nether {
+                Some(m) => {
+                    chests.insert(key_nether, m);
+                }
+                None => {
+                    chests.remove(&key_nether);
+                }
+            }
+            match prev_ow {
+                Some(m) => {
+                    chests.insert(key_ow, m);
+                }
+                None => {
+                    chests.remove(&key_ow);
+                }
+            }
+        }
+        assert_eq!(nether_signal, Some(2), "Nether comparator reads Nether chest");
+        assert_eq!(ow_signal, Some(0), "Overworld comparator reads Overworld chest");
+    }
+
+    /// #104: the chunk heightmap compound carries both `MOTION_BLOCKING` and
+    /// `WORLD_SURFACE`, each the 37-long 9-bit non-straddling packed array
+    /// Vanilla 1.21.1 writes.
+    #[test]
+    fn p8a_parity_heightmaps_emit_motion_blocking_and_world_surface() {
+        let mut mb = [0i32; 256];
+        let mut ws = [0i32; 256];
+        mb[0] = 70;
+        mb[255] = 100;
+        ws[0] = 80;
+        ws[255] = 90;
+        let nbt = heightmaps_nbt_dim(&mb, &ws, -64);
+        fn entry(nbt: &[u8], at: usize) -> (&str, Vec<u64>, usize) {
+            assert_eq!(nbt[at], 12, "TAG_Long_Array");
+            let name_len = u16::from_be_bytes([nbt[at + 1], nbt[at + 2]]) as usize;
+            let name = std::str::from_utf8(&nbt[at + 3..at + 3 + name_len]).unwrap();
+            let mut cur = at + 3 + name_len;
+            let count = i32::from_be_bytes(nbt[cur..cur + 4].try_into().unwrap());
+            assert_eq!(count, 37, "a Vanilla heightmap is exactly 37 longs");
+            cur += 4;
+            let longs: Vec<u64> = (0..37)
+                .map(|i| u64::from_be_bytes(nbt[cur + 8 * i..cur + 8 * i + 8].try_into().unwrap()))
+                .collect();
+            (name, longs, cur + 37 * 8)
+        }
+        assert_eq!(nbt[0], 10, "anonymous TAG_Compound");
+        let (n1, l1, at) = entry(&nbt, 1);
+        let (n2, l2, at) = entry(&nbt, at);
+        assert_eq!(n1, "MOTION_BLOCKING");
+        assert_eq!(n2, "WORLD_SURFACE");
+        assert_eq!(nbt[at], 0, "compound terminator");
+        assert_eq!(at + 1, nbt.len(), "nothing trails the compound");
+        let val = |longs: &[u64], i: usize| (longs[i / 7] >> ((i % 7) * 9)) & 0x1ff;
+        assert_eq!(val(&l1, 0), 134); // 70 - (-64)
+        assert_eq!(val(&l1, 255), 164); // 100 - (-64)
+        assert_eq!(val(&l2, 0), 144); // 80 - (-64)
+        assert_eq!(val(&l2, 255), 154); // 90 - (-64)
+    }
+
+    /// Profiler unification: `game_tick` records into the very same
+    /// `ServerHotspotProfiler` `/profile` reads — one `OnceLock`, not two.
+    #[test]
+    fn p8a_parity_game_tick_profiler_is_the_profiled_instance() {
+        {
+            // Another test may leave the controller frozen; a skipped tick
+            // would feed nothing.
+            let mut ctl = p8a_lock(tick_controller());
+            ctl.frozen = false;
+            ctl.step_remaining = 0;
+            ctl.sprint_remaining = 0;
+        }
+        // `ring_len` saturates at capacity, so the shared-ring signal is
+        // `ring_next` advancing exactly one slot per recorded tick.
+        let before = p8a_lock(live_hotspot_profiler()).ring_next;
+        game_tick(|_, tick| tick());
+        assert_eq!(
+            p8a_lock(live_hotspot_profiler()).ring_next,
+            (before + 1) % PROFILER_RING_CAPACITY,
+            "a real game_tick must land in the /profile profiler"
+        );
+    }
+
+    /// #124: `game_tick` stages follow Vanilla `ServerLevel.tick` order —
+    /// scheduled block ticks, fluid ticks, raids, the chunk pass (entities,
+    /// block entities, `tickChunk` random ticks), then queued block events.
+    #[test]
+    fn p8a_parity_tick_phases_follow_vanilla_order() {
+        {
+            let mut ctl = p8a_lock(tick_controller());
+            ctl.frozen = false;
+            ctl.step_remaining = 0;
+            ctl.sprint_remaining = 0;
+        }
+        let mut names: Vec<&'static str> = Vec::new();
+        game_tick(|name, _| names.push(name));
+        let at = |name: &str| {
+            names
+                .iter()
+                .position(|&n| n == name)
+                .unwrap_or_else(|| panic!("stage {name} missing from {names:?}"))
+        };
+        assert!(at("scheduled_blocks") < at("generated_fluids"));
+        assert!(at("redstone") < at("villager_raid"));
+        assert!(at("generated_fluids") < at("water"));
+        assert!(at("water") < at("villager_raid"));
+        assert!(at("villager_raid") < at("drops"));
+        assert!(at("villager_raid") < at("mobs"));
+        assert!(at("drops") < at("mobs"));
+        assert!(at("mobs") < at("furnaces"));
+        assert!(at("furnaces") < at("random_ticks"));
+        assert!(at("hoppers") < at("random_ticks"));
+        assert!(at("random_ticks") < at("block_updates"));
+        assert!(at("block_updates") < at("live_mods"));
+    }
+
+    /// #120: `villager_raid` is a real `game_tick` stage — omen conversion and
+    /// raid progression run every server tick — gated by the live
+    /// `disableRaids` gamerule atomic.
+    #[test]
+    fn p8a_parity_raid_stage_is_wired_and_disable_gated() {
+        {
+            let mut ctl = p8a_lock(tick_controller());
+            ctl.frozen = false;
+            ctl.step_remaining = 0;
+            ctl.sprint_remaining = 0;
+        }
+        let mut names: Vec<&'static str> = Vec::new();
+        game_tick(|name, _| names.push(name));
+        assert!(
+            names.contains(&"villager_raid"),
+            "raid trigger and progression must tick inside game_tick"
+        );
+        let saved = GR_DISABLE_RAIDS.swap(1, Ordering::Relaxed);
+        assert!(gr_disable_raids());
+        GR_DISABLE_RAIDS.store(0, Ordering::Relaxed);
+        assert!(!gr_disable_raids());
+        GR_DISABLE_RAIDS.store(saved, Ordering::Relaxed);
     }
 }
