@@ -65,6 +65,7 @@ dependencies = [
 name = "create-adapter"
 version = "0.1.0"
 dependencies = [
+ "mc-spine-core",
  "mod-adapter-core",
  "mod-offload",
 ]
