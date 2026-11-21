@@ -19,6 +19,12 @@
 //!   mod-contraption geometry: dense 48-byte [`KineticInstanceGpu`] records in
 //!   an SSBO plus one [`DrawIndexedIndirectCommand`] per mesh kind, matching
 //!   `VkDrawIndexedIndirectCommand`.
+//! * [`BlockEntityInstancePool`] applies the same instancing to block
+//!   entities — chests, item frames, signs, beds, banners, bells, hoppers —
+//!   so a storage room submits one indirect draw per [`BlockEntityMeshKind`]
+//!   on SSBO/MDI GPUs or 16 KiB-safe UBO batches on
+//!   [`ActiveRenderBackend::ClassicLowSpec`], with CPU distance + frustum
+//!   culling ahead of the upload.
 
 use std::collections::BTreeMap;
 
@@ -982,11 +988,522 @@ impl KineticInstancePool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// BlockEntity GPU instancing pool (storage-room scale)
+// ---------------------------------------------------------------------------
+
+/// 16-way yaw resolution stored in [`BlockEntityInstanceGpu::facing_and_flags`]
+/// bits 0..5 (cardinal facings use steps 0, 4, 8, 12).
+pub const BLOCK_ENTITY_FACING_MASK: u32 = 0x1f;
+/// `facing_and_flags` shift for the dye-color field (bits 5..9, values 0..16
+/// matching Minecraft's dye order).
+pub const BLOCK_ENTITY_DYE_SHIFT: u32 = 5;
+/// `facing_and_flags` dye-color field width.
+pub const BLOCK_ENTITY_DYE_MASK: u32 = 0xf;
+/// `facing_and_flags` bit: emissive rendering (glow item frame, glowing
+/// sign text).
+pub const BLOCK_ENTITY_FLAG_GLOWING: u32 = 1 << 9;
+/// `facing_and_flags` bit: the mesh mounts flat on a wall face instead of
+/// standing free (wall sign/frame orientation data).
+pub const BLOCK_ENTITY_FLAG_WALL_MOUNTED: u32 = 1 << 10;
+/// `lod_flags` bit: skip both distance and frustum culling for this
+/// instance — for block entities that must render at any range.
+pub const BLOCK_ENTITY_LOD_FLAG_NO_CULL: u32 = 1;
+/// First mesh-kind id available to [`BlockEntityMeshKind::Custom`]: the
+/// built-in kinds occupy ids 0..14 (15 is reserved), so custom kinds can
+/// never collide with a vanilla kind.
+pub const BLOCK_ENTITY_MESH_KIND_CUSTOM_BASE: u32 = 16;
+/// Bytes per [`BlockEntityInstanceGpu`] record — the same 48 B stride as
+/// [`KineticInstanceGpu`], so both pools share the 16 KiB UBO batch budget.
+pub const BLOCK_ENTITY_INSTANCE_GPU_BYTES: u32 =
+    std::mem::size_of::<BlockEntityInstanceGpu>() as u32;
+
+/// Pack the `facing_and_flags` word: `facing_steps` 0..16 (16-way yaw;
+/// cardinal = 0/4/8/12), `dye_color` 0..16, plus the glowing and
+/// wall-mounted bits.
+pub const fn pack_facing_and_flags(
+    facing_steps: u32,
+    dye_color: u32,
+    glowing: bool,
+    wall_mounted: bool,
+) -> u32 {
+    (facing_steps & BLOCK_ENTITY_FACING_MASK)
+        | ((dye_color & BLOCK_ENTITY_DYE_MASK) << BLOCK_ENTITY_DYE_SHIFT)
+        | ((glowing as u32) << 9)
+        | ((wall_mounted as u32) << 10)
+}
+
+/// The shared mesh template a block entity draws, keyed by
+/// [`BlockEntityInstanceGpu::mesh_kind`]. One mesh kind covers every block
+/// entity that shares one vertex/index run — chests, double-chest halves,
+/// frames, signs, beds, banners, the bell, and hoppers — while
+/// [`BlockEntityMeshKind::Custom`] maps into its own id range
+/// (`>=` [`BLOCK_ENTITY_MESH_KIND_CUSTOM_BASE`]) so modded or datapack
+/// geometry never collides with a built-in kind.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BlockEntityMeshKind {
+    /// Single chest (27-slot box).
+    ChestSingle = 0,
+    /// Left half of a double chest.
+    ChestDoubleLeft = 1,
+    /// Right half of a double chest.
+    ChestDoubleRight = 2,
+    /// Ender chest.
+    EnderChest = 3,
+    /// Shulker box (`lid_or_anim_rad` carries the open progress).
+    ShulkerBox = 4,
+    /// Item frame lying flat against a block face.
+    ItemFrame = 5,
+    /// Glow item frame (emissive).
+    GlowItemFrame = 6,
+    /// Free-standing sign post.
+    StandingSign = 7,
+    /// Sign mounted flat on a wall.
+    WallSign = 8,
+    /// Hanging sign suspended from chains.
+    HangingSign = 9,
+    /// Head half of a bed.
+    BedHead = 10,
+    /// Foot half of a bed.
+    BedFoot = 11,
+    /// Banner; standing and wall variants share the mesh, the
+    /// wall-mounted flag bit carries the orientation difference.
+    Banner = 12,
+    /// Bell (`lid_or_anim_rad` carries the swing angle).
+    Bell = 13,
+    /// Hopper.
+    Hopper = 14,
+    /// Modded/datapack mesh kinds; `Custom(v)` draws as mesh-kind id
+    /// `BLOCK_ENTITY_MESH_KIND_CUSTOM_BASE + v` (saturating), leaving id 15
+    /// permanently reserved.
+    Custom(u32) = 15,
+}
+
+impl BlockEntityMeshKind {
+    /// The `mesh_kind` id this kind groups and draws under: the built-in
+    /// discriminant for the named kinds, `BLOCK_ENTITY_MESH_KIND_CUSTOM_BASE
+    /// + v` for `Custom(v)` (saturating at `u32::MAX`).
+    pub const fn to_mesh_kind_id(self) -> u32 {
+        match self {
+            Self::ChestSingle => 0,
+            Self::ChestDoubleLeft => 1,
+            Self::ChestDoubleRight => 2,
+            Self::EnderChest => 3,
+            Self::ShulkerBox => 4,
+            Self::ItemFrame => 5,
+            Self::GlowItemFrame => 6,
+            Self::StandingSign => 7,
+            Self::WallSign => 8,
+            Self::HangingSign => 9,
+            Self::BedHead => 10,
+            Self::BedFoot => 11,
+            Self::Banner => 12,
+            Self::Bell => 13,
+            Self::Hopper => 14,
+            Self::Custom(v) => BLOCK_ENTITY_MESH_KIND_CUSTOM_BASE.saturating_add(v),
+        }
+    }
+}
+
+/// Dense GPU instance record for one block entity (chest, frame, sign, bed,
+/// banner, bell, hopper). Exactly 48 bytes, `align(4)` — the same stride as
+/// [`KineticInstanceGpu`], so both pools share the
+/// [`MAX_INSTANCES_PER_UBO_16KB`]-instance 16 KiB UBO budget on
+/// [`ActiveRenderBackend::ClassicLowSpec`] hardware. `lid_or_anim_rad`
+/// carries the chest/shulker lid angle, bell swing, or sign wobble, so an
+/// animation tick rewrites a live instance record instead of rebuilding a
+/// chunk mesh.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BlockEntityInstanceGpu {
+    /// Block position in render-world blocks (the block's min corner).
+    pub pos: [f32; 3],
+    /// Chest/shulker lid angle, bell swing, or sign wobble in radians.
+    pub lid_or_anim_rad: f32,
+    /// Packed facing/dye/glowing/wall-mounted word; see
+    /// [`pack_facing_and_flags`].
+    pub facing_and_flags: u32,
+    /// Packed light: block-light nibble | sky-light nibble << 4 per channel.
+    pub light_packed: u32,
+    /// RGBA tint, one byte per channel.
+    pub tint_rgba: u32,
+    /// Per-axis nonuniform scale; also the culling AABB's extent above
+    /// `pos`, so the default `[1.0; 3]` culls as a one-block box.
+    pub scale_xyz: [f32; 3],
+    /// Mesh-kind id this instance groups under; upserts write
+    /// `kind.to_mesh_kind_id()` here so the record always matches its batch
+    /// grouping.
+    pub mesh_kind: u32,
+    /// LOD/culling flags; [`BLOCK_ENTITY_LOD_FLAG_NO_CULL`] exempts the
+    /// instance from distance and frustum culling.
+    pub lod_flags: u32,
+}
+
+impl BlockEntityInstanceGpu {
+    /// 16-way yaw steps packed in `facing_and_flags` bits 0..5 (0..16;
+    /// cardinal = 0/4/8/12).
+    pub fn facing_steps(&self) -> u32 {
+        self.facing_and_flags & BLOCK_ENTITY_FACING_MASK
+    }
+
+    /// Dye color packed in `facing_and_flags` bits 5..9 (0..16).
+    pub fn dye_color(&self) -> u32 {
+        (self.facing_and_flags >> BLOCK_ENTITY_DYE_SHIFT) & BLOCK_ENTITY_DYE_MASK
+    }
+
+    /// Whether the instance renders emissive (glow frame, glowing text).
+    pub fn glowing(&self) -> bool {
+        self.facing_and_flags & BLOCK_ENTITY_FLAG_GLOWING != 0
+    }
+
+    /// Whether the mesh mounts flat on a wall face.
+    pub fn wall_mounted(&self) -> bool {
+        self.facing_and_flags & BLOCK_ENTITY_FLAG_WALL_MOUNTED != 0
+    }
+
+    /// Whether distance and frustum culling may drop this instance —
+    /// false once [`BLOCK_ENTITY_LOD_FLAG_NO_CULL`] is set in `lod_flags`.
+    pub fn cullable(&self) -> bool {
+        self.lod_flags & BLOCK_ENTITY_LOD_FLAG_NO_CULL == 0
+    }
+}
+
+/// Instance AABB for culling: `pos` is the block's min corner and
+/// `scale_xyz` the extent; a negative scale flips the corner.
+#[inline]
+fn block_entity_aabb(record: &BlockEntityInstanceGpu) -> ([f32; 3], [f32; 3]) {
+    let mut min = [0.0; 3];
+    let mut max = [0.0; 3];
+    for axis in 0..3 {
+        let extent = record.pos[axis] + record.scale_xyz[axis];
+        min[axis] = record.pos[axis].min(extent);
+        max[axis] = record.pos[axis].max(extent);
+    }
+    (min, max)
+}
+
+/// CPU-side accounting for one culled block-entity batch build: how many
+/// registered instances were dropped by the distance test, how many by the
+/// frustum test, and how many reached the GPU stream.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockEntityBatchStats {
+    /// Live instances in the pool when the build ran.
+    pub total_registered: u32,
+    /// Instances dropped because their `pos` lay past `max_dist_sq`.
+    pub culled_distance: u32,
+    /// Instances dropped because their AABB was fully outside
+    /// `frustum_planes` (after surviving the distance test).
+    pub culled_frustum: u32,
+    /// Instances written into the frame's packed GPU stream (survivors
+    /// with a registered template).
+    pub uploaded_instances: u32,
+    /// Draw calls the build emits: indirect commands on the SSBO/MDI path,
+    /// UBO batches on [`ActiveRenderBackend::ClassicLowSpec`].
+    pub draw_calls: u32,
+}
+
+/// One frame's block-entity instancing upload on the SSBO/indirect path:
+/// the dense instance buffer, one [`DrawIndexedIndirectCommand`] per active
+/// mesh kind, and the culling accounting.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlockEntityFrameUpload {
+    /// Instance records grouped by `mesh_kind`; command `first_instance`
+    /// indexes this array.
+    pub instances: Vec<BlockEntityInstanceGpu>,
+    /// Exactly one [`DrawIndexedIndirectCommand`] per active `mesh_kind`
+    /// that has a registered template, in ascending `mesh_kind` order.
+    pub commands: Vec<DrawIndexedIndirectCommand>,
+    /// What the cull pass kept and dropped to produce this upload.
+    pub stats: BlockEntityBatchStats,
+}
+
+/// One uniform-buffer-sized draw batch for the
+/// [`ActiveRenderBackend::ClassicLowSpec`] block-entity path: at most
+/// `max_instances_per_ubo` [`BlockEntityInstanceGpu`] records of a single
+/// `mesh_kind`, uploaded through one UBO bind instead of the shared SSBO
+/// the indirect path uses.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlockEntityUboBatch {
+    /// The shared mesh template this batch draws.
+    pub mesh_kind: u32,
+    /// Index run length in the merged geometry buffer.
+    pub index_count: u32,
+    /// First index of the template's run in the merged geometry buffer.
+    pub first_index: u32,
+    /// Vertex offset applied when indexing the template's run.
+    pub vertex_offset: i32,
+    /// This batch's offset in the frame's packed instance stream (the sum
+    /// of all earlier batches' instance counts, across all mesh kinds).
+    pub first_instance: u32,
+    /// The exact instance records this batch uploads, in the same
+    /// deterministic order [`BlockEntityInstancePool::build_indirect_batches`]
+    /// writes them.
+    pub instances: Vec<BlockEntityInstanceGpu>,
+}
+
+/// One frame's block-entity UBO upload: the chunked batches plus the
+/// culling accounting that produced them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlockEntityUboFrame {
+    /// Draw batches in ascending `mesh_kind` order, each holding at most
+    /// `max_instances_per_ubo` records.
+    pub batches: Vec<BlockEntityUboBatch>,
+    /// What the cull pass kept and dropped to produce these batches.
+    pub stats: BlockEntityBatchStats,
+}
+
+/// Hardware-instancing pool for block-entity geometry — chests, item
+/// frames, signs, beds, banners, bells, hoppers — the per-block-entity draw
+/// calls that make storage rooms the worst vanilla FPS cliff. Upserts and
+/// removals keep instances keyed by `instance_id`; each frame a build call
+/// packs the surviving instances into a deterministic SSBO (sorted by
+/// `mesh_kind`, then `instance_id`) and emits exactly one indirect command
+/// per mesh kind on MDI hardware, or 16 KiB-safe UBO batches on
+/// [`ActiveRenderBackend::ClassicLowSpec`] Intel HD/UHD iGPUs. The
+/// `*_culled` builds drop out-of-frustum and past-`max_dist_sq` instances
+/// before upload, so frames and signs beyond a couple of chunk radii cost
+/// nothing while near geometry keeps its exact vanilla appearance.
+#[derive(Default)]
+pub struct BlockEntityInstancePool {
+    /// `instance_id -> record`; BTreeMap keeps a stable id order.
+    instances: BTreeMap<u64, BlockEntityInstanceGpu>,
+    /// `mesh_kind -> merged-buffer run`.
+    templates: BTreeMap<u32, MeshKindTemplate>,
+}
+
+impl BlockEntityInstancePool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert or overwrite `instance_id`. The explicit `kind` is
+    /// authoritative and is written into `record.mesh_kind` so the SSBO
+    /// record always matches its batch grouping.
+    pub fn upsert(
+        &mut self,
+        instance_id: u64,
+        kind: BlockEntityMeshKind,
+        mut record: BlockEntityInstanceGpu,
+    ) {
+        record.mesh_kind = kind.to_mesh_kind_id();
+        self.instances.insert(instance_id, record);
+    }
+
+    /// Remove `instance_id`; returns false when it was not present. Removal
+    /// leaves no residue: the next build emits neither the record nor its
+    /// bytes.
+    pub fn remove(&mut self, instance_id: u64) -> bool {
+        self.instances.remove(&instance_id).is_some()
+    }
+
+    /// The live record for `instance_id`.
+    pub fn get(&self, instance_id: u64) -> Option<&BlockEntityInstanceGpu> {
+        self.instances.get(&instance_id)
+    }
+
+    /// Number of live instances.
+    pub fn len(&self) -> usize {
+        self.instances.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
+    }
+
+    /// Register the merged-geometry-buffer run for `kind`. Instances of a
+    /// kind with no template are skipped entirely at batch time — they are
+    /// neither uploaded nor drawn.
+    pub fn set_mesh_template(
+        &mut self,
+        kind: BlockEntityMeshKind,
+        index_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+    ) {
+        self.templates.insert(
+            kind.to_mesh_kind_id(),
+            MeshKindTemplate {
+                index_count,
+                first_index,
+                vertex_offset,
+            },
+        );
+    }
+
+    /// The registered template for `kind`, if any.
+    pub fn mesh_template(&self, kind: BlockEntityMeshKind) -> Option<MeshKindTemplate> {
+        self.templates.get(&kind.to_mesh_kind_id()).copied()
+    }
+
+    /// Pack the visible instances into the deterministic frame stream —
+    /// sorted by (`mesh_kind`, `instance_id`), skipping kinds with no
+    /// template — after the cull pass. A cullable instance is dropped when
+    /// `pos` is farther than `max_dist_sq` from `camera_pos`, or when its
+    /// `scale_xyz` AABB lies fully outside any `frustum_planes` plane
+    /// (`dot(n, p) + d >= 0` inside, [`aabb_in_frustum`]'s positive-vertex
+    /// test). [`BLOCK_ENTITY_LOD_FLAG_NO_CULL`] instances skip both tests.
+    /// Shared by the SSBO/indirect and UBO batch paths so both emit
+    /// identical instance bytes.
+    fn pack_instance_runs_culled(
+        &self,
+        camera_pos: [f32; 3],
+        max_dist_sq: f32,
+        frustum_planes: &[[f32; 4]],
+    ) -> (
+        Vec<BlockEntityInstanceGpu>,
+        Vec<(u32, MeshKindTemplate, u32, u32)>,
+        BlockEntityBatchStats,
+    ) {
+        let mut stats = BlockEntityBatchStats {
+            total_registered: self.instances.len() as u32,
+            ..BlockEntityBatchStats::default()
+        };
+        let mut visible = Vec::with_capacity(self.instances.len());
+        for record in self.instances.values() {
+            if record.cullable() {
+                let d = [
+                    record.pos[0] - camera_pos[0],
+                    record.pos[1] - camera_pos[1],
+                    record.pos[2] - camera_pos[2],
+                ];
+                if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > max_dist_sq {
+                    stats.culled_distance += 1;
+                    continue;
+                }
+                let (min, max) = block_entity_aabb(record);
+                if !aabb_in_frustum(min, max, frustum_planes) {
+                    stats.culled_frustum += 1;
+                    continue;
+                }
+            }
+            visible.push(record);
+        }
+
+        let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
+        for record in &visible {
+            if self.templates.contains_key(&record.mesh_kind) {
+                *counts.entry(record.mesh_kind).or_default() += 1;
+            }
+        }
+        let total: u32 = counts.values().sum();
+        let mut instances = vec![BlockEntityInstanceGpu::default(); total as usize];
+        let mut runs = Vec::with_capacity(counts.len());
+        let mut cursors: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut next = 0u32;
+        for (&kind, &count) in &counts {
+            runs.push((kind, self.templates[&kind], next, count));
+            cursors.insert(kind, next);
+            next += count;
+        }
+        for record in visible {
+            let Some(slot) = cursors.get_mut(&record.mesh_kind) else {
+                continue;
+            };
+            instances[*slot as usize] = *record;
+            *slot += 1;
+        }
+        stats.uploaded_instances = total;
+        (instances, runs, stats)
+    }
+
+    /// Pack the frame's instancing upload after CPU distance + frustum
+    /// culling. Deterministic: surviving instances sort by (`mesh_kind`,
+    /// `instance_id`), so two builds over identical state are
+    /// byte-identical. One [`DrawIndexedIndirectCommand`] per surviving
+    /// `mesh_kind` with a registered template; `stats` reports the cull
+    /// accounting and `stats.draw_calls` equals `commands.len()`.
+    pub fn build_indirect_batches_culled(
+        &self,
+        camera_pos: [f32; 3],
+        max_dist_sq: f32,
+        frustum_planes: &[[f32; 4]],
+    ) -> BlockEntityFrameUpload {
+        let (instances, runs, mut stats) =
+            self.pack_instance_runs_culled(camera_pos, max_dist_sq, frustum_planes);
+        let commands = runs
+            .iter()
+            .map(|&(_, template, first_instance, count)| DrawIndexedIndirectCommand {
+                index_count: template.index_count,
+                instance_count: count,
+                first_index: template.first_index,
+                vertex_offset: template.vertex_offset,
+                first_instance,
+            })
+            .collect::<Vec<_>>();
+        stats.draw_calls = commands.len() as u32;
+        BlockEntityFrameUpload {
+            instances,
+            commands,
+            stats,
+        }
+    }
+
+    /// Unculled frame upload — every registered, templated instance.
+    /// Equivalent to `build_indirect_batches_culled([0.0; 3],
+    /// f32::INFINITY, &[])`.
+    pub fn build_indirect_batches(&self) -> BlockEntityFrameUpload {
+        self.build_indirect_batches_culled([0.0; 3], f32::INFINITY, &[])
+    }
+
+    /// Split the frame's culled instance stream into uniform-buffer-sized
+    /// draw batches for [`ActiveRenderBackend::ClassicLowSpec`]: every
+    /// surviving `mesh_kind`'s run is chunked into groups of at most
+    /// `max_instances_per_ubo` instances (`0` is clamped to 1), in
+    /// ascending `mesh_kind` order. Pass [`MAX_INSTANCES_PER_UBO_16KB`] —
+    /// or [`GpuMemoryProfile::max_instances_per_ubo`] — so each batch fits
+    /// the 16 KiB UBO floor every GL 3.3 / Vulkan 1.1 device guarantees.
+    /// Deterministic and lossless: concatenating every batch's `instances`
+    /// reproduces the same byte stream
+    /// [`Self::build_indirect_batches_culled`] packs for the same camera.
+    pub fn build_ubo_batches_culled(
+        &self,
+        camera_pos: [f32; 3],
+        max_dist_sq: f32,
+        frustum_planes: &[[f32; 4]],
+        max_instances_per_ubo: usize,
+    ) -> BlockEntityUboFrame {
+        let per_ubo = max_instances_per_ubo.max(1);
+        let (instances, runs, mut stats) =
+            self.pack_instance_runs_culled(camera_pos, max_dist_sq, frustum_planes);
+        let mut batches = Vec::new();
+        for (kind, template, first, count) in runs {
+            let start = first as usize;
+            let end = (first + count) as usize;
+            for (offset, chunk) in instances[start..end].chunks(per_ubo).enumerate() {
+                batches.push(BlockEntityUboBatch {
+                    mesh_kind: kind,
+                    index_count: template.index_count,
+                    first_index: template.first_index,
+                    vertex_offset: template.vertex_offset,
+                    first_instance: first + (offset * per_ubo) as u32,
+                    instances: chunk.to_vec(),
+                });
+            }
+        }
+        stats.draw_calls = batches.len() as u32;
+        BlockEntityUboFrame { batches, stats }
+    }
+
+    /// Unculled UBO batching — every registered, templated instance.
+    /// Equivalent to `build_ubo_batches_culled([0.0; 3], f32::INFINITY,
+    /// &[], max_instances_per_ubo)`, returning just the batch list.
+    pub fn build_ubo_batches(&self, max_instances_per_ubo: usize) -> Vec<BlockEntityUboBatch> {
+        self.build_ubo_batches_culled([0.0; 3], f32::INFINITY, &[], max_instances_per_ubo)
+            .batches
+    }
+}
+
 const _: () = {
     assert!(std::mem::size_of::<KineticInstanceGpu>() == 48);
     assert!(MAX_INSTANCES_PER_UBO_16KB * KINETIC_INSTANCE_GPU_BYTES as usize
         <= MIN_GUARANTEED_UBO_BYTES as usize);
     assert!(std::mem::align_of::<KineticInstanceGpu>() == 4);
+    assert!(std::mem::size_of::<BlockEntityInstanceGpu>() == 48);
+    assert!(std::mem::align_of::<BlockEntityInstanceGpu>() == 4);
+    assert!(MAX_INSTANCES_PER_UBO_16KB * BLOCK_ENTITY_INSTANCE_GPU_BYTES as usize
+        <= MIN_GUARANTEED_UBO_BYTES as usize);
     assert!(std::mem::size_of::<DrawIndexedIndirectCommand>() == 20);
     assert!(std::mem::size_of::<SubWorldTransformGpu>() == 64);
     assert!(std::mem::size_of::<MeshletDescriptor>() == 16);

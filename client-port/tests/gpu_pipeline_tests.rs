@@ -871,3 +871,457 @@ fn low_spec_budget_stays_generous_on_dedicated_gpus() {
     assert_eq!(budget.max_mesh_cache_mib, 256);
     assert!(!budget.use_ubo_kinetic_batches);
 }
+
+// ---------------------------------------------------------------------------
+// Lane PERF-3: BlockEntityInstancePool (storage-room instancing)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn block_entity_records_match_the_declared_layout() {
+    assert_eq!(size_of::<BlockEntityInstanceGpu>(), 48);
+    assert_eq!(align_of::<BlockEntityInstanceGpu>(), 4);
+    assert_eq!(BLOCK_ENTITY_INSTANCE_GPU_BYTES, 48);
+    assert_eq!(offset_of!(BlockEntityInstanceGpu, pos), 0);
+    assert_eq!(offset_of!(BlockEntityInstanceGpu, lid_or_anim_rad), 12);
+    assert_eq!(offset_of!(BlockEntityInstanceGpu, facing_and_flags), 16);
+    assert_eq!(offset_of!(BlockEntityInstanceGpu, light_packed), 20);
+    assert_eq!(offset_of!(BlockEntityInstanceGpu, tint_rgba), 24);
+    assert_eq!(offset_of!(BlockEntityInstanceGpu, scale_xyz), 28);
+    assert_eq!(offset_of!(BlockEntityInstanceGpu, mesh_kind), 40);
+    assert_eq!(offset_of!(BlockEntityInstanceGpu, lod_flags), 44);
+    // Same stride as the kinetic pool, so both share the 16 KiB UBO floor.
+    assert_eq!(BLOCK_ENTITY_INSTANCE_GPU_BYTES, KINETIC_INSTANCE_GPU_BYTES);
+    assert!(
+        MAX_INSTANCES_PER_UBO_16KB * BLOCK_ENTITY_INSTANCE_GPU_BYTES as usize
+            <= MIN_GUARANTEED_UBO_BYTES as usize
+    );
+}
+
+#[test]
+fn block_entity_mesh_kind_ids_are_stable_and_collision_free() {
+    let named = [
+        BlockEntityMeshKind::ChestSingle,
+        BlockEntityMeshKind::ChestDoubleLeft,
+        BlockEntityMeshKind::ChestDoubleRight,
+        BlockEntityMeshKind::EnderChest,
+        BlockEntityMeshKind::ShulkerBox,
+        BlockEntityMeshKind::ItemFrame,
+        BlockEntityMeshKind::GlowItemFrame,
+        BlockEntityMeshKind::StandingSign,
+        BlockEntityMeshKind::WallSign,
+        BlockEntityMeshKind::HangingSign,
+        BlockEntityMeshKind::BedHead,
+        BlockEntityMeshKind::BedFoot,
+        BlockEntityMeshKind::Banner,
+        BlockEntityMeshKind::Bell,
+        BlockEntityMeshKind::Hopper,
+    ];
+    assert_eq!(named.len(), 15);
+    for (expected, kind) in named.iter().enumerate() {
+        assert_eq!(kind.to_mesh_kind_id(), expected as u32, "{kind:?}");
+    }
+    // Custom kinds live strictly above the reserved id 15.
+    assert_eq!(
+        BlockEntityMeshKind::Custom(0).to_mesh_kind_id(),
+        BLOCK_ENTITY_MESH_KIND_CUSTOM_BASE
+    );
+    assert_eq!(
+        BlockEntityMeshKind::Custom(41).to_mesh_kind_id(),
+        BLOCK_ENTITY_MESH_KIND_CUSTOM_BASE + 41
+    );
+    assert_eq!(
+        BlockEntityMeshKind::Custom(u32::MAX).to_mesh_kind_id(),
+        u32::MAX,
+        "custom ids saturate instead of wrapping into the built-in range"
+    );
+    // No named kind can collide with a custom id.
+    assert!(named
+        .iter()
+        .all(|kind| kind.to_mesh_kind_id() < BLOCK_ENTITY_MESH_KIND_CUSTOM_BASE));
+}
+
+#[test]
+fn block_entity_flags_pack_and_unpack() {
+    let flags = pack_facing_and_flags(9, 14, true, false);
+    let mut record = BlockEntityInstanceGpu {
+        facing_and_flags: flags,
+        ..BlockEntityInstanceGpu::default()
+    };
+    assert_eq!(record.facing_steps(), 9);
+    assert_eq!(record.dye_color(), 14);
+    assert!(record.glowing());
+    assert!(!record.wall_mounted());
+    assert!(record.cullable());
+
+    // Values above the field width are masked off.
+    record.facing_and_flags = pack_facing_and_flags(37, 19, false, true);
+    assert_eq!(record.facing_steps(), 37 & BLOCK_ENTITY_FACING_MASK);
+    assert_eq!(record.dye_color(), 19 & BLOCK_ENTITY_DYE_MASK);
+    assert!(!record.glowing());
+    assert!(record.wall_mounted());
+
+    record.lod_flags = BLOCK_ENTITY_LOD_FLAG_NO_CULL;
+    assert!(!record.cullable());
+}
+
+fn block_entity_instance(seed: u64) -> BlockEntityInstanceGpu {
+    BlockEntityInstanceGpu {
+        // A storage-room grid: ~190 x ~100 blocks of block entities.
+        pos: [
+            (seed % 97) as f32 * 2.0,
+            64.0 + (seed % 4) as f32,
+            (seed % 53) as f32 * 2.0,
+        ],
+        lid_or_anim_rad: (seed % 17) as f32 * 0.1,
+        facing_and_flags: pack_facing_and_flags(
+            (seed % 16) as u32,
+            (seed % 16) as u32,
+            false,
+            false,
+        ),
+        light_packed: 0x00ff,
+        tint_rgba: 0xffff_ffff,
+        scale_xyz: [1.0; 3],
+        mesh_kind: 0,
+        lod_flags: 0,
+    }
+}
+
+fn block_entity_at(x: f32, y: f32, z: f32) -> BlockEntityInstanceGpu {
+    BlockEntityInstanceGpu {
+        pos: [x, y, z],
+        scale_xyz: [1.0; 3],
+        tint_rgba: 0xffff_ffff,
+        ..block_entity_instance(0)
+    }
+}
+
+fn be_instance_bytes(instances: &[BlockEntityInstanceGpu]) -> &[u8] {
+    // SAFETY: BlockEntityInstanceGpu is a plain repr(C) record; reading it
+    // as bytes within its own slice is valid.
+    unsafe { std::slice::from_raw_parts(instances.as_ptr().cast::<u8>(), size_of_val(instances)) }
+}
+
+/// The 1,000-chest / 500-frame / 300-sign storage room from the lane spec.
+fn storage_room_pool() -> BlockEntityInstancePool {
+    let mut pool = BlockEntityInstancePool::new();
+    pool.set_mesh_template(BlockEntityMeshKind::ChestSingle, 54, 0, 0);
+    pool.set_mesh_template(BlockEntityMeshKind::ItemFrame, 12, 54, 24);
+    pool.set_mesh_template(BlockEntityMeshKind::StandingSign, 24, 66, 48);
+    for id in 0..1_000u64 {
+        pool.upsert(
+            id,
+            BlockEntityMeshKind::ChestSingle,
+            block_entity_instance(id),
+        );
+    }
+    for id in 1_000..1_500u64 {
+        pool.upsert(id, BlockEntityMeshKind::ItemFrame, block_entity_instance(id));
+    }
+    for id in 1_500..1_800u64 {
+        pool.upsert(
+            id,
+            BlockEntityMeshKind::StandingSign,
+            block_entity_instance(id),
+        );
+    }
+    pool
+}
+
+const STORAGE_ROOM_CAMERA: [f32; 3] = [96.0, 66.0, 52.0];
+
+#[test]
+fn storage_room_emits_one_indirect_command_per_mesh_kind() {
+    let pool = storage_room_pool();
+    assert_eq!(pool.len(), 1_800);
+
+    let upload = pool.build_indirect_batches_culled(
+        STORAGE_ROOM_CAMERA,
+        f32::INFINITY,
+        &[],
+    );
+    // 1,800 individual block-entity draws collapse to exactly 3 indirect
+    // commands — one per active mesh kind, ascending by mesh-kind id
+    // (ChestSingle=0, ItemFrame=5, StandingSign=7).
+    assert_eq!(upload.commands.len(), 3);
+    assert_eq!(upload.instances.len(), 1_800);
+    let expected = [
+        (BlockEntityMeshKind::ChestSingle, 1_000u32),
+        (BlockEntityMeshKind::ItemFrame, 500),
+        (BlockEntityMeshKind::StandingSign, 300),
+    ];
+    let mut first_instance = 0u32;
+    for (command, &(kind, count)) in upload.commands.iter().zip(&expected) {
+        let template = pool.mesh_template(kind).unwrap();
+        assert_eq!(command.index_count, template.index_count);
+        assert_eq!(command.first_index, template.first_index);
+        assert_eq!(command.vertex_offset, template.vertex_offset);
+        assert_eq!(command.instance_count, count);
+        assert_eq!(command.first_instance, first_instance);
+        // Every instance in the run belongs to the kind and runs fill in
+        // ascending instance-id order (id == upsert order == seed order).
+        let run = &upload.instances
+            [command.first_instance as usize..(command.first_instance + count) as usize];
+        assert!(run.iter().all(|r| r.mesh_kind == kind.to_mesh_kind_id()));
+        first_instance += count;
+    }
+    assert_eq!(
+        upload.stats,
+        BlockEntityBatchStats {
+            total_registered: 1_800,
+            culled_distance: 0,
+            culled_frustum: 0,
+            uploaded_instances: 1_800,
+            draw_calls: 3,
+        }
+    );
+
+    // Determinism: the unculled build and a repeat culled build are
+    // byte-identical.
+    let unculled = pool.build_indirect_batches();
+    assert_eq!(unculled, upload);
+    let repeat = pool.build_indirect_batches_culled(STORAGE_ROOM_CAMERA, f32::INFINITY, &[]);
+    assert_eq!(
+        be_instance_bytes(&upload.instances),
+        be_instance_bytes(&repeat.instances)
+    );
+}
+
+#[test]
+fn storage_room_ubo_batches_split_1000_chests_into_256_256_256_232() {
+    // Chests only: the ClassicLowSpec 16 KiB UBO path must split 1,000
+    // 48 B records into 256 + 256 + 256 + 232.
+    let mut pool = BlockEntityInstancePool::new();
+    pool.set_mesh_template(BlockEntityMeshKind::ChestSingle, 54, 0, 0);
+    for id in 0..1_000u64 {
+        pool.upsert(
+            id,
+            BlockEntityMeshKind::ChestSingle,
+            block_entity_instance(id),
+        );
+    }
+
+    let frame = pool.build_ubo_batches_culled(
+        STORAGE_ROOM_CAMERA,
+        f32::INFINITY,
+        &[],
+        MAX_INSTANCES_PER_UBO_16KB,
+    );
+    assert_eq!(frame.batches.len(), 4);
+    assert_eq!(
+        frame
+            .batches
+            .iter()
+            .map(|b| b.instances.len())
+            .collect::<Vec<_>>(),
+        vec![256, 256, 256, 232]
+    );
+    assert_eq!(
+        frame.stats,
+        BlockEntityBatchStats {
+            total_registered: 1_000,
+            culled_distance: 0,
+            culled_frustum: 0,
+            uploaded_instances: 1_000,
+            draw_calls: 4,
+        }
+    );
+
+    // Exact conservation and gapless, ascending coverage of the stream.
+    let conserved: usize = frame.batches.iter().map(|b| b.instances.len()).sum();
+    assert_eq!(conserved, 1_000);
+    let mut first_instance = 0u32;
+    for batch in &frame.batches {
+        assert_eq!(batch.mesh_kind, BlockEntityMeshKind::ChestSingle.to_mesh_kind_id());
+        assert_eq!(batch.index_count, 54);
+        assert_eq!(batch.first_index, 0);
+        assert_eq!(batch.vertex_offset, 0);
+        assert_eq!(batch.first_instance, first_instance);
+        first_instance += batch.instances.len() as u32;
+    }
+    // The unculled shorthand emits the same batch list.
+    assert_eq!(
+        pool.build_ubo_batches(MAX_INSTANCES_PER_UBO_16KB),
+        frame.batches
+    );
+}
+
+#[test]
+fn block_entity_ubo_stream_is_byte_identical_to_indirect_stream() {
+    let pool = storage_room_pool();
+    let indirect =
+        pool.build_indirect_batches_culled(STORAGE_ROOM_CAMERA, f32::INFINITY, &[]);
+    let frame = pool.build_ubo_batches_culled(
+        STORAGE_ROOM_CAMERA,
+        f32::INFINITY,
+        &[],
+        MAX_INSTANCES_PER_UBO_16KB,
+    );
+
+    // 1,000 chests -> 4, 500 frames -> 256+244 = 2, 300 signs -> 256+44 = 2.
+    assert_eq!(frame.batches.len(), 8);
+    assert_eq!(
+        frame
+            .batches
+            .iter()
+            .map(|b| b.mesh_kind)
+            .collect::<Vec<_>>(),
+        vec![0, 0, 0, 0, 5, 5, 7, 7]
+    );
+    assert_eq!(frame.batches[5].instances.len(), 244);
+    assert_eq!(frame.batches[7].instances.len(), 44);
+    assert_eq!(frame.stats.uploaded_instances, 1_800);
+    assert_eq!(frame.stats.draw_calls, 8);
+
+    let ubo_stream: Vec<BlockEntityInstanceGpu> = frame
+        .batches
+        .iter()
+        .flat_map(|b| b.instances.iter().copied())
+        .collect();
+    assert_eq!(
+        be_instance_bytes(&ubo_stream),
+        be_instance_bytes(&indirect.instances),
+        "UBO batches must conserve the exact indirect instance bytes"
+    );
+    // Every batch carries its kind's template geometry run (the values
+    // storage_room_pool registered: chest 54/0/0, frame 12/54/24,
+    // sign 24/66/48).
+    for batch in &frame.batches {
+        let (index_count, first_index, vertex_offset) = match batch.mesh_kind {
+            0 => (54, 0, 0),
+            5 => (12, 54, 24),
+            7 => (24, 66, 48),
+            other => panic!("unexpected mesh_kind {other}"),
+        };
+        assert_eq!(batch.index_count, index_count);
+        assert_eq!(batch.first_index, first_index);
+        assert_eq!(batch.vertex_offset, vertex_offset);
+    }
+}
+
+#[test]
+fn block_entity_culling_drops_far_and_offscreen_instances() {
+    let mut pool = BlockEntityInstancePool::new();
+    pool.set_mesh_template(BlockEntityMeshKind::ItemFrame, 12, 0, 0);
+    pool.set_mesh_template(BlockEntityMeshKind::ChestSingle, 54, 12, 8);
+    // Camera at the origin looking toward +z; the z >= 0 plane is the only
+    // frustum boundary.
+    let camera = [0.0, 64.0, 0.0];
+    let planes = [[0.0, 0.0, 1.0, 0.0]];
+    pool.upsert(0, BlockEntityMeshKind::ItemFrame, block_entity_at(4.0, 64.0, 10.0));
+    pool.upsert(1, BlockEntityMeshKind::ItemFrame, block_entity_at(200.0, 64.0, 0.0));
+    pool.upsert(2, BlockEntityMeshKind::ItemFrame, block_entity_at(4.0, 64.0, -50.0));
+    pool.upsert(3, BlockEntityMeshKind::ChestSingle, block_entity_at(2.0, 64.0, 5.0));
+
+    // 64-block entity render distance.
+    let upload = pool.build_indirect_batches_culled(camera, 64.0 * 64.0, &planes);
+    assert_eq!(
+        upload.stats,
+        BlockEntityBatchStats {
+            total_registered: 4,
+            culled_distance: 1, // id 1, 200 blocks out
+            culled_frustum: 1,  // id 2, inside range but fully behind z = 0
+            uploaded_instances: 2,
+            draw_calls: 2,
+        }
+    );
+    assert_eq!(upload.commands.len(), 2);
+    // The survivors are exactly the near frame and the near chest, still
+    // grouped one command per mesh kind (ChestSingle=0 first).
+    assert_eq!(upload.instances.len(), 2);
+    assert_eq!(upload.instances[0].pos, [2.0, 64.0, 5.0]);
+    assert_eq!(upload.instances[0].mesh_kind, 0);
+    assert_eq!(upload.instances[1].pos, [4.0, 64.0, 10.0]);
+    assert_eq!(upload.instances[1].mesh_kind, 5);
+
+    // Distance culling alone (no planes) drops only the 200-block frame.
+    let upload = pool.build_indirect_batches_culled(camera, 64.0 * 64.0, &[]);
+    assert_eq!(upload.stats.culled_distance, 1);
+    assert_eq!(upload.stats.culled_frustum, 0);
+    assert_eq!(upload.stats.uploaded_instances, 3);
+}
+
+#[test]
+fn block_entity_no_cull_flag_survives_distance_and_frustum() {
+    let mut pool = BlockEntityInstancePool::new();
+    pool.set_mesh_template(BlockEntityMeshKind::ItemFrame, 12, 0, 0);
+    let mut far = block_entity_at(500.0, 64.0, -500.0);
+    far.lod_flags = BLOCK_ENTITY_LOD_FLAG_NO_CULL;
+    pool.upsert(0, BlockEntityMeshKind::ItemFrame, far);
+    pool.upsert(1, BlockEntityMeshKind::ItemFrame, block_entity_at(4.0, 64.0, 10.0));
+
+    let upload = pool.build_indirect_batches_culled(
+        [0.0, 64.0, 0.0],
+        64.0 * 64.0,
+        &[[0.0, 0.0, 1.0, 0.0]],
+    );
+    // The flagged frame skips both tests despite being 500+ blocks away
+    // and fully behind the camera plane.
+    assert_eq!(upload.stats.culled_distance, 0);
+    assert_eq!(upload.stats.culled_frustum, 0);
+    assert_eq!(upload.stats.uploaded_instances, 2);
+    assert_eq!(upload.instances[0].pos, [500.0, 64.0, -500.0]);
+}
+
+#[test]
+fn chest_lid_angle_updates_in_place_without_rebatching() {
+    let mut pool = BlockEntityInstancePool::new();
+    pool.set_mesh_template(BlockEntityMeshKind::ChestSingle, 54, 0, 0);
+    for id in 0..10u64 {
+        pool.upsert(
+            id,
+            BlockEntityMeshKind::ChestSingle,
+            block_entity_instance(id),
+        );
+    }
+    let before = pool.build_indirect_batches();
+
+    // A lid-open tick rewrites the live record — no chunk mesh rebuild,
+    // no pool growth, no command-buffer change.
+    let mut record = *pool.get(5).unwrap();
+    record.lid_or_anim_rad = std::f32::consts::FRAC_PI_2;
+    pool.upsert(5, BlockEntityMeshKind::ChestSingle, record);
+    assert_eq!(pool.len(), 10);
+
+    let after = pool.build_indirect_batches();
+    assert_eq!(after.commands, before.commands);
+    assert_eq!(after.instances.len(), before.instances.len());
+    // Same-kind instances pack in id order, so slot 5 is id 5: only its
+    // lid bytes changed.
+    assert_eq!(
+        after.instances[5].lid_or_anim_rad,
+        std::f32::consts::FRAC_PI_2
+    );
+    for i in 0..10usize {
+        if i != 5 {
+            assert_eq!(after.instances[i], before.instances[i], "slot {i}");
+        }
+    }
+}
+
+#[test]
+fn untemplated_block_entity_kinds_are_not_uploaded() {
+    let mut pool = BlockEntityInstancePool::new();
+    pool.set_mesh_template(BlockEntityMeshKind::ChestSingle, 54, 0, 0);
+    pool.upsert(0, BlockEntityMeshKind::ChestSingle, block_entity_at(1.0, 64.0, 1.0));
+    pool.upsert(1, BlockEntityMeshKind::Custom(3), block_entity_at(2.0, 64.0, 1.0));
+
+    let upload = pool.build_indirect_batches();
+    assert_eq!(upload.stats.total_registered, 2);
+    assert_eq!(upload.stats.uploaded_instances, 1);
+    assert_eq!(upload.commands.len(), 1);
+    assert_eq!(upload.instances[0].mesh_kind, 0);
+
+    // Kind mismatch is authoritative: upserting a record built for another
+    // kind still lands it in the requested kind's run.
+    let mut wrong_kind = block_entity_at(3.0, 64.0, 1.0);
+    wrong_kind.mesh_kind = 99;
+    pool.upsert(2, BlockEntityMeshKind::ChestSingle, wrong_kind);
+    let upload = pool.build_indirect_batches();
+    assert_eq!(upload.stats.uploaded_instances, 2);
+    assert_eq!(upload.instances[1].mesh_kind, 0);
+
+    assert!(pool.remove(1));
+    assert!(!pool.remove(1));
+    assert_eq!(pool.build_indirect_batches().stats.total_registered, 2);
+}
