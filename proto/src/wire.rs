@@ -425,6 +425,23 @@ impl<'a> WireReader<'a> {
         Ok(BitSet::from_words(words))
     }
 
+    /// `VarInt(n)` + `n` little-endian bytes — the 1.21.5+
+    /// (`ByteBufCodecs.BIT_SET`) `java.util.BitSet` form where bit `i` is bit
+    /// `i % 8` of byte `i / 8`, bounded by `max_bytes`. The byte count is not
+    /// required to be a multiple of eight: the tail word keeps its unset high
+    /// bits zero.
+    pub fn read_bitset_bytes(&mut self, max_bytes: usize) -> Result<BitSet, ProtoError> {
+        let count = self.read_count(max_bytes)?;
+        let bytes = self.take(count)?;
+        let mut words = Vec::with_capacity(count.div_ceil(8).min(64));
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            words.push(u64::from_le_bytes(word));
+        }
+        Ok(BitSet::from_words(words))
+    }
+
     /// Consume one anonymous network NBT value and return its raw byte span
     /// (including the leading tag byte). Used where the canonical IR carries
     /// NBT opaquely — registry-data entries, component payloads — so callers
@@ -686,6 +703,17 @@ impl WireWriter {
         for &word in &set.words {
             self.write_u64(word);
         }
+    }
+
+    /// `VarInt(n)` + `n` little-endian bytes — the 1.21.5+
+    /// `java.util.BitSet.toByteArray` form, which drops trailing zero bytes.
+    pub fn write_bitset_bytes(&mut self, set: &BitSet) {
+        let mut bytes = Vec::with_capacity(set.words.len() * 8);
+        for &word in &set.words {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        self.write_bytes(&bytes[..len]);
     }
 }
 

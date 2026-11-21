@@ -321,14 +321,9 @@ fn protocol767_compressed_handshake_mock_server() {
     server_thread.join().unwrap();
 }
 
-fn build_synthetic_chunk_packet(cx: i32, cz: i32, section_count: usize) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&cx.to_be_bytes());
-    body.extend_from_slice(&cz.to_be_bytes());
-    // Minimal unnamed Compound NBT heightmap: TAG_Compound (10) + TAG_End (0)
-    body.push(10);
-    body.push(0);
-
+/// Paletted-section bytes shared by the 767 and 777 chunk bodies: section 4
+/// is stone at y=0 / water at y=1, the rest is air; biomes are all index 0.
+fn chunk_section_bytes(section_count: usize) -> Vec<u8> {
     let mut sec_bytes = Vec::new();
     for s in 0..section_count {
         if s == 4 {
@@ -366,7 +361,18 @@ fn build_synthetic_chunk_packet(cx: i32, cz: i32, section_count: usize) -> Vec<u
         write_varint(&mut sec_bytes, 0);
         write_varint(&mut sec_bytes, 0);
     }
+    sec_bytes
+}
 
+fn build_synthetic_chunk_packet(cx: i32, cz: i32, section_count: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&cx.to_be_bytes());
+    body.extend_from_slice(&cz.to_be_bytes());
+    // Minimal unnamed Compound NBT heightmap: TAG_Compound (10) + TAG_End (0)
+    body.push(10);
+    body.push(0);
+
+    let sec_bytes = chunk_section_bytes(section_count);
     write_varint(&mut body, sec_bytes.len() as i32);
     body.extend_from_slice(&sec_bytes);
     write_varint(&mut body, 0); // 0 block entities
@@ -374,6 +380,41 @@ fn build_synthetic_chunk_packet(cx: i32, cz: i32, section_count: usize) -> Vec<u
     // Light masks: provide sky light for light section 5 (section index 4), empty block light
     write_varint(&mut body, 1);
     body.extend_from_slice(&(1u64 << 5).to_be_bytes()); // sky_mask
+    write_varint(&mut body, 0); // block_mask
+    write_varint(&mut body, 0); // empty_sky_mask
+    write_varint(&mut body, 0); // empty_block_mask
+    write_varint(&mut body, 1); // 1 sky array
+    write_varint(&mut body, 2048);
+    body.extend_from_slice(&[0xffu8; 2048]);
+    write_varint(&mut body, 0); // 0 block arrays
+    body
+}
+
+/// The 26.3 (777) `level_chunk_with_light` body: same Int x/z and paletted
+/// sections as 767, but the heightmaps field is the 1.21.5+ record array
+/// (`VarInt(count)` + `VarInt(type), VarInt(long_len), i64[]`) and the four
+/// light masks are `java.util.BitSet` byte arrays (`VarInt` byte count +
+/// little-endian bytes) instead of `VarInt` + `u64` words.
+fn build_777_chunk_packet(cx: i32, cz: i32, section_count: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&cx.to_be_bytes());
+    body.extend_from_slice(&cz.to_be_bytes());
+
+    // Heightmap record array: one MOTION_BLOCKING entry — 9 bits per column
+    // for a 384-block world -> 36 longs.
+    write_varint(&mut body, 1); // 1 record
+    write_varint(&mut body, 1); // type: MOTION_BLOCKING
+    write_varint(&mut body, 36); // long count
+    body.extend_from_slice(&[0u8; 36 * 8]);
+
+    let sec_bytes = chunk_section_bytes(section_count);
+    write_varint(&mut body, sec_bytes.len() as i32);
+    body.extend_from_slice(&sec_bytes);
+    write_varint(&mut body, 0); // 0 block entities
+
+    // Byte-array masks: sky light present in light section 5 -> byte 0 = 0x20.
+    write_varint(&mut body, 1);
+    body.push(1 << 5); // sky_mask
     write_varint(&mut body, 0); // block_mask
     write_varint(&mut body, 0); // empty_sky_mask
     write_varint(&mut body, 0); // empty_block_mask
@@ -1205,4 +1246,349 @@ fn world_state_opens_version_dir_pack() {
         Path::new("/nonexistent-mc-spine-version-pack"),
     )
     .is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Lane H9: full 26.3 (777) mock-server-to-PNG render proof
+// ---------------------------------------------------------------------------
+
+/// Anonymous-NBT `{"text":"..."}` component — the same byte shape vanilla
+/// writes for `system_chat`/`disconnect` reasons.
+fn nbt_text_component(text: &str) -> Vec<u8> {
+    let mut v = vec![10u8]; // TAG_Compound
+    v.push(8); // TAG_String
+    v.extend_from_slice(&4u16.to_be_bytes());
+    v.extend_from_slice(b"text");
+    v.extend_from_slice(&(text.len() as u16).to_be_bytes());
+    v.extend_from_slice(text.as_bytes());
+    v.push(0);
+    v
+}
+
+// Mock 26.3 (protocol 777) server: Handshake -> Login -> Configuration ->
+// Join Game -> `level_chunk_with_light` (record-array heightmaps + byte-array
+// light masks) -> `block_update` -> `system_chat` -> `player_position`, then
+// `forget_level_chunk` + play `disconnect`. All ids resolve through the
+// builtin 777 `ProtocolTable` — nothing is hardcoded on either side.
+#[test]
+fn protocol777_chunk_blockupdate_chat_disconnect_render_e2e() {
+    use mc_spine_proto::{PacketDir, PacketPhase, ProtocolTable};
+
+    let t777 = ProtocolTable::v777_builtin();
+    let play = PacketPhase::Play;
+    let s2c_play = |name: &'static str| {
+        t777.packet_id(play, PacketDir::Clientbound, name).unwrap() as i32
+    };
+    // Version-divergent ids this test exercises end-to-end (verified against
+    // the 26.3 reference implementation).
+    assert_eq!(s2c_play("level_chunk_with_light"), 0x2e);
+    assert_eq!(s2c_play("block_update"), 0x08);
+    assert_eq!(s2c_play("forget_level_chunk"), 0x26);
+    assert_eq!(s2c_play("system_chat"), 0x7c);
+    assert_eq!(s2c_play("disconnect"), 0x20);
+    assert_eq!(s2c_play("login"), 0x32);
+    assert_eq!(s2c_play("player_position"), 0x49);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let t777 = ProtocolTable::v777_builtin();
+        let cfg_phase = PacketPhase::Configuration;
+        let play = PacketPhase::Play;
+        let s2c_cfg = |name: &'static str| {
+            t777.packet_id(cfg_phase, PacketDir::Clientbound, name).unwrap() as i32
+        };
+        let c2s_cfg = |name: &'static str| {
+            t777.packet_id(cfg_phase, PacketDir::Serverbound, name).unwrap() as i32
+        };
+        let s2c_play = |name: &'static str| {
+            t777.packet_id(play, PacketDir::Clientbound, name).unwrap() as i32
+        };
+        let c2s_play = |name: &'static str| {
+            t777.packet_id(play, PacketDir::Serverbound, name).unwrap() as i32
+        };
+
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let send = |sock: &mut std::net::TcpStream, pid: i32, body: &[u8]| {
+            sock.write_all(&encode_packet(pid, body, None)).unwrap();
+        };
+
+        // Handshake: protocol 777, next_state login.
+        let (pid, body) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00);
+        let mut r = WireReader::new(&body);
+        assert_eq!(r.read_varint().unwrap(), 777);
+        let _host = r.read_string(255).unwrap();
+        let _ = r.take(2).unwrap();
+        assert_eq!(r.read_varint().unwrap(), 2);
+
+        // Login Start -> 26.3 Login Success: Game Profile + session UUID.
+        let (pid, _login) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00);
+        let mut ls = Vec::new();
+        ls.extend_from_slice(&offline_uuid("Tester"));
+        write_string(&mut ls, "Tester");
+        write_varint(&mut ls, 0); // properties: 0
+        ls.extend_from_slice(&[7u8; 16]); // session id
+        send(&mut sock, 0x02, &ls);
+        let (pid, _) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x03, "login_acknowledged");
+
+        // Configuration keep_alive -> echo, then select_known_packs ->
+        // client_information + select_known_packs response, then
+        // finish_configuration -> ack.
+        send(&mut sock, s2c_cfg("keep_alive"), &42i64.to_be_bytes());
+        let (pid, ka) = read_mock_frame(&mut sock);
+        assert_eq!(pid, c2s_cfg("keep_alive"));
+        assert_eq!(ka, 42i64.to_be_bytes());
+
+        let mut packs = Vec::new();
+        write_varint(&mut packs, 0);
+        send(&mut sock, s2c_cfg("select_known_packs"), &packs);
+        let (pid, _info) = read_mock_frame(&mut sock);
+        assert_eq!(pid, c2s_cfg("client_information"));
+        let (pid, _packs) = read_mock_frame(&mut sock);
+        assert_eq!(pid, c2s_cfg("select_known_packs"));
+
+        send(&mut sock, s2c_cfg("finish_configuration"), &[]);
+        let (pid, _) = read_mock_frame(&mut sock);
+        assert_eq!(pid, c2s_cfg("finish_configuration"));
+
+        // Play login (Join Game): entity 11, one overworld level, spawn info
+        // in the 26.3 VarInt-game-mode + sea_level form.
+        let mut jg = Vec::new();
+        jg.extend_from_slice(&11i32.to_be_bytes()); // entity id
+        jg.push(0); // hardcore
+        write_varint(&mut jg, 1); // 1 level
+        write_string(&mut jg, "minecraft:overworld");
+        write_varint(&mut jg, 20); // max players
+        write_varint(&mut jg, 8); // chunk radius
+        write_varint(&mut jg, 8); // simulation distance
+        jg.push(0); // reduced debug
+        jg.push(0); // show death screen
+        jg.push(0); // limited crafting
+        write_varint(&mut jg, 0); // dimension_type id
+        write_string(&mut jg, "minecraft:overworld");
+        jg.extend_from_slice(&0i64.to_be_bytes()); // hashed seed
+        write_varint(&mut jg, 0); // game mode: survival
+        write_varint(&mut jg, 0); // previous game mode: undefined
+        jg.push(0); // debug
+        jg.push(0); // flat
+        jg.push(0); // last death location: absent
+        write_varint(&mut jg, 0); // portal cooldown
+        write_varint(&mut jg, 63); // sea level
+        jg.push(0); // online_mode (offline)
+        jg.push(0); // enforces secure chat
+        send(&mut sock, s2c_play("login"), &jg);
+
+        // Chunk stream: center -> batch start -> chunk -> batch finished.
+        let mut center = Vec::new();
+        write_varint(&mut center, 0);
+        write_varint(&mut center, 0);
+        send(&mut sock, s2c_play("set_chunk_cache_center"), &center);
+        send(&mut sock, s2c_play("chunk_batch_start"), &[]);
+        send(
+            &mut sock,
+            s2c_play("level_chunk_with_light"),
+            &build_777_chunk_packet(0, 0, 24),
+        );
+        let mut fin = Vec::new();
+        write_varint(&mut fin, 1); // batch size 1
+        send(&mut sock, s2c_play("chunk_batch_finished"), &fin);
+        let (pid, cbr) = read_mock_frame(&mut sock);
+        assert_eq!(pid, c2s_play("chunk_batch_received"));
+        assert_eq!(WireReader::new(&cbr).read_f32().unwrap(), 30.0);
+
+        // block_update: stone -> (5,2,5), then a system_chat component.
+        let mut bu = Vec::new();
+        bu.extend_from_slice(&pack_position([5, 2, 5]).to_be_bytes());
+        write_varint(&mut bu, 1); // state: stone
+        send(&mut sock, s2c_play("block_update"), &bu);
+
+        let mut chat = nbt_text_component("welcome to 26.3");
+        chat.push(0); // overlay = false
+        send(&mut sock, s2c_play("system_chat"), &chat);
+
+        // 26.3 player_position: teleport id, pos, velocity, yaw/pitch, Int flags.
+        let mut tp = Vec::new();
+        write_varint(&mut tp, 7);
+        tp.extend_from_slice(&8.5f64.to_be_bytes());
+        tp.extend_from_slice(&4.38f64.to_be_bytes());
+        tp.extend_from_slice(&8.5f64.to_be_bytes());
+        tp.extend_from_slice(&0.0f64.to_be_bytes());
+        tp.extend_from_slice(&0.0f64.to_be_bytes());
+        tp.extend_from_slice(&0.0f64.to_be_bytes());
+        tp.extend_from_slice(&0.0f32.to_be_bytes()); // yaw
+        tp.extend_from_slice(&0.0f32.to_be_bytes()); // pitch
+        tp.extend_from_slice(&0i32.to_be_bytes()); // flags
+        send(&mut sock, s2c_play("player_position"), &tp);
+
+        // accept_teleportation echoes the pose; move_player_pos_rot follows.
+        let (pid, ack) = read_mock_frame(&mut sock);
+        assert_eq!(pid, c2s_play("accept_teleportation"));
+        let mut r = WireReader::new(&ack);
+        assert_eq!(r.read_varint().unwrap(), 7);
+        assert_eq!(r.read_f64().unwrap(), 8.5);
+        let (pid, _pos_rot) = read_mock_frame(&mut sock);
+        assert_eq!(pid, c2s_play("move_player_pos_rot"));
+
+        // forget_level_chunk drops (0,0), then a play-phase disconnect.
+        send(
+            &mut sock,
+            s2c_play("forget_level_chunk"),
+            &0i64.to_be_bytes(),
+        );
+        send(
+            &mut sock,
+            s2c_play("disconnect"),
+            &nbt_text_component("26.3 session complete"),
+        );
+    });
+
+    let (mut cli, report) = ProtocolClient::connect_for_version(
+        "127.0.0.1",
+        port,
+        "Tester",
+        offline_uuid("Tester"),
+        2,
+        Duration::from_secs(5),
+        mc_spine_proto::ProtocolVersion::V26_3,
+    )
+    .expect("777 connect");
+    assert!(report.login_ok && report.config_ok);
+    assert_eq!(cli.protocol_version.number(), 777);
+
+    // Phase A: join -> chunk -> block update -> chat -> teleport.
+    let mut world: Option<WorldState> = None;
+    let mut teleported = false;
+    let mut saw_chat = false;
+    while !teleported {
+        match cli
+            .recv_play(Duration::from_secs(5))
+            .unwrap()
+            .expect("server must keep sending")
+        {
+            PlayEvent::JoinGame {
+                entity_id,
+                dimension,
+            } => {
+                assert_eq!(entity_id, 11);
+                assert_eq!(dimension.section_count(), 24);
+                world = Some(WorldState::new(dimension, test_block_table()));
+            }
+            PlayEvent::ChunkBatchStart | PlayEvent::SetCenterChunk { .. } => {}
+            PlayEvent::ChunkData(chunk) => {
+                assert_eq!((chunk.cx, chunk.cz), (0, 0));
+                assert_eq!(chunk.sections.len(), 24);
+                world
+                    .as_mut()
+                    .unwrap()
+                    .apply_chunk(*chunk)
+                    .expect("apply 777 chunk");
+            }
+            PlayEvent::ChunkBatchFinished(size) => {
+                assert_eq!(size, 1);
+                cli.send_chunk_batch_received(30.0).unwrap();
+            }
+            PlayEvent::BlockUpdate { pos, state_id } => {
+                assert_eq!(pos, [5, 2, 5]);
+                world.as_mut().unwrap().apply_block_update(pos, state_id).unwrap();
+            }
+            PlayEvent::SystemChat { text, overlay } => {
+                assert_eq!(text, "welcome to 26.3");
+                assert!(!overlay);
+                saw_chat = true;
+            }
+            PlayEvent::Teleport(tp) => {
+                assert_eq!(tp.teleport_id, 7);
+                cli.send_accept_teleportation(
+                    tp.teleport_id,
+                    [tp.x, tp.y, tp.z],
+                    tp.yaw,
+                    tp.pitch,
+                    true,
+                )
+                .unwrap();
+                teleported = true;
+            }
+            other => panic!("unexpected play event: {other:?}"),
+        }
+    }
+    assert!(saw_chat);
+
+    // The block update landed inside the decoded 777 chunk.
+    let world = world.as_mut().unwrap();
+    assert_eq!(world.chunks_decoded, 1);
+    assert_eq!(world.block_updates, 1);
+    assert_eq!(world.get_block_state(5, 0, 5), Some(1));
+    assert_eq!(world.get_block_state(5, 1, 5), Some(80));
+    assert_eq!(world.get_block_state(5, 2, 5), Some(1), "block_update applied");
+
+    // Mesh through client-port and render a verified non-blank PNG.
+    world
+        .rebuild_dirty_bounded(64, [8.5, 4.0, 8.5])
+        .expect("rebuild dirty");
+    assert!(world.metrics.packed_vertices > 0);
+    let frame =
+        render::render_frame(&world, [8.5, 6.0, 8.5], 0.0, 35.0, 160, 90).expect("render frame");
+    assert!(frame.stats.triangles_drawn > 0);
+    assert!(frame.stats.pixels_shaded > 0);
+    let png = frame.encode_png();
+    assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+    assert_eq!(&png[12..16], b"IHDR");
+    let mut idat = Vec::new();
+    let mut pos = 8usize;
+    let mut saw_iend = false;
+    while pos + 12 <= png.len() {
+        let len = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
+        let tag = &png[pos + 4..pos + 8];
+        if tag == b"IDAT" {
+            idat.extend_from_slice(&png[pos + 8..pos + 8 + len]);
+        } else if tag == b"IEND" {
+            saw_iend = true;
+            break;
+        }
+        pos += 12 + len;
+    }
+    assert!(!idat.is_empty() && saw_iend);
+    let stride = 160 * 3 + 1;
+    let raw_pixels = zlib_decompress(&idat, stride * 90 + 64).expect("inflate IDAT");
+    let mut distinct = std::collections::HashSet::new();
+    for row in raw_pixels.chunks_exact(stride) {
+        for px in row[1..].as_chunks::<3>().0 {
+            distinct.insert([px[0], px[1], px[2]]);
+        }
+    }
+    assert!(
+        distinct.len() > 8,
+        "777-rendered frame must not be a flat fill"
+    );
+
+    // Phase B: forget_level_chunk unloads the column, disconnect ends play.
+    let mut unloaded = false;
+    loop {
+        match cli
+            .recv_play(Duration::from_secs(5))
+            .unwrap()
+            .expect("server must keep sending")
+        {
+            PlayEvent::UnloadChunk { cx, cz } => {
+                assert_eq!((cx, cz), (0, 0));
+                world.unload_chunk(cx, cz);
+                unloaded = true;
+            }
+            PlayEvent::Disconnect(msg) => {
+                assert_eq!(msg, "26.3 session complete");
+                break;
+            }
+            other => panic!("unexpected play event: {other:?}"),
+        }
+    }
+    assert!(unloaded);
+    assert_eq!(world.chunks_unloaded, 1);
+    assert_eq!(world.get_block_state(5, 0, 5), None);
+
+    server.join().unwrap();
 }

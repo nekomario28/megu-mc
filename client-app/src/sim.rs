@@ -555,6 +555,9 @@ struct SessionRunner {
     keep_alives: u64,
     health: f32,
     food: i32,
+    /// `system_chat` packets seen this session — retained so a live session
+    /// can surface chat/decoded-component coverage in diagnostics.
+    system_chats: u64,
     last_chunk_at: Option<Instant>,
 }
 
@@ -636,6 +639,9 @@ impl SessionRunner {
                 self.health = health;
                 self.food = food;
             }
+            PlayEvent::SystemChat { .. } => {
+                self.system_chats += 1;
+            }
             PlayEvent::Disconnect(reason) => {
                 return Err(format!("server disconnected during play: {reason}"));
             }
@@ -699,6 +705,7 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         keep_alives: 0,
         health: 20.0,
         food: 20,
+        system_chats: 0,
         last_chunk_at: None,
     };
 

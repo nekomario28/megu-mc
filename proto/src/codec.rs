@@ -24,7 +24,7 @@
 use crate::table::{PacketDir, PacketPhase, ProtocolTable};
 use crate::version::{ProtocolVersion, VersionCapabilities};
 use crate::wire::{
-    read_frame, write_frame, BitSet, ProtoError, WireReader, WireWriter,
+    read_frame, write_frame, BitSet, BlockPos, ProtoError, WireReader, WireWriter,
     MAX_STRING_CHARS,
 };
 
@@ -268,6 +268,10 @@ pub enum S2CPacket {
     /// `login/clientbound/set_compression` (0x03).
     SetCompression { threshold: i32 },
     // -- configuration phase --
+    /// `configuration/clientbound/disconnect` — reason component bytes
+    /// (anonymous NBT, the same wire name the play phase reuses under
+    /// [`S2CPacket::PlayDisconnect`]).
+    ConfigDisconnect { reason: Vec<u8> },
     /// `configuration/clientbound/keep_alive` (0x04).
     ConfigKeepAlive { id: i64 },
     /// `configuration/clientbound/registry_data` (0x07 in 767).
@@ -279,8 +283,16 @@ pub enum S2CPacket {
     /// `configuration/clientbound/finish_configuration` (0x03).
     ConfigFinishConfiguration,
     // -- play phase --
+    /// `play/clientbound/disconnect` — reason component bytes (anonymous NBT).
+    PlayDisconnect { reason: Vec<u8> },
     /// `play/clientbound/keep_alive` (0x26).
     KeepAlive { id: i64 },
+    /// `play/clientbound/block_update` — packed [`BlockPos`] + `VarInt`
+    /// global block-state id.
+    BlockUpdate { pos: BlockPos, state_id: u32 },
+    /// `play/clientbound/forget_level_chunk` — the packed-`i64` `ChunkPos`
+    /// (`z << 32 | (x as u32)`), unloaded without a light payload.
+    ForgetLevelChunk { cx: i32, cz: i32 },
     /// `play/clientbound/light_update` (0x2a) — chunk coords plus the four
     /// section masks and light arrays. The masks are full multi-word
     /// [`BitSet`]s: a single-`u64` mask silently corrupts heights past 64
@@ -755,7 +767,7 @@ impl CodecV767 {
 
     /// Decode one clientbound frame as `phase` without changing codec state.
     pub fn decode_s2c_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<S2CPacket, ProtoError> {
-        decode_s2c_in(&self.table, phase, frame)
+        decode_s2c_in(&self.capabilities, &self.table, phase, frame)
     }
 
     /// Decode one serverbound frame as `phase` without changing codec state.
@@ -765,8 +777,11 @@ impl CodecV767 {
 }
 
 /// Decode one clientbound frame as `phase` against `table` — the shared
-/// engine behind `CodecV767::decode_s2c_in` and `TableDrivenCodec`.
+/// engine behind `CodecV767::decode_s2c_in` and `TableDrivenCodec`. `caps`
+/// switches the version-sensitive wire shapes (e.g. the 1.21.5+ byte-array
+/// light masks).
 pub(crate) fn decode_s2c_in(
+    caps: &VersionCapabilities,
     table: &ProtocolTable,
     phase: PacketPhase,
     frame: &[u8],
@@ -779,7 +794,7 @@ pub(crate) fn decode_s2c_in(
             context: "s2c packet",
         })?;
     let mut r = WireReader::new(body);
-    let packet = read_s2c(table, phase, name, &mut r)?;
+    let packet = read_s2c(caps, table, phase, name, &mut r)?;
     r.finish()?;
     Ok(packet)
 }
@@ -826,6 +841,7 @@ pub(crate) fn framed(
 }
 
 pub(crate) fn encode_s2c_body(
+    caps: &VersionCapabilities,
     table: &ProtocolTable,
     packet: &S2CPacket,
 ) -> Result<(PacketPhase, &'static str, Vec<u8>), ProtoError> {
@@ -869,6 +885,10 @@ pub(crate) fn encode_s2c_body(
             w.write_varint(*threshold);
             (PacketPhase::Login, "set_compression")
         }
+        S2CPacket::ConfigDisconnect { reason } => {
+            w.raw(reason);
+            (PacketPhase::Configuration, "disconnect")
+        }
         S2CPacket::ConfigKeepAlive { id } => {
             w.write_i64(*id);
             (PacketPhase::Configuration, "keep_alive")
@@ -891,9 +911,22 @@ pub(crate) fn encode_s2c_body(
         S2CPacket::ConfigFinishConfiguration => {
             (PacketPhase::Configuration, "finish_configuration")
         }
+        S2CPacket::PlayDisconnect { reason } => {
+            w.raw(reason);
+            (PacketPhase::Play, "disconnect")
+        }
         S2CPacket::KeepAlive { id } => {
             w.write_i64(*id);
             (PacketPhase::Play, "keep_alive")
+        }
+        S2CPacket::BlockUpdate { pos, state_id } => {
+            w.write_position(*pos);
+            w.write_varint(*state_id as i32);
+            (PacketPhase::Play, "block_update")
+        }
+        S2CPacket::ForgetLevelChunk { cx, cz } => {
+            w.write_i64((i64::from(*cz) << 32) | (i64::from(*cx) & 0xffff_ffff));
+            (PacketPhase::Play, "forget_level_chunk")
         }
         S2CPacket::LightUpdateMask {
             chunk_x,
@@ -907,10 +940,17 @@ pub(crate) fn encode_s2c_body(
         } => {
             w.write_varint(*chunk_x);
             w.write_varint(*chunk_z);
-            w.write_bitset(sky_mask);
-            w.write_bitset(block_mask);
-            w.write_bitset(empty_sky_mask);
-            w.write_bitset(empty_block_mask);
+            let write_mask = |w: &mut WireWriter, mask: &BitSet| {
+                if caps.light_mask_byte_array {
+                    w.write_bitset_bytes(mask);
+                } else {
+                    w.write_bitset(mask);
+                }
+            };
+            write_mask(&mut w, sky_mask);
+            write_mask(&mut w, block_mask);
+            write_mask(&mut w, empty_sky_mask);
+            write_mask(&mut w, empty_block_mask);
             w.write_varint(sky_light.len() as i32);
             for array in sky_light {
                 w.write_bytes(array);
@@ -1132,6 +1172,7 @@ pub(crate) fn encode_c2s_body(
 /// `phase` disambiguates wire names shared across phases (`keep_alive`,
 /// `finish_configuration`).
 fn read_s2c(
+    caps: &VersionCapabilities,
     table: &ProtocolTable,
     phase: PacketPhase,
     name: &str,
@@ -1181,6 +1222,31 @@ fn read_s2c(
                 S2CPacket::KeepAlive { id }
             }
         }
+        "disconnect" => {
+            let reason = r.read_anonymous_nbt()?.to_vec();
+            if phase == PacketPhase::Configuration {
+                S2CPacket::ConfigDisconnect { reason }
+            } else {
+                S2CPacket::PlayDisconnect { reason }
+            }
+        }
+        "block_update" => S2CPacket::BlockUpdate {
+            pos: r.read_position()?,
+            state_id: u32::try_from(r.read_varint()?).map_err(|_| {
+                ProtoError::InvalidDiscriminant {
+                    value: -1,
+                    what: "block state id",
+                }
+            })?,
+        },
+        "forget_level_chunk" => {
+            // Packed `ChunkPos` `i64`: x in the low 32 bits, z in the high.
+            let packed = r.read_i64()?;
+            S2CPacket::ForgetLevelChunk {
+                cx: packed as i32,
+                cz: (packed >> 32) as i32,
+            }
+        }
         "registry_data" => S2CPacket::ConfigRegistryData {
             registry_id: r.read_string(MAX_NAME_CHARS)?,
             entries: {
@@ -1202,10 +1268,20 @@ fn read_s2c(
         "light_update" => {
             let chunk_x = r.read_varint()?;
             let chunk_z = r.read_varint()?;
-            let sky_mask = r.read_bitset(1024)?;
-            let block_mask = r.read_bitset(1024)?;
-            let empty_sky_mask = r.read_bitset(1024)?;
-            let empty_block_mask = r.read_bitset(1024)?;
+            // 1024 words / 8192 bytes bound the same worst-case section count
+            // under each mask encoding.
+            let byte_masks = caps.light_mask_byte_array;
+            let read_mask = |r: &mut WireReader<'_>| -> Result<BitSet, ProtoError> {
+                if byte_masks {
+                    r.read_bitset_bytes(8192)
+                } else {
+                    r.read_bitset(1024)
+                }
+            };
+            let sky_mask = read_mask(r)?;
+            let block_mask = read_mask(r)?;
+            let empty_sky_mask = read_mask(r)?;
+            let empty_block_mask = read_mask(r)?;
             let read_arrays = |r: &mut WireReader<'_>| -> Result<Vec<Vec<u8>>, ProtoError> {
                 let n = r.read_count(1024)?;
                 let mut arrays = Vec::with_capacity(n.min(64));
@@ -1451,7 +1527,7 @@ impl ProtocolCodec for CodecV767 {
     fn encode_s2c(&self, packet: &S2CPacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
         // A keep_alive in configuration and play share a field shape but are
         // different packets — the IR variant names the phase explicitly.
-        let (phase, name, body) = encode_s2c_body(&self.table, packet)?;
+        let (phase, name, body) = encode_s2c_body(&self.capabilities, &self.table, packet)?;
         framed(&self.table, phase, PacketDir::Clientbound, name, &body, out)
     }
 

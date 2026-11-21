@@ -167,6 +167,11 @@ pub struct VersionCapabilities {
     /// word, so codecs may fast-path the single-word case. Kept as a flag so
     /// taller-world support flips behavior without a signature change.
     pub multi_word_light_mask: bool,
+    /// Whether `light_update`/`level_chunk_with_light` masks serialize as a
+    /// `java.util.BitSet` byte array (`VarInt` byte count + little-endian
+    /// bytes — the 1.21.5+ `ByteBufCodecs.BIT_SET` form) instead of the
+    /// 1.21.1 `VarInt` word count + big-endian `u64` words.
+    pub light_mask_byte_array: bool,
     /// Whether `minecraft:client_information` carries `particle_status`
     /// (1.21.2+ splits it out of the old "particle/all/decreased/minimal" view
     /// distance encoding into a separate display field).
@@ -206,6 +211,7 @@ const CAP_1_21_1: VersionCapabilities = VersionCapabilities {
     recipe_sync_mode: RecipeSyncMode::FullOnJoin,
     block_state_json_format: BlockStateJsonFormat::NameString,
     multi_word_light_mask: true,
+    light_mask_byte_array: false,
     split_particle_status: false,
     relative_movement_flags: false,
     consumable_component: false,
@@ -222,6 +228,7 @@ const CAP_1_21_3: VersionCapabilities = VersionCapabilities {
     recipe_sync_mode: RecipeSyncMode::FullOnJoin,
     block_state_json_format: BlockStateJsonFormat::StructuredEntry,
     multi_word_light_mask: true,
+    light_mask_byte_array: false,
     split_particle_status: true,
     relative_movement_flags: true,
     consumable_component: true,
@@ -238,6 +245,7 @@ const CAP_1_21_4: VersionCapabilities = VersionCapabilities {
     recipe_sync_mode: RecipeSyncMode::FullOnJoin,
     block_state_json_format: BlockStateJsonFormat::StructuredEntry,
     multi_word_light_mask: true,
+    light_mask_byte_array: false,
     split_particle_status: true,
     relative_movement_flags: true,
     consumable_component: true,
@@ -254,6 +262,7 @@ const CAP_1_21_5: VersionCapabilities = VersionCapabilities {
     recipe_sync_mode: RecipeSyncMode::FullOnJoin,
     block_state_json_format: BlockStateJsonFormat::StructuredEntry,
     multi_word_light_mask: true,
+    light_mask_byte_array: true,
     split_particle_status: true,
     relative_movement_flags: true,
     consumable_component: true,
@@ -274,6 +283,7 @@ const CAP_26_3: VersionCapabilities = VersionCapabilities {
     recipe_sync_mode: RecipeSyncMode::RecipeBookDisplays,
     block_state_json_format: BlockStateJsonFormat::DualNameOrId,
     multi_word_light_mask: true,
+    light_mask_byte_array: true,
     split_particle_status: true,
     relative_movement_flags: true,
     consumable_component: true,

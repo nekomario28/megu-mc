@@ -144,6 +144,27 @@ impl<'a> WireReader<'a> {
         Ok(words)
     }
 
+    /// 1.21.5+ `java.util.BitSet` wire form: `VarInt` byte count then
+    /// little-endian bytes (`byte[i/8] >> (i%8)`), normalized to the u64-word
+    /// representation [`bitset_get`] reads.
+    pub fn read_bitset_bytes(&mut self, max_bytes: usize) -> Result<Vec<u64>, String> {
+        let count = usize::try_from(self.read_varint()?)
+            .map_err(|_| "negative bitset byte length".to_string())?;
+        if count > max_bytes {
+            return Err(format!(
+                "bitset byte length {count} exceeds bound {max_bytes}"
+            ));
+        }
+        let bytes = self.take(count)?;
+        let mut words = Vec::with_capacity(count.div_ceil(8));
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            words.push(u64::from_le_bytes(word));
+        }
+        Ok(words)
+    }
+
     pub fn read_nbt(&mut self) -> Result<NbtValue, String> {
         let tag = self.read_u8()?;
         self.read_nbt_payload(tag, 0)
@@ -918,12 +939,19 @@ pub struct DecodedChunk {
 fn decode_light_section_payload(
     reader: &mut WireReader<'_>,
     light_section_count: usize,
+    byte_array_masks: bool,
 ) -> Result<DecodedLightData, String> {
-    let max_longs = light_section_count.div_ceil(64);
-    let sky_mask = reader.read_bitset(max_longs)?;
-    let block_mask = reader.read_bitset(max_longs)?;
-    let empty_sky_mask = reader.read_bitset(max_longs)?;
-    let empty_block_mask = reader.read_bitset(max_longs)?;
+    let read_mask = |r: &mut WireReader<'_>| -> Result<Vec<u64>, String> {
+        if byte_array_masks {
+            r.read_bitset_bytes(light_section_count.div_ceil(8))
+        } else {
+            r.read_bitset(light_section_count.div_ceil(64))
+        }
+    };
+    let sky_mask = read_mask(reader)?;
+    let block_mask = read_mask(reader)?;
+    let empty_sky_mask = read_mask(reader)?;
+    let empty_block_mask = read_mask(reader)?;
 
     let sky_count = usize::try_from(reader.read_varint()?)
         .map_err(|_| "negative sky light array count".to_string())?;
@@ -974,21 +1002,26 @@ fn decode_light_section_payload(
 }
 
 /// Version-sensitive knobs for `level_chunk_with_light` decoding: the
-/// block-state bound a version pack declares (`registry.state_count()`) and
+/// block-state bound a version pack declares (`registry.state_count()`),
 /// whether the heightmaps field is the 1.21.5+ array-of-`Heightmap`-records
-/// form (`false` is the 767 single-NBT-compound form).
+/// form (`false` is the 767 single-NBT-compound form), and whether the four
+/// light masks are the 1.21.5+ `java.util.BitSet` byte-array form (`false`
+/// is the 767 `VarInt` + `u64` word form).
 #[derive(Clone, Copy, Debug)]
 pub struct ChunkDecodeProfile {
     pub state_count: usize,
     pub heightmaps_are_records: bool,
+    pub byte_array_light_masks: bool,
 }
 
 impl ChunkDecodeProfile {
-    /// The pinned 1.21.1 profile: kernel `STATE_COUNT` + NBT heightmaps.
+    /// The pinned 1.21.1 profile: kernel `STATE_COUNT` + NBT heightmaps +
+    /// long-array light masks.
     pub fn v767() -> Self {
         Self {
             state_count: mc_spine_kernel::STATE_COUNT as usize,
             heightmaps_are_records: false,
+            byte_array_light_masks: false,
         }
     }
 }
@@ -1068,7 +1101,11 @@ pub fn decode_chunk_packet_profiled(
         let _nbt = reader.read_nbt()?;
     }
 
-    let light = decode_light_section_payload(&mut reader, section_count + 2)?;
+    let light = decode_light_section_payload(
+        &mut reader,
+        section_count + 2,
+        profile.byte_array_light_masks,
+    )?;
     Ok(DecodedChunk {
         cx,
         cz,
@@ -1080,11 +1117,12 @@ pub fn decode_chunk_packet_profiled(
 pub fn decode_update_light_packet(
     body: &[u8],
     section_count: usize,
+    byte_array_masks: bool,
 ) -> Result<(i32, i32, DecodedLightData), String> {
     let mut reader = WireReader::new(body);
     let cx = reader.read_varint()?;
     let cz = reader.read_varint()?;
-    let light = decode_light_section_payload(&mut reader, section_count + 2)?;
+    let light = decode_light_section_payload(&mut reader, section_count + 2, byte_array_masks)?;
     Ok((cx, cz, light))
 }
 
@@ -1157,7 +1195,9 @@ pub struct TeleportSync {
     pub z: f64,
     pub yaw: f32,
     pub pitch: f32,
-    pub flags: u8,
+    /// Relative-flag bitmask — a `u8` on the 767 wire but a full `Int` on
+    /// 26.x (which adds `DELTA_*`/`ROTATE_DELTA` bits above `0x10`).
+    pub flags: i32,
     pub teleport_id: i32,
 }
 
@@ -1198,6 +1238,9 @@ pub enum PlayEvent {
         food: i32,
         saturation: f32,
     },
+    /// `system_chat` — extracted plain text plus the overlay (action-bar)
+    /// flag; the NBT component itself stays in `protocol`'s decoder.
+    SystemChat { text: String, overlay: bool },
     Disconnect(String),
     Other(i32),
 }
@@ -1826,7 +1869,7 @@ impl ProtocolClient {
                     z,
                     yaw,
                     pitch,
-                    flags: flags as u8,
+                    flags,
                     teleport_id,
                 }))
             }
@@ -1839,6 +1882,7 @@ impl ProtocolClient {
                     ChunkDecodeProfile {
                         state_count: self.block_state_count,
                         heightmaps_are_records: self.wire_26x(),
+                        byte_array_light_masks: self.wire_26x(),
                     },
                 )?;
                 Ok(PlayEvent::ChunkData(Box::new(chunk)))
@@ -1848,8 +1892,11 @@ impl ProtocolClient {
                 Ok(PlayEvent::ChunkBatchFinished(batch_size))
             }
             Some("light_update") => {
-                let (cx, cz, light) =
-                    decode_update_light_packet(body, self.dimension.section_count())?;
+                let (cx, cz, light) = decode_update_light_packet(
+                    body,
+                    self.dimension.section_count(),
+                    self.wire_26x(),
+                )?;
                 Ok(PlayEvent::UpdateLight { cx, cz, light })
             }
             Some("block_update") => {
@@ -1886,6 +1933,15 @@ impl ProtocolClient {
                     food,
                     saturation,
                 })
+            }
+            Some("system_chat") => {
+                let mut r = WireReader::new(body);
+                let text = r
+                    .read_nbt()
+                    .map(|v| v.extract_text())
+                    .unwrap_or_default();
+                let overlay = r.read_bool()?;
+                Ok(PlayEvent::SystemChat { text, overlay })
             }
             Some("disconnect") => {
                 let msg = WireReader::new(body)

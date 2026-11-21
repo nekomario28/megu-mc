@@ -298,7 +298,7 @@ impl TableDrivenCodec {
 
     /// Decode one clientbound frame as `phase` without changing codec state.
     pub fn decode_s2c_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<S2CPacket, ProtoError> {
-        codec::decode_s2c_in(&self.table, phase, frame)
+        codec::decode_s2c_in(&self.capabilities, &self.table, phase, frame)
     }
 
     /// Decode one serverbound frame as `phase` without changing codec state.
@@ -317,7 +317,8 @@ impl ProtocolCodec for TableDrivenCodec {
     }
 
     fn encode_s2c(&self, packet: &S2CPacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        let (phase, name, body) = codec::encode_s2c_body(&self.table, packet)?;
+        let (phase, name, body) =
+            codec::encode_s2c_body(&self.capabilities, &self.table, packet)?;
         codec::framed(
             &self.table,
             phase,
@@ -1209,6 +1210,123 @@ mod tests {
             assert_eq!(c767.decode_s2c_in(phase, &f767).unwrap(), p767);
             assert_eq!(c777.decode_s2c_in(phase, &f777).unwrap(), p777);
         }
+    }
+
+    #[test]
+    fn router_dual_chunk_block_disconnect_packets_roundtrip() {
+        use crate::wire::{BitSet, BlockPos};
+
+        let router = VersionRouter::with_v767_and_v777();
+        let mut c767 = CodecV767::new();
+        c767.set_phase(PacketPhase::Play);
+        let c777 = codec_777();
+        let selected767 = router.select(767).unwrap();
+        let selected777 = router.select(777).unwrap();
+
+        // (packet, wire id under 767, wire id under 777) — every id resolves
+        // through the builtin tables, so 767 vs 777 renumbering shows up as
+        // distinct frame bytes for the same IR.
+        let cases: Vec<(S2CPacket, i32, i32, PacketPhase)> = vec![
+            (
+                S2CPacket::BlockUpdate {
+                    pos: BlockPos::new(-30, 64, 12),
+                    state_id: 0x1234,
+                },
+                0x09,
+                0x08,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::ForgetLevelChunk { cx: -1, cz: 2 },
+                0x21,
+                0x26,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::PlayDisconnect {
+                    reason: text_component("bye"),
+                },
+                0x1d,
+                0x20,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::ConfigDisconnect {
+                    reason: text_component("cfg"),
+                },
+                0x02,
+                0x02,
+                PacketPhase::Configuration,
+            ),
+        ];
+
+        for (packet, id767, id777, phase) in cases {
+            let mut f767 = Vec::new();
+            let mut f777 = Vec::new();
+            c767.encode_s2c(&packet, &mut f767).unwrap();
+            c777.encode_s2c(&packet, &mut f777).unwrap();
+            let mut s767 = Vec::new();
+            let mut s777 = Vec::new();
+            selected767.encode_s2c(&packet, &mut s767).unwrap();
+            selected777.encode_s2c(&packet, &mut s777).unwrap();
+            assert_eq!(s767, f767);
+            assert_eq!(s777, f777);
+            let (w767, body767) = read_frame(&f767).unwrap();
+            let (w777, body777) = read_frame(&f777).unwrap();
+            assert_eq!((w767, w777), (id767, id777));
+            assert_eq!(body767, body777, "body drift on {packet:?}");
+            assert_eq!(c767.decode_s2c_in(phase, &f767).unwrap(), packet);
+            assert_eq!(c777.decode_s2c_in(phase, &f777).unwrap(), packet);
+        }
+
+        // forget_level_chunk packs `ChunkPos` as `z << 32 | (x as u32)` —
+        // negative coordinates must roundtrip through the high/low halves.
+        let mut f = Vec::new();
+        c777.encode_s2c(
+            &S2CPacket::ForgetLevelChunk { cx: -1, cz: 2 },
+            &mut f,
+        )
+        .unwrap();
+        let (_, body) = read_frame(&f).unwrap();
+        assert_eq!(
+            body,
+            (0x0000_0002_ffff_ffffi64).to_be_bytes(),
+            "ChunkPos packing"
+        );
+
+        // The same LightUpdateMask IR emits u64-word masks under 767 and
+        // little-endian byte-array masks (trailing zero bytes dropped) under
+        // 777; both decode back to identical masks.
+        let light = S2CPacket::LightUpdateMask {
+            chunk_x: -2,
+            chunk_z: 3,
+            sky_mask: BitSet::from_words(vec![0x20, 0x40]),
+            block_mask: BitSet::from_u64(0x1),
+            empty_sky_mask: BitSet::new(),
+            empty_block_mask: BitSet::from_u64(0x2),
+            sky_light: vec![vec![0xff; 2048], vec![0xee; 2048]],
+            block_light: vec![vec![0x11; 2048]],
+        };
+        let mut f767 = Vec::new();
+        let mut f777 = Vec::new();
+        c767.encode_s2c(&light, &mut f767).unwrap();
+        c777.encode_s2c(&light, &mut f777).unwrap();
+        let (_, body767) = read_frame(&f767).unwrap();
+        let (_, body777) = read_frame(&f777).unwrap();
+        assert_ne!(body767, body777, "mask encoding must differ by version");
+        // VarInt(-2) is 5 bytes + VarInt(3) 1 byte, so the sky mask starts at
+        // byte 6 in both bodies.
+        // 767 sky mask: VarInt(2 words) + BE words.
+        assert_eq!(&body767[6..7], &[2]);
+        assert_eq!(&body767[7..15], &0x20u64.to_be_bytes());
+        assert_eq!(&body767[15..23], &0x40u64.to_be_bytes());
+        // 777 sky mask: VarInt(9 bytes) + LE bytes of both words with the
+        // trailing zeros dropped.
+        assert_eq!(&body777[6..7], &[9]);
+        assert_eq!(&body777[7..8], &[0x20]);
+        assert_eq!(&body777[15..16], &[0x40]);
+        assert_eq!(c767.decode_s2c_in(PacketPhase::Play, &f767).unwrap(), light);
+        assert_eq!(c777.decode_s2c_in(PacketPhase::Play, &f777).unwrap(), light);
     }
 
     #[test]
