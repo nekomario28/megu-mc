@@ -1269,6 +1269,7 @@ mod block_entity_helpers {
         drops: Vec<Drop>,
         rng: u64,
         cells: Vec<(DimBlockPos, u32)>,
+        map_states: HashMap<i64, MapState>,
     }
 
     impl LiveWorld {
@@ -1281,6 +1282,7 @@ mod block_entity_helpers {
                 drops: std::mem::take(&mut *drops().lock().unwrap()),
                 rng: world_rng::saved_state(),
                 cells: Vec::new(),
+                map_states: std::mem::take(&mut *live_map_states().lock().unwrap()),
             }
         }
 
@@ -1310,6 +1312,7 @@ mod block_entity_helpers {
             *clients().lock().unwrap() = std::mem::take(&mut self.players);
             *player_mechanism_sessions().lock().unwrap() = std::mem::take(&mut self.sessions);
             *drops().lock().unwrap() = std::mem::take(&mut self.drops);
+            *live_map_states().lock().unwrap() = std::mem::take(&mut self.map_states);
         }
     }
 
@@ -1788,5 +1791,349 @@ mod block_entity_helpers {
         );
         world.tick_at(u64::from(GAME_TICKS_PER_TICK));
         assert!(reload_at(key).get("RecordItem").is_none());
+    }
+
+    #[test]
+    fn live_menu_stonecutter_opens_selects_button_and_crafts() {
+        let _guard = world_guard();
+        let mut world = LiveWorld::new();
+        let (client, _receiver) = effect_tests::client_pair();
+        let (dim, x, y, z) = (DimId::Overworld, 94_000, 320, 94_000);
+        *client.pos.lock().unwrap() = (
+            x as f64 + 0.5,
+            y as f64 + 0.5,
+            z as f64 - 1.5,
+            0.0,
+            0.0,
+            true,
+        );
+        attach_live_menu(&client);
+
+        let key = (dim, x, y, z);
+        world.place(key, "stonecutter");
+        assert!(click_block(&client, key));
+        let window = live_menu_id(&client).unwrap();
+        {
+            let connection = live_menu_connection(&client).unwrap();
+            let active = connection.active.lock().unwrap();
+            let session = active.as_ref().unwrap();
+            assert!(matches!(session.menu, LiveMenu::Stonecutter(_)));
+            assert_eq!(session.menu.screen(), (24, "Stonecutter"));
+        }
+
+        // Four stone into input slot 0 -> the deterministic recipe list appears.
+        *client.cursor.lock().unwrap() = (name_to_item("stone").unwrap(), 4, vec![]);
+        with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
+        let recipes = {
+            let connection = live_menu_connection(&client).unwrap();
+            let active = connection.active.lock().unwrap();
+            let LiveMenu::Stonecutter(menu) = &active.as_ref().unwrap().menu else {
+                panic!("stonecutter session lost")
+            };
+            assert_eq!(menu.input.1, 4);
+            menu.available_recipes()
+        };
+        assert_eq!(recipes.len(), 7);
+
+        // ContainerButtonClick selects recipe index 0; the result slot fills.
+        with_save_guard(|| live_enchant_button(&client, i32::from(window), 0));
+        with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
+        let taken = client.cursor.lock().unwrap().clone();
+        assert_eq!(taken, (recipes[0].0, recipes[0].1, vec![]));
+        {
+            let connection = live_menu_connection(&client).unwrap();
+            let active = connection.active.lock().unwrap();
+            let LiveMenu::Stonecutter(menu) = &active.as_ref().unwrap().menu else {
+                panic!("stonecutter session lost")
+            };
+            // One input consumed; the selection survives while input remains.
+            assert_eq!(menu.input.1, 3);
+            assert_eq!(menu.selected_recipe, Some(0));
+        }
+
+        // Emptying the input clears the selection; the menu stays live.
+        *client.cursor.lock().unwrap() = Stack::default();
+        with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
+        assert_eq!(client.cursor.lock().unwrap().1, 3);
+        {
+            let connection = live_menu_connection(&client).unwrap();
+            let active = connection.active.lock().unwrap();
+            let LiveMenu::Stonecutter(menu) = &active.as_ref().unwrap().menu else {
+                panic!("stonecutter session lost")
+            };
+            assert_eq!(menu.selected_recipe, None);
+        }
+    }
+
+    #[test]
+    fn live_menu_grindstone_disenchants_repairs_and_awards_xp() {
+        let _guard = world_guard();
+        let mut world = LiveWorld::new();
+        let (client, _receiver) = effect_tests::client_pair();
+        let (dim, x, y, z) = (DimId::Overworld, 95_000, 320, 95_000);
+        *client.pos.lock().unwrap() = (
+            x as f64 + 0.5,
+            y as f64 + 0.5,
+            z as f64 - 1.5,
+            0.0,
+            0.0,
+            true,
+        );
+        attach_live_menu(&client);
+
+        let key = (dim, x, y, z);
+        world.place(key, "grindstone");
+        assert!(click_block(&client, key));
+        let window = live_menu_id(&client).unwrap();
+        {
+            let connection = live_menu_connection(&client).unwrap();
+            let active = connection.active.lock().unwrap();
+            let session = active.as_ref().unwrap();
+            assert!(matches!(session.menu, LiveMenu::Grindstone(_)));
+            assert_eq!(session.menu.screen(), (15, "Repair & Disenchant"));
+        }
+
+        // Disenchant: one sword carrying sharpness II + binding_curse keeps only
+        // the curse and refunds XP in vanilla's [j, 2j-1] band.
+        let sword = name_to_item("diamond_sword").unwrap();
+        let mut comps = Vec::new();
+        comp_set(
+            &mut comps,
+            COMP_ENCHANTMENTS,
+            enchantments_data(&[(32, 2), (2, 1)], true),
+        );
+        comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 1561);
+        comp_set_varint(&mut comps, COMP_DAMAGE, 40);
+        *client.cursor.lock().unwrap() = (sword, 1, comps);
+        with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
+        let xp_before = *client.xp.lock().unwrap();
+        with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
+        let taken = client.cursor.lock().unwrap().clone();
+        assert_eq!(taken.0, sword);
+        assert_eq!(taken.1, 1);
+        assert_eq!(enchantments_get(&taken.2), vec![(2, 1)]);
+        assert_eq!(comp_varint(&taken.2, COMP_DAMAGE), Some(40));
+        // xp_base = min_cost(sharpness II) = 11 -> j = 6, xp in [6, 11].
+        let gained = *client.xp.lock().unwrap() - xp_before;
+        assert!((6..=11).contains(&gained), "grindstone xp {gained}");
+        {
+            let connection = live_menu_connection(&client).unwrap();
+            let active = connection.active.lock().unwrap();
+            let LiveMenu::Grindstone(menu) = &active.as_ref().unwrap().menu else {
+                panic!("grindstone session lost")
+            };
+            assert_eq!(menu.top.1, 0);
+            assert_eq!(menu.bottom.1, 0);
+        }
+
+        // Repair: two damaged swords merge durability with the vanilla +5%
+        // max-damage bonus and strip every enchantment (no curses to keep).
+        let mut damaged = Vec::new();
+        comp_set(&mut damaged, COMP_ENCHANTMENTS, enchantments_data(&[(32, 2)], true));
+        comp_set_varint(&mut damaged, COMP_MAX_DAMAGE, 1561);
+        comp_set_varint(&mut damaged, COMP_DAMAGE, 1200);
+        let mut damaged_b = Vec::new();
+        comp_set(&mut damaged_b, COMP_ENCHANTMENTS, enchantments_data(&[(34, 3)], true));
+        comp_set_varint(&mut damaged_b, COMP_MAX_DAMAGE, 1561);
+        comp_set_varint(&mut damaged_b, COMP_DAMAGE, 1200);
+        *client.cursor.lock().unwrap() = (sword, 1, damaged);
+        with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
+        *client.cursor.lock().unwrap() = (sword, 1, damaged_b);
+        with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
+        let xp_before = *client.xp.lock().unwrap();
+        with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
+        let repaired = client.cursor.lock().unwrap().clone();
+        assert_eq!(repaired.0, sword);
+        assert_eq!(repaired.1, 1);
+        assert!(enchantments_get(&repaired.2).is_empty());
+        // 361 + 361 + 1561*5% = 800 remaining -> 1561 - 800 = 761 damage.
+        assert_eq!(comp_varint(&repaired.2, COMP_DAMAGE), Some(761));
+        // xp_base = 11 + 21 = 32 -> j = 16, xp in [16, 31].
+        let gained = *client.xp.lock().unwrap() - xp_before;
+        assert!((16..=31).contains(&gained), "grindstone xp {gained}");
+    }
+
+    #[test]
+    fn live_menu_loom_and_cartography_roundtrip_and_return_inputs_on_close() {
+        let _guard = world_guard();
+        let mut world = LiveWorld::new();
+        let (client, _receiver) = effect_tests::client_pair();
+        let (dim, x, y, z) = (DimId::Overworld, 96_000, 320, 96_000);
+        *client.pos.lock().unwrap() = (
+            x as f64 + 0.5,
+            y as f64 + 0.5,
+            z as f64 - 1.5,
+            0.0,
+            0.0,
+            true,
+        );
+        attach_live_menu(&client);
+
+        // ---- loom ----
+        let loom = (dim, x, y, z);
+        world.place(loom, "loom");
+        assert!(click_block(&client, loom));
+        let window = live_menu_id(&client).unwrap();
+        {
+            let connection = live_menu_connection(&client).unwrap();
+            let active = connection.active.lock().unwrap();
+            assert_eq!(active.as_ref().unwrap().menu.screen(), (18, "Loom"));
+        }
+        let banner = name_to_item("white_banner").unwrap();
+        *client.cursor.lock().unwrap() = (banner, 1, vec![]);
+        with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
+        *client.cursor.lock().unwrap() = (name_to_item("red_dye").unwrap(), 3, vec![]);
+        with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
+        // Button 13 is "cross" in the no-item-required pattern list.
+        with_save_guard(|| live_enchant_button(&client, i32::from(window), 13));
+        with_save_guard(|| live_menu_click(&client, window, 3, 0, 0));
+        let taken = client.cursor.lock().unwrap().clone();
+        assert_eq!(taken.0, banner);
+        assert_eq!(
+            live_banner_layers(&taken),
+            vec![BannerLayer {
+                pattern: "cross".to_string(),
+                color: 14
+            }]
+        );
+        {
+            let connection = live_menu_connection(&client).unwrap();
+            let active = connection.active.lock().unwrap();
+            let LiveMenu::Loom(menu) = &active.as_ref().unwrap().menu else {
+                panic!("loom session lost")
+            };
+            assert_eq!(menu.banner.1, 0);
+            assert_eq!(menu.dye.1, 2);
+        }
+
+        // A banner-pattern item narrows the selectable list and survives takes.
+        client
+            .inv
+            .lock()
+            .unwrap()
+            .insert(10, std::mem::take(&mut *client.cursor.lock().unwrap()));
+        *client.cursor.lock().unwrap() = (banner, 1, vec![]);
+        with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
+        *client.cursor.lock().unwrap() =
+            (name_to_item("creeper_banner_pattern").unwrap(), 1, vec![]);
+        with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
+        with_save_guard(|| live_enchant_button(&client, i32::from(window), 0));
+        with_save_guard(|| live_menu_click(&client, window, 3, 0, 0));
+        let taken = client.cursor.lock().unwrap().clone();
+        assert_eq!(
+            live_banner_layers(&taken),
+            vec![BannerLayer {
+                pattern: "creeper".to_string(),
+                color: 14
+            }]
+        );
+        {
+            let connection = live_menu_connection(&client).unwrap();
+            let active = connection.active.lock().unwrap();
+            let LiveMenu::Loom(menu) = &active.as_ref().unwrap().menu else {
+                panic!("loom session lost")
+            };
+            assert_eq!(menu.dye.1, 1);
+            assert_eq!(menu.pattern_item.1, 1);
+        }
+        // Closing returns the remaining dye and the (preserved) pattern item.
+        with_save_guard(|| close_live_menu(&client, true, true));
+        {
+            let inventory = client.inv.lock().unwrap();
+            assert!(inventory
+                .values()
+                .any(|s| item_to_name(s.0) == Some("red_dye") && s.1 == 1));
+            assert!(inventory
+                .values()
+                .any(|s| item_to_name(s.0) == Some("creeper_banner_pattern") && s.1 == 1));
+        }
+
+        // ---- cartography table ----
+        let carto = (dim, x + 1, y, z);
+        world.place(carto, "cartography_table");
+        live_map_states().lock().unwrap().insert(
+            7,
+            MapState {
+                map_id: 7,
+                scale: 0,
+                locked: false,
+            },
+        );
+        assert!(click_block(&client, carto));
+        let window = live_menu_id(&client).unwrap();
+        {
+            let connection = live_menu_connection(&client).unwrap();
+            let active = connection.active.lock().unwrap();
+            assert_eq!(
+                active.as_ref().unwrap().menu.screen(),
+                (23, "Cartography Table")
+            );
+        }
+        let filled = name_to_item("filled_map").unwrap();
+        let mut map_comps = Vec::new();
+        comp_set_varint(&mut map_comps, WM_COMP_MAP_ID, 7);
+
+        // Zoom out: map + paper -> fresh map id at scale 1.
+        *client.cursor.lock().unwrap() = (filled, 1, map_comps.clone());
+        with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
+        *client.cursor.lock().unwrap() = (name_to_item("paper").unwrap(), 1, vec![]);
+        with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
+        with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
+        let zoomed = client.cursor.lock().unwrap().clone();
+        assert_eq!((zoomed.0, zoomed.1), (filled, 1));
+        let zoomed_id = comp_varint(&zoomed.2, WM_COMP_MAP_ID).unwrap();
+        assert_ne!(zoomed_id, 7);
+        assert_eq!(
+            live_map_states().lock().unwrap().get(&zoomed_id).copied(),
+            Some(MapState {
+                map_id: zoomed_id,
+                scale: 1,
+                locked: false,
+            })
+        );
+
+        // Clone: the zoomed map (already on the cursor) + an empty map yields
+        // two copies sharing the same id.
+        with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
+        *client.cursor.lock().unwrap() = (name_to_item("map").unwrap(), 1, vec![]);
+        with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
+        with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
+        let cloned = client.cursor.lock().unwrap().clone();
+        assert_eq!((cloned.0, cloned.1), (filled, 2));
+        assert_eq!(comp_varint(&cloned.2, WM_COMP_MAP_ID), Some(zoomed_id));
+
+        // Lock: map + glass pane -> same id, locked flag recorded server-side.
+        client
+            .inv
+            .lock()
+            .unwrap()
+            .insert(11, std::mem::take(&mut *client.cursor.lock().unwrap()));
+        *client.cursor.lock().unwrap() = (filled, 1, map_comps);
+        with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
+        *client.cursor.lock().unwrap() = (name_to_item("glass_pane").unwrap(), 2, vec![]);
+        with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
+        with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
+        let locked = client.cursor.lock().unwrap().clone();
+        assert_eq!((locked.0, locked.1), (filled, 1));
+        assert_eq!(comp_varint(&locked.2, WM_COMP_MAP_ID), Some(7));
+        assert_eq!(
+            live_map_states().lock().unwrap().get(&7).copied(),
+            Some(MapState {
+                map_id: 7,
+                scale: 0,
+                locked: true,
+            })
+        );
+
+        // One glass pane remains in the addition slot; closing returns it.
+        with_save_guard(|| close_live_menu(&client, true, true));
+        let inventory = client.inv.lock().unwrap();
+        assert!(inventory
+            .values()
+            .any(|s| item_to_name(s.0) == Some("glass_pane") && s.1 == 1));
+        assert!(inventory.values().any(|s| {
+            item_to_name(s.0) == Some("filled_map")
+                && comp_varint(&s.2, WM_COMP_MAP_ID) == Some(7)
+        }));
     }
 }

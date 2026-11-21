@@ -7217,7 +7217,16 @@ fn item_to_state(item: i64) -> Option<u32> {
         678 => 9120, // trapped_chest's default state (single, north, dry)
         _ => {
             let name = item_to_name(item)?;
-            live_block_entity_id(name)?;
+            // Block entities plus the workstation blocks, which are BlockItems
+            // with no entity data.
+            if live_block_entity_id(name).is_none()
+                && !matches!(
+                    name,
+                    "stonecutter" | "grindstone" | "loom" | "cartography_table"
+                )
+            {
+                return None;
+            }
             let reg = breg()?;
             reg.state_of(&format!("minecraft:{name}"), None)
         }
@@ -7354,6 +7363,25 @@ fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
                     return None;
                 }
                 p += 1;
+            }
+            COMP_BANNER_PATTERNS => {
+                let layers = slot_read_varint(b, &mut p)?;
+                if !(0..=256).contains(&layers) {
+                    return None;
+                }
+                for _ in 0..layers {
+                    // Holder<BannerPattern>: 0 carries an inline definition
+                    // (asset id + translation key); otherwise it is id + 1.
+                    if slot_read_varint(b, &mut p)? == 0 {
+                        let mut rest = b.get(p..)?;
+                        registry_wire_name(&mut rest)?;
+                        registry_wire_name(&mut rest)?;
+                        p = b.len() - rest.len();
+                    }
+                    if !(0..=15).contains(&slot_read_varint(b, &mut p)?) {
+                        return None;
+                    }
+                }
             }
             // Component payloads are not length-prefixed. Without a type-aware
             // decoder their boundary cannot be recovered, so reject the whole
@@ -8303,6 +8331,10 @@ enum LiveMenu {
     Lectern,
     Smithing(SmithingMenu),
     Merchant(i32, MerchantMenu),
+    Stonecutter(StonecutterMenu),
+    Grindstone(GrindstoneMenu),
+    Loom(LoomMenu),
+    Cartography(CartographyMenu),
 }
 
 impl LiveMenu {
@@ -8315,6 +8347,10 @@ impl LiveMenu {
             Self::Enchanting(_) => (13, "Enchant"),
             Self::Merchant(..) => (19, "Villager"),
             Self::Smithing(_) => (21, "Upgrade Gear"),
+            Self::Stonecutter(_) => StonecutterMenu::screen(),
+            Self::Grindstone(_) => GrindstoneMenu::screen(),
+            Self::Loom(_) => LoomMenu::screen(),
+            Self::Cartography(_) => CartographyMenu::screen(),
         }
     }
 
@@ -8324,6 +8360,10 @@ impl LiveMenu {
             Self::Enchanting(menu) => vec![&mut menu.item, &mut menu.lapis],
             Self::Smithing(menu) => vec![&mut menu.template, &mut menu.base, &mut menu.addition],
             Self::Merchant(_, menu) => menu.payments.iter_mut().collect(),
+            Self::Stonecutter(menu) => vec![&mut menu.input],
+            Self::Grindstone(menu) => vec![&mut menu.top, &mut menu.bottom],
+            Self::Loom(menu) => vec![&mut menu.banner, &mut menu.dye, &mut menu.pattern_item],
+            Self::Cartography(menu) => vec![&mut menu.map, &mut menu.addition],
             Self::Brewing | Self::Crafter | Self::Lectern => Vec::new(),
         }
     }
@@ -8479,6 +8519,10 @@ fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u3
         "minecraft:brewing_stand" => LiveMenu::Brewing,
         "minecraft:crafter" => LiveMenu::Crafter,
         "minecraft:smithing_table" => LiveMenu::Smithing(SmithingMenu::default()),
+        "minecraft:stonecutter" => LiveMenu::Stonecutter(StonecutterMenu::default()),
+        "minecraft:grindstone" => LiveMenu::Grindstone(GrindstoneMenu::default()),
+        "minecraft:loom" => LiveMenu::Loom(LoomMenu::default()),
+        "minecraft:cartography_table" => LiveMenu::Cartography(CartographyMenu::default()),
         _ => return use_live_block_entity(c, key, state),
     };
     if !c.is_spectator() {
@@ -8523,12 +8567,17 @@ fn open_live_menu(c: &Client, anchor: Option<DimBlockPos>, menu: LiveMenu) {
 
     // The older windows reserve IDs 1–3. A new ID lets clicks from a replaced
     // menu be rejected even if the next menu has the same layout.
-    let id = connection
-        .next_id
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-            Some(if id == 100 { 4 } else { id + 1 })
-        })
-        .unwrap();
+    let id = loop {
+        let current = connection.next_id.load(Ordering::Relaxed);
+        let next = if current == 100 { 4 } else { current + 1 };
+        if connection
+            .next_id
+            .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break current;
+        }
+    };
     let mut active = connection.active.lock().unwrap();
     let session = active.insert(LiveMenuSession {
         id,
@@ -8578,10 +8627,196 @@ fn anvil_hover_name(stack: &Stack) -> &str {
     item_to_name(stack.0).unwrap_or_default()
 }
 
+// `minecraft:banner_patterns` on the 1.21.1 component wire. The
+// `minecraft:data_component_type` tail is pinned by the codebase's anchors
+// (trim=35); the registry then runs debug_stick_state ..= note_block_sound
+// before banner_patterns at 49.
+const COMP_BANNER_PATTERNS: i64 = 49;
+
+// `minecraft:banner_pattern` registry order from the captured 1.21.1
+// Configuration packet (config_packets.bin): `base` at 0, then alphabetical.
+const BANNER_PATTERN_REGISTRY: &[&str] = &[
+    "base",
+    "border",
+    "bricks",
+    "circle",
+    "creeper",
+    "cross",
+    "curly_border",
+    "diagonal_left",
+    "diagonal_right",
+    "diagonal_up_left",
+    "diagonal_up_right",
+    "flow",
+    "flower",
+    "globe",
+    "gradient",
+    "gradient_up",
+    "guster",
+    "half_horizontal",
+    "half_horizontal_bottom",
+    "half_vertical",
+    "half_vertical_right",
+    "mojang",
+    "piglin",
+    "rhombus",
+    "skull",
+    "small_stripes",
+    "square_bottom_left",
+    "square_bottom_right",
+    "square_top_left",
+    "square_top_right",
+    "straight_cross",
+    "stripe_bottom",
+    "stripe_center",
+    "stripe_downleft",
+    "stripe_downright",
+    "stripe_left",
+    "stripe_middle",
+    "stripe_right",
+    "stripe_top",
+    "triangle_bottom",
+    "triangle_top",
+    "triangles_bottom",
+    "triangles_top",
+];
+
+// Read the banner's banner_patterns component into menu layers. Inline
+// (non-registry) pattern definitions keep their asset id as the pattern name,
+// which re-encodes inline.
+fn live_banner_layers(stack: &Stack) -> Vec<BannerLayer> {
+    let mut layers = Vec::new();
+    let Some(mut data) = comp_get(&stack.2, COMP_BANNER_PATTERNS) else {
+        return layers;
+    };
+    let Some(count) = read_protocol_i32(&mut data) else {
+        return layers;
+    };
+    for _ in 0..count.clamp(0, 256) {
+        let Some(holder) = read_protocol_i32(&mut data) else {
+            break;
+        };
+        let pattern = if holder <= 0 {
+            let Some(asset) = registry_wire_name(&mut data) else {
+                break;
+            };
+            let Some(_) = registry_wire_name(&mut data) else {
+                break;
+            };
+            asset.to_string()
+        } else {
+            let Some(&name) = BANNER_PATTERN_REGISTRY.get((holder - 1) as usize) else {
+                break;
+            };
+            name.to_string()
+        };
+        let Some(color) = read_protocol_i32(&mut data) else {
+            break;
+        };
+        if !(0..=15).contains(&color) {
+            break;
+        }
+        layers.push(BannerLayer {
+            pattern,
+            color: color as u8,
+        });
+    }
+    layers
+}
+
+fn live_banner_patterns_data(layers: &[BannerLayer]) -> Vec<u8> {
+    let mut data = Vec::new();
+    write_varint(&mut data, layers.len() as i64);
+    for layer in layers {
+        if let Some(id) = BANNER_PATTERN_REGISTRY
+            .iter()
+            .position(|name| *name == layer.pattern)
+        {
+            // Holder streams reserve zero for inline definitions (COMP_ARMOR_TRIM).
+            write_varint(&mut data, id as i64 + 1);
+        } else {
+            write_varint(&mut data, 0);
+            write_str(&mut data, &layer.pattern);
+            write_str(&mut data, "");
+        }
+        write_varint(&mut data, i64::from(layer.color));
+    }
+    data
+}
+
+// `LoomMenu.slotsChanged`/`updateSelectablePatterns` (1.21.1): the layer list
+// follows the banner's banner_patterns component, and the selected pattern
+// index only resets when the offered list changes - removing banner or dye
+// empties the result but keeps the selection.
+fn live_loom_refresh(menu: &mut LoomMenu) {
+    menu.banner_layers = live_banner_layers(&menu.banner);
+    let patterns = menu.selectable_patterns();
+    let keep = menu
+        .selected_pattern
+        .as_ref()
+        .is_some_and(|selected| patterns.iter().any(|entry| entry == selected));
+    if !keep {
+        menu.selected_pattern = None;
+    }
+}
+
+// The client previews the result with the appended layer, so the wire stack
+// carries the full (existing + selected) layer list.
+fn live_loom_result(menu: &LoomMenu) -> Stack {
+    let mut result = menu.result();
+    if result.1 == 0 {
+        return result;
+    }
+    let mut layers = menu.banner_layers.clone();
+    if let (Some(pattern), Some(color)) = (
+        menu.selected_pattern.clone(),
+        wm_dye_color_index(&menu.dye),
+    ) {
+        layers.push(BannerLayer { pattern, color });
+    }
+    comp_set(
+        &mut result.2,
+        COMP_BANNER_PATTERNS,
+        live_banner_patterns_data(&layers),
+    );
+    result
+}
+
+// Server-side map data (vanilla MapItemSavedData): the filled_map stack carries
+// only its map_id component; scale and the locked flag live here keyed by it.
+fn live_map_states() -> &'static LockedMap<i64, MapState> {
+    static STATES: Registry<i64, MapState> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn live_next_map_id() -> i64 {
+    static NEXT_MAP_ID: AtomicU64 = AtomicU64::new(0);
+    NEXT_MAP_ID.fetch_add(1, Ordering::Relaxed) as i64
+}
+
+fn live_map_state(stack: &Stack) -> Option<MapState> {
+    if stack.1 != 1 || item_to_name(stack.0) != Some("filled_map") {
+        return None;
+    }
+    let map_id = comp_varint(&stack.2, WM_COMP_MAP_ID)?;
+    Some(
+        live_map_states()
+            .lock()
+            .unwrap()
+            .get(&map_id)
+            .copied()
+            .unwrap_or(MapState {
+                map_id,
+                scale: 0,
+                locked: false,
+            }),
+    )
+}
+
 fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) {
     let mut properties = Vec::new();
     let mut offers = None;
-    let slots = match &session.menu {
+    let slots = match &mut session.menu {
         LiveMenu::Anvil(menu) => {
             let result = menu.result(anvil_hover_name(&menu.left), *c.gm.lock().unwrap() == 1);
             properties.extend(anvil_window_properties(
@@ -8675,6 +8910,54 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
                 offers = Some(live_offers_payload(session.id, villager));
             }
             vec![menu.payments[0].clone(), menu.payments[1].clone(), output]
+        }
+        LiveMenu::Stonecutter(menu) => {
+            properties.push(WindowPropertyUpdate {
+                property: 0,
+                value: menu.selected_recipe.map_or(-1, |index| index as i16),
+            });
+            vec![menu.input.clone(), menu.result()]
+        }
+        LiveMenu::Grindstone(menu) => vec![
+            menu.top.clone(),
+            menu.bottom.clone(),
+            menu.compute()
+                .map(|(result, _)| result)
+                .unwrap_or_default(),
+        ],
+        LiveMenu::Loom(menu) => {
+            live_loom_refresh(menu);
+            properties.push(WindowPropertyUpdate {
+                property: 0,
+                value: menu
+                    .selected_pattern
+                    .as_deref()
+                    .and_then(|selected| {
+                        menu.selectable_patterns()
+                            .iter()
+                            .position(|entry| entry == selected)
+                    })
+                    .map_or(-1, |index| index as i16),
+            });
+            vec![
+                menu.banner.clone(),
+                menu.dye.clone(),
+                menu.pattern_item.clone(),
+                live_loom_result(menu),
+            ]
+        }
+        LiveMenu::Cartography(menu) => {
+            menu.map_state = live_map_state(&menu.map);
+            let result = menu
+                .preview()
+                .map(|(mut result, state)| {
+                    // Clone/lock keep the source map_id; a zoom's fresh id is
+                    // allocated at take time by the caller-owned counter.
+                    comp_set_varint(&mut result.2, WM_COMP_MAP_ID, state.map_id);
+                    result
+                })
+                .unwrap_or_default();
+            vec![menu.map.clone(), menu.addition.clone(), result]
         }
     };
     session.state_id = (session.state_id + 1) & 0x7fff;
@@ -8819,6 +9102,27 @@ fn live_enchant_button(c: &Client, window: i32, button: i32) {
         }
         return;
     }
+    if matches!(session.menu, LiveMenu::Stonecutter(_) | LiveMenu::Loom(_)) {
+        if button >= 0 && live_menu_valid(c, session) {
+            match &mut session.menu {
+                // Vanilla `clickMenuButton`: the button is an index into the
+                // available recipes (stonecutter) or selectable patterns (loom).
+                LiveMenu::Stonecutter(menu) => {
+                    menu.select_button(button as usize);
+                }
+                LiveMenu::Loom(menu) => {
+                    if let Some(pattern) =
+                        menu.selectable_patterns().get(button as usize).cloned()
+                    {
+                        menu.select_pattern(&pattern);
+                    }
+                }
+                _ => {}
+            }
+            sync_live_menu(c, session, false);
+        }
+        return;
+    }
     if let LiveMenu::Enchanting(menu) = &mut session.menu {
         let creative = *c.gm.lock().unwrap() == 1;
         let mut seed = connection.enchantment_seed.lock().unwrap();
@@ -8899,6 +9203,22 @@ fn live_input_limit(menu: &LiveMenu, slot: usize, stack: &Stack) -> u8 {
             0
         }
         LiveMenu::Smithing(_) if slot == 2 && !TRIM_MATERIAL_ITEMS.contains(&item) => 0,
+        // Vanilla `GrindstoneMenu` mayPlace: isDamageableItem ||
+        // EnchantmentHelper.hasAnyEnchantments (covers stored enchantments).
+        LiveMenu::Grindstone(_)
+            if wm_stack_max_damage(stack).is_none() && !wm_stack_enchanted(stack) =>
+        {
+            0
+        }
+        LiveMenu::Loom(_) if slot == 0 && wm_banner_name(stack).is_none() => 0,
+        LiveMenu::Loom(_) if slot == 1 && wm_dye_color_index(stack).is_none() => 0,
+        LiveMenu::Loom(_) if slot == 2 && wm_pattern_item_name(stack).is_none() => 0,
+        LiveMenu::Cartography(_) if slot == 0 && item != "filled_map" => 0,
+        LiveMenu::Cartography(_)
+            if slot == 1 && !matches!(item, "paper" | "map" | "glass_pane") =>
+        {
+            0
+        }
         _ => stack_max_of(stack) as u8,
     }
 }
@@ -8943,10 +9263,19 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
             return;
         }
         LiveMenu::Smithing(_) => 4,
+        LiveMenu::Stonecutter(_) => 2,
+        LiveMenu::Grindstone(_) | LiveMenu::Cartography(_) => 3,
+        LiveMenu::Loom(_) => 4,
     };
     let output_slot = match session.menu {
         LiveMenu::Crafter => 9,
-        LiveMenu::Anvil(_) | LiveMenu::Merchant(..) | LiveMenu::Smithing(_) => slots - 1,
+        LiveMenu::Anvil(_)
+        | LiveMenu::Merchant(..)
+        | LiveMenu::Smithing(_)
+        | LiveMenu::Stonecutter(_)
+        | LiveMenu::Grindstone(_)
+        | LiveMenu::Loom(_)
+        | LiveMenu::Cartography(_) => slots - 1,
         _ => -1,
     };
     let mut inventory = c.inv.lock().unwrap();
@@ -8954,6 +9283,8 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
     let mut offer_changed = false;
     let mut wear_anvil = false;
     let mut brewing_changed = false;
+    let mut grind_xp = 0i64;
+    let mut carto_state = None;
 
     if slot == output_slot && slot >= 0 {
         let mut quick_move_inventory = None;
@@ -8992,6 +9323,58 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                 output
             }
             LiveMenu::Smithing(menu) => menu.take_result(receive),
+            LiveMenu::Stonecutter(menu) => {
+                let result = menu.result();
+                if result.1 != 0 && receive(&result) {
+                    menu.take_result()
+                } else {
+                    None
+                }
+            }
+            LiveMenu::Grindstone(menu) => menu.compute().and_then(|(result, _)| {
+                if !receive(&result) {
+                    return None;
+                }
+                // Deterministic [0, 1) roll of vanilla getExperienceAmount's
+                // nextInt(j) draw.
+                let roll = (world_rng::next_u64() >> 11) as f64 / 9007199254740992.0;
+                menu.take_result(roll).map(|(output, xp)| {
+                    grind_xp = xp;
+                    output
+                })
+            }),
+            LiveMenu::Loom(menu) => {
+                let result = menu.result();
+                if result.1 != 0 && receive(&result) {
+                    menu.take_result().map(|(mut output, layers)| {
+                        comp_set(
+                            &mut output.2,
+                            COMP_BANNER_PATTERNS,
+                            live_banner_patterns_data(&layers),
+                        );
+                        output
+                    })
+                } else {
+                    None
+                }
+            }
+            LiveMenu::Cartography(menu) => {
+                menu.map_state = live_map_state(&menu.map);
+                menu.preview().and_then(|(result, _)| {
+                    if !receive(&result) {
+                        return None;
+                    }
+                    let new_map_id = if item_to_name(menu.addition.0) == Some("paper") {
+                        live_next_map_id()
+                    } else {
+                        -1
+                    };
+                    menu.take_result(new_map_id).map(|(output, state)| {
+                        carto_state = Some(state);
+                        output
+                    })
+                })
+            }
             LiveMenu::Merchant(id, menu) => {
                 let mut villagers = live_villagers().lock().unwrap();
                 let items = MerchantItems(&merchant_item_prototype);
@@ -9013,6 +9396,15 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
             } else {
                 result.1 += cursor.1;
                 *cursor = result;
+            }
+            // Vanilla `GrindstoneMenu` awards the disenchant refund straight to
+            // the player; a cartography zoom/clone/lock registers the map state
+            // under the id the result stack now carries.
+            if grind_xp > 0 {
+                let _ = send_player_xp(c, |xp| add_player_xp_points(xp, grind_xp as i32));
+            }
+            if let Some(state) = carto_state {
+                live_map_states().lock().unwrap().insert(state.map_id, state);
             }
         }
     } else if (0..slots).contains(&slot) {
@@ -9063,6 +9455,12 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                 }
             }
         } else {
+            // Vanilla `StonecutterMenu.slotsChanged`: a different input item
+            // resets the selected recipe index (count changes do not).
+            let stonecut_item = match &session.menu {
+                LiveMenu::Stonecutter(menu) => Some(menu.input.0),
+                _ => None,
+            };
             let limit = live_input_limit(&session.menu, slot as usize, &cursor);
             let mut inputs = session.menu.input_slots();
             let target = &mut inputs[slot as usize];
@@ -9071,9 +9469,21 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
             } else {
                 pickup_into_inventory(&mut inventory, *c.held.lock().unwrap(), false, target);
             }
+            drop(inputs);
+            if let (LiveMenu::Stonecutter(menu), Some(before)) =
+                (&mut session.menu, stonecut_item)
+            {
+                if menu.input.0 != before {
+                    menu.selected_recipe = None;
+                }
+            }
         }
     } else if (slots..slots + 36).contains(&slot) {
         let inv_slot = slot - slots + 9;
+        let stonecut_item = match &session.menu {
+            LiveMenu::Stonecutter(menu) => Some(menu.input.0),
+            _ => None,
+        };
         if mode == 0 {
             click_slot(&mut inventory, &mut cursor, inv_slot, button);
         } else if let Some(mut source) = inventory.remove(&inv_slot) {
@@ -9121,6 +9531,13 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
             }
             if source.1 != 0 {
                 inventory.insert(inv_slot, source);
+            }
+        }
+        if let (LiveMenu::Stonecutter(menu), Some(before)) =
+            (&mut session.menu, stonecut_item)
+        {
+            if menu.input.0 != before {
+                menu.selected_recipe = None;
             }
         }
     } else if slot == -999 && mode == 0 && cursor.1 != 0 {
@@ -9230,6 +9647,10 @@ fn live_menu_valid(c: &Client, session: &LiveMenuSession) -> bool {
             | (LiveMenu::Brewing, "minecraft:brewing_stand")
             | (LiveMenu::Crafter, "minecraft:crafter")
             | (LiveMenu::Smithing(_), "minecraft:smithing_table")
+            | (LiveMenu::Stonecutter(_), "minecraft:stonecutter")
+            | (LiveMenu::Grindstone(_), "minecraft:grindstone")
+            | (LiveMenu::Loom(_), "minecraft:loom")
+            | (LiveMenu::Cartography(_), "minecraft:cartography_table")
     )
 }
 
