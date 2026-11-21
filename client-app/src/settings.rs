@@ -18,6 +18,12 @@ use std::path::Path;
 
 use mc_spine_client_mesh::RenderBackendPreference;
 
+use crate::audio_qol::{
+    DEFAULT_CHAT_HISTORY_LINES, DEFAULT_MAX_CONCURRENT_SAME_SOUND, DEFAULT_MAX_VOLUME_CAP,
+    DEFAULT_TOOL_WARN_PERCENT, DEFAULT_ZOOM_DIVISOR, MAX_CHAT_HISTORY_LINES,
+    MAX_MAX_CONCURRENT_SAME_SOUND, MAX_TOOL_WARN_PERCENT, MAX_VOLUME_CAP, MAX_ZOOM_DIVISOR,
+    MIN_CHAT_HISTORY_LINES, MIN_MAX_CONCURRENT_SAME_SOUND, MIN_ZOOM_DIVISOR,
+};
 use crate::lod::LodConfig;
 
 /// Minimum render distance selectable in the UI (chunks).
@@ -309,9 +315,52 @@ impl HostMapFairPlaySettings {
     }
 }
 
+/// Quality-of-life toggles that do not change rendering: audio limiting,
+/// smooth zoom, tool-durability warnings, and chat history. Persisted under
+/// the `[qol]` TOML table; every key is optional and falls back to the
+/// permissive default when absent, so settings files written before this
+/// section existed keep working unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClientQolSettings {
+    /// Hard ceiling for the mixed audio buffer, `0.0..=1.0`. `1.0` (the
+    /// default) leaves the mix untouched; lower values cap spikes such as
+    /// thunder or Wither hurt sounds.
+    pub max_volume_cap: f32,
+    /// How many instances of the same `(sound_id, cell)` may play per tick
+    /// before redundant stacking is attenuated/suppressed, `1..=32`.
+    pub max_concurrent_same_sound: u8,
+    /// Fully-zoomed FOV divisor while the zoom key is held, `1.5..=10.0`.
+    pub zoom_divisor: f32,
+    /// Warn when a tool's remaining durability drops to this percent of
+    /// max, `0..=100`.
+    pub tool_warn_percent: u8,
+    /// When `true`, the final swing that would break a tool is blocked.
+    /// Defaults to `false` so vanilla breaking behavior is unchanged unless
+    /// the player opts in.
+    pub prevent_tool_break: bool,
+    /// Chat history ring capacity in lines, `100..=5000`.
+    pub chat_history_lines: usize,
+    /// Whether chat history survives a server disconnect/reconnect.
+    pub retain_chat_on_reconnect: bool,
+}
+
+impl Default for ClientQolSettings {
+    fn default() -> Self {
+        Self {
+            max_volume_cap: DEFAULT_MAX_VOLUME_CAP,
+            max_concurrent_same_sound: DEFAULT_MAX_CONCURRENT_SAME_SOUND,
+            zoom_divisor: DEFAULT_ZOOM_DIVISOR,
+            tool_warn_percent: DEFAULT_TOOL_WARN_PERCENT,
+            prevent_tool_break: false,
+            chat_history_lines: DEFAULT_CHAT_HISTORY_LINES,
+            retain_chat_on_reconnect: true,
+        }
+    }
+}
+
 /// Everything a player can tune. Fields are self-documenting; the TOML file
 /// mirrors them 1:1.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClientSettings {
     pub preset: QualityPreset,
     /// `6..=32` chunks; also the LOD `full_detail_radius` boundary.
@@ -339,6 +388,9 @@ pub struct ClientSettings {
     /// (integrated server, LAN share, friend relay); ignored on plain
     /// client joins to a remote server.
     pub map_fair_play: HostMapFairPlaySettings,
+    /// Quality-of-life toggles (audio limiter, zoom, tool warnings, chat
+    /// history) persisted under the `[qol]` TOML table.
+    pub qol: ClientQolSettings,
 }
 
 impl Default for ClientSettings {
@@ -346,6 +398,12 @@ impl Default for ClientSettings {
         Self::from_preset(QualityPreset::Balanced)
     }
 }
+
+// `ClientQolSettings` carries f32 fields, so `Eq` cannot be derived. Every
+// float is clamped to a finite range on every construction/parse path, so
+// reflexivity holds in practice; `Eq` is still required by `CliConfig`'s
+// derive in `cli.rs`.
+impl Eq for ClientSettings {}
 
 impl ClientSettings {
     /// One named bundle. `Custom` seeds the same defaults as `Balanced`;
@@ -365,6 +423,7 @@ impl ClientSettings {
             background_fps_limit: DEFAULT_BACKGROUND_FPS_LIMIT,
             gpu_backend: RenderBackendPreference::Auto,
             map_fair_play: HostMapFairPlaySettings::default(),
+            qol: ClientQolSettings::default(),
         };
         match preset {
             QualityPreset::Fast => {
@@ -443,7 +502,16 @@ impl ClientSettings {
              allow_waypoint_teleport = {}\n\
              minimap_mode = \"{}\"\n\
              allow_mob_radar = {}\n\
-             player_radar_scope = \"{}\"\n",
+             player_radar_scope = \"{}\"\n\
+             \n\
+             [qol]\n\
+             max_volume_cap = {}\n\
+             max_concurrent_same_sound = {}\n\
+             zoom_divisor = {}\n\
+             tool_warn_percent = {}\n\
+             prevent_tool_break = {}\n\
+             chat_history_lines = {}\n\
+             retain_chat_on_reconnect = {}\n",
             self.preset.as_str(),
             self.view_distance,
             self.distant_horizon.as_str(),
@@ -463,6 +531,13 @@ impl ClientSettings {
             self.map_fair_play.minimap_mode.as_str(),
             self.map_fair_play.allow_mob_radar,
             self.map_fair_play.player_radar_scope.as_str(),
+            self.qol.max_volume_cap,
+            self.qol.max_concurrent_same_sound,
+            self.qol.zoom_divisor,
+            self.qol.tool_warn_percent,
+            self.qol.prevent_tool_break,
+            self.qol.chat_history_lines,
+            self.qol.retain_chat_on_reconnect,
         )
     }
 
@@ -517,6 +592,24 @@ impl ClientSettings {
                 "allow_waypoint_teleport" => {
                     self.map_fair_play.allow_waypoint_teleport =
                         parsed.map_fair_play.allow_waypoint_teleport;
+                }
+                "max_volume_cap" => self.qol.max_volume_cap = parsed.qol.max_volume_cap,
+                "max_concurrent_same_sound" => {
+                    self.qol.max_concurrent_same_sound =
+                        parsed.qol.max_concurrent_same_sound;
+                }
+                "zoom_divisor" => self.qol.zoom_divisor = parsed.qol.zoom_divisor,
+                "tool_warn_percent" => {
+                    self.qol.tool_warn_percent = parsed.qol.tool_warn_percent;
+                }
+                "prevent_tool_break" => {
+                    self.qol.prevent_tool_break = parsed.qol.prevent_tool_break;
+                }
+                "chat_history_lines" => {
+                    self.qol.chat_history_lines = parsed.qol.chat_history_lines;
+                }
+                "retain_chat_on_reconnect" => {
+                    self.qol.retain_chat_on_reconnect = parsed.qol.retain_chat_on_reconnect;
                 }
                 _ => {}
             }
@@ -735,6 +828,80 @@ impl ClientSettings {
                     }
                     None => invalid(&mut warnings),
                 },
+                "max_volume_cap" => match value.parse::<f32>() {
+                    Ok(v) if v.is_finite() => {
+                        settings.qol.max_volume_cap =
+                            clamp_f32(v, 0.0, MAX_VOLUME_CAP, key, &mut warnings);
+                        seen.push("max_volume_cap");
+                    }
+                    _ => invalid(&mut warnings),
+                },
+                "max_concurrent_same_sound" => match value.parse::<i64>() {
+                    Ok(v) => {
+                        settings.qol.max_concurrent_same_sound = clamp_i64(
+                            v,
+                            i64::from(MIN_MAX_CONCURRENT_SAME_SOUND),
+                            i64::from(MAX_MAX_CONCURRENT_SAME_SOUND),
+                            key,
+                            &mut warnings,
+                        ) as u8;
+                        seen.push("max_concurrent_same_sound");
+                    }
+                    Err(_) => invalid(&mut warnings),
+                },
+                "zoom_divisor" => match value.parse::<f32>() {
+                    Ok(v) if v.is_finite() => {
+                        settings.qol.zoom_divisor = clamp_f32(
+                            v,
+                            MIN_ZOOM_DIVISOR,
+                            MAX_ZOOM_DIVISOR,
+                            key,
+                            &mut warnings,
+                        );
+                        seen.push("zoom_divisor");
+                    }
+                    _ => invalid(&mut warnings),
+                },
+                "tool_warn_percent" => match value.parse::<i64>() {
+                    Ok(v) => {
+                        settings.qol.tool_warn_percent = clamp_i64(
+                            v,
+                            0,
+                            i64::from(MAX_TOOL_WARN_PERCENT),
+                            key,
+                            &mut warnings,
+                        ) as u8;
+                        seen.push("tool_warn_percent");
+                    }
+                    Err(_) => invalid(&mut warnings),
+                },
+                "prevent_tool_break" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.qol.prevent_tool_break = b;
+                        seen.push("prevent_tool_break");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "chat_history_lines" => match value.parse::<i64>() {
+                    Ok(v) => {
+                        settings.qol.chat_history_lines = clamp_i64(
+                            v,
+                            MIN_CHAT_HISTORY_LINES as i64,
+                            MAX_CHAT_HISTORY_LINES as i64,
+                            key,
+                            &mut warnings,
+                        ) as usize;
+                        seen.push("chat_history_lines");
+                    }
+                    Err(_) => invalid(&mut warnings),
+                },
+                "retain_chat_on_reconnect" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.qol.retain_chat_on_reconnect = b;
+                        seen.push("retain_chat_on_reconnect");
+                    }
+                    None => invalid(&mut warnings),
+                },
                 other => warnings.push(format!("unknown key '{other}' ignored")),
             }
         }
@@ -898,6 +1065,14 @@ fn clamp_i64(value: i64, min: i64, max: i64, key: &str, warnings: &mut Vec<Strin
     clamped
 }
 
+fn clamp_f32(value: f32, min: f32, max: f32, key: &str, warnings: &mut Vec<String>) -> f32 {
+    let clamped = value.clamp(min, max);
+    if clamped != value {
+        warnings.push(format!("'{key}' value {value} clamped to {clamped}"));
+    }
+    clamped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,6 +1158,15 @@ mod tests {
                 minimap_mode: HostMinimapMode::FairPlay,
                 allow_mob_radar: false,
                 player_radar_scope: HostPlayerRadarScope::None,
+            },
+            qol: ClientQolSettings {
+                max_volume_cap: 0.5,
+                max_concurrent_same_sound: 8,
+                zoom_divisor: 6.0,
+                tool_warn_percent: 25,
+                prevent_tool_break: true,
+                chat_history_lines: 250,
+                retain_chat_on_reconnect: false,
             },
         };
         let text = s.to_toml();
