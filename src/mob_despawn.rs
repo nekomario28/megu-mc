@@ -126,7 +126,11 @@ fn tick_natural_hostile_despawn() {
             hostile.observe_hurt(&mob, hp);
 
             let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-            let distance = nearest_player_distance_sq(&players[mob.dim.index()], [x, y, z]);
+            // `players` only tracks the three vanilla dimensions; a datapack
+            // dimension slot indexes past the array, so it sees no players.
+            let distance = players
+                .get(mob.dim.index())
+                .and_then(|players| nearest_player_distance_sq(players, [x, y, z]));
             if hostile.check_despawn(peaceful, distance) {
                 discarded.insert(mob.eid, mob);
                 return false;
@@ -161,7 +165,9 @@ fn despawn_players(clients: &[Arc<Client>]) -> [Vec<[f64; 3]>; 3] {
     let mut players = [Vec::new(), Vec::new(), Vec::new()];
     for client in clients.iter().filter(|client| !client.is_spectator()) {
         let (dim, x, y, z, ..) = client_dim_pos(client);
-        players[dim.index()].push([x, y, z]);
+        if let Some(players) = players.get_mut(dim.index()) {
+            players.push([x, y, z]);
+        }
     }
     players
 }
@@ -248,9 +254,13 @@ mod mob_despawn_tests {
     const ZERO_ROLL_SEED: u64 = 923;
 
     fn zombie(eid: i32, pos: (f64, f64, f64)) -> Arc<Mob> {
+        zombie_in(eid, pos, DimId::Overworld)
+    }
+
+    fn zombie_in(eid: i32, pos: (f64, f64, f64), dim: DimId) -> Arc<Mob> {
         let past = Instant::now() - Duration::from_secs(10);
         Arc::new(Mob {
-            dim: DimId::Overworld,
+            dim,
             eid,
             etype: name_to_etype("zombie").unwrap(),
             uuid: [0; 16],
@@ -422,6 +432,38 @@ mod mob_despawn_tests {
         }
         tick_natural_hostile_despawn();
         assert!(mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+
+    #[test]
+    fn bughunt_root_despawn_tracks_only_vanilla_dimension_slots() {
+        // A client in a datapack dimension (slot >= 3) indexed past the end of
+        // the three-slot per-dimension player array.
+        let (player, _) = client_pair();
+        *player.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::from_raw(3);
+        let players = despawn_players(&[Arc::new(player)]);
+        assert!(players.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn bughunt_root_despawn_custom_dimension_hostile_keeps_ticking() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        DIFFICULTY.store(1, Ordering::Relaxed);
+        tick_natural_hostile_despawn();
+        let (player, _) = client_pair();
+        crate::clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(player));
+        // A mob in a datapack dimension slot indexed past the same array.
+        push_natural_hostile(
+            &mut mobs().lock().unwrap_or_else(|e| e.into_inner()),
+            zombie_in(40, (0.0, 70.0, 0.0), DimId::from_raw(3)),
+        );
+        tick_natural_hostile_despawn();
+        // With no players tracked for its dimension the mob stays loaded.
+        assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
     }
 
     #[test]

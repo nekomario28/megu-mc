@@ -119,7 +119,13 @@ pub(crate) struct Plan {
 
 const HORIZONTAL: [Pos; 4] = [(0, 0, -1), (1, 0, 0), (0, 0, 1), (-1, 0, 0)];
 fn add(p: Pos, d: Pos) -> Pos {
-    (p.0 + d.0, p.1 + d.1, p.2 + d.2)
+    // Vanilla neighbour arithmetic is Java `int` math: it wraps at the i32
+    // edges, where a plain `+` panics under the test profile's overflow checks.
+    (
+        p.0.wrapping_add(d.0),
+        p.1.wrapping_add(d.1),
+        p.2.wrapping_add(d.2),
+    )
 }
 fn opposite(d: Pos) -> Pos {
     (-d.0, -d.1, -d.2)
@@ -841,6 +847,47 @@ mod tests {
                 (1, 0, 0),
                 Cell::Fluid(fluid(Kind::Lava, lava_drop_off_for_dim(dim)))
             )));
+        }
+    }
+
+    /// Neighbour generation is Java `int` arithmetic: a position one step off
+    /// the i32 edge wraps to the other edge instead of panicking.
+    #[test]
+    fn bughunt_root_neighbour_math_wraps_at_i32_edges() {
+        struct OpenWorld(HashMap<Pos, Cell>);
+        impl Reader for OpenWorld {
+            type Error = Pos;
+            fn cell(&mut self, p: Pos) -> Result<Cell, Pos> {
+                Ok(self.0.get(&p).copied().unwrap_or(Cell::Air))
+            }
+            fn unsupported_contact(&mut self, p: Pos) -> Pos {
+                p
+            }
+        }
+        let world = |p: Pos, below: Pos, kind| {
+            OpenWorld(HashMap::from([
+                (p, Cell::Fluid(fluid(kind, 0))),
+                (below, Cell::Solid),
+            ]))
+        };
+        // A horizontal step off each X/Z edge lands on the wrapped neighbour.
+        for (p, wrapped) in [
+            ((i32::MIN, 0, 0), (i32::MAX, 0, 0)),
+            ((i32::MAX, 0, 0), (i32::MIN, 0, 0)),
+            ((0, 0, i32::MIN), (0, 0, i32::MAX)),
+            ((0, 0, i32::MAX), (0, 0, i32::MIN)),
+        ] {
+            let mut w = world(p, (p.0, -1, p.2), Kind::Water);
+            let plan = tick(&mut w, p, Kind::Water, true, true).unwrap();
+            assert!(plan.writes.iter().any(|(w, _)| *w == wrapped), "{p:?}");
+        }
+        // The below/above lookups wrap at the Y edges the same way.
+        for (p, kind) in [
+            ((0, i32::MIN, 0), Kind::Water),
+            ((0, i32::MAX, 0), Kind::Lava),
+        ] {
+            let mut w = world(p, (0, p.1.wrapping_sub(1), 0), kind);
+            tick(&mut w, p, kind, true, true).unwrap();
         }
     }
 }

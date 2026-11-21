@@ -834,9 +834,15 @@ fn roll_loot(pools: &[LootPool]) -> Vec<Stack> {
             continue;
         }
         for r in 0..pl.rolls {
-            let e = &pl.entries[((h >> (r * 8 + 3)) as usize) % pl.entries.len()];
+            if pl.entries.is_empty() {
+                continue;
+            }
+            // Datapack pools may declare up to 64 rolls; the per-roll windows
+            // pass bit 63 at roll 8, and `r * 8` itself wraps a u8 at roll 32.
+            let e = &pl.entries
+                [(h.wrapping_shr(u32::from(r) * 8 + 3) as usize) % pl.entries.len()];
             let span = (e.max - e.min + 1) as u64;
-            let cnt = e.min + (((h >> (r * 8 + 17)) % span.max(1)) as u8);
+            let cnt = e.min + (((h.wrapping_shr(u32::from(r) * 8 + 17)) % span.max(1)) as u8);
             if cnt > 0 {
                 let mut st: Stack = (e.item, cnt, Vec::new());
                 apply_loot_funcs(&mut st, &pl.funcs);
@@ -2860,6 +2866,33 @@ mod p1_combat_tests {
         );
         refresh_equip_attrs(&client);
         assert_eq!(max_hp_of(&client.name), 24.0);
+    }
+
+    #[test]
+    fn bughunt_root_roll_loot_wide_rolls_and_empty_entries() {
+        // A datapack pool may declare up to 64 rolls: the per-roll hash windows
+        // pass bit 63 at roll 8 and `r * 8` overflows a u8 at roll 32, so the
+        // extraction must wrap the shift instead of panicking. A pool whose
+        // entries were all filtered out yields no drops rather than dividing
+        // by zero, matching the seeded roller.
+        let pool = |rolls: u8, entries: Vec<LootEntry>| LootPool {
+            rolls,
+            chance: 1.0,
+            entries,
+            funcs: Vec::new(),
+        };
+        let drops = roll_loot(&[pool(
+            64,
+            vec![LootEntry {
+                item: 1,
+                min: 1,
+                max: 1,
+                funcs: Vec::new(),
+            }],
+        )]);
+        assert_eq!(drops.len(), 64);
+        assert!(drops.iter().all(|stack| stack.0 == 1 && stack.1 == 1));
+        assert!(roll_loot(&[pool(4, Vec::new())]).is_empty());
     }
 }
 
