@@ -20,10 +20,18 @@
 //! `ClassicLowSpec` GPU) fails closed to [`ShaderActivationOutcome::FallbackToVanilla`]
 //! with human-readable missing-capability diagnostics — never crashing.
 
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+
+use mc_spine_client_mesh::shaderpack_reflect::{
+    plan_wgsl_binding_table, reflect_glsl_program, AttachmentUsagePlan,
+    ReflectedProgramBindings, WgslBindingTable,
+};
 use mc_spine_client_mesh::{
     is_megu_wgsl_pack, load_megu_wgsl_pack, plan_shader_pipeline_with_options, GpuShaderCaps,
-    MeguWgslPack, PackDimension, PassKind, PipelineStage, ShaderOptionOverrides, ShaderPackFamily,
-    ShaderPackLang, ShaderPackSource, ShaderPipelinePlan,
+    MeguWgslPack, PackDimension, PassKind, PipelineStage, Profile, ShaderOption,
+    ShaderOptionOverrides, ShaderPackFamily, ShaderPackLang, ShaderPackSource, ShaderPass,
+    ShaderPipelinePlan,
 };
 
 use crate::lod::LodConfig;
@@ -120,6 +128,29 @@ pub enum LoadedPackKind {
     MeguWgsl(MeguWgslPack),
 }
 
+/// Reflected GLSL resource inventory plus the deterministic WGSL binding
+/// table for one shaderpass program.
+///
+/// Populated automatically by [`activate_shaderpack`] for GLSL packs
+/// (`ClassicOptiFine`, `IrisModern`, `DistantHorizonsHybrid`) by scanning the
+/// preprocessed, option-resolved sources of every shader unit in the pass.
+/// Binding plans describe resources only; actual WGSL code generation and
+/// buffer layouts are validated by the renderer.
+#[derive(Clone, Debug)]
+pub struct ReflectedPassPlan {
+    /// Program name (`gbuffers_terrain`, `composite`, `begin`, ...).
+    pub pass_name: String,
+    /// Pipeline stage this pass executes in.
+    pub stage: PipelineStage,
+    /// GLSL resource declarations merged across all shader units of the pass.
+    pub bindings: ReflectedProgramBindings,
+    /// Deterministic WGSL `@group`/`@binding` allocation for `bindings`.
+    pub wgsl_table: WgslBindingTable,
+    /// Framebuffer attachments this pass samples
+    /// (color/depth/shadow/DistantHorizons depth/noise).
+    pub attachments: AttachmentUsagePlan,
+}
+
 /// A validated, ready-to-execute shaderpack session bound to a GPU pipeline
 /// and frame render graph.
 #[derive(Clone, Debug)]
@@ -138,6 +169,9 @@ pub struct ActiveShaderSession {
     pub dual_hand_light: bool,
     /// Ordered pass names across all active stages.
     pub ordered_pass_names: Vec<String>,
+    /// Per-pass reflected GLSL binding tables in execution order. Empty for
+    /// Megu native WGSL packs, which need no GLSL resource translation.
+    pub reflected_passes: Vec<ReflectedPassPlan>,
     /// Underlying Megu render graph for geometry submission & VRAM budgeting.
     pub base_render_graph: RenderGraphPlan,
     /// Underlying planned pack (OptiFine/Iris or Megu native WGSL).
@@ -175,6 +209,326 @@ impl ShaderActivationOutcome {
     pub fn is_fallback(&self) -> bool {
         matches!(self, Self::FallbackToVanilla { .. })
     }
+
+    /// Plain-data snapshot for a shaderpack option screen, whether the pack
+    /// activated or safely fell back to vanilla rendering. Fallback
+    /// snapshots carry a non-jargon banner (the detailed capability list
+    /// stays on the outcome's `missing_capabilities`/`user_notice` fields).
+    pub fn ui_snapshot(&self) -> ShaderpackUiSnapshot {
+        match self {
+            Self::Active(session) => session.ui_snapshot(),
+            Self::FallbackToVanilla {
+                pack_name, family, ..
+            } => ShaderpackUiSnapshot::fallback(
+                pack_name,
+                *family,
+                format!(
+                    "Shaderpack '{pack_name}' can't run on this graphics device; using built-in graphics instead."
+                ),
+            ),
+        }
+    }
+}
+
+/// One selectable shaderpack option shown on an option screen.
+///
+/// `current_value` follows the pack-override convention: `None` disables the
+/// define (`// #define KEY`), `Some("")` enables a bare define (`#define
+/// KEY`), and `Some(v)` sets `#define KEY v`. Options with an empty `values`
+/// list are plain boolean toggles.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShaderpackUiOption {
+    /// Option key (`#define` name, e.g. `SHADOW_RES`).
+    pub key: String,
+    /// Localized label (`option.<key>`), falling back to the raw key.
+    pub label: String,
+    /// Localized tooltip (`option.<key>.comment`), when the pack provides one.
+    pub comment: Option<String>,
+    /// Effective value in the running session after profile/option overrides.
+    pub current_value: Option<String>,
+    /// Enumerated allowed values (`value.<key>.<val>` lang entries plus every
+    /// value observed in defines and profiles). Numeric tokens sort first in
+    /// ascending order, then symbolic tokens alphabetically.
+    pub values: Vec<ShaderpackUiOptionValue>,
+    /// Listed in the pack's `sliders =` property.
+    pub is_slider: bool,
+}
+
+/// One allowed value of a valued shaderpack option, with its display label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShaderpackUiOptionValue {
+    /// Raw `#define` value token (e.g. `2048`).
+    pub value: String,
+    /// Localized label (`value.<key>.<value>`), falling back to the token.
+    pub label: String,
+}
+
+/// A user-selectable `profile.<NAME>` preset resolved to plain data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShaderpackUiProfile {
+    /// Profile name (the part after `profile.`).
+    pub name: String,
+    /// Localized label (`profile.<name>`), falling back to the name.
+    pub label: String,
+    /// Resolved option changes in [`ShaderOptionOverrides::options`]
+    /// convention (`None` disables, `Some("")` enables a bare define,
+    /// `Some(v)` sets `#define K v`). `program:` tokens are program switches
+    /// and are not options, so they are omitted.
+    pub options: BTreeMap<String, Option<String>>,
+}
+
+/// A named option sub-screen (`screen.<NAME>`) or the root screen (`""`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShaderpackUiScreen {
+    /// Sub-screen name; `""` is the root option screen.
+    pub name: String,
+    /// Localized title (`screen.<name>`); `""` for the root screen.
+    pub label: String,
+    /// Ordered entries: option keys and `[name]` sub-screen links.
+    pub entries: Vec<String>,
+}
+
+/// Clean, plain-data snapshot of a shaderpack's option-screen state — pack
+/// name, family, localized option labels/values, profiles, sub-screens, the
+/// merged `lang/*.lang` table (`en_US` fallback applied), and a non-jargon
+/// GPU fallback banner notice.
+///
+/// Built by [`ActiveShaderSession::ui_snapshot`] for active packs or by
+/// [`ShaderpackUiSnapshot::fallback`] for packs that could not run on this
+/// device. Contains no GPU handles and no `client-ui` types, so
+/// `client-app` stays decoupled from the UI crate while the data maps
+/// directly onto the option screen's row/profile/screen/label model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderpackUiSnapshot {
+    /// Display name of the pack.
+    pub pack_name: String,
+    /// Detected pack family (`None` only for a fallback snapshot whose pack
+    /// could not even be classified).
+    pub family: Option<ShaderPackFamily>,
+    /// Resolved UI locale (`ja_JP`, `en_US`, ...), `""` when no lang table.
+    pub locale: String,
+    /// All selectable options discovered in the pack, sorted by key.
+    pub options: Vec<ShaderpackUiOption>,
+    /// Available `profile.<NAME>` presets, sorted by name.
+    pub profiles: Vec<ShaderpackUiProfile>,
+    /// Option screens (`""` root first, then `screen.<NAME>` sub-screens).
+    pub screens: Vec<ShaderpackUiScreen>,
+    /// Merged `lang/*.lang` table with `en_US` fallback already applied —
+    /// ready to drop into an option screen's label map.
+    pub labels: BTreeMap<String, String>,
+    /// Non-jargon GPU fallback banner shown when the pack cannot run on this
+    /// device (`None` for healthy active sessions).
+    pub fallback_notice: Option<String>,
+}
+
+impl ShaderpackUiSnapshot {
+    /// Snapshot shown when a pack failed activation: carries only the pack
+    /// identity and the non-jargon fallback banner so the option screen can
+    /// explain that built-in rendering is being used instead.
+    pub fn fallback(
+        pack_name: impl Into<String>,
+        family: Option<ShaderPackFamily>,
+        notice: impl Into<String>,
+    ) -> Self {
+        Self {
+            pack_name: pack_name.into(),
+            family,
+            fallback_notice: Some(notice.into()),
+            ..Self::default()
+        }
+    }
+}
+
+impl ActiveShaderSession {
+    /// Export a plain-data [`ShaderpackUiSnapshot`] of this session for an
+    /// option screen: options discovered across all passes (merged with the
+    /// pack's `screen`/`sliders`/`profile` metadata), localized via the
+    /// session's resolved `lang/*.lang` table.
+    pub fn ui_snapshot(&self) -> ShaderpackUiSnapshot {
+        let mut options: BTreeMap<String, ShaderOption> = BTreeMap::new();
+        let mut sliders = BTreeSet::new();
+        let mut screens_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut profiles_map: BTreeMap<String, Profile> = BTreeMap::new();
+
+        if let LoadedPackKind::IrisOptiFine(plan) = &self.pack {
+            // An enabled `#define` wins over a commented `// #define` for the
+            // same key, matching the per-unit collection rule.
+            for pass in &plan.passes {
+                for unit in pass.shaders.values() {
+                    for (name, option) in &unit.defines {
+                        options
+                            .entry(name.clone())
+                            .and_modify(|existing| {
+                                if !existing.enabled && option.enabled {
+                                    *existing = option.clone();
+                                }
+                            })
+                            .or_insert_with(|| option.clone());
+                    }
+                }
+            }
+            if let Some(props) = &plan.properties {
+                sliders = props.sliders.iter().cloned().collect();
+                screens_map = props.screens.clone();
+                profiles_map = props.profiles.clone();
+            }
+        }
+
+        // Screen/slider/profile metadata may reference option keys that no
+        // shader unit `#define`s; surface them as disabled toggles so the
+        // option screen still renders a deterministic row.
+        let referenced = |key: &str, options: &mut BTreeMap<String, ShaderOption>| {
+            if !key.is_empty() {
+                options.entry(key.to_owned()).or_insert_with(|| ShaderOption {
+                    name: key.to_owned(),
+                    value: None,
+                    enabled: false,
+                });
+            }
+        };
+        for entry in screens_map.values().flatten() {
+            if !(entry.starts_with('[') && entry.ends_with(']')) {
+                referenced(entry, &mut options);
+            }
+        }
+        for key in &sliders {
+            referenced(key, &mut options);
+        }
+        for profile in profiles_map.values() {
+            for token in &profile.tokens {
+                if token.starts_with("program:") {
+                    continue;
+                }
+                let key = token.strip_prefix('!').unwrap_or(token);
+                let key = key.split('=').next().unwrap_or_default().trim();
+                referenced(key, &mut options);
+            }
+        }
+
+        let profile_options: Vec<BTreeMap<String, Option<String>>> = profiles_map
+            .values()
+            .map(resolve_profile_options)
+            .collect();
+        let options_ui = options
+            .into_values()
+            .map(|option| {
+                let current_value = if option.enabled {
+                    Some(option.value.clone().unwrap_or_default())
+                } else {
+                    None
+                };
+                let values = collect_option_values(
+                    &option.name,
+                    &self.lang,
+                    option.value.as_deref(),
+                    &profile_options,
+                );
+                let is_slider = sliders.contains(&option.name);
+                ShaderpackUiOption {
+                    label: self.lang.option_label(&option.name).to_owned(),
+                    comment: self.lang.option_comment(&option.name).map(str::to_owned),
+                    key: option.name,
+                    current_value,
+                    values,
+                    is_slider,
+                }
+            })
+            .collect();
+
+        ShaderpackUiSnapshot {
+            pack_name: self.pack_name.clone(),
+            family: Some(self.family),
+            locale: self.lang.locale.clone(),
+            options: options_ui,
+            profiles: profiles_map
+                .into_values()
+                .zip(profile_options)
+                .map(|(profile, options)| ShaderpackUiProfile {
+                    label: self.lang.profile_label(&profile.name).to_owned(),
+                    name: profile.name,
+                    options,
+                })
+                .collect(),
+            screens: screens_map
+                .into_iter()
+                .map(|(name, entries)| ShaderpackUiScreen {
+                    label: if name.is_empty() {
+                        String::new()
+                    } else {
+                        self.lang.screen_label(&name).to_owned()
+                    },
+                    name,
+                    entries,
+                })
+                .collect(),
+            labels: self.lang.entries.clone(),
+            fallback_notice: None,
+        }
+    }
+}
+
+/// Resolve a `profile.<NAME>` token list into the option-override convention
+/// (`None` disables, `Some("")` enables a bare define, `Some(v)` sets a
+/// value), skipping `program:` program-switch tokens.
+fn resolve_profile_options(profile: &Profile) -> BTreeMap<String, Option<String>> {
+    let mut resolved = BTreeMap::new();
+    for token in &profile.tokens {
+        if token.starts_with("program:") {
+            continue;
+        }
+        if let Some(stripped) = token.strip_prefix('!') {
+            if !stripped.is_empty() {
+                resolved.insert(stripped.to_owned(), None);
+            }
+        } else if let Some((key, value)) = token.split_once('=') {
+            resolved.insert(key.trim().to_owned(), Some(value.trim().to_owned()));
+        } else if !token.is_empty() {
+            resolved.insert(token.clone(), Some(String::new()));
+        }
+    }
+    resolved
+}
+
+/// Enumerate an option's allowed values: `value.<key>.<val>` lang entries
+/// first, then the active define value, then values assigned by profiles.
+/// Numeric tokens sort ascending before symbolic tokens; duplicates are
+/// removed keeping the first occurrence.
+fn collect_option_values(
+    key: &str,
+    lang: &ShaderPackLang,
+    current_define_value: Option<&str>,
+    profile_options: &[BTreeMap<String, Option<String>>],
+) -> Vec<ShaderpackUiOptionValue> {
+    let mut tokens: Vec<String> = lang
+        .entries
+        .range(format!("value.{key}.")..)
+        .take_while(|(k, _)| k.starts_with(&format!("value.{key}.")))
+        .map(|(k, _)| k[format!("value.{key}.").len()..].to_owned())
+        .collect();
+    if let Some(value) = current_define_value.filter(|v| !v.is_empty()) {
+        tokens.push(value.to_owned());
+    }
+    for options in profile_options {
+        if let Some(Some(value)) = options.get(key) {
+            if !value.is_empty() {
+                tokens.push(value.clone());
+            }
+        }
+    }
+    tokens.sort_by(|a, b| match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.total_cmp(&y).then_with(|| a.cmp(b)),
+        (Ok(_), Err(_)) => Ordering::Less,
+        (Err(_), Ok(_)) => Ordering::Greater,
+        _ => a.cmp(b),
+    });
+    tokens.dedup();
+    tokens
+        .into_iter()
+        .map(|value| ShaderpackUiOptionValue {
+            label: lang.value_label(key, &value).to_owned(),
+            value,
+        })
+        .collect()
 }
 
 /// Options controlling shaderpack activation.
@@ -245,6 +599,7 @@ pub fn activate_shaderpack(
     let lod_integration = resolve_iris_lod_integration(&plan, req.lod_config);
     let dual_hand_light = plan.uniforms.uses_dual_hand_light();
     let ordered_pass_names = plan.passes.iter().map(|p| p.name.clone()).collect();
+    let reflected_passes = plan.passes.iter().map(reflect_pass).collect();
     let family = plan.family;
 
     ShaderActivationOutcome::Active(Box::new(ActiveShaderSession {
@@ -255,6 +610,7 @@ pub fn activate_shaderpack(
         lod_integration,
         dual_hand_light,
         ordered_pass_names,
+        reflected_passes,
         base_render_graph: base_graph,
         pack: LoadedPackKind::IrisOptiFine(Box::new(plan)),
     }))
@@ -342,9 +698,65 @@ fn activate_megu_wgsl(
         lod_integration,
         dual_hand_light: false,
         ordered_pass_names,
+        reflected_passes: Vec::new(),
         base_render_graph: base_graph,
         pack: LoadedPackKind::MeguWgsl(wgsl_pack),
     }))
+}
+
+/// Reflect the merged GLSL resource inventory of `pass` (all shader units of
+/// the program) and plan its deterministic WGSL binding table.
+fn reflect_pass(pass: &ShaderPass) -> ReflectedPassPlan {
+    let mut bindings = ReflectedProgramBindings::default();
+    for unit in pass.shaders.values() {
+        merge_reflected_bindings(&mut bindings, reflect_glsl_program(&unit.source));
+    }
+    let wgsl_table = plan_wgsl_binding_table(&bindings);
+    ReflectedPassPlan {
+        pass_name: pass.name.clone(),
+        stage: pass.stage,
+        attachments: wgsl_table.attachments.clone(),
+        wgsl_table,
+        bindings,
+    }
+}
+
+/// Merge one shader unit's reflection into a program-level inventory, keeping
+/// the same name-sorted, name-deduplicated ordering the reflector produces
+/// per unit. The highest `#version` wins; the first declared workgroup size
+/// is kept.
+fn merge_reflected_bindings(
+    into: &mut ReflectedProgramBindings,
+    from: ReflectedProgramBindings,
+) {
+    if from
+        .glsl_version
+        .is_some_and(|v| into.glsl_version.is_none_or(|cur| v > cur))
+    {
+        into.glsl_version = from.glsl_version;
+    }
+    if into.workgroup_size.is_none() {
+        into.workgroup_size = from.workgroup_size;
+    }
+    into.uniforms.extend(from.uniforms);
+    into.samplers.extend(from.samplers);
+    into.uniform_blocks.extend(from.uniform_blocks);
+    into.storage_buffers.extend(from.storage_buffers);
+    into.storage_images.extend(from.storage_images);
+    into.uniforms.sort_by(|a, b| a.name.cmp(&b.name));
+    into.uniforms.dedup_by(|a, b| a.name == b.name);
+    into.samplers.sort_by(|a, b| a.name.cmp(&b.name));
+    into.samplers.dedup_by(|a, b| a.name == b.name);
+    into.uniform_blocks
+        .sort_by(|a, b| a.block_name.cmp(&b.block_name));
+    into.uniform_blocks
+        .dedup_by(|a, b| a.block_name == b.block_name);
+    into.storage_buffers
+        .sort_by(|a, b| a.block_name.cmp(&b.block_name));
+    into.storage_buffers
+        .dedup_by(|a, b| a.block_name == b.block_name);
+    into.storage_images.sort_by(|a, b| a.name.cmp(&b.name));
+    into.storage_images.dedup_by(|a, b| a.name == b.name);
 }
 
 fn resolve_iris_lod_integration(
