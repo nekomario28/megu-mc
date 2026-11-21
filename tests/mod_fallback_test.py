@@ -102,17 +102,36 @@ def _shim_report(jar_reports):
 
 def _fake_mod(mod_id, mod_ids=None, has_java_bytecode=True,
               shimcheck_compatible=True, has_unsupported_mixin_or_at=False,
-              reasons=()):
+              reasons=(), has_custom_chunk_generator=False):
     mod = SimpleNamespace(
         mod_id=mod_id,
         mod_ids=mod_ids or [mod_id],
         has_java_bytecode=has_java_bytecode,
         shimcheck_compatible=shimcheck_compatible,
         has_unsupported_mixin_or_at=has_unsupported_mixin_or_at,
+        has_custom_chunk_generator=has_custom_chunk_generator,
         source=f"mods/{mod_id}.jar",
     )
     mod.reason_codes = lambda: list(reasons)
     return mod
+
+
+def _dim_type_json():
+    return json.dumps({
+        "min_y": 0, "height": 384, "coordinate_scale": 1.0,
+        "has_skylight": True, "has_ceiling": False,
+        "ultrawarm": False, "natural": True,
+        "bed_works": True, "respawn_anchor_works": False,
+        "ambient_light": 0.0, "effects": "minecraft:overworld",
+    })
+
+
+def _dim_json(gen_type="minecraft:noise", type_id=None):
+    return json.dumps({
+        "type": type_id or "test:dim",
+        "generator": {"type": gen_type,
+                      "biome_source": {"type": "minecraft:multi_noise"}},
+    })
 
 
 class ClassifierUnitTests(unittest.TestCase):
@@ -195,6 +214,26 @@ class ClassifierUnitTests(unittest.TestCase):
     def test_profile_mod_with_bytecode_is_tier1(self):
         mods = [_fake_mod("mekanism")]
         tier, reasons = mod_launcher.classify(mods[0], set(), {"mekanism"})
+        self.assertEqual(tier, 1)
+        self.assertEqual(reasons,
+                         ["handled by zero-JVM universal adapter / offload profile"])
+
+    def test_custom_chunk_generator_is_tier3_even_without_bytecode(self):
+        # A modded Java ChunkGenerator can never run on the native Track 2
+        # dynamic-dimension path, even when the jar carries no .class files.
+        mods = [_fake_mod("deepdim", has_java_bytecode=False,
+                          has_custom_chunk_generator=True)]
+        tier, reasons = mod_launcher.classify(mods[0], set(), set())
+        self.assertEqual(tier, 3)
+        self.assertEqual(reasons, ["CUSTOM_CHUNK_GENERATOR"])
+
+        # Profiles and ShimCheck verdicts cannot override it either.
+        tier, reasons = mod_launcher.classify(mods[0], set(), {"deepdim"})
+        self.assertEqual((tier, reasons), (3, ["CUSTOM_CHUNK_GENERATOR"]))
+
+    def test_pure_data_dimension_pack_stays_tier1(self):
+        mods = [_fake_mod("twilight_datapack", has_java_bytecode=False)]
+        tier, reasons = mod_launcher.classify(mods[0], set(), set())
         self.assertEqual(tier, 1)
         self.assertEqual(reasons,
                          ["handled by zero-JVM universal adapter / offload profile"])
@@ -502,6 +541,82 @@ class LauncherIntegrationTests(unittest.TestCase):
         self.assertEqual(report["plan"], "DelegateToNeoForge")
         self.assertTrue(report["dry_run"])
         self.assertFalse(report["launch"]["executed"])
+
+    def test_pure_data_dimension_mod_jar_is_tier1_zero_jvm(self):
+        """Aether-style data-driven dimension mod: dimension_type + dimension
+        + worldgen + ore tags, vanilla noise generator, zero .class files =>
+        Tier 1, mc-spine launches natively and NeoForge never starts."""
+        aether = self.mods / "aetherlike.jar"
+        _data_zip(aether, [
+            ("data/aetherlike/dimension_type/the_aether.json", _dim_type_json()),
+            ("data/aetherlike/dimension/the_aether.json",
+             _dim_json("minecraft:noise", "aetherlike:the_aether")),
+            ("data/aetherlike/worldgen/noise_settings/aether_noise.json", "{}"),
+            ("data/aetherlike/tags/block/ores.json",
+             '{"values": ["aetherlike:ambrosium_ore", "#forge:ores"]}'),
+            ("data/c/tags/blocks/chests.json",
+             '{"values": [{"id": "aetherlike:skyroot_chest", "required": false}]}'),
+            ("pack.mcmeta", '{"pack":{"pack_format":48}}'),
+        ])
+        mc_marker = self.tmp / "mc.json"
+        neo_marker = self.tmp / "neo.json"
+        proc, report = self.invoke(
+            "--fallback", "delegate",
+            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--neoforge-fallback-cmd", self.cmd(neo_marker),
+            "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["plan"], "RunNative")
+        self.assertFalse(report["needs_bounded_jvm"])
+        assignment = report["assignments"][0]
+        self.assertEqual(assignment["tier"], 1)
+        self.assertEqual(assignment["tier_name"], "UniversalNative")
+        dims = report["dimension_mods"]
+        self.assertEqual(len(dims), 1)
+        self.assertEqual(dims[0]["dimensions"], ["aetherlike:the_aether"])
+        self.assertEqual(dims[0]["dimension_types"],
+                         ["aetherlike:the_aether"])
+        self.assertEqual(dims[0]["custom_chunk_generators"], [])
+        self.assertEqual(dims[0]["ore_tag_blocks"],
+                         ["aetherlike:ambrosium_ore"])
+        self.assertEqual(dims[0]["chest_tag_blocks"],
+                         ["aetherlike:skyroot_chest"])
+        self.assertTrue(mc_marker.is_file(), "mc-spine stub never ran")
+        self.assertFalse(neo_marker.exists(),
+                         "NeoForge ran for a pure data-driven dimension mod")
+
+    def test_custom_generator_dimension_mod_jar_delegates_tier3(self):
+        """A dimension mod whose `dimension/` JSON names a modded Java
+        ChunkGenerator is Tier 3 with CUSTOM_CHUNK_GENERATOR even when
+        ShimCheck reports the jar COMPATIBLE — the bounded shim cannot host a
+        custom ChunkGenerator."""
+        deep = self.mods / "deepdim.jar"
+        _jar(deep, "deepdim", entries=[
+            ("data/deepdim/dimension_type/otherside.json", _dim_type_json()),
+            ("data/deepdim/dimension/otherside.json",
+             _dim_json("deepdim:echoing_void_gen", "deepdim:otherside")),
+        ])
+        shim = self.write_shim((deep, "COMPATIBLE", []))
+        mc_marker = self.tmp / "mc.json"
+        neo_marker = self.tmp / "neo.json"
+        proc, report = self.invoke(
+            "--fallback", "delegate",
+            "--shimcheck-json", str(shim),
+            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--neoforge-fallback-cmd", self.cmd(neo_marker),
+            "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["plan"], "DelegateToNeoForge")
+        triggers = report["triggering_mods"]
+        self.assertEqual([a["mod_id"] for a in triggers], ["deepdim"])
+        self.assertEqual(triggers[0]["reasons"], ["CUSTOM_CHUNK_GENERATOR"])
+        self.assertIn("deepdim -> CUSTOM_CHUNK_GENERATOR", proc.stderr)
+        dims = report["dimension_mods"]
+        self.assertEqual(len(dims), 1)
+        self.assertEqual(dims[0]["custom_chunk_generators"],
+                         ["deepdim:echoing_void_gen"])
+        self.assertFalse(mc_marker.exists(), "mc-spine ran during delegation")
+        self.assertTrue(neo_marker.is_file(), "NeoForge fallback never ran")
 
     def test_human_report_prints_tier_table(self):
         create = self.mods / "create.jar"

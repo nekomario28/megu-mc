@@ -13,6 +13,11 @@
 //!   Configuration `frozen_registry*` synchronization frames.
 //! - [`profile`]: Generic declarative offload runtime bridging any mod's
 //!   cables/pipes/tanks/processors onto `mod_offload::RegionScheduler`.
+//! - [`dimension_mod`]: Universal dimension-adding mod support — zero-JVM
+//!   `dimension_type`/`dimension`/`worldgen`/ore-tag discovery, declarative
+//!   mod portals (vertical frames, fluid pools, rocket ascent, interact
+//!   blocks), per-dimension environment profiles, and >64-section light
+//!   masks for tall custom dimensions.
 //! - [`fallback`]: 4-tier mod execution classifier and safe fallback planner
 //!   (`Strict`, `Quarantine` with Save v2 block-loss guard, `DelegateNeoForge`).
 
@@ -20,6 +25,13 @@
 
 pub mod blockstates;
 pub mod data_loader;
+pub mod dimension_mod;
 pub mod fallback;
 pub mod neoforge_wire;
 pub mod profile;
+
+pub use dimension_mod::{
+    DimEntryDescriptor, DimTypeDescriptor, DimensionEnvProfile, DimensionModClassification,
+    DimensionModData, DimensionModProfile, GeneratorKind, PortalRegistry, PortalRule,
+    PortalTransition, PortalTrigger, TeleportIntent,
+};

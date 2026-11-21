@@ -13,6 +13,13 @@ pinned upstream NeoForge 1.21.1 runtime.
                             declarative offload profile in --profiles-dir (zero JVM)
   Tier 2 BoundedJvmShim   : Java mod verified COMPATIBLE by ShimCheck
   Tier 3 RequiresFallback : Java mod rejected by ShimCheck (Mixin/AT/missing API)
+                            or any `data/*/dimension/*.json` declaring a custom
+                            Java ChunkGenerator (CUSTOM_CHUNK_GENERATOR)
+
+Dimension-adding mods shipping `data/<ns>/dimension_type/*.json` plus
+`data/<ns>/dimension/*.json` are summarised under `dimension_mods` in the
+JSON report; pure data-driven ones (vanilla noise/flat/void generators, no
+custom ChunkGenerator) stay Tier 1 and launch with zero JVM.
 
 Fallback policies when >= 1 Tier 3 mod exists:
 
@@ -70,6 +77,14 @@ REASON_REFUSE_QUARANTINE = (
 
 CODE_MISSING_SHIMCHECK = "MISSING_SHIMCHECK_REPORT"
 CODE_UNSCANNABLE = "UNSCANNABLE_JAVA_MOD"
+CODE_CUSTOM_CHUNK_GENERATOR = "CUSTOM_CHUNK_GENERATOR"
+
+# `dimension/` `generator.type` values the native Track 2 dynamic-dimension
+# path executes with zero JVM (mirrors `GeneratorKind` in
+# mod-adapter-core/src/dimension_mod.rs). Anything else is a modded Java
+# ChunkGenerator and routes the mod to Tier 3 fallback.
+NATIVE_DIMENSION_GENERATORS = frozenset(
+    ("minecraft:noise", "minecraft:flat", "minecraft:debug"))
 
 IDENTIFIER = re.compile(rb"[a-z0-9_.\-]{1,64}:[a-z0-9_/.\-]{1,128}")
 TABLE_HEADER = re.compile(r"^\s*\[\[?\s*([^\]]+)\s*\]?\]")
@@ -96,6 +111,59 @@ def _entries_of(source):
                 yield name, lambda n=name: archive.read(n)
     except zipfile.BadZipFile as error:
         raise LauncherError(f"not a readable jar/zip: {source} ({error})")
+
+
+def _read_limited(read, limit=MAX_DATA_ENTRY_BYTES):
+    """Read one archive/directory entry, or None when unreadable/oversized."""
+    try:
+        payload = read()
+    except (OSError, KeyError, RuntimeError):
+        return None
+    if payload is None or len(payload) > limit:
+        return None
+    return payload
+
+
+def _dimension_generator_type(read):
+    """`generator.type` of a `data/*/dimension/*.json` file, or None."""
+    payload = _read_limited(read)
+    if payload is None:
+        return None
+    try:
+        doc = json.loads(payload)
+    except ValueError:
+        return None
+    generator = doc.get("generator") if isinstance(doc, dict) else None
+    if not isinstance(generator, dict):
+        return None
+    gen_type = generator.get("type")
+    return gen_type if isinstance(gen_type, str) else None
+
+
+def _tag_member_ids(read):
+    """Concrete (non-`#tag`) member ids of a `data/*/tags/.../*.json` file."""
+    payload = _read_limited(read)
+    if payload is None:
+        return []
+    try:
+        doc = json.loads(payload)
+    except ValueError:
+        return []
+    values = doc.get("values") if isinstance(doc, dict) else None
+    if not isinstance(values, list):
+        return []
+    members = []
+    for value in values:
+        if isinstance(value, str):
+            member = value
+        elif isinstance(value, dict) and isinstance(value.get("id"), str):
+            member = value["id"]
+        else:
+            continue
+        # Nested `#ns:tag` references expand through the tag table, not here.
+        if not member.startswith("#"):
+            members.append(member)
+    return members
 
 
 def _mod_ids_from_toml(text):
@@ -137,6 +205,13 @@ class DiscoveredMod:
         # List of {"code", "symbol", "detail"} dicts (ShimCheck reasons or
         # launcher-generated codes when ShimCheck never ran on this entry).
         self.rejection_reasons = []
+        # Dimension-mod discovery (mirrors `discover_dimension_mod_entries` in
+        # mod-adapter-core/src/dimension_mod.rs).
+        self.dimension_types = []
+        self.declared_dimensions = []
+        self.custom_chunk_generators = []
+        self.ore_tag_blocks = []
+        self.chest_tag_blocks = []
         declared = []
         namespaces = []
         toml_text = None
@@ -167,6 +242,23 @@ class DiscoveredMod:
             parts = name.split("/")
             if len(parts) >= 3 and parts[0] == "data":
                 namespaces.append(parts[1])
+            if len(parts) >= 4 and parts[0] == "data" and name.endswith(".json"):
+                stem = "/".join(parts[3:])[:-len(".json")]
+                if parts[2] == "dimension_type":
+                    self.dimension_types.append(f"{parts[1]}:{stem}")
+                elif parts[2] == "dimension":
+                    self.declared_dimensions.append(f"{parts[1]}:{stem}")
+                    gen_type = _dimension_generator_type(read)
+                    if (gen_type is not None
+                            and gen_type not in NATIVE_DIMENSION_GENERATORS):
+                        self.custom_chunk_generators.append(gen_type)
+                elif (parts[2] == "tags" and len(parts) >= 5
+                        and parts[3] in ("block", "blocks")):
+                    leaf = stem.rsplit("/", 1)[-1]
+                    if leaf.startswith("ores"):
+                        self.ore_tag_blocks.extend(_tag_member_ids(read))
+                    elif leaf.startswith("chests"):
+                        self.chest_tag_blocks.extend(_tag_member_ids(read))
         if toml_text is not None:
             declared = _mod_ids_from_toml(toml_text) + declared
         unique_ns = sorted(set(namespaces))
@@ -182,12 +274,26 @@ class DiscoveredMod:
         else:
             self.mod_ids = [source.stem if source.is_file() else source.name]
         self.mod_id = self.mod_ids[0]
+        self.is_dimension_mod = bool(self.dimension_types) and bool(
+            self.declared_dimensions)
+        self.has_custom_chunk_generator = bool(self.custom_chunk_generators)
 
     def reject(self, code, symbol, detail):
         self.rejection_reasons.append({"code": code, "symbol": symbol, "detail": detail})
 
     def reason_codes(self):
         return [r["code"] for r in self.rejection_reasons]
+
+    def dimension_report(self):
+        """`dimension_mods` JSON report entry for one dimension mod."""
+        return {
+            "mod_id": self.mod_id,
+            "dimensions": sorted(set(self.declared_dimensions)),
+            "dimension_types": sorted(set(self.dimension_types)),
+            "custom_chunk_generators": sorted(set(self.custom_chunk_generators)),
+            "ore_tag_blocks": sorted(set(self.ore_tag_blocks)),
+            "chest_tag_blocks": sorted(set(self.chest_tag_blocks)),
+        }
 
 
 def discover_mods(mods_dir):
@@ -357,6 +463,10 @@ def classify(mod, flagship_ids, profile_ids):
     owned = set(mod.mod_ids)
     if owned & flagship_ids:
         return 0, [REASON_FLAGSHIP]
+    if getattr(mod, "has_custom_chunk_generator", False):
+        # A modded Java ChunkGenerator cannot run on the native Track 2
+        # dynamic-dimension path or the bounded shim: explicit Tier 3.
+        return 3, [CODE_CUSTOM_CHUNK_GENERATOR]
     if not mod.has_java_bytecode or owned & profile_ids:
         return 1, [REASON_UNIVERSAL]
     if mod.shimcheck_compatible and not mod.has_unsupported_mixin_or_at:
@@ -526,6 +636,7 @@ def build_report(args, plan, launch):
         "triggering_mods": [a.as_dict() for a in plan.get("triggering_mods", [])],
         "blocking_mods": [a.as_dict() for a in plan.get("blocking_mods", [])],
         "refusal_reason": plan.get("reason"),
+        "dimension_mods": plan.get("dimension_mods", []),
         "saved_world_namespaces": sorted(plan.get("saved_namespaces", [])),
         "staging_dir": str(plan.get("staging_dir") or ""),
         "dry_run": bool(args.dry_run),
@@ -636,6 +747,8 @@ def main():
             load_safe_data_only=args.quarantine_load_data,
             force_drop_saved_blocks=args.force_drop_saved_blocks)
         plan["saved_namespaces"] = saved
+        plan["dimension_mods"] = [
+            m.dimension_report() for m in mods if m.is_dimension_mod]
 
         launch = {"kind": None, "command": [], "executed": False,
                   "exit_code": None, "dry_run": bool(args.dry_run)}
