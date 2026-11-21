@@ -4183,6 +4183,192 @@ fn run_publish_command(level: u8, args: &[&str]) -> String {
     format!("Local game hosted on port {port}")
 }
 
+// ---------------------------------------------------------------------------
+// Lane POLICY-CMD: one owner-level `/megu policy` surface for the server's
+// opt-in gameplay policies. Every default is the vanilla/opt-in-safe value;
+// `set` validates the whole key/value pair before mutating so a rejected
+// command can never leave a half-applied policy behind.
+// ---------------------------------------------------------------------------
+
+const POLICY_USAGE: &str = "usage: /megu policy list|get <key>|set <key> <value>|reset";
+
+#[derive(Clone, Debug, PartialEq)]
+struct LiveServerPolicy {
+    minimap_mode: String,
+    allow_cave_map: bool,
+    allow_mob_radar: bool,
+    player_radar_scope: String,
+    allow_waypoint_teleport: bool,
+    mine_all: String,
+    cut_all: String,
+    xp_merge_mode: String,
+    max_frame_mib: u32,
+}
+
+impl Default for LiveServerPolicy {
+    fn default() -> Self {
+        Self {
+            minimap_mode: "unrestricted".to_owned(),
+            allow_cave_map: true,
+            allow_mob_radar: true,
+            player_radar_scope: "all".to_owned(),
+            allow_waypoint_teleport: true,
+            mine_all: "off".to_owned(),
+            cut_all: "off".to_owned(),
+            xp_merge_mode: "vanilla".to_owned(),
+            max_frame_mib: 2,
+        }
+    }
+}
+
+fn policy_invalid_value(key: &str, value: &str) -> String {
+    format!("Invalid value '{value}' for policy '{key}'")
+}
+
+fn policy_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(policy_invalid_value(key, value)),
+    }
+}
+
+fn policy_choice<'a>(key: &str, value: &'a str, allowed: &[&str]) -> Result<&'a str, String> {
+    if allowed.iter().any(|candidate| *candidate == value) {
+        Ok(value)
+    } else {
+        Err(policy_invalid_value(key, value))
+    }
+}
+
+impl LiveServerPolicy {
+    fn get(&self, key: &str) -> Result<String, String> {
+        match key {
+            "minimap_mode" => Ok(self.minimap_mode.clone()),
+            "allow_cave_map" => Ok(self.allow_cave_map.to_string()),
+            "allow_mob_radar" => Ok(self.allow_mob_radar.to_string()),
+            "player_radar_scope" => Ok(self.player_radar_scope.clone()),
+            "allow_waypoint_teleport" => Ok(self.allow_waypoint_teleport.to_string()),
+            "mine_all" => Ok(self.mine_all.clone()),
+            "cut_all" => Ok(self.cut_all.clone()),
+            "xp_merge_mode" => Ok(self.xp_merge_mode.clone()),
+            "max_frame_mib" => Ok(self.max_frame_mib.to_string()),
+            _ => Err(format!("Unknown policy '{key}'")),
+        }
+    }
+
+    fn list(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("minimap_mode", self.minimap_mode.clone()),
+            ("allow_cave_map", self.allow_cave_map.to_string()),
+            ("allow_mob_radar", self.allow_mob_radar.to_string()),
+            ("player_radar_scope", self.player_radar_scope.clone()),
+            ("allow_waypoint_teleport", self.allow_waypoint_teleport.to_string()),
+            ("mine_all", self.mine_all.clone()),
+            ("cut_all", self.cut_all.clone()),
+            ("xp_merge_mode", self.xp_merge_mode.clone()),
+            ("max_frame_mib", self.max_frame_mib.to_string()),
+        ]
+    }
+
+    fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        match key {
+            "minimap_mode" => {
+                self.minimap_mode = policy_choice(
+                    key,
+                    value,
+                    &["unrestricted", "fair_play", "disabled"],
+                )?
+                .to_owned();
+            }
+            "allow_cave_map" => self.allow_cave_map = policy_bool(key, value)?,
+            "allow_mob_radar" => self.allow_mob_radar = policy_bool(key, value)?,
+            "player_radar_scope" => {
+                self.player_radar_scope = policy_choice(key, value, &["all", "party_only", "none"])?
+                    .to_owned();
+            }
+            "allow_waypoint_teleport" => {
+                self.allow_waypoint_teleport = policy_bool(key, value)?
+            }
+            "mine_all" | "cut_all" => {
+                let mode = policy_choice(
+                    key,
+                    value,
+                    &["off", "sneak_only", "while_not_sneaking", "always"],
+                )?
+                .to_owned();
+                if key == "mine_all" {
+                    self.mine_all = mode;
+                } else {
+                    self.cut_all = mode;
+                }
+            }
+            "xp_merge_mode" => {
+                self.xp_merge_mode = policy_choice(
+                    key,
+                    value,
+                    &["vanilla", "overflow_only", "aggressive"],
+                )?
+                .to_owned();
+            }
+            "max_frame_mib" => {
+                let mib = match value.parse::<u32>() {
+                    Ok(mib) if (2..=32).contains(&mib) => mib,
+                    _ => return Err(policy_invalid_value(key, value)),
+                };
+                self.max_frame_mib = mib;
+            }
+            _ => return Err(format!("Unknown policy '{key}'")),
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn live_server_policy() -> &'static Mutex<LiveServerPolicy> {
+    static POLICY: OnceLock<Mutex<LiveServerPolicy>> = OnceLock::new();
+    POLICY.get_or_init(|| Mutex::new(LiveServerPolicy::default()))
+}
+
+/// `/megu policy ...` is owner-level (4) like `/profile`: the advertised tree
+/// only exposes it at level 4 and the handler re-checks the level so a
+/// level-2 `.mcfunction` frame can never mutate the policy store.
+fn run_policy_command(level: u8, args: &[&str]) -> String {
+    if level < 4 {
+        return P8C_DENIED.into();
+    }
+    let mut policy = live_server_policy()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match args {
+        ["policy", "list"] => policy
+            .list()
+            .iter()
+            .map(|(key, value)| format!("{key} = {value}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+        ["policy", "get", key] => match policy.get(key) {
+            Ok(value) => format!("{key} = {value}"),
+            Err(error) => error,
+        },
+        ["policy", "set", key, value] => match policy.set(key, value) {
+            Ok(()) => match policy.get(key) {
+                Ok(current) => format!("{key} = {current}"),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        },
+        ["policy", "reset"] => {
+            policy.reset();
+            "All server policies reset to defaults".into()
+        }
+        _ => POLICY_USAGE.into(),
+    }
+}
+
 // ------------------------------------------------ #225: player/entity gaps
 
 /// The entity-effect wire packet with an explicit duration and particle
@@ -7530,5 +7716,313 @@ mod p8c_parity_tests {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|c| c.eid != 98_400);
         tags().lock().unwrap_or_else(|e| e.into_inner()).remove("p:p8c_tag");
+    }
+}
+
+// ------------------------------------------------------- policy_cmd_tests ---
+
+#[cfg(test)]
+mod policy_cmd_tests {
+    use super::*;
+
+    fn policy_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn policy_client(name: &str) -> (Arc<Client>, std::net::TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.name = name.into();
+        (Arc::new(client), receiver)
+    }
+
+    fn policy_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    fn policy_run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    fn policy_op_ctx(name: &str, level: u8) -> (CmdCtx, std::net::TcpStream) {
+        if level > 0 {
+            ops_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set(name, level, false);
+        }
+        let (client, receiver) = policy_client(name);
+        (policy_ctx(Some(client)), receiver)
+    }
+
+    fn policy_deop(name: &str) {
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+    }
+
+    fn policy_reset() {
+        live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset();
+    }
+
+    #[test]
+    fn policy_cmd_defaults_are_vanilla_permissive_and_opt_in() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        {
+            let policy = live_server_policy()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(policy.minimap_mode, "unrestricted");
+            assert!(policy.allow_cave_map);
+            assert!(policy.allow_mob_radar);
+            assert_eq!(policy.player_radar_scope, "all");
+            assert!(policy.allow_waypoint_teleport);
+            assert_eq!(policy.mine_all, "off");
+            assert_eq!(policy.cut_all, "off");
+            assert_eq!(policy.xp_merge_mode, "vanilla");
+            assert_eq!(policy.max_frame_mib, 2);
+            assert_eq!(policy.list().len(), 9);
+        }
+        let ctx = policy_ctx(None);
+        for (key, value) in [
+            ("minimap_mode", "unrestricted"),
+            ("allow_cave_map", "true"),
+            ("allow_mob_radar", "true"),
+            ("player_radar_scope", "all"),
+            ("allow_waypoint_teleport", "true"),
+            ("mine_all", "off"),
+            ("cut_all", "off"),
+            ("xp_merge_mode", "vanilla"),
+            ("max_frame_mib", "2"),
+        ] {
+            assert_eq!(
+                policy_run(&ctx, &format!("/megu policy get {key}")),
+                format!("{key} = {value}")
+            );
+        }
+        let list = policy_run(&ctx, "/megu policy list");
+        for key in [
+            "minimap_mode",
+            "allow_cave_map",
+            "allow_mob_radar",
+            "player_radar_scope",
+            "allow_waypoint_teleport",
+            "mine_all",
+            "cut_all",
+            "xp_merge_mode",
+            "max_frame_mib",
+        ] {
+            assert!(list.contains(&format!("{key} = ")), "{list}");
+        }
+        policy_reset();
+    }
+
+    #[test]
+    fn policy_cmd_op_level_four_sets_gets_lists_and_resets() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        let ctx = policy_ctx(None);
+        for (line, want) in [
+            (
+                "/megu policy set cut_all sneak_only",
+                "cut_all = sneak_only",
+            ),
+            (
+                "/megu policy set minimap_mode fair_play",
+                "minimap_mode = fair_play",
+            ),
+            (
+                "/megu policy set player_radar_scope party_only",
+                "player_radar_scope = party_only",
+            ),
+            ("/megu policy set max_frame_mib 16", "max_frame_mib = 16"),
+            (
+                "/megu policy set allow_mob_radar false",
+                "allow_mob_radar = false",
+            ),
+            (
+                "/megu policy set xp_merge_mode aggressive",
+                "xp_merge_mode = aggressive",
+            ),
+        ] {
+            assert_eq!(policy_run(&ctx, line), want, "{line}");
+        }
+        for (key, value) in [
+            ("cut_all", "sneak_only"),
+            ("minimap_mode", "fair_play"),
+            ("player_radar_scope", "party_only"),
+            ("max_frame_mib", "16"),
+            ("allow_mob_radar", "false"),
+            ("xp_merge_mode", "aggressive"),
+        ] {
+            assert_eq!(
+                policy_run(&ctx, &format!("/megu policy get {key}")),
+                format!("{key} = {value}")
+            );
+        }
+        let list = policy_run(&ctx, "/megu policy list");
+        assert!(list.contains("cut_all = sneak_only"), "{list}");
+        assert!(list.contains("max_frame_mib = 16"), "{list}");
+        assert_eq!(
+            policy_run(&ctx, "/megu policy reset"),
+            "All server policies reset to defaults"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get cut_all"),
+            "cut_all = off"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get max_frame_mib"),
+            "max_frame_mib = 2"
+        );
+        // An ops.json level-4 player has the same access as the console.
+        let (op4, _recv) = policy_op_ctx("policy_cmd_l4", 4);
+        assert_eq!(
+            policy_run(&op4, "/megu policy set mine_all always"),
+            "mine_all = always"
+        );
+        policy_deop("policy_cmd_l4");
+        policy_reset();
+    }
+
+    #[test]
+    fn policy_cmd_refuses_levels_below_four_and_level_two_functions() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        for (name, level) in [
+            ("policy_cmd_l0", 0u8),
+            ("policy_cmd_l1", 1),
+            ("policy_cmd_l2", 2),
+            ("policy_cmd_l3", 3),
+        ] {
+            let (ctx, _recv) = policy_op_ctx(name, level);
+            for msg in [
+                "/megu policy list",
+                "/megu policy get cut_all",
+                "/megu policy set cut_all sneak_only",
+                "/megu policy reset",
+            ] {
+                assert_eq!(
+                    policy_run(&ctx, msg),
+                    "You do not have permission to run that command",
+                    "level-{level} source must be refused {msg}"
+                );
+            }
+            policy_deop(name);
+        }
+        for level in 0..4u8 {
+            assert!(
+                command_tree_at_level(level).child("megu").is_none(),
+                "megu must not be advertised at level {level}"
+            );
+            let error = live_brigadier_tree()
+                .parse_command_for_level("/megu policy list", level)
+                .err()
+                .expect("megu must be permission-denied below level 4");
+            assert_eq!(
+                error.kind(),
+                brigadier::BrigadierErrorKind::PermissionDenied
+            );
+        }
+        assert!(command_tree_at_level(4).child("megu").is_some());
+        live_brigadier_tree()
+            .parse_command_for_level("/megu policy list", 4)
+            .expect("level 4 parses /megu policy list");
+        // A level-2 `.mcfunction` frame re-enters run_command_ctx with the
+        // same source: run_function_lines is that path, not an approximation.
+        let (ctx, _recv) = policy_op_ctx("policy_cmd_fn2", 2);
+        run_function_lines(
+            &["megu policy set cut_all sneak_only".to_owned()],
+            ctx.me.clone(),
+            &mut None,
+            0,
+        );
+        policy_deop("policy_cmd_fn2");
+        let policy = live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(policy.cut_all, "off", "level-2 function mutated policy");
+        drop(policy);
+        policy_reset();
+    }
+
+    #[test]
+    fn policy_cmd_invalid_key_or_value_fails_closed_without_mutating() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        let ctx = policy_ctx(None);
+        assert_eq!(
+            policy_run(&ctx, "/megu policy set bogus off"),
+            "Unknown policy 'bogus'"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get bogus"),
+            "Unknown policy 'bogus'"
+        );
+        for (line, want) in [
+            (
+                "/megu policy set max_frame_mib 64",
+                "Invalid value '64' for policy 'max_frame_mib'",
+            ),
+            (
+                "/megu policy set max_frame_mib 1",
+                "Invalid value '1' for policy 'max_frame_mib'",
+            ),
+            (
+                "/megu policy set max_frame_mib abc",
+                "Invalid value 'abc' for policy 'max_frame_mib'",
+            ),
+            (
+                "/megu policy set minimap_mode bogus",
+                "Invalid value 'bogus' for policy 'minimap_mode'",
+            ),
+            (
+                "/megu policy set allow_cave_map maybe",
+                "Invalid value 'maybe' for policy 'allow_cave_map'",
+            ),
+            (
+                "/megu policy set mine_all sometimes",
+                "Invalid value 'sometimes' for policy 'mine_all'",
+            ),
+        ] {
+            assert_eq!(policy_run(&ctx, line), want, "{line}");
+        }
+        // A rejected set leaves the previous valid value in place.
+        assert_eq!(
+            policy_run(&ctx, "/megu policy set cut_all sneak_only"),
+            "cut_all = sneak_only"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy set cut_all bogus"),
+            "Invalid value 'bogus' for policy 'cut_all'"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get cut_all"),
+            "cut_all = sneak_only"
+        );
+        for line in [
+            "/megu",
+            "/megu policy",
+            "/megu policy get",
+            "/megu policy set cut_all",
+            "/megu policy reset now",
+        ] {
+            assert_eq!(policy_run(&ctx, line), POLICY_USAGE, "{line}");
+        }
+        policy_reset();
     }
 }

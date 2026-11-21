@@ -4105,6 +4105,20 @@ fn command_allowed_for_player(cmd: &str, args: &[&str]) -> bool {
     command_allowed_at_level(cmd, 0)
         || (cmd == "time" && matches!(args.first().copied(), Some("query" | "get")))
 }
+/// `/megu` is a server-added owner command: `required_permission_level` lives
+/// in `server_ops.rs`, outside this lane, so the OP-4 mapping is applied at
+/// the dispatch/advertise boundary instead of falling through to the default
+/// level-2 gate.
+fn required_permission_level_for_source(cmd: &str) -> u8 {
+    if cmd == "megu" {
+        4
+    } else {
+        required_permission_level(cmd)
+    }
+}
+fn command_allowed_for_source(cmd: &str, level: u8) -> bool {
+    level >= required_permission_level_for_source(cmd)
+}
 fn command_usage(name: &str) -> String {
     // Exact usage for every literal `native_command_dispatcher` registers.
     // Anything missing here is not a command the server knows, so /help
@@ -4146,6 +4160,7 @@ fn command_usage(name: &str) -> String {
         "locate" => "/locate structure|biome|poi <id>",
         "loot" => "/loot spawn|give|insert|replace <target> <source>",
         "me" => "/me <action>",
+        "megu" => "/megu policy list|get <key>|set <key> <value>|reset",
         "msg" | "tell" | "w" => "/msg <player> <message>",
         "op" => "/op <player>",
         "pardon" => "/pardon <player>",
@@ -4435,6 +4450,10 @@ fn completion_argument(
     }
 }
 
+fn policy_command_argument(name: &str) -> PlayCommandBuilder {
+    PlayCommandBuilder::argument(name, Box::new(brigadier::StringArgumentType::word()))
+}
+
 #[cfg(test)]
 fn command_tree(admin: bool) -> brigadier::CommandNode<()> {
     command_tree_at_level(if admin { 4 } else { 0 })
@@ -4623,7 +4642,7 @@ fn mod_command_literals() -> Vec<(String, u8)> {
 fn live_brigadier_tree() -> brigadier::BrigadierTree<()> {
     brigadier::BrigadierTree::new(command_dispatcher_at_level(4, None), |literal| {
         mod_command_required_level(literal)
-            .unwrap_or_else(|| required_permission_level(literal))
+            .unwrap_or_else(|| required_permission_level_for_source(literal))
     })
 }
 
@@ -4945,6 +4964,17 @@ fn native_command_dispatcher(
     }
     if level >= 4 {
         register(literal("profile").then(args("arguments")));
+        let policy = done("policy")
+            .then(done("list"))
+            .then(done("reset"))
+            .then(literal("get").then(policy_command_argument("key").executes(|_| Ok(0))))
+            .then(
+                literal("set").then(
+                    policy_command_argument("key")
+                        .then(policy_command_argument("value").executes(|_| Ok(0))),
+                ),
+            );
+        register(done("megu").then(policy));
     }
     // P8c cluster-C owner commands; `required_permission_level` already maps
     // all four to 4, so `register_at_level` advertises them at level 4 only.
@@ -6390,7 +6420,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     // players at their ops.json level. `command_allowed_for_player` keeps the
     // argument-aware level-0 exceptions (e.g. `/time query`) on top.
     let level = me.map_or(4, |player| player_permission_level(&player.name));
-    if !command_allowed_at_level(cmd, level)
+    if !command_allowed_for_source(cmd, level)
         && !command_allowed_for_player(cmd, &args)
         && !mod_command_permitted(cmd, level)
     {
@@ -6512,7 +6542,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 .rsplit(':')
                 .next()
                 .unwrap_or("");
-            if name.is_empty() || !command_allowed_at_level(name, level) {
+            if name.is_empty() || !command_allowed_for_source(name, level) {
                 "Unknown command or insufficient permissions".into()
             } else {
                 command_usage(name)
@@ -7386,6 +7416,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         // defaults unmapped names to 2 and a level-2 `.mcfunction` frame must
         // never reach either command.
         "profile" => run_profile_command(level, &args),
+        "megu" => run_policy_command(level, &args),
         "transfer" => run_transfer_command(ctx, level, &args),
         // P8c cluster-C diagnostics are owner-level (4) too; each handler
         // re-checks `level` like `run_profile_command` does.
