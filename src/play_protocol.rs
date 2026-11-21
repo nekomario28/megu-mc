@@ -454,6 +454,20 @@ fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> st
     result
 }
 
+/// A START_DESTROY_BLOCK the client has not cancelled. Vanilla survival mining
+/// advances on the server (`ServerPlayerGameMode.tick` accumulates destroy
+/// progress and breaks the block when it reaches the dig duration); the finish
+/// packet a client sends only predicts the same event, so the stored duration
+/// here is the completion trigger. `state` pins the block the dig was computed
+/// for — if the cell changed underneath, the dig is abandoned instead.
+#[derive(Clone, Copy)]
+struct PendingDig {
+    pos: DimBlockPos,
+    state: u32,
+    started: Instant,
+    seconds: f32,
+}
+
 struct Client {
     eid: i32,
     uuid: [u8; 16],
@@ -483,7 +497,7 @@ struct Client {
     #[allow(dead_code)]
     merchant_in: Mutex<[Stack; 2]>,
     bow_draw: Mutex<Option<Instant>>,
-    dig: Mutex<Option<(i32, i32, i32, Instant)>>,
+    dig: Mutex<Option<PendingDig>>,
     eat_start: Mutex<Option<Instant>>,
     blocking: Mutex<bool>,
     sprinting: Mutex<bool>,
@@ -1132,6 +1146,151 @@ fn interest_tick() {
     }
     for client in &cls {
         sync_entity_interest(client, &ents);
+    }
+    dig_progress_tick(&cls);
+}
+
+/// Server-side mining completion: a pending START_DESTROY_BLOCK whose block
+/// still matches and whose dig duration has elapsed breaks, exactly as
+/// `ServerPlayerGameMode.tick` advancing `destroyProgress` past 1.0 would. A
+/// changed or removed block, a cancelled dig, or a client disconnect clears the
+/// pending state instead.
+fn dig_progress_tick(cls: &[Arc<Client>]) {
+    for c in cls {
+        let Some(dig) = *c.dig.lock().unwrap() else {
+            continue;
+        };
+        let (dim, x, y, z) = dig.pos;
+        let current = block_at_dim(dim, x, y, z);
+        if current != dig.state {
+            *c.dig.lock().unwrap() = None;
+            continue;
+        }
+        if dig.started.elapsed().as_secs_f32() >= dig.seconds {
+            *c.dig.lock().unwrap() = None;
+            finish_block_break(c, dim, x, y, z, dig.state);
+        }
+    }
+}
+
+/// Apply a confirmed block break: clear the cell, fan the update out to every
+/// chunk watcher, then run the survival bookkeeping (exhaustion, tool wear,
+/// drops). Shared by the dig packet's immediate path and the tick-driven
+/// destroy progress that runs after START_DESTROY_BLOCK.
+fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old: u32) {
+    let held = {
+        let held_slot = *me.held.lock().unwrap();
+        let inv = me.inv.lock().unwrap();
+        inv.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new()))
+    };
+    #[cfg(feature = "neoforge-events")]
+    if java_compat::NEOFORGE.get().is_some() {
+        let result = neoforge_event(me, java_compat::S1Event::BlockBreak {
+            dim: dim.index() as u8,
+            pos: (x, y, z),
+            state: old,
+            player: (me.eid, me.name.clone()),
+            exp_to_drop: 0,
+        });
+        if result.is_err() || !set_block_if_dim(dim, x, y, z, 0, Some(old)) {
+            neoforge_resync_block(me, dim, (x, y, z));
+            return;
+        }
+    } else {
+        set_block_dim(dim, x, y, z, 0);
+    }
+    #[cfg(not(feature = "neoforge-events"))]
+    set_block_dim(dim, x, y, z, 0);
+    note_block_update_dim(dim, x, y, z, 0);
+    if *me.gm.lock().unwrap() != 1 {
+        *me.walk_acc.lock().unwrap() += 0.005; // block-break exhaustion
+                                               // vanilla: breaking a block damages the held tool
+        if tool_max_damage(held.0).is_some()
+            || comp_get(&held.2, COMP_MAX_DAMAGE).is_some()
+        {
+            if damage_held(me) {
+                let (pxx, pyy, pzz, ..) = {
+                    let p = me.pos.lock().unwrap();
+                    *p
+                };
+                let snd = sound_pkt_named("entity.item.break", pxx, pyy + 1.0, pzz);
+                broadcast(-1, |_c| (0x68, snd.clone()));
+            }
+            held_slot_resync(me);
+        }
+        let silk = enchant_level(&held.2, 33) > 0;
+        let fort = enchant_level(&held.2, 13).clamp(0, 3) as u8;
+        // ore loot: (material drop, silk-touch drops the ore block
+        // item instead, fortune multiplies the material count)
+        let ore: Option<(i64, i64)> = match old {
+            127 | 128 => Some((803, 62)),     // coal -> coal_ore
+            125 | 126 => Some((810, 64)),     // raw_iron -> iron_ore
+            123 | 124 => Some((814, 68)),     // raw_gold -> gold_ore
+            4274 | 4275 => Some((805, 76)),   // diamond -> diamond_ore
+            520 | 521 => Some((807, 74)),     // lapis -> lapis_ore
+            5735..=5737 => Some((657, 70)),   // redstone -> redstone_ore
+            22942..=22943 => Some((812, 66)), // raw_copper -> copper_ore
+            7511 | 7512 => Some((806, 72)),   // emerald -> emerald_ore
+            _ => None,
+        };
+        let (drop_item, drop_cnt) = if let (true, Some(o)) = (silk, ore) {
+            (Some(o.1), 1)
+        } else {
+            let it = match old {
+                127 | 128 => Some(803),
+                125 | 126 => Some(810),
+                123 | 124 => Some(814),
+                4274 | 4275 => Some(805),
+                520 | 521 => Some(807),
+                5735..=5737 => Some(657),
+                22942..=22943 => Some(812),
+                7511 | 7512 => Some(806),
+                4278..=4285 => Some(853), // wheat -> seeds
+                _ => block_drop(old),
+            };
+            let n = if fort > 0 && ore.is_some() {
+                1 + (world_rng::next_u64() % (fort as u64 + 1)) as u8
+            } else {
+                1
+            };
+            (it, n)
+        };
+        crops().lock().unwrap().remove(&ow_block((x, y, z)));
+        if old == 4285 {
+            // ripe: extra wheat drop
+            let d = Drop {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                x: x as f64 + 0.5,
+                y: y as f64 + 0.25,
+                z: z as f64 + 0.5,
+                item: 854,
+                cnt: 1,
+                comps: Vec::new(),
+                age: 0,
+                target: None,
+                thrower: None,
+            };
+            drops().lock().unwrap().push(d);
+        }
+        if let Some(item) = if !can_harvest(old as i64, held.0) {
+            None
+        } else {
+            drop_item
+        } {
+            let d = Drop {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                x: x as f64 + 0.5,
+                y: y as f64 + 0.25,
+                z: z as f64 + 0.5,
+                item,
+                cnt: drop_cnt,
+                comps: Vec::new(),
+                age: 0,
+                target: None,
+                thrower: None,
+            };
+            drops().lock().unwrap().push(d);
+        }
     }
 }
 
@@ -2005,6 +2164,7 @@ fn stream_chunks(
         prefetch_terrain_group_dim(dim, chunk_group, lo, hi, delivery_workers, delivery_round);
         for (cx, cz) in chunk_group {
             let mut packet = map_chunk(*cx, *cz, dim, gen);
+            splice_chunk_block_entities(&mut packet, live_chunk_block_entities(dim, *cx, *cz));
             cull_chunk_light(&mut packet, dim);
             if send_packet(s, 0x27, packet).is_err() {
                 failed = true;
@@ -2050,6 +2210,192 @@ fn stream_chunks(
     if send_packet(s, 0x0c, bf).is_ok() {
         ack.sent_batch(Instant::now(), batch);
     }
+}
+
+/// `BuiltInRegistries.BLOCK_ENTITY_TYPE` ids in 1.21.1 for the twelve
+/// `live_block_entity_id` families (sign=7 and mob_spawner=9 are already
+/// pinned by `sign_entity_pkt` and `generated_spawner_chunk_entities`).
+fn live_block_entity_wire_id(id: &str) -> Option<i64> {
+    Some(match id {
+        "minecraft:jukebox" => 4,
+        "minecraft:beacon" => 14,
+        "minecraft:skull" => 15,
+        "minecraft:banner" => 19,
+        "minecraft:lectern" => 29,
+        "minecraft:campfire" => 32,
+        "minecraft:chiseled_bookshelf" => 38,
+        "minecraft:brushable_block" => 39,
+        "minecraft:decorated_pot" => 40,
+        "minecraft:crafter" => 41,
+        "minecraft:trial_spawner" => 42,
+        "minecraft:vault" => 43,
+        _ => return None,
+    })
+}
+
+/// The live block entities a 0x27 chunk packet must carry for `(dim, cx, cz)`:
+/// each is encoded as `ChunkBlockEntity` (position, type id, network NBT with
+/// `x`/`y`/`z`/`id` — the same payload `live_block_entity_snapshot` produces).
+fn live_chunk_block_entities(dim: DimId, cx: i32, cz: i32) -> Vec<ChunkBlockEntity> {
+    with_save_guard(|| {
+        let Some(reg) = crate::block_registry::breg() else {
+            return Vec::new();
+        };
+        let mut store = live_block_entities().lock().unwrap();
+        store.discover(reg);
+        store
+            .entries
+            .iter()
+            .filter(|(&(edim, x, _, z), _)| edim == dim && x >> 4 == cx && z >> 4 == cz)
+            .filter_map(|(&(edim, x, y, z), &(block, ref entity))| {
+                // The entry only reaches the client while the block it
+                // describes is still in place.
+                let state = block_at_dim(edim, x, y, z);
+                if reg.block_id_of(state) != Some(block) {
+                    return None;
+                }
+                let id = live_block_entity_id(reg.name_of(state))?;
+                let wire_id = live_block_entity_wire_id(id)?;
+                let Tag::Compound(mut fields) = entity.to_nbt() else {
+                    return None;
+                };
+                for (field, value) in [("x", x), ("y", y), ("z", z)] {
+                    block_entity_put(&mut fields, field, Tag::Int(value));
+                }
+                block_entity_put(&mut fields, "id", block_entity_string(id));
+                let nbt = crate::nbt::write_network_nbt(&Tag::Compound(fields)).ok()?;
+                Some(((x, y, z), wire_id, nbt))
+            })
+            .collect()
+    })
+}
+
+/// Merge `extra` block-entity entries into an assembled 0x27 payload. The
+/// section sits between the chunk section data and the light masks, so it is
+/// located by walking the heightmaps compound and the section byte count
+/// rather than assuming an offset; a malformed packet is left untouched.
+fn splice_chunk_block_entities(packet: &mut Vec<u8>, extra: Vec<ChunkBlockEntity>) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut pos = 8usize;
+    if packet.len() < pos || !nbt_wire_skip(packet, &mut pos, 0) {
+        return;
+    }
+    // data length varint + the block-states/biomes payload it counts
+    {
+        let mut rest = &packet[pos..];
+        let Some(len) = read_varint(&mut rest) else {
+            return;
+        };
+        pos = packet.len() - rest.len();
+        if len < 0 {
+            return;
+        }
+        let Some(end) = pos.checked_add(len as usize) else {
+            return;
+        };
+        if end > packet.len() {
+            return;
+        }
+        pos = end;
+    }
+    // block-entity count varint, then existing entries
+    let count_pos = pos;
+    let mut rest = &packet[pos..];
+    let Some(existing) = read_varint(&mut rest) else {
+        return;
+    };
+    if !(0..=4096).contains(&existing) {
+        return;
+    }
+    let entries_start = packet.len() - rest.len();
+    let mut p = entries_start;
+    for _ in 0..existing {
+        if p + 3 > packet.len() {
+            return;
+        }
+        p += 3; // packed section-local x/z byte + i16 y
+        {
+            let mut r = &packet[p..];
+            if read_varint(&mut r).is_none() {
+                return;
+            }
+            p = packet.len() - r.len();
+        }
+        if !nbt_wire_skip(packet, &mut p, 0) {
+            return;
+        }
+    }
+    let tail = packet.split_off(p);
+    let entries = packet.split_off(entries_start);
+    packet.truncate(count_pos);
+    write_varint(packet, existing + extra.len() as i64);
+    packet.extend_from_slice(&entries);
+    for ((x, y, z), wire_id, nbt) in extra {
+        packet.push(((x & 15) as u8) << 4 | (z & 15) as u8);
+        packet.extend_from_slice(&(y as i16).to_be_bytes());
+        write_varint(packet, wire_id);
+        packet.extend_from_slice(&nbt);
+    }
+    packet.extend_from_slice(&tail);
+}
+
+/// `minecraft:mob_effect` registry ids for the six effects a beacon offers.
+fn beacon_effect_from_wire(id: i64) -> Option<BeaconEffect> {
+    Some(match id {
+        1 => BeaconEffect::Speed,
+        3 => BeaconEffect::Haste,
+        5 => BeaconEffect::Strength,
+        8 => BeaconEffect::JumpBoost,
+        10 => BeaconEffect::Regeneration,
+        11 => BeaconEffect::Resistance,
+        _ => return None,
+    })
+}
+
+/// The beacon block a player last used without sneaking, keyed by entity id —
+/// the slot a real beacon menu would own. Eids are never reused, so entries
+/// are simply dropped with the client's own teardown.
+fn beacon_menu_anchors() -> &'static Mutex<HashMap<i32, DimBlockPos>> {
+    static ANCHORS: OnceLock<Mutex<HashMap<i32, DimBlockPos>>> = OnceLock::new();
+    ANCHORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The beacon a `set_beacon_effect` refers to. The anchor recorded when the
+/// beacon was used wins (a real client sends this packet while its beacon menu
+/// is open); without one, the nearest beacon still standing in interaction
+/// range stands in for it.
+fn live_beacon_anchor(me: &Client, dim: DimId) -> Option<DimBlockPos> {
+    let reg = crate::block_registry::breg()?;
+    let is_beacon = |x: i32, y: i32, z: i32| {
+        live_block_entity_id(reg.name_of(block_at_dim(dim, x, y, z)))
+            == Some("minecraft:beacon")
+    };
+    if let Some(&(adim, x, y, z)) = beacon_menu_anchors().lock().unwrap().get(&me.eid) {
+        if adim == dim && is_beacon(x, y, z) {
+            return Some((adim, x, y, z));
+        }
+    }
+    let (px, py, pz, ..) = *me.pos.lock().unwrap();
+    live_block_entities()
+        .lock()
+        .unwrap()
+        .entries
+        .iter()
+        .filter(|(&(edim, x, y, z), _)| edim == dim && is_beacon(x, y, z))
+        .map(|(&key, _)| {
+            let (_, x, y, z) = key;
+            (
+                (x as f64 + 0.5 - px).powi(2)
+                    + (y as f64 + 0.5 - py).powi(2)
+                    + (z as f64 + 0.5 - pz).powi(2),
+                key,
+            )
+        })
+        .filter(|(d2, _)| *d2 <= 64.0)
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, key)| key)
 }
 
 fn pump_client_chunks(client: &Client, announce_center: bool) -> bool {
@@ -4071,11 +4417,16 @@ fn handle(mut s: TcpStream) {
                             break_now = true;
                         } else if let Some(t) = req {
                             if status == 0 {
-                                *me.dig.lock().unwrap() = Some((x, y, z, Instant::now()));
+                                *me.dig.lock().unwrap() = Some(PendingDig {
+                                    pos: (dim, x, y, z),
+                                    state: old,
+                                    started: Instant::now(),
+                                    seconds: t,
+                                });
                             } else {
                                 let t0 = me.dig.lock().unwrap().and_then(|d| {
-                                    if (d.0, d.1, d.2) == (x, y, z) {
-                                        Some(d.3)
+                                    if (d.pos.1, d.pos.2, d.pos.3) == (x, y, z) {
+                                        Some(d.started)
                                     } else {
                                         None
                                     }
@@ -4096,117 +4447,7 @@ fn handle(mut s: TcpStream) {
                         note_block_update_dim(dim, x, y, z, old); // rejected: resync truth
                     }
                     if break_now {
-                        #[cfg(feature = "neoforge-events")]
-                        if java_compat::NEOFORGE.get().is_some() {
-                            let result = neoforge_event(&me, java_compat::S1Event::BlockBreak {
-                                dim: dim.index() as u8,
-                                pos: (x, y, z),
-                                state: old,
-                                player: (me.eid, me.name.clone()),
-                                exp_to_drop: 0,
-                            });
-                            if result.is_err() || !set_block_if_dim(dim, x, y, z, 0, Some(old)) {
-                                neoforge_resync_block(&me, dim, (x, y, z));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
-                                continue;
-                            }
-                        } else {
-                            set_block_dim(dim, x, y, z, 0);
-                        }
-                        #[cfg(not(feature = "neoforge-events"))]
-                        set_block_dim(dim, x, y, z, 0);
-                        note_block_update_dim(dim, x, y, z, 0);
-                        if *me.gm.lock().unwrap() != 1 {
-                            *me.walk_acc.lock().unwrap() += 0.005; // block-break exhaustion
-                                                                   // vanilla: breaking a block damages the held tool
-                            if tool_max_damage(held.0).is_some()
-                                || comp_get(&held.2, COMP_MAX_DAMAGE).is_some()
-                            {
-                                if damage_held(&me) {
-                                    let (pxx, pyy, pzz, ..) = {
-                                        let p = me.pos.lock().unwrap();
-                                        *p
-                                    };
-                                    let snd =
-                                        sound_pkt_named("entity.item.break", pxx, pyy + 1.0, pzz);
-                                    broadcast(-1, |_c| (0x68, snd.clone()));
-                                }
-                                held_slot_resync(&me);
-                            }
-                            let silk = enchant_level(&held.2, 33) > 0;
-                            let fort = enchant_level(&held.2, 13).clamp(0, 3) as u8;
-                            // ore loot: (material drop, silk-touch drops the ore block
-                            // item instead, fortune multiplies the material count)
-                            let ore: Option<(i64, i64)> = match old {
-                                127 | 128 => Some((803, 62)),     // coal -> coal_ore
-                                125 | 126 => Some((810, 64)),     // raw_iron -> iron_ore
-                                123 | 124 => Some((814, 68)),     // raw_gold -> gold_ore
-                                4274 | 4275 => Some((805, 76)),   // diamond -> diamond_ore
-                                520 | 521 => Some((807, 74)),     // lapis -> lapis_ore
-                                5735..=5737 => Some((657, 70)),   // redstone -> redstone_ore
-                                22942..=22943 => Some((812, 66)), // raw_copper -> copper_ore
-                                7511 | 7512 => Some((806, 72)),   // emerald -> emerald_ore
-                                _ => None,
-                            };
-                            let (drop_item, drop_cnt) = if let (true, Some(o)) = (silk, ore) {
-                                (Some(o.1), 1)
-                            } else {
-                                let it = match old {
-                                    127 | 128 => Some(803),
-                                    125 | 126 => Some(810),
-                                    123 | 124 => Some(814),
-                                    4274 | 4275 => Some(805),
-                                    520 | 521 => Some(807),
-                                    5735..=5737 => Some(657),
-                                    22942..=22943 => Some(812),
-                                    7511 | 7512 => Some(806),
-                                    4278..=4285 => Some(853), // wheat -> seeds
-                                    _ => block_drop(old),
-                                };
-                                let n = if fort > 0 && ore.is_some() {
-                                    1 + (world_rng::next_u64() % (fort as u64 + 1)) as u8
-                                } else {
-                                    1
-                                };
-                                (it, n)
-                            };
-                            crops().lock().unwrap().remove(&ow_block((x, y, z)));
-                            if old == 4285 {
-                                // ripe: extra wheat drop
-                                let d = Drop {
-                                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                    x: x as f64 + 0.5,
-                                    y: y as f64 + 0.25,
-                                    z: z as f64 + 0.5,
-                                    item: 854,
-                                    cnt: 1,
-                                    comps: Vec::new(),
-                                    age: 0,
-                                    target: None,
-                                    thrower: None,
-                                };
-                                drops().lock().unwrap().push(d);
-                            }
-                            if let Some(item) = if !can_harvest(old as i64, held.0) {
-                                None
-                            } else {
-                                drop_item
-                            } {
-                                let d = Drop {
-                                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                    x: x as f64 + 0.5,
-                                    y: y as f64 + 0.25,
-                                    z: z as f64 + 0.5,
-                                    item,
-                                    cnt: drop_cnt,
-                                    comps: Vec::new(),
-                                    age: 0,
-                                    target: None,
-                                    thrower: None,
-                                };
-                                drops().lock().unwrap().push(d);
-                            }
-                        }
+                        finish_block_break(&me, dim, x, y, z, old);
                     }
                 }
                 let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
@@ -4281,6 +4522,30 @@ fn handle(mut s: TcpStream) {
                     true
                 };
                 let sneaking = *me.sneaking.lock().unwrap();
+                if !sneaking
+                    && crate::block_registry::breg().is_some_and(|reg| {
+                        live_block_entity_id(reg.name_of(clicked)) == Some("minecraft:beacon")
+                    })
+                {
+                    // vanilla BeaconBlock.useWithoutItem opens the beacon screen.
+                    // Until a live beacon window exists the held stack stands in
+                    // for its payment slot; the anchor is what a real
+                    // `set_beacon_effect` would resolve against.
+                    beacon_menu_anchors()
+                        .lock()
+                        .unwrap()
+                        .insert(me.eid, (dim, x, y, z));
+                    with_save_guard(|| {
+                        if let Some(reg) = crate::block_registry::breg() {
+                            live_block_entities()
+                                .lock()
+                                .unwrap()
+                                .at(reg, (dim, x, y, z), clicked);
+                        }
+                    });
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    continue;
+                }
                 if !sneaking
                     && (open_live_block_menu(&me, (dim, x, y, z), clicked)
                         || use_redstone_component(&me, (dim, x, y, z), clicked))
@@ -5687,6 +5952,80 @@ fn handle(mut s: TcpStream) {
                     with_save_guard(|| live_select_trade(&me, index));
                 }
             }
+            0x2e => {
+                // set_beacon_effect: Optional<varint> primary, Optional<varint>
+                // secondary — mob-effect registry ids, not BeaconEffect ordinals.
+                let mut sl = &b[..];
+                let opt = |sl: &mut &[u8]| -> Option<Option<i64>> {
+                    match *sl.first()? {
+                        0 => {
+                            *sl = &sl[1..];
+                            Some(None)
+                        }
+                        1 => {
+                            *sl = &sl[1..];
+                            read_varint(sl).map(Some)
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(primary) = opt(&mut sl) else {
+                    continue;
+                };
+                let Some(secondary) = opt(&mut sl) else {
+                    continue;
+                };
+                let primary = primary.and_then(beacon_effect_from_wire);
+                let secondary = secondary.and_then(beacon_effect_from_wire);
+                let dim = *me.dim.lock().unwrap();
+                if let Some((bdim, bx, by, bz)) = live_beacon_anchor(&me, dim) {
+                    let applied = with_save_guard(|| {
+                        let Some(reg) = crate::block_registry::breg() else {
+                            return false;
+                        };
+                        let state = block_at_dim(bdim, bx, by, bz);
+                        let mut store = live_block_entities().lock().unwrap();
+                        let Some(LiveBlockEntity::Beacon(beacon)) =
+                            store.at(reg, (bdim, bx, by, bz), state)
+                        else {
+                            return false;
+                        };
+                        let held_slot = 36 + *me.held.lock().unwrap();
+                        let stack = me
+                            .inv
+                            .lock()
+                            .unwrap()
+                            .get(&held_slot)
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut payment = BlockEntityItem::from_stack(&stack);
+                        if !beacon.confirm(primary, secondary, &mut payment) {
+                            return false;
+                        }
+                        map_take(&mut me.inv.lock().unwrap(), held_slot, 1);
+                        true
+                    });
+                    if applied {
+                        // The beacon's changed state is the confirmation: the
+                        // updated block-entity data goes out to every holder of
+                        // its chunk, matching sendBlockUpdated.
+                        if let Some((_, tag)) =
+                            live_block_entity_snapshot((bdim, bx, by, bz))
+                        {
+                            if let Ok(nbt) = crate::nbt::write_network_nbt(&tag) {
+                                let mut pkt = Vec::new();
+                                write_pos(&mut pkt, bx, by, bz);
+                                write_varint(&mut pkt, 14); // block entity type: beacon
+                                pkt.extend_from_slice(&nbt);
+                                broadcast_chunk_dim(bdim, bx >> 4, bz >> 4, |_c| {
+                                    (0x07, pkt.clone())
+                                });
+                                held_slot_resync(&me);
+                            }
+                        }
+                    }
+                }
+            }
             0x0f => {
                 if let Some(id) = live_menu_id(&me) {
                     if b.as_slice() == [id] {
@@ -5716,6 +6055,7 @@ fn handle(mut s: TcpStream) {
                 *me.chest_sync.lock().unwrap() = None;
                 *me.open_furnace.lock().unwrap() = None;
                 *me.open_table.lock().unwrap() = false;
+                beacon_menu_anchors().lock().unwrap().remove(&me.eid);
                 if had_container {
                     // vanilla containerMenu.removed: the carried stack is
                     // thrown into the world, crafting grid goes back to inv
@@ -7014,6 +7354,7 @@ fn handle(mut s: TcpStream) {
         drop(cls);
         player_mechanism_sessions().lock().unwrap().remove(&me_cleanup.eid);
         death_drop_marks().lock().unwrap().remove(&me_cleanup.eid);
+        beacon_menu_anchors().lock().unwrap().remove(&me_cleanup.eid);
         broadcast(me_cleanup.eid, |_c| {
             (0x42, {
                 let mut p = Vec::new();
