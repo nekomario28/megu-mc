@@ -101,6 +101,10 @@ python3 tests/megu_translate_test.py
 python3 tests/megu_bench_test.py
 python3 tests/mini_jre_test.py
 python3 tests/vanilla_parity_audit_test.py
+python3 tools/vanilla_parity_audit.py --format text --strict --min-c2s-handled 58 --min-gamerules-wired 51
+python3 tests/modloader_parity_audit_test.py
+python3 tools/modloader_parity_audit.py --format text --strict --min-overall-pct 100
+python3 tests/vanilla_live_diff_test.py
 python3 tests/live_parity_e2e_wire.py --self-test
 python3 tests/mod_suite_live_wire.py --self-test
 python3 website/check_site.py
@@ -187,6 +191,7 @@ timeout 180 python3 tests/command_brigadier_ops_wire.py "$binary"
 timeout 180 python3 tests/command_datapack_wire.py
 timeout 180 python3 tests/w1_w3_live_wire.py "$binary"
 timeout 180 python3 tests/live_parity_e2e_wire.py "$binary"
+timeout 180 python3 tools/vanilla_live_diff.py --megu-bin "$binary" --format text --strict
 timeout 180 python3 tests/client_prediction_wire.py --binary "$binary"
 timeout 180 python3 tests/client_inventory_pickup_wire.py --binary "$binary"
 timeout 180 python3 tests/client_kernel_wire.py "$binary"
