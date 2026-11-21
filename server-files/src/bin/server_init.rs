@@ -17,9 +17,10 @@
 use mc_spine_core::version::TargetVersion;
 use mc_spine_server_files::json::Json;
 use mc_spine_server_files::{
-    check_eula, valid_player_name, BannedIps, BannedPlayers, EulaStatus, OpsList, ServerDirectory,
-    ServerProperties, UserCache, Whitelist, BANNED_IPS_FILE, BANNED_PLAYERS_FILE, EULA_FILE,
-    EULA_LINK, OPS_FILE, PROPERTIES_FILE, USERCACHE_FILE, WHITELIST_FILE,
+    check_eula, valid_player_name, BannedIps, BannedPlayers, ClaimChunkKey, ClaimOwner,
+    ClaimsWorld, ChunkClaim, EulaStatus, OpsList, Party, ServerDirectory, ServerProperties,
+    SubClaimId, UserCache, Whitelist, BANNED_IPS_FILE, BANNED_PLAYERS_FILE, EULA_FILE, EULA_LINK,
+    OPS_FILE, PROPERTIES_FILE, USERCACHE_FILE, WHITELIST_FILE,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -38,6 +39,10 @@ USAGE:
                       [--created <stamp>] [--source <name>] [--json]
     mc-spine-init pardon --dir <dir> <player> [--json]
     mc-spine-init whitelist --dir <dir> <on|off|add|remove|list> [player] [--json]
+    mc-spine-init claims --dir <dir> list [--dimension <dim>] [--json]
+    mc-spine-init claims --dir <dir> parties [--json]
+    mc-spine-init claims --dir <dir> server-claim <dim> <cx> <cz> [--forceload] [--json]
+    mc-spine-init claims --dir <dir> unclaim <dim> <cx> <cz> [--json]
     mc-spine-init --help
 
 COMMANDS:
@@ -64,6 +69,14 @@ COMMANDS:
     pardon      Lift a player ban.
     whitelist   on/off toggle white-list in server.properties; add/remove edit
                 whitelist.json; list prints its entries.
+    claims      Offline OpenPAC/FTB-Chunks administration of the claims store
+                (openpac_claims.json / openpac_parties.json). list prints
+                claims (optionally filtered to one dimension) plus the
+                forceload count; parties prints parties with members and
+                allies; server-claim claims a chunk for the server (spawn
+                protection), optionally force-loaded; unclaim drops any
+                claim as admin. Only the two claims files are read and
+                written — eula.txt is never touched.
 
 OPTIONS:
     --dir <dir>          The server working directory (required).
@@ -126,6 +139,23 @@ enum WhitelistAction {
     List,
 }
 
+enum ClaimsAction {
+    /// `--dimension` is a normalized `namespace:path` filter.
+    List { dimension: Option<String> },
+    Parties,
+    ServerClaim {
+        dimension: String,
+        cx: i32,
+        cz: i32,
+        forceload: bool,
+    },
+    Unclaim {
+        dimension: String,
+        cx: i32,
+        cz: i32,
+    },
+}
+
 enum Command {
     Help,
     Init {
@@ -175,6 +205,11 @@ enum Command {
         dir: PathBuf,
         target: TargetVersion,
         action: WhitelistAction,
+        json: bool,
+    },
+    Claims {
+        dir: PathBuf,
+        action: ClaimsAction,
         json: bool,
     },
 }
@@ -230,7 +265,17 @@ fn parse_args(
                 common.json = true;
                 true
             }
-            other if other.starts_with('-') => take_flag(other, inline, &mut source)?,
+            // A `-`-prefixed word is an option — unless it starts with a
+            // digit, in which case it is a negative number (claims chunk
+            // coordinates legitimately go below zero), not a flag.
+            other if other.starts_with('-')
+                && !other
+                    .as_bytes()
+                    .get(1)
+                    .is_some_and(u8::is_ascii_digit) =>
+            {
+                take_flag(other, inline, &mut source)?
+            }
             _ => {
                 common.positionals.push(arg.to_owned());
                 true
@@ -485,6 +530,105 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Whitelist {
                 dir: required_dir(&common)?,
                 target: target(&common),
+                action,
+                json: common.json,
+            })
+        }
+        "claims" => {
+            let mut dimension = None;
+            let mut forceload = false;
+            let common = parse_args("claims", rest, |flag, _inline, source| {
+                match flag {
+                    "--dimension" => dimension = Some(source.value("--dimension")?),
+                    "--forceload" => {
+                        source.no_value("--forceload")?;
+                        forceload = true;
+                    }
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+            // --dimension only makes sense on list, --forceload only on
+            // server-claim; a misplaced flag is a usage error, not a
+            // silently ignored one.
+            let misplaced = |action: &str, flag: &str| -> CliError {
+                usage(format!("claims {action}: {flag} does not apply to this action"))
+            };
+            let coord = |action: &str, name: &str, raw: &str| -> Result<i32, CliError> {
+                raw.parse::<i32>().map_err(|_| {
+                    usage(format!(
+                        "claims {action}: {name} {raw:?} is not a 32-bit integer"
+                    ))
+                })
+            };
+            let dim_filter = |raw: &str| -> Result<String, CliError> {
+                ClaimChunkKey::new(raw, 0, 0)
+                    .map(|k| k.dimension)
+                    .map_err(|e| usage(format!("claims list --dimension: {e}")))
+            };
+            let action = match common.positionals.as_slice() {
+                [a] if a == "list" => {
+                    if forceload {
+                        return Err(misplaced("list", "--forceload"));
+                    }
+                    ClaimsAction::List {
+                        dimension: dimension.as_deref().map(dim_filter).transpose()?,
+                    }
+                }
+                [a] if a == "parties" => {
+                    if dimension.is_some() {
+                        return Err(misplaced("parties", "--dimension"));
+                    }
+                    if forceload {
+                        return Err(misplaced("parties", "--forceload"));
+                    }
+                    ClaimsAction::Parties
+                }
+                [a, dim, cx, cz] if a == "server-claim" => {
+                    if dimension.is_some() {
+                        return Err(misplaced("server-claim", "--dimension"));
+                    }
+                    ClaimsAction::ServerClaim {
+                        dimension: dim.clone(),
+                        cx: coord("server-claim", "cx", cx)?,
+                        cz: coord("server-claim", "cz", cz)?,
+                        forceload,
+                    }
+                }
+                [a, dim, cx, cz] if a == "unclaim" => {
+                    if dimension.is_some() {
+                        return Err(misplaced("unclaim", "--dimension"));
+                    }
+                    if forceload {
+                        return Err(misplaced("unclaim", "--forceload"));
+                    }
+                    ClaimsAction::Unclaim {
+                        dimension: dim.clone(),
+                        cx: coord("unclaim", "cx", cx)?,
+                        cz: coord("unclaim", "cz", cz)?,
+                    }
+                }
+                [a, ..] if matches!(a.as_str(), "server-claim" | "unclaim") => {
+                    return Err(usage(format!(
+                        "claims {a} needs exactly <dim> <cx> <cz>"
+                    )))
+                }
+                [a, ..] if matches!(a.as_str(), "list" | "parties") => {
+                    return Err(usage(format!("claims {a}: unexpected extra arguments")))
+                }
+                [a, ..] => {
+                    return Err(usage(format!(
+                        "claims: unknown action {a:?}; expected list|parties|server-claim|unclaim"
+                    )))
+                }
+                [] => {
+                    return Err(usage(
+                        "claims needs an action: list|parties|server-claim|unclaim",
+                    ))
+                }
+            };
+            Ok(Command::Claims {
+                dir: required_dir(&common)?,
                 action,
                 json: common.json,
             })
@@ -1174,6 +1318,251 @@ fn cmd_whitelist(
     }
 }
 
+// ------------------------------------------------------------------ claims
+
+/// The offline claims store lives beside the admin files but is *not* part
+/// of [`ServerDirectory`]: these actions read and write only
+/// `openpac_claims.json` / `openpac_parties.json`, so `eula.txt` and the
+/// admin registries are never touched.
+fn load_claims(dir: &Path) -> Result<ClaimsWorld, CliError> {
+    ClaimsWorld::load_from_dir(dir)
+        .map_err(|e| fail(format!("cannot load claims from {}: {e}", dir.display())))
+}
+
+fn save_claims(world: &ClaimsWorld, dir: &Path) -> Result<(), CliError> {
+    world
+        .save_to_dir(dir)
+        .map_err(|e| fail(format!("cannot save claims into {}: {e}", dir.display())))
+}
+
+/// The `owner_key` spelling the persistence layer uses internally.
+fn claims_owner_label(owner: &ClaimOwner) -> String {
+    match owner {
+        ClaimOwner::Player(u) => format!("player:{u}"),
+        ClaimOwner::Server => "server".to_owned(),
+        ClaimOwner::Expired(u) => format!("expired:{u}"),
+    }
+}
+
+fn claim_key(action: &str, dim: &str, cx: i32, cz: i32) -> Result<ClaimChunkKey, CliError> {
+    ClaimChunkKey::new(dim, cx, cz).map_err(|e| usage(format!("claims {action}: {e}")))
+}
+
+fn cmd_claims(dir: &Path, action: &ClaimsAction, json: bool) -> Result<(), CliError> {
+    match action {
+        ClaimsAction::List { dimension } => {
+            let world = load_claims(dir)?;
+            let rows: Vec<(&ClaimChunkKey, &ChunkClaim)> = world
+                .claims()
+                .iter()
+                .filter(|(k, _)| {
+                    dimension
+                        .as_deref()
+                        .is_none_or(|d| k.dimension.as_str() == d)
+                })
+                .collect();
+            let forceloads = rows.iter().filter(|(_, c)| c.forceloaded).count();
+            if json {
+                emit(jobj(vec![
+                    ("action", jstr("claims")),
+                    ("subaction", jstr("list")),
+                    ("dir", jstr(dir.display().to_string())),
+                    (
+                        "dimension",
+                        dimension
+                            .as_deref()
+                            .map(jstr)
+                            .unwrap_or(Json::Null),
+                    ),
+                    (
+                        "claims",
+                        jlist(rows
+                            .iter()
+                            .map(|(k, c)| {
+                                jobj(vec![
+                                    ("dimension", jstr(k.dimension.clone())),
+                                    ("cx", jint(i64::from(k.cx))),
+                                    ("cz", jint(i64::from(k.cz))),
+                                    ("owner", jstr(claims_owner_label(&c.owner))),
+                                    ("sub_claim", jstr(c.sub_claim.clone())),
+                                    ("forceloaded", Json::Bool(c.forceloaded)),
+                                    ("color", jstr(format!("#{:06x}", c.color_rgb))),
+                                ])
+                            })
+                            .collect()),
+                    ),
+                    ("claim_count", jint(rows.len() as i64)),
+                    ("forceload_count", jint(forceloads as i64)),
+                ]));
+            } else {
+                let scope = dimension
+                    .as_deref()
+                    .map(|d| format!(" — dimension {d}"))
+                    .unwrap_or_default();
+                println!("claims: {}{scope}", dir.display());
+                for (k, c) in &rows {
+                    println!(
+                        "  {k}: owner={} sub={} forceloaded={} color=#{:06x}",
+                        claims_owner_label(&c.owner),
+                        c.sub_claim,
+                        c.forceloaded,
+                        c.color_rgb,
+                    );
+                }
+                println!(
+                    "  {} claim{}, {} forceloaded",
+                    rows.len(),
+                    if rows.len() == 1 { "" } else { "s" },
+                    forceloads,
+                );
+            }
+            Ok(())
+        }
+        ClaimsAction::Parties => {
+            let world = load_claims(dir)?;
+            let parties: Vec<&Party> = world.parties().values().collect();
+            if json {
+                emit(jobj(vec![
+                    ("action", jstr("claims")),
+                    ("subaction", jstr("parties")),
+                    ("dir", jstr(dir.display().to_string())),
+                    (
+                        "parties",
+                        jlist(parties
+                            .iter()
+                            .map(|p| {
+                                jobj(vec![
+                                    ("id", jstr(p.id.clone())),
+                                    ("name", jstr(p.name.clone())),
+                                    ("owner", jstr(p.owner_uuid.clone())),
+                                    (
+                                        "members",
+                                        jlist(p
+                                            .members
+                                            .iter()
+                                            .map(|(u, r)| {
+                                                jobj(vec![
+                                                    ("uuid", jstr(u.clone())),
+                                                    ("rank", jstr(r.as_str())),
+                                                ])
+                                            })
+                                            .collect()),
+                                    ),
+                                    (
+                                        "allies",
+                                        jlist(p
+                                            .allies
+                                            .iter()
+                                            .map(|a| jstr(a.clone()))
+                                            .collect()),
+                                    ),
+                                    (
+                                        "invites",
+                                        jlist(p
+                                            .pending_invites
+                                            .iter()
+                                            .map(|a| jstr(a.clone()))
+                                            .collect()),
+                                    ),
+                                    ("color", jstr(format!("#{:06x}", p.color_rgb))),
+                                ])
+                            })
+                            .collect()),
+                    ),
+                    ("party_count", jint(parties.len() as i64)),
+                ]));
+            } else {
+                println!("parties: {}", dir.display());
+                for p in &parties {
+                    let members: Vec<String> = p
+                        .members
+                        .iter()
+                        .map(|(u, r)| format!("{u}={}", r.as_str()))
+                        .collect();
+                    let allies: Vec<&str> = p.allies.iter().map(String::as_str).collect();
+                    let invites: Vec<&str> =
+                        p.pending_invites.iter().map(String::as_str).collect();
+                    println!(
+                        "  {} {:?} color=#{:06x}: members=[{}] allies=[{}] invites=[{}]",
+                        p.id,
+                        p.name,
+                        p.color_rgb,
+                        members.join(","),
+                        allies.join(","),
+                        invites.join(","),
+                    );
+                }
+                println!(
+                    "  {} part{}",
+                    parties.len(),
+                    if parties.len() == 1 { "y" } else { "ies" },
+                );
+            }
+            Ok(())
+        }
+        ClaimsAction::ServerClaim {
+            dimension,
+            cx,
+            cz,
+            forceload,
+        } => {
+            let key = claim_key("server-claim", dimension, *cx, *cz)?;
+            let mut world = load_claims(dir)?;
+            world
+                .claim_server_chunk(true, key.clone(), &SubClaimId::main())
+                .map_err(|e| fail(format!("claims server-claim: {e}")))?;
+            if *forceload {
+                world
+                    .set_forceload_as("", true, &key, true)
+                    .map_err(|e| fail(format!("claims server-claim --forceload: {e}")))?;
+            }
+            save_claims(&world, dir)?;
+            report(
+                json,
+                true,
+                vec![
+                    ("action", jstr("claims")),
+                    ("subaction", jstr("server-claim")),
+                    ("dir", jstr(dir.display().to_string())),
+                    ("dimension", jstr(key.dimension.clone())),
+                    ("cx", jint(i64::from(key.cx))),
+                    ("cz", jint(i64::from(key.cz))),
+                    ("forceloaded", Json::Bool(*forceload)),
+                    ("changed", Json::Bool(true)),
+                ],
+                format!(
+                    "claims: server-claimed {key}{}",
+                    if *forceload { " (forceloaded)" } else { "" },
+                ),
+            );
+            Ok(())
+        }
+        ClaimsAction::Unclaim { dimension, cx, cz } => {
+            let key = claim_key("unclaim", dimension, *cx, *cz)?;
+            let mut world = load_claims(dir)?;
+            world
+                .unclaim_chunk_as("", true, &key)
+                .map_err(|e| fail(format!("claims unclaim: {e}")))?;
+            save_claims(&world, dir)?;
+            report(
+                json,
+                true,
+                vec![
+                    ("action", jstr("claims")),
+                    ("subaction", jstr("unclaim")),
+                    ("dir", jstr(dir.display().to_string())),
+                    ("dimension", jstr(key.dimension.clone())),
+                    ("cx", jint(i64::from(key.cx))),
+                    ("cz", jint(i64::from(key.cz))),
+                    ("removed", Json::Bool(true)),
+                ],
+                format!("claims: unclaimed {key}"),
+            );
+            Ok(())
+        }
+    }
+}
+
 // --------------------------------------------------------------------- main
 
 fn main() -> ExitCode {
@@ -1236,6 +1625,7 @@ fn main() -> ExitCode {
             action,
             json,
         } => cmd_whitelist(&dir, target, &action, json).map(|()| 0u8),
+        Command::Claims { dir, action, json } => cmd_claims(&dir, &action, json).map(|()| 0u8),
     };
     match result {
         Ok(code) => ExitCode::from(code),

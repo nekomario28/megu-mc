@@ -8,8 +8,9 @@
 use mc_spine_core::version::TargetVersion;
 use mc_spine_server_files::json::{self, Json};
 use mc_spine_server_files::{
-    offline_uuid, AdmissionDecision, EulaStatus, ServerDirectory, BANNED_IPS_FILE,
-    BANNED_PLAYERS_FILE, EULA_FILE, OPS_FILE, PROPERTIES_FILE, USERCACHE_FILE, WHITELIST_FILE,
+    offline_uuid, AdmissionDecision, ClaimChunkKey, ClaimOwner, ClaimsWorld, EulaStatus,
+    ServerDirectory, SubClaimId, BANNED_IPS_FILE, BANNED_PLAYERS_FILE, CLAIMS_FILE, EULA_FILE,
+    OPS_FILE, PARTIES_FILE, PROPERTIES_FILE, USERCACHE_FILE, WHITELIST_FILE,
 };
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -538,4 +539,204 @@ fn corrupt_admin_json_fails_the_command_with_exit_1() {
     // An init over the broken file also refuses rather than clobbering.
     let out = run(&["init", "--dir", &d]);
     assert_eq!(code(&out), 1);
+}
+
+#[test]
+fn claims_admin_roundtrip_and_fail_closed() {
+    let scratch = TestDir::new("claims");
+    let dir = ready_dir(&scratch);
+    let d = || dir.to_str().unwrap().to_string();
+    let eula_before = std::fs::read(dir.join(EULA_FILE)).unwrap();
+
+    // Bad command lines exit 2: no action, an unknown action, missing or
+    // malformed coordinates, an invalid dimension, and misplaced flags.
+    for args in [
+        &["claims", "--dir", &d()][..],
+        &["claims", "--dir", &d(), "bogus"][..],
+        &["claims", "--dir", &d(), "list", "extra"][..],
+        &["claims", "--dir", &d(), "parties", "extra"][..],
+        &["claims", "--dir", &d(), "server-claim"][..],
+        &["claims", "--dir", &d(), "server-claim", "minecraft:overworld", "0"][..],
+        &["claims", "--dir", &d(), "unclaim", "minecraft:overworld", "0", "0", "extra"][..],
+        &["claims", "--dir", &d(), "server-claim", "bad dim", "0", "0"][..],
+        &["claims", "--dir", &d(), "server-claim", "minecraft:overworld", "x", "0"][..],
+        &["claims", "--dir", &d(), "server-claim", "minecraft:overworld", "99999999999", "0"][..],
+        &["claims", "--dir", &d(), "list", "--forceload"][..],
+        &["claims", "--dir", &d(), "parties", "--dimension", "overworld"][..],
+        &["claims", "--dir", &d(), "unclaim", "minecraft:overworld", "0", "0", "--forceload"][..],
+        &["claims", "--dir", &d(), "server-claim", "overworld", "0", "0", "--dimension", "overworld"][..],
+        &["claims", "--dir", &d(), "list", "--dimension", "BAD DIM"][..],
+        &["claims", "--dir", &d(), "list", "--wat"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(code(&out), 2, "{args:?} -> out={} err={}", stdout(&out), stderr(&out));
+    }
+
+    // Unclaiming wilderness is an engine failure, not a bad command line.
+    let out = run(&["claims", "--dir", &d(), "unclaim", "minecraft:overworld", "0", "0"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+
+    // An empty store lists cleanly in both renderers.
+    let out = run(&["claims", "--dir", &d(), "list", "--json"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = json_stdout(&out);
+    assert_eq!(get(&doc, "claim_count"), &Json::Number(0.0));
+    assert_eq!(get(&doc, "dimension"), &Json::Null);
+
+    // Server-claim a spawn chunk with a forceload ticket; the dimension is
+    // normalized to its canonical spelling in the report and on disk.
+    let out = run(&[
+        "claims", "--dir", &d(), "server-claim", "overworld", "3", "-2", "--forceload",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("server-claimed minecraft:overworld chunk (3, -2)"), "{text}");
+    assert!(text.contains("forceloaded"), "{text}");
+
+    // Both claims files exist; eula.txt was never rewritten.
+    assert!(dir.join(CLAIMS_FILE).is_file());
+    assert!(dir.join(PARTIES_FILE).is_file());
+    assert_eq!(std::fs::read(dir.join(EULA_FILE)).unwrap(), eula_before);
+
+    // `list --json` reports it: owner server, forceload counted.
+    let out = run(&["claims", "--dir", &d(), "list", "--json"]);
+    assert_eq!(code(&out), 0);
+    let doc = json_stdout(&out);
+    assert_eq!(get(&doc, "claim_count"), &Json::Number(1.0));
+    assert_eq!(get(&doc, "forceload_count"), &Json::Number(1.0));
+    let rows = get(&doc, "claims").as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_field(&rows[0], "dimension"), "minecraft:overworld");
+    assert_eq!(get(&rows[0], "cx"), &Json::Number(3.0));
+    assert_eq!(get(&rows[0], "cz"), &Json::Number(-2.0));
+    assert_eq!(str_field(&rows[0], "owner"), "server");
+    assert_eq!(str_field(&rows[0], "sub_claim"), "main");
+    assert_eq!(get(&rows[0], "forceloaded"), &Json::Bool(true));
+
+    // --dimension filters, normalizing the same way the key parser does.
+    let out = run(&["claims", "--dir", &d(), "list", "--dimension", "overworld", "--json"]);
+    assert_eq!(get(&json_stdout(&out), "claim_count"), &Json::Number(1.0));
+    let out = run(&["claims", "--dir", &d(), "list", "--dimension", "the_nether", "--json"]);
+    assert_eq!(get(&json_stdout(&out), "claim_count"), &Json::Number(0.0));
+
+    // The engine itself sees the persisted claim: server-owned, force-loaded.
+    let world = ClaimsWorld::load_from_dir(&dir).unwrap();
+    let key = ClaimChunkKey::new("overworld", 3, -2).unwrap();
+    let claim = world.claim_at(&key).unwrap();
+    assert_eq!(claim.owner, ClaimOwner::Server);
+    assert!(claim.forceloaded);
+
+    // Re-claiming the same chunk fails closed (exit 1), no half-write.
+    let out = run(&["claims", "--dir", &d(), "server-claim", "overworld", "3", "-2"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+
+    // A second chunk in a different dimension, then the filtered counts.
+    let out = run(&["claims", "--dir", &d(), "server-claim", "the_nether", "0", "0"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let out = run(&["claims", "--dir", &d(), "list", "--json"]);
+    assert_eq!(get(&json_stdout(&out), "claim_count"), &Json::Number(2.0));
+    let out = run(&["claims", "--dir", &d(), "list", "--dimension", "overworld", "--json"]);
+    assert_eq!(get(&json_stdout(&out), "claim_count"), &Json::Number(1.0));
+
+    // Unclaim drops it as admin, --json report agrees.
+    let out = run(&["claims", "--dir", &d(), "unclaim", "overworld", "3", "-2", "--json"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = json_stdout(&out);
+    assert_eq!(str_field(&doc, "subaction"), "unclaim");
+    assert_eq!(str_field(&doc, "dimension"), "minecraft:overworld");
+    assert_eq!(get(&doc, "removed"), &Json::Bool(true));
+
+    let world = ClaimsWorld::load_from_dir(&dir).unwrap();
+    assert!(world.claim_at(&key).is_none());
+    assert_eq!(world.claims().len(), 1);
+
+    // Both files still parse; no atomic-write temp files leaked.
+    for name in [CLAIMS_FILE, PARTIES_FILE] {
+        let text = std::fs::read_to_string(dir.join(name)).unwrap();
+        json::parse(&text).unwrap_or_else(|e| panic!("{name} is corrupt: {e}"));
+    }
+    let strays: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(strays.is_empty(), "{strays:?}");
+    assert_eq!(std::fs::read(dir.join(EULA_FILE)).unwrap(), eula_before);
+}
+
+#[test]
+fn claims_listing_reads_player_claims_and_parties() {
+    let scratch = TestDir::new("claims-read");
+    let dir = scratch.path("srv");
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_str().unwrap().to_string();
+
+    // A store built by the engine itself: a party, two members, a player
+    // claim in a named sub-claim — the CLI only reads it.
+    let mut world = ClaimsWorld::new();
+    world.create_party(UUID_A, "Raiders").unwrap();
+    world.invite_player(UUID_A, "00000000-0000-0000-0000-0000000000bb").unwrap();
+    world.accept_invite("00000000-0000-0000-0000-0000000000bb", None).unwrap();
+    world
+        .claim_chunk(UUID_A, ClaimChunkKey::new("overworld", 1, 1).unwrap(), &SubClaimId::main())
+        .unwrap();
+    world
+        .claim_chunk(
+            UUID_A,
+            ClaimChunkKey::new("aeronautics:space", -4, 7).unwrap(),
+            &SubClaimId::parse("farm").unwrap(),
+        )
+        .unwrap();
+    world.save_to_dir(&dir).unwrap();
+
+    // list --json sees both dimensions and the party-derived owner.
+    let out = run(&["claims", "--dir", &d, "list", "--json"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = json_stdout(&out);
+    assert_eq!(get(&doc, "claim_count"), &Json::Number(2.0));
+    let rows = get(&doc, "claims").as_array().unwrap();
+    // Claims iterate in key order: aeronautics:space sorts first.
+    assert_eq!(str_field(&rows[0], "dimension"), "aeronautics:space");
+    assert_eq!(str_field(&rows[0], "owner"), &format!("player:{UUID_A}"));
+    assert_eq!(str_field(&rows[0], "sub_claim"), "farm");
+    assert_eq!(str_field(&rows[1], "dimension"), "minecraft:overworld");
+    assert_eq!(str_field(&rows[1], "sub_claim"), "main");
+
+    // parties --json lists the party, its ranks and its empty ally/invite
+    // sets (the accepted invite left pending_invites).
+    let out = run(&["claims", "--dir", &d, "parties", "--json"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = json_stdout(&out);
+    assert_eq!(get(&doc, "party_count"), &Json::Number(1.0));
+    let parties = get(&doc, "parties").as_array().unwrap();
+    assert_eq!(str_field(&parties[0], "id"), "party-1");
+    assert_eq!(str_field(&parties[0], "name"), "Raiders");
+    assert_eq!(str_field(&parties[0], "owner"), UUID_A);
+    let members = get(&parties[0], "members").as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    // Members sort by UUID: ...aa (owner) precedes ...bb (member).
+    assert_eq!(str_field(&members[0], "uuid"), UUID_A);
+    assert_eq!(str_field(&members[0], "rank"), "owner");
+    assert_eq!(str_field(&members[1], "rank"), "member");
+    assert!(get(&parties[0], "allies").as_array().unwrap().is_empty());
+    assert!(get(&parties[0], "invites").as_array().unwrap().is_empty());
+
+    // Read-only commands never rewrite the store.
+    let before = std::fs::read(dir.join(CLAIMS_FILE)).unwrap();
+    let out = run(&["claims", "--dir", &d, "list"]);
+    assert_eq!(code(&out), 0);
+    assert!(stdout(&out).contains("2 claims"), "{}", stdout(&out));
+    assert_eq!(std::fs::read(dir.join(CLAIMS_FILE)).unwrap(), before);
+
+    // A corrupt claims store fails closed with exit 1, never a repaired
+    // empty listing.
+    scratch.write("srv/openpac_claims.json", b"{ definitely not json");
+    let out = run(&["claims", "--dir", &d, "list"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let out = run(&["claims", "--dir", &d, "parties"]);
+    assert_eq!(code(&out), 1);
+    assert_eq!(
+        std::fs::read(dir.join(CLAIMS_FILE)).unwrap(),
+        b"{ definitely not json"
+    );
 }

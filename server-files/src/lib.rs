@@ -31,12 +31,17 @@
 //!   budgets, the `/oclaims`/`/oparties`/`/opac`/`/opm` command dispatcher, a
 //!   monotonic sync-delta feed for claims overlays, and atomic
 //!   `openpac_claims.json`/`openpac_parties.json` persistence.
+//! * [`claims_wire`] — the deterministic `CustomPacketPayload` codec that
+//!   carries those claims and sync deltas to client overlays over the
+//!   `openpartiesandclaims:claims_sync` / `ftbchunks:claims_sync` /
+//!   `mc-spine:claims_v1` channels.
 //! * [`directory`] — [`directory::ServerDirectory`], the facade that owns the
 //!   whole set: `load_or_init`, Vanilla-precedence `admit_login` and
 //!   `save_all_atomic`, pinned to a [`mc_spine_core::version::TargetVersion`].
 
 pub mod atomic;
 pub mod claims;
+pub mod claims_wire;
 pub mod directory;
 pub mod eula;
 pub mod json;
@@ -49,6 +54,13 @@ pub use claims::{
     exec_openpac_command, ClaimAction, ClaimChunkKey, ClaimDecision, ClaimOwner,
     ClaimProtectionConfig, ClaimsError, ClaimsSyncDelta, ClaimsWorld, ChunkClaim, DenyReason,
     Party, PartyRank, SubClaimId, CLAIMS_FILE, PARTIES_FILE,
+};
+pub use claims_wire::{
+    build_delta_batches, build_dimension_sync_batches, decode_claims_batch,
+    decode_custom_payload_frame, encode_claims_batch, encode_custom_payload_frame, ClaimsWireBatch,
+    ClaimsWireCell, ClaimsWireEntry, ClaimsWireError, WireOwnerKind,
+    CHANNEL_FTBCHUNKS_CLAIMS_SYNC, CHANNEL_MC_SPINE_CLAIMS_V1, CHANNEL_OPENPAC_CLAIMS_SYNC,
+    MAX_WIRE_CLAIMS_PER_BATCH, MAX_WIRE_STRING_BYTES, WIRE_PROTOCOL_TAG,
 };
 pub use directory::{AdmissionDecision, ServerDirectory};
 pub use eula::{check_eula, write_default_eula, EulaStatus, EULA_FILE, EULA_LINK};
