@@ -5866,8 +5866,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     }
     let _ = send_packet(&mut s, 0x53, vec![initial_held as u8]);
     let mut vp = Vec::new();
-    write_varint(&mut vp, 0);
-    write_varint(&mut vp, 0);
+    write_varint(&mut vp, i64::from((sx.floor() as i32).div_euclid(16)));
+    write_varint(&mut vp, i64::from((sz.floor() as i32).div_euclid(16)));
     let _ = send_packet(&mut s, 0x54, vp);
     let spawn = *WORLD_SPAWN.lock().unwrap();
     let _ = send_packet(&mut s, 0x56, spawn_position_packet(spawn));
@@ -7661,6 +7661,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 sync_chest_openers_dim(&audience, &before);
                             }
                         }
+                        continue;
+                    }
+                    if pet_collar_or_parrot_interact(&me, target, 36 + held_slot) {
                         continue;
                     }
                     if live_mob_interact(&me, target, 36 + held_slot) {
@@ -10018,6 +10021,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         player_mechanism_sessions().lock().unwrap().remove(&me_cleanup.eid);
         death_drop_marks().lock().unwrap().remove(&me_cleanup.eid);
         beacon_menu_anchors().lock().unwrap().remove(&me_cleanup.eid);
+        // A disconnecting player drops both sides of `ServerPlayer.camera`: the
+        // entry naming their own view and any spectator still watching them.
+        {
+            let mut cams = spectator_cameras().lock().unwrap_or_else(|e| e.into_inner());
+            cams.remove(&me_cleanup.eid);
+            cams.retain(|_, target| *target != me_cleanup.eid);
+        }
         // `Entity.remove` on the leaving player: they step out of any vehicle
         // and the vehicle's trackers get the updated SetPassengers.
         live_mount_forget(me_cleanup.eid);
@@ -10072,6 +10082,194 @@ impl std::ops::Drop for ConnectionSlot<'_> {
 }
 static IP_CONNS: connection_limits::IpConnections = connection_limits::IpConnections::new();
 static LOGINS: connection_limits::LoginRegistry = connection_limits::LoginRegistry::new();
+
+// ---------------- Live pet interact: collar dyes + parrot taming ----------------
+// Wolf/cat tame + sitting already ride `live_mob_interact`; this front half
+// covers what it does not know: vanilla dyes on a player-owned collar, and the
+// parrot, whose tame items `PetBehavior::try_tame` does not name. Parrot tame
+// state is kept in `parrot_pets`: `MobBehaviorState` has no parrot variant, and
+// tagging one as Cat would write fields `save_v2`'s reader cannot consume back
+// for etype 75.
+fn parrot_pets() -> &'static Mutex<HashMap<i32, PetBehavior>> {
+    static P: OnceLock<Mutex<HashMap<i32, PetBehavior>>> = OnceLock::new();
+    P.get_or_init(Mutex::default)
+}
+
+// Vanilla dye order matches the item ids: white_dye (944) .. black_dye (959)
+// -> collar colors 0..=15.
+fn pet_dye_color(item: i64) -> Option<u8> {
+    (944..=959).contains(&item).then_some((item - 944) as u8)
+}
+
+fn parrot_seed(item: i64) -> bool {
+    // wheat_seeds | pumpkin_seeds | melon_seeds | torchflower_seeds | beetroot_seeds
+    matches!(item, 853 | 986 | 987 | 1152 | 1155)
+}
+
+fn consume_one_item(client: &Client, slot: i16) {
+    if *client.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
+        return;
+    }
+    let mut inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(stack) = inv.get_mut(&slot) {
+        stack.1 -= 1;
+        if stack.1 == 0 {
+            inv.remove(&slot);
+        }
+    }
+    let updated = inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+    drop(inv);
+    resync_slot(client, 0, slot, &updated);
+}
+
+enum PetInteract {
+    Collar { etype: i64, color: u8 },
+    ParrotFed { tamed: bool, sitting: bool },
+    Sitting(bool),
+}
+
+fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> bool {
+    if *client.gm.lock().unwrap_or_else(|e| e.into_inner()) == 3
+        || !client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&target)
+    {
+        return false;
+    }
+    let mob = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|m| m.eid == target && matches!(m.etype, 15 | 75 | 122))
+        .cloned();
+    let Some(mob) = mob else { return false };
+    let item = client
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&slot)
+        .map(|stack| stack.0)
+        .unwrap_or(0);
+    let mut effect = None;
+    let mut consume = false;
+    if mob.etype == 75 {
+        let mut pets = parrot_pets().lock().unwrap_or_else(|e| e.into_inner());
+        let pet = pets
+            .entry(target)
+            .or_insert_with(|| PetBehavior::new(PetKind::Cat));
+        if pet.owner.is_none() {
+            if parrot_seed(item) {
+                // vanilla Parrot.mobInteract: each seed is eaten, taming lands
+                // one roll in ten.
+                consume = true;
+                if world_rng::next_u64() % 10 == 0 {
+                    pet.owner = Some(client.uuid);
+                    pet.sitting = true;
+                    pet.hp = *mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+                }
+                effect = Some(PetInteract::ParrotFed {
+                    tamed: pet.owner.is_some(),
+                    sitting: pet.sitting,
+                });
+            }
+        } else if pet.owner == Some(client.uuid) {
+            pet.sitting = !pet.sitting;
+            effect = Some(PetInteract::Sitting(pet.sitting));
+        }
+    } else if let Some(color) = pet_dye_color(item) {
+        let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+        let state = states
+            .entry(target)
+            .or_insert_with(|| LiveMobState::new(mob.etype));
+        if let Some(MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet)) =
+            &mut state.behavior
+        {
+            if pet.dye_collar(client.uuid, color) {
+                consume = true;
+                effect = Some(PetInteract::Collar {
+                    etype: mob.etype,
+                    color,
+                });
+            }
+        }
+    }
+    if !consume && effect.is_none() {
+        return false;
+    }
+    if consume {
+        consume_one_item(client, slot);
+    }
+    match effect {
+        // Collar metadata is an Int serializer: wolf at index 20 (1.21.5 slots
+        // DATA_SOUND_VARIANT at 19), cat at index 21.
+        Some(PetInteract::Collar { etype, color }) => {
+            let index = if etype == 122 { 20 } else { 21 };
+            broadcast_seen(target, |_| {
+                (0x58, live_mob_metadata(target, index, 1, color))
+            });
+        }
+        Some(PetInteract::ParrotFed { tamed, sitting }) => {
+            let flags = u8::from(sitting) | (u8::from(tamed) << 2);
+            broadcast_seen(target, |_| (0x58, live_mob_metadata(target, 17, 0, flags)));
+            let mut packet = target.to_be_bytes().to_vec();
+            packet.push(if tamed { 7 } else { 6 });
+            broadcast_seen(target, |_| (0x1f, packet.clone()));
+        }
+        Some(PetInteract::Sitting(sitting)) => {
+            let flags = u8::from(sitting) | 4;
+            broadcast_seen(target, |_| (0x58, live_mob_metadata(target, 17, 0, flags)));
+        }
+        None => {}
+    }
+    true
+}
+
+/// Vanilla `TamableAnimal` follow teleport: a standing tamed pet more than 12
+/// blocks out (`dist_sq > 144.0`) reseats on the nearest safe, solid floor next
+/// to its owner. Sitting pets never teleport, and a landing only counts when
+/// the block below is solid while the two blocks at foot and head height are
+/// not.
+#[cfg_attr(not(test), allow(dead_code))]
+fn pet_follow_teleport_step(
+    owner_dim: DimId,
+    owner_pos: (f64, f64, f64),
+    pet_pos: (f64, f64, f64),
+    sitting: bool,
+    mut is_solid_floor: impl FnMut(DimId, i32, i32, i32) -> bool,
+) -> Option<(f64, f64, f64)> {
+    if sitting {
+        return None;
+    }
+    let (dx, dy, dz) = (
+        owner_pos.0 - pet_pos.0,
+        owner_pos.1 - pet_pos.1,
+        owner_pos.2 - pet_pos.2,
+    );
+    if dx * dx + dy * dy + dz * dz <= 144.0 {
+        return None;
+    }
+    let (ox, oy, oz) = (
+        owner_pos.0.floor() as i32,
+        owner_pos.1.floor() as i32,
+        owner_pos.2.floor() as i32,
+    );
+    for dy in -1..=1i32 {
+        for dx in -3..=3i32 {
+            for dz in -3..=3i32 {
+                let (bx, by, bz) = (ox + dx, oy + dy, oz + dz);
+                if is_solid_floor(owner_dim, bx, by - 1, bz)
+                    && !is_solid_floor(owner_dim, bx, by, bz)
+                    && !is_solid_floor(owner_dim, bx, by + 1, bz)
+                {
+                    return Some((bx as f64 + 0.5, by as f64, bz as f64 + 0.5));
+                }
+            }
+        }
+    }
+    None
+}
 
 // ---------------- Lane P8a: dimension-scoped interact helpers ----------------
 // The legacy interact helpers in `menus_and_items.rs` read `block_at` and key
@@ -11498,6 +11696,462 @@ mod w3_tests {
             "vanilla wire ids must still resolve with a custom slot present"
         );
         worldgen::reset_dimension_registry();
+    }
+}
+
+#[cfg(test)]
+mod fix_tame_rejoin_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn fx_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(15)
+    }
+
+    /// Handshake + Login Start on a fresh loopback connection, then the raw
+    /// socket; the server side is a spawned `handle` on the accepted half.
+    fn fx_login_session(name: &str, uuid: [u8; 16]) -> (TcpStream, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (srv, _) = listener.accept().unwrap();
+            handle(srv);
+        });
+        let mut cli = TcpStream::connect(addr).unwrap();
+        cli.set_nodelay(true).ok();
+        cli.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        let mut hs = Vec::new();
+        write_varint(&mut hs, 767);
+        write_str(&mut hs, "127.0.0.1");
+        hs.extend_from_slice(&25565u16.to_be_bytes());
+        write_varint(&mut hs, 2);
+        send_packet(&mut cli, 0x00, hs).unwrap();
+        let mut login = Vec::new();
+        write_str(&mut login, name);
+        login.extend_from_slice(&uuid);
+        send_packet(&mut cli, 0x00, login).unwrap();
+        (cli, server)
+    }
+
+    /// `fx_login_session` through configuration into the play loop, also
+    /// capturing the 0x54 SetChunkCacheCenter body sent right after Join Game.
+    fn fx_connect(
+        name: &str,
+        uuid: [u8; 16],
+    ) -> (TcpStream, std::thread::JoinHandle<()>, Arc<Client>, Vec<u8>) {
+        let (mut cli, server) = fx_login_session(name, uuid);
+        let deadline = fx_deadline();
+        loop {
+            let (pid, _) = read_packet(&mut cli, deadline).expect("login success");
+            if pid == 0x02 {
+                break;
+            }
+        }
+        send_packet(&mut cli, 0x03, vec![]).unwrap();
+        let mut ci = Vec::new();
+        write_str(&mut ci, "en_us");
+        ci.push(2);
+        write_varint(&mut ci, 0);
+        ci.push(1);
+        ci.push(0x7f);
+        write_varint(&mut ci, 1);
+        ci.push(0);
+        ci.push(1);
+        send_packet(&mut cli, 0x00, ci).unwrap();
+        loop {
+            let (pid, _) = read_packet(&mut cli, deadline).expect("config packets");
+            if pid == 0x0e {
+                let mut kp = Vec::new();
+                write_varint(&mut kp, 0);
+                send_packet(&mut cli, 0x07, kp).unwrap();
+            } else if pid == 0x03 {
+                send_packet(&mut cli, 0x03, vec![]).unwrap();
+                break;
+            }
+        }
+        let mut center = Vec::new();
+        loop {
+            let (pid, body) = read_packet(&mut cli, deadline).expect("play position");
+            if pid == 0x54 {
+                center = body.clone();
+            }
+            if pid == 0x40 {
+                send_packet(&mut cli, 0x00, body[33..].to_vec()).unwrap();
+                break;
+            }
+        }
+        let reg_deadline = Instant::now() + Duration::from_secs(2);
+        let me = loop {
+            if let Some(found) = clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|c| c.name == name)
+                .cloned()
+            {
+                break found;
+            }
+            assert!(Instant::now() < reg_deadline, "registered play client");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        (cli, server, me, center)
+    }
+
+    /// The offline-mode UUID `login_identity` derives from the player name —
+    /// the key `saved_players` is read under on rejoin.
+    fn fx_offline_uuid(name: &str) -> [u8; 16] {
+        let mut uuid = generation_math::md5(format!("OfflinePlayer:{name}").as_bytes());
+        uuid[6] = (uuid[6] & 0x0f) | 0x30;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        uuid
+    }
+
+    fn fx_save(uuid: [u8; 16], position: DimPosRot) {
+        saved_players()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                uuid,
+                PlayerSave {
+                    position,
+                    inventory: HashMap::new(),
+                    ender_chest: HashMap::new(),
+                    held: 0,
+                    health: 20.0,
+                    absorption: 0.0,
+                    food: 20,
+                    saturation: 5.0,
+                    exhaustion: 0.0,
+                    xp_level: 0,
+                    xp_progress: 0.0,
+                    xp_total: 0,
+                    gamemode: 0,
+                    effects: Vec::new(),
+                    respawn: None,
+                },
+            );
+    }
+
+    fn fx_spawn_mob(etype: i64, pos: (f64, f64, f64)) -> Arc<Mob> {
+        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+        let mob = Arc::new(Mob {
+            dim: DimId::Overworld,
+            eid,
+            uuid: [0x77u8; 16],
+            etype,
+            pos: Mutex::new((pos.0, pos.1, pos.2, 0.0, 0.0)),
+            hp: Mutex::new(8.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(300),
+            vel: Mutex::new([0.0; 3]),
+        });
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        live_mob_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, LiveMobState::new(etype));
+        mob
+    }
+
+    fn fx_pet(eid: i32) -> Option<(Option<[u8; 16]>, bool, f32, u8)> {
+        let states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+        match &states.get(&eid)?.behavior {
+            Some(MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet)) => {
+                Some((pet.owner, pet.sitting, pet.hp, pet.collar_color))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn fix_tame_rejoin_chunk_cache_center_uses_saved_position() {
+        let uuid = fx_offline_uuid("FarRejoin");
+        fx_save(uuid, (DimId::Overworld, 1000.5, 70.0, -640.2, 0.0, 0.0));
+        let (cli, server, _me, center) = fx_connect("FarRejoin", uuid);
+        assert!(!center.is_empty(), "0x54 SetChunkCacheCenter must arrive");
+        let mut sl = &center[..];
+        // Chunk coords are i32 varints; a negative reads back zero-extended.
+        let cx = read_varint(&mut sl).unwrap() as i32;
+        let cz = read_varint(&mut sl).unwrap() as i32;
+        assert_eq!(
+            (cx, cz),
+            (62, -41),
+            "rejoin at (1000.5, -640.2) must center chunk (62, -41), not (0, 0)"
+        );
+        drop(cli);
+        let _ = server.join();
+        saved_players()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uuid);
+    }
+
+    #[test]
+    fn fix_tame_rejoin_disconnect_clears_spectator_camera() {
+        let (cli, server, me, _center) = fx_connect("SpecCam", [0x66u8; 16]);
+        {
+            let mut cams = spectator_cameras().lock().unwrap_or_else(|e| e.into_inner());
+            cams.insert(me.eid, 31337);
+            cams.insert(42424, me.eid);
+        }
+        drop(cli);
+        let _ = server.join();
+        {
+            let cams = spectator_cameras().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !cams.contains_key(&me.eid),
+                "a leaver's own camera entry must drop on disconnect"
+            );
+            assert!(
+                !cams.values().any(|target| *target == me.eid),
+                "no spectator camera may keep targeting the leaver"
+            );
+        }
+        spectator_cameras()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&42424);
+    }
+
+    #[test]
+    fn fix_tame_rejoin_wolf_tame_sit_dye_stranger_rejected() {
+        let (mut owner, _os) = effect_tests::client_pair();
+        owner.uuid = [0x11u8; 16];
+        let (mut stranger, _ss) = effect_tests::client_pair();
+        stranger.uuid = [0x22u8; 16];
+        let wolf = fx_spawn_mob(122, (10.0, 70.0, 10.0));
+        for c in [&owner, &stranger] {
+            c.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(wolf.eid);
+        }
+        // A fed bone is eaten every try, tame or not (survival consumption).
+        owner
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (961, 8, Vec::new()));
+        live_mob_interact(&owner, wolf.eid, 36);
+        assert_eq!(
+            owner
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .map(|stack| stack.1),
+            Some(7),
+            "a bone fed to an untamed wolf is consumed"
+        );
+        let mut tamed = false;
+        for _ in 0..60 {
+            // A tame leaves the wolf sitting; check before clicking so an
+            // owner-click does not toggle it right back off.
+            if fx_pet(wolf.eid).and_then(|p| p.0).is_some() {
+                tamed = true;
+                break;
+            }
+            if owner
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .is_none()
+            {
+                owner
+                    .inv
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(36, (961, 8, Vec::new()));
+            }
+            live_mob_interact(&owner, wolf.eid, 36);
+        }
+        tamed |= fx_pet(wolf.eid).and_then(|p| p.0).is_some();
+        assert!(tamed, "bones tame the wolf within the deterministic rolls");
+        let (pet_owner, sitting, hp, collar) = fx_pet(wolf.eid).expect("wolf pet state");
+        assert_eq!(pet_owner, Some(owner.uuid));
+        assert!(sitting, "a freshly tamed wolf sits");
+        assert_eq!(hp, 40.0, "a tamed wolf's max health is 40");
+        assert_eq!(*wolf.hp.lock().unwrap_or_else(|e| e.into_inner()), 40.0);
+        assert_eq!(collar, 14);
+
+        // Strangers cannot sit or dye someone else's pet.
+        stranger
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (955, 1, Vec::new()));
+        assert!(!pet_collar_or_parrot_interact(&stranger, wolf.eid, 36));
+        assert!(!live_mob_interact(&stranger, wolf.eid, 36));
+        assert_eq!(fx_pet(wolf.eid).map(|p| p.3), Some(14));
+        assert_eq!(fx_pet(wolf.eid).map(|p| p.1), Some(true));
+
+        // Owner empty hand toggles sitting.
+        owner
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&36);
+        assert!(live_mob_interact(&owner, wolf.eid, 36));
+        assert_eq!(fx_pet(wolf.eid).map(|p| p.1), Some(false));
+        assert!(live_mob_interact(&owner, wolf.eid, 36));
+        assert_eq!(fx_pet(wolf.eid).map(|p| p.1), Some(true));
+
+        // Owner dye colors the collar and consumes one dye in survival.
+        owner
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (955, 1, Vec::new()));
+        assert!(pet_collar_or_parrot_interact(&owner, wolf.eid, 36));
+        assert_eq!(fx_pet(wolf.eid).map(|p| p.3), Some(11));
+        assert!(
+            owner
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .is_none(),
+            "the dye used on the collar is consumed"
+        );
+
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != wolf.eid);
+        live_mob_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&wolf.eid);
+    }
+
+    #[test]
+    fn fix_tame_rejoin_parrot_seed_tame_and_owner_sit() {
+        let (mut owner, _os) = effect_tests::client_pair();
+        owner.uuid = [0x33u8; 16];
+        let (mut stranger, _ss) = effect_tests::client_pair();
+        stranger.uuid = [0x44u8; 16];
+        let parrot = fx_spawn_mob(75, (10.0, 70.0, 10.0));
+        for c in [&owner, &stranger] {
+            c.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(parrot.eid);
+        }
+        owner
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (853, 8, Vec::new()));
+        assert!(pet_collar_or_parrot_interact(&owner, parrot.eid, 36));
+        assert_eq!(
+            owner
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .map(|stack| stack.1),
+            Some(7),
+            "a seed fed to an untamed parrot is consumed"
+        );
+        let mut tamed = false;
+        for _ in 0..500 {
+            // Same guard as the wolf loop: a tame sits the parrot, so check
+            // before clicking or the next owner-click toggles it off again.
+            if parrot_pets()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&parrot.eid)
+                .is_some_and(|pet| pet.owner.is_some())
+            {
+                tamed = true;
+                break;
+            }
+            if owner
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .is_none()
+            {
+                owner
+                    .inv
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(36, (853, 8, Vec::new()));
+            }
+            pet_collar_or_parrot_interact(&owner, parrot.eid, 36);
+        }
+        assert!(tamed, "seeds tame the parrot within the 1-in-10 rolls");
+        assert!(parrot_pets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&parrot.eid)
+            .is_some_and(|pet| pet.owner == Some(owner.uuid) && pet.sitting));
+
+        // Strangers cannot toggle the parrot; the owner can.
+        assert!(!pet_collar_or_parrot_interact(&stranger, parrot.eid, 36));
+        assert!(pet_collar_or_parrot_interact(&owner, parrot.eid, 36));
+        assert!(parrot_pets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&parrot.eid)
+            .is_some_and(|pet| !pet.sitting));
+
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != parrot.eid);
+        live_mob_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&parrot.eid);
+        parrot_pets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&parrot.eid);
+    }
+
+    #[test]
+    fn fix_tame_rejoin_pet_follow_teleports_only_to_safe_floor() {
+        let owner = (0.0, 64.0, 0.0);
+        let floor = |_: DimId, _x: i32, y: i32, _z: i32| y == 63;
+        // Standing and 13 blocks out: teleport to the first safe floor scan hit.
+        assert_eq!(
+            pet_follow_teleport_step(DimId::Overworld, owner, (13.0, 64.0, 0.0), false, floor),
+            Some((-2.5, 64.0, -2.5))
+        );
+        // Sitting pets never teleport.
+        assert_eq!(
+            pet_follow_teleport_step(DimId::Overworld, owner, (13.0, 64.0, 0.0), true, floor),
+            None
+        );
+        // Within the 12-block leash there is nothing to do.
+        assert_eq!(
+            pet_follow_teleport_step(DimId::Overworld, owner, (8.0, 64.0, 8.0), false, floor),
+            None
+        );
+        // Exactly 12 blocks is still in range (144.0 is not > 144.0).
+        assert_eq!(
+            pet_follow_teleport_step(DimId::Overworld, owner, (12.0, 64.0, 0.0), false, floor),
+            None
+        );
+        // No safe floor anywhere near the owner: no teleport.
+        assert_eq!(
+            pet_follow_teleport_step(
+                DimId::Overworld,
+                owner,
+                (13.0, 64.0, 0.0),
+                false,
+                |_: DimId, _x: i32, _y: i32, _z: i32| false
+            ),
+            None
+        );
     }
 }
 
