@@ -609,6 +609,18 @@ fn sweeping_movement_ok(horizontal_speed: f64, speed_cap: f64) -> bool {
 
 // vanilla: blocking with a shield pays floor(blocked)+1 durability
 fn damage_shield(me: &Arc<Client>, blocked: f32) {
+    damage_shield_attempts(me, vanilla_shield_attempts(blocked))
+}
+/// Vanilla `LivingEntity.hurtCurrentlyUsedShield`: `1 + floor(amount)`
+/// durability attempts, and only when the blocked hit is worth 3+.
+fn vanilla_shield_attempts(damage: f32) -> i64 {
+    if damage >= 3.0 {
+        1 + damage.floor() as i64
+    } else {
+        0
+    }
+}
+fn damage_shield_attempts(me: &Arc<Client>, attempts: i64) {
     let sh = name_to_item("shield").unwrap_or(-9);
     let slots = [45i16, 36 + *me.held.lock().unwrap_or_else(|e| e.into_inner())];
     let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
@@ -625,7 +637,7 @@ fn damage_shield(me: &Arc<Client>, blocked: f32) {
         let unb = enchant_level(&st.2, 39);
         let maxd = comp_varint(&st.2, COMP_MAX_DAMAGE).unwrap_or(337);
         let mut add = 0i64;
-        for _ in 0..(blocked.floor() as i64 + 1) {
+        for _ in 0..attempts.max(0) {
             if unb == 0 || world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
                 add += 1
             }
@@ -638,6 +650,733 @@ fn damage_shield(me: &Arc<Client>, blocked: f32) {
         }
         return;
     }
+}
+
+// ---------- VANILLA-COMBAT-2: missing 1.21.1 combat & survival parity ----------
+//
+// Wind-charge bursts (launch, fall reset, TRIGGER block interaction), the
+// shield's 180° block arc with its 5-tick raise warmup and 100-tick axe
+// disable, totem death protection with the void/`/kill` source exclusions, and
+// trident Loyalty/Riptide/Channeling. Constants were read out of the 1.21.1
+// server jar (`coh`/`cog`/`dcp`/`ddn`/`dco`, `cmx`, `buk`, `bsu`).
+
+/// Which charge produced a wind burst — a thrown `WindCharge` item or the
+/// Breeze's own `BreezeWindCharge` projectile.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum WindChargeKind {
+    Player,
+    Breeze,
+}
+
+/// The `Level.explode` arguments each charge supplies, plus the direct-hit
+/// damage its `onHitEntity` pays (the burst itself always deals 0).
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct WindChargeProfile {
+    /// Explosion power; the launch reach is `radius * 2` (vanilla `hurtEntities`
+    /// scans `power * 2`).
+    radius: f64,
+    /// `AdvancedExplosionDamageCalculator.getKnockbackMultiplier`.
+    knockback_multiplier: f64,
+    /// `onHitEntity` damage.
+    direct_hit_damage: f32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn wind_charge_profile(kind: WindChargeKind) -> WindChargeProfile {
+    match kind {
+        // `coh` (`WindCharge`): explode power 1.2, `Optional.of(1.22f)` in the
+        // `ddn` damage calculator, `ExplosionInteraction.TRIGGER`.
+        WindChargeKind::Player => WindChargeProfile {
+            radius: 1.2,
+            knockback_multiplier: 1.22,
+            direct_hit_damage: 1.0,
+        },
+        // `cog` (`BreezeWindCharge`): explode power 3.0, same TRIGGER
+        // interaction. The lane spec pins the launch multiplier at 0.6 —
+        // "40% less knockback than a regular explosion".
+        WindChargeKind::Breeze => WindChargeProfile {
+            radius: 3.0,
+            knockback_multiplier: 0.6,
+            direct_hit_damage: 1.0,
+        },
+    }
+}
+
+/// `Explosion.hurtEntities`' knockback arm: `(1 - dist/(power*2))` falloff,
+/// `seenPercent`, the charge's `knockbackMultiplier` and the target's
+/// knockback resistance, applied along the normalized direction to the
+/// target's eye as an additive delta velocity. Vanilla skips entities at the
+/// exact burst center; non-finite inputs scrub to `None`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn evaluate_wind_charge_burst(
+    kind: WindChargeKind,
+    impact: [f64; 3],
+    target_pos: [f64; 3],
+    target_eye_y: f64,
+    seen_percent: f64,
+    knockback_resist: f64,
+) -> Option<[f64; 3]> {
+    let profile = wind_charge_profile(kind);
+    if !impact.iter().all(|v| v.is_finite())
+        || !target_pos.iter().all(|v| v.is_finite())
+        || !target_eye_y.is_finite()
+        || !seen_percent.is_finite()
+        || !knockback_resist.is_finite()
+    {
+        return None;
+    }
+    let d = [
+        target_pos[0] - impact[0],
+        target_eye_y - impact[1],
+        target_pos[2] - impact[2],
+    ];
+    let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let reach = profile.radius * 2.0;
+    if dist <= 1e-9 || dist / reach > 1.0 || seen_percent <= 0.0 {
+        return None;
+    }
+    let strength = (1.0 - dist / reach)
+        * seen_percent.clamp(0.0, 1.0)
+        * profile.knockback_multiplier
+        * (1.0 - knockback_resist.clamp(0.0, 1.0));
+    Some([
+        d[0] / dist * strength,
+        d[1] / dist * strength,
+        d[2] / dist * strength,
+    ])
+}
+
+/// The wind-burst fall-distance reset: vanilla records the burst's Y so the
+/// mace combo only counts the drop below it ("accumulates fall damage only
+/// when falling below the Y level where the wind burst hit").
+#[cfg_attr(not(test), allow(dead_code))]
+fn wind_charge_reset_fall(c: &Client, burst_y: f64) {
+    if burst_y.is_finite() {
+        *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = burst_y;
+    }
+}
+
+/// `ExplosionInteraction.TRIGGER` on one block: non-iron doors, trapdoors and
+/// fence gates flip `open`; levers flip `powered`; buttons press (the redstone
+/// pass schedules the vanilla release); bells ring. Blocks held by a redstone
+/// signal and the iron variants never move. Returns whether it triggered.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wind_charge_trigger_at(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    let Some(reg) = breg() else {
+        return false;
+    };
+    let st = block_at_dim(dim, x, y, z);
+    if st == 0 {
+        return false;
+    }
+    let name = reg.name_of(st);
+    let powered = reg
+        .get_prop(st, "powered")
+        .map(|p| p == "true")
+        .unwrap_or(false);
+    let set = |st2: u32, prop: &str, val: &str, px: i32, py: i32, pz: i32| -> bool {
+        let nst = reg.with_prop(st2, prop, val);
+        if nst == st2 {
+            return false;
+        }
+        set_block_dim(dim, px, py, pz, nst);
+        note_block_update_dim(dim, px, py, pz, nst);
+        true
+    };
+    if name == "minecraft:lever" {
+        return set(st, "powered", if powered { "false" } else { "true" }, x, y, z);
+    }
+    if reg.in_tag(st, "minecraft:buttons") || name.ends_with("_button") {
+        return !powered && set(st, "powered", "true", x, y, z);
+    }
+    if name == "minecraft:bell" {
+        return !powered && set(st, "powered", "true", x, y, z);
+    }
+    let iron = name == "minecraft:iron_door" || name == "minecraft:iron_trapdoor";
+    let toggleable =
+        name.ends_with("_door") || name.ends_with("_trapdoor") || name.ends_with("_fence_gate");
+    if !toggleable || iron || powered {
+        return false;
+    }
+    let opened = reg
+        .get_prop(st, "open")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let val = if opened { "false" } else { "true" };
+    let ok = set(st, "open", val, x, y, z);
+    // `DoorBlock.setOpen` flips both halves, not just the half the burst hit.
+    if ok && name.ends_with("_door") {
+        for oy in [-1i32, 1] {
+            let ost = block_at_dim(dim, x, y + oy, z);
+            if reg.name_of(ost) == name {
+                set(ost, "open", val, x, y + oy, z);
+            }
+        }
+    }
+    ok
+}
+
+/// The TRIGGER pass over the burst's block radius.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wind_charge_trigger_blocks(dim: DimId, impact: [f64; 3], radius: f64) -> usize {
+    if !impact.iter().all(|v| v.is_finite()) || !radius.is_finite() {
+        return 0;
+    }
+    let [bx, by, bz] = impact.map(|v| v.floor() as i32);
+    let r = radius.ceil() as i32;
+    let mut hits = 0;
+    for dx in -r..=r {
+        for dy in -r..=r {
+            for dz in -r..=r {
+                if (dx * dx + dy * dy + dz * dz) as f64 > radius * radius + 1e-9 {
+                    continue;
+                }
+                if wind_charge_trigger_at(dim, bx + dx, by + dy, bz + dz) {
+                    hits += 1;
+                }
+            }
+        }
+    }
+    hits
+}
+
+/// Applies a wind-charge burst: launches entities (`hurtEntities`), resets the
+/// thrower's fall distance to the burst Y, fires the TRIGGER block pass and
+/// broadcasts the burst. `thrower_eid` is the charge's owner (-1 when none).
+#[cfg_attr(not(test), allow(dead_code))]
+fn wind_charge_burst(dim: DimId, kind: WindChargeKind, impact: [f64; 3], thrower_eid: i32) {
+    let profile = wind_charge_profile(kind);
+    for c in client_snapshot() {
+        if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim
+            || *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 3
+        {
+            continue;
+        }
+        let (x, y, z, ..) = {
+            let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            *p
+        };
+        let eye = y
+            + f64::from(player_eye_height(
+                *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()),
+                *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner()),
+            ));
+        if let Some(dv) =
+            evaluate_wind_charge_burst(kind, impact, [x, y, z], eye, 1.0, knockback_resist_of(&c))
+        {
+            let pkt = velocity_pkt(
+                c.eid,
+                (dv[0] * 8000.0) as i16,
+                (dv[1] * 8000.0) as i16,
+                (dv[2] * 8000.0) as i16,
+            );
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x5a, pkt.clone());
+            }
+            broadcast_seen_ex(c.eid, c.eid, |_c| (0x5a, pkt.clone()));
+        }
+        if c.eid == thrower_eid {
+            wind_charge_reset_fall(&c, impact[1]);
+        }
+    }
+    for m in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if m.dim != dim {
+            continue;
+        }
+        let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let eye = my + f64::from(entity_eye_height_1211(m.etype));
+        if let Some(dv) =
+            evaluate_wind_charge_burst(kind, impact, [mx, my, mz], eye, 1.0, 0.0)
+        {
+            let mut p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.0 += dv[0];
+            p.1 += dv[1];
+            p.2 += dv[2];
+            let (nx, ny, nz, yaw, pitch) = *p;
+            drop(p);
+            broadcast_seen(m.eid, |_c| {
+                (0x70, entity_teleport(m.eid, nx, ny, nz, yaw, pitch, true))
+            });
+        }
+    }
+    wind_charge_trigger_blocks(dim, impact, profile.radius);
+    broadcast(-1, |_c| {
+        (
+            0x20,
+            explosion_pkt_with_power(impact[0], impact[1], impact[2], profile.radius as f32, &[]),
+        )
+    });
+    ac_note_explosion(dim, impact, profile.radius);
+}
+
+// ---------- shield arc / warmup / axe disable ----------
+
+/// `getTicksUsingItem() >= 5`: the shield covers the player only after this
+/// many game ticks of use.
+const SHIELD_WARMUP_GT: u64 = 5;
+/// `disableShield`/`ServerGamePacketListenerImpl` shield cooldown — 100 game
+/// ticks (5s at 20 TPS).
+const SHIELD_DISABLE_GT: u32 = 100;
+/// Wall-clock form of the disable window the `shield_cd` timestamp tracks.
+const SHIELD_DISABLE_DUR: Duration = Duration::from_secs(5);
+
+/// eid -> server tick a raised shield was first observed (the warmup clock;
+/// `blocking` itself flips in `menus_and_items`).
+static SHIELD_RAISED_AT: OnceLock<Mutex<HashMap<i32, u64>>> = OnceLock::new();
+fn shield_raised() -> &'static Mutex<HashMap<i32, u64>> {
+    SHIELD_RAISED_AT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// eid -> the server tick the Riptide spin attack ends (`startAutoSpinAttack`).
+static RIPTIDE_SPIN: OnceLock<Mutex<HashMap<i32, u64>>> = OnceLock::new();
+fn riptide_spin() -> &'static Mutex<HashMap<i32, u64>> {
+    RIPTIDE_SPIN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// kind==1 (trident) projectile eids already seen on a tick (Riptide resolves
+/// on first observation).
+static TRIDENT_SEEN: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+fn trident_seen() -> &'static Mutex<HashSet<i32>> {
+    TRIDENT_SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+/// kind==1 projectile eids currently in Loyalty return flight.
+static TRIDENT_RETURNING: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+fn trident_returning() -> &'static Mutex<HashSet<i32>> {
+    TRIDENT_RETURNING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Per-tick state maintenance for this lane: tracks shield raise times by
+/// observing the `blocking` flag and prunes the eid-keyed lane maps.
+fn combat2_state_tick() {
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    let cls = client_snapshot();
+    let mut live = HashSet::with_capacity(cls.len());
+    let mut raised = shield_raised().lock().unwrap_or_else(|e| e.into_inner());
+    for c in &cls {
+        live.insert(c.eid);
+        if *c.blocking.lock().unwrap_or_else(|e| e.into_inner()) {
+            raised.entry(c.eid).or_insert(now);
+        } else {
+            raised.remove(&c.eid);
+        }
+    }
+    raised.retain(|eid, _| live.contains(eid));
+    drop(raised);
+    riptide_spin()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|eid, _| live.contains(eid));
+}
+
+/// Game ticks the player's shield has been up (vanilla `getTicksUsingItem`);
+/// an unrecorded raise counts as 0 — vanilla refuses the block in that window.
+fn shield_raised_ticks(c: &Client) -> u64 {
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    shield_raised()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&c.eid)
+        .map_or(0, |since| {
+            now.saturating_sub(*since) * u64::from(GAME_TICKS_PER_TICK)
+        })
+}
+
+/// The spin-attack window a Riptide launch armed for `eid`, in game ticks.
+#[cfg_attr(not(test), allow(dead_code))]
+fn spin_attack_ticks_left(eid: i32) -> u64 {
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    riptide_spin()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&eid)
+        .map_or(0, |until| {
+            until.saturating_sub(now) * u64::from(GAME_TICKS_PER_TICK)
+        })
+}
+
+/// The attack a shield may block: blocker's raise time and cooldown, the
+/// damage-source gate, the two horizontal direction vectors, the attacker
+/// disable data and the raw damage (for the durability calc).
+#[derive(Clone, Copy, Debug)]
+struct ShieldAttackCtx {
+    /// Game ticks the shield has been raised (`getTicksUsingItem`).
+    raised_ticks: u64,
+    /// A previous 100-tick disable is still running.
+    cooldown_active: bool,
+    /// `DamageTypeTags.BYPASSES_SHIELD` — nothing blocks it.
+    unblockable: bool,
+    /// Horizontal unit view vector of the blocker.
+    look: [f64; 2],
+    /// Horizontal unit vector blocker -> damage source.
+    to_attacker: [f64; 2],
+    /// `LivingEntity.canDisableShield` — attacker main hand is an axe.
+    attacker_can_disable: bool,
+    /// Player attackers roll; disabling mobs (Vindicator/Piglin Brute) always.
+    attacker_is_player: bool,
+    attacker_sprinting: bool,
+    /// Efficiency level on the attacking axe (player roll only).
+    attacker_efficiency: i64,
+    /// Pre-drawn roll in [0,1) for the player-attacker chance.
+    disable_roll: f32,
+    /// Raw incoming damage for the `hurtCurrentlyUsedShield` durability calc.
+    damage: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShieldBlock {
+    blocked: bool,
+    /// `1 + floor(damage)` when damage >= 3 else 0 (`hurtCurrentlyUsedShield`).
+    durability_attempts: i64,
+    /// `Some(100)` when `disableShield` arms the 100-tick cooldown.
+    disable_ticks: Option<u32>,
+}
+
+/// `LivingEntity.isDamageSourceBlocked` + `blockUsingShield`: the frontal
+/// 180° hemisphere (`dot(look_xz, to_attacker_xz) > 0`), the 5-tick warmup,
+/// the unblockable-source and running-cooldown gates, the axe-disable roll
+/// and the shield durability math.
+fn evaluate_shield_block(ctx: &ShieldAttackCtx) -> ShieldBlock {
+    let miss = ShieldBlock {
+        blocked: false,
+        durability_attempts: 0,
+        disable_ticks: None,
+    };
+    if ctx.unblockable || ctx.cooldown_active || ctx.raised_ticks < SHIELD_WARMUP_GT {
+        return miss;
+    }
+    let dot = ctx.look[0] * ctx.to_attacker[0] + ctx.look[1] * ctx.to_attacker[1];
+    if !(dot > 0.0) {
+        return miss;
+    }
+    let durability_attempts = vanilla_shield_attempts(ctx.damage);
+    let disable_ticks = if ctx.attacker_can_disable {
+        let chance = if ctx.attacker_is_player {
+            // `Player.disableShield`: 25% + 5%/Efficiency, +75% while sprinting.
+            let base = 0.25 + 0.05 * ctx.attacker_efficiency as f32;
+            if ctx.attacker_sprinting {
+                base + 0.75
+            } else {
+                base
+            }
+        } else {
+            1.0
+        };
+        (ctx.disable_roll < chance.min(1.0)).then_some(SHIELD_DISABLE_GT)
+    } else {
+        None
+    };
+    ShieldBlock {
+        blocked: true,
+        durability_attempts,
+        disable_ticks,
+    }
+}
+
+/// Builds the pure attack context for a hit on `c` from `attacker`: the raise
+/// clock from `SHIELD_RAISED_AT`, the wall-clock cooldown flag and the two
+/// horizontally-normalized direction vectors vanilla compares.
+fn shield_hit_ctx(c: &Client, attacker: [f64; 3], damage: f32) -> ShieldAttackCtx {
+    let (px, _, pz, yaw, _, _) = {
+        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        *p
+    };
+    let yr = (yaw as f64).to_radians();
+    // Vanilla getViewVector horizontal projection: (-sin yaw, cos yaw).
+    let look_raw = [-yr.sin(), yr.cos()];
+    let ln = (look_raw[0] * look_raw[0] + look_raw[1] * look_raw[1]).sqrt();
+    let look = if ln > 1e-9 {
+        [look_raw[0] / ln, look_raw[1] / ln]
+    } else {
+        [0.0, 1.0]
+    };
+    let to_raw = [attacker[0] - px, attacker[2] - pz];
+    let tn = (to_raw[0] * to_raw[0] + to_raw[1] * to_raw[1]).sqrt();
+    let to_attacker = if tn > 1e-9 {
+        [to_raw[0] / tn, to_raw[1] / tn]
+    } else {
+        [0.0, 0.0]
+    };
+    ShieldAttackCtx {
+        raised_ticks: shield_raised_ticks(c),
+        cooldown_active: c
+            .shield_cd
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+            <= SHIELD_DISABLE_DUR,
+        unblockable: false,
+        look,
+        to_attacker,
+        attacker_can_disable: false,
+        attacker_is_player: false,
+        attacker_sprinting: false,
+        attacker_efficiency: 0,
+        disable_roll: 0.0,
+        damage,
+    }
+}
+
+/// `LivingEntity.canDisableShield` for the mobs this registry fields: the
+/// axe-wielding Vindicator (114) and Piglin Brute (79).
+fn mob_can_disable_shield(etype: i64) -> bool {
+    matches!(etype, 79 | 114)
+}
+
+/// `LivingEntity.blockUsingShield`'s disable arm applied to the live fields.
+fn apply_shield_disable(c: &Client) {
+    *c.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *c.shield_cd.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+}
+
+// ---------- totem of undying ----------
+
+/// Vanilla `DamageTypeTags.BYPASSES_INVULNERABILITY` splits sources that can
+/// trigger `checkTotemDeathProtection` from `fellOutOfWorld`/`generic_kill`,
+/// which always bypass it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TotemDamageKind {
+    Ordinary,
+    Void,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Kill,
+}
+
+/// `LivingEntity.checkTotemDeathProtection`: on lethal ordinary damage a held
+/// totem (offhand first, then the selected main-hand slot) is consumed, hp is
+/// set to 1, existing effects are cleared, the vanilla grant applies
+/// (Regeneration II 900t, Absorption II 100t, Fire Resistance I 800t) and
+/// entity status 35 goes out. Void and `/kill` sources bypass protection.
+/// Returns whether a totem popped.
+fn try_trigger_totem_of_undying(c: &Client, hp_after_damage: f32, kind: TotemDamageKind) -> bool {
+    if kind != TotemDamageKind::Ordinary
+        || hp_after_damage > 0.0
+        || *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1
+    {
+        return false;
+    }
+    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let held_k = 36i16 + (*c.held.lock().unwrap_or_else(|e| e.into_inner()));
+    for k in [45i16, held_k] {
+        if let Some(st) = inv.get(&k).cloned().filter(|s| s.0 == 1163) {
+            if st.1 <= 1 {
+                inv.remove(&k);
+            } else {
+                inv.insert(k, (st.0, st.1 - 1, st.2));
+            }
+            let now = inv.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
+            drop(inv);
+            *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
+            resync_slot(c, 0, k, &now);
+            // entity_status 35 = totem use; i32 entity id + i8 status
+            let mut st_pkt = Vec::new();
+            st_pkt.extend_from_slice(&c.eid.to_be_bytes());
+            st_pkt.push(35);
+            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x1f, st_pkt.clone());
+            broadcast_seen(c.eid, |_c| (0x1f, st_pkt.clone()));
+            let (px, py, pz, ..) = {
+                let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+                *p
+            };
+            let snd = sound_pkt_named("item.totem.use", px, py, pz);
+            broadcast_seen(c.eid, |_c| (0x68, snd.clone()));
+            // Death protection replaces existing effects with the vanilla grant set.
+            grant_totem_effects(c, &mut c.effs.lock().unwrap_or_else(|e| e.into_inner()));
+            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x5d, health_pkt_c(1.0, c));
+            return true;
+        }
+    }
+    false
+}
+
+// ---------- trident specials ----------
+
+/// `evaluate_trident_special` inputs: enchant levels read off the thrown
+/// trident (Loyalty 19 / Riptide 31 / Channeling 5) and the situation flags
+/// each vanilla branch reads.
+#[derive(Clone, Copy, Debug, Default)]
+struct TridentSpecialCtx {
+    loyalty: i64,
+    riptide: i64,
+    channeling: i64,
+    /// `Entity.isInWaterOrRain` for the thrower.
+    wet: bool,
+    /// `onGround` of the thrower — vanilla adds a small vertical boost.
+    on_ground: bool,
+    /// Unit look vector of the thrower.
+    look: [f64; 3],
+    /// Trident position (return origin) and the owner's eye position
+    /// (return target).
+    trident: [f64; 3],
+    owner: [f64; 3],
+    /// `level.isThundering()`.
+    thundering: bool,
+    /// `level.canSeeSky(hitBlockPos)`.
+    open_sky: bool,
+}
+
+/// `TridentItem.releaseUsing`'s launch payload.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RiptideLaunch {
+    /// `push(look * (0.75 + 0.75 * riptideLevel))`.
+    velocity: [f64; 3],
+    /// `startAutoSpinAttack(20)`.
+    spin_ticks: u32,
+    /// `move(SELF, 0..1.2..0)` when released on the ground, else 0.
+    ground_boost: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RiptideOutcome {
+    /// No Riptide on the trident.
+    NotRiptide,
+    /// Riptide present but the thrower is dry — `releaseUsing` refuses the
+    /// throw entirely (no projectile, the item stays in hand).
+    Refused,
+    Launch(RiptideLaunch),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TridentSpecial {
+    /// `ThrownTrident`'s Loyalty return impulse `dir * 0.05 * loyalty` toward
+    /// the owner's eye — it applies even below `min_y` (the return survives
+    /// the void). `None` without Loyalty 1..=3.
+    loyalty_return: Option<[f64; 3]>,
+    riptide: RiptideOutcome,
+    /// `ThrownTrident` channeling lightning: thunderstorm AND open sky.
+    channeling_lightning: bool,
+}
+
+fn evaluate_trident_special(ctx: &TridentSpecialCtx) -> TridentSpecial {
+    let loyalty_return = if (1..=3).contains(&ctx.loyalty)
+        && ctx
+            .trident
+            .iter()
+            .chain(ctx.owner.iter())
+            .all(|v| v.is_finite())
+    {
+        let d = [
+            ctx.owner[0] - ctx.trident[0],
+            ctx.owner[1] - ctx.trident[1],
+            ctx.owner[2] - ctx.trident[2],
+        ];
+        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if n > 1e-9 {
+            let s = 0.05 * ctx.loyalty as f64;
+            Some([d[0] / n * s, d[1] / n * s, d[2] / n * s])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let riptide = if !(1..=3).contains(&ctx.riptide) {
+        RiptideOutcome::NotRiptide
+    } else if !ctx.wet || !ctx.look.iter().all(|v| v.is_finite()) {
+        RiptideOutcome::Refused
+    } else {
+        let n = (ctx.look[0] * ctx.look[0] + ctx.look[1] * ctx.look[1] + ctx.look[2] * ctx.look[2])
+            .sqrt();
+        if n <= 1e-9 {
+            RiptideOutcome::Refused
+        } else {
+            let speed = 0.75 + 0.75 * ctx.riptide as f64;
+            RiptideOutcome::Launch(RiptideLaunch {
+                velocity: [
+                    ctx.look[0] / n * speed,
+                    ctx.look[1] / n * speed,
+                    ctx.look[2] / n * speed,
+                ],
+                spin_ticks: 20,
+                ground_boost: if ctx.on_ground { 1.2 } else { 0.0 },
+            })
+        }
+    };
+    TridentSpecial {
+        loyalty_return,
+        riptide,
+        channeling_lightning: ctx.channeling > 0 && ctx.thundering && ctx.open_sky,
+    }
+}
+
+/// `Level.canSeeSky`: sky light reaches a position only through zero-opacity
+/// states — air and glass pass, while leaves and water attenuate below 15.
+fn can_see_sky(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    if !dim.has_skylight() {
+        return false;
+    }
+    let Some(reg) = breg() else {
+        return false;
+    };
+    let top = dim.min_y() + dim.height();
+    for yy in y.max(dim.min_y())..top {
+        if reg.opacity_of(block_at_dim(dim, x, yy, z)) != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// `Entity.isInWaterOrRain` for a client: the AABB touches water, or it is
+/// raining at a position with open sky.
+fn trident_thrower_wet(c: &Client) -> bool {
+    let (x, y, z, ..) = {
+        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        *p
+    };
+    let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let sneaking = *c.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+    let fall_fly = *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
+    if aabb_in_water_with(player_bounding_box(x, y, z, sneaking, fall_fly), &|bx, by, bz| {
+        block_at_dim(dim, bx, by, bz)
+    }) {
+        return true;
+    }
+    RAINING.load(Ordering::Relaxed) > 0
+        && can_see_sky(
+            dim,
+            x.floor() as i32,
+            (y + f64::from(player_eye_height(sneaking, fall_fly))).floor() as i32,
+            z.floor() as i32,
+        )
+}
+
+/// Vanilla Riptide never despawns the item — `releaseUsing` keeps it in hand.
+/// The local throw consumed it already, so it is pushed back into the held
+/// slot (or dropped at the feet when the hand has moved on).
+fn trident_restore(c: &Arc<Client>, item: i64, comps: &Comps) {
+    if item <= 0 {
+        return;
+    }
+    let hs = 36 + *c.held.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+        if !inv.contains_key(&hs) {
+            inv.insert(hs, (item, 1, comps.clone()));
+            let st = inv.get(&hs).cloned().unwrap_or((0, 0, Vec::new()));
+            drop(inv);
+            resync_slot(c, 0, hs, &st);
+            return;
+        }
+    }
+    let (x, y, z, ..) = {
+        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        *p
+    };
+    drops()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Drop {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x,
+            y,
+            z,
+            item,
+            cnt: 1,
+            comps: comps.clone(),
+            age: 0,
+            target: None,
+            thrower: None,
+        });
 }
 // vanilla hurtArmor: each worn piece pays max(1, floor(raw/4)); each
 // piece rolls its own Unbreaking. Returns slots that broke (for resync).
@@ -1093,44 +1832,22 @@ fn dmg_after(c: &Client, raw: f32, kind: u8) -> f32 {
 }
 // call AFTER the hp write: if hp hit 0 and a totem is held (main or
 // offhand), consume it — vanilla sets hp to 1, fires entity_status 35,
-// plays the totem animation+sound, grants absorption/regen/fire_resist
+// plays the totem animation+sound, grants absorption/regen/fire_resist.
+// Damage taken below the world bottom is `fellOutOfWorld` (the void caller in
+// the main tick only applies it there), a `BYPASSES_INVULNERABILITY` source
+// vanilla's `checkTotemDeathProtection` never sees.
 fn totem_check(c: &Client) {
-    if *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0 || *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
-        return;
-    }
-    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-    let held_k = 36i16 + (*c.held.lock().unwrap_or_else(|e| e.into_inner()));
-    for k in [45i16, held_k] {
-        if inv.get(&k).map(|v| v.0) == Some(1163) {
-            let st = inv.get(&k).unwrap().clone();
-            if st.1 <= 1 {
-                inv.remove(&k);
-            } else {
-                inv.insert(k, (st.0, st.1 - 1, st.2));
-            }
-            let now = inv.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
-            drop(inv);
-            *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
-            resync_slot(c, 0, k, &now);
-            // entity_status 35 = totem use; i32 entity id + i8 status
-            let mut st_pkt = Vec::new();
-            st_pkt.extend_from_slice(&c.eid.to_be_bytes());
-            st_pkt.push(35);
-            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x1f, st_pkt.clone());
-            broadcast_seen(c.eid, |_c| (0x1f, st_pkt.clone()));
-            let (px, py, pz, ..) = {
-                let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-                *p
-            };
-            let snd = sound_pkt_named("item.totem.use", px, py, pz);
-            broadcast_seen(c.eid, |_c| (0x68, snd.clone()));
-            // Death protection replaces existing effects with the vanilla grant set.
-            grant_totem_effects(c, &mut c.effs.lock().unwrap_or_else(|e| e.into_inner()));
-            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x5d, health_pkt_c(1.0, c));
-            return;
+    let hp = *c.hp.lock().unwrap_or_else(|e| e.into_inner());
+    let kind = {
+        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let below = p.1 < f64::from(c.dim.lock().unwrap_or_else(|e| e.into_inner()).min_y());
+        if below {
+            TotemDamageKind::Void
+        } else {
+            TotemDamageKind::Ordinary
         }
-    }
-    drop(inv);
+    };
+    let _ = try_trigger_totem_of_undying(c, hp, kind);
 }
 // Both death-protection paths own the effect guard; do not acquire it here.
 fn totem_effects(ef: &mut Vec<Eff>) {
@@ -1424,16 +2141,126 @@ fn mob_hurt_window_tick() {
 
 fn arrow_tick() {
     mob_hurt_window_tick();
+    combat2_state_tick();
     let mut dead: Vec<i32> = vec![];
-    let mut hits: Vec<(i32, f32)> = vec![]; // (victim eid, arrow dmg)
+    let mut hits: Vec<(i32, f32, f64, f64)> = vec![]; // (victim eid, dmg, arrow x, z)
     let mut mob_dead: Vec<(i32, i64, f64, f64, f64)> = vec![];
     {
         let mut ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
         let region = region_guard();
+        let mut returning = trident_returning().lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen_tridents = trident_seen().lock().unwrap_or_else(|e| e.into_inner());
         for a in ar.iter_mut() {
             let eid = a.eid;
             if !region.is_hot(a.x as i32, a.z as i32) {
                 continue;
+            }
+            if a.kind == 1 {
+                // Loyalty return flight (`ThrownTrident` after `dealtDamage`):
+                // `vel = vel*0.01 + dir(owner_eye)*0.05*loyalty` — no dimension
+                // floor gates it, so a trident below `min_y` still comes home.
+                if returning.contains(&eid) {
+                    let owner_pos = clients()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .find(|c| c.eid == a.owner)
+                        .map(|c| {
+                            let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+                            (p.0, p.1 + 0.9, p.2)
+                        });
+                    let Some((ox, oy, oz)) = owner_pos else {
+                        returning.remove(&eid);
+                        dead.push(eid);
+                        continue;
+                    };
+                    let eval = evaluate_trident_special(&TridentSpecialCtx {
+                        loyalty: a.loy,
+                        trident: [a.x, a.y, a.z],
+                        owner: [ox, oy, oz],
+                        ..Default::default()
+                    });
+                    let d = [ox - a.x, oy - a.y, oz - a.z];
+                    let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                    if n <= 1.0 {
+                        returning.remove(&eid);
+                        dead.push(eid);
+                        continue;
+                    }
+                    let imp = eval.loyalty_return.unwrap_or([0.0; 3]);
+                    a.dx = a.dx * 0.01 + imp[0];
+                    a.dy = a.dy * 0.01 + imp[1];
+                    a.dz = a.dz * 0.01 + imp[2];
+                    a.x += a.dx;
+                    a.y += a.dy;
+                    a.z += a.dz;
+                    let (ax, ay, az) = (a.x, a.y, a.z);
+                    broadcast_seen(eid, |_c| {
+                        (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
+                    });
+                    continue;
+                }
+                // Riptide resolves the first tick the projectile is observed:
+                // vanilla `releaseUsing` never spawns one — the thrower is
+                // propelled along the look vector (wet-only) and keeps the item.
+                if seen_tridents.insert(eid) {
+                    let riptide = enchant_level(&a.ret_comps, 31);
+                    if (1..=3).contains(&riptide) {
+                        let owner = clients()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .iter()
+                            .find(|c| c.eid == a.owner)
+                            .cloned();
+                        if let Some(oc) = owner {
+                            let (x, y, z, yaw, pitch, on_ground) =
+                                *oc.pos.lock().unwrap_or_else(|e| e.into_inner());
+                            let (yr, pr) = ((yaw as f64).to_radians(), (pitch as f64).to_radians());
+                            let eval = evaluate_trident_special(&TridentSpecialCtx {
+                                riptide,
+                                wet: trident_thrower_wet(&oc),
+                                on_ground,
+                                look: [
+                                    -yr.sin() * pr.cos(),
+                                    -pr.sin(),
+                                    yr.cos() * pr.cos(),
+                                ],
+                                ..Default::default()
+                            });
+                            if let RiptideOutcome::Launch(launch) = eval.riptide {
+                                let pkt = velocity_pkt(
+                                    oc.eid,
+                                    (launch.velocity[0] * 8000.0) as i16,
+                                    (launch.velocity[1] * 8000.0) as i16,
+                                    (launch.velocity[2] * 8000.0) as i16,
+                                );
+                                if let Ok(mut w) = oc.sock.lock() {
+                                    let _ = send_packet(&mut w, 0x5a, pkt.clone());
+                                }
+                                broadcast_seen_ex(oc.eid, oc.eid, |_c| (0x5a, pkt.clone()));
+                                riptide_spin()
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(
+                                        oc.eid,
+                                        TICK_IDX.load(Ordering::Relaxed)
+                                            + server_ticks(u64::from(launch.spin_ticks)),
+                                    );
+                                if launch.ground_boost > 0.0 {
+                                    let mut p = oc.pos.lock().unwrap_or_else(|e| e.into_inner());
+                                    p.1 += launch.ground_boost;
+                                }
+                                let snd = sound_pkt_named("entity.generic.explode", x, y, z);
+                                broadcast_seen(oc.eid, |_c| (0x68, snd.clone()));
+                            }
+                            // Refused launches also never leave the hand.
+                            trident_restore(&oc, a.ret_item, &a.ret_comps);
+                            a.ret_item = 0;
+                            dead.push(eid);
+                            continue;
+                        }
+                    }
+                }
             }
             if a.stuck {
                 a.ttl -= 1;
@@ -1507,7 +2334,11 @@ fn arrow_tick() {
                 // tridents stick like arrows in vanilla too, but our trident
                 // return path handles its own landing — only plain arrows stick
                 if a.kind == 1 {
-                    dead.push(eid);
+                    if a.loy > 0 {
+                        returning.insert(eid);
+                    } else {
+                        dead.push(eid);
+                    }
                 } else {
                     a.stuck = true;
                     a.ttl = server_ticks(ARROW_TTL_GT) as i32;
@@ -1577,8 +2408,24 @@ fn arrow_tick() {
                         }
                         broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
                         // channeling: trident hit in thunder calls lightning
-                        // (punch slot carries the level for kind==1)
-                        if a.kind == 1 && a.punch > 0 && THUNDERING.load(Ordering::Relaxed) > 0 {
+                        // (punch slot carries the level for kind==1) — only
+                        // with open sky above the hit (vanilla canSeeSky)
+                        let channeling_hit = a.kind == 1
+                            && a.punch > 0
+                            && evaluate_trident_special(&TridentSpecialCtx {
+                                channeling: i64::from(a.punch),
+                                thundering: THUNDERING.load(Ordering::Relaxed) > 0,
+                                open_sky: THUNDERING.load(Ordering::Relaxed) > 0
+                                    && can_see_sky(
+                                        DimId::Overworld,
+                                        mx.floor() as i32,
+                                        my.floor() as i32,
+                                        mz.floor() as i32,
+                                    ),
+                                ..Default::default()
+                            })
+                            .channeling_lightning;
+                        if channeling_hit {
                             {
                                 let mut h2 = m.hp.lock().unwrap_or_else(|e| e.into_inner());
                                 *h2 -= 5.0;
@@ -1608,6 +2455,8 @@ fn arrow_tick() {
                         if a.pierce > 0 {
                             a.pierce -= 1;
                             a.last_hit = m.eid;
+                        } else if a.kind == 1 && a.loy > 0 {
+                            returning.insert(eid);
                         } else {
                             dead.push(eid);
                         }
@@ -1636,10 +2485,12 @@ fn arrow_tick() {
                             0.3,
                             2.0,
                         ) {
-                            hits.push((c.eid, a.dmg));
+                            hits.push((c.eid, a.dmg, ax, az));
                             if a.pierce > 0 {
                                 a.pierce -= 1;
                                 a.last_hit = c.eid;
+                            } else if a.kind == 1 && a.loy > 0 {
+                                returning.insert(eid);
                             } else {
                                 dead.push(eid);
                             }
@@ -1662,8 +2513,12 @@ fn arrow_tick() {
                         0.3,
                         2.0,
                     ) {
-                        hits.push((c.eid, a.dmg));
-                        dead.push(eid);
+                        hits.push((c.eid, a.dmg, ax, az));
+                        if a.kind == 1 && a.loy > 0 {
+                            returning.insert(eid);
+                        } else {
+                            dead.push(eid);
+                        }
                         break;
                     }
                 }
@@ -1686,6 +2541,8 @@ fn arrow_tick() {
             })
             .collect();
         ar.retain(|a| !dead.contains(&a.eid));
+        returning.retain(|eid| ar.iter().any(|a| a.eid == *eid));
+        seen_tridents.retain(|eid| ar.iter().any(|a| a.eid == *eid));
         for (ow, lx, ly, lz, loy, ri, rc) in landed {
             let (tx, ty, tz) = if loy > 0 {
                 clients()
@@ -1721,21 +2578,24 @@ fn arrow_tick() {
     for eid in &dead {
         broadcast_seen_destroy(*eid);
     }
-    for (veid, admg) in hits {
+    for (veid, admg, ax, az) in hits {
         let cls: Vec<Arc<Client>> = client_snapshot();
         if let Some(c) = cls.iter().find(|c| c.eid == veid) {
             if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
                 continue;
             }
-            let blocked_ar = *c.blocking.lock().unwrap_or_else(|e| e.into_inner())
-                && c.shield_cd.lock().unwrap_or_else(|e| e.into_inner()).elapsed() > Duration::from_secs(5);
+            // the evaluator's raise clock already tracks `blocking` — a lowered
+            // shield reports 0 raised ticks, below the warmup gate
+            let eval = evaluate_shield_block(&shield_hit_ctx(c, [ax, 0.0, az], admg));
+            let blocked_ar = eval.blocked
+                && *c.blocking.lock().unwrap_or_else(|e| e.into_inner());
             // a rejected hit must not cost shield durability (vanilla returns before that)
             let Some((ad, _)) = damage_after_invulnerability(c, if blocked_ar { 0.0 } else { admg })
             else {
                 continue;
             };
             if blocked_ar {
-                damage_shield(c, admg);
+                damage_shield_attempts(c, eval.durability_attempts);
             }
             let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
             *h = (*h
@@ -1890,12 +2750,14 @@ fn live_mob_damage_player(
     if !matches!(*player.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 2) || *player.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
         return false;
     }
-    if protection_kind == Some(0)
-        && *player.blocking.lock().unwrap_or_else(|e| e.into_inner())
-        && player.shield_cd.lock().unwrap_or_else(|e| e.into_inner()).elapsed() > Duration::from_secs(5)
-    {
-        damage_shield(player, damage);
-        return false;
+    if protection_kind == Some(0) {
+        // Vanilla `isDamageSourceBlocked`: raise warmup, 180° attacker arc and
+        // the running disable cooldown all gate the block before durability.
+        let eval = evaluate_shield_block(&shield_hit_ctx(player, origin, damage));
+        if eval.blocked && *player.blocking.lock().unwrap_or_else(|e| e.into_inner()) {
+            damage_shield_attempts(player, eval.durability_attempts);
+            return false;
+        }
     }
     if damage <= 0.0 {
         return false;
@@ -1941,6 +2803,21 @@ fn live_mob_damage_player(
 }
 
 fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, up: f64) {
+    // Vanilla `blockUsingShield`: a blocking hit from an axe-wielding mob
+    // (Vindicator / Piglin Brute — `canDisableShield`) arms the 100-tick
+    // shield disable even though the blocked hit itself still costs durability.
+    if mob_can_disable_shield(mob.etype) {
+        let mut ctx = shield_hit_ctx(player, pos, diff_mob_dmg(amount));
+        ctx.attacker_can_disable = true;
+        let eval = evaluate_shield_block(&ctx);
+        if eval.blocked && *player.blocking.lock().unwrap_or_else(|e| e.into_inner()) {
+            damage_shield_attempts(player, eval.durability_attempts);
+            if eval.disable_ticks.is_some() {
+                apply_shield_disable(player);
+            }
+            return;
+        }
+    }
     if !live_mob_damage_player(player, pos, diff_mob_dmg(amount), Some(0), Some(up)) {
         return;
     }
@@ -3269,5 +4146,987 @@ mod p5a_parity_tests {
         for tick in 1..=server_ticks(40) {
             assert!(!tick_mob_fire(4245, tick, mob_fire_immune(blaze), false));
         }
+    }
+}
+
+#[cfg(test)]
+mod vanilla_combat2_tests {
+    use super::effect_tests::client_pair;
+    use super::*;
+
+    /// Restores every global a test in this lane can touch.
+    struct LaneGuard {
+        tick: u64,
+        raining: u64,
+        thundering: u64,
+        blocks: Vec<(DimId, i32, i32, i32, u32)>,
+    }
+    impl LaneGuard {
+        fn new() -> Self {
+            Self {
+                tick: TICK_IDX.load(Ordering::Relaxed),
+                raining: RAINING.load(Ordering::Relaxed),
+                thundering: THUNDERING.load(Ordering::Relaxed),
+                blocks: Vec::new(),
+            }
+        }
+        fn set_block(&mut self, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+            if self
+                .blocks
+                .iter()
+                .all(|b| !(b.0 == dim && b.1 == x && b.2 == y && b.3 == z))
+            {
+                self.blocks.push((dim, x, y, z, block_at_dim(dim, x, y, z)));
+            }
+            set_block_dim(dim, x, y, z, st);
+        }
+    }
+    impl std::ops::Drop for LaneGuard {
+        fn drop(&mut self) {
+            TICK_IDX.store(self.tick, Ordering::Relaxed);
+            RAINING.store(self.raining, Ordering::Relaxed);
+            THUNDERING.store(self.thundering, Ordering::Relaxed);
+            for (dim, x, y, z, st) in self.blocks.drain(..) {
+                set_block_dim(dim, x, y, z, st);
+            }
+            clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|c| c.eid != 4242);
+            arrows()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|a| a.eid != 99901);
+            drops()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|d| d.item != 9999);
+            for m in [
+                shield_raised(),
+                riptide_spin(),
+            ] {
+                m.lock().unwrap_or_else(|e| e.into_inner()).remove(&4242);
+            }
+            trident_returning()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&99901);
+            trident_seen()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&99901);
+        }
+    }
+
+    fn shield_ctx() -> ShieldAttackCtx {
+        ShieldAttackCtx {
+            raised_ticks: SHIELD_WARMUP_GT,
+            cooldown_active: false,
+            unblockable: false,
+            look: [0.0, 1.0],
+            to_attacker: [0.0, 1.0],
+            attacker_can_disable: false,
+            attacker_is_player: false,
+            attacker_sprinting: false,
+            attacker_efficiency: 0,
+            disable_roll: 0.0,
+            damage: 5.0,
+        }
+    }
+
+    // ---------- Wind Charge ----------
+
+    #[test]
+    fn vanilla_combat2_wind_charge_profiles() {
+        let p = wind_charge_profile(WindChargeKind::Player);
+        assert_eq!(p.radius, 1.2);
+        assert_eq!(p.knockback_multiplier, 1.22);
+        assert_eq!(p.direct_hit_damage, 1.0);
+        let b = wind_charge_profile(WindChargeKind::Breeze);
+        assert_eq!(b.radius, 3.0);
+        assert_eq!(b.knockback_multiplier, 0.6);
+        assert_eq!(b.direct_hit_damage, 1.0);
+    }
+
+    #[test]
+    fn vanilla_combat2_wind_charge_launch_math() {
+        // Impact at origin, target eye 1m up => dir (0,1,0), dist 1.
+        // strength = (1 - 1/2.4) * 1.0 * 1.22 = 0.711666...
+        let dv = evaluate_wind_charge_burst(
+            WindChargeKind::Player,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        let want = (1.0 - 1.0 / 2.4) * 1.22;
+        assert!((dv[1] - want).abs() < 1e-9, "{:?} vs {want}", dv);
+        assert!(dv[0].abs() < 1e-9 && dv[2].abs() < 1e-9);
+        // Breeze: same geometry, reach 6.0, mult 0.6.
+        let dv = evaluate_wind_charge_burst(
+            WindChargeKind::Breeze,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        let want = (1.0 - 1.0 / 6.0) * 0.6;
+        assert!((dv[1] - want).abs() < 1e-9);
+        // seen-percent and knockback resistance both scale the launch.
+        let half_seen = evaluate_wind_charge_burst(
+            WindChargeKind::Player,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.5,
+            0.0,
+        )
+        .unwrap();
+        let player_want = (1.0 - 1.0 / 2.4) * 1.22 * 0.5;
+        assert!((half_seen[1] - player_want).abs() < 1e-9);
+        let resisted = evaluate_wind_charge_burst(
+            WindChargeKind::Player,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+            1.0,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(resisted, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn vanilla_combat2_wind_charge_edges_scrub_nonfinite() {
+        // Exact center: vanilla skips.
+        assert_eq!(
+            evaluate_wind_charge_burst(
+                WindChargeKind::Player,
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                1.0,
+                1.0,
+                0.0,
+            ),
+            None
+        );
+        // Out of reach (dist > radius*2).
+        assert_eq!(
+            evaluate_wind_charge_burst(
+                WindChargeKind::Player,
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                2.5,
+                1.0,
+                0.0,
+            ),
+            None
+        );
+        // Exactly at the reach boundary the falloff hits zero.
+        assert_eq!(
+            evaluate_wind_charge_burst(
+                WindChargeKind::Player,
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                2.4,
+                1.0,
+                0.0,
+            ),
+            Some([0.0, 0.0, 0.0])
+        );
+        // Zero visibility.
+        assert_eq!(
+            evaluate_wind_charge_burst(
+                WindChargeKind::Player,
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                1.0,
+                0.0,
+                0.0,
+            ),
+            None
+        );
+        // Non-finite inputs are scrubbed, never propagated.
+        for (impact, pos, eye, seen, kbr) in [
+            ([f64::NAN, 0.0, 0.0], [0.0; 3], 1.0, 1.0, 0.0),
+            ([0.0; 3], [f64::INFINITY, 0.0, 0.0], 1.0, 1.0, 0.0),
+            ([0.0; 3], [0.0; 3], f64::NAN, 1.0, 0.0),
+            ([0.0; 3], [0.0; 3], 1.0, f64::NAN, 0.0),
+            ([0.0; 3], [0.0; 3], 1.0, 1.0, f64::NEG_INFINITY),
+        ] {
+            assert_eq!(
+                evaluate_wind_charge_burst(
+                    WindChargeKind::Player,
+                    impact,
+                    pos,
+                    eye,
+                    seen,
+                    kbr
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn vanilla_combat2_wind_charge_fall_reset() {
+        let _g = LaneGuard::new();
+        let (c, _r) = client_pair();
+        *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 120.0;
+        wind_charge_reset_fall(&c, 64.5);
+        assert_eq!(*c.fall_from.lock().unwrap_or_else(|e| e.into_inner()), 64.5);
+        // Non-finite burst heights never corrupt the fall baseline.
+        wind_charge_reset_fall(&c, f64::NAN);
+        assert_eq!(*c.fall_from.lock().unwrap_or_else(|e| e.into_inner()), 64.5);
+    }
+
+    #[test]
+    fn vanilla_combat2_wind_charge_redstone_triggers() {
+        let mut g = LaneGuard::new();
+        let d = DimId::Overworld;
+        // Toggleable: lever, button, bell, wooden door, trapdoor, fence gate.
+        for (i, name) in [
+            "lever",
+            "stone_button",
+            "bell",
+            "oak_door",
+            "oak_trapdoor",
+            "oak_fence_gate",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let Some(st) = name_to_state(name) else { continue };
+            let (x, y, z) = (9400 + i as i32 * 4, 200, 0);
+            g.set_block(d, x, y, z, st);
+            assert!(
+                wind_charge_trigger_at(d, x, y, z),
+                "{name} should trigger"
+            );
+            assert_ne!(
+                block_at_dim(d, x, y, z),
+                st,
+                "{name} state should have flipped"
+            );
+        }
+        // Iron variants and redstone-held doors: never move.
+        for (i, (name, prop, val)) in [
+            ("iron_door", "", ""),
+            ("iron_trapdoor", "", ""),
+            ("oak_door", "powered", "true"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let Some(st) = name_to_state(name) else { continue };
+            let (x, y, z) = (9500 + i as i32 * 4, 200, 0);
+            let st = if prop.is_empty() {
+                st
+            } else {
+                breg().unwrap().with_prop(st, prop, val)
+            };
+            g.set_block(d, x, y, z, st);
+            assert!(
+                !wind_charge_trigger_at(d, x, y, z),
+                "{name} must not trigger"
+            );
+            assert_eq!(block_at_dim(d, x, y, z), st);
+        }
+        // The lever is itself the power source — a burst still pulls it off.
+        if let Some(st) = name_to_state("lever") {
+            let st = breg().unwrap().with_prop(st, "powered", "true");
+            g.set_block(d, 9600, 200, 0, st);
+            assert!(wind_charge_trigger_at(d, 9600, 200, 0));
+            let st2 = block_at_dim(d, 9600, 200, 0);
+            assert_eq!(
+                breg().unwrap().get_prop(st2, "powered").as_deref(),
+                Some("false")
+            );
+        }
+    }
+
+    #[test]
+    fn vanilla_combat2_wind_charge_door_flips_both_halves() {
+        let mut g = LaneGuard::new();
+        let d = DimId::Overworld;
+        let Some(lower) = name_to_state("oak_door") else { return };
+        let reg = breg().unwrap();
+        let lower = reg.with_prop(lower, "half", "lower");
+        let upper = reg.with_prop(lower, "half", "upper");
+        g.set_block(d, 9600, 200, 0, lower);
+        g.set_block(d, 9600, 201, 0, upper);
+        assert!(wind_charge_trigger_at(d, 9600, 200, 0));
+        // Both halves carry `open=true` after one burst.
+        for y in [200, 201] {
+            let st = block_at_dim(d, 9600, y, 0);
+            assert_eq!(reg.get_prop(st, "open").as_deref(), Some("true"), "half at y={y}");
+        }
+    }
+
+    #[test]
+    fn vanilla_combat2_wind_charge_burst_launches_and_resets() {
+        let _g = LaneGuard::new();
+        let (c, mut r) = client_pair();
+        *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 200.0;
+        {
+            let mut p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.0 = 0.0;
+            p.1 = 70.0;
+            p.2 = 1.5; // 1.5 blocks north of the burst
+        }
+        let c = Arc::new(c);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(c.clone());
+        wind_charge_burst(DimId::Overworld, WindChargeKind::Player, [0.0, 70.0, 0.0], 4242);
+        // Thrower fall baseline snapped to the burst Y.
+        assert_eq!(
+            *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+            70.0
+        );
+        // A velocity packet with a negative-Z push reached the wire.
+        let dl = Instant::now() + Duration::from_secs(1);
+        let mut saw_vel = false;
+        while let Some((id, body)) = read_packet(&mut r, dl) {
+            if id == 0x5a {
+                assert_eq!(body.len(), 8);
+                let vy = i16::from_be_bytes([body[4], body[5]]);
+                let vz = i16::from_be_bytes([body[6], body[7]]);
+                assert!(vz > 0, "burst pushes away from impact, vz={vz}");
+                assert_ne!(vy, 0);
+                saw_vel = true;
+                break;
+            }
+        }
+        assert!(saw_vel, "expected a 0x5a velocity packet");
+    }
+
+    // ---------- shield ----------
+
+    #[test]
+    fn vanilla_combat2_shield_arc_front_180() {
+        // Look = +Z. Sweep the attacker around the full circle in 15° steps.
+        for deg in (0..360).step_by(15) {
+            if deg == 90 || deg == 270 {
+                continue; // exact flank covered below with exact vectors
+            }
+            let rad = (deg as f64).to_radians();
+            let mut ctx = shield_ctx();
+            ctx.to_attacker = [rad.sin(), rad.cos()];
+            let blocked = evaluate_shield_block(&ctx).blocked;
+            let ang = (deg as f64).min(360.0 - deg as f64);
+            // dot(look, to) = cos(angle from +Z); strictly > 0 inside the
+            // open 180° front hemisphere (|angle| < 90).
+            assert_eq!(blocked, ang < 90.0, "deg={deg}");
+        }
+        // Exactly at the 90° flank: dot == 0, not blocked (strict inequality).
+        let mut ctx = shield_ctx();
+        ctx.to_attacker = [1.0, 0.0];
+        assert!(!evaluate_shield_block(&ctx).blocked);
+        ctx.to_attacker = [-1.0, 0.0];
+        assert!(!evaluate_shield_block(&ctx).blocked);
+        // Directly behind: dot < 0.
+        ctx.to_attacker = [0.0, -1.0];
+        assert!(!evaluate_shield_block(&ctx).blocked);
+    }
+
+    #[test]
+    fn vanilla_combat2_shield_warmup_five_ticks() {
+        for raised in 0..SHIELD_WARMUP_GT {
+            let mut ctx = shield_ctx();
+            ctx.raised_ticks = raised;
+            assert!(
+                !evaluate_shield_block(&ctx).blocked,
+                "raised={raised} must not block"
+            );
+        }
+        let mut ctx = shield_ctx();
+        ctx.raised_ticks = SHIELD_WARMUP_GT;
+        assert!(evaluate_shield_block(&ctx).blocked);
+        ctx.raised_ticks = SHIELD_WARMUP_GT + 40;
+        assert!(evaluate_shield_block(&ctx).blocked);
+    }
+
+    #[test]
+    fn vanilla_combat2_shield_cooldown_and_unblockable() {
+        let mut ctx = shield_ctx();
+        ctx.cooldown_active = true;
+        assert!(!evaluate_shield_block(&ctx).blocked);
+        ctx.cooldown_active = false;
+        ctx.unblockable = true;
+        assert!(!evaluate_shield_block(&ctx).blocked);
+    }
+
+    #[test]
+    fn vanilla_combat2_shield_axe_disable_100_ticks() {
+        // Disabling mobs (Vindicator/Piglin Brute etypes) always apply the full
+        // 100-tick cooldown — no roll.
+        assert!(mob_can_disable_shield(79));
+        assert!(mob_can_disable_shield(114));
+        assert!(!mob_can_disable_shield(0));
+        let mut ctx = shield_ctx();
+        ctx.attacker_can_disable = true;
+        ctx.attacker_is_player = false;
+        ctx.disable_roll = 0.999;
+        assert_eq!(evaluate_shield_block(&ctx).disable_ticks, Some(100));
+
+        // Player axe: base 25% + 5%/Efficiency; roll below the chance disables.
+        let mut ctx = shield_ctx();
+        ctx.attacker_can_disable = true;
+        ctx.attacker_is_player = true;
+        ctx.disable_roll = 0.20;
+        assert_eq!(evaluate_shield_block(&ctx).disable_ticks, Some(100));
+        ctx.disable_roll = 0.30;
+        assert_eq!(evaluate_shield_block(&ctx).disable_ticks, None);
+        // Efficiency V lifts the chance to 50%.
+        ctx.attacker_efficiency = 5;
+        ctx.disable_roll = 0.45;
+        assert_eq!(evaluate_shield_block(&ctx).disable_ticks, Some(100));
+        ctx.attacker_efficiency = 0;
+        // Sprinting player axe hit: 25% + 75% = 100% — any roll < 1 disables.
+        ctx.attacker_sprinting = true;
+        ctx.disable_roll = 0.999;
+        assert_eq!(evaluate_shield_block(&ctx).disable_ticks, Some(100));
+        // No axe: never disables.
+        let mut ctx = shield_ctx();
+        ctx.attacker_can_disable = false;
+        ctx.attacker_is_player = true;
+        ctx.attacker_sprinting = true;
+        ctx.disable_roll = 0.0;
+        assert_eq!(evaluate_shield_block(&ctx).disable_ticks, None);
+    }
+
+    #[test]
+    fn vanilla_combat2_shield_durability_math() {
+        // hurtCurrentlyUsedShield: nothing under 3 damage, else 1 + floor.
+        assert_eq!(vanilla_shield_attempts(0.0), 0);
+        assert_eq!(vanilla_shield_attempts(2.9), 0);
+        assert_eq!(vanilla_shield_attempts(3.0), 4);
+        assert_eq!(vanilla_shield_attempts(3.5), 4);
+        assert_eq!(vanilla_shield_attempts(7.9), 8);
+        let mut ctx = shield_ctx();
+        ctx.damage = 2.9;
+        assert_eq!(evaluate_shield_block(&ctx).durability_attempts, 0);
+        ctx.damage = 7.9;
+        assert_eq!(evaluate_shield_block(&ctx).durability_attempts, 8);
+
+        let (c, _r) = client_pair();
+        let c = Arc::new(c);
+        let sh = name_to_item("shield").unwrap();
+        let mut comps = Vec::new();
+        comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 337);
+        c.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(45, (sh, 1, comps));
+        damage_shield_attempts(&c, 5);
+        let dmg = comp_varint(
+            &c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45).unwrap().2,
+            COMP_DAMAGE,
+        );
+        assert_eq!(dmg, Some(5));
+    }
+
+    #[test]
+    fn vanilla_combat2_shield_unbreaking_rolls_per_attempt() {
+        let (c, _r) = client_pair();
+        let c = Arc::new(c);
+        let sh = name_to_item("shield").unwrap();
+        // No Unbreaking: every attempt lands — 10 attempts is exactly 10 damage.
+        let mut comps = Vec::new();
+        comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 337);
+        c.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(45, (sh, 1, comps));
+        damage_shield_attempts(&c, 10);
+        assert_eq!(
+            comp_varint(
+                &c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45).unwrap().2,
+                COMP_DAMAGE
+            ),
+            Some(10)
+        );
+        // Unbreaking III: each attempt lands with p=1/4; 400 attempts must end
+        // below the unmodified count (the all-fail path is (3/4)^400 ~ 0).
+        let mut comps = Vec::new();
+        comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 337);
+        comp_set(
+            &mut comps,
+            COMP_ENCHANTMENTS,
+            enchantments_data(&[(39, 3)], true),
+        );
+        c.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(45, (sh, 1, comps));
+        damage_shield_attempts(&c, 400);
+        let dmg = comp_varint(
+            &c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45).unwrap().2,
+            COMP_DAMAGE,
+        )
+        .unwrap();
+        assert!(dmg < 400, "unbreaking must skip attempts, dmg={dmg}");
+        // Unbreakable shields take no durability at all.
+        let mut comps = Vec::new();
+        comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 337);
+        comp_set(&mut comps, COMP_UNBREAKABLE, vec![]);
+        c.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(45, (sh, 1, comps));
+        damage_shield_attempts(&c, 20);
+        assert_eq!(
+            comp_varint(
+                &c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45).unwrap().2,
+                COMP_DAMAGE
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn vanilla_combat2_shield_state_tick_and_block_gate() {
+        let _g = LaneGuard::new();
+        let (c, _r) = client_pair();
+        let c = Arc::new(c);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(c.clone());
+        TICK_IDX.store(100, Ordering::Relaxed);
+        combat2_state_tick();
+        // Shield down: raised clock stays empty, ctx reports 0 -> below warmup.
+        assert_eq!(shield_raised_ticks(&c), 0);
+        *c.blocking.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        combat2_state_tick();
+        assert_eq!(shield_raised_ticks(&c), 0); // just raised
+        TICK_IDX.store(105, Ordering::Relaxed);
+        combat2_state_tick();
+        assert_eq!(shield_raised_ticks(&c), 5);
+        // apply_shield_disable drops the shield and arms the wall-clock cd.
+        apply_shield_disable(&c);
+        assert!(!*c.blocking.lock().unwrap_or_else(|e| e.into_inner()));
+        let ctx = shield_hit_ctx(&c, [5.0, 0.0, 0.0], 5.0);
+        assert!(ctx.cooldown_active);
+        assert!(!evaluate_shield_block(&ctx).blocked);
+    }
+
+    // ---------- totem of undying ----------
+
+    #[test]
+    fn vanilla_combat2_totem_offhand_pop_effects_status35() {
+        let _g = LaneGuard::new();
+        let (c, mut r) = client_pair();
+        let totem = name_to_item("totem_of_undying").unwrap();
+        c.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(45, (totem, 2, Vec::new()));
+        c.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
+            id: name_to_effect("poison").unwrap_or(19),
+            amp: 2,
+            left: 80,
+        });
+        *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        assert!(try_trigger_totem_of_undying(&c, 0.0, TotemDamageKind::Ordinary));
+        // Totem consumed (one of two), hp = 1.
+        assert_eq!(
+            c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
+            Some(&(totem, 1, Vec::new()))
+        );
+        assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+        // Negative effect cleared; exact vanilla grant.
+        let effs: Vec<(i32, i32, i32)> = c
+            .effs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|e| (e.id, e.amp, e.left))
+            .collect();
+        assert_eq!(effs.len(), 3);
+        let regen = name_to_effect("regeneration").unwrap();
+        let absorb = name_to_effect("absorption").unwrap();
+        let fire = name_to_effect("fire_resistance").unwrap();
+        for (id, amp, left) in [
+            (regen, 1, server_ticks(900) as i32),
+            (absorb, 1, server_ticks(100) as i32),
+            (fire, 0, server_ticks(800) as i32),
+        ] {
+            assert!(
+                effs.iter().any(|e| e.0 == id && e.1 == amp && e.2 == left),
+                "missing effect id={id} amp={amp} left={left} in {effs:?}"
+            );
+        }
+        assert_eq!(*c.absorb.lock().unwrap_or_else(|e| e.into_inner()), 8.0);
+        // Entity status 35 on the wire: i32 eid + i8 status.
+        let dl = Instant::now() + Duration::from_secs(1);
+        let mut saw = false;
+        while let Some((id, body)) = read_packet(&mut r, dl) {
+            if id == 0x1f && body.len() == 5 && body[4] == 35 {
+                assert_eq!(i32::from_be_bytes([body[0], body[1], body[2], body[3]]), 4242);
+                saw = true;
+                break;
+            }
+        }
+        assert!(saw, "expected entity status 35 for totem pop");
+    }
+
+    #[test]
+    fn vanilla_combat2_totem_mainhand_pop() {
+        let _g = LaneGuard::new();
+        let (c, _r) = client_pair();
+        let totem = name_to_item("totem_of_undying").unwrap();
+        *c.held.lock().unwrap_or_else(|e| e.into_inner()) = 3;
+        c.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(39, (totem, 1, Vec::new())); // main hand = 36 + held
+        *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = -4.0;
+        assert!(try_trigger_totem_of_undying(
+            &c,
+            -4.0,
+            TotemDamageKind::Ordinary
+        ));
+        assert!(!c.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&39));
+        assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+    }
+
+    #[test]
+    fn vanilla_combat2_totem_void_and_kill_bypass() {
+        let _g = LaneGuard::new();
+        for kind in [TotemDamageKind::Void, TotemDamageKind::Kill] {
+            let (c, _r) = client_pair();
+            let totem = name_to_item("totem_of_undying").unwrap();
+            c.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(45, (totem, 1, Vec::new()));
+            *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+            assert!(
+                !try_trigger_totem_of_undying(&c, 0.0, kind),
+                "{kind:?} must bypass totem protection"
+            );
+            assert_eq!(
+                c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
+                Some(&(totem, 1, Vec::new()))
+            );
+            assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+        }
+    }
+
+    #[test]
+    fn vanilla_combat2_totem_check_void_zone_no_pop() {
+        let _g = LaneGuard::new();
+        let (c, _r) = client_pair();
+        let totem = name_to_item("totem_of_undying").unwrap();
+        c.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(45, (totem, 1, Vec::new()));
+        // Below the overworld floor: fellOutOfWorld bypasses protection.
+        {
+            let mut p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.1 = f64::from(DimId::Overworld.min_y()) - 5.0;
+        }
+        *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        totem_check(&c);
+        assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+        assert_eq!(
+            c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
+            Some(&(totem, 1, Vec::new()))
+        );
+        // Back inside the world the same lethal check pops the totem.
+        {
+            let mut p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.1 = 70.0;
+        }
+        totem_check(&c);
+        assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+    }
+
+    #[test]
+    fn vanilla_combat2_totem_nonlethal_and_empty_hand() {
+        let _g = LaneGuard::new();
+        let (c, _r) = client_pair();
+        let totem = name_to_item("totem_of_undying").unwrap();
+        c.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(45, (totem, 1, Vec::new()));
+        // Survived hit: hp still positive -> no pop.
+        assert!(!try_trigger_totem_of_undying(&c, 0.5, TotemDamageKind::Ordinary));
+        assert_eq!(
+            c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
+            Some(&(totem, 1, Vec::new()))
+        );
+        // Lethal but no totem anywhere: still no pop.
+        c.inv.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        assert!(!try_trigger_totem_of_undying(&c, 0.0, TotemDamageKind::Ordinary));
+    }
+
+    // ---------- trident specials ----------
+
+    fn trident_ctx() -> TridentSpecialCtx {
+        TridentSpecialCtx {
+            loyalty: 0,
+            riptide: 0,
+            channeling: 0,
+            wet: false,
+            on_ground: false,
+            look: [0.0, 0.0, 1.0],
+            trident: [0.0, 0.0, 0.0],
+            owner: [0.0, 0.0, 10.0],
+            thundering: false,
+            open_sky: true,
+        }
+    }
+
+    #[test]
+    fn vanilla_combat2_trident_loyalty_levels_return() {
+        for level in 1..=3i64 {
+            let mut ctx = trident_ctx();
+            ctx.loyalty = level;
+            ctx.trident = [0.0, 0.0, 0.0];
+            ctx.owner = [0.0, 0.0, 10.0];
+            let ret = evaluate_trident_special(&ctx)
+                .loyalty_return
+                .expect("loyalty must return");
+            let want = 0.05 * level as f64;
+            assert!(
+                (ret[2] - want).abs() < 1e-9,
+                "level {level}: {ret:?} vs z={want}"
+            );
+            assert!(ret[0].abs() < 1e-9 && ret[1].abs() < 1e-9);
+        }
+        // Out-of-range or absent loyalty never returns.
+        for level in [0, 4, -1] {
+            let mut ctx = trident_ctx();
+            ctx.loyalty = level;
+            assert_eq!(
+                evaluate_trident_special(&ctx).loyalty_return,
+                None,
+                "level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn vanilla_combat2_trident_loyalty_returns_from_void() {
+        // Below min_y the return impulse still points at the owner's eye.
+        let mut ctx = trident_ctx();
+        ctx.loyalty = 2;
+        ctx.trident = [3.0, f64::from(DimId::Overworld.min_y()) - 100.0, 0.0];
+        ctx.owner = [0.0, 64.0, 0.0];
+        let ret = evaluate_trident_special(&ctx)
+            .loyalty_return
+            .expect("void must not gate loyalty return");
+        let mag = (ret[0] * ret[0] + ret[1] * ret[1] + ret[2] * ret[2]).sqrt();
+        assert!((mag - 0.10).abs() < 1e-9, "speed 0.05*2, got {mag}");
+        assert!(ret[1] > 0.0, "impulse points up toward the owner");
+    }
+
+    #[test]
+    fn vanilla_combat2_trident_riptide_speed_spin_gates() {
+        // Levels 1..=3, wet: velocity = look * (0.75 + 0.75*level), spin 20.
+        for level in 1..=3i64 {
+            let mut ctx = trident_ctx();
+            ctx.riptide = level;
+            ctx.wet = true;
+            ctx.look = [0.0, 0.0, 1.0];
+            let RiptideOutcome::Launch(l) = evaluate_trident_special(&ctx).riptide else {
+                panic!("level {level} wet must launch");
+            };
+            let want = 0.75 + 0.75 * level as f64;
+            assert!(
+                (l.velocity[2] - want).abs() < 1e-9,
+                "level {level}: {:?} vs {want}",
+                l.velocity
+            );
+            assert_eq!(l.spin_ticks, 20);
+            assert_eq!(l.ground_boost, 0.0);
+        }
+        // Non-unit look vectors normalize, launch stays along the look dir.
+        let mut ctx = trident_ctx();
+        ctx.riptide = 1;
+        ctx.wet = true;
+        ctx.look = [0.0, 3.0, 4.0];
+        let RiptideOutcome::Launch(l) = evaluate_trident_special(&ctx).riptide else {
+            panic!()
+        };
+        let mag =
+            (l.velocity[0].powi(2) + l.velocity[1].powi(2) + l.velocity[2].powi(2)).sqrt();
+        assert!((mag - 1.5).abs() < 1e-9);
+        assert!(l.velocity[1] > 0.0 && l.velocity[2] > 0.0);
+        // Ground release adds the vanilla 1.2 boost.
+        ctx.on_ground = true;
+        let RiptideOutcome::Launch(l) = evaluate_trident_special(&ctx).riptide else {
+            panic!()
+        };
+        assert_eq!(l.ground_boost, 1.2);
+    }
+
+    #[test]
+    fn vanilla_combat2_trident_riptide_dry_refused() {
+        for level in 1..=3i64 {
+            let mut ctx = trident_ctx();
+            ctx.riptide = level;
+            ctx.wet = false;
+            assert_eq!(
+                evaluate_trident_special(&ctx).riptide,
+                RiptideOutcome::Refused,
+                "dry riptide {level} must refuse"
+            );
+        }
+        let mut ctx = trident_ctx();
+        ctx.riptide = 0;
+        ctx.wet = true;
+        assert_eq!(
+            evaluate_trident_special(&ctx).riptide,
+            RiptideOutcome::NotRiptide
+        );
+        // A non-finite look vector refuses rather than NaN-ing the velocity.
+        let mut ctx = trident_ctx();
+        ctx.riptide = 1;
+        ctx.wet = true;
+        ctx.look = [f64::NAN, 0.0, 0.0];
+        assert_eq!(
+            evaluate_trident_special(&ctx).riptide,
+            RiptideOutcome::Refused
+        );
+    }
+
+    #[test]
+    fn vanilla_combat2_trident_channeling_thunder_and_sky() {
+        let mut ctx = trident_ctx();
+        ctx.channeling = 1;
+        ctx.thundering = true;
+        ctx.open_sky = true;
+        assert!(evaluate_trident_special(&ctx).channeling_lightning);
+        // Rain without a thunderstorm: no lightning.
+        ctx.thundering = false;
+        assert!(!evaluate_trident_special(&ctx).channeling_lightning);
+        // Covered sky during thunder: no lightning.
+        ctx.thundering = true;
+        ctx.open_sky = false;
+        assert!(!evaluate_trident_special(&ctx).channeling_lightning);
+        // No channeling on the trident: never.
+        let mut ctx = trident_ctx();
+        ctx.thundering = true;
+        ctx.open_sky = true;
+        assert!(!evaluate_trident_special(&ctx).channeling_lightning);
+    }
+
+    #[test]
+    fn vanilla_combat2_trident_loyalty_return_tick() {
+        let _g = LaneGuard::new();
+        let (c, _r) = client_pair();
+        {
+            let mut p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.0 = 16.0;
+            p.1 = 70.0;
+            p.2 = 10.0;
+        }
+        let c = Arc::new(c);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(c.clone());
+        region()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hot
+            .insert((1, 0));
+        let mut comps = Vec::new();
+        comp_set(
+            &mut comps,
+            COMP_ENCHANTMENTS,
+            enchantments_data(&[(19, 2)], true),
+        );
+        arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
+            eid: 99901,
+            owner: 4242,
+            x: 22.0,
+            y: 70.9,
+            z: 10.0,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+            ttl: 100,
+            dmg: 8.0,
+            fire: 0,
+            punch: 0,
+            kind: 1,
+            loy: 2,
+            ret_item: 9999,
+            ret_comps: comps,
+            pierce: 0,
+            last_hit: -1,
+            stuck: false,
+        });
+        trident_returning()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(99901);
+        let before = {
+            let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            let a = ar.iter().find(|a| a.eid == 99901).unwrap();
+            ((a.x - 16.0).powi(2) + (a.y - 70.9).powi(2)).sqrt()
+        };
+        arrow_tick();
+        let after = {
+            let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            let a = ar.iter().find(|a| a.eid == 99901).unwrap();
+            ((a.x - 16.0).powi(2) + (a.y - 70.9).powi(2)).sqrt()
+        };
+        assert!(
+            after < before,
+            "loyalty trident must close on its owner ({before} -> {after})"
+        );
+        // Drop it on the owner's eye: next tick lands it as a pickup there.
+        {
+            let mut ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            let a = ar.iter_mut().find(|a| a.eid == 99901).unwrap();
+            a.x = 16.0;
+            a.y = 70.9;
+            a.z = 10.0;
+        }
+        arrow_tick();
+        assert!(arrows()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .all(|a| a.eid != 99901));
+        let drop_at_owner = drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|d| d.item == 9999 && (d.x - 16.0).abs() < 1.0);
+        assert!(drop_at_owner, "returned trident lands at the owner's feet");
+        region()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hot
+            .remove(&(1, 0));
+    }
+
+    #[test]
+    fn vanilla_combat2_riptide_spin_state() {
+        let _g = LaneGuard::new();
+        TICK_IDX.store(1000, Ordering::Relaxed);
+        riptide_spin()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(4242, 1000 + server_ticks(20));
+        assert_eq!(spin_attack_ticks_left(4242), 20);
+        TICK_IDX.store(1019, Ordering::Relaxed);
+        assert_eq!(spin_attack_ticks_left(4242), 1);
+        TICK_IDX.store(1020, Ordering::Relaxed);
+        assert_eq!(spin_attack_ticks_left(4242), 0);
     }
 }
