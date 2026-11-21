@@ -98,6 +98,11 @@
 //!   FIPS 180-4 SHA-256 with constant-time digest comparison,
 //!   [`mod_sync::ConsentToken`]-gated atomic installs that refuse symlink
 //!   escapes, and [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`] auto-skip.
+//! - [`custom_media`]: generic content-addressed custom painting/photo
+//!   media registry — fail-closed PNG/JPEG header inspection with hard
+//!   dimension/size bounds, per-player quotas, SHA-256 dedup, canvas
+//!   placement tracking, and chunked `MDIA` wire framing with verified
+//!   out-of-order reassembly for immersive-painting/camera mods.
 //! - [`unified_bundle`]: shrink-to-generic `mc-spine-mod-bundle/1`
 //!   declarative mod bundle — one pure-JSON document declaring a mod's
 //!   portals, progression barriers, biome regions, creature specs, and
@@ -113,6 +118,7 @@ pub mod bytecode_subset_vm;
 pub mod class_mixin_scanner;
 pub mod creature_primitives;
 pub mod culinary_adapter;
+pub mod custom_media;
 pub mod data_loader;
 pub mod dimension_mod;
 pub mod ecosystem_compat;
