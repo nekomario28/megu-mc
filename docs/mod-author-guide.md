@@ -1,6 +1,6 @@
 # Mod・シェーダー開発者ガイド / Mod & Shader Author Guide
 
-対象は Minecraft 1.21.1 の NeoForge / Fabric Mod 作者、および Megu クライアント用シェーダー作者です。ここでは **ソースコードで確認できる API と、今後の開発予定**を区別します。事前解析で互換候補と判定されても、実ワールドでの動作保証にはなりません。
+対象は Minecraft 1.21.1 の NeoForge / Fabric Mod 作者、および Megu クライアント用シェーダー作者です。現行の CLI・アダプター・Bundle API の使い方を示します。事前解析で互換候補と判定されても、実ワールドでの動作保証にはなりません。
 
 ## 1. 既存 Mod（NeoForge 1.21.1 / Fabric 1.21.1）をそのまま動かす仕組み（自動アダプト）
 
@@ -32,7 +32,32 @@ mc-spine-mod-check --scan-mods-dir mods/ --json
 - `--scan-mods-dir` はディレクトリ内の JAR をまとめて検査し、重複軽量化 Mod のスキップ、調理系のレシピ・タグ・loot modifier の検出、Tier 2 / Tier 3 の判定を報告します。
 - 終了コードは `0`（検査上の受理）、`2`（不一致・未 lift・引数不正など）、`1`（読めない・危険な入力など）です。各モードで `0` の意味は異なるため、診断内容も確認してください。
 
-**公開アダプト CLI の計画**として `mc-spine-mod-check --adapt-jar <mod.jar>`、`--adapt-mods-dir <dir>` を想定しています。既存 JAR をサーバー内部で自動分類する実装と同じ機能を、明示的な変換・診断操作として公開する構想です。**現行 `mod_check.rs` にはこの2オプションは未実装**です。
+### 自動アダプト CLI（実装済み）
+
+`mc-spine-mod-check` の `--adapt-jar` と `--adapt-mods-dir` は利用できます。JAR 内の loader manifest、宣言データ、Mixin バイトコードを読み、`auto_skipped`、`native_bundle`、`tier2_lifted_shim`、`tier3_fallback_required` のいずれかに分類します。実行は JVM 不要です。
+
+```sh
+# 単一 JAR の自動分類。生成されたネイティブ Bundle と診断 JSON を保存
+mc-spine-mod-check --adapt-jar mods/example.jar --out mods/adapted --json
+
+# mods/ の全 JAR を分類。結果を mods/adapted/ に保存
+mc-spine-mod-check --adapt-mods-dir mods/ --out mods/adapted/ --json
+
+# サーバー用途では除外される client-only Mixin も解析する場合
+mc-spine-mod-check --adapt-jar mods/example.jar --include-client-mixins --json
+```
+
+`--json` の標準出力は単一 JAR では `mc-spine-jar-adaptation/1`、ディレクトリでは `mc-spine-mods-dir-adaptation/1` です。`--out <dir>` を指定すると `adaptation-report.json` と、ネイティブ化できた Mod ごとの `<mod_id>.bundle.json` を書き出します。後者の JSON は厳格な `mc-spine-mod-bundle/1` スキーマで検証されます。`--out` を省略するとファイルを生成せず、診断のみ表示します。
+
+終了コード `0` は全 JAR がスキップ・Native・Tier 2 のいずれかと判定されたことを示し、`2` は Tier 3 が含まれるか引数が不正、`1` はファイルの読み書き不可や危険・破損した入力を示します。`2` の場合でも、`--out` を指定していれば成功した Native Bundle と診断レポートは保存されます。
+
+サーバーの `src/live_mod_bridge.rs` には起動時の JAR 分類・宣言データ読込・対応する Mixin の lift と、`mods/` および `mods/adapted/` の検証済み `*.bundle.json` 登録が実装されています。ランチャーの `tools/mod_launcher.py --auto-adapt` も実装済みで、起動計画時に既存 Bundle を事前確認し、利用可能な `mc-spine-mod-check --scan-mods-dir` の結果と ShimCheck を組み合わせて判定します。次のコマンドで起動計画を確認できます。
+
+```sh
+python3 tools/mod_launcher.py --mods-dir mods/ --auto-adapt --dry-run --json
+```
+
+ランチャーの `--auto-adapt` は `--adapt-mods-dir --out` による Bundle ファイルの書き出しとは別の入口です。JAR から生成ファイルが必要な場合は上記の `mc-spine-mod-check --adapt-* --out` を実行してください。
 
 ## 2. 既存 Mod を mc-spine で最大限速く・互換性高く動かすための設計ベストプラクティス
 
@@ -46,7 +71,17 @@ mc-spine-mod-check --scan-mods-dir mods/ --json
 
 **ネイティブ開発の利点** — 対応する宣言的プリミティブだけで完結する Mod は、**Gradle・JDK・Minecraft mappings・Mixin の設定やボイラープレートが不要**です。JSON を記述して Rust の汎用ランタイムに渡せるため、個別の Java クラスをコンパイルする工程と JVM 実行コストを省けます。対応範囲では変更もデータ中心で、`dep_resolver::assess_hot_reload_after_add` は Bundle を含む安全な JAR を **hot-reload 可能と判定**します。再起動不要の適用可否は JAR 内の Mixin・ネイティブライブラリ・バイトコードに依存します。
 
-**スターターの自動生成は計画中**です。将来の `mc-spine-mod-check --scaffold-native <mod_id>` は、Mod ID から宣言 JSON とデータパックの雛形を即時生成する入口として想定しています。**現行 CLI ではまだ実行できません。**
+**スターターの自動生成は実装済み**です。`--scaffold-native` は `mc-spine-mod-bundle/1` の検証可能な宣言 JSON を標準出力または指定ファイルに生成します。`--version` は Bundle の `mc_version_range`（バージョン指定または Maven / SemVer 範囲）、`--name` は表示名の検証用引数です。現行のスキーマには表示名のフィールドがないため、Bundle に保存されるのは `mod_id` とバージョン範囲などの定義済みフィールドです。データパックの JSON は別途作成してください。
+
+```sh
+# ファイルに保存する（親ディレクトリは事前に作成）
+mc-spine-mod-check --scaffold-native my_sample_mod --version '[1.21,)' --out my_sample_mod.bundle.json
+
+# ファイル指定がない場合は Bundle JSON を標準出力する
+mc-spine-mod-check --scaffold-native my_sample_mod
+```
+
+Mod ID は安全な小文字の英数字・`_`・`.`・`-` のみで構成された単独 ID に限られます。`../escape` のようなパスを含む ID は終了コード `2` で拒否されます。ファイル書き込み失敗時は `1` です。
 
 ### Bundle 本体の最小例
 
@@ -132,7 +167,7 @@ data/starling/worldgen/biome/moon_plains.json  # 別途、実際のバイオー�
 {"replace": false, "values": ["minecraft:apple"]}
 ```
 
-カスタムアイテム `starling:moon_berry` をこのタグに追加する場合、そのアイテムの登録も必要です。上記の ID は **宣言形の説明用**です。現行スキーマが自由なブロック・アイテム・イベントを JSON からすべて登録できるとは主張しません。将来の scaffold と対応領域拡張では、これらの定義を単一のネイティブ作成体験に統合することを目標とします。
+カスタムアイテム `starling:moon_berry` をこのタグに追加する場合、そのアイテムの登録も必要です。上記の ID は **宣言形の説明用**です。現行スキーマが自由なブロック・アイテム・イベントを JSON からすべて登録できるとは主張しません。現行の `--scaffold-native` は Bundle の初期 JSON を生成しますが、標準データパックのレシピ・タグやカスタム登録定義は自動生成しません。
 
 ## 4. 外部シェーダーパック対応とネイティブ WGSL パック（`megu-shader.toml`）
 
@@ -210,7 +245,11 @@ Fabric / NeoForge 互換レイヤ経由で動的ロードする **独立した�
 - Inspect packs with `mc-spine-mod-check --modpack <pack.mrpack>`.
 - Inspect Mixin bytecode with `--scan-jar <mod.jar>`.
 - Inspect a complete `mods/` folder with `--scan-mods-dir mods/`.
-- `--adapt-jar`, `--adapt-mods-dir` and `--scaffold-native` are planned CLI options.
+- Auto-adapt an existing JAR with `--adapt-jar mods/example.jar --out mods/adapted --json` (schema `mc-spine-jar-adaptation/1`).
+- Auto-adapt a full folder with `--adapt-mods-dir mods/ --out mods/adapted --json` (schema `mc-spine-mods-dir-adaptation/1`).
+- Generate a valid `mc-spine-mod-bundle/1` starter with `--scaffold-native my_sample_mod --out my_sample_mod.bundle.json`.
+- `--adapt-*` exits 0 for accepted/skipped/Tier 2 mods, 2 for Tier 3 or invalid arguments, and 1 for unreadable or unsafe input.
+- `live_mod_bridge` auto-classifies JARs and registers validated bundles during boot. `tools/mod_launcher.py --auto-adapt` enables launcher preflight classification.
 - Native bundle authors can avoid Gradle, JDK, mappings and Mixin boilerplate.
 - The current bundle schema defines portals, biome regions, creatures and custom channels.
 - Recipes, tags and dimensions use separate standard datapack JSON assets.
@@ -220,4 +259,4 @@ Fabric / NeoForge 互換レイヤ経由で動的ロードする **独立した�
 - Native WGSL uses `megu-shader.toml` with `[pack]` and `[pass.<name>]` sections.
 - Unsupported GPU features trigger a safe built-in-renderer fallback.
 - Independent external JARs and user-installed shaders retain their own licenses.
-- This guide describes current parser capabilities and planned authoring tools separately.
+- The auto-adapter and native Bundle scaffold commands are available now, with compatibility still determined per mod.
