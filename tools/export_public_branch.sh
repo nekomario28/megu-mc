@@ -48,7 +48,9 @@ else
 fi
 cd -- "$stage"
 # No links in the current export format: do not follow one while removing or writing files.
-unsafe=$(find . \( -type l -o -name .git -o -name '*.jar' -o -name '*.class' \) -print -quit)
+# world_overlay*.bin* is local server state that must never be archived or tracked.
+unsafe=$(find . \( -type l -o -name .git -o -name '*.jar' -o -name '*.class' \
+                -o -name 'world_overlay*.bin*' \) -print -quit)
 [[ -z $unsafe ]] || die "unexpected archive member: $unsafe"
 excluded=(datapacks/vanilla/ assets/block_states_1211.json config_packets.bin
           tests/data/biome_probe_1211.tsv tests/data/vanilla_vectors_1211.tsv
@@ -59,6 +61,16 @@ for path in "${excluded[@]}"; do
     rm -rf -- "${path%/}"
     printf '/%s\n' "$path" >> .gitignore
 done
+# Every remaining *_1211* name under assets/ and tests/data/ is generated from the
+# pinned 1.21.1 jar by tools/vanilla_data/ - Mojang-derived data the public tree
+# regenerates instead of redistributing. Collect first so removing a directory
+# cannot confuse the traversal.
+generated=()
+while IFS= read -r -d '' path; do generated+=("$path"); done \
+    < <(find assets tests/data -name '*_1211*' -print0)
+((${#generated[@]})) || die 'no generated *_1211* artifacts found to strip'
+for path in "${generated[@]}"; do rm -rf -- "$path"; done
+printf '/assets/**/*_1211*\n/tests/data/**/*_1211*\n' >> .gitignore
 
 git init -q --template= -b "$branch"
 git config --get user.name >/dev/null || git config --local user.name "${name:-Public Export}"
@@ -73,7 +85,13 @@ git ls-files --error-unmatch -- .gitignore >/dev/null
 for path in "${excluded[@]}"; do
     git check-ignore -q --no-index -- "$path" || die "not ignored: $path"
 done
-forbidden=$(git ls-files -- '*.jar' '*.class' "${excluded[@]%/}")
+for path in assets/blocks_1211.json tests/data/dimension_terrain_1211 \
+            tests/data/basalt_columns_1211.tsv world_overlay.bin \
+            world_overlay_nether.bin.bak; do
+    git check-ignore -q --no-index -- "$path" || die "not ignored: $path"
+done
+forbidden=$(git ls-files -- '*.jar' '*.class' 'world_overlay*.bin*' \
+                         'assets/*_1211*' 'tests/data/*_1211*' "${excluded[@]%/}")
 [[ -z $forbidden ]] || die "forbidden index entries: $forbidden"
 ignored=$(git ls-files -ci --exclude-standard)
 [[ -z $ignored ]] || die "tracked ignored files: $ignored"
@@ -89,7 +107,7 @@ if ((verify)); then
     printf '%s\n' "$report"
     [[ $rc == 1 ]] || die "expected dev_check exit 1, got $rc"
     if grep -Eq '\[ERROR *\]' <<< "$report"; then die 'dev_check reported an error'; fi
-    grep -A1 -F '[MISSING    ] build_inputs' <<< "$report" | grep -F 'datapacks/vanilla/' >/dev/null || die 'expected missing datapack build inputs'
+    grep -A1 -F '[MISSING    ] build_inputs' <<< "$report" | grep -E 'datapacks/vanilla/|_1211' >/dev/null || die 'expected missing Mojang build inputs'
     grep -E '^\[MISSING    \] runtime_data .*datapacks/vanilla.*config_packets\.bin' <<< "$report" >/dev/null || die 'expected missing runtime inputs'
 fi
 mv -T -- "$stage" "$out"

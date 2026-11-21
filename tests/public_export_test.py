@@ -45,6 +45,21 @@ def test_export(from_worktree):
                      *(f'tests/data/{name}_1211.tsv' for name in TSVS)):
             assert not (out / path).exists(), path
             run(out, 'git', 'check-ignore', '-q', '--no-index', path)
+        # Every clean first-party crate and the tools a public user needs to
+        # regenerate data and package a release must survive the export.
+        for path in ('proto/Cargo.toml', 'state-store/Cargo.toml',
+                     'server-files/Cargo.toml', 'mod-adapter-core/Cargo.toml',
+                     'create-adapter/Cargo.toml', 'mod-offload/Cargo.toml',
+                     'client-port/Cargo.toml', 'client-kernel/Cargo.toml',
+                     'client-app/Cargo.toml', 'tools/vanilla_data/version_pack.py',
+                     'tools/vanilla_data/gen_vanilla_data.sh', 'tools/mod_launcher.py',
+                     'tools/release_bundle.py'):
+            assert (out / path).is_file(), path
+        # No generated (*_1211*) or local-state (world_overlay*.bin*) artifact may
+        # be left anywhere in the exported tree.
+        generated = [p for p in out.rglob('*_1211*') if '.git' not in p.parts]
+        assert not generated, generated[:5]
+        assert not list(out.rglob('world_overlay*.bin*')), 'world_overlay artifact exported'
         check_docs(out)
 
         assert 'not empty' in run(ROOT, EXPORT, '--out', out, expect=1)
