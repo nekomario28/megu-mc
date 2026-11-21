@@ -88,6 +88,10 @@ use mod_adapter_core::fallback::{
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::mod_sync as lmb_sync;
 #[cfg(feature = "mod-suite")]
+use mod_adapter_core::mixin_lifter::{lift_mixin_sites, LiftedBinding, MixinLiftVerdict};
+#[cfg(feature = "mod-suite")]
+use mod_adapter_core::unified_bundle::{DeclarativeModBundle, UnifiedModRuntime};
+#[cfg(feature = "mod-suite")]
 use mod_adapter_core::modpack::infer_candidate_mod_id;
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::profile as lmb_profile;
@@ -131,6 +135,22 @@ struct LiveModJarReport {
     skipped_client_mixins: usize,
 }
 
+/// What was automatically onboarded from a JAR. Lifted bindings are installed
+/// only for a fully verified Tier 2 classification; Tier 3 is diagnostic.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct AutoAdaptedModSummary {
+    file_name: String,
+    mod_id: String,
+    tier: ExecutionTier,
+    lifted_hooks: Vec<LiftedBinding>,
+    cooking_recipes: usize,
+    cutting_recipes: usize,
+    tag_files: usize,
+    tag_values: usize,
+}
+
 /// Everything the live mod suite owns at runtime. `active` stays false until
 /// `live_mod_suite_boot` (or a test) arms a surface — an unarmed suite is a
 /// zero-cost no-op for every emitter below.
@@ -141,6 +161,12 @@ struct LiveModSuite {
     active: bool,
     /// Per-JAR classification audit, in sorted file order.
     reports: Vec<LiveModJarReport>,
+    /// Validated native bundle registry, shared with the live boot surfaces.
+    unified: UnifiedModRuntime,
+    /// Automatic JAR adaptation receipts, including Tier 3 diagnostics.
+    auto_adapted: Vec<AutoAdaptedModSummary>,
+    /// Verified Tier 2 event bindings, keyed by the source mod id.
+    lifted_hooks: Vec<(String, LiftedBinding)>,
     /// Validated merged Fabric + NeoForge server-side manifest table.
     dual_loader: DualLoaderPlan,
     /// Methods verified against the restricted JVM opcode and host-call sets.
@@ -177,6 +203,9 @@ impl LiveModSuite {
         Self {
             active: false,
             reports: Vec::new(),
+            unified: UnifiedModRuntime::default(),
+            auto_adapted: Vec::new(),
+            lifted_hooks: Vec::new(),
             dual_loader: DualLoaderPlan::default(),
             damage_hooks: Vec::new(),
             culinary: CulinaryRegistry::new(),
@@ -224,6 +253,7 @@ impl LiveModSuite {
             );
             return;
         }
+        self.scan_bundles_dir(dir);
         let jars = Self::jar_listing(dir);
         let mut bounded_jars = Vec::new();
         for (file_name, path) in &jars {
@@ -285,6 +315,57 @@ impl LiveModSuite {
         self.log_boot_report(jars.len());
     }
 
+    /// Load validated declarative bundles from mods/ and mods/adapted/.
+    /// Invalid, incompatible and duplicate bundle ids have no runtime effect.
+    fn scan_bundles_dir(&mut self, dir: &std::path::Path) {
+        const MAX_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+        let mut paths = Vec::new();
+        for root in [dir.to_path_buf(), dir.join("adapted")] {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                continue;
+            };
+            let mut root_paths = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|ty| ty.is_file())
+                    && path.file_name().and_then(|n| n.to_str()).is_some_and(|name| name.ends_with(".bundle.json"))
+                {
+                    root_paths.push(path);
+                }
+            }
+            root_paths.sort();
+            paths.extend(root_paths);
+        }
+        let mut installed = BTreeSet::new();
+        for path in paths {
+            let result = (|| {
+                let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+                if metadata.len() > MAX_BUNDLE_BYTES {
+                    return Err("bundle exceeds 4 MiB limit".to_string());
+                }
+                let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                let bundle = DeclarativeModBundle::from_json(&json).map_err(|e| e.to_string())?;
+                if installed.contains(&bundle.mod_id) {
+                    return Err(format!("duplicate bundle mod id {}", bundle.mod_id));
+                }
+                let receipt = self.unified.register_bundle(&bundle, LIVE_MOD_MC_TARGET)
+                    .map_err(|e| e.to_string())?;
+                installed.insert(bundle.mod_id);
+                Ok(receipt)
+            })();
+            match result {
+                Ok(receipt) => eprintln!(
+                    "[live-mods] auto-adapted native bundle {}: {} portals, {} progression barriers, {} regions, {} creatures, {} channels",
+                    receipt.mod_id, receipt.portals_installed, receipt.progression_barriers_installed,
+                    receipt.biome_regions_installed, receipt.creatures_installed,
+                    receipt.custom_channels_declared,
+                ),
+                Err(error) => eprintln!("[live-mods] bundle {} rejected: {error}", path.display()),
+            }
+        }
+        self.barriers = self.unified.progression_engine();
+    }
+
     /// Classify + data-load one JAR file.
     fn scan_jar(&mut self, file_name: &str, path: &std::path::Path) {
         let mod_id = infer_candidate_mod_id(file_name)
@@ -328,8 +409,10 @@ impl LiveModSuite {
         // Generic culinary auto-discovery: only jars actually carrying
         // `data/<ns>/{recipes,tags,loot_modifiers,food}` contribute, so this
         // is safe to feed every content mod, not just Farmer's Delight.
+        let mut discovered = CulinaryDiscoveryStats::default();
         match self.culinary.load_from_jar_bytes(&bytes) {
             Ok(stats) => {
+                discovered = stats.clone();
                 let agg = &mut self.culinary_stats;
                 agg.jar_members += stats.jar_members;
                 agg.data_files += stats.data_files;
@@ -347,6 +430,30 @@ impl LiveModSuite {
         }
         let (tier, diagnostic, classes_scanned, mixin_sites, skipped_client_mixins) =
             live_mod_classify(&mod_id, &bytes);
+        let lifted_hooks = if tier == ExecutionTier::BoundedJvmShim {
+            match scan_jar_mixins_with_options(&bytes, JarScanOptions::default()) {
+                Ok(scan) => match lift_mixin_sites(&scan.sites) {
+                    MixinLiftVerdict::FullyLiftable(hooks) if !hooks.is_empty() => hooks,
+                    _ => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        self.lifted_hooks.extend(
+            lifted_hooks.iter().cloned().map(|hook| (mod_id.clone(), hook))
+        );
+        self.auto_adapted.push(AutoAdaptedModSummary {
+            file_name: file_name.to_string(),
+            mod_id: mod_id.clone(),
+            tier,
+            lifted_hooks,
+            cooking_recipes: discovered.cooking_recipes,
+            cutting_recipes: discovered.cutting_recipes,
+            tag_files: discovered.tag_files,
+            tag_values: discovered.tag_values,
+        });
         self.reports.push(LiveModJarReport {
             file_name: file_name.to_string(),
             mod_id,
@@ -583,7 +690,9 @@ impl LiveModSuite {
                     "[live-mods] progression barriers armed: {} rule(s)",
                     rules.len()
                 );
-                self.barriers = ProgressionBarrierEngine::new(rules);
+                let mut all_rules = self.unified.progression_rules().to_vec();
+                all_rules.extend(rules);
+                self.barriers = ProgressionBarrierEngine::new(all_rules);
             }
             Err(error) => {
                 eprintln!("[live-mods] progression rules {}: {error}", path.display());
@@ -741,6 +850,17 @@ fn live_mod_class_members(jar: &[u8]) -> Result<Vec<(String, Vec<u8>)>, &'static
 fn live_mod_suite() -> &'static Mutex<LiveModSuite> {
     static SUITE: OnceLock<Mutex<LiveModSuite>> = OnceLock::new();
     SUITE.get_or_init(|| Mutex::new(LiveModSuite::new()))
+}
+
+/// Snapshot of the automatically registered native mod bundles.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_unified_runtime() -> UnifiedModRuntime {
+    live_mod_suite()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .unified
+        .clone()
 }
 
 /// The only capabilities exposed to verified damage bytecode. Each method
@@ -2030,6 +2150,82 @@ mod wire_mods_tests {
     }
 
     // ---------- boot scan ----------
+
+    #[test]
+    fn live_mod_bridge_auto_registers_native_bundles_on_boot() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = lmb_temp_dir("bundle-boot");
+        let adapted = dir.join("adapted");
+        std::fs::create_dir_all(&adapted).unwrap();
+        for (path, id, channel) in [
+            (dir.join("first.bundle.json"), "first:mod", "first:sync"),
+            (adapted.join("second.bundle.json"), "second:mod", "second:sync"),
+        ] {
+            std::fs::write(path, format!(
+                r#"{{"schema":"mc-spine-mod-bundle/1","mod_id":"{id}","mc_version_range":"[1.21.1,1.21.1]","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":["{channel}"]}}"#
+            )).unwrap();
+        }
+        // A parsed but incompatible bundle must not reserve the id of a
+        // subsequent valid bundle during the same boot.
+        std::fs::write(dir.join("a-incompatible.bundle.json"),
+            r#"{"schema":"mc-spine-mod-bundle/1","mod_id":"first:mod","mc_version_range":"[1.20.1,1.20.1]","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":[]}"#
+        ).unwrap();
+        std::fs::write(dir.join("invalid.bundle.json"), r#"{"schema":"wrong"}"#).unwrap();
+        let previous = std::env::var_os("MC_SPINE_MODS_DIR");
+        std::env::set_var("MC_SPINE_MODS_DIR", &dir);
+        live_mod_suite_boot();
+        if let Some(value) = previous {
+            std::env::set_var("MC_SPINE_MODS_DIR", value);
+        } else {
+            std::env::remove_var("MC_SPINE_MODS_DIR");
+        }
+        let runtime = live_mod_unified_runtime();
+        assert_eq!(runtime.installed_mod_ids(), &["first:mod", "second:mod"]);
+        assert!(runtime.is_channel_registered("first:sync"));
+        assert!(runtime.is_channel_registered("second:sync"));
+        fresh_suite();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn live_mod_bridge_auto_adapts_jars_on_boot() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = lmb_temp_dir("jar-boot");
+        std::fs::write(dir.join("sodium-0.6.jar"), lmb_test_jar(&[("x.bin", b"x")])).unwrap();
+        std::fs::write(dir.join("delightaddon-1.jar"), lmb_culinary_jar("delightaddon")).unwrap();
+        std::fs::write(dir.join("safemod-1.jar"), lmb_inject_jar(
+            "com/safemod", "net/minecraft/world/entity/LivingEntity", "hurt"
+        )).unwrap();
+        std::fs::write(dir.join("redirectmod-1.jar"), lmb_redirect_jar(
+            "com/redmod", "net/minecraft/world/entity/LivingEntity", "hurt"
+        )).unwrap();
+        let previous = std::env::var_os("MC_SPINE_MODS_DIR");
+        std::env::set_var("MC_SPINE_MODS_DIR", &dir);
+        live_mod_suite_boot();
+        if let Some(value) = previous {
+            std::env::set_var("MC_SPINE_MODS_DIR", value);
+        } else {
+            std::env::remove_var("MC_SPINE_MODS_DIR");
+        }
+        let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(suite.auto_adapted.len(), 3);
+        assert_eq!(suite.culinary_stats.cooking_recipes, 1);
+        assert_eq!(suite.auto_adapted.iter().find(|m| m.mod_id == "delightaddon")
+            .unwrap().tag_files, 1);
+        let safe = suite.auto_adapted.iter().find(|m| m.mod_id == "safemod").unwrap();
+        assert_eq!(safe.tier, ExecutionTier::BoundedJvmShim);
+        assert_eq!(safe.lifted_hooks.len(), 1);
+        assert_eq!(suite.lifted_hooks.len(), 1);
+        assert_eq!(suite.lifted_hooks[0].1.hook, StandardEventHook::EntityDamagePre);
+        let fallback = suite.auto_adapted.iter().find(|m| m.mod_id == "redirectmod").unwrap();
+        assert_eq!(fallback.tier, ExecutionTier::RequiresFallback);
+        assert!(fallback.lifted_hooks.is_empty());
+        assert!(suite.reports.iter().any(|r| r.mod_id == "sodium"
+            && r.tier == ExecutionTier::BuiltInSuperseded));
+        drop(suite);
+        fresh_suite();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn wire_mods_boot_scan_supersedes_loads_culinary_and_classifies() {

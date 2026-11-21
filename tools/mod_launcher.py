@@ -950,15 +950,107 @@ class DiscoveredMod:
         }
 
 
-def discover_mods(mods_dir):
+def discover_mods(mods_dir, auto_adapt=False):
     if not mods_dir.is_dir():
         raise LauncherError(f"--mods-dir is not a directory: {mods_dir}")
     entries = [
         p for p in sorted(mods_dir.iterdir(), key=lambda p: p.name)
-        if not p.name.startswith(".")
+        if not p.name.startswith(".") and not (auto_adapt and p.name == "adapted")
         and (p.is_dir() or p.suffix.lower() in (".jar", ".zip"))
     ]
     return [DiscoveredMod(p) for p in entries]
+
+
+def discover_native_bundles(mods_dir, target):
+    """Pre-flight native bundles in mods/ and mods/adapted/.
+
+    The server's DeclarativeModBundle parser performs the authoritative
+    section-level validation during boot.
+    """
+    bundles = []
+    seen_ids = set()
+    allowed = {"schema", "mod_id", "mc_version_range", "portals",
+               "progression_barriers", "biome_regions", "creatures",
+               "custom_channels"}
+    for root in (mods_dir, mods_dir / "adapted"):
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*.bundle.json")):
+            try:
+                if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+                    raise ValueError("bundle is not a regular file within the 4 MiB limit")
+                doc = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError) as error:
+                raise LauncherError(f"invalid native bundle {path}: {error}")
+            if not isinstance(doc, dict) or doc.get("schema") != "mc-spine-mod-bundle/1":
+                raise LauncherError(f"invalid native bundle {path}: unsupported schema")
+            if set(doc) - allowed:
+                raise LauncherError(f"invalid native bundle {path}: unknown top-level keys")
+            mod_id = doc.get("mod_id")
+            if not isinstance(mod_id, str) or not re.fullmatch(
+                    r"[a-z0-9_.-]+:[a-z0-9_./-]+", mod_id):
+                raise LauncherError(f"invalid native bundle {path}: invalid mod_id")
+            if mod_id in seen_ids:
+                raise LauncherError(f"duplicate native bundle mod_id: {mod_id}")
+            version = doc.get("mc_version_range")
+            if not isinstance(version, str):
+                raise LauncherError(f"invalid native bundle {path}: missing mc_version_range")
+            verdict = check_mod_mc_version(target, version)
+            if verdict.kind != "compatible":
+                raise LauncherError(f"incompatible native bundle {path}: {version} ({verdict.kind})")
+            for field in ("portals", "progression_barriers", "biome_regions",
+                          "creatures", "custom_channels"):
+                if not isinstance(doc.get(field), list) or len(doc[field]) > 1024:
+                    raise LauncherError(f"invalid native bundle {path}: {field} must be an array of at most 1024 entries")
+            seen_ids.add(mod_id)
+            bundles.append({"mod_id": mod_id, "source": str(path),
+                            "status": "native_bundle_preflight",
+                            "sections": {key: len(doc.get(key, [])) for key in
+                                         ("portals", "progression_barriers", "biome_regions",
+                                          "creatures", "custom_channels")}})
+    return bundles
+
+
+def run_auto_adapt_scan(mods_dir):
+    """Use the native bounded JAR scanner when installed; otherwise defer to
+    the existing Python + ShimCheck classifier without assuming bytecode safety.
+    """
+    native = ROOT / "target" / "debug" / "mc-spine-mod-check"
+    checker = str(native) if native.is_file() and os.access(native, os.X_OK) else shutil.which(
+        "mc-spine-mod-check")
+    if checker is None:
+        return "python", {}
+    try:
+        proc = subprocess.run([checker, "--scan-mods-dir", str(mods_dir), "--json"],
+                              cwd=ROOT, capture_output=True, text=True)
+        if proc.returncode not in (0, 2):
+            raise ValueError(proc.stderr.strip() or f"exit {proc.returncode}")
+        report = json.loads(proc.stdout)
+        if report.get("schema") != "mc-spine-mods-dir-scan/1":
+            raise ValueError("unexpected report schema")
+    except (OSError, ValueError) as error:
+        return f"python (native checker unavailable: {error})", {}
+    return "mc-spine-mod-check", {
+        item["jar"]: item for item in report.get("jars", [])
+        if isinstance(item, dict) and isinstance(item.get("jar"), str)
+    }
+
+
+def promote_verified_lifted_mixins(mods, scan):
+    """Accept a complete lift only when ShimCheck has no independent blockers."""
+    for mod in mods:
+        row = scan.get(mod.source.name, {})
+        if row.get("class") != "lifted_tier2" or not row.get("lifted_hooks"):
+            continue
+        if not mod.has_java_bytecode or row.get("unliftable"):
+            continue
+        blockers = [r for r in mod.rejection_reasons
+                    if "MIXIN" not in r["code"]]
+        if blockers:
+            continue
+        mod.rejection_reasons = []
+        mod.shimcheck_compatible = True
+        mod.has_unsupported_mixin_or_at = False
 
 
 def load_profiles(profiles_dir):
@@ -1349,6 +1441,13 @@ def stage_mods(plan, staging_dir, mods_dir, log):
             shutil.copytree(source, target)
         else:
             shutil.copy2(source, target)
+    # The native runtime also discovers standalone declarative bundles.
+    for bundle in plan.get("native_bundles", []):
+        source = Path(bundle["source"])
+        relative = source.relative_to(mods_dir)
+        destination = active_dir / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
     quarantined_dir = staging_dir / "quarantined_data"
     quarantine_report = []
     for assignment in plan["quarantined_mods"]:
@@ -1390,7 +1489,7 @@ def _child_env(plan, mods_dir, staging_dir, policy):
     env = dict(os.environ)
     env["MC_SPINE_LAUNCHER_PLAN"] = plan["plan"]
     env["MC_SPINE_FALLBACK_POLICY"] = policy
-    env["MC_SPINE_MODS_DIR"] = str(mods_dir)
+    env["MC_SPINE_MODS_DIR"] = str(mods_dir.resolve())
     env["MC_SPINE_STAGING_DIR"] = str(staging_dir)
     env["MC_SPINE_NEEDS_BOUNDED_JVM"] = (
         "true" if plan.get("needs_bounded_jvm") else "false")
@@ -1412,7 +1511,7 @@ def _run_command(argv, env):
 
 
 def build_report(args, plan, launch):
-    return {
+    report = {
         "schema": "mc-spine-mod-launcher/1",
         "mods_dir": str(args.mods_dir),
         "policy": args.fallback,
@@ -1431,6 +1530,10 @@ def build_report(args, plan, launch):
         "dry_run": bool(args.dry_run),
         "launch": launch,
     }
+    if plan.get("auto_adapt"):
+        report["auto_adapt"] = plan["auto_adapt"]
+        report["native_bundles"] = plan.get("native_bundles", [])
+    return report
 
 
 def _print_table(assignments):
@@ -1456,6 +1559,18 @@ def _print_human(report):
     if report["saved_world_namespaces"]:
         print(f"saved ns    : {','.join(report['saved_world_namespaces'])}")
     _print_table(report["assignments"])
+    if "auto_adapt" in report:
+        adapted = report["auto_adapt"]
+        print(f"auto-adapt  : {adapted['checker']}")
+        for bundle in report["native_bundles"]:
+            print(f"  native bundle : {bundle['mod_id']} ({Path(bundle['source']).name})")
+        for group, label in (("native", "native data"),
+                             ("tier2_lifted", "Tier 2 lifted"),
+                             ("tier2_shim", "Tier 2 shim"),
+                             ("tier3_fallback", "Tier 3 fallback"),
+                             ("skipped_perf", "auto-skipped perf")):
+            for item in adapted[group]:
+                print(f"  {label}: {item}")
     plan = report["plan"]
     if plan == "RunNative":
         suffix = ""
@@ -2164,6 +2279,8 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--mods-dir", type=Path,
                       help="directory of mod .jar/.zip files and datapack dirs")
+    mode.add_argument("--adapt-mods-dir", type=Path,
+                      help="mods directory to auto-adapt at server startup")
     mode.add_argument("--modpack", type=Path,
                       help="modpack to pre-flight instead: a .mrpack/.zip "
                            "archive or a standalone modrinth.index.json / "
@@ -2204,16 +2321,23 @@ def main():
                         help="quarantine staging directory (default: target/tmp/mod-launcher-staging)")
     parser.add_argument("--dry-run", action="store_true",
                         help="compute and print the plan without launching anything")
+    parser.add_argument("--auto-adapt", action="store_true",
+                        help="scan mods for native bundles and automatic Tier 2 mixin lifting")
     parser.add_argument("--json", action="store_true", help="emit deterministic JSON report")
     args = parser.parse_args()
+    if args.adapt_mods_dir is not None:
+        args.mods_dir = args.adapt_mods_dir
+        args.auto_adapt = True
 
     def log(message):
         print(message, file=sys.stderr if args.json else sys.stdout)
 
     try:
         if args.modpack is not None:
+            if args.auto_adapt:
+                raise LauncherError("--auto-adapt requires a mods directory")
             return run_modpack_preflight(args)
-        mods = discover_mods(args.mods_dir)
+        mods = discover_mods(args.mods_dir, auto_adapt=args.auto_adapt)
         profile_ids, warnings = load_profiles(args.profiles_dir)
         for warning in warnings:
             log(f"profiles: {warning}")
@@ -2227,6 +2351,9 @@ def main():
                 f"invalid --mc-version '{args.mc_version}' "
                 "(expected a numeric release like 1.21.1)")
 
+        bundles = discover_native_bundles(args.mods_dir, target) if args.auto_adapt else []
+        checker, scan = run_auto_adapt_scan(args.mods_dir) if args.auto_adapt else (None, {})
+
         # Superseded perf mods are skipped before ShimCheck: scanning them
         # would only surface the heavy Mixins we intentionally ignore.
         bytecode_jars = [m.source for m in mods
@@ -2234,6 +2361,8 @@ def main():
                          and not is_builtin_superseded(m)]
         reports = run_shimcheck(bytecode_jars, args)
         apply_shimcheck(mods, reports)
+        if args.auto_adapt:
+            promote_verified_lifted_mixins(mods, scan)
 
         plan = plan_startup(
             mods, flagship_ids, set(profile_ids), saved, args.fallback,
@@ -2248,6 +2377,26 @@ def main():
                     ", ".join(plan["superseded_perf_mods"])))
         plan["dimension_mods"] = [
             m.dimension_report() for m in mods if m.is_dimension_mod]
+        if args.auto_adapt:
+            plan["native_bundles"] = bundles
+            groups = {"native": [], "tier2_lifted": [], "tier2_shim": [],
+                      "tier3_fallback": [], "skipped_perf": []}
+            for assignment in plan["assignments"]:
+                if assignment.tier == TIER_SUPERSEDED:
+                    groups["skipped_perf"].append(assignment.mod_id)
+                elif assignment.tier in (0, 1):
+                    groups["native"].append(assignment.mod_id)
+                elif assignment.tier == 2:
+                    row = scan.get(Path(assignment.source).name, {})
+                    group = ("tier2_lifted" if row.get("class") == "lifted_tier2"
+                             and row.get("lifted_hooks") and not row.get("unliftable")
+                             else "tier2_shim")
+                    groups[group].append(assignment.mod_id)
+                else:
+                    groups["tier3_fallback"].append(assignment.mod_id)
+            plan["auto_adapt"] = {"checker": checker, **groups,
+                                  "jars": [scan.get(m.source.name, {}) for m in mods
+                                           if m.source.suffix.lower() == ".jar"]}
 
         launch = {"kind": None, "command": [], "executed": False,
                   "exit_code": None, "dry_run": bool(args.dry_run)}

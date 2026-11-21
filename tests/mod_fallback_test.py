@@ -807,6 +807,76 @@ class LauncherIntegrationTests(unittest.TestCase):
             report = json.loads(proc.stdout)
         return proc, report
 
+    def test_auto_adapt_discovers_bundles_and_skips_perf_mod(self):
+        _jar(self.mods / "sodium-0.6.jar", "sodium")
+        adapted = self.mods / "adapted"
+        adapted.mkdir()
+        for path, mod_id in ((self.mods / "first.bundle.json", "first:mod"),
+                             (adapted / "second.bundle.json", "second:mod")):
+            path.write_text(json.dumps({
+                "schema": "mc-spine-mod-bundle/1", "mod_id": mod_id,
+                "mc_version_range": "[1.21.1,1.21.1]",
+                "portals": [], "progression_barriers": [],
+                "biome_regions": [], "creatures": [],
+                "custom_channels": [mod_id.replace(":mod", ":sync")],
+            }), encoding="utf-8")
+        marker = self.tmp / "auto.json"
+        proc, report = self.invoke("--auto-adapt", "--mc-spine-cmd",
+                                   self.cmd(marker), "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["plan"], "RunNative")
+        self.assertEqual([b["mod_id"] for b in report["native_bundles"]],
+                         ["first:mod", "second:mod"])
+        self.assertEqual(report["auto_adapt"]["skipped_perf"], ["sodium"])
+        self.assertFalse(any(a["mod_id"] == "adapted" for a in report["assignments"]))
+        self.assertEqual(json.loads(marker.read_text())["mods_dir"],
+                         str(self.mods.resolve()))
+        self.assertFalse((self.staging / "mods").exists())
+
+        proc, _ = self.invoke("--auto-adapt", "--dry-run")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("native bundle : first:mod", proc.stdout)
+        self.assertIn("auto-skipped perf: sodium", proc.stdout)
+
+    def test_adapt_mods_dir_alias_and_tier_summary(self):
+        safe = self.mods / "safe.jar"
+        unsafe = self.mods / "unsafe.jar"
+        _jar(safe, "safe")
+        _jar(unsafe, "unsafe")
+        shim = self.write_shim(
+            (safe, "COMPATIBLE", []),
+            (unsafe, "REJECTED", [("UNSUPPORTED_SYMBOL", "u.M#broken", "unknown")]),
+        )
+        command = [sys.executable, str(TOOL), "--adapt-mods-dir", str(self.mods),
+                   "--shimcheck-json", str(shim), "--dry-run", "--json"]
+        proc = subprocess.run(command, cwd=ROOT, env=self.env,
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report["auto_adapt"]["tier2_lifted"], [])
+        self.assertEqual(report["auto_adapt"]["tier2_shim"], ["safe"])
+        self.assertEqual(report["auto_adapt"]["tier3_fallback"], ["unsafe"])
+        self.assertEqual(report["plan"], "DelegateToNeoForge")
+
+    def test_auto_adapt_rejects_invalid_native_bundle(self):
+        (self.mods / "invalid.bundle.json").write_text(json.dumps({
+            "schema": "mc-spine-mod-bundle/1", "mod_id": "invalid:mod",
+            "mc_version_range": "[1.20.1,1.20.1]",
+        }), encoding="utf-8")
+        proc, _ = self.invoke("--auto-adapt", "--dry-run", "--json")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("incompatible native bundle", proc.stderr)
+
+    def test_auto_adapt_rejects_missing_required_bundle_sections(self):
+        (self.mods / "incomplete.bundle.json").write_text(json.dumps({
+            "schema": "mc-spine-mod-bundle/1", "mod_id": "missing:sections",
+            "mc_version_range": "[1.21.1,1.21.1]",
+            "custom_channels": [],
+        }), encoding="utf-8")
+        proc, _ = self.invoke("--auto-adapt", "--dry-run", "--json")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("portals must be an array", proc.stderr)
+
     def test_native_fast_path_never_starts_neoforge(self):
         """create flagship + pure-data pack + mekanism profile => all Tier 0/1.
 
