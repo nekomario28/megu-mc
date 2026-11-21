@@ -26,11 +26,17 @@
 //!   `banned-ips.json`.
 //! * [`usercache`] — `usercache.json`: a bounded `uuid` <-> `name` most
 //!   recently used cache.
+//! * [`claims`] — a clean-room OpenPAC/FTB-Chunks-style engine: chunk claims
+//!   with per-owner sub-claims and quotas, parties/allies, force-loading
+//!   budgets, the `/oclaims`/`/oparties`/`/opac`/`/opm` command dispatcher, a
+//!   monotonic sync-delta feed for claims overlays, and atomic
+//!   `openpac_claims.json`/`openpac_parties.json` persistence.
 //! * [`directory`] — [`directory::ServerDirectory`], the facade that owns the
 //!   whole set: `load_or_init`, Vanilla-precedence `admit_login` and
 //!   `save_all_atomic`, pinned to a [`mc_spine_core::version::TargetVersion`].
 
 pub mod atomic;
+pub mod claims;
 pub mod directory;
 pub mod eula;
 pub mod json;
@@ -39,6 +45,11 @@ pub mod properties;
 pub mod usercache;
 
 pub use atomic::write_atomic;
+pub use claims::{
+    exec_openpac_command, ClaimAction, ClaimChunkKey, ClaimDecision, ClaimOwner,
+    ClaimProtectionConfig, ClaimsError, ClaimsSyncDelta, ClaimsWorld, ChunkClaim, DenyReason,
+    Party, PartyRank, SubClaimId, CLAIMS_FILE, PARTIES_FILE,
+};
 pub use directory::{AdmissionDecision, ServerDirectory};
 pub use eula::{check_eula, write_default_eula, EulaStatus, EULA_FILE, EULA_LINK};
 pub use json::{Json, JsonError};
