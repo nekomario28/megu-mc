@@ -46,13 +46,28 @@
 //!   front end that runs `level.dat`-style documents through the
 //!   [`datafix::DataFixer`]. The `26.3` -> `1.21.1` direction exists only
 //!   behind an explicit `allow_downgrade` opt-in.
+//! * [`anvil_inspect`] — the pure-`std` vanilla Anvil inspector: an RFC
+//!   1952/1951 gzip reader, a strict binary NBT <-> [`datafix::DataValue`]
+//!   bridge (depth cap 64, size cap 32 MiB), `r.*.*.mca` region-header
+//!   scanning, and [`anvil_inspect::inspect_anvil_world_dir`] which reads
+//!   `level.dat` (gzip or raw), classifies the save's `DataVersion` against
+//!   the two pinned targets, and counts populated chunks across
+//!   `region/`, `DIM-1/region/` and `DIM1/region/`.
 
+pub mod anvil_inspect;
 pub mod datafix;
 pub mod migrate;
 pub mod region_tick;
 pub mod sharded;
 pub mod snapshot;
 
+pub use anvil_inspect::{
+    decode_nbt_to_data_value, encode_data_value_to_nbt, gzip_decompress, gzip_encode_stored,
+    inspect_anvil_world_dir, inspect_level_dat, inspect_mca_header, AnvilCompatibility,
+    AnvilDimensionReport, AnvilInspectError, AnvilRegionFileReport, AnvilWorldReport,
+    LevelDatCompression, LevelDatSummary, McaChunkInfo, McaCompression, McaRegionSummary,
+    MCA_HEADER_BYTES, MCA_SECTOR_BYTES, MCA_SLOT_COUNT, NBT_DEPTH_CAP, NBT_SIZE_CAP,
+};
 pub use datafix::{DataFixError, DataFixReport, DataFixStep, DataFixer, DataValue, DV_1_21_1, DV_26_3};
 pub use migrate::{
     inspect_snapshot, migrate_json_document, migrate_snapshot, parse_data_json, to_data_json,

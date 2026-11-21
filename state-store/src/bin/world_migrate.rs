@@ -8,8 +8,8 @@
 
 use mc_spine_core::version::TargetVersion;
 use mc_spine_state_store::{
-    inspect_snapshot, migrate_json_document, migrate_snapshot, to_data_json, write_file_atomic,
-    DataValue, MigrationError, SnapshotSummary,
+    inspect_anvil_world_dir, inspect_snapshot, migrate_json_document, migrate_snapshot,
+    to_data_json, write_file_atomic, DataValue, MigrationError, SnapshotSummary,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,6 +21,7 @@ between Minecraft 1.21.1 (DataVersion 3955) and 26.3 (DataVersion 5023)
 
 USAGE:
     mc-spine-world-migrate inspect <file.stv1> [--json]
+    mc-spine-world-migrate inspect-anvil <world_dir> [--json]
     mc-spine-world-migrate migrate --in <in.stv1> --out <out.stv1> --to <1.21.1|26.3> [--allow-downgrade] [--json]
     mc-spine-world-migrate migrate-json --in <in.json> --out <out.json> --to <1.21.1|26.3> [--allow-downgrade] [--json]
     mc-spine-world-migrate --help
@@ -29,6 +30,12 @@ COMMANDS:
     inspect        Validate an STV1 snapshot file and print what it carries:
                    the Minecraft/protocol/DataVersion it was saved under and
                    its dimension, chunk, block-override and block-entity counts.
+    inspect-anvil  Inspect a vanilla Anvil world directory: reads level.dat
+                   (gzip or raw) for the level name, saved-by version, seed
+                   and data packs, classifies the world against the two
+                   supported releases, and scans the region/, DIM-1/region/
+                   and DIM1/region/ directories for region files, populated
+                   chunks and compression methods.
     migrate        Re-seal an STV1 snapshot for another Minecraft version.
                    The output is written atomically and is verified decodable
                    before it is reported.
@@ -80,6 +87,10 @@ enum Command {
     Help,
     Inspect {
         path: PathBuf,
+        json: bool,
+    },
+    InspectAnvil {
+        dir: PathBuf,
         json: bool,
     },
     Migrate {
@@ -190,6 +201,28 @@ fn parse_args(args: &[String]) -> Result<Command, CliError> {
             }
             Ok(Command::Inspect {
                 path: path.ok_or_else(|| usage("inspect needs a file to read"))?,
+                json,
+            })
+        }
+        "inspect-anvil" => {
+            let mut dir = None;
+            let mut json = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    other if other.starts_with('-') => {
+                        return Err(usage(format!("inspect-anvil: unknown option {other:?}")))
+                    }
+                    _ => {
+                        if dir.is_some() {
+                            return Err(usage("inspect-anvil takes exactly one world directory"));
+                        }
+                        dir = Some(PathBuf::from(arg));
+                    }
+                }
+            }
+            Ok(Command::InspectAnvil {
+                dir: dir.ok_or_else(|| usage("inspect-anvil needs a world directory"))?,
                 json,
             })
         }
@@ -314,6 +347,17 @@ fn cmd_inspect(path: &Path, json: bool) -> Result<(), CliError> {
         println!("{}", to_data_json(&summary_value(path, &summary)));
     } else {
         print_summary(path, &summary);
+    }
+    Ok(())
+}
+
+fn cmd_inspect_anvil(dir: &Path, json: bool) -> Result<(), CliError> {
+    let report = inspect_anvil_world_dir(dir)
+        .map_err(|e| fail(format!("{}: {e}", dir.display())))?;
+    if json {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", report.to_human());
     }
     Ok(())
 }
@@ -463,6 +507,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         Command::Inspect { path, json } => cmd_inspect(&path, json),
+        Command::InspectAnvil { dir, json } => cmd_inspect_anvil(&dir, json),
         Command::Migrate {
             input,
             output,

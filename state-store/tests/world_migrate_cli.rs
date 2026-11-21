@@ -5,8 +5,8 @@
 
 use mc_spine_core::version::TargetVersion;
 use mc_spine_state_store::{
-    decode_snapshot, encode_snapshot, parse_data_json, BlockCoord, ChunkCoord, DataValue,
-    ServerContext,
+    decode_snapshot, encode_data_value_to_nbt, encode_snapshot, gzip_encode_stored,
+    parse_data_json, BlockCoord, ChunkCoord, DataValue, ServerContext,
 };
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -349,6 +349,209 @@ fn migrate_json_upgrade_downgrade_and_reports() {
         doc.as_map().unwrap()["DataVersion"],
         DataValue::Int(3955)
     );
+}
+
+// ---------------------------------------------------------- inspect-anvil
+
+fn dv_map(pairs: Vec<(&str, DataValue)>) -> DataValue {
+    DataValue::Map(
+        pairs
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    )
+}
+
+/// The smallest `level.dat` document that still looks like a real save.
+fn level_dat_nbt(data_version: i64, level_name: &str, seed: i64) -> Vec<u8> {
+    encode_data_value_to_nbt(
+        "",
+        &dv_map(vec![(
+            "Data",
+            dv_map(vec![
+                ("DataVersion", DataValue::Int(data_version)),
+                ("LevelName", DataValue::Str(level_name.to_string())),
+                ("RandomSeed", DataValue::Int(seed)),
+                (
+                    "Version",
+                    dv_map(vec![
+                        ("Id", DataValue::Int(data_version)),
+                        (
+                            "Name",
+                            DataValue::Str(if data_version == 3955 {
+                                "1.21.1"
+                            } else {
+                                "26.3"
+                            }
+                            .to_string()),
+                        ),
+                    ]),
+                ),
+                (
+                    "DataPacks",
+                    dv_map(vec![(
+                        "Enabled",
+                        DataValue::List(vec![DataValue::Str("vanilla".to_string())]),
+                    )]),
+                ),
+            ]),
+        )]),
+    )
+    .unwrap()
+}
+
+/// A region file with one populated chunk per (slot, compression) pair.
+fn mca_bytes(chunks: &[(usize, u8)]) -> Vec<u8> {
+    let mut bytes = vec![0u8; 8192];
+    for (i, &(slot, compression)) in chunks.iter().enumerate() {
+        let offset = 2 + i as u32; // one sector per chunk, packed from 2
+        let sectors = 1u8;
+        bytes[slot * 4] = ((offset >> 16) & 0xff) as u8;
+        bytes[slot * 4 + 1] = ((offset >> 8) & 0xff) as u8;
+        bytes[slot * 4 + 2] = (offset & 0xff) as u8;
+        bytes[slot * 4 + 3] = sectors;
+        let start = offset as usize * 4096;
+        let end = start + sectors as usize * 4096;
+        bytes.resize(bytes.len().max(end), 0);
+        bytes[start..start + 4].copy_from_slice(&20u32.to_be_bytes());
+        bytes[start + 4] = compression;
+    }
+    bytes
+}
+
+/// A synthetic Anvil world: gzip `level.dat` at `data_version`, populated
+/// chunks in all three dimension region dirs.
+fn anvil_world(dir: &TestDir, data_version: i64) -> PathBuf {
+    let world = dir.path("world");
+    std::fs::create_dir_all(&world).unwrap();
+    std::fs::write(
+        world.join("level.dat"),
+        gzip_encode_stored(&level_dat_nbt(data_version, "CLI World", 99)),
+    )
+    .unwrap();
+    for (rel, file, chunks) in [
+        ("region", "r.0.0.mca", &[(0usize, 2u8), (5, 1)][..]),
+        ("region", "r.-1.2.mca", &[(1usize, 1u8)][..]),
+        ("DIM-1/region", "r.0.0.mca", &[(0usize, 2u8)][..]),
+        ("DIM1/region", "r.0.0.mca", &[(0usize, 3u8), (9, 4)][..]),
+    ] {
+        let rdir = world.join(rel);
+        std::fs::create_dir_all(&rdir).unwrap();
+        std::fs::write(rdir.join(file), mca_bytes(chunks)).unwrap();
+    }
+    world
+}
+
+#[test]
+fn inspect_anvil_text_and_json() {
+    let dir = TestDir::new("anvil");
+    let world = anvil_world(&dir, 3955);
+    let world_str = world.to_str().unwrap().to_string();
+
+    let out = run(&["inspect-anvil", &world_str]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("minecraft 1.21.1"), "{text}");
+    assert!(text.contains("\"CLI World\""), "{text}");
+    assert!(text.contains("data version 3955"), "{text}");
+    assert!(text.contains("seed 99"), "{text}");
+    assert!(text.contains("4 region file(s), 6 populated chunk(s)"), "{text}");
+    assert!(text.contains("nether"), "{text}");
+
+    let out = run(&["inspect-anvil", &world_str, "--json"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = parse_data_json(&stdout(&out)).unwrap();
+    let m = doc.as_map().unwrap();
+    assert_eq!(m["data_version"], DataValue::Int(3955));
+    assert_eq!(m["detected_target"], DataValue::Str("1.21.1".to_string()));
+    assert_eq!(m["compatibility"], DataValue::Str("supported".to_string()));
+    assert_eq!(m["level_name"], DataValue::Str("CLI World".to_string()));
+    assert_eq!(m["populated_chunks"], DataValue::Int(6));
+    assert_eq!(m["region_file_count"], DataValue::Int(4));
+    let dims = match &m["dimensions"] {
+        DataValue::List(v) => v.clone(),
+        _ => panic!("dimensions must be a list"),
+    };
+    assert_eq!(dims.len(), 3);
+    assert_eq!(
+        dims[0].as_map().unwrap()["dimension"],
+        DataValue::Str("overworld".to_string())
+    );
+    assert_eq!(dims[0].as_map().unwrap()["populated_chunks"], DataValue::Int(3));
+    assert_eq!(dims[2].as_map().unwrap()["populated_chunks"], DataValue::Int(2));
+    let ld = m["level_dat"].as_map().unwrap();
+    assert_eq!(ld["compression"], DataValue::Str("gzip".to_string()));
+    assert_eq!(ld["random_seed"], DataValue::Int(99));
+}
+
+#[test]
+fn inspect_anvil_raw_level_dat_and_unsupported_version() {
+    let dir = TestDir::new("anvil-raw");
+    let world = dir.path("world");
+    std::fs::create_dir_all(world.join("region")).unwrap();
+    // Raw (uncompressed) NBT level.dat at 26.3's DataVersion.
+    std::fs::write(
+        world.join("level.dat"),
+        level_dat_nbt(5023, "Raw World", -7),
+    )
+    .unwrap();
+    std::fs::write(world.join("region/r.0.0.mca"), mca_bytes(&[(0, 2)])).unwrap();
+
+    let out = run(&["inspect-anvil", world.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("minecraft 26.3"), "{text}");
+    assert!(text.contains("uncompressed data"), "{text}");
+
+    // A DataVersion between the targets still inspects fine — the world is
+    // valid, it is just not a version this build serves.
+    let world2 = anvil_world(&dir, 4500);
+    let out = run(&["inspect-anvil", world2.to_str().unwrap(), "--json"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = parse_data_json(&stdout(&out)).unwrap();
+    let m = doc.as_map().unwrap();
+    assert_eq!(
+        m["compatibility"],
+        DataValue::Str("between_targets".to_string())
+    );
+    assert_eq!(m["detected_target"], DataValue::Null);
+}
+
+#[test]
+fn inspect_anvil_fail_closed_and_arg_errors() {
+    let dir = TestDir::new("anvil-bad");
+
+    // Missing directory / missing level.dat / corrupt level.dat all exit 1.
+    let out = run(&["inspect-anvil", dir.path("nope").to_str().unwrap()]);
+    assert_eq!(code(&out), 1);
+
+    let world = dir.path("world");
+    std::fs::create_dir_all(&world).unwrap();
+    let out = run(&["inspect-anvil", world.to_str().unwrap()]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    assert!(stderr(&out).contains("level.dat"), "{}", stderr(&out));
+
+    std::fs::write(world.join("level.dat"), b"definitely not nbt").unwrap();
+    let out = run(&["inspect-anvil", world.to_str().unwrap()]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+
+    // Truncated .mca inside an otherwise valid world still exits 1.
+    let world = anvil_world(&dir, 3955);
+    std::fs::write(world.join("region/r.9.9.mca"), vec![0u8; 512]).unwrap();
+    let out = run(&["inspect-anvil", world.to_str().unwrap()]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    assert!(stderr(&out).contains("r.9.9.mca"), "{}", stderr(&out));
+
+    // Bad command lines exit 2.
+    for args in [
+        &["inspect-anvil"][..],
+        &["inspect-anvil", "a", "b"][..],
+        &["inspect-anvil", "a", "--wat"][..],
+        &["inspect-anvil", "--json"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(code(&out), 2, "{args:?} -> {}", stdout(&out));
+    }
 }
 
 #[test]
