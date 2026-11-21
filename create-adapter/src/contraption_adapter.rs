@@ -29,6 +29,8 @@ pub enum ContraptionError {
     TooLarge { count: usize, limit: usize },
     Cluster(ClusterError),
     InvalidPose,
+    /// A world coordinate or local offset fell outside `i32` range.
+    CoordinateOverflow,
     CorruptSnapshot(String),
 }
 
@@ -104,7 +106,12 @@ impl LiveContraption {
                 });
             }
             let state_id = attached_blocks[&pos];
-            let local = [pos[0] - anchor[0], pos[1] - anchor[1], pos[2] - anchor[2]];
+            let mut local = [0_i32; 3];
+            for axis in 0..3 {
+                local[axis] = pos[axis]
+                    .checked_sub(anchor[axis])
+                    .ok_or(ContraptionError::CoordinateOverflow)?;
+            }
             local_cells.push((local, state_id));
             world_removals.push(WorldBlockEdit {
                 pos: DimBlockPos::new(dim, pos[0], pos[1], pos[2]),
@@ -120,7 +127,16 @@ impl LiveContraption {
                 [0, 0, -1],
             ];
             for d in DIRS {
-                let n = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+                // A neighbour past the i32 edge cannot be a map key; skip it
+                // instead of panicking on `pos + d` overflow.
+                let (Some(nx), Some(ny), Some(nz)) = (
+                    pos[0].checked_add(d[0]),
+                    pos[1].checked_add(d[1]),
+                    pos[2].checked_add(d[2]),
+                ) else {
+                    continue;
+                };
+                let n = [nx, ny, nz];
                 if attached_blocks.contains_key(&n) && visited.insert(n) {
                     queue.push_back(n);
                 }
@@ -221,7 +237,15 @@ impl LiveContraption {
                     _ => unreachable!(),
                 };
                 WorldBlockEdit {
-                    pos: DimBlockPos::new(self.dim, base_x + rx, base_y + ly, base_z + rz),
+                    // `base_*` saturates at the i32 edge after `as i32` on a
+                    // huge translation; clamp the final sum too so a long
+                    // Linear run cannot panic on `base + r` overflow.
+                    pos: DimBlockPos::new(
+                        self.dim,
+                        base_x.saturating_add(rx),
+                        base_y.saturating_add(ly),
+                        base_z.saturating_add(rz),
+                    ),
                     state_id: Some(state_id),
                 }
             })
@@ -357,5 +381,79 @@ mod tests {
         let restored = LiveContraption::restore(&snap, &reg).unwrap();
         assert_eq!(restored.block_count(), 3);
         assert!((restored.yaw_deg - 90.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn assembly_at_i32_edges_fails_closed_or_skips() {
+        let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
+        let shaft = reg.default_state("create:shaft").unwrap();
+
+        // Seed at the +X edge: the +X neighbour overflows i32 and must be
+        // skipped, not panic; local coords still resolve.
+        let mut world = BTreeMap::new();
+        world.insert([i32::MAX, 64, 10], shaft);
+        world.insert([i32::MAX - 1, 64, 10], shaft);
+        let (c, _) = LiveContraption::assemble_from_world(
+            1,
+            0,
+            [i32::MAX, 64, 10],
+            [i32::MAX, 64, 10],
+            &world,
+            ContraptionKind::Linear {
+                velocity_per_tick: [0.0; 3],
+            },
+            DEFAULT_MAX_CONTRAPTION_BLOCKS,
+        )
+        .unwrap();
+        assert_eq!(c.block_count(), 2);
+
+        // Anchor on the opposite edge makes `pos - anchor` overflow i32;
+        // the assembly must report CoordinateOverflow, not panic.
+        let mut world = BTreeMap::new();
+        world.insert([i32::MAX, 64, 10], shaft);
+        let err = match LiveContraption::assemble_from_world(
+            2,
+            0,
+            [i32::MIN, 64, 10],
+            [i32::MAX, 64, 10],
+            &world,
+            ContraptionKind::Linear {
+                velocity_per_tick: [0.0; 3],
+            },
+            DEFAULT_MAX_CONTRAPTION_BLOCKS,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected CoordinateOverflow"),
+        };
+        assert_eq!(err, ContraptionError::CoordinateOverflow);
+    }
+
+    #[test]
+    fn disassemble_saturates_after_huge_translation() {
+        let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
+        let shaft = reg.default_state("create:shaft").unwrap();
+        let mut world = BTreeMap::new();
+        world.insert([10, 64, 10], shaft);
+        world.insert([11, 64, 10], shaft);
+        let (mut c, _) = LiveContraption::assemble_from_world(
+            3,
+            0,
+            [10, 64, 10],
+            [10, 64, 10],
+            &world,
+            ContraptionKind::Linear {
+                velocity_per_tick: [1.0e300; 3],
+            },
+            DEFAULT_MAX_CONTRAPTION_BLOCKS,
+        )
+        .unwrap();
+        // Drive the translation far past the i32 range, then disassemble:
+        // `round() as i32` saturates and the final `base + r` must not panic.
+        c.translation = [1.0e300, -1.0e300, 1.0e300];
+        let edits = c.disassemble_to_world();
+        assert_eq!(edits.len(), 2);
+        // Saturated to the i32 edges rather than wrapping or panicking.
+        assert!(edits.iter().all(|e| e.pos.x == i32::MAX));
+        assert!(edits.iter().all(|e| e.pos.y == i32::MIN));
     }
 }

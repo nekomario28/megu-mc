@@ -22,7 +22,11 @@
 //!   the 65 536-entry `sin`/`cos` table, `floor_div`/`floor_mod` grid
 //!   arithmetic, `clamp`, the `lerp` family, `smoothstep`, `wrap_degrees` and
 //!   `get_seed`.
+//! * [`crash_report`] — [`crash_report::CrashContext`]: deterministic
+//!   `MEGU-E-XXXXXXXX` fingerprints and privacy-redacted bilingual blame
+//!   reports for operator-facing crash triage.
 
+pub mod crash_report;
 pub mod id;
 pub mod math;
 pub mod random;

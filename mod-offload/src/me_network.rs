@@ -428,9 +428,17 @@ impl StorageCell {
     }
 
     /// Bytes committed: `types * bytes_per_type + ceil(items / 8)`.
+    /// Saturating: `bytes_per_type` and stored counts are caller-controlled,
+    /// so plain arithmetic could overflow and wrap the budget either way.
     pub fn used_bytes(&self) -> u64 {
-        let items: u64 = self.contents.values().copied().sum();
-        self.contents.len() as u64 * self.bytes_per_type + items.div_ceil(ITEMS_PER_BYTE)
+        let items = self
+            .contents
+            .values()
+            .copied()
+            .fold(0_u64, u64::saturating_add);
+        (self.contents.len() as u64)
+            .saturating_mul(self.bytes_per_type)
+            .saturating_add(items.div_ceil(ITEMS_PER_BYTE))
     }
 
     pub fn free_bytes(&self) -> u64 {
@@ -448,7 +456,8 @@ impl StorageCell {
             }
             (free - self.bytes_per_type).saturating_mul(ITEMS_PER_BYTE)
         } else {
-            (held.div_ceil(ITEMS_PER_BYTE) + free)
+            held.div_ceil(ITEMS_PER_BYTE)
+                .saturating_add(free)
                 .saturating_mul(ITEMS_PER_BYTE)
                 .saturating_sub(held)
         }
@@ -496,7 +505,7 @@ impl MeStorageIndex {
         self.cells
             .values()
             .map(|cell| cell.contents.get(item_id).copied().unwrap_or(0))
-            .sum()
+            .fold(0_u64, u64::saturating_add)
     }
 
     pub fn total_items(&self) -> u64 {
@@ -504,7 +513,7 @@ impl MeStorageIndex {
             .values()
             .flat_map(|cell| cell.contents.values())
             .copied()
-            .sum()
+            .fold(0_u64, u64::saturating_add)
     }
 
     /// Insert up to `count` items, walking cells by descending priority; ties
@@ -533,7 +542,15 @@ impl MeStorageIndex {
             let cell = self.cells.get_mut(&id).unwrap();
             let accepted = remaining.min(cell.insert_capacity(item_id));
             if accepted > 0 {
-                *cell.contents.entry(item_id.to_string()).or_default() += accepted;
+                *cell
+                    .contents
+                    .entry(item_id.to_string())
+                    .or_default() = cell
+                    .contents
+                    .get(item_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(accepted);
                 remaining -= accepted;
             }
         }
@@ -609,7 +626,7 @@ impl MeStorageIndex {
             .items
             .iter()
             .map(|(item, count)| count - self.insert(item, *count))
-            .sum()
+            .fold(0_u64, u64::saturating_add)
     }
 }
 
@@ -697,7 +714,12 @@ impl CraftingPlan {
         balance
             .into_iter()
             .filter(|(_, amount)| *amount > 0)
-            .map(|(item, amount)| (item, amount as u64))
+            .map(|(item, amount)| {
+                (
+                    item,
+                    u64::try_from(amount).unwrap_or(u64::MAX),
+                )
+            })
             .collect()
     }
 }
@@ -736,7 +758,12 @@ impl PlanContext<'_> {
         let stored = self.storage.available(item).saturating_sub(drawn);
         let taken = need.min(stored);
         if taken > 0 {
-            *self.consumed.entry(item.to_string()).or_default() += taken;
+            *self.consumed.entry(item.to_string()).or_default() = self
+                .consumed
+                .get(item)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(taken);
             need -= taken;
             if need == 0 {
                 return Ok(());
@@ -758,7 +785,15 @@ impl PlanContext<'_> {
             .iter()
             .find(|pattern| pattern.outputs.iter().any(|(out, _)| out == item))
         else {
-            *self.missing.entry(item.to_string()).or_default() += need;
+            *self
+                .missing
+                .entry(item.to_string())
+                .or_default() = self
+                .missing
+                .get(item)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(need);
             return Ok(());
         };
         let per_run: u64 = pattern
@@ -766,9 +801,17 @@ impl PlanContext<'_> {
             .iter()
             .filter(|(out, _)| out == item)
             .map(|(_, count)| *count)
-            .sum();
+            .fold(0_u64, u64::saturating_add);
         if per_run == 0 {
-            *self.missing.entry(item.to_string()).or_default() += need;
+            *self
+                .missing
+                .entry(item.to_string())
+                .or_default() = self
+                .missing
+                .get(item)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(need);
             return Ok(());
         }
         let runs = need.div_ceil(per_run);
@@ -889,10 +932,18 @@ impl MeCraftingPlanner {
         for (item, count) in outbound {
             let accepted = storage.insert(&item, count);
             if accepted > 0 {
-                *committed_outputs.entry(item.clone()).or_default() += accepted;
+                *committed_outputs.entry(item.clone()).or_default() = committed_outputs
+                    .get(&item)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(accepted);
             }
             if accepted < count {
-                *uncommitted_outputs.entry(item).or_default() += count - accepted;
+                *uncommitted_outputs.entry(item).or_default() = uncommitted_outputs
+                    .get(&item)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(count - accepted);
             }
         }
         Ok(ExecutionReport {
@@ -944,6 +995,33 @@ mod tests {
         }
         assert_eq!(index.insert("u", 16), 8);
         assert_eq!(index.insert("t64", 1), 0);
+    }
+
+    #[test]
+    fn storage_accounting_saturates_instead_of_overflowing() {
+        // `bytes_per_type` and stored counts are caller-controlled u64s; the
+        // budget math must saturate, never wrap or panic.
+        let mut c = StorageCell::new(1, 0, u64::MAX, 63, u64::MAX);
+        c.contents.insert("huge".into(), u64::MAX);
+        assert_eq!(c.used_bytes(), u64::MAX);
+        assert_eq!(c.free_bytes(), 0);
+        assert_eq!(c.insert_capacity("huge"), 0);
+
+        let mut index = MeStorageIndex::new();
+        index.add_cell(c).unwrap();
+        let mut other = StorageCell::new(2, 0, u64::MAX, 63, 8);
+        other.contents.insert("huge".into(), u64::MAX);
+        index.add_cell(other).unwrap();
+        // Two saturated cells must not wrap `available` back to a small
+        // number that a reserve_batch could then "satisfy".
+        assert_eq!(index.available("huge"), u64::MAX);
+        assert_eq!(index.total_items(), u64::MAX);
+        // Insert into a saturated cell accepts nothing and does not panic.
+        assert_eq!(index.insert("huge", 1), 0);
+        // A fresh type on the less-saturated cell accepts up to u64::MAX
+        // without the stored count wrapping.
+        assert_eq!(index.insert("new", u64::MAX), u64::MAX);
+        assert_eq!(index.cell(2).unwrap().contents["new"], u64::MAX);
     }
 
     #[test]

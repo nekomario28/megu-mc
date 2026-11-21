@@ -19,6 +19,17 @@ pub const MAX_STRING_CHARS: usize = 32_767;
 /// vanilla packet, including chunk columns).
 pub const MAX_FRAME_LENGTH: usize = 16 * 1024 * 1024;
 
+/// The vanilla-compatible per-frame cap: 2 MiB (`2_097_152` bytes), the
+/// bound a stock client/server applies to a single packet frame. Offered as
+/// the conservative [`PacketCapPolicy`] for deployments that want vanilla
+/// semantics without touching the crate-wide [`MAX_FRAME_LENGTH`] default.
+pub const VANILLA_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+/// Hard ceiling for [`PacketCapPolicy`]: 32 MiB. Sized for giant modded
+/// recipe/NBT payloads while still failing closed on absurd declarations —
+/// a policy can never widen the accepted frame beyond this.
+pub const MAX_EXTENDED_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
 /// Bound on anonymous-NBT payload size where a raw span is decoded
 /// (configuration registry entries, components). Matches the client reader.
 const MAX_NBT_BYTES: usize = 2 * 1024 * 1024;
@@ -754,6 +765,68 @@ pub fn read_frame_bounded(frame: &[u8], max_length: usize) -> Result<(i32, &[u8]
     Ok((id, r.rest()))
 }
 
+/// Per-connection frame-size policy for [`read_frame_with_policy`].
+///
+/// The cap is opt-in: [`PacketCapPolicy::vanilla`] keeps the stock 2 MiB
+/// bound, [`PacketCapPolicy::extended`] admits frames up to
+/// [`MAX_EXTENDED_FRAME_BYTES`] for modded recipe/NBT traffic, and
+/// [`PacketCapPolicy::try_new`] accepts any value in `1..=32 MiB`,
+/// refusing `0` and anything larger fail-closed. Existing callers of
+/// [`read_frame`] are unaffected — they keep [`MAX_FRAME_LENGTH`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketCapPolicy {
+    max_frame_bytes: usize,
+}
+
+impl PacketCapPolicy {
+    /// The vanilla 2 MiB frame bound.
+    pub fn vanilla() -> Self {
+        Self {
+            max_frame_bytes: VANILLA_FRAME_BYTES,
+        }
+    }
+
+    /// The maximum configurable bound, 32 MiB, for giant modded packets.
+    pub fn extended() -> Self {
+        Self {
+            max_frame_bytes: MAX_EXTENDED_FRAME_BYTES,
+        }
+    }
+
+    /// A policy with an explicit bound. `0` and values above
+    /// [`MAX_EXTENDED_FRAME_BYTES`] are refused — a zero cap would reject
+    /// every frame and an over-large one would defeat the allocation guard.
+    pub fn try_new(max_frame_bytes: usize) -> Result<Self, ProtoError> {
+        if max_frame_bytes == 0 || max_frame_bytes > MAX_EXTENDED_FRAME_BYTES {
+            return Err(ProtoError::LengthOutOfBounds {
+                length: max_frame_bytes,
+                max: MAX_EXTENDED_FRAME_BYTES,
+            });
+        }
+        Ok(Self { max_frame_bytes })
+    }
+
+    /// The declared-length bound this policy enforces.
+    pub fn max_frame_bytes(&self) -> usize {
+        self.max_frame_bytes
+    }
+}
+
+impl Default for PacketCapPolicy {
+    fn default() -> Self {
+        Self::vanilla()
+    }
+}
+
+/// [`read_frame`] under an explicit [`PacketCapPolicy`]: the declared frame
+/// length must fit `policy.max_frame_bytes()` and match the buffer exactly.
+pub fn read_frame_with_policy(
+    frame: &[u8],
+    policy: PacketCapPolicy,
+) -> Result<(i32, &[u8]), ProtoError> {
+    read_frame_bounded(frame, policy.max_frame_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +993,45 @@ mod tests {
             read_frame(&lying),
             Err(ProtoError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn packet_cap_policy_bounds_and_validation() {
+        assert_eq!(PacketCapPolicy::vanilla().max_frame_bytes(), 2_097_152);
+        assert_eq!(
+            PacketCapPolicy::extended().max_frame_bytes(),
+            MAX_EXTENDED_FRAME_BYTES
+        );
+        assert_eq!(PacketCapPolicy::default(), PacketCapPolicy::vanilla());
+        // 0 and anything above 32 MiB fail closed.
+        assert!(PacketCapPolicy::try_new(0).is_err());
+        assert!(PacketCapPolicy::try_new(MAX_EXTENDED_FRAME_BYTES + 1).is_err());
+        assert!(PacketCapPolicy::try_new(MAX_EXTENDED_FRAME_BYTES).is_ok());
+        assert!(PacketCapPolicy::try_new(1).is_ok());
+
+        // Declared len = id varint (1) + payload. A payload of
+        // VANILLA_FRAME_BYTES - 1 declares exactly the vanilla cap.
+        let payload = vec![0u8; VANILLA_FRAME_BYTES - 1];
+        let mut frame = Vec::new();
+        write_frame(&mut frame, 0x26, &payload);
+        let (id, body) = read_frame_with_policy(&frame, PacketCapPolicy::vanilla()).unwrap();
+        assert_eq!((id, body.len()), (0x26, payload.len()));
+
+        // One byte over the vanilla cap is rejected by vanilla() ...
+        let mut big = Vec::new();
+        write_frame(&mut big, 0x26, &vec![0u8; VANILLA_FRAME_BYTES]);
+        assert!(matches!(
+            read_frame_with_policy(&big, PacketCapPolicy::vanilla()),
+            Err(ProtoError::FrameTooLarge { .. } | ProtoError::LengthOutOfBounds { .. })
+        ));
+        // ... but extended() admits it, and the crate default is unaffected.
+        let (id, body) = read_frame_with_policy(&big, PacketCapPolicy::extended()).unwrap();
+        assert_eq!((id, body.len()), (0x26, VANILLA_FRAME_BYTES));
+        assert!(read_frame(&big).is_ok());
+        // A declaration beyond even the extended cap still fails closed.
+        let mut huge = Vec::new();
+        write_frame(&mut huge, 0x26, &vec![0u8; MAX_EXTENDED_FRAME_BYTES]);
+        assert!(read_frame_with_policy(&huge, PacketCapPolicy::extended()).is_err());
     }
 
     #[test]
