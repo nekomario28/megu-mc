@@ -82,7 +82,7 @@ ratchet "ignored tests (parked gates)" '#\[ignore' 1 \
 # Count only direct Mutex/RwLock guard unwrap calls, excluding comment lines and
 # other unwraps such as thread attachment. The initial ceiling is the live count.
 ratchet "lock/rwlock unwraps (no new poison cascades)" \
-  '\.(lock|read|write)\(\)\.unwrap\(\)' 2560 \
+  '\.(lock|read|write)\(\)\.unwrap\(\)' 2167 \
   "New poison-sensitive lock unwraps must not grow without an explicit review." noncomment
 
 echo
