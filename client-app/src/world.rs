@@ -2,7 +2,7 @@
 //! Live Protocol 767 world cache, block-state classification, `client-port`
 //! greedy meshing + vertex packing + translucent sorting, and collision lookup.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -10,9 +10,10 @@ use mc_spine_client_mesh::ffi::{
     mc_spine_client_mesh_pack_vertices, mc_spine_client_mesh_sort_translucent, PackedVertex, ABI_OK,
 };
 use mc_spine_client_mesh::{
-    section_index, Block, Light, MeshCache, MissingNeighbor, Quad, Section, SectionCoord,
-    ALL_FACES, CUTOUT, FLUID_TINTED, LAVA, LIGHT_BYTES, NO_FLUID, OPAQUE, SAME_STATE_CULL,
-    SECTION_CELLS, TINTED, TRANSLUCENT, WATER,
+    section_index, Block, DirectionBuckets, FaceVisibility, Light, MeshCache, MissingNeighbor,
+    Quad, RenderRegions, Section, SectionCoord, SectionGraph, ALL_FACES, CUTOUT, FLUID_TINTED,
+    LAVA, LIGHT_BYTES, NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT,
+    WATER,
 };
 use mc_spine_kernel::{
     Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdate, PalettedSection,
@@ -950,6 +951,14 @@ impl MeshMetrics {
     }
 }
 
+/// S1 graph node for one loaded section: the 6x6 `FaceVisibility` reachability
+/// matrix plus whether the section can emit geometry for `GraphCuller`.
+#[derive(Clone, Copy, Debug)]
+struct SectionVisibility {
+    faces: FaceVisibility,
+    renderable: bool,
+}
+
 pub struct WorldState {
     pub dimension: DimensionMeta,
     pub blocks: BlockTable,
@@ -965,6 +974,13 @@ pub struct WorldState {
     packed_meshes: HashMap<SectionCoord, Vec<PackedVertex>>,
     translucent_orders: HashMap<SectionCoord, Vec<u32>>,
     quad_counts: HashMap<SectionCoord, usize>,
+    /// S1 per-section 6x6 face-to-face visibility graph (including uniform-air
+    /// sections) plus the renderable flag fed to `GraphCuller`.
+    visibility: HashMap<SectionCoord, SectionVisibility>,
+    /// S3 per-section direction-bucket ranges over the grouped packed mesh.
+    direction_buckets: HashMap<SectionCoord, DirectionBuckets>,
+    /// S4 shared 8x4x8-section arena producing batched MultiDraw submissions.
+    render_regions: RenderRegions,
     pub chunks_decoded: u64,
     pub chunks_unloaded: u64,
     pub light_updates: u64,
@@ -1040,6 +1056,9 @@ impl WorldState {
             packed_meshes: HashMap::new(),
             translucent_orders: HashMap::new(),
             quad_counts: HashMap::new(),
+            visibility: HashMap::new(),
+            direction_buckets: HashMap::new(),
+            render_regions: RenderRegions::default(),
             chunks_decoded: 0,
             chunks_unloaded: 0,
             light_updates: 0,
@@ -1057,6 +1076,9 @@ impl WorldState {
         self.packed_meshes.clear();
         self.translucent_orders.clear();
         self.quad_counts.clear();
+        self.visibility.clear();
+        self.direction_buckets.clear();
+        self.render_regions = RenderRegions::default();
         self.recompute_live_totals();
     }
 
@@ -1107,9 +1129,11 @@ impl WorldState {
             let coord = SectionCoord(decoded.cx, min_sy + idx as i32, decoded.cz);
             if stored.has_non_air {
                 let mesh_sec = stored.to_mesh_section(&self.blocks);
+                self.set_section_visibility(coord, FaceVisibility::compute(&mesh_sec.blocks), true);
                 self.mesh_cache.insert(coord, mesh_sec);
             } else {
                 self.remove_section_mesh(coord);
+                self.set_section_visibility(coord, FaceVisibility::uniform_air(), false);
             }
             stored_sections.push(stored);
         }
@@ -1375,14 +1399,22 @@ impl WorldState {
             if !sec.has_non_air {
                 sec.has_non_air = true;
                 let mesh_sec = sec.to_mesh_section(&self.blocks);
+                self.set_section_visibility(coord, FaceVisibility::compute(&mesh_sec.blocks), true);
                 self.mesh_cache.insert(coord, mesh_sec);
-            } else {
-                self.mesh_cache
-                    .set_cell(coord, [lx, ly, lz], mesh_block, light);
+            } else if self
+                .mesh_cache
+                .set_cell(coord, [lx, ly, lz], mesh_block, light)
+            {
+                let mesh_sec = sec.to_mesh_section(&self.blocks);
+                self.set_section_visibility(coord, FaceVisibility::compute(&mesh_sec.blocks), true);
             }
-        } else if sec.has_non_air {
-            self.mesh_cache
-                .set_cell(coord, [lx, ly, lz], mesh_block, light);
+        } else if sec.has_non_air
+            && self
+                .mesh_cache
+                .set_cell(coord, [lx, ly, lz], mesh_block, light)
+        {
+            let mesh_sec = sec.to_mesh_section(&self.blocks);
+            self.set_section_visibility(coord, FaceVisibility::compute(&mesh_sec.blocks), true);
         }
         self.apply_local_light_edit(x, y, z, clamped);
         Ok(())
@@ -1404,60 +1436,153 @@ impl WorldState {
         self.packed_meshes.remove(&coord);
         self.translucent_orders.remove(&coord);
         self.quad_counts.remove(&coord);
+        self.direction_buckets.remove(&coord);
+        self.visibility.remove(&coord);
+        self.render_regions.remove(coord);
+    }
+
+    /// Record the S1 visibility graph node for one loaded section.
+    /// `renderable` mirrors `StoredSection::has_non_air`: the section can emit
+    /// geometry toward `GraphCuller`'s `visible` set.
+    fn set_section_visibility(
+        &mut self,
+        coord: SectionCoord,
+        faces: FaceVisibility,
+        renderable: bool,
+    ) {
+        self.visibility
+            .insert(coord, SectionVisibility { faces, renderable });
     }
 
     /// Run a bounded greedy-meshing pass on dirty sections, then pack vertices
     /// (16 bytes/vertex, 4 vertices/quad) and sort translucent quads back-to-front.
+    /// Ordering falls back to pure camera distance; see
+    /// [`rebuild_dirty_bounded_ordered`](Self::rebuild_dirty_bounded_ordered).
     pub fn rebuild_dirty_bounded(
         &mut self,
         limit: usize,
         camera: [f32; 3],
     ) -> Result<usize, String> {
-        if limit == 0 || self.mesh_cache.pending() == 0 {
-            return Ok(0);
+        self.rebuild_dirty_bounded_ordered(limit, camera, &[])
+    }
+
+    /// Same as [`rebuild_dirty_bounded`](Self::rebuild_dirty_bounded) but the
+    /// dirty queue is drained in `MeshCache::rebuild_dirty_ordered` order:
+    /// sections inside the camera frustum first, then nearest to farthest.
+    /// `planes` are the six view planes in `box_in_frustum` form
+    /// (`dot(n, p) + d >= 0` inside); an empty slice degrades to pure distance
+    /// ordering. Afterwards a threshold-gated `MeshCache::resort_translucent`
+    /// re-derives renderer artifacts only for sections whose translucent quad
+    /// order actually changed — no full re-sort while the camera stays inside
+    /// `MeshCache::resort_threshold` of the last sort origin.
+    pub fn rebuild_dirty_bounded_ordered(
+        &mut self,
+        limit: usize,
+        camera: [f32; 3],
+        planes: &[[f32; 4]],
+    ) -> Result<usize, String> {
+        let mut refresh: BTreeSet<SectionCoord> = BTreeSet::new();
+        let mut rebuilt_count = 0usize;
+        if limit != 0 && self.mesh_cache.pending() != 0 {
+            let t_mesh = Instant::now();
+            let rebuilt = self.mesh_cache.rebuild_dirty_ordered(limit, camera, planes);
+            let mesh_us = t_mesh.elapsed().as_micros() as u64;
+            self.metrics.total_mesh_us += mesh_us;
+            rebuilt_count = rebuilt.len();
+            self.metrics.sections_rebuilt += rebuilt_count as u64;
+            refresh.extend(rebuilt);
         }
-        let t_mesh = Instant::now();
-        let rebuilt = self.mesh_cache.rebuild_dirty(limit);
-        let mesh_us = t_mesh.elapsed().as_micros() as u64;
-        self.metrics.total_mesh_us += mesh_us;
-        self.metrics.sections_rebuilt += rebuilt.len() as u64;
 
-        for &coord in &rebuilt {
-            let quads = self.mesh_cache.mesh(coord).unwrap_or(&[]);
-            self.quad_counts.insert(coord, quads.len());
+        // S5: incremental translucent re-sort, gated on camera displacement.
+        // Under the resort threshold this returns an empty list and costs only
+        // the distance check; dirty sections are skipped inside the cache.
+        let t_sort = Instant::now();
+        let resorted = self.mesh_cache.resort_translucent(camera);
+        self.metrics.total_sort_us += t_sort.elapsed().as_micros() as u64;
+        refresh.extend(resorted);
 
-            let t_pack = Instant::now();
-            let packed = pack_vertices(quads)
-                .map_err(|code| format!("pack_vertices failed with ABI code {code}"))?;
-            self.metrics.total_pack_us += t_pack.elapsed().as_micros() as u64;
-            debug_assert_eq!(packed.len(), quads.len() * 4);
-            self.packed_meshes.insert(coord, packed);
-
-            let local_cam = [
-                camera[0] - (coord.0 * 16) as f32,
-                camera[1] - (coord.1 * 16) as f32,
-                camera[2] - (coord.2 * 16) as f32,
-            ];
-            let t_sort = Instant::now();
-            let order = sort_translucent(quads, local_cam)
-                .map_err(|code| format!("sort_translucent failed with ABI code {code}"))?;
-            self.metrics.total_sort_us += t_sort.elapsed().as_micros() as u64;
-            self.translucent_orders.insert(coord, order);
+        for coord in refresh {
+            self.derive_section_artifacts(coord, camera)?;
         }
 
         self.recompute_live_totals();
-        Ok(rebuilt.len())
+        Ok(rebuilt_count)
+    }
+
+    /// Refresh every renderer-facing artifact for one clean meshed section:
+    /// S3 direction-bucket ranges over the grouped quad order, the packed
+    /// 16-byte vertices, the S4 shared-arena region upload and the S5
+    /// translucent sort order. Idempotent.
+    fn derive_section_artifacts(
+        &mut self,
+        coord: SectionCoord,
+        camera: [f32; 3],
+    ) -> Result<(), String> {
+        let (grouped, buckets) = {
+            let quads = self.mesh_cache.mesh(coord).unwrap_or(&[]);
+            DirectionBuckets::group(quads)
+        };
+        self.quad_counts.insert(coord, grouped.len());
+        self.direction_buckets.insert(coord, buckets);
+        self.render_regions.upload(coord, &grouped);
+
+        let t_pack = Instant::now();
+        let packed = pack_vertices(&grouped)
+            .map_err(|code| format!("pack_vertices failed with ABI code {code}"))?;
+        self.metrics.total_pack_us += t_pack.elapsed().as_micros() as u64;
+        debug_assert_eq!(packed.len(), grouped.len() * 4);
+        self.packed_meshes.insert(coord, packed);
+
+        let local_cam = [
+            camera[0] - (coord.0 * 16) as f32,
+            camera[1] - (coord.1 * 16) as f32,
+            camera[2] - (coord.2 * 16) as f32,
+        ];
+        let t_sort = Instant::now();
+        let order = sort_translucent(&grouped, local_cam)
+            .map_err(|code| format!("sort_translucent failed with ABI code {code}"))?;
+        self.metrics.total_sort_us += t_sort.elapsed().as_micros() as u64;
+        self.translucent_orders.insert(coord, order);
+        Ok(())
+    }
+
+    /// S1 graph nodes for `GraphCuller::search`: every loaded section —
+    /// including uniform-air sections, which propagate sight but are never
+    /// renderable — with its 6x6 face-reachability mask and renderable flag.
+    pub fn section_graphs(&self) -> impl Iterator<Item = (SectionCoord, SectionGraph)> + '_ {
+        self.visibility.iter().map(|(&coord, &entry)| {
+            (
+                coord,
+                SectionGraph {
+                    through: entry.faces.bits(),
+                    renderable: entry.renderable,
+                },
+            )
+        })
+    }
+
+    /// S3 direction-bucket ranges for one section, in grouped packed-vertex
+    /// order. `None` until the section's first rebuild.
+    pub fn direction_buckets(&self, coord: SectionCoord) -> Option<DirectionBuckets> {
+        self.direction_buckets.get(&coord).copied()
+    }
+
+    /// S4 shared render-region arena for MultiDraw command batching.
+    pub fn render_regions(&self) -> &RenderRegions {
+        &self.render_regions
     }
 
     /// Iterate rebuilt sections as `(coord, packed 16-byte vertices)` for the
-    /// software rasterizer. Four vertices per quad, corner order preserved.
+    /// software rasterizer. Four vertices per quad, corner order preserved,
+    /// quads in S3 direction-bucket grouped order.
     pub fn packed_meshes(&self) -> impl Iterator<Item = (SectionCoord, &[PackedVertex])> {
         self.packed_meshes
             .iter()
             .map(|(coord, verts)| (*coord, verts.as_slice()))
     }
 
-    /// `sort_translucent` quad indices for one section, back-to-front.
+    /// `sort_translucent` quad indices for one section, back-to-front over the
+    /// grouped packed-vertex order.
     pub fn translucent_order(&self, coord: SectionCoord) -> Option<&[u32]> {
         self.translucent_orders.get(&coord).map(Vec::as_slice)
     }

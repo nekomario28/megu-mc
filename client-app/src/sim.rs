@@ -321,6 +321,11 @@ pub struct SessionSummary {
     pub render_ms: f64,
     pub triangles_drawn: u64,
     pub pixels_shaded: u64,
+    pub drawn_sections: u64,
+    pub culled_sections: u64,
+    pub region_draw_calls: u64,
+    pub buckets_drawn: u64,
+    pub buckets_culled: u64,
 }
 
 impl SessionSummary {
@@ -372,7 +377,12 @@ impl SessionSummary {
                 "\"packets_tx\":{},",
                 "\"render_ms\":{:.3},",
                 "\"triangles_drawn\":{},",
-                "\"pixels_shaded\":{}",
+                "\"pixels_shaded\":{},",
+                "\"drawn_sections\":{},",
+                "\"culled_sections\":{},",
+                "\"region_draw_calls\":{},",
+                "\"buckets_drawn\":{},",
+                "\"buckets_culled\":{}",
                 "}}"
             ),
             escape_json(&self.username),
@@ -416,6 +426,11 @@ impl SessionSummary {
             self.render_ms,
             self.triangles_drawn,
             self.pixels_shaded,
+            self.drawn_sections,
+            self.culled_sections,
+            self.region_draw_calls,
+            self.buckets_drawn,
+            self.buckets_culled,
         )
     }
 
@@ -428,6 +443,7 @@ impl SessionSummary {
                 "  world:         chunks_decoded={} loaded={} unloaded={} batches={} light_updates={} block_updates={} local_light={}\n",
                 "  meshing:       sections_rebuilt={} quads={} packed_vertices={} translucent={} avg={:.1} us/section (block_json={})\n",
                 "  render:        {:.2} ms, {} triangles, {} px shaded\n",
+                "  culling:       sections drawn={} culled={} | region_draw_calls={} | buckets drawn={} culled={}\n",
                 "  prediction:    script={} ticks={} pos=({:.3}, {:.3}, {:.3}) on_ground={} teleports={} corrections_0x40={} max_drift={:.6}\n",
                 "  network:       health={:.1} food={} keep_alives={} rx={} tx={}"
             ),
@@ -454,6 +470,11 @@ impl SessionSummary {
             self.render_ms,
             self.triangles_drawn,
             self.pixels_shaded,
+            self.drawn_sections,
+            self.culled_sections,
+            self.region_draw_calls,
+            self.buckets_drawn,
+            self.buckets_culled,
             self.script.as_str(),
             self.ticks_executed,
             self.final_pos[0],
@@ -628,6 +649,22 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
     // window is ready, so a healthy server never waits this long.
     let sync_deadline = Instant::now() + Duration::from_secs(120);
 
+    // Frustum planes for dirty-section rebuild prioritization (in-frustum and
+    // near-camera sections mesh first). Aspect follows the configured frame.
+    let render_aspect = f64::from(cfg.render_width) / f64::from(cfg.render_height.max(1));
+    let player_planes = |runner: &SessionRunner| {
+        let cam = runner.player.camera();
+        (
+            cam,
+            crate::render::frustum_planes(
+                cam,
+                runner.player.yaw,
+                runner.player.pitch,
+                render_aspect,
+            ),
+        )
+    };
+
     // Phase 1: Receive JoinGame + initial spawn Teleport + initial chunk window.
     while Instant::now() < sync_deadline {
         let ready = runner.play_ok
@@ -641,8 +678,10 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
             break;
         }
         runner.poll_once(Duration::from_millis(50))?;
-        let cam = runner.player.camera();
-        runner.world.rebuild_dirty_bounded(16, cam)?;
+        let (cam, planes) = player_planes(&runner);
+        runner
+            .world
+            .rebuild_dirty_bounded_ordered(16, cam, &planes)?;
     }
 
     if !runner.play_ok || !runner.initial_spawn_done {
@@ -679,8 +718,10 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
             )?;
         }
 
-        let cam = runner.player.camera();
-        runner.world.rebuild_dirty_bounded(16, cam)?;
+        let (cam, planes) = player_planes(&runner);
+        runner
+            .world
+            .rebuild_dirty_bounded_ordered(16, cam, &planes)?;
 
         while let Some(rem) = tick_period.checked_sub(tick_start.elapsed()) {
             if rem.is_zero() {
@@ -701,14 +742,21 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         }
     }
     while runner.world.pending_mesh_sections() > 0 {
-        let cam = runner.player.camera();
-        runner.world.rebuild_dirty_bounded(64, cam)?;
+        let (cam, planes) = player_planes(&runner);
+        runner
+            .world
+            .rebuild_dirty_bounded_ordered(64, cam, &planes)?;
     }
 
     // Optional software-rasterized PNG frame from the final camera pose.
     let mut render_ms = 0.0;
     let mut triangles_drawn = 0u64;
     let mut pixels_shaded = 0u64;
+    let mut drawn_sections = 0u64;
+    let mut culled_sections = 0u64;
+    let mut region_draw_calls = 0u64;
+    let mut buckets_drawn = 0u64;
+    let mut buckets_culled = 0u64;
     if let Some(ref png_path) = cfg.render_png {
         let cam = runner.player.camera();
         let eye = [f64::from(cam[0]), f64::from(cam[1]), f64::from(cam[2])];
@@ -724,6 +772,11 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         render_ms = frame.stats.render_ms;
         triangles_drawn = frame.stats.triangles_drawn;
         pixels_shaded = frame.stats.pixels_shaded;
+        drawn_sections = frame.stats.drawn_sections;
+        culled_sections = frame.stats.culled_sections;
+        region_draw_calls = frame.stats.region_draw_calls;
+        buckets_drawn = frame.stats.buckets_drawn;
+        buckets_culled = frame.stats.buckets_culled;
     }
 
     Ok(SessionSummary {
@@ -766,5 +819,10 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         render_ms,
         triangles_drawn,
         pixels_shaded,
+        drawn_sections,
+        culled_sections,
+        region_draw_calls,
+        buckets_drawn,
+        buckets_culled,
     })
 }

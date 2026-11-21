@@ -6,11 +6,15 @@
 //! camera, shades with face normal + AO + sky/block light and a deterministic
 //! block-ID color palette, then alpha-blends translucent quads back-to-front.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
 use mc_spine_client_mesh::ffi::PackedVertex;
-use mc_spine_client_mesh::SectionCoord;
+use mc_spine_client_mesh::{
+    box_facing_mask, bucket_draw_mask, GraphCuller, RenderRegions, SectionCoord, DIRECTION_BUCKETS,
+    DIRECTION_BUCKET_UNASSIGNED,
+};
 
 use crate::protocol::zlib_compress_stored;
 use crate::world::WorldState;
@@ -40,6 +44,19 @@ pub struct RenderStats {
     pub render_ms: f64,
     pub triangles_drawn: u64,
     pub pixels_shaded: u64,
+    /// S2: renderable sections the `GraphCuller` BFS reached and that had
+    /// packed geometry submitted to the rasterizer.
+    pub drawn_sections: u64,
+    /// S2: renderable sections rejected by frustum or occlusion culling.
+    pub culled_sections: u64,
+    /// S4: batched MultiDraw submissions for the regions holding drawn
+    /// sections (one `MultiDrawCommand` per region x facing bucket).
+    pub region_draw_calls: u64,
+    /// S3: non-empty direction buckets submitted across drawn sections.
+    pub buckets_drawn: u64,
+    /// S3: non-empty direction buckets skipped as backfacing across drawn
+    /// sections.
+    pub buckets_culled: u64,
 }
 
 /// A rendered RGB frame ready for PNG encoding.
@@ -341,6 +358,92 @@ fn translucent_alpha(v: &CamVertex) -> f32 {
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// Camera basis for `yaw`/`pitch` (degrees, server convention): forward into
+/// the screen, right = forward x up, up = right x forward.
+fn camera_basis(yaw: f32, pitch: f32) -> ([f64; 3], [f64; 3], [f64; 3]) {
+    let yaw = f64::from(yaw).to_radians();
+    let pitch = f64::from(pitch).to_radians();
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let fwd = [-sy * cp, -sp, cy * cp];
+    let right = [-fwd[2], 0.0, fwd[0]];
+    let right_len = (right[0] * right[0] + right[2] * right[2]).sqrt();
+    if right_len > 1e-9 {
+        let r = [right[0] / right_len, 0.0, right[2] / right_len];
+        let u = [
+            r[1] * fwd[2] - r[2] * fwd[1],
+            r[2] * fwd[0] - r[0] * fwd[2],
+            r[0] * fwd[1] - r[1] * fwd[0],
+        ];
+        (fwd, r, u)
+    } else {
+        // Looking straight up/down: fall back to a stable right vector.
+        (fwd, [1.0, 0.0, 0.0], [0.0, 0.0, -1.0])
+    }
+}
+
+/// The six world-space frustum planes of a camera pose, in
+/// `mc_spine_client_mesh::box_in_frustum` form (`dot(n, p) + d >= 0` inside).
+/// `aspect` is render width / height. Used by the S2 `GraphCuller` walk and to
+/// prioritize `MeshCache::rebuild_dirty_ordered`.
+pub fn frustum_planes(camera: [f32; 3], yaw: f32, pitch: f32, aspect: f64) -> [[f32; 4]; 6] {
+    let eye = [
+        f64::from(camera[0]),
+        f64::from(camera[1]),
+        f64::from(camera[2]),
+    ];
+    let (fwd, right, up) = camera_basis(yaw, pitch);
+    let tan_v = (FOV_DEG.to_radians() * 0.5).tan();
+    let tan_h = tan_v * aspect;
+    // Side planes pass through the eye: a camera-space point (x, y, z) is
+    // inside when |x| <= z*tan_h and |y| <= z*tan_v.
+    let through_eye = |n: [f64; 3]| -> [f32; 4] {
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        let (nx, ny, nz) = (n[0] / len, n[1] / len, n[2] / len);
+        [
+            nx as f32,
+            ny as f32,
+            nz as f32,
+            (-(nx * eye[0] + ny * eye[1] + nz * eye[2])) as f32,
+        ]
+    };
+    let d_fwd = fwd[0] * eye[0] + fwd[1] * eye[1] + fwd[2] * eye[2];
+    [
+        through_eye([
+            right[0] + fwd[0] * tan_h,
+            right[1] + fwd[1] * tan_h,
+            right[2] + fwd[2] * tan_h,
+        ]),
+        through_eye([
+            fwd[0] * tan_h - right[0],
+            fwd[1] * tan_h - right[1],
+            fwd[2] * tan_h - right[2],
+        ]),
+        through_eye([
+            up[0] + fwd[0] * tan_v,
+            up[1] + fwd[1] * tan_v,
+            up[2] + fwd[2] * tan_v,
+        ]),
+        through_eye([
+            fwd[0] * tan_v - up[0],
+            fwd[1] * tan_v - up[1],
+            fwd[2] * tan_v - up[2],
+        ]),
+        [
+            fwd[0] as f32,
+            fwd[1] as f32,
+            fwd[2] as f32,
+            (-d_fwd - NEAR_Z) as f32,
+        ],
+        [
+            -fwd[0] as f32,
+            -fwd[1] as f32,
+            -fwd[2] as f32,
+            (d_fwd + FAR_Z) as f32,
+        ],
+    ]
+}
+
 /// Render one camera frame of the live world to an RGB buffer.
 /// `eye` is the camera position (player pos + eye height); `yaw`/`pitch` are
 /// degrees using the server's convention (`forward = (-sin yaw·cos pitch,
@@ -359,27 +462,9 @@ pub fn render_frame(
     let started = Instant::now();
     let mut raster = Rasterizer::new(width, height);
 
-    let yaw = f64::from(yaw).to_radians();
-    let pitch = f64::from(pitch).to_radians();
-    let (sy, cy) = yaw.sin_cos();
-    let (sp, cp) = pitch.sin_cos();
-    // Camera basis: forward into the screen, right = forward × up, up = right × forward.
-    let fwd = [-sy * cp, -sp, cy * cp];
-    let right = [-fwd[2], 0.0, fwd[0]];
-    let right_len = (right[0] * right[0] + right[2] * right[2]).sqrt();
-    let (right, up) = if right_len > 1e-9 {
-        let r = [right[0] / right_len, 0.0, right[2] / right_len];
-        // up = right × forward
-        let u = [
-            r[1] * fwd[2] - r[2] * fwd[1],
-            r[2] * fwd[0] - r[0] * fwd[2],
-            r[0] * fwd[1] - r[1] * fwd[0],
-        ];
-        (r, u)
-    } else {
-        // Looking straight up/down: fall back to a stable right vector.
-        ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0])
-    };
+    let (fwd, right, up) = camera_basis(yaw, pitch);
+    let eye32 = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
+    let planes = frustum_planes(eye32, yaw, pitch, f64::from(width) / f64::from(height));
 
     // Transform world vertices into camera space.
     let to_camera = |p: [f64; 3]| -> [f64; 3] {
@@ -391,43 +476,100 @@ pub fn render_frame(
         ]
     };
 
-    // Collect translucent sections (coord + quad order) for the second pass.
-    let meshes: Vec<(SectionCoord, &[PackedVertex])> = world.packed_meshes().collect();
-    let mut translucent_sections: Vec<(f64, SectionCoord)> = Vec::new();
+    // S2: frustum x BFS graph cull over the S1 visibility graph. Only sections
+    // the walk reaches are rasterized; everything else is counted as culled.
+    let camera_section = SectionCoord(
+        (eye[0] / 16.0).floor() as i32,
+        (eye[1] / 16.0).floor() as i32,
+        (eye[2] / 16.0).floor() as i32,
+    );
+    let cull = GraphCuller::new(camera_section, &planes).search(world.section_graphs());
+    raster.stats.culled_sections = cull.culled as u64;
 
-    for &(coord, packed) in &meshes {
+    let meshes: HashMap<SectionCoord, &[PackedVertex]> = world.packed_meshes().collect();
+    // Translucent draw list: (squared camera distance, coord, bucket draw mask).
+    let mut translucent_sections: Vec<(f64, SectionCoord, u8)> = Vec::new();
+    // S4 accounting: per-region set of drawn-section slab identities
+    // (vertex_offset, index_offset) so MultiDraw submissions are only counted
+    // when they contain at least one drawn section's draw.
+    let mut drawn_slabs: HashMap<[i32; 3], HashSet<(u32, u32)>> = HashMap::new();
+
+    for &coord in &cull.visible {
+        let Some(&packed) = meshes.get(&coord) else {
+            continue;
+        };
         if packed.len() < 4 || packed.len() % 4 != 0 {
             continue;
         }
+        let Some(buckets) = world.direction_buckets(coord) else {
+            continue;
+        };
+        raster.stats.drawn_sections += 1;
+        if let Some(slab) = world
+            .render_regions()
+            .region(coord)
+            .and_then(|region| region.slab(coord))
+        {
+            drawn_slabs
+                .entry(RenderRegions::origin_of(coord))
+                .or_default()
+                .insert((slab.vertex_offset, slab.index_offset));
+        }
+
         let origin = [
             f64::from(coord.0) * 16.0,
             f64::from(coord.1) * 16.0,
             f64::from(coord.2) * 16.0,
         ];
+        // S3: keep only the direction buckets whose section side faces the
+        // camera; the unassigned bucket always draws.
+        let draw_mask = bucket_draw_mask(box_facing_mask(
+            [origin[0] as f32, origin[1] as f32, origin[2] as f32],
+            eye32,
+        ));
         let mut section_has_translucent = false;
-        for quad in packed.as_chunks::<4>().0 {
-            let mut verts = [CamVertex::default(); 4];
-            let mut any_translucent = false;
-            for (i, pv) in quad.iter().enumerate() {
-                verts[i] = decode_vertex(pv, origin);
-                any_translucent |= is_translucent_quad(&verts[i]);
-            }
-            // All four vertices of a quad share layer/fluid/diagonal.
-            if any_translucent {
-                section_has_translucent = true;
+        for bucket in 0..DIRECTION_BUCKETS {
+            let (offset, count) = (
+                buckets.offset[bucket] as usize,
+                buckets.count[bucket] as usize,
+            );
+            if count == 0 {
                 continue;
             }
-            let diagonal = verts[0].diagonal;
-            for vtx in verts.iter_mut() {
-                vtx.pos = to_camera(vtx.pos);
+            if bucket != DIRECTION_BUCKET_UNASSIGNED && draw_mask & (1 << bucket) == 0 {
+                raster.stats.buckets_culled += 1;
+                continue;
             }
-            let tris: [[usize; 3]; 2] = if diagonal {
-                [[0, 1, 3], [1, 2, 3]]
-            } else {
-                [[0, 1, 2], [0, 2, 3]]
-            };
-            for tri in tris {
-                raster.clipped_triangle(&[verts[tri[0]], verts[tri[1]], verts[tri[2]]], false, 1.0);
+            raster.stats.buckets_drawn += 1;
+            for qi in offset..offset + count {
+                let quad = &packed[qi * 4..qi * 4 + 4];
+                let mut verts = [CamVertex::default(); 4];
+                let mut any_translucent = false;
+                for (i, pv) in quad.iter().enumerate() {
+                    verts[i] = decode_vertex(pv, origin);
+                    any_translucent |= is_translucent_quad(&verts[i]);
+                }
+                // All four vertices of a quad share layer/fluid/diagonal.
+                if any_translucent {
+                    section_has_translucent = true;
+                    continue;
+                }
+                let diagonal = verts[0].diagonal;
+                for vtx in verts.iter_mut() {
+                    vtx.pos = to_camera(vtx.pos);
+                }
+                let tris: [[usize; 3]; 2] = if diagonal {
+                    [[0, 1, 3], [1, 2, 3]]
+                } else {
+                    [[0, 1, 2], [0, 2, 3]]
+                };
+                for tri in tris {
+                    raster.clipped_triangle(
+                        &[verts[tri[0]], verts[tri[1]], verts[tri[2]]],
+                        false,
+                        1.0,
+                    );
+                }
             }
         }
         if section_has_translucent {
@@ -437,14 +579,14 @@ pub fn render_frame(
                 origin[2] + 8.0 - eye[2],
             ];
             let dist2 = center[0] * center[0] + center[1] * center[1] + center[2] * center[2];
-            translucent_sections.push((dist2, coord));
+            translucent_sections.push((dist2, coord, draw_mask));
         }
     }
 
     // Translucent pass: far sections first, `sort_translucent` order within.
     translucent_sections.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    for (_, coord) in translucent_sections {
-        let Some(&(_, packed)) = meshes.iter().find(|&&(c, _)| c == coord) else {
+    for (_, coord, draw_mask) in translucent_sections {
+        let Some(&packed) = meshes.get(&coord) else {
             continue;
         };
         let origin = [
@@ -462,6 +604,12 @@ pub fn render_frame(
                 continue;
             }
             let quad = &packed[qi * 4..qi * 4 + 4];
+            // S3 bucket culling applies to translucent quads too: the packed
+            // direction attribute is the quad's direction bucket.
+            let direction = quad[0].attributes & ATTR_DIRECTION_MASK;
+            if draw_mask & (1 << direction) == 0 {
+                continue;
+            }
             let mut verts = [CamVertex::default(); 4];
             for (i, pv) in quad.iter().enumerate() {
                 verts[i] = decode_vertex(pv, origin);
@@ -487,6 +635,22 @@ pub fn render_frame(
             }
         }
     }
+
+    // S4: one MultiDraw submission per (region, facing bucket); a submission
+    // counts only when at least one of its indirect draws belongs to a section
+    // drawn this frame — culled sections never reach the GPU.
+    raster.stats.region_draw_calls = world
+        .render_regions()
+        .build_multidraw(eye32)
+        .iter()
+        .filter(|cmd| {
+            drawn_slabs.get(&cmd.region).is_some_and(|slabs| {
+                cmd.draws
+                    .iter()
+                    .any(|d| slabs.contains(&(d.base_vertex as u32, d.first_index)))
+            })
+        })
+        .count() as u64;
 
     raster.stats.render_ms = started.elapsed().as_secs_f64() * 1000.0;
     Ok(RenderedFrame {
@@ -549,4 +713,160 @@ pub fn encode_png_rgb(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&png_chunk(b"IDAT", &idat));
     out.extend_from_slice(&png_chunk(b"IEND", &[]));
     out
+}
+
+// ---------------------------------------------------------------------------
+// Tests: S2 graph culling, S3 bucket culling, S4 region batching
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mc_spine_client_mesh::SECTION_CELLS;
+
+    use crate::protocol::{DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta};
+    use crate::world::{BlockTable, WorldState};
+
+    fn test_dimension() -> DimensionMeta {
+        DimensionMeta {
+            name: "minecraft:overworld".to_string(),
+            min_y: 0,
+            height: 64,
+            has_skylight: true,
+        }
+    }
+
+    fn uniform_section(state: u32) -> DecodedSection {
+        DecodedSection {
+            non_air: if state == 0 { 0 } else { SECTION_CELLS as i16 },
+            states: Box::new([state; SECTION_CELLS]),
+            biomes: [0; 64],
+        }
+    }
+
+    fn chunk(cx: i32, cz: i32, sections: Vec<DecodedSection>) -> DecodedChunk {
+        DecodedChunk {
+            cx,
+            cz,
+            sections,
+            light: DecodedLightData {
+                sky_mask: Vec::new(),
+                block_mask: Vec::new(),
+                empty_sky_mask: Vec::new(),
+                empty_block_mask: Vec::new(),
+                sky_arrays: Vec::new(),
+                block_arrays: Vec::new(),
+            },
+        }
+    }
+
+    /// 4x4-chunk terrain: a solid floor layer (y sections 0-1) carved by a
+    /// 2x2-section cave pocket at y=1, under open air (y=2-3). Camera sits in
+    /// the cave; the sealed underground sections must be occlusion-culled.
+    fn cave_world() -> WorldState {
+        let mut world = WorldState::new(test_dimension(), BlockTable::builtin());
+        for cx in 0..4 {
+            for cz in 0..4 {
+                let in_cave = (1..=2).contains(&cx) && (1..=2).contains(&cz);
+                let sections = vec![
+                    uniform_section(1),
+                    uniform_section(if in_cave { 0 } else { 1 }),
+                    uniform_section(0),
+                    uniform_section(0),
+                ];
+                world.apply_chunk(chunk(cx, cz, sections)).unwrap();
+            }
+        }
+        world
+    }
+
+    #[test]
+    fn graph_culler_culls_occluded_underground_sections() {
+        let mut world = cave_world();
+        let eye = [32.0, 24.0, 32.0];
+        let cam32 = [32.0, 24.0, 32.0];
+        let planes = frustum_planes(cam32, 0.0, 55.0, 16.0 / 9.0);
+        world
+            .rebuild_dirty_bounded_ordered(usize::MAX, cam32, &planes)
+            .unwrap();
+
+        let frame = render_frame(&world, eye, 0.0, 55.0, 160, 90).unwrap();
+        assert!(frame.stats.drawn_sections > 0, "no sections drawn");
+        // 12 of the 16 sealed floor sections are fully buried (4 form the
+        // cave floor and are drawn); the frustum may cull even more.
+        assert!(
+            frame.stats.culled_sections >= 12,
+            "expected >= 12 occluded underground sections, got {}",
+            frame.stats.culled_sections
+        );
+        assert!(frame.stats.triangles_drawn > 0);
+        // All drawn sections share one 8x4x8 region; MultiDraw submissions
+        // never exceed the per-section call count they replace.
+        assert!(frame.stats.region_draw_calls > 0);
+        assert!(frame.stats.region_draw_calls <= frame.stats.drawn_sections);
+    }
+
+    #[test]
+    fn backfacing_direction_buckets_are_skipped() {
+        // One floating stone section surrounded by air emits all six axis
+        // buckets; the camera below-north sees only Down + North.
+        let mut world = WorldState::new(test_dimension(), BlockTable::builtin());
+        let mut sections = vec![uniform_section(0); 4];
+        sections[2] = uniform_section(1);
+        world.apply_chunk(chunk(0, 0, sections)).unwrap();
+        let eye = [8.0, 24.0, -16.0];
+        let cam32 = [8.0, 24.0, -16.0];
+        let planes = frustum_planes(cam32, 0.0, 0.0, 16.0 / 9.0);
+        world
+            .rebuild_dirty_bounded_ordered(usize::MAX, cam32, &planes)
+            .unwrap();
+
+        let frame = render_frame(&world, eye, 0.0, 0.0, 160, 90).unwrap();
+        assert_eq!(frame.stats.drawn_sections, 1);
+        // Facing = Down|North -> 2 buckets drawn, 4 backfacing culled.
+        assert_eq!(frame.stats.buckets_drawn, 2);
+        assert_eq!(frame.stats.buckets_culled, 4);
+        assert!(frame.stats.region_draw_calls >= 1);
+    }
+
+    #[test]
+    fn render_regions_batch_sections_into_fewer_draw_calls() {
+        // 2x2 chunks, floor slab at y=0 under air: four drawn sections sharing
+        // the same facing bucket collapse into one MultiDraw submission.
+        let mut world = WorldState::new(test_dimension(), BlockTable::builtin());
+        for cx in 0..2 {
+            for cz in 0..2 {
+                let sections = vec![
+                    uniform_section(1),
+                    uniform_section(0),
+                    uniform_section(0),
+                    uniform_section(0),
+                ];
+                world.apply_chunk(chunk(cx, cz, sections)).unwrap();
+            }
+        }
+        let eye = [16.0, 70.0, 16.0];
+        let cam32 = [16.0, 70.0, 16.0];
+        let planes = frustum_planes(cam32, 0.0, 60.0, 16.0 / 9.0);
+        world
+            .rebuild_dirty_bounded_ordered(usize::MAX, cam32, &planes)
+            .unwrap();
+
+        let frame = render_frame(&world, eye, 0.0, 60.0, 160, 90).unwrap();
+        assert!(
+            frame.stats.drawn_sections >= 2,
+            "expected several drawn floor sections, got {}",
+            frame.stats.drawn_sections
+        );
+        assert!(
+            frame.stats.region_draw_calls < frame.stats.drawn_sections,
+            "expected batching: {} calls vs {} sections",
+            frame.stats.region_draw_calls,
+            frame.stats.drawn_sections
+        );
+        assert!(frame.stats.buckets_drawn > 0);
+        // Each floor section also emits back-facing side/bottom buckets that
+        // must be skipped while the camera is above the slab.
+        assert!(frame.stats.buckets_culled > 0);
+    }
 }
