@@ -861,3 +861,418 @@ fn enchant_rejects_invalid_levels_and_kill_removes_selected_items() {
     assert_eq!(result, "Killed 1");
     assert!(!drops().lock().unwrap().iter().any(|item| item.eid == 5251));
 }
+
+// ---------- /spreadplayers, /particle, /playsound, raw loot tables (#197) ----------
+
+fn packet_client(eid: i32, name: &str, x: f64, y: f64, z: f64) -> (Arc<Client>, std::net::TcpStream) {
+    let (mut client, receiver) = crate::effect_tests::client_pair();
+    client.eid = eid;
+    client.name = name.into();
+    *client.pos.lock().unwrap() = (x, y, z, 0.0, 0.0, true);
+    receiver
+        .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+        .unwrap();
+    (Arc::new(client), receiver)
+}
+
+fn frame_varint(r: &mut std::net::TcpStream) -> Option<(i64, usize)> {
+    let mut value = 0i64;
+    for i in 0..5 {
+        let mut b = [0u8; 1];
+        std::io::Read::read_exact(r, &mut b).ok()?;
+        value |= ((b[0] & 0x7f) as i64) << (7 * i);
+        if b[0] & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+    }
+    None
+}
+
+/// One uncompressed frame: varint length, varint packet id, payload.
+fn read_frame(r: &mut std::net::TcpStream) -> Option<(i64, Vec<u8>)> {
+    let (len, _) = frame_varint(r)?;
+    let (id, used) = frame_varint(r)?;
+    let mut payload = vec![0u8; (len as usize).checked_sub(used)?];
+    std::io::Read::read_exact(r, &mut payload).ok()?;
+    Some((id, payload))
+}
+
+fn be_f64(payload: &[u8], at: usize) -> f64 {
+    f64::from_be_bytes(payload[at..at + 8].try_into().unwrap())
+}
+
+fn be_f32(payload: &[u8], at: usize) -> f32 {
+    f32::from_be_bytes(payload[at..at + 4].try_into().unwrap())
+}
+
+fn be_i32(payload: &[u8], at: usize) -> i32 {
+    i32::from_be_bytes(payload[at..at + 4].try_into().unwrap())
+}
+
+#[test]
+fn spreadplayers_rejects_bad_arguments_and_empty_targets() {
+    let _world = world_guard();
+    let ctx = command_context(None);
+    let run = |msg| run_command_ctx(&ctx, msg, &mut None);
+    assert!(run("/spreadplayers").starts_with("usage:"));
+    assert!(run("/spreadplayers 0 0 5").starts_with("usage:"));
+    assert_eq!(run("/spreadplayers 0 0 -1 10 false @a"), "Distance is too small.");
+    assert_eq!(run("/spreadplayers 0 0 5 5 false @a"), "Max range is too small.");
+    assert_eq!(
+        run("/spreadplayers 0 0 5 10 maybe @a"),
+        "'maybe' is not true or false"
+    );
+    assert_eq!(run("/spreadplayers 0 0 5 10 under 9999 false @a"), "Invalid max height");
+    assert_eq!(run("/spreadplayers 0 0 5 10 under -100 false @a"), "Invalid max height");
+    assert!(run("/spreadplayers 0 0 5 10 under @a").starts_with("usage:"));
+    assert_eq!(run("/spreadplayers 0 0 5 10 false nobody_online"), "No entity found");
+    // `under` at the dimension floor leaves no scannable column, so the
+    // 10,000-attempt spread must fail deterministically.
+    let (a, _ra) = packet_client(8301, "spread-floor", 0.5, 16.0, 0.5);
+    clients().lock().unwrap().push(a.clone());
+    assert!(run("/spreadplayers 0 0 1 10 under -64 false spread-floor")
+        .starts_with("Could not spread"));
+    clients().lock().unwrap().retain(|c| c.eid != a.eid);
+}
+
+#[test]
+fn spreadplayers_places_players_and_mobs_deterministically() {
+    let _world = world_guard();
+    let (a, _ra) = packet_client(8311, "spread-a", 0.5, 16.0, 0.5);
+    let (b, _rb) = packet_client(8312, "spread-b", 1.5, 16.0, 0.5);
+    clients().lock().unwrap().extend([a.clone(), b.clone()]);
+    assert!(insert_live_mob(
+        name_to_etype("cow").unwrap(),
+        DimId::Overworld,
+        (2.0, 16.0, 0.5, 0.0, 0.0),
+        10.0,
+        None,
+    ));
+    let mob_eid = mobs().lock().unwrap().last().unwrap().eid;
+    // Tag the fixture mob so the selector cannot pick up mobs left behind by
+    // earlier tests in this process.
+    tags()
+        .lock()
+        .unwrap()
+        .entry(format!("e:{mob_eid}"))
+        .or_default()
+        .insert("spread_fixture".into());
+
+    let ctx = command_context(None);
+    let run = |msg| run_command_ctx(&ctx, msg, &mut None);
+    let state = world_rng::saved_state();
+    let first = run("/spreadplayers 0 0 5 20 false spread-a spread-b @e[tag=spread_fixture]");
+    let pa = *a.pos.lock().unwrap();
+    let pb = *b.pos.lock().unwrap();
+    let mob_pos = {
+        let mobs = mobs().lock().unwrap();
+        let m = mobs.iter().find(|m| m.eid == mob_eid).unwrap();
+        let p = m.pos.lock().unwrap();
+        *p
+    };
+    // Replay from the same RNG state: vanilla spread is deterministic.
+    *a.pos.lock().unwrap() = (0.5, 16.0, 0.5, 0.0, 0.0, true);
+    *b.pos.lock().unwrap() = (1.5, 16.0, 0.5, 0.0, 0.0, true);
+    {
+        let mobs = mobs().lock().unwrap();
+        let m = mobs.iter().find(|m| m.eid == mob_eid).unwrap();
+        *m.pos.lock().unwrap() = (2.0, 16.0, 0.5, 0.0, 0.0);
+    }
+    world_rng::restore(state);
+    let second = run("/spreadplayers 0 0 5 20 false spread-a spread-b @e[tag=spread_fixture]");
+    let pa2 = *a.pos.lock().unwrap();
+    let pb2 = *b.pos.lock().unwrap();
+    let mob_pos2 = {
+        let mobs = mobs().lock().unwrap();
+        let m = mobs.iter().find(|m| m.eid == mob_eid).unwrap();
+        let p = m.pos.lock().unwrap();
+        *p
+    };
+
+    clients().lock().unwrap().retain(|c| c.eid != 8311 && c.eid != 8312);
+    remove_live_mob(mob_eid);
+    tags().lock().unwrap().remove(&format!("e:{mob_eid}"));
+
+    assert!(first.starts_with("Successfully spread 3 entities"), "{first}");
+    assert_eq!(first, second);
+    assert_eq!(pa, pa2);
+    assert_eq!(pb, pb2);
+    assert_eq!(mob_pos, mob_pos2);
+    for pos in [pa, pb] {
+        assert!(pos.0 >= -20.5 && pos.0 <= 20.5, "x {}", pos.0);
+        assert!(pos.2 >= -20.5 && pos.2 <= 20.5, "z {}", pos.2);
+        // feet land on an integer surface Y inside the dimension.
+        assert!((pos.1 - pos.1.round()).abs() < 1e-9, "y {}", pos.1);
+        assert!(pos.1 >= f64::from(DimId::Overworld.min_y()), "y {}", pos.1);
+    }
+    let dx = pa.0 - pb.0;
+    let dz = pa.2 - pb.2;
+    assert!(dx * dx + dz * dz >= 3.5 * 3.5, "piles must keep spreadDistance");
+    assert!((mob_pos.1 - mob_pos.1.round()).abs() < 1e-9);
+
+    // `under` bounds the surface scan by maxHeight.
+    let (c, _rc) = packet_client(8313, "spread-under", 0.5, 16.0, 0.5);
+    clients().lock().unwrap().push(c.clone());
+    let under = run("/spreadplayers 0 0 1 10 under 100 false spread-under");
+    let pc = *c.pos.lock().unwrap();
+    clients().lock().unwrap().retain(|cl| cl.eid != c.eid);
+    assert!(under.starts_with("Successfully spread"), "{under}");
+    assert!(pc.1 <= 100.0 && pc.1 >= -64.0, "y {}", pc.1);
+}
+
+#[test]
+fn particle_validates_ids_and_encodes_viewer_scoped_packets() {
+    let _world = world_guard();
+    let (a, mut ra) = packet_client(8321, "particle-a", 0.5, 16.0, 0.5);
+    let (b, mut rb) = packet_client(8322, "particle-b", 100.0, 16.0, 0.5);
+    clients().lock().unwrap().extend([a.clone(), b.clone()]);
+    let ctx = command_context(None);
+    let run = |msg| run_command_ctx(&ctx, msg, &mut None);
+
+    assert!(run("/particle").starts_with("usage:"));
+    assert_eq!(run("/particle not_a_particle"), "Unknown particle 'not_a_particle'");
+    assert!(run("/particle flame 0 0").starts_with("usage:"));
+    assert_eq!(
+        run("/particle flame 0 0 0 0 0 0 0 -1"),
+        "Count must be a non-negative integer"
+    );
+    assert!(run("/particle flame 0 0 0 0 0 0 -0.5 1").starts_with("usage:"));
+    assert_eq!(run("/particle flame 1000 16 0.5"), "No players in range");
+
+    // Full form with force + explicit viewer: only that player is in range
+    // anyway for `normal`, but force widens it to 512 — the viewer argument
+    // is what keeps `particle-b` (100 blocks out) from receiving it.
+    let ok = run("/particle flame 0.5 16 0.5 0.1 0.2 0.3 0.5 7 force particle-a");
+    assert!(ok.starts_with("Displayed"), "{ok}");
+    let (id, payload) = read_frame(&mut ra).expect("particle packet for viewer");
+    assert_eq!(id, 0x29);
+    assert_eq!(payload[0], 1, "longDistance/force flag");
+    assert_eq!(be_f64(&payload, 1), 0.5);
+    assert_eq!(be_f64(&payload, 9), 16.0);
+    assert_eq!(be_f64(&payload, 17), 0.5);
+    assert_eq!(be_f32(&payload, 25), 0.1);
+    assert_eq!(be_f32(&payload, 29), 0.2);
+    assert_eq!(be_f32(&payload, 33), 0.3);
+    assert_eq!(be_f32(&payload, 37), 0.5);
+    assert_eq!(be_i32(&payload, 41), 7);
+    // trailing varint is the particle type id (flame = 31)
+    let mut pid = 0i64;
+    for (i, byte) in payload[45..].iter().enumerate() {
+        pid |= ((*byte & 0x7f) as i64) << (7 * i);
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    assert_eq!(pid, i64::from(particle_id("flame").unwrap()));
+    assert!(read_frame(&mut rb).is_none(), "non-viewer must not receive it");
+
+    // Simple form: one particle at the executor position, normal range.
+    let simple = run("/particle flame");
+    assert!(simple.starts_with("Displayed"), "{simple}");
+    let (id, payload) = read_frame(&mut ra).expect("simple particle packet");
+    assert_eq!(id, 0x29);
+    assert_eq!(payload[0], 0);
+    assert_eq!(be_f64(&payload, 1), ctx.x);
+    assert_eq!(be_i32(&payload, 41), 0, "simple form sends a single particle");
+    assert!(read_frame(&mut rb).is_none(), "out of normal range");
+
+    // `normal` mode uses the 32-block radius: move b to 40 blocks and give it
+    // force explicitly through a second viewer selector.
+    *b.pos.lock().unwrap() = (40.5, 16.0, 0.5, 0.0, 0.0, true);
+    let ranged = run("/particle flame 0.5 16 0.5 0 0 0 0 1 normal particle-b");
+    assert_eq!(ranged, "No players in range");
+    let forced = run("/particle flame 0.5 16 0.5 0 0 0 0 1 force particle-b");
+    assert!(forced.starts_with("Displayed"), "{forced}");
+    let (id, payload) = read_frame(&mut rb).expect("force reaches 40 blocks");
+    assert_eq!(id, 0x29);
+    assert_eq!(payload[0], 1);
+    assert_eq!(be_i32(&payload, 41), 1);
+    assert!(read_frame(&mut ra).is_none(), "viewer-scoped: a gets nothing");
+
+    clients().lock().unwrap().retain(|c| c.eid != 8321 && c.eid != 8322);
+}
+
+#[test]
+fn playsound_validates_arguments_and_encodes_sound_packets() {
+    let _world = world_guard();
+    let (a, mut ra) = packet_client(8331, "sound-a", 0.5, 16.0, 0.5);
+    clients().lock().unwrap().push(a.clone());
+    std::env::set_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", "1");
+    let ctx = command_context(Some(a.clone()));
+    let run = |msg| run_command_ctx(&ctx, msg, &mut None);
+
+    assert!(run("/playsound").starts_with("usage:"));
+    assert_eq!(run("/playsound not_a_sound"), "Unknown sound 'not_a_sound'");
+    assert_eq!(
+        run("/playsound entity.player.levelup nobody_online"),
+        "No players found"
+    );
+    assert!(run("/playsound entity.player.levelup @a 0 0").starts_with("usage:"));
+    assert_eq!(
+        run("/playsound entity.player.levelup @a 0 0 0 -1"),
+        "Volume must be at least 0.0"
+    );
+    assert_eq!(
+        run("/playsound entity.player.levelup @a 0 0 0 1 3.0"),
+        "Pitch must be between 0.0 and 2.0"
+    );
+    assert_eq!(
+        run("/playsound entity.player.levelup @a 0 0 0 1 1 2.0"),
+        "minVolume must be between 0.0 and 1.0"
+    );
+
+    // No targets argument: defaults to the executing player.
+    let basic = run("/playsound entity.player.levelup");
+    assert_eq!(basic, "Played sound to 1 player(s)");
+    let (id, payload) = read_frame(&mut ra).expect("sound packet");
+    assert_eq!(id, 0x68);
+    // ItemSoundHolder: registry id + 1 as varint, then source category.
+    let (sid, used) = {
+        let mut v = 0i64;
+        let mut n = 0;
+        for i in 0..5 {
+            let b = payload[i];
+            v |= ((b & 0x7f) as i64) << (7 * i);
+            n = i + 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        (v, n)
+    };
+    assert_eq!(sid, i64::from(sound_id("entity.player.levelup").unwrap()) + 1);
+    // source varint follows the holder id
+    let source = payload[used] & 0x7f;
+    assert_eq!(i64::from(source), 0, "master");
+    let base = used + 1;
+    // executor position is the default sound position, volume/pitch default 1
+    assert_eq!(be_i32(&payload, base), 4, "x = 0.5 * 8");
+    assert_eq!(be_i32(&payload, base + 4), 128, "y = 16 * 8");
+    assert_eq!(be_i32(&payload, base + 8), 4, "z = 0.5 * 8");
+    assert_eq!(be_f32(&payload, base + 12), 1.0);
+    assert_eq!(be_f32(&payload, base + 16), 1.0);
+    assert_eq!(payload.len(), base + 28, "seed i64 closes the packet");
+
+    // Full form: source, named target, position, volume, pitch, minVolume.
+    let full = run("/playsound entity.player.levelup music sound-a 1 16 2 2.0 1.5 0.5");
+    assert_eq!(full, "Played sound to 1 player(s)");
+    let (id, payload) = read_frame(&mut ra).expect("full sound packet");
+    assert_eq!(id, 0x68);
+    let (sid, used) = {
+        let mut v = 0i64;
+        let mut n = 0;
+        for i in 0..5 {
+            let b = payload[i];
+            v |= ((b & 0x7f) as i64) << (7 * i);
+            n = i + 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        (v, n)
+    };
+    assert_eq!(sid, i64::from(sound_id("entity.player.levelup").unwrap()) + 1);
+    assert_eq!(i64::from(payload[used] & 0x7f), 1, "music source");
+    let base = used + 1;
+    assert_eq!(be_i32(&payload, base), 8, "x = 1 * 8");
+    assert_eq!(be_i32(&payload, base + 4), 128, "y = 16 * 8");
+    assert_eq!(be_i32(&payload, base + 8), 16, "z = 2 * 8");
+    assert_eq!(be_f32(&payload, base + 12), 2.0);
+    assert_eq!(be_f32(&payload, base + 16), 1.5);
+    assert_eq!(payload.len(), base + 28);
+
+    // minVolume: a target outside 16*volume hears the sound re-centred two
+    // blocks from itself toward the source, at minVolume.
+    *a.pos.lock().unwrap() = (200.0, 16.0, 0.5, 0.0, 0.0, true);
+    let distant = run("/playsound entity.player.levelup @a 0 16 0 1.0 1.0 0.5");
+    assert_eq!(distant, "Played sound to 1 player(s)");
+    let (_id, payload) = read_frame(&mut ra).expect("minVolume packet");
+    // holder varint (2 bytes for this id) + 1-byte master source
+    let base = 3;
+    // position ~ (198, 16, 0.5): two blocks from the player toward (0,16,0)
+    let x = be_i32(&payload, base);
+    assert!((x - 1584).abs() <= 2, "re-centred x {x}");
+    assert_eq!(be_i32(&payload, base + 4), 128);
+    assert_eq!(be_f32(&payload, base + 12), 0.5, "minVolume");
+    assert_eq!(be_f32(&payload, base + 16), 1.0);
+
+    clients().lock().unwrap().retain(|c| c.eid != 8331);
+    std::env::remove_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS");
+}
+
+#[test]
+fn datapack_raw_loot_tables_keep_json_and_follow_reload() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let _directory = CommandDirectory::enter();
+    let root = std::path::Path::new(DATAPACK_DIRECTORY);
+    // Folder packs are recognised by their data/ tree; "folder" sorts before
+    // "test.zip", so the zip is the later (winning) source for shared ids.
+    std::fs::create_dir_all(root.join("folder/data/test/loot_table/chests")).unwrap();
+    std::fs::write(
+        root.join("folder/data/test/loot_table/chests/shared.json"),
+        r#"{"pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:apple"}]}],"note":"folder"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("folder/data/test/loot_tables/plural")).unwrap();
+    std::fs::write(
+        root.join("folder/data/test/loot_tables/plural/only.json"),
+        r#"{"pools":[],"note":"plural-folder"}"#,
+    )
+    .unwrap();
+    let files: &[(&str, &[u8], bool)] = &[
+        (
+            "data/test/loot_table/chests/shared.json",
+            br#"{"pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}],"note":"zip"}"#,
+            false,
+        ),
+        (
+            "data/test/loot_table/chests/zipped.json",
+            br#"{"pools":[{"rolls":2,"entries":[{"type":"minecraft:item","name":"minecraft:emerald"}]}]}"#,
+            true,
+        ),
+        (
+            "data/other/loot_table/no_pools.json",
+            br#"{"note":"raw only, nothing the pool parser keeps"}"#,
+            false,
+        ),
+    ];
+    std::fs::write(root.join("test.zip"), zip_fixture(files)).unwrap();
+
+    let console = command_context(None);
+    let run = |msg| run_command_ctx(&console, msg, &mut None);
+    assert_eq!(run("/reload"), "Reloading! (2 pack(s))");
+
+    // Raw JSON survives even where the bounded pool parser keeps nothing.
+    assert_eq!(
+        loot_table_json("other:no_pools").as_deref(),
+        Some(r#"{"note":"raw only, nothing the pool parser keeps"}"#)
+    );
+    assert!(!loot_tables().lock().unwrap().contains_key("other:no_pools"));
+    // Singular and plural folder spellings share the same resource id space.
+    assert_eq!(
+        loot_table_json("test:plural/only").as_deref(),
+        Some(r#"{"pools":[],"note":"plural-folder"}"#)
+    );
+    // Zip (later source) overrides the folder pack on the shared id, and the
+    // parsed pool registry agrees with the raw winner.
+    let shared = loot_table_json("test:chests/shared").unwrap();
+    assert!(shared.contains("\"note\":\"zip\""), "{shared}");
+    assert!(loot_tables().lock().unwrap()["test:chests/shared"]
+        .iter()
+        .any(|pool| !pool.entries.is_empty()));
+    assert!(loot_table_json("test:chests/zipped").unwrap().contains("emerald"));
+    assert!(loot_table_json("chests/shared").is_none(), "bare path is minecraft:");
+    assert!(loot_table_json("missing:table").is_none());
+
+    // Disabling the zip and reloading replaces the cache wholesale: zip-only
+    // ids disappear and shared ids fall back to the folder body.
+    assert!(run("/datapack disable file/test.zip").starts_with("Disabled datapack"));
+    assert_eq!(run("/reload"), "Reloading! (1 pack(s))");
+    assert!(loot_table_json("test:chests/zipped").is_none());
+    assert!(loot_table_json("other:no_pools").is_none());
+    let shared = loot_table_json("test:chests/shared").unwrap();
+    assert!(shared.contains("\"note\":\"folder\""), "{shared}");
+    assert!(loot_table_json("test:plural/only").is_some());
+}

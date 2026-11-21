@@ -1316,6 +1316,7 @@ struct DatapackContent {
     block_tags: HashMap<String, Vec<String>>,
     item_tags: HashMap<String, Vec<String>>,
     loot: HashMap<String, Vec<LootPool>>,
+    loot_raw: HashMap<String, String>,
     mob_loot: HashMap<i64, Vec<LootPool>>,
     item_mods: HashMap<String, Vec<LootFunc>>,
     advancements: HashMap<String, Advancement>,
@@ -1331,6 +1332,7 @@ impl DatapackContent {
         let mut blocks = block_tags().lock().unwrap();
         let mut items = item_tags().lock().unwrap();
         let mut loot = loot_tables().lock().unwrap();
+        let mut loot_raw = raw_loot_tables().lock().unwrap();
         let mut mob_loot = mob_loot_tables().lock().unwrap();
         let mut mods = item_mods().lock().unwrap();
         let mut advs = advancements().lock().unwrap();
@@ -1341,6 +1343,7 @@ impl DatapackContent {
         *blocks = self.block_tags;
         *items = self.item_tags;
         *loot = self.loot;
+        *loot_raw = self.loot_raw;
         *mob_loot = self.mob_loot;
         *mods = self.item_mods;
         *advs = self.advancements;
@@ -1562,6 +1565,9 @@ impl DatapackContent {
     }
 
     fn read_loot(&mut self, key: String, rel: &str, body: &str) {
+        // #197: keep the raw JSON even when the bounded pool parser below
+        // cannot use it, so generic consumers can look a table up by id.
+        self.loot_raw.insert(key.clone(), body.to_owned());
         let mut pools: Vec<LootPool> = Vec::new();
         if let Some(pa) = jarray(body, "pools") {
             for pb in jobjects(pa) {
@@ -2990,6 +2996,27 @@ fn loot_tables() -> &'static Mutex<HashMap<String, Vec<LootPool>>> {
     static R: OnceLock<Mutex<HashMap<String, Vec<LootPool>>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
+// #197: raw `data/<ns>/loot_table[s]/**.json` bodies keyed `ns:path`, kept so
+// consumers that need fields the pool parser drops can resolve a table by
+// resource id. Replaced wholesale on every datapack publish, so /reload and
+// datapack enable/disable keep it in step with the parsed registries.
+fn raw_loot_tables() -> &'static Mutex<HashMap<String, String>> {
+    static R: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// The raw JSON body of the loot table `ns:path` (a bare path reads as
+/// `minecraft:`), or `None` when no enabled datapack provides it.
+// #197 seam: menus_and_items/chest_loot consume this once generic loot-table
+// lookup lands; until then only tests exercise it.
+#[allow(dead_code)]
+fn loot_table_json(id: &str) -> Option<String> {
+    let id = if id.contains(':') {
+        id.to_owned()
+    } else {
+        format!("minecraft:{id}")
+    };
+    raw_loot_tables().lock().unwrap().get(&id).cloned()
+}
 fn mob_loot_tables() -> &'static Mutex<HashMap<i64, Vec<LootPool>>> {
     static R: OnceLock<Mutex<HashMap<i64, Vec<LootPool>>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
@@ -4112,6 +4139,7 @@ fn native_command_dispatcher(
         "schedule",
         "scoreboard",
         "setblock",
+        "spreadplayers",
         "stopsound",
         "summon",
         "tag",
@@ -4202,6 +4230,628 @@ fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
             payload,
         );
     }
+}
+
+// ---------- /spreadplayers ----------
+// Vanilla 1.21.1 SpreadPlayersCommand: targets are grouped into piles (one
+// per scoreboard team when respectTeams holds, otherwise one per entity),
+// the piles relax under the world RNG until every pair sits at least
+// spreadDistance apart inside the center +/- maxRange square, and each pile
+// then snaps to the safe surface. Scoreboard teams are not wired yet (the
+// same gap entity_push documents), so the grouping key always misses and
+// every target is its own pile — the deterministic fallback.
+const SPREAD_MAX_ITERATIONS: usize = 10_000;
+
+fn spreadplayers_f64() -> f64 {
+    // Top 53 bits of the world stream -> uniform [0, 1).
+    (world_rng::next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+}
+
+fn strict_coord(tok: &str, base: f64) -> Option<f64> {
+    let v = if let Some(off) = tok.strip_prefix('~') {
+        match off.parse::<f64>() {
+            Ok(d) => base + d,
+            Err(_) if off.is_empty() => base,
+            Err(_) => return None,
+        }
+    } else if tok.starts_with('^') {
+        return None;
+    } else {
+        tok.parse::<f64>().ok()?
+    };
+    v.is_finite().then_some(v)
+}
+
+fn strict_num(tok: &str) -> Option<f64> {
+    tok.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+enum SpreadTarget {
+    Player(Arc<Client>),
+    Mob(Arc<Mob>),
+}
+
+fn spreadplayers_team(_target: &SpreadTarget) -> Option<String> {
+    // No scoreboard-team storage exists yet; when it lands, members sharing
+    // this key collapse into one pile under respectTeams.
+    None
+}
+
+fn spreadplayers_hazardous(reg: &block_registry::BReg, st: u32) -> bool {
+    reg.is_liquid(st)
+        || matches!(
+            reg.name_of(st),
+            "minecraft:fire" | "minecraft:soul_fire" | "minecraft:bubble_column"
+        )
+}
+
+// Feet Y for a pile at block column (x, z), or None when the column offers no
+// safe surface. Normal mode takes the highest motion-blocking block; `under`
+// additionally requires the block to sit below maxHeight with two air blocks
+// above it. A liquid or fire cell at feet/head height invalidates the column.
+fn spreadplayers_ground_y(dim: DimId, x: i32, z: i32, under: Option<i32>) -> Option<i32> {
+    let reg = breg()?;
+    let min_y = dim.min_y();
+    let top = min_y + dim.height() - 1;
+    let mut y = match under {
+        Some(h) => h.saturating_sub(1).min(top),
+        None => top,
+    };
+    if y < min_y {
+        return None;
+    }
+    while y >= min_y {
+        let st = block_at_dim(dim, x, y, z);
+        if reg.is_solid(st) {
+            let feet = block_at_dim(dim, x, y + 1, z);
+            let head = block_at_dim(dim, x, y + 2, z);
+            let clear = if under.is_some() {
+                reg.is_air(feet) && reg.is_air(head)
+            } else {
+                !spreadplayers_hazardous(reg, feet) && !spreadplayers_hazardous(reg, head)
+            };
+            if clear {
+                return Some(y + 1);
+            }
+        }
+        y -= 1;
+    }
+    None
+}
+
+fn spreadplayers_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> String {
+    const USAGE: &str = "usage: /spreadplayers <x> <z> <spreadDistance> <maxRange> [under <maxHeight>] <respectTeams> <targets...>";
+    let (Some(cx), Some(cz)) = (
+        args.first().and_then(|t| strict_coord(t, ctx.x)),
+        args.get(1).and_then(|t| strict_coord(t, ctx.z)),
+    ) else {
+        return USAGE.into();
+    };
+    let (Some(spread), Some(max_range)) = (
+        args.get(2).and_then(|t| strict_num(t)),
+        args.get(3).and_then(|t| strict_num(t)),
+    ) else {
+        return USAGE.into();
+    };
+    if spread < 0.0 {
+        return "Distance is too small.".into();
+    }
+    // Vanilla requires maxRange >= spreadDistance + 1 so at least one valid
+    // position can exist inside the square.
+    if max_range < spread + 1.0 {
+        return "Max range is too small.".into();
+    }
+    let dim = cmd_dim(ctx);
+    let mut idx = 4;
+    let under = if args.get(idx) == Some(&"under") {
+        idx += 1;
+        let Some(h) = args.get(idx).and_then(|t| t.parse::<i64>().ok()) else {
+            return USAGE.into();
+        };
+        if !(i64::from(dim.min_y())..=i64::from(dim.min_y() + dim.height())).contains(&h) {
+            return "Invalid max height".into();
+        }
+        idx += 1;
+        Some(h as i32)
+    } else {
+        None
+    };
+    let Some(&respect_teams) = args.get(idx) else {
+        return USAGE.into();
+    };
+    let respect_teams = match respect_teams {
+        "true" => true,
+        "false" => false,
+        other => return format!("'{other}' is not true or false"),
+    };
+    idx += 1;
+    if idx >= args.len() {
+        return USAGE.into();
+    }
+    let cls = client_snapshot();
+    let mob_snap = mobs().lock().unwrap().clone();
+    let mut targets: Vec<SpreadTarget> = Vec::new();
+    for token in &args[idx..] {
+        for eid in resolve_selector(token, me) {
+            if let Ok(pid) = eid.parse::<i32>() {
+                if let Some(c) = cls.iter().find(|c| c.eid == pid) {
+                    if *c.dim.lock().unwrap() == dim {
+                        targets.push(SpreadTarget::Player(c.clone()));
+                    }
+                }
+            } else if let Some(mid) = eid
+                .strip_prefix("m:")
+                .and_then(|e| e.parse::<i32>().ok())
+            {
+                if let Some(m) = mob_snap.iter().find(|m| m.eid == mid) {
+                    if m.dim == dim {
+                        targets.push(SpreadTarget::Mob(m.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if targets.is_empty() {
+        return "No entity found".into();
+    }
+
+    // Piles: respectTeams collapses members sharing a team key into one pile;
+    // with no team storage every key misses, so each target stays alone.
+    struct Pile {
+        x: f64,
+        z: f64,
+        members: Vec<usize>,
+    }
+    let min_x = cx - max_range;
+    let max_x = cx + max_range;
+    let min_z = cz - max_range;
+    let max_z = cz + max_range;
+    let mut piles: Vec<Pile> = Vec::new();
+    let mut team_piles: HashMap<String, usize> = HashMap::new();
+    for (index, target) in targets.iter().enumerate() {
+        if respect_teams {
+            if let Some(team) = spreadplayers_team(target) {
+                if let Some(&slot) = team_piles.get(&team) {
+                    piles[slot].members.push(index);
+                    continue;
+                }
+                team_piles.insert(team, piles.len());
+            }
+        }
+        piles.push(Pile {
+            x: min_x + spreadplayers_f64() * (max_x - min_x),
+            z: min_z + spreadplayers_f64() * (max_z - min_z),
+            members: vec![index],
+        });
+    }
+
+    // Relaxation pass (vanilla spreadPositions): repelled piles step one unit
+    // away from their close neighbours' centroid and clamp into the square;
+    // a fully settled pass still has to find a safe surface per pile.
+    let mut iterations = 0usize;
+    let mut settled = false;
+    while iterations < SPREAD_MAX_ITERATIONS && !settled {
+        iterations += 1;
+        let mut moved = false;
+        for i in 0..piles.len() {
+            let (px, pz) = (piles[i].x, piles[i].z);
+            let mut close = 0usize;
+            let mut rx = 0.0f64;
+            let mut rz = 0.0f64;
+            for j in 0..piles.len() {
+                if i == j {
+                    continue;
+                }
+                let dx = piles[j].x - px;
+                let dz = piles[j].z - pz;
+                if dx * dx + dz * dz < spread * spread {
+                    close += 1;
+                    rx += dx;
+                    rz += dz;
+                }
+            }
+            if close > 0 {
+                let len = (rx * rx + rz * rz).sqrt();
+                let mut nx = px / close as f64;
+                let mut nz = pz / close as f64;
+                if len > 0.0 {
+                    nx -= rx / len;
+                    nz -= rz / len;
+                } else {
+                    nx = min_x + spreadplayers_f64() * (max_x - min_x);
+                    nz = min_z + spreadplayers_f64() * (max_z - min_z);
+                }
+                let nx = nx.clamp(min_x, max_x);
+                let nz = nz.clamp(min_z, max_z);
+                if nx != piles[i].x || nz != piles[i].z {
+                    piles[i].x = nx;
+                    piles[i].z = nz;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            let mut rerolled = false;
+            for pile in piles.iter_mut() {
+                let gx = pile.x.floor() as i32;
+                let gz = pile.z.floor() as i32;
+                if spreadplayers_ground_y(dim, gx, gz, under).is_none() {
+                    pile.x = min_x + spreadplayers_f64() * (max_x - min_x);
+                    pile.z = min_z + spreadplayers_f64() * (max_z - min_z);
+                    rerolled = true;
+                }
+            }
+            if !rerolled {
+                settled = true;
+            }
+        }
+    }
+    if !settled {
+        let what = if respect_teams { "teams" } else { "entities" };
+        return format!(
+            "Could not spread {} {} around {}, {} (too many for the available space)",
+            piles.len(),
+            what,
+            cx,
+            cz
+        );
+    }
+
+    // All piles converged on safe columns; only now move anything.
+    let mut placements: Vec<(f64, f64, f64)> = Vec::with_capacity(piles.len());
+    for pile in &piles {
+        let gx = pile.x.floor() as i32;
+        let gz = pile.z.floor() as i32;
+        let Some(y) = spreadplayers_ground_y(dim, gx, gz, under) else {
+            return "Could not spread entities around the center (no safe surface)".into();
+        };
+        placements.push((pile.x, y as f64, pile.z));
+    }
+    for (pi, pile) in piles.iter().enumerate() {
+        let (x, y, z) = placements[pi];
+        let px = x.floor() + 0.5;
+        let pz = z.floor() + 0.5;
+        for &mi in &pile.members {
+            match &targets[mi] {
+                SpreadTarget::Player(c) => {
+                    if *c.dim.lock().unwrap() != dim {
+                        continue;
+                    }
+                    let (yaw, pitch) = {
+                        let p = c.pos.lock().unwrap();
+                        (p.3, p.4)
+                    };
+                    teleport_in_dimension(c, &mut c.sock.lock().unwrap(), (px, y, pz, yaw, pitch));
+                }
+                SpreadTarget::Mob(m) => {
+                    {
+                        let mut p = m.pos.lock().unwrap();
+                        p.0 = px;
+                        p.1 = y;
+                        p.2 = pz;
+                    }
+                    let (yaw, pitch) = {
+                        let p = m.pos.lock().unwrap();
+                        (p.3, p.4)
+                    };
+                    let tp = entity_teleport(m.eid, px, y, pz, yaw, pitch, true);
+                    broadcast_seen(m.eid, |_c| (0x70, tp.clone()));
+                }
+            }
+        }
+    }
+    let what = if respect_teams { "teams" } else { "entities" };
+    let mut out = format!(
+        "Successfully spread {} {} around {}, {}",
+        piles.len(),
+        what,
+        cx,
+        cz
+    );
+    if piles.len() > 1 {
+        // Report the realised spacing like vanilla's average-distance line.
+        let mut total = 0.0f64;
+        for i in 0..placements.len() {
+            let mut best = f64::MAX;
+            for j in 0..placements.len() {
+                if i != j {
+                    let dx = placements[i].0 - placements[j].0;
+                    let dz = placements[i].2 - placements[j].2;
+                    best = best.min(dx * dx + dz * dz);
+                }
+            }
+            total += best.sqrt();
+        }
+        out += &format!(
+            " (average distance between {} is {:.2} blocks apart after {} iterations)",
+            what,
+            total / piles.len() as f64,
+            iterations
+        );
+    }
+    out
+}
+
+// ---------- /particle ----------
+// world_particles 0x29 (minecraft-data 1.21.1): longDistance, x/y/z f64,
+// offsetX/Y/Z f32, velocityOffset f32, amount i32, particle varint last.
+fn particle_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> String {
+    const USAGE: &str = "usage: /particle <name> [<pos>] | <name> <pos> <delta> <speed> <count> [force|normal] [<viewers>]";
+    let Some(name) = args.first() else {
+        return USAGE.into();
+    };
+    let Some(pid) = particle_id(name.trim_start_matches("minecraft:")) else {
+        return format!("Unknown particle '{name}'");
+    };
+    let rest = &args[1..];
+    let (px, py, pz, dx, dy, dz, speed, count, force, viewer_sel) = if rest.len() <= 3 {
+        // Simple form: /particle <name> [<pos>] — a single particle at pos.
+        let (px, py, pz) = match rest.len() {
+            0 => (ctx.x, ctx.y, ctx.z),
+            3 => {
+                let (Some(x), Some(y), Some(z)) = (
+                    strict_coord(rest[0], ctx.x),
+                    strict_coord(rest[1], ctx.y),
+                    strict_coord(rest[2], ctx.z),
+                ) else {
+                    return USAGE.into();
+                };
+                (x, y, z)
+            }
+            _ => return USAGE.into(),
+        };
+        (px, py, pz, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0i32, false, None)
+    } else {
+        // Full form: pos(3) delta(3) speed(1) count(1), then optional
+        // force|normal and a single viewers selector.
+        if rest.len() < 8 {
+            return USAGE.into();
+        }
+        let (Some(px), Some(py), Some(pz)) = (
+            strict_coord(rest[0], ctx.x),
+            strict_coord(rest[1], ctx.y),
+            strict_coord(rest[2], ctx.z),
+        ) else {
+            return USAGE.into();
+        };
+        let (Some(dx), Some(dy), Some(dz)) = (
+            strict_coord(rest[3], ctx.x),
+            strict_coord(rest[4], ctx.y),
+            strict_coord(rest[5], ctx.z),
+        ) else {
+            return USAGE.into();
+        };
+        let Some(speed) = strict_num(rest[6]).filter(|v| *v >= 0.0) else {
+            return USAGE.into();
+        };
+        let Some(count) = rest[7].parse::<i32>().ok().filter(|c| *c >= 0) else {
+            return "Count must be a non-negative integer".into();
+        };
+        let mut i = 8;
+        let mut force = false;
+        if let Some(mode) = rest.get(i) {
+            match *mode {
+                "force" => {
+                    force = true;
+                    i += 1;
+                }
+                "normal" => i += 1,
+                _ => return USAGE.into(),
+            }
+        }
+        let viewer_sel = if i < rest.len() {
+            if rest.len() - i != 1 {
+                return USAGE.into();
+            }
+            Some(rest[i])
+        } else {
+            None
+        };
+        (
+            px,
+            py,
+            pz,
+            dx as f32,
+            dy as f32,
+            dz as f32,
+            speed as f32,
+            count,
+            force,
+            viewer_sel,
+        )
+    };
+
+    let dim = cmd_dim(ctx);
+    let range = if force { 512.0 } else { 32.0 };
+    let range2 = range * range;
+    let cls = client_snapshot();
+    let in_range = |c: &Arc<Client>| {
+        if *c.dim.lock().unwrap() != dim {
+            return false;
+        }
+        let p = *c.pos.lock().unwrap();
+        let ddx = p.0 - px;
+        let ddy = p.1 - py;
+        let ddz = p.2 - pz;
+        ddx * ddx + ddy * ddy + ddz * ddz < range2
+    };
+    let recipients: Vec<Arc<Client>> = match viewer_sel {
+        Some(sel) => {
+            let mut out: Vec<Arc<Client>> = Vec::new();
+            for eid in resolve_selector(sel, me) {
+                if let Ok(pid) = eid.parse::<i32>() {
+                    if let Some(c) = cls.iter().find(|c| c.eid == pid) {
+                        if in_range(c) && !out.iter().any(|o| o.eid == pid) {
+                            out.push(c.clone());
+                        }
+                    }
+                }
+            }
+            out
+        }
+        None => cls.iter().filter(|c| in_range(c)).cloned().collect(),
+    };
+    if recipients.is_empty() {
+        return "No players in range".into();
+    }
+    let mut packet = Vec::new();
+    packet.push(force as u8);
+    packet.extend_from_slice(&px.to_be_bytes());
+    packet.extend_from_slice(&py.to_be_bytes());
+    packet.extend_from_slice(&pz.to_be_bytes());
+    packet.extend_from_slice(&dx.to_be_bytes());
+    packet.extend_from_slice(&dy.to_be_bytes());
+    packet.extend_from_slice(&dz.to_be_bytes());
+    packet.extend_from_slice(&speed.to_be_bytes());
+    packet.extend_from_slice(&count.to_be_bytes());
+    write_varint(&mut packet, pid as i64);
+    for c in &recipients {
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x29, packet.clone());
+        }
+    }
+    format!("Displayed {} {}", count, name)
+}
+
+// ---------- /playsound ----------
+// sound_effect 0x68: ItemSoundHolder (registry id + 1 varint, matching
+// sound_pkt_named), source varint, fixed-point x/y/z (x8 i32), volume f32,
+// pitch f32, seed i64.
+const SOUNDSOURCE_IDS: [(&str, i64); 10] = [
+    ("master", 0),
+    ("music", 1),
+    ("record", 2),
+    ("weather", 3),
+    ("block", 4),
+    ("hostile", 5),
+    ("neutral", 6),
+    ("player", 7),
+    ("ambient", 8),
+    ("voice", 9),
+];
+
+fn playsound_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> String {
+    const USAGE: &str = "usage: /playsound <sound> [<source>] [<targets>] [<pos>] [<volume>] [<pitch>] [<minVolume>]";
+    let Some(name) = args.first() else {
+        return USAGE.into();
+    };
+    let Some(sid) = sound_id(name.trim_start_matches("minecraft:")) else {
+        return format!("Unknown sound '{name}'");
+    };
+    let mut i = 1;
+    let mut source = "master";
+    if let Some(tok) = args.get(i) {
+        if SOUNDSOURCE_IDS.iter().any(|(s, _)| s == tok) {
+            source = *tok;
+            i += 1;
+        }
+    }
+    // Vanilla's argument chain is strictly ordered: a targets token must come
+    // before any position, and each numeric argument requires the previous
+    // ones. Anything left after the optional source is therefore the targets
+    // selector; a bare number still parses as a (failing) player name there.
+    let mut targets: Vec<Arc<Client>> = Vec::new();
+    if let Some(tok) = args.get(i) {
+        i += 1;
+        let cls = client_snapshot();
+        for eid in resolve_selector(tok, me) {
+            if let Ok(pid) = eid.parse::<i32>() {
+                if let Some(c) = cls.iter().find(|c| c.eid == pid) {
+                    if !targets.iter().any(|o| o.eid == pid) {
+                        targets.push(c.clone());
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return "No players found".into();
+        }
+    } else if let Some(c) = me {
+        targets.push(c.clone());
+    }
+    let rest = args.len() - i;
+    if !matches!(rest, 0 | 3..=6) {
+        return USAGE.into();
+    }
+    let (px, py, pz, volume, pitch, min_volume) = if rest == 0 {
+        (ctx.x, ctx.y, ctx.z, 1.0f64, 1.0f64, 0.0f64)
+    } else {
+        let (Some(x), Some(y), Some(z)) = (
+            strict_coord(args[i], ctx.x),
+            strict_coord(args[i + 1], ctx.y),
+            strict_coord(args[i + 2], ctx.z),
+        ) else {
+            return USAGE.into();
+        };
+        // Absent arguments fall back to vanilla defaults; a present but
+        // unparsable token is a syntax error, not a default.
+        let num = |k: usize, default: f64| match args.get(i + k) {
+            Some(t) => strict_num(t),
+            None => Some(default),
+        };
+        let (Some(volume), Some(pitch), Some(min_volume)) = (
+            num(3, 1.0),
+            num(4, 1.0),
+            num(5, 0.0),
+        ) else {
+            return USAGE.into();
+        };
+        if !(volume >= 0.0) {
+            return "Volume must be at least 0.0".into();
+        }
+        if !(0.0..=2.0).contains(&pitch) {
+            return "Pitch must be between 0.0 and 2.0".into();
+        }
+        if !(0.0..=1.0).contains(&min_volume) {
+            return "minVolume must be between 0.0 and 1.0".into();
+        }
+        (x, y, z, volume, pitch, min_volume)
+    };
+    let source_id = SOUNDSOURCE_IDS
+        .iter()
+        .find(|(s, _)| *s == source)
+        .map(|(_, id)| *id)
+        .unwrap_or(0);
+    // Vanilla minVolume: players outside the 16*volume audible sphere get the
+    // packet re-centred two blocks from themselves toward the source at
+    // minVolume; the 767 packet carries no minVolume field, so the split is
+        // applied here per recipient.
+    let audible = 16.0 * volume;
+    let mut sent = 0usize;
+    for c in &targets {
+        let p = *c.pos.lock().unwrap();
+        let (dx, dy, dz) = (p.0 - px, p.1 - py, p.2 - pz);
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        let (sx, sy, sz, vol) = if volume > 0.0 && dist <= audible {
+            (px, py, pz, volume)
+        } else if min_volume > 0.0 && dist > 0.0 {
+            // Two blocks from the player toward the sound source.
+            let k = 2.0 / dist;
+            (
+                p.0 + (px - p.0) * k,
+                p.1 + (py - p.1) * k,
+                p.2 + (pz - p.2) * k,
+                min_volume,
+            )
+        } else {
+            continue;
+        };
+        let mut packet = Vec::new();
+        write_varint(&mut packet, sid as i64 + 1);
+        write_varint(&mut packet, source_id);
+        packet.extend_from_slice(&((sx * 8.0).floor() as i32).to_be_bytes());
+        packet.extend_from_slice(&((sy * 8.0).floor() as i32).to_be_bytes());
+        packet.extend_from_slice(&((sz * 8.0).floor() as i32).to_be_bytes());
+        packet.extend_from_slice(&(vol as f32).to_be_bytes());
+        packet.extend_from_slice(&(pitch as f32).to_be_bytes());
+        packet.extend_from_slice(&(world_rng::next_u64() as i64).to_be_bytes());
+        if let Ok(mut w) = c.sock.lock() {
+            if send_packet(&mut w, 0x68, packet).is_ok() {
+                sent += 1;
+            }
+        }
+    }
+    format!("Played sound to {sent} player(s)")
 }
 
 fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
@@ -5040,35 +5690,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 format!("Dropped {} item stack(s)", n)
             } else { "usage: /loot spawn x y z loot <table>|kill <entity>".into() }
         }
-        "playsound" => {
-            // /playsound <sound> [source] [targets] — sound subset
-            let snd = args.first().copied().unwrap_or("");
-            let sid = match sound_id(snd.trim_start_matches("minecraft:")) {
-                Some(i) => i, None => return format!("Unknown sound '{}'", snd) };
-            let cat = args.get(1).copied().unwrap_or("master");
-            let cat_id = match cat { "music"=>1,"record"=>2,"weather"=>3,"block"=>4,"hostile"=>5,
-                "neutral"=>6,"player"=>7,"ambient"=>8,"voice"=>9,_=>0 };
-            let targets = if args.len() > 2 { resolve_selector(args[2], me) }
-                else { me.map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
-            let mut n = 0;
-            let cls: Vec<Arc<Client>> = client_snapshot();
-            for t in &targets {
-                if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
-                    let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
-                    let mut p2 = Vec::new();
-                    write_varint(&mut p2, sid as i64 + 1); // holder: registry id
-                    write_varint(&mut p2, cat_id);
-                    p2.extend_from_slice(&((px * 8.0) as i32).to_be_bytes());
-                    p2.extend_from_slice(&((py * 8.0) as i32).to_be_bytes());
-                    p2.extend_from_slice(&((pz * 8.0) as i32).to_be_bytes());
-                    p2.extend_from_slice(&1.0f32.to_be_bytes());
-                    p2.extend_from_slice(&1.0f32.to_be_bytes());
-                    p2.extend_from_slice(&0i64.to_be_bytes()); // seed
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x68, p2); n += 1; }
-                }
-            }
-            format!("Played sound to {} player(s)", n)
-        }
+        "playsound" => playsound_command(ctx, &args, me),
         "title" => {
             if args.len() < 3 { return "usage: /title <targets> title|subtitle|actionbar|times <text>".into(); }
             // /title <targets> title|subtitle|actionbar|times <text|i s o>
@@ -5105,29 +5727,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             }
             format!("Title {} to {} player(s)", mode, n)
         }
-        "particle" => {
-            // /particle <name> [x y z [dx dy dz speed count]] — world_particles 0x29
-            let nm = args.first().copied().unwrap_or("");
-            let Some(pid) = particle_id(nm.trim_start_matches("minecraft:")) else {
-                return format!("Unknown particle '{}'", nm) };
-            let (px, py, pz) = (coord(args.get(1).copied().unwrap_or("~"), ctx.x),
-                                coord(args.get(2).copied().unwrap_or("~"), ctx.y),
-                                coord(args.get(3).copied().unwrap_or("~"), ctx.z));
-            let cnt: i32 = args.get(8).and_then(|v| v.parse().ok()).unwrap_or(10);
-            let mut p = Vec::new();
-            p.push(0); // longDistance
-            p.extend_from_slice(&px.to_be_bytes());
-            p.extend_from_slice(&py.to_be_bytes());
-            p.extend_from_slice(&pz.to_be_bytes());
-            p.extend_from_slice(&0.2f32.to_be_bytes());
-            p.extend_from_slice(&0.2f32.to_be_bytes());
-            p.extend_from_slice(&0.2f32.to_be_bytes());
-            p.extend_from_slice(&0.0f32.to_be_bytes()); // speed
-            p.extend_from_slice(&cnt.to_be_bytes());
-            write_varint(&mut p, pid as i64);
-            broadcast(-1, |_c| (0x29, p.clone()));
-            format!("Displayed {} {}", cnt, nm)
-        }
+        "particle" => particle_command(ctx, &args, me),
+        "spreadplayers" => spreadplayers_command(ctx, &args, me),
         "trigger" => run_trigger_command(&args, me),
         "attribute" => {
             // /attribute <target> <attr> base get|set <v>
