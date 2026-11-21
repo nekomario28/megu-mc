@@ -5044,8 +5044,14 @@ impl GeneratedFluidOwner {
                 return Err("fluid plan cannot write a non-fluid cell".into())
             }
         };
+        self.write_state(pos, state, now);
+        Ok(())
+    }
+    fn write_state(&mut self, pos: BlockPos, state: u32, now: i64) {
+        let old = block_at(pos.0, pos.1, pos.2);
+        let old_fluid = fluid_from_block(old);
         if old == state {
-            return Ok(());
+            return;
         }
         let previous = NATIVE_FLUID_WRITE.with(|v| v.replace(true));
         struct ResetNativeFluidWrite(bool);
@@ -5080,7 +5086,6 @@ impl GeneratedFluidOwner {
                 WATERLOGGED_DEFER.with(|v| v.borrow_mut().push(n));
             }
         }
-        Ok(())
     }
     fn tick(&mut self, now: i64, eligible: &HashSet<(i32, i32)>) -> Result<(), String> {
         let due = self
@@ -5122,6 +5127,11 @@ impl GeneratedFluidOwner {
                     if let Some(f) = plan.updated_self {
                         self.schedule(pos, f, now, false);
                     }
+                }
+            }
+            for (pos, reaction) in plan.solidifications {
+                if let Some(state) = fluid_solidification_state(reaction) {
+                    self.write_state(pos, state, now);
                 }
             }
         }
@@ -5366,6 +5376,8 @@ impl flowing_fluid::Reader for FluidReader {
         let reg = crate::block_registry::breg().ok_or("missing block registry")?;
         if reg.is_air(st) {
             Ok(flowing_fluid::Cell::Air)
+        } else if fluid_washes_away(reg, st) {
+            Ok(flowing_fluid::Cell::Passable)
         } else if reg.is_solid_render(st)
             || matches!(
                 reg.name_of(st),
