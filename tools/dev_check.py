@@ -48,6 +48,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -82,6 +83,26 @@ QUOTE = 300
 # `javac -version` prints "javac 21.0.1". Anchored on the program name so a number in a
 # warning, a path or a count is never mistaken for the version.
 JAVAC_VERSION = re.compile(r"^\s*javac\s+(\d+)", re.MULTILINE)
+
+# The standalone workspace crates a quickstart expects next to the root crate.
+STANDALONE_CRATES = (
+    "client-port",
+    "client-kernel",
+    "client-app",
+    "mod-offload",
+    "mod-adapter-core",
+    "create-adapter",
+    "proto",
+    "state-store",
+    "server-files",
+)
+
+# Free-space floor for the build target dir and TMPDIR. A `cargo` build writes
+# several GiB and fails with opaque errors on a full filesystem; under this
+# floor the report warns but stays green unless MC_SPINE_DEV_CHECK_DISK_FATAL
+# opts in to blocking.
+DISK_MIN_FREE_GIB = 5
+DISK_FATAL_ENV = "MC_SPINE_DEV_CHECK_DISK_FATAL"
 
 
 class Result:
@@ -395,6 +416,78 @@ def check_depsgx():
                   detail="presence only: the version is unverified")
 
 
+def check_workspace():
+    """The standalone crates, [profile.fast] and the version-pack tool.
+
+    Informational only: an absent piece does not block the pure-python route —
+    it names which multi-crate checks this checkout cannot run.
+    """
+    missing = [f"{crate}/" for crate in STANDALONE_CRATES
+               if not (ROOT / crate / "Cargo.toml").is_file()]
+    manifest = ROOT / "Cargo.toml"
+    fast = (manifest.is_file()
+            and re.search(r"^\s*\[profile\.fast\]", read_text(manifest), re.MULTILINE))
+    if not fast:
+        missing.append("[profile.fast] in Cargo.toml")
+    if not (ROOT / "tools/vanilla_data/version_pack.py").is_file():
+        missing.append("tools/vanilla_data/version_pack.py")
+    executed = ("ran: checked the 9 standalone crates, [profile.fast] and "
+                "tools/vanilla_data/version_pack.py")
+    if missing:
+        return Result("workspace", MISSING, f"{len(missing)} piece(s) absent", executed,
+                      detail="missing: " + "; ".join(missing))
+    return Result("workspace", OK,
+                  f"{len(STANDALONE_CRATES)} crates + [profile.fast] + version_pack.py",
+                  executed,
+                  detail="per-crate: cargo test --manifest-path <crate>/Cargo.toml "
+                         "--offline --locked -j1")
+
+
+def check_disk_headroom():
+    """Free space on the build target dir and TMPDIR — a warning, not a gate.
+
+    A near-full filesystem fails `cargo` late and opaquely; naming it here is
+    cheap. Never required, and it only blocks when MC_SPINE_DEV_CHECK_DISK_FATAL
+    is set, so tight CI hosts stay green by default.
+    """
+    target = Path(os.environ.get("CARGO_TARGET_DIR") or (ROOT / "target"))
+    tmp = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    floor = DISK_MIN_FREE_GIB * (1 << 30)
+    probed, parts, low = [], [], []
+    for label, path in (("target", target), ("tmp", tmp)):
+        probe = path
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        probed.append(str(probe))
+        try:
+            usage = shutil.disk_usage(probe)
+        except OSError as exc:
+            parts.append(f"{label} unreadable ({exc})")
+            continue
+        gib = usage.free / (1 << 30)
+        note = f"{label} {gib:.1f} GiB free"
+        if probe != path:
+            note += f" (measured at {probe})"
+        if usage.free < floor:
+            low.append(label)
+            note += f" — under {DISK_MIN_FREE_GIB} GiB"
+        parts.append(note)
+    executed = "ran: shutil.disk_usage on " + ", ".join(probed)
+    if not low:
+        return Result("disk_headroom", OK, "; ".join(parts), executed,
+                      detail=f"warns under {DISK_MIN_FREE_GIB} GiB free; never fatal "
+                             f"unless {DISK_FATAL_ENV} is set")
+    fatal = os.environ.get(DISK_FATAL_ENV, "").strip().lower() in ("1", "true", "yes")
+    detail = ("a cargo build needs several GiB; point CARGO_TARGET_DIR or TMPDIR "
+              "at a filesystem with more room")
+    if fatal:
+        return Result("disk_headroom", ERROR, "LOW DISK: " + "; ".join(parts), executed,
+                      detail=detail + f" ({DISK_FATAL_ENV} makes this blocking)")
+    return Result("disk_headroom", OK, "warning: " + "; ".join(parts), executed,
+                  detail=detail + f"; a warning only — set {DISK_FATAL_ENV}=1 "
+                                  "to make it block")
+
+
 # Which inspected checks each route depends on. A route is READY only when every one of
 # them is OK at this preflight's limited scope: a missing included file blocks the Rust
 # route even when the compiler is installed, and an unreadable javac version blocks the
@@ -506,6 +599,8 @@ def main(argv=None):
             check_vanilla_jar(),
             check_jdk(timeout_ms),
             check_depsgx(),
+            check_workspace(),
+            check_disk_headroom(),
         ]
     except Exception as exc:  # noqa: BLE001 - a preflight crash must not look like a report
         print(f"dev_check: internal error: {type(exc).__name__}: {exc}", file=sys.stderr)
