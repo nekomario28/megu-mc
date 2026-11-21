@@ -439,31 +439,49 @@ class WorkspaceInventoryContract(unittest.TestCase):
     def fill_workspace(self):
         for crate in ("client-port", "client-kernel", "client-app", "mod-offload",
                       "mod-adapter-core", "create-adapter", "proto", "state-store",
-                      "server-files"):
+                      "server-files", "core"):
             crate_dir = self.fixture.root / crate
-            crate_dir.mkdir()
+            crate_dir.mkdir(exist_ok=True)
             (crate_dir / "Cargo.toml").write_text(
                 f'[package]\nname = "{crate}"\nlicense = "GPL-3.0-or-later"\n')
         manifest = self.fixture.root / "Cargo.toml"
         manifest.write_text(manifest.read_text()
                             + '[profile.fast]\ninherits = "release"\n')
-        (self.fixture.root / "tools/vanilla_data/version_pack.py").write_text(
-            "#!/usr/bin/env python3\n")
+        for rel in ("tools/vanilla_data/version_pack.py", "tools/release_bundle.py",
+                    "tests/companion_suite_e2e.py"):
+            (self.fixture.root / rel).write_text("#!/usr/bin/env python3\n")
 
     def test_absent_pieces_are_named_but_do_not_block(self):
         code, output = self.fixture.run()
         self.assertEqual(code, 0, output)
         self.assertEqual(self.fixture.statuses(output)["workspace"], "MISSING")
         self.assertIn("client-port/", output)
+        self.assertIn("core/", output)
         self.assertIn("[profile.fast]", output)
         self.assertIn("version_pack.py", output)
+        self.assertIn("release_bundle.py", output)
+        self.assertIn("companion_suite_e2e.py", output)
 
     def test_full_inventory_reports_ok(self):
         self.fill_workspace()
         code, output = self.fixture.run()
         self.assertEqual(code, 0, output)
         self.assertEqual(self.fixture.statuses(output)["workspace"], "OK")
-        self.assertIn("9 crates", output)
+        self.assertIn("10 crates", output)
+
+    def test_each_of_the_ten_crates_is_individually_inventoried(self):
+        self.fill_workspace()
+        crates = ("core", "proto", "state-store", "server-files", "mod-adapter-core",
+                  "create-adapter", "mod-offload", "client-kernel", "client-port",
+                  "client-app")
+        self.assertEqual(len(set(crates)), 10)
+        for crate in crates:
+            with self.subTest(crate=crate):
+                shutil.rmtree(self.fixture.root / crate)
+                code, output = self.fixture.run()
+                self.assertEqual(code, 0, output)
+                self.assertEqual(self.fixture.statuses(output)["workspace"], "MISSING")
+                self.assertIn(f"{crate}/", output)
 
     def test_one_missing_crate_is_named(self):
         self.fill_workspace()

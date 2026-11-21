@@ -85,6 +85,7 @@ QUOTE = 300
 JAVAC_VERSION = re.compile(r"^\s*javac\s+(\d+)", re.MULTILINE)
 
 # The standalone workspace crates a quickstart expects next to the root crate.
+# `core` (mc-spine-core) is the shared leaf every other standalone crate builds on.
 STANDALONE_CRATES = (
     "client-port",
     "client-kernel",
@@ -95,6 +96,14 @@ STANDALONE_CRATES = (
     "proto",
     "state-store",
     "server-files",
+    "core",
+)
+
+# Tracked tool/test files the workspace check inventories next to the crates.
+WORKSPACE_FILES = (
+    "tools/vanilla_data/version_pack.py",
+    "tools/release_bundle.py",
+    "tests/companion_suite_e2e.py",
 )
 
 # Free-space floor for the build target dir and TMPDIR. A `cargo` build writes
@@ -417,7 +426,7 @@ def check_depsgx():
 
 
 def check_workspace():
-    """The standalone crates, [profile.fast] and the version-pack tool.
+    """The standalone crates, [profile.fast] and the workspace tool/test files.
 
     Informational only: an absent piece does not block the pure-python route —
     it names which multi-crate checks this checkout cannot run.
@@ -429,15 +438,15 @@ def check_workspace():
             and re.search(r"^\s*\[profile\.fast\]", read_text(manifest), re.MULTILINE))
     if not fast:
         missing.append("[profile.fast] in Cargo.toml")
-    if not (ROOT / "tools/vanilla_data/version_pack.py").is_file():
-        missing.append("tools/vanilla_data/version_pack.py")
-    executed = ("ran: checked the 9 standalone crates, [profile.fast] and "
-                "tools/vanilla_data/version_pack.py")
+    missing.extend(rel for rel in WORKSPACE_FILES if not (ROOT / rel).is_file())
+    executed = ("ran: checked the 10 standalone crates, [profile.fast] and "
+                + ", ".join(WORKSPACE_FILES))
     if missing:
         return Result("workspace", MISSING, f"{len(missing)} piece(s) absent", executed,
                       detail="missing: " + "; ".join(missing))
     return Result("workspace", OK,
-                  f"{len(STANDALONE_CRATES)} crates + [profile.fast] + version_pack.py",
+                  f"{len(STANDALONE_CRATES)} crates + [profile.fast] + "
+                  f"{len(WORKSPACE_FILES)} workspace files",
                   executed,
                   detail="per-crate: cargo test --manifest-path <crate>/Cargo.toml "
                          "--offline --locked -j1")

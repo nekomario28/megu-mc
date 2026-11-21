@@ -56,6 +56,7 @@ STANDALONE_CRATES = (
     "proto",
     "state-store",
     "server-files",
+    "core",
 )
 
 # Extra harnesses a crate change can affect beyond its own cargo test.
@@ -63,6 +64,15 @@ CRATE_EXTRA_HARNESS = {
     "client-port": ("python3 tests/culling_perf_gate.py --self-test",),
     "client-app": ("python3 tests/client_fork_e2e.py --self-test",),
     "mod-adapter-core": ("python3 tests/mod_fallback_test.py",),
+}
+
+# Direct consumers in the crate DAG: editing a shared leaf crate invalidates the
+# crates built on it, so their harnesses run as if they had changed too.
+# mc-spine-core is the zero-dependency leaf (see core/Cargo.toml); its direct
+# consumers are the five crates whose manifest names mc-spine-core.
+CRATE_DOWNSTREAM = {
+    "core": ("proto", "state-store", "server-files", "mod-adapter-core",
+             "client-kernel"),
 }
 
 # Gates every src/** change must pass.
@@ -250,10 +260,20 @@ def map_changed_files(paths):
             continue
         first = path.split("/", 1)[0]
         if first in STANDALONE_CRATES:
-            commands.add(crate_test(first))
-            commands.update(CRATE_EXTRA_HARNESS.get(first, ()))
+            for crate in (first,) + CRATE_DOWNSTREAM.get(first, ()):
+                commands.add(crate_test(crate))
+                commands.update(CRATE_EXTRA_HARNESS.get(crate, ()))
         elif path == "tools/mod_launcher.py":
             commands.add("python3 tests/mod_fallback_test.py")
+        elif path == "tools/release_bundle.py":
+            commands.add("python3 tools/release_bundle.py --self-test")
+        elif path == "tools/export_public_branch.sh":
+            commands.add("python3 tests/public_export_test.py")
+        elif path == "tests/companion_suite_e2e.py":
+            commands.add("python3 tests/companion_suite_e2e.py --self-test")
+        elif path == "docker" or path.startswith("docker/"):
+            commands.add("bash -n docker/entrypoint.sh")
+            commands.add("python3 tools/provenance_check.py")
         elif path == "tools/vanilla_data" or path.startswith("tools/vanilla_data/"):
             commands.add("python3 tools/vanilla_data/version_pack.py --self-test")
         elif path == "src" or path.startswith("src/"):
@@ -500,10 +520,34 @@ class CacheContract(unittest.TestCase):
 
 class MapContract(unittest.TestCase):
     def test_every_standalone_crate_maps_to_its_own_cargo_test(self):
-        self.assertEqual(len(STANDALONE_CRATES), 9)
+        self.assertEqual(len(STANDALONE_CRATES), 10)
         for crate in STANDALONE_CRATES:
             commands = map_changed_files([f"{crate}/src/lib.rs"])
             self.assertIn(crate_test(crate), commands, crate)
+
+    def test_core_change_reaches_its_five_direct_downstream_crates(self):
+        commands = map_changed_files(["core/src/lib.rs"])
+        self.assertIn(crate_test("core"), commands)
+        for crate in ("proto", "state-store", "server-files", "mod-adapter-core",
+                      "client-kernel"):
+            self.assertIn(crate_test(crate), commands, crate)
+        # Downstream crates get their full harness treatment, not just cargo test.
+        self.assertIn("python3 tests/mod_fallback_test.py", commands)
+        # Crates that do not depend on core stay out of the mapping.
+        for crate in ("client-port", "client-app", "mod-offload", "create-adapter"):
+            self.assertNotIn(crate_test(crate), commands, crate)
+
+    def test_release_docker_and_companion_mappings(self):
+        self.assertEqual(map_changed_files(["tools/release_bundle.py"]),
+                         ["python3 tools/release_bundle.py --self-test"])
+        self.assertEqual(map_changed_files(["tools/export_public_branch.sh"]),
+                         ["python3 tests/public_export_test.py"])
+        self.assertEqual(map_changed_files(["tests/companion_suite_e2e.py"]),
+                         ["python3 tests/companion_suite_e2e.py --self-test"])
+        docker = {"bash -n docker/entrypoint.sh",
+                  "python3 tools/provenance_check.py"}
+        self.assertEqual(set(map_changed_files(["docker/Dockerfile"])), docker)
+        self.assertEqual(set(map_changed_files(["docker/entrypoint.sh"])), docker)
 
     def test_crate_extra_harnesses(self):
         self.assertIn("python3 tests/culling_perf_gate.py --self-test",
