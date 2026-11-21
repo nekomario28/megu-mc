@@ -119,12 +119,29 @@ impl PlayerSave {
         };
         let respawn = {
             let dim = client.spawn_dim.lock().unwrap();
-            saved_value(&client.spawn_pt).map(|(x, y, z, angle)| SpawnTarget {
-                kind: SpawnTargetKind::Legacy,
-                dim: *dim,
-                position: (x, y, z),
-                angle,
-                forced: false,
+            saved_value(&client.spawn_pt).map(|(x, y, z, angle)| {
+                let live = SpawnTarget {
+                    kind: SpawnTargetKind::Legacy,
+                    dim: *dim,
+                    position: (x, y, z),
+                    angle,
+                    forced: false,
+                };
+                // The live client only tracks the destination. When a bed or
+                // respawn anchor record was already saved for this exact point,
+                // the autosave's recapture keeps that record instead of
+                // flattening the kind back to Legacy.
+                saved_players()
+                    .lock()
+                    .unwrap()
+                    .get(&client.uuid)
+                    .and_then(|save| save.respawn)
+                    .filter(|saved| {
+                        saved.dim == live.dim
+                            && saved.position == live.position
+                            && saved.angle == live.angle
+                    })
+                    .unwrap_or(live)
             })
         };
         let ender_chest = chests()
@@ -2213,6 +2230,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         f.extend_from_slice(b"SPA1");
         f.extend_from_slice(&world_spawn.3.to_be_bytes());
     }
+    append_block_entities_footer(f);
     append_save_state(f, &players, spawn_pitch, &ms, &mob_data);
     generated.append(f);
     let (sources, generated_blocks, generated_fluids) = worldgen::with_gen(|g| {
@@ -2978,6 +2996,10 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     let (before_generated, _) = split_save_footer(before_ticks, b"GEN1")?;
     let (payload, body) = split_save_footer(before_generated, SAVE_STATE_MAGIC)?;
     let mut state = body.map(SaveState::read).transpose()?;
+    let (payload, block_entities) = split_save_footer(payload, BLOCK_ENTITIES_MAGIC)?;
+    let block_entities = block_entities
+        .map(read_block_entities_body)
+        .transpose()?;
     if generated.as_ref().is_some_and(|s| (!s.sources.is_empty() || !s.spider_flags.is_empty())
         && worldgen::with_gen(|_| ()).is_none()) {
         return Err("generated content requires initialized world generator");
@@ -4089,6 +4111,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     *saved_players().lock().unwrap() = state.players;
     *saved_raids().lock().unwrap() = state.raids;
     *live_brewing_stands().lock().unwrap() = brewing;
+    restore_saved_block_entities(block_entities);
     eprintln!(
         "[spine] loaded {} dirty chunks",
         world().lock().unwrap().len()
@@ -4200,6 +4223,127 @@ fn read_brewing_footer(
         return Err("trailing bytes in brewing footer");
     }
     Ok((&payload[..start], stands))
+}
+
+// Live block-entity snapshots (#216): beacon, campfire, lectern, chiseled
+// bookshelf, decorated pot, crafter, jukebox, banner, skull, brushable block,
+// trial spawner and vault. Each entry carries its position, the block state it
+// was snapshotted against and the vanilla named-NBT payload, framed
+// `[body][body size u64][BEN1]` like the other save-state footers. It is written
+// between the legacy region and SVP1 so a save with no block entities keeps
+// every legacy byte — and every other footer's position — exactly where it was.
+const BLOCK_ENTITIES_MAGIC: &[u8; 4] = b"BEN1";
+
+fn append_block_entities_footer(out: &mut Vec<u8>) {
+    let Some(reg) = breg() else { return };
+    // Pick up blocks placed since the last tick's scan so entities nobody has
+    // interacted with persist too.
+    live_block_entities().lock().unwrap().discover(reg);
+    let keys: Vec<DimBlockPos> = live_block_entities()
+        .lock()
+        .unwrap()
+        .entries
+        .keys()
+        .copied()
+        .collect();
+    let mut entries = Vec::new();
+    for key in keys {
+        if let Some((state, tag)) = live_block_entity_snapshot(key) {
+            entries.push((key, state, tag));
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_by_key(|&((dim, x, y, z), _, _)| (dim.index(), x, y, z));
+    let start = out.len();
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for ((dim, x, y, z), state, tag) in entries {
+        out.push(dim.index() as u8);
+        save_numbers!(out, x, y, z, state);
+        let nbt = nbt::write_named(&nbt::NbtString::text(""), &tag)
+            .expect("block entity NBT must encode");
+        out.extend_from_slice(&(nbt.len() as u32).to_be_bytes());
+        out.extend_from_slice(&nbt);
+    }
+    out.extend_from_slice(&((out.len() - start) as u64).to_be_bytes());
+    out.extend_from_slice(BLOCK_ENTITIES_MAGIC);
+}
+
+fn read_block_entities_body(
+    body: &[u8],
+) -> Result<Vec<(DimBlockPos, u32, nbt::Tag)>, &'static str> {
+    let mut entries = Vec::new();
+    let mut positions = HashSet::new();
+    let mut p = 0;
+    let count = read_dim2_count(body, &mut p, 21).map_err(|_| "invalid block entity count")?;
+    for _ in 0..count {
+        let header = body.get(p..p + 17).ok_or("truncated block entity")?;
+        p += header.len();
+        let dim =
+            DimId::from_index(header[0] as usize).ok_or("invalid block entity dimension")?;
+        let coordinate =
+            |i| i32::from_be_bytes(header[i..i + 4].try_into().unwrap());
+        let key @ (_, x, y, z) = (dim, coordinate(1), coordinate(5), coordinate(9));
+        let state = u32::from_be_bytes(header[13..17].try_into().unwrap());
+        let len = u32::from_be_bytes(
+            body.get(p..p + 4)
+                .ok_or("truncated block entity NBT length")?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        p += 4;
+        let data = body.get(p..p + len).ok_or("truncated block entity NBT")?;
+        p += len;
+        let (name, tag) = nbt::read_named(data)?;
+        if !name.0.is_empty() || !matches!(tag, nbt::Tag::Compound(_)) {
+            return Err("block entity root must be an unnamed compound");
+        }
+        if block_entity_str_field(&tag, "id").is_none() {
+            return Err("block entity is missing its type id");
+        }
+        if block_entity_int(&tag, "x") != x
+            || block_entity_int(&tag, "y") != y
+            || block_entity_int(&tag, "z") != z
+        {
+            return Err("block entity position mismatch");
+        }
+        if !positions.insert(key) {
+            return Err("duplicate block entity position");
+        }
+        entries.push((key, state, tag));
+    }
+    if p != body.len() {
+        return Err("trailing bytes in block entity footer");
+    }
+    Ok(entries)
+}
+
+// The saved block state is authoritative: the snapshot was taken atomically with
+// the world edits, and a non-Overworld dimension's overlay file lands after the
+// main payload has already run. The store's discovery keeps reconciling entries
+// against the live world, so a block that does not come back drops the record on
+// the next scan of its chunk.
+fn restore_saved_block_entities(entries: Option<Vec<(DimBlockPos, u32, nbt::Tag)>>) {
+    let mut store = live_block_entities().lock().unwrap();
+    store.entries.clear();
+    let (Some(reg), Some(entries)) = (breg(), entries) else {
+        return;
+    };
+    for (key, state, tag) in entries {
+        let Some(id) = live_block_entity_id(reg.name_of(state)) else {
+            continue;
+        };
+        if block_entity_str_field(&tag, "id").as_deref() != Some(id) {
+            continue;
+        }
+        let Some(block) = reg.block_id_of(state) else {
+            continue;
+        };
+        store
+            .entries
+            .insert(key, (block, LiveBlockEntity::load(reg, state, id, &tag)));
+    }
 }
 
 #[cfg(test)]

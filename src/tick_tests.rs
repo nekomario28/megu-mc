@@ -7608,10 +7608,25 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
     world_rng::restore(old_rng);
     set_test_region(old_hot, old_warm);
     // Pin the legacy payload (including BRD1) and the payload with the SED1 suffix.
+    // The outer footers peel in `decode_world_payload` order; the block-entity and
+    // save-state extensions sit between the legacy region and GEN1, so the legacy
+    // digest is the peeled prefix re-joined to the tail that followed them.
     let (before_seed, seed) = read_world_seed_footer(&first_payload).unwrap();
     assert_eq!(seed, Some(0));
-    assert_eq!(payload_digest(before_seed), "ccb95841c40f2d55ccd155989ad93fc8");
-    assert_eq!(first, "298e3a9e54bfb08500015ce6ebfa6bfb");
+    let (before_mobs, _) = read_mob_dimensions_footer(before_seed).unwrap();
+    let (before_brewing, _) = read_brewing_footer(before_mobs).unwrap();
+    let (before_dim2, _) = read_dim2_footer(before_brewing).unwrap();
+    let (before_dim, _, _) = read_dim_footer(before_dim2).unwrap();
+    let (before_loot, _) = read_block_loot_footer(before_dim).unwrap();
+    let (before_owners, _) = read_drop_owners_footer(before_loot).unwrap();
+    let before_ticks = tick_persistence::prefix(before_owners).unwrap();
+    let (before_generated, _) = split_save_footer(before_ticks, b"GEN1").unwrap();
+    let (before_state, _) = split_save_footer(before_generated, SAVE_STATE_MAGIC).unwrap();
+    let (legacy_prefix, _) = split_save_footer(before_state, BLOCK_ENTITIES_MAGIC).unwrap();
+    let mut legacy = legacy_prefix.to_vec();
+    legacy.extend_from_slice(&before_seed[before_generated.len()..]);
+    assert_eq!(payload_digest(&legacy), "ccb95841c40f2d55ccd155989ad93fc8");
+    assert_eq!(first, "5bdc0aa461c9f2c5cea3febebd51728d");
 }
 
 // ---------- chest world-side contract remainder (M2 slice 3d) ----------

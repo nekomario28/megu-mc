@@ -2352,3 +2352,182 @@ fn save_v2_rejects_a_truncated_companion_before_publishing_any_of_its_edits() {
     load_dim_overlay_from(DimId::Nether, &payload).unwrap();
     assert_eq!(world().lock().unwrap()[&(DimId::Nether, 0, 0)][&3], 501);
 }
+
+#[test]
+fn save_v2_live_block_entities_round_trip_all_families() {
+    test_support::require_vanilla_data();
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _world_guard = world_guard();
+    let old_world = std::mem::take(&mut *world().lock().unwrap());
+    let old_store = std::mem::take(&mut *live_block_entities().lock().unwrap());
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
+    let old_rng = world_rng::saved_state();
+
+    let cases = [
+        ("beacon", "beacon"),
+        ("soul_campfire", "campfire"),
+        ("lectern", "lectern"),
+        ("chiseled_bookshelf", "chiseled_bookshelf"),
+        ("decorated_pot", "decorated_pot"),
+        ("crafter", "crafter"),
+        ("jukebox", "jukebox"),
+        ("red_banner", "banner"),
+        ("player_head", "skull"),
+        ("suspicious_gravel", "brushable_block"),
+        ("trial_spawner", "trial_spawner"),
+        ("vault", "vault"),
+    ];
+    for (i, (block, _)) in cases.iter().enumerate() {
+        place_block_dim(
+            DimId::Overworld,
+            5_000 + i as i32,
+            220,
+            5_000,
+            name_to_state(block).unwrap(),
+        );
+    }
+    // Mutated payloads prove more than presence survives the round trip.
+    let banner_tag = block_entity_compound([
+        ("id", block_entity_string("minecraft:banner")),
+        (
+            "patterns",
+            Tag::List(
+                10,
+                vec![block_entity_compound([
+                    ("pattern", block_entity_string("minecraft:stripe_center")),
+                    ("color", block_entity_string("blue")),
+                ])],
+            ),
+        ),
+    ]);
+    let banner_key = (DimId::Overworld, 5_007, 220, 5_000);
+    assert!(restore_live_block_entity(banner_key, &banner_tag));
+    let campfire_key = (DimId::Overworld, 5_001, 220, 5_000);
+    let campfire_tag = block_entity_compound([
+        ("id", block_entity_string("minecraft:campfire")),
+        ("CookingTimes", Tag::IntArray(vec![10, 20, 30, 40])),
+        ("CookingTotalTimes", Tag::IntArray(vec![600; 4])),
+    ]);
+    assert!(restore_live_block_entity(campfire_key, &campfire_tag));
+
+    let expected: Vec<_> = cases
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let key = (DimId::Overworld, 5_000 + i as i32, 220, 5_000);
+            (key, live_block_entity_snapshot(key).unwrap())
+        })
+        .collect();
+
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    // The footer rides between the legacy region and SVP1.
+    {
+        let tail = payload_through_drop_owners_footer(&payload).unwrap();
+        let (tail, _) = read_drop_owners_footer(tail).unwrap();
+        let tail = tick_persistence::prefix(tail).unwrap();
+        let (before_generated, _) = split_save_footer(tail, b"GEN1").unwrap();
+        let (state_prefix, _) = split_save_footer(before_generated, SAVE_STATE_MAGIC).unwrap();
+        assert!(
+            state_prefix.ends_with(BLOCK_ENTITIES_MAGIC),
+            "save with live block entities must carry the BEN1 footer"
+        );
+    }
+
+    live_block_entities().lock().unwrap().entries.clear();
+    load_world_from(&payload).unwrap();
+    let restored: Vec<_> = cases
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let key = (DimId::Overworld, 5_000 + i as i32, 220, 5_000);
+            (key, live_block_entity_snapshot(key))
+        })
+        .collect();
+
+    *world().lock().unwrap() = old_world;
+    *live_block_entities().lock().unwrap() = old_store;
+    *drops().lock().unwrap() = old_drops;
+    world_rng::restore(old_rng);
+
+    assert_eq!(restored, expected.into_iter().map(|(k, s)| (k, Some(s))).collect::<Vec<_>>());
+}
+
+#[test]
+fn save_v2_autosave_preserves_bed_and_anchor_spawn_target_kinds() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _world_guard = world_guard();
+    let old_players = std::mem::take(&mut *saved_players().lock().unwrap());
+    let old_clients = std::mem::take(&mut *clients().lock().unwrap());
+
+    let bed = SpawnTarget {
+        kind: SpawnTargetKind::Bed,
+        dim: DimId::Overworld,
+        position: (10.5, 65.0, -7.5),
+        angle: 90.0,
+        forced: true,
+    };
+    let anchor = SpawnTarget {
+        kind: SpawnTargetKind::Anchor,
+        dim: DimId::Nether,
+        position: (-3.5, 70.0, 12.5),
+        angle: -45.0,
+        forced: false,
+    };
+    for (uuid, target) in [([7; 16], bed), ([9; 16], anchor)] {
+        let (mut client, _peer) = effect_tests::client_pair();
+        client.uuid = uuid;
+        client.eid += 7_000;
+        *client.spawn_dim.lock().unwrap() = target.dim;
+        *client.spawn_pt.lock().unwrap() =
+            Some((target.position.0, target.position.1, target.position.2, target.angle));
+        let mut state =
+            PlayerSave::capture(&client, client_dim_pos(&client), &HashMap::new());
+        state.respawn = Some(target);
+        saved_players().lock().unwrap().insert(uuid, state);
+        clients().lock().unwrap().push(Arc::new(client));
+    }
+
+    // The autosave recaptures every live client from spawn_pt, which carries no
+    // kind. The saved bed/anchor records must survive that recapture unchanged.
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    let after_save = {
+        let saved = saved_players().lock().unwrap();
+        (saved[&[7; 16]].respawn, saved[&[9; 16]].respawn)
+    };
+    saved_players().lock().unwrap().clear();
+    load_world_from(&payload).unwrap();
+    let after_load = {
+        let saved = saved_players().lock().unwrap();
+        (saved[&[7; 16]].respawn, saved[&[9; 16]].respawn)
+    };
+
+    // A moved spawn point has no saved record to match and stays Legacy.
+    *clients().lock().unwrap()[0].spawn_pt.lock().unwrap() =
+        Some((1.5, 60.0, 1.5, 0.0));
+    let mut second = Vec::new();
+    save_world_into(&mut second);
+    let moved = saved_players().lock().unwrap()[&[7; 16]].respawn;
+
+    clients().lock().unwrap().clear();
+    *saved_players().lock().unwrap() = old_players;
+    *clients().lock().unwrap() = old_clients;
+
+    assert_eq!(after_save, (Some(bed), Some(anchor)));
+    assert_eq!(after_load, (Some(bed), Some(anchor)));
+    assert_eq!(
+        moved,
+        Some(SpawnTarget {
+            kind: SpawnTargetKind::Legacy,
+            dim: DimId::Overworld,
+            position: (1.5, 60.0, 1.5),
+            angle: 0.0,
+            forced: false,
+        })
+    );
+}
