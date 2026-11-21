@@ -2559,6 +2559,1297 @@ fn exec_p3b_command(ctx: &CmdCtx, cmd: &str, args: &[&str], s: &mut Option<&Clie
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lane P6d: `/profile` on the live PERF-1 hotspot profiler, protocol-767
+// `/transfer` (#149), expanded `/data` (#170) and `/advancement query` (#174).
+// ---------------------------------------------------------------------------
+
+/// The shared `ServerHotspotProfiler` from `operator_ux.rs` (PERF-1). The tick
+/// pipeline records tick durations and per-chunk subsystem work into this one
+/// store; `/profile` renders the same live instance, so the report a level-4
+/// operator reads always reflects real server state.
+fn live_hotspot_profiler() -> &'static Mutex<ServerHotspotProfiler> {
+    static PROFILER: OnceLock<Mutex<ServerHotspotProfiler>> = OnceLock::new();
+    PROFILER.get_or_init(|| Mutex::new(ServerHotspotProfiler::default()))
+}
+
+/// `/profile` is an owner-level (4) diagnostic. `required_permission_level`
+/// lives outside this lane's files, so the gate is re-checked inside the
+/// handler: a level-2/3 operator — and therefore a level-2 `.mcfunction` frame
+/// too — is refused with the same reply the outer permission gate produces.
+fn run_profile_command(level: u8, args: &[&str]) -> String {
+    if level < 4 {
+        return "You do not have permission to run that command".into();
+    }
+    let profiler = live_hotspot_profiler();
+    match args {
+        [] => profiler.lock().unwrap().summary(5).format_human(),
+        ["reset"] => {
+            profiler.lock().unwrap().reset();
+            "Profiler counters reset".into()
+        }
+        [raw] => match raw.parse::<usize>() {
+            Ok(n) => profiler
+                .lock()
+                .unwrap()
+                .summary(n.clamp(1, 20))
+                .format_human(),
+            Err(_) => "usage: /profile [<top_n>|reset]".into(),
+        },
+        _ => "usage: /profile [<top_n>|reset]".into(),
+    }
+}
+
+/// Protocol 767 clientbound `transfer` — `proto/src/data_v767.rs` lists it as
+/// `(Play, Clientbound, "transfer", 0x73)`.
+const TRANSFER_PACKET_ID: i64 = 0x73;
+
+/// A `String` field on the wire must be non-empty and bounded; control
+/// characters, whitespace and NUL have no business in a hostname either, so
+/// the host is restricted to printable non-space ASCII within 255 bytes.
+fn transfer_hostname_valid(host: &str) -> bool {
+    (1..=255).contains(&host.len()) && host.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// `[String host][VarInt port]` — the full clientbound `transfer` body.
+fn transfer_packet(host: &str, port: u16) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(host.len() + 6);
+    write_str(&mut payload, host);
+    write_varint(&mut payload, i64::from(port));
+    payload
+}
+
+/// Vanilla `/transfer` is a level-3 literal (`requires(source.hasPermission(3))`).
+/// Like `/profile` the level is re-checked here: a level-2 operator or
+/// `.mcfunction` frame must never reach the packet write.
+fn run_transfer_command(ctx: &CmdCtx, level: u8, args: &[&str]) -> String {
+    if level < 3 {
+        return "You do not have permission to run that command".into();
+    }
+    let usage = "usage: /transfer <hostname> [<port>] [<players>]";
+    let [host, rest @ ..] = args else {
+        return usage.into();
+    };
+    if rest.len() > 2 {
+        return usage.into();
+    }
+    if !transfer_hostname_valid(host) {
+        return format!("Invalid hostname '{host}'");
+    }
+    let port = match rest.first() {
+        None => 25565,
+        Some(raw) => match raw.parse::<u16>() {
+            Ok(0) | Err(_) => return format!("Invalid port '{raw}'"),
+            Ok(port) => port,
+        },
+    };
+    let targets = player_command_targets(rest.get(1).copied().unwrap_or("@s"), ctx.me.as_ref());
+    if targets.is_empty() {
+        return "No player found".into();
+    }
+    let payload = transfer_packet(host, port);
+    let mut sent = 0usize;
+    for target in &targets {
+        if send_packet(
+            &mut target.sock.lock().unwrap(),
+            TRANSFER_PACKET_ID,
+            payload.clone(),
+        )
+        .is_ok()
+        {
+            sent += 1;
+        }
+    }
+    format!("Transferred {sent} player(s) to {host}:{port}")
+}
+
+// ------------------------------------------------------------- /data (#170)
+
+/// One `/data` verb target: a live block entity, a single entity, or a named
+/// storage id. Block positions resolve `~` against the source like Vanilla.
+enum DataTarget {
+    Block(DimId, BlockPos),
+    Entity(String),
+    Storage(String),
+}
+
+/// `/data merge|modify` writes land here when the live container store cannot
+/// express the resulting NBT — the overlay is seeded from the live block-entity
+/// data on the first write and stays authoritative for `/data` reads. `Items`
+/// is still synced back to `chests()`/`furnaces()` after every write.
+fn data_block_overrides() -> &'static LockedMap<DimBlockPos, ExecTag> {
+    static STORE: Registry<DimBlockPos, ExecTag> = OnceLock::new();
+    STORE.get_or_init(Mutex::default)
+}
+
+/// Extra per-entity NBT fields the live entity model does not carry
+/// (`CustomName`, `NoAI`, `ArmorItems`, `HandItems`, arbitrary merged keys).
+/// Keyed by the same `tag_key` the `/tag` store uses (`p:name`, `e:eid`, ...).
+fn data_entity_extras() -> &'static LockedMap<String, ExecTag> {
+    static STORE: Registry<String, ExecTag> = OnceLock::new();
+    STORE.get_or_init(Mutex::default)
+}
+
+fn data_parse_target<'a>(
+    source: &ExecuteSource,
+    args: &'a [&'a str],
+) -> Result<(DataTarget, &'a [&'a str]), String> {
+    match args {
+        ["block", x, y, z, rest @ ..] => {
+            let [sx, sy, sz] = source.position();
+            let pos = execute_block_pos([coord(x, sx), coord(y, sy), coord(z, sz)]);
+            Ok((DataTarget::Block(source.dimension, pos), rest))
+        }
+        ["entity", selector, rest @ ..] => {
+            Ok((DataTarget::Entity((*selector).to_owned()), rest))
+        }
+        ["storage", id, rest @ ..] => {
+            Ok((DataTarget::Storage(block_registry::ns_name(id)), rest))
+        }
+        _ => Err(
+            "usage: /data <verb> block <x> <y> <z>|entity <target>|storage <id> ...".into(),
+        ),
+    }
+}
+
+/// One entity's NBT root: the `execute` read model plus the fields `/data`
+/// needs (`Motion`, `Air`, `Fire`, `Tags`, `SelectedItem`, `ArmorItems`,
+/// `HandItems`) and any extras earlier writes recorded in `data_entity_extras`.
+fn data_entity_root(entity: &ExecuteEntity) -> ExecTag {
+    let mut root = execute_entity_data(entity);
+    let ExecTag::Compound(fields) = &mut root else {
+        return root;
+    };
+    let mut put = |name: &str, value: ExecTag| {
+        fields.insert(NbtString::text(name), value);
+    };
+    let extras = data_entity_extras().lock().unwrap().clone();
+    let extras = extras.get(&entity.tag_key());
+    let extra = |name: &str| -> Option<&ExecTag> {
+        extras.and_then(|tag| tag.get(name))
+    };
+    let doubles = |values: [f64; 3]| -> ExecTag {
+        ExecTag::List(
+            6,
+            values
+                .iter()
+                .map(|v| ExecTag::Double(v.to_bits()))
+                .collect(),
+        )
+    };
+    let motion = match entity {
+        ExecuteEntity::Mob(mob) => *mob.vel.lock().unwrap(),
+        _ => [0.0; 3],
+    };
+    put("Motion", doubles(motion));
+    match entity {
+        ExecuteEntity::Player(player) => {
+            let air = *player.air.lock().unwrap();
+            put("Air", ExecTag::Short(air.clamp(-300, 30_000) as i16));
+            put(
+                "Fire",
+                extra("Fire").cloned().unwrap_or(ExecTag::Short(-20)),
+            );
+            put(
+                "Invulnerable",
+                extra("Invulnerable")
+                    .cloned()
+                    .unwrap_or(ExecTag::Byte(0)),
+            );
+            let inv = player.inv.lock().unwrap();
+            let held = *player.held.lock().unwrap();
+            if let Some(selected) = inv
+                .get(&(36 + held))
+                .and_then(|stack| data_item_nbt(stack))
+            {
+                put("SelectedItem", selected);
+            }
+            put("ArmorItems", data_armor_items(&inv));
+            put("HandItems", data_hand_items(&inv, held));
+        }
+        ExecuteEntity::Mob(mob) => {
+            put(
+                "Air",
+                ExecTag::Short((*mob.air.lock().unwrap()).clamp(-300, 30_000) as i16),
+            );
+            put(
+                "Fire",
+                ExecTag::Short((*mob.fire_ticks.lock().unwrap()).clamp(-20, 30_000) as i16),
+            );
+            put(
+                "Invulnerable",
+                extra("Invulnerable").cloned().unwrap_or(ExecTag::Byte(0)),
+            );
+            put("NoAI", extra("NoAI").cloned().unwrap_or(ExecTag::Byte(0)));
+            put(
+                "ArmorItems",
+                extra("ArmorItems")
+                    .cloned()
+                    .unwrap_or_else(|| ExecTag::List(10, vec![data_empty_item(); 4])),
+            );
+            put(
+                "HandItems",
+                extra("HandItems")
+                    .cloned()
+                    .unwrap_or_else(|| ExecTag::List(10, vec![data_empty_item(); 2])),
+            );
+        }
+        ExecuteEntity::Other { .. } => {
+            put(
+                "Invulnerable",
+                extra("Invulnerable").cloned().unwrap_or(ExecTag::Byte(0)),
+            );
+        }
+    }
+    let mut entity_tags: Vec<ExecTag> = tags()
+        .lock()
+        .unwrap()
+        .get(&entity.tag_key())
+        .into_iter()
+        .flatten()
+        .map(|tag| ExecTag::String(NbtString::text(tag)))
+        .collect();
+    entity_tags.sort_by(|a, b| execute_tag_snbt(a).cmp(&execute_tag_snbt(b)));
+    put("Tags", ExecTag::List(8, entity_tags));
+    if let Some(ExecTag::Compound(extra_fields)) = extras {
+        for (key, value) in extra_fields {
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    root
+}
+
+fn data_empty_item() -> ExecTag {
+    ExecTag::Compound(Default::default())
+}
+
+/// A live stack rendered the way vanilla writes it inside `SelectedItem` /
+/// `ArmorItems`/`HandItems`: the compound without the `Slot` index.
+fn data_item_nbt(stack: &Stack) -> Option<ExecTag> {
+    let mut tag = stack_to_nbt(0, stack)?;
+    if let ExecTag::Compound(fields) = &mut tag {
+        fields.remove(&NbtString::text("Slot"));
+    }
+    Some(tag)
+}
+
+/// Vanilla `ArmorItems` order is feet, legs, chest, head — window-0 slots
+/// 8, 7, 6, 5 on this server.
+fn data_armor_items(inv: &HashMap<i16, Stack>) -> ExecTag {
+    ExecTag::List(
+        10,
+        [8, 7, 6, 5]
+            .iter()
+            .map(|slot| {
+                inv.get(slot)
+                    .and_then(data_item_nbt)
+                    .unwrap_or_else(data_empty_item)
+            })
+            .collect(),
+    )
+}
+
+/// Vanilla `HandItems` order is main hand then off hand — the held hotbar
+/// stack and window slot 45.
+fn data_hand_items(inv: &HashMap<i16, Stack>, held: i16) -> ExecTag {
+    ExecTag::List(
+        10,
+        [36 + held, 45]
+            .iter()
+            .map(|slot| {
+                inv.get(slot)
+                    .and_then(data_item_nbt)
+                    .unwrap_or_else(data_empty_item)
+            })
+            .collect(),
+    )
+}
+
+/// Parse one vanilla item-stack compound (`{id:"minecraft:x",count:n}`) into a
+/// live `Stack`; an empty compound is vanilla's empty-slot marker.
+fn data_item_stack(tag: &ExecTag) -> Option<Stack> {
+    let ExecTag::Compound(fields) = tag else {
+        return None;
+    };
+    if fields.is_empty() {
+        return None;
+    }
+    let mut with_slot = fields.clone();
+    with_slot.insert(NbtString::text("Slot"), ExecTag::Byte(0));
+    items_nbt_to_stacks(&ExecTag::List(10, vec![ExecTag::Compound(with_slot)]))
+        .ok()?
+        .remove(&0)
+}
+
+fn data_actor_root(actor: &Actor) -> ExecTag {
+    let (x, y, z) = *actor.pos.lock().unwrap();
+    execute_nbt_compound([
+        (
+            "Pos",
+            ExecTag::List(
+                6,
+                [x, y, z]
+                    .iter()
+                    .map(|v| ExecTag::Double(v.to_bits()))
+                    .collect(),
+            ),
+        ),
+        (
+            "Inventory",
+            stacks_to_items_nbt(&actor.inv.lock().unwrap()),
+        ),
+    ])
+}
+
+/// The compound a `/data` verb reads for `target`, plus the subject name the
+/// reply interpolates. Vanilla's "is not a block entity" and "no entity"
+/// failures come back as `Err`.
+fn data_read_root(source: &ExecuteSource, target: &DataTarget) -> Result<(String, ExecTag), String> {
+    match target {
+        DataTarget::Block(dim, pos @ (x, y, z)) => {
+            let key = (*dim, *x, *y, *z);
+            let mut root = data_block_overrides()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .or_else(|| execute_block_data(*dim, *pos));
+            let Some(root) = root.as_mut() else {
+                return Err(format!("The block at {x}, {y}, {z} is not a block entity"));
+            };
+            if let ExecTag::Compound(fields) = root {
+                for (name, value) in [("x", x), ("y", y), ("z", z)] {
+                    fields.insert(NbtString::text(name), ExecTag::Int(*value));
+                }
+            }
+            Ok((format!("Storage at {x}, {y}, {z}"), root.clone()))
+        }
+        DataTarget::Entity(selector) => {
+            let selected = source.select(selector)?;
+            match selected.as_slice() {
+                [entity] => Ok((entity.score_holder(), data_entity_root(entity))),
+                [] => actors()
+                    .lock()
+                    .unwrap()
+                    .get(selector.as_str())
+                    .map(|actor| (actor.name.clone(), data_actor_root(actor)))
+                    .ok_or_else(|| "No entity found".to_owned()),
+                _ => Err("Expected a single entity".into()),
+            }
+        }
+        DataTarget::Storage(id) => execute_storage()
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .map(|root| (format!("Storage '{id}'"), root))
+            .ok_or_else(|| format!("Unknown storage '{id}'")),
+    }
+}
+
+/// `data_entity_root`'s write half: land one top-level field where the live
+/// model keeps it, file it under `data_entity_extras` otherwise.
+fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) {
+    let extra = |entity: &ExecuteEntity, name: &str, value: &ExecTag| {
+        let mut extras = data_entity_extras().lock().unwrap();
+        let entry = extras
+            .entry(entity.tag_key())
+            .or_insert_with(|| ExecTag::Compound(Default::default()));
+        if let ExecTag::Compound(fields) = entry {
+            fields.insert(NbtString::text(name), value.clone());
+        }
+    };
+    match name {
+        "id" | "x" | "y" | "z" | "UUID" => {}
+        "Pos" => {
+            if let Some([x, y, z]) = data_nbt_vec3(value) {
+                match entity {
+                    ExecuteEntity::Player(player) => {
+                        let mut pos = player.pos.lock().unwrap();
+                        (pos.0, pos.1, pos.2) = (x, y, z);
+                    }
+                    ExecuteEntity::Mob(mob) => {
+                        let mut pos = mob.pos.lock().unwrap();
+                        (pos.0, pos.1, pos.2) = (x, y, z);
+                    }
+                    ExecuteEntity::Other { id, kind, .. } => {
+                        data_move_other_entity(*id, kind, [x, y, z]);
+                    }
+                }
+            }
+        }
+        "Rotation" => {
+            if let ExecTag::List(_, v) = value {
+                let angles: Vec<f32> = v
+                    .iter()
+                    .filter_map(|tag| data_nbt_f64(tag).map(|n| n as f32))
+                    .collect();
+                if let [yaw, pitch, ..] = angles.as_slice() {
+                    match entity {
+                        ExecuteEntity::Player(player) => {
+                            let mut pos = player.pos.lock().unwrap();
+                            (pos.3, pos.4) = (*yaw, *pitch);
+                        }
+                        ExecuteEntity::Mob(mob) => {
+                            let mut pos = mob.pos.lock().unwrap();
+                            (pos.3, pos.4) = (*yaw, *pitch);
+                        }
+                        ExecuteEntity::Other { .. } => {}
+                    }
+                }
+            }
+        }
+        "Motion" => {
+            if let Some(motion) = data_nbt_vec3(value) {
+                match entity {
+                    ExecuteEntity::Mob(mob) => *mob.vel.lock().unwrap() = motion,
+                    _ => extra(entity, name, value),
+                }
+            }
+        }
+        "Health" => {
+            if let Some(hp) = data_nbt_f64(value) {
+                match entity {
+                    ExecuteEntity::Player(player) => {
+                        *player.hp.lock().unwrap() = hp as f32;
+                    }
+                    ExecuteEntity::Mob(mob) => *mob.hp.lock().unwrap() = hp as f32,
+                    ExecuteEntity::Other { .. } => {}
+                }
+            }
+        }
+        "Air" => {
+            if let Some(ticks) = data_nbt_f64(value).map(|n| n as i32) {
+                match entity {
+                    ExecuteEntity::Player(player) => *player.air.lock().unwrap() = ticks,
+                    ExecuteEntity::Mob(mob) => *mob.air.lock().unwrap() = ticks,
+                    ExecuteEntity::Other { .. } => {}
+                }
+            }
+        }
+        "Fire" => {
+            if let Some(ticks) = data_nbt_f64(value).map(|n| n as i32) {
+                match entity {
+                    ExecuteEntity::Mob(mob) => *mob.fire_ticks.lock().unwrap() = ticks,
+                    _ => extra(entity, name, value),
+                }
+            }
+        }
+        "Invulnerable" => {
+            if let ExecuteEntity::Player(player) = entity {
+                let flag = data_nbt_f64(value).map_or(false, |n| n != 0.0);
+                *player.invulnerable.lock().unwrap() = if flag { i32::MAX } else { 0 };
+            }
+            extra(entity, name, value);
+        }
+        "Tags" => {
+            if let ExecTag::List(_, entries) = value {
+                let mut set = HashSet::new();
+                for entry in entries {
+                    if let ExecTag::String(tag) = entry {
+                        if let Ok(tag) = tag.to_utf8() {
+                            set.insert(tag);
+                        }
+                    }
+                }
+                let mut store = tags().lock().unwrap();
+                let key = entity.tag_key();
+                if set.is_empty() {
+                    store.remove(&key);
+                } else {
+                    store.insert(key, set);
+                }
+            }
+        }
+        "Inventory" => {
+            if let ExecTag::List(..) = value {
+                match entity {
+                    ExecuteEntity::Player(player) => {
+                        if let Ok(slots) = items_nbt_to_stacks(value) {
+                            *player.inv.lock().unwrap() = slots;
+                        }
+                    }
+                    _ => extra(entity, name, value),
+                }
+            }
+        }
+        "SelectedItem" => {
+            if let ExecTag::Compound(..) = value {
+                match entity {
+                    ExecuteEntity::Player(player) => {
+                        let slot = 36 + *player.held.lock().unwrap();
+                        let mut inv = player.inv.lock().unwrap();
+                        match data_item_stack(value) {
+                            Some(stack) => {
+                                inv.insert(slot, stack);
+                            }
+                            None => {
+                                inv.remove(&slot);
+                            }
+                        }
+                    }
+                    _ => extra(entity, name, value),
+                }
+            }
+        }
+        "ArmorItems" => {
+            if let ExecTag::List(_, entries) = value {
+                match entity {
+                    ExecuteEntity::Player(player) => {
+                        let mut inv = player.inv.lock().unwrap();
+                        for (slot, entry) in [8, 7, 6, 5].into_iter().zip(entries.iter()) {
+                            match data_item_stack(entry) {
+                                Some(stack) => {
+                                    inv.insert(slot, stack);
+                                }
+                                None => {
+                                    inv.remove(&slot);
+                                }
+                            }
+                        }
+                    }
+                    _ => extra(entity, name, value),
+                }
+            }
+        }
+        "HandItems" => {
+            if let ExecTag::List(_, entries) = value {
+                match entity {
+                    ExecuteEntity::Player(player) => {
+                        let held = *player.held.lock().unwrap();
+                        let mut inv = player.inv.lock().unwrap();
+                        for (slot, entry) in [36 + held, 45].into_iter().zip(entries.iter()) {
+                            match data_item_stack(entry) {
+                                Some(stack) => {
+                                    inv.insert(slot, stack);
+                                }
+                                None => {
+                                    inv.remove(&slot);
+                                }
+                            }
+                        }
+                    }
+                    _ => extra(entity, name, value),
+                }
+            }
+        }
+        "CustomName" | "NoAI" => extra(entity, name, value),
+        _ => extra(entity, name, value),
+    }
+}
+
+/// `data_entity_root`'s remove half: fields the live model re-derives on write
+/// (`Pos`, `Rotation`, `Motion`, ids) behave like Vanilla — the value a later
+/// save produces is unaffected; the rest reset to their load defaults.
+fn data_remove_entity_field(entity: &ExecuteEntity, name: &str) {
+    let drop_extra = |entity: &ExecuteEntity, name: &str| {
+        if let Some(tag) = data_entity_extras().lock().unwrap().get_mut(&entity.tag_key()) {
+            if let ExecTag::Compound(fields) = tag {
+                fields.remove(&NbtString::text(name));
+            }
+        }
+    };
+    match name {
+        "id" | "x" | "y" | "z" | "UUID" | "Pos" | "Rotation" | "Motion" | "Item" => {}
+        "Health" => match entity {
+            ExecuteEntity::Player(player) => *player.hp.lock().unwrap() = 20.0,
+            ExecuteEntity::Mob(mob) => {
+                *mob.hp.lock().unwrap() = entity_max_health_1211(mob.etype);
+            }
+            ExecuteEntity::Other { .. } => {}
+        },
+        "Air" => match entity {
+            ExecuteEntity::Player(player) => *player.air.lock().unwrap() = 300,
+            ExecuteEntity::Mob(mob) => *mob.air.lock().unwrap() = 300,
+            ExecuteEntity::Other { .. } => {}
+        },
+        "Fire" => match entity {
+            ExecuteEntity::Mob(mob) => *mob.fire_ticks.lock().unwrap() = -20,
+            _ => drop_extra(entity, name),
+        },
+        "Invulnerable" => {
+            if let ExecuteEntity::Player(player) = entity {
+                *player.invulnerable.lock().unwrap() = 0;
+            }
+            drop_extra(entity, name);
+        }
+        "Tags" => {
+            tags().lock().unwrap().remove(&entity.tag_key());
+        }
+        "Inventory" => {
+            if let ExecuteEntity::Player(player) = entity {
+                player.inv.lock().unwrap().clear();
+            }
+            drop_extra(entity, name);
+        }
+        "SelectedItem" => {
+            if let ExecuteEntity::Player(player) = entity {
+                let slot = 36 + *player.held.lock().unwrap();
+                player.inv.lock().unwrap().remove(&slot);
+            }
+            drop_extra(entity, name);
+        }
+        "ArmorItems" => {
+            if let ExecuteEntity::Player(player) = entity {
+                let mut inv = player.inv.lock().unwrap();
+                for slot in [8, 7, 6, 5] {
+                    inv.remove(&slot);
+                }
+            }
+            drop_extra(entity, name);
+        }
+        "HandItems" => {
+            if let ExecuteEntity::Player(player) = entity {
+                let held = *player.held.lock().unwrap();
+                let mut inv = player.inv.lock().unwrap();
+                for slot in [36 + held, 45] {
+                    inv.remove(&slot);
+                }
+            }
+            drop_extra(entity, name);
+        }
+        _ => drop_extra(entity, name),
+    }
+}
+
+fn data_move_other_entity(id: i32, kind: &str, [x, y, z]: [f64; 3]) {
+    match kind {
+        "minecraft:item" => {
+            if let Some(drop) = drops().lock().unwrap().iter_mut().find(|d| d.eid == id) {
+                (drop.x, drop.y, drop.z) = (x, y, z);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn data_nbt_f64(tag: &ExecTag) -> Option<f64> {
+    match tag {
+        ExecTag::Byte(v) => Some(f64::from(*v)),
+        ExecTag::Short(v) => Some(f64::from(*v)),
+        ExecTag::Int(v) => Some(f64::from(*v)),
+        ExecTag::Long(v) => Some(*v as f64),
+        ExecTag::Float(v) => Some(f64::from(f32::from_bits(*v))),
+        ExecTag::Double(v) => Some(f64::from_bits(*v)),
+        _ => None,
+    }
+}
+
+fn data_nbt_vec3(tag: &ExecTag) -> Option<[f64; 3]> {
+    let ExecTag::List(_, values) = tag else {
+        return None;
+    };
+    let coords: Vec<f64> = values.iter().filter_map(data_nbt_f64).collect();
+    match coords.as_slice() {
+        [x, y, z] => Some([*x, *y, *z]),
+        _ => None,
+    }
+}
+
+/// `execute_nbt_merge`'s recursive compound merge: compound fields merge
+/// depth-first, everything else replaces outright.
+fn data_nbt_merge(dst: &mut ExecTag, src: &ExecTag) {
+    match (dst, src) {
+        (ExecTag::Compound(dst_fields), ExecTag::Compound(src_fields)) => {
+            for (key, value) in src_fields {
+                match dst_fields.get_mut(key) {
+                    Some(existing) => data_nbt_merge(existing, value),
+                    None => {
+                        dst_fields.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (dst, src) => *dst = src.clone(),
+    }
+}
+
+/// The `remove` half of `ExecuteNbtPath`'s grammar: `Key` drops a compound
+/// member, `Index` drops a list slot, `All`/`Match` fan the removal out.
+fn data_nbt_remove(root: &mut ExecTag, nodes: &[ExecuteNbtNode]) -> bool {
+    use ExecuteNbtNode::*;
+    let Some((node, rest)) = nodes.split_first() else {
+        return false;
+    };
+    match (node, root) {
+        (Key(key), ExecTag::Compound(fields)) => {
+            if rest.is_empty() {
+                fields.remove(key).is_some()
+            } else {
+                fields
+                    .get_mut(key)
+                    .is_some_and(|value| data_nbt_remove(value, rest))
+            }
+        }
+        (Index(index), ExecTag::List(_, entries)) => {
+            execute_nbt_index(*index, entries.len()).is_some_and(|index| {
+                if rest.is_empty() {
+                    entries.remove(index);
+                    true
+                } else {
+                    data_nbt_remove(&mut entries[index], rest)
+                }
+            })
+        }
+        (All | Match(_, true), ExecTag::List(_, entries)) => {
+            let is_match = |entry: &ExecTag| match node {
+                All => true,
+                Match(pattern, _) => execute_nbt_matches(pattern, entry),
+                _ => unreachable!(),
+            };
+            if rest.is_empty() {
+                let before = entries.len();
+                entries.retain(|entry| !is_match(entry));
+                before != entries.len()
+            } else {
+                entries
+                    .iter_mut()
+                    .filter(|entry| is_match(entry))
+                    .fold(false, |removed, entry| {
+                        data_nbt_remove(entry, rest) || removed
+                    })
+            }
+        }
+        (Match(pattern, false), value)
+            if !rest.is_empty() && execute_nbt_matches(pattern, value) =>
+        {
+            data_nbt_remove(value, rest)
+        }
+        _ => false,
+    }
+}
+
+/// Mutable fan-out for `data modify`'s merge/append/prepend/insert: resolves
+/// every existing tag the path names, the same set `ExecuteNbtPath::get` reads.
+fn data_nbt_resolve_mut<'a>(
+    root: &'a mut ExecTag,
+    nodes: &[ExecuteNbtNode],
+) -> Vec<&'a mut ExecTag> {
+    use ExecuteNbtNode::*;
+    let mut values = vec![root];
+    for node in nodes {
+        let mut next = Vec::new();
+        for value in values {
+            match (node, value) {
+                (Key(key), ExecTag::Compound(fields)) => {
+                    if let Some(value) = fields.get_mut(key) {
+                        next.push(value);
+                    }
+                }
+                (Index(index), ExecTag::List(_, entries)) => {
+                    if let Some(index) = execute_nbt_index(*index, entries.len()) {
+                        next.push(&mut entries[index]);
+                    }
+                }
+                (All, ExecTag::List(_, entries)) => next.extend(entries.iter_mut()),
+                (Match(pattern, true), ExecTag::List(_, entries)) => next.extend(
+                    entries
+                        .iter_mut()
+                        .filter(|entry| execute_nbt_matches(pattern, entry)),
+                ),
+                (Match(pattern, false), value)
+                    if execute_nbt_matches(pattern, value) =>
+                {
+                    next.push(value);
+                }
+                _ => {}
+            }
+        }
+        if next.is_empty() {
+            return next;
+        }
+        values = next;
+    }
+    values
+}
+
+enum DataModifyOp {
+    Set,
+    Merge,
+    Append,
+    Prepend,
+    Insert(i32),
+}
+
+fn data_apply_modify(
+    root: &mut ExecTag,
+    path: &ExecuteNbtPath,
+    op: &DataModifyOp,
+    value: &ExecTag,
+) -> bool {
+    match op {
+        DataModifyOp::Set => path.set(root, value),
+        DataModifyOp::Merge => data_nbt_resolve_mut(root, &path.0)
+            .into_iter()
+            .fold(false, |changed, target| {
+                if let (ExecTag::Compound(_), ExecTag::Compound(_)) = (&*target, value) {
+                    data_nbt_merge(target, value);
+                    true
+                } else {
+                    changed
+                }
+            }),
+        DataModifyOp::Append | DataModifyOp::Prepend | DataModifyOp::Insert(_) => {
+            data_nbt_resolve_mut(root, &path.0)
+                .into_iter()
+                .fold(false, |changed, target| {
+                    let ExecTag::List(kind, entries) = target else {
+                        return changed;
+                    };
+                    if entries.is_empty() {
+                        *kind = value.id();
+                    }
+                    match op {
+                        DataModifyOp::Append => entries.push(value.clone()),
+                        DataModifyOp::Prepend => entries.insert(0, value.clone()),
+                        DataModifyOp::Insert(index) => {
+                            let len = entries.len() as i32;
+                            let index = if *index < 0 { len + index } else { *index };
+                            if !(0..=len).contains(&index) {
+                                return changed;
+                            }
+                            entries.insert(index as usize, value.clone());
+                        }
+                        _ => unreachable!(),
+                    }
+                    true
+                })
+        }
+    }
+}
+
+/// `data get`'s reply body for one target: path-less reads print the whole
+/// root, a path resolves to its values, and `scale` multiplies a lone number.
+fn data_get(
+    source: &ExecuteSource,
+    target: &DataTarget,
+    path: Option<&str>,
+    scale: Option<&str>,
+) -> Result<String, String> {
+    let (label, root) = data_read_root(source, target)?;
+    let values: Vec<ExecTag> = match path {
+        Some(path) => {
+            let parsed = ExecuteNbtPath::parse(path)?;
+            let values = parsed.get(&root);
+            if values.is_empty() {
+                return Err(format!("Found no elements at '{path}'"));
+            }
+            values.into_iter().map(|v| v.into_owned()).collect()
+        }
+        None => vec![root],
+    };
+    if values.len() != 1 {
+        return Err(format!(
+            "Found {} elements at '{}'",
+            values.len(),
+            path.unwrap_or("")
+        ));
+    }
+    let rendered = match scale {
+        Some(raw) => {
+            let scale: f64 = raw
+                .parse()
+                .map_err(|_| format!("Invalid scale '{raw}'"))?;
+            let value = data_nbt_f64(&values[0])
+                .ok_or_else(|| "Cannot scale non-numeric data".to_owned())?;
+            format!("{}", value * scale)
+        }
+        None => execute_tag_snbt(&values[0]),
+    };
+    let head = match target {
+        DataTarget::Block(..) => "Storage has the following contents".to_owned(),
+        DataTarget::Entity(_) => format!("{label} has the following entity data"),
+        DataTarget::Storage(_) => format!("{label} has the following contents"),
+    };
+    Ok(format!("{head}: {rendered}"))
+}
+
+/// Reconcile a written block-entity root with the live container store:
+/// `Items` lands in `chests()` (or the furnace slots) so the opened container
+/// shows exactly what `/data` reports; its removal empties the container.
+fn data_sync_block_items(dim: DimId, (x, y, z): BlockPos, root: &ExecTag) {
+    let key = (dim, x, y, z);
+    let furnace = dim == DimId::Overworld && is_furnace_at(x, y, z);
+    match root.get("Items") {
+        Some(items) => {
+            if let Ok(mut slots) = items_nbt_to_stacks(items) {
+                if furnace {
+                    if let Some(f) = furnaces().lock().unwrap().get_mut(&key) {
+                        f.input = slots.remove(&0).unwrap_or_default();
+                        f.fuel = slots.remove(&1).unwrap_or_default();
+                        f.output = slots.remove(&2).unwrap_or_default();
+                    }
+                } else {
+                    chests()
+                        .lock()
+                        .unwrap()
+                        .insert(ContainerKey::Block(key), slots);
+                }
+            }
+        }
+        None => {
+            chests().lock().unwrap().remove(&ContainerKey::Block(key));
+            // A removed `Items` empties a live furnace only when it held
+            // anything; `furnace_slots` reports the non-empty slots.
+            if furnace && !furnace_slots((x, y, z)).is_empty() {
+                if let Some(f) = furnaces().lock().unwrap().get_mut(&key) {
+                    f.input = (0, 0, Vec::new());
+                    f.fuel = (0, 0, Vec::new());
+                    f.output = (0, 0, Vec::new());
+                }
+            }
+        }
+    }
+}
+
+/// Land a rebuilt root back on the target. Entities apply each field through
+/// `data_apply_entity_field` and clear fields the rebuild dropped; blocks go
+/// to the overlay plus the `Items` sync; storage swaps the stored tag.
+fn data_write_root(
+    source: &ExecuteSource,
+    target: &DataTarget,
+    previous: &ExecTag,
+    root: &ExecTag,
+) -> Result<(), String> {
+    match target {
+        DataTarget::Block(dim, pos @ (x, y, z)) => {
+            data_block_overrides()
+                .lock()
+                .unwrap()
+                .insert((*dim, *x, *y, *z), root.clone());
+            data_sync_block_items(*dim, *pos, root);
+            Ok(())
+        }
+        DataTarget::Entity(selector) => {
+            let selected = source.select(selector)?;
+            let [entity] = selected.as_slice() else {
+                return Err(if selected.is_empty() {
+                    "No entity found".into()
+                } else {
+                    "Expected a single entity".into()
+                });
+            };
+            if let ExecTag::Compound(fields) = root {
+                for (key, value) in fields {
+                    if let Ok(name) = key.to_utf8() {
+                        data_apply_entity_field(entity, &name, value);
+                    }
+                }
+            }
+            if let ExecTag::Compound(before) = previous {
+                for key in before.keys() {
+                    let still = matches!(root, ExecTag::Compound(fields) if fields.contains_key(key));
+                    if !still {
+                        if let Ok(name) = key.to_utf8() {
+                            data_remove_entity_field(entity, &name);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        DataTarget::Storage(id) => {
+            execute_storage()
+                .lock()
+                .unwrap()
+                .insert(id.clone(), root.clone());
+            Ok(())
+        }
+    }
+}
+
+/// `data modify`'s source clause: `from <target> [<path>]`, `string <target>
+/// [<path>] [<start>] [<end>]` or a literal `value <snbt>`.
+fn data_modify_source(
+    source: &ExecuteSource,
+    args: &[&str],
+) -> Result<Vec<ExecTag>, String> {
+    let usage = || {
+        "usage: /data modify <target> <path> <set|merge|append|prepend|insert n> \
+         from|string <block|entity|storage> ... [<path>] | value <nbt>"
+            .to_owned()
+    };
+    match args {
+        ["value", snbt] => {
+            let mut reader = brigadier::StringReader::new(*snbt);
+            match execute_read_snbt(&mut reader, 0) {
+                Some(tag) if !reader.can_read() => Ok(vec![tag]),
+                _ => Err(format!("Invalid NBT '{snbt}'")),
+            }
+        }
+        [mode @ ("from" | "string"), rest @ ..] => {
+            let (target, rest) = data_parse_target(source, rest).map_err(|_| usage())?;
+            let (_, root) = data_read_root(source, &target)?;
+            let (values, rest) = match rest {
+                [] => (vec![root], &rest[..]),
+                [path, rest @ ..] => {
+                    let parsed = ExecuteNbtPath::parse(path)?;
+                    let values: Vec<ExecTag> = parsed
+                        .get(&root)
+                        .into_iter()
+                        .map(|v| v.into_owned())
+                        .collect();
+                    if values.is_empty() {
+                        return Err(format!("Found no elements at '{path}'"));
+                    }
+                    (values, rest)
+                }
+            };
+            if *mode == "from" {
+                if !rest.is_empty() {
+                    return Err(usage());
+                }
+                return Ok(values);
+            }
+            let to_index = |raw: Option<&&str>, default: i64| -> Result<i64, String> {
+                match raw {
+                    None => Ok(default),
+                    Some(raw) => raw
+                        .parse::<i64>()
+                        .map_err(|_| format!("Invalid index '{raw}'")),
+                }
+            };
+            let start = to_index(rest.first(), 0)?;
+            let end = to_index(rest.get(1), -1)?;
+            if rest.len() > 2 {
+                return Err(usage());
+            }
+            Ok(values
+                .iter()
+                .map(|value| {
+                    let text = match value {
+                        ExecTag::String(text) => text.to_utf8().unwrap_or_default(),
+                        other => execute_tag_snbt(other),
+                    };
+                    let chars: Vec<char> = text.chars().collect();
+                    let len = chars.len() as i64;
+                    let start = if start < 0 { len + start } else { start }.clamp(0, len) as usize;
+                    let end = if end < 0 { len + end + 1 } else { end }.clamp(start as i64, len) as usize;
+                    ExecTag::String(NbtString::text(&chars[start..end].iter().collect::<String>()))
+                })
+                .collect())
+        }
+        _ => Err(usage()),
+    }
+}
+
+fn run_data_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    let source = ExecuteSource::new(ctx);
+    let reply = match args {
+        ["get", rest @ ..] => {
+            let parsed = data_parse_target(&source, rest)
+                .and_then(|(target, rest)| match rest {
+                    [] => data_get(&source, &target, None, None),
+                    [path] => data_get(&source, &target, Some(path), None),
+                    [path, scale] => data_get(&source, &target, Some(path), Some(scale)),
+                    _ => Err(
+                        "usage: /data get block <x> <y> <z>|entity <t>|storage <id> [<path>] [<scale>]"
+                            .into(),
+                    ),
+                });
+            parsed
+        }
+        ["merge", rest @ ..] => data_parse_target(&source, rest).and_then(|(target, rest)| {
+            let [snbt] = rest else {
+                return Err("usage: /data merge <target> <nbt>".into());
+            };
+            let mut reader = brigadier::StringReader::new(*snbt);
+            let patch = match execute_read_snbt(&mut reader, 0) {
+                Some(tag @ ExecTag::Compound(_)) if !reader.can_read() => tag,
+                _ => return Err(format!("Expected a compound, got '{snbt}'")),
+            };
+            let (_, previous) = match data_read_root(&source, &target) {
+                Ok(read) => read,
+                Err(error) => match &target {
+                    DataTarget::Storage(_) => (String::new(), execute_nbt_compound([])),
+                    _ => return Err(error),
+                },
+            };
+            let mut root = previous.clone();
+            data_nbt_merge(&mut root, &patch);
+            data_write_root(&source, &target, &previous, &root)?;
+            Ok("Modified data".to_owned())
+        }),
+        ["modify", rest @ ..] => data_parse_target(&source, rest).and_then(|(target, rest)| {
+            let [raw_path, rest @ ..] = rest else {
+                return Err("usage: /data modify <target> <path> <op> <source>".into());
+            };
+            let path = ExecuteNbtPath::parse(raw_path)?;
+            let (op, rest) = match rest {
+                ["set", rest @ ..] => (DataModifyOp::Set, &rest[..]),
+                ["merge", rest @ ..] => (DataModifyOp::Merge, &rest[..]),
+                ["append", rest @ ..] => (DataModifyOp::Append, &rest[..]),
+                ["prepend", rest @ ..] => (DataModifyOp::Prepend, &rest[..]),
+                ["insert", index, rest @ ..] => match index.parse::<i32>() {
+                    Ok(index) => (DataModifyOp::Insert(index), &rest[..]),
+                    Err(_) => return Err(format!("Invalid insert index '{index}'")),
+                },
+                _ => return Err("usage: /data modify <target> <path> <op> <source>".into()),
+            };
+            let values = data_modify_source(&source, rest)?;
+            let (_, previous) = data_read_root(&source, &target)?;
+            let mut root = previous.clone();
+            for value in &values {
+                if !data_apply_modify(&mut root, &path, &op, value) {
+                    return Err(format!("Could not modify '{raw_path}'"));
+                }
+            }
+            data_write_root(&source, &target, &previous, &root)?;
+            Ok("Modified data".to_owned())
+        }),
+        ["remove", rest @ ..] => data_parse_target(&source, rest).and_then(|(target, rest)| {
+            let [path] = rest else {
+                return Err("usage: /data remove <target> <path>".into());
+            };
+            let path = ExecuteNbtPath::parse(path)?;
+            let (_, previous) = data_read_root(&source, &target)?;
+            let mut root = previous.clone();
+            data_nbt_remove(&mut root, &path.0);
+            data_write_root(&source, &target, &previous, &root)?;
+            Ok("Removed data".to_owned())
+        }),
+        _ => Err(
+            "usage: /data get|merge|modify|remove block <x> <y> <z>|entity <t>|storage <id> ..."
+                .into(),
+        ),
+    };
+    reply.unwrap_or_else(|error| error)
+}
+
+// -------------------------------------------------- /advancement query (#174)
+
+/// The scope grammar `query` shares with grant/revoke: `everything`, `only`,
+/// `from`, `through`, `until`. The result is the flat id list to count.
+fn advancement_query_scope(tracker: &AdvancementTracker, scope: &[&str]) -> Result<Vec<String>, String> {
+    let resolve = |id: &str| -> Result<String, String> {
+        if let Ok(definition) = resolve_command_advancement(tracker, id) {
+            return Ok(definition.id.to_owned());
+        }
+        let id = if id.contains(':') {
+            id.to_owned()
+        } else {
+            format!("minecraft:{id}")
+        };
+        if advancements().lock().unwrap().contains_key(&id) {
+            Ok(id)
+        } else {
+            Err(format!("Unknown advancement: {id}"))
+        }
+    };
+    match scope {
+        ["everything"] => {
+            let mut ids: Vec<String> = tracker
+                .definitions
+                .iter()
+                .map(|definition| definition.id.to_owned())
+                .collect();
+            for id in advancements().lock().unwrap().keys() {
+                if !ids.iter().any(|known| known == id) {
+                    ids.push(id.clone());
+                }
+            }
+            Ok(ids)
+        }
+        ["only", id] => resolve(id).map(|id| vec![id]),
+        ["from", id] | ["through", id] | ["until", id] => {
+            let id = resolve(id)?;
+            let mut ids: Vec<String> = tracker
+                .definitions
+                .iter()
+                .filter(|definition| {
+                    let downward = tracker.has_ancestor(definition.id, &id);
+                    let upward = tracker.has_ancestor(&id, definition.id);
+                    match scope[0] {
+                        "from" => downward,
+                        "until" => upward,
+                        _ => downward || upward,
+                    }
+                })
+                .map(|definition| definition.id.to_owned())
+                .collect();
+            if ids.is_empty() {
+                // A datapack-only id has no parent linkage; the scope is itself.
+                ids.push(id);
+            }
+            Ok(ids)
+        }
+        _ => Err(
+            "Usage: /advancement query <target> everything|only <adv>|from <adv>|through <adv>|until <adv>"
+                .into(),
+        ),
+    }
+}
+
+/// Live-tracker completion: criteria-complete for registered definitions, the
+/// persisted earned set for datapack-only ids.
+fn advancement_query_done(tracker: &AdvancementTracker, player: &str, id: &str) -> bool {
+    match tracker.definition(id) {
+        Some(definition) => tracker.criteria_complete(player, definition),
+        None => adv_done()
+            .lock()
+            .unwrap()
+            .get(player)
+            .is_some_and(|earned| earned.contains(id)),
+    }
+}
+
+fn run_advancement_query(
+    tracker: &AdvancementTracker,
+    targets: &[Arc<Client>],
+    scope: &[&str],
+) -> String {
+    let ids = match advancement_query_scope(tracker, scope) {
+        Ok(ids) => ids,
+        Err(error) => return error,
+    };
+    targets
+        .iter()
+        .map(|player| {
+            if let ["only", id] = scope {
+                let id = ids.first().map(String::as_str).unwrap_or(id);
+                if advancement_query_done(tracker, &player.name, id) {
+                    return format!("{} has completed advancement {}", player.name, id);
+                }
+                if let Some(definition) = tracker.definition(id) {
+                    let required: HashSet<&str> = definition
+                        .requirements
+                        .iter()
+                        .copied()
+                        .flatten()
+                        .copied()
+                        .collect();
+                    let earned = tracker
+                        .progress
+                        .get(&player.name)
+                        .and_then(|rows| rows.get(definition.id))
+                        .map_or(0, |criteria| {
+                            criteria.keys().filter(|k| required.contains(**k)).count()
+                        });
+                    return format!(
+                        "{} has completed {} of {} criteria for {}",
+                        player.name,
+                        earned,
+                        required.len(),
+                        id
+                    );
+                }
+                return format!("{} has not completed advancement {}", player.name, id);
+            }
+            let granted = ids
+                .iter()
+                .filter(|id| advancement_query_done(tracker, &player.name, id))
+                .count();
+            format!(
+                "{} has completed {} of {} advancements",
+                player.name,
+                granted,
+                ids.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 // ------------------------------------------------------------------ tests ---
 
 #[cfg(test)]
@@ -3806,5 +5097,581 @@ mod p5d_parity_tests {
                 place_block_dim(dim, x, 240, z, 0);
             }
         }
+    }
+}
+
+// ------------------------------------------------------------ p6d_parity ---
+
+#[cfg(test)]
+mod p6d_parity_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    fn p6d_client(eid: i32, name: &str, x: f64, y: f64, z: f64) -> (Arc<Client>, TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.eid = eid;
+        client.name = name.into();
+        *client.pos.lock().unwrap() = (x, y, z, 0.0, 0.0, true);
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        (Arc::new(client), receiver)
+    }
+
+    fn p6d_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    fn p6d_run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    /// A level-`level` operator context for `name`: the ops registry is the
+    /// real `player_permission_level` source, no test-only bypass.
+    fn p6d_op_ctx(name: &str, level: u8) -> CmdCtx {
+        if level > 0 {
+            ops_registry()
+                .lock()
+                .unwrap()
+                .set(name, level, false);
+        }
+        let (client, _recv) = p6d_client(97_000 + level as i32, name, 0.5, 16.0, 0.5);
+        p6d_ctx(Some(client))
+    }
+
+    fn p6d_deop(name: &str) {
+        ops_registry().lock().unwrap().remove(name);
+    }
+
+    fn p6d_frame_varint(r: &mut TcpStream) -> Option<(i64, usize)> {
+        let mut value = 0i64;
+        for i in 0..5 {
+            let mut b = [0u8; 1];
+            r.read_exact(&mut b).ok()?;
+            value |= ((b[0] & 0x7f) as i64) << (7 * i);
+            if b[0] & 0x80 == 0 {
+                return Some((value, i + 1));
+            }
+        }
+        None
+    }
+
+    /// One uncompressed frame: varint length, varint packet id, payload.
+    fn p6d_read_frame(r: &mut TcpStream) -> Option<(i64, Vec<u8>)> {
+        let (len, _) = p6d_frame_varint(r)?;
+        let (id, used) = p6d_frame_varint(r)?;
+        let mut payload = vec![0u8; (len as usize).checked_sub(used)?];
+        r.read_exact(&mut payload).ok()?;
+        Some((id, payload))
+    }
+
+    fn p6d_seed_profiler() {
+        let mut profiler = live_hotspot_profiler().lock().unwrap();
+        profiler.reset();
+        for us in [9_000u32, 11_000, 14_000, 10_000, 12_000] {
+            profiler.record_tick_us(us);
+        }
+        profiler.record_chunk_work(DimId::Overworld, 12, -4, ProfilerSubsystem::Hoppers, 8_500);
+        profiler.record_chunk_work(DimId::Overworld, 12, -4, ProfilerSubsystem::Hoppers, 5_700);
+        profiler.record_chunk_work(DimId::Nether, 2, 7, ProfilerSubsystem::Mobs, 3_100);
+    }
+
+    // /profile: owner-level only, live profiler output, clean reset.
+    #[test]
+    fn p6d_parity_profile_permission_levels_refuse_below_four() {
+        let _world = world_guard();
+        let denied = "You do not have permission to run that command";
+        for (name, level) in [
+            ("p6d_l0", 0u8),
+            ("p6d_l2", 2),
+            ("p6d_l3", 3),
+        ] {
+            let ctx = p6d_op_ctx(name, level);
+            assert_eq!(
+                p6d_run(&ctx, "/profile"),
+                denied,
+                "level-{level} source must be refused /profile"
+            );
+            assert_eq!(
+                p6d_run(&ctx, "/profile reset"),
+                denied,
+                "level-{level} source must be refused /profile reset"
+            );
+            p6d_deop(name);
+        }
+        // The advertised tree keeps the literals away from lower levels.
+        for level in 0..4u8 {
+            let root = native_command_dispatcher(level, None);
+            assert!(
+                root.root().child("profile").is_none(),
+                "profile literal must not be advertised at level {level}"
+            );
+        }
+        for level in 0..3u8 {
+            let root = native_command_dispatcher(level, None);
+            assert!(
+                root.root().child("transfer").is_none(),
+                "transfer literal must not be advertised at level {level}"
+            );
+        }
+        let level3 = native_command_dispatcher(3, None);
+        assert!(level3.root().child("transfer").is_some());
+        assert!(level3.root().child("profile").is_none());
+        let level4 = native_command_dispatcher(4, None);
+        assert!(level4.root().child("profile").is_some());
+        assert!(level4.root().child("transfer").is_some());
+    }
+
+    #[test]
+    fn p6d_parity_profile_level_two_mcfunction_refused() {
+        let _world = world_guard();
+        p6d_seed_profiler();
+        let ctx = p6d_op_ctx("p6d_fn2", 2);
+        // A `.mcfunction` frame re-enters run_command_ctx with the same source;
+        // run_function_lines is that path, not a test approximation.
+        run_function_lines(
+            &["profile reset".to_owned()],
+            ctx.me.clone(),
+            &mut None,
+            0,
+        );
+        let report = live_hotspot_profiler().lock().unwrap().summary(5);
+        assert_eq!(
+            report.ticks_recorded, 5,
+            "level-2 .mcfunction `profile reset` must not touch the profiler"
+        );
+        p6d_deop("p6d_fn2");
+    }
+
+    #[test]
+    fn p6d_parity_profile_live_hotspots_and_reset() {
+        let _world = world_guard();
+        p6d_seed_profiler();
+        let ctx = p6d_ctx(None); // console: level 4
+        let report = p6d_run(&ctx, "/profile");
+        assert!(report.contains("TPS "), "{report}");
+        assert!(report.contains("MSPT mean"), "{report}");
+        assert!(report.contains("Top chunk hotspots:"), "{report}");
+        assert!(
+            report.contains("Overworld chunk (12, -4) [x=200, z=-56]"),
+            "{report}"
+        );
+        assert!(report.contains("hoppers"), "{report}");
+        assert!(report.contains("Nether chunk (2, 7)"), "{report}");
+        // top_n clamps at 1..=20: a bare `1` prints only the hottest chunk.
+        let top1 = p6d_run(&ctx, "/profile 1");
+        assert!(top1.contains("Overworld chunk (12, -4)"), "{top1}");
+        assert!(!top1.contains("Nether chunk"), "{top1}");
+        assert_eq!(
+            p6d_run(&ctx, "/profile reset"),
+            "Profiler counters reset"
+        );
+        let after = p6d_run(&ctx, "/profile");
+        assert!(after.contains("No chunk hotspots recorded."), "{after}");
+        assert!(after.contains("(0 ticks)"), "{after}");
+        // Usage rejects unknown subcommands and extra arguments.
+        assert_eq!(
+            p6d_run(&ctx, "/profile bogus"),
+            "usage: /profile [<top_n>|reset]"
+        );
+        assert_eq!(
+            p6d_run(&ctx, "/profile 1 2"),
+            "usage: /profile [<top_n>|reset]"
+        );
+        // An op-4 player runs it too.
+        let admin = p6d_op_ctx("p6d_l4", 4);
+        assert!(p6d_run(&admin, "/profile").contains("MSPT"), "op-4 refused");
+        p6d_deop("p6d_l4");
+    }
+
+    // /transfer: protocol-767 clientbound 0x73, fail-closed validation, op >= 3.
+    #[test]
+    fn p6d_parity_transfer_packet_id_and_wire_bytes() {
+        let _world = world_guard();
+        // `proto/src/data_v767.rs` pins (Play, Clientbound, "transfer", 0x73).
+        assert_eq!(TRANSFER_PACKET_ID, 0x73);
+        let (player, mut recv) = p6d_client(97_100, "p6d_xfer", 0.5, 16.0, 0.5);
+        clients().lock().unwrap().push(player.clone());
+        let ctx = p6d_ctx(None);
+        assert_eq!(
+            p6d_run(&ctx, "/transfer example.org 25565 p6d_xfer"),
+            "Transferred 1 player(s) to example.org:25565"
+        );
+        let (id, payload) = p6d_read_frame(&mut recv).expect("transfer frame");
+        assert_eq!(id, 0x73, "protocol-767 transfer packet id");
+        // String("example.org") + VarInt(25565): [0x0b]["example.org"][0xdd 0xc7 0x01].
+        let mut expected = vec![11u8];
+        expected.extend_from_slice(b"example.org");
+        expected.extend_from_slice(&[0xdd, 0xc7, 0x01]);
+        assert_eq!(payload, expected, "transfer wire bytes");
+        // Default port 25565 when omitted, executor = default target.
+        let (admin, mut recv2) = p6d_client(97_101, "p6d_xfer4", 0.5, 16.0, 0.5);
+        ops_registry().lock().unwrap().set("p6d_xfer4", 4, false);
+        clients().lock().unwrap().push(admin.clone());
+        let admin_ctx = p6d_ctx(Some(admin));
+        assert_eq!(
+            p6d_run(&admin_ctx, "/transfer localhost"),
+            "Transferred 1 player(s) to localhost:25565"
+        );
+        let (id, payload) = p6d_read_frame(&mut recv2).expect("default-port frame");
+        assert_eq!(id, 0x73);
+        let mut expected = vec![9u8];
+        expected.extend_from_slice(b"localhost");
+        expected.extend_from_slice(&[0xdd, 0xc7, 0x01]);
+        assert_eq!(payload, expected);
+        clients()
+            .lock()
+            .unwrap()
+            .retain(|c| !matches!(c.eid, 97_100 | 97_101));
+        ops_registry().lock().unwrap().remove("p6d_xfer4");
+    }
+
+    #[test]
+    fn p6d_parity_transfer_fail_closed_and_permission() {
+        let _world = world_guard();
+        let (player, mut recv) = p6d_client(97_110, "p6d_xfer3", 0.5, 16.0, 0.5);
+        ops_registry()
+            .lock()
+            .unwrap()
+            .set("p6d_xfer3", 3, false);
+        clients().lock().unwrap().push(player.clone());
+        let ctx3 = p6d_ctx(Some(player.clone()));
+        // Level 3 is exactly enough — vanilla hasPermission(3).
+        assert!(p6d_run(&ctx3, "/transfer ok.example 7777")
+            .starts_with("Transferred 1 player(s)"));
+        let _ = p6d_read_frame(&mut recv).expect("level-3 transfer");
+        // Fail-closed validation: no packet leaves for any of these.
+        assert!(
+            p6d_run(&ctx3, "/transfer \"bad host\" 7777").starts_with("Invalid hostname"),
+            "quoted hostname containing a space must fail closed"
+        );
+        assert_eq!(p6d_run(&ctx3, "/transfer host 0"), "Invalid port '0'");
+        assert_eq!(p6d_run(&ctx3, "/transfer host 65536"), "Invalid port '65536'");
+        assert_eq!(p6d_run(&ctx3, "/transfer host -1"), "Invalid port '-1'");
+        assert_eq!(p6d_run(&ctx3, "/transfer host abc"), "Invalid port 'abc'");
+        assert_eq!(
+            p6d_run(&ctx3, &format!("/transfer {}", "x".repeat(256))),
+            format!("Invalid hostname '{}'", "x".repeat(256))
+        );
+        assert_eq!(
+            p6d_run(&ctx3, "/transfer"),
+            "usage: /transfer <hostname> [<port>] [<players>]"
+        );
+        // Nothing reached the wire for the refused commands above.
+        let mut sink = [0u8; 1];
+        assert!(recv.read_exact(&mut sink).is_err(), "refused transfers sent a packet");
+        // A level-2 operator (and therefore a level-2 function frame) is refused.
+        let (weak, _r) = p6d_client(97_111, "p6d_xfer2", 0.5, 16.0, 0.5);
+        ops_registry()
+            .lock()
+            .unwrap()
+            .set("p6d_xfer2", 2, false);
+        let ctx2 = p6d_ctx(Some(weak));
+        assert_eq!(
+            p6d_run(&ctx2, "/transfer host"),
+            "You do not have permission to run that command"
+        );
+        run_function_lines(
+            &["transfer host 7777 p6d_xfer3".to_owned()],
+            ctx2.me.clone(),
+            &mut None,
+            0,
+        );
+        assert!(recv.read_exact(&mut sink).is_err(), "level-2 function sent a packet");
+        clients()
+            .lock()
+            .unwrap()
+            .retain(|c| !matches!(c.eid, 97_110 | 97_111));
+        ops_registry().lock().unwrap().remove("p6d_xfer3");
+        ops_registry().lock().unwrap().remove("p6d_xfer2");
+    }
+
+    // /data: storage, entity, block roundtrips through get/merge/modify/remove.
+    #[test]
+    fn p6d_parity_data_storage_roundtrip() {
+        let _world = world_guard();
+        let ctx = p6d_ctx(None);
+        let store = "minecraft:p6d_db";
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data merge storage {store} {{a:1b,list:[1,2],nested:{{x:5}}}}")),
+            "Modified data"
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data get storage {store} a")),
+            format!("Storage '{store}' has the following contents: 1b")
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data get storage {store} nested.x")),
+            format!("Storage '{store}' has the following contents: 5")
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data get storage {store} list")),
+            format!("Storage '{store}' has the following contents: [1,2]")
+        );
+        // merge merges deep, not whole-compound replace.
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data merge storage {store} {{nested:{{y:7}}}}")),
+            "Modified data"
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data get storage {store} nested")),
+            format!("Storage '{store}' has the following contents: {{\"x\":5,\"y\":7}}")
+        );
+        // modify set / append / insert / merge.
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data modify storage {store} a set value 9b")),
+            "Modified data"
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data get storage {store} a")),
+            format!("Storage '{store}' has the following contents: 9b")
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data modify storage {store} list append value 3")),
+            "Modified data"
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data modify storage {store} list insert 0 value 0")),
+            "Modified data"
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data get storage {store} list")),
+            format!("Storage '{store}' has the following contents: [0,1,2,3]")
+        );
+        // from-source modify copies a live value.
+        assert_eq!(
+            p6d_run(
+                &ctx,
+                &format!("/data modify storage {store} copied set from storage {store} nested.x")
+            ),
+            "Modified data"
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data get storage {store} copied")),
+            format!("Storage '{store}' has the following contents: 5")
+        );
+        // remove prunes nested paths and list indices.
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data remove storage {store} nested.x")),
+            "Removed data"
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data get storage {store} nested")),
+            format!("Storage '{store}' has the following contents: {{\"y\":7}}")
+        );
+        assert_eq!(
+            p6d_run(&ctx, &format!("/data get storage {store} missing")),
+            format!("Found no elements at 'missing'")
+        );
+        execute_storage().lock().unwrap().remove(store);
+    }
+
+    #[test]
+    fn p6d_parity_data_entity_roundtrip() {
+        let _world = world_guard();
+        let (player, _recv) = p6d_client(97_200, "p6d_data", 1.5, 64.0, -2.5);
+        clients().lock().unwrap().push(player.clone());
+        let ctx = p6d_ctx(None);
+        // Live reads: Pos/Health/Motion/Air/Tags out of the real player state.
+        let pos = p6d_run(&ctx, "/data get entity p6d_data Pos");
+        assert!(pos.contains("1.5d"), "{pos}");
+        assert!(pos.contains("64d"), "{pos}");
+        assert!(pos.contains("-2.5d"), "{pos}");
+        assert_eq!(
+            p6d_run(&ctx, "/data get entity p6d_data Health"),
+            "p6d_data has the following entity data: 20f"
+        );
+        assert_eq!(
+            p6d_run(&ctx, "/data get entity p6d_data Air"),
+            format!("p6d_data has the following entity data: {}s", *player.air.lock().unwrap())
+        );
+        assert_eq!(
+            p6d_run(&ctx, "/data get entity p6d_data Motion"),
+            "p6d_data has the following entity data: [0d,0d,0d]"
+        );
+        // merge writes reach the live model: Health lands in the hp mutex.
+        assert_eq!(
+            p6d_run(&ctx, "/data merge entity p6d_data {Health:5.0f,Tags:[\"marker\"],NoAI:1b}"),
+            "Modified data"
+        );
+        assert_eq!(*player.hp.lock().unwrap(), 5.0);
+        assert!(tags()
+            .lock()
+            .unwrap()
+            .get("p:p6d_data")
+            .is_some_and(|set| set.contains("marker")));
+        assert_eq!(
+            p6d_run(&ctx, "/data get entity p6d_data NoAI"),
+            "p6d_data has the following entity data: 1b"
+        );
+        // modify append on Tags, then remove Health restores the load default.
+        assert_eq!(
+            p6d_run(
+                &ctx,
+                "/data modify entity p6d_data Tags append value \"second\""
+            ),
+            "Modified data"
+        );
+        let tags_out = p6d_run(&ctx, "/data get entity p6d_data Tags");
+        assert!(tags_out.contains("\"marker\"") && tags_out.contains("\"second\""), "{tags_out}");
+        assert_eq!(
+            p6d_run(&ctx, "/data remove entity p6d_data Health"),
+            "Removed data"
+        );
+        assert_eq!(*player.hp.lock().unwrap(), 20.0);
+        // SelectedItem/Inventory write through to the live inventory map.
+        let stone = name_to_item("stone").unwrap();
+        assert_eq!(
+            p6d_run(
+                &ctx,
+                "/data merge entity p6d_data {SelectedItem:{id:\"minecraft:stone\",count:2}}"
+            ),
+            "Modified data"
+        );
+        let held_slot = 36 + *player.held.lock().unwrap();
+        assert_eq!(
+            player.inv.lock().unwrap().get(&held_slot).map(|s| (s.0, s.1)),
+            Some((stone, 2))
+        );
+        assert_eq!(
+            p6d_run(&ctx, "/data get entity p6d_data SelectedItem.id"),
+            "p6d_data has the following entity data: \"minecraft:stone\""
+        );
+        // Rotation/Pos land in the live position tuple.
+        assert_eq!(
+            p6d_run(&ctx, "/data merge entity p6d_data {Rotation:[90.0f,45.0f]}"),
+            "Modified data"
+        );
+        let pos = *player.pos.lock().unwrap();
+        assert_eq!((pos.3, pos.4), (90.0, 45.0));
+        clients().lock().unwrap().retain(|c| c.eid != 97_200);
+        tags().lock().unwrap().remove("p:p6d_data");
+        data_entity_extras().lock().unwrap().remove("p:p6d_data");
+    }
+
+    #[test]
+    fn p6d_parity_data_block_roundtrip() {
+        let _world = world_guard();
+        let ctx = p6d_ctx(None);
+        let key = ContainerKey::Block((DimId::Overworld, 40, 90, 40));
+        let stone = name_to_item("stone").unwrap();
+        chests()
+            .lock()
+            .unwrap()
+            .insert(key, HashMap::from([(0i16, (stone, 3u8, Vec::new()))]));
+        let got = p6d_run(&ctx, "/data get block 40 90 40 Items");
+        assert!(got.starts_with("Storage has the following contents"), "{got}");
+        assert!(got.contains("\"minecraft:stone\""), "{got}");
+        assert!(got.contains("\"count\":3"), "{got}");
+        // merge lands in the live container store — a list field replaces
+        // whole (vanilla `Items` is a flat list, not slot-keyed).
+        assert_eq!(
+            p6d_run(
+                &ctx,
+                "/data merge block 40 90 40 {Items:[{Slot:2b,id:\"minecraft:diamond\",count:1}]}"
+            ),
+            "Modified data"
+        );
+        {
+            let live = chests().lock().unwrap();
+            let slots = live.get(&key).unwrap();
+            assert_eq!(slots.get(&2).map(|s| s.1), Some(1));
+            assert_eq!(slots.len(), 1);
+        }
+        // modify set rewrites a single nested value in place.
+        assert_eq!(
+            p6d_run(&ctx, "/data modify block 40 90 40 Items[0].count set value 7"),
+            "Modified data"
+        );
+        assert_eq!(
+            p6d_run(&ctx, "/data get block 40 90 40 Items[0].count"),
+            "Storage has the following contents: 7"
+        );
+        assert_eq!(
+            chests().lock().unwrap().get(&key).and_then(|s| s.get(&2)).map(|s| s.1),
+            Some(7)
+        );
+        // remove Items empties the live container.
+        assert_eq!(
+            p6d_run(&ctx, "/data remove block 40 90 40 Items"),
+            "Removed data"
+        );
+        assert!(chests().lock().unwrap().get(&key).is_none()
+            || chests().lock().unwrap().get(&key).is_some_and(|s| s.is_empty()));
+        // A block position with no block entity fails closed.
+        assert_eq!(
+            p6d_run(&ctx, "/data get block 60 90 60"),
+            "The block at 60, 90, 60 is not a block entity"
+        );
+        chests().lock().unwrap().remove(&key);
+        data_block_overrides()
+            .lock()
+            .unwrap()
+            .remove(&(DimId::Overworld, 40, 90, 40));
+        data_block_overrides()
+            .lock()
+            .unwrap()
+            .remove(&(DimId::Overworld, 60, 90, 60));
+    }
+
+    // /advancement query: exact granted/total counts against the live tracker.
+    #[test]
+    fn p6d_parity_advancement_query_exact_counts() {
+        let _world = world_guard();
+        let (player, _recv) = p6d_client(97_300, "p6d_adv", 0.5, 16.0, 0.5);
+        clients().lock().unwrap().push(player.clone());
+        let ctx = p6d_ctx(None);
+        // 19 live definitions in CORE_ADVANCEMENTS; nothing granted yet.
+        assert_eq!(
+            p6d_run(&ctx, "/advancement query p6d_adv everything"),
+            "p6d_adv has completed 0 of 19 advancements"
+        );
+        // only: the single-id scope reports the id itself.
+        assert_eq!(
+            p6d_run(&ctx, "/advancement query p6d_adv only minecraft:story/root"),
+            "p6d_adv has completed 0 of 1 criteria for minecraft:story/root"
+        );
+        // Grant the root, then the mine_diamond chain (root, mine_stone,
+        // upgrade_tools, smelt_iron, iron_tools, mine_diamond = 6).
+        let grant = p6d_run(&ctx, "/advancement grant p6d_adv until minecraft:story/mine_diamond");
+        assert!(grant.contains("6 advancement"), "{grant}");
+        assert_eq!(
+            p6d_run(&ctx, "/advancement query p6d_adv everything"),
+            "p6d_adv has completed 6 of 19 advancements"
+        );
+        // until smelt_iron: smelt_iron + upgrade_tools + mine_stone + root = 4.
+        assert_eq!(
+            p6d_run(&ctx, "/advancement query p6d_adv until minecraft:story/smelt_iron"),
+            "p6d_adv has completed 4 of 4 advancements"
+        );
+        // from mine_diamond: mine_diamond + shiny_gear + enchant_item = 3, of
+        // which only mine_diamond itself is granted.
+        assert_eq!(
+            p6d_run(&ctx, "/advancement query p6d_adv from minecraft:story/mine_diamond"),
+            "p6d_adv has completed 1 of 3 advancements"
+        );
+        // through smelt_iron covers the whole story tree (16): until-side 4
+        // plus descendants, with the 6 granted so far.
+        assert_eq!(
+            p6d_run(&ctx, "/advancement query p6d_adv through minecraft:story/smelt_iron"),
+            "p6d_adv has completed 6 of 16 advancements"
+        );
+        // only on an incomplete advancement reports criteria progress.
+        let only = p6d_run(&ctx, "/advancement query p6d_adv only minecraft:story/obtain_armor");
+        assert!(
+            only.contains("obtain_armor"),
+            "{only}"
+        );
+        clients().lock().unwrap().retain(|c| c.eid != 97_300);
+        let mut tracker = player_advancements().lock().unwrap();
+        tracker.progress.remove("p6d_adv");
+        tracker.sent_progress.remove("p6d_adv");
+        adv_done().lock().unwrap().remove("p6d_adv");
     }
 }

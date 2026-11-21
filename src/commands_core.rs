@@ -3345,14 +3345,17 @@ fn restore_player_advancements(tracker: &mut AdvancementTracker, name: &str) {
 }
 
 fn run_advancement_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
-    let [action @ ("grant" | "revoke"), target, scope @ ..] = args else {
-        return "Usage: /advancement grant|revoke <target> <scope>".into();
+    let [action @ ("grant" | "revoke" | "query"), target, scope @ ..] = args else {
+        return "Usage: /advancement grant|revoke|query <target> <scope>".into();
     };
     let targets = player_command_targets(target, source);
     if targets.is_empty() {
         return "No player found".into();
     }
     let mut tracker = player_advancements().lock().unwrap();
+    if *action == "query" {
+        return run_advancement_query(&tracker, &targets, scope);
+    }
     let now = advancement_time_ms();
     let mut replies = Vec::new();
     let mut resolved = args.to_vec();
@@ -4107,7 +4110,7 @@ fn command_usage(name: &str) -> String {
     // Anything missing here is not a command the server knows, so /help
     // reports it as unknown rather than pretending a usage line exists.
     let usage = match name.trim_start_matches('/') {
-        "advancement" => "/advancement grant|revoke <target> everything|from|through|until|only <id> [<criterion>]",
+        "advancement" => "/advancement grant|revoke|query <target> everything|from|through|until|only <id> [<criterion>]",
         "attribute" => "/attribute <target> <attribute> base|modifier ...",
         "ban" => "/ban <player> [<reason>]",
         "ban-ip" => "/ban-ip <target> [<reason>]",
@@ -4117,7 +4120,7 @@ fn command_usage(name: &str) -> String {
         "clone" => "/clone <from> <to> <destination> [replace|masked|filtered <block>] [force|move|normal]",
         "counts" => "no arguments; debug entity/store census",
         "damage" => "/damage <target> <amount> [<type>] [at <pos>|by <entity>]",
-        "data" => "/data get|remove block <x> <y> <z> Items | get entity <target> <path>",
+        "data" => "/data get|merge|modify|remove block <x> <y> <z>|entity <target>|storage <id> [<path>] [<nbt|source|scale>]",
         "datapack" => "/datapack list [enabled|available] | enable <name> | disable <name>",
         "defaultgamemode" => "/defaultgamemode <survival|creative|adventure|spectator>",
         "deop" => "/deop <player>",
@@ -4148,6 +4151,7 @@ fn command_usage(name: &str) -> String {
         "particle" => "/particle <particle> [<x> <y> <z> [<dx> <dy> <dz> [<speed> [<count> [<mode> [<viewers>]]]]]]",
         "place" => "/place feature|template <id> [<pos>]",
         "player" => "/player <name> spawn|look|attack|use|stop|kill",
+        "profile" => "/profile [<top_n>|reset]",
         "playsound" => "/playsound <sound> [<source>] [<target>] [<pos>] [<volume>] [<pitch>] [<minVolume>]",
         "random" => "/random value|roll <range> [<sequence>] | reset <sequence> [*]",
         "recipe" => "/recipe give|take <target> <recipe|*>",
@@ -4177,6 +4181,7 @@ fn command_usage(name: &str) -> String {
         "tick" => "/tick query|rate|freeze|unfreeze|step|sprint ...",
         "time" => "/time add <time>[t|s|d] | set <day|noon|night|midnight|ticks> | query <day|daytime|gametime>",
         "title" => "/title <target> title|subtitle|actionbar|times|clear|reset ...",
+        "transfer" => "/transfer <hostname> [<port>] [<players>]",
         "trigger" => "/trigger <objective> [add|set <value>]",
         "weather" => "/weather clear|rain|thunder [<duration>]",
         "whitelist" => "/whitelist on|off|list|add|remove|reload [<player>]",
@@ -4710,6 +4715,16 @@ fn native_command_dispatcher(
     }
     for name in ["clear", "gamerule", "setworldspawn", "spawnpoint"] {
         register_at_level(name, done(name).then(args("arguments")));
+    }
+    // Vanilla's `/transfer` literal sits at level 3; `/profile` is the owner
+    // diagnostic PERF-1's profiler feeds at level 4. `register_at_level` keys
+    // on `required_permission_level` — which this lane cannot narrow — so both
+    // gates are explicit here and enforced again inside dispatch.
+    if level >= 3 {
+        register(literal("transfer").then(args("arguments")));
+    }
+    if level >= 4 {
+        register(literal("profile").then(args("arguments")));
     }
     dispatcher
 }
@@ -7382,94 +7397,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 _ => format!("player: unknown subcommand {}", sub),
             }
         }
-        "data" => {
-            // data remove|get block x y z <path>
-            if args.get(1).copied() == Some("block") && args.len() >= 6 {
-                let (bx, by, bz) = (coord(args[2], ctx.x) as i32, coord(args[3], ctx.y) as i32, coord(args[4], ctx.z) as i32);
-                let path = args.get(5).copied().unwrap_or("");
-                match args[0] {
-                    "remove" => {
-                        if path == "Items" {
-                            chests().lock().unwrap().remove(&ContainerKey::ow((bx, by, bz)));
-                            if let Some(f) = furnaces().lock().unwrap().get_mut(&ow_block((bx, by, bz))) {
-                                f.input = (0, 0, Vec::new()); f.fuel = (0, 0, Vec::new()); f.output = (0, 0, Vec::new());
-                            }
-                        }
-                        "Removed data from block".into()
-                    }
-                    "get" => {
-                        if path == "Items" || path.is_empty() {
-                            let mut slots = if is_furnace_at(bx, by, bz) { furnace_slots((bx, by, bz)) }
-                                else { chests().lock().unwrap().get(&ContainerKey::ow((bx, by, bz))).cloned().unwrap_or_default() };
-                            let mut v: Vec<(i16, Stack)> = slots.drain().collect();
-                            v.sort_by_key(|(k, _)| *k);
-                            let items: Vec<String> = v.iter()
-                                .map(|(k, (it, c, _))| format!("{{Slot:{}b,id:{},count:{}}}", k, it, c))
-                                .collect();
-                            format!("Storage has the following contents: [Items:[{}]]", items.join(","))
-                        } else { "unsupported path (have: Items)".into() }
-                    }
-                    _ => "usage: /data get|remove block x y z Items".into(),
-                }
-            } else if args.get(1).copied() == Some("entity") && args.len() >= 4 {
-                // data get entity <selector> <path>: Pos|Health|Inventory[<...>]
-                if args[0] != "get" { return "usage: /data get entity <sel> <path>".into() }
-                let sel = args[2];
-                let path = args.get(3).copied().unwrap_or("");
-                let eids = resolve_selector(sel, me);
-                let mut out = String::new();
-                // players first
-                let cls: Vec<Arc<Client>> = client_snapshot();
-                for e in &eids {
-                    if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *e) {
-                        let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
-                        let v = match path {
-                            "Pos" => format!("[{}d,{}d,{}d]", px, py, pz),
-                            "Health" => format!("{}", *c.hp.lock().unwrap()),
-                            p if p.starts_with("Inventory") => {
-                                let inv = c.inv.lock().unwrap();
-                                let mut v: Vec<(i16,Stack)> = inv.iter().map(|(k,v)|(*k,v.clone())).collect();
-                                v.sort_by_key(|(k,_)| *k);
-                                format!("[{}]", v.iter().map(|(k,(it,c,_))| format!("{{Slot:{}b,id:{},count:{}}}",k,it,c)).collect::<Vec<_>>().join(","))
-                            }
-                            _ => format!("unsupported path '{}'", path),
-                        };
-                        out += &format!("{} has: {}; ", c.name, v);
-                    }
-                }
-                drop(cls);
-                // item drops
-                let dps = drops().lock().unwrap();
-                for e in &eids {
-                    if let Some(deid) = e.strip_prefix("d:").and_then(|x| x.parse::<i32>().ok()) {
-                        if let Some(d) = dps.iter().find(|d| d.eid == deid) {
-                            let v = match path {
-                                "Pos" => format!("[{}d,{}d,{}d]", d.x, d.y, d.z),
-                                "Item" => format!("{{id:{},count:{}}}", d.item, d.cnt),
-                                _ => format!("unsupported path '{}'", path),
-                            };
-                            out += &format!("entity {} has: {}; ", e, v);
-                        }
-                    }
-                }
-                drop(dps);
-                // mobs
-                let ms = mobs().lock().unwrap();
-                for e in &eids {
-                    let meid = e.strip_prefix("m:").unwrap_or(e);
-                    if let Some(m) = ms.iter().find(|m| m.eid.to_string() == meid) {
-                        let (px, py, pz, ..) = { let p = m.pos.lock().unwrap(); *p };
-                        let v = match path {
-                            "Pos" => format!("[{}d,{}d,{}d]", px, py, pz),
-                            "Health" => format!("{}", *m.hp.lock().unwrap()),
-                            _ => format!("unsupported path '{}'", path),
-                        };
-                        out += &format!("entity {} has: {}; ", e, v);
-                    }
-                }
-                if out.is_empty() { "No entity found".into() } else { out.trim_end().into() }
-            } else { "usage: /data get|remove block x y z Items | get entity <sel> <path>".into() }
-        }
+        "data" => run_data_command(ctx, &args),
+        // `/profile` is owner-level (4) and `/transfer` moderator-level (3);
+        // both handlers re-check `level` because `required_permission_level`
+        // defaults unmapped names to 2 and a level-2 `.mcfunction` frame must
+        // never reach either command.
+        "profile" => run_profile_command(level, &args),
+        "transfer" => run_transfer_command(ctx, level, &args),
         "list" => {
             let c = clients().lock().unwrap();
             let names: Vec<String> = c.iter().map(|x| x.name.clone()).collect();
