@@ -1,0 +1,53 @@
+name: Cross-platform checks
+
+on:
+  push:
+    branches:
+      - main
+      - 'fix/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  xplat:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Toolchain pinned (audit item 197); bump deliberately together with a green build.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.0
+      # The eleven standalone crates each carry their own Cargo.lock; build and
+      # test them on every OS so a Unix-only assumption fails here, not on a
+      # contributor's Windows machine.
+      - name: Standalone crate builds and tests
+        shell: bash
+        run: |
+          for d in core proto state-store server-files mod-offload mod-adapter-core create-adapter client-kernel client-port client-ui client-app; do
+            echo "=== $d ==="
+            cargo test --manifest-path "$d/Cargo.toml" --locked
+          done
+      # Root binary must compile everywhere: signal-hook is cfg(unix)-gated and
+      # entity UUID entropy goes through os_fill_random (urandom / BCryptGenRandom).
+      - name: Root binary check (locked)
+        run: cargo check --bins --locked
+      - name: Python gates
+        shell: bash
+        run: |
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" tools/provenance_check.py
+          "$PY" tests/mini_jre_test.py
+          "$PY" tests/megu_translate_test.py
+          "$PY" website/check_site.py

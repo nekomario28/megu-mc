@@ -395,6 +395,43 @@ fn every_ms(cell: &'static OnceLock<Mutex<Instant>>, period: u64, body: impl FnO
         body();
     }
 }
+/// Cross-platform OS entropy fill. Unix reads `/dev/urandom`; Windows calls
+/// Win32 `BCryptGenRandom` with the system-preferred RNG — zero extra crates.
+/// Returns false when the platform source could not supply the bytes.
+fn os_fill_random(buf: &mut [u8]) -> bool {
+    #[cfg(unix)]
+    return std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(buf))
+        .is_ok();
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt")]
+        extern "system" {
+            fn BCryptGenRandom(
+                halgorithm: *mut core::ffi::c_void,
+                pbbuffer: *mut u8,
+                cbbuffer: u32,
+                dwflags: u32,
+            ) -> i32;
+        }
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+        // NTSTATUS success codes are non-negative; a NULL algorithm handle
+        // selects the system-preferred RNG when the flag is set.
+        unsafe {
+            BCryptGenRandom(
+                core::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            ) >= 0
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = buf;
+        false
+    }
+}
 static TICK: AtomicU64 = AtomicU64::new(0);
 static SPAWN_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 static WORLD_TIME: AtomicU64 = AtomicU64::new(1000); // morning
@@ -628,12 +665,15 @@ fn environment_time_tick() {
         });
     });
     every_ms(&SIZE_LOG_AT, SIZE_LOG_MS, || {
+        #[cfg(target_os = "linux")]
         let rss = std::fs::read_to_string("/proc/self/status")
             .unwrap_or_default()
             .lines()
             .find(|l| l.starts_with("VmRSS"))
             .map(|l| l.to_string())
             .unwrap_or_default();
+        #[cfg(not(target_os = "linux"))]
+        let rss = String::new();
         eprintln!("[sz] t={} {} | mobs={} drops={} xps={} arrows={} bob={} pearl={} primed={} chests={} furn={} crops={} world={} inv={} clients={}",
             t, rss.trim(),
             mobs().lock().unwrap().len(), drops().lock().unwrap().len(), xps().lock().unwrap().len(),
@@ -5179,9 +5219,7 @@ fn materialize_generation_payloads_inner(
                     let mut ms = mobs().lock().unwrap();
                     if ms.len() < MOB_CAP {
                         let mut uuid = [0u8; 16];
-                        std::fs::File::open("/dev/urandom")
-                            .and_then(|mut f| f.read_exact(&mut uuid))
-                            .expect("entity UUID entropy");
+                        assert!(os_fill_random(&mut uuid), "entity UUID entropy");
                         uuid[6] = (uuid[6] & 15) | 64;
                         uuid[8] = (uuid[8] & 63) | 128;
                         ms.push(Arc::new(Mob {
@@ -5211,9 +5249,7 @@ fn materialize_generation_payloads_inner(
             }
             crate::generation_payload::GenerationPayload::ChestMinecart { loot_seed } => {
                 let mut uuid = [0; 16];
-                std::fs::File::open("/dev/urandom")
-                    .and_then(|mut f| f.read_exact(&mut uuid))
-                    .expect("entity UUID entropy");
+                assert!(os_fill_random(&mut uuid), "entity UUID entropy");
                 uuid[6] = (uuid[6] & 15) | 64;
                 uuid[8] = (uuid[8] & 63) | 128;
                 let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -5237,9 +5273,7 @@ fn materialize_generation_payloads_inner(
                     continue;
                 }
                 let mut uuid = [0u8; 16];
-                std::fs::File::open("/dev/urandom")
-                    .and_then(|mut f| f.read_exact(&mut uuid))
-                    .expect("entity UUID entropy");
+                assert!(os_fill_random(&mut uuid), "entity UUID entropy");
                 uuid[6] = (uuid[6] & 15) | 64;
                 uuid[8] = (uuid[8] & 63) | 128;
                 let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -5769,9 +5803,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
     }
     fn insert(&mut self, pos: [f64; 3], yaw: f32) -> bool {
         let mut uuid = [0; 16];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut uuid))
-            .expect("entity UUID entropy");
+        assert!(os_fill_random(&mut uuid), "entity UUID entropy");
         uuid[6] = (uuid[6] & 15) | 64;
         uuid[8] = (uuid[8] & 63) | 128;
         let cave_spider = name_to_etype("cave_spider").unwrap();
@@ -14180,6 +14212,9 @@ fn start_gs4_query(bind: &str, game_port: u16) {
     }
 }
 
+// Only the Unix signal-handler block calls this; on Windows the stdin `/stop`
+// console path exits the process, which ends the responder thread with it.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn stop_gs4_query() {
     // Dropping the handle flips the flag and joins the responder thread.
     GS4_QUERY.lock().unwrap().take();
@@ -14353,9 +14388,7 @@ fn world_block_entity_tick() {
                                 mobs().lock().unwrap_or_else(|e| e.into_inner());
                             if ms.len() < MOB_CAP {
                                 let mut uuid = [0u8; 16];
-                                std::fs::File::open("/dev/urandom")
-                                    .and_then(|mut f| f.read_exact(&mut uuid))
-                                    .expect("entity UUID entropy");
+                                assert!(os_fill_random(&mut uuid), "entity UUID entropy");
                                 uuid[6] = (uuid[6] & 15) | 64;
                                 uuid[8] = (uuid[8] & 63) | 128;
                                 ms.push(Arc::new(Mob {
@@ -15653,6 +15686,9 @@ fn main() {
     });
     // vanilla saves the world on SIGTERM/SIGINT (docker/systemd stop);
     // without a handler the autosave window (30s) is lost on kill.
+    // signal-hook is a Unix-only dependency; Windows exits via the stdin
+    // `/stop` / SHUTDOWN console loop spawned below instead.
+    #[cfg(unix)]
     {
         let mut sigs = signal_hook::iterator::Signals::new([
             signal_hook::consts::SIGTERM,
@@ -18442,5 +18478,23 @@ mod w3_live_wire_tests {
         let decoded =
             decode_award_stats(&mut &payload[..]).expect("valid 0x04 payload");
         assert_eq!(decoded.counts, stats.counts);
+    }
+}
+
+#[cfg(test)]
+mod xplat2_tests {
+    use super::os_fill_random;
+
+    #[test]
+    fn xplat2_os_fill_random_produces_non_zero_entropy() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        assert!(os_fill_random(&mut a), "OS entropy source must fill");
+        assert!(os_fill_random(&mut b), "OS entropy source must fill");
+        assert!(
+            a.iter().any(|&x| x != 0),
+            "filled buffer must not stay zeroed"
+        );
+        assert_ne!(a, b, "two consecutive draws must differ");
     }
 }

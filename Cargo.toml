@@ -57,5 +57,10 @@ mod-adapter-core = { path = "mod-adapter-core", optional = true }
 create-adapter = { path = "create-adapter", optional = true }
 mc-spine-core = { path = "core", optional = true }
 mod-offload = { path = "mod-offload", optional = true }
-signal-hook = "0.4.4"
 ureq = { version = "3.4.2", features = ["rustls"] }
+
+# Unix-only: `src/main.rs` arms the SIGTERM/SIGINT save handler through
+# signal-hook's `Signals` iterator. Windows exits through the stdin `/stop`
+# console loop instead, so the crate must not enter a Windows build graph.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4.4"
