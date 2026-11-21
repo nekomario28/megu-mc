@@ -3385,6 +3385,10 @@ fn stream_chunks(
     // rock for a surface player, `false` sends the real chunk. Decided by
     // `update_underground_lane` before the stream, never per chunk.
     occluded: bool,
+    // `spectatorsGenerateChunks`: `false` while a spectator streams under the
+    // rule switched off — only chunks already generated may enter the batch,
+    // so the stream never tickets fresh worldgen on their behalf.
+    allow_generate: bool,
 ) {
     let tick = TICK_IDX.load(Ordering::Relaxed);
     let select = |delivery: &mut connection_limits::ChunkDelivery| {
@@ -3397,6 +3401,13 @@ fn stream_chunks(
     } else {
         with_play_wire(s, |play| select(&mut play.chunk_delivery))
             .unwrap_or_else(|| select(&mut connection_limits::ChunkDelivery::default()))
+    };
+    let news = if allow_generate {
+        news
+    } else {
+        news.into_iter()
+            .filter(|&(cx, cz)| spectator_chunk_allowed(dim, cx, cz))
+            .collect::<Vec<_>>()
     };
     // chunks leaving the window get an explicit unload — vanilla keeps
     // client memory bounded and the set now means exactly "chunks the
@@ -3496,6 +3507,880 @@ fn stream_chunks(
     write_varint(&mut bf, batch as i64);
     if send_packet(s, 0x0c, bf).is_ok() {
         ack.sent_batch(Instant::now(), batch);
+    }
+}
+
+// ---------- PARITY-58-C2S: remaining protocol-767 C2S play packets ----------
+
+/// A bounds-checked cursor over one C2S body. Same contract as `P3bReader`
+/// (every read fails closed on truncation) plus the VarLong `set_structure_block`
+/// carries — the reader lives here so it cannot drift from the decoders.
+struct C2sReader<'a> {
+    data: &'a [u8],
+    p: usize,
+}
+#[allow(dead_code)]
+impl<'a> C2sReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        C2sReader { data, p: 0 }
+    }
+    fn done(&self) -> bool {
+        self.p == self.data.len()
+    }
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.data.get(self.p)?;
+        self.p += 1;
+        Some(b)
+    }
+    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let body = self.data.get(self.p..self.p.checked_add(n)?)?;
+        self.p += n;
+        Some(body)
+    }
+    /// Java `readVarInt`: LEB128, at most five payload bytes, u32 envelope.
+    fn varint(&mut self) -> Option<i64> {
+        let mut v = 0u64;
+        for i in 0..5 {
+            let byte = *self.data.get(self.p)?;
+            self.p += 1;
+            v |= ((byte & 0x7f) as u64) << (7 * i);
+            if byte & 0x80 == 0 {
+                return Some(v as i64);
+            }
+        }
+        None
+    }
+    /// Java `readVarLong`: same LEB128 body, up to ten payload bytes.
+    fn varlong(&mut self) -> Option<i64> {
+        let mut v = 0u64;
+        for i in 0..10 {
+            let byte = *self.data.get(self.p)?;
+            self.p += 1;
+            v |= ((byte & 0x7f) as u64) << (7 * i);
+            if byte & 0x80 == 0 {
+                return Some(v as i64);
+            }
+        }
+        None
+    }
+    /// `FriendlyByteBuf.readUtf(max)`: VarInt length bounded at `max * 4`
+    /// bytes, then at most `max` decoded chars of strict UTF-8.
+    fn utf(&mut self, max: usize) -> Option<String> {
+        let len = self.varint()?;
+        if !(0..=max as i64 * 4).contains(&len) {
+            return None;
+        }
+        let body = self.data.get(self.p..self.p.checked_add(len as usize)?)?;
+        self.p += len as usize;
+        let s = std::str::from_utf8(body).ok()?;
+        if s.chars().count() > max {
+            return None;
+        }
+        Some(s.to_owned())
+    }
+}
+
+/// `ServerboundChatAckPacket` bookkeeping: the offset count the client has
+/// acknowledged on top of its last-seen window. A monotone counter, never a
+/// trusted index into a buffer, so a hostile offset cannot rewind it.
+#[allow(dead_code)]
+fn chat_ack_offsets() -> &'static Mutex<HashMap<i32, i64>> {
+    static OFFSETS: OnceLock<Mutex<HashMap<i32, i64>>> = OnceLock::new();
+    OFFSETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The most recent `ServerboundChatSessionUpdatePacket` a connection sent:
+/// session id, expiry and the public-key material sizes. The packet is
+/// recorded, not trusted — the P7a signed-chat verification lane consumes it.
+#[allow(dead_code)]
+struct ChatSessionMeta {
+    #[allow(dead_code)]
+    session: [u8; 16],
+    #[allow(dead_code)]
+    expires_at: i64,
+    #[allow(dead_code)]
+    key_len: usize,
+    #[allow(dead_code)]
+    sig_len: usize,
+}
+#[allow(dead_code)]
+fn chat_sessions() -> &'static Mutex<HashMap<i32, ChatSessionMeta>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<i32, ChatSessionMeta>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `ServerboundCookieResponsePacket` payloads per connection, keyed by cookie
+/// identifier. `ClientboundStoreCookiePacket` state lives here until the
+/// connection drops.
+#[allow(dead_code)]
+fn client_cookies() -> &'static Mutex<HashMap<i32, HashMap<String, Option<Vec<u8>>>>> {
+    static COOKIES: OnceLock<Mutex<HashMap<i32, HashMap<String, Option<Vec<u8>>>>>> =
+        OnceLock::new();
+    COOKIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `ServerboundDebugSampleSubscriptionPacket` subscribers: entity id -> sample
+/// type (`0 = TICK_TIME`, the only `DebugSubscription` vanilla 1.21.1 defines).
+/// OP>=2 gated at packet intake.
+fn debug_sample_subscribers() -> &'static Mutex<HashMap<i32, i64>> {
+    static SUBS: OnceLock<Mutex<HashMap<i32, i64>>> = OnceLock::new();
+    SUBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `ServerboundPongPacket` ids — the latest `ClientboundPingPacket` round-trip
+/// each connection answered, kept for the latency ledger.
+#[allow(dead_code)]
+fn last_client_pongs() -> &'static Mutex<HashMap<i32, i32>> {
+    static PONGS: OnceLock<Mutex<HashMap<i32, i32>>> = OnceLock::new();
+    PONGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The flying bit `ServerboundPlayerAbilitiesPacket` last set on a connection
+/// that holds `mayfly`. Survival requests are refused before they reach it.
+fn client_abilities_flying() -> &'static Mutex<HashMap<i32, bool>> {
+    static FLYING: OnceLock<Mutex<HashMap<i32, bool>>> = OnceLock::new();
+    FLYING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `ServerboundSeenAdvancementsPacket` state: `(action, opened tab)` where
+/// action `0 = OpenedTab` carries the tab identifier, `1 = ClosedScreen` none.
+#[allow(dead_code)]
+fn seen_advancement_state() -> &'static Mutex<HashMap<i32, (i64, Option<String>)>> {
+    static SEEN: OnceLock<Mutex<HashMap<i32, (i64, Option<String>)>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `ServerboundConfigurationAcknowledgedPacket` arrivals — the client finished
+/// the optional mid-play reconfigure exchange.
+#[allow(dead_code)]
+fn reconfigure_acked() -> &'static Mutex<HashSet<i32>> {
+    static ACKED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    ACKED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Jigsaw-block edit metadata an OP+creative client committed, keyed by the
+/// edited block position like the command-block lane's records.
+#[allow(dead_code)]
+struct JigsawBlockUpdate {
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    target: String,
+    #[allow(dead_code)]
+    pool: String,
+    #[allow(dead_code)]
+    final_state: String,
+    /// `JigsawBlockEntity.JointType`: `0 = rollable`, `1 = aligned`.
+    #[allow(dead_code)]
+    joint: u8,
+    #[allow(dead_code)]
+    selection_priority: i64,
+    #[allow(dead_code)]
+    placement_priority: i64,
+}
+#[allow(dead_code)]
+fn jigsaw_block_updates() -> &'static Mutex<HashMap<DimBlockPos, JigsawBlockUpdate>> {
+    static UPDATES: OnceLock<Mutex<HashMap<DimBlockPos, JigsawBlockUpdate>>> =
+        OnceLock::new();
+    UPDATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Structure-block edit metadata an OP+creative client committed.
+#[allow(dead_code)]
+struct StructureBlockUpdate {
+    #[allow(dead_code)]
+    action: i64,
+    #[allow(dead_code)]
+    mode: i64,
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    offset: (i32, i32, i32),
+    #[allow(dead_code)]
+    size: (i32, i32, i32),
+    #[allow(dead_code)]
+    mirror: i64,
+    #[allow(dead_code)]
+    rotation: i64,
+    #[allow(dead_code)]
+    data: String,
+    /// `StructureBlockEntity` integrity float, clamped to `0.0..=1.0` like
+    /// vanilla `ServerboundSetStructureBlockPacket`'s `Mth.clamp`.
+    #[allow(dead_code)]
+    integrity: f32,
+    #[allow(dead_code)]
+    seed: i64,
+    #[allow(dead_code)]
+    flags: u8,
+}
+#[allow(dead_code)]
+fn structure_block_updates() -> &'static Mutex<HashMap<DimBlockPos, StructureBlockUpdate>> {
+    static UPDATES: OnceLock<Mutex<HashMap<DimBlockPos, StructureBlockUpdate>>> =
+        OnceLock::new();
+    UPDATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `jigsaw_generate` requests an OP+creative client sent, keyed by the jigsaw
+/// block position: `(levels, keep_jigsaws)`.
+#[allow(dead_code)]
+fn jigsaw_generate_requests() -> &'static Mutex<HashMap<DimBlockPos, (i64, bool)>> {
+    static REQUESTS: OnceLock<Mutex<HashMap<DimBlockPos, (i64, bool)>>> = OnceLock::new();
+    REQUESTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// --- fail-closed decoders ----------------------------------------------------
+
+/// `block_entity_tag_query` (C2S 0x01): VarInt transaction id + packed
+/// `BlockPos`. The OP>=2 gate lives in the caller.
+fn decode_block_entity_tag_query(body: &[u8]) -> Option<(i32, (i32, i32, i32))> {
+    let mut r = C2sReader::new(body);
+    let tx_id = i32::try_from(r.varint()?).ok()?;
+    let pos = read_pos(r.bytes(8)?);
+    if !r.done() {
+        return None;
+    }
+    Some((tx_id, pos))
+}
+
+/// `chat_ack` (C2S 0x03): the `LastSeenMessages.Update` offset VarInt —
+/// negative values and trailing bytes both fail closed.
+fn decode_chat_ack(body: &[u8]) -> Option<i64> {
+    let mut r = C2sReader::new(body);
+    let offset = r.varint()?;
+    if !r.done() || offset < 0 {
+        return None;
+    }
+    Some(offset)
+}
+
+/// `chat_session_update` (C2S 0x07): session UUID, expiry i64, then the
+/// `ProfilePublicKey` — key bytes and signature bytes, each VarInt-prefixed
+/// and capped at one vanilla key's generous bound.
+const CHAT_SESSION_MATERIAL_MAX: i64 = 4096;
+fn decode_chat_session_update(body: &[u8]) -> Option<ChatSessionMeta> {
+    let mut r = C2sReader::new(body);
+    let session: [u8; 16] = r.bytes(16)?.try_into().ok()?;
+    let expires_at = i64::from_be_bytes(r.bytes(8)?.try_into().ok()?);
+    let key_len = r.varint()?;
+    if !(0..=CHAT_SESSION_MATERIAL_MAX).contains(&key_len) {
+        return None;
+    }
+    r.bytes(key_len as usize)?;
+    let sig_len = r.varint()?;
+    if !(0..=CHAT_SESSION_MATERIAL_MAX).contains(&sig_len) {
+        return None;
+    }
+    r.bytes(sig_len as usize)?;
+    if !r.done() {
+        return None;
+    }
+    Some(ChatSessionMeta {
+        session,
+        expires_at,
+        key_len: key_len as usize,
+        sig_len: sig_len as usize,
+    })
+}
+
+/// `container_slot_state_changed` (C2S 0x10): crafter grid slot, window id,
+/// new disabled state — vanilla only honours the 3x3 grid (`0..9`).
+fn decode_container_slot_state(body: &[u8]) -> Option<(i64, i64, bool)> {
+    let mut r = C2sReader::new(body);
+    let slot_id = r.varint()?;
+    let window_id = r.varint()?;
+    let new_state = match r.byte()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    if !r.done() || !(0..9).contains(&slot_id) {
+        return None;
+    }
+    Some((slot_id, window_id, new_state))
+}
+
+/// `cookie_response` (C2S 0x11): cookie identifier + optional payload capped
+/// at vanilla `SharedConstants.MAX_COOKIE_PAYLOAD_SIZE` (5 KiB).
+const COOKIE_PAYLOAD_MAX: i64 = 5120;
+fn decode_cookie_response(body: &[u8]) -> Option<(String, Option<Vec<u8>>)> {
+    let mut r = C2sReader::new(body);
+    let key = r.utf(32767)?;
+    if key.is_empty() {
+        return None;
+    }
+    let payload = match r.byte()? {
+        0 => None,
+        1 => {
+            let len = r.varint()?;
+            if !(0..=COOKIE_PAYLOAD_MAX).contains(&len) {
+                return None;
+            }
+            Some(r.bytes(len as usize)?.to_vec())
+        }
+        _ => return None,
+    };
+    if !r.done() {
+        return None;
+    }
+    Some((key, payload))
+}
+
+/// `debug_sample_subscription` (C2S 0x13): the `DebugSubscription` VarInt —
+/// only `0` (`TICK_TIME`) exists in 767.
+fn decode_debug_sample_subscription(body: &[u8]) -> Option<i64> {
+    let mut r = C2sReader::new(body);
+    let sample_type = r.varint()?;
+    if !r.done() || sample_type != 0 {
+        return None;
+    }
+    Some(sample_type)
+}
+
+/// `edit_book` (C2S 0x14) bounded exactly like `ServerboundEditBookPacket`:
+/// slot `0..=40`, at most 100 pages of at most 1024 chars each, an optional
+/// title of at most 32 chars.
+const EDIT_BOOK_MAX_PAGES: i64 = 100;
+const EDIT_BOOK_MAX_PAGE_CHARS: usize = 1024;
+const EDIT_BOOK_MAX_TITLE_CHARS: usize = 32;
+struct EditBookUpdate {
+    slot: i64,
+    pages: Vec<String>,
+    title: Option<String>,
+}
+fn decode_edit_book(body: &[u8]) -> Option<EditBookUpdate> {
+    let mut r = C2sReader::new(body);
+    let slot = r.varint()?;
+    if !(0..=40).contains(&slot) {
+        return None;
+    }
+    let count = r.varint()?;
+    if !(0..=EDIT_BOOK_MAX_PAGES).contains(&count) {
+        return None;
+    }
+    let mut pages = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        pages.push(r.utf(EDIT_BOOK_MAX_PAGE_CHARS)?);
+    }
+    let title = match r.byte()? {
+        0 => None,
+        1 => Some(r.utf(EDIT_BOOK_MAX_TITLE_CHARS)?),
+        _ => return None,
+    };
+    if !r.done() {
+        return None;
+    }
+    Some(EditBookUpdate { slot, pages, title })
+}
+
+/// `entity_tag_query` (C2S 0x15): transaction VarInt + entity id VarInt.
+fn decode_entity_tag_query(body: &[u8]) -> Option<(i32, i32)> {
+    let mut r = C2sReader::new(body);
+    let tx_id = i32::try_from(r.varint()?).ok()?;
+    let entity_id = i32::try_from(r.varint()?).ok()?;
+    if !r.done() {
+        return None;
+    }
+    Some((tx_id, entity_id))
+}
+
+/// `jigsaw_generate` (C2S 0x17): packed `BlockPos`, VarInt levels bounded by
+/// vanilla `JigsawStructure.MAX_DEPTH` (20), keep-jigsaws bool.
+fn decode_jigsaw_generate(body: &[u8]) -> Option<((i32, i32, i32), i64, bool)> {
+    let mut r = C2sReader::new(body);
+    let pos = read_pos(r.bytes(8)?);
+    let levels = r.varint()?;
+    let keep_jigsaws = match r.byte()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    if !r.done() || !(0..=20).contains(&levels) {
+        return None;
+    }
+    Some((pos, levels, keep_jigsaws))
+}
+
+/// `lock_difficulty` (C2S 0x19): exactly one boolean byte.
+fn decode_lock_difficulty(body: &[u8]) -> Option<bool> {
+    match body {
+        [0] => Some(false),
+        [1] => Some(true),
+        _ => None,
+    }
+}
+
+/// `ping_request` (C2S 0x21): exactly one i64 payload the client mirrors back.
+fn decode_ping_request(body: &[u8]) -> Option<i64> {
+    Some(i64::from_be_bytes(body.try_into().ok()?))
+}
+
+/// `player_abilities` (C2S 0x23): exactly one flags byte — only bit 0x02
+/// (flying) is meaningful on the server.
+fn decode_player_abilities(body: &[u8]) -> Option<u8> {
+    match *body {
+        [flags] => Some(flags),
+        _ => None,
+    }
+}
+
+/// `pong` (C2S 0x27): exactly one i32 id answering `ClientboundPingPacket`.
+fn decode_pong(body: &[u8]) -> Option<i32> {
+    Some(i32::from_be_bytes(body.try_into().ok()?))
+}
+
+/// `seen_advancements` (C2S 0x2c): action VarInt (`0 = OpenedTab`,
+/// `1 = ClosedScreen`); the tab `Identifier` exists only for `OpenedTab`.
+fn decode_seen_advancements(body: &[u8]) -> Option<(i64, Option<String>)> {
+    let mut r = C2sReader::new(body);
+    match r.varint()? {
+        0 => {
+            let tab = r.utf(32767)?;
+            if !r.done() {
+                return None;
+            }
+            Some((0, Some(tab)))
+        }
+        1 => {
+            if r.done() {
+                Some((1, None))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `set_jigsaw_block` (C2S 0x33): position + the `JigsawBlockEntity` fields the
+/// editor round-trips — name/target/pool/final-state, `joint` enum and the two
+/// priority VarInts.
+fn decode_set_jigsaw_block(body: &[u8]) -> Option<((i32, i32, i32), JigsawBlockUpdate)> {
+    let mut r = C2sReader::new(body);
+    let pos = read_pos(r.bytes(8)?);
+    let name = r.utf(32767)?;
+    let target = r.utf(32767)?;
+    let pool = r.utf(32767)?;
+    let final_state = r.utf(32767)?;
+    let joint = match r.utf(32767)?.as_str() {
+        "rollable" => 0u8,
+        "aligned" => 1u8,
+        _ => return None,
+    };
+    let selection_priority = r.varint()?;
+    let placement_priority = r.varint()?;
+    if !r.done() {
+        return None;
+    }
+    Some((
+        pos,
+        JigsawBlockUpdate {
+            name,
+            target,
+            pool,
+            final_state,
+            joint,
+            selection_priority,
+            placement_priority,
+        },
+    ))
+}
+
+/// `set_structure_block` (C2S 0x34): `UpdateType`, `StructureMode`, name, the
+/// `i8` offset/size box vanilla clamps to 48 cells, `Mirror`, `Rotation`,
+/// metadata, the integrity float, VarLong seed and the flags byte.
+fn decode_set_structure_block(body: &[u8]) -> Option<((i32, i32, i32), StructureBlockUpdate)> {
+    let mut r = C2sReader::new(body);
+    let pos = read_pos(r.bytes(8)?);
+    let action = r.varint()?;
+    let mode = r.varint()?;
+    if !(0..=3).contains(&action) || !(0..=3).contains(&mode) {
+        return None;
+    }
+    let name = r.utf(32767)?;
+    let offset = (
+        r.byte()? as i8 as i32,
+        r.byte()? as i8 as i32,
+        r.byte()? as i8 as i32,
+    );
+    if [offset.0, offset.1, offset.2]
+        .iter()
+        .any(|v| !(-48..=48).contains(v))
+    {
+        return None;
+    }
+    let size = (
+        r.byte()? as i8 as i32,
+        r.byte()? as i8 as i32,
+        r.byte()? as i8 as i32,
+    );
+    if [size.0, size.1, size.2].iter().any(|v| !(0..=48).contains(v)) {
+        return None;
+    }
+    let mirror = r.varint()?;
+    let rotation = r.varint()?;
+    if !(0..=2).contains(&mirror) || !(0..=3).contains(&rotation) {
+        return None;
+    }
+    let data = r.utf(128)?;
+    let integrity = f32::from_be_bytes(r.bytes(4)?.try_into().ok()?).clamp(0.0, 1.0);
+    let seed = r.varlong()?;
+    let flags = r.byte()?;
+    if !r.done() {
+        return None;
+    }
+    Some((
+        pos,
+        StructureBlockUpdate {
+            action,
+            mode,
+            name,
+            offset,
+            size,
+            mirror,
+            rotation,
+            data,
+            integrity,
+            seed,
+            flags,
+        },
+    ))
+}
+
+/// `teleport_to_entity` (C2S 0x37): a bare 16-byte entity UUID.
+fn decode_teleport_to_entity(body: &[u8]) -> Option<[u8; 16]> {
+    body.try_into().ok()
+}
+
+// --- shared apply helpers ----------------------------------------------------
+
+/// The `Player.canUseGameMasterBlocks` shape every gamemaster packet in this
+/// section shares: `hasPermissions(2)` plus creative mode.
+fn sender_gamemaster_permitted(me: &Client) -> bool {
+    player_permission_level(&me.name) >= 2
+        && *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1
+}
+
+/// `ClientboundTagQueryPacket` (S2C 0x6e): transaction VarInt + one anonymous
+/// NBT payload; a bare TAG_End when the target has no NBT answers the query
+/// with the same "missing" vanilla sends for an unregistered entity.
+fn tag_query_reply(tx_id: i32, nbt: Option<Tag>) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, i64::from(tx_id));
+    match nbt {
+        Some(tag) => p.extend_from_slice(
+            &crate::nbt::write_network_nbt(&tag).unwrap_or_else(|_| vec![0]),
+        ),
+        None => p.push(0),
+    }
+    p
+}
+
+/// Minimal living-entity NBT for `entity_tag_query`: `id`, `Pos`, `Rotation` —
+/// the head of `Entity#saveWithoutId`. Players report as `minecraft:player`,
+/// mobs by their 1.21.1 registry name.
+fn entity_tag_nbt(entity_id: i32) -> Option<Tag> {
+    for c in clients().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if c.eid == entity_id {
+            let (x, y, z, yaw, pitch, _) =
+                *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            return Some(entity_tag_compound("minecraft:player", [x, y, z], [yaw, pitch]));
+        }
+    }
+    for m in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if m.eid == entity_id {
+            let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let name = entity_spec_by_id(m.etype)
+                .map(|s| s.name)
+                .unwrap_or("minecraft:pig");
+            return Some(entity_tag_compound(name, [x, y, z], [yaw, pitch]));
+        }
+    }
+    None
+}
+fn entity_tag_compound(id: &str, pos: [f64; 3], rot: [f32; 2]) -> Tag {
+    let mut fields = BlockEntityNbtFields::new();
+    block_entity_put(&mut fields, "id", block_entity_string(id));
+    block_entity_put(
+        &mut fields,
+        "Pos",
+        Tag::List(6, pos.iter().map(|v| Tag::Double(v.to_bits())).collect()),
+    );
+    block_entity_put(
+        &mut fields,
+        "Rotation",
+        Tag::List(5, rot.iter().map(|v| Tag::Float(v.to_bits())).collect()),
+    );
+    Tag::Compound(fields)
+}
+
+/// `container_slot_state_changed` apply: the `Crafter` block entity the
+/// sender's open menu anchors to takes the slot's disabled bit, then the
+/// viewer gets the `container_set_data` property vanilla's `CrafterMenu`
+/// `setSlotStatus` pushes.
+fn c2s_apply_container_slot_state(me: &Arc<Client>, slot_id: i64, window_id: i64, new_state: bool) {
+    let Some(connection) = live_menu_connection(me) else {
+        return;
+    };
+    let (session_id, anchor) = {
+        let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(session) = active.as_ref() else { return };
+        if !matches!(session.menu, LiveMenu::Crafter) || i64::from(session.id) != window_id {
+            return;
+        }
+        (session.id, session.anchor)
+    };
+    let Some(key @ (dim, x, y, z)) = anchor else { return };
+    let applied = with_save_guard(|| {
+        let Some(reg) = crate::block_registry::breg() else {
+            return false;
+        };
+        let state = block_at_dim(dim, x, y, z);
+        if live_block_entity_id(reg.name_of(state)) != Some("minecraft:crafter") {
+            return false;
+        }
+        let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(LiveBlockEntity::Crafter(crafter, _)) = store.at(reg, key, state) else {
+            return false;
+        };
+        crafter.set_slot_disabled(slot_id as usize, new_state)
+    });
+    if applied {
+        let mut p = vec![session_id];
+        p.extend_from_slice(&(slot_id as i16).to_be_bytes());
+        p.extend_from_slice(&(new_state as i16).to_be_bytes());
+        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x14, p);
+    }
+}
+
+/// `minecraft:writable_book_content` (component 33): a `Filterable<String>`
+/// page list — raw string + "no filtered form" flag.
+fn writable_book_content_payload(pages: &[String]) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, pages.len() as i64);
+    for page in pages {
+        write_str(&mut p, page);
+        p.push(0);
+    }
+    p
+}
+
+/// `minecraft:written_book_content` (component 34): `Filterable<String>` title,
+/// author, generation, `Filterable<Component>` pages, resolved flag — the
+/// shape vanilla `WrittenBookContent` signs into.
+fn written_book_content_payload(title: &str, author: &str, pages: &[String]) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_str(&mut p, title);
+    p.push(0); // no filtered title
+    write_str(&mut p, author);
+    write_varint(&mut p, 0); // generation 0 = original
+    write_varint(&mut p, pages.len() as i64);
+    for page in pages {
+        p.extend_from_slice(&chat_nbt(page)); // anonymous {"text":...} compound
+        p.push(0); // no filtered form
+    }
+    p.push(1); // resolved
+    p
+}
+
+/// `edit_book` apply: the named slot must hold a `writable_book` (a signed
+/// `written_book` is immutable in vanilla); pages replace
+/// `writable_book_content`, a title signs the stack into `written_book` with
+/// the sender as author.
+fn c2s_apply_edit_book(me: &Client, book: &EditBookUpdate) {
+    // Vanilla raw inventory indices: 0..8 hotbar -> window 36..44, 9..35 main
+    // -> window 9..35, 36..39 armor -> window 5..8, 40 offhand -> 45.
+    let wslot: i16 = match book.slot {
+        0..=8 => 36 + book.slot as i16,
+        9..=35 => book.slot as i16,
+        36..=39 => 44 - book.slot as i16,
+        40 => 45,
+        _ => return,
+    };
+    let st = {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((item, count, _)) = inv.get(&wslot).cloned() else {
+            return;
+        };
+        if item != 1091 {
+            // writable_book
+            return;
+        }
+        let st = match &book.title {
+            Some(title) => (
+                1092i64,
+                count,
+                vec![(34i64, written_book_content_payload(title, &me.name, &book.pages))],
+            ),
+            None => (
+                item,
+                count,
+                vec![(33i64, writable_book_content_payload(&book.pages))],
+            ),
+        };
+        inv.insert(wslot, st.clone());
+        st
+    };
+    resync_slot(me, 0, wslot, &st);
+}
+
+/// `player_abilities` apply: only the flying bit is honoured, and only while
+/// `mayfly` holds — survival fly-hack requests are refused exactly like
+/// `ServerGamePacketListenerImpl.handlePlayerAbilities`, then the
+/// `ClientboundPlayerAbilitiesPacket` echo settles the client's flags.
+fn c2s_apply_player_abilities(me: &Client, flags: u8) {
+    let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
+    let mayfly = matches!(gm, 1 | 3);
+    let flying = flags & 0x02 != 0 && mayfly;
+    client_abilities_flying()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(me.eid, flying);
+    let mut ab = vec![0u8];
+    if mayfly {
+        ab[0] |= 0x01 | 0x04;
+    }
+    if gm == 1 {
+        ab[0] |= 0x08;
+    }
+    if flying {
+        ab[0] |= 0x02;
+    }
+    ab.extend_from_slice(&0.05f32.to_be_bytes());
+    ab.extend_from_slice(&0.1f32.to_be_bytes());
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x38, ab);
+}
+
+/// `lock_difficulty` apply: OP>=2 only, then the `ChangeDifficulty` broadcast
+/// every client gets — `difficulty` byte plus the new `difficultyLocked` flag.
+fn c2s_apply_lock_difficulty(me: &Client, locked: bool) -> bool {
+    if player_permission_level(&me.name) < 2 {
+        return false;
+    }
+    DIFFICULTY_LOCKED.store(locked as u8, Ordering::Relaxed);
+    let packet = vec![DIFFICULTY.load(Ordering::Relaxed), locked as u8];
+    broadcast(-1, |_c| (0x0b, packet.clone()));
+    true
+}
+
+/// `teleport_to_entity` target resolution: players and mobs both count (the
+/// packet is `/spectate`'s wire form), and a cross-dimension target rides the
+/// same respawn path a portal takes.
+fn c2s_spectate_teleport(me: &Arc<Client>, uuid: &[u8; 16]) {
+    let target = {
+        let players = clients().lock().unwrap_or_else(|e| e.into_inner());
+        let found = players.iter().find(|c| &c.uuid == uuid).cloned();
+        drop(players);
+        found.map(|c| {
+            let (x, y, z, yaw, pitch, _) =
+                *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            (*c.dim.lock().unwrap_or_else(|e| e.into_inner()), x, y, z, yaw, pitch)
+        })
+    }
+    .or_else(|| {
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
+            .find(|m| &m.uuid == uuid)
+            .map(|m| {
+                let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                (m.dim, x, y, z, yaw, pitch)
+            })
+    });
+    let Some((dim, x, y, z, yaw, pitch)) = target else {
+        return;
+    };
+    if dim != *me.dim.lock().unwrap_or_else(|e| e.into_inner()) {
+        let view = *me.view.lock().unwrap_or_else(|e| e.into_inner());
+        switch_client_dimension(me, dim, (x, y, z, yaw, pitch), view);
+        return;
+    }
+    let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+    teleport_in_dimension(me, &mut sock, (x, y, z, yaw, pitch));
+}
+
+/// `spectatorsGenerateChunks`: a spectator may only stream chunks that are
+/// already generated (`pop_done`, the FEATURES-layer completion mark); the
+/// worldgen-disabled flat world passes everything, matching vanilla where the
+/// gate only withholds on-demand generation.
+fn spectator_chunk_allowed(dim: DimId, cx: i32, cz: i32) -> bool {
+    worldgen::with_gen_dim(dim, |g| g.pop_done.contains(&(cx, cz))).unwrap_or(true)
+}
+
+/// `EndPortalBlock.getOrCreatePortal`'s `block.end_portal.spawn` global level
+/// event: every online player hears it when `globalSoundEvents` is on, only
+/// same-dimension listeners inside the vanilla 64-block level-event radius
+/// when it is off.
+fn end_portal_spawn_sound(dim: DimId, x: f64, y: f64, z: f64) {
+    // `Holder<SoundEvent>` by name: holder id 0 defers resolution to the
+    // client's own sound registry — no local sound id table to keep in sync.
+    let mut p = Vec::new();
+    write_varint(&mut p, 0);
+    write_str(&mut p, "minecraft:block.end_portal.spawn");
+    write_varint(&mut p, 0); // source: master
+    p.extend_from_slice(&((x * 8.0) as i32).to_be_bytes());
+    p.extend_from_slice(&((y * 8.0) as i32).to_be_bytes());
+    p.extend_from_slice(&((z * 8.0) as i32).to_be_bytes());
+    p.extend_from_slice(&1.0f32.to_be_bytes());
+    p.extend_from_slice(&1.0f32.to_be_bytes());
+    p.extend_from_slice(&0i64.to_be_bytes());
+    if gamerule_live_value("globalSoundEvents") != 0 {
+        broadcast(-1, |_c| (0x68, p.clone()));
+        return;
+    }
+    for c in client_snapshot() {
+        if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
+        let (px, py, pz, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        if !connection_limits::within_broadcast_range(px, py, pz, x, y, z, 64.0) {
+            continue;
+        }
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x68, p.clone());
+        }
+    }
+}
+
+/// `reducedDebugInfo` transitions land in `command_gamerules()` from a command
+/// path this module cannot hook, so the tick watches the live value and
+/// replays vanilla `sendGameRulesToPlayer` for every client — entity event 22
+/// (reduced F3 debug) or 23 (full), addressed to the recipient's own entity.
+fn gamerule_watch_tick() {
+    static LAST: AtomicI32 = AtomicI32::new(-1);
+    let now = gamerule_live_value("reducedDebugInfo") != 0;
+    let last = LAST.swap(now as i32, Ordering::Relaxed);
+    if last < 0 || (last != 0) == now {
+        return;
+    }
+    let status: i8 = if now { 22 } else { 23 };
+    for c in client_snapshot() {
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x1f, entity_event_pkt(c.eid, status));
+        }
+    }
+}
+
+/// One finished tick's `TICK_TIME` sample to every
+/// `debug_sample_subscription` subscriber as `ClientboundDebugSamplePacket`
+/// (0x1b) — a VarInt length and that many i64 samples, nanoseconds.
+fn push_debug_tick_sample(tick_us: u32) {
+    let subs: HashSet<i32> = debug_sample_subscribers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .copied()
+        .collect();
+    if subs.is_empty() {
+        return;
+    }
+    let mut p = Vec::new();
+    write_varint(&mut p, 1);
+    p.extend_from_slice(&(i64::from(tick_us) * 1000).to_be_bytes());
+    for c in client_snapshot() {
+        if !subs.contains(&c.eid) {
+            continue;
+        }
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x1b, p.clone());
+        }
     }
 }
 
@@ -3775,6 +4660,7 @@ fn pump_client_chunks(client: &Client, announce_center: bool) -> bool {
         announce_center,
         None,
         occluded,
+        !client.is_spectator() || gamerule_live_value("spectatorsGenerateChunks") != 0,
     );
     !ack.awaiting()
         && with_play_wire(&socket, |play| play.chunk_delivery.has_pending()).unwrap_or(false)
@@ -4033,6 +4919,7 @@ fn switch_client_dimension(
             true,
             None,
             dim_occluded,
+            !me.is_spectator() || gamerule_live_value("spectatorsGenerateChunks") != 0,
         );
     }
     let mut sock = me.sock.lock().unwrap();
@@ -4270,6 +5157,7 @@ fn try_end_portal_activation(
                     note_block_update_dim(dim, ox + ix, fy, oz + iz, END_PORTAL_STATE);
                 }
             }
+            end_portal_spawn_sound(dim, ox as f64 + 2.5, fy as f64, oz as f64 + 2.5);
             return true;
         }
     }
@@ -4285,6 +5173,7 @@ fn try_end_portal_activation(
                     note_block_update_dim(dim, ox + ix, fy, oz + iz, END_PORTAL_STATE);
                 }
             }
+            end_portal_spawn_sound(dim, ox as f64 + 2.5, fy as f64, oz as f64 + 2.5);
             return true;
         }
     }
@@ -5212,6 +6101,24 @@ fn drop_player_items_on_death(player: &Arc<Client>) {
         let _ = send_packet(&mut w, 0x22, ge);
     }
     broadcast_seen_ex(player.eid, player.eid, |_c| (0x1f, death_evt.clone()));
+    // `enderPearlsVanishOnDeath`: the dying owner's in-flight pearls die with
+    // them — before keepInventory decides the inventory's fate, exactly like
+    // vanilla `LivingEntity.die`'s pearl cleanup.
+    if gamerule_live_value("enderPearlsVanishOnDeath") != 0 {
+        let gone: Vec<i32> = {
+            let mut pq = pearls().lock().unwrap_or_else(|e| e.into_inner());
+            let gone: Vec<i32> = pq
+                .iter()
+                .filter(|p| p.owner == player.eid)
+                .map(|p| p.eid)
+                .collect();
+            pq.retain(|p| p.owner != player.eid);
+            gone
+        };
+        for eid in gone {
+            broadcast_seen_destroy(eid);
+        }
+    }
     if GR_KEEP_INVENTORY.load(Ordering::Relaxed) != 0
         || !matches!(*player.gm.lock().unwrap(), 0 | 2)
     {
@@ -6613,6 +7520,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         true,
         Some(&mut chunk_delivery),
         initial_occluded,
+        initial_gm != 3 || gamerule_live_value("spectatorsGenerateChunks") != 0,
     );
     let mut tm = Vec::new();
     tm.extend_from_slice(&0i64.to_be_bytes());
@@ -6630,6 +7538,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         0x0b,
         vec![DIFFICULTY.load(Ordering::Relaxed), 0],
     );
+    // `GameRules.sendGameRulesToPlayer` on `PlayerList.placeNewPlayer`: entity
+    // event 22 on the joining player's own entity turns reduced F3 debug on,
+    // 23 restores the full readout.
+    let debug_status: i8 = if gamerule_live_value("reducedDebugInfo") != 0 {
+        22
+    } else {
+        23
+    };
+    let _ = send_packet(&mut s, 0x1f, entity_event_pkt(player_eid, debug_status));
     let mut xp = Vec::new();
     xp.extend_from_slice(&saved_player.as_ref().map_or(0.0, |save| save.xp_progress).to_be_bytes());
     write_varint(&mut xp, saved_player.as_ref().map_or(0, |save| save.xp_level) as i64);
@@ -7007,7 +7924,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             }
             0x02 => {
                 // Serverbound change difficulty: difficulty byte + locked flag.
-                if b.len() == 2 && b[0] <= 3 && b[1] <= 1 && player_is_admin(&me.name) {
+                // A `lock_difficulty`-locked world refuses further changes —
+                // vanilla `LevelData.setDifficulty` does the same refusal.
+                if DIFFICULTY_LOCKED.load(Ordering::Relaxed) == 0
+                    && b.len() == 2
+                    && b[0] <= 3
+                    && b[1] <= 1
+                    && player_is_admin(&me.name)
+                {
                     set_difficulty(b[0]);
                 }
             }
@@ -7064,16 +7988,26 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     } else {
                         before.5
                     };
-                    let checked_gnd = match ac_check_move(
-                        &me,
-                        (before.0, before.1, before.2),
-                        (px, py, pz),
-                        claimed,
-                    ) {
-                        AcMoveVerdict::Accept { ground } => ground,
-                        AcMoveVerdict::Setback => {
-                            ac_setback(&me, before);
-                            continue;
+                    // `disableElytraMovementCheck`: a gliding player's position
+                    // packets skip the anti-cheat envelope when the rule is on —
+                    // vanilla skips the same moved-too-quickly check for
+                    // `isFallFlying` under the gamerule.
+                    let checked_gnd = if *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner())
+                        && gamerule_live_value("disableElytraMovementCheck") != 0
+                    {
+                        claimed
+                    } else {
+                        match ac_check_move(
+                            &me,
+                            (before.0, before.1, before.2),
+                            (px, py, pz),
+                            claimed,
+                        ) {
+                            AcMoveVerdict::Accept { ground } => ground,
+                            AcMoveVerdict::Setback => {
+                                ac_setback(&me, before);
+                                continue;
+                            }
                         }
                     };
                     let teleport = me.teleport.lock().unwrap();
@@ -10655,6 +11589,225 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         }
                     }
                 }
+            0x01 => {
+                // block_entity_tag_query: the OP>=2 debug-stick query; the
+                // block's live NBT answers on `tag_query` (S2C 0x6e).
+                if let Some((tx_id, pos)) = decode_block_entity_tag_query(&b) {
+                    if player_permission_level(&me.name) >= 2 {
+                        let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                        let nbt = live_block_entity_snapshot((dim, pos.0, pos.1, pos.2))
+                            .map(|(_, tag)| tag);
+                        let _ = send_packet(
+                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                            0x6e,
+                            tag_query_reply(tx_id, nbt),
+                        );
+                    }
+                }
+            }
+            0x03 => {
+                // chat_ack: fold the acknowledged offset into the connection's
+                // last-seen counter — saturating so a hostile offset cannot
+                // wrap it backwards.
+                if let Some(offset) = decode_chat_ack(&b) {
+                    let mut offsets =
+                        chat_ack_offsets().lock().unwrap_or_else(|e| e.into_inner());
+                    let entry = offsets.entry(me.eid).or_insert(0);
+                    *entry = entry.saturating_add(offset);
+                }
+            }
+            0x07 => {
+                // chat_session_update: record the signed-chat session metadata
+                // for the P7a lane; strict bounds refuse oversized keys.
+                if let Some(meta) = decode_chat_session_update(&b) {
+                    chat_sessions()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(me.eid, meta);
+                }
+            }
+            0x0c => {
+                // configuration_acknowledged: the client finished a mid-play
+                // reconfigure exchange — record it; a stray empty ack is
+                // harmless on a server that does not currently reconfigure.
+                if b.is_empty() {
+                    reconfigure_acked()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(me.eid);
+                }
+            }
+            0x10 => {
+                // container_slot_state_changed: crafter slot toggles land on
+                // the live Crafter block entity the menu anchors to.
+                if let Some((slot_id, window_id, new_state)) = decode_container_slot_state(&b) {
+                    c2s_apply_container_slot_state(&me, slot_id, window_id, new_state);
+                }
+            }
+            0x11 => {
+                // cookie_response: per-connection store, 5 KiB cap enforced
+                // in the decoder.
+                if let Some((key, payload)) = decode_cookie_response(&b) {
+                    client_cookies()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entry(me.eid)
+                        .or_default()
+                        .insert(key, payload);
+                }
+            }
+            0x13 => {
+                // debug_sample_subscription: OP>=2 subscribes to the per-tick
+                // `debug_sample` push; everyone else is refused fail-closed.
+                if let Some(sample_type) = decode_debug_sample_subscription(&b) {
+                    if player_permission_level(&me.name) >= 2 {
+                        debug_sample_subscribers()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(me.eid, sample_type);
+                    }
+                }
+            }
+            0x14 => {
+                if let Some(book) = decode_edit_book(&b) {
+                    c2s_apply_edit_book(&me, &book);
+                }
+            }
+            0x15 => {
+                // entity_tag_query: OP>=2, answers with the target's
+                // `id`/`Pos`/`Rotation` NBT on `tag_query` (S2C 0x6e).
+                if let Some((tx_id, entity_id)) = decode_entity_tag_query(&b) {
+                    if player_permission_level(&me.name) >= 2 {
+                        let _ = send_packet(
+                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                            0x6e,
+                            tag_query_reply(tx_id, entity_tag_nbt(entity_id)),
+                        );
+                    }
+                }
+            }
+            0x17 => {
+                // jigsaw_generate: OP>=2 + creative; the request is recorded
+                // against the block position like a structure edit.
+                if let Some((pos, levels, keep_jigsaws)) = decode_jigsaw_generate(&b) {
+                    if sender_gamemaster_permitted(&me) {
+                        let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                        jigsaw_generate_requests()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert((dim, pos.0, pos.1, pos.2), (levels, keep_jigsaws));
+                    }
+                }
+            }
+            0x19 => {
+                // lock_difficulty: OP>=2 only — locks the world difficulty and
+                // broadcasts `ChangeDifficulty` with the locked flag.
+                if let Some(locked) = decode_lock_difficulty(&b) {
+                    c2s_apply_lock_difficulty(&me, locked);
+                }
+            }
+            0x21 => {
+                // ping_request: mirror the i64 straight back on `pong_response`
+                // (S2C 0x36) — the client's play-phase latency readout.
+                if let Some(payload) = decode_ping_request(&b) {
+                    let _ = send_packet(
+                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                        0x36,
+                        payload.to_be_bytes().to_vec(),
+                    );
+                }
+            }
+            0x23 => {
+                // player_abilities: honour the flying bit only under `mayfly` —
+                // a survival fly-hack request is refused, never stored.
+                if let Some(flags) = decode_player_abilities(&b) {
+                    c2s_apply_player_abilities(&me, flags);
+                }
+            }
+            0x27 => {
+                // pong: the client answered a `ClientboundPingPacket`; the id
+                // lands on the per-connection ledger.
+                if let Some(id) = decode_pong(&b) {
+                    last_client_pongs()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(me.eid, id);
+                }
+            }
+            0x2c => {
+                // seen_advancements: OpenedTab carries the tab id,
+                // ClosedScreen carries nothing.
+                if let Some(state) = decode_seen_advancements(&b) {
+                    seen_advancement_state()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(me.eid, state);
+                }
+            }
+            0x30 => {
+                // set_command_block: the VANILLA-CMDBLK decoder + apply —
+                // OP>=2, creative and `enable-command-block` are all enforced
+                // inside `apply_set_command_block`.
+                if let Some(update) = decode_set_command_block_c2s(&b) {
+                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = apply_set_command_block(
+                        player_permission_level(&me.name),
+                        *me.gm.lock().unwrap_or_else(|e| e.into_inner()),
+                        true,
+                        dim,
+                        update,
+                    );
+                }
+            }
+            0x31 => {
+                // set_command_minecart: identical gate under
+                // `apply_set_command_minecart`.
+                if let Some(update) = decode_set_command_minecart_c2s(&b) {
+                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = apply_set_command_minecart(
+                        player_permission_level(&me.name),
+                        *me.gm.lock().unwrap_or_else(|e| e.into_inner()),
+                        true,
+                        dim,
+                        update,
+                    );
+                }
+            }
+            0x33 => {
+                // set_jigsaw_block: OP>=2 + creative; the edit metadata is
+                // recorded against the block position.
+                if let Some((pos, update)) = decode_set_jigsaw_block(&b) {
+                    if sender_gamemaster_permitted(&me) {
+                        let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                        jigsaw_block_updates()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert((dim, pos.0, pos.1, pos.2), update);
+                    }
+                }
+            }
+            0x34 => {
+                // set_structure_block: OP>=2 + creative; same recorded-edit
+                // contract as the jigsaw arm.
+                if let Some((pos, update)) = decode_set_structure_block(&b) {
+                    if sender_gamemaster_permitted(&me) {
+                        let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                        structure_block_updates()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert((dim, pos.0, pos.1, pos.2), update);
+                    }
+                }
+            }
+            0x37 => {
+                // teleport_to_entity: spectator-only — vanilla refuses anyone
+                // else outright before resolving the target.
+                if let Some(uuid) = decode_teleport_to_entity(&b) {
+                    if me.is_spectator() {
+                        c2s_spectate_teleport(&me, &uuid);
+                    }
+                }
+            }
             _ => {}
         }
         apply_queued_block_updates();
@@ -10784,6 +11937,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         player_mechanism_sessions().lock().unwrap().remove(&me_cleanup.eid);
         death_drop_marks().lock().unwrap().remove(&me_cleanup.eid);
         beacon_menu_anchors().lock().unwrap().remove(&me_cleanup.eid);
+        // PARITY-58-C2S: per-connection packet state dies with the connection.
+        chat_ack_offsets().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
+        chat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
+        client_cookies().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
+        debug_sample_subscribers().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
+        last_client_pongs().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
+        client_abilities_flying().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
+        seen_advancement_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
+        reconfigure_acked().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
         // A disconnecting player drops both sides of `ServerPlayer.camera`: the
         // entry naming their own view and any spectator still watching them.
         {
@@ -15552,5 +16714,736 @@ mod bot_net2_tests {
             stone,
             "the parked chunk restores its block"
         );
+    }
+}
+
+// ---------- PARITY-58-C2S: packet + gamerule parity tests ----------
+
+#[cfg(test)]
+mod parity_58_c2s_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    /// A loopback client like the other wire tests: `me.sock` is the server
+    /// end, the returned peer reads the bytes the server wrote.
+    fn p58_client(name: &str, eid: i32) -> (Arc<Client>, std::net::TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let me = Arc::new(Client {
+            eid,
+            uuid: [0x58u8; 16],
+            name: name.to_string(),
+            player_attack_damage_id: None,
+            pos: Mutex::new((0.5, 65.0, 0.5, 0.0, 0.0, true)),
+            teleport: Mutex::new(Default::default()),
+            hp: Mutex::new(20.0),
+            sock: Mutex::new(stream),
+            inv: Mutex::new(HashMap::new()),
+            cursor: Mutex::new((0, 0, Vec::new())),
+            drag: Mutex::new((0, Vec::new())),
+            open_chest: Mutex::new(None),
+            chest_sync: Mutex::new(None),
+            open_furnace: Mutex::new(None),
+            craft: Mutex::new(HashMap::new()),
+            craft9: Mutex::new(HashMap::new()),
+            open_table: Mutex::new(false),
+            open_merchant: Mutex::new(false),
+            trade_sel: Mutex::new(0),
+            merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
+            bow_draw: Mutex::new(None),
+            dig: Mutex::new(None),
+            eat_start: Mutex::new(None),
+            blocking: Mutex::new(false),
+            sprinting: Mutex::new(false),
+            sneaking: Mutex::new(false),
+            last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            fall_fly: Mutex::new(false),
+            invulnerable: Mutex::new(0),
+            last_hurt: Mutex::new(0.0),
+            shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            absorb: Mutex::new(0.0),
+            pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            xp: Mutex::new(0),
+            skin: Mutex::new(None),
+            seen: Mutex::new(HashSet::new()),
+            chunks: Mutex::new(HashSet::from([(0, 0)])),
+            chunk_ack: Mutex::new(ChunkFeedback::new(1)),
+            gen_sources: Mutex::new(GenSources::default()),
+            gm: Mutex::new(0),
+            fall_from: Mutex::new(65.0),
+            food: Mutex::new(20),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            armor_pts: Mutex::new(0),
+            sat: Mutex::new(5.0),
+            walk_acc: Mutex::new(0.0),
+            lastp: Mutex::new((0.5, 65.0, 0.5)),
+            spawn_pt: Mutex::new(None),
+            dim: Mutex::new(DimId::Overworld),
+            spawn_dim: Mutex::new(DimId::Overworld),
+            view: Mutex::new(2),
+            in_portal: Mutex::new(false),
+            portal_at: Mutex::new(None),
+            held: Mutex::new(0),
+            effs: Mutex::new(Vec::new()),
+            lod_v1_enabled: AtomicBool::new(false),
+            underground_revealed: AtomicBool::new(false),
+            sleeping: Mutex::new(None),
+            inv_state_id: AtomicI32::new(0),
+        });
+        (me, peer)
+    }
+
+    fn p58_frame(peer: &mut std::net::TcpStream) -> Option<(i64, Vec<u8>)> {
+        peer.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let mut buf = [0u8; 8192];
+        let n = peer.read(&mut buf).ok()?;
+        let mut body = &buf[..n];
+        let _len = read_varint(&mut body)?;
+        let id = read_varint(&mut body)?;
+        Some((id, body.to_vec()))
+    }
+
+    /// Restores touched `command_gamerules` entries and `OPERATORS`/`DIFFICULTY`
+    /// state on every exit path.
+    struct P58Guard(Vec<(&'static str, i32)>, u8, u8);
+    impl P58Guard {
+        fn take(names: &[&'static str]) -> Self {
+            let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
+            let taken = names
+                .iter()
+                .map(|n| (*n, rules.get(n).copied().unwrap_or(-1)))
+                .collect();
+            P58Guard(
+                taken,
+                DIFFICULTY.load(Ordering::Relaxed),
+                DIFFICULTY_LOCKED.load(Ordering::Relaxed),
+            )
+        }
+    }
+    impl std::ops::Drop for P58Guard {
+        fn drop(&mut self) {
+            let mut rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
+            for (n, v) in self.0.drain(..) {
+                rules.insert(n, v);
+            }
+            drop(rules);
+            DIFFICULTY.store(self.1, Ordering::Relaxed);
+            DIFFICULTY_LOCKED.store(self.2, Ordering::Relaxed);
+        }
+    }
+
+    /// Removes test clients from `clients()` on every exit path.
+    struct P58Clients(Vec<i32>);
+    impl std::ops::Drop for P58Clients {
+        fn drop(&mut self) {
+            let eids = std::mem::take(&mut self.0);
+            clients()
+                .lock()
+                .unwrap()
+                .retain(|c| !eids.contains(&c.eid));
+        }
+    }
+
+    /// Drops an operator-list entry the test granted.
+    struct P58Op(String);
+    impl std::ops::Drop for P58Op {
+        fn drop(&mut self) {
+            OPERATORS.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+        }
+    }
+
+    /// Unsubscribes a `debug_sample_subscription` test subscriber.
+    struct SubGuard(i32);
+    impl std::ops::Drop for SubGuard {
+        fn drop(&mut self) {
+            debug_sample_subscribers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.0);
+        }
+    }
+
+    /// Removes the pearl fixtures and the death-drop mark a death test left.
+    struct PearlCleanup(i32);
+    impl std::ops::Drop for PearlCleanup {
+        fn drop(&mut self) {
+            pearls()
+                .lock()
+                .unwrap()
+                .retain(|p| p.eid != 99001 && p.eid != 99002);
+            death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+        }
+    }
+
+    /// Valid wire bodies decode to exactly the values vanilla's packet classes
+    /// carry — one row per new decoder.
+    #[test]
+    fn parity_58_c2s_decoders_accept_wire_shapes() {
+        // block_entity_tag_query: VarInt tx + packed BlockPos.
+        let mut p = Vec::new();
+        write_varint(&mut p, 7);
+        write_pos(&mut p, 10, 64, -20);
+        let (tx, pos) = decode_block_entity_tag_query(&p).expect("beq decodes");
+        assert_eq!(tx, 7);
+        assert_eq!(pos, (10, 64, -20));
+
+        assert_eq!(decode_chat_ack(&[0x03]), Some(3));
+        assert_eq!(decode_ping_request(&5i64.to_be_bytes()), Some(5));
+        assert_eq!(decode_pong(&7i32.to_be_bytes()), Some(7));
+        assert_eq!(decode_player_abilities(&[0x02]), Some(0x02));
+        assert_eq!(decode_lock_difficulty(&[1]), Some(true));
+        assert_eq!(decode_lock_difficulty(&[0]), Some(false));
+
+        // cookie_response: key + optional payload.
+        let mut c = Vec::new();
+        write_str(&mut c, "minecraft:brand");
+        c.push(1);
+        write_varint(&mut c, 3);
+        c.extend_from_slice(b"van");
+        let (key, payload) = decode_cookie_response(&c).expect("cookie decodes");
+        assert_eq!(key, "minecraft:brand");
+        assert_eq!(payload, Some(b"van".to_vec()));
+
+        // seen_advancements: OpenedTab carries the tab id, ClosedScreen none.
+        let mut sa = vec![0x00];
+        write_str(&mut sa, "minecraft:story/root");
+        assert_eq!(
+            decode_seen_advancements(&sa),
+            Some((0, Some("minecraft:story/root".to_string())))
+        );
+        assert_eq!(decode_seen_advancements(&[0x01]), Some((1, None)));
+
+        // container_slot_state_changed: slot, window, bool.
+        assert_eq!(decode_container_slot_state(&[0x04, 0x01, 0x01]), Some((4, 1, true)));
+
+        // jigsaw_generate: pos + levels + bool.
+        let mut jg = Vec::new();
+        write_pos(&mut jg, 1, 2, 3);
+        write_varint(&mut jg, 20);
+        jg.push(1);
+        assert_eq!(
+            decode_jigsaw_generate(&jg),
+            Some(((1, 2, 3), 20, true))
+        );
+
+        // teleport_to_entity: raw 16-byte uuid.
+        let uuid = [0xabu8; 16];
+        assert_eq!(decode_teleport_to_entity(&uuid), Some(uuid));
+
+        // entity_tag_query: two VarInts.
+        assert_eq!(decode_entity_tag_query(&[0x05, 0x09]), Some((5, 9)));
+        assert_eq!(decode_debug_sample_subscription(&[0x00]), Some(0));
+
+        // set_structure_block: pos + UPDATE_DATA/DATA + name + i8 offset/size
+        // + mirror/rotation + metadata + f32 integrity + VarLong seed + flags.
+        let mut sb = Vec::new();
+        write_pos(&mut sb, 1, 64, -3);
+        write_varint(&mut sb, 0); // UPDATE_DATA
+        write_varint(&mut sb, 3); // DATA
+        write_str(&mut sb, "house_a");
+        sb.extend_from_slice(&[0, 1, 2]);
+        sb.extend_from_slice(&[4, 5, 6]);
+        write_varint(&mut sb, 1); // FRONT_BACK
+        write_varint(&mut sb, 2); // CLOCKWISE_180
+        write_str(&mut sb, "loot=true");
+        sb.extend_from_slice(&0.75f32.to_be_bytes());
+        write_varint(&mut sb, 42);
+        sb.push(0x07); // ignoreEntities|showAir|showBoundingBox
+        let (sp, su) = decode_set_structure_block(&sb).expect("structure block decodes");
+        assert_eq!(sp, (1, 64, -3));
+        assert_eq!(su.mode, 3);
+        assert_eq!(su.size, (4, 5, 6));
+        assert!((su.integrity - 0.75).abs() < f32::EPSILON);
+        assert_eq!(su.seed, 42);
+        assert_eq!(su.flags, 0x07);
+
+        // set_jigsaw_block: pos + four identifiers + joint + two priorities.
+        let mut jb = Vec::new();
+        write_pos(&mut jb, 7, 70, 8);
+        for s in ["minecraft:n", "minecraft:t", "minecraft:p", "minecraft:stone"] {
+            write_str(&mut jb, s);
+        }
+        write_str(&mut jb, "aligned");
+        write_varint(&mut jb, 5);
+        write_varint(&mut jb, 9);
+        let (jp, ju) = decode_set_jigsaw_block(&jb).expect("jigsaw decodes");
+        assert_eq!(jp, (7, 70, 8));
+        assert_eq!(ju.joint, 1);
+        assert_eq!((ju.selection_priority, ju.placement_priority), (5, 9));
+    }
+
+    /// Every decoder fails closed on truncation, out-of-range values, invalid
+    /// bools/enums and trailing garbage — never a partial accept.
+    #[test]
+    fn parity_58_c2s_decoders_fail_closed() {
+        assert!(decode_block_entity_tag_query(&[]).is_none());
+        assert!(decode_block_entity_tag_query(&[0x07]).is_none());
+        assert!(decode_chat_ack(&[]).is_none());
+        assert!(decode_chat_ack(&[0x01, 0x00]).is_none(), "trailing garbage");
+        assert!(decode_ping_request(&[0; 7]).is_none());
+        assert!(decode_ping_request(&[0; 9]).is_none());
+        assert!(decode_pong(&[0; 3]).is_none());
+        assert!(decode_player_abilities(&[]).is_none());
+        assert!(decode_player_abilities(&[1, 2]).is_none());
+        assert!(decode_lock_difficulty(&[]).is_none());
+        assert!(decode_lock_difficulty(&[2]).is_none());
+        assert!(decode_lock_difficulty(&[1, 0]).is_none());
+        assert!(decode_debug_sample_subscription(&[0x01]).is_none(), "only TICK_TIME=0");
+        assert!(decode_teleport_to_entity(&[0u8; 15]).is_none());
+        assert!(decode_seen_advancements(&[0x02]).is_none(), "bad action");
+        assert!(decode_seen_advancements(&[0x00]).is_none(), "OpenedTab needs tab id");
+        assert!(decode_seen_advancements(&[0x01, 0x00]).is_none(), "ClosedScreen is bare");
+        assert!(decode_container_slot_state(&[0x09, 0x00, 0x01]).is_none(), "slot < 9");
+        assert!(decode_container_slot_state(&[0x01, 0x00, 0x02]).is_none(), "strict bool");
+
+        // cookie_response: 5KiB+1 payload refused.
+        let mut big = Vec::new();
+        write_str(&mut big, "k");
+        big.push(1);
+        write_varint(&mut big, COOKIE_PAYLOAD_MAX + 1);
+        big.resize(big.len() + (COOKIE_PAYLOAD_MAX + 1) as usize, 0);
+        assert!(decode_cookie_response(&big).is_none());
+
+        // jigsaw_generate: levels > MAX_DEPTH refused, bool byte strict.
+        let mut jg = Vec::new();
+        write_pos(&mut jg, 0, 0, 0);
+        write_varint(&mut jg, 21);
+        jg.push(0);
+        assert!(decode_jigsaw_generate(&jg).is_none());
+        let mut jg2 = Vec::new();
+        write_pos(&mut jg2, 0, 0, 0);
+        write_varint(&mut jg2, 5);
+        jg2.push(2);
+        assert!(decode_jigsaw_generate(&jg2).is_none());
+
+        // edit_book: slot > 40, > 100 pages, page > 1024 chars, title > 32.
+        let mut eb = Vec::new();
+        write_varint(&mut eb, 41);
+        write_varint(&mut eb, 0);
+        eb.push(0);
+        assert!(decode_edit_book(&eb).is_none());
+        let mut eb2 = Vec::new();
+        write_varint(&mut eb2, 0);
+        write_varint(&mut eb2, EDIT_BOOK_MAX_PAGES + 1);
+        assert!(decode_edit_book(&eb2).is_none());
+        let mut eb3 = Vec::new();
+        write_varint(&mut eb3, 0);
+        write_varint(&mut eb3, 1);
+        write_str(&mut eb3, &"x".repeat(EDIT_BOOK_MAX_PAGE_CHARS + 1));
+        assert!(decode_edit_book(&eb3).is_none());
+        let mut eb4 = Vec::new();
+        write_varint(&mut eb4, 0);
+        write_varint(&mut eb4, 0);
+        eb4.push(1);
+        write_str(&mut eb4, &"t".repeat(EDIT_BOOK_MAX_TITLE_CHARS + 1));
+        assert!(decode_edit_book(&eb4).is_none());
+
+        // set_structure_block: out-of-range enums/offsets refused.
+        let mut sb = Vec::new();
+        write_pos(&mut sb, 0, 0, 0);
+        write_varint(&mut sb, 4); // action > 3
+        assert!(decode_set_structure_block(&sb).is_none());
+        let mut sb2 = Vec::new();
+        write_pos(&mut sb2, 0, 0, 0);
+        write_varint(&mut sb2, 0);
+        write_varint(&mut sb2, 0);
+        write_str(&mut sb2, "n");
+        sb2.extend_from_slice(&[0, 0, 0]);
+        sb2.extend_from_slice(&[49, 0, 0]); // size > 48
+        assert!(decode_set_structure_block(&sb2).is_none());
+
+        // set_jigsaw_block: bad joint enum refused.
+        let mut jb = Vec::new();
+        write_pos(&mut jb, 0, 0, 0);
+        for s in ["a", "b", "c", "d"] {
+            write_str(&mut jb, s);
+        }
+        write_str(&mut jb, "bogus");
+        write_varint(&mut jb, 0);
+        write_varint(&mut jb, 0);
+        assert!(decode_set_jigsaw_block(&jb).is_none());
+
+        // chat_session_update: oversized key material refused.
+        let mut cs = vec![0u8; 16 + 8];
+        write_varint(&mut cs, CHAT_SESSION_MATERIAL_MAX + 1);
+        assert!(decode_chat_session_update(&cs).is_none());
+    }
+
+    /// `ping_request` (0x21): the arm mirrors the i64 on `pong_response`
+    /// (0x36) — pin the wire round-trip through the same send path.
+    #[test]
+    fn parity_58_c2s_ping_request_echoes_payload_on_pong_response() {
+        let (me, mut peer) = p58_client("P58Ping", 58001);
+        let payload = 0x1122334455667788i64;
+        let body = payload.to_be_bytes();
+        assert_eq!(decode_ping_request(&body), Some(payload));
+        let _ = send_packet(
+            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+            0x36,
+            body.to_vec(),
+        );
+        let (id, pong) = p58_frame(&mut peer).expect("pong_response lands");
+        assert_eq!(id, 0x36, "play pong_response id");
+        assert_eq!(pong, body.to_vec(), "exact i64 mirror");
+    }
+
+    /// `player_abilities` (0x23): survival requests to fly are refused; the
+    /// creative flyer is honoured and echoed on `player_abilities` (0x38).
+    #[test]
+    fn parity_58_c2s_player_abilities_survival_refused_creative_allowed() {
+        let _guard = world_guard();
+        // Survival: bit set but mayfly absent -> refused, echo has no fly bit.
+        let (me, mut peer) = p58_client("P58Surv", 58002);
+        c2s_apply_player_abilities(&me, 0x02);
+        assert_eq!(
+            client_abilities_flying()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&me.eid)
+                .copied(),
+            Some(false),
+            "a survival fly request is never stored"
+        );
+        let (id, ab) = p58_frame(&mut peer).expect("abilities echo");
+        assert_eq!(id, 0x38);
+        assert_eq!(ab[0] & 0x02, 0, "echo carries no flying bit");
+
+        // Creative: the same request takes the flying bit.
+        let (me2, mut peer2) = p58_client("P58Crea", 58003);
+        *me2.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+        c2s_apply_player_abilities(&me2, 0x02);
+        assert_eq!(
+            client_abilities_flying()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&me2.eid)
+                .copied(),
+            Some(true)
+        );
+        let (id2, ab2) = p58_frame(&mut peer2).expect("creative echo");
+        assert_eq!(id2, 0x38);
+        assert_eq!(ab2[0] & 0x0f, 0x0f, "invulnerable+flying+mayfly+instabuild");
+    }
+
+    /// `lock_difficulty` (0x19): non-OP refused fail-closed; an OP lock flips
+    /// `DIFFICULTY_LOCKED` and broadcasts `change_difficulty` (0x0b) with the
+    /// locked flag set.
+    #[test]
+    fn parity_58_c2s_lock_difficulty_op_gate_and_broadcast() {
+        let _guard = world_guard();
+        let _keep = P58Guard::take(&[]);
+        let (me, mut peer) = p58_client("P58Lock", 58004);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        let _cl = P58Clients(vec![me.eid]);
+
+        DIFFICULTY_LOCKED.store(0, Ordering::Relaxed);
+        assert!(!c2s_apply_lock_difficulty(&me, true), "level 0 refused");
+        assert_eq!(DIFFICULTY_LOCKED.load(Ordering::Relaxed), 0);
+
+        OPERATORS
+            .lock()
+            .unwrap()
+            .insert(me.name.to_ascii_lowercase());
+        let _op = P58Op(me.name.to_ascii_lowercase());
+        assert!(c2s_apply_lock_difficulty(&me, true), "OP locks");
+        assert_eq!(DIFFICULTY_LOCKED.load(Ordering::Relaxed), 1);
+        let (id, body) = p58_frame(&mut peer).expect("broadcast lands");
+        assert_eq!(id, 0x0b);
+        assert_eq!(body[1], 1, "locked flag");
+    }
+
+    /// `edit_book` (0x14): pages land on `writable_book_content`, a title signs
+    /// the stack into `written_book` — and a non-book slot is untouched.
+    #[test]
+    fn parity_58_c2s_edit_book_writes_and_signs() {
+        let (me, _peer) = p58_client("P58Book", 58005);
+        // Raw slot 0 -> window slot 36.
+        me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (1091, 1, Vec::new()));
+        let book = EditBookUpdate {
+            slot: 0,
+            pages: vec!["p1".to_string(), "p2".to_string()],
+            title: None,
+        };
+        c2s_apply_edit_book(&me, &book);
+        {
+            let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+            let (item, _count, comps) = inv.get(&36).expect("book still there");
+            assert_eq!(*item, 1091, "unsigned stays writable_book");
+            assert_eq!(comps.len(), 1);
+            assert_eq!(comps[0].0, 33, "writable_book_content");
+        }
+        let sign = EditBookUpdate {
+            slot: 0,
+            pages: vec!["final".to_string()],
+            title: Some("T".to_string()),
+        };
+        c2s_apply_edit_book(&me, &sign);
+        {
+            let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+            let (item, _count, comps) = inv.get(&36).expect("signed book");
+            assert_eq!(*item, 1092, "title signs into written_book");
+            assert_eq!(comps[0].0, 34, "written_book_content");
+        }
+        // A written book is immutable: a further edit must not rewrite it.
+        let before = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36).cloned();
+        let again = EditBookUpdate {
+            slot: 0,
+            pages: vec!["hack".to_string()],
+            title: None,
+        };
+        c2s_apply_edit_book(&me, &again);
+        assert_eq!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36).cloned(), before);
+    }
+
+    /// `teleport_to_entity` (0x37) resolves a target player to a same-dimension
+    /// `teleport` (0x40) on the spectator's stream.
+    #[test]
+    fn parity_58_c2s_spectate_teleport_writes_teleport() {
+        let _guard = world_guard();
+        let (target, _tpeer) = p58_client("P58Target", 58006);
+        *target.pos.lock().unwrap_or_else(|e| e.into_inner()) = (10.5, 70.0, -4.5, 90.0, 10.0, true);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(target.clone());
+        let (me, mut peer) = p58_client("P58Spec", 58007);
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 3;
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        let _cl = P58Clients(vec![target.eid, me.eid]);
+
+        c2s_spectate_teleport(&me, &target.uuid);
+        let (id, _body) = p58_frame(&mut peer).expect("teleport packet");
+        assert_eq!(id, 0x40, "same-dimension spectate teleports");
+        let pos = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!((pos.0, pos.1, pos.2), (10.5, 70.0, -4.5));
+
+        // An unknown uuid is a quiet no-op — no packet, position untouched.
+        c2s_spectate_teleport(&me, &[0xeeu8; 16]);
+        assert!(p58_frame(&mut peer).is_none(), "nothing for a stale uuid");
+    }
+
+    /// `debug_sample_subscription` + the tick's `push_debug_tick_sample`: a
+    /// subscriber gets `debug_sample` (0x1b) with one i64 ns sample.
+    #[test]
+    fn parity_58_c2s_debug_sample_subscriber_gets_tick_time() {
+        let _guard = world_guard();
+        let (me, mut peer) = p58_client("P58Dbg", 58008);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        let _cl = P58Clients(vec![me.eid]);
+        let eid = me.eid;
+        debug_sample_subscribers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, 0);
+        let _sub = SubGuard(eid);
+        push_debug_tick_sample(250);
+        let (id, body) = p58_frame(&mut peer).expect("debug sample lands");
+        assert_eq!(id, 0x1b);
+        let mut rest = body.as_slice();
+        assert_eq!(read_varint(&mut rest), Some(1), "one sample");
+        let ns = i64::from_be_bytes(rest[..8].try_into().unwrap());
+        assert_eq!(ns, 250_000, "250us as nanoseconds");
+    }
+
+    /// `reducedDebugInfo`: flipping the rule replays vanilla
+    /// `sendGameRulesToPlayer` — entity event 22 on, 23 off, addressed to the
+    /// recipient's own entity.
+    #[test]
+    fn parity_58_c2s_reduced_debug_info_watch_broadcasts_entity_event() {
+        let _guard = world_guard();
+        let _keep = P58Guard::take(&["reducedDebugInfo"]);
+        let (me, mut peer) = p58_client("P58Debug", 58009);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        let _cl = P58Clients(vec![me.eid]);
+
+        command_gamerules()
+            .lock()
+            .unwrap()
+            .insert("reducedDebugInfo", 0);
+        gamerule_watch_tick(); // re-baselines the watcher
+        assert!(p58_frame(&mut peer).is_none(), "no event while unchanged");
+
+        command_gamerules()
+            .lock()
+            .unwrap()
+            .insert("reducedDebugInfo", 1);
+        gamerule_watch_tick();
+        let (id, body) = p58_frame(&mut peer).expect("status 22");
+        assert_eq!(id, 0x1f);
+        assert_eq!(body.last().copied(), Some(22u8 as u8));
+
+        command_gamerules()
+            .lock()
+            .unwrap()
+            .insert("reducedDebugInfo", 0);
+        gamerule_watch_tick();
+        let (id2, body2) = p58_frame(&mut peer).expect("status 23");
+        assert_eq!(id2, 0x1f);
+        assert_eq!(body2.last().copied(), Some(23u8));
+    }
+
+    /// `enderPearlsVanishOnDeath`: the dying owner's pearls leave the flight
+    /// list when the rule is on and survive it when off.
+    #[test]
+    fn parity_58_c2s_ender_pearls_vanish_on_death_gate() {
+        let _guard = world_guard();
+        let _keep = P58Guard::take(&["enderPearlsVanishOnDeath"]);
+        let (me, _peer) = p58_client("P58Pearl", 58010);
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 3; // spectator: early return after pearl cleanup
+        *me.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        pearls().lock().unwrap_or_else(|e| e.into_inner()).push(Pearl {
+            eid: 99001,
+            owner: me.eid,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+            ttl: 20,
+        });
+        pearls().lock().unwrap_or_else(|e| e.into_inner()).push(Pearl {
+            eid: 99002,
+            owner: -777,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+            ttl: 20,
+        });
+        let _pearl_cleanup = PearlCleanup(me.eid);
+
+        command_gamerules()
+            .lock()
+            .unwrap()
+            .insert("enderPearlsVanishOnDeath", 1);
+        drop_player_items_on_death(&me);
+        {
+            let pq = pearls().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!pq.iter().any(|p| p.eid == 99001), "owner's pearl vanished");
+            assert!(pq.iter().any(|p| p.eid == 99002), "others keep flying");
+        }
+    }
+
+    /// The six newly-wired rules read live through `gamerule_live_value` —
+    /// the function every new gate calls.
+    #[test]
+    fn parity_58_c2s_gamerules_read_live() {
+        let _keep = P58Guard::take(&[
+            "disableElytraMovementCheck",
+            "enderPearlsVanishOnDeath",
+            "globalSoundEvents",
+            "projectilesCanBreakBlocks",
+            "reducedDebugInfo",
+            "spectatorsGenerateChunks",
+        ]);
+        for (name, on, off) in [
+            ("disableElytraMovementCheck", 1, 0),
+            ("enderPearlsVanishOnDeath", 1, 0),
+            ("globalSoundEvents", 1, 0),
+            ("projectilesCanBreakBlocks", 0, 1),
+            ("reducedDebugInfo", 1, 0),
+            ("spectatorsGenerateChunks", 0, 1),
+        ] {
+            command_gamerules()
+                .lock()
+                .unwrap()
+                .insert(name, on);
+            assert_eq!(gamerule_live_value(name), on, "{name} on");
+            command_gamerules()
+                .lock()
+                .unwrap()
+                .insert(name, off);
+            assert_eq!(gamerule_live_value(name), off, "{name} off");
+        }
+    }
+
+    /// `globalSoundEvents`: the portal sound broadcast reaches everyone when
+    /// the rule is on and only same-dimension listeners in radius when off.
+    #[test]
+    fn parity_58_c2s_global_sound_events_audience() {
+        let _guard = world_guard();
+        let _keep = P58Guard::take(&["globalSoundEvents"]);
+        let (near, mut near_peer) = p58_client("P58Near", 58011);
+        let (far, mut far_peer) = p58_client("P58Far", 58012);
+        *far.pos.lock().unwrap_or_else(|e| e.into_inner()) = (5000.5, 65.0, 5000.5, 0.0, 0.0, true);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(near.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(far.clone());
+        let _cl = P58Clients(vec![near.eid, far.eid]);
+
+        command_gamerules()
+            .lock()
+            .unwrap()
+            .insert("globalSoundEvents", 0);
+        end_portal_spawn_sound(DimId::Overworld, 0.5, 65.0, 0.5);
+        assert!(p58_frame(&mut near_peer).is_some(), "near listener hears it");
+        assert!(p58_frame(&mut far_peer).is_none(), "far player out of radius");
+
+        command_gamerules()
+            .lock()
+            .unwrap()
+            .insert("globalSoundEvents", 1);
+        end_portal_spawn_sound(DimId::Overworld, 0.5, 65.0, 0.5);
+        assert!(p58_frame(&mut near_peer).is_some());
+        assert!(
+            p58_frame(&mut far_peer).is_some(),
+            "global audience reaches every dimension and distance"
+        );
+    }
+
+    /// `set_command_block`/`set_command_minecart` wire decode feeds the
+    /// VANILLA-CMDBLK applies under the OP+creative+enabled gate.
+    #[test]
+    fn parity_58_c2s_command_block_packets_gate() {
+        // pos + "say hi" + Sequence + flags.
+        let mut body = Vec::new();
+        write_pos(&mut body, 1, 2, 3);
+        write_str(&mut body, "say hi");
+        write_varint(&mut body, 0);
+        body.push(0x07); // track_output | conditional | automatic
+        let update = decode_set_command_block_c2s(&body).expect("decodes");
+        assert_eq!(update.pos, (1, 2, 3));
+        assert!(update.automatic && update.conditional && update.track_output);
+        assert!(decode_set_command_block_c2s(&body[..body.len() - 1]).is_none());
+
+        // The shared edit gate itself: non-OP, survival and toggle-off all
+        // refuse before any record is written.
+        assert!(apply_set_command_block(0, 1, true, DimId::Overworld, update).is_err());
+        let update2 = decode_set_command_block_c2s(&body).unwrap();
+        assert!(apply_set_command_block(2, 0, true, DimId::Overworld, update2).is_err());
+        let update3 = decode_set_command_block_c2s(&body).unwrap();
+        assert!(apply_set_command_block(2, 1, false, DimId::Overworld, update3).is_err());
+        let update4 = decode_set_command_block_c2s(&body).unwrap();
+        let _guard = world_guard();
+        assert!(apply_set_command_block(2, 1, true, DimId::Overworld, update4).is_ok());
+    }
+
+    /// `tag_query` (0x6e) reply shape: VarInt tx id then anonymous NBT; an
+    /// absent target is a bare TAG_End like vanilla's null-tag reply.
+    #[test]
+    fn parity_58_c2s_tag_query_reply_shape() {
+        let payload = tag_query_reply(0x1f3, None);
+        let mut rest = payload.as_slice();
+        assert_eq!(read_varint(&mut rest), Some(0x1f3));
+        assert_eq!(rest, &[0u8], "empty TAG_End for a missing target");
+    }
+
+    /// `spectatorsGenerateChunks`: the gate the chunk stream applies — a dim
+    /// with no registered generator passes everything (the flat-world path
+    /// never generates anyway), matching vanilla's no-generation no-op.
+    #[test]
+    fn parity_58_c2s_spectator_chunk_gate_passthrough() {
+        assert!(spectator_chunk_allowed(DimId::Overworld, i32::MAX / 16, 0));
+        assert!(spectator_chunk_allowed(DimId::Nether, -1, -1));
+    }
+
+    /// `container_slot_state_changed` needs a crafter menu; a sender with no
+    /// open menu is a quiet no-op (never a panic or a state write).
+    #[test]
+    fn parity_58_c2s_crafter_slot_state_no_menu_noop() {
+        let (me, _peer) = p58_client("P58Crafter", 58013);
+        c2s_apply_container_slot_state(&me, 4, 1, true); // must not panic
     }
 }

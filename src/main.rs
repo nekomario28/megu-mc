@@ -622,6 +622,10 @@ fn dim_ultrawarm(dim: DimId) -> bool {
 static WORLD_SPAWN: Mutex<(f64, f64, f64, f32)> = Mutex::new((0.5, 16.0, 0.5, 0.0));
 // 0=peaceful 1=easy 2=normal 3=hard; gates hostile night spawns
 static DIFFICULTY: AtomicU8 = AtomicU8::new(2);
+// vanilla `LevelData.difficultyLocked`, set by the OP-only `lock_difficulty`
+// packet (C2S 0x19). Session-scoped: the level.dat `DifficultyLocked` field is
+// not in this lane's save format, so a restart clears it like a fresh world.
+static DIFFICULTY_LOCKED: AtomicU8 = AtomicU8::new(0);
 static POWERED_PLATES: OnceLock<Mutex<HashSet<(i32, i32, i32)>>> = OnceLock::new();
 fn powered_plates() -> &'static Mutex<HashSet<(i32, i32, i32)>> {
     POWERED_PLATES.get_or_init(|| Mutex::new(HashSet::new()))
@@ -4277,6 +4281,27 @@ fn w1_arrow_tick() {
                 w1_dominant_axis([prev[3], prev[4], prev[5]]),
                 true,
             );
+        }
+    }
+    // `projectilesCanBreakBlocks`: a still-flying arrow or trident shatters the
+    // fragile cells vanilla registers `onProjectileHit` for — chorus flower,
+    // pointed dripstone, decorated pot — and keeps flying. With the rule off
+    // the block survives (and a solid one still sticks the projectile). Vanilla
+    // gates a wind-charge burst's break of the same cells under this rule too;
+    // this lane has no live wind-charge thrower, so arrows and tridents carry
+    // the live gate.
+    if gamerule_live_value("projectilesCanBreakBlocks") != 0 {
+        for a in after.iter().filter(|a| !a.stuck) {
+            let cell = [a.x, a.y, a.z].map(|coord| coord.floor() as i32);
+            if matches!(
+                reg.name_of(block_at(cell[0], cell[1], cell[2])),
+                "minecraft:chorus_flower"
+                    | "minecraft:pointed_dripstone"
+                    | "minecraft:decorated_pot"
+            ) {
+                set_block_dim(DimId::Overworld, cell[0], cell[1], cell[2], 0);
+                note_block_update_dim(DimId::Overworld, cell[0], cell[1], cell[2], 0);
+            }
         }
     }
 }
@@ -15119,7 +15144,11 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     #[cfg(feature = "create-offload")]
     run("mod_offload", mod_offload_tick);
     run("live_mods", live_mod_tick);
+    run("gamerules", gamerule_watch_tick);
     let wire_us = wire_tick_start.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+    // Vanilla `MinecraftServer.pushTickTimeMetric`: the finished tick's cost is
+    // the sample `debug_sample` subscribers are handed each tick.
+    push_debug_tick_sample(wire_us);
     live_hotspot_profiler()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
