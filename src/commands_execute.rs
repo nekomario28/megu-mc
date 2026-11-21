@@ -471,6 +471,12 @@ impl ExecuteSource {
         } else {
             Vec::new()
         };
+        // Vanilla `@a[team=red]` reads the scoreboard team that owns each
+        // candidate's score-holder name; `p3b_team_of` is that registry.
+        let entity_teams: Vec<Option<String>> = entities
+            .iter()
+            .map(|entity| p3b_team_of(&entity.score_holder()))
+            .collect();
         let candidates: Vec<_> = entities
             .iter()
             .zip(&entity_tags)
@@ -526,6 +532,9 @@ impl ExecuteSource {
                     tags,
                     scores,
                     nbt: entity_nbt.get(index).and_then(Option::as_ref),
+                    team: entity_teams
+                        .get(index)
+                        .and_then(|team| team.as_deref()),
                     ..Default::default()
                 }
             })
@@ -2168,6 +2177,10 @@ fn execute_run(
                 for line in lines {
                     let _ = execute_run(source, &line, s);
                     ran += 1;
+                    // `/return` ends the calling function's remaining lines.
+                    if line == "return" || line.starts_with("return ") {
+                        break;
+                    }
                 }
                 Ok(ran)
             });

@@ -392,7 +392,10 @@ fn operators_persist_and_gate_player_commands() {
     let run = |ctx, msg| run_command_ctx(ctx, msg, &mut None);
 
     assert!(run(&player, "/time query daytime").starts_with("The time is "));
-    assert_eq!(run(&player, "/help"), "commands: help list time me msg tell w");
+    assert_eq!(
+        run(&player, "/help"),
+        "commands: help list time me msg tell w teammsg tm trigger"
+    );
     // vanilla TimeArgument has a minimum of 0, so negative /time add is rejected
     assert_eq!(run(&console, "/time add -5"), "usage: /time add <ticks>");
     assert!(run(&player, "/op Fixture_Op").contains("permission"));
@@ -417,7 +420,7 @@ fn operators_persist_and_gate_player_commands() {
     assert!(run(&player, "/time set 456").contains("permission"));
     assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 123);
 
-    std::fs::write(path, "[\"fixture_op\"] trailing").unwrap();
+    std::fs::write(path, "{\"unexpected\": \"object\"}").unwrap();
     assert!(load_operators(path).is_err());
     assert!(!player_is_admin("another"));
     assert!(set_operator(std::path::Path::new("missing/ops.json"), "fixture_op", true).is_err());
@@ -549,7 +552,10 @@ fn brigadier_play_tree_and_completion_respect_permissions() {
         .iter()
         .map(|node| node.name().to_owned())
         .collect();
-    assert_eq!(names, ["help", "list", "time", "me", "msg", "tell", "w"]);
+    assert_eq!(
+        names,
+        ["help", "list", "time", "me", "msg", "tell", "w", "teammsg", "tm", "trigger"]
+    );
     assert!(basic.child("time").unwrap().child("set").is_none());
     assert!(admin
         .child("time")
@@ -566,19 +572,19 @@ fn brigadier_play_tree_and_completion_respect_permissions() {
         players: vec!["Fixture_Op".into()],
         ..Default::default()
     };
-    let suggest = |text, admin| {
+    let suggest = |text, level| {
         let request = brigadier_wire::CommandSuggestionsRequest::new(313, text);
         let bytes = brigadier_wire::command_suggestions_request_payload(&request).unwrap();
         let request = brigadier_wire::parse_command_suggestions_request(&bytes).unwrap();
-        command_suggestion_response(&request, admin, &completions)
+        command_suggestion_response(&request, level, &completions)
     };
-    let response = suggest("/op Fi", true);
+    let response = suggest("/op Fi", 4);
     assert_eq!(response.transaction_id, 313);
     assert_eq!((response.start, response.length), (4, 2));
     assert_eq!(response.entries[0].text, "Fixture_Op");
-    assert!(suggest("/op Fi", false).entries.is_empty());
-    assert_eq!(suggest("time q", false).entries[0].text, "query");
-    assert_eq!(suggest("/time set mi", true).entries[0].text, "midnight");
+    assert!(suggest("/op Fi", 0).entries.is_empty());
+    assert_eq!(suggest("time q", 0).entries[0].text, "query");
+    assert_eq!(suggest("/time set mi", 4).entries[0].text, "midnight");
     assert!(brigadier_wire::command_suggestions_response_payload(&response).is_ok());
     assert!(brigadier_wire::parse_command_suggestions_request(&[0, 5, b'/']).is_err());
 }
@@ -1275,4 +1281,207 @@ fn datapack_raw_loot_tables_keep_json_and_follow_reload() {
     let shared = loot_table_json("test:chests/shared").unwrap();
     assert!(shared.contains("\"note\":\"folder\""), "{shared}");
     assert!(loot_table_json("test:plural/only").is_some());
+}
+
+/// The W1 wiring lane end-to-end: every newly live command family reaches its
+/// engine through `run_command_ctx`, and the `team=` selector reads the live
+/// `TeamRegistry`.
+#[test]
+fn live_commands_dispatch_ban_whitelist_team_tick_locate_random_and_recipe() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let _world = world_guard();
+    let _directory = CommandDirectory::enter();
+    let console = command_context(None);
+    let run = |msg: &str| run_command_ctx(&console, msg, &mut None);
+
+    let (mut alpha, _ha) = crate::effect_tests::client_pair();
+    let (mut beta, _hb) = crate::effect_tests::client_pair();
+    alpha.eid = 8401;
+    alpha.name = "wl_alpha".into();
+    beta.eid = 8402;
+    beta.name = "wl_beta".into();
+    let (ea, eb) = (alpha.eid, beta.eid);
+    clients().lock().unwrap().extend([Arc::new(alpha), Arc::new(beta)]);
+
+    // /ban + /banlist + /pardon reach BanRegistry (and persist under ".").
+    assert!(run("/ban wl_alpha").starts_with("Banned wl_alpha"));
+    assert!(ban_registry().lock().unwrap().player_ban("wl_alpha").is_some());
+    assert!(run("/banlist").contains("wl_alpha"));
+    assert!(run("/pardon wl_alpha").contains("wl_alpha"));
+    assert!(ban_registry().lock().unwrap().player_ban("wl_alpha").is_none());
+
+    // /whitelist add/on/list/off/remove.
+    assert!(run("/whitelist add wl_beta").contains("wl_beta"));
+    assert!(run("/whitelist on").contains("turned on"));
+    assert!(whitelist_registry().lock().unwrap().enabled);
+    assert!(run("/whitelist list").contains("wl_beta"));
+    assert!(run("/whitelist off").contains("turned off"));
+    assert!(run("/whitelist remove wl_beta").contains("wl_beta"));
+
+    // /team add + join feed the live registry the `team=` selector reads.
+    assert_eq!(run("/team add wl_team"), "Created team wl_team");
+    assert_eq!(run("/team join wl_team wl_alpha"), "Added wl_alpha to team wl_team");
+    assert_eq!(p3b_team_of("wl_alpha").as_deref(), Some("wl_team"));
+    assert_eq!(resolve_selector("@a[team=wl_team]", None), vec![ea.to_string()]);
+    assert_eq!(resolve_selector("@a[team=!wl_team]", None), vec![eb.to_string()]);
+
+    // /tick freeze/step/unfreeze reach TickController, and the game_tick gate
+    // skips world ticks while frozen except for queued steps.
+    assert_eq!(run("/tick freeze"), "Froze the game");
+    let before = TICK_IDX.load(Ordering::Relaxed);
+    game_tick(|_, tick| tick());
+    assert_eq!(TICK_IDX.load(Ordering::Relaxed), before, "frozen world must not tick");
+    assert_eq!(run("/tick step 1"), "Stepping forward 1 tick(s)");
+    game_tick(|_, tick| tick());
+    assert_eq!(TICK_IDX.load(Ordering::Relaxed), before + 1, "step budget runs one tick");
+    game_tick(|_, tick| tick());
+    assert_eq!(TICK_IDX.load(Ordering::Relaxed), before + 1, "budget exhausted");
+    assert_eq!(run("/tick unfreeze"), "The game is no longer frozen");
+
+    // /locate and /random dispatch (found-or-not is world-dependent).
+    let located = run("/locate biome minecraft:plains");
+    assert!(!located.starts_with("usage:") && !located.starts_with("unknown"), "{located}");
+    let rolled = run("/random roll 1..100");
+    assert!(rolled.contains("Server rolled"), "{rolled}");
+
+    // /recipe give|take against the live recipe universe.
+    recipe_ids().lock().unwrap().insert("fixture:stone".to_owned());
+    assert_eq!(run("/recipe give wl_beta fixture:stone"), "Gave 1 new recipes to wl_beta");
+    assert_eq!(run("/recipe take wl_beta fixture:stone"), "Took 1 recipes from wl_beta");
+    assert_eq!(run("/recipe give wl_beta fixture:bogus"), "Unknown recipe 'fixture:bogus'");
+
+    // Restore every shared registry the test mutated.
+    run("/tick unfreeze");
+    teams().lock().unwrap().remove("wl_team").ok();
+    whitelist_registry().lock().unwrap().enabled = false;
+    recipe_ids().lock().unwrap().remove("fixture:stone");
+    recipe_books().lock().unwrap().clear();
+    clients().lock().unwrap().retain(|c| c.eid != ea && c.eid != eb);
+}
+
+/// Vanilla `hasPermission(level)`: level-0 players get only the everyone set,
+/// level-2 adds cheats, level-3 adds moderation, level-4 adds server control.
+/// The same levels drive the advertised command tree. Also proves `/return`
+/// short-circuits a `.mcfunction` (and `$`-macro expansion when `with` args
+/// are supplied).
+#[test]
+fn live_permission_levels_gate_commands_and_function_return_stops_execution() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let _world = world_guard();
+    let _directory = CommandDirectory::enter();
+    std::env::remove_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS");
+
+    let fixture = |name: &str, eid: i32| {
+        let (mut client, _hold) = crate::effect_tests::client_pair();
+        client.name = name.to_owned();
+        client.eid = eid;
+        let client = Arc::new(client);
+        clients().lock().unwrap().push(client.clone());
+        command_context(Some(client))
+    };
+    let plain = fixture("perm_none", 8411);
+    let level2 = fixture("perm_two", 8412);
+    let level3 = fixture("perm_three", 8413);
+    let level4 = fixture("perm_four", 8414);
+    {
+        let mut ops = ops_registry().lock().unwrap();
+        ops.entries.clear();
+        ops.set("perm_two", 2, false);
+        ops.set("perm_three", 3, false);
+        ops.set("perm_four", 4, false);
+    }
+
+    // Run through the real dispatcher: each source is gated by its level.
+    assert_eq!(player_permission_level("perm_none"), 0);
+    assert_eq!(player_permission_level("perm_two"), 2);
+    assert_eq!(player_permission_level("perm_three"), 3);
+    assert_eq!(player_permission_level("perm_four"), 4);
+    for ctx in [&plain, &level2, &level3, &level4] {
+        assert!(run_command_ctx(ctx, "/list", &mut None).contains("players:"));
+        // `/me` broadcasts and returns no reply text.
+        assert!(run_command_ctx(ctx, "/me waves", &mut None).is_empty());
+    }
+    assert!(run_command_ctx(&plain, "/gamemode creative", &mut None).contains("permission"));
+    assert!(run_command_ctx(&plain, "/team list", &mut None).contains("permission"));
+    assert!(run_command_ctx(&level2, "/team list", &mut None).contains("no teams"));
+    assert!(run_command_ctx(&level2, "/gamemode creative", &mut None).contains("gamemode"));
+    assert!(run_command_ctx(&level2, "/ban perm_none", &mut None).contains("permission"));
+    assert!(run_command_ctx(&level2, "/tick freeze", &mut None).contains("permission"));
+    assert!(run_command_ctx(&level3, "/ban perm_none", &mut None).starts_with("Banned perm_none"));
+    assert!(run_command_ctx(&level3, "/tick freeze", &mut None) == "Froze the game");
+    run_command_ctx(&level3, "/tick unfreeze", &mut None);
+    assert!(run_command_ctx(&level3, "/pardon perm_none", &mut None).contains("perm_none"));
+    assert!(run_command_ctx(&level3, "/save-off", &mut None).contains("permission"));
+    assert!(run_command_ctx(&level4, "/save-off", &mut None).contains("disabled"));
+    run_command_ctx(&level4, "/save-on", &mut None);
+
+    // The advertised literal tree honours the same levels (tab completion).
+    let none_tree = command_tree_at_level(0);
+    let two_tree = command_tree_at_level(2);
+    let three_tree = command_tree_at_level(3);
+    let four_tree = command_tree_at_level(4);
+    for name in ["help", "list", "me", "msg", "teammsg", "tm", "trigger"] {
+        assert!(none_tree.child(name).is_some(), "level0 missing {name}");
+    }
+    for name in ["team", "tick", "locate", "random", "return", "recipe", "ban", "op", "stop"] {
+        assert!(none_tree.child(name).is_none(), "level0 must not see {name}");
+    }
+    for name in ["team", "locate", "random", "return", "recipe"] {
+        assert!(two_tree.child(name).is_some(), "level2 missing {name}");
+    }
+    for name in ["ban", "pardon", "banlist", "whitelist", "kick", "op", "deop"] {
+        assert!(two_tree.child(name).is_none(), "level2 must not see {name}");
+        assert!(three_tree.child(name).is_some(), "level3 missing {name}");
+    }
+    for name in ["stop", "save-off", "reload"] {
+        assert!(three_tree.child(name).is_none(), "level3 must not see {name}");
+        assert!(four_tree.child(name).is_some(), "level4 missing {name}");
+    }
+    // `tick` is a level-3 literal in Vanilla 1.21.1.
+    assert!(two_tree.child("tick").is_none());
+    assert!(three_tree.child("tick").is_some());
+
+    // `/return` ends the function's remaining lines; a macro function expands
+    // `$(var)` only when `with` args are supplied.
+    {
+        let mut functions = HashMap::new();
+        functions.insert(
+            "test:w1_early".to_owned(),
+            vec!["return 5".to_owned(), "time set 999999".to_owned()],
+        );
+        functions.insert(
+            "test:w1_macro".to_owned(),
+            vec!["$time set $(t)".to_owned()],
+        );
+        packs().lock().unwrap().push(Datapack {
+            name: "w1test".to_owned(),
+            functions,
+            load: Vec::new(),
+            tick: Vec::new(),
+        });
+    }
+    let before_time = WORLD_TIME.load(Ordering::Relaxed);
+    let console = command_context(None);
+    assert_eq!(run_command_ctx(&console, "/function test:w1_early", &mut None), "ran 1 commands");
+    assert_ne!(WORLD_TIME.load(Ordering::Relaxed), 999999, "line after /return must not run");
+    assert_eq!(run_command_ctx(&console, "/function test:w1_macro", &mut None), "ran 0 commands");
+    assert_eq!(
+        run_command_ctx(&console, "/function test:w1_macro with {t:7777}", &mut None),
+        "ran 1 commands"
+    );
+    assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 7777);
+
+    // Restore shared state.
+    WORLD_TIME.store(before_time, Ordering::Relaxed);
+    packs().lock().unwrap().retain(|p| p.name != "w1test");
+    {
+        let mut ops = ops_registry().lock().unwrap();
+        ops.entries.clear();
+    }
+    ban_registry().lock().unwrap().players.clear();
+    clients().lock().unwrap().retain(|c| !(8411..=8414).contains(&c.eid));
 }

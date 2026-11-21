@@ -12727,6 +12727,12 @@ pub(crate) mod loopprof {
 }
 
 fn game_tick(mut step: impl FnMut(&'static str, fn())) {
+    // `/tick freeze` skips world ticks unless `/tick step` or `/tick sprint`
+    // queued budget; a sprint always runs. The default is unfrozen, so callers
+    // (including tests) that never froze see no change.
+    if !tick_controller().lock().unwrap().should_run_game_tick() {
+        return;
+    }
     let prof = tickprof::enabled();
     let n = tickprof::TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if prof && n % 100 == 0 {
@@ -12811,6 +12817,59 @@ fn main() {
         std::process::exit(2);
     }
     let probe_args: Vec<String> = std::env::args().skip(1).collect();
+    if probe_args
+        .first()
+        .is_some_and(|arg| arg == "--import-anvil")
+    {
+        // `--import-anvil <vanilla_world_dir>`: read a vanilla 1.21.1 world
+        // (level.dat + region/*.mca + DIM-1/DIM1), apply it to the in-memory
+        // world, and persist through the normal save path so the next server
+        // run boots the imported world.
+        assert_eq!(
+            probe_args.len(),
+            2,
+            "usage: --import-anvil <vanilla_world_dir>"
+        );
+        let report = import_anvil_world(std::path::Path::new(&probe_args[1]))
+            .unwrap_or_else(|error| {
+                eprintln!("[anvil] import failed: {error}");
+                std::process::exit(2);
+            });
+        for error in &report.chunk_errors {
+            eprintln!("[anvil] {error}");
+        }
+        apply_anvil_import(&report);
+        save_world();
+        println!(
+            "imported {} chunk(s) from {} region file(s), {} decode error(s)",
+            report.chunks.len(),
+            report.region_files,
+            report.chunk_errors.len()
+        );
+        return;
+    }
+    if probe_args
+        .first()
+        .is_some_and(|arg| arg == "--export-anvil")
+    {
+        // `--export-anvil <out_dir>`: load the saved world, then write the
+        // vanilla directory (`level.dat` + `region/*.mca` per dimension).
+        assert_eq!(probe_args.len(), 2, "usage: --export-anvil <out_dir>");
+        if let Err(error) = load_world() {
+            eprintln!("[anvil] export aborted — world save failed to load: {error}");
+            std::process::exit(1);
+        }
+        let report = export_anvil_world(std::path::Path::new(&probe_args[1]))
+            .unwrap_or_else(|error| {
+                eprintln!("[anvil] export failed: {error}");
+                std::process::exit(2);
+            });
+        println!(
+            "exported {} chunk(s) into {} region file(s) (level.dat written: {})",
+            report.chunks_written, report.region_files, report.level_written
+        );
+        return;
+    }
     if probe_args
         .first()
         .is_some_and(|arg| arg == "--worldgen-cell")
@@ -13870,6 +13929,18 @@ fn main() {
             }
         });
     }
+    // Daemon stdin console (live server mode only — every tool/probe/dump mode
+    // has already returned). Lines run as level-4 console commands; `stop` ends
+    // the loop (the dispatched `/stop` shuts the process down itself), and EOF
+    // exits silently so headless/non-TTY runs are unaffected.
+    thread::spawn(|| {
+        let stdin = std::io::stdin();
+        let _ = run_stdin_console_loop(stdin.lock(), |line| {
+            let mut none: Option<&Client> = None;
+            run_command(None, &format!("/{line}"), &mut none);
+            String::new()
+        });
+    });
     let port: u16 = std::env::var("MC_SPINE_PORT")
         .ok()
         .and_then(|p| p.parse().ok())

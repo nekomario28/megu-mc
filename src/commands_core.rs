@@ -1312,6 +1312,7 @@ fn packs() -> &'static Mutex<Vec<Datapack>> {
 struct DatapackContent {
     packs: Vec<Datapack>,
     recipes: Vec<JsonRecipe>,
+    recipe_ids: std::collections::BTreeSet<String>,
     smelts: Vec<SmeltRecipe>,
     block_tags: HashMap<String, Vec<String>>,
     item_tags: HashMap<String, Vec<String>>,
@@ -1337,8 +1338,10 @@ impl DatapackContent {
         let mut mods = item_mods().lock().unwrap();
         let mut advs = advancements().lock().unwrap();
         let mut conditions = predicates().lock().unwrap();
+        let mut ids = recipe_ids().lock().unwrap();
         let mut active = packs().lock().unwrap();
         *recipes = self.recipes;
+        *ids = self.recipe_ids;
         *smelts = self.smelts;
         *blocks = self.block_tags;
         *items = self.item_tags;
@@ -1436,7 +1439,10 @@ impl DatapackContent {
                     _ => {}
                 }
             }
-            "recipe" | "recipes" => self.read_recipe(body),
+            "recipe" | "recipes" => {
+                self.recipe_ids.insert(key.clone());
+                self.read_recipe(body)
+            }
             "loot_table" | "loot_tables" => self.read_loot(key, rel, body),
             "item_modifier" | "item_modifiers" => {
                 let funcs = parse_loot_funcs(body);
@@ -2170,13 +2176,41 @@ fn lookup_function(name: &str) -> Option<Vec<String>> {
         .find_map(|p| p.functions.get(&name).cloned())
 }
 fn run_function(name: &str, me: Option<Arc<Client>>, s: &mut Option<&Client>) -> usize {
-    run_function_depth(name, me, s, 0)
+    run_function_depth(name, me, s, 0, None)
+}
+/// `/function <name> [with] <compound>` argument parsing: the compound's fields
+/// become the macro substitutions `$`-prefixed lines consume.
+fn function_macro_args(args: &[&str]) -> Result<Option<BTreeMap<String, String>>, String> {
+    let text = match args {
+        [] => return Ok(None),
+        ["with", rest @ ..] => rest.join(" "),
+        rest => rest.join(" "),
+    };
+    let mut reader = brigadier::StringReader::new(&text);
+    let Some(ExecTag::Compound(fields)) = execute_read_snbt(&mut reader, 0) else {
+        return Err(format!("Expected macro arguments as a compound, got '{text}'"));
+    };
+    if reader.can_read() {
+        return Err(format!("Unexpected trailing macro arguments '{text}'"));
+    }
+    let mut out = BTreeMap::new();
+    for (name, tag) in fields {
+        out.insert(
+            String::from_utf16_lossy(&name.0),
+            match tag {
+                ExecTag::String(s) => String::from_utf16_lossy(&s.0),
+                other => execute_tag_snbt(&other),
+            },
+        );
+    }
+    Ok(Some(out))
 }
 fn run_function_depth(
     name: &str,
     me: Option<Arc<Client>>,
     s: &mut Option<&Client>,
     depth: usize,
+    macro_args: Option<&BTreeMap<String, String>>,
 ) -> usize {
     if depth > 16 {
         return 0;
@@ -2184,13 +2218,59 @@ fn run_function_depth(
     let Some(lines) = lookup_function(name) else {
         return 0;
     };
+    // Vanilla instantiates a macro-bearing function before running it: called
+    // without arguments, or with an unbound `$(var)`, the whole call fails and
+    // no line runs.
+    if lines.iter().any(|line| line.starts_with('$')) {
+        let Some(args) = macro_args else {
+            return 0;
+        };
+        let mut expanded = Vec::with_capacity(lines.len());
+        for line in &lines {
+            expanded.push(if line.starts_with('$') {
+                match expand_mcfunction_macro(line, args) {
+                    Ok(line) => line,
+                    Err(_) => return 0,
+                }
+            } else {
+                line.clone()
+            });
+        }
+        return run_function_lines(&expanded, me, s, depth);
+    }
+    run_function_lines(&lines, me, s, depth)
+}
+fn run_function_lines(
+    lines: &[String],
+    me: Option<Arc<Client>>,
+    s: &mut Option<&Client>,
+    depth: usize,
+) -> usize {
     let mut n = 0;
     for line in lines {
         if let Some(rest) = line.strip_prefix("function ") {
-            n += run_function_depth(rest.trim(), me.clone(), s, depth + 1);
+            // `function <name> [with <compound>]` — a nested call may carry its
+            // own macro arguments.
+            let (inner, compound) = match rest.split_once(" with ") {
+                Some((name, compound)) => (name.trim(), Some(compound.trim())),
+                None => (rest.trim(), None),
+            };
+            let parsed = match compound {
+                Some(compound) => match function_macro_args(&["with", compound]) {
+                    Ok(parsed) => parsed,
+                    Err(_) => continue,
+                },
+                None => None,
+            };
+            n += run_function_depth(inner, me.clone(), s, depth + 1, parsed.as_ref());
         } else {
             run_command(me.as_ref(), &format!("/{}", line), s);
             n += 1;
+            // `/return` ends the calling function's remaining lines like
+            // Vanilla's discarded frame.
+            if *line == "return" || line.starts_with("return ") {
+                break;
+            }
         }
     }
     n
@@ -3777,7 +3857,7 @@ fn run_command(me: Option<&Arc<Client>>, msg: &str, s: &mut Option<&Client>) {
     run_command_ctx(&ctx, msg, s);
 }
 fn command_allowed_for_player(cmd: &str, args: &[&str]) -> bool {
-    matches!(cmd, "help" | "list" | "me" | "msg" | "tell" | "w")
+    command_allowed_at_level(cmd, 0)
         || (cmd == "time" && matches!(args.first().copied(), Some("query" | "get")))
 }
 fn command_usage(name: &str) -> String {
@@ -3815,18 +3895,63 @@ const OPS_FILE: &str = "ops.json";
 type Operators = std::collections::BTreeSet<String>;
 static OPERATORS: Mutex<Operators> = Mutex::new(Operators::new());
 
+/// The leveled view of `ops.json`: `OpsRegistry` accepts both the legacy flat
+/// name array (read as level-4 operators, what the old schema meant) and the
+/// Vanilla object form. `OPERATORS` stays the plain name set the older helpers
+/// and fixtures already know; the two are written together.
+fn ops_registry() -> &'static Mutex<OpsRegistry> {
+    static OPS: OnceLock<Mutex<OpsRegistry>> = OnceLock::new();
+    OPS.get_or_init(|| Mutex::new(OpsRegistry::default()))
+}
+
+fn ban_registry() -> &'static Mutex<BanRegistry> {
+    static BANS: OnceLock<Mutex<BanRegistry>> = OnceLock::new();
+    BANS.get_or_init(|| Mutex::new(BanRegistry::default()))
+}
+
+fn whitelist_registry() -> &'static Mutex<WhitelistRegistry> {
+    static LIST: OnceLock<Mutex<WhitelistRegistry>> = OnceLock::new();
+    LIST.get_or_init(|| Mutex::new(WhitelistRegistry::default()))
+}
+
+/// The recipe ids every loaded datapack declared (`data/<ns>/recipe/**.json`),
+/// published with the same content swap as `json_recipes`.
+fn recipe_ids() -> &'static Mutex<std::collections::BTreeSet<String>> {
+    static IDS: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+    IDS.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
 fn valid_player_name(name: &str) -> bool {
     (1..=16).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// Vanilla permission level `0..=4` for a player name: `4` for the console and
+/// the unsafe test escape, the operator entry's level otherwise.
+fn player_permission_level(name: &str) -> u8 {
+    if allow_unsafe_player_admin() {
+        return 4;
+    }
+    let level = ops_registry().lock().unwrap().op_level_of(name);
+    if level > 0 {
+        return level;
+    }
+    // The legacy name set is written by `set_operator` alongside the registry;
+    // a name present only there is still a level-4 operator.
+    if OPERATORS
+        .lock()
+        .unwrap()
+        .contains(&name.to_ascii_lowercase())
+    {
+        return 4;
+    }
+    0
+}
+
 fn player_is_admin(name: &str) -> bool {
     // The server's offline login claims a name. The same case folding is used
-    // by the login reservation and operator list.
-    allow_unsafe_player_admin()
-        || OPERATORS
-            .lock()
-            .unwrap()
-            .contains(&name.to_ascii_lowercase())
+    // by the login reservation and operator list. Vanilla's `hasPermission(2)`
+    // is the gate that splits cheat commands from the everyone set.
+    player_permission_level(name) >= 2
 }
 
 fn set_difficulty(difficulty: u8) {
@@ -3860,6 +3985,7 @@ fn set_difficulty(difficulty: u8) {
     }
 }
 
+#[cfg(test)]
 fn read_operators(path: &std::path::Path) -> std::io::Result<Operators> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -3896,14 +4022,22 @@ fn read_operators(path: &std::path::Path) -> std::io::Result<Operators> {
 }
 
 fn load_operators(path: &std::path::Path) -> std::io::Result<()> {
+    // `OpsRegistry::load` accepts both the Vanilla object schema and the legacy
+    // flat name array, so it is the single parse both views are fed from.
     let mut operators = OPERATORS.lock().unwrap();
-    match read_operators(path) {
-        Ok(names) => {
-            *operators = names;
+    match OpsRegistry::load(path) {
+        Ok(registry) => {
+            *operators = registry
+                .entries
+                .iter()
+                .map(|e| e.name.to_ascii_lowercase())
+                .collect();
+            *ops_registry().lock().unwrap() = registry;
             Ok(())
         }
         Err(error) => {
             operators.clear();
+            ops_registry().lock().unwrap().entries.clear();
             Err(error)
         }
     }
@@ -3915,7 +4049,7 @@ fn set_operator(path: &std::path::Path, name: &str, enable: bool) -> std::io::Re
     let mut proposed = operators.clone();
     let name = name.to_ascii_lowercase();
     let changed = if enable {
-        proposed.insert(name)
+        proposed.insert(name.clone())
     } else {
         proposed.remove(&name)
     };
@@ -3943,6 +4077,14 @@ fn set_operator(path: &std::path::Path, name: &str, enable: bool) -> std::io::Re
         return Err(error);
     }
     *operators = proposed;
+    {
+        let mut registry = ops_registry().lock().unwrap();
+        if enable {
+            registry.set(&name, 4, false);
+        } else {
+            registry.remove(&name);
+        }
+    }
     Ok(true)
 }
 
@@ -3978,15 +4120,22 @@ fn completion_argument(
     }
 }
 
+#[cfg(test)]
 fn command_tree(admin: bool) -> brigadier::CommandNode<()> {
-    command_dispatcher(admin, None).root().clone()
+    command_tree_at_level(if admin { 4 } else { 0 })
 }
 
-fn command_dispatcher(
-    admin: bool,
+/// The literal tree Vanilla's 1.21.1 `Commands` packet sends a source at
+/// `level`: only literals whose `hasPermission` gate the level passes.
+fn command_tree_at_level(level: u8) -> brigadier::CommandNode<()> {
+    command_dispatcher_at_level(level, None).root().clone()
+}
+
+fn command_dispatcher_at_level(
+    level: u8,
     completions: Option<&CommandCompletions>,
 ) -> brigadier::CommandDispatcher<()> {
-    let dispatcher = native_command_dispatcher(admin, completions);
+    let dispatcher = native_command_dispatcher(level, completions);
     #[cfg(feature = "neoforge-events")]
     if let Some(runtime) = java_compat::NEOFORGE.get() {
         for name in &runtime.commands {
@@ -3999,12 +4148,12 @@ fn command_dispatcher(
 
 #[cfg(feature = "neoforge-events")]
 fn exclude_native_neoforge_literals(literals: &mut Vec<String>) {
-    let dispatcher = native_command_dispatcher(true, None);
+    let dispatcher = native_command_dispatcher(4, None);
     literals.retain(|name| dispatcher.root().child(name).is_none());
 }
 
 fn native_command_dispatcher(
-    admin: bool,
+    level: u8,
     completions: Option<&CommandCompletions>,
 ) -> brigadier::CommandDispatcher<()> {
     // Execution remains in run_command_ctx. Executable nodes describe the
@@ -4027,7 +4176,7 @@ fn native_command_dispatcher(
     for query in ["query", "get"] {
         time = time.then(choices(done(query), &["daytime", "gametime", "day"]));
     }
-    if admin {
+    if level >= 2 {
         let ticks = PlayCommandBuilder::argument(
             "ticks",
             Box::new(brigadier::LongArgumentType::long_at_least(0)),
@@ -4043,10 +4192,18 @@ fn native_command_dispatcher(
                 ).executes(|_| Ok(0))),
         );
     }
-    let register = |node| {
+    let register = |node: PlayCommandBuilder| {
         dispatcher
             .register(node)
             .expect("play command is a literal");
+    };
+    // Every literal below this point obeys Vanilla's per-command
+    // `hasPermission(level)` gate, so a level-2 operator never sees the
+    // level-3/4 literals its `required_permission_level` does not pass.
+    let register_at_level = |name: &str, node: PlayCommandBuilder| {
+        if command_allowed_at_level(name, level) {
+            register(node);
+        }
     };
     let help = literal("help").executes(|_| Ok(0)).then(completion_argument("command", word(), None));
     for node in [help, done("list"), time] {
@@ -4056,25 +4213,79 @@ fn native_command_dispatcher(
     for name in ["msg", "tell", "w"] {
         register(literal(name).then(player().then(message())));
     }
-    if !admin {
+    for name in ["teammsg", "tm"] {
+        register(literal(name).then(message()));
+    }
+    register(literal("trigger").then(args("arguments")));
+    if level < 2 {
         return dispatcher;
     }
     for name in ["counts", "reload", "save", "save-all", "save-on", "save-off", "seed", "stop"] {
-        register(done(name));
+        register_at_level(name, done(name));
     }
-    register(literal("kick").then(player().executes(|_| Ok(0)).then(message())));
-    register(literal("setidletimeout").then(PlayCommandBuilder::argument(
-        "minutes",
-        Box::new(brigadier::IntegerArgumentType::integer_at_least(0)),
-    ).executes(|_| Ok(0))));
+    register_at_level(
+        "kick",
+        literal("kick").then(player().then(message())),
+    );
+    register_at_level(
+        "setidletimeout",
+        literal("setidletimeout").then(PlayCommandBuilder::argument(
+            "minutes",
+            Box::new(brigadier::IntegerArgumentType::integer_at_least(0)),
+        ).executes(|_| Ok(0))),
+    );
     register(["survival", "creative", "adventure", "spectator", "0", "1", "2", "3"]
         .iter().fold(literal("defaultgamemode"), |node, mode| node.then(done(mode))));
-    register(literal("op").then(player()));
-    register(literal("deop").then(completion_argument(
-        "player",
-        word(),
-        completions.map(|c| c.operators.as_slice()),
-    )));
+    register_at_level("op", literal("op").then(player()));
+    register_at_level(
+        "deop",
+        literal("deop").then(completion_argument(
+            "player",
+            word(),
+            completions.map(|c| c.operators.as_slice()),
+        )),
+    );
+    // Vanilla level-3 moderation literals.
+    for name in ["ban", "pardon"] {
+        register_at_level(
+            name,
+            literal(name).then(player().then(message())),
+        );
+    }
+    for name in ["ban-ip", "pardon-ip"] {
+        register_at_level(
+            name,
+            literal(name).then(args("target").then(message())),
+        );
+    }
+    register_at_level(
+        "banlist",
+        choices(done("banlist"), &["ips", "players"]),
+    );
+    register_at_level(
+        "whitelist",
+        choices(
+            literal("whitelist"),
+            &["on", "off", "list", "add", "remove", "reload"],
+        )
+        .then(player()),
+    );
+    // Vanilla level-2 literals wired this lane.
+    register_at_level(
+        "team",
+        literal("team").then(args("arguments")),
+    );
+    for name in ["locate", "random", "return", "recipe"] {
+        register_at_level(name, literal(name).then(args("arguments")));
+    }
+    register_at_level(
+        "tick",
+        choices(
+            literal("tick"),
+            &["query", "rate", "freeze", "unfreeze", "step", "sprint"],
+        )
+        .then(args("arguments")),
+    );
     register(
         literal("datapack")
             .then(choices(done("list"), &["enabled", "available"]))
@@ -4174,21 +4385,24 @@ fn native_command_dispatcher(
         "tellraw",
         "title",
         "tp",
-        "trigger",
         "worldborder",
         "xp",
     ] {
-        register(literal(name).then(args("arguments")));
+        register_at_level(name, literal(name).then(args("arguments")));
     }
     for name in ["clear", "gamerule", "setworldspawn", "spawnpoint"] {
-        register(done(name).then(args("arguments")));
+        register_at_level(name, done(name).then(args("arguments")));
     }
     dispatcher
 }
 
 fn send_commands(socket: &mut TcpStream, admin: bool) -> std::io::Result<()> {
-    let payload =
-        brigadier_wire::commands_payload(&command_tree(admin)).map_err(std::io::Error::other)?;
+    send_commands_at_level(socket, if admin { 4 } else { 0 })
+}
+
+fn send_commands_at_level(socket: &mut TcpStream, level: u8) -> std::io::Result<()> {
+    let payload = brigadier_wire::commands_payload(&command_tree_at_level(level))
+        .map_err(std::io::Error::other)?;
     send_packet(
         socket,
         i64::from(brigadier_wire::CLIENTBOUND_COMMANDS),
@@ -4198,15 +4412,15 @@ fn send_commands(socket: &mut TcpStream, admin: bool) -> std::io::Result<()> {
 
 fn update_client_commands(client: &Client) {
     let mut socket = client.sock.lock().unwrap();
-    let _ = send_commands(&mut socket, player_is_admin(&client.name));
+    let _ = send_commands_at_level(&mut socket, player_permission_level(&client.name));
 }
 
 fn command_suggestion_response(
     request: &brigadier_wire::CommandSuggestionsRequest,
-    admin: bool,
+    level: u8,
     completions: &CommandCompletions,
 ) -> brigadier_wire::CommandSuggestionsResponse {
-    let dispatcher = command_dispatcher(admin, Some(completions));
+    let dispatcher = command_dispatcher_at_level(level, Some(completions));
     let mut reader = brigadier::StringReader::new(&request.text);
     if request.text.starts_with('/') {
         reader.skip();
@@ -4229,13 +4443,19 @@ fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
     let Ok(request) = brigadier_wire::parse_command_suggestions_request(body) else {
         return;
     };
-    let admin = player_is_admin(&client.name);
+    let level = player_permission_level(&client.name);
     let mut completions = CommandCompletions {
         players: client_snapshot().iter().map(|c| c.name.clone()).collect(),
         ..CommandCompletions::default()
     };
-    if admin {
-        completions.operators = OPERATORS.lock().unwrap().iter().cloned().collect();
+    if level >= 2 {
+        completions.operators = ops_registry()
+            .lock()
+            .unwrap()
+            .names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
         completions.enabled_packs = packs()
             .lock()
             .unwrap()
@@ -4249,7 +4469,7 @@ fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
             .cloned()
             .collect();
     }
-    let response = command_suggestion_response(&request, admin, &completions);
+    let response = command_suggestion_response(&request, level, &completions);
     if let Ok(payload) = brigadier_wire::command_suggestions_response_payload(&response) {
         let _ = send_packet(
             &mut client.sock.lock().unwrap(),
@@ -4895,8 +5115,11 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     };
     let cmd = tokens.first().map(String::as_str).unwrap_or("");
     let args: Vec<&str> = tokens.iter().skip(1).map(String::as_str).collect();
-    let admin = me.is_none_or(|player| player_is_admin(&player.name));
-    if !admin && !command_allowed_for_player(cmd, &args) {
+    // Vanilla `CommandSourceStack.hasPermission`: the console runs at level 4,
+    // players at their ops.json level. `command_allowed_for_player` keeps the
+    // argument-aware level-0 exceptions (e.g. `/time query`) on top.
+    let level = me.map_or(4, |player| player_permission_level(&player.name));
+    if !command_allowed_at_level(cmd, level) && !command_allowed_for_player(cmd, &args) {
         let reply = "You do not have permission to run that command";
         if let Some(client) = s {
             let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(reply));
@@ -4985,7 +5208,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         }
         "help" if !args.is_empty() => command_usage(args[0]),
         "help" => {
-            let names = command_tree(admin).children().into_iter()
+            let names = command_tree_at_level(level).children().into_iter()
                 .map(|node| node.name().to_owned()).collect::<Vec<_>>();
             format!("commands: {}", names.join(" "))
         }
@@ -5692,8 +5915,14 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         }
         "function" => {
             if let Some(name) = args.first() {
-                format!("ran {} commands", run_function(name, me.cloned(), s))
-            } else { "usage: /function <ns:name>".into() }
+                match function_macro_args(&args[1..]) {
+                    Ok(macro_args) => format!(
+                        "ran {} commands",
+                        run_function_depth(name, me.cloned(), s, 0, macro_args.as_ref())
+                    ),
+                    Err(error) => error,
+                }
+            } else { "usage: /function <ns:name> [with <compound>]".into() }
         }
         "loot" => {
             // subset: loot spawn <x> <y> <z> loot <table> | kill <entity-type>
@@ -6164,6 +6393,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let names: Vec<String> = c.iter().map(|x| x.name.clone()).collect();
             format!("{} players: {}", names.len(), names.join(", "))
         }
+        "ban" | "ban-ip" | "banlist" | "pardon" | "pardon-ip" | "whitelist" => {
+            run_server_ops_command(ctx, cmd, &args)
+        }
+        "team" | "teammsg" | "tm" | "tick" | "locate" | "random" | "return" => {
+            exec_p3b_command(ctx, cmd, &args, s)
+        }
+        "recipe" => run_recipe_command(ctx, &args),
         "seed" => WORLD_SEED.load(Ordering::Relaxed).to_string(),
         "" => "".into(),
         _ => format!("Unknown command: {}", cmd),
@@ -6182,6 +6418,145 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         }
     }
     reply
+}
+
+/// Disconnect one online player the way `/kick` does.
+fn kick_client(client: &Arc<Client>, text: &str) {
+    let mut socket = client.sock.lock().unwrap();
+    play_disconnect(&mut socket, text);
+    let _ = socket.shutdown(std::net::Shutdown::Both);
+}
+
+/// `/ban`, `/ban-ip`, `/banlist`, `/pardon`, `/pardon-ip`, `/whitelist` against
+/// the live registries in the server working directory (where the Vanilla-named
+/// files live). After a mutation, online players who no longer pass Vanilla's
+/// `canPlayerLogin` order are dropped: a fresh player/IP ban disconnects the
+/// matching clients, and an enforced whitelist disconnects everyone who is not
+/// whitelisted or an operator.
+fn run_server_ops_command(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> String {
+    let input = std::iter::once(cmd)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let source = ctx
+        .me
+        .as_ref()
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| "Server".to_owned());
+    // `created` wants a real timestamp (entries persist across restarts):
+    // reuse the advancement lane's epoch read rather than add a clock site.
+    let now = advancement_time_ms().to_string();
+    let dir = std::path::Path::new(".");
+    // First ops command loads the persisted files once, so a `/whitelist add`
+    // or `/ban` cannot overwrite entries the files already held.
+    static OPS_FILES_LOADED: AtomicBool = AtomicBool::new(false);
+    if !OPS_FILES_LOADED.swap(true, Ordering::Relaxed) {
+        match BanRegistry::load(dir) {
+            Ok(bans) => *ban_registry().lock().unwrap() = bans,
+            Err(error) => eprintln!("[spine] could not load ban lists: {error}"),
+        }
+        match WhitelistRegistry::load(&dir.join(WHITELIST_FILE)) {
+            Ok(list) => *whitelist_registry().lock().unwrap() = list,
+            Err(error) => eprintln!("[spine] could not load {WHITELIST_FILE}: {error}"),
+        }
+    }
+    let (reply, kicks) = {
+        let mut bans = ban_registry().lock().unwrap();
+        let mut whitelist = whitelist_registry().lock().unwrap();
+        exec_server_ops_command(&input, &mut bans, &mut whitelist, dir, &source, &now)
+    };
+    let ip_ban_reason = |client: &Arc<Client>| -> Option<String> {
+        let ip = client.sock.lock().unwrap().peer_addr().ok()?.ip().to_string();
+        ban_registry()
+            .lock()
+            .unwrap()
+            .ip_ban(&ip)
+            .map(|ban| {
+                format!(
+                    "Your IP address is banned from this server.\nReason: {}",
+                    ban.reason
+                )
+            })
+    };
+    for client in client_snapshot() {
+        if kicks
+            .iter()
+            .any(|name| client.name.eq_ignore_ascii_case(name))
+        {
+            let text = ban_registry()
+                .lock()
+                .unwrap()
+                .player_ban(&client.name)
+                .map(|ban| {
+                    format!("You are banned from this server.\nReason: {}", ban.reason)
+                })
+                .unwrap_or_else(|| "You are banned from this server.".to_owned());
+            kick_client(&client, &text);
+        } else if cmd == "ban-ip" {
+            if let Some(text) = ip_ban_reason(&client) {
+                kick_client(&client, &text);
+            }
+        }
+    }
+    if whitelist_registry().lock().unwrap().enabled {
+        for client in client_snapshot() {
+            let admitted = whitelist_registry().lock().unwrap().contains(&client.name)
+                || ops_registry().lock().unwrap().is_op(&client.name);
+            if !admitted {
+                kick_client(&client, "You are not white-listed on this server!");
+            }
+        }
+    }
+    reply
+}
+
+/// `/recipe give|take <targets> <recipe|*>` — applies the delta to each target's
+/// `PlayerRecipeBook` and pushes the S2C `0x41` updates the outcome carries.
+fn run_recipe_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    let &[verb, targets, recipe] = args else {
+        return "usage: /recipe <give|take> <targets> <recipe|*>".into();
+    };
+    let verb = match verb {
+        "give" => RecipeCommandVerb::Give,
+        "take" => RecipeCommandVerb::Take,
+        _ => return "usage: /recipe <give|take> <targets> <recipe|*>".into(),
+    };
+    let universe: Vec<String> = recipe_ids().lock().unwrap().iter().cloned().collect();
+    if recipe != "*" && !universe.iter().any(|id| id == recipe) {
+        return format!("Unknown recipe '{recipe}'");
+    }
+    let targets = player_command_targets(targets, ctx.me.as_ref());
+    if targets.is_empty() {
+        return "No player found".into();
+    }
+    let mut books = recipe_books().lock().unwrap();
+    let mut total_changed = 0usize;
+    let mut players_changed = 0usize;
+    for client in &targets {
+        let book = books
+            .entry(client.uuid)
+            .or_insert_with(PlayerRecipeBook::new);
+        let Some(outcome) = exec_recipe_command(book, verb, &universe, recipe) else {
+            return format!("Unknown recipe '{recipe}'");
+        };
+        if !outcome.changed.is_empty() {
+            players_changed += 1;
+            total_changed += outcome.changed.len();
+            for payload in outcome.packets {
+                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x41, payload);
+            }
+        }
+    }
+    let single = targets.len() == 1;
+    let name = targets[0].name.as_str();
+    match (verb, total_changed, single) {
+        (RecipeCommandVerb::Give, 0, _) => "No new recipes could be given".into(),
+        (RecipeCommandVerb::Give, n, true) => format!("Gave {n} new recipes to {name}"),
+        (RecipeCommandVerb::Give, n, false) => format!("Gave {n} new recipes to {players_changed} players"),
+        (RecipeCommandVerb::Take, 0, _) => "No recipes could be taken".into(),
+        (RecipeCommandVerb::Take, n, true) => format!("Took {n} recipes from {name}"),
+        (RecipeCommandVerb::Take, n, false) => format!("Took {n} recipes from {players_changed} players"),
+    }
 }
 
 /// Whether a command reply is a failure the player should see even when
