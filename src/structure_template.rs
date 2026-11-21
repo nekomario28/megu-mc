@@ -1040,11 +1040,22 @@ impl Template {
         let front = tag
             .get("front_text")
             .ok_or("a sign template needs front_text")?;
-        let Tag::Compound(_) = front else {
-            return Err("front_text must be a compound");
+        let lines = Self::sign_side(front)?;
+        // The Sign payload only carries the front's four lines, but a malformed
+        // back side must not silently survive placement either.
+        if let Some(back) = tag.get("back_text") {
+            Self::sign_side(back)?;
+        }
+        Ok(lines)
+    }
+
+    /// One sign side's four lines, decoded from the game's own message form.
+    fn sign_side(side: &Tag) -> Result<[String; 4], &'static str> {
+        let Tag::Compound(_) = side else {
+            return Err("a sign side must be a compound");
         };
-        let Some(Tag::List(_, messages)) = front.get("messages") else {
-            return Err("front_text.messages must be a list");
+        let Some(Tag::List(_, messages)) = side.get("messages") else {
+            return Err("a sign side's messages must be a list");
         };
         if messages.len() != 4 {
             return Err("a sign side has exactly four messages");
@@ -1069,23 +1080,48 @@ impl Template {
     }
 
     /// Structural or decorative block entities that carry no active store in this port
-    /// and should pass through template placement without failing closed.
+    /// and should pass through template placement without failing closed. Anything a
+    /// store or the payload seam owns — containers, signs, a spawner's `SpawnData`,
+    /// a decorated pot's `LootTable`/`Items` — routes through `staged_payload`
+    /// instead, which stages the supported fields and refuses the rest. Content keys
+    /// a live store reads but the seam cannot carry yet (`Book`, a bookshelf's
+    /// `Items`) fail closed the same way.
     fn is_passthrough_block_entity(state: u32, tag: &Tag, reg: &BReg) -> bool {
-        if !matches!(tag, Tag::Compound(_)) {
+        let Tag::Compound(values) = tag else {
             return false;
-        }
+        };
         let name = reg.name_of(state);
-        if matches!(
-            name,
-            "minecraft:chest"
-                | "minecraft:trapped_chest"
-                | "minecraft:barrel"
-                | "minecraft:furnace"
-                | "minecraft:blast_furnace"
-                | "minecraft:smoker"
-        ) || tag.get("front_text").is_some()
+        let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+        match bare {
+            // A marker with no config stays structural; `SpawnData` (and the
+            // config around it) routes through `staged_payload`.
+            "spawner" => {
+                return values
+                    .keys()
+                    .all(|k| k.to_utf8().map(|k| k == "id").unwrap_or(false));
+            }
+            // A decorated pot's `sherds`/`item` have no payload seam yet; its
+            // `LootTable`/`Items` do.
+            "decorated_pot" => {
+                return tag.get("sherds").is_some() || tag.get("item").is_some();
+            }
+            _ => {}
+        }
+        if crate::generation_payload::ContainerKind::for_block(name).is_some()
+            || tag.get("front_text").is_some()
             || name.ends_with("_sign")
             || name.ends_with("_hanging_sign")
+        {
+            return false;
+        }
+        // Entities with a live store but no payload route yet fail closed when
+        // the tag carries the content that store would read.
+        if (bare == "lectern" && tag.get("Book").is_some())
+            || (bare == "chiseled_bookshelf" && tag.get("Items").is_some())
+            || (matches!(bare, "suspicious_sand" | "suspicious_gravel")
+                && (tag.get("item").is_some()
+                    || tag.get("LootTable").is_some()
+                    || tag.get("LootTableSeed").is_some()))
         {
             return false;
         }
@@ -1093,10 +1129,8 @@ impl Template {
             name,
             "minecraft:jigsaw"
                 | "minecraft:structure_block"
-                | "minecraft:spawner"
                 | "minecraft:trial_spawner"
                 | "minecraft:vault"
-                | "minecraft:decorated_pot"
                 | "minecraft:suspicious_sand"
                 | "minecraft:suspicious_gravel"
                 | "minecraft:brewing_stand"
@@ -1118,10 +1152,6 @@ impl Template {
                 | "minecraft:end_gateway"
                 | "minecraft:end_portal"
                 | "minecraft:flower_pot"
-                | "minecraft:hopper"
-                | "minecraft:dropper"
-                | "minecraft:dispenser"
-                | "minecraft:crafter"
                 | "minecraft:piston"
                 | "minecraft:moving_piston"
                 | "minecraft:command_block"
@@ -1136,13 +1166,12 @@ impl Template {
             || name.ends_with("_wall_skull")
             || name.ends_with("_head")
             || name.ends_with("_wall_head")
-            || name.ends_with("_shulker_box")
-            || name == "minecraft:shulker_box"
     }
 
-    /// Which of the supported block-entity payloads a tag carries:
-    /// a sign's `front_text`, a container's `LootTable` (+ optional `LootTableSeed`),
-    /// or a container's `Items`.
+    /// Which of the supported block-entity payloads a tag carries: a sign's
+    /// `front_text` (with `back_text` validated), a spawner's `SpawnData.entity`,
+    /// a container's `LootTable` (+ optional `LootTableSeed`), or a container's
+    /// `Items`.
     pub(crate) fn staged_payload(
         tag: &Tag,
         state: u32,
@@ -1151,6 +1180,9 @@ impl Template {
         use crate::generation_payload::{ContainerKind, GenerationPayload};
         if tag.get("front_text").is_some() {
             return Ok(GenerationPayload::Sign(Self::sign_lines(tag)?));
+        }
+        if reg.name_of(state) == "minecraft:spawner" {
+            return Self::spawner_payload(tag);
         }
         let kind = match ContainerKind::for_block(reg.name_of(state)) {
             Some(kind) => kind,
@@ -1222,9 +1254,69 @@ impl Template {
         Ok(GenerationPayload::Container { kind, slots })
     }
 
+    /// A spawner's saved config. The runtime spawner model keeps the serving
+    /// entity id (`SpawnData.entity.id`) and authors its own delay/range
+    /// defaults — the same fields the jigsaw path extracts — so the rest of the
+    /// vanilla `BaseSpawner` layout is accepted by name but not carried. A tag
+    /// without `SpawnData`, or with keys outside the vanilla layout, is refused.
+    fn spawner_payload(
+        tag: &Tag,
+    ) -> Result<crate::generation_payload::GenerationPayload, &'static str> {
+        let Tag::Compound(values) = tag else {
+            return Err("template block NBT must be a compound");
+        };
+        for key in values.keys() {
+            let key = key.to_utf8().map_err(|_| "template NBT key is not UTF-8")?;
+            if !matches!(
+                key.as_str(),
+                "id"
+                    | "Delay"
+                    | "MinSpawnDelay"
+                    | "MaxSpawnDelay"
+                    | "SpawnCount"
+                    | "MaxNearbyEntities"
+                    | "RequiredPlayerRange"
+                    | "SpawnRange"
+                    | "SpawnData"
+                    | "SpawnPotentials"
+                    | "custom_spawn_rules"
+            ) {
+                return Err("unsupported template spawner NBT field");
+            }
+        }
+        if let Some(potentials) = tag.get("SpawnPotentials") {
+            let Tag::List(_, entries) = potentials else {
+                return Err("template spawner SpawnPotentials must be a list");
+            };
+            if entries
+                .iter()
+                .any(|entry| !matches!(entry, Tag::Compound(_)))
+            {
+                return Err("template spawner SpawnPotentials entries must be compounds");
+            }
+        }
+        let Some(Tag::Compound(_)) = tag.get("SpawnData") else {
+            return Err("template spawner needs SpawnData");
+        };
+        let entity = tag
+            .get("SpawnData")
+            .and_then(|d| d.get("entity"))
+            .ok_or("template spawner SpawnData needs an entity")?;
+        let Tag::Compound(_) = entity else {
+            return Err("template spawner SpawnData.entity must be a compound");
+        };
+        let id = entity
+            .get("id")
+            .and_then(Tag::string)
+            .ok_or("template spawner entity needs a string id")?
+            .to_utf8()
+            .map_err(|_| "spawner entity id is not UTF-8")?;
+        Ok(crate::generation_payload::GenerationPayload::SpawnerEntity(id))
+    }
+
     /// The general template contract: no template entities yet, and NBT limited to
-    /// container `Items`/`LootTable`, signs' `front_text`, or passthrough structural
-    /// block entities. Callers add their own restrictions on top (the fossil path
+    /// container `Items`/`LootTable`, signs, a spawner's `SpawnData`, or passthrough
+    /// structural block entities. Callers add their own restrictions on top (the fossil path
     /// requires full cubes), so admission is not baked into placement and one owner
     /// serves every caller.
     #[cfg(test)]
@@ -1301,6 +1393,12 @@ impl Template {
         processors: &[Processor],
         clip: [i32; 6],
     ) -> Result<bool, &'static str> {
+        // `StructureTemplate.placeInWorld` also places the entity list through
+        // `placeEntities`; this entry point has no entity seam, so a template
+        // carrying one is refused rather than silently dropping the spawn.
+        if !self.entities.is_empty() {
+            return Err("template placement does not handle template entities");
+        }
         if self.palettes.is_empty() {
             return Ok(false);
         }
@@ -1410,18 +1508,35 @@ impl Template {
                     }
                 })
         };
+        // The bounded edge rule above owns the cases the scripted worlds pin. The
+        // shared `update_shape` (the template-structure owner, same module) covers
+        // the remaining `BlockBehaviour.updateShape` families — wall banners,
+        // snowy dirt, doors, tall seagrass, chest pairing, crops, mushrooms,
+        // multiface faces, ladders and buttons — so an edge touching one of them
+        // finalizes instead of freezing.
+        let shape_at = |ctx: &mut crate::generation_context::FC,
+                            pos: Pos,
+                            state: u32,
+                            neighbor: u32,
+                            direction: u8|
+         -> Option<u32> {
+            edge_shape(ctx, pos, state, neighbor, direction).or_else(|| {
+                let next = update_shape(reg, state, direction, neighbor, ctx, pos);
+                (next != state).then_some(next)
+            })
+        };
         // Native updateShapeAtEdge visits exposed voxel faces after ALL writes,
         // updating inside (`p`) first and passing the resulting state to outside (`q`).
-        for (direction, p, q) in crate::voxel_faces::exposed_faces(written) {
+        for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()) {
             let mut inside = ctx.get(p.0, p.1, p.2);
             let outside = ctx.get(q.0, q.1, q.2);
             crate::generation_context::schedule_leaf_edge_state(ctx, reg, p, inside, outside);
             crate::generation_context::schedule_leaf_edge_state(ctx, reg, q, outside, inside);
-            if let Some(state) = edge_shape(ctx, p, inside, outside, direction) {
+            if let Some(state) = shape_at(ctx, p, inside, outside, direction) {
                 ctx.set(p.0, p.1, p.2, state);
                 inside = state;
             }
-            if let Some(state) = edge_shape(ctx, q, outside, inside, direction ^ 1) {
+            if let Some(state) = shape_at(ctx, q, outside, inside, direction ^ 1) {
                 ctx.set(q.0, q.1, q.2, state);
             }
             match reg.fluid_name(inside) {
@@ -1437,6 +1552,35 @@ impl Template {
                 "minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),
                 "minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),
                 _ => {}
+            }
+        }
+        // Native `Block.updateFromNeighbourShapes` runs once per written cell after
+        // the exposed-face pass: the same `updateShape` chain applied across
+        // `UPDATE_SHAPE_ORDER` (WEST, EAST, NORTH, SOUTH, DOWN, UP), each result
+        // cascading into the next direction and the chain stopping at air. This is
+        // what connects a cell every one of whose neighbors the template also
+        // wrote (it has no exposed face to visit) and what breaks a fragile block
+        // placed on a support that is not center-sturdy.
+        let air = reg.state_of("minecraft:air", None);
+        for &p in &written {
+            let mut current = ctx.get(p.0, p.1, p.2);
+            let start = current;
+            for direction in [4u8, 5, 2, 3, 0, 1] {
+                let (dx, dy, dz) = direction_delta(direction);
+                let neighbor = ctx.get(
+                    p.0.wrapping_add(dx),
+                    p.1.wrapping_add(dy),
+                    p.2.wrapping_add(dz),
+                );
+                if let Some(next) = shape_at(ctx, p, current, neighbor, direction) {
+                    current = next;
+                }
+                if current == air {
+                    break;
+                }
+            }
+            if current != start {
+                ctx.set(p.0, p.1, p.2, current);
             }
         }
         Ok(true)
@@ -3385,7 +3529,7 @@ mod tests {
                     [0, 0, 0, 31, 255, 31],
                 )
                 .is_ok());
-            assert_eq!(ctx.payloads.len(), 2, "chest loot + furnace stage payloads; decorative BEs pass through");
+            assert_eq!(ctx.payloads.len(), 3, "chest loot + furnace + pot loot stage payloads; structural BEs pass through");
             assert_eq!(
                 ctx.payloads[0],
                 (
@@ -3402,6 +3546,18 @@ mod tests {
                 ((5, 70, 4), GenerationPayload::Container { kind: ContainerKind::Furnace, slots })
                 if slots.len() == 1
             ));
+            assert_eq!(
+                ctx.payloads[2],
+                (
+                    (7, 70, 4),
+                    GenerationPayload::LootContainer {
+                        kind: ContainerKind::BlockContainer(1),
+                        loot_table: "minecraft:pots/trial_chambers/corridor".to_owned(),
+                        loot_seed: None,
+                    }
+                ),
+                "a decorated pot's LootTable now stages; only sherds/item stay passthrough"
+            );
             let _ = air;
             let mut staged = std::mem::take(&mut ctx.payloads);
             g.stage_payloads((0, 0), &mut staged);
@@ -3420,6 +3576,7 @@ mod tests {
         assert!(crate::furnaces().lock().unwrap().contains_key(&crate::ow_block((5, 70, 4))));
         crate::chests().lock().unwrap().remove(&crate::ContainerKey::ow((4, 70, 4)));
         crate::pending_block_loot().lock().unwrap().remove(&crate::ow_block((4, 70, 4)));
+        crate::pending_block_loot().lock().unwrap().remove(&crate::ow_block((7, 70, 4)));
         crate::furnaces().lock().unwrap().remove(&crate::ow_block((5, 70, 4)));
     }
 
@@ -3478,6 +3635,552 @@ mod tests {
             ctx.g.generated_fluid_ticks(),
             vec![(p_stair, 0)],
             "placed inside waterlogged stair must reserve fluid tick"
+        );
+    }
+
+    /// `updateFromNeighbourShapes`: a written cell whose neighbors are all written
+    /// too has no exposed face, so only the per-cell pass can connect it.
+    #[test]
+    fn neighbour_shapes_pass_connects_a_fully_surrounded_written_fence() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let bone = reg.state_of("minecraft:bone_block", None);
+        let fence = reg.state_of("minecraft:oak_fence", None);
+        let mut blocks = vec![BlockInfo { pos: (0, 0, 0), state: fence, nbt: None }];
+        for pos in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+            blocks.push(BlockInfo { pos, state: bone, nbt: None });
+        }
+        let template = Template {
+            size: (3, 3, 3),
+            palettes: vec![blocks],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        ctx.test_writes = Some(Vec::new());
+        let mut rng = Xor::seed_worldgen(3);
+        assert!(template
+            .place_blocks(
+                &mut ctx,
+                &mut rng,
+                Placement {
+                    origin: (8, 72, 8), pivot: (0, 0, 0),
+                    mirror: Mirror::None, rotation: Rotation::None,
+                },
+                &[], [0, 0, 0, 31, 255, 31],
+            )
+            .unwrap());
+        let placed = ctx.get(8, 72, 8);
+        for side in ["north", "south", "west", "east"] {
+            assert_eq!(
+                reg.get_prop(placed, side).as_deref(),
+                Some("true"),
+                "a written fence inside written cubes connects on {side}"
+            );
+        }
+        assert_eq!(
+            ctx.test_writes.as_ref().unwrap().len(),
+            8,
+            "seven template writes plus the one neighbor-shape fix"
+        );
+    }
+
+    /// `updateFromNeighbourShapes` applies the fragile-support check to a written
+    /// cell, not only to world cells at the template edge: a torch the template
+    /// puts on a single slab must break the way `canSupportCenter` breaks it.
+    #[test]
+    fn neighbour_shapes_pass_breaks_fragile_block_on_written_partial_support() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let slab = reg.with_prop(reg.state_of("minecraft:oak_slab", None), "type", "bottom");
+        let torch = reg.state_of("minecraft:torch", None);
+        let template = Template {
+            size: (1, 2, 1),
+            palettes: vec![vec![
+                BlockInfo { pos: (0, 0, 0), state: slab, nbt: None },
+                BlockInfo { pos: (0, 1, 0), state: torch, nbt: None },
+            ]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        ctx.test_writes = Some(Vec::new());
+        let mut rng = Xor::seed_worldgen(5);
+        assert!(template
+            .place_blocks(
+                &mut ctx,
+                &mut rng,
+                Placement {
+                    origin: (8, 72, 8), pivot: (0, 0, 0),
+                    mirror: Mirror::None, rotation: Rotation::None,
+                },
+                &[], [0, 0, 0, 31, 255, 31],
+            )
+            .unwrap());
+        assert_eq!(ctx.get(8, 72, 8), slab);
+        assert_eq!(
+            ctx.get(8, 73, 8),
+            air,
+            "a single slab's top face is not center-sturdy, so the torch breaks"
+        );
+        assert_eq!(ctx.test_writes.as_ref().unwrap().len(), 3);
+    }
+
+    /// The shared `update_shape` families the bounded edge rule does not name
+    /// still finalize at template edges: `SnowyDirtBlock.updateShape` marks a
+    /// written grass block under snow, and `WallBannerBlock.updateShape` drops
+    /// a banner whose written support leaves (the end city's tower edge case).
+    #[test]
+    fn shared_update_families_finalize_at_template_edges() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let bone = reg.state_of("minecraft:bone_block", None);
+        let grass = reg.state_of("minecraft:grass_block", None);
+        let snow = reg.state_of("minecraft:snow_block", None);
+        let banner = reg.with_prop(
+            reg.state_of("minecraft:magenta_wall_banner", None),
+            "facing",
+            "south",
+        );
+        let placement = |origin| Placement {
+            origin,
+            pivot: (0, 0, 0),
+            mirror: Mirror::None,
+            rotation: Rotation::None,
+        };
+
+        // A written grass block with a snow block above its edge: the inside
+        // side of the exposed face gets `snowy=true`.
+        let grassy = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo { pos: (0, 0, 0), state: grass, nbt: None }]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        ctx.test_base_cell((8, 73, 8), snow);
+        let mut rng = Xor::seed_worldgen(11);
+        assert!(grassy
+            .place_blocks(&mut ctx, &mut rng, placement((8, 72, 8)), &[], [0, 0, 0, 31, 255, 31])
+            .unwrap());
+        assert_eq!(
+            reg.get_prop(ctx.get(8, 72, 8), "snowy").as_deref(),
+            Some("true"),
+            "grass under an outside snow block must turn snowy"
+        );
+
+        // A banner whose support the template erases: facing "south" means the
+        // support is the cell north of the banner; writing air there drops it.
+        let erase = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo { pos: (0, 0, 0), state: air, nbt: None }]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        ctx.test_base_cell((8, 72, 7), bone);
+        ctx.test_base_cell((8, 72, 8), banner);
+        let mut rng = Xor::seed_worldgen(11);
+        assert!(erase
+            .place_blocks(&mut ctx, &mut rng, placement((8, 72, 7)), &[], [0, 0, 0, 31, 255, 31])
+            .unwrap());
+        assert_eq!(ctx.get(8, 72, 7), air, "the template erased the support cell");
+        assert_eq!(
+            ctx.get(8, 72, 8),
+            air,
+            "the wall banner loses its written support and drops"
+        );
+    }
+
+    /// Extended container staging: dispenser/hopper/shulker-box `Items` and a
+    /// dispenser `LootTable` are staged instead of silently dropped, while
+    /// unknown fields still fail closed.
+    #[test]
+    fn extended_containers_stage_and_unknown_fields_fail_closed() {
+        use crate::generation_payload::{ContainerKind, GenerationPayload};
+        let reg = crate::block_registry::breg().unwrap();
+        let tag = |entries: Vec<(&str, Tag)>| {
+            Tag::Compound(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (NbtString::text(k), v))
+                    .collect(),
+            )
+        };
+        let id = |name: &str| ("id", Tag::String(NbtString::text(name)));
+        let items = |slot: i8, item: &str, count: i32| {
+            ("Items", Tag::List(10, vec![container_entry(slot, item, count)]))
+        };
+
+        for (block, kind) in [
+            ("minecraft:dispenser", ContainerKind::BlockContainer(9)),
+            ("minecraft:dropper", ContainerKind::BlockContainer(9)),
+            ("minecraft:crafter", ContainerKind::BlockContainer(9)),
+            ("minecraft:hopper", ContainerKind::BlockContainer(5)),
+            ("minecraft:white_shulker_box", ContainerKind::Chest),
+        ] {
+            let state = reg.state_of(block, None);
+            let nbt = tag(vec![id(block), items(0, "minecraft:iron_ore", 3)]);
+            assert!(
+                !Template::is_passthrough_block_entity(state, &nbt, reg),
+                "{block} must route through the payload seam, not passthrough"
+            );
+            assert_eq!(
+                Template::staged_payload(&nbt, state, reg),
+                Ok(GenerationPayload::Container {
+                    kind,
+                    slots: vec![(0, crate::name_to_item("minecraft:iron_ore").unwrap(), 3)],
+                }),
+                "{block} Items stage into the owning store"
+            );
+        }
+
+        let dispenser = reg.state_of("minecraft:dispenser", None);
+        let loot = tag(vec![
+            id("minecraft:dispenser"),
+            ("LootTable", Tag::String(NbtString::text("minecraft:chests/simple_dungeon"))),
+            ("LootTableSeed", Tag::Long(7)),
+        ]);
+        assert_eq!(
+            Template::staged_payload(&loot, dispenser, reg),
+            Ok(GenerationPayload::LootContainer {
+                kind: ContainerKind::BlockContainer(9),
+                loot_table: "minecraft:chests/simple_dungeon".to_owned(),
+                loot_seed: Some(7),
+            }),
+            "a dispenser LootTable now stages instead of being dropped"
+        );
+
+        let bad = tag(vec![
+            id("minecraft:dispenser"),
+            items(0, "minecraft:iron_ore", 1),
+            ("Failure", Tag::Int(1)),
+        ]);
+        assert!(Template::staged_payload(&bad, dispenser, reg).is_err(),
+            "an unhandled field on a storable container is refused");
+
+        // Content keys a live store reads but the seam cannot carry yet are
+        // refused rather than silently dropped.
+        let lectern = reg.state_of("minecraft:lectern", None);
+        assert!(Template::is_passthrough_block_entity(
+            lectern,
+            &tag(vec![id("minecraft:lectern")]),
+            reg
+        ));
+        assert!(!Template::is_passthrough_block_entity(
+            lectern,
+            &tag(vec![id("minecraft:lectern"), ("Book", Tag::Compound(BTreeMap::new()))]),
+            reg
+        ));
+        assert!(Template::staged_payload(
+            &tag(vec![id("minecraft:lectern"), ("Book", Tag::Compound(BTreeMap::new()))]),
+            lectern,
+            reg
+        )
+        .is_err());
+        let bookshelf = reg.state_of("minecraft:chiseled_bookshelf", None);
+        assert!(!Template::is_passthrough_block_entity(
+            bookshelf,
+            &tag(vec![id("minecraft:chiseled_bookshelf"), items(0, "minecraft:book", 1)]),
+            reg
+        ));
+
+        // Brewing stands and campfires carry `Items` in the corpus but have no
+        // payload route; pinning that bound so a later seam must move them.
+        let brewing = reg.state_of("minecraft:brewing_stand", None);
+        assert!(Template::is_passthrough_block_entity(
+            brewing,
+            &tag(vec![id("minecraft:brewing_stand"), items(0, "minecraft:iron_ore", 1)]),
+            reg
+        ));
+    }
+
+    /// A decorated pot's `sherds`/`item` stay passthrough (no payload seam), but
+    /// its `LootTable`/`Items` stage like every other randomizable container.
+    #[test]
+    fn decorated_pot_sherds_pass_through_but_loot_stages() {
+        use crate::generation_payload::{ContainerKind, GenerationPayload};
+        let reg = crate::block_registry::breg().unwrap();
+        let pot = reg.state_of("minecraft:decorated_pot", None);
+        let tag = |entries: Vec<(&str, Tag)>| {
+            Tag::Compound(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (NbtString::text(k), v))
+                    .collect(),
+            )
+        };
+        let sherd_pot = tag(vec![
+            ("id", Tag::String(NbtString::text("minecraft:decorated_pot"))),
+            ("LootTable", Tag::String(NbtString::text("minecraft:pots/trial_chambers/corridor"))),
+            ("sherds", Tag::List(8, vec![])),
+        ]);
+        assert!(
+            Template::is_passthrough_block_entity(pot, &sherd_pot, reg),
+            "a pot carrying sherds stays passthrough (no seam for them)"
+        );
+        let loot_pot = tag(vec![
+            ("id", Tag::String(NbtString::text("minecraft:decorated_pot"))),
+            ("LootTable", Tag::String(NbtString::text("minecraft:pots/trial_chambers/corridor"))),
+        ]);
+        assert!(!Template::is_passthrough_block_entity(pot, &loot_pot, reg));
+        assert_eq!(
+            Template::staged_payload(&loot_pot, pot, reg),
+            Ok(GenerationPayload::LootContainer {
+                kind: ContainerKind::BlockContainer(1),
+                loot_table: "minecraft:pots/trial_chambers/corridor".to_owned(),
+                loot_seed: None,
+            })
+        );
+    }
+
+    /// `SpawnData.entity.id` is the one spawner field the runtime model keeps;
+    /// the rest of the vanilla `BaseSpawner` layout is accepted by name, and
+    /// anything outside it — or a malformed `SpawnData` — fails closed.
+    #[test]
+    fn spawner_spawn_data_stages_entity_and_fails_closed() {
+        use crate::generation_payload::GenerationPayload;
+        let reg = crate::block_registry::breg().unwrap();
+        let spawner = reg.state_of("minecraft:spawner", None);
+        let tag = |entries: Vec<(&str, Tag)>| {
+            Tag::Compound(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (NbtString::text(k), v))
+                    .collect(),
+            )
+        };
+        let spawn_data = tag(vec![(
+            "entity",
+            tag(vec![("id", Tag::String(NbtString::text("minecraft:cave_spider")))]),
+        )]);
+        let full = tag(vec![
+            ("id", Tag::String(NbtString::text("minecraft:spawner"))),
+            ("Delay", Tag::Short(0)),
+            ("MinSpawnDelay", Tag::Short(200)),
+            ("MaxSpawnDelay", Tag::Short(800)),
+            ("SpawnCount", Tag::Short(4)),
+            ("MaxNearbyEntities", Tag::Short(6)),
+            ("RequiredPlayerRange", Tag::Short(16)),
+            ("SpawnRange", Tag::Short(4)),
+            ("SpawnData", spawn_data.clone()),
+            (
+                "SpawnPotentials",
+                Tag::List(10, vec![tag(vec![
+                    ("weight", Tag::Int(1)),
+                    ("data", tag(vec![(
+                        "entity",
+                        tag(vec![("id", Tag::String(NbtString::text("minecraft:cave_spider")))]),
+                    )])),
+                ])]),
+            ),
+        ]);
+        assert!(!Template::is_passthrough_block_entity(spawner, &full, reg),
+            "a configured spawner must not pass through");
+        assert_eq!(
+            Template::staged_payload(&full, spawner, reg),
+            Ok(GenerationPayload::SpawnerEntity(
+                "minecraft:cave_spider".to_owned()
+            )),
+            "the serving entity id survives staging"
+        );
+
+        let id_only = tag(vec![("id", Tag::String(NbtString::text("minecraft:spawner")))]);
+        assert!(
+            Template::is_passthrough_block_entity(spawner, &id_only, reg),
+            "a bare spawner marker stays structural"
+        );
+
+        for (case, nbt) in [
+            ("unknown field", tag(vec![
+                ("id", Tag::String(NbtString::text("minecraft:spawner"))),
+                ("SpawnData", spawn_data.clone()),
+                ("PlayerRange", Tag::Short(4)),
+            ])),
+            ("SpawnData is not a compound", tag(vec![
+                ("SpawnData", Tag::Int(3)),
+            ])),
+            ("SpawnPotentials not a list", tag(vec![
+                ("SpawnData", spawn_data.clone()),
+                ("SpawnPotentials", Tag::Compound(BTreeMap::new())),
+            ])),
+            ("entity id missing", tag(vec![(
+                "SpawnData",
+                tag(vec![("entity", tag(vec![]))]),
+            )])),
+        ] {
+            assert!(
+                Template::staged_payload(&nbt, spawner, reg).is_err(),
+                "malformed spawner NBT must fail closed: {case}"
+            );
+        }
+    }
+
+    /// `SpawnData` on a placed spawner block reaches the payload seam end to end.
+    #[test]
+    fn place_blocks_stages_the_spawner_entity() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::generation_payload::GenerationPayload;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let spawner = reg.state_of("minecraft:spawner", None);
+        let mut inner = BTreeMap::new();
+        inner.insert(NbtString::text("id"), Tag::String(NbtString::text("minecraft:cave_spider")));
+        let mut spawn_data = BTreeMap::new();
+        spawn_data.insert(NbtString::text("entity"), Tag::Compound(inner));
+        let mut nbt = BTreeMap::new();
+        nbt.insert(NbtString::text("id"), Tag::String(NbtString::text("minecraft:spawner")));
+        nbt.insert(NbtString::text("SpawnData"), Tag::Compound(spawn_data));
+        let template = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo {
+                pos: (0, 0, 0),
+                state: spawner,
+                nbt: Some(Tag::Compound(nbt)),
+            }]],
+            entities: Vec::new(),
+        };
+        assert!(template.validate_placement().is_ok());
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        let mut rng = Xor::seed_worldgen(13);
+        assert!(template
+            .place_blocks(
+                &mut ctx,
+                &mut rng,
+                Placement {
+                    origin: (8, 72, 8), pivot: (0, 0, 0),
+                    mirror: Mirror::None, rotation: Rotation::None,
+                },
+                &[], [0, 0, 0, 31, 255, 31],
+            )
+            .unwrap());
+        assert_eq!(
+            ctx.payloads,
+            vec![(
+                (8, 72, 8),
+                GenerationPayload::SpawnerEntity("minecraft:cave_spider".to_owned())
+            )]
+        );
+    }
+
+    /// A sign's `back_text` is decoded with the same rules as the front: a
+    /// malformed back side fails closed even though the payload only carries
+    /// the front's four lines today.
+    #[test]
+    fn sign_back_text_is_validated_and_front_text_stages() {
+        use crate::generation_payload::GenerationPayload;
+        let reg = crate::block_registry::breg().unwrap();
+        let sign = reg.state_of("minecraft:oak_sign", None);
+        let side = |lines: [&str; 4]| {
+            Tag::Compound(BTreeMap::from([
+                (
+                    NbtString::text("messages"),
+                    Tag::List(
+                        8,
+                        lines
+                            .iter()
+                            .map(|l| {
+                                Tag::String(NbtString::text(format!("\"{l}\"").as_str()))
+                            })
+                            .collect(),
+                    ),
+                ),
+                (NbtString::text("color"), Tag::String(NbtString::text("white"))),
+                (NbtString::text("has_glowing_text"), Tag::Byte(0)),
+            ]))
+        };
+        let mut nbt = BTreeMap::new();
+        nbt.insert(NbtString::text("front_text"), side(["Front", "", "", ""]));
+        nbt.insert(NbtString::text("back_text"), side(["Back", "", "", ""]));
+        assert_eq!(
+            Template::staged_payload(&Tag::Compound(nbt), sign, reg),
+            Ok(GenerationPayload::Sign([
+                "Front".to_owned(),
+                String::new(),
+                String::new(),
+                String::new()
+            ])),
+            "a valid back_text validates and the front still stages"
+        );
+        let mut nbt = BTreeMap::new();
+        nbt.insert(NbtString::text("front_text"), side(["Front", "", "", ""]));
+        nbt.insert(
+            NbtString::text("back_text"),
+            Tag::Compound(BTreeMap::from([(
+                NbtString::text("messages"),
+                Tag::List(8, vec![Tag::String(NbtString::text("\"x\""))]),
+            )])),
+        );
+        assert_eq!(
+            Template::staged_payload(&Tag::Compound(nbt), sign, reg),
+            Err("a sign side has exactly four messages"),
+            "a malformed back_text is refused, not silently dropped"
+        );
+    }
+
+    /// This entry point has no entity seam, so a template whose `entities` list
+    /// is populated is refused rather than silently dropping the spawns.
+    #[test]
+    fn place_blocks_refuses_a_template_carrying_entities() {
+        let reg = crate::block_registry::breg().unwrap();
+        let template = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo {
+                pos: (0, 0, 0),
+                state: reg.state_of("minecraft:bone_block", None),
+                nbt: None,
+            }]],
+            entities: vec![EntityInfo {
+                pos: [0.5, 0.0, 0.5],
+                block_pos: (0, 0, 0),
+                nbt: Tag::Compound(BTreeMap::from([(
+                    NbtString::text("id"),
+                    Tag::String(NbtString::text("minecraft:pig")),
+                )])),
+            }],
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = crate::generation_context::FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        let mut rng = Xor::seed_worldgen(5);
+        assert_eq!(
+            template.place_blocks(
+                &mut ctx,
+                &mut rng,
+                Placement {
+                    origin: (8, 72, 8), pivot: (0, 0, 0),
+                    mirror: Mirror::None, rotation: Rotation::None,
+                },
+                &[],
+                [0, 0, 0, 31, 255, 31],
+            ),
+            Err("template placement does not handle template entities"),
+        );
+        assert_eq!(
+            ctx.get(8, 72, 8),
+            reg.state_of("minecraft:air", None),
+            "a refused template wrote nothing"
         );
     }
 }

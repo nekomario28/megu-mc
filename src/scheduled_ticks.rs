@@ -268,6 +268,210 @@ mod tests {
         let cases = delivery_fixture::replay(false, |_, _, _| unreachable!());
         assert_eq!(cases, 5);
     }
+
+    /// `LevelChunkTicks.unpack`: deduplication is on the (pos, block) identity,
+    /// each chunk's list starts its negative sub-order at its own length, and
+    /// every proto tick lands due `now` at normal priority. A mutant that
+    /// counts pending entries globally instead of per chunk produces the
+    /// wrong sub-orders here.
+    #[test]
+    fn unpack_generated_restarts_negative_sub_order_per_chunk() {
+        let mut queue = ScheduledTicks::new();
+        queue.unpack_generated(
+            vec![
+                ((1, 2, 3), 7),
+                ((1, 2, 3), 7), // exact identity: deduplicated before counting
+                ((1, 2, 3), 9), // same pos, different block: a second tick
+                ((1, 4, 3), 7),
+                ((17, 0, 17), 7),   // chunk (1,1)
+                ((-16, 0, -16), 7), // chunk (-1,-1)
+            ],
+            50,
+        );
+        let out = queue.collect(50, 100, |_| true);
+        assert_eq!(out.len(), 5, "the duplicate identity is dropped");
+        assert!(
+            out.iter().all(|t| t.due == 50 && t.priority == 0),
+            "proto ticks are zero-delay, normal priority"
+        );
+        // Chunk (0,0) holds three ticks with sub_orders -3, -2, -1 in pending
+        // order; all of them sort ahead of the single-tick chunks' -1 heads.
+        let head: Vec<_> = out[..3]
+            .iter()
+            .map(|t| (t.pos, t.block, t.sub_order))
+            .collect();
+        assert_eq!(
+            head,
+            vec![
+                ((1, 2, 3), 7, -3),
+                ((1, 2, 3), 9, -2),
+                ((1, 4, 3), 7, -1),
+            ],
+            "per-chunk sub-order starts at minus the chunk's own pending length"
+        );
+        let mut tail: Vec<_> = out[3..]
+            .iter()
+            .map(|t| (t.pos, t.block, t.sub_order))
+            .collect();
+        tail.sort();
+        assert_eq!(
+            tail,
+            vec![((-16, 0, -16), 7, -1), ((17, 0, 17), 7, -1)],
+            "every chunk's list restarts its own negative sub-order"
+        );
+    }
+
+    /// `LevelTicks.schedule` refuses a duplicate (pos, block) and keeps the
+    /// entry already queued — rescheduling must not move a tick earlier or
+    /// later, and a different block at the same pos is a separate identity.
+    #[test]
+    fn schedule_keeps_the_first_of_duplicate_identities() {
+        let mut queue = ScheduledTicks::new();
+        let first = ScheduledTick {
+            pos: (1, 0, 1),
+            block: 7,
+            due: 5,
+            priority: 0,
+            sub_order: 0,
+        };
+        assert!(queue.schedule(first));
+        assert!(
+            !queue.schedule(ScheduledTick {
+                pos: (1, 0, 1),
+                block: 7,
+                due: 1,
+                priority: -3,
+                sub_order: 2,
+            }),
+            "the duplicate identity is refused"
+        );
+        assert!(
+            queue.schedule(ScheduledTick {
+                pos: (1, 0, 1),
+                block: 8,
+                due: 1,
+                priority: -3,
+                sub_order: 2,
+            }),
+            "a different block at the same position is a different tick"
+        );
+        let out = queue.collect(10, 10, |_| true);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].block, 8, "the earlier-due distinct block delivers first");
+        assert_eq!(out[1], first, "the original due time is kept, not replaced");
+    }
+
+    /// Saved ticks inflate their delays at the load game time with a 32-bit
+    /// `SavedTick.delay`: a delay wider than i32 wraps to an overdue tick, and
+    /// sub-orders restart per chunk in heap order, discarding the saved ones.
+    #[test]
+    fn unpack_saved_restarts_sub_order_and_wraps_i32_delays() {
+        let mut queue = ScheduledTicks::new();
+        assert!(queue.schedule(ScheduledTick {
+            pos: (1, 0, 1),
+            block: 7,
+            due: 100,
+            priority: 0,
+            sub_order: 9,
+        }));
+        assert!(queue.schedule(ScheduledTick {
+            pos: (2, 0, 1),
+            block: 8,
+            due: 100,
+            priority: -1,
+            sub_order: 3,
+        }));
+        assert!(queue.schedule(ScheduledTick {
+            pos: (33, 0, 1),
+            block: 9,
+            due: 50,
+            priority: 0,
+            sub_order: 0,
+        }));
+        assert!(queue.schedule(ScheduledTick {
+            pos: (49, 0, 1),
+            block: 5,
+            due: 60 + i64::from(i32::MAX) + 7,
+            priority: 0,
+            sub_order: 0,
+        }));
+        let mut loaded = queue.unpack_saved(60);
+        let out = loaded.collect(200, 10, |_| true);
+        assert_eq!(out.len(), 4);
+        // Chunk (0,0) saved in heap order: the priority -1 tick leads, so its
+        // reloaded sub_orders are -2 then -1.
+        assert_eq!(out[0].pos, (2, 0, 1));
+        assert_eq!(out[0].due, 100, "small delays survive the round-trip");
+        assert_eq!(out[0].sub_order, -2);
+        assert_eq!(out[1].pos, (1, 0, 1));
+        assert_eq!(out[1].sub_order, -1);
+        let wrapped = out
+            .iter()
+            .find(|t| t.pos == (49, 0, 1))
+            .expect("the wrapped tick survives");
+        assert!(
+            wrapped.due < 60,
+            "a delay wider than i32 wraps to an overdue trigger, got {}",
+            wrapped.due
+        );
+        let lone = out
+            .iter()
+            .find(|t| t.pos == (33, 0, 1))
+            .expect("the single-tick chunk survives");
+        assert_eq!(lone.sub_order, -1, "one-tick chunks restart at -1");
+    }
+
+    /// The persisted state must round-trip byte for byte (the fastutil table
+    /// layout and heap order are part of the contract), and decoding corrupt
+    /// input fails closed on every structural check.
+    #[test]
+    fn tick_state_roundtrip_is_byte_stable_and_decode_fails_closed() {
+        let mut queue = ScheduledTicks::new();
+        queue.unpack_generated(vec![((-1, 0, -1), 9), ((17, 0, 17), 8)], 40);
+        assert!(queue.schedule(ScheduledTick {
+            pos: (1, 2, 3),
+            block: 7,
+            due: 40,
+            priority: 0,
+            sub_order: 0,
+        }));
+        assert!(queue.schedule(ScheduledTick {
+            pos: (0, 0, 0),
+            block: 3,
+            due: 41,
+            priority: 1,
+            sub_order: 4,
+        }));
+        let mut bytes = Vec::new();
+        queue.encode(&mut bytes);
+        let mut slice = &bytes[..];
+        let decoded = ScheduledTicks::decode(&mut slice).expect("encode output decodes");
+        let mut again = Vec::new();
+        decoded.encode(&mut again);
+        assert_eq!(bytes, again, "decode/encode is byte-stable");
+
+        // Chunks are stored sorted by (x, z): (-1,-1) 1 tick, (0,0) 2 ticks,
+        // (1,1) 1 tick. A chunk record is 12 header bytes + 33 bytes per tick;
+        // a tick's `due` field starts at offset 16 inside its 33-byte record.
+        let chunk2_tick2_due = 4 + (12 + 33) + 12 + 33 + 16;
+        let mut bad = bytes.clone();
+        bad[4 + 12..4 + 12 + 4].copy_from_slice(&17i32.to_be_bytes()); // first chunk's tick pos.x
+        assert!(
+            ScheduledTicks::decode(&mut &bad[..]).is_err(),
+            "a tick outside its declared chunk is refused"
+        );
+        let mut bad = bytes.clone();
+        bad[chunk2_tick2_due..chunk2_tick2_due + 8]
+            .copy_from_slice(&1i64.to_be_bytes()); // second tick of chunk (0,0) before its parent
+        assert!(
+            ScheduledTicks::decode(&mut &bad[..]).is_err(),
+            "a heap child ordering before its parent is refused"
+        );
+        assert!(
+            ScheduledTicks::decode(&mut &bytes[..bytes.len() - 1]).is_err(),
+            "truncated state is refused"
+        );
+    }
 }
 
 #[cfg(test)]
