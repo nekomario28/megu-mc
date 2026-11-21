@@ -2210,6 +2210,659 @@ impl WorldMechanismLcg {
     }
 }
 
+// The nine P5e block-entity families use one dimension-scoped live store.
+// Events are returned to the caller so item/entity creation and status effects
+// can be applied after the registry mutex has been released.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WorldBlockEntityEvent {
+    Cooked {
+        pos: BlockPos,
+        slot: usize,
+        item: String,
+    },
+    Brewed {
+        pos: BlockPos,
+        ejected_glass_bottle: bool,
+    },
+    Spawn {
+        pos: BlockPos,
+        entity_id: String,
+        location: [f64; 3],
+    },
+    BeaconEffect {
+        pos: BlockPos,
+        player: usize,
+        effect: String,
+        amplifier: u8,
+        duration_ticks: i32,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorldBlockEntityInteraction {
+    Changed,
+    ReturnedItem(String),
+    CrafterPulse,
+}
+
+/// Insert/replace a live payload at the corresponding dimension and block.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn register_world_block_entity(
+    dim: DimId,
+    pos: BlockPos,
+    entity: VanillaBlockEntity,
+) -> Option<VanillaBlockEntity> {
+    world_block_entity_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((dim, pos.0, pos.1, pos.2), entity)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn remove_world_block_entity(
+    dim: DimId,
+    pos: BlockPos,
+) -> Option<VanillaBlockEntity> {
+    world_block_entity_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(dim, pos.0, pos.1, pos.2))
+}
+
+/// Read the vanilla comparator output of a stored block entity. Families that
+/// have no analog output report 0, while absent positions return None.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn comparator_signal_at_be(dim: DimId, pos: BlockPos) -> Option<u8> {
+    let store = world_block_entity_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let be = store.get(&(dim, pos.0, pos.1, pos.2))?;
+    Some(match be {
+        VanillaBlockEntity::BrewingStand(stand) => {
+            let slots: [Option<BeSlotItem>; 5] = std::array::from_fn(|index| match index {
+                0..=2 => stand.bottles[index].map(|potion| {
+                    let name = match potion.form {
+                        PotionForm::Drinkable => "minecraft:potion",
+                        PotionForm::Splash => "minecraft:splash_potion",
+                        PotionForm::Lingering => "minecraft:lingering_potion",
+                    };
+                    (name.to_owned(), 1)
+                }),
+                3 => stand.ingredient.map(|(ingredient, count)| (format!("{ingredient:?}"), count)),
+                _ => (stand.blaze_powder > 0)
+                    .then(|| ("minecraft:blaze_powder".to_owned(), stand.blaze_powder)),
+            });
+            be_container_signal(&slots, |id| match id {
+                "minecraft:potion" | "minecraft:splash_potion" | "minecraft:lingering_potion" => 1,
+                _ => 64,
+            })
+        }
+        VanillaBlockEntity::Crafter(be) => be.comparator_signal(),
+        VanillaBlockEntity::Campfire(_) => 0,
+        VanillaBlockEntity::Jukebox(be) => be.comparator_signal(),
+        VanillaBlockEntity::MobSpawner(_) => 0,
+        VanillaBlockEntity::Lectern(be) => be.comparator_signal(),
+        VanillaBlockEntity::ChiseledBookshelf(be) => be.comparator_signal(),
+        VanillaBlockEntity::DecoratedPot(be) => {
+            let max_stack = be.item_id.as_deref()
+                .and_then(name_to_item)
+                .map_or(64, |item| item_stack_max(item, &Vec::new()).clamp(1, 64) as u8);
+            be.comparator_signal(max_stack)
+        }
+        VanillaBlockEntity::Beacon(_) => 0,
+    })
+}
+
+/// Interact with one of the non-ticking container families. For a lectern,
+/// Some(book) places a book, None + Some(page) turns to that zero-based page,
+/// and None + None removes the book. Bookshelves use slots 0..=5. A pot
+/// inserts or extracts one item per call. A crafter with None + Some(slot)
+/// toggles that slot, while Some("powered")/Some("unpowered") updates its
+/// redstone state and reports the rising-edge pulse exactly once.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn interact_world_block_entity(
+    dim: DimId,
+    pos: BlockPos,
+    actor_item: Option<&str>,
+    slot_hint: Option<usize>,
+) -> Option<WorldBlockEntityInteraction> {
+    let mut store = world_block_entity_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let be = store.get_mut(&(dim, pos.0, pos.1, pos.2))?;
+    match be {
+        VanillaBlockEntity::Lectern(lectern) => match actor_item {
+            Some(book) if lectern.book_item.is_none() && matches!(
+                book.strip_prefix("minecraft:").unwrap_or(book),
+                "writable_book" | "written_book"
+            ) => {
+                lectern.book_item = Some(book.to_string());
+                lectern.page = 0;
+                // Page count must come from the item's content when available.
+                lectern.total_pages = lectern.total_pages.max(1);
+                Some(WorldBlockEntityInteraction::Changed)
+            }
+            None if lectern.book_item.is_some() => {
+                if let Some(page) = slot_hint {
+                    lectern.set_page(i32::try_from(page).unwrap_or(i32::MAX))
+                        .then_some(WorldBlockEntityInteraction::Changed)
+                } else {
+                    lectern.page = 0;
+                    lectern.total_pages = 0;
+                    lectern.book_item.take().map(WorldBlockEntityInteraction::ReturnedItem)
+                }
+            }
+            _ => None,
+        },
+        VanillaBlockEntity::ChiseledBookshelf(shelf) => {
+            let slot = slot_hint?;
+            match actor_item {
+                Some(book) if matches!(
+                    book.strip_prefix("minecraft:").unwrap_or(book),
+                    "book" | "writable_book" | "written_book" | "enchanted_book"
+                ) => shelf.insert_book(slot, book)
+                    .then_some(WorldBlockEntityInteraction::Changed),
+                None => shelf.remove_book(slot).map(WorldBlockEntityInteraction::ReturnedItem),
+                _ => None,
+            }
+        }
+        VanillaBlockEntity::DecoratedPot(pot) => match actor_item {
+            Some(item) if !item.is_empty() => {
+                let stack_max = name_to_item(item)
+                    .map_or(64, |id| item_stack_max(id, &Vec::new()).clamp(1, 64) as u8);
+                if pot.item_id.as_deref().is_some_and(|stored| stored != item)
+                    || pot.item_count >= stack_max
+                {
+                    None
+                } else {
+                    pot.item_id.get_or_insert_with(|| item.to_string());
+                    pot.item_count += 1;
+                    Some(WorldBlockEntityInteraction::Changed)
+                }
+            }
+            None if pot.item_count > 0 => {
+                pot.item_count -= 1;
+                let returned = pot.item_id.clone()?;
+                if pot.item_count == 0 {
+                    pot.item_id = None;
+                }
+                Some(WorldBlockEntityInteraction::ReturnedItem(returned))
+            }
+            _ => None,
+        },
+        VanillaBlockEntity::Crafter(crafter) => match actor_item {
+            None => {
+                let slot = slot_hint?;
+                crafter.set_slot_disabled(slot, !crafter.slot_disabled(slot))
+                    .then_some(WorldBlockEntityInteraction::Changed)
+            }
+            Some("powered" | "minecraft:powered") => {
+                if crafter.set_powered(true) {
+                    Some(WorldBlockEntityInteraction::CrafterPulse)
+                } else {
+                    None
+                }
+            }
+            Some("unpowered" | "minecraft:unpowered") => {
+                let was_powered = crafter.triggered;
+                crafter.set_powered(false);
+                was_powered.then_some(WorldBlockEntityInteraction::Changed)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Advance every registered ticking entity for one world tick and return the
+/// effects to be committed by the simulation owner after releasing the mutex.
+/// `nearby_players` contains positions from `dim` in stable caller order.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn tick_world_block_entities(
+    dim: DimId,
+    world_tick: u64,
+    nearby_players: &[[f64; 3]],
+    rand_seed: u64,
+) -> Vec<WorldBlockEntityEvent> {
+    // Snapshot live entities before locking the block-entity store. This also
+    // avoids acquiring the mobs registry while the block-entity lock is held.
+    let live_mobs: Vec<(i64, [f64; 3])> = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|mob| mob.dim == dim)
+        .map(|mob| {
+            let pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            (mob.etype, [pos.0, pos.1, pos.2])
+        })
+        .collect();
+    let reg = breg();
+    let mut store = world_block_entity_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // HashMap iteration order is randomized. Sort positions for deterministic
+    // spawner randomness and event order across runs and insertion histories.
+    let mut positions: Vec<_> = store.keys().filter(|(d, _, _, _)| *d == dim).copied().collect();
+    positions.sort_by_key(|(_, x, y, z)| (*x, *y, *z));
+    let mut rng = WorldMechanismLcg::new(rand_seed ^ world_tick);
+    let mut events = Vec::new();
+    for (dim, x, y, z) in positions {
+        let pos = (x, y, z);
+        let Some(entity) = store.get_mut(&(dim, x, y, z)) else { continue };
+        match entity {
+            VanillaBlockEntity::Campfire(fire) => {
+                let lit = reg.is_some_and(|reg| {
+                    reg.get_prop(block_at_dim(dim, x, y, z), "lit").as_deref() == Some("true")
+                });
+                // A saved, unknown input must survive a completed timer. The
+                // P5e tick removes completed slots before recipe resolution.
+                let unsupported: Vec<_> = if lit {
+                    fire.slots.iter().enumerate().filter_map(|(slot, entry)| {
+                        let (id, elapsed, total) = entry.as_ref()?;
+                        if elapsed.saturating_add(1) < *total
+                            || BlockEntityItem::new(id, 1)
+                                .and_then(|item| live_campfire_result(&item))
+                                .is_some()
+                        {
+                            return None;
+                        }
+                        Some((slot, (id.clone(), *elapsed, *total)))
+                    }).collect()
+                } else {
+                    Vec::new()
+                };
+                for (slot, input) in fire.tick(lit) {
+                    let cooked = BlockEntityItem::new(&input, 1)
+                        .and_then(|item| live_campfire_result(&item));
+                    if let Some(item) = cooked {
+                        events.push(WorldBlockEntityEvent::Cooked {
+                            pos,
+                            slot,
+                            item: item.id.to_string(),
+                        });
+                    }
+                }
+                for (slot, input) in unsupported {
+                    fire.slots[slot] = Some(input);
+                }
+            }
+            VanillaBlockEntity::BrewingStand(stand) => {
+                if let BrewingTick::Completed { ejected_glass_bottle } = stand.tick() {
+                    events.push(WorldBlockEntityEvent::Brewed { pos, ejected_glass_bottle });
+                }
+            }
+            VanillaBlockEntity::MobSpawner(spawner) => {
+                let center = [f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5];
+                let armed = nearby_players.iter().any(|p| {
+                    spawner.player_in_range(p[0] - center[0], p[1] - center[1], p[2] - center[2])
+                });
+                if !armed || !spawner.delay_tick() {
+                    continue;
+                }
+                let range = f64::from(spawner.spawn_range);
+                let kind = entity_spec_by_name(&spawner.entity_id)
+                    .filter(|spec| spec.max_health > 0.0)
+                    .map(|spec| spec.id);
+                let existing = live_mobs.iter().filter(|(id, at)| {
+                    Some(*id) == kind &&
+                        (0..3).all(|i| (at[i] - center[i]).abs() <= range)
+                }).count();
+                let mut admitted = existing;
+                let spawn_count = if kind.is_some() { spawner.spawn_count } else { 0 };
+                for _ in 0..spawn_count {
+                    if admitted >= usize::from(spawner.max_nearby_entities) {
+                        break;
+                    }
+                    let offset = |rng: &mut WorldMechanismLcg| {
+                        let a = f64::from(rng.next_bits(24)) / f64::from(1 << 24);
+                        let b = f64::from(rng.next_bits(24)) / f64::from(1 << 24);
+                        (a - b) * range
+                    };
+                    let location = [
+                        center[0] + offset(&mut rng),
+                        f64::from(y) + f64::from(rng.next_int(3)) - 1.0,
+                        center[2] + offset(&mut rng),
+                    ];
+                    events.push(WorldBlockEntityEvent::Spawn {
+                        pos,
+                        entity_id: spawner.entity_id.clone(),
+                        location,
+                    });
+                    admitted += 1;
+                }
+                let random = rng.next_bits(24) as f32 / (1 << 24) as f32;
+                spawner.reset_delay(random);
+            }
+            VanillaBlockEntity::Jukebox(jukebox) => {
+                if jukebox.record_item.is_some() {
+                    jukebox.ticks_since_song_started = jukebox.ticks_since_song_started.saturating_add(1);
+                }
+            }
+            VanillaBlockEntity::Beacon(beacon) if world_tick.is_multiple_of(80) => {
+                let Some(reg) = reg else { continue };
+                beacon.levels = beacon_pyramid_levels(|dx, dy, dz| {
+                    let state = block_at_dim(dim, x + dx, y + dy, z + dz);
+                    matches!(reg.name_of(state),
+                        "minecraft:iron_block" | "minecraft:gold_block" |
+                        "minecraft:diamond_block" | "minecraft:emerald_block" |
+                        "minecraft:netherite_block")
+                });
+                if beacon.levels == 0 || beacon.primary_effect.is_none() {
+                    continue;
+                }
+                let clear = (y + 1..dim.min_y() + dim.height()).all(|above| {
+                    let state = block_at_dim(dim, x, above, z);
+                    reg.opacity_of(state) < 15 || reg.name_of(state) == "minecraft:bedrock"
+                });
+                if !clear { continue; }
+                let (primary, secondary) = beacon.active_effects();
+                let radius_sq = f64::from(beacon.effect_range()).powi(2);
+                for (player, at) in nearby_players.iter().enumerate() {
+                    let distance_sq = (at[0] - f64::from(x) - 0.5).powi(2)
+                        + (at[1] - f64::from(y) - 0.5).powi(2)
+                        + (at[2] - f64::from(z) - 0.5).powi(2);
+                    if distance_sq > radius_sq { continue; }
+                    if let Some(effect) = &primary {
+                        events.push(WorldBlockEntityEvent::BeaconEffect {
+                            pos, player, effect: effect.clone(),
+                            amplifier: u8::from(secondary.as_ref() == Some(effect)),
+                            duration_ticks: beacon.effect_duration_ticks(),
+                        });
+                    }
+                    if let Some(effect) = &secondary {
+                        if primary.as_ref() != Some(effect) {
+                            events.push(WorldBlockEntityEvent::BeaconEffect {
+                                pos, player, effect: effect.clone(), amplifier: 0,
+                                duration_ticks: beacon.effect_duration_ticks(),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    events
+}
+
+#[cfg(test)]
+mod w_be_integration_tests {
+    use super::*;
+
+    fn place(dim: DimId, pos: BlockPos, entity: VanillaBlockEntity) {
+        assert!(register_world_block_entity(dim, pos, entity).is_none());
+    }
+
+    fn remove(dim: DimId, pos: BlockPos) -> VanillaBlockEntity {
+        remove_world_block_entity(dim, pos).expect("block entity registered")
+    }
+
+    #[test]
+    fn w_be_registry_dimensions_and_all_nine_comparator_families() {
+        let pos = (23401, 220, 23401);
+        place(DimId::Overworld, pos, VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
+            record_item: Some("minecraft:music_disc_cat".into()),
+            ..Default::default()
+        }));
+        place(DimId::Nether, pos, VanillaBlockEntity::MobSpawner(MobSpawnerBlockEntity::default()));
+        assert_eq!(comparator_signal_at_be(DimId::Overworld, pos), Some(2));
+        assert_eq!(comparator_signal_at_be(DimId::Nether, pos), Some(0));
+        assert_eq!(comparator_signal_at_be(DimId::End, pos), None);
+        assert!(matches!(remove(DimId::Overworld, pos), VanillaBlockEntity::Jukebox(_)));
+        assert!(matches!(remove(DimId::Nether, pos), VanillaBlockEntity::MobSpawner(_)));
+
+        let dim = DimId::End;
+        let cases = [
+            VanillaBlockEntity::BrewingStand(BrewingStand::default()),
+            VanillaBlockEntity::Crafter(CrafterBlockEntity::default()),
+            VanillaBlockEntity::Campfire(CampfireBlockEntity::default()),
+            VanillaBlockEntity::Lectern(LecternBlockEntity::default()),
+            VanillaBlockEntity::ChiseledBookshelf(ChiseledBookshelfBlockEntity::default()),
+            VanillaBlockEntity::DecoratedPot(DecoratedPotBlockEntity::default()),
+            VanillaBlockEntity::Beacon(BeaconBlockEntity::default()),
+        ];
+        for (i, entity) in cases.into_iter().enumerate() {
+            let at = (pos.0 + i as i32 + 1, pos.1, pos.2);
+            place(dim, at, entity);
+            assert_eq!(comparator_signal_at_be(dim, at), Some(0));
+            remove(dim, at);
+            assert_eq!(comparator_signal_at_be(dim, at), None);
+        }
+    }
+
+    #[test]
+    fn w_be_campfire_cooks_four_slots_at_600_ticks_and_clears() {
+        let dim = DimId::Overworld;
+        let pos = (23420, 220, 23420);
+        let reg = breg().expect("block registry");
+        let campfire = reg.state_of("minecraft:campfire", None);
+        set_block_dim(dim, pos.0, pos.1, pos.2, reg.with_prop(campfire, "lit", "true"));
+        let mut fire = CampfireBlockEntity::default();
+        for item in ["beef", "chicken", "potato", "salmon"] {
+            assert!(fire.place(item, 600).is_some());
+        }
+        place(dim, pos, VanillaBlockEntity::Campfire(fire));
+        for tick in 0..599 {
+            assert!(tick_world_block_entities(dim, tick, &[], 17).is_empty());
+        }
+        let events = tick_world_block_entities(dim, 599, &[], 17);
+        assert_eq!(events, [
+            WorldBlockEntityEvent::Cooked { pos, slot: 0, item: "minecraft:cooked_beef".into() },
+            WorldBlockEntityEvent::Cooked { pos, slot: 1, item: "minecraft:cooked_chicken".into() },
+            WorldBlockEntityEvent::Cooked { pos, slot: 2, item: "minecraft:baked_potato".into() },
+            WorldBlockEntityEvent::Cooked { pos, slot: 3, item: "minecraft:cooked_salmon".into() },
+        ]);
+        let VanillaBlockEntity::Campfire(fire) = remove(dim, pos) else { panic!("campfire") };
+        assert!(fire.slots.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn w_be_campfire_keeps_unsupported_saved_input() {
+        let dim = DimId::Overworld;
+        let pos = (23425, 220, 23425);
+        let reg = breg().expect("block registry");
+        let campfire = reg.state_of("minecraft:campfire", None);
+        set_block_dim(dim, pos.0, pos.1, pos.2, reg.with_prop(campfire, "lit", "true"));
+        let mut fire = CampfireBlockEntity::default();
+        fire.place("minecraft:diamond", 1).expect("free slot");
+        place(dim, pos, VanillaBlockEntity::Campfire(fire));
+        assert!(tick_world_block_entities(dim, 0, &[], 17).is_empty());
+        let VanillaBlockEntity::Campfire(fire) = remove(dim, pos) else { panic!("campfire") };
+        assert_eq!(fire.slots[0], Some(("minecraft:diamond".into(), 0, 1)));
+    }
+
+    #[test]
+    fn w_be_brewing_consumes_blaze_fuel_and_finishes_400_ticks() {
+        let dim = DimId::Nether;
+        let pos = (23430, 220, 23430);
+        let stand = BrewingStand {
+            bottles: [Some(BrewingPotion { kind: PotionKind::Water, form: PotionForm::Drinkable }); 3],
+            ingredient: Some((BrewingIngredient::NetherWart, 2)),
+            blaze_powder: 1,
+            ..Default::default()
+        };
+        place(dim, pos, VanillaBlockEntity::BrewingStand(stand));
+        assert!(tick_world_block_entities(dim, 0, &[], 123).is_empty());
+        assert!(comparator_signal_at_be(dim, pos).is_some_and(|s| s > 0));
+        for tick in 1..400 {
+            assert!(tick_world_block_entities(dim, tick, &[], 123).is_empty());
+        }
+        assert_eq!(tick_world_block_entities(dim, 400, &[], 123), [
+            WorldBlockEntityEvent::Brewed { pos, ejected_glass_bottle: false }
+        ]);
+        let VanillaBlockEntity::BrewingStand(stand) = remove(dim, pos) else { panic!("stand") };
+        assert_eq!(stand.brew_time, 0);
+        assert_eq!(stand.fuel, 19);
+        assert_eq!(stand.blaze_powder, 0);
+        assert_eq!(stand.ingredient, Some((BrewingIngredient::NetherWart, 1)));
+        assert!(stand.bottles.iter().all(|p| p.is_some_and(|p| p.kind == PotionKind::Awkward)));
+    }
+
+    #[test]
+    fn w_be_spawner_respects_player_radius_delay_cap_and_determinism() {
+        let dim = DimId::End;
+        let pos = (23440, 220, 23440);
+        let spawner = MobSpawnerBlockEntity {
+            entity_id: "minecraft:zombie".into(),
+            delay: 2,
+            min_spawn_delay: 5,
+            max_spawn_delay: 10,
+            spawn_count: 4,
+            max_nearby_entities: 2,
+            ..Default::default()
+        };
+        let far = [[f64::from(pos.0) + 17.0, 220.5, f64::from(pos.2) + 0.5]];
+        let near = [[f64::from(pos.0) + 0.5, 220.5, f64::from(pos.2) + 0.5]];
+        place(dim, pos, VanillaBlockEntity::MobSpawner(spawner.clone()));
+        assert!(tick_world_block_entities(dim, 0, &far, 33).is_empty());
+        assert!(tick_world_block_entities(dim, 1, &near, 33).is_empty());
+        assert!(tick_world_block_entities(dim, 2, &near, 33).is_empty());
+        let events = tick_world_block_entities(dim, 3, &near, 33);
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            let WorldBlockEntityEvent::Spawn { pos: origin, entity_id, location } = event else { panic!("spawn") };
+            assert_eq!(*origin, pos);
+            assert_eq!(entity_id, "minecraft:zombie");
+            assert!((location[0] - f64::from(pos.0) - 0.5).abs() <= 4.0);
+            assert!((location[2] - f64::from(pos.2) - 0.5).abs() <= 4.0);
+        }
+        let VanillaBlockEntity::MobSpawner(spawner_after) = remove(dim, pos) else { panic!("spawner") };
+        assert!((5..=10).contains(&spawner_after.delay));
+        place(dim, pos, VanillaBlockEntity::MobSpawner(MobSpawnerBlockEntity { delay: 0, ..spawner }));
+        assert_eq!(tick_world_block_entities(dim, 3, &near, 33), events);
+        remove(dim, pos);
+    }
+
+    #[test]
+    fn w_be_spawner_unknown_entity_does_not_emit_invalid_spawn() {
+        let dim = DimId::End;
+        let pos = (23445, 220, 23445);
+        place(dim, pos, VanillaBlockEntity::MobSpawner(MobSpawnerBlockEntity {
+            entity_id: "minecraft:not_a_real_mob".into(),
+            delay: 0,
+            min_spawn_delay: 7,
+            max_spawn_delay: 8,
+            ..Default::default()
+        }));
+        let nearby = [[23445.5, 220.5, 23445.5]];
+        assert!(tick_world_block_entities(dim, 0, &nearby, 0).is_empty());
+        let VanillaBlockEntity::MobSpawner(spawner) = remove(dim, pos) else { panic!("spawner") };
+        assert_eq!(spawner.delay, 7);
+    }
+
+    #[test]
+    fn w_be_beacon_pyramid_effect_every_80_ticks_and_radius() {
+        let dim = DimId::Overworld;
+        let pos = (23450, 220, 23450);
+        let reg = breg().expect("block registry");
+        let iron = reg.state_of("minecraft:iron_block", None);
+        for x in -1..=1 {
+            for z in -1..=1 {
+                set_block_dim(dim, pos.0 + x, pos.1 - 1, pos.2 + z, iron);
+            }
+        }
+        place(dim, pos, VanillaBlockEntity::Beacon(BeaconBlockEntity {
+            primary_effect: Some("minecraft:haste".into()),
+            ..Default::default()
+        }));
+        let players = [
+            [f64::from(pos.0) + 0.5, 220.5, f64::from(pos.2) + 0.5],
+            [f64::from(pos.0) + 30.5, 220.5, f64::from(pos.2) + 0.5],
+        ];
+        let events = tick_world_block_entities(dim, 80, &players, 123);
+        assert_eq!(events, [WorldBlockEntityEvent::BeaconEffect {
+            pos, player: 0, effect: "minecraft:haste".into(), amplifier: 0, duration_ticks: 220,
+        }]);
+        assert!(tick_world_block_entities(dim, 81, &players, 123).is_empty());
+        let VanillaBlockEntity::Beacon(beacon) = remove(dim, pos) else { panic!("beacon") };
+        assert_eq!(beacon.levels, 1);
+    }
+
+    #[test]
+    fn w_be_jukebox_ticks_and_comparator_output() {
+        let dim = DimId::End;
+        let pos = (23460, 220, 23460);
+        place(dim, pos, VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
+            record_item: Some("minecraft:music_disc_5".into()),
+            ..Default::default()
+        }));
+        for tick in 1..=8 {
+            assert!(tick_world_block_entities(dim, tick, &[], 0).is_empty());
+        }
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(15));
+        let VanillaBlockEntity::Jukebox(jukebox) = remove(dim, pos) else { panic!("jukebox") };
+        assert_eq!(jukebox.ticks_since_song_started, 8);
+    }
+
+    #[test]
+    fn w_be_lectern_pages_and_book_insertion_removal() {
+        let dim = DimId::End;
+        let pos = (23470, 220, 23470);
+        place(dim, pos, VanillaBlockEntity::Lectern(LecternBlockEntity {
+            book_item: Some("minecraft:written_book".into()),
+            page: 0, total_pages: 5,
+        }));
+        assert_eq!(interact_world_block_entity(dim, pos, None, Some(3)), Some(WorldBlockEntityInteraction::Changed));
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(11));
+        assert_eq!(interact_world_block_entity(dim, pos, None, None), Some(WorldBlockEntityInteraction::ReturnedItem("minecraft:written_book".into())));
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(0));
+        assert_eq!(interact_world_block_entity(dim, pos, Some("minecraft:writable_book"), None), Some(WorldBlockEntityInteraction::Changed));
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(15));
+        remove(dim, pos);
+    }
+
+    #[test]
+    fn w_be_bookshelf_slot_bounds_and_last_interacted_comparator() {
+        let dim = DimId::End;
+        let pos = (23480, 220, 23480);
+        place(dim, pos, VanillaBlockEntity::ChiseledBookshelf(ChiseledBookshelfBlockEntity::default()));
+        assert_eq!(interact_world_block_entity(dim, pos, Some("minecraft:book"), Some(6)), None);
+        assert_eq!(interact_world_block_entity(dim, pos, Some("minecraft:enchanted_book"), Some(5)), Some(WorldBlockEntityInteraction::Changed));
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(6));
+        assert_eq!(interact_world_block_entity(dim, pos, None, Some(5)), Some(WorldBlockEntityInteraction::ReturnedItem("enchanted_book".into())));
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(6));
+        assert_eq!(interact_world_block_entity(dim, pos, None, Some(5)), None);
+        remove(dim, pos);
+    }
+
+    #[test]
+    fn w_be_pot_insert_extract_respects_stack_capacity() {
+        let dim = DimId::Nether;
+        let pos = (23490, 220, 23490);
+        place(dim, pos, VanillaBlockEntity::DecoratedPot(DecoratedPotBlockEntity::default()));
+        assert_eq!(interact_world_block_entity(dim, pos, Some("minecraft:stone"), None), Some(WorldBlockEntityInteraction::Changed));
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(1));
+        assert_eq!(interact_world_block_entity(dim, pos, Some("minecraft:dirt"), None), None);
+        for _ in 1..64 {
+            assert_eq!(interact_world_block_entity(dim, pos, Some("minecraft:stone"), None), Some(WorldBlockEntityInteraction::Changed));
+        }
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(15));
+        assert_eq!(interact_world_block_entity(dim, pos, Some("minecraft:stone"), None), None);
+        assert_eq!(interact_world_block_entity(dim, pos, None, None), Some(WorldBlockEntityInteraction::ReturnedItem("minecraft:stone".into())));
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(14));
+        remove(dim, pos);
+    }
+
+    #[test]
+    fn w_be_crafter_slot_toggle_and_rising_edge_pulse() {
+        let dim = DimId::End;
+        let pos = (23500, 220, 23500);
+        place(dim, pos, VanillaBlockEntity::Crafter(CrafterBlockEntity::default()));
+        assert_eq!(interact_world_block_entity(dim, pos, None, Some(9)), None);
+        assert_eq!(interact_world_block_entity(dim, pos, None, Some(0)), Some(WorldBlockEntityInteraction::Changed));
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(1));
+        assert_eq!(interact_world_block_entity(dim, pos, None, Some(0)), Some(WorldBlockEntityInteraction::Changed));
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(0));
+        assert_eq!(interact_world_block_entity(dim, pos, Some("powered"), None), Some(WorldBlockEntityInteraction::CrafterPulse));
+        assert_eq!(interact_world_block_entity(dim, pos, Some("powered"), None), None);
+        assert_eq!(interact_world_block_entity(dim, pos, Some("unpowered"), None), Some(WorldBlockEntityInteraction::Changed));
+        assert_eq!(interact_world_block_entity(dim, pos, Some("powered"), None), Some(WorldBlockEntityInteraction::CrafterPulse));
+        remove(dim, pos);
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn eval_random_ticks(
     sections: &[RandomTickSection],

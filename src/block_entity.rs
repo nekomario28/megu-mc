@@ -949,6 +949,36 @@ impl MobSpawnerBlockEntity {
     }
 }
 
+// Live world-mechanism ownership. All nine families share the same dimension
+// key, including the brewing stand's component-aware potion representation.
+// Accessors recover poisoned mutexes at each call site.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) enum VanillaBlockEntity {
+    BrewingStand(BrewingStand),
+    Crafter(CrafterBlockEntity),
+    Campfire(CampfireBlockEntity),
+    Jukebox(JukeboxBlockEntity),
+    MobSpawner(MobSpawnerBlockEntity),
+    Lectern(LecternBlockEntity),
+    ChiseledBookshelf(ChiseledBookshelfBlockEntity),
+    DecoratedPot(DecoratedPotBlockEntity),
+    Beacon(BeaconBlockEntity),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+type WorldBlockEntityRegistry = std::sync::Mutex<
+    std::collections::HashMap<(DimId, i32, i32, i32), VanillaBlockEntity>,
+>;
+
+static WORLD_BLOCK_ENTITY_REGISTRY: std::sync::OnceLock<WorldBlockEntityRegistry> =
+    std::sync::OnceLock::new();
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn world_block_entity_registry() -> &'static WorldBlockEntityRegistry {
+    WORLD_BLOCK_ENTITY_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 #[cfg(test)]
 mod p5e_parity_block_entity_tests {
     use super::*;
