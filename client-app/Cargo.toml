@@ -1,0 +1,24 @@
+[package]
+name = "mc-spine-client"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+description = "Standalone native Minecraft 1.21.1 (Protocol 767) client executable for mc-spine"
+publish = false
+
+[lib]
+name = "mc_spine_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mc-spine-client"
+path = "src/main.rs"
+
+[dependencies]
+mc_spine_kernel = { package = "mc-spine-kernel", path = "../client-kernel" }
+mc_spine_client_mesh = { package = "mc-spine-client-mesh", path = "../client-port" }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
