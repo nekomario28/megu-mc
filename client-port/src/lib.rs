@@ -8,6 +8,7 @@ mod column;
 mod cull;
 mod culler;
 pub mod ffi;
+pub mod gpu_pipeline;
 mod lod;
 mod mesh;
 mod packed;
@@ -21,6 +22,15 @@ mod tests;
 pub use cache::{MeshCache, SectionCoord, DEFAULT_RESORT_THRESHOLD};
 pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
 pub use culler::{through_bit, CullResult, GraphCuller, SectionGraph, THROUGH_ALL};
+pub use gpu_pipeline::{
+    cull_meshlets_cpu_reference, pack_axis_flags, pack_section_meshlets, resolve_render_backend,
+    ActiveRenderBackend, BackendResolution, DrawIndexedIndirectCommand, GpuCapabilities, GpuVendor,
+    KineticFrameUpload, KineticInstanceGpu, KineticInstancePool, MeshKindTemplate,
+    MeshletDescriptor, RenderBackendPreference, SectionMeshlets, SubWorldTransformGpu,
+    KINETIC_AXIS_MASK, KINETIC_FLAG_OVERSTRESSED, KINETIC_FLAG_REVERSED, KINETIC_SUBWORLD_MAX,
+    KINETIC_SUBWORLD_SHIFT, MAX_QUADS_PER_MESHLET, REQUIRED_MESH_OUTPUT_PRIMITIVES,
+    REQUIRED_MESH_OUTPUT_VERTICES,
+};
 pub use lod::{summarize_column, LodCell, LodSummary, LOD_COARSE, LOD_FINE};
 pub use mesh::{
     bucket_draw_mask, mesh_section, DirectionBuckets, Layer, Quad, DIRECTION_BUCKETS,
