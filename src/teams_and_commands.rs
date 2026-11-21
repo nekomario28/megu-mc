@@ -315,6 +315,11 @@ impl<'a> P3bReader<'a> {
         self.p += 1;
         Some(b)
     }
+    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let body = self.data.get(self.p..self.p.checked_add(n)?)?;
+        self.p += n;
+        Some(body)
+    }
     fn varint(&mut self) -> Option<i64> {
         let mut v = 0i64;
         for i in 0..5 {
@@ -5232,6 +5237,669 @@ fn run_attribute_command(args: &[&str], me: Option<&Arc<Client>>) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lane VANILLA-CMDBLK — vanilla 1.21.1 command blocks + command minecarts.
+//
+// Security contract (hard invariants):
+//   * editing a command block/minecart requires OP level >= 2 AND creative
+//     mode (gamemode == 1) with the enable-command-block toggle on — refused
+//     fail-closed otherwise;
+//   * every command runs through `run_command_ctx_level` pinned at exactly OP
+//     level 2, never the console's 4, and the `COMMAND_BLOCK_ROOT_DENY` roots
+//     are refused outright so a block can never stop/op/ban/transfer/profile
+//     the server no matter how the shared level table evolves.
+// ---------------------------------------------------------------------------
+
+/// `minecraft:command_block`/`repeating`/`chain` — the wire enum order of the
+/// 767 `set_command_block` mode VarInt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum CommandBlockMode {
+    /// Chain command block: runs immediately when the block facing into it
+    /// executed (and its own `powered || automatic` holds).
+    Sequence,
+    /// Repeating command block: runs every tick while powered or always-active.
+    Auto,
+    /// Impulse command block: runs once on the rising edge of
+    /// `powered || automatic`.
+    Redstone,
+}
+
+/// `minecraft:command_block[facing=*]` — the direction a finished block
+/// triggers next; also where the comparator-side of the block reads from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum CommandBlockFacing {
+    Down,
+    Up,
+    North,
+    South,
+    West,
+    East,
+}
+
+impl CommandBlockFacing {
+    #[allow(dead_code)]
+    fn delta(self) -> (i32, i32, i32) {
+        match self {
+            CommandBlockFacing::Down => (0, -1, 0),
+            CommandBlockFacing::Up => (0, 1, 0),
+            CommandBlockFacing::North => (0, 0, -1),
+            CommandBlockFacing::South => (0, 0, 1),
+            CommandBlockFacing::West => (-1, 0, 0),
+            CommandBlockFacing::East => (1, 0, 0),
+        }
+    }
+}
+
+/// One placed command block — the fields the `set_command_block` packet writes
+/// plus the runtime state vanilla keeps on the block entity.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CommandBlockRecord {
+    dim: DimId,
+    pos: (i32, i32, i32),
+    mode: CommandBlockMode,
+    facing: CommandBlockFacing,
+    command: String,
+    /// Wire `trackOutput` — whether `last_output` is refreshed per run.
+    track_output: bool,
+    last_output: String,
+    /// Conditional chain blocks run only when the block facing into them left
+    /// `success_count > 0`.
+    conditional: bool,
+    /// Vanilla `auto` flag ("Always Active"): no redstone power needed.
+    automatic: bool,
+    /// Set by the redstone layer; combined with `automatic` for the
+    /// edge/run checks.
+    powered: bool,
+    last_powered: bool,
+    /// Vanilla `successCount`: `1` when the last run did not produce an error
+    /// reply, `0` otherwise; drives conditionals and the comparator signal.
+    success_count: i32,
+    /// Whether the conditional check passed at the last trigger.
+    condition_met: bool,
+    /// Vanilla `updateLastExecution` record flag. No wall-clock execution
+    /// timestamp is kept; here it instead gates the `last_powered`
+    /// edge-bookkeeping refresh — clearing it freezes the recorded power edge
+    /// (the vanilla side effect of not updating the execution record).
+    update_last_execution: bool,
+}
+
+#[allow(dead_code)]
+impl CommandBlockRecord {
+    fn new(dim: DimId, pos: (i32, i32, i32)) -> Self {
+        CommandBlockRecord {
+            dim,
+            pos,
+            mode: CommandBlockMode::Redstone,
+            facing: CommandBlockFacing::Up,
+            command: String::new(),
+            track_output: false,
+            last_output: String::new(),
+            conditional: false,
+            automatic: false,
+            powered: false,
+            last_powered: false,
+            success_count: 0,
+            condition_met: false,
+            update_last_execution: true,
+        }
+    }
+}
+
+/// One `minecraft:command_block_minecart` — its command runs at OP level 2
+/// every 4 ticks while the cart sits on a powered activator rail.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CommandMinecartRecord {
+    entity_id: i32,
+    dim: DimId,
+    x: f64,
+    y: f64,
+    z: f64,
+    command: String,
+    track_output: bool,
+    last_output: String,
+    success_count: i32,
+    /// Set by the activator-rail logic; execution cadence is counted only
+    /// while this holds.
+    activated: bool,
+    powered_ticks: u32,
+}
+
+/// Every live command block, keyed `(dim, x, y, z)`.
+#[allow(dead_code)]
+fn live_command_blocks(
+) -> &'static Mutex<HashMap<(DimId, i32, i32, i32), CommandBlockRecord>> {
+    static BLOCKS: OnceLock<
+        Mutex<HashMap<(DimId, i32, i32, i32), CommandBlockRecord>>,
+    > = OnceLock::new();
+    BLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Every live command minecart, keyed entity id.
+#[allow(dead_code)]
+fn command_minecarts() -> &'static Mutex<HashMap<i32, CommandMinecartRecord>> {
+    static CARTS: OnceLock<Mutex<HashMap<i32, CommandMinecartRecord>>> =
+        OnceLock::new();
+    CARTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `enable-command-block` policy: `MC_SPINE_ENABLE_COMMAND_BLOCK` in the
+/// environment (server policy may layer the same switch). Anything but an
+/// explicit false-y value keeps the vanilla default `true`.
+#[allow(dead_code)]
+fn command_blocks_enabled() -> bool {
+    std::env::var("MC_SPINE_ENABLE_COMMAND_BLOCK")
+        .map(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
+/// The permission level every command block and command minecart executes
+/// under — vanilla pins these sources at level 2, never higher.
+const COMMAND_BLOCK_OP_LEVEL: u8 = 2;
+
+/// Root literals a command block is never allowed to run even if the shared
+/// `required_permission_level` table would (today or after an edit) rate them
+/// at level 2. `transfer`/`profile` are exactly such roots today; the rest of
+/// the spec'd refuse-list is already refused by the level-2 gate and is kept
+/// here as defence in depth.
+const COMMAND_BLOCK_ROOT_DENY: &[&str] = &[
+    "stop", "op", "deop", "ban", "ban-ip", "banlist", "pardon", "pardon-ip",
+    "kick", "whitelist", "setidletimeout", "tick", "save", "save-all",
+    "save-on", "save-off", "reload", "debug", "jfr", "perf", "publish",
+    "transfer", "profile", "megu",
+];
+
+/// Whether `root` may run from a command block source: the level-2 gate plus
+/// the explicit root deny-list. The dispatcher's own permission check still
+/// applies on top — this is the extra invariant, not a replacement.
+#[allow(dead_code)]
+fn command_block_source_allowed(root: &str) -> bool {
+    command_allowed_for_source(root, COMMAND_BLOCK_OP_LEVEL)
+        && !COMMAND_BLOCK_ROOT_DENY.contains(&root)
+}
+
+/// Longest command string the `set_command_block` / `set_command_minecart`
+/// decoders accept — below vanilla's hard `MAX_COMMAND_LENGTH` of 32767 and
+/// well inside any surrounding packet bound.
+const COMMAND_BLOCK_COMMAND_MAX: usize = 32_500;
+
+/// Execute `command` from a command source at `(x, y, z)` in `dim` — shared
+/// by command blocks (block-centre position) and command minecarts (cart
+/// position). Returns `(success_count, reply)`.
+#[allow(dead_code)]
+fn command_source_run(
+    _dim: DimId,
+    x: f64,
+    y: f64,
+    z: f64,
+    command: &str,
+) -> (i32, String) {
+    let trimmed = command.trim();
+    let root = trimmed
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    let reply = if trimmed.is_empty() {
+        String::new()
+    } else if !command_block_source_allowed(root) {
+        "You do not have permission to run that command".to_owned()
+    } else {
+        let ctx = CmdCtx {
+            me: None,
+            x,
+            y,
+            z,
+        };
+        run_command_ctx_level(
+            &ctx,
+            &format!("/{}", trimmed.trim_start_matches('/')),
+            &mut None,
+            Some(COMMAND_BLOCK_OP_LEVEL),
+        )
+    };
+    let success = if trimmed.is_empty() || command_reply_is_error(&reply) {
+        0
+    } else {
+        1
+    };
+    (success, reply)
+}
+
+/// Run the record at `cursor` once and propagate the chain trigger along
+/// `facing` — the shared tail of the impulse/repeating tick and of each chain
+/// step. `budget` (`maxCommandChainLength`) is consumed per *chain-block
+/// execution* only, exactly bounding execution cycles. `consecutive_skips`
+/// bounds the walk itself: while no block runs, `success_count` state is
+/// frozen, so skipping more distinct blocks than exist can only repeat
+/// already-skipped nodes forever — a guaranteed non-executing cycle.
+#[allow(dead_code)]
+fn command_block_execute_trigger(
+    trigger: (DimId, i32, i32, i32),
+    budget: &mut u32,
+) {
+    let block_total = live_command_blocks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    let mut cursor = trigger;
+    let mut prev_success = 0i32;
+    let mut consecutive_skips = 0usize;
+    let mut first = true;
+    loop {
+        if !first && consecutive_skips > block_total {
+            break;
+        }
+        let step = {
+            let mut map = live_command_blocks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(rec) = map.get_mut(&cursor) else {
+                break;
+            };
+            if !first {
+                if rec.mode != CommandBlockMode::Sequence {
+                    break;
+                }
+                let powered = rec.powered || rec.automatic;
+                let cond_ok = !rec.conditional || prev_success > 0;
+                rec.condition_met = powered && cond_ok;
+                // Vanilla propagates the trigger through chain blocks that do
+                // not run (unpowered, or a failed condition) — the next
+                // block then sees this block's *stored* success count.
+                prev_success = rec.success_count;
+                if !powered || !cond_ok {
+                    consecutive_skips += 1;
+                    cursor = (
+                        cursor.0,
+                        cursor.1 + rec.facing.delta().0,
+                        cursor.2 + rec.facing.delta().1,
+                        cursor.3 + rec.facing.delta().2,
+                    );
+                    continue;
+                }
+                if *budget == 0 {
+                    // `maxCommandChainLength` exhausted — the chain stops
+                    // cleanly, cutting any execution cycle.
+                    break;
+                }
+                *budget -= 1;
+            }
+            (
+                rec.command.clone(),
+                rec.track_output,
+                rec.facing,
+            )
+        };
+        let (dim, x, y, z) = cursor;
+        let (success, reply) = command_source_run(
+            dim,
+            x as f64 + 0.5,
+            y as f64 + 0.5,
+            z as f64 + 0.5,
+            &step.0,
+        );
+        {
+            let mut map = live_command_blocks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(rec) = map.get_mut(&cursor) {
+                rec.success_count = success;
+                rec.last_output = if step.1 { reply } else { String::new() };
+            }
+        }
+        consecutive_skips = 0;
+        prev_success = success;
+        let (dx, dy, dz) = step.2.delta();
+        cursor = (dim, x + dx, y + dy, z + dz);
+        first = false;
+    }
+}
+
+/// One server tick of the command-block engine: impulse blocks fire on the
+/// rising edge of `powered || automatic`, repeating blocks every tick while
+/// it holds; chain blocks never fire here — they only propagate off a block
+/// that just ran.
+#[allow(dead_code)]
+fn command_block_tick() {
+    if !command_blocks_enabled() {
+        return;
+    }
+    let triggers: Vec<(DimId, i32, i32, i32)> = {
+        let mut map = live_command_blocks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.iter_mut()
+            .filter_map(|(key, rec)| {
+                let active = rec.powered || rec.automatic;
+                let rising = active && !rec.last_powered;
+                if rec.update_last_execution {
+                    rec.last_powered = active;
+                }
+                match rec.mode {
+                    CommandBlockMode::Auto => active.then_some(*key),
+                    CommandBlockMode::Redstone => rising.then_some(*key),
+                    CommandBlockMode::Sequence => None,
+                }
+            })
+            .collect()
+    };
+    for trigger in triggers {
+        let mut budget = gr_max_command_chain_length();
+        command_block_execute_trigger(trigger, &mut budget);
+    }
+}
+
+/// The comparator read-out vanilla exposes from a command block's
+/// `successCount` (clamped to the 0..15 signal range).
+#[allow(dead_code)]
+fn command_block_comparator_signal(dim: DimId, pos: (i32, i32, i32)) -> u8 {
+    live_command_blocks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(dim, pos.0, pos.1, pos.2))
+        .map_or(0, |rec| rec.success_count.clamp(0, 15) as u8)
+}
+
+/// Insert or update a live command block record (world layer's place/edit
+/// path) — replaces the whole record except `dim`/`pos` which key it.
+#[allow(dead_code)]
+fn upsert_command_block(rec: CommandBlockRecord) {
+    live_command_blocks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((rec.dim, rec.pos.0, rec.pos.1, rec.pos.2), rec);
+}
+
+/// Set the externally-powered flag the tick's edge detection reads.
+#[allow(dead_code)]
+fn set_command_block_powered(dim: DimId, pos: (i32, i32, i32), powered: bool) {
+    if let Some(rec) = live_command_blocks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&(dim, pos.0, pos.1, pos.2))
+    {
+        rec.powered = powered;
+    }
+}
+
+/// Drop the record when the world block is broken.
+#[allow(dead_code)]
+fn remove_command_block(
+    dim: DimId,
+    pos: (i32, i32, i32),
+) -> Option<CommandBlockRecord> {
+    live_command_blocks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(dim, pos.0, pos.1, pos.2))
+}
+
+/// Register a live command minecart (spawn or `set_command_minecart` edit).
+#[allow(dead_code)]
+fn upsert_command_minecart(rec: CommandMinecartRecord) {
+    command_minecarts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(rec.entity_id, rec);
+}
+
+/// The activator-rail signal: powered rail -> `activated = true`.
+#[allow(dead_code)]
+fn set_command_minecart_activated(entity_id: i32, activated: bool) {
+    if let Some(rec) = command_minecarts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&entity_id)
+    {
+        if !activated {
+            rec.powered_ticks = 0;
+        }
+        rec.activated = activated;
+    }
+}
+
+/// Drop the minecart record when the entity dies.
+#[allow(dead_code)]
+fn remove_command_minecart(entity_id: i32) -> Option<CommandMinecartRecord> {
+    command_minecarts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&entity_id)
+}
+
+/// One server tick of the command-minecart engine: an activated cart runs its
+/// command every 4 ticks (vanilla's `tickCount % 4 == 0` cadence) at OP level
+/// 2, positioned at the cart.
+#[allow(dead_code)]
+fn command_minecart_tick() {
+    if !command_blocks_enabled() {
+        return;
+    }
+    let due: Vec<i32> = {
+        let mut carts = command_minecarts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        carts
+            .iter_mut()
+            .filter_map(|(id, rec)| {
+                if !rec.activated {
+                    return None;
+                }
+                let run = rec.powered_ticks % 4 == 0;
+                rec.powered_ticks = rec.powered_ticks.saturating_add(1);
+                run.then_some(*id)
+            })
+            .collect()
+    };
+    for entity_id in due {
+        let snapshot = {
+            let carts = command_minecarts()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            carts.get(&entity_id).map(|rec| {
+                (rec.dim, rec.x, rec.y, rec.z, rec.command.clone(), rec.track_output)
+            })
+        };
+        let Some((dim, x, y, z, command, track_output)) = snapshot else {
+            continue;
+        };
+        let (success, reply) = command_source_run(dim, x, y, z, &command);
+        if let Some(rec) = command_minecarts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&entity_id)
+        {
+            rec.success_count = success;
+            rec.last_output = if track_output { reply } else { String::new() };
+        }
+    }
+}
+
+/// 767 `set_command_block` (C2S 0x30) decoded: packed BlockPos, command
+/// string, mode VarInt, flags byte — exactly the vanilla field order.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+struct SetCommandBlockUpdate {
+    pos: (i32, i32, i32),
+    command: String,
+    mode: CommandBlockMode,
+    track_output: bool,
+    conditional: bool,
+    automatic: bool,
+}
+
+/// 767 `set_command_minecart` (C2S 0x31) decoded: entity VarInt, command
+/// string, track-output bool.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+struct SetCommandMinecartUpdate {
+    entity_id: i32,
+    command: String,
+    track_output: bool,
+}
+
+/// Vanilla `FriendlyByteBuf.readUtf`-style string for the two command-block
+/// packets — VarInt length, hard cap, strict UTF-8, fail closed.
+#[allow(dead_code)]
+fn command_block_wire_string(r: &mut P3bReader<'_>) -> Option<String> {
+    let len = r.varint()?;
+    if !(0..=COMMAND_BLOCK_COMMAND_MAX as i64).contains(&len) {
+        return None;
+    }
+    let body = r.bytes(len as usize)?;
+    std::str::from_utf8(body).ok().map(str::to_owned)
+}
+
+/// Vanilla `BlockPos` packed-i64 layout: `x << 38 | z << 12 | y`, the y field
+/// signed at 12 bits.
+#[allow(dead_code)]
+fn command_block_unpack_pos(packed: i64) -> (i32, i32, i32) {
+    (
+        (packed >> 38) as i32,
+        ((packed << 52) >> 52) as i32,
+        ((packed << 26) >> 38) as i32,
+    )
+}
+
+/// Decode the protocol-767 serverbound `set_command_block` body. Truncation,
+/// an oversized command, a mode outside `0..=2` or trailing garbage all fail
+/// closed with `None`.
+#[allow(dead_code)]
+fn decode_set_command_block_c2s(body: &[u8]) -> Option<SetCommandBlockUpdate> {
+    let packed = i64::from_be_bytes(body.get(..8)?.try_into().ok()?);
+    let mut r = P3bReader::new(body.get(8..)?);
+    let command = command_block_wire_string(&mut r)?;
+    let mode = match r.varint()? {
+        0 => CommandBlockMode::Sequence,
+        1 => CommandBlockMode::Auto,
+        2 => CommandBlockMode::Redstone,
+        _ => return None,
+    };
+    let flags = r.byte()?;
+    if !r.done() {
+        return None;
+    }
+    Some(SetCommandBlockUpdate {
+        pos: command_block_unpack_pos(packed),
+        command,
+        mode,
+        track_output: flags & 0x01 != 0,
+        conditional: flags & 0x02 != 0,
+        automatic: flags & 0x04 != 0,
+    })
+}
+
+/// Decode the protocol-767 serverbound `set_command_minecart` body — VarInt
+/// entity id, capped command string, single boolean byte — fail closed.
+#[allow(dead_code)]
+fn decode_set_command_minecart_c2s(body: &[u8]) -> Option<SetCommandMinecartUpdate> {
+    let mut r = P3bReader::new(body);
+    let entity_id = i32::try_from(r.varint()?).ok()?;
+    let command = command_block_wire_string(&mut r)?;
+    let track_output = match r.byte()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    if !r.done() {
+        return None;
+    }
+    Some(SetCommandMinecartUpdate {
+        entity_id,
+        command,
+        track_output,
+    })
+}
+
+/// The shared edit gate for both packets: enabled toggle + OP level >= 2 +
+/// creative (`gamemode == 1`) — refused fail-closed, matching vanilla's
+/// `Player.canUseGameMasterBlocks` check.
+#[allow(dead_code)]
+fn command_block_edit_permitted(
+    caller_op_level: u8,
+    caller_gamemode: u8,
+    enable_cmd_block: bool,
+) -> Result<(), String> {
+    if !(enable_cmd_block && command_blocks_enabled()) {
+        return Err("Command blocks are not enabled on this server".into());
+    }
+    if caller_op_level < 2 || caller_gamemode != 1 {
+        return Err(
+            "You do not have permission to use command blocks".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Apply a decoded `set_command_block` update for `dim`. Runtime state the
+/// packet does not carry (`powered`, `last_powered`, `success_count`,
+/// `facing`, `condition_met`, `update_last_execution`) survives an edit;
+/// a fresh position starts a default record.
+#[allow(dead_code)]
+fn apply_set_command_block(
+    caller_op_level: u8,
+    caller_gamemode: u8,
+    enable_cmd_block: bool,
+    dim: DimId,
+    pkt: SetCommandBlockUpdate,
+) -> Result<(), String> {
+    command_block_edit_permitted(caller_op_level, caller_gamemode, enable_cmd_block)?;
+    let mut map = live_command_blocks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let rec = map
+        .entry((dim, pkt.pos.0, pkt.pos.1, pkt.pos.2))
+        .or_insert_with(|| CommandBlockRecord::new(dim, pkt.pos));
+    rec.mode = pkt.mode;
+    rec.command = pkt.command;
+    rec.track_output = pkt.track_output;
+    rec.conditional = pkt.conditional;
+    rec.automatic = pkt.automatic;
+    Ok(())
+}
+
+/// Apply a decoded `set_command_minecart` update under the same edit gate.
+#[allow(dead_code)]
+fn apply_set_command_minecart(
+    caller_op_level: u8,
+    caller_gamemode: u8,
+    enable_cmd_block: bool,
+    dim: DimId,
+    pkt: SetCommandMinecartUpdate,
+) -> Result<(), String> {
+    command_block_edit_permitted(caller_op_level, caller_gamemode, enable_cmd_block)?;
+    let mut carts = command_minecarts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let rec = carts.entry(pkt.entity_id).or_insert_with(|| {
+        CommandMinecartRecord {
+            entity_id: pkt.entity_id,
+            dim,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            command: String::new(),
+            track_output: false,
+            last_output: String::new(),
+            success_count: 0,
+            activated: false,
+            powered_ticks: 0,
+        }
+    });
+    rec.command = pkt.command;
+    rec.track_output = pkt.track_output;
+    Ok(())
+}
+
 // ------------------------------------------------------------------ tests ---
 
 #[cfg(test)]
@@ -8236,5 +8904,619 @@ mod policy_cmd_tests {
             .party_friendly_fire = true;
         assert!(should_allow_party_pvp(true));
         policy_reset();
+    }
+}
+
+// ------------------------------------------------------------- tests (VANILLA-CMDBLK)
+
+#[cfg(test)]
+mod vanilla_cmdblk_tests {
+    use super::*;
+
+    fn clear_cmd_state() {
+        live_command_blocks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        command_minecarts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    fn put_block(
+        dim: DimId,
+        pos: (i32, i32, i32),
+        mode: CommandBlockMode,
+        facing: CommandBlockFacing,
+        command: &str,
+        conditional: bool,
+        automatic: bool,
+        powered: bool,
+    ) {
+        let mut rec = CommandBlockRecord::new(dim, pos);
+        rec.mode = mode;
+        rec.facing = facing;
+        rec.command = command.to_owned();
+        rec.conditional = conditional;
+        rec.automatic = automatic;
+        rec.powered = powered;
+        upsert_command_block(rec);
+    }
+
+    fn block_rec(dim: DimId, pos: (i32, i32, i32)) -> CommandBlockRecord {
+        live_command_blocks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            [ &(dim, pos.0, pos.1, pos.2)]
+        .clone()
+    }
+
+    fn world_time() -> u64 {
+        WORLD_TIME.load(Ordering::Relaxed)
+    }
+
+    fn update(
+        pos: (i32, i32, i32),
+        command: &str,
+        mode: CommandBlockMode,
+        flags: (bool, bool, bool),
+    ) -> SetCommandBlockUpdate {
+        SetCommandBlockUpdate {
+            pos,
+            command: command.to_owned(),
+            mode,
+            track_output: flags.0,
+            conditional: flags.1,
+            automatic: flags.2,
+        }
+    }
+
+    #[test]
+    fn vanilla_cmdblk_impulse_runs_once_per_rising_edge() {
+        let _world = world_guard();
+        clear_cmd_state();
+        let (dim, pos) = (DimId::Overworld, (10, 64, 10));
+        put_block(dim, pos, CommandBlockMode::Redstone, CommandBlockFacing::Up, "time add 7", false, false, false);
+        let t0 = world_time();
+        command_block_tick();
+        assert_eq!(world_time(), t0, "unpowered impulse must not run");
+        set_command_block_powered(dim, pos, true);
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 7, "rising edge runs once");
+        command_block_tick();
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 7, "held power is not a new edge");
+        set_command_block_powered(dim, pos, false);
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 7, "falling edge runs nothing");
+        set_command_block_powered(dim, pos, true);
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 14, "re-powering is a new edge");
+        assert_eq!(block_rec(dim, pos).success_count, 1);
+    }
+
+    #[test]
+    fn vanilla_cmdblk_repeating_runs_every_tick_when_always_active() {
+        let _world = world_guard();
+        clear_cmd_state();
+        let (dim, pos) = (DimId::Overworld, (11, 64, 10));
+        put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 2", false, true, false);
+        let t0 = world_time();
+        for _ in 0..3 {
+            command_block_tick();
+        }
+        assert_eq!(world_time(), t0 + 6, "always-active repeating runs each tick");
+        // Powered (but not automatic) repeating blocks run each tick too.
+        put_block(dim, (11, 64, 11), CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 3", false, false, true);
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 6 + 2 + 3);
+        set_command_block_powered(dim, (11, 64, 11), false);
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 6 + 2 + 3 + 2, "unpowered repeating idles");
+    }
+
+    #[test]
+    fn vanilla_cmdblk_chain_runs_unconditional_in_facing_order() {
+        let _world = world_guard();
+        clear_cmd_state();
+        let dim = DimId::Overworld;
+        put_block(dim, (0, 64, 20), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", false, false, true);
+        put_block(dim, (1, 64, 20), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 1", false, true, false);
+        put_block(dim, (2, 64, 20), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 1", false, true, false);
+        let t0 = world_time();
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 3, "trigger + two chain blocks");
+        for x in 0..=2 {
+            assert_eq!(block_rec(dim, (x, 64, 20)).success_count, 1);
+        }
+    }
+
+    #[test]
+    fn vanilla_cmdblk_chain_conditional_gates_on_predecessor_success() {
+        let _world = world_guard();
+        clear_cmd_state();
+        let dim = DimId::Overworld;
+        let chain1 = (1, 64, 30);
+        let chain2 = (2, 64, 30);
+        put_block(dim, (0, 64, 30), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", false, false, true);
+        put_block(dim, chain1, CommandBlockMode::Sequence, CommandBlockFacing::East, "nonexistent_root_xyz", false, true, false);
+        put_block(dim, chain2, CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 3", true, true, false);
+        let t0 = world_time();
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 1, "only the trigger ran");
+        assert_eq!(block_rec(dim, chain1).success_count, 0, "unknown command fails");
+        assert_eq!(block_rec(dim, chain2).success_count, 0);
+        assert!(!block_rec(dim, chain2).condition_met, "condition failed");
+        // Same chain, succeeding predecessor: the conditional block runs.
+        set_command_block_powered(dim, (0, 64, 30), false);
+        command_block_tick();
+        {
+            let mut map = live_command_blocks().lock().unwrap_or_else(|e| e.into_inner());
+            map.get_mut(&(dim, chain1.0, chain1.1, chain1.2)).unwrap().command = "time add 2".to_owned();
+        }
+        set_command_block_powered(dim, (0, 64, 30), true);
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 1 + 1 + 2 + 3);
+        assert!(block_rec(dim, chain2).condition_met);
+        assert_eq!(block_rec(dim, chain2).success_count, 1);
+        // An unpowered (needs-redstone) chain block is skipped but the trigger
+        // still propagates past it, matching vanilla chain propagation.
+        let dim2 = DimId::Nether;
+        put_block(dim2, (0, 64, 30), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", false, false, true);
+        put_block(dim2, (1, 64, 30), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 10", false, false, false);
+        put_block(dim2, (2, 64, 30), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 4", false, true, false);
+        let t1 = world_time();
+        command_block_tick();
+        assert_eq!(world_time(), t1 + 1 + 4, "unpowered link skipped, tail still ran");
+    }
+
+    #[test]
+    fn vanilla_cmdblk_max_chain_length_bounds_execution_cycle() {
+        let _world = world_guard();
+        clear_cmd_state();
+        let dim = DimId::End;
+        put_block(dim, (0, 64, 40), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", false, false, true);
+        put_block(dim, (1, 64, 40), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 1", false, true, false);
+        put_block(dim, (2, 64, 40), CommandBlockMode::Sequence, CommandBlockFacing::West, "time add 1", false, true, false);
+        {
+            let mut rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
+            rules.insert("maxCommandChainLength", 5);
+        }
+        let t0 = world_time();
+        command_block_tick();
+        {
+            let mut rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
+            rules.insert("maxCommandChainLength", 65536);
+        }
+        // Trigger (1) + exactly 5 chained executions — the A<->B cycle is cut
+        // by the gamerule, never allowed to spin.
+        assert_eq!(world_time(), t0 + 6, "chain executions capped at maxCommandChainLength");
+    }
+
+    #[test]
+    fn vanilla_cmdblk_runs_at_op_level_two_never_admin() {
+        let _world = world_guard();
+        clear_cmd_state();
+        let dim = DimId::Overworld;
+        for (i, root) in [
+            "stop", "op", "ban", "transfer", "profile", "debug", "jfr", "perf",
+            "publish", "megu", "deop", "whitelist", "save-all", "tick",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let pos = (100 + i as i32, 64, 50);
+            put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, root, false, true, false);
+            command_block_tick();
+            assert_eq!(
+                block_rec(dim, pos).success_count,
+                0,
+                "/{root} must be refused from a command block"
+            );
+        }
+        // ...but a level-2 command still runs — the source is level 2, not 0.
+        let pos = (120, 64, 50);
+        put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 5", false, true, false);
+        live_command_blocks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&(dim, pos.0, pos.1, pos.2))
+            .unwrap()
+            .track_output = true;
+        let t0 = world_time();
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 5);
+        let rec = block_rec(dim, pos);
+        assert_eq!(rec.success_count, 1);
+        assert!(rec.last_output.contains("Set the time"), "track_output captured");
+    }
+
+    #[test]
+    fn vanilla_cmdblk_edit_requires_op_level_two_and_creative() {
+        let _world = world_guard();
+        clear_cmd_state();
+        let dim = DimId::Overworld;
+        let pkt = || update((1, 2, 3), "time add 1", CommandBlockMode::Auto, (true, false, true));
+        assert!(apply_set_command_block(0, 1, true, dim, pkt()).is_err(), "non-OP refused");
+        assert!(apply_set_command_block(1, 1, true, dim, pkt()).is_err(), "level 1 refused");
+        assert!(apply_set_command_block(2, 0, true, dim, pkt()).is_err(), "survival refused");
+        assert!(apply_set_command_block(2, 2, true, dim, pkt()).is_err(), "adventure refused");
+        assert!(apply_set_command_block(2, 3, true, dim, pkt()).is_err(), "spectator refused");
+        assert!(apply_set_command_block(2, 1, false, dim, pkt()).is_err(), "toggle off refused");
+        assert!(apply_set_command_block(2, 1, true, dim, pkt()).is_ok(), "OP2 creative allowed");
+        let rec = block_rec(dim, (1, 2, 3));
+        assert_eq!(rec.mode, CommandBlockMode::Auto);
+        assert_eq!(rec.command, "time add 1");
+        assert!(rec.track_output && rec.automatic && !rec.conditional);
+        // Minecart edits sit under the identical gate.
+        let cart = SetCommandMinecartUpdate { entity_id: 77, command: "say hi".into(), track_output: true };
+        assert!(apply_set_command_minecart(0, 1, true, dim, cart.clone()).is_err());
+        assert!(apply_set_command_minecart(2, 0, true, dim, cart.clone()).is_err());
+        assert!(apply_set_command_minecart(2, 1, true, dim, cart.clone()).is_ok());
+        let carts = command_minecarts().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(carts[&77].command, "say hi");
+        assert!(carts[&77].track_output);
+    }
+
+    fn wire_varint(v: i64, out: &mut Vec<u8>) {
+        let mut v = v as u32;
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    fn pack_block_pos(x: i32, y: i32, z: i32) -> i64 {
+        ((x as i64 & 0x3ff_ffff) << 38) | ((z as i64 & 0x3ff_ffff) << 12) | (y as i64 & 0xfff)
+    }
+
+    #[test]
+    fn vanilla_cmdblk_decode_set_command_block_wire() {
+        let _world = world_guard();
+        let mut body = Vec::new();
+        body.extend_from_slice(&pack_block_pos(300, -64, -200).to_be_bytes());
+        wire_varint(10, &mut body);
+        body.extend_from_slice(b"time add 1");
+        wire_varint(1, &mut body); // Auto (repeating)
+        body.push(0x05); // track_output + automatic
+        let pkt = decode_set_command_block_c2s(&body).expect("valid packet");
+        assert_eq!(pkt.pos, (300, -64, -200));
+        assert_eq!(pkt.command, "time add 1");
+        assert_eq!(pkt.mode, CommandBlockMode::Auto);
+        assert!(pkt.track_output && pkt.automatic && !pkt.conditional);
+        // Chain mode + conditional flag decode too.
+        let mut body2 = body.clone();
+        *body2.last_mut().unwrap() = 0x02;
+        let mode_pos = body2.len() - 2;
+        body2[mode_pos] = 0x00;
+        let pkt2 = decode_set_command_block_c2s(&body2).expect("chain packet");
+        assert_eq!(pkt2.mode, CommandBlockMode::Sequence);
+        assert!(pkt2.conditional && !pkt2.track_output && !pkt2.automatic);
+        // Fail closed: truncation, bad mode, oversized command, trailing byte.
+        assert!(decode_set_command_block_c2s(&body[..body.len() - 1]).is_none());
+        assert!(decode_set_command_block_c2s(&body[..4]).is_none());
+        let mut bad_mode = body.clone();
+        bad_mode[mode_pos] = 3;
+        assert!(decode_set_command_block_c2s(&bad_mode).is_none());
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&pack_block_pos(0, 0, 0).to_be_bytes());
+        wire_varint(32_501, &mut oversized);
+        oversized.extend_from_slice(&vec![b'a'; 32_501]);
+        oversized.push(0);
+        oversized.push(0);
+        assert!(decode_set_command_block_c2s(&oversized).is_none());
+        let mut trailing = body.clone();
+        trailing.push(0);
+        assert!(decode_set_command_block_c2s(&trailing).is_none());
+        // Boundary: exactly 32_500 bytes still decodes.
+        let mut boundary = Vec::new();
+        boundary.extend_from_slice(&pack_block_pos(0, 0, 0).to_be_bytes());
+        wire_varint(32_500, &mut boundary);
+        boundary.extend_from_slice(&vec![b'a'; 32_500]);
+        wire_varint(2, &mut boundary);
+        boundary.push(0);
+        assert!(decode_set_command_block_c2s(&boundary).is_some());
+    }
+
+    #[test]
+    fn vanilla_cmdblk_decode_set_command_minecart_wire() {
+        let _world = world_guard();
+        let mut body = Vec::new();
+        wire_varint(42, &mut body);
+        wire_varint(6, &mut body);
+        body.extend_from_slice(b"say hi");
+        body.push(1);
+        let pkt = decode_set_command_minecart_c2s(&body).expect("valid minecart packet");
+        assert_eq!(pkt.entity_id, 42);
+        assert_eq!(pkt.command, "say hi");
+        assert!(pkt.track_output);
+        assert!(decode_set_command_minecart_c2s(&body[..body.len() - 1]).is_none());
+        let mut bad_bool = body.clone();
+        *bad_bool.last_mut().unwrap() = 2;
+        assert!(decode_set_command_minecart_c2s(&bad_bool).is_none());
+        assert!(decode_set_command_minecart_c2s(&[]).is_none());
+    }
+
+    #[test]
+    fn vanilla_cmdblk_comparator_signal_is_success_count_clamped() {
+        let _world = world_guard();
+        clear_cmd_state();
+        let dim = DimId::Overworld;
+        let pos = (50, 64, 60);
+        assert_eq!(command_block_comparator_signal(dim, pos), 0, "absent block reads 0");
+        put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 1", false, true, false);
+        command_block_tick();
+        assert_eq!(command_block_comparator_signal(dim, pos), 1);
+        {
+            let mut map = live_command_blocks().lock().unwrap_or_else(|e| e.into_inner());
+            map.get_mut(&(dim, pos.0, pos.1, pos.2)).unwrap().success_count = 40;
+        }
+        assert_eq!(command_block_comparator_signal(dim, pos), 15, "clamped to 15");
+    }
+
+    #[test]
+    fn vanilla_cmdblk_minecart_runs_every_fourth_tick_activated() {
+        let _world = world_guard();
+        clear_cmd_state();
+        upsert_command_minecart(CommandMinecartRecord {
+            entity_id: 9,
+            dim: DimId::Overworld,
+            x: 3.5,
+            y: 64.0,
+            z: 3.5,
+            command: "time add 1".into(),
+            track_output: true,
+            last_output: String::new(),
+            success_count: 0,
+            activated: false,
+            powered_ticks: 0,
+        });
+        let t0 = world_time();
+        command_minecart_tick();
+        assert_eq!(world_time(), t0, "inactivated cart does not run");
+        set_command_minecart_activated(9, true);
+        for _ in 0..10 {
+            command_minecart_tick();
+        }
+        // Activation ticks 0, 4, 8 -> three executions.
+        assert_eq!(world_time(), t0 + 3);
+        set_command_minecart_activated(9, false);
+        command_minecart_tick();
+        assert_eq!(world_time(), t0 + 3, "deactivation stops the cadence");
+        let carts = command_minecarts().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(carts[&9].success_count, 1);
+        assert!(carts[&9].last_output.contains("Set the time"));
+    }
+
+    #[test]
+    fn vanilla_cmdblk_disabled_toggle_refuses_edit_and_execution() {
+        let _world = world_guard();
+        clear_cmd_state();
+        let dim = DimId::Overworld;
+        std::env::set_var("MC_SPINE_ENABLE_COMMAND_BLOCK", "0");
+        let pkt = update((7, 7, 7), "time add 1", CommandBlockMode::Auto, (false, false, true));
+        assert!(apply_set_command_block(2, 1, true, dim, pkt).is_err(), "env-disabled edit refused");
+        put_block(dim, (7, 7, 8), CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 1", false, true, false);
+        let t0 = world_time();
+        command_block_tick();
+        assert_eq!(world_time(), t0, "disabled engine must not tick");
+        std::env::remove_var("MC_SPINE_ENABLE_COMMAND_BLOCK");
+        command_block_tick();
+        assert_eq!(world_time(), t0 + 1, "re-enabled engine ticks again");
+    }
+
+    // ---- datapack zip + DPC1 cache ----------------------------------------
+
+    struct CmdblkFixture {
+        dir: std::path::PathBuf,
+    }
+
+    impl CmdblkFixture {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "spine-cmdblk-{tag}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+        fn put(&self, rel: &str, value: &[u8]) {
+            let file = self.dir.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, value).unwrap();
+        }
+        fn root(&self) -> std::path::PathBuf {
+            self.dir.join("datapacks")
+        }
+    }
+
+    impl std::ops::Drop for CmdblkFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Minimal stored-method ZIP writer matching `zip_datapack_entries`'s
+    /// contiguous-layout validation.
+    fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, body) in entries {
+            let offset = out.len() as u32;
+            let crc = {
+                let mut c = flate2::Crc::new();
+                c.update(body);
+                c.sum()
+            };
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0x0800u16.to_le_bytes()); // UTF-8 names
+            out.extend_from_slice(&0u16.to_le_bytes()); // stored
+            out.extend_from_slice(&[0u8; 4]); // mod time/date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(body);
+            central.extend_from_slice(b"PK\x01\x02");
+            central.extend_from_slice(&20u16.to_le_bytes()); // made by
+            central.extend_from_slice(&20u16.to_le_bytes()); // needed
+            central.extend_from_slice(&0x0800u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&[0u8; 4]);
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&[0u8; 8]); // extra/comment/disk/int-attrs
+            central.extend_from_slice(&0u32.to_le_bytes()); // ext attrs
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let central_start = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&[0u8; 4]); // disk + central disk
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&central_start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out
+    }
+
+    fn clear_pack_state() {
+        disabled_datapacks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        datapack_order()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    fn pack_named(name: &str) -> Option<Datapack> {
+        packs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| Datapack {
+                name: p.name.clone(),
+                functions: p.functions.clone(),
+                load: p.load.clone(),
+                tick: p.tick.clone(),
+            })
+    }
+
+    #[test]
+    fn vanilla_cmdblk_zip_datapack_loads_functions_tags_recipes() {
+        let _world = world_guard();
+        clear_pack_state();
+        let f = CmdblkFixture::new("zip");
+        let zip = make_zip(&[
+            ("pack.mcmeta", br#"{"pack":{"pack_format":48,"description":"z"}}"#),
+            ("data/zz/function/hello.mcfunction", b"say hello\ntime add 1\n"),
+            ("data/zz/tags/item/probe.json", br#"{"values":["minecraft:stone"]}"#),
+            ("data/zz/tags/function/tick.json", br#"{"values":["zz:hello"]}"#),
+            ("data/zz/recipe/cut.json", br#"{"type":"minecraft:stonecutting","ingredient":{"item":"minecraft:stone"},"result":{"id":"minecraft:diamond","count":2}}"#),
+        ]);
+        f.put("datapacks/ztest.zip", &zip);
+        reload_datapacks(&f.root(), None, false).expect("zip datapack reload");
+        let pack = pack_named("ztest.zip").expect("zip pack loaded");
+        assert_eq!(
+            pack.functions["zz:hello"],
+            vec!["say hello".to_owned(), "time add 1".to_owned()]
+        );
+        assert_eq!(pack.tick, vec!["zz:hello".to_owned()], "tick tag hook loaded");
+        let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            registry.tags["item"]["zz:probe"],
+            vec!["minecraft:stone".to_owned()]
+        );
+        assert_eq!(registry.stonecutting.len(), 1);
+        assert_eq!(registry.stonecutting[0].count, 2);
+        drop(registry);
+        assert!(recipe_ids()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains("zz:cut"));
+        assert_eq!(
+            pack_format_verdicts().lock().unwrap_or_else(|e| e.into_inner())["ztest.zip"],
+            PackFormatVerdict::Compatible
+        );
+        // A `../` traversal member rejects the whole archive, fail closed.
+        let evil = make_zip(&[
+            ("pack.mcmeta", br#"{"pack":{"pack_format":48}}"#),
+            ("../evil.json", b"{}"),
+            ("data/zz/function/evil.mcfunction", b"say evil\n"),
+        ]);
+        f.put("datapacks/evil.zip", &evil);
+        reload_datapacks(&f.root(), None, false).expect("reload with evil zip");
+        assert!(pack_named("evil.zip").is_none(), "traversal zip rejected wholesale");
+        assert!(pack_named("ztest.zip").is_some());
+    }
+
+    #[test]
+    fn vanilla_cmdblk_dpc1_cache_warm_hit_and_invalidation() {
+        let _world = world_guard();
+        clear_pack_state();
+        let f = CmdblkFixture::new("dpc1");
+        f.put(
+            "datapacks/dpack/pack.mcmeta",
+            br#"{"pack":{"pack_format":48}}"#,
+        );
+        f.put(
+            "datapacks/dpack/data/zz/tags/item/probe.json",
+            br#"{"values":["minecraft:diamond"]}"#,
+        );
+        f.put(
+            "datapacks/dpack/data/zz/function/run.mcfunction",
+            b"time add 1\n",
+        );
+        let cache = f.dir.join("cache");
+        std::env::set_var("MC_SPINE_DATAPACK_CACHE_DIR", &cache);
+        reload_datapacks(&f.root(), None, false).expect("cold reload");
+        assert!(!DPC1_LAST_RELOAD_WARM.load(Ordering::Relaxed), "first load is cold");
+        assert!(cache.join("datapacks.dpc1").is_file(), "cache file written");
+        // Warm hit: identical published content without re-parsing tags.
+        reload_datapacks(&f.root(), None, false).expect("warm reload");
+        assert!(DPC1_LAST_RELOAD_WARM.load(Ordering::Relaxed), "second load is warm");
+        let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            registry.tags["item"]["zz:probe"],
+            vec!["minecraft:diamond".to_owned()],
+            "warm tag restored from snapshot"
+        );
+        drop(registry);
+        let pack = pack_named("dpack").expect("pack still present on warm hit");
+        assert_eq!(pack.functions["zz:run"], vec!["time add 1".to_owned()]);
+        // One changed byte invalidates the digest -> cold rebuild.
+        f.put(
+            "datapacks/dpack/data/zz/tags/item/probe.json",
+            br#"{"values":["minecraft:emerald"]}"#,
+        );
+        reload_datapacks(&f.root(), None, false).expect("invalidated reload");
+        assert!(
+            !DPC1_LAST_RELOAD_WARM.load(Ordering::Relaxed),
+            "one changed byte must invalidate"
+        );
+        let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(registry.tags["item"]["zz:probe"], vec!["minecraft:emerald".to_owned()]);
+        drop(registry);
+        std::env::remove_var("MC_SPINE_DATAPACK_CACHE_DIR");
     }
 }

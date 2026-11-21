@@ -1901,11 +1901,9 @@ fn datapack_sources(base: &std::path::Path) -> Vec<(String, std::path::PathBuf, 
     sources
 }
 
-fn read_directory_datapack(
-    base: &std::path::Path,
-    pack: &mut Datapack,
-    content: &mut DatapackContent,
-) {
+/// `(relative-path, body)` for every `data/**/*.json|mcfunction` file in a
+/// directory datapack, in the same sorted order `read_entry` used to consume.
+fn directory_datapack_entries(base: &std::path::Path) -> Vec<(String, String)> {
     let mut dirs = vec![base.join("data")];
     let mut files = Vec::new();
     while let Some(dir) = dirs.pop() {
@@ -1929,14 +1927,157 @@ fn read_directory_datapack(
         }
     }
     files.sort_unstable();
+    let mut entries = Vec::new();
     for file in files {
         let Ok(path) = file.strip_prefix(base) else {
             continue;
         };
         if let (Some(path), Ok(body)) = (path.to_str(), std::fs::read_to_string(&file)) {
-            content.read_entry(pack, &path.replace('\\', "/"), &body);
+            entries.push((path.replace('\\', "/"), body));
         }
     }
+    entries
+}
+
+/// Read-and-validate one `.zip` datapack archive with the bounded parser.
+/// `None` is the fail-closed answer for oversized, truncated, traversal or
+/// otherwise malformed archives.
+fn zip_datapack_file_entries(path: &std::path::Path) -> Option<Vec<(String, Vec<u8>)>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| {
+            file.take(ZIP_MAX_BYTES as u64 + 1).read_to_end(&mut bytes)
+        })
+        .ok()
+        .filter(|&len| len <= ZIP_MAX_BYTES)?;
+    zip_datapack_entries(&bytes)
+}
+
+/// One enabled datapack source reduced to `(relative-path, text)` entries:
+/// `data/**/*.json|mcfunction` for directories and every UTF-8 archive member
+/// for `.zip` packs. `pack.mcmeta` rides along separately so the DPC1
+/// snapshot can record the pack-format verdicts.
+struct RawDatapack {
+    name: String,
+    mcmeta: Option<String>,
+    entries: Vec<(String, String)>,
+}
+
+/// The 1.21.1 `PackType.SERVER_DATA` release the `pack.mcmeta` compatibility
+/// check targets: scalar `pack_format` 48, `(major, minor)` `(48, 0)` —
+/// matching `TargetVersion::V1_21_1.data_pack_format()` in mc-spine-core.
+const DATAPACK_TARGET_PACK_FORMAT: u32 = 48;
+const DATAPACK_TARGET_PACK_FORMAT_TUPLE: (u32, u32) = (48, 0);
+
+/// The `pack.mcmeta` verdicts of the most recent reload, keyed by pack name —
+/// on a DPC1 warm hit they come back verbatim from the snapshot.
+fn pack_format_verdicts(
+) -> &'static Mutex<std::collections::BTreeMap<String, PackFormatVerdict>> {
+    static VERDICTS: OnceLock<
+        Mutex<std::collections::BTreeMap<String, PackFormatVerdict>>,
+    > = OnceLock::new();
+    VERDICTS.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Whether the most recent `reload_datapacks` was served by the DPC1 startup
+/// cache — the probe the warm-path tests read.
+static DPC1_LAST_RELOAD_WARM: AtomicBool = AtomicBool::new(false);
+
+/// `true` for the entries a DPC1 warm reload may skip: `tags/` bodies outside
+/// the `function` category. The snapshot already owns their registry state;
+/// `tags/function/**` still re-parses because `load`/`tick` hooks are per-pack
+/// data the snapshot does not carry.
+fn dpc1_warm_entry_cached(path: &str) -> bool {
+    let mut parts = path.split('/');
+    if parts.next() != Some("data")
+        || parts.next().is_none()
+        || parts.next() != Some("tags")
+    {
+        return false;
+    }
+    parts
+        .next()
+        .is_some_and(|category| tag_category(category) != "function")
+}
+
+/// Feed one `RawDatapack` list through `read_entry` in load order. `warm`
+/// skips the entries the DPC1 snapshot already covers; the caller overlays
+/// `snapshot.registry` afterwards either way, so both paths publish the same
+/// content.
+fn parse_raw_datapacks(
+    raw_packs: &[RawDatapack],
+    content: &mut DatapackContent,
+    warm: bool,
+) {
+    content
+        .registry
+        .tags
+        .insert("block".to_owned(), builtin_block_tags());
+    content
+        .registry
+        .tags
+        .insert("item".to_owned(), builtin_item_tags());
+    for raw in raw_packs {
+        let mut pack = Datapack {
+            name: raw.name.clone(),
+            functions: HashMap::new(),
+            load: Vec::new(),
+            tick: Vec::new(),
+        };
+        for (path, body) in &raw.entries {
+            if warm && dpc1_warm_entry_cached(path) {
+                continue;
+            }
+            content.read_entry(&mut pack, path, body);
+        }
+        eprintln!(
+            "[spine] datapack {}: {} fn, load={:?}, tick={:?}",
+            pack.name,
+            pack.functions.len(),
+            pack.load,
+            pack.tick
+        );
+        content.packs.push(pack);
+    }
+    // Resolve here, before `dpc1_snapshot_of` moves the registry out: the
+    // cached registry then contains only the resolved members, and the second
+    // `resolve_optional_tags` inside `publish` is a no-op on both paths.
+    content.resolve_optional_tags();
+}
+
+/// Extract the cacheable slice of a fully parsed `DatapackContent`: the whole
+/// registry is moved out (restored by the caller from the returned snapshot),
+/// loot JSON is copied, and pack verdicts + dynamic registries are read
+/// straight off the raw inputs.
+fn dpc1_snapshot_of(
+    content: &mut DatapackContent,
+    raw_packs: &[RawDatapack],
+) -> Dpc1Snapshot {
+    let mut snapshot = Dpc1Snapshot::default();
+    snapshot.registry = std::mem::take(&mut content.registry);
+    snapshot.loot_json = content
+        .loot_raw
+        .iter()
+        .map(|(key, body)| (key.clone(), body.clone()))
+        .collect();
+    for raw in raw_packs {
+        let verdict = raw.mcmeta.as_deref().map_or(
+            PackFormatVerdict::Invalid,
+            |mcmeta| {
+                parse_and_check_pack_mcmeta(
+                    mcmeta,
+                    DATAPACK_TARGET_PACK_FORMAT,
+                    DATAPACK_TARGET_PACK_FORMAT_TUPLE,
+                )
+                .unwrap_or(PackFormatVerdict::Invalid)
+            },
+        );
+        snapshot.pack_verdicts.insert(raw.name.clone(), verdict);
+        for (path, body) in &raw.entries {
+            snapshot.dynamic.read_entry(path, body);
+        }
+    }
+    snapshot
 }
 
 const DATAPACK_DIRECTORY: &str = "datapacks";
@@ -2035,34 +2176,21 @@ fn reload_datapacks(
             .collect();
         sources.sort_by_key(|(name, _, _)| rank.get(name.as_str()).copied().unwrap_or(usize::MAX));
     }
-    let mut content = DatapackContent::default();
-    content
-        .registry
-        .tags
-        .insert("block".to_owned(), builtin_block_tags());
-    content
-        .registry
-        .tags
-        .insert("item".to_owned(), builtin_item_tags());
+    // Collect every enabled source as raw text entries first. With
+    // `MC_SPINE_DATAPACK_CACHE_DIR` set, `dpc1_load_or_build` then serves the
+    // covered categories (tags, extended recipes, loot JSON, pack verdicts,
+    // dynamic registries) from the DPC1 startup cache on a warm hit; the
+    // residual warm parse below re-reads everything else, and a single changed
+    // input byte invalidates the digest — so a cache hit can never change the
+    // published content, only how it was obtained.
+    let mut raw_packs: Vec<RawDatapack> = Vec::new();
     let mut dim_sources = Vec::new();
     for (name, path, zip) in sources {
         if disabled.contains(&name) {
             continue;
         }
-        let mut pack = Datapack {
-            name,
-            functions: HashMap::new(),
-            load: Vec::new(),
-            tick: Vec::new(),
-        };
         if zip {
-            let mut bytes = Vec::new();
-            let entries = std::fs::File::open(&path)
-                .and_then(|file| file.take(ZIP_MAX_BYTES as u64 + 1).read_to_end(&mut bytes))
-                .ok()
-                .filter(|&len| len <= ZIP_MAX_BYTES)
-                .and_then(|_| zip_datapack_entries(&bytes));
-            let Some(entries) = entries else {
+            let Some(entries) = zip_datapack_file_entries(&path) else {
                 eprintln!(
                     "[spine] rejecting invalid or unsupported datapack {}",
                     path.display()
@@ -2079,26 +2207,68 @@ fn reload_datapacks(
                     })
                     .collect(),
             ));
-            for (path, body) in entries {
-                if let Ok(body) = std::str::from_utf8(&body) {
-                    content.read_entry(&mut pack, &path, body);
-                }
-            }
+            let mcmeta = entries
+                .iter()
+                .find(|(path, _)| path == "pack.mcmeta")
+                .and_then(|(_, body)| std::str::from_utf8(body).ok().map(str::to_owned));
+            raw_packs.push(RawDatapack {
+                name,
+                mcmeta,
+                entries: entries
+                    .iter()
+                    .filter_map(|(path, body)| {
+                        std::str::from_utf8(body)
+                            .ok()
+                            .map(|body| (path.clone(), body.to_owned()))
+                    })
+                    .collect(),
+            });
         } else {
             dim_sources.push(worldgen::DatapackDimensionSource::Directory(
                 path.clone(),
             ));
-            read_directory_datapack(&path, &mut pack, &mut content);
+            raw_packs.push(RawDatapack {
+                name,
+                mcmeta: std::fs::read_to_string(path.join("pack.mcmeta")).ok(),
+                entries: directory_datapack_entries(&path),
+            });
         }
-        eprintln!(
-            "[spine] datapack {}: {} fn, load={:?}, tick={:?}",
-            pack.name,
-            pack.functions.len(),
-            pack.load,
-            pack.tick
-        );
-        content.packs.push(pack);
     }
+    let enabled_order: Vec<String> = raw_packs.iter().map(|raw| raw.name.clone()).collect();
+    let mut content = DatapackContent::default();
+    let cache_dir = dpc1_configured_cache_dir();
+    let (snapshot, warm) = dpc1_load_or_build(
+        base,
+        &enabled_order,
+        cache_dir.as_deref(),
+        || {
+            parse_raw_datapacks(&raw_packs, &mut content, false);
+            Ok(dpc1_snapshot_of(&mut content, &raw_packs))
+        },
+    )?;
+    if warm {
+        DPC1_LAST_RELOAD_WARM.store(true, Ordering::Relaxed);
+        eprintln!("[spine] datapack cache warm reload");
+        parse_raw_datapacks(&raw_packs, &mut content, true);
+    } else {
+        DPC1_LAST_RELOAD_WARM.store(false, Ordering::Relaxed);
+    }
+    let Dpc1Snapshot {
+        registry,
+        pack_verdicts,
+        dynamic,
+        ..
+    } = snapshot;
+    // The snapshot's registry is the complete one (builtins + every tag +
+    // extended recipe, optional members already resolved): it overlays the
+    // parsed staging registry identically on cold and warm reloads.
+    content.registry = registry;
+    *dynamic_registries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = dynamic;
+    *pack_format_verdicts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = pack_verdicts;
     if let Some((name, true, _)) = change {
         if !content.packs.iter().any(|pack| pack.name == name) {
             return Err(format!("Could not load datapack '{name}'"));
@@ -2506,6 +2676,19 @@ fn command_gamerules() -> &'static Mutex<HashMap<&'static str, i32>> {
     static RULES: OnceLock<Mutex<HashMap<&'static str, i32>>> = OnceLock::new();
     RULES.get_or_init(|| Mutex::new(COMMAND_GAMERULE_DEFAULTS.iter()
         .map(|&(name, _, default)| (name, default)).collect()))
+}
+
+/// `maxCommandChainLength` — the hard bound on chained command-block
+/// executions per trigger (vanilla default 65536). Negative settings clamp
+/// to zero, which still lets the triggering block run but stops every chain.
+fn gr_max_command_chain_length() -> u32 {
+    command_gamerules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get("maxCommandChainLength")
+        .copied()
+        .unwrap_or(65536)
+        .max(0) as u32
 }
 
 // Resolve core command targets through the same Brigadier snapshot as /execute.
@@ -6401,6 +6584,20 @@ fn run_loot_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> St
 }
 
 fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
+    run_command_ctx_level(ctx, msg, s, None)
+}
+
+/// `run_command_ctx` with the source permission level pinned instead of
+/// derived from `ctx.me`. Command blocks pass `Some(2)`: vanilla runs them
+/// through a `CommandSourceStack` at exactly permission level 2, never the
+/// console's 4, so `stop`/`op`/`ban`-class commands stay refused. `None`
+/// keeps the legacy derive (console 4, otherwise the ops.json level).
+fn run_command_ctx_level(
+    ctx: &CmdCtx,
+    msg: &str,
+    s: &mut Option<&Client>,
+    source_level: Option<u8>,
+) -> String {
     let me = ctx.me.as_ref();
     let Some(input) = msg.strip_prefix('/') else { return "Expected a command starting with /".into() };
     let first_word = input.split_whitespace().next().unwrap_or("");
@@ -6419,7 +6616,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     // Vanilla `CommandSourceStack.hasPermission`: the console runs at level 4,
     // players at their ops.json level. `command_allowed_for_player` keeps the
     // argument-aware level-0 exceptions (e.g. `/time query`) on top.
-    let level = me.map_or(4, |player| player_permission_level(&player.name));
+    let level = source_level
+        .map(|pinned| pinned.min(4))
+        .unwrap_or_else(|| me.map_or(4, |player| player_permission_level(&player.name)));
     if !command_allowed_for_source(cmd, level)
         && !command_allowed_for_player(cmd, &args)
         && !mod_command_permitted(cmd, level)
