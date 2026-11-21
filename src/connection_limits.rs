@@ -15,11 +15,11 @@
 //! | `MC_SPINE_RCON_LOCKOUT_SECS` | 30 | first lockout length; doubles per further failure, capped at 15 min |
 //! | `MC_SPINE_BACKUP_INTERVAL_SECS` | 600 | minimum age before an older world backup generation is rotated |
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex, OnceLock,
+    Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 
@@ -305,6 +305,208 @@ mod chunk_delivery_tests {
             .next_batch(new, &sent, 0.0, &feedback, 22)
             .is_empty());
     }
+}
+
+// -------------------------------------------------------- chunk packet frames
+
+/// One fully encoded `0x27` chunk packet, shared by every client that asks for
+/// the same column at the same world revision.
+struct CachedChunkPacket {
+    /// The revision the bytes were produced under. A `frame` call whose
+    /// revision differs must miss: the revision folds in the chunk's 3x3 block
+    /// versions (bumped by every `set_block*`), its signature (signs, spawners,
+    /// neighbour generated emitters, the settled light revision — so a relit
+    /// chunk invalidates too), and the live block entities spliced on send.
+    revision: u64,
+    /// The chunk's own generated light emitters, restored into the caller's
+    /// `GenSources` on a hit exactly as a rebuild would record them.
+    own_emitters: Vec<((i32, i32, i32), u8)>,
+    /// `varint(len)` + `varint(0x27)` + payload — the exact bytes an
+    /// uncompressed client receives.
+    plain: Arc<Vec<u8>>,
+    /// `encode_compressed_frame` of the same body, built on first request for
+    /// the negotiated threshold (uniform per server: one env knob).
+    compressed: Option<(usize, Arc<Vec<u8>>)>,
+}
+
+/// The `0x27` frame body: packet id + payload.
+fn chunk_packet_body(payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(payload.len() + 5);
+    crate::write_varint(&mut body, 0x27);
+    body.extend_from_slice(payload);
+    body
+}
+
+/// `body` prefixed by its frame length: the uncompressed wire frame.
+fn plain_frame(body: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(body.len() + 5);
+    crate::write_varint(&mut frame, body.len() as i64);
+    frame.extend_from_slice(body);
+    frame
+}
+
+/// The body inside a `plain_frame` (the frames this cache builds; `plain` is
+/// `varint(len)` + body).
+fn body_of_frame(plain: &[u8]) -> &[u8] {
+    let mut rest = plain;
+    let _ = crate::read_protocol_i32(&mut rest);
+    rest
+}
+
+/// Generation-keyed, revision-gated cache of `0x27` chunk packet frames.
+///
+/// Streaming one column to N players used to rebuild the packet per reader:
+/// `map_chunk` (itself payload-cached), the live block-entity splice, the light
+/// cull — and, when compression is on, a zlib pass per client per chunk, the
+/// most expensive step of the send. The bytes depend only on the world state
+/// the revision folds together, so every reader at the same revision receives
+/// literally the same `Arc`, and a player re-entering a column reuses it too.
+/// Entries are bounded (the same 512 the payload/light caches use) and dropped
+/// wholesale when the generator's `generation` moves, like `MapChunkCache`.
+pub(crate) struct ChunkPacketCache {
+    generation: u64,
+    map: HashMap<(crate::DimId, i32, i32), CachedChunkPacket>,
+    order: VecDeque<(crate::DimId, i32, i32)>,
+}
+
+/// Entries retained; each holds a full chunk frame plus (at most) its
+/// compressed form.
+const CHUNK_PACKET_CACHE_CAP: usize = 512;
+
+impl ChunkPacketCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            generation: 0,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn sync_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.map.clear();
+            self.order.clear();
+            self.generation = generation;
+        }
+    }
+
+    /// The ready-to-write frame for `key` at `revision`, with the chunk's own
+    /// emitters to restore into the caller's `GenSources`. `None` when the
+    /// entry is absent or stale — the caller rebuilds and offers `insert`.
+    pub(crate) fn frame(
+        &mut self,
+        generation: u64,
+        key: (crate::DimId, i32, i32),
+        revision: u64,
+        compression: Option<usize>,
+    ) -> Option<(Arc<Vec<u8>>, Vec<((i32, i32, i32), u8)>)> {
+        self.sync_generation(generation);
+        let entry = self.map.get_mut(&key)?;
+        if entry.revision != revision {
+            return None;
+        }
+        let frame = match compression {
+            None => entry.plain.clone(),
+            Some(threshold) => match &entry.compressed {
+                Some((for_threshold, frame)) if *for_threshold == threshold => frame.clone(),
+                _ => {
+                    let frame = Arc::new(encode_compressed_frame(
+                        body_of_frame(&entry.plain),
+                        threshold,
+                    ));
+                    entry.compressed = Some((threshold, frame.clone()));
+                    frame
+                }
+            },
+        };
+        Some((frame, entry.own_emitters.clone()))
+    }
+
+    /// Store `payload` (no packet id — the `0x27` prefix is added here) at
+    /// `revision`. Only call when the revision's inputs held for the whole
+    /// build; a mid-build edit must be a miss on the next `frame`, not a stale
+    /// hit under the old revision.
+    pub(crate) fn insert(
+        &mut self,
+        generation: u64,
+        key: (crate::DimId, i32, i32),
+        revision: u64,
+        own_emitters: Vec<((i32, i32, i32), u8)>,
+        payload: Vec<u8>,
+    ) {
+        self.sync_generation(generation);
+        let entry = CachedChunkPacket {
+            revision,
+            own_emitters,
+            plain: Arc::new(plain_frame(&chunk_packet_body(&payload))),
+            compressed: None,
+        };
+        if self.map.insert(key, entry).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > CHUNK_PACKET_CACHE_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+
+    /// The frame for a payload that must not be retained (the build raced an
+    /// edit). The bytes sent are identical to a cached entry's.
+    pub(crate) fn frame_uncached(payload: &[u8], compression: Option<usize>) -> Arc<Vec<u8>> {
+        let body = chunk_packet_body(payload);
+        match compression {
+            None => Arc::new(plain_frame(&body)),
+            Some(threshold) => Arc::new(encode_compressed_frame(&body, threshold)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
+// --------------------------------------------------- broadcast range policy
+
+/// The radius vanilla `PlayerList.broadcast(except, x, y, z, radius, dimension,
+/// packet)` uses for a positioned world-effect packet, read from the packet
+/// itself: sounds (`0x68`) carry `16 * volume` with a 16-block floor, level
+/// particles (`0x29`) reach 512 blocks only under their long-distance flag
+/// (otherwise 32), and explosions (`0x20`) reach 64. `None` means the packet
+/// has no vanilla range contract — a culled broadcast must refuse to send it
+/// rather than silently reach everyone.
+pub(crate) fn broadcast_radius(id: i64, payload: &[u8]) -> Option<f64> {
+    match id {
+        0x68 => {
+            // named sound: varint id+1, varint source, fixed-point x/y/z (x8
+            // i32), f32 volume — the range check needs only the volume.
+            let mut body = payload;
+            crate::read_protocol_i32(&mut body)?;
+            crate::read_protocol_i32(&mut body)?;
+            let volume = f32::from_be_bytes(body.get(12..16)?.try_into().ok()?);
+            Some((16.0 * f64::from(volume)).max(16.0))
+        }
+        0x29 => Some(if payload.first() == Some(&1) { 512.0 } else { 32.0 }),
+        0x20 => Some(64.0),
+        _ => None,
+    }
+}
+
+/// `PlayerList.broadcast` sends strictly inside the radius (`d² < r²`), in the
+/// same dimension (the caller checks that separately).
+pub(crate) fn within_broadcast_range(
+    px: f64,
+    py: f64,
+    pz: f64,
+    x: f64,
+    y: f64,
+    z: f64,
+    radius: f64,
+) -> bool {
+    let (dx, dy, dz) = (px - x, py - y, pz - z);
+    dx * dx + dy * dy + dz * dz < radius * radius
 }
 
 // ---------------------------------------------------------- play keepalive
@@ -1204,5 +1406,110 @@ mod tests {
         assert_eq!(catch_panic(|| panic!("boom")), Err("boom".to_string()));
         let n = 7;
         assert_eq!(catch_panic(move || panic!("n={n}")), Err("n=7".to_string()));
+    }
+
+    #[test]
+    fn chunk_packet_cache_shares_frames_until_the_revision_moves() {
+        let mut cache = ChunkPacketCache::new();
+        let key = (crate::DimId::Overworld, 4, -7);
+        assert!(cache.frame(10, key, 41, None).is_none());
+        cache.insert(10, key, 41, vec![((1, 2, 3), 15)], vec![9, 9, 9]);
+        let (f1, emitters) = cache.frame(10, key, 41, None).unwrap();
+        let (f2, _) = cache.frame(10, key, 41, None).unwrap();
+        assert!(
+            Arc::ptr_eq(&f1, &f2),
+            "readers at the same revision share one frame"
+        );
+        assert_eq!(emitters, [((1, 2, 3), 15)]);
+        // The frame decodes to a 0x27 packet carrying the payload verbatim.
+        let mut body = &f1[..];
+        crate::read_protocol_i32(&mut body);
+        assert_eq!(crate::read_protocol_i32(&mut body), Some(0x27));
+        assert_eq!(body, [9, 9, 9]);
+        // Compressed readers get a lazily built, then shared, compressed frame.
+        let (c1, _) = cache.frame(10, key, 41, Some(256)).unwrap();
+        let (c2, _) = cache.frame(10, key, 41, Some(256)).unwrap();
+        assert!(Arc::ptr_eq(&c1, &c2));
+        assert_ne!(f1, c1);
+        let mut framed = &c1[..];
+        crate::read_protocol_i32(&mut framed);
+        let body = decode_compressed_frame(framed, 256, 1 << 20).unwrap();
+        let mut payload = &body[..];
+        assert_eq!(crate::read_protocol_i32(&mut payload), Some(0x27));
+        assert_eq!(payload, [9, 9, 9]);
+        let (c3, _) = cache.frame(10, key, 41, Some(64)).unwrap();
+        assert!(
+            !Arc::ptr_eq(&c1, &c3),
+            "each threshold builds its own compressed frame"
+        );
+        // A block/light revision bump (what set_block* produces) invalidates.
+        assert!(cache.frame(10, key, 42, None).is_none());
+        cache.insert(10, key, 42, vec![], vec![7]);
+        let (f3, _) = cache.frame(10, key, 42, None).unwrap();
+        assert_ne!(f1, f3);
+        assert!(Arc::ptr_eq(&f3, &cache.frame(10, key, 42, None).unwrap().0));
+        // frame_uncached emits identical bytes without touching the entry.
+        assert_eq!(*ChunkPacketCache::frame_uncached(&[9, 9, 9], None), *f1);
+    }
+
+    #[test]
+    fn chunk_packet_cache_drops_everything_on_a_generation_change() {
+        let mut cache = ChunkPacketCache::new();
+        let key = (crate::DimId::Overworld, 0, 0);
+        cache.insert(10, key, 1, vec![], vec![1]);
+        assert!(cache.frame(11, key, 1, None).is_none());
+        cache.insert(11, key, 1, vec![], vec![2]);
+        let (frame, _) = cache.frame(11, key, 1, None).unwrap();
+        let mut body = &frame[..];
+        crate::read_protocol_i32(&mut body);
+        crate::read_protocol_i32(&mut body);
+        assert_eq!(body, [2]);
+    }
+
+    #[test]
+    fn chunk_packet_cache_stays_bounded() {
+        let mut cache = ChunkPacketCache::new();
+        for i in 0..(CHUNK_PACKET_CACHE_CAP + 4) {
+            cache.insert(1, (crate::DimId::Overworld, i as i32, 0), 1, vec![], vec![i as u8]);
+        }
+        assert!(cache.map.len() <= CHUNK_PACKET_CACHE_CAP);
+        assert!(cache
+            .frame(1, (crate::DimId::Overworld, 0, 0), 1, None)
+            .is_none());
+    }
+
+    #[test]
+    fn broadcast_radius_reads_the_vanilla_range_contract() {
+        // named sound: id+1 varint, source varint, fixed-point pos, f32 volume.
+        let mut snd = Vec::new();
+        crate::write_varint(&mut snd, 763 + 1);
+        crate::write_varint(&mut snd, 0);
+        for v in [8i32, 520, -16] {
+            snd.extend_from_slice(&v.to_be_bytes());
+        }
+        snd.extend_from_slice(&1.0f32.to_be_bytes());
+        assert_eq!(broadcast_radius(0x68, &snd), Some(16.0));
+        let mut loud = snd.clone();
+        loud.truncate(loud.len() - 4);
+        loud.extend_from_slice(&4.0f32.to_be_bytes());
+        assert_eq!(broadcast_radius(0x68, &loud), Some(64.0));
+        // particles reach 512 only with the long-distance flag, else 32.
+        assert_eq!(broadcast_radius(0x29, &[1]), Some(512.0));
+        assert_eq!(broadcast_radius(0x29, &[0]), Some(32.0));
+        assert_eq!(broadcast_radius(0x20, &[0; 24]), Some(64.0));
+        // a packet with no positioned contract is refused, not sent wide.
+        assert_eq!(broadcast_radius(0x6c, &[1, 2, 3]), None);
+        assert_eq!(broadcast_radius(0x68, &[0]), None);
+    }
+
+    #[test]
+    fn broadcast_membership_is_a_strict_radius_sphere() {
+        assert!(within_broadcast_range(0.0, 0.0, 0.0, 15.99, 0.0, 0.0, 16.0));
+        assert!(
+            !within_broadcast_range(0.0, 0.0, 0.0, 16.0, 0.0, 0.0, 16.0),
+            "vanilla's `dist² < r²` is strict at the boundary"
+        );
+        assert!(within_broadcast_range(0.0, 0.0, 0.0, 8.0, 8.0, 8.0, 16.0));
+        assert!(!within_broadcast_range(0.0, 0.0, 0.0, 9.3, 9.3, 9.3, 16.0));
     }
 }

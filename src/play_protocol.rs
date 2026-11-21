@@ -1221,7 +1221,14 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
                     *p
                 };
                 let snd = sound_pkt_named("entity.item.break", pxx, pyy + 1.0, pzz);
-                broadcast(-1, |_c| (0x68, snd.clone()));
+                broadcast_near(
+                    *me.dim.lock().unwrap(),
+                    pxx,
+                    pyy + 1.0,
+                    pzz,
+                    -1,
+                    |_c| (0x68, snd.clone()),
+                );
             }
             held_slot_resync(me);
         }
@@ -1433,6 +1440,49 @@ fn broadcast_seen_ex_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
             if let Ok(mut socket) = client.sock.lock() {
                 let _ = send_packet(&mut socket, id, packet);
             }
+        }
+    }
+}
+
+/// Position-scoped broadcast: vanilla `PlayerList.broadcast(except, x, y, z,
+/// radius, dimension, packet)` reaches only same-dimension players strictly
+/// inside `radius` of the effect. The radius is read from the packet itself
+/// (`connection_limits::broadcast_radius`), so a packet id with no vanilla
+/// range contract — chat, weather, player-info — is refused rather than sent
+/// to the whole list; this is for sounds, particles and explosions only.
+fn broadcast_near<F: Fn(&Client) -> (i64, Vec<u8>)>(
+    dim: DimId,
+    x: f64,
+    y: f64,
+    z: f64,
+    me_eid: i32,
+    mk: F,
+) {
+    broadcast_near_in(dim, &client_snapshot(), x, y, z, me_eid, mk)
+}
+fn broadcast_near_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
+    dim: DimId,
+    audience: &[Arc<Client>],
+    x: f64,
+    y: f64,
+    z: f64,
+    me_eid: i32,
+    mk: F,
+) {
+    for client in audience.iter().filter(|c| c.eid != me_eid) {
+        if *client.dim.lock().unwrap() != dim {
+            continue;
+        }
+        let (id, packet) = mk(client);
+        let Some(radius) = connection_limits::broadcast_radius(id, &packet) else {
+            continue;
+        };
+        let (px, py, pz, ..) = *client.pos.lock().unwrap();
+        if !connection_limits::within_broadcast_range(px, py, pz, x, y, z, radius) {
+            continue;
+        }
+        if let Ok(mut socket) = client.sock.lock() {
+            let _ = send_packet(&mut socket, id, packet);
         }
     }
 }
@@ -2166,6 +2216,116 @@ fn cull_chunk_light(packet: &mut Vec<u8>, dim: DimId) {
     packet.extend_from_slice(&sparse);
 }
 
+fn chunk_packet_cache() -> &'static Mutex<connection_limits::ChunkPacketCache> {
+    static CACHE: OnceLock<Mutex<connection_limits::ChunkPacketCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(connection_limits::ChunkPacketCache::new()))
+}
+
+/// FNV-1a combine step, matching `map_chunk_sig`'s combiner.
+fn chunk_packet_mix(h: u64, v: u64) -> u64 {
+    (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+/// The revision a shared `0x27` frame is gated on: every input the sent bytes
+/// can carry. The 3x3 `chunk_versions` tuple moves on any `set_block*` write in
+/// the chunk or a neighbour (block edits and the light updates they cause),
+/// `map_chunk_sig` covers signs, Overworld spawners, the neighbour generated
+/// emitters in `gen` and the settled light revision, and the fingerprint
+/// covers the live block entities `splice_chunk_block_entities` merges in.
+fn chunk_packet_revision(
+    versions: &[u64; 9],
+    sig: u64,
+    block_entities: &[ChunkBlockEntity],
+) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &v in versions {
+        h = chunk_packet_mix(h, v);
+    }
+    h = chunk_packet_mix(h, sig);
+    for ((x, y, z), wire_id, nbt) in block_entities {
+        for v in [*x as u64, *y as u64, *z as u64, *wire_id as u64] {
+            h = chunk_packet_mix(h, v);
+        }
+        for &b in nbt {
+            h = chunk_packet_mix(h, u64::from(b));
+        }
+    }
+    h
+}
+
+/// The compression threshold `s` negotiated, if any. Read once per
+/// `stream_chunks` call: the frames the cache hands out are shared, so the
+/// per-packet `send_packet` lookup is not repeated per chunk.
+fn socket_compression(s: &TcpStream) -> Option<usize> {
+    SOCKET_WIRE.get().and_then(|states| {
+        states
+            .lock()
+            .unwrap()
+            .get(&socket_key(s))?
+            .compression
+    })
+}
+
+/// Write an already-framed packet (bytes shared from `ChunkPacketCache`) with
+/// `write_frame`'s failure contract: a partial write kills the socket.
+fn write_shared_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
+    let result = s.write_all(frame);
+    if result.is_err() {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+    result
+}
+
+/// The shared `0x27` frame for `(dim, cx, cz)` at its current world revision.
+/// On a miss the packet is rebuilt exactly as before — `map_chunk`, the live
+/// block-entity splice, the light cull — then stored under the revision the
+/// build started from only when those inputs held to the end; a mid-build edit
+/// gets correct bytes that are simply not cached.
+fn cached_chunk_frame(
+    compression: Option<usize>,
+    gen: &mut GenSources,
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+) -> Arc<Vec<u8>> {
+    let key = (dim, cx, cz);
+    let generation = current_gen_seq();
+    // `live_chunk_block_entities` iterates a map; sort so the spliced bytes
+    // (and their fingerprint) are deterministic across readers.
+    let mut entities = live_chunk_block_entities(dim, cx, cz);
+    entities.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+    let versions = chunk_versions_3x3(dim, cx, cz);
+    let revision = chunk_packet_revision(&versions, map_chunk_sig(dim, cx, cz, gen), &entities);
+    if let Some((frame, emitters)) = chunk_packet_cache()
+        .lock()
+        .unwrap()
+        .frame(generation, key, revision, compression)
+    {
+        // A hit restores the chunk's own emitters into `gen` exactly as a
+        // rebuild would; `light_dirty_for_dim` reads them below.
+        gen.insert((cx, cz), emitters);
+        return frame;
+    }
+    let mut packet = map_chunk(cx, cz, dim, gen);
+    let emitters = gen.get(&(cx, cz)).cloned().unwrap_or_default();
+    let still_current = chunk_packet_revision(
+        &chunk_versions_3x3(dim, cx, cz),
+        map_chunk_sig(dim, cx, cz, gen),
+        &entities,
+    ) == revision;
+    splice_chunk_block_entities(&mut packet, entities);
+    cull_chunk_light(&mut packet, dim);
+    if !still_current {
+        return connection_limits::ChunkPacketCache::frame_uncached(&packet, compression);
+    }
+    let mut cache = chunk_packet_cache().lock().unwrap();
+    cache.insert(generation, key, revision, emitters, packet);
+    cache
+        .frame(generation, key, revision, compression)
+        .map(|(frame, _)| frame)
+        .expect("a freshly inserted chunk packet must frame")
+}
+
 fn stream_chunks(
     s: &mut TcpStream,
     sent: &mut std::collections::HashSet<(i32, i32)>,
@@ -2236,14 +2396,13 @@ fn stream_chunks(
     // The terrain rows stop one section below the dimension's own ceiling: a Nether/End
     // window is 0..256 (16 sections), not the Overworld's -64..320.
     let (lo, hi) = (dim.min_y(), dim.min_y() + dim.height() - 16);
+    let compression = socket_compression(s);
     let mut failed = false;
     'delivery: for chunk_group in news.chunks(terrain_group(delivery_workers)) {
         prefetch_terrain_group_dim(dim, chunk_group, lo, hi, delivery_workers, delivery_round);
         for (cx, cz) in chunk_group {
-            let mut packet = map_chunk(*cx, *cz, dim, gen);
-            splice_chunk_block_entities(&mut packet, live_chunk_block_entities(dim, *cx, *cz));
-            cull_chunk_light(&mut packet, dim);
-            if send_packet(s, 0x27, packet).is_err() {
+            let frame = cached_chunk_frame(compression, gen, dim, *cx, *cz);
+            if write_shared_frame(s, &frame).is_err() {
                 failed = true;
                 break 'delivery;
             }
@@ -4293,7 +4452,14 @@ fn handle(mut s: TcpStream) {
                             // vanilla: firing a bow/crossbow wears it
                             if damage_held(&me) {
                                 let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
-                                broadcast(-1, |_c| (0x68, snd.clone()));
+                                broadcast_near(
+                                    *me.dim.lock().unwrap(),
+                                    x,
+                                    y + 1.0,
+                                    z,
+                                    -1,
+                                    |_c| (0x68, snd.clone()),
+                                );
                             }
                             {
                                 let inv = me.inv.lock().unwrap().get(&asl).cloned();
@@ -5501,7 +5667,14 @@ fn handle(mut s: TcpStream) {
                                         };
                                         let snd =
                                             sound_pkt_named("entity.item.break", pxx, pyy, pzz);
-                                        broadcast(-1, |_c| (0x68, snd.clone()));
+                                        broadcast_near(
+                                            *me.dim.lock().unwrap(),
+                                            pxx,
+                                            pyy,
+                                            pzz,
+                                            -1,
+                                            |_c| (0x68, snd.clone()),
+                                        );
                                     }
                                     held_slot_resync(&me);
                                     if starts_hurt_window && !vb && dmg > 0.0 {
@@ -5766,7 +5939,14 @@ fn handle(mut s: TcpStream) {
                                         *p
                                     };
                                     let snd = sound_pkt_named("entity.item.break", pxx, pyy, pzz);
-                                    broadcast(-1, |_c| (0x68, snd.clone()));
+                                    broadcast_near(
+                                        *me.dim.lock().unwrap(),
+                                        pxx,
+                                        pyy,
+                                        pzz,
+                                        -1,
+                                        |_c| (0x68, snd.clone()),
+                                    );
                                 }
                                 held_slot_resync(&me);
                                 let h = m.hp.lock().unwrap();
@@ -7468,14 +7648,8 @@ fn handle(mut s: TcpStream) {
         player_mechanism_sessions().lock().unwrap().remove(&me_cleanup.eid);
         death_drop_marks().lock().unwrap().remove(&me_cleanup.eid);
         beacon_menu_anchors().lock().unwrap().remove(&me_cleanup.eid);
-        broadcast(me_cleanup.eid, |_c| {
-            (0x42, {
-                let mut p = Vec::new();
-                write_varint(&mut p, 1);
-                write_varint(&mut p, me_cleanup.eid as i64);
-                p
-            })
-        });
+        // vanilla culls the destroy to this entity's trackers
+        broadcast_seen_destroy(me_cleanup.eid);
         let mut p = Vec::new();
         write_varint(&mut p, 1);
         p.extend_from_slice(&me_cleanup.uuid);
@@ -7941,5 +8115,127 @@ mod connection_limits_wire_tests {
             names,
             SYNCED_REGISTRIES.map(|name| format!("minecraft:{name}"))
         );
+    }
+
+    /// `broadcast_near_in` is `PlayerList.broadcast(except, x, y, z, radius,
+    /// dimension, packet)`: only same-dimension clients strictly inside the
+    /// packet's own radius receive it.
+    #[test]
+    fn broadcast_near_in_culls_out_of_range_and_wrong_dimension_clients() {
+        use std::io::Read as _;
+        fn arrived(r: &mut TcpStream) -> usize {
+            let mut buf = [0u8; 4096];
+            let mut total = 0;
+            loop {
+                match r.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(_) => break,
+                }
+            }
+            total
+        }
+        let mk = |eid: i32, x: f64, z: f64| {
+            let (mut c, r) = effect_tests::client_pair();
+            c.eid = eid;
+            *c.pos.lock().unwrap() = (x, 70.0, z, 0.0, 0.0, true);
+            r.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            (Arc::new(c), r)
+        };
+        let (near, mut r_near) = mk(11, 10.0, 0.0);
+        let (mid, mut r_mid) = mk(12, 30.0, 0.0);
+        let (other_dim, mut r_dim) = mk(13, 0.0, 0.0);
+        *other_dim.dim.lock().unwrap() = DimId::Nether;
+        let (edge, mut r_edge) = mk(14, 16.0, 0.0);
+        let (far, mut r_far) = mk(15, 40.0, 0.0);
+        let audience = [near, mid, other_dim, edge, far];
+
+        // A volume-1.0 sound reaches 16 blocks, strictly inside.
+        let snd = sound_pkt_named("entity.item.break", 0.0, 70.0, 0.0);
+        broadcast_near_in(DimId::Overworld, &audience, 0.0, 70.0, 0.0, -1, |_| {
+            (0x68, snd.clone())
+        });
+        assert!(arrived(&mut r_near) > 0, "10 blocks is inside 16");
+        assert_eq!(arrived(&mut r_mid), 0, "30 blocks is past 16");
+        assert_eq!(arrived(&mut r_dim), 0, "another dimension hears nothing");
+        assert_eq!(arrived(&mut r_edge), 0, "exactly r is out: the boundary is strict");
+        assert_eq!(arrived(&mut r_far), 0, "40 blocks is past 16");
+
+        // A forced (longDistance) particle reaches 512; normal reaches 32.
+        let forced = vec![1u8];
+        broadcast_near_in(DimId::Overworld, &audience, 0.0, 70.0, 0.0, -1, |_| {
+            (0x29, forced.clone())
+        });
+        assert!(arrived(&mut r_far) > 0, "40 blocks is inside 512");
+        for r in [&mut r_near, &mut r_mid, &mut r_dim, &mut r_edge] {
+            let _ = arrived(r); // drain so the next broadcast asserts cleanly
+        }
+        let normal = vec![0u8];
+        broadcast_near_in(DimId::Overworld, &audience, 0.0, 70.0, 0.0, -1, |_| {
+            (0x29, normal.clone())
+        });
+        assert!(arrived(&mut r_near) > 0, "10 blocks is inside 32");
+        assert!(arrived(&mut r_mid) > 0, "30 blocks is inside 32");
+        assert_eq!(arrived(&mut r_far), 0, "40 blocks is past 32");
+        let _ = arrived(&mut r_edge); // inside 32, but already pinned above
+
+        // A packet with no vanilla range contract is refused, not sent wide.
+        broadcast_near_in(DimId::Overworld, &audience, 0.0, 70.0, 0.0, -1, |_| {
+            (0x6c, vec![1, 2, 3])
+        });
+        assert_eq!(arrived(&mut r_near), 0, "chat carries no positioned range");
+    }
+
+    /// Two readers of the same column at the same world revision receive the
+    /// same shared frame `Arc`; a `set_block*` write bumps the chunk version,
+    /// the revision moves, and the next build replaces the entry.
+    #[test]
+    fn chunk_packet_frames_are_shared_and_invalidated_by_edits() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        crate::test_support::require_vanilla_data();
+        let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _gen_guard = crate::worldgen::lock_gen_for_tests();
+        assert!(worldgen::init(0, crate::name_to_state), "overworld");
+        let dim = DimId::Overworld;
+        let (cx, cz) = (0, 0);
+        clear_chunk_caches_for_tests();
+        chunk_packet_cache().lock().unwrap().clear();
+        let mut gen = GenSources::new();
+        let f1 = cached_chunk_frame(None, &mut gen, dim, cx, cz);
+        let mut gen2 = GenSources::new();
+        let f2 = cached_chunk_frame(None, &mut gen2, dim, cx, cz);
+        assert!(
+            Arc::ptr_eq(&f1, &f2),
+            "a second reader reuses the exact frame Arc"
+        );
+        assert_eq!(
+            gen2.get(&(cx, cz)),
+            gen.get(&(cx, cz)),
+            "a hit restores the chunk's own emitters like a rebuild"
+        );
+        {
+            let mut body = &f1[..];
+            read_protocol_i32(&mut body); // frame length
+            assert_eq!(read_protocol_i32(&mut body), Some(0x27));
+        }
+        // A block edit bumps the 3x3 version tuple; the revision moves.
+        let stone = name_to_state("stone").expect("stone in the pinned registry");
+        let cur = block_at_dim(dim, 8, 70, 8);
+        let st = if cur == stone { 12958 } else { stone };
+        set_block_dim(dim, 8, 70, 8, st);
+        let f3 = cached_chunk_frame(None, &mut gen, dim, cx, cz);
+        assert!(!Arc::ptr_eq(&f1, &f3), "the edit must not hit the old frame");
+        assert_ne!(f1, f3, "the rebuild carries the edited cell");
+        let f4 = cached_chunk_frame(None, &mut GenSources::new(), dim, cx, cz);
+        assert!(Arc::ptr_eq(&f3, &f4), "the rebuilt frame is shared too");
+        // Compressed readers share one lazily compressed frame of the same body.
+        let c1 = cached_chunk_frame(Some(256), &mut gen, dim, cx, cz);
+        let c2 = cached_chunk_frame(Some(256), &mut gen, dim, cx, cz);
+        assert!(Arc::ptr_eq(&c1, &c2));
+        set_block_dim(dim, 8, 70, 8, cur);
+        let f5 = cached_chunk_frame(None, &mut gen, dim, cx, cz);
+        assert_eq!(f1, f5, "restoring the cell restores the bytes");
     }
 }
