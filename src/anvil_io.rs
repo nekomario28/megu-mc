@@ -1633,6 +1633,268 @@ fn export_anvil_world_with_options(
     Ok(report)
 }
 
+// ---------- live persistence bridge ----------
+//
+// `--import-anvil`/`--export-anvil` are one-shot helpers; this bridge aims the
+// same codec at a directory the running server owns. `live_anvil_load_dir`
+// opens it at startup (or stamps a fresh world into an empty one) and
+// `live_anvil_save_dir` is the autosave target: `level.dat` rotates to
+// `level.dat_old` exactly as vanilla rotates it, every `.mca` write is staged
+// in its own directory and renamed over the live file so a crash never leaves
+// a half-written region, and region files merge with the on-disk contents so
+// chunks with no edits are never rewritten — or lost.
+
+/// Whether native Anvil storage is armed for this run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Consumed by the runtime startup/save hooks.
+enum AnvilStorageMode {
+    /// No `MC_SPINE_ANVIL_WORLD_DIR`: saves stay on the v2 overlay files.
+    Disabled,
+    /// A world directory is configured: load it at startup, flush to it on
+    /// every save.
+    Live,
+}
+
+/// `MC_SPINE_ANVIL_WORLD_DIR`: when set to a non-empty path the runtime treats
+/// it as the live world store — loaded at startup, flushed on every autosave.
+#[allow(dead_code)]
+fn anvil_world_dir_from_env() -> Option<std::path::PathBuf> {
+    let raw = std::env::var("MC_SPINE_ANVIL_WORLD_DIR").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(trimmed))
+    }
+}
+
+/// The storage mode the environment selects.
+#[allow(dead_code)]
+fn anvil_storage_mode() -> AnvilStorageMode {
+    if anvil_world_dir_from_env().is_some() {
+        AnvilStorageMode::Live
+    } else {
+        AnvilStorageMode::Disabled
+    }
+}
+
+/// What `live_anvil_load_dir` did with a world directory.
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
+struct AnvilLoadSummary {
+    /// The directory held no Anvil data: a fresh `level.dat` was stamped into
+    /// it so even a crash before the first autosave leaves a valid world.
+    initialized: bool,
+    /// `level.dat` existed and parsed.
+    level_loaded: bool,
+    region_files: usize,
+    chunks_loaded: usize,
+    /// Chunks that failed to decode, in words — the rest still loaded.
+    chunk_errors: Vec<String>,
+    /// Chunks whose `DataVersion` sits outside the readable schema range.
+    unsupported_chunks: usize,
+    /// Section entries dropped for carrying no `Y` index at all.
+    dropped_sections: usize,
+}
+
+/// What `live_anvil_save_dir` wrote.
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
+struct AnvilSaveSummary {
+    level_written: bool,
+    /// A prior `level.dat` was rotated to `level.dat_old` before the new one
+    /// took the live name — vanilla's crash-recovery backup.
+    backup_rotated: bool,
+    region_files: usize,
+    chunks_written: usize,
+}
+
+/// Does `dir` hold anything shaped like an Anvil world — a `level.dat` or at
+/// least one `.mca` in any of the three vanilla region directories.
+fn anvil_dir_has_data(dir: &std::path::Path) -> bool {
+    if dir.join("level.dat").is_file() {
+        return true;
+    }
+    ["region", "DIM-1/region", "DIM1/region"].iter().any(|rel| {
+        std::fs::read_dir(dir.join(rel)).is_ok_and(|mut entries| {
+            entries.any(|e| {
+                e.is_ok_and(|e| e.path().extension().is_some_and(|x| x == "mca"))
+            })
+        })
+    })
+}
+
+/// `level.dat` with vanilla's own rotation: the new contents are staged as
+/// `level.dat_new` (fsynced), any existing `level.dat` becomes `level.dat_old`,
+/// then the staged file takes the live name. A crash at any step leaves a
+/// complete file under one of the three names; a failed final rename tries to
+/// put the previous file back. Returns whether a backup was rotated.
+#[allow(dead_code)]
+fn write_level_dat_rotating(
+    path: &std::path::Path,
+    level: &AnvilLevelDat,
+) -> Result<bool, String> {
+    let bytes = write_level_dat(level)?;
+    let mut new_name = path.as_os_str().to_owned();
+    new_name.push("_new");
+    let staged = std::path::PathBuf::from(new_name);
+    {
+        let mut f = std::fs::File::create(&staged)
+            .map_err(|e| format!("cannot create {}: {e}", staged.display()))?;
+        if let Err(e) = f.write_all(&bytes).and_then(|_| f.sync_all()) {
+            drop(f);
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!("cannot write {}: {e}", staged.display()));
+        }
+    }
+    let mut old_name = path.as_os_str().to_owned();
+    old_name.push("_old");
+    let backup = std::path::PathBuf::from(old_name);
+    let mut rotated = false;
+    if path.exists() {
+        std::fs::rename(path, &backup)
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&staged);
+                format!(
+                    "cannot rotate {} to {}: {e}",
+                    path.display(),
+                    backup.display()
+                )
+            })?;
+        rotated = true;
+    }
+    match std::fs::rename(&staged, path) {
+        Ok(()) => Ok(rotated),
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            // The rotation already moved the old file aside; put it back so a
+            // failed save leaves the world it found rather than none at all.
+            if rotated {
+                let _ = std::fs::rename(&backup, path);
+            }
+            Err(format!(
+                "cannot rename {} over {}: {e}",
+                staged.display(),
+                path.display()
+            ))
+        }
+    }
+}
+
+/// Open `dir` as the live world: an Anvil directory with data is imported and
+/// applied exactly as `import_anvil_world` + `apply_anvil_import` do; an empty
+/// or missing directory is created and stamped with a fresh `level.dat` so the
+/// world is valid before the first autosave ever runs.
+#[allow(dead_code)]
+fn live_anvil_load_dir(dir: &std::path::Path) -> Result<AnvilLoadSummary, String> {
+    if !anvil_dir_has_data(dir) {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let level_name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("world");
+        write_level_dat_rotating(
+            &dir.join("level.dat"),
+            &anvil_level_dat_from_state(level_name, ANVIL_DATA_VERSION),
+        )?;
+        return Ok(AnvilLoadSummary {
+            initialized: true,
+            ..AnvilLoadSummary::default()
+        });
+    }
+    let report = import_anvil_world(dir)?;
+    let summary = AnvilLoadSummary {
+        initialized: false,
+        level_loaded: report.level.is_some(),
+        region_files: report.region_files,
+        chunks_loaded: report.chunks.len(),
+        chunk_errors: report.chunk_errors.clone(),
+        unsupported_chunks: report.unsupported_chunks,
+        dropped_sections: report.dropped_sections,
+    };
+    apply_anvil_import(&report);
+    Ok(summary)
+}
+
+/// Flush the live overlay into `dir` as a native Anvil world: `level.dat` is
+/// rotated (`level.dat` -> `level.dat_old`, vanilla's crash backup) and each
+/// dirty chunk is merged into its region file — chunks already on disk with no
+/// overlay edits stay byte-for-byte as they were, so a live save never drops
+/// imported content the runtime has not touched.
+#[allow(dead_code)]
+fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String> {
+    let mut summary = AnvilSaveSummary::default();
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let level_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("world");
+    summary.backup_rotated = write_level_dat_rotating(
+        &dir.join("level.dat"),
+        &anvil_level_dat_from_state(level_name, ANVIL_DATA_VERSION),
+    )?;
+    summary.level_written = true;
+    let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
+    // Snapshot the overlay once: no `world()` borrow crosses a worldgen call.
+    let snapshot: HashMap<DimChunkKey, HashMap<u32, u32>> =
+        world().lock().unwrap().clone();
+    let mut by_region: std::collections::BTreeMap<(DimId, i32, i32), Vec<(i32, i32)>> =
+        Default::default();
+    for &(dim, cx, cz) in snapshot.keys() {
+        if anvil_dim_region_dir(dim).is_some() {
+            by_region
+                .entry((dim, cx.div_euclid(32), cz.div_euclid(32)))
+                .or_default()
+                .push((cx, cz));
+        }
+    }
+    for ((dim, rx, rz), chunks) in by_region {
+        let rel = anvil_dim_region_dir(dim).expect("vanilla dims only");
+        let region_dir = dir.join(rel);
+        std::fs::create_dir_all(&region_dir)
+            .map_err(|e| format!("cannot create {}: {e}", region_dir.display()))?;
+        let region_path = region_dir.join(format!("r.{rx}.{rz}.mca"));
+        // Merge, never blindly overwrite: a region file that exists keeps its
+        // untouched chunks; one that fails to read aborts the save outright —
+        // a partial file must never replace a good one.
+        let mut region = if region_path.is_file() {
+            read_region_file(&region_path)?
+        } else {
+            AnvilRegion::default()
+        };
+        for (cx, cz) in chunks {
+            let overlay = snapshot
+                .get(&(dim, cx, cz))
+                .cloned()
+                .unwrap_or_default();
+            let chunk = AnvilChunk {
+                cx,
+                cz,
+                data_version: ANVIL_DATA_VERSION,
+                status: "minecraft:full".to_string(),
+                sections: anvil_export_sections(dim, cx, cz, &overlay),
+                block_entities: anvil_export_block_entities(dim, cx, cz),
+                unknown_states: 0,
+                dropped_sections: 0,
+            };
+            region.chunks.insert(
+                (cx, cz),
+                AnvilChunkRecord {
+                    timestamp,
+                    compression: 2,
+                    nbt: anvil_chunk_to_nbt(&chunk, dim.min_y() >> 4),
+                },
+            );
+            summary.chunks_written += 1;
+        }
+        write_region_file(&region_path, &region)?;
+        summary.region_files += 1;
+    }
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod anvil_io_tests {
     use super::*;
@@ -2523,5 +2785,230 @@ mod anvil_io_tests {
             .expect("overworld chunk reimported");
         assert_eq!(chunk.edits[&local_idx(1, 70, 2)], stone);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    // ------------------------------------------ live persistence bridge ----
+
+    /// Every regular file under `dir`, recursively — used to prove a save
+    /// leaves no staged bytes behind.
+    fn p4a_files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn p4a_anvil_world_dir_from_env_arms_live_storage_mode() {
+        std::env::remove_var("MC_SPINE_ANVIL_WORLD_DIR");
+        assert_eq!(anvil_world_dir_from_env(), None);
+        assert_eq!(anvil_storage_mode(), AnvilStorageMode::Disabled);
+        std::env::set_var("MC_SPINE_ANVIL_WORLD_DIR", "   ");
+        assert_eq!(anvil_world_dir_from_env(), None, "blank is unset");
+        std::env::set_var(
+            "MC_SPINE_ANVIL_WORLD_DIR",
+            " /data/tmp/p4a-live-world ",
+        );
+        assert_eq!(
+            anvil_world_dir_from_env(),
+            Some(std::path::PathBuf::from("/data/tmp/p4a-live-world")),
+            "surrounding whitespace is trimmed"
+        );
+        assert_eq!(anvil_storage_mode(), AnvilStorageMode::Live);
+        std::env::remove_var("MC_SPINE_ANVIL_WORLD_DIR");
+        assert_eq!(anvil_storage_mode(), AnvilStorageMode::Disabled);
+    }
+
+    #[test]
+    fn p4a_live_anvil_save_then_load_roundtrips_three_dimensions() {
+        let _guard = world_guard();
+        let _fixture = AnvilWorldFixture::capture(&[]);
+        let grass = name_to_state("grass_block").expect("grass_block state");
+        let netherrack = name_to_state("netherrack").expect("netherrack state");
+        let end_stone = name_to_state("end_stone").expect("end_stone state");
+        {
+            let mut w = world().lock().unwrap();
+            w.clear();
+            // Negative chunk coords exercise the r.-1.0 / r.0.-1 naming too.
+            w.insert(
+                (DimId::Overworld, 0i32, 0i32),
+                HashMap::from([(local_idx(1, 70, 2), grass)]),
+            );
+            w.insert(
+                (DimId::Nether, -1i32, 0i32),
+                HashMap::from([(local_idx(-2, 40, 3), netherrack)]),
+            );
+            w.insert(
+                (DimId::End, 0i32, -1i32),
+                HashMap::from([(local_idx(4, 50, -5), end_stone)]),
+            );
+        }
+        WORLD_SEED.store(0x0123_4567_89ab_cdef, Ordering::Relaxed);
+        *WORLD_SPAWN.lock().unwrap() = (8.5, 65.0, -3.5, 90.0);
+        WORLD_TIME.store(77_000, Ordering::Relaxed);
+
+        let dir = anvil_tmp_dir("live-rt");
+        let save = live_anvil_save_dir(&dir).unwrap();
+        assert!(save.level_written);
+        assert!(!save.backup_rotated, "first save has nothing to rotate");
+        assert_eq!(save.chunks_written, 3);
+        assert_eq!(save.region_files, 3);
+        for path in [
+            dir.join("level.dat"),
+            dir.join("region").join("r.0.0.mca"),
+            dir.join("DIM-1").join("region").join("r.-1.0.mca"),
+            dir.join("DIM1").join("region").join("r.0.-1.mca"),
+        ] {
+            assert!(path.is_file(), "missing {}", path.display());
+        }
+
+        // Wipe live state, then the load must bring it all back.
+        world().lock().unwrap().clear();
+        WORLD_SEED.store(0, Ordering::Relaxed);
+        *WORLD_SPAWN.lock().unwrap() = (0.5, 0.0, 0.5, 0.0);
+        WORLD_TIME.store(0, Ordering::Relaxed);
+        let load = live_anvil_load_dir(&dir).unwrap();
+        assert!(!load.initialized);
+        assert!(load.level_loaded);
+        assert_eq!(load.region_files, 3);
+        assert_eq!(load.chunks_loaded, 3);
+        assert!(load.chunk_errors.is_empty(), "{:?}", load.chunk_errors);
+        assert_eq!(load.unsupported_chunks, 0);
+        assert_eq!(load.dropped_sections, 0);
+        assert_eq!(overlay_block_dim(DimId::Overworld, 1, 70, 2), Some(grass));
+        assert_eq!(overlay_block_dim(DimId::Nether, -2, 40, 3), Some(netherrack));
+        assert_eq!(overlay_block_dim(DimId::End, 4, 50, -5), Some(end_stone));
+        assert_eq!(WORLD_SEED.load(Ordering::Relaxed), 0x0123_4567_89ab_cdef);
+        assert_eq!(*WORLD_SPAWN.lock().unwrap(), (8.5, 65.0, -3.5, 90.0));
+        assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 77_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p4a_live_anvil_load_initializes_empty_dir_then_reloads() {
+        let _guard = world_guard();
+        let _fixture = AnvilWorldFixture::capture(&[]);
+        let dir = anvil_tmp_dir("live-init").join("fresh-world");
+        // The directory does not exist yet: open_or_init stamps a level.dat.
+        let first = live_anvil_load_dir(&dir).unwrap();
+        assert!(first.initialized);
+        assert!(!first.level_loaded);
+        assert_eq!(first.chunks_loaded, 0);
+        let level = read_level_dat_path(&dir.join("level.dat")).unwrap();
+        assert_eq!(level.data_version(), ANVIL_DATA_VERSION);
+        assert_eq!(level.level_name(), "fresh-world");
+        // A level.dat alone also counts as data: a second open is a real load.
+        let second = live_anvil_load_dir(&dir).unwrap();
+        assert!(!second.initialized);
+        assert!(second.level_loaded);
+        assert_eq!(second.chunks_loaded, 0);
+        let _ = std::fs::remove_dir_all(anvil_tmp_dir("live-init").as_path());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p4a_live_anvil_save_rotates_level_dat_old_and_leaves_no_staging_files() {
+        let _guard = world_guard();
+        let _fixture = AnvilWorldFixture::capture(&[]);
+        let stone = name_to_state("stone").expect("stone state");
+        {
+            let mut w = world().lock().unwrap();
+            w.clear();
+            w.insert(
+                (DimId::Overworld, 0i32, 0i32),
+                HashMap::from([(local_idx(3, 64, 3), stone)]),
+            );
+        }
+        let dir = anvil_tmp_dir("live-rot");
+        let first = live_anvil_save_dir(&dir).unwrap();
+        assert!(first.level_written && !first.backup_rotated);
+        assert!(dir.join("level.dat").is_file());
+        assert!(!dir.join("level.dat_old").exists(), "no backup on first save");
+
+        let second = live_anvil_save_dir(&dir).unwrap();
+        assert!(second.backup_rotated, "second save must rotate");
+        // level.dat_old holds a complete prior level.dat: it parses.
+        assert!(read_level_dat_path(&dir.join("level.dat_old")).is_ok());
+        let third = live_anvil_save_dir(&dir).unwrap();
+        assert!(third.backup_rotated, "every later save rotates too");
+
+        // No staged bytes survive anywhere under the world directory.
+        for file in p4a_files_under(&dir) {
+            let name = file.file_name().unwrap().to_string_lossy();
+            assert!(
+                !name.ends_with(".tmp") && !name.ends_with("_new"),
+                "stray staging file {}",
+                file.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p4a_live_anvil_save_merges_into_region_preserving_clean_chunks() {
+        let _guard = world_guard();
+        let _fixture = AnvilWorldFixture::capture(&[]);
+        let stone = name_to_state("stone").expect("stone state");
+        let dirt = name_to_state("dirt").expect("dirt state");
+        {
+            let mut w = world().lock().unwrap();
+            w.clear();
+            w.insert(
+                (DimId::Overworld, 0i32, 0i32),
+                HashMap::from([(local_idx(1, 70, 1), stone)]),
+            );
+            w.insert(
+                (DimId::Overworld, 1i32, 0i32),
+                HashMap::from([(local_idx(17, 65, 1), dirt)]),
+            );
+        }
+        let dir = anvil_tmp_dir("live-merge");
+        live_anvil_save_dir(&dir).unwrap();
+
+        // Chunk (1,0) is clean this cycle — dropped from the overlay — while
+        // chunk (0,0) gains a new edit. The merge must keep (1,0)'s record.
+        {
+            let mut w = world().lock().unwrap();
+            w.remove(&(DimId::Overworld, 1, 0));
+            w.get_mut(&(DimId::Overworld, 0, 0))
+                .unwrap()
+                .insert(local_idx(2, 71, 2), dirt);
+        }
+        let save = live_anvil_save_dir(&dir).unwrap();
+        assert_eq!(save.chunks_written, 1, "only the dirty chunk re-encodes");
+
+        let region = read_region_file(&dir.join("region").join("r.0.0.mca")).unwrap();
+        assert!(region.chunks.contains_key(&(0, 0)));
+        assert!(region.chunks.contains_key(&(1, 0)), "clean chunk preserved");
+        let clean = anvil_chunk_from_nbt(&region.chunks[&(1, 0)].nbt, (1, 0)).unwrap();
+        assert_eq!(
+            anvil_chunk_edits(&clean, DimId::Overworld)[&local_idx(17, 65, 1)],
+            dirt,
+            "untouched chunk keeps its first-save contents"
+        );
+        let dirty = anvil_chunk_from_nbt(&region.chunks[&(0, 0)].nbt, (0, 0)).unwrap();
+        let edits = anvil_chunk_edits(&dirty, DimId::Overworld);
+        assert_eq!(edits[&local_idx(1, 70, 1)], stone);
+        assert_eq!(edits[&local_idx(2, 71, 2)], dirt, "new edit lands");
+
+        // An mca-bearing directory without level.dat is still world data: a
+        // load imports the chunks instead of reinitializing over them.
+        std::fs::remove_file(dir.join("level.dat")).unwrap();
+        world().lock().unwrap().clear();
+        let load = live_anvil_load_dir(&dir).unwrap();
+        assert!(!load.initialized, "region data alone means this is not fresh");
+        assert!(!load.level_loaded);
+        assert_eq!(load.chunks_loaded, 2);
+        assert_eq!(overlay_block_dim(DimId::Overworld, 17, 65, 1), Some(dirt));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

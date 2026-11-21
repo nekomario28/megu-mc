@@ -602,6 +602,345 @@ impl AutoLoadBalancer {
     }
 }
 
+// ----------------------------------------------------- GameSpy4 (GS4) query
+//
+// Vanilla's UDP query protocol: every datagram opens with the magic bytes
+// 0xFE 0xFD, a packet type, and a session id. A Handshake (0x09) issues a
+// per-IP challenge token with a 30 second lease; a Stat request (0x00) must
+// echo a live token back — 11 bytes asks for the basic stat line, 15 bytes
+// for the full K/V block plus the online player list.
+
+/// The two magic bytes every GS4 datagram opens with.
+const GS4_MAGIC: [u8; 2] = [0xFE, 0xFD];
+const GS4_TYPE_STAT: u8 = 0x00;
+const GS4_TYPE_HANDSHAKE: u8 = 0x09;
+/// Vanilla masks every session id down to 0x0F0F0F0F on the way in and echoes
+/// the masked value back in each reply.
+const GS4_SESSION_MASK: i32 = 0x0F0F0F0F;
+/// A challenge token stays valid for 30 seconds per the vanilla spec.
+const GS4_CHALLENGE_TTL: Duration = Duration::from_secs(30);
+/// Requests larger than this are dropped unread — no valid query comes close.
+const GS4_MAX_DATAGRAM: usize = 1460;
+/// Bound on outstanding challenge entries so a handshake flood cannot grow
+/// the map without limit; expired entries are swept before the cap applies.
+const GS4_CHALLENGE_CAP: usize = 4096;
+
+/// Everything a stat reply reports, gathered by the caller — the handler never
+/// reaches into live server state itself.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[allow(dead_code)]
+struct Gs4StatusSnapshot {
+    /// Server MOTD; the `hostname` key of the full reply.
+    motd: String,
+    /// Vanilla reports "SMP" for survival multiplayer.
+    gametype: String,
+    /// "MINECRAFT" in vanilla's reply.
+    game_id: String,
+    /// The server's release name, e.g. "1.21.1".
+    version: String,
+    /// Vanilla's own server reports an empty plugin list.
+    plugins: String,
+    /// The world/map name, e.g. "world".
+    map: String,
+    max_players: usize,
+    /// Online player names; `numplayers` is their count.
+    players: Vec<String>,
+    host_port: u16,
+    host_ip: String,
+}
+
+/// A vanilla-flavoured snapshot: gametype "SMP", game_id "MINECRAFT", no
+/// plugins — the three fields a pure-vanilla server never varies.
+#[allow(dead_code)]
+fn gs4_vanilla_snapshot(
+    motd: String,
+    map: String,
+    players: Vec<String>,
+    max_players: usize,
+    host_port: u16,
+    host_ip: String,
+) -> Gs4StatusSnapshot {
+    Gs4StatusSnapshot {
+        motd,
+        gametype: "SMP".to_string(),
+        game_id: "MINECRAFT".to_string(),
+        version: "1.21.1".to_string(),
+        plugins: String::new(),
+        map,
+        max_players,
+        players,
+        host_port,
+        host_ip,
+    }
+}
+
+/// One issued challenge token and when it was minted.
+#[derive(Clone, Copy, Debug)]
+struct Gs4Challenge {
+    token: i32,
+    issued_at: Instant,
+}
+
+/// The sans-IO GS4 core: per-IP challenge tokens and byte-exact replies. Every
+/// clock read arrives as an `Instant` argument, so expiry is testable without
+/// sleeping and the token stream is deterministic per handler salt — no
+/// wall-clock read anywhere in the protocol path.
+#[allow(dead_code)]
+struct Gs4QueryHandler {
+    challenges: HashMap<std::net::IpAddr, Gs4Challenge>,
+    /// Monotone issuance counter: the moving input of the token hash, so a
+    /// re-issued challenge for the same address mints a fresh value.
+    issued: u64,
+    /// Per-handler salt: a token minted by one server cannot be replayed on a
+    /// differently seeded one.
+    salt: u64,
+}
+
+#[allow(dead_code)]
+impl Gs4QueryHandler {
+    fn new(salt: u64) -> Self {
+        Self {
+            challenges: HashMap::new(),
+            issued: 0,
+            salt,
+        }
+    }
+
+    /// FNV-1a over the salt, the client address and the issuance counter —
+    /// deterministic per handler, different per issue, always a positive
+    /// decimal string like vanilla's integer tokens.
+    fn mint_token(&self, ip: std::net::IpAddr) -> i32 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |b: u8| {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for b in self.salt.to_be_bytes() {
+            mix(b);
+        }
+        match ip {
+            std::net::IpAddr::V4(v4) => v4.octets().into_iter().for_each(&mut mix),
+            std::net::IpAddr::V6(v6) => v6.octets().into_iter().for_each(&mut mix),
+        }
+        for b in self.issued.to_be_bytes() {
+            mix(b);
+        }
+        (h & 0x7fff_ffff) as i32
+    }
+
+    /// The stored token for `ip` is honoured while it is younger than the TTL
+    /// and matches `challenge` exactly. An expired entry is evicted on sight so
+    /// the map cannot accumulate dead leases.
+    fn challenge_valid(&mut self, ip: std::net::IpAddr, challenge: i32, now: Instant) -> bool {
+        let Some(entry) = self.challenges.get(&ip).copied() else {
+            return false;
+        };
+        if now.duration_since(entry.issued_at) >= GS4_CHALLENGE_TTL {
+            self.challenges.remove(&ip);
+            return false;
+        }
+        entry.token == challenge
+    }
+
+    /// Handshake (0x09): mint (or, inside the lease, reuse) the address's
+    /// token and answer `[0x09][session_id][token\0]`. `None` when the
+    /// challenge table is genuinely saturated — a handshake flood fails
+    /// closed rather than growing the map forever.
+    fn handle_handshake(
+        &mut self,
+        ip: std::net::IpAddr,
+        session_id: i32,
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        if self.challenges.len() >= GS4_CHALLENGE_CAP {
+            self.challenges
+                .retain(|_, c| now.duration_since(c.issued_at) < GS4_CHALLENGE_TTL);
+            if self.challenges.len() >= GS4_CHALLENGE_CAP {
+                return None;
+            }
+        }
+        let token = match self.challenges.get(&ip) {
+            Some(entry) if now.duration_since(entry.issued_at) < GS4_CHALLENGE_TTL => {
+                entry.token
+            }
+            _ => {
+                self.issued += 1;
+                let token = self.mint_token(ip);
+                self.challenges.insert(
+                    ip,
+                    Gs4Challenge {
+                        token,
+                        issued_at: now,
+                    },
+                );
+                token
+            }
+        };
+        let mut reply = Vec::with_capacity(16);
+        reply.push(GS4_TYPE_HANDSHAKE);
+        reply.extend_from_slice(&session_id.to_be_bytes());
+        reply.extend_from_slice(token.to_string().as_bytes());
+        reply.push(0);
+        Some(reply)
+    }
+
+    /// One datagram in, maybe one reply out. `None` means dropped: bad magic,
+    /// an unknown type, a truncated or oversized packet, a stat request of a
+    /// size that is neither basic nor full, or a challenge check that failed.
+    /// `snapshot` is consulted only after a stat request's token validates.
+    fn handle_datagram(
+        &mut self,
+        src_ip: std::net::IpAddr,
+        packet: &[u8],
+        now: Instant,
+        snapshot: &dyn Fn() -> Gs4StatusSnapshot,
+    ) -> Option<Vec<u8>> {
+        if packet.len() < 7 || packet.len() > GS4_MAX_DATAGRAM {
+            return None;
+        }
+        if packet[0..2] != GS4_MAGIC {
+            return None;
+        }
+        let session_id =
+            i32::from_be_bytes(packet[3..7].try_into().unwrap()) & GS4_SESSION_MASK;
+        match packet[2] {
+            GS4_TYPE_HANDSHAKE => self.handle_handshake(src_ip, session_id, now),
+            GS4_TYPE_STAT => {
+                let full = match packet.len() {
+                    11 => false,
+                    15 => true,
+                    _ => return None,
+                };
+                let challenge = i32::from_be_bytes(packet[7..11].try_into().unwrap());
+                if !self.challenge_valid(src_ip, challenge, now) {
+                    return None;
+                }
+                let snap = snapshot();
+                Some(if full {
+                    gs4_full_stat(session_id, &snap)
+                } else {
+                    gs4_basic_stat(session_id, &snap)
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The 11-byte basic stat: `[0x00][session_id]` then MOTD, gametype, map and
+/// both player counts as `\0`-terminated text, the port as a little-endian
+/// u16 (the one non-text field on the wire) and the host address.
+#[allow(dead_code)]
+fn gs4_basic_stat(session_id: i32, snap: &Gs4StatusSnapshot) -> Vec<u8> {
+    let num = snap.players.len().to_string();
+    let max = snap.max_players.to_string();
+    let mut out = Vec::new();
+    out.push(GS4_TYPE_STAT);
+    out.extend_from_slice(&session_id.to_be_bytes());
+    for field in [
+        snap.motd.as_str(),
+        snap.gametype.as_str(),
+        snap.map.as_str(),
+        num.as_str(),
+        max.as_str(),
+    ] {
+        out.extend_from_slice(field.as_bytes());
+        out.push(0);
+    }
+    out.extend_from_slice(&snap.host_port.to_le_bytes());
+    out.extend_from_slice(snap.host_ip.as_bytes());
+    out.push(0);
+    out
+}
+
+/// The full stat: the `splitnum` K/V section in vanilla's fixed key order, then
+/// the `player_` section with every online name.
+#[allow(dead_code)]
+fn gs4_full_stat(session_id: i32, snap: &Gs4StatusSnapshot) -> Vec<u8> {
+    let num = snap.players.len().to_string();
+    let max = snap.max_players.to_string();
+    let port = snap.host_port.to_string();
+    let mut out = Vec::new();
+    out.push(GS4_TYPE_STAT);
+    out.extend_from_slice(&session_id.to_be_bytes());
+    out.extend_from_slice(b"splitnum\x00\x80\x00");
+    for (key, value) in [
+        ("hostname", snap.motd.as_str()),
+        ("gametype", snap.gametype.as_str()),
+        ("game_id", snap.game_id.as_str()),
+        ("version", snap.version.as_str()),
+        ("plugins", snap.plugins.as_str()),
+        ("map", snap.map.as_str()),
+        ("numplayers", num.as_str()),
+        ("maxplayers", max.as_str()),
+        ("hostport", port.as_str()),
+        ("hostip", snap.host_ip.as_str()),
+    ] {
+        out.extend_from_slice(key.as_bytes());
+        out.push(0);
+        out.extend_from_slice(value.as_bytes());
+        out.push(0);
+    }
+    out.push(0);
+    out.extend_from_slice(b"\x01player_\x00\x00");
+    for name in &snap.players {
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+    }
+    out.push(0);
+    out
+}
+
+/// A per-process salt for the live listener's token stream: the pid plus a
+/// stack address — no clock read, and tokens minted here cannot be replayed
+/// against a differently seeded handler.
+#[allow(dead_code)]
+fn gs4_runner_salt() -> u64 {
+    let marker = 0u8;
+    (u64::from(std::process::id()) << 32)
+        | (&marker as *const u8 as usize as u64 & 0xffff_ffff)
+}
+
+/// Bind the GS4 listener on `bind_addr` and serve datagrams until `stop_flag`
+/// goes true. Returns the bound address — the port actually taken when the
+/// bind asked for `:0` — and the thread's join handle. The socket polls the
+/// flag every ~50 ms so `stop` lands promptly; send errors never kill the
+/// listener, exactly as the LAN announcer treats its multicast route.
+#[allow(dead_code)]
+fn spawn_gs4_query_thread(
+    bind_addr: &str,
+    snapshot_fn: Arc<dyn Fn() -> Gs4StatusSnapshot + Send + Sync>,
+    stop_flag: Arc<AtomicBool>,
+) -> std::io::Result<(std::net::SocketAddr, thread::JoinHandle<()>)> {
+    let sock = std::net::UdpSocket::bind(bind_addr)?;
+    sock.set_read_timeout(Some(Duration::from_millis(50)))?;
+    let bound = sock.local_addr()?;
+    let join = thread::Builder::new()
+        .name("gs4-query".to_string())
+        .spawn(move || {
+            let mut handler = Gs4QueryHandler::new(gs4_runner_salt());
+            // One byte past the cap: a larger datagram still lands (truncated
+            // to the buffer) and is dropped by the size gate, never answered.
+            let mut buf = [0u8; GS4_MAX_DATAGRAM + 1];
+            while !stop_flag.load(Ordering::Relaxed) {
+                match sock.recv_from(&mut buf) {
+                    Ok((n, src)) if n <= GS4_MAX_DATAGRAM => {
+                        if let Some(reply) = handler.handle_datagram(
+                            src.ip(),
+                            &buf[..n],
+                            Instant::now(),
+                            &*snapshot_fn,
+                        ) {
+                            let _ = sock.send_to(&reply, src);
+                        }
+                    }
+                    Ok(_) => {} // oversized datagram: dropped
+                    Err(_) => {} // timeout poll or a transient socket error
+                }
+            }
+        })?;
+    Ok((bound, join))
+}
+
 // ---------------------------------------------------------------- tests ----
 
 #[cfg(test)]
@@ -919,5 +1258,404 @@ mod operator_ux_tests {
             }
         }
         assert_eq!(bal.budget(), LoadBudget::FULL);
+    }
+
+    // ------------------------------------------------------ GS4 query ----
+
+    fn p4a_gs4_snapshot() -> Gs4StatusSnapshot {
+        gs4_vanilla_snapshot(
+            "A Minecraft Server".to_string(),
+            "world".to_string(),
+            vec!["Alice".to_string(), "Bob".to_string()],
+            20,
+            25565,
+            "127.0.0.1".to_string(),
+        )
+    }
+
+    fn p4a_gs4_handshake(session_id: i32) -> Vec<u8> {
+        let mut p = vec![0xFE, 0xFD, 0x09];
+        p.extend_from_slice(&session_id.to_be_bytes());
+        p
+    }
+
+    fn p4a_gs4_stat(session_id: i32, challenge: i32, full: bool) -> Vec<u8> {
+        let mut p = vec![0xFE, 0xFD, 0x00];
+        p.extend_from_slice(&session_id.to_be_bytes());
+        p.extend_from_slice(&challenge.to_be_bytes());
+        if full {
+            p.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        p
+    }
+
+    /// The decimal token out of a handshake reply's `[0x09][sid][token\0]`.
+    fn p4a_gs4_token_of(reply: &[u8]) -> i32 {
+        assert_eq!(reply[0], 0x09, "handshake reply type");
+        assert_eq!(reply.last(), Some(&0), "handshake reply terminator");
+        std::str::from_utf8(&reply[5..reply.len() - 1])
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn p4a_no_snapshot() -> impl Fn() -> Gs4StatusSnapshot {
+        || -> Gs4StatusSnapshot {
+            panic!("a handshake must never need the status snapshot")
+        }
+    }
+
+    /// The byte-exact basic-stat body for `p4a_gs4_snapshot` at `session_id`.
+    fn p4a_expected_basic(session_id: i32) -> Vec<u8> {
+        let mut out = vec![0x00];
+        out.extend_from_slice(&session_id.to_be_bytes());
+        for field in ["A Minecraft Server", "SMP", "world", "2", "20"] {
+            out.extend_from_slice(field.as_bytes());
+            out.push(0);
+        }
+        out.extend_from_slice(&25565u16.to_le_bytes());
+        out.extend_from_slice(b"127.0.0.1");
+        out.push(0);
+        out
+    }
+
+    /// The byte-exact full-stat body for `p4a_gs4_snapshot` at `session_id`.
+    fn p4a_expected_full(session_id: i32) -> Vec<u8> {
+        let mut out = vec![0x00];
+        out.extend_from_slice(&session_id.to_be_bytes());
+        out.extend_from_slice(b"splitnum\x00\x80\x00");
+        for (k, v) in [
+            ("hostname", "A Minecraft Server"),
+            ("gametype", "SMP"),
+            ("game_id", "MINECRAFT"),
+            ("version", "1.21.1"),
+            ("plugins", ""),
+            ("map", "world"),
+            ("numplayers", "2"),
+            ("maxplayers", "20"),
+            ("hostport", "25565"),
+            ("hostip", "127.0.0.1"),
+        ] {
+            out.extend_from_slice(k.as_bytes());
+            out.push(0);
+            out.extend_from_slice(v.as_bytes());
+            out.push(0);
+        }
+        out.push(0);
+        out.extend_from_slice(b"\x01player_\x00\x00");
+        for name in ["Alice", "Bob"] {
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+        }
+        out.push(0);
+        out
+    }
+
+    #[test]
+    fn p4a_gs4_handshake_issues_per_ip_challenge_and_echoes_masked_session() {
+        let mut handler = Gs4QueryHandler::new(0x5eed);
+        let now = Instant::now();
+        let ip: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let no_snap = p4a_no_snapshot();
+
+        // 0x7f7f7f7f masks down to 0x0f0f0f0f — the echoed bytes must be the
+        // masked id, not what the client sent.
+        let reply = handler
+            .handle_datagram(ip, &p4a_gs4_handshake(0x7f7f_7f7f), now, &no_snap)
+            .expect("handshake must be answered");
+        assert_eq!(&reply[1..5], &0x0f0f_0f0fi32.to_be_bytes());
+        let token = p4a_gs4_token_of(&reply);
+        assert!(token > 0, "token text is a positive decimal: {token}");
+
+        // A second handshake inside the lease reuses the live token verbatim.
+        let again = handler
+            .handle_datagram(
+                ip,
+                &p4a_gs4_handshake(0x7f7f_7f7f),
+                now + Duration::from_secs(10),
+                &no_snap,
+            )
+            .unwrap();
+        assert_eq!(again, reply, "same IP inside the TTL keeps its token");
+
+        // A different address gets its own token, not a shared one.
+        let other: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+        let other_reply = handler
+            .handle_datagram(other, &p4a_gs4_handshake(0x7f7f_7f7f), now, &no_snap)
+            .unwrap();
+        assert_ne!(
+            p4a_gs4_token_of(&other_reply),
+            token,
+            "a second address must not share the first token"
+        );
+
+        // The token stream is deterministic per salt: a fresh handler with the
+        // same salt mints the same first token for the same address.
+        let mut twin = Gs4QueryHandler::new(0x5eed);
+        let twin_reply = twin
+            .handle_datagram(ip, &p4a_gs4_handshake(0x7f7f_7f7f), now, &no_snap)
+            .unwrap();
+        assert_eq!(twin_reply, reply, "deterministic per (salt, ip, issue)");
+
+        // …and a different salt mints a different stream.
+        let mut other_salt = Gs4QueryHandler::new(0xbad5);
+        let other_salt_reply = other_salt
+            .handle_datagram(ip, &p4a_gs4_handshake(0x7f7f_7f7f), now, &no_snap)
+            .unwrap();
+        assert_ne!(
+            p4a_gs4_token_of(&other_salt_reply),
+            token,
+            "tokens must not replay across handler salts"
+        );
+    }
+
+    #[test]
+    fn p4a_gs4_basic_and_full_stat_replies_are_byte_exact() {
+        let mut handler = Gs4QueryHandler::new(0x5eed);
+        let now = Instant::now();
+        let ip: std::net::IpAddr = "198.51.100.23".parse().unwrap();
+        let snap_value = p4a_gs4_snapshot();
+        let snap = || snap_value.clone();
+        let no_snap = p4a_no_snapshot();
+
+        let reply = handler
+            .handle_datagram(ip, &p4a_gs4_handshake(0x0102_0304), now, &no_snap)
+            .unwrap();
+        let token = p4a_gs4_token_of(&reply);
+
+        let basic = handler
+            .handle_datagram(
+                ip,
+                &p4a_gs4_stat(0x1122_3344, token, false),
+                now + Duration::from_secs(1),
+                &snap,
+            )
+            .expect("a valid basic stat must be answered");
+        assert_eq!(basic, p4a_expected_basic(0x0102_0304));
+
+        let full = handler
+            .handle_datagram(
+                ip,
+                &p4a_gs4_stat(0x1a2b_3c4d, token, true),
+                now + Duration::from_secs(2),
+                &snap,
+            )
+            .expect("a valid full stat must be answered");
+        assert_eq!(full, p4a_expected_full(0x0a0b_0c0d));
+    }
+
+    #[test]
+    fn p4a_gs4_fail_closed_on_bad_magic_truncation_oversize_and_tokens() {
+        let mut handler = Gs4QueryHandler::new(0x5eed);
+        let now = Instant::now();
+        let ip_a: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let ip_b: std::net::IpAddr = "203.0.113.11".parse().unwrap();
+        let snap_value = p4a_gs4_snapshot();
+        let snap = || snap_value.clone();
+        let no_snap = p4a_no_snapshot();
+
+        // Wrong magic, truncation, an unknown type, oversize.
+        assert_eq!(
+            handler.handle_datagram(ip_a, &[0x00, 0x00, 0x09, 0, 0, 0, 1], now, &no_snap),
+            None,
+            "bad magic"
+        );
+        assert_eq!(
+            handler.handle_datagram(ip_a, &[0xFE, 0xFD], now, &no_snap),
+            None,
+            "truncated below the session id"
+        );
+        assert_eq!(
+            handler.handle_datagram(ip_a, &[0xFE, 0xFD, 0x09, 0, 0, 0], now, &no_snap),
+            None,
+            "a 6-byte datagram has no full session id"
+        );
+        assert_eq!(
+            handler.handle_datagram(
+                ip_a,
+                &p4a_gs4_handshake(7),
+                now,
+                &no_snap,
+            )
+            .is_some(),
+            true,
+            "control: a real handshake answers"
+        );
+        // Re-handshake above consumed the first issuance; mint a stable token
+        // for the stat checks that follow.
+        let token = p4a_gs4_token_of(
+            &handler
+                .handle_datagram(ip_a, &p4a_gs4_handshake(7), now, &no_snap)
+                .unwrap(),
+        );
+        assert_eq!(
+            handler.handle_datagram(ip_a, &p4a_gs4_handshake(7), now, &no_snap)
+                .map(|r| p4a_gs4_token_of(&r)),
+            Some(token),
+            "control: same lease token"
+        );
+        let mut unknown = p4a_gs4_handshake(7);
+        unknown[2] = 0x07;
+        assert_eq!(
+            handler.handle_datagram(ip_a, &unknown, now, &no_snap),
+            None,
+            "unknown packet type"
+        );
+        let mut big = vec![0xFE, 0xFD, 0x09];
+        big.extend_from_slice(&7i32.to_be_bytes());
+        big.resize(GS4_MAX_DATAGRAM + 1, 0);
+        assert_eq!(
+            handler.handle_datagram(ip_a, &big, now, &no_snap),
+            None,
+            "oversized datagram"
+        );
+
+        // Stat requests without a live token: wrong value, no lease at all
+        // (from an address that never handshook), and a stolen-token replay
+        // from a second address.
+        assert_eq!(
+            handler.handle_datagram(ip_a, &p4a_gs4_stat(7, token + 1, false), now, &snap),
+            None,
+            "wrong token value"
+        );
+        assert_eq!(
+            handler.handle_datagram(ip_b, &p4a_gs4_stat(7, token, false), now, &snap),
+            None,
+            "token is bound to the handshaking address, not the value alone"
+        );
+        assert_eq!(
+            handler.handle_datagram(ip_a, &p4a_gs4_stat(7, token, false), now, &snap),
+            Some(p4a_expected_basic(7)),
+            "control: the live token answers"
+        );
+
+        // Sizes around the two legal stat bodies are all rejected.
+        for len in [8usize, 10, 12, 14, 16, 100] {
+            let mut weird = vec![0xFE, 0xFD, 0x00];
+            weird.extend_from_slice(&7i32.to_be_bytes());
+            weird.extend_from_slice(&token.to_be_bytes());
+            weird.resize(len, 0);
+            assert_eq!(
+                handler.handle_datagram(ip_a, &weird, now, &snap),
+                None,
+                "stat request of {len} bytes"
+            );
+        }
+
+        // At the TTL boundary the lease is dead; past it a new handshake mints
+        // a fresh token and the old one stays dead.
+        assert_eq!(
+            handler.handle_datagram(
+                ip_a,
+                &p4a_gs4_stat(7, token, false),
+                now + GS4_CHALLENGE_TTL,
+                &snap,
+            ),
+            None,
+            "expired token at the TTL boundary"
+        );
+        let renewed = handler
+            .handle_datagram(
+                ip_a,
+                &p4a_gs4_handshake(7),
+                now + GS4_CHALLENGE_TTL + Duration::from_secs(1),
+                &no_snap,
+            )
+            .unwrap();
+        let new_token = p4a_gs4_token_of(&renewed);
+        assert_ne!(new_token, token, "expiry mints a fresh token");
+        assert_eq!(
+            handler.handle_datagram(
+                ip_a,
+                &p4a_gs4_stat(7, token, false),
+                now + GS4_CHALLENGE_TTL + Duration::from_secs(2),
+                &snap,
+            ),
+            None,
+            "the dead token stays dead"
+        );
+        assert!(
+            handler
+                .handle_datagram(
+                    ip_a,
+                    &p4a_gs4_stat(7, new_token, false),
+                    now + GS4_CHALLENGE_TTL + Duration::from_secs(3),
+                    &snap,
+                )
+                .is_some(),
+            "the renewed lease answers"
+        );
+    }
+
+    #[test]
+    fn p4a_gs4_udp_loopback_serves_handshake_basic_full_and_drops() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let snap_value = p4a_gs4_snapshot();
+        let snapshot_fn: Arc<dyn Fn() -> Gs4StatusSnapshot + Send + Sync> =
+            Arc::new(move || snap_value.clone());
+        let Ok((addr, join)) = spawn_gs4_query_thread(
+            "127.0.0.1:0",
+            Arc::clone(&snapshot_fn),
+            Arc::clone(&stop),
+        ) else {
+            return; // no UDP loopback in this sandbox: nothing to verify
+        };
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+
+        // Handshake -> [0x09][masked sid][token\0].
+        client
+            .send_to(&p4a_gs4_handshake(0x7f7f_7f7f), addr)
+            .unwrap();
+        let (n, src) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(src.ip(), addr.ip());
+        let reply = &buf[..n];
+        assert_eq!(reply[0], 0x09);
+        assert_eq!(&reply[1..5], &0x0f0f_0f0fi32.to_be_bytes());
+        let token = p4a_gs4_token_of(reply);
+        assert!(token > 0);
+
+        // Basic stat over the wire, byte-compared against the known layout.
+        client
+            .send_to(&p4a_gs4_stat(0x1122_3344, token, false), addr)
+            .unwrap();
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], p4a_expected_basic(0x0102_0304).as_slice());
+
+        // Full stat: the K/V block and the player list, byte-exact.
+        client
+            .send_to(&p4a_gs4_stat(0x1a2b_3c4d, token, true), addr)
+            .unwrap();
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], p4a_expected_full(0x0a0b_0c0d).as_slice());
+
+        // Fail-closed over the wire: a wrong token and a bad-magic datagram
+        // get no reply at all (recv times out).
+        client
+            .send_to(&p4a_gs4_stat(0x0102_0304, token + 1, false), addr)
+            .unwrap();
+        assert!(client.recv_from(&mut buf).is_err(), "wrong token is dropped");
+        client.send_to(&[0xDE, 0xAD, 0x09, 0, 0, 0, 1], addr).unwrap();
+        assert!(client.recv_from(&mut buf).is_err(), "bad magic is dropped");
+
+        // Cross-IP theft: 127.0.0.2 presenting 127.0.0.1's token is refused.
+        if let Ok(other) = std::net::UdpSocket::bind("127.0.0.2:0") {
+            other
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            other
+                .send_to(&p4a_gs4_stat(0x0102_0304, token, false), addr)
+                .unwrap();
+            assert!(
+                other.recv_from(&mut buf).is_err(),
+                "a token is bound to its handshaking address"
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        join.join().unwrap();
     }
 }
