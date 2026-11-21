@@ -8750,6 +8750,22 @@ fn ingr_match(ig: &Ingr, item: i64, depth: usize) -> bool {
             if depth > 8 {
                 return false;
             }
+            let tag = if t.contains(':') {
+                t.clone()
+            } else {
+                format!("minecraft:{t}")
+            };
+            // The datapack registry's `item` tags expand nested `#ref`s with a
+            // cycle guard, so tags loaded by `/reload` (or a pack the legacy
+            // mirror has not been refreshed with) still answer membership.
+            {
+                let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(map) = registry.tags.get("item") {
+                    if map.contains_key(&tag) && dp_item_tag_match(map, &tag, item) {
+                        return true;
+                    }
+                }
+            }
             let members = item_tags()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -8762,9 +8778,341 @@ fn ingr_match(ig: &Ingr, item: i64, depth: usize) -> bool {
                 } else {
                     name_to_item(m).map(|i| i == item).unwrap_or(false)
                 }
-            })
+            }) || vanilla_item_tag_fallback(&tag, item)
         }
     }
+}
+
+// ---------- Lane W2: datapack recipes + tags in the live menus ----------
+
+/// `true` when `tag` expands (through nested `#ref`s, cycle-guarded) to
+/// `item` in the given `item` tag map. Members resolve through `name_to_item`
+/// exactly like the loader's own ingredient normalization does.
+fn dp_item_tag_match(map: &HashMap<String, Vec<String>>, tag: &str, item: i64) -> bool {
+    let mut members = Vec::new();
+    tag_expand_into(
+        map,
+        tag,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+        &mut members,
+    );
+    members
+        .iter()
+        .any(|m| name_to_item(m.trim_start_matches("minecraft:")) == Some(item))
+}
+
+/// The captured vanilla datapack ships no item tags, so the memberships the
+/// 1.21.1 smithing recipes rely on are filled in here: the same fallbacks the
+/// crafting parity harness uses for `diamond_tool_materials`,
+/// `trimmable_armor` and `trim_materials`.
+fn vanilla_item_tag_fallback(tag: &str, item: i64) -> bool {
+    let Some(name) = item_to_name(item) else {
+        return false;
+    };
+    match tag {
+        "minecraft:diamond_tool_materials" => {
+            tool_parts(name).is_some_and(|(tier, _)| tier == "diamond")
+        }
+        "minecraft:trimmable_armor" => armor_parts(name).is_some(),
+        "minecraft:trim_materials" => TRIM_MATERIAL_ITEMS.contains(&name),
+        _ => false,
+    }
+}
+
+/// `ingr_match` for a caller that already holds the datapack registry: the
+/// registry `item` tags first, then the legacy mirror, then the vanilla
+/// smithing-tag fallbacks. `legacy` must be locked *before* the registry, the
+/// same order `DatapackContent::publish` acquires them.
+fn dp_ingr_match_locked(
+    registry: &DatapackRegistry,
+    legacy: &HashMap<String, Vec<String>>,
+    ig: &Ingr,
+    item: i64,
+    depth: usize,
+) -> bool {
+    match ig {
+        Ingr::Item(i) => *i == item,
+        Ingr::Tag(t) => {
+            if depth > 8 {
+                return false;
+            }
+            let tag = if t.contains(':') {
+                t.clone()
+            } else {
+                format!("minecraft:{t}")
+            };
+            if let Some(map) = registry.tags.get("item") {
+                if map.contains_key(&tag) && dp_item_tag_match(map, &tag, item) {
+                    return true;
+                }
+            }
+            if legacy.get(&tag).cloned().unwrap_or_default().iter().any(|m| {
+                match m.strip_prefix('#') {
+                    Some(inner) => dp_ingr_match_locked(
+                        registry,
+                        legacy,
+                        &Ingr::Tag(inner.to_owned()),
+                        item,
+                        depth + 1,
+                    ),
+                    None => name_to_item(m) == Some(item),
+                }
+            }) {
+                return true;
+            }
+            vanilla_item_tag_fallback(&tag, item)
+        }
+    }
+}
+
+/// `true` when `stack` matches any alternative of one recipe ingredient slot.
+fn dp_slot_matches(
+    registry: &DatapackRegistry,
+    legacy: &HashMap<String, Vec<String>>,
+    ingredients: &[Ingr],
+    stack: &Stack,
+) -> bool {
+    stack.1 > 0
+        && ingredients
+            .iter()
+            .any(|ig| dp_ingr_match_locked(registry, legacy, ig, stack.0, 0))
+}
+
+/// Datapack `stonecutting` recipes matching one input item, in stable order.
+/// `Ingr::Tag` alternatives resolve through the loaded `item` tags.
+fn live_dp_stonecut_recipes(item: i64) -> Vec<(i64, u8)> {
+    let legacy = item_tags().lock().unwrap_or_else(|e| e.into_inner());
+    let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<(i64, u8)> = registry
+        .stonecutting
+        .iter()
+        .filter(|recipe| {
+            recipe
+                .ingredients
+                .iter()
+                .any(|ig| dp_ingr_match_locked(&registry, &legacy, ig, item, 0))
+        })
+        .map(|recipe| (recipe.result, recipe.count))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The offered list the live stonecutter actually crafts from: datapack
+/// recipes first, then the builtin table for inputs the loaded packs do not
+/// cover (and the whole table when no datapack is loaded).
+fn live_stonecutter_recipes(input: &Stack) -> Vec<(i64, u8)> {
+    if input.1 == 0 {
+        return Vec::new();
+    }
+    let mut out = live_dp_stonecut_recipes(input.0);
+    if let Some(name) = item_to_name(input.0) {
+        for recipe in wm_stonecut_recipes(name) {
+            if !out.contains(&recipe) {
+                out.push(recipe);
+            }
+        }
+    }
+    out
+}
+
+fn live_stonecutter_result(menu: &StonecutterMenu) -> Stack {
+    menu.selected_recipe
+        .and_then(|index| live_stonecutter_recipes(&menu.input).get(index).copied())
+        .map(|(item, count)| (item, count, Vec::new()))
+        .unwrap_or_default()
+}
+
+fn live_stonecutter_select(menu: &mut StonecutterMenu, index: usize) -> bool {
+    if index < live_stonecutter_recipes(&menu.input).len() {
+        menu.selected_recipe = Some(index);
+        true
+    } else {
+        menu.selected_recipe = None;
+        false
+    }
+}
+
+fn live_stonecutter_take(menu: &mut StonecutterMenu) -> Option<Stack> {
+    let out = live_stonecutter_result(menu);
+    if out.1 == 0 || menu.input.1 == 0 {
+        return None;
+    }
+    menu.input.1 -= 1;
+    if menu.input.1 == 0 {
+        menu.input = Stack::default();
+        menu.selected_recipe = None;
+    }
+    Some(out)
+}
+
+/// `SmithingMenu.mayPlace` over the loaded datapack recipes: the recipe
+/// manager's template/base/addition ingredient sets decide what each slot
+/// accepts, covering custom templates and additions the builtin rules reject.
+fn live_dp_smithing_slot_accepts(slot: usize, stack: &Stack) -> bool {
+    let legacy = item_tags().lock().unwrap_or_else(|e| e.into_inner());
+    let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+    registry
+        .smithing_transform
+        .iter()
+        .chain(&registry.smithing_trim)
+        .any(|recipe| {
+            let ingredients = match slot {
+                0 => &recipe.template,
+                1 => &recipe.base,
+                _ => &recipe.addition,
+            };
+            dp_slot_matches(&registry, &legacy, ingredients, stack)
+        })
+}
+
+/// A matched datapack `smithing_trim`: the base stack keeps its item and
+/// components and gains `armor_trim` when pattern and material resolve to the
+/// trim registries. An already-identical trim refuses, like vanilla.
+fn live_dp_smithing_trim_output(template: &Stack, base: &Stack, addition: &Stack) -> Option<Stack> {
+    let pattern = item_to_name(template.0)?.strip_suffix("_armor_trim_smithing_template")?;
+    let material = item_to_name(addition.0)?;
+    let pattern_id = TRIM_PATTERNS.iter().position(|name| *name == pattern)?;
+    let material_id = TRIM_MATERIAL_ITEMS
+        .iter()
+        .position(|name| *name == material)?;
+    let trim = [material_id as u8 + 1, pattern_id as u8 + 1, 1];
+    if comp_get(&base.2, COMP_ARMOR_TRIM).and_then(|data| data.get(..2)) == Some(&trim[..2]) {
+        return None;
+    }
+    let mut result = (base.0, 1, base.2.clone());
+    comp_set(&mut result.2, COMP_ARMOR_TRIM, trim.to_vec());
+    Some(result)
+}
+
+/// The live smithing table's output: loaded `smithing_transform` and
+/// `smithing_trim` recipes first (tag ingredients resolved through the `item`
+/// tags), then the builtin upgrade/trim rules when no datapack recipe
+/// applies, so vanilla behavior survives with no datapack loaded.
+fn live_smithing_result(template: &Stack, base: &Stack, addition: &Stack) -> Option<Stack> {
+    if template.1 == 0 || base.1 == 0 || addition.1 == 0 {
+        return None;
+    }
+    {
+        let legacy = item_tags().lock().unwrap_or_else(|e| e.into_inner());
+        let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let matches = |recipe: &SmithingRecipe| {
+            dp_slot_matches(&registry, &legacy, &recipe.template, template)
+                && dp_slot_matches(&registry, &legacy, &recipe.base, base)
+                && dp_slot_matches(&registry, &legacy, &recipe.addition, addition)
+        };
+        if let Some(result) = registry.smithing_transform.iter().find_map(|recipe| {
+            if !matches(recipe) {
+                return None;
+            }
+            // Vanilla `transmuteCopy`: the result item keeps the base's
+            // component patch.
+            recipe.result.map(|item| (item, 1, base.2.clone()))
+        }) {
+            return Some(result);
+        }
+        if registry.smithing_trim.iter().any(matches) {
+            if let Some(result) = live_dp_smithing_trim_output(template, base, addition) {
+                return Some(result);
+            }
+        }
+    }
+    smithing_result(template, base, addition)
+}
+
+fn live_smithing_take(
+    menu: &mut SmithingMenu,
+    can_receive: impl FnOnce(&Stack) -> bool,
+) -> Option<Stack> {
+    let result =
+        live_smithing_result(&menu.template, &menu.base, &menu.addition).filter(can_receive)?;
+    for stack in [&mut menu.template, &mut menu.base, &mut menu.addition] {
+        consume_menu_stack(stack, 1);
+    }
+    Some(result)
+}
+
+/// The analog signal a live comparator reads at `pos`: the W-BE block-entity
+/// store first (lectern, chiseled bookshelf, jukebox, decorated pot, crafter,
+/// brewing stand, spawner), then the live block entities menus materialize,
+/// then the classic container fullness for chests, barrels, dispensers,
+/// droppers, hoppers and furnaces.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn live_comparator_signal_at(dim: DimId, x: i32, y: i32, z: i32) -> Option<u8> {
+    if let Some(signal) = comparator_signal_at_be(dim, (x, y, z)) {
+        return Some(signal);
+    }
+    {
+        let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, entity)) = store.entries.get(&(dim, x, y, z)) {
+            return Some(match entity {
+                LiveBlockEntity::Lectern(lectern, _) => {
+                    lectern.comparator_signal().clamp(0, 15) as u8
+                }
+                LiveBlockEntity::ChiseledBookshelf(shelf) => shelf.comparator_signal(),
+                LiveBlockEntity::DecoratedPot(pot) => {
+                    let stack_limit = pot
+                        .item
+                        .as_ref()
+                        .and_then(BlockEntityItem::to_stack)
+                        .map(|stack| stack_max_of(&stack) as u8)
+                        .unwrap_or(64);
+                    pot.comparator_signal(stack_limit)
+                }
+                LiveBlockEntity::Crafter(crafter, _) => crafter.comparator_signal(),
+                LiveBlockEntity::Jukebox(box_) => box_.comparator_signal(live_jukebox_song),
+                // Stored block entities with no analog output report 0, just
+                // like their W-BE counterparts (spawner, beacon, campfire...).
+                _ => 0,
+            });
+        }
+    }
+    let fullness = |stack: &Stack| (u32::from(stack.1), stack_max_of(stack) as u32);
+    let name = breg()?.name_of(block_at_dim(dim, x, y, z));
+    if name == "minecraft:brewing_stand" {
+        let stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
+        let slots = stands
+            .get(&(dim, x, y, z))
+            .map(|entry| entry.menu.slots.iter().map(fullness).collect::<Vec<_>>())
+            .unwrap_or_default();
+        return Some(container_analog_output_signal(&slots, 5));
+    }
+    let size = match name {
+        "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => 27,
+        "minecraft:dispenser" | "minecraft:dropper" => 9,
+        "minecraft:hopper" => 5,
+        "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
+            let furnaces = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            let slots = furnaces
+                .get(&(dim, x, y, z))
+                .map(|f| [&f.input, &f.fuel, &f.output].map(fullness));
+            return Some(container_analog_output_signal(
+                slots.as_ref().map_or(&[], |s| &s[..]),
+                3,
+            ));
+        }
+        _ => return None,
+    };
+    let chests = chests().lock().unwrap_or_else(|e| e.into_inner());
+    let window = chest_window_dim(dim, x, y, z);
+    let containers = [Some(window.0), window.1];
+    let slots = containers
+        .into_iter()
+        .flatten()
+        .flat_map(|key| {
+            chests
+                .get(&key)
+                .into_iter()
+                .flat_map(|slots| slots.values())
+        })
+        .map(fullness)
+        .collect::<Vec<_>>();
+    Some(container_analog_output_signal(
+        &slots,
+        size * if window.1.is_some() { 2 } else { 1 },
+    ))
 }
 fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
     // vanilla translation: the pattern's bounding box may sit at any
@@ -9660,7 +10008,8 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
                 menu.template.clone(),
                 menu.base.clone(),
                 menu.addition.clone(),
-                menu.result().unwrap_or_default(),
+                live_smithing_result(&menu.template, &menu.base, &menu.addition)
+                    .unwrap_or_default(),
             ]
         }
         LiveMenu::Merchant(id, menu) => {
@@ -9682,7 +10031,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
                 property: 0,
                 value: menu.selected_recipe.map_or(-1, |index| index as i16),
             });
-            vec![menu.input.clone(), menu.result()]
+            vec![menu.input.clone(), live_stonecutter_result(menu)]
         }
         LiveMenu::Grindstone(menu) => vec![
             menu.top.clone(),
@@ -9904,7 +10253,7 @@ fn live_enchant_button(c: &Client, window: i32, button: i32) {
                 // Vanilla `clickMenuButton`: the button is an index into the
                 // available recipes (stonecutter) or selectable patterns (loom).
                 LiveMenu::Stonecutter(menu) => {
-                    menu.select_button(button as usize);
+                    live_stonecutter_select(menu, button as usize);
                 }
                 LiveMenu::Loom(menu) => {
                     if let Some(pattern) =
@@ -9992,6 +10341,11 @@ fn live_input_limit(menu: &LiveMenu, slot: usize, stack: &Stack) -> u8 {
     match menu {
         LiveMenu::Enchanting(_) if slot == 0 => 1,
         LiveMenu::Enchanting(_) if item != "lapis_lazuli" => 0,
+        // Datapack smithing recipes widen `mayPlace` past the builtin rules:
+        // any loaded recipe's ingredient set accepts its slot's item.
+        LiveMenu::Smithing(_) if live_dp_smithing_slot_accepts(slot, stack) => {
+            stack_max_of(stack) as u8
+        }
         LiveMenu::Smithing(_) if slot == 0 && !item.ends_with("_smithing_template") => 0,
         LiveMenu::Smithing(_)
             if slot == 1 && tool_parts(item).is_none() && armor_parts(item).is_none() =>
@@ -10123,11 +10477,11 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                 });
                 output
             }
-            LiveMenu::Smithing(menu) => menu.take_result(receive),
+            LiveMenu::Smithing(menu) => live_smithing_take(menu, receive),
             LiveMenu::Stonecutter(menu) => {
-                let result = menu.result();
+                let result = live_stonecutter_result(menu);
                 if result.1 != 0 && receive(&result) {
-                    menu.take_result()
+                    live_stonecutter_take(menu)
                 } else {
                     None
                 }
@@ -12168,5 +12522,309 @@ mod p8b2_parity_component_wire_tests {
         invalid.extend_from_slice(&[1, 1, 1, 0]);
         write_varint(&mut invalid, SLOT_COMPONENT_TYPE_COUNT);
         assert!(slot_read_wire(&invalid).is_none());
+    }
+}
+
+#[cfg(test)]
+mod w2_live_wire_tests {
+    use super::*;
+
+    /// Saves and restores the datapack registry, legacy tag/recipe globals and
+    /// the live block-entity store around a live-wiring test.
+    struct DatapackWorld {
+        registry: DatapackRegistry,
+        items: HashMap<String, Vec<String>>,
+        recipes: Vec<JsonRecipe>,
+        smelts: Vec<SmeltRecipe>,
+        entities: LiveBlockEntityStore,
+    }
+
+    impl DatapackWorld {
+        fn new() -> Self {
+            Self {
+                registry: std::mem::take(
+                    &mut *datapack_registry().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                items: std::mem::take(
+                    &mut *item_tags().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                recipes: std::mem::take(
+                    &mut *json_recipes().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                smelts: std::mem::take(
+                    &mut *json_smelts().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                entities: std::mem::take(
+                    &mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+            }
+        }
+
+        fn set_item_tag(&mut self, tag: &str, members: &[&str]) {
+            self.registry_mut()
+                .tags
+                .entry("item".to_owned())
+                .or_default()
+                .insert(tag.to_owned(), members.iter().map(|m| m.to_string()).collect());
+        }
+
+        fn registry_mut(&mut self) -> std::sync::MutexGuard<'_, DatapackRegistry> {
+            datapack_registry().lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn recipes_mut(&mut self) -> std::sync::MutexGuard<'_, Vec<JsonRecipe>> {
+            json_recipes().lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn smelts_mut(&mut self) -> std::sync::MutexGuard<'_, Vec<SmeltRecipe>> {
+            json_smelts().lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    impl std::ops::Drop for DatapackWorld {
+        fn drop(&mut self) {
+            *datapack_registry().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.registry);
+            *item_tags().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.items);
+            *json_recipes().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.recipes);
+            *json_smelts().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.smelts);
+            *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.entities);
+        }
+    }
+
+    #[test]
+    fn w2_live_wire_datapack_stonecutting_with_tag_ingredient_crafts() {
+        let _guard = world_guard();
+        let mut world = DatapackWorld::new();
+        let Some(stone) = name_to_item("stone") else {
+            return;
+        };
+        let Some(glass) = name_to_item("glass") else {
+            return;
+        };
+        // A nested `#ref` ingredient proves the `item` tag expansion runs.
+        world.set_item_tag("test:w2_cut", &["#test:w2_cut_inner"]);
+        world.set_item_tag("test:w2_cut_inner", &["minecraft:stone"]);
+        world
+            .registry_mut()
+            .stonecutting
+            .push(StonecuttingRecipe {
+                ingredients: vec![Ingr::Tag("test:w2_cut".to_owned())],
+                result: glass,
+                count: 3,
+            });
+
+        let mut menu = StonecutterMenu::default();
+        menu.set_input((stone, 8, Vec::new()));
+        let recipes = live_stonecutter_recipes(&menu.input);
+        assert_eq!(recipes.first(), Some(&(glass, 3)), "recipes: {recipes:?}");
+        // The builtin table still answers for inputs the pack also covers.
+        assert!(recipes.len() > 1, "builtin stonecut recipes remain offered");
+        assert!(live_stonecutter_select(&mut menu, 0));
+        assert_eq!(live_stonecutter_result(&menu), (glass, 3, Vec::new()));
+        assert_eq!(
+            live_stonecutter_take(&mut menu),
+            Some((glass, 3, Vec::new()))
+        );
+        assert_eq!((menu.input.0, menu.input.1), (stone, 7));
+        // An input the datapack does not cover keeps the vanilla fallback.
+        assert!(live_dp_stonecut_recipes(name_to_item("cobblestone").unwrap_or(-1)).is_empty());
+    }
+
+    #[test]
+    fn w2_live_wire_datapack_smithing_transform_produces_result() {
+        let _guard = world_guard();
+        let mut world = DatapackWorld::new();
+        let (Some(template), Some(base), Some(addition), Some(result)) = (
+            name_to_item("netherite_upgrade_smithing_template"),
+            name_to_item("iron_sword"),
+            name_to_item("stick"),
+            name_to_item("netherite_sword"),
+        ) else {
+            return;
+        };
+        // A tag base proves tag ingredients resolve inside the live menu.
+        world.set_item_tag("test:w2_upgradable", &["minecraft:iron_sword"]);
+        world
+            .registry_mut()
+            .smithing_transform
+            .push(SmithingRecipe {
+                template: vec![Ingr::Item(template)],
+                base: vec![Ingr::Tag("test:w2_upgradable".to_owned())],
+                addition: vec![Ingr::Item(addition)],
+                result: Some(result),
+            });
+
+        let mut damaged: Stack = (base, 1, Vec::new());
+        comp_set_varint(&mut damaged.2, COMP_DAMAGE, 12);
+        let mut menu = SmithingMenu {
+            template: (template, 1, Vec::new()),
+            base: damaged.clone(),
+            addition: (addition, 1, Vec::new()),
+        };
+        // Vanilla `transmuteCopy`: the result item keeps the base's components.
+        assert_eq!(
+            live_smithing_result(&menu.template, &menu.base, &menu.addition),
+            Some((result, 1, damaged.2.clone()))
+        );
+        // A stick is no trim material, so the builtin slot-2 rule rejects it;
+        // the loaded recipe's addition set admits it (vanilla `mayPlace`).
+        assert_eq!(
+            live_input_limit(
+                &LiveMenu::Smithing(SmithingMenu::default()),
+                2,
+                &(addition, 1, Vec::new())
+            ),
+            64
+        );
+        assert_eq!(live_smithing_take(&mut menu, |_| true), Some((result, 1, damaged.2)));
+        assert!(menu.template.1 == 0 && menu.base.1 == 0 && menu.addition.1 == 0);
+    }
+
+    #[test]
+    fn w2_live_wire_datapack_smithing_trim_applies_armor_trim() {
+        let _guard = world_guard();
+        let mut world = DatapackWorld::new();
+        let (Some(template), Some(base), Some(addition)) = (
+            name_to_item("bolt_armor_trim_smithing_template"),
+            name_to_item("iron_chestplate"),
+            name_to_item("redstone"),
+        ) else {
+            return;
+        };
+        // The vanilla tag spellings resolve through the fallback memberships.
+        world.registry_mut().smithing_trim.push(SmithingRecipe {
+            template: vec![Ingr::Item(template)],
+            base: vec![Ingr::Tag("minecraft:trimmable_armor".to_owned())],
+            addition: vec![Ingr::Tag("minecraft:trim_materials".to_owned())],
+            result: None,
+        });
+
+        let mut menu = SmithingMenu {
+            template: (template, 1, Vec::new()),
+            base: (base, 1, Vec::new()),
+            addition: (addition, 1, Vec::new()),
+        };
+        let result =
+            live_smithing_result(&menu.template, &menu.base, &menu.addition).expect("trim output");
+        assert_eq!(result.0, base);
+        // bolt is TRIM_PATTERNS[0], redstone is TRIM_MATERIAL_ITEMS[9].
+        assert_eq!(comp_get(&result.2, COMP_ARMOR_TRIM), Some([10, 1, 1].as_slice()));
+        assert_eq!(live_smithing_take(&mut menu, |_| true), Some(result.clone()));
+        // The same trim applied twice refuses, like vanilla's trim recipe.
+        assert_eq!(
+            live_smithing_result(
+                &(template, 1, Vec::new()),
+                &result,
+                &(addition, 1, Vec::new())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn w2_live_wire_datapack_item_tags_match_crafting_and_smelting() {
+        let _guard = world_guard();
+        let mut world = DatapackWorld::new();
+        let (Some(coal), Some(result), Some(gold)) = (
+            name_to_item("coal"),
+            name_to_item("torch"),
+            name_to_item("gold_ingot"),
+        ) else {
+            return;
+        };
+        world.set_item_tag("test:w2_ing", &["#test:w2_ing_inner"]);
+        world.set_item_tag("test:w2_ing_inner", &["minecraft:coal"]);
+        assert!(ingr_match(&Ingr::Tag("test:w2_ing".to_owned()), coal, 0));
+        assert!(!ingr_match(&Ingr::Tag("test:w2_ing".to_owned()), gold, 0));
+
+        world.recipes_mut().push(JsonRecipe {
+            shaped: false,
+            rows: Vec::new(),
+            key: HashMap::new(),
+            ing: vec![Ingr::Tag("test:w2_ing".to_owned())],
+            out: result,
+            out_cnt: 4,
+        });
+        let grid: HashMap<i16, Stack> = HashMap::from([(1i16, (coal, 1, Vec::new()))]);
+        assert_eq!(json_craft_match(&grid, 2), Some((result, 4, Vec::new())));
+
+        world
+            .smelts_mut()
+            .push((Ingr::Tag("test:w2_ing".to_owned()), gold, 2, 1.5));
+        assert_eq!(smelt_out(coal), Some((gold, 2)));
+        assert_eq!(smelt_xp(coal), 1.5);
+    }
+
+    #[test]
+    fn w2_live_wire_comparator_reads_world_be_and_live_stores() {
+        let _guard = world_guard();
+        let _world = DatapackWorld::new();
+        let pos = (4_500_011, 120, 4_500_011);
+        let (x, y, z) = pos;
+
+        // W-BE chiseled bookshelf: last interacted slot + 1.
+        let mut shelf = ChiseledBookshelfBlockEntity::default();
+        assert!(shelf.insert_book(4, "minecraft:book"));
+        register_world_block_entity(
+            DimId::Overworld,
+            pos,
+            VanillaBlockEntity::ChiseledBookshelf(shelf),
+        );
+        assert_eq!(live_comparator_signal_at(DimId::Overworld, x, y, z), Some(5));
+
+        // W-BE jukebox: the song registry's comparator_output (cat = 2).
+        register_world_block_entity(
+            DimId::Overworld,
+            (x + 1, y, z),
+            VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
+                record_item: Some("minecraft:music_disc_cat".to_owned()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(live_comparator_signal_at(DimId::Overworld, x + 1, y, z), Some(2));
+
+        // W-BE lectern: floor(page / (pages - 1) * 14) + 1 = 8 at page 7 of 15.
+        register_world_block_entity(
+            DimId::Overworld,
+            (x, y, z + 1),
+            VanillaBlockEntity::Lectern(LecternBlockEntity {
+                book_item: Some("minecraft:written_book".to_owned()),
+                page: 7,
+                total_pages: 15,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(live_comparator_signal_at(DimId::Overworld, x, y, z + 1), Some(8));
+
+        // W-BE spawner: stored but has no analog output.
+        register_world_block_entity(
+            DimId::Overworld,
+            (x + 1, y, z + 1),
+            VanillaBlockEntity::MobSpawner(MobSpawnerBlockEntity::default()),
+        );
+        assert_eq!(live_comparator_signal_at(DimId::Overworld, x + 1, y, z + 1), Some(0));
+
+        // The live block-entity store is consulted when no W-BE entity exists.
+        let mut live_shelf = ChiseledBookshelf::default();
+        let mut book = BlockEntityItem::new("minecraft:book", 1);
+        assert!(live_shelf.insert_book(2, &mut book));
+        live_block_entities()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .insert(
+                (DimId::Overworld, x + 2, y, z),
+                (0, LiveBlockEntity::ChiseledBookshelf(live_shelf)),
+            );
+        assert_eq!(live_comparator_signal_at(DimId::Overworld, x + 2, y, z), Some(3));
+
+        // Cleanup: absent positions read nothing.
+        remove_world_block_entity(DimId::Overworld, pos);
+        assert_eq!(live_comparator_signal_at(DimId::Overworld, x, y, z), None);
     }
 }
