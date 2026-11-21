@@ -345,9 +345,11 @@ impl ChunkLightBatch {
 
 /// Tick-local, last-write-wins aggregation by chunk and block position.
 /// `drain` emits each chunk once, with deterministic chunk/position ordering.
+type ChunkEditMap = BTreeMap<(i32, i32, i32), u32>;
+
 #[derive(Clone, Debug, Default)]
 pub struct CoalescedLightQueue {
-    chunks: BTreeMap<(i32, i32), BTreeMap<(i32, i32, i32), u32>>,
+    chunks: BTreeMap<(i32, i32), ChunkEditMap>,
     unique_positions: usize,
 }
 

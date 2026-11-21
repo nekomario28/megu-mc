@@ -206,7 +206,8 @@ fn registry_table_matches_existing_light_fact_masks() {
 #[test]
 fn leaf_decay_burst_is_last_write_wins_and_one_batch_per_chunk() {
     let mut queue = CoalescedLightQueue::new();
-    let mut expected: BTreeMap<(i32, i32), BTreeMap<(i32, i32, i32), u32>> = BTreeMap::new();
+    type CellMap = BTreeMap<(i32, i32, i32), u32>;
+    let mut expected: BTreeMap<(i32, i32), CellMap> = BTreeMap::new();
 
     for event in 0..2_300 {
         let cell = event % 617;

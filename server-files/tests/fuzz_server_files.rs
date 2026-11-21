@@ -474,7 +474,7 @@ fn list_json_corpus() -> Vec<Vec<u8>> {
 
 /// Real `openpac_claims.json`/`openpac_parties.json` bytes produced by the
 /// crate's own writer, plus hand-shaped hostile documents.
-fn claims_corpus(scratch: &PathBuf) -> Vec<Vec<u8>> {
+fn claims_corpus(scratch: &std::path::Path) -> Vec<Vec<u8>> {
     let mut corpus = Vec::new();
     let mut world = ClaimsWorld::new();
     let main = SubClaimId::main();

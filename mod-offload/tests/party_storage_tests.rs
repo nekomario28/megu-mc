@@ -71,7 +71,7 @@ fn make_record(tag: u8) -> CompanionRecord {
     r.held_item = Some("test:soothe_charm".into());
     r.status_condition = None;
     r.nature_or_trait = "brave".into();
-    r.shiny_or_rare = tag % 2 == 0;
+    r.shiny_or_rare = tag.is_multiple_of(2);
     r.moves = vec![
         "test:scratch".into(),
         "test:ember_dash".into(),
@@ -750,7 +750,7 @@ fn prty_decode_rejects_unknown_schema_and_oversized_counts() {
 
     // box_count past the 64-box cap, re-sealed: refused before allocation.
     let mut bad = body.to_vec();
-    bad[8..12].copy_from_slice(&u32::from(MAX_BOX_COUNT as u32 + 1).to_be_bytes());
+    bad[8..12].copy_from_slice(&(MAX_BOX_COUNT as u32 + 1).to_be_bytes());
     assert_eq!(
         decode_storage(&seal(bad)),
         Err(StorageDecodeError::OversizedCount {

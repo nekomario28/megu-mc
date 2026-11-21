@@ -852,6 +852,7 @@ impl LightEngine {
 
     /// Validate a batch the way `edit_batch` requires: nonempty, each edit in
     /// the window and in a loaded column, each fact representable.
+    #[allow(clippy::type_complexity)]
     fn prepare_edits(
         &self,
         edits: &[LightEdit],

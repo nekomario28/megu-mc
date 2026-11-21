@@ -230,7 +230,7 @@ impl Registry {
     /// parsed `block_states.json` object when the pack provides it, and
     /// `facts_bin` the pack's six-bytes-per-state facts table.
     fn from_parsed(blocks: &J, states: Option<&J>, facts_bin: &[u8]) -> Result<Self, Error> {
-        if facts_bin.is_empty() || facts_bin.len() % FACT_BYTES != 0 {
+        if facts_bin.is_empty() || !facts_bin.len().is_multiple_of(FACT_BYTES) {
             return Err(Error::InvalidJson);
         }
         let state_count = facts_bin.len() / FACT_BYTES;

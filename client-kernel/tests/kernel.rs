@@ -1044,7 +1044,7 @@ fn eighty_section_window_and_word_trimming() {
         &masks.empty_sky_mask,
         &masks.empty_block_mask,
     ] {
-        assert!(mask.last().map_or(true, |word| *word != 0), "untrimmed tail");
+        assert!(mask.last().is_none_or(|word| *word != 0), "untrimmed tail");
     }
 }
 

@@ -246,7 +246,7 @@ pub fn solve_collisions_spatial(
         result.cramming_damage[i] = max_entity_cramming > 0
             && result.candidate_counts[i] >= max_entity_cramming
             && nonpassengers >= max_entity_cramming
-            && cramming_rolls[i] % 4 == 0;
+            && cramming_rolls[i].is_multiple_of(4);
     }
     result
 }

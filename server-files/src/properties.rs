@@ -230,7 +230,7 @@ fn physical_lines(text: &str) -> Vec<&str> {
 }
 
 fn trim_leading_ws(s: &str) -> &str {
-    s.trim_start_matches(|c| c == ' ' || c == '\t' || c == '\u{0c}')
+    s.trim_start_matches([' ', '\t', '\u{0c}'])
 }
 
 /// `true` when `s` ends in an odd run of backslashes: the line continues.
@@ -403,20 +403,15 @@ fn prop_i64(doc: &PropertiesFile, key: &str, default: i64) -> i64 {
 /// [`MinimapMode::Unrestricted`], so no map feature is ever locked unless an
 /// operator opts in. An unrecognized value fails *closed* to
 /// [`MinimapMode::Disabled`] rather than silently permitting everything.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MinimapMode {
     /// Map mods run with every feature enabled (the default).
+    #[default]
     Unrestricted,
     /// Maps run, gated by the server's `allow-*` restriction keys.
     FairPlay,
     /// No minimap/world-map features at all.
     Disabled,
-}
-
-impl Default for MinimapMode {
-    fn default() -> Self {
-        Self::Unrestricted
-    }
 }
 
 impl MinimapMode {
@@ -447,20 +442,15 @@ impl MinimapMode {
 /// Like [`MinimapMode`], absent reads as the permissive default
 /// [`PlayerRadarScope::All`] and an unrecognized value fails closed to
 /// [`PlayerRadarScope::None`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PlayerRadarScope {
     /// Every player is visible on every radar (the default).
+    #[default]
     All,
     /// Self, operators, and party members / allied parties only.
     PartyOnly,
     /// Self and operators only — nobody else appears on the radar.
     None,
-}
-
-impl Default for PlayerRadarScope {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 impl PlayerRadarScope {

@@ -85,7 +85,7 @@ fn reference_collision(pool: &SoaEntityPool, max_cramming: usize, rolls: &[u8]) 
         expected.cramming_damage[i] = max_cramming > 0
             && expected.candidate_counts[i] >= max_cramming
             && nonpassengers >= max_cramming
-            && rolls[i] % 4 == 0;
+            && rolls[i].is_multiple_of(4);
     }
     expected
 }
@@ -727,7 +727,7 @@ fn fifty_plus_mobs_per_chunk_cached_vs_uncached_with_los_and_negative_chunks() {
             follow_range: if i % 17 == 0 { 280.0 } else { 12.0 },
         };
         let los = |_: &MobSensor, target: &SensorEntity| {
-            target.id % 13 != 0 && (mob.id ^ target.id) % 19 != 0
+            !target.id.is_multiple_of(13) && !(mob.id ^ target.id).is_multiple_of(19)
         };
         assert_eq!(
             cache.evaluate_mob_targets(&mob, los),

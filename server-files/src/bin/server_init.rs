@@ -768,6 +768,7 @@ fn populate_default_properties(props: &mut ServerProperties) {
     props.set_network_compression_threshold(256);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_init(
     dir: &Path,
     target: TargetVersion,

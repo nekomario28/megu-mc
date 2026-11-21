@@ -850,11 +850,16 @@ mod tests {
     /// One fully deterministic run of every region, returning each exported
     /// frame in sorted-key order. `budget.max_time` stays `None` — wall time
     /// is never part of the result.
+    type RunAllExport = (
+        Vec<(RegionKey, Result<RegionReport, TransportError>)>,
+        Vec<(RegionKey, Vec<u8>)>,
+    );
+
     fn run_all_and_export(
         scheduler: &mut RegionScheduler,
         tick: u64,
         threads: usize,
-    ) -> (Vec<(RegionKey, Result<RegionReport, TransportError>)>, Vec<(RegionKey, Vec<u8>)>) {
+    ) -> RunAllExport {
         let reports = scheduler.advance_all(
             tick,
             RegionBudget {
