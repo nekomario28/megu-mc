@@ -48,7 +48,10 @@ case "${MUTATION_STABILITY:-0}" in
 # `resourcepack.zip`; that file was removed as unprovenanced (see THIRD_PARTY.md) and the server
 # now simply advertises no resource pack, so there is nothing to copy. Everything else (specs,
 # .git, target, caches) is not an input and is not copied.
-INPUTS=(Cargo.toml Cargo.lock rust-toolchain.toml src tests tools assets datapacks evidence)
+# The manifest also resolves three optional path crates (`create-offload`), so their
+# manifests travel with the copy or cargo cannot read the dependency graph at all.
+INPUTS=(Cargo.toml Cargo.lock rust-toolchain.toml src tests tools assets datapacks evidence \
+    core mod-adapter-core create-adapter mod-offload)
 RUNTIME_INPUTS=(config_packets.bin)
 
 fail() {
@@ -697,7 +700,7 @@ check "sky spill loses one level per step" \
 # (measured 2026-11-16, registry_tests::sky_light_reads_lit_at_the_surface_and_dark_under_it),
 # which is the false green this entry closes.
 check "the light packet assembles spill into its floors" \
-  src/main.rs '    let spill = sky_spill(cx, cz, floor_of, op);' \
+  src/main.rs '    let spill = sky_spill(dim, cx, cz, floor_of, op);' \
   '    let spill = Default::default();' \
   registry_tests::sky_light_assembly_lights_through_an_opening_and_stops_at_a_barrier
 
@@ -872,28 +875,28 @@ check "broken sign text cannot survive its block" \
 # mutation moves to the column it reads. The pumpkin `state_flags` load it used to break is
 # covered by the metadata-offset entries above.
 check "solid metadata must reach every note block state" \
-  src/block_registry.rs '        state_fact(st)[0] & FACT_BLOCKS_MOTION != 0' \
-  '        state_fact(st)[0] & FACT_IS_AIR != 0' \
+  src/block_registry.rs '        self.pred_of(st) & FACT_BLOCKS_MOTION != 0' \
+  '        self.pred_of(st) & FACT_IS_AIR != 0' \
   note_block_keeps_solid_and_light_values_for_every_instrument
 
 check "the pinned facts separate the predicates vanilla separates" \
-  src/block_registry.rs '        state_fact(st)[0] & FACT_IS_AIR != 0' \
+  src/block_registry.rs '        self.pred_of(st) & FACT_IS_AIR != 0' \
   '        st == 0' \
   state_facts_answer_the_predicates_vanilla_separates
 
 check "an empty collision shape is not a full one" \
-  src/block_registry.rs '        state_fact(st)[0] & FACT_COLLISION_EMPTY != 0' \
-  '        state_fact(st)[0] & FACT_COLLISION_FULL != 0' \
+  src/block_registry.rs '        self.pred_of(st) & FACT_COLLISION_EMPTY != 0' \
+  '        self.pred_of(st) & FACT_COLLISION_FULL != 0' \
   state_facts_answer_the_predicates_vanilla_separates
 
 check "a fluid state is not a liquid block" \
-  src/block_registry.rs '        state_fact(st)[0] & FACT_FLUID_EMPTY == 0' \
-  '        state_fact(st)[0] & FACT_LIQUID != 0' \
+  src/block_registry.rs '        self.pred_of(st) & FACT_FLUID_EMPTY == 0' \
+  '        self.pred_of(st) & FACT_LIQUID != 0' \
   state_facts_answer_the_predicates_vanilla_separates
 
 check "the light columns are emission then block, not one shifted" \
-  src/block_registry.rs '        state_fact(st)[1] >> 4' \
-  '        state_fact(st)[1] & 0xf' \
+  src/block_registry.rs '        self.light_of_byte(st) >> 4' \
+  '        self.light_of_byte(st) & 0xf' \
   state_facts_answer_the_predicates_vanilla_separates
 
 check "the face planes are indexed by support type, not by direction" \
@@ -1126,10 +1129,10 @@ check "the deep-state memo returns the value it computed" \
   feature_population_output_matches_the_pre_refactor_capture
 check "the noise-value cache returns the value it computed" \
   src/generation_math.rs '            if slot.0 == key {
-                Some(slot.1)
+                slot.1
             } else {' \
   '            if slot.0 == key {
-                Some(slot.1 + 1.0)
+                slot.1 + 1.0
             } else {' \
   feature_population_output_matches_the_pre_refactor_capture
 check "the shared biome cache returns the value it computed" \
@@ -1202,12 +1205,18 @@ check "chat returns the actual sender and message" \
   tests/gameplay_wire.py 'gameplay wire: FAIL chat-echo'
 
 check "light arrays agree with their section masks" \
-  src/main.rs '    p.extend_from_slice(&sky_mask.to_be_bytes()); // skyLightMask' \
-  '    p.extend_from_slice(&(sky_mask - 1).to_be_bytes()); // skyLightMask' \
+  src/main.rs '        write_varint(
+            p,
+            mask.iter().map(|w| w.count_ones() as i64).sum::<i64>(),
+        );' \
+  '        write_varint(
+            p,
+            mask.iter().map(|w| w.count_ones() as i64).sum::<i64>() + 1,
+        );' \
   tests/gameplay_wire.py 'gameplay wire: FAIL light-mask-count'
 check "an update packet sends block light only" \
-  src/main.rs '        [0, mask, 0, empty],' \
-  '        [0, mask, 1, empty],' \
+  src/main.rs '        [Vec::new(), mask, Vec::new(), empty],' \
+  '        [Vec::new(), mask, vec![1], empty],' \
   update_light_packet_sends_block_light_only
 
 check "a large dripstone body is built in the empty cells" \
@@ -2408,8 +2417,10 @@ check "typed feature draws exclude raw positional RNGs" \
   generation_math::tests::draw_trace_separates_wrapped_and_raw_sources
 
 check "dump-only requests cannot fall through to runtime persistence" \
-  src/main.rs '        && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()' \
-  '        && false' tests/population_plan_test.py 'population plan: FAIL missing-profile'
+  src/main.rs '    if std::env::var_os("MC_SPINE_WG_DUMP").is_some()
+        && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()' \
+  '    if std::env::var_os("MC_SPINE_WG_DUMP").is_some()
+        && false' tests/population_plan_test.py 'population plan: FAIL missing-profile'
 
 # Both huge mushrooms and huge fungus double height. Bind this mutation to the
 # mushroom's initial height draw; a bare `height *= 2` now matches both bodies.
@@ -3851,8 +3862,8 @@ check "p2_3_s2b_dim2_furnace_loads_into_its_own_dimension" \
 # mutant below keeps the Overworld path identical and breaks exactly one Nether/End promise,
 # so the packet-level test has to notice it rather than trusting the helper that was edited.
 check "p2_3_s3_nether_and_end_have_zero_sky_mask" \
-  src/main.rs '    let sky_mask: i64 = if worldgen::has_skylight(dim) { mask } else { 0 };' \
-  '    let sky_mask: i64 = if worldgen::has_skylight(dim) { mask } else { mask };' \
+  src/main.rs '    let has_sky = worldgen::has_skylight(dim);' \
+  '    let has_sky = true;' \
   tick_tests::p2_3_s3_nether_and_end_chunk_packets_emit_16_sections_and_zero_sky_mask
 
 # Sixteen sections in the Nether/End, not the Overworld's twenty-four. A hard-coded 24 also
@@ -3872,8 +3883,10 @@ check "p2_3_s3_heightmap_uses_the_dimension_min_y" \
 # Block light is anchored one section below min_y: -16 in the Nether/End, not the
 # Overworld's -80. Using the Overworld anchor shifts a Nether torch from section 3 to 7.
 check "p2_3_s3_block_light_anchors_at_dimension_light_min_y" \
-  src/main.rs '    let light_min_y = dim.light_min_y();' \
-  '    let light_min_y = LIGHT_MIN_Y;' \
+  src/main.rs '    let light_sections = dim.light_sections();
+    let light_min_y = dim.light_min_y();' \
+  '    let light_sections = dim.light_sections();
+    let light_min_y = LIGHT_MIN_Y;' \
   tick_tests::p2_3_s3_nether_and_end_block_light_anchors_at_light_min_y_minus_16
 
 # A band read that answers from the Overworld's key makes a Nether write invisible to its own
@@ -3887,15 +3900,15 @@ check "p2_3_s3_band_cache_is_keyed_by_dimension" \
 # chunk window, the block-delta audience and the persisted position. Each mutant below
 # breaks one of those links and leaves the rest of the Overworld path identical.
 check "p2_3_s4_wire_id_is_the_registry_id" \
-  src/play_protocol.rs '    dim_type_wire_ids()[dim.index()]' \
-  '    dim.index() as i32' \
+  src/play_protocol.rs '        return dim_type_wire_ids()[dim.index()];' \
+  '        return dim.index() as i32;' \
   tick_tests::p2_3_s4_dimension_type_wire_ids_come_from_the_pinned_registry
 
 check "p2_3_s4_join_game_declares_every_dimension" \
-  src/play_protocol.rs '    write_varint(&mut p, 3);
-    for d in DimId::ALL {' \
+  src/play_protocol.rs '    write_varint(&mut p, dimensions.len() as i64);
+    for d in dimensions {' \
   '    write_varint(&mut p, 1);
-    for d in DimId::ALL {' \
+    for d in dimensions {' \
   tick_tests::p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim
 
 check "p2_3_s4_spawn_info_uses_wire_id" \
@@ -3928,21 +3941,33 @@ check "p2_3_s4_logout_saves_the_live_dimension" \
   tick_tests::p2_3_s4_logout_persists_the_clients_live_dimension
 
 check "p2_3_s4_chunk_deltas_respect_the_dimension_filter" \
-  src/play_protocol.rs '        if *client.dim.lock().unwrap() != dim {
+  src/play_protocol.rs '        let Ok(mut socket) = client.sock.lock() else {
+            continue;
+        };
+        if *client.dim.lock().unwrap() != dim {
             continue;
         }
         let (id, packet) = mk(client);' \
-  '        let (id, packet) = mk(client);' \
+  '        let Ok(mut socket) = client.sock.lock() else {
+            continue;
+        };
+        let (id, packet) = mk(client);' \
   tick_tests::p2_3_s4_broadcast_chunk_dim_filters_other_dimensions
 
 # The same filter, observed end-to-end with two live clients on the wire. This gate is not
 # selected by MUTATION_FILTER=p2_3_s4 (its filter names the script), but the full campaign runs it.
 check "p2_3_s4_block_deltas_are_dimension_scoped" \
-  src/play_protocol.rs '        if *client.dim.lock().unwrap() != dim {
+  src/play_protocol.rs '        let Ok(mut socket) = client.sock.lock() else {
+            continue;
+        };
+        if *client.dim.lock().unwrap() != dim {
             continue;
         }
         let (id, packet) = mk(client);' \
-  '        let (id, packet) = mk(client);' \
+  '        let Ok(mut socket) = client.sock.lock() else {
+            continue;
+        };
+        let (id, packet) = mk(client);' \
   tests/dimension_wire.py 'dimension wire: FAIL nether-edit-leaked-to-overworld'
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
