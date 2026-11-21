@@ -724,6 +724,10 @@ pub struct MeshKindTemplate {
     pub vertex_offset: i32,
 }
 
+/// Per-`mesh_kind` run descriptors `(mesh_kind, template, first_instance,
+/// count)` produced by the instance-packing passes.
+type InstanceRuns = Vec<(u32, MeshKindTemplate, u32, u32)>;
+
 /// 6-DOF rigid transform for one contraption/airship sub-world, as a 4x4
 /// column-major matrix (64 bytes). Slot 0 conventionally stays
 /// [`SubWorldTransformGpu::IDENTITY`] for the static world grid; a flying
@@ -893,7 +897,7 @@ impl KineticInstancePool {
     /// emit identical instance bytes.
     fn pack_instance_runs(
         &self,
-    ) -> (Vec<KineticInstanceGpu>, Vec<(u32, MeshKindTemplate, u32, u32)>) {
+    ) -> (Vec<KineticInstanceGpu>, InstanceRuns) {
         let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
         for record in self.instances.values() {
             if self.templates.contains_key(&record.mesh_kind) {
@@ -1351,11 +1355,7 @@ impl BlockEntityInstancePool {
         camera_pos: [f32; 3],
         max_dist_sq: f32,
         frustum_planes: &[[f32; 4]],
-    ) -> (
-        Vec<BlockEntityInstanceGpu>,
-        Vec<(u32, MeshKindTemplate, u32, u32)>,
-        BlockEntityBatchStats,
-    ) {
+    ) -> (Vec<BlockEntityInstanceGpu>, InstanceRuns, BlockEntityBatchStats) {
         let mut stats = BlockEntityBatchStats {
             total_registered: self.instances.len() as u32,
             ..BlockEntityBatchStats::default()

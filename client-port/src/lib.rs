@@ -9,6 +9,7 @@ mod cull;
 mod culler;
 pub mod ffi;
 pub mod gpu_pipeline;
+pub mod hiz_culler;
 mod lod;
 mod mesh;
 pub mod model_baker;
@@ -40,6 +41,7 @@ pub use gpu_pipeline::{
     MAX_QUADS_PER_MESHLET, MIN_GUARANTEED_UBO_BYTES, REQUIRED_MESH_OUTPUT_PRIMITIVES,
     REQUIRED_MESH_OUTPUT_VERTICES,
 };
+pub use hiz_culler::{HiZCullStats, HiZError, HiZPyramid, MAX_DEPTH_DIMENSION};
 pub use lod::{summarize_column, LodCell, LodSummary, LOD_COARSE, LOD_FINE};
 pub use mesh::{
     bucket_draw_mask, mesh_section, DirectionBuckets, Layer, Quad, DIRECTION_BUCKETS,

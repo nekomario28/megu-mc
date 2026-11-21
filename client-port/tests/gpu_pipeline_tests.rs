@@ -386,7 +386,7 @@ fn kinetic_instance(seed: u64, mesh_kind: u32) -> KineticInstanceGpu {
         pos: [seed as f32, 64.0, (seed % 97) as f32],
         angular_velocity: 1.5,
         phase: (seed % 31) as f32 * 0.1,
-        axis_and_flags: pack_axis_flags((seed % 3) as u32, seed % 7 == 0, false, 0),
+        axis_and_flags: pack_axis_flags((seed % 3) as u32, seed.is_multiple_of(7), false, 0),
         light_packed: 0x00f0,
         tint_rgba: 0xffff_ffff,
         scale_xyz: [1.0; 3],
@@ -492,7 +492,10 @@ fn removed_instances_leave_no_stale_records() {
     assert_eq!(upload.commands.len(), 1);
     assert_eq!(upload.commands[0].instance_count, 90);
     // pos.x carries the id: no removed id may survive in the SSBO.
-    assert!(upload.instances.iter().all(|r| (r.pos[0] as u64) % 10 != 0));
+    assert!(upload
+        .instances
+        .iter()
+        .all(|r| !(r.pos[0] as u64).is_multiple_of(10)));
 }
 
 #[test]
