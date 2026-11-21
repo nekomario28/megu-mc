@@ -91,6 +91,9 @@ python3 tests/client_fork_e2e.py --self-test
 python3 tests/perf_bench_test.py
 python3 tests/pgo_build_test.py
 python3 tools/vanilla_data/version_pack.py --self-test
+python3 tools/parity_cache.py --self-test
+python3 tools/release_bundle.py --self-test
+python3 tests/dev_check_test.py
 python3 tests/verify_gate_coverage_test.py
 
 echo "== module layering"
