@@ -24,6 +24,34 @@ fn within_tick(a: &ScheduledTick, b: &ScheduledTick) -> Ordering {
     (a.priority, a.sub_order).cmp(&(b.priority, b.sub_order))
 }
 
+thread_local! {
+    /// `collect` runs once per queue per tick and its per-chunk container
+    /// heap is pure scratch — it never escapes the drain — so it rides a
+    /// bounded thread-local instead of allocating a fresh `Vec` every pass.
+    /// The buffer is taken out (not borrowed) for the drain so a nested
+    /// `collect` would still see a usable empty `Vec`.
+    static COLLECT_CONTAINERS: std::cell::RefCell<Vec<ChunkPos>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Retained-capacity bound for the shared `collect` container heap: a
+/// one-off wide drain shrinks back on return instead of pinning peak memory.
+const COLLECT_SCRATCH_KEEP_BYTES: usize = 256 * 1024;
+
+fn bound_collect_scratch(v: &mut Vec<ChunkPos>) {
+    let keep = COLLECT_SCRATCH_KEEP_BYTES / std::mem::size_of::<ChunkPos>().max(1);
+    if v.capacity() > keep {
+        v.shrink_to(keep);
+    }
+}
+
+/// Retained capacity of the shared `collect` container heap — test-only proof
+/// that the scratch buffer is reused (and bounded) across drains.
+#[cfg(test)]
+fn collect_scratch_capacity() -> usize {
+    COLLECT_CONTAINERS.with(|cell| cell.borrow().capacity())
+}
+
 // Java PriorityQueue's treatment of equal elements is observable when two
 // containers have the same next priority/sub-order.
 fn heap_push<T>(heap: &mut Vec<T>, value: T, cmp: impl Fn(&T, &T) -> Ordering) {
@@ -472,6 +500,132 @@ mod tests {
             "truncated state is refused"
         );
     }
+
+    /// XPOLL-REDSTONE-TICKS: a 1,000-drain mixed workload must deliver the
+    /// identical `(pos, block, due, priority, sub_order)` stream on two
+    /// identically scheduled queues, keep every callback at or before its
+    /// `now`, and leave the shared container scratch at a stable bounded
+    /// capacity — zero steady-state growth.
+    #[test]
+    fn xpoll_redstone_ticks_drain_preserves_order_and_bounded_scratch() {
+        fn schedule(queue: &mut ScheduledTicks) -> usize {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut accepted = 0;
+            for i in 0..2_000u64 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let chunk = (i % 64) as i32;
+                let tick = ScheduledTick {
+                    pos: (
+                        chunk * 16 + (i % 7) as i32,
+                        (i % 12) as i32,
+                        ((i * 3) % 16) as i32,
+                    ),
+                    block: (i % 5) as u32,
+                    due: (i % 40) as i64,
+                    priority: ((i % 7) as i64 - 3) as i8,
+                    sub_order: i as i64,
+                };
+                accepted += usize::from(queue.schedule(tick));
+            }
+            accepted
+        }
+
+        let mut first = ScheduledTicks::new();
+        let mut second = ScheduledTicks::new();
+        let accepted = schedule(&mut first);
+        assert_eq!(accepted, schedule(&mut second));
+
+        let mut drained_first = Vec::new();
+        let mut drained_second = Vec::new();
+        let drain_start = std::time::Instant::now();
+        for now in 0..1_000i64 {
+            // Ticks all come due inside the first 40 drains; the remaining
+            // 960 collects exercise the empty fast path.
+            let a = first.collect(now, 1_000, |_| true);
+            let b = second.collect(now, 1_000, |_| true);
+            assert!(a.iter().all(|t| t.due <= now), "tick delivered before due");
+            assert_eq!(a, b, "identical queues diverged at now {now}");
+            drained_first.extend(a);
+            drained_second.extend(b);
+        }
+        // 40 working drains + 960 O(1) empty fast paths across two queues.
+        eprintln!(
+            "xpoll_redstone_ticks drain={} ticks={} collects=2000 elapsed={:.3}ms",
+            accepted,
+            drained_first.len(),
+            drain_start.elapsed().as_secs_f64() * 1e3,
+        );
+        assert_eq!(drained_first, drained_second);
+        assert_eq!(drained_first.len(), accepted, "every accepted tick delivered once");
+        // Every tick is delivered at the first `now` that reaches its due
+        // (the limit never binds here), so the stream's due stamps are
+        // nondecreasing across the whole run.
+        assert!(
+            drained_first.windows(2).all(|w| w[0].due <= w[1].due),
+            "a later-due tick overtook an earlier one"
+        );
+
+        // The shared scratch reached its working set during the wide drains
+        // and did not grow while the remaining collects hit the fast path.
+        let capacity = collect_scratch_capacity();
+        assert!(capacity > 0, "the drain used the shared container scratch");
+        assert!(
+            capacity * std::mem::size_of::<ChunkPos>() <= COLLECT_SCRATCH_KEEP_BYTES,
+            "scratch stayed under the 256 KiB bound"
+        );
+        for _ in 0..200 {
+            assert!(first.collect(2_000, 1_000, |_| true).is_empty());
+        }
+        assert_eq!(collect_scratch_capacity(), capacity, "steady-state scratch growth");
+    }
+
+    /// XPOLL-REDSTONE-TICKS: empty and future-only queues answer in O(1)
+    /// without delivering or dropping pending work; ineligible chunks keep
+    /// their deadlines for a later eligible drain.
+    #[test]
+    fn xpoll_redstone_ticks_empty_and_future_only_fast_path() {
+        let mut queue = ScheduledTicks::new();
+        assert!(queue.collect(0, 100, |_| true).is_empty());
+        assert_eq!(collect_scratch_capacity(), 0, "empty drains never touch scratch");
+
+        for i in 0..32i32 {
+            assert!(queue.schedule(ScheduledTick {
+                pos: (i * 16, 0, 0),
+                block: 1,
+                due: 100 + i64::from(i),
+                priority: 0,
+                sub_order: i64::from(i),
+            }));
+        }
+        assert!(queue.collect(50, 100, |_| true).is_empty(), "nothing is due yet");
+        assert!(queue.has_pending_matching(|_| true), "future ticks stay pending");
+
+        let due = queue.collect(200, 100, |_| true);
+        assert_eq!(due.len(), 32);
+        assert_eq!(
+            due.iter().map(|t| t.pos.0).collect::<Vec<_>>(),
+            (0..32i32).map(|i| i * 16).collect::<Vec<_>>(),
+            "one tick per chunk drains in sub-order"
+        );
+        assert!(queue.collect(300, 100, |_| true).is_empty());
+
+        // An ineligible chunk is not drained and not forgotten.
+        assert!(queue.schedule(ScheduledTick {
+            pos: (512, 0, 0),
+            block: 2,
+            due: 10,
+            priority: 0,
+            sub_order: 99,
+        }));
+        assert!(queue.collect(400, 100, |_| false).is_empty());
+        assert!(queue.has_pending_matching(|t| t.block == 2));
+        let rest = queue.collect(400, 100, |_| true);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].pos, (512, 0, 0));
+        assert!(!queue.has_pending_matching(|_| true));
+    }
 }
 
 #[cfg(test)]
@@ -813,7 +967,16 @@ impl ScheduledTicks {
         limit: usize,
         eligible: impl Fn(ChunkPos) -> bool,
     ) -> Vec<ScheduledTick> {
-        let mut containers = Vec::new();
+        // `next` holds exactly one deadline per chunk that still has a pending
+        // tick, so an empty table means every heap is drained: answer in O(1)
+        // without touching the allocator, the container heap, or the sort.
+        if self.next.len == 0 {
+            debug_assert!(self.chunks.values().all(|chunk| chunk.heap.is_empty()));
+            return Vec::new();
+        }
+        let mut containers =
+            COLLECT_CONTAINERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        containers.clear();
         self.next.take_ready(|key, due| {
             let chunk = chunk_from_key(key);
             if due > now || !eligible(chunk) {
@@ -824,7 +987,11 @@ impl ScheduledTicks {
             });
             true
         });
-        let mut result = Vec::new();
+        // Every popped container yields at least its head tick before the
+        // loop can stop, so this is a lower bound on the final length — the
+        // reserve never over-allocates past what the drain is guaranteed to
+        // return, and the returned `Vec` still owns its own buffer.
+        let mut result = Vec::with_capacity(containers.len().min(limit));
         while result.len() < limit && !containers.is_empty() {
             let chunk = heap_pop(&mut containers, |a, b| {
                 within_tick(&self.chunks[a].heap[0], &self.chunks[b].heap[0])
@@ -859,10 +1026,12 @@ impl ScheduledTicks {
                 }
             }
         }
-        for chunk in containers {
+        for chunk in containers.drain(..) {
             self.next
                 .put(chunk_key(chunk), self.chunks[&chunk].heap[0].due);
         }
+        bound_collect_scratch(&mut containers);
+        COLLECT_CONTAINERS.with(|cell| *cell.borrow_mut() = containers);
         result
     }
 }

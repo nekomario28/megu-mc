@@ -34,6 +34,37 @@ fn fluid_washes_away(reg: &crate::block_registry::BReg, state: u32) -> bool {
     reg.is_collision_empty(state) && !reg.blocks_motion(state)
 }
 
+thread_local! {
+    /// BFS scratch for [`sponge_absorb_water`]: the visited set and frontier
+    /// queue are per-call scratch that never escapes the pass. Both are taken
+    /// out (not borrowed) for the traversal — a nested absorb would still see
+    /// usable empty collections rather than panicking on the `RefCell`.
+    /// Vanilla caps the walk at 65 visited cells with <= 6 neighbours each,
+    /// so both collections stay far under the 256 KiB scratch bound by
+    /// construction.
+    static SPONGE_SEEN: std::cell::RefCell<HashSet<BlockPos>> =
+        std::cell::RefCell::new(HashSet::new());
+    static SPONGE_QUEUE: std::cell::RefCell<std::collections::VecDeque<(BlockPos, u8)>> =
+        std::cell::RefCell::new(std::collections::VecDeque::new());
+}
+
+/// Per-tick scratch for [`tick_world_block_entities`]: the mob snapshot, the
+/// sorted block-entity position list and the crafter re-poll list are rebuilt
+/// every tick but never escape the pass, so they ride one bounded
+/// thread-local instead of three fresh `Vec`s per tick. The whole struct is
+/// taken out for the pass so re-entrant use still sees empty buffers.
+#[derive(Default)]
+struct BeTickScratch {
+    live_mobs: Vec<(i64, [f64; 3])>,
+    positions: Vec<(DimId, i32, i32, i32)>,
+    crafter_power: Vec<(BlockPos, bool)>,
+}
+
+thread_local! {
+    static BE_TICK_SCRATCH: std::cell::RefCell<BeTickScratch> =
+        std::cell::RefCell::new(BeTickScratch::default());
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 const WORLD_BORDER_MAX_SIZE: f64 = 59_999_968.0;
 
@@ -2444,32 +2475,43 @@ pub(crate) fn tick_world_block_entities(
     nearby_players: &[[f64; 3]],
     rand_seed: u64,
 ) -> Vec<WorldBlockEntityEvent> {
+    // The mob snapshot, position list and crafter re-poll list ride the
+    // bounded thread-local scratch: taken out for the pass so the `RefCell`
+    // is never held across the registry locks below, and returned bounded
+    // for the next tick.
+    let mut scratch =
+        BE_TICK_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    scratch.live_mobs.clear();
+    scratch.positions.clear();
+    scratch.crafter_power.clear();
     // Snapshot live entities before locking the block-entity store. This also
     // avoids acquiring the mobs registry while the block-entity lock is held.
-    let live_mobs: Vec<(i64, [f64; 3])> = mobs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|mob| mob.dim == dim)
-        .map(|mob| {
-            let pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-            (mob.etype, [pos.0, pos.1, pos.2])
-        })
-        .collect();
+    scratch.live_mobs.extend(
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|mob| mob.dim == dim)
+            .map(|mob| {
+                let pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                (mob.etype, [pos.0, pos.1, pos.2])
+            }),
+    );
     let reg = breg();
     let mut store = world_block_entity_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     // HashMap iteration order is randomized. Sort positions for deterministic
     // spawner randomness and event order across runs and insertion histories.
-    let mut positions: Vec<_> = store.keys().filter(|(d, _, _, _)| *d == dim).copied().collect();
-    positions.sort_by_key(|(_, x, y, z)| (*x, *y, *z));
+    scratch
+        .positions
+        .extend(store.keys().filter(|(d, _, _, _)| *d == dim).copied());
+    scratch.positions.sort_by_key(|(_, x, y, z)| (*x, *y, *z));
     let mut rng = WorldMechanismLcg::new(rand_seed ^ world_tick);
     let mut events = Vec::new();
     // Crafters whose last applied powered state the redstone pass may since
     // have changed are re-polled after the store lock is released.
-    let mut crafter_power = Vec::new();
-    for (dim, x, y, z) in positions {
+    for &(dim, x, y, z) in &scratch.positions {
         let pos = (x, y, z);
         let Some(entity) = store.get_mut(&(dim, x, y, z)) else { continue };
         match entity {
@@ -2526,7 +2568,7 @@ pub(crate) fn tick_world_block_entities(
                 let kind = entity_spec_by_name(&spawner.entity_id)
                     .filter(|spec| spec.max_health > 0.0)
                     .map(|spec| spec.id);
-                let existing = live_mobs.iter().filter(|(id, at)| {
+                let existing = scratch.live_mobs.iter().filter(|(id, at)| {
                     Some(*id) == kind &&
                         (0..3).all(|i| (at[i] - center[i]).abs() <= range)
                 }).count();
@@ -2562,7 +2604,7 @@ pub(crate) fn tick_world_block_entities(
                 }
             }
             VanillaBlockEntity::Crafter(crafter) => {
-                crafter_power.push((pos, crafter.triggered));
+                scratch.crafter_power.push((pos, crafter.triggered));
             }
             VanillaBlockEntity::Beacon(beacon) if world_tick.is_multiple_of(80) => {
                 let Some(reg) = reg else { continue };
@@ -2614,9 +2656,9 @@ pub(crate) fn tick_world_block_entities(
     // value. A changed signal goes through `interact_world_block_entity`,
     // which reports the rising-edge `CrafterPulse` exactly once — the vanilla
     // `neighborChanged` semantics for a crafter.
-    if let (Some(reg), false) = (reg, crafter_power.is_empty()) {
+    if let (Some(reg), false) = (reg, scratch.crafter_power.is_empty()) {
         let now = live_block_entity_time();
-        for (pos, was_powered) in crafter_power {
+        for (pos, was_powered) in scratch.crafter_power.drain(..) {
             let powered = live_crafter_powered(reg, (dim, pos.0, pos.1, pos.2), now);
             if powered == was_powered {
                 continue;
@@ -2625,6 +2667,10 @@ pub(crate) fn tick_world_block_entities(
             interact_world_block_entity(dim, pos, Some(action), None);
         }
     }
+    bound_vec_scratch(&mut scratch.live_mobs);
+    bound_vec_scratch(&mut scratch.positions);
+    bound_vec_scratch(&mut scratch.crafter_power);
+    BE_TICK_SCRATCH.with(|cell| *cell.borrow_mut() = scratch);
     events
 }
 
@@ -8332,8 +8378,12 @@ pub(crate) fn note_block_refresh_instrument_dim(
     }
     let inst = note_block_instrument_at_dim(dim, pos)?;
     let new_st = reg.with_prop(st, "instrument", inst.state_name());
-    set_block_dim(dim, pos.0, pos.1, pos.2, new_st);
-    note_block_update_dim(dim, pos.0, pos.1, pos.2, new_st);
+    // Vanilla `updateNoteBlockState` only writes when the recomputed state
+    // differs; an unchanged instrument must not rebroadcast a block update.
+    if new_st != st {
+        set_block_dim(dim, pos.0, pos.1, pos.2, new_st);
+        note_block_update_dim(dim, pos.0, pos.1, pos.2, new_st);
+    }
     Some(inst)
 }
 
@@ -8828,9 +8878,15 @@ pub(crate) fn sponge_absorb_water(dim: DimId, sponge: BlockPos) -> Vec<BlockPos>
         }
     };
 
-    let mut seen: HashSet<BlockPos> = HashSet::from([sponge]);
-    let mut queue: std::collections::VecDeque<(BlockPos, u8)> =
-        std::collections::VecDeque::from([(sponge, 0)]);
+    // The visited set and frontier ride the bounded thread-local scratch:
+    // taken out for the pass so the `RefCell` is never held across the world
+    // writes below, and returned cleared for the next absorb.
+    let mut seen = SPONGE_SEEN.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    seen.clear();
+    seen.insert(sponge);
+    let mut queue = SPONGE_QUEUE.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    queue.clear();
+    queue.push_back((sponge, 0));
     let mut absorbed: Vec<BlockPos> = Vec::new();
     let mut visited: usize = 0;
     while let Some((cur, depth)) = queue.pop_front() {
@@ -8860,6 +8916,10 @@ pub(crate) fn sponge_absorb_water(dim: DimId, sponge: BlockPos) -> Vec<BlockPos>
             }
         }
     }
+    // Both collections are inherently bounded by the 65-cell vanilla cap, so
+    // they go straight back without a capacity trim.
+    SPONGE_SEEN.with(|cell| *cell.borrow_mut() = seen);
+    SPONGE_QUEUE.with(|cell| *cell.borrow_mut() = queue);
     absorbed
 }
 
@@ -9333,6 +9393,183 @@ mod vanilla_blocks_tests {
         assert!(sponge_nether_dries(DimId::Nether));
         assert!(!sponge_nether_dries(DimId::Overworld));
         assert!(!sponge_nether_dries(DimId::End));
+    }
+
+    /// XPOLL-REDSTONE-TICKS: the sponge BFS rides the bounded thread-local
+    /// scratch; two identical water shells must absorb in the identical
+    /// relative BFS order, and the retained scratch stays tiny.
+    #[test]
+    fn xpoll_redstone_ticks_sponge_bfs_reuses_scratch_bit_identical() {
+        let _guard = world_guard();
+        let dim = DimId::Overworld;
+        let shell = |origin: BlockPos| {
+            for dx in -2..=2 {
+                for dy in -2..=2 {
+                    for dz in -2..=2 {
+                        if dx == 0 && dy == 0 && dz == 0 {
+                            continue;
+                        }
+                        set_block_dim(
+                            dim,
+                            origin.0 + dx,
+                            origin.1 + dy,
+                            origin.2 + dz,
+                            state("minecraft:water"),
+                        );
+                    }
+                }
+            }
+        };
+        let sponge_a = (24700, 210, 24700);
+        let sponge_b = (24800, 210, 24800);
+        set_block_dim(dim, sponge_a.0, sponge_a.1, sponge_a.2, state("minecraft:sponge"));
+        shell(sponge_a);
+        let first = sponge_absorb_water(dim, sponge_a);
+        set_block_dim(dim, sponge_b.0, sponge_b.1, sponge_b.2, state("minecraft:sponge"));
+        shell(sponge_b);
+        let second = sponge_absorb_water(dim, sponge_b);
+
+        let relative = |sponge: BlockPos, absorbed: &[BlockPos]| -> Vec<(i32, i32, i32)> {
+            absorbed
+                .iter()
+                .map(|p| (p.0 - sponge.0, p.1 - sponge.1, p.2 - sponge.2))
+                .collect()
+        };
+        assert!(!first.is_empty());
+        assert_eq!(
+            relative(sponge_a, &first),
+            relative(sponge_b, &second),
+            "reused BFS scratch changed the absorption order"
+        );
+        // Vanilla bounds the walk at 65 visited cells x 6 neighbours, so the
+        // retained scratch can never approach the 256 KiB cap.
+        SPONGE_QUEUE.with(|cell| {
+            assert!(
+                cell.borrow().capacity() * std::mem::size_of::<(BlockPos, u8)>()
+                    <= 256 * 1024
+            );
+        });
+        SPONGE_SEEN.with(|cell| {
+            assert!(cell.borrow().capacity() <= 4096, "visited set stayed bounded");
+        });
+    }
+
+    /// XPOLL-REDSTONE-TICKS: recomputing an unchanged instrument must not
+    /// rewrite the block or queue a neighbor broadcast; a real change still
+    /// does, and the next identical refresh is silent again.
+    #[test]
+    fn xpoll_redstone_ticks_unchanged_state_skips_broadcast() {
+        let _guard = world_guard();
+        let dim = DimId::Overworld;
+        let pos = (24900, 210, 24900);
+        set_block_dim(dim, pos.0, pos.1, pos.2, state("minecraft:note_block"));
+        set_block_dim(dim, pos.0, pos.1 - 1, pos.2, state("minecraft:air"));
+        let section = (
+            dim,
+            pos.0.div_euclid(16),
+            pos.1.div_euclid(16),
+            pos.2.div_euclid(16),
+        );
+        let pending_len = || {
+            pending_blocks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&section)
+                .map_or(0, |entries| entries.len())
+        };
+
+        let before = pending_len();
+        assert_eq!(
+            note_block_refresh_instrument_dim(dim, pos),
+            Some(NoteBlockInstrument::Harp),
+            "air below resolves to the default harp instrument"
+        );
+        assert_eq!(
+            pending_len(),
+            before,
+            "an unchanged instrument queued a redundant block update"
+        );
+
+        set_block_dim(dim, pos.0, pos.1 - 1, pos.2, state("minecraft:gold_block"));
+        assert_eq!(
+            note_block_refresh_instrument_dim(dim, pos),
+            Some(NoteBlockInstrument::Bell)
+        );
+        let changed = pending_len();
+        assert!(changed > before, "a real instrument change still broadcasts");
+        assert_eq!(
+            note_block_refresh_instrument_dim(dim, pos),
+            Some(NoteBlockInstrument::Bell)
+        );
+        assert_eq!(
+            pending_len(),
+            changed,
+            "the settled instrument must not rebroadcast"
+        );
+    }
+
+    /// XPOLL-REDSTONE-TICKS: the per-tick block-entity pass reuses its
+    /// bounded scratch; two identical ticks over an identical registry emit
+    /// identical events and the scratch stays under the 256 KiB bound.
+    #[test]
+    fn xpoll_redstone_ticks_be_tick_scratch_bounded_and_deterministic() {
+        let _guard = world_guard();
+        let dim = DimId::Overworld;
+        let campfire = || {
+            VanillaBlockEntity::Campfire(CampfireBlockEntity {
+                slots: std::array::from_fn(|i| {
+                    (i == 0).then(|| ("minecraft:beef".to_string(), 0, 1))
+                }),
+            })
+        };
+        let positions = [(25200, 210, 25200), (25201, 210, 25200), (25202, 210, 25200)];
+        for (i, pos) in positions.iter().enumerate() {
+            let (entity, block) = match i {
+                0 => (
+                    campfire(),
+                    reg().with_prop(
+                        reg().state_of("minecraft:campfire", None),
+                        "lit",
+                        "true",
+                    ),
+                ),
+                1 => (
+                    VanillaBlockEntity::Jukebox(JukeboxBlockEntity::default()),
+                    reg().state_of("minecraft:jukebox", None),
+                ),
+                _ => (
+                    VanillaBlockEntity::Crafter(CrafterBlockEntity::default()),
+                    reg().state_of("minecraft:crafter", None),
+                ),
+            };
+            register_world_block_entity(dim, *pos, entity);
+            set_block_dim(dim, pos.0, pos.1, pos.2, block);
+        }
+
+        let first = tick_world_block_entities(dim, 7, &[], 42);
+        // Re-arm the finished campfire slot so the second tick is identical.
+        register_world_block_entity(dim, positions[0], campfire());
+        let second = tick_world_block_entities(dim, 7, &[], 42);
+        assert_eq!(first, second, "reused scratch changed the tick's events");
+        assert!(
+            first.iter().any(|event| matches!(event, WorldBlockEntityEvent::Cooked { .. })),
+            "the lit campfire cooked through the live tick"
+        );
+        BE_TICK_SCRATCH.with(|cell| {
+            let scratch = cell.borrow();
+            assert!(
+                scratch.live_mobs.capacity() * std::mem::size_of::<(i64, [f64; 3])>()
+                    <= 256 * 1024
+            );
+            assert!(
+                scratch.positions.capacity() * std::mem::size_of::<(DimId, i32, i32, i32)>()
+                    <= 256 * 1024
+            );
+            assert!(
+                scratch.crafter_power.capacity() * std::mem::size_of::<(BlockPos, bool)>()
+                    <= 256 * 1024
+            );
+        });
     }
 }
 
