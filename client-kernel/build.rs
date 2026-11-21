@@ -31,9 +31,14 @@ fn main() {
     let main = source("main");
     let protocol = source("play_protocol");
     let varint = between(&protocol, "\nfn write_varint(", "\nfn write_str(");
-    let palette = source("paletted");
-    let palette = split(&palette, "    pub(crate) fn write_wire(").0;
-    emit("palette.rs", format!("{varint}\n{palette}}}\n"));
+    let palette_src = source("paletted");
+    let palette = split(&palette_src, "    pub(crate) fn write_wire(").0;
+    let palette_helpers = between(
+        &palette_src,
+        "\n/// VarInt byte count",
+        "\npub(crate) fn run_paletted_bench(",
+    );
+    emit("palette.rs", format!("{varint}\n{palette}}}\n{palette_helpers}\n"));
 
     let nbt = source("nbt");
     let (read, gzip) = split(&nbt, "\npub(crate) fn read_gzip(");
@@ -47,7 +52,7 @@ fn main() {
     let aabb_impl = between(
         &collision,
         "    fn min(self)",
-        "\n/// 1.21.1 `BlockCollisions`",
+        "\n/// The 1.21.1 `BlockCollisions`",
     );
     let sweep = between(
         &collision,
@@ -100,7 +105,7 @@ fn main() {
     // Switch the lookup value from a BReg state ID to the caller's per-cell facts.
     let fluid_query = format!("{fluid_height}{solid_face}{fluid_flow}");
     let block_lookup = "get_block: &impl Fn(i32, i32, i32) -> u32";
-    assert_eq!(fluid_query.matches(block_lookup).count(), 4);
+    assert_eq!(fluid_query.matches(block_lookup).count(), 5);
     let fluid_query = fluid_query.replace(
         block_lookup,
         "get_block: &impl Fn(i32, i32, i32) -> FluidCell",

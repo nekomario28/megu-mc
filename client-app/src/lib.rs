@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod render;
 pub mod render_graph;
 pub mod settings;
+pub mod shaderpack_runtime;
 pub mod shaders;
 pub mod sim;
 pub mod world;

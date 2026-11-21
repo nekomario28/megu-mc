@@ -2,7 +2,7 @@
 use crate::Error;
 use std::cell::Cell;
 
-#[allow(clippy::all)]
+#[allow(clippy::all, dead_code)]
 mod owner {
     use super::FluidCell;
 

@@ -1363,7 +1363,7 @@ mod incremental_lighting_tests {
         }
 
         let rounds = 20usize;
-        let t0 = Instant::now();
+        let t0 = std::time::Instant::now();
         for _ in 0..rounds {
             engine.rebuild();
         }
@@ -1375,7 +1375,7 @@ mod incremental_lighting_tests {
             .collect();
         let remove: Vec<(Position, LightBlock)> =
             place.iter().map(|&(pos, _)| (pos, AIR)).collect();
-        let t1 = Instant::now();
+        let t1 = std::time::Instant::now();
         let mut sink = 0usize;
         for i in 0..rounds {
             let edits = if i % 2 == 0 { &place } else { &remove };

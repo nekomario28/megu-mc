@@ -80,12 +80,15 @@ pub use region::{
 };
 pub use section::*;
 pub use shaderpack::{
-    plan_shader_pipeline, preprocess_shader_source, AlphaTest, BlendDirective, CustomImage,
-    CustomTexture, GpuShaderCaps, IdMap, IdMatcher, IrisFeature, PackDimension, PackOrigin,
-    PassKind, PipelineStage, PreprocessedShader, Profile, ShaderCompatibilityReport, ShaderKind,
-    ShaderOption, ShaderPackError, ShaderPackSource, ShaderPass, ShaderProperties, ShadowSettings,
-    SsboSpec, MAX_INCLUDE_DEPTH, MAX_PACK_FILES, MAX_PACK_UNPACKED_BYTES, MAX_PROPERTIES_BYTES,
-    MAX_SHADER_FILE_BYTES, MAX_TOTAL_INCLUDES, MAX_ZIP_FILE_BYTES,
+    is_megu_wgsl_pack, load_megu_wgsl_pack, plan_shader_pipeline,
+    plan_shader_pipeline_with_options, preprocess_shader_source, AlphaTest, BlendDirective,
+    CustomImage, CustomTexture, GpuShaderCaps, IdMap, IdMatcher, IrisFeature, MeguWgslPack,
+    MeguWgslPass, PackDimension, PackOrigin, PassKind, PipelineStage, PreprocessedShader, Profile,
+    ShaderCompatibilityReport, ShaderKind, ShaderOption, ShaderOptionOverrides, ShaderPackError,
+    ShaderPackFamily, ShaderPackLang, ShaderPackSource, ShaderPass, ShaderProperties,
+    ShaderPipelinePlan, ShaderUniformRequirements, ShadowSettings, SsboSpec, MAX_INCLUDE_DEPTH,
+    MAX_PACK_FILES, MAX_PACK_UNPACKED_BYTES, MAX_PROPERTIES_BYTES, MAX_SHADER_FILE_BYTES,
+    MAX_TOTAL_INCLUDES, MAX_ZIP_FILE_BYTES, MEGU_WGSL_MANIFEST,
 };
 pub use upload_budget::{
     ChunkUploadBudget, DEFAULT_MAX_UPLOADS_PER_FRAME, DEFAULT_MAX_UPLOAD_BYTES_PER_FRAME,

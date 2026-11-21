@@ -478,6 +478,7 @@ pub(crate) mod owner {
                 patch,
                 frontier,
                 queue,
+                ..
             } = &mut scratch;
             patch.clear();
             frontier.clear();

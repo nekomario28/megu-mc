@@ -2509,11 +2509,14 @@ impl GpuShaderCaps {
 }
 
 /// A fully-planned shaderpack: ordered passes, parsed properties, material
-/// ID maps and the GPU compatibility verdict.
+/// ID maps, uniform/buffer requirements, pack family classification, and
+/// the GPU compatibility verdict.
 #[derive(Clone, Debug)]
 pub struct ShaderPipelinePlan {
     /// Dimension the plan was built for.
     pub dimension: PackDimension,
+    /// Broad shaderpack architecture family detected from passes and properties.
+    pub family: ShaderPackFamily,
     /// Passes in execution order (stage, then program order).
     pub passes: Vec<ShaderPass>,
     /// Parsed `shaders.properties`, when present.
@@ -2524,6 +2527,9 @@ pub struct ShaderPipelinePlan {
     pub item_ids: Option<IdMap>,
     /// `entity.properties` material IDs.
     pub entity_ids: Option<IdMap>,
+    /// Uniform, buffer, dual-hand lighting and DistantHorizons LOD requirements
+    /// discovered across all preprocessed passes.
+    pub uniforms: ShaderUniformRequirements,
     /// Compatibility verdict against the supplied caps.
     pub compatibility: ShaderCompatibilityReport,
 }
@@ -2551,6 +2557,12 @@ impl ShaderPipelinePlan {
     /// against.
     pub fn is_compatible(&self) -> bool {
         self.compatibility.is_compatible()
+    }
+
+    /// Whether this pack defines any DistantHorizons/LOD passes
+    /// (`dh_terrain`, `dh_water`, `dh_shadow`, ...).
+    pub fn has_dh_lod_passes(&self) -> bool {
+        self.passes.iter().any(|p| p.name.starts_with("dh_"))
     }
 }
 
@@ -2601,7 +2613,10 @@ fn program_stage(name: &str) -> Option<PipelineStage> {
         Some(PipelineStage::Prepare)
     } else if prefixed_digits(name, "begin") {
         Some(PipelineStage::Begin)
-    } else if prefixed_digits(name, "shadowcomp") || prefixed_digits(name, "shadow") {
+    } else if prefixed_digits(name, "shadowcomp")
+        || prefixed_digits(name, "shadow")
+        || name == "dh_shadow"
+    {
         Some(PipelineStage::Shadow)
     } else if name.starts_with("gbuffers_") {
         Some(PipelineStage::Gbuffers)
@@ -2612,12 +2627,18 @@ fn program_stage(name: &str) -> Option<PipelineStage> {
     }
 }
 
-/// Sort key within a stage: shadow-map programs before `shadowcomp`, known
-/// gbuffers programs in canonical order, numbered suffixes numerically, then
-/// by name.
+/// Sort key within a stage: shadow-map programs (`shadow*` -> `dh_shadow` ->
+/// `shadowcomp*`), known gbuffers programs in canonical order, `dh_terrain`
+/// before `dh_water`, numbered suffixes numerically, then by name.
 fn pass_sort_key(pass_name: &str, stage: PipelineStage) -> (u32, u32) {
-    let group = if stage == PipelineStage::Shadow && pass_name.starts_with("shadowcomp") {
-        1
+    let group = if stage == PipelineStage::Shadow {
+        if pass_name == "dh_shadow" {
+            1
+        } else if pass_name.starts_with("shadowcomp") {
+            2
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -2627,6 +2648,12 @@ fn pass_sort_key(pass_name: &str, stage: PipelineStage) -> (u32, u32) {
             .position(|&n| n == pass_name)
             .map(|i| i as u32)
             .unwrap_or(u32::MAX)
+    } else if stage == PipelineStage::DistantHorizons {
+        match pass_name {
+            "dh_terrain" => 0,
+            "dh_water" => 1,
+            _ => u32::MAX,
+        }
     } else {
         u32::MAX
     };
@@ -2644,6 +2671,28 @@ pub fn plan_shader_pipeline(
     dimension: PackDimension,
     caps: &GpuShaderCaps,
 ) -> Result<ShaderPipelinePlan, ShaderPackError> {
+    plan_shader_pipeline_with_options(
+        source,
+        dimension,
+        caps,
+        &ShaderOptionOverrides::default(),
+    )
+}
+
+/// Like [`plan_shader_pipeline`], additionally applying a named
+/// `profile.<NAME>` (from `shaders.properties`) and explicit per-option
+/// overrides to every `#define`/`// #define` option in the preprocessed
+/// shader sources before capability and uniform inspection.
+pub fn plan_shader_pipeline_with_options(
+    source: &ShaderPackSource,
+    dimension: PackDimension,
+    caps: &GpuShaderCaps,
+    overrides: &ShaderOptionOverrides,
+) -> Result<ShaderPipelinePlan, ShaderPackError> {
+    // --- pack-level properties first so profile.<NAME> can drive options --
+    let properties = ShaderProperties::load(source)?;
+    let resolved_overrides = resolve_option_overrides(properties.as_ref(), overrides);
+
     // --- discover program files ------------------------------------------
     let dim_dir = dimension.dir_name();
     // program name -> (kind -> virtual path)
@@ -2703,7 +2752,11 @@ pub fn plan_shader_pipeline(
         }
         let mut shaders = BTreeMap::new();
         for (kind, path) in &files {
-            shaders.insert(*kind, preprocess_shader_source(source, path)?);
+            let mut pp = preprocess_shader_source(source, path)?;
+            if !resolved_overrides.is_empty() {
+                apply_option_overrides_to_unit(&mut pp, &resolved_overrides);
+            }
+            shaders.insert(*kind, pp);
         }
         let render_targets = shaders
             .get(&ShaderKind::Fragment)
@@ -2733,8 +2786,6 @@ pub fn plan_shader_pipeline(
             .then_with(|| program_num(&a.name).cmp(&program_num(&b.name)))
             .then_with(|| a.name.cmp(&b.name))
     });
-    // --- pack-level properties -------------------------------------------
-    let properties = ShaderProperties::load(source)?;
     let load_map = |file: &str, f: fn(&str) -> Result<IdMap, ShaderPackError>| {
         match source.read_text(file) {
             Some(t) => f(&t).map(Some),
@@ -2744,14 +2795,18 @@ pub fn plan_shader_pipeline(
     let block_ids = load_map("block.properties", IdMap::from_block_properties)?;
     let item_ids = load_map("item.properties", IdMap::from_item_properties)?;
     let entity_ids = load_map("entity.properties", IdMap::from_entity_properties)?;
+    let uniforms = analyze_uniform_requirements(&passes);
+    let family = classify_pack_family(&passes, properties.as_ref(), &uniforms);
     let compatibility = validate_capabilities(&passes, properties.as_ref(), caps);
     Ok(ShaderPipelinePlan {
         dimension,
+        family,
         passes,
         properties,
         block_ids,
         item_ids,
         entity_ids,
+        uniforms,
         compatibility,
     })
 }
@@ -2849,4 +2904,711 @@ fn validate_capabilities(
     } else {
         ShaderCompatibilityReport::MissingCapabilities { missing }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Broad pack family classification, uniform analysis & lang/*.lang UI strings
+// ---------------------------------------------------------------------------
+
+/// High-level shaderpack family inferred from passes, GLSL versions, and
+/// pack manifest. Used for diagnostics and pipeline routing — never restricts
+/// a pack by brand name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ShaderPackFamily {
+    /// Classic OptiFine-style pack (GLSL 120..330, `gbuffers_*`/`composite*`/
+    /// `final`, `colortex`/`depthtex`/`shadowtex`, `DRAWBUFFERS`, no compute,
+    /// no SSBO, no custom images).
+    ClassicOptiFine,
+    /// Next-gen Iris 1.7..1.11+ pack (GLSL 430..460, `.csh` compute passes,
+    /// `bufferObject.*` SSBOs, `image.*` custom images, `begin`/`shadowcomp`/
+    /// `prepare`/`deferred`, or `RENDERTARGETS`).
+    IrisModern,
+    /// OptiFine/Iris pack that additionally supplies DistantHorizons LOD
+    /// passes (`dh_terrain`, `dh_water`, `dh_shadow`) for native Megu LOD
+    /// integration.
+    DistantHorizonsHybrid,
+    /// Megu native WGSL pack (`megu-shader.toml` + `.wgsl` modules) with zero
+    /// GLSL translation overhead on Vulkan/Metal/DX12.
+    MeguNativeWgsl,
+}
+
+impl ShaderPackFamily {
+    /// Stable lowercase identifier for logs and JSON reports.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClassicOptiFine => "classic-optifine",
+            Self::IrisModern => "iris-modern",
+            Self::DistantHorizonsHybrid => "distant-horizons-hybrid",
+            Self::MeguNativeWgsl => "megu-native-wgsl",
+        }
+    }
+}
+
+/// Standard uniform, attachment, dual-hand lighting and LOD inputs referenced
+/// across a shaderpack's preprocessed passes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderUniformRequirements {
+    /// Referenced color attachments (`colortex0`..`colortex15`, normalized
+    /// from legacy `gcolor`/`gdepth`/`gnormal`/`composite`/`gaux1..4` aliases).
+    pub color_attachments: BTreeSet<u8>,
+    /// Referenced depth attachments (`depthtex0`..`depthtex2`).
+    pub depth_attachments: BTreeSet<u8>,
+    /// Referenced shadow depth maps (`shadowtex0`, `shadowtex1`, `shadow`).
+    pub shadow_depth_attachments: BTreeSet<u8>,
+    /// Referenced shadow color buffers (`shadowcolor0`, `shadowcolor1`).
+    pub shadow_color_attachments: BTreeSet<u8>,
+    /// Whether any pass reads main-hand held light (`heldItemId` /
+    /// `heldBlockLightValue`).
+    pub uses_main_hand_light: bool,
+    /// Whether any pass reads off-hand held light (`heldItemId2` /
+    /// `heldBlockLightValue2`).
+    pub uses_off_hand_light: bool,
+    /// Whether any pass reads DistantHorizons/LOD uniforms (`dhDepthTex0/1`,
+    /// `dhRenderDistance`, `dhNearPlane`, `dhFarPlane`) or defines a `dh_*`
+    /// program.
+    pub uses_dh_lod: bool,
+    /// Highest GLSL `#version` observed across all passes (`None` if undeclared).
+    pub max_glsl_version: Option<u32>,
+    /// Lowest GLSL `#version` observed across all passes (`None` if undeclared).
+    pub min_glsl_version: Option<u32>,
+}
+
+impl ShaderUniformRequirements {
+    /// True when the pack uses both main-hand and off-hand dynamic light
+    /// uniforms (Iris 1.7+ dual-hand lighting).
+    pub const fn uses_dual_hand_light(&self) -> bool {
+        self.uses_main_hand_light && self.uses_off_hand_light
+    }
+}
+
+fn contains_ident(src: &str, ident: &str) -> bool {
+    let bytes = src.as_bytes();
+    let needle = ident.as_bytes();
+    if needle.is_empty() || bytes.len() < needle.len() {
+        return false;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut start = 0;
+    while let Some(rel) = src[start..].find(ident) {
+        let pos = start + rel;
+        let before_ok = pos == 0 || !is_ident(bytes[pos - 1]);
+        let after = pos + needle.len();
+        let after_ok = after == bytes.len() || !is_ident(bytes[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+fn analyze_uniform_requirements(passes: &[ShaderPass]) -> ShaderUniformRequirements {
+    const LEGACY_COLOR_ALIASES: &[(&str, u8)] = &[
+        ("gcolor", 0),
+        ("gdepth", 1),
+        ("gnormal", 2),
+        ("composite", 3),
+        ("gaux1", 4),
+        ("gaux2", 5),
+        ("gaux3", 6),
+        ("gaux4", 7),
+    ];
+    let mut req = ShaderUniformRequirements::default();
+    for pass in passes {
+        if pass.name.starts_with("dh_") {
+            req.uses_dh_lod = true;
+        }
+        for shader in pass.shaders.values() {
+            if let Some(v) = shader.glsl_version {
+                req.max_glsl_version = Some(req.max_glsl_version.map_or(v, |m| m.max(v)));
+                req.min_glsl_version = Some(req.min_glsl_version.map_or(v, |m| m.min(v)));
+            }
+            let s = shader.source.as_str();
+            for idx in 0u8..16 {
+                if contains_ident(s, &format!("colortex{idx}")) {
+                    req.color_attachments.insert(idx);
+                }
+            }
+            for &(alias, idx) in LEGACY_COLOR_ALIASES {
+                if contains_ident(s, alias) {
+                    req.color_attachments.insert(idx);
+                }
+            }
+            for idx in 0u8..=2 {
+                if contains_ident(s, &format!("depthtex{idx}")) {
+                    req.depth_attachments.insert(idx);
+                }
+            }
+            for idx in 0u8..=1 {
+                if contains_ident(s, &format!("shadowtex{idx}")) {
+                    req.shadow_depth_attachments.insert(idx);
+                }
+                if contains_ident(s, &format!("shadowcolor{idx}")) {
+                    req.shadow_color_attachments.insert(idx);
+                }
+            }
+            if contains_ident(s, "shadow") && contains_ident(s, "sampler2D") {
+                req.shadow_depth_attachments.insert(0);
+            }
+            if contains_ident(s, "heldItemId") || contains_ident(s, "heldBlockLightValue") {
+                req.uses_main_hand_light = true;
+            }
+            if contains_ident(s, "heldItemId2") || contains_ident(s, "heldBlockLightValue2") {
+                req.uses_off_hand_light = true;
+            }
+            if contains_ident(s, "dhDepthTex0")
+                || contains_ident(s, "dhDepthTex1")
+                || contains_ident(s, "dhRenderDistance")
+                || contains_ident(s, "dhNearPlane")
+                || contains_ident(s, "dhFarPlane")
+            {
+                req.uses_dh_lod = true;
+            }
+        }
+    }
+    req
+}
+
+fn classify_pack_family(
+    passes: &[ShaderPass],
+    properties: Option<&ShaderProperties>,
+    uniforms: &ShaderUniformRequirements,
+) -> ShaderPackFamily {
+    if passes.iter().any(|p| p.name.starts_with("dh_")) || uniforms.uses_dh_lod {
+        return ShaderPackFamily::DistantHorizonsHybrid;
+    }
+    let has_modern_stage = passes.iter().any(|p| {
+        p.kind == PassKind::Compute
+            || matches!(p.stage, PipelineStage::Begin | PipelineStage::Prepare)
+            || p.name.starts_with("shadowcomp")
+    });
+    let has_modern_props = properties.is_some_and(|p| {
+        !p.ssbos.is_empty() || !p.images.is_empty() || !p.required_features.is_empty()
+    });
+    let has_modern_glsl = uniforms.max_glsl_version.is_some_and(|v| v >= 430);
+    if has_modern_stage || has_modern_props || has_modern_glsl {
+        ShaderPackFamily::IrisModern
+    } else {
+        ShaderPackFamily::ClassicOptiFine
+    }
+}
+
+/// Option & profile overrides applied before shader preprocessing completes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderOptionOverrides {
+    /// Optional `profile.<NAME>` from `shaders.properties` to activate first.
+    pub profile: Option<String>,
+    /// Explicit per-option overrides (`Some(val)` sets `#define NAME val`,
+    /// `Some("")` sets `#define NAME`, `None` disables to `// #define NAME`).
+    pub options: BTreeMap<String, Option<String>>,
+}
+
+fn resolve_option_overrides(
+    props: Option<&ShaderProperties>,
+    overrides: &ShaderOptionOverrides,
+) -> BTreeMap<String, Option<String>> {
+    let mut resolved = BTreeMap::new();
+    if let (Some(props), Some(profile_name)) = (props, overrides.profile.as_deref()) {
+        if let Some(profile) = props.profiles.get(profile_name) {
+            for tok in &profile.tokens {
+                if tok.starts_with("program:") {
+                    continue;
+                }
+                if let Some(stripped) = tok.strip_prefix('!') {
+                    if !stripped.is_empty() {
+                        resolved.insert(stripped.to_owned(), None);
+                    }
+                } else if let Some((k, v)) = tok.split_once('=') {
+                    resolved.insert(k.trim().to_owned(), Some(v.trim().to_owned()));
+                } else if !tok.is_empty() {
+                    resolved.insert(tok.clone(), Some(String::new()));
+                }
+            }
+        }
+    }
+    for (k, v) in &overrides.options {
+        resolved.insert(k.clone(), v.clone());
+    }
+    resolved
+}
+
+fn apply_option_overrides_to_unit(
+    unit: &mut PreprocessedShader,
+    overrides: &BTreeMap<String, Option<String>>,
+) {
+    let mut new_lines = Vec::new();
+    let mut changed = false;
+    for line in unit.source.split('\n') {
+        let trimmed = line.trim_start();
+        let (was_commented, after_hash) = if let Some(rest) = trimmed.strip_prefix("//") {
+            let r = rest.trim_start();
+            if let Some(h) = r.strip_prefix('#') {
+                (true, Some(h.trim_start()))
+            } else {
+                (false, None)
+            }
+        } else if let Some(h) = trimmed.strip_prefix('#') {
+            (false, Some(h.trim_start()))
+        } else {
+            (false, None)
+        };
+        let mut replaced = None;
+        if let Some(rest) = after_hash {
+            if let Some(def_rest) = rest.strip_prefix("define") {
+                if def_rest.starts_with([' ', '\t']) {
+                    let body = def_rest.trim_start();
+                    let name: String = body
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if let Some(override_val) = overrides.get(&name) {
+                        changed = true;
+                        let replacement = match override_val {
+                            None => format!("// #define {name}"),
+                            Some(v) if v.is_empty() => format!("#define {name}"),
+                            Some(v) => format!("#define {name} {v}"),
+                        };
+                        let opt = unit.defines.entry(name.clone()).or_insert(ShaderOption {
+                            name: name.clone(),
+                            value: None,
+                            enabled: !was_commented,
+                        });
+                        match override_val {
+                            None => {
+                                opt.enabled = false;
+                            }
+                            Some(v) => {
+                                opt.enabled = true;
+                                opt.value = if v.is_empty() { None } else { Some(v.clone()) };
+                            }
+                        }
+                        replaced = Some(replacement);
+                    }
+                }
+            }
+        }
+        match replaced {
+            Some(r) => new_lines.push(r),
+            None => new_lines.push(line.to_owned()),
+        }
+    }
+    if changed {
+        unit.source = new_lines.join("\n");
+    }
+}
+
+/// Parsed `lang/<locale>.lang` localization table for shaderpack option UIs
+/// (`option.<NAME>`, `value.<NAME>.<VAL>`, `profile.<NAME>`, `screen.<NAME>`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderPackLang {
+    /// Resolved locale tag (e.g. `ja_JP`, `en_US`), or `""` when empty.
+    pub locale: String,
+    /// `key -> localized text`, merged with `en_US` fallback when present.
+    pub entries: BTreeMap<String, String>,
+}
+
+impl ShaderPackLang {
+    /// Parse a single `.lang` file (`key=value` lines, `#` comments).
+    pub fn parse(locale: impl Into<String>, text: &str) -> Self {
+        let mut entries = BTreeMap::new();
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim();
+                if !key.is_empty() {
+                    entries.insert(key.to_owned(), v.trim().to_owned());
+                }
+            }
+        }
+        Self {
+            locale: locale.into(),
+            entries,
+        }
+    }
+
+    /// Look up the localized display name for an option, falling back to `name`.
+    pub fn option_label<'a>(&'a self, name: &'a str) -> &'a str {
+        self.entries
+            .get(&format!("option.{name}"))
+            .map(String::as_str)
+            .unwrap_or(name)
+    }
+
+    /// Look up the localized tooltip/comment for an option, if present.
+    pub fn option_comment(&self, name: &str) -> Option<&str> {
+        self.entries
+            .get(&format!("option.{name}.comment"))
+            .map(String::as_str)
+    }
+
+    /// Look up a localized option value label (`value.<OPTION>.<VAL>`),
+    /// falling back to `val`.
+    pub fn value_label<'a>(&'a self, option: &str, val: &'a str) -> &'a str {
+        self.entries
+            .get(&format!("value.{option}.{val}"))
+            .map(String::as_str)
+            .unwrap_or(val)
+    }
+
+    /// Look up a localized profile name (`profile.<NAME>`), falling back to `name`.
+    pub fn profile_label<'a>(&'a self, name: &'a str) -> &'a str {
+        self.entries
+            .get(&format!("profile.{name}"))
+            .map(String::as_str)
+            .unwrap_or(name)
+    }
+
+    /// Look up a localized screen title (`screen.<NAME>`), falling back to `name`.
+    pub fn screen_label<'a>(&'a self, name: &'a str) -> &'a str {
+        self.entries
+            .get(&format!("screen.{name}"))
+            .map(String::as_str)
+            .unwrap_or(name)
+    }
+}
+
+impl ShaderPackSource {
+    /// Sorted list of locale names available under `lang/<locale>.lang`.
+    pub fn available_locales(&self) -> Vec<String> {
+        let mut out = BTreeSet::new();
+        for path in self.list() {
+            if let Some(rest) = path.strip_prefix("lang/") {
+                if let Some(stem) = rest.strip_suffix(".lang") {
+                    if !stem.contains('/') && !stem.is_empty() {
+                        out.insert(stem.to_owned());
+                    }
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Load `lang/<locale>.lang` (case-insensitive locale match) layered over
+    /// `lang/en_US.lang` so missing translations fall back cleanly to English
+    /// and then to the raw key.
+    pub fn load_lang(&self, locale: &str) -> ShaderPackLang {
+        let find_file = |want: &str| -> Option<(String, String)> {
+            let want_lc = want.to_ascii_lowercase();
+            for path in self.list() {
+                if let Some(rest) = path.strip_prefix("lang/") {
+                    if let Some(stem) = rest.strip_suffix(".lang") {
+                        if !stem.contains('/') && stem.to_ascii_lowercase() == want_lc {
+                            if let Some(text) = self.read_text(path) {
+                                return Some((stem.to_owned(), text));
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        };
+        let mut merged = match find_file("en_US") {
+            Some((loc, text)) => ShaderPackLang::parse(loc, &text),
+            None => ShaderPackLang::default(),
+        };
+        if !locale.eq_ignore_ascii_case("en_US") {
+            if let Some((loc, text)) = find_file(locale) {
+                let overlay = ShaderPackLang::parse(loc.clone(), &text);
+                merged.locale = loc;
+                for (k, v) in overlay.entries {
+                    merged.entries.insert(k, v);
+                }
+            }
+        }
+        merged
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Megu Native WGSL Shaderpack (`megu-shader.toml` + `.wgsl` passes)
+// ---------------------------------------------------------------------------
+
+/// Default manifest path inside a Megu native WGSL shaderpack.
+pub const MEGU_WGSL_MANIFEST: &str = "megu-shader.toml";
+
+/// One pass declared inside a Megu native WGSL shaderpack (`[pass.<name>]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeguWgslPass {
+    /// Pass name (e.g. `terrain_opaque`, `lod_terrain`, `composite0`, `final`).
+    pub name: String,
+    /// Pipeline stage this pass executes in.
+    pub stage: PipelineStage,
+    /// Graphics or compute pass kind.
+    pub kind: PassKind,
+    /// Pack-relative `.wgsl` file path.
+    pub file: String,
+    /// Raw WGSL source text read from [`ShaderPackSource`].
+    pub wgsl_source: String,
+    /// Declared color attachment targets, if any.
+    pub render_targets: Vec<String>,
+    /// Compute workgroup dispatch count `[x, y, z]`, when `kind == Compute`.
+    pub work_groups: Option<[u32; 3]>,
+}
+
+/// Loaded Megu native WGSL shaderpack — zero GLSL translation overhead on
+/// Vulkan/Metal/DX12 backends, sharing the same bounded [`ShaderPackSource`]
+/// loader and [`GpuShaderCaps`] validation as external OptiFine/Iris packs.
+#[derive(Clone, Debug)]
+pub struct MeguWgslPack {
+    /// Human-readable pack display name.
+    pub name: String,
+    /// Pack author (optional).
+    pub author: String,
+    /// Pack version string (optional).
+    pub version: String,
+    /// Manifest API version (currently `1`).
+    pub api_version: u32,
+    /// Whether the pack explicitly requires GPU compute shaders.
+    pub requires_compute: bool,
+    /// Whether the pack explicitly requires SSBO storage buffers.
+    pub requires_ssbo: bool,
+    /// Whether the pack provides native Megu LOD shading passes.
+    pub supports_lod: bool,
+    /// Ordered WGSL passes.
+    pub passes: Vec<MeguWgslPass>,
+    /// GPU capability verdict against the supplied [`GpuShaderCaps`].
+    pub compatibility: ShaderCompatibilityReport,
+}
+
+impl MeguWgslPack {
+    /// Whether this WGSL pack can execute on the validated GPU capabilities.
+    pub fn is_compatible(&self) -> bool {
+        self.compatibility.is_compatible()
+    }
+}
+
+fn parse_megu_stage(tok: &str) -> Option<PipelineStage> {
+    match tok.trim().to_ascii_lowercase().as_str() {
+        "begin" => Some(PipelineStage::Begin),
+        "shadow" => Some(PipelineStage::Shadow),
+        "prepare" => Some(PipelineStage::Prepare),
+        "gbuffers" | "terrain" | "opaque" | "translucent" => Some(PipelineStage::Gbuffers),
+        "lod" | "distant_horizons" | "dh" => Some(PipelineStage::DistantHorizons),
+        "deferred" => Some(PipelineStage::Deferred),
+        "composite" => Some(PipelineStage::Composite),
+        "final" => Some(PipelineStage::Final),
+        _ => None,
+    }
+}
+
+fn unquote_toml_str(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2
+        && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
+    {
+        t[1..t.len() - 1].to_owned()
+    } else {
+        t.to_owned()
+    }
+}
+
+/// Detect whether `source` is a Megu native WGSL pack (`megu-shader.toml`).
+pub fn is_megu_wgsl_pack(source: &ShaderPackSource) -> bool {
+    source.read(MEGU_WGSL_MANIFEST).is_some()
+}
+
+/// Load and validate a Megu native WGSL pack (`megu-shader.toml` + `.wgsl`
+/// files) against `caps`.
+pub fn load_megu_wgsl_pack(
+    source: &ShaderPackSource,
+    caps: &GpuShaderCaps,
+) -> Result<MeguWgslPack, ShaderPackError> {
+    let text = source
+        .read_text(MEGU_WGSL_MANIFEST)
+        .ok_or(ShaderPackError::EmptyPack)?;
+    let mut name = String::from("megu-wgsl-pack");
+    let mut author = String::new();
+    let mut version = String::from("0.1.0");
+    let mut api_version = 1u32;
+    let mut requires_compute = false;
+    let mut requires_ssbo = false;
+    let mut supports_lod = false;
+
+    #[derive(Default)]
+    struct RawPass {
+        stage: Option<PipelineStage>,
+        kind: Option<PassKind>,
+        file: Option<String>,
+        targets: Vec<String>,
+        work_groups: Option<[u32; 3]>,
+    }
+    let mut section = String::new();
+    let mut raw_passes: BTreeMap<String, RawPass> = BTreeMap::new();
+
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = match raw_line.find('#') {
+            Some(c) => raw_line[..c].trim(),
+            None => raw_line.trim(),
+        };
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            section = header.trim().to_owned();
+            if let Some(pass_name) = section.strip_prefix("pass.") {
+                raw_passes.entry(pass_name.trim().to_owned()).or_default();
+            }
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(malformed_props(
+                MEGU_WGSL_MANIFEST,
+                line_no,
+                "expected key = value",
+            ));
+        };
+        let key = k.trim();
+        let val = v.trim();
+        if section.is_empty() || section == "pack" {
+            match key {
+                "name" => name = unquote_toml_str(val),
+                "author" => author = unquote_toml_str(val),
+                "version" => version = unquote_toml_str(val),
+                "api" | "api_version" => {
+                    api_version = val.parse().map_err(|_| {
+                        malformed_props(MEGU_WGSL_MANIFEST, line_no, "invalid api_version")
+                    })?;
+                }
+                "requires_compute" => requires_compute = val == "true",
+                "requires_ssbo" => requires_ssbo = val == "true",
+                "supports_lod" => supports_lod = val == "true",
+                _ => {}
+            }
+        } else if let Some(pass_name) = section.strip_prefix("pass.") {
+            let entry = raw_passes.entry(pass_name.trim().to_owned()).or_default();
+            match key {
+                "stage" => {
+                    let s = unquote_toml_str(val);
+                    entry.stage = Some(parse_megu_stage(&s).ok_or_else(|| {
+                        malformed_props(MEGU_WGSL_MANIFEST, line_no, "unknown pipeline stage")
+                    })?);
+                }
+                "kind" => {
+                    let s = unquote_toml_str(val).to_ascii_lowercase();
+                    entry.kind = Some(match s.as_str() {
+                        "compute" => PassKind::Compute,
+                        "graphics" => PassKind::Graphics,
+                        _ => {
+                            return Err(malformed_props(
+                                MEGU_WGSL_MANIFEST,
+                                line_no,
+                                "kind must be graphics or compute",
+                            ));
+                        }
+                    });
+                }
+                "file" => entry.file = Some(unquote_toml_str(val)),
+                "targets" => {
+                    let inner = val.trim_start_matches('[').trim_end_matches(']');
+                    entry.targets = inner
+                        .split(',')
+                        .map(unquote_toml_str)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                "workgroups" => {
+                    let inner = val.trim_start_matches('[').trim_end_matches(']');
+                    let nums: Result<Vec<u32>, _> = inner
+                        .split(',')
+                        .map(|s| s.trim().parse::<u32>())
+                        .collect();
+                    let nums = nums.map_err(|_| {
+                        malformed_props(MEGU_WGSL_MANIFEST, line_no, "bad workgroups")
+                    })?;
+                    if nums.len() != 3 || nums.contains(&0) {
+                        return Err(malformed_props(
+                            MEGU_WGSL_MANIFEST,
+                            line_no,
+                            "workgroups must be 3 positive integers",
+                        ));
+                    }
+                    entry.work_groups = Some([nums[0], nums[1], nums[2]]);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if raw_passes.is_empty() {
+        return Err(ShaderPackError::EmptyPack);
+    }
+
+    let mut passes = Vec::with_capacity(raw_passes.len());
+    for (pass_name, rp) in raw_passes {
+        let stage = rp.stage.unwrap_or(PipelineStage::Gbuffers);
+        let kind = rp.kind.unwrap_or(PassKind::Graphics);
+        let file = rp.file.ok_or_else(|| ShaderPackError::IncompleteProgram {
+            name: pass_name.clone(),
+            reason: "WGSL pass missing `file`".to_owned(),
+        })?;
+        validate_virtual_path(&file)?;
+        let wgsl_source = source.read_text(&file).ok_or_else(|| {
+            ShaderPackError::IncludeNotFound {
+                include: file.clone(),
+                from: MEGU_WGSL_MANIFEST.to_owned(),
+            }
+        })?;
+        if stage == PipelineStage::DistantHorizons {
+            supports_lod = true;
+        }
+        if kind == PassKind::Compute {
+            requires_compute = true;
+        }
+        passes.push(MeguWgslPass {
+            name: pass_name,
+            stage,
+            kind,
+            file,
+            wgsl_source,
+            render_targets: rp.targets,
+            work_groups: rp.work_groups,
+        });
+    }
+    passes.sort_by(|a, b| a.stage.cmp(&b.stage).then_with(|| a.name.cmp(&b.name)));
+
+    let mut missing = Vec::new();
+    if api_version != 1 {
+        missing.push(format!(
+            "unsupported megu-shader API version {api_version} (supported: 1)"
+        ));
+    }
+    if requires_compute && !caps.supports_compute {
+        missing.push("compute shaders required by WGSL pack".to_owned());
+    }
+    if requires_ssbo && !caps.supports_ssbo {
+        missing.push("shader storage buffers (SSBO) required by WGSL pack".to_owned());
+    }
+    for pass in &passes {
+        if pass.render_targets.len() as u32 > caps.max_color_attachments {
+            missing.push(format!(
+                "{}: {} color attachments required (max {})",
+                pass.name,
+                pass.render_targets.len(),
+                caps.max_color_attachments
+            ));
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    let compatibility = if missing.is_empty() {
+        ShaderCompatibilityReport::Compatible
+    } else {
+        ShaderCompatibilityReport::MissingCapabilities { missing }
+    };
+
+    Ok(MeguWgslPack {
+        name,
+        author,
+        version,
+        api_version,
+        requires_compute,
+        requires_ssbo,
+        supports_lod,
+        passes,
+        compatibility,
+    })
 }
