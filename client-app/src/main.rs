@@ -7,6 +7,7 @@ use std::time::Duration;
 use mc_spine_client::cli::{
     help_text, parse_args, parse_host_port, redact_from_argv, version_info_text, CliConfig,
 };
+use mc_spine_client::friend_client::FriendGuestBridge;
 use mc_spine_client::integrated;
 use mc_spine_client::protocol::ping_server;
 use mc_spine_client::settings::ClientSettings;
@@ -86,6 +87,28 @@ fn main() -> ExitCode {
         return run_status_ping(&cfg, &target);
     }
 
+    // A local one-connection adapter lets the existing Minecraft Login/Play
+    // state machine use FRL1 without replacing its TCP transport internals.
+    let friend_bridge = if let Some(code) = cfg.join_code {
+        let relay = cfg
+            .relay
+            .as_deref()
+            .expect("CLI requires relay with join code");
+        match FriendGuestBridge::start(relay, &code, &cfg.username, Duration::from_secs(15)) {
+            Ok(bridge) => {
+                cfg.server = Some(bridge.local_addr().ip().to_string());
+                cfg.port = bridge.local_addr().port();
+                Some(bridge)
+            }
+            Err(err) => {
+                eprintln!("mc-spine-client: {}", cfg.redact(&err));
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
     let endpoint = match cfg.target_endpoint() {
         Ok(ep) => ep,
         Err(err) => {
@@ -118,6 +141,7 @@ fn main() -> ExitCode {
         }
     }
     let _integrated_server = integrated_server;
+    let _friend_bridge = friend_bridge;
 
     match run_session(&cfg) {
         Ok(summary) => {

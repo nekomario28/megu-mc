@@ -6,6 +6,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use mc_spine_client_mesh::RenderBackendPreference;
+use mc_spine_proto::friend_relay::InviteCode;
 
 use crate::settings::{
     ClientSettings, CloudMode, DistantHorizon, ParticleLevel, QualityPreset,
@@ -96,6 +97,8 @@ pub struct CliConfig {
     pub quick_play_singleplayer: Option<String>,
     pub server: Option<String>,
     pub port: u16,
+    pub join_code: Option<InviteCode>,
+    pub relay: Option<String>,
     pub server_bin: Option<PathBuf>,
     pub seed: Option<i64>,
 
@@ -173,6 +176,8 @@ impl Default for CliConfig {
             quick_play_singleplayer: None,
             server: None,
             port: 25565,
+            join_code: None,
+            relay: None,
             server_bin: None,
             seed: None,
             mc_version: mc_spine_proto::ProtocolVersion::V1_21_1,
@@ -236,6 +241,8 @@ impl fmt::Debug for CliConfig {
             .field("quick_play_singleplayer", &self.quick_play_singleplayer)
             .field("server", &self.server)
             .field("port", &self.port)
+            .field("join_code", &self.join_code)
+            .field("relay", &self.relay)
             .field("server_bin", &self.server_bin)
             .field("seed", &self.seed)
             .field("mc_version", &self.mc_version)
@@ -302,6 +309,7 @@ impl CliConfig {
         self.quick_play_multiplayer.is_some()
             || self.quick_play_singleplayer.is_some()
             || self.server.is_some()
+            || self.join_code.is_some()
             || self.render_png.is_some()
             || self.ping.is_some()
     }
@@ -605,6 +613,14 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 cfg.quick_play_singleplayer = Some(take_val(flag, &mut i)?);
             }
             "--server" => cfg.server = Some(take_val(flag, &mut i)?),
+            "--join-code" => {
+                let raw = take_val(flag, &mut i)?;
+                cfg.join_code = Some(
+                    InviteCode::parse(&raw)
+                        .map_err(|e| format!("invalid --join-code '{raw}': {e}"))?,
+                );
+            }
+            "--relay" => cfg.relay = Some(take_val(flag, &mut i)?),
             "--server-bin" => cfg.server_bin = Some(PathBuf::from(take_val(flag, &mut i)?)),
             "--seed" => {
                 let raw_seed = take_val(flag, &mut i)?;
@@ -777,6 +793,26 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
         }
     }
 
+    if cfg.join_code.is_some() {
+        let relay = cfg
+            .relay
+            .as_deref()
+            .ok_or_else(|| "--join-code requires --relay <host:port>".to_string())?;
+        let (_, port) = parse_host_port(relay, 0)?;
+        if !relay.contains(':') || port == 0 {
+            return Err("--relay must include a nonzero port (<host:port>)".to_string());
+        }
+        if cfg.server.is_some()
+            || cfg.quick_play_multiplayer.is_some()
+            || cfg.quick_play_singleplayer.is_some()
+            || cfg.ping.is_some()
+        {
+            return Err(
+                "--join-code cannot be combined with another server target or --ping".to_string(),
+            );
+        }
+    }
+
     Ok(cfg)
 }
 
@@ -804,6 +840,8 @@ LAUNCHER COMPATIBILITY FLAGS:
   --quickPlayMultiplayer <host[:p]>  Connect directly to multiplayer server
   --quickPlaySingleplayer <world>    Launch integrated mc-spine server for world
   --server <host>                    Server host (alternative to quickPlayMultiplayer)
+  --join-code <MEGU-XXXX-XXXX>       Join a shared world using a friend invite
+  --relay <host:port>                Relay address (required with --join-code)
   --port <port>                      Server port (default: 25565)
   --server-bin <path>                mc-spine server binary for --quickPlaySingleplayer
   --seed <seed>                      World seed for a new --quickPlaySingleplayer world
