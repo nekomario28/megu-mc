@@ -811,18 +811,25 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
             }
             "--max-fps" => {
                 let raw = take_val(flag, &mut i)?;
-                if matches!(raw.to_ascii_lowercase().as_str(), "unlimited" | "none" | "off") {
+                if matches!(
+                    raw.to_ascii_lowercase().as_str(),
+                    "unlimited" | "none" | "off"
+                ) {
                     cfg.max_fps = Some(None);
                 } else {
                     let parsed = raw
                         .parse::<i64>()
                         .map_err(|_| format!("invalid --max-fps '{raw}'"))?;
-                    if !(i64::from(MIN_MAX_FPS)..=i64::from(MAX_MAX_FPS)).contains(&parsed) {
-                        return Err(format!(
-                            "--max-fps must be 'unlimited' or in {MIN_MAX_FPS}..={MAX_MAX_FPS} (got {parsed})"
-                        ));
+                    if parsed == 0 {
+                        cfg.max_fps = Some(None);
+                    } else {
+                        if !(i64::from(MIN_MAX_FPS)..=i64::from(MAX_MAX_FPS)).contains(&parsed) {
+                            return Err(format!(
+                                "--max-fps must be 0, 'unlimited', or in {MIN_MAX_FPS}..={MAX_MAX_FPS} (got {parsed})"
+                            ));
+                        }
+                        cfg.max_fps = Some(Some(parsed as u32));
                     }
-                    cfg.max_fps = Some(Some(parsed as u32));
                 }
             }
             "--background-fps" => {
@@ -1023,7 +1030,8 @@ PLAYER SETTINGS:
   --smooth-lighting <on|off>       Smooth lighting
   --entity-shadows <on|off>        Entity shadows
   --vsync <on|off>                 Vertical sync
-  --max-fps <N|unlimited>          Frame rate cap, 30..=260
+  --max-fps <N|0|unlimited|none>   Frame rate cap, 10..=2000
+                                   (0, none, or unlimited disables the cap)
   --background-fps <N>             Frame rate cap while unfocused, 0..=240
                                    (0 disables background throttling,
                                    default 15)
@@ -1339,7 +1347,8 @@ mod tests {
             vec!["--particles", "lots"],
             vec!["--vsync", "maybe"],
             vec!["--smooth-lighting", "2"],
-            vec!["--max-fps", "12"],
+            vec!["--max-fps", "9"],
+            vec!["--max-fps", "2001"],
             vec!["--max-fps", "fast"],
             vec!["--gpu-backend", "vulkan"],
             vec!["--gpu-backend"],

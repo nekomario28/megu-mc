@@ -39,9 +39,26 @@ pub const MAX_FOV: u8 = 110;
 /// Default field of view (degrees).
 pub const DEFAULT_FOV: u8 = 70;
 /// Minimum FPS cap when one is set (frames/second).
-pub const MIN_MAX_FPS: u32 = 30;
+pub const MIN_MAX_FPS: u32 = 10;
 /// Maximum FPS cap when one is set (frames/second).
-pub const MAX_MAX_FPS: u32 = 260;
+pub const MAX_MAX_FPS: u32 = 2000;
+/// Vanilla `options.txt` `maxFps` value the official UI labels Unlimited.
+pub const VANILLA_OPTIONS_UNLIMITED_FPS: i64 = 260;
+/// Canonical free-FPS slider stops, ending in `None` for Unlimited.
+pub const FPS_SLIDER_PRESETS: &[Option<u32>] = &[
+    Some(30),
+    Some(60),
+    Some(120),
+    Some(144),
+    Some(165),
+    Some(240),
+    Some(280),
+    Some(320),
+    Some(360),
+    Some(480),
+    Some(600),
+    None,
+];
 /// Default frame-rate cap while the window is unfocused (frames/second).
 pub const DEFAULT_BACKGROUND_FPS_LIMIT: u16 = 15;
 /// Maximum selectable background FPS cap; `0` disables background throttling.
@@ -373,7 +390,7 @@ pub struct ClientSettings {
     /// `30..=110` degrees.
     pub fov: u8,
     pub vsync: bool,
-    /// `None` = unlimited; `Some(30..=260)` otherwise.
+    /// `None` = unlimited; `Some(10..=2000)` otherwise.
     pub max_fps: Option<u32>,
     /// Frame-rate cap applied while the window is unfocused, in the spirit
     /// of Vanilla's "Dynamic FPS" graphics toggle: `0` disables background
@@ -735,6 +752,10 @@ impl ClientSettings {
                         seen.push("max_fps");
                     } else {
                         match value.parse::<i64>() {
+                            Ok(0) => {
+                                settings.max_fps = None;
+                                seen.push("max_fps");
+                            }
                             Ok(v) => {
                                 settings.max_fps = Some(clamp_u32(
                                     v,
@@ -1001,8 +1022,8 @@ impl ClientSettings {
         if let Some(v) = get("maxFps").and_then(parse_i64) {
             applied = true;
             // Vanilla's slider tops out at 260, which its UI shows as
-            // "Unlimited".
-            self.max_fps = if v >= i64::from(MAX_MAX_FPS) {
+            // "Unlimited"; mc-spine's own cap now extends to 2000.
+            self.max_fps = if v >= VANILLA_OPTIONS_UNLIMITED_FPS {
                 None
             } else {
                 Some(v.clamp(i64::from(MIN_MAX_FPS), i64::from(MAX_MAX_FPS)) as u32)
@@ -1226,7 +1247,7 @@ mod tests {
             preset = \"ludicrous\"\n\
             view_distance = 99\n\
             fov = 0\n\
-            max_fps = 12\n\
+            max_fps = 5\n\
             bogus_key = 1\n\
             vsync = maybe\n\
             smooth_lighting = false\n";
@@ -1234,6 +1255,7 @@ mod tests {
         assert_eq!(s.view_distance, MAX_VIEW_DISTANCE);
         assert_eq!(s.fov, MIN_FOV);
         assert_eq!(s.max_fps, Some(MIN_MAX_FPS));
+        assert!(warnings.iter().any(|w| w.contains("max_fps")));
         assert!(!s.smooth_lighting);
         // preset/vsync stay default on invalid input.
         assert_eq!(s.preset, QualityPreset::Balanced);
