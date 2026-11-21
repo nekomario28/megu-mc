@@ -42,10 +42,19 @@
 //!   ([`voice_relay::VoiceRelayState`]) with distance/dimension culling,
 //!   whisper radius, group channels and mute/deafen/block, and the live
 //!   non-blocking [`voice_relay::UdpVoiceRelay`] over `std::net::UdpSocket`.
+//! * [`friend_relay`] — the port-forwarding-free friend-invite relay
+//!   (`FRL1`): Crockford Base32 invite codes ([`friend_relay::InviteCode`])
+//!   rendered `MEGU-XXXX-XXXX`, a compact length-prefixed stream-multiplexing
+//!   wire protocol ([`friend_relay::FriendPacket`]), the sans-IO
+//!   [`friend_relay::FriendRelayRouter`] enforcing `max_guests`, `Instant`-TTL
+//!   invite expiry, constant-time secret comparison and per-host stream
+//!   isolation, and the live non-blocking [`friend_relay::TcpFriendRelay`]
+//!   bridging one host tunnel to many guest TCP connections.
 
 pub mod codec;
 mod data_v767;
 mod data_v777;
+pub mod friend_relay;
 pub mod resolver;
 pub mod router;
 pub mod session;
@@ -57,6 +66,11 @@ pub mod wire;
 pub use codec::{
     C2SPacket, CodecV767, EquipmentSlot, ItemStack, LoginProperty, MenuKind,
     ProtocolCodec, RawComponent, RegistryDataEntry, S2CPacket, TeamInfo, TeamOperation,
+};
+pub use friend_relay::{
+    ExpiredHost, FriendPacket, FriendRelayConfig, FriendRelayMetrics, FriendRelayRouter,
+    GuestStream, HostSession, InviteCode, RevokeError, TcpFriendRelay, FRIEND_MAGIC,
+    MAX_FRL1_FRAME_BYTES, MAX_STREAM_PAYLOAD_BYTES,
 };
 pub use resolver::{resolve as resolve_server_address, ResolveError};
 pub use router::{SessionRemapSummary, SessionRemapper, TableDrivenCodec, VersionRouter};
