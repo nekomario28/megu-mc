@@ -110,3 +110,67 @@ seed 4242 from (−2, −3), Overworld seed −1 from (−3, 1), and Nether and 
   The section fill and mark order also matched the scalar cell path.
 - `tools/layers_check.sh`, `tools/debt_ratchet.sh`, `tools/provenance_check.py`,
   and `git diff --check` passed.
+
+## P1-2 follow-up: octave-noise cache utilization (2026-11-21)
+
+This comparison starts from `f6e2d98c18e30b7c6080104d900c7379c0d82c52`,
+after the earlier M3 improvements above. The untouched release executable is
+`target/tmp/mc-spine-p1-2-before` (SHA-256
+`78871f8d7628fe9f5ec0d3e54ec049c0a897e388de746ebd4ecb6bcc6a04b5e0`).
+The tested candidate release executable has SHA-256
+`ffc1ba7fef5698bbf8dc790969f659c78715aba3204aed744626dadbf4d50eaf`.
+Both use the same locked release build. `Normal::get_4` and `Normal::get_8`
+evaluate batches with respectively one or up to two missing noise-cache entries
+through `Normal::get` rather than recomputing the full SIMD batch. `nhash`
+also folds high coordinate bits into the cache index. The previous hash mapped
+many integral X coordinates at fixed Y and Z to the same cache slot. Cache
+keys, octave accumulation order, and floating-point evaluation remain unchanged.
+
+The dominant prior full-dump costs were column builds, beardifier resolution,
+carving, section filling and feature placement, with over five million aquifer
+queries. A separate sparse surface-scan experiment was discarded after its
+three-round A/B produced no repeatable CPU improvement and degraded several
+parallel phase timings. Paletted storage had already measured within noise.
+
+`tools/perf_bench.py` interleaved the original and candidate release binaries
+for five rounds of 64 seed-0 Overworld chunks per workload and worker count.
+`--profile-counters` added one separate M1–M6 counter pass per cell. Medians
+are reported below. CPU is child user + system time, and throughput is 64
+chunks divided by the median dump-phase time.
+
+| Workload | Jobs | CPU before → after | Phase before → after | Chunks/s before → after |
+|---|---:|---:|---:|---:|
+| Full | 1 | 4.088 → 4.047 s | 4.119 → 4.127 s | 15.54 → 15.51 |
+| Full | 8 | 4.032 → 4.055 s | 2.172 → 2.203 s | 29.47 → 29.06 |
+| Terrain and carvers | 1 | 1.841 → 1.837 s | 1.854 → 1.910 s | 34.52 → 33.52 |
+| Terrain and carvers | 8 | 1.700 → 1.701 s | 0.859 → 0.839 s | 74.48 → 76.28 |
+| Terrain | 1 | 0.911 → 0.914 s | 0.978 → 0.953 s | 65.45 → 67.18 |
+| Terrain | 8 | 1.017 → 1.019 s | 0.232 → 0.233 s | 275.63 → 274.28 |
+
+The differences are small and mixed. Full one-worker CPU improved by 1.00%,
+while full eight-worker CPU regressed by 0.57% and phase time by 1.43%.
+The change has **no demonstrated end-to-end performance gain** on this sample.
+The previously measured live
+`WARM=1` result remains 16.82 CPU seconds versus Vanilla's 4.23 seconds.
+The live driver delivered different chunk counts, so no new equal-work live
+comparison or Vanilla speedup has been established.
+
+All 60 timed dumps and 12 separate counter dumps matched the recorded full,
+no-feature and terrain SHA-256 values in the preceding section. Additionally,
+baseline and candidate 4×4 block dumps and heightmaps matched byte-for-byte in
+all eight cross-seed/dimension checks below.
+
+| Preset | Seed | Start chunk | Blocks SHA-256 | Heightmap SHA-256 |
+|---|---:|---|---|---|
+| Overworld | 4242 | (−2, −3) | `bb90bd3dbce88872c3815b0aeaf0e4dea02b955fcb536f413b0dd4553ad3f7d7` | `c327a399464c17a6a88317285ee6cde392af972374a7f83555e467ffd158044d` |
+| Overworld | −1 | (−3, 1) | `957c119f822b8a5b735d82f107e18425b0d0f43d360ca9994cdb33080d168105` | `0f1f64e20e2026d3aed2c45f4d107402136b9363380a14a4416ff2fad0a63e93` |
+| Nether | 4242 | (−2, −3) | `dbfaedda32809eff2bbab7b62f84ad305ce9e6e95353ddc527b99c99a861a3a0` | `e9ad578d52c49c4fb43d24d5d316bc25be7cf0c4c5be3f47219a9be954f59043` |
+| End | 4242 | (−2, −3) | `c7f2adf76bc056bd2fb1b815fee716f37f8a50d7633117547e37397ac1596a27` | `3c435bd1d98e818034c7d639e03273121919301aaf9da2c782b7eb506d6f3b89` |
+
+Final P1-2 validation on this candidate passed `cargo check --offline
+--locked -j 1 --all-targets` with zero warnings, 141 generation contract tests,
+17 feature pipeline tests, two native aquifer tests, and two additional cache
+parity/distribution tests. `tools/layers_check.sh`, `tools/debt_ratchet.sh`,
+`tools/provenance_check.py` and `git diff --check` all passed. These checks
+validate the sampled scenarios and contracts; the live WARM=1 CPU budget and
+equal-work Vanilla comparison still require measurement.

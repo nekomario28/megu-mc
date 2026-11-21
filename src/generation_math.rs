@@ -1010,6 +1010,9 @@ fn nhash(k: NKey) -> usize {
     h = (h ^ k.1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     h = (h ^ k.2).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     h = (h ^ k.3).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // Integral block coordinates have zero low mantissa bits. Fold in the high
+    // bits before indexing, or many distinct positions share the same slot.
+    h = (h ^ (h >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (h >> 32) as usize & (NCACHE_N - 1)
 }
 /// Native 1.21.1 `NormalNoise` summation shape. The first `split` layers are
@@ -1084,10 +1087,9 @@ impl Normal {
         v
     }
 
-    /// Four scalar [`Normal::get`] values, bit for bit. All four NCACHE probes (and,
-    /// on a miss, all four stores) share a single `RefCell` borrow; the layer summation
-    /// keeps `Normal::get`'s exact accumulation order and calls [`Perlin::get_4`] for
-    /// each octave's four samples.
+    /// Four scalar [`Normal::get`] values, bit for bit. NCACHE probes share one
+    /// `RefCell` borrow. The common batch path stores misses together and uses
+    /// [`Perlin::get_4`] for each octave, preserving scalar accumulation order.
     pub(crate) fn get_4(&self, x: [f64; 4], y: [f64; 4], z: [f64; 4]) -> [f64; 4] {
         let key: [NKey; 4] = std::array::from_fn(|k| {
             (
@@ -1111,6 +1113,14 @@ impl Normal {
         });
         if cached.iter().all(Option::is_some) {
             return cached.map(Option::unwrap);
+        }
+        // A mostly warm batch is cheaper as individual scalar misses than as
+        // an entire four-lane octave evaluation. The scalar path preserves the
+        // exact octave accumulation and cache key semantics.
+        if cached.iter().filter(|v| v.is_none()).count() == 1 {
+            return std::array::from_fn(|k| {
+                cached[k].unwrap_or_else(|| self.get(x[k], y[k], z[k]))
+            });
         }
         let vals = self.eval_x4_uncached(x, y, z);
         NCACHE.with(|c| {
@@ -1179,10 +1189,10 @@ impl Normal {
         }
     }
 
-    /// Eight scalar [`Normal::get`] values, bit for bit (layer A2-c). All eight NCACHE probes
-    /// (and, on a miss, all eight stores) share one `RefCell` borrow per phase; the layer
-    /// summation keeps `Normal::get`'s exact accumulation order and calls [`Perlin::get_8`]
-    /// for each octave's eight samples.
+    /// Eight scalar [`Normal::get`] values, bit for bit (layer A2-c). NCACHE
+    /// probes share one `RefCell` borrow. The common batch path stores misses
+    /// together and uses [`Perlin::get_8`] for each octave, preserving scalar
+    /// accumulation order.
     pub(crate) fn get_8(&self, x: [f64; 8], y: [f64; 8], z: [f64; 8]) -> [f64; 8] {
         let key: [NKey; 8] = std::array::from_fn(|k| {
             (
@@ -1206,6 +1216,13 @@ impl Normal {
         });
         if cached.iter().all(Option::is_some) {
             return cached.map(Option::unwrap);
+        }
+        // The SIMD evaluator computes all eight octaves even for cache hits.
+        // Re-evaluate the one or two misses through the identical scalar path.
+        if cached.iter().filter(|v| v.is_none()).count() <= 2 {
+            return std::array::from_fn(|k| {
+                cached[k].unwrap_or_else(|| self.get(x[k], y[k], z[k]))
+            });
         }
         let vals = self.eval_x8_uncached(x, y, z);
         NCACHE.with(|c| {
@@ -2449,5 +2466,98 @@ mod next_int_vs_vanilla_tests {
         assert!(perlin_cases >= 3 * 24 * 8, "Perlin cases did not run");
         assert!(normal_cases >= 4 * 24 * 8, "Normal cases did not run");
         assert!(cache_hit_cases > 0, "cache-hit path was never exercised");
+    }
+
+    #[test]
+    fn normal_partial_cache_batches_match_scalar_bits() {
+        fn check<const N: usize>(
+            normal: &Normal,
+            x: [f64; N],
+            y: [f64; N],
+            z: [f64; N],
+            misses: usize,
+            batch: impl FnOnce([f64; N], [f64; N], [f64; N]) -> [f64; N],
+        ) {
+            let clear = || NCACHE.with(|c| c.borrow_mut().fill(((usize::MAX, 0, 0, 0), 0.0)));
+            let mut indices = std::collections::HashSet::new();
+            for k in 0..N {
+                let key = (
+                    normal.cache_id,
+                    x[k].to_bits(),
+                    y[k].to_bits(),
+                    z[k].to_bits(),
+                );
+                assert!(
+                    indices.insert(nhash(key)),
+                    "test coordinates collide in NCACHE"
+                );
+            }
+
+            clear();
+            let expected: [f64; N] = std::array::from_fn(|k| normal.get(x[k], y[k], z[k]));
+            clear();
+            for k in misses..N {
+                assert_eq!(
+                    normal.get(x[k], y[k], z[k]).to_bits(),
+                    expected[k].to_bits()
+                );
+            }
+            let actual = batch(x, y, z);
+            for k in 0..N {
+                assert_eq!(
+                    actual[k].to_bits(),
+                    expected[k].to_bits(),
+                    "lane {k}, misses {misses}"
+                );
+            }
+        }
+
+        let normals = [
+            normal_new(&mut Xor::seed(41), -2, 0.9, &[1.0, 0.75, 0.5]),
+            normal_new_amps(&mut Xor::seed(42), -1, &[1.0, 0.0, 0.5, 0.25]),
+            normal_legacy_nether(43),
+        ];
+        let y: [f64; 8] = std::array::from_fn(|k| k as f64 * -0.5 + 1.125);
+        let z: [f64; 8] = std::array::from_fn(|k| k as f64 * 0.75 - 4.375);
+        for normal in &normals {
+            let mut x = [0.0; 8];
+            let mut used_indices = std::collections::HashSet::new();
+            for k in 0..8 {
+                let mut trial = 0;
+                loop {
+                    x[k] = k as f64 * 0.25 - 0.75 + trial as f64 * 0.03125;
+                    let key = (
+                        normal.cache_id,
+                        x[k].to_bits(),
+                        y[k].to_bits(),
+                        z[k].to_bits(),
+                    );
+                    if used_indices.insert(nhash(key)) {
+                        break;
+                    }
+                    trial += 1;
+                    assert!(trial < 1000, "could not find distinct cache index");
+                }
+            }
+            check(
+                normal,
+                x[..4].try_into().unwrap(),
+                y[..4].try_into().unwrap(),
+                z[..4].try_into().unwrap(),
+                1,
+                |x, y, z| normal.get_4(x, y, z),
+            );
+            for misses in 1..=2 {
+                check(normal, x, y, z, misses, |x, y, z| normal.get_8(x, y, z));
+            }
+        }
+    }
+
+    #[test]
+    fn normal_cache_hash_distributes_integer_coordinates() {
+        let indices: std::collections::HashSet<_> = (0..128)
+            .map(|x| nhash((1, (x as f64).to_bits(), 64.0f64.to_bits(), 0.0f64.to_bits())))
+            .collect();
+        assert_eq!(indices.len(), 128, "integer coordinates collide in NCACHE");
     }
 }
