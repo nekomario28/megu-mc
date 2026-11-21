@@ -38,6 +38,12 @@
 //! * [`directory`] — [`directory::ServerDirectory`], the facade that owns the
 //!   whole set: `load_or_init`, Vanilla-precedence `admit_login` and
 //!   `save_all_atomic`, pinned to a [`mc_spine_core::version::TargetVersion`].
+//! * [`perf_cache`] — zero-side-effect performance caches: a shared
+//!   `Arc<[u8]>` compressed chunk packet cache keyed on every
+//!   rendering/protocol discriminator, a view-direction chunk send queue
+//!   covering the exact Vanilla `(2d + 1)^2` square, and a hash-verified
+//!   `SBC1` startup datapack/registry binary cache that fails closed to a
+//!   clean miss on any stale or corrupted input.
 
 pub mod atomic;
 pub mod claims;
@@ -46,6 +52,7 @@ pub mod directory;
 pub mod eula;
 pub mod json;
 pub mod lists;
+pub mod perf_cache;
 pub mod properties;
 pub mod usercache;
 
@@ -69,6 +76,11 @@ pub use lists::{
     normalize_ban_ip, offline_uuid, valid_player_name, BanEntry, BannedIps, BannedPlayers,
     IpBanEntry, OpEntry, OpsList, Whitelist, WhitelistEntry, BANNED_IPS_FILE, BANNED_PLAYERS_FILE,
     OPS_FILE, WHITELIST_FILE,
+};
+pub use perf_cache::{
+    look_dir_from_yaw, CacheLookup, CacheMissReason, ChunkCacheStats, ChunkWireKey,
+    DirectionalChunkQueue, SharedChunkWireCache, StartupBinaryCache, StartupInputFile,
+    StartupInputFingerprint, CACHE_SCHEMA_VERSION, STARTUP_CACHE_MAGIC,
 };
 pub use properties::{MalformedEscape, PropertiesFile, ServerProperties, PROPERTIES_FILE};
 pub use usercache::{UserCache, UserCacheEntry, DEFAULT_CAPACITY, USERCACHE_FILE};
