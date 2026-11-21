@@ -4,9 +4,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Megu — Fast. Lightweight. Mod-compatible.</title>
+  <title>Megu — Blazingly fast. Lightweight. Mod-compatible.</title>
   <meta name="description"
-        content="Megu (codename mc-spine) is a fast, lightweight, mod-compatible Minecraft: Java Edition 1.21.1 &amp; 26.3 server and client engine.">
+        content="Megu (codename mc-spine) is a blazingly fast, lightweight, mod-compatible Minecraft: Java Edition 1.21.1 &amp; 26.3 engine built for everything from low-end Intel laptops to Vulkan GPUs.">
   <link rel="stylesheet" href="style.css">
   <script src="site-config.js"></script>
   <script src="app.js" defer></script>
@@ -47,12 +47,12 @@
 
         <h1 class="hero-title">
           <span data-cfg="projectName">Megu</span>
-          <span class="hero-sub" data-i18n="hero_headline">Fast. Lightweight. Mod-compatible.</span>
+          <span class="hero-sub" data-i18n="hero_headline">Blazingly fast. Lightweight. Mod-compatible.</span>
         </h1>
 
         <p class="lead" data-i18n="hero_lead">
-          A fast Minecraft: Java Edition engine for 1.21.1 and 26.3 — built for vanilla worlds and NeoForge/Fabric modpacks,
-          with low memory use, native mod acceleration, and safe fallback to NeoForge.
+          A Minecraft: Java Edition engine for 1.21.1 and 26.3 — engineered for heavy Create factories, NeoForge/Fabric modpacks,
+          Vulkan rendering, and ultra-low-spec PCs (including legacy Intel HD/UHD graphics) with ~1/10 the RAM footprint.
         </p>
 
         <div class="hero-actions">
@@ -168,30 +168,30 @@
         <h2 data-i18n="how_title">How it stays lightweight</h2>
         <div class="pillars">
           <article class="pillar">
-            <h3 data-i18n="p1_title">Your own server.jar</h3>
+            <h3 data-i18n="p1_title">Create factories without TPS drops</h3>
             <p data-i18n="p1_body">
-              No Mojang binaries or assets are ever shipped. Runtime tables are generated locally from your own official Minecraft jar on first setup.
+              Kinetic networks, belts, fluids, 6-DOF airships, and Farmer's Delight cooking pots run natively in Rust with O(1) sleeping machines (zero idle CPU) and GPU instancing that packs 10,000 rotating gears into one draw call per mesh kind.
             </p>
           </article>
           <article class="pillar">
-            <h3 data-i18n="p2_title">Drop-in modpacks</h3>
+            <h3 data-i18n="p2_title">Vulkan to ultra-low-spec Intel GPUs</h3>
             <p data-i18n="p2_body">
-              36 performance mods (Sodium, Lithium, ModernFix, Distant Horizons, and more) are skipped automatically.
-              Create kinetics, Farmer's Delight &amp; addons, and OpenPAC/FTB Chunks have clean-room Rust engines; unsupported Mixins delegate safely to NeoForge.
+              Selectable rendering pipeline: Vulkan Mesh Shaders (RTX, Radeon RDNA2+, Arc), Compute + Multi-Draw Indirect,
+              and a ClassicLowSpec mode (16 KiB UBO batches + low-VRAM Horizon LOD) tuned for older Intel HD 4000 / UHD 630 laptops.
             </p>
           </article>
           <article class="pillar">
-            <h3 data-i18n="p3_title">Built for every GPU</h3>
+            <h3 data-i18n="p3_title">Drop-in modpacks &amp; safe fallback</h3>
             <p data-i18n="p3_body">
-              Selectable client rendering path: Vulkan Mesh Shaders (RTX, Radeon RDNA2+, Arc), Compute + Multi-Draw Indirect,
-              and a low-VRAM UBO path designed for older Intel HD/UHD integrated graphics.
+              36 optimization mods (Sodium, Lithium, ModernFix, Distant Horizons, and more) are skipped automatically.
+              OpenPAC/FTB Chunks and simple @Inject Mixins run natively or via bounded bridge; unsupported heavy Mixins delegate safely to NeoForge.
             </p>
           </article>
           <article class="pillar">
-            <h3 data-i18n="p4_title">Clean-room open source</h3>
+            <h3 data-i18n="p4_title">Your own jar, clean-room OSS</h3>
             <p data-i18n="p4_body">
-              Written from scratch in Rust with zero external crates in the core workspace. Root licensed GPL-3.0-or-later;
-              first-party crates triple-licensed LGPL/GPL/AGPL-3.0-or-later.
+              Zero Mojang files bundled — runtime data is generated locally from your official Minecraft jar.
+              Zero external crates in core; GPL-3.0-or-later root and LGPL/GPL/AGPL-3.0-or-later subcrates.
             </p>
           </article>
         </div>
@@ -309,7 +309,7 @@ cargo run --locked</code></pre>
       nav_quickstart: "起動手順",
       nav_scope: "対応状況",
       hero_headline: "爆速。軽量。Mod 互換。",
-      hero_lead: "バニラも NeoForge/Fabric Modpack も高速に動かす Minecraft 互換エンジン（1.21.1 / 26.3）。軽量化 Mod の自動スキップ・主要 Mod のネイティブ高速化・未対応 Mod の安全フォールバックを備えます。",
+      hero_lead: "重い Create 工場も NeoForge/Fabric Modpack も軽快に動かす Minecraft 互換エンジン（1.21.1 / 26.3）。Vulkan 駆動から旧世代 Intel 内蔵 GPU の超低スペック PC まで対応し、RAM 使用量は約 1/10。",
       cta_start: "起動手順へ",
       cta_check: "Modpackを診断",
       cta_github: "GitHub を見る",
@@ -317,7 +317,7 @@ cargo run --locked</code></pre>
       bench_meta: "Linux x86_64 実測 · 3 回平均 · seed 0 · 描画距離 4",
       bench_ram_label: "常駐メモリ (VmRSS)",
       bench_thr_label: "負荷時の OS スレッド数",
-      bench_caveat: "tools/load_compare.sh（同一マシン・20 秒移動負荷）の実測記録（evidence/gameplay/load-compare/receipt.json）。※ Alpha 版は本家より実装機能が少ないため完全同一条件ではなく、地形 feature 生成の CPU 最適化は引き続き進行中です。",
+      bench_caveat: "tools/load_compare.sh（同一マシン・20 秒移動負荷）の実測記録（evidence/gameplay/load-compare/receipt.json）。※ Alpha 版は本家より機能が少なく完全同一条件ではなく、地形 feature 生成の CPU 最適化は引き続き進行中です。",
       checker_title: "手元の Modpack をその場で診断。",
       checker_note: "このタブ内で完結 — ファイルは一切送信されません。",
       checker_desc: "Modrinth の .mrpack や CurseForge の .zip を落とすだけで、自動スキップされる軽量化 Mod・ネイティブ動作・要検査 JAR を即座に表示します。",
@@ -327,14 +327,14 @@ cargo run --locked</code></pre>
       checker_hint: "またはクリックしてファイルを選択",
       checker_raw: "JSON レポートとテキスト要約",
       how_title: "軽さの理由と仕組み",
-      p1_title: "手元の公式 server.jar から生成",
-      p1_body: "Mojang のバイナリやアセットは一切同梱しません。初回セットアップ時に手元の公式 Minecraft ファイルからローカル生成します。",
-      p2_title: "Modpack をそのまま投入",
-      p2_body: "Sodium・Lithium・ModernFix・Distant Horizons 等 36 種の軽量化 Mod を自動スキップ。Create 動力網・Farmer's Delight と全アドオン・OpenPAC/FTB Chunks はクリーンルーム Rust で動作し、未対応 Mixin は本家 NeoForge へ安全に委譲します。",
-      p3_title: "旧世代 Intel 内蔵 GPU から RTX まで",
-      p3_body: "Vulkan Mesh Shader（RTX / Radeon RDNA2+ / Arc）、Compute + Multi-Draw Indirect に加え、旧世代 Intel HD/UHD 内蔵 GPU 向けの省 VRAM・UBO バッチ経路を選択可能。",
-      p4_title: "クリーンルーム＆オープンソース",
-      p4_body: "コアワークスペース外部依存ゼロの独自 Rust 実装。本体 GPL-3.0-or-later、独立クレート群は LGPL/GPL/AGPL-3.0-or-later のトリプルライセンス。",
+      p1_title: "Create 工場が重くならない設計",
+      p1_body: "動力網・ベルト・流体・6-DOF 飛行船・Farmer's Delight 調理鍋をネイティブ Rust で処理。アイドル機械は O(1) 睡眠で CPU 消費 0、回転歯車 1 万個も GPU インスタンシングでメッシュ種あたり 1 ドローコールへ集約します。",
+      p2_title: "Vulkan 駆動 ＋ 超低スペ PC 対応",
+      p2_body: "RTX / Radeon RDNA2+ / Arc 向け Vulkan Mesh Shader、Compute + Multi-Draw Indirect に加え、旧世代 Intel HD 4000 / UHD 630 ノート向けの ClassicLowSpec（16 KiB UBO バッチ＋省 VRAM 遠景 LOD）を選択できます。",
+      p3_title: "Modpack をそのまま投入＆安全フォールバック",
+      p3_body: "Sodium・Lithium・ModernFix・Distant Horizons 等 36 種の軽量化 Mod を自動スキップ。OpenPAC/FTB Chunks や単純な @Inject Mixin はネイティブ／軽量実行し、未対応の重 Mixin は本家 NeoForge へ安全に委譲します。",
+      p4_title: "Mojang 非同梱・クリーンルーム OSS",
+      p4_body: "Mojang のファイルや他 Mod のコードは一切同梱しません。実行データは手元の公式 server.jar からローカル生成。コア外部依存 0・GPL-3.0-or-later（独立クレートは LGPL/GPL/AGPL）。",
       qs_title: "3 コマンドで起動。",
       qs_1: "1. サーバーディレクトリを初期化",
       qs_2: "2. Modpack や mods/ フォルダを事前診断（JVM 不要）",
