@@ -17,9 +17,9 @@
 //    DecompressionStream, no third-party libraries) pulls the manifest
 //    member straight out of a dropped .mrpack/.zip archive.
 //
-// 2. The DOM wiring: SITE_CONFIG brand binding, the drag-and-drop checker
-//    UI, and copy-to-clipboard buttons. Everything runs 100% client-side;
-//    no manifest bytes ever leave the tab.
+// 2. The DOM wiring: SITE_CONFIG brand binding, the drag-and-drop checker,
+//    and masked feedback dialog. Modpack manifests stay in the browser;
+//    feedback is sent only after the player reviews and submits it.
 //
 // Clean-room note (same contract as fallback.rs/modpack.rs): matching file
 // names and mod ids against BUILTIN_SUPERSEDED_PERF_MODS only decides
@@ -45,6 +45,7 @@
       "NeoForge/Fabric mod compatibility and Velocity forwarding support.",
     mcTargets: ["1.21.1", "26.3"],
     githubUrl: "https://github.com/nekomario28/mc-spine",
+    reportApiUrl: "",
     releasesUrl: "https://github.com/nekomario28/mc-spine/releases",
     docsBaseUrl: "https://github.com/nekomario28/mc-spine/tree/main/docs",
     customDomain: "",
@@ -69,6 +70,99 @@
       }
     }
     return cfg;
+  }
+
+  // Compact /api/report contract, shared by the preview, POST and fallback.
+  var REPORT_MAX_BYTES = 4096;
+  var REPORT_FINGERPRINT = /^MEGU-E-[0-9A-F]{8}$/;
+
+  function redactReportText(value) {
+    return value
+      .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|sk-[A-Za-z0-9_-]{16,})\b/g,
+        "[REDACTED]")
+      .replace(/\bBearer\s+[^\s"'<>]+/gi, "Bearer [REDACTED]")
+      .replace(/("(?:token|secret|password|api[_-]?key|authorization|rcon\.password)"\s*:\s*)"[^"]*"/gi,
+        '$1"[REDACTED]"')
+      .replace(/((?:rcon\.password|access[_-]?token|api[_-]?key|secret|password|token|authorization)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi,
+        "$1[REDACTED]")
+      .replace(/\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+        "[REDACTED]")
+      .replace(/(^|[^A-Za-z0-9_.])((?:[a-f0-9]{0,4}:){2,}[a-f0-9]{0,4}(?:%[a-z0-9]+)?)(?=$|[^A-Za-z0-9_.])/gi,
+        "$1[REDACTED IP]")
+      .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED IP]")
+      .replace(/(^|[\s([{'"=])(?:[A-Za-z]:[\\/]|\\\\)[^\s"'<>]+/gm,
+        "$1[REDACTED PATH]")
+      .replace(/~\/(?:[^\s"'<>/]+\/)*[^\s"'<>/]+/g, "[REDACTED PATH]")
+      .replace(/(^|[\s([{=:'"])(\/(?!\/)[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~+-]+)+)/gm,
+        "$1[REDACTED PATH]");
+  }
+
+  function enforceReportByteLimit(json) {
+    var bytes = new TextEncoder().encode(json).length;
+    if (bytes > REPORT_MAX_BYTES) {
+      throw new Error("Report exceeds 4 KiB");
+    }
+    return bytes;
+  }
+
+  function buildCompactReport(input) {
+    if (!input || ["crash", "bug", "idea"].indexOf(input.kind) === -1) {
+      throw new Error("Invalid report type");
+    }
+    if (input.mc_version !== "1.21.1" && input.mc_version !== "26.3") {
+      throw new Error("Invalid Minecraft version");
+    }
+    if (typeof input.summary !== "string" ||
+        !input.summary.trim() || input.summary.length > 240) {
+      throw new Error("Summary must be 1–240 characters");
+    }
+    var fingerprint = String(input.fingerprint || "").trim().toUpperCase();
+    if (fingerprint && !REPORT_FINGERPRINT.test(fingerprint)) {
+      throw new Error("Invalid fingerprint (MEGU-E-XXXXXXXX)");
+    }
+    var report = {
+      schema: "megu-report/1",
+      kind: input.kind,
+      mc_version: input.mc_version,
+      engine_version: "",
+      os: "",
+      summary: redactReportText(input.summary.trim()),
+    };
+    if (fingerprint) {
+      report.fingerprint = fingerprint;
+    }
+    var json = JSON.stringify(report);
+    var bytes = enforceReportByteLimit(json);
+    return { report: report, json: json, bytes: bytes };
+  }
+
+  function githubReportBase(githubUrl) {
+    try {
+      var url = new URL(githubUrl);
+      if (url.protocol === "https:" && url.hostname === "github.com" &&
+          /^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/?$/.test(url.pathname)) {
+        return url.origin + url.pathname.replace(/\/$/, "");
+      }
+    } catch (_) {}
+    return "https://github.com/nekomario28/mc-spine";
+  }
+
+  function makeGitHubIssueUrl(githubUrl, compact) {
+    var report = compact.report;
+    var prefix = { crash: "[Crash]", bug: "[Bug]", idea: "[Idea]" }[report.kind];
+    var title = (prefix + (report.fingerprint ? " " + report.fingerprint : "") +
+      " " + report.summary).slice(0, 140);
+    var body = "**Kind:** " + report.kind + "\n" +
+      "**MC version:** " + report.mc_version + "\n\n" +
+      "**Summary:** " + report.summary + "\n\n" +
+      "**Masked megu-report/1 JSON:**\n```json\n" + compact.json + "\n```";
+    return githubReportBase(githubUrl) + "/issues/new?title=" +
+      encodeURIComponent(title) + "&body=" + encodeURIComponent(body);
+  }
+
+  function makeFingerprintSearchUrl(githubUrl, fingerprint) {
+    return githubReportBase(githubUrl) + "/issues?q=" +
+      encodeURIComponent(fingerprint || "MEGU-E-");
   }
 
   // ---------------------------------------------------------------------
@@ -1623,6 +1717,11 @@
   // ---------------------------------------------------------------------
 
   var api = {
+    buildCompactReport: buildCompactReport,
+    enforceReportByteLimit: enforceReportByteLimit,
+    redactReportText: redactReportText,
+    makeGitHubIssueUrl: makeGitHubIssueUrl,
+    makeFingerprintSearchUrl: makeFingerprintSearchUrl,
     analyzeModpackJson: analyzeModpackJson,
     extractManifestFromZipBytes: extractManifestFromZipBytes,
     formatHumanSummary: formatHumanSummary,
@@ -1788,6 +1887,279 @@
         copyText(code.textContent, btn);
       }
     });
+  }
+
+  // -- Unified crash / bug / idea reporting -------------------------------
+
+  function bindFeedback() {
+    var overlay = $("feedback-overlay");
+    if (!overlay) {
+      return;
+    }
+    var form = $("feedback-form");
+    var kind = $("feedback-kind");
+    var fingerprint = $("feedback-fingerprint");
+    var version = $("feedback-version");
+    var summary = $("feedback-summary");
+    var preview = $("feedback-preview");
+    var size = $("feedback-size");
+    var status = $("feedback-status");
+    var fallback = $("feedback-fallback");
+    var sendRow = $("feedback-send-row");
+    var sendButton = $("feedback-send");
+    var copyButton = $("feedback-copy");
+    var githubLink = $("feedback-github");
+    var searchLink = $("feedback-search");
+    var result = $("feedback-result");
+    var resultLink = $("feedback-result-link");
+    var count = $("feedback-count");
+    var apiUrl = typeof CFG.reportApiUrl === "string" ? CFG.reportApiUrl.trim() : "";
+    var draft = null;
+    var pending = false;
+    var failed = false;
+    var lastFocused = null;
+    var oldOverflow = "";
+    var statusKey = "";
+    var statusDetail = "";
+    var text = {
+      en: {
+        summary: "Enter a summary (240 characters max).",
+        fingerprint: "Use a fingerprint such as MEGU-E-1234ABCD.",
+        version: "Choose a supported Minecraft version.",
+        invalid: "Check the report fields.",
+        preview: "Enter a summary to preview the masked report.",
+        crash: "A fingerprint is required for API crash reports. You can use GitHub below without one.",
+        sending: "Sending masked report…",
+        sent: "Report sent.",
+        failed: "Could not send the report. Use the options below.",
+        copied: "Masked report copied.",
+        copyFailed: "Clipboard unavailable. Select and copy the preview above.",
+        count: function (n) { return n + " reports total"; },
+      },
+      ja: {
+        summary: "概要を 240 文字以内で入力してください。",
+        fingerprint: "MEGU-E-1234ABCD の形式で入力してください。",
+        version: "対応する Minecraft バージョンを選択してください。",
+        invalid: "入力内容を確認してください。",
+        preview: "概要を入力すると、マスク済みレポートを確認できます。",
+        crash: "API 経由のクラッシュ報告にはフィンガープリントが必要です。GitHub からは省略できます。",
+        sending: "マスク済みレポートを送信中…",
+        sent: "レポートを送信しました。",
+        failed: "送信できませんでした。以下の方法をご利用ください。",
+        copied: "マスク済みレポートをコピーしました。",
+        copyFailed: "コピーできませんでした。上のプレビューを選択してコピーしてください。",
+        count: function (n) { return "報告数 " + n + " 件"; },
+      },
+    };
+
+    function messages() {
+      return text[document.documentElement.lang === "ja" ? "ja" : "en"];
+    }
+
+    function setStatus(key, detail) {
+      statusKey = key;
+      statusDetail = detail || "";
+      status.textContent = key ? messages()[key] +
+        (statusDetail ? " " + statusDetail : "") : "";
+    }
+
+    function isCrashWithoutFingerprint() {
+      return draft && draft.report.kind === "crash" &&
+        !draft.report.fingerprint;
+    }
+
+    function updateFallback() {
+      var needsFallback = !apiUrl || failed || isCrashWithoutFingerprint();
+      fallback.hidden = !needsFallback;
+      sendRow.hidden = !apiUrl || !!isCrashWithoutFingerprint();
+      sendButton.disabled = !draft || pending;
+      copyButton.disabled = !draft;
+      if (draft) {
+        githubLink.href = makeGitHubIssueUrl(CFG.githubUrl, draft);
+        searchLink.href = makeFingerprintSearchUrl(
+          CFG.githubUrl, draft.report.fingerprint);
+      } else {
+        githubLink.removeAttribute("href");
+        searchLink.href = makeFingerprintSearchUrl(CFG.githubUrl, "");
+      }
+      githubLink.setAttribute("aria-disabled", draft ? "false" : "true");
+    }
+
+    function refresh() {
+      failed = false;
+      result.hidden = true;
+      try {
+        draft = buildCompactReport({
+          kind: kind.value,
+          fingerprint: fingerprint.value,
+          mc_version: version.value,
+          summary: summary.value,
+        });
+        preview.textContent = draft.json;
+        size.textContent = draft.bytes + " / 4096 B";
+        setStatus(isCrashWithoutFingerprint() && apiUrl ? "crash" : "");
+      } catch (err) {
+        draft = null;
+        preview.textContent = messages().preview;
+        size.textContent = "0 / 4096 B";
+        setStatus(summary.value.length ?
+          (err.message.indexOf("fingerprint") !== -1 ? "fingerprint" :
+            err.message.indexOf("version") !== -1 ? "version" : "summary") : "");
+      }
+      updateFallback();
+    }
+
+    function closeModal() {
+      if (overlay.hidden) {
+        return;
+      }
+      overlay.hidden = true;
+      document.body.style.overflow = oldOverflow;
+      if (lastFocused && lastFocused.isConnected) {
+        lastFocused.focus();
+      }
+    }
+
+    function openModal() {
+      lastFocused = document.activeElement;
+      oldOverflow = document.body.style.overflow;
+      overlay.hidden = false;
+      document.body.style.overflow = "hidden";
+      refresh();
+      kind.focus();
+    }
+
+    $("feedback-open").addEventListener("click", openModal);
+    $("feedback-close").addEventListener("click", closeModal);
+    overlay.addEventListener("click", function (ev) {
+      if (ev.target === overlay) {
+        closeModal();
+      }
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (overlay.hidden) {
+        return;
+      }
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        closeModal();
+      } else if (ev.key === "Tab") {
+        var items = Array.prototype.filter.call(
+          overlay.querySelectorAll("button:not([disabled]), input:not([disabled]), " +
+            "select:not([disabled]), textarea:not([disabled]), a[href], [tabindex='0']"),
+          function (el) { return !el.closest("[hidden]"); });
+        if (!items.length) {
+          ev.preventDefault();
+          $("feedback-dialog").focus();
+          return;
+        }
+        var first = items[0];
+        var last = items[items.length - 1];
+        if (ev.shiftKey && (document.activeElement === first ||
+            !overlay.contains(document.activeElement))) {
+          ev.preventDefault();
+          last.focus();
+        } else if (!ev.shiftKey && (document.activeElement === last ||
+                   !overlay.contains(document.activeElement))) {
+          ev.preventDefault();
+          first.focus();
+        }
+      }
+    });
+
+    [kind, fingerprint, version, summary].forEach(function (el) {
+      el.addEventListener("input", refresh);
+      el.addEventListener("change", refresh);
+    });
+    document.addEventListener("megu:languagechange", function () {
+      if (statusKey) {
+        setStatus(statusKey, statusDetail);
+      }
+      if (!draft) {
+        preview.textContent = messages().preview;
+      }
+      if (!result.hidden && count.dataset.total) {
+        count.textContent = messages().count(Number(count.dataset.total));
+      }
+    });
+
+    copyButton.addEventListener("click", function () {
+      if (!draft) {
+        return;
+      }
+      var copiedJson = draft.json;
+      function copied() { setStatus("copied"); }
+      function copyFallback() {
+        var ta = document.createElement("textarea");
+        ta.value = copiedJson;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = false;
+        try {
+          ok = document.execCommand("copy");
+        } catch (_) {
+          ok = false;
+        } finally {
+          ta.remove();
+        }
+        setStatus(ok ? "copied" : "copyFailed");
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(copiedJson).then(copied, copyFallback);
+      } else {
+        copyFallback();
+      }
+    });
+
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      refresh();
+      if (!draft) {
+        setStatus(summary.value.trim() ? "invalid" : "summary");
+        summary.focus();
+        return;
+      }
+      if (!apiUrl || isCrashWithoutFingerprint() || pending) {
+        updateFallback();
+        return;
+      }
+      var sentJson = draft.json;
+      pending = true;
+      updateFallback();
+      setStatus("sending");
+      fetch(apiUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: sentJson,
+      }).then(function (response) {
+        return response.json().then(function (data) {
+          if (!response.ok || !data || data.ok !== true ||
+              typeof data.issue_url !== "string" ||
+              !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/issues\/\d+$/.test(data.issue_url)) {
+            throw new Error(data && data.error || "Invalid report response");
+          }
+          return data;
+        });
+      }).then(function (data) {
+        resultLink.href = data.issue_url;
+        resultLink.textContent = data.issue_url;
+        count.dataset.total = data.total_reports > 1 ? data.total_reports : "";
+        count.textContent = count.dataset.total ?
+          messages().count(Number(count.dataset.total)) : "";
+        result.hidden = false;
+        setStatus("sent");
+      }).catch(function () {
+        failed = true;
+        setStatus("failed");
+      }).finally(function () {
+        pending = false;
+        updateFallback();
+      });
+    });
+
+    refresh();
   }
 
   // -- Pre-flight checker UI ------------------------------------------------
@@ -2030,4 +2402,5 @@
   bindConfig();
   bindCopyButtons();
   bindChecker();
+  bindFeedback();
 })(typeof window !== "undefined" ? window : globalThis);

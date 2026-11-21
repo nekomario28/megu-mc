@@ -306,6 +306,9 @@ cargo run --locked</code></pre>
           <span data-cfg="tagline">A Minecraft-compatible engine written in Rust (codename: mc-spine)</span>
         </div>
         <div class="foot-links">
+          <button class="foot-feedback" id="feedback-open" type="button"
+                  aria-haspopup="dialog" aria-controls="feedback-dialog"
+                  data-i18n="feedback_open">Report bug / Send idea</button>
           <a href="https://github.com/nekomario28/mc-spine" data-cfg-href="githubUrl">GitHub</a>
           <a href="https://github.com/nekomario28/mc-spine" data-cfg-href="githubUrl">Contribute</a>
           <a href="https://github.com/nekomario28/mc-spine/releases" data-cfg-href="releasesUrl">Releases</a>
@@ -321,6 +324,72 @@ cargo run --locked</code></pre>
       <p class="deploy-note" id="deploy-note"></p>
     </div>
   </footer>
+
+  <div class="feedback-overlay" id="feedback-overlay" hidden>
+    <section class="feedback-dialog" id="feedback-dialog" role="dialog"
+             aria-modal="true" aria-labelledby="feedback-title"
+             aria-describedby="feedback-desc" tabindex="-1">
+      <div class="feedback-heading">
+        <h2 id="feedback-title" data-i18n="feedback_title">Report a crash, bug or idea</h2>
+        <button class="feedback-close" id="feedback-close" type="button"
+                aria-label="Close" data-i18n-aria-label="feedback_close">×</button>
+      </div>
+      <p class="feedback-desc" id="feedback-desc" data-i18n="feedback_desc">
+        Prepare a masked report without an account. Direct sending is available when site reporting is enabled.
+      </p>
+      <form id="feedback-form">
+        <div class="feedback-fields">
+          <label for="feedback-kind" data-i18n="feedback_kind">Report type</label>
+          <select id="feedback-kind" name="kind">
+            <option value="crash" data-i18n="feedback_crash">Crash</option>
+            <option value="bug" selected data-i18n="feedback_bug">Bug</option>
+            <option value="idea" data-i18n="feedback_idea">Idea</option>
+          </select>
+          <label for="feedback-fingerprint" data-i18n="feedback_fingerprint">Fingerprint (optional)</label>
+          <input id="feedback-fingerprint" name="fingerprint" type="text"
+                 maxlength="15" pattern="[Mm][Ee][Gg][Uu]-[Ee]-[0-9a-fA-F]{8}"
+                 placeholder="MEGU-E-XXXXXXXX" autocomplete="off" spellcheck="false">
+          <label for="feedback-version" data-i18n="feedback_version">Minecraft version</label>
+          <select id="feedback-version" name="mc_version">
+            <option value="1.21.1">1.21.1</option>
+            <option value="26.3">26.3</option>
+          </select>
+          <label for="feedback-summary" data-i18n="feedback_summary">Summary (240 characters max)</label>
+          <textarea id="feedback-summary" name="summary" rows="3" maxlength="240"
+                    required aria-describedby="feedback-summary-hint"
+                    placeholder="What happened?" data-i18n-placeholder="feedback_placeholder"></textarea>
+          <p class="feedback-hint" id="feedback-summary-hint" data-i18n="feedback_summary_hint">
+            Include steps to reproduce if known. Do not include secrets or personal information.
+          </p>
+        </div>
+        <div class="feedback-preview-heading">
+          <strong data-i18n="feedback_preview">Masked report preview</strong>
+          <span id="feedback-size">0 / 4096 B</span>
+        </div>
+        <pre class="feedback-preview" id="feedback-preview" tabindex="0" aria-label="Masked JSON preview" data-i18n-aria-label="feedback_preview_label"></pre>
+        <p class="feedback-hint" data-i18n="feedback_privacy">
+          Exactly this compact JSON is submitted. Paths, IP addresses and common secrets are masked in this browser.
+        </p>
+        <p class="feedback-status" id="feedback-status" role="status" aria-live="polite"></p>
+        <div class="feedback-send" id="feedback-send-row">
+          <span data-i18n="feedback_confirm">Send OK?</span>
+          <button class="btn primary" id="feedback-send" type="submit" data-i18n="feedback_send">Send</button>
+        </div>
+        <div class="feedback-fallback" id="feedback-fallback" hidden>
+          <button class="btn" id="feedback-copy" type="button" data-i18n="feedback_copy">Copy masked report</button>
+          <a class="btn" id="feedback-github" target="_blank" rel="noopener noreferrer"
+             data-i18n="feedback_github">Open pre-filled GitHub Issue</a>
+          <a class="feedback-search" id="feedback-search" target="_blank" rel="noopener noreferrer"
+             data-i18n="feedback_search">Search existing fingerprint</a>
+        </div>
+        <p class="feedback-result" id="feedback-result" hidden>
+          <span data-i18n="feedback_issue">GitHub Issue</span>
+          <a id="feedback-result-link" target="_blank" rel="noopener noreferrer"></a>
+          <span id="feedback-count"></span>
+        </p>
+      </form>
+    </section>
+  </div>
 
   <script>
   (function () {
@@ -388,12 +457,43 @@ cargo run --locked</code></pre>
       scope_wip_1: "戦闘・残りゲームルール・一般シード地形の完全 Vanilla パリティ",
       scope_wip_2: "ライブサーバーのネイティブ Anvil 保存と実 Mod 実行範囲の拡大",
       scope_wip_3: "独立 GPU クライアント実描画（Bukkit/Spigot/Paper プラグインは対象外 — Velocity プラグインまたは NeoForge/Fabric Mod を利用してください）",
-      footer_legal: "独立したクリーンルーム OSS プロジェクトです。Mojang・Microsoft および記載の各 Mod 作者とは一切関係ありません。"
+      footer_legal: "独立したクリーンルーム OSS プロジェクトです。Mojang・Microsoft および記載の各 Mod 作者とは一切関係ありません。",
+      feedback_open: "不具合報告・要望",
+      feedback_title: "クラッシュ・不具合・要望を送る",
+      feedback_desc: "アカウントなしでマスク済みレポートを作成できます。サイトからの直接送信は報告機能の有効化後に利用できます。",
+      feedback_close: "閉じる",
+      feedback_kind: "報告の種類",
+      feedback_crash: "クラッシュ",
+      feedback_bug: "不具合",
+      feedback_idea: "要望",
+      feedback_fingerprint: "フィンガープリント（任意）",
+      feedback_version: "Minecraft バージョン",
+      feedback_summary: "概要（240 文字以内）",
+      feedback_placeholder: "何が起きましたか？",
+      feedback_summary_hint: "わかれば再現手順も記入してください。個人情報や秘密情報は入力しないでください。",
+      feedback_preview: "マスク済みレポートのプレビュー",
+      feedback_preview_label: "マスク済み JSON プレビュー",
+      feedback_privacy: "この JSON をそのまま送信します。パス・IP アドレス・一般的な秘密情報はブラウザ内でマスクします。",
+      feedback_confirm: "送信しますか？",
+      feedback_send: "送信",
+      feedback_copy: "マスク済みレポートをコピー",
+      feedback_github: "入力済み GitHub Issue を開く",
+      feedback_search: "既存のフィンガープリントを検索",
+      feedback_issue: "GitHub Issue"
     };
     var EN = {};
     var nodes = document.querySelectorAll("[data-i18n]");
+    var attributeNodes = document.querySelectorAll("[data-i18n-placeholder], [data-i18n-aria-label]");
     Array.prototype.forEach.call(nodes, function (el) {
       EN[el.getAttribute("data-i18n")] = el.textContent;
+    });
+    Array.prototype.forEach.call(attributeNodes, function (el) {
+      if (el.hasAttribute("data-i18n-placeholder")) {
+        EN[el.getAttribute("data-i18n-placeholder")] = el.getAttribute("placeholder");
+      }
+      if (el.hasAttribute("data-i18n-aria-label")) {
+        EN[el.getAttribute("data-i18n-aria-label")] = el.getAttribute("aria-label");
+      }
     });
     var btn = document.getElementById("lang-toggle");
     var STORAGE_KEY = "megu_site_lang";
@@ -428,9 +528,19 @@ cargo run --locked</code></pre>
           el.textContent = dict[key];
         }
       });
+      Array.prototype.forEach.call(attributeNodes, function (el) {
+        if (el.hasAttribute("data-i18n-placeholder")) {
+          el.setAttribute("placeholder", dict[el.getAttribute("data-i18n-placeholder")]);
+        }
+        if (el.hasAttribute("data-i18n-aria-label")) {
+          el.setAttribute("aria-label", dict[el.getAttribute("data-i18n-aria-label")]);
+        }
+      });
       if (btn) {
         btn.textContent = lang === "ja" ? "EN" : "日本語";
+        btn.setAttribute("aria-label", lang === "ja" ? "英語に切り替え" : "Switch to Japanese");
       }
+      document.dispatchEvent(new CustomEvent("megu:languagechange", { detail: { lang: lang } }));
       if (persist) {
         try {
           if (window.localStorage) {

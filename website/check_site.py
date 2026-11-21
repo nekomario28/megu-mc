@@ -17,12 +17,9 @@ Checks, all fail-closed:
      assembled below without writing them contiguously, so this script
      does not flag itself).
   4. website/site-config.js declares every required SITE_CONFIG key.
-  5. When `node` is on PATH, a small unit harness requires website/app.js
-     (and site-config.js first, exactly like the browser) and exercises
-     analyzeModpackJson against Modrinth + CurseForge fixtures, the
-     version-range engine, id inference, path-traversal rejection, and
-     extractManifestFromZipBytes against a real ZIP_DEFLATED .mrpack, a
-     stored CurseForge .zip, and corrupt/oversized fail-closed archives.
+  5. When `node` is on PATH, a unit harness exercises the modpack checker,
+     bounded ZIP extraction, and the feedback report builder, client-side
+     redaction, 4 KiB cap, and pre-filled GitHub fallback links.
   6. When `node` is on PATH, website/test_functions.mjs exercises the
      Cloudflare Pages Functions in functions/api/ (payload validation,
      redaction, milestone comments, KV dedup, Turnstile, /api/latest)
@@ -214,16 +211,27 @@ def check_forbidden_names():
 
 
 def check_site_config_keys():
-    """Check 4: site-config.js declares every required key."""
+    """Check 4: site configuration and EN/JA markup copies are complete."""
     cfg = WEBSITE / "site-config.js"
     if not cfg.is_file():
         return ["website/site-config.js is missing"]
     text = cfg.read_text(encoding="utf-8")
-    return [
+    findings = [
         f"site-config.js does not declare '{key}'"
         for key in REQUIRED_CONFIG_KEYS
         if not re.search(rf"\b{re.escape(key)}\s*:", text)
     ]
+    markup = (WEBSITE / "index.html").read_text(encoding="utf-8")
+    ja = re.search(r"var JA\s*=\s*\{(.*?)\n\s*\};", markup, re.S)
+    if not ja:
+        return findings + ["index.html is missing the JA dictionary"]
+    keys = set(re.findall(
+        r"(?m)^\s*([a-z][a-z0-9_]*):\s*", ja.group(1)))
+    referenced = set(re.findall(
+        r'data-i18n(?:-placeholder|-aria-label)?="([a-z0-9_]+)"', markup))
+    for key in sorted(referenced - keys):
+        findings.append(f"index.html is missing JA copy for '{key}'")
+    return findings
 
 
 JS_HARNESS = r"""
@@ -234,6 +242,69 @@ const m = require(process.env.APP_JS);
 
 // Catalog sanity.
 assert.strictEqual(m.BUILTIN_SUPERSEDED_PERF_MODS.length, 36);
+
+// --- Masked feedback /api/report contract and fallback -----------------
+const sensitive = "Crash in /home/alice/.minecraft/logs/latest.log on " +
+  "192.168.1.25, C:\\Users\\Bob\\Desktop\\crash.txt, " +
+  "Bearer secret_ABC123 token=very-secret " +
+  "github_pat_12345678901234567890";
+const compact = m.buildCompactReport({
+  kind: "crash", fingerprint: "megu-e-ab12cd34", mc_version: "1.21.1",
+  summary: sensitive,
+});
+assert.deepStrictEqual(JSON.parse(compact.json), compact.report);
+assert.strictEqual(compact.report.schema, "megu-report/1");
+assert.strictEqual(compact.report.kind, "crash");
+assert.strictEqual(compact.report.fingerprint, "MEGU-E-AB12CD34");
+assert.strictEqual(compact.report.mc_version, "1.21.1");
+assert.strictEqual(compact.report.engine_version, "");
+assert.strictEqual(compact.report.os, "");
+assert.strictEqual(compact.bytes, Buffer.byteLength(compact.json, "utf8"));
+assert.ok(compact.bytes <= 4096);
+for (const secret of ["alice", "192.168.1.25", "Bob", "secret_ABC123",
+                      "very-secret", "github_pat_"]) {
+  assert.ok(!compact.json.includes(secret), secret + " leaked");
+}
+assert.ok(compact.json.includes("[REDACTED PATH]"));
+assert.ok(compact.json.includes("[REDACTED IP]"));
+assert.ok(compact.json.includes("[REDACTED]"));
+assert.ok(!m.redactReportText("~/.minecraft/config token=12345").includes("12345"));
+assert.ok(!m.redactReportText("/var/log/minecraft.log").includes("/var/log"));
+assert.ok(!m.redactReportText("[2001:db8::1]").includes("2001:db8"));
+assert.strictEqual(m.redactReportText("fe80::1"), "[REDACTED IP]");
+assert.strictEqual(m.redactReportText("::1"), "[REDACTED IP]");
+assert.strictEqual(m.redactReportText("https://example.com/docs"),
+                   "https://example.com/docs");
+assert.ok(!m.redactReportText('{"token":"superSecret"}').includes("superSecret"));
+assert.throws(() => m.buildCompactReport({
+  kind: "idea", mc_version: "26.3", summary: "a".repeat(241),
+}), /240/);
+assert.throws(() => m.buildCompactReport({
+  kind: "bug", mc_version: "1.21.1", summary: "ok",
+  fingerprint: "MEGU-E-invalid",
+}), /fingerprint/);
+const idea = m.buildCompactReport({
+  kind: "idea", mc_version: "26.3", summary: "Better gamepad support",
+});
+assert.ok(!Object.hasOwn(idea.report, "fingerprint"));
+const crashNoFingerprint = m.buildCompactReport({
+  kind: "crash", mc_version: "1.21.1", summary: "Crash without a log ID",
+});
+assert.ok(!Object.hasOwn(crashNoFingerprint.report, "fingerprint"));
+assert.ok(m.enforceReportByteLimit("界".repeat(1365)) <= 4096);
+assert.throws(() => m.enforceReportByteLimit("界".repeat(1366)), /4 KiB/);
+const fallback = new URL(m.makeGitHubIssueUrl(
+  "https://github.com/nekomario28/mc-spine", compact));
+assert.strictEqual(fallback.origin, "https://github.com");
+assert.strictEqual(fallback.pathname, "/nekomario28/mc-spine/issues/new");
+assert.ok(fallback.searchParams.get("title").startsWith(
+  "[Crash] MEGU-E-AB12CD34"));
+assert.ok(fallback.searchParams.get("body").includes(compact.json));
+assert.ok(!fallback.searchParams.get("body").includes("alice"));
+const search = new URL(m.makeFingerprintSearchUrl(
+  "https://github.com/nekomario28/mc-spine", compact.report.fingerprint));
+assert.strictEqual(search.pathname, "/nekomario28/mc-spine/issues");
+assert.strictEqual(search.searchParams.get("q"), "MEGU-E-AB12CD34");
 
 // --- Sample Modrinth pack: every classification exercised --------------
 const report = m.analyzeModpackJson(m.SAMPLE_MODRINTH_INDEX_JSON, {
@@ -646,7 +717,7 @@ def main():
         ("local assets & zero external deps", check_local_assets),
         ("BUILTIN_SUPERSEDED_PERF_MODS sync", check_perf_mod_sync),
         ("forbidden asset names", check_forbidden_names),
-        ("site-config.js keys", check_site_config_keys),
+        ("site config & EN/JA copy", check_site_config_keys),
         ("app.js unit check (node)", check_js_unit),
         ("functions unit check (node)", check_functions_unit),
     )
