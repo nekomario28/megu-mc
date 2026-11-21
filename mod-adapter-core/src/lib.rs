@@ -27,6 +27,13 @@
 //!   version-range parsing, the `pack_format`/`DataVersion` lookup table, and
 //!   target-version-aware compat verdicts consumed by
 //!   [`fallback::plan_mod_startup_for_version`].
+//! - [`modpack`]: Modrinth `.mrpack` (`modrinth.index.json`) and CurseForge
+//!   (`manifest.json`) modpack pre-flight analyzer — parses both manifest
+//!   formats fail-closed (including path-traversal rejection), checks the
+//!   pack's Minecraft version against the server target, and reports in
+//!   plain language which files are auto-skipped as
+//!   [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`], which are client-only,
+//!   which run natively, and which still need a bytecode inspection.
 
 #![deny(unsafe_code)]
 
@@ -34,6 +41,7 @@ pub mod blockstates;
 pub mod data_loader;
 pub mod dimension_mod;
 pub mod fallback;
+pub mod modpack;
 pub mod neoforge_wire;
 pub mod profile;
 pub mod version_compat;
