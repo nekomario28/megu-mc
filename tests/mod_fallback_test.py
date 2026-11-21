@@ -129,7 +129,9 @@ def _fake_mod(mod_id, mod_ids=None, has_java_bytecode=True,
               shimcheck_compatible=True, has_unsupported_mixin_or_at=False,
               reasons=(), has_custom_chunk_generator=False,
               mc_version_range=None, pack_format=None,
-              pack_supported_min=None, pack_supported_max=None):
+              pack_supported_min=None, pack_supported_max=None,
+              pack_format_tuple=None, pack_min_format=None,
+              pack_max_format=None):
     mod = SimpleNamespace(
         mod_id=mod_id,
         mod_ids=mod_ids or [mod_id],
@@ -141,6 +143,9 @@ def _fake_mod(mod_id, mod_ids=None, has_java_bytecode=True,
         pack_format=pack_format,
         pack_supported_min=pack_supported_min,
         pack_supported_max=pack_supported_max,
+        pack_format_tuple=pack_format_tuple,
+        pack_min_format=pack_min_format,
+        pack_max_format=pack_max_format,
         source=f"mods/{mod_id}.jar",
     )
     mod.reason_codes = lambda: list(reasons)
@@ -441,6 +446,62 @@ class ClassifierUnitTests(unittest.TestCase):
         tier, _ = mod_launcher.classify(old, set(), set(), (1, 19, 4))
         self.assertEqual(tier, 3)
 
+    def test_pure_data_pack_26_x_min_max_format_tuple_gate(self):
+        # The 26.x schema: pack_format [121, 0] plus a min_format/max_format
+        # span. Exact match and span-coverage both load on 26.3.
+        new26 = _fake_mod("new26", has_java_bytecode=False,
+                          pack_format_tuple=(121, 0),
+                          pack_min_format=(121, 0), pack_max_format=(121, 0))
+        tier, reasons = mod_launcher.classify(new26, set(), set(), (26, 3, 0))
+        self.assertEqual(tier, 1)
+        self.assertEqual(reasons, [
+            "handled by zero-JVM universal adapter / offload profile"])
+        # A pack spanning both targets is Tier 1 on either release line.
+        universal = _fake_mod("universal", has_java_bytecode=False,
+                              pack_format_tuple=(48, 0),
+                              pack_min_format=(48, 0),
+                              pack_max_format=(121, 0))
+        for target in ((1, 21, 1), (26, 3, 0)):
+            tier, _ = mod_launcher.classify(universal, set(), set(), target)
+            self.assertEqual(tier, 1, target)
+        # A legacy scalar pack_format 48 is refused on 26.3 (format 121).
+        legacy = _fake_mod("legacy", has_java_bytecode=False, pack_format=48)
+        tier, reasons = mod_launcher.classify(legacy, set(), set(), (26, 3, 0))
+        self.assertEqual(tier, 3)
+        self.assertEqual(reasons[0], "PACK_FORMAT_INCOMPATIBLE")
+        self.assertIn("pack_format 48", reasons[1])
+        self.assertIn("26.3", reasons[1])
+        # And the inverse: a 26.3-only tuple pack is refused on 1.21.1.
+        tier, reasons = mod_launcher.classify(new26, set(), set(), (1, 21, 1))
+        self.assertEqual(tier, 3)
+        self.assertEqual(reasons[0], "PACK_FORMAT_INCOMPATIBLE")
+        self.assertIn("min_format", reasons[1])
+        self.assertIn("1.21.1", reasons[1])
+
+    def test_mc_version_26_3_gates_ranges_but_sodium_stays_superseded(self):
+        # NeoForge [26.3,26.4) and Fabric >=26.3 declare the new release line.
+        for mod in (_versioned_fake("n26", "[26.3,26.4)"),
+                    _versioned_fake("f26", ">=26.3")):
+            _, reasons = mod_launcher.classify(mod, set(), set(), (26, 3, 0))
+            # Mixin-incompatible with no profile: Tier 3 on technical grounds
+            # only — the version gate stays silent on its declared target.
+            self.assertEqual(reasons, ["UNSUPPORTED_MIXIN_INJECTION"])
+        # A 1.21.1-only mod on 26.3 is a major mismatch, never silent.
+        old = _versioned_fake("oldmod", "[1.21.1]")
+        tier, reasons = mod_launcher.classify(old, set(), set(), (26, 3, 0))
+        self.assertEqual(tier, 3)
+        self.assertEqual(reasons, [
+            "MC_VERSION_INCOMPATIBLE",
+            "built for Minecraft [1.21.1], server is running 26.3.0",
+        ])
+        # sodium declaring a 1.21.1-only range is still BuiltInSuperseded on
+        # 26.3 — the catalog wins before the version gate.
+        sodium = _versioned_fake("sodium", "[1.21.1]")
+        tier, reasons = mod_launcher.classify(sodium, set(), set(), (26, 3, 0))
+        self.assertEqual(tier, mod_launcher.TIER_SUPERSEDED)
+        self.assertEqual(reasons,
+                         ["already covered by mc-spine built-in optimizations"])
+
 
 class VersionCompatUnitTests(unittest.TestCase):
     """Ports of the #[cfg(test)] cases in mod-adapter-core/src/version_compat.rs."""
@@ -462,10 +523,17 @@ class VersionCompatUnitTests(unittest.TestCase):
         self.assertLess((1, 21, 1), (1, 21, 3))
         self.assertEqual(mod_launcher.format_mc_version((1, 21, 1)), "1.21.1")
         self.assertEqual(mod_launcher.format_mc_version(v("1.21")), "1.21.0")
+        # Year-based 26.x versions parse and order past the 1.x line.
+        self.assertEqual(v("26.3"), (26, 3, 0))
+        self.assertEqual(v("26.3.1"), (26, 3, 1))
+        self.assertEqual(mod_launcher.format_mc_version(v("26.3")), "26.3.0")
+        self.assertLess((1, 21, 5), (26, 0, 0))
+        self.assertLess((26, 3, 0), (26, 4, 0))
 
     def test_pack_format_and_data_version_table(self):
         pf = mod_launcher.data_pack_format_for
         dv = mod_launcher.data_version_for
+        pft = mod_launcher.data_pack_format_tuple_for
         self.assertEqual(pf((1, 20, 4)), 26)
         self.assertEqual(dv((1, 20, 4)), 3700)
         self.assertEqual(pf((1, 20, 6)), 41)
@@ -480,8 +548,14 @@ class VersionCompatUnitTests(unittest.TestCase):
         self.assertEqual(dv((1, 21, 4)), 4189)
         self.assertEqual(pf((1, 21, 5)), 71)
         self.assertEqual(dv((1, 21, 5)), 4325)
+        self.assertEqual(pf((26, 3, 0)), 121)
+        self.assertEqual(dv((26, 3, 0)), 5023)
         self.assertIsNone(pf((1, 19, 4)))
         self.assertIsNone(dv((2, 0, 0)))
+        # The (major, minor) tuple mirrors: legacy versions get a zero minor.
+        self.assertEqual(pft((1, 21, 1)), (48, 0))
+        self.assertEqual(pft((26, 3, 0)), (121, 0))
+        self.assertIsNone(pft((1, 19, 4)))
 
     def test_check_pack_format_across_supported_targets(self):
         cpf = mod_launcher.check_pack_format
@@ -498,6 +572,39 @@ class VersionCompatUnitTests(unittest.TestCase):
         self.assertTrue(cpf((1, 20, 4), 48, None, 71))
         # Unknown target format fails closed.
         self.assertFalse(cpf((1, 19, 4), 26, 1, 99))
+
+    def test_check_pack_format_tuple_covers_26_3_min_max_format(self):
+        cpf = mod_launcher.check_pack_format_tuple
+        # A 26.3 datapack declaring min_format == max_format == [121, 0].
+        self.assertTrue(cpf((26, 3, 0), (121, 0), (121, 0), (121, 0)))
+        self.assertFalse(cpf((1, 21, 1), (121, 0), (121, 0), (121, 0)))
+        # A pack spanning both targets: min (48,0) - max (121,0).
+        self.assertTrue(cpf((1, 21, 1), (48, 0), (48, 0), (121, 0)))
+        self.assertTrue(cpf((26, 3, 0), (48, 0), (48, 0), (121, 0)))
+        # Tuples order lexicographically: (121, 0) < (121, 1).
+        self.assertFalse(cpf((26, 3, 0), (121, 1), (121, 1), None))
+        self.assertTrue(cpf((26, 3, 0), (121, 0), (120, 0), None))
+        # Exact format match without a declared span.
+        self.assertTrue(cpf((26, 3, 0), (121, 0)))
+        self.assertFalse(cpf((1, 21, 4), (121, 0)))
+        # Unknown target format fails closed.
+        self.assertFalse(cpf((9, 9, 9), (121, 0), (0, 0), None))
+
+    def test_year_based_26_x_versions_parse_and_range(self):
+        # `[26.3]`, `[26.3,26.4)`, `>=26.3`, `26.3.x` behave like any other
+        # numeric bound in both supported syntaxes.
+        pin = self.vrange("[26.3]")
+        self.assertTrue(pin.contains((26, 3, 0)))
+        self.assertFalse(pin.contains((26, 3, 1)))
+        r = self.vrange("[26.3,26.4)")
+        self.assertTrue(r.contains((26, 3, 5)))
+        self.assertFalse(r.contains((26, 4, 0)))
+        self.assertTrue(self.vrange(">=26.3").contains((26, 9, 0)))
+        self.assertTrue(self.vrange("26.3.x").contains((26, 3, 7)))
+        self.assertFalse(self.vrange("26.3.x").contains((26, 4, 0)))
+        # A 1.21.1-only range never covers 26.3 (different release line).
+        verdict = mod_launcher.check_mod_mc_version((26, 3, 0), "[1.21.1]")
+        self.assertEqual(verdict.kind, "major_mismatch")
 
     def test_maven_exact_pins_and_intervals(self):
         pin = self.vrange("[1.21.1]")
@@ -1291,6 +1398,134 @@ class LauncherIntegrationTests(unittest.TestCase):
             self.assertIn(target, by_id["oldpack"]["reasons"][1])
             self.assertEqual([a["mod_id"] for a in report["triggering_mods"]],
                              ["oldpack"], target)
+
+    def test_mc_version_26_3_gates_real_jar_ranges(self):
+        """--mc-version 26.3: NeoForge [26.3,26.4) and Fabric >=26.3 jars
+        classify cleanly, while a 1.21.1-only mod is refused as a different
+        release line — never silently compatible."""
+        oldmod = self.mods / "oldmod.jar"
+        _jar(oldmod, "oldmod", mc_range="[1.21.1]")
+        n26 = self.mods / "n26.jar"
+        _jar(n26, "n26", mc_range="[26.3,26.4)")
+        f26 = self.mods / "f26.jar"
+        _fabric_jar(f26, "f26", ">=26.3")
+        shim = self.write_shim(
+            (oldmod, "COMPATIBLE", []),
+            (n26, "COMPATIBLE", []),
+            (f26, "COMPATIBLE", []))
+        proc, report = self.invoke(
+            "--mc-version", "26.3",
+            "--fallback", "delegate",
+            "--shimcheck-json", str(shim),
+            "--dry-run", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["mc_version"], "26.3.0")
+        self.assertEqual(report["plan"], "DelegateToNeoForge")
+        triggers = report["triggering_mods"]
+        self.assertEqual([a["mod_id"] for a in triggers], ["oldmod"])
+        self.assertEqual(triggers[0]["reasons"], [
+            "MC_VERSION_INCOMPATIBLE",
+            "built for Minecraft [1.21.1], server is running 26.3.0",
+        ])
+        by_id = {a["mod_id"]: a for a in report["assignments"]}
+        for mod_id in ("n26", "f26"):
+            self.assertEqual(by_id[mod_id]["tier_name"], "BoundedJvmShim",
+                             mod_id)
+            self.assertEqual(by_id[mod_id]["mc_version_verdict"],
+                             "compatible", mod_id)
+        self.assertEqual(by_id["oldmod"]["mc_version_verdict"],
+                         "major_mismatch")
+
+    def test_mc_version_26_3_sodium_stays_builtin_superseded(self):
+        """Even a sodium jar declaring a 1.21.1-only range is still
+        BuiltInSuperseded under --mc-version 26.3: the catalog check wins
+        before the version gate, so no Tier-3 fallback is triggered."""
+        sodium = self.mods / "sodium.jar"
+        _jar(sodium, "sodium", mc_range="[1.21.1]")
+        shim = self.write_shim((sodium, "REJECTED",
+            [("UNSUPPORTED_MIXIN_INJECTION", "sodium.Mix @Redirect",
+              "Unsupported S0 injection")]))
+        proc, report = self.invoke(
+            "--mc-version", "26.3",
+            "--fallback", "strict",
+            "--shimcheck-json", str(shim),
+            "--dry-run", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["mc_version"], "26.3.0")
+        self.assertEqual(report["plan"], "RunNative")
+        self.assertEqual(report["superseded_perf_mods"], ["sodium"])
+        self.assertEqual(report["triggering_mods"], [])
+        assignment = report["assignments"][0]
+        self.assertEqual(assignment["tier_name"], "BuiltInSuperseded")
+        self.assertEqual(assignment["reasons"],
+                         ["already covered by mc-spine built-in optimizations"])
+        self.assertEqual(assignment["mc_version_range"], "[1.21.1]")
+        self.assertIsNone(assignment["mc_version_verdict"])
+
+    def test_datapack_26_x_min_max_format_tuples_gate_version(self):
+        """The 26.x pack.mcmeta schema — pack_format [major, minor] plus
+        min_format/max_format tuples ([121, 0] or scalar 121) — is gated like
+        the legacy scalar pack_format/supported_formats."""
+        new26 = self.mods / "new26.zip"
+        _data_zip(new26, [
+            ("pack.mcmeta",
+             '{"pack":{"pack_format":[121,0],'
+             '"min_format":[121,0],"max_format":[125,0]}}'),
+            ("data/new26/recipes/thing.json",
+             '{"type":"minecraft:crafting_shaped"}'),
+        ])
+        # Scalar min_format/max_format spellings work too.
+        scalar26 = self.mods / "scalar26.zip"
+        _data_zip(scalar26, [
+            ("pack.mcmeta",
+             '{"pack":{"pack_format":[121,0],'
+             '"min_format":121,"max_format":121}}'),
+            ("data/scalar26/recipes/thing.json",
+             '{"type":"minecraft:crafting_shaped"}'),
+        ])
+        # A legacy 1.21.1-only pack declares scalar pack_format 48.
+        legacy = self.mods / "legacy.zip"
+        _data_zip(legacy, [
+            ("pack.mcmeta", '{"pack":{"pack_format":48}}'),
+            ("data/legacy/recipes/thing.json",
+             '{"type":"minecraft:crafting_shaped"}'),
+        ])
+        # On 26.3: the tuple packs load, the legacy pack is refused.
+        proc, report = self.invoke(
+            "--mc-version", "26.3",
+            "--fallback", "delegate",
+            "--dry-run", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        by_id = {a["mod_id"]: a for a in report["assignments"]}
+        for mod_id in ("new26", "scalar26"):
+            self.assertEqual(by_id[mod_id]["tier_name"], "UniversalNative",
+                             mod_id)
+            self.assertIsNone(by_id[mod_id]["pack_format"], mod_id)
+            self.assertEqual(by_id[mod_id]["pack_min_format"], [121, 0],
+                             mod_id)
+        legacy_a = by_id["legacy"]
+        self.assertEqual(legacy_a["tier_name"], "RequiresFallback")
+        self.assertEqual(legacy_a["reasons"][0], "PACK_FORMAT_INCOMPATIBLE")
+        self.assertIn("pack_format 48", legacy_a["reasons"][1])
+        self.assertIn("26.3.0", legacy_a["reasons"][1])
+        self.assertEqual([a["mod_id"] for a in report["triggering_mods"]],
+                         ["legacy"])
+        # On 1.21.1 the roles invert: 26.x-only tuple packs are refused.
+        proc, report = self.invoke(
+            "--mc-version", "1.21.1",
+            "--fallback", "delegate",
+            "--dry-run", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        by_id = {a["mod_id"]: a for a in report["assignments"]}
+        self.assertEqual(by_id["legacy"]["tier_name"], "UniversalNative")
+        for mod_id in ("new26", "scalar26"):
+            a = by_id[mod_id]
+            self.assertEqual(a["tier_name"], "RequiresFallback", mod_id)
+            self.assertEqual(a["reasons"][0], "PACK_FORMAT_INCOMPATIBLE",
+                             mod_id)
+            self.assertIn("min_format", a["reasons"][1], mod_id)
+        self.assertEqual({a["mod_id"] for a in report["triggering_mods"]},
+                         {"new26", "scalar26"})
 
     def test_invalid_mc_version_flag_fails_closed(self):
         proc, _ = self.invoke("--mc-version", "bogus",

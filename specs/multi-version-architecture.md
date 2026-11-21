@@ -1,8 +1,31 @@
 # Multi-Version Architecture Blueprint
 
 **Status:** proposal — Lane N1a (design + tooling foundation only; no `src/` changes in this lane).
-**Scope:** prepare `mc-spine` for Minecraft Java versions beyond the pinned 1.21.1 / protocol 767
-(1.21.4 / 769, 1.21.5 / 770, 1.21.8, 1.22) without scattering protocol numbers through the tree.
+**Scope:** two first-class Minecraft Java targets, aligned end to end:
+
+- **`1.21.1`** — the native/mod line: protocol `767`, `DataVersion 3955`,
+  data `pack_format (48, 0)`, Java 21 LTS for mod runtimes (NeoForge/Fabric).
+- **`26.3` (latest vanilla)** — the newest release line: protocol `777`,
+  `DataVersion 5023`, data `pack_format (121, 0)` / resource `(97, 1)`
+  (`version.json` spells these as flat `pack_version.{data,resource}_{major,minor}`
+  ints and `pack.mcmeta` as `min_format`/`max_format` `[major, minor]` tuples),
+  Java 25.
+
+Intermediate snapshots/releases stay *compatible-but-not-primary*: they ride the same
+VersionPack + IdRemapper machinery, but tests, gates and docs pin exactly the two
+targets above. Everything is designed so a third target is a data pack, not a code fork.
+
+**Reference implementation:** the architecture borrows patterns from the MIT-licensed
+Horizon rewrite (`mc-spine-local/reference/horizon-survey/`): a single pinned version
+module (`horizon-core`'s `version.rs` — here, `mod-adapter-core`'s
+`McVersion`/`version_compat` tables and the pack manifests), a name→id table plus
+resolver split as in `horizon-protocol`'s `ids.rs`/`resolver.rs` (here:
+`packet_ids.json`/`registry_ids.json` + `IdRemapper`), a versioned-storage datafix
+pipeline as in `horizon-world`'s `datafix/` (here: `DataVersion` classification +
+migration in `src/anvil_io.rs`), the dedicated-server file contract of
+`horizon-server-files`, and Horizon's `[profile.fast]` quick-link build profile for
+iteration.
+
 **Companion tool:** [`tools/vanilla_data/version_pack.py`](../tools/vanilla_data/version_pack.py) —
 builds, verifies and diffs the VersionPack data contract specified in §2.
 
@@ -85,10 +108,13 @@ questions through typed APIs. Nobody outside layer 1 ever sees a protocol number
 ### 1.3 Storage layer — `DataVersion` + migration
 
 - Region/level writes stamp the *active* pack's `data_version` (manifest), not a file-local
-  constant: `ANVIL_DATA_VERSION` becomes `pack.manifest.data_version` (3955 for 1.21.1).
+  constant: `ANVIL_DATA_VERSION` becomes `pack.manifest.data_version` (3955 for 1.21.1,
+  5023 for 26.3 — both classified in `AnvilSchemaVersion` since the relevant chunk
+  section schema (`sections[].Y`, `block_states`, `biomes`) is unchanged between them).
 - Reads accept `DataVersion <= supported` and dispatch on it: equal → direct load; older →
   apply the `IdRemapper` chain across the intermediate packs (block-state ids, entity ids,
-  item ids) before decoding palettes/entities; newer → **fail closed** with the same
+  item ids) before decoding palettes/entities; newer than the newest known milestone
+  (currently `> 5023`) → **fail closed** with the same
   idiom [`worldgen::VANILLA_DATA_MISSING`](../src/worldgen.rs) uses today — a named
   command to run, not a silent `Option`.
 - `save_v2`'s own MET-versioning stays an orthogonal axis: it tracks *our* container
@@ -145,7 +171,11 @@ applies to `datapacks/vanilla`.
 
 `pack_format`/`data_version`/`jar_sha1` may be `null` only when the source did not provide
 them; `mc_version` and `protocol_version` are mandatory. `block_states.json` is listed
-only when `reports/blocks.json` was present.
+only when `reports/blocks.json` was present. `pack_format` records the source's shape:
+legacy `{"data": 48, "resource": 34}` on the 1.x line, or the flat
+`{"data_major": 121, "data_minor": 0, "resource_major": 97, "resource_minor": 1}`
+the 26.x `version.json` emits (tuple `[a, b]` values in `pack_version` normalize to the
+same `<key>_major`/`<key>_minor` keys).
 
 ### `packet_ids.json`
 
@@ -201,8 +231,9 @@ registry (plus `block_states`): `added`, `removed`, `renumbered`
 (`name -> {from_id, to_id}`), `unchanged_count`, `registry_renumbered`,
 `added_registry`/`removed_registry`, and an `id_remap` section with `forward`/`reverse`
 maps and `added_ids`/`removed_ids` — the ready-to-load input for §1.2/§1.3. The self-test
-pins this against a synthetic 1.21.1→1.21.4 delta including an inserted id that shifts
-subsequent numbering.
+pins this against synthetic deltas for the two real targets: 1.21.1 (767) → 1.21.4 (769)
+and 1.21.1 (767) → 26.3 (777), each including an inserted id that shifts subsequent
+numbering and forward/reverse `id_remap` verification.
 
 ### Retiring `config_packets.bin`
 

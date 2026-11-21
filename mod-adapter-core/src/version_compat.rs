@@ -27,9 +27,11 @@ use std::fmt;
 
 /// A Minecraft release version triple (`major.minor.patch`).
 ///
-/// Minecraft releases since 1.10 are `1.<minor>[.<patch>]`; `parse` accepts
-/// the two-component shorthand (`"1.21"` means `1.21.0`) so bounds copied from
-/// mod manifests compare correctly.
+/// Minecraft releases are either `1.<minor>[.<patch>]` (the 1.10-1.21.x line)
+/// or the year-based `<year>.<minor>[.<patch>]` scheme (26.x onward);
+/// `parse` accepts the two-component shorthand (`"1.21"` means `1.21.0`,
+/// `"26.3"` means `26.3.0`) so bounds copied from mod manifests compare
+/// correctly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct McVersion {
     pub major: u16,
@@ -53,13 +55,17 @@ impl McVersion {
     pub const V1_21_3: Self = Self::new(1, 21, 3);
     pub const V1_21_4: Self = Self::new(1, 21, 4);
     pub const V1_21_5: Self = Self::new(1, 21, 5);
+    /// Latest vanilla 26.3 (protocol 777, `DataVersion` 5023): the second
+    /// first-class target, on the year-based `26.<minor>` scheme.
+    pub const V26_3: Self = Self::new(26, 3, 0);
 
     /// The Minecraft version this `mc-spine` runtime currently implements.
     /// Used as the default target for version-aware mod classification; bump
     /// when the wire/runtime moves to a newer release line.
     pub const CURRENT: Self = Self::V1_21_1;
 
-    /// Parse `"1.21.1"`, `"1.21"` (= `1.21.0`), or `"1"` (= `1.0.0`).
+    /// Parse `"1.21.1"`, `"1.21"` (= `1.21.0`), `"26.3"` (= `26.3.0`), or
+    /// `"1"` (= `1.0.0`).
     /// Returns `None` on empty input, non-numeric or missing components, more
     /// than three components, or components outside `u16`.
     pub fn parse(s: &str) -> Option<Self> {
@@ -497,7 +503,8 @@ pub fn check_mod_mc_version(target: McVersion, declared_range: &str) -> VersionC
 
 /// `pack_format` datapack/data format number for `v` (`pack.mcmeta`
 /// `pack.pack_format`), covering the 1.20.4-1.21.5 line mc-spine ships
-/// profiles for. `None` for versions outside the table.
+/// profiles for plus latest vanilla 26.3. `None` for versions outside the
+/// table.
 pub fn data_pack_format_for(v: McVersion) -> Option<u32> {
     Some(match v {
         McVersion::V1_20_4 => 26,
@@ -507,12 +514,21 @@ pub fn data_pack_format_for(v: McVersion) -> Option<u32> {
         McVersion::V1_21_3 => 57,
         McVersion::V1_21_4 => 61,
         McVersion::V1_21_5 => 71,
+        McVersion::V26_3 => 121,
         _ => return None,
     })
 }
 
+/// `(major, minor)` data pack format tuple for `v` — the shape `pack.mcmeta`
+/// `min_format`/`max_format` use on the 26.x line. Scalar-`pack_format`
+/// versions report `(format, 0)`: `1.21.1` -> `(48, 0)`, `26.3` ->
+/// `(121, 0)`. `None` for versions outside the table.
+pub fn data_pack_format_tuple_for(v: McVersion) -> Option<(u32, u32)> {
+    data_pack_format_for(v).map(|major| (major, 0))
+}
+
 /// Mojang `DataVersion` for `v` (the number stored in world/player saves),
-/// covering the same 1.20.4-1.21.5 table as [`data_pack_format_for`].
+/// covering the same 1.20.4-1.21.5 + 26.3 table as [`data_pack_format_for`].
 pub fn data_version_for(v: McVersion) -> Option<i32> {
     Some(match v {
         McVersion::V1_20_4 => 3700,
@@ -522,6 +538,7 @@ pub fn data_version_for(v: McVersion) -> Option<i32> {
         McVersion::V1_21_3 => 4082,
         McVersion::V1_21_4 => 4189,
         McVersion::V1_21_5 => 4325,
+        McVersion::V26_3 => 5023,
         _ => return None,
     })
 }
@@ -553,6 +570,35 @@ pub fn check_pack_format(
     lo <= target_pf && target_pf <= hi
 }
 
+/// Whether a datapack declaring `(major, minor)` format tuples — the
+/// `pack.mcmeta` `min_format`/`max_format` schema the 26.x line uses — is
+/// loadable on a server running `target`.
+///
+/// Same contract as [`check_pack_format`]: compatible when the target's own
+/// format tuple equals `format` or falls inside the declared
+/// `min_fmt..=max_fmt` span. Tuples compare lexicographically, so
+/// `(121, 0) < (121, 1)`. `false` when `target` has no known format (fail
+/// closed).
+pub fn check_pack_format_tuple(
+    target: McVersion,
+    format: (u32, u32),
+    min_fmt: Option<(u32, u32)>,
+    max_fmt: Option<(u32, u32)>,
+) -> bool {
+    let Some(target_fmt) = data_pack_format_tuple_for(target) else {
+        return false;
+    };
+    if target_fmt == format {
+        return true;
+    }
+    if min_fmt.is_none() && max_fmt.is_none() {
+        return false;
+    }
+    let lo = min_fmt.unwrap_or((0, 0));
+    let hi = max_fmt.unwrap_or((u32::MAX, u32::MAX));
+    lo <= target_fmt && target_fmt <= hi
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +624,11 @@ mod tests {
         assert!(v(1, 20, 6) < v(1, 21, 0) && v(1, 21, 1) < v(1, 21, 3));
         assert_eq!(McVersion::V1_21_1.to_string(), "1.21.1");
         assert_eq!(McVersion::parse("1.21").unwrap().to_string(), "1.21.0");
+        // Year-based 26.x versions parse and order past the 1.x line.
+        assert_eq!(McVersion::parse("26.3"), Some(McVersion::V26_3));
+        assert_eq!(McVersion::parse("26.3.1"), Some(v(26, 3, 1)));
+        assert_eq!(McVersion::V26_3.to_string(), "26.3.0");
+        assert!(v(1, 21, 5) < v(26, 0, 0) && v(26, 3, 0) < v(26, 4, 0));
     }
 
     #[test]
@@ -596,8 +647,14 @@ mod tests {
         assert_eq!(data_version_for(McVersion::V1_21_4), Some(4189));
         assert_eq!(data_pack_format_for(McVersion::V1_21_5), Some(71));
         assert_eq!(data_version_for(McVersion::V1_21_5), Some(4325));
+        assert_eq!(data_pack_format_for(McVersion::V26_3), Some(121));
+        assert_eq!(data_version_for(McVersion::V26_3), Some(5023));
         assert_eq!(data_pack_format_for(v(1, 19, 4)), None);
         assert_eq!(data_version_for(v(2, 0, 0)), None);
+        // The (major, minor) tuple mirrors: legacy versions get a zero minor.
+        assert_eq!(data_pack_format_tuple_for(McVersion::V1_21_1), Some((48, 0)));
+        assert_eq!(data_pack_format_tuple_for(McVersion::V26_3), Some((121, 0)));
+        assert_eq!(data_pack_format_tuple_for(v(1, 19, 4)), None);
     }
 
     #[test]
@@ -630,6 +687,75 @@ mod tests {
         assert!(check_pack_format(McVersion::V1_20_4, 48, None, Some(71)));
         // Unknown target format fails closed.
         assert!(!check_pack_format(v(1, 19, 4), 26, Some(1), Some(99)));
+    }
+
+    #[test]
+    fn check_pack_format_tuple_covers_26_3_min_max_format() {
+        // A 26.3 datapack declaring min_format == max_format == [121, 0].
+        assert!(check_pack_format_tuple(
+            McVersion::V26_3,
+            (121, 0),
+            Some((121, 0)),
+            Some((121, 0))
+        ));
+        assert!(!check_pack_format_tuple(
+            McVersion::V1_21_1,
+            (121, 0),
+            Some((121, 0)),
+            Some((121, 0))
+        ));
+        // A pack spanning both targets: min (48,0) - max (121,0).
+        assert!(check_pack_format_tuple(
+            McVersion::V1_21_1,
+            (48, 0),
+            Some((48, 0)),
+            Some((121, 0))
+        ));
+        assert!(check_pack_format_tuple(
+            McVersion::V26_3,
+            (48, 0),
+            Some((48, 0)),
+            Some((121, 0))
+        ));
+        // Tuples order lexicographically: (121, 0) < (121, 1).
+        assert!(!check_pack_format_tuple(
+            McVersion::V26_3,
+            (121, 1),
+            Some((121, 1)),
+            None
+        ));
+        assert!(check_pack_format_tuple(
+            McVersion::V26_3,
+            (121, 0),
+            Some((120, 0)),
+            None
+        ));
+        // Exact format match without a declared span.
+        assert!(check_pack_format_tuple(McVersion::V26_3, (121, 0), None, None));
+        assert!(!check_pack_format_tuple(McVersion::V1_21_4, (121, 0), None, None));
+        // Unknown target format fails closed.
+        assert!(!check_pack_format_tuple(v(9, 9, 9), (121, 0), Some((0, 0)), None));
+    }
+
+    #[test]
+    fn year_based_26_x_versions_parse_and_range() {
+        // `[26.3]`, `[26.3,26.4)`, `>=26.3`, `26.3.x` all behave like any
+        // other numeric bound in both supported syntaxes.
+        assert!(range("[26.3]").contains(McVersion::V26_3));
+        assert!(!range("[26.3]").contains(v(26, 3, 1)));
+        assert!(range("[26.3,26.4)").contains(v(26, 3, 5)));
+        assert!(!range("[26.3,26.4)").contains(v(26, 4, 0)));
+        assert!(range(">=26.3").contains(v(26, 9, 0)));
+        assert!(range("26.3.x").contains(v(26, 3, 7)));
+        assert!(!range("26.3.x").contains(v(26, 4, 0)));
+        // A 1.21.1-only mod on a 26.3 server is a different release line.
+        assert_eq!(
+            check_mod_mc_version(McVersion::V26_3, "[1.21.1]"),
+            VersionCompatVerdict::MajorMismatch {
+                target: McVersion::V26_3,
+                declared: "[1.21.1]".to_string()
+            }
+        );
     }
 
     #[test]

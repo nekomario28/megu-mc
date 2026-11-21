@@ -366,16 +366,50 @@ def _version_json_meta(path):
         if raw.get(field) is not None:
             meta[key] = require_int(raw[field], f"version.json {field}")
     pack_version = raw.get("pack_version")
-    if isinstance(pack_version, int) and not isinstance(pack_version, bool):
-        meta["pack_format"] = pack_version
-    elif isinstance(pack_version, dict):
-        meta["pack_format"] = {
-            k: require_int(v, f"version.json pack_version.{k}")
-            for k, v in sorted(pack_version.items())
-        }
-    elif pack_version is not None:
-        raise PackError(f"version.json pack_version: unexpected value {pack_version!r}")
+    if pack_version is not None:
+        meta["pack_format"] = _pack_version_to_meta(pack_version)
     return meta
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _pack_version_to_meta(pack_version):
+    """Normalize a version.json `pack_version` to int or a dict of ints.
+
+    Spelling forms seen in the wild:
+      legacy int          pack_version: 15
+      flat ints           {"data": 48, "resource": 34}
+      flat major/minor    {"data_major": 121, "data_minor": 0, ...}  (26.x)
+      tuple entries       {"data": [121, 0], "resource": [97, 1]}
+      bare data tuple     [121, 0]
+    Tuple entries expand to `<key>_major`/`<key>_minor` so every form lands
+    on the same flat-int manifest shape.
+    """
+    if _is_int(pack_version):
+        return pack_version
+    if isinstance(pack_version, dict):
+        out = {}
+        for key, value in sorted(pack_version.items()):
+            require_str(key, "version.json pack_version key")
+            if _is_int(value):
+                out[key] = value
+            elif (isinstance(value, (list, tuple)) and value
+                    and all(_is_int(v) for v in value)):
+                out[f"{key}_major"] = value[0]
+                out[f"{key}_minor"] = value[1] if len(value) > 1 else 0
+            else:
+                raise PackError(
+                    f"version.json pack_version.{key}: "
+                    f"unexpected value {value!r}")
+        return out
+    if (isinstance(pack_version, (list, tuple)) and pack_version
+            and all(_is_int(v) for v in pack_version)):
+        return {"data_major": pack_version[0],
+                "data_minor": pack_version[1] if len(pack_version) > 1 else 0}
+    raise PackError(
+        f"version.json pack_version: unexpected value {pack_version!r}")
 
 
 def _pick(field, flag_value, json_value):
@@ -713,10 +747,11 @@ def cmd_diff(args):
 def _fixture(version):
     """A synthetic but schema-faithful DataGenerator reports dir.
 
-    v767 models 1.21.1, v769 models 1.21.4: between them one play packet is
-    added (inserting an id), one removed, one renumbered; the data-component,
-    entity-type and menu registries gain/lose/renumber entries; one registry's
-    own protocol id moves; one whole registry appears; block-state ids shift."""
+    v767 models 1.21.1, v769 models 1.21.4, v777 models latest vanilla 26.3:
+    between them one play packet is added (inserting an id), one removed, one
+    renumbered; the data-component, entity-type and menu registries
+    gain/lose/renumber entries; one registry's own protocol id moves; one
+    whole registry appears; block-state ids shift."""
     reports = {
         "packets.json": {
             "handshake": {"serverbound": {"minecraft:intention": {"protocol_id": 0}}},
@@ -814,6 +849,56 @@ def _fixture(version):
             "minecraft:dirt": {"states": [{"id": 3, "default": True}]},
         },
     }
+    if version == 767:
+        return reports
+    if version == 777:
+        # ---- 26.3 (protocol 777) delta, the latest-vanilla target ---------
+        play_c2s = reports["packets.json"]["play"]["clientbound"]
+        del play_c2s["minecraft:legacy_removed_packet"]
+        play_c2s["minecraft:player_chat"]["protocol_id"] = 3       # shifted by insert
+        play_c2s["minecraft:new_inserted_packet"] = {"protocol_id": 2}
+        play_c2s["minecraft:minecart_along_track"] = {"protocol_id": 40}
+        play_c2s["minecraft:chunk_batch_finished_v2"] = {"protocol_id": 41}
+        reports["packets.json"]["configuration"]["clientbound"][
+            "minecraft:select_known_packs"] = {"protocol_id": 14}
+        reports["packets.json"]["configuration"]["clientbound"][
+            "minecraft:transfer_v2"] = {"protocol_id": 15}
+
+        comp = reports["registries.json"]["minecraft:data_component_type"]["entries"]
+        del comp["minecraft:legacy_thing"]
+        comp["minecraft:equippable"] = {"protocol_id": 1}          # inserted at 1
+        comp["minecraft:custom_name"]["protocol_id"] = 2           # renumbered
+        comp["minecraft:enchantments"]["protocol_id"] = 3          # renumbered
+        comp["minecraft:tooltip_style"] = {"protocol_id": 4}       # appended
+        comp["minecraft:kinetic_weapon"] = {"protocol_id": 5}      # 26.x addition
+
+        et = reports["registries.json"]["minecraft:entity_type"]["entries"]
+        et["minecraft:creaking"] = {"protocol_id": 129}
+        et["minecraft:copper_golem"] = {"protocol_id": 130}
+
+        menu = reports["registries.json"]["minecraft:menu"]
+        menu["protocol_id"] = 13                                   # registry renumbered
+        menu["entries"]["minecraft:crafter_3x3"] = {"protocol_id": 9}
+
+        reports["registries.json"]["minecraft:variant_registry"] = {
+            "protocol_id": 99,
+            "entries": {"minecraft:variant_a": {"protocol_id": 0}},
+        }
+        reports["registries.json"]["minecraft:timeline"] = {
+            "protocol_id": 100,
+            "entries": {"minecraft:default": {"protocol_id": 0}},
+        }
+
+        reports["blocks.json"] = {
+            "minecraft:air": {"states": [{"id": 0, "default": True}]},
+            "minecraft:new_block": {"states": [{"id": 1, "default": True}]},
+            "minecraft:stone": {"states": [{"id": 2, "default": True},
+                                           {"id": 3, "properties": {"variant": "b"}}]},
+            "minecraft:dirt": {"states": [{"id": 4, "default": True},
+                                          {"id": 5, "properties": {"moist": "7"}}]},
+            "minecraft:copper_bars": {"states": [{"id": 6, "default": True}]},
+        }
+        return reports
     if version != 769:
         return reports
     # ---- 1.21.4 (protocol 769) delta -----------------------------------------
@@ -855,19 +940,32 @@ def _fixture(version):
     return reports
 
 
+# version.json metadata per fixture protocol. 26.3 uses the modern flat
+# `pack_version.{data,resource}_{major,minor}` spelling.
+_VERSION_JSON_META = {
+    767: {"id": "1.21.1", "name": "1.21.1", "world_version": 3955,
+          "pack_version": {"resource": 34, "data": 48}},
+    769: {"id": "1.21.4", "name": "1.21.4", "world_version": 4189,
+          "pack_version": {"resource": 46, "data": 61}},
+    777: {"id": "26.3", "name": "26.3", "world_version": 5023,
+          "pack_version": {"resource_major": 97, "resource_minor": 1,
+                           "data_major": 121, "data_minor": 0}},
+}
+
+
 def _write_reports(root, version):
     reports_dir = Path(root) / "reports"
     reports_dir.mkdir(parents=True)
     for name, obj in _fixture(version).items():
         (reports_dir / name).write_text(
             json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+    meta = _VERSION_JSON_META[version]
     version_json = {
-        "id": f"1.21.1" if version == 767 else "1.21.4",
-        "name": f"1.21.1" if version == 767 else "1.21.4",
+        "id": meta["id"],
+        "name": meta["name"],
         "protocol_version": version,
-        "world_version": 3955 if version == 767 else 4189,
-        "pack_version": {"resource": 34 if version == 767 else 46,
-                         "data": 48 if version == 767 else 61},
+        "world_version": meta["world_version"],
+        "pack_version": meta["pack_version"],
         "stable": True,
     }
     (Path(root) / "version.json").write_text(json.dumps(version_json), encoding="utf-8")
@@ -1120,6 +1218,74 @@ def self_test():
         check("diff: reverse direction inverts",
               back["id_remap"]["registries"]["minecraft:data_component_type"]["forward"]
               == {"2": 1, "3": 2})
+
+        # ---- 5. real-target cross-version: 1.21.1 (767) -> 26.3 (777) ---------
+        rep777 = _write_reports(tmp / "v777", 777)
+        pack_c = tmp / "pack_777"
+        cmd_build(_ns(reports=str(rep777), out=str(pack_c),
+                      version_json=str(tmp / "v777" / "version.json"),
+                      mc_version=None, protocol=None, data_version=None,
+                      pack_format=None, jar_sha1=None))
+        check("26.3 build: all four pack files written",
+              all((pack_c / f).is_file() for f in files))
+        manifest_c = load_json(pack_c / MANIFEST_JSON, MANIFEST_JSON)
+        check("26.3 build: manifest records flat pack_version major/minor",
+              manifest_c["mc_version"] == "26.3"
+              and manifest_c["protocol_version"] == 777
+              and manifest_c["data_version"] == 5023
+              and manifest_c["pack_format"] == {
+                  "data_major": 121, "data_minor": 0,
+                  "resource_major": 97, "resource_minor": 1})
+        mc, pc, rc, bc = verify_pack(pack_c)
+        check("26.3 verify: valid pack passes",
+              mc["protocol_version"] == 777
+              and pc["play"]["clientbound"]["minecraft:add_entity"] == 1
+              and "minecraft:timeline" in rc)
+
+        delta_c = diff_packs(pack_a, pack_c)
+        check("26.3 diff: header records both real targets",
+              delta_c["from"] == {"mc_version": "1.21.1", "protocol_version": 767}
+              and delta_c["to"] == {"mc_version": "26.3", "protocol_version": 777})
+        play_c = delta_c["packets"]["play/clientbound"]
+        check("26.3 diff: added play packets detected",
+              play_c["added"] == {"minecraft:new_inserted_packet": 2,
+                                  "minecraft:minecart_along_track": 40,
+                                  "minecraft:chunk_batch_finished_v2": 41})
+        check("26.3 diff: removed play packet detected",
+              play_c["removed"] == {"minecraft:legacy_removed_packet": 99})
+        check("26.3 diff: renumbered play packet detected",
+              play_c["renumbered"]
+              == {"minecraft:player_chat": {"from_id": 2, "to_id": 3}})
+        check("26.3 diff: new configuration packets detected",
+              delta_c["packets"]["configuration/clientbound"]["added"]
+              == {"minecraft:select_known_packs": 14,
+                  "minecraft:transfer_v2": 15})
+        comp_c = delta_c["registries"]["minecraft:data_component_type"]
+        check("26.3 diff: data components added",
+              comp_c["added"] == {"minecraft:equippable": 1,
+                                  "minecraft:tooltip_style": 4,
+                                  "minecraft:kinetic_weapon": 5})
+        check("26.3 diff: data components renumbered",
+              comp_c["renumbered"] == {
+                  "minecraft:custom_name": {"from_id": 1, "to_id": 2},
+                  "minecraft:enchantments": {"from_id": 2, "to_id": 3}})
+        check("26.3 diff: second added registry detected",
+              delta_c["registries"]["minecraft:timeline"]["added_registry"] is True)
+        remap_c = delta_c["id_remap"]["registries"]["minecraft:data_component_type"]
+        check("26.3 diff: id_remap forward exact",
+              remap_c["forward"] == {"1": 2, "2": 3})
+        check("26.3 diff: id_remap reverse exact",
+              remap_c["reverse"] == {"2": 1, "3": 2})
+        check("26.3 diff: id_remap added/removed ids",
+              remap_c["added_ids"] == [1, 4, 5]
+              and remap_c["removed_ids"] == [3])
+        # Forward and reverse directions are true inverses across targets.
+        back_c = diff_packs(pack_c, pack_a)
+        check("26.3 diff: reverse direction inverts",
+              back_c["id_remap"]["registries"]["minecraft:data_component_type"]["forward"]
+              == {"2": 1, "3": 2}
+              and back_c["packets"]["play/clientbound"]["added"]
+              == {"minecraft:legacy_removed_packet": 99})
 
     for line in checks:
         print(line)

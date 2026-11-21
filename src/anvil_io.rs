@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-// ---------- Vanilla 1.21.1 Anvil (.mca region + level.dat) import/export ----------
+// ----- Vanilla Anvil (.mca region + level.dat) import/export, 1.21.1 + 26.3 -----
 //
 // P3-A: a second persistence codec next to the Save v2 format (src/save_v2.rs).
-// This reads a vanilla 1.21.1 world directory (level.dat + region/*.mca, plus the
+// This reads a vanilla world directory (level.dat + region/*.mca, plus the
 // DIM-1/DIM1 companions) into this server's overlay world state, and writes the
-// same directory shape back out so a 1.21.1 client/server can open the result.
+// same directory shape back out so a vanilla client/server can open the result.
+// Both first-class targets share the layout: 1.21.1 (`DataVersion` 3955, the
+// native write format) and latest vanilla 26.3 (`DataVersion` 5023).
 // All binary NBT goes through the shared Java codec (src/nbt.rs) and flate2 — no
 // new dependencies, no new modules (this file is `include!`d into main).
 
@@ -27,10 +29,11 @@ const ANVIL_LEVEL_NBT_BUDGET: usize = 256 << 20;
 //
 // Vanilla stamps every `level.dat` and chunk record with a `DataVersion`
 // integer that names the release's save schema. The codec writes 1.21.1
-// natively and reads the neighbouring releases whose section layout is
-// identical (1.20.4 through 1.21.5 all store `sections[].Y`,
-// `block_states`/`biomes` palettes and the same packed `data` arrays), so the
-// table below maps each known milestone and classifies everything around it.
+// natively and reads the releases whose section layout is identical — the
+// 1.20.4-1.21.5 line plus latest vanilla 26.3, the second first-class
+// target: all store `sections[].Y`, `block_states`/`biomes` palettes and the
+// same packed `data` arrays. The table below maps each known milestone and
+// classifies everything around it.
 
 /// A Minecraft Java release line the anvil codec can name, keyed by the
 /// `DataVersion` integer vanilla writes for it.
@@ -44,6 +47,9 @@ enum AnvilSchemaVersion {
     V1_21_3,
     V1_21_4,
     V1_21_5,
+    /// 26.3 (`DataVersion` 5023): the latest-vanilla release line, a
+    /// supported target next to native 1.21.1.
+    V26_3,
     /// A `DataVersion` this table does not list — a snapshot between
     /// milestones, an older save, or a release newer than the table.
     Unknown(i32),
@@ -59,6 +65,7 @@ impl AnvilSchemaVersion {
             Self::V1_21_3 => 4082,
             Self::V1_21_4 => 4189,
             Self::V1_21_5 => 4325,
+            Self::V26_3 => 5023,
             Self::Unknown(dv) => dv,
         }
     }
@@ -74,6 +81,7 @@ impl AnvilSchemaVersion {
             Self::V1_21_3 => "1.21.3",
             Self::V1_21_4 => "1.21.4",
             Self::V1_21_5 => "1.21.5",
+            Self::V26_3 => "26.3",
             Self::Unknown(_) => "custom",
         }
     }
@@ -87,6 +95,7 @@ impl AnvilSchemaVersion {
             4082 => Self::V1_21_3,
             4189 => Self::V1_21_4,
             4325 => Self::V1_21_5,
+            5023 => Self::V26_3,
             other => Self::Unknown(other),
         }
     }
@@ -121,7 +130,7 @@ fn classify_anvil_data_version(dv: i32) -> AnvilVersionSupport {
             AnvilVersionSupport::LegacyUnsupported
         }
         AnvilSchemaVersion::Unknown(d)
-            if d > AnvilSchemaVersion::V1_21_5.data_version() =>
+            if d > AnvilSchemaVersion::V26_3.data_version() =>
         {
             AnvilVersionSupport::FutureUnknown
         }
@@ -2304,16 +2313,18 @@ mod anvil_io_tests {
             (V::V1_21_3, 4082, "1.21.3"),
             (V::V1_21_4, 4189, "1.21.4"),
             (V::V1_21_5, 4325, "1.21.5"),
+            (V::V26_3, 5023, "26.3"),
         ] {
             assert_eq!(schema.data_version(), dv);
             assert_eq!(schema.release_name(), name);
             assert_eq!(V::from_data_version(dv), schema);
         }
         use AnvilVersionSupport as S;
-        // The codec's native format is exactly 1.21.1.
+        // The codec's native format is exactly 1.21.1; 26.3 is the known
+        // supported latest-vanilla target, not a second native format.
         assert_eq!(classify_anvil_data_version(ANVIL_DATA_VERSION), S::Native);
         // Every other milestone shares this codec's section schema.
-        for dv in [3700, 3839, 3953, 4082, 4189, 4325] {
+        for dv in [3700, 3839, 3953, 4082, 4189, 4325, 5023] {
             assert_eq!(
                 classify_anvil_data_version(dv),
                 S::Compatible,
@@ -2321,7 +2332,7 @@ mod anvil_io_tests {
             );
         }
         // Snapshot DataVersions between milestones classify the same way.
-        for dv in [3701, 3838, 3954, 4000, 4188, 4190, 4324] {
+        for dv in [3701, 3838, 3954, 4000, 4188, 4190, 4324, 4326, 4400, 5022] {
             assert_eq!(
                 classify_anvil_data_version(dv),
                 S::Compatible,
@@ -2337,7 +2348,7 @@ mod anvil_io_tests {
             );
         }
         // Newer than the table: an unlisted release, never assumed readable.
-        for dv in [4326, 4400, i32::MAX] {
+        for dv in [5024, 5100, i32::MAX] {
             assert_eq!(
                 classify_anvil_data_version(dv),
                 S::FutureUnknown,
@@ -2461,6 +2472,56 @@ mod anvil_io_tests {
         assert_eq!(chunk.edits[&local_idx(1, 70, 2)], stone);
         assert_eq!(chunk.dropped_sections, 0);
         assert_eq!(chunk.unknown_states, 0);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn anvil_export_26_3_stamps_data_version_5023_and_reimports() {
+        let _guard = world_guard();
+        let key = (DimId::Overworld, 0i32, 0i32);
+        let _fixture = AnvilWorldFixture::capture(&[]);
+        let stone = name_to_state("stone").expect("stone state");
+        {
+            let mut w = world().lock().unwrap();
+            w.clear();
+            w.insert(key, HashMap::from([(local_idx(1, 70, 2), stone)]));
+        }
+        let out = anvil_tmp_dir("world5023");
+        let report = export_anvil_world_with_options(
+            &out,
+            &AnvilExportOptions {
+                target_data_version: 5023,
+            },
+        )
+        .unwrap();
+        assert!(report.level_written);
+        assert_eq!(report.chunks_written, 1);
+        // level.dat stamps the 26.3 DataVersion and release name.
+        let level = read_level_dat_path(&out.join("level.dat")).unwrap();
+        assert_eq!(level.data_version(), 5023);
+        let version = level.data().get("Version").unwrap();
+        assert_eq!(anvil_i32(version, "Id"), Some(5023));
+        assert_eq!(anvil_str(version, "Name").as_deref(), Some("26.3"));
+        // So does every chunk record.
+        let region = read_region_file(&out.join("region").join("r.0.0.mca")).unwrap();
+        let record = region.chunks.get(&(0, 0)).unwrap();
+        assert_eq!(anvil_i32(&record.nbt, "DataVersion"), Some(5023));
+        // Reimport: 5023 classifies Compatible (a known supported target, not
+        // future-unknown), the blocks decode, nothing counts as unsupported.
+        assert_eq!(
+            classify_anvil_data_version(5023),
+            AnvilVersionSupport::Compatible
+        );
+        let imported = import_anvil_world(&out).unwrap();
+        assert_eq!(imported.data_version_counts.get(&5023), Some(&1));
+        assert_eq!(imported.unsupported_chunks, 0);
+        assert!(imported.chunk_errors.is_empty(), "{:?}", imported.chunk_errors);
+        let chunk = imported
+            .chunks
+            .iter()
+            .find(|c| c.dim == DimId::Overworld)
+            .expect("overworld chunk reimported");
+        assert_eq!(chunk.edits[&local_idx(1, 70, 2)], stone);
         let _ = std::fs::remove_dir_all(&out);
     }
 }

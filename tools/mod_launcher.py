@@ -35,11 +35,15 @@ Every entry also passes a Minecraft version gate (after the superseded check,
 before every other tier check — classify_mod_for_version in fallback.rs): a
 declared neoforge.mods.toml/mods.toml `versionRange`, fabric.mod.json
 `depends.minecraft` range, or pure-data pack.mcmeta `pack_format` that does
-not cover --mc-version (default 1.21.1, mirroring McVersion::CURRENT) yields
+not cover --mc-version (default 1.21.1, mirroring McVersion::CURRENT; the
+latest-vanilla target 26.3 works too: `--mc-version 26.3`) yields
 Tier 3 with MC_VERSION_INCOMPATIBLE / MC_VERSION_RANGE_INVALID /
 PACK_FORMAT_INCOMPATIBLE plus a plain-language reason, so a mod built for
-another Minecraft release never silently executes broken native code. The
-declared range and verdict are recorded per assignment in the JSON report.
+another Minecraft release never silently executes broken native code. Both
+the legacy scalar `pack_format`/`supported_formats` schema and the 26.x
+`(major, minor)` `min_format`/`max_format` tuples are recognized in
+pack.mcmeta. The declared range and verdict are recorded per assignment in
+the JSON report.
 
 Fallback policies when >= 1 Tier 3 mod exists:
 
@@ -166,7 +170,8 @@ _KEY_MAX = (1 << 64) - 1  # u64::MAX — unbounded interval end.
 _ASCII_WS = " \t\n\r\x0c"  # Rust is_ascii_whitespace: ' ' \t \n \x0C \r
 
 # pack_format / DataVersion tables covering the 1.20.4-1.21.5 line mc-spine
-# ships profiles for (mirrors data_pack_format_for / data_version_for).
+# ships profiles for, plus latest vanilla 26.3 (mirrors
+# data_pack_format_for / data_version_for).
 _DATA_PACK_FORMATS = {
     (1, 20, 4): 26,
     (1, 20, 6): 41,
@@ -175,6 +180,7 @@ _DATA_PACK_FORMATS = {
     (1, 21, 3): 57,
     (1, 21, 4): 61,
     (1, 21, 5): 71,
+    (26, 3, 0): 121,
 }
 _DATA_VERSIONS = {
     (1, 20, 4): 3700,
@@ -184,6 +190,7 @@ _DATA_VERSIONS = {
     (1, 21, 3): 4082,
     (1, 21, 4): 4189,
     (1, 21, 5): 4325,
+    (26, 3, 0): 5023,
 }
 
 # Kind values mirror VersionCompatVerdict in version_compat.rs.
@@ -514,6 +521,18 @@ def data_version_for(version):
     return _DATA_VERSIONS.get(version)
 
 
+def data_pack_format_tuple_for(version):
+    """(major, minor) data pack format tuple for version, or None.
+
+    Mirrors data_pack_format_tuple_for in version_compat.rs: the shape
+    pack.mcmeta `min_format`/`max_format` use on the 26.x line. Scalar
+    pack_format versions report (format, 0): 1.21.1 -> (48, 0),
+    26.3 -> (121, 0).
+    """
+    major = data_pack_format_for(version)
+    return (major, 0) if major is not None else None
+
+
 def check_pack_format(target, pack_format, supported_min=None,
                       supported_max=None):
     """Whether a datapack declaring `pack_format` (and optionally a
@@ -530,6 +549,23 @@ def check_pack_format(target, pack_format, supported_min=None,
     lo = supported_min if supported_min is not None else 0
     hi = supported_max if supported_max is not None else 0xFFFFFFFF
     return lo <= target_pf <= hi
+
+
+def check_pack_format_tuple(target, format, min_fmt=None, max_fmt=None):
+    """Whether a datapack declaring (major, minor) format tuples — the
+    pack.mcmeta `min_format`/`max_format` schema the 26.x line uses — is
+    loadable on a server running `target`. Same contract as
+    check_pack_format; tuples compare lexicographically."""
+    target_fmt = data_pack_format_tuple_for(target)
+    if target_fmt is None:
+        return False
+    if target_fmt == format:
+        return True
+    if min_fmt is None and max_fmt is None:
+        return False
+    lo = min_fmt if min_fmt is not None else (0, 0)
+    hi = max_fmt if max_fmt is not None else (0xFFFFFFFF, 0xFFFFFFFF)
+    return lo <= target_fmt <= hi
 
 
 class LauncherError(Exception):
@@ -730,6 +766,31 @@ def _supported_formats_span(value):
     return None, None
 
 
+def _format_tuple(value):
+    """A 26.x pack.mcmeta format bound (`min_format`/`max_format`, or a
+    tuple-shaped `pack_format`) -> (major, minor), or None when `value` is
+    not a format declaration.
+
+    Minecraft 26.x spells a bound as `[major, minor]` or a bare `major` int.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return (value, 0)
+    if isinstance(value, (list, tuple)) and len(value) >= 1:
+        major = value[0]
+        minor = value[1] if len(value) >= 2 else 0
+        if (isinstance(major, int) and not isinstance(major, bool)
+                and isinstance(minor, int) and not isinstance(minor, bool)):
+            return (major, minor)
+    return None
+
+
+def _format_tuple_text(fmt):
+    """`[major, minor]` display of a (major, minor) format tuple."""
+    return f"[{fmt[0]}, {fmt[1]}]"
+
+
 class DiscoveredMod:
     """Audit summary of one mods/ entry (mirrors `DiscoveredMod` in fallback.rs)."""
 
@@ -754,10 +815,15 @@ class DiscoveredMod:
         # `mc_version_range: Option<String>` in fallback.rs). None means the
         # mod declares nothing and the --mc-version gate does not apply.
         self.mc_version_range = None
-        # pack.mcmeta metadata for pure-data zips / datapack directories.
+        # pack.mcmeta metadata for pure-data zips / datapack directories:
+        # the legacy scalar pack_format/supported_formats schema, plus the
+        # 26.x (major, minor) min_format/max_format tuples.
         self.pack_format = None
+        self.pack_format_tuple = None
         self.pack_supported_min = None
         self.pack_supported_max = None
+        self.pack_min_format = None
+        self.pack_max_format = None
         declared = []
         namespaces = []
         toml_text = None
@@ -791,9 +857,16 @@ class DiscoveredMod:
                     if (isinstance(pack_format, int)
                             and not isinstance(pack_format, bool)):
                         self.pack_format = pack_format
+                    else:
+                        # The 26.x spelling `pack_format: [major, minor]`.
+                        self.pack_format_tuple = _format_tuple(pack_format)
                     self.pack_supported_min, self.pack_supported_max = (
                         _supported_formats_span(
                             pack.get("supported_formats")))
+                    self.pack_min_format = _format_tuple(
+                        pack.get("min_format"))
+                    self.pack_max_format = _format_tuple(
+                        pack.get("max_format"))
             elif lowered == "quilt.mod.json":
                 try:
                     doc = json.loads(read())
@@ -1027,6 +1100,8 @@ class Assignment:
         self.mc_version_verdict = (
             mc_version_verdict.kind if mc_version_verdict else None)
         self.pack_format = getattr(mod, "pack_format", None)
+        self.pack_min_format = getattr(mod, "pack_min_format", None)
+        self.pack_max_format = getattr(mod, "pack_max_format", None)
 
     def as_dict(self):
         return {
@@ -1038,34 +1113,59 @@ class Assignment:
             "mc_version_range": self.mc_version_range,
             "mc_version_verdict": self.mc_version_verdict,
             "pack_format": self.pack_format,
+            "pack_min_format": self.pack_min_format,
+            "pack_max_format": self.pack_max_format,
         }
 
 
 def _pack_format_verdict(mod, target):
     """PACK_FORMAT_INCOMPATIBLE detail text for a pure-data pack, or None.
 
-    Mirrors check_pack_format in version_compat.rs: compatible (or undeclared)
-    pack metadata returns None; an incompatible declaration returns the
-    operator-facing explanation that follows the reason code.
+    Mirrors check_pack_format / check_pack_format_tuple in version_compat.rs:
+    compatible (or undeclared) pack metadata returns None; an incompatible
+    declaration returns the operator-facing explanation that follows the
+    reason code. Both the legacy scalar `pack_format`/`supported_formats`
+    schema and the 26.x `(major, minor)` `min_format`/`max_format` tuples are
+    gated; a pack declaring both schemas is compatible when either passes.
     """
     pack_format = getattr(mod, "pack_format", None)
-    if pack_format is None:
+    fmt_tuple = getattr(mod, "pack_format_tuple", None)
+    min_fmt = getattr(mod, "pack_min_format", None)
+    max_fmt = getattr(mod, "pack_max_format", None)
+    if (pack_format is None and fmt_tuple is None
+            and min_fmt is None and max_fmt is None):
         return None
     supported_min = getattr(mod, "pack_supported_min", None)
     supported_max = getattr(mod, "pack_supported_max", None)
-    if check_pack_format(target, pack_format, supported_min, supported_max):
+    if pack_format is not None and check_pack_format(
+            target, pack_format, supported_min, supported_max):
         return None
+    has_tuple_schema = (fmt_tuple is not None or min_fmt is not None
+                        or max_fmt is not None)
+    if has_tuple_schema:
+        declared_fmt = (fmt_tuple if fmt_tuple is not None
+                        else (min_fmt if min_fmt is not None else max_fmt))
+        if check_pack_format_tuple(target, declared_fmt, min_fmt, max_fmt):
+            return None
     span = ""
     if supported_min is not None or supported_max is not None:
         lo = str(supported_min) if supported_min is not None else "0"
         hi = str(supported_max) if supported_max is not None else "any"
         span = f" (supported_formats {lo}-{hi})"
+    declared = ""
+    if pack_format is not None:
+        declared = f"pack_format {pack_format}{span}"
+    if has_tuple_schema:
+        lo = _format_tuple_text(min_fmt) if min_fmt is not None else "[0, 0]"
+        hi = _format_tuple_text(max_fmt) if max_fmt is not None else "any"
+        tuple_text = f"min_format {lo} / max_format {hi}"
+        declared = f"{declared} and {tuple_text}" if declared else tuple_text
     target_pf = data_pack_format_for(target)
     target_str = format_mc_version(target)
     if target_pf is None:
-        return (f"declares pack_format {pack_format}{span}; server is running "
+        return (f"declares {declared}; server is running "
                 f"Minecraft {target_str}, which has no known datapack format")
-    return (f"declares pack_format {pack_format}{span}, server is running "
+    return (f"declares {declared}, server is running "
             f"Minecraft {target_str} (pack_format {target_pf})")
 
 
@@ -1383,8 +1483,9 @@ def main():
     parser.add_argument("--flagship-mods", type=str, default="create",
                         help="comma-separated flagship native mod ids (default: create)")
     parser.add_argument("--mc-version", type=str, default="1.21.1",
-                        help="Minecraft version the server runs; mod ranges and "
-                             "datapack pack_format are gated against it "
+                        help="Minecraft version the server runs (e.g. 1.21.1 "
+                             "or 26.3); mod ranges and datapack "
+                             "pack_format/min_format are gated against it "
                              "(default: 1.21.1)")
     parser.add_argument("--fallback", choices=("strict", "quarantine", "delegate"),
                         default="delegate", help="Tier 3 fallback policy (default: delegate)")
