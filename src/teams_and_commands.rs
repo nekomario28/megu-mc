@@ -4203,6 +4203,11 @@ struct LiveServerPolicy {
     cut_all: String,
     xp_merge_mode: String,
     max_frame_mib: u32,
+    /// OPS-SRE: Vanilla lets every hit land, so both friendly-fire switches
+    /// default `true`; `false` is the strict opt-in that protects a pet's
+    /// owner/party allies and party-vs-party damage respectively.
+    pub pet_friendly_fire: bool,
+    pub party_friendly_fire: bool,
 }
 
 impl Default for LiveServerPolicy {
@@ -4217,6 +4222,8 @@ impl Default for LiveServerPolicy {
             cut_all: "off".to_owned(),
             xp_merge_mode: "vanilla".to_owned(),
             max_frame_mib: 2,
+            pet_friendly_fire: true,
+            party_friendly_fire: true,
         }
     }
 }
@@ -4253,6 +4260,8 @@ impl LiveServerPolicy {
             "cut_all" => Ok(self.cut_all.clone()),
             "xp_merge_mode" => Ok(self.xp_merge_mode.clone()),
             "max_frame_mib" => Ok(self.max_frame_mib.to_string()),
+            "pet_friendly_fire" => Ok(self.pet_friendly_fire.to_string()),
+            "party_friendly_fire" => Ok(self.party_friendly_fire.to_string()),
             _ => Err(format!("Unknown policy '{key}'")),
         }
     }
@@ -4268,6 +4277,8 @@ impl LiveServerPolicy {
             ("cut_all", self.cut_all.clone()),
             ("xp_merge_mode", self.xp_merge_mode.clone()),
             ("max_frame_mib", self.max_frame_mib.to_string()),
+            ("pet_friendly_fire", self.pet_friendly_fire.to_string()),
+            ("party_friendly_fire", self.party_friendly_fire.to_string()),
         ]
     }
 
@@ -4318,6 +4329,8 @@ impl LiveServerPolicy {
                 };
                 self.max_frame_mib = mib;
             }
+            "pet_friendly_fire" => self.pet_friendly_fire = policy_bool(key, value)?,
+            "party_friendly_fire" => self.party_friendly_fire = policy_bool(key, value)?,
             _ => return Err(format!("Unknown policy '{key}'")),
         }
         Ok(())
@@ -4331,6 +4344,45 @@ impl LiveServerPolicy {
 fn live_server_policy() -> &'static Mutex<LiveServerPolicy> {
     static POLICY: OnceLock<Mutex<LiveServerPolicy>> = OnceLock::new();
     POLICY.get_or_init(|| Mutex::new(LiveServerPolicy::default()))
+}
+
+/// OPS-SRE friendly-fire gates. Both read the live policy so a
+/// `/megu policy set` lands on the very next hit, and both are Vanilla by
+/// default: `true` means every hit connects exactly like stock, and only an
+/// explicit `false` arms the protection below.
+
+/// May `attacker_uuid` damage the pet owned by `pet_owner_uuid`? With
+/// `pet_friendly_fire` on (the default) the answer is always yes. With it off
+/// the owner cannot clip their own pet and a party ally cannot either, while
+/// hostile mobs — whose entity uuid is never the owner's player uuid — and
+/// unrelated players still deal normal damage. An untamed pet (`None` owner)
+/// is wild: the owner check cannot match and anyone may hurt it.
+#[allow(dead_code)]
+fn should_allow_pet_damage(
+    attacker_uuid: [u8; 16],
+    pet_owner_uuid: Option<[u8; 16]>,
+    attacker_is_party_ally: bool,
+) -> bool {
+    if live_server_policy()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pet_friendly_fire
+    {
+        return true;
+    }
+    !attacker_is_party_ally && pet_owner_uuid != Some(attacker_uuid)
+}
+
+/// May a hit between party allies land? `party_friendly_fire` on (the
+/// default) is Vanilla: yes, always. Off, allies are protected and every
+/// non-ally pairing fights normally.
+#[allow(dead_code)]
+fn should_allow_party_pvp(attacker_is_party_ally: bool) -> bool {
+    live_server_policy()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .party_friendly_fire
+        || !attacker_is_party_ally
 }
 
 /// `/megu policy ...` is owner-level (4) like `/profile`: the advertised tree
@@ -7792,7 +7844,9 @@ mod policy_cmd_tests {
             assert_eq!(policy.cut_all, "off");
             assert_eq!(policy.xp_merge_mode, "vanilla");
             assert_eq!(policy.max_frame_mib, 2);
-            assert_eq!(policy.list().len(), 9);
+            assert!(policy.pet_friendly_fire);
+            assert!(policy.party_friendly_fire);
+            assert_eq!(policy.list().len(), 11);
         }
         let ctx = policy_ctx(None);
         for (key, value) in [
@@ -7805,6 +7859,8 @@ mod policy_cmd_tests {
             ("cut_all", "off"),
             ("xp_merge_mode", "vanilla"),
             ("max_frame_mib", "2"),
+            ("pet_friendly_fire", "true"),
+            ("party_friendly_fire", "true"),
         ] {
             assert_eq!(
                 policy_run(&ctx, &format!("/megu policy get {key}")),
@@ -7822,6 +7878,8 @@ mod policy_cmd_tests {
             "cut_all",
             "xp_merge_mode",
             "max_frame_mib",
+            "pet_friendly_fire",
+            "party_friendly_fire",
         ] {
             assert!(list.contains(&format!("{key} = ")), "{list}");
         }
@@ -8023,6 +8081,160 @@ mod policy_cmd_tests {
         ] {
             assert_eq!(policy_run(&ctx, line), POLICY_USAGE, "{line}");
         }
+        policy_reset();
+    }
+
+    #[test]
+    fn ops_sre_policy_friendly_fire_keys_default_true_opt_in_and_reset() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        let ctx = policy_ctx(None);
+        // Vanilla-faithful defaults: friendly fire allowed for pets and party.
+        for key in ["pet_friendly_fire", "party_friendly_fire"] {
+            assert_eq!(
+                policy_run(&ctx, &format!("/megu policy get {key}")),
+                format!("{key} = true")
+            );
+        }
+        let list = policy_run(&ctx, "/megu policy list");
+        assert!(list.contains("pet_friendly_fire = true"), "{list}");
+        assert!(list.contains("party_friendly_fire = true"), "{list}");
+        // Strict opt-in: only an explicit `false` arms the protection.
+        assert_eq!(
+            policy_run(&ctx, "/megu policy set pet_friendly_fire false"),
+            "pet_friendly_fire = false"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy set party_friendly_fire false"),
+            "party_friendly_fire = false"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get pet_friendly_fire"),
+            "pet_friendly_fire = false"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get party_friendly_fire"),
+            "party_friendly_fire = false"
+        );
+        // A rejected value fails closed and leaves the stored flag alone.
+        assert_eq!(
+            policy_run(&ctx, "/megu policy set pet_friendly_fire maybe"),
+            "Invalid value 'maybe' for policy 'pet_friendly_fire'"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy set party_friendly_fire 0"),
+            "Invalid value '0' for policy 'party_friendly_fire'"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get pet_friendly_fire"),
+            "pet_friendly_fire = false"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy reset"),
+            "All server policies reset to defaults"
+        );
+        for key in ["pet_friendly_fire", "party_friendly_fire"] {
+            assert_eq!(
+                policy_run(&ctx, &format!("/megu policy get {key}")),
+                format!("{key} = true")
+            );
+        }
+    }
+
+    #[test]
+    fn ops_sre_friendly_fire_policy_refused_below_op_level_four() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        for level in 0..4u8 {
+            let (ctx, _recv) = policy_op_ctx(&format!("ops_sre_ff_l{level}"), level);
+            for msg in [
+                "/megu policy set pet_friendly_fire false",
+                "/megu policy set party_friendly_fire false",
+                "/megu policy get pet_friendly_fire",
+            ] {
+                assert_eq!(
+                    policy_run(&ctx, msg),
+                    "You do not have permission to run that command",
+                    "level-{level} source must be refused {msg}"
+                );
+            }
+            policy_deop(&format!("ops_sre_ff_l{level}"));
+        }
+        // The stored flags were never touched by the refused commands.
+        let policy = live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(policy.pet_friendly_fire);
+        assert!(policy.party_friendly_fire);
+        drop(policy);
+        policy_reset();
+    }
+
+    #[test]
+    fn ops_sre_pet_damage_gate_blocks_owner_and_ally_only_when_disabled() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        let owner = [0x0Au8; 16];
+        let other = [0x0Bu8; 16];
+        let pet = Some(owner);
+        // Default `true` is Vanilla: every pairing's hit lands.
+        assert!(should_allow_pet_damage(owner, pet, false));
+        assert!(should_allow_pet_damage(owner, pet, true));
+        assert!(should_allow_pet_damage(other, pet, false));
+        assert!(should_allow_pet_damage(other, pet, true));
+        assert!(should_allow_pet_damage(other, None, false));
+        // Opt-in `false`: owner and party-ally hits on the pet are blocked,
+        // hostile mobs and unrelated players still deal normal damage.
+        live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pet_friendly_fire = false;
+        assert!(!should_allow_pet_damage(owner, pet, false), "owner self-hit blocked");
+        assert!(!should_allow_pet_damage(other, pet, true), "party-ally hit blocked");
+        assert!(should_allow_pet_damage(other, pet, false), "non-ally hit allowed");
+        assert!(
+            should_allow_pet_damage([0xEEu8; 16], pet, false),
+            "a mob uuid never equals the owner's player uuid"
+        );
+        assert!(
+            should_allow_pet_damage(other, None, false),
+            "an untamed pet is wild"
+        );
+        assert!(
+            !should_allow_pet_damage(other, None, true),
+            "party allies are still protected even on untamed pets"
+        );
+        // Re-enabling restores Vanilla instantly.
+        live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pet_friendly_fire = true;
+        assert!(should_allow_pet_damage(owner, pet, false));
+        policy_reset();
+    }
+
+    #[test]
+    fn ops_sre_party_pvp_gate_blocks_allies_only_when_disabled() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        // Default `true`: allies and non-allies both take hits (Vanilla).
+        assert!(should_allow_party_pvp(true));
+        assert!(should_allow_party_pvp(false));
+        live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .party_friendly_fire = false;
+        assert!(!should_allow_party_pvp(true), "ally hit blocked");
+        assert!(should_allow_party_pvp(false), "non-ally hit allowed");
+        live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .party_friendly_fire = true;
+        assert!(should_allow_party_pvp(true));
         policy_reset();
     }
 }

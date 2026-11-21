@@ -2046,6 +2046,332 @@ impl ServerHotspotProfiler {
     }
 }
 
+// -------------------------------------- 24/365 SRE primitives (OPS-SRE)
+//
+// Three small, dependency-free primitives the operator surface shares: a
+// monotonic tick watchdog, a rolling world-backup rotator with a disk-space
+// guard, and a Prometheus text formatter for a localhost scrape endpoint
+// (Grafana, Uptime Kuma). Everything is sans-IO: callers hand in the
+// readings, the code never sleeps, blocks on I/O or panics.
+
+/// How long the tick heartbeat has been silent, classified against the
+/// watchdog's warn/critical thresholds. `stall_ms` rides on the non-healthy
+/// arms so the diagnostic needs no second clock read.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchdogVerdict {
+    Healthy,
+    Warning { stall_ms: u64 },
+    CriticalStall { stall_ms: u64 },
+}
+
+#[allow(dead_code)]
+impl WatchdogVerdict {
+    /// The greppable one-liner for a non-healthy verdict. `MEGU-E-` is the
+    /// operator-error tag family the crash reports already use; the 8-hex
+    /// suffix is a small FNV-1a over the severity and stall so the same stall
+    /// always renders the same tag. `Healthy` maps to `None`: a live tick
+    /// emits nothing.
+    fn diagnostic(self) -> Option<String> {
+        let (severity, stall_ms) = match self {
+            Self::Healthy => return None,
+            Self::Warning { stall_ms } => ("warning", stall_ms),
+            Self::CriticalStall { stall_ms } => ("critical", stall_ms),
+        };
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in severity
+            .bytes()
+            .chain(stall_ms.to_be_bytes())
+        {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Some(format!(
+            "MEGU-E-{:08X} tick watchdog stall {}ms severity={severity}",
+            h as u32, stall_ms
+        ))
+    }
+}
+
+/// Default stall budgets: a 5 s silence is worth an operator note, 30 s
+/// means the tick loop is effectively dead.
+const WATCHDOG_WARN_MS: u64 = 5_000;
+const WATCHDOG_CRITICAL_MS: u64 = 30_000;
+
+/// Monotonic heartbeat for the server tick loop. `beat()` stamps every
+/// completed tick; `check_stall` classifies the silence since the last beat.
+/// `now` always arrives as an argument — the same convention
+/// `Gs4QueryHandler` uses — so tests never sleep and no wall clock is read.
+#[allow(dead_code)]
+struct TickWatchdog {
+    last_beat: Instant,
+    warn_ms: u64,
+    critical_ms: u64,
+}
+
+#[allow(dead_code)]
+impl TickWatchdog {
+    fn new() -> Self {
+        Self::with_thresholds(WATCHDOG_WARN_MS, WATCHDOG_CRITICAL_MS)
+    }
+
+    /// Custom thresholds; `critical` clamps up to `warn` and `warn` floors at
+    /// 1 ms so the bands can never invert or fire on a zero stall.
+    fn with_thresholds(warn_ms: u64, critical_ms: u64) -> Self {
+        let warn_ms = warn_ms.max(1);
+        Self {
+            last_beat: Instant::now(),
+            warn_ms,
+            critical_ms: critical_ms.max(warn_ms),
+        }
+    }
+
+    /// One completed tick: the heartbeat moves to now.
+    fn beat(&mut self) {
+        self.last_beat = Instant::now();
+    }
+
+    /// Classify the stall at `now`. `max_stall_ms` is the caller's own tick
+    /// budget: `0` keeps the configured warn threshold, a nonzero value can
+    /// only tighten it — the watchdog's ceiling is authoritative, so a caller
+    /// may ask for an earlier warning but never a later one.
+    fn check_stall(&self, now: Instant, max_stall_ms: u64) -> WatchdogVerdict {
+        let stall_ms = now
+            .saturating_duration_since(self.last_beat)
+            .as_millis() as u64;
+        let warn_ms = if max_stall_ms == 0 {
+            self.warn_ms
+        } else {
+            self.warn_ms.min(max_stall_ms)
+        };
+        let critical_ms = self.critical_ms.max(warn_ms);
+        if stall_ms > critical_ms {
+            WatchdogVerdict::CriticalStall { stall_ms }
+        } else if stall_ms > warn_ms {
+            WatchdogVerdict::Warning { stall_ms }
+        } else {
+            WatchdogVerdict::Healthy
+        }
+    }
+}
+
+/// Retention bounds for world backups: keep at most `max_backups` generations
+/// and never start a new one while free disk sits under `min_free_bytes`.
+#[allow(dead_code)]
+struct RollingBackupPolicy {
+    max_backups: usize,
+    min_free_bytes: u64,
+}
+
+/// The retention ceiling `max_backups` is validated against.
+const BACKUP_MAX_BACKUPS_LIMIT: usize = 128;
+/// Vanilla-faithful defaults: a dozen generations, half a GiB of headroom.
+const BACKUP_DEFAULT_MAX_BACKUPS: usize = 12;
+const BACKUP_DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
+
+#[allow(dead_code)]
+impl RollingBackupPolicy {
+    /// `max_backups` must sit in `1..=128`; `min_free_bytes` is the disk-space
+    /// guard — a backup that would leave the volume under it is refused.
+    fn new(max_backups: usize, min_free_bytes: u64) -> Result<Self, String> {
+        if !(1..=BACKUP_MAX_BACKUPS_LIMIT).contains(&max_backups) {
+            return Err(format!(
+                "backup max_backups must be in 1..={BACKUP_MAX_BACKUPS_LIMIT}"
+            ));
+        }
+        Ok(Self {
+            max_backups,
+            min_free_bytes,
+        })
+    }
+}
+
+#[allow(dead_code)]
+impl Default for RollingBackupPolicy {
+    fn default() -> Self {
+        Self {
+            max_backups: BACKUP_DEFAULT_MAX_BACKUPS,
+            min_free_bytes: BACKUP_DEFAULT_MIN_FREE_BYTES,
+        }
+    }
+}
+
+/// What the rotator decided for one backup cycle.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BackupVerdict {
+    /// Disk guard passed: write the new backup, then prune `prune` (oldest
+    /// sequence first) so the set never exceeds `max_backups`.
+    Proceed { prune: Vec<String> },
+    /// `free_bytes` is under the policy floor — skip this cycle cleanly; the
+    /// caller sees the numbers and nothing is deleted.
+    SkippedLowDisk {
+        free_bytes: u64,
+        min_free_bytes: u64,
+    },
+    /// A listed name is not a plain `world-backup-<seq>.tar.gz` basename, so
+    /// the directory listing cannot be trusted: fail closed and prune
+    /// nothing this round.
+    RejectedName { name: String },
+}
+
+/// The sequence number inside a strict `world-backup-<seq>.tar.gz` basename,
+/// or `None` for anything else. The check is purely lexical — callers hand
+/// basenames, never paths — so `..`, separators, a missing suffix, an empty
+/// or non-digit sequence and sequence overflow all fail closed, and no
+/// symlink or traversal entry can ever be expressed.
+#[allow(dead_code)]
+fn backup_seq_of(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("world-backup-")?;
+    let digits = rest.strip_suffix(".tar.gz")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Decide one rotation. `existing` is the backup directory's basenames in any
+/// order — the rotator sorts by embedded sequence itself, so "oldest" means
+/// the lowest `<seq>`, never lexical order (`world-backup-10` sorts before
+/// `world-backup-2` as text but is newer). On `Proceed`, `prune` lists exactly
+/// the oldest files whose removal keeps the post-write count at
+/// `max_backups`; the caller writes the new backup first, then deletes
+/// `prune`.
+#[allow(dead_code)]
+fn plan_backup_rotation(
+    policy: &RollingBackupPolicy,
+    free_bytes: u64,
+    existing: &[String],
+) -> BackupVerdict {
+    if free_bytes < policy.min_free_bytes {
+        return BackupVerdict::SkippedLowDisk {
+            free_bytes,
+            min_free_bytes: policy.min_free_bytes,
+        };
+    }
+    let mut ordered: Vec<(u64, &str)> = Vec::with_capacity(existing.len());
+    for name in existing {
+        match backup_seq_of(name) {
+            Some(seq) => ordered.push((seq, name.as_str())),
+            None => {
+                return BackupVerdict::RejectedName {
+                    name: name.clone(),
+                }
+            }
+        }
+    }
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    // After the new backup lands the set holds existing+1; prune the excess
+    // oldest so retention never exceeds max_backups.
+    let excess = (ordered.len() + 1).saturating_sub(policy.max_backups);
+    let prune = ordered
+        .iter()
+        .take(excess)
+        .map(|(_, name)| (*name).to_owned())
+        .collect();
+    BackupVerdict::Proceed { prune }
+}
+
+/// One scrape of server vitals for a Prometheus text endpoint. Every field is
+/// gathered by the caller — the same convention `OperatorHealthSnapshot` and
+/// `Gs4StatusSnapshot` already follow — so the formatter reads fields and
+/// never interrogates the server.
+#[allow(dead_code)]
+struct OperatorMetricsSnapshot {
+    /// Observed ticks per second (20.0 nominal).
+    tps: f64,
+    mspt_p50: f64,
+    mspt_p95: f64,
+    mspt_p99: f64,
+    players_online: u64,
+    loaded_chunks: u64,
+    /// Tick targets the fault quarantine currently holds frozen.
+    quarantined_faults: u64,
+    /// Resident set size in MiB.
+    rss_mib: f64,
+    uptime_seconds: f64,
+}
+
+#[allow(dead_code)]
+impl OperatorMetricsSnapshot {
+    /// Prometheus text exposition (0.0.4): a `# HELP`/`# TYPE` pair then one
+    /// sample line per metric, every name `mc_spine_`-prefixed for a
+    /// localhost scrape. Non-finite floats render as `0` — a NaN sample makes
+    /// some collectors reject the whole exposition, and `0` is the honest
+    /// "no reading" anyway.
+    fn format_prometheus(&self) -> String {
+        fn gauge(v: f64) -> String {
+            if v.is_finite() {
+                format!("{v}")
+            } else {
+                "0".to_string()
+            }
+        }
+        let rows: [(&str, &str, String); 9] = [
+            (
+                "mc_spine_tps",
+                "Server ticks per second, 20.0 nominal",
+                gauge(self.tps),
+            ),
+            (
+                "mc_spine_mspt_p50",
+                "Median tick time in milliseconds",
+                gauge(self.mspt_p50),
+            ),
+            (
+                "mc_spine_mspt_p95",
+                "95th-percentile tick time in milliseconds",
+                gauge(self.mspt_p95),
+            ),
+            (
+                "mc_spine_mspt_p99",
+                "99th-percentile tick time in milliseconds",
+                gauge(self.mspt_p99),
+            ),
+            (
+                "mc_spine_players_online",
+                "Players currently online",
+                self.players_online.to_string(),
+            ),
+            (
+                "mc_spine_loaded_chunks",
+                "World chunks currently loaded",
+                self.loaded_chunks.to_string(),
+            ),
+            (
+                "mc_spine_quarantined_faults",
+                "Tick targets frozen by the fault quarantine",
+                self.quarantined_faults.to_string(),
+            ),
+            (
+                "mc_spine_rss_mib",
+                "Resident memory in MiB",
+                gauge(self.rss_mib),
+            ),
+            (
+                "mc_spine_uptime_seconds",
+                "Process uptime in seconds",
+                gauge(self.uptime_seconds),
+            ),
+        ];
+        let mut out = String::with_capacity(1024);
+        for (name, help, value) in rows {
+            out.push_str("# HELP ");
+            out.push_str(name);
+            out.push(' ');
+            out.push_str(help);
+            out.push('\n');
+            out.push_str("# TYPE ");
+            out.push_str(name);
+            out.push_str(" gauge\n");
+            out.push_str(name);
+            out.push(' ');
+            out.push_str(&value);
+            out.push('\n');
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod perf1_profiler_tests {
     use super::*;
@@ -2196,5 +2522,274 @@ mod perf1_profiler_tests {
         assert_eq!(profiler.chunks.len(), PROFILER_MAX_CHUNKS);
         assert!(!profiler.chunks.contains_key(&(DimId::Overworld, 0, 0)));
         assert!(profiler.chunks.contains_key(&(DimId::Nether, 1, 1)));
+    }
+}
+
+#[cfg(test)]
+mod ops_sre_tests {
+    use super::*;
+
+    #[test]
+    fn ops_sre_tick_watchdog_classifies_healthy_warning_and_critical() {
+        let mut watchdog = TickWatchdog::new();
+        let now = Instant::now();
+        // A fresh beat is healthy; beat() itself re-arms the heartbeat.
+        watchdog.last_beat = now - Duration::from_millis(100);
+        assert_eq!(
+            watchdog.check_stall(now, 0),
+            WatchdogVerdict::Healthy
+        );
+        watchdog.beat();
+        assert_eq!(
+            watchdog.check_stall(Instant::now(), 0),
+            WatchdogVerdict::Healthy
+        );
+        assert!(WatchdogVerdict::Healthy.diagnostic().is_none());
+
+        // Past the 5 s warn budget but inside the 30 s critical budget.
+        watchdog.last_beat = now - Duration::from_millis(5_001);
+        let verdict = watchdog.check_stall(now, 0);
+        assert_eq!(verdict, WatchdogVerdict::Warning { stall_ms: 5_001 });
+        let diag = verdict.diagnostic().expect("warning emits a diagnostic");
+        assert!(diag.starts_with("MEGU-E-"), "{diag}");
+        assert!(diag.contains("stall 5001ms"), "{diag}");
+        assert!(diag.contains("severity=warning"), "{diag}");
+        assert_eq!(diag.len(), "MEGU-E-".len() + 8 + " tick watchdog stall 5001ms severity=warning".len(), "{diag}");
+        // The tag is deterministic: the same stall renders the same MEGU-E id.
+        assert_eq!(
+            verdict.diagnostic(),
+            WatchdogVerdict::Warning { stall_ms: 5_001 }.diagnostic()
+        );
+
+        // Past the 30 s critical budget.
+        watchdog.last_beat = now - Duration::from_millis(30_001);
+        let verdict = watchdog.check_stall(now, 0);
+        assert_eq!(
+            verdict,
+            WatchdogVerdict::CriticalStall { stall_ms: 30_001 }
+        );
+        let diag = verdict.diagnostic().expect("critical emits a diagnostic");
+        assert!(diag.starts_with("MEGU-E-"), "{diag}");
+        assert!(diag.contains("severity=critical"), "{diag}");
+
+        // A caller tick budget can tighten the warn band but never loosen it.
+        watchdog.last_beat = now - Duration::from_millis(60);
+        assert_eq!(
+            watchdog.check_stall(now, 50),
+            WatchdogVerdict::Warning { stall_ms: 60 }
+        );
+        watchdog.last_beat = now - Duration::from_millis(4_000);
+        assert_eq!(
+            watchdog.check_stall(now, 60_000),
+            WatchdogVerdict::Healthy,
+            "a loose caller budget cannot push the warn past the configured 5 s"
+        );
+        // Custom thresholds and the inverted-band clamp.
+        let mut tight = TickWatchdog::with_thresholds(10, 5);
+        tight.last_beat = now - Duration::from_millis(11);
+        assert_eq!(
+            tight.check_stall(now, 0),
+            WatchdogVerdict::CriticalStall { stall_ms: 11 },
+            "critical clamps up to warn, so 11 ms is already critical"
+        );
+    }
+
+    #[test]
+    fn ops_sre_backup_rotation_skips_low_disk_and_prunes_oldest() {
+        let policy = RollingBackupPolicy::default();
+        assert_eq!(policy.max_backups, 12);
+        assert_eq!(policy.min_free_bytes, 512 * 1024 * 1024);
+        assert!(RollingBackupPolicy::new(0, 0).is_err());
+        assert!(RollingBackupPolicy::new(129, 0).is_err());
+        assert!(RollingBackupPolicy::new(1, 0).is_ok());
+        assert!(RollingBackupPolicy::new(128, 0).is_ok());
+
+        let names = |seqs: &[u64]| -> Vec<String> {
+            seqs.iter()
+                .map(|s| format!("world-backup-{s}.tar.gz"))
+                .collect()
+        };
+
+        // Below the 512 MiB floor the backup is skipped cleanly — nothing is
+        // pruned and the verdict carries both numbers for the operator.
+        let low = plan_backup_rotation(&policy, 512 * 1024 * 1024 - 1, &names(&[1, 2, 3]));
+        assert_eq!(
+            low,
+            BackupVerdict::SkippedLowDisk {
+                free_bytes: 512 * 1024 * 1024 - 1,
+                min_free_bytes: 512 * 1024 * 1024,
+            }
+        );
+        // Exactly at the floor is allowed.
+        assert!(matches!(
+            plan_backup_rotation(&policy, 512 * 1024 * 1024, &[]),
+            BackupVerdict::Proceed { .. }
+        ));
+
+        // Under the cap nothing is pruned; at the cap the oldest seq goes.
+        let small = RollingBackupPolicy::new(3, 0).unwrap();
+        assert_eq!(
+            plan_backup_rotation(&small, u64::MAX, &names(&[1, 2])),
+            BackupVerdict::Proceed { prune: vec![] }
+        );
+        // 3 existing + 1 incoming = 4 > max 3 -> prune exactly the oldest.
+        assert_eq!(
+            plan_backup_rotation(&small, u64::MAX, &names(&[1, 2, 3])),
+            BackupVerdict::Proceed {
+                prune: vec!["world-backup-1.tar.gz".to_string()]
+            }
+        );
+        // Input order is irrelevant: seq — not lexical text — decides age.
+        let mut shuffled = names(&[10, 2, 3]);
+        shuffled.reverse();
+        assert_eq!(
+            plan_backup_rotation(&small, u64::MAX, &shuffled),
+            BackupVerdict::Proceed {
+                prune: vec!["world-backup-2.tar.gz".to_string()]
+            }
+        );
+        // A bigger excess prunes oldest-first, count exact: 4 existing + 1
+        // incoming against a cap of 2 drops the three oldest.
+        let tiny = RollingBackupPolicy::new(2, 0).unwrap();
+        assert_eq!(
+            plan_backup_rotation(&tiny, u64::MAX, &names(&[4, 1, 7, 2])),
+            BackupVerdict::Proceed {
+                prune: vec![
+                    "world-backup-1.tar.gz".to_string(),
+                    "world-backup-2.tar.gz".to_string(),
+                    "world-backup-4.tar.gz".to_string(),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn ops_sre_backup_rotation_rejects_unsafe_names_fail_closed() {
+        let policy = RollingBackupPolicy::default();
+        for bad in [
+            "../world-backup-1.tar.gz",
+            "world-backup-../x.tar.gz",
+            "world-backup-1.tar.gz/../../evil",
+            "sub/world-backup-1.tar.gz",
+            "world-backup-1.tar.gz\\evil",
+            "world-backup-.tar.gz",
+            "world-backup-abc.tar.gz",
+            "world-backup--1.tar.gz",
+            "world-backup-1.tar.gz ",
+            "world-backup-1.zip",
+            "backup-1.tar.gz",
+            "world-backup-18446744073709551616.tar.gz", // u64 overflow
+            "",
+        ] {
+            let existing = vec![bad.to_string()];
+            assert_eq!(
+                plan_backup_rotation(&policy, u64::MAX, &existing),
+                BackupVerdict::RejectedName {
+                    name: bad.to_string()
+                },
+                "{bad:?} must fail closed"
+            );
+        }
+        // One bad apple spoils the listing: valid siblings are not pruned.
+        let mut mixed = vec!["world-backup-1.tar.gz".to_string(), "notes.txt".to_string()];
+        mixed.push("world-backup-2.tar.gz".to_string());
+        assert!(matches!(
+            plan_backup_rotation(&policy, u64::MAX, &mixed),
+            BackupVerdict::RejectedName { .. }
+        ));
+        // Leading zeros still parse to a sequence and stay prunable.
+        assert_eq!(
+            plan_backup_rotation(
+                &RollingBackupPolicy::new(1, 0).unwrap(),
+                u64::MAX,
+                &["world-backup-007.tar.gz".to_string()],
+            ),
+            BackupVerdict::Proceed {
+                prune: vec!["world-backup-007.tar.gz".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn ops_sre_prometheus_snapshot_emits_valid_lines_and_scrubs_non_finite() {
+        let snap = OperatorMetricsSnapshot {
+            tps: 19.98,
+            mspt_p50: 12.5,
+            mspt_p95: 41.25,
+            mspt_p99: 87.5,
+            players_online: 3,
+            loaded_chunks: 225,
+            quarantined_faults: 2,
+            rss_mib: 142.0,
+            uptime_seconds: 3600.5,
+        };
+        let text = snap.format_prometheus();
+        for name in [
+            "mc_spine_tps",
+            "mc_spine_mspt_p50",
+            "mc_spine_mspt_p95",
+            "mc_spine_mspt_p99",
+            "mc_spine_players_online",
+            "mc_spine_loaded_chunks",
+            "mc_spine_quarantined_faults",
+            "mc_spine_rss_mib",
+            "mc_spine_uptime_seconds",
+        ] {
+            assert!(text.contains(&format!("# TYPE {name} gauge\n")), "{name} missing TYPE");
+            assert!(text.contains(&format!("# HELP {name} ")), "{name} missing HELP");
+            let sample = text
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name} sample line missing in:\n{text}"));
+            let value = sample.rsplit(' ').next().unwrap();
+            assert!(
+                value.parse::<f64>().is_ok(),
+                "{name} sample is not a number: {value}"
+            );
+        }
+        assert!(text.contains("mc_spine_tps 19.98\n"), "{text}");
+        assert!(text.contains("mc_spine_players_online 3\n"), "{text}");
+        assert!(text.contains("mc_spine_quarantined_faults 2\n"), "{text}");
+        assert!(text.contains("mc_spine_uptime_seconds 3600.5\n"), "{text}");
+        // Every line is a comment, a TYPE/HELP header, or `name value` — no
+        // stray prose can break a scraper.
+        for line in text.lines() {
+            assert!(
+                line.starts_with('#')
+                    || line.split_once(' ').is_some_and(|(name, _)| {
+                        name.starts_with("mc_spine_") && !name.contains(' ')
+                    }),
+                "non exposition line: {line}"
+            );
+        }
+
+        // NaN and both infinities scrub to 0, never "NaN"/"inf" on the wire.
+        let dirty = OperatorMetricsSnapshot {
+            tps: f64::NAN,
+            mspt_p50: f64::INFINITY,
+            mspt_p95: f64::NEG_INFINITY,
+            mspt_p99: 0.0,
+            players_online: 0,
+            loaded_chunks: 0,
+            quarantined_faults: 0,
+            rss_mib: f64::NAN,
+            uptime_seconds: f64::INFINITY,
+        };
+        let text = dirty.format_prometheus();
+        assert!(!text.contains("NaN"), "{text}");
+        assert!(!text.contains("inf"), "{text}");
+        for name in [
+            "mc_spine_tps",
+            "mc_spine_mspt_p50",
+            "mc_spine_mspt_p95",
+            "mc_spine_rss_mib",
+            "mc_spine_uptime_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("{name} 0\n")),
+                "{name} must scrub to 0:\n{text}"
+            );
+        }
+        assert!(text.contains("mc_spine_mspt_p99 0\n"), "{text}");
     }
 }
