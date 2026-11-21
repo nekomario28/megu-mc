@@ -53,6 +53,15 @@
 //!   plain language which files are auto-skipped as
 //!   [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`], which are client-only,
 //!   which run natively, and which still need a bytecode inspection.
+//! - [`world_extensions`]: generic world & mod extension primitives —
+//!   declarative [`world_extensions::ProgressionBarrierEngine`] biome gates
+//!   (Twilight-Forest-style chained boss progression, RPG packs), multi-part
+//!   [`world_extensions::BossEncounterState`] hitboxes, the bounded `CGD1`
+//!   chunk-generator / `EAD1` entity-AI delegate wire contracts, built-in
+//!   AppleSkin + server-side inventory-sorter QoL support with a proven
+//!   item-conservation invariant, and a
+//!   [`world_extensions::BiomeRegionBlender`] TerraBlender-style weighted
+//!   Voronoi multi-region biome composer.
 
 #![deny(unsafe_code)]
 
@@ -67,6 +76,7 @@ pub mod modpack;
 pub mod neoforge_wire;
 pub mod profile;
 pub mod version_compat;
+pub mod world_extensions;
 
 pub use dimension_mod::{
     DimEntryDescriptor, DimTypeDescriptor, DimensionEnvProfile, DimensionModClassification,
