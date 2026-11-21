@@ -9971,12 +9971,13 @@ impl<'a, 's> CarveRun<'a, 's> {
         //   write's read, but the terrain read below hands `terrain_cell` the unfolded
         //   position (`aq_state`/`block_density` see it), so answering a folded out-of-chunk
         //   position from this chunk's rows would substitute another cell's state.
-        // * the cell must be above `lava`. `carve_state` returns without asking the aquifer at
-        //   or below the lava level, so `shouldScheduleFluidUpdate` keeps whatever the last
-        //   writer left there and `carve_block`'s mark gate reads it — at or below the level
-        //   the flag this read writes *is* the one the gate sees. Above it, `carve_state`
-        //   always calls `aq_state`, which writes the flag, so a prefetched read that skips
-        //   the write cannot be observed.
+        // * the cell must be above `lava`. A carve-time read is a lookup of what the fill
+        //   wrote — vanilla's `carveBlock` reads the chunk's blocks and never asks the
+        //   aquifer, so `shouldScheduleFluidUpdate` is only ever written by
+        //   `getCarveState` (and by the fill before carving started). `terrain_cell`
+        //   recomputes the aquifer's answer lazily, so at or below the level its flag
+        //   write *would* be the one the mark gate sees; the prefetch fast path simply
+        //   cannot answer there, because it has no flag of its own to write.
         if y > self.lava && (x >> 4) == self.tx && (z >> 4) == self.tz {
             if let Some(st) = prefetched_cell(g, self.pref, x, y, z) {
                 #[cfg(test)]
@@ -9984,7 +9985,14 @@ impl<'a, 's> CarveRun<'a, 's> {
                 return st;
             }
         }
-        g.terrain_cell(cc, x, y, z)
+        // Keep the flag across the fallback too: a `terrain_cell` call here stands in for
+        // the same block lookup the prefetch answered, and its aquifer work — including a
+        // lazy surface-material build under `ChunkCols` — is this generator's own history,
+        // not part of the carve's `getCarveState` flag chain the mark gate reads.
+        let sched = g.aq_schedule_fluid_update();
+        let st = g.terrain_cell(cc, x, y, z);
+        g.set_aq_schedule_fluid_update(sched);
+        st
     }
 }
 
@@ -10730,6 +10738,13 @@ fn compute_carve_chunk(
     let probe_here = probe_env == Some("all") || (here_str.is_some() && probe_env == here_str);
     let dump_here = dump_env.is_some() && dump_env == here_str;
     let wseed = g.wseed();
+    // Vanilla's aquifer lives on the chunk's `NoiseChunk`: `shouldScheduleFluidUpdate` is
+    // whatever `fillFromNoise` left when `applyCarvers` runs on the same object. A worker
+    // served its columns from the round's share did not run that build, so the flag enters
+    // the carve from the columns, not from this generator's unrelated last aquifer call.
+    if let Some(sched) = cc.carve_sched {
+        g.set_aq_schedule_fluid_update(sched);
+    }
     let mut run = CarveRun::empty(g, pref, tx, tz, scratch);
     run.probe = probe_here;
     let mut starts = 0u32;
@@ -11338,9 +11353,9 @@ impl CarveRun<'_, '_> {
         y: i32,
         z: i32,
     ) -> bool {
-        // `carve_state`'s lava branch returns before it asks the aquifer, so the ``read`` below
-        // needs the level up front: at or below it, the flag that read writes is the one the
-        // mark gate further down reads (see `CarveRun::read`).
+        // The ``read`` below needs the level up front for the prefetch gate (see
+        // `CarveRun::read`): the prefetched rows carry the state but not the aquifer's flag,
+        // so they can only answer above it.
         self.lava = c.lava.resolve(self.min_y, self.height);
         let cur = self.read(g, cc, x, y, z);
         let br = match breg() {

@@ -1689,6 +1689,13 @@ pub(crate) fn round_start_scans(round: u64) -> Option<u64> {
     round_cache(round).map(|c| c.scans.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Test probe: `(built, shared)` for the round's adapting-starts flight cache — the number
+/// of distinct keys computed against the number of asks served from a flight or a slot.
+#[cfg(test)]
+pub(crate) fn round_adapting_flight_counts(round: u64) -> Option<(u64, u64)> {
+    round_cache(round).map(|c| c.adapting_starts.flight_counts())
+}
+
 /// The round's cache, cloned out of the map so a caller never holds the map's mutex while it
 /// waits for (or builds) a value.
 fn round_cache(round: u64) -> Option<std::sync::Arc<RoundCache>> {

@@ -2085,6 +2085,11 @@ pub struct Gen {
     /// return value for the same reason there — `computeSubstance` has one return channel, the
     /// substance, and the flag is a separate observable of the same call.
     aq_sched: bool,
+    /// How many aquifer calls this generator has answered. `build_cols_body` snapshots it so a
+    /// column shared through a [`TerrainShare`] knows whether the build that produced it wrote
+    /// `aq_sched` at all: a build whose surface scan never reached below sea level leaves the
+    /// flag the *caller's* history wrote, which is each generator's own and must not travel.
+    aq_calls: u64,
     /// Sections whose terrain-stage marks are already in [`Gen::shape_marks`]. Keyed by
     /// section because that is the granularity `base_section_rows` decides and
     /// `terrain_section` can be asked for twice.
@@ -3441,6 +3446,7 @@ impl Gen {
             shape_marks: HashMap::new(),
             mark_src: HashMap::new(),
             aq_sched: false,
+            aq_calls: 0,
             terrain_marked: HashSet::new(),
             pop_active: None,
             restored_tick_sources: HashSet::new(),
@@ -7185,6 +7191,14 @@ pub(crate) struct ChunkCols {
     /// `SurfaceSystem.buildSurface`). `None` during nested structure-heightmap
     /// queries (`beard_depth > 0`) and for chunks with no structures.
     beard: Option<std::sync::Arc<BeardChunkData>>,
+    /// The `aq_sched` flag this chunk's build left, when the build asked the aquifer at
+    /// all — the state vanilla's per-chunk `Aquifer` is in when `applyCarvers` starts on
+    /// the same `NoiseChunk` that `fillFromNoise` filled. Columns served from a share did
+    /// not run the build on the asking generator, so a carve restores this instead of
+    /// reading whatever its own last aquifer call left. `None` for base columns and
+    /// synthetic test columns (no fill ran) and for a build that made no aquifer call:
+    /// then the flag the build left is the caller's own history, not the chunk's.
+    pub(crate) carve_sched: Option<bool>,
 }
 
 /// The lazily-built half of a [`ChunkCols`]: surface material windows and the per-column
@@ -8452,6 +8466,7 @@ impl Gen {
             shape_marks: HashMap::new(),
             mark_src: HashMap::new(),
             aq_sched: false,
+            aq_calls: 0,
             terrain_marked: HashSet::new(),
             pop_active: None,
             restored_tick_sources: HashSet::new(),
@@ -9112,6 +9127,7 @@ impl Gen {
                     rd: [0i16; 256],
                     wtop: [0i16; 256],
                     beard: None,
+                    carve_sched: None,
                 },
                 memos: Box::new(std::array::from_fn(|_| FlatCornerMemo::new(dfs_len))),
                 ub_filled: vec![false; ny],
@@ -9467,6 +9483,10 @@ impl Gen {
 
     fn build_cols_body(&mut self, cx: i32, cz: i32, final_columns: bool) -> Option<ChunkCols> {
         let g = self;
+        // Whether this build asks the aquifer decides what `carve_sched` means: `Some`
+        // when a call wrote `aq_sched` during the build (the flag the chunk's own aquifer
+        // holds), `None` when the build left the flag the caller already had.
+        let aq0 = g.aq_calls;
         let ny = ((g.height / g.noise_cell_h) + 1) as usize;
         let nx = (16 / g.noise_cell_w + 1) as usize;
         // Resolve the chunk's beardifier before `surf`, `wtop` and `mats`: vanilla's
@@ -9614,6 +9634,7 @@ impl Gen {
             rd: [0i16; 256],
             wtop: [0i16; 256],
             beard,
+            carve_sched: None,
         };
         // A base column is the noise answer only: vanilla's `getBaseColumn` runs neither
         // `SurfaceSystem.buildSurface` nor the heightmap pass, and `block_density` never
@@ -9677,6 +9698,10 @@ impl Gen {
                 cc.wtop[lz * 16 + lx] = wt as i16;
             }
         }
+        // `aq_calls != aq0` means this build asked the aquifer (the `wtop` probe below sea
+        // level, or a structure heightmap inside `resolve_beard`), so `aq_sched` is the flag
+        // this chunk's aquifer holds at carve time — not the caller's leftover.
+        cc.carve_sched = (g.aq_calls != aq0).then_some(g.aq_sched);
         // Layer A2-b: `mats`/`rd` are built on first material read (`ChunkCols::surface_mats`),
         // not here. Most columns in a worldgen round are neighbour/heightmap sources and never
         // read them; the exact in-pipeline scan now lives in `Gen::build_surface_mats`.
@@ -10528,6 +10553,7 @@ impl Gen {
                 rd: [0i16; 256],
                 wtop: [0i16; 256],
                 beard: None,
+                carve_sched: None,
             })
         });
         let mut memos = self.base_hm_memos.take().unwrap_or_else(|| {
@@ -11804,7 +11830,14 @@ impl Gen {
         is_fluid: bool,
     ) -> Option<u32> {
         let root = self.surface_rule?;
-        let cc = self.cols(x >> 4, z >> 4)?;
+        // Vanilla's `topMaterial` never asks the aquifer, but this `cols` lookup can build
+        // columns on a cold generator — or answer from a share on one that did not — and the
+        // `aq_sched` flag it would leave is this generator's own history leaking into the
+        // carve's mark gate. Keep the flag across the lookup either way.
+        let sched = self.aq_sched;
+        let cc = self.cols(x >> 4, z >> 4);
+        self.aq_sched = sched;
+        let cc = cc?;
         let mut c = SC::new();
         c.x = x;
         c.z = z;
@@ -12696,6 +12729,13 @@ impl Gen {
         self.aq_sched
     }
 
+    /// Install the flag a shared column build recorded in [`ChunkCols::carve_sched`]. A carve
+    /// on a generator that did not run the build restores it instead of answering the mark
+    /// gate with whatever its own last aquifer call left.
+    pub(crate) fn set_aq_schedule_fluid_update(&mut self, sched: bool) {
+        self.aq_sched = sched;
+    }
+
     /// Fast aquifer probe when the caller already proved `density <= 0.0`.
     /// Returns `Some(res)` when `aq_state(x, y, z, d)` returns `res` identically for every
     /// `d <= 0.0`, avoiding unnecessary `noodle` density evaluation. Returns `None` when
@@ -12704,6 +12744,9 @@ impl Gen {
         if aq_trace_enabled() {
             return None;
         }
+        // Every return below writes `aq_sched` exactly as `aq_state` would for this cell,
+        // so it is an aquifer call for `build_cols_body`'s touch accounting too.
+        self.aq_calls = self.aq_calls.wrapping_add(1);
         if self.aq.is_none() {
             m3_inc(M3_AQUIFER_CELLS);
             self.aq_sched = false;
@@ -12767,6 +12810,7 @@ impl Gen {
         // M3 P1a M5: how many cells ask the aquifer at all. The count is the stage's share of
         // the 4096 cells a section fills; the aquifer's own cost sits behind it.
         m3_inc(M3_AQUIFER_CELLS);
+        self.aq_calls = self.aq_calls.wrapping_add(1);
         let g = self;
         // Every return below is one of `Aquifer$NoiseBasedAquifer.computeSubstance`'s, and each
         // carries its own `this.w = …` assignment:
@@ -13772,6 +13816,7 @@ mod wg_tests {
                 rd: [0; 256],
                 wtop: [0; 256],
                 beard: None,
+                carve_sched: None,
             };
             let (cx, cz) = (-2, 3);
             let field = |x, y, z| f64::from(x) * 3.0 + f64::from(y) * 0.5 + f64::from(z) * 7.0;
@@ -17398,41 +17443,65 @@ mod wg_tests {
         let local = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld)
             .expect("generator for the fixture seed");
         let data = std::sync::Arc::clone(&local.data);
-        let keys: Vec<(i32, i32)> = (-1..=1)
-            .flat_map(|x| (-1..=1).map(move |z| (x, z)))
+        // Centered on (44, -24): a seed-0 region whose windows admit four adapting chunks
+        // (two of them - a trail_ruins and a trial_chambers - generate starts and so read
+        // base columns), and every admitted chunk sits inside six to nine of the nine
+        // 17x17 windows. The overlapping asks are what exercise the round's single flight;
+        // the spawn-adjacent 3x3 admits only one chunk, which generates no start.
+        let keys: Vec<(i32, i32)> = (43..=45)
+            .flat_map(|x| (-25..=-23).map(move |z| (x, z)))
             .collect();
-        let arm = |jobs: usize| -> (u64, Vec<u64>) {
+        let arm = |jobs: usize| -> (u64, (u64, u64), Vec<u64>) {
             let round = crate::feature::starts_round_begin();
             let _ = prefetch_cols_with(&data, Some(resolver), &keys, jobs, Some(round));
             let scans = crate::feature::round_start_scans(round).expect("the round's start cache");
+            let flights =
+                crate::feature::round_adapting_flight_counts(round).expect("adapting flights");
             let counts = terrain_share(round).expect("the round's terrain share");
             let counts = counts.flight_counts().into_iter().flat_map(|(a, b)| [a, b]).collect();
             crate::feature::starts_round_end(round);
-            (scans, counts)
+            (scans, flights, counts)
         };
-        let (serial, serial_counts) = arm(1);
-        let (parallel, parallel_counts) = arm(5);
+        let (serial, serial_flights, serial_counts) = arm(1);
+        let (parallel, parallel_flights, parallel_counts) = arm(5);
         // `--nocapture` shows the measurement, not just the verdict: this is the P1a row that
         // grew (`chunk_starts` 281 -> 454-462) and the share's own work, per worker count.
         eprintln!(
-            "[m3 p1b] starts_round scans jobs=1 {} jobs=5 {} | share (bases,beards,cols) as \
+            "[m3 p1b] starts_round scans jobs=1 {} jobs=5 {} | adapting (built,shared) jobs=1 \
+             {serial_flights:?} jobs=5 {parallel_flights:?} | share (bases,beards,cols) as \
              (built,shared) jobs=1 {serial_counts:?} jobs=5 {parallel_counts:?}",
             serial, parallel
         );
         assert!(
-            serial > keys.len() as u64,
-            "a 17x17 window per chunk must scan more chunks than the block holds: {serial} scans \
-             for {} chunks (a zero here would make the equality below vacuous)",
+            serial >= 1,
+            "the fixture region admits adapting chunks: a zero here would make the equality \
+             below vacuous"
+        );
+        let serial_asks = serial_flights.0 + serial_flights.1;
+        assert!(
+            serial_asks > keys.len() as u64,
+            "overlapping 17x17 windows must ask the adapting-starts cache for more values than \
+             the block holds: {serial_asks} asks for {} chunks",
             keys.len()
         );
         assert!(
-            serial_counts[0] > 0,
-            "the round's share was never used; the counters below would say nothing"
+            serial_flights.1 > 0,
+            "no adapting-starts ask was served from a shared publication: the windows did not \
+             overlap, so single flight is unproven"
+        );
+        assert!(
+            serial_counts[2] > 0 && serial_counts[4] > 0,
+            "the round's beards/cols share was never used; the counters below would say nothing"
         );
         assert_eq!(
             parallel, serial,
             "five workers ran {parallel} admission scans against {serial} serially: a starts key \
              was computed twice inside one round"
+        );
+        assert_eq!(
+            parallel_flights, serial_flights,
+            "five workers split the same adapting-starts asks into a different built/shared mix \
+             than one: {parallel_flights:?} against {serial_flights:?}"
         );
         assert_eq!(
             parallel_counts, serial_counts,
@@ -19237,7 +19306,9 @@ mod wg_tests {
             let ny = ((g.height / g.noise_cell_h) + 1) as usize;
             let is2 = g.is_2d.clone();
             for (cx, cz) in [(0i32, 0i32), (-17, -23), (5, -7)] {
-                let cc = g.build_cols_body(cx, cz, false).expect("cols");
+                // `final_columns = true` fills every `interp_ids()` grid — density and
+                // vein alike; a base column only carries the density-reachable ones.
+                let cc = g.build_cols_body(cx, cz, true).expect("cols");
                 let mut memo: HashMap<(usize, i32, i32, i32), f64> = HashMap::new();
                 let mut grids = 0usize;
                 for iid in g.interp_ids() {
@@ -19434,6 +19505,7 @@ mod wg_tests {
             rd: [0; 256],
             wtop: [0; 256],
             beard: None,
+            carve_sched: None,
         };
         // Distinct corner values with signed zeros and subnormals, so a wrong corner load
         // or a reordered lerp cannot hide behind a constant grid.
@@ -19485,6 +19557,7 @@ mod wg_tests {
             rd: [0; 256],
             wtop: [0; 256],
             beard: None,
+            carve_sched: None,
         };
         assert!(trilinear_x8(&cells, &narrow, 0, min_y, 0).is_none());
     }

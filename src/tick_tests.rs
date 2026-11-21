@@ -3729,6 +3729,10 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
                     saves_during_fall.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 n += 1;
+                // Between iterations the lock drops: yield so a waiter woken by the unlock
+                // can complete its acquisition instead of losing the re-acquisition race to
+                // this loop, which would starve every `with_save_guard` writer in the suite.
+                std::thread::yield_now();
             }
             n
         })
@@ -3859,6 +3863,9 @@ fn a_saved_below_world_drop_is_not_duplicated() {
                 }
                 drop(store);
                 n += 1;
+                // See the matching saver above: the yield is what lets a queued
+                // `with_save_guard` writer win the lock this loop just released.
+                std::thread::yield_now();
             }
             n
         })
@@ -6256,10 +6263,23 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
                 save_world_into(&mut buf);
                 snaps.lock().unwrap().push(buf);
                 n += 1;
+                // See the matching saver above: yield so queued writers are not starved.
+                std::thread::yield_now();
             }
             n
         })
     };
+    // Under parallel load the saver can be scheduled late enough that the whole scenario
+    // would already be over before its first snapshot: wait until it has proved itself,
+    // like `a_saved_below_world_drop_is_not_duplicated` does, before exercising the writes.
+    let wait = std::time::Instant::now();
+    while snaps.lock().unwrap().is_empty() {
+        assert!(
+            wait.elapsed().as_secs() < 10,
+            "the saver never captured a snapshot"
+        );
+        std::thread::yield_now();
+    }
     // A falling column exercises the write and the booking from several paths.
     for y in 191..=193 {
         set_block(1, y, 1, sand);
