@@ -1,0 +1,10 @@
+[package]
+name = "create-adapter"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+description = "Zero-JVM Create Mod core adapter on top of mc-spine mod-offload kernels"
+publish = false
+
+[dependencies]
+mod-offload = { path = "../mod-offload" }
