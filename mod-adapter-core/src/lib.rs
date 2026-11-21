@@ -62,6 +62,13 @@
 //!   item-conservation invariant, and a
 //!   [`world_extensions::BiomeRegionBlender`] TerraBlender-style weighted
 //!   Voronoi multi-region biome composer.
+//! - [`mod_sync`]: hardened server→client mod sync protocol — the `MSY1`
+//!   `CustomPacketPayload` body on channel `mc-spine:mod_sync_v1`, an
+//!   HTTPS-only trusted-CDN allowlist with SSRF/IP-literal/credentials
+//!   rejection, a strict `.jar` basename jail, zero-dependency pure-`std`
+//!   FIPS 180-4 SHA-256 with constant-time digest comparison,
+//!   [`mod_sync::ConsentToken`]-gated atomic installs that refuse symlink
+//!   escapes, and [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`] auto-skip.
 
 #![deny(unsafe_code)]
 
@@ -73,6 +80,7 @@ pub mod dimension_mod;
 pub mod fallback;
 pub mod mixin_lifter;
 pub mod modpack;
+pub mod mod_sync;
 pub mod neoforge_wire;
 pub mod profile;
 pub mod version_compat;
