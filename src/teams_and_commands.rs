@@ -4030,36 +4030,42 @@ fn trace_function_lines(
     s: &mut Option<&Client>,
     depth: usize,
 ) -> (usize, usize) {
-    let mut executed = 0usize;
-    let mut succeeded = 0usize;
-    for line in lines {
-        if let Some(rest) = line.strip_prefix("function ") {
-            let (inner, compound) = match rest.split_once(" with ") {
-                Some((name, compound)) => (name.trim(), Some(compound.trim())),
-                None => (rest.trim(), None),
-            };
-            let parsed = match compound {
-                Some(compound) => match function_macro_args(&["with", compound]) {
-                    Ok(parsed) => parsed,
-                    Err(_) => continue,
-                },
-                None => None,
-            };
-            let n = run_function_depth(inner, ctx.me.clone(), s, depth + 1, parsed.as_ref());
-            executed += n;
-            succeeded += n;
-        } else {
-            let reply = run_command_ctx(ctx, &format!("/{line}"), s);
-            executed += 1;
-            if !command_reply_is_error(&reply) {
-                succeeded += 1;
-            }
-            if *line == "return" || line.starts_with("return ") {
+    with_command_chain_budget(|| {
+        let mut executed = 0usize;
+        let mut succeeded = 0usize;
+        for line in lines {
+            if !command_chain_consume() {
                 break;
             }
+            if let Some(rest) = line.strip_prefix("function ") {
+                let (inner, compound) = match rest.split_once(" with ") {
+                    Some((name, compound)) => (name.trim(), Some(compound.trim())),
+                    None => (rest.trim(), None),
+                };
+                let parsed = match compound {
+                    Some(compound) => match function_macro_args(&["with", compound]) {
+                        Ok(parsed) => parsed,
+                        Err(_) => continue,
+                    },
+                    None => None,
+                };
+                let n =
+                    run_function_depth(inner, ctx.me.clone(), s, depth + 1, parsed.as_ref());
+                executed += n;
+                succeeded += n;
+            } else {
+                let reply = run_command_ctx(ctx, &format!("/{line}"), s);
+                executed += 1;
+                if !command_reply_is_error(&reply) {
+                    succeeded += 1;
+                }
+                if *line == "return" || line.starts_with("return ") {
+                    break;
+                }
+            }
         }
-    }
-    (executed, succeeded)
+        (executed, succeeded)
+    })
 }
 
 /// `/jfr start|stop` — the native telemetry recording Vanilla's JFR command
@@ -5471,6 +5477,17 @@ fn command_source_run(
     } else {
         1
     };
+    // `commandBlockOutput` gates the vanilla admin-channel echo of the reply
+    // to online operators (`[@: ...]`); the block's `last_output` bookkeeping
+    // in the caller is unaffected either way.
+    if !reply.is_empty() && gr_command_block_output() {
+        let payload = system_chat(&format!("[@: {reply}]"));
+        fanout_in(
+            &client_snapshot(),
+            |client| player_permission_level(&client.name) >= 1,
+            |_| (0x6c, payload.clone()),
+        );
+    }
     (success, reply)
 }
 
@@ -9518,5 +9535,347 @@ mod vanilla_cmdblk_tests {
         assert_eq!(registry.tags["item"]["zz:probe"], vec!["minecraft:emerald".to_owned()]);
         drop(registry);
         std::env::remove_var("MC_SPINE_DATAPACK_CACHE_DIR");
+    }
+}
+
+// ------------------------------------------------------ tests (PARITY-51-GR)
+
+#[cfg(test)]
+mod parity_51_gr_tests {
+    use super::*;
+    use std::net::TcpStream;
+
+    fn p51_client(eid: i32, name: &str) -> (Arc<Client>, TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.eid = eid;
+        client.name = name.into();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        (Arc::new(client), receiver)
+    }
+
+    fn p51_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    fn p51_put_block(
+        dim: DimId,
+        pos: (i32, i32, i32),
+        mode: CommandBlockMode,
+        facing: CommandBlockFacing,
+        command: &str,
+        conditional: bool,
+        automatic: bool,
+        powered: bool,
+    ) {
+        let mut rec = CommandBlockRecord::new(dim, pos);
+        rec.mode = mode;
+        rec.facing = facing;
+        rec.command = command.to_owned();
+        rec.conditional = conditional;
+        rec.automatic = automatic;
+        rec.powered = powered;
+        upsert_command_block(rec);
+    }
+
+    fn p51_frame(r: &mut TcpStream) -> Option<(i64, Vec<u8>)> {
+        read_packet(r, Instant::now() + Duration::from_millis(300))
+    }
+
+    /// `commandBlockOutput=false`: the "@" admin-channel echo to operators is
+    /// suppressed while the block still records `last_output` (track_output).
+    #[test]
+    fn parity_51_gr_command_block_output_gates_admin_broadcast() {
+        let _world = world_guard();
+        live_command_blocks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let dim = DimId::Overworld;
+        let pos = (40, 64, 60);
+        p51_put_block(
+            dim,
+            pos,
+            CommandBlockMode::Auto,
+            CommandBlockFacing::Up,
+            "time add 1",
+            false,
+            true,
+            false,
+        );
+        live_command_blocks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&(dim, pos.0, pos.1, pos.2))
+            .unwrap()
+            .track_output = true;
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set("p51_gr_op", 2, false);
+        let (op_client, mut op_recv) = p51_client(95_101, "p51_gr_op");
+        let (user_client, mut user_recv) = p51_client(95_102, "p51_gr_user");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend([op_client.clone(), user_client.clone()]);
+        command_gamerules()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("commandBlockOutput", 0);
+        command_block_tick();
+        let rec = live_command_blocks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())[&(dim, pos.0, pos.1, pos.2)]
+        .clone();
+        assert!(
+            rec.last_output.contains("Set the time"),
+            "last_output is still recorded when commandBlockOutput is off"
+        );
+        assert!(
+            p51_frame(&mut op_recv).is_none(),
+            "no operator broadcast when commandBlockOutput is off"
+        );
+        command_gamerules()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("commandBlockOutput", 1);
+        command_block_tick();
+        let frame = p51_frame(&mut op_recv)
+            .expect("operators receive the echo when commandBlockOutput is on");
+        assert_eq!(frame.0, 0x6c);
+        assert!(
+            String::from_utf8_lossy(&frame.1).contains("[@:"),
+            "vanilla admin-channel prefix on the command-block echo"
+        );
+        assert!(
+            p51_frame(&mut user_recv).is_none(),
+            "non-operators never see the admin channel"
+        );
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.eid != 95_101 && c.eid != 95_102);
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("p51_gr_op");
+    }
+
+    /// `logAdminCommands=false`: player-issued operator commands stop echoing
+    /// to the server console; `true` restores the `[admin]` line.
+    #[test]
+    fn parity_51_gr_log_admin_commands_gates_console_echo() {
+        let _world = world_guard();
+        admin_command_log()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set("p51_gr_admin", 4, false);
+        let (admin, _a) = p51_client(95_110, "p51_gr_admin");
+        let ctx = p51_ctx(Some(admin));
+        command_gamerules()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("logAdminCommands", 0);
+        run_command_ctx(&ctx, "/time add 1", &mut None);
+        assert!(
+            admin_command_log()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "admin echo suppressed when logAdminCommands is off"
+        );
+        command_gamerules()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("logAdminCommands", 1);
+        run_command_ctx(&ctx, "/time add 2", &mut None);
+        assert_eq!(
+            admin_command_log()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .back()
+                .map(String::as_str),
+            Some("[admin] p51_gr_admin: /time add 2"),
+        );
+        // A public (level-0) command never logs, and neither does a
+        // non-operator player running a level-0-allowed form.
+        run_command_ctx(&ctx, "/help", &mut None);
+        let (user, _u) = p51_client(95_111, "p51_gr_guest");
+        run_command_ctx(&p51_ctx(Some(user)), "/time query daytime", &mut None);
+        assert_eq!(
+            admin_command_log()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .back()
+                .map(String::as_str),
+            Some("[admin] p51_gr_admin: /time add 2"),
+            "neither /help nor a non-operator's query may append a line"
+        );
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("p51_gr_admin");
+    }
+
+    /// `maxCommandForkCount`: `/execute as @e as @e` squares the source list
+    /// and must stop cleanly at the gamerule instead of pinning the tick.
+    #[test]
+    fn parity_51_gr_max_command_fork_count_caps_execute_fanout() {
+        let _world = world_guard();
+        let players: Vec<Arc<Client>> = (0..3)
+            .map(|i| p51_client(95_120 + i, &format!("p51_gr_fork{i}")).0)
+            .collect();
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(players.iter().cloned());
+        let console = p51_ctx(None);
+        command_gamerules()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("maxCommandForkCount", 4);
+        let reply =
+            run_command_ctx(&console, "/execute as @e as @e run say boom", &mut None);
+        assert_eq!(
+            reply, "execute fork limit",
+            "nine-fork fanout is cut at the configured ceiling"
+        );
+        command_gamerules()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("maxCommandForkCount", 65536);
+        let reply =
+            run_command_ctx(&console, "/execute as @e as @e run say boom", &mut None);
+        assert_ne!(
+            reply, "execute fork limit",
+            "vanilla default ceiling lets a small fanout finish"
+        );
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| !(95_120..=95_122).contains(&c.eid));
+    }
+
+    /// `maxCommandChainLength`: `.mcfunction` lines and nested `function`
+    /// calls share one bounded queue; the command-block chain keeps its
+    /// per-trigger cap.
+    #[test]
+    fn parity_51_gr_max_command_chain_length_caps_mcfunction_and_blocks() {
+        let _world = world_guard();
+        live_command_blocks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let mut functions = HashMap::new();
+        functions.insert(
+            "p51:long".to_owned(),
+            (0..10).map(|_| "time add 1".to_owned()).collect(),
+        );
+        functions.insert(
+            "p51:outer".to_owned(),
+            vec!["function p51:inner".to_owned(), "time add 1".to_owned()],
+        );
+        functions.insert(
+            "p51:inner".to_owned(),
+            vec!["time add 1".to_owned(), "time add 1".to_owned()],
+        );
+        packs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Datapack {
+                name: "p51_gr".to_owned(),
+                functions,
+                load: Vec::new(),
+                tick: Vec::new(),
+            });
+        let console = p51_ctx(None);
+        let world_time = || WORLD_TIME.load(Ordering::Relaxed);
+        command_gamerules()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("maxCommandChainLength", 3);
+        let t0 = world_time();
+        let reply = run_command_ctx(&console, "/function p51:long", &mut None);
+        assert_eq!(
+            world_time(),
+            t0 + 3,
+            "function lines stop at maxCommandChainLength"
+        );
+        assert_eq!(reply, "ran 3 commands");
+        // A nested `function` call shares the chain queue — no fresh budget:
+        // outer line (1) + first inner line (1) = the whole cap.
+        command_gamerules()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("maxCommandChainLength", 2);
+        let t1 = world_time();
+        run_command_ctx(&console, "/function p51:outer", &mut None);
+        assert_eq!(
+            world_time(),
+            t1 + 1,
+            "nested function consumes the shared chain budget"
+        );
+        // Command-block chains keep their per-trigger cap on the same rule.
+        let dim = DimId::End;
+        p51_put_block(
+            dim,
+            (0, 64, 40),
+            CommandBlockMode::Redstone,
+            CommandBlockFacing::East,
+            "time add 1",
+            false,
+            false,
+            true,
+        );
+        p51_put_block(
+            dim,
+            (1, 64, 40),
+            CommandBlockMode::Sequence,
+            CommandBlockFacing::East,
+            "time add 1",
+            false,
+            true,
+            false,
+        );
+        p51_put_block(
+            dim,
+            (2, 64, 40),
+            CommandBlockMode::Sequence,
+            CommandBlockFacing::West,
+            "time add 1",
+            false,
+            true,
+            false,
+        );
+        let t2 = world_time();
+        command_block_tick();
+        assert_eq!(
+            world_time(),
+            t2 + 3,
+            "trigger + exactly two chained executions under cap 2"
+        );
+        live_command_blocks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        command_gamerules()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("maxCommandChainLength", 65536);
+        packs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|p| p.name != "p51_gr");
     }
 }

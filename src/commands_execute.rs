@@ -109,7 +109,6 @@ fn jstr_all(arr: &str) -> Vec<String> {
         .collect()
 }
 const EXECUTE_DEPTH_LIMIT: u32 = 16;
-const EXECUTE_FORK_LIMIT: usize = 65_536;
 
 thread_local! {
     static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -2026,6 +2025,9 @@ fn execute_pipeline(
     s: &mut Option<&Client>,
 ) -> Result<ExecuteReport, String> {
     let mut branches = vec![(source, Vec::new())];
+    // `maxCommandForkCount` bounds the fork queue (`as @e as @e` squares it):
+    // the chain stops cleanly at the gamerule instead of pinning the tick.
+    let fork_limit = gr_max_command_fork_count() as usize;
     let mut first_error = None;
     let mut tested = false;
     let mut succeeded = 0;
@@ -2085,7 +2087,7 @@ fn execute_pipeline(
                     }
                 }
             }
-            if next.len() > EXECUTE_FORK_LIMIT {
+            if next.len() > fork_limit {
                 return Err("execute fork limit".into());
             }
         }

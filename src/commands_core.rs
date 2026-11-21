@@ -2467,6 +2467,54 @@ fn function_macro_args(args: &[&str]) -> Result<Option<BTreeMap<String, String>>
     }
     Ok(Some(out))
 }
+thread_local! {
+    /// Remaining `maxCommandChainLength` budget of the live command chain:
+    /// the outermost `/function` entry installs the gamerule value and nested
+    /// calls share it — one chain, one bounded queue, like vanilla's
+    /// `ExecutionContext.commandQueue` cap.
+    static COMMAND_CHAIN_BUDGET: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `run` under a `maxCommandChainLength` budget: the outermost chain
+/// entry installs a fresh budget; nested entries share the caller's and a
+/// `.mcfunction` chain can never spin past the gamerule.
+fn with_command_chain_budget<T>(run: impl FnOnce() -> T) -> T {
+    enum Restore {
+        Installed,
+        Shared,
+    }
+    impl std::ops::Drop for Restore {
+        fn drop(&mut self) {
+            if matches!(self, Restore::Installed) {
+                COMMAND_CHAIN_BUDGET.with(|cell| cell.set(None));
+            }
+        }
+    }
+    let _restore = COMMAND_CHAIN_BUDGET.with(|cell| {
+        if cell.get().is_none() {
+            cell.set(Some(gr_max_command_chain_length()));
+            Restore::Installed
+        } else {
+            Restore::Shared
+        }
+    });
+    run()
+}
+
+/// Consume one chain command slot; `false` once `maxCommandChainLength` is
+/// exhausted. Outside a chain (no installed budget) nothing is counted.
+fn command_chain_consume() -> bool {
+    COMMAND_CHAIN_BUDGET.with(|cell| match cell.get() {
+        None => true,
+        Some(0) => false,
+        Some(remaining) => {
+            cell.set(Some(remaining - 1));
+            true
+        }
+    })
+}
+
 fn run_function_depth(
     name: &str,
     me: Option<Arc<Client>>,
@@ -2474,33 +2522,35 @@ fn run_function_depth(
     depth: usize,
     macro_args: Option<&BTreeMap<String, String>>,
 ) -> usize {
-    if depth > 16 {
-        return 0;
-    }
-    let Some(lines) = lookup_function(name) else {
-        return 0;
-    };
-    // Vanilla instantiates a macro-bearing function before running it: called
-    // without arguments, or with an unbound `$(var)`, the whole call fails and
-    // no line runs.
-    if lines.iter().any(|line| line.starts_with('$')) {
-        let Some(args) = macro_args else {
+    with_command_chain_budget(|| {
+        if depth > 16 {
+            return 0;
+        }
+        let Some(lines) = lookup_function(name) else {
             return 0;
         };
-        let mut expanded = Vec::with_capacity(lines.len());
-        for line in &lines {
-            expanded.push(if line.starts_with('$') {
-                match expand_mcfunction_macro(line, args) {
-                    Ok(line) => line,
-                    Err(_) => return 0,
-                }
-            } else {
-                line.clone()
-            });
+        // Vanilla instantiates a macro-bearing function before running it: called
+        // without arguments, or with an unbound `$(var)`, the whole call fails and
+        // no line runs.
+        if lines.iter().any(|line| line.starts_with('$')) {
+            let Some(args) = macro_args else {
+                return 0;
+            };
+            let mut expanded = Vec::with_capacity(lines.len());
+            for line in &lines {
+                expanded.push(if line.starts_with('$') {
+                    match expand_mcfunction_macro(line, args) {
+                        Ok(line) => line,
+                        Err(_) => return 0,
+                    }
+                } else {
+                    line.clone()
+                });
+            }
+            return run_function_lines(&expanded, me, s, depth);
         }
-        return run_function_lines(&expanded, me, s, depth);
-    }
-    run_function_lines(&lines, me, s, depth)
+        run_function_lines(&lines, me, s, depth)
+    })
 }
 fn run_function_lines(
     lines: &[String],
@@ -2508,34 +2558,41 @@ fn run_function_lines(
     s: &mut Option<&Client>,
     depth: usize,
 ) -> usize {
-    let mut n = 0;
-    for line in lines {
-        if let Some(rest) = line.strip_prefix("function ") {
-            // `function <name> [with <compound>]` — a nested call may carry its
-            // own macro arguments.
-            let (inner, compound) = match rest.split_once(" with ") {
-                Some((name, compound)) => (name.trim(), Some(compound.trim())),
-                None => (rest.trim(), None),
-            };
-            let parsed = match compound {
-                Some(compound) => match function_macro_args(&["with", compound]) {
-                    Ok(parsed) => parsed,
-                    Err(_) => continue,
-                },
-                None => None,
-            };
-            n += run_function_depth(inner, me.clone(), s, depth + 1, parsed.as_ref());
-        } else {
-            run_command(me.as_ref(), &format!("/{}", line), s);
-            n += 1;
-            // `/return` ends the calling function's remaining lines like
-            // Vanilla's discarded frame.
-            if *line == "return" || line.starts_with("return ") {
+    with_command_chain_budget(|| {
+        let mut n = 0;
+        for line in lines {
+            if !command_chain_consume() {
+                // `maxCommandChainLength` exhausted — the chain stops cleanly
+                // the way vanilla's bounded commandQueue drops the rest.
                 break;
             }
+            if let Some(rest) = line.strip_prefix("function ") {
+                // `function <name> [with <compound>]` — a nested call may carry its
+                // own macro arguments.
+                let (inner, compound) = match rest.split_once(" with ") {
+                    Some((name, compound)) => (name.trim(), Some(compound.trim())),
+                    None => (rest.trim(), None),
+                };
+                let parsed = match compound {
+                    Some(compound) => match function_macro_args(&["with", compound]) {
+                        Ok(parsed) => parsed,
+                        Err(_) => continue,
+                    },
+                    None => None,
+                };
+                n += run_function_depth(inner, me.clone(), s, depth + 1, parsed.as_ref());
+            } else {
+                run_command(me.as_ref(), &format!("/{}", line), s);
+                n += 1;
+                // `/return` ends the calling function's remaining lines like
+                // Vanilla's discarded frame.
+                if *line == "return" || line.starts_with("return ") {
+                    break;
+                }
+            }
         }
-    }
-    n
+        n
+    })
 }
 
 fn player_command_targets(target: &str, source: Option<&Arc<Client>>) -> Vec<Arc<Client>> {
@@ -2689,6 +2746,65 @@ fn gr_max_command_chain_length() -> u32 {
         .copied()
         .unwrap_or(65536)
         .max(0) as u32
+}
+
+/// `maxCommandForkCount` — the hard bound on `/execute` branch fanout
+/// (vanilla default 65536): `as @e as @e` squares the source list, and the
+/// queue check cuts the fork before the count can pin a tick. Negative
+/// settings clamp to zero, refusing every branch like an empty queue.
+fn gr_max_command_fork_count() -> u32 {
+    command_gamerules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get("maxCommandForkCount")
+        .copied()
+        .unwrap_or(65536)
+        .max(0) as u32
+}
+
+/// `commandBlockOutput` — whether a command block's reply is echoed to online
+/// operators on the "@" admin channel (vanilla default true). The block's own
+/// `last_output`/`track_output` bookkeeping is unaffected by the rule.
+fn gr_command_block_output() -> bool {
+    command_gamerules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get("commandBlockOutput")
+        .copied()
+        .unwrap_or(1)
+        != 0
+}
+
+/// `logAdminCommands` — whether player-issued operator commands are echoed to
+/// the server console (vanilla default true).
+fn gr_log_admin_commands() -> bool {
+    command_gamerules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get("logAdminCommands")
+        .copied()
+        .unwrap_or(1)
+        != 0
+}
+
+/// `logAdminCommands` sink: `eprintln!` is the console half; a bounded ring
+/// mirrors the most recent lines for in-process tooling and tests.
+fn admin_command_log() -> &'static Mutex<std::collections::VecDeque<String>> {
+    static LOG: OnceLock<Mutex<std::collections::VecDeque<String>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// Echo one operator command to the server console as `[admin] <player>: /<cmd>`.
+fn log_admin_command(player: &str, input: &str) {
+    let line = format!("[admin] {player}: /{input}");
+    {
+        let mut log = admin_command_log().lock().unwrap_or_else(|e| e.into_inner());
+        while log.len() >= 64 {
+            log.pop_front();
+        }
+        log.push_back(line.clone());
+    }
+    eprintln!("{line}");
 }
 
 // Resolve core command targets through the same Brigadier snapshot as /execute.
@@ -5147,17 +5263,18 @@ fn native_command_dispatcher(
     }
     if level >= 4 {
         register(literal("profile").then(args("arguments")));
-        let policy = done("policy")
-            .then(done("list"))
-            .then(done("reset"))
-            .then(literal("get").then(policy_command_argument("key").executes(|_| Ok(0))))
-            .then(
-                literal("set").then(
-                    policy_command_argument("key")
-                        .then(policy_command_argument("value").executes(|_| Ok(0))),
+        register(done("megu").then(
+            done("policy")
+                .then(done("list"))
+                .then(done("reset"))
+                .then(literal("get").then(policy_command_argument("key").executes(|_| Ok(0))))
+                .then(
+                    literal("set").then(
+                        policy_command_argument("key")
+                            .then(policy_command_argument("value").executes(|_| Ok(0))),
+                    ),
                 ),
-            );
-        register(done("megu").then(policy));
+        ));
     }
     // P8c cluster-C owner commands; `required_permission_level` already maps
     // all four to 4, so `register_at_level` advertises them at level 4 only.
@@ -6583,21 +6700,17 @@ fn run_loot_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> St
     }
 }
 
-fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
-    run_command_ctx_level(ctx, msg, s, None)
+thread_local! {
+    /// Permission level `run_command_ctx_level` pins for the duration of one
+    /// dispatch. A pinned source (command block/minecart at exactly OP level
+    /// 2) propagates through nested `run_command_ctx` re-entries —
+    /// `.mcfunction` frames and `execute ... run` tails — the way vanilla's
+    /// `CommandSourceStack` carries its level down the whole chain.
+    static PINNED_COMMAND_LEVEL: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
 }
 
-/// `run_command_ctx` with the source permission level pinned instead of
-/// derived from `ctx.me`. Command blocks pass `Some(2)`: vanilla runs them
-/// through a `CommandSourceStack` at exactly permission level 2, never the
-/// console's 4, so `stop`/`op`/`ban`-class commands stay refused. `None`
-/// keeps the legacy derive (console 4, otherwise the ops.json level).
-fn run_command_ctx_level(
-    ctx: &CmdCtx,
-    msg: &str,
-    s: &mut Option<&Client>,
-    source_level: Option<u8>,
-) -> String {
+fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     let me = ctx.me.as_ref();
     let Some(input) = msg.strip_prefix('/') else { return "Expected a command starting with /".into() };
     let first_word = input.split_whitespace().next().unwrap_or("");
@@ -6616,7 +6729,8 @@ fn run_command_ctx_level(
     // Vanilla `CommandSourceStack.hasPermission`: the console runs at level 4,
     // players at their ops.json level. `command_allowed_for_player` keeps the
     // argument-aware level-0 exceptions (e.g. `/time query`) on top.
-    let level = source_level
+    let level = PINNED_COMMAND_LEVEL
+        .with(std::cell::Cell::get)
         .map(|pinned| pinned.min(4))
         .unwrap_or_else(|| me.map_or(4, |player| player_permission_level(&player.name)));
     if !command_allowed_for_source(cmd, level)
@@ -6628,6 +6742,14 @@ fn run_command_ctx_level(
             let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat(reply));
         }
         return reply.into();
+    }
+    // `logAdminCommands` echoes player-issued operator commands to the server
+    // console. Public (level-0) commands and non-player sources — console,
+    // command blocks — never log.
+    if level >= 1 && !command_allowed_at_level(cmd, 0) && gr_log_admin_commands() {
+        if let Some(player) = me {
+            log_admin_command(&player.name, input);
+        }
     }
     #[cfg(feature = "neoforge-events")]
     let mod_command = java_compat::NEOFORGE.get().filter(|runtime| {
@@ -6674,6 +6796,16 @@ fn run_command_ctx_level(
         .and_then(|parsed| run_custom_mod_command(ctx, parsed, level));
     let reply = match mod_outcome {
         Some(outcome) => outcome.message,
+        // Console/RCON-only diagnostic (Vanilla has no `status` literal, so it
+        // deliberately never enters `command_tree_at_level` — player tab
+        // completion stays 100% Vanilla). The console is the only source that
+        // reaches this arm: it runs at level 4 with `me.is_none()`; a player
+        // who types the word still gets the unknown-command reply.
+        None if cmd == "status" && ctx.me.is_none() => {
+            // RCON carries the reply in its response frame; the stdin console
+            // sees it via the shared `[cmd]` echo below.
+            format_operator_status(&operator_health_snapshot())
+        }
         None => match cmd {
         "execute" => run_execute(ctx, &args, s),
         "time" => {
@@ -6993,16 +7125,6 @@ fn run_command_ctx_level(
             };
             connection_limits::set_idle_timeout(Duration::from_secs(u64::from(minutes) * 60));
             format!("Set idle timeout to {minutes} minutes")
-        }
-        // Console/RCON-only diagnostic (Vanilla has no `status` literal, so it
-        // deliberately never enters `command_tree_at_level` — player tab
-        // completion stays 100% Vanilla). The console is the only source that
-        // reaches this arm: it runs at level 4 with `me.is_none()`; a player
-        // who types the word still gets the unknown-command reply.
-        "status" if ctx.me.is_none() => {
-            // RCON carries the reply in its response frame; the stdin console
-            // sees it via the shared `[cmd]` echo below.
-            format_operator_status(&operator_health_snapshot())
         }
         "stop" => {
             shutdown_world_save();
@@ -7655,6 +7777,27 @@ fn run_command_ctx_level(
         }
     }
     reply
+}
+
+/// `run_command_ctx` with the source permission level pinned instead of
+/// derived from `ctx.me`. Command blocks pass `Some(2)`: vanilla runs them
+/// through a `CommandSourceStack` at exactly permission level 2, never the
+/// console's 4, so `stop`/`op`/`ban`-class commands stay refused. `None`
+/// keeps the legacy derive (console 4, otherwise the ops.json level).
+fn run_command_ctx_level(
+    ctx: &CmdCtx,
+    msg: &str,
+    s: &mut Option<&Client>,
+    source_level: Option<u8>,
+) -> String {
+    struct RestoreLevel(Option<u8>);
+    impl std::ops::Drop for RestoreLevel {
+        fn drop(&mut self) {
+            PINNED_COMMAND_LEVEL.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = RestoreLevel(PINNED_COMMAND_LEVEL.with(|cell| cell.replace(source_level)));
+    run_command_ctx(ctx, msg, s)
 }
 
 /// Disconnect one online player the way `/kick` does.
