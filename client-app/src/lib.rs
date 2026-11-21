@@ -3,6 +3,8 @@
 //! `mc-spine-kernel` and `mc-spine-client-mesh`.
 
 pub mod cli;
+pub mod integrated;
 pub mod protocol;
+pub mod render;
 pub mod sim;
 pub mod world;

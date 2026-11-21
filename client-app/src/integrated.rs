@@ -1,0 +1,294 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+//! Real `--quickPlaySingleplayer <world>` support: resolve the `mc-spine`
+//! server binary, launch it on an ephemeral loopback port with the world save
+//! rooted at `<gameDir>/saves/<world>`, wait for TCP readiness, and always
+//! terminate + reap the child via a `Drop` guard.
+
+use std::env;
+use std::fs;
+use std::io;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::cli::CliConfig;
+
+/// Upper bound for the integrated server to start listening.
+const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const READY_POLL: Duration = Duration::from_millis(50);
+
+/// A running integrated `mc-spine` server child. Dropping kills and reaps it.
+pub struct SingleplayerServer {
+    child: Child,
+    pub port: u16,
+    #[allow(dead_code)]
+    world_dir: PathBuf,
+}
+
+impl SingleplayerServer {
+    pub fn addr(&self) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], self.port))
+    }
+}
+
+impl Drop for SingleplayerServer {
+    fn drop(&mut self) {
+        // Prefer a graceful SIGTERM so the server can run its save_world()
+        // shutdown path; fall back to kill() if it does not exit promptly.
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .arg("-TERM")
+                .arg(self.child.id().to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => return,
+                    Ok(None) if Instant::now() >= deadline => break,
+                    Ok(None) => thread::sleep(Duration::from_millis(25)),
+                }
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Fail-closed world-name validation: the name becomes a single path
+/// component under `<gameDir>/saves/`, so separators, traversal segments,
+/// dot names, empty strings and control characters are all rejected.
+pub fn validate_world_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("empty --quickPlaySingleplayer world name".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err(format!(
+            "invalid --quickPlaySingleplayer world name '{name}'"
+        ));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(format!(
+            "invalid --quickPlaySingleplayer world name '{name}': path separators are not allowed"
+        ));
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "invalid --quickPlaySingleplayer world name '{name}': control characters are not allowed"
+        ));
+    }
+    Ok(())
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Resolve the `mc-spine` server binary. Order: `--server-bin`,
+/// `MC_SPINE_SERVER_BIN`, a `mc-spine` sibling of this executable, then
+/// `target/{debug,release}/mc-spine` relative to the working directory and to
+/// ancestors of the working directory and this executable.
+pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(path) = explicit {
+        let path = path.to_path_buf();
+        if is_executable_file(&path) {
+            return Ok(path);
+        }
+        return Err(format!(
+            "--server-bin '{}' does not exist or is not a file",
+            path.display()
+        ));
+    }
+    if let Ok(env_path) = env::var("MC_SPINE_SERVER_BIN") {
+        if !env_path.is_empty() {
+            let path = PathBuf::from(&env_path);
+            if is_executable_file(&path) {
+                return Ok(path);
+            }
+            return Err(format!(
+                "MC_SPINE_SERVER_BIN '{}' does not exist or is not a file",
+                path.display()
+            ));
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("mc-spine"));
+            #[cfg(windows)]
+            candidates.push(dir.join("mc-spine.exe"));
+        }
+    }
+    let mut bases: Vec<PathBuf> = vec![env::current_dir().unwrap_or_else(|_| PathBuf::from("."))];
+    if let Ok(exe) = env::current_exe() {
+        bases.extend(exe.ancestors().skip(1).take(6).map(Path::to_path_buf));
+    }
+    for base in bases {
+        candidates.push(base.join("target/debug/mc-spine"));
+        candidates.push(base.join("target/release/mc-spine"));
+        candidates.push(base.join("mc-spine"));
+    }
+    for candidate in candidates {
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(
+        "could not locate the mc-spine server binary (set --server-bin <path> or MC_SPINE_SERVER_BIN)"
+            .to_string(),
+    )
+}
+
+/// Locate the server runtime root: a directory containing `config_packets.bin`,
+/// `datapacks/` and `assets/block_states_1211.json`, searched from the server
+/// binary's ancestors and the working directory upwards.
+fn find_runtime_root(server_bin: &Path) -> Option<PathBuf> {
+    let mut bases: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = server_bin.parent() {
+        bases.extend(dir.ancestors().take(8).map(Path::to_path_buf));
+    }
+    if let Ok(cwd) = env::current_dir() {
+        bases.extend(cwd.ancestors().take(8).map(Path::to_path_buf));
+    }
+    bases.sort();
+    bases.dedup();
+    bases.into_iter().find(|dir| {
+        dir.join("config_packets.bin").is_file()
+            && dir.join("datapacks").is_dir()
+            && dir.join("assets/block_states_1211.json").is_file()
+    })
+}
+
+#[cfg(unix)]
+fn link_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+    if dst.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    match std::os::unix::fs::symlink(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) if src.is_dir() => copy_dir_all(src, dst),
+        Err(_) => fs::copy(src, dst).map(|_| ()),
+    }
+}
+
+#[cfg(not(unix))]
+fn link_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+    if dst.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    if src.is_dir() {
+        copy_dir_all(src, dst)
+    } else {
+        fs::copy(src, dst).map(|_| ())
+    }
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Expose the server runtime assets (`assets/`, `datapacks/`,
+/// `config_packets.bin`) inside the per-world run directory, which doubles as
+/// the server's working directory and save location.
+fn prepare_world_dir(world_dir: &Path, runtime_root: &Path) -> Result<(), String> {
+    fs::create_dir_all(world_dir)
+        .map_err(|e| format!("cannot create world dir {}: {e}", world_dir.display()))?;
+    for name in ["assets", "datapacks", "config_packets.bin"] {
+        link_or_copy(&runtime_root.join(name), &world_dir.join(name))
+            .map_err(|e| format!("cannot link {} into {}: {e}", name, world_dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Launch the integrated server for `--quickPlaySingleplayer`. On success the
+/// returned guard keeps the child alive until dropped.
+pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
+    let world = cfg
+        .quick_play_singleplayer
+        .as_deref()
+        .ok_or_else(|| "no --quickPlaySingleplayer world configured".to_string())?;
+    validate_world_name(world)?;
+
+    let server_bin = resolve_server_bin(cfg.server_bin.as_deref())?;
+    let runtime_root = find_runtime_root(&server_bin).ok_or_else(|| {
+        format!(
+            "could not find mc-spine runtime assets (config_packets.bin, datapacks/, assets/) near {}",
+            server_bin.display()
+        )
+    })?;
+
+    let game_dir = cfg.game_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+    let world_dir = game_dir.join("saves").join(world);
+    prepare_world_dir(&world_dir, &runtime_root)?;
+
+    // Ephemeral loopback port: bind :0, read the assigned port, release.
+    let port = {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|e| format!("cannot allocate loopback port: {e}"))?;
+        listener
+            .local_addr()
+            .map_err(|e| format!("cannot read loopback port: {e}"))?
+            .port()
+    };
+
+    let mut command = Command::new(&server_bin);
+    command
+        .current_dir(&world_dir)
+        .env("MC_SPINE_BIND_ADDR", "127.0.0.1")
+        .env("MC_SPINE_PORT", port.to_string())
+        .env("MC_SPINE_WORLD_DIR", &world_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    if let Some(seed) = cfg.seed {
+        command.env("MC_SPINE_SEED", seed.to_string());
+    }
+    let mut child = command.spawn().map_err(|e| {
+        format!(
+            "failed to spawn mc-spine server '{}': {e}",
+            server_bin.display()
+        )
+    })?;
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "mc-spine server exited during startup (status {status}) for world '{world}'"
+            ));
+        }
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+            return Ok(SingleplayerServer {
+                child,
+                port,
+                world_dir,
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "timed out after {}s waiting for mc-spine server on {addr}",
+                READY_TIMEOUT.as_secs()
+            ));
+        }
+        thread::sleep(READY_POLL);
+    }
+}

@@ -14,7 +14,10 @@ use mc_spine_client_mesh::{
     ALL_FACES, CUTOUT, FLUID_TINTED, LAVA, LIGHT_BYTES, NO_FLUID, OPAQUE, SAME_STATE_CULL,
     SECTION_CELLS, TINTED, TRANSLUCENT, WATER,
 };
-use mc_spine_kernel::{Aabb, FluidCell, FluidKind, PalettedSection, STATE_COUNT};
+use mc_spine_kernel::{
+    Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdate, PalettedSection,
+    Registry, STATE_COUNT,
+};
 
 use crate::protocol::{bitset_get, DecodedChunk, DecodedLightData, DimensionMeta};
 
@@ -950,6 +953,13 @@ impl MeshMetrics {
 pub struct WorldState {
     pub dimension: DimensionMeta,
     pub blocks: BlockTable,
+    /// Pinned Vanilla 1.21.1 block registry (luminance, opacity, fluid and
+    /// occlusion facts) when `assets/block_states_1211.json` +
+    /// `assets/blocks_1211.json` were available; `None` in fallback mode.
+    pub registry: Option<Registry>,
+    /// Incremental light engine fed by local block edits; only present when
+    /// the registry loaded and the dimension fits the engine window.
+    light_engine: Option<LightEngine>,
     pub columns: HashMap<(i32, i32), ChunkColumn>,
     pub mesh_cache: MeshCache,
     packed_meshes: HashMap<SectionCoord, Vec<PackedVertex>>,
@@ -959,14 +969,72 @@ pub struct WorldState {
     pub chunks_unloaded: u64,
     pub light_updates: u64,
     pub block_updates: u64,
+    /// Block cells relit by the local `LightEngine` after 0x09/0x49 edits.
+    pub local_light_edits: u64,
     pub metrics: MeshMetrics,
+}
+
+/// Candidate directories holding the pinned `assets/` pair, mirroring
+/// `BlockTable::load`'s search order.
+fn kernel_asset_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("assets"), PathBuf::from("../assets")];
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().skip(1).take(6) {
+            dirs.push(ancestor.join("assets"));
+        }
+    }
+    dirs
+}
+
+fn try_open_registry(states: &Path, blocks: &Path) -> Option<Registry> {
+    let states_json = std::fs::read(states).ok()?;
+    let blocks_json = std::fs::read(blocks).ok()?;
+    Registry::open_json(&states_json, &blocks_json).ok()
+}
+
+/// Load the kernel `Registry` from the asset pair that supplied the block
+/// table. Returns `None` (clean fallback) when either file is absent or the
+/// pair fails validation.
+fn load_kernel_registry(states_path: Option<&Path>) -> Option<Registry> {
+    if let Some(states) = states_path {
+        if let Some(dir) = states.parent() {
+            if let Some(registry) = try_open_registry(states, &dir.join("blocks_1211.json")) {
+                return Some(registry);
+            }
+        }
+    }
+    for dir in kernel_asset_dirs() {
+        if let Some(registry) = try_open_registry(
+            &dir.join("block_states_1211.json"),
+            &dir.join("blocks_1211.json"),
+        ) {
+            return Some(registry);
+        }
+    }
+    None
+}
+
+fn light_engine_for(dimension: &DimensionMeta, enabled: bool) -> Option<LightEngine> {
+    if !enabled {
+        return None;
+    }
+    LightEngine::new(
+        dimension.min_y,
+        u32::try_from(dimension.height).ok()?,
+        dimension.has_skylight,
+    )
+    .ok()
 }
 
 impl WorldState {
     pub fn new(dimension: DimensionMeta, blocks: BlockTable) -> Self {
+        let registry = load_kernel_registry(blocks.source_path.as_deref());
+        let light_engine = light_engine_for(&dimension, registry.is_some());
         Self {
             dimension,
             blocks,
+            registry,
+            light_engine,
             columns: HashMap::new(),
             mesh_cache: MeshCache::new(MissingNeighbor::Air),
             packed_meshes: HashMap::new(),
@@ -976,12 +1044,14 @@ impl WorldState {
             chunks_unloaded: 0,
             light_updates: 0,
             block_updates: 0,
+            local_light_edits: 0,
             metrics: MeshMetrics::default(),
         }
     }
 
     pub fn reset_dimension(&mut self, dimension: DimensionMeta) {
         self.dimension = dimension;
+        self.light_engine = light_engine_for(&self.dimension, self.registry.is_some());
         self.columns.clear();
         self.mesh_cache = MeshCache::new(MissingNeighbor::Air);
         self.packed_meshes.clear();
@@ -1053,7 +1123,176 @@ impl WorldState {
             },
         );
         self.chunks_decoded += 1;
+        self.load_light_chunk(decoded.cx, decoded.cz);
         Ok(())
+    }
+
+    /// Feed one decoded column into the local `LightEngine` as `LightFact`
+    /// cells ordered y, z, x from the window bottom. Skipped silently when the
+    /// engine or registry is absent or the column does not cover the window.
+    fn load_light_chunk(&mut self, cx: i32, cz: i32) {
+        let (Some(engine), Some(registry), Some(col)) = (
+            self.light_engine.as_mut(),
+            self.registry.as_ref(),
+            self.columns.get(&(cx, cz)),
+        ) else {
+            return;
+        };
+        let cells_per_chunk = engine.cells_per_chunk();
+        let height_blocks = cells_per_chunk / 256;
+        if col.sections.len() * SECTION_CELLS != cells_per_chunk {
+            return;
+        }
+        let mut cells = Vec::with_capacity(cells_per_chunk);
+        for y_off in 0..height_blocks {
+            let sy = y_off / 16;
+            let ly = y_off % 16;
+            let sec = &col.sections[sy];
+            for lz in 0..16usize {
+                for lx in 0..16usize {
+                    let state = sec
+                        .palette
+                        .get(section_index(lx, ly, lz))
+                        .unwrap_or(0)
+                        .min(STATE_COUNT - 1);
+                    let fact = registry.facts(state).unwrap_or_default();
+                    cells.push(LightFact {
+                        opacity: fact.opacity,
+                        emission: fact.luminance,
+                        occlusion: fact.face_occlusion,
+                    });
+                }
+            }
+        }
+        let _ = engine.load_chunk(cx, cz, &cells);
+    }
+
+    /// Apply one local block edit to the incremental light engine and push the
+    /// resulting 2048-byte sky/block arrays into the stored sections + mesh
+    /// cache. No-op when the engine or registry is unavailable or the edited
+    /// chunk was never loaded into the engine.
+    fn apply_local_light_edit(&mut self, x: i32, y: i32, z: i32, state_id: u32) {
+        let fact = match self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.facts(state_id).ok())
+        {
+            Some(fact) => fact,
+            None => return,
+        };
+        let edit = LightEdit {
+            x,
+            y,
+            z,
+            fact: LightFact {
+                opacity: fact.opacity,
+                emission: fact.luminance,
+                occlusion: fact.face_occlusion,
+            },
+        };
+        let update = {
+            let Some(engine) = self.light_engine.as_mut() else {
+                return;
+            };
+            match engine.apply_edits(&[edit]) {
+                Ok(update) => update,
+                Err(_) => return,
+            }
+        };
+        self.local_light_edits += 1;
+        self.apply_local_light_update(update);
+    }
+
+    /// Write engine-produced light sections back into `StoredSection`s and
+    /// reinsert changed sections into the `MeshCache`.
+    fn apply_local_light_update(&mut self, update: LightUpdate) {
+        let min_sy = self.dimension.min_section_y();
+        for chunk_update in update.chunks {
+            let (cx, cz) = chunk_update.chunk;
+            // Merge sky/block payloads and cleared (all-zero) sections per
+            // local section index. Light-section index `i` maps to stored
+            // section `i - 1` (index 0 is the guard section below min_y).
+            type SectionLightChange = (usize, Option<[u8; LIGHT_BYTES]>, Option<[u8; LIGHT_BYTES]>);
+            let mut changes: Vec<SectionLightChange> = Vec::new();
+            let mut put =
+                |sy: usize, sky: Option<[u8; LIGHT_BYTES]>, block: Option<[u8; LIGHT_BYTES]>| {
+                    if let Some(entry) = changes.iter_mut().find(|entry| entry.0 == sy) {
+                        if sky.is_some() {
+                            entry.1 = sky;
+                        }
+                        if block.is_some() {
+                            entry.2 = block;
+                        }
+                    } else {
+                        changes.push((sy, sky, block));
+                    }
+                };
+            for (light_idx, array) in chunk_update.sky_sections {
+                if light_idx >= 1 {
+                    put(light_idx - 1, Some(array), None);
+                }
+            }
+            for (light_idx, array) in chunk_update.block_sections {
+                if light_idx >= 1 {
+                    put(light_idx - 1, None, Some(array));
+                }
+            }
+            let mut empty_sky = chunk_update.empty_sky_mask;
+            while empty_sky != 0 {
+                let bit = empty_sky.trailing_zeros() as usize;
+                empty_sky &= empty_sky - 1;
+                if bit >= 1 {
+                    put(bit - 1, Some([0u8; LIGHT_BYTES]), None);
+                }
+            }
+            let mut empty_block = chunk_update.empty_block_mask;
+            while empty_block != 0 {
+                let bit = empty_block.trailing_zeros() as usize;
+                empty_block &= empty_block - 1;
+                if bit >= 1 {
+                    put(bit - 1, None, Some([0u8; LIGHT_BYTES]));
+                }
+            }
+
+            let mut dirty = Vec::new();
+            {
+                let Some(col) = self.columns.get_mut(&(cx, cz)) else {
+                    continue;
+                };
+                for (sy, sky, block) in changes {
+                    let Some(sec) = col.sections.get_mut(sy) else {
+                        continue;
+                    };
+                    let mut changed = false;
+                    if let Some(array) = sky {
+                        if sec.sky_light != array {
+                            sec.sky_light = array;
+                            changed = true;
+                        }
+                    }
+                    if let Some(array) = block {
+                        if sec.block_light != array {
+                            sec.block_light = array;
+                            changed = true;
+                        }
+                    }
+                    if changed && sec.has_non_air {
+                        dirty.push(sy);
+                    }
+                }
+            }
+            for sy in dirty {
+                let coord = SectionCoord(cx, min_sy + sy as i32, cz);
+                let mesh_sec = match self.columns.get(&(cx, cz)) {
+                    Some(col) => match col.sections.get(sy) {
+                        Some(sec) => sec.to_mesh_section(&self.blocks),
+                        None => continue,
+                    },
+                    None => continue,
+                };
+                self.mesh_cache.insert(coord, mesh_sec);
+            }
+        }
     }
 
     pub fn apply_light_update(
@@ -1145,6 +1384,7 @@ impl WorldState {
             self.mesh_cache
                 .set_cell(coord, [lx, ly, lz], mesh_block, light);
         }
+        self.apply_local_light_edit(x, y, z, clamped);
         Ok(())
     }
 
@@ -1207,6 +1447,19 @@ impl WorldState {
 
         self.recompute_live_totals();
         Ok(rebuilt.len())
+    }
+
+    /// Iterate rebuilt sections as `(coord, packed 16-byte vertices)` for the
+    /// software rasterizer. Four vertices per quad, corner order preserved.
+    pub fn packed_meshes(&self) -> impl Iterator<Item = (SectionCoord, &[PackedVertex])> {
+        self.packed_meshes
+            .iter()
+            .map(|(coord, verts)| (*coord, verts.as_slice()))
+    }
+
+    /// `sort_translucent` quad indices for one section, back-to-front.
+    pub fn translucent_order(&self, coord: SectionCoord) -> Option<&[u32]> {
+        self.translucent_orders.get(&coord).map(Vec::as_slice)
     }
 
     fn recompute_live_totals(&mut self) {

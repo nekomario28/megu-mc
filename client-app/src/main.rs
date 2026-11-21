@@ -4,6 +4,7 @@
 use std::process::ExitCode;
 
 use mc_spine_client::cli::{help_text, parse_args, redact_from_argv, version_info_text};
+use mc_spine_client::integrated;
 use mc_spine_client::sim::run_session;
 
 fn main() -> ExitCode {
@@ -26,6 +27,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    let mut cfg = cfg;
     let endpoint = match cfg.target_endpoint() {
         Ok(ep) => ep,
         Err(err) => {
@@ -34,19 +36,30 @@ fn main() -> ExitCode {
         }
     };
 
+    // Real --quickPlaySingleplayer loopback: launch the integrated mc-spine
+    // server on an ephemeral port and keep the guard alive for the session.
+    let mut integrated_server = None;
     if endpoint.is_none() {
-        if let Some(ref world_name) = cfg.quick_play_singleplayer {
+        if cfg.quick_play_singleplayer.is_some() {
+            match integrated::launch(&cfg) {
+                Ok(server) => {
+                    cfg.server = Some("127.0.0.1".to_string());
+                    cfg.port = server.port;
+                    integrated_server = Some(server);
+                }
+                Err(err) => {
+                    eprintln!("mc-spine-client: {}", cfg.redact(&err));
+                    return ExitCode::from(2);
+                }
+            }
+        } else {
             eprintln!(
-                "mc-spine-client: --quickPlaySingleplayer '{}' requires an integrated server endpoint via --quickPlayMultiplayer or --server",
-                cfg.redact(world_name)
+                "mc-spine-client: no server specified (pass --quickPlayMultiplayer <host[:port]>, --quickPlaySingleplayer <world>, or --server <host>; use --help for usage)"
             );
             return ExitCode::from(2);
         }
-        eprintln!(
-            "mc-spine-client: no server specified (pass --quickPlayMultiplayer <host[:port]> or --server <host>; use --help for usage)"
-        );
-        return ExitCode::from(2);
     }
+    let _integrated_server = integrated_server;
 
     match run_session(&cfg) {
         Ok(summary) => {

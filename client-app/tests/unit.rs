@@ -510,3 +510,244 @@ fn physics_prediction_gravity_wall_and_water_fluid_impulse() {
     assert!(out.in_fluid);
     assert!(swimmer.in_water);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2: kernel Registry + LightEngine, software renderer, integrated SP
+// ---------------------------------------------------------------------------
+
+use std::path::PathBuf;
+
+use mc_spine_client::integrated;
+use mc_spine_client::render;
+use mc_spine_client::sim::run_session;
+use mc_spine_client_mesh::{section_index, LIGHT_BYTES};
+
+fn test_block_table() -> BlockTable {
+    let json_path = Path::new("../assets/block_states_1211.json");
+    if json_path.is_file() {
+        BlockTable::from_json_file(json_path).expect("load block_states_1211.json")
+    } else {
+        BlockTable::builtin()
+    }
+}
+
+fn read_light_nibble(bytes: &[u8; LIGHT_BYTES], idx: usize) -> u8 {
+    (bytes[idx / 2] >> ((idx & 1) * 4)) & 0x0f
+}
+
+#[test]
+fn kernel_registry_light_engine_local_edit_light_update_remesh() {
+    let raw = build_synthetic_chunk_packet(0, 0, 24);
+    let decoded = decode_chunk_packet(&raw, 24, 64).expect("decode synthetic chunk");
+    let mut world = WorldState::new(DimensionMeta::default(), test_block_table());
+    world.apply_chunk(decoded).expect("apply chunk");
+
+    let registry = world
+        .registry
+        .as_ref()
+        .expect("kernel Registry should load from ../assets");
+    let torch = registry
+        .default_state("minecraft:torch")
+        .expect("torch block state");
+
+    // (5,2,5) is air above the synthetic stone floor at y=0.
+    world
+        .apply_block_update([5, 2, 5], torch)
+        .expect("torch edit");
+    assert_eq!(world.local_light_edits, 1);
+
+    // The engine's block-light propagation must land in the stored section
+    // nibble arrays; stored section index 4 covers world y 0..15.
+    let col = world.columns.get(&(0, 0)).expect("chunk column");
+    let sec = &col.sections[4];
+    let torch_light = read_light_nibble(&sec.block_light, section_index(5, 2, 5));
+    let neighbor_light = read_light_nibble(&sec.block_light, section_index(6, 2, 5));
+    assert!(torch_light > 0, "torch cell should emit block light");
+    assert!(
+        neighbor_light > 0 && neighbor_light < torch_light,
+        "block light should decay away from the torch (torch={torch_light} near={neighbor_light})"
+    );
+
+    // The relit section is marked dirty and remeshes with the new light.
+    assert!(world.pending_mesh_sections() > 0);
+    world
+        .rebuild_dirty_bounded(64, [8.0, 4.0, 8.0])
+        .expect("rebuild after local light edit");
+    assert!(world.metrics.total_quads > 0);
+}
+
+#[test]
+fn render_packed_quads_into_valid_nonblank_png() {
+    let raw = build_synthetic_chunk_packet(0, 0, 24);
+    let decoded = decode_chunk_packet(&raw, 24, 64).expect("decode synthetic chunk");
+    let mut world = WorldState::new(DimensionMeta::default(), test_block_table());
+    world.apply_chunk(decoded).expect("apply chunk");
+    world
+        .rebuild_dirty_bounded(64, [8.0, 4.0, 8.0])
+        .expect("rebuild dirty");
+    assert!(world.metrics.packed_vertices > 0);
+
+    // Eye above the floor, pitched down to frame the meshed chunk.
+    let frame =
+        render::render_frame(&world, [8.5, 6.0, 8.5], 0.0, 35.0, 160, 90).expect("render frame");
+    assert!(frame.stats.triangles_drawn > 0);
+    assert!(frame.stats.pixels_shaded > 0);
+    assert!(frame.stats.render_ms >= 0.0);
+
+    let png = frame.encode_png();
+    assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+    assert_eq!(&png[8..12], &13u32.to_be_bytes(), "IHDR length");
+    assert_eq!(&png[12..16], b"IHDR");
+    assert_eq!(&png[16..20], &160u32.to_be_bytes(), "width");
+    assert_eq!(&png[20..24], &90u32.to_be_bytes(), "height");
+    assert_eq!(&png[24..29], &[8, 2, 0, 0, 0], "8-bit truecolor RGB");
+
+    // Walk chunks: collect IDAT payload, require a terminating IEND.
+    let mut idat = Vec::new();
+    let mut pos = 8usize;
+    let mut saw_iend = false;
+    while pos + 12 <= png.len() {
+        let len = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
+        let tag = &png[pos + 4..pos + 8];
+        let data = &png[pos + 8..pos + 8 + len];
+        match tag {
+            b"IDAT" => idat.extend_from_slice(data),
+            b"IEND" => {
+                saw_iend = true;
+                break;
+            }
+            _ => {}
+        }
+        pos += 12 + len;
+    }
+    assert!(!idat.is_empty(), "PNG must contain IDAT");
+    assert!(saw_iend, "PNG must contain IEND");
+
+    let stride = 160 * 3 + 1;
+    let raw_pixels = zlib_decompress(&idat, stride * 90 + 64).expect("inflate IDAT");
+    assert_eq!(raw_pixels.len(), stride * 90);
+    let mut distinct = std::collections::HashSet::new();
+    for row in raw_pixels.chunks_exact(stride) {
+        assert_eq!(row[0], 0, "encoder must emit filter type 0");
+        for px in row[1..].as_chunks::<3>().0 {
+            distinct.insert([px[0], px[1], px[2]]);
+        }
+    }
+    assert!(
+        distinct.len() > 8,
+        "rendered frame must not be a flat fill ({distinct:?})"
+    );
+}
+
+#[test]
+fn quickplay_singleplayer_world_name_traversal_rejected() {
+    for bad in ["", "..", "../escape", "a/b", "a\\b", "..\\win", "a\u{7}b"] {
+        assert!(
+            integrated::validate_world_name(bad).is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    for good in ["testworld", "My World", "world-1_2.3", "slot5"] {
+        assert!(
+            integrated::validate_world_name(good).is_ok(),
+            "{good:?} must be accepted"
+        );
+    }
+}
+
+#[test]
+fn cli_quickplay_render_and_server_flags() {
+    let argv = vec![
+        "--quickPlaySingleplayer",
+        "testworld",
+        "--gameDir",
+        "/tmp/g",
+        "--server-bin",
+        "/tmp/mc-spine",
+        "--seed",
+        "42",
+        "--render-png",
+        "/tmp/f.png",
+        "--width",
+        "640",
+        "--height",
+        "360",
+        "--headless",
+        "--ticks",
+        "5",
+    ];
+    let cfg = parse_args(&argv).expect("parse flags");
+    assert_eq!(cfg.quick_play_singleplayer.as_deref(), Some("testworld"));
+    assert_eq!(cfg.server_bin.as_deref(), Some(Path::new("/tmp/mc-spine")));
+    assert_eq!(cfg.seed, Some(42));
+    assert_eq!(cfg.render_png.as_deref(), Some(Path::new("/tmp/f.png")));
+    assert_eq!(cfg.render_width, 640);
+    assert_eq!(cfg.render_height, 360);
+
+    let clamped = parse_args(&["--render-png", "x.png", "--width", "1", "--height", "99999"])
+        .expect("parse clamped dims");
+    assert_eq!(clamped.render_width, 64);
+    assert_eq!(clamped.render_height, 1080);
+    assert_eq!(clamped.render_png.as_deref(), Some(Path::new("x.png")));
+}
+
+fn find_server_bin() -> Option<PathBuf> {
+    if let Ok(bin) = integrated::resolve_server_bin(None) {
+        return Some(bin);
+    }
+    [
+        PathBuf::from("../target/debug/mc-spine"),
+        PathBuf::from("../target/release/mc-spine"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+#[test]
+fn quickplay_singleplayer_loopback_e2e_renders_png() {
+    let Some(bin) = find_server_bin() else {
+        eprintln!("mc-spine server binary not built; skipping live E2E");
+        return;
+    };
+    let game_dir = std::env::temp_dir().join(format!("mc-spine-client-e2e-{}", std::process::id()));
+    let png_path = game_dir.join("frame.png");
+    let _ = std::fs::remove_dir_all(&game_dir);
+
+    let argv: Vec<String> = vec![
+        "--headless".to_string(),
+        "--quickPlaySingleplayer".to_string(),
+        "e2eworld".to_string(),
+        "--gameDir".to_string(),
+        game_dir.to_string_lossy().into_owned(),
+        "--server-bin".to_string(),
+        bin.to_string_lossy().into_owned(),
+        "--ticks".to_string(),
+        "20".to_string(),
+        "--script".to_string(),
+        "walk".to_string(),
+        "--render-png".to_string(),
+        png_path.to_string_lossy().into_owned(),
+        "--json-summary".to_string(),
+    ];
+    let cfg = parse_args(&argv).expect("parse e2e args");
+
+    // Mirror main(): launch the integrated server, point the session at it.
+    let server = integrated::launch(&cfg).expect("launch integrated server");
+    let mut cfg = cfg;
+    cfg.server = Some("127.0.0.1".to_string());
+    cfg.port = server.port;
+    let summary = run_session(&cfg).expect("run session against integrated server");
+    drop(server); // SIGTERM + reap before touching artifacts
+
+    let png = std::fs::read(&png_path).expect("render PNG must exist");
+    assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+    assert!(png.len() > 200, "PNG suspiciously small: {}", png.len());
+
+    assert!(summary.login_ok && summary.config_ok && summary.play_ok);
+    assert!(summary.chunks_decoded > 0, "no chunks decoded");
+    assert!(
+        summary.triangles_drawn > 0 || summary.pixels_shaded > 0,
+        "renderer produced no output"
+    );
+    let _ = std::fs::remove_dir_all(&game_dir);
+}

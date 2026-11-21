@@ -298,6 +298,7 @@ pub struct SessionSummary {
     pub chunk_batches: u64,
     pub light_updates: u64,
     pub block_updates: u64,
+    pub local_light_edits: u64,
     pub sections_rebuilt: u64,
     pub total_quads: usize,
     pub packed_vertices: usize,
@@ -317,6 +318,9 @@ pub struct SessionSummary {
     pub keep_alives: u64,
     pub packets_rx: u64,
     pub packets_tx: u64,
+    pub render_ms: f64,
+    pub triangles_drawn: u64,
+    pub pixels_shaded: u64,
 }
 
 impl SessionSummary {
@@ -346,6 +350,7 @@ impl SessionSummary {
                 "\"chunk_batches\":{},",
                 "\"light_updates\":{},",
                 "\"block_updates\":{},",
+                "\"local_light_edits\":{},",
                 "\"sections_rebuilt\":{},",
                 "\"total_quads\":{},",
                 "\"packed_vertices\":{},",
@@ -364,7 +369,10 @@ impl SessionSummary {
                 "\"food\":{},",
                 "\"keep_alives\":{},",
                 "\"packets_rx\":{},",
-                "\"packets_tx\":{}",
+                "\"packets_tx\":{},",
+                "\"render_ms\":{:.3},",
+                "\"triangles_drawn\":{},",
+                "\"pixels_shaded\":{}",
                 "}}"
             ),
             escape_json(&self.username),
@@ -383,6 +391,7 @@ impl SessionSummary {
             self.chunk_batches,
             self.light_updates,
             self.block_updates,
+            self.local_light_edits,
             self.sections_rebuilt,
             self.total_quads,
             self.packed_vertices,
@@ -404,6 +413,9 @@ impl SessionSummary {
             self.keep_alives,
             self.packets_rx,
             self.packets_tx,
+            self.render_ms,
+            self.triangles_drawn,
+            self.pixels_shaded,
         )
     }
 
@@ -413,8 +425,9 @@ impl SessionSummary {
                 "mc-spine-client session complete (Protocol 767)\n",
                 "  server:        {} (dimension={}, entity_id={})\n",
                 "  handshake:     login={} config={} play={} compression={:?}\n",
-                "  world:         chunks_decoded={} loaded={} unloaded={} batches={} light_updates={} block_updates={}\n",
+                "  world:         chunks_decoded={} loaded={} unloaded={} batches={} light_updates={} block_updates={} local_light={}\n",
                 "  meshing:       sections_rebuilt={} quads={} packed_vertices={} translucent={} avg={:.1} us/section (block_json={})\n",
+                "  render:        {:.2} ms, {} triangles, {} px shaded\n",
                 "  prediction:    script={} ticks={} pos=({:.3}, {:.3}, {:.3}) on_ground={} teleports={} corrections_0x40={} max_drift={:.6}\n",
                 "  network:       health={:.1} food={} keep_alives={} rx={} tx={}"
             ),
@@ -431,12 +444,16 @@ impl SessionSummary {
             self.chunk_batches,
             self.light_updates,
             self.block_updates,
+            self.local_light_edits,
             self.sections_rebuilt,
             self.total_quads,
             self.packed_vertices,
             self.translucent_quads,
             self.avg_mesh_us_per_section,
             self.block_states_from_json,
+            self.render_ms,
+            self.triangles_drawn,
+            self.pixels_shaded,
             self.script.as_str(),
             self.ticks_executed,
             self.final_pos[0],
@@ -606,7 +623,10 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
     };
 
     let expected_window = ((2 * i32::from(cfg.view_distance) + 1) as usize).pow(2);
-    let sync_deadline = Instant::now() + Duration::from_secs(15);
+    // Generous bound: an integrated server may still be generating the spawn
+    // chunk window when the session starts. The loop exits as soon as the
+    // window is ready, so a healthy server never waits this long.
+    let sync_deadline = Instant::now() + Duration::from_secs(120);
 
     // Phase 1: Receive JoinGame + initial spawn Teleport + initial chunk window.
     while Instant::now() < sync_deadline {
@@ -685,6 +705,27 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         runner.world.rebuild_dirty_bounded(64, cam)?;
     }
 
+    // Optional software-rasterized PNG frame from the final camera pose.
+    let mut render_ms = 0.0;
+    let mut triangles_drawn = 0u64;
+    let mut pixels_shaded = 0u64;
+    if let Some(ref png_path) = cfg.render_png {
+        let cam = runner.player.camera();
+        let eye = [f64::from(cam[0]), f64::from(cam[1]), f64::from(cam[2])];
+        let frame = crate::render::render_frame(
+            &runner.world,
+            eye,
+            runner.player.yaw,
+            runner.player.pitch,
+            cfg.render_width,
+            cfg.render_height,
+        )?;
+        frame.write_png(png_path)?;
+        render_ms = frame.stats.render_ms;
+        triangles_drawn = frame.stats.triangles_drawn;
+        pixels_shaded = frame.stats.pixels_shaded;
+    }
+
     Ok(SessionSummary {
         username: handshake.server_username,
         server: format!("{host}:{port}"),
@@ -702,6 +743,7 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         chunk_batches: runner.chunk_batches,
         light_updates: runner.world.light_updates,
         block_updates: runner.world.block_updates,
+        local_light_edits: runner.world.local_light_edits,
         sections_rebuilt: runner.world.metrics.sections_rebuilt,
         total_quads: runner.world.metrics.total_quads,
         packed_vertices: runner.world.metrics.packed_vertices,
@@ -721,5 +763,8 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         keep_alives: runner.keep_alives,
         packets_rx: runner.client.packets_rx,
         packets_tx: runner.client.packets_tx,
+        render_ms,
+        triangles_drawn,
+        pixels_shaded,
     })
 }

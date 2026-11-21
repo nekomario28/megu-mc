@@ -69,6 +69,8 @@ pub struct CliConfig {
     pub quick_play_singleplayer: Option<String>,
     pub server: Option<String>,
     pub port: u16,
+    pub server_bin: Option<PathBuf>,
+    pub seed: Option<i64>,
 
     // Native mc-spine-client flags
     pub headless: bool,
@@ -77,6 +79,9 @@ pub struct CliConfig {
     pub assets_json: Option<PathBuf>,
     pub script: ScriptMode,
     pub json_summary: bool,
+    pub render_png: Option<PathBuf>,
+    pub render_width: u32,
+    pub render_height: u32,
     pub show_help: bool,
     pub show_version_info: bool,
 
@@ -103,12 +108,17 @@ impl Default for CliConfig {
             quick_play_singleplayer: None,
             server: None,
             port: 25565,
+            server_bin: None,
+            seed: None,
             headless: false,
             ticks: 40,
             view_distance: 2,
             assets_json: None,
             script: ScriptMode::Idle,
             json_summary: false,
+            render_png: None,
+            render_width: 320,
+            render_height: 180,
             show_help: false,
             show_version_info: false,
             secrets: Vec::new(),
@@ -141,12 +151,17 @@ impl fmt::Debug for CliConfig {
             .field("quick_play_singleplayer", &self.quick_play_singleplayer)
             .field("server", &self.server)
             .field("port", &self.port)
+            .field("server_bin", &self.server_bin)
+            .field("seed", &self.seed)
             .field("headless", &self.headless)
             .field("ticks", &self.ticks)
             .field("view_distance", &self.view_distance)
             .field("assets_json", &self.assets_json)
             .field("script", &self.script)
             .field("json_summary", &self.json_summary)
+            .field("render_png", &self.render_png)
+            .field("render_width", &self.render_width)
+            .field("render_height", &self.render_height)
             .finish()
     }
 }
@@ -343,6 +358,15 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 cfg.quick_play_singleplayer = Some(take_val(flag, &mut i)?);
             }
             "--server" => cfg.server = Some(take_val(flag, &mut i)?),
+            "--server-bin" => cfg.server_bin = Some(PathBuf::from(take_val(flag, &mut i)?)),
+            "--seed" => {
+                let raw_seed = take_val(flag, &mut i)?;
+                cfg.seed = Some(
+                    raw_seed
+                        .parse::<i64>()
+                        .map_err(|_| format!("invalid --seed '{raw_seed}'"))?,
+                );
+            }
             "--port" => {
                 let raw_port = take_val(flag, &mut i)?;
                 cfg.port = raw_port
@@ -370,12 +394,25 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 let raw_script = take_val(flag, &mut i)?;
                 cfg.script = ScriptMode::parse(&raw_script)?;
             }
+            "--render-png" => cfg.render_png = Some(PathBuf::from(take_val(flag, &mut i)?)),
+            "--width" => {
+                let raw_w = take_val(flag, &mut i)?;
+                let parsed = raw_w
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --width '{raw_w}'"))?;
+                cfg.render_width = parsed.clamp(64, 1920);
+            }
+            "--height" => {
+                let raw_h = take_val(flag, &mut i)?;
+                let parsed = raw_h
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --height '{raw_h}'"))?;
+                cfg.render_height = parsed.clamp(64, 1080);
+            }
             // Standard optional Minecraft launcher flags that take no value.
             "--demo" | "--fullscreen" | "--disableMultiplayer" | "--disableChat" => {}
             // Standard optional Minecraft launcher flags that take a single value.
-            "--width"
-            | "--height"
-            | "--userProperties"
+            "--userProperties"
             | "--profileProperties"
             | "--quickPlayPath"
             | "--quickPlayRealms"
@@ -418,9 +455,11 @@ LAUNCHER COMPATIBILITY FLAGS:
   --assetsDir <path>                 Minecraft assets directory
   --assetIndex <id>                  Asset index identifier
   --quickPlayMultiplayer <host[:p]>  Connect directly to multiplayer server
-  --quickPlaySingleplayer <world>    Singleplayer world name
+  --quickPlaySingleplayer <world>    Launch integrated mc-spine server for world
   --server <host>                    Server host (alternative to quickPlayMultiplayer)
   --port <port>                      Server port (default: 25565)
+  --server-bin <path>                mc-spine server binary for --quickPlaySingleplayer
+  --seed <seed>                      World seed for a new --quickPlaySingleplayer world
 
 NATIVE CLIENT FLAGS:
   --headless                         Run headless protocol + meshing + physics session
@@ -429,6 +468,9 @@ NATIVE CLIENT FLAGS:
   --assets-json <path>               Path to assets/block_states_1211.json
   --script <mode>                    Scripted input: walk|jump|sprint|idle|survey
   --json-summary                     Emit machine-readable JSON summary on stdout
+  --render-png <path>                Render final camera frame to a PNG screenshot
+  --width <px>                       Render width, clamped 64..=1920 (default: 320)
+  --height <px>                      Render height, clamped 64..=1080 (default: 180)
   --version-info                     Print version, protocol, and ABI info
   -h, --help                         Print this help message
 "
