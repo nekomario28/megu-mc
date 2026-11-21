@@ -938,7 +938,7 @@ fn anvil_gamerule_string(is_bool: bool, value: i32) -> String {
 /// Live `GameRules` compound from `command_gamerules()` + the eight atomic rules
 /// `gamerule_value` treats as authoritative.
 fn anvil_gamerules_nbt() -> AnvilNbt {
-    let rules = command_gamerules().lock().unwrap();
+    let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
     anvil_obj(
         &COMMAND_GAMERULE_DEFAULTS
             .iter()
@@ -958,7 +958,7 @@ fn anvil_gamerules_nbt() -> AnvilNbt {
 /// Apply a parsed `GameRules` compound: known rules update both the command
 /// registry and the eight live atomics; unknown names are ignored.
 fn anvil_apply_gamerules(rules: &std::collections::BTreeMap<String, String>) {
-    let mut map = command_gamerules().lock().unwrap();
+    let mut map = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
     for &(name, is_bool, _) in COMMAND_GAMERULE_DEFAULTS {
         let Some(text) = rules.get(name) else {
             continue;
@@ -1038,9 +1038,9 @@ fn anvil_level_dimensions() -> AnvilNbt {
 /// release that version names.
 fn anvil_level_dat_from_state(level_name: &str, data_version: i32) -> AnvilLevelDat {
     let schema = AnvilSchemaVersion::from_data_version(data_version);
-    let spawn = *WORLD_SPAWN.lock().unwrap();
+    let spawn = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     let now_ms = border_now_ms();
-    let border = *world_border().lock().unwrap();
+    let border = *world_border().lock().unwrap_or_else(|e| e.into_inner());
     let raining = RAINING.load(Ordering::Relaxed);
     let thundering = THUNDERING.load(Ordering::Relaxed);
     let seed = WORLD_SEED.load(Ordering::Relaxed) as i64;
@@ -1129,7 +1129,7 @@ fn anvil_level_dat_from_state(level_name: &str, data_version: i32) -> AnvilLevel
 fn anvil_apply_level_dat(level: &AnvilLevelDat) {
     WORLD_SEED.store(level.seed() as u64, Ordering::Relaxed);
     let (sx, sy, sz, angle) = level.spawn();
-    *WORLD_SPAWN.lock().unwrap() = (
+    *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (
         f64::from(sx) + 0.5,
         f64::from(sy),
         f64::from(sz) + 0.5,
@@ -1146,7 +1146,7 @@ fn anvil_apply_level_dat(level: &AnvilLevelDat) {
     );
     let (cx, cz, size, warn_blocks, warn_time, damage, safe) = level.border();
     {
-        let mut border = world_border().lock().unwrap();
+        let mut border = world_border().lock().unwrap_or_else(|e| e.into_inner());
         border.center_x = cx;
         border.center_z = cz;
         border.old_size = size.clamp(1.0, WORLD_BORDER_MAX_SIZE);
@@ -1375,7 +1375,7 @@ fn apply_anvil_import(report: &AnvilImportReport) {
         anvil_apply_level_dat(level);
     }
     {
-        let mut w = world().lock().unwrap();
+        let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
         for chunk in &report.chunks {
             w.entry((chunk.dim, chunk.cx, chunk.cz))
                 .or_default()
@@ -1383,8 +1383,8 @@ fn apply_anvil_import(report: &AnvilImportReport) {
         }
     }
     {
-        let mut entities = anvil_block_entities().lock().unwrap();
-        let mut sign_map = signs().lock().unwrap();
+        let mut entities = anvil_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+        let mut sign_map = signs().lock().unwrap_or_else(|e| e.into_inner());
         for chunk in &report.chunks {
             for entity in &chunk.block_entities {
                 let (Some(x), Some(y), Some(z)) = (
@@ -1504,7 +1504,7 @@ fn anvil_export_block_entities(
     let in_chunk = |x: i32, z: i32| x >> 4 == cx && z >> 4 == cz;
     let mut by_pos: std::collections::BTreeMap<(i32, i32, i32), AnvilNbt> =
         Default::default();
-    for (&(d, x, y, z), tag) in anvil_block_entities().lock().unwrap().iter() {
+    for (&(d, x, y, z), tag) in anvil_block_entities().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         if d == dim && in_chunk(x, z) {
             by_pos.insert((x, y, z), tag.clone());
         }
@@ -1512,7 +1512,7 @@ fn anvil_export_block_entities(
     // Spawners are Overworld-only generated content; their stored tag is
     // already the full entity compound including x/y/z.
     if dim == DimId::Overworld {
-        for (&(x, y, z), tag) in generated_content().lock().unwrap().spawners.iter() {
+        for (&(x, y, z), tag) in generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.iter() {
             if in_chunk(x, z) {
                 by_pos.insert((x, y, z), tag.clone());
             }
@@ -1585,7 +1585,7 @@ fn export_anvil_world_with_options(
     let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
     // Snapshot the overlay once: no `world()` borrow crosses a worldgen call.
     let snapshot: HashMap<DimChunkKey, HashMap<u32, u32>> =
-        world().lock().unwrap().clone();
+        world().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut by_region: std::collections::BTreeMap<(DimId, i32, i32), Vec<(i32, i32)>> =
         Default::default();
     for &(dim, cx, cz) in snapshot.keys() {
@@ -1839,7 +1839,7 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
     let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
     // Snapshot the overlay once: no `world()` borrow crosses a worldgen call.
     let snapshot: HashMap<DimChunkKey, HashMap<u32, u32>> =
-        world().lock().unwrap().clone();
+        world().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut by_region: std::collections::BTreeMap<(DimId, i32, i32), Vec<(i32, i32)>> =
         Default::default();
     for &(dim, cx, cz) in snapshot.keys() {
@@ -2298,18 +2298,18 @@ mod anvil_io_tests {
 
     impl AnvilWorldFixture {
         fn capture(sign_keys: &[SignKey]) -> Self {
-            let w = world().lock().unwrap();
-            let s = signs().lock().unwrap();
+            let w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let s = signs().lock().unwrap_or_else(|e| e.into_inner());
             Self {
                 seed: WORLD_SEED.load(Ordering::Relaxed),
-                spawn: *WORLD_SPAWN.lock().unwrap(),
+                spawn: *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()),
                 time: WORLD_TIME.load(Ordering::Relaxed),
                 difficulty: DIFFICULTY.load(Ordering::Relaxed),
                 raining: RAINING.load(Ordering::Relaxed),
                 thundering: THUNDERING.load(Ordering::Relaxed),
                 game_mode: DEFAULT_GAME_MODE.load(Ordering::Relaxed),
-                border: *world_border().lock().unwrap(),
-                rules: command_gamerules().lock().unwrap().clone(),
+                border: *world_border().lock().unwrap_or_else(|e| e.into_inner()),
+                rules: command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 rule_keep: GR_KEEP_INVENTORY.load(Ordering::Relaxed),
                 rule_day: GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed),
                 rule_weather: GR_WEATHER_CYCLE.load(Ordering::Relaxed),
@@ -2319,7 +2319,7 @@ mod anvil_io_tests {
                 rule_loot: GR_MOB_LOOT.load(Ordering::Relaxed),
                 rule_cram: GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed),
                 world_snapshot: w.clone(),
-                entities: anvil_block_entities().lock().unwrap().clone(),
+                entities: anvil_block_entities().lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 sign_entries: sign_keys.iter().map(|&k| (k, s.get(&k).cloned())).collect(),
             }
         }
@@ -2328,18 +2328,18 @@ mod anvil_io_tests {
     impl std::ops::Drop for AnvilWorldFixture {
         fn drop(&mut self) {
             WORLD_SEED.store(self.seed, Ordering::Relaxed);
-            *WORLD_SPAWN.lock().unwrap() = self.spawn;
+            *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = self.spawn;
             WORLD_TIME.store(self.time, Ordering::Relaxed);
             DIFFICULTY.store(self.difficulty, Ordering::Relaxed);
             RAINING.store(self.raining, Ordering::Relaxed);
             THUNDERING.store(self.thundering, Ordering::Relaxed);
             DEFAULT_GAME_MODE.store(self.game_mode, Ordering::Relaxed);
-            *world_border().lock().unwrap() = self.border;
+            *world_border().lock().unwrap_or_else(|e| e.into_inner()) = self.border;
             let restored = std::mem::take(&mut self.rules);
             for (&name, &val) in &restored {
                 gamerule_atomic_store(name, val);
             }
-            *command_gamerules().lock().unwrap() = restored;
+            *command_gamerules().lock().unwrap_or_else(|e| e.into_inner()) = restored;
             GR_KEEP_INVENTORY.store(self.rule_keep, Ordering::Relaxed);
             GR_DAYLIGHT_CYCLE.store(self.rule_day, Ordering::Relaxed);
             GR_WEATHER_CYCLE.store(self.rule_weather, Ordering::Relaxed);
@@ -2348,9 +2348,9 @@ mod anvil_io_tests {
             GR_NATURAL_REGEN.store(self.rule_regen, Ordering::Relaxed);
             GR_MOB_LOOT.store(self.rule_loot, Ordering::Relaxed);
             GR_MAX_ENTITY_CRAMMING.store(self.rule_cram, Ordering::Relaxed);
-            *world().lock().unwrap() = std::mem::take(&mut self.world_snapshot);
-            *anvil_block_entities().lock().unwrap() = std::mem::take(&mut self.entities);
-            let mut s = signs().lock().unwrap();
+            *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world_snapshot);
+            *anvil_block_entities().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.entities);
+            let mut s = signs().lock().unwrap_or_else(|e| e.into_inner());
             for (key, entry) in self.sign_entries.drain(..) {
                 match entry {
                     Some(lines) => {
@@ -2381,7 +2381,7 @@ mod anvil_io_tests {
         {
             // Replace the whole overlay (restored by the fixture) so the export
             // reports exactly the chunks this test planted.
-            let mut w = world().lock().unwrap();
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
             w.clear();
             let mut ow_chunk = HashMap::new();
             ow_chunk.insert(local_idx(1, 70, 2), grass);
@@ -2390,23 +2390,23 @@ mod anvil_io_tests {
             w.insert(nether, HashMap::from([(local_idx(2, 40, 3), netherrack)]));
             w.insert(end, HashMap::from([(local_idx(4, 50, 5), end_stone)]));
         }
-        anvil_block_entities().lock().unwrap().clear();
-        signs().lock().unwrap().insert(
+        anvil_block_entities().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        signs().lock().unwrap_or_else(|e| e.into_inner()).insert(
             sign_key,
             ["first".into(), "second".into(), String::new(), "fourth".into()],
         );
         WORLD_SEED.store(0x1234_5678_9abc_def0, Ordering::Relaxed);
-        *WORLD_SPAWN.lock().unwrap() = (12.5, 72.0, -34.5, 45.0);
+        *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (12.5, 72.0, -34.5, 45.0);
         WORLD_TIME.store(131_000, Ordering::Relaxed);
         DIFFICULTY.store(3, Ordering::Relaxed);
         RAINING.store(5_000, Ordering::Relaxed);
         THUNDERING.store(300, Ordering::Relaxed);
-        command_gamerules().lock().unwrap().insert("keepInventory", 1);
+        command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).insert("keepInventory", 1);
         GR_KEEP_INVENTORY.store(1, Ordering::Relaxed);
-        command_gamerules().lock().unwrap().insert("randomTickSpeed", 9);
+        command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).insert("randomTickSpeed", 9);
         gamerule_atomic_store("randomTickSpeed", 9);
         {
-            let mut border = world_border().lock().unwrap();
+            let mut border = world_border().lock().unwrap_or_else(|e| e.into_inner());
             border.center_x = 100.5;
             border.center_z = -20.25;
             border.old_size = 8_000.0;
@@ -2507,26 +2507,26 @@ mod anvil_io_tests {
         assert_eq!(overlay_block_dim(DimId::Nether, 2, 40, 3), Some(netherrack));
         assert_eq!(overlay_block_dim(DimId::End, 4, 50, 5), Some(end_stone));
         assert_eq!(WORLD_SEED.load(Ordering::Relaxed), 0x1234_5678_9abc_def0);
-        assert_eq!(*WORLD_SPAWN.lock().unwrap(), (12.5, 72.0, -34.5, 45.0));
+        assert_eq!(*WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()), (12.5, 72.0, -34.5, 45.0));
         assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 131_000);
         assert_eq!(DIFFICULTY.load(Ordering::Relaxed), 3);
         assert_eq!(RAINING.load(Ordering::Relaxed), 5_000);
         assert_eq!(THUNDERING.load(Ordering::Relaxed), 300);
-        assert_eq!(command_gamerules().lock().unwrap()["keepInventory"], 1);
+        assert_eq!(command_gamerules().lock().unwrap_or_else(|e| e.into_inner())["keepInventory"], 1);
         assert_eq!(GR_KEEP_INVENTORY.load(Ordering::Relaxed), 1);
-        assert_eq!(command_gamerules().lock().unwrap()["randomTickSpeed"], 9);
+        assert_eq!(command_gamerules().lock().unwrap_or_else(|e| e.into_inner())["randomTickSpeed"], 9);
         {
-            let b = *world_border().lock().unwrap();
+            let b = *world_border().lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!((b.center_x, b.center_z, b.new_size), (100.5, -20.25, 8_000.0));
             assert_eq!((b.warning_blocks, b.warning_time_secs), (10, 20));
         }
         assert_eq!(
-            signs().lock().unwrap()[&sign_key][..2],
+            signs().lock().unwrap_or_else(|e| e.into_inner())[&sign_key][..2],
             ["first".to_string(), "second".to_string()]
         );
         assert!(anvil_block_entities()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .contains_key(&(DimId::Overworld, 3, 80, 3)));
 
         // Second cycle: export the now-applied world and re-import it; both the
@@ -2695,7 +2695,7 @@ mod anvil_io_tests {
         let _fixture = AnvilWorldFixture::capture(&[]);
         let stone = name_to_state("stone").expect("stone state");
         {
-            let mut w = world().lock().unwrap();
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
             w.clear();
             w.insert(key, HashMap::from([(local_idx(1, 70, 2), stone)]));
         }
@@ -2744,7 +2744,7 @@ mod anvil_io_tests {
         let _fixture = AnvilWorldFixture::capture(&[]);
         let stone = name_to_state("stone").expect("stone state");
         {
-            let mut w = world().lock().unwrap();
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
             w.clear();
             w.insert(key, HashMap::from([(local_idx(1, 70, 2), stone)]));
         }
@@ -2836,7 +2836,7 @@ mod anvil_io_tests {
         let netherrack = name_to_state("netherrack").expect("netherrack state");
         let end_stone = name_to_state("end_stone").expect("end_stone state");
         {
-            let mut w = world().lock().unwrap();
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
             w.clear();
             // Negative chunk coords exercise the r.-1.0 / r.0.-1 naming too.
             w.insert(
@@ -2853,7 +2853,7 @@ mod anvil_io_tests {
             );
         }
         WORLD_SEED.store(0x0123_4567_89ab_cdef, Ordering::Relaxed);
-        *WORLD_SPAWN.lock().unwrap() = (8.5, 65.0, -3.5, 90.0);
+        *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (8.5, 65.0, -3.5, 90.0);
         WORLD_TIME.store(77_000, Ordering::Relaxed);
 
         let dir = anvil_tmp_dir("live-rt");
@@ -2872,9 +2872,9 @@ mod anvil_io_tests {
         }
 
         // Wipe live state, then the load must bring it all back.
-        world().lock().unwrap().clear();
+        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
         WORLD_SEED.store(0, Ordering::Relaxed);
-        *WORLD_SPAWN.lock().unwrap() = (0.5, 0.0, 0.5, 0.0);
+        *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 0.0, 0.5, 0.0);
         WORLD_TIME.store(0, Ordering::Relaxed);
         let load = live_anvil_load_dir(&dir).unwrap();
         assert!(!load.initialized);
@@ -2888,7 +2888,7 @@ mod anvil_io_tests {
         assert_eq!(overlay_block_dim(DimId::Nether, -2, 40, 3), Some(netherrack));
         assert_eq!(overlay_block_dim(DimId::End, 4, 50, -5), Some(end_stone));
         assert_eq!(WORLD_SEED.load(Ordering::Relaxed), 0x0123_4567_89ab_cdef);
-        assert_eq!(*WORLD_SPAWN.lock().unwrap(), (8.5, 65.0, -3.5, 90.0));
+        assert_eq!(*WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()), (8.5, 65.0, -3.5, 90.0));
         assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 77_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2921,7 +2921,7 @@ mod anvil_io_tests {
         let _fixture = AnvilWorldFixture::capture(&[]);
         let stone = name_to_state("stone").expect("stone state");
         {
-            let mut w = world().lock().unwrap();
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
             w.clear();
             w.insert(
                 (DimId::Overworld, 0i32, 0i32),
@@ -2960,7 +2960,7 @@ mod anvil_io_tests {
         let stone = name_to_state("stone").expect("stone state");
         let dirt = name_to_state("dirt").expect("dirt state");
         {
-            let mut w = world().lock().unwrap();
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
             w.clear();
             w.insert(
                 (DimId::Overworld, 0i32, 0i32),
@@ -2977,7 +2977,7 @@ mod anvil_io_tests {
         // Chunk (1,0) is clean this cycle — dropped from the overlay — while
         // chunk (0,0) gains a new edit. The merge must keep (1,0)'s record.
         {
-            let mut w = world().lock().unwrap();
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
             w.remove(&(DimId::Overworld, 1, 0));
             w.get_mut(&(DimId::Overworld, 0, 0))
                 .unwrap()
@@ -3003,7 +3003,7 @@ mod anvil_io_tests {
         // An mca-bearing directory without level.dat is still world data: a
         // load imports the chunks instead of reinitializing over them.
         std::fs::remove_file(dir.join("level.dat")).unwrap();
-        world().lock().unwrap().clear();
+        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
         let load = live_anvil_load_dir(&dir).unwrap();
         assert!(!load.initialized, "region data alone means this is not fresh");
         assert!(!load.level_loaded);

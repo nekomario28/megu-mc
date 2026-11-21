@@ -358,7 +358,7 @@ pub(super) fn tick_effects(c: &Client) {
     if let Some(t) = __t {
         crate::tickprof::add("fx/adv_call", t.elapsed());
     }
-    let mut ef = c.effs.lock().unwrap();
+    let mut ef = c.effs.lock().unwrap_or_else(|e| e.into_inner());
     if ef.is_empty() {
         return;
     }
@@ -367,13 +367,13 @@ pub(super) fn tick_effects(c: &Client) {
     let mut grant_totem = false;
     for e in ef.iter_mut() {
         e.left -= 1;
-        if *c.gm.lock().unwrap() == 1 {
+        if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
             if e.left <= 0 {
                 expired.push(e.id);
             }
             continue;
         }
-        let mut h = c.hp.lock().unwrap();
+        let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
         match e.id {
             9 => {
                 let iv = server_ticks(periodic_effect_interval(50, e.amp) as u64) as i32;
@@ -399,8 +399,8 @@ pub(super) fn tick_effects(c: &Client) {
                 }
                 if *h <= 0.0 {
                     // The effect guard is held here; do not re-lock it through totem_check.
-                    let mut inv2 = c.inv.lock().unwrap();
-                    let hk = 36i16 + (*c.held.lock().unwrap());
+                    let mut inv2 = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+                    let hk = 36i16 + (*c.held.lock().unwrap_or_else(|e| e.into_inner()));
                     let mut saved = false;
                     let mut saved_k = -1i16;
                     let mut saved_now = (0i64, 0u8, Vec::new());
@@ -426,10 +426,10 @@ pub(super) fn tick_effects(c: &Client) {
                         let mut st_pkt = Vec::new();
                         st_pkt.extend_from_slice(&c.eid.to_be_bytes());
                         st_pkt.push(35);
-                        let _ = send_packet(&mut c.sock.lock().unwrap(), 0x1f, st_pkt.clone());
+                        let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x1f, st_pkt.clone());
                         broadcast_seen(c.eid, |_c| (0x1f, st_pkt.clone()));
                         let (px, py, pz, ..) = {
-                            let p = c.pos.lock().unwrap();
+                            let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                             *p
                         };
                         let snd = sound_pkt_named("item.totem.use", px, py, pz);
@@ -442,22 +442,22 @@ pub(super) fn tick_effects(c: &Client) {
             // two saturation points, capped at the resulting food level.
             22 => {
                 drop(h);
-                let mut f = c.food.lock().unwrap();
-                let mut sat = c.sat.lock().unwrap();
+                let mut f = c.food.lock().unwrap_or_else(|e| e.into_inner());
+                let mut sat = c.sat.lock().unwrap_or_else(|e| e.into_inner());
                 let (next_food, next_sat) = saturation_tick_for(*f, *sat, e.amp);
                 dirty2 |= next_food != *f || next_sat != *sat;
                 *f = next_food;
                 *sat = next_sat;
                 drop(sat);
                 drop(f);
-                h = c.hp.lock().unwrap();
+                h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
             }
             12 | 28 => {
                 // Water Breathing and Conduit Power prevent the ordinary air
                 // supply from reaching the drowning threshold.
                 drop(h);
-                *c.air.lock().unwrap() = server_ticks(AIR_SUPPLY_GT) as i32;
-                h = c.hp.lock().unwrap();
+                *c.air.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(AIR_SUPPLY_GT) as i32;
+                h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
             }
             _ => {}
         }
@@ -472,13 +472,13 @@ pub(super) fn tick_effects(c: &Client) {
     }
     if dirty2 {
         if let Ok(mut w) = c.sock.lock() {
-            let _ = send_packet(&mut w, 0x5d, health_pkt_c(*c.hp.lock().unwrap(), c));
+            let _ = send_packet(&mut w, 0x5d, health_pkt_c(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), c));
         }
     }
     for id in &expired {
         ef.retain(|e| e.id != *id);
         if *id == 21 {
-            *c.absorb.lock().unwrap() = 0.0;
+            *c.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
         }
         let pk = remove_effect_pkt(c.eid, *id);
         if let Ok(mut w) = c.sock.lock() {
@@ -540,24 +540,24 @@ mod tests {
     #[test]
     fn p5b_parity_poison_stops_at_one_hp_and_wither_is_lethal_live() {
         let (client, _receiver) = crate::effect_tests::client_pair();
-        *client.hp.lock().unwrap() = 1.0;
-        client.effs.lock().unwrap().push(Eff {
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
+        client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
             id: 18,
             amp: 0,
             left: 26,
         });
         tick_effects(&client);
-        assert_eq!(*client.hp.lock().unwrap(), 1.0);
+        assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
 
-        client.effs.lock().unwrap().clear();
-        *client.hp.lock().unwrap() = 1.0;
-        client.effs.lock().unwrap().push(Eff {
+        client.effs.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
+        client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
             id: 19,
             amp: 0,
             left: 41,
         });
         tick_effects(&client);
-        assert_eq!(*client.hp.lock().unwrap(), 0.0);
+        assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
     }
 
     #[test]
@@ -586,15 +586,15 @@ mod tests {
     #[test]
     fn p5b_parity_tick_effects_apply_amplified_saturation_live() {
         let (client, _receiver) = crate::effect_tests::client_pair();
-        *client.food.lock().unwrap() = 10;
-        *client.sat.lock().unwrap() = 0.0;
-        client.effs.lock().unwrap().push(Eff {
+        *client.food.lock().unwrap_or_else(|e| e.into_inner()) = 10;
+        *client.sat.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
             id: 22,
             amp: 1,
             left: 20,
         });
         tick_effects(&client);
-        assert_eq!(*client.food.lock().unwrap(), 12);
-        assert_eq!(*client.sat.lock().unwrap(), 4.0);
+        assert_eq!(*client.food.lock().unwrap_or_else(|e| e.into_inner()), 12);
+        assert_eq!(*client.sat.lock().unwrap_or_else(|e| e.into_inner()), 4.0);
     }
 }

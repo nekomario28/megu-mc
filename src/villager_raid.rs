@@ -1635,7 +1635,7 @@ fn live_poi_scan(dim: DimId, center: BlockPos) -> usize {
     };
     let min_y = (center.1 - LIVE_POI_SCAN_RADIUS).max(dim.min_y());
     let max_y = (center.1 + LIVE_POI_SCAN_RADIUS).min(dim.min_y() + dim.height() - 1);
-    let mut registries = live_pois().lock().unwrap();
+    let mut registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
     scan_poi_box(
         registries.entry(dim).or_default(),
         reg,
@@ -1729,7 +1729,7 @@ fn profession_offers(profession: VillagerProfession) -> Vec<MerchantOffer> {
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_villager_bind_pois(dim: DimId, position: BlockPos, villager: &mut Villager) {
     live_poi_scan(dim, position);
-    let mut registries = live_pois().lock().unwrap();
+    let mut registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
     let pois = registries.entry(dim).or_default();
     let mut nearby: Vec<(BlockPos, PoiKind)> = pois
         .records
@@ -1771,13 +1771,13 @@ fn live_villager_tick(tick: u64) {
     let villager_etype = name_to_etype("villager");
     let live: Vec<(i32, [u8; 16], DimId, BlockPos)> = mobs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|mob| {
-            Some(mob.etype) == villager_etype && *mob.hp.lock().unwrap() > 0.0
+            Some(mob.etype) == villager_etype && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
         })
         .map(|mob| {
-            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
             (
                 mob.eid,
                 mob.uuid,
@@ -1786,7 +1786,7 @@ fn live_villager_tick(tick: u64) {
             )
         })
         .collect();
-    let mut villagers = live_villagers().lock().unwrap();
+    let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
     let live_eids: HashSet<i32> = live.iter().map(|&(eid, ..)| eid).collect();
     // A removed or dead villager releases its POI claims before its record
     // goes; without this a village stays claimed by ghosts.
@@ -1796,7 +1796,7 @@ fn live_villager_tick(tick: u64) {
         .copied()
         .collect();
     if !retired_eids.is_empty() {
-        let mut registries = live_pois().lock().unwrap();
+        let mut registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
         for eid in retired_eids {
             let Some(mut villager) = villagers.remove(&eid) else {
                 continue;
@@ -1819,7 +1819,7 @@ fn live_villager_tick(tick: u64) {
             live_villager_bind_pois(dim, position, villager);
         }
         {
-            let registries = live_pois().lock().unwrap();
+            let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
             let empty = PoiRegistry::default();
             let pois = registries.get(&dim).unwrap_or(&empty);
             villager.tick(pois, position, world_time);
@@ -1846,7 +1846,7 @@ fn live_effect_id(name: &str) -> Option<i32> {
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_grant_effect(client: &Client, id: i32, amp: i32, left: i32) {
     {
-        let mut effs = client.effs.lock().unwrap();
+        let mut effs = client.effs.lock().unwrap_or_else(|e| e.into_inner());
         if effs
             .iter()
             .any(|eff| eff.id == id && eff.left >= left && eff.amp >= amp)
@@ -1865,7 +1865,7 @@ fn live_grant_effect(client: &Client, id: i32, amp: i32, left: i32) {
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_remove_effect(client: &Client, id: i32) {
-    client.effs.lock().unwrap().retain(|eff| eff.id != id);
+    client.effs.lock().unwrap_or_else(|e| e.into_inner()).retain(|eff| eff.id != id);
     let packet = remove_effect_pkt(client.eid, id);
     if let Ok(mut sock) = client.sock.lock() {
         let _ = send_packet(&mut sock, 0x43, packet.clone());
@@ -1885,7 +1885,7 @@ fn live_raid_omen_tick() {
     let bad_omen = live_effect_id("bad_omen");
     let raid_omen = live_effect_id("raid_omen");
     let difficulty = raid_difficulty();
-    let mut omens = live_raid_omens().lock().unwrap();
+    let mut omens = live_raid_omens().lock().unwrap_or_else(|e| e.into_inner());
     for client in clients.iter().filter(|client| !client.is_spectator()) {
         let (dim, x, y, z, ..) = client_dim_pos(client);
         let position = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
@@ -1895,7 +1895,7 @@ fn live_raid_omen_tick() {
             }
             let mut omen = Some(*omen);
             let raid = {
-                let registries = live_pois().lock().unwrap();
+                let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
                 registries.get(&dim).and_then(|pois| {
                     Raid::try_start(pois, position, client.uuid, &mut omen, difficulty)
                 })
@@ -1906,12 +1906,12 @@ fn live_raid_omen_tick() {
             }
             if let Some(raid) = raid {
                 live_raid_bossbar_write(dim, raid.center, None, 0, &clients);
-                saved_raids().lock().unwrap().push((dim, raid));
+                saved_raids().lock().unwrap_or_else(|e| e.into_inner()).push((dim, raid));
             }
             continue;
         }
         let amplifier = {
-            let effs = client.effs.lock().unwrap();
+            let effs = client.effs.lock().unwrap_or_else(|e| e.into_inner());
             effs.iter()
                 .find(|eff| Some(eff.id) == bad_omen)
                 .map(|eff| eff.amp)
@@ -1920,7 +1920,7 @@ fn live_raid_omen_tick() {
             continue;
         };
         let in_village = {
-            let registries = live_pois().lock().unwrap();
+            let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
             registries.get(&dim).is_some_and(|pois| {
                 pois.claimed_near(position)
                     .any(|(_, kind)| matches!(kind, PoiKind::Bed | PoiKind::Bell))
@@ -1996,7 +1996,7 @@ fn live_raid_bossbar_write(
     let id = live_raid_bar_id(dim, center);
     let audience = live_raid_audience(clients, dim, center);
     if action == 1 {
-        let bar = bossbars().lock().unwrap().remove(&id);
+        let bar = bossbars().lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         let pkt = bossbar_pkt(&id, 1, bar.as_ref());
         for client in audience {
             if let Ok(mut sock) = client.sock.lock() {
@@ -2007,13 +2007,13 @@ fn live_raid_bossbar_write(
     }
     let total = live_raid_wave_totals()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&(dim, center))
         .copied()
         .unwrap_or(1)
         .max(1);
     let remaining = raid.map_or(0, |raid| raid.remaining.len() as i32);
-    let mut bars = bossbars().lock().unwrap();
+    let mut bars = bossbars().lock().unwrap_or_else(|e| e.into_inner());
     let bar = bars.entry(id.clone()).or_insert_with(|| Bossbar {
         name: "Raid".into(),
         color: 1,
@@ -2079,7 +2079,7 @@ fn live_raid_spawn_wave(dim: DimId, raid: &Raid, wave: RaidWave) {
         };
         let yaw = world_rng::next_below(360) as f32;
         let spawned = with_save_guard(|| {
-            let mut current = mobs().lock().unwrap();
+            let mut current = mobs().lock().unwrap_or_else(|e| e.into_inner());
             if current.len() >= MOB_CAP {
                 return None;
             }
@@ -2096,13 +2096,13 @@ fn live_raid_spawn_wave(dim: DimId, raid: &Raid, wave: RaidWave) {
         if let Some(mob) = spawned {
             live_raid_mobs()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(mob.eid, (dim, raid.center, raider_id));
         }
     }
     live_raid_wave_totals()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert((dim, raid.center), total as i32);
 }
 
@@ -2133,14 +2133,14 @@ fn living_villagers_near(dim: DimId, center: BlockPos) -> usize {
     let villager_etype = name_to_etype("villager");
     mobs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|mob| {
             mob.dim == dim
                 && Some(mob.etype) == villager_etype
-                && *mob.hp.lock().unwrap() > 0.0
+                && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
                 && {
-                    let (x, y, z, ..) = *mob.pos.lock().unwrap();
+                    let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
                     villager_within(
                         (x.floor() as i32, y.floor() as i32, z.floor() as i32),
                         center,
@@ -2157,23 +2157,23 @@ fn living_villagers_near(dim: DimId, center: BlockPos) -> usize {
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_step() {
     let clients = client_snapshot();
-    let mut raids = saved_raids().lock().unwrap();
+    let mut raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
     if raids.is_empty() {
-        live_raid_mobs().lock().unwrap().clear();
+        live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
         return;
     }
     // A tracked raider that died (or left the live list) counts as defeated;
     // the closest player inside 64 blocks is recorded as the killer.
     let mut defeated = Vec::new();
     {
-        let tracked = live_raid_mobs().lock().unwrap();
-        let mob_list = mobs().lock().unwrap();
+        let tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
         for (&eid, &(dim, center, raider)) in tracked.iter() {
             let mob = mob_list.iter().find(|mob| mob.eid == eid);
-            let dead = mob.is_none_or(|mob| *mob.hp.lock().unwrap() <= 0.0);
+            let dead = mob.is_none_or(|mob| *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0);
             if dead {
                 let killer = mob.and_then(|mob| {
-                    let (x, y, z, ..) = *mob.pos.lock().unwrap();
+                    let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
                     live_raid_nearest_player(&clients, dim, (x, y, z))
                 });
                 defeated.push((eid, dim, center, raider, killer));
@@ -2181,7 +2181,7 @@ fn live_raid_step() {
         }
     }
     if !defeated.is_empty() {
-        let mut tracked = live_raid_mobs().lock().unwrap();
+        let mut tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
         for (eid, dim, center, raider, killer) in defeated {
             tracked.remove(&eid);
             if let Some((_, raid)) = raids
@@ -2195,7 +2195,7 @@ fn live_raid_step() {
     for (dim, raid) in raids.iter_mut() {
         let living = living_villagers_near(*dim, raid.center);
         let event = {
-            let registries = live_pois().lock().unwrap();
+            let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
             let empty = PoiRegistry::default();
             let pois = registries.get(dim).unwrap_or(&empty);
             raid.tick(pois, living)
@@ -2229,8 +2229,8 @@ fn live_raid_step() {
         .map(|(dim, raid)| (*dim, raid.center))
         .collect();
     if !ended.is_empty() {
-        let mut tracked = live_raid_mobs().lock().unwrap();
-        let mut totals = live_raid_wave_totals().lock().unwrap();
+        let mut tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let mut totals = live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner());
         for (dim, center) in &ended {
             tracked.retain(|_, (d, c, _)| !(*d == *dim && *c == *center));
             totals.remove(&(*dim, *center));
@@ -2300,7 +2300,7 @@ fn special_spawn_state() -> &'static Mutex<SpecialSpawnState> {
 fn live_spawn_named(dim: DimId, name: &str, pos: (f64, f64, f64, f32, f32)) -> Option<Arc<Mob>> {
     let spec = entity_spec_by_name(name)?;
     with_save_guard(|| {
-        let mut current = mobs().lock().unwrap();
+        let mut current = mobs().lock().unwrap_or_else(|e| e.into_inner());
         if current.len() >= MOB_CAP {
             return None;
         }
@@ -2424,17 +2424,17 @@ fn can_summon_shrieker_near(dim: DimId, bx: i32, by: i32, bz: i32) -> bool {
 fn live_special_spawn_tick(clients: &[Arc<Client>]) {
     let now = TICK.load(Ordering::Relaxed);
     let world_time = WORLD_TIME.load(Ordering::Relaxed);
-    let mut state = special_spawn_state().lock().unwrap();
+    let mut state = special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
     let overworld_players: Vec<(VillageUuid, (f64, f64, f64), bool)> = clients
         .iter()
         .filter(|client| !client.is_spectator())
-        .filter(|client| *client.dim.lock().unwrap() == DimId::Overworld)
+        .filter(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == DimId::Overworld)
         .map(|client| {
-            let (x, y, z, ..) = *client.pos.lock().unwrap();
+            let (x, y, z, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
             (
                 client.uuid,
                 (x, y, z),
-                client.sleeping.lock().unwrap().is_some(),
+                client.sleeping.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
             )
         })
         .collect();
@@ -3900,7 +3900,7 @@ mod villager_raid_tests {
             villager.offers.clone(),
         );
         let claim_holds = {
-            let registries = live_pois().lock().unwrap();
+            let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
             registries.get(&DimId::Overworld).is_some_and(|pois| {
                 pois.has_claim(
                     lectern,
@@ -3950,14 +3950,14 @@ mod villager_raid_tests {
     impl LiveRaidFixture {
         fn new() -> Self {
             Self {
-                clients: std::mem::take(&mut *clients().lock().unwrap()),
-                mob_list: std::mem::take(&mut *mobs().lock().unwrap()),
-                raids: std::mem::take(&mut *saved_raids().lock().unwrap()),
-                villagers: std::mem::take(&mut *live_villagers().lock().unwrap()),
-                pois: std::mem::take(&mut *live_pois().lock().unwrap()),
-                omens: std::mem::take(&mut *live_raid_omens().lock().unwrap()),
-                raiders: std::mem::take(&mut *live_raid_mobs().lock().unwrap()),
-                totals: std::mem::take(&mut *live_raid_wave_totals().lock().unwrap()),
+                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                mob_list: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
+                raids: std::mem::take(&mut *saved_raids().lock().unwrap_or_else(|e| e.into_inner())),
+                villagers: std::mem::take(&mut *live_villagers().lock().unwrap_or_else(|e| e.into_inner())),
+                pois: std::mem::take(&mut *live_pois().lock().unwrap_or_else(|e| e.into_inner())),
+                omens: std::mem::take(&mut *live_raid_omens().lock().unwrap_or_else(|e| e.into_inner())),
+                raiders: std::mem::take(&mut *live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner())),
+                totals: std::mem::take(&mut *live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner())),
                 cells: Vec::new(),
                 mob_spawning: GR_MOB_SPAWNING.swap(1, Ordering::Relaxed),
                 difficulty: DIFFICULTY.swap(1, Ordering::Relaxed),
@@ -3976,14 +3976,14 @@ mod villager_raid_tests {
             GR_MOB_SPAWNING.store(self.mob_spawning, Ordering::Relaxed);
             DIFFICULTY.store(self.difficulty, Ordering::Relaxed);
             TICK.store(self.tick, Ordering::Relaxed);
-            *clients().lock().unwrap() = std::mem::take(&mut self.clients);
-            *mobs().lock().unwrap() = std::mem::take(&mut self.mob_list);
-            *saved_raids().lock().unwrap() = std::mem::take(&mut self.raids);
-            *live_villagers().lock().unwrap() = std::mem::take(&mut self.villagers);
-            *live_pois().lock().unwrap() = std::mem::take(&mut self.pois);
-            *live_raid_omens().lock().unwrap() = std::mem::take(&mut self.omens);
-            *live_raid_mobs().lock().unwrap() = std::mem::take(&mut self.raiders);
-            *live_raid_wave_totals().lock().unwrap() = std::mem::take(&mut self.totals);
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
+            *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mob_list);
+            *saved_raids().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.raids);
+            *live_villagers().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.villagers);
+            *live_pois().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.pois);
+            *live_raid_omens().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.omens);
+            *live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.raiders);
+            *live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.totals);
         }
     }
 
@@ -4015,17 +4015,17 @@ mod villager_raid_tests {
             None,
         );
         {
-            let mut registries = live_pois().lock().unwrap();
+            let mut registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
             let pois = registries.entry(DimId::Overworld).or_default();
             pois.register(bed, PoiKind::Bed);
             pois.register(bell, PoiKind::Bell);
             assert!(pois.claim(bed, villager_mob.uuid));
             assert!(pois.claim(bell, villager_mob.uuid));
         }
-        mobs().lock().unwrap().push(Arc::clone(&villager_mob));
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&villager_mob));
         // The omen carrier stands inside the village with Bad Omen.
         let (client, _receiver) = effect_tests::client_pair();
-        *client.pos.lock().unwrap() = (
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
             village.0 as f64 + 0.5,
             village.1 as f64,
             village.2 as f64 + 0.5,
@@ -4033,13 +4033,13 @@ mod villager_raid_tests {
             0.0,
             true,
         );
-        client.effs.lock().unwrap().push(Eff {
+        client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
             id: bad_omen,
             amp: 0,
             left: server_ticks(u64::from(BAD_OMEN_TICKS)) as i32,
         });
         let client = Arc::new(client);
-        clients().lock().unwrap().push(Arc::clone(&client));
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&client));
 
         // Bad Omen converts to a raid omen on the first tick, then counts
         // down the vanilla 600 ticks before `Raid::try_start` takes over.
@@ -4050,24 +4050,24 @@ mod villager_raid_tests {
             client
                 .effs
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .all(|eff| eff.id != bad_omen),
             "bad omen should have converted on village entry"
         );
-        let raids_now = saved_raids().lock().unwrap().len();
+        let raids_now = saved_raids().lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(raids_now, 1, "a raid should start inside the village");
         // Wave one spawns after the vanilla 300-tick countdown.
         for _ in 0..=u64::from(RAID_WAVE_COUNTDOWN) {
             villager_raid_tick();
         }
-        let first_wave: Vec<i32> = live_raid_mobs().lock().unwrap().keys().copied().collect();
+        let first_wave: Vec<i32> = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
         assert!(
             !first_wave.is_empty(),
             "the first raid wave should spawn live raider mobs"
         );
         {
-            let mob_list = mobs().lock().unwrap();
+            let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
             let pillager = name_to_etype("pillager").unwrap();
             for &eid in &first_wave {
                 let mob = mob_list
@@ -4081,17 +4081,17 @@ mod villager_raid_tests {
         // Killing every raider counts as defeats; the next countdown then
         // advances the raid to wave two.
         {
-            let mob_list = mobs().lock().unwrap();
+            let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
             for &eid in &first_wave {
                 let mob = mob_list.iter().find(|mob| mob.eid == eid).unwrap();
-                *mob.hp.lock().unwrap() = 0.0;
+                *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
             }
         }
         for _ in 0..=(u64::from(RAID_WAVE_COUNTDOWN) + 30) {
             villager_raid_tick();
         }
         {
-            let raids = saved_raids().lock().unwrap();
+            let raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
             let (_, raid) = raids.first().expect("the raid should still be active");
             assert_eq!(
                 raid.waves_spawned, 2,
@@ -4099,7 +4099,7 @@ mod villager_raid_tests {
             );
             assert_eq!(raid.state, RaidState::InProgress);
         }
-        let second_wave: Vec<i32> = live_raid_mobs().lock().unwrap().keys().copied().collect();
+        let second_wave: Vec<i32> = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
         assert!(
             !second_wave.is_empty() && second_wave.iter().all(|eid| !first_wave.contains(eid)),
             "wave two should spawn a fresh set of live raider mobs"
@@ -4137,7 +4137,7 @@ mod p2_parity_village_tests {
     struct StoredRules(Vec<(&'static str, i32)>);
     impl StoredRules {
         fn take(names: &[&'static str]) -> Self {
-            let map = command_gamerules().lock().unwrap();
+            let map = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             StoredRules(
                 names
                     .iter()
@@ -4146,12 +4146,12 @@ mod p2_parity_village_tests {
             )
         }
         fn set(&self, name: &'static str, value: i32) {
-            command_gamerules().lock().unwrap().insert(name, value);
+            command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).insert(name, value);
         }
     }
     impl std::ops::Drop for StoredRules {
         fn drop(&mut self) {
-            let mut map = command_gamerules().lock().unwrap();
+            let mut map = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             for (name, value) in self.0.drain(..) {
                 map.insert(name, value);
             }
@@ -4237,12 +4237,12 @@ mod p2_parity_village_tests {
             return;
         };
         let _stored = StoredRules::take(&["doInsomnia"]);
-        let old_clients = std::mem::take(&mut *clients().lock().unwrap());
-        let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
+        let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
+        let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
         let old_time = WORLD_TIME.swap(15_000, Ordering::Relaxed);
         let old_tick = TICK.swap(500_000, Ordering::Relaxed);
         let old_spawn = {
-            let mut state = special_spawn_state().lock().unwrap();
+            let mut state = special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
             std::mem::replace(
                 &mut *state,
                 SpecialSpawnState::default(),
@@ -4257,43 +4257,43 @@ mod p2_parity_village_tests {
         );
         impl std::ops::Drop for Restore {
             fn drop(&mut self) {
-                *clients().lock().unwrap() = std::mem::take(&mut self.0);
-                *mobs().lock().unwrap() = std::mem::take(&mut self.1);
+                *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.0);
+                *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.1);
                 WORLD_TIME.store(self.2, Ordering::Relaxed);
                 TICK.store(self.3, Ordering::Relaxed);
-                *special_spawn_state().lock().unwrap() =
+                *special_spawn_state().lock().unwrap_or_else(|e| e.into_inner()) =
                     std::mem::replace(&mut self.4, Default::default());
             }
         }
         let _restore = Restore(old_clients, old_mobs, old_time, old_tick, old_spawn);
 
         let (client, _receiver) = effect_tests::client_pair();
-        *client.pos.lock().unwrap() = (0.5, 150.0, 0.5, 0.0, 0.0, true);
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 150.0, 0.5, 0.0, 0.0, true);
         let uuid = client.uuid;
         let client = Arc::new(client);
-        clients().lock().unwrap().push(Arc::clone(&client));
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&client));
         {
-            let mut state = special_spawn_state().lock().unwrap();
+            let mut state = special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
             state.time_since_rest.insert(uuid, 100_000);
             // Sweep now, then force the next sweep through the tick call.
             state.insomnia_next = 500_000;
         }
 
         // doInsomnia=false: the sweep runs but no phantom spawns.
-        command_gamerules().lock().unwrap().insert("doInsomnia", 0);
+        command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).insert("doInsomnia", 0);
         live_special_spawn_tick(&[Arc::clone(&client)]);
         assert!(
-            mobs().lock().unwrap().iter().all(|mob| mob.etype != phantom),
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().all(|mob| mob.etype != phantom),
             "doInsomnia=false must block phantom spawns"
         );
 
         // doInsomnia=true: the same state spawns phantoms for the sleepless.
         // The first sweep rescheduled `insomnia_next`, so force it due again.
-        command_gamerules().lock().unwrap().insert("doInsomnia", 1);
-        special_spawn_state().lock().unwrap().insomnia_next = 500_000;
+        command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).insert("doInsomnia", 1);
+        special_spawn_state().lock().unwrap_or_else(|e| e.into_inner()).insomnia_next = 500_000;
         live_special_spawn_tick(&[Arc::clone(&client)]);
         assert!(
-            mobs().lock().unwrap().iter().any(|mob| mob.etype == phantom),
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| mob.etype == phantom),
             "doInsomnia=true must spawn phantoms for a 100k-tick insomniac"
         );
     }

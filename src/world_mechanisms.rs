@@ -2471,7 +2471,7 @@ fn eval_grass_spread(input: GrassSpreadInput) -> GrassSpreadResult {
 #[cfg_attr(not(test), allow(dead_code))]
 fn gamerule_live_value(name: &str) -> i32 {
     gamerule_atomic_value(name)
-        .or_else(|| command_gamerules().lock().unwrap().get(name).copied())
+        .or_else(|| command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).get(name).copied())
         .unwrap_or(0)
 }
 
@@ -5437,8 +5437,8 @@ mod p1a_random_tick_and_gamerule_tests {
         let farmland = moist_farmland(reg);
         cells.set(0, 149, 0, farmland);
         cells.set(0, 150, 0, reg.state_of("minecraft:wheat", None));
-        let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
-        forceloaded().lock().unwrap().insert((0, 0));
+        let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
+        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
         for _ in 0..3 {
             random_tick_pass();
         }
@@ -5460,7 +5460,7 @@ mod p1a_random_tick_and_gamerule_tests {
                 break;
             }
         }
-        *forceloaded().lock().unwrap() = old_forced;
+        *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
         assert!(grew, "a non-zero randomTickSpeed must reach the wheat");
 
         // doFireTick false: production on_random_tick leaves fire alone.
@@ -5486,21 +5486,21 @@ mod p1a_random_tick_and_gamerule_tests {
             cells.set(48, ground + dy, 0, 0);
         }
         let safe = new_mob(9601, 22, 48.5, ground as f64 + 12.0, 0.5, 20.0, 300);
-        let mut pos = *safe.pos.lock().unwrap();
+        let mut pos = *safe.pos.lock().unwrap_or_else(|e| e.into_inner());
         mob_snap_y(&safe, &mut pos);
         assert_eq!(
-            *safe.hp.lock().unwrap(),
+            *safe.hp.lock().unwrap_or_else(|e| e.into_inner()),
             20.0,
             "fallDamage=false suppresses mob fall damage"
         );
         gamerule(&mut sink, "fallDamage true");
         let hurt = new_mob(9602, 22, 48.5, ground as f64 + 12.0, 0.5, 20.0, 300);
-        let mut pos = *hurt.pos.lock().unwrap();
+        let mut pos = *hurt.pos.lock().unwrap_or_else(|e| e.into_inner());
         mob_snap_y(&hurt, &mut pos);
         assert!(
-            *hurt.hp.lock().unwrap() < 20.0,
+            *hurt.hp.lock().unwrap_or_else(|e| e.into_inner()) < 20.0,
             "fallDamage=true must let the same fall hurt: {}",
-            *hurt.hp.lock().unwrap()
+            *hurt.hp.lock().unwrap_or_else(|e| e.into_inner())
         );
 
         // fireDamage + drowningDamage: the live mob tick's environmental arms
@@ -5571,11 +5571,11 @@ mod p1a_random_tick_and_gamerule_tests {
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
         });
-        let old_clients = std::mem::take(&mut *clients().lock().unwrap());
-        let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
+        let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
+        let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
         let old_tick = TICK.load(Ordering::Relaxed);
         let old_world_time = WORLD_TIME.load(Ordering::Relaxed);
-        clients().lock().unwrap().push(dummy_client);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(dummy_client);
         TICK.store(server_ticks(20), Ordering::Relaxed);
         WORLD_TIME.store(6000, Ordering::Relaxed);
 
@@ -5589,12 +5589,12 @@ mod p1a_random_tick_and_gamerule_tests {
                 10.0,
                 server_ticks(AIR_SUPPLY_GT) as i32,
             );
-            mobs().lock().unwrap().push(mob.clone());
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
             mob
         };
         let submerged_chicken = |eid: i32| {
             let mob = new_mob(eid, 19, 0.5, 60.0, 0.5, 4.0, 0);
-            mobs().lock().unwrap().push(mob.clone());
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
             mob
         };
         cells.set(-3, 60, -3, 102); // flowing lava under the pig
@@ -5607,34 +5607,34 @@ mod p1a_random_tick_and_gamerule_tests {
         refresh_hot();
         mob_tick();
         assert_eq!(
-            *pig.hp.lock().unwrap(),
+            *pig.hp.lock().unwrap_or_else(|e| e.into_inner()),
             10.0,
             "fireDamage=false suppresses lava damage"
         );
         assert_eq!(
-            *chicken.hp.lock().unwrap(),
+            *chicken.hp.lock().unwrap_or_else(|e| e.into_inner()),
             4.0,
             "drowningDamage=false suppresses drowning"
         );
-        mobs().lock().unwrap().clear();
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
         gamerule(&mut sink, "fireDamage true");
         gamerule(&mut sink, "drowningDamage true");
         let pig = pig_in_lava(9612);
         let chicken = submerged_chicken(9613);
         mob_tick();
         assert!(
-            *pig.hp.lock().unwrap() < 10.0,
+            *pig.hp.lock().unwrap_or_else(|e| e.into_inner()) < 10.0,
             "fireDamage=true must let lava hurt: {}",
-            *pig.hp.lock().unwrap()
+            *pig.hp.lock().unwrap_or_else(|e| e.into_inner())
         );
         assert!(
-            *chicken.hp.lock().unwrap() < 4.0,
+            *chicken.hp.lock().unwrap_or_else(|e| e.into_inner()) < 4.0,
             "drowningDamage=true must let drowning hurt: {}",
-            *chicken.hp.lock().unwrap()
+            *chicken.hp.lock().unwrap_or_else(|e| e.into_inner())
         );
-        mobs().lock().unwrap().clear();
-        *clients().lock().unwrap() = old_clients;
-        *mobs().lock().unwrap() = old_mobs;
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) = old_clients;
+        *mobs().lock().unwrap_or_else(|e| e.into_inner()) = old_mobs;
         TICK.store(old_tick, Ordering::Relaxed);
         WORLD_TIME.store(old_world_time, Ordering::Relaxed);
 
@@ -5757,7 +5757,7 @@ mod p1a_random_tick_and_gamerule_tests {
         ];
         for (name, value) in &changed {
             gamerule_atomic_store(name, *value);
-            command_gamerules().lock().unwrap().insert(name, *value);
+            command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).insert(name, *value);
         }
         let mut saved = Vec::new();
         save_world_into(&mut saved);
@@ -5830,7 +5830,7 @@ mod p2_parity_world_tests {
     struct StoredRules(Vec<(&'static str, i32)>);
     impl StoredRules {
         fn take(names: &[&'static str]) -> Self {
-            let map = command_gamerules().lock().unwrap();
+            let map = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             StoredRules(
                 names
                     .iter()
@@ -5839,12 +5839,12 @@ mod p2_parity_world_tests {
             )
         }
         fn set(&self, name: &'static str, value: i32) {
-            command_gamerules().lock().unwrap().insert(name, value);
+            command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).insert(name, value);
         }
     }
     impl std::ops::Drop for StoredRules {
         fn drop(&mut self) {
-            let mut map = command_gamerules().lock().unwrap();
+            let mut map = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             for (name, value) in self.0.drain(..) {
                 map.insert(name, value);
             }
@@ -6285,13 +6285,13 @@ mod p2_parity_world_tests {
         let client = test_client("reward_tester", 9777, [7u8; 16]);
         let uuid = client.uuid;
         {
-            clients().lock().unwrap().push(client);
+            clients().lock().unwrap_or_else(|e| e.into_inner()).push(client);
         }
         struct RemoveClient(i32);
         impl std::ops::Drop for RemoveClient {
             fn drop(&mut self) {
-                clients().lock().unwrap().retain(|c| c.eid != self.0);
-                recipe_books().lock().unwrap().remove(&[7u8; 16]);
+                clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != self.0);
+                recipe_books().lock().unwrap_or_else(|e| e.into_inner()).remove(&[7u8; 16]);
             }
         }
         let _cleanup = RemoveClient(9777);
@@ -6300,14 +6300,14 @@ mod p2_parity_world_tests {
         let spec = advancement_reward_spec("minecraft:story/mine_stone")
             .expect("mine_stone carries recipe rewards");
         for id in spec.recipes {
-            recipe_ids().lock().unwrap().insert((*id).to_string());
+            recipe_ids().lock().unwrap_or_else(|e| e.into_inner()).insert((*id).to_string());
         }
 
         let mut tracker = AdvancementTracker::default();
         tracker.grant_only("reward_tester", "minecraft:story/mine_stone", 0);
         let book = recipe_books()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&uuid)
             .cloned()
             .unwrap_or_default();
@@ -6324,7 +6324,7 @@ mod p2_parity_world_tests {
         second.grant_only("reward_tester", "minecraft:story/mine_stone", 0);
         let before = recipe_books()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&uuid)
             .cloned()
             .unwrap_or_default()
@@ -6333,7 +6333,7 @@ mod p2_parity_world_tests {
         second.grant_only("reward_tester", "minecraft:story/mine_stone", 0);
         let after = recipe_books()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&uuid)
             .cloned()
             .unwrap_or_default()

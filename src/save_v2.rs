@@ -110,15 +110,15 @@ fn saved_value<T: Copy>(value: &Mutex<T>) -> T {
 impl PlayerSave {
     fn capture(client: &Client, position: DimPosRot, inventory: &HashMap<i16, Stack>) -> Self {
         let (xp_total, (xp_level, xp_progress)) = {
-            let total = client.xp.lock().unwrap();
-            let sessions = player_mechanism_sessions().lock().unwrap();
+            let total = client.xp.lock().unwrap_or_else(|e| e.into_inner());
+            let sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
             (
                 *total,
                 sessions.get(&client.eid).map_or((0, 0.0), |s| s.xp_bar),
             )
         };
         let respawn = {
-            let dim = client.spawn_dim.lock().unwrap();
+            let dim = client.spawn_dim.lock().unwrap_or_else(|e| e.into_inner());
             saved_value(&client.spawn_pt).map(|(x, y, z, angle)| {
                 let live = SpawnTarget {
                     kind: SpawnTargetKind::Legacy,
@@ -133,7 +133,7 @@ impl PlayerSave {
                 // flattening the kind back to Legacy.
                 saved_players()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(&client.uuid)
                     .and_then(|save| save.respawn)
                     .filter(|saved| {
@@ -146,14 +146,14 @@ impl PlayerSave {
         };
         let ender_chest = chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&ender_container_key(&client.uuid))
             .map(|slots| saved_slots(slots, 0..27))
             .unwrap_or_default();
         let effects = client
             .effs
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|effect| (effect.id, effect.amp, effect.left))
             .collect();
@@ -375,9 +375,9 @@ impl MobSave {
             saved_value(&mob.love),
             saved_value(&mob.air)
         );
-        out.push(u8::from(sitting_cats().lock().unwrap().contains(&mob.eid)));
-        Self::write_behavior(out, live_mob_states().lock().unwrap().get(&mob.eid), now);
-        let villagers = live_villagers().lock().unwrap();
+        out.push(u8::from(sitting_cats().lock().unwrap_or_else(|e| e.into_inner()).contains(&mob.eid)));
+        Self::write_behavior(out, live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).get(&mob.eid), now);
+        let villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
         let villager = villagers.get(&mob.eid);
         out.push(u8::from(villager.is_some()));
         if let Some(villager) = villager {
@@ -866,7 +866,7 @@ const LEGACY_ATOMIC_GAMERULES: &[&str] = &[
 ];
 
 fn restore_gamerules(saved: Option<&[i32]>) {
-    let mut rules = command_gamerules().lock().unwrap();
+    let mut rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
     rules.clear();
     rules.extend(COMMAND_GAMERULE_DEFAULTS.iter().map(|&(name, _, default)| (name, default)));
     for (index, &(name, _, _)) in COMMAND_GAMERULE_DEFAULTS.iter().enumerate() {
@@ -911,7 +911,7 @@ fn append_save_state(
     mobs: &[Arc<Mob>],
     mob_data: &[u8],
 ) {
-    let raids = saved_raids().lock().unwrap();
+    let raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
     let start = out.len();
     save_numbers!(out, spawn_pitch);
     let mut players: Vec<_> = players.iter().collect();
@@ -930,7 +930,7 @@ fn append_save_state(
     // SVX1 is inside SVP1, after the original records. Old SVP1 readers in
     // this version can still load older SVP1 bodies with no SVX1 suffix.
     out.extend_from_slice(SAVE_ENTITY_RULES_MAGIC);
-    let rules = command_gamerules().lock().unwrap();
+    let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
     write_varint(out, COMMAND_GAMERULE_DEFAULTS.len() as i64);
     for &(name, _, _) in COMMAND_GAMERULE_DEFAULTS.iter() {
         write_varint(out, name.len() as i64);
@@ -940,7 +940,7 @@ fn append_save_state(
     drop(rules);
     // EIDs change across loads, so persist custom mob attributes by MET4
     // ordinal and restore them against the newly assigned IDs.
-    let attributes = attrs().lock().unwrap();
+    let attributes = attrs().lock().unwrap_or_else(|e| e.into_inner());
     let mut mob_attrs = Vec::new();
     for (index, mob) in mobs.iter().enumerate() {
         for (selector_key, key) in [
@@ -1069,14 +1069,14 @@ fn rebuild_derived_indexes() {
     // freezes every machine vanilla would keep running.
     let owned = GENERATED_FLUID_OWNER
         .get()
-        .map(|owner| owner.lock().unwrap().owned.clone())
+        .map(|owner| owner.lock().unwrap_or_else(|e| e.into_inner()).owned.clone())
         .unwrap_or_default();
-    let w = world().lock().unwrap();
-    let mut wtr = waters().lock().unwrap();
-    let mut hh = hoppers().lock().unwrap();
-    let mut cg = crops().lock().unwrap();
-    let mut cells = plugin_cells().lock().unwrap();
-    let lamp_on = !plugins().lock().unwrap().is_empty();
+    let w = world().lock().unwrap_or_else(|e| e.into_inner());
+    let mut wtr = waters().lock().unwrap_or_else(|e| e.into_inner());
+    let mut hh = hoppers().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cg = crops().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cells = plugin_cells().lock().unwrap_or_else(|e| e.into_inner());
+    let lamp_on = !plugins().lock().unwrap_or_else(|e| e.into_inner()).is_empty();
     // The indexes below hold positions, not `(dimension, position)`, so they describe the
     // Overworld: `rebuild_derived_indexes` walks the Overworld's edits and leaves another
     // dimension's alone until the indexes name a dimension themselves (S3).
@@ -1091,18 +1091,18 @@ fn rebuild_derived_indexes() {
             if (80..=95).contains(st) {
                 wtr.insert((x, y, z));
                 if !owned.contains(&(x, y, z)) {
-                    water_queue().lock().unwrap().schedule((x, y, z), 1);
+                    water_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
                 }
             }
             if (96..=111).contains(st) {
-                lavas().lock().unwrap().insert((x, y, z));
+                lavas().lock().unwrap_or_else(|e| e.into_inner()).insert((x, y, z));
                 if !owned.contains(&(x, y, z)) {
-                    lava_queue().lock().unwrap().schedule((x, y, z), 1);
+                    lava_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
                 }
             }
             if (9225..=9234).contains(st) {
                 hh.insert((x, y, z));
-                hopper_queue().lock().unwrap().schedule((x, y, z), 1);
+                hopper_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
             }
             if (4278..=4285).contains(st) {
                 cg.insert((DimId::Overworld, x, y, z), (*st - 4278) as u8);
@@ -1169,7 +1169,7 @@ fn world_save_dir() -> std::path::PathBuf {
 /// file, and one reader for both, so "the Overworld's table" and "the same format for another
 /// dimension" cannot drift into two formats.
 fn save_dim_overlay_into(dim: DimId, f: &mut Vec<u8>) -> usize {
-    let w = world().lock().unwrap();
+    let w = world().lock().unwrap_or_else(|e| e.into_inner());
     let chunks: Vec<(&DimChunkKey, &HashMap<u32, u32>)> =
         w.iter().filter(|(key, _)| key.0 == dim).collect();
     let count = chunks.len();
@@ -1725,9 +1725,9 @@ fn save_world_into(f: &mut Vec<u8>) {
         g.take_staged_payloads(), g.payload_sources.clone(), g.mineshaft_spawners.clone()
     )).unwrap_or_default();
     materialize_generation_payloads_inner(pending);
-    let mut content = generated_content().lock().unwrap().clone();
+    let mut content = generated_content().lock().unwrap_or_else(|e| e.into_inner()).clone();
     {
-        let ch = chests().lock().unwrap();
+        let ch = chests().lock().unwrap_or_else(|e| e.into_inner());
         for cart in &mut content.carts {
             if !cart.has_loot_table() {
                 if let Ok(uuid) = cart.uuid() {
@@ -1746,12 +1746,12 @@ fn save_world_into(f: &mut Vec<u8>) {
         .into_iter()
         .map(|client| {
             let position = client_dim_pos(&client);
-            let inventory = client.inv.lock().unwrap().clone();
+            let inventory = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let state = PlayerSave::capture(&client, position, &inventory);
             (client.uuid, client.name.clone(), inventory, state)
         })
         .collect();
-    let mut players = saved_players().lock().unwrap().clone();
+    let mut players = saved_players().lock().unwrap_or_else(|e| e.into_inner()).clone();
     for (uuid, _, _, state) in &active_players {
         players.insert(*uuid, state.clone());
     }
@@ -1773,7 +1773,7 @@ fn save_world_into(f: &mut Vec<u8>) {
     // which can take `chests`, so taking them in the opposite order here would invert the locks.
     let mut dim2 = Dim2Entries::default();
     let mut dxt = DxtEntries::default();
-    for (pos, age) in crops().lock().unwrap().iter() {
+    for (pos, age) in crops().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         if pos.0 == DimId::Overworld {
             continue;
         }
@@ -1784,7 +1784,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
     }
     (*f).extend_from_slice(b"MET4");
-    let ms = mobs().lock().unwrap().clone();
+    let ms = mobs().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mob_dimensions = ms.iter().map(|mob| mob.dim).collect::<Vec<_>>();
     let mut mob_data = Vec::new();
     {
@@ -1798,7 +1798,7 @@ fn save_world_into(f: &mut Vec<u8>) {
             (*f).extend_from_slice(&z.to_be_bytes());
             (*f).extend_from_slice(
                 &{
-                    let h = m.hp.lock().unwrap();
+                    let h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
                     *h
                 }
                 .to_be_bytes(),
@@ -1808,7 +1808,7 @@ fn save_world_into(f: &mut Vec<u8>) {
     }
     (*f).extend_from_slice(&WORLD_TIME.load(Ordering::Relaxed).to_be_bytes());
     {
-        let mut all: HashMap<String, HashMap<i16, Stack>> = inv_store().lock().unwrap().clone();
+        let mut all: HashMap<String, HashMap<i16, Stack>> = inv_store().lock().unwrap_or_else(|e| e.into_inner()).clone();
         for (_, name, slots, _) in &active_players {
             all.insert(name.clone(), slots.clone());
         }
@@ -1829,7 +1829,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 }
             }
         }
-        let ch = chests().lock().unwrap();
+        let ch = chests().lock().unwrap_or_else(|e| e.into_inner());
         // The legacy chest table holds the Overworld's block containers only — including the
         // synthetic per-player Ender keys, which always live under the Overworld — in the exact
         // old `(x, y, z)` wire layout. Anything in another dimension goes to DIM2.
@@ -1856,7 +1856,7 @@ fn save_world_into(f: &mut Vec<u8>) {
             (*f).extend_from_slice(&z.to_be_bytes());
             write_stack_table(&mut *f, slots);
         }
-        let sg = signs().lock().unwrap();
+        let sg = signs().lock().unwrap_or_else(|e| e.into_inner());
         // The legacy signs section carries the Overworld's signs only, in the exact old wire
         // layout. Another dimension's sign goes to the footer, so its presence cannot shift a
         // single byte of an Overworld-only save.
@@ -1884,7 +1884,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
         // forceload tail — vanilla keeps forced chunks across restarts;
         // losing them would silently freeze fixture+machine regions.
-        let fl = forceloaded().lock().unwrap();
+        let fl = forceloaded().lock().unwrap_or_else(|e| e.into_inner());
         write_varint(&mut *f, fl.len() as i64);
         for &(cx, cz) in fl.iter() {
             (*f).extend_from_slice(&cx.to_be_bytes());
@@ -1893,7 +1893,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         // Players log back in where they left. The legacy six fields are
         // written for every player (so an Overworld-only save is byte-identical); the dimension of
         // a player who logged out elsewhere is corrected from the footer on load.
-        let mut allp: HashMap<String, DimPosRot> = pos_store().lock().unwrap().clone();
+        let mut allp: HashMap<String, DimPosRot> = pos_store().lock().unwrap_or_else(|e| e.into_inner()).clone();
         for (_, name, _, state) in &active_players {
             allp.insert(name.clone(), state.position);
         }
@@ -1922,14 +1922,14 @@ fn save_world_into(f: &mut Vec<u8>) {
         // the drop list had already been serialized.
         let tridents: Vec<(f64, f64, f64, i64, Comps)> = arrows()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|a| a.kind == 1 && a.ret_item > 0)
             .map(|a| (a.x, a.y, a.z, a.ret_item, a.ret_comps.clone()))
             .collect();
         let mut drop_ages: Vec<u32> = Vec::new();
         {
-            let ds = drops().lock().unwrap();
+            let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
             write_varint(&mut *f, (ds.len() + tridents.len()) as i64);
             for (idx, d) in ds.iter().enumerate() {
                 (*f).extend_from_slice(&d.eid.to_be_bytes());
@@ -1962,7 +1962,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         // Furnaces are block entities — contents and smelting state are durable in vanilla. The
         // legacy furnace table holds the Overworld's entries in the old wire layout; another
         // dimension's furnace goes to DIM2.
-        let fs = furnaces().lock().unwrap();
+        let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
         let ow_furnaces: Vec<_> = fs
             .iter()
             .filter_map(|(pos, fr)| match pos.0 {
@@ -1993,7 +1993,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         // sheared-mob indices (eids are re-issued on load — persist by
         // mob order, not eid)
         {
-            let sh = sheared().lock().unwrap();
+            let sh = sheared().lock().unwrap_or_else(|e| e.into_inner());
             let idx: Vec<i64> = ms
                 .iter()
                 .enumerate()
@@ -2007,7 +2007,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
         // Keep the legacy scoreboard layout. Both pieces describe one snapshot.
         let (scoreboard_objectives, scoreboard_sidebar) = {
-            let board = scoreboard().lock().unwrap();
+            let board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
             write_varint(&mut *f, board.objectives.len() as i64);
             for obj in board.objectives.keys() {
                 (*f).extend_from_slice(&(obj.len() as u16).to_be_bytes());
@@ -2027,7 +2027,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         };
         // XP orbs are world entities too — same persistence class as drops
         {
-            let xs = xps().lock().unwrap();
+            let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
             write_varint(&mut *f, xs.len() as i64);
             for x in xs.iter() {
                 (*f).extend_from_slice(&x.eid.to_be_bytes());
@@ -2045,7 +2045,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         // projectiles + primed tnt are world entities in vanilla —
         // they survive restart mid-flight
         {
-            let ar = arrows().lock().unwrap();
+            let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
             // ARW2: stuck flag persists so saved arrows resume embedded
             (*f).extend_from_slice(b"ARW2");
             // Tridents travel in the drop list above, so they are excluded here
@@ -2067,7 +2067,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 (*f).extend_from_slice(&a.ttl.to_be_bytes());
                 (*f).push(a.stuck as u8);
             }
-            let bo = bobbers().lock().unwrap();
+            let bo = bobbers().lock().unwrap_or_else(|e| e.into_inner());
             write_varint(&mut *f, bo.len() as i64);
             for a in bo.iter() {
                 (*f).extend_from_slice(&a.eid.to_be_bytes());
@@ -2081,7 +2081,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 (*f).extend_from_slice(&a.age.to_be_bytes());
                 (*f).push(a.bit as u8);
             }
-            let pe = pearls().lock().unwrap();
+            let pe = pearls().lock().unwrap_or_else(|e| e.into_inner());
             write_varint(&mut *f, pe.len() as i64);
             for a in pe.iter() {
                 (*f).extend_from_slice(&a.eid.to_be_bytes());
@@ -2094,7 +2094,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 (*f).extend_from_slice(&a.dz.to_be_bytes());
                 (*f).extend_from_slice(&a.ttl.to_be_bytes());
             }
-            let pr = primed().lock().unwrap();
+            let pr = primed().lock().unwrap_or_else(|e| e.into_inner());
             write_varint(&mut *f, pr.len() as i64);
             for a in pr.iter() {
                 (*f).extend_from_slice(&a.eid.to_be_bytes());
@@ -2125,7 +2125,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         (*f).push(DIFFICULTY.load(Ordering::Relaxed));
         // entity tags: players by name, mobs by ordinal (eids re-issue)
         {
-            let tm = tags().lock().unwrap();
+            let tm = tags().lock().unwrap_or_else(|e| e.into_inner());
             let players: Vec<(&String, &HashSet<String>)> =
                 tm.iter().filter(|(k, _)| k.starts_with("p:")).collect();
             write_varint(&mut *f, players.len() as i64);
@@ -2158,7 +2158,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         // persisted — re-anchor on load)
         {
             let t_now = TICK.load(Ordering::Relaxed);
-            let sf = sched_fns().lock().unwrap();
+            let sf = sched_fns().lock().unwrap_or_else(|e| e.into_inner());
             let n_sched = sf.len();
             write_varint(&mut *f, n_sched as i64);
             for (f2, due) in sf.iter() {
@@ -2166,7 +2166,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 (*f).extend_from_slice(f2.as_bytes());
                 (*f).extend_from_slice(&(due.saturating_sub(t_now)).to_be_bytes());
             }
-            let ag = adv_done().lock().unwrap();
+            let ag = adv_done().lock().unwrap_or_else(|e| e.into_inner());
             write_varint(&mut *f, ag.len() as i64);
             for (pn, ids) in ag.iter() {
                 (*f).extend_from_slice(&(pn.len() as u16).to_be_bytes());
@@ -2178,7 +2178,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 }
             }
             // player attributes (p: keys) — e: keys are transient by design
-            let at = attrs().lock().unwrap();
+            let at = attrs().lock().unwrap_or_else(|e| e.into_inner());
             let pa: Vec<(&String, &HashMap<String, f64>)> =
                 at.iter().filter(|(k, _)| k.starts_with("p:")).collect();
             write_varint(&mut *f, pa.len() as i64);
@@ -2209,7 +2209,7 @@ fn save_world_into(f: &mut Vec<u8>) {
 
     // FAL2: falling-block entities (id, position, velocity, block state, age). FAL1 stored a
     // cell the old cell-moving model held; a save carrying it is converted on load.
-    let mut in_flight = falling().lock().unwrap().clone();
+    let mut in_flight = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();
     in_flight.sort_by(|a, b| {
         (a.x.to_bits(), a.y.to_bits(), a.z.to_bits(), a.eid).cmp(&(
             b.x.to_bits(),
@@ -2243,7 +2243,7 @@ fn save_world_into(f: &mut Vec<u8>) {
     // monotonic clock's origin is never persisted across process restarts.
     {
         let now_ms = border_now_ms();
-        let border = *world_border().lock().unwrap();
+        let border = *world_border().lock().unwrap_or_else(|e| e.into_inner());
         (*f).extend_from_slice(b"BRD1");
         (*f).extend_from_slice(&border.center_x.to_be_bytes());
         (*f).extend_from_slice(&border.center_z.to_be_bytes());
@@ -2272,11 +2272,11 @@ fn save_world_into(f: &mut Vec<u8>) {
         )
     })
     .unwrap_or_default();
-    let blocks = block_ticks().lock().unwrap().clone();
+    let blocks = block_ticks().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (fluid_order, fluids, owned) = GENERATED_FLUID_OWNER
         .get()
         .map(|owner| {
-            let owner = owner.lock().unwrap();
+            let owner = owner.lock().unwrap_or_else(|e| e.into_inner());
             (owner.next_order, owner.queue.clone(), owner.owned.clone())
         })
         .unwrap_or_else(|| (0, scheduled_ticks::ScheduledTicks::new(), HashSet::new()));
@@ -2296,7 +2296,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         append_drop_owners_footer(f, &drop_owners);
     }
     let mut block_loot: Vec<(BlockPos, PendingBlockLoot)> = Vec::new();
-    for (&(dim, x, y, z), entry) in pending_block_loot().lock().unwrap().iter() {
+    for (&(dim, x, y, z), entry) in pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         if dim == DimId::Overworld {
             block_loot.push(((x, y, z), entry.clone()));
         } else if dim.is_vanilla() {
@@ -2346,7 +2346,7 @@ fn save_world_into(f: &mut Vec<u8>) {
             dxt.mob_dims.push((ordinal as u32, dim_key(*dim)));
         }
     }
-    for (ordinal, (dim, _)) in saved_raids().lock().unwrap().iter().enumerate() {
+    for (ordinal, (dim, _)) in saved_raids().lock().unwrap_or_else(|e| e.into_inner()).iter().enumerate() {
         if !dim.is_vanilla() {
             dxt.raid_dims.push((ordinal as u32, dim_key(*dim)));
         }
@@ -2366,7 +2366,7 @@ fn save_world_into(f: &mut Vec<u8>) {
     }
     append_world_seed_footer(f, WORLD_SEED.load(Ordering::Relaxed));
     // Keep full UUID records for players who go offline before the next save.
-    *saved_players().lock().unwrap() = players;
+    *saved_players().lock().unwrap_or_else(|e| e.into_inner()) = players;
 }
 
 // ---------- save version header ----------
@@ -2498,7 +2498,7 @@ static LOADED_SAVE_VERSION: Mutex<Option<SaveVersionHeader>> = Mutex::new(None);
 
 #[allow(dead_code)]
 fn loaded_save_version_header() -> Option<SaveVersionHeader> {
-    LOADED_SAVE_VERSION.lock().unwrap().clone()
+    LOADED_SAVE_VERSION.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// `[schema u8][varint name len][name utf8][data_version i32][protocol i32]`,
@@ -2601,7 +2601,7 @@ const WORLD_BORDER_SAVE_DEFAULT: WorldBorderSave = WorldBorderSave {
 /// the vanilla default: the `new_size` target is the diameter that survives a
 /// load, while BRD1 keeps the live interpolation.
 fn save_world_border_record() -> Option<WorldBorderSave> {
-    let border = *world_border().lock().unwrap();
+    let border = *world_border().lock().unwrap_or_else(|e| e.into_inner());
     let record = WorldBorderSave {
         center_x: border.center_x,
         center_z: border.center_z,
@@ -2667,7 +2667,7 @@ fn read_world_border_footer(payload: &[u8]) -> Result<Option<WorldBorderSave>, &
 /// target, so a saved lerp completes on load while BRD1 keeps any still-live
 /// transition in saves that carry both records.
 fn apply_saved_world_border(border: &WorldBorderSave) {
-    *world_border().lock().unwrap() = WorldBorderState {
+    *world_border().lock().unwrap_or_else(|e| e.into_inner()) = WorldBorderState {
         center_x: border.center_x,
         center_z: border.center_z,
         old_size: border.diameter,
@@ -3859,7 +3859,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             "[save] world was written for a NEWER DataVersion ({file_dv} > running {running_dv}); content this build does not know may be ignored on load"
         ),
     }
-    *LOADED_SAVE_VERSION.lock().unwrap() = Some(save_version);
+    *LOADED_SAVE_VERSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(save_version);
     // WBD1 tucks beneath VER1: read it before the peel hides it, and restore
     // it before the body scan so a BRD1 record in the same save keeps owning
     // the live transition.
@@ -3953,7 +3953,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
         if p < payload.len() {
             let pn = rv(payload, &mut p);
-            let mut store = inv_store().lock().unwrap();
+            let mut store = inv_store().lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..pn {
                 if p + 2 > payload.len() {
                     break;
@@ -3991,7 +3991,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
         if p < payload.len() {
             let cn = rv(payload, &mut p);
-            let mut ch = chests().lock().unwrap();
+            let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..cn {
                 if p + 12 > payload.len() {
                     break;
@@ -4009,7 +4009,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
         if p < payload.len() {
             let sn = rv(payload, &mut p);
-            let mut sg = signs().lock().unwrap();
+            let mut sg = signs().lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..sn {
                 if p + 13 > payload.len() {
                     break;
@@ -4041,7 +4041,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
         if p < payload.len() {
             let fn_ = rv(payload, &mut p);
-            let mut fl = forceloaded().lock().unwrap();
+            let mut fl = forceloaded().lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..fn_ {
                 if p + 8 > payload.len() {
                     break;
@@ -4055,7 +4055,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
         if p < payload.len() {
             let pn = rv(payload, &mut p);
-            let mut ps = pos_store().lock().unwrap();
+            let mut ps = pos_store().lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..pn {
                 if p + 2 > payload.len() {
                     break;
@@ -4084,7 +4084,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
         if p < payload.len() {
             let dn = rv(payload, &mut p);
-            let mut ds = drops().lock().unwrap();
+            let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..dn {
                 if p + 30 > payload.len() {
                     break;
@@ -4133,7 +4133,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
         if p < payload.len() {
             let fn_ = rv(payload, &mut p);
-            let mut fs = furnaces().lock().unwrap();
+            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..fn_ {
                 if p + 12 > payload.len() {
                     break;
@@ -4162,7 +4162,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
         if p < payload.len() {
             let on = rv(payload, &mut p);
-            let mut board = scoreboard().lock().unwrap();
+            let mut board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..on {
                 if p + 2 > payload.len() {
                     break;
@@ -4206,7 +4206,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         if p + 1 < payload.len() {
             // XP orbs (eid,x,y,z,val,age_ms)
             let xn = rv(payload, &mut p);
-            let mut xs = xps().lock().unwrap();
+            let mut xs = xps().lock().unwrap_or_else(|e| e.into_inner());
             let mut mx: i32 = 0;
             for _ in 0..xn {
                 if p + 34 > payload.len() {
@@ -4246,7 +4246,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
         if p < payload.len() {
             // drop ages by order — restore remaining despawn budget
-            let mut ds = drops().lock().unwrap();
+            let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
             for d in ds.iter_mut() {
                 if p + 4 > payload.len() {
                     break;
@@ -4282,7 +4282,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
             let n = rv(payload, &mut p);
             {
-                let mut ar = arrows().lock().unwrap();
+                let mut ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
                 let rec = if arw2 { 61 } else { 60 };
                 for _ in 0..n {
                     if p + rec > payload.len() {
@@ -4334,7 +4334,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
             let n = rv(payload, &mut p);
             {
-                let mut bo = bobbers().lock().unwrap();
+                let mut bo = bobbers().lock().unwrap_or_else(|e| e.into_inner());
                 for _ in 0..n {
                     if p + 61 > payload.len() {
                         break;
@@ -4371,7 +4371,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
             let n = rv(payload, &mut p);
             {
-                let mut pe = pearls().lock().unwrap();
+                let mut pe = pearls().lock().unwrap_or_else(|e| e.into_inner());
                 for _ in 0..n {
                     if p + 60 > payload.len() {
                         break;
@@ -4405,7 +4405,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
             let n = rv(payload, &mut p);
             {
-                let mut pr = primed().lock().unwrap();
+                let mut pr = primed().lock().unwrap_or_else(|e| e.into_inner());
                 for _ in 0..n {
                     if p + 32 > payload.len() {
                         break;
@@ -4469,13 +4469,13 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 f64::from_be_bytes(b[p + 8..p + 16].try_into().unwrap()),
                 f64::from_be_bytes(b[p + 16..p + 24].try_into().unwrap()),
             );
-            *WORLD_SPAWN.lock().unwrap() = (x, y, z, 0.0);
+            *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0);
             p += 24;
             DIFFICULTY.store(b[p], Ordering::Relaxed);
             p += 1;
         }
         if p < payload.len() {
-            let mut tm = tags().lock().unwrap();
+            let mut tm = tags().lock().unwrap_or_else(|e| e.into_inner());
             let pn = rv(payload, &mut p);
             for _ in 0..pn {
                 if p + 2 > payload.len() {
@@ -4531,7 +4531,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             restored_mob_tags = mtag;
             if p < payload.len() {
                 let sn = rv(payload, &mut p);
-                let mut sf = sched_fns().lock().unwrap();
+                let mut sf = sched_fns().lock().unwrap_or_else(|e| e.into_inner());
                 let t_now = TICK.load(Ordering::Relaxed);
                 for _ in 0..sn {
                     if p + 2 > payload.len() {
@@ -4554,7 +4554,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
             if p < payload.len() {
                 let gn = rv(payload, &mut p);
-                let mut ag = adv_done().lock().unwrap();
+                let mut ag = adv_done().lock().unwrap_or_else(|e| e.into_inner());
                 for _ in 0..gn {
                     if p + 2 > payload.len() {
                         break;
@@ -4588,7 +4588,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             // player attributes
             if p < payload.len() {
                 let an = rv(payload, &mut p);
-                let mut at = attrs().lock().unwrap();
+                let mut at = attrs().lock().unwrap_or_else(|e| e.into_inner());
                 for _ in 0..an {
                     if p + 2 > payload.len() {
                         break;
@@ -4624,7 +4624,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 // objective types + sidebar
                 if p < payload.len() {
                     let oc = rv(payload, &mut p);
-                    let mut board = scoreboard().lock().unwrap();
+                    let mut board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
                     for _ in 0..oc {
                         if p + 2 > payload.len() {
                             break;
@@ -4667,8 +4667,8 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         eprintln!(
             "[spine] loaded meta: {} mobs, {} invs, {} chests",
             mn,
-            inv_store().lock().unwrap().len(),
-            chests().lock().unwrap().len()
+            inv_store().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            chests().lock().unwrap_or_else(|e| e.into_inner()).len()
         );
     }
 
@@ -4678,13 +4678,13 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     // already exists in the Overworld section stays independent: the footer's key names its own
     // dimension. A player's coordinates came from the legacy section; only the dimension changes.
     if !dim_signs.is_empty() {
-        let mut sg = signs().lock().unwrap();
+        let mut sg = signs().lock().unwrap_or_else(|e| e.into_inner());
         for (dim, x, y, z, front, lines) in dim_signs {
             sg.insert((dim, x, y, z, front), lines);
         }
     }
     if !dim_players.is_empty() {
-        let mut ps = pos_store().lock().unwrap();
+        let mut ps = pos_store().lock().unwrap_or_else(|e| e.into_inner());
         for (name, dim) in dim_players {
             if let Some(entry) = ps.get_mut(&name) {
                 entry.0 = dim;
@@ -4716,7 +4716,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             let time = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
             p += 4;
             NEXT_EID.fetch_max(eid + 1, Ordering::SeqCst);
-            falling().lock().unwrap().push(Fall {
+            falling().lock().unwrap_or_else(|e| e.into_inner()).push(Fall {
                 eid,
                 x,
                 y,
@@ -4750,12 +4750,12 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             // explicitly: the block is now the entity, not whatever terrain is underneath it.
             world()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .entry((DimId::Overworld, fx >> 4, fz >> 4))
                 .or_default()
                 .insert(local_idx(fx, fy, fz), 0);
             let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-            falling().lock().unwrap().push(Fall {
+            falling().lock().unwrap_or_else(|e| e.into_inner()).push(Fall {
                 eid,
                 x: fx as f64 + 0.5,
                 y: fy as f64,
@@ -4805,7 +4805,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             if [center_x, center_z, old_size, new_size, damage_per_block, damage_safe_zone]
                 .iter().all(|value| value.is_finite())
             {
-                *world_border().lock().unwrap() = WorldBorderState {
+                *world_border().lock().unwrap_or_else(|e| e.into_inner()) = WorldBorderState {
                     center_x, center_z, old_size, new_size,
                     lerp_start_ms: border_now_ms(),
                     lerp_duration_ms: duration.max(0),
@@ -4818,13 +4818,13 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     if let Some(bytes) = payload.get(p..p + 8).filter(|bytes| &bytes[..4] == b"SPA1") {
         let angle = f32::from_be_bytes(bytes[4..].try_into().unwrap());
         if angle.is_finite() {
-            WORLD_SPAWN.lock().unwrap().3 = angle;
+            WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()).3 = angle;
         }
     }
     if let Some(state) = tick_state {
         TICK_IDX.store(state.now, Ordering::Relaxed);
         BLOCK_TICK_ORDER.store(state.block_order, Ordering::Relaxed);
-        *block_ticks().lock().unwrap() = state.blocks;
+        *block_ticks().lock().unwrap_or_else(|e| e.into_inner()) = state.blocks;
         let mut owner = GeneratedFluidOwner::new();
         owner.queue = state.fluids;
         owner.next_order = state.fluid_order;
@@ -4832,7 +4832,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         *GENERATED_FLUID_OWNER
             .get_or_init(|| Mutex::new(GeneratedFluidOwner::new()))
             .lock()
-            .unwrap() = owner;
+            .unwrap_or_else(|e| e.into_inner()) = owner;
         worldgen::with_gen(|g| {
             g.restore_tick_sources(state.sources);
             g.restore_generated_ticks(state.generated_blocks, state.generated_fluids);
@@ -4854,9 +4854,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         for frame in &mut generated.content.frames {
             frame.eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
         }
-        *generated_content().lock().unwrap() = generated.content;
+        *generated_content().lock().unwrap_or_else(|e| e.into_inner()) = generated.content;
         if !cart_inventories.is_empty() {
-            let mut ch = chests().lock().unwrap();
+            let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
             for (key, slots) in cart_inventories {
                 ch.insert(key, slots);
             }
@@ -4867,7 +4867,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         });
     }
     // The legacy block-loot footer is Overworld-only; its positions load back with that dimension.
-    *pending_block_loot().lock().unwrap() = block_loot
+    *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()) = block_loot
         .into_iter()
         .map(|(pos, entry)| (ow_block(pos), entry))
         .collect();
@@ -4875,25 +4875,25 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     // so a mixed save cannot let an old Overworld entry overwrite a new one at the same coordinate.
     if !dim2.is_empty() {
         {
-            let mut ch = chests().lock().unwrap();
+            let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
             for (pos, slots) in dim2.chests {
                 ch.insert(ContainerKey::Block(pos), slots);
             }
         }
         {
-            let mut fs = furnaces().lock().unwrap();
+            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
             for (pos, fr) in dim2.furnaces {
                 fs.insert(pos, fr);
             }
         }
         {
-            let mut cg = crops().lock().unwrap();
+            let mut cg = crops().lock().unwrap_or_else(|e| e.into_inner());
             for (pos, age) in dim2.crops {
                 cg.insert(pos, age);
             }
         }
         {
-            let mut all = pending_block_loot().lock().unwrap();
+            let mut all = pending_block_loot().lock().unwrap_or_else(|e| e.into_inner());
             for (pos, entry) in dim2.loot {
                 all.insert(pos, entry);
             }
@@ -4901,7 +4901,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     }
     // Entity-scoped attributes belong to the loaded world, including when it
     // contains no mobs. Old runtime EIDs must not retain stale values.
-    attrs().lock().unwrap().retain(|key, _| !key.starts_with("e:"));
+    attrs().lock().unwrap_or_else(|e| e.into_inner()).retain(|key, _| !key.starts_with("e:"));
     // Persisted drop, projectile, TNT and falling-block IDs must reserve their range
     // before mobs receive fresh IDs. Keep mob ordinals stable for shearing and tags.
     if !restored_mobs.is_empty() {
@@ -4923,7 +4923,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
         let mut extra = extra.into_iter();
-        let mut ms = mobs().lock().unwrap();
+        let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
         let first = ms.len();
         for (index, (etype, x, y, z, hp)) in restored_mobs.into_iter().enumerate() {
             let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -4946,13 +4946,13 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                     || saved.state.blaze_charged
                     || !saved.state.potions.is_empty()
                 {
-                    live_mob_states().lock().unwrap().insert(eid, saved.state);
+                    live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, saved.state);
                 }
                 if saved.sitting_cat {
-                    sitting_cats().lock().unwrap().insert(eid);
+                    sitting_cats().lock().unwrap_or_else(|e| e.into_inner()).insert(eid);
                 }
                 if let Some(villager) = saved.villager {
-                    live_villagers().lock().unwrap().insert(eid, villager);
+                    live_villagers().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, villager);
                 }
             }
             let last_action = Instant::now() - Duration::from_secs(10);
@@ -4973,19 +4973,19 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 air: Mutex::new(air),
             }));
         }
-        let mut attributes = attrs().lock().unwrap();
+        let mut attributes = attrs().lock().unwrap_or_else(|e| e.into_inner());
         for (index, selector_key, values) in mob_attributes {
             let prefix = if selector_key { "e:m:" } else { "e:" };
             attributes.insert(format!("{}{}", prefix, ms[first + index].eid), values);
         }
-        let mut sh = sheared().lock().unwrap();
+        let mut sh = sheared().lock().unwrap_or_else(|e| e.into_inner());
         for index in restored_sheared {
             if let Some(m) = ms.get(first + index) {
                 sh.insert(m.eid);
             }
         }
         drop(sh);
-        let mut tm = tags().lock().unwrap();
+        let mut tm = tags().lock().unwrap_or_else(|e| e.into_inner());
         for (index, state) in restored_mob_tags {
             if let Some(m) = ms.get(first + index) {
                 tm.insert(format!("e:{}", m.eid), state);
@@ -5006,7 +5006,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
         {
-            let mut ps = pos_store().lock().unwrap();
+            let mut ps = pos_store().lock().unwrap_or_else(|e| e.into_inner());
             for (name, key) in &dxt.players {
                 if let (Some(dim), Some(entry)) = (dxt_dim(key), ps.get_mut(name)) {
                     entry.0 = dim;
@@ -5041,7 +5041,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
         {
-            let mut sg = signs().lock().unwrap();
+            let mut sg = signs().lock().unwrap_or_else(|e| e.into_inner());
             for (key, x, y, z, front, lines) in &dxt.signs {
                 if let Some(dim) = dxt_dim(key) {
                     sg.insert((dim, *x, *y, *z, *front), lines.clone());
@@ -5049,7 +5049,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
         {
-            let mut ch = chests().lock().unwrap();
+            let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
             for (key, x, y, z, items) in &dxt.chests {
                 if let Some(dim) = dxt_dim(key) {
                     ch.insert(ContainerKey::Block((dim, *x, *y, *z)), items.clone());
@@ -5057,7 +5057,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
         {
-            let mut fs = furnaces().lock().unwrap();
+            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
             for (key, x, y, z, furnace) in &dxt.furnaces {
                 if let Some(dim) = dxt_dim(key) {
                     fs.insert((dim, *x, *y, *z), clone_furnace_for_footer(furnace));
@@ -5065,7 +5065,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
         {
-            let mut cg = crops().lock().unwrap();
+            let mut cg = crops().lock().unwrap_or_else(|e| e.into_inner());
             for (key, x, y, z, age) in &dxt.crops {
                 if let Some(dim) = dxt_dim(key) {
                     cg.insert((dim, *x, *y, *z), *age);
@@ -5074,7 +5074,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
         for (key, x, y, z, loot) in &dxt.loot {
             if let Some(dim) = dxt_dim(key) {
-                pending_block_loot().lock().unwrap().insert((dim, *x, *y, *z), loot.clone());
+                pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).insert((dim, *x, *y, *z), loot.clone());
             }
         }
         for (key, x, y, z, slots, fuel, remaining) in &dxt.brewing {
@@ -5110,14 +5110,14 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         );
     }
     restore_gamerules(state.gamerules.as_deref());
-    *WORLD_SPAWN_PITCH.lock().unwrap() = state.spawn_pitch;
-    *saved_players().lock().unwrap() = state.players;
-    *saved_raids().lock().unwrap() = state.raids;
-    *live_brewing_stands().lock().unwrap() = brewing;
+    *WORLD_SPAWN_PITCH.lock().unwrap_or_else(|e| e.into_inner()) = state.spawn_pitch;
+    *saved_players().lock().unwrap_or_else(|e| e.into_inner()) = state.players;
+    *saved_raids().lock().unwrap_or_else(|e| e.into_inner()) = state.raids;
+    *live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()) = brewing;
     restore_saved_block_entities(block_entities);
     eprintln!(
         "[spine] loaded {} dirty chunks",
-        world().lock().unwrap().len()
+        world().lock().unwrap_or_else(|e| e.into_inner()).len()
     );
     rebuild_derived_indexes();
     Ok(())
@@ -5128,7 +5128,7 @@ const BREWING_SAVE_MAGIC: &[u8; 4] = b"BRS1";
 /// The live brewing stands a custom dimension owns, for DXT1. The BRS1 footer
 /// keeps its vanilla-only set and its byte-identical layout.
 fn collect_dxt_brewing(dxt: &mut DxtEntries) {
-    let stands = live_brewing_stands().lock().unwrap();
+    let stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
     let mut entries: Vec<_> = stands
         .iter()
         .filter(|(pos, _)| !pos.0.is_vanilla())
@@ -5156,7 +5156,7 @@ fn collect_dxt_brewing(dxt: &mut DxtEntries) {
 }
 
 fn append_brewing_footer(out: &mut Vec<u8>) {
-    let stands = live_brewing_stands().lock().unwrap();
+    let stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
     let mut entries: Vec<_> = stands
         .iter()
         .filter(|(pos, stand)| {
@@ -5273,10 +5273,10 @@ fn append_block_entities_footer(out: &mut Vec<u8>, dxt: &mut DxtEntries) {
     let Some(reg) = breg() else { return };
     // Pick up blocks placed since the last tick's scan so entities nobody has
     // interacted with persist too.
-    live_block_entities().lock().unwrap().discover(reg);
+    live_block_entities().lock().unwrap_or_else(|e| e.into_inner()).discover(reg);
     let keys: Vec<DimBlockPos> = live_block_entities()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entries
         .keys()
         .copied()
@@ -5365,7 +5365,7 @@ fn read_block_entities_body(
 // against the live world, so a block that does not come back drops the record on
 // the next scan of its chunk.
 fn restore_saved_block_entities(entries: Option<Vec<(DimBlockPos, u32, nbt::Tag)>>) {
-    let mut store = live_block_entities().lock().unwrap();
+    let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
     store.entries.clear();
     let (Some(reg), Some(entries)) = (breg(), entries) else {
         return;
@@ -5723,11 +5723,11 @@ mod p5b_parity_world_border_tests {
     #[test]
     fn p5b_parity_world_border_default_save_emits_no_footer() {
         let _guard = world_guard();
-        let old = *world_border().lock().unwrap();
-        *world_border().lock().unwrap() = WorldBorderState::default();
+        let old = *world_border().lock().unwrap_or_else(|e| e.into_inner());
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = WorldBorderState::default();
         let mut payload = Vec::new();
         save_world_into(&mut payload);
-        *world_border().lock().unwrap() = old;
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = old;
         assert!(payload.ends_with(WORLD_SEED_MAGIC));
         assert_eq!(read_world_border_footer(&payload).unwrap(), None);
         // A default save is byte-for-byte the pre-record layout: the 12-byte
@@ -5740,18 +5740,18 @@ mod p5b_parity_world_border_tests {
     #[test]
     fn p5b_parity_world_border_custom_state_round_trips() {
         let _guard = world_guard();
-        let old = *world_border().lock().unwrap();
-        *world_border().lock().unwrap() = custom_border_state();
+        let old = *world_border().lock().unwrap_or_else(|e| e.into_inner());
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = custom_border_state();
         let mut payload = Vec::new();
         save_world_into(&mut payload);
         assert_eq!(
             read_world_border_footer(&payload).unwrap(),
             Some(custom_record())
         );
-        *world_border().lock().unwrap() = WorldBorderState::default();
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = WorldBorderState::default();
         load_world_from(&payload).unwrap();
-        let loaded = *world_border().lock().unwrap();
-        *world_border().lock().unwrap() = old;
+        let loaded = *world_border().lock().unwrap_or_else(|e| e.into_inner());
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = old;
         assert_eq!(
             (
                 loaded.center_x,
@@ -5769,11 +5769,11 @@ mod p5b_parity_world_border_tests {
     #[test]
     fn p5b_parity_world_border_record_restores_without_brd1() {
         let _guard = world_guard();
-        let old = *world_border().lock().unwrap();
-        *world_border().lock().unwrap() = custom_border_state();
+        let old = *world_border().lock().unwrap_or_else(|e| e.into_inner());
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = custom_border_state();
         let mut payload = Vec::new();
         save_world_into(&mut payload);
-        *world_border().lock().unwrap() = WorldBorderState::default();
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = WorldBorderState::default();
         // Remove the BRD1 body record (magic + 8*7 + 4*3 body bytes) so only
         // WBD1 can restore the border.
         const BRD1_LEN: usize = 4 + 8 * 7 + 4 * 3;
@@ -5783,8 +5783,8 @@ mod p5b_parity_world_border_tests {
             .expect("BRD1 record present");
         payload.drain(at..at + BRD1_LEN);
         load_world_from(&payload).unwrap();
-        let loaded = *world_border().lock().unwrap();
-        *world_border().lock().unwrap() = old;
+        let loaded = *world_border().lock().unwrap_or_else(|e| e.into_inner());
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = old;
         assert_eq!(
             (
                 loaded.center_x,
@@ -5816,11 +5816,11 @@ mod p5b_parity_world_border_tests {
         assert!(read_world_border_footer(&bad).is_err());
         // A corrupt record inside a real save fails the whole load closed.
         let _guard = world_guard();
-        let old = *world_border().lock().unwrap();
-        *world_border().lock().unwrap() = custom_border_state();
+        let old = *world_border().lock().unwrap_or_else(|e| e.into_inner());
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = custom_border_state();
         let mut payload = Vec::new();
         save_world_into(&mut payload);
-        *world_border().lock().unwrap() = old;
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = old;
         let at = payload
             .windows(4)
             .position(|w| w == b"WBD1")
