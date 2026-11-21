@@ -107,7 +107,7 @@ cleanup_verify_artifacts() {
   rm -f "$build_manifest"
   rm -rf client-port/target client-kernel/target client-app/target mod-offload/target \
       mod-adapter-core/target create-adapter/target proto/target state-store/target \
-      server-files/target
+      server-files/target core/target
 }
 trap cleanup_verify_artifacts EXIT
 
@@ -121,6 +121,7 @@ cargo test --manifest-path create-adapter/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path proto/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path state-store/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path server-files/Cargo.toml --offline --locked -j 2
+cargo test --manifest-path core/Cargo.toml --offline --locked -j 2
 
 echo "== tests, serial"
 cargo test --offline --locked -j 2 -- --test-threads=1
