@@ -50,7 +50,202 @@ const COMP_UNBREAKABLE: i64 = 4;
 const COMP_CUSTOM_NAME: i64 = 5;
 const COMP_LORE: i64 = 7;
 const COMP_ENCHANTMENTS: i64 = 9;
+// `minecraft:attribute_modifiers` is data_component_type id 12 in 1.21.1,
+// verified against proto/src/data_v767.rs `V767_COMPONENTS` (index = protocol
+// id) — the same table the COMP_REPAIR_COST=16 / COMP_MAP_ID=26 /
+// COMP_ARMOR_TRIM=35 / COMP_BANNER_PATTERNS=49 anchors come from.
+const COMP_ATTRIBUTE_MODIFIERS: i64 = 12;
 const COMP_STORED_ENCHANTMENTS: i64 = 23;
+
+/// `AttributeModifier.Operation` varint enum (Protocol 767).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ItemAttrOp {
+    AddValue = 0,
+    AddMultipliedBase = 1,
+    AddMultipliedTotal = 2,
+}
+impl ItemAttrOp {
+    fn from_wire(v: i64) -> Option<Self> {
+        Some(match v {
+            0 => Self::AddValue,
+            1 => Self::AddMultipliedBase,
+            2 => Self::AddMultipliedTotal,
+            _ => return None,
+        })
+    }
+    fn snbt_name(self) -> &'static str {
+        match self {
+            Self::AddValue => "add_value",
+            Self::AddMultipliedBase => "add_multiplied_base",
+            Self::AddMultipliedTotal => "add_multiplied_total",
+        }
+    }
+    fn from_snbt(s: &str) -> Option<Self> {
+        Some(match s.trim().trim_matches(['\'', '"']) {
+            "add_value" => Self::AddValue,
+            "add_multiplied_base" => Self::AddMultipliedBase,
+            "add_multiplied_total" => Self::AddMultipliedTotal,
+            _ => return None,
+        })
+    }
+}
+
+/// `EquipmentSlotGroup` varint enum (Protocol 767, vanilla 1.21.1 order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ItemAttrSlotGroup {
+    Any = 0,
+    MainHand = 1,
+    OffHand = 2,
+    Hand = 3,
+    Feet = 4,
+    Legs = 5,
+    Chest = 6,
+    Head = 7,
+    Armor = 8,
+    Body = 9,
+}
+impl ItemAttrSlotGroup {
+    fn from_wire(v: i64) -> Option<Self> {
+        use ItemAttrSlotGroup::*;
+        Some(match v {
+            0 => Any,
+            1 => MainHand,
+            2 => OffHand,
+            3 => Hand,
+            4 => Feet,
+            5 => Legs,
+            6 => Chest,
+            7 => Head,
+            8 => Armor,
+            9 => Body,
+            _ => return None,
+        })
+    }
+    /// Vanilla `EquipmentSlotGroup.test(EquipmentSlot)`: `equipped_in` is the
+    /// slot the item actually sits in (MainHand/OffHand/Feet/Legs/Chest/Head or
+    /// Body), `self` is the group the modifier was declared for.
+    fn applies_to(self, equipped_in: ItemAttrSlotGroup) -> bool {
+        use ItemAttrSlotGroup::*;
+        match self {
+            Any => true,
+            Hand => matches!(equipped_in, MainHand | OffHand),
+            Armor => matches!(equipped_in, Feet | Legs | Chest | Head),
+            _ => self == equipped_in,
+        }
+    }
+    fn snbt_name(self) -> &'static str {
+        use ItemAttrSlotGroup::*;
+        match self {
+            Any => "any",
+            MainHand => "mainhand",
+            OffHand => "offhand",
+            Hand => "hand",
+            Feet => "feet",
+            Legs => "legs",
+            Chest => "chest",
+            Head => "head",
+            Armor => "armor",
+            Body => "body",
+        }
+    }
+    fn from_snbt(s: &str) -> Option<Self> {
+        use ItemAttrSlotGroup::*;
+        Some(match s.trim().trim_matches(['\'', '"']) {
+            "any" => Any,
+            "mainhand" => MainHand,
+            "offhand" => OffHand,
+            "hand" => Hand,
+            "feet" => Feet,
+            "legs" => Legs,
+            "chest" => Chest,
+            "head" => Head,
+            "armor" => Armor,
+            "body" => Body,
+            _ => return None,
+        })
+    }
+}
+
+/// One `ItemAttributeModifiers.Entry`: `attribute`, `modifier` (id + amount +
+/// operation), `slot`.
+#[derive(Clone, Debug, PartialEq)]
+struct ItemAttributeModifier {
+    attribute_id: i32,
+    modifier_id: String,
+    amount: f64,
+    operation: ItemAttrOp,
+    slot: ItemAttrSlotGroup,
+}
+/// `minecraft:attribute_modifiers` component payload.
+#[derive(Clone, Debug, PartialEq)]
+struct AttributeModifiersComponent {
+    modifiers: Vec<ItemAttributeModifier>,
+    show_in_tooltip: bool,
+}
+
+/// `ItemAttributeModifiers.STREAM_CODEC` encode (Protocol 767).
+fn attr_modifiers_data(c: &AttributeModifiersComponent) -> Vec<u8> {
+    let mut d = Vec::new();
+    write_varint(&mut d, c.modifiers.len() as i64);
+    for m in &c.modifiers {
+        write_varint(&mut d, i64::from(m.attribute_id));
+        write_varint(&mut d, m.modifier_id.len() as i64);
+        d.extend_from_slice(m.modifier_id.as_bytes());
+        d.extend_from_slice(&m.amount.to_be_bytes());
+        write_varint(&mut d, m.operation as i64);
+        write_varint(&mut d, m.slot as i64);
+    }
+    d.push(u8::from(c.show_in_tooltip));
+    d
+}
+/// `ItemAttributeModifiers.STREAM_CODEC` decode from a prefix of `input`;
+/// consumes exactly the component bytes.
+fn attr_modifiers_read(input: &mut &[u8]) -> Option<AttributeModifiersComponent> {
+    let n = read_protocol_i32(input)?;
+    if !(0..=1024).contains(&n) {
+        return None;
+    }
+    let mut modifiers = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let attribute_id = read_protocol_i32(input)?;
+        let id_len = usize::try_from(read_protocol_i32(input)?).ok()?;
+        if id_len > 32767 {
+            return None;
+        }
+        let (name, rest) = input.split_at_checked(id_len)?;
+        *input = rest;
+        let modifier_id = std::str::from_utf8(name).ok()?.to_string();
+        let amount = f64::from_be_bytes(input.get(..8)?.try_into().unwrap());
+        *input = input.get(8..)?;
+        let operation = ItemAttrOp::from_wire(i64::from(read_protocol_i32(input)?))?;
+        let slot = ItemAttrSlotGroup::from_wire(i64::from(read_protocol_i32(input)?))?;
+        modifiers.push(ItemAttributeModifier {
+            attribute_id,
+            modifier_id,
+            amount,
+            operation,
+            slot,
+        });
+    }
+    let show_in_tooltip = match *input.first()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    *input = input.get(1..)?;
+    Some(AttributeModifiersComponent {
+        modifiers,
+        show_in_tooltip,
+    })
+}
+/// Whole-slice variant for stored component payloads: trailing bytes reject.
+fn attr_modifiers_parse(data: &[u8]) -> Option<AttributeModifiersComponent> {
+    let mut rest = data;
+    attr_modifiers_read(&mut rest).filter(|_| rest.is_empty())
+}
+fn stack_attr_modifiers(comps: &Comps) -> Option<AttributeModifiersComponent> {
+    comp_get(comps, COMP_ATTRIBUTE_MODIFIERS).and_then(attr_modifiers_parse)
+}
 // max stack size: explicit component wins, else vanilla defaults
 // (1.21.1 minecraft-data: unstackable ids and the 16-stack ids)
 fn item_stack_max(item: i64, comps: &Comps) -> i64 {
@@ -4256,6 +4451,48 @@ fn stack_to_nbt(slot: i16, (item, count, comps): &Stack) -> Option<crate::nbt::T
                         Tag::Int(read_varint_at(data, 0).0 as i32),
                     );
                 }
+                COMP_ATTRIBUTE_MODIFIERS => {
+                    if let Some(amc) = attr_modifiers_parse(data) {
+                        let mut list = Vec::new();
+                        for m in &amc.modifiers {
+                            let Some(aname) = attr_key_name(i64::from(m.attribute_id)) else {
+                                continue;
+                            };
+                            let mut e = std::collections::BTreeMap::new();
+                            e.insert(
+                                NbtString::text("type"),
+                                Tag::String(NbtString::text(aname)),
+                            );
+                            e.insert(
+                                NbtString::text("id"),
+                                Tag::String(NbtString::text(&m.modifier_id)),
+                            );
+                            e.insert(NbtString::text("amount"), Tag::Double(m.amount.to_bits()));
+                            e.insert(
+                                NbtString::text("operation"),
+                                Tag::String(NbtString::text(m.operation.snbt_name())),
+                            );
+                            e.insert(
+                                NbtString::text("slot"),
+                                Tag::String(NbtString::text(m.slot.snbt_name())),
+                            );
+                            list.push(Tag::Compound(e));
+                        }
+                        let mut inner = std::collections::BTreeMap::new();
+                        inner.insert(
+                            NbtString::text("modifiers"),
+                            Tag::List(if list.is_empty() { 0 } else { 10 }, list),
+                        );
+                        inner.insert(
+                            NbtString::text("show_in_tooltip"),
+                            Tag::Byte(i8::from(amc.show_in_tooltip)),
+                        );
+                        comp_map.insert(
+                            NbtString::text("minecraft:attribute_modifiers"),
+                            Tag::Compound(inner),
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -4327,6 +4564,72 @@ fn items_nbt_to_stacks(tag: &crate::nbt::Tag) -> Result<HashMap<i16, Stack>, &'s
                         if let Some(n) = nbt_int_val(v) {
                             comp_set_varint(&mut comps, 16, n);
                         }
+                    }
+                    "attribute_modifiers" => {
+                        let mut modifiers = Vec::new();
+                        if let Some(list) = v.get("modifiers").and_then(|t| t.list()) {
+                            for e in list {
+                                let Some(aname) = e
+                                    .get("type")
+                                    .and_then(|t| t.string())
+                                    .and_then(|s| s.to_utf8().ok())
+                                else {
+                                    continue;
+                                };
+                                let Some(attribute_id) = attr_key_id(&aname) else {
+                                    continue;
+                                };
+                                let modifier_id = e
+                                    .get("id")
+                                    .and_then(|t| t.string())
+                                    .and_then(|s| s.to_utf8().ok())
+                                    .unwrap_or_else(|| "mc-spine:custom".to_string());
+                                let amount = e
+                                    .get("amount")
+                                    .and_then(|t| match t {
+                                        Tag::Double(bits) => Some(f64::from_bits(*bits)),
+                                        Tag::Float(bits) => Some(f64::from(f32::from_bits(*bits))),
+                                        _ => nbt_int_val(t).map(|n| n as f64),
+                                    })
+                                    .unwrap_or(0.0);
+                                let operation = e
+                                    .get("operation")
+                                    .and_then(|t| t.string())
+                                    .and_then(|s| s.to_utf8().ok())
+                                    .as_deref()
+                                    .and_then(ItemAttrOp::from_snbt)
+                                    .unwrap_or(ItemAttrOp::AddValue);
+                                let slot = e
+                                    .get("slot")
+                                    .and_then(|t| t.string())
+                                    .and_then(|s| s.to_utf8().ok())
+                                    .as_deref()
+                                    .and_then(ItemAttrSlotGroup::from_snbt)
+                                    .unwrap_or(ItemAttrSlotGroup::Any);
+                                modifiers.push(ItemAttributeModifier {
+                                    attribute_id: attribute_id as i32,
+                                    modifier_id,
+                                    amount,
+                                    operation,
+                                    slot,
+                                });
+                            }
+                        }
+                        let show_in_tooltip = v
+                            .get("show_in_tooltip")
+                            .and_then(|t| match t {
+                                Tag::Byte(b) => Some(*b != 0),
+                                _ => None,
+                            })
+                            .unwrap_or(true);
+                        comp_set(
+                            &mut comps,
+                            COMP_ATTRIBUTE_MODIFIERS,
+                            attr_modifiers_data(&AttributeModifiersComponent {
+                                modifiers,
+                                show_in_tooltip,
+                            }),
+                        );
                     }
                     "unbreakable" => {
                         let show = v
@@ -7382,6 +7685,11 @@ fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
                         return None;
                     }
                 }
+            }
+            COMP_ATTRIBUTE_MODIFIERS => {
+                let mut rest = b.get(p..)?;
+                attr_modifiers_read(&mut rest)?;
+                p = b.len() - rest.len();
             }
             // Component payloads are not length-prefixed. Without a type-aware
             // decoder their boundary cannot be recovered, so reject the whole
@@ -10471,5 +10779,96 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod p1_combat_item_tests {
+    use super::*;
+
+    fn am_mod(attribute_id: i32, amount: f64, op: ItemAttrOp, slot: ItemAttrSlotGroup) -> ItemAttributeModifier {
+        ItemAttributeModifier {
+            attribute_id,
+            modifier_id: "mc-spine:test".to_string(),
+            amount,
+            operation: op,
+            slot,
+        }
+    }
+
+    #[test]
+    fn p1_combat_attribute_modifiers_codec_roundtrip() {
+        let comp = AttributeModifiersComponent {
+            modifiers: vec![
+                am_mod(2, 3.5, ItemAttrOp::AddValue, ItemAttrSlotGroup::MainHand),
+                am_mod(4, -1.25, ItemAttrOp::AddMultipliedBase, ItemAttrSlotGroup::Any),
+                am_mod(16, 8.0, ItemAttrOp::AddMultipliedTotal, ItemAttrSlotGroup::Armor),
+            ],
+            show_in_tooltip: false,
+        };
+        let data = attr_modifiers_data(&comp);
+        assert_eq!(attr_modifiers_parse(&data), Some(comp));
+        // Trailing garbage and truncation both reject.
+        let mut long = data.clone();
+        long.push(0);
+        assert_eq!(attr_modifiers_parse(&long), None);
+        assert_eq!(attr_modifiers_parse(&data[..data.len() - 1]), None);
+        // Bad operation rejects.
+        let mut bad_op = attr_modifiers_data(&AttributeModifiersComponent {
+            modifiers: vec![am_mod(2, 1.0, ItemAttrOp::AddValue, ItemAttrSlotGroup::Any)],
+            show_in_tooltip: true,
+        });
+        let n = bad_op.len();
+        bad_op[n - 3] = 7; // operation byte position (op, slot, bool tail)
+        assert_eq!(attr_modifiers_parse(&bad_op), None);
+    }
+
+    #[test]
+    fn p1_combat_attribute_modifiers_slot_wire_roundtrip() {
+        let sword = name_to_item("diamond_sword").unwrap();
+        let comp = AttributeModifiersComponent {
+            modifiers: vec![
+                am_mod(2, 3.0, ItemAttrOp::AddValue, ItemAttrSlotGroup::MainHand),
+                am_mod(4, -2.4, ItemAttrOp::AddValue, ItemAttrSlotGroup::MainHand),
+            ],
+            show_in_tooltip: true,
+        };
+        let mut comps = Vec::new();
+        comp_set(&mut comps, COMP_ATTRIBUTE_MODIFIERS, attr_modifiers_data(&comp));
+        let st: Stack = (sword, 1, comps);
+        let mut packet = 9i16.to_be_bytes().to_vec();
+        packet.extend_from_slice(&slot_wire(&st));
+        let (slot, (item, cnt, wire_comps)) = slot_read_wire(&packet).unwrap();
+        assert_eq!(slot, 9);
+        assert_eq!((item, cnt), (sword, 1));
+        assert_eq!(
+            comp_get(&wire_comps, COMP_ATTRIBUTE_MODIFIERS).and_then(attr_modifiers_parse),
+            Some(comp)
+        );
+    }
+
+    #[test]
+    fn p1_combat_attribute_modifiers_nbt_roundtrip() {
+        let sword = name_to_item("diamond_sword").unwrap();
+        let comp = AttributeModifiersComponent {
+            modifiers: vec![am_mod(
+                13,
+                0.35,
+                ItemAttrOp::AddValue,
+                ItemAttrSlotGroup::Chest,
+            )],
+            show_in_tooltip: true,
+        };
+        let mut comps = Vec::new();
+        comp_set(&mut comps, COMP_ATTRIBUTE_MODIFIERS, attr_modifiers_data(&comp));
+        let st: Stack = (sword, 1, comps);
+        let tag = stack_to_nbt(6, &st).unwrap();
+        let items = crate::nbt::Tag::List(10, vec![tag]);
+        let back = items_nbt_to_stacks(&items).unwrap();
+        let (_, _, round) = back.get(&6).unwrap();
+        assert_eq!(
+            comp_get(round, COMP_ATTRIBUTE_MODIFIERS).and_then(attr_modifiers_parse),
+            Some(comp)
+        );
     }
 }

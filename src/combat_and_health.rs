@@ -124,8 +124,194 @@ fn attack_cooldown(item: i64) -> f64 {
     }
 }
 
+// ---------- attribute modifiers on equipped items ----------
+// Protocol 767 attribute registry ids (`minecraft:attribute`); the same order
+// `attr_key_id` encodes on the wire.
+const ATTR_ARMOR: i32 = 0;
+const ATTR_ARMOR_TOUGHNESS: i32 = 1;
+const ATTR_ATTACK_DAMAGE: i32 = 2;
+const ATTR_ATTACK_SPEED: i32 = 4;
+const ATTR_KNOCKBACK_RESISTANCE: i32 = 13;
+const ATTR_MAX_HEALTH: i32 = 16;
+
+/// Vanilla `AttributeInstance.calculateValue` order: `(base + Σadd_value) *
+/// (1 + Σadd_multiplied_base) * Π(1 + add_multiplied_total)`, where only
+/// modifiers whose slot group matches the slot the item is equipped in count.
+fn apply_item_attribute_modifiers(
+    base: f64,
+    equipped: &[(ItemAttrSlotGroup, &Stack)],
+    attribute_id: i32,
+) -> f64 {
+    let mut add = 0.0;
+    let mut mult_base = 0.0;
+    let mut mult_total = 1.0;
+    for (equipped_in, stack) in equipped {
+        let Some(amc) = stack_attr_modifiers(&stack.2) else {
+            continue;
+        };
+        for m in &amc.modifiers {
+            if m.attribute_id != attribute_id || !m.slot.applies_to(*equipped_in) {
+                continue;
+            }
+            match m.operation {
+                ItemAttrOp::AddValue => add += m.amount,
+                ItemAttrOp::AddMultipliedBase => mult_base += m.amount,
+                ItemAttrOp::AddMultipliedTotal => mult_total *= 1.0 + m.amount,
+            }
+        }
+    }
+    (base + add) * (1.0 + mult_base) * mult_total
+}
+
+/// The items vanilla's `getAttributeModifiers` sees for a living player:
+/// main hand, off hand, and the four armor slots. Stacks are cloned so no
+/// inventory lock is held while the modifiers are evaluated.
+fn equipped_pairs(c: &Client) -> Vec<(ItemAttrSlotGroup, Stack)> {
+    let inv = c.inv.lock().unwrap();
+    let held_slot = *c.held.lock().unwrap();
+    let mut out = Vec::with_capacity(6);
+    if let Some(st) = inv.get(&(36 + held_slot)) {
+        out.push((ItemAttrSlotGroup::MainHand, st.clone()));
+    }
+    if let Some(st) = inv.get(&45) {
+        out.push((ItemAttrSlotGroup::OffHand, st.clone()));
+    }
+    for (slot, grp) in [
+        (5i16, ItemAttrSlotGroup::Head),
+        (6, ItemAttrSlotGroup::Chest),
+        (7, ItemAttrSlotGroup::Legs),
+        (8, ItemAttrSlotGroup::Feet),
+    ] {
+        if let Some(st) = inv.get(&slot) {
+            out.push((grp, st.clone()));
+        }
+    }
+    out
+}
+
+/// Per-player cache of the (add_value sum, multiplied_base sum,
+/// multiplied_total product) triple for each attribute, computed from the
+/// equipped items. `attr_of` is reached from paths that already hold the
+/// health lock (main.rs player tick), so it must not take the inventory lock;
+/// the cache is refreshed on the exhaustion hook (per tick per client) and on
+/// every melee charge instead.
+static EQUIP_ATTRS: OnceLock<Mutex<HashMap<String, HashMap<i32, (f64, f64, f64)>>>> =
+    OnceLock::new();
+fn equip_attrs() -> &'static Mutex<HashMap<String, HashMap<i32, (f64, f64, f64)>>> {
+    EQUIP_ATTRS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn refresh_equip_attrs(c: &Client) {
+    let equipped = equipped_pairs(c);
+    let pairs: Vec<(ItemAttrSlotGroup, &Stack)> =
+        equipped.iter().map(|(g, s)| (*g, s)).collect();
+    let mut m: HashMap<i32, (f64, f64, f64)> = HashMap::new();
+    for id in [
+        ATTR_ARMOR,
+        ATTR_ARMOR_TOUGHNESS,
+        ATTR_ATTACK_DAMAGE,
+        ATTR_ATTACK_SPEED,
+        ATTR_KNOCKBACK_RESISTANCE,
+        ATTR_MAX_HEALTH,
+    ] {
+        let (mut add, mut mb, mut mt) = (0.0, 0.0, 1.0);
+        for (equipped_in, stack) in &pairs {
+            let Some(amc) = stack_attr_modifiers(&stack.2) else {
+                continue;
+            };
+            for md in &amc.modifiers {
+                if md.attribute_id != id || !md.slot.applies_to(*equipped_in) {
+                    continue;
+                }
+                match md.operation {
+                    ItemAttrOp::AddValue => add += md.amount,
+                    ItemAttrOp::AddMultipliedBase => mb += md.amount,
+                    ItemAttrOp::AddMultipliedTotal => mt *= 1.0 + md.amount,
+                }
+            }
+        }
+        if add != 0.0 || mb != 0.0 || mt != 1.0 {
+            m.insert(id, (add, mb, mt));
+        }
+    }
+    equip_attrs().lock().unwrap().insert(c.name.clone(), m);
+}
+
+/// Vanilla `Player.currentItemAttackStrengthDelay` source: the effective
+/// `generic.attack_speed`. A stack that carries an `attribute_modifiers`
+/// component replaces the item's vanilla default (vanilla defaults are
+/// components), so the whole attribute is resolved through the codec; a stack
+/// without one keeps the table speed — the table encodes `4.0 + item delta`,
+/// so the delta is preserved on top of any `/attribute`-set base.
+fn melee_attack_speed(me: &Client, item: i64) -> f64 {
+    let base = attrs()
+        .lock()
+        .unwrap()
+        .get(&format!("p:{}", me.name))
+        .and_then(|m| m.get("generic.attack_speed"))
+        .copied()
+        .unwrap_or(4.0);
+    let equipped = equipped_pairs(me);
+    let mainhand_has_component = equipped
+        .iter()
+        .find(|(g, _)| *g == ItemAttrSlotGroup::MainHand)
+        .is_some_and(|(_, st)| comp_get(&st.2, COMP_ATTRIBUTE_MODIFIERS).is_some());
+    if mainhand_has_component {
+        let pairs: Vec<(ItemAttrSlotGroup, &Stack)> =
+            equipped.iter().map(|(g, s)| (*g, s)).collect();
+        apply_item_attribute_modifiers(base, &pairs, ATTR_ATTACK_SPEED)
+    } else {
+        let table_speed = 1.0 / attack_cooldown(item);
+        let pairs: Vec<(ItemAttrSlotGroup, &Stack)> = equipped
+            .iter()
+            .filter(|(g, _)| *g != ItemAttrSlotGroup::MainHand)
+            .map(|(g, s)| (*g, s))
+            .collect();
+        apply_item_attribute_modifiers(base + table_speed - 4.0, &pairs, ATTR_ATTACK_SPEED)
+    }
+}
+
+/// Per-entity attack-strength state (`Player.attackStrengthTicker`): the tick
+/// of the last attack reset, the held slot/item it was taken with, and the
+/// wall stamp mirrored into `Client.last_melee` (a wall stamp that does not
+/// match is an out-of-band write — tests set the field directly — and is then
+/// honoured as a reset instead of being treated as cooldown progress).
+struct AttackTicker {
+    tick: u64,
+    held_slot: i16,
+    item: i64,
+    wall: Option<Instant>,
+}
+static ATTACK_TICKERS: OnceLock<Mutex<HashMap<i32, AttackTicker>>> = OnceLock::new();
+fn attack_tickers() -> &'static Mutex<HashMap<i32, AttackTicker>> {
+    ATTACK_TICKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Vanilla `Player.resetAttackStrengthTicker`: called on attack and on
+/// held-item switch; the next charge measurement starts from this tick.
+/// melee_charge detects the switch itself; this is the reset entry point for
+/// swing paths outside this file.
+#[allow(dead_code)]
+fn reset_attack_ticker(eid: i32) {
+    let mut map = attack_tickers().lock().unwrap();
+    let tick = TICK_IDX.load(Ordering::Relaxed);
+    map.entry(eid)
+        .and_modify(|st| {
+            st.tick = tick;
+            st.wall = None;
+        })
+        .or_insert(AttackTicker {
+            tick,
+            held_slot: -1,
+            item: -1,
+            wall: None,
+        });
+}
+
+// vanilla 1.9+ `Player.getAttackStrengthScale(0.5)`: ticks since the last
+// attack reset scaled by `20 / attack_speed`, clamped to 1.0. Driven by
+// TICK_IDX so `/tick freeze` and tick lag freeze the recharge instead of
+// drifting on wall-clock time.
 fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
-    let speed = me.effs.lock().unwrap().iter().fold(1.0_f32, |speed, effect| {
+    let speed_eff = me.effs.lock().unwrap().iter().fold(1.0_f32, |speed, effect| {
         match effect.id {
             2 | 3 => speed * effects::effect_attribute_modifier(
                 effect.id + 1, effect.amp, effects::EffectAttribute::AttackSpeed,
@@ -133,11 +319,45 @@ fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
             _ => speed,
         }
     });
-    let cd = attack_cooldown(item) / f64::from(speed.max(0.001));
+    let speed = melee_attack_speed(me, item) * f64::from(speed_eff.max(0.001));
+    let delay_ticks = 20.0 / speed.max(0.001);
+    let now_tick = TICK_IDX.load(Ordering::Relaxed);
+    let held_slot = *me.held.lock().unwrap();
     let mut lm = me.last_melee.lock().unwrap();
-    let c = (lm.elapsed().as_secs_f64() / cd).min(1.0) as f32;
+    let wall_ticks =
+        u64::try_from(lm.elapsed().as_millis() / u128::from(TICK_MS)).unwrap_or(u64::MAX);
+    let mut map = attack_tickers().lock().unwrap();
+    let elapsed = match map.get(&me.eid) {
+        // Ticker is live and the wall stamp is untouched: game ticks only.
+        Some(st) if st.wall == Some(*lm) => {
+            if st.held_slot == held_slot && st.item == item {
+                now_tick.saturating_sub(st.tick)
+            } else {
+                // Held-item switch: vanilla resets the ticker, so zero ticks
+                // have elapsed on the new item's clock.
+                0
+            }
+        }
+        // Ticker reset by reset_attack_ticker (no wall stamp recorded yet).
+        Some(st) if st.wall.is_none() => now_tick.saturating_sub(st.tick),
+        // Out-of-band write of last_melee (or first attack): treat the wall
+        // age as the tick age, so direct field writes still mean what they
+        // used to mean for callers that never touch TICK_IDX.
+        _ => wall_ticks,
+    };
+    let charge = ((elapsed as f64 + 0.5) / delay_ticks).clamp(0.0, 1.0) as f32;
     *lm = Instant::now();
-    c
+    map.insert(
+        me.eid,
+        AttackTicker {
+            tick: now_tick,
+            held_slot,
+            item,
+            wall: Some(*lm),
+        },
+    );
+    refresh_equip_attrs(me);
+    charge
 }
 fn enchantment_targets_undead(etype: i64) -> bool {
     entity_spec_by_id(etype).is_some_and(|entity| {
@@ -553,9 +773,101 @@ fn diff_expl_dmg(d: f32) -> f32 {
         _ => d,
     }
 }
-fn armor_mult(c: &Client) -> f32 {
-    let pts = *c.armor_pts.lock().unwrap();
-    (1.0 - 0.04 * pts as f32).max(0.2)
+// Vanilla default `generic.armor_toughness` baked into armor items as their
+// default attribute_modifiers component (diamond +2, netherite +3 per piece).
+// The default only counts while the piece carries no explicit component.
+fn armor_default_toughness(item: i64) -> f64 {
+    for (n, t) in [
+        ("netherite_helmet", 3.0),
+        ("netherite_chestplate", 3.0),
+        ("netherite_leggings", 3.0),
+        ("netherite_boots", 3.0),
+        ("diamond_helmet", 2.0),
+        ("diamond_chestplate", 2.0),
+        ("diamond_leggings", 2.0),
+        ("diamond_boots", 2.0),
+    ] {
+        if name_to_item(n) == Some(item) {
+            return t;
+        }
+    }
+    0.0
+}
+fn armor_default_knockback_resistance(item: i64) -> f64 {
+    for n in [
+        "netherite_helmet",
+        "netherite_chestplate",
+        "netherite_leggings",
+        "netherite_boots",
+    ] {
+        if name_to_item(n) == Some(item) {
+            return 0.1;
+        }
+    }
+    0.0
+}
+fn armor_toughness_of(pairs: &[(ItemAttrSlotGroup, &Stack)]) -> f64 {
+    let mut base = 0.0;
+    for (grp, st) in pairs {
+        if matches!(
+            grp,
+            ItemAttrSlotGroup::Head
+                | ItemAttrSlotGroup::Chest
+                | ItemAttrSlotGroup::Legs
+                | ItemAttrSlotGroup::Feet
+        ) && comp_get(&st.2, COMP_ATTRIBUTE_MODIFIERS).is_none()
+        {
+            base += armor_default_toughness(st.0);
+        }
+    }
+    apply_item_attribute_modifiers(base, pairs, ATTR_ARMOR_TOUGHNESS)
+}
+fn knockback_resist_of(c: &Client) -> f64 {
+    let equipped = equipped_pairs(c);
+    let pairs: Vec<(ItemAttrSlotGroup, &Stack)> =
+        equipped.iter().map(|(g, s)| (*g, s)).collect();
+    let mut base = 0.0;
+    for (grp, st) in &pairs {
+        if matches!(
+            grp,
+            ItemAttrSlotGroup::Head
+                | ItemAttrSlotGroup::Chest
+                | ItemAttrSlotGroup::Legs
+                | ItemAttrSlotGroup::Feet
+        ) && comp_get(&st.2, COMP_ATTRIBUTE_MODIFIERS).is_none()
+        {
+            base += armor_default_knockback_resistance(st.0);
+        }
+    }
+    // Vanilla LivingEntity.knockback clamps the resistance factor to 1.
+    apply_item_attribute_modifiers(base, &pairs, ATTR_KNOCKBACK_RESISTANCE).clamp(0.0, 1.0)
+}
+// vanilla `CombatRules.getDamageAfterAbsorb`: armor points are weakened by
+// the incoming damage scaled on armor toughness, the reduction clamped to
+// [armor*0.2, 20] and capped at 20/25 = 80%.
+fn armor_dmg_factor(c: &Client, raw: f32) -> f64 {
+    let equipped = equipped_pairs(c);
+    let pairs: Vec<(ItemAttrSlotGroup, &Stack)> =
+        equipped.iter().map(|(g, s)| (*g, s)).collect();
+    // armor_pts already carries the worn pieces' component modifiers; only
+    // hand-held items still add on top.
+    let hand_pairs: Vec<(ItemAttrSlotGroup, &Stack)> = pairs
+        .iter()
+        .filter(|(g, _)| {
+            matches!(
+                g,
+                ItemAttrSlotGroup::MainHand | ItemAttrSlotGroup::OffHand
+            )
+        })
+        .copied()
+        .collect();
+    let armor = f64::from(*c.armor_pts.lock().unwrap())
+        + apply_item_attribute_modifiers(0.0, &hand_pairs, ATTR_ARMOR);
+    let f = 2.0 + armor_toughness_of(&pairs) / 4.0;
+    let v = armor - f64::from(raw) / f;
+    let lo = armor * 0.2;
+    let g = if v < lo { lo } else { v.min(20.0) };
+    1.0 - g / 25.0
 }
 // vanilla EPF: protection-family enchantments on worn armor add a
 // post-armor reduction of min(epf,20)*4%. kind: 0 generic (prot only),
@@ -579,8 +891,8 @@ fn enchant_epf(c: &Client, kind: u8) -> i64 {
     epf.min(20)
 }
 fn dmg_after(c: &Client, raw: f32, kind: u8) -> f32 {
-    let arm = raw * armor_mult(c);
-    arm * (1.0 - 0.04 * enchant_epf(c, kind) as f32)
+    let arm = f64::from(raw) * armor_dmg_factor(c, raw);
+    (arm * (1.0 - 0.04 * enchant_epf(c, kind) as f64)) as f32
 }
 // call AFTER the hp write: if hp hit 0 and a totem is held (main or
 // offhand), consume it — vanilla sets hp to 1, fires entity_status 35,
@@ -711,16 +1023,29 @@ fn armor_pts_of(inv: &HashMap<i16, Stack>) -> i32 {
             ],
         ),
     ];
-    for (slot, mats) in slots {
-        if let Some((item, _, _)) = inv.get(&slot) {
-            for (n, p) in mats {
-                if name_to_item(n) == Some(*item) {
-                    pts += p
+    let mut pairs: Vec<(ItemAttrSlotGroup, &Stack)> = Vec::new();
+    for ((slot, mats), grp) in slots.iter().zip([
+        ItemAttrSlotGroup::Head,
+        ItemAttrSlotGroup::Chest,
+        ItemAttrSlotGroup::Legs,
+        ItemAttrSlotGroup::Feet,
+    ]) {
+        if let Some(st @ (item, _, comps)) = inv.get(slot) {
+            // An explicit attribute_modifiers component replaces the piece's
+            // vanilla default, so the table points only count without one.
+            if comp_get(comps, COMP_ATTRIBUTE_MODIFIERS).is_none() {
+                for &(n, p) in *mats {
+                    if name_to_item(n) == Some(*item) {
+                        pts += p
+                    }
                 }
             }
+            pairs.push((grp, st));
         }
     }
-    pts
+    // The table points play the role of the item's vanilla default modifier,
+    // so they join the base side of calculateValue's three-stage fold.
+    apply_item_attribute_modifiers(f64::from(pts), &pairs, ATTR_ARMOR).round() as i32
 }
 
 /// Vanilla merges xp orbs closer than one block into a single higher-value orb.
@@ -862,7 +1187,46 @@ fn projectile_segment_hits(
     bounds.contains(start) || bounds.clip(start, end).is_some()
 }
 
+/// Vanilla `LivingEntity.invulnerableTime` for mobs is ten game ticks
+/// (`hurt`'s `invulnerableTime > 10` gate). The melee/sweep gates in
+/// play_protocol.rs read `Mob.hurt_at` as a wall instant (500 ms), so this
+/// per-tick pass keeps the wall stamp in agreement with the tick stamp:
+/// while `TICK_IDX - last_hurt_tick < 10` the wall stamp is pushed into the
+/// future (its `elapsed()` saturates to 0, so the gate stays shut even under
+/// `/tick freeze` or lag), and once the window has closed the stamp is backed
+/// out to exactly the hurt instant so downstream readers — `recently_hurt`'s
+/// two-second XP window and despawn observation — see the same wall time they
+/// always did. A fresh wall stamp with no tick stamp (paths that still write
+/// only `hurt_at`, e.g. the melee gate) is adopted into the tick window on
+/// the next tick.
+const MOB_HURT_WINDOW_GT: u64 = 10;
+fn mob_hurt_window_tick() {
+    let now_tick = TICK_IDX.load(Ordering::Relaxed);
+    let now = Instant::now();
+    for mob in mobs().lock().unwrap().iter() {
+        let mut hurt_tick = mob.last_hurt_tick.lock().unwrap();
+        let mut hurt_at = mob.hurt_at.lock().unwrap();
+        match *hurt_tick {
+            Some(t) if now_tick.saturating_sub(t) < MOB_HURT_WINDOW_GT => {
+                *hurt_at = now + Duration::from_secs(3600);
+            }
+            Some(_) => {
+                if hurt_at.elapsed() < Duration::from_millis(500) {
+                    *hurt_at = now - Duration::from_millis(500);
+                }
+            }
+            None => {
+                if hurt_at.elapsed() < Duration::from_millis(500) {
+                    *hurt_tick = Some(now_tick);
+                    *hurt_at = now + Duration::from_secs(3600);
+                }
+            }
+        }
+    }
+}
+
 fn arrow_tick() {
+    mob_hurt_window_tick();
     let mut dead: Vec<i32> = vec![];
     let mut hits: Vec<(i32, f32)> = vec![]; // (victim eid, arrow dmg)
     let mut mob_dead: Vec<(i32, i64, f64, f64, f64)> = vec![];
@@ -982,6 +1346,8 @@ fn arrow_tick() {
                             break;
                         }
                         *m.hurt_at.lock().unwrap() = Instant::now();
+                        *m.last_hurt_tick.lock().unwrap() =
+                            Some(TICK_IDX.load(Ordering::Relaxed));
                         let mut h = m.hp.lock().unwrap();
                         *h -= a.dmg;
                         let dh = *h;
@@ -1349,14 +1715,17 @@ fn live_mob_damage_player(
         damage_armor(player, damage);
     }
     let health = *player.hp.lock().unwrap();
+    // Vanilla LivingEntity.knockback scales the horizontal push by
+    // (1 - knockback_resistance); the vertical component is unaffected.
+    let kb_res = knockback_resist_of(player);
     let velocity = knockback_y.map(|up| {
         let (x, _, z, ..) = *player.pos.lock().unwrap();
         let [dx, _, dz] = mob_behavior_unit([x - origin[0], 0.0, z - origin[2]]);
         velocity_pkt(
             player.eid,
-            (dx * 3200.0) as i16,
+            (dx * 3200.0 * (1.0 - kb_res)) as i16,
             (up * 8000.0) as i16,
-            (dz * 3200.0) as i16,
+            (dz * 3200.0 * (1.0 - kb_res)) as i16,
         )
     });
     if let Ok(mut sock) = player.sock.lock() {
@@ -1387,6 +1756,7 @@ fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, u
     if thorns > 0 && world_rng::next_u64() % 100 < (thorns * 15) as u64 {
         *mob.hp.lock().unwrap() -= (1 + world_rng::next_u64() % 4) as f32;
         *mob.hurt_at.lock().unwrap() = Instant::now();
+        *mob.last_hurt_tick.lock().unwrap() = Some(TICK_IDX.load(Ordering::Relaxed));
         broadcast_seen(mob.eid, |_| (0x24, hurt_anim(mob.eid)));
     }
     if *player.hp.lock().unwrap() <= 0.0
@@ -1628,6 +1998,9 @@ fn player_mechanism_sessions() -> &'static LockedMap<i32, PlayerMechanismSession
 }
 
 fn player_movement_exhaustion(c: &Client, (x, y, z): (f64, f64, f64)) -> f32 {
+    // Once per client per tick, before the health lock is taken downstream:
+    // keep the equipment attribute view attr_of reports current.
+    refresh_equip_attrs(c);
     let (last_x, _, last_z) = std::mem::replace(&mut *c.lastp.lock().unwrap(), (x, y, z));
     let distance = (x - last_x).hypot(z - last_z);
     let movement = if distance >= 10.0 {
@@ -1722,6 +2095,8 @@ fn reset_player_food(c: &Client) {
     if let Some(session) = sessions.get_mut(&c.eid) {
         session.food_timer = 0;
     }
+    attack_tickers().lock().unwrap().remove(&c.eid);
+    equip_attrs().lock().unwrap().remove(&c.name);
     let data = FoodData::default();
     *c.food.lock().unwrap() = data.food_level;
     *c.sat.lock().unwrap() = data.saturation;
@@ -1893,14 +2268,57 @@ fn attr_default(name: &str) -> f64 {
         _ => 0.0,
     }
 }
+/// `attr_key_id`'s inverse for NBT export (`type` names are namespaced).
+fn attr_key_name(id: i64) -> Option<&'static str> {
+    Some(match id {
+        0 => "minecraft:generic.armor",
+        1 => "minecraft:generic.armor_toughness",
+        2 => "minecraft:generic.attack_damage",
+        3 => "minecraft:generic.attack_knockback",
+        4 => "minecraft:generic.attack_speed",
+        5 => "minecraft:player.block_break_speed",
+        6 => "minecraft:player.block_interaction_range",
+        7 => "minecraft:player.entity_interaction_range",
+        8 => "minecraft:generic.fall_damage_multiplier",
+        9 => "minecraft:generic.flying_speed",
+        10 => "minecraft:generic.follow_range",
+        11 => "minecraft:generic.gravity",
+        12 => "minecraft:generic.jump_strength",
+        13 => "minecraft:generic.knockback_resistance",
+        14 => "minecraft:generic.luck",
+        15 => "minecraft:generic.max_absorption",
+        16 => "minecraft:generic.max_health",
+        17 => "minecraft:generic.movement_speed",
+        18 => "minecraft:generic.safe_fall_distance",
+        19 => "minecraft:generic.scale",
+        20 => "minecraft:zombie.spawn_reinforcements",
+        21 => "minecraft:generic.step_height",
+        _ => return None,
+    })
+}
 fn attr_of(key: &str, name: &str) -> f64 {
-    attrs()
+    let base = attrs()
         .lock()
         .unwrap()
         .get(key)
         .and_then(|m| m.get(name))
         .copied()
-        .unwrap_or_else(|| attr_default(name))
+        .unwrap_or_else(|| attr_default(name));
+    // Vanilla attribute instances resolve equipment modifiers on top of the
+    // base. The equipment side is cached (computed without taking locks here:
+    // some callers hold the health lock, which orders after inventory).
+    if let (Some(id), Some(pname)) = (attr_key_id(name), key.strip_prefix("p:")) {
+        if let Some((add, mb, mt)) = equip_attrs()
+            .lock()
+            .unwrap()
+            .get(pname)
+            .and_then(|m| m.get(&(id as i32)))
+            .copied()
+        {
+            return (base + add) * (1.0 + mb) * mt;
+        }
+    }
+    base
 }
 fn max_hp_of(pname: &str) -> f32 {
     attr_of(&format!("p:{}", pname), "generic.max_health") as f32
@@ -1932,5 +2350,323 @@ fn send_attrs(c: &Arc<Client>) {
     let p = attrs_pkt(c.eid, &m);
     if let Ok(mut w) = c.sock.lock() {
         let _ = send_packet(&mut w, 0x75, p);
+    }
+}
+
+#[cfg(test)]
+mod p1_combat_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    /// Restores the shared tick clock and clears the per-player combat maps the
+    /// fixture eid/name can collide on across tests.
+    struct CombatGuard {
+        time: u64,
+    }
+    impl CombatGuard {
+        fn new() -> Self {
+            Self {
+                time: TICK_IDX.swap(0, Ordering::Relaxed),
+            }
+        }
+    }
+    impl std::ops::Drop for CombatGuard {
+        fn drop(&mut self) {
+            TICK_IDX.store(self.time, Ordering::Relaxed);
+            attack_tickers().lock().unwrap().remove(&4242);
+            equip_attrs().lock().unwrap().remove("totem-test");
+            mobs().lock().unwrap().retain(|m| m.eid != 4242);
+        }
+    }
+
+    fn attr_stack(mods: &[ItemAttributeModifier]) -> Stack {
+        let mut comps = Vec::new();
+        comp_set(
+            &mut comps,
+            COMP_ATTRIBUTE_MODIFIERS,
+            attr_modifiers_data(&AttributeModifiersComponent {
+                modifiers: mods.to_vec(),
+                show_in_tooltip: true,
+            }),
+        );
+        (name_to_item("diamond_sword").unwrap(), 1, comps)
+    }
+    fn attr_mod(attribute_id: i32, amount: f64, op: ItemAttrOp, slot: ItemAttrSlotGroup) -> ItemAttributeModifier {
+        ItemAttributeModifier {
+            attribute_id,
+            modifier_id: "mc-spine:test".to_string(),
+            amount,
+            operation: op,
+            slot,
+        }
+    }
+
+    fn test_mob(eid: i32) -> Arc<Mob> {
+        Arc::new(Mob {
+            dim: DimId::Overworld,
+            eid,
+            uuid: [eid as u8; 16],
+            etype: 124,
+            pos: Mutex::new((0.0, 64.0, 0.0, 0.0, 0.0)),
+            hp: Mutex::new(20.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            vel: Mutex::new([0.0; 3]),
+        })
+    }
+
+    #[test]
+    fn p1_combat_attack_cooldown_counts_game_ticks() {
+        let _g = CombatGuard::new();
+        let (client, _rx) = client_pair();
+        let client = Arc::new(client);
+        let sword = name_to_item("diamond_sword").unwrap();
+        client.inv.lock().unwrap().insert(36, (sword, 1, Vec::new()));
+        TICK_IDX.store(100, Ordering::Relaxed);
+        // Never attacked: full charge (vanilla attackStrengthTicker starts ready).
+        assert_eq!(melee_charge(&client, sword), 1.0);
+        // Diamond sword attack speed 1.6 -> delay 12.5 game ticks; charge
+        // (elapsed + 0.5) / delay.
+        TICK_IDX.store(103, Ordering::Relaxed);
+        let c = f64::from(melee_charge(&client, sword));
+        assert!((c - 3.5 / 12.5).abs() < 1e-6, "{c}");
+        TICK_IDX.store(112, Ordering::Relaxed);
+        let c = f64::from(melee_charge(&client, sword));
+        assert!((c - 9.5 / 12.5).abs() < 1e-6, "{c}");
+        TICK_IDX.store(300, Ordering::Relaxed);
+        assert_eq!(melee_charge(&client, sword), 1.0);
+    }
+
+    #[test]
+    fn p1_combat_attack_cooldown_ignores_wall_clock() {
+        let _g = CombatGuard::new();
+        let (client, _rx) = client_pair();
+        let client = Arc::new(client);
+        let sword = name_to_item("diamond_sword").unwrap();
+        client.inv.lock().unwrap().insert(36, (sword, 1, Vec::new()));
+        TICK_IDX.store(100, Ordering::Relaxed);
+        assert_eq!(melee_charge(&client, sword), 1.0);
+        // Wall time passes but TICK_IDX stands still (as under /tick freeze):
+        // the charge must not recharge.
+        std::thread::sleep(Duration::from_millis(650));
+        let c = f64::from(melee_charge(&client, sword));
+        assert!((c - 0.5 / 12.5).abs() < 1e-6, "frozen charge must be ~0.04, got {c}");
+    }
+
+    #[test]
+    fn p1_combat_held_item_switch_resets_charge() {
+        let _g = CombatGuard::new();
+        let (client, _rx) = client_pair();
+        let client = Arc::new(client);
+        let sword = name_to_item("diamond_sword").unwrap();
+        client.inv.lock().unwrap().insert(36, (sword, 1, Vec::new()));
+        client.inv.lock().unwrap().insert(37, (sword, 1, Vec::new()));
+        TICK_IDX.store(100, Ordering::Relaxed);
+        assert_eq!(melee_charge(&client, sword), 1.0);
+        TICK_IDX.store(112, Ordering::Relaxed);
+        // 12 ticks of charge (0.76) on the old item, then vanilla
+        // resetAttackStrengthTicker on the switch: the new item starts at 0.
+        *client.held.lock().unwrap() = 1;
+        let c = f64::from(melee_charge(&client, sword));
+        assert!((c - 0.5 / 12.5).abs() < 1e-6, "{c}");
+    }
+
+    #[test]
+    fn p1_combat_mob_hurt_window_runs_on_ticks() {
+        let _g = CombatGuard::new();
+        let mob = test_mob(4242);
+        mobs().lock().unwrap().push(mob.clone());
+        TICK_IDX.store(100, Ordering::Relaxed);
+        // The melee gate writes only the wall stamp; the tick pass adopts it.
+        *mob.hurt_at.lock().unwrap() = Instant::now();
+        mob_hurt_window_tick();
+        assert_eq!(*mob.last_hurt_tick.lock().unwrap(), Some(100));
+        assert!(
+            mob.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500),
+            "window must be shut ten ticks"
+        );
+        // Frozen ticks: even after the wall window would have lapsed, the gate
+        // stays shut.
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(mob.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500));
+        // Ten game ticks later the window ends and the wall stamp is backed out
+        // to the hurt instant (elapsed >= the 500ms gate).
+        TICK_IDX.store(110, Ordering::Relaxed);
+        mob_hurt_window_tick();
+        assert!(mob.hurt_at.lock().unwrap().elapsed() >= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn p1_combat_mob_hurt_window_stamped_paths_hold() {
+        let _g = CombatGuard::new();
+        let mob = test_mob(4242);
+        mobs().lock().unwrap().push(mob.clone());
+        TICK_IDX.store(100, Ordering::Relaxed);
+        *mob.last_hurt_tick.lock().unwrap() = Some(100);
+        *mob.hurt_at.lock().unwrap() = Instant::now();
+        mob_hurt_window_tick();
+        TICK_IDX.store(109, Ordering::Relaxed);
+        mob_hurt_window_tick();
+        assert!(
+            mob.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500),
+            "still inside the 10-tick window at tick 109"
+        );
+        TICK_IDX.store(110, Ordering::Relaxed);
+        mob_hurt_window_tick();
+        assert!(mob.hurt_at.lock().unwrap().elapsed() >= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn p1_combat_apply_item_attribute_modifiers_vanilla_order() {
+        let sword = attr_stack(&[
+            attr_mod(ATTR_ATTACK_DAMAGE, 2.0, ItemAttrOp::AddValue, ItemAttrSlotGroup::MainHand),
+            attr_mod(ATTR_ATTACK_DAMAGE, 0.5, ItemAttrOp::AddMultipliedBase, ItemAttrSlotGroup::Any),
+            attr_mod(ATTR_ATTACK_DAMAGE, 0.5, ItemAttrOp::AddMultipliedTotal, ItemAttrSlotGroup::Hand),
+            // Declared for feet: must not count while the sword is in hand.
+            attr_mod(ATTR_ATTACK_DAMAGE, 100.0, ItemAttrOp::AddValue, ItemAttrSlotGroup::Feet),
+        ]);
+        let pairs: Vec<(ItemAttrSlotGroup, &Stack)> =
+            vec![(ItemAttrSlotGroup::MainHand, &sword)];
+        // (1 + 2) * (1 + 0.5) * (1 + 0.5) = 6.75
+        assert_eq!(
+            apply_item_attribute_modifiers(1.0, &pairs, ATTR_ATTACK_DAMAGE),
+            6.75
+        );
+        // The same sword worn on the head sees only the Any modifier.
+        let head_pairs: Vec<(ItemAttrSlotGroup, &Stack)> =
+            vec![(ItemAttrSlotGroup::Head, &sword)];
+        assert_eq!(
+            apply_item_attribute_modifiers(1.0, &head_pairs, ATTR_ATTACK_DAMAGE),
+            1.5
+        );
+        // On the feet slot the Feet and Any modifiers both count — the
+        // MainHand and Hand ones do not: (1 + 100) * (1 + 0.5) = 151.5.
+        let feet_pairs: Vec<(ItemAttrSlotGroup, &Stack)> =
+            vec![(ItemAttrSlotGroup::Feet, &sword)];
+        assert_eq!(
+            apply_item_attribute_modifiers(1.0, &feet_pairs, ATTR_ATTACK_DAMAGE),
+            151.5
+        );
+        // No component: base passes through untouched.
+        let plain: Stack = (name_to_item("diamond_sword").unwrap(), 1, Vec::new());
+        let pairs = vec![(ItemAttrSlotGroup::MainHand, &plain)];
+        assert_eq!(
+            apply_item_attribute_modifiers(4.0, &pairs, ATTR_ATTACK_SPEED),
+            4.0
+        );
+    }
+
+    #[test]
+    fn p1_combat_armor_group_and_piece_defaults() {
+        // A helmet whose modifier is declared for the armor group counts on any
+        // armor slot; a piece with an explicit component replaces its vanilla
+        // default points entirely.
+        let helm = name_to_item("iron_helmet").unwrap();
+        let mut inv = HashMap::new();
+        inv.insert(5i16, (helm, 1, Vec::new()));
+        assert_eq!(armor_pts_of(&inv), 2);
+        let boosted = (
+            helm,
+            1,
+            vec![(
+                COMP_ATTRIBUTE_MODIFIERS,
+                attr_modifiers_data(&AttributeModifiersComponent {
+                    modifiers: vec![
+                        attr_mod(ATTR_ARMOR, 4.0, ItemAttrOp::AddValue, ItemAttrSlotGroup::Armor),
+                        attr_mod(ATTR_ARMOR_TOUGHNESS, 1.0, ItemAttrOp::AddValue, ItemAttrSlotGroup::Head),
+                    ],
+                    show_in_tooltip: true,
+                }),
+            )],
+        );
+        inv.insert(5, boosted);
+        // Component replaces the iron helmet's default 2: total is 4.
+        assert_eq!(armor_pts_of(&inv), 4);
+        let stacks = inv.get(&5).cloned().unwrap();
+        let pairs: Vec<(ItemAttrSlotGroup, &Stack)> =
+            vec![(ItemAttrSlotGroup::Head, &stacks)];
+        assert_eq!(armor_toughness_of(&pairs), 1.0);
+    }
+
+    #[test]
+    fn p1_combat_live_melee_uses_attribute_components() {
+        let _g = CombatGuard::new();
+        let (client, _rx) = client_pair();
+        let client = Arc::new(client);
+        let sword = name_to_item("diamond_sword").unwrap();
+        // +3 attack damage and a slower attack speed (1.2 < 1.6 table speed).
+        client.inv.lock().unwrap().insert(
+            36,
+            attr_stack(&[
+                attr_mod(ATTR_ATTACK_DAMAGE, 3.0, ItemAttrOp::AddValue, ItemAttrSlotGroup::MainHand),
+                attr_mod(ATTR_ATTACK_SPEED, -2.8, ItemAttrOp::AddValue, ItemAttrSlotGroup::MainHand),
+            ]),
+        );
+        TICK_IDX.store(100, Ordering::Relaxed);
+        // First charge seeds the equipment cache the attr path reads.
+        assert_eq!(melee_charge(&client, sword), 1.0);
+        // Live attack_damage attribute: base 1 + 3.
+        assert_eq!(
+            attr_of(&format!("p:{}", client.name), "generic.attack_damage"),
+            4.0
+        );
+        // Live attack speed: component replaces the vanilla default, so
+        // 4.0 - 2.8 = 1.2 -> delay 16.667 ticks; 3 elapsed -> ~0.21 charge
+        // (a plain diamond sword would be 0.28).
+        TICK_IDX.store(103, Ordering::Relaxed);
+        let c = f64::from(melee_charge(&client, sword));
+        assert!((c - 3.5 / (20.0 / 1.2)).abs() < 1e-6, "{c}");
+    }
+
+    #[test]
+    fn p1_combat_knockback_resistance_from_component() {
+        let _g = CombatGuard::new();
+        let (client, _rx) = client_pair();
+        let client = Arc::new(client);
+        assert_eq!(knockback_resist_of(&client), 0.0);
+        client.inv.lock().unwrap().insert(
+            45,
+            attr_stack(&[attr_mod(
+                ATTR_KNOCKBACK_RESISTANCE,
+                0.6,
+                ItemAttrOp::AddValue,
+                ItemAttrSlotGroup::OffHand,
+            )]),
+        );
+        assert_eq!(knockback_resist_of(&client), 0.6);
+    }
+
+    #[test]
+    fn p1_combat_max_health_component_via_attr_cache() {
+        let _g = CombatGuard::new();
+        let (client, _rx) = client_pair();
+        let client = Arc::new(client);
+        assert_eq!(max_hp_of(&client.name), 20.0);
+        client.inv.lock().unwrap().insert(
+            5,
+            (
+                name_to_item("iron_helmet").unwrap(),
+                1,
+                vec![(
+                    COMP_ATTRIBUTE_MODIFIERS,
+                    attr_modifiers_data(&AttributeModifiersComponent {
+                        modifiers: vec![attr_mod(
+                            ATTR_MAX_HEALTH,
+                            4.0,
+                            ItemAttrOp::AddValue,
+                            ItemAttrSlotGroup::Head,
+                        )],
+                        show_in_tooltip: true,
+                    }),
+                )],
+            ),
+        );
+        refresh_equip_attrs(&client);
+        assert_eq!(max_hp_of(&client.name), 24.0);
     }
 }
