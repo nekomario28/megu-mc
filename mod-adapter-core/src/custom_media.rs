@@ -26,8 +26,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
-use crate::mod_sync::sha256;
+use crate::mod_sync::{digest_hex, sha256};
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -96,6 +99,9 @@ pub enum MediaErrorKind {
     DuplicateChunk,
     /// Reassembled bytes failed SHA-256 or image-header verification.
     DigestMismatch,
+    /// On-disk media-store failure: I/O error, symlink, oversize file, or
+    /// integrity violation. Corrupt blobs are never served.
+    Storage,
 }
 
 /// Fail-closed error for every custom-media check. Carries a
@@ -589,7 +595,7 @@ impl CustomMediaRegistry {
             ("y", placement.pos.y),
             ("z", placement.pos.z),
         ] {
-            if v < -MAX_WORLD_COORD || v > MAX_WORLD_COORD {
+            if !(-MAX_WORLD_COORD..=MAX_WORLD_COORD).contains(&v) {
                 return Err(err(
                     MediaErrorKind::InvalidDimensions,
                     format!("canvas pos {axis}={v} outside world bounds"),
@@ -628,6 +634,290 @@ impl CustomMediaRegistry {
             .filter(|sha| !client_known_hashes.contains(sha))
             .filter_map(|sha| self.assets.get(&sha).map(|a| a.meta.clone()))
             .collect()
+    }
+
+    /// View-scoped variant of [`Self::missing_for_client`]: only canvases in
+    /// `dim` whose chunk lies within Chebyshev distance
+    /// `view_distance_chunks` of the client's chunk contribute their asset
+    /// digest. `client_cx`/`client_cz` are chunk coordinates; canvas block
+    /// positions are converted with `div_euclid(16)`. Paintings outside the
+    /// player's view — or placed in another dimension — cost zero wire
+    /// bytes.
+    pub fn missing_for_client_in_view(
+        &self,
+        dim: &str,
+        client_cx: i32,
+        client_cz: i32,
+        view_distance_chunks: i32,
+        client_known_hashes: &HashSet<[u8; 32]>,
+    ) -> Vec<MediaAssetMeta> {
+        let view = i64::from(view_distance_chunks.max(0));
+        let client_cx = i64::from(client_cx);
+        let client_cz = i64::from(client_cz);
+        let mut referenced: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for canvas in self.canvases.values() {
+            if canvas.dim != dim {
+                continue;
+            }
+            let cx = i64::from(canvas.pos.x).div_euclid(16);
+            let cz = i64::from(canvas.pos.z).div_euclid(16);
+            if (cx - client_cx).abs() <= view && (cz - client_cz).abs() <= view {
+                referenced.insert(canvas.media_sha256);
+            }
+        }
+        referenced
+            .into_iter()
+            .filter(|sha| !client_known_hashes.contains(sha))
+            .filter_map(|sha| self.assets.get(&sha).map(|a| a.meta.clone()))
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Disk-backed blob store with bounded hot-RAM LRU
+// ---------------------------------------------------------------------------
+
+/// Default hot-RAM budget for [`DiskBackedMediaStore`]: 32 MiB.
+pub const DEFAULT_HOT_RAM_BYTES: usize = 32 * 1024 * 1024;
+
+/// One hot-cached blob plus its LRU stamp.
+#[derive(Debug)]
+struct HotBlob {
+    bytes: Vec<u8>,
+    /// Last-use stamp; the smallest stamp is evicted first.
+    stamp: u64,
+}
+
+fn store_io(context: &str, e: io::Error) -> MediaError {
+    err(MediaErrorKind::Storage, format!("{context}: {e}"))
+}
+
+/// Content-addressed image blob store backed by an on-disk directory.
+///
+/// Every verified image is published atomically to
+/// `<root>/<hex_sha256>.bin` and may additionally live in a bounded hot-RAM
+/// LRU cache ([`Self::with_ram_cap`], default
+/// [`DEFAULT_HOT_RAM_BYTES`]). Evicting from RAM never deletes the blob —
+/// [`Self::get_bytes`] transparently reloads it from disk, re-verifying the
+/// SHA-256 before serving. Disk reads fail closed on symlinks, oversize
+/// files, and digest mismatches: corrupt bytes are never returned.
+#[derive(Debug)]
+pub struct DiskBackedMediaStore {
+    root: PathBuf,
+    max_ram_bytes: usize,
+    hot: HashMap<[u8; 32], HotBlob>,
+    /// `stamp -> sha256` giving O(log n) LRU eviction; exactly one live
+    /// entry per hot blob.
+    order: BTreeMap<u64, [u8; 32]>,
+    clock: u64,
+    cached_ram_bytes: usize,
+}
+
+impl DiskBackedMediaStore {
+    /// Store rooted at `root` with the default 32 MiB hot-RAM budget.
+    pub fn new<P: AsRef<Path>>(root: P) -> Result<Self, MediaError> {
+        Self::with_ram_cap(root, DEFAULT_HOT_RAM_BYTES)
+    }
+
+    /// Store rooted at `root` with an explicit hot-RAM byte budget.
+    /// `max_ram_bytes == 0` is clamped to 1 byte, which in practice keeps
+    /// the cache empty (every blob is larger) — a disk-only mode.
+    /// Fails closed when `root` already exists as a symlink.
+    pub fn with_ram_cap<P: AsRef<Path>>(root: P, max_ram_bytes: usize) -> Result<Self, MediaError> {
+        let root = root.as_ref().to_path_buf();
+        if let Ok(meta) = fs::symlink_metadata(&root) {
+            if meta.file_type().is_symlink() {
+                return Err(err(
+                    MediaErrorKind::Storage,
+                    "media store root is a symlink; refusing to follow",
+                ));
+            }
+        }
+        fs::create_dir_all(&root).map_err(|e| store_io("create media store root", e))?;
+        Ok(Self {
+            root,
+            max_ram_bytes: max_ram_bytes.max(1),
+            hot: HashMap::new(),
+            order: BTreeMap::new(),
+            clock: 0,
+            cached_ram_bytes: 0,
+        })
+    }
+
+    /// Bytes currently held in the hot-RAM LRU; always
+    /// `<= max_ram_bytes`.
+    pub fn cached_ram_bytes(&self) -> usize {
+        self.cached_ram_bytes
+    }
+
+    /// Number of blobs currently resident in hot RAM.
+    pub fn cached_count(&self) -> usize {
+        self.hot.len()
+    }
+
+    /// Configured hot-RAM budget in bytes.
+    pub fn max_ram_bytes(&self) -> usize {
+        self.max_ram_bytes
+    }
+
+    fn blob_path(&self, sha256: &[u8; 32]) -> PathBuf {
+        self.root.join(format!("{}.bin", digest_hex(sha256)))
+    }
+
+    /// Store `bytes` durably under their SHA-256 content address. The same
+    /// fail-closed validation as the registry applies (non-empty, size
+    /// bound, PNG/JPEG header with in-bounds dimensions). The blob is
+    /// published atomically — temp file in the same directory, then rename
+    /// — and admitted to the hot-RAM LRU, evicting older blobs as needed.
+    /// Returns the digest; re-storing identical bytes is idempotent.
+    pub fn put_bytes(&mut self, bytes: &[u8]) -> Result<[u8; 32], MediaError> {
+        if bytes.is_empty() {
+            return Err(err(
+                MediaErrorKind::UnsupportedFormat,
+                "empty image payload",
+            ));
+        }
+        if bytes.len() > MAX_MEDIA_BYTES {
+            return Err(err(
+                MediaErrorKind::PayloadTooLarge,
+                format!("image payload {} bytes exceeds {MAX_MEDIA_BYTES}", bytes.len()),
+            ));
+        }
+        inspect_image_header(bytes)?;
+        let digest = sha256(bytes);
+        let path = self.blob_path(&digest);
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                return Err(err(
+                    MediaErrorKind::Storage,
+                    "refusing to write through a symlinked blob path",
+                ));
+            }
+        }
+        let tmp = self
+            .root
+            .join(format!(".{}.tmp.{}", digest_hex(&digest), std::process::id()));
+        fs::write(&tmp, bytes).map_err(|e| store_io("write media blob temp file", e))?;
+        if let Err(e) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(store_io("publish media blob", e));
+        }
+        self.hot_insert(digest, bytes.to_vec());
+        Ok(digest)
+    }
+
+    /// Fetch blob bytes by digest: served from hot RAM on a hit, otherwise
+    /// transparently reloaded from disk — SHA-256 re-verified — and
+    /// promoted into the LRU while `cached_ram_bytes` stays within budget.
+    /// `Ok(None)` when nothing is stored under `sha256`. I/O failures,
+    /// symlinks, oversize files, and digest mismatches are fail-closed
+    /// `Err`s; corrupt bytes are never served.
+    pub fn get_bytes(&mut self, sha256: &[u8; 32]) -> Result<Option<Vec<u8>>, MediaError> {
+        if self.hot.contains_key(sha256) {
+            self.touch(*sha256);
+            let blob = self.hot.get(sha256).expect("hot entry checked above");
+            return Ok(Some(blob.bytes.clone()));
+        }
+        let path = self.blob_path(sha256);
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(store_io("stat media blob", e)),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(err(
+                MediaErrorKind::Storage,
+                "blob path is a symlink; refusing to follow",
+            ));
+        }
+        if !meta.is_file() {
+            return Err(err(
+                MediaErrorKind::Storage,
+                "blob path is not a regular file",
+            ));
+        }
+        if meta.len() > MAX_MEDIA_BYTES as u64 {
+            return Err(err(
+                MediaErrorKind::Storage,
+                format!(
+                    "on-disk blob {} bytes exceeds {MAX_MEDIA_BYTES}",
+                    meta.len()
+                ),
+            ));
+        }
+        let bytes = fs::read(&path).map_err(|e| store_io("read media blob", e))?;
+        if bytes.len() > MAX_MEDIA_BYTES {
+            return Err(err(
+                MediaErrorKind::Storage,
+                format!(
+                    "on-disk blob {} bytes exceeds {MAX_MEDIA_BYTES}",
+                    bytes.len()
+                ),
+            ));
+        }
+        if crate::mod_sync::sha256(&bytes) != *sha256 {
+            return Err(err(
+                MediaErrorKind::DigestMismatch,
+                "on-disk blob fails SHA-256 verification",
+            ));
+        }
+        self.hot_insert(*sha256, bytes.clone());
+        Ok(Some(bytes))
+    }
+
+    /// Whether a blob is retrievable — hot or a regular file on disk.
+    /// Symlinked paths do not count: [`Self::get_bytes`] refuses them.
+    pub fn contains(&self, sha256: &[u8; 32]) -> bool {
+        self.hot.contains_key(sha256)
+            || fs::symlink_metadata(self.blob_path(sha256))
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+    }
+
+    /// Insert `bytes` into the hot LRU as most-recently-used, then evict
+    /// least-recently-used blobs until `cached_ram_bytes <= max_ram_bytes`.
+    /// Blobs larger than the whole budget are never cached — disk remains
+    /// authoritative for them.
+    fn hot_insert(&mut self, sha256: [u8; 32], bytes: Vec<u8>) {
+        if bytes.is_empty() || bytes.len() > self.max_ram_bytes {
+            return;
+        }
+        if let Some(old) = self.hot.remove(&sha256) {
+            self.cached_ram_bytes = self.cached_ram_bytes.saturating_sub(old.bytes.len());
+            self.order.remove(&old.stamp);
+        }
+        self.clock += 1;
+        let len = bytes.len();
+        self.hot
+            .insert(sha256, HotBlob { bytes, stamp: self.clock });
+        self.order.insert(self.clock, sha256);
+        self.cached_ram_bytes += len;
+        self.evict_lru();
+    }
+
+    /// Mark `sha256` most-recently-used. Caller guarantees a hot entry.
+    fn touch(&mut self, sha256: [u8; 32]) {
+        self.clock += 1;
+        if let Some(blob) = self.hot.get_mut(&sha256) {
+            let old_stamp = blob.stamp;
+            blob.stamp = self.clock;
+            self.order.remove(&old_stamp);
+            self.order.insert(self.clock, sha256);
+        }
+    }
+
+    /// Drop least-recently-used hot blobs until the byte budget holds.
+    /// Evicted blobs stay durable on disk.
+    fn evict_lru(&mut self) {
+        while self.cached_ram_bytes > self.max_ram_bytes {
+            let Some((&stamp, &sha256)) = self.order.iter().next() else {
+                break;
+            };
+            self.order.remove(&stamp);
+            if let Some(blob) = self.hot.remove(&sha256) {
+                self.cached_ram_bytes = self.cached_ram_bytes.saturating_sub(blob.bytes.len());
+            }
+        }
     }
 }
 

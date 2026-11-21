@@ -46,8 +46,8 @@
 
 use crate::sharded::{BlockCoord, ChunkCoord, ServerContext};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 
 /// Frame magic: `AUD`it log, revision 1.
@@ -59,6 +59,11 @@ const MAX_FRAME_PAYLOAD: u32 = 4 * 1024 * 1024;
 const FLAG_ROLLED_BACK: u8 = 0b01;
 /// `flags` bit: the payload carries an `item_id` string.
 const FLAG_HAS_ITEM: u8 = 0b10;
+/// Default in-memory record window for [`AuditLog::new`]: generous enough
+/// for ordinary operations, small enough that a 30-day WAL cannot grow
+/// server RAM without bound. Older history stays durable in the `AUD1`
+/// WAL and remains reachable through [`AuditLog::query_wal_streaming`].
+pub const DEFAULT_MAX_IN_MEMORY_ENTRIES: usize = 50_000;
 
 /// What an [`AuditRecord`] did to the world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -230,10 +235,12 @@ pub struct BlockRollbackDelta {
     pub restored_state: u32,
 }
 
-/// Append-only audit log: in-memory records plus a `(dimension, cx, cz)`
-/// chunk-bucket index over them. Records are never reordered or renumbered,
-/// so `seq` order is history order.
-#[derive(Default)]
+/// Append-only audit log: a bounded in-memory window of recent records
+/// plus a `(dimension, cx, cz)` chunk-bucket index over them. Records are
+/// never reordered or renumbered, so `seq` order is history order. When
+/// the window exceeds [`Self::max_in_memory`], the oldest records — and
+/// their index entries — are evicted; the `AUD1` WAL on disk always
+/// retains the full durable history.
 pub struct AuditLog {
     records: Vec<AuditRecord>,
     /// Next sequence number `append` hands out (starts at 1).
@@ -242,15 +249,48 @@ pub struct AuditLog {
     /// the outer map so radius queries pay one string hash per lookup box,
     /// not per key.
     chunk_index: HashMap<String, HashMap<(i32, i32), Vec<usize>>>,
+    /// Maximum records held in memory; excess evicts oldest-first.
+    max_in_memory: usize,
+    /// Total records evicted from the in-memory window over the log's life.
+    evicted_count: u64,
+}
+
+impl Default for AuditLog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AuditLog {
+    /// Log with the default in-memory window
+    /// ([`DEFAULT_MAX_IN_MEMORY_ENTRIES`]).
     pub fn new() -> Self {
+        Self::with_ram_cap(DEFAULT_MAX_IN_MEMORY_ENTRIES)
+    }
+
+    /// Log with an explicit in-memory record cap. `0` is clamped to `1` —
+    /// a window must always hold the record just appended. Records beyond
+    /// the cap are evicted oldest-first (records *and* their spatial index
+    /// entries), keeping RAM strictly bounded; the WAL keeps everything.
+    pub fn with_ram_cap(max_in_memory_entries: usize) -> Self {
         Self {
             records: Vec::new(),
             next_seq: 1,
             chunk_index: HashMap::new(),
+            max_in_memory: max_in_memory_entries.max(1),
+            evicted_count: 0,
         }
+    }
+
+    /// Configured in-memory record cap.
+    pub fn max_in_memory(&self) -> usize {
+        self.max_in_memory
+    }
+
+    /// How many records have been evicted from the in-memory window.
+    /// Evicted history is still durable in the `AUD1` WAL.
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted_count
     }
 
     pub fn len(&self) -> usize {
@@ -279,6 +319,7 @@ impl AuditLog {
         let seq = record.seq;
         self.records.push(record);
         self.index_record(self.records.len() - 1);
+        self.enforce_ram_window();
         seq
     }
 
@@ -292,6 +333,7 @@ impl AuditLog {
         self.next_seq += 1;
         self.records.push(record);
         self.index_record(self.records.len() - 1);
+        self.enforce_ram_window();
         Ok(self.next_seq - 1)
     }
 
@@ -446,10 +488,35 @@ impl AuditLog {
     }
 
     /// `recover` over a whole file. Only file I/O can produce `Err`; a
-    /// truncated or corrupt tail is data, not an error.
+    /// truncated or corrupt tail is data, not an error. The recovered log
+    /// obeys the same in-memory cap as a live one — use
+    /// [`AuditLog::query_wal_streaming`] to search history the window has
+    /// already evicted.
     pub fn recover_from_file<P: AsRef<Path>>(path: P) -> io::Result<(Self, usize)> {
         let bytes = std::fs::read(path)?;
         Ok(Self::recover(&bytes))
+    }
+
+    /// Query a WAL file directly: `AUD1` frames are streamed from disk one
+    /// at a time, CRC-checked, decoded, filtered through `query`, and
+    /// dropped — the full durable history is searchable at O(1) log-size
+    /// memory, including records the bounded in-memory window evicted.
+    /// Replay stops at the first incomplete, corrupt, or undecodable frame,
+    /// exactly like [`AuditLog::recover`]: an append-only log cannot trust
+    /// anything written after a bad frame.
+    pub fn query_wal_streaming<P: AsRef<Path>>(
+        wal_path: P,
+        query: &AuditQuery,
+    ) -> io::Result<Vec<AuditRecord>> {
+        let file = File::open(wal_path)?;
+        let mut reader = BufReader::new(file);
+        let mut out = Vec::new();
+        while let Some(record) = read_audit_frame(&mut reader)? {
+            if Self::matches(&record, query) {
+                out.push(record);
+            }
+        }
+        Ok(out)
     }
 
     /// Insert a record exactly as stored (its `seq` is trusted, not
@@ -458,6 +525,38 @@ impl AuditLog {
         self.next_seq = self.next_seq.max(record.seq + 1);
         self.records.push(record);
         self.index_record(self.records.len() - 1);
+        self.enforce_ram_window();
+    }
+
+    /// Evict oldest records — and their chunk-index entries — until the
+    /// in-memory window fits the cap. Draining happens in batches (down to
+    /// 3/4 of the cap) so the `O(records)` memmove and `O(index)` reindex
+    /// stay amortized O(1) per append. Only RAM is reclaimed: the `AUD1`
+    /// WAL on disk retains every record ever appended.
+    fn enforce_ram_window(&mut self) {
+        if self.records.len() <= self.max_in_memory {
+            return;
+        }
+        let keep = (self.max_in_memory - self.max_in_memory / 4).max(1);
+        let drain = self.records.len() - keep;
+        self.records.drain(..drain);
+        self.evicted_count += drain as u64;
+        // Every stored index points `drain` positions too high now; indices
+        // below `drain` named evicted records and are dropped with them.
+        for buckets in self.chunk_index.values_mut() {
+            for bucket in buckets.values_mut() {
+                bucket.retain_mut(|i| {
+                    if *i >= drain {
+                        *i -= drain;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            buckets.retain(|_, bucket| !bucket.is_empty());
+        }
+        self.chunk_index.retain(|_, buckets| !buckets.is_empty());
     }
 
     /// Add record `index` to the `(dimension, cx, cz)` bucket index.
@@ -754,6 +853,43 @@ fn decode_frame(bytes: &[u8]) -> Option<(AuditRecord, usize)> {
         return None;
     }
     Some((decode_payload(payload)?, end))
+}
+
+/// Read one `AUD1` frame from `reader` for [`AuditLog::query_wal_streaming`].
+/// `Ok(None)` on a clean end-of-file, a torn tail, a bad magic, an
+/// oversized length, a CRC mismatch, or an undecodable payload — the same
+/// stop conditions [`AuditLog::recover`] applies, so both see identical
+/// history.
+fn read_audit_frame<R: Read>(reader: &mut R) -> io::Result<Option<AuditRecord>> {
+    let mut head = [0u8; 8];
+    if let Err(e) = reader.read_exact(&mut head) {
+        return if e.kind() == io::ErrorKind::UnexpectedEof {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+    if &head[..4] != AUDIT_MAGIC {
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes(head[4..8].try_into().expect("8-byte frame head"));
+    if len > MAX_FRAME_PAYLOAD {
+        return Ok(None);
+    }
+    let mut body = vec![0u8; len as usize + 4];
+    if let Err(e) = reader.read_exact(&mut body) {
+        return if e.kind() == io::ErrorKind::UnexpectedEof {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+    let payload = &body[..len as usize];
+    let stored_crc = u32::from_be_bytes(body[len as usize..].try_into().expect("4 crc bytes"));
+    if crc32(payload) != stored_crc {
+        return Ok(None);
+    }
+    Ok(decode_payload(payload))
 }
 
 // ------------------------------------------------------------------ CRC32

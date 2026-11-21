@@ -8,12 +8,15 @@
 //! rejection.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mod_adapter_core::custom_media::{
-    encode_media_chunks, inspect_image_header, CanvasFacing, CustomMediaRegistry, MediaChunkReassembler,
-    MediaErrorKind, MediaFormat, MediaPos, CanvasPlacement, MDIA_CHUNK_PAYLOAD, MAX_MEDIA_BYTES,
+    encode_media_chunks, inspect_image_header, CanvasFacing, CustomMediaRegistry,
+    DiskBackedMediaStore, MediaChunkReassembler, MediaErrorKind, MediaFormat, MediaPos,
+    CanvasPlacement, MDIA_CHUNK_PAYLOAD, MAX_MEDIA_BYTES,
 };
-use mod_adapter_core::mod_sync::sha256;
+use mod_adapter_core::mod_sync::{digest_hex, sha256, sha256_hex};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -61,6 +64,45 @@ fn canvas_for(id: u64, sha: [u8; 32]) -> CanvasPlacement {
         height_blocks: 1,
         media_sha256: sha,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scratch dirs for disk-backed store tests
+// ---------------------------------------------------------------------------
+
+static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "mc-spine-media-{}-{}-{tag}",
+            std::process::id(),
+            DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A valid PNG padded with inert trailing bytes to an exact size, so LRU
+/// byte accounting is exercised deterministically.
+fn sized_png(target: usize, pad: u8) -> Vec<u8> {
+    let mut v = png_bytes(8, 8);
+    assert!(v.len() < target, "fixture smaller than target");
+    v.resize(target, pad);
+    v
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +267,74 @@ fn canvas_lifecycle_and_missing_for_client() {
     assert!(reg.canvas(1).is_none());
 }
 
+#[test]
+fn missing_for_client_in_view_skips_out_of_view_and_other_dims() {
+    let mut reg = CustomMediaRegistry::new();
+    let near = reg.register_asset("u", "near", &png_bytes(8, 8)).unwrap();
+    let far = reg.register_asset("u", "far", &png_bytes(16, 16)).unwrap();
+    let other_dim = reg
+        .register_asset("u", "other", &png_bytes(24, 24))
+        .unwrap();
+
+    // In view: pos (-10, 64, -20) -> chunk (-1, -2) via div_euclid(16).
+    let mut c = canvas_for(1, near.sha256);
+    c.pos = MediaPos::new(-10, 64, -20);
+    reg.place_canvas(c).unwrap();
+    // Same dimension but ~64 chunks away in z -> outside view distance 1.
+    let mut c = canvas_for(2, far.sha256);
+    c.pos = MediaPos::new(-10, 64, 1000);
+    reg.place_canvas(c).unwrap();
+    // Same spot as the near canvas but a different dimension -> excluded.
+    let mut c = canvas_for(3, other_dim.sha256);
+    c.dim = "minecraft:the_nether".to_string();
+    c.pos = MediaPos::new(-10, 64, -20);
+    reg.place_canvas(c).unwrap();
+
+    // Client chunk (0, -2), view distance 1 chunk: only the near painting
+    // is inside the Chebyshev window ((-1,-2) vs (0,-2): dx=1, dz=0).
+    let missing = reg.missing_for_client_in_view(
+        "minecraft:overworld",
+        0,
+        -2,
+        1,
+        &HashSet::new(),
+    );
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].sha256, near.sha256);
+
+    // The unfiltered variant still sees every placed canvas's assets.
+    assert_eq!(reg.missing_for_client(&HashSet::new()).len(), 3);
+
+    // A client already holding the in-view digest needs nothing, and a
+    // client in a different dimension sees none of these canvases.
+    let known = HashSet::from([near.sha256]);
+    assert!(
+        reg.missing_for_client_in_view("minecraft:overworld", 0, -2, 1, &known)
+            .is_empty()
+    );
+    assert!(
+        reg.missing_for_client_in_view("minecraft:the_end", 0, -2, 64, &HashSet::new())
+            .is_empty()
+    );
+
+    // View distance 0 still matches the client's own chunk: from client
+    // chunk (-1, -2) the near canvas and a second far-asset canvas placed
+    // in that same chunk are in view; the distant far canvas is not.
+    let mut same_chunk = canvas_for(4, far.sha256);
+    same_chunk.pos = MediaPos::new(-9, 64, -21); // chunk (-1, -2)
+    reg.place_canvas(same_chunk).unwrap();
+    let missing = reg.missing_for_client_in_view(
+        "minecraft:overworld",
+        -1,
+        -2,
+        0,
+        &HashSet::new(),
+    );
+    assert_eq!(missing.len(), 2);
+    assert!(missing.iter().any(|m| m.sha256 == near.sha256));
+    assert!(missing.iter().any(|m| m.sha256 == far.sha256));
+}
+
 // ---------------------------------------------------------------------------
 // MDIA chunked wire framing
 // ---------------------------------------------------------------------------
@@ -344,4 +454,119 @@ fn encode_rejects_empty_and_oversized() {
     assert!(encode_media_chunks(&digest, &[]).is_err());
     let big = vec![0u8; MAX_MEDIA_BYTES + 1];
     assert!(encode_media_chunks(&digest, &big).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// DiskBackedMediaStore: bounded hot-RAM LRU over durable blobs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn disk_store_lru_cap_bounds_ram_and_disk_stays_durable() {
+    let dir = TestDir::new("store-lru");
+    let root = dir.path("blobs");
+    let mut store = DiskBackedMediaStore::with_ram_cap(&root, 200).expect("open store");
+
+    // Three distinct 100-byte images against a 200-byte RAM budget.
+    let img_a = sized_png(100, 0x11);
+    let img_b = sized_png(100, 0x22);
+    let img_c = sized_png(100, 0x33);
+    let a = store.put_bytes(&img_a).expect("put a");
+    let b = store.put_bytes(&img_b).expect("put b");
+    let c = store.put_bytes(&img_c).expect("put c");
+    assert_ne!(a, b);
+    assert_ne!(b, c);
+
+    // RAM stayed within budget; every blob is durable on disk regardless.
+    assert!(store.cached_ram_bytes() <= 200);
+    assert_eq!(store.cached_ram_bytes(), 200, "two 100B blobs fit the cap");
+    for (digest, img) in [(a, &img_a), (b, &img_b), (c, &img_c)] {
+        let disk = root.join(format!("{}.bin", sha256_hex(img)));
+        assert_eq!(disk.file_name().unwrap().to_str().unwrap(),
+            format!("{}.bin", digest_hex(&digest)));
+        assert!(store.contains(&digest));
+    }
+
+    // The LRU-evicted blob reloads transparently from disk with identical
+    // bytes, and the reload itself is promoted within the byte budget.
+    for digest in [a, b, c, a] {
+        let got = store.get_bytes(&digest).expect("get").expect("present");
+        let want = match digest {
+            d if d == a => &img_a,
+            d if d == b => &img_b,
+            _ => &img_c,
+        };
+        assert_eq!(&got, want);
+        assert!(store.cached_ram_bytes() <= 200);
+    }
+
+    // Unknown digest: absent, not an error.
+    assert!(store.get_bytes(&[0xEE; 32]).unwrap().is_none());
+}
+
+#[test]
+fn disk_store_rejects_oversize_and_non_image_payloads() {
+    let dir = TestDir::new("store-validate");
+    let mut store = DiskBackedMediaStore::new(dir.path("blobs")).expect("open store");
+    assert!(store.put_bytes(b"").is_err());
+    let err = store.put_bytes(b"<svg>nope</svg>").unwrap_err();
+    assert_eq!(err.kind(), MediaErrorKind::UnsupportedFormat);
+    let mut big = png_bytes(1, 1);
+    big.resize(MAX_MEDIA_BYTES + 1, 0x00);
+    let err = store.put_bytes(&big).unwrap_err();
+    assert_eq!(err.kind(), MediaErrorKind::PayloadTooLarge);
+    assert_eq!(store.cached_ram_bytes(), 0);
+}
+
+#[test]
+fn disk_store_fails_closed_on_tampered_disk_blob() {
+    let dir = TestDir::new("store-tamper");
+    let root = dir.path("blobs");
+    let mut store = DiskBackedMediaStore::with_ram_cap(&root, 200).expect("open store");
+
+    let img_a = sized_png(100, 0x11);
+    let img_b = sized_png(100, 0x22);
+    let img_c = sized_png(100, 0x33);
+    let a = store.put_bytes(&img_a).unwrap();
+    let b = store.put_bytes(&img_b).unwrap();
+    store.put_bytes(&img_c).unwrap();
+    // Cap 200 / 3x100B: `a` is the LRU eviction — served only from disk.
+    assert_eq!(store.cached_count(), 2);
+    assert!(store.cached_ram_bytes() <= 200);
+
+    // Tamper with the durable copy: the SHA-256 re-verify must refuse it.
+    let path = root.join(format!("{}.bin", sha256_hex(&img_a)));
+    std::fs::write(&path, b"forged bytes, same length-ish").unwrap();
+    let err = store.get_bytes(&a).unwrap_err();
+    assert_eq!(err.kind(), MediaErrorKind::DigestMismatch);
+    // Hot-cached siblings are unaffected.
+    assert_eq!(
+        store.get_bytes(&b).unwrap().unwrap(),
+        img_b,
+        "untampered hot blob still serves"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn disk_store_refuses_symlinked_blob_paths() {
+    let dir = TestDir::new("store-symlink");
+    let root = dir.path("blobs");
+    let mut store = DiskBackedMediaStore::new(&root).expect("open store");
+
+    // A digest whose "blob" is actually a symlink must fail closed, never
+    // follow the link.
+    let ghost = [0xEEu8; 32];
+    let ghost_path = root.join(format!("{}.bin", digest_hex(&ghost)));
+    std::os::unix::fs::symlink(dir.path("elsewhere"), &ghost_path).unwrap();
+    let err = store.get_bytes(&ghost).unwrap_err();
+    assert_eq!(err.kind(), MediaErrorKind::Storage);
+    assert!(!store.contains(&ghost));
+
+    // A symlinked store root is rejected at open time.
+    let real = dir.path("real-root");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = dir.path("link-root");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let err = DiskBackedMediaStore::new(&link).unwrap_err();
+    assert_eq!(err.kind(), MediaErrorKind::Storage);
 }

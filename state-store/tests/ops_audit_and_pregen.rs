@@ -203,6 +203,138 @@ fn audit_wal_corrupt_frame_stops_replay_at_that_point() {
     assert_eq!(truncated, frames.len() - second_frame.len());
 }
 
+#[test]
+fn audit_ram_cap_bounds_window_and_wal_streaming_reads_full_history() {
+    let dir = TestDir::new("ramcap");
+    let path = dir.path("audit.aud1");
+
+    // 500 appends against a 100-entry in-memory window, all durable in WAL.
+    let mut log = AuditLog::with_ram_cap(100);
+    for i in 0..500u64 {
+        log.append_to_file(
+            &path,
+            record(
+                1000 + i,
+                if i % 2 == 0 { "Alice" } else { "Griefer" },
+                [(i % 7) as i32 * 16, 64, (i % 5) as i32 * 16],
+                AuditAction::BlockPlace,
+                0,
+                i as u32,
+            ),
+        )
+        .unwrap();
+    }
+
+    // The window is strictly bounded and evictions are accounted: every
+    // appended record is either resident or counted as evicted.
+    assert!(log.len() <= 100, "len {} must respect the cap", log.len());
+    assert_eq!(
+        log.evicted_count(),
+        500 - log.len() as u64,
+        "evicted + resident must equal appended"
+    );
+    assert!(log.evicted_count() > 0);
+
+    // Resident records are exactly the newest seqs, contiguous to 500.
+    let seqs: Vec<u64> = log.records().iter().map(|r| r.seq).collect();
+    let first = 501 - seqs.len() as u64;
+    assert_eq!(seqs, (first..=500).collect::<Vec<_>>());
+
+    // The spatial index was reindexed with the records: an unfiltered
+    // query returns exactly the resident window, and bucket lookups for
+    // evicted positions return nothing instead of stale indices.
+    assert_eq!(log.query(&AuditQuery::new()).len(), log.len());
+    let stale = log.query(&AuditQuery::new().actor("#nobody"));
+    assert!(stale.is_empty());
+
+    // WAL streaming sees the FULL durable history the window evicted.
+    let all = AuditLog::query_wal_streaming(&path, &AuditQuery::new()).unwrap();
+    assert_eq!(all.len(), 500);
+    assert_eq!(all[0].seq, 1);
+    assert_eq!(all[499].seq, 500);
+    assert!(all.windows(2).all(|w| w[0].seq + 1 == w[1].seq));
+
+    let griefer = AuditLog::query_wal_streaming(
+        &path,
+        &AuditQuery::new().actor("Griefer"),
+    )
+    .unwrap();
+    assert_eq!(griefer.len(), 250);
+    // The same filter against the bounded in-memory window sees only the
+    // recent tail — proof the streaming path reaches evicted history.
+    let mem = log.query(&AuditQuery::new().actor("Griefer"));
+    assert!(!mem.is_empty());
+    assert!(mem.len() < griefer.len());
+
+    // Spatial + tick filters compose on the streamed path too.
+    let recent = AuditLog::query_wal_streaming(
+        &path,
+        &AuditQuery::new().since_tick(1490),
+    )
+    .unwrap();
+    assert_eq!(recent.len(), 10);
+    assert!(recent.iter().all(|r| r.tick >= 1490));
+}
+
+#[test]
+fn audit_ram_cap_zero_clamps_and_recover_resumes_seq() {
+    let mut log = AuditLog::with_ram_cap(0);
+    assert_eq!(log.max_in_memory(), 1);
+    for i in 0..5u64 {
+        log.append(record(i, "A", [i as i32, 64, 0], AuditAction::BlockPlace, 0, 1));
+    }
+    assert_eq!(log.len(), 1);
+    assert_eq!(log.evicted_count(), 4);
+    assert_eq!(log.records()[0].seq, 5, "only the newest record survives");
+
+    // Recovery rebuilds the window under the default cap and next_seq
+    // still resumes past the full on-disk history.
+    let dir = TestDir::new("ramcap-recover");
+    let path = dir.path("audit.aud1");
+    let mut log = AuditLog::with_ram_cap(10);
+    for i in 0..50u64 {
+        log.append_to_file(
+            &path,
+            record(i, "A", [i as i32, 64, 0], AuditAction::BlockPlace, 0, 1),
+        )
+        .unwrap();
+    }
+    let (mut recovered, truncated) = AuditLog::recover_from_file(&path).unwrap();
+    assert_eq!(truncated, 0);
+    assert_eq!(recovered.len(), 50, "50 records fit the default window");
+    assert_eq!(
+        recovered.append(record(99, "B", [0, 64, 0], AuditAction::BlockPlace, 0, 1)),
+        51,
+        "seq numbering continues past evicted history"
+    );
+}
+
+#[test]
+fn audit_wal_streaming_stops_at_first_bad_frame() {
+    let dir = TestDir::new("wal-stream-corrupt");
+    let path = dir.path("audit.aud1");
+
+    let mut log = AuditLog::new();
+    for i in 0..3u64 {
+        log.append_to_file(
+            &path,
+            record(i, "Alice", [i as i32, 64, 0], AuditAction::BlockPlace, 0, 1),
+        )
+        .unwrap();
+    }
+    // Three identical frames; flip a byte at the file midpoint — inside
+    // frame 2's payload/CRC region — then replay must stop there exactly
+    // like `recover` does, never trusting frame 3.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0x5a;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let got = AuditLog::query_wal_streaming(&path, &AuditQuery::new()).unwrap();
+    assert_eq!(got.len(), 1, "replay stops at the corrupt frame like recover");
+    assert_eq!(got[0].seq, 1);
+}
+
 // ----------------------------------------------------------- grief rollback
 
 #[test]
