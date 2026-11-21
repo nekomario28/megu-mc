@@ -32,6 +32,10 @@ WATER_SOURCE = WATER_BLOCK["defaultState"]
 WATER_STATES = range(WATER_BLOCK["minStateId"], WATER_BLOCK["maxStateId"] + 1)
 PLAYER_HALF_WIDTH = 0.3
 PLAYER_HEIGHT = 1.8
+# VecDeltaCodec quantizes positions to 1/4096 blocks before differencing.
+POSITION_QUANTUM = 4096.0
+# 0x70 absolute teleport plus the 0x2e/0x2f/0x30 relative-move rewrites of it.
+MOVE_IDS = (0x70, 0x2e, 0x2f, 0x30)
 # LivingEntity.travel widens 0.8F to double before applying vertical drag.
 WATER_VERTICAL_DRAG = 0.800000011920929
 OVERWORLD = ("minecraft:overworld", -64, 384, 24, True)
@@ -43,6 +47,17 @@ FULL_BLOCK_STATES = {
 }
 
 
+def wire_position_q(coords):
+    return tuple(math.floor(c * POSITION_QUANTUM + 0.5) for c in coords)
+
+
+def last_entity_pose(client, entity_id):
+    for eid, coords, grounded in reversed(client.teleports):
+        if eid == entity_id:
+            return coords, grounded
+    return None
+
+
 class PredictionClient(Client):
     def __init__(self, game, name):
         super().__init__(game, name)
@@ -50,6 +65,8 @@ class PredictionClient(Client):
         self.position_syncs = []
         self.tracked = set()
         self.teleports = []
+        self.entity_pos_q = {}
+        self.last_move_packet = None
 
     def read(self, timeout):
         packet, body = super().read(timeout)
@@ -60,12 +77,21 @@ class PredictionClient(Client):
                 self.position_syncs.append(self.pos)
             elif packet == 0x47:
                 self.tracked.clear()
+                self.entity_pos_q.clear()
             elif packet == 0x01:
-                self.tracked.add(Reader(body).varint())
+                reader = Reader(body)
+                eid = reader.varint()
+                self.tracked.add(eid)
+                reader.take(16)  # uuid
+                reader.varint()  # entity type
+                self.entity_pos_q[eid] = wire_position_q(
+                    [reader.number(">d") for _ in range(3)])
             elif packet == 0x42:
                 reader = Reader(body)
                 for _ in range(reader.varint()):
-                    self.tracked.discard(reader.varint())
+                    eid = reader.varint()
+                    self.tracked.discard(eid)
+                    self.entity_pos_q.pop(eid, None)
             elif packet == 0x70:
                 reader = Reader(body)
                 eid = reader.varint()
@@ -73,7 +99,27 @@ class PredictionClient(Client):
                 reader.take(2)  # encoded yaw and pitch
                 grounded = bool(reader.number("B"))
                 require(reader.pos == len(body), "entity-teleport-complete")
+                self.entity_pos_q[eid] = wire_position_q(coords)
                 self.teleports.append((eid, coords, grounded))
+                self.last_move_packet = packet
+            elif packet in (0x2e, 0x2f, 0x30):
+                reader = Reader(body)
+                eid = reader.varint()
+                if packet == 0x30:
+                    reader.take(2)  # yaw and pitch
+                    delta = (0, 0, 0)
+                else:
+                    delta = tuple(reader.number(">h") for _ in range(3))
+                    if packet == 0x2f:
+                        reader.take(2)  # yaw and pitch
+                grounded = bool(reader.number("B"))
+                require(reader.pos == len(body), "entity-relative-move-complete")
+                if eid in self.entity_pos_q:
+                    self.entity_pos_q[eid] = tuple(
+                        q + d for q, d in zip(self.entity_pos_q[eid], delta))
+                    coords = tuple(v / POSITION_QUANTUM for v in self.entity_pos_q[eid])
+                    self.teleports.append((eid, coords, grounded))
+                self.last_move_packet = packet
         return packet, body
 
 
@@ -205,12 +251,26 @@ def drain(client, duration=0.20):
 
 
 def await_authority(observer, entity_id, expected, grounded):
-    def moved(packet, body):
-        return packet == 0x70 and observer.teleports[-1][0] == entity_id
+    expected_q = wire_position_q(expected)
+    # A repeated pose inside the entity's update interval is culled before it
+    # reaches the wire, so an already-matching pose needs no fresh broadcast.
+    known = last_entity_pose(observer, entity_id)
+    if (known is not None and wire_position_q(known[0]) == expected_q
+            and known[1] == grounded):
+        return
+
+    def moved(packet, _body):
+        return (packet in MOVE_IDS and observer.teleports
+                and observer.teleports[-1][0] == entity_id
+                and wire_position_q(observer.teleports[-1][1]) == expected_q
+                and observer.teleports[-1][2] == grounded)
 
     observer.until(moved, "server-entity-teleport")
     _, authoritative, server_ground = observer.teleports[-1]
-    require(authoritative == expected, "server-position-drift")
+    if observer.last_move_packet == 0x70:
+        require(authoritative == expected, "server-position-drift")
+    else:
+        require(wire_position_q(authoritative) == expected_q, "server-position-drift")
     require(server_ground == grounded, "server-ground-flag-drift")
 
 
@@ -225,6 +285,15 @@ def verify_prediction(actor, observer, actor_predictor, observer_predictor, east
 
 
 def set_creative_stone(client):
+    # 0x32 is creative-only and the default game mode is survival.
+    chat_command(client, "gamemode creative")
+
+    def gamemode_confirmed(packet, _body):
+        if packet == 0x22:
+            return len(_body) == 5 and _body[0] == 3
+        return packet == 0x6c and "gamemode" in client.messages[-1]
+
+    client.until(gamemode_confirmed, "creative-gamemode-confirm")
     # Inventory slot 36 is the selected hotbar slot. Components count is zero.
     client.send(0x32, struct.pack(">h", 36) + vint(1) + vint(STONE_ITEM) + vint(0) + vint(0))
 

@@ -6,11 +6,14 @@ import struct
 from contextlib import ExitStack
 
 from client_prediction_wire import (
+    MOVE_IDS,
     PLAYER_HALF_WIDTH,
     PLAYER_HEIGHT,
     WATER_SOURCE,
     WATER_STATES,
     PredictionClient,
+    last_entity_pose,
+    wire_position_q,
 )
 from protocol767 import AIR_STATES, STATE_COUNT, WIRE_BLOCKS, Reader, palette, require
 
@@ -134,14 +137,31 @@ class Movement:
 
     def send(self, coords, grounded):
         self.actor.send(0x1A, struct.pack(">ddd?", *coords, grounded))
-        self.observer.until(
-            lambda pid, _: pid == 0x70 and self.observer.teleports[-1][0] == self.actor.entity_id,
-            "server-entity-position-0x70",
-        )
-        _, accepted, ground_flag = self.observer.teleports[-1]
+        observer = self.observer
+        expected_q = wire_position_q(coords)
+        # A repeated pose inside the entity's update interval is culled before
+        # it reaches the wire, so an already-matching pose needs no broadcast.
+        known = last_entity_pose(observer, self.actor.entity_id)
+        if (known is None or wire_position_q(known[0]) != expected_q
+                or known[1] != grounded):
+            observer.until(
+                lambda pid, _: pid in MOVE_IDS and observer.teleports
+                and observer.teleports[-1][0] == self.actor.entity_id
+                and wire_position_q(observer.teleports[-1][1]) == expected_q
+                and observer.teleports[-1][2] == grounded,
+                "server-entity-position",
+            )
+            _, accepted, ground_flag = observer.teleports[-1]
+            if observer.last_move_packet == 0x70:
+                require(accepted == coords,
+                        f"server-position-drift: predicted={coords}, server={accepted}")
+            else:
+                require(wire_position_q(accepted) == expected_q,
+                        f"server-position-drift: predicted={coords}, server={accepted}")
+            require(ground_flag == grounded, "server-ground-flag-drift")
+        else:
+            accepted = coords
         self.max_drift = max(self.max_drift, math.dist(coords, accepted))
-        require(accepted == coords, f"server-position-drift: predicted={coords}, server={accepted}")
-        require(ground_flag == grounded, "server-ground-flag-drift")
         self.samples += 1
 
     def box(self):
