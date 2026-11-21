@@ -57,6 +57,7 @@ include!("save_v2.rs");
 include!("commands_core.rs");
 include!("commands_execute.rs");
 include!("menus_and_items.rs");
+include!("workstations_and_mounts.rs");
 include!("combat_and_health.rs");
 include!("play_protocol.rs");
 include!("lod_protocol.rs");
