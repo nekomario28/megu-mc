@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
 use crate::{
-    edge_corner_index, mesh::append_section, Direction, Quad, Sample, SectionView, EDGE,
-    EDGE_CORNER_CELLS, FACE_CELLS,
+    mesh::{
+        encode_fluid, encode_occ, fill_vertical_edges_and_corners_missing, load_interior,
+        load_sample_border_plane_into, mesh_loaded_section, missing_encoded, pad_index,
+        unpack_light_row, BorderStates, MesherScratch, QuadSink, PAD_EDGE, PAD_SLICE,
+    },
+    Direction, Sample, SectionView, EDGE, FACE_CELLS,
 };
 
 pub(crate) type FacePlane = [Sample; FACE_CELLS];
@@ -18,73 +22,309 @@ pub(crate) struct ColumnSection<'a> {
     pub uniform_air: bool,
 }
 
-pub(crate) fn mesh_column(
+struct ColumnBorders<'a> {
+    sections: &'a [ColumnSection<'a>],
+    index: usize,
+    neighbors: [Option<&'a [FacePlane]>; 4],
+}
+
+impl BorderStates for ColumnBorders<'_> {
+    #[inline(always)]
+    fn border_state_id(&self, direction: Direction, x: usize, y: usize, z: usize) -> u32 {
+        match direction {
+            Direction::Down => self.index.checked_sub(1).map_or(0, |other| {
+                self.sections[other].view.blocks[(EDGE - 1) * FACE_CELLS + z * EDGE + x].state_id
+            }),
+            Direction::Up => self
+                .sections
+                .get(self.index + 1)
+                .map_or(0, |other| other.view.blocks[z * EDGE + x].state_id),
+            Direction::North => self.neighbors[0].map_or(0, |faces| {
+                faces[self.index][direction.border_index([x, y, z])]
+                    .block
+                    .state_id
+            }),
+            Direction::South => self.neighbors[1].map_or(0, |faces| {
+                faces[self.index][direction.border_index([x, y, z])]
+                    .block
+                    .state_id
+            }),
+            Direction::West => self.neighbors[2].map_or(0, |faces| {
+                faces[self.index][direction.border_index([x, y, z])]
+                    .block
+                    .state_id
+            }),
+            Direction::East => self.neighbors[3].map_or(0, |faces| {
+                faces[self.index][direction.border_index([x, y, z])]
+                    .block
+                    .state_id
+            }),
+        }
+    }
+}
+
+fn fill_vertical_plane(
+    section: Option<&ColumnSection<'_>>,
+    y: usize,
+    py: usize,
+    miss_occ: u8,
+    miss_light: u8,
+    load_fluid: bool,
+    scratch: &mut MesherScratch,
+) {
+    let plane_base = py * PAD_SLICE;
+    match section {
+        Some(other) => {
+            let block_y = y * FACE_CELLS;
+            let light_y = y * (FACE_CELLS / 2);
+            for z in 0..EDGE {
+                let dst = plane_base + (z + 1) * PAD_EDGE + 1;
+                if other.uniform_air {
+                    scratch.occ[dst..dst + EDGE].fill(0);
+                    if load_fluid {
+                        scratch.fluid[dst..dst + EDGE].fill(0);
+                    }
+                } else {
+                    let src = &other.view.blocks[block_y + z * EDGE..block_y + z * EDGE + EDGE];
+                    for (x, &block) in src.iter().enumerate() {
+                        scratch.occ[dst + x] = encode_occ(block);
+                    }
+                    if load_fluid {
+                        for (x, &block) in src.iter().enumerate() {
+                            scratch.fluid[dst + x] = encode_fluid(block);
+                        }
+                    }
+                }
+                unpack_light_row(
+                    other.view.block_light,
+                    other.view.sky_light,
+                    light_y + z * (EDGE / 2),
+                    &mut scratch.light[dst..dst + EDGE],
+                );
+            }
+        }
+        None => {
+            for z in 0..EDGE {
+                let dst = plane_base + (z + 1) * PAD_EDGE + 1;
+                scratch.occ[dst..dst + EDGE].fill(miss_occ);
+                scratch.light[dst..dst + EDGE].fill(miss_light);
+                if load_fluid {
+                    scratch.fluid[dst..dst + EDGE].fill(0);
+                }
+            }
+        }
+    }
+}
+
+fn fill_cardinal_missing(
+    dir: Direction,
+    miss_occ: u8,
+    miss_light: u8,
+    load_fluid: bool,
+    scratch: &mut MesherScratch,
+) {
+    match dir {
+        Direction::North | Direction::South => {
+            let pz = if dir == Direction::North {
+                0
+            } else {
+                PAD_EDGE - 1
+            };
+            for y in 0..EDGE {
+                let dst = (y + 1) * PAD_SLICE + pz * PAD_EDGE + 1;
+                scratch.occ[dst..dst + EDGE].fill(miss_occ);
+                scratch.light[dst..dst + EDGE].fill(miss_light);
+                if load_fluid {
+                    scratch.fluid[dst..dst + EDGE].fill(0);
+                }
+            }
+        }
+        Direction::West | Direction::East => {
+            let px = if dir == Direction::West {
+                0
+            } else {
+                PAD_EDGE - 1
+            };
+            for y in 0..EDGE {
+                let row_base = (y + 1) * PAD_SLICE + px;
+                for z in 0..EDGE {
+                    let idx = row_base + (z + 1) * PAD_EDGE;
+                    scratch.occ[idx] = miss_occ;
+                    scratch.light[idx] = miss_light;
+                }
+                if load_fluid {
+                    for z in 0..EDGE {
+                        let idx = row_base + (z + 1) * PAD_EDGE;
+                        scratch.fluid[idx] = 0;
+                    }
+                }
+            }
+        }
+        Direction::Down | Direction::Up => unreachable!(),
+    }
+}
+
+fn load_column_shell(
+    sections: &[ColumnSection<'_>],
+    index: usize,
+    neighbors: [Option<&[FacePlane]>; 4],
+    load_fluid: bool,
+    reuse_missing_sides: bool,
+    scratch: &mut MesherScratch,
+) {
+    let (miss_occ, miss_light) = missing_encoded(sections[index].view.missing);
+
+    let down_section = index.checked_sub(1).map(|i| &sections[i]);
+    let up_section = sections.get(index + 1);
+    fill_vertical_plane(
+        down_section,
+        EDGE - 1,
+        0,
+        miss_occ,
+        miss_light,
+        load_fluid,
+        scratch,
+    );
+    fill_vertical_plane(
+        up_section,
+        0,
+        PAD_EDGE - 1,
+        miss_occ,
+        miss_light,
+        load_fluid,
+        scratch,
+    );
+
+    if reuse_missing_sides {
+        return;
+    }
+
+    for (side, neighbor) in CARDINALS.into_iter().zip(neighbors) {
+        match neighbor {
+            Some(faces) => load_sample_border_plane_into(&faces[index], side, load_fluid, scratch),
+            None => fill_cardinal_missing(side, miss_occ, miss_light, load_fluid, scratch),
+        }
+    }
+
+    fill_vertical_edges_and_corners_missing(miss_occ, miss_light, load_fluid, scratch);
+
+    // Horizontal edges at py = 0 (Down) and py = 17 (Up) from cardinal neighbors of adjacent sections.
+    for (py, y, other_opt) in [
+        (0usize, EDGE - 1, index.checked_sub(1)),
+        (
+            PAD_EDGE - 1,
+            0usize,
+            (index + 1 < sections.len()).then_some(index + 1),
+        ),
+    ] {
+        // North (pz = 0) and South (pz = 17): border_index = y * 16 + x
+        for (pz, neighbor) in [(0usize, neighbors[0]), (PAD_EDGE - 1, neighbors[1])] {
+            let dst = pad_index(1, py, pz);
+            match (other_opt, neighbor) {
+                (Some(other), Some(faces)) => {
+                    let src = &faces[other][y * EDGE..y * EDGE + EDGE];
+                    for (x, &s) in src.iter().enumerate() {
+                        scratch.occ[dst + x] = encode_occ(s.block);
+                        scratch.light[dst + x] = s.light.0;
+                    }
+                    if load_fluid {
+                        for (x, &s) in src.iter().enumerate() {
+                            scratch.fluid[dst + x] = encode_fluid(s.block);
+                        }
+                    }
+                }
+                _ => {
+                    scratch.occ[dst..dst + EDGE].fill(miss_occ);
+                    scratch.light[dst..dst + EDGE].fill(miss_light);
+                    if load_fluid {
+                        scratch.fluid[dst..dst + EDGE].fill(0);
+                    }
+                }
+            }
+        }
+        // West (px = 0) and East (px = 17): border_index = z * 16 + y
+        for (px, neighbor) in [(0usize, neighbors[2]), (PAD_EDGE - 1, neighbors[3])] {
+            match (other_opt, neighbor) {
+                (Some(other), Some(faces)) => {
+                    let plane = &faces[other];
+                    for z in 0..EDGE {
+                        let idx = pad_index(px, py, z + 1);
+                        let s = plane[z * EDGE + y];
+                        scratch.occ[idx] = encode_occ(s.block);
+                        scratch.light[idx] = s.light.0;
+                        if load_fluid {
+                            scratch.fluid[idx] = encode_fluid(s.block);
+                        }
+                    }
+                }
+                _ => {
+                    for z in 0..EDGE {
+                        let idx = pad_index(px, py, z + 1);
+                        scratch.occ[idx] = miss_occ;
+                        scratch.light[idx] = miss_light;
+                        if load_fluid {
+                            scratch.fluid[idx] = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn mesh_column_into<S: QuadSink>(
     sections: &[ColumnSection<'_>],
     neighbors: [Option<&[FacePlane]>; 4],
-) -> Vec<Quad> {
-    let mut quads = Vec::new();
+    scratch: &mut MesherScratch,
+    quads: &mut S,
+) {
+    let no_cardinals = neighbors.iter().all(Option::is_none);
+    let mut cached_missing: Option<(crate::MissingNeighbor, bool)> = None;
     for (index, section) in sections.iter().enumerate() {
         if section.uniform_air {
             continue;
         }
-        let mut view = section.view;
-        for (side, neighbor) in CARDINALS.into_iter().zip(neighbors) {
-            view.borders[side as usize] = neighbor.map(|faces| &faces[index]);
+        let view = &section.view;
+        let scan = load_interior(view.blocks, view.block_light, view.sky_light, scratch);
+        if !scan.any_cube && !scan.any_fluid {
+            continue;
         }
-
-        let fallback = view.missing.sample();
-        let mut halo = [fallback; EDGE_CORNER_CELLS];
-        let mut vertical = [[fallback; FACE_CELLS]; 2];
-        for side in [Direction::Down, Direction::Up] {
-            let Some(other) = index
-                .checked_add_signed(side.step() as isize)
-                .filter(|&i| i < sections.len())
-            else {
-                continue;
-            };
-            let y = if side == Direction::Down { EDGE - 1 } else { 0 };
-            let plane = &mut vertical[side as usize];
-            for (i, sample) in plane.iter_mut().enumerate() {
-                *sample = sections[other].view.sample_local(i % EDGE, y, i / EDGE);
-            }
-
-            // Cardinal planes from the adjacent section supply the X/Y and Y/Z edges.
-            for (horizontal, neighbor) in CARDINALS.into_iter().zip(neighbors) {
-                let Some(faces) = neighbor else { continue };
-                let axis = horizontal.axis();
-                let free = 2 - axis;
-                for coordinate in 0..EDGE {
-                    let mut p = [0; 3];
-                    p[1] = y;
-                    p[free] = coordinate;
-                    let sample = faces[other][horizontal.border_index(p)];
-                    let mut outside = p.map(|coordinate| coordinate as i32);
-                    outside[1] = if side == Direction::Down {
-                        -1
-                    } else {
-                        EDGE as i32
-                    };
-                    outside[axis] = if horizontal.step() < 0 {
-                        -1
-                    } else {
-                        EDGE as i32
-                    };
-                    halo[edge_corner_index(outside).expect("vertical cardinal edge")] = sample;
-                }
-            }
+        let reuse_missing_sides = no_cardinals
+            && matches!(
+                cached_missing,
+                Some((m, fluid_zeroed)) if m == view.missing && (!scan.any_fluid || fluid_zeroed)
+            );
+        load_column_shell(
+            sections,
+            index,
+            neighbors,
+            scan.any_fluid,
+            reuse_missing_sides,
+            scratch,
+        );
+        if no_cardinals {
+            let fluid_zeroed =
+                scan.any_fluid || matches!(cached_missing, Some((m, true)) if m == view.missing);
+            cached_missing = Some((view.missing, fluid_zeroed));
         }
-        view.borders[Direction::Down as usize] = Some(&vertical[0]);
-        view.borders[Direction::Up as usize] = Some(&vertical[1]);
-        view.edges_and_corners = Some(&halo);
-
-        let start = quads.len();
-        append_section(&view, &mut quads);
+        let borders = ColumnBorders {
+            sections,
+            index,
+            neighbors,
+        };
         let y_offset = (index * EDGE) as f32;
-        for quad in &mut quads[start..] {
-            for position in &mut quad.positions {
-                position[1] += y_offset;
-            }
-        }
+        mesh_loaded_section(view.blocks, &borders, scan, scratch, y_offset, quads);
     }
-    quads
+}
+
+#[cfg(test)]
+pub(crate) fn mesh_column(
+    sections: &[ColumnSection<'_>],
+    neighbors: [Option<&[FacePlane]>; 4],
+) -> Vec<crate::Quad> {
+    crate::mesh::with_scratch(|scratch| {
+        let mut quads = Vec::new();
+        mesh_column_into(sections, neighbors, scratch, &mut quads);
+        quads
+    })
 }

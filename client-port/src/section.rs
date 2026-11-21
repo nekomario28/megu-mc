@@ -125,6 +125,7 @@ impl Block {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn occludes(self, side: Direction) -> bool {
         self.flags & OPAQUE != 0 && self.occlusion & side.bit() != 0
     }

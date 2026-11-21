@@ -2,13 +2,14 @@
 
 //! C ABI v1. See `include/mc_spine_client_mesh.h` for the caller contract.
 
+use std::mem::MaybeUninit;
 use std::ptr;
 
 pub use crate::packed::PackedVertex;
 
 use crate::{
-    column::{mesh_column, ColumnSection, FacePlane},
-    mesh_section,
+    column::{mesh_column_into, ColumnSection, FacePlane},
+    mesh::{mesh_section_with_scratch, with_scratch, CountSink},
     packed::{depth_key, is_packable, is_translucent, pack_quad, MAX_COLUMN_SECTIONS},
     Block, Direction, Layer, MissingNeighbor, Quad, Sample, SectionView, EDGE_CORNER_CELLS,
     FACE_CELLS, LIGHT_BYTES, SECTION_CELLS,
@@ -96,18 +97,30 @@ pub unsafe extern "C" fn mc_spine_mesh_section(
                 .as_ref(),
         }
     };
-    let quads = mesh_section(&view);
-    // SAFETY: caller supplies a separate writable count.
-    unsafe { count.write(quads.len()) };
-    if output.is_null() {
-        return ABI_OK;
-    }
-    if capacity < quads.len() {
-        return ABI_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: the caller supplies a separate output buffer with enough capacity.
-    unsafe { ptr::copy_nonoverlapping(quads.as_ptr(), output, quads.len()) };
-    ABI_OK
+    with_scratch(|scratch| {
+        if output.is_null() {
+            let mut sink = CountSink(0);
+            mesh_section_with_scratch(&view, scratch, 0.0, &mut sink);
+            // SAFETY: caller supplies a separate writable count.
+            unsafe { count.write(sink.0) };
+            return ABI_OK;
+        }
+        let mut quads = std::mem::take(&mut scratch.quads);
+        quads.clear();
+        mesh_section_with_scratch(&view, scratch, 0.0, &mut quads);
+        let len = quads.len();
+        // SAFETY: caller supplies a separate writable count.
+        unsafe { count.write(len) };
+        let status = if capacity < len {
+            ABI_BUFFER_TOO_SMALL
+        } else {
+            // SAFETY: the caller supplies a separate output buffer with enough capacity.
+            unsafe { ptr::copy_nonoverlapping(quads.as_ptr(), output, len) };
+            ABI_OK
+        };
+        scratch.quads = quads;
+        status
+    })
 }
 
 #[repr(C)]
@@ -166,8 +179,9 @@ pub unsafe extern "C" fn mc_spine_client_mesh_column(
     // SAFETY: the header requires section_count readable descriptors and the
     // count is bounded before constructing the slice.
     let inputs = unsafe { std::slice::from_raw_parts(input.sections, input.section_count) };
-    let mut sections = Vec::with_capacity(inputs.len());
-    for section in inputs {
+    let mut section_slots: [MaybeUninit<ColumnSection<'_>>; MAX_COLUMN_SECTIONS] =
+        [const { MaybeUninit::uninit() }; MAX_COLUMN_SECTIONS];
+    for (slot, section) in section_slots.iter_mut().zip(inputs) {
         let (blocks, uniform_air) = match section.flags {
             // SAFETY: a non-null dense block array has the fixed length and alignment.
             0 => match unsafe { section.blocks.cast::<[Block; SECTION_CELLS]>().as_ref() } {
@@ -186,7 +200,7 @@ pub unsafe extern "C" fn mc_spine_client_mesh_column(
         }) else {
             return ABI_INVALID_ARGUMENT;
         };
-        sections.push(ColumnSection {
+        slot.write(ColumnSection {
             uniform_air,
             view: SectionView {
                 blocks,
@@ -198,6 +212,13 @@ pub unsafe extern "C" fn mc_spine_client_mesh_column(
             },
         });
     }
+    // SAFETY: the first inputs.len() slots were initialized in the loop above.
+    let sections = unsafe {
+        std::slice::from_raw_parts(
+            section_slots.as_ptr().cast::<ColumnSection<'_>>(),
+            inputs.len(),
+        )
+    };
     let borders = input.borders.map(|border| {
         if border.is_null() {
             None
@@ -206,42 +227,44 @@ pub unsafe extern "C" fn mc_spine_client_mesh_column(
             Some(unsafe { std::slice::from_raw_parts(border.cast::<FacePlane>(), sections.len()) })
         }
     });
-    let quads = mesh_column(&sections, borders);
-    // SAFETY: count is writable and separate from the other buffers.
-    unsafe { count.write(quads.len()) };
-    if output.is_null() {
-        return ABI_OK;
-    }
-    if capacity < quads.len() {
-        return ABI_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: the caller supplies a disjoint, writable output with enough capacity.
-    unsafe { ptr::copy_nonoverlapping(quads.as_ptr(), output, quads.len()) };
-    ABI_OK
+    with_scratch(|scratch| {
+        if output.is_null() {
+            let mut sink = CountSink(0);
+            mesh_column_into(sections, borders, scratch, &mut sink);
+            // SAFETY: count is writable and separate from the other buffers.
+            unsafe { count.write(sink.0) };
+            return ABI_OK;
+        }
+        let mut quads = std::mem::take(&mut scratch.quads);
+        quads.clear();
+        mesh_column_into(sections, borders, scratch, &mut quads);
+        let len = quads.len();
+        // SAFETY: count is writable and separate from the other buffers.
+        unsafe { count.write(len) };
+        let status = if capacity < len {
+            ABI_BUFFER_TOO_SMALL
+        } else {
+            // SAFETY: the caller supplies a disjoint, writable output with enough capacity.
+            unsafe { ptr::copy_nonoverlapping(quads.as_ptr(), output, len) };
+            ABI_OK
+        };
+        scratch.quads = quads;
+        status
+    })
 }
 
 // Validate the byte-sized C discriminants before creating a Rust reference to
 // any Quad. A C caller can initialize these bytes to values outside the enums.
-unsafe fn checked_quads<'a>(quads: *const Quad, len: usize) -> Option<&'a [Quad]> {
-    if quads.is_null() || len > isize::MAX as usize / std::mem::size_of::<Quad>() {
-        return None;
-    }
-    for i in 0..len {
-        // SAFETY: only read the initialized bytes at the two enum field offsets.
-        let (direction, layer) = unsafe {
-            let quad = quads.add(i);
-            (
-                ptr::addr_of!((*quad).direction).cast::<u8>().read(),
-                ptr::addr_of!((*quad).layer).cast::<u8>().read(),
-            )
-        };
-        if direction > Direction::East as u8 || layer > Layer::Fluid as u8 {
-            return None;
-        }
-    }
-    // SAFETY: the caller supplies initialized fields with the declared length
-    // and alignment. Enum values and maximum slice length were checked above.
-    Some(unsafe { std::slice::from_raw_parts(quads, len) })
+#[inline(always)]
+unsafe fn validate_quad_enums(quad: *const Quad) -> bool {
+    // SAFETY: only read the initialized bytes at the two enum field offsets.
+    let (direction, layer) = unsafe {
+        (
+            ptr::addr_of!((*quad).direction).cast::<u8>().read(),
+            ptr::addr_of!((*quad).layer).cast::<u8>().read(),
+        )
+    };
+    direction <= Direction::East as u8 && layer <= Layer::Fluid as u8
 }
 
 /// Pack four vertices per input quad directly into a caller-owned buffer.
@@ -264,17 +287,25 @@ pub unsafe extern "C" fn mc_spine_client_mesh_pack_vertices(
     }
     // SAFETY: non-null count is writable.
     unsafe { count.write(0) };
-    if output.is_null() && capacity != 0 {
+    if (output.is_null() && capacity != 0)
+        || quads.is_null()
+        || quad_count > isize::MAX as usize / std::mem::size_of::<Quad>()
+    {
         return ABI_INVALID_ARGUMENT;
     }
-    // SAFETY: non-null input is readable for the declared number of quads.
-    let Some(quads) = (unsafe { checked_quads(quads, quad_count) }) else {
-        return ABI_INVALID_ARGUMENT;
-    };
-    if !quads.iter().all(is_packable) {
-        return ABI_INVALID_ARGUMENT;
+    // Validate enum discriminants and packability in a single pass before touching output.
+    for i in 0..quad_count {
+        // SAFETY: quads is valid for quad_count initialized elements.
+        let qptr = unsafe { quads.add(i) };
+        if !unsafe { validate_quad_enums(qptr) } {
+            return ABI_INVALID_ARGUMENT;
+        }
+        // SAFETY: enum discriminants for qptr were validated above.
+        if !is_packable(unsafe { &*qptr }) {
+            return ABI_INVALID_ARGUMENT;
+        }
     }
-    let required = quads.len() * 4;
+    let required = quad_count * 4;
     // SAFETY: count is writable and separate from input and output.
     unsafe { count.write(required) };
     if output.is_null() {
@@ -283,6 +314,8 @@ pub unsafe extern "C" fn mc_spine_client_mesh_pack_vertices(
     if capacity < required {
         return ABI_BUFFER_TOO_SMALL;
     }
+    // SAFETY: all quad_count elements were validated above.
+    let quads = unsafe { std::slice::from_raw_parts(quads, quad_count) };
     let output = output.cast::<[PackedVertex; 4]>();
     for (i, quad) in quads.iter().enumerate() {
         // SAFETY: the caller supplies room for four writable vertices per quad.
@@ -316,45 +349,61 @@ pub unsafe extern "C" fn mc_spine_client_mesh_sort_translucent(
     unsafe { count.write(0) };
     let camera = [camera_x, camera_y, camera_z];
     if (output.is_null() && capacity != 0)
+        || quads.is_null()
+        || quad_count > isize::MAX as usize / std::mem::size_of::<Quad>()
         || u32::try_from(quad_count).is_err()
         || !camera.into_iter().all(f32::is_finite)
     {
         return ABI_INVALID_ARGUMENT;
     }
-    // SAFETY: non-null input is readable for the declared number of quads.
-    let Some(quads) = (unsafe { checked_quads(quads, quad_count) }) else {
-        return ABI_INVALID_ARGUMENT;
-    };
-    let mut required = 0;
-    for quad in quads.iter().filter(|quad| is_translucent(quad)) {
-        if !quad.positions.iter().flatten().all(|n| n.is_finite()) {
-            return ABI_INVALID_ARGUMENT;
+    with_scratch(|scratch| {
+        let mut order = std::mem::take(&mut scratch.sort_buf);
+        order.clear();
+        let collect = !output.is_null();
+        let mut required = 0usize;
+        for i in 0..quad_count {
+            // SAFETY: quads is valid for quad_count initialized elements.
+            let qptr = unsafe { quads.add(i) };
+            if !unsafe { validate_quad_enums(qptr) } {
+                scratch.sort_buf = order;
+                return ABI_INVALID_ARGUMENT;
+            }
+            // SAFETY: enum discriminants for qptr were validated above.
+            let quad = unsafe { &*qptr };
+            if is_translucent(quad) {
+                for pos in &quad.positions {
+                    if !pos[0].is_finite() || !pos[1].is_finite() || !pos[2].is_finite() {
+                        scratch.sort_buf = order;
+                        return ABI_INVALID_ARGUMENT;
+                    }
+                }
+                if collect && required < capacity {
+                    order.push((depth_key(quad, camera), i as u32));
+                }
+                required += 1;
+            }
         }
-        required += 1;
-    }
-    // SAFETY: count is writable and separate from input and output.
-    unsafe { count.write(required) };
-    if output.is_null() {
-        return ABI_OK;
-    }
-    if capacity < required {
-        return ABI_BUFFER_TOO_SMALL;
-    }
-    let mut order = Vec::with_capacity(required);
-    for (i, quad) in quads.iter().enumerate() {
-        if is_translucent(quad) {
-            order.push((depth_key(quad, camera), i as u32));
+        // SAFETY: count is writable and separate from input and output.
+        unsafe { count.write(required) };
+        if output.is_null() {
+            scratch.sort_buf = order;
+            return ABI_OK;
         }
-    }
-    order.sort_unstable_by(|(left, i), (right, j)| {
-        right
-            .partial_cmp(left)
-            .expect("finite depths")
-            .then(i.cmp(j))
-    });
-    for (slot, (_, i)) in order.into_iter().enumerate() {
-        // SAFETY: output has enough room for every translucent index.
-        unsafe { output.add(slot).write(i) };
-    }
-    ABI_OK
+        if capacity < required {
+            scratch.sort_buf = order;
+            return ABI_BUFFER_TOO_SMALL;
+        }
+        order.sort_unstable_by(|(left, i), (right, j)| {
+            right
+                .partial_cmp(left)
+                .expect("finite depths")
+                .then(i.cmp(j))
+        });
+        for (slot, (_, i)) in order.iter().enumerate() {
+            // SAFETY: output has enough room for every translucent index.
+            unsafe { output.add(slot).write(*i) };
+        }
+        scratch.sort_buf = order;
+        ABI_OK
+    })
 }
