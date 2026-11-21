@@ -4,7 +4,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Megu — Vanilla &amp; Modpacks, rebuilt in Rust</title>
+  <title>Megu — Same seed, same world, written in Rust</title>
   <meta name="description"
         content="Megu (codename mc-spine) is an experimental Minecraft: Java Edition 1.21.1 &amp; 26.3 server and client engine written in Rust with tiered NeoForge/Fabric mod support.">
   <link rel="stylesheet" href="style.css">
@@ -45,13 +45,13 @@
         </p>
 
         <h1 class="hero-title">
-          <span data-cfg="projectName">Megu</span>:
-          <span class="hero-sub" data-i18n="hero_headline">Vanilla &amp; Modpacks, rebuilt in Rust.</span>
+          <span data-cfg="projectName">Megu</span>
+          <span class="hero-sub" data-i18n="hero_headline">Same seed, same world — written from scratch in Rust.</span>
         </h1>
 
         <p class="lead" data-i18n="hero_lead">
-          An open-source Minecraft server, mod runtime, and companion client toolkit written in Rust —
-          checked against vanilla 1.21.1, ready for 26.3 migration, with native engines for popular mods and safe fallback when Java is still needed.
+          A clean-room Minecraft: Java Edition engine for 1.21.1 and 26.3.
+          Differential-tested against vanilla worldgen and protocol, with native Rust engines for major mods and safe fallback to NeoForge when Java is still required.
         </p>
 
         <div class="hero-actions">
@@ -120,7 +120,7 @@
 
     <section id="how">
       <div class="wrap">
-        <h2 data-i18n="how_title">Same worlds, less overhead.</h2>
+        <h2 data-i18n="how_title">A different foundation, the same world.</h2>
         <div class="pillars">
           <article class="pillar">
             <h3 data-i18n="p1_title">Your own server.jar</h3>
@@ -259,23 +259,23 @@ cargo run --locked</code></pre>
     "use strict";
     var JA = {
       nav_checker: "Modpack診断",
-      nav_how: "仕組み",
-      nav_quickstart: "クイックスタート",
+      nav_how: "設計",
+      nav_quickstart: "起動手順",
       nav_scope: "対応状況",
-      hero_headline: "Vanilla も Modpack も、Rust で軽く。",
-      hero_lead: "Java Edition 1.21.1 互換検証と 26.3 移行を備えた、日本発のオープンソース Rust 製 Minecraft 互換エンジン。定番 Mod のクリーンルーム実装と安全なフォールバックで、サーバーからクライアント基盤まで軽量に動かします。",
-      cta_start: "はじめる",
-      cta_check: "Modpackを診断する",
+      hero_headline: "同じ種、変わらぬ世界、Rustで組む。",
+      hero_lead: "Java Edition 1.21.1・26.3 に向けたクリーンルーム Rust 実装の Minecraft 互換エンジン。地形生成とプロトコルをバニラと突き合わせ、主要 Mod はネイティブで動かし、未対応 Mod は本家 NeoForge へ委譲します。",
+      cta_start: "起動手順へ",
+      cta_check: "Modpackを診断",
       cta_github: "GitHub を見る",
       checker_title: "手元の Modpack をその場で診断。",
-      checker_note: "このタブ内で完結 — ファイルは一切アップロードされません。",
+      checker_note: "このタブ内で完結 — ファイルは一切送信されません。",
       checker_desc: "Modrinth の .mrpack や CurseForge の .zip を落とすだけで、自動スキップされる軽量化 Mod・Rust ネイティブ動作・要検査 JAR を即座に表示します。",
       checker_target: "対象バージョン",
       checker_sample: "サンプルパックを試す",
       checker_drop: ".mrpack / CurseForge .zip / manifest .json をドロップ",
       checker_hint: "またはクリックしてファイルを選択",
       checker_raw: "JSON レポートとテキスト要約",
-      how_title: "いつものワールドを、もっと軽く。",
+      how_title: "器を替えて、世界を残す。",
       p1_title: "手元の公式 server.jar から生成",
       p1_body: "Mojang のバイナリやアセットは一切同梱しません。初回セットアップ時に手元の公式 Minecraft ファイルからローカル生成します。",
       p2_title: "Modpack をそのまま投入",
@@ -306,11 +306,32 @@ cargo run --locked</code></pre>
       EN[el.getAttribute("data-i18n")] = el.textContent;
     });
     var btn = document.getElementById("lang-toggle");
+    var STORAGE_KEY = "megu_site_lang";
+    function detectDefaultLang() {
+      try {
+        var saved = window.localStorage && window.localStorage.getItem(STORAGE_KEY);
+        if (saved === "ja" || saved === "en") {
+          return saved;
+        }
+      } catch (_) {}
+      var list = (navigator.languages && navigator.languages.length)
+        ? navigator.languages
+        : [navigator.language || "en"];
+      for (var i = 0; i < list.length; i++) {
+        if (/^ja\b/i.test(String(list[i] || ""))) {
+          return "ja";
+        }
+        if (/^en\b/i.test(String(list[i] || ""))) {
+          return "en";
+        }
+      }
+      return "en";
+    }
     var lang = "en";
-    function applyLang(next) {
-      lang = next;
-      document.documentElement.lang = next;
-      var dict = next === "ja" ? JA : EN;
+    function applyLang(next, persist) {
+      lang = next === "ja" ? "ja" : "en";
+      document.documentElement.lang = lang;
+      var dict = lang === "ja" ? JA : EN;
       Array.prototype.forEach.call(nodes, function (el) {
         var key = el.getAttribute("data-i18n");
         if (dict[key]) {
@@ -318,12 +339,20 @@ cargo run --locked</code></pre>
         }
       });
       if (btn) {
-        btn.textContent = next === "ja" ? "EN" : "日本語";
+        btn.textContent = lang === "ja" ? "EN" : "日本語";
+      }
+      if (persist) {
+        try {
+          if (window.localStorage) {
+            window.localStorage.setItem(STORAGE_KEY, lang);
+          }
+        } catch (_) {}
       }
     }
+    applyLang(detectDefaultLang(), false);
     if (btn) {
       btn.addEventListener("click", function () {
-        applyLang(lang === "en" ? "ja" : "en");
+        applyLang(lang === "en" ? "ja" : "en", true);
       });
     }
   })();
