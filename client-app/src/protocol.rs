@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use mc_spine_proto::{PacketDir, PacketPhase, ProtocolCodec, RecipeSyncMode};
@@ -1283,6 +1283,30 @@ pub struct ProtocolClient {
 }
 
 impl ProtocolClient {
+    /// Wrap an already-connected stream at `protocol_version`: the shared
+    /// constructor behind `connect_resolved` (Login path) and
+    /// `ping_server_resolved` (Status path).
+    fn on_stream(
+        stream: TcpStream,
+        codec: Arc<dyn ProtocolCodec>,
+        protocol_version: mc_spine_proto::ProtocolVersion,
+    ) -> Self {
+        Self {
+            stream,
+            compression: None,
+            read_buf: Vec::new(),
+            codec,
+            dimension_types_by_id: HashMap::new(),
+            dimension_types_by_name: HashMap::new(),
+            block_state_count: mc_spine_kernel::STATE_COUNT as usize,
+            dimension: DimensionMeta::default(),
+            biome_count: 64,
+            protocol_version,
+            packets_rx: 0,
+            packets_tx: 0,
+        }
+    }
+
     /// True when the selected table carries the 26.x wire profile
     /// (`RecipeBookDisplays` is the proto's 26.x-generation marker): the
     /// post-1.21.5 login/play shapes — Game-Profile login success with a
@@ -1410,20 +1434,7 @@ impl ProtocolClient {
         let _ = stream.set_read_timeout(Some(timeout));
         let _ = stream.set_write_timeout(Some(timeout));
 
-        let mut client = Self {
-            stream,
-            compression: None,
-            read_buf: Vec::new(),
-            codec,
-            dimension_types_by_id: HashMap::new(),
-            dimension_types_by_name: HashMap::new(),
-            block_state_count: mc_spine_kernel::STATE_COUNT as usize,
-            dimension: DimensionMeta::default(),
-            biome_count: 64,
-            protocol_version,
-            packets_rx: 0,
-            packets_tx: 0,
-        };
+        let mut client = Self::on_stream(stream, codec, protocol_version);
 
         // 1. Handshake — original host/port even when the SRV lookup
         //    redirected the TCP target (vanilla ServerNameResolver rule).
@@ -2028,4 +2039,626 @@ fn build_client_information(
         write_varint(&mut out, 0); // particle_status: all (1.21.2+)
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Server-list status ping (Handshake -> Status Request/Response -> Ping/Pong)
+// ---------------------------------------------------------------------------
+
+/// Bound on the status-response JSON document: vanilla favicons are a few
+/// KiB of base64, so this leaves generous headroom without trusting the peer.
+const MAX_STATUS_JSON_BYTES: usize = 1024 * 1024;
+const MAX_STATUS_JSON_DEPTH: usize = 64;
+const MAX_STATUS_JSON_NODES: usize = 16_384;
+
+/// A completed `next_state = 1` server-list status exchange: the fields a
+/// player or operator actually reads off a Multiplayer row, plus the
+/// Ping/Pong round trip measured with a monotonic clock.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServerStatusPing {
+    /// The `host` the Handshake carried (the original name even when a
+    /// `_minecraft._tcp` SRV record moved the socket).
+    pub host: String,
+    /// The `port` the Handshake carried.
+    pub port: u16,
+    /// The socket address actually dialed after SRV/address resolution.
+    pub resolved_addr: SocketAddr,
+    /// The protocol version offered in the Handshake.
+    pub requested_protocol: i32,
+    /// `version.name` the server reported.
+    pub version_name: String,
+    /// `version.protocol` the server reported.
+    pub protocol: i64,
+    /// `true` when the reported protocol equals `requested_protocol`.
+    pub protocol_match: bool,
+    /// `players.online` / `players.max` the server reported.
+    pub players_online: i64,
+    pub players_max: i64,
+    /// Display names from `players.sample` (the hover list), in order.
+    pub player_sample: Vec<String>,
+    /// Plain-text `description` (the MOTD).
+    pub motd: String,
+    /// Whether the server advertised a non-empty `favicon`.
+    pub has_favicon: bool,
+    /// Ping/Pong round trip in milliseconds (`Instant`-measured).
+    pub rtt_ms: f64,
+}
+
+impl ServerStatusPing {
+    /// Machine-readable single-line JSON, shaped like `SessionSummary`'s.
+    pub fn to_json(&self) -> String {
+        let sample = self
+            .player_sample
+            .iter()
+            .map(|name| format!("\"{}\"", escape_json_string(name)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            concat!(
+                "{{",
+                "\"status\":\"ok\",",
+                "\"host\":\"{}\",",
+                "\"port\":{},",
+                "\"resolved_address\":\"{}\",",
+                "\"requested_protocol\":{},",
+                "\"version_name\":\"{}\",",
+                "\"protocol\":{},",
+                "\"protocol_match\":{},",
+                "\"players_online\":{},",
+                "\"players_max\":{},",
+                "\"player_sample\":[{}],",
+                "\"motd\":\"{}\",",
+                "\"has_favicon\":{},",
+                "\"rtt_ms\":{:.3}",
+                "}}"
+            ),
+            escape_json_string(&self.host),
+            self.port,
+            self.resolved_addr,
+            self.requested_protocol,
+            escape_json_string(&self.version_name),
+            self.protocol,
+            self.protocol_match,
+            self.players_online,
+            self.players_max,
+            sample,
+            escape_json_string(&self.motd),
+            self.has_favicon,
+            self.rtt_ms,
+        )
+    }
+
+    /// Plain-language operator output: version, players, MOTD, latency, icon.
+    pub fn to_human(&self) -> String {
+        let version = if self.protocol_match {
+            format!("{} (protocol {})", self.version_name, self.protocol)
+        } else {
+            format!(
+                "{} (protocol {}; you asked for {})",
+                self.version_name, self.protocol, self.requested_protocol
+            )
+        };
+        let players = if self.player_sample.is_empty() {
+            format!("{} / {}", self.players_online, self.players_max)
+        } else {
+            format!(
+                "{} / {} — {}",
+                self.players_online,
+                self.players_max,
+                self.player_sample.join(", ")
+            )
+        };
+        let motd = strip_format_codes(&self.motd);
+        let motd = motd.replace(['\n', '\r'], " ");
+        format!(
+            "Server status for {}:{}\n  connected to: {}\n  version:      {}\n  players:      {}\n  motd:         {}\n  latency:      {:.1} ms\n  icon:         {}",
+            self.host,
+            self.port,
+            self.resolved_addr,
+            version,
+            players,
+            motd.trim(),
+            self.rtt_ms,
+            if self.has_favicon { "present" } else { "none" },
+        )
+    }
+}
+
+/// Remove `§`-prefixed formatting codes from a MOTD for terminal display.
+fn strip_format_codes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{00a7}' {
+            chars.next();
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Monotonic ping nonce: nanoseconds since a process-fixed `Instant` epoch,
+/// so the value is clock-independent and strictly monotonic for later calls
+/// after a clock tick elapses — never `SystemTime`.
+fn status_ping_nonce() -> i64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    Instant::now().saturating_duration_since(*epoch).as_nanos() as i64
+}
+
+/// Run a server-list status ping against `host:port` speaking `version`'s
+/// protocol: Handshake (`next_state = 1`), Status Request, Status Response
+/// JSON, then a Ping/Pong round trip for the latency figure. The
+/// `_minecraft._tcp` SRV lookup is the live one; see
+/// [`ping_server_resolved`] for the injectable seam.
+pub fn ping_server(
+    host: &str,
+    port: u16,
+    version: mc_spine_proto::ProtocolVersion,
+    timeout: Duration,
+) -> Result<ServerStatusPing, String> {
+    ping_server_resolved(host, port, version, timeout, |h, p| {
+        mc_spine_proto::resolve_server_address(h, p).map_err(|e| e.to_string())
+    })
+}
+
+/// [`ping_server`] with the `_minecraft._tcp` SRV / address lookup injected,
+/// so tests can prove the SRV redirect and the original-host-preservation
+/// rule without live DNS. Works identically for `1.21.1` (767) and `26.3`
+/// (777): the status packet ids resolve through the version's table.
+pub fn ping_server_resolved(
+    host: &str,
+    port: u16,
+    version: mc_spine_proto::ProtocolVersion,
+    timeout: Duration,
+    resolve: impl FnOnce(&str, u16) -> Result<Vec<SocketAddr>, String>,
+) -> Result<ServerStatusPing, String> {
+    let codec = mc_spine_proto::VersionRouter::with_v767_and_v777()
+        .select(version.number())
+        .map_err(|e| e.to_string())?;
+    let addrs = resolve(host, port)?;
+    if addrs.is_empty() {
+        return Err(format!(
+            "resolve_server_address({host}:{port}) yielded no addresses"
+        ));
+    }
+    let addr = format!("{host}:{port}");
+    let stream = TcpStream::connect(addrs.as_slice())
+        .map_err(|e| format!("failed to connect to {addr}: {e}"))?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let resolved_addr = stream.peer_addr().unwrap_or(addrs[0]);
+    let mut client = ProtocolClient::on_stream(stream, codec, version);
+
+    let deadline = Instant::now() + timeout;
+
+    // Handshake — original host/port even when the SRV lookup redirected the
+    // TCP target (vanilla ServerNameResolver rule); next_state 1 = Status.
+    let mut hs = Vec::new();
+    write_varint(&mut hs, version.number());
+    write_string(&mut hs, host);
+    hs.extend_from_slice(&port.to_be_bytes());
+    write_varint(&mut hs, 1);
+    client.send_named(PacketPhase::Handshake, "handshake", &hs)?;
+
+    // Status Request (no payload) -> Status Response carries the JSON.
+    client.send_named(PacketPhase::Status, "status_request", &[])?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| "status ping timed out".to_string())?;
+    let Some((pid, body)) = client.recv_raw(remaining)? else {
+        return Err("timed out waiting for status response".to_string());
+    };
+    if client.s2c_name(PacketPhase::Status, pid).as_deref() != Some("status_response") {
+        return Err(format!(
+            "expected status_response, received packet id {pid:#04x}"
+        ));
+    }
+    let json_text = WireReader::new(&body).read_string(MAX_STATUS_JSON_BYTES)?;
+    let mut status = parse_status_response(&json_text)?;
+
+    // Ping Request -> Pong: the echoed payload must match exactly.
+    let nonce = status_ping_nonce();
+    let ping_start = Instant::now();
+    client.send_named(PacketPhase::Status, "ping_request", &nonce.to_be_bytes())?;
+    let rtt = loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "status ping timed out".to_string())?;
+        let Some((pid, body)) = client.recv_raw(remaining)? else {
+            return Err("timed out waiting for pong".to_string());
+        };
+        if client.s2c_name(PacketPhase::Status, pid).as_deref() == Some("pong_response") {
+            let echoed = WireReader::new(&body).read_i64()?;
+            if echoed != nonce {
+                return Err(format!(
+                    "pong payload mismatch: sent {nonce}, server echoed {echoed}"
+                ));
+            }
+            break ping_start.elapsed();
+        }
+    };
+
+    status.host = host.to_string();
+    status.port = port;
+    status.resolved_addr = resolved_addr;
+    status.requested_protocol = version.number();
+    status.protocol_match = status.protocol == i64::from(version.number());
+    status.rtt_ms = rtt.as_secs_f64() * 1000.0;
+    Ok(status)
+}
+
+/// Parse the status-response JSON into a [`ServerStatusPing`]; the caller
+/// fills the transport fields (`host`, `port`, `resolved_addr`,
+/// `requested_protocol`, `protocol_match`, `rtt_ms`) afterwards.
+fn parse_status_response(text: &str) -> Result<ServerStatusPing, String> {
+    let root = parse_status_json(text)?;
+    let version_name = root
+        .get("version")
+        .and_then(|v| v.get("name"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let protocol = root
+        .get("version")
+        .and_then(|v| v.get("protocol"))
+        .and_then(JsonValue::as_i64)
+        .ok_or_else(|| "status response missing numeric version.protocol".to_string())?;
+    let players = root.get("players");
+    let players_online = players
+        .and_then(|p| p.get("online"))
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0);
+    let players_max = players
+        .and_then(|p| p.get("max"))
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0);
+    let player_sample = players
+        .and_then(|p| p.get("sample"))
+        .map(|s| match s {
+            JsonValue::Arr(items) => items
+                .iter()
+                .filter_map(|e| e.get("name").and_then(JsonValue::as_str).map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default();
+    let motd = root
+        .get("description")
+        .map(JsonValue::plain_text)
+        .unwrap_or_default();
+    let has_favicon = matches!(root.get("favicon"), Some(JsonValue::Str(s)) if !s.is_empty());
+    Ok(ServerStatusPing {
+        host: String::new(),
+        port: 0,
+        resolved_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+        requested_protocol: 0,
+        version_name,
+        protocol,
+        protocol_match: false,
+        players_online,
+        players_max,
+        player_sample,
+        motd,
+        has_favicon,
+        rtt_ms: 0.0,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Minimal bounded JSON parser for the status response (pure std)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+enum JsonValue {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    Arr(Vec<JsonValue>),
+    Obj(Vec<(String, JsonValue)>),
+}
+
+impl JsonValue {
+    fn get(&self, key: &str) -> Option<&JsonValue> {
+        match self {
+            Self::Obj(entries) => entries
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Num(n) if n.fract() == 0.0 && n.abs() <= i64::MAX as f64 => Some(*n as i64),
+            _ => None,
+        }
+    }
+
+    /// Flatten a chat-component-shaped value into plain text: a bare string,
+    /// an array of components, or `{text|translate, extra: [...]}`.
+    fn plain_text(&self) -> String {
+        match self {
+            Self::Str(s) => s.clone(),
+            Self::Arr(items) => items.iter().map(Self::plain_text).collect(),
+            Self::Obj(_) => {
+                let mut out = String::new();
+                if let Some(t) = self.get("text").and_then(JsonValue::as_str) {
+                    out.push_str(t);
+                } else if let Some(t) = self.get("translate").and_then(JsonValue::as_str) {
+                    out.push_str(t);
+                }
+                if let Some(extra) = self.get("extra") {
+                    out.push_str(&extra.plain_text());
+                }
+                out
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+fn parse_status_json(text: &str) -> Result<JsonValue, String> {
+    let mut parser = JsonParser {
+        bytes: text.as_bytes(),
+        pos: 0,
+        nodes: 0,
+    };
+    parser.skip_ws();
+    let value = parser.value(0)?;
+    parser.skip_ws();
+    if parser.pos != parser.bytes.len() {
+        return Err("trailing bytes after status JSON document".to_string());
+    }
+    Ok(value)
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    nodes: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Result<JsonValue, String> {
+        if depth >= MAX_STATUS_JSON_DEPTH {
+            return Err("status JSON nesting depth exceeded".to_string());
+        }
+        self.nodes += 1;
+        if self.nodes > MAX_STATUS_JSON_NODES {
+            return Err("status JSON node budget exceeded".to_string());
+        }
+        match self.peek() {
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
+            Some(b'"') => Ok(JsonValue::Str(self.string()?)),
+            Some(b't') => self.literal(b"true", JsonValue::Bool(true)),
+            Some(b'f') => self.literal(b"false", JsonValue::Bool(false)),
+            Some(b'n') => self.literal(b"null", JsonValue::Null),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            Some(c) => Err(format!("unexpected byte 0x{c:02x} in status JSON")),
+            None => Err("truncated status JSON".to_string()),
+        }
+    }
+
+    fn literal(&mut self, lit: &[u8], value: JsonValue) -> Result<JsonValue, String> {
+        if self.bytes[self.pos..].starts_with(lit) {
+            self.pos += lit.len();
+            Ok(value)
+        } else {
+            Err("invalid JSON literal in status response".to_string())
+        }
+    }
+
+    fn number(&mut self) -> Result<JsonValue, String> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| "invalid JSON number".to_string())?;
+        text.parse::<f64>()
+            .map(JsonValue::Num)
+            .map_err(|_| format!("invalid JSON number '{text}'"))
+    }
+
+    fn hex4(&mut self) -> Result<u32, String> {
+        let end = self.pos + 4;
+        if end > self.bytes.len() {
+            return Err("truncated \\u escape in status JSON".to_string());
+        }
+        let s = std::str::from_utf8(&self.bytes[self.pos..end])
+            .map_err(|_| "invalid \\u escape in status JSON".to_string())?;
+        let value =
+            u32::from_str_radix(s, 16).map_err(|_| format!("invalid \\u escape '{s}'"))?;
+        self.pos = end;
+        Ok(value)
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        self.pos += 1; // opening quote
+        let mut out = String::new();
+        loop {
+            let Some(c) = self.peek() else {
+                return Err("unterminated string in status JSON".to_string());
+            };
+            self.pos += 1;
+            match c {
+                b'"' => return Ok(out),
+                b'\\' => {
+                    let Some(esc) = self.peek() else {
+                        return Err("unterminated escape in status JSON".to_string());
+                    };
+                    self.pos += 1;
+                    match esc {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{0008}'),
+                        b'f' => out.push('\u{000c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let hi = self.hex4()?;
+                            let mut ch = char::from_u32(hi).unwrap_or('\u{fffd}');
+                            if (0xD800..0xDC00).contains(&hi) {
+                                // A high surrogate only completes when a
+                                // `\uXXXX` low surrogate follows; otherwise
+                                // the lone surrogate renders as U+FFFD.
+                                ch = '\u{fffd}';
+                                let save = self.pos;
+                                if self.peek() == Some(b'\\') {
+                                    self.pos += 1;
+                                    if self.peek() == Some(b'u') {
+                                        self.pos += 1;
+                                        let lo = self.hex4()?;
+                                        if (0xDC00..0xE000).contains(&lo) {
+                                            ch = char::from_u32(
+                                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00),
+                                            )
+                                            .unwrap_or('\u{fffd}');
+                                        } else {
+                                            self.pos = save;
+                                        }
+                                    } else {
+                                        self.pos = save;
+                                    }
+                                }
+                            } else if (0xDC00..0xE000).contains(&hi) {
+                                ch = '\u{fffd}';
+                            }
+                            out.push(ch);
+                        }
+                        other => {
+                            return Err(format!("invalid escape '\\{}' in status JSON", other as char))
+                        }
+                    }
+                }
+                c if c < 0x80 => out.push(c as char),
+                _ => {
+                    // `text` is already valid UTF-8, so this byte starts a
+                    // multi-byte scalar: decode it whole and keep going.
+                    let start = self.pos - 1;
+                    let tail = std::str::from_utf8(&self.bytes[start..])
+                        .map_err(|_| "invalid UTF-8 in status JSON".to_string())?;
+                    let ch = tail.chars().next().unwrap();
+                    out.push(ch);
+                    self.pos = start + ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn array(&mut self, depth: usize) -> Result<JsonValue, String> {
+        self.pos += 1; // '['
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(JsonValue::Arr(items));
+        }
+        loop {
+            self.skip_ws();
+            items.push(self.value(depth + 1)?);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(JsonValue::Arr(items));
+                }
+                _ => return Err("expected ',' or ']' in status JSON array".to_string()),
+            }
+        }
+    }
+
+    fn object(&mut self, depth: usize) -> Result<JsonValue, String> {
+        self.pos += 1; // '{'
+        let mut entries = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(JsonValue::Obj(entries));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return Err("expected string key in status JSON object".to_string());
+            }
+            let key = self.string()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err("expected ':' in status JSON object".to_string());
+            }
+            self.pos += 1;
+            self.skip_ws();
+            let value = self.value(depth + 1)?;
+            entries.push((key, value));
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(JsonValue::Obj(entries));
+                }
+                _ => return Err("expected ',' or '}' in status JSON object".to_string()),
+            }
+        }
+    }
 }

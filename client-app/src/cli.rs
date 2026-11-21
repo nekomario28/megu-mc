@@ -101,6 +101,8 @@ pub struct CliConfig {
     /// Protocol the client handshakes with (`--mc-version`); defaults to
     /// 1.21.1/767.
     pub mc_version: mc_spine_proto::ProtocolVersion,
+    /// `--ping <host[:port]>`: run a server-list status query and exit.
+    pub ping: Option<String>,
     /// Kernel version pack directory (`--version-dir` or
     /// `MC_SPINE_VERSION_DIR`) for `Registry::from_version_dir`.
     pub version_dir: Option<PathBuf>,
@@ -169,6 +171,7 @@ impl Default for CliConfig {
             server_bin: None,
             seed: None,
             mc_version: mc_spine_proto::ProtocolVersion::V1_21_1,
+            ping: None,
             version_dir: None,
             headless: false,
             ticks: 40,
@@ -230,6 +233,7 @@ impl fmt::Debug for CliConfig {
             .field("server_bin", &self.server_bin)
             .field("seed", &self.seed)
             .field("mc_version", &self.mc_version)
+            .field("ping", &self.ping)
             .field("version_dir", &self.version_dir)
             .field("headless", &self.headless)
             .field("ticks", &self.ticks)
@@ -292,6 +296,7 @@ impl CliConfig {
             || self.quick_play_singleplayer.is_some()
             || self.server.is_some()
             || self.render_png.is_some()
+            || self.ping.is_some()
     }
 
     /// Merge the configured settings sources into
@@ -567,7 +572,7 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
             "-h" | "--help" => cfg.show_help = true,
             "--version-info" => cfg.show_version_info = true,
             "--headless" => cfg.headless = true,
-            "--json-summary" => cfg.json_summary = true,
+            "--json" | "--json-summary" => cfg.json_summary = true,
             "--username" => cfg.username = take_val(flag, &mut i)?,
             "--uuid" => cfg.uuid = Some(take_val(flag, &mut i)?),
             "--accessToken" => cfg.access_token = Some(take_val(flag, &mut i)?),
@@ -698,6 +703,7 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 let raw = take_val(flag, &mut i)?;
                 cfg.mc_version = parse_mc_version(&raw)?;
             }
+            "--ping" => cfg.ping = Some(take_val(flag, &mut i)?),
             "--version-dir" => {
                 cfg.version_dir = Some(PathBuf::from(take_val(flag, &mut i)?));
             }
@@ -784,6 +790,9 @@ LAUNCHER COMPATIBILITY FLAGS:
 
 NATIVE CLIENT FLAGS:
   --mc-version <ver>                 Client protocol: 1.21.1|26.3 or 767|777 (default: 1.21.1)
+  --ping <host[:port]>               Query a server's status (version, players,
+                                     MOTD, latency, icon) and exit; honors
+                                     --mc-version and --json/--json-summary
   --version-dir <path>               Kernel version pack directory for the block
                                      registry (env: MC_SPINE_VERSION_DIR)
   --headless                         Run headless protocol + meshing + physics session
@@ -791,7 +800,8 @@ NATIVE CLIENT FLAGS:
   --view-distance <N>                Client view distance in chunks, 2..=32 (default: 2)
   --assets-json <path>               Path to assets/block_states_1211.json
   --script <mode>                    Scripted input: walk|jump|sprint|idle|survey
-  --json-summary                     Emit machine-readable JSON summary on stdout
+  --json-summary, --json             Emit machine-readable JSON on stdout
+                                     (session summary or --ping status)
   --render-png <path>                Render final camera frame to a PNG screenshot
   --width <px>                       Render width, clamped 64..=1920 (default: 320)
   --height <px>                      Render height, clamped 64..=1080 (default: 180)

@@ -1592,3 +1592,260 @@ fn protocol777_chunk_blockupdate_chat_disconnect_render_e2e() {
 
     server.join().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// --ping server-list status query (Handshake -> Status -> Ping/Pong)
+// ---------------------------------------------------------------------------
+
+use mc_spine_client::protocol::{ping_server_resolved, ServerStatusPing};
+
+/// What the mock status server does with the client's Ping Request payload.
+#[derive(Clone, Copy)]
+enum MockPong {
+    /// Echo the nonce back (correct server behavior).
+    Echo,
+    /// Echo nonce + 1 — the client must reject the mismatched pong.
+    Corrupt,
+}
+
+/// Spawn a loopback server answering exactly one status ping with `json`,
+/// asserting the handshake carries `expect_protocol`, `expect_host`, and
+/// `expect_handshake_port` (`None` = the bound port the client dialed) with
+/// `next_state = 1` (Status). Returns the bound port for the resolver plus
+/// the thread handle.
+fn spawn_status_server(
+    expect_protocol: i32,
+    expect_host: &str,
+    expect_handshake_port: Option<u16>,
+    json: String,
+    pong: MockPong,
+) -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind status mock");
+    let bound_port = listener.local_addr().unwrap().port();
+    let expect_host = expect_host.to_string();
+    let handle = thread::spawn(move || {
+        let expect_port = expect_handshake_port.unwrap_or(bound_port);
+        let (mut sock, _) = listener.accept().expect("accept status ping");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        // Handshake: expected protocol + ORIGINAL host/port, next_state 1.
+        let (pid, body) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00, "first packet must be handshake");
+        let mut r = WireReader::new(&body);
+        assert_eq!(r.read_varint().unwrap(), expect_protocol);
+        assert_eq!(r.read_string(255).unwrap(), expect_host);
+        let mut raw_port = [0u8; 2];
+        raw_port.copy_from_slice(r.take(2).unwrap());
+        assert_eq!(u16::from_be_bytes(raw_port), expect_port);
+        assert_eq!(r.read_varint().unwrap(), 1, "next_state must be Status");
+
+        // Status Request (0x00, empty) -> Status Response (0x00, JSON).
+        let (pid, body) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00, "status_request");
+        assert!(body.is_empty(), "status_request carries no payload");
+        let mut resp = Vec::new();
+        write_string(&mut resp, &json);
+        sock.write_all(&encode_packet(0x00, &resp, None)).unwrap();
+
+        // Ping Request (0x01, i64) -> Pong (0x01, echoed or corrupted nonce).
+        let (pid, body) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x01, "ping_request");
+        let mut r = WireReader::new(&body);
+        let nonce = r.read_i64().unwrap();
+        let echoed = match pong {
+            MockPong::Echo => nonce,
+            MockPong::Corrupt => nonce.wrapping_add(1),
+        };
+        sock.write_all(&encode_packet(0x01, &echoed.to_be_bytes(), None))
+            .unwrap();
+    });
+    (bound_port, handle)
+}
+
+/// Status JSON with a player hover sample and a component-shaped MOTD;
+/// `favicon` toggles whether the icon field is sent at all.
+fn status_json(protocol: i64, name: &str, favicon: bool) -> String {
+    let favicon_field = if favicon {
+        ",\"favicon\":\"data:image/png;base64,iVBORw0KGgoAAAANS=\""
+    } else {
+        ""
+    };
+    format!(
+        "{{\"version\":{{\"name\":\"{name}\",\"protocol\":{protocol}}},\
+         \"players\":{{\"max\":20,\"online\":2,\
+         \"sample\":[{{\"name\":\"Steve\",\"id\":\"00000000-0000-0000-0000-000000000001\"}},\
+         {{\"name\":\"Alex\",\"id\":\"00000000-0000-0000-0000-000000000002\"}}]}},\
+         \"description\":{{\"text\":\"Hello \",\"extra\":[{{\"text\":\"World\"}}]}}{favicon_field}}}"
+    )
+}
+
+fn loopback_resolver(
+    port: u16,
+) -> impl FnOnce(&str, u16) -> Result<Vec<std::net::SocketAddr>, String> {
+    move |_, _| Ok(vec![format!("127.0.0.1:{port}").parse().unwrap()])
+}
+
+/// The full status exchange works identically on 767 and 777: version,
+/// players + hover sample, component MOTD flattening, favicon detection,
+/// and a measured round trip — while the mock asserts the handshake's
+/// protocol, host, port, and `next_state = 1`.
+#[test]
+fn ping_status_mock_server_both_protocol_versions() {
+    for (version, protocol, label) in [
+        (
+            mc_spine_proto::ProtocolVersion::V1_21_1,
+            767i64,
+            "mc-spine 1.21.1",
+        ),
+        (
+            mc_spine_proto::ProtocolVersion::V26_3,
+            777i64,
+            "mc-spine 26.3",
+        ),
+    ] {
+        let json = status_json(protocol, label, true);
+        let (port, server) =
+            spawn_status_server(protocol as i32, "127.0.0.1", None, json, MockPong::Echo);
+
+        let status: ServerStatusPing =
+            ping_server_resolved("127.0.0.1", port, version, Duration::from_secs(5), loopback_resolver(port))
+                .expect("status ping failed");
+        assert_eq!(status.host, "127.0.0.1");
+        assert_eq!(status.port, port);
+        assert_eq!(status.resolved_addr, format!("127.0.0.1:{port}").parse().unwrap());
+        assert_eq!(status.version_name, label);
+        assert_eq!(status.protocol, protocol);
+        assert!(status.protocol_match);
+        assert_eq!(status.requested_protocol, protocol as i32);
+        assert_eq!(status.players_online, 2);
+        assert_eq!(status.players_max, 20);
+        assert_eq!(status.player_sample, vec!["Steve", "Alex"]);
+        assert_eq!(status.motd, "Hello World");
+        assert!(status.has_favicon);
+        assert!(status.rtt_ms >= 0.0);
+
+        // Human output stays jargon-free; JSON output round-trips the fields.
+        let human = status.to_human();
+        assert!(human.contains(label), "human output missing version: {human}");
+        assert!(human.contains("2 / 20"), "human output missing players: {human}");
+        assert!(human.contains("Hello World"), "human output missing motd: {human}");
+        assert!(human.contains("ms"), "human output missing latency: {human}");
+        assert!(human.contains("present"), "human output missing icon: {human}");
+        let json_out = status.to_json();
+        assert!(json_out.contains("\"protocol\":767") || json_out.contains("\"protocol\":777"));
+        assert!(json_out.contains("\"protocol_match\":true"));
+        assert!(json_out.contains("\"player_sample\":[\"Steve\",\"Alex\"]"));
+
+        server.join().unwrap();
+    }
+}
+
+/// A `_minecraft._tcp` redirect moves the socket to the backend, but the
+/// Handshake still carries the ORIGINAL host and the default port — the
+/// vanilla ServerNameResolver rule — proven without live DNS.
+#[test]
+fn ping_srv_redirect_preserves_original_host_in_handshake() {
+    let json = status_json(767, "backend", false);
+    let (backend_port, server) =
+        spawn_status_server(767, "play.example.org", Some(25565), json, MockPong::Echo);
+
+    let status = ping_server_resolved(
+        "play.example.org",
+        25565,
+        mc_spine_proto::ProtocolVersion::V1_21_1,
+        Duration::from_secs(5),
+        move |host, port| {
+            // The injected SRV answer redirects the socket to the backend.
+            assert_eq!(host, "play.example.org");
+            assert_eq!(port, 25565);
+            Ok(vec![format!("127.0.0.1:{backend_port}").parse().unwrap()])
+        },
+    )
+    .expect("SRV-redirected status ping failed");
+    assert_eq!(status.host, "play.example.org");
+    assert_eq!(status.port, 25565);
+    assert_eq!(
+        status.resolved_addr,
+        format!("127.0.0.1:{backend_port}").parse().unwrap()
+    );
+    assert!(!status.has_favicon);
+    server.join().unwrap();
+}
+
+/// A pong echoing a different nonce is a hard error, not a silent pass.
+#[test]
+fn ping_rejects_mismatched_pong_nonce() {
+    let json = status_json(777, "mc-spine 26.3", true);
+    let (port, server) =
+        spawn_status_server(777, "127.0.0.1", None, json, MockPong::Corrupt);
+
+    let err = ping_server_resolved(
+        "127.0.0.1",
+        port,
+        mc_spine_proto::ProtocolVersion::V26_3,
+        Duration::from_secs(5),
+        loopback_resolver(port),
+    )
+    .expect_err("corrupted pong must fail the ping");
+    assert!(err.contains("pong"), "unexpected error: {err}");
+    server.join().unwrap();
+}
+
+/// A server reporting a different protocol than the one the Handshake
+/// offered is surfaced cleanly via `protocol_match`.
+#[test]
+fn ping_reports_protocol_mismatch() {
+    // Client handshakes 777; the server reports protocol 767 in its JSON.
+    let json = status_json(767, "actually-a-767-server", false);
+    let (port, server) =
+        spawn_status_server(777, "127.0.0.1", None, json, MockPong::Echo);
+
+    let status = ping_server_resolved(
+        "127.0.0.1",
+        port,
+        mc_spine_proto::ProtocolVersion::V26_3,
+        Duration::from_secs(5),
+        loopback_resolver(port),
+    )
+    .expect("mismatched-protocol ping still answers");
+    assert_eq!(status.protocol, 767);
+    assert_eq!(status.requested_protocol, 777);
+    assert!(!status.protocol_match);
+    assert!(status.to_human().contains("you asked for 777"));
+    assert!(status.to_json().contains("\"protocol_match\":false"));
+    server.join().unwrap();
+}
+
+/// `--ping` parses `host[:port]` like the other server flags, honors
+/// `--mc-version` and `--json`, and counts as a session action.
+#[test]
+fn cli_ping_flag_parses_and_marks_session_action() {
+    let cfg = parse_args(&["--ping", "play.example.org"]).unwrap();
+    assert_eq!(cfg.ping.as_deref(), Some("play.example.org"));
+    assert!(cfg.wants_session_action());
+    let (host, port) = parse_host_port(cfg.ping.as_deref().unwrap(), cfg.port).unwrap();
+    assert_eq!((host.as_str(), port), ("play.example.org", 25565));
+
+    let cfg = parse_args(&[
+        "--ping",
+        "play.example.org:25570",
+        "--mc-version",
+        "26.3",
+        "--json",
+    ])
+    .unwrap();
+    assert_eq!(cfg.mc_version.number(), 777);
+    assert!(cfg.json_summary);
+    let (host, port) = parse_host_port(cfg.ping.as_deref().unwrap(), cfg.port).unwrap();
+    assert_eq!((host.as_str(), port), ("play.example.org", 25570));
+
+    // `--ping` honors an explicit `--port` default like the other flags.
+    let cfg = parse_args(&["--ping", "play.example.org", "--port", "25999"]).unwrap();
+    let (_, port) = parse_host_port(cfg.ping.as_deref().unwrap(), cfg.port).unwrap();
+    assert_eq!(port, 25999);
+
+    // Inline `--ping=host:port` works too, and a missing value is an error.
+    let cfg = parse_args(&["--ping=example.org:1234"]).unwrap();
+    assert_eq!(cfg.ping.as_deref(), Some("example.org:1234"));
+    assert!(parse_args(&["--ping"]).is_err());
+}

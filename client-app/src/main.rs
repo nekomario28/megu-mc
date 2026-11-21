@@ -2,11 +2,19 @@
 //! Native Minecraft 1.21.1 (Protocol 767) client executable for mc-spine.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
-use mc_spine_client::cli::{help_text, parse_args, redact_from_argv, version_info_text};
+use mc_spine_client::cli::{
+    help_text, parse_args, parse_host_port, redact_from_argv, version_info_text, CliConfig,
+};
 use mc_spine_client::integrated;
+use mc_spine_client::protocol::ping_server;
 use mc_spine_client::settings::ClientSettings;
 use mc_spine_client::sim::run_session;
+
+/// Status ping gives the server ten seconds for the whole exchange —
+/// generous on a loaded loopback, short enough for an operator's patience.
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
@@ -72,6 +80,12 @@ fn main() -> ExitCode {
         }
     }
 
+    // `--ping` is a server action like a session: SRV-aware, --mc-version
+    // aware, JSON or human output, then exit.
+    if let Some(target) = cfg.ping.clone() {
+        return run_status_ping(&cfg, &target);
+    }
+
     let endpoint = match cfg.target_endpoint() {
         Ok(ep) => ep,
         Err(err) => {
@@ -111,6 +125,32 @@ fn main() -> ExitCode {
                 println!("{}", summary.to_json());
             } else {
                 println!("{}", summary.to_human());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("mc-spine-client: {}", cfg.redact(&err));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `--ping <host[:port]>`: query the server's status in `cfg.mc_version`'s
+/// protocol and print either a human summary or `--json` output.
+fn run_status_ping(cfg: &CliConfig, target: &str) -> ExitCode {
+    let (host, port) = match parse_host_port(target, cfg.port) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            eprintln!("mc-spine-client: {}", cfg.redact(&err));
+            return ExitCode::from(2);
+        }
+    };
+    match ping_server(&host, port, cfg.mc_version, PING_TIMEOUT) {
+        Ok(status) => {
+            if cfg.json_summary {
+                println!("{}", status.to_json());
+            } else {
+                println!("{}", status.to_human());
             }
             ExitCode::SUCCESS
         }

@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mc_spine_client_mesh::ffi::PackedVertex;
 use mc_spine_client_mesh::{
@@ -95,6 +95,195 @@ impl Default for RenderConfig {
             entity_shadows: true,
             vsync: true,
             max_fps: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Always-on frame budget governor
+// ---------------------------------------------------------------------------
+
+/// Throttle stage the [`FrameBudgetGovernor`] is holding at, cheapest work
+/// first. The numeric stage (`0..=3`) is what the governor tracks; the names
+/// say what that stage trims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThrottleStage {
+    /// Stage 0: every user setting passes through untouched.
+    Full,
+    /// Stage 1: dirty-section rebuilds per frame are capped.
+    TrimRebuilds,
+    /// Stage 2: far-terrain LOD columns are trimmed too.
+    TrimLod,
+    /// Stage 3: minimum work — rebuilds, LOD, and view distance all cut.
+    MinBudget,
+}
+
+impl ThrottleStage {
+    const COUNT: u8 = 4;
+
+    fn from_stage(stage: u8) -> Self {
+        match stage {
+            0 => Self::Full,
+            1 => Self::TrimRebuilds,
+            2 => Self::TrimLod,
+            _ => Self::MinBudget,
+        }
+    }
+
+    /// The `0..=3` stage number (`Full` = 0).
+    pub const fn stage(self) -> u8 {
+        match self {
+            Self::Full => 0,
+            Self::TrimRebuilds => 1,
+            Self::TrimLod => 2,
+            Self::MinBudget => 3,
+        }
+    }
+}
+
+/// Per-frame work budget the governor hands back: how much work the render
+/// loop may spend this frame without breaching the frame-time target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameRenderBudget {
+    /// Dirty section rebuilds allowed this frame (`usize::MAX` = uncapped).
+    pub max_dirty_rebuilds_per_frame: usize,
+    /// LOD columns the far-terrain pass may keep this frame.
+    pub effective_lod_chunks: u16,
+    /// Full-detail view distance cap this frame.
+    pub effective_view_distance: u8,
+}
+
+/// Weight given to the newest frame in the rolling mean: the average settles
+/// over roughly the last ~15 frames rather than jumping on one spike.
+const FRAME_EWMA_ALPHA: f64 = 0.15;
+/// Over 110% of the frame budget the frame is overloaded; under 60% there is
+/// room to give work back. Between them the stage holds — that deadband is
+/// what keeps the budget from flapping.
+const FRAME_OVERLOAD_RATIO: f64 = 1.10;
+const FRAME_RECOVER_RATIO: f64 = 0.60;
+/// Consecutive over-budget frames before one stage-up step, so a single GC
+/// or disk spike never engages the throttle.
+const FRAME_ESCALATE_AFTER: u32 = 3;
+/// Consecutive comfortable frames before one stage-down step — slower than
+/// escalation so recovery does not immediately re-overload.
+const FRAME_RECOVER_AFTER: u32 = 10;
+/// Frame budget when `max_fps` is uncapped (roughly 60 fps).
+const DEFAULT_FRAME_BUDGET_MS: f64 = 1000.0 / 60.0;
+
+/// Always-on frame budget throttle, mirroring the server's `AutoLoadBalancer`
+/// design: no settings toggle, no wall clock — the caller feeds one
+/// `Duration` per frame and reads [`FrameRenderBudget`]s back. The EWMA +
+/// consecutive-frame guards keep single-frame GC/disk spikes from engaging
+/// the throttle, and hysteresis steps the stage down one at a time once
+/// frame times stay comfortably under budget.
+#[derive(Clone, Debug)]
+pub struct FrameBudgetGovernor {
+    ewma_ms: f64,
+    primed: bool,
+    stage: u8,
+    over_frames: u32,
+    under_frames: u32,
+    budget_ms: f64,
+}
+
+impl FrameBudgetGovernor {
+    /// Governor for a `max_fps` cap (`None` = uncapped ~60 fps budget).
+    pub fn new(max_fps: Option<u32>) -> Self {
+        Self {
+            ewma_ms: 0.0,
+            primed: false,
+            stage: 0,
+            over_frames: 0,
+            under_frames: 0,
+            budget_ms: max_fps
+                .map(|fps| 1000.0 / fps.max(1) as f64)
+                .unwrap_or(DEFAULT_FRAME_BUDGET_MS),
+        }
+    }
+
+    /// Record one frame's cost and return the stage now in force. One call
+    /// moves at most one stage in one direction, which is what makes the
+    /// adaptation smooth rather than oscillating.
+    pub fn observe_frame(&mut self, frame_time: Duration) -> ThrottleStage {
+        let ms = frame_time.as_secs_f64() * 1000.0;
+        self.ewma_ms = if self.primed {
+            self.ewma_ms + (ms - self.ewma_ms) * FRAME_EWMA_ALPHA
+        } else {
+            self.primed = true;
+            ms
+        };
+        if ms > self.budget_ms * FRAME_OVERLOAD_RATIO {
+            self.over_frames += 1;
+            self.under_frames = 0;
+            if self.over_frames >= FRAME_ESCALATE_AFTER
+                && self.ewma_ms > self.budget_ms * FRAME_OVERLOAD_RATIO
+            {
+                self.stage = (self.stage + 1).min(ThrottleStage::COUNT - 1);
+                self.over_frames = 0;
+            }
+        } else if ms < self.budget_ms * FRAME_RECOVER_RATIO {
+            self.under_frames += 1;
+            self.over_frames = 0;
+            if self.under_frames >= FRAME_RECOVER_AFTER
+                && self.ewma_ms < self.budget_ms * FRAME_RECOVER_RATIO
+            {
+                self.stage = self.stage.saturating_sub(1);
+                self.under_frames = 0;
+            }
+        } else {
+            // Deadband frame: neither overloaded nor comfortable, so both
+            // consecutive-run counters restart — a stage move always needs
+            // an unbroken run of qualifying frames.
+            self.over_frames = 0;
+            self.under_frames = 0;
+        }
+        self.stage()
+    }
+
+    /// The stage currently in force.
+    pub fn stage(&self) -> ThrottleStage {
+        ThrottleStage::from_stage(self.stage)
+    }
+
+    /// The smoothed (EWMA) frame time the governor is reacting to.
+    pub fn frame_ms(&self) -> f64 {
+        self.ewma_ms
+    }
+
+    /// The configured frame budget in milliseconds.
+    pub fn budget_ms(&self) -> f64 {
+        self.budget_ms
+    }
+
+    /// The work budget this frame should run with, given the user's base
+    /// `view_distance` and far-terrain `lod_chunks`. At [`ThrottleStage::Full`]
+    /// every field is the exact user setting, untouched.
+    pub fn effective_budget(
+        &self,
+        base_view_distance: u8,
+        base_lod_chunks: u16,
+    ) -> FrameRenderBudget {
+        match self.stage() {
+            ThrottleStage::Full => FrameRenderBudget {
+                max_dirty_rebuilds_per_frame: usize::MAX,
+                effective_lod_chunks: base_lod_chunks,
+                effective_view_distance: base_view_distance,
+            },
+            ThrottleStage::TrimRebuilds => FrameRenderBudget {
+                max_dirty_rebuilds_per_frame: 8,
+                effective_lod_chunks: base_lod_chunks,
+                effective_view_distance: base_view_distance,
+            },
+            ThrottleStage::TrimLod => FrameRenderBudget {
+                max_dirty_rebuilds_per_frame: 4,
+                effective_lod_chunks: base_lod_chunks / 2,
+                effective_view_distance: base_view_distance,
+            },
+            ThrottleStage::MinBudget => FrameRenderBudget {
+                max_dirty_rebuilds_per_frame: 2,
+                effective_lod_chunks: base_lod_chunks / 4,
+                effective_view_distance: base_view_distance.saturating_sub(4).max(2),
+            },
         }
     }
 }
@@ -1084,5 +1273,102 @@ mod tests {
             full.stats.drawn_sections
         );
         assert!(limited.stats.culled_sections > full.stats.culled_sections);
+    }
+
+    /// Stage 0 (`Full`) returns the exact user settings untouched, and the
+    /// budget tracks `1000 / max_fps` (16.67 ms when unlimited).
+    #[test]
+    fn governor_full_stage_passes_user_settings_through() {
+        let governor = FrameBudgetGovernor::new(Some(60));
+        assert_eq!(governor.stage(), ThrottleStage::Full);
+        assert!((governor.budget_ms() - 1000.0 / 60.0).abs() < 1e-9);
+        let budget = governor.effective_budget(16, 96);
+        assert_eq!(budget.max_dirty_rebuilds_per_frame, usize::MAX);
+        assert_eq!(budget.effective_lod_chunks, 96);
+        assert_eq!(budget.effective_view_distance, 16);
+
+        let unlimited = FrameBudgetGovernor::new(None);
+        assert!((unlimited.budget_ms() - 1000.0 / 60.0).abs() < 1e-9);
+        let capped = FrameBudgetGovernor::new(Some(144));
+        assert!((capped.budget_ms() - 1000.0 / 144.0).abs() < 1e-9);
+    }
+
+    /// One huge GC/disk-style frame — even one that lingers in the EWMA —
+    /// never moves the stage off Full.
+    #[test]
+    fn governor_ignores_single_frame_spike() {
+        let mut governor = FrameBudgetGovernor::new(Some(60));
+        for _ in 0..20 {
+            governor.observe_frame(Duration::from_millis(8));
+        }
+        governor.observe_frame(Duration::from_millis(300));
+        assert_eq!(governor.stage(), ThrottleStage::Full);
+        // Even though the spike keeps the EWMA elevated for several frames,
+        // the consecutive-over-budget guard never completes.
+        for _ in 0..8 {
+            governor.observe_frame(Duration::from_millis(8));
+            assert_eq!(governor.stage(), ThrottleStage::Full);
+        }
+    }
+
+    /// Sustained overload escalates one stage at a time (0 -> 1 -> 2 -> 3),
+    /// each stage tightening a different slice of the frame budget.
+    #[test]
+    fn governor_escalates_through_stages_under_sustained_overload() {
+        let mut governor = FrameBudgetGovernor::new(Some(60));
+        for (want, rebuilds, lod, view) in [
+            (ThrottleStage::TrimRebuilds, 8, 96, 16),
+            (ThrottleStage::TrimLod, 4, 48, 16),
+            (ThrottleStage::MinBudget, 2, 24, 12),
+        ] {
+            for _ in 0..3 {
+                governor.observe_frame(Duration::from_millis(30));
+            }
+            assert_eq!(governor.stage(), want);
+            let budget = governor.effective_budget(16, 96);
+            assert_eq!(budget.max_dirty_rebuilds_per_frame, rebuilds);
+            assert_eq!(budget.effective_lod_chunks, lod);
+            assert_eq!(budget.effective_view_distance, view);
+        }
+        // Stage 3 is the ceiling: further overload stays put.
+        for _ in 0..6 {
+            governor.observe_frame(Duration::from_millis(30));
+        }
+        assert_eq!(governor.stage(), ThrottleStage::MinBudget);
+        // The view-distance floor never drops below 2.
+        assert_eq!(governor.effective_budget(4, 8).effective_view_distance, 2);
+        assert_eq!(governor.effective_budget(4, 3).effective_lod_chunks, 0);
+    }
+
+    /// Once frame time stays comfortably under budget the governor steps
+    /// down one stage at a time (3 -> 2 -> 1 -> 0) — never faster.
+    #[test]
+    fn governor_steps_down_one_stage_at_a_time_on_recovery() {
+        let mut governor = FrameBudgetGovernor::new(Some(60));
+        for _ in 0..9 {
+            governor.observe_frame(Duration::from_millis(30));
+        }
+        assert_eq!(governor.stage(), ThrottleStage::MinBudget);
+
+        let mut seen = vec![governor.stage()];
+        for _ in 0..300 {
+            governor.observe_frame(Duration::from_millis(5));
+            if governor.stage() != *seen.last().unwrap() {
+                seen.push(governor.stage());
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ThrottleStage::MinBudget,
+                ThrottleStage::TrimLod,
+                ThrottleStage::TrimRebuilds,
+                ThrottleStage::Full,
+            ],
+            "recovery must walk down exactly one stage at a time"
+        );
+        let budget = governor.effective_budget(16, 96);
+        assert_eq!(budget.max_dirty_rebuilds_per_frame, usize::MAX);
+        assert_eq!(budget.effective_view_distance, 16);
     }
 }
