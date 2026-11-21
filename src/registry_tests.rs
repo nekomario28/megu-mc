@@ -2787,3 +2787,614 @@ fn bundled_datapacks_all_declare_a_format_compatible_with_1211() {
         "the bundled datapacks must be checked, but only {checked} were"
     );
 }
+
+// ---------- #221: end-to-end datapack + mod-compatibility registry validation ----------
+//
+// The two pure decisions above -- the pack.mcmeta format gate and the 0x07 registry-data
+// assembler -- are only useful together. A loader sees a stack of packs (vanilla, a custom
+// datapack, a mod datapack), drops the ones whose format or data it cannot use, and overlays
+// the survivors in priority order before sending the registry packets. These tests drive
+// that whole path: a bad pack is discarded without poisoning the good ones, the survivors
+// are overlaid deterministically, and every emitted entry round-trips through the network
+// NBT codec.
+
+#[derive(Debug, Clone, Copy)]
+struct CandidatePack<'a> {
+    name: &'a str,
+    /// Files by pack-root-relative path; the `pack.mcmeta` entry is the format gate's input.
+    files: &'a [(&'a str, &'a [u8])],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadRejection<'a> {
+    NoMeta(&'a str),
+    Format(&'a str, PackFormatError),
+    InvalidData(&'a str),
+}
+
+/// Model the loader's pack gate plus registry assembly. Each candidate is checked on its
+/// own: a pack without a usable `pack.mcmeta`, or whose registry files cannot be encoded
+/// (bad JSON, bad path, duplicate path within the pack), is dropped and recorded. Only
+/// surviving packs reach `build_registry_data_payloads`, so one bad pack cannot poison
+/// the others. Packs are overlaid low-to-high priority; later packs win.
+fn load_registry_data<'a>(
+    packs: impl IntoIterator<Item = CandidatePack<'a>>,
+) -> Result<(Vec<Vec<u8>>, Vec<LoadRejection<'a>>), String> {
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for pack in packs {
+        let Some(meta) = pack
+            .files
+            .iter()
+            .find(|(path, _)| *path == "pack.mcmeta")
+            .map(|(_, bytes)| *bytes)
+        else {
+            rejected.push(LoadRejection::NoMeta(pack.name));
+            continue;
+        };
+        if let Err(err) = validate_pack_mcmeta_format(meta) {
+            rejected.push(LoadRejection::Format(pack.name, err));
+            continue;
+        }
+        // Round-trip this pack through the assembler in isolation: any error here
+        // disqualifies the whole pack, never the other packs in the stack.
+        if build_registry_data_payloads([pack.files.iter().copied()]).is_err() {
+            rejected.push(LoadRejection::InvalidData(pack.name));
+            continue;
+        }
+        accepted.push(pack.files);
+    }
+    let payloads = build_registry_data_payloads(accepted.into_iter().map(|f| f.iter().copied()))?;
+    Ok((payloads, rejected))
+}
+
+fn nbt_str(value: &str) -> nbt::Tag {
+    nbt::Tag::String(nbt::NbtString::text(value))
+}
+
+/// Decode one 0x07 registry payload, consuming it exactly. Each entry's network NBT is
+/// re-encoded and decoded again, proving the codec round-trips byte-for-byte.
+fn decode_registry_payload(payload: &[u8]) -> (String, Vec<(String, nbt::Tag)>) {
+    let mut input = payload;
+    let registry = read_registry_string(&mut input).to_string();
+    let count = read_protocol_i32(&mut input).expect("a registry count");
+    assert!(count >= 0, "a registry cannot have a negative entry count");
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        let id = read_registry_string(&mut input).to_string();
+        assert_eq!(
+            input.split_off(..1),
+            Some(&[1u8][..]),
+            "each registry entry carries present NBT"
+        );
+        let start = input;
+        let tag = nbt::read_network_nbt(&mut input).unwrap();
+        let wire = &start[..start.len() - input.len()];
+        assert_eq!(nbt::write_network_nbt(&tag).unwrap(), wire, "NBT re-encode");
+        let mut again = wire;
+        assert_eq!(nbt::read_network_nbt(&mut again).unwrap(), tag);
+        assert!(again.is_empty());
+        entries.push((id, tag));
+    }
+    assert!(input.is_empty(), "trailing bytes in registry payload");
+    (registry, entries)
+}
+
+#[test]
+fn datapack_mod_e2e_overlay_precedence_and_deterministic_ordering() {
+    // Vanilla declares the point format 48; the custom datapack declares a range that
+    // includes 48; the mod was built for 57 but declares backward compatibility to 48.
+    // All three are loadable by a 1.21.1 server.
+    let vanilla: [(&str, &[u8]); 3] = [
+        (
+            "pack.mcmeta",
+            br#"{"pack":{"pack_format":48,"description":"vanilla"}}"#,
+        ),
+        (
+            "data/minecraft/damage_type/generic.json",
+            br#"{"message_id":"generic"}"#,
+        ),
+        (
+            "data/minecraft/worldgen/biome/plains.json",
+            br#"{"has_precipitation":false,"temperature":0.8,"downfall":0.4,"effects":{"fog_color":1,"water_color":2,"water_fog_color":3,"sky_color":4},"spawners":{}}"#,
+        ),
+    ];
+    let custom: [(&str, &[u8]); 4] = [
+        (
+            "pack.mcmeta",
+            br#"{"pack":{"pack_format":48,"supported_formats":[46,50],"description":"custom"}}"#,
+        ),
+        (
+            "data/example/damage_type/custom.json",
+            br#"{"message_id":"custom"}"#,
+        ),
+        (
+            "data/example/worldgen/biome/custom_biome.json",
+            br#"{"has_precipitation":true,"temperature":0.1,"downfall":0.9,"effects":{"fog_color":5,"water_color":6,"water_fog_color":7,"sky_color":8}}"#,
+        ),
+        (
+            "data/example/enchantment/custom_enchant.json",
+            br#"{"description":"custom","max_level":3}"#,
+        ),
+    ];
+    let modpack: [(&str, &[u8]); 5] = [
+        (
+            "pack.mcmeta",
+            br#"{"pack":{"pack_format":57,"supported_formats":{"min_inclusive":48,"max_inclusive":57},"description":"mod"}}"#,
+        ),
+        (
+            "data/minecraft/damage_type/generic.json",
+            br#"{"message_id":"generic_mod"}"#,
+        ),
+        (
+            "data/example/damage_type/custom.json",
+            br#"{"message_id":"custom_mod"}"#,
+        ),
+        (
+            "data/mod/trim_material/alloy.json",
+            br#"{"asset_name":"alloy","ingredient":"minecraft:iron_ingot"}"#,
+        ),
+        (
+            "data/mod/jukebox_song/track.json",
+            br#"{"sound_event":"mod:track","length":100}"#,
+        ),
+    ];
+
+    let (payloads, rejected) = load_registry_data([
+        CandidatePack {
+            name: "vanilla",
+            files: &vanilla,
+        },
+        CandidatePack {
+            name: "custom",
+            files: &custom,
+        },
+        CandidatePack {
+            name: "mod",
+            files: &modpack,
+        },
+    ])
+    .unwrap();
+    assert!(rejected.is_empty(), "{rejected:?}");
+    assert_eq!(payloads.len(), 5);
+
+    let decoded: Vec<_> = payloads.iter().map(|p| decode_registry_payload(p)).collect();
+    // Payloads follow the vanilla configuration registry order, not pack order.
+    assert_eq!(
+        decoded.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(),
+        [
+            "minecraft:worldgen/biome",
+            "minecraft:trim_material",
+            "minecraft:damage_type",
+            "minecraft:enchantment",
+            "minecraft:jukebox_song",
+        ]
+    );
+
+    // Within a registry, entries are ordered by path then namespace and the highest
+    // priority pack supplies the value for a path declared more than once.
+    let damage = &decoded[2].1;
+    assert_eq!(
+        damage.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["example:custom", "minecraft:generic"]
+    );
+    assert_eq!(
+        damage[0].1.get("message_id"),
+        Some(&nbt_str("custom_mod")),
+        "the mod pack overrides the custom datapack"
+    );
+    assert_eq!(
+        damage[1].1.get("message_id"),
+        Some(&nbt_str("generic_mod")),
+        "the mod pack overrides vanilla"
+    );
+
+    // The multi-entry 0x07 payload is exactly the wire layout: registry id, VarInt count,
+    // then (id, present=NBT) pairs in sorted order.
+    let expected_damage = b"\x15minecraft:damage_type\x02\
+                            \x0eexample:custom\x01\x0a\x08\x00\x0amessage_id\x00\x0acustom_mod\x00\
+                            \x11minecraft:generic\x01\x0a\x08\x00\x0amessage_id\x00\x0bgeneric_mod\x00";
+    assert_eq!(&payloads[2], expected_damage);
+
+    // Biomes from both lower-priority packs survive; the network codec still strips the
+    // worldgen-only fields (spawners) before encoding.
+    assert_eq!(
+        decoded[0]
+            .1
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["example:custom_biome", "minecraft:plains"]
+    );
+    let nbt::Tag::Compound(plains) = &decoded[0].1[1].1 else {
+        panic!("the vanilla biome must be a compound");
+    };
+    assert_eq!(
+        plains.keys().map(|k| k.to_utf8().unwrap()).collect::<Vec<_>>(),
+        ["downfall", "effects", "has_precipitation", "temperature"]
+    );
+    assert_eq!(
+        plains.get(&nbt::NbtString::text("has_precipitation")),
+        Some(&nbt::Tag::Byte(0))
+    );
+
+    // The three kinds declared by exactly one pack are each present once.
+    for (payload, id, field) in [
+        (&decoded[1], "mod:alloy", "asset_name"),
+        (&decoded[3], "example:custom_enchant", "description"),
+        (&decoded[4], "mod:track", "sound_event"),
+    ] {
+        assert_eq!(payload.1.len(), 1);
+        assert_eq!(payload.1[0].0, id);
+        assert!(payload.1[0].1.get(field).is_some());
+    }
+
+    // Reversing the files inside every pack changes nothing: the bytes are a function of
+    // the pack stack, not of the order a directory reader happened to yield files in.
+    let vanilla_rev: Vec<_> = vanilla.iter().rev().copied().collect();
+    let custom_rev: Vec<_> = custom.iter().rev().copied().collect();
+    let mod_rev: Vec<_> = modpack.iter().rev().copied().collect();
+    let (reordered, rejected) = load_registry_data([
+        CandidatePack {
+            name: "vanilla",
+            files: &vanilla_rev,
+        },
+        CandidatePack {
+            name: "custom",
+            files: &custom_rev,
+        },
+        CandidatePack {
+            name: "mod",
+            files: &mod_rev,
+        },
+    ])
+    .unwrap();
+    assert!(rejected.is_empty(), "{rejected:?}");
+    assert_eq!(reordered, payloads);
+
+    // Swapping pack priority swaps the winners, while the entry set stays the same.
+    let (flipped, rejected) = load_registry_data([
+        CandidatePack {
+            name: "mod",
+            files: &modpack,
+        },
+        CandidatePack {
+            name: "custom",
+            files: &custom,
+        },
+        CandidatePack {
+            name: "vanilla",
+            files: &vanilla,
+        },
+    ])
+    .unwrap();
+    assert!(rejected.is_empty(), "{rejected:?}");
+    let flipped = decode_registry_payload(&flipped[2]).1;
+    assert_eq!(
+        flipped[0].1.get("message_id"),
+        Some(&nbt_str("custom")),
+        "now the custom pack is later than the mod pack"
+    );
+    assert_eq!(
+        flipped[1].1.get("message_id"),
+        Some(&nbt_str("generic")),
+        "now vanilla is later than the mod pack"
+    );
+}
+
+#[test]
+fn datapack_mod_e2e_all_five_custom_registries_round_trip_network_nbt() {
+    // Rich values exercise every JSON type the registry codec preserves. The biome also
+    // carries worldgen fields that must not reach the network codec.
+    let pack: [(&str, &[u8]); 6] = [
+        ("pack.mcmeta", br#"{"pack":{"pack_format":48,"description":"e2e"}}"#),
+        (
+            "data/example/damage_type/deep.json",
+            br#"{"message_id":"deep","scaling":"never","exhaustion":0.25,"deaths":["fall","drown"],"effects":"hurt"}"#,
+        ),
+        (
+            "data/example/worldgen/biome/deep.json",
+            br#"{"has_precipitation":true,"temperature":0.2,"downfall":0.7,"effects":{"fog_color":11,"water_color":12,"water_fog_color":13,"sky_color":14},"carvers":{"air":[]},"features":["a"],"spawn_costs":{"b":{}},"spawners":{"c":{}},"creature_spawn_probability":0.01}"#,
+        ),
+        (
+            "data/example/enchantment/deep.json",
+            br##"{"description":"deep","max_level":5,"weight":2,"exclusive_set":["minecraft:protection"],"supported_items":"#minecraft:armor"}"##,
+        ),
+        (
+            "data/example/trim_material/deep.json",
+            br#"{"asset_name":"deep","ingredient":"minecraft:diamond","description":"Deep","palette":{"material_0":123456}}"#,
+        ),
+        (
+            "data/example/jukebox_song/deep.json",
+            br#"{"sound_event":"example:deep","length":128,"duration_in_ticks":2560,"description":"Deep","comparison":0,"max_distance":16}"#,
+        ),
+    ];
+
+    let (payloads, rejected) =
+        load_registry_data([CandidatePack { name: "pack", files: &pack }]).unwrap();
+    assert!(rejected.is_empty(), "{rejected:?}");
+    let decoded: BTreeMap<String, Vec<(String, nbt::Tag)>> = payloads
+        .iter()
+        .map(|p| decode_registry_payload(p))
+        .collect();
+    assert_eq!(decoded.len(), 5, "all five custom registries must be sent");
+
+    let damage = &decoded["minecraft:damage_type"];
+    assert_eq!(damage.len(), 1);
+    assert_eq!(damage[0].0, "example:deep");
+    assert_eq!(damage[0].1.get("message_id"), Some(&nbt_str("deep")));
+    assert_eq!(damage[0].1.get("scaling"), Some(&nbt_str("never")));
+    assert_eq!(
+        damage[0].1.get("exhaustion"),
+        Some(&nbt::Tag::Double(0.25_f64.to_bits()))
+    );
+    assert_eq!(
+        damage[0].1.get("deaths"),
+        Some(&nbt::Tag::List(8, vec![nbt_str("fall"), nbt_str("drown")]))
+    );
+
+    let biome = &decoded["minecraft:worldgen/biome"];
+    assert_eq!(biome.len(), 1);
+    assert_eq!(biome[0].0, "example:deep");
+    let nbt::Tag::Compound(fields) = &biome[0].1 else {
+        panic!("the biome must be a compound");
+    };
+    assert_eq!(
+        fields.keys().map(|k| k.to_utf8().unwrap()).collect::<Vec<_>>(),
+        ["downfall", "effects", "has_precipitation", "temperature"]
+    );
+    assert_eq!(
+        fields.get(&nbt::NbtString::text("has_precipitation")),
+        Some(&nbt::Tag::Byte(1))
+    );
+    assert_eq!(
+        fields.get(&nbt::NbtString::text("temperature")),
+        Some(&nbt::Tag::Double(0.2_f64.to_bits()))
+    );
+    let nbt::Tag::Compound(effects) = fields.get(&nbt::NbtString::text("effects")).unwrap() else {
+        panic!("biome effects must be a compound");
+    };
+    for (key, value) in [
+        ("fog_color", 11),
+        ("water_color", 12),
+        ("water_fog_color", 13),
+        ("sky_color", 14),
+    ] {
+        assert_eq!(
+            effects.get(&nbt::NbtString::text(key)),
+            Some(&nbt::Tag::Int(value))
+        );
+    }
+
+    let enchantment = &decoded["minecraft:enchantment"];
+    assert_eq!(enchantment.len(), 1);
+    assert_eq!(enchantment[0].0, "example:deep");
+    assert_eq!(enchantment[0].1.get("max_level"), Some(&nbt::Tag::Int(5)));
+    assert_eq!(enchantment[0].1.get("weight"), Some(&nbt::Tag::Int(2)));
+    assert_eq!(
+        enchantment[0].1.get("exclusive_set"),
+        Some(&nbt::Tag::List(8, vec![nbt_str("minecraft:protection")]))
+    );
+
+    let trim = &decoded["minecraft:trim_material"];
+    assert_eq!(trim.len(), 1);
+    assert_eq!(trim[0].0, "example:deep");
+    assert_eq!(trim[0].1.get("ingredient"), Some(&nbt_str("minecraft:diamond")));
+    let nbt::Tag::Compound(palette) = trim[0].1.get("palette").unwrap() else {
+        panic!("trim palette must be a compound");
+    };
+    assert_eq!(
+        palette.get(&nbt::NbtString::text("material_0")),
+        Some(&nbt::Tag::Int(123456))
+    );
+
+    let jukebox = &decoded["minecraft:jukebox_song"];
+    assert_eq!(jukebox.len(), 1);
+    assert_eq!(jukebox[0].0, "example:deep");
+    assert_eq!(jukebox[0].1.get("sound_event"), Some(&nbt_str("example:deep")));
+    assert_eq!(jukebox[0].1.get("length"), Some(&nbt::Tag::Int(128)));
+    assert_eq!(
+        jukebox[0].1.get("duration_in_ticks"),
+        Some(&nbt::Tag::Int(2560))
+    );
+}
+
+#[test]
+fn datapack_mod_e2e_invalid_packs_are_dropped_without_poisoning_valid_ones() {
+    let vanilla: [(&str, &[u8]); 2] = [
+        (
+            "pack.mcmeta",
+            br#"{"pack":{"pack_format":48,"description":"vanilla"}}"#,
+        ),
+        (
+            "data/minecraft/damage_type/generic.json",
+            br#"{"message_id":"generic"}"#,
+        ),
+    ];
+    let bad_format: [(&str, &[u8]); 2] = [
+        ("pack.mcmeta", br#"{"pack":{"pack_format":61}}"#),
+        (
+            "data/bad/damage_type/wrong.json",
+            br#"{"message_id":"wrong"}"#,
+        ),
+    ];
+    let unsupported: [(&str, &[u8]); 2] = [
+        (
+            "pack.mcmeta",
+            br#"{"pack":{"pack_format":48,"supported_formats":[50,60]}}"#,
+        ),
+        (
+            "data/bad/damage_type/unsupported.json",
+            br#"{"message_id":"unsupported"}"#,
+        ),
+    ];
+    let malformed_meta: [(&str, &[u8]); 2] = [
+        ("pack.mcmeta", b"{\"pack\": {\"pack_format\": 48,}"),
+        (
+            "data/bad/damage_type/meta.json",
+            br#"{"message_id":"meta"}"#,
+        ),
+    ];
+    let malformed_data: [(&str, &[u8]); 2] = [
+        ("pack.mcmeta", br#"{"pack":{"pack_format":48}}"#),
+        ("data/bad/damage_type/broken.json", b"{not json"),
+    ];
+    let bad_path: [(&str, &[u8]); 2] = [
+        ("pack.mcmeta", br#"{"pack":{"pack_format":48}}"#),
+        (
+            "data/Bad/damage_type/upper.json",
+            br#"{"message_id":"upper"}"#,
+        ),
+    ];
+    let no_meta: [(&str, &[u8]); 1] = [(
+        "data/bad/damage_type/nometa.json",
+        br#"{"message_id":"nometa"}"#,
+    )];
+    let modpack: [(&str, &[u8]); 2] = [
+        (
+            "pack.mcmeta",
+            br#"{"pack":{"pack_format":57,"supported_formats":[48,57]}}"#,
+        ),
+        (
+            "data/mod/damage_type/modded.json",
+            br#"{"message_id":"modded"}"#,
+        ),
+    ];
+
+    let (payloads, rejected) = load_registry_data([
+        CandidatePack {
+            name: "vanilla",
+            files: &vanilla,
+        },
+        CandidatePack {
+            name: "bad_format",
+            files: &bad_format,
+        },
+        CandidatePack {
+            name: "unsupported",
+            files: &unsupported,
+        },
+        CandidatePack {
+            name: "malformed_meta",
+            files: &malformed_meta,
+        },
+        CandidatePack {
+            name: "malformed_data",
+            files: &malformed_data,
+        },
+        CandidatePack {
+            name: "bad_path",
+            files: &bad_path,
+        },
+        CandidatePack {
+            name: "no_meta",
+            files: &no_meta,
+        },
+        CandidatePack {
+            name: "mod",
+            files: &modpack,
+        },
+    ])
+    .unwrap();
+
+    assert_eq!(
+        rejected,
+        vec![
+            LoadRejection::Format("bad_format", PackFormatError::WrongPackFormat(61)),
+            LoadRejection::Format(
+                "unsupported",
+                PackFormatError::FormatNotSupported { min: 50, max: 60 }
+            ),
+            LoadRejection::Format("malformed_meta", PackFormatError::MalformedJson),
+            LoadRejection::InvalidData("malformed_data"),
+            LoadRejection::InvalidData("bad_path"),
+            LoadRejection::NoMeta("no_meta"),
+        ]
+    );
+
+    // The surviving payloads are exactly the overlay of the two good packs: not one entry
+    // from a rejected pack leaks into the registry packet.
+    let expected =
+        build_registry_data_payloads([vanilla.iter().copied(), modpack.iter().copied()]).unwrap();
+    assert_eq!(payloads, expected);
+    let (registry, entries) = decode_registry_payload(&payloads[0]);
+    assert_eq!(registry, "minecraft:damage_type");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["minecraft:generic", "mod:modded"]
+    );
+    assert_eq!(entries[0].1.get("message_id"), Some(&nbt_str("generic")));
+    assert_eq!(entries[1].1.get("message_id"), Some(&nbt_str("modded")));
+}
+
+#[test]
+fn datapack_mod_e2e_duplicate_paths_are_pack_local_and_later_packs_win() {
+    let vanilla: [(&str, &[u8]); 2] = [
+        ("pack.mcmeta", br#"{"pack":{"pack_format":48}}"#),
+        (
+            "data/minecraft/damage_type/generic.json",
+            br#"{"message_id":"generic"}"#,
+        ),
+    ];
+    // Two files with the same path in one pack are ambiguous: the whole pack is dropped.
+    let duplicate: [(&str, &[u8]); 3] = [
+        ("pack.mcmeta", br#"{"pack":{"pack_format":48}}"#),
+        (
+            "data/example/damage_type/dup.json",
+            br#"{"message_id":"first"}"#,
+        ),
+        (
+            "data/example/damage_type/dup.json",
+            br#"{"message_id":"second"}"#,
+        ),
+    ];
+    let modpack: [(&str, &[u8]); 3] = [
+        (
+            "pack.mcmeta",
+            br#"{"pack":{"pack_format":57,"supported_formats":[48,57]}}"#,
+        ),
+        (
+            "data/minecraft/damage_type/generic.json",
+            br#"{"message_id":"generic_mod"}"#,
+        ),
+        (
+            "data/mod/damage_type/mod_only.json",
+            br#"{"message_id":"mod_only"}"#,
+        ),
+    ];
+
+    let err = build_registry_data_payloads([duplicate.iter().copied()]).unwrap_err();
+    assert!(err.contains("duplicate registry file"), "{err}");
+
+    let (payloads, rejected) = load_registry_data([
+        CandidatePack {
+            name: "vanilla",
+            files: &vanilla,
+        },
+        CandidatePack {
+            name: "duplicate",
+            files: &duplicate,
+        },
+        CandidatePack {
+            name: "mod",
+            files: &modpack,
+        },
+    ])
+    .unwrap();
+    assert_eq!(rejected, vec![LoadRejection::InvalidData("duplicate")]);
+
+    let (_, entries) = decode_registry_payload(&payloads[0]);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["minecraft:generic", "mod:mod_only"]
+    );
+    // The same path in two different packs is a legal override, and the later pack wins.
+    assert_eq!(entries[0].1.get("message_id"), Some(&nbt_str("generic_mod")));
+    assert_eq!(entries[1].1.get("message_id"), Some(&nbt_str("mod_only")));
+}
