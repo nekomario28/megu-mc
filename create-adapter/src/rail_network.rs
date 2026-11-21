@@ -1014,8 +1014,8 @@ impl RailNetwork {
         let gauge = self
             .trains
             .get(&train)
-            .map(|t| t.gauge().clone())
-            .unwrap_or_else(|| e.gauge.clone());
+            .map(|t| t.gauge())
+            .unwrap_or(&e.gauge);
         let next = self
             .trains
             .get(&train)
@@ -1028,7 +1028,7 @@ impl RailNetwork {
                     None
                 }
             })
-            .or_else(|| self.graph.next_edge_for(e.to, &gauge))?;
+            .or_else(|| self.graph.next_edge_for(e.to, gauge))?;
         self.block_of(next)
     }
 
@@ -1117,34 +1117,30 @@ pub fn tick_rail_network(
             continue;
         }
         release_reservations(net, id);
-        let state = net.trains[&id].state.clone();
-        match state {
-            TrainRunState::Terminus => {}
-            TrainRunState::WaitingAtStation {
+        if matches!(&net.trains[&id].state, TrainRunState::Running) {
+            step_running(net, id, &mut events);
+        } else {
+            let t = net.trains.get_mut(&id).expect("checked");
+            if let TrainRunState::WaitingAtStation {
                 station,
                 ticks_left,
-            } => {
-                if ticks_left == 0 {
-                    let t = net.trains.get_mut(&id).expect("checked");
+            } = &mut t.state
+            {
+                if *ticks_left > 0 {
+                    *ticks_left -= 1;
+                } else {
+                    // Move the station name into the departure event only on
+                    // departure, avoiding a String clone on every waiting tick.
+                    let station = std::mem::take(station);
                     t.schedule_idx += 1;
                     if t.schedule.looping && t.schedule_idx >= t.schedule.instructions.len() {
                         t.schedule_idx = 0;
                     }
                     t.target = None;
                     t.state = TrainRunState::Running;
-                    events.push(TransitEvent::DepartedStation {
-                        train: id,
-                        station,
-                    });
-                } else {
-                    let t = net.trains.get_mut(&id).expect("checked");
-                    t.state = TrainRunState::WaitingAtStation {
-                        station,
-                        ticks_left: ticks_left - 1,
-                    };
+                    events.push(TransitEvent::DepartedStation { train: id, station });
                 }
             }
-            TrainRunState::Running => step_running(net, id, &mut events),
         }
         refresh_occupancy(net, id);
         update_render_mode(net, id, loaded_chunks, &mut events);
@@ -1301,14 +1297,13 @@ fn step_running(net: &mut RailNetwork, id: TrainId, events: &mut Vec<TransitEven
     if !ensure_target(net, id, events) {
         return;
     }
-    let (pos_edge, pos_s, speed, gauge, target, next_via_route) = {
+    let (pos_edge, pos_s, speed, target, next_via_route) = {
         let t = net.trains.get(&id).expect("checked");
         (
             t.pos_edge,
             t.pos_s,
             t.speed,
-            t.gauge().clone(),
-            t.target.clone(),
+            t.target.as_ref().map(|target| (target.edge, target.s)),
             t.route.front().copied(),
         )
     };
@@ -1320,15 +1315,15 @@ fn step_running(net: &mut RailNetwork, id: TrainId, events: &mut Vec<TransitEven
     let mut stop_kind = StopKind::None;
     let mut arrived_station: Option<String> = None;
 
-    if let Some(tg) = &target {
-        let d = if next_via_route.is_none() && tg.edge == pos_edge {
-            tg.s - pos_s
+    if let Some((target_edge, target_s)) = target {
+        let d = if next_via_route.is_none() && target_edge == pos_edge {
+            target_s - pos_s
         } else {
             let mut d = remaining;
             let n = net.trains[&id].route.len();
             for (i, e) in net.trains[&id].route.iter().enumerate() {
                 d += if i + 1 == n {
-                    tg.s
+                    target_s
                 } else {
                     net.graph.edges[e].length()
                 };
@@ -1342,7 +1337,7 @@ fn step_running(net: &mut RailNetwork, id: TrainId, events: &mut Vec<TransitEven
     // Signal-guarded boundary ahead (or end of line when nothing follows).
     let next_edge = next_via_route.or_else(|| {
         if target.is_none() {
-            net.graph.next_edge_for(head_node, &gauge)
+            net.graph.next_edge_for(head_node, net.trains[&id].gauge())
         } else {
             None
         }
@@ -1442,7 +1437,7 @@ fn advance(net: &mut RailNetwork, id: TrainId, mut d: f64) {
             let t = net.trains.get(&id).expect("checked");
             t.route.front().copied().or_else(|| {
                 let node = net.graph.edges[&pos_edge].to;
-                net.graph.next_edge_for(node, &t.gauge().clone())
+                net.graph.next_edge_for(node, t.gauge())
             })
         };
         match next {

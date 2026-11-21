@@ -13,14 +13,19 @@
 //! never a silently repaired value.
 
 use crate::atomic::write_atomic;
+use std::borrow::Cow;
 use std::fmt;
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 
 /// The file's Vanilla name; [`ServerProperties::load_from`] and
 /// [`ServerProperties::save_to`] take any path, but this is what a dedicated
 /// server reads in its working directory.
 pub const PROPERTIES_FILE: &str = "server.properties";
+
+/// Maximum on-disk size accepted by the startup properties loader.
+/// Unbounded user-supplied configuration must not exhaust server memory.
+pub const MAX_PROPERTIES_BYTES: usize = 1024 * 1024;
 
 /// A `\uXXXX` escape without four hex digits (Java's `Malformed \uxxxx
 /// encoding.`).
@@ -76,24 +81,24 @@ impl PropertiesFile {
             // one and pulls in the next line (whose leading whitespace Java
             // skips). `raw` keeps the untouched spelling when there is one
             // physical line; a joined entry emits its logical form.
-            let mut logical = trimmed.to_owned();
+            let mut logical = Cow::Borrowed(trimmed);
             let mut joined = false;
             while trailing_backslash_odd(&logical) {
-                logical.pop();
+                logical.to_mut().pop();
                 joined = true;
                 if i < physical.len() {
-                    logical.push_str(trim_leading_ws(physical[i]));
+                    logical.to_mut().push_str(trim_leading_ws(physical[i]));
                     i += 1;
                 } else {
                     break;
                 }
             }
+            let (key, value) = split_entry(&logical)?;
             let raw = if joined {
-                logical.clone()
+                logical.into_owned()
             } else {
                 line.to_owned()
             };
-            let (key, value) = split_entry(&logical)?;
             file.lines.push(Line::Entry { raw, key, value });
         }
         Ok(file)
@@ -110,12 +115,24 @@ impl PropertiesFile {
 
     /// Load `path`; a missing file is an empty document, not an error.
     pub fn load_from(path: &Path) -> io::Result<Self> {
-        match std::fs::read(path) {
-            Ok(bytes) => Self::parse_bytes(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e),
+        };
+        // The extra byte distinguishes a full valid file from an oversized
+        // one without reading an attacker-controlled amount into memory.
+        let mut bytes = Vec::new();
+        file.take((MAX_PROPERTIES_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_PROPERTIES_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "server.properties exceeds maximum size",
+            ));
         }
+        Self::parse_bytes(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
     /// Serialize the document. Untouched lines are emitted verbatim; edited
@@ -243,26 +260,24 @@ fn trailing_backslash_odd(s: &str) -> bool {
 /// follows, and the remainder is the value (trailing whitespace kept, as Java
 /// keeps it).
 fn split_entry(line: &str) -> Result<(String, String), MalformedEscape> {
-    let chars: Vec<char> = line.chars().collect();
-    let mut key_len = 0;
-    let mut value_start = chars.len();
+    let mut key_end = line.len();
+    let mut value_start = line.len();
     let mut has_sep = false;
     let mut backslash = false;
-    while key_len < chars.len() {
-        let c = chars[key_len];
+    for (index, c) in line.char_indices() {
         if (c == '=' || c == ':') && !backslash {
-            value_start = key_len + 1;
+            key_end = index;
+            value_start = index + c.len_utf8();
             has_sep = true;
             break;
         } else if (c == ' ' || c == '\t' || c == '\u{0c}') && !backslash {
-            value_start = key_len + 1;
+            key_end = index;
+            value_start = index + c.len_utf8();
             break;
         }
         backslash = c == '\\' && !backslash;
-        key_len += 1;
     }
-    while value_start < chars.len() {
-        let c = chars[value_start];
+    while let Some(c) = line[value_start..].chars().next() {
         if c != ' ' && c != '\t' && c != '\u{0c}' {
             if !has_sep && (c == '=' || c == ':') {
                 has_sep = true;
@@ -270,11 +285,9 @@ fn split_entry(line: &str) -> Result<(String, String), MalformedEscape> {
                 break;
             }
         }
-        value_start += 1;
+        value_start += c.len_utf8();
     }
-    let key: String = chars[..key_len].iter().collect();
-    let value: String = chars[value_start..].iter().collect();
-    Ok((unescape(&key)?, unescape(&value)?))
+    Ok((unescape(&line[..key_end])?, unescape(&line[value_start..])?))
 }
 
 /// `loadConvert`: `\t` `\r` `\n` `\f` and `\uXXXX` produce the named
@@ -282,6 +295,9 @@ fn split_entry(line: &str) -> Result<(String, String), MalformedEscape> {
 /// stands for itself. `\u` escapes decode as UTF-16 units so a surrogate pair
 /// combines; a lone one reads as U+FFFD.
 fn unescape(input: &str) -> Result<String, MalformedEscape> {
+    if !input.contains('\\') {
+        return Ok(input.to_owned());
+    }
     fn flush(units: &mut Vec<u16>, out: &mut String) {
         if !units.is_empty() {
             out.extend(char::decode_utf16(units.drain(..)).map(|r| r.unwrap_or('\u{fffd}')));
@@ -915,6 +931,40 @@ mod tests {
         // Latin-1 bytes still read (ISO-8859-1 fallback).
         let doc = PropertiesFile::parse_bytes(b"motd=caf\xe9").unwrap();
         assert_eq!(doc.get("motd"), Some("café"));
+    }
+
+    #[test]
+    fn multibyte_keys_whitespace_and_escaped_separators_roundtrip() {
+        let original = "  é\\=k:\tvalue\nkey\\ name  =   café\nemoji=😀\n";
+        let doc = PropertiesFile::parse(original).unwrap();
+        assert_eq!(doc.get("é=k"), Some("value"));
+        assert_eq!(doc.get("key name"), Some("café"));
+        assert_eq!(doc.get("emoji"), Some("😀"));
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn load_from_enforces_size_boundary_and_rejects_malformed_escapes() {
+        let path = std::env::temp_dir().join(format!(
+            "mc-spine-properties-boundary-{}.properties",
+            std::process::id()
+        ));
+        let valid = format!("k={}", "a".repeat(MAX_PROPERTIES_BYTES - 2));
+        std::fs::write(&path, &valid).unwrap();
+        assert_eq!(PropertiesFile::load_from(&path).unwrap().get("k"), Some(&valid[2..]));
+
+        std::fs::write(&path, format!("{valid}x")).unwrap();
+        assert_eq!(
+            PropertiesFile::load_from(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        std::fs::write(&path, b"ok=1\nbroken=\\u12\n").unwrap();
+        assert_eq!(
+            PropertiesFile::load_from(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -173,7 +173,7 @@ pub fn solve_collisions_spatial(
     let len = pool.len();
     assert_eq!(cramming_rolls.len(), len);
     let bounds: Vec<_> = (0..len).map(|index| entity_bounds(pool, index)).collect();
-    let mut cells: HashMap<Cell, Vec<usize>> = HashMap::new();
+    let mut cells: HashMap<Cell, Vec<usize>> = HashMap::with_capacity(len);
     let mut large = Vec::new();
     for (index, &aabb) in bounds.iter().enumerate() {
         if let Some(range) = cell_range(aabb) {
@@ -188,7 +188,8 @@ pub fn solve_collisions_spatial(
         cramming_damage: vec![false; len],
         candidate_counts: vec![0; len],
     };
-    let mut candidates = Vec::new();
+    // Reuse the candidate buffer across every entity within this solve.
+    let mut candidates = Vec::with_capacity(len);
     for i in 0..len {
         if !pool.kinds[i].is_living() || pool.flags[i] & FLAG_SPECTATOR != 0 {
             continue;
@@ -288,9 +289,9 @@ fn same_velocity(a: [f64; 3], b: [f64; 3]) -> bool {
 /// Existing positions and velocities remain untouched, so water/chute movement
 /// continues from the surviving physical stack. Divergent flows never coalesce.
 pub fn merge_item_stacks(items: &mut [DroppedItem]) -> MergeReport {
-    let mut cells: HashMap<Cell, Vec<usize>> = HashMap::new();
+    let mut cells: HashMap<Cell, Vec<usize>> = HashMap::with_capacity(items.len());
     let mut report = MergeReport::default();
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::with_capacity(items.len());
     for i in 0..items.len() {
         if items[i].count == 0 {
             continue;
@@ -335,9 +336,9 @@ pub fn merge_item_stacks(items: &mut [DroppedItem]) -> MergeReport {
 /// XP values are accumulated with checked arithmetic. A zero-value orb is a
 /// tombstone; incompatible velocities remain independent flow participants.
 pub fn merge_xp_orbs(orbs: &mut [XpOrb]) -> MergeReport {
-    let mut cells: HashMap<Cell, Vec<usize>> = HashMap::new();
+    let mut cells: HashMap<Cell, Vec<usize>> = HashMap::with_capacity(orbs.len());
     let mut report = MergeReport::default();
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::with_capacity(orbs.len());
     for i in 0..orbs.len() {
         if orbs[i].value == 0 {
             continue;

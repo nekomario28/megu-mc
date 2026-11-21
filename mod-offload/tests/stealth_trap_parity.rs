@@ -21,7 +21,7 @@ fn reference_collision(pool: &SoaEntityPool, max_cramming: usize, rolls: &[u8]) 
         cramming_damage: vec![false; n],
         candidate_counts: vec![0; n],
     };
-    for i in 0..n {
+    for (i, &roll) in rolls.iter().enumerate() {
         if matches!(
             pool.kinds[i],
             EntityKind::Other | EntityKind::PointOfInterest
@@ -85,7 +85,7 @@ fn reference_collision(pool: &SoaEntityPool, max_cramming: usize, rolls: &[u8]) 
         expected.cramming_damage[i] = max_cramming > 0
             && expected.candidate_counts[i] >= max_cramming
             && nonpassengers >= max_cramming
-            && rolls[i].is_multiple_of(4);
+            && roll.is_multiple_of(4);
     }
     expected
 }

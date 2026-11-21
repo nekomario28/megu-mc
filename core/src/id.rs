@@ -110,10 +110,12 @@ impl ResourceLocation {
             input: text.to_string(),
             reason,
         };
-        let (namespace, path) = match text.split(':').collect::<Vec<_>>().as_slice() {
-            [path] => (DEFAULT_NAMESPACE, *path),
-            [namespace, path] => (*namespace, *path),
-            _ => return Err(reject(InvalidReason::TooManySeparators)),
+        let (namespace, path) = match text.split_once(':') {
+            Some((_, path)) if path.contains(':') => {
+                return Err(reject(InvalidReason::TooManySeparators));
+            }
+            Some((namespace, path)) => (namespace, path),
+            None => (DEFAULT_NAMESPACE, text),
         };
         if namespace.is_empty() {
             return Err(reject(InvalidReason::EmptyNamespace));
@@ -130,8 +132,17 @@ impl ResourceLocation {
         if has_parent_traversal(path) {
             return Err(reject(InvalidReason::ParentTraversal));
         }
+        let full = if text.contains(':') {
+            text.to_owned()
+        } else {
+            let mut full = String::with_capacity(namespace.len() + 1 + path.len());
+            full.push_str(namespace);
+            full.push(':');
+            full.push_str(path);
+            full
+        };
         Ok(Self {
-            full: format!("{namespace}:{path}"),
+            full,
             sep: namespace.len(),
         })
     }

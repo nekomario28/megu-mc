@@ -739,11 +739,8 @@ fn emit(doc: Json) {
 
 /// Which of [`ALL_FILES`] existed before [`ServerDirectory::load_or_init`]
 /// ran (it may create `eula.txt` itself).
-fn preexisting(dir: &Path) -> Vec<bool> {
-    ALL_FILES
-        .iter()
-        .map(|name| dir.join(name).exists())
-        .collect()
+fn preexisting(dir: &Path) -> [bool; ALL_FILES.len()] {
+    ALL_FILES.map(|name| dir.join(name).exists())
 }
 
 /// A missing `server.properties` materializes as the Vanilla defaults — the

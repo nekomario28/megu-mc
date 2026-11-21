@@ -982,7 +982,11 @@ fn put_slot(out: &mut Vec<u8>, slot: &Option<CompanionRecord>) {
 /// storage always produces byte-identical output because slots encode in a
 /// fixed order and no hash-map iteration reaches the wire.
 pub fn encode_storage(storage: &PlayerCompanionStorage) -> Vec<u8> {
-    let mut out = Vec::new();
+    // Reserve the fixed envelope and one presence marker per slot. Records
+    // grow the buffer only when their variable-length contents require it.
+    let mut out = Vec::with_capacity(
+        16 + PARTY_SLOTS + storage.boxes.len() * BOX_SLOTS,
+    );
     out.extend_from_slice(PRTY_MAGIC);
     put_u32(&mut out, PRTY_SCHEMA_VERSION);
     put_u32(&mut out, storage.boxes.len() as u32);

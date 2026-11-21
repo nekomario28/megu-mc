@@ -13,6 +13,7 @@ use mc_spine_server_files::{
     BANNED_IPS_FILE, BANNED_PLAYERS_FILE, CLAIMS_FILE, EULA_FILE, OPS_FILE, PARTIES_FILE,
     PROPERTIES_FILE, USERCACHE_FILE, WHITELIST_FILE,
 };
+use mc_spine_server_files::properties::MAX_PROPERTIES_BYTES;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -351,6 +352,24 @@ fn doctor_exit_1_on_corrupt_files() {
     scratch.write("srv/usercache.json", b"[{\"uuid\":\"u\"}]");
     let out = run(&["doctor", "--dir", dir.to_str().unwrap()]);
     assert_eq!(code(&out), 1, "{}", stdout(&out));
+}
+
+#[test]
+fn doctor_and_init_refuse_oversized_properties_without_overwriting() {
+    let scratch = TestDir::new("properties-too-large");
+    let dir = ready_dir(&scratch);
+    let bytes = vec![b'a'; MAX_PROPERTIES_BYTES + 1];
+    let path = scratch.write("srv/server.properties", &bytes);
+
+    let out = run(&["doctor", "--dir", dir.to_str().unwrap(), "--json"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let doc = json_stdout(&out);
+    let props = get(get(&doc, "files"), PROPERTIES_FILE);
+    assert_eq!(str_field(props, "status"), "error");
+
+    let out = run(&["init", "--dir", dir.to_str().unwrap(), "--port", "25570"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
 }
 
 #[test]

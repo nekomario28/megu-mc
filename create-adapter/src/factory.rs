@@ -732,6 +732,34 @@ mod tests {
     use mod_offload::recipe_processor::{Resource, ResourceKind};
 
     #[test]
+    fn idle_factory_ticks_do_not_export_and_active_ticks_are_bounded() {
+        let mut factory = CreateFactory::new(core_create_registry(DEFAULT_BASE_STATE_ID));
+        for tick in 1..=32 {
+            assert!(factory.step_tick(tick, 4, None).unwrap().is_empty());
+        }
+
+        let pos = DimBlockPos::new(0, 0, 64, 0);
+        factory.add_belt_segment(pos, 1, 4, 1).unwrap();
+        factory.add_belt_segment(pos, 2, 4, 1).unwrap();
+        factory.link_belt(pos, 1, Some(2)).unwrap();
+        factory.insert_belt_item(pos, 1, 42).unwrap();
+
+        let mut produced = 0;
+        for tick in 33..=40 {
+            for output in factory.step_tick(tick, 4, None).unwrap() {
+                assert_eq!(output.region, pos.region_key());
+                assert!(output.report.processed <= 4);
+                assert_eq!(output.s5_frame.len(), output.batch.bytes);
+                produced += output.batch.records;
+            }
+        }
+        assert!(produced > 0);
+        for tick in 41..=48 {
+            assert!(factory.step_tick(tick, 4, None).unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn cogwheel_gearing_clutch_gearshift_overstress_and_recovery() {
         let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
         let water_wheel_z = reg

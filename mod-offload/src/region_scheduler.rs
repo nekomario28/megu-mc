@@ -133,12 +133,21 @@ impl RegionScheduler {
         budget: RegionBudget,
         threads: usize,
     ) -> Vec<(RegionKey, Result<RegionReport, TransportError>)> {
+        let workers = threads.max(1).min(self.regions.len().max(1));
+        // Most idle and small servers have a single active region. Avoid the
+        // intermediate region list and scoped-thread setup on that tick path.
+        if workers == 1 {
+            return self
+                .regions
+                .iter_mut()
+                .map(|(&key, region)| (key, region.advance_to(tick, budget)))
+                .collect();
+        }
         let mut regions: Vec<(RegionKey, &mut Region)> = self
             .regions
             .iter_mut()
             .map(|(&key, region)| (key, region))
             .collect();
-        let workers = threads.max(1).min(regions.len().max(1));
         let slice_len = regions.len().div_ceil(workers);
         let run = |slice: &mut [(RegionKey, &mut Region)]| {
             slice
@@ -146,14 +155,11 @@ impl RegionScheduler {
                 .map(|(key, region)| (*key, region.advance_to(tick, budget)))
                 .collect::<Vec<_>>()
         };
-        if workers <= 1 {
-            return run(&mut regions);
-        }
         thread::scope(|scope| {
-            let handles: Vec<_> = regions
-                .chunks_mut(slice_len)
-                .map(|slice| scope.spawn(move || run(slice)))
-                .collect();
+            let mut handles = Vec::with_capacity(workers);
+            for slice in regions.chunks_mut(slice_len) {
+                handles.push(scope.spawn(move || run(slice)));
+            }
             handles
                 .into_iter()
                 .flat_map(|handle| handle.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
@@ -954,5 +960,32 @@ mod tests {
         // Empty scheduler: no work, no panic, whatever the thread count.
         let mut empty = RegionScheduler::default();
         assert!(empty.advance_all(10, BUDGET, 4).is_empty());
+    }
+
+    #[test]
+    fn idle_single_region_stays_empty_and_active_work_obeys_budget() {
+        let key = RegionKey::for_block(0, 0, 0);
+        let mut scheduler = RegionScheduler::default();
+        scheduler.region_mut(key);
+
+        for tick in 1..=32 {
+            let reports = scheduler.advance_all(tick, BUDGET, 1);
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].0, key);
+            assert_eq!(reports[0].1.unwrap().processed, 0);
+            assert_eq!(reports[0].1.unwrap().backlog, None);
+        }
+
+        seed_region(scheduler.region_mut(key), 42, &[7, 8, 9]);
+        let first = scheduler.advance_all(40, BUDGET, 1);
+        assert_eq!(first[0].1.unwrap().processed, 1);
+        assert!(first[0].1.unwrap().backlog.is_some());
+
+        let second = scheduler.advance_all(40, BUDGET, 1);
+        assert_eq!(second[0].1.unwrap().processed, 1);
+        let third = scheduler.advance_all(40, BUDGET, 1);
+        assert_eq!(third[0].1.unwrap().processed, 1);
+        assert_eq!(third[0].1.unwrap().backlog, None);
+        assert_eq!(scheduler.advance_all(40, BUDGET, 1)[0].1.unwrap().processed, 0);
     }
 }
