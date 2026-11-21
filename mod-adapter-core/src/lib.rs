@@ -53,6 +53,14 @@
 //!   plain language which files are auto-skipped as
 //!   [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`], which are client-only,
 //!   which run natively, and which still need a bytecode inspection.
+//! - [`creature_primitives`]: generic zero-mod-name creature primitives —
+//!   a declarative [`creature_primitives::CreatureSpec`]/[`creature_primitives::CreatureState`]
+//!   tame/breed/command-mode state machine (`Follow`/`Sit`/`Wander`, healing,
+//!   love mode, baby growth, owner-follow teleports), five-type
+//!   [`creature_primitives::MovementProfile`] locomotion (`Land`,
+//!   `Amphibious`, `Aquatic`, `GlidingFlight`, `WallClimb`), and a
+//!   dirty-tracked [`creature_primitives::DynamicEntityMetadata`] table with
+//!   the exact Protocol 767 `0x58` `SetEntityData` wire codec.
 //! - [`world_extensions`]: generic world & mod extension primitives —
 //!   declarative [`world_extensions::ProgressionBarrierEngine`] biome gates
 //!   (Twilight-Forest-style chained boss progression, RPG packs), multi-part
@@ -74,6 +82,7 @@
 
 pub mod blockstates;
 pub mod class_mixin_scanner;
+pub mod creature_primitives;
 pub mod culinary_adapter;
 pub mod data_loader;
 pub mod dimension_mod;
