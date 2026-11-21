@@ -1455,6 +1455,149 @@ fn compute_is_2d(dfs: &[DF]) -> Vec<bool> {
     is2
 }
 
+/// Exact post-order constant folding over the density-function id table.
+///
+/// [`DfCompiler::const_value`] already knows which nodes are position
+/// independent; this pass applies the same IEEE-754 operations once at load so
+/// the folded `DF::C` answers the interpreter, the flat-memo evaluator, the
+/// vein/aquifer fast paths and the compiled program identically while doing
+/// less work per block.
+///
+/// Only `Const op Const` shapes fold — no `x + 0.0` identities and no
+/// `0.0 * x` (both are wrong for `-0.0`/`NaN`/`Inf`), and no reassociation:
+/// `(a + b) + c` never becomes `a + (b + c)`. `Cache` and `BlendD` are pure
+/// pass-throughs and fold with their input. `Interp` folds only when the
+/// constant survives the corner-grid trilinear: `lerp3` of eight equal finite,
+/// non-negative-zero corners returns the corner itself, while a `-0.0` or
+/// non-finite constant would come back `+0.0`/NaN through the grid. `Zero` is
+/// never rewritten: the vein and aquifer fast paths recognise the variant
+/// itself (`matches!(.., DF::Zero)`), not just its value.
+///
+/// Returns the number of nodes rewritten to `DF::C`.
+fn fold_constant_dfs(dfs: &mut Vec<DF>) -> usize {
+    fn const_at(dfs: &[DF], id: usize, vals: &mut [Option<f64>], state: &mut [u8]) -> Option<f64> {
+        if state[id] == 2 {
+            return vals[id];
+        }
+        if state[id] == 1 {
+            // A cycle is not a valid density DAG; leave it unfolded.
+            return None;
+        }
+        state[id] = 1;
+        let v = match &dfs[id] {
+            DF::C(v) => Some(*v),
+            DF::Zero => Some(0.0),
+            DF::Add(a, b) => {
+                match (const_at(dfs, *a, vals, state), const_at(dfs, *b, vals, state)) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    _ => None,
+                }
+            }
+            DF::Sub(a, b) => {
+                match (const_at(dfs, *a, vals, state), const_at(dfs, *b, vals, state)) {
+                    (Some(a), Some(b)) => Some(a - b),
+                    _ => None,
+                }
+            }
+            DF::Mul(a, b) => {
+                match (const_at(dfs, *a, vals, state), const_at(dfs, *b, vals, state)) {
+                    (Some(a), Some(b)) => Some(a * b),
+                    _ => None,
+                }
+            }
+            DF::Min(a, b) => {
+                match (const_at(dfs, *a, vals, state), const_at(dfs, *b, vals, state)) {
+                    (Some(a), Some(b)) => Some(df_min(a, b)),
+                    _ => None,
+                }
+            }
+            DF::Max(a, b) => {
+                match (const_at(dfs, *a, vals, state), const_at(dfs, *b, vals, state)) {
+                    (Some(a), Some(b)) => Some(df_max(a, b)),
+                    _ => None,
+                }
+            }
+            DF::Div(a, b) => match const_at(dfs, *b, vals, state) {
+                Some(b) if b == 0.0 => Some(0.0),
+                Some(b) => const_at(dfs, *a, vals, state).map(|a| a / b),
+                None => None,
+            },
+            DF::Neg(a) => const_at(dfs, *a, vals, state).map(|v| -v),
+            DF::Abs(a) => const_at(dfs, *a, vals, state).map(|v| v.abs()),
+            DF::Sq(a) => const_at(dfs, *a, vals, state).map(|v| v * v),
+            DF::Cube(a) => const_at(dfs, *a, vals, state).map(|v| v * v * v),
+            DF::HNeg(a) => const_at(dfs, *a, vals, state)
+                .map(|v| if v > 0.0 { v } else { v * 0.5 }),
+            DF::QNeg(a) => const_at(dfs, *a, vals, state)
+                .map(|v| if v > 0.0 { v } else { v * 0.25 }),
+            DF::Squeeze(a) => const_at(dfs, *a, vals, state).map(|v| {
+                let v = v.clamp(-1.0, 1.0);
+                v / 2.0 - v * v * v / 24.0
+            }),
+            DF::Clamp { i, lo, hi } => {
+                // `f64::clamp` panics on `lo > hi` or a NaN bound; the
+                // interpreter would panic at evaluation time, so an out-of-order
+                // clamp is left unfolded to keep that behaviour identical.
+                if *lo <= *hi {
+                    const_at(dfs, *i, vals, state).map(|v| v.clamp(*lo, *hi))
+                } else {
+                    None
+                }
+            }
+            DF::Lerp { a, f, s } => {
+                match (
+                    const_at(dfs, *a, vals, state),
+                    const_at(dfs, *f, vals, state),
+                    const_at(dfs, *s, vals, state),
+                ) {
+                    (Some(a), Some(f), Some(s)) => Some(f + a * (s - f)),
+                    _ => None,
+                }
+            }
+            DF::Cache(a) | DF::BlendD(a) => const_at(dfs, *a, vals, state),
+            DF::Interp(a) => const_at(dfs, *a, vals, state)
+                .filter(|v| v.is_finite() && !(*v == 0.0 && v.is_sign_negative())),
+            _ => None,
+        };
+        vals[id] = v;
+        state[id] = 2;
+        v
+    }
+    let n = dfs.len();
+    let mut vals = vec![None; n];
+    let mut state = vec![0u8; n];
+    let mut folded = 0usize;
+    for id in 0..n {
+        if let Some(v) = const_at(dfs.as_slice(), id, &mut vals, &mut state) {
+            if !matches!(dfs[id], DF::C(_) | DF::Zero) {
+                dfs[id] = DF::C(v);
+                folded += 1;
+            }
+        }
+    }
+    folded
+}
+
+/// Bytes `clear()` + `shrink_to_fit()` hands back for a load-only
+/// `HashMap<String, usize>`: every key's heap buffer plus the bucket table
+/// (`capacity` slots of `(K, V)` plus one control byte each — hashbrown's
+/// usable capacity is a little under the bucket count, so this is a slight
+/// underestimate).
+fn str_map_trim_bytes(m: &mut HashMap<String, usize>) -> usize {
+    let heap: usize = m.keys().map(|k| k.capacity()).sum();
+    let table = m.capacity() * (std::mem::size_of::<(String, usize)>() + 1);
+    m.clear();
+    m.shrink_to_fit();
+    heap + table
+}
+
+/// Bytes a `Vec`'s spare capacity held before `shrink_to_fit`.
+fn vec_trim_bytes<T>(v: &mut Vec<T>) -> usize {
+    let before = v.capacity();
+    v.shrink_to_fit();
+    before.saturating_sub(v.capacity()) * std::mem::size_of::<T>()
+}
+
 // ---------- vanilla surface (material_rule) ----------
 
 #[derive(Clone, Copy)]
@@ -1977,6 +2120,13 @@ pub struct GenData {
     /// vertical levels, which removes ~49x redundant work on the y-independent spline /
     /// continentalness / erosion subtrees (Layer A2-a).
     is_2d: Vec<bool>,
+    /// Density-function nodes [`fold_constant_dfs`] rewrote to `DF::C` during
+    /// load (0 for the unfolded test loader). Diagnostics only.
+    df_folded: usize,
+    /// Capacity-based estimate of the bytes the post-load trim handed back to
+    /// the allocator (cleared load-only maps plus every finalized Vec's spare
+    /// capacity). Diagnostics only.
+    ram_trimmed: usize,
     biome_zoom: i64,
     btree: Option<BT>,
     leaf_ps: Vec<[[i32; 2]; 7]>,
@@ -3463,6 +3613,28 @@ impl Gen {
         res: fn(&str) -> Option<u32>,
         preset: NoisePreset,
     ) -> Option<Gen> {
+        Self::load_preset_inner(seed, res, preset, true)
+    }
+
+    /// The unfolded twin of [`Gen::load_preset_uncached`], for the
+    /// `perf_df_constant_fold_*` A/B: identical inputs with
+    /// [`fold_constant_dfs`] skipped, so the raw and folded id tables can be
+    /// built and timed side by side. Test-only; production always folds.
+    #[cfg(test)]
+    fn load_preset_uncached_unfolded(
+        seed: u64,
+        res: fn(&str) -> Option<u32>,
+        preset: NoisePreset,
+    ) -> Option<Gen> {
+        Self::load_preset_inner(seed, res, preset, false)
+    }
+
+    fn load_preset_inner(
+        seed: u64,
+        res: fn(&str) -> Option<u32>,
+        preset: NoisePreset,
+        fold_dfs: bool,
+    ) -> Option<Gen> {
         let files = Self::df_files();
         let mut g = Gen {
             data: std::sync::Arc::new(GenData {
@@ -3509,6 +3681,8 @@ impl Gen {
                 aq: None,
                 vein: None,
                 is_2d: Vec::new(),
+                df_folded: 0,
+                ram_trimmed: 0,
                 world_seed: seed,
                 interp_nodes: Vec::new(),
                 density_interp_nodes: Vec::new(),
@@ -3895,6 +4069,15 @@ impl Gen {
                 });
             }
         }
+        // Exact constant folding over the finished id table, before `is_2d`,
+        // the interp classification and the compiled program read it: only
+        // position-independent subtrees collapse (see `fold_constant_dfs`), so
+        // every evaluator sees the same values with less work per block.
+        g.df_folded = if fold_dfs {
+            fold_constant_dfs(&mut g.dfs)
+        } else {
+            0
+        };
         // Compile `final_density` once, now that the id table is final.
         g.is_2d = compute_is_2d(&g.dfs);
         let density_ids = g.interp_ids_from(&[g.final_density]);
@@ -3925,6 +4108,30 @@ impl Gen {
         if std::env::var_os("WG_COUNT").is_some() {
             g.df_hits_init();
         }
+        // Post-load RAM trim. `names`, `noise_names`, `rule_ids` and
+        // `cond_ids` exist for JSON loading; their only post-load readers are
+        // the debug/test resolvers (`resolve_ref`/`noise_id`), which re-parse
+        // and re-insert on demand. `bleaf` stays: `biome_leaf_of_name` is a
+        // runtime lookup. Every Vec below is final here, so its spare capacity
+        // is reclaimed once.
+        let mut trimmed = 0usize;
+        trimmed += str_map_trim_bytes(&mut g.names);
+        trimmed += str_map_trim_bytes(&mut g.noise_names);
+        trimmed += str_map_trim_bytes(&mut g.rule_ids);
+        trimmed += str_map_trim_bytes(&mut g.cond_ids);
+        trimmed += vec_trim_bytes(&mut g.dfs);
+        trimmed += vec_trim_bytes(&mut g.noises);
+        trimmed += vec_trim_bytes(&mut g.is_2d);
+        trimmed += vec_trim_bytes(&mut g.rules);
+        trimmed += vec_trim_bytes(&mut g.conds);
+        trimmed += vec_trim_bytes(&mut g.leaf_ps);
+        trimmed += vec_trim_bytes(&mut g.biome_names);
+        trimmed += vec_trim_bytes(&mut g.biome_ids);
+        trimmed += vec_trim_bytes(&mut g.biome_weather);
+        trimmed += vec_trim_bytes(&mut g.interp_nodes);
+        trimmed += vec_trim_bytes(&mut g.density_interp_nodes);
+        trimmed += vec_trim_bytes(&mut g.vein_interp_nodes);
+        g.ram_trimmed = trimmed;
         Some(g)
     }
 
@@ -17141,6 +17348,109 @@ mod wg_tests {
             "PERF deep_state: {:.4} ms/call",
             t.elapsed().as_secs_f64() * 1000.0 / m as f64
         );
+    }
+
+    /// Lane PERF-DF: the load-time [`fold_constant_dfs`] pass must (a) fire on
+    /// the pinned pack, (b) leave every evaluated density bit-identical, and
+    /// (c) not regress chunk terrain generation. The unfolded twin loader is
+    /// the "before" side of the A/B — same inputs, fold skipped — so no env
+    /// switch or second fixture is needed. The post-load RAM trim is verified
+    /// by the build-only maps being empty on both generators.
+    #[test]
+    fn perf_df_constant_fold_counts_and_benchmarks_chunk_terrain() {
+        crate::test_support::require_vanilla_data();
+        let mut folded = Gen::load_preset_uncached(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("folded generator");
+        let mut raw =
+            Gen::load_preset_uncached_unfolded(0, crate::name_to_state, NoisePreset::Overworld)
+                .expect("unfolded generator");
+        assert!(
+            folded.df_folded > 0,
+            "the pinned pack exercises no constant fold"
+        );
+        assert_eq!(raw.df_folded, 0, "the unfolded loader must skip the fold");
+        assert_eq!(
+            folded.dfs.len(),
+            raw.dfs.len(),
+            "folding rewrites in place; the id table cannot grow or shrink"
+        );
+        for g in [&folded, &raw] {
+            assert!(g.names.is_empty() && g.noise_names.is_empty());
+            assert!(g.rule_ids.is_empty() && g.cond_ids.is_empty());
+            assert!(!g.bleaf.is_empty(), "biome_leaf_of_name is a runtime lookup");
+        }
+        assert!(
+            folded.ram_trimmed > 0,
+            "the post-load trim must reclaim measurable slack"
+        );
+        eprintln!(
+            "PERF_DF_RAM_TRIM reclaimed_bytes folded={} unfolded={}",
+            folded.ram_trimmed, raw.ram_trimmed
+        );
+        let folded_ids: Vec<usize> = (0..raw.dfs.len())
+            .filter(|&i| {
+                matches!(folded.dfs[i], DF::C(_)) && !matches!(raw.dfs[i], DF::C(_))
+            })
+            .collect();
+        assert_eq!(folded_ids.len(), folded.df_folded);
+        eprintln!(
+            "PERF_DF_CONSTANT_FOLD nodes: {:?}",
+            folded_ids
+                .iter()
+                .map(|&i| (i, df_kind(&raw.dfs[i])))
+                .collect::<Vec<_>>()
+        );
+
+        // Bit identity across the fold boundary: the interpreted evaluator and
+        // the trilerped chunk path must agree bit for bit.
+        for (x, y, z) in [(0, 0, 0), (3, -20, -7), (-129, 64, 255), (1000, 200, -333)] {
+            let a = folded.eval(folded.final_density, x, y, z, &mut HashMap::new());
+            let b = raw.eval(raw.final_density, x, y, z, &mut HashMap::new());
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "interpreted density differs at ({x},{y},{z})"
+            );
+        }
+        for (cx, cz) in [(0, 0), (-3, 5)] {
+            let fc = folded.cols(cx, cz).expect("folded cols");
+            let rc = raw.cols(cx, cz).expect("raw cols");
+            for (x, y, z) in [
+                (cx * 16, -40, cz * 16),
+                (cx * 16 + 7, 90, cz * 16 + 9),
+                (cx * 16 + 3, 12, cz * 16 + 15),
+            ] {
+                let a = folded.block_density(&fc, x, y, z);
+                let b = raw.block_density(&rc, x, y, z);
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "block density differs at ({x},{y},{z})"
+                );
+            }
+        }
+
+        // Chunk terrain generation before/after: `cols` builds the whole
+        // column set (interp grids + density + surface), the same work the
+        // terrain stage does per chunk.
+        for (label, g) in [("unfolded", &mut raw), ("folded", &mut folded)] {
+            let t = std::time::Instant::now();
+            let mut built = 0u32;
+            for cx in 0..4i32 {
+                for cz in 0..4i32 {
+                    if g.cols(cx, cz).is_some() {
+                        built += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "PERF_DF_CONSTANT_FOLD {label}: folded_nodes={} chunks={built} \
+                 elapsed={:?} per_chunk={:?}",
+                g.df_folded,
+                t.elapsed(),
+                t.elapsed() / built.max(1)
+            );
+        }
     }
 
     /// The published immutable facts must equal the generator's own values: they are
