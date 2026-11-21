@@ -81,6 +81,7 @@ MC_SPINE_PORT=25699 cargo run --locked
 ## どこから読むか
 
 - 参加する・並列作業の担当境界: [CONTRIBUTING.md](CONTRIBUTING.md) → [開発ガイド](docs/development.md)
+- Mod・シェーダーの作者向け: [Mod・シェーダー開発者ガイド](docs/mod-author-guide.md)
 - 現在の作業と未解決事項: [specs/README.md](specs/README.md)
 - 目標と合格条件: [specs/PLAN.md](specs/PLAN.md) / 次の順序: [specs/ROADMAP.md](specs/ROADMAP.md)
 - 設計原則と比較の規律: [DESIGN.md](DESIGN.md)
