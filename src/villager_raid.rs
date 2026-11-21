@@ -1040,14 +1040,10 @@ impl Villager {
         self.refresh_pois(pois);
     }
 
+    /// Day-boundary bookkeeping shared by the full tick and the LOD sleep
+    /// path: gossip decays and the twice-daily restock budget resets.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn tick(
-        &mut self,
-        pois: &PoiRegistry,
-        position: BlockPos,
-        world_time: u64,
-    ) -> (VillagerActivity, Option<BlockPos>) {
-        self.refresh_pois(pois);
+    fn roll_day(&mut self, world_time: u64) {
         let day = world_time / VILLAGER_DAY_TICKS;
         if self.day.is_none_or(|previous| day > previous) {
             if let Some(previous) = self.day {
@@ -1056,6 +1052,43 @@ impl Villager {
             self.day = Some(day);
             self.restocks_today = 0;
         }
+    }
+
+    /// Vanilla work-station restock: the workstation occupies its block, so the
+    /// villager works from an adjacent block — next to the job site, under two
+    /// restocks per day, `VILLAGER_RESTOCK_COOLDOWN` apart, and only when an
+    /// offer has actually been used. Returns whether a restock happened.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn restock_at_job_site(&mut self, position: BlockPos, world_time: u64) -> bool {
+        if self
+            .job_site
+            .is_some_and(|site| villager_within(position, site, 1))
+            && self.restocks_today < 2
+            && self.last_restock.is_none_or(|last| {
+                world_time.saturating_sub(last) >= VILLAGER_RESTOCK_COOLDOWN
+            })
+            && self.offers.iter().any(|offer| offer.uses > 0)
+        {
+            for offer in &mut self.offers {
+                offer.update_demand();
+                offer.uses = 0;
+            }
+            self.last_restock = Some(world_time);
+            self.restocks_today += 1;
+            return true;
+        }
+        false
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn tick(
+        &mut self,
+        pois: &PoiRegistry,
+        position: BlockPos,
+        world_time: u64,
+    ) -> (VillagerActivity, Option<BlockPos>) {
+        self.refresh_pois(pois);
+        self.roll_day(world_time);
 
         let activity = VillagerActivity::at(world_time);
         let target = match activity {
@@ -1063,28 +1096,30 @@ impl Villager {
             VillagerActivity::Meet => self.meeting_point,
             VillagerActivity::Rest => self.home,
             VillagerActivity::Work => {
-                // The workstation occupies its block. Work from an adjacent block.
-                if self
-                    .job_site
-                    .is_some_and(|site| villager_within(position, site, 1))
-                    && self.restocks_today < 2
-                    && self.last_restock.is_none_or(|last| {
-                        world_time.saturating_sub(last) >= VILLAGER_RESTOCK_COOLDOWN
-                    })
-                    && self.offers.iter().any(|offer| offer.uses > 0)
-                {
-                    for offer in &mut self.offers {
-                        offer.update_demand();
-                        offer.uses = 0;
-                    }
-                    self.last_restock = Some(world_time);
-                    self.restocks_today += 1;
-                }
+                self.restock_at_job_site(position, world_time);
                 self.job_site
             }
         };
         self.sleeping = activity == VillagerActivity::Rest && target == Some(position);
         (activity, target)
+    }
+
+    /// The [`VillagerAiLodState::TradingHallSleep`] tick: the same day
+    /// bookkeeping, POI-claim validation and work-window restock rules as
+    /// [`Villager::tick`] — but no movement target and no pathfinding, which
+    /// are the work a confined villager can never use anyway. Returns whether
+    /// a restock happened.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn lod_sleep_tick(
+        &mut self,
+        pois: &PoiRegistry,
+        position: BlockPos,
+        world_time: u64,
+    ) -> bool {
+        self.refresh_pois(pois);
+        self.roll_day(world_time);
+        VillagerActivity::at(world_time) == VillagerActivity::Work
+            && self.restock_at_job_site(position, world_time)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -4261,5 +4296,447 @@ mod p2_parity_village_tests {
             mobs().lock().unwrap().iter().any(|mob| mob.etype == phantom),
             "doInsomnia=true must spawn phantoms for a 100k-tick insomniac"
         );
+    }
+}
+
+// ----------------------------------------- trading-hall villager AI LOD (PERF-1)
+//
+// A villager sealed in a trading-hall cell pays a per-tick pathfinding and POI
+// rescan bill for movement it can never make. The LOD layer below classifies
+// confined, settled villagers into `TradingHallSleep`, which skips that work
+// entirely while still running vanilla's exact restock/trade/day bookkeeping —
+// and any wake condition (threat, opening wall, damage) restores full AI on
+// the very same tick.
+
+/// Stationarity that counts as confinement even without a wall probe: a
+/// villager that has not moved for this many ticks is not going anywhere.
+#[cfg_attr(not(test), allow(dead_code))]
+const VILLAGER_LOD_CONFINED_TICKS: u32 = 40;
+
+/// A hostile inside this radius is a wake-up threat. Vanilla villagers flee
+/// zombies/pillagers/vexes/ravagers within a comparable range.
+#[cfg_attr(not(test), allow(dead_code))]
+const VILLAGER_LOD_THREAT_RADIUS: u16 = 12;
+
+/// The mob types `villager_lod_threat_nearby` counts — the vanilla panic list
+/// a trading-hall villager must still react to instantly.
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_villager_lod_threat(etype_name: &str) -> bool {
+    matches!(
+        etype_name
+            .strip_prefix("minecraft:")
+            .unwrap_or(etype_name),
+        "zombie" | "pillager" | "vex" | "ravager"
+    )
+}
+
+/// Is a panic-capable hostile within [`VILLAGER_LOD_THREAT_RADIUS`] of
+/// `position`? `hostiles` yields `(position, etype_name)` pairs; the caller
+/// gathers them from the mob registry, so the LOD step itself never scans.
+#[cfg_attr(not(test), allow(dead_code))]
+fn villager_lod_threat_nearby<'a>(
+    position: BlockPos,
+    hostiles: impl IntoIterator<Item = (BlockPos, &'a str)>,
+) -> bool {
+    hostiles
+        .into_iter()
+        .any(|(pos, name)| is_villager_lod_threat(name) && villager_within(position, pos, VILLAGER_LOD_THREAT_RADIUS))
+}
+
+/// AI level-of-detail for one villager.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum VillagerAiLodState {
+    /// Full per-tick AI: schedule, movement target, pathfinding, POI rescans.
+    #[default]
+    Active,
+    /// Confined trading-hall villager: restock/trade/bookkeeping only — zero
+    /// pathfinding and zero POI scans while the state holds.
+    TradingHallSleep,
+}
+
+/// World facts the LOD classifier needs for this tick, gathered by the caller
+/// (the wall probe and the hostile scan are world queries, not villager
+/// state). `took_damage` forces an instant wake like vanilla panic does.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default)]
+struct VillagerLodSenses {
+    /// All four horizontal neighbours of the villager's cell are blocked.
+    exits_blocked: bool,
+    /// A zombie/pillager/vex/ravager is within `VILLAGER_LOD_THREAT_RADIUS`.
+    threat_nearby: bool,
+    /// The villager took damage since the previous step.
+    took_damage: bool,
+}
+
+/// Aggregate accounting the operator surface reads: how many ticks ran full
+/// AI, how many slept, how many pathfind calls were skipped, and how many
+/// work-station restocks happened (in either state — sleep does not starve
+/// the trading hall).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VillagerLodStats {
+    active_ticks: u64,
+    sleeping_ticks: u64,
+    pathfinds_skipped: u64,
+    restocks_performed: u64,
+}
+
+/// Per-villager LOD record: current state, the stationarity counter feeding
+/// the 40-tick confinement rule, the last seen position that counter
+/// derives from, and the counters.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Default)]
+struct VillagerAiLod {
+    state: VillagerAiLodState,
+    confined_ticks: u32,
+    last_position: Option<BlockPos>,
+    stats: VillagerLodStats,
+}
+
+/// Classify this tick: `Active` unless the villager is confined (all four
+/// horizontal exits blocked, or stationary for [`VILLAGER_LOD_CONFINED_TICKS`]
+/// ticks) with a settled profession and no hostile in range. Threats and
+/// damage are instant-wake conditions checked before anything else.
+#[cfg_attr(not(test), allow(dead_code))]
+fn classify_villager_lod(
+    villager: &Villager,
+    lod: &VillagerAiLod,
+    senses: &VillagerLodSenses,
+) -> VillagerAiLodState {
+    if senses.took_damage || senses.threat_nearby {
+        return VillagerAiLodState::Active;
+    }
+    let confined =
+        senses.exits_blocked || lod.confined_ticks >= VILLAGER_LOD_CONFINED_TICKS;
+    if confined && villager.profession != VillagerProfession::None {
+        VillagerAiLodState::TradingHallSleep
+    } else {
+        VillagerAiLodState::Active
+    }
+}
+
+/// One game tick of villager AI under LOD. Returns the state that ran and the
+/// movement target — `None` in `TradingHallSleep`, where the caller must not
+/// pathfind at all.
+///
+/// Wake semantics are instant: damage or a nearby hostile puts the villager on
+/// the full [`Villager::tick`] path this same tick. A wall opening while
+/// asleep is also a real wake — `exits_blocked` clearing resets the
+/// stationarity counter so the villager gets `VILLAGER_LOD_CONFINED_TICKS`
+/// ticks of full AI to exploit the opening; if it still cannot leave, it
+/// settles back to sleep instead of freezing forever.
+#[cfg_attr(not(test), allow(dead_code))]
+fn step_villager_with_lod(
+    villager: &mut Villager,
+    lod: &mut VillagerAiLod,
+    pois: &PoiRegistry,
+    position: BlockPos,
+    world_time: u64,
+    senses: VillagerLodSenses,
+) -> (VillagerAiLodState, Option<BlockPos>) {
+    let moved = lod.last_position.is_some_and(|last| last != position);
+    lod.last_position = Some(position);
+    if moved {
+        lod.confined_ticks = 0;
+    } else {
+        lod.confined_ticks = lod.confined_ticks.saturating_add(1);
+    }
+    if lod.state == VillagerAiLodState::TradingHallSleep && !senses.exits_blocked {
+        // A surrounding block opened: reset the counter so stationarity has to
+        // be re-proven rather than pinning the villager asleep forever.
+        lod.confined_ticks = 0;
+    }
+    lod.state = classify_villager_lod(villager, lod, &senses);
+    match lod.state {
+        VillagerAiLodState::Active => {
+            lod.stats.active_ticks += 1;
+            let (_, target) = villager.tick(pois, position, world_time);
+            // `last_restock` stamped with this tick's time is the restock
+            // itself — a `restocks_today` delta misses the day-rollover case.
+            if villager.last_restock == Some(world_time) {
+                lod.stats.restocks_performed += 1;
+            }
+            (lod.state, target)
+        }
+        VillagerAiLodState::TradingHallSleep => {
+            lod.stats.sleeping_ticks += 1;
+            lod.stats.pathfinds_skipped += 1;
+            if villager.lod_sleep_tick(pois, position, world_time) {
+                lod.stats.restocks_performed += 1;
+            }
+            (lod.state, None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod perf1_villager_lod_tests {
+    use super::*;
+
+    const PLAYER: VillageUuid = [7; 16];
+    const JOB_SITE: BlockPos = (3, 64, 0);
+    const CELL: BlockPos = (3, 64, 1);
+    const WHEAT: i64 = 854;
+    const EMERALD: i64 = 806;
+
+    fn stack(item: i64, count: u8) -> Stack {
+        (item, count, Vec::new())
+    }
+
+    fn items() -> MerchantItems<'static> {
+        fn prototype(_item: i64) -> &'static Comps {
+            static NORMAL: OnceLock<Comps> = OnceLock::new();
+            NORMAL.get_or_init(|| vec![(1, vec![64])])
+        }
+        MerchantItems(&prototype)
+    }
+
+    fn lod_offer() -> MerchantOffer {
+        MerchantOffer {
+            cost_a: ItemCost {
+                item: WHEAT,
+                count: 20,
+                components: Vec::new(),
+            },
+            cost_b: None,
+            result: stack(EMERALD, 3),
+            uses: 0,
+            max_uses: 16,
+            xp_reward: 2,
+            price_multiplier: 0.05,
+            demand: 0,
+            special_price_diff: 0,
+        }
+    }
+
+    /// A librarian already bound to its lectern — the standard trading-hall
+    /// resident. `id` distinguishes the hall's claimants.
+    fn lod_villager(id: u8) -> (PoiRegistry, Villager, VillagerAiLod) {
+        let mut pois = PoiRegistry::default();
+        pois.register(JOB_SITE, PoiKind::JobSite(VillagerProfession::Librarian));
+        let mut villager = Villager::new([id; 16], VillagerProfession::None);
+        assert!(villager.claim_poi(&mut pois, JOB_SITE));
+        villager.offers.push(lod_offer());
+        (pois, villager, VillagerAiLod::default())
+    }
+
+    fn confined() -> VillagerLodSenses {
+        VillagerLodSenses {
+            exits_blocked: true,
+            ..VillagerLodSenses::default()
+        }
+    }
+
+    #[test]
+    fn perf1_confined_trading_hall_villagers_sleep_and_skip_every_pathfind() {
+        // 100 sealed trading-hall cells: each villager is walled in next to
+        // its job site with a used offer, the canonical lag farm.
+        let mut hall: Vec<(PoiRegistry, Villager, VillagerAiLod)> =
+            (0..100).map(|i| lod_villager(i as u8)).collect();
+        for (_, villager, _) in &mut hall {
+            villager.offers[0].uses = 1;
+        }
+
+        // Work window: the wake-on-entry step already sleeps (exits blocked).
+        for (pois, villager, lod) in &mut hall {
+            let (state, target) =
+                step_villager_with_lod(villager, lod, pois, CELL, 3_000, confined());
+            let _ = target;
+            assert_eq!(state, VillagerAiLodState::TradingHallSleep);
+            assert_eq!(lod.stats.pathfinds_skipped, 1);
+        }
+        // First restock fired while asleep: vanilla bookkeeping still runs.
+        assert!(hall.iter().all(|(_, v, _)| v.restocks_today == 1));
+
+        // Second restock once the cooldown allows; a third is denied — exactly
+        // the vanilla twice-per-day budget.
+        for (pois, villager, lod) in &mut hall {
+            villager.offers[0].uses = 1;
+            step_villager_with_lod(villager, lod, pois, CELL, 5_000, confined());
+            assert_eq!(villager.restocks_today, 2);
+        }
+        for (pois, villager, lod) in &mut hall {
+            villager.offers[0].uses = 1;
+            step_villager_with_lod(villager, lod, pois, CELL, 7_500, confined());
+            assert_eq!(villager.restocks_today, 2, "third restock must not fire");
+        }
+
+        let restocks: u64 = hall
+            .iter()
+            .map(|(_, _, lod)| lod.stats.restocks_performed)
+            .sum();
+        assert_eq!(restocks, 200, "two restocks each across the hall");
+
+        // 60 more ticks of pure sleep: still not a single pathfind.
+        for _ in 0..60 {
+            for (pois, villager, lod) in &mut hall {
+                let (state, _) = step_villager_with_lod(
+                    villager,
+                    lod,
+                    pois,
+                    CELL,
+                    7_500,
+                    confined(),
+                );
+                assert_eq!(state, VillagerAiLodState::TradingHallSleep);
+            }
+        }
+        let stats: (u64, u64, u64) = hall.iter().fold((0, 0, 0), |a, (_, _, lod)| {
+            (
+                a.0 + lod.stats.active_ticks,
+                a.1 + lod.stats.sleeping_ticks,
+                a.2 + lod.stats.pathfinds_skipped,
+            )
+        });
+        assert_eq!(stats.0, 0, "no active ticks — they were confined all along");
+        assert_eq!(stats.1, 6_300, "every tick slept");
+        assert_eq!(stats.2, 6_300, "every pathfind skipped");
+    }
+
+    #[test]
+    fn perf1_sleeping_villager_wakes_instantly_on_threat_and_damage() {
+        let (pois, mut villager, mut lod) = lod_villager(9);
+        let senses = confined();
+        let (state, _) = step_villager_with_lod(&mut villager, &mut lod, &pois, CELL, 3_000, senses);
+        assert_eq!(state, VillagerAiLodState::TradingHallSleep);
+
+        // A zombie shuffling up to the cell: wake on that very tick and run
+        // the full AI path (which produces a movement target).
+        let mut threatened = senses;
+        threatened.threat_nearby = true;
+        let (state, _) =
+            step_villager_with_lod(&mut villager, &mut lod, &pois, CELL, 3_001, threatened);
+        assert_eq!(state, VillagerAiLodState::Active);
+        assert_eq!(lod.stats.active_ticks, 1);
+
+        // Back to sleep once it passes...
+        let (state, _) = step_villager_with_lod(&mut villager, &mut lod, &pois, CELL, 3_002, senses);
+        assert_eq!(state, VillagerAiLodState::TradingHallSleep);
+        // ... and damage wakes just as fast as a threat does.
+        let mut hurt = senses;
+        hurt.took_damage = true;
+        let (state, _) = step_villager_with_lod(&mut villager, &mut lod, &pois, CELL, 3_003, hurt);
+        assert_eq!(state, VillagerAiLodState::Active);
+
+        // The classifier's threat probe itself: the four vanilla panic
+        // mobs inside 12 blocks, nothing else, nothing further.
+        let at = CELL;
+        assert!(villager_lod_threat_nearby(at, [((at.0 + 12, at.1, at.2), "zombie")]));
+        assert!(!villager_lod_threat_nearby(at, [((at.0 + 13, at.1, at.2), "zombie")]));
+        assert!(villager_lod_threat_nearby(
+            at,
+            [((at.0 + 8, at.1 + 8, at.2), "minecraft:ravager")]
+        ));
+        for name in ["pillager", "vex"] {
+            assert!(villager_lod_threat_nearby(at, [((at.0, at.1, at.2 + 3), name)]));
+        }
+        assert!(!villager_lod_threat_nearby(at, [((at.0, at.1, at.2 + 2), "skeleton")]));
+        assert!(!villager_lod_threat_nearby(at, [((at.0 + 9, at.1 + 9, at.2), "zombie")]));
+    }
+
+    #[test]
+    fn perf1_sleeping_villager_wakes_when_a_wall_opens_then_can_resleep() {
+        let (pois, mut villager, mut lod) = lod_villager(9);
+        let senses = confined();
+        let (state, _) = step_villager_with_lod(&mut villager, &mut lod, &pois, CELL, 3_000, senses);
+        assert_eq!(state, VillagerAiLodState::TradingHallSleep);
+        let skipped_at_sleep = lod.stats.pathfinds_skipped;
+
+        // A piston opens the cell: full AI resumes immediately, and the
+        // stationarity counter resets so the villager gets a real chance out.
+        let mut open = senses;
+        open.exits_blocked = false;
+        let (state, target) =
+            step_villager_with_lod(&mut villager, &mut lod, &pois, CELL, 3_001, open);
+        assert_eq!(state, VillagerAiLodState::Active);
+        assert_eq!(lod.confined_ticks, 0);
+        assert_eq!(target, villager.job_site, "Work-time AI targets the job site");
+        assert_eq!(lod.stats.pathfinds_skipped, skipped_at_sleep);
+
+        // If it still cannot actually leave (the opening led nowhere), 40
+        // stationary ticks re-earn the sleep instead of pinning it awake.
+        let mut stepped = 0u32;
+        loop {
+            let (state, _) = step_villager_with_lod(
+                &mut villager,
+                &mut lod,
+                &pois,
+                CELL,
+                3_001 + u64::from(stepped),
+                open,
+            );
+            stepped += 1;
+            if state == VillagerAiLodState::TradingHallSleep {
+                break;
+            }
+            assert!(stepped <= 40, "confinement must re-arrive within 40 ticks");
+        }
+        assert_eq!(stepped, 40, "wake grace is exactly the confinement window");
+    }
+
+    #[test]
+    fn perf1_sleeping_villager_keeps_full_trade_interaction() {
+        let (pois, mut villager, mut lod) = lod_villager(9);
+        let senses = confined();
+        let (state, _) = step_villager_with_lod(&mut villager, &mut lod, &pois, CELL, 3_000, senses);
+        assert_eq!(state, VillagerAiLodState::TradingHallSleep);
+
+        // A player clicks the villager: the trade session opens, executes and
+        // consumes exactly like an awake villager's.
+        assert!(villager.start_trading(&pois, PLAYER, None));
+        let mut menu = MerchantMenu {
+            payments: [stack(WHEAT, 20), stack(0, 0)],
+            ..MerchantMenu::default()
+        };
+        assert_eq!(
+            villager
+                .trade(PLAYER, &mut menu, &items())
+                .map(|trade| trade.result),
+            Some(stack(EMERALD, 3))
+        );
+        villager.stop_trading();
+        assert_eq!(villager.offers[0].uses, 1, "trades still wear the offer out");
+
+        // ...which is precisely what lets the next Work tick restock.
+        let (state, _) = step_villager_with_lod(&mut villager, &mut lod, &pois, CELL, 5_000, senses);
+        assert_eq!(state, VillagerAiLodState::TradingHallSleep);
+        assert_eq!(villager.restocks_today, 1);
+        assert_eq!(lod.stats.restocks_performed, 1);
+    }
+
+    #[test]
+    fn perf1_unsettled_profession_and_open_cells_never_sleep() {
+        // A confined villager with no profession never sleeps: it has nothing
+        // settled to preserve.
+        let mut pois = PoiRegistry::default();
+        pois.register(JOB_SITE, PoiKind::JobSite(VillagerProfession::Librarian));
+        let mut villager = Villager::new([4; 16], VillagerProfession::None);
+        let mut lod = VillagerAiLod::default();
+        for tick in 0..60 {
+            let (state, _) = step_villager_with_lod(
+                &mut villager,
+                &mut lod,
+                &pois,
+                CELL,
+                3_000 + tick,
+                confined(),
+            );
+            assert_eq!(state, VillagerAiLodState::Active, "unsettled must stay awake");
+        }
+
+        // And the "stationary" half of confinement: open exits but 40 ticks
+        // without moving also earns the sleep.
+        let (pois, mut villager, mut lod) = lod_villager(9);
+        let open = VillagerLodSenses::default();
+        for tick in 0..40u64 {
+            let (state, _) =
+                step_villager_with_lod(&mut villager, &mut lod, &pois, CELL, 3_000 + tick, open);
+            if tick < 39 {
+                assert_eq!(state, VillagerAiLodState::Active);
+            }
+        }
+        assert_eq!(lod.state, VillagerAiLodState::TradingHallSleep);
+        assert_eq!(lod.stats.pathfinds_skipped, 1);
     }
 }

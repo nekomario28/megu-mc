@@ -1659,3 +1659,542 @@ mod operator_ux_tests {
         join.join().unwrap();
     }
 }
+
+// ------------------------------------------- built-in MSPT hotspot profiler
+//
+// PERF-1: the zero-dependency Spark substitute. A fixed ring of per-tick
+// durations gives mean/p50/p95/p99/max MSPT and exact TPS; a bounded per-chunk
+// accumulator attributes work microseconds to `(dim, cx, cz)` and subsystem,
+// so `/perf` style output can name the chunk that is actually eating the tick.
+
+/// Ring capacity: 1,200 ticks is a 60-second window at the 20 TPS target.
+#[allow(dead_code)]
+const PROFILER_RING_CAPACITY: usize = 1_200;
+
+/// Bound on the per-chunk accumulator. A server can touch more chunks than
+/// this in a minute; when the map is full the coldest entry is evicted for a
+/// new arrival, so the retained set tracks the hot chunks that matter.
+#[allow(dead_code)]
+const PROFILER_MAX_CHUNKS: usize = 8_192;
+
+/// Subsystems chunk work is attributed to. The label is what operators see —
+/// plain words, no internal names.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ProfilerSubsystem {
+    Hoppers,
+    Villagers,
+    Worldgen,
+    Redstone,
+    Mobs,
+    Light,
+    Network,
+    Mods,
+}
+
+#[allow(dead_code)]
+impl ProfilerSubsystem {
+    const ALL: [Self; 8] = [
+        Self::Hoppers,
+        Self::Villagers,
+        Self::Worldgen,
+        Self::Redstone,
+        Self::Mobs,
+        Self::Light,
+        Self::Network,
+        Self::Mods,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Lowercase label for human lines and JSON keys.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hoppers => "hoppers",
+            Self::Villagers => "villagers",
+            Self::Worldgen => "worldgen",
+            Self::Redstone => "redstone",
+            Self::Mobs => "mobs",
+            Self::Light => "light",
+            Self::Network => "network",
+            Self::Mods => "mods",
+        }
+    }
+}
+
+/// Per-chunk work ledger: microseconds per subsystem plus the running total
+/// the hot-set eviction and top-N ranking read.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ChunkWorkLedger {
+    per_subsystem: [u64; 8],
+    total: u64,
+}
+
+/// One row of a [`ProfilerReport`]'s top-N list: the chunk, its block-center
+/// coordinates (`cx*16+8`, `cz*16+8` — where a `/tp` lands), the total
+/// microseconds attributed in the window, the mean cost per recorded tick,
+/// and the subsystem that dominates it.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ChunkHotspot {
+    dim: DimId,
+    chunk_x: i32,
+    chunk_z: i32,
+    block_x: i32,
+    block_z: i32,
+    total_us: u64,
+    ms_per_tick: f64,
+    dominant: ProfilerSubsystem,
+}
+
+/// A point-in-time readout from [`ServerHotspotProfiler::summary`]: exact TPS
+/// and the MSPT percentiles, the subsystem percentage breakdown, and the
+/// hottest chunks. `format_human` is the console/report rendering; `to_json`
+/// is the same data for tooling.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ProfilerReport {
+    ticks_recorded: usize,
+    tps: f64,
+    mspt_mean: f64,
+    mspt_p50: f64,
+    mspt_p95: f64,
+    mspt_p99: f64,
+    mspt_max: f64,
+    /// `(subsystem, window microseconds, share of attributed work)` per
+    /// subsystem, in `ProfilerSubsystem::ALL` order.
+    subsystem_us: [(ProfilerSubsystem, u64, f64); 8],
+    total_attributed_us: u64,
+    top_chunks: Vec<ChunkHotspot>,
+}
+
+/// What an operator reads for a dimension: the friendly vanilla names, the
+/// registry id for custom dimensions.
+#[allow(dead_code)]
+fn profiler_dim_name(dim: DimId) -> String {
+    match dim {
+        DimId::Overworld => "Overworld".to_string(),
+        DimId::Nether => "Nether".to_string(),
+        DimId::End => "End".to_string(),
+        _ => dim.dimension_id().to_string(),
+    }
+}
+
+#[allow(dead_code)]
+impl ProfilerReport {
+    /// Jargon-free operator output: one status line, one subsystem line, then
+    /// the hottest chunks as `Overworld chunk (12, -4) [x=200, z=-56]:
+    /// 14.2 ms/tick (hoppers)`.
+    fn format_human(&self) -> String {
+        let mut out = format!(
+            "TPS {:.1} | MSPT mean {:.1} ms, p50 {:.1}, p95 {:.1}, p99 {:.1}, max {:.1} ms ({} ticks)\n",
+            self.tps,
+            self.mspt_mean,
+            self.mspt_p50,
+            self.mspt_p95,
+            self.mspt_p99,
+            self.mspt_max,
+            self.ticks_recorded,
+        );
+        let breakdown: Vec<String> = self
+            .subsystem_us
+            .iter()
+            .filter(|(_, us, _)| *us > 0)
+            .map(|(sub, _, pct)| format!("{} {:.1}%", sub.label(), pct))
+            .collect();
+        if !breakdown.is_empty() {
+            out.push_str(&format!("Work by subsystem: {}\n", breakdown.join(", ")));
+        }
+        if self.top_chunks.is_empty() {
+            out.push_str("No chunk hotspots recorded.\n");
+        } else {
+            out.push_str("Top chunk hotspots:\n");
+            for spot in &self.top_chunks {
+                out.push_str(&format!(
+                    "  {} chunk ({}, {}) [x={}, z={}]: {:.1} ms/tick ({})\n",
+                    profiler_dim_name(spot.dim),
+                    spot.chunk_x,
+                    spot.chunk_z,
+                    spot.block_x,
+                    spot.block_z,
+                    spot.ms_per_tick,
+                    spot.dominant.label(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// The same report as JSON — hand-built like the status reply, so nothing
+    /// outside this file is needed.
+    fn to_json(&self) -> String {
+        let subsystems = self
+            .subsystem_us
+            .iter()
+            .map(|(sub, us, pct)| {
+                format!(
+                    "\"{}\":{{\"us\":{us},\"pct\":{pct:.2}}}",
+                    sub.label()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let chunks = self
+            .top_chunks
+            .iter()
+            .map(|spot| {
+                format!(
+                    "{{\"dim\":\"{}\",\"cx\":{},\"cz\":{},\"x\":{},\"z\":{},\
+                     \"total_us\":{},\"ms_per_tick\":{:.2},\"subsystem\":\"{}\"}}",
+                    status_json_text(&spot.dim.dimension_id()),
+                    spot.chunk_x,
+                    spot.chunk_z,
+                    spot.block_x,
+                    spot.block_z,
+                    spot.total_us,
+                    spot.ms_per_tick,
+                    spot.dominant.label(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"ticks\":{},\"tps\":{:.2},\"mspt\":{{\"mean\":{:.2},\"p50\":{:.2},\
+             \"p95\":{:.2},\"p99\":{:.2},\"max\":{:.2}}},\"subsystems\":{{{subsystems}}},\
+             \"top_chunks\":[{chunks}]}}",
+            self.ticks_recorded,
+            self.tps,
+            self.mspt_mean,
+            self.mspt_p50,
+            self.mspt_p95,
+            self.mspt_p99,
+            self.mspt_max,
+        )
+    }
+}
+
+/// The recorder itself: a fixed ring of tick durations plus the bounded
+/// per-chunk work map. `record_*` calls are the only inputs; `summary` turns
+/// the window into a report. All times are microseconds — `Instant`-side
+/// callers convert once at the edge.
+#[allow(dead_code)]
+struct ServerHotspotProfiler {
+    /// `ring[..ring_len]` is the valid window; before the first wrap that is
+    /// `0..ring_next`, after it the whole array is valid.
+    ring: Vec<u32>,
+    ring_next: usize,
+    ring_len: usize,
+    chunks: HashMap<(DimId, i32, i32), ChunkWorkLedger>,
+}
+
+#[allow(dead_code)]
+impl Default for ServerHotspotProfiler {
+    fn default() -> Self {
+        Self {
+            ring: vec![0; PROFILER_RING_CAPACITY],
+            ring_next: 0,
+            ring_len: 0,
+            chunks: HashMap::new(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl ServerHotspotProfiler {
+    /// One tick's duration, in microseconds.
+    fn record_tick_us(&mut self, us: u32) {
+        self.ring[self.ring_next] = us;
+        self.ring_next = (self.ring_next + 1) % PROFILER_RING_CAPACITY;
+        self.ring_len = (self.ring_len + 1).min(PROFILER_RING_CAPACITY);
+    }
+
+    /// Attribute `us` microseconds of work inside `(dim, cx, cz)` to
+    /// `subsystem`. Over the bound, the coldest chunk is evicted for a new key.
+    fn record_chunk_work(
+        &mut self,
+        dim: DimId,
+        cx: i32,
+        cz: i32,
+        subsystem: ProfilerSubsystem,
+        us: u32,
+    ) {
+        let key = (dim, cx, cz);
+        if !self.chunks.contains_key(&key) && self.chunks.len() >= PROFILER_MAX_CHUNKS {
+            if let Some(coldest) = self
+                .chunks
+                .iter()
+                .min_by_key(|(_, ledger)| ledger.total)
+                .map(|(key, _)| *key)
+            {
+                self.chunks.remove(&coldest);
+            }
+        }
+        let ledger = self.chunks.entry(key).or_default();
+        ledger.per_subsystem[subsystem.index()] += u64::from(us);
+        ledger.total += u64::from(us);
+    }
+
+    /// Drop everything: fresh ring, empty chunk map.
+    fn reset(&mut self) {
+        self.ring.fill(0);
+        self.ring_next = 0;
+        self.ring_len = 0;
+        self.chunks.clear();
+    }
+
+    /// Snapshot the window. Percentiles are nearest-rank over the recorded
+    /// ticks — `p`% of ticks were at or under `pP`. TPS is `1e6 / mean_us`
+    /// clamped to the 20 TPS ceiling; an empty or zero-cost window reads 20.
+    fn summary(&self, top_n: usize) -> ProfilerReport {
+        let mut ticks: Vec<u32> = self.ring[..self.ring_len].to_vec();
+        ticks.sort_unstable();
+        let n = ticks.len();
+        let mean_us = if n == 0 {
+            0.0
+        } else {
+            ticks.iter().map(|&t| u64::from(t)).sum::<u64>() as f64 / n as f64
+        };
+        let tps = if mean_us <= 0.0 {
+            20.0
+        } else {
+            (1_000_000.0 / mean_us).min(20.0)
+        };
+        let percentile = |p: usize| -> f64 {
+            if n == 0 {
+                return 0.0;
+            }
+            // nearest-rank: ceil(p/100 * n), 1-indexed.
+            let rank = (p * n).div_ceil(100).max(1);
+            f64::from(ticks[(rank - 1).min(n - 1)]) / 1000.0
+        };
+        let mspt_max = f64::from(ticks.last().copied().unwrap_or(0)) / 1000.0;
+
+        let mut subsystem_us = ProfilerSubsystem::ALL.map(|sub| (sub, 0u64, 0.0f64));
+        let mut total_attributed = 0u64;
+        for ledger in self.chunks.values() {
+            total_attributed += ledger.total;
+            for entry in &mut subsystem_us {
+                entry.1 += ledger.per_subsystem[entry.0.index()];
+            }
+        }
+        for entry in &mut subsystem_us {
+            entry.2 = if total_attributed == 0 {
+                0.0
+            } else {
+                entry.1 as f64 * 100.0 / total_attributed as f64
+            };
+        }
+
+        let mut ranked: Vec<ChunkHotspot> = self
+            .chunks
+            .iter()
+            .map(|(&(dim, cx, cz), ledger)| {
+                let dominant = ProfilerSubsystem::ALL
+                    .iter()
+                    .max_by_key(|sub| ledger.per_subsystem[sub.index()])
+                    .copied()
+                    .unwrap_or(ProfilerSubsystem::Mobs);
+                ChunkHotspot {
+                    dim,
+                    chunk_x: cx,
+                    chunk_z: cz,
+                    block_x: cx.saturating_mul(16).saturating_add(8),
+                    block_z: cz.saturating_mul(16).saturating_add(8),
+                    total_us: ledger.total,
+                    ms_per_tick: if n == 0 {
+                        0.0
+                    } else {
+                        ledger.total as f64 / n as f64 / 1000.0
+                    },
+                    dominant,
+                }
+            })
+            .collect();
+        // Hottest first; ties break on coordinates so reports are stable.
+        ranked.sort_by(|a, b| {
+            b.total_us
+                .cmp(&a.total_us)
+                .then((a.dim, a.chunk_x, a.chunk_z).cmp(&(b.dim, b.chunk_x, b.chunk_z)))
+        });
+        ranked.truncate(top_n);
+
+        ProfilerReport {
+            ticks_recorded: n,
+            tps,
+            mspt_mean: mean_us / 1000.0,
+            mspt_p50: percentile(50),
+            mspt_p95: percentile(95),
+            mspt_p99: percentile(99),
+            mspt_max,
+            subsystem_us,
+            total_attributed_us: total_attributed,
+            top_chunks: ranked,
+        }
+    }
+
+    /// Human rendering of the current window, top five chunks.
+    fn format_human(&self) -> String {
+        self.summary(5).format_human()
+    }
+
+    /// JSON rendering of the current window, top five chunks.
+    fn to_json(&self) -> String {
+        self.summary(5).to_json()
+    }
+}
+
+#[cfg(test)]
+mod perf1_profiler_tests {
+    use super::*;
+
+    #[test]
+    fn perf1_profiler_reports_exact_mspt_percentiles_and_tps() {
+        let mut profiler = ServerHotspotProfiler::default();
+        // A loaded minute: 1000 ticks at 10 ms, 180 at 50 ms, 20 at 100 ms.
+        for _ in 0..1_000 {
+            profiler.record_tick_us(10_000);
+        }
+        for _ in 0..180 {
+            profiler.record_tick_us(50_000);
+        }
+        for _ in 0..20 {
+            profiler.record_tick_us(100_000);
+        }
+
+        let report = profiler.summary(5);
+        assert_eq!(report.ticks_recorded, 1_200);
+        // mean = 21_000_000 / 1200 = 17_500 us = 17.5 ms; TPS clamps at 20.
+        assert!((report.mspt_mean - 17.5).abs() < 1e-9, "{}", report.mspt_mean);
+        assert!((report.tps - 20.0).abs() < 1e-9, "{}", report.tps);
+        // nearest-rank: p50 lands inside the 10ms block, p95 in the 50ms
+        // block, p99/max in the 100ms tail.
+        assert!((report.mspt_p50 - 10.0).abs() < 1e-9, "{}", report.mspt_p50);
+        assert!((report.mspt_p95 - 50.0).abs() < 1e-9, "{}", report.mspt_p95);
+        assert!((report.mspt_p99 - 100.0).abs() < 1e-9, "{}", report.mspt_p99);
+        assert!((report.mspt_max - 100.0).abs() < 1e-9, "{}", report.mspt_max);
+    }
+
+    #[test]
+    fn perf1_profiler_tps_reflects_real_mspt_and_ring_wraps() {
+        let mut profiler = ServerHotspotProfiler::default();
+        // 1,400 writes over a 1,200-slot ring: the first 200 are evicted, the
+        // surviving window is exactly the last 1,200 ticks at 40 ms.
+        for _ in 0..200 {
+            profiler.record_tick_us(5_000);
+        }
+        for _ in 0..1_200 {
+            profiler.record_tick_us(40_000);
+        }
+        let report = profiler.summary(0);
+        assert_eq!(report.ticks_recorded, 1_200);
+        assert!((report.mspt_mean - 40.0).abs() < 1e-9);
+        // TPS = 1e6 / 40_000 us = 25 -> clamped to the 20 TPS ceiling.
+        assert!((report.tps - 20.0).abs() < 1e-9);
+
+        profiler.reset();
+        assert_eq!(profiler.ring_len, 0);
+        assert!(profiler.chunks.is_empty());
+        // 80 ms ticks: TPS = 12.5, unclamped — the slow server case.
+        for _ in 0..100 {
+            profiler.record_tick_us(80_000);
+        }
+        let report = profiler.summary(0);
+        assert_eq!(report.ticks_recorded, 100);
+        assert!((report.tps - 12.5).abs() < 1e-9, "{}", report.tps);
+        assert!((report.mspt_p99 - 80.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn perf1_profiler_ranks_chunk_hotspots_with_block_coords_and_dominant() {
+        let mut profiler = ServerHotspotProfiler::default();
+        for _ in 0..100 {
+            profiler.record_tick_us(50_000);
+        }
+        // Overworld (12,-4) is the hoppers hotspot: 1420 us/tick over the
+        // window -> 14.2 ms/tick at n=10? no: n=100 ticks -> total/100.
+        profiler.record_chunk_work(DimId::Overworld, 12, -4, ProfilerSubsystem::Hoppers, 1_000_000);
+        profiler.record_chunk_work(DimId::Overworld, 12, -4, ProfilerSubsystem::Redstone, 200_000);
+        profiler.record_chunk_work(DimId::Overworld, 12, -4, ProfilerSubsystem::Hoppers, 220_000);
+        profiler.record_chunk_work(DimId::Overworld, 0, 0, ProfilerSubsystem::Villagers, 500_000);
+        profiler.record_chunk_work(DimId::Nether, -9, 9, ProfilerSubsystem::Worldgen, 50_000);
+        profiler.record_chunk_work(DimId::Overworld, 3, 3, ProfilerSubsystem::Mobs, 10_000);
+
+        let report = profiler.summary(2);
+        assert_eq!(report.top_chunks.len(), 2);
+        let hottest = &report.top_chunks[0];
+        assert_eq!((hottest.dim, hottest.chunk_x, hottest.chunk_z), (DimId::Overworld, 12, -4));
+        // block-center: cx*16+8, cz*16+8
+        assert_eq!((hottest.block_x, hottest.block_z), (200, -56));
+        assert_eq!(hottest.total_us, 1_420_000);
+        // 1_420_000 us over 100 ticks = 14.2 ms/tick.
+        assert!((hottest.ms_per_tick - 14.2).abs() < 1e-9, "{}", hottest.ms_per_tick);
+        assert_eq!(hottest.dominant, ProfilerSubsystem::Hoppers);
+        assert_eq!(report.top_chunks[1].chunk_x, 0);
+        assert_eq!(report.top_chunks[1].dominant, ProfilerSubsystem::Villagers);
+
+        // Subsystem percentages of the attributed 1_980_000 us.
+        let pct = |sub: ProfilerSubsystem| {
+            report
+                .subsystem_us
+                .iter()
+                .find(|(s, _, _)| *s == sub)
+                .map(|(_, us, pct)| (*us, *pct))
+                .unwrap()
+        };
+        let (us, p) = pct(ProfilerSubsystem::Hoppers);
+        assert_eq!(us, 1_220_000);
+        assert!((p - 1_220_000.0 * 100.0 / 1_980_000.0).abs() < 1e-6, "{p}");
+        let (_, p) = pct(ProfilerSubsystem::Worldgen);
+        assert!((p - 50_000.0 * 100.0 / 1_980_000.0).abs() < 1e-6);
+        let total_pct: f64 = report.subsystem_us.iter().map(|(_, _, p)| p).sum();
+        assert!((total_pct - 100.0).abs() < 1e-6, "{total_pct}");
+    }
+
+    #[test]
+    fn perf1_profiler_formats_human_line_and_valid_json() {
+        let mut profiler = ServerHotspotProfiler::default();
+        for _ in 0..100 {
+            profiler.record_tick_us(50_000);
+        }
+        profiler.record_chunk_work(DimId::Overworld, 12, -4, ProfilerSubsystem::Hoppers, 1_420_000);
+
+        let human = profiler.summary(5).format_human();
+        assert!(human.contains("TPS 20.0"), "{human}");
+        assert!(human.contains("p99"), "{human}");
+        assert!(
+            human.contains("Overworld chunk (12, -4) [x=200, z=-56]: 14.2 ms/tick (hoppers)"),
+            "{human}"
+        );
+
+        let json = profiler.summary(5).to_json();
+        let parsed = jparse(json.as_bytes()).expect("report JSON must parse");
+        let _ = parsed;
+        assert!(json.contains("\"p99\":80.00") || json.contains("\"p99\":50.00"), "{json}");
+        assert!(json.contains("\"dim\":\"minecraft:overworld\""), "{json}");
+        assert!(json.contains("\"x\":200,\"z\":-56"), "{json}");
+        assert!(json.contains("\"subsystem\":\"hoppers\""), "{json}");
+
+        // The profiler's own convenience renderings use top five.
+        assert_eq!(profiler.format_human(), profiler.summary(5).format_human());
+    }
+
+    #[test]
+    fn perf1_profiler_bound_evicts_the_coldest_chunk() {
+        let mut profiler = ServerHotspotProfiler::default();
+        profiler.record_tick_us(50_000);
+        // Fill the map to capacity; chunk (0,0) is a small cold entry.
+        profiler.record_chunk_work(DimId::Overworld, 0, 0, ProfilerSubsystem::Mobs, 1);
+        for i in 1..PROFILER_MAX_CHUNKS as i32 {
+            profiler.record_chunk_work(DimId::Overworld, i, 7, ProfilerSubsystem::Mobs, 100);
+        }
+        assert_eq!(profiler.chunks.len(), PROFILER_MAX_CHUNKS);
+        // A hot new arrival evicts the coldest (the 1-us entry), not itself.
+        profiler.record_chunk_work(DimId::Nether, 1, 1, ProfilerSubsystem::Hoppers, 9_999);
+        assert_eq!(profiler.chunks.len(), PROFILER_MAX_CHUNKS);
+        assert!(!profiler.chunks.contains_key(&(DimId::Overworld, 0, 0)));
+        assert!(profiler.chunks.contains_key(&(DimId::Nether, 1, 1)));
+    }
+}

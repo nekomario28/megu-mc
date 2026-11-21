@@ -6342,3 +6342,873 @@ mod p2_parity_world_tests {
         assert_eq!(before, after, "a second grant of the same advancement must not re-pay rewards");
     }
 }
+
+// ------------------------------------------------- O(1) sleeping hopper engine
+//
+// PERF-1: the sorting-system lag fix. A hopper whose pull source, push target,
+// own inventory and suction cell are all unchanged since its last empty attempt
+// performs zero slot reads — it sleeps on four revision counters instead of
+// re-scanning every tick. The world bumps a revision through
+// `notify_container_changed` / `notify_item_entered_cell` on any mutation,
+// which wakes only the hoppers watching that position, so a settled array
+// idles at O(1) per hopper while transfers keep vanilla's exact 8-tick
+// cadence and push-then-pull order.
+
+/// Vanilla `HopperBlockEntity.setCooldown(8)`: one item per eight ticks.
+#[cfg_attr(not(test), allow(dead_code))]
+const HOPPER_TRANSFER_COOLDOWN: i64 = 8;
+
+/// Vanilla hopper inventory size.
+#[cfg_attr(not(test), allow(dead_code))]
+const HOPPER_INVENTORY_SIZE: usize = 5;
+
+/// The `facing` block-state direction a hopper pushes toward — the same 0..4
+/// encoding `hopper_tick` reads out of block states 9225..=9229. A hopper
+/// never points up.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HopperFacing {
+    Down,
+    North,
+    South,
+    West,
+    East,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl HopperFacing {
+    /// Unit vector from the hopper toward its push target.
+    fn offset(self) -> (i32, i32, i32) {
+        match self {
+            Self::Down => (0, -1, 0),
+            Self::North => (0, 0, -1),
+            Self::South => (0, 0, 1),
+            Self::West => (-1, 0, 0),
+            Self::East => (1, 0, 0),
+        }
+    }
+}
+
+/// Monotonic per-position mutation counters — the whole "has anything changed?"
+/// question a sleeping hopper asks. Every slot write to a container, every
+/// container removal, and every dropped item that lands in a hopper's suction
+/// cell bumps one counter; a sleeping hopper re-reads its four watched counters
+/// (never the slots behind them) to learn whether a rescan can change anything.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Default)]
+struct ContainerRevisionTracker {
+    /// `(dim, x, y, z) -> u64` for block-entity inventories, including the
+    /// hoppers' own five slots.
+    containers: HashMap<DimBlockPos, u64>,
+    /// `(dim, x, y, z) -> u64` keyed by the *hopper's* position — the cell an
+    /// item entity enters is the block space above that hopper, but keying the
+    /// cell by the hopper keeps it distinct from the container that may also
+    /// sit there.
+    suction: HashMap<DimBlockPos, u64>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ContainerRevisionTracker {
+    fn revision(&self, pos: DimBlockPos) -> u64 {
+        self.containers.get(&pos).copied().unwrap_or(0)
+    }
+
+    fn bump(&mut self, pos: DimBlockPos) -> u64 {
+        let entry = self.containers.entry(pos).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    fn suction_revision(&self, hopper: DimBlockPos) -> u64 {
+        self.suction.get(&hopper).copied().unwrap_or(0)
+    }
+
+    fn bump_suction(&mut self, hopper: DimBlockPos) -> u64 {
+        let entry = self.suction.entry(hopper).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+}
+
+/// One tracked hopper. The four `seen_*` fields are the revisions observed
+/// when the last empty-handed attempt put the hopper to sleep; while all four
+/// still match the tracker, a rescan is guaranteed to find exactly what the
+/// last scan found — nothing — so it is skipped outright.
+#[cfg_attr(not(test), allow(dead_code))]
+struct SleepingHopper {
+    pos: DimBlockPos,
+    facing: HopperFacing,
+    redstone_locked: bool,
+    /// Vanilla `cooldownTime`: decremented every tick, attempts run at <= 0,
+    /// reset to [`HOPPER_TRANSFER_COOLDOWN`] on a successful transfer.
+    cooldown_ticks: i64,
+    sleeping: bool,
+    seen_self_rev: u64,
+    seen_above_rev: u64,
+    seen_target_rev: u64,
+    seen_suction_rev: u64,
+    /// The hopper's own five vanilla inventory slots.
+    slots: Vec<Option<Stack>>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl SleepingHopper {
+    fn new(pos: DimBlockPos, facing: HopperFacing) -> Self {
+        Self {
+            pos,
+            facing,
+            redstone_locked: false,
+            cooldown_ticks: 0,
+            sleeping: false,
+            seen_self_rev: 0,
+            seen_above_rev: 0,
+            seen_target_rev: 0,
+            seen_suction_rev: 0,
+            slots: vec![None; HOPPER_INVENTORY_SIZE],
+        }
+    }
+
+    fn above(pos: DimBlockPos) -> DimBlockPos {
+        (pos.0, pos.1, pos.2 + 1, pos.3)
+    }
+
+    fn target(pos: DimBlockPos, facing: HopperFacing) -> DimBlockPos {
+        let (dx, dy, dz) = facing.offset();
+        (pos.0, pos.1 + dx, pos.2 + dy, pos.3 + dz)
+    }
+}
+
+/// Per-tick accounting proving the sleep is real: how many hoppers ran the
+/// scan path, how many were skipped while asleep, and how many items moved.
+/// `slot_reads` counts individual slot inspections — a fully settled array
+/// reports zero.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HopperTickStats {
+    active_scanned: u64,
+    sleeping_skipped: u64,
+    items_transferred: u64,
+    slot_reads: u64,
+}
+
+/// The scheduler. It owns a world image of the inventories it can touch —
+/// hopper slots live on their [`SleepingHopper`], other block containers in
+/// `containers`, and item entities waiting in suction cells in `suction` — so
+/// every mutation funnels through a revision bump and the sleep invariant is
+/// enforced by construction rather than by caller discipline.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Default)]
+struct SleepingHopperEngine {
+    revisions: ContainerRevisionTracker,
+    hoppers: BTreeMap<DimBlockPos, SleepingHopper>,
+    containers: HashMap<DimBlockPos, Vec<Option<Stack>>>,
+    /// Item entities resting in each hopper's suction cell, keyed by hopper pos.
+    suction: HashMap<DimBlockPos, Vec<Stack>>,
+    /// Slot inspections performed inside transfer attempts — the counter the
+    /// "0 slot scans while asleep" claim reads.
+    slot_reads: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl SleepingHopperEngine {
+    /// Place a hopper. It starts awake at cooldown 0: the world around it may
+    /// already hold items, which is exactly what the first tick must look at.
+    fn place_hopper(&mut self, pos: DimBlockPos, facing: HopperFacing) {
+        self.hoppers.insert(pos, SleepingHopper::new(pos, facing));
+        // The block now holds a (possibly empty) inventory — neighbours that
+        // were sleeping on the old state of this cell get to re-observe it.
+        self.notify_container_changed(pos);
+    }
+
+    fn remove_hopper(&mut self, pos: DimBlockPos) -> bool {
+        self.suction.remove(&pos);
+        let removed = self.hoppers.remove(&pos).is_some();
+        if removed {
+            // The block changed for neighbours: a hopper above may have been
+            // pushing into it, one below pulling from it.
+            self.notify_container_changed(pos);
+        }
+        removed
+    }
+
+    fn hopper(&self, pos: DimBlockPos) -> Option<&SleepingHopper> {
+        self.hoppers.get(&pos)
+    }
+
+    /// Install or replace a non-hopper container's slot array. Replacement is
+    /// a mutation: watchers re-observe through the bumped revision.
+    fn set_container(&mut self, pos: DimBlockPos, slots: Vec<Option<Stack>>) {
+        self.containers.insert(pos, slots);
+        self.notify_container_changed(pos);
+    }
+
+    fn remove_container(&mut self, pos: DimBlockPos) -> bool {
+        if self.containers.remove(&pos).is_some() {
+            self.notify_container_changed(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Write one inventory slot — container or hopper; `mutate_slots`
+    /// resolves the store. This is the world's mutation point — every write
+    /// bumps the revision, which is what makes sleeping safe.
+    fn set_slot(&mut self, pos: DimBlockPos, index: usize, stack: Option<Stack>) -> bool {
+        self.mutate_slots(pos, |slots| {
+            let Some(slot) = slots.get_mut(index) else {
+                return (false, false);
+            };
+            *slot = stack;
+            (true, true)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Slots at `pos`, whichever store owns them: a hopper's own inventory
+    /// first, then the container map (hoppers are containers to other hoppers,
+    /// which is what makes a chain of hoppers work at all).
+    fn slots_of(&self, pos: DimBlockPos) -> Option<&[Option<Stack>]> {
+        if let Some(hopper) = self.hoppers.get(&pos) {
+            Some(&hopper.slots)
+        } else {
+            self.containers.get(&pos).map(Vec::as_slice)
+        }
+    }
+
+    /// Read one slot, counting the read — `slot_reads` is the number that
+    /// must stay at zero while an array sleeps.
+    fn read_slot(&mut self, pos: DimBlockPos, index: usize) -> Option<&Stack> {
+        self.slot_reads += 1;
+        self.slots_of(pos).and_then(|slots| slots.get(index)).and_then(Option::as_ref)
+    }
+
+    /// `notify_container_changed`: any mutation of the block-entity inventory
+    /// at `pos` — slot writes, removal, or a hopper pushing into it. Bumps the
+    /// revision and wakes only the sleeping hoppers actually watching `pos`:
+    /// the hopper at `pos` itself, the hopper below it (`above == pos`), and
+    /// the hoppers facing it (`target == pos`).
+    fn notify_container_changed(&mut self, pos: DimBlockPos) {
+        self.revisions.bump(pos);
+        // Candidate hopper positions: self, below (pulls from `pos`), and one
+        // per facing that could target `pos`. Verified against the hopper's
+        // real watched set so no unaffected hopper wakes.
+        let (_, x, y, z) = pos;
+        let candidates = [
+            pos,
+            (pos.0, x, y - 1, z),
+            (pos.0, x, y + 1, z),
+            (pos.0, x, y, z - 1),
+            (pos.0, x, y, z + 1),
+            (pos.0, x - 1, y, z),
+            (pos.0, x + 1, y, z),
+        ];
+        for candidate in candidates {
+            let Some(hopper) = self.hoppers.get_mut(&candidate) else {
+                continue;
+            };
+            if hopper.sleeping
+                && (hopper.pos == pos
+                    || SleepingHopper::above(hopper.pos) == pos
+                    || SleepingHopper::target(hopper.pos, hopper.facing) == pos)
+            {
+                hopper.sleeping = false;
+            }
+        }
+    }
+
+    /// `notify_item_entered_cell`: a dropped item landed in `hopper_pos`'s
+    /// suction cell (the block space above it). The stack joins the pending
+    /// list and the hopper wakes to suck it on its next attempt.
+    fn notify_item_entered_cell(&mut self, hopper_pos: DimBlockPos, stack: Stack) {
+        self.revisions.bump_suction(hopper_pos);
+        self.suction.entry(hopper_pos).or_default().push(stack);
+        if let Some(hopper) = self.hoppers.get_mut(&hopper_pos) {
+            hopper.sleeping = false;
+        }
+    }
+
+    /// `set_redstone_locked`: power applied/removed. Unlocking wakes the
+    /// hopper — vanilla's `ENABLED` gate is re-checked every tick, so an
+    /// unpowered-then-powered hopper resumes on the same cadence a vanilla
+    /// hopper would.
+    fn set_redstone_locked(&mut self, pos: DimBlockPos, locked: bool) {
+        if let Some(hopper) = self.hoppers.get_mut(&pos) {
+            hopper.redstone_locked = locked;
+            if !locked {
+                hopper.sleeping = false;
+            }
+        }
+    }
+
+    /// The watched revisions all still match — a rescan would repeat the last
+    /// (empty) attempt, so the hopper may stay asleep.
+    fn watched_revisions_unchanged(&self, hopper: &SleepingHopper) -> bool {
+        self.revisions.revision(hopper.pos) == hopper.seen_self_rev
+            && self.revisions.revision(SleepingHopper::above(hopper.pos))
+                == hopper.seen_above_rev
+            && self.revisions
+                .revision(SleepingHopper::target(hopper.pos, hopper.facing))
+                == hopper.seen_target_rev
+            && self.revisions.suction_revision(hopper.pos) == hopper.seen_suction_rev
+    }
+
+    /// Record the current watched revisions and enter sleep.
+    fn sleep(&mut self, pos: DimBlockPos) {
+        let Some(hopper) = self.hoppers.get_mut(&pos) else {
+            return;
+        };
+        hopper.seen_self_rev = self.revisions.revision(pos);
+        hopper.seen_above_rev = self
+            .revisions
+            .revision(SleepingHopper::above(pos));
+        hopper.seen_target_rev = self
+            .revisions
+            .revision(SleepingHopper::target(pos, hopper.facing));
+        hopper.seen_suction_rev = self.revisions.suction_revision(pos);
+        hopper.sleeping = true;
+    }
+
+    /// One item of `stack` into `slots`: merge onto a same-item partial first
+    /// (vanilla `addItem` order), else the first empty slot.
+    fn insert_one(slots: &mut [Option<Stack>], item: i64, comps: &Comps, max: u8) -> bool {
+        if let Some(slot) = slots.iter_mut().find(|slot| {
+            matches!(slot, Some((it, count, c)) if *it == item && *c == *comps && *count < max)
+        }) {
+            if let Some(stack) = slot {
+                stack.1 += 1;
+            }
+            return true;
+        }
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some((item, 1, comps.clone()));
+            return true;
+        }
+        false
+    }
+
+    /// Slots at `pos` as mutable, plus the bookkeeping a real change owes:
+    /// `f` reports `(result, changed)` and the revision only bumps — waking
+    /// watchers — when something actually moved. A probe that finds no room is
+    /// not a mutation and must not churn the counters hoppers sleep on.
+    fn mutate_slots<R>(
+        &mut self,
+        pos: DimBlockPos,
+        f: impl FnOnce(&mut Vec<Option<Stack>>) -> (R, bool),
+    ) -> Option<R> {
+        if let Some(hopper) = self.hoppers.get_mut(&pos) {
+            let (out, changed) = f(&mut hopper.slots);
+            if changed {
+                self.notify_container_changed(pos);
+            }
+            return Some(out);
+        }
+        if let Some(slots) = self.containers.get_mut(&pos) {
+            let (out, changed) = f(slots);
+            if changed {
+                self.notify_container_changed(pos);
+            }
+            return Some(out);
+        }
+        None
+    }
+
+    /// Remove one item from slot `index` at `pos` — a prior read found it
+    /// non-empty, so the decrement always lands.
+    fn take_one(&mut self, pos: DimBlockPos, index: usize) {
+        self.mutate_slots(pos, |slots| {
+            if let Some(stack) = slots.get_mut(index).and_then(Option::as_mut) {
+                stack.1 -= 1;
+                if stack.1 == 0 {
+                    slots[index] = None;
+                }
+            }
+            ((), true)
+        });
+    }
+
+    /// Push: the first non-empty own slot loses one item into the facing
+    /// container. Vanilla `ejectItems` — runs before any pull.
+    fn attempt_push(&mut self, pos: DimBlockPos, target: DimBlockPos) -> bool {
+        if self.slots_of(target).is_none() {
+            return false;
+        }
+        let own_len = self.hoppers.get(&pos).map(|h| h.slots.len()).unwrap_or(0);
+        for index in 0..own_len {
+            let Some((item, _, comps)) = self.read_slot(pos, index).cloned() else {
+                continue;
+            };
+            let max = item_stack_max(item, &comps).clamp(1, 255) as u8;
+            let pushed = self
+                .mutate_slots(target, |slots| {
+                    let inserted = Self::insert_one(slots, item, &comps, max);
+                    (inserted, inserted)
+                })
+                .unwrap_or(false);
+            if pushed {
+                self.take_one(pos, index);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Pull: one item from the first extractable slot of the container above
+    /// into the hopper's own inventory. Vanilla `suckInItems`' container half:
+    /// source slots are tried in order until one can be placed.
+    fn attempt_pull(&mut self, pos: DimBlockPos, above: DimBlockPos) -> bool {
+        let Some(above_len) = self.slots_of(above).map(<[_]>::len) else {
+            return false;
+        };
+        let own_len = self.hoppers.get(&pos).map(|h| h.slots.len()).unwrap_or(0);
+        for index in 0..above_len {
+            let Some((item, _, comps)) = self.read_slot(above, index).cloned() else {
+                continue;
+            };
+            let max = item_stack_max(item, &comps).clamp(1, 255) as u8;
+            let mut room = false;
+            for own_index in 0..own_len {
+                match self.read_slot(pos, own_index) {
+                    None => {
+                        room = true;
+                        break;
+                    }
+                    Some((it, count, c)) if *it == item && *c == comps && *count < max => {
+                        room = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if !room {
+                continue;
+            }
+            // Room was just verified, so the insert cannot fail — take first,
+            // then place, and a bug that breaks that pairing debug-asserts.
+            self.take_one(above, index);
+            let inserted = self
+                .mutate_slots(pos, |slots| {
+                    let inserted = Self::insert_one(slots, item, &comps, max);
+                    (inserted, inserted)
+                })
+                .unwrap_or(false);
+            debug_assert!(inserted, "pull destination lost room between probe and insert");
+            return true;
+        }
+        false
+    }
+
+    /// Suck: pending item entities in the cell are inserted into the hopper's
+    /// inventory, as much of the stack as fits, like vanilla
+    /// `addItem(Hopper, ItemEntity)` — entities are tried in order until one
+    /// fits, one entity per activation.
+    fn attempt_suck(&mut self, pos: DimBlockPos) -> u64 {
+        let pending = self.suction.get(&pos).map(|items| items.len()).unwrap_or(0);
+        for index in 0..pending {
+            let Some((item, mut count, comps)) = self
+                .suction
+                .get(&pos)
+                .and_then(|items| items.get(index))
+                .cloned()
+            else {
+                continue;
+            };
+            let max = item_stack_max(item, &comps).clamp(1, 255) as u8;
+            let moved = self
+                .mutate_slots(pos, |slots| {
+                    let mut moved = 0u64;
+                    while count > 0 && Self::insert_one(slots, item, &comps, max) {
+                        count -= 1;
+                        moved += 1;
+                    }
+                    (moved, moved > 0)
+                })
+                .unwrap_or(0);
+            if moved == 0 {
+                continue;
+            }
+            self.revisions.bump_suction(pos);
+            let items = self.suction.get_mut(&pos).unwrap();
+            if count == 0 {
+                items.remove(index);
+            } else {
+                items[index].1 = count;
+            }
+            if items.is_empty() {
+                self.suction.remove(&pos);
+            }
+            return moved;
+        }
+        0
+    }
+
+    /// Vanilla `tryMoveItems`: `ejectItems | supplier` is an *eager* OR — a
+    /// hopper with a buffered item and a non-empty source does both in one
+    /// activation (the push first). The supplier half is `suckInItems`: pull
+    /// from the container above, else item entities in the cell.
+    fn attempt_transfers(&mut self, pos: DimBlockPos, facing: HopperFacing) -> u64 {
+        let target = SleepingHopper::target(pos, facing);
+        let above = SleepingHopper::above(pos);
+        let mut moved = u64::from(self.attempt_push(pos, target));
+        if self.attempt_pull(pos, above) {
+            moved += 1;
+        } else {
+            moved += self.attempt_suck(pos);
+        }
+        moved
+    }
+
+    /// One game tick over every tracked hopper. Sleeping hoppers whose four
+    /// watched revisions still match cost four map lookups and nothing else —
+    /// no slot reads, no scans.
+    fn tick(&mut self) -> HopperTickStats {
+        let mut stats = HopperTickStats::default();
+        self.slot_reads = 0;
+        // BTreeMap order keeps activations deterministic; positions are copied
+        // out because transfers mutate neighbour hoppers mid-sweep.
+        let positions: Vec<DimBlockPos> = self.hoppers.keys().copied().collect();
+        for pos in positions {
+            let Some(hopper) = self.hoppers.get(&pos) else {
+                continue; // removed by an earlier activation this tick
+            };
+            let (facing, locked, sleeping) =
+                (hopper.facing, hopper.redstone_locked, hopper.sleeping);
+            if sleeping {
+                if self.watched_revisions_unchanged(hopper) {
+                    stats.sleeping_skipped += 1;
+                    continue;
+                }
+                if let Some(hopper) = self.hoppers.get_mut(&pos) {
+                    hopper.sleeping = false;
+                }
+            }
+            // vanilla: `--cooldownTime` every tick, attempt when <= 0; locked
+            // hoppers still run the countdown but never attempt.
+            let cooldown = self
+                .hoppers
+                .get_mut(&pos)
+                .map(|hopper| {
+                    hopper.cooldown_ticks -= 1;
+                    hopper.cooldown_ticks
+                })
+                .unwrap_or(0);
+            if locked || cooldown > 0 {
+                continue;
+            }
+            stats.active_scanned += 1;
+            let moved = self.attempt_transfers(pos, facing);
+            if moved > 0 {
+                stats.items_transferred += u64::from(moved);
+                if let Some(hopper) = self.hoppers.get_mut(&pos) {
+                    hopper.cooldown_ticks = HOPPER_TRANSFER_COOLDOWN;
+                }
+            } else {
+                self.sleep(pos);
+            }
+        }
+        stats.slot_reads = self.slot_reads;
+        stats
+    }
+}
+
+#[cfg(test)]
+mod perf1_sleeping_hopper_tests {
+    use super::*;
+
+    const DIM: DimId = DimId::Overworld;
+    const IRON: i64 = 811; // minecraft:iron_ingot in the item table
+
+    fn stack(count: u8) -> Stack {
+        (IRON, count, Vec::new())
+    }
+
+    fn pos(x: i32, y: i32, z: i32) -> DimBlockPos {
+        (DIM, x, y, z)
+    }
+
+    /// A classic sorting-system row: `n` hoppers at y=64, each fed by an input
+    /// chest directly above and pushing Down into its own output chest below.
+    /// No hopper feeds another hopper, so wakes are attributable one-to-one.
+    fn sorting_array(n: i32) -> SleepingHopperEngine {
+        let mut engine = SleepingHopperEngine::default();
+        for x in 0..n {
+            engine.place_hopper(pos(x, 64, 0), HopperFacing::Down);
+            engine.set_container(pos(x, 65, 0), vec![None; 27]);
+            engine.set_container(pos(x, 63, 0), vec![None; 27]);
+        }
+        engine
+    }
+
+    fn settle(engine: &mut SleepingHopperEngine, ticks: usize) {
+        for _ in 0..ticks {
+            engine.tick();
+        }
+    }
+
+    fn container_item_count(engine: &SleepingHopperEngine, at: DimBlockPos) -> u64 {
+        engine
+            .slots_of(at)
+            .map(|slots| {
+                slots
+                    .iter()
+                    .flatten()
+                    .map(|(_, count, _)| u64::from(*count))
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn perf1_idle_1000_hopper_sorting_array_sleeps_with_zero_slot_reads() {
+        let mut engine = sorting_array(1000);
+        settle(&mut engine, 3);
+
+        let stats = engine.tick();
+        assert_eq!(
+            stats.active_scanned, 0,
+            "a settled array must run no scans at all"
+        );
+        assert_eq!(stats.sleeping_skipped, 1000);
+        assert_eq!(stats.items_transferred, 0);
+        assert_eq!(stats.slot_reads, 0, "sleeping means literally 0 slot scans");
+
+        // Stays settled: one hundred more ticks, still zero work.
+        for _ in 0..100 {
+            let stats = engine.tick();
+            assert_eq!(stats.active_scanned, 0);
+            assert_eq!(stats.sleeping_skipped, 1000);
+            assert_eq!(stats.slot_reads, 0);
+        }
+    }
+
+    #[test]
+    fn perf1_chest_insert_wakes_only_the_adjacent_hopper() {
+        let mut engine = sorting_array(1000);
+        settle(&mut engine, 3);
+        assert_eq!(engine.tick().sleeping_skipped, 1000);
+
+        // One item lands in input chest #42.
+        assert!(engine.set_slot(pos(42, 65, 0), 0, Some(stack(3))));
+        let stats = engine.tick();
+        assert_eq!(
+            stats.active_scanned, 1,
+            "only hopper #42 may wake — the other 999 stay asleep"
+        );
+        assert_eq!(stats.sleeping_skipped, 999);
+        assert_eq!(stats.items_transferred, 1, "the wake tick pulls one item");
+
+        // The pull went chest -> hopper inventory.
+        assert_eq!(container_item_count(&engine, pos(42, 65, 0)), 2);
+        assert_eq!(container_item_count(&engine, pos(42, 64, 0)), 1);
+        assert_eq!(container_item_count(&engine, pos(42, 63, 0)), 0);
+
+        // Vanilla moves at the exact 8-tick cadence, and each activation does
+        // the *eager* push+pull pair once the buffer is primed: t8 pushes the
+        // pulled item down AND pulls item two (2 items), t16 the same (2),
+        // t24 pushes the last item (1).
+        for _ in 0..7 {
+            assert_eq!(engine.tick().items_transferred, 0, "cooldown must hold");
+        }
+        assert_eq!(engine.tick().items_transferred, 2);
+        assert_eq!(container_item_count(&engine, pos(42, 63, 0)), 1);
+        assert_eq!(container_item_count(&engine, pos(42, 64, 0)), 1);
+        for _ in 0..7 {
+            assert_eq!(engine.tick().items_transferred, 0);
+        }
+        assert_eq!(engine.tick().items_transferred, 2);
+        for _ in 0..7 {
+            assert_eq!(engine.tick().items_transferred, 0);
+        }
+        assert_eq!(engine.tick().items_transferred, 1);
+        assert_eq!(container_item_count(&engine, pos(42, 65, 0)), 0);
+        assert_eq!(container_item_count(&engine, pos(42, 63, 0)), 3);
+        assert_eq!(container_item_count(&engine, pos(42, 64, 0)), 0);
+
+        // Drained: the last push put hopper 42 on cooldown — after those 8
+        // ticks its empty-handed scan fails and the whole array re-sleeps.
+        settle(&mut engine, 12);
+        let stats = engine.tick();
+        assert_eq!(stats.active_scanned, 0);
+        assert_eq!(stats.sleeping_skipped, 1000);
+        assert_eq!(stats.slot_reads, 0);
+    }
+
+    #[test]
+    fn perf1_hopper_chain_matches_vanilla_8_tick_order_exactly() {
+        // chest -> hopper -> chest: three items must move one per activation,
+        // push first then pull, at the vanilla 8-tick cooldown.
+        let mut engine = SleepingHopperEngine::default();
+        let chest = pos(0, 66, 0);
+        let hopper = pos(0, 65, 0);
+        let output = pos(0, 64, 0);
+        engine.place_hopper(hopper, HopperFacing::Down);
+        engine.set_container(chest, vec![Some(stack(3)), None]);
+        engine.set_container(output, vec![None; 27]);
+
+        // Push order: seed the hopper's own slot — vanilla ejects that first
+        // even with a full source above it.
+        engine
+            .hoppers
+            .get_mut(&hopper)
+            .unwrap()
+            .slots[0] = Some(stack(1));
+
+        let mut pull_ticks = Vec::new();
+        let mut push_ticks = Vec::new();
+        for tick in 0..40 {
+            let before_above = container_item_count(&engine, chest);
+            let before_out = container_item_count(&engine, output);
+            engine.tick();
+            if container_item_count(&engine, chest) < before_above {
+                pull_ticks.push(tick);
+            }
+            if container_item_count(&engine, output) > before_out {
+                push_ticks.push(tick);
+            }
+        }
+        // Activation ticks: t0 pushes the seeded own item AND pulls item one
+        // (the eager pair); t8 pushes item one and pulls item two; t16 pushes
+        // two and pulls three; t24 pushes three and the chest is drained.
+        assert_eq!(pull_ticks, vec![0, 8, 16], "pull cadence");
+        assert_eq!(push_ticks, vec![0, 8, 16, 24], "push cadence");
+        assert_eq!(container_item_count(&engine, chest), 0);
+        assert_eq!(container_item_count(&engine, output), 4);
+        assert_eq!(container_item_count(&engine, hopper), 0);
+    }
+
+    #[test]
+    fn perf1_redstone_locked_hopper_holds_items_and_unlock_resumes() {
+        let mut engine = SleepingHopperEngine::default();
+        let chest = pos(0, 66, 0);
+        let hopper = pos(0, 65, 0);
+        let output = pos(0, 64, 0);
+        engine.place_hopper(hopper, HopperFacing::Down);
+        engine.set_container(chest, vec![Some(stack(2)), None]);
+        engine.set_container(output, vec![None; 27]);
+
+        engine.set_redstone_locked(hopper, true);
+        for _ in 0..20 {
+            let stats = engine.tick();
+            assert_eq!(stats.items_transferred, 0, "a powered hopper holds items");
+        }
+        assert_eq!(container_item_count(&engine, chest), 2);
+
+        engine.set_redstone_locked(hopper, false);
+        let stats = engine.tick();
+        assert_eq!(stats.items_transferred, 1, "unlock resumes on the next tick");
+    }
+
+    #[test]
+    fn perf1_dropped_item_in_suction_cell_wakes_sleeping_hopper() {
+        let mut engine = SleepingHopperEngine::default();
+        let hopper = pos(0, 65, 0);
+        let output = pos(0, 64, 0);
+        engine.place_hopper(hopper, HopperFacing::Down);
+        engine.set_container(output, vec![None; 27]);
+        settle(&mut engine, 2);
+        assert_eq!(engine.tick().sleeping_skipped, 1);
+        assert!(engine.hopper(hopper).unwrap().sleeping);
+
+        // A drop lands on the hopper: only that hopper wakes, and the entity
+        // is sucked into its inventory on the wake tick.
+        engine.notify_item_entered_cell(hopper, stack(5));
+        assert!(!engine.hopper(hopper).unwrap().sleeping);
+        let stats = engine.tick();
+        assert_eq!(stats.items_transferred, 5, "the whole entity stack is sucked");
+        assert_eq!(container_item_count(&engine, hopper), 5);
+
+        // It flows out on the normal 8-tick cadence.
+        for _ in 0..7 {
+            assert_eq!(engine.tick().items_transferred, 0);
+        }
+        assert_eq!(engine.tick().items_transferred, 1);
+    }
+
+    #[test]
+    fn perf1_sleeping_hopper_wakes_when_a_watched_container_is_removed() {
+        let mut engine = sorting_array(4);
+        settle(&mut engine, 2);
+        assert_eq!(engine.tick().sleeping_skipped, 4);
+
+        // Breaking the input chest above hopper 1 must wake it — vanilla would
+        // re-scan and find the source gone.
+        assert!(engine.remove_container(pos(1, 65, 0)));
+        let stats = engine.tick();
+        assert_eq!(stats.active_scanned, 1, "only hopper 1 re-scans");
+        assert_eq!(stats.items_transferred, 0);
+        // ... and having found nothing, it goes back to sleep.
+        assert_eq!(engine.tick().sleeping_skipped, 4);
+    }
+}
+
+#[cfg(test)]
+mod perf1_sleeping_hopper_facing_tests {
+    use super::*;
+
+    const DIM: DimId = DimId::Overworld;
+    const IRON: i64 = 811;
+
+    fn pos(x: i32, y: i32, z: i32) -> DimBlockPos {
+        (DIM, x, y, z)
+    }
+
+    #[test]
+    fn perf1_every_facing_pushes_to_its_vanilla_target() {
+        // One hopper per facing, each seeded with one item and a chest on the
+        // matching side — the offset table is the wire facing order.
+        let mut engine = SleepingHopperEngine::default();
+        let cases = [
+            (HopperFacing::Down, (0, -1, 0)),
+            (HopperFacing::North, (0, 0, -1)),
+            (HopperFacing::South, (0, 0, 1)),
+            (HopperFacing::West, (-1, 0, 0)),
+            (HopperFacing::East, (1, 0, 0)),
+        ];
+        for (i, (facing, (dx, dy, dz))) in cases.iter().enumerate() {
+            let at = pos(i as i32 * 4, 64, 0);
+            engine.place_hopper(at, *facing);
+            let target = pos(at.1 + dx, at.2 + dy, at.3 + dz);
+            engine.set_container(target, vec![None; 27]);
+            engine.hoppers.get_mut(&at).unwrap().slots[0] = Some((IRON, 1, Vec::new()));
+            engine.notify_container_changed(at);
+        }
+        engine.tick();
+        for (i, (_, (dx, dy, dz))) in cases.iter().enumerate() {
+            let at = pos(i as i32 * 4, 64, 0);
+            let target = pos(at.1 + dx, at.2 + dy, at.3 + dz);
+            let moved: u64 = engine
+                .slots_of(target)
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|(_, c, _)| u64::from(*c))
+                .sum();
+            assert_eq!(moved, 1, "hopper at {at:?} pushed the wrong way");
+        }
+    }
+
+    #[test]
+    fn perf1_removing_a_hopper_wakes_the_hopper_pulling_from_it() {
+        // Hopper B pulls from hopper A above it; A is then broken. Vanilla B
+        // re-scans and finds the source gone — sleeping B must do the same.
+        let mut engine = SleepingHopperEngine::default();
+        let a = pos(0, 66, 0);
+        let b = pos(0, 65, 0);
+        let out = pos(0, 64, 0);
+        engine.place_hopper(a, HopperFacing::Down);
+        engine.place_hopper(b, HopperFacing::Down);
+        engine.set_container(out, vec![None; 27]);
+        // A pushes nowhere (no container below it other than B's inventory —
+        // which it will fill): let the pair settle into sleep with A empty.
+        for _ in 0..3 {
+            engine.tick();
+        }
+        assert_eq!(engine.tick().sleeping_skipped, 2);
+
+        assert!(engine.remove_hopper(a));
+        let stats = engine.tick();
+        assert_eq!(stats.active_scanned, 1, "only B re-scans when A vanishes");
+        assert_eq!(engine.tick().sleeping_skipped, 1, "B settles again");
+        assert!(!engine.remove_hopper(a), "second removal is a no-op");
+    }
+}
