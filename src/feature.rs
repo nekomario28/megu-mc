@@ -10425,7 +10425,7 @@ fn wave_levels(pending: &[(i32, i32)], spacing: i32) -> Vec<usize> {
 /// ticks and direct marks it filed on its scratch `Gen`. The owner replays them in `pending`
 /// order at the wave commit.
 struct PopulateWorkerResult {
-    wr: HashMap<(i32, i32, i32), u32>,
+    wr: crate::generation_context::FlatChunkWriteMap,
     shape_marks: Vec<(i32, i32, i32)>,
     direct_marks: Vec<((i32, i32), Vec<(i32, i32, i32)>)>,
     payloads: crate::generation_context::StagedPayloads,
@@ -10455,7 +10455,7 @@ fn populate_worker(
     POPULATE_WORKERS.fetch_add(1, Ordering::Relaxed);
 
     let empty = || PopulateWorkerResult {
-        wr: HashMap::new(),
+        wr: crate::generation_context::FlatChunkWriteMap::new(),
         shape_marks: Vec::new(),
         direct_marks: Vec::new(),
         payloads: Vec::new(),

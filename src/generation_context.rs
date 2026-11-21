@@ -5,6 +5,7 @@
 
 use crate::block_registry::{breg, BReg, HeightmapKind};
 use crate::worldgen::Gen;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[allow(unused_imports)]
@@ -62,6 +63,396 @@ pub(crate) struct PromoLight {
     block: HashMap<(i32, i32, i32), u8>,
 }
 
+// ---------- flat chunk-window write buffer ----------
+
+/// The marker a dense section cell carries before its first write. No real
+/// block state is `u32::MAX`; a write that literally arrives with it is routed
+/// to the overflow so the sentinel keeps a single meaning.
+const WR_EMPTY: u32 = u32::MAX;
+/// Dense `y` band: 24 16-block sections covering `[-64, 320)`, the union of the
+/// 1.21.1 generators' build windows. Writes above or below it land in the
+/// overflow, which is what keeps tall custom dimensions equivalent.
+const WR_MIN_Y: i32 = -64;
+const WR_Y_SECTIONS: usize = 24;
+/// 3x3 chunks times the `y` sections: the full dense index space.
+const WR_SECTIONS: usize = 9 * WR_Y_SECTIONS;
+
+/// The block-state write buffer behind [`FC::wr`].
+///
+/// Feature population writes almost every cell inside the 3x3 chunk window
+/// `feature_write_allowed` enforces (the `pop_active` chunk plus its eight
+/// neighbours), and `y` stays inside a few dozen 16-block sections. A
+/// `HashMap` pays a SipHash plus a probe for each of the ~60k writes a
+/// 9-chunk pass makes; this map resolves an in-window `(x, y, z)` to one flat
+/// array index instead: 9 chunks x 24 sections of 4096 cells, each section a
+/// boxed array allocated only once a write touches it, so untouched `y`
+/// bands cost eight bytes and hot ore/cave/tree sections do O(1) indexed
+/// reads and writes with zero hashing.
+///
+/// Coordinates outside the window, outside `[-64, 320)` on `y`, or any write
+/// before the window anchored fall back to `overflow`, so every key a
+/// `HashMap` would hold is held here with the same observable behaviour:
+/// `get`, `contains_key`, `len`, `iter` and `PartialEq` agree on the key
+/// *set*, which is all any consumer may rely on - the previous map's
+/// iteration order was hasher-random per process, so no reader can depend on
+/// order, only on membership.
+///
+/// `order` stores every live key once, in first-write order. Iteration must
+/// hand out `(&key, &value)` pairs (callers pattern-match `(&pos, &st)`) and
+/// the dense cells store no keys, so the vector is the key store; the value
+/// half is still one indexed read. `touched` records which sections were
+/// allocated so `clear` and sweeps visit only those.
+///
+/// `view` is a lazily materialised `HashMap` kept for the callers that pass
+/// `&wr` to helpers typed `&HashMap` (the test digests) or coerce `&mut wr`
+/// through `DerefMut`. Once materialised it becomes the authoritative store -
+/// `view.get().is_some()` means `view` holds every entry - so all operations
+/// delegate to it until `clear`/consumption. Materialisation is O(n) and only
+/// ever happens on the compatibility paths; the hot write path never builds
+/// it.
+#[derive(Clone)]
+pub(crate) struct FlatChunkWriteMap {
+    /// Chunk coords of the 3x3 window centre: `pop_active` when the pass is
+    /// running, otherwise the first write's chunk. `None` routes everything
+    /// to the overflow.
+    anchor: Option<(i32, i32)>,
+    /// `sections[chunk * WR_Y_SECTIONS + section_y]`; a touched section is a
+    /// 4096-cell array with `WR_EMPTY` meaning "no write".
+    sections: [Option<Box<[u32; 4096]>>; WR_SECTIONS],
+    /// Section indices allocated so far, so `clear` visits only real work.
+    touched: Vec<u16>,
+    /// Every live key exactly once, in first-write order: the `&key` store
+    /// `iter`/`keys`/`into_iter` draw from.
+    order: Vec<(i32, i32, i32)>,
+    /// Keys the window cannot hold (out-of-window, out-of-`y`, sentinel
+    /// writes). A key lives in exactly one of the two stores.
+    overflow: HashMap<(i32, i32, i32), u32>,
+    /// Live key count across both stores (only authoritative while `view` is
+    /// absent).
+    len: usize,
+    /// Materialised compatibility view; when present it is the map.
+    view: OnceCell<HashMap<(i32, i32, i32), u32>>,
+}
+
+/// The dense slot of a coordinate: `(section_index, cell_index)`, or `None`
+/// when the coordinate does not fit the anchored 3x3 x 24-section window.
+impl FlatChunkWriteMap {
+    #[inline]
+    fn slot(&self, x: i32, y: i32, z: i32) -> Option<(usize, usize)> {
+        let (ax, az) = self.anchor?;
+        if y < WR_MIN_Y || y >= WR_MIN_Y + 16 * WR_Y_SECTIONS as i32 {
+            return None;
+        }
+        let (dx, dz) = ((x >> 4) - ax, (z >> 4) - az);
+        if !(-1..=1).contains(&dx) || !(-1..=1).contains(&dz) {
+            return None;
+        }
+        let chunk = (dx + 1) as usize + (dz + 1) as usize * 3;
+        let section = chunk * WR_Y_SECTIONS + ((y - WR_MIN_Y) >> 4) as usize;
+        let cell = (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | (x & 15) as usize;
+        Some((section, cell))
+    }
+
+    /// The dense key as `(x, y, z)` of a live cell: identical content to a
+    /// `HashMap`, produced once for the compatibility view.
+    fn full_map(&self) -> HashMap<(i32, i32, i32), u32> {
+        self.iter().map(|(&k, &v)| (k, v)).collect()
+    }
+
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Centre the dense window on chunk `(cx, cz)` if no anchor was set yet.
+    /// `FC::new` calls this with `pop_active` so the whole writable halo lands
+    /// in the flat arrays instead of whichever chunk the first write happened
+    /// to touch.
+    pub(crate) fn anchor_window(&mut self, cx: i32, cz: i32) {
+        if self.anchor.is_none() {
+            self.anchor = Some((cx, cz));
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, k: &(i32, i32, i32)) -> Option<&u32> {
+        if let Some(view) = self.view.get() {
+            return view.get(k);
+        }
+        if let Some((si, cell)) = self.slot(k.0, k.1, k.2) {
+            if let Some(sec) = &self.sections[si] {
+                let v = &sec[cell];
+                if *v != WR_EMPTY {
+                    return Some(v);
+                }
+            }
+        }
+        if self.overflow.is_empty() {
+            return None;
+        }
+        self.overflow.get(k)
+    }
+
+    #[inline]
+    pub(crate) fn contains_key(&self, k: &(i32, i32, i32)) -> bool {
+        if let Some(view) = self.view.get() {
+            return view.contains_key(k);
+        }
+        if let Some((si, cell)) = self.slot(k.0, k.1, k.2) {
+            if self.sections[si]
+                .as_ref()
+                .is_some_and(|s| s[cell] != WR_EMPTY)
+            {
+                return true;
+            }
+        }
+        !self.overflow.is_empty() && self.overflow.contains_key(k)
+    }
+
+    pub(crate) fn insert(&mut self, k: (i32, i32, i32), st: u32) -> Option<u32> {
+        if let Some(view) = self.view.get_mut() {
+            return view.insert(k, st);
+        }
+        let (x, y, z) = k;
+        if self.anchor.is_none() {
+            self.anchor = Some((x >> 4, z >> 4));
+        }
+        let slot = self.slot(x, y, z);
+        match (slot, st == WR_EMPTY) {
+            (Some((si, cell)), false) => {
+                if self.sections[si].is_none() {
+                    self.sections[si] = Some(Box::new([WR_EMPTY; 4096]));
+                    self.touched.push(si as u16);
+                }
+                let sec = self.sections[si].as_mut().unwrap();
+                let old = std::mem::replace(&mut sec[cell], st);
+                if old != WR_EMPTY {
+                    return Some(old);
+                }
+                // Fresh dense cell, but the key may already live in the
+                // overflow (an earlier `WR_EMPTY`-valued write): reuse that
+                // occupancy so each key lives in exactly one store. The
+                // empty check keeps the usual no-overflow case off the
+                // hashing path entirely.
+                if !self.overflow.is_empty() {
+                    if let Some(old) = self.overflow.remove(&k) {
+                        return Some(old);
+                    }
+                }
+                self.order.push(k);
+                self.len += 1;
+                None
+            }
+            _ => {
+                // Out-of-window, out-of-`y`, or a literal `WR_EMPTY` state:
+                // the key lives in the overflow. Any earlier dense slot is
+                // cleared so a later `get` reaches the overflow entry.
+                let mut prev = None;
+                if let Some((si, cell)) = slot {
+                    if let Some(sec) = &mut self.sections[si] {
+                        if sec[cell] != WR_EMPTY {
+                            prev = Some(std::mem::replace(&mut sec[cell], WR_EMPTY));
+                        }
+                    }
+                }
+                if let Some(old) = self.overflow.insert(k, st) {
+                    prev = Some(old);
+                }
+                if prev.is_none() {
+                    self.order.push(k);
+                    self.len += 1;
+                }
+                prev
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove(&mut self, k: &(i32, i32, i32)) -> Option<u32> {
+        if let Some(view) = self.view.get_mut() {
+            return view.remove(k);
+        }
+        let mut out = None;
+        if let Some((si, cell)) = self.slot(k.0, k.1, k.2) {
+            if let Some(sec) = &mut self.sections[si] {
+                if sec[cell] != WR_EMPTY {
+                    out = Some(std::mem::replace(&mut sec[cell], WR_EMPTY));
+                }
+            }
+        }
+        if let Some(v) = self.overflow.remove(k) {
+            out = Some(v);
+        }
+        if out.is_some() {
+            self.len -= 1;
+            if let Some(p) = self.order.iter().position(|e| e == k) {
+                self.order.swap_remove(p);
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear(&mut self) {
+        if let Some(view) = self.view.get_mut() {
+            view.clear();
+            return;
+        }
+        for si in self.touched.drain(..) {
+            self.sections[si as usize] = None;
+        }
+        self.overflow.clear();
+        self.order.clear();
+        self.len = 0;
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self.view.get() {
+            Some(view) => view.len(),
+            None => self.len,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn iter(&self) -> WrIter<'_> {
+        match self.view.get() {
+            Some(view) => WrIter::Map(view.iter()),
+            None => WrIter::Keys {
+                keys: self.order.iter(),
+                map: self,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &(i32, i32, i32)> + '_ {
+        self.iter().map(|(k, _)| k)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn values(&self) -> impl Iterator<Item = &u32> + '_ {
+        self.iter().map(|(_, v)| v)
+    }
+}
+
+/// `FlatChunkWriteMap::iter`: the materialised view when it exists, else the
+/// `order` vector filtered through the live stores (a `remove`d or moved key
+/// is skipped by the `get` miss).
+pub(crate) enum WrIter<'a> {
+    Map(std::collections::hash_map::Iter<'a, (i32, i32, i32), u32>),
+    Keys {
+        keys: std::slice::Iter<'a, (i32, i32, i32)>,
+        map: &'a FlatChunkWriteMap,
+    },
+}
+
+impl<'a> Iterator for WrIter<'a> {
+    type Item = (&'a (i32, i32, i32), &'a u32);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            WrIter::Map(it) => it.next(),
+            WrIter::Keys { keys, map } => loop {
+                let k = keys.next()?;
+                if let Some(v) = map.get(k) {
+                    return Some((k, v));
+                }
+            },
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            WrIter::Map(it) => it.size_hint(),
+            WrIter::Keys { keys, .. } => (keys.len(), Some(keys.len())),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a FlatChunkWriteMap {
+    type Item = (&'a (i32, i32, i32), &'a u32);
+    type IntoIter = WrIter<'a>;
+    fn into_iter(self) -> WrIter<'a> {
+        self.iter()
+    }
+}
+
+impl IntoIterator for FlatChunkWriteMap {
+    type Item = ((i32, i32, i32), u32);
+    type IntoIter = std::vec::IntoIter<((i32, i32, i32), u32)>;
+    fn into_iter(mut self) -> Self::IntoIter {
+        let out: Vec<((i32, i32, i32), u32)> = match self.view.take() {
+            Some(view) => view.into_iter().collect(),
+            None => self
+                .order
+                .iter()
+                .filter_map(|k| self.get(k).map(|v| (*k, *v)))
+                .collect(),
+        };
+        out.into_iter()
+    }
+}
+
+impl std::iter::FromIterator<((i32, i32, i32), u32)> for FlatChunkWriteMap {
+    fn from_iter<I: IntoIterator<Item = ((i32, i32, i32), u32)>>(iter: I) -> Self {
+        let mut m = Self::new();
+        for (k, v) in iter {
+            m.insert(k, v);
+        }
+        m
+    }
+}
+
+impl Default for FlatChunkWriteMap {
+    fn default() -> Self {
+        Self {
+            anchor: None,
+            sections: std::array::from_fn(|_| None),
+            touched: Vec::new(),
+            order: Vec::new(),
+            overflow: HashMap::new(),
+            len: 0,
+            view: OnceCell::new(),
+        }
+    }
+}
+
+impl PartialEq for FlatChunkWriteMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().all(|(k, v)| other.get(k) == Some(v))
+    }
+}
+
+impl std::fmt::Debug for FlatChunkWriteMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+/// `&wr` where a `&HashMap` is required (the test digest helpers) and `&mut wr`
+/// for `mem::take`-style derefs both coerce to the lazily built full map. The
+/// view is only materialised on these paths and stays authoritative once built.
+impl std::ops::Deref for FlatChunkWriteMap {
+    type Target = HashMap<(i32, i32, i32), u32>;
+    fn deref(&self) -> &Self::Target {
+        self.view.get_or_init(|| self.full_map())
+    }
+}
+
+impl std::ops::DerefMut for FlatChunkWriteMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        if self.view.get().is_none() {
+            let full = self.full_map();
+            let _ = self.view.set(full);
+        }
+        self.view.get_mut().unwrap()
+    }
+}
+
 pub(crate) struct FC<'a> {
     pub(crate) g: &'a mut Gen,
     /// A3-a wave workers borrow the owner read-only for the state a feature placement reads
@@ -71,7 +462,11 @@ pub(crate) struct FC<'a> {
     owner: Option<&'a Gen>,
     /// Population indices before wave scheduling reorders independent chunks.
     worker_order: Option<(&'a HashMap<(i32, i32), usize>, usize)>,
-    pub(crate) wr: HashMap<(i32, i32, i32), u32>,
+    /// The feature-write layer: a dense 3x3-chunk window (see
+    /// [`FlatChunkWriteMap`]) instead of a plain `HashMap`. `get`/`insert` on
+    /// in-window cells are O(1) array accesses; out-of-window cells fall back
+    /// to the embedded overflow, so the observable key set is unchanged.
+    pub(crate) wr: FlatChunkWriteMap,
     /// `ChunkAccess.postProcessing` as it stands after this chunk's own generation:
     /// the write positions `StructurePiece.placeBlock` marked, in mark order. They
     /// are consumed at the end of this chunk's `populate` (see
@@ -115,11 +510,16 @@ pub(crate) struct FC<'a> {
 }
 impl<'a> FC<'a> {
     pub(crate) fn new(g: &'a mut Gen) -> Self {
-        FC {
+        // The 3x3 window `feature_write_allowed` enforces is centred on the
+        // chunk being populated; anchoring the write buffer on it puts every
+        // legal write on the flat path. Outside a FEATURES pass (tests, dump
+        // helpers) the buffer anchors lazily on its first write.
+        let anchor = g.pop_active;
+        let mut ctx = FC {
             g,
             owner: None,
             worker_order: None,
-            wr: HashMap::new(),
+            wr: FlatChunkWriteMap::new(),
             shape_marks: Vec::new(),
             rc: HashMap::new(),
             hmwg: HashMap::new(),
@@ -137,7 +537,11 @@ impl<'a> FC<'a> {
             test_block_light: 0,
             #[cfg(test)]
             test_writes: None,
+        };
+        if let Some((ax, az)) = anchor {
+            ctx.wr.anchor_window(ax, az);
         }
+        ctx
     }
 
     /// A wave worker's context: its own scratch generator for writes, the owner for the
@@ -158,7 +562,7 @@ impl<'a> FC<'a> {
     /// owner and the same promotion boundary as the serial arm runs here, in population order.
     pub(crate) fn new_commit(
         g: &'a mut Gen,
-        wr: HashMap<(i32, i32, i32), u32>,
+        wr: FlatChunkWriteMap,
         shape_marks: Vec<(i32, i32, i32)>,
         payloads: Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>,
     ) -> Self {
@@ -882,4 +1286,283 @@ pub(crate) fn heightmap_dump(path: &str, n: i32, ox: i32, oz: i32, terrain_only:
         ),
         Err(e) => eprintln!("[hmdump] {path}: {e}"),
     }
+}
+
+// ---------- PERF-2a tests: FlatChunkWriteMap parity and cost ----------
+
+/// Deterministic xorshift64 for the parity driver and the bench workload.
+#[cfg(test)]
+fn perf2a_rng(seed: u64) -> impl FnMut() -> u64 {
+    let mut s = seed | 1;
+    move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    }
+}
+
+/// 50k mixed operations must produce exactly the observable behaviour of
+/// `HashMap<(i32, i32, i32), u32>`: same `insert`/`remove` returns, same `get`/
+/// `contains_key`/`len`, same key set on `iter`/`into_iter`, working
+/// `Clone`/`PartialEq`/`clear`/`FromIterator`, and a materialised `&HashMap`
+/// deref that stays live under later writes.
+#[cfg(test)]
+#[test]
+fn perf2a_flat_wr_differential_parity() {
+    let mut rng = perf2a_rng(0x9E37_79B9_7F4A_7C15);
+    let mut flat = FlatChunkWriteMap::new();
+    // Anchor on chunk (0,0): in-window x,z in -16..=31, y in -64..=319.
+    flat.anchor_window(0, 0);
+    let mut map: HashMap<(i32, i32, i32), u32> = HashMap::new();
+
+    for i in 0..50_000u64 {
+        let r = rng();
+        // ~64% in-window, ~8% window edge, ~8% negative in-window,
+        // ~10% out-of-window x/z, ~5% out-of-range y, ~5% negative far.
+        let (x, y, z) = match r % 100 {
+            0..=63 => (
+                ((r >> 8) % 48) as i32 - 16,
+                -64 + ((r >> 16) % 384) as i32,
+                ((r >> 32) % 48) as i32 - 16,
+            ),
+            64..=71 => (
+                (((r >> 8) % 3) as i32 - 1) * 16 + ((r >> 16) % 16) as i32,
+                -64 + ((r >> 32) % 384) as i32,
+                (((r >> 40) % 3) as i32 - 1) * 16 + ((r >> 48) % 16) as i32,
+            ),
+            72..=79 => (
+                -(((r >> 8) % 32) as i32),
+                -64 + ((r >> 16) % 384) as i32,
+                -(((r >> 32) % 32) as i32),
+            ),
+            80..=89 => (
+                ((r >> 8) % 2000) as i32 - 1000,
+                -64 + ((r >> 16) % 384) as i32,
+                ((r >> 32) % 2000) as i32 - 1000,
+            ),
+            90..=94 => (
+                ((r >> 8) % 48) as i32 - 16,
+                -200 + ((r >> 16) % 700) as i32,
+                ((r >> 32) % 48) as i32 - 16,
+            ),
+            _ => (
+                -(((r >> 8) % 4000) as i32),
+                -64 + ((r >> 16) % 384) as i32,
+                -(((r >> 32) % 4000) as i32),
+            ),
+        };
+        // A rare sentinel write proves the u32::MAX overflow routing.
+        let st = if i % 997 == 0 {
+            u32::MAX
+        } else {
+            ((r >> 40) % 4096) as u32
+        };
+        match r % 13 {
+            0 => assert_eq!(
+                map.remove(&(x, y, z)),
+                flat.remove(&(x, y, z)),
+                "remove {x},{y},{z}"
+            ),
+            _ => assert_eq!(
+                map.insert((x, y, z), st),
+                flat.insert((x, y, z), st),
+                "insert {x},{y},{z}"
+            ),
+        }
+        if i % 641 == 0 {
+            assert_eq!(map.len(), flat.len());
+            assert_eq!(map.get(&(x, y, z)), flat.get(&(x, y, z)));
+            assert_eq!(map.contains_key(&(x, y, z)), flat.contains_key(&(x, y, z)));
+        }
+    }
+
+    assert_eq!(map.len(), flat.len());
+    assert_eq!(map.is_empty(), flat.is_empty());
+    let mut a: Vec<_> = flat.iter().map(|(&k, &v)| (k, v)).collect();
+    a.sort();
+    let mut b: Vec<_> = map.iter().map(|(&k, &v)| (k, v)).collect();
+    b.sort();
+    assert_eq!(a, b, "iterated key set must equal the HashMap's");
+    let mut ka: Vec<_> = flat.keys().copied().collect();
+    ka.sort();
+    let mut kb: Vec<_> = map.keys().copied().collect();
+    kb.sort();
+    assert_eq!(ka, kb);
+
+    let clone = flat.clone();
+    assert!(clone == flat);
+    assert!(flat != FlatChunkWriteMap::new() || flat.is_empty());
+
+    // Consuming iteration yields the same key set.
+    let consumed: HashMap<_, _> = flat.clone().into_iter().collect();
+    assert_eq!(consumed, map);
+    let rebuilt: FlatChunkWriteMap = map.iter().map(|(&k, &v)| (k, v)).collect();
+    assert!(rebuilt == flat);
+
+    // The `&HashMap` compatibility view materialises complete contents, then
+    // keeps answering as the map mutates (sha helpers rely on it).
+    {
+        let hv: &HashMap<(i32, i32, i32), u32> = &flat;
+        assert_eq!(hv.len(), map.len());
+    }
+    let sentinel_key = (5_000, 64, -5_000);
+    flat.insert(sentinel_key, 7);
+    {
+        let hv: &HashMap<(i32, i32, i32), u32> = &flat;
+        assert_eq!(hv.get(&sentinel_key), Some(&7));
+        assert_eq!(hv.len(), map.len() + 1);
+    }
+
+    // `&mut HashMap` deref mutations land in the map: `mem::take` semantics.
+    {
+        let hm: &mut HashMap<(i32, i32, i32), u32> = &mut flat;
+        let took = std::mem::take(hm);
+        assert_eq!(took.len(), map.len() + 1);
+    }
+    assert!(flat.is_empty());
+    flat.insert((1, 2, 3), 9);
+    assert_eq!(flat.get(&(1, 2, 3)), Some(&9));
+
+    let mut cleared = flat.clone();
+    cleared.clear();
+    assert!(cleared.is_empty());
+    assert_eq!(cleared.len(), 0);
+}
+
+/// After materialisation the view must stay authoritative across every op:
+/// a `Deref` snapshot plus later writes/removes/iter must still agree with a
+/// plain `HashMap` run through the same sequence.
+#[cfg(test)]
+#[test]
+fn perf2a_flat_wr_view_stays_authoritative() {
+    let mut rng = perf2a_rng(0xB529_7A4D_B529_7A4D);
+    let mut flat = FlatChunkWriteMap::new();
+    flat.anchor_window(0, 0);
+    let mut map: HashMap<(i32, i32, i32), u32> = HashMap::new();
+    for _ in 0..2_000 {
+        let r = rng();
+        let k = (
+            ((r >> 8) % 48) as i32 - 16,
+            -64 + ((r >> 16) % 384) as i32,
+            ((r >> 32) % 48) as i32 - 16,
+        );
+        flat.insert(k, (r % 4096) as u32);
+        map.insert(k, (r % 4096) as u32);
+    }
+    // Materialise, then mutate through both paths.
+    {
+        let hv: &HashMap<(i32, i32, i32), u32> = &flat;
+        assert_eq!(hv.len(), map.len());
+    }
+    for _ in 0..1_000 {
+        let r = rng();
+        let k = (
+            ((r >> 8) % 64) as i32 - 32,
+            -64 + ((r >> 16) % 384) as i32,
+            ((r >> 32) % 64) as i32 - 32,
+        );
+        if r % 11 == 0 {
+            flat.remove(&k);
+            map.remove(&k);
+        } else {
+            flat.insert(k, (r % 8192) as u32);
+            map.insert(k, (r % 8192) as u32);
+        }
+    }
+    {
+        let hv: &HashMap<(i32, i32, i32), u32> = &flat;
+        assert_eq!(hv.len(), map.len());
+    }
+    let mut a: Vec<_> = flat.iter().map(|(&k, &v)| (k, v)).collect();
+    a.sort();
+    let mut b: Vec<_> = map.iter().map(|(&k, &v)| (k, v)).collect();
+    b.sort();
+    assert_eq!(a, b);
+}
+
+/// Micro-bench: an ore-vein-shaped workload of ~60k writes plus read-backs,
+/// measuring the flat window against the `HashMap` it replaces. The numbers
+/// are printed (not asserted) so the check stays stable across hardware; the
+/// correctness of every written cell *is* asserted.
+#[cfg(test)]
+#[test]
+fn perf2a_flat_wr_ore_vein_bench() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    // Clustered ore-vein cells: ~30 veins of ~2,000 writes inside a 3x3
+    // chunk window, with ~20% read-backs of already-written cells.
+    let mut rng = perf2a_rng(0xD1B5_4A32_D1B5_4A32);
+    let mut cells: Vec<(i32, i32, i32)> = Vec::with_capacity(60_000);
+    let mut reads: Vec<(i32, i32, i32)> = Vec::with_capacity(12_000);
+    for v in 0..30 {
+        let (bx, by, bz) = (
+            ((rng() % 40) as i32) - 12,
+            -40 + (rng() % 200) as i32,
+            ((rng() % 40) as i32) - 12,
+        );
+        for _ in 0..2_000 {
+            let r = rng();
+            let k = (
+                bx + ((r >> 8) % 11) as i32 - 5,
+                by + ((r >> 16) % 11) as i32 - 5,
+                bz + ((r >> 32) % 11) as i32 - 5,
+            );
+            cells.push(k);
+            if r % 5 == 0 && !cells.is_empty() {
+                reads.push(cells[(r as usize) % cells.len()]);
+            }
+        }
+        let _ = v;
+    }
+
+    let mut flat = FlatChunkWriteMap::new();
+    flat.anchor_window(0, 0);
+    let t0 = Instant::now();
+    for &k in &cells {
+        black_box(flat.insert(k, 42));
+    }
+    let flat_ins = t0.elapsed();
+    let t0 = Instant::now();
+    let mut acc = 0u64;
+    for &k in &reads {
+        acc += flat.get(&k).copied().unwrap_or(0) as u64;
+    }
+    let flat_get = t0.elapsed();
+
+    let mut map: HashMap<(i32, i32, i32), u32> = HashMap::new();
+    let t0 = Instant::now();
+    for &k in &cells {
+        black_box(map.insert(k, 42));
+    }
+    let map_ins = t0.elapsed();
+    let t0 = Instant::now();
+    let mut acc2 = 0u64;
+    for &k in &reads {
+        acc2 += map.get(&k).copied().unwrap_or(0) as u64;
+    }
+    let map_get = t0.elapsed();
+    assert_eq!(acc, acc2);
+
+    let mut a: Vec<_> = flat.iter().map(|(&k, &v)| (k, v)).collect();
+    a.sort();
+    let mut b: Vec<_> = map.iter().map(|(&k, &v)| (k, v)).collect();
+    b.sort();
+    assert_eq!(a, b);
+
+    let flat_ip = flat_ins.as_nanos() as f64 / cells.len() as f64;
+    let map_ip = map_ins.as_nanos() as f64 / cells.len() as f64;
+    let flat_gp = flat_get.as_nanos() as f64 / reads.len() as f64;
+    let map_gp = map_get.as_nanos() as f64 / reads.len() as f64;
+    eprintln!(
+        "perf2a ore-vein workload: {} cells ({} unique), {} reads\n\
+         \x20 insert: flat {flat_ins:?} ({flat_ip:.1} ns/op)  hashmap {map_ins:?} ({map_ip:.1} ns/op)  speedup {:.2}x\n\
+         \x20 get:    flat {flat_get:?} ({flat_gp:.1} ns/op)  hashmap {map_get:?} ({map_gp:.1} ns/op)  speedup {:.2}x",
+        cells.len(),
+        a.len(),
+        reads.len(),
+        map_ip / flat_ip,
+        map_gp / flat_gp,
+    );
 }
