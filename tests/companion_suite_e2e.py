@@ -781,6 +781,32 @@ def self_test():
 
     # .mrpack builder: a real ZIP_DEFLATED archive both parsers accept.
     with tempfile.TemporaryDirectory(prefix="companion-e2e-selftest-") as tmp:
+        server_dir = Path(tmp) / "server"
+        start = run([
+            sys.executable, ROOT / "tools" / "megu_start.py",
+            "--dir", server_dir, "--dry-run", "--json", "--lang", "en",
+            "--accept-eula",
+        ])
+        try:
+            start_plan = json.loads(start.stdout)
+        except ValueError:
+            start_plan = {}
+        check_("onboarding: dry-run returns a JSON plan without starting a server",
+               start.returncode in (0, 2) and not start.stderr
+               and isinstance(start_plan, dict)
+               and start_plan.get("schema") == "megu-start-plan/1"
+               and start_plan.get("dry_run") is True
+               and isinstance(start_plan.get("ready"), bool)
+               and isinstance(start_plan.get("action_items"), list)
+               and isinstance(start_plan.get("launch_argv"), list)
+               and "mc-spine" in start_plan["launch_argv"])
+        check_("onboarding: dry-run only creates the server bootstrap files",
+               {path.relative_to(Path(tmp)).as_posix()
+                for path in Path(tmp).rglob("*")}
+               == {"server", "server/eula.txt", "server/server.properties"}
+               and (server_dir / "eula.txt").read_text(encoding="utf-8")
+               == "eula=true\n")
+
         pack = Path(tmp) / "pack.mrpack"
         build_mrpack(pack)
         with zipfile.ZipFile(pack) as archive:

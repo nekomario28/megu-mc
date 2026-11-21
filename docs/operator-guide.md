@@ -29,6 +29,22 @@ honest about today's coverage.
 offline while the server is stopped. It never clobbers an existing file;
 on an existing `server.properties` only the flags you pass are applied.
 
+**One-command onboarding.** The Python launcher bootstraps a local server
+directory, checks the EULA and optional modpack, and starts `mc-spine` only
+when the pre-flight succeeds. Review the Minecraft EULA before opting in.
+
+```sh
+python3 tools/megu_start.py --dir ./server --accept-eula
+python3 tools/megu_start.py --dir ./server --modpack pack.mrpack \
+    --accept-eula --lang auto --dry-run --json
+```
+
+`--lang` accepts `auto`, `en`, or `ja`. `--json` emits a
+`megu-start-plan/1` plan; `--dry-run` avoids launching the server while
+still initializing `eula.txt` and `server.properties` in the chosen
+directory. A modpack is checked, not downloaded or installed. A plan
+with `action_items` must be resolved before starting the server.
+
 ```sh
 # Create the directory and its files. --mc-version pins the target
 # (default: 26.3, the latest vanilla).
@@ -109,6 +125,22 @@ The lifter is fail-closed: `@Overwrite`/`@Redirect`/`@Modify*`/
 `@Accessor`/`@Invoker`, `locals` capture, non-trivial injection points,
 and unknown targets all keep the mod at Tier 3 — it never guesses.
 
+**Scan an installed `mods/` folder without a JVM.** This inspects the
+bytecode of each JAR, detects Farmer's Delight and compatible culinary
+recipes/tags from addons, and skips the 36 built-in superseded performance
+mod ids before scanning. Safe `@Inject` sites can be lifted from Tier 3 to
+Tier 2; other hooks remain flagged for inspection.
+
+```sh
+mc-spine-mod-check --scan-mods-dir ./mods --json
+mc-spine-mod-check --scan-mods-dir ./mods --include-client-mixins --json
+```
+
+Client mixins are excluded by default on dedicated servers. For directory
+scans, exit `0` means no JAR requires Tier 3, `2` means at least one does
+(or invalid arguments), and `1` means the directory or JAR could not be
+read or parsed.
+
 The same pre-flight also runs entirely in the browser: [../website](../website)
 is a zero-build static page (no bundler, no CDN) whose dropzone accepts a
 `.mrpack` or pack `.zip`, extracts the manifest client-side with a
@@ -174,6 +206,15 @@ Environment knobs the runtime actually reads:
 | `MC_SPINE_RCON_BIND_ADDR` | 127.0.0.1 | RCON bind address |
 | `MC_SPINE_VERSION_DIR` | unset | kernel version pack directory for the block registry |
 | `MC_SPINE_CONFIG` | `server.toml` | path of the optional config file |
+| `MC_SPINE_ENABLE_QUERY` | off | `1`/`true` enables the GameSpy4 UDP Query responder; `enable-query=true` in `server.properties` also enables it |
+| `MC_SPINE_QUERY_PORT` | game port | UDP Query port; overrides `query.port` in `server.properties` |
+| `MC_SPINE_ANVIL_WORLD_DIR` | unset | load a vanilla-format Anvil world at boot and write it on autosave/shutdown |
+
+**GameSpy4 (GS4) Query.** Enable the opt-in UDP status/rules responder
+with `MC_SPINE_ENABLE_QUERY=1 mc-spine`, or add `enable-query=true` to
+`server.properties`. It uses the game port for UDP unless
+`MC_SPINE_QUERY_PORT` or `query.port` selects another port. Open the
+corresponding UDP port if the query service should be remotely reachable.
 
 **Console.** In live mode, stdin lines run as level-4 console commands:
 `stop` saves the world and exits; `status` prints the operator health
@@ -246,6 +287,11 @@ mc-spine-world-migrate inspect save.stv1
 # read-only.
 mc-spine-world-migrate inspect-anvil /path/to/vanilla-world --json
 
+# Migrate a real level.dat (gzip or raw NBT) to the 26.3 DataVersion.
+# --in stays untouched; --backup-old preserves any existing --out.
+mc-spine-world-migrate migrate-level --in ./world/level.dat \
+    --out ./converted/level.dat --to 26.3 --backup-old --json
+
 # Re-seal a snapshot for another version. --out is written atomically
 # and verified decodable before it is reported; --in is never modified.
 mc-spine-world-migrate migrate --in old.stv1 --out new.stv1 --to 26.3
@@ -260,6 +306,12 @@ mc-spine-world-migrate migrate-json --in level-1211.json \
 mc-spine-world-migrate migrate --in new.stv1 --out old.stv1 \
     --to 1.21.1 --allow-downgrade
 ```
+
+For a live vanilla-format world, start the server with
+`MC_SPINE_ANVIL_WORLD_DIR=/path/to/vanilla-world mc-spine`. The Anvil
+import runs after the overlay load and wins on overlapping data; saves
+write back to that directory. Back up an existing world before enabling
+live writes.
 
 Exit codes: `0` success, `1` file-level failure (unreadable, corrupt, CRC
 mismatch, malformed JSON, unknown DataVersion), `2` a refused downgrade
@@ -311,6 +363,29 @@ table spread across three dimensions and prints
 p50/p99/mean/max latency and packets-per-second (text, or JSON with
 `--json`). Exit codes: `0` success, `1` a bind error or failed
 self-test, `2` a bad command line or a refused public bind.
+
+**Friend invite relay (`FRL1`).** A host can connect outward to a
+`FRL1` relay and share its issued invite code. Guests connect without
+router port forwarding using the existing client flags:
+
+```sh
+mc-spine-client --join-code MEGU-XXXX-XXXX --relay relay.example.org:24455
+```
+
+The code must be issued by a running host/relay; the example code is a
+placeholder. `--relay` is required with `--join-code`.
+
+**GPU backend selection.** The native client supports the following
+backend preferences. `classic-low-spec` selects the 16 KiB UBO-batched
+path for legacy Intel HD/UHD GPUs with limited shader support.
+
+```sh
+mc-spine-client --gpu-backend auto
+mc-spine-client --gpu-backend mesh-shader
+mc-spine-client --gpu-backend compute-indirect
+mc-spine-client --gpu-backend classic-low-spec
+mc-spine-client --gpu-backend classic
+```
 
 ## 7. Alpha caveats and security notes
 
