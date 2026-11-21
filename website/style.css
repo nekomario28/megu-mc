@@ -369,6 +369,20 @@ h3 {
   white-space: nowrap;
 }
 
+.metric-list {
+  display: grid;
+  gap: 8px;
+}
+
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--text);
+}
+
 .bench-caveat {
   margin: 14px 0 0;
   font-size: 12.5px;

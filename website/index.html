@@ -99,11 +99,30 @@
               <span class="bar-val">64 threads</span>
             </div>
           </div>
+
+          <div class="bench-card">
+            <div class="bench-label" data-i18n="bench_net_label">Packet &amp; wire overhead</div>
+            <div class="metric-list">
+              <div class="metric-row">
+                <span data-i18n="m_sec_wire">Cached section wire encode</span>
+                <span class="bar-val">289 ns/sec</span>
+              </div>
+              <div class="metric-row">
+                <span data-i18n="m_voice_lat">UDP voice relay latency (p50 / p99)</span>
+                <span class="bar-val">1.4 / 2.4 µs</span>
+              </div>
+              <div class="metric-row">
+                <span data-i18n="m_startup">Startup &amp; GC pauses</span>
+                <span class="bar-val" data-i18n="m_startup_val">No JVM / 0 ms GC</span>
+              </div>
+            </div>
+          </div>
         </div>
 
         <p class="bench-caveat" data-i18n="bench_caveat">
-          Recorded via tools/load_compare.sh (20s moving viewer, same seed &amp; machine; receipt in evidence/gameplay/load-compare/receipt.json).
-          Caveat: Alpha implements fewer vanilla features than server.jar, and worldgen feature CPU is still being optimized (not yet a full like-for-like M3 proof).
+          RAM &amp; threads: tools/load_compare.sh (20s moving viewer, same seed &amp; machine; evidence/gameplay/load-compare/receipt.json).
+          Section wire: issue41-palette-bench (release); voice relay: mc-spine-voice-relay --bench-packets (32 players, 3 dims, ~640k frames/s).
+          Caveat: Alpha implements fewer vanilla features than server.jar, and full release-mode datapack startup &amp; worldgen CPU benchmarks are still being finalized.
         </p>
       </div>
     </section>
@@ -188,10 +207,10 @@
             </p>
           </article>
           <article class="pillar">
-            <h3 data-i18n="p4_title">Your own jar, clean-room OSS</h3>
+            <h3 data-i18n="p4_title">Low latency, lean packets &amp; fast boot</h3>
             <p data-i18n="p4_body">
-              Zero Mojang files bundled — runtime data is generated locally from your official Minecraft jar.
-              Zero external crates in core; GPL-3.0-or-later root and LGPL/GPL/AGPL-3.0-or-later subcrates.
+              Single native binary with no JVM warm-up or stop-the-world GC spikes. Cached clean-wire chunk sections (289 ns),
+              256 B threshold zlib compression, relative delta entity packets, per-connection backpressure, and a 1.4 µs UDP voice relay keep latency flat.
             </p>
           </article>
         </div>
@@ -317,7 +336,12 @@ cargo run --locked</code></pre>
       bench_meta: "Linux x86_64 実測 · 3 回平均 · seed 0 · 描画距離 4",
       bench_ram_label: "常駐メモリ (VmRSS)",
       bench_thr_label: "負荷時の OS スレッド数",
-      bench_caveat: "tools/load_compare.sh（同一マシン・20 秒移動負荷）の実測記録（evidence/gameplay/load-compare/receipt.json）。※ Alpha 版は本家より機能が少なく完全同一条件ではなく、地形 feature 生成の CPU 最適化は引き続き進行中です。",
+      bench_net_label: "パケット・遅延・起動特性",
+      m_sec_wire: "チャンクセクション直列化（キャッシュ時）",
+      m_voice_lat: "UDP 近接ボイス中継遅延 (p50 / p99)",
+      m_startup: "起動・GC 停止",
+      m_startup_val: "JVM 不要 / GC 停止 0 ms",
+      bench_caveat: "RAM・スレッド数：tools/load_compare.sh（同一マシン・20 秒移動負荷、evidence/gameplay/load-compare/receipt.json）。セクション直列化：issue41-palette-bench（release）。ボイス中継：mc-spine-voice-relay --bench-packets（32人・3次元・約64万 frame/s）。※ Alpha 版は本家より機能が少なく、データパック込みの本番起動速度・地形生成 CPU 最適化は引き続き計測・改善中です。",
       checker_title: "手元の Modpack をその場で診断。",
       checker_note: "このタブ内で完結 — ファイルは一切送信されません。",
       checker_desc: "Modrinth の .mrpack や CurseForge の .zip を落とすだけで、自動スキップされる軽量化 Mod・ネイティブ動作・要検査 JAR を即座に表示します。",
@@ -333,8 +357,8 @@ cargo run --locked</code></pre>
       p2_body: "RTX / Radeon RDNA2+ / Arc 向け Vulkan Mesh Shader、Compute + Multi-Draw Indirect に加え、旧世代 Intel HD 4000 / UHD 630 ノート向けの ClassicLowSpec（16 KiB UBO バッチ＋省 VRAM 遠景 LOD）を選択できます。",
       p3_title: "Modpack をそのまま投入＆安全フォールバック",
       p3_body: "Sodium・Lithium・ModernFix・Distant Horizons 等 36 種の軽量化 Mod を自動スキップ。OpenPAC/FTB Chunks や単純な @Inject Mixin はネイティブ／軽量実行し、未対応の重 Mixin は本家 NeoForge へ安全に委譲します。",
-      p4_title: "Mojang 非同梱・クリーンルーム OSS",
-      p4_body: "Mojang のファイルや他 Mod のコードは一切同梱しません。実行データは手元の公式 server.jar からローカル生成。コア外部依存 0・GPL-3.0-or-later（独立クレートは LGPL/GPL/AGPL）。",
+      p4_title: "高速起動・低遅延・省パケット設計",
+      p4_body: "JVM ウォームアップや GC ストップ・ザ・ワールドなしの単一ネイティブバイナリ。クリーンワイヤーキャッシュ（289 ns/セクション）・256B 閾値 zlib 圧縮・エンティティ相対移動差分・接続別バックプレッシャ・p50 1.4 µs の UDP ボイス中継で遅延スパイクを抑えます。",
       qs_title: "3 コマンドで起動。",
       qs_1: "1. サーバーディレクトリを初期化",
       qs_2: "2. Modpack や mods/ フォルダを事前診断（JVM 不要）",
