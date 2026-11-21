@@ -60,9 +60,33 @@ sys.exit(int(sys.argv[2]) if len(sys.argv) > 2 else 0)
 '''
 
 
-def _jar(path, mod_id, entries=()):
+def _jar(path, mod_id, entries=(), mc_range=None):
+    toml = MODS_TOML.format(mod_id=mod_id)
+    if mc_range is not None:
+        toml += (
+            f"[[dependencies.{mod_id}]]\n"
+            'modId="minecraft"\n'
+            "mandatory=true\n"
+            f'versionRange="{mc_range}"\n'
+            'side="BOTH"\n')
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
-        out.writestr("META-INF/neoforge.mods.toml", MODS_TOML.format(mod_id=mod_id))
+        out.writestr("META-INF/neoforge.mods.toml", toml)
+        out.writestr(f"{mod_id}/Main.class", b"\xca\xfe\xba\xbe")
+        for name, payload in entries:
+            out.writestr(name, payload)
+
+
+def _fabric_jar(path, mod_id, depends, entries=()):
+    """Fabric-loader jar whose fabric.mod.json declares depends.minecraft."""
+    manifest = json.dumps({
+        "schemaVersion": 1,
+        "id": mod_id,
+        "version": "1.0.0",
+        "environment": "*",
+        "depends": {"minecraft": depends},
+    })
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        out.writestr("fabric.mod.json", manifest)
         out.writestr(f"{mod_id}/Main.class", b"\xca\xfe\xba\xbe")
         for name, payload in entries:
             out.writestr(name, payload)
@@ -103,7 +127,9 @@ def _shim_report(jar_reports):
 
 def _fake_mod(mod_id, mod_ids=None, has_java_bytecode=True,
               shimcheck_compatible=True, has_unsupported_mixin_or_at=False,
-              reasons=(), has_custom_chunk_generator=False):
+              reasons=(), has_custom_chunk_generator=False,
+              mc_version_range=None, pack_format=None,
+              pack_supported_min=None, pack_supported_max=None):
     mod = SimpleNamespace(
         mod_id=mod_id,
         mod_ids=mod_ids or [mod_id],
@@ -111,10 +137,23 @@ def _fake_mod(mod_id, mod_ids=None, has_java_bytecode=True,
         shimcheck_compatible=shimcheck_compatible,
         has_unsupported_mixin_or_at=has_unsupported_mixin_or_at,
         has_custom_chunk_generator=has_custom_chunk_generator,
+        mc_version_range=mc_version_range,
+        pack_format=pack_format,
+        pack_supported_min=pack_supported_min,
+        pack_supported_max=pack_supported_max,
         source=f"mods/{mod_id}.jar",
     )
     mod.reason_codes = lambda: list(reasons)
     return mod
+
+
+def _versioned_fake(mod_id, mc_version_range):
+    """Java mod with a declared Minecraft range and a ShimCheck rejection."""
+    return _fake_mod(
+        mod_id, shimcheck_compatible=False,
+        has_unsupported_mixin_or_at=True,
+        reasons=["UNSUPPORTED_MIXIN_INJECTION"],
+        mc_version_range=mc_version_range)
 
 
 def _dim_type_json():
@@ -289,6 +328,337 @@ class ClassifierUnitTests(unittest.TestCase):
                        "lithium", "starlight", "ferritecore", "modernfix",
                        "noisium", "c2me"):
             self.assertIn(mod_id, mod_launcher.BUILTIN_SUPERSEDED_PERF_MODS)
+
+    def test_superseded_perf_mod_skips_version_check_entirely(self):
+        # `sodium` built only for 1.20.1 on a 1.21.1 server: the superseded
+        # catalog wins before the version gate, so it is still a clean
+        # BuiltInSuperseded skip — never a version-mismatch Tier 3 report.
+        sodium = _versioned_fake("sodium", "[1.20.1,1.20.2)")
+        tier, reasons = mod_launcher.classify(sodium, set(), set())
+        self.assertEqual(tier, mod_launcher.TIER_SUPERSEDED)
+        self.assertEqual(reasons,
+                         ["already covered by mc-spine built-in optimizations"])
+
+    def test_incompatible_declared_range_is_tier3_with_plain_language_reason(self):
+        # A real content mod declaring a 1.20.1-only Maven range on a 1.21.1
+        # server must never silently execute broken native code.
+        jei = _versioned_fake("jei", "[1.20.1,1.20.2)")
+        tier, reasons = mod_launcher.classify(jei, set(), set())
+        self.assertEqual(tier, 3)
+        self.assertEqual(reasons, [
+            "MC_VERSION_INCOMPATIBLE",
+            "built for Minecraft [1.20.1,1.20.2), server is running 1.21.1",
+        ])
+
+    def test_compatible_declared_range_runs_on_every_target_in_band(self):
+        m = _versioned_fake("somecontent", "[1.21.1,1.21.5)")
+        for target in ((1, 21, 1), (1, 21, 3), (1, 21, 4)):
+            # Mixin-incompatible with no profile: falls through to Tier 3
+            # *only* on technical grounds — the version gate stays silent.
+            _, reasons = mod_launcher.classify(m, set(), set(), target)
+            self.assertEqual(reasons, ["UNSUPPORTED_MIXIN_INJECTION"], target)
+        # A profile-backed mod stays Tier 1 on every in-band target.
+        for target in ((1, 21, 1), (1, 21, 4)):
+            tier, _ = mod_launcher.classify(m, set(), {"somecontent"}, target)
+            self.assertEqual(tier, 1, target)
+
+    def test_invalid_declared_range_fails_closed_as_tier3(self):
+        m = _versioned_fake("broken_manifest", "not-a-version-range!!")
+        tier, reasons = mod_launcher.classify(m, set(), set())
+        self.assertEqual(tier, 3)
+        self.assertEqual(reasons[0], "MC_VERSION_RANGE_INVALID")
+        self.assertEqual(len(reasons), 2)
+        self.assertTrue(reasons[1].startswith(
+            "declares an invalid Minecraft version range"))
+        self.assertIn("not-a-version-range!!", reasons[1])
+
+    def test_plan_startup_for_version_flags_mismatch_per_policy(self):
+        mods = [
+            _versioned_fake("jei", "[1.20.1,1.20.2)"),
+            _versioned_fake("sodium", "[1.20.1,1.20.2)"),
+            _versioned_fake("okmod", "[1.21.1,1.21.5)"),
+        ]
+        # Under delegate, only `jei` triggers; sodium is still superseded.
+        plan = self.plan(mods, profiles=["okmod"], policy="delegate")
+        self.assertEqual(plan["plan"], "DelegateToNeoForge")
+        triggers = plan["triggering_mods"]
+        self.assertEqual(len(triggers), 1)
+        self.assertEqual(triggers[0].mod_id, "jei")
+        self.assertEqual(triggers[0].reasons, [
+            "MC_VERSION_INCOMPATIBLE",
+            "built for Minecraft [1.20.1,1.20.2), server is running 1.21.1",
+        ])
+        tiers = {a.mod_id: a.tier for a in plan["assignments"]}
+        self.assertEqual(tiers, {
+            "jei": 3,
+            "sodium": mod_launcher.TIER_SUPERSEDED,
+            "okmod": 1,
+        })
+        self.assertEqual(plan["mc_version"], "1.21.1")
+        # The declared range and verdict are recorded on every assignment.
+        by_id = {a.mod_id: a for a in plan["assignments"]}
+        self.assertEqual(by_id["jei"].as_dict()["mc_version_range"],
+                         "[1.20.1,1.20.2)")
+        self.assertEqual(by_id["jei"].as_dict()["mc_version_verdict"],
+                         "major_mismatch")
+        self.assertEqual(by_id["okmod"].as_dict()["mc_version_verdict"],
+                         "compatible")
+        # Sodium's range is recorded for audit but never gated on.
+        self.assertEqual(by_id["sodium"].as_dict()["mc_version_range"],
+                         "[1.20.1,1.20.2)")
+        self.assertIsNone(by_id["sodium"].as_dict()["mc_version_verdict"])
+        # Drop `jei`: every remaining declared range holds on 1.21.4 too.
+        plan = self.plan(mods[1:], profiles=["okmod"], policy="delegate",
+                         target_mc_version=(1, 21, 4))
+        self.assertEqual(plan["plan"], "RunNative")
+        self.assertEqual(plan["mc_version"], "1.21.4")
+        # Strict refuses cleanly with the version reason in the audit trail.
+        plan = self.plan([_versioned_fake("jei", "[1.20.1,1.20.2)")],
+                         policy="strict")
+        self.assertEqual(plan["plan"], "RefuseStartup")
+        self.assertIn("server is running 1.21.1",
+                      plan["blocking_mods"][0].reasons[1])
+
+    def test_pure_data_pack_format_gate(self):
+        # A datapack declaring pack_format 48 plus a supported span covering
+        # 1.21.0-1.21.5 stays Tier 1 on 1.21.1 and 1.21.4 alike.
+        good = _fake_mod("okpack", has_java_bytecode=False,
+                         pack_format=48,
+                         pack_supported_min=48, pack_supported_max=61)
+        for target in ((1, 21, 1), (1, 21, 4)):
+            tier, reasons = mod_launcher.classify(good, set(), set(), target)
+            self.assertEqual(tier, 1, target)
+            self.assertEqual(reasons, [
+                "handled by zero-JVM universal adapter / offload profile"])
+        # A 1.20.4-era pack (pack_format 26) fails closed on 1.21.1.
+        old = _fake_mod("oldpack", has_java_bytecode=False, pack_format=26)
+        tier, reasons = mod_launcher.classify(old, set(), set())
+        self.assertEqual(tier, 3)
+        self.assertEqual(reasons[0], "PACK_FORMAT_INCOMPATIBLE")
+        self.assertIn("pack_format 26", reasons[1])
+        self.assertIn("1.21.1", reasons[1])
+        # Unknown server pack_format fails closed too.
+        tier, _ = mod_launcher.classify(old, set(), set(), (1, 19, 4))
+        self.assertEqual(tier, 3)
+
+
+class VersionCompatUnitTests(unittest.TestCase):
+    """Ports of the #[cfg(test)] cases in mod-adapter-core/src/version_compat.rs."""
+
+    def vrange(self, s):
+        return mod_launcher.parse_version_range(s)
+
+    def test_mc_version_parse_and_ordering(self):
+        v = mod_launcher.parse_mc_version
+        self.assertEqual(v("1.21.1"), (1, 21, 1))
+        self.assertEqual(v("1.21"), (1, 21, 0))
+        self.assertEqual(v("1"), (1, 0, 0))
+        self.assertIsNone(v(""))
+        self.assertIsNone(v("1.21.1.4"))
+        self.assertIsNone(v("1.x"))
+        self.assertIsNone(v("abc"))
+        self.assertIsNone(v("1.65536.0"))
+        self.assertLess((1, 20, 6), (1, 21, 0))
+        self.assertLess((1, 21, 1), (1, 21, 3))
+        self.assertEqual(mod_launcher.format_mc_version((1, 21, 1)), "1.21.1")
+        self.assertEqual(mod_launcher.format_mc_version(v("1.21")), "1.21.0")
+
+    def test_pack_format_and_data_version_table(self):
+        pf = mod_launcher.data_pack_format_for
+        dv = mod_launcher.data_version_for
+        self.assertEqual(pf((1, 20, 4)), 26)
+        self.assertEqual(dv((1, 20, 4)), 3700)
+        self.assertEqual(pf((1, 20, 6)), 41)
+        self.assertEqual(dv((1, 20, 6)), 3839)
+        self.assertEqual(pf((1, 21, 0)), 48)
+        self.assertEqual(dv((1, 21, 0)), 3953)
+        self.assertEqual(pf((1, 21, 1)), 48)
+        self.assertEqual(dv((1, 21, 1)), 3955)
+        self.assertEqual(pf((1, 21, 3)), 57)
+        self.assertEqual(dv((1, 21, 3)), 4082)
+        self.assertEqual(pf((1, 21, 4)), 61)
+        self.assertEqual(dv((1, 21, 4)), 4189)
+        self.assertEqual(pf((1, 21, 5)), 71)
+        self.assertEqual(dv((1, 21, 5)), 4325)
+        self.assertIsNone(pf((1, 19, 4)))
+        self.assertIsNone(dv((2, 0, 0)))
+
+    def test_check_pack_format_across_supported_targets(self):
+        cpf = mod_launcher.check_pack_format
+        # Exact-format pack built for 1.21.1 (pack_format 48).
+        self.assertTrue(cpf((1, 21, 1), 48))
+        self.assertFalse(cpf((1, 21, 4), 48))
+        self.assertFalse(cpf((1, 20, 4), 48))
+        # Pack declaring a supported span covering 1.21.0-1.21.5.
+        self.assertTrue(cpf((1, 21, 1), 48, 48, 71))
+        self.assertTrue(cpf((1, 21, 4), 48, 48, 71))
+        self.assertFalse(cpf((1, 20, 6), 48, 48, 71))
+        # Min-only / max-only bounds.
+        self.assertTrue(cpf((1, 21, 5), 48, 48, None))
+        self.assertTrue(cpf((1, 20, 4), 48, None, 71))
+        # Unknown target format fails closed.
+        self.assertFalse(cpf((1, 19, 4), 26, 1, 99))
+
+    def test_maven_exact_pins_and_intervals(self):
+        pin = self.vrange("[1.21.1]")
+        self.assertTrue(pin.contains((1, 21, 1)))
+        self.assertFalse(pin.contains((1, 21, 0)))
+        self.assertFalse(pin.contains((1, 21, 3)))
+
+        r = self.vrange("[1.21.1,1.21.5)")
+        self.assertTrue(r.contains((1, 21, 1)))
+        self.assertTrue(r.contains((1, 21, 3)))
+        self.assertTrue(r.contains((1, 21, 4)))
+        self.assertFalse(r.contains((1, 21, 5)))
+        self.assertFalse(r.contains((1, 21, 0)))
+        self.assertFalse(r.contains((1, 20, 6)))
+
+        r = self.vrange("(1.21.1,1.21.4]")
+        self.assertFalse(r.contains((1, 21, 1)))
+        self.assertTrue(r.contains((1, 21, 3)))
+        self.assertTrue(r.contains((1, 21, 4)))
+        self.assertFalse(r.contains((1, 21, 5)))
+
+        # Unbounded both ways.
+        self.assertTrue(self.vrange("[1.21.1,)").contains((1, 21, 5)))
+        self.assertFalse(self.vrange("[1.21.1,)").contains((1, 21, 0)))
+        self.assertTrue(self.vrange("(,1.21.5)").contains((1, 20, 4)))
+        self.assertFalse(self.vrange("(,1.21.5)").contains((1, 21, 5)))
+        self.assertTrue(self.vrange("[,1.21.5]").contains((1, 21, 5)))
+
+        # Two-component bounds: "1.21" is 1.21.0.
+        r = self.vrange("(1.21,1.22]")
+        self.assertFalse(r.contains((1, 21, 0)))
+        self.assertTrue(r.contains((1, 21, 1)))
+        self.assertTrue(r.contains((1, 22, 0)))
+        self.assertFalse(r.contains((1, 22, 1)))
+
+        # Maven union `(,1.20.5],[1.21.1,)`: a gap across 1.20.6-1.21.0.
+        r = self.vrange("(,1.20.5],[1.21.1,)")
+        self.assertTrue(r.contains((1, 20, 4)))
+        self.assertTrue(r.contains((1, 20, 5)))
+        self.assertFalse(r.contains((1, 20, 6)))
+        self.assertFalse(r.contains((1, 21, 0)))
+        self.assertTrue(r.contains((1, 21, 1)))
+        self.assertTrue(r.contains((1, 21, 5)))
+
+        # Bare exact version in the Maven ecosystem.
+        r = self.vrange("1.21.1")
+        self.assertTrue(r.contains((1, 21, 1)))
+        self.assertFalse(r.contains((1, 21, 3)))
+
+    def test_semver_comparators_tilde_caret_wildcards(self):
+        r = self.vrange(">=1.21.1")
+        self.assertTrue(r.contains((1, 21, 1)))
+        self.assertTrue(r.contains((2, 0, 0)))
+        self.assertFalse(r.contains((1, 21, 0)))
+
+        r = self.vrange(">=1.21.1 <1.21.5")
+        self.assertTrue(r.contains((1, 21, 1)))
+        self.assertTrue(r.contains((1, 21, 4)))
+        self.assertFalse(r.contains((1, 21, 5)))
+        self.assertFalse(r.contains((1, 21, 0)))
+
+        # `~1.21.1` == `>=1.21.1 <1.22.0`.
+        r = self.vrange("~1.21.1")
+        self.assertTrue(r.contains((1, 21, 1)))
+        self.assertTrue(r.contains((1, 21, 99)))
+        self.assertFalse(r.contains((1, 22, 0)))
+        self.assertFalse(r.contains((1, 21, 0)))
+
+        # `^1.21.1` == `>=1.21.1 <2.0.0`; `^0.x` keeps the minor band.
+        r = self.vrange("^1.21.1")
+        self.assertTrue(r.contains((1, 99, 0)))
+        self.assertFalse(r.contains((2, 0, 0)))
+        r = self.vrange("^0.2.3")
+        self.assertTrue(r.contains((0, 2, 9)))
+        self.assertFalse(r.contains((0, 3, 0)))
+        self.assertFalse(r.contains((0, 2, 2)))
+
+        # Wildcards: `1.21.x` == `>=1.21.0 <1.22.0`; `1.x` == `>=1.0.0 <2.0.0`.
+        r = self.vrange("1.21.x")
+        self.assertTrue(r.contains((1, 21, 0)))
+        self.assertTrue(r.contains((1, 21, 99)))
+        self.assertFalse(r.contains((1, 22, 0)))
+        self.assertFalse(r.contains((1, 20, 9)))
+        self.assertTrue(self.vrange("1.21.*").contains((1, 21, 4)))
+        self.assertTrue(self.vrange("1.x").contains((1, 2, 3)))
+        self.assertFalse(self.vrange("1.x").contains((2, 0, 0)))
+        self.assertTrue(self.vrange("*").contains((9, 9, 9)))
+
+        # `<`/`>`/`<=` on partial versions use the band edges.
+        r = self.vrange("<1.22")
+        self.assertTrue(r.contains((1, 21, 9)))
+        self.assertFalse(r.contains((1, 22, 0)))
+        # npm band semantics: `>1.21` means "after the 1.21.x line" (>=1.22.0).
+        r = self.vrange(">1.21")
+        self.assertFalse(r.contains((1, 21, 1)))
+        self.assertTrue(r.contains((1, 22, 0)))
+        self.assertFalse(r.contains((1, 21, 0)))
+        self.assertTrue(self.vrange(">1.21.0").contains((1, 21, 1)))
+        r = self.vrange("<=1.21.x")
+        self.assertTrue(r.contains((1, 21, 99)))
+        self.assertFalse(r.contains((1, 22, 0)))
+
+        # `=` pin and OR union.
+        self.assertTrue(self.vrange("=1.21.1").contains((1, 21, 1)))
+        self.assertFalse(self.vrange("=1.21.1").contains((1, 21, 3)))
+        r = self.vrange("1.21.1 || 1.21.4")
+        self.assertTrue(r.contains((1, 21, 1)))
+        self.assertTrue(r.contains((1, 21, 4)))
+        self.assertFalse(r.contains((1, 21, 3)))
+        r = self.vrange("1.20.x || >=1.21.1 <1.22")
+        self.assertTrue(r.contains((1, 20, 1)))
+        self.assertTrue(r.contains((1, 21, 5)))
+        self.assertFalse(r.contains((1, 21, 0)))
+        self.assertFalse(r.contains((1, 22, 0)))
+
+        # Partial bare `1.21` covers the whole 1.21.x band.
+        r = self.vrange("1.21")
+        self.assertTrue(r.contains((1, 21, 0)))
+        self.assertTrue(r.contains((1, 21, 9)))
+        self.assertFalse(r.contains((1, 22, 0)))
+
+    def test_malformed_ranges_fail_closed_never_panic(self):
+        for bad in ("", "   ", "[", "(", "]", "[1.21.1", "[1.21.1,",
+                    "[1.21.1,1.21.5,1.21.9)", "[]", "(1.21.1)", "[1.21.1] extra",
+                    ">=", "~", "1.x.2", "1.2.3.4", "abc", ">=abc",
+                    "1.21.1 ||", "|| 1.21.1", "1.21.1 1.21.4 junk",
+                    "1.21.1-rc1", "<0.0.0 garbage", ",", "[1.21.1],garbage!"):
+            with self.assertRaises(mod_launcher.VersionRangeError, msg=bad):
+                self.vrange(bad)
+        # `<0.0.0` parses but matches nothing.
+        self.assertFalse(self.vrange("<0.0.0").contains((0, 0, 0)))
+
+    def test_mod_version_verdict_distinguishes_minor_and_major(self):
+        target = (1, 21, 1)
+        check = mod_launcher.check_mod_mc_version
+        self.assertEqual(check(target, "[1.21.1,1.22)").kind, "compatible")
+        self.assertEqual(check(target, ">=1.20 <1.22").kind, "compatible")
+        # Same 1.21.x line, outside the declared window -> minor.
+        verdict = check(target, ">=1.21.3")
+        self.assertEqual(verdict.kind, "minor_mismatch")
+        self.assertEqual(verdict.declared, ">=1.21.3")
+        verdict = check(target, "[1.21.3,1.21.5)")
+        self.assertEqual(verdict.kind, "minor_mismatch")
+        self.assertEqual(verdict.declared, "[1.21.3,1.21.5)")
+        # A different release line entirely -> major.
+        verdict = check(target, "[1.20.1,1.20.2)")
+        self.assertEqual(verdict.kind, "major_mismatch")
+        self.assertEqual(verdict.declared, "[1.20.1,1.20.2)")
+        verdict = check(target, "1.20.x")
+        self.assertEqual(verdict.kind, "major_mismatch")
+        self.assertEqual(verdict.declared, "1.20.x")
+        # A union spanning both lines still admits a 1.21.x version: minor.
+        verdict = check(target, "1.20.x || >=1.21.3 <1.22")
+        self.assertEqual(verdict.kind, "minor_mismatch")
+        self.assertEqual(verdict.declared, "1.20.x || >=1.21.3 <1.22")
+        # Malformed input reports invalid_range with the reason preserved.
+        verdict = check(target, "bogus!!")
+        self.assertEqual(verdict.kind, "invalid_range")
+        self.assertEqual(verdict.declared, "bogus!!")
+        self.assertTrue(verdict.reason)
+        self.assertEqual(check(target, "  ").kind, "invalid_range")
 
 
 class LauncherIntegrationTests(unittest.TestCase):
@@ -777,6 +1147,156 @@ class LauncherIntegrationTests(unittest.TestCase):
         self.assertIn(
             "Built-in optimizations replace 1 mod(s) "
             "(skipped automatically): sodium", proc.stderr)
+
+    def test_neoforge_minecraft_dependency_range_gates_version(self):
+        """Real neoforge.mods.toml extraction: the [[dependencies.<mod>]]
+        entry with modId="minecraft" feeds the --mc-version gate.
+
+        `jei` declares [1.20.1,1.20.2) -> Tier 3 MC_VERSION_INCOMPATIBLE with
+        the plain-language message on both 1.21.1 and 1.21.4. `okmod` declares
+        [1.21.1,1.21.5) -> accepted on BOTH targets and still Tier 2."""
+        jei = self.mods / "jei.jar"
+        _jar(jei, "jei", mc_range="[1.20.1,1.20.2)")
+        okmod = self.mods / "okmod.jar"
+        _jar(okmod, "okmod", mc_range="[1.21.1,1.21.5)")
+        shim = self.write_shim(
+            (jei, "COMPATIBLE", []),
+            (okmod, "COMPATIBLE", []))
+        for target in ("1.21.1", "1.21.4"):
+            proc, report = self.invoke(
+                "--mc-version", target,
+                "--fallback", "delegate",
+                "--shimcheck-json", str(shim),
+                "--dry-run", "--json")
+            self.assertEqual(proc.returncode, 0, (target, proc.stderr))
+            self.assertEqual(report["mc_version"], target)
+            self.assertEqual(report["plan"], "DelegateToNeoForge")
+            triggers = report["triggering_mods"]
+            self.assertEqual([a["mod_id"] for a in triggers], ["jei"], target)
+            self.assertEqual(triggers[0]["reasons"], [
+                "MC_VERSION_INCOMPATIBLE",
+                f"built for Minecraft [1.20.1,1.20.2), "
+                f"server is running {target}",
+            ])
+            by_id = {a["mod_id"]: a for a in report["assignments"]}
+            self.assertEqual(by_id["jei"]["mc_version_range"],
+                             "[1.20.1,1.20.2)")
+            self.assertEqual(by_id["jei"]["mc_version_verdict"],
+                             "major_mismatch")
+            self.assertEqual(by_id["okmod"]["tier_name"], "BoundedJvmShim")
+            self.assertEqual(by_id["okmod"]["mc_version_range"],
+                             "[1.21.1,1.21.5)")
+            self.assertEqual(by_id["okmod"]["mc_version_verdict"],
+                             "compatible")
+
+    def test_fabric_depends_minecraft_ranges(self):
+        """fabric.mod.json `depends.minecraft` feeds the same gate: comparators,
+        tilde, wildcards, and list-OR all parse; a malformed range fails
+        closed as MC_VERSION_RANGE_INVALID instead of crashing."""
+        jars = {}
+        specs = {
+            "fab_ok": ">=1.21.1 <1.21.5",
+            "fab_tilde": "~1.21.1",
+            "fab_wild": "1.21.x",
+            "fab_list": ["1.20.x", "1.21.x"],
+            "fab_bad": "bogus!!",
+        }
+        for mod_id, depends in specs.items():
+            jar = self.mods / f"{mod_id}.jar"
+            _fabric_jar(jar, mod_id, depends)
+            jars[mod_id] = jar
+        shim = self.write_shim(
+            *[(jar, "COMPATIBLE", []) for jar in jars.values()])
+        proc, report = self.invoke(
+            "--fallback", "delegate",
+            "--shimcheck-json", str(shim),
+            "--dry-run", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["mc_version"], "1.21.1")
+        by_id = {a["mod_id"]: a for a in report["assignments"]}
+        for mod_id in ("fab_ok", "fab_tilde", "fab_wild", "fab_list"):
+            self.assertEqual(by_id[mod_id]["tier_name"], "BoundedJvmShim",
+                             mod_id)
+            self.assertEqual(by_id[mod_id]["mc_version_verdict"],
+                             "compatible", mod_id)
+        # Fabric list depends join as an OR union for the SemVer parser.
+        self.assertEqual(by_id["fab_list"]["mc_version_range"],
+                         "1.20.x || 1.21.x")
+        # The malformed range fails closed as Tier 3, never a crash.
+        self.assertEqual(by_id["fab_bad"]["tier_name"], "RequiresFallback")
+        self.assertEqual(by_id["fab_bad"]["mc_version_verdict"],
+                         "invalid_range")
+        self.assertEqual(by_id["fab_bad"]["reasons"][0],
+                         "MC_VERSION_RANGE_INVALID")
+        self.assertIn("bogus!!", by_id["fab_bad"]["reasons"][1])
+        self.assertEqual([a["mod_id"] for a in report["triggering_mods"]],
+                         ["fab_bad"])
+
+    def test_fabric_sodium_declaring_old_version_stays_superseded(self):
+        """A sodium JAR whose fabric.mod.json declares only 1.20.x is STILL
+        BuiltInSuperseded: the catalog check wins before the version gate,
+        so no Tier-3 noise is produced for it."""
+        sodium = self.mods / "sodium.jar"
+        _fabric_jar(sodium, "sodium", "1.20.x")
+        proc, report = self.invoke(
+            "--fallback", "delegate",
+            "--dry-run", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["plan"], "RunNative")
+        self.assertEqual(report["superseded_perf_mods"], ["sodium"])
+        self.assertEqual(report["triggering_mods"], [])
+        assignment = report["assignments"][0]
+        self.assertEqual(assignment["tier_name"], "BuiltInSuperseded")
+        self.assertEqual(assignment["reasons"],
+                         ["already covered by mc-spine built-in optimizations"])
+        # The declared range is still recorded for audit, verdict uncomputed.
+        self.assertEqual(assignment["mc_version_range"], "1.20.x")
+        self.assertIsNone(assignment["mc_version_verdict"])
+
+    def test_datapack_pack_format_gates_version(self):
+        """pack.mcmeta pack_format/supported_formats are gated for pure-data
+        packs: a 48+[48,61] pack loads on 1.21.1 and 1.21.4; a pack_format 26
+        datapack directory reports PACK_FORMAT_INCOMPATIBLE on 1.21.1."""
+        okpack = self.mods / "okpack.zip"
+        _data_zip(okpack, [
+            ("pack.mcmeta",
+             '{"pack":{"pack_format":48,"supported_formats":[48,61]}}'),
+            ("data/okpack/recipes/thing.json",
+             '{"type":"minecraft:crafting_shaped"}'),
+        ])
+        oldpack = self.mods / "oldpack"
+        (oldpack / "data" / "oldpack" / "recipes").mkdir(parents=True)
+        (oldpack / "pack.mcmeta").write_text(
+            '{"pack":{"pack_format":26}}', encoding="utf-8")
+        (oldpack / "data" / "oldpack" / "recipes" / "thing.json").write_text(
+            '{"type":"minecraft:crafting_shaped"}', encoding="utf-8")
+        for target in ("1.21.1", "1.21.4"):
+            proc, report = self.invoke(
+                "--mc-version", target,
+                "--fallback", "delegate",
+                "--dry-run", "--json")
+            self.assertEqual(proc.returncode, 0, (target, proc.stderr))
+            self.assertEqual(report["plan"], "DelegateToNeoForge")
+            by_id = {a["mod_id"]: a for a in report["assignments"]}
+            # 48 in [48,61] covers both 1.21.1 (pf 48) and 1.21.4 (pf 61).
+            self.assertEqual(by_id["okpack"]["tier_name"],
+                             "UniversalNative", target)
+            self.assertEqual(by_id["okpack"]["pack_format"], 48)
+            # pack_format 26 never covers a 1.21.x target.
+            self.assertEqual(by_id["oldpack"]["tier_name"],
+                             "RequiresFallback", target)
+            self.assertEqual(by_id["oldpack"]["reasons"][0],
+                             "PACK_FORMAT_INCOMPATIBLE", target)
+            self.assertIn("pack_format 26", by_id["oldpack"]["reasons"][1])
+            self.assertIn(target, by_id["oldpack"]["reasons"][1])
+            self.assertEqual([a["mod_id"] for a in report["triggering_mods"]],
+                             ["oldpack"], target)
+
+    def test_invalid_mc_version_flag_fails_closed(self):
+        proc, _ = self.invoke("--mc-version", "bogus",
+                              "--dry-run", "--json")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("invalid --mc-version", proc.stderr)
 
     def test_human_report_prints_tier_table(self):
         create = self.mods / "create.jar"

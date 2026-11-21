@@ -31,6 +31,16 @@ Dimension-adding mods shipping `data/<ns>/dimension_type/*.json` plus
 JSON report; pure data-driven ones (vanilla noise/flat/void generators, no
 custom ChunkGenerator) stay Tier 1 and launch with zero JVM.
 
+Every entry also passes a Minecraft version gate (after the superseded check,
+before every other tier check — classify_mod_for_version in fallback.rs): a
+declared neoforge.mods.toml/mods.toml `versionRange`, fabric.mod.json
+`depends.minecraft` range, or pure-data pack.mcmeta `pack_format` that does
+not cover --mc-version (default 1.21.1, mirroring McVersion::CURRENT) yields
+Tier 3 with MC_VERSION_INCOMPATIBLE / MC_VERSION_RANGE_INVALID /
+PACK_FORMAT_INCOMPATIBLE plus a plain-language reason, so a mod built for
+another Minecraft release never silently executes broken native code. The
+declared range and verdict are recorded per assignment in the JSON report.
+
 Fallback policies when >= 1 Tier 3 mod exists:
 
   strict     : refuse startup before binding TCP (exit 2) with reason codes
@@ -48,6 +58,7 @@ Exit status: 0 launched (or --dry-run plan computed), 1 launcher error,
 """
 
 import argparse
+from collections import namedtuple
 import gzip
 import json
 import os
@@ -110,6 +121,9 @@ REASON_REFUSE_QUARANTINE = (
 CODE_MISSING_SHIMCHECK = "MISSING_SHIMCHECK_REPORT"
 CODE_UNSCANNABLE = "UNSCANNABLE_JAVA_MOD"
 CODE_CUSTOM_CHUNK_GENERATOR = "CUSTOM_CHUNK_GENERATOR"
+CODE_MC_VERSION_INCOMPATIBLE = "MC_VERSION_INCOMPATIBLE"
+CODE_MC_VERSION_RANGE_INVALID = "MC_VERSION_RANGE_INVALID"
+CODE_PACK_FORMAT_INCOMPATIBLE = "PACK_FORMAT_INCOMPATIBLE"
 
 # `dimension/` `generator.type` values the native Track 2 dynamic-dimension
 # path executes with zero JVM (mirrors `GeneratorKind` in
@@ -121,6 +135,401 @@ NATIVE_DIMENSION_GENERATORS = frozenset(
 IDENTIFIER = re.compile(rb"[a-z0-9_.\-]{1,64}:[a-z0-9_/.\-]{1,128}")
 TABLE_HEADER = re.compile(r"^\s*\[\[?\s*([^\]]+)\s*\]?\]")
 MODID_LINE = re.compile(r"""^\s*modId\s*=\s*['"]([^'"]+)['"]""")
+VERSION_RANGE_LINE = re.compile(
+    r"""^\s*versionRange\s*=\s*['"]([^'"]*)['"]""")
+
+
+# ---------------------------------------------------------------------------
+# Multi-version compatibility engine — exact port of
+# mod-adapter-core/src/version_compat.rs. Pure stdlib, fail closed: every
+# malformed version or range string raises VersionRangeError (or returns
+# None/False) instead of crashing, so a corrupt mod manifest degrades to a
+# clean "incompatible" diagnostic rather than a launcher exception.
+#
+# Supported range syntaxes:
+#   NeoForge / Forge / Maven intervals : exact pins [1.21.1], closed/open
+#       intervals [1.21.1,1.21.5) / (1.21,1.22], unbounded ends [1.21.1,) /
+#       (,1.21.5), comma-separated unions (,1.20.5],[1.21.1,), bare versions.
+#   Fabric / SemVer                    : comparators >=1.21.1 <=1.21.4 >1.21
+#       <1.22 =1.21.1, tilde ~1.21.1 (>=1.21.1 <1.22.0), caret ^1.21.1
+#       (>=1.21.1 <2.0.0), wildcards 1.21.x / 1.21.* / *, space-separated AND
+#       predicates (>=1.21.1 <1.21.5), and || OR unions (1.21.1 || 1.21.4).
+#       Partial versions cover their whole band (npm convention): bare/`=`
+#       `1.21` means `1.21.x`, so `>1.21` is `>=1.22.0`.
+# ---------------------------------------------------------------------------
+
+# The Minecraft version this mc-spine runtime implements, mirroring
+# McVersion::CURRENT; the default for --mc-version.
+DEFAULT_MC_VERSION = (1, 21, 1)
+
+_KEY_MAX = (1 << 64) - 1  # u64::MAX — unbounded interval end.
+_ASCII_WS = " \t\n\r\x0c"  # Rust is_ascii_whitespace: ' ' \t \n \x0C \r
+
+# pack_format / DataVersion tables covering the 1.20.4-1.21.5 line mc-spine
+# ships profiles for (mirrors data_pack_format_for / data_version_for).
+_DATA_PACK_FORMATS = {
+    (1, 20, 4): 26,
+    (1, 20, 6): 41,
+    (1, 21, 0): 48,
+    (1, 21, 1): 48,
+    (1, 21, 3): 57,
+    (1, 21, 4): 61,
+    (1, 21, 5): 71,
+}
+_DATA_VERSIONS = {
+    (1, 20, 4): 3700,
+    (1, 20, 6): 3839,
+    (1, 21, 0): 3953,
+    (1, 21, 1): 3955,
+    (1, 21, 3): 4082,
+    (1, 21, 4): 4189,
+    (1, 21, 5): 4325,
+}
+
+# Kind values mirror VersionCompatVerdict in version_compat.rs.
+VersionVerdict = namedtuple("VersionVerdict", ("kind", "declared", "reason"))
+
+
+class VersionRangeError(Exception):
+    """Fail-closed error from parsing a declared version range."""
+
+
+def _vkey(version):
+    """Total-order key packing (major, minor, patch) into one int."""
+    return (version[0] << 32) | (version[1] << 16) | version[2]
+
+
+def format_mc_version(version):
+    """`major.minor.patch` display of a (major, minor, patch) triple."""
+    return "%d.%d.%d" % version
+
+
+def _parse_numeric_version(text):
+    """1-3 all-digit components (mirror of parse_numeric_version)."""
+    if not text:
+        raise VersionRangeError("empty version")
+    parts = text.split(".")
+    if len(parts) > 3:
+        raise VersionRangeError(
+            f"version '{text}' has more than three components")
+    numbers = [0, 0, 0]
+    for i, part in enumerate(parts):
+        if not part or not part.isascii() or not part.isdigit():
+            raise VersionRangeError(
+                f"version '{text}' has non-numeric component '{part}'")
+        numbers[i] = int(part)
+        if numbers[i] > 0xFFFF:
+            raise VersionRangeError(
+                f"version '{text}' component '{part}' out of range")
+    return tuple(numbers)
+
+
+def parse_mc_version(text):
+    """Parse '1.21.1', '1.21' (=1.21.0), or '1' (=1.0.0); None on invalid."""
+    try:
+        return _parse_numeric_version(text.strip())
+    except VersionRangeError:
+        return None
+
+
+def _parse_spec(text):
+    """SemVer-ish version spec -> (lo triple, specified) — parse_spec port.
+
+    `specified` counts the leading numeric components: `1.21.x` -> 2,
+    `1.x`/`1` -> 1, `*` -> 0.
+    """
+    text = text.strip()
+    if text[:1] in ("v", "V"):
+        text = text[1:]
+    text = text.split("+", 1)[0]
+    if not text:
+        raise VersionRangeError("empty version spec")
+    if "-" in text:
+        raise VersionRangeError(
+            f"prerelease/hyphenated spec '{text}' is unsupported "
+            "(use an explicit range)")
+    parts = text.split(".")
+    if len(parts) > 3:
+        raise VersionRangeError(
+            f"version spec '{text}' has more than three components")
+    lo = [0, 0, 0]
+    specified = len(parts)
+    saw_wildcard = False
+    for i, part in enumerate(parts):
+        if not part:
+            raise VersionRangeError(
+                f"version spec '{text}' has an empty component")
+        if part in ("x", "X", "*"):
+            saw_wildcard = True
+            if specified == len(parts):
+                specified = i
+            continue
+        if saw_wildcard:
+            raise VersionRangeError(
+                f"version spec '{text}' has a numeric component after "
+                "a wildcard")
+        if not part.isascii() or not part.isdigit():
+            raise VersionRangeError(
+                f"version spec '{text}' has non-numeric component '{part}'")
+        lo[i] = int(part)
+        if lo[i] > 0xFFFF:
+            raise VersionRangeError(
+                f"version spec '{text}' component '{part}' out of range")
+    return lo, specified
+
+
+def _spec_lo_key(lo):
+    return (lo[0] << 32) | (lo[1] << 16) | lo[2]
+
+
+def _spec_band_hi(lo, specified):
+    """Exclusive upper key of the spec band: 1.21.1->1.21.2, 1.21.x->1.22.0."""
+    if specified == 0:
+        return _KEY_MAX
+    if specified == 1:
+        return (lo[0] + 1) << 32
+    if specified == 2:
+        return (lo[0] << 32) | ((lo[1] + 1) << 16)
+    return _spec_lo_key(lo) + 1
+
+
+_PREDICATE_OPS = ("~", "^", ">=", "<=", ">", "<", "=")
+
+
+def _predicate_interval(tok):
+    """One SemVer predicate token -> inclusive [lo, hi] key interval."""
+    if tok in ("*", "x", "X"):
+        return 0, _KEY_MAX
+    op, body = "", tok
+    for candidate in _PREDICATE_OPS:
+        if tok.startswith(candidate):
+            op, body = candidate, tok[len(candidate):]
+            break
+    if not body:
+        raise VersionRangeError(f"predicate '{tok}' is missing a version")
+    spec_lo, specified = _parse_spec(body)
+    if specified == 0:
+        # `*`, `~*`, `^*`, `>=1.x` style: wildcard-only spec matches anything.
+        return 0, _KEY_MAX
+    lo = _spec_lo_key(spec_lo)
+    hi_band = _spec_band_hi(spec_lo, specified)
+    if op == ">=":
+        return lo, _KEY_MAX
+    if op == ">":
+        return hi_band, _KEY_MAX
+    if op == "<=":
+        return (0, lo) if specified == 3 else (0, hi_band - 1)
+    if op == "<":
+        if lo == 0:
+            return 1, 0  # `<0.0.0` matches nothing; empty interval marker.
+        return 0, lo - 1
+    if op == "=":
+        return lo, hi_band - 1
+    if op == "~":
+        # Tilde keeps the minor band: `~1.21.1` is `>=1.21.1 <1.22.0`,
+        # `~1` is `>=1.0.0 <2.0.0`.
+        hi = ((spec_lo[0] << 32) | ((spec_lo[1] + 1) << 16)
+              if specified >= 2 else (spec_lo[0] + 1) << 32)
+        return lo, hi - 1
+    if op == "^":
+        # Caret allows everything below the leftmost non-zero component's
+        # increment: `^1.21.1` <2.0.0, `^0.2.3` <0.3.0, `^0.0.3` <0.0.4,
+        # `^0.0` <0.1.0, `^0` <1.0.0.
+        if spec_lo[0] > 0:
+            hi = (spec_lo[0] + 1) << 32
+        elif specified >= 2 and spec_lo[1] > 0:
+            hi = (spec_lo[1] + 1) << 16
+        elif specified == 3:
+            hi = spec_lo[2] + 1
+        elif specified == 2:
+            hi = 1 << 16
+        else:
+            hi = 1 << 32
+        return lo, hi - 1
+    # Bare spec: a full `1.21.1` pins exactly, a partial `1.21`/`1` covers
+    # its whole band (`1.21.x`-style), matching SemVer range convention.
+    return lo, hi_band - 1
+
+
+def _parse_maven_member(text, i):
+    """One bracketed Maven interval member starting at text[i] ('[' or '(').
+
+    Returns (lo, hi, next_index) with lo/hi inclusive version keys and
+    next_index just past the closer.
+    """
+    open_incl = text[i] == "["
+    close = -1
+    for j in range(i + 1, len(text)):
+        if text[j] in "])":
+            close = j
+            break
+    if close < 0:
+        raise VersionRangeError(f"unterminated interval in '{text}'")
+    close_incl = text[close] == "]"
+    inner = text[i + 1:close]
+    parts = inner.split(",")
+    if len(parts) == 1:
+        pin = parts[0].strip()
+        if not pin:
+            raise VersionRangeError(f"empty interval '{inner}' in '{text}'")
+        if not open_incl:
+            raise VersionRangeError(
+                f"exact pin '{inner}' in '{text}' must use square brackets")
+        key = _vkey(_parse_numeric_version(pin))
+        return key, key, close + 1
+    if len(parts) == 2:
+        lo_s, hi_s = parts[0].strip(), parts[1].strip()
+        if lo_s:
+            key = _vkey(_parse_numeric_version(lo_s))
+            lo = key if open_incl else key + 1
+        else:
+            lo = 0
+        if hi_s:
+            key = _vkey(_parse_numeric_version(hi_s))
+            hi = key if close_incl else max(key - 1, 0)
+        else:
+            hi = _KEY_MAX
+        return lo, hi, close + 1
+    raise VersionRangeError(
+        f"interval '{inner}' in '{text}' has more than two bounds")
+
+
+def _parse_maven_range(text):
+    """Maven/NeoForge range -> union of inclusive version-key intervals."""
+    intervals = []
+    i, n = 0, len(text)
+    while True:
+        while i < n and text[i] in _ASCII_WS:
+            i += 1
+        if i >= n:
+            if not intervals:
+                raise VersionRangeError("empty version range")
+            raise VersionRangeError(f"trailing separator in '{text}'")
+        if text[i] in "[(":
+            lo, hi, i = _parse_maven_member(text, i)
+            intervals.append((lo, hi))
+        else:
+            # Bare member inside the list: exact pin (`(,1.0],1.2` style).
+            end = text.find(",", i)
+            end = n if end < 0 else end
+            member = text[i:end].strip()
+            if not member:
+                raise VersionRangeError(f"empty list member in '{text}'")
+            key = _vkey(_parse_numeric_version(member))
+            intervals.append((key, key))
+            i = end
+        while i < n and text[i] in _ASCII_WS:
+            i += 1
+        if i >= n:
+            break
+        if text[i] != ",":
+            raise VersionRangeError(
+                f"expected ',' between intervals in '{text}'")
+        i += 1
+    return intervals
+
+
+def _parse_semver_range(text):
+    """Fabric/SemVer range -> union of inclusive version-key intervals."""
+    intervals = []
+    for arm in text.split("||"):
+        arm = arm.strip()
+        if not arm:
+            raise VersionRangeError(f"empty '||' arm in '{text}'")
+        lo, hi = 0, _KEY_MAX
+        tokens = arm.split()
+        j = 0
+        while j < len(tokens):
+            tok = tokens[j]
+            # Tolerate `>= 1.21.1`: a lone operator binds the next token.
+            if tok in _PREDICATE_OPS and j + 1 < len(tokens):
+                tok += tokens[j + 1]
+                j += 1
+            bound_lo, bound_hi = _predicate_interval(tok)
+            lo = max(lo, bound_lo)
+            hi = min(hi, bound_hi)
+            j += 1
+        intervals.append((lo, hi))
+    return intervals
+
+
+class VersionRange:
+    """Parsed declared range: a union of inclusive version-key intervals."""
+
+    def __init__(self, declared, intervals):
+        self.declared = declared
+        self.intervals = intervals
+
+    def contains(self, version):
+        key = _vkey(version)
+        return any(lo <= key <= hi for lo, hi in self.intervals)
+
+    def overlaps_minor_band(self, version):
+        """Whether the range admits any version on version's major.minor line."""
+        lo = _vkey((version[0], version[1], 0))
+        hi = _vkey((version[0], version[1], 0xFFFF))
+        return any(a <= hi and b >= lo for a, b in self.intervals)
+
+
+def parse_version_range(declared):
+    """Parse `declared`: Maven when it opens with '['/'(', else Fabric SemVer.
+
+    Empty or malformed input raises VersionRangeError — fail closed, never a
+    crash on a corrupt manifest.
+    """
+    trimmed = declared.strip()
+    if not trimmed:
+        raise VersionRangeError("empty version range")
+    intervals = (_parse_maven_range(trimmed) if trimmed[0] in "[("
+                 else _parse_semver_range(trimmed))
+    return VersionRange(trimmed, intervals)
+
+
+def check_mod_mc_version(target, declared_range):
+    """Check one mod's declared range against the server's target version.
+
+    Mirrors check_mod_mc_version in version_compat.rs: returns a
+    VersionVerdict with kind "compatible" | "minor_mismatch" |
+    "major_mismatch" | "invalid_range".
+    """
+    declared = declared_range.strip()
+    try:
+        vrange = parse_version_range(declared_range)
+    except VersionRangeError as error:
+        return VersionVerdict("invalid_range", declared, str(error))
+    if vrange.contains(target):
+        return VersionVerdict("compatible", None, None)
+    if vrange.overlaps_minor_band(target):
+        return VersionVerdict("minor_mismatch", declared, None)
+    return VersionVerdict("major_mismatch", declared, None)
+
+
+def data_pack_format_for(version):
+    """pack.mcmeta `pack_format` for version, or None outside the table."""
+    return _DATA_PACK_FORMATS.get(version)
+
+
+def data_version_for(version):
+    """Mojang `DataVersion` for version, or None outside the table."""
+    return _DATA_VERSIONS.get(version)
+
+
+def check_pack_format(target, pack_format, supported_min=None,
+                      supported_max=None):
+    """Whether a datapack declaring `pack_format` (and optionally a
+    `supported_formats` [min, max] span, as pack.mcmeta allows since 1.20.2)
+    is loadable on a server running `target`. Fail closed when `target` has
+    no known pack_format."""
+    target_pf = data_pack_format_for(target)
+    if target_pf is None:
+        return False
+    if target_pf == pack_format:
+        return True
+    if supported_min is None and supported_max is None:
+        return False
+    lo = supported_min if supported_min is not None else 0
+    hi = supported_max if supported_max is not None else 0xFFFFFFFF
+    return lo <= target_pf <= hi
 
 
 class LauncherError(Exception):
@@ -226,6 +635,101 @@ def _mod_ids_from_toml(text):
     return ids
 
 
+def _mc_version_range_from_toml(text):
+    """`versionRange` of the `[[dependencies.*]]` entry declaring
+    `modId = "minecraft"` in a neoforge.mods.toml / mods.toml, or None."""
+    try:
+        import tomllib
+
+        document = tomllib.loads(text)
+    except Exception:
+        document = None
+    if isinstance(document, dict):
+        dependencies = document.get("dependencies")
+        if isinstance(dependencies, dict):
+            for owner in sorted(dependencies):
+                entries = dependencies[owner]
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if (isinstance(entry, dict)
+                            and isinstance(entry.get("modId"), str)
+                            and entry["modId"].lower() == "minecraft"
+                            and isinstance(entry.get("versionRange"), str)):
+                        return entry["versionRange"]
+    # Line-scan fallback when tomllib is unavailable or the parse failed.
+    in_dep = False
+    dep_id = None
+    dep_range = None
+    for line in text.splitlines():
+        header = TABLE_HEADER.match(line)
+        if header:
+            if (dep_id is not None and dep_id.lower() == "minecraft"
+                    and dep_range is not None):
+                return dep_range
+            name = header.group(1).strip()
+            in_dep = "[[" in line and name.startswith("dependencies.")
+            dep_id = dep_range = None
+            continue
+        if not in_dep:
+            continue
+        match = MODID_LINE.match(line)
+        if match:
+            dep_id = match.group(1)
+            continue
+        match = VERSION_RANGE_LINE.match(line)
+        if match:
+            dep_range = match.group(1)
+    if (dep_id is not None and dep_id.lower() == "minecraft"
+            and dep_range is not None):
+        return dep_range
+    return None
+
+
+def _mc_version_range_from_fabric(doc):
+    """`depends.minecraft` from a parsed fabric.mod.json, or None.
+
+    A string is one range; a list is a set of alternatives (OR per the
+    Fabric Loader spec), joined as a `||` union for the SemVer parser.
+    """
+    depends = doc.get("depends") if isinstance(doc, dict) else None
+    if not isinstance(depends, dict):
+        return None
+    declared = depends.get("minecraft")
+    if isinstance(declared, str):
+        return declared
+    if isinstance(declared, list):
+        parts = [d for d in declared if isinstance(d, str)]
+        if parts:
+            return " || ".join(parts)
+    return None
+
+
+def _supported_formats_span(value):
+    """pack.mcmeta `supported_formats` -> (min, max); each int or None.
+
+    Accepts the three Mojang spellings: a bare int (exact), a `[min, max]`
+    list, or `{"min_inclusive": n, "max_inclusive": n}`.
+    """
+    if isinstance(value, bool):
+        return None, None
+    if isinstance(value, int):
+        return value, value
+    if isinstance(value, (list, tuple)):
+        lo = value[0] if len(value) >= 1 else None
+        hi = value[1] if len(value) >= 2 else None
+        lo = lo if isinstance(lo, int) and not isinstance(lo, bool) else None
+        hi = hi if isinstance(hi, int) and not isinstance(hi, bool) else None
+        return lo, hi
+    if isinstance(value, dict):
+        lo = value.get("min_inclusive")
+        hi = value.get("max_inclusive")
+        lo = lo if isinstance(lo, int) and not isinstance(lo, bool) else None
+        hi = hi if isinstance(hi, int) and not isinstance(hi, bool) else None
+        return lo, hi
+    return None, None
+
+
 class DiscoveredMod:
     """Audit summary of one mods/ entry (mirrors `DiscoveredMod` in fallback.rs)."""
 
@@ -244,9 +748,20 @@ class DiscoveredMod:
         self.custom_chunk_generators = []
         self.ore_tag_blocks = []
         self.chest_tag_blocks = []
+        # Declared Minecraft version range in either loader syntax — Maven
+        # interval from neoforge.mods.toml/mods.toml `versionRange`, or SemVer
+        # from fabric.mod.json `depends.minecraft` (mirrors DiscoveredMod's
+        # `mc_version_range: Option<String>` in fallback.rs). None means the
+        # mod declares nothing and the --mc-version gate does not apply.
+        self.mc_version_range = None
+        # pack.mcmeta metadata for pure-data zips / datapack directories.
+        self.pack_format = None
+        self.pack_supported_min = None
+        self.pack_supported_max = None
         declared = []
         namespaces = []
         toml_text = None
+        fabric_range = None
         for name, read in _entries_of(source):
             lowered = name.lower()
             if lowered.endswith(".class"):
@@ -259,10 +774,26 @@ class DiscoveredMod:
             elif lowered == "fabric.mod.json":
                 try:
                     doc = json.loads(read())
-                    if isinstance(doc.get("id"), str):
-                        declared.append(doc["id"])
+                    if isinstance(doc, dict):
+                        if isinstance(doc.get("id"), str):
+                            declared.append(doc["id"])
+                        fabric_range = _mc_version_range_from_fabric(doc)
                 except (OSError, ValueError):
                     pass
+            elif lowered == "pack.mcmeta":
+                try:
+                    doc = json.loads(read())
+                except (OSError, ValueError):
+                    doc = None
+                pack = doc.get("pack") if isinstance(doc, dict) else None
+                if isinstance(pack, dict):
+                    pack_format = pack.get("pack_format")
+                    if (isinstance(pack_format, int)
+                            and not isinstance(pack_format, bool)):
+                        self.pack_format = pack_format
+                    self.pack_supported_min, self.pack_supported_max = (
+                        _supported_formats_span(
+                            pack.get("supported_formats")))
             elif lowered == "quilt.mod.json":
                 try:
                     doc = json.loads(read())
@@ -291,8 +822,14 @@ class DiscoveredMod:
                         self.ore_tag_blocks.extend(_tag_member_ids(read))
                     elif leaf.startswith("chests"):
                         self.chest_tag_blocks.extend(_tag_member_ids(read))
+        toml_range = None
         if toml_text is not None:
             declared = _mod_ids_from_toml(toml_text) + declared
+            toml_range = _mc_version_range_from_toml(toml_text)
+        # A NeoForge/Forge minecraft dependency wins over fabric.mod.json when
+        # a jar somehow ships both manifests.
+        self.mc_version_range = (
+            toml_range if toml_range is not None else fabric_range)
         unique_ns = sorted(set(namespaces))
         if declared:
             self.mod_ids = sorted(set(declared))
@@ -480,12 +1017,16 @@ def apply_shimcheck(mods, reports):
 
 
 class Assignment:
-    def __init__(self, mod, tier, reasons):
+    def __init__(self, mod, tier, reasons, mc_version_verdict=None):
         self.mod_id = mod.mod_id
         self.mod_ids = list(mod.mod_ids)
         self.tier = tier
         self.reasons = reasons
         self.source = str(mod.source)
+        self.mc_version_range = getattr(mod, "mc_version_range", None)
+        self.mc_version_verdict = (
+            mc_version_verdict.kind if mc_version_verdict else None)
+        self.pack_format = getattr(mod, "pack_format", None)
 
     def as_dict(self):
         return {
@@ -494,15 +1035,43 @@ class Assignment:
             "tier_name": TIER_NAMES[self.tier],
             "source": self.source,
             "reasons": self.reasons,
+            "mc_version_range": self.mc_version_range,
+            "mc_version_verdict": self.mc_version_verdict,
+            "pack_format": self.pack_format,
         }
 
 
-def classify(mod, flagship_ids, profile_ids):
-    """Exact port of the tier cascade in fallback.rs `plan_mod_startup`."""
-    if is_builtin_superseded(mod):
-        # Checked before flagship/ShimCheck/Tier 3: a superseded perf mod's
-        # Mixins must never reach the fallback cascade.
-        return TIER_SUPERSEDED, [REASON_SUPERSEDED]
+def _pack_format_verdict(mod, target):
+    """PACK_FORMAT_INCOMPATIBLE detail text for a pure-data pack, or None.
+
+    Mirrors check_pack_format in version_compat.rs: compatible (or undeclared)
+    pack metadata returns None; an incompatible declaration returns the
+    operator-facing explanation that follows the reason code.
+    """
+    pack_format = getattr(mod, "pack_format", None)
+    if pack_format is None:
+        return None
+    supported_min = getattr(mod, "pack_supported_min", None)
+    supported_max = getattr(mod, "pack_supported_max", None)
+    if check_pack_format(target, pack_format, supported_min, supported_max):
+        return None
+    span = ""
+    if supported_min is not None or supported_max is not None:
+        lo = str(supported_min) if supported_min is not None else "0"
+        hi = str(supported_max) if supported_max is not None else "any"
+        span = f" (supported_formats {lo}-{hi})"
+    target_pf = data_pack_format_for(target)
+    target_str = format_mc_version(target)
+    if target_pf is None:
+        return (f"declares pack_format {pack_format}{span}; server is running "
+                f"Minecraft {target_str}, which has no known datapack format")
+    return (f"declares pack_format {pack_format}{span}, server is running "
+            f"Minecraft {target_str} (pack_format {target_pf})")
+
+
+def _classify_execution_path(mod, flagship_ids, profile_ids, target):
+    """Tier 0/1/2/3 cascade below the superseded catalog and the Minecraft
+    version gate (mirrors classify_execution_path in fallback.rs)."""
     owned = set(mod.mod_ids)
     if owned & flagship_ids:
         return 0, [REASON_FLAGSHIP]
@@ -510,7 +1079,15 @@ def classify(mod, flagship_ids, profile_ids):
         # A modded Java ChunkGenerator cannot run on the native Track 2
         # dynamic-dimension path or the bounded shim: explicit Tier 3.
         return 3, [CODE_CUSTOM_CHUNK_GENERATOR]
-    if not mod.has_java_bytecode or owned & profile_ids:
+    if not mod.has_java_bytecode:
+        # Pure-data zips / datapack directories: gate pack.mcmeta's declared
+        # pack_format (plus optional supported_formats span) against the
+        # target so a pack built for another data format never silently runs.
+        pack_verdict = _pack_format_verdict(mod, target)
+        if pack_verdict is not None:
+            return 3, [CODE_PACK_FORMAT_INCOMPATIBLE, pack_verdict]
+        return 1, [REASON_UNIVERSAL]
+    if owned & profile_ids:
         return 1, [REASON_UNIVERSAL]
     if mod.shimcheck_compatible and not mod.has_unsupported_mixin_or_at:
         return 2, [REASON_SHIM]
@@ -518,28 +1095,65 @@ def classify(mod, flagship_ids, profile_ids):
     return 3, reasons
 
 
+def _classify_full(mod, flagship_ids, profile_ids, target):
+    """(tier, reasons, mc_version_verdict) — classify_mod_for_version port."""
+    if is_builtin_superseded(mod):
+        # Checked before the version gate and every other step: a superseded
+        # perf mod built for another Minecraft version (e.g. sodium declaring
+        # 1.20.1) stays a clean BuiltInSuperseded skip with zero fallback
+        # noise — its range is recorded but never gated on.
+        return TIER_SUPERSEDED, [REASON_SUPERSEDED], None
+    verdict = None
+    declared = getattr(mod, "mc_version_range", None)
+    if declared is not None:
+        verdict = check_mod_mc_version(target, declared)
+        target_str = format_mc_version(target)
+        if verdict.kind == "invalid_range":
+            return 3, [CODE_MC_VERSION_RANGE_INVALID,
+                       f"declares an invalid Minecraft version range "
+                       f"'{verdict.declared}' ({verdict.reason}); cannot "
+                       f"confirm it supports server {target_str}"], verdict
+        if verdict.kind in ("minor_mismatch", "major_mismatch"):
+            return 3, [CODE_MC_VERSION_INCOMPATIBLE,
+                       f"built for Minecraft {verdict.declared}, server is "
+                       f"running {target_str}"], verdict
+    tier, reasons = _classify_execution_path(
+        mod, flagship_ids, profile_ids, target)
+    return tier, reasons, verdict
+
+
+def classify(mod, flagship_ids, profile_ids, target=DEFAULT_MC_VERSION):
+    """Exact port of `classify_mod_for_version` in fallback.rs."""
+    tier, reasons, _ = _classify_full(mod, flagship_ids, profile_ids, target)
+    return tier, reasons
+
+
 def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
-                 load_safe_data_only=False, force_drop_saved_blocks=False):
-    """Exact port of `plan_mod_startup`; returns a dict plan."""
+                 load_safe_data_only=False, force_drop_saved_blocks=False,
+                 target_mc_version=DEFAULT_MC_VERSION):
+    """Exact port of `plan_mod_startup_for_version`; returns a dict plan."""
     assignments = []
     tier3 = []
     superseded = []
     needs_bounded_jvm = False
     for mod in mods:
-        tier, reasons = classify(mod, flagship_ids, profile_ids)
+        tier, reasons, verdict = _classify_full(
+            mod, flagship_ids, profile_ids, target_mc_version)
         if tier == 2:
             needs_bounded_jvm = True
-        assignment = Assignment(mod, tier, reasons)
+        assignment = Assignment(mod, tier, reasons, verdict)
         assignments.append(assignment)
         if tier == 3:
             tier3.append(assignment)
         elif tier == TIER_SUPERSEDED:
             superseded.append(assignment)
     superseded_ids = sorted({a.mod_id for a in superseded})
+    mc_version = format_mc_version(target_mc_version)
 
     if not tier3:
         return {
             "plan": "RunNative",
+            "mc_version": mc_version,
             "assignments": assignments,
             "needs_bounded_jvm": needs_bounded_jvm,
             "quarantined_mods": [],
@@ -549,6 +1163,7 @@ def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
     if policy == "strict":
         return {
             "plan": "RefuseStartup",
+            "mc_version": mc_version,
             "reason": REASON_REFUSE_STRICT,
             "blocking_mods": tier3,
             "assignments": assignments,
@@ -560,6 +1175,7 @@ def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
             if endangered:
                 return {
                     "plan": "RefuseStartup",
+                    "mc_version": mc_version,
                     "reason": REASON_REFUSE_QUARANTINE,
                     "blocking_mods": endangered,
                     "assignments": assignments,
@@ -567,6 +1183,7 @@ def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
                 }
         return {
             "plan": "RunNative",
+            "mc_version": mc_version,
             "assignments": [a for a in assignments if a.tier != 3],
             "needs_bounded_jvm": needs_bounded_jvm,
             "quarantined_mods": tier3,
@@ -576,6 +1193,7 @@ def plan_startup(mods, flagship_ids, profile_ids, saved_namespaces, policy,
     if policy == "delegate":
         return {
             "plan": "DelegateToNeoForge",
+            "mc_version": mc_version,
             "triggering_mods": tier3,
             "assignments": assignments,
             "superseded_perf_mods": superseded_ids,
@@ -686,6 +1304,7 @@ def build_report(args, plan, launch):
         "schema": "mc-spine-mod-launcher/1",
         "mods_dir": str(args.mods_dir),
         "policy": args.fallback,
+        "mc_version": plan.get("mc_version"),
         "plan": plan["plan"],
         "needs_bounded_jvm": bool(plan.get("needs_bounded_jvm")),
         "assignments": [a.as_dict() for a in plan["assignments"]],
@@ -720,6 +1339,7 @@ def _print_table(assignments):
 def _print_human(report):
     print("== mc-spine mod startup classification ==")
     print(f"policy      : {report['policy']}")
+    print(f"mc_version  : {report['mc_version']}")
     print(f"mods_dir    : {report['mods_dir']}")
     if report["saved_world_namespaces"]:
         print(f"saved ns    : {','.join(report['saved_world_namespaces'])}")
@@ -762,6 +1382,10 @@ def main():
                         help="saved world file/dir scanned for namespaces")
     parser.add_argument("--flagship-mods", type=str, default="create",
                         help="comma-separated flagship native mod ids (default: create)")
+    parser.add_argument("--mc-version", type=str, default="1.21.1",
+                        help="Minecraft version the server runs; mod ranges and "
+                             "datapack pack_format are gated against it "
+                             "(default: 1.21.1)")
     parser.add_argument("--fallback", choices=("strict", "quarantine", "delegate"),
                         default="delegate", help="Tier 3 fallback policy (default: delegate)")
     parser.add_argument("--quarantine-load-data", action="store_true",
@@ -796,6 +1420,11 @@ def main():
         if args.save_file is not None:
             saved |= saved_namespaces_from_path(args.save_file)
         flagship_ids = {s for s in args.flagship_mods.split(",") if s}
+        target = parse_mc_version(args.mc_version)
+        if target is None:
+            raise LauncherError(
+                f"invalid --mc-version '{args.mc_version}' "
+                "(expected a numeric release like 1.21.1)")
 
         # Superseded perf mods are skipped before ShimCheck: scanning them
         # would only surface the heavy Mixins we intentionally ignore.
@@ -808,7 +1437,8 @@ def main():
         plan = plan_startup(
             mods, flagship_ids, set(profile_ids), saved, args.fallback,
             load_safe_data_only=args.quarantine_load_data,
-            force_drop_saved_blocks=args.force_drop_saved_blocks)
+            force_drop_saved_blocks=args.force_drop_saved_blocks,
+            target_mc_version=target)
         plan["saved_namespaces"] = saved
         if plan["superseded_perf_mods"]:
             log("Built-in optimizations replace {} mod(s) "
