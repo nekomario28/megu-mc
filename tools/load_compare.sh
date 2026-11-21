@@ -6,7 +6,10 @@
 # the work a player causes: streaming chunks for a view that moves, ticking the
 # world around it, and unloading what falls behind. This runs the same protocol
 # client against both servers with the same seed, world type, view distance and
-# movement script, and samples CPU/RSS over the same window.
+# movement script, and samples CPU/RSS over the same window. The driver reports
+# the chunks each server actually delivered, so the CPU is reported per chunk as
+# well as raw: a cheaper number from a server that streamed less work is not a
+# cheaper server.
 #
 #   tools/load_compare.sh [seconds] [seed]
 #
@@ -43,6 +46,12 @@ enable-rcon=false
 sync-chunk-writes=false
 network-compression-threshold=-1
 level-type=minecraft:normal
+# The viewer is a protocol driver with no world model: at ground level vanilla
+# rejects its position whenever the terrain rises, which froze the sweep after
+# two blocks. Creative skips that collision check (the ten-block move limit
+# still applies, and the driver climbs inside it), so both servers stream
+# chunks for the same moving view.
+gamemode=creative
 EOF
 }
 
@@ -55,41 +64,67 @@ wait_for_line() { # logfile pid marker timeout_s
   echo "server did not reach '$3' in $4 s"; tail -8 "$1"; return 1
 }
 
-sample_load() { # pid port loadout
-  local pid=$1 port=$2 out=$3 hz c0 c1 rss thr load
+sample_load() { # pid port loadout -> "cpu(s) rss(MiB) threads chunks ms/chunk"
+  local pid=$1 port=$2 out=$3 hz c0 c1 rss thr load chunks
   # WARM=1 spends one window driving first, so the measured window does not
   # contain the spawn/ login burst. The sweep is deterministic, so the warm pass
   # covers the first half of the path and the measured pass the second.
   if [ "${WARM:-0}" = 1 ]; then
     ( cd "$ROOT" && timeout $((SECONDS_WINDOW + 30)) \
-        python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadWarm ) >/dev/null 2>&1 || true
+        python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadWarm --view-distance 4 ) >/dev/null 2>&1 || true
   fi
   hz=$(getconf CLK_TCK)
   c0=$(awk '{print $14+$15}' "/proc/$pid/stat")
   # Let the viewer settle, then measure the same window of movement.
   sleep 3
-  load=$( ( cd "$ROOT" && timeout $((SECONDS_WINDOW + 30)) python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadA ) 2>&1 )
+  load=$( ( cd "$ROOT" && timeout $((SECONDS_WINDOW + 30)) \
+      python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadA --view-distance 4 ) 2>&1 )
   [ $? -eq 0 ] || load="LOAD failed: $load"
   c1=$(awk '{print $14+$15}' "/proc/$pid/stat")
   rss=$(awk '/VmRSS/{print $2}' "/proc/$pid/status")
   thr=$(awk '/Threads/{print $2}' "/proc/$pid/status")
   printf '%s\n' "$load" > "$out"
-  awk -v c0="$c0" -v c1="$c1" -v hz="$hz" -v rss="$rss" -v thr="$thr" \
-      'BEGIN{printf "%.3f %.1f %d", (c1-c0)/hz, rss/1024, thr}'
+  # The driver reports the chunks each server actually delivered. Without the
+  # count a CPU number is unattributable: the same window cost 4.2 s for nine
+  # vanilla chunks and 20.6 s for eighty-one mc-spine chunks.
+  chunks=$(printf '%s\n' "$load" | sed -n 's/.*chunks_login=\([0-9]*\).*chunks_drive=\([0-9]*\).*/\1 \2/p' \
+           | awk 'NF{print $1+$2; exit}')
+  [ -n "$chunks" ] || chunks=0
+  awk -v c0="$c0" -v c1="$c1" -v hz="$hz" -v rss="$rss" -v thr="$thr" -v chunks="$chunks" \
+      'BEGIN{cpu=(c1-c0)/hz; ms=(chunks>0)?cpu*1000/chunks:-1;
+             printf "%.4f %.1f %d %d %.4f", cpu, rss/1024, thr, chunks, ms}'
 }
 
+row() { # label "cpu rss threads chunks ms"
+  awk -v label="$1" -v m="$2" 'BEGIN{
+    split(m, a, " ");
+    ms = (a[5] >= 0) ? sprintf("%.2f", a[5]) : "-";
+    printf "%-12s %8.3f %9.1f %8d %9d %10s\n", label, a[1], a[2], a[3], a[4], ms;
+  }'
+}
+
+jar_ok() { [ -f "$1" ] && [ "$(sha1sum "$1" | cut -d' ' -f1)" = "$JAR_SHA1" ]; }
+
 mkdir -p "$WORK"
-if [ ! -f "$JAR" ] || [ "$(sha1sum "$JAR" | cut -d' ' -f1)" != "$JAR_SHA1" ]; then
-  if [ -f /tmp/idle-compare/server.jar ] && \
-     [ "$(sha1sum /tmp/idle-compare/server.jar | cut -d' ' -f1)" = "$JAR_SHA1" ]; then
-    cp /tmp/idle-compare/server.jar "$JAR"
-  else
-    echo "fetching the vanilla 1.21.1 server bundle"
-    URL=$(curl -sS https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
-          | python3 -c 'import json,sys;print([v for v in json.load(sys.stdin)["versions"] if v["id"]=="1.21.1"][0]["url"])')
-    URL=$(curl -sS "$URL" | python3 -c 'import json,sys;print(json.load(sys.stdin)["downloads"]["server"]["url"])')
-    curl -sS -o "$JAR" "$URL"
-  fi
+if ! jar_ok "$JAR"; then
+  # Reuse a pinned jar already on the host before reaching for the network: an
+  # offline run must measure the same build, not fail because it cannot fetch.
+  for candidate in /home/yuu/tmpx/carverfresh/server.jar /tmp/idle-compare/server.jar; do
+    if jar_ok "$candidate"; then
+      echo "reusing the pinned vanilla server jar from $candidate"
+      cp "$candidate" "$JAR"
+      break
+    fi
+  done
+fi
+if ! jar_ok "$JAR"; then
+  echo "fetching the vanilla 1.21.1 server bundle"
+  URL=$(curl -sS https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
+        | python3 -c 'import json,sys;print([v for v in json.load(sys.stdin)["versions"] if v["id"]=="1.21.1"][0]["url"])')
+  URL=$(curl -sS "$URL" | python3 -c 'import json,sys;print(json.load(sys.stdin)["downloads"]["server"]["url"])')
+  curl -sS -o "$JAR" "$URL"
+  # A fetch that lands a different build is not the pinned comparison point.
+  jar_ok "$JAR" || { echo "fetched jar does not match the pinned sha1 $JAR_SHA1" >&2; exit 1; }
 fi
 
 echo "-- vanilla, normal, seed $SEED, view 4 / sim 5, moving viewer ${SECONDS_WINDOW}s"
@@ -120,9 +155,9 @@ wait_for_line "$SPINE_DIR/spine.log" "$SPID" 'listening' 60
 SPI=$(sample_load "$SPID" "$SPINE_PORT" "$WORK/spine-load.txt")
 kill "$SPID" 2>/dev/null || true
 
-printf '\n%-12s %8s %9s %8s\n' "load ${SECONDS_WINDOW}s" "cpu(s)" "rss(MiB)" "threads"
-printf '%-12s ' vanilla;  echo "$VAN"
-printf '%-12s ' mc-spine; echo "$SPI"
+printf '\n%-12s %8s %9s %8s %9s %10s\n' "load ${SECONDS_WINDOW}s" "cpu(s)" "rss(MiB)" "threads" "chunks" "ms/chunk"
+row vanilla "$VAN"
+row mc-spine "$SPI"
 printf 'vanilla   driver: %s\n' "$(cat "$WORK/van-load.txt")"
 printf 'mc-spine  driver: %s\n' "$(cat "$WORK/spine-load.txt")"
 echo
