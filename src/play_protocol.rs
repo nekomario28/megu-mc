@@ -191,7 +191,13 @@ impl RxBuf {
             Ok(0) => RxOut::Closed,
             Ok(n) => {
                 self.buf.extend(&tmp[..n]);
-                RxOut::Idle
+                match self.try_frame() {
+                    Some(frame) => frame.unwrap_or(RxOut::Idle),
+                    None => {
+                        let _ = s.shutdown(std::net::Shutdown::Both);
+                        RxOut::Closed
+                    }
+                }
             }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -223,11 +229,17 @@ struct SocketWireState {
 
 #[derive(Default)]
 struct PlayWireState {
-    poses: HashMap<i32, EntityWirePose>,
-    window: Option<ChunkWindow>,
+    poses: HashMap<i32, TrackedWirePose>,
+    chunk_delivery: connection_limits::ChunkDelivery,
 }
 
-#[derive(Clone, Copy)]
+struct TrackedWirePose {
+    pose: EntityWirePose,
+    interval: u64,
+    last_sent_tick: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 struct EntityWirePose {
     pos: [f64; 3],
     yaw: u8,
@@ -236,12 +248,7 @@ struct EntityWirePose {
 }
 
 impl EntityWirePose {
-    fn read(payload: &[u8], spawn: bool) -> Option<Self> {
-        let mut fields = payload;
-        if spawn {
-            fields = fields.get(16..)?; // UUID
-            read_protocol_i32(&mut fields)?; // entity type
-        }
+    fn read(fields: &[u8], spawn: bool) -> Option<Self> {
         let pos = [
             f64::from_be_bytes(fields.get(..8)?.try_into().ok()?),
             f64::from_be_bytes(fields.get(8..16)?.try_into().ok()?),
@@ -290,46 +297,73 @@ impl PlayWireState {
         let Some(eid) = read_protocol_i32(&mut payload) else {
             return;
         };
-        if let Some(pose) = EntityWirePose::read(payload, true) {
-            self.poses.insert(eid, pose);
-        }
+        let Some(mut fields) = payload.get(16..) else {
+            return; // UUID
+        };
+        let Some(etype) = read_protocol_i32(&mut fields) else {
+            return;
+        };
+        let Some(pose) = EntityWirePose::read(fields, true) else {
+            return;
+        };
+        let interval = entity_spec_by_id(i64::from(etype))
+            .map_or(0, |spec| u64::from(entity_update_interval_ticks(spec.name)));
+        self.poses.insert(
+            eid,
+            TrackedWirePose {
+                pose,
+                interval,
+                last_sent_tick: None,
+            },
+        );
     }
 
-    fn update_packet(&mut self, id: &mut i64, payload: &mut Vec<u8>) {
+    fn update_packet(&mut self, id: &mut i64, payload: &mut Vec<u8>, tick: u64) -> bool {
         let mut fields = payload.as_slice();
         match *id {
             0x70 => {
                 let Some(eid) = read_protocol_i32(&mut fields) else {
-                    return;
+                    return true;
                 };
                 let Some(previous) = self.poses.get_mut(&eid) else {
-                    return;
+                    return true;
                 };
                 let Some(next) = EntityWirePose::read(fields, false) else {
-                    return;
+                    return true;
                 };
-                if let Some(packet) = previous.relative_packet(eid, next) {
+                // These producers also send teleports and impulse-driven movement.
+                // Only a repeat of the last sent pose is safe to pace by type here.
+                if previous.pose == next
+                    && previous
+                        .last_sent_tick
+                        .is_some_and(|sent| tick.wrapping_sub(sent) < previous.interval)
+                {
+                    return false;
+                }
+                if let Some(packet) = previous.pose.relative_packet(eid, next) {
                     (*id, *payload) = packet;
                 }
-                *previous = next;
+                previous.pose = next;
+                previous.last_sent_tick = Some(tick);
             }
             0x42 => {
                 let Some(count) = read_protocol_i32(&mut fields) else {
-                    return;
+                    return true;
                 };
                 for _ in 0..count {
                     let Some(eid) = read_protocol_i32(&mut fields) else {
-                        return;
+                        return true;
                     };
                     self.poses.remove(&eid);
                 }
             }
             0x47 => {
                 self.poses.clear();
-                self.window = None;
+                self.chunk_delivery.reset_window();
             }
             _ => {}
         }
+        true
     }
 }
 
@@ -384,14 +418,18 @@ fn negotiate_compression(
 }
 
 fn send_packet(s: &mut TcpStream, mut id: i64, mut payload: Vec<u8>) -> std::io::Result<()> {
+    let mut send = true;
     let compression = SOCKET_WIRE.get().and_then(|states| {
         let mut states = states.lock().unwrap();
         let state = states.get_mut(&socket_key(s))?;
         if let Some(play) = &mut state.play {
-            play.update_packet(&mut id, &mut payload);
+            send = play.update_packet(&mut id, &mut payload, TICK_IDX.load(Ordering::Relaxed));
         }
         state.compression
     });
+    if !send {
+        return Ok(());
+    }
     let mut body = Vec::new();
     write_varint(&mut body, id);
     body.extend_from_slice(&payload);
@@ -492,14 +530,18 @@ struct Client {
 }
 
 impl Client {
-    fn enter_play_wire(&self, compression: Option<usize>, window: ChunkWindow) {
+    fn enter_play_wire(
+        &self,
+        compression: Option<usize>,
+        chunk_delivery: connection_limits::ChunkDelivery,
+    ) {
         let key = socket_key(&self.sock.lock().unwrap());
         socket_wire().lock().unwrap().insert(
             key,
             SocketWireState {
                 compression,
                 play: Some(PlayWireState {
-                    window: Some(window),
+                    chunk_delivery,
                     ..PlayWireState::default()
                 }),
             },
@@ -1766,8 +1808,7 @@ fn client_info_view_distance(body: &[u8]) -> Option<i32> {
     Some(view)
 }
 
-/// The chunks in a view window: the ceiling on one batch, and the pace the
-/// client starts with before it has asked for anything.
+/// The number of chunks the current view window can hold.
 fn window_batch(view: i32) -> usize {
     let side = (2 * view + 1).max(1) as usize;
     side * side
@@ -1802,16 +1843,12 @@ impl ChunkWindow {
             .collect()
     }
 
-    fn pending(self, sent: &HashSet<(i32, i32)>, yaw: f32) -> Vec<(i32, i32)> {
+    fn unsent(self, sent: &HashSet<(i32, i32)>) -> impl Iterator<Item = (i32, i32)> + '_ {
         let (cx, cz) = self.center;
         let r = self.radius;
-        let mut chunks: Vec<_> = (cx.saturating_sub(r)..=cx.saturating_add(r))
-            .flat_map(|x| (cz.saturating_sub(r)..=cz.saturating_add(r)).map(move |z| (x, z)))
-            .filter(|c| !sent.contains(c))
-            .collect();
-        let (sin, cos) = f64::from(yaw).to_radians().sin_cos();
-        prioritize_chunks(&mut chunks, self.center, (-sin, cos));
-        chunks
+        (cx.saturating_sub(r)..=cx.saturating_add(r))
+            .flat_map(move |x| (cz.saturating_sub(r)..=cz.saturating_add(r)).map(move |z| (x, z)))
+            .filter(move |c| !sent.contains(c))
     }
 }
 
@@ -1844,10 +1881,7 @@ fn cull_chunk_light(packet: &mut Vec<u8>, dim: DimId) {
         return;
     }
     light = &light[2..];
-    let mut lists = [
-        Vec::<[u8; 2048]>::with_capacity(sky_count),
-        Vec::with_capacity(block_count),
-    ];
+    let mut lists = [Vec::with_capacity(sky_count), Vec::with_capacity(block_count)];
     for (arrays, count) in lists.iter_mut().zip([sky_count, block_count]) {
         if read_protocol_i32(&mut light) != Some(count as i32) {
             return;
@@ -1857,39 +1891,43 @@ fn cull_chunk_light(packet: &mut Vec<u8>, dim: DimId) {
                 return;
             }
             let (array, rest) = light.split_at(2048);
-            arrays.push(array.try_into().unwrap());
+            arrays.push(array);
             light = rest;
         }
     }
     if !light.is_empty() {
         return;
     }
-    let [sky, block] = lists.each_ref().map(|arrays| {
-        let (_, nonempty) = section_nonempty_masks(&[], arrays);
-        let mut present = 0u64;
-        for (i, lit) in nonempty.into_iter().enumerate() {
-            if lit {
-                present |= 1 << i;
-            }
-        }
-        (present, ((1 << arrays.len()) - 1) ^ present)
+    let bands = lists.each_ref().map(|arrays| {
+        let nonempty: Vec<_> = arrays
+            .iter()
+            .map(|section| section[0] != 0 || uniform_section(*section) != Some(0))
+            .collect();
+        // Full light-engine band, including the two boundary sections. A
+        // nonzero light array can belong to an all-air block section.
+        light_sections_in_band(&nonempty, 0, arrays.len().saturating_sub(1))
     });
-    packet.truncate(start);
-    for mask in [sky.0, block.0, sky.1, block.1] {
-        write_varint(packet, i64::from(mask != 0));
+    let [(sky, empty_sky), (block, empty_block)] = std::array::from_fn(|layer| {
+        let present = bands[layer].iter().fold(0u64, |mask, &i| mask | (1 << i));
+        (present, ((1 << lists[layer].len()) - 1) ^ present)
+    });
+    let array_bytes = (bands[0].len() + bands[1].len()) * ARRAY_WIRE_SIZE;
+    let mut sparse = Vec::with_capacity(4 * (1 + 8) + 2 + array_bytes);
+    for mask in [sky, block, empty_sky, empty_block] {
+        write_varint(&mut sparse, i64::from(mask != 0));
         if mask != 0 {
-            packet.extend_from_slice(&mask.to_be_bytes());
+            sparse.extend_from_slice(&mask.to_be_bytes());
         }
     }
-    for (mask, arrays) in [sky.0, block.0].into_iter().zip(&lists) {
-        write_varint(packet, i64::from(mask.count_ones()));
-        for (i, section) in arrays.iter().enumerate() {
-            if mask & (1 << i) != 0 {
-                write_varint(packet, section.len() as i64);
-                packet.extend_from_slice(section);
-            }
+    for (band, arrays) in bands.iter().zip(&lists) {
+        write_varint(&mut sparse, band.len() as i64);
+        for &i in band {
+            write_varint(&mut sparse, 2048);
+            sparse.extend_from_slice(arrays[i]);
         }
     }
+    packet.truncate(start);
+    packet.extend_from_slice(&sparse);
 }
 
 fn stream_chunks(
@@ -1904,8 +1942,21 @@ fn stream_chunks(
     // player crossing a chunk) - not on every batch, or a client pacing its own
     // batches would see the centre move while nothing did
     announce_center: bool,
+    // The first batch is sent before the shared Play writer has been registered.
+    initial_delivery: Option<&mut connection_limits::ChunkDelivery>,
 ) {
-    let previous = with_play_wire(s, |play| play.window.replace(window)).flatten();
+    let tick = TICK_IDX.load(Ordering::Relaxed);
+    let select = |delivery: &mut connection_limits::ChunkDelivery| {
+        let previous = delivery.window();
+        let news = delivery.next_batch(window, sent, yaw, ack, tick);
+        (previous, news)
+    };
+    let (previous, news) = if let Some(delivery) = initial_delivery {
+        select(delivery)
+    } else {
+        with_play_wire(s, |play| select(&mut play.chunk_delivery))
+            .unwrap_or_else(|| select(&mut connection_limits::ChunkDelivery::default()))
+    };
     // chunks leaving the window get an explicit unload — vanilla keeps
     // client memory bounded and the set now means exactly "chunks the
     // client holds" (updates must only target holders).
@@ -1929,16 +1980,6 @@ fn stream_chunks(
             return;
         }
     }
-    // A batch is already in flight: vanilla waits for the client's Chunk Batch
-    // Received before starting the next one, and so does this. The chunks that
-    // did not fit are simply not marked as held, so the pump that runs on the
-    // acknowledgement sends them.
-    if ack.awaiting() {
-        return;
-    }
-    let mut news = window.pending(sent, yaw);
-    // The client's requested chunks/tick bounds this batch.
-    news.truncate(ack.batch_size());
     if news.is_empty() {
         return;
     }
@@ -2009,6 +2050,29 @@ fn stream_chunks(
     if send_packet(s, 0x0c, bf).is_ok() {
         ack.sent_batch(Instant::now(), batch);
     }
+}
+
+fn pump_client_chunks(client: &Client, announce_center: bool) -> bool {
+    let mut ack = client.chunk_ack.lock().unwrap();
+    let view = *client.view.lock().unwrap();
+    let mut chunks = client.chunks.lock().unwrap();
+    let mut gen = client.gen_sources.lock().unwrap();
+    let mut socket = client.sock.lock().unwrap();
+    // Same-dimension teleports also hold the writer while changing position.
+    let (dim, x, _, z, yaw, _) = client_dim_pos(client);
+    stream_chunks(
+        &mut socket,
+        &mut chunks,
+        &mut gen,
+        &mut ack,
+        dim,
+        ChunkWindow::at(x, z, view),
+        yaw,
+        announce_center,
+        None,
+    );
+    !ack.awaiting()
+        && with_play_wire(&socket, |play| play.chunk_delivery.has_pending()).unwrap_or(false)
 }
 
 /// Skip one **unnamed-root** network NBT value (the shape carried inside a
@@ -2185,6 +2249,8 @@ fn switch_client_dimension(
     }
     // Retire everything the old world was tracking before the client drops its chunks.
     let mut seen = me.seen.lock().unwrap();
+    // Serialize the transition with the connection thread's chunk pump.
+    let mut ack = me.chunk_ack.lock().unwrap();
     if !seen.is_empty() {
         let removed: Vec<_> = seen.drain().collect();
         let _ = send_packet(
@@ -2210,10 +2276,7 @@ fn switch_client_dimension(
     drop(seen);
     *me.in_portal.lock().unwrap() = false;
     *me.fall_from.lock().unwrap() = target.1;
-    {
-        let mut ack = me.chunk_ack.lock().unwrap();
-        *ack = ChunkFeedback::new(window_batch(view));
-    }
+    *ack = connection_limits::chunk_feedback(window_batch(view));
     let gm = *me.gm.lock().unwrap();
     let mut rp = spawn_info_dim(new_dim, gm);
     rp.push(0x03); // data_kept: keep inventory and attributes across the move
@@ -2222,7 +2285,6 @@ fn switch_client_dimension(
     ge.extend_from_slice(&0f32.to_be_bytes());
     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x22, ge);
     {
-        let mut ack = me.chunk_ack.lock().unwrap();
         let mut ch = me.chunks.lock().unwrap();
         let mut gen = me.gen_sources.lock().unwrap();
         stream_chunks(
@@ -2234,6 +2296,7 @@ fn switch_client_dimension(
             ChunkWindow::at(target.0, target.2, view),
             target.3,
             true,
+            None,
         );
     }
     let mut sock = me.sock.lock().unwrap();
@@ -3152,8 +3215,8 @@ fn handle(mut s: TcpStream) {
     let mut sent: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     let mut gen: GenSources = GenSources::new();
     let mut view = client_view.clamp(2, SERVER_VIEW_DISTANCE);
-    // the window is the ceiling; the client's first acknowledgement lowers the pace
-    let mut chunk_ack = ChunkFeedback::new(window_batch(view));
+    let mut chunk_ack = connection_limits::chunk_feedback(window_batch(view));
+    let mut chunk_delivery = connection_limits::ChunkDelivery::default();
     let initial_window = ChunkWindow::at(sx, sz, view);
     // vanilla: a returning player resumes where they logged out — the chunk window,
     // spawn teleport and authoritative pos all agree. The dimension was read above,
@@ -3167,6 +3230,7 @@ fn handle(mut s: TcpStream) {
         initial_window,
         syaw,
         true,
+        Some(&mut chunk_delivery),
     );
     let mut tm = Vec::new();
     tm.extend_from_slice(&0i64.to_be_bytes());
@@ -3274,7 +3338,8 @@ fn handle(mut s: TcpStream) {
             save.effects.iter().map(|&(id, amp, left)| Eff { id, amp, left }).collect()
         })),
     });
-    me.enter_play_wire(compression, initial_window);
+    let mut retry_chunks = chunk_delivery.has_pending();
+    me.enter_play_wire(compression, chunk_delivery);
     {
         let border = world_border().lock().unwrap();
         let board = scoreboard().lock().unwrap();
@@ -3368,7 +3433,6 @@ fn handle(mut s: TcpStream) {
     }
     let me_cleanup = me.clone();
     // ---- consume loop ----
-    s.set_read_timeout(Some(Duration::from_secs(2))).ok();
     s.set_write_timeout(Some(Duration::from_secs(2))).ok();
     let mut keepalive = connection_limits::KeepaliveState::new(Instant::now());
     let mut next_keepalive_id = 1i64;
@@ -3378,6 +3442,8 @@ fn handle(mut s: TcpStream) {
     // Play-state packet inactivity is tracked separately from the keep-alive deadline.
     let mut last_rx = Instant::now();
     let mut chat_throttle = connection_limits::ChatThrottle::new(Instant::now());
+    let mut read_timeout = None;
+    let mut last_chunk_retry_tick = TICK_IDX.load(Ordering::Relaxed);
     'conn: loop {
         drop_player_items_on_death(&me);
         use connection_limits::KeepaliveAction;
@@ -3396,6 +3462,30 @@ fn handle(mut s: TcpStream) {
             }
             KeepaliveAction::Wait => {}
         }
+        // ACKs and movement can wake delivery immediately. An eligible backlog
+        // gets another chance on the next tick, even during continuous input.
+        let tick = TICK_IDX.load(Ordering::Relaxed);
+        if retry_chunks && tick != last_chunk_retry_tick {
+            retry_chunks = pump_client_chunks(&me, false);
+            last_chunk_retry_tick = tick;
+        }
+        let timeout = if retry_chunks {
+            Duration::from_millis(TICK_MS)
+        } else {
+            Duration::from_secs(2)
+        };
+        if read_timeout != Some(timeout) {
+            s.set_read_timeout(Some(timeout)).ok();
+            read_timeout = Some(timeout);
+        }
+        // A client that stopped answering chunk batches is gone, even on an idle socket.
+        if me.chunk_ack.lock().unwrap().timed_out(Instant::now()) {
+            eprintln!(
+                "[spine] {} disconnected: chunk batch acknowledgement timeout",
+                me.name
+            );
+            break 'conn;
+        }
         let (pid, b) = match rx.next(&mut s) {
             RxOut::Closed => break 'conn,
             RxOut::Idle => {
@@ -3408,6 +3498,13 @@ fn handle(mut s: TcpStream) {
                     play_disconnect(&mut me.sock.lock().unwrap(), "Timed out");
                     break 'conn;
                 }
+                // A dimension change initiated by another connection can
+                // create a backlog even while this connection is idle.
+                let tick = TICK_IDX.load(Ordering::Relaxed);
+                if tick != last_chunk_retry_tick {
+                    retry_chunks = pump_client_chunks(&me, false);
+                    last_chunk_retry_tick = tick;
+                }
                 continue;
             }
             RxOut::Frame(pid, b) => {
@@ -3417,14 +3514,6 @@ fn handle(mut s: TcpStream) {
         };
         drop_player_items_on_death(&me);
 
-        // a client that stopped answering chunk batches is gone, not slow
-        if me.chunk_ack.lock().unwrap().timed_out(Instant::now()) {
-            eprintln!(
-                "[spine] {} disconnected: chunk batch acknowledgement timeout",
-                me.name
-            );
-            break 'conn;
-        }
         // vanilla refuses a movement update whose position is not finite or is
         // outside the world; letting it through carries the value into worldgen,
         // visibility and every float-to-int conversion behind them.
@@ -3438,6 +3527,7 @@ fn handle(mut s: TcpStream) {
                 let mut payload = b.as_slice();
                 if let Some(id) = read_protocol_i32(&mut payload).filter(|_| payload.is_empty()) {
                     me.teleport.lock().unwrap().confirm(id);
+                    retry_chunks = pump_client_chunks(&me, false);
                 }
             }
             0x18 => {
@@ -3463,23 +3553,7 @@ fn handle(mut s: TcpStream) {
                     eprintln!("[spine] {} disconnected: {why}", me.name);
                     break 'conn;
                 }
-                // nothing else pumps the queue when the player stands still, so
-                // the next batch goes out from here
-                let (dim, px, _, pz, yaw, _) = client_dim_pos(&me);
-                let mut ack = me.chunk_ack.lock().unwrap();
-                let mut ch = me.chunks.lock().unwrap();
-                let mut gen = me.gen_sources.lock().unwrap();
-                // the pump: no centre announcement, this is the same window
-                stream_chunks(
-                    &mut me.sock.lock().unwrap(),
-                    &mut ch,
-                    &mut gen,
-                    &mut ack,
-                    dim,
-                    ChunkWindow::at(px, pz, view),
-                    yaw,
-                    false,
-                );
+                retry_chunks = pump_client_chunks(&me, false);
             }
             0x0a => {
                 let Some(requested) = client_info_view_distance(&b) else {
@@ -3489,21 +3563,11 @@ fn handle(mut s: TcpStream) {
                 if effective != view {
                     view = effective;
                     *me.view.lock().unwrap() = view;
-                    let (dim, x, _, z, yaw, _) = client_dim_pos(&me);
-                    let mut ack = me.chunk_ack.lock().unwrap();
-                    ack.set_window(window_batch(view));
-                    let mut chunks = me.chunks.lock().unwrap();
-                    let mut gen = me.gen_sources.lock().unwrap();
-                    stream_chunks(
-                        &mut me.sock.lock().unwrap(),
-                        &mut chunks,
-                        &mut gen,
-                        &mut ack,
-                        dim,
-                        ChunkWindow::at(x, z, view),
-                        yaw,
-                        true,
+                    connection_limits::set_chunk_feedback_window(
+                        &mut me.chunk_ack.lock().unwrap(),
+                        window_batch(view),
                     );
+                    retry_chunks = pump_client_chunks(&me, true);
                 }
             }
             id if id == i64::from(brigadier_wire::SERVERBOUND_COMMAND_SUGGESTION) => {
@@ -3540,26 +3604,16 @@ fn handle(mut s: TcpStream) {
                         continue;
                     }
                     let window = ChunkWindow::at(px, pz, view);
-                    let current = with_play_wire(&me.sock.lock().unwrap(), |play| play.window).flatten();
+                    let current = with_play_wire(&me.sock.lock().unwrap(), |play| {
+                        play.chunk_delivery.window()
+                    })
+                    .flatten();
                     if current != Some(window) {
-                        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let mut ack = me.chunk_ack.lock().unwrap();
-                            let mut ch = me.chunks.lock().unwrap();
-                            let mut gen = me.gen_sources.lock().unwrap();
-                            stream_chunks(
-                                &mut me.sock.lock().unwrap(),
-                                &mut ch,
-                                &mut gen,
-                                &mut ack,
-                                *me.dim.lock().unwrap(),
-                                window,
-                                yaw,
-                                true,
-                            )
-                        }))
-                        .is_ok();
-
-                        let _ = ok;
+                        if let Ok(pending) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            pump_client_chunks(&me, true)
+                        })) {
+                            retry_chunks = pending;
+                        }
                     }
                     broadcast_seen(me.eid, |_c| {
                         (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, gnd))
@@ -7170,7 +7224,7 @@ mod connection_limits_wire_tests {
             );
             drop(registration); // Login framing and the Play writer have separate owners.
 
-            client.enter_play_wire(compression, ChunkWindow::at(0.0, 0.0, 2));
+            client.enter_play_wire(compression, Default::default());
             let mut rx = RxBuf::new(compression);
             for payload in [vec![0x12], vec![0x34; 512]] {
                 send_packet(&mut client.sock.lock().unwrap(), 0x26, payload.clone()).unwrap();
@@ -7194,7 +7248,7 @@ mod connection_limits_wire_tests {
     fn tracking_spawn_delta_and_removal_follow_the_observers_loaded_chunks() {
         let (client, mut peer) = effect_tests::client_pair();
         let client = Arc::new(client);
-        client.enter_play_wire(None, ChunkWindow::at(0.0, 0.0, 8));
+        client.enter_play_wire(None, Default::default());
         let eid = 77;
         let x = 16.0;
         let y = 70.0;
@@ -7261,6 +7315,27 @@ mod connection_limits_wire_tests {
     }
 
     #[test]
+    fn duplicate_poses_follow_the_entity_interval_and_changed_poses_send_immediately() {
+        let mut play = PlayWireState::default();
+        let eid = 77;
+        play.remember_spawn(&spawn_typed_pkt(eid, 4, 0.0, 70.0, 0.0)); // arrow
+        let update = |play: &mut PlayWireState, tick, x| {
+            let mut id = 0x70;
+            let mut payload = entity_teleport(eid, x, 70.0, 0.0, 0.0, 0.0, false);
+            play.update_packet(&mut id, &mut payload, tick)
+                .then_some((id, payload))
+        };
+        assert!(update(&mut play, 10, 1.0).is_some());
+        assert_eq!(update(&mut play, 11, 1.0), None);
+        assert_eq!(
+            update(&mut play, 11, 2.0),
+            Some((0x2e, vec![77, 0x10, 0, 0, 0, 0, 0, 0]))
+        );
+        assert_eq!(update(&mut play, 30, 2.0), None);
+        assert!(update(&mut play, 31, 2.0).is_some());
+    }
+
+    #[test]
     fn moved_chunk_window_unloads_only_sent_chunks_and_prioritizes_the_look_direction() {
         let previous = ChunkWindow {
             center: (0, 0),
@@ -7273,7 +7348,10 @@ mod connection_limits_wire_tests {
         let mut sent = HashSet::from([(-2, -2), (-2, 2), (1, 1), (2, 0)]);
         assert_eq!(window.leaving(Some(previous), &sent), [(-2, -2), (-2, 2)]);
         sent.retain(|&c| window.contains(c));
-        let south = window.pending(&sent, 0.0);
+        let mut feedback = connection_limits::chunk_feedback(25);
+        feedback.acknowledge(&25.0f32.to_be_bytes()).unwrap();
+        let south = connection_limits::ChunkDelivery::default()
+            .next_batch(window, &sent, 0.0, &feedback, 0);
         assert_eq!(south.len(), 23);
         assert_eq!(south[0], (1, 0));
         assert!(south[1].1 > 0);
@@ -7307,20 +7385,27 @@ mod connection_limits_wire_tests {
                 payload.extend(mask.to_be_bytes());
             }
             payload.extend([0, 0]);
-            for (count, lit) in [(sky_count, 3), (dim.light_sections(), 1)] {
+            let block_count = dim.light_sections();
+            let mut expected_arrays = [Vec::new(), Vec::new()];
+            for (layer, count) in [sky_count, block_count].into_iter().enumerate() {
                 write_varint(&mut payload, count as i64);
                 for idx in 0..count {
                     write_varint(&mut payload, 2048);
                     let mut section = [0; 2048];
-                    if idx == lit {
+                    if idx == 0 {
+                        section.fill(0xff);
+                    } else if idx == count - 1 {
                         section[512] = 0x0e;
+                    }
+                    if idx == 0 || idx == count - 1 {
+                        expected_arrays[layer].push(section);
                     }
                     payload.extend(section);
                 }
             }
             cull_chunk_light(&mut payload, dim);
-            let sky_lit = if sky_count == 0 { 0 } else { 1u64 << 3 };
-            let block_lit = 1u64 << 1;
+            let block_lit = 1 | (1u64 << (block_count - 1));
+            let sky_lit = if sky_count == 0 { 0 } else { block_lit };
             let all = dim.light_mask() as u64;
             let expected = [
                 sky_lit,
@@ -7337,12 +7422,11 @@ mod connection_limits_wire_tests {
                     light = &light[8..];
                 }
             }
-            let sky = i32::from(sky_count > 0);
-            for count in [sky, 1] {
-                assert_eq!(read_protocol_i32(&mut light), Some(count));
-                if count == 1 {
+            for arrays in expected_arrays {
+                assert_eq!(read_protocol_i32(&mut light), Some(arrays.len() as i32));
+                for array in arrays {
                     assert_eq!(read_protocol_i32(&mut light), Some(2048));
-                    assert_eq!(light[512], 0x0e);
+                    assert_eq!(light[..2048], array);
                     light = &light[2048..];
                 }
             }

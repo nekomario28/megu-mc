@@ -149,6 +149,164 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// ---------------------------------------------------------- chunk delivery
+
+// PlayerChunkSender in Java 1.21.1 clamps feedback to 64 chunks per tick.
+const MAX_CHUNKS_PER_TICK: usize = 64;
+
+pub(crate) fn chunk_feedback(window_size: usize) -> crate::ChunkFeedback {
+    // Partial clients may wait for the initial view before sending feedback.
+    crate::ChunkFeedback::new(window_size.min(MAX_CHUNKS_PER_TICK))
+}
+
+pub(crate) fn set_chunk_feedback_window(feedback: &mut crate::ChunkFeedback, size: usize) {
+    feedback.set_window(size.min(MAX_CHUNKS_PER_TICK));
+}
+
+pub(crate) struct ChunkDelivery {
+    budget: crate::ChunkSendBudget,
+    window: Option<crate::ChunkWindow>,
+    last_batch_tick: Option<u64>,
+}
+
+impl Default for ChunkDelivery {
+    fn default() -> Self {
+        Self {
+            budget: crate::ChunkSendBudget::new(MAX_CHUNKS_PER_TICK),
+            window: None,
+            last_batch_tick: None,
+        }
+    }
+}
+
+impl ChunkDelivery {
+    pub(crate) fn window(&self) -> Option<crate::ChunkWindow> {
+        self.window
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.budget.queued.is_empty()
+    }
+
+    pub(crate) fn reset_window(&mut self) {
+        self.window = None;
+        self.budget.queued.clear();
+    }
+
+    pub(crate) fn next_batch(
+        &mut self,
+        window: crate::ChunkWindow,
+        sent: &HashSet<(i32, i32)>,
+        yaw: f32,
+        feedback: &crate::ChunkFeedback,
+        tick: u64,
+    ) -> Vec<(i32, i32)> {
+        if self.window != Some(window) {
+            self.window = Some(window);
+            // Keep the queue bounded even when the ACK gate is closed.
+            self.budget.queued.retain(|&chunk| window.contains(chunk));
+            for chunk in window.unsent(sent) {
+                self.budget.enqueue(chunk);
+            }
+        }
+        if feedback.awaiting() || self.last_batch_tick == Some(tick) || !self.has_pending() {
+            return Vec::new();
+        }
+        self.budget.max_chunks_per_tick = feedback.batch_size();
+        let (sin, cos) = f64::from(yaw).rem_euclid(360.0).to_radians().sin_cos();
+        // Keep a cardinal side chunk from sorting ahead of a forward chunk.
+        let snap = |component: f64| {
+            if component.abs() < f64::EPSILON {
+                0.0
+            } else {
+                component
+            }
+        };
+        let batch =
+            self.budget
+                .drain_tick(window.center, window.radius as u32, (snap(-sin), snap(cos)));
+        if !batch.is_empty() {
+            self.last_batch_tick = Some(tick);
+        }
+        batch
+    }
+}
+
+#[cfg(test)]
+mod chunk_delivery_tests {
+    use super::*;
+    use crate::ChunkWindow;
+
+    #[test]
+    fn chunk_delivery_obeys_the_tick_budget_even_after_an_ack() {
+        let mut delivery = ChunkDelivery::default();
+        let mut feedback = chunk_feedback(289);
+        let window = ChunkWindow::at(0.0, 0.0, 8);
+        let mut sent = HashSet::new();
+        let initial = delivery.next_batch(window, &sent, 0.0, &feedback, 10);
+        assert_eq!(initial.len(), 64);
+        assert_eq!(initial[0], (0, 0));
+        assert!(initial[1..].iter().all(|&(_, z)| z > 0));
+        sent.extend(initial);
+
+        feedback.acknowledge(&1000.0f32.to_be_bytes()).unwrap();
+        assert!(delivery
+            .next_batch(window, &sent, 0.0, &feedback, 10)
+            .is_empty());
+        // Reverse the look: the remaining chunks are prioritized at drain time.
+        let turn = delivery.next_batch(window, &sent, 180.0, &feedback, 11);
+        assert_eq!(turn.len(), 64);
+        assert!(turn
+            .iter()
+            .all(|chunk| window.contains(*chunk) && !sent.contains(chunk)));
+        assert_eq!(turn[0], (0, -1));
+        sent.extend(turn);
+        feedback.sent_batch(Instant::now(), 64);
+        assert!(delivery
+            .next_batch(window, &sent, 180.0, &feedback, 12)
+            .is_empty());
+        feedback.acknowledge(&2.0f32.to_be_bytes()).unwrap();
+        assert_eq!(
+            delivery.next_batch(window, &sent, 180.0, &feedback, 12).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn chunk_delivery_discards_unsent_chunks_when_the_window_moves() {
+        let mut delivery = ChunkDelivery::default();
+        let mut feedback = chunk_feedback(25);
+        feedback.acknowledge(&1.0f32.to_be_bytes()).unwrap();
+        let old = ChunkWindow::at(-32.0, -32.0, 2);
+        let mut sent = HashSet::new();
+        assert_eq!(
+            delivery.next_batch(old, &sent, 0.0, &feedback, 20),
+            [(-2, -2)]
+        );
+        sent.insert((-2, -2));
+        assert!(delivery.has_pending());
+        feedback.sent_batch(Instant::now(), 1);
+
+        let new = ChunkWindow::at(160.0, 160.0, 1);
+        assert_eq!(new.leaving(Some(old), &sent), [(-2, -2)]);
+        sent.clear();
+        assert!(delivery
+            .next_batch(new, &sent, 0.0, &feedback, 21)
+            .is_empty());
+        feedback.acknowledge(&25.0f32.to_be_bytes()).unwrap();
+        let selected = delivery.next_batch(new, &sent, 0.0, &feedback, 21);
+        assert_eq!(selected.len(), 9);
+        assert_eq!(selected[0], (10, 10));
+        assert!(selected
+            .iter()
+            .all(|&chunk| new.contains(chunk) && !old.contains(chunk)));
+        assert!(!delivery.has_pending());
+        assert!(delivery
+            .next_batch(new, &sent, 0.0, &feedback, 22)
+            .is_empty());
+    }
+}
+
 // ---------------------------------------------------------- play keepalive
 
 /// Vanilla 1.21.1 sends a keepalive every 15 seconds and expects the matching
