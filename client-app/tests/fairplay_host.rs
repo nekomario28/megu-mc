@@ -74,8 +74,10 @@ fn fair_play_toml_roundtrip_is_lossless() {
             player_radar_scope: HostPlayerRadarScope::All,
         },
     ] {
-        let mut s = ClientSettings::default();
-        s.map_fair_play = fp;
+        let s = ClientSettings {
+            map_fair_play: fp,
+            ..ClientSettings::default()
+        };
         let (back, warnings) = ClientSettings::from_toml(&s.to_toml());
         assert_eq!(back, s, "{fp:?}");
         assert_eq!(back.map_fair_play, fp);
@@ -101,19 +103,21 @@ fn fair_play_omitted_keys_keep_permissive_defaults() {
     assert!(warnings.is_empty());
 
     // apply_toml overlays only the keys a file defines.
-    let mut s = ClientSettings::default();
-    s.map_fair_play = HostMapFairPlaySettings {
-        minimap_fair_play: true,
-        allow_cave_map: false,
-        allow_entity_radar: false,
-        allow_waypoint_teleport: true,
-        minimap_mode: HostMinimapMode::FairPlay,
-        allow_mob_radar: false,
-        player_radar_scope: HostPlayerRadarScope::PartyOnly,
+    let mut s = ClientSettings {
+        map_fair_play: HostMapFairPlaySettings {
+            minimap_fair_play: true,
+            allow_cave_map: false,
+            allow_entity_radar: false,
+            allow_waypoint_teleport: true,
+            minimap_mode: HostMinimapMode::FairPlay,
+            allow_mob_radar: false,
+            player_radar_scope: HostPlayerRadarScope::PartyOnly,
+        },
+        ..ClientSettings::default()
     };
     let warnings = s.apply_toml("view_distance = 14\n");
     assert!(warnings.is_empty());
-    assert_eq!(s.map_fair_play.allow_entity_radar, false);
+    assert!(!s.map_fair_play.allow_entity_radar);
     s.apply_toml("allow_entity_radar = true\n");
     assert!(s.map_fair_play.allow_entity_radar);
     // The mob-radar mirror moved with the legacy spelling.

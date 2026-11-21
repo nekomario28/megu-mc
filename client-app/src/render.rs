@@ -1299,8 +1299,10 @@ mod tests {
 
         let eye = [8.0, 40.0, 8.0];
         let full = render_frame(&world, eye, 0.0, 0.0, 160, 90).unwrap();
-        let mut settings = ClientSettings::default();
-        settings.view_distance = 6;
+        let settings = ClientSettings {
+            view_distance: 6,
+            ..ClientSettings::default()
+        };
         let config = RenderConfig::from_settings(&settings);
         let limited =
             render_frame_with_config(&world, eye, 0.0, 0.0, 160, 90, &config).unwrap();

@@ -92,6 +92,11 @@ fn cache_size_parser_handles_k_m_g_and_bare_kib() {
     assert_eq!(parse_cache_size_kib(""), None);
     assert_eq!(parse_cache_size_kib("K"), None);
     assert_eq!(parse_cache_size_kib("abcK"), None);
+    // Absurd magnitudes saturate at u32::MAX instead of overflowing u64.
+    assert_eq!(
+        parse_cache_size_kib("18446744073709551615G"),
+        Some(u32::MAX)
+    );
 }
 
 #[test]
@@ -378,8 +383,10 @@ fn tuning_plan_seeds_settings_then_user_overrides_win() {
 #[test]
 fn background_fps_toml_roundtrip_clamp_and_default() {
     // Lossless roundtrip of a non-default value.
-    let mut s = ClientSettings::default();
-    s.background_fps_limit = 45;
+    let s = ClientSettings {
+        background_fps_limit: 45,
+        ..ClientSettings::default()
+    };
     let (back, warnings) = ClientSettings::from_toml(&s.to_toml());
     assert_eq!(back, s);
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -403,8 +410,10 @@ fn background_fps_toml_roundtrip_clamp_and_default() {
     assert!(warnings.iter().any(|w| w.contains("background_fps_limit")));
 
     // apply_toml overlays only the keys a file defines.
-    let mut s = ClientSettings::default();
-    s.background_fps_limit = 99;
+    let mut s = ClientSettings {
+        background_fps_limit: 99,
+        ..ClientSettings::default()
+    };
     s.apply_toml("view_distance = 20\n");
     assert_eq!(s.background_fps_limit, 99, "unset key must survive overlay");
     s.apply_toml("background_fps_limit = 30\n");
@@ -456,9 +465,11 @@ fn background_fps_cli_override_and_fail_closed() {
 
 #[test]
 fn render_config_focus_gated_fps_cap_and_rebuilds() {
-    let mut config = RenderConfig::default();
-    config.max_fps = Some(144);
-    config.background_fps_limit = 15;
+    let mut config = RenderConfig {
+        max_fps: Some(144),
+        background_fps_limit: 15,
+        ..RenderConfig::default()
+    };
 
     // Focused: the normal foreground cap applies.
     assert_eq!(config.effective_fps_cap(true), 144);
@@ -480,8 +491,10 @@ fn render_config_focus_gated_fps_cap_and_rebuilds() {
     assert_eq!(config.effective_fps_cap(false), 20);
 
     // The cap flows settings -> RenderConfig unchanged.
-    let mut settings = ClientSettings::default();
-    settings.background_fps_limit = 45;
+    let settings = ClientSettings {
+        background_fps_limit: 45,
+        ..ClientSettings::default()
+    };
     let config = RenderConfig::from_settings(&settings);
     assert_eq!(config.background_fps_limit, 45);
     assert_eq!(config.effective_fps_cap(false), 45);

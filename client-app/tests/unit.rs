@@ -11,11 +11,13 @@ use std::time::Duration;
 
 use mc_spine_client::cli::{parse_args, parse_host_port, redact_from_argv, ScriptMode};
 use mc_spine_client::protocol::{
-    decode_chunk_packet, decode_packet_body, decode_section_blocks_update, encode_packet,
-    offline_uuid, pack_position, parse_uuid, unpack_position, write_string, write_varint,
-    write_varlong, zlib_compress_stored, zlib_decompress, DimensionMeta, PlayEvent, ProtocolClient,
-    TeleportSync, WireReader,
+    decode_chunk_packet, decode_packet_body, decode_paletted_container,
+    decode_section_blocks_update, decode_update_light_packet, encode_packet, offline_uuid,
+    pack_position, parse_uuid, unpack_position, write_string, write_varint, write_varlong,
+    zlib_compress_stored, zlib_decompress, DimensionMeta, PlayEvent, ProtocolClient, TeleportSync,
+    WireReader,
 };
+use mc_spine_kernel::Aabb;
 use mc_spine_client::sim::{PlayerPhysics, TickInput};
 use mc_spine_client::world::{pack_vertices, sort_translucent, BlockTable, WorldState};
 use mc_spine_client_mesh::ffi::PackedVertex;
@@ -480,6 +482,63 @@ fn chunk_decode_greedy_mesh_pack_vertices_and_sort_translucent() {
     // Direct pack_vertices & sort_translucent invariants on empty slice.
     assert!(pack_vertices(&[]).unwrap().is_empty());
     assert!(sort_translucent(&[], [0.0, 0.0, 0.0]).unwrap().is_empty());
+}
+
+#[test]
+fn hostile_wire_counts_fail_closed_before_allocation() {
+    // A server-controlled dimension_type `height` of i32::MAX makes
+    // `section_count()` ~134M; the chunk/light decoders must reject the
+    // count instead of pre-allocating tens of GB of section slots.
+    let hostile_sections = (i32::MAX as usize) / 16 + 1;
+    assert!(decode_chunk_packet(&[], hostile_sections, 64).is_err());
+    assert!(decode_update_light_packet(&[], hostile_sections, false).is_err());
+    // The bound still admits real dimensions (24/96-section tests pass).
+    assert!(decode_chunk_packet(&[], 4096, 64).is_err()); // empty body, not the cap
+    let over = decode_chunk_packet(&[], 4097, 64);
+    assert!(over.unwrap_err().contains("section count"));
+
+    // Palette length larger than the bytes that follow can never be
+    // satisfied — reject before `Vec::with_capacity(plen)`.
+    // bits=8 (indirect), then VarInt 0x7FFFFFFF, then 4 trailing bytes.
+    let pal = vec![8u8, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0, 0, 0, 0];
+    let mut r = WireReader::new(&pal);
+    let err = decode_paletted_container(&mut r, 4096, 8, 4, 15).unwrap_err();
+    assert!(err.contains("palette length"), "{err}");
+
+    // Section-blocks-update count larger than remaining input: each record
+    // is a VarLong of at least one byte.
+    let mut sb = Vec::new();
+    sb.extend_from_slice(&0i64.to_be_bytes()); // section pos (0,0,0)
+    write_varint(&mut sb, i32::MAX); // count = 2^31-1, zero records follow
+    let err = decode_section_blocks_update(&sb).unwrap_err();
+    assert!(err.contains("section update count"), "{err}");
+}
+
+#[test]
+fn hostile_dimension_meta_cannot_overflow_block_lookups() {
+    // `min_y`/`height` arrive from server-sent dimension_type NBT as raw
+    // i32s; `min_y + height` used to overflow i32 in debug builds and wrap
+    // in release, corrupting the world bounds check.
+    let hostile = DimensionMeta {
+        name: "evil:huge".to_string(),
+        min_y: 1,
+        height: i32::MAX,
+        has_skylight: false,
+    };
+    let mut world = WorldState::new(hostile, BlockTable::builtin());
+    // Below min_y reads as air; in-range-but-unloaded reads as no column.
+    // (Before the i64 widening, `min_y + height` overflowed i32.)
+    assert_eq!(world.get_block_state(0, 0, 0), Some(0));
+    assert_eq!(world.get_block_state(0, i32::MAX, 0), None);
+    world.apply_block_update([0, i32::MAX, 0], 1).unwrap();
+
+    // A sweep hugging the i32 boundary: `floor() as i32` saturates to
+    // i32::MIN and the ±1 bound math must not overflow (debug panic before).
+    let shapes = world.collect_collision_aabbs(Aabb {
+        min: [-2147483648.5, -2147483648.5, -2147483648.5],
+        max: [-2147483648.4, -2147483648.4, -2147483648.4],
+    });
+    assert!(shapes.is_empty()); // nothing loaded near the saturated coords
 }
 
 #[test]
@@ -1718,7 +1777,7 @@ fn protocol777_chunk_blockupdate_chat_disconnect_render_e2e() {
         .expect("rebuild dirty");
     assert!(world.metrics.packed_vertices > 0);
     let frame =
-        render::render_frame(&world, [8.5, 6.0, 8.5], 0.0, 35.0, 160, 90).expect("render frame");
+        render::render_frame(world, [8.5, 6.0, 8.5], 0.0, 35.0, 160, 90).expect("render frame");
     assert!(frame.stats.triangles_drawn > 0);
     assert!(frame.stats.pixels_shaded > 0);
     let png = frame.encode_png();

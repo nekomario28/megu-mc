@@ -1129,8 +1129,11 @@ impl WorldState {
     }
 
     pub fn get_block_state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
-        let min_y = self.dimension.min_y;
-        let max_y = min_y + self.dimension.height;
+        // `min_y`/`height` come from server-sent dimension_type NBT and may
+        // be any i32; widen before adding so hostile values cannot overflow.
+        let min_y = i64::from(self.dimension.min_y);
+        let max_y = min_y + i64::from(self.dimension.height);
+        let y = i64::from(y);
         if y < min_y || y >= max_y {
             return Some(0);
         }
@@ -1411,9 +1414,11 @@ impl WorldState {
     pub fn apply_block_update(&mut self, pos: [i32; 3], state_id: u32) -> Result<(), String> {
         self.block_updates += 1;
         let [x, y, z] = pos;
-        let min_y = self.dimension.min_y;
-        let max_y = min_y + self.dimension.height;
-        if y < min_y || y >= max_y {
+        // Widen before adding: `min_y`/`height` are server-controlled i32s.
+        let min_y = i64::from(self.dimension.min_y);
+        let max_y = min_y + i64::from(self.dimension.height);
+        let y64 = i64::from(y);
+        if y64 < min_y || y64 >= max_y {
             return Ok(());
         }
         let cx = x.div_euclid(16);
@@ -1421,13 +1426,13 @@ impl WorldState {
         let Some(col) = self.columns.get_mut(&(cx, cz)) else {
             return Ok(());
         };
-        let sec_idx = ((y - min_y) / 16) as usize;
+        let sec_idx = ((y64 - min_y) / 16) as usize;
         let Some(sec) = col.sections.get_mut(sec_idx) else {
             return Ok(());
         };
 
         let lx = x.rem_euclid(16) as usize;
-        let ly = (y - min_y).rem_euclid(16) as usize;
+        let ly = (y64 - min_y).rem_euclid(16) as usize;
         let lz = z.rem_euclid(16) as usize;
         let cell_idx = section_index(lx, ly, lz);
         let clamped = state_id
@@ -1657,12 +1662,15 @@ impl WorldState {
     }
 
     pub fn collect_collision_aabbs(&self, sweep: Aabb) -> Vec<Aabb> {
-        let min_x = sweep.min[0].floor() as i32 - 1;
-        let max_x = sweep.max[0].floor() as i32 + 1;
-        let min_y = sweep.min[1].floor() as i32 - 1;
-        let max_y = sweep.max[1].floor() as i32 + 1;
-        let min_z = sweep.min[2].floor() as i32 - 1;
-        let max_z = sweep.max[2].floor() as i32 + 1;
+        // `as i32` saturates at the extremes; saturating ±1 keeps the bound
+        // arithmetic from overflowing (and wrapping the range empty in
+        // release while panicking in debug).
+        let min_x = (sweep.min[0].floor() as i32).saturating_sub(1);
+        let max_x = (sweep.max[0].floor() as i32).saturating_add(1);
+        let min_y = (sweep.min[1].floor() as i32).saturating_sub(1);
+        let max_y = (sweep.max[1].floor() as i32).saturating_add(1);
+        let min_z = (sweep.min[2].floor() as i32).saturating_sub(1);
+        let max_z = (sweep.max[2].floor() as i32).saturating_add(1);
 
         let mut shapes = Vec::new();
         for bx in min_x..=max_x {

@@ -491,12 +491,16 @@ impl AuditLog {
             let cz_lo = (((center[2] as i64) - radius).div_euclid(16)).clamp(chunk_lo, chunk_hi);
             let cz_hi = (((center[2] as i64) + radius).div_euclid(16)).clamp(chunk_lo, chunk_hi);
             let mut out = Vec::new();
+            // Walk the buckets that exist and keep the ones inside the box:
+            // iterating the clamped coordinate range instead would touch up
+            // to ~(2^28)^2 cells for an i32-wide radius — a hang, not a
+            // query. Bucket count is bounded by the record count.
             let mut collect = |buckets: &HashMap<(i32, i32), Vec<usize>>| {
-                for cx in cx_lo..=cx_hi {
-                    for cz in cz_lo..=cz_hi {
-                        if let Some(bucket) = buckets.get(&(cx as i32, cz as i32)) {
-                            out.extend_from_slice(bucket);
-                        }
+                for (&(cx, cz), bucket) in buckets {
+                    if (cx_lo..=cx_hi).contains(&(i64::from(cx)))
+                        && (cz_lo..=cz_hi).contains(&(i64::from(cz)))
+                    {
+                        out.extend_from_slice(bucket);
                     }
                 }
             };
@@ -551,10 +555,12 @@ impl AuditLog {
             }
         }
         if let Some((center, radius)) = query.center {
-            let radius = radius.max(0) as i64;
-            let dx = record.pos[0] as i64 - center[0] as i64;
-            let dy = record.pos[1] as i64 - center[1] as i64;
-            let dz = record.pos[2] as i64 - center[2] as i64;
+            let radius = i128::from(radius.max(0));
+            // i32 positions can differ by ~2^32, so the squared terms
+            // overflow i64; i128 keeps the sphere test exact.
+            let dx = i128::from(record.pos[0]) - i128::from(center[0]);
+            let dy = i128::from(record.pos[1]) - i128::from(center[1]);
+            let dz = i128::from(record.pos[2]) - i128::from(center[2]);
             if dx * dx + dy * dy + dz * dz > radius * radius {
                 return false;
             }
@@ -899,5 +905,26 @@ mod tests {
         // Actions filter.
         let q = AuditQuery::new().actions([AuditAction::Explosion]);
         assert_eq!(log.query(&q).len(), 1);
+    }
+
+    #[test]
+    fn spatial_query_with_i32_extremes_stays_exact() {
+        let mut log = AuditLog::new();
+        log.append(rec(0, 1, "a", [i32::MIN, 0, i32::MAX]));
+        log.append(rec(0, 2, "b", [0, 0, 0]));
+
+        // i32-extreme positions differ by ~2^32, so dx*dx overflowed i64
+        // before the i128 widening — both records are genuinely outside a
+        // i32::MAX-block sphere around this opposite corner.
+        let q = AuditQuery::new().within([i32::MAX, 0, i32::MIN], i32::MAX);
+        assert!(log.query(&q).is_empty());
+
+        // An i32-wide radius must still answer: the box covers every chunk
+        // bucket, but only existing buckets are walked (previously this
+        // iterated ~(2^28)^2 cells and hung).
+        let q = AuditQuery::new().within([0, 0, 0], i32::MAX);
+        let hits = log.query(&q);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].pos, [0, 0, 0]);
     }
 }

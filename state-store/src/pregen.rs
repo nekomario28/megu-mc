@@ -85,11 +85,16 @@ fn ring_cells(k: i64) -> Vec<(i64, i64)> {
     cells
 }
 
-/// Whether offset `(dx, dz)` is inside `shape` at `radius`.
+/// Whether offset `(dx, dz)` is inside `shape` at `radius`. i128 keeps the
+/// squares exact: `radius_chunks` is a `u32`, so offsets near `u32::MAX`
+/// would overflow i64.
 fn in_shape(dx: i64, dz: i64, radius: i64, shape: PregenShape) -> bool {
     match shape {
         PregenShape::Square => true,
-        PregenShape::Circle => dx * dx + dz * dz <= radius * radius,
+        PregenShape::Circle => {
+            let (dx, dz, r) = (i128::from(dx), i128::from(dz), i128::from(radius));
+            dx * dx + dz * dz <= r * r
+        }
     }
 }
 
@@ -124,15 +129,17 @@ pub fn spiral_order(
 /// Chunks inside a `Circle` of `radius`: `sum over dx of 2*floor(sqrt(r^2 -
 /// dx^2)) + 1`, counted exactly with integer square roots.
 fn circle_total(radius: u32) -> u64 {
-    let r = radius as u64;
+    let r = u128::from(radius);
     let r2 = r * r;
-    let mut total = 0u64;
+    let mut total = 0u128;
     for dx in 0..=r {
         let dz_max = (r2 - dx * dx).isqrt();
         let columns = 2 * dz_max + 1;
         total += if dx == 0 { columns } else { 2 * columns };
     }
-    total
+    // A circle over the whole u32 chunk range is ~5.8e19 chunks, past u64;
+    // saturate rather than overflow (such a job could never finish anyway).
+    total.min(u128::from(u64::MAX)) as u64
 }
 
 /// A capped, pausable pregen run. Construct with
@@ -162,8 +169,10 @@ impl PregenJob {
     pub fn new(center_cx: i32, center_cz: i32, radius_chunks: u32, shape: PregenShape) -> Self {
         let total = match shape {
             PregenShape::Square => {
-                let side = 2 * radius_chunks as u64 + 1;
-                side * side
+                // `(2r+1)^2` overflows u64 for radius_chunks near u32::MAX;
+                // saturate — no real plan reaches that size.
+                let side = u128::from(radius_chunks) * 2 + 1;
+                (side * side).min(u128::from(u64::MAX)) as u64
             }
             PregenShape::Circle => circle_total(radius_chunks),
         };
@@ -596,6 +605,16 @@ mod tests {
                 .iter()
                 .all(|&(cx, cz)| cx as i64 * cx as i64 + cz as i64 * cz as i64 <= r2));
         }
+    }
+
+    #[test]
+    fn extreme_radius_totals_saturate_instead_of_overflowing() {
+        // (2r+1)^2 for r = u32::MAX is ~7.4e19, past u64::MAX — the square
+        // total overflowed (panic in debug, wrap in release) before.
+        let mut job = PregenJob::new(0, 0, u32::MAX, PregenShape::Square);
+        assert_eq!(job.progress().total, u64::MAX);
+        // The job still emits its first ring correctly.
+        assert_eq!(job.take_batch(1), vec![(0, 0)]);
     }
 
     #[test]

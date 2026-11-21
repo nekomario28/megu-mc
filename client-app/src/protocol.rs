@@ -16,6 +16,12 @@ pub const PROTOCOL_767: i32 = mc_spine_proto::ProtocolVersion::V1_21_1.number();
 pub const MAX_PACKET_SIZE: usize = 16 * 1024 * 1024;
 const MAX_NBT_DEPTH: usize = 64;
 const MAX_NBT_ARRAY: usize = 1_048_576;
+/// Upper bound on the section count a `level_chunk_with_light` /
+/// `light_update` packet may claim. The count derives from server-sent
+/// `dimension_type` NBT (`height / 16`), so it is attacker-controlled:
+/// 4096 sections is a 65,536-block world height, far past any real
+/// dimension, and keeps the per-section `Vec` pre-allocations bounded.
+const MAX_WORLD_SECTIONS: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Wire reader / writer primitives
@@ -864,6 +870,15 @@ pub fn decode_paletted_container(
         }
         let plen = usize::try_from(reader.read_varint()?)
             .map_err(|_| "negative palette length".to_string())?;
+        // Every palette entry is a VarInt of at least one byte, so a length
+        // past the remaining input can never be satisfied — reject before
+        // `with_capacity` turns a hostile count into a huge allocation.
+        if plen > reader.remaining() {
+            return Err(format!(
+                "palette length {plen} exceeds {} remaining bytes",
+                reader.remaining()
+            ));
+        }
         let mut values = Vec::with_capacity(plen);
         for _ in 0..plen {
             values.push(
@@ -1040,6 +1055,11 @@ pub fn decode_chunk_packet_profiled(
     biome_count: usize,
     profile: ChunkDecodeProfile,
 ) -> Result<DecodedChunk, String> {
+    if section_count > MAX_WORLD_SECTIONS {
+        return Err(format!(
+            "section count {section_count} exceeds bound {MAX_WORLD_SECTIONS}"
+        ));
+    }
     let mut reader = WireReader::new(body);
     let cx = reader.read_i32()?;
     let cz = reader.read_i32()?;
@@ -1119,6 +1139,11 @@ pub fn decode_update_light_packet(
     section_count: usize,
     byte_array_masks: bool,
 ) -> Result<(i32, i32, DecodedLightData), String> {
+    if section_count > MAX_WORLD_SECTIONS {
+        return Err(format!(
+            "section count {section_count} exceeds bound {MAX_WORLD_SECTIONS}"
+        ));
+    }
     let mut reader = WireReader::new(body);
     let cx = reader.read_varint()?;
     let cz = reader.read_varint()?;
@@ -1135,6 +1160,14 @@ pub fn decode_section_blocks_update(body: &[u8]) -> Result<Vec<([i32; 3], u32)>,
 
     let count = usize::try_from(reader.read_varint()?)
         .map_err(|_| "negative section update count".to_string())?;
+    // Each update record is a VarLong of at least one byte, so a count past
+    // the remaining input can never be satisfied.
+    if count > reader.remaining() {
+        return Err(format!(
+            "section update count {count} exceeds {} remaining bytes",
+            reader.remaining()
+        ));
+    }
     let mut updates = Vec::with_capacity(count);
     for _ in 0..count {
         let record = reader.read_varlong()? as u64;
@@ -1408,6 +1441,7 @@ impl ProtocolClient {
     /// `connect_for_version` with the `_minecraft._tcp` SRV / address lookup
     /// injected, so loopback tests can prove both the SRV redirect and the
     /// original-host-preservation rule without live DNS.
+    #[allow(clippy::too_many_arguments)]
     pub fn connect_resolved(
         host: &str,
         port: u16,
@@ -1627,7 +1661,7 @@ impl ProtocolClient {
 
     /// Shared `login`/`respawn` tail: dimension + seed + game modes + flags
     /// + death location + portal cooldown (+ `sea_level` from 1.21.2). The
-    /// 26.x profile switches the two game modes to VarInt enums.
+    ///   26.x profile switches the two game modes to VarInt enums.
     fn parse_spawn_info(&self, r: &mut WireReader<'_>) -> Result<(i32, String), String> {
         let dim_type_id = r.read_varint()?;
         let dim_name = r.read_string(256)?;

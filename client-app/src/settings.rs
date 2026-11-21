@@ -1007,8 +1007,10 @@ mod tests {
             RenderBackendPreference::ClassicLowSpec,
             RenderBackendPreference::Classic,
         ] {
-            let mut s = ClientSettings::default();
-            s.gpu_backend = backend;
+            let s = ClientSettings {
+                gpu_backend: backend,
+                ..ClientSettings::default()
+            };
             let (back, warnings) = ClientSettings::from_toml(&s.to_toml());
             assert_eq!(back, s, "{backend:?}");
             assert_eq!(back.gpu_backend, backend);

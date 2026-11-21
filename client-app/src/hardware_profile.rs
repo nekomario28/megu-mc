@@ -184,7 +184,9 @@ pub fn parse_cache_size_kib(text: &str) -> Option<u32> {
         _ => (trimmed, 1u64),
     };
     let value: u64 = digits.trim().parse().ok()?;
-    Some((value * multiplier).min(u64::from(u32::MAX)) as u32)
+    // sysfs text is host-controlled but still untrusted input: saturate
+    // instead of overflowing on absurd magnitudes.
+    Some(value.saturating_mul(multiplier).min(u64::from(u32::MAX)) as u32)
 }
 
 /// Parse a sysfs PCI `vendor`/`device` file (`0x10de\n`) into a hex id.
