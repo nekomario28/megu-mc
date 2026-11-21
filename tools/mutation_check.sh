@@ -1126,7 +1126,7 @@ check "the deep-state memo returns the value it computed" \
             inc_if(m3_read, M3_DEEP_HIT);
             return 0;
         }' \
-  feature_population_output_matches_the_pre_refactor_capture
+  deep_state_memo_returns_the_value_it_computed
 check "the noise-value cache returns the value it computed" \
   src/generation_math.rs '            if slot.0 == key {
                 slot.1

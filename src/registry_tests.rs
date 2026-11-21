@@ -1663,6 +1663,55 @@ fn a_panicking_scene_fixture_leaves_the_parent_untouched() {
     );
 }
 
+/// The gate for `Gen::deep_state_cached`'s memo-hit branch needs a caller that reaches the
+/// memo at all: the Overworld surface rule compiles to `deep_fast`, so the feature capture
+/// never looks in `deep_c` and mutating the hit arm there changes nothing. The Nether rule
+/// carries `not` conditions the fast evaluator has no form for, so `deep_fast` stays unset
+/// and every read lands on the memo.
+#[test]
+fn deep_state_memo_returns_the_value_it_computed() {
+    crate::test_support::require_vanilla_data();
+    let _guard = crate::worldgen::lock_gen_for_tests();
+    let _measurement = crate::worldgen::M3_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    worldgen::m3_test_force(true);
+    worldgen::m3_reset_local();
+    let mut g = worldgen::Gen::load_preset(0, name_to_state, worldgen::NoisePreset::Nether)
+        .expect("nether generator for the memo gate");
+    let cc = g.cols(0, 0).expect("nether chunk columns");
+    let _read = worldgen::M3FeatureRead::enter();
+    // The first read of a cell computes it and memos it; the second must be the memo's hit
+    // arm returning the same value. Only a non-air cell proves that: air reads 0 both ways
+    // and a mutant returning 0 on a hit would stay green.
+    let mut checked = 0usize;
+    'cells: for x in 0..16 {
+        for z in 0..16 {
+            for y in 4..120 {
+                let computed = g.deep_state_cached(x, y, z, &cc);
+                if computed == 0 {
+                    continue;
+                }
+                let memoized = g.deep_state_cached(x, y, z, &cc);
+                assert_eq!(
+                    memoized, computed,
+                    "the deep-state memo must return the value it computed at {x},{y},{z}"
+                );
+                checked += 1;
+                if checked == 16 {
+                    break 'cells;
+                }
+            }
+        }
+    }
+    assert!(checked > 0, "no non-air deep-state cell was found to compare");
+    assert!(
+        worldgen::m3_local().0[worldgen::M3_DEEP_HIT] > 0,
+        "the memo-hit arm must have answered at least one read for this gate to be live"
+    );
+    worldgen::m3_test_force(false);
+}
+
 // ---------- M3 P5: the encode and light hot paths, against the code they replaced ----------
 //
 // Each of the three rewrites below is a shape change with an identity obligation: the stack
@@ -3407,8 +3456,13 @@ fn datapack_mod_e2e_duplicate_paths_are_pack_local_and_later_packs_win() {
 
 // ---- Track 2: dynamic dimension architecture --------------------------------
 
-// The dimension registry is process-global; tests that register custom
-// dimensions must not run concurrently.
+// The dimension registry is process-global, and registration reaches further
+// than the registry: `register_datapack_dimensions` publishes `BLOCK_LOOKUP`
+// (flipping `block_at` from its no-generator fallback to real terrain),
+// `reset_dimension_registry` truncates the per-dimension generator slots, and
+// some bodies write `world()`/`pos_store()` directly. `DYNAMIC_DIM_LOCK` only
+// serializes these tests against each other; the world and generator guards
+// are what keep a concurrent world test's scene or fingerprint stable.
 static DYNAMIC_DIM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn dynamic_dim_entries(files: &[(&str, &str)]) -> Vec<worldgen::DatapackDimensionSource> {
@@ -3432,6 +3486,8 @@ const DYNAMIC_DIM_TYPE: &str = r##"{
 
 #[test]
 fn dynamic_dim_datapack_registers_flat_dimension() {
+    let _world_guard = world_guard();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
@@ -3472,6 +3528,8 @@ fn dynamic_dim_datapack_registers_flat_dimension() {
 
 #[test]
 fn dynamic_dim_slots_are_sorted_and_stable_by_canonical_name() {
+    let _world_guard = world_guard();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
@@ -3492,6 +3550,8 @@ fn dynamic_dim_slots_are_sorted_and_stable_by_canonical_name() {
 
 #[test]
 fn dynamic_dim_invalid_geometry_is_rejected() {
+    let _world_guard = world_guard();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
     worldgen::reset_dimension_registry();
     for (min_y, height) in [(-33, 192), (-32, 190), (0, 0)] {
@@ -3511,6 +3571,8 @@ fn dynamic_dim_invalid_geometry_is_rejected() {
 
 #[test]
 fn dynamic_dim_noise_generator_uses_custom_window() {
+    let _world_guard = world_guard();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
@@ -3533,6 +3595,8 @@ fn dynamic_dim_noise_generator_uses_custom_window() {
 
 #[test]
 fn dynamic_dim_join_game_names_all_dimensions() {
+    let _world_guard = world_guard();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
@@ -3557,6 +3621,8 @@ fn dynamic_dim_join_game_names_all_dimensions() {
 
 #[test]
 fn dynamic_dim_execute_in_resolves_custom_name() {
+    let _world_guard = world_guard();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
@@ -3575,6 +3641,8 @@ fn dynamic_dim_execute_in_resolves_custom_name() {
 
 #[test]
 fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
+    let _world_guard = world_guard();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
@@ -3699,6 +3767,8 @@ fn lod_test_req1(resolution: u8, cx: i32, cz: i32) -> Vec<u8> {
 
 #[test]
 fn dynamic_dim_chunk_packet_cache_isolates_dimensions() {
+    let _world_guard = world_guard();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
@@ -3748,6 +3818,8 @@ fn dynamic_dim_chunk_packet_cache_isolates_dimensions() {
 
 #[test]
 fn dynamic_dim_broadcast_near_isolates_custom_dimensions() {
+    let _world_guard = world_guard();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
@@ -3934,6 +4006,8 @@ fn lod_v1_wire_matches_client_app_codec_and_vanilla_unaffected() {
     assert!(lod_test_frames(&mut lod_r).is_empty());
 
     // -- the column encoder answers for the Overworld and a custom dimension --
+    let _world_guard = world_guard();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[

@@ -525,6 +525,10 @@ fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
     use crate::{DimId, MobCategory};
     use std::sync::atomic::Ordering;
 
+    // This test rewrites shared spawn/world state; hold the world-test lock for its whole
+    // body so a sibling mutating the same globals (or reading `world()`/`mobs()` under it)
+    // cannot overlap. The swaps below alone leave the window between them unguarded.
+    let _guard = crate::world_guard();
     let mob_spawning = crate::GR_MOB_SPAWNING.swap(1, Ordering::Relaxed);
     let difficulty = crate::DIFFICULTY.swap(1, Ordering::Relaxed);
     let saved_visited = std::mem::take(&mut *crate::spawned_creature_chunks().lock().unwrap());

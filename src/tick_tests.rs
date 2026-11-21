@@ -576,6 +576,8 @@ struct WorldSnapshot {
     scheduled_blocks: scheduled_ticks::ScheduledTicks,
     generated_fluids: Option<GeneratedFluidOwner>,
     pending_block_loot: HashMap<DimBlockPos, PendingBlockLoot>,
+    generated_leaves: Vec<worldgen::GeneratedTick>,
+    gen_seq: u64,
 }
 impl WorldSnapshot {
     fn take() -> WorldSnapshot {
@@ -594,6 +596,13 @@ impl WorldSnapshot {
                 std::mem::replace(&mut *owner.lock().unwrap(), GeneratedFluidOwner::new())
             }),
             pending_block_loot: std::mem::take(&mut *pending_block_loot().lock().unwrap()),
+            // Park the worldgen leaf backlog alongside `block_ticks`: the next
+            // `scheduled_block_tick` unpacks every pending generated tick, and a backlog
+            // accumulated by earlier tests turns an ordinary falling-booking drain into a
+            // chunk-generation storm. The generator keeps the drained half parked for the
+            // snapshot's lifetime so the test runs against a clean scheduled-tick queue.
+            generated_leaves: worldgen::take_generated_leaf_ticks(),
+            gen_seq: worldgen::generation_seq(),
         }
     }
 }
@@ -620,6 +629,14 @@ impl std::ops::Drop for WorldSnapshot {
         }
         *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()) =
             std::mem::take(&mut self.pending_block_loot);
+        // Return the parked leaf backlog to the generator it was drained from. A re-`init`
+        // bumps `generation_seq` and swaps the published queues, so leaves parked under a
+        // different generator are dropped rather than queued into a world they never
+        // belonged to.
+        let leaves = std::mem::take(&mut self.generated_leaves);
+        if !leaves.is_empty() && worldgen::generation_seq() == self.gen_seq {
+            worldgen::with_gen(|g| g.append_generated_ticks(leaves, vec![]));
+        }
     }
 }
 
@@ -3505,6 +3522,7 @@ fn falling_booking_is_two_game_ticks_and_support_rescue_cancels_it() {
 fn sand_falls_under_vanilla_gravity_until_it_lands() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
@@ -3603,6 +3621,7 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
 fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
@@ -4040,6 +4059,7 @@ fn concurrent_knockout_and_falling_conserve_blocks() {
 fn two_stacked_sand_blocks_fall_without_deadlocking() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
@@ -4119,6 +4139,7 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
 fn a_new_block_in_a_passing_entity_cell_still_falls() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
@@ -4191,6 +4212,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
 fn a_falling_block_passes_through_a_replaceable_block() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
@@ -4252,6 +4274,7 @@ fn a_falling_block_passes_through_a_replaceable_block() {
 fn a_long_unsupported_column_converts_in_one_pass() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
@@ -4302,6 +4325,7 @@ fn a_long_unsupported_column_converts_in_one_pass() {
 fn placing_unsupported_sand_queues_air_not_a_ghost() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_world = world().lock().unwrap().clone();
@@ -4349,6 +4373,7 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
 fn every_falling_block_becomes_an_entity_and_lands() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
@@ -4413,6 +4438,7 @@ fn every_falling_block_becomes_an_entity_and_lands() {
 fn a_falling_block_waits_in_a_cold_chunk() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
@@ -7559,6 +7585,15 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
         RAINING.store(0, Ordering::Relaxed);
         THUNDERING.store(0, Ordering::Relaxed);
         world_rng::restore(0x5EED_0000_0000_1234);
+        // `villager_raid`'s special-spawn bookkeeping is process-global too: a
+        // fresh state has `patrol_next`/`insomnia_next` at 0, so tick 1 reschedules
+        // them with RNG draws and leaves the counters far past the tick range —
+        // the pinned seed must stay untouched for the digest below to hold.
+        *special_spawn_state().lock().unwrap() = SpecialSpawnState {
+            patrol_next: u64::MAX,
+            insomnia_next: u64::MAX,
+            ..SpecialSpawnState::default()
+        };
         for _ in 0..200 {
             game_tick(|_, tick| tick());
         }
