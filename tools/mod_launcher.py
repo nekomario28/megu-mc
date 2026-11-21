@@ -57,8 +57,20 @@ Fallback policies when >= 1 Tier 3 mod exists:
                mods + reason codes logged (0 Tier 3 mods => pure native,
                NeoForge is never started)
 
-Exit status: 0 launched (or --dry-run plan computed), 1 launcher error,
-2 startup refused / delegation impossible.
+`--modpack <pack>` (mutually exclusive with --mods-dir) runs the pre-flight
+analyzer ported from mod-adapter-core/src/modpack.rs instead: point it at a
+Modrinth .mrpack/.zip archive, a standalone modrinth.index.json, a
+CurseForge manifest.json, or a CurseForge .zip and it classifies every
+declared file against --mc-version, --flagship-mods, and --profiles-dir
+*before* anything is downloaded or launched — client_only_skipped,
+superseded_perf_mod, native_flagship, universal_native, or
+needs_inspection — then prints a jargon-free operator summary
+(--format human) or a JSON report (--format json / --json).
+
+Exit status: 0 launched / plan computed / modpack compatible
+(ready_native, ready_with_auto_skips, or needs_jar_inspection), 1 launcher
+error / invalid or unsafe modpack manifest, 2 startup refused / delegation
+impossible / modpack version_mismatch.
 """
 
 import argparse
@@ -1469,11 +1481,697 @@ def _print_human(report):
         print(f"launch exit : {launch['exit_code']}")
 
 
+# ---------------------------------------------------------------------------
+# Modpack pre-flight analyzer — exact port of
+# mod-adapter-core/src/modpack.rs. Pure stdlib: parses the two manifest
+# formats real packs ship — Modrinth `.mrpack` (`modrinth.index.json`,
+# formatVersion 1) and CurseForge (`manifest.json`, manifestType
+# `minecraftModpack`, manifestVersion 1), standalone or inside a pack zip —
+# and classifies every declared file against --mc-version, --flagship-mods,
+# and --profiles-dir before anything is downloaded or launched.
+#
+# Both parsers are fail closed: malformed JSON, wrong
+# formatVersion/manifestType/game, missing required fields, and
+# path-traversal entries (`..`, absolute paths, Windows drive letters,
+# backslash separators, empty/`.` segments, NUL bytes) are hard errors,
+# never silent skips.
+#
+# Clean-room note (same contract as fallback.rs/modpack.rs): matching file
+# names and mod ids against BUILTIN_SUPERSEDED_PERF_MODS, flagship, or
+# profile sets is strictly factual compatibility matching — it only decides
+# whether a user-supplied JAR is loaded or skipped. No code, assets, or
+# data from any third-party mod is copied, linked, bundled, or derived.
+# ---------------------------------------------------------------------------
+
+MODRINTH_LOADER_DEPENDENCIES = frozenset((
+    "neoforge", "forge", "fabric-loader", "quilt-loader", "fabric-api",
+))
+
+# ModpackEntryClass / ModpackReadiness kind values mirror modpack.rs.
+CLASS_SUPERSEDED_PERF_MOD = "superseded_perf_mod"
+CLASS_CLIENT_ONLY_SKIPPED = "client_only_skipped"
+CLASS_NATIVE_FLAGSHIP = "native_flagship"
+CLASS_UNIVERSAL_NATIVE = "universal_native"
+CLASS_NEEDS_INSPECTION = "needs_inspection"
+
+READINESS_READY_NATIVE = "ready_native"
+READINESS_READY_WITH_AUTO_SKIPS = "ready_with_auto_skips"
+READINESS_NEEDS_JAR_INSPECTION = "needs_jar_inspection"
+READINESS_VERSION_MISMATCH = "version_mismatch"
+
+
+class ModpackError(LauncherError):
+    """Fail-closed modpack manifest error (mirrors `ModpackError`)."""
+
+
+def _opt_u64(value):
+    """JSON value -> u64, or None (mirrors JsonValue::as_u64)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _req_obj(obj, key, ctx):
+    value = obj.get(key)
+    if not isinstance(value, dict):
+        raise ModpackError(f"{ctx}: missing object '{key}'")
+    return value
+
+
+def _req_str(obj, key, ctx):
+    value = obj.get(key)
+    if not isinstance(value, str):
+        raise ModpackError(f"{ctx}: missing string '{key}'")
+    return value
+
+
+def _req_u64(obj, key, ctx):
+    value = _opt_u64(obj.get(key))
+    if value is None:
+        raise ModpackError(f"{ctx}: missing number '{key}'")
+    return value
+
+
+def _req_array(obj, key, ctx):
+    value = obj.get(key)
+    if not isinstance(value, list):
+        raise ModpackError(f"{ctx}: missing array '{key}'")
+    return value
+
+
+def _parse_env_support(value, ctx):
+    """Modrinth `env.client`/`env.server` flag -> required/optional/unsupported."""
+    if value is None:
+        return "required"
+    if value in ("required", "optional", "unsupported"):
+        return value
+    if isinstance(value, str):
+        raise ModpackError(
+            f"{ctx}: unknown env value '{value}' "
+            "(expected required/optional/unsupported)")
+    raise ModpackError(f"{ctx}: env value must be a string")
+
+
+def _validate_member_path(path, ctx):
+    """Fail-closed manifest member path validation (validate_member_path):
+    rejects `..` traversal, absolute paths, Windows drive letters, backslash
+    separators, empty/`.` segments, and NUL bytes."""
+    if not path:
+        raise ModpackError(f"{ctx}: empty path")
+    if "\0" in path:
+        raise ModpackError(f"{ctx}: NUL byte in path {path!r}")
+    if "\\" in path:
+        raise ModpackError(
+            f"{ctx}: backslash separator not allowed in path '{path}'")
+    if path.startswith("/"):
+        raise ModpackError(f"{ctx}: absolute path '{path}'")
+    if (len(path) >= 2 and path[0].isascii() and path[0].isalpha()
+            and path[1] == ":"):
+        raise ModpackError(f"{ctx}: Windows drive-letter path '{path}'")
+    for segment in path.split("/"):
+        if not segment:
+            raise ModpackError(f"{ctx}: empty path segment in '{path}'")
+        if segment == ".":
+            raise ModpackError(f"{ctx}: '.' path segment in '{path}'")
+        if segment == "..":
+            raise ModpackError(f"{ctx}: '..' traversal segment in '{path}'")
+
+
+# Version-segment prefixes stripped during JAR-name -> mod id inference
+# (is_versionish_token in modpack.rs).
+_VERSIONISH_PREFIXES = (
+    "snapshot", "release", "build", "beta", "alpha", "rev", "pre",
+    "mc", "rc", "v", "b", "r",
+)
+_VERSIONISH_MARKERS = frozenset((
+    "b", "beta", "alpha", "rc", "pre", "preview", "release", "final",
+    "snapshot",
+))
+# Loader/edition tokens stripped when they trail a JAR name
+# (is_loaderish_token). Deliberately narrow: under-stripping only degrades
+# an entry to needs_inspection, while over-stripping could produce a wrong
+# mod id.
+_LOADERISH_TOKENS = frozenset((
+    "fabric", "forge", "neoforge", "quilt", "liteloader", "rift",
+    "common", "universal", "multiloader", "all",
+))
+
+
+def _is_versionish_token(tok):
+    """Whether a filename token is a version segment worth stripping:
+    digits/dots (`1.21.1`), prefixed versions (`mc1.21.1`, `v2`, `build42`),
+    or a lone pre-release marker (`b`, `beta`, `rc`, …)."""
+    if not tok:
+        return False
+    digits_or_dots = all(c.isascii() and (c.isdigit() or c == ".")
+                         for c in tok)
+    if digits_or_dots and any(c.isdigit() for c in tok):
+        return True
+    for prefix in _VERSIONISH_PREFIXES:
+        rest = tok[len(prefix):] if tok.startswith(prefix) else ""
+        if rest and all(c.isascii() and (c.isdigit() or c == ".")
+                        for c in rest):
+            return True
+    return tok in _VERSIONISH_MARKERS
+
+
+def _is_jar_name(name):
+    """Case-insensitive `.jar` check — an uppercase `MOD.JAR` is still a
+    Java JAR and must never slip through as a data file (fail closed)."""
+    return len(name) > 4 and name[-4:].lower() == ".jar"
+
+
+def infer_candidate_mod_id(path):
+    """Normalized candidate mod id from a JAR path's basename, or None.
+
+    Mirrors infer_candidate_mod_id in modpack.rs: lowercase, `_`/`+` folded
+    to `-`, trailing version and loader tokens stripped.
+    `mods/sodium-fabric-0.6.13+mc1.21.1.jar` -> `sodium`,
+    `mods/DistantHorizons-2.3.2-b-1.21.1-fabric-neoforge.jar` ->
+    `distanthorizons`, `mods/fabric-api-0.102.0+1.21.1.jar` -> `fabric-api`.
+    """
+    name = path.rsplit("/", 1)[-1]
+    if not _is_jar_name(name):
+        return None
+    normalized = name[:-4].lower().replace("_", "-").replace("+", "-")
+    tokens = [t for t in normalized.split("-") if t]
+    while tokens and (_is_versionish_token(tokens[-1])
+                      or tokens[-1] in _LOADERISH_TOKENS):
+        tokens.pop()
+    return "-".join(tokens) if tokens else None
+
+
+def _normalized_mod_key(mod_id):
+    """Mod id comparison key: case-folded with `-`/`_` removed, so
+    `embeddium_extra`, `Embeddium-Extra`, and `embeddiumextra` all compare
+    equal (normalized_mod_key in modpack.rs)."""
+    return "".join(c for c in mod_id.lower() if c not in "-_")
+
+
+def _normalized_slug_id(slug):
+    """CurseForge slug -> the same id space infer_candidate_mod_id produces
+    (lowercase, `_` -> `-`)."""
+    return slug.lower().replace("_", "-")
+
+
+class ModpackFile:
+    """One file entry inside a modpack manifest (mirrors `ModpackFile`)."""
+
+    def __init__(self, path, candidate_mod_id, client_support="required",
+                 server_support="required", required=True, file_size=None,
+                 sha1=None, sha512=None, project_id=None, file_id=None):
+        self.path = path
+        self.candidate_mod_id = candidate_mod_id
+        self.client_support = client_support
+        self.server_support = server_support
+        self.required = required
+        self.file_size = file_size
+        self.sha1 = sha1
+        self.sha512 = sha512
+        self.project_id = project_id
+        self.file_id = file_id
+
+
+class ModpackManifest:
+    """A parsed modpack manifest (mirrors `ModpackManifest`)."""
+
+    def __init__(self, pack_format, name, version, mc_version, loaders,
+                 files):
+        self.format = pack_format  # "modrinth" | "curseforge"
+        self.name = name
+        self.version = version
+        self.mc_version = mc_version
+        self.loaders = loaders  # [{"id", "version", "primary"}]
+        self.files = files      # [ModpackFile]
+
+
+def parse_modrinth_manifest(text):
+    """Parse a Modrinth `modrinth.index.json` document (from_modrinth_json).
+
+    Requires formatVersion == 1, game == "minecraft", name, versionId,
+    dependencies.minecraft, and files[]; optional loader dependencies are
+    collected into ModpackManifest.loaders. Every files[].path is validated
+    against traversal/absolute/drive/NUL injection.
+    """
+    ctx = "modrinth.index.json"
+    try:
+        root = json.loads(text)
+    except ValueError as error:
+        raise ModpackError(f"{ctx}: {error}")
+    if not isinstance(root, dict):
+        raise ModpackError(f"{ctx}: root must be an object")
+
+    format_version = _req_u64(root, "formatVersion", ctx)
+    if format_version != 1:
+        raise ModpackError(
+            f"{ctx}: unsupported formatVersion {format_version} "
+            "(expected 1)")
+    game = _req_str(root, "game", ctx)
+    if game != "minecraft":
+        raise ModpackError(
+            f"{ctx}: unsupported game '{game}' (expected 'minecraft')")
+    name = _req_str(root, "name", ctx)
+    version = _req_str(root, "versionId", ctx)
+
+    deps = _req_obj(root, "dependencies", ctx)
+    mc_version = _req_str(deps, "minecraft", ctx)
+    loaders = []
+    for dep_id in sorted(deps):
+        if dep_id == "minecraft" or dep_id not in MODRINTH_LOADER_DEPENDENCIES:
+            continue
+        dep_version = deps[dep_id]
+        if not isinstance(dep_version, str):
+            raise ModpackError(
+                f"{ctx}: dependencies.{dep_id} must be a version string")
+        loaders.append({"id": dep_id, "version": dep_version,
+                        "primary": True})
+
+    files = []
+    for i, entry in enumerate(_req_array(root, "files", ctx)):
+        fctx = f"{ctx}: files[{i}]"
+        if not isinstance(entry, dict):
+            raise ModpackError(f"{fctx}: must be an object")
+        path = _req_str(entry, "path", fctx)
+        _validate_member_path(path, fctx)
+
+        env = entry.get("env")
+        if env is None:
+            client_support = server_support = "required"
+        elif isinstance(env, dict):
+            client_support = _parse_env_support(env.get("client"), fctx)
+            server_support = _parse_env_support(env.get("server"), fctx)
+        else:
+            raise ModpackError(f"{fctx}: env must be an object")
+
+        hashes = entry.get("hashes")
+        hashes = hashes if isinstance(hashes, dict) else {}
+        sha1 = hashes.get("sha1")
+        sha512 = hashes.get("sha512")
+        files.append(ModpackFile(
+            path=path,
+            candidate_mod_id=infer_candidate_mod_id(path),
+            client_support=client_support,
+            server_support=server_support,
+            required=True,
+            file_size=_opt_u64(entry.get("fileSize")),
+            sha1=sha1 if isinstance(sha1, str) else None,
+            sha512=sha512 if isinstance(sha512, str) else None,
+        ))
+
+    return ModpackManifest("modrinth", name, version, mc_version, loaders,
+                           files)
+
+
+def parse_curseforge_manifest(text):
+    """Parse a CurseForge `manifest.json` document (from_curseforge_json).
+
+    Requires manifestType == "minecraftModpack", manifestVersion == 1,
+    name, version, minecraft.version, and files[] with numeric
+    projectID/fileID. Optional per-file slug/fileName drive candidate mod
+    id inference; entries without either fail closed to needs_inspection.
+    """
+    ctx = "manifest.json"
+    try:
+        root = json.loads(text)
+    except ValueError as error:
+        raise ModpackError(f"{ctx}: {error}")
+    if not isinstance(root, dict):
+        raise ModpackError(f"{ctx}: root must be an object")
+
+    manifest_type = _req_str(root, "manifestType", ctx)
+    if manifest_type != "minecraftModpack":
+        raise ModpackError(
+            f"{ctx}: unsupported manifestType '{manifest_type}' "
+            "(expected 'minecraftModpack')")
+    manifest_version = _req_u64(root, "manifestVersion", ctx)
+    if manifest_version != 1:
+        raise ModpackError(
+            f"{ctx}: unsupported manifestVersion {manifest_version} "
+            "(expected 1)")
+    name = _req_str(root, "name", ctx)
+    version = _req_str(root, "version", ctx)
+
+    mc = _req_obj(root, "minecraft", ctx)
+    mc_version = _req_str(mc, "version", ctx)
+    loaders = []
+    mod_loaders = mc.get("modLoaders")
+    if isinstance(mod_loaders, list):
+        for i, entry in enumerate(mod_loaders):
+            lctx = f"{ctx}: minecraft.modLoaders[{i}]"
+            if not isinstance(entry, dict):
+                raise ModpackError(f"{lctx}: must be an object")
+            id_field = _req_str(entry, "id", lctx)
+            # Ids look like "neoforge-21.1.93": loader + '-' + version.
+            if "-" in id_field:
+                loader_id, loader_version = id_field.split("-", 1)
+            else:
+                loader_id, loader_version = id_field, ""
+            primary = entry.get("primary")
+            loaders.append({
+                "id": loader_id,
+                "version": loader_version,
+                "primary": primary if isinstance(primary, bool) else False,
+            })
+
+    files = []
+    for i, entry in enumerate(_req_array(root, "files", ctx)):
+        fctx = f"{ctx}: files[{i}]"
+        if not isinstance(entry, dict):
+            raise ModpackError(f"{fctx}: must be an object")
+        project_id = _req_u64(entry, "projectID", fctx)
+        file_id = _req_u64(entry, "fileID", fctx)
+        required = entry.get("required")
+        required = required if isinstance(required, bool) else True
+
+        slug = entry.get("slug")
+        slug = slug if isinstance(slug, str) else None
+        file_name = entry.get("fileName")
+        file_name = file_name if isinstance(file_name, str) else None
+        for kind, value in (("slug", slug), ("fileName", file_name)):
+            if value is not None and (
+                    not value or "/" in value or "\\" in value
+                    or ".." in value or "\0" in value):
+                raise ModpackError(
+                    f"{fctx}: unsafe {kind} '{value}' (must be a bare name)")
+        if file_name is not None:
+            path = f"mods/{file_name}"
+            candidate = (_normalized_slug_id(slug) if slug is not None
+                         else infer_candidate_mod_id(file_name))
+        elif slug is not None:
+            path = f"mods/{slug}.jar"
+            candidate = _normalized_slug_id(slug)
+        else:
+            path = (f"mods/curseforge-project-{project_id}"
+                    f"-file-{file_id}.jar")
+            candidate = None
+        files.append(ModpackFile(
+            path=path,
+            candidate_mod_id=candidate,
+            required=required,
+            project_id=project_id,
+            file_id=file_id,
+        ))
+
+    return ModpackManifest("curseforge", name, version, mc_version, loaders,
+                           files)
+
+
+def _load_modpack_document(path):
+    """(format, manifest_text) for --modpack: a .mrpack/.zip archive or a
+    standalone modrinth.index.json / CurseForge manifest.json."""
+    if not path.is_file():
+        raise ModpackError(f"--modpack does not exist: {path}")
+    if zipfile.is_zipfile(path):
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = set(archive.namelist())
+                if "modrinth.index.json" in names:
+                    member, pack_format = "modrinth.index.json", "modrinth"
+                elif "manifest.json" in names:
+                    member, pack_format = "manifest.json", "curseforge"
+                else:
+                    raise ModpackError(
+                        f"{path.name}: archive contains neither "
+                        "modrinth.index.json nor manifest.json")
+                try:
+                    return pack_format, archive.read(member).decode("utf-8")
+                except (KeyError, RuntimeError,
+                        UnicodeDecodeError) as error:
+                    raise ModpackError(
+                        f"{path.name}: cannot read {member} ({error})")
+        except zipfile.BadZipFile as error:
+            raise ModpackError(
+                f"not a readable pack archive: {path} ({error})")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ModpackError(f"cannot read --modpack {path}: {error}")
+    try:
+        doc = json.loads(text)
+    except ValueError as error:
+        raise ModpackError(f"{path.name}: invalid JSON ({error})")
+    if not isinstance(doc, dict):
+        raise ModpackError(f"{path.name}: root must be an object")
+    if "manifestType" in doc or path.name == "manifest.json":
+        return "curseforge", text
+    if ("formatVersion" in doc or "game" in doc
+            or path.name == "modrinth.index.json"):
+        return "modrinth", text
+    raise ModpackError(
+        f"{path.name}: cannot determine pack format (expected a Modrinth "
+        "modrinth.index.json or a CurseForge manifest.json)")
+
+
+def load_modpack(path):
+    """Parse a --modpack argument into a ModpackManifest."""
+    pack_format, text = _load_modpack_document(path)
+    if pack_format == "modrinth":
+        return parse_modrinth_manifest(text)
+    return parse_curseforge_manifest(text)
+
+
+class ModpackEntry:
+    """One analyzed manifest entry (mirrors `ModpackEntry`)."""
+
+    def __init__(self, path, candidate_mod_id, entry_class, note):
+        self.path = path
+        self.candidate_mod_id = candidate_mod_id
+        self.entry_class = entry_class
+        self.note = note
+
+    def as_dict(self):
+        return {
+            "path": self.path,
+            "candidate_mod_id": self.candidate_mod_id,
+            "class": self.entry_class,
+            "note": self.note,
+        }
+
+
+class ModpackPreflightReport:
+    """Full pre-flight report (mirrors `ModpackPreflightReport`)."""
+
+    def __init__(self, manifest, target, version_verdict, entries,
+                 readiness):
+        self.pack_name = manifest.name
+        self.pack_version = manifest.version
+        self.format = manifest.format
+        self.mc_version_declared = manifest.mc_version
+        self.loaders = manifest.loaders
+        self.target = target
+        self.version_verdict = version_verdict
+        self.entries = entries
+        self.readiness = readiness
+
+    def _names(self, classes):
+        """Sorted display names (inferred mod id, else file basename) of
+        entries classified in `classes`."""
+        return sorted(
+            e.candidate_mod_id or e.path.rsplit("/", 1)[-1]
+            for e in self.entries if e.entry_class in classes)
+
+    def skipped_perf_mod_names(self):
+        """Redundant perf mods skipped automatically (clean-room built-ins)."""
+        return self._names({CLASS_SUPERSEDED_PERF_MOD})
+
+    def client_only_names(self):
+        """Client-only entries a dedicated server does not install."""
+        return self._names({CLASS_CLIENT_ONLY_SKIPPED})
+
+    def native_names(self):
+        """Entries running natively (flagship + universal/profile/datapack)."""
+        return self._names({CLASS_NATIVE_FLAGSHIP, CLASS_UNIVERSAL_NATIVE})
+
+    def needs_inspection_names(self):
+        """Uninspected Java JARs needing a compatibility check first."""
+        return self._names({CLASS_NEEDS_INSPECTION})
+
+    def format_human_summary(self):
+        """Jargon-free operator summary (format_human_summary port)."""
+        format_name = {"modrinth": "Modrinth pack",
+                       "curseforge": "CurseForge pack"}[self.format]
+        lines = [f'Pre-flight report for "{self.pack_name}" '
+                 f"{self.pack_version} ({format_name})"]
+        verdict = self.version_verdict
+        target_str = format_mc_version(self.target)
+        if verdict.kind == "compatible":
+            lines.append(
+                f"The pack targets Minecraft {self.mc_version_declared}, "
+                "which matches this server.")
+        elif verdict.kind in ("minor_mismatch", "major_mismatch"):
+            lines.append(
+                f"The pack targets Minecraft {self.mc_version_declared} "
+                f"but this server runs {target_str} — the versions do not "
+                "match.")
+        else:
+            lines.append(
+                "The pack declares an unreadable Minecraft version "
+                f"'{verdict.declared}', so it cannot be confirmed against "
+                f"this server ({target_str}).")
+
+        lines.append(f"Checked {len(self.entries)} pack file(s):")
+        skipped = self.skipped_perf_mod_names()
+        if skipped:
+            lines.append(
+                f"  - {len(skipped)} performance mod(s) skipped "
+                "automatically — mc-spine already has the same "
+                "optimizations built in (clean-room): "
+                + ", ".join(skipped))
+        client_only = self.client_only_names()
+        if client_only:
+            lines.append(
+                f"  - {len(client_only)} client-side mod(s) a dedicated "
+                "server does not install: " + ", ".join(client_only))
+        native = self.native_names()
+        if native:
+            lines.append(
+                f"  - {len(native)} mod(s) run natively with no Java "
+                "needed: " + ", ".join(native))
+        inspect = self.needs_inspection_names()
+        if inspect:
+            lines.append(
+                f"  - {len(inspect)} Java mod(s) still need a "
+                "compatibility inspection before launch: "
+                + ", ".join(inspect))
+
+        result = {
+            READINESS_READY_NATIVE:
+                "ready — every file in this pack runs natively on "
+                "mc-spine.",
+            READINESS_READY_WITH_AUTO_SKIPS:
+                "ready — redundant and client-only files are skipped "
+                "automatically; the rest runs natively.",
+            READINESS_NEEDS_JAR_INSPECTION:
+                "almost ready — the Java mod(s) listed above still need a "
+                "compatibility check before launch.",
+            READINESS_VERSION_MISMATCH:
+                "not compatible — this pack was built for a different "
+                "Minecraft version.",
+        }[self.readiness]
+        lines.append(f"Result: {result}")
+        return "\n".join(lines)
+
+    def as_dict(self):
+        return {
+            "schema": "mc-spine-modpack-preflight/1",
+            "pack_name": self.pack_name,
+            "pack_version": self.pack_version,
+            "format": self.format,
+            "mc_version_declared": self.mc_version_declared,
+            "target": format_mc_version(self.target),
+            "loaders": self.loaders,
+            "version_verdict": {
+                "kind": self.version_verdict.kind,
+                "declared": self.version_verdict.declared,
+                "reason": self.version_verdict.reason,
+            },
+            "entries": [e.as_dict() for e in self.entries],
+            "readiness": self.readiness,
+            "skipped_perf_mods": self.skipped_perf_mod_names(),
+            "client_only_mods": self.client_only_names(),
+            "native_mods": self.native_names(),
+            "needs_inspection_mods": self.needs_inspection_names(),
+        }
+
+
+def _classify_pack_entry(pack_file, superseded, flagship, profile):
+    """One manifest file -> (class, note) — classify_entry port.
+
+    Client-only files first, then BUILTIN_SUPERSEDED_PERF_MODS auto-skips,
+    then flagship/profile natives and pure-data files, and finally unknown
+    Java JARs fall to needs_inspection."""
+    if pack_file.server_support == "unsupported":
+        return CLASS_CLIENT_ONLY_SKIPPED, (
+            "client-side only; a dedicated server never installs it")
+    if pack_file.candidate_mod_id is not None:
+        key = _normalized_mod_key(pack_file.candidate_mod_id)
+        if key in superseded:
+            return CLASS_SUPERSEDED_PERF_MOD, (
+                "redundant performance mod — mc-spine already ships an "
+                "equivalent clean-room optimization")
+        if key in flagship:
+            return CLASS_NATIVE_FLAGSHIP, (
+                "handled by a flagship native Rust adapter (no Java)")
+        if key in profile:
+            return CLASS_UNIVERSAL_NATIVE, (
+                "covered by a declarative offload profile (no Java)")
+    if pack_file.path.startswith("datapacks/"):
+        return CLASS_UNIVERSAL_NATIVE, (
+            "datapack — pure data, runs natively")
+    if not _is_jar_name(pack_file.path.rsplit("/", 1)[-1]):
+        return CLASS_UNIVERSAL_NATIVE, (
+            "data/resource file — no Java bytecode to adapt")
+    return CLASS_NEEDS_INSPECTION, (
+        "unrecognized Java mod — its bytecode still needs a compatibility "
+        "inspection before launch")
+
+
+def analyze_modpack(manifest, target, flagship_mods, profile_mods):
+    """Classify a parsed modpack manifest against the server target,
+    flagship adapter ids, and declarative profile ids (analyze_modpack)."""
+    verdict = check_mod_mc_version(target, manifest.mc_version)
+    superseded = {_normalized_mod_key(i) for i in BUILTIN_SUPERSEDED_PERF_MODS}
+    flagship = {_normalized_mod_key(i) for i in flagship_mods}
+    profile = {_normalized_mod_key(i) for i in profile_mods}
+
+    entries = []
+    for pack_file in manifest.files:
+        entry_class, note = _classify_pack_entry(
+            pack_file, superseded, flagship, profile)
+        entries.append(ModpackEntry(
+            pack_file.path, pack_file.candidate_mod_id, entry_class, note))
+
+    if verdict.kind != "compatible":
+        readiness = READINESS_VERSION_MISMATCH
+    elif any(e.entry_class == CLASS_NEEDS_INSPECTION for e in entries):
+        readiness = READINESS_NEEDS_JAR_INSPECTION
+    elif any(e.entry_class in (CLASS_SUPERSEDED_PERF_MOD,
+                               CLASS_CLIENT_ONLY_SKIPPED)
+             for e in entries):
+        readiness = READINESS_READY_WITH_AUTO_SKIPS
+    else:
+        readiness = READINESS_READY_NATIVE
+    return ModpackPreflightReport(
+        manifest, target, verdict, entries, readiness)
+
+
+def run_modpack_preflight(args):
+    """--modpack mode: parse, classify, report; returns the exit code."""
+    target = parse_mc_version(args.mc_version)
+    if target is None:
+        raise LauncherError(
+            f"invalid --mc-version '{args.mc_version}' "
+            "(expected a numeric release like 1.21.1)")
+    profile_ids, warnings = load_profiles(args.profiles_dir)
+    for warning in warnings:
+        # Always stderr so a --format json report stays parseable.
+        print(f"profiles: {warning}", file=sys.stderr)
+    manifest = load_modpack(args.modpack)
+    flagship_ids = {s for s in args.flagship_mods.split(",") if s}
+    report = analyze_modpack(manifest, target, flagship_ids,
+                             set(profile_ids))
+    if args.json or args.format == "json":
+        print(json.dumps(report.as_dict(), indent=2))
+    else:
+        print(report.format_human_summary())
+    return 2 if report.readiness == READINESS_VERSION_MISMATCH else 0
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="4-tier mod classifier + strict/quarantine/delegate fallback launcher")
-    parser.add_argument("--mods-dir", type=Path, required=True,
-                        help="directory of mod .jar/.zip files and datapack dirs")
+        description="4-tier mod classifier + strict/quarantine/delegate "
+                    "fallback launcher, and modpack pre-flight analyzer")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--mods-dir", type=Path,
+                      help="directory of mod .jar/.zip files and datapack dirs")
+    mode.add_argument("--modpack", type=Path,
+                      help="modpack to pre-flight instead: a .mrpack/.zip "
+                           "archive or a standalone modrinth.index.json / "
+                           "CurseForge manifest.json")
+    parser.add_argument("--format", choices=("human", "json"),
+                        default="human",
+                        help="--modpack report format (default: human; "
+                             "--json also selects json)")
     parser.add_argument("--profiles-dir", type=Path,
                         help="directory of declarative offload profile JSONs")
     parser.add_argument("--world-namespaces", type=str, default="",
@@ -1513,6 +2211,8 @@ def main():
         print(message, file=sys.stderr if args.json else sys.stdout)
 
     try:
+        if args.modpack is not None:
+            return run_modpack_preflight(args)
         mods = discover_mods(args.mods_dir)
         profile_ids, warnings = load_profiles(args.profiles_dir)
         for warning in warnings:

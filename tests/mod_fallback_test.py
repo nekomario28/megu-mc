@@ -1545,5 +1545,667 @@ class LauncherIntegrationTests(unittest.TestCase):
         self.assertIn("create", proc.stdout)
 
 
+# ---------------------------------------------------------------------------
+# Modpack pre-flight (`--modpack`): ports of the #[cfg(test)] cases in
+# mod-adapter-core/src/modpack.rs plus real .mrpack / CurseForge .zip CLI
+# integration.
+# ---------------------------------------------------------------------------
+
+# Real-shaped 1.21.1 NeoForge Modrinth index: Create + Aether content mods,
+# five redundant perf mods, one client-only mod, one datapack, and one
+# unknown JAR (MODRINTH_1211 in modpack.rs).
+MODRINTH_1211 = {
+    "formatVersion": 1,
+    "game": "minecraft",
+    "versionId": "1.4.0",
+    "name": "Create NeoForge Adventure",
+    "summary": "Create, Aether, and a performance stack",
+    "files": [
+        {"path": "mods/create-1.21.1-6.0.6.jar",
+         "hashes": {"sha1": "a" * 40, "sha512": "b"},
+         "env": {"client": "required", "server": "required"},
+         "downloads": ["https://cdn.modrinth.com/data/abc/create.jar"],
+         "fileSize": 16000000},
+        {"path": "mods/aether-1.21.1-1.5.9-neoforge.jar",
+         "hashes": {"sha512": "c"},
+         "env": {"client": "required", "server": "required"},
+         "downloads": ["https://cdn.modrinth.com/data/def/aether.jar"],
+         "fileSize": 42000000},
+        {"path": "mods/sodium-neoforge-0.6.13+mc1.21.1.jar",
+         "hashes": {"sha512": "d"},
+         "env": {"client": "required", "server": "optional"},
+         "downloads": ["https://cdn.modrinth.com/data/ghi/sodium.jar"],
+         "fileSize": 2000000},
+        {"path": "mods/lithium-neoforge-0.15.0+mc1.21.1.jar",
+         "hashes": {"sha512": "e"},
+         "env": {"client": "required", "server": "required"},
+         "downloads": ["https://cdn.modrinth.com/data/jkl/lithium.jar"],
+         "fileSize": 1000000},
+        {"path": "mods/modernfix-neoforge-5.20.2+mc1.21.1.jar",
+         "hashes": {"sha512": "f"},
+         "env": {"client": "required", "server": "required"},
+         "downloads": ["https://cdn.modrinth.com/data/mno/modernfix.jar"],
+         "fileSize": 3000000},
+        {"path": "mods/DistantHorizons-2.3.2-b-1.21.1-fabric-neoforge.jar",
+         "hashes": {"sha512": "g"},
+         "env": {"client": "required", "server": "required"},
+         "downloads": ["https://cdn.modrinth.com/data/pqr/dh.jar"],
+         "fileSize": 25000000},
+        {"path": "mods/ferritecore-7.0.2-neoforge.jar",
+         "hashes": {"sha512": "h"},
+         "env": {"client": "required", "server": "required"},
+         "downloads": ["https://cdn.modrinth.com/data/stu/ferritecore.jar"],
+         "fileSize": 300000},
+        {"path": "mods/iris-neoforge-1.8.0+mc1.21.1.jar",
+         "hashes": {"sha512": "i"},
+         "env": {"client": "required", "server": "unsupported"},
+         "downloads": ["https://cdn.modrinth.com/data/vwx/iris.jar"],
+         "fileSize": 2500000},
+        {"path": "datapacks/terralith-v2.5.8.zip",
+         "hashes": {"sha512": "j"},
+         "env": {"client": "required", "server": "required"},
+         "downloads": ["https://cdn.modrinth.com/data/yz1/terralith.zip"],
+         "fileSize": 800000},
+        {"path": "mods/mysterious-factory-3.2.1.jar",
+         "hashes": {"sha512": "k"},
+         "env": {"client": "required", "server": "required"},
+         "downloads": ["https://cdn.modrinth.com/data/234/mystery.jar"],
+         "fileSize": 900000},
+    ],
+    "dependencies": {"minecraft": "1.21.1", "neoforge": "21.1.93"},
+}
+
+CURSEFORGE_1211 = {
+    "minecraft": {
+        "version": "1.21.1",
+        "modLoaders": [
+            {"id": "neoforge-21.1.93", "primary": True},
+            {"id": "forge-52.0.0", "primary": False},
+        ],
+    },
+    "manifestType": "minecraftModpack",
+    "manifestVersion": 1,
+    "name": "CF Adventure",
+    "version": "7.1",
+    "author": "someone",
+    "files": [
+        {"projectID": 123, "fileID": 456, "required": True,
+         "slug": "create", "fileName": "create-1.21.1-6.0.6.jar"},
+        {"projectID": 234, "fileID": 567, "required": True,
+         "slug": "sodium",
+         "fileName": "sodium-neoforge-0.6.13+mc1.21.1.jar"},
+        {"projectID": 345, "fileID": 678, "required": True,
+         "slug": "lithium"},
+        {"projectID": 456, "fileID": 789, "required": False},
+        {"projectID": 567, "fileID": 890, "required": True,
+         "fileName": "mekanism-1.21.1-10.7.7.jar"},
+    ],
+    "overrides": "overrides",
+}
+
+
+def _modrinth_doc(**overrides):
+    doc = json.loads(json.dumps(MODRINTH_1211))
+    doc.update(overrides)
+    return doc
+
+
+def _mrpack(path, index, extra_members=()):
+    """A real .mrpack zip: modrinth.index.json plus optional overrides."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        out.writestr("modrinth.index.json",
+                     index if isinstance(index, str) else json.dumps(index))
+        for name, payload in extra_members:
+            out.writestr(name, payload)
+
+
+def _curseforge_zip(path, manifest, extra_members=()):
+    """A CurseForge pack zip: manifest.json plus optional overrides."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        out.writestr("manifest.json",
+                     manifest if isinstance(manifest, str)
+                     else json.dumps(manifest))
+        for name, payload in extra_members:
+            out.writestr(name, payload)
+
+
+class ModpackPreflightUnitTests(unittest.TestCase):
+    """Ports of the #[cfg(test)] cases in mod-adapter-core/src/modpack.rs."""
+
+    def modrinth(self, doc=None):
+        return mod_launcher.parse_modrinth_manifest(
+            json.dumps(doc if doc is not None else MODRINTH_1211))
+
+    def analyze(self, manifest, target=(1, 21, 1), flagship=(), profiles=()):
+        return mod_launcher.analyze_modpack(
+            manifest, target, set(flagship), set(profiles))
+
+    def test_candidate_id_strips_loader_and_version_suffixes(self):
+        cases = [
+            ("mods/create-1.21.1-6.0.6.jar", "create"),
+            ("mods/sodium-fabric-0.6.13+mc1.21.1.jar", "sodium"),
+            ("mods/lithium-neoforge-0.15.0+mc1.21.1.jar", "lithium"),
+            ("mods/modernfix-neoforge-5.20.2+mc1.21.1.jar", "modernfix"),
+            ("mods/DistantHorizons-2.3.2-b-1.21.1-fabric-neoforge.jar",
+             "distanthorizons"),
+            ("mods/ferritecore-7.0.2-neoforge.jar", "ferritecore"),
+            ("mods/fabric-api-0.102.0+1.21.1.jar", "fabric-api"),
+            ("mods/aether-1.21.1-1.5.9-neoforge.jar", "aether"),
+            ("mods/jei-1.21.1-neoforge-19.21.0.247.jar", "jei"),
+            ("mods/embeddium_extra-0.5.7+mc1.21.1.jar", "embeddium-extra"),
+            ("mods/mekanism-1.21.1-10.7.7.jar", "mekanism"),
+        ]
+        infer = mod_launcher.infer_candidate_mod_id
+        for path, expected in cases:
+            self.assertEqual(infer(path), expected, path)
+        self.assertIsNone(infer("mods/1.21.1.jar"))
+        self.assertIsNone(infer("datapacks/x.zip"))
+
+    def test_modrinth_manifest_parses_real_shape(self):
+        m = self.modrinth()
+        self.assertEqual(m.format, "modrinth")
+        self.assertEqual(m.name, "Create NeoForge Adventure")
+        self.assertEqual(m.version, "1.4.0")
+        self.assertEqual(m.mc_version, "1.21.1")
+        self.assertEqual(m.loaders, [
+            {"id": "neoforge", "version": "21.1.93", "primary": True}])
+        self.assertEqual(len(m.files), 10)
+        self.assertEqual(m.files[0].candidate_mod_id, "create")
+        self.assertEqual(m.files[2].candidate_mod_id, "sodium")
+        self.assertEqual(m.files[5].candidate_mod_id, "distanthorizons")
+        self.assertEqual(m.files[7].server_support, "unsupported")
+        self.assertEqual(m.files[0].file_size, 16000000)
+        self.assertEqual(m.files[0].sha1, "a" * 40)
+        self.assertEqual(m.files[0].sha512, "b")
+
+    def test_modrinth_preflight_classifies_every_entry(self):
+        report = self.analyze(self.modrinth(), flagship=["create", "aether"])
+        self.assertEqual(report.version_verdict.kind, "compatible")
+        self.assertEqual(report.readiness, "needs_jar_inspection")
+        self.assertEqual(len(report.entries), 10)
+        class_of = {e.path: e.entry_class for e in report.entries}
+        self.assertEqual(class_of["mods/create-1.21.1-6.0.6.jar"],
+                         "native_flagship")
+        self.assertEqual(class_of["mods/aether-1.21.1-1.5.9-neoforge.jar"],
+                         "native_flagship")
+        for perf in ("mods/sodium-neoforge-0.6.13+mc1.21.1.jar",
+                     "mods/lithium-neoforge-0.15.0+mc1.21.1.jar",
+                     "mods/modernfix-neoforge-5.20.2+mc1.21.1.jar",
+                     "mods/DistantHorizons-2.3.2-b-1.21.1-fabric-neoforge.jar",
+                     "mods/ferritecore-7.0.2-neoforge.jar"):
+            self.assertEqual(class_of[perf], "superseded_perf_mod", perf)
+        self.assertEqual(class_of["mods/iris-neoforge-1.8.0+mc1.21.1.jar"],
+                         "client_only_skipped")
+        self.assertEqual(class_of["datapacks/terralith-v2.5.8.zip"],
+                         "universal_native")
+        self.assertEqual(class_of["mods/mysterious-factory-3.2.1.jar"],
+                         "needs_inspection")
+        self.assertEqual(report.skipped_perf_mod_names(), [
+            "distanthorizons", "ferritecore", "lithium", "modernfix",
+            "sodium"])
+        self.assertEqual(report.client_only_names(), ["iris"])
+        self.assertEqual(report.needs_inspection_names(),
+                         ["mysterious-factory"])
+
+    def test_modrinth_native_pack_reports_ready_with_auto_skips(self):
+        doc = _modrinth_doc(files=[
+            {"path": "mods/create-1.21.1-6.0.6.jar",
+             "hashes": {"sha512": "x"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+            {"path": "mods/sodium-neoforge-0.6.13+mc1.21.1.jar",
+             "hashes": {"sha512": "y"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+        ])
+        report = self.analyze(self.modrinth(doc), flagship=["create"])
+        self.assertEqual(report.readiness, "ready_with_auto_skips")
+
+    def test_modrinth_all_native_pack_reports_ready_native(self):
+        doc = _modrinth_doc(files=[
+            {"path": "mods/create-1.21.1-6.0.6.jar",
+             "hashes": {"sha512": "x"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+            {"path": "datapacks/custom-recipes.zip",
+             "hashes": {"sha512": "y"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+        ])
+        report = self.analyze(self.modrinth(doc), flagship=["create"])
+        self.assertEqual(report.readiness, "ready_native")
+
+    def test_modrinth_26_3_pack_matches_26_3_target(self):
+        doc = _modrinth_doc(
+            dependencies={"minecraft": "26.3", "neoforge": "21.1.93"})
+        doc["files"][0]["path"] = "mods/create-26.3-6.0.6.jar"
+        m = self.modrinth(doc)
+        self.assertEqual(m.mc_version, "26.3")
+        report = self.analyze(
+            m, target=(26, 3, 0), flagship=["create", "aether"])
+        self.assertEqual(report.version_verdict.kind, "compatible")
+        self.assertEqual(report.readiness, "needs_jar_inspection")
+
+    def test_modrinth_1211_pack_mismatches_26_3_target(self):
+        report = self.analyze(
+            self.modrinth(), target=(26, 3, 0),
+            flagship=["create", "aether"])
+        self.assertEqual(report.version_verdict.kind, "major_mismatch")
+        self.assertEqual(report.readiness, "version_mismatch")
+
+    def test_profile_and_datapack_entries_classify_universal_native(self):
+        doc = _modrinth_doc(files=[
+            {"path": "mods/jei-1.21.1-neoforge-19.21.0.247.jar",
+             "hashes": {"sha512": "x"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+            {"path": "datapacks/dungeon-pack.zip",
+             "hashes": {"sha512": "y"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+        ])
+        report = self.analyze(self.modrinth(doc), profiles=["jei"])
+        self.assertEqual(report.entries[0].entry_class, "universal_native")
+        self.assertEqual(report.entries[1].entry_class, "universal_native")
+        self.assertEqual(report.readiness, "ready_native")
+
+    def test_curseforge_manifest_parses_real_shape(self):
+        m = mod_launcher.parse_curseforge_manifest(
+            json.dumps(CURSEFORGE_1211))
+        self.assertEqual(m.format, "curseforge")
+        self.assertEqual(m.name, "CF Adventure")
+        self.assertEqual(m.version, "7.1")
+        self.assertEqual(m.mc_version, "1.21.1")
+        self.assertEqual(len(m.loaders), 2)
+        self.assertEqual(m.loaders[0]["id"], "neoforge")
+        self.assertEqual(m.loaders[0]["version"], "21.1.93")
+        self.assertTrue(m.loaders[0]["primary"])
+        self.assertFalse(m.loaders[1]["primary"])
+        self.assertEqual(len(m.files), 5)
+        self.assertEqual(m.files[0].project_id, 123)
+        self.assertEqual(m.files[0].candidate_mod_id, "create")
+        self.assertFalse(m.files[3].required)
+        self.assertIsNone(m.files[3].candidate_mod_id)
+        self.assertEqual(m.files[4].candidate_mod_id, "mekanism")
+
+    def test_curseforge_preflight_report(self):
+        m = mod_launcher.parse_curseforge_manifest(
+            json.dumps(CURSEFORGE_1211))
+        report = self.analyze(m, flagship=["create"])
+        self.assertEqual(report.version_verdict.kind, "compatible")
+        self.assertEqual(report.skipped_perf_mod_names(),
+                         ["lithium", "sodium"])
+        self.assertEqual(report.native_names(), ["create"])
+        self.assertEqual(report.needs_inspection_names(), [
+            "curseforge-project-456-file-789.jar", "mekanism"])
+        self.assertEqual(report.readiness, "needs_jar_inspection")
+
+    def test_modrinth_rejects_path_traversal_fail_closed(self):
+        for bad in ("../../etc/passwd", "mods/../../etc/passwd",
+                    "/abs/path.jar", "//server/share.jar",
+                    "mods\\..\\evil.jar", "mods\\evil.jar",
+                    "C:\\evil.jar", "C:/evil.jar", "mods//dup.jar",
+                    "mods/./weird.jar"):
+            doc = _modrinth_doc(files=[
+                {"path": bad, "hashes": {"sha512": "a"},
+                 "downloads": [], "fileSize": 1}])
+            with self.assertRaises(mod_launcher.ModpackError, msg=bad):
+                self.modrinth(doc)
+
+    def test_modrinth_rejects_nul_byte_in_path(self):
+        doc = _modrinth_doc(files=[
+            {"path": "mods/evil\x00.jar", "hashes": {"sha512": "a"},
+             "downloads": [], "fileSize": 1}])
+        with self.assertRaises(mod_launcher.ModpackError):
+            self.modrinth(doc)
+
+    def test_modrinth_rejects_wrong_game_and_format(self):
+        for bad in (
+                {"formatVersion": 2, "game": "minecraft", "versionId": "1",
+                 "name": "x", "files": [],
+                 "dependencies": {"minecraft": "1.21.1"}},
+                {"formatVersion": 1, "game": "terraria", "versionId": "1",
+                 "name": "x", "files": [],
+                 "dependencies": {"minecraft": "1.21.1"}},
+                {"formatVersion": 1, "game": "minecraft", "versionId": "1",
+                 "name": "x", "files": [], "dependencies": {}}):
+            with self.assertRaises(mod_launcher.ModpackError, msg=bad):
+                mod_launcher.parse_modrinth_manifest(json.dumps(bad))
+
+    def test_malformed_json_fails_closed(self):
+        for bad in ("", "not json", "{",
+                    '{"formatVersion": 1, "game": "minecraft", '
+                    '"versionId": "1", "name": "x", "files": [}',
+                    "[]", "42"):
+            with self.assertRaises(mod_launcher.ModpackError, msg=bad):
+                mod_launcher.parse_modrinth_manifest(bad)
+            with self.assertRaises(mod_launcher.ModpackError, msg=bad):
+                mod_launcher.parse_curseforge_manifest(bad)
+
+    def test_curseforge_rejects_wrong_manifest_type(self):
+        base = {"manifestType": "minecraftModpack", "manifestVersion": 1,
+                "name": "x", "version": "1",
+                "minecraft": {"version": "1.21.1", "modLoaders": []},
+                "files": []}
+        for mutate in (
+                lambda d: d.update(manifestVersion=2),
+                lambda d: d.update(manifestType="other"),
+                lambda d: d.update(files=[{
+                    "projectID": "a", "fileID": 1, "required": True}])):
+            doc = json.loads(json.dumps(base))
+            mutate(doc)
+            with self.assertRaises(mod_launcher.ModpackError, msg=doc):
+                mod_launcher.parse_curseforge_manifest(json.dumps(doc))
+
+    def test_curseforge_rejects_unsafe_slug_and_filename(self):
+        base = {"manifestType": "minecraftModpack", "manifestVersion": 1,
+                "name": "x", "version": "1",
+                "minecraft": {"version": "1.21.1", "modLoaders": []}}
+        for extra in ({"slug": "../evil"}, {"slug": "a/b"},
+                      {"fileName": "..\\evil.jar"},
+                      {"fileName": "sub/evil.jar"}):
+            entry = {"projectID": 1, "fileID": 2, "required": True}
+            entry.update(extra)
+            doc = dict(base, files=[entry])
+            with self.assertRaises(mod_launcher.ModpackError, msg=extra):
+                mod_launcher.parse_curseforge_manifest(json.dumps(doc))
+
+    def test_uppercase_jar_extension_still_needs_inspection(self):
+        doc = _modrinth_doc(files=[
+            {"path": "mods/MYSTERY-1.0.JAR", "hashes": {"sha512": "x"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1}])
+        report = self.analyze(self.modrinth(doc))
+        self.assertEqual(report.entries[0].entry_class, "needs_inspection")
+        self.assertEqual(report.readiness, "needs_jar_inspection")
+
+    def test_human_summary_is_plain_language_and_names_skipped_mods(self):
+        report = self.analyze(self.modrinth(),
+                              flagship=["create", "aether"])
+        summary = report.format_human_summary()
+        self.assertIn("Create NeoForge Adventure", summary)
+        self.assertIn("Modrinth pack", summary)
+        self.assertIn("matches this server", summary)
+        for name in ("distanthorizons", "ferritecore", "lithium",
+                     "modernfix", "sodium"):
+            self.assertIn(name, summary)
+        self.assertIn("built in", summary)
+        self.assertIn("iris", summary)
+        self.assertIn("aether", summary)
+        self.assertIn("create", summary)
+        self.assertIn("mysterious-factory", summary)
+        self.assertIn("almost ready", summary)
+
+    def test_human_summary_reports_version_mismatch_plainly(self):
+        report = self.analyze(self.modrinth(), target=(26, 3, 0))
+        summary = report.format_human_summary()
+        self.assertIn("versions do not match", summary)
+        self.assertIn("different Minecraft version", summary)
+
+
+class ModpackPreflightCliTests(unittest.TestCase):
+    """`--modpack` CLI end-to-end: real .mrpack / CurseForge archives."""
+
+    @classmethod
+    def setUpClass(cls):
+        TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+    def setUp(self):
+        self.ws = tempfile.TemporaryDirectory(prefix="modpack-", dir=TMP_ROOT)
+        self.tmp = Path(self.ws.name)
+        self.env = dict(os.environ, TMPDIR=str(TMP_ROOT))
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    def invoke(self, *argv):
+        command = [sys.executable, str(TOOL), "--modpack"] + [
+            str(a) for a in argv]
+        proc = subprocess.run(command, cwd=ROOT, env=self.env,
+                              capture_output=True, text=True)
+        report = None
+        if proc.stdout.strip() and proc.stdout.lstrip().startswith("{"):
+            report = json.loads(proc.stdout)
+        return proc, report
+
+    def test_mrpack_zip_preflight_json_and_human(self):
+        """A real .mrpack zip (1.21.1 NeoForge Create + perf mods + a
+        client-only mod) reports JSON and human pre-flight, exit 0."""
+        pack = self.tmp / "adventure.mrpack"
+        _mrpack(pack, MODRINTH_1211,
+                extra_members=[("overrides/options.txt", "fov:1")])
+        proc, report = self.invoke(
+            pack, "--format", "json", "--flagship-mods", "create,aether")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["schema"], "mc-spine-modpack-preflight/1")
+        self.assertEqual(report["format"], "modrinth")
+        self.assertEqual(report["pack_name"], "Create NeoForge Adventure")
+        self.assertEqual(report["mc_version_declared"], "1.21.1")
+        self.assertEqual(report["target"], "1.21.1")
+        self.assertEqual(report["version_verdict"]["kind"], "compatible")
+        self.assertEqual(report["readiness"], "needs_jar_inspection")
+        class_of = {e["path"]: e["class"] for e in report["entries"]}
+        for perf in ("mods/sodium-neoforge-0.6.13+mc1.21.1.jar",
+                     "mods/lithium-neoforge-0.15.0+mc1.21.1.jar",
+                     "mods/DistantHorizons-2.3.2-b-1.21.1-fabric-neoforge.jar"):
+            self.assertEqual(class_of[perf], "superseded_perf_mod", perf)
+        self.assertEqual(class_of["mods/create-1.21.1-6.0.6.jar"],
+                         "native_flagship")
+        self.assertEqual(class_of["mods/iris-neoforge-1.8.0+mc1.21.1.jar"],
+                         "client_only_skipped")
+        self.assertEqual(class_of["datapacks/terralith-v2.5.8.zip"],
+                         "universal_native")
+        self.assertEqual(class_of["mods/mysterious-factory-3.2.1.jar"],
+                         "needs_inspection")
+        self.assertEqual(report["skipped_perf_mods"], [
+            "distanthorizons", "ferritecore", "lithium", "modernfix",
+            "sodium"])
+        self.assertEqual(report["client_only_mods"], ["iris"])
+
+        proc, _ = self.invoke(
+            pack, "--format", "human", "--flagship-mods", "create,aether")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Create NeoForge Adventure", proc.stdout)
+        self.assertIn("Modrinth pack", proc.stdout)
+        self.assertIn("matches this server", proc.stdout)
+        self.assertIn("built in", proc.stdout)
+        for name in ("distanthorizons", "ferritecore", "lithium",
+                     "modernfix", "sodium", "iris", "mysterious-factory"):
+            self.assertIn(name, proc.stdout)
+        self.assertIn("almost ready", proc.stdout)
+
+    def test_standalone_modrinth_index_json_preflight(self):
+        index = self.tmp / "modrinth.index.json"
+        index.write_text(json.dumps(MODRINTH_1211), encoding="utf-8")
+        proc, report = self.invoke(
+            index, "--format", "json", "--flagship-mods", "create,aether")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["format"], "modrinth")
+        self.assertEqual(report["readiness"], "needs_jar_inspection")
+
+    def test_26_3_pack_ok_on_26_3_but_1211_pack_mismatches(self):
+        pack26 = self.tmp / "pack26.mrpack"
+        doc = _modrinth_doc(
+            dependencies={"minecraft": "26.3", "neoforge": "21.1.93"})
+        _mrpack(pack26, doc)
+        proc, report = self.invoke(
+            pack26, "--mc-version", "26.3", "--format", "json",
+            "--flagship-mods", "create,aether")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["target"], "26.3.0")
+        self.assertEqual(report["version_verdict"]["kind"], "compatible")
+        self.assertEqual(report["readiness"], "needs_jar_inspection")
+
+        pack1211 = self.tmp / "pack1211.mrpack"
+        _mrpack(pack1211, MODRINTH_1211)
+        proc, report = self.invoke(
+            pack1211, "--mc-version", "26.3", "--format", "json",
+            "--flagship-mods", "create,aether")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(report["version_verdict"]["kind"],
+                         "major_mismatch")
+        self.assertEqual(report["readiness"], "version_mismatch")
+        proc, _ = self.invoke(pack1211, "--mc-version", "26.3")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("versions do not match", proc.stdout)
+        self.assertIn("not compatible", proc.stdout)
+
+    def test_curseforge_manifest_json_and_zip_preflight(self):
+        manifest = self.tmp / "manifest.json"
+        manifest.write_text(json.dumps(CURSEFORGE_1211), encoding="utf-8")
+        for source in (manifest,):
+            proc, report = self.invoke(
+                source, "--format", "json", "--flagship-mods", "create")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(report["format"], "curseforge")
+            self.assertEqual(report["readiness"], "needs_jar_inspection")
+            self.assertEqual(report["skipped_perf_mods"],
+                             ["lithium", "sodium"])
+            self.assertEqual(report["needs_inspection_mods"], [
+                "curseforge-project-456-file-789.jar", "mekanism"])
+        pack = self.tmp / "cfpack.zip"
+        _curseforge_zip(pack, CURSEFORGE_1211,
+                        extra_members=[("overrides/config.cfg", "x=1")])
+        proc, report = self.invoke(
+            pack, "--format", "json", "--flagship-mods", "create")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["format"], "curseforge")
+        self.assertEqual(report["pack_name"], "CF Adventure")
+        self.assertEqual(report["loaders"][0],
+                         {"id": "neoforge", "version": "21.1.93",
+                          "primary": True})
+        self.assertEqual(report["skipped_perf_mods"],
+                         ["lithium", "sodium"])
+
+    def test_fail_closed_traversal_nul_and_malformed_exit_1(self):
+        for bad_path in ("../../etc/passwd", "C:\\evil.jar",
+                         "mods/evil\x00.jar", "mods//dup.jar",
+                         "mods/./weird.jar"):
+            doc = _modrinth_doc(files=[
+                {"path": bad_path, "hashes": {"sha512": "a"},
+                 "downloads": [], "fileSize": 1}])
+            pack = self.tmp / "evil.mrpack"
+            _mrpack(pack, doc)
+            proc, report = self.invoke(pack, "--format", "json")
+            self.assertEqual(proc.returncode, 1, bad_path)
+            self.assertIsNone(report)
+            self.assertIn("modrinth.index.json", proc.stderr)
+        # Malformed standalone JSON is a hard error, never a silent skip.
+        broken = self.tmp / "modrinth.index.json"
+        broken.write_text("{not json", encoding="utf-8")
+        proc, _ = self.invoke(broken, "--format", "json")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("invalid JSON", proc.stderr)
+        # A zip carrying neither manifest is equally rejected.
+        empty_zip = self.tmp / "empty.zip"
+        _data_zip(empty_zip, [("random.txt", "hi")])
+        proc, _ = self.invoke(empty_zip, "--format", "json")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("neither", proc.stderr)
+        # Missing pack path.
+        proc, _ = self.invoke(self.tmp / "nope.mrpack", "--format", "json")
+        self.assertEqual(proc.returncode, 1)
+
+    def test_uppercase_jar_classifies_needs_inspection(self):
+        doc = _modrinth_doc(files=[
+            {"path": "mods/MYSTERY-1.0.JAR", "hashes": {"sha512": "x"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1}])
+        pack = self.tmp / "upper.mrpack"
+        _mrpack(pack, doc)
+        proc, report = self.invoke(pack, "--format", "json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["entries"][0]["class"],
+                         "needs_inspection")
+        self.assertEqual(report["readiness"], "needs_jar_inspection")
+
+    def test_profiles_dir_marks_profile_mods_universal(self):
+        profiles = self.tmp / "profiles"
+        profiles.mkdir()
+        (profiles / "jei.json").write_text(json.dumps({
+            "mod_id": "jei",
+            "blocks": [{"id": "jei:gui", "role": "ui"}],
+        }), encoding="utf-8")
+        doc = _modrinth_doc(files=[
+            {"path": "mods/jei-1.21.1-neoforge-19.21.0.247.jar",
+             "hashes": {"sha512": "x"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+            {"path": "mods/mystery-9.9.jar", "hashes": {"sha512": "y"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+        ])
+        pack = self.tmp / "pack.mrpack"
+        _mrpack(pack, doc)
+        proc, report = self.invoke(
+            pack, "--format", "json", "--profiles-dir", str(profiles))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        class_of = {e["path"]: e["class"] for e in report["entries"]}
+        self.assertEqual(
+            class_of["mods/jei-1.21.1-neoforge-19.21.0.247.jar"],
+            "universal_native")
+        self.assertEqual(class_of["mods/mystery-9.9.jar"],
+                         "needs_inspection")
+
+    def test_modpack_flagship_default_and_custom_ids(self):
+        """--flagship-mods drives native_flagship; default is create."""
+        pack = self.tmp / "pack.mrpack"
+        _mrpack(pack, MODRINTH_1211)
+        # Default --flagship-mods is just "create": aether lands in
+        # needs_inspection until named.
+        proc, report = self.invoke(pack, "--format", "json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        class_of = {e["path"]: e["class"] for e in report["entries"]}
+        self.assertEqual(class_of["mods/create-1.21.1-6.0.6.jar"],
+                         "native_flagship")
+        self.assertEqual(class_of["mods/aether-1.21.1-1.5.9-neoforge.jar"],
+                         "needs_inspection")
+        proc, report = self.invoke(
+            pack, "--format", "json", "--flagship-mods", "create,aether")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        class_of = {e["path"]: e["class"] for e in report["entries"]}
+        self.assertEqual(class_of["mods/aether-1.21.1-1.5.9-neoforge.jar"],
+                         "native_flagship")
+
+    def test_modpack_json_flag_alias_and_mutual_exclusion(self):
+        pack = self.tmp / "pack.mrpack"
+        _mrpack(pack, MODRINTH_1211)
+        proc, report = self.invoke(
+            pack, "--json", "--flagship-mods", "create,aether")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["schema"], "mc-spine-modpack-preflight/1")
+        # --mods-dir and --modpack are mutually exclusive.
+        command = [sys.executable, str(TOOL),
+                   "--mods-dir", str(self.tmp), "--modpack", str(pack)]
+        proc = subprocess.run(command, cwd=ROOT, env=self.env,
+                              capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("not allowed with argument", proc.stderr)
+
+    def test_modpack_safe_pack_reports_ready_with_auto_skips(self):
+        doc = _modrinth_doc(files=[
+            {"path": "mods/create-1.21.1-6.0.6.jar",
+             "hashes": {"sha512": "x"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+            {"path": "mods/sodium-neoforge-0.6.13+mc1.21.1.jar",
+             "hashes": {"sha512": "y"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+            {"path": "datapacks/custom-recipes.zip",
+             "hashes": {"sha512": "z"},
+             "env": {"client": "required", "server": "required"},
+             "downloads": [], "fileSize": 1},
+        ])
+        pack = self.tmp / "safe.mrpack"
+        _mrpack(pack, doc)
+        proc, report = self.invoke(pack, "--format", "json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report["readiness"], "ready_with_auto_skips")
+        proc, _ = self.invoke(pack)
+        self.assertIn("ready — redundant and client-only files are "
+                      "skipped automatically", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
