@@ -31,6 +31,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs;
+use std::path::Path;
 
 use crate::data_loader::{parse_json, DataLoadError, JsonValue};
 use crate::fallback::BUILTIN_SUPERSEDED_PERF_MODS;
@@ -573,6 +575,72 @@ impl ModpackManifest {
             files,
         })
     }
+
+    /// Load a manifest from a path on disk — the entry point the
+    /// `mc-spine-mod-check` CLI and `tools/mod_launcher.py --modpack`
+    /// share. Accepts three shapes:
+    ///
+    /// - a standalone `modrinth.index.json` or CurseForge `manifest.json`
+    ///   (format sniffed by root key — `manifestType` or the exact file
+    ///   name `manifest.json` picks CurseForge, `formatVersion`/`game` or
+    ///   the exact name `modrinth.index.json` picks Modrinth);
+    /// - a `.mrpack` / `.zip` archive carrying `modrinth.index.json` or
+    ///   `manifest.json` at its root (`modrinth.index.json` wins when both
+    ///   exist), read through a bounds-checked zero-dependency ZIP loader
+    ///   supporting stored and raw-deflate members.
+    ///
+    /// Everything unsafe is a hard error, never a partial manifest:
+    /// unreadable files, corrupt/truncated archives, encrypted or ZIP64
+    /// members, unknown compression methods, CRC mismatches, non-UTF-8
+    /// manifests, and members decompressing past
+    /// [`MAX_MANIFEST_MEMBER_BYTES`] all fail closed.
+    pub fn from_path(path: &Path) -> Result<Self, ModpackError> {
+        let display = path.display().to_string();
+        let bytes = fs::read(path)
+            .map_err(|e| err(format!("cannot read --modpack {display}: {e}")))?;
+        match pack_member_bytes(&bytes, &display)? {
+            Some((ModpackFormat::Modrinth, text)) => Self::from_modrinth_json(&text),
+            Some((ModpackFormat::CurseForge, text)) => Self::from_curseforge_json(&text),
+            None => Self::from_standalone_json(&bytes, path, &display),
+        }
+    }
+
+    /// `from_path` branch for a file that is not a pack archive: decode it
+    /// as UTF-8 JSON and sniff the format by root key (falling back to the
+    /// conventional file names), mirroring `_load_modpack_document` in
+    /// `tools/mod_launcher.py`.
+    fn from_standalone_json(
+        bytes: &[u8],
+        path: &Path,
+        display: &str,
+    ) -> Result<Self, ModpackError> {
+        if bytes.len() > MAX_MANIFEST_MEMBER_BYTES {
+            return Err(err(format!(
+                "{display}: manifest exceeds the 16 MiB limit"
+            )));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| err(format!("{display}: manifest is not UTF-8")))?;
+        let root = parse_json(bytes)
+            .map_err(|e| err(format!("{display}: invalid JSON ({})", json_err(e))))?;
+        let obj = root
+            .as_object()
+            .ok_or_else(|| err(format!("{display}: root must be an object")))?;
+        let file_name = path.file_name().and_then(|n| n.to_str());
+        if obj.contains_key("manifestType") || file_name == Some("manifest.json") {
+            Self::from_curseforge_json(text)
+        } else if obj.contains_key("formatVersion")
+            || obj.contains_key("game")
+            || file_name == Some("modrinth.index.json")
+        {
+            Self::from_modrinth_json(text)
+        } else {
+            Err(err(format!(
+                "{display}: cannot determine pack format (expected a Modrinth \
+                 modrinth.index.json or a CurseForge manifest.json)"
+            )))
+        }
+    }
 }
 
 /// Normalize a CurseForge slug to the same id space
@@ -642,6 +710,9 @@ pub struct ModpackPreflightReport {
     pub mc_version_declared: String,
     /// The Minecraft version the server targets.
     pub target: McVersion,
+    /// Modloader dependencies declared by the pack (`dependencies` on
+    /// Modrinth, `minecraft.modLoaders[]` on CurseForge).
+    pub loaders: Vec<ModpackLoader>,
     /// Verdict from [`check_mod_mc_version`] on the declared range.
     pub version_verdict: VersionCompatVerdict,
     pub entries: Vec<ModpackEntry>,
@@ -793,6 +864,188 @@ impl ModpackPreflightReport {
         );
         out
     }
+
+    /// Deterministic JSON form of this report — the
+    /// `mc-spine-modpack-preflight/1` schema `tools/mod_launcher.py`
+    /// emits with `json.dumps(report, indent=2)`, with the same key
+    /// order, snake_case enum spellings, and ASCII-only escaping so the
+    /// Rust and Python reports diff byte-for-byte.
+    pub fn to_json(&self) -> String {
+        use fmt::Write;
+        let mut out = String::with_capacity(768 + self.entries.len() * 224);
+        out.push_str("{\n");
+        json_field_str(&mut out, 1, "schema", "mc-spine-modpack-preflight/1", true);
+        json_field_str(&mut out, 1, "pack_name", &self.pack_name, true);
+        json_field_str(&mut out, 1, "pack_version", &self.pack_version, true);
+        json_field_str(
+            &mut out,
+            1,
+            "format",
+            match self.format {
+                ModpackFormat::Modrinth => "modrinth",
+                ModpackFormat::CurseForge => "curseforge",
+            },
+            true,
+        );
+        json_field_str(&mut out, 1, "mc_version_declared", &self.mc_version_declared, true);
+        json_field_str(&mut out, 1, "target", &self.target.to_string(), true);
+
+        if self.loaders.is_empty() {
+            let _ = writeln!(out, "  \"loaders\": [],");
+        } else {
+            let _ = writeln!(out, "  \"loaders\": [");
+            for (i, loader) in self.loaders.iter().enumerate() {
+                let last = i + 1 == self.loaders.len();
+                let _ = writeln!(out, "    {{");
+                json_field_str(&mut out, 3, "id", &loader.id, true);
+                json_field_str(&mut out, 3, "version", &loader.version, true);
+                let _ = writeln!(out, "      \"primary\": {}", loader.primary);
+                let _ = writeln!(out, "    }}{}", if last { "" } else { "," });
+            }
+            let _ = writeln!(out, "  ],");
+        }
+
+        let (kind, declared, reason) = match &self.version_verdict {
+            VersionCompatVerdict::Compatible => ("compatible", None, None),
+            VersionCompatVerdict::MinorMismatch { declared, .. } => {
+                ("minor_mismatch", Some(declared.as_str()), None)
+            }
+            VersionCompatVerdict::MajorMismatch { declared, .. } => {
+                ("major_mismatch", Some(declared.as_str()), None)
+            }
+            VersionCompatVerdict::InvalidRange { declared, reason } => {
+                ("invalid_range", Some(declared.as_str()), Some(reason.as_str()))
+            }
+        };
+        let _ = writeln!(out, "  \"version_verdict\": {{");
+        json_field_str(&mut out, 2, "kind", kind, true);
+        json_field_opt_str(&mut out, 2, "declared", declared, true);
+        json_field_opt_str(&mut out, 2, "reason", reason, false);
+        let _ = writeln!(out, "  }},");
+
+        if self.entries.is_empty() {
+            let _ = writeln!(out, "  \"entries\": [],");
+        } else {
+            let _ = writeln!(out, "  \"entries\": [");
+            for (i, entry) in self.entries.iter().enumerate() {
+                let last = i + 1 == self.entries.len();
+                let _ = writeln!(out, "    {{");
+                json_field_str(&mut out, 3, "path", &entry.path, true);
+                json_field_opt_str(
+                    &mut out,
+                    3,
+                    "candidate_mod_id",
+                    entry.candidate_mod_id.as_deref(),
+                    true,
+                );
+                json_field_str(&mut out, 3, "class", entry_class_name(entry.class), true);
+                json_field_str(&mut out, 3, "note", &entry.note, false);
+                let _ = writeln!(out, "    }}{}", if last { "" } else { "," });
+            }
+            let _ = writeln!(out, "  ],");
+        }
+
+        json_field_str(&mut out, 1, "readiness", readiness_name(self.readiness), true);
+        json_str_array_field(&mut out, "skipped_perf_mods", &self.skipped_perf_mod_names(), true);
+        json_str_array_field(&mut out, "client_only_mods", &self.client_only_names(), true);
+        json_str_array_field(&mut out, "native_mods", &self.native_names(), true);
+        json_str_array_field(&mut out, "needs_inspection_mods", &self.needs_inspection_names(), false);
+        out.push_str("}\n");
+        out
+    }
+}
+
+/// `ModpackEntryClass` as the snake_case string the
+/// `mc-spine-modpack-preflight/1` schema uses.
+fn entry_class_name(class: ModpackEntryClass) -> &'static str {
+    match class {
+        ModpackEntryClass::SupersededPerfMod => "superseded_perf_mod",
+        ModpackEntryClass::ClientOnlySkipped => "client_only_skipped",
+        ModpackEntryClass::NativeFlagship => "native_flagship",
+        ModpackEntryClass::UniversalNative => "universal_native",
+        ModpackEntryClass::NeedsInspection => "needs_inspection",
+    }
+}
+
+/// `ModpackReadiness` as the snake_case string the schema uses.
+fn readiness_name(readiness: ModpackReadiness) -> &'static str {
+    match readiness {
+        ModpackReadiness::ReadyNative => "ready_native",
+        ModpackReadiness::ReadyWithAutoSkips => "ready_with_auto_skips",
+        ModpackReadiness::NeedsJarInspection => "needs_jar_inspection",
+        ModpackReadiness::VersionMismatch => "version_mismatch",
+    }
+}
+
+/// Append `"key": "escaped"` (indent `level` x 2 spaces) plus a trailing
+/// comma when `comma` — the `json.dumps(indent=2)` line shape.
+fn json_field_str(out: &mut String, level: usize, key: &str, value: &str, comma: bool) {
+    use fmt::Write;
+    let _ = write!(out, "{:width$}\"{key}\": ", "", width = level * 2);
+    json_string(out, value);
+    let _ = writeln!(out, "{}", if comma { "," } else { "" });
+}
+
+/// Same line shape for a `string | null` field.
+fn json_field_opt_str(
+    out: &mut String,
+    level: usize,
+    key: &str,
+    value: Option<&str>,
+    comma: bool,
+) {
+    use fmt::Write;
+    let _ = write!(out, "{:width$}\"{key}\": ", "", width = level * 2);
+    match value {
+        Some(v) => json_string(out, v),
+        None => out.push_str("null"),
+    }
+    let _ = writeln!(out, "{}", if comma { "," } else { "" });
+}
+
+/// `"key": [...]` for a string list at top level: `[]` inline when empty,
+/// else one element per line exactly like `json.dumps(indent=2)`.
+fn json_str_array_field(out: &mut String, key: &str, items: &[String], comma: bool) {
+    use fmt::Write;
+    if items.is_empty() {
+        let _ = writeln!(out, "  \"{key}\": []{}", if comma { "," } else { "" });
+        return;
+    }
+    let _ = writeln!(out, "  \"{key}\": [");
+    for (i, item) in items.iter().enumerate() {
+        let _ = write!(out, "    ");
+        json_string(out, item);
+        let _ = writeln!(out, "{}", if i + 1 == items.len() { "" } else { "," });
+    }
+    let _ = writeln!(out, "  ]{}", if comma { "," } else { "" });
+}
+
+/// JSON string escaping identical to `json.dumps` with `ensure_ascii`:
+/// `\"`, `\\`, the `\b \f \n \r \t` short escapes, `\uXXXX` for other
+/// control bytes and every non-ASCII scalar (astral code points as a
+/// UTF-16 surrogate pair).
+fn json_string(out: &mut String, s: &str) {
+    use fmt::Write;
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (' '..='~').contains(&c) => out.push(c),
+            c => {
+                let mut buf = [0u16; 2];
+                for u in c.encode_utf16(&mut buf) {
+                    let _ = write!(out, "\\u{u:04x}");
+                }
+            }
+        }
+    }
+    out.push('"');
 }
 
 /// Display label for an entry: the inferred mod id when known, else the
@@ -866,6 +1119,7 @@ pub fn analyze_modpack(
         format: manifest.format,
         mc_version_declared: manifest.mc_version.clone(),
         target,
+        loaders: manifest.loaders.clone(),
         version_verdict,
         entries,
         readiness,
@@ -922,6 +1176,535 @@ fn classify_entry(
         "unrecognized Java mod — its bytecode still needs a compatibility inspection before launch"
             .to_string(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Zero-dependency pack-archive reader (`.mrpack` / `.zip`)
+// ---------------------------------------------------------------------------
+
+/// Largest decompressed manifest member accepted from a pack archive:
+/// 16 MiB. A hostile archive can declare a tiny compressed blob that
+/// inflates to gigabytes, so the declared central-directory size is
+/// checked before a single output byte is produced and the inflater is
+/// capped at the same budget — fail closed on a zip bomb.
+const MAX_MANIFEST_MEMBER_BYTES: usize = 16 * 1024 * 1024;
+
+const LOCAL_FILE_SIG: u32 = 0x0403_4b50;
+const CENTRAL_DIR_SIG: u32 = 0x0201_4b50;
+const EOCD_SIG: u32 = 0x0605_4b50;
+/// Longest tail that can hold an end-of-central-directory record:
+/// 22-byte header + maximum 64 KiB archive comment.
+const MAX_EOCD_TAIL: usize = 22 + u16::MAX as usize;
+/// Largest central directory accepted — far past any real pack; corrupt
+/// offsets are caught by the bounds checks this feeds.
+const MAX_CENTRAL_DIR_BYTES: u64 = 64 * 1024 * 1024;
+
+fn u16_at(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[at],
+        bytes[at + 1],
+        bytes[at + 2],
+        bytes[at + 3],
+    ])
+}
+
+/// Locate a structurally coherent end-of-central-directory record by
+/// scanning the file tail backwards, or `None` when the buffer is not a
+/// readable archive (mirrors `zipfile.is_zipfile`). A candidate counts
+/// only when its comment length reaches exactly the end of file, it
+/// describes a single disk, and its central-directory span fits inside
+/// the buffer.
+fn find_eocd(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 22 {
+        return None;
+    }
+    let floor = bytes.len().saturating_sub(MAX_EOCD_TAIL);
+    let mut pos = bytes.len() - 22;
+    loop {
+        if u32_at(bytes, pos) == EOCD_SIG {
+            let comment_len = u16_at(bytes, pos + 20) as usize;
+            let single_disk = u16_at(bytes, pos + 4) == 0
+                && u16_at(bytes, pos + 6) == 0
+                && u16_at(bytes, pos + 8) == u16_at(bytes, pos + 10);
+            let cd_size = u32_at(bytes, pos + 12) as u64;
+            let cd_offset = u32_at(bytes, pos + 16) as u64;
+            let coherent_span = cd_offset
+                .checked_add(cd_size)
+                .is_some_and(|end| end <= pos as u64);
+            if pos + 22 + comment_len == bytes.len()
+                && single_disk
+                && coherent_span
+            {
+                return Some(pos);
+            }
+        }
+        if pos == floor {
+            return None;
+        }
+        pos -= 1;
+    }
+}
+
+/// One central-directory record for a candidate manifest member.
+struct CentralMember {
+    flags: u16,
+    method: u16,
+    crc32: u32,
+    comp_size: u64,
+    uncomp_size: u64,
+    local_offset: u64,
+}
+
+/// Read the manifest member out of a pack archive: `modrinth.index.json`
+/// when present, else `manifest.json` — both only at the archive root,
+/// exactly like `namelist()` matching in `tools/mod_launcher.py`. Returns
+/// `Ok(None)` when `bytes` is not an archive at all (the standalone-JSON
+/// path), `Err` for every corrupt or unsafe archive shape.
+fn pack_member_bytes(
+    bytes: &[u8],
+    display: &str,
+) -> Result<Option<(ModpackFormat, String)>, ModpackError> {
+    let Some(eocd) = find_eocd(bytes) else {
+        if bytes.starts_with(&LOCAL_FILE_SIG.to_le_bytes())
+            || bytes.starts_with(&EOCD_SIG.to_le_bytes())
+        {
+            return Err(err(format!(
+                "{display}: not a readable pack archive (missing end-of-central-directory record)"
+            )));
+        }
+        return Ok(None);
+    };
+
+    let count = u16_at(bytes, eocd + 10) as usize;
+    let cd_size = u32_at(bytes, eocd + 12) as u64;
+    let cd_offset = u32_at(bytes, eocd + 16) as u64;
+    if cd_size > MAX_CENTRAL_DIR_BYTES {
+        return Err(err(format!(
+            "{display}: central directory exceeds a sane size"
+        )));
+    }
+    // `concat`: bytes prepended ahead of the archive proper (self-
+    // extracting stubs, appended junk) shift every stored offset by the
+    // same delta — the same adjustment `zipfile` applies.
+    let concat = (eocd as u64)
+        .checked_sub(cd_size + cd_offset)
+        .ok_or_else(|| err(format!("{display}: corrupt central directory offsets")))?;
+    let mut cursor = (cd_offset + concat) as usize;
+
+    // Later duplicates shadow earlier ones, matching `zipfile`'s
+    // `NameToInfo` last-wins table.
+    let mut modrinth: Option<CentralMember> = None;
+    let mut curseforge: Option<CentralMember> = None;
+    for _ in 0..count {
+        if cursor + 46 > eocd {
+            return Err(err(format!("{display}: truncated central directory")));
+        }
+        if u32_at(bytes, cursor) != CENTRAL_DIR_SIG {
+            return Err(err(format!(
+                "{display}: corrupt central directory (bad entry signature)"
+            )));
+        }
+        let name_len = u16_at(bytes, cursor + 28) as usize;
+        let extra_len = u16_at(bytes, cursor + 30) as usize;
+        let entry_comment_len = u16_at(bytes, cursor + 32) as usize;
+        let name_end = cursor
+            .checked_add(46)
+            .and_then(|v| v.checked_add(name_len))
+            .ok_or_else(|| err(format!("{display}: central directory length overflow")))?;
+        if name_end > eocd {
+            return Err(err(format!("{display}: truncated central directory name")));
+        }
+        let name = &bytes[cursor + 46..name_end];
+        let is_manifest = name == b"modrinth.index.json" || name == b"manifest.json";
+        let member = CentralMember {
+            flags: u16_at(bytes, cursor + 8),
+            method: u16_at(bytes, cursor + 10),
+            crc32: u32_at(bytes, cursor + 16),
+            comp_size: u32_at(bytes, cursor + 20) as u64,
+            uncomp_size: u32_at(bytes, cursor + 24) as u64,
+            local_offset: u32_at(bytes, cursor + 42) as u64 + concat,
+        };
+        if is_manifest {
+            if member.comp_size == u64::from(u32::MAX)
+                || member.uncomp_size == u64::from(u32::MAX)
+                || member.local_offset - concat == u64::from(u32::MAX)
+            {
+                return Err(err(format!(
+                    "{display}: ZIP64 manifest member is unsupported"
+                )));
+            }
+            if member.method != 0 && member.method != 8 {
+                return Err(err(format!(
+                    "{display}: manifest member uses unsupported compression method {}",
+                    member.method
+                )));
+            }
+            if name == b"modrinth.index.json" {
+                modrinth = Some(member);
+            } else {
+                curseforge = Some(member);
+            }
+        }
+        cursor = name_end
+            .checked_add(extra_len)
+            .and_then(|v| v.checked_add(entry_comment_len))
+            .ok_or_else(|| err(format!("{display}: central directory length overflow")))?;
+    }
+
+    let (member, entry_name, format) = match (modrinth, curseforge) {
+        (Some(m), _) => (m, "modrinth.index.json", ModpackFormat::Modrinth),
+        (None, Some(m)) => (m, "manifest.json", ModpackFormat::CurseForge),
+        (None, None) => {
+            return Err(err(format!(
+                "{display}: archive contains neither modrinth.index.json nor manifest.json"
+            )))
+        }
+    };
+    let text = extract_member(bytes, &member, entry_name, display)?;
+    Ok(Some((format, text)))
+}
+
+/// Read, decompress, and verify one archive member — fail closed on
+/// encryption, an oversized declaration, a truncated payload, a wrong
+/// decompressed length, or a CRC-32 mismatch.
+fn extract_member(
+    bytes: &[u8],
+    member: &CentralMember,
+    name: &str,
+    display: &str,
+) -> Result<String, ModpackError> {
+    if member.flags & 0x1 != 0 {
+        return Err(err(format!("{display}: {name} is encrypted")));
+    }
+    if member.uncomp_size > MAX_MANIFEST_MEMBER_BYTES as u64 {
+        return Err(err(format!(
+            "{display}: {name} exceeds the 16 MiB manifest limit"
+        )));
+    }
+    let local = usize::try_from(member.local_offset)
+        .map_err(|_| err(format!("{display}: corrupt member offset for {name}")))?;
+    if local + 30 > bytes.len() || u32_at(bytes, local) != LOCAL_FILE_SIG {
+        return Err(err(format!(
+            "{display}: corrupt local file header for {name}"
+        )));
+    }
+    let name_len = u16_at(bytes, local + 26) as usize;
+    let extra_len = u16_at(bytes, local + 28) as usize;
+    let data_start = local
+        .checked_add(30)
+        .and_then(|v| v.checked_add(name_len))
+        .and_then(|v| v.checked_add(extra_len))
+        .ok_or_else(|| err(format!("{display}: member header overflow for {name}")))?;
+    let comp_size = usize::try_from(member.comp_size)
+        .map_err(|_| err(format!("{display}: corrupt member size for {name}")))?;
+    let data_end = data_start
+        .checked_add(comp_size)
+        .ok_or_else(|| err(format!("{display}: member payload overflow for {name}")))?;
+    if data_end > bytes.len() {
+        return Err(err(format!("{display}: truncated member {name}")));
+    }
+    let budget = usize::try_from(member.uncomp_size)
+        .unwrap_or(MAX_MANIFEST_MEMBER_BYTES)
+        .min(MAX_MANIFEST_MEMBER_BYTES);
+    let payload = &bytes[data_start..data_end];
+    let decoded = match member.method {
+        0 => payload.to_vec(),
+        8 => inflate_raw(payload, budget)
+            .map_err(|e| err(format!("{display}: corrupt deflate stream in {name} ({e})")))?,
+        _ => unreachable!("method checked during directory scan"),
+    };
+    if decoded.len() as u64 != member.uncomp_size {
+        return Err(err(format!(
+            "{display}: {name} decompressed length does not match the directory"
+        )));
+    }
+    if crc32(&decoded) != member.crc32 {
+        return Err(err(format!("{display}: CRC-32 mismatch in {name}")));
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| err(format!("{display}: {name} is not UTF-8")))
+}
+
+// ---------------------------------------------------------------------------
+// Raw RFC 1951 DEFLATE decoder (bit reader + canonical Huffman +
+// fixed/dynamic trees + LZ77 window), the same clean-room implementation
+// `client-kernel` uses for gzip members — here without the RFC 1952
+// framing since ZIP members carry their own CRC and size fields.
+// ---------------------------------------------------------------------------
+
+/// Bit-level input cursor over a deflate stream (LSB-first packing).
+struct DeflateBits<'a> {
+    input: &'a [u8],
+    used: u8,
+}
+
+impl DeflateBits<'_> {
+    fn read(&mut self, n: u8) -> Result<u16, String> {
+        let mut value = 0;
+        let mut read = 0;
+        while read < n {
+            let byte = *self.input.first().ok_or_else(invalid_deflate)?;
+            let width = (n - read).min(8 - self.used);
+            let mask = (1u16 << width) - 1;
+            value |= (u16::from(byte >> self.used) & mask) << read;
+            read += width;
+            self.used += width;
+            if self.used == 8 {
+                self.used = 0;
+                self.input = &self.input[1..];
+            }
+        }
+        Ok(value)
+    }
+
+    fn align(&mut self) {
+        if self.used != 0 {
+            self.input = &self.input[1..];
+            self.used = 0;
+        }
+    }
+}
+
+fn invalid_deflate() -> String {
+    "invalid deflate stream".to_string()
+}
+
+fn deflate_budget() -> String {
+    "deflate output exceeds the manifest size limit".to_string()
+}
+
+/// Canonical Huffman decode table: contiguous codes at each width, in
+/// symbol order.
+struct DeflateHuffman {
+    counts: [u16; 16],
+    symbols: Vec<u16>,
+    max_width: usize,
+}
+
+impl DeflateHuffman {
+    fn new(lengths: &[u8], allow_single: bool) -> Result<Self, String> {
+        let mut counts = [0u16; 16];
+        let mut max_width = 0;
+        for &length in lengths {
+            let width = usize::from(length);
+            if width != 0 {
+                *counts.get_mut(width).ok_or_else(invalid_deflate)? += 1;
+                max_width = max_width.max(width);
+            }
+        }
+        let mut remaining = 1i32;
+        let mut offsets = [0usize; 16];
+        let mut total = 0;
+        for width in 1..=max_width {
+            remaining = 2 * remaining - i32::from(counts[width]);
+            if remaining < 0 {
+                return Err(invalid_deflate());
+            }
+            offsets[width] = total;
+            total += usize::from(counts[width]);
+        }
+        if remaining != 0 && !(allow_single && total == 1 && max_width == 1) {
+            return Err(invalid_deflate());
+        }
+        let mut symbols = vec![0; total];
+        for (symbol, &length) in lengths
+            .iter()
+            .enumerate()
+            .filter(|&(_, &length)| length != 0)
+        {
+            let offset = &mut offsets[usize::from(length)];
+            symbols[*offset] = symbol as u16;
+            *offset += 1;
+        }
+        Ok(Self {
+            counts,
+            symbols,
+            max_width,
+        })
+    }
+
+    fn read(&self, bits: &mut DeflateBits<'_>) -> Result<u16, String> {
+        let (mut code, mut first, mut offset) = (0, 0, 0);
+        for width in 1..=self.max_width {
+            code = (code << 1) | bits.read(1)?;
+            let count = self.counts[width];
+            if code >= first && code - first < count {
+                return Ok(self.symbols[offset + usize::from(code - first)]);
+            }
+            first = (first + count) << 1;
+            offset += usize::from(count);
+        }
+        Err(invalid_deflate())
+    }
+}
+
+fn fixed_trees() -> Result<(DeflateHuffman, Option<DeflateHuffman>), String> {
+    let mut lengths = [8; 288];
+    lengths[144..256].fill(9);
+    lengths[256..280].fill(7);
+    Ok((
+        DeflateHuffman::new(&lengths, false)?,
+        Some(DeflateHuffman::new(&[5; 32], false)?),
+    ))
+}
+
+fn dynamic_trees(
+    bits: &mut DeflateBits<'_>,
+) -> Result<(DeflateHuffman, Option<DeflateHuffman>), String> {
+    let literals = usize::from(bits.read(5)?) + 257;
+    let distances = usize::from(bits.read(5)?) + 1;
+    let code_count = usize::from(bits.read(4)?) + 4;
+    if literals > 286 {
+        return Err(invalid_deflate());
+    }
+    const ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    let mut codes = [0; 19];
+    for &symbol in &ORDER[..code_count] {
+        codes[symbol] = bits.read(3)? as u8;
+    }
+    let tree = DeflateHuffman::new(&codes, false)?;
+    let mut lengths = Vec::with_capacity(literals + distances);
+    while lengths.len() < literals + distances {
+        let (length, count) = match tree.read(bits)? {
+            n @ 0..=15 => (n as u8, 1),
+            16 => (
+                *lengths.last().ok_or_else(invalid_deflate)?,
+                usize::from(bits.read(2)?) + 3,
+            ),
+            17 => (0, usize::from(bits.read(3)?) + 3),
+            18 => (0, usize::from(bits.read(7)?) + 11),
+            _ => return Err(invalid_deflate()),
+        };
+        let end = lengths.len() + count;
+        if end > literals + distances {
+            return Err(invalid_deflate());
+        }
+        lengths.resize(end, length);
+    }
+    if lengths[256] == 0 {
+        return Err(invalid_deflate());
+    }
+    let (literals, distances) = lengths.split_at(literals);
+    let distances = if distances == [0] {
+        None
+    } else {
+        Some(DeflateHuffman::new(distances, true)?)
+    };
+    Ok((DeflateHuffman::new(literals, true)?, distances))
+}
+
+const LENGTH_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
+];
+const DISTANCE_BASE: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+
+/// Inflate a raw deflate member into at most `budget` bytes.
+fn inflate_raw(input: &[u8], budget: usize) -> Result<Vec<u8>, String> {
+    let mut bits = DeflateBits { input, used: 0 };
+    let mut out = Vec::new();
+    loop {
+        let final_block = bits.read(1)? != 0;
+        match bits.read(2)? {
+            0 => {
+                bits.align();
+                let length = bits.read(16)?;
+                let complement = bits.read(16)?;
+                if length != !complement {
+                    return Err(invalid_deflate());
+                }
+                let (data, rest) = bits
+                    .input
+                    .split_at_checked(usize::from(length))
+                    .ok_or_else(invalid_deflate)?;
+                bits.input = rest;
+                if data.len() > budget - out.len() {
+                    return Err(deflate_budget());
+                }
+                out.extend_from_slice(data);
+            }
+            kind @ (1 | 2) => {
+                let (literals, distances) = if kind == 1 {
+                    fixed_trees()?
+                } else {
+                    dynamic_trees(&mut bits)?
+                };
+                loop {
+                    match literals.read(&mut bits)? {
+                        byte @ 0..=255 => {
+                            if out.len() == budget {
+                                return Err(deflate_budget());
+                            }
+                            out.push(byte as u8);
+                        }
+                        256 => break,
+                        symbol @ 257..=285 => {
+                            let index = (symbol - 257) as usize;
+                            let extra = if symbol < 285 {
+                                index.saturating_sub(4) / 4
+                            } else {
+                                0
+                            };
+                            let length =
+                                usize::from(LENGTH_BASE[index] + bits.read(extra as u8)?);
+                            let code = distances
+                                .as_ref()
+                                .ok_or_else(invalid_deflate)?
+                                .read(&mut bits)? as usize;
+                            let base = *DISTANCE_BASE.get(code).ok_or_else(invalid_deflate)?;
+                            let extra = code.saturating_sub(2) / 2;
+                            let distance = usize::from(base + bits.read(extra as u8)?);
+                            if distance > out.len() {
+                                return Err(invalid_deflate());
+                            }
+                            if length > budget - out.len() {
+                                return Err(deflate_budget());
+                            }
+                            for _ in 0..length {
+                                out.push(out[out.len() - distance]);
+                            }
+                        }
+                        _ => return Err(invalid_deflate()),
+                    }
+                }
+            }
+            _ => return Err(invalid_deflate()),
+        }
+        if final_block {
+            return Ok(out);
+        }
+    }
+}
+
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < table.len() {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = (crc >> 1) ^ if crc & 1 == 1 { 0xedb8_8320 } else { 0 };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+fn crc32(data: &[u8]) -> u32 {
+    !data.iter().fold(!0, |crc, byte| {
+        (crc >> 8) ^ CRC_TABLE[((crc as u8) ^ byte) as usize]
+    })
 }
 
 #[cfg(test)]
@@ -1503,5 +2286,344 @@ mod tests {
         let summary = report.format_human_summary();
         assert!(summary.contains("versions do not match"));
         assert!(summary.contains("different Minecraft version"));
+    }
+
+    // -- to_json ------------------------------------------------------------
+
+    #[test]
+    fn to_json_emits_preflight_schema() {
+        let m = ModpackManifest::from_modrinth_json(MODRINTH_1211).unwrap();
+        let report = analyze_modpack(
+            &m,
+            McVersion::V1_21_1,
+            &set(&["create", "aether"]),
+            &set(&[]),
+        );
+        let json = report.to_json();
+        let root = parse_json(json.as_bytes()).expect("to_json must be valid JSON");
+        let r = root.as_object().unwrap();
+        let s = |k: &str| r.get(k).and_then(JsonValue::as_str).unwrap_or("");
+        assert_eq!(s("schema"), "mc-spine-modpack-preflight/1");
+        assert_eq!(s("pack_name"), "Create NeoForge Adventure");
+        assert_eq!(s("pack_version"), "1.4.0");
+        assert_eq!(s("format"), "modrinth");
+        assert_eq!(s("mc_version_declared"), "1.21.1");
+        assert_eq!(s("target"), "1.21.1");
+        assert_eq!(s("readiness"), "needs_jar_inspection");
+
+        let verdict = r.get("version_verdict").unwrap().as_object().unwrap();
+        assert_eq!(
+            verdict.get("kind").and_then(JsonValue::as_str),
+            Some("compatible")
+        );
+        assert!(matches!(verdict.get("declared"), Some(JsonValue::Null)));
+        assert!(matches!(verdict.get("reason"), Some(JsonValue::Null)));
+
+        let loaders = r.get("loaders").unwrap().as_array().unwrap();
+        assert_eq!(loaders.len(), 1);
+        assert_eq!(
+            loaders[0]
+                .as_object()
+                .and_then(|o| o.get("id"))
+                .and_then(JsonValue::as_str),
+            Some("neoforge")
+        );
+
+        let entries = r.get("entries").unwrap().as_array().unwrap();
+        assert_eq!(entries.len(), 10);
+        let class_of = |path: &str| {
+            entries
+                .iter()
+                .find(|e| {
+                    e.as_object()
+                        .and_then(|o| o.get("path"))
+                        .and_then(JsonValue::as_str)
+                        == Some(path)
+                })
+                .and_then(|e| e.as_object())
+                .and_then(|o| o.get("class"))
+                .and_then(JsonValue::as_str)
+                .unwrap()
+        };
+        assert_eq!(
+            class_of("mods/create-1.21.1-6.0.6.jar"),
+            "native_flagship"
+        );
+        assert_eq!(
+            class_of("mods/sodium-neoforge-0.6.13+mc1.21.1.jar"),
+            "superseded_perf_mod"
+        );
+        assert_eq!(
+            class_of("mods/iris-neoforge-1.8.0+mc1.21.1.jar"),
+            "client_only_skipped"
+        );
+        assert_eq!(
+            class_of("mods/mysterious-factory-3.2.1.jar"),
+            "needs_inspection"
+        );
+
+        let list = |k: &str| {
+            r.get(k)
+                .and_then(JsonValue::as_array)
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            list("skipped_perf_mods"),
+            vec![
+                "distanthorizons",
+                "ferritecore",
+                "lithium",
+                "modernfix",
+                "sodium"
+            ]
+        );
+        assert_eq!(list("client_only_mods"), vec!["iris"]);
+        assert_eq!(
+            list("needs_inspection_mods"),
+            vec!["mysterious-factory"]
+        );
+
+        // Re-serializing the parsed tree is a fixed point: the output is
+        // deterministic across calls.
+        assert_eq!(report.to_json(), json);
+    }
+
+    #[test]
+    fn to_json_reports_mismatch_and_escapes_like_python() {
+        let text = MODRINTH_1211.replace(
+            "\"name\": \"Create NeoForge Adventure\"",
+            "\"name\": \"pack\\t\\u00e9 \\\"v\\\"\"",
+        );
+        let m = ModpackManifest::from_modrinth_json(&text).unwrap();
+        let report = analyze_modpack(&m, McVersion::V26_3, &set(&[]), &set(&[]));
+        let json = report.to_json();
+        let root = parse_json(json.as_bytes()).unwrap();
+        let r = root.as_object().unwrap();
+        let verdict = r.get("version_verdict").unwrap().as_object().unwrap();
+        assert_eq!(
+            verdict.get("kind").and_then(JsonValue::as_str),
+            Some("major_mismatch")
+        );
+        assert_eq!(
+            verdict.get("declared").and_then(JsonValue::as_str),
+            Some("1.21.1")
+        );
+        assert_eq!(
+            r.get("readiness").and_then(JsonValue::as_str),
+            Some("version_mismatch")
+        );
+        // json.dumps(ensure_ascii) shape: tab short-escape, é -> \u00e9.
+        assert!(json.contains("pack\\t\\u00e9 \\\"v\\\"\""), "{json}");
+    }
+
+    // -- Archive reader + inflate ------------------------------------------
+
+    /// One-entry `.mrpack`-shaped archive built in memory (local header,
+    /// central directory, EOCD), optionally with a `preamble` to exercise
+    /// the `concat` adjustment self-extracting archives need.
+    fn zip_one(name: &str, method: u16, flags: u16, payload: &[u8], uncomp: u32, crc: u32) -> Vec<u8> {
+        fn u16le(out: &mut Vec<u8>, v: u16) {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        fn u32le(out: &mut Vec<u8>, v: u32) {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        u32le(&mut out, LOCAL_FILE_SIG);
+        u16le(&mut out, 20);
+        u16le(&mut out, flags);
+        u16le(&mut out, method);
+        u16le(&mut out, 0);
+        u16le(&mut out, 0);
+        u32le(&mut out, crc);
+        u32le(&mut out, payload.len() as u32);
+        u32le(&mut out, uncomp);
+        u16le(&mut out, name.len() as u16);
+        u16le(&mut out, 0);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(payload);
+        let cd_offset = out.len() as u32;
+        u32le(&mut out, CENTRAL_DIR_SIG);
+        u16le(&mut out, 20);
+        u16le(&mut out, 20);
+        u16le(&mut out, flags);
+        u16le(&mut out, method);
+        u16le(&mut out, 0);
+        u16le(&mut out, 0);
+        u32le(&mut out, crc);
+        u32le(&mut out, payload.len() as u32);
+        u32le(&mut out, uncomp);
+        u16le(&mut out, name.len() as u16);
+        u16le(&mut out, 0);
+        u16le(&mut out, 0);
+        u16le(&mut out, 0);
+        u16le(&mut out, 0);
+        u32le(&mut out, 0);
+        u32le(&mut out, 0);
+        out.extend_from_slice(name.as_bytes());
+        let cd_size = out.len() as u32 - cd_offset;
+        u32le(&mut out, EOCD_SIG);
+        u16le(&mut out, 0);
+        u16le(&mut out, 0);
+        u16le(&mut out, 1);
+        u16le(&mut out, 1);
+        u32le(&mut out, cd_size);
+        u32le(&mut out, cd_offset);
+        u16le(&mut out, 0);
+        out
+    }
+
+    #[test]
+    fn archive_reader_extracts_stored_member_and_tolerates_preamble() {
+        let zip = zip_one(
+            "modrinth.index.json",
+            0,
+            0,
+            MODRINTH_1211.as_bytes(),
+            MODRINTH_1211.len() as u32,
+            crc32(MODRINTH_1211.as_bytes()),
+        );
+        let (format, text) = pack_member_bytes(&zip, "t.mrpack").unwrap().unwrap();
+        assert_eq!(format, ModpackFormat::Modrinth);
+        let m = ModpackManifest::from_modrinth_json(&text).unwrap();
+        assert_eq!(m.name, "Create NeoForge Adventure");
+
+        // Self-extracting preamble: concatenated bytes shift every stored
+        // offset by the same delta the EOCD math absorbs.
+        let mut prefixed = b"SFX-STUB".to_vec();
+        prefixed.extend_from_slice(&zip);
+        assert!(pack_member_bytes(&prefixed, "t.mrpack").unwrap().is_some());
+
+        // A plain JSON document is not an archive at all.
+        assert_eq!(pack_member_bytes(MODRINTH_1211.as_bytes(), "t.json").unwrap(), None);
+    }
+
+    #[test]
+    fn archive_reader_prefers_modrinth_then_falls_back_to_curseforge() {
+        let cf = CURSEFORGE_1211.as_bytes();
+        let zip = zip_one("manifest.json", 0, 0, cf, cf.len() as u32, crc32(cf));
+        let (format, _) = pack_member_bytes(&zip, "t.zip").unwrap().unwrap();
+        assert_eq!(format, ModpackFormat::CurseForge);
+    }
+
+    #[test]
+    fn archive_reader_fail_closed() {
+        let body = MODRINTH_1211.as_bytes();
+        let good_crc = crc32(body);
+        for (label, zip) in [
+            (
+                "pk prefix without EOCD",
+                [&LOCAL_FILE_SIG.to_le_bytes()[..], b"junk"].concat(),
+            ),
+            (
+                "archive without a manifest member",
+                zip_one("overrides/x.txt", 0, 0, b"x", 1, crc32(b"x")),
+            ),
+            (
+                "oversized member",
+                zip_one("modrinth.index.json", 0, 0, body, 17 * 1024 * 1024, good_crc),
+            ),
+            (
+                "crc mismatch",
+                zip_one("modrinth.index.json", 0, 0, body, body.len() as u32, good_crc ^ 1),
+            ),
+            (
+                "unsupported method",
+                zip_one("modrinth.index.json", 12, 0, body, body.len() as u32, good_crc),
+            ),
+            (
+                "encrypted member",
+                zip_one("modrinth.index.json", 0, 0x1, body, body.len() as u32, good_crc),
+            ),
+        ] {
+            assert!(
+                pack_member_bytes(&zip, "t").is_err(),
+                "{label} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn inflate_raw_decodes_stored_and_backreference_streams() {
+        // BTYPE=00 stored block: BFINAL|00, LEN, NLEN, raw bytes.
+        let stored: &[u8] = &[
+            0x01, 21, 0, 234, 255, b's', b't', b'o', b'r', b'e', b'd', b' ', b'b', b'l', b'o',
+            b'c', b'k', b' ', b'p', b'a', b'y', b'l', b'o', b'a', b'd', b'!',
+        ];
+        let out = inflate_raw(stored, 1024).unwrap();
+        assert_eq!(out, b"stored block payload!");
+
+        // zlib level-9 raw stream over "abc"*12 + 0..20: exercises both
+        // Huffman literals and a length/distance back-reference.
+        let compressed: &[u8] = &[
+            75, 76, 74, 78, 36, 132, 24, 24, 153, 152, 89, 88, 217, 216, 57, 56, 185, 184,
+            121, 120, 249, 248, 5, 4, 133, 132, 1,
+        ];
+        let mut expected = b"abc".repeat(12);
+        expected.extend(0u8..20);
+        let out = inflate_raw(compressed, 1024).unwrap();
+        assert_eq!(out, expected);
+
+        // Budget violation and truncation fail closed.
+        assert!(inflate_raw(compressed, 10).is_err());
+        assert!(inflate_raw(&compressed[..10], 1024).is_err());
+        assert!(inflate_raw(&[], 1024).is_err());
+    }
+
+    // -- from_path -----------------------------------------------------------
+
+    #[test]
+    fn from_path_loads_standalone_and_archive_manifests() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "mc-spine-modpack-from-path-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let json_path = dir.join("modrinth.index.json");
+        fs::File::create(&json_path)
+            .unwrap()
+            .write_all(MODRINTH_1211.as_bytes())
+            .unwrap();
+        let m = ModpackManifest::from_path(&json_path).unwrap();
+        assert_eq!(m.format, ModpackFormat::Modrinth);
+        assert_eq!(m.name, "Create NeoForge Adventure");
+
+        let cf_path = dir.join("manifest.json");
+        fs::File::create(&cf_path)
+            .unwrap()
+            .write_all(CURSEFORGE_1211.as_bytes())
+            .unwrap();
+        let m = ModpackManifest::from_path(&cf_path).unwrap();
+        assert_eq!(m.format, ModpackFormat::CurseForge);
+
+        let cf = CURSEFORGE_1211.as_bytes();
+        let zip_path = dir.join("pack.mrpack");
+        fs::File::create(&zip_path)
+            .unwrap()
+            .write_all(&zip_one(
+                "manifest.json",
+                0,
+                0,
+                cf,
+                cf.len() as u32,
+                crc32(cf),
+            ))
+            .unwrap();
+        let m = ModpackManifest::from_path(&zip_path).unwrap();
+        assert_eq!(m.format, ModpackFormat::CurseForge);
+        assert_eq!(m.name, "CF Adventure");
+
+        assert!(ModpackManifest::from_path(&dir.join("missing.mrpack")).is_err());
+        let garbage_path = dir.join("garbage.mrpack");
+        fs::File::create(&garbage_path)
+            .unwrap()
+            .write_all(b"PK\x03\x04not-a-zip")
+            .unwrap();
+        assert!(ModpackManifest::from_path(&garbage_path).is_err());
     }
 }
