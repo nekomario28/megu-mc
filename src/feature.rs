@@ -7097,8 +7097,8 @@ fn gen_vein_impl<T>(
         (std::mem::take(&mut s.ds), std::mem::take(&mut s.bits))
     });
     ds.resize(ds_len, 0.0);
-    bits.clear();
     bits.resize(words, 0u64);
+    bits.fill(0);
     for k in 0..j {
         let f = k as f32 / j as f32;
         let ki = k as usize * 4;
@@ -7150,6 +7150,14 @@ fn gen_vein_impl<T>(
         let x1 = ((cx + d).floor() as i32).max(x0);
         let y1 = ((cy + d).floor() as i32).max(y0);
         let z1 = ((cz + d).floor() as i32).max(z0);
+        // The world window is the placement boundary (which can exceed the
+        // noise-generator window in the Nether and End). Reject whole Y slices
+        // before evaluating their ellipsoid coordinates.
+        let y0 = y0.max(ctx.g.world_min_y);
+        let y1 = y1.min(ctx.g.world_min_y + ctx.g.world_height - 1);
+        if y0 > y1 {
+            continue;
+        }
         for xx in x0..=x1 {
             let ux = (xx as f64 + 0.5 - cx) / d;
             let ux2 = ux * ux;
@@ -7175,12 +7183,12 @@ fn gen_vein_impl<T>(
                     if bi >= bsz {
                         continue;
                     }
-                    let w = bi >> 6;
                     let mask = 1u64 << (bi & 63);
-                    if (bits[w] & mask) != 0 {
+                    let word = &mut bits[bi >> 6];
+                    if (*word & mask) != 0 {
                         continue;
                     }
-                    bits[w] |= mask;
+                    *word |= mask;
                     let cur = ctx.get(xx, yy, zz);
                     for (rt, st) in targets {
                         let ok = matches_rt(rt, reg, cur, yy, rng)
@@ -7305,14 +7313,12 @@ fn gen_ore_impl<T>(
                     trace,
                     matches_rt,
                 );
-                if let Some(spec) = env_str!("ORE_CELL_TRACE") {
-                    if spec == format!("{},{},{}", pos.0, pos.1, pos.2) {
-                        eprintln!(
-                            "ORECELL origin={pos:?} size={size} wrote={} radius={:?}",
-                            ctx.wr.len() - before,
-                            (d, e, h, j, l, mm)
-                        );
-                    }
+                if trace {
+                    eprintln!(
+                        "ORECELL origin={pos:?} size={size} wrote={} radius={:?}",
+                        ctx.wr.len() - before,
+                        (d, e, h, j, l, mm)
+                    );
                 }
                 return;
             }
@@ -7371,6 +7377,105 @@ pub(crate) fn ore_cells_for_test(
     let mut v: Vec<(i32, i32, i32)> = ctx.wr.keys().copied().collect();
     v.sort();
     v
+}
+
+/// Pins the ore geometry and the full feature-population capture to SHA-256 while
+/// reporting the elapsed time per populated chunk for this exact fixture.
+#[cfg(test)]
+#[test]
+fn perf_ore_parity_and_timing() {
+    use std::time::{Duration, Instant};
+
+    crate::test_support::require_vanilla_data();
+    let _guard = crate::worldgen::lock_gen_for_tests();
+
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut bytes = b"GEN-OUTPUT-1\0".to_vec();
+    let mut population_time = Duration::ZERO;
+    for (x, y, z) in [(-1, 64, -1), (0, 64, 0), (-17, 64, -1), (0, 80, 0)] {
+        let start = Instant::now();
+        let result = g.feat_state(x, y, z, populate);
+        population_time += start.elapsed();
+        for n in [x, y, z] {
+            bytes.extend_from_slice(&n.to_le_bytes());
+        }
+        bytes.push(u8::from(result.is_some()));
+        bytes.extend_from_slice(&result.unwrap_or(0).to_le_bytes());
+        // Every successful FEATURES write belongs to the active chunk's 3x3
+        // neighborhood. Include each bucket exactly once, including edge writes.
+        let mut buckets = std::collections::BTreeSet::new();
+        for &(cx, cz) in &g.pop_done {
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    buckets.insert((cx + dx, cz + dz));
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for (cx, cz) in buckets {
+            if let Some(map) = g.feat_map(cx, cz) {
+                rows.extend(map.iter().map(|(&index, &state)| (cx, cz, index, state)));
+            }
+        }
+        rows.sort_unstable();
+        assert!(!rows.is_empty(), "fixture must exercise feature writes");
+        bytes.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+        for (cx, cz, index, state) in rows {
+            bytes.extend_from_slice(&cx.to_le_bytes());
+            bytes.extend_from_slice(&cz.to_le_bytes());
+            bytes.extend_from_slice(&index.to_le_bytes());
+            bytes.extend_from_slice(&state.to_le_bytes());
+        }
+        let mut done: Vec<_> = g.pop_done.iter().copied().collect();
+        done.sort_unstable();
+        bytes.extend_from_slice(&(done.len() as u64).to_le_bytes());
+        for (cx, cz) in done {
+            bytes.extend_from_slice(&cx.to_le_bytes());
+            bytes.extend_from_slice(&cz.to_le_bytes());
+        }
+    }
+    let feature_hash = crate::generation_math::sha256(&bytes);
+    let feature_digest = feature_hash
+        .iter()
+        .map(|v| format!("{v:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        feature_digest,
+        "d63f366bd84594170be88b2391c4f39bdffc921578cba65b4a2ef114da6c2cfb",
+        "feature population changed from the pre-optimization SHA-256 capture"
+    );
+    let chunks = g.pop_done.len();
+    assert!(chunks > 0, "fixture must populate chunks");
+    eprintln!(
+        "perf_ore feature_population sha256={} chunks={} us/chunk={:.1}",
+        feature_digest,
+        chunks,
+        population_time.as_secs_f64() * 1_000_000.0 / chunks as f64,
+    );
+
+    let ore_cells = ore_cells_for_test(60007, (7, 49, 13), 64);
+    let mut ore_bytes = Vec::with_capacity(ore_cells.len() * 12);
+    for &(x, y, z) in &ore_cells {
+        for n in [x, y, z] {
+            ore_bytes.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+    assert_eq!(ore_cells.len(), 666, "native ore fixture cell count");
+    let ore_hash = crate::generation_math::sha256(&ore_bytes);
+    let ore_digest = ore_hash
+        .iter()
+        .map(|v| format!("{v:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        ore_digest,
+        "683a9109b6089e98b73ba4eafb268cd4b8e79af21f672d7d0dfd04fd2cc50f55",
+        "native ore geometry changed from the pre-optimization SHA-256 capture"
+    );
+    eprintln!(
+        "perf_ore ore_geometry sha256={} cells={}",
+        ore_digest,
+        ore_cells.len(),
+    );
 }
 
 /// StructurePiece.reorient: horizontal order is NORTH, EAST, SOUTH, WEST;
