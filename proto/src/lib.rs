@@ -37,6 +37,11 @@
 //!   by handshake protocol number).
 //! * [`resolver`] — vanilla's `_minecraft._tcp.<host>.` SRV redirect lookup
 //!   and address resolution, pure `std` DNS (RFC 1035/2782).
+//! * [`voice_relay`] — the clean-room `VCR1` UDP proximity voice relay: a
+//!   compact datagram codec ([`voice_relay::VoicePacket`]), a sans-IO router
+//!   ([`voice_relay::VoiceRelayState`]) with distance/dimension culling,
+//!   whisper radius, group channels and mute/deafen/block, and the live
+//!   non-blocking [`voice_relay::UdpVoiceRelay`] over `std::net::UdpSocket`.
 
 pub mod codec;
 mod data_v767;
@@ -46,6 +51,7 @@ pub mod router;
 pub mod session;
 pub mod table;
 pub mod version;
+pub mod voice_relay;
 pub mod wire;
 
 pub use codec::{
@@ -61,5 +67,10 @@ pub use table::{IdRemapper, PacketDir, PacketPhase, ProtocolTable, Registry, Rem
 pub use version::{
     BlockStateJsonFormat, NoTargetVersion, ProtocolVersion, RecipeSyncMode,
     VersionCapabilities,
+};
+pub use voice_relay::{
+    RouteReject, UdpVoiceRelay, VoiceDelivery, VoiceGroupKind, VoicePacket, VoicePlayerState,
+    VoiceRelayConfig, VoiceRelayMetrics, VoiceRelayState, MAX_OPUS_PAYLOAD_BYTES,
+    MAX_VOICE_DATAGRAM_BYTES, VOICE_MAGIC, VOICE_RATE_WINDOW,
 };
 pub use wire::{BitSet, BlockPos, ProtoError, WireReader, WireWriter};
