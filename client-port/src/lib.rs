@@ -3,6 +3,7 @@
 //! CPU section meshing for Minecraft Java 1.21.1 (protocol 767).
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod atlas;
 mod cache;
 mod column;
 mod cull;
@@ -21,6 +22,12 @@ pub mod visibility;
 #[cfg(test)]
 mod tests;
 
+pub use atlas::{
+    apply_biome_tint, build_mipmaps, remap_baked_quad_uvs, remap_baked_quad_uvs_inset,
+    AnimFrame, AnimationError, AtlasBuilder, AtlasError, AtlasMip, PackedAtlas,
+    SpriteAnimation, SpritePlacement, DEFAULT_ATLAS_MAX_DIM, MAX_ANIMATION_FRAMES,
+    MAX_ATLAS_DIM, MAX_SPRITE_PADDING,
+};
 pub use cache::{MeshCache, SectionCoord, DEFAULT_RESORT_THRESHOLD};
 pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
 pub use culler::{through_bit, CullResult, GraphCuller, SectionGraph, THROUGH_ALL};
