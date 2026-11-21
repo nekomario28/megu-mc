@@ -212,6 +212,21 @@ class MeguTranslateTests(unittest.TestCase):
                 with self.assertRaises(translator.TranslationError):
                     translator.validate_endpoint(endpoint, allow_remote=False)
 
+    def test_default_endpoint_is_numeric_loopback_and_remote_requires_opt_in(self):
+        self.assertEqual(translator.DEFAULT_ENDPOINT,
+                         "http://127.0.0.1:11434/v1/chat/completions")
+        self.assertEqual(translator.validate_endpoint(
+            translator.DEFAULT_ENDPOINT, allow_remote=False).hostname, "127.0.0.1")
+        self.fixtures()
+        remote = "https://example.invalid/v1/chat/completions"
+        refused = self.cli("--dry-run", "--endpoint", remote)
+        self.assertEqual(refused.returncode, 2)
+        allowed = self.cli("--dry-run", "--endpoint", remote, "--allow-remote-llm")
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(json.loads(allowed.stdout)["to_translate"], 3)
+        self.assertFalse(self.pack.exists())
+        self.assertFalse(self.cache.exists())
+
     def test_unsafe_zip_members_fail_closed_and_keep_existing_output(self):
         self.pack.write_bytes(b"keep-this-archive")
         for member in ("../escape", "/absolute", "assets\\evil", "assets/../escape"):

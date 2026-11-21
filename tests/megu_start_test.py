@@ -261,6 +261,108 @@ class MeguStartTest(unittest.TestCase):
         self.assertEqual(process.returncode, 1)
         self.assertFalse(self.server.exists())
 
+    def test_unsupported_mc_version_rejected_before_initialization(self):
+        process = self.cli("--accept-eula", "--dry-run", "--mc-version", "26.4")
+        self.assertEqual(process.returncode, 2)
+        self.assertIn("invalid choice", process.stderr)
+        self.assertFalse(self.server.exists())
+
+    def test_python_initializer_fallback_without_binary(self):
+        with mock.patch.object(megu_start, "init_binary", return_value=None):
+            with mock.patch.object(megu_start, "data_ready", return_value=True):
+                with mock.patch.object(megu_start.subprocess, "run") as native_run:
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        status = megu_start.main([
+                            "--dir", str(self.server), "--accept-eula", "--dry-run", "--json",
+                        ])
+        self.assertEqual(status, 0, output.getvalue())
+        self.assertTrue(json.loads(output.getvalue())["ready"])
+        self.assertEqual((self.server / "eula.txt").read_text(), "eula=true\n")
+        self.assertIn("server-port=25565", (self.server / "server.properties").read_text())
+        native_run.assert_not_called()
+
+    def test_native_binary_found_in_server_files_cargo_target(self):
+        binary = self.base / "server-files" / "target" / "debug" / "mc-spine-init"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        with mock.patch.object(megu_start, "ROOT", self.base):
+            with mock.patch.object(megu_start.shutil, "which", return_value=None):
+                with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": ""}):
+                    self.assertEqual(megu_start.init_binary(), str(binary))
+
+    def test_26_3_native_initializer_delegation_preserves_eula_and_flags(self):
+        response = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({
+                "dir": str(self.server), "mc_version": "26.3", "port": 25566,
+                "dry_run": True, "eula_accepted": True, "actions": [],
+            }), stderr="",
+        )
+        with mock.patch.object(megu_start, "init_binary", return_value="/built/mc-spine-init"):
+            with mock.patch.object(megu_start, "data_ready", return_value=True):
+                with mock.patch.object(megu_start.subprocess, "run", return_value=response) as run:
+                    with mock.patch.object(megu_start.subprocess, "Popen") as launch:
+                        with contextlib.redirect_stdout(io.StringIO()) as output:
+                            status = megu_start.main([
+                                "--dir", str(self.server), "--mc-version", "26.3",
+                                "--port", "25566", "--accept-eula", "--dry-run", "--json",
+                            ])
+        self.assertEqual(status, 0, output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["mc_version"], "26.3")
+        self.assertEqual((self.server / "eula.txt").read_text(), "eula=true\n")
+        self.assertEqual(run.call_args.args[0], [
+            "/built/mc-spine-init", "--dir", str(self.server), "--mc-version", "26.3",
+            "--port", "25566", "--json", "--accept-eula", "--dry-run",
+        ])
+        self.assertFalse(run.call_args.kwargs["shell"])
+        launch.assert_not_called()
+
+    def test_native_initializer_keeps_previous_eula_without_accept_flag(self):
+        self.server.mkdir()
+        original = "# agreed beforehand\neula=true\n"
+        (self.server / "eula.txt").write_text(original)
+        response = subprocess.CompletedProcess([], 0, stdout=json.dumps({
+            "dir": str(self.server), "mc_version": "1.21.1", "port": 25565,
+            "dry_run": True, "eula_accepted": True,
+        }), stderr="")
+        with mock.patch.object(megu_start, "init_binary", return_value="/built/mc-spine-init"):
+            with mock.patch.object(megu_start, "data_ready", return_value=True):
+                with mock.patch.object(megu_start.subprocess, "run", return_value=response) as run:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        status = megu_start.main(["--dir", str(self.server), "--dry-run"])
+        self.assertEqual(status, 0)
+        self.assertEqual((self.server / "eula.txt").read_text(), original)
+        self.assertNotIn("--accept-eula", run.call_args.args[0])
+        self.assertNotIn("--force", run.call_args.args[0])
+
+    def test_native_initializer_failure_or_invalid_report_blocks_launch(self):
+        responses = [
+            subprocess.CompletedProcess([], 1, stdout="", stderr="internal secret"),
+            subprocess.CompletedProcess([], 0, stdout="invalid json", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=json.dumps({
+                "dir": str(self.server), "mc_version": "26.3", "port": 25565,
+                "dry_run": False, "eula_accepted": True,
+            }), stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=json.dumps({
+                "dir": str(self.server), "mc_version": "1.21.1", "port": 25565,
+                "dry_run": False, "eula_accepted": False,
+            }), stderr=""),
+        ]
+        for response in responses:
+            with self.subTest(response=response.stdout):
+                with mock.patch.object(megu_start, "init_binary", return_value="/built/mc-spine-init"):
+                    with mock.patch.object(megu_start, "data_ready", return_value=True):
+                        with mock.patch.object(megu_start.subprocess, "run", return_value=response):
+                            with mock.patch.object(megu_start.subprocess, "Popen") as launch:
+                                with contextlib.redirect_stdout(io.StringIO()) as output:
+                                    status = megu_start.main([
+                                        "--dir", str(self.server), "--accept-eula", "--json",
+                                    ])
+                self.assertEqual(status, 1)
+                self.assertFalse(json.loads(output.getvalue())["ready"])
+                self.assertNotIn("internal secret", output.getvalue())
+                launch.assert_not_called()
+
     def test_missing_generated_data_has_exact_generation_command(self):
         output = io.StringIO()
         with mock.patch.object(megu_start, "data_ready", return_value=False):
@@ -290,7 +392,8 @@ class MeguStartTest(unittest.TestCase):
                   "skipped_perf_mods": ["sodium"], "native_mods": [],
                   "client_only_mods": [], "needs_inspection_mods": []}
         result = mock.Mock(returncode=0, stdout=json.dumps(report), stderr="")
-        with mock.patch.object(megu_start.subprocess, "run", return_value=result) as run:
+        with mock.patch.object(megu_start, "init_binary", return_value=None), \
+                mock.patch.object(megu_start.subprocess, "run", return_value=result) as run:
             with mock.patch.object(megu_start.subprocess, "Popen", side_effect=AssertionError(
                     "dry-run started a server")):
                 with contextlib.redirect_stdout(io.StringIO()):

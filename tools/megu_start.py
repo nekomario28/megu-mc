@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -193,6 +194,50 @@ def bootstrap(directory, port, accept):
         props_file.write_text(f"server-port={port or DEFAULT_PORT}\nserver-ip=127.0.0.1\n", encoding="utf-8")
     properties = properties_from(props_file.read_text(encoding="utf-8"))
     return properties, ensure_eula(directory, accept)
+
+
+def init_binary():
+    """Find a built mc-spine-init, including a custom Cargo target directory."""
+    targets = [ROOT / "target", ROOT / "server-files" / "target"]
+    if os.environ.get("CARGO_TARGET_DIR"):
+        target = Path(os.environ["CARGO_TARGET_DIR"])
+        targets.insert(0, target if target.is_absolute() else ROOT / target)
+    for target in targets:
+        for profile in ("debug", "release"):
+            candidate = target / profile / "mc-spine-init"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    return shutil.which("mc-spine-init")
+
+
+def initialize_directory(directory, mc_version, port, accept, dry_run):
+    """Complete native initialization when available, keeping Python's EULA gate."""
+    binary = init_binary()
+    if binary is None:
+        return
+    command = [binary, "--dir", str(directory), "--mc-version", mc_version,
+               "--port", str(port), "--json"]
+    if accept:
+        command.append("--accept-eula")
+    if dry_run:
+        command.append("--dry-run")
+    try:
+        result = subprocess.run(command, shell=False, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=30, check=False)
+        if result.returncode != 0:
+            raise ValueError("mc-spine-init failed")
+        report = json.loads(result.stdout)
+        if (not isinstance(report, dict) or report.get("dir") != str(directory)
+                or report.get("mc_version") != mc_version or report.get("port") != port
+                or report.get("dry_run") is not dry_run
+                or report.get("eula_accepted") is not True):
+            raise ValueError("mc-spine-init returned an invalid initialization report")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+        raise ValueError("mc-spine-init could not complete initialization") from error
+    # Native initialization must never invalidate a previously accepted EULA.
+    if not eula_accepted((directory / "eula.txt").read_text(encoding="utf-8")):
+        raise ValueError("mc-spine-init left the EULA unaccepted")
 
 
 def validate_archive(path):
@@ -433,6 +478,7 @@ def main(argv=None):
         if plan["needs_inspection_mods"]:
             if not args.dry_run:
                 return output(plan, args.json, lang, 2)
+        initialize_directory(directory, args.mc_version, port, args.accept_eula, args.dry_run)
         if args.dry_run:
             return output(plan, args.json, lang, 0)
 
