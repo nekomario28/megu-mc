@@ -39,13 +39,25 @@
 //!   a [`sharded::ServerContext`]'s chunk overlays keyed on
 //!   `mc_spine_core::version::TargetVersion`, failing closed on any
 //!   corruption.
+//! * [`migrate`] — the operator-facing migration engine
+//!   ([`migrate::inspect_snapshot`], [`migrate::migrate_snapshot`],
+//!   [`migrate::migrate_json_document`]): `STV1` snapshot inspection and
+//!   atomic `1.21.1` <-> `26.3` re-sealing, plus a minimal pure-`std` JSON
+//!   front end that runs `level.dat`-style documents through the
+//!   [`datafix::DataFixer`]. The `26.3` -> `1.21.1` direction exists only
+//!   behind an explicit `allow_downgrade` opt-in.
 
 pub mod datafix;
+pub mod migrate;
 pub mod region_tick;
 pub mod sharded;
 pub mod snapshot;
 
 pub use datafix::{DataFixError, DataFixReport, DataFixStep, DataFixer, DataValue, DV_1_21_1, DV_26_3};
+pub use migrate::{
+    inspect_snapshot, migrate_json_document, migrate_snapshot, parse_data_json, to_data_json,
+    write_file_atomic, JsonError, MigrationError, SnapshotMigrationReport, SnapshotSummary,
+};
 pub use region_tick::{
     partition_independent_regions, tick_dimension_regions_parallel, RegionCoord, RegionTickStats,
     RegionWork, REGION_SIDE_CHUNKS, WAVE_COUNT,

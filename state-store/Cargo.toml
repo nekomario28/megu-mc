@@ -12,3 +12,7 @@ description = "Standalone 64-shard DimensionState/ServerContext runtime store an
 # TargetVersion registry), not a crates.io dependency.
 [dependencies]
 mc_spine_core = { package = "mc-spine-core", path = "../core" }
+
+[[bin]]
+name = "mc-spine-world-migrate"
+path = "src/bin/world_migrate.rs"
