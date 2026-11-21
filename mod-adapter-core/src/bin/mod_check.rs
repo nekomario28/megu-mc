@@ -18,6 +18,14 @@
 //! standard mc-spine event hook (Tier 2, bounded JVM shim) or reports it
 //! unliftable with the reason it stays at Tier 3.
 //!
+//! `--scan-mods-dir` points the same engines at an entire `mods/` folder:
+//! JARs whose filenames infer a [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`]
+//! id are skipped without reading a byte, every other JAR gets both the
+//! bytecode mixin scan *and* [`culinary_adapter::CulinaryRegistry`]'s
+//! generic culinary discovery, and each lands in one of five classes —
+//! auto-skipped, native culinary, clean data, Tier 2 lifted, or Tier 3
+//! requiring fallback.
+//!
 //! Exit codes mirror `tools/mod_launcher.py --modpack`: `0` the input is
 //! fully usable on this server, `2` a version mismatch, unliftable mixin
 //! sites, or invalid arguments, `1` an unreadable or unsafe input.
@@ -29,20 +37,26 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mod_adapter_core::class_mixin_scanner::{
-    scan_jar_path_with_options, JarMixinScanReport, JarScanOptions,
+    scan_jar_mixins_with_options, scan_jar_path_with_options, JarMixinScanReport, JarScanOptions,
 };
+use mod_adapter_core::culinary_adapter::{CulinaryDiscoveryStats, CulinaryRegistry};
+use mod_adapter_core::fallback::BUILTIN_SUPERSEDED_PERF_MODS;
 use mod_adapter_core::mixin_lifter::{
     LiftedBinding, MixinLiftVerdict, MixinSite, UnliftableReason,
 };
-use mod_adapter_core::modpack::{analyze_modpack, ModpackManifest, ModpackReadiness};
+use mod_adapter_core::modpack::{
+    analyze_modpack, infer_candidate_mod_id, ModpackManifest, ModpackReadiness,
+};
 use mod_adapter_core::version_compat::McVersion;
 
 const USAGE: &str = "\
 mc-spine-mod-check — check whether a modpack can run on this mc-spine server,
-or scan one mod JAR's mixin bytecode for Tier 2 liftability
+scan one mod JAR's mixin bytecode for Tier 2 liftability, or inspect a whole
+mods/ directory with zero JVM
 
 Usage: mc-spine-mod-check --modpack <path> [options]
        mc-spine-mod-check --scan-jar <mod.jar> [--include-client-mixins] [--json]
+       mc-spine-mod-check --scan-mods-dir <dir> [--include-client-mixins] [--json]
 
 --modpack accepts a Modrinth .mrpack archive, a standalone modrinth.index.json,
 or a CurseForge manifest.json / pack .zip, and reports — before anything is
@@ -56,10 +70,20 @@ each mixin injection site is either lifted onto a standard mc-spine event
 hook (Tier 2, bounded JVM shim) or reported unliftable with the reason it
 stays at Tier 3.
 
+--scan-mods-dir inspects every *.jar inside a mods/ folder, still with no
+JVM: JARs named like a built-in superseded performance mod (Sodium,
+Lithium, Distant Horizons, ...) are skipped without reading a byte, every
+other JAR gets both the bytecode mixin scan and the generic culinary data
+discovery (cooking/cutting recipes, item/block tags, loot modifiers), and
+each one is classified as auto-skipped, native culinary, clean data,
+Tier 2 lifted, or requiring a Tier 3 fallback.
+
 Options:
   --modpack <path>        modpack file to check
   --scan-jar <path>       mod JAR to bytecode-scan for mixin sites
-                          (mutually exclusive with --modpack)
+                          (mutually exclusive with --modpack/--scan-mods-dir)
+  --scan-mods-dir <dir>   directory of mod JARs to inspect together
+                          (mutually exclusive with --modpack/--scan-jar)
   --mc-version <version>  Minecraft version this server runs: 1.21.1 or 26.3
                           (default: 1.21.1; --modpack only)
   --flagship <ids>        comma-separated mod ids handled by a flagship
@@ -78,7 +102,9 @@ different Minecraft version or the arguments were invalid, 1 the pack could
 not be read or is unsafe. For --scan-jar, 0 every mixin site lifted to a
 standard event hook (Tier 2 eligible), 2 at least one site stays at Tier 3
 or the arguments were invalid, 1 the JAR or a .class member could not be
-read or parsed.";
+read or parsed. For --scan-mods-dir, 0 no JAR requires a Tier 3 fallback,
+2 at least one does (or the arguments were invalid), 1 the directory is
+missing/unreadable or a JAR could not be read or parsed.";
 
 struct Cli {
     modpack: PathBuf,
@@ -96,10 +122,19 @@ struct JarCli {
     json: bool,
 }
 
+struct ModsDirCli {
+    dir: PathBuf,
+    /// [`JarScanOptions::server_only`] — `false` once
+    /// `--include-client-mixins` is passed.
+    server_only: bool,
+    json: bool,
+}
+
 enum Action {
     Help,
     RunModpack(Cli),
     ScanJar(JarCli),
+    ScanModsDir(ModsDirCli),
 }
 
 fn csv_ids(value: &OsString) -> Result<BTreeSet<String>, String> {
@@ -121,6 +156,7 @@ fn csv_ids(value: &OsString) -> Result<BTreeSet<String>, String> {
 fn parse_args(argv: &[OsString]) -> Result<Action, String> {
     let mut modpack: Option<PathBuf> = None;
     let mut scan_jar: Option<PathBuf> = None;
+    let mut mods_dir: Option<PathBuf> = None;
     let mut mc_version: Option<String> = None;
     let mut flagship: Option<BTreeSet<String>> = None;
     let mut profiles: Option<BTreeSet<String>> = None;
@@ -177,6 +213,10 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                 let v = take_value(argv, &mut i, "--scan-jar", inline_os.as_ref())?;
                 scan_jar = Some(PathBuf::from(v));
             }
+            "--scan-mods-dir" => {
+                let v = take_value(argv, &mut i, "--scan-mods-dir", inline_os.as_ref())?;
+                mods_dir = Some(PathBuf::from(v));
+            }
             "--mc-version" => {
                 let v = take_value(argv, &mut i, "--mc-version", inline_os.as_ref())?;
                 mc_version = Some(
@@ -204,28 +244,53 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
     if help {
         return Ok(Action::Help);
     }
-    match (modpack, scan_jar) {
-        (Some(_), Some(_)) => Err("--modpack and --scan-jar are mutually exclusive".to_string()),
-        (None, None) => Err("one of --modpack or --scan-jar is required".to_string()),
-        (None, Some(jar)) => {
-            for (flag, present) in [
-                ("--mc-version", mc_version.is_some()),
-                ("--flagship", flagship.is_some()),
-                ("--profiles", profiles.is_some()),
-            ] {
-                if present {
-                    return Err(format!("{flag} only applies to --modpack"));
-                }
+    let modes = modpack.is_some() as usize
+        + scan_jar.is_some() as usize
+        + mods_dir.is_some() as usize;
+    match modes {
+        0 => return Err("one of --modpack, --scan-jar or --scan-mods-dir is required".to_string()),
+        1 => {}
+        _ => {
+            return Err(
+                "--modpack, --scan-jar and --scan-mods-dir are mutually exclusive".to_string(),
+            )
+        }
+    }
+    let reject_modpack_only = |mode: &str| -> Result<(), String> {
+        for (flag, present) in [
+            ("--mc-version", mc_version.is_some()),
+            ("--flagship", flagship.is_some()),
+            ("--profiles", profiles.is_some()),
+        ] {
+            if present {
+                return Err(format!("{flag} only applies to --modpack, not {mode}"));
             }
+        }
+        Ok(())
+    };
+    match (modpack, scan_jar, mods_dir) {
+        (None, None, Some(dir)) => {
+            reject_modpack_only("--scan-mods-dir")?;
+            Ok(Action::ScanModsDir(ModsDirCli {
+                dir,
+                server_only: !include_client_mixins,
+                json,
+            }))
+        }
+        (None, Some(jar), None) => {
+            reject_modpack_only("--scan-jar")?;
             Ok(Action::ScanJar(JarCli {
                 jar,
                 server_only: !include_client_mixins,
                 json,
             }))
         }
-        (Some(modpack), None) => {
+        (Some(modpack), None, None) => {
             if include_client_mixins {
-                return Err("--include-client-mixins only applies to --scan-jar".to_string());
+                return Err(
+                    "--include-client-mixins only applies to --scan-jar or --scan-mods-dir"
+                        .to_string(),
+                );
             }
             let declared = mc_version.unwrap_or_else(|| "1.21.1".to_string());
             let target = McVersion::parse(declared.trim())
@@ -241,6 +306,8 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                 json,
             }))
         }
+        // More than one mode flag was rejected above.
+        _ => unreachable!("mutually exclusive modes rejected before dispatch"),
     }
 }
 
@@ -379,17 +446,42 @@ fn json_field_opt_str(out: &mut String, level: usize, key: &str, value: Option<&
     let _ = writeln!(out, "{}", if comma { "," } else { "" });
 }
 
+/// Append `"key": <u64>` (indent `level` x 2 spaces) plus a trailing
+/// comma when `comma`.
+fn json_field_u64(out: &mut String, level: usize, key: &str, value: u64, comma: bool) {
+    use std::fmt::Write;
+    let _ = writeln!(
+        out,
+        "{:width$}\"{key}\": {value}{}",
+        "",
+        if comma { "," } else { "" },
+        width = level * 2
+    );
+}
+
+/// Same line shape for a `bool` field.
+fn json_field_bool(out: &mut String, level: usize, key: &str, value: bool, comma: bool) {
+    use std::fmt::Write;
+    let _ = writeln!(
+        out,
+        "{:width$}\"{key}\": {value}{}",
+        "",
+        if comma { "," } else { "" },
+        width = level * 2
+    );
+}
+
 /// The `mixin_class`/`target_*`/`annotation`/`at` fields shared by
 /// `lifted_hooks` and `unliftable` entries (all comma-terminated; the
 /// caller appends the entry's final field).
-fn json_site_fields(out: &mut String, site: &MixinSite) {
-    json_field_str(out, 3, "mixin_class", &site.mixin_class, true);
-    json_field_str(out, 3, "target_class", &site.target_class, true);
-    json_field_str(out, 3, "target_method", &site.target_method, true);
-    json_field_str(out, 3, "annotation", site.annotation.as_str(), true);
+fn json_site_fields(out: &mut String, level: usize, site: &MixinSite) {
+    json_field_str(out, level, "mixin_class", &site.mixin_class, true);
+    json_field_str(out, level, "target_class", &site.target_class, true);
+    json_field_str(out, level, "target_method", &site.target_method, true);
+    json_field_str(out, level, "annotation", site.annotation.as_str(), true);
     json_field_opt_str(
         out,
-        3,
+        level,
         "at",
         site.at.as_ref().map(|p| p.to_string()).as_deref(),
         true,
@@ -436,7 +528,7 @@ fn scan_report_json(path: &Path, report: &JarMixinScanReport) -> String {
             let last = i + 1 == lifted.len();
             let _ = writeln!(out, "    {{");
             json_field_str(&mut out, 3, "hook", binding.hook.as_str(), true);
-            json_site_fields(&mut out, &binding.site);
+            json_site_fields(&mut out, 3, &binding.site);
             let _ = writeln!(out, "      \"cancellable\": {}", binding.cancellable);
             let _ = writeln!(out, "    }}{}", if last { "" } else { "," });
         }
@@ -451,9 +543,467 @@ fn scan_report_json(path: &Path, report: &JarMixinScanReport) -> String {
         for (i, (site, reason)) in unliftable.iter().enumerate() {
             let last = i + 1 == unliftable.len();
             let _ = writeln!(out, "    {{");
-            json_site_fields(&mut out, site);
+            json_site_fields(&mut out, 3, site);
             json_field_str(&mut out, 3, "reason", reason.as_str(), false);
             let _ = writeln!(out, "    }}{}", if last { "" } else { "," });
+        }
+        let _ = writeln!(out, "  ]");
+    }
+    out.push_str("}\n");
+    out
+}
+
+// ---------------------------------------------------------------------------
+// --scan-mods-dir report
+// ---------------------------------------------------------------------------
+
+/// Per-JAR outcome of a `--scan-mods-dir` pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModsDirClass {
+    /// Filename infers a [`BUILTIN_SUPERSEDED_PERF_MODS`] id — skipped
+    /// without reading a byte.
+    SupersededPerfMod,
+    /// Zero mixin sites and >=1 discovered cooking/cutting recipe or loot
+    /// modifier — a Farmer's Delight-family mod or addon (Tier 1 native).
+    NativeCulinary,
+    /// Zero mixin sites and no culinary data — plain data/clean JAR.
+    NativeDataOrClean,
+    /// Mixin sites present, every one lifted onto a standard event hook.
+    LiftedTier2,
+    /// At least one mixin site could not be lifted — stays at Tier 3.
+    RequiresFallback,
+}
+
+impl ModsDirClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SupersededPerfMod => "superseded_perf_mod",
+            Self::NativeCulinary => "native_culinary",
+            Self::NativeDataOrClean => "native_data_or_clean",
+            Self::LiftedTier2 => "lifted_tier2",
+            Self::RequiresFallback => "requires_fallback",
+        }
+    }
+}
+
+/// One `*.jar` entry in a directory scan report.
+struct ModsDirJar {
+    /// File name (the `jars` array and human lines key off this).
+    name: String,
+    /// [`infer_candidate_mod_id`] result over the file name.
+    mod_id: Option<String>,
+    class: ModsDirClass,
+    /// Bytecode scan — `None` only for [`ModsDirClass::SupersededPerfMod`].
+    scan: Option<JarMixinScanReport>,
+    /// Per-JAR culinary discovery stats (merged totals live on the report).
+    culinary: Option<CulinaryDiscoveryStats>,
+}
+
+/// Merged culinary counters across every scanned JAR.
+#[derive(Default)]
+struct ModsDirCulinaryTotals {
+    jar_members: u64,
+    data_files: u64,
+    cooking_recipes: u64,
+    cutting_recipes: u64,
+    skipped_recipes: u64,
+    tag_files: u64,
+    tag_values: u64,
+    loot_modifiers: u64,
+    food_specs: u64,
+}
+
+impl ModsDirCulinaryTotals {
+    fn add(&mut self, s: &CulinaryDiscoveryStats) {
+        self.jar_members += s.jar_members as u64;
+        self.data_files += s.data_files as u64;
+        self.cooking_recipes += s.cooking_recipes as u64;
+        self.cutting_recipes += s.cutting_recipes as u64;
+        self.skipped_recipes += s.skipped_recipes as u64;
+        self.tag_files += s.tag_files as u64;
+        self.tag_values += s.tag_values as u64;
+        self.loot_modifiers += s.loot_modifiers as u64;
+        self.food_specs += s.food_specs as u64;
+    }
+}
+
+/// The case/separator-insensitive comparison `modpack` applies to
+/// [`BUILTIN_SUPERSEDED_PERF_MODS`]: `-`/`_` removed, lowercased, so an
+/// inferred `embeddium-extra` still matches the catalog's `embeddium_extra`.
+fn normalized_mod_key(id: &str) -> String {
+    id.chars()
+        .filter(|c| !matches!(c, '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Run the directory scan, returning per-JAR reports in deterministic
+/// filename order, the ignored non-JAR entry count, and the merged
+/// culinary totals. Any unreadable directory entry, unreadable JAR, or
+/// fail-closed scanner error aborts the pass (exit 1 upstream) — a
+/// silently skipped or half-scanned JAR would look identical to a clean
+/// one, which is exactly what this tool exists to distinguish.
+fn scan_mods_dir(
+    cli: &ModsDirCli,
+) -> Result<(Vec<ModsDirJar>, usize, ModsDirCulinaryTotals), String> {
+    if !cli.dir.is_dir() {
+        return Err(format!(
+            "'{}': not an existing directory",
+            cli.dir.display()
+        ));
+    }
+    let entries = std::fs::read_dir(&cli.dir).map_err(|e| {
+        format!("'{}': cannot read mods directory: {e}", cli.dir.display())
+    })?;
+    let mut names = Vec::new();
+    let mut non_jar = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            format!(
+                "'{}': cannot list directory entry: {e}",
+                cli.dir.display()
+            )
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.to_ascii_lowercase().ends_with(".jar") {
+            names.push(name);
+        } else {
+            non_jar += 1;
+        }
+    }
+    // Deterministic order: case-insensitive filename, byte order as the
+    // tiebreak — the report never depends on readdir order.
+    names.sort_by(|a, b| {
+        a.to_lowercase()
+            .cmp(&b.to_lowercase())
+            .then_with(|| a.cmp(b))
+    });
+
+    let superseded: BTreeSet<String> = BUILTIN_SUPERSEDED_PERF_MODS
+        .iter()
+        .map(|id| normalized_mod_key(id))
+        .collect();
+    let opts = JarScanOptions {
+        server_only: cli.server_only,
+    };
+    let mut registry = CulinaryRegistry::new();
+    let mut culinary_totals = ModsDirCulinaryTotals::default();
+    let mut jars = Vec::with_capacity(names.len());
+
+    for name in names {
+        let mod_id = infer_candidate_mod_id(&name);
+        if mod_id
+            .as_deref()
+            .map(|id| superseded.contains(&normalized_mod_key(id)))
+            .unwrap_or(false)
+        {
+            jars.push(ModsDirJar {
+                name,
+                mod_id,
+                class: ModsDirClass::SupersededPerfMod,
+                scan: None,
+                culinary: None,
+            });
+            continue;
+        }
+        let path = cli.dir.join(&name);
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("'{name}': cannot read JAR: {e}"))?;
+        let scan = scan_jar_mixins_with_options(&bytes, opts)
+            .map_err(|e| format!("'{name}': mixin scan failed: {e}"))?;
+        let culinary = registry
+            .load_from_jar_bytes(&bytes)
+            .map_err(|e| format!("'{name}': culinary discovery failed: {e}"))?;
+        let class = if !unliftable_sites(&scan.verdict).is_empty() {
+            ModsDirClass::RequiresFallback
+        } else if !scan.sites.is_empty() {
+            ModsDirClass::LiftedTier2
+        } else if culinary.cooking_recipes + culinary.cutting_recipes + culinary.loot_modifiers > 0
+        {
+            ModsDirClass::NativeCulinary
+        } else {
+            ModsDirClass::NativeDataOrClean
+        };
+        culinary_totals.add(&culinary);
+        jars.push(ModsDirJar {
+            name,
+            mod_id,
+            class,
+            scan: Some(scan),
+            culinary: Some(culinary),
+        });
+    }
+    Ok((jars, non_jar, culinary_totals))
+}
+
+fn mods_dir_count(jars: &[ModsDirJar], class: ModsDirClass) -> usize {
+    jars.iter().filter(|j| j.class == class).count()
+}
+
+/// Crisp operator summary: one line per JAR (culinary counts, lifted-site
+/// count, or the exact unliftable sites for Tier 3 JARs), the merged
+/// culinary totals, then a plain-language verdict line.
+fn format_mods_dir_human(
+    dir: &Path,
+    jars: &[ModsDirJar],
+    non_jar: usize,
+    culinary: &ModsDirCulinaryTotals,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Mods directory scan of \"{}\"",
+        dir.display()
+    );
+    let _ = writeln!(
+        out,
+        "Found {} JAR(s){}; {} built-in performance mod(s) skipped automatically.",
+        jars.len(),
+        if non_jar > 0 {
+            format!(" ({non_jar} non-JAR entr{} ignored)", if non_jar == 1 { "y" } else { "ies" })
+        } else {
+            String::new()
+        },
+        mods_dir_count(jars, ModsDirClass::SupersededPerfMod),
+    );
+    for jar in jars {
+        let id = jar.mod_id.as_deref().unwrap_or("<unknown id>");
+        match jar.class {
+            ModsDirClass::SupersededPerfMod => {
+                let _ = writeln!(
+                    out,
+                    "  {} [{id}]: skipped — already covered by mc-spine built-in optimizations.",
+                    jar.name
+                );
+            }
+            ModsDirClass::NativeCulinary => {
+                let c = jar.culinary.as_ref().expect("scanned jar has stats");
+                let _ = writeln!(
+                    out,
+                    "  {} [{id}]: native culinary — discovered {} cooking, {} cutting, {} loot modifier(s); runs natively (Tier 1).",
+                    jar.name, c.cooking_recipes, c.cutting_recipes, c.loot_modifiers
+                );
+            }
+            ModsDirClass::NativeDataOrClean => {
+                let _ = writeln!(
+                    out,
+                    "  {} [{id}]: clean — no mixin sites, nothing to lift; runs natively.",
+                    jar.name
+                );
+            }
+            ModsDirClass::LiftedTier2 => {
+                let scan = jar.scan.as_ref().expect("scanned jar has report");
+                let _ = writeln!(
+                    out,
+                    "  {} [{id}]: Tier 2 — all {} mixin site(s) lifted onto standard event hooks (bounded JVM shim).",
+                    jar.name,
+                    lifted_bindings(&scan.verdict).len()
+                );
+            }
+            ModsDirClass::RequiresFallback => {
+                let scan = jar.scan.as_ref().expect("scanned jar has report");
+                let unliftable = unliftable_sites(&scan.verdict);
+                let _ = writeln!(
+                    out,
+                    "  {} [{id}]: requires fallback — {} mixin site(s) stay at Tier 3:",
+                    jar.name,
+                    unliftable.len()
+                );
+                for (site, reason) in unliftable {
+                    let _ = writeln!(out, "      {} ({})", describe_site(site), reason);
+                }
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "Culinary discoveries: {} cooking, {} cutting, {} loot modifier(s), {} tag file(s), {} food spec(s).",
+        culinary.cooking_recipes,
+        culinary.cutting_recipes,
+        culinary.loot_modifiers,
+        culinary.tag_files,
+        culinary.food_specs,
+    );
+    let fallback = mods_dir_count(jars, ModsDirClass::RequiresFallback);
+    if fallback == 0 {
+        let _ = write!(
+            out,
+            "Result: clean — every JAR runs natively or on a bounded Tier 2 shim; no fallback needed."
+        );
+    } else {
+        let _ = write!(
+            out,
+            "Result: requires fallback — {fallback} JAR(s) have unliftable mixin sites and stay at Tier 3 (quarantine or NeoForge fallback)."
+        );
+    }
+    out
+}
+
+/// Per-JAR `jars[]` entry of the `mc-spine-mods-dir-scan/1` schema: file
+/// name, inferred mod id, class, then — for scanned JARs — the same
+/// `lifted_hooks`/`unliftable` site detail `--scan-jar` emits plus the
+/// per-JAR culinary counters.
+fn mods_dir_jar_json(out: &mut String, jar: &ModsDirJar, last: bool) {
+    use std::fmt::Write;
+    let _ = writeln!(out, "    {{");
+    json_field_str(out, 3, "jar", &jar.name, true);
+    json_field_opt_str(out, 3, "mod_id", jar.mod_id.as_deref(), true);
+    json_field_str(out, 3, "class", jar.class.as_str(), true);
+    match &jar.scan {
+        None => json_field_bool(out, 3, "scanned", false, false),
+        Some(scan) => {
+            json_field_bool(out, 3, "scanned", true, true);
+            json_field_u64(
+                out,
+                3,
+                "mixin_configs_found",
+                scan.mixin_configs_found as u64,
+                true,
+            );
+            json_field_u64(out, 3, "classes_scanned", scan.classes_scanned as u64, true);
+            json_field_u64(
+                out,
+                3,
+                "skipped_client_mixins",
+                scan.skipped_client_mixins as u64,
+                true,
+            );
+            json_field_u64(out, 3, "sites_found", scan.sites.len() as u64, true);
+
+            let lifted = lifted_bindings(&scan.verdict);
+            if lifted.is_empty() {
+                let _ = writeln!(out, "      \"lifted_hooks\": [],");
+            } else {
+                let _ = writeln!(out, "      \"lifted_hooks\": [");
+                for (i, binding) in lifted.iter().enumerate() {
+                    let last = i + 1 == lifted.len();
+                    let _ = writeln!(out, "        {{");
+                    json_field_str(out, 5, "hook", binding.hook.as_str(), true);
+                    json_site_fields(out, 5, &binding.site);
+                    let _ = writeln!(out, "          \"cancellable\": {}", binding.cancellable);
+                    let _ = writeln!(out, "        }}{}", if last { "" } else { "," });
+                }
+                let _ = writeln!(out, "      ],");
+            }
+
+            let unliftable = unliftable_sites(&scan.verdict);
+            if unliftable.is_empty() {
+                let _ = writeln!(out, "      \"unliftable\": [],");
+            } else {
+                let _ = writeln!(out, "      \"unliftable\": [");
+                for (i, (site, reason)) in unliftable.iter().enumerate() {
+                    let last = i + 1 == unliftable.len();
+                    let _ = writeln!(out, "        {{");
+                    json_site_fields(out, 5, site);
+                    json_field_str(out, 5, "reason", reason.as_str(), false);
+                    let _ = writeln!(out, "        }}{}", if last { "" } else { "," });
+                }
+                let _ = writeln!(out, "      ],");
+            }
+
+            let c = jar.culinary.as_ref().expect("scanned jar has stats");
+            let _ = writeln!(out, "      \"culinary\": {{");
+            json_field_u64(out, 4, "jar_members", c.jar_members as u64, true);
+            json_field_u64(out, 4, "data_files", c.data_files as u64, true);
+            json_field_u64(out, 4, "cooking_recipes", c.cooking_recipes as u64, true);
+            json_field_u64(out, 4, "cutting_recipes", c.cutting_recipes as u64, true);
+            json_field_u64(out, 4, "skipped_recipes", c.skipped_recipes as u64, true);
+            json_field_u64(out, 4, "tag_files", c.tag_files as u64, true);
+            json_field_u64(out, 4, "tag_values", c.tag_values as u64, true);
+            json_field_u64(out, 4, "loot_modifiers", c.loot_modifiers as u64, true);
+            json_field_u64(out, 4, "food_specs", c.food_specs as u64, false);
+            let _ = writeln!(out, "      }}");
+        }
+    }
+    let _ = writeln!(out, "    }}{}", if last { "" } else { "," });
+}
+
+/// Deterministic `mc-spine-mods-dir-scan/1` JSON form of a directory
+/// scan: totals by class, merged culinary counters, then one entry per
+/// JAR in the same filename order as the human report.
+fn mods_dir_json(
+    dir: &Path,
+    jars: &[ModsDirJar],
+    non_jar: usize,
+    culinary: &ModsDirCulinaryTotals,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(1024 + jars.len() * 384);
+    out.push_str("{\n");
+    json_field_str(&mut out, 1, "schema", "mc-spine-mods-dir-scan/1", true);
+    json_field_str(&mut out, 1, "dir", &dir.display().to_string(), true);
+    json_field_u64(&mut out, 1, "jars_found", jars.len() as u64, true);
+    json_field_u64(&mut out, 1, "non_jar_entries", non_jar as u64, true);
+
+    let _ = writeln!(out, "  \"totals\": {{");
+    json_field_u64(
+        &mut out,
+        2,
+        "superseded_perf_mod",
+        mods_dir_count(jars, ModsDirClass::SupersededPerfMod) as u64,
+        true,
+    );
+    json_field_u64(
+        &mut out,
+        2,
+        "native_culinary",
+        mods_dir_count(jars, ModsDirClass::NativeCulinary) as u64,
+        true,
+    );
+    json_field_u64(
+        &mut out,
+        2,
+        "native_data_or_clean",
+        mods_dir_count(jars, ModsDirClass::NativeDataOrClean) as u64,
+        true,
+    );
+    json_field_u64(
+        &mut out,
+        2,
+        "lifted_tier2",
+        mods_dir_count(jars, ModsDirClass::LiftedTier2) as u64,
+        true,
+    );
+    json_field_u64(
+        &mut out,
+        2,
+        "requires_fallback",
+        mods_dir_count(jars, ModsDirClass::RequiresFallback) as u64,
+        false,
+    );
+    let _ = writeln!(out, "  }},");
+
+    let _ = writeln!(out, "  \"culinary\": {{");
+    json_field_u64(&mut out, 2, "jar_members", culinary.jar_members, true);
+    json_field_u64(&mut out, 2, "data_files", culinary.data_files, true);
+    json_field_u64(&mut out, 2, "cooking_recipes", culinary.cooking_recipes, true);
+    json_field_u64(&mut out, 2, "cutting_recipes", culinary.cutting_recipes, true);
+    json_field_u64(&mut out, 2, "skipped_recipes", culinary.skipped_recipes, true);
+    json_field_u64(&mut out, 2, "tag_files", culinary.tag_files, true);
+    json_field_u64(&mut out, 2, "tag_values", culinary.tag_values, true);
+    json_field_u64(&mut out, 2, "loot_modifiers", culinary.loot_modifiers, true);
+    json_field_u64(&mut out, 2, "food_specs", culinary.food_specs, false);
+    let _ = writeln!(out, "  }},");
+
+    json_field_str(
+        &mut out,
+        1,
+        "verdict",
+        if mods_dir_count(jars, ModsDirClass::RequiresFallback) == 0 {
+            "clean"
+        } else {
+            "requires_fallback"
+        },
+        true,
+    );
+
+    if jars.is_empty() {
+        let _ = writeln!(out, "  \"jars\": []");
+    } else {
+        let _ = writeln!(out, "  \"jars\": [");
+        for (i, jar) in jars.iter().enumerate() {
+            mods_dir_jar_json(&mut out, jar, i + 1 == jars.len());
         }
         let _ = writeln!(out, "  ]");
     }
@@ -506,6 +1056,29 @@ fn run_scan_jar(cli: &JarCli) -> ExitCode {
     }
 }
 
+fn run_scan_mods_dir(cli: &ModsDirCli) -> ExitCode {
+    let (jars, non_jar, culinary) = match scan_mods_dir(cli) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("mc-spine-mod-check: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if cli.json {
+        print!("{}", mods_dir_json(&cli.dir, &jars, non_jar, &culinary));
+    } else {
+        println!(
+            "{}",
+            format_mods_dir_human(&cli.dir, &jars, non_jar, &culinary)
+        );
+    }
+    if mods_dir_count(&jars, ModsDirClass::RequiresFallback) == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    }
+}
+
 fn main() -> ExitCode {
     let argv: Vec<OsString> = env::args_os().skip(1).collect();
     match parse_args(&argv) {
@@ -515,6 +1088,7 @@ fn main() -> ExitCode {
         }
         Ok(Action::RunModpack(cli)) => run_modpack(cli),
         Ok(Action::ScanJar(cli)) => run_scan_jar(&cli),
+        Ok(Action::ScanModsDir(cli)) => run_scan_mods_dir(&cli),
         Err(msg) => {
             eprintln!("mc-spine-mod-check: {msg}");
             eprintln!("Try 'mc-spine-mod-check --help' for usage.");

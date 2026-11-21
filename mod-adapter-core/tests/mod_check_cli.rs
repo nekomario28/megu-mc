@@ -1198,3 +1198,434 @@ fn invalid_cli_args_exit_2() {
         );
     }
 }
+
+// -- --scan-mods-dir ------------------------------------------------------
+
+/// Farmer's Delight-shaped JAR: one `*:cooking` + one `*:cutting` recipe,
+/// one `*:add_item` loot modifier, one shared `c:tools/knife` item tag,
+/// one unrelated vanilla recipe (counted as skipped), and MANIFEST noise.
+/// No `.class` members and no mixin config — pure data.
+fn farmers_delight_jar() -> Vec<u8> {
+    build_zip(&[
+        stored_entry("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+        stored_entry(
+            "data/farmersdelight/recipe/cooking/beef_stew.json",
+            br#"{"type":"farmersdelight:cooking","ingredients":[{"item":"minecraft:beef"},{"item":"minecraft:carrot"}],"result":{"id":"farmersdelight:beef_stew","count":1},"container":"minecraft:bowl","cookingtime":200}"#,
+        ),
+        stored_entry(
+            "data/farmersdelight/recipe/cutting/straw_from_wheat.json",
+            br#"{"type":"farmersdelight:cutting","ingredients":[{"item":"minecraft:wheat"}],"tool":{"tag":"c:tools/knife"},"result":[{"item":{"id":"farmersdelight:straw"},"chance":1.0}]}"#,
+        ),
+        stored_entry(
+            "data/farmersdelight/loot_modifiers/straw_from_grass.json",
+            br##"{"type":"farmersdelight:add_item","conditions":[{"condition":"neoforge:loot_table_id","loot_table_id":"minecraft:blocks/short_grass"}],"item":"farmersdelight:straw","chance":1.0}"##,
+        ),
+        stored_entry(
+            "data/c/tags/item/tools/knife.json",
+            br#"{"replace":false,"values":["farmersdelight:flint_knife","farmersdelight:iron_knife"]}"#,
+        ),
+        stored_entry(
+            "data/minecraft/recipe/cake.json",
+            br#"{"type":"minecraft:crafting_shaped","result":{"id":"minecraft:cake","count":1}}"#,
+        ),
+    ])
+}
+
+/// A `custom_delight` addon JAR no code names: a `*:fermenting` recipe
+/// plus a `*:cutting` recipe, both under the legacy `recipes/` dir —
+/// proving the discovery is 100 % generic across addon namespaces.
+fn custom_delight_addon_jar() -> Vec<u8> {
+    build_zip(&[
+        stored_entry(
+            "data/custom_delight/recipes/fermenting/cider.json",
+            br#"{"type":"custom_delight:fermenting","ingredients":[{"item":"minecraft:apple"},{"item":"minecraft:sugar"}],"result":{"id":"custom_delight:cider"},"container":"minecraft:glass_bottle","cookingtime":400}"#,
+        ),
+        stored_entry(
+            "data/custom_delight/recipes/cutting/loaf_slices.json",
+            br#"{"type":"custom_delight:cutting","ingredients":[{"item":"custom_delight:loaf"}],"tool":{"item":"minecraft:iron_axe"},"result":[{"item":{"id":"custom_delight:slice","count":4}}]}"#,
+        ),
+    ])
+}
+
+/// The baseline mods/ folder: a superseded perf mod written as literal
+/// garbage bytes (proving the auto-skip never reads a byte), the two
+/// culinary JARs, a fully liftable mixin JAR, an empty archive exercising
+/// the case-insensitive `.JAR` match, and a non-JAR file that must be
+/// ignored.
+fn write_mixed_mods_dir(dir: &Path) {
+    write_fixture(dir, "sodium-0.6.jar", b"not even a zip archive");
+    write_fixture(dir, "farmersdelight-1.21.1.jar", &farmers_delight_jar());
+    write_fixture(dir, "custom_delight_addon.jar", &custom_delight_addon_jar());
+    write_fixture(dir, "safe-inject-mod.jar", &safe_jar());
+    write_fixture(dir, "dataonly.JAR", &build_zip(&[]));
+    write_fixture(dir, "readme.txt", b"place mod jars here\n");
+}
+
+/// Look up one `jars[]` entry of a parsed dir-scan report by file name.
+fn jar_entry<'a>(
+    jars: &'a [JsonValue],
+    name: &str,
+) -> &'a std::collections::BTreeMap<String, JsonValue> {
+    jars.iter()
+        .find(|j| str_field(obj(j), "jar") == name)
+        .map(obj)
+        .unwrap_or_else(|| panic!("jars[] must contain '{name}'"))
+}
+
+#[test]
+fn scan_mods_dir_mixed_folder_exits_0() {
+    let dir = fixture_dir("modsdir-mixed");
+    write_mixed_mods_dir(&dir);
+    let d = dir.to_str().unwrap();
+
+    let (code, stdout, stderr) = run(&["--scan-mods-dir", d]);
+    assert_eq!(code, 0, "clean dir scan must exit 0, stderr: {stderr}");
+    assert!(stderr.is_empty(), "clean run must not log: {stderr}");
+    assert!(stdout.contains("Mods directory scan"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Found 5 JAR(s)"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("1 non-JAR entry ignored"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("sodium-0.6.jar [sodium]: skipped"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("native culinary"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Tier 2"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Result: clean"), "stdout:\n{stdout}");
+
+    let (code, stdout, stderr) = run(&["--scan-mods-dir", d, "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let root = parse_json(stdout.as_bytes()).expect("stdout must be valid JSON");
+    let r = obj(&root);
+    assert_eq!(str_field(r, "schema"), "mc-spine-mods-dir-scan/1");
+    assert_eq!(str_field(r, "verdict"), "clean");
+    assert_eq!(r.get("jars_found").and_then(JsonValue::as_u64), Some(5));
+    assert_eq!(
+        r.get("non_jar_entries").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+
+    let totals = obj(r.get("totals").unwrap());
+    assert_eq!(
+        totals
+            .get("superseded_perf_mod")
+            .and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        totals.get("native_culinary").and_then(JsonValue::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        totals
+            .get("native_data_or_clean")
+            .and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        totals.get("lifted_tier2").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        totals
+            .get("requires_fallback")
+            .and_then(JsonValue::as_u64),
+        Some(0)
+    );
+
+    let culinary = obj(r.get("culinary").unwrap());
+    assert_eq!(
+        culinary.get("cooking_recipes").and_then(JsonValue::as_u64),
+        Some(2),
+        "beef_stew + cider"
+    );
+    assert_eq!(
+        culinary.get("cutting_recipes").and_then(JsonValue::as_u64),
+        Some(2),
+        "straw + loaf_slices"
+    );
+    assert_eq!(
+        culinary.get("loot_modifiers").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        culinary.get("tag_files").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        culinary.get("tag_values").and_then(JsonValue::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        culinary.get("skipped_recipes").and_then(JsonValue::as_u64),
+        Some(1),
+        "the vanilla cake recipe is skipped"
+    );
+    assert_eq!(
+        culinary.get("data_files").and_then(JsonValue::as_u64),
+        Some(7)
+    );
+
+    let jars = r
+        .get("jars")
+        .and_then(JsonValue::as_array)
+        .expect("jars array");
+    assert_eq!(jars.len(), 5);
+    let names: Vec<String> = jars
+        .iter()
+        .map(|j| str_field(obj(j), "jar").to_string())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "custom_delight_addon.jar",
+            "dataonly.JAR",
+            "farmersdelight-1.21.1.jar",
+            "safe-inject-mod.jar",
+            "sodium-0.6.jar"
+        ],
+        "deterministic filename order"
+    );
+
+    let sodium = jar_entry(jars, "sodium-0.6.jar");
+    assert_eq!(str_field(sodium, "mod_id"), "sodium");
+    assert_eq!(str_field(sodium, "class"), "superseded_perf_mod");
+    assert_eq!(
+        sodium.get("scanned").and_then(JsonValue::as_bool),
+        Some(false),
+        "superseded perf mods are never read"
+    );
+
+    let fd = jar_entry(jars, "farmersdelight-1.21.1.jar");
+    assert_eq!(str_field(fd, "mod_id"), "farmersdelight");
+    assert_eq!(str_field(fd, "class"), "native_culinary");
+    let fdc = obj(fd.get("culinary").unwrap());
+    assert_eq!(
+        fdc.get("cooking_recipes").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        fdc.get("cutting_recipes").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        fdc.get("loot_modifiers").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+
+    let addon = jar_entry(jars, "custom_delight_addon.jar");
+    assert_eq!(str_field(addon, "class"), "native_culinary");
+    let ac = obj(addon.get("culinary").unwrap());
+    assert_eq!(
+        ac.get("cooking_recipes").and_then(JsonValue::as_u64),
+        Some(1),
+        "the generic *:fermenting recipe counts as cooking"
+    );
+
+    let safe = jar_entry(jars, "safe-inject-mod.jar");
+    assert_eq!(str_field(safe, "class"), "lifted_tier2");
+    let lifted = safe
+        .get("lifted_hooks")
+        .and_then(JsonValue::as_array)
+        .expect("lifted_hooks array");
+    assert_eq!(lifted.len(), 1);
+    assert_eq!(str_field(obj(&lifted[0]), "hook"), "EntityDamagePre");
+
+    let data = jar_entry(jars, "dataonly.JAR");
+    assert_eq!(str_field(data, "class"), "native_data_or_clean");
+    assert_eq!(str_field(data, "mod_id"), "dataonly");
+}
+
+#[test]
+fn scan_mods_dir_unliftable_jar_exits_2() {
+    let dir = fixture_dir("modsdir-bad");
+    write_mixed_mods_dir(&dir);
+    write_fixture(&dir, "heavy-redirect.jar", &unliftable_jar());
+    let d = dir.to_str().unwrap();
+
+    let (code, stdout, _) = run(&["--scan-mods-dir", d]);
+    assert_eq!(code, 2, "an unliftable JAR must exit 2");
+    assert!(stdout.contains("heavy-redirect.jar"), "stdout:\n{stdout}");
+    assert!(stdout.contains("@Redirect"), "stdout:\n{stdout}");
+    assert!(stdout.contains("BrokenMixin"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("UnsupportedAnnotation"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("requires fallback"), "stdout:\n{stdout}");
+
+    let (code, stdout, _) = run(&["--scan-mods-dir", d, "--json"]);
+    assert_eq!(code, 2);
+    let root = parse_json(stdout.as_bytes()).unwrap();
+    let r = obj(&root);
+    assert_eq!(str_field(r, "verdict"), "requires_fallback");
+    let totals = obj(r.get("totals").unwrap());
+    assert_eq!(
+        totals
+            .get("requires_fallback")
+            .and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    let jars = r.get("jars").and_then(JsonValue::as_array).unwrap();
+    let heavy = jar_entry(jars, "heavy-redirect.jar");
+    assert_eq!(str_field(heavy, "class"), "requires_fallback");
+    let unliftable = heavy
+        .get("unliftable")
+        .and_then(JsonValue::as_array)
+        .expect("unliftable array");
+    assert_eq!(unliftable.len(), 2);
+    for site in unliftable {
+        let s = obj(site);
+        assert_eq!(str_field(s, "mixin_class"), "com/badmod/mixin/BrokenMixin");
+        assert_eq!(str_field(s, "reason"), "UnsupportedAnnotation");
+    }
+    // The rest of the folder is still classified and reported.
+    assert_eq!(
+        str_field(jar_entry(jars, "sodium-0.6.jar"), "class"),
+        "superseded_perf_mod"
+    );
+    assert_eq!(
+        str_field(jar_entry(jars, "safe-inject-mod.jar"), "class"),
+        "lifted_tier2"
+    );
+}
+
+#[test]
+fn scan_mods_dir_include_client_mixins_wires_through() {
+    let dir = fixture_dir("modsdir-client");
+    write_fixture(&dir, "client.jar", &client_mixin_jar());
+    let d = dir.to_str().unwrap();
+
+    // Default server-side scan: the client-only @Overwrite is skipped,
+    // the server mixin lifts -> clean, exit 0.
+    let (code, stdout, stderr) = run(&["--scan-mods-dir", d, "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let root = parse_json(stdout.as_bytes()).unwrap();
+    let r = obj(&root);
+    let jars = r.get("jars").and_then(JsonValue::as_array).unwrap();
+    let entry = jar_entry(jars, "client.jar");
+    assert_eq!(str_field(entry, "class"), "lifted_tier2");
+    assert_eq!(
+        entry
+            .get("skipped_client_mixins")
+            .and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        entry.get("classes_scanned").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+
+    // --include-client-mixins scans the client class too — its
+    // @Overwrite flips the jar to requires_fallback.
+    let (code, stdout, _) =
+        run(&["--scan-mods-dir", d, "--include-client-mixins", "--json"]);
+    assert_eq!(code, 2);
+    let root = parse_json(stdout.as_bytes()).unwrap();
+    let r = obj(&root);
+    let jars = r.get("jars").and_then(JsonValue::as_array).unwrap();
+    let entry = jar_entry(jars, "client.jar");
+    assert_eq!(str_field(entry, "class"), "requires_fallback");
+    assert_eq!(
+        entry.get("classes_scanned").and_then(JsonValue::as_u64),
+        Some(2)
+    );
+}
+
+#[test]
+fn scan_mods_dir_missing_and_corrupt_inputs_exit_1() {
+    let dir = fixture_dir("modsdir-errors");
+
+    let (code, _, stderr) = run(&["--scan-mods-dir", "/nonexistent/mods"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("mc-spine-mod-check"), "stderr: {stderr}");
+    assert!(stderr.contains("not an existing directory"), "stderr: {stderr}");
+
+    // A regular file is not a directory.
+    let file = write_fixture(&dir, "a-file", b"x");
+    let (code, _, _) = run(&["--scan-mods-dir", file.to_str().unwrap()]);
+    assert_eq!(code, 1, "non-directory input must fail closed");
+
+    // A corrupt JAR (not a ZIP at all) aborts the scan and names the jar.
+    write_fixture(&dir, "broken.jar", b"not a zip at all");
+    let (code, _, stderr) = run(&["--scan-mods-dir", dir.to_str().unwrap()]);
+    assert_eq!(code, 1, "corrupt JAR must fail closed");
+    assert!(stderr.contains("broken.jar"), "stderr: {stderr}");
+
+    // A mixin config registering an absent class also fails closed.
+    let dir2 = fixture_dir("modsdir-missing-class");
+    write_fixture(
+        &dir2,
+        "half.jar",
+        &build_zip(&[stored_entry(
+            "x.mixins.json",
+            br#"{"package": "com.x.mixin", "mixins": ["Gone"]}"#,
+        )]),
+    );
+    let (code, _, stderr) = run(&["--scan-mods-dir", dir2.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Gone"), "stderr: {stderr}");
+
+    // A subdirectory masquerading as a JAR cannot be read.
+    let dir3 = fixture_dir("modsdir-subdir");
+    fs::create_dir_all(dir3.join("fake.jar")).expect("create fake jar dir");
+    let (code, _, stderr) = run(&["--scan-mods-dir", dir3.to_str().unwrap()]);
+    assert_eq!(code, 1, "a *.jar directory must fail closed");
+    assert!(stderr.contains("fake.jar"), "stderr: {stderr}");
+}
+
+#[test]
+fn scan_mods_dir_mutual_exclusion_and_flag_gating_exit_2() {
+    let dir = fixture_dir("modsdir-mutex");
+    let pack = write_fixture(&dir, "a.mrpack", &mrpack(MODRINTH_1211));
+    let jar = write_fixture(&dir, "safe.jar", &safe_jar());
+    let d = dir.to_str().unwrap();
+
+    for args in [
+        vec!["--scan-mods-dir", d, "--modpack", pack.to_str().unwrap()],
+        vec!["--scan-mods-dir", d, "--scan-jar", jar.to_str().unwrap()],
+        vec!["--modpack", pack.to_str().unwrap(), "--scan-mods-dir", d],
+        vec!["--scan-mods-dir", d, "--mc-version", "26.3"],
+        vec!["--scan-mods-dir", d, "--flagship", "create"],
+        vec!["--scan-mods-dir", d, "--profiles", "jei"],
+        vec!["--scan-mods-dir"],
+    ] {
+        let (code, _, stderr) = run(&args);
+        assert_eq!(code, 2, "args {args:?} must exit 2");
+        assert!(
+            stderr.contains("mc-spine-mod-check"),
+            "args {args:?} stderr must explain the error: {stderr}"
+        );
+    }
+
+    let (code, _, stderr) =
+        run(&["--scan-mods-dir", d, "--modpack", pack.to_str().unwrap()]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("mutually exclusive"), "stderr: {stderr}");
+}
+
+#[test]
+fn scan_mods_dir_empty_dir_and_equals_form_exit_0() {
+    let dir = fixture_dir("modsdir-empty");
+
+    let (code, stdout, stderr) = run(&["--scan-mods-dir", dir.to_str().unwrap()]);
+    assert_eq!(code, 0, "empty dir is trivially clean, stderr: {stderr}");
+    assert!(stdout.contains("Found 0 JAR(s)"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Result: clean"), "stdout:\n{stdout}");
+
+    let arg = format!("--scan-mods-dir={}", dir.to_str().unwrap());
+    let (code, stdout, _) = run(&[arg.as_str(), "--json"]);
+    assert_eq!(code, 0);
+    let root = parse_json(stdout.as_bytes()).unwrap();
+    let r = obj(&root);
+    assert_eq!(str_field(r, "schema"), "mc-spine-mods-dir-scan/1");
+    assert_eq!(str_field(r, "verdict"), "clean");
+    assert_eq!(r.get("jars_found").and_then(JsonValue::as_u64), Some(0));
+    assert!(r
+        .get("jars")
+        .and_then(JsonValue::as_array)
+        .expect("jars array")
+        .is_empty());
+}
