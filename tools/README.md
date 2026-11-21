@@ -20,6 +20,10 @@
 | native capture を取り直す | `sculk_capture.sh`、`*_fixture.sh`、`native_chunk_capture.py`。jar・JDK・（`config_packets.bin` だけは）EULA 同意が要る |
 | 構造物1つを capture から manifest 行まで通す | `structure_capture.py`（下の[構造物 capture のレシピ](#構造物-capture-のレシピ)）。候補chunkの確定 → 固定jarで `structures` stage capture → **capture自身の `structures.starts` で start を確認** → `port_triage` → manifest 行 |
 | 出自と層の監査 | `provenance_scan.py`（コード共有の測定）、`pack_provenance.py`（同梱 pack と固定 jar の data の距離）、`asset_coverage.py` |
+| リリース bundle を組む・検査する | `release_bundle.py build --binary <bin> [--extra-binary <path>] --out-dir <dir> --version <v> --target <triple>` — member 順・mtime・mode を正規化した deterministic tarball＋manifest＋SHA256SUMS。`verify --bundle … --manifest … --sums …` は tarball の byte を読み直して manifest と一致を要求し、Mojang 由来・repo 内部 member を拒否する |
+| modpack が起動前に動くか判定 | `mod_launcher.py --modpack <pack.mrpack\|.zip\|manifest.json> --mc-version <1.21.1\|26.3>` — DL・起動前に MC 版の一致・自動 skip・native/bytecode 検査を分類する。`mc-spine-mod-check` と同じ判定（exit 0/2/1）。コンテナでは `MC_SPINE_MODPACK`/`MC_SPINE_MC_VERSION` 経由で entrypoint がこれを呼ぶ |
+| 版ごとの VersionPack を組む・検査・比較 | `vanilla_data/version_pack.py {build\|verify\|diff}` — vanilla DataGenerator の `--reports` 出力から pack を build（`--version-json` で jar の版情報を取る）、fail-closed `verify`、2 pack 間の packet/registry 差分を `diff` |
+| 変更 path から回すべき harness を選ぶ | `parity_cache.py map --paths <files>`（`--git-diff REF`/`--changed-files` も可）。`run --name <oracle> --dep <files>` は oracle 実行を内容 hash で cache する |
 
 ## 前提データと生成段階（clone 直後）
 
