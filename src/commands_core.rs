@@ -1947,6 +1947,23 @@ fn disabled_datapacks() -> &'static Mutex<HashSet<String>> {
     DISABLED_DATAPACKS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// #165 — the explicit enabled-pack order vanilla keeps in its pack
+/// repository: later packs apply over earlier ones, and `/datapack list
+/// enabled` reports them in this sequence.
+fn datapack_order() -> &'static Mutex<Vec<String>> {
+    static ORDER: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    ORDER.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Where `/datapack enable <name>` files the pack. `first`/`last` insert at
+/// the ends; `before`/`after` fail closed when the anchor pack is not enabled.
+enum DatapackPlacement {
+    First,
+    Last,
+    Before(String),
+    After(String),
+}
+
 #[cfg(test)]
 fn load_datapacks() {
     reload_datapacks(std::path::Path::new(DATAPACK_DIRECTORY), None, false).unwrap();
@@ -1954,7 +1971,7 @@ fn load_datapacks() {
 
 fn reload_datapacks(
     base: &std::path::Path,
-    change: Option<(&str, bool)>,
+    change: Option<(&str, bool, DatapackPlacement)>,
     run_load_functions: bool,
 ) -> Result<usize, String> {
     // Load functions can invoke commands, including another reload. Refuse an
@@ -1962,18 +1979,61 @@ fn reload_datapacks(
     let _reload = DATAPACK_RELOAD
         .try_lock()
         .map_err(|_| "Datapack reload already in progress")?;
-    let sources = datapack_sources(base);
+    let mut sources = datapack_sources(base);
     let mut disabled = disabled_datapacks().lock().unwrap().clone();
-    if let Some((name, enable)) = change {
+    if let Some((name, enable, _)) = &change {
         if !sources.iter().any(|(candidate, _, _)| candidate == name) {
             return Err(format!("Unknown datapack '{name}'"));
         }
-        if enable && !disabled.remove(name) {
+        if *enable && !disabled.remove(*name) {
             return Err(format!("Datapack '{name}' is already enabled"));
         }
-        if !enable && !disabled.insert(name.to_owned()) {
+        if !*enable && !disabled.insert(name.to_string()) {
             return Err(format!("Datapack '{name}' is already disabled"));
         }
+    }
+    // #165 — reconcile the explicit enabled-pack order with the set about to
+    // load, apply any placement request, then sort the source list so load
+    // order (and `list enabled`) matches it. Failing on a bad anchor leaves
+    // every store untouched: `disabled` above is still only a local copy.
+    {
+        let enabled: HashSet<&str> = sources
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .filter(|name| !disabled.contains(*name))
+            .collect();
+        let mut order = datapack_order().lock().unwrap();
+        order.retain(|name| enabled.contains(name.as_str()));
+        for (name, _, _) in &sources {
+            if enabled.contains(name.as_str()) && !order.iter().any(|o| o == name) {
+                order.push(name.clone());
+            }
+        }
+        if let Some((name, true, placement)) = &change {
+            order.retain(|n| n != name);
+            match placement {
+                DatapackPlacement::First => order.insert(0, name.to_string()),
+                DatapackPlacement::Last => order.push(name.to_string()),
+                DatapackPlacement::Before(anchor) => {
+                    let Some(i) = order.iter().position(|n| n == anchor) else {
+                        return Err(format!("Pack '{anchor}' is not enabled"));
+                    };
+                    order.insert(i, name.to_string());
+                }
+                DatapackPlacement::After(anchor) => {
+                    let Some(i) = order.iter().position(|n| n == anchor) else {
+                        return Err(format!("Pack '{anchor}' is not enabled"));
+                    };
+                    order.insert(i + 1, name.to_string());
+                }
+            }
+        }
+        let rank: HashMap<&str, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+        sources.sort_by_key(|(name, _, _)| rank.get(name.as_str()).copied().unwrap_or(usize::MAX));
     }
     let mut content = DatapackContent::default();
     content
@@ -2039,7 +2099,7 @@ fn reload_datapacks(
         );
         content.packs.push(pack);
     }
-    if let Some((name, true)) = change {
+    if let Some((name, true, _)) = change {
         if !content.packs.iter().any(|pack| pack.name == name) {
             return Err(format!("Could not load datapack '{name}'"));
         }
@@ -2083,10 +2143,32 @@ fn run_datapack_command(args: &[&str]) -> String {
                 .filter_map(|(name, _, _)| disabled.contains(&name).then_some(name))
                 .collect()
         }
-        [action @ ("enable" | "disable"), name] => {
+        [action @ ("enable" | "disable"), name, rest @ ..] => {
             let name = name.strip_prefix("file/").unwrap_or(name);
             let enable = *action == "enable";
-            return match reload_datapacks(base, Some((name, enable)), true) {
+            // #165 — `enable` takes an optional placement: first|last
+            // (default last) or before|after an already-enabled pack.
+            let placement = if !enable {
+                if !rest.is_empty() {
+                    return "usage: /datapack disable <name>".into();
+                }
+                DatapackPlacement::Last
+            } else {
+                match rest {
+                    [] | ["last"] => DatapackPlacement::Last,
+                    ["first"] => DatapackPlacement::First,
+                    ["before", anchor] => DatapackPlacement::Before(
+                        anchor.strip_prefix("file/").unwrap_or(anchor).to_owned(),
+                    ),
+                    ["after", anchor] => DatapackPlacement::After(
+                        anchor.strip_prefix("file/").unwrap_or(anchor).to_owned(),
+                    ),
+                    _ => {
+                        return "usage: /datapack enable <name> [first|last|before <existing>|after <existing>]".into()
+                    }
+                }
+            };
+            return match reload_datapacks(base, Some((name, enable, placement)), true) {
                 Ok(count) => format!(
                     "{} datapack '{name}'. Reloading! ({count} pack(s))",
                     if enable { "Enabled" } else { "Disabled" }
@@ -2094,7 +2176,7 @@ fn run_datapack_command(args: &[&str]) -> String {
                 Err(error) => error,
             };
         }
-        _ => return "usage: /datapack list [enabled|available] | enable|disable <name>".into(),
+        _ => return "usage: /datapack list [enabled|available] | enable <name> [first|last|before <existing>|after <existing>] | disable <name>".into(),
     };
     format!("{} packs: {}", names.len(), names.join(", "))
 }
@@ -3844,6 +3926,36 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
     })
 }
 
+/// #97/#167 — attach the `{snbt}` payload `/setblock` parsed to the block
+/// entity that owns it: `Items` lists file into the container store the chunk
+/// packet serializes, and the typed block-entity kinds (beacon, lectern,
+/// jukebox, banner, …) take the whole tag through the live-entity restore path.
+fn setblock_attach_nbt(dim: DimId, x: i32, y: i32, z: i32, tag: ExecTag) {
+    let ExecTag::Compound(mut fields) = tag else {
+        return;
+    };
+    if let Some(items) = fields.remove(&NbtString::text("Items")) {
+        if let Ok(slots) = items_nbt_to_stacks(&items) {
+            if !slots.is_empty() {
+                chests()
+                    .lock()
+                    .unwrap()
+                    .insert(ContainerKey::Block((dim, x, y, z)), slots);
+            }
+        }
+    }
+    let Some(reg) = breg() else { return };
+    let state = block_at_dim(dim, x, y, z);
+    let Some(id) = live_block_entity_id(reg.name_of(state)) else {
+        return;
+    };
+    block_entity_put(&mut fields, "id", block_entity_string(id));
+    for (key, value) in [("x", x), ("y", y), ("z", z)] {
+        block_entity_put(&mut fields, key, ExecTag::Int(value));
+    }
+    restore_live_block_entity((dim, x, y, z), &ExecTag::Compound(fields));
+}
+
 #[cfg(feature = "neoforge-events")]
 fn run_neoforge_command(
     runtime: &java_compat::NeoForgeRuntime,
@@ -3904,10 +4016,39 @@ fn schedule_delay_ticks(time: &str) -> u64 {
     (num.parse::<f64>().unwrap_or(1.0) * mult) as u64
 }
 
+/// #96/#173 — vanilla `/weather` duration: a `TimeArgument` whose `t`/`s`/`d`
+/// suffixes keep their usual tick meanings, but whose bare number is SECONDS
+/// (the 1.21.1 parser reads a count of seconds and multiplies by 20 — not the
+/// 4-tick quarter-second some ports use).
+fn weather_time_argument(value: &str) -> Option<i64> {
+    let (num, mult) = value
+        .strip_suffix('t')
+        .map(|n| (n, 1.0f64))
+        .or_else(|| value.strip_suffix('s').map(|n| (n, TICKS_PER_SECOND as f64)))
+        .or_else(|| value.strip_suffix('d').map(|n| (n, 24_000.0)))
+        .unwrap_or((value, TICKS_PER_SECOND as f64));
+    let parsed = num.parse::<f64>().ok()?;
+    (parsed.is_finite() && parsed >= 0.0).then(|| (parsed * mult) as i64)
+}
+
+/// The duration vanilla rolls when `/weather` omits `<duration>`: uniform in
+/// `ServerLevel.RAIN_DELAY` (clear), `RAIN_DURATION`, or `THUNDER_DURATION`.
+/// Drawn from the seeded world stream so a replayed run sees the same rolls —
+/// never the wall clock.
+fn weather_default_ticks(mode: &str) -> i64 {
+    let (lo, hi) = match mode {
+        "rain" => (12_000u32, 24_000u32),
+        "thunder" => (3_600, 15_600),
+        _ => (12_000, 180_000),
+    };
+    i64::from(lo + world_rng::next_below(hi - lo + 1))
+}
+
+#[cfg(test)]
 fn weather_duration_ticks(seconds: Option<&str>) -> i32 {
     seconds
-        .and_then(|value| value.parse::<i32>().ok())
-        .and_then(|value| value.checked_mul(TICKS_PER_SECOND as i32))
+        .and_then(weather_time_argument)
+        .and_then(|v| i32::try_from(v).ok())
         .unwrap_or(6000)
 }
 
@@ -5282,14 +5423,723 @@ fn playsound_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> S
     format!("Played sound to {sent} player(s)")
 }
 
+/// #98 — the one command-argument tokenizer: whitespace splits at the top
+/// level only, so `"quoted strings"` (with `\"` escapes), `[...]` selector
+/// brackets and `{...}` SNBT compounds survive as single tokens.
+fn split_command_args(input: &str) -> Result<Vec<String>, String> {
+    crate::brigadier::split_command_args_preserving_quotes(input)
+}
+
+// ---------- /tp (#175) ----------
+/// One shared mover for `/tp` subjects: players take the real teleport packet
+/// path (0x40, plus a respawn when the dimension changes), mobs write their
+/// live position and get the entity-teleport broadcast (0x70), and fake actors
+/// keep their simple pos record.
+enum TpMover {
+    Player(Arc<Client>),
+    Mob(Arc<Mob>),
+    Actor(Arc<Actor>),
+}
+
+impl TpMover {
+    fn position(&self) -> (f64, f64, f64, f32, f32) {
+        match self {
+            Self::Player(client) => {
+                let p = client.pos.lock().unwrap();
+                (p.0, p.1, p.2, p.3, p.4)
+            }
+            Self::Mob(mob) => *mob.pos.lock().unwrap(),
+            Self::Actor(actor) => {
+                let p = actor.pos.lock().unwrap();
+                (p.0, p.1, p.2, 0.0, 0.0)
+            }
+        }
+    }
+
+    fn teleport(&self, dim: DimId, x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> bool {
+        match self {
+            Self::Player(client) => {
+                if *client.dim.lock().unwrap() != dim {
+                    // A cross-dimension /tp is a real respawn, not a coordinate
+                    // patch: the client needs 0x47 and a whole new window.
+                    let view = *client.view.lock().unwrap();
+                    switch_client_dimension(client, dim, (x, y, z, yaw, pitch), view);
+                } else {
+                    teleport_in_dimension(
+                        client,
+                        &mut client.sock.lock().unwrap(),
+                        (x, y, z, yaw, pitch),
+                    );
+                }
+                true
+            }
+            Self::Mob(mob) => {
+                if mob.dim != dim {
+                    return false;
+                }
+                *mob.pos.lock().unwrap() = (x, y, z, yaw, pitch);
+                let tp = entity_teleport(mob.eid, x, y, z, yaw, pitch, true);
+                broadcast_seen(mob.eid, |_c| (0x70, tp.clone()));
+                true
+            }
+            Self::Actor(actor) => {
+                *actor.pos.lock().unwrap() = (x, y, z);
+                true
+            }
+        }
+    }
+}
+
+/// A rotation argument token: absolute degrees or a `~`-relative offset from
+/// each subject's current angle, matching vanilla `RotationArgument`.
+enum TpAngle {
+    Abs(f32),
+    Rel(f32),
+}
+
+impl TpAngle {
+    fn parse(tok: &str) -> Option<TpAngle> {
+        if let Some(off) = tok.strip_prefix('~') {
+            if off.is_empty() {
+                return Some(TpAngle::Rel(0.0));
+            }
+            let v = off.parse::<f32>().ok()?;
+            v.is_finite().then_some(TpAngle::Rel(v))
+        } else {
+            let v = tok.parse::<f32>().ok()?;
+            v.is_finite().then_some(TpAngle::Abs(v))
+        }
+    }
+
+    fn resolve(&self, base: f32) -> f32 {
+        match self {
+            Self::Abs(v) => *v,
+            Self::Rel(off) => base + *off,
+        }
+    }
+}
+
+/// How the destination fixes each subject's final rotation.
+enum TpRot {
+    Keep,
+    Set(TpAngle, TpAngle),
+    /// Aim the subject's feet-anchor at this world point.
+    Facing([f64; 3]),
+}
+
+/// Vanilla `Entity.lookAt` math (`btm`): `yaw = atan2(-dx, dz)`,
+/// `pitch = atan2(-dy, hypot(dx, dz))` in degrees, wrapped to [-180, 180).
+fn tp_look_angles(from: [f64; 3], to: [f64; 3]) -> (f32, f32) {
+    let dx = to[0] - from[0];
+    let dy = to[1] - from[1];
+    let dz = to[2] - from[2];
+    (
+        tp_wrap_degrees((-dx).atan2(dz).to_degrees() as f32),
+        tp_wrap_degrees((-dy).atan2(dx.hypot(dz)).to_degrees() as f32),
+    )
+}
+
+fn tp_wrap_degrees(angle: f32) -> f32 {
+    let wrapped = angle % 360.0;
+    if wrapped >= 180.0 {
+        wrapped - 360.0
+    } else if wrapped < -180.0 {
+        wrapped + 360.0
+    } else {
+        wrapped
+    }
+}
+
+/// Resolve a single-entity argument (selector or player name) the way
+/// `execute`'s entity args do. Vanilla requires destination entity args to
+/// match exactly one entity.
+fn tp_single_entity(
+    ctx: &CmdCtx,
+    token: &str,
+) -> Result<ExecuteEntity, String> {
+    let source = ExecuteSource::new(ctx);
+    match source.select(token) {
+        Err(e) => Err(e),
+        Ok(entities) if entities.len() == 1 => Ok(entities.into_iter().next().unwrap()),
+        Ok(entities) if entities.is_empty() => Err("No entity was found".into()),
+        Ok(_) => Err("Only one entity is allowed".into()),
+    }
+}
+
+/// A teleport destination for a single entity token that is neither a live
+/// selector match nor a player — the fake actors used by parity fixtures.
+fn tp_actor_destination(token: &str) -> Option<([f64; 3], DimId)> {
+    actors().lock().unwrap().get(token).map(|actor| {
+        let p = *actor.pos.lock().unwrap();
+        ([p.0, p.1, p.2], DimId::Overworld)
+    })
+}
+
+fn run_teleport_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> String {
+    const USAGE: &str = "usage: /tp [<targets>] (<entity>|<x> <y> <z> [[<yaw> <pitch>]|facing (<fx> <fy> <fz>|entity <entity> [feet|eyes])])";
+    let Some((&first, rest)) = args.split_first() else {
+        return USAGE.into();
+    };
+    // The first token is the *targets* argument whenever it is not itself a
+    // coordinate and at least one further argument follows. `/tp <entity>`
+    // (single token) teleports the executor to that entity.
+    let first_is_coord = first.parse::<f64>().is_ok() || first.starts_with('~');
+    let (subject_tokens, dest): (&[&str], &[&str]) = if rest.is_empty() || first_is_coord {
+        (&[][..], &args[..])
+    } else {
+        (&args[..1], rest)
+    };
+
+    // ---- subjects -------------------------------------------------------
+    let mut movers: Vec<TpMover> = Vec::new();
+    if subject_tokens.is_empty() {
+        if let Some(client) = me {
+            movers.push(TpMover::Player(client.clone()));
+        } else {
+            return "No entity was found".into();
+        }
+    } else {
+        let source = ExecuteSource::new(ctx);
+        for token in subject_tokens {
+            let selected = match source.select(token) {
+                Ok(entities) => entities,
+                Err(e) => return e,
+            };
+            if selected.is_empty() {
+                if let Some(actor) = actors().lock().unwrap().get(*token).cloned() {
+                    movers.push(TpMover::Actor(actor));
+                }
+            }
+            for entity in selected {
+                match entity {
+                    ExecuteEntity::Player(client) => movers.push(TpMover::Player(client)),
+                    ExecuteEntity::Mob(mob) => movers.push(TpMover::Mob(mob)),
+                    // Projectiles, items and other non-living entities have no
+                    // live pos handle exposed to commands yet; vanilla moves
+                    // them, we report them as unmatched.
+                    ExecuteEntity::Other { .. } => {}
+                }
+            }
+        }
+    }
+    if movers.is_empty() {
+        return "No entity was found".into();
+    }
+
+    // ---- destination + rotation ------------------------------------------
+    let (dest_pos, dest_dim, rot): ([f64; 3], DimId, TpRot) = if dest.len() == 1 {
+        // `/tp <targets> <dest_entity>` — vanilla also adopts the
+        // destination entity's own rotation.
+        match tp_single_entity(ctx, dest[0]) {
+            Ok(entity) => {
+                let (pos, [yaw, pitch]) = entity.location();
+                (pos, entity.dimension(), TpRot::Set(TpAngle::Abs(yaw as f32), TpAngle::Abs(pitch as f32)))
+            }
+            Err(e) => match tp_actor_destination(dest[0]) {
+                Some((pos, dim)) => (pos, dim, TpRot::Keep),
+                None => return e,
+            },
+        }
+    } else if dest.len() >= 3 {
+        let pos = [
+            coord(dest[0], ctx.x),
+            coord(dest[1], ctx.y),
+            coord(dest[2], ctx.z),
+        ];
+        if !pos.into_iter().all(f64::is_finite) {
+            return "Invalid position".into();
+        }
+        let rot = match dest.get(3) {
+            None => TpRot::Keep,
+            Some(&"facing") => match dest.get(4) {
+                Some(&"entity") => {
+                    if dest.len() > 7 {
+                        return USAGE.into();
+                    }
+                    let Some(&sel) = dest.get(5) else {
+                        return USAGE.into();
+                    };
+                    let anchor = dest.get(6).copied().unwrap_or("feet");
+                    if !matches!(anchor, "feet" | "eyes") {
+                        return USAGE.into();
+                    }
+                    let entity = match tp_single_entity(ctx, sel) {
+                        Ok(entity) => entity,
+                        Err(e) => return e,
+                    };
+                    let (mut face, _) = entity.location();
+                    if anchor == "eyes" {
+                        face[1] += entity.eye_height();
+                    }
+                    TpRot::Facing(face)
+                }
+                _ => {
+                    if dest.len() != 7 {
+                        return USAGE.into();
+                    }
+                    let face = [
+                        coord(dest[4], ctx.x),
+                        coord(dest[5], ctx.y),
+                        coord(dest[6], ctx.z),
+                    ];
+                    if !face.into_iter().all(f64::is_finite) {
+                        return "Invalid position".into();
+                    }
+                    TpRot::Facing(face)
+                }
+            },
+            Some(&yaw_tok) => {
+                if dest.len() != 5 {
+                    return USAGE.into();
+                }
+                let (Some(yaw), Some(pitch)) =
+                    (TpAngle::parse(yaw_tok), TpAngle::parse(dest[4]))
+                else {
+                    return USAGE.into();
+                };
+                TpRot::Set(yaw, pitch)
+            }
+        };
+        (pos, cmd_dim(ctx), rot)
+    } else {
+        return USAGE.into();
+    };
+
+    // ---- apply ------------------------------------------------------------
+    let mut n = 0usize;
+    for mover in &movers {
+        let (_, _, _, cur_yaw, cur_pitch) = mover.position();
+        let [x, y, z] = dest_pos;
+        let (yaw, pitch) = match &rot {
+            TpRot::Keep => (cur_yaw, cur_pitch),
+            TpRot::Set(y, p) => (
+                tp_wrap_degrees(y.resolve(cur_yaw)),
+                tp_wrap_degrees(p.resolve(cur_pitch)),
+            ),
+            // Vanilla aims from the subject's feet-anchor at the destination.
+            TpRot::Facing(face) => tp_look_angles([x, y, z], *face),
+        };
+        if mover.teleport(dest_dim, x, y, z, yaw, pitch) {
+            n += 1;
+        }
+    }
+    format!("Teleported {} target(s)", n)
+}
+
+// ---------- /loot (#176) ----------
+fn loot_table_pools(id: &str) -> Option<Vec<LootPool>> {
+    let id = if id.contains(':') {
+        id.to_owned()
+    } else {
+        format!("minecraft:{id}")
+    };
+    loot_tables().lock().unwrap().get(&id).map(|pools| {
+        pools
+            .iter()
+            .map(|pl| LootPool {
+                rolls: pl.rolls,
+                chance: pl.chance,
+                funcs: pl.funcs.clone(),
+                entries: pl
+                    .entries
+                    .iter()
+                    .map(|e| LootEntry {
+                        item: e.item,
+                        min: e.min,
+                        max: e.max,
+                        funcs: e.funcs.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    })
+}
+
+/// `/loot <slot>` spec shared by the `replace` targets — the same window-0
+/// keys `/item` understands.
+fn loot_slot_of(spec: &str, held: i16) -> Option<i16> {
+    Some(match spec {
+        "weapon.mainhand" => 36 + held,
+        "weapon.offhand" => 45,
+        "armor.head" => 5,
+        "armor.chest" => 6,
+        "armor.legs" => 7,
+        "armor.feet" => 8,
+        _ => {
+            let n = spec
+                .strip_prefix("hotbar.")
+                .or_else(|| spec.strip_prefix("inventory."))
+                .or_else(|| spec.strip_prefix("container."))?;
+            n.parse::<i16>().ok().map(|x| 9 + x)?
+        }
+    })
+}
+
+/// Give a stack to a player exactly like `/give`: merge into a matching
+/// partial stack first, then hotbar (36-44) before the main inventory (9-35).
+fn loot_give_stack(client: &Arc<Client>, stack: &Stack) {
+    let (item, cnt, comps) = stack;
+    let mut inv = client.inv.lock().unwrap();
+    let slot: i16 = (36..=44i16)
+        .chain(9..=35)
+        .find(|sl| {
+            inv.get(sl).map(|(it, cn, cc)| {
+                *it == *item && *cc == *comps
+                    && (*cn as i64 + *cnt as i64) <= item_stack_max(*item, comps) as i64
+            }).unwrap_or(false)
+        })
+        .or_else(|| (36..=44).chain(9..=35).find(|sl| !inv.contains_key(sl)))
+        .unwrap_or(36);
+    let st = if let Some(existing) = inv.get_mut(&slot) {
+        existing.1 = existing.1.saturating_add(*cnt);
+        existing.clone()
+    } else {
+        inv.insert(slot, stack.clone());
+        stack.clone()
+    };
+    drop(inv);
+    let mut p = vec![0u8];
+    write_varint(&mut p, 0);
+    p.extend_from_slice(&slot.to_be_bytes());
+    p.extend_from_slice(&slot_wire(&st));
+    if let Ok(mut w) = client.sock.lock() {
+        let _ = send_packet(&mut w, 0x15, p);
+    }
+}
+
+/// The capacity `/loot insert` fills into for the block at `pos` — the same
+/// sizes `RandomizableContainer` uses, or `None` when the block is no
+/// container at all (vanilla fails closed there).
+fn loot_container_capacity(dim: DimId, x: i32, y: i32, z: i32) -> Option<i16> {
+    if dim == DimId::Overworld && is_furnace_at(x, y, z) {
+        return Some(3);
+    }
+    // `container_kind` only names 27-slot generic containers today.
+    container_kind(block_at_dim(dim, x, y, z)).map(|_| 27)
+}
+
+/// Roll one `/loot` source clause into item stacks.
+fn loot_roll_source(
+    ctx: &CmdCtx,
+    source: &[&str],
+) -> Result<Vec<Stack>, String> {
+    const USAGE: &str = "usage: /loot ... (loot <table>|kill <entity>|mine <x> <y> <z> [<tool>]|fish <table> <x> <y> <z> [<tool>])";
+    let Some((&kind, rest)) = source.split_first() else {
+        return Err(USAGE.into());
+    };
+    match kind {
+        "loot" => {
+            let [id] = rest else { return Err(USAGE.into()) };
+            loot_table_pools(id)
+                .map(|pools| roll_loot(&pools))
+                .ok_or_else(|| format!("Unknown loot table '{id}'"))
+        }
+        "kill" => {
+            let [entity] = rest else { return Err(USAGE.into()) };
+            // A selector or entity name resolves through the same path as
+            // execute's entity args; a bare type name falls back to the
+            // registry like the old subset did.
+            if entity.starts_with('@') {
+                match tp_single_entity(ctx, entity) {
+                    Ok(ExecuteEntity::Mob(mob)) => {
+                        let burning = *mob.fire_ticks.lock().unwrap() > 0;
+                        Ok(mob_loot(mob.etype, burning))
+                    }
+                    Ok(_) => Err("Entity has no loot table".into()),
+                    Err(e) => Err(e),
+                }
+            } else {
+                match name_to_etype(entity.trim_start_matches("minecraft:")) {
+                    Some(etype) => Ok(mob_loot(etype, false)),
+                    None => Err(format!("Unknown entity '{entity}'")),
+                }
+            }
+        }
+        "mine" => {
+            if !(3..=4).contains(&rest.len()) {
+                return Err(USAGE.into());
+            }
+            let (x, y, z) = (
+                coord(rest[0], ctx.x) as i32,
+                coord(rest[1], ctx.y) as i32,
+                coord(rest[2], ctx.z) as i32,
+            );
+            // Vanilla accepts `mainhand`/`offhand`/an item id; the drop table
+            // here is the registry's, which already encodes silk-touch rules.
+            if let Some(&tool) = rest.get(3) {
+                let known = matches!(tool, "mainhand" | "offhand")
+                    || name_to_item(tool.trim_start_matches("minecraft:")).is_some();
+                if !known {
+                    return Err(format!("Unknown item '{tool}'"));
+                }
+            }
+            Ok(block_drops(block_at_dim(cmd_dim(ctx), x, y, z))
+                .into_iter()
+                .map(|item| (item, 1u8, Vec::new()))
+                .collect())
+        }
+        "fish" => {
+            if !(4..=5).contains(&rest.len()) {
+                return Err(USAGE.into());
+            }
+            let id = rest[0];
+            // rest[1..4] is the fishing position; rest[4] an optional tool.
+            if let Some(&tool) = rest.get(4) {
+                let known = matches!(tool, "mainhand" | "offhand")
+                    || name_to_item(tool.trim_start_matches("minecraft:")).is_some();
+                if !known {
+                    return Err(format!("Unknown item '{tool}'"));
+                }
+            }
+            loot_table_pools(id)
+                .map(|pools| roll_loot(&pools))
+                .ok_or_else(|| format!("Unknown loot table '{id}'"))
+        }
+        _ => Err(USAGE.into()),
+    }
+}
+
+/// `replace` consumes an optional <count> between the slot spec and the
+/// source: a bare integer token, which cannot itself start a source clause.
+fn loot_take_count<'a>(rest: &'a [&'a str]) -> (Option<usize>, &'a [&'a str]) {
+    match rest.first() {
+        Some(tok) if tok.parse::<usize>().is_ok() && rest.len() > 1 => {
+            (tok.parse::<usize>().ok(), &rest[1..])
+        }
+        _ => (None, rest),
+    }
+}
+
+fn run_loot_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> String {
+    const USAGE: &str = "usage: /loot (give <players>|insert <x> <y> <z>|replace block <x> <y> <z> <slot> [<count>]|replace entity <targets> <slot> [<count>]|spawn <x> <y> <z>) <source>";
+    let Some(&target) = args.first() else {
+        return USAGE.into();
+    };
+    match target {
+        "give" => {
+            let [selector, source @ ..] = &args[1..] else {
+                return USAGE.into();
+            };
+            if source.is_empty() {
+                return USAGE.into();
+            }
+            let mut players: Vec<Arc<Client>> = Vec::new();
+            for eid in resolve_selector(selector, me) {
+                if let Ok(id) = eid.parse::<i32>() {
+                    if let Some(c) = client_snapshot()
+                        .into_iter()
+                        .find(|c| c.eid == id)
+                    {
+                        players.push(c);
+                    }
+                }
+            }
+            if players.is_empty() {
+                return "No players found".into();
+            }
+            let items = match loot_roll_source(ctx, source) {
+                Ok(items) => items,
+                Err(e) => return e,
+            };
+            let mut total = 0usize;
+            for c in &players {
+                for st in &items {
+                    loot_give_stack(c, st);
+                    total += 1;
+                }
+            }
+            format!("Gave {} item stack(s)", total)
+        }
+        "insert" => {
+            let (Some(x), Some(y), Some(z)) =
+                (args.get(1), args.get(2), args.get(3))
+            else {
+                return USAGE.into();
+            };
+            let (bx, by, bz) = (
+                coord(x, ctx.x) as i32,
+                coord(y, ctx.y) as i32,
+                coord(z, ctx.z) as i32,
+            );
+            let source = &args[4..];
+            if source.is_empty() {
+                return USAGE.into();
+            }
+            let dim = cmd_dim(ctx);
+            let Some(capacity) = loot_container_capacity(dim, bx, by, bz) else {
+                return "The target block is not a container".into();
+            };
+            let items = match loot_roll_source(ctx, source) {
+                Ok(items) => items,
+                Err(e) => return e,
+            };
+            let key = ContainerKey::Block((dim, bx, by, bz));
+            let mut chests = chests().lock().unwrap();
+            let slots = chests.entry(key).or_default();
+            let mut n = 0usize;
+            for st in &items {
+                // vanilla `insert` merges partials first, then the first free
+                // slot — same fill order as hopper insertion.
+                let merge = (0..capacity).find(|sl| {
+                    slots.get(sl).map(|(it, cn, cc)| {
+                        *it == st.0 && *cc == st.2
+                            && (*cn as i64 + st.1 as i64)
+                                <= item_stack_max(st.0, &st.2) as i64
+                    }).unwrap_or(false)
+                });
+                let slot = merge.or_else(|| (0..capacity).find(|sl| !slots.contains_key(sl)));
+                let Some(slot) = slot else { continue };
+                if let Some(existing) = slots.get_mut(&slot) {
+                    existing.1 = existing.1.saturating_add(st.1);
+                } else {
+                    slots.insert(slot, st.clone());
+                }
+                n += 1;
+            }
+            format!("Inserted {} item stack(s)", n)
+        }
+        "replace" => {
+            match args.get(1).copied() {
+                Some("block") => {
+                    let (Some(x), Some(y), Some(z), Some(&slot_spec)) =
+                        (args.get(2), args.get(3), args.get(4), args.get(5))
+                    else {
+                        return USAGE.into();
+                    };
+                    let Some(slot) = slot_spec
+                        .strip_prefix("container.")
+                        .and_then(|v| v.parse::<i16>().ok())
+                    else {
+                        return USAGE.into();
+                    };
+                    let (count, source) = loot_take_count(&args[6..]);
+                    if source.is_empty() {
+                        return USAGE.into();
+                    }
+                    let (bx, by, bz) = (
+                        coord(x, ctx.x) as i32,
+                        coord(y, ctx.y) as i32,
+                        coord(z, ctx.z) as i32,
+                    );
+                    let dim = cmd_dim(ctx);
+                    let Some(capacity) = loot_container_capacity(dim, bx, by, bz) else {
+                        return "The target block is not a container".into();
+                    };
+                    let items = match loot_roll_source(ctx, source) {
+                        Ok(items) => items,
+                        Err(e) => return e,
+                    };
+                    let limit = count.unwrap_or(1).min(items.len());
+                    let mut n = 0usize;
+                    let mut chests = chests().lock().unwrap();
+                    let slots = chests.entry(ContainerKey::Block((dim, bx, by, bz))).or_default();
+                    for (i, st) in items.iter().take(limit).enumerate() {
+                        let s = slot + i as i16;
+                        if s < 0 || s >= capacity {
+                            break;
+                        }
+                        slots.insert(s, st.clone());
+                        n += 1;
+                    }
+                    format!("Replaced {} slot(s)", n)
+                }
+                Some("entity") => {
+                    let (Some(&selector), Some(&slot_spec)) = (args.get(2), args.get(3))
+                    else {
+                        return USAGE.into();
+                    };
+                    let (count, source) = loot_take_count(&args[4..]);
+                    if source.is_empty() {
+                        return USAGE.into();
+                    }
+                    let items = match loot_roll_source(ctx, source) {
+                        Ok(items) => items,
+                        Err(e) => return e,
+                    };
+                    let limit = count.unwrap_or(1).min(items.len());
+                    let mut n = 0usize;
+                    let cls = client_snapshot();
+                    for eid in resolve_selector(selector, me) {
+                        let Ok(id) = eid.parse::<i32>() else { continue };
+                        let Some(c) = cls.iter().find(|c| c.eid == id) else { continue };
+                        for (i, st) in items.iter().take(limit).enumerate() {
+                            let spec = if i == 0 {
+                                slot_spec.to_owned()
+                            } else {
+                                // `replace entity` counts consecutive
+                                // container.N slots for the <count> form.
+                                match slot_spec.strip_prefix("container.").and_then(|v| v.parse::<i16>().ok()) {
+                                    Some(base) => format!("container.{}", base + i as i16),
+                                    None => slot_spec.to_owned(),
+                                }
+                            };
+                            let Some(slot) = loot_slot_of(&spec, *c.held.lock().unwrap()) else { continue };
+                            {
+                                let mut inv = c.inv.lock().unwrap();
+                                inv.insert(slot, st.clone());
+                                *c.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+                            }
+                            let mut p = vec![0u8];
+                            write_varint(&mut p, 0);
+                            p.extend_from_slice(&slot.to_be_bytes());
+                            p.extend_from_slice(&slot_wire(st));
+                            if let Ok(mut w) = c.sock.lock() {
+                                let _ = send_packet(&mut w, 0x15, p);
+                            }
+                            n += 1;
+                        }
+                    }
+                    format!("Replaced {} slot(s)", n)
+                }
+                _ => USAGE.into(),
+            }
+        }
+        "spawn" => {
+            let (Some(x), Some(y), Some(z)) =
+                (args.get(1), args.get(2), args.get(3))
+            else {
+                return USAGE.into();
+            };
+            let source = &args[4..];
+            if source.is_empty() {
+                return USAGE.into();
+            }
+            let (lx, ly, lz) = (coord(x, ctx.x), coord(y, ctx.y), coord(z, ctx.z));
+            let items = match loot_roll_source(ctx, source) {
+                Ok(items) => items,
+                Err(e) => return e,
+            };
+            let n = items.len();
+            for (item, cnt, ic) in items {
+                drops().lock().unwrap().push(Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: lx,
+                    y: ly,
+                    z: lz,
+                    item,
+                    cnt,
+                    comps: ic,
+                    age: 0,
+                    target: None,
+                    thrower: None,
+                });
+            }
+            format!("Dropped {} item stack(s)", n)
+        }
+        _ => USAGE.into(),
+    }
+}
+
 fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     let me = ctx.me.as_ref();
     let Some(input) = msg.strip_prefix('/') else { return "Expected a command starting with /".into() };
     let first_word = input.split_whitespace().next().unwrap_or("");
     let tokens = if matches!(first_word, "say" | "execute") {
+        // `say`/`execute` re-join their arguments anyway, and greedy vanilla
+        // text may carry an unmatched quote the strict tokenizer would reject.
         input.split_whitespace().map(str::to_owned).collect()
     } else {
-        match crate::brigadier::split_command_args_preserving_quotes(input) {
+        match split_command_args(input) {
             Ok(tokens) => tokens,
             Err(error) => return format!("Invalid command: {error}"),
         }
@@ -5492,44 +6342,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             }
         }
         "reload" => "usage: /reload".into(),
-        "tp" | "teleport" => {
-            let mut actor_tgt: Option<String> = None;
-            let (targets, xyz): (Vec<String>, &[&str]) = if args.first().map(|a| a.starts_with('@')).unwrap_or(false) {
-                (resolve_selector(args[0], me), &args[1..])
-            } else if args.len() >= 4 && args[0].parse::<f64>().is_err() && !args[0].starts_with('~') {
-                let nm = args[0];
-                let t = { clients().lock().unwrap().iter().find(|c| c.name == nm).map(|c| c.eid.to_string()) };
-                if t.is_none() && actors().lock().unwrap().contains_key(nm) { actor_tgt = Some(nm.to_string()); }
-                (t.into_iter().collect(), &args[1..])
-            } else if let Some(me) = me { (vec![me.eid.to_string()], &args[..]) } else { (vec![], &args[..]) };
-            if xyz.len() < 3 { "usage: /tp [@target] x y z".into() } else {
-                let (x, y, z) = (coord(xyz[0], ctx.x), coord(xyz[1], ctx.y), coord(xyz[2], ctx.z));
-                let mut n = 0;
-                if let Some(nm) = &actor_tgt {
-                    if let Some(a) = actors().lock().unwrap().get(nm) { *a.pos.lock().unwrap() = (x, y, z); n += 1; }
-                }
-                let cls: Vec<Arc<Client>> = client_snapshot();
-                for t in &targets {
-                    if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
-                        let (yaw, pitch) = {
-                            let p = c.pos.lock().unwrap();
-                            (p.3, p.4)
-                        };
-                        let cur_dim = *c.dim.lock().unwrap();
-                        if cur_dim != cmd_dim(ctx) {
-                            // A cross-dimension /tp is a real respawn, not a coordinate patch:
-                            // the client needs 0x47 and a whole new window before 0x40.
-                            let view = *c.view.lock().unwrap();
-                            switch_client_dimension(c, cmd_dim(ctx), (x, y, z, yaw, pitch), view);
-                        } else {
-                            teleport_in_dimension(c, &mut c.sock.lock().unwrap(), (x, y, z, yaw, pitch));
-                        }
-                        n += 1;
-                    }
-                }
-                format!("Teleported {} target(s)", n)
-            }
-        }
+        "tp" | "teleport" => run_teleport_command(ctx, &args, me),
         "say" => {
             let line = format!("[Server] {}", args.join(" "));
             let pl = system_chat(&line);
@@ -5859,14 +6672,88 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         }
         "xp" | "experience" => run_experience_command(&args, me),
         "setblock" => {
-            if args.len() >= 4 {
-                let (x, y, z) = (coord(args[0], ctx.x) as i32, coord(args[1], ctx.y) as i32, coord(args[2], ctx.z) as i32);
-                let Some(st) = state_from_arg(args[3]) else {
-                    return format!("Unknown block '{}'", args[3]);
-                };
-                place_block_dim(cmd_dim(ctx), x, y, z, st);
-                format!("Set block at {} {} {} in {}", x, y, z, cmd_dim(ctx).dimension_id())
-            } else { "usage: /setblock x y z <block>".into() }
+            if args.len() < 4 {
+                return "usage: /setblock x y z <block>[states][{nbt}] [destroy|keep|replace]".into();
+            }
+            let (x, y, z) = (coord(args[0], ctx.x) as i32, coord(args[1], ctx.y) as i32, coord(args[2], ctx.z) as i32);
+            let dim = cmd_dim(ctx);
+            if let Err(e) = check_modification_bounds(dim, (x, y, z)) {
+                return e;
+            }
+            // #97/#167 — the block arg may carry [states] plus a glued {snbt}
+            // block-entity payload; a bare `{...}` token works the same way.
+            let block_arg = args[3];
+            let (block_name, mut nbt_text) = match block_arg.split_once('{') {
+                Some((name, rest)) => (name, Some(format!("{{{rest}"))),
+                None => (block_arg, None),
+            };
+            let mut mode_index = 4;
+            if nbt_text.is_none() && args.get(4).is_some_and(|a| a.starts_with('{')) {
+                nbt_text = Some(args[4].to_owned());
+                mode_index = 5;
+            }
+            let mode = args.get(mode_index).copied().unwrap_or("replace");
+            if args.len() > mode_index + 1 || !matches!(mode, "destroy" | "keep" | "replace") {
+                return "usage: /setblock x y z <block>[states][{nbt}] [destroy|keep|replace]".into();
+            }
+            let nbt = match &nbt_text {
+                Some(text) => {
+                    let mut reader = brigadier::StringReader::new(text);
+                    match execute_read_snbt(&mut reader, 0) {
+                        Some(tag @ ExecTag::Compound(_)) if !reader.can_read() => Some(tag),
+                        _ => return format!("Invalid block entity data '{text}'"),
+                    }
+                }
+                None => None,
+            };
+            // Fail closed: an unresolved block id is an error, never silent air.
+            let Some(st) = state_from_arg(block_name) else {
+                return format!("Unknown block '{}'", block_name);
+            };
+            let old = block_at_dim(dim, x, y, z);
+            let old_is_air = breg().map_or(old == COMMAND_AIR_STATE, |reg| reg.is_air(old));
+            if mode == "keep" && !old_is_air {
+                return "Could not set the block".into();
+            }
+            if mode == "destroy" && !old_is_air {
+                set_block_dim(dim, x, y, z, COMMAND_AIR_STATE);
+                // vanilla destroyBlock: LevelEvent 2001 (break particles + sound)
+                // then the block's item drop under doTileDrops.
+                let mut p = Vec::new();
+                p.extend_from_slice(&2001i32.to_be_bytes());
+                write_pos(&mut p, x, y, z);
+                p.extend_from_slice(&(old as i32).to_be_bytes());
+                p.push(0);
+                broadcast_near(dim, f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5, -1, |_c| {
+                    (0x28, p.clone())
+                });
+                if dim == DimId::Overworld && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
+                    let mut drops = drops().lock().unwrap();
+                    let remaining = DROP_CAP.saturating_sub(drops.len());
+                    drops.extend(
+                        block_drops(old)
+                            .into_iter()
+                            .take(remaining)
+                            .map(|item| Drop {
+                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                x: f64::from(x) + 0.5,
+                                y: f64::from(y) + 0.5,
+                                z: f64::from(z) + 0.5,
+                                item,
+                                cnt: 1,
+                                comps: Vec::new(),
+                                age: 0,
+                                target: None,
+                                thrower: None,
+                            }),
+                    );
+                }
+            }
+            place_block_dim(dim, x, y, z, st);
+            if let Some(tag) = nbt {
+                setblock_attach_nbt(dim, x, y, z, tag);
+            }
+            format!("Set block at {} {} {} in {}", x, y, z, dim.dimension_id())
         }
         "summon" => {
             if args.len() < 4 {
@@ -6111,8 +6998,21 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             }
         }
         "weather" => {
-            let w = args.first().copied().unwrap_or("clear");
-            let dur = weather_duration_ticks(args.get(1).copied());
+            // #96/#173 — vanilla `/weather clear|rain|thunder [<duration>]`. An
+            // omitted duration is a seeded roll in vanilla's per-mode range,
+            // and a malformed one fails closed instead of clearing silently.
+            let w = args.first().copied().unwrap_or("");
+            if !matches!(w, "clear" | "rain" | "thunder") || args.len() > 2 {
+                return "usage: /weather clear|rain|thunder [<duration>]".into();
+            }
+            let ticks: i64 = match args.get(1) {
+                Some(raw) => match weather_time_argument(raw) {
+                    Some(t) => t,
+                    None => return "usage: /weather clear|rain|thunder [<duration>]".into(),
+                },
+                None => weather_default_ticks(w),
+            };
+            let dur = ticks.min(i64::from(i32::MAX)) as i32;
             let (code, ticks) = match w { "rain" => (1u8, dur), "thunder" => (1, dur), _ => (2u8, 0) };
             RAINING.store(ticks.max(0) as u64, Ordering::Relaxed);
             THUNDERING.store(if w == "thunder" { ticks.max(0) as u64 } else { 0 }, Ordering::Relaxed);
@@ -6131,35 +7031,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 }
             } else { "usage: /function <ns:name> [with <compound>]".into() }
         }
-        "loot" => {
-            // subset: loot spawn <x> <y> <z> loot <table> | kill <entity-type>
-            if args.first() == Some(&"spawn") && args.len() >= 6 {
-                let (lx, ly, lz) = (coord(args[1], ctx.x), coord(args[2], ctx.y), coord(args[3], ctx.z));
-                let items: Vec<Stack> = match args[4] {
-                    "loot" => {
-                        let id = args.get(5).copied().unwrap_or("");
-                        let id = if id.contains(':') { id.to_string() } else { format!("minecraft:{}", id) };
-                        match loot_tables().lock().unwrap().get(&id).map(|p| p.iter().map(|pl| LootPool { rolls: pl.rolls, chance: pl.chance, funcs: pl.funcs.clone(),
-                            entries: pl.entries.iter().map(|e| LootEntry { item: e.item, min: e.min, max: e.max, funcs: e.funcs.clone() }).collect() }).collect::<Vec<_>>()) {
-                            Some(p) => roll_loot(&p),
-                            None => return format!("Unknown loot table '{}'", args.get(5).copied().unwrap_or("")),
-                        }
-                    }
-                    "kill" => {
-                        let et = name_to_etype(args.get(5).copied().unwrap_or("").trim_start_matches("minecraft:"));
-                        match et { Some(t) => mob_loot(t, false),
-                                   None => return "usage: /loot spawn x y z loot <table>|kill <entity>".into() }
-                    }
-                    _ => return "usage: /loot spawn x y z loot <table>|kill <entity>".into(),
-                };
-                let n = items.len();
-                for (item, cnt, ic) in items {
-                    drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                        x: lx, y: ly, z: lz, item, cnt, comps: ic, age: 0, target: None, thrower: None });
-                }
-                format!("Dropped {} item stack(s)", n)
-            } else { "usage: /loot spawn x y z loot <table>|kill <entity>".into() }
-        }
+        "loot" => run_loot_command(ctx, &args, me),
         "playsound" => playsound_command(ctx, &args, me),
         "title" => {
             if args.len() < 3 { return "usage: /title <targets> title|subtitle|actionbar|times <text>".into(); }
@@ -6837,5 +7709,638 @@ mod security_command_tests {
             assert!(regular.child(name).is_none(), "{name}");
             assert!(operator.child(name).is_some(), "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod p5f_parity_tests {
+    // Lane P5f — issues #96, #97, #98, #165, #167, #173, #175, #176, plus the
+    // /forceload query result fix for `execute store result`.
+    use super::*;
+    use std::net::TcpStream;
+
+    fn p5f_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    fn p5f_run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    fn p5f_client(eid: i32, name: &str, x: f64, y: f64, z: f64) -> (Arc<Client>, TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.eid = eid;
+        client.name = name.into();
+        *client.pos.lock().unwrap() = (x, y, z, 0.0, 0.0, true);
+        (Arc::new(client), receiver)
+    }
+
+    fn p5f_loot_table(item: i64) -> Vec<LootPool> {
+        vec![LootPool {
+            rolls: 1,
+            chance: 1.0,
+            funcs: Vec::new(),
+            entries: vec![LootEntry {
+                item,
+                min: 1,
+                max: 1,
+                funcs: Vec::new(),
+            }],
+        }]
+    }
+
+    // #96/#173 — vanilla `/weather` reads a TimeArgument whose bare number is
+    // SECONDS (*20 ticks), and an omitted duration is a seeded roll in the
+    // per-mode vanilla range.
+    #[test]
+    fn p5f_parity_weather_time_argument_and_default_ranges() {
+        assert_eq!(weather_time_argument("60"), Some(1200));
+        assert_eq!(weather_time_argument("20t"), Some(20));
+        assert_eq!(weather_time_argument("60s"), Some(1200));
+        assert_eq!(weather_time_argument("2d"), Some(48_000));
+        assert_eq!(weather_time_argument("0.5s"), Some(10));
+        assert_eq!(weather_time_argument("bogus"), None);
+        assert_eq!(weather_time_argument("-1"), None);
+        assert_eq!(weather_time_argument("NaN"), None);
+        assert_eq!(weather_time_argument(""), None);
+        for (mode, lo, hi) in [
+            ("clear", 12_000i64, 180_000i64),
+            ("rain", 12_000, 24_000),
+            ("thunder", 3_600, 15_600),
+        ] {
+            let rolled = weather_default_ticks(mode);
+            assert!(
+                (lo..=hi).contains(&rolled),
+                "{mode} default {rolled} outside {lo}..={hi}"
+            );
+        }
+    }
+
+    #[test]
+    fn p5f_parity_weather_command_durations_state_and_fail_closed() {
+        let _world = world_guard();
+        let ctx = p5f_ctx(None);
+        assert_eq!(p5f_run(&ctx, "/weather rain 30"), "Weather: rain");
+        assert_eq!(RAINING.load(Ordering::Relaxed), 600);
+        assert_eq!(THUNDERING.load(Ordering::Relaxed), 0);
+        assert_eq!(p5f_run(&ctx, "/weather thunder 10s"), "Weather: thunder");
+        assert_eq!(THUNDERING.load(Ordering::Relaxed), 200);
+        assert_eq!(RAINING.load(Ordering::Relaxed), 200);
+        assert_eq!(p5f_run(&ctx, "/weather rain 20t"), "Weather: rain");
+        assert_eq!(RAINING.load(Ordering::Relaxed), 20);
+        // An omitted duration is a seeded roll inside the vanilla range.
+        assert_eq!(p5f_run(&ctx, "/weather rain"), "Weather: rain");
+        let rolled = RAINING.load(Ordering::Relaxed);
+        assert!((12_000..=24_000).contains(&rolled), "rain default {rolled}");
+        assert_eq!(p5f_run(&ctx, "/weather clear"), "Weather: clear");
+        assert_eq!(RAINING.load(Ordering::Relaxed), 0);
+        assert_eq!(THUNDERING.load(Ordering::Relaxed), 0);
+        // Bad mode, bad duration, and extra args all fail closed.
+        assert!(p5f_run(&ctx, "/weather bogus").starts_with("usage:"));
+        assert!(p5f_run(&ctx, "/weather rain -5").starts_with("usage:"));
+        assert!(p5f_run(&ctx, "/weather rain bogus").starts_with("usage:"));
+        assert!(p5f_run(&ctx, "/weather rain 5 extra").starts_with("usage:"));
+        assert!(p5f_run(&ctx, "/weather").starts_with("usage:"));
+    }
+
+    // #97/#167 — unknown blocks fail closed; keep/destroy/replace and the
+    // {snbt} block-entity payload all behave like vanilla.
+    #[test]
+    fn p5f_parity_setblock_fails_closed_on_unknown_and_bad_args() {
+        let _world = world_guard();
+        let ctx = p5f_ctx(None);
+        assert_eq!(
+            p5f_run(&ctx, "/setblock 0 60 0 minecraft:not_a_real_block"),
+            "Unknown block 'minecraft:not_a_real_block'"
+        );
+        assert!(p5f_run(&ctx, "/setblock 0 60 0").starts_with("usage:"));
+        assert!(p5f_run(&ctx, "/setblock 0 60 0 stone sideways").starts_with("usage:"));
+        // Unbalanced glue never reaches the parser: the tokenizer rejects it.
+        assert!(p5f_run(&ctx, "/setblock 0 60 0 stone{oops").starts_with("Invalid command:"));
+        // Balanced but malformed SNBT reaches the parser and fails closed.
+        assert!(p5f_run(&ctx, "/setblock 0 60 0 stone{oops}").starts_with("Invalid block entity data"));
+        assert_eq!(
+            p5f_run(&ctx, "/setblock 0 400 0 stone"),
+            "Block position is outside the world"
+        );
+    }
+
+    #[test]
+    fn p5f_parity_setblock_keep_destroy_replace_and_snbt() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let ctx = p5f_ctx(None);
+        let stone = name_to_state("minecraft:stone").unwrap();
+        let gold = name_to_state("minecraft:gold_block").unwrap();
+        let pos = (30, 80, 30);
+        assert!(p5f_run(&ctx, "/setblock 30 80 30 minecraft:stone").starts_with("Set block"));
+        // keep refuses to overwrite a non-air block, works on air.
+        assert_eq!(
+            p5f_run(&ctx, "/setblock 30 80 30 minecraft:gold_block keep"),
+            "Could not set the block"
+        );
+        assert_eq!(block_at_dim(DimId::Overworld, pos.0, pos.1, pos.2), stone);
+        assert!(p5f_run(&ctx, "/setblock 31 80 30 minecraft:gold_block keep").starts_with("Set block"));
+        assert_eq!(block_at_dim(DimId::Overworld, 31, 80, 30), gold);
+        // destroy drops the old block then replaces it.
+        let drops_before = drops().lock().unwrap().len();
+        assert!(p5f_run(&ctx, "/setblock 30 80 30 minecraft:gold_block destroy").starts_with("Set block"));
+        assert_eq!(block_at_dim(DimId::Overworld, pos.0, pos.1, pos.2), gold);
+        let gained = drops().lock().unwrap().len() - drops_before;
+        assert!(gained >= 1, "destroy should have dropped the old block");
+        // replace is the default.
+        assert!(p5f_run(&ctx, "/setblock 31 80 30 minecraft:stone").starts_with("Set block"));
+        assert_eq!(block_at_dim(DimId::Overworld, 31, 80, 30), stone);
+        // A glued {snbt} payload files Items into the container store.
+        let reply = p5f_run(
+            &ctx,
+            r#"/setblock 32 80 30 minecraft:chest{Items:[{id:"minecraft:stone",Count:3b,Slot:2b}]}"#,
+        );
+        assert!(reply.starts_with("Set block"), "{reply}");
+        let slots = chests()
+            .lock()
+            .unwrap()
+            .get(&ContainerKey::Block((DimId::Overworld, 32, 80, 30)))
+            .cloned()
+            .unwrap_or_default();
+        let stone_item = name_to_item("stone").unwrap();
+        assert_eq!(slots.get(&2).map(|s| (s.0, s.1)), Some((stone_item, 3)));
+        // A bare {snbt} token works the same way.
+        let reply = p5f_run(
+            &ctx,
+            r#"/setblock 33 80 30 minecraft:chest {Items:[{id:"minecraft:diamond",Count:1b,Slot:0b}]} keep"#,
+        );
+        assert!(reply.starts_with("Set block"), "{reply}");
+        let slots = chests()
+            .lock()
+            .unwrap()
+            .get(&ContainerKey::Block((DimId::Overworld, 33, 80, 30)))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            slots.get(&0).map(|s| (s.0, s.1)),
+            Some((name_to_item("diamond").unwrap(), 1))
+        );
+    }
+
+    // #98 — one quote/bracket/brace-aware tokenizer for every command path.
+    #[test]
+    fn p5f_parity_split_command_args_quotes_brackets_and_braces() {
+        let args = split_command_args(
+            r#"setblock 0 64 0 chest{Items:[{id:"minecraft:stone"}]} keep"#,
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            [
+                "setblock",
+                "0",
+                "64",
+                "0",
+                r#"chest{Items:[{id:"minecraft:stone"}]}"#,
+                "keep"
+            ]
+        );
+        let args = split_command_args(r#"tp @e[name="My Mob",limit=1] 0 64 0"#).unwrap();
+        assert_eq!(args[1], r#"@e[name="My Mob",limit=1]"#);
+        let args = split_command_args("give @s \"quoted item\"").unwrap();
+        assert_eq!(args[2], "\"quoted item\"");
+        let args = split_command_args("give @s \"say \\\"hi\\\"\"").unwrap();
+        assert_eq!(args[2], "\"say \\\"hi\\\"\"");
+        assert!(split_command_args("setblock 0 0 0 stone{").is_err());
+        assert!(split_command_args("tp @e[name=a 0 0 0").is_err());
+        // The dispatcher uses it too: an unbalanced quote errors instead of
+        // silently splitting mid-token.
+        let _world = world_guard();
+        let ctx = p5f_ctx(None);
+        assert!(p5f_run(&ctx, "/setblock 0 60 0 \"stone").starts_with("Invalid command:"));
+        // ...and execute tails resolve the same way: the SNBT token survives.
+        let err = p5f_run(&ctx, "/execute run setblock 0 60 0 chest{Items:[");
+        assert!(err.starts_with("Invalid command:"), "{err}");
+    }
+
+    // #165 — `/datapack enable` files the pack at the requested position and
+    // `/datapack list enabled` reports the explicit order.
+    #[test]
+    fn p5f_parity_datapack_enable_ordering() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let work = std::env::temp_dir().join(format!("spine-p5f-dp-{}", std::process::id()));
+        let root = work.join("datapacks");
+        for pack in ["alpha", "beta", "gamma"] {
+            std::fs::create_dir_all(root.join(format!("{pack}/data/p5f/function"))).unwrap();
+        }
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&work).unwrap();
+        let ctx = p5f_ctx(None);
+        assert_eq!(p5f_run(&ctx, "/reload"), "Reloading! (3 pack(s))");
+        assert_eq!(p5f_run(&ctx, "/datapack list enabled"), "3 packs: alpha, beta, gamma");
+
+        // first|last file at the ends.
+        assert_eq!(
+            p5f_run(&ctx, "/datapack disable beta"),
+            "Disabled datapack 'beta'. Reloading! (2 pack(s))"
+        );
+        assert!(p5f_run(&ctx, "/datapack enable beta first").starts_with("Enabled datapack 'beta'"));
+        assert_eq!(p5f_run(&ctx, "/datapack list enabled"), "3 packs: beta, alpha, gamma");
+        assert!(p5f_run(&ctx, "/datapack disable beta").starts_with("Disabled datapack"));
+        assert!(p5f_run(&ctx, "/datapack enable beta last").starts_with("Enabled datapack 'beta'"));
+        assert_eq!(p5f_run(&ctx, "/datapack list enabled"), "3 packs: alpha, gamma, beta");
+
+        // before|after anchor inside the enabled set.
+        assert!(p5f_run(&ctx, "/datapack disable beta").starts_with("Disabled datapack"));
+        assert!(p5f_run(&ctx, "/datapack enable beta before gamma").starts_with("Enabled datapack 'beta'"));
+        assert_eq!(p5f_run(&ctx, "/datapack list enabled"), "3 packs: alpha, beta, gamma");
+        assert!(p5f_run(&ctx, "/datapack disable gamma").starts_with("Disabled datapack"));
+        assert!(p5f_run(&ctx, "/datapack enable gamma after beta").starts_with("Enabled datapack 'gamma'"));
+        assert_eq!(p5f_run(&ctx, "/datapack list enabled"), "3 packs: alpha, beta, gamma");
+
+        // A non-enabled anchor fails closed — nothing is enabled or reordered.
+        assert!(p5f_run(&ctx, "/datapack disable beta").starts_with("Disabled datapack"));
+        assert_eq!(
+            p5f_run(&ctx, "/datapack enable beta before delta"),
+            "Pack 'delta' is not enabled"
+        );
+        assert_eq!(p5f_run(&ctx, "/datapack list enabled"), "2 packs: alpha, gamma");
+        assert_eq!(p5f_run(&ctx, "/datapack list available"), "1 packs: beta");
+        assert_eq!(
+            p5f_run(&ctx, "/datapack enable beta before beta"),
+            "Pack 'beta' is not enabled"
+        );
+        assert_eq!(
+            p5f_run(&ctx, "/datapack enable beta sideways"),
+            "usage: /datapack enable <name> [first|last|before <existing>|after <existing>]"
+        );
+        assert!(p5f_run(&ctx, "/datapack enable beta").starts_with("Enabled datapack 'beta'"));
+        assert_eq!(p5f_run(&ctx, "/datapack list enabled"), "3 packs: alpha, gamma, beta");
+
+        std::env::set_current_dir(&previous).unwrap();
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    // #175 — entity destination, explicit rotation, and `facing` all compute
+    // the exact vanilla angles and move every supported subject kind.
+    #[test]
+    fn p5f_parity_tp_look_angles_match_vanilla() {
+        // yaw = atan2(-dx, dz); pitch = atan2(-dy, hypot(dx, dz)) in degrees.
+        let (yaw, pitch) = tp_look_angles([0.0, 64.0, 0.0], [0.0, 64.0, 10.0]);
+        assert_eq!((yaw, pitch), (0.0, 0.0));
+        let (yaw, pitch) = tp_look_angles([0.0, 64.0, 0.0], [10.0, 64.0, 0.0]);
+        assert_eq!((yaw, pitch), (-90.0, 0.0));
+        let (yaw, pitch) = tp_look_angles([0.0, 64.0, 0.0], [0.0, 60.0, 0.0]);
+        assert_eq!((yaw, pitch), (0.0, 90.0));
+        let (yaw, pitch) = tp_look_angles([0.0, 64.0, 0.0], [0.0, 68.0, 0.0]);
+        assert_eq!((yaw, pitch), (0.0, -90.0));
+        let (yaw, _) = tp_look_angles([0.0, 0.0, 0.0], [-1.0, 0.0, -1.0]);
+        assert_eq!(yaw, 135.0);
+        assert_eq!(TpAngle::parse("~").map(|a| a.resolve(30.0)), Some(30.0));
+        assert_eq!(TpAngle::parse("~15").map(|a| a.resolve(30.0)), Some(45.0));
+        assert_eq!(TpAngle::parse("45").map(|a| a.resolve(30.0)), Some(45.0));
+        assert!(TpAngle::parse("bogus").is_none());
+        assert!(TpAngle::parse("NaN").is_none());
+    }
+
+    #[test]
+    fn p5f_parity_tp_coordinates_rotation_facing_and_entity_dest() {
+        let _world = world_guard();
+        let (a, _ra) = p5f_client(9101, "p5f-a", 0.5, 16.0, 0.5);
+        let (b, _rb) = p5f_client(9102, "p5f-b", 100.5, 70.0, -50.5);
+        clients().lock().unwrap().extend([a.clone(), b.clone()]);
+        let ctx = p5f_ctx(None);
+
+        // coords + explicit rotation
+        assert_eq!(p5f_run(&ctx, "/tp p5f-a 10 64 -20 90 -45"), "Teleported 1 target(s)");
+        let p = *a.pos.lock().unwrap();
+        assert_eq!((p.0, p.1, p.2), (10.0, 64.0, -20.0));
+        assert_eq!((p.3, p.4), (90.0, -45.0));
+        // no rotation keeps the current one
+        assert_eq!(p5f_run(&ctx, "/tp p5f-a 1 65 2"), "Teleported 1 target(s)");
+        let p = *a.pos.lock().unwrap();
+        assert_eq!((p.0, p.1, p.2), (1.0, 65.0, 2.0));
+        assert_eq!((p.3, p.4), (90.0, -45.0));
+        // relative rotation ~ wraps like vanilla
+        assert_eq!(p5f_run(&ctx, "/tp p5f-a 1 65 2 ~90 ~"), "Teleported 1 target(s)");
+        let p = *a.pos.lock().unwrap();
+        assert_eq!((p.3, p.4), (-180.0, -45.0));
+
+        // facing a point: aimed from the subject's feet at the new position
+        assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing 0 64 10"), "Teleported 1 target(s)");
+        let p = *a.pos.lock().unwrap();
+        assert_eq!((p.3, p.4), (0.0, 0.0));
+        assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing 10 64 0"), "Teleported 1 target(s)");
+        let p = *a.pos.lock().unwrap();
+        assert_eq!((p.3, p.4), (-90.0, 0.0));
+        assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing 0 60 0"), "Teleported 1 target(s)");
+        let p = *a.pos.lock().unwrap();
+        assert_eq!((p.3, p.4), (0.0, 90.0));
+
+        // facing entity feet vs eyes: the eyes anchor adds the eye height.
+        let (bx, by, bz) = (100.5, 70.0, -50.5);
+        let (expect_yaw, expect_pitch) =
+            tp_look_angles([0.0, 64.0, 0.0], [bx, by, bz]);
+        assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing entity p5f-b feet"), "Teleported 1 target(s)");
+        let p = *a.pos.lock().unwrap();
+        assert_eq!((p.3, p.4), (expect_yaw, expect_pitch));
+        let (expect_yaw, expect_pitch) =
+            tp_look_angles([0.0, 64.0, 0.0], [bx, by + 1.62, bz]);
+        assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing entity p5f-b eyes"), "Teleported 1 target(s)");
+        let p = *a.pos.lock().unwrap();
+        assert_eq!((p.3, p.4), (expect_yaw, expect_pitch));
+
+        // entity destination adopts the destination's position AND rotation
+        *b.pos.lock().unwrap() = (5.0, 65.0, 7.0, 45.0, -30.0, true);
+        assert_eq!(p5f_run(&ctx, "/tp p5f-a p5f-b"), "Teleported 1 target(s)");
+        let p = *a.pos.lock().unwrap();
+        assert_eq!((p.0, p.1, p.2, p.3, p.4), (5.0, 65.0, 7.0, 45.0, -30.0));
+        // selector subjects and selector destination
+        assert_eq!(
+            p5f_run(&ctx, "/tp @a[name=p5f-a] @a[name=p5f-b]"),
+            "Teleported 1 target(s)"
+        );
+        let p = *a.pos.lock().unwrap();
+        assert_eq!((p.0, p.1, p.2), (5.0, 65.0, 7.0));
+
+        // mobs move and broadcast the entity-teleport packet path
+        assert!(insert_live_mob(
+            name_to_etype("zombie").unwrap(),
+            DimId::Overworld,
+            (1.0, 16.0, 1.0, 0.0, 0.0),
+            20.0,
+            None,
+        ));
+        let zeid = mobs().lock().unwrap().last().unwrap().eid;
+        assert_eq!(p5f_run(&ctx, "/tp @e[type=zombie] p5f-b"), "Teleported 1 target(s)");
+        let zombie = mobs()
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.eid == zeid)
+            .cloned()
+            .unwrap();
+        let zp = *zombie.pos.lock().unwrap();
+        assert_eq!((zp.0, zp.1, zp.2), (5.0, 65.0, 7.0));
+        assert_eq!((zp.3, zp.4), (45.0, -30.0));
+
+        // fake actors keep working as subjects
+        {
+            let mut actors = actors().lock().unwrap();
+            actors.insert(
+                "p5f-actor".to_owned(),
+                Arc::new(Actor {
+                    name: "p5f-actor".into(),
+                    eid: 9901,
+                    pos: Mutex::new((0.0, 0.0, 0.0)),
+                    look: Mutex::new(None),
+                    action: Mutex::new(""),
+                    held: Mutex::new((0, 0, Vec::new())),
+                    inv: Mutex::new(HashMap::new()),
+                }),
+            );
+        }
+        assert_eq!(p5f_run(&ctx, "/tp p5f-actor 8 70 9"), "Teleported 1 target(s)");
+        assert_eq!(
+            *actors().lock().unwrap().get("p5f-actor").unwrap().pos.lock().unwrap(),
+            (8.0, 70.0, 9.0)
+        );
+        actors().lock().unwrap().remove("p5f-actor");
+
+        // failure modes
+        assert!(insert_live_mob(
+            name_to_etype("zombie").unwrap(),
+            DimId::Overworld,
+            (2.0, 16.0, 2.0, 0.0, 0.0),
+            20.0,
+            None,
+        ));
+        let zeid2 = mobs().lock().unwrap().last().unwrap().eid;
+        assert_eq!(
+            p5f_run(&ctx, "/tp @e[type=zombie] @e[type=zombie]"),
+            "Only one entity is allowed"
+        );
+        assert_eq!(p5f_run(&ctx, "/tp p5f-missing 0 0 0"), "No entity was found");
+        assert!(p5f_run(&ctx, "/tp").starts_with("usage:"));
+        assert!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing entity p5f-b eyes junk").starts_with("usage:"));
+        assert!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing 0 0").starts_with("usage:"));
+
+        mobs().lock().unwrap().retain(|m| m.eid != zeid && m.eid != zeid2);
+        clients()
+            .lock()
+            .unwrap()
+            .retain(|c| c.eid != a.eid && c.eid != b.eid);
+    }
+
+    // #176 — every target mode x every source mode parses and dispatches.
+    #[test]
+    fn p5f_parity_loot_spawn_give_replace_entity_sources() {
+        let _world = world_guard();
+        let ctx = p5f_ctx(None);
+        let diamond = name_to_item("diamond").unwrap();
+        let emerald = name_to_item("emerald").unwrap();
+        loot_tables()
+            .lock()
+            .unwrap()
+            .insert("p5f:fixed".to_owned(), p5f_loot_table(diamond));
+
+        // spawn + loot table source
+        let before = drops().lock().unwrap().len();
+        assert_eq!(
+            p5f_run(&ctx, "/loot spawn 5 64 5 loot p5f:fixed"),
+            "Dropped 1 item stack(s)"
+        );
+        let drop = drops().lock().unwrap().pop().unwrap();
+        assert_eq!((drop.item, drop.cnt), (diamond, 1));
+        assert_eq!(drops().lock().unwrap().len(), before);
+
+        // spawn + fish source (table + position + tool)
+        assert_eq!(
+            p5f_run(&ctx, "/loot spawn 5 64 5 fish p5f:fixed 0 64 0 minecraft:fishing_rod"),
+            "Dropped 1 item stack(s)"
+        );
+        let drop = drops().lock().unwrap().pop().unwrap();
+        assert_eq!((drop.item, drop.cnt), (diamond, 1));
+        assert_eq!(drops().lock().unwrap().len(), before);
+
+        // spawn + kill by entity type name: the cow fallback drops its pair.
+        let before = drops().lock().unwrap().len();
+        let reply = p5f_run(&ctx, "/loot spawn 5 64 5 kill minecraft:cow");
+        assert!(reply.starts_with("Dropped"), "{reply}");
+        let gained = drops().lock().unwrap().len() - before;
+        assert!(gained >= 1, "cow kill source should drop something");
+        drops().lock().unwrap().truncate(before);
+
+        // kill via a live entity selector
+        assert!(insert_live_mob(
+            name_to_etype("pig").unwrap(),
+            DimId::Overworld,
+            (3.0, 16.0, 3.0, 0.0, 0.0),
+            10.0,
+            None,
+        ));
+        let peid = mobs().lock().unwrap().last().unwrap().eid;
+        let before = drops().lock().unwrap().len();
+        let reply = p5f_run(&ctx, "/loot spawn 5 64 5 kill @e[type=pig]");
+        assert!(reply.starts_with("Dropped"), "{reply}");
+        assert!(drops().lock().unwrap().len() > before);
+        drops().lock().unwrap().truncate(before);
+        assert_eq!(
+            p5f_run(&ctx, "/loot spawn 5 64 5 kill @e[type=zombie]"),
+            "No entity was found"
+        );
+
+        // give source into a player inventory
+        let (c, _rc) = p5f_client(9201, "p5f-loot", 0.5, 16.0, 0.5);
+        clients().lock().unwrap().push(c.clone());
+        assert_eq!(
+            p5f_run(&ctx, "/loot give p5f-loot loot p5f:fixed"),
+            "Gave 1 item stack(s)"
+        );
+        assert!(c
+            .inv
+            .lock()
+            .unwrap()
+            .values()
+            .any(|(it, cnt, _)| *it == diamond && *cnt == 1));
+
+        // replace entity <slot> writes the first rolled stack
+        loot_tables()
+            .lock()
+            .unwrap()
+            .insert("p5f:emerald".to_owned(), p5f_loot_table(emerald));
+        assert_eq!(
+            p5f_run(&ctx, "/loot replace entity p5f-loot weapon.mainhand loot p5f:emerald"),
+            "Replaced 1 slot(s)"
+        );
+        let held = 36 + *c.held.lock().unwrap();
+        assert_eq!(
+            c.inv.lock().unwrap().get(&held).map(|s| (s.0, s.1)),
+            Some((emerald, 1))
+        );
+        clients().lock().unwrap().retain(|cl| cl.eid != c.eid);
+        mobs().lock().unwrap().retain(|m| m.eid != peid);
+        loot_tables().lock().unwrap().remove("p5f:fixed");
+        loot_tables().lock().unwrap().remove("p5f:emerald");
+
+        // unknown table / entity fail closed
+        assert_eq!(
+            p5f_run(&ctx, "/loot spawn 0 64 0 loot p5f:missing"),
+            "Unknown loot table 'p5f:missing'"
+        );
+        assert_eq!(
+            p5f_run(&ctx, "/loot spawn 0 64 0 kill minecraft:not_an_entity"),
+            "Unknown entity 'minecraft:not_an_entity'"
+        );
+        assert!(p5f_run(&ctx, "/loot").starts_with("usage:"));
+        assert!(p5f_run(&ctx, "/loot spawn 0 64 0").starts_with("usage:"));
+    }
+
+    #[test]
+    fn p5f_parity_loot_insert_replace_block_and_mine() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let ctx = p5f_ctx(None);
+        let diamond = name_to_item("diamond").unwrap();
+        loot_tables()
+            .lock()
+            .unwrap()
+            .insert("p5f:chest".to_owned(), p5f_loot_table(diamond));
+
+        // insert requires a real container block
+        assert_eq!(
+            p5f_run(&ctx, "/loot insert 40 80 40 loot p5f:chest"),
+            "The target block is not a container"
+        );
+        assert!(p5f_run(&ctx, "/setblock 40 80 40 minecraft:chest").starts_with("Set block"));
+        assert_eq!(
+            p5f_run(&ctx, "/loot insert 40 80 40 loot p5f:chest"),
+            "Inserted 1 item stack(s)"
+        );
+        let slots = chests()
+            .lock()
+            .unwrap()
+            .get(&ContainerKey::Block((DimId::Overworld, 40, 80, 40)))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(slots.get(&0).map(|s| (s.0, s.1)), Some((diamond, 1)));
+
+        // replace block <slot> writes exactly that slot
+        assert_eq!(
+            p5f_run(&ctx, "/loot replace block 40 80 40 container.5 loot p5f:chest"),
+            "Replaced 1 slot(s)"
+        );
+        let slots = chests()
+            .lock()
+            .unwrap()
+            .get(&ContainerKey::Block((DimId::Overworld, 40, 80, 40)))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(slots.get(&5).map(|s| (s.0, s.1)), Some((diamond, 1)));
+
+        // mine rolls the block's drop table
+        assert!(p5f_run(&ctx, "/setblock 41 80 40 minecraft:diamond_ore").starts_with("Set block"));
+        let before = drops().lock().unwrap().len();
+        let reply = p5f_run(&ctx, "/loot spawn 42 80 40 mine 41 80 40");
+        assert!(reply.starts_with("Dropped"), "{reply}");
+        let gained: Vec<Drop> = drops().lock().unwrap().split_off(before);
+        assert!(!gained.is_empty(), "mining diamond_ore should drop");
+
+        // spawn + mine with an explicit tool token parses too
+        let reply = p5f_run(&ctx, "/loot spawn 42 80 40 mine 41 80 40 minecraft:diamond_pickaxe");
+        assert!(reply.starts_with("Dropped"), "{reply}");
+        drops().lock().unwrap().truncate(before);
+        assert_eq!(
+            p5f_run(&ctx, "/loot spawn 42 80 40 mine 41 80 40 minecraft:not_a_tool"),
+            "Unknown item 'minecraft:not_a_tool'"
+        );
+
+        loot_tables().lock().unwrap().remove("p5f:chest");
+    }
+
+    // Bonus — `execute store result` now sees 1 vs 0 for /forceload query.
+    #[test]
+    fn p5f_parity_forceload_query_execute_store_result() {
+        let _world = world_guard();
+        let ctx = p5f_ctx(None);
+        let previous = std::mem::replace(&mut *forceloaded().lock().unwrap(), HashSet::new());
+        assert_eq!(
+            p5f_run(&ctx, "/scoreboard objectives add p5f dummy"),
+            "Added objective p5f"
+        );
+        // not force-loaded -> 0
+        assert_eq!(
+            p5f_run(&ctx, "/execute store result score holder p5f run forceload query 7 9"),
+            "Stored 0 in p5f for holder"
+        );
+        assert_eq!(scoreboard().lock().unwrap().get("holder", "p5f"), Some(0));
+        // force-loaded -> 1
+        assert!(p5f_run(&ctx, "/forceload add 7 9").contains("force"));
+        assert_eq!(
+            p5f_run(&ctx, "/execute store result score holder p5f run forceload query 7 9"),
+            "Stored 1 in p5f for holder"
+        );
+        assert_eq!(scoreboard().lock().unwrap().get("holder", "p5f"), Some(1));
+        // direct mapping sanity for the bare-count query as well
+        assert_eq!(
+            execute_legacy_result("forceload", "Chunk 7, 9 is force loaded"),
+            Some(1)
+        );
+        assert_eq!(
+            execute_legacy_result("forceload", "Chunk 7, 9 is not force loaded"),
+            Some(0)
+        );
+        assert_eq!(
+            execute_legacy_result("forceload", "3 forceloaded chunk(s)"),
+            Some(3)
+        );
+        p5f_run(&ctx, "/forceload remove all");
+        scoreboard().lock().unwrap().remove_objective("p5f");
+        *forceloaded().lock().unwrap() = previous;
     }
 }

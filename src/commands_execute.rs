@@ -2187,11 +2187,14 @@ fn execute_run(
         }
         _ => {}
     }
-    let mut args: Vec<String> = if matches!(name, "scoreboard" | "data" | "tag" | "kill") {
-        brigadier::split_command_args_preserving_quotes(tail)?
-    } else {
-        tail.split_whitespace().map(str::to_owned).collect()
-    };
+    // #98 — execute tails tokenize with the same quote/bracket-aware splitter
+    // as top-level commands, so `execute run setblock x y z chest{...}` keeps
+    // its SNBT and quoted arguments intact. Greedy tails (say/tellraw-style
+    // malformed quotes) fall back to whitespace: the tokens only feed the
+    // coordinate pre-resolution below, and the dispatched command string is
+    // re-tokenized by `run_command_ctx`, which reports strict errors itself.
+    let mut args: Vec<String> = split_command_args(tail)
+        .unwrap_or_else(|_| tail.split_whitespace().map(str::to_owned).collect());
     let parts: Vec<&str> = args.iter().map(String::as_str).collect();
     match (name, parts.as_slice()) {
         ("scoreboard", ["players", _, _, ..]) => return execute_run_scoreboard(source, &parts, s),
@@ -2418,6 +2421,11 @@ fn execute_legacy_result(name: &str, reply: &str) -> Option<i32> {
             .strip_prefix("Reset ")
             .and_then(parse_first)
             .or_else(|| parse_first(reply)),
+        // `/forceload query <x> <z>` reports 1 when the chunk is force-loaded,
+        // 0 when it is not; the bare query reports the chunk count.
+        "forceload" if reply.contains(" is not force loaded") => Some(0),
+        "forceload" if reply.contains(" is force loaded") => Some(1),
+        "forceload" => parse_first(reply),
         _ => None,
     };
     if matches!(
