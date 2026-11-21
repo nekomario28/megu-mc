@@ -71,7 +71,7 @@ fn read_before(s: &mut TcpStream, mut out: &mut [u8], deadline: Instant) -> Opti
             return None;
         }
         if let Some(cipher) = conn_cipher(s) {
-            cipher.rx.lock().unwrap().decrypt(&mut out[..n]);
+            cipher.rx.lock().unwrap_or_else(|e| e.into_inner()).decrypt(&mut out[..n]);
         }
         out = &mut out[n..];
     }
@@ -208,7 +208,7 @@ impl RxBuf {
             Ok(0) => RxOut::Closed,
             Ok(n) => {
                 if let Some(cipher) = conn_cipher(s) {
-                    cipher.rx.lock().unwrap().decrypt(&mut tmp[..n]);
+                    cipher.rx.lock().unwrap_or_else(|e| e.into_inner()).decrypt(&mut tmp[..n]);
                 }
                 self.buf.extend(&tmp[..n]);
                 match self.try_frame() {
@@ -436,7 +436,7 @@ fn socket_wire() -> &'static Mutex<HashMap<u64, SocketWireState>> {
 }
 
 fn with_play_wire<T>(socket: &TcpStream, f: impl FnOnce(&mut PlayWireState) -> T) -> Option<T> {
-    let mut states = SOCKET_WIRE.get()?.lock().unwrap();
+    let mut states = SOCKET_WIRE.get()?.lock().unwrap_or_else(|e| e.into_inner());
     states.get_mut(&socket_key(socket))?.play.as_mut().map(f)
 }
 
@@ -477,7 +477,7 @@ fn negotiate_compression(
     };
     send_packet(s, 0x03, connection_limits::set_compression(threshold))?;
     let key = socket_key(s);
-    let mut states = socket_wire().lock().unwrap();
+    let mut states = socket_wire().lock().unwrap_or_else(|e| e.into_inner());
     // Merge, not overwrite: online-mode login arms a cipher on this socket
     // before compression is negotiated.
     states.entry(key).or_default().compression = Some(size);
@@ -498,7 +498,7 @@ fn send_packet(s: &mut TcpStream, mut id: i64, mut payload: Vec<u8>) -> std::io:
     }
     let mut send = true;
     let compression = SOCKET_WIRE.get().and_then(|states| {
-        let mut states = states.lock().unwrap();
+        let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
         let state = states.get_mut(&socket_key(s))?;
         if let Some(play) = &mut state.play {
             send = play.update_packet(&mut id, &mut payload, TICK_IDX.load(Ordering::Relaxed));
@@ -525,7 +525,7 @@ fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> st
         }
     };
     if let Some(cipher) = conn_cipher(s) {
-        cipher.tx.lock().unwrap().encrypt(&mut frame);
+        cipher.tx.lock().unwrap_or_else(|e| e.into_inner()).encrypt(&mut frame);
     }
     let result = s.write_all(&frame);
     if result.is_err() {
@@ -767,8 +767,8 @@ impl Client {
         compression: Option<usize>,
         chunk_delivery: connection_limits::ChunkDelivery,
     ) {
-        let key = socket_key(&self.sock.lock().unwrap());
-        let mut states = socket_wire().lock().unwrap();
+        let key = socket_key(&self.sock.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut states = socket_wire().lock().unwrap_or_else(|e| e.into_inner());
         // Merge, not overwrite: the encryption handshake may have armed a
         // cipher on this writer fd before the play state existed.
         let state = states.entry(key).or_default();
@@ -780,12 +780,12 @@ impl Client {
     }
 
     fn is_spectator(&self) -> bool {
-        *self.gm.lock().unwrap() == 3
+        *self.gm.lock().unwrap_or_else(|e| e.into_inner()) == 3
     }
     fn touch_aabb(&self) -> EntityAabb {
-        let (px, py, pz, ..) = *self.pos.lock().unwrap();
-        let sneaking = *self.sneaking.lock().unwrap();
-        let fall_fly = *self.fall_fly.lock().unwrap();
+        let (px, py, pz, ..) = *self.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let sneaking = *self.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+        let fall_fly = *self.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
         player_touch_aabb(px, py, pz, sneaking, fall_fly)
     }
 }
@@ -920,15 +920,15 @@ fn load_skin_properties(name: &str) -> Option<(String, String)> {
 /// Give `t` its resolved textures and re-announce it so connected viewers see them.
 fn apply_skin(t: &Arc<Client>, res: Option<(String, String)>) {
     if let Some((v, sig)) = res {
-        *t.skin.lock().unwrap() = Some((v.clone(), sig.clone()));
+        *t.skin.lock().unwrap_or_else(|e| e.into_inner()) = Some((v.clone(), sig.clone()));
         // re-add player info so already-connected viewers pick up the skin
-        let cs = clients().lock().unwrap();
+        let cs = clients().lock().unwrap_or_else(|e| e.into_inner());
         if !cs.iter().any(|c| Arc::ptr_eq(c, t)) {
             return;
         }
         let pi = player_info_add(t);
         for c in cs.iter() {
-            let _ = send_packet(&mut c.sock.lock().unwrap(), 0x3e, pi.clone());
+            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x3e, pi.clone());
         }
     }
 }
@@ -951,7 +951,7 @@ impl std::ops::Drop for SkinLookupSlot {
 fn kick_skin(name: String, target: &Arc<Client>) {
     // Mojang names are case-insensitive; one cache entry per name, not per spelling.
     let key = name.to_ascii_lowercase();
-    let hit = skin_cache_get(&skin_cache().lock().unwrap(), &key, Instant::now());
+    let hit = skin_cache_get(&skin_cache().lock().unwrap_or_else(|e| e.into_inner()), &key, Instant::now());
     if let Some(res) = hit {
         apply_skin(target, res);
         return;
@@ -965,7 +965,7 @@ fn kick_skin(name: String, target: &Arc<Client>) {
         let _slot = slot;
         let r = load_skin_properties(&name);
         skin_cache_put(
-            &mut skin_cache().lock().unwrap(),
+            &mut skin_cache().lock().unwrap_or_else(|e| e.into_inner()),
             key,
             r.clone(),
             Instant::now(),
@@ -980,7 +980,7 @@ fn player_info_add(c: &Client) -> Vec<u8> {
     write_varint(&mut p, 1);
     p.extend_from_slice(&c.uuid);
     write_str(&mut p, &c.name);
-    let skin = c.skin.lock().unwrap().clone();
+    let skin = c.skin.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some((v, sig)) = skin {
         write_varint(&mut p, 1);
         write_str(&mut p, "textures");
@@ -996,7 +996,7 @@ fn player_info_add(c: &Client) -> Vec<u8> {
     p
 }
 fn spawn_player(c: &Client) -> Vec<u8> {
-    let (x, y, z, yaw, pitch, _g) = *c.pos.lock().unwrap();
+    let (x, y, z, yaw, pitch, _g) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
     let mut p = Vec::new();
     write_varint(&mut p, c.eid as i64);
     p.extend_from_slice(&c.uuid);
@@ -1039,7 +1039,7 @@ fn head_rot(eid: i32, yaw: f32) -> Vec<u8> {
 /// before the rule was written down, so the rule is a function rather than a
 /// comment that the next caller has to find.
 fn client_snapshot() -> Vec<Arc<Client>> {
-    clients().lock().unwrap().iter().cloned().collect()
+    clients().lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
 }
 
 /// Send one packet to every client the predicate accepts. The snapshot is taken
@@ -1113,8 +1113,8 @@ fn container_state_stale(me: &Client, wid: u8, click_state_id: i32) -> bool {
 /// authoritative counter advances and every slot is resent, so the client and
 /// server re-agree instead of drifting apart.
 fn resend_container_content(me: &Client, wid: u8) {
-    let inv = me.inv.lock().unwrap().clone();
-    let cursor = me.cursor.lock().unwrap().clone();
+    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let cursor = me.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let empty = Stack::default();
     let mut q = vec![wid];
     match wid {
@@ -1126,12 +1126,12 @@ fn resend_container_content(me: &Client, wid: u8) {
             }
         }
         1 => {
-            let Some(window) = *me.open_chest.lock().unwrap() else {
+            let Some(window) = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner()) else {
                 return;
             };
             let slots = chest_window_slots(window);
             let state_id = {
-                let mut sync = me.chest_sync.lock().unwrap();
+                let mut sync = me.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
                 let sync = sync.get_or_insert_with(|| ChestSyncState {
                     window,
                     anchor: None,
@@ -1152,7 +1152,7 @@ fn resend_container_content(me: &Client, wid: u8) {
             }
         }
         2 => {
-            let Some((dim, x, y, z)) = *me.open_furnace.lock().unwrap() else {
+            let Some((dim, x, y, z)) = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) else {
                 return;
             };
             write_varint(&mut q, i64::from(inv_state_next(me)));
@@ -1165,7 +1165,7 @@ fn resend_container_content(me: &Client, wid: u8) {
             }
         }
         3 => {
-            let craft9 = me.craft9.lock().unwrap().clone();
+            let craft9 = me.craft9.lock().unwrap_or_else(|e| e.into_inner()).clone();
             write_varint(&mut q, i64::from(inv_state_next(me)));
             write_varint(&mut q, 46);
             let result = json_craft_match(&craft9, 3).unwrap_or_default();
@@ -1212,7 +1212,7 @@ fn broadcast_sleep_pose(me: &Client, sleeping: bool, bed: (i32, i32, i32)) {
 /// Wake the player if they are in a bed: clear the state and restore the pose
 /// for observers. Returns true when the player was sleeping.
 fn wake_if_sleeping(me: &Client) -> bool {
-    if let Some(state) = me.sleeping.lock().unwrap().take() {
+    if let Some(state) = me.sleeping.lock().unwrap_or_else(|e| e.into_inner()).take() {
         broadcast_sleep_pose(me, false, state.bed);
         true
     } else {
@@ -1231,7 +1231,7 @@ fn skip_night() {
     THUNDERING.store(0, Ordering::Relaxed);
     let sleepers: Vec<Arc<Client>> = client_snapshot()
         .into_iter()
-        .filter(|c| c.sleeping.lock().unwrap().is_some())
+        .filter(|c| c.sleeping.lock().unwrap_or_else(|e| e.into_inner()).is_some())
         .collect();
     let mut tm = Vec::new();
     tm.extend_from_slice(&0i64.to_be_bytes());
@@ -1239,7 +1239,7 @@ fn skip_night() {
     let mut rain = vec![2u8]; // END_RAINING
     rain.extend_from_slice(&0f32.to_be_bytes());
     for sleeper in sleepers {
-        let bed = sleeper.sleeping.lock().unwrap().take().map_or((0, 0, 0), |s| s.bed);
+        let bed = sleeper.sleeping.lock().unwrap_or_else(|e| e.into_inner()).take().map_or((0, 0, 0), |s| s.bed);
         broadcast_sleep_pose(&sleeper, false, bed);
         if let Ok(mut w) = sleeper.sock.lock() {
             let _ = send_packet(&mut w, 0x64, tm.clone());
@@ -1258,11 +1258,11 @@ fn sleep_tick() {
     let clients = client_snapshot();
     let mut any_ready = false;
     for c in &clients {
-        let mut sl = c.sleeping.lock().unwrap();
+        let mut sl = c.sleeping.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut state) = *sl else {
             continue;
         };
-        let last_hurt = *c.last_hurt.lock().unwrap();
+        let last_hurt = *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner());
         if last_hurt > state.last_hurt {
             let bed = state.bed;
             *sl = None;
@@ -1283,9 +1283,9 @@ fn sleep_tick() {
     // denominator; `playersSleepingPercentage` > 100 can never be met.
     let (sleeping, all) = clients
         .iter()
-        .filter(|c| *c.dim.lock().unwrap() == DimId::Overworld)
+        .filter(|c| *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == DimId::Overworld)
         .fold((0i64, 0i64), |(s, a), c| {
-            (s + i64::from(c.sleeping.lock().unwrap().is_some()), a + 1)
+            (s + i64::from(c.sleeping.lock().unwrap_or_else(|e| e.into_inner()).is_some()), a + 1)
         });
     if all == 0 {
         return;
@@ -1308,10 +1308,10 @@ fn sleep_tick() {
 /// observers see the lying-down animation. Actual time travel happens in
 /// `sleep_tick` after 100 slept ticks.
 fn enter_bed(me: &Client, x: i32, y: i32, z: i32) {
-    *me.sleeping.lock().unwrap() = Some(Sleeping {
+    *me.sleeping.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sleeping {
         bed: (x, y, z),
         ticks: 0,
-        last_hurt: *me.last_hurt.lock().unwrap(),
+        last_hurt: *me.last_hurt.lock().unwrap_or_else(|e| e.into_inner()),
     });
     broadcast_sleep_pose(me, true, (x, y, z));
 }
@@ -1376,7 +1376,7 @@ fn interest_tick() {
             ),
         );
     }
-    for frame in generated_content().lock().unwrap().frames.iter() {
+    for frame in generated_content().lock().unwrap_or_else(|e| e.into_inner()).frames.iter() {
         let frame = frame.clone();
         let [x, y, z] = frame.pos().expect("validated generated frame");
         queue(
@@ -1402,8 +1402,8 @@ fn interest_tick() {
         );
     }
     let mut live_eids = HashSet::new();
-    for m in mobs().lock().unwrap().iter() {
-        let p = *m.pos.lock().unwrap();
+    for m in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let p = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
         let m = m.clone();
         live_eids.insert(m.eid);
         queue(
@@ -1454,7 +1454,7 @@ fn interest_tick() {
             ),
         );
     }
-    for &projectile in live_mob_projectiles().lock().unwrap().iter() {
+    for &projectile in live_mob_projectiles().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let [x, y, z] = projectile.pos;
         queue(
             projectile.dim,
@@ -1468,7 +1468,7 @@ fn interest_tick() {
             ),
         );
     }
-    for cloud in live_dragon_clouds().lock().unwrap().iter() {
+    for cloud in live_dragon_clouds().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, [x, y, z]) = (cloud.eid, cloud.pos);
         queue(
             cloud.dim,
@@ -1482,7 +1482,7 @@ fn interest_tick() {
             ),
         );
     }
-    for d in drops().lock().unwrap().iter() {
+    for d in drops().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z, item, cnt, comps) =
             (d.eid, d.x, d.y, d.z, d.item, d.cnt, d.comps.clone());
         queue(
@@ -1511,7 +1511,7 @@ fn interest_tick() {
             ),
         );
     }
-    for a in arrows().lock().unwrap().iter() {
+    for a in arrows().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let a2 = Arrow {
             eid: a.eid,
             owner: a.owner,
@@ -1545,7 +1545,7 @@ fn interest_tick() {
             ),
         );
     }
-    for b in bobbers().lock().unwrap().iter() {
+    for b in bobbers().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z) = (b.eid, b.x, b.y, b.z);
         queue(
             DimId::Overworld,
@@ -1559,7 +1559,7 @@ fn interest_tick() {
             ),
         );
     }
-    for p in pearls().lock().unwrap().iter() {
+    for p in pearls().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z) = (p.eid, p.x, p.y, p.z);
         queue(
             DimId::Overworld,
@@ -1573,7 +1573,7 @@ fn interest_tick() {
             ),
         );
     }
-    for sb in snowballs().lock().unwrap().iter() {
+    for sb in snowballs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z) = (sb.eid, sb.x, sb.y, sb.z);
         queue(
             DimId::Overworld,
@@ -1601,7 +1601,7 @@ fn interest_tick() {
             ),
         );
     }
-    for t in primed().lock().unwrap().iter() {
+    for t in primed().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z) = (t.eid, t.x, t.y, t.z);
         queue(
             DimId::Overworld,
@@ -1615,7 +1615,7 @@ fn interest_tick() {
             ),
         );
     }
-    for f in falling().lock().unwrap().iter() {
+    for f in falling().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z, state) = (f.eid, f.x, f.y, f.z, f.state);
         queue(
             DimId::Overworld,
@@ -1629,7 +1629,7 @@ fn interest_tick() {
             ),
         );
     }
-    for o in xps().lock().unwrap().iter() {
+    for o in xps().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z, val) = (o.eid, o.x, o.y, o.z, o.val);
         queue(
             DimId::Overworld,
@@ -1689,17 +1689,17 @@ fn interest_tick() {
 /// pending state instead.
 fn dig_progress_tick(cls: &[Arc<Client>]) {
     for c in cls {
-        let Some(dig) = *c.dig.lock().unwrap() else {
+        let Some(dig) = *c.dig.lock().unwrap_or_else(|e| e.into_inner()) else {
             continue;
         };
         let (dim, x, y, z) = dig.pos;
         let current = block_at_dim(dim, x, y, z);
         if current != dig.state {
-            *c.dig.lock().unwrap() = None;
+            *c.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
             continue;
         }
         if dig.started.elapsed().as_secs_f32() >= dig.seconds {
-            *c.dig.lock().unwrap() = None;
+            *c.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
             finish_block_break(c, dim, x, y, z, dig.state);
         }
     }
@@ -1778,10 +1778,10 @@ fn pick_item_plan(
 /// block, `Inventory.pick` its stack into the selection, then resync the
 /// touched slots and the carried-item index the way vanilla's packet does.
 fn pick_item(me: &Arc<Client>, held_slot: &mut i16) {
-    let (px, py, pz, yaw, pitch, _) = *me.pos.lock().unwrap();
-    let creative = *me.gm.lock().unwrap() == 1;
+    let (px, py, pz, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
     let reach = if creative { 5.6f64 } else { 4.9 };
-    let dim = *me.dim.lock().unwrap();
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
     let Some((bx, by, bz)) = ray_pick_block(dim, px, py + 1.62, pz, yaw, pitch, reach)
     else {
         return;
@@ -1795,16 +1795,16 @@ fn pick_item(me: &Arc<Client>, held_slot: &mut i16) {
     };
     let selected = 36 + *held_slot;
     let plan = {
-        let inv = me.inv.lock().unwrap();
+        let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         pick_item_plan(&inv, item, creative)
     };
     match plan {
         Some(PickItemPlan::Select(slot)) => {
             *held_slot = slot - 36;
-            *me.held.lock().unwrap() = *held_slot;
+            *me.held.lock().unwrap_or_else(|e| e.into_inner()) = *held_slot;
         }
         Some(PickItemPlan::Swap(slot)) => {
-            let mut inv = me.inv.lock().unwrap();
+            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             let held_stack = inv.get(&selected).cloned().unwrap_or((0, 0, Vec::new()));
             let match_stack = inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
             inv.insert(selected, match_stack);
@@ -1833,13 +1833,13 @@ fn pick_item(me: &Arc<Client>, held_slot: &mut i16) {
             }
         }
         Some(PickItemPlan::FillCreative) => {
-            me.inv.lock().unwrap().insert(selected, (item, 1, Vec::new()));
+            me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(selected, (item, 1, Vec::new()));
             held_slot_resync(me);
         }
         None => return,
     }
     // Vanilla closes `handlePickItem` with ClientboundSetHeldSlotPacket.
-    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x53, vec![*held_slot as u8]);
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x53, vec![*held_slot as u8]);
 }
 
 /// `can_place_on`/`can_break` component ids (protocol 767 data-component
@@ -1990,13 +1990,13 @@ fn try_toggle_trapdoor(dim: DimId, x: i32, y: i32, z: i32) -> bool {
 /// destroy progress that runs after START_DESTROY_BLOCK.
 fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old: u32) {
     let held = {
-        let held_slot = *me.held.lock().unwrap();
-        let inv = me.inv.lock().unwrap();
+        let held_slot = *me.held.lock().unwrap_or_else(|e| e.into_inner());
+        let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         inv.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new()))
     };
     // Vanilla rechecks mayDestroy in `destroyAndAck`: an adventure-mode dig
     // still finishes only while the held stack's can_break matches.
-    if *me.gm.lock().unwrap() == 2 {
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 2 {
         let allowed = block_registry::breg().is_some_and(|reg| {
             adventure_stack_allows(reg, old, &held, COMP_CAN_BREAK)
         });
@@ -2029,8 +2029,8 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
     #[cfg(not(feature = "neoforge-events"))]
     set_block_dim(dim, x, y, z, 0);
     note_block_update_dim(dim, x, y, z, 0);
-    if *me.gm.lock().unwrap() != 1 {
-        *me.walk_acc.lock().unwrap() += 0.005; // block-break exhaustion
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+        *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.005; // block-break exhaustion
         // `Stats.BLOCK_MINED` for the block that was there — keyed by the
         // block item registry id like every other mined stat entry.
         if let Some(reg) = crate::block_registry::breg() {
@@ -2044,12 +2044,12 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
         {
             if damage_held(me) {
                 let (pxx, pyy, pzz, ..) = {
-                    let p = me.pos.lock().unwrap();
+                    let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     *p
                 };
                 let snd = sound_pkt_named("entity.item.break", pxx, pyy + 1.0, pzz);
                 broadcast_near(
-                    *me.dim.lock().unwrap(),
+                    *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
                     pxx,
                     pyy + 1.0,
                     pzz,
@@ -2096,7 +2096,7 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
             };
             (it, n)
         };
-        crops().lock().unwrap().remove(&(dim, x, y, z));
+        crops().lock().unwrap_or_else(|e| e.into_inner()).remove(&(dim, x, y, z));
         if old == 4285 && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
             // ripe: extra wheat drop
             let d = Drop {
@@ -2111,7 +2111,7 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
                 target: None,
                 thrower: None,
             };
-            drops().lock().unwrap().push(d);
+            drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
         }
         if let Some(item) = if !can_harvest(old as i64, held.0)
             || GR_DO_TILE_DROPS.load(Ordering::Relaxed) == 0
@@ -2132,16 +2132,16 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
                 target: None,
                 thrower: None,
             };
-            drops().lock().unwrap().push(d);
+            drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
         }
     }
 }
 
 fn sync_entity_interest(client: &Client, entities: &[TrackedSpawn]) {
-    let mut seen = client.seen.lock().unwrap();
-    let chunks = client.chunks.lock().unwrap();
+    let mut seen = client.seen.lock().unwrap_or_else(|e| e.into_inner());
+    let chunks = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
     let (dim, px, _, pz, _, _) = client_dim_pos(client);
-    let view = *client.view.lock().unwrap();
+    let view = *client.view.lock().unwrap_or_else(|e| e.into_inner());
     let mut eligible = HashMap::new();
     for TrackedSpawn {
         dim: entity_dim,
@@ -2226,7 +2226,7 @@ fn broadcast_chunk_dim_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     for client in audience {
         // Stream and unload take the chunk lock before the socket. Keep the
         // audience check in that order so a delta cannot follow an unload.
-        let chunks = client.chunks.lock().unwrap();
+        let chunks = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
         if !chunks.contains(&(cx, cz)) {
             continue;
         }
@@ -2265,7 +2265,7 @@ fn broadcast_seen_ex_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     let mut shared = None;
     for client in audience.iter().filter(|c| c.eid != excl) {
         // Serialize updates with the tracking sweep's spawn and remove packets.
-        let seen = client.seen.lock().unwrap();
+        let seen = client.seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.contains(&eid) {
             let (id, packet) = mk(client);
             if let Ok(mut socket) = client.sock.lock() {
@@ -2302,14 +2302,14 @@ fn broadcast_near_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
 ) {
     let mut shared = None;
     for client in audience.iter().filter(|c| c.eid != me_eid) {
-        if *client.dim.lock().unwrap() != dim {
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
             continue;
         }
         let (id, packet) = mk(client);
         let Some(radius) = connection_limits::broadcast_radius(id, &packet) else {
             continue;
         };
-        let (px, py, pz, ..) = *client.pos.lock().unwrap();
+        let (px, py, pz, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
         if !connection_limits::within_broadcast_range(px, py, pz, x, y, z, radius) {
             continue;
         }
@@ -2442,7 +2442,7 @@ fn vanilla_knockback(
 }
 
 fn spawn_mob(m: &Mob) -> Vec<u8> {
-    let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap();
+    let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
     let mut p = Vec::new();
     write_varint(&mut p, m.eid as i64);
     p.extend_from_slice(&m.uuid);
@@ -2757,7 +2757,7 @@ fn load_registry_overlays(base: &std::path::Path) -> Result<Vec<Vec<u8>>, String
     let mut sources = datapack_sources(base);
     // The built-in pack is the base. User packs follow in the server's pack order.
     sources.sort_by_key(|(name, _, _)| name != "vanilla");
-    let disabled = disabled_datapacks().lock().unwrap().clone();
+    let disabled = disabled_datapacks().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut packs = Vec::new();
     for (name, path, zip) in sources {
         if !disabled.contains(&name) {
@@ -2973,7 +2973,7 @@ fn append_custom_dimension_types(config: &mut [(i64, Vec<u8>)]) {
             appended.push((spec.type_key, entry));
         }
         {
-            let mut table = dim_type_entry_ids().lock().unwrap();
+            let mut table = dim_type_entry_ids().lock().unwrap_or_else(|e| e.into_inner());
             for spec in &specs {
                 if let Some(&index) = ids.get(spec.type_key) {
                     table.insert(spec.type_key, index);
@@ -3287,7 +3287,7 @@ fn write_shared_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
     let frame = match conn_cipher(s) {
         Some(cipher) => {
             let mut v = frame.to_vec();
-            cipher.tx.lock().unwrap().encrypt(&mut v);
+            cipher.tx.lock().unwrap_or_else(|e| e.into_inner()).encrypt(&mut v);
             encrypted = v;
             &encrypted[..]
         }
@@ -3359,7 +3359,7 @@ fn cached_chunk_frame(
     if !still_current {
         return connection_limits::ChunkPacketCache::frame_uncached(&packet, compression);
     }
-    let mut cache = chunk_packet_cache().lock().unwrap();
+    let mut cache = chunk_packet_cache().lock().unwrap_or_else(|e| e.into_inner());
     cache.insert(generation, key, revision, emitters, packet);
     cache
         .frame(generation, key, revision, compression)
@@ -4413,7 +4413,7 @@ fn live_chunk_block_entities(dim: DimId, cx: i32, cz: i32) -> Vec<ChunkBlockEnti
         let Some(reg) = crate::block_registry::breg() else {
             return Vec::new();
         };
-        let mut store = live_block_entities().lock().unwrap();
+        let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
         store.discover(reg);
         store
             .entries
@@ -4544,12 +4544,12 @@ fn live_beacon_anchor(me: &Client, dim: DimId) -> Option<DimBlockPos> {
         live_block_entity_id(reg.name_of(block_at_dim(dim, x, y, z)))
             == Some("minecraft:beacon")
     };
-    if let Some(&(adim, x, y, z)) = beacon_menu_anchors().lock().unwrap().get(&me.eid) {
+    if let Some(&(adim, x, y, z)) = beacon_menu_anchors().lock().unwrap_or_else(|e| e.into_inner()).get(&me.eid) {
         if adim == dim && is_beacon(x, y, z) {
             return Some((adim, x, y, z));
         }
     }
-    let (px, py, pz, ..) = *me.pos.lock().unwrap();
+    let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
     live_block_entities()
         .lock()
         .unwrap()
@@ -4605,14 +4605,14 @@ fn should_occlude_underground(
 fn resend_loaded_chunks(me: &Client, occluded: bool) {
     let (dim, px, _py, pz, ..) = client_dim_pos(me);
     let (pcx, pcz) = (spatial_chunk_coord(px), spatial_chunk_coord(pz));
-    let mut ordered: Vec<(i32, i32)> = me.chunks.lock().unwrap().iter().copied().collect();
+    let mut ordered: Vec<(i32, i32)> = me.chunks.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
     ordered.sort_by_key(|&(cx, cz)| {
         let (dx, dz) = (cx - pcx, cz - pcz);
         dx * dx + dz * dz
     });
     // Lock order matches `pump_client_chunks`: gen_sources before sock.
-    let mut gen = me.gen_sources.lock().unwrap();
-    let mut sock = me.sock.lock().unwrap();
+    let mut gen = me.gen_sources.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
     let compression = socket_compression(&sock);
     for (cx, cz) in ordered {
         let frame = cached_chunk_frame(compression, &mut gen, dim, cx, cz, occluded);
@@ -4628,7 +4628,7 @@ fn resend_loaded_chunks(me: &Client, occluded: bool) {
 /// strongholds appear; resurface: anti-cave-xray re-arms).
 fn update_underground_lane(me: &Client) -> bool {
     let (dim, px, py, pz, ..) = client_dim_pos(me);
-    let gm = *me.gm.lock().unwrap();
+    let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
     let surface = height_at_dim(dim, px.floor() as i32, pz.floor() as i32);
     let revealed = me.underground_revealed.load(Ordering::Relaxed);
     let occluded = should_occlude_underground(dim, py, surface, gm, revealed);
@@ -4642,11 +4642,11 @@ fn update_underground_lane(me: &Client) -> bool {
 
 fn pump_client_chunks(client: &Client, announce_center: bool) -> bool {
     let occluded = update_underground_lane(client);
-    let mut ack = client.chunk_ack.lock().unwrap();
-    let view = *client.view.lock().unwrap();
-    let mut chunks = client.chunks.lock().unwrap();
-    let mut gen = client.gen_sources.lock().unwrap();
-    let mut socket = client.sock.lock().unwrap();
+    let mut ack = client.chunk_ack.lock().unwrap_or_else(|e| e.into_inner());
+    let view = *client.view.lock().unwrap_or_else(|e| e.into_inner());
+    let mut chunks = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gen = client.gen_sources.lock().unwrap_or_else(|e| e.into_inner());
+    let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
     // Same-dimension teleports also hold the writer while changing position.
     let (dim, x, _, z, yaw, _) = client_dim_pos(client);
     stream_chunks(
@@ -4858,58 +4858,58 @@ fn switch_client_dimension(
     target: (f64, f64, f64, f32, f32),
     view: i32,
 ) {
-    let old_dim = *me.dim.lock().unwrap();
+    let old_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
     close_live_menu(me, true, true);
-    let had_furnace = me.open_furnace.lock().unwrap().take().is_some();
+    let had_furnace = me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()).take().is_some();
     if had_furnace {
-        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x12, vec![2]);
+        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x12, vec![2]);
     }
     // Retire everything the old world was tracking before the client drops its chunks.
-    let mut seen = me.seen.lock().unwrap();
+    let mut seen = me.seen.lock().unwrap_or_else(|e| e.into_inner());
     // Serialize the transition with the connection thread's chunk pump.
-    let mut ack = me.chunk_ack.lock().unwrap();
+    let mut ack = me.chunk_ack.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.is_empty() {
         let removed: Vec<_> = seen.drain().collect();
         let _ = send_packet(
-            &mut me.sock.lock().unwrap(),
+            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
             0x42,
             remove_entities_payload(&removed),
         );
     }
     if old_dim != new_dim {
         me.chunks.lock().unwrap().clear();
-        me.gen_sources.lock().unwrap().clear();
+        me.gen_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     let teleport_id = {
-        let mut teleport = me.teleport.lock().unwrap();
+        let mut teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
         let id = teleport.begin();
         ac_expect_teleport(me.eid);
         // Spawn eligibility reads this pair in the same lock order.
-        let mut dim = me.dim.lock().unwrap();
-        let mut p = me.pos.lock().unwrap();
+        let mut dim = me.dim.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
         *dim = new_dim;
         *p = (target.0, target.1, target.2, target.3, target.4, true);
         id
     };
     drop(seen);
-    *me.in_portal.lock().unwrap() = false;
-    *me.fall_from.lock().unwrap() = target.1;
+    *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = target.1;
     *ack = connection_limits::chunk_feedback(window_batch(view));
-    let gm = *me.gm.lock().unwrap();
+    let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
     let mut rp = spawn_info_dim(new_dim, gm);
     rp.push(0x03); // data_kept: keep inventory and attributes across the move
-    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x47, rp);
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x47, rp);
     let mut ge = vec![13u8]; // START_WAITING_CHUNKS
     ge.extend_from_slice(&0f32.to_be_bytes());
-    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x22, ge);
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x22, ge);
     // A dimension hop re-derives the lane from scratch: Nether/End always get
     // the real lane, and the hysteresis restarts on the new surface.
     let dim_occluded = update_underground_lane(me);
     {
-        let mut ch = me.chunks.lock().unwrap();
-        let mut gen = me.gen_sources.lock().unwrap();
+        let mut ch = me.chunks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gen = me.gen_sources.lock().unwrap_or_else(|e| e.into_inner());
         stream_chunks(
-            &mut me.sock.lock().unwrap(),
+            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
             &mut ch,
             &mut gen,
             &mut ack,
@@ -4922,8 +4922,8 @@ fn switch_client_dimension(
             !me.is_spectator() || gamerule_live_value("spectatorsGenerateChunks") != 0,
         );
     }
-    let mut sock = me.sock.lock().unwrap();
-    let mut teleport = me.teleport.lock().unwrap();
+    let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
     if teleport.preparing(teleport_id) {
         send_prepared_teleport(&mut sock, &mut teleport, target, teleport_id);
     }
@@ -5008,16 +5008,16 @@ fn enter_portal(
     pitch: f32,
     view: i32,
 ) {
-    let dim = *me.dim.lock().unwrap();
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
     if is_end_portal_state(st) {
         if dim == DimId::Overworld {
             materialize_end_spawn();
             switch_client_dimension(me, DimId::End, (100.5, 49.0, 0.5, yaw, pitch), view);
         } else {
             let (sdim, sx, sy, sz) = {
-                let sdim = *me.spawn_dim.lock().unwrap();
-                let pos = me.spawn_pt.lock().unwrap().unwrap_or_else(|| {
-                    let w = *WORLD_SPAWN.lock().unwrap();
+                let sdim = *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner());
+                let pos = me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(|| {
+                    let w = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
                     (w.0, w.1, w.2, w.3)
                 });
                 (sdim, pos.0, pos.1, pos.2)
@@ -5038,24 +5038,24 @@ fn enter_portal(
     }
     // Arrival is inside a real portal; hold the per-player guard until the player steps out
     // so the destination portal cannot send them straight back.
-    *me.in_portal.lock().unwrap() = true;
+    *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = true;
 }
 
 /// Called after a movement frame. Returns whether a dimension transition happened.
 fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
-    let dim = *me.dim.lock().unwrap();
-    let (px, py, pz, yaw, pitch, _) = *me.pos.lock().unwrap();
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let (px, py, pz, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
     let (bx, by, bz) = (px.floor() as i32, py.floor() as i32, pz.floor() as i32);
     let st = block_at_dim(dim, bx, by, bz);
     if !is_nether_portal_state(st) && !is_end_portal_state(st) {
-        *me.in_portal.lock().unwrap() = false;
-        *me.portal_at.lock().unwrap() = None;
+        *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return false;
     }
-    if *me.in_portal.lock().unwrap() {
+    if *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) {
         return false; // arrival guard: wait until the player leaves the portal block
     }
-    *me.in_portal.lock().unwrap() = true;
+    *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = true;
     let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 0;
     // `playersNetherPortalDefaultDelay` (survival, 80 GT = 4 s) and
     // `playersNetherPortalCreativeDelay` (creative/spectator, 1 GT ≈ instant)
@@ -5070,7 +5070,7 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
         enter_portal(me, st, bx, by, bz, yaw, pitch, view);
         return true;
     }
-    let mut at = me.portal_at.lock().unwrap();
+    let mut at = me.portal_at.lock().unwrap_or_else(|e| e.into_inner());
     if at.is_none() {
         *at = Some(Instant::now());
         return false;
@@ -5745,10 +5745,10 @@ fn teleport_in_dimension(
     sock: &mut TcpStream,
     (x, y, z, yaw, pitch): (f64, f64, f64, f32, f32),
 ) {
-    let mut teleport = c.teleport.lock().unwrap();
+    let mut teleport = c.teleport.lock().unwrap_or_else(|e| e.into_inner());
     let id = teleport.begin();
     ac_expect_teleport(c.eid);
-    *c.pos.lock().unwrap() = (x, y, z, yaw, pitch, true);
+    *c.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, yaw, pitch, true);
     send_prepared_teleport(sock, &mut teleport, (x, y, z, yaw, pitch), id);
 }
 
@@ -5821,7 +5821,7 @@ fn deliver_neoforge_messages(source: Option<&Client>, messages: Vec<(i32, String
                     .map(Arc::as_ref)
             });
             if let Some(client) = recipient {
-                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&text));
+                let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat(&text));
             }
         }
     }
@@ -5874,7 +5874,7 @@ fn neoforge_resync_block(client: &Client, dim: DimId, (x, y, z): BlockPos) {
     let mut body = Vec::new();
     write_pos(&mut body, x, y, z);
     write_varint(&mut body, i64::from(visible));
-    let _ = send_packet(&mut client.sock.lock().unwrap(), 0x09, body);
+    let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x09, body);
 }
 
 #[cfg(feature = "neoforge-events")]
@@ -5948,7 +5948,7 @@ fn neoforge_payload(client: &Client, mut body: &[u8]) {
         packet.extend_from_slice(&envelope.bytes);
         for recipient in &audience {
             if envelope.target_eid.is_none_or(|eid| eid == recipient.eid) {
-                let _ = send_packet(&mut recipient.sock.lock().unwrap(), 0x19, packet.clone());
+                let _ = send_packet(&mut recipient.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x19, packet.clone());
             }
         }
     }
@@ -6079,10 +6079,10 @@ fn death_drop_marks() -> &'static Mutex<HashSet<i32>> {
 }
 
 fn drop_player_items_on_death(player: &Arc<Client>) {
-    if *player.hp.lock().unwrap() > 0.0 {
+    if *player.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0 {
         return;
     }
-    if !death_drop_marks().lock().unwrap().insert(player.eid) {
+    if !death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).insert(player.eid) {
         return;
     }
     // vanilla LivingEntity.die → broadcastEntityEvent(entity, (byte) 3): the
@@ -6120,28 +6120,28 @@ fn drop_player_items_on_death(player: &Arc<Client>) {
         }
     }
     if GR_KEEP_INVENTORY.load(Ordering::Relaxed) != 0
-        || !matches!(*player.gm.lock().unwrap(), 0 | 2)
+        || !matches!(*player.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 2)
     {
         return;
     }
     close_live_menu(player, true, true);
-    let (dx, dy, dz, ..) = *player.pos.lock().unwrap();
+    let (dx, dy, dz, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
     let mut spill: Vec<Stack> = {
-        let mut inventory = player.inv.lock().unwrap();
+        let mut inventory = player.inv.lock().unwrap_or_else(|e| e.into_inner());
         let items = inventory.values().cloned().collect();
         inventory.clear();
         items
     };
-    *player.armor_pts.lock().unwrap() = 0;
-    let cursor = std::mem::take(&mut *player.cursor.lock().unwrap());
+    *player.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    let cursor = std::mem::take(&mut *player.cursor.lock().unwrap_or_else(|e| e.into_inner()));
     if cursor.1 > 0 {
         spill.push(cursor);
     }
     for grid in [&player.craft, &player.craft9] {
-        spill.extend(std::mem::take(&mut *grid.lock().unwrap()).into_values());
+        spill.extend(std::mem::take(&mut *grid.lock().unwrap_or_else(|e| e.into_inner())).into_values());
     }
     {
-        let mut spawned = drops().lock().unwrap();
+        let mut spawned = drops().lock().unwrap_or_else(|e| e.into_inner());
         for (item, cnt, comps) in spill
             .into_iter()
             .filter(|stack| stack.1 > 0 && enchant_level(&stack.2, 40) == 0)
@@ -6161,7 +6161,7 @@ fn drop_player_items_on_death(player: &Arc<Client>) {
         }
     }
     let mut experience = take_dropped_experience(player);
-    let mut spawned = xps().lock().unwrap();
+    let mut spawned = xps().lock().unwrap_or_else(|e| e.into_inner());
     while experience > 0 {
         let count = experience.min(10) as i16;
         experience -= i64::from(count);
@@ -6182,7 +6182,7 @@ fn save_live_player_snapshot(
     inventory: &HashMap<i16, Stack>,
 ) {
     let mut snapshot = PlayerSave::capture(player, position, inventory);
-    let mut saved = saved_players().lock().unwrap();
+    let mut saved = saved_players().lock().unwrap_or_else(|e| e.into_inner());
     if let (Some(old), Some(current)) = (
         saved.get(&player.uuid).and_then(|save| save.respawn),
         snapshot.respawn,
@@ -6467,7 +6467,7 @@ fn entity_equipment_packet(eid: i32, eq: &EntityEquipment) -> Option<Vec<u8>> {
 /// `default_mob_equipment` leaves the mob bare-handed.
 fn mob_equipment_packet(mob: &Mob) -> Option<Vec<u8>> {
     let spec = entity_spec_by_id(mob.etype)?;
-    let mut equipment = mob_equipment().lock().unwrap();
+    let mut equipment = mob_equipment().lock().unwrap_or_else(|e| e.into_inner());
     let eq = equipment.entry(mob.eid).or_insert_with(|| {
         default_mob_equipment(
             spec.name,
@@ -6482,8 +6482,8 @@ fn mob_equipment_packet(mob: &Mob) -> Option<Vec<u8>> {
 /// hand is the selected hotbar slot (36..=44), the off hand is menu slot 45,
 /// and armor is menu slots 5..=8 in vanilla order head→feet.
 fn player_equipment(me: &Client) -> EntityEquipment {
-    let inv = me.inv.lock().unwrap();
-    let held = *me.held.lock().unwrap();
+    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let held = *me.held.lock().unwrap_or_else(|e| e.into_inner());
     let stack = |slot: i16| inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
     let mut eq = EntityEquipment::default();
     eq.set(EquipmentSlot::MainHand, stack(36 + held));
@@ -6572,7 +6572,7 @@ fn try_mount_vehicle(me: &Arc<Client>, target: i32) -> bool {
         return false;
     }
     let Some(mob) = ({
-        let ms = mobs().lock().unwrap();
+        let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
         ms.iter().find(|m| m.eid == target).cloned()
     }) else {
         return false;
@@ -6581,14 +6581,14 @@ fn try_mount_vehicle(me: &Arc<Client>, target: i32) -> bool {
         return false;
     };
     let at = {
-        let p = *mob.pos.lock().unwrap();
+        let p = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
         [p.0, p.1, p.2]
     };
     let seat = {
-        let mut live = mounts().lock().unwrap();
+        let mut live = mounts().lock().unwrap_or_else(|e| e.into_inner());
         live.registry.register_vehicle(target, kind, at);
         let rider = {
-            let p = *me.pos.lock().unwrap();
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
             [p.0, p.1, p.2]
         };
         live.registry.register_rider(me.eid, rider);
@@ -6601,11 +6601,11 @@ fn try_mount_vehicle(me: &Arc<Client>, target: i32) -> bool {
     // the carry is credited so anti-cheat does not flag the seat move.
     let off = kind.seat_offset(seat);
     {
-        let mut p = me.pos.lock().unwrap();
+        let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
         *p = (at[0] + off[0], at[1] + off[1], at[2] + off[2], p.3, p.4, p.5);
     }
     ac_note_carried_motion(me.eid, [off[0], off[1], off[2]]);
-    let packet = mounts().lock().unwrap().registry.encode_set_passengers(target);
+    let packet = mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.encode_set_passengers(target);
     broadcast_seen(target, |_c| (0x5f, packet.clone()));
     true
 }
@@ -6663,12 +6663,12 @@ fn live_vehicle_env(dim: DimId, etype: i64, pos: [f64; 3], kind: VehicleKind) ->
 /// position plus yaw, every seated rider re-seated, the driver credited for
 /// the carry and a `0x70` teleport to the vehicle's trackers.
 fn step_live_vehicle(me: &Arc<Client>, pkt: &MoveVehiclePacket) {
-    let Some(vehicle) = mounts().lock().unwrap().registry.vehicle_of.get(&me.eid).copied()
+    let Some(vehicle) = mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.vehicle_of.get(&me.eid).copied()
     else {
         return;
     };
     let Some(mob) = ({
-        let ms = mobs().lock().unwrap();
+        let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
         ms.iter().find(|m| m.eid == vehicle).cloned()
     }) else {
         return;
@@ -6676,14 +6676,14 @@ fn step_live_vehicle(me: &Arc<Client>, pkt: &MoveVehiclePacket) {
     let Some(kind) = vehicle_kind_of(mob.etype) else {
         return;
     };
-    let dim = *me.dim.lock().unwrap();
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
     let from = {
-        let p = *mob.pos.lock().unwrap();
+        let p = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
         [p.0, p.1, p.2]
     };
     let env = live_vehicle_env(dim, mob.etype, from, kind);
     let step = {
-        let mut live = mounts().lock().unwrap();
+        let mut live = mounts().lock().unwrap_or_else(|e| e.into_inner());
         // The registry's last word on the vehicle position is what the vanilla
         // anti-cheat distance check prices the step against.
         live.registry.register_rider(vehicle, from);
@@ -6691,7 +6691,7 @@ fn step_live_vehicle(me: &Arc<Client>, pkt: &MoveVehiclePacket) {
     };
     let Ok(step) = step else { return };
     {
-        let mut p = mob.pos.lock().unwrap();
+        let mut p = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
         p.0 = step.pos[0];
         p.1 = step.pos[1];
         p.2 = step.pos[2];
@@ -6711,7 +6711,7 @@ fn step_live_vehicle(me: &Arc<Client>, pkt: &MoveVehiclePacket) {
         .position(|&e| e == me.eid);
     if let Some(seat) = seat {
         let off = kind.seat_offset(seat);
-        let mut p = me.pos.lock().unwrap();
+        let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
         let (yaw, pitch, ground) = (p.3, p.4, p.5);
         *p = (
             step.pos[0] + off[0],
@@ -6728,7 +6728,7 @@ fn step_live_vehicle(me: &Arc<Client>, pkt: &MoveVehiclePacket) {
 
 /// The vehicle a passenger eid is riding, per the live mount graph.
 fn vehicle_of(eid: i32) -> Option<i32> {
-    mounts().lock().unwrap().registry.vehicle_of.get(&eid).copied()
+    mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.vehicle_of.get(&eid).copied()
 }
 
 /// Dismount a riding player, re-seat them at the offset vanilla
@@ -6737,21 +6737,21 @@ fn player_dismount(me: &Arc<Client>, reposition: bool) {
     let Some(vehicle) = vehicle_of(me.eid) else {
         return;
     };
-    let at = mounts().lock().unwrap().registry.dismount(me.eid);
+    let at = mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.dismount(me.eid);
     let Some(at) = at else { return };
     if reposition {
         let (yaw, pitch) = {
-            let p = me.pos.lock().unwrap();
+            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
             (p.3, p.4)
         };
-        let mut sock = me.sock.lock().unwrap();
+        let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
         teleport_in_dimension(me, &mut sock, (at[0], at[1], at[2], yaw, pitch));
     } else {
-        let mut p = me.pos.lock().unwrap();
+        let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
         let (yaw, pitch, ground) = (p.3, p.4, p.5);
         *p = (at[0], at[1], at[2], yaw, pitch, ground);
     }
-    let packet = mounts().lock().unwrap().registry.encode_set_passengers(vehicle);
+    let packet = mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.encode_set_passengers(vehicle);
     broadcast_seen(vehicle, |_c| (0x5f, packet.clone()));
 }
 
@@ -6762,7 +6762,7 @@ fn live_mount_forget(eid: i32) {
     let mut freed: Vec<(i32, [f64; 3])> = Vec::new();
     let mut updated: Vec<i32> = Vec::new();
     {
-        let mut live = mounts().lock().unwrap();
+        let mut live = mounts().lock().unwrap_or_else(|e| e.into_inner());
         let seats = live.registry.passengers_of(eid).to_vec();
         if !seats.is_empty() {
             for passenger in seats {
@@ -6788,7 +6788,7 @@ fn live_mount_forget(eid: i32) {
             .find(|c| c.eid == passenger)
             .cloned()
         {
-            let mut p = client.pos.lock().unwrap();
+            let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
             let (yaw, pitch, ground) = (p.3, p.4, p.5);
             *p = (at[0], at[1], at[2], yaw, pitch, ground);
         }
@@ -6796,7 +6796,7 @@ fn live_mount_forget(eid: i32) {
     updated.sort_unstable();
     updated.dedup();
     for vehicle in updated {
-        let packet = mounts().lock().unwrap().registry.encode_set_passengers(vehicle);
+        let packet = mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.encode_set_passengers(vehicle);
         broadcast_seen(vehicle, |_c| (0x5f, packet.clone()));
     }
 }
@@ -7052,7 +7052,7 @@ fn w3_ingredient_matches(matcher: &str, item: i64) -> bool {
 fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     let grid_is_3x3 = if place.window_id == 0 {
         false
-    } else if place.window_id == 3 && *me.open_table.lock().unwrap() {
+    } else if place.window_id == 3 && *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
         true
     } else {
         return;
@@ -7085,11 +7085,11 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     let repeats = if place.make_all { 64 } else { 1 };
     let mut placed = false;
     {
-        let mut inv = me.inv.lock().unwrap();
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         let mut grid = if grid_is_3x3 {
-            me.craft9.lock().unwrap()
+            me.craft9.lock().unwrap_or_else(|e| e.into_inner())
         } else {
-            me.craft.lock().unwrap()
+            me.craft.lock().unwrap_or_else(|e| e.into_inner())
         };
         for _ in 0..repeats {
             // Commit-or-nothing one repeat: try the whole pattern on copies so
@@ -7138,11 +7138,11 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     // grid slots and the inventory slots the ingredients came from.
     let (grid, inv) = (
         if grid_is_3x3 {
-            me.craft9.lock().unwrap().clone()
+            me.craft9.lock().unwrap_or_else(|e| e.into_inner()).clone()
         } else {
-            me.craft.lock().unwrap().clone()
+            me.craft.lock().unwrap_or_else(|e| e.into_inner()).clone()
         },
-        me.inv.lock().unwrap().clone(),
+        me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     );
     let result = if grid_is_3x3 {
         craft3_result(&grid)
@@ -7151,7 +7151,7 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     }
     .unwrap_or((0, 0, Vec::new()));
     let wid = place.window_id as u8;
-    let mut sock = me.sock.lock().unwrap();
+    let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
     let mut echo = |slot: i16, st: &Stack| {
         let mut p = vec![wid];
         write_varint(&mut p, 0);
@@ -7204,7 +7204,7 @@ fn handle(s: TcpStream) {
 /// mid-session: unregister the client from the online list and detach it from
 /// the mount graph like the normal disconnect path does.
 fn forget_live_client(eid: i32) {
-    clients().lock().unwrap().retain(|c| c.eid != eid);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != eid);
     live_mount_forget(eid);
 }
 
@@ -7319,8 +7319,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // the player cap — evaluated before Login Success so the refusal arrives
     // as a Login-state Disconnect like Vanilla's.
     {
-        let online = clients().lock().unwrap().len();
-        let mut live = live_admission().lock().unwrap();
+        let online = clients().lock().unwrap_or_else(|e| e.into_inner()).len();
+        let mut live = live_admission().lock().unwrap_or_else(|e| e.into_inner());
         let live = live.get_or_insert_with(LiveAdmission::load);
         if let Err(reason) = check_login_admission(
             &name,
@@ -7450,13 +7450,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // window both name the world the player actually logged out in. The 0x2b payload and
     // the camera position must agree or the client asks for chunks from the wrong generator.
     let player_uuid: [u8; 16] = uuid.as_slice().try_into().unwrap();
-    let saved_player = saved_players().lock().unwrap().get(&player_uuid).cloned();
+    let saved_player = saved_players().lock().unwrap_or_else(|e| e.into_inner()).get(&player_uuid).cloned();
     let (saved_dim, sx, sy, sz, syaw, spitch) = saved_player
         .as_ref()
         .map(|save| save.position)
-        .or_else(|| pos_store().lock().unwrap().get(&name).copied())
+        .or_else(|| pos_store().lock().unwrap_or_else(|e| e.into_inner()).get(&name).copied())
         .unwrap_or_else(|| {
-            let w = *WORLD_SPAWN.lock().unwrap();
+            let w = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
             (DimId::Overworld, w.0, w.1, w.2, w.3, 0.0)
         });
     let player_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -7477,7 +7477,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     write_varint(&mut vp, i64::from((sx.floor() as i32).div_euclid(16)));
     write_varint(&mut vp, i64::from((sz.floor() as i32).div_euclid(16)));
     let _ = send_packet(&mut s, 0x54, vp);
-    let spawn = *WORLD_SPAWN.lock().unwrap();
+    let spawn = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     let _ = send_packet(&mut s, 0x56, spawn_position_packet(spawn));
     let mut gs = vec![13u8];
     gs.extend_from_slice(&0f32.to_be_bytes());
@@ -7587,7 +7587,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     let saved_inv = saved_player
         .as_ref()
         .map(|save| save.inventory.clone())
-        .or_else(|| inv_store().lock().unwrap().get(&name).cloned());
+        .or_else(|| inv_store().lock().unwrap_or_else(|e| e.into_inner()).get(&name).cloned());
     eprintln!(
         "[spine] {} joined from {} (uuid {})",
         name,
@@ -7681,12 +7681,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     let mut retry_chunks = chunk_delivery.has_pending();
     me.enter_play_wire(compression, chunk_delivery);
     {
-        let border = world_border().lock().unwrap();
-        let board = scoreboard().lock().unwrap();
-        let mut tracker = player_advancements().lock().unwrap();
+        let border = world_border().lock().unwrap_or_else(|e| e.into_inner());
+        let board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
+        let mut tracker = player_advancements().lock().unwrap_or_else(|e| e.into_inner());
         restore_player_advancements(&mut tracker, &me.name);
         {
-            let mut w = me.sock.lock().unwrap();
+            let mut w = me.sock.lock().unwrap_or_else(|e| e.into_inner());
             let now = border_now_ms();
             let mut snapshot = *border;
             snapshot.finish_lerp(now);
@@ -7695,7 +7695,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             let _ = sync_scoreboard(&mut w, &board);
         }
         send_advancement_delta(&mut tracker, &me, true);
-        player_mechanism_sessions().lock().unwrap().insert(
+        player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(
             me.eid,
             PlayerMechanismSession {
                 xp_bar: saved_player.as_ref().map_or((0, 0.0), |save| (save.xp_level, save.xp_progress)),
@@ -7709,12 +7709,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         );
     }
     if let Some(save) = saved_player.as_ref() {
-        chests().lock().unwrap().insert(
+        chests().lock().unwrap_or_else(|e| e.into_inner()).insert(
             ender_container_key(&me.uuid),
             save.ender_chest.clone(),
         );
         for &(id, amp, left) in &save.effects {
-            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x76, entity_effect_pkt(me.eid, id, amp, left));
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x76, entity_effect_pkt(me.eid, id, amp, left));
         }
     }
     // Java sees the login before the tick thread can snapshot this player.
@@ -7724,14 +7724,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     }
     {
         // Match bossbar command lock order so a joining member receives one Add.
-        let bars = bossbars().lock().unwrap();
-        let mut cls = clients().lock().unwrap();
-        *me.chunks.lock().unwrap() = sent;
+        let bars = bossbars().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
+        *me.chunks.lock().unwrap_or_else(|e| e.into_inner()) = sent;
         for c in cls.iter() {
             // tab-list info is global (vanilla keeps it world-wide);
             // the ENTITY spawn is interest-gated — the sweep sends it
             // only once the other player enters visible range.
-            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x3e, player_info_add(c));
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x3e, player_info_add(c));
             let pi = player_info_add(&me);
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x3e, pi.clone());
@@ -7739,7 +7739,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         }
         cls.push(me.clone());
         for (id, bar) in bars.iter().filter(|(_, bar)| bar.shown_to(&me)) {
-            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x0a, bossbar_pkt(id, 0, Some(bar)));
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x0a, bossbar_pkt(id, 0, Some(bar)));
         }
     }
     // An operator change can happen during the initial chunk stream, before
@@ -7754,23 +7754,23 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     }
     // refresh armor points from restored inventory
     {
-        let iv = me.inv.lock().unwrap();
-        *me.armor_pts.lock().unwrap() = armor_pts_of(&iv);
+        let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&iv);
     }
     send_attrs(&me);
     // echo restored inventory slots so the client sees them
     {
-        let inv = me.inv.lock().unwrap();
+        let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         for (&slot, st) in inv.iter() {
             let mut p = vec![0u8];
             write_varint(&mut p, 0);
             p.extend_from_slice(&slot.to_be_bytes());
             p.extend_from_slice(&slot_wire(st));
-            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
         }
     }
     {
-        let ms = mobs().lock().unwrap();
+        let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
         // mobs/drops stream via interest_tick (distance-gated)
         drop(ms);
         // drops/xp/mobs stream via interest_tick (distance-gated)
@@ -7826,7 +7826,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         use connection_limits::KeepaliveAction;
         match keepalive.tick(Instant::now(), next_keepalive_id) {
             KeepaliveAction::Send(id) => {
-                if send_packet(&mut me.sock.lock().unwrap(), 0x26, id.to_be_bytes().to_vec())
+                if send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x26, id.to_be_bytes().to_vec())
                     .is_err()
                 {
                     break 'conn;
@@ -7835,7 +7835,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 next_keepalive_id = next_keepalive_id.wrapping_add(1);
             }
             KeepaliveAction::TimedOut => {
-                play_disconnect(&mut me.sock.lock().unwrap(), "Timed out");
+                play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Timed out");
                 break 'conn;
             }
             KeepaliveAction::Wait => {}
@@ -7857,7 +7857,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             read_timeout = Some(timeout);
         }
         // A client that stopped answering chunk batches is gone, even on an idle socket.
-        if me.chunk_ack.lock().unwrap().timed_out(Instant::now()) {
+        if me.chunk_ack.lock().unwrap_or_else(|e| e.into_inner()).timed_out(Instant::now()) {
             eprintln!(
                 "[spine] {} disconnected: chunk batch acknowledgement timeout",
                 me.name
@@ -7873,7 +7873,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         "[spine] {} disconnected: no packet for {:?}",
                         me.name, idle_limit
                     );
-                    play_disconnect(&mut me.sock.lock().unwrap(), "Timed out");
+                    play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Timed out");
                     break 'conn;
                 }
                 // A dimension change initiated by another connection can
@@ -7904,13 +7904,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             0x00 => {
                 let mut payload = b.as_slice();
                 if let Some(id) = read_protocol_i32(&mut payload).filter(|_| payload.is_empty()) {
-                    me.teleport.lock().unwrap().confirm(id);
+                    me.teleport.lock().unwrap_or_else(|e| e.into_inner()).confirm(id);
                     retry_chunks = pump_client_chunks(&me, false);
                 }
             }
             0x18 => {
                 if !keepalive.reply(Instant::now(), &b) {
-                    play_disconnect(&mut me.sock.lock().unwrap(), "Timed out");
+                    play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Timed out");
                     break 'conn;
                 }
                 // A reply that matched the pending challenge is a measured
@@ -7939,7 +7939,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // Java 1.21.1 Chunk Batch Received: desired chunks per tick, four
                 // big-endian f32 bytes. Answering it opens the next batch.
                 let acked = {
-                    let mut ack = me.chunk_ack.lock().unwrap();
+                    let mut ack = me.chunk_ack.lock().unwrap_or_else(|e| e.into_inner());
                     ack.acknowledge(&b)
                 };
                 if let Err(why) = acked {
@@ -7955,10 +7955,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let effective = requested.clamp(2, SERVER_VIEW_DISTANCE);
                 if effective != view {
                     view = effective;
-                    *me.view.lock().unwrap() = view;
-                    send_view_distance(&mut me.sock.lock().unwrap(), view);
+                    *me.view.lock().unwrap_or_else(|e| e.into_inner()) = view;
+                    send_view_distance(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), view);
                     connection_limits::set_chunk_feedback_window(
-                        &mut me.chunk_ack.lock().unwrap(),
+                        &mut me.chunk_ack.lock().unwrap_or_else(|e| e.into_inner()),
                         window_batch(view),
                     );
                     retry_chunks = pump_client_chunks(&me, true);
@@ -7973,14 +7973,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let px = f64::from_be_bytes(b[..8].try_into().unwrap());
                     let py = f64::from_be_bytes(b[8..16].try_into().unwrap());
                     let pz = f64::from_be_bytes(b[16..24].try_into().unwrap());
-                    if !me.teleport.lock().unwrap().movement_allowed() {
+                    if !me.teleport.lock().unwrap_or_else(|e| e.into_inner()).movement_allowed() {
                         continue;
                     }
                     // Vanilla wakes a sleeping player when they move.
                     wake_if_sleeping(&me);
                     // Anti-cheat runs before any lock is taken: it reads attributes, effects
                     // and blocks around the player, and may pull the player back.
-                    let before = *me.pos.lock().unwrap();
+                    let before = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     let claimed = if pid == 0x1b && b.len() >= 33 {
                         b[32] != 0
                     } else if pid == 0x1a && b.len() >= 25 {
@@ -8010,11 +8010,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             }
                         }
                     };
-                    let teleport = me.teleport.lock().unwrap();
+                    let teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
                     if !teleport.movement_allowed() {
                         continue;
                     }
-                    let mut p = me.pos.lock().unwrap();
+                    let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     let (mut yaw, mut pitch, gnd) = (p.3, p.4, checked_gnd);
                     if pid == 0x1b && b.len() >= 33 {
                         yaw = f32::from_be_bytes(b[24..28].try_into().unwrap());
@@ -8039,7 +8039,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         update_underground_lane(&me);
                     }
                     let window = ChunkWindow::at(px, pz, view);
-                    let current = with_play_wire(&me.sock.lock().unwrap(), |play| {
+                    let current = with_play_wire(&me.sock.lock().unwrap_or_else(|e| e.into_inner()), |play| {
                         play.chunk_delivery.window()
                     })
                     .flatten();
@@ -8070,16 +8070,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if !yaw.is_finite() || !pitch.is_finite() {
                         continue;
                     }
-                    let teleport = me.teleport.lock().unwrap();
+                    let teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
                     if !teleport.movement_allowed() {
                         continue;
                     }
                     let at = {
-                        let p = me.pos.lock().unwrap();
+                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                         (p.0, p.1, p.2)
                     };
                     let gnd = ac_effective_ground(&me, at, b[8] != 0);
-                    let mut p = me.pos.lock().unwrap();
+                    let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     let prev_gnd = p.5;
                     p.3 = yaw;
                     p.4 = pitch;
@@ -8100,19 +8100,19 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let _eid = read_varint(&mut sl);
                 if let Some(act) = read_varint(&mut sl) {
                     match act {
-                        0 => *me.sneaking.lock().unwrap() = true,
-                        1 => *me.sneaking.lock().unwrap() = false,
+                        0 => *me.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = true,
+                        1 => *me.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = false,
                         2 => {
                             wake_if_sleeping(&me);
                         }
-                        3 => *me.sprinting.lock().unwrap() = true,
-                        4 => *me.sprinting.lock().unwrap() = false,
+                        3 => *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = true,
+                        4 => *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = false,
                         _ => {}
                     }
                     if (0..=1).contains(&act) || (3..=4).contains(&act) {
-                        let sneak = *me.sneaking.lock().unwrap();
-                        let sprint = *me.sprinting.lock().unwrap();
-                        let glide = *me.fall_fly.lock().unwrap();
+                        let sneak = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+                        let sprint = *me.sprinting.lock().unwrap_or_else(|e| e.into_inner());
+                        let glide = *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
                         // flags: sneak=0x02 sprint=0x08 fall_flying=0x80 ; pose: sneak=5 fall_fly=1 else standing=0
                         let mut p = Vec::new();
                         write_varint(&mut p, me.eid as i64);
@@ -8141,7 +8141,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // new main hand is emitted by the loop-head equipment diff.
                 if b.len() >= 2 {
                     held_slot = i16::from_be_bytes(b[..2].try_into().unwrap()).clamp(0, 8);
-                    *me.held.lock().unwrap() = held_slot;
+                    *me.held.lock().unwrap_or_else(|e| e.into_inner()) = held_slot;
                 }
             }
             0x20 => {
@@ -8153,16 +8153,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             0x1d => {
                 // flying: onGround only
                 if !b.is_empty() {
-                    let teleport = me.teleport.lock().unwrap();
+                    let teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
                     if !teleport.movement_allowed() {
                         continue;
                     }
                     let at = {
-                        let p = me.pos.lock().unwrap();
+                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                         (p.0, p.1, p.2)
                     };
                     let gnd = ac_effective_ground(&me, at, b[0] != 0);
-                    let mut p = me.pos.lock().unwrap();
+                    let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     let prev_gnd = p.5;
                     p.5 = gnd;
                     drop(p);
@@ -8184,7 +8184,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // boat-paddle animation state; it moves no world state itself.
                 if let Some(paddle) = decode_paddle_boat(&b) {
                     if let Some(vehicle) = vehicle_of(me.eid) {
-                        mounts().lock().unwrap().paddling.insert(vehicle, paddle);
+                        mounts().lock().unwrap_or_else(|e| e.into_inner()).paddling.insert(vehicle, paddle);
                     }
                 }
             }
@@ -8223,8 +8223,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 };
                 if status == 5 {
                     // finish using item (bow release / lower shield)
-                    *me.blocking.lock().unwrap() = false;
-                    let eat0 = me.eat_start.lock().unwrap().take();
+                    *me.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                    let eat0 = me.eat_start.lock().unwrap_or_else(|e| e.into_inner()).take();
                     if let Some(t0) = eat0 {
                         // vanilla: release after 32 ticks consumes; earlier release aborts
                         if t0.elapsed().as_secs_f32() >= 1.4 {
@@ -8248,12 +8248,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             .find(|(_, (i, c, _))| *i == 802 && *c > 0)
                             .map(|(&sl, _)| sl);
                         let (hit, _) = {
-                            let inv = me.inv.lock().unwrap();
+                            let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             (inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0), 0)
                         };
                         let charge_t = (draw_t / 1.19).min(1.0);
                         let qc = {
-                            let i2 = me.inv.lock().unwrap();
+                            let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             enchant_level(
                                 &i2.get(&(36 + held_slot))
                                     .map(|v| v.2.clone())
@@ -8271,7 +8271,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         {
                             let pow_f = (charge_t * charge_t + 2.0 * charge_t) / 3.0;
                             let inf = {
-                                let i2 = me.inv.lock().unwrap();
+                                let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 enchant_level(
                                     &i2.get(&(36 + held_slot))
                                         .map(|v| v.2.clone())
@@ -8280,7 +8280,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 ) > 0
                             };
                             if !inf {
-                                let mut inv = me.inv.lock().unwrap();
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 let n = inv[&asl].1 - 1;
                                 if n == 0 {
                                     inv.remove(&asl);
@@ -8288,12 +8288,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     inv.get_mut(&asl).unwrap().1 = n;
                                 }
                             }
-                            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+                            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                             let yr = (yaw as f64).to_radians();
                             let pr = (pitch as f64).to_radians();
                             // bow enchants: power scales arrow dmg, flame ignites, punch knocks
                             let held_c = {
-                                let i2 = me.inv.lock().unwrap();
+                                let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 i2.get(&(36 + held_slot))
                                     .map(|v| v.2.clone())
                                     .unwrap_or_default()
@@ -8328,12 +8328,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 stuck: false,
                             };
                             let (admg, afire, apunch, apierce) = (a.dmg, a.fire, a.punch, a.pierce);
-                            arrows().lock().unwrap().push(a);
+                            arrows().lock().unwrap_or_else(|e| e.into_inner()).push(a);
                             // multishot (crossbow): +2 arrows spread +-10deg
                             if hit == 1192 && enchant_level(&held_c, 23) > 0 {
                                 for off in [-0.1745f64, 0.1745] {
                                     let yr2 = yr + off;
-                                    arrows().lock().unwrap().push(Arrow {
+                                    arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
                                         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                                         owner: me.eid,
                                         x,
@@ -8361,7 +8361,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             if damage_held(&me) {
                                 let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
                                 broadcast_near(
-                                    *me.dim.lock().unwrap(),
+                                    *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
                                     x,
                                     y + 1.0,
                                     z,
@@ -8370,30 +8370,30 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 );
                             }
                             {
-                                let inv = me.inv.lock().unwrap().get(&asl).cloned();
+                                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&asl).cloned();
                                 let mut p = vec![4u8];
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&(36i16 + held_slot).to_be_bytes());
                                 let held_now = {
-                                    let i2 = me.inv.lock().unwrap();
+                                    let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                     i2.get(&(36 + held_slot))
                                         .cloned()
                                         .unwrap_or((0, 0, Vec::new()))
                                 };
                                 p.extend_from_slice(&slot_wire(&held_now));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                                 let mut p2 = vec![4u8];
                                 write_varint(&mut p2, 0);
                                 p2.extend_from_slice(&asl.to_be_bytes());
                                 let iv = inv.unwrap_or((0, 0, Vec::new()));
                                 p2.extend_from_slice(&slot_wire(&iv));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p2);
+                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p2);
                             }
                         }
                         if hit == name_to_item("trident").unwrap_or(-9) && draw_t >= 0.1 {
                             // trident throw
                             let held_st = {
-                                let i2 = me.inv.lock().unwrap();
+                                let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 i2.get(&(36 + held_slot))
                                     .cloned()
                                     .unwrap_or((0, 0, Vec::new()))
@@ -8403,8 +8403,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             let chan = enchant_level(&held_st.2, 5);
                             // survival consumes the thrown trident; it lands as a
                             // pickupable drop (or returns at owner's feet w/ loyalty)
-                            if *me.gm.lock().unwrap() != 1 {
-                                let mut inv = me.inv.lock().unwrap();
+                            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 let hs = 36 + held_slot;
                                 if let Some(st) = inv.get_mut(&hs) {
                                     if st.1 <= 1 {
@@ -8414,10 +8414,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     }
                                 }
                             }
-                            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+                            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                             let yr = (yaw as f64).to_radians();
                             let pr = (pitch as f64).to_radians();
-                            arrows().lock().unwrap().push(Arrow {
+                            arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
                                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                                 owner: me.eid,
                                 x,
@@ -8445,7 +8445,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if status == 6 {
                     // swap_item_in_hand: held <-> offhand (F key)
                     let hs = 36 + held_slot;
-                    let mut inv = me.inv.lock().unwrap();
+                    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                     let a = inv.remove(&hs).unwrap_or((0, 0, Vec::new()));
                     let b = inv.remove(&45i16).unwrap_or((0, 0, Vec::new()));
                     if b.1 > 0 {
@@ -8464,7 +8464,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         // vanilla: Q-drop works in creative too
                         let hs = 36 + held_slot;
                         let it = {
-                            let mut inv = me.inv.lock().unwrap();
+                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             let take = inv.get(&hs).map(|st| if status == 3 { st.1 } else { 1 });
                             take.and_then(|t| {
                                 inv.get(&hs).map(|st| (st.0, t, st.1 <= t, st.2.clone()))
@@ -8480,10 +8480,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         };
                         if let Some((item, cnt, comps)) = it {
                             let (px, py, pz, ..) = {
-                                let p = me.pos.lock().unwrap();
+                                let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                 *p
                             };
-                            drops().lock().unwrap().push(Drop {
+                            drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
                                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                                 x: px,
                                 y: py + 1.3,
@@ -8499,7 +8499,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 let mut p = vec![0u8];
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&hs.to_be_bytes());
-                                let now = me.inv.lock().unwrap().get(&hs).cloned().unwrap_or((
+                                let now = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&hs).cloned().unwrap_or((
                                     0,
                                     0,
                                     Vec::new(),
@@ -8513,12 +8513,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     }
                 }
                 if status == 1 {
-                    *me.dig.lock().unwrap() = None;
+                    *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 } // aborted dig
                 if status == 0 || status == 2 {
                     // vanilla block_interaction_range: 4.5 survival / 5.0 creative
-                    let (px, py, pz, _, _, on_ground) = *me.pos.lock().unwrap();
-                    let game_mode = *me.gm.lock().unwrap();
+                    let (px, py, pz, _, _, on_ground) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    let game_mode = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
                     let gm_creative = game_mode == 1;
                     let reach = if gm_creative { 5.6f64 } else { 4.9 };
                     let (ddx, ddy, ddz) = (
@@ -8527,17 +8527,17 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         z as f64 + 0.5 - pz,
                     );
                     let in_range = ddx * ddx + ddy * ddy + ddz * ddz <= reach * reach;
-                    let dim = *me.dim.lock().unwrap();
+                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                     let old = block_at_dim(dim, x, y, z);
                     let held = {
-                        let inv = me.inv.lock().unwrap();
+                        let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                         inv.get(&(36 + held_slot))
                             .cloned()
                             .unwrap_or((0, 0, Vec::new()))
                     };
                     let req = if in_range {
                         let (haste, fatigue) = {
-                            let effects = me.effs.lock().unwrap();
+                            let effects = me.effs.lock().unwrap_or_else(|e| e.into_inner());
                             (
                                 effects.iter().find(|effect| effect.id == 2).map(|effect| effect.amp),
                                 effects.iter().find(|effect| effect.id == 3).map(|effect| effect.amp),
@@ -8551,7 +8551,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             );
                             registry.has_water(block_at_dim(dim, bx, by, bz))
                         });
-                        let aqua_affinity = me.inv.lock().unwrap().get(&5)
+                        let aqua_affinity = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&5)
                             .is_some_and(|helmet| enchant_level(&helmet.2, 0) > 0);
                         let base_speed = tool_dig_speed(&held, old as i64);
                         let modified_speed = mining_speed_with_modifiers(
@@ -8582,14 +8582,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             break_now = true;
                         } else if let Some(t) = req {
                             if status == 0 {
-                                *me.dig.lock().unwrap() = Some(PendingDig {
+                                *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingDig {
                                     pos: (dim, x, y, z),
                                     state: old,
                                     started: Instant::now(),
                                     seconds: t,
                                 });
                             } else {
-                                let t0 = me.dig.lock().unwrap().and_then(|d| {
+                                let t0 = me.dig.lock().unwrap_or_else(|e| e.into_inner()).and_then(|d| {
                                     if (d.pos.1, d.pos.2, d.pos.3) == (x, y, z) {
                                         Some(d.started)
                                     } else {
@@ -8606,7 +8606,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         }
                     }
                     if break_now {
-                        *me.dig.lock().unwrap() = None;
+                        *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     }
                     if !break_now && status == 2 && old != 0 {
                         note_block_update_dim(dim, x, y, z, old); // rejected: resync truth
@@ -8615,7 +8615,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         finish_block_break(&me, dim, x, y, z, old);
                     }
                 }
-                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
             }
             0x38 => {
                 // block_place
@@ -8647,8 +8647,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // (clicked block center vs eye) — gates placement AND
                 // block interactions (containers/signs/buckets all below).
                 {
-                    let (px, py, pz, ..) = *me.pos.lock().unwrap();
-                    let reach = if *me.gm.lock().unwrap() == 1 {
+                    let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    let reach = if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
                         5.6f64
                     } else {
                         4.9
@@ -8659,13 +8659,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         z as f64 + 0.5 - pz,
                     );
                     if rx * rx + ry * ry + rz * rz > reach * reach {
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
                 }
                 let (dx, dy, dz) = FACE_OFF[(face.clamp(0, 5)) as usize];
                 let (tx, ty, tz) = (x + dx, y + dy, z + dz);
-                let dim = *me.dim.lock().unwrap();
+                let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                 let clicked = block_at_dim(dim, x, y, z);
                 // `EndPortalFrameBlock.useItemOn`: an `ender_eye` on an eyeless
                 // frame sets its eye and tries the 5x5 ring activation.
@@ -8673,7 +8673,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     continue;
                 }
                 let place = |pos: BlockPos, state| {
-                    if *me.gm.lock().unwrap() == 2 {
+                    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 2 {
                         // Adventure `mayPlace`: the held stack's can_place_on
                         // predicates must match the clicked block.
                         let held = me
@@ -8711,7 +8711,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     place_block_dim(dim, pos.0, pos.1, pos.2, state);
                     true
                 };
-                let sneaking = *me.sneaking.lock().unwrap();
+                let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
                 if !sneaking
                     && crate::block_registry::breg().is_some_and(|reg| {
                         live_block_entity_id(reg.name_of(clicked)) == Some("minecraft:beacon")
@@ -8733,7 +8733,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 .at(reg, (dim, x, y, z), clicked);
                         }
                     });
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 // `FenceBlock.useItemOn` -> `LeadItem.bindPlayerMobs`: a fence
@@ -8757,13 +8757,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     && (open_live_block_menu(&me, (dim, x, y, z), clicked)
                         || use_redstone_component(&me, (dim, x, y, z), clicked))
                 {
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 // The older right-click handlers use Overworld-only block state.
                 // In another dimension, route the newly supported items before them.
                 if dim != DimId::Overworld {
-                    let held = me.inv.lock().unwrap().get(&(36 + held_slot)).map(|s| s.0);
+                    let held = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&(36 + held_slot)).map(|s| s.0);
                     if let Some(item) = held {
                         if try_live_block_placement(
                             &me,
@@ -8773,7 +8773,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             item,
                             clicked,
                         ) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                             continue;
                         }
                     }
@@ -8785,8 +8785,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let mut op = Vec::new();
                     write_pos(&mut op, x, y, z);
                     op.push(1);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x34, op);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x34, op);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 // chest: open container instead of placing
@@ -8800,7 +8800,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if (kind == "Chest" && chest_window_blocked_dim(dim, window))
                         || (me.is_spectator() && window_has_pending_loot(window))
                     {
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
                     let audience = client_snapshot();
@@ -8816,11 +8816,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     }
                     let before = chest_opener_snapshot_dim(&audience, &halves);
                     close_live_menu(&me, false, true);
-                    let inv = me.inv.lock().unwrap().clone();
+                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     open_chest_for_client(&me, window, None, &inv, kind);
                     // `ContainerOpenersCounter.incrementOpeners` -> openerCountChanged
                     sync_chest_openers_dim(&audience, &before);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 // ender chest: per-player shared storage (synthetic key, not world pos)
@@ -8828,7 +8828,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     // `EnderChestBlock.useWithoutItem` (`dip.a`): refuses when the cell
                     // above `isRedstoneConductor`.
                     if is_blocked_chest_by_block_dim(dim, (x, y, z)) {
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
                     let audience = client_snapshot();
@@ -8843,10 +8843,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let before = chest_opener_snapshot_dim(&audience, &halves);
                     let key = ender_container_key(&me.uuid);
                     close_live_menu(&me, false, true);
-                    let inv = me.inv.lock().unwrap().clone();
+                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     open_chest_for_client(&me, (key, None), Some((x, y, z)), &inv, "Ender Chest");
                     sync_chest_openers_dim(&audience, &before);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 // flint & steel on TNT -> ignite
@@ -8863,24 +8863,24 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     set_block_dim(dim, x, y, z, 0);
                     note_block_update_dim(dim, x, y, z, 0);
                     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                    primed().lock().unwrap().push(Primed {
+                    primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
                         eid,
                         x: x as f64 + 0.5,
                         y: y as f64 + 0.5,
                         z: z as f64 + 0.5,
                         left: server_ticks(TNT_FUSE_GT) as i32,
                     });
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 if block_at_dim(dim, x, y, z) == name_to_state("crafting_table").unwrap_or(u32::MAX) {
                     close_live_menu(&me, false, true);
-                    *me.open_table.lock().unwrap() = true;
+                    *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) = true;
                     let mut p = Vec::new();
                     write_varint(&mut p, 3); // windowId 3
                     write_varint(&mut p, 12); // crafting menu
                     p.extend_from_slice(&chat_nbt("Crafting"));
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x33, p);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x33, p);
                     let mut q = vec![3u8];
                     write_varint(&mut q, 0);
                     write_varint(&mut q, 46);
@@ -8888,9 +8888,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
                     }
                     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x13, q);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x13, q);
                     // now fill: grid empty, inv slots
-                    let inv = me.inv.lock().unwrap().clone();
+                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let mut r = vec![3u8];
                     write_varint(&mut r, 0);
                     write_varint(&mut r, 46);
@@ -8903,22 +8903,22 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         r.extend_from_slice(&slot_wire(&(it, c, _cc)));
                     }
                     r.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x13, r);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x13, r);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 if block_at_dim(dim, x, y, z) == name_to_state("furnace").unwrap_or(u32::MAX) {
                     close_live_menu(&me, false, true);
-                    *me.open_furnace.lock().unwrap() = Some((dim, x, y, z));
-                    let inv = me.inv.lock().unwrap().clone();
+                    *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = Some((dim, x, y, z));
+                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
-                    open_furnace_window(&mut me.sock.lock().unwrap(), &inv, &slots);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    open_furnace_window(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), &inv, &slots);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 // buckets: empty fills from source; filled places liquid
                 let held_b = {
-                    let inv = me.inv.lock().unwrap();
+                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                     inv.get(&(36 + held_slot)).cloned()
                 };
                 if let Some((item, cnt, _hc)) = held_b {
@@ -8927,7 +8927,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         let fi = if src == 80 { 909 } else { 910 };
                         set_block_dim(dim, x, y, z, 0);
                         note_block_update_dim(dim, x, y, z, 0);
-                        let mut inv = me.inv.lock().unwrap();
+                        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                         if cnt > 1 {
                             inv.insert(36 + held_slot, (908, cnt - 1, _hc));
                             let free = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
@@ -8944,8 +8944,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         write_varint(&mut p, 0);
                         p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                         p.extend_from_slice(&slot_wire(&(i2, c2, _cc)));
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
                     let replaceable = matches!(
@@ -8955,20 +8955,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if (item == 909 || item == 910) && replaceable {
                         let st = if item == 909 { 80 } else { 96 };
                         if !place((tx, ty, tz), st) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                             continue;
                         }
-                        if *me.gm.lock().unwrap() != 1 {
-                            let mut inv = me.inv.lock().unwrap();
+                        if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             inv.insert(36 + held_slot, (908, 1, Vec::new()));
                             drop(inv);
                             let mut p = vec![0u8];
                             write_varint(&mut p, 0);
                             p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(908, 1, Vec::new())));
-                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                         }
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
                 }
@@ -8988,15 +8988,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         || crate::worldgen::dimension_spec(dim)
                             .is_some_and(|spec| spec.bed_works);
                     if bed_works && sleep_ok {
-                        let angle = me.pos.lock().unwrap().3;
+                        let angle = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
                         let position = (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5);
                         {
-                            let mut spawn_dim = me.spawn_dim.lock().unwrap();
-                            *me.spawn_pt.lock().unwrap() =
+                            let mut spawn_dim = me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner());
+                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
                                 Some((position.0, position.1, position.2, angle));
                             *spawn_dim = dim;
                         }
-                        let inventory = me.inv.lock().unwrap().clone();
+                        let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let mut snapshot = PlayerSave::capture(&me, client_dim_pos(&me), &inventory);
                         snapshot.respawn = Some(SpawnTarget {
                             kind: SpawnTargetKind::Bed,
@@ -9005,18 +9005,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             angle,
                             forced: false,
                         });
-                        saved_players().lock().unwrap().insert(me.uuid, snapshot);
+                        saved_players().lock().unwrap_or_else(|e| e.into_inner()).insert(me.uuid, snapshot);
                         let mut sp = Vec::new();
                         write_pos(&mut sp, x, y, z);
                         sp.extend_from_slice(&angle.to_be_bytes());
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x56, sp);
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x56, sp);
                         // Vanilla `startSleepInBed`: the player lies down and
                         // `sleep_tick` skips the night once enough Overworld
                         // players have slept 100 ticks
                         // (playersSleepingPercentage).
                         enter_bed(&me, x, y, z);
                     }
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 // door toggle: flip open bit on both halves
@@ -9028,7 +9028,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             note_block_update_dim(dim, x, y + dy, z, st ^ 2);
                         }
                     }
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 // fence gate toggle (open bit = stride 2)
@@ -9036,17 +9036,17 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let st = block_at_dim(dim, x, y, z);
                     set_block_dim(dim, x, y, z, st ^ 2);
                     note_block_update_dim(dim, x, y, z, st ^ 2);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 if trapdoor_state(block_at_dim(dim, x, y, z)) {
                     try_toggle_trapdoor(dim, x, y, z);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
                 // hotbar slots are window slots 36..=44
                 let held = {
-                    let inv = me.inv.lock().unwrap();
+                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                     inv.get(&(36 + held_slot)).cloned()
                 };
                 // bone meal on crops: +2..4 stages, consume 1
@@ -9057,10 +9057,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         let bump = 2 + ((x.wrapping_mul(7) ^ z.wrapping_mul(13) ^ y) & 1) as u8;
                         let nage = (age + bump).min(7);
                         set_block_dim(dim, x, y, z, 4278 + nage as u32);
-                        crops().lock().unwrap().insert((dim, x, y, z), nage);
+                        crops().lock().unwrap_or_else(|e| e.into_inner()).insert((dim, x, y, z), nage);
                         note_block_update_dim(dim, x, y, z, 4278 + nage as u32);
-                        if *me.gm.lock().unwrap() != 1 {
-                            let mut inv = me.inv.lock().unwrap();
+                        if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some((it, c, _cc)) = inv.get(&(36 + held_slot)).cloned() {
                                 if c <= 1 {
                                     inv.remove(&(36 + held_slot));
@@ -9077,9 +9077,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             write_varint(&mut p, 0);
                             p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                         }
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
                 }
@@ -9090,10 +9090,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if is_hoe && tillable && face == 1 {
                         let fm = name_to_state("farmland").unwrap_or(0);
                         if !place((x, y, z), fm) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                             continue;
                         }
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
                     // wheat seeds on farmland -> wheat age0 + consume seed
@@ -9101,12 +9101,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         && block_at_dim(dim, x, y, z) == name_to_state("farmland").unwrap_or(u32::MAX)
                     {
                         if !place((tx, ty, tz), 4278) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                             continue;
                         }
-                        crops().lock().unwrap().insert((dim, tx, ty, tz), 0);
-                        if *me.gm.lock().unwrap() != 1 {
-                            let mut inv = me.inv.lock().unwrap();
+                        crops().lock().unwrap_or_else(|e| e.into_inner()).insert((dim, tx, ty, tz), 0);
+                        if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some((it, c, _cc)) = inv.get(&(36 + held_slot)).cloned() {
                                 if c <= 1 {
                                     inv.remove(&(36 + held_slot));
@@ -9123,30 +9123,30 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             write_varint(&mut p, 0);
                             p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                         }
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
                 }
                 if let Some((item, _cnt, _)) = held {
                     if let Some(sb) = sign_base_for_item(item) {
                         let yaw = {
-                            let p = me.pos.lock().unwrap();
+                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                             p.3
                         } as f64;
                         let rot = (((180.0 + yaw) * 16.0 / 360.0 + 0.5) as i64 & 15) as u32;
                         let st = sb + rot * 2 + 1;
                         if !place((tx, ty, tz), st) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                             continue;
                         }
                         ac_consume_placed_item(&me, held_slot);
                         let mut op = Vec::new();
                         write_pos(&mut op, tx, ty, tz);
                         op.push(1);
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x34, op);
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x34, op);
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
                     if try_live_block_placement(
@@ -9157,7 +9157,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         item,
                         clicked,
                     ) {
-                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
                     if let Some(st) = item_to_state(item) {
@@ -9167,8 +9167,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         // `waterlogged` from the fluid it replaces.
                         let st = match chest_kind(st) {
                             Some(name) => {
-                                let yaw = me.pos.lock().unwrap().3;
-                                let sneaking = *me.sneaking.lock().unwrap();
+                                let yaw = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+                                let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
                                 chest_placement_state_dim(
                                     dim,
                                     name,
@@ -9185,7 +9185,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         }
                     }
                 }
-                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
             }
             0x36 => {
                 // arm_animation: relay swing to others
@@ -9215,12 +9215,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
                     if !connection_limits::chat_text_valid(&m) {
                         eprintln!("[spine] {} disconnected: illegal chat command", me.name);
-                        play_disconnect(&mut me.sock.lock().unwrap(), "Illegal characters in chat");
+                        play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Illegal characters in chat");
                         break 'conn;
                     }
                     if !chat_throttle.allow(Instant::now()) {
                         eprintln!("[spine] {} disconnected: chat spam", me.name);
-                        play_disconnect(&mut me.sock.lock().unwrap(), "Kicked for spamming!");
+                        play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Kicked for spamming!");
                         break 'conn;
                     }
 
@@ -9245,7 +9245,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // vanilla entity_interaction_range = 3.0; gate all attack/interact
                 // uses so distant entities can't be hit/sheared/bred cross-map.
                 {
-                    let (px, py, pz, ..) = *me.pos.lock().unwrap();
+                    let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     let vt: Option<Arc<Client>> = {
                         clients()
                             .lock()
@@ -9256,18 +9256,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     };
                     let tp = vt
                         .map(|v| {
-                            let p = *v.pos.lock().unwrap();
+                            let p = *v.pos.lock().unwrap_or_else(|e| e.into_inner());
                             (p.0, p.1, p.2, false)
                         })
                         .or_else(|| {
-                            let ms = mobs().lock().unwrap();
+                            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
                             ms.iter().find(|m| m.eid == target).map(|m| {
-                                let p = *m.pos.lock().unwrap();
+                                let p = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
                                 (p.0, p.1, p.2, false)
                             })
                         })
                         .or_else(|| {
-                            let gen = generated_content().lock().unwrap();
+                            let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
                             gen.carts
                                 .iter()
                                 .find(|c| c.eid == target)
@@ -9308,7 +9308,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         .find(|c| c.eid == target)
                         .and_then(|c| c.uuid().ok());
                     if let Some(uuid) = cart_uuid {
-                        if *me.gm.lock().unwrap() != 3 {
+                        if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 3 {
                             unpack_cart_loot_if_needed(uuid);
                             let key = ContainerKey::Cart(uuid);
                             let (audience, before) =
@@ -9324,7 +9324,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     (Vec::new(), Vec::new())
                                 };
                             close_live_menu(&me, false, true);
-                            let inv = me.inv.lock().unwrap().clone();
+                            let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                             open_chest_for_client(
                                 &me,
                                 (key, None),
@@ -9386,16 +9386,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if held_it == 983 && !is_villager {
                         // shears on sheep -> wool
                         let is_sheep = {
-                            let ms = mobs().lock().unwrap();
+                            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
                             ms.iter().any(|m| m.eid == target && m.etype == 87)
                         };
-                        if is_sheep && !sheared().lock().unwrap().contains(&target) {
-                            sheared().lock().unwrap().insert(target);
+                        if is_sheep && !sheared().lock().unwrap_or_else(|e| e.into_inner()).contains(&target) {
+                            sheared().lock().unwrap_or_else(|e| e.into_inner()).insert(target);
                             let (mx, my, mz) = {
-                                let ms = mobs().lock().unwrap();
+                                let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
                                 ms.iter()
                                     .find(|m| m.eid == target)
-                                    .map(|m| *m.pos.lock().unwrap())
+                                    .map(|m| *m.pos.lock().unwrap_or_else(|e| e.into_inner()))
                                     .map(|p| (p.0, p.1, p.2))
                                     .unwrap_or((0.0, 0.0, 0.0))
                             };
@@ -9414,7 +9414,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     target: None,
                                     thrower: None,
                                 };
-                                drops().lock().unwrap().push(d);
+                                drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
                             }
                             continue;
                         }
@@ -9422,14 +9422,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if held_it == 908 && !is_villager {
                         // bucket on cow/sheep -> milk
                         let milkable = {
-                            let ms = mobs().lock().unwrap();
+                            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
                             ms.iter()
                                 .any(|m| m.eid == target && [22i64, 77].contains(&m.etype))
                         };
                         if milkable {
                             let k = 36 + held_slot;
                             {
-                                let mut inv = me.inv.lock().unwrap();
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 let c = inv.get(&k).map(|v| v.1).unwrap_or(0);
                                 if c <= 1 {
                                     inv.insert(k, (914, 1, Vec::new()));
@@ -9441,7 +9441,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 }
                             }
                             let (it2, c2, _c2) =
-                                me.inv.lock().unwrap().get(&k).cloned().unwrap_or((
+                                me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&k).cloned().unwrap_or((
                                     0,
                                     0,
                                     Vec::new(),
@@ -9450,7 +9450,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             write_varint(&mut p, 0);
                             p.extend_from_slice(&k.to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it2, c2, _c2)));
-                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                             continue;
                         }
                     }
@@ -9458,7 +9458,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         // Keep the legacy wheat interaction and accept the GP-1 temptation items.
                         let mut loved = false;
                         {
-                            let ms = mobs().lock().unwrap();
+                            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(m) = ms
                                 .iter()
                                 .find(|m| m.eid == target && match m.etype {
@@ -9468,13 +9468,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     _ => false,
                                 })
                             {
-                                *m.love.lock().unwrap() = 80;
+                                *m.love.lock().unwrap_or_else(|e| e.into_inner()) = 80;
                                 loved = true;
                             }
                         }
                         if loved {
-                            if *me.gm.lock().unwrap() != 1 {
-                                let mut inv = me.inv.lock().unwrap();
+                            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 let k = 36 + held_slot;
                                 if let Some((it, c, _kc)) = inv.get(&k).cloned() {
                                     if c > 1 {
@@ -9490,7 +9490,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&k.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                             }
                             continue;
                         }
@@ -9509,7 +9509,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     }
                     // PvP: target may be another player
                     if target != me.eid {
-                        let gm = *me.gm.lock().unwrap();
+                        let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
                         if gm != 3 && break_generated_cart(target, gm != 1) {
                             continue;
                         }
@@ -9527,11 +9527,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     .cloned()
                             };
                             if let Some(v) = vic.as_ref() {
-                                if *v.gm.lock().unwrap() == 1 {
+                                if *v.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
                                 } else {
                                     // vanilla: attack_damage attribute (fist=1) + held item bonus + sharpness
                                     let held = {
-                                        let i2 = me.inv.lock().unwrap();
+                                        let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                         i2.get(&(36 + held_slot)).cloned().unwrap_or((
                                             0,
                                             0,
@@ -9569,12 +9569,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     // attr default 1 = fist; an attribute-set value adds on top
                                     let chg = melee_charge(&me, held.0);
                                     let crt = {
-                                        let (_px, py, _pz, _, _, g) = *me.pos.lock().unwrap();
-                                        let ff = *me.fall_from.lock().unwrap();
+                                        let (_px, py, _pz, _, _, g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                                        let ff = *me.fall_from.lock().unwrap_or_else(|e| e.into_inner());
                                         !g && py < ff - 0.1
                                     };
                                     let (strb, wkb) = {
-                                        let ef = me.effs.lock().unwrap();
+                                        let ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
                                         (
                                             ef.iter()
                                                 .find(|e| e.id == 4)
@@ -9609,20 +9609,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         continue;
                                     };
                                     let dmg = accepted;
-                                    *me.walk_acc.lock().unwrap() += 0.1;
+                                    *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.1;
                                     // vanilla: an axe hit disables a raised shield for 5s
-                                    if kind == 3 && *v.blocking.lock().unwrap() {
-                                        *v.blocking.lock().unwrap() = false;
-                                        *v.shield_cd.lock().unwrap() = Instant::now();
+                                    if kind == 3 && *v.blocking.lock().unwrap_or_else(|e| e.into_inner()) {
+                                        *v.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                                        *v.shield_cd.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                                     }
                                     let vb = kind != 3
-                                        && *v.blocking.lock().unwrap()
-                                        && v.shield_cd.lock().unwrap().elapsed()
+                                        && *v.blocking.lock().unwrap_or_else(|e| e.into_inner())
+                                        && v.shield_cd.lock().unwrap_or_else(|e| e.into_inner()).elapsed()
                                             > Duration::from_secs(5);
                                     if vb {
                                         damage_shield(v, dmg);
                                     }
-                                    let mut h = v.hp.lock().unwrap();
+                                    let mut h = v.hp.lock().unwrap_or_else(|e| e.into_inner());
                                     *h = (*h
                                         - if vb {
                                             0.0
@@ -9633,7 +9633,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     if *h <= 0.0 {
                                         drop(h);
                                         totem_check(v);
-                                        h = v.hp.lock().unwrap();
+                                        h = v.hp.lock().unwrap_or_else(|e| e.into_inner());
                                     }
                                     let hh = *h;
                                     drop(h);
@@ -9642,13 +9642,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     }
                                     if damage_held(&me) {
                                         let (pxx, pyy, pzz, ..) = {
-                                            let p = me.pos.lock().unwrap();
+                                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                             *p
                                         };
                                         let snd =
                                             sound_pkt_named("entity.item.break", pxx, pyy, pzz);
                                         broadcast_near(
-                                            *me.dim.lock().unwrap(),
+                                            *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
                                             pxx,
                                             pyy,
                                             pzz,
@@ -9658,8 +9658,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     }
                                     held_slot_resync(&me);
                                     if starts_hurt_window && !vb && dmg > 0.0 {
-                                        let attacker_dim = *me.dim.lock().unwrap();
-                                        let victim_dim = *v.dim.lock().unwrap();
+                                        let attacker_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                                        let victim_dim = *v.dim.lock().unwrap_or_else(|e| e.into_inner());
                                         if attacker_dim == victim_dim {
                                             broadcast_player_attack_damage(
                                                 v.eid, me.eid, victim_dim,
@@ -9668,11 +9668,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     }
                                     let (pp, vp) = (
                                         {
-                                            let p = me.pos.lock().unwrap();
+                                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                             *p
                                         },
                                         {
-                                            let p = v.pos.lock().unwrap();
+                                            let p = v.pos.lock().unwrap_or_else(|e| e.into_inner());
                                             *p
                                         },
                                     );
@@ -9709,7 +9709,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             broadcast_seen_ex(veid, veid, |_c| (0x24, hurt_pkt.clone()));
                             if hh <= 0.0 {
                                 let victim = {
-                                    clients().lock().unwrap().iter().find(|c| c.eid == veid).cloned()
+                                    clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid == veid).cloned()
                                 };
                                 if let Some(victim) = victim {
                                     drop_player_items_on_death(&victim);
@@ -9728,24 +9728,24 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let mut dead: Vec<(i32, i64, f64, f64, f64)> = Vec::new();
                     let mut swept: Vec<i32> = Vec::new();
                     {
-                        let ms = mobs().lock().unwrap();
+                        let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(m) = ms.iter().find(|m| m.eid == target) {
-                            if m.dim != *me.dim.lock().unwrap() {
+                            if m.dim != *me.dim.lock().unwrap_or_else(|e| e.into_inner()) {
                                 continue;
                             }
                             // vanilla hurtTime: 0.5s of invulnerability after a hit
                             let fresh =
-                                m.hurt_at.lock().unwrap().elapsed() >= Duration::from_millis(500);
+                                m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= Duration::from_millis(500);
                             if fresh {
                                 if !live_mob_hit_allowed(m, me.eid, BossHit::Other) {
                                     continue;
                                 }
-                                *m.hurt_at.lock().unwrap() = Instant::now();
+                                *m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                             }
                             if fresh {
-                                *me.walk_acc.lock().unwrap() += 0.1;
+                                *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.1;
                                 let held = {
-                                    let i2 = me.inv.lock().unwrap();
+                                    let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                     i2.get(&(36 + held_slot))
                                         .cloned()
                                         .unwrap_or((0, 0, Vec::new()))
@@ -9793,8 +9793,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 let scale = 0.2 + 0.8 * charge * charge;
                                 // Vanilla criticals require a charged attack and exclude
                                 // sprinting, water, climbable blocks, and blindness.
-                                let (px, py, pz, _, _, grounded) = *me.pos.lock().unwrap();
-                                let dim = *me.dim.lock().unwrap();
+                                let (px, py, pz, _, _, grounded) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                                let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                                 let (bx, by, bz) = (
                                     px.floor() as i32,
                                     py.floor() as i32,
@@ -9832,19 +9832,19 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     .unwrap()
                                     .iter()
                                     .any(|effect| effect.id == 14);
-                                let ff = *me.fall_from.lock().unwrap();
+                                let ff = *me.fall_from.lock().unwrap_or_else(|e| e.into_inner());
                                 let crit = melee_critical_allowed(
                                     charge,
                                     grounded,
                                     py < ff - 0.1,
-                                    *me.fall_fly.lock().unwrap(),
-                                    *me.sprinting.lock().unwrap(),
+                                    *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()),
+                                    *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()),
                                     in_water,
                                     climbing,
                                     blind,
                                 );
                                 let (strb, wkb) = {
-                                    let ef = me.effs.lock().unwrap();
+                                    let ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
                                     (
                                         ef.iter()
                                             .find(|e| e.id == 4)
@@ -9860,21 +9860,21 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             * -4.0,
                                     )
                                 };
-                                let mut h = m.hp.lock().unwrap();
+                                let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
                                 *h -= ((wep + sharp + spec + strb + wkb).max(0.0))
                                     * scale
                                     * if crit { 1.5 } else { 1.0 };
                                 drop(h);
                                 // Vanilla swords sweep even without Sweeping Edge.
                                 if kind == 0 {
-                                    let (mx, my, mz, ..) = *m.pos.lock().unwrap();
+                                    let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
                                     let (width, height) = entity_dimensions_1211(m.etype);
                                     let target_box = PlayerAabb {
                                         min: [mx - f64::from(width) / 2.0, my, mz - f64::from(width) / 2.0],
                                         max: [mx + f64::from(width) / 2.0, my + f64::from(height), mz + f64::from(width) / 2.0],
                                     };
                                     for other in ms.iter().filter(|other| other.eid != m.eid && other.dim == dim) {
-                                        let (ox, oy, oz, ..) = *other.pos.lock().unwrap();
+                                        let (ox, oy, oz, ..) = *other.pos.lock().unwrap_or_else(|e| e.into_inner());
                                         let (ow, oh) = entity_dimensions_1211(other.etype);
                                         let candidate = PlayerAabb {
                                             min: [ox - f64::from(ow) / 2.0, oy, oz - f64::from(ow) / 2.0],
@@ -9883,7 +9883,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         let sweep = sweeping_attack(
                                             charge,
                                             grounded,
-                                            *me.sprinting.lock().unwrap(),
+                                            *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()),
                                             crit,
                                             [px, py, pz],
                                             target_box,
@@ -9894,13 +9894,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         if !sweep.eligible || !live_mob_hit_allowed(other, me.eid, BossHit::Other) {
                                             continue;
                                         }
-                                        let mut hurt_at = other.hurt_at.lock().unwrap();
+                                        let mut hurt_at = other.hurt_at.lock().unwrap_or_else(|e| e.into_inner());
                                         if hurt_at.elapsed() < Duration::from_millis(500) {
                                             continue;
                                         }
                                         *hurt_at = Instant::now();
                                         drop(hurt_at);
-                                        let mut health = other.hp.lock().unwrap();
+                                        let mut health = other.hp.lock().unwrap_or_else(|e| e.into_inner());
                                         if *health <= 0.0 {
                                             continue;
                                         }
@@ -9915,16 +9915,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 // Fire Aspect adds four seconds of independent burn time per level.
                                 let fa = enchant_level(&held.2, 10);
                                 if fa > 0 && !mob_fire_immune(m.etype) {
-                                    *m.fire_ticks.lock().unwrap() = fire_aspect_duration_ticks(fa);
+                                    *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = fire_aspect_duration_ticks(fa);
                                 }
                                 if damage_held(&me) {
                                     let (pxx, pyy, pzz, ..) = {
-                                        let p = me.pos.lock().unwrap();
+                                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                         *p
                                     };
                                     let snd = sound_pkt_named("entity.item.break", pxx, pyy, pzz);
                                     broadcast_near(
-                                        *me.dim.lock().unwrap(),
+                                        *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
                                         pxx,
                                         pyy,
                                         pzz,
@@ -9933,26 +9933,26 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     );
                                 }
                                 held_slot_resync(&me);
-                                let h = m.hp.lock().unwrap();
+                                let h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
                                 if *h <= 0.0 {
                                     let (mx, my, mz, ..) = {
-                                        let p = m.pos.lock().unwrap();
+                                        let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
                                         *p
                                     };
                                     dead.push((m.eid, m.etype, mx, my, mz));
                                 }
                                 let ha = hurt_anim(m.eid);
                                 let _ =
-                                    send_packet(&mut me.sock.lock().unwrap(), 0x24, ha.clone());
+                                    send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x24, ha.clone());
                                 broadcast_seen_ex(me.eid, me.eid, |_c| (0x24, ha.clone()));
                                 // knockback away from attacker
                                 let (pp, mp) = (
                                     {
-                                        let p = me.pos.lock().unwrap();
+                                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                         *p
                                     },
                                     {
-                                        let p = m.pos.lock().unwrap();
+                                        let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
                                         *p
                                     },
                                 );
@@ -9968,16 +9968,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 );
                                 broadcast_seen(m.eid, |_c| (0x5a, vp.clone()));
                                 // vanilla: sprint attacks add knockback and reset the sprint
-                                let sprint_hit = *me.sprinting.lock().unwrap();
+                                let sprint_hit = *me.sprinting.lock().unwrap_or_else(|e| e.into_inner());
                                 if sprint_hit {
-                                    *me.sprinting.lock().unwrap() = false;
+                                    *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = false;
                                 }
                                 let kbs = 0.6
                                     + 0.6 * enchant_level(&held.2, 17) as f64
                                     + if sprint_hit { 0.5 } else { 0.0 };
                                 let (nx, nz) = (mp.0 + kx * kbs, mp.2 + kz * kbs);
                                 {
-                                    let mut p = m.pos.lock().unwrap();
+                                    let mut p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
                                     p.0 = nx;
                                     p.2 = nz;
                                 }
@@ -10009,17 +10009,17 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             broadcast(-1, |_c| (0x6c, line.clone()));
                         }
                         let Some((mob, state)) = remove_live_mob(deid) else { continue };
-                        let burn_kill = *mob.fire_ticks.lock().unwrap() > 0;
+                        let burn_kill = *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0;
                         live_mob_death(&mob, state, [mx, my, mz]);
                         broadcast_seen_destroy(deid);
-                        let was_sheared = sheared().lock().unwrap().remove(&deid);
+                        let was_sheared = sheared().lock().unwrap_or_else(|e| e.into_inner()).remove(&deid);
                         // A dead vehicle drops its riders, a dead rider leaves
                         // its seat, and the mob's equipment record dies with it.
                         live_mount_forget(deid);
-                        mob_equipment().lock().unwrap().remove(&deid);
+                        mob_equipment().lock().unwrap_or_else(|e| e.into_inner()).remove(&deid);
                         // looting: +0..level extra count per drop
                         let held2 = {
-                            let i2 = me.inv.lock().unwrap();
+                            let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             i2.get(&(36 + held_slot))
                                 .cloned()
                                 .unwrap_or((0, 0, Vec::new()))
@@ -10047,10 +10047,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 target: None,
                                 thrower: None,
                             };
-                            drops().lock().unwrap().push(d);
+                            drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
                         }
                         let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                        xps().lock().unwrap().push(Xp {
+                        xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
                             eid: xeid,
                             x: mx,
                             y: my,
@@ -10100,7 +10100,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let action = read_varint(&mut sl);
                 if action == Some(1) && sl.is_empty() {
                     let body = {
-                        let mut stats = player_stats().lock().unwrap();
+                        let mut stats = player_stats().lock().unwrap_or_else(|e| e.into_inner());
                         let stats = stats.entry(me.uuid).or_insert_with(PlayerStats::new);
                         // P8b-2: the protocol-767 `award_stats` payload comes
                         // from the P8b-2 codec over the live counter book —
@@ -10115,12 +10115,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             .collect();
                         encode_award_stats_0x04(&entries)
                     };
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x04, body);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x04, body);
                 } else if action == Some(0) && sl.is_empty() {
                     drop_player_items_on_death(&me);
                     let restored_health = max_hp_of(&me.name);
                     {
-                        let mut health = me.hp.lock().unwrap();
+                        let mut health = me.hp.lock().unwrap_or_else(|e| e.into_inner());
                         if *health > 0.0 {
                             continue;
                         }
@@ -10129,28 +10129,28 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     // `ServerPlayer.stopRiding` on death: the respawn starts
                     // unmounted wherever the death happened.
                     player_dismount(&me, false);
-                    death_drop_marks().lock().unwrap().remove(&me.eid);
+                    death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&me.eid);
                     close_live_menu(&me, true, true);
                     // P2-3-S4: respawn in the dimension the spawn point belongs to. A
                     // death in the Nether returns to the Overworld bed/world spawn when that
                     // is where the spawn point was set, with a full window rebuild.
                     let (sdim, (rx, ry, rz, yaw)) = {
-                        let sdim = me.spawn_dim.lock().unwrap();
-                        let point = *me.spawn_pt.lock().unwrap();
+                        let sdim = me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner());
+                        let point = *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner());
                         match point {
                             Some(point) => (*sdim, point),
-                            None => (DimId::Overworld, *WORLD_SPAWN.lock().unwrap()),
+                            None => (DimId::Overworld, *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner())),
                         }
                     };
                     switch_client_dimension(&me, sdim, (rx, ry, rz, yaw, 0.0), view);
                     reset_player_food(&me);
                     let _ = send_player_xp(&me, |_| Ok(()));
                     {
-                        let iv = me.inv.lock().unwrap();
-                        *me.armor_pts.lock().unwrap() = armor_pts_of(&iv);
+                        let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&iv);
                     }
                     let _ = send_packet(
-                        &mut me.sock.lock().unwrap(),
+                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
                         0x5d,
                         health_pkt_c(max_hp_of(&me.name), &me),
                     );
@@ -10161,15 +10161,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     write_varint(&mut q, 0);
                     write_varint(&mut q, 46);
                     {
-                        let iv = me.inv.lock().unwrap();
+                        let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                         for i in 0..46i16 {
                             let (it, c, _cc) = iv.get(&i).cloned().unwrap_or((0, 0, Vec::new()));
                             q.extend_from_slice(&slot_wire(&(it, c, _cc)));
                         }
                     }
                     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); // carried
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x13, q);
-                    let inventory = me.inv.lock().unwrap().clone();
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x13, q);
+                    let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     save_live_player_snapshot(&me, client_dim_pos(&me), &inventory);
                 }
             }
@@ -10180,7 +10180,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 eprintln!("[spine] resource_pack status {status:?}");
                 if resource_pack_status_disconnects(status) {
                     play_disconnect(
-                        &mut me.sock.lock().unwrap(),
+                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
                         "This server requires the configured resource pack.",
                     );
                     break 'conn;
@@ -10199,11 +10199,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         *l = String::from_utf8_lossy(&sl[..m]).into_owned();
                         sl = &sl[m..];
                     }
-                    let dim = *me.dim.lock().unwrap();
-                    let pos = *me.pos.lock().unwrap();
+                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    let pos = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     // ServerPlayer's sign edit path checks mayInteract and the
                     // eight-block squared distance before changing the block entity.
-                    if !matches!(*me.gm.lock().unwrap(), 0 | 1)
+                    if !matches!(*me.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 1)
                         || !sign_edit_in_range((pos.0, pos.1, pos.2), sx, sy, sz)
                         || !is_sign_block_state(block_at_dim(dim, sx, sy, sz))
                     {
@@ -10220,7 +10220,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             }
             0x32 => {
                 // set_creative_slot: slot i16 + slot data (creative only)
-                if b.len() >= 3 && *me.gm.lock().unwrap() == 1 {
+                if b.len() >= 3 && *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
                     let Some((slot, st)) = slot_read_wire(&b) else {
                         continue;
                     };
@@ -10230,20 +10230,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         continue;
                     }
                     if st.1 > 0 {
-                        me.inv.lock().unwrap().insert(slot, st.clone());
+                        me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(slot, st.clone());
                     } else {
-                        me.inv.lock().unwrap().remove(&slot);
+                        me.inv.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
                     }
                     {
-                        let iv = me.inv.lock().unwrap();
-                        *me.armor_pts.lock().unwrap() = armor_pts_of(&iv);
+                        let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&iv);
                     }
                     // echo container set_slot (0x15): window 0, stateId 0
                     let mut p = vec![0u8];
                     write_varint(&mut p, 0);
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&st));
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                 }
             }
             0x0d => {
@@ -10296,20 +10296,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 };
                 let primary = primary.and_then(beacon_effect_from_wire);
                 let secondary = secondary.and_then(beacon_effect_from_wire);
-                let dim = *me.dim.lock().unwrap();
+                let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some((bdim, bx, by, bz)) = live_beacon_anchor(&me, dim) {
                     let applied = with_save_guard(|| {
                         let Some(reg) = crate::block_registry::breg() else {
                             return false;
                         };
                         let state = block_at_dim(bdim, bx, by, bz);
-                        let mut store = live_block_entities().lock().unwrap();
+                        let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
                         let Some(LiveBlockEntity::Beacon(beacon)) =
                             store.at(reg, (bdim, bx, by, bz), state)
                         else {
                             return false;
                         };
-                        let held_slot = 36 + *me.held.lock().unwrap();
+                        let held_slot = 36 + *me.held.lock().unwrap_or_else(|e| e.into_inner());
                         let stack = me
                             .inv
                             .lock()
@@ -10321,7 +10321,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         if !beacon.confirm(primary, secondary, &mut payment) {
                             return false;
                         }
-                        map_take(&mut me.inv.lock().unwrap(), held_slot, 1);
+                        map_take(&mut me.inv.lock().unwrap_or_else(|e| e.into_inner()), held_slot, 1);
                         true
                     });
                     if applied {
@@ -10364,26 +10364,26 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let cdim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                     let halves = client_window_halves_dim(open, anchor, cdim);
                     let before = chest_opener_snapshot_dim(&audience, &halves);
-                    *me.open_chest.lock().unwrap() = None;
-                    *me.chest_sync.lock().unwrap() = None;
+                    *me.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    *me.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     sync_chest_openers_dim(&audience, &before);
                 }
                 let had_container = chest_window.is_some()
-                    || me.open_furnace.lock().unwrap().is_some()
-                    || *me.open_table.lock().unwrap();
-                *me.open_chest.lock().unwrap() = None;
-                *me.chest_sync.lock().unwrap() = None;
-                *me.open_furnace.lock().unwrap() = None;
-                *me.open_table.lock().unwrap() = false;
-                beacon_menu_anchors().lock().unwrap().remove(&me.eid);
+                    || me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+                    || *me.open_table.lock().unwrap_or_else(|e| e.into_inner());
+                *me.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *me.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                beacon_menu_anchors().lock().unwrap_or_else(|e| e.into_inner()).remove(&me.eid);
                 if had_container {
                     // vanilla containerMenu.removed: the carried stack is
                     // thrown into the world, crafting grid goes back to inv
                     let cur =
-                        std::mem::take(&mut *me.cursor.lock().unwrap());
+                        std::mem::take(&mut *me.cursor.lock().unwrap_or_else(|e| e.into_inner()));
                     if cur.1 > 0 {
-                        let (px, py, pz, ..) = *me.pos.lock().unwrap();
-                        drops().lock().unwrap().push(Drop {
+                        let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
                             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                             x: px,
                             y: py + 1.3,
@@ -10396,9 +10396,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             thrower: None,
                         });
                     }
-                    let mut inv = me.inv.lock().unwrap();
+                    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                     for g in [&me.craft, &me.craft9] {
-                        for (_, st) in std::mem::take(&mut *g.lock().unwrap()) {
+                        for (_, st) in std::mem::take(&mut *g.lock().unwrap_or_else(|e| e.into_inner())) {
                             if st.1 > 0 {
                                 let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
                                 inv.insert(slot, st);
@@ -10406,7 +10406,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         }
                     }
                     drop(inv);
-                    *me.drag.lock().unwrap() = (-1, Vec::new());
+                    *me.drag.lock().unwrap_or_else(|e| e.into_inner()) = (-1, Vec::new());
                 }
             }
             0x0e
@@ -10432,7 +10432,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 // pushes the authoritative contents first, then
                                 // processes the click anyway.
                                 let _ = live_menu_connection(&me).is_some_and(|conn| {
-                                    let mut session = conn.active.lock().unwrap();
+                                    let mut session = conn.active.lock().unwrap_or_else(|e| e.into_inner());
                                     match session.as_mut() {
                                         Some(s)
                                             if s.id == wid && s.state_id != click_state_id =>
@@ -10447,11 +10447,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             }
                             continue;
                         }
-                        let active = if me.open_chest.lock().unwrap().is_some() {
+                        let active = if me.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
                             1
-                        } else if me.open_furnace.lock().unwrap().is_some() {
+                        } else if me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
                             2
-                        } else if *me.open_table.lock().unwrap() {
+                        } else if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
                             3
                         } else {
                             0
@@ -10465,18 +10465,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         if container_state_stale(&me, wid, click_state_id) {
                             resend_container_content(&me, wid);
                         }
-                        let creative = *me.gm.lock().unwrap() == 1;
+                        let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
                         if wid == 0 && (5..=8).contains(&slot) && matches!(mode, 0 | 1 | 4) {
-                            let stack = me.inv.lock().unwrap().get(&slot).cloned();
+                            let stack = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&slot).cloned();
                             if armor_removal_blocked(slot, stack.as_ref(), creative) {
                                 resync_slot(&me, 0, slot, &stack.unwrap());
-                                let cursor = me.cursor.lock().unwrap().clone();
+                                let cursor = me.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 resync_slot(&me, 0, -1, &cursor);
                                 continue;
                             }
                         }
                         if mode == 0 {
-                            let chest_pos = *me.open_chest.lock().unwrap();
+                            let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some((cp, cp2)) = chest_pos {
                                 if !window_live_for(&me, (cp, cp2)) {
                                     invalidate_client_chest_window(
@@ -10488,9 +10488,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 }
                                 // chest window: single 0-26 chest,27-62 inv | double 0-26 A,27-53 B,54-89 inv
                                 let rows = if cp2.is_some() { 54i16 } else { 27i16 };
-                                let mut all = chests().lock().unwrap();
-                                let mut inv = me.inv.lock().unwrap();
-                                let mut cur = me.cursor.lock().unwrap();
+                                let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
                                 if slot == -999 {
                                     if cur.1 > 0 {
                                         // vanilla: left-click outside = throw whole stack, right-click = one
@@ -10502,7 +10502,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             cur.1 -= n;
                                         }
                                         let (px, py, pz, ..) = {
-                                            let p = me.pos.lock().unwrap();
+                                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                             *p
                                         };
                                         let d = Drop {
@@ -10517,7 +10517,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             target: None,
                                             thrower: Some(me.uuid),
                                         };
-                                        drops().lock().unwrap().push(d);
+                                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
                                     }
                                 } else if slot >= 0 && slot < rows + 36 {
                                     let (gslot, gmap): (i16, &mut HashMap<i16, Stack>) =
@@ -10537,9 +10537,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 }
                                 continue;
                             }
-                            let furnace_pos = *me.open_furnace.lock().unwrap();
+                            let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(fp) = furnace_pos {
-                                let mut fs = furnaces().lock().unwrap();
+                                let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
                                 let f = fs.entry(fp).or_insert(Furnace {
                                     input: (0, 0, Vec::new()),
                                     fuel: (0, 0, Vec::new()),
@@ -10551,8 +10551,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     recipe_cache: CachedLookup::default(),
                                     fuel_cache: CachedLookup::default(),
                                 });
-                                let mut inv = me.inv.lock().unwrap();
-                                let mut cur = me.cursor.lock().unwrap();
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
                                 if slot == -999 {
                                     if cur.1 > 0 {
                                         // vanilla: left-click outside = throw whole stack, right-click = one
@@ -10564,7 +10564,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             cur.1 -= n;
                                         }
                                         let (px, py, pz, ..) = {
-                                            let p = me.pos.lock().unwrap();
+                                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                             *p
                                         };
                                         let d = Drop {
@@ -10579,7 +10579,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             target: None,
                                             thrower: Some(me.uuid),
                                         };
-                                        drops().lock().unwrap().push(d);
+                                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
                                     }
                                 } else if (0..39).contains(&slot) {
                                     if slot == 2 {
@@ -10597,7 +10597,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             f.output = (0, 0, Vec::new());
                                             f.dirty = true;
                                             let (px, py, pz, ..) = {
-                                                let p = me.pos.lock().unwrap();
+                                                let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                                 *p
                                             };
                                             furnace_xp_pop(f, px, py, pz);
@@ -10662,7 +10662,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     } else {
                                         let islot = slot + 6;
                                         click_slot(&mut inv, &mut cur, islot, btn as i8);
-                                        *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+                                        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                                     }
                                 }
                                 // Snapshot the changed slots before acquiring the socket mutex.
@@ -10674,7 +10674,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 drop(inv);
                                 drop(fs);
                                 if (0..39).contains(&slot) {
-                                    let mut sock = me.sock.lock().unwrap();
+                                    let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
                                     for (wsl, st) in slots.iter().enumerate() {
                                         let mut p = vec![2u8];
                                         write_varint(&mut p, 0);
@@ -10692,10 +10692,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 }
                                 continue;
                             }
-                            if *me.open_table.lock().unwrap() {
-                                let mut grid = me.craft9.lock().unwrap();
-                                let mut inv = me.inv.lock().unwrap();
-                                let mut cur = me.cursor.lock().unwrap();
+                            if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
+                                let mut grid = me.craft9.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
                                 if slot == -999 {
                                     if cur.1 > 0 {
                                         let n = if btn == 1 { 1 } else { cur.1 };
@@ -10706,7 +10706,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             cur.1 -= n;
                                         }
                                         let (px, py, pz, ..) = {
-                                            let p = me.pos.lock().unwrap();
+                                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                             *p
                                         };
                                         let d = Drop {
@@ -10721,7 +10721,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             target: None,
                                             thrower: Some(me.uuid),
                                         };
-                                        drops().lock().unwrap().push(d);
+                                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
                                         drop(cur);
                                         drop(grid);
                                         drop(inv);
@@ -10752,7 +10752,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     click_slot(&mut grid, &mut cur, slot, btn as i8);
                                 } else if (10..=45).contains(&slot) {
                                     click_slot(&mut inv, &mut cur, slot - 1, btn as i8);
-                                    *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+                                    *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                                 }
                                 // echo changed slot + result
                                 let (it, c, _ce) = if slot == 0 {
@@ -10773,13 +10773,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     write_varint(&mut p, 0);
                                     p.extend_from_slice(&slot.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&(it, c, _ce)));
-                                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                                 }
                                 let mut p0 = vec![3u8];
                                 write_varint(&mut p0, 0);
                                 p0.extend_from_slice(&0i16.to_be_bytes());
                                 p0.extend_from_slice(&slot_wire(&(out.0, out.1, Vec::new())));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p0);
+                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p0);
                                 continue;
                             }
                             // Window 0 (player inventory + 2x2 craft grid). Vanilla's
@@ -10787,24 +10787,24 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             // changed, in menu order (result, grid, armor, inventory,
                             // offhand), then the carried stack when it differs from the
                             // stack the client acknowledged in this click.
-                            let pre_grid = me.craft.lock().unwrap().clone();
-                            let pre_inv = me.inv.lock().unwrap().clone();
+                            let pre_grid = me.craft.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            let pre_inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                             let pre_result =
                                 craft_result(&pre_grid).unwrap_or((0, 0, Vec::new()));
                             if slot == -999 {
                                 let cur = {
-                                    let c = me.cursor.lock().unwrap();
+                                    let c = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
                                     c.clone()
                                 };
                                 if cur.1 > 0 {
                                     let n = if btn == 1 { 1 } else { cur.1 };
                                     if n >= cur.1 {
-                                        *me.cursor.lock().unwrap() = (0, 0, Vec::new());
+                                        *me.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, Vec::new());
                                     } else {
-                                        me.cursor.lock().unwrap().1 -= n;
+                                        me.cursor.lock().unwrap_or_else(|e| e.into_inner()).1 -= n;
                                     }
                                     let (px, py, pz, ..) = {
-                                        let p = me.pos.lock().unwrap();
+                                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                         *p
                                     };
                                     let d = Drop {
@@ -10819,12 +10819,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         target: None,
                                         thrower: Some(me.uuid),
                                     };
-                                    drops().lock().unwrap().push(d);
+                                    drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
                                 }
                             } else if slot == 0 {
                                 // craft output: take result, consume one of each ingredient
-                                let mut cur = me.cursor.lock().unwrap();
-                                let mut grid = me.craft.lock().unwrap();
+                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut grid = me.craft.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some((ri, rc, _rc)) = craft_result(&grid) {
                                     if cur.1 == 0
                                         || (cur.0 == ri
@@ -10844,8 +10844,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     }
                                 }
                             } else if (1..=4).contains(&slot) {
-                                let mut grid = me.craft.lock().unwrap();
-                                let mut cur = me.cursor.lock().unwrap();
+                                let mut grid = me.craft.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
                                 click_slot(&mut grid, &mut cur, slot, btn as i8);
                             } else if (5..=8).contains(&slot) || slot == 45 {
                                 // armor + offhand: vanilla restricts armor
@@ -10893,25 +10893,25 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         _ => true,
                                     }
                                 };
-                                let mut inv = me.inv.lock().unwrap();
-                                let mut cur = me.cursor.lock().unwrap();
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
                                 if cur.1 > 0 && armor_slot_ok(cur.0, slot) || cur.1 == 0 {
                                     click_slot(&mut inv, &mut cur, slot, btn as i8);
-                                    *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+                                    *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                                 }
                             } else if (9..=44).contains(&slot) {
-                                let mut inv = me.inv.lock().unwrap();
-                                let mut cur = me.cursor.lock().unwrap();
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
                                 click_slot(&mut inv, &mut cur, slot, btn as i8);
-                                *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+                                *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                             }
-                            let post_grid = me.craft.lock().unwrap().clone();
-                            let post_inv = me.inv.lock().unwrap().clone();
-                            let post_cur = me.cursor.lock().unwrap().clone();
+                            let post_grid = me.craft.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            let post_inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            let post_cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
                             let post_result =
                                 craft_result(&post_grid).unwrap_or((0, 0, Vec::new()));
                             let carried = click_carried_stack(click_tail);
-                            let mut sock = me.sock.lock().unwrap();
+                            let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
                             if post_result != pre_result {
                                 let mut p = vec![0u8];
                                 write_varint(&mut p, 0);
@@ -10968,7 +10968,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             // number-key swap: hovered slot <-> hotbar slot btn (0-8)
                             let hb = 36 + btn as i16;
                             if (0..=8).contains(&btn) {
-                                let chest_pos = *me.open_chest.lock().unwrap();
+                                let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some((cp, cp2)) = chest_pos {
                                     if !window_live_for(&me, (cp, cp2)) {
                                         invalidate_client_chest_window(
@@ -10979,11 +10979,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         continue;
                                     }
                                 }
-                                let furnace_pos = *me.open_furnace.lock().unwrap();
-                                let mut inv = me.inv.lock().unwrap();
+                                let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some((cp, cp2)) = chest_pos {
                                     let rows = if cp2.is_some() { 54i16 } else { 27i16 };
-                                    let mut all = chests().lock().unwrap();
+                                    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
                                     if slot >= 0 && slot < rows + 36 {
                                         let hst = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
                                         if slot < rows {
@@ -11045,7 +11045,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         );
                                     }
                                 } else if let Some(fp) = furnace_pos {
-                                    let mut fs = furnaces().lock().unwrap();
+                                    let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
                                     if (0..39).contains(&slot) {
                                         let hst = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
                                         if slot >= 3 {
@@ -11076,7 +11076,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                                     let st = std::mem::take(&mut f.output);
                                                     f.dirty = true;
                                                     let (px, py, pz, ..) = {
-                                                        let p = me.pos.lock().unwrap();
+                                                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                                         *p
                                                     };
                                                     furnace_xp_pop(f, px, py, pz);
@@ -11124,12 +11124,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         resync_slot(&me, 0, hb, &a);
                                     }
                                 }
-                                *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+                                *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                             }
                         } else if mode == 6 {
                             // double-click: gather all matching stacks in the
                             // window onto the cursor (up to stack cap)
-                            let chest_pos = *me.open_chest.lock().unwrap();
+                            let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some((cp, cp2)) = chest_pos {
                                 if !window_live_for(&me, (cp, cp2)) {
                                     invalidate_client_chest_window(
@@ -11140,12 +11140,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     continue;
                                 }
                             }
-                            let mut cur = me.cursor.lock().unwrap();
-                            let mut inv = me.inv.lock().unwrap();
+                            let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             if cur.1 > 0 {
                                 let cap = item_stack_max(cur.0, &cur.2) as i64;
                                 if let Some((cp, cp2)) = chest_pos {
-                                    let mut all = chests().lock().unwrap();
+                                    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
                                     for pos in [cp].into_iter().chain(cp2) {
                                         let m = all.entry(pos).or_default();
                                         let ks: Vec<i16> = m
@@ -11204,7 +11204,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         } else if mode == 5 {
                             // drag-paint: btn 0/4 start (left/right), 1/5 add slot, 2/6 end
                             let bt = btn as i32;
-                            let mut dr = me.drag.lock().unwrap();
+                            let mut dr = me.drag.lock().unwrap_or_else(|e| e.into_inner());
                             match bt {
                                 0 | 4 => {
                                     dr.0 = bt;
@@ -11220,7 +11220,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         let slots_taken = std::mem::take(&mut dr.1);
                                         dr.0 = -1;
                                         drop(dr);
-                                        let mut cur = me.cursor.lock().unwrap();
+                                        let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
                                         if cur.1 > 0 && !slots_taken.is_empty() {
                                             let per = (cur.1 as usize / slots_taken.len()) as u8;
                                             // vanilla right-drag paints exactly 1 per slot
@@ -11237,7 +11237,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         } else if mode == 4 || mode == 1 {
                             // vanilla click modes: 4=throw hovered slot (btn 0=one,
                             // 1=whole stack); 1=shift-move between regions
-                            let chest_pos = *me.open_chest.lock().unwrap();
+                            let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some((cp, cp2)) = chest_pos {
                                 if !window_live_for(&me, (cp, cp2)) {
                                     invalidate_client_chest_window(
@@ -11248,16 +11248,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     continue;
                                 }
                             }
-                            let furnace_pos = *me.open_furnace.lock().unwrap();
+                            let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
                             let (px, py, pz, ..) = {
-                                let p = me.pos.lock().unwrap();
+                                let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                 *p
                             };
                             macro_rules! throw {
                                 ($st:expr) => {{
                                     let st: Stack = $st;
                                     if st.1 > 0 {
-                                        drops().lock().unwrap().push(Drop {
+                                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
                                             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                                             x: px,
                                             y: py + 1.3,
@@ -11275,8 +11275,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             if let Some((cp, cp2)) = chest_pos {
                                 // window slots: 0..rows chest | rows..rows+36 inv(key=slot-rows+9)
                                 let rows = if cp2.is_some() { 54i16 } else { 27i16 };
-                                let mut all = chests().lock().unwrap();
-                                let mut inv = me.inv.lock().unwrap();
+                                let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 if slot >= 0 && slot < rows + 36 {
                                     let in_cont = slot < rows;
                                     if mode == 4 {
@@ -11321,8 +11321,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             }
                             if let Some(fp) = furnace_pos {
                                 // window: 0 input,1 fuel,2 output | 3..38 inv(key=slot+6)
-                                let mut fs = furnaces().lock().unwrap();
-                                let mut inv = me.inv.lock().unwrap();
+                                let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 if (0..39).contains(&slot) {
                                     if mode == 4 {
                                         if slot >= 3 {
@@ -11362,7 +11362,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                                 f.dirty = true;
                                                 if slot == 2 {
                                                     let (px, py, pz, ..) = {
-                                                        let p = me.pos.lock().unwrap();
+                                                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                                         *p
                                                     };
                                                     furnace_xp_pop(f, px, py, pz);
@@ -11387,7 +11387,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             let st = std::mem::take(&mut f.output);
                                             f.dirty = true;
                                             let (px, py, pz, ..) = {
-                                                let p = me.pos.lock().unwrap();
+                                                let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                                 *p
                                             };
                                             furnace_xp_pop(f, px, py, pz);
@@ -11497,8 +11497,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             }
                             // inventory window: 5-8 armor | 45 offhand | 1-4 craft | 9-44 inv
                             {
-                                let mut inv = me.inv.lock().unwrap();
-                                let mut grid = me.craft.lock().unwrap();
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut grid = me.craft.lock().unwrap_or_else(|e| e.into_inner());
                                 if mode == 4 {
                                     let got = if (5..=8).contains(&slot)
                                         || (9..=44).contains(&slot)
@@ -11566,18 +11566,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         }
                                     }
                                 }
-                                *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+                                *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                                 drop(grid);
                                 drop(inv);
                                 resync_slot(&me, 0, slot, &{
-                                    let i2 = me.inv.lock().unwrap();
+                                    let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                     i2.get(&slot).cloned().unwrap_or((0, 0, Vec::new()))
                                 });
                                 // armor/offhand moves need armor slot echo too
                                 if (5..=8).contains(&slot) || slot == 45 || mode == 1 {
                                     for asl in 5..=8i16 {
                                         let st2 =
-                                            me.inv.lock().unwrap().get(&asl).cloned().unwrap_or((
+                                            me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&asl).cloned().unwrap_or((
                                                 0,
                                                 0,
                                                 Vec::new(),
@@ -11816,14 +11816,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         eprintln!("[spine] {} left (from {})", name, peer);
         {
             // remove owned projectile/bobber entities
-            let mut fb = bobbers().lock().unwrap();
+            let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
             let gone_b: Vec<i32> = fb
                 .iter()
                 .filter(|b| b.owner == me_cleanup.eid)
                 .map(|b| b.eid)
                 .collect();
             fb.retain(|b| b.owner != me_cleanup.eid);
-            let mut pq = pearls().lock().unwrap();
+            let mut pq = pearls().lock().unwrap_or_else(|e| e.into_inner());
             let gone_p: Vec<i32> = pq
                 .iter()
                 .filter(|p| p.owner == me_cleanup.eid)
@@ -11841,18 +11841,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             // are placed back into the inventory (the
             // overflow falls on the ground as item entities)
             let mut back: Vec<Stack> = Vec::new();
-            let cur = std::mem::take(&mut *me_cleanup.cursor.lock().unwrap());
+            let cur = std::mem::take(&mut *me_cleanup.cursor.lock().unwrap_or_else(|e| e.into_inner()));
             if cur.1 > 0 {
                 back.push(cur);
             }
             for g in [&me_cleanup.craft, &me_cleanup.craft9] {
-                for (_, st) in std::mem::take(&mut *g.lock().unwrap()) {
+                for (_, st) in std::mem::take(&mut *g.lock().unwrap_or_else(|e| e.into_inner())) {
                     if st.1 > 0 {
                         back.push(st);
                     }
                 }
             }
-            let mut inv = me_cleanup.inv.lock().unwrap();
+            let mut inv = me_cleanup.inv.lock().unwrap_or_else(|e| e.into_inner());
             let mut to_drop: Vec<Stack> = Vec::new();
             for st in back {
                 // merge into matching stacks first, then first empty slot
@@ -11880,8 +11880,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 }
             }
             if !to_drop.is_empty() {
-                let (px, py, pz, ..) = *me_cleanup.pos.lock().unwrap();
-                let mut drp = drops().lock().unwrap();
+                let (px, py, pz, ..) = *me_cleanup.pos.lock().unwrap_or_else(|e| e.into_inner());
+                let mut drp = drops().lock().unwrap_or_else(|e| e.into_inner());
                 for st in to_drop {
                     drp.push(Drop {
                         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
@@ -11897,7 +11897,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     });
                 }
             }
-            *me_cleanup.drag.lock().unwrap() = (-1, Vec::new());
+            *me_cleanup.drag.lock().unwrap_or_else(|e| e.into_inner()) = (-1, Vec::new());
             let inventory_snapshot = inv.clone();
             drop(inv);
             inv_store()
@@ -11907,20 +11907,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             // A logout persists the dimension the player was actually in, so the next
             // login's 0x2b Join Game and first chunk window resume in that world.
             let record = client_dim_pos(&me_cleanup);
-            pos_store().lock().unwrap().insert(name.clone(), record);
+            pos_store().lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone(), record);
             save_live_player_snapshot(&me_cleanup, record, &inventory_snapshot);
         }
         // vanilla `ServerPlayer.disconnect` -> `containerMenu.removed` -> stopOpen:
         // the leaving viewer stops counting before it leaves the client list. The window
-        // is read into a local first: `if let Some(open) = *mutex.lock().unwrap()` holds
+        // is read into a local first: `if let Some(open) = *mutex.lock().unwrap_or_else(|e| e.into_inner())` holds
         // the lock for the whole body, and the body locks it again to clear it.
         if let Some((open, anchor)) = client_open_window_and_anchor(&me_cleanup) {
             let audience = client_snapshot();
             let cdim = *me_cleanup.dim.lock().unwrap_or_else(|e| e.into_inner());
             let halves = client_window_halves_dim(open, anchor, cdim);
             let before = chest_opener_snapshot_dim(&audience, &halves);
-            *me_cleanup.open_chest.lock().unwrap() = None;
-            *me_cleanup.chest_sync.lock().unwrap() = None;
+            *me_cleanup.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *me_cleanup.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
             sync_chest_openers_dim(&audience, &before);
         }
         #[cfg(feature = "neoforge-events")]
@@ -11930,13 +11930,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 java_compat::S1Event::PlayerLogout(me_cleanup.eid, me_cleanup.name.clone()),
             );
         }
-        let mut cls = clients().lock().unwrap();
+        let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
         cls.retain(|c| c.eid != me_cleanup.eid);
         drop(cls);
-        *me_cleanup.sleeping.lock().unwrap() = None;
-        player_mechanism_sessions().lock().unwrap().remove(&me_cleanup.eid);
-        death_drop_marks().lock().unwrap().remove(&me_cleanup.eid);
-        beacon_menu_anchors().lock().unwrap().remove(&me_cleanup.eid);
+        *me_cleanup.sleeping.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
+        death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
+        beacon_menu_anchors().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
         // PARITY-58-C2S: per-connection packet state dies with the connection.
         chat_ack_offsets().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
         chat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
@@ -12713,7 +12713,7 @@ mod connection_limits_wire_tests {
     fn login_negotiation_and_play_framing_use_the_same_threshold() {
         for threshold in [-1, 0, 256] {
             let (client, mut peer) = effect_tests::client_pair();
-            let mut login_socket = client.sock.lock().unwrap().try_clone().unwrap();
+            let mut login_socket = client.sock.lock().unwrap_or_else(|e| e.into_inner()).try_clone().unwrap();
             let registration = negotiate_compression(&mut login_socket, threshold).unwrap();
             let compression = usize::try_from(threshold).ok();
             if compression.is_some() {
@@ -12732,7 +12732,7 @@ mod connection_limits_wire_tests {
             client.enter_play_wire(compression, Default::default());
             let mut rx = RxBuf::new(compression);
             for payload in [vec![0x12], vec![0x34; 512]] {
-                send_packet(&mut client.sock.lock().unwrap(), 0x26, payload.clone()).unwrap();
+                send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x26, payload.clone()).unwrap();
                 let end = deadline();
                 loop {
                     assert!(Instant::now() < end, "Play frame did not arrive");
@@ -12771,14 +12771,14 @@ mod connection_limits_wire_tests {
         };
         let entities = [arrow];
         sync_entity_interest(&client, &entities);
-        assert!(!client.seen.lock().unwrap().contains(&eid));
-        client.chunks.lock().unwrap().insert((1, 0));
+        assert!(!client.seen.lock().unwrap_or_else(|e| e.into_inner()).contains(&eid));
+        client.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((1, 0));
         sync_entity_interest(&client, &entities);
         assert_eq!(
             read_packet(&mut peer, deadline()),
             Some((0x01, spawn_typed_pkt(eid, 4, x, y, z)))
         );
-        assert!(client.seen.lock().unwrap().contains(&eid));
+        assert!(client.seen.lock().unwrap_or_else(|e| e.into_inner()).contains(&eid));
 
         let upper = x + f64::from(i16::MAX) / 4096.0;
         let next = upper + 1.5;
@@ -12810,13 +12810,13 @@ mod connection_limits_wire_tests {
         assert!(!entity_in_tracking_range((0.0, 0.0), (64.0, 64.0), 4, 8));
         assert!(!entity_in_tracking_range((0.0, 0.0), (64.01, 0.0), 4, 8));
         assert!(!entity_in_tracking_range((0.0, 0.0), (33.0, 0.0), 4, 2));
-        client.chunks.lock().unwrap().clear();
+        client.chunks.lock().unwrap_or_else(|e| e.into_inner()).clear();
         sync_entity_interest(&client, &entities);
         assert_eq!(
             read_packet(&mut peer, deadline()),
             Some((0x42, vec![1, 77]))
         );
-        assert!(!client.seen.lock().unwrap().contains(&eid));
+        assert!(!client.seen.lock().unwrap_or_else(|e| e.into_inner()).contains(&eid));
     }
 
     #[test]
@@ -12967,7 +12967,7 @@ mod connection_limits_wire_tests {
             })
             .unwrap();
         let (client, mut peer) = effect_tests::client_pair();
-        write_frame(&mut client.sock.lock().unwrap(), packet, Some(256)).unwrap();
+        write_frame(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), packet, Some(256)).unwrap();
         let (id, body) = read_login_frame(&mut peer, deadline(), Some(256)).unwrap();
         assert_eq!(id, 0x07);
         let mut body = body.as_slice();
@@ -13015,14 +13015,14 @@ mod connection_limits_wire_tests {
         let mk = |eid: i32, x: f64, z: f64| {
             let (mut c, r) = effect_tests::client_pair();
             c.eid = eid;
-            *c.pos.lock().unwrap() = (x, 70.0, z, 0.0, 0.0, true);
+            *c.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, 70.0, z, 0.0, 0.0, true);
             r.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
             (Arc::new(c), r)
         };
         let (near, mut r_near) = mk(11, 10.0, 0.0);
         let (mid, mut r_mid) = mk(12, 30.0, 0.0);
         let (other_dim, mut r_dim) = mk(13, 0.0, 0.0);
-        *other_dim.dim.lock().unwrap() = DimId::Nether;
+        *other_dim.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
         let (edge, mut r_edge) = mk(14, 16.0, 0.0);
         let (far, mut r_far) = mk(15, 40.0, 0.0);
         let audience = [near, mid, other_dim, edge, far];
@@ -13078,7 +13078,7 @@ mod connection_limits_wire_tests {
         let dim = DimId::Overworld;
         let (cx, cz) = (0, 0);
         clear_chunk_caches_for_tests();
-        chunk_packet_cache().lock().unwrap().clear();
+        chunk_packet_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
         let mut gen = GenSources::new();
         let f1 = cached_chunk_frame(None, &mut gen, dim, cx, cz, false);
         let mut gen2 = GenSources::new();
@@ -13127,8 +13127,8 @@ mod sleep_protocol_parity_tests {
 
     #[test]
     fn bed_sleep_respects_100_ticks_and_players_sleeping_percentage() {
-        let _serial = SLEEP_TEST_LOCK.lock().unwrap();
-        let old_clients = std::mem::take(&mut *clients().lock().unwrap());
+        let _serial = SLEEP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
         let old_world_time = WORLD_TIME.load(Ordering::Relaxed);
         let old_percentage = command_gamerules()
             .lock()
@@ -13137,21 +13137,21 @@ mod sleep_protocol_parity_tests {
             .copied();
         let (client, _peer) = effect_tests::client_pair();
         let client = Arc::new(client);
-        clients().lock().unwrap().push(client.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(client.clone());
 
         WORLD_TIME.store(13000, Ordering::Relaxed);
         enter_bed(&client, 0, 64, 0);
-        assert!(client.sleeping.lock().unwrap().is_some());
+        assert!(client.sleeping.lock().unwrap_or_else(|e| e.into_inner()).is_some());
         // Entering a bed does not skip the night immediately.
         assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 13000);
         for _ in 0..99 {
             sleep_tick();
         }
         assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 13000);
-        assert!(client.sleeping.lock().unwrap().is_some());
+        assert!(client.sleeping.lock().unwrap_or_else(|e| e.into_inner()).is_some());
         sleep_tick();
         assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 24000);
-        assert!(client.sleeping.lock().unwrap().is_none());
+        assert!(client.sleeping.lock().unwrap_or_else(|e| e.into_inner()).is_none());
 
         // playersSleepingPercentage > 100 can never be met.
         WORLD_TIME.store(13000, Ordering::Relaxed);
@@ -13191,13 +13191,13 @@ mod sleep_protocol_parity_tests {
         }
         assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 13000);
 
-        *clients().lock().unwrap() = old_clients;
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) = old_clients;
         WORLD_TIME.store(old_world_time, Ordering::Relaxed);
     }
 
     #[test]
     fn protocol_sends_view_and_sim_distance_and_validates_container_state_id() {
-        let _serial = SLEEP_TEST_LOCK.lock().unwrap();
+        let _serial = SLEEP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Vanilla 1.21.1 default: 256; `0`/negative disables; positive is the
         // negotiated threshold.
         assert_eq!(connection_limits::compression_threshold_env(|_| None), 256);
@@ -13210,7 +13210,7 @@ mod sleep_protocol_parity_tests {
 
         let (client, mut peer) = effect_tests::client_pair();
         client.enter_play_wire(None, Default::default());
-        send_view_distance(&mut client.sock.lock().unwrap(), SERVER_VIEW_DISTANCE);
+        send_view_distance(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), SERVER_VIEW_DISTANCE);
         assert_eq!(
             read_packet(&mut peer, deadline()),
             Some((0x55, vec![SERVER_VIEW_DISTANCE as u8]))
@@ -13404,7 +13404,7 @@ mod w3_tests {
             ),
         ];
         for (name, admission, reason) in cases {
-            *live_admission().lock().unwrap() = Some(admission);
+            *live_admission().lock().unwrap_or_else(|e| e.into_inner()) = Some(admission);
             let (mut cli, server) = w3_login_session(name, [0xabu8; 16]);
             let (pid, body) = read_packet(&mut cli, w3_deadline()).expect("disconnect packet");
             assert_eq!(pid, 0x00, "login must be refused with 0x00 for {name}");
@@ -13420,13 +13420,13 @@ mod w3_tests {
             drop(cli);
             let _ = server.join();
         }
-        *live_admission().lock().unwrap() = None;
+        *live_admission().lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[test]
     fn w3_vehicle_move_0x1e_and_dismount_0x26_and_stats_0x09_live() {
         let (mut cli, server, me) = w3_connect("W3Rider", [0x77u8; 16]);
-        let (px, py, pz, ..) = *me.pos.lock().unwrap();
+        let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
         let boat_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
         let boat = Arc::new(Mob {
             dim: DimId::Overworld,
@@ -13444,8 +13444,8 @@ mod w3_tests {
             air: Mutex::new(300),
             vel: Mutex::new([0.0; 3]),
         });
-        mobs().lock().unwrap().push(boat.clone());
-        me.seen.lock().unwrap().insert(boat_eid);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(boat.clone());
+        me.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(boat_eid);
 
         // 0x16 interact -> mounted, 0x5f broadcast reaches the tracker.
         let mut interact = Vec::new();
@@ -13471,11 +13471,11 @@ mod w3_tests {
         mv.extend_from_slice(&0f32.to_be_bytes());
         send_packet(&mut cli, 0x1e, mv).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while boat.pos.lock().unwrap().0 <= px + 1.0 + 1.0e-9 {
+        while boat.pos.lock().unwrap_or_else(|e| e.into_inner()).0 <= px + 1.0 + 1.0e-9 {
             assert!(Instant::now() < deadline, "boat never moved");
             std::thread::sleep(Duration::from_millis(2));
         }
-        let seat = *me.pos.lock().unwrap();
+        let seat = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             (seat.0 - (px + 1.05)).abs() < 1.0e-6,
             "rider must be re-seated onto the moved vehicle, got {seat:?}"
@@ -13507,7 +13507,7 @@ mod w3_tests {
         let stats = decode_award_stats(&mut rest).expect("valid award stats");
         assert_eq!(stats.get(StatCategory::Mined, 1), 7);
 
-        mobs().lock().unwrap().retain(|m| m.eid != boat_eid);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != boat_eid);
         drop(cli);
         let _ = server.join();
     }
@@ -13609,7 +13609,7 @@ mod w3_tests {
     #[test]
     fn bughunt_net_look_packet_0x1c_rejects_non_finite_angles() {
         let (mut cli, server, me) = w3_connect("BugHuntLook", [0x66u8; 16]);
-        *me.pos.lock().unwrap() = (0.5, 71.0, 0.5, 10.0, 20.0, true);
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 71.0, 0.5, 10.0, 20.0, true);
         let look = |yaw: f32, pitch: f32| {
             let mut b = Vec::new();
             b.extend_from_slice(&yaw.to_be_bytes());
@@ -13626,14 +13626,14 @@ mod w3_tests {
         ] {
             send_packet(&mut cli, 0x1c, look(yaw, pitch)).unwrap();
             std::thread::sleep(Duration::from_millis(80));
-            let p = *me.pos.lock().unwrap();
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!((p.3, p.4), (10.0, 20.0), "non-finite look {yaw}/{pitch} applied");
         }
         // A finite look still lands, proving the packet path executed.
         send_packet(&mut cli, 0x1c, look(90.0, -15.0)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let p = *me.pos.lock().unwrap();
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
             if p.3 == 90.0 && p.4 == -15.0 {
                 break;
             }
@@ -14182,7 +14182,7 @@ mod w4_tests {
                     None => std::env::remove_var(name),
                 }
             }
-            *live_admission().lock().unwrap() = None;
+            *live_admission().lock().unwrap_or_else(|e| e.into_inner()) = None;
             set_online_auth_provider(None);
         }
     }
@@ -14357,8 +14357,8 @@ mod w4_tests {
             server_hash: &str,
             client_ip: Option<&str>,
         ) -> Result<MojangJoinedProfile, String> {
-            *self.seen_hash.lock().unwrap() = Some(server_hash.to_string());
-            *self.seen_ip.lock().unwrap() = client_ip.map(str::to_string);
+            *self.seen_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(server_hash.to_string());
+            *self.seen_ip.lock().unwrap_or_else(|e| e.into_inner()) = client_ip.map(str::to_string);
             Ok(self.profile.clone())
         }
     }
@@ -14382,7 +14382,7 @@ mod w4_tests {
         viewer.name = "W4StatusViewer".to_string();
         viewer.uuid = [0xabu8; 16];
         let viewer = Arc::new(viewer);
-        clients().lock().unwrap().push(viewer.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(viewer.clone());
 
         let (mut cli, server) = w4_client();
         let deadline = w4_deadline();
@@ -14415,7 +14415,7 @@ mod w4_tests {
         let pong = w4_read_until(&mut cli, 0x01, deadline).expect("pong");
         assert_eq!(pong, 0xfeed_beefi64.to_be_bytes().to_vec());
 
-        clients().lock().unwrap().retain(|c| c.eid != viewer.eid);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != viewer.eid);
         drop(cli);
         let _ = server.join();
         let _ = std::fs::remove_file(icon);
@@ -14458,7 +14458,7 @@ mod w4_tests {
         let _ = server.join();
 
         // The IP ban runs on the *forwarded* address, not the loopback peer.
-        *live_admission().lock().unwrap() = Some(LiveAdmission {
+        *live_admission().lock().unwrap_or_else(|e| e.into_inner()) = Some(LiveAdmission {
             ops: OpsRegistry::default(),
             bans: BanRegistry {
                 players: Vec::new(),
@@ -14494,7 +14494,7 @@ mod w4_tests {
         );
         drop(cli);
         let _ = server.join();
-        *live_admission().lock().unwrap() = None;
+        *live_admission().lock().unwrap_or_else(|e| e.into_inner()) = None;
 
         // A tampered payload fails closed with a Login Disconnect, then the
         // connection is gone entirely.
@@ -14605,15 +14605,15 @@ mod w4_tests {
 
         // The session check saw the vanilla server hash and the real peer IP.
         assert_eq!(
-            *auth.seen_hash.lock().unwrap(),
+            *auth.seen_hash.lock().unwrap_or_else(|e| e.into_inner()),
             Some(mc_server_hash("", &secret, &key_der)),
             "hasJoined must be asked for the sha1 of id || secret || key"
         );
         assert_eq!(
-            auth.seen_ip.lock().unwrap().as_deref(),
+            auth.seen_ip.lock().unwrap_or_else(|e| e.into_inner()).as_deref(),
             Some("127.0.0.1")
         );
-        assert_eq!(auth.decrypt_calls.lock().unwrap().len(), 2);
+        assert_eq!(auth.decrypt_calls.lock().unwrap_or_else(|e| e.into_inner()).len(), 2);
         drop(cli);
         let _ = server.join();
 
@@ -14633,10 +14633,10 @@ mod w4_tests {
         // A registered, mounted client that a panicking handler would orphan.
         let (client, _peer) = effect_tests::client_pair();
         let me = Arc::new(client);
-        clients().lock().unwrap().push(me.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
         let vehicle = NEXT_EID.fetch_add(1, Ordering::SeqCst);
         {
-            let mut live = mounts().lock().unwrap();
+            let mut live = mounts().lock().unwrap_or_else(|e| e.into_inner());
             live.registry
                 .register_vehicle(vehicle, VehicleKind::Boat, [0.0, 64.0, 0.0]);
             live.registry.register_rider(me.eid, [0.0, 64.0, 0.0]);
@@ -14656,7 +14656,7 @@ mod w4_tests {
             before + 1
         );
         assert!(
-            clients().lock().unwrap().iter().all(|c| c.eid != me.eid),
+            clients().lock().unwrap_or_else(|e| e.into_inner()).iter().all(|c| c.eid != me.eid),
             "the panicked client must be unregistered"
         );
         assert_eq!(vehicle_of(me.eid), None, "the ghost rider must dismount");
@@ -14707,7 +14707,7 @@ mod p5c_live_tests {
     struct Rules(Vec<(&'static str, i32)>);
     impl Rules {
         fn take(names: &[&'static str]) -> Self {
-            let rules = command_gamerules().lock().unwrap();
+            let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             let taken = names
                 .iter()
                 .map(|name| (*name, rules.get(name).copied().unwrap_or(-1)))
@@ -14715,12 +14715,12 @@ mod p5c_live_tests {
             Rules(taken)
         }
         fn set(&self, name: &'static str, value: i32) {
-            command_gamerules().lock().unwrap().insert(name, value);
+            command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).insert(name, value);
         }
     }
     impl std::ops::Drop for Rules {
         fn drop(&mut self) {
-            let mut rules = command_gamerules().lock().unwrap();
+            let mut rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             for (name, value) in self.0.drain(..) {
                 rules.insert(name, value);
             }
@@ -14911,7 +14911,7 @@ mod p5c_live_tests {
             name_to_item("iron_helmet").unwrap(),
         );
         {
-            let mut inv = me.inv.lock().unwrap();
+            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             inv.insert(36, (sword, 1, Vec::new())); // selected hotbar
             inv.insert(45, (shield, 1, Vec::new())); // offhand
             inv.insert(5, (helm, 1, Vec::new()));
@@ -14975,7 +14975,7 @@ mod p5c_live_tests {
             eid: me.eid,
             difficulty: DIFFICULTY.load(Ordering::Relaxed),
         };
-        clients().lock().unwrap().push(me.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
 
         // #131: hasPermission(2) — a non-operator is refused before the
         // difficulty ever changes; a level-4 operator is let through.
@@ -14985,7 +14985,7 @@ mod p5c_live_tests {
             .unwrap()
             .insert(me.name.to_ascii_lowercase());
         assert!(player_is_admin(&me.name));
-        OPERATORS.lock().unwrap().remove(&me.name.to_ascii_lowercase());
+        OPERATORS.lock().unwrap_or_else(|e| e.into_inner()).remove(&me.name.to_ascii_lowercase());
 
         set_difficulty(0);
         assert_eq!(DIFFICULTY.load(Ordering::Relaxed), 0);
@@ -15002,9 +15002,9 @@ mod p5c_live_tests {
         let input = name_to_item("raw_iron").unwrap();
         let coal = name_to_item("coal").unwrap();
         test_region_warm_insert((0, 0));
-        furnaces().lock().unwrap().clear();
+        furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
         for dim in [DimId::Nether, DimId::End] {
-            furnaces().lock().unwrap().insert(
+            furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(
                 (dim, 0, 70, 0),
                 Furnace {
                     input: (input, 1, Vec::new()),
@@ -15020,7 +15020,7 @@ mod p5c_live_tests {
             );
         }
         furnace_tick();
-        let guard = furnaces().lock().unwrap();
+        let guard = furnaces().lock().unwrap_or_else(|e| e.into_inner());
         for dim in [DimId::Nether, DimId::End] {
             let furnace = guard
                 .get(&(dim, 0, 70, 0))
@@ -15028,7 +15028,7 @@ mod p5c_live_tests {
             assert_eq!(furnace.progress, 1, "{dim:?} furnace must tick");
         }
         drop(guard);
-        furnaces().lock().unwrap().clear();
+        furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
         test_region_warm_remove(&(0, 0));
     }
 
@@ -15114,21 +15114,21 @@ mod p5c_live_tests {
         if reg.name_of(glow) != "minecraft:glowstone" {
             return;
         }
-        pending_light_edits().lock().unwrap().clear();
+        pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()).clear();
         let pos = Position { x: 5, y: 70, z: 5 };
         // Two edits to the same cell inside one tick collapse into a single
         // queued entry carrying the first old and the last new — the drain
         // then feeds ONE edit_batch per dimension.
         note_light_edit(DimId::Overworld, pos, glow, 0);
         note_light_edit(DimId::Overworld, pos, 0, glow);
-        let edits = pending_light_edits().lock().unwrap();
+        let edits = pending_light_edits().lock().unwrap_or_else(|e| e.into_inner());
         let per_dim = edits.get(&DimId::Overworld).expect("queued");
         assert_eq!(per_dim.len(), 1, "same-cell edits coalesce");
         let (old, new) = per_dim.get(&pos).copied().unwrap();
         drop(edits);
         assert_eq!(old, light_properties(reg, glow));
         assert_eq!(new, light_properties(reg, glow));
-        pending_light_edits().lock().unwrap().clear();
+        pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     #[test]
