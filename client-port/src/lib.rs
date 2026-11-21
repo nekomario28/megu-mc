@@ -4,6 +4,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod atlas;
+pub mod ber_instancing;
 mod cache;
 mod column;
 mod cull;
@@ -29,6 +30,13 @@ pub use atlas::{
     AnimFrame, AnimationError, AtlasBuilder, AtlasError, AtlasMip, PackedAtlas,
     SpriteAnimation, SpritePlacement, DEFAULT_ATLAS_MAX_DIM, MAX_ANIMATION_FRAMES,
     MAX_ATLAS_DIM, MAX_SPRITE_PADDING,
+};
+pub use ber_instancing::{
+    BerAtlasKey, BerCullStats, BerEntityInput, BerFrameBatches, BerFrameView, BerInstanceBatch,
+    BerInstanceData, BerInteriorItem, BerLodPolicy, BerModelKey, BerMotionState, BerShellModel,
+    BlockEntityInstanceBatcher, BER_INSTANCE_GPU_BYTES, DEFAULT_MAX_DYNAMIC_DIST,
+    DEFAULT_NEAR_INTERIOR_DIST, LOW_SPEC_MAX_DYNAMIC_DIST, LOW_SPEC_NEAR_INTERIOR_DIST,
+    LOD_SCALE_MAX, LOD_SCALE_MIN,
 };
 pub use cache::{MeshCache, SectionCoord, DEFAULT_RESORT_THRESHOLD};
 pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
