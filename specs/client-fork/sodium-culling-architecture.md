@@ -28,10 +28,12 @@ chunk-packet cache.
 
 | Responsibility | Current implementation |
 | --- | --- |
-| Chunk packet cache (`ChunkPacketCache`) | `MapChunkCache` / `map_chunk` / `build_map_chunk` / `map_chunk_sig` / `chunk_versions_3x3` in [src/main.rs](../../src/main.rs) (cache struct ~line 9620, `map_chunk` ~line 9740). One assembled `0x27` payload per `(DimId, cx, cz)`, validated against the 3×3 `chunk_version_dim` tuple plus an order-independent FNV-1a signature of signs, spawners and neighbor `GenSources`; FIFO cap `MAP_CHUNK_CACHE_CAP = 512`. A hit also restores the chunk's own generated emitters into the caller's `GenSources`. |
+| Chunk packet payload cache (`MapChunkCache`) | `MapChunkCache` / `map_chunk` / `build_map_chunk` / `map_chunk_sig` / `chunk_versions_3x3` in [src/main.rs](../../src/main.rs) (cache struct ~line 9620, `map_chunk` ~line 9740). One assembled `0x27` *payload* per `(DimId, cx, cz)`, validated against the 3×3 `chunk_version_dim` tuple plus an order-independent FNV-1a signature of signs, spawners and neighbor `GenSources`; FIFO cap `MAP_CHUNK_CACHE_CAP = 512`. A hit also restores the chunk's own generated emitters into the caller's `GenSources`. |
+| Shared `0x27` frame cache (`ChunkPacketCache`) | `ChunkPacketCache` / `CachedChunkPacket` / `chunk_packet_cache` / `cached_chunk_frame` / `chunk_packet_revision` in [src/connection_limits.rs](../../src/connection_limits.rs) (~line 366) and [src/play_protocol.rs](../../src/play_protocol.rs) (~line 2219). Sits in front of `map_chunk`: one fully framed packet (`varint len` + `0x27` + payload, after the live block-entity splice and `cull_chunk_light`) per `(DimId, cx, cz)` at a world *revision*, shared as `Arc<Vec<u8>>` across every reader at that revision. Each entry stores the uncompressed `plain` frame plus at most one lazily built `compressed` frame memoized per negotiated threshold — a different threshold rebuilds it. The revision is an FNV-1a fold of the 3×3 `chunk_versions` tuple + `map_chunk_sig` + a fingerprint over the sorted live block entities (`live_chunk_block_entities`), so a block edit, a relight or a block-entity change all invalidate. Bounded FIFO `CHUNK_PACKET_CACHE_CAP = 512`; the whole map drops when the generator `generation` moves; a build that races an edit is served via `frame_uncached` (byte-identical, not retained). A hit restores the chunk's own emitters into the caller's `GenSources`, exactly as a rebuild would. |
 | Visibility budget | `ChunkSendBudget` (`queued`, `max_chunks_per_tick`) and `prioritize_chunks` (center first, then look-forward, side, behind; distance + coordinate tie-break) in [src/entity_spatial.rs](../../src/entity_spatial.rs); driven per tick by `ChunkDelivery::next_batch` in [src/connection_limits.rs](../../src/connection_limits.rs). |
 | Tracking culling | `ChunkWindow` (Chebyshev `(2·view+1)²` window, `contains`/`leaving`/`unsent`) in [src/play_protocol.rs](../../src/play_protocol.rs); `chunk_view_diff` in `entity_spatial.rs`; `ChunkFeedback` ack gate (`0x08` Chunk Batch Received → `sent_batch` → next `0x0c`/`0x0d` batch) in [src/chunk_ack.rs](../../src/chunk_ack.rs). `SERVER_VIEW_DISTANCE = 8` bounds the window; `stream_chunks` emits `0x21` unloads only for chunks the client actually holds. |
-| Wire shaping | `cull_chunk_light` rewrites `map_chunk`'s full light lists into sparse mask+array form in [src/play_protocol.rs](../../src/play_protocol.rs); `splice_chunk_block_entities` merges live block entities; entity tracking uses per-type `client_tracking_range`/`update_interval` from the 1.21.1 registry (`entity_spatial.rs`, `compute_tracking_diff`). |
+| Broadcast range/dimension culling | `broadcast_near` / `broadcast_near_in` in [src/play_protocol.rs](../../src/play_protocol.rs) (~line 1453) over `broadcast_radius` / `within_broadcast_range` in [src/connection_limits.rs](../../src/connection_limits.rs) (~line 480). Vanilla `PlayerList.broadcast` semantics: same `DimId` only, strict `d² < r²` sphere, and the radius is read from the packet itself — sound `0x68` reaches `max(16·volume, 16)`, particles `0x29` reach 512 only under the long-distance flag (else 32), explosions `0x20` reach 64. A packet id with no vanilla positioned contract is refused rather than sent to the whole player list. |
+| Wire shaping | `cull_chunk_light` rewrites `map_chunk`'s full light lists into sparse mask+array form in [src/play_protocol.rs](../../src/play_protocol.rs); `splice_chunk_block_entities` merges live block entities (its output feeds the frame revision fingerprint); entity tracking uses per-type `client_tracking_range`/`update_interval` from the 1.21.1 registry (`entity_spatial.rs`, `compute_tracking_diff`). |
 
 Server guarantees the client layer depends on:
 
@@ -43,7 +45,10 @@ Server guarantees the client layer depends on:
 - `map_chunk` output is byte-stable for identical `(dim, cx, cz, versions,
   sig)` inputs — the cache key *is* the invalidation contract. Any new input
   to `build_map_chunk` must be folded into `map_chunk_sig` or the 3×3
-  versions, or the cache silently serves stale terrain.
+  versions, or the cache silently serves stale terrain. The same rule holds
+  one level up: any new input to the *sent* `0x27` frame (post-splice,
+  post-light-cull bytes) must be folded into `chunk_packet_revision`, or
+  `ChunkPacketCache` serves stale frames to every reader at that revision.
 
 ## Layer 2 — Shared kernel: O(1) render facts and lighting
 
@@ -66,54 +71,49 @@ Stages S1–S6 below are the target pipeline. **Status is marked per stage**;
 into `client-app`, "design" means specified here but not yet implemented.
 Nothing in this section changes the wire contract with the server.
 
-### S1 — 6×6 Visibility Graph (design; substrate exists)
+### S1 — 6×6 Visibility Graph (kernel)
 
-Nodes are the 16³ sections inside the client's loaded column window; an edge
-exists between sections sharing a face, and each node carries its
-`SectionVis` mask plus `uniform_air`/`sealed` proofs. The graph answers "which
-sections can possibly emit geometry toward a given side" without touching
-block data.
+`FaceVisibility` in [client-port/src/visibility.rs](../../client-port/src/visibility.rs)
+implements the per-section reachability graph: a packed 36-bit matrix where
+bit `enter * 6 + exit` records whether sight entering the section through
+face `enter` can leave through face `exit`. A cell is open unless it is a
+full-occlusion opaque cube (`OPAQUE` with all six `occlusion` bits set);
+air, partial-occlusion cubes, cutout/translucent blocks and fluids all admit
+sight. `compute` packs a closed-cell bitmap, then floods each open
+connected component with a stack-allocated 512-bit visited bitmap —
+allocation-free. `compute_hinted` honours the `uniform_air` /
+`sealed_solid` caller guarantees in O(1), matching the
+`MC_SPINE_MESH_COLUMN_*` column flags. Reachability is symmetric and
+`visible_from(enter)` returns the six-bit exit mask for O(1) graph
+traversal. Covered by unit tests in the same file (air = `ALL`, sealed =
+`NONE`, enclosed cavity, x=8 wall disconnecting only West↔East, single-file
+tunnel, waterlogged opaque still blocking).
 
-Current substrate this builds on:
+The cross-section graph walk that consumes these masks is S2; the
+`SectionVis` boundary-face proofs in [cull.rs](../../client-port/src/cull.rs)
+remain the cheaper per-node predicate where full reachability is not needed.
 
-- `MeshCache` already computes the exact dirty neighborhood of an edit — the
-  26-section halo plus edge/corner samples — in
-  [client-port/src/cache.rs](../../client-port/src/cache.rs) (`SectionCoord::
-  neighbors`, `insert`/`remove`/`set_cell` boundary comparison, `build`
-  assembling `borders`/`edges_and_corners`).
-- `SectionVis::visible_towards(facing)` in
-  [client-port/src/cull.rs](../../client-port/src/cull.rs) is the per-node
-  predicate the graph traversal consults; `box_facing_mask` produces the
-  camera-side `facing` mask for a section box.
+### S2 — Frustum × direction-monotonic BFS `GraphCuller` (kernel)
 
-The "6×6" name denotes the graph's shape contract: nodes are 16³ sections
-and every node carries a six-bit `boundary_faces` mask over the six axis
-directions (`Direction::ALL` = Down/Up/North/South/West/East), so each node
-has exactly six neighbor slots — the stage evaluates six-direction
-adjacency on six-bit masks. How many section rings the graph spans (the
-loaded column window vs. a fixed 6×6-section band per the
-Distant-Horizons design) is fixed when the graph is implemented, not
-before.
+`GraphCuller` in [client-port/src/culler.rs](../../client-port/src/culler.rs)
+implements the Sodium-style occlusion walk: a breadth-first search from the
+camera's section over per-section `SectionGraph { through, renderable }`
+masks — the same 36-bit `entry * 6 + exit` reachability shape as S1's
+`FaceVisibility`. Two monotonicity rules bound the walk: a node never exits
+through a face it entered (no backtracking), and a node is only re-queued
+when it gains a previously unseen entry face (six bits per section).
+Off-frustum sections are culled at enqueue time via `box_in_frustum`, so
+they neither draw nor propagate; `CullResult { visible, culled }` reports
+BFS-ordered survivors and the occluded count. `SectionGraph::AIR`
+propagates without drawing; `SectionGraph::SOLID` draws but never
+propagates. Unit tests cover a synthetic 8×4×8 terrain + cave fixture
+(≥60% cull), corridor connectivity gating, off-frustum non-traversal,
+multi-entry dedup, and a camera inside sealed geometry.
 
-### S2 — Frustum × BFS `GraphCuller` (design; primitives exist)
-
-A breadth-first walk over the S1 graph from the camera's section, pruning a
-node when (a) its box fails `box_in_frustum` against the six view planes or
-(b) `SectionVis::visible_towards` proves no emitted face can face the camera.
-BFS (not per-section independent tests) is what makes occlusion *between*
-sections cheap: a sealed neighbor ring stops the walk early.
-
-Existing primitives:
-
-- `box_in_frustum(min, planes)` — conservative six-plane test, false only on
-  proven outside — in [client-port/src/cull.rs](../../client-port/src/cull.rs).
-- `box_facing_mask(min, camera)` — which of the six section sides face the
-  camera — same file.
-- `client-app`'s software renderer currently iterates every packed section
-  and sorts translucent sections by squared camera distance in
-  [client-app/src/render.rs](../../client-app/src/render.rs); the culler
-  replaces that full scan with the graph walk and feeds only survivors to
-  the rasterizer.
+`client-app` does not call `GraphCuller` yet; wiring it in front of the
+renderer (replacing the full per-section scan in
+[client-app/src/render.rs](../../client-app/src/render.rs)) is part of the
+in-progress app-side integration.
 
 ### S3 — 7-direction bucketed backface culling (kernel)
 
@@ -129,21 +129,40 @@ part of the same predicate, mirrored conservatively by `face_can_emit` in
 of real emission.
 
 Every emitted `Quad` is tagged with a `Layer` bucket — `Opaque`, `Cutout`,
-`Translucent`, `Fluid` ([mesh.rs](../../client-port/src/mesh.rs)) — which is
-the draw-order contract S4's MultiDraw consumes: opaque/cutout buckets are
-order-free, translucent and fluid are sorted (S5). The "7-direction" stage
-name covers the six cube-face directions plus the fluid direction bucket;
-the invariant is that culling happens before greedy merging, never after.
+`Translucent`, `Fluid` — which is the draw-order contract S4's MultiDraw
+consumes: opaque/cutout buckets are order-free, translucent and fluid are
+sorted (S5). On top of that, `DirectionBuckets` /
+`bucket_draw_mask` in [mesh.rs](../../client-port/src/mesh.rs) add the
+seven-way *direction* bucketing: six face-direction buckets plus
+`DIRECTION_BUCKET_UNASSIGNED` for renderer-appended geometry. A section's
+`box_facing_mask` (which of its six sides face the camera) maps in O(1) to
+the draw mask — three back-facing buckets are skipped — and
+`DirectionBuckets::group`/`group_into` stably regroups quads into
+contiguous per-bucket ranges. The C ABI exposes this as
+`mc_spine_client_mesh_bucket_directions` in
+[client-port/src/ffi.rs](../../client-port/src/ffi.rs) (null output =
+query counts; `DirectionBuckets` reports offsets/counts). The "7-direction"
+invariant is unchanged: culling happens before greedy merging, never after.
 
-### S4 — `RenderRegion` 8×4×8 MultiDraw (design; vertex contract exists)
+### S4 — `RenderRegion` 8×4×8 MultiDraw (kernel)
 
-Group sections into render regions of 8×4×8 sections (128×64×128 blocks —
-the Distant-Horizons LOD-cell footprint scaled to section quads) and submit
-each region as one indirect/MultiDraw call per layer bucket instead of one
-draw per section. This is a client-app/GPU concern only; `client-port`'s
-contract is unchanged.
+[client-port/src/region.rs](../../client-port/src/region.rs) implements the
+region layer inside the kernel: an `8×4×8` slab of sections
+(`REGION_X/Y/Z`, 256 slots per region) shares one packed-vertex arena and
+one index arena. `RenderRegion::upload` carves variable-length
+`SectionSlab`s out of the arenas with a first-fit allocator whose free
+list is offset-sorted and coalesced on release, so an unload/rebuild cycle
+reuses the released range instead of growing the arena; `remove` returns
+the slab and drops empty regions via `RenderRegions`. `build_multidraw`
+folds every non-empty slot into one `MultiDrawCommand` per
+`(region, box_facing_mask bucket)` pair — the `DrawElementsCommand`
+parameter block matches `glDrawElementsInstancedBaseVertexBaseInstance` —
+replacing per-section draw calls with a single multi-draw submission per
+bucket. `client-app` does not consume `RenderRegions` yet; adopting it is
+part of the in-progress app-side integration and must keep the
+`PackedVertex`/`Quad` contracts unchanged.
 
-Existing substrate:
+Existing substrate this builds on:
 
 - `PackedVertex` — 16-byte vertex, 4 per quad, integer attributes — produced
   by `mc_spine_client_mesh_pack_vertices` in
@@ -158,23 +177,31 @@ Existing substrate:
   already consumes `(coord, &[PackedVertex])` pairs — the region boundary is
   where per-section iteration becomes per-region batching.
 
-### S5 — Incremental translucent sort (app)
+### S5 — Incremental translucent sort (kernel scheduler; app wiring partial)
 
 Translucent correctness requires back-to-front order, but re-sorting the
-whole world per frame is the classic churn point. The implementation sorts
-*per section, only when that section re-meshes*:
+whole world per frame is the classic churn point. The kernel now provides
+two schedulers in [client-port/src/cache.rs](../../client-port/src/cache.rs):
 
-- `mc_spine_client_mesh_sort_translucent` returns quad indices sorted by
-  decreasing squared camera distance from the quad centroid (ascending input
-  index on ties) — [client-port/src/packed.rs](../../client-port/src/packed.rs),
-  exported through `client-port/src/ffi.rs` and wrapped in
-  [client-app/src/world.rs](../../client-app/src/world.rs).
-- `WorldState::rebuild_dirty_bounded(limit, camera)` re-meshes at most
-  `limit` dirty sections per pass, re-packs vertices and refreshes that
-  section's `translucent_orders` entry — dirty tracking lives in
-  `MeshCache::rebuild_dirty` ([client-port/src/cache.rs](../../client-port/src/cache.rs)).
-- `render.rs` draws opaque/cutout first, then translucent sections far-to-near
-  with `sort_translucent` order inside each section.
+- `MeshCache::rebuild_dirty_ordered(limit, camera, planes)` rebuilds at most
+  `limit` dirty sections in-frustum-and-near-camera-first order
+  (`queue_key`: off-frustum last, then ascending squared distance to the
+  section box), replacing plain coordinate-order `rebuild_dirty` when a
+  camera is known.
+- `MeshCache::resort_translucent(camera)` is the threshold-gated
+  incremental sort: while the camera stays within `resort_threshold`
+  (default 1 block, `DEFAULT_RESORT_THRESHOLD`) of the last committed sort
+  it is a no-op; once crossed, every clean mesh has its translucent quads
+  reordered back-to-front with the same `depth_key` + ascending-index
+  tie-break as `mc_spine_client_mesh_sort_translucent`, and only sections
+  whose order actually changed are reported. Dirty sections are skipped —
+  their rebuild replaces the order anyway.
+
+App side: `client-app`'s `WorldState::rebuild_dirty_bounded` still calls
+`rebuild_dirty` + the per-section `sort_translucent` FFI
+([client-app/src/world.rs](../../client-app/src/world.rs)); switching it to
+`rebuild_dirty_ordered`/`resort_translucent` is part of the in-progress
+Wave B1/B2 wiring.
 
 ### S6 — Horizon LOD (kernel; app integration pending)
 
@@ -187,7 +214,8 @@ no second decode path:
   4` (4×4-block footprints) or `LOD_FINE = 16` (per-block columns), scanning
   sections top-down and stopping once every column found its top —
   [client-port/src/lod.rs](../../client-port/src/lod.rs).
-- `LodSummary` owns the cell buffer so regeneration is allocation-free.
+- `LodSummary` owns the cell buffer so regeneration is allocation-free
+  (`update` reuses the `Vec`, reports `height()` = covered column height).
 - `lod_bench` measures summary cost and the sealed-section culling savings on
   the same 24-section Overworld fixture the mesh bench uses —
   [client-port/src/bin/lod_bench.rs](../../client-port/src/bin/lod_bench.rs).
@@ -207,10 +235,12 @@ world state ──► server: MapChunkCache ──► 0x27/0x21/0x2a/0x0c paced 
         client-app: DecodedChunk ──► PalettedSection/Block+Light (kernel facts)
                         │
                         ▼
-        client-port: MeshCache (S1 dirty graph) ──► mesh_section (S3 cull)
+        client-port: MeshCache (dirty tracking) ──► mesh_section (S3 cull,
+                        │                          S1 FaceVisibility proofs)
                         │                            │
                         │                            ▼
-                        │                  PackedVertex + Layer buckets (S4)
+                        │                  PackedVertex + Layer buckets (S4
+                        │                  RenderRegion arenas / MultiDraw)
                         │                            │
                         ▼                            ▼
         S2 GraphCuller ──► survivors only ──► render.rs (S5 translucent,

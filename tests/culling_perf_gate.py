@@ -7,9 +7,11 @@ this gate enforces.
 
 Two modes:
 
-  --self-test   Pure-Python models of the culling math, bucket skipping and
-                the server's chunk-packet cache invariants. No cargo, no
-                network, no server binary; deterministic and fast.
+  --self-test   Pure-Python models of the culling math, bucket skipping,
+                the S1-S6 client-port kernels (FaceVisibility, GraphCuller,
+                DirectionBuckets, RenderRegion, LodSummary) and the server's
+                chunk-packet/frame-cache invariants. No cargo, no network,
+                no server binary; deterministic and fast.
 
   (default)     Live gate: builds client-port's release `lod_bench` and
                 `mesh_bench` when absent, runs them, and asserts both the
@@ -489,6 +491,518 @@ def translucent_order(quads, camera):
 
 
 # ---------------------------------------------------------------------------
+# client-port Layer-3 kernel models: FaceVisibility (S1, visibility.rs),
+# GraphCuller (S2, culler.rs), DirectionBuckets + bucket_draw_mask (S3,
+# mesh.rs), RenderRegion slab arenas (S4, region.rs), LodSummary (S6,
+# lod.rs). Flag values and bit layouts are pinned to the Rust sources; the
+# models prove the gate's expectations without compiling.
+# ---------------------------------------------------------------------------
+
+FACES = 6
+MATRIX_BITS = (1 << (FACES * FACES)) - 1
+FV_NONE = 0
+FV_ALL = MATRIX_BITS
+
+# Direction values double as coordinate offsets for the section graph:
+# axis() maps West/East->x, Down/Up->y, North/South->z; step() is -1 on even
+# directions, +1 on odd (section.rs Direction::offset).
+DIR_OFFSET = [(0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)]
+
+
+def blocks_sight(block):
+    """Mirror of visibility.rs blocks_sight: full-occlusion opaque cubes stop sight."""
+    return block.flags & OPAQUE != 0 and block.occlusion & ALL_FACES == ALL_FACES
+
+
+def cell_faces(x, y, z):
+    """Mirror of visibility.rs cell_faces: boundary-plane mask of a cell."""
+    faces = 0
+    if y == 0:
+        faces |= direction_bit(DOWN)
+    if y == EDGE - 1:
+        faces |= direction_bit(UP)
+    if z == 0:
+        faces |= direction_bit(NORTH)
+    if z == EDGE - 1:
+        faces |= direction_bit(SOUTH)
+    if x == 0:
+        faces |= direction_bit(WEST)
+    if x == EDGE - 1:
+        faces |= direction_bit(EAST)
+    return faces
+
+
+def face_visibility_compute(blocks):
+    """Mirror of FaceVisibility::compute: 36-bit enter*6+exit reachability."""
+    closed = [blocks_sight(b) for b in blocks]
+    any_open = any(not c for c in closed)
+    any_closed = any(closed)
+    if not any_open:
+        return FV_NONE
+    if not any_closed:
+        return FV_ALL
+    # Closed cells start visited; the flood only enters open cells.
+    visited = list(closed)
+    stack = [0] * SECTION_CELLS
+    bits = 0
+    for start in range(SECTION_CELLS):
+        if visited[start]:
+            continue
+        faces = 0
+        top = 0
+        visited[start] = True
+        stack[top] = start
+        top += 1
+        while top:
+            top -= 1
+            index = stack[top]
+            x = index % EDGE
+            z = (index // EDGE) % EDGE
+            y = index // FACE_CELLS
+            faces |= cell_faces(x, y, z)
+            nxt = []
+            if x != 0:
+                nxt.append(index + STEP[WEST])
+            if x != EDGE - 1:
+                nxt.append(index + STEP[EAST])
+            if z != 0:
+                nxt.append(index + STEP[NORTH])
+            if z != EDGE - 1:
+                nxt.append(index + STEP[SOUTH])
+            if y != 0:
+                nxt.append(index + STEP[DOWN])
+            if y != EDGE - 1:
+                nxt.append(index + STEP[UP])
+            for n in nxt:
+                if not visited[n]:
+                    visited[n] = True
+                    stack[top] = n
+                    top += 1
+        touched = faces
+        while touched:
+            enter = (touched & -touched).bit_length() - 1
+            touched &= touched - 1
+            bits |= faces << (enter * FACES)
+        if bits == MATRIX_BITS:
+            break
+    return bits
+
+
+def face_visibility_hinted(blocks, uniform_air, sealed_solid):
+    """Mirror of FaceVisibility::compute_hinted (uniform_air wins)."""
+    if uniform_air:
+        return FV_ALL
+    if sealed_solid:
+        return FV_NONE
+    return face_visibility_compute(blocks)
+
+
+def fv_is_connected(bits, enter, exit_):
+    return (bits >> (enter * FACES + exit_)) & 1 != 0
+
+
+def fv_visible_from(bits, enter):
+    return (bits >> (enter * FACES)) & ALL_FACES
+
+
+# --- S2 GraphCuller (culler.rs) -------------------------------------------
+
+THROUGH_ALL = MATRIX_BITS
+GRAPH_PROCESSED = 1 << 6
+
+
+class SectionGraph:
+    """Mirror of culler.rs SectionGraph { through, renderable }."""
+
+    __slots__ = ("through", "renderable")
+
+    def __init__(self, through, renderable):
+        self.through = through
+        self.renderable = renderable
+
+    def can_reach(self, entry, exit_):
+        return self.through & (1 << (entry * FACES + exit_)) != 0
+
+
+SG_AIR = SectionGraph(THROUGH_ALL, False)
+SG_SOLID = SectionGraph(0, True)
+
+
+def section_in_frustum(coord, planes):
+    mn = [float(coord[i] * EDGE) for i in range(3)]
+    return box_in_frustum(mn, planes)
+
+
+def graph_culler_search(sections, camera, planes):
+    """Mirror of GraphCuller::search. Returns (visible, culled).
+
+    `sections` maps coord tuples to SectionGraph; `camera` is the section
+    containing the eye (always a node, AIR when unlisted).
+    """
+    entries = {camera: ALL_FACES}
+    queue = deque([camera])
+    visible = []
+    while queue:
+        coord = queue.popleft()
+        graph = sections.get(coord, SG_AIR)
+        if not entries[coord] & GRAPH_PROCESSED:
+            entries[coord] |= GRAPH_PROCESSED
+            if graph.renderable and section_in_frustum(coord, planes):
+                visible.append(coord)
+        entry_mask = entries[coord]
+        out = 0
+        for entry in range(FACES):
+            if not entry_mask & direction_bit(entry):
+                continue
+            for exit_ in range(FACES):
+                if exit_ != entry and graph.can_reach(entry, exit_):
+                    out |= direction_bit(exit_)
+        if coord != camera:
+            # Never backtrack out an entry face.
+            out &= ALL_FACES & ~entry_mask
+        for exit_ in range(FACES):
+            if not out & direction_bit(exit_):
+                continue
+            nxt = tuple(coord[i] + DIR_OFFSET[exit_][i] for i in range(3))
+            face = direction_bit(direction_opposite(exit_))
+            if nxt not in sections:
+                continue
+            mask = entries.get(nxt, 0)
+            if mask & face or not section_in_frustum(nxt, planes):
+                continue
+            entries[nxt] = mask | face
+            queue.append(nxt)
+    renderable = sum(1 for g in sections.values() if g.renderable)
+    return visible, renderable - len(visible)
+
+
+# --- S3 DirectionBuckets + bucket_draw_mask (mesh.rs) -----------------------
+
+DIRECTION_BUCKETS = 7
+DIRECTION_BUCKET_UNASSIGNED = 6  # Direction::East + 1
+
+
+def bucket_draw_mask(facing):
+    """Mirror of mesh.rs bucket_draw_mask: facing==0 draws everything."""
+    facing &= ALL_FACES
+    if facing == 0:
+        return (1 << DIRECTION_BUCKETS) - 1
+    return facing | (1 << DIRECTION_BUCKET_UNASSIGNED)
+
+
+def direction_buckets_group(directions):
+    """Mirror of DirectionBuckets::group_into: stable regroup by direction.
+
+    `directions` is a list of Direction values. Returns (grouped, buckets)
+    where buckets has contiguous `offset`/`count` arrays covering the whole
+    grouped range.
+    """
+    count = [0] * DIRECTION_BUCKETS
+    for d in directions:
+        count[d] += 1
+    offsets = []
+    nxt = 0
+    for c in count:
+        offsets.append(nxt)
+        nxt += c
+    grouped = []
+    for b in range(DIRECTION_BUCKETS):
+        grouped.extend(d for d in directions if d == b)
+    return grouped, {"offset": offsets, "count": count}
+
+
+# --- S4 RenderRegion slab arenas (region.rs) --------------------------------
+
+REGION_X, REGION_Y, REGION_Z = 8, 4, 8
+REGION_SECTIONS = REGION_X * REGION_Y * REGION_Z
+
+
+class _Arena:
+    """Mirror of region.rs Arena: first-fit over a sorted, coalesced free list."""
+
+    __slots__ = ("buf_len", "free")
+
+    def __init__(self):
+        self.buf_len = 0
+        self.free = []  # (offset, len), sorted by offset, never adjacent
+
+    def upload(self, data_len):
+        if data_len == 0:
+            return 0
+        for i, (offset, length) in enumerate(self.free):
+            if length >= data_len:
+                if length == data_len:
+                    self.free.pop(i)
+                else:
+                    self.free[i] = (offset + data_len, length - data_len)
+                return offset
+        offset = self.buf_len
+        self.buf_len += data_len
+        return offset
+
+    def release(self, offset, length):
+        if length == 0:
+            return
+        pos = 0
+        while pos < len(self.free) and self.free[pos][0] < offset:
+            pos += 1
+        self.free.insert(pos, (offset, length))
+        if (pos + 1 < len(self.free)
+                and self.free[pos][0] + self.free[pos][1] == self.free[pos + 1][0]):
+            self.free[pos] = (self.free[pos][0],
+                              self.free[pos][1] + self.free[pos + 1][1])
+            self.free.pop(pos + 1)
+        if (pos > 0
+                and self.free[pos - 1][0] + self.free[pos - 1][1] == self.free[pos][0]):
+            self.free[pos - 1] = (self.free[pos - 1][0],
+                                  self.free[pos - 1][1] + self.free[pos][1])
+            self.free.pop(pos)
+
+    def free_len(self):
+        return sum(length for _, length in self.free)
+
+
+class RenderRegion:
+    """Mirror of region.rs RenderRegion; `quads` arguments are quad counts
+    (4 packed vertices + 6 indices per quad is all the arena math needs)."""
+
+    __slots__ = ("origin", "vertices", "indices", "slots", "occupied")
+
+    def __init__(self, origin):
+        self.origin = tuple(origin)
+        self.vertices = _Arena()
+        self.indices = _Arena()
+        self.slots = [None] * REGION_SECTIONS
+        self.occupied = 0
+
+    def local(self, coord):
+        x = coord[0] - self.origin[0]
+        y = coord[1] - self.origin[1]
+        z = coord[2] - self.origin[2]
+        if not (0 <= x < REGION_X and 0 <= y < REGION_Y and 0 <= z < REGION_Z):
+            return None
+        return y * REGION_X * REGION_Z + z * REGION_X + x
+
+    def contains(self, coord):
+        return self.local(coord) is not None
+
+    def slab(self, coord):
+        index = self.local(coord)
+        return None if index is None else self.slots[index]
+
+    def upload(self, coord, quad_count):
+        index = self.local(coord)
+        if index is None:
+            return False
+        vlen = quad_count * 4
+        ilen = quad_count * 6
+        old = self.slots[index]
+        if old is not None:
+            self.vertices.release(old["vertex_offset"], old["vertices"])
+            self.indices.release(old["index_offset"], old["indices"])
+            self.occupied -= 1
+        slab = {"vertex_offset": self.vertices.upload(vlen),
+                "vertices": vlen,
+                "index_offset": self.indices.upload(ilen),
+                "indices": ilen}
+        self.slots[index] = slab
+        self.occupied += 1
+        return True
+
+    def remove(self, coord):
+        index = self.local(coord)
+        if index is None:
+            return False
+        old = self.slots[index]
+        if old is None:
+            return False
+        self.vertices.release(old["vertex_offset"], old["vertices"])
+        self.indices.release(old["index_offset"], old["indices"])
+        self.slots[index] = None
+        self.occupied -= 1
+        return True
+
+    def stats(self):
+        return {"sections": self.occupied,
+                "vertex_words": self.vertices.buf_len,
+                "vertex_free": self.vertices.free_len(),
+                "index_words": self.indices.buf_len,
+                "index_free": self.indices.free_len()}
+
+    def build_multidraw(self, camera):
+        """One command per facing bucket; draws in slot order."""
+        buckets = {}
+        for index, slab in enumerate(self.slots):
+            if slab is None or slab["indices"] == 0:
+                continue
+            x = index % REGION_X
+            z = (index // REGION_X) % REGION_Z
+            y = index // (REGION_X * REGION_Z)
+            mn = [float((self.origin[0] + x) * EDGE),
+                  float((self.origin[1] + y) * EDGE),
+                  float((self.origin[2] + z) * EDGE)]
+            buckets.setdefault(box_facing_mask(mn, camera), []).append(
+                {"index_count": slab["indices"], "instance_count": 1,
+                 "first_index": slab["index_offset"],
+                 "base_vertex": slab["vertex_offset"], "base_instance": 0})
+        return [{"region": list(self.origin), "facing": facing, "draws": draws}
+                for facing, draws in sorted(buckets.items())]
+
+
+class RenderRegions:
+    """Mirror of region.rs RenderRegions."""
+
+    def __init__(self):
+        self.regions = {}
+
+    @staticmethod
+    def origin_of(coord):
+        return [coord[0] // REGION_X * REGION_X,
+                coord[1] // REGION_Y * REGION_Y,
+                coord[2] // REGION_Z * REGION_Z]
+
+    def upload(self, coord, quad_count):
+        origin = self.origin_of(coord)
+        region = self.regions.get(tuple(origin))
+        if region is None:
+            region = RenderRegion(origin)
+            self.regions[tuple(origin)] = region
+        region.upload(coord, quad_count)
+
+    def remove(self, coord):
+        origin = tuple(self.origin_of(coord))
+        region = self.regions.get(origin)
+        if region is None or not region.remove(coord):
+            return False
+        if region.occupied == 0:
+            del self.regions[origin]
+        return True
+
+    def build_multidraw(self, camera):
+        commands = []
+        for region in self.regions.values():
+            commands.extend(region.build_multidraw(camera))
+        commands.sort(key=lambda c: (c["region"], c["facing"]))
+        return commands
+
+
+# --- Layer 1 ChunkPacketCache (connection_limits.rs) ------------------------
+
+CHUNK_PACKET_CACHE_CAP = 512
+
+
+def _varint(v):
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _read_varint(buf, pos=0):
+    result = 0
+    i = 0
+    while True:
+        byte = buf[pos + i]
+        result |= (byte & 0x7F) << (7 * i)
+        if not byte & 0x80:
+            return result, pos + i + 1
+        i += 1
+
+
+class _Frame:
+    """Stand-in for the shared Arc<Vec<u8>>: identity is the sharing signal."""
+
+    __slots__ = ("data",)
+
+    def __init__(self, data):
+        self.data = data
+
+    def __eq__(self, other):
+        return isinstance(other, _Frame) and self.data == other.data
+
+
+def _body_of_frame(plain):
+    _, pos = _read_varint(plain)
+    return plain[pos:]
+
+
+def _plain_frame(body):
+    return _Frame(_varint(len(body)) + body)
+
+
+def _compressed_frame(body, threshold):
+    if len(body) < threshold:
+        inner = _varint(0) + body
+    else:
+        inner = _varint(len(body)) + zlib.compress(body)
+    return _Frame(_varint(len(inner)) + inner)
+
+
+class ChunkPacketCache:
+    """Mirror of connection_limits.rs ChunkPacketCache.
+
+    Entries are keyed by (dim, cx, cz) — `dim` is an opaque tag here — and
+    gated on a caller-computed world `revision`; `compression` is the
+    negotiated threshold or None. Frames are shared objects: two readers at
+    the same revision literally receive the same `_Frame`.
+    """
+
+    def __init__(self):
+        self.generation = 0
+        self.map = {}
+        self.order = deque()
+
+    def _sync_generation(self, generation):
+        if self.generation != generation:
+            self.map.clear()
+            self.order.clear()
+            self.generation = generation
+
+    @staticmethod
+    def _body(payload):
+        return _varint(0x27) + bytes(payload)
+
+    def frame(self, generation, key, revision, compression):
+        self._sync_generation(generation)
+        entry = self.map.get(key)
+        if entry is None or entry["revision"] != revision:
+            return None
+        if compression is None:
+            frame = entry["plain"]
+        else:
+            if entry["compressed"] is None or entry["compressed"][0] != compression:
+                entry["compressed"] = (
+                    compression,
+                    _compressed_frame(_body_of_frame(entry["plain"].data), compression))
+            frame = entry["compressed"][1]
+        return frame, list(entry["emitters"])
+
+    def insert(self, generation, key, revision, own_emitters, payload):
+        self._sync_generation(generation)
+        entry = {"revision": revision,
+                 "emitters": list(own_emitters),
+                 "plain": _plain_frame(self._body(payload)),
+                 "compressed": None}
+        if key not in self.map:
+            self.order.append(key)
+        self.map[key] = entry
+        while len(self.order) > CHUNK_PACKET_CACHE_CAP:
+            self.map.pop(self.order.popleft(), None)
+
+    @staticmethod
+    def frame_uncached(payload, compression):
+        body = ChunkPacketCache._body(payload)
+        if compression is None:
+            return _plain_frame(body)
+        return _compressed_frame(body, compression)
+
+
+# ---------------------------------------------------------------------------
 # Self-test checks.
 # ---------------------------------------------------------------------------
 
@@ -704,6 +1218,319 @@ def self_test():
     check(order == [1, 3, 2], f"translucent-order-{order}")
     check(translucent_order([quad(1, 0, 0, LAYER_FLUID, WATER)], (0, 0, 0)) == [0],
           "water-fluid-included")
+
+    # --- S1 FaceVisibility (visibility.rs) ---
+    vis_air = face_visibility_compute([AIR] * SECTION_CELLS)
+    check(vis_air == FV_ALL, f"fv-air-{vis_air}")
+    for enter in range(FACES):
+        check(fv_visible_from(vis_air, enter) == ALL_FACES, f"fv-air-from-{enter}")
+        for exit_ in range(FACES):
+            check(fv_is_connected(vis_air, enter, exit_), f"fv-air-conn-{enter}-{exit_}")
+    check(face_visibility_hinted([AIR] * SECTION_CELLS, True, False) == FV_ALL,
+          "fv-hint-air")
+    check(face_visibility_hinted([stone] * SECTION_CELLS, False, True) == FV_NONE,
+          "fv-hint-sealed")
+
+    vis_sealed = face_visibility_compute([stone] * SECTION_CELLS)
+    check(vis_sealed == FV_NONE, f"fv-sealed-{vis_sealed}")
+    # Enclosed cavity: air only inside x,y,z in 2..13 never reaches a face.
+    cavity = [opaque_cube(1)] * SECTION_CELLS
+    for y in range(2, 14):
+        for z in range(2, 14):
+            for x in range(2, 14):
+                cavity[section_index(x, y, z)] = AIR
+    check(face_visibility_compute(cavity) == FV_NONE, "fv-cavity")
+    # Partial occlusion and fluids stay sight-open.
+    stairs = Block(state_id=7, flags=OPAQUE, occlusion=direction_bit(UP))
+    mixed = [stairs] * SECTION_CELLS
+    for i in range(0, SECTION_CELLS, 3):
+        mixed[i] = Block(state_id=1, flags=FLUID_TINTED, occlusion=0,
+                         fluid_kind=WATER, fluid_level=0)
+    check(face_visibility_compute(mixed) == FV_ALL, "fv-partial-open")
+    # Full wall at x=8 disconnects only West<->East.
+    walled = [AIR] * SECTION_CELLS
+    for z in range(EDGE):
+        for y in range(EDGE):
+            walled[section_index(8, y, z)] = opaque_cube(1)
+    vis_wall = face_visibility_compute(walled)
+    check(not fv_is_connected(vis_wall, WEST, EAST)
+          and not fv_is_connected(vis_wall, EAST, WEST), "fv-wall-opposite")
+    for a, b in ((WEST, WEST), (WEST, DOWN), (WEST, NORTH), (EAST, UP),
+                 (EAST, SOUTH), (NORTH, EAST), (DOWN, UP), (NORTH, SOUTH)):
+        check(fv_is_connected(vis_wall, a, b), f"fv-wall-conn-{a}-{b}")
+    check(fv_visible_from(vis_wall, WEST) == 0b011111, "fv-wall-west-mask")
+    check(fv_visible_from(vis_wall, EAST) == 0b101111, "fv-wall-east-mask")
+    check(fv_visible_from(vis_wall, NORTH) == ALL_FACES, "fv-wall-north-mask")
+    # Single-file tunnel along x connects exactly West and East.
+    tunnel = [opaque_cube(1)] * SECTION_CELLS
+    for x in range(EDGE):
+        tunnel[section_index(x, 8, 8)] = AIR
+    vis_tunnel = face_visibility_compute(tunnel)
+    we = direction_bit(WEST) | direction_bit(EAST)
+    check(fv_visible_from(vis_tunnel, WEST) == we
+          and fv_visible_from(vis_tunnel, EAST) == we, "fv-tunnel-axes")
+    for d in (DOWN, UP, NORTH, SOUTH):
+        check(fv_visible_from(vis_tunnel, d) == 0, f"fv-tunnel-{d}")
+    expected_tunnel = ((we << (WEST * FACES)) | (we << (EAST * FACES)))
+    check(vis_tunnel == expected_tunnel, f"fv-tunnel-bits-{vis_tunnel}")
+    for enter in range(FACES):
+        for exit_ in range(FACES):
+            check(fv_is_connected(vis_tunnel, enter, exit_)
+                  == fv_is_connected(vis_tunnel, exit_, enter),
+                  f"fv-tunnel-asym-{enter}-{exit_}")
+    # A waterlogged opaque cube still blocks sight.
+    waterlogged = opaque_cube(1)
+    waterlogged.flags |= WATERLOGGED
+    waterlogged.fluid_kind = WATER
+    check(face_visibility_compute([waterlogged] * SECTION_CELLS) == FV_NONE,
+          "fv-waterlogged")
+
+    # --- S2 GraphCuller (culler.rs) ---
+    def box_planes(mn, mx):
+        return [[1.0, 0.0, 0.0, -mn[0]], [-1.0, 0.0, 0.0, mx[0]],
+                [0.0, 1.0, 0.0, -mn[1]], [0.0, -1.0, 0.0, mx[1]],
+                [0.0, 0.0, 1.0, -mn[2]], [0.0, 0.0, -1.0, mx[2]]]
+
+    # Synthetic terrain + cave: 8x4x8 sections, 3-thick solid floor (y=0..2)
+    # carved by a 3x1x3 pocket at y=1, all-air top (y=3).
+    cave = {(x, 1, z) for x in range(3, 6) for z in range(3, 6)}
+    terrain = {}
+    for x in range(8):
+        for z in range(8):
+            for y in range(4):
+                graph = SG_AIR if y == 3 or (x, y, z) in cave else SG_SOLID
+                terrain[(x, y, z)] = graph
+    camera = (4, 1, 4)
+    planes = box_planes([-1024.0, -1024.0, 2.0 * EDGE], [1024.0] * 3)
+    visible, culled = graph_culler_search(terrain, camera, planes)
+    check(len(visible) == 30, f"culler-visible-{len(visible)}")
+    renderable = sum(1 for g in terrain.values() if g.renderable)
+    check(renderable == 183, f"culler-renderable-{renderable}")
+    check(culled == renderable - len(visible), f"culler-culled-{culled}")
+    check(culled * 5 >= renderable * 3, "culler-culled-60pct")
+    for c in ((4, 0, 4), (4, 2, 4), (2, 1, 4)):
+        check(c in visible, f"culler-pocket-wall-{c}")
+    for c in ((0, 0, 0), (2, 1, 2), (4, 1, 4)):
+        check(c not in visible, f"culler-hidden-{c}")
+    check(not any(c[1] == 3 for c in visible), "culler-air-layer")
+
+    # Corridor connectivity: only N->S and S->N travel propagates.
+    corridor = SectionGraph(1 << (NORTH * FACES + SOUTH)
+                            | 1 << (SOUTH * FACES + NORTH), False)
+    cmap = {(0, 0, 0): corridor, (0, 0, 1): corridor, (0, 0, 2): corridor,
+            (1, 0, 1): SG_SOLID, (0, 0, 3): SG_SOLID}
+    vis2, culled2 = graph_culler_search(cmap, (0, 0, 0),
+                                        box_planes([-1024.0] * 3, [1024.0] * 3))
+    check((0, 0, 3) in vis2 and (1, 0, 1) not in vis2, "culler-corridor")
+    check(culled2 == 1, f"culler-corridor-culled-{culled2}")
+
+    # Off-frustum arm is not traversed, so the solid behind it stays culled.
+    omap = {(0, 0, 0): SG_AIR, (0, 0, -1): SG_AIR,
+            (0, 0, -2): SG_SOLID, (0, 0, 1): SG_SOLID}
+    vis3, culled3 = graph_culler_search(omap, (0, 0, 0),
+                                        box_planes([-1024.0, -1024.0, 0.0],
+                                                   [1024.0] * 3))
+    check(vis3 == [(0, 0, 1)] and culled3 == 1, f"culler-frustum-{vis3}-{culled3}")
+
+    # Multi-entry sections are listed once (PROCESSED flag dedups).
+    mmap = {(0, 0, 0): SG_AIR, (1, 0, 0): SG_AIR, (2, 0, 0): SG_AIR,
+            (2, 0, 1): SG_SOLID}
+    vis4, culled4 = graph_culler_search(mmap, (0, 0, 0),
+                                        box_planes([-1024.0] * 3, [1024.0] * 3))
+    check(vis4 == [(2, 0, 1)] and culled4 == 0, f"culler-dedup-{vis4}")
+
+    # Camera inside sealed geometry sees only itself.
+    smap = {(0, 0, 0): SG_SOLID, (1, 0, 0): SG_SOLID}
+    vis5, culled5 = graph_culler_search(smap, (0, 0, 0),
+                                        box_planes([-1024.0] * 3, [1024.0] * 3))
+    check(vis5 == [(0, 0, 0)] and culled5 == 1, f"culler-sealed-cam-{vis5}")
+
+    # --- S3 DirectionBuckets + bucket_draw_mask (mesh.rs) ---
+    check(bucket_draw_mask(0) == 0x7F, "bucket-mask-enclosed")
+    check(bucket_draw_mask(direction_bit(WEST)) == direction_bit(WEST)
+          | (1 << DIRECTION_BUCKET_UNASSIGNED), "bucket-mask-west")
+    west_north = direction_bit(WEST) | direction_bit(NORTH)
+    check(bucket_draw_mask(west_north) == west_north
+          | (1 << DIRECTION_BUCKET_UNASSIGNED), "bucket-mask-west-north")
+    # Facing mask comes from box_facing_mask; enclosed camera -> draw all.
+    facing = box_facing_mask([0.0] * 3, [-1.0, 8.0, -1.0])
+    check(bucket_draw_mask(facing) == bucket_draw_mask(west_north),
+          "bucket-mask-facing-consistency")
+    enclosed = bucket_draw_mask(box_facing_mask([0.0] * 3, [8.0, 8.0, 8.0]))
+    check(enclosed == 0x7F, "bucket-mask-enclosed-camera")
+
+    directions = [UP, DOWN, UP, EAST, NORTH, UP, SOUTH, DOWN]
+    grouped, buckets = direction_buckets_group(directions)
+    check(len(grouped) == len(directions), "bucket-group-size")
+    check(grouped == [d for b in range(DIRECTION_BUCKETS)
+                      for d in directions if d == b],
+          f"bucket-group-order-{grouped}")
+    check(grouped[:2] == [DOWN, DOWN] and grouped[2:5] == [UP] * 3,
+          "bucket-group-stable")
+    check(buckets["count"] == [2, 3, 1, 1, 0, 1, 0],
+          f"bucket-counts-{buckets['count']}")
+    offs, total = buckets["offset"], 0
+    for b, (off, cnt) in enumerate(zip(offs, buckets["count"])):
+        check(off == total, f"bucket-offset-{b}")
+        total += cnt
+    check(total == len(directions), "bucket-cover")
+    # group_into appends: a second call's offsets shift by the prior length.
+    more = [WEST, EAST]
+    grouped2, buckets2 = direction_buckets_group(more)
+    check(buckets2["offset"][WEST] == 0 and buckets2["count"][WEST] == 1
+          and buckets2["count"][EAST] == 1, "bucket-second-group")
+
+    # --- S4 RenderRegion slab reuse (region.rs) ---
+    region = RenderRegion([0, 0, 0])
+    a, b, c, d, e = ((0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0))
+    check(region.upload(a, 4) and region.upload(b, 2), "region-upload")
+    old_a = dict(region.slab(a))
+    old_b = dict(region.slab(b))
+    check((old_a["vertex_offset"], old_a["index_offset"]) == (0, 0), "region-a-origin")
+    grown = region.stats()
+    check(grown["vertex_words"] == 24, f"region-vertex-words-{grown}")
+    # Rebuilding in place releases before allocating: b keeps its slab.
+    check(region.upload(b, 2), "region-reupload")
+    check(region.slab(b) == old_b, "region-rebuild-same-slab")
+    check(region.stats()["vertex_words"] == grown["vertex_words"],
+          "region-no-growth")
+    # Unloading a frees its range; a same-size upload reuses it exactly.
+    check(region.remove(a), "region-remove-a")
+    check(region.upload(c, 4), "region-upload-c")
+    check(region.slab(c) == old_a, "region-reuse-slab")
+    check(region.stats()["vertex_words"] == grown["vertex_words"],
+          "region-still-no-growth")
+    # A smaller upload splits the freed range instead of growing.
+    check(region.remove(c), "region-remove-c")
+    check(region.upload(d, 1), "region-upload-d")
+    check(region.slab(d)["vertex_offset"] == 0, "region-d-offset")
+    check(region.upload(e, 2), "region-upload-e")
+    check(region.slab(e)["vertex_offset"] == 4, "region-e-offset")
+    stats = region.stats()
+    check(stats["vertex_words"] == grown["vertex_words"]
+          and stats["vertex_free"] == 4, f"region-free-{stats}")
+    check(not region.upload((0, 4, 0), 1), "region-outside-y")
+    check(not region.upload((8, 0, 0), 1), "region-outside-x")
+
+    # MultiDraw: 8 sections along x in one region + one in the next.
+    regions = RenderRegions()
+    for x in range(8):
+        regions.upload((x, 0, 0), 1)
+    regions.upload((8, 0, 0), 1)
+    commands = regions.build_multidraw([-8.0, 8.0, 8.0])
+    check(len(commands) == 2, f"multidraw-count-{len(commands)}")
+    check(commands[0]["region"] == [0, 0, 0]
+          and commands[1]["region"] == [8, 0, 0], "multidraw-regions")
+    check(commands[0]["facing"] == direction_bit(WEST), "multidraw-facing")
+    check(len(commands[0]["draws"]) == 8, "multidraw-draws")
+    for i, draw in enumerate(commands[0]["draws"]):
+        check(draw["index_count"] == 6 and draw["instance_count"] == 1
+              and draw["first_index"] == i * 6
+              and draw["base_vertex"] == i * 4
+              and draw["base_instance"] == 0, f"multidraw-draw-{i}")
+    # Camera inside section 0 splits the first region into two buckets.
+    commands = regions.build_multidraw([8.0, 8.0, 8.0])
+    check(len(commands) == 3, f"multidraw-split-{len(commands)}")
+    check([(c["region"], c["facing"]) for c in commands]
+          == [([0, 0, 0], 0), ([0, 0, 0], direction_bit(WEST)),
+              ([8, 0, 0], direction_bit(WEST))], "multidraw-split-order")
+    # Free-list coalescing across neighbors.
+    region2 = RenderRegion([0, 0, 0])
+    coords = [(x, 0, 0) for x in range(4)]
+    for coord in coords:
+        check(region2.upload(coord, 2), "region2-upload")
+    check(region2.remove(coords[1]) and region2.remove(coords[2]),
+          "region2-remove-middle")
+    check(region2.upload((4, 0, 0), 3), "region2-upload-hole")
+    check(region2.slab((4, 0, 0))["vertex_offset"] == 8, "region2-hole-offset")
+    s2 = region2.stats()
+    check(s2["vertex_words"] == 32 and s2["vertex_free"] == 4,
+          f"region2-coalesce-{s2}")
+    # RenderRegions drops an emptied region.
+    check(regions.remove((8, 0, 0)), "regions-remove")
+    check(tuple(RenderRegions.origin_of((9, 5, 9))) == (8, 4, 8),
+          "regions-origin-negative-safe")
+
+    # --- S6 LodSummary (lod.rs) ---
+    class LodSummary:
+        """Mirror of lod.rs LodSummary: update reuses the cell buffer."""
+
+        def __init__(self, edge):
+            check(edge in (LOD_COARSE, LOD_FINE), "lodsummary-edge")
+            self.edge = edge
+            self.cells = [(0, 0, LOD_CELL_EMPTY_TOP)] * (edge * edge)
+            self.height = 0
+
+        def cells_view(self):
+            return self.cells
+
+        def update(self, sections):
+            self.height = len(sections) * EDGE
+            self.cells[:] = summarize_column(sections, self.edge)
+            return self.cells
+
+    summary = LodSummary(LOD_COARSE)
+    first = summary.update(sections)
+    check(summary.height == 3 * EDGE, "lodsummary-height")
+    check(len(first) == LOD_COARSE * LOD_COARSE, "lodsummary-size")
+    second = summary.update([air_section])
+    check(second is first, "lodsummary-buffer-reused")
+    check(all(c[2] == LOD_CELL_EMPTY_TOP for c in second),
+          "lodsummary-reupdate")
+    summary.update(sections)
+    check(summary.cells_view()[1 * LOD_COARSE + 0][0] == 7,
+          "lodsummary-gold-persists")
+    fine_summary = LodSummary(LOD_FINE)
+    fine_summary.update(sections)
+    check(len(fine_summary.cells_view()) == LOD_FINE * LOD_FINE,
+          "lodsummary-fine-size")
+
+    # --- Layer 1 ChunkPacketCache (connection_limits.rs) ---
+    pcache = ChunkPacketCache()
+    key = ("overworld", 4, -7)
+    check(pcache.frame(10, key, 41, None) is None, "pcache-miss")
+    pcache.insert(10, key, 41, [((1, 2, 3), 15)], [9, 9, 9])
+    f1, emitters = pcache.frame(10, key, 41, None)
+    f2, _ = pcache.frame(10, key, 41, None)
+    check(f1 is f2, "pcache-shared-frame")
+    check(emitters == [((1, 2, 3), 15)], "pcache-emitters")
+    # Frame decodes to varint(len) + varint(0x27) + payload.
+    _, pos = _read_varint(f1.data)
+    pid, pos2 = _read_varint(f1.data, pos)
+    check(pid == 0x27 and f1.data[pos2:] == bytes([9, 9, 9]), "pcache-frame-body")
+    # Compressed readers get a lazily built, then shared, compressed frame.
+    c1, _ = pcache.frame(10, key, 41, 256)
+    c2, _ = pcache.frame(10, key, 41, 256)
+    check(c1 is c2 and c1 is not f1 and c1 != f1, "pcache-compressed-shared")
+    c3, _ = pcache.frame(10, key, 41, 64)
+    check(c3 is not c1, "pcache-per-threshold")
+    c1b, _ = pcache.frame(10, key, 41, 256)
+    check(c1b is not c3, "pcache-threshold-rebuilds")
+    # Revision bump invalidates; reinsert replaces.
+    check(pcache.frame(10, key, 42, None) is None, "pcache-revision-miss")
+    pcache.insert(10, key, 42, [], [7])
+    f3, _ = pcache.frame(10, key, 42, None)
+    check(f3 is not f1 and f3 != f1, "pcache-revision-frame")
+    check(pcache.frame(10, key, 42, None)[0] is f3, "pcache-reshare")
+    # frame_uncached emits identical bytes without touching the entry.
+    uncached = ChunkPacketCache.frame_uncached([9, 9, 9], None)
+    check(uncached == f1 or uncached.data == f1.data, "pcache-uncached-equal")
+    # A generation change drops every entry.
+    check(pcache.frame(11, key, 42, None) is None, "pcache-generation-miss")
+    pcache.insert(11, key, 42, [], [2])
+    gframe, _ = pcache.frame(11, key, 42, None)
+    _, gpos = _read_varint(gframe.data)
+    _, gpos2 = _read_varint(gframe.data, gpos)
+    check(gframe.data[gpos2:] == bytes([2]), "pcache-generation-frame")
+    # FIFO bound: CAP+4 inserts evict the oldest keys.
+    big = ChunkPacketCache()
+    for i in range(CHUNK_PACKET_CACHE_CAP + 4):
+        big.insert(1, ("overworld", i, 0), 1, [], bytes([i & 0xFF]))
+    check(len(big.map) <= CHUNK_PACKET_CACHE_CAP, "pcache-cap-bound")
+    check(big.frame(1, ("overworld", 0, 0), 1, None) is None,
+          "pcache-fifo-evicted")
+    check(big.frame(1, ("overworld", CHUNK_PACKET_CACHE_CAP + 3, 0), 1, None)
+          is not None, "pcache-newest-kept")
 
 
 def self_test_main():

@@ -1,7 +1,7 @@
 # 実装・検証チェックリスト（`perf/worldgen-parallel`）
 
 作成: 2026-11-06。基点: `48dfe73b4e1db64d5ce295f0e533d30780a8fc37`。
-更新: 2026-11-21（同期基準: `cfffac7`）。状態: **部分実装・限定検証済み。上位P0〜P4の完了は別判定**。Wave 5（B4 昇格・Save v2・protocol 767・execute・gamerules・block entities・fluids・M3 計測）を下記「Wave 5 同期受入」に反映済み。
+更新: 2026-11-21（同期基準: `a970d82`）。状態: **部分実装・限定検証済み。上位P0〜P4の完了は別判定**。Wave 5（B4 昇格・Save v2・protocol 767・execute・gamerules・block entities・fluids・M3 計測）と Wave B（CF-5 culling カーネル・`ChunkPacketCache`・broadcast culling・perf gate 拡張）を下記「Wave 5 同期受入」「Wave B 同期受入」に反映済み。
 作成時点の履歴と、下記の現行棚卸しを混同しない。
 
 この文書は**作業順、担当する既存owner、完了ゲートを一覧化する実行台帳**。
@@ -36,6 +36,18 @@
 | M3 worldgen CPU／アロケーション | `a82df1a`（CPU/alloc 削減）、`cfffac7`（octave noise cache）＋ [`m3-warm-worldgen.md`](../evidence/perf/m3-warm-worldgen.md) | **`WARM=1` live CPU は mc-spine 16.82 s 対 Vanilla 4.23 s。equal-work live throughput／G3 50 ms budget は未検証**。`cfffac7` は end-to-end 利得なし |
 
 `9ab10ca`／`9bfba2d` 等の同名コミットは HEAD の祖先ではないため、この台帳の完了根拠には使わない。
+
+## Wave B 同期受入（2026-11-21、HEAD `a970d82`）
+
+以下は `git log` と checkout 内ソース、および本 worktree での実実行結果のみを根拠にした記録。上位 P0〜P4 の完了判定や `P4-1` 同一 SHA gate に代わるものではない。
+
+| 同期項目 | 完了根拠（commit / 実行結果） | 残す境界 |
+|---|---|---|
+| CF-5 Layer 1: `ChunkPacketCache`＋`broadcast_near` | `a970d82`：`src/connection_limits.rs` の `ChunkPacketCache`（512-entry FIFO、共有 `Arc<Vec<u8>>` plain フレーム＋閾値ごとの遅延 compressed フレーム、generation リセット）と `src/play_protocol.rs` の `cached_chunk_frame`/`chunk_packet_revision`（3×3 `chunk_versions`＋`map_chunk_sig`＋live block entity fingerprint）。`broadcast_near`/`broadcast_near_in` が `broadcast_radius`/`within_broadcast_range` 経由で Vanilla の厳密半径 `d² < r²`・同一 `DimId`・パケット由来半径（sound/particle/explosion）に限定 | `container_wire.py` live PASS（13.2 s、`target/debug/mc-spine`）。新 wire 挙動は `P4-1` の同一 SHA 再収集対象 |
+| CF-5 `client-port` カーネル S1〜S6 | `4be29f7`（S1 `FaceVisibility` 6×6 ビットマスク＋S3 `DirectionBuckets`/`bucket_draw_mask`/`mc_spine_client_mesh_bucket_directions`）、`20fb3fa`（S6 `summarize_column`/`LodSummary`＋sealed-section culling）、`f7bed23`（S2 `GraphCuller` direction-monotonic BFS＋S4 `RenderRegion` 8×4×8 slab arena/`MultiDrawCommand`＋S5 `rebuild_dirty_ordered`/`resort_translucent`）。`cargo test --manifest-path client-port/Cargo.toml` 53 tests PASS | **`client-app` 配線は未完了**（Wave B1/B2）: `GraphCuller`/`RenderRegion`/`LodSummary`/`rebuild_dirty_ordered`/`resort_translucent` は `client-app/src/` から未参照。`client-app` は従来の `rebuild_dirty`＋per-section `sort_translucent` のまま |
+| `tests/culling_perf_gate.py` 拡張と live gate | self-test に S1 `FaceVisibility`・S2 `GraphCuller`・S3 `DirectionBuckets`・S4 `RenderRegion` slab 再利用・S6 `LodSummary`・Layer 1 `ChunkPacketCache` の Python ミラーを追加。`--self-test` PASS、`--runs 20` PASS（19 metrics、全 quad/vertex カウント pin 一致・全 timing ceiling 内） | live モードは `mesh_bench`/`lod_bench` の出力のみ検査；S2/S4 の新カーネル専用ベンチ予算は今後の登録対象 |
+| `client_fork_e2e.py` | `--self-test` PASS（offline、wrapper parser/tamper/redaction のみ） | フル E2E（ビルド＋Prism/mrpack export＋実サーバー往復）は未実施。release artifact 3種（`libmc_spine_client_mesh.so`/`libmc_spine_kernel.so`/`mc-spine-client`）は未ビルド |
+| 仕様同期 | `specs/client-fork/sodium-culling-architecture.md` を HEAD `a970d82` の Layer 1/Layer 3 実装状態へ更新、`specs/ROADMAP.md` に Wave B 行を追加 | ドキュメントのみ；動作変更なし |
 
 ## 現行の棚卸し（2026-11-13、上位項目の一括完了ではない）
 
@@ -130,6 +142,7 @@
 - [x] **CF-2（Client Port描画・増分lighting・Greedy Meshing）**: `client-port/` Greedy Mesher + AO + fluid surfaces + 24-section column meshing + packed 16-byte vertex VBO + translucent sorting と Protocol 767 wire bridge（`0018bac`, `d384fb8`, `8f7a520`）。`768 -> 3` quad reduction（256.00x）、5,208.55 µs/column。増分lighting `src/lighting.rs` directional slab/stair face occlusion・settled emitter-removal parityは15/15 live Vanilla snapshots byte-exact（`6598fe6`, `906ec67`; `tests/lighting_parity_test.py` PASS）。
 - [x] **CF-3（`mods/` 投入型 Rust Integrated Server 第 1 段 JAR パッケージ完了 `8199d14`）**: [build_integrated_mod.py](../tools/client_launcher/build_integrated_mod.py) で Fabric/NeoForge 両対応 `mc-spine-integrated.jar` ＋ `IntegratedServerBridge` ループバック起動・監視・クリーン終了を実装（`client_launcher_test.py` 18/18 PASS。残件：実ゲーム Client Mod ライフサイクル・Direct `ByteBuffer` FFI 接続）。
 - [x] **CF-4（Launcher bundle exporter — `e46f6b0`）**: Prism Launcher / Modrinth `.mrpack` / Official Launcher bundle exporter と SHA-256 integrity gate（`tools/client_launcher/export_launcher_bundle.py`, `tests/client_launcher_test.py` 25/25 PASS）。
+- [ ] **CF-5（Sodium + Horizon 可視化アーキテクチャ — カーネル完了・app 配線未完了）**: [sodium-culling-architecture.md](client-fork/sodium-culling-architecture.md) の 3 層契約に基づき、Layer 1（server）に `ChunkPacketCache` 共有 `0x27` フレーム＋`broadcast_near` Vanilla 半径/次元 culling（`a970d82`、`container_wire.py` live PASS）、Layer 3 の `client-port` カーネルに S1 `FaceVisibility`・S2 `GraphCuller`・S3 `DirectionBuckets`・S4 `RenderRegion`・S5 `rebuild_dirty_ordered`/`resort_translucent`・S6 `LodSummary`（`4be29f7`, `20fb3fa`, `f7bed23`、53 unit tests PASS、`culling_perf_gate.py` self-test＋live `--runs 20` PASS）を実装済み。**残件**: `client-app` への配線（Wave B1/B2 — `GraphCuller`/`RenderRegion`/`LodSummary`/新スケジューラ採用）、S2/S4 専用ベンチ予算の perf gate 登録、フル `client_fork_e2e.py` E2E。
 
 ### R7 — ゲームプレイ完全性（M2→M4：`GP-0`〜`GP-7`）
 
@@ -151,7 +164,7 @@
 
 ## 次の着手
 
-[ROADMAPの直近の状態と出口](ROADMAP.md#直近の実行順2026-11-21-wave-5-同期)を参照する。Wave 3/4 と Wave 5 の完了済みレーンを反映済み。次の統合出口は `WARM=1` live CPU（Vanilla 4.23 s 対比）、P1 template/Fossil 残件の追跡と `P4-1` 同一SHA Release Gate。
+[ROADMAPの直近の状態と出口](ROADMAP.md#直近の実行順2026-11-21-wave-b-同期)を参照する。Wave 3/4・Wave 5 の完了済みレーンと Wave B（CF-5 culling カーネル＋Layer 1 フレームキャッシュ）の同期済み範囲を反映済み。次の統合出口は `client-app` への CF-5 カーネル配線（Wave B1/B2）、`WARM=1` live CPU（Vanilla 4.23 s 対比）、P1 template/Fossil 残件の追跡と `P4-1` 同一SHA Release Gate。
 下記の作成時点の「未実行」を、現在の未実装一覧や最新gate結果に読み替えない。
 
 ## 履歴: 作成時点の作業実績（2026-11-06〜07）
