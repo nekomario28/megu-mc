@@ -322,6 +322,62 @@ fn client_tracking_range_chunks(entity_id: &str) -> u32 {
         .map_or(5, |spec| spec.client_tracking_range as u32)
 }
 
+// The registry is extracted from the 1.21.1 EntityType registrations. The
+// builder default is three; unknown IDs must be validated before use.
+#[allow(dead_code)]
+fn entity_update_interval_ticks(entity_id: &str) -> u32 {
+    let name = entity_id.strip_prefix("minecraft:").unwrap_or(entity_id);
+    ENTITY_REGISTRY_1211.iter()
+        .find(|spec| spec.name.strip_prefix("minecraft:") == Some(name))
+        .map_or(3, |spec| spec.update_interval as u32)
+}
+
+/// A bounded queue of not-yet-serialized chunks. The supplied window is a
+/// scheduling constraint, not a substitute for vanilla's tracked chunk set.
+#[allow(dead_code)]
+struct ChunkSendBudget {
+    queued: Vec<(i32, i32)>,
+    max_chunks_per_tick: usize,
+}
+
+#[allow(dead_code)]
+impl ChunkSendBudget {
+    fn new(max_chunks_per_tick: usize) -> Self {
+        Self { queued: Vec::new(), max_chunks_per_tick }
+    }
+
+    fn enqueue(&mut self, chunk: (i32, i32)) {
+        if !self.queued.contains(&chunk) { self.queued.push(chunk); }
+    }
+
+    fn drain_tick(&mut self, center: (i32, i32), radius: u32, look: (f64, f64)) -> Vec<(i32, i32)> {
+        let radius = i64::from(radius);
+        self.queued.retain(|&(x, z)| {
+            (i64::from(x) - i64::from(center.0)).abs() <= radius &&
+            (i64::from(z) - i64::from(center.1)).abs() <= radius
+        });
+        prioritize_chunks(&mut self.queued, center, look);
+        let count = self.max_chunks_per_tick.min(self.queued.len());
+        self.queued.drain(..count).collect()
+    }
+}
+
+/// Uniform sections can use a single palette entry; air and light remain
+/// independent and neither permits omitting a section from the chunk format.
+#[allow(dead_code)]
+fn uniform_section<T: Eq + Copy>(states: &[T]) -> Option<T> {
+    let (&first, rest) = states.split_first()?;
+    rest.iter().all(|state| *state == first).then_some(first)
+}
+
+/// Select light arrays already known to be needed within an inclusive band.
+/// Outside entries are not asserted empty and must not be encoded as zero.
+#[allow(dead_code)]
+fn light_sections_in_band(nonempty: &[bool], first: usize, last: usize) -> Vec<usize> {
+    nonempty.iter().enumerate().filter_map(|(i, &present)|
+        (present && first <= i && i <= last).then_some(i)).collect()
+}
+
 /// Inputs are the actual per-player tracked and eligible sets, after all Vanilla
 /// distance, passenger, visibility, and chunk-tracking checks have been applied.
 #[allow(dead_code)]
@@ -390,6 +446,29 @@ fn section_nonempty_masks(air: &[[bool; 4096]], light: &[[u8; 2048]]) -> (Vec<bo
 #[cfg(test)]
 mod entity_spatial_tests {
     use super::*;
+
+    #[test]
+    fn entity_spatial_budget_drops_stale_before_draining() {
+        let mut budget = ChunkSendBudget::new(2);
+        for chunk in [(0, 0), (1, 0), (-1, 0), (0, 1), (5, 5), (1, 0)] { budget.enqueue(chunk); }
+        assert_eq!(budget.drain_tick((0, 0), 1, (1.0, 0.0)), vec![(0, 0), (1, 0)]);
+        assert_eq!(budget.drain_tick((1, 0), 1, (1.0, 0.0)), vec![(0, 1)]);
+        assert!(budget.drain_tick((1, 0), 1, (1.0, 0.0)).is_empty());
+    }
+
+    #[test]
+    fn entity_spatial_intervals_and_section_classification() {
+        for (name, ticks) in [("player", 2), ("arrow", 20), ("block_display", 1),
+            ("area_effect_cloud", i32::MAX as u32), ("other:cow", 3)] {
+            assert_eq!(entity_update_interval_ticks(name), ticks);
+        }
+        let mut blocks = [0u16; 4096];
+        assert_eq!(uniform_section(&blocks), Some(0));
+        blocks[4095] = 1;
+        assert_eq!(uniform_section(&blocks), None);
+        assert_eq!(uniform_section::<u8>(&[]), None);
+        assert_eq!(light_sections_in_band(&[true, false, true, true], 1, 2), vec![2]);
+    }
 
     #[test]
     fn entity_spatial_tracking_ranges_and_diffs() {
