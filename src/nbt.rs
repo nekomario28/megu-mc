@@ -76,8 +76,11 @@ impl Tag {
     }
 }
 
+const MAX_NBT_TAGS: usize = 250_000;
+
 struct Reader<'a> {
     input: &'a [u8],
+    remaining_tags: usize,
 }
 impl<'a> Reader<'a> {
     fn bytes(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
@@ -131,6 +134,10 @@ impl<'a> Reader<'a> {
         Ok(NbtString(units))
     }
     fn tag(&mut self, id: u8, depth: usize) -> Result<Tag, &'static str> {
+        if self.remaining_tags == 0 {
+            return Err("NBT exceeds tag count budget");
+        }
+        self.remaining_tags -= 1;
         Ok(match id {
             0 => Tag::End,
             1 => Tag::Byte(i8::from_be_bytes(self.number()?)),
@@ -200,7 +207,10 @@ impl<'a> Reader<'a> {
 }
 
 pub(crate) fn read_named(input: &[u8]) -> Result<(NbtString, Tag), &'static str> {
-    let mut reader = Reader { input };
+    let mut reader = Reader {
+        input,
+        remaining_tags: MAX_NBT_TAGS,
+    };
     let id = reader.number::<1>()?[0];
     let name = if id == 0 {
         NbtString(Vec::new())
@@ -349,7 +359,10 @@ pub(crate) fn read_network_nbt(input: &mut &[u8]) -> Result<Tag, &'static str> {
     let Some((&10, rest)) = input.split_first() else {
         return Err("network registry NBT root must be a compound");
     };
-    let mut reader = Reader { input: rest };
+    let mut reader = Reader {
+        input: rest,
+        remaining_tags: MAX_NBT_TAGS,
+    };
     let tag = reader.tag(10, 0)?;
     *input = reader.input;
     Ok(tag)

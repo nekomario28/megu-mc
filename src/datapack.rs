@@ -858,10 +858,12 @@ enum McRe {
 const MC_RE_MAX_REP: u32 = 64;
 /// Bound on compiled program size (instructions) for the same reason.
 const MC_RE_MAX_INSTS: usize = 4096;
+const MC_RE_MAX_DEPTH: usize = 32;
 
 struct McReParser<'a> {
     c: &'a [char],
     i: usize,
+    depth: usize,
 }
 
 impl<'a> McReParser<'a> {
@@ -1079,6 +1081,10 @@ impl<'a> McReParser<'a> {
         self.i += 1;
         match c {
             '(' => {
+                if self.depth >= MC_RE_MAX_DEPTH {
+                    return None;
+                }
+                self.depth += 1;
                 // `(?:...)` non-capturing group prefix is accepted silently.
                 if self.peek() == Some('?') {
                     self.i += 1;
@@ -1086,7 +1092,9 @@ impl<'a> McReParser<'a> {
                         self.i += 1;
                     }
                 }
-                let n = self.alt()?;
+                let n = self.alt();
+                self.depth -= 1;
+                let n = n?;
                 if self.peek() != Some(')') {
                     return None;
                 }
@@ -1186,8 +1194,15 @@ fn mc_re_emit(node: &McRe, prog: &mut Vec<McInst>) -> Option<()> {
 
 /// Compile a pattern into an NFA program; `None` on a malformed pattern.
 fn mc_re_compile(pattern: &str) -> Option<Vec<McInst>> {
+    if pattern.len() > MC_RE_MAX_INSTS {
+        return None;
+    }
     let chars: Vec<char> = pattern.chars().collect();
-    let mut parser = McReParser { c: &chars, i: 0 };
+    let mut parser = McReParser {
+        c: &chars,
+        i: 0,
+        depth: 0,
+    };
     let ast = parser.alt()?;
     if parser.i != chars.len() {
         return None;

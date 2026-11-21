@@ -37,9 +37,12 @@ impl J {
     }
 }
 
+const MAX_JSON_DEPTH: usize = 128;
+
 pub(crate) struct JP<'a> {
     b: &'a [u8],
     i: usize,
+    depth: usize,
 }
 impl<'a> JP<'a> {
     pub(crate) fn ws(&mut self) {
@@ -51,54 +54,89 @@ impl<'a> JP<'a> {
         self.ws();
         match *self.b.get(self.i)? {
             b'{' => {
+                if self.depth >= MAX_JSON_DEPTH {
+                    return None;
+                }
+                self.depth += 1;
                 self.i += 1;
                 let mut m = vec![];
                 loop {
                     self.ws();
                     if self.b.get(self.i) == Some(&b'}') {
                         self.i += 1;
+                        self.depth -= 1;
                         return Some(J::Obj(m));
                     }
-                    let k = match self.val()? {
-                        J::Str(s) => s,
-                        _ => return None,
+                    let k = match self.val() {
+                        Some(J::Str(s)) => s,
+                        _ => {
+                            self.depth -= 1;
+                            return None;
+                        }
                     };
                     self.ws();
                     if self.b.get(self.i) != Some(&b':') {
+                        self.depth -= 1;
                         return None;
                     }
                     self.i += 1;
-                    let v = self.val()?;
+                    let v = match self.val() {
+                        Some(v) => v,
+                        None => {
+                            self.depth -= 1;
+                            return None;
+                        }
+                    };
                     m.push((k, v));
                     self.ws();
                     match self.b.get(self.i) {
                         Some(&b',') => self.i += 1,
                         Some(&b'}') => {
                             self.i += 1;
+                            self.depth -= 1;
                             return Some(J::Obj(m));
                         }
-                        _ => return None,
+                        _ => {
+                            self.depth -= 1;
+                            return None;
+                        }
                     }
                 }
             }
             b'[' => {
+                if self.depth >= MAX_JSON_DEPTH {
+                    return None;
+                }
+                self.depth += 1;
                 self.i += 1;
                 let mut a = vec![];
                 loop {
                     self.ws();
                     if self.b.get(self.i) == Some(&b']') {
                         self.i += 1;
+                        self.depth -= 1;
                         return Some(J::Arr(a));
                     }
-                    a.push(self.val()?);
+                    let v = match self.val() {
+                        Some(v) => v,
+                        None => {
+                            self.depth -= 1;
+                            return None;
+                        }
+                    };
+                    a.push(v);
                     self.ws();
                     match self.b.get(self.i) {
                         Some(&b',') => self.i += 1,
                         Some(&b']') => {
                             self.i += 1;
+                            self.depth -= 1;
                             return Some(J::Arr(a));
                         }
-                        _ => return None,
+                        _ => {
+                            self.depth -= 1;
+                            return None;
+                        }
                     }
                 }
             }
@@ -121,28 +159,70 @@ impl<'a> JP<'a> {
                             b'u' => {
                                 let h = self.b.get(self.i..self.i + 4)?;
                                 self.i += 4;
-                                char::from_u32(
-                                    u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?,
-                                )
-                                .unwrap_or('?')
+                                let u1 =
+                                    u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?;
+                                if (0xD800..=0xDBFF).contains(&u1)
+                                    && self.b.get(self.i..self.i + 2) == Some(b"\\u")
+                                {
+                                    if let Some(h2) = self.b.get(self.i + 2..self.i + 6) {
+                                        if let Some(u2) = std::str::from_utf8(h2)
+                                            .ok()
+                                            .and_then(|t| u32::from_str_radix(t, 16).ok())
+                                        {
+                                            if (0xDC00..=0xDFFF).contains(&u2) {
+                                                self.i += 6;
+                                                let cp = 0x10000
+                                                    + ((u1 - 0xD800) << 10)
+                                                    + (u2 - 0xDC00);
+                                                s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                                char::from_u32(u1).unwrap_or('?')
                             }
                             x => x as char,
                         });
-                    } else {
+                    } else if c < 0x80 {
                         s.push(c as char);
+                    } else {
+                        let start = self.i - 1;
+                        let tail = &self.b[start..];
+                        let ch = match std::str::from_utf8(tail) {
+                            Ok(text) => text.chars().next()?,
+                            Err(err) => {
+                                let valid = err.valid_up_to();
+                                if valid == 0 {
+                                    return None;
+                                }
+                                std::str::from_utf8(&tail[..valid]).ok()?.chars().next()?
+                            }
+                        };
+                        self.i = start + ch.len_utf8();
+                        s.push(ch);
                     }
                 }
                 None
             }
             b't' => {
+                if self.b.get(self.i..self.i + 4) != Some(b"true") {
+                    return None;
+                }
                 self.i += 4;
                 Some(J::Num(1.0))
             }
             b'f' => {
+                if self.b.get(self.i..self.i + 5) != Some(b"false") {
+                    return None;
+                }
                 self.i += 5;
                 Some(J::Num(0.0))
             }
             b'n' => {
+                if self.b.get(self.i..self.i + 4) != Some(b"null") {
+                    return None;
+                }
                 self.i += 4;
                 Some(J::Null)
             }
@@ -166,7 +246,7 @@ impl<'a> JP<'a> {
     }
 }
 pub(crate) fn jparse(b: &[u8]) -> Option<J> {
-    JP { b, i: 0 }.val()
+    JP { b, i: 0, depth: 0 }.val()
 }
 
 // Typed field accessors shared by the registry, providers and feature parsing.
@@ -210,5 +290,22 @@ mod tests {
         assert!(jbool(&value, "unset", true));
         assert!(matches!(value.get("unset"), Some(J::Null)));
         assert!(!matches!(value.get("aquifers_enabled"), Some(J::Null)));
+    }
+
+    #[test]
+    fn deeply_nested_json_fails_closed_without_stack_overflow() {
+        let deep_arr = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
+        assert!(jparse(deep_arr.as_bytes()).is_none());
+        let deep_obj = format!("{}{}", "{\"a\":".repeat(10_000), "}".repeat(10_000));
+        assert!(jparse(deep_obj.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn utf16_surrogate_pair_and_utf8_japanese_decode_cleanly() {
+        let value = jparse("{\"icon\":\"\\uD83D\\uDE00\",\"ja\":\"日本語テスト\"}".as_bytes()).unwrap();
+        assert_eq!(jstr(&value, "icon").as_deref(), Some("\u{1F600}"));
+        assert_eq!(jstr(&value, "ja").as_deref(), Some("日本語テスト"));
+        assert!(jparse(b"tr").is_none());
+        assert!(jparse(b"nul").is_none());
     }
 }
