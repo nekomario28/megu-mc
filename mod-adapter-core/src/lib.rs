@@ -9,6 +9,11 @@
 //!   Cartesian expansion and Save v2 canonical `"namespace:block[k=v]"` codec.
 //! - [`data_loader`]: Zero-JVM JSON & stored-ZIP/JAR loader for recipes, tags,
 //!   and declarative mod offload profiles across any namespace.
+//! - [`dep_resolver`]: missing mod-dependency UX engine — Modrinth v2
+//!   auto-fetch query building and verified artifact selection behind
+//!   [`mod_sync::ConsentToken`]-gated, content-addressed installs, plus a
+//!   restart-free hot-reload classifier for newly dropped JARs and an
+//!   EN/JA [`dep_resolver::DepRecoveryPlan`] operator summary.
 //! - [`neoforge_wire`]: Protocol 767 VarInt/string codecs and NeoForge 1.21.1
 //!   Configuration `frozen_registry*` synchronization frames.
 //! - [`profile`]: Generic declarative offload runtime bridging any mod's
@@ -120,6 +125,7 @@ pub mod creature_primitives;
 pub mod culinary_adapter;
 pub mod custom_media;
 pub mod data_loader;
+pub mod dep_resolver;
 pub mod dimension_mod;
 pub mod ecosystem_compat;
 pub mod fallback;
