@@ -76,6 +76,8 @@ fn entity_selectors_include_live_non_players_and_select_nearest_or_random() {
     let _world = world_guard();
     let (mut player, _hold) = crate::effect_tests::client_pair();
     player.eid = 4244;
+    player.name = "selector-test".into();
+    *player.gm.lock().unwrap() = 1;
     *player.pos.lock().unwrap() = (0.5, 16.0, 0.5, 0.0, 0.0, false);
     let player_eid = player.eid;
     clients().lock().unwrap().push(Arc::new(player));
@@ -112,15 +114,27 @@ fn entity_selectors_include_live_non_players_and_select_nearest_or_random() {
     ));
     let mob_eid = mobs().lock().unwrap().last().unwrap().eid;
 
+    {
+        let mut board = scoreboard().lock().unwrap();
+        apply_scoreboard_command(&mut board, &["objectives", "add", "selector_test", "dummy"]).unwrap();
+        board.set("selector-test", "selector_test", 7).unwrap();
+    }
+    let player_filter = resolve_selector("@a[name=selector-test,gamemode=creative,level=0,scores={selector_test=7}]", None);
+    scoreboard().lock().unwrap().remove_objective("selector_test");
     let all_entities = resolve_selector("@e", None);
     let all_players = resolve_selector("@a", None);
     let nearest_item = resolve_selector("@n[type=item]", None);
     let random_item = resolve_selector("@r[type=item]", None);
+    let filtered = resolve_selector(r#"@e[type=item,nbt={Item:{id:"minecraft:stone"}},distance=..2,sort=nearest,limit=1]"#, None);
+    tags().lock().unwrap().entry("d:4246".into()).or_default().insert("marked".into());
+    let tagged = resolve_selector("@e[type=item,tag=marked,sort=furthest,limit=1]", None);
+    tags().lock().unwrap().remove("d:4246");
 
     clients().lock().unwrap().retain(|c| c.eid != player_eid);
     drops().lock().unwrap().retain(|d| d.eid != 4245 && d.eid != 4246);
     remove_live_mob(mob_eid);
 
+    assert_eq!(player_filter, vec![player_eid.to_string()]);
     assert!(all_entities.contains(&player_eid.to_string()));
     assert!(all_entities.contains(&"d:4245".to_string()));
     assert!(all_entities.contains(&"d:4246".to_string()));
@@ -128,6 +142,8 @@ fn entity_selectors_include_live_non_players_and_select_nearest_or_random() {
     assert!(all_players.contains(&player_eid.to_string()));
     assert!(all_players.iter().all(|eid| eid.parse::<i32>().is_ok()));
     assert_eq!(nearest_item, vec!["d:4245".to_string()]);
+    assert_eq!(filtered, vec!["d:4245".to_string()]);
+    assert_eq!(tagged, vec!["d:4246".to_string()]);
     assert_eq!(random_item.len(), 1);
     assert!(random_item[0] == "d:4245" || random_item[0] == "d:4246");
 }
@@ -829,4 +845,19 @@ fn effect_clear_rejects_unknown_effect() {
     let ctx = command_context(None);
     assert_eq!(run_command_ctx(&ctx, "/effect clear @a not_an_effect", &mut None),
         "unknown effect 'not_an_effect'");
+}
+
+#[test]
+fn enchant_rejects_invalid_levels_and_kill_removes_selected_items() {
+    let _world = world_guard();
+    let ctx = command_context(None);
+    assert_eq!(run_command_ctx(&ctx, "/enchant nobody sharpness nope", &mut None), "Invalid enchantment level");
+    drops().lock().unwrap().push(Drop {
+        eid: 5251, x: 0.5, y: 16.0, z: 0.5,
+        item: name_to_item("stone").unwrap(), cnt: 1, comps: Vec::new(),
+        age: 0, target: None, thrower: None,
+    });
+    let result = run_command_ctx(&ctx, "/kill @e[type=item,nbt={Item:{id:\"minecraft:stone\"}},limit=1]", &mut None);
+    assert_eq!(result, "Killed 1");
+    assert!(!drops().lock().unwrap().iter().any(|item| item.eid == 5251));
 }

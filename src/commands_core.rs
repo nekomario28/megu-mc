@@ -2184,6 +2184,23 @@ fn player_command_targets(target: &str, source: Option<&Arc<Client>>) -> Vec<Arc
 }
 
 fn run_experience_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
+    if let ["query", target, unit @ ("points" | "levels")] = args {
+        let targets = player_command_targets(target, source);
+        let [player] = targets.as_slice() else {
+            return "Expected one player".into();
+        };
+        let sessions = player_mechanism_sessions().lock().unwrap();
+        let Some(session) = sessions.get(&player.eid) else {
+            return "Player experience is unavailable".into();
+        };
+        let xp = PlayerXpState {
+            level: session.xp_bar.0,
+            progress: session.xp_bar.1,
+            total_experience: 0,
+        };
+        let amount = if *unit == "levels" { xp.query_experience_levels() } else { xp.query_experience_points() };
+        return format!("{} has {} experience {}", player.name, amount, unit);
+    }
     let [action @ ("add" | "set"), target, amount, units @ ..] = args else {
         return "Usage: /xp add|set <target> <amount> [points|levels]".into();
     };
@@ -2295,315 +2312,31 @@ fn command_gamerules() -> &'static Mutex<HashMap<&'static str, i32>> {
         .map(|&(name, _, default)| (name, default)).collect()))
 }
 
-// resolve @selector -> player eids or mob eids ("m:<eid>" prefixed for mobs)
-fn selector_entities() -> Vec<(String, String, (f64, f64, f64))> {
-    let mut entities = Vec::new();
-    for c in client_snapshot() {
-        let p = *c.pos.lock().unwrap();
-        entities.push((c.eid.to_string(), "player".to_string(), (p.0, p.1, p.2)));
-    }
-    for m in mobs().lock().unwrap().iter() {
-        let p = *m.pos.lock().unwrap();
-        let name = entity_spec_by_id(m.etype)
-            .map_or("unknown", |spec| spec.name)
-            .to_string();
-        entities.push((format!("m:{}", m.eid), name, (p.0, p.1, p.2)));
-    }
-    for d in drops().lock().unwrap().iter() {
-        entities.push((format!("d:{}", d.eid), "item".into(), (d.x, d.y, d.z)));
-    }
-    for t in primed().lock().unwrap().iter() {
-        entities.push((format!("t:{}", t.eid), "tnt".into(), (t.x, t.y, t.z)));
-    }
-    for a in arrows().lock().unwrap().iter() {
-        entities.push((format!("a:{}", a.eid), "arrow".into(), (a.x, a.y, a.z)));
-    }
-    for p in pearls().lock().unwrap().iter() {
-        entities.push((format!("p:{}", p.eid), "ender_pearl".into(), (p.x, p.y, p.z)));
-    }
-    for b in bobbers().lock().unwrap().iter() {
-        entities.push((format!("b:{}", b.eid), "fishing_bobber".into(), (b.x, b.y, b.z)));
-    }
-    for x in xps().lock().unwrap().iter() {
-        entities.push((format!("x:{}", x.eid), "experience_orb".into(), (x.x, x.y, x.z)));
-    }
-    entities
-}
-
-fn resolve_bounded_selector(kind: char, args: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
-    let (mut x, mut y, mut z) = ctx.map(|c| {
+// Resolve core command targets through the same Brigadier snapshot as /execute.
+fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
+    let (x, y, z) = ctx.map(|c| {
         let p = *c.pos.lock().unwrap();
         (p.0, p.1, p.2)
-    })
-    .unwrap_or((0.5, 16.0, 0.5));
-    let (mut typ, mut max_distance, mut min_distance, mut limit) =
-        (None, f64::INFINITY, 0.0, None);
-    for kv in args.split(',').filter(|s| !s.trim().is_empty()) {
-        let Some((key, value)) = kv.trim().split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "type" => {
-                let (negated, value) = (value.starts_with('!'), value.trim_start_matches('!'));
-                let value = value.trim_start_matches("minecraft:");
-                typ = Some(if negated {
-                    format!("!{value}")
-                } else {
-                    value.to_string()
-                });
-            }
-            "x" => x = value.parse().unwrap_or(x),
-            "y" => y = value.parse().unwrap_or(y),
-            "z" => z = value.parse().unwrap_or(z),
-            "distance" => {
-                if let Some((lo, hi)) = value.split_once("..") {
-                    min_distance = lo.parse().unwrap_or(0.0);
-                    max_distance = hi.parse().unwrap_or(f64::INFINITY);
-                } else if let Ok(exact) = value.parse() {
-                    min_distance = exact;
-                    max_distance = exact;
-                }
-            }
-            "limit" => limit = value.parse::<usize>().ok(),
-            _ => {}
-        }
-    }
-    let random_players_only = kind == 'r' && typ.is_none();
-    let mut found: Vec<_> = selector_entities()
-        .into_iter()
-        .filter_map(|(id, entity_type, pos)| {
-            if random_players_only && entity_type != "player" {
-                return None;
-            }
-            if let Some(filter) = typ.as_deref() {
-                let (negated, filter) = (filter.starts_with('!'), filter.trim_start_matches('!'));
-                if (entity_type == filter) == negated {
-                    return None;
-                }
-            }
-            let distance =
-                ((pos.0 - x).powi(2) + (pos.1 - y).powi(2) + (pos.2 - z).powi(2)).sqrt();
-            (distance >= min_distance && distance <= max_distance).then_some((id, distance))
-        })
-        .collect();
-    if kind == 'n' {
-        found.sort_by(|a, b| a.1.total_cmp(&b.1));
-    }
-    if kind == 'r' {
-        if !found.is_empty() {
-            let index = (world_rng::next_u64() % found.len() as u64) as usize;
-            found.swap(0, index);
-        }
-    }
-    let default_limit = if matches!(kind, 'r' | 'n') { 1 } else { usize::MAX };
-    found
-        .into_iter()
-        .take(limit.unwrap_or(default_limit))
-        .map(|(id, _)| id)
-        .collect()
-}
-
-fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
-    for kind in ['e', 'r', 'n'] {
-        let prefix = format!("@{kind}");
-        if sel == prefix {
-            return resolve_bounded_selector(kind, "", ctx);
-        }
-        if let Some(args) = sel
-            .strip_prefix(&format!("{prefix}["))
-            .and_then(|s| s.strip_suffix(']'))
-        {
-            if kind != 'e' || args.trim().is_empty() {
-                return resolve_bounded_selector(kind, args, ctx);
+    }).unwrap_or((0.5, 16.0, 0.5));
+    let source = ExecuteSource::new(&CmdCtx { me: ctx.cloned(), x, y, z });
+    // Preserve the legacy extension that permits @r[type=...] for non-players.
+    let random_entities = sel.strip_prefix("@r[").and_then(|args| args.strip_suffix(']'))
+        .filter(|args| args.split(',').any(|part| part.trim_start().starts_with("type=")))
+        .map(|args| {
+            let sort = if args.split(',').any(|part| part.trim_start().starts_with("sort=")) { "" } else { ",sort=random" };
+            let limit = if args.split(',').any(|part| part.trim_start().starts_with("limit=")) { "" } else { ",limit=1" };
+            format!("@e[{args}{sort}{limit}]")
+        });
+    source.select(random_entities.as_deref().unwrap_or(sel)).unwrap_or_default().into_iter().filter_map(|entity| {
+        match entity {
+            ExecuteEntity::Player(player) => Some(player.eid.to_string()),
+            ExecuteEntity::Mob(mob) => Some(format!("m:{}", mob.eid)),
+            other @ ExecuteEntity::Other { .. } => {
+                let key = other.tag_key();
+                matches!(key.as_bytes().first(), Some(b'd' | b't' | b'a' | b'p' | b'b' | b'x')).then_some(key)
             }
         }
-    }
-    if let Some(inner) = sel.strip_prefix("@e[").and_then(|x| x.strip_suffix(']')) {
-        let mut typ: Option<String> = None;
-        let (mut cx, mut cy, mut cz) = ctx
-            .map(|c| {
-                let p = *c.pos.lock().unwrap();
-                (p.0, p.1, p.2)
-            })
-            .unwrap_or((0.5, 16.0, 0.5));
-        let mut dist: Option<f64> = None;
-        let mut item_filter: Option<i64> = None;
-        let mut tag_filt: Option<(String, bool)> = None;
-        for kv in inner.split(',') {
-            if let Some((k, v)) = kv.trim().split_once('=') {
-                match k.trim() {
-                    "type" => {
-                        typ = Some(
-                            v.trim_start_matches("minecraft:")
-                                .trim_start_matches('!')
-                                .to_string(),
-                        )
-                    }
-                    "x" => cx = v.parse().unwrap_or(cx),
-                    "y" => cy = v.parse().unwrap_or(cy),
-                    "z" => cz = v.parse().unwrap_or(cz),
-                    "nbt" => {
-                        item_filter = v
-                            .split("id:\"")
-                            .nth(1)
-                            .and_then(|r| r.split('\"').next())
-                            .and_then(|id| name_to_item(id.trim_start_matches("minecraft:")));
-                    }
-                    "tag" => {
-                        tag_filt = Some((
-                            v.trim().trim_start_matches('!').to_string(),
-                            v.trim().starts_with('!'),
-                        ))
-                    }
-                    "distance" => {
-                        let v = v.trim();
-                        dist = Some(if let Some(hi) = v.strip_prefix("..") {
-                            hi.parse().unwrap_or(f64::MAX)
-                        } else {
-                            v.parse().unwrap_or(0.0)
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let near = |x: f64, y: f64, z: f64| {
-            let d = ((x - cx).powi(2) + (y - cy).powi(2) + (z - cz).powi(2)).sqrt();
-            dist.map(|dd| d <= dd + 1e-6).unwrap_or(true)
-        };
-        return match typ.as_deref() {
-            Some("player") => {
-                let tm = tags().lock().unwrap();
-                clients()
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|c| {
-                        let p = *c.pos.lock().unwrap();
-                        near(p.0, p.1, p.2)
-                    })
-                    .filter(|c| {
-                        tag_filt
-                            .as_ref()
-                            .map(|(tg, neg)| {
-                                *neg != tm
-                                    .get(&format!("p:{}", c.name))
-                                    .map(|st| st.contains(tg))
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(true)
-                    })
-                    .map(|c| c.eid.to_string())
-                    .collect()
-            }
-            Some("item") => drops()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|d| near(d.x, d.y, d.z) && item_filter.map(|f| d.item == f).unwrap_or(true))
-                .map(|d| format!("d:{}", d.eid))
-                .collect(),
-            Some("tnt") => primed()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|t| near(t.x, t.y, t.z))
-                .map(|t| format!("t:{}", t.eid))
-                .collect(),
-            Some("arrow") => arrows()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|a| near(a.x, a.y, a.z))
-                .map(|a| format!("a:{}", a.eid))
-                .collect(),
-            Some("ender_pearl") => pearls()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|a| near(a.x, a.y, a.z))
-                .map(|a| format!("p:{}", a.eid))
-                .collect(),
-            Some("fishing_bobber") => bobbers()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|a| near(a.x, a.y, a.z))
-                .map(|a| format!("b:{}", a.eid))
-                .collect(),
-            Some("experience_orb") => xps()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|a| near(a.x, a.y, a.z))
-                .map(|a| format!("x:{}", a.eid))
-                .collect(),
-            t => {
-                let et = t.and_then(name_to_etype).unwrap_or(-1);
-                {
-                    let tm = tags().lock().unwrap();
-                    mobs()
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|m| {
-                            (t.is_none() || m.etype == et) && {
-                                let p = *m.pos.lock().unwrap();
-                                near(p.0, p.1, p.2)
-                            }
-                        })
-                        .filter(|m| {
-                            tag_filt
-                                .as_ref()
-                                .map(|(tg, neg)| {
-                                    *neg != tm
-                                        .get(&format!("e:{}", m.eid))
-                                        .map(|st| st.contains(tg))
-                                        .unwrap_or(false)
-                                })
-                                .unwrap_or(true)
-                        })
-                        .map(|m| format!("m:{}", m.eid))
-                        .collect()
-                }
-            }
-        };
-    }
-    let cls: Vec<Arc<Client>> = client_snapshot();
-    if sel == "@p" {
-        if let Some(c) = ctx {
-            let pp = *c.pos.lock().unwrap();
-            let mut best: Option<(f64, i32)> = None;
-            for cl in cls.iter() {
-                let cp = *cl.pos.lock().unwrap();
-                let d = (cp.0 - pp.0).powi(2) + (cp.2 - pp.2).powi(2);
-                if best.map(|b| d < b.0).unwrap_or(true) {
-                    best = Some((d, cl.eid));
-                }
-            }
-            if let Some((_, e)) = best {
-                return vec![e.to_string()];
-            }
-        }
-        return cls
-            .first()
-            .map(|c| vec![c.eid.to_string()])
-            .unwrap_or_default();
-    }
-    if sel == "@a" || sel == "@e" {
-        return cls.iter().map(|c| c.eid.to_string()).collect();
-    }
-    if sel == "@s" {
-        return ctx.map(|c| vec![c.eid.to_string()]).unwrap_or_default();
-    }
-    // bare player name resolves to that player (vanilla target syntax)
-    if !sel.starts_with('@') {
-        if let Some(c) = cls.iter().find(|c| c.name == sel) {
-            return vec![c.eid.to_string()];
-        }
-    }
-    vec![]
+    }).collect()
 }
 
 // execution context: who + where (for ~ coords)
@@ -5104,7 +4837,14 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let Some(eid) = enchant_id(en_name) else {
                 return format!("Unknown enchantment: {}", en_name)
             };
-            let lvl = args.iter().rev().find_map(|a| a.parse::<i64>().ok()).unwrap_or(1);
+            let lvl = match args.as_slice() {
+                [_, _] => 1,
+                [_, _, level] => match level.parse::<i64>() {
+                    Ok(level) => level,
+                    Err(_) => return "Invalid enchantment level".into(),
+                },
+                _ => return "Usage: /enchant <target> <enchantment> [level]".into(),
+            };
             if lvl < 1 || lvl > enchant_max_level(eid) {
                 return format!("Level {} not supported for {} (max {})", lvl, en_name, enchant_max_level(eid))
             }
