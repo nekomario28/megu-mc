@@ -21,6 +21,8 @@ const SERVER_CONFIG_DEFAULT_FILE: &str = r#"# mc-spine settings. Every key is op
 # port = 25565
 # motd = "mc-spine"
 # max_players = 20
+# The Minecraft release this server runs as: "1.21.1" (default) or "26.3".
+# target_version = "1.21.1"
 
 [anticheat]
 # Enable or disable movement, fall-damage and placement checks (creative/spectator and ops are skipped by default).
@@ -411,7 +413,10 @@ const SERVER_CONFIG_KEYS: &[(&str, &str)] = &[
     // Reliability / ops / multi-version keys read by `RuntimeOpsConfig`. Keeping
     // them in the shared table means the boot export reaches the consumers that
     // already read the variable directly (`MC_SPINE_VERSION_DIR` in
-    // block_registry, `MC_SPINE_MC_VERSION` in save_v2).
+    // block_registry, `MC_SPINE_TARGET_VERSION`/`MC_SPINE_MC_VERSION` in
+    // save_v2). `target_version` is the canonical Two-Target knob;
+    // `target_mc_version` is the pre-Two-Target spelling kept so existing files
+    // keep working.
     ("online_mode", "MC_SPINE_ONLINE_MODE"),
     ("velocity_forwarding", "MC_SPINE_VELOCITY_FORWARDING"),
     ("velocity_forwarding_secret", "MC_SPINE_VELOCITY_SECRET"),
@@ -419,6 +424,7 @@ const SERVER_CONFIG_KEYS: &[(&str, &str)] = &[
     ("backup_max_keep", "MC_SPINE_BACKUP_MAX_KEEP"),
     ("lan_broadcast", "MC_SPINE_LAN_BROADCAST"),
     ("auto_load_balance", "MC_SPINE_AUTO_LOAD_BALANCE"),
+    ("target_version", "MC_SPINE_TARGET_VERSION"),
     ("target_mc_version", "MC_SPINE_MC_VERSION"),
     ("version_pack_dir", "MC_SPINE_VERSION_DIR"),
 ];
@@ -560,9 +566,15 @@ fn server_config_reread() -> Result<(ServerConfigDoc, Vec<String>), String> {
 // same variables through `server_config_boot` (`online-mode` is the only one
 // of these that has a vanilla key).
 
-/// The MC release the bundled data pack targets; `MC_SPINE_MC_VERSION` and the
-/// `[server] target_mc_version` key move it together.
+/// The MC release the bundled data pack targets; `MC_SPINE_TARGET_VERSION` and
+/// the `[server] target_version` key move it together (the legacy
+/// `MC_SPINE_MC_VERSION` / `target_mc_version` pair still fills it).
 pub(crate) const RUNTIME_OPS_DEFAULT_MC_VERSION: &str = "1.21.1";
+/// The two first-class MC releases this server can run as
+/// (`specs/multi-version-architecture.md`): the native `1.21.1` line and the
+/// latest vanilla `26.3` line. `target_version` must name one of these; any
+/// other value fails closed to the default.
+pub(crate) const RUNTIME_OPS_TARGET_VERSIONS: &[&str] = &["1.21.1", "26.3"];
 // Autosave cadence bounds: tight enough that a typo cannot stall saving for a
 // day or spin the writer every tick.
 const AUTOSAVE_SECS_DEFAULT: u64 = 300;
@@ -603,8 +615,9 @@ pub(crate) struct RuntimeOpsConfig {
     /// unless an operator explicitly turns it off.
     pub(crate) auto_load_balance: bool,
     /// The MC release the active version pack describes
-    /// (`MC_SPINE_MC_VERSION`).
-    pub(crate) target_mc_version: String,
+    /// (`MC_SPINE_TARGET_VERSION` / `[server] target_version`, validated
+    /// against `RUNTIME_OPS_TARGET_VERSIONS`).
+    pub(crate) target_version: String,
     /// Explicit version-pack directory (`MC_SPINE_VERSION_DIR`); unset means
     /// the bundled tables.
     pub(crate) version_pack_dir: Option<String>,
@@ -623,7 +636,7 @@ impl Default for RuntimeOpsConfig {
             backup_max_keep: BACKUP_MAX_KEEP_DEFAULT,
             lan_broadcast: false,
             auto_load_balance: true,
-            target_mc_version: RUNTIME_OPS_DEFAULT_MC_VERSION.to_owned(),
+            target_version: RUNTIME_OPS_DEFAULT_MC_VERSION.to_owned(),
             version_pack_dir: None,
             notes: Vec::new(),
         }
@@ -643,7 +656,7 @@ impl std::fmt::Debug for RuntimeOpsConfig {
             .field("backup_max_keep", &self.backup_max_keep)
             .field("lan_broadcast", &self.lan_broadcast)
             .field("auto_load_balance", &self.auto_load_balance)
-            .field("target_mc_version", &self.target_mc_version)
+            .field("target_version", &self.target_version)
             .field("version_pack_dir", &self.version_pack_dir)
             .field("notes", &self.notes)
             .finish()
@@ -735,13 +748,53 @@ fn ops_str(
         .filter(|s| !s.is_empty())
 }
 
+/// The MC release the server runs as. Layers, highest first:
+/// `MC_SPINE_TARGET_VERSION`, `[server] target_version`, then the legacy pair
+/// `MC_SPINE_MC_VERSION` / `[server] target_mc_version`. A layer must name one
+/// of `RUNTIME_OPS_TARGET_VERSIONS`; an unrecognized value is noted and the
+/// next layer is tried, so a typo can never make the server claim a release it
+/// does not implement.
+fn ops_target_version(
+    notes: &mut Vec<String>,
+    file: impl Fn(&str) -> Option<ServerConfigValue>,
+    env: impl Fn(&str) -> Option<String>,
+) -> String {
+    let mut file_str = |key: &str| match file(key) {
+        Some(ServerConfigValue::Str(s)) => Some(s),
+        Some(v) => {
+            notes.push(format!("[server] {key} must be a string, got {v:?}"));
+            None
+        }
+        None => None,
+    };
+    let layers = [
+        env("MC_SPINE_TARGET_VERSION"),
+        file_str("target_version"),
+        env("MC_SPINE_MC_VERSION"),
+        file_str("target_mc_version"),
+    ];
+    for raw in layers.into_iter().flatten() {
+        let value = raw.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if RUNTIME_OPS_TARGET_VERSIONS.contains(&value) {
+            return value.to_owned();
+        }
+        notes.push(format!(
+            "target_version `{value}` is not a supported release (expected \"1.21.1\" or \"26.3\"); ignoring"
+        ));
+    }
+    RUNTIME_OPS_DEFAULT_MC_VERSION.to_owned()
+}
+
 impl RuntimeOpsConfig {
     /// `[server]` from the parsed file, then the environment on top:
     /// `MC_SPINE_ONLINE_MODE`, `MC_SPINE_VELOCITY_FORWARDING`,
     /// `MC_SPINE_VELOCITY_SECRET`, `MC_SPINE_AUTOSAVE_SECS`,
     /// `MC_SPINE_BACKUP_MAX_KEEP`, `MC_SPINE_LAN_BROADCAST`,
-    /// `MC_SPINE_AUTO_LOAD_BALANCE`, `MC_SPINE_MC_VERSION`,
-    /// `MC_SPINE_VERSION_DIR`.
+    /// `MC_SPINE_AUTO_LOAD_BALANCE`, `MC_SPINE_TARGET_VERSION` (and the legacy
+    /// `MC_SPINE_MC_VERSION`), `MC_SPINE_VERSION_DIR`.
     pub(crate) fn from_doc(
         doc: &ServerConfigDoc,
         env: impl Fn(&str) -> Option<String>,
@@ -772,8 +825,7 @@ impl RuntimeOpsConfig {
             },
             lan_broadcast: ops_bool(&mut notes, "lan_broadcast", get("lan_broadcast"), env("MC_SPINE_LAN_BROADCAST"), false),
             auto_load_balance: ops_bool(&mut notes, "auto_load_balance", get("auto_load_balance"), env("MC_SPINE_AUTO_LOAD_BALANCE"), true),
-            target_mc_version: ops_str(&mut notes, "target_mc_version", get("target_mc_version"), env("MC_SPINE_MC_VERSION"))
-                .unwrap_or_else(|| RUNTIME_OPS_DEFAULT_MC_VERSION.to_owned()),
+            target_version: ops_target_version(&mut notes, |k| get(k).cloned(), |n| env(n)),
             version_pack_dir: ops_str(&mut notes, "version_pack_dir", get("version_pack_dir"), env("MC_SPINE_VERSION_DIR")),
             notes: Vec::new(),
         };
@@ -809,7 +861,7 @@ impl RuntimeOpsConfig {
     #[allow(dead_code)]
     pub(crate) fn summary(&self) -> String {
         format!(
-            "ops: online_mode={} velocity_forwarding={} (secret {}) autosave={}s backups={} lan={} load_balance={} mc_version={} pack_dir={}",
+            "ops: online_mode={} velocity_forwarding={} (secret {}) autosave={}s backups={} lan={} load_balance={} target_version={} pack_dir={}",
             self.online_mode,
             self.velocity_forwarding,
             if self.velocity_forwarding_secret.is_some() { "[REDACTED]" } else { "unset" },
@@ -817,7 +869,7 @@ impl RuntimeOpsConfig {
             self.backup_max_keep,
             self.lan_broadcast,
             self.auto_load_balance,
-            self.target_mc_version,
+            self.target_version,
             self.version_pack_dir.as_deref().unwrap_or("<bundled>"),
         )
     }
@@ -983,7 +1035,7 @@ mod server_config_tests {
         assert_eq!(c.backup_max_keep, 5);
         assert!(!c.lan_broadcast);
         assert!(c.auto_load_balance);
-        assert_eq!(c.target_mc_version, "1.21.1");
+        assert_eq!(c.target_version, "1.21.1");
         assert_eq!(c.version_pack_dir, None);
     }
 
@@ -998,7 +1050,7 @@ mod server_config_tests {
              backup_max_keep = 3\n\
              lan_broadcast = true\n\
              auto_load_balance = false\n\
-             target_mc_version = \"1.21.4\"\n\
+             target_version = \"26.3\"\n\
              version_pack_dir = \"packs/1214\"\n",
         );
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -1007,7 +1059,7 @@ mod server_config_tests {
             "MC_SPINE_ONLINE_MODE" => Some("0".to_owned()),
             "MC_SPINE_AUTOSAVE_SECS" => Some("45".to_owned()),
             "MC_SPINE_BACKUP_MAX_KEEP" => Some("8".to_owned()),
-            "MC_SPINE_MC_VERSION" => Some("1.21.5".to_owned()),
+            "MC_SPINE_TARGET_VERSION" => Some("1.21.1".to_owned()),
             _ => None,
         };
         let c = RuntimeOpsConfig::from_doc(&doc, env);
@@ -1015,7 +1067,7 @@ mod server_config_tests {
         assert!(!c.online_mode);
         assert_eq!(c.autosave_interval_secs, 45);
         assert_eq!(c.backup_max_keep, 8);
-        assert_eq!(c.target_mc_version, "1.21.5");
+        assert_eq!(c.target_version, "1.21.1");
         // Everything else comes from the file.
         assert!(c.velocity_forwarding);
         assert_eq!(c.velocity_forwarding_secret(), Some("file-secret"));
@@ -1030,12 +1082,13 @@ mod server_config_tests {
         // A `[server]` key with no environment override lands in the same
         // `MC_SPINE_*` variable its env-reading consumers already watch.
         let (doc, _) = server_config_parse(
-            "[server]\nonline_mode = true\ntarget_mc_version = \"1.21.4\"\nversion_pack_dir = \"p\"\n",
+            "[server]\nonline_mode = true\ntarget_version = \"26.3\"\ntarget_mc_version = \"1.21.1\"\nversion_pack_dir = \"p\"\n",
         );
         let env = server_config_server_env(&doc, |name| name == "MC_SPINE_ONLINE_MODE");
         let got: BTreeMap<&str, String> = env.into_iter().collect();
         assert!(!got.contains_key("MC_SPINE_ONLINE_MODE")); // env already won
-        assert_eq!(got["MC_SPINE_MC_VERSION"], "1.21.4");
+        assert_eq!(got["MC_SPINE_TARGET_VERSION"], "26.3");
+        assert_eq!(got["MC_SPINE_MC_VERSION"], "1.21.1");
         assert_eq!(got["MC_SPINE_VERSION_DIR"], "p");
         // And resolving the file sees the value the env layer would have set.
         let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
@@ -1124,5 +1177,80 @@ mod server_config_tests {
         // An empty env var is unset, so the default still applies.
         assert!(c.auto_load_balance);
         assert!(c.notes.is_empty(), "{:?}", c.notes);
+    }
+
+    #[test]
+    fn runtime_ops_target_version_accepts_both_targets_and_env_wins() {
+        // `[server] target_version` accepts exactly the two first-class targets.
+        for version in RUNTIME_OPS_TARGET_VERSIONS {
+            let (doc, _) = server_config_parse(&format!(
+                "[server]\ntarget_version = \"{version}\"\n"
+            ));
+            assert!(server_config_unknown_keys(&doc).is_empty());
+            let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
+            assert_eq!(c.target_version, *version);
+            assert!(c.notes.is_empty(), "{:?}", c.notes);
+        }
+        // `MC_SPINE_TARGET_VERSION` beats the file.
+        let (doc, _) = server_config_parse("[server]\ntarget_version = \"26.3\"\n");
+        let env = |name: &str| (name == "MC_SPINE_TARGET_VERSION").then(|| "1.21.1".to_owned());
+        let c = RuntimeOpsConfig::from_doc(&doc, env);
+        assert_eq!(c.target_version, "1.21.1");
+        assert!(c.notes.is_empty(), "{:?}", c.notes);
+        // The canonical pair outranks the legacy one entirely.
+        let env = |name: &str| match name {
+            "MC_SPINE_TARGET_VERSION" => Some("26.3".to_owned()),
+            "MC_SPINE_MC_VERSION" => Some("1.21.1".to_owned()),
+            _ => None,
+        };
+        let c = RuntimeOpsConfig::from_doc(&doc, env);
+        assert_eq!(c.target_version, "26.3");
+    }
+
+    #[test]
+    fn runtime_ops_target_version_legacy_pair_and_fail_closed() {
+        // The pre-Two-Target `target_mc_version` / `MC_SPINE_MC_VERSION` pair
+        // still fills the knob when the canonical one is unset.
+        let (doc, _) = server_config_parse("[server]\ntarget_mc_version = \"26.3\"\n");
+        let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
+        assert_eq!(c.target_version, "26.3");
+        assert!(c.notes.is_empty(), "{:?}", c.notes);
+        let c = RuntimeOpsConfig::from_doc(&doc, |name| {
+            (name == "MC_SPINE_MC_VERSION").then(|| "1.21.1".to_owned())
+        });
+        assert_eq!(c.target_version, "1.21.1");
+        // An unknown file value is noted and fails closed to the default.
+        let (doc, _) = server_config_parse("[server]\ntarget_version = \"1.21.4\"\n");
+        let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
+        assert_eq!(c.target_version, "1.21.1");
+        assert!(c
+            .notes
+            .iter()
+            .any(|n| n.contains("1.21.4") && n.contains("not a supported release")));
+        // An invalid env value falls through to a valid file layer.
+        let (doc, _) = server_config_parse("[server]\ntarget_version = \"26.3\"\n");
+        let c = RuntimeOpsConfig::from_doc(&doc, |name| {
+            (name == "MC_SPINE_TARGET_VERSION").then(|| "beta".to_owned())
+        });
+        assert_eq!(c.target_version, "26.3");
+        assert!(c.notes.iter().any(|n| n.contains("beta")));
+        // Every layer invalid means the default, with one note per bad value.
+        let (doc, _) = server_config_parse("[server]\ntarget_mc_version = \"snapshot-25w99a\"\n");
+        let c = RuntimeOpsConfig::from_doc(&doc, |name| {
+            (name == "MC_SPINE_MC_VERSION").then(|| "1.99".to_owned())
+        });
+        assert_eq!(c.target_version, "1.21.1");
+        assert_eq!(
+            c.notes
+                .iter()
+                .filter(|n| n.contains("not a supported release"))
+                .count(),
+            2
+        );
+        // A non-string file value is a note, not a crash or a guessed version.
+        let (doc, _) = server_config_parse("[server]\ntarget_version = 26.3\n");
+        let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
+        assert_eq!(c.target_version, "1.21.1");
+        assert!(c.notes.iter().any(|n| n.contains("must be a string")));
     }
 }

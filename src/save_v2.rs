@@ -1762,11 +1762,11 @@ fn save_world_into(f: &mut Vec<u8>) {
     // META section: mobs + world time + inventories (offline store + live).
     // MET4 = stacks carry component blobs and entity ages are server ticks.
     // MET2/MET3 stored those ages in milliseconds, which the loader converts.
-    let mut drop_owners: Vec<(u32, Option<[u8; 16]>, Option<[u8; 16]>)> = Vec::new();
+    let mut drop_owners: Vec<DropOwnerRecord> = Vec::new();
     // Non-Overworld signs and player dimensions ride in a footer (see `append_dim_footer`), so the
     // legacy sections below stay byte-for-byte identical for an Overworld-only save.
-    let dim_signs: Vec<(DimId, i32, i32, i32, u8, [String; 4])>;
-    let mut dim_players: Vec<(String, DimId)> = Vec::new();
+    let dim_signs: Vec<DimSignRecord>;
+    let mut dim_players: Vec<DimPlayerRecord> = Vec::new();
     // Chests, furnaces, crops and pending loot outside the Overworld go to their own footer; the
     // legacy sections below carry the Overworld's entries in the old wire layout. Crops are
     // collected before any container lock: the growth tick holds `crops` while writing a block,
@@ -2395,7 +2395,15 @@ const SAVE_VERSION_TABLE: &[(&str, i32, i32)] = &[
     ("1.21.3", 4082, 768),
     ("1.21.4", 4189, 769),
     ("1.21.5", 4325, 770),
+    ("26.3", 5023, 777),
 ];
+
+/// The releases this build runs as: the two first-class targets of
+/// `specs/multi-version-architecture.md` (`1.21.1` and `26.3`). The table
+/// above can *describe* more milestones for diagnostics, but a running target
+/// is only ever one of these — anything else fails closed to the 1.21.1
+/// default.
+const SAVE_TARGET_VERSIONS: &[&str] = &["1.21.1", "26.3"];
 
 /// The save schema this build writes natively. The version header records it so
 /// a future build can tell a save's vintage before parsing a byte of content.
@@ -2418,8 +2426,8 @@ impl SaveVersionHeader {
     fn v1_21_1() -> Self {
         SaveVersionHeader {
             mc_version: "1.21.1".to_owned(),
-            data_version: 3955,
-            protocol_version: 767,
+            data_version: SAVE_DATA_VERSION_RUNNING,
+            protocol_version: SAVE_PROTOCOL_VERSION_RUNNING,
             inferred_legacy_header: false,
         }
     }
@@ -2432,38 +2440,55 @@ impl SaveVersionHeader {
         }
     }
 
-    /// The header for a named release. A name the table does not know keeps
-    /// the name verbatim but takes the running schema's version pair, so a
-    /// custom pack never silently claims a DataVersion it did not write.
-    fn for_mc_version(mc_version: &str) -> Self {
+    /// The header for a named release, or `None` when the version table does
+    /// not know the name: nobody may guess a DataVersion pair for a release
+    /// the table cannot describe.
+    fn for_mc_version(mc_version: &str) -> Option<Self> {
         let name = mc_version.trim();
-        let (data_version, protocol_version) = SAVE_VERSION_TABLE
+        SAVE_VERSION_TABLE
             .iter()
             .find(|(n, _, _)| *n == name)
-            .map(|entry| (entry.1, entry.2))
-            .unwrap_or((SAVE_DATA_VERSION_RUNNING, SAVE_PROTOCOL_VERSION_RUNNING));
-        SaveVersionHeader {
-            mc_version: name.to_owned(),
-            data_version,
-            protocol_version,
-            inferred_legacy_header: false,
-        }
+            .map(|&(_, data_version, protocol_version)| SaveVersionHeader {
+                mc_version: name.to_owned(),
+                data_version,
+                protocol_version,
+                inferred_legacy_header: false,
+            })
     }
 }
 
-/// The record new snapshots carry: `MC_SPINE_MC_VERSION` when the operator
-/// pointed the server at another version pack, else `None`. Like every other
-/// additive footer here, a record that would only restate the native defaults
-/// is never emitted — a 1.21.1 save keeps the exact pre-header byte layout and
-/// its loader infers the same values instead.
-fn save_version_header() -> Option<SaveVersionHeader> {
-    match std::env::var("MC_SPINE_MC_VERSION") {
-        Ok(v) if !v.trim().is_empty() => {
-            let header = SaveVersionHeader::for_mc_version(&v);
-            (header != SaveVersionHeader::v1_21_1()).then_some(header)
+/// The MC release this process writes and loads natively:
+/// `MC_SPINE_TARGET_VERSION`, then the legacy `MC_SPINE_MC_VERSION`, each
+/// expected to name one of the two first-class targets
+/// (`SAVE_TARGET_VERSIONS`). An unset, empty or unrecognized variable is
+/// skipped with a warning — the 1.21.1 default is the only silent choice.
+fn running_save_version() -> SaveVersionHeader {
+    for var in ["MC_SPINE_TARGET_VERSION", "MC_SPINE_MC_VERSION"] {
+        let Ok(name) = std::env::var(var) else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
         }
-        _ => None,
+        match SaveVersionHeader::for_mc_version(name) {
+            Some(header) if SAVE_TARGET_VERSIONS.contains(&name) => return header,
+            _ => eprintln!(
+                "[save] {var}=`{name}` is not a supported target (1.21.1 or 26.3); ignoring"
+            ),
+        }
     }
+    SaveVersionHeader::v1_21_1()
+}
+
+/// The record new snapshots carry: `Some` when the running target is not the
+/// native 1.21.1 schema, else `None`. Like every other additive footer here, a
+/// record that would only restate the native defaults is never emitted — a
+/// 1.21.1 save keeps the exact pre-header byte layout and its loader infers
+/// the same values instead.
+fn save_version_header() -> Option<SaveVersionHeader> {
+    let running = running_save_version();
+    (running != SaveVersionHeader::v1_21_1()).then_some(running)
 }
 
 /// How a snapshot's DataVersion relates to this build's save schema.
@@ -2766,10 +2791,18 @@ fn read_mob_dimensions_footer(payload: &[u8]) -> Result<(&[u8], Vec<DimId>), &'s
 // mapped to the Overworld.
 const DIM_FOOTER_LEN: usize = 12;
 const DIM_MAGIC: &[u8; 4] = b"DIM1";
+/// `(dim, x, y, z, facing, lines)` — one sign parked in a non-Overworld
+/// dimension.
+type DimSignRecord = (DimId, i32, i32, i32, u8, [String; 4]);
+/// `(name, dim)` — the dimension a player logged out in.
+type DimPlayerRecord = (String, DimId);
+/// What `read_dim_footer` peels off: the remaining payload plus the two
+/// record tables.
+type DimFooterRecords<'a> = (&'a [u8], Vec<DimSignRecord>, Vec<DimPlayerRecord>);
 fn append_dim_footer(
     out: &mut Vec<u8>,
-    signs: &[(DimId, i32, i32, i32, u8, [String; 4])],
-    players: &[(String, DimId)],
+    signs: &[DimSignRecord],
+    players: &[DimPlayerRecord],
 ) {
     let start = out.len();
     out.extend_from_slice(&(signs.len() as u32).to_be_bytes());
@@ -2794,16 +2827,7 @@ fn append_dim_footer(
     out.extend_from_slice(&size.to_be_bytes());
     out.extend_from_slice(DIM_MAGIC);
 }
-fn read_dim_footer(
-    payload: &[u8],
-) -> Result<
-    (
-        &[u8],
-        Vec<(DimId, i32, i32, i32, u8, [String; 4])>,
-        Vec<(String, DimId)>,
-    ),
-    &'static str,
-> {
+fn read_dim_footer(payload: &[u8]) -> Result<DimFooterRecords<'_>, &'static str> {
     if !payload.ends_with(DIM_MAGIC) {
         return Ok((payload, Vec::new(), Vec::new()));
     }
@@ -3143,6 +3167,12 @@ fn read_dim2_footer(payload: &[u8]) -> Result<(&[u8], Dim2Entries), &'static str
 //   u64 body size, "DXT1"
 const DXT_MAGIC: &[u8; 4] = b"DXT1";
 
+/// `(key, x, y, z, slots)` — a parked chest-like container outside the
+/// Overworld.
+type DxtChestRecord = (String, i32, i32, i32, HashMap<i16, Stack>);
+/// `(key, x, y, z, slots, fuel, brew time)` — a parked brewing stand.
+type DxtBrewingRecord = (String, i32, i32, i32, HashMap<i16, Stack>, u8, u16);
+
 #[derive(Default)]
 struct DxtEntries {
     overlays: Vec<(String, Vec<u8>)>,
@@ -3151,11 +3181,11 @@ struct DxtEntries {
     mob_dims: Vec<(u32, String)>,
     raid_dims: Vec<(u32, String)>,
     signs: Vec<(String, i32, i32, i32, u8, [String; 4])>,
-    chests: Vec<(String, i32, i32, i32, HashMap<i16, Stack>)>,
+    chests: Vec<DxtChestRecord>,
     furnaces: Vec<(String, i32, i32, i32, Furnace)>,
     crops: Vec<(String, i32, i32, i32, u8)>,
     loot: Vec<(String, i32, i32, i32, PendingBlockLoot)>,
-    brewing: Vec<(String, i32, i32, i32, HashMap<i16, Stack>, u8, u16)>,
+    brewing: Vec<DxtBrewingRecord>,
     block_entities: Vec<(String, i32, i32, i32, u32, nbt::Tag)>,
 }
 
@@ -3718,10 +3748,12 @@ fn read_block_loot_footer(
 }
 const DROP_OWNERS_FOOTER_LEN: usize = 12;
 const DROP_OWNERS_MAGIC: &[u8; 4] = b"DRO1";
-fn append_drop_owners_footer(
-    out: &mut Vec<u8>,
-    owners: &[(u32, Option<[u8; 16]>, Option<[u8; 16]>)],
-) {
+/// `(index, target owner, thrower)` as written: the `u32` is the drop's
+/// position in the entity record order.
+type DropOwnerRecord = (u32, Option<[u8; 16]>, Option<[u8; 16]>);
+/// The same record with the index widened to `usize` on the read path.
+type DropOwnerIndex = (usize, Option<[u8; 16]>, Option<[u8; 16]>);
+fn append_drop_owners_footer(out: &mut Vec<u8>, owners: &[DropOwnerRecord]) {
     let start = out.len();
     out.extend_from_slice(&(owners.len() as u32).to_be_bytes());
     for &(idx, target, thrower) in owners {
@@ -3741,7 +3773,7 @@ fn append_drop_owners_footer(
 }
 fn read_drop_owners_footer(
     payload: &[u8],
-) -> Result<(&[u8], Vec<(usize, Option<[u8; 16]>, Option<[u8; 16]>)>), &'static str> {
+) -> Result<(&[u8], Vec<DropOwnerIndex>), &'static str> {
     if !payload.ends_with(DROP_OWNERS_MAGIC) {
         return Ok((payload, Vec::new()));
     }
@@ -3847,20 +3879,36 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
 
 fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     // The optional VER1 record sits just beneath the seed trailer; read it
-    // before peeling so a save written for another release is announced rather
+    // before peeling so a save written for another release is rejected rather
     // than silently parsed under the wrong schema. A file without the record
-    // is a pre-header save and gets the 1.21.1 header it always meant.
+    // is a pre-header save and means the 1.21.1 header it always meant — which
+    // is an exact match only while the running target is 1.21.1 itself.
     let save_version =
         read_save_version_header(payload)?.unwrap_or_else(SaveVersionHeader::legacy);
-    match classify_save_v2_version(&save_version, SAVE_DATA_VERSION_RUNNING) {
+    let running = running_save_version();
+    match classify_save_v2_version(&save_version, running.data_version) {
         SaveVersionCompat::Exact => {}
-        SaveVersionCompat::OlderUpgradeable { delta } => eprintln!(
-            "[save] world was written for {} (DataVersion {}, {delta} versions behind the running schema); loading it under the 1.21.1 layout",
-            save_version.mc_version, save_version.data_version
-        ),
-        SaveVersionCompat::NewerUnknown { file_dv, running_dv } => eprintln!(
-            "[save] world was written for a NEWER DataVersion ({file_dv} > running {running_dv}); content this build does not know may be ignored on load"
-        ),
+        SaveVersionCompat::OlderUpgradeable { delta } => {
+            eprintln!(
+                "[save] refusing to load a world written for {} (DataVersion {}, {delta} versions behind this build's {} / DataVersion {}); run mc-spine-world-migrate to upgrade it",
+                save_version.mc_version,
+                save_version.data_version,
+                running.mc_version,
+                running.data_version
+            );
+            return Err(
+                "world snapshot was written for an older Minecraft version; run mc-spine-world-migrate to upgrade it",
+            );
+        }
+        SaveVersionCompat::NewerUnknown { file_dv, running_dv } => {
+            eprintln!(
+                "[save] refusing to load a world written for {} (DataVersion {file_dv}), newer than this build's {} / DataVersion {running_dv}; run mc-spine-world-migrate to convert it",
+                save_version.mc_version, running.mc_version
+            );
+            return Err(
+                "world snapshot was written for a newer or unknown Minecraft version; run mc-spine-world-migrate to convert it",
+            );
+        }
     }
     *LOADED_SAVE_VERSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(save_version);
     // WBD1 tucks beneath VER1: read it before the peel hides it, and restore
@@ -5491,8 +5539,12 @@ fn wbe_entity_from_payload(
     .ok_or("invalid W-BE entity payload")
 }
 
+/// `(dim block pos, entity kind, NBT blob)` — one saved block entity outside
+/// the Overworld.
+type WbeFooterEntry = ((DimId, i32, i32, i32), u8, Vec<u8>);
+
 fn append_wbe_footer(out: &mut Vec<u8>) {
-    let mut entries: Vec<((DimId, i32, i32, i32), u8, Vec<u8>)> = Vec::new();
+    let mut entries: Vec<WbeFooterEntry> = Vec::new();
     {
         let registry = world_block_entity_registry()
             .lock()
@@ -5526,9 +5578,12 @@ fn append_wbe_footer(out: &mut Vec<u8>) {
     out.extend_from_slice(WBE_MAGIC);
 }
 
+/// The block entities a WBE1 body carries back: position to the live record.
+type SavedBlockEntities = Vec<(DimBlockPos, VanillaBlockEntity)>;
+
 fn read_wbe_footer(
     payload: &[u8],
-) -> Result<(&[u8], Vec<(DimBlockPos, VanillaBlockEntity)>), &'static str> {
+) -> Result<(&[u8], SavedBlockEntities), &'static str> {
     let (payload, body) = split_save_footer(payload, WBE_MAGIC)?;
     let Some(body) = body else {
         return Ok((payload, Vec::new()));
@@ -5831,11 +5886,49 @@ mod save_backup_tests {
 mod save_v2_version_tests {
     use super::*;
 
+    /// Run `run` with `MC_SPINE_TARGET_VERSION` / `MC_SPINE_MC_VERSION` set to
+    /// the given values, then put back whatever was there before — even on a
+    /// panic, so a failed assertion cannot leak a target into the next test.
+    fn with_target_env<R>(
+        target: Option<&str>,
+        legacy: Option<&str>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl std::ops::Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+        let vars = ["MC_SPINE_TARGET_VERSION", "MC_SPINE_MC_VERSION"];
+        let _restore = Restore(
+            vars.iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        );
+        for (name, value) in [
+            ("MC_SPINE_TARGET_VERSION", target),
+            ("MC_SPINE_MC_VERSION", legacy),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        run()
+    }
+
     #[test]
-    fn save_v2_version_header_round_trips_1211_and_1214() {
+    fn save_v2_version_header_round_trips_for_known_releases() {
         for header in [
             SaveVersionHeader::v1_21_1(),
-            SaveVersionHeader::for_mc_version("1.21.4"),
+            SaveVersionHeader::for_mc_version("1.21.4").unwrap(),
+            SaveVersionHeader::for_mc_version("26.3").unwrap(),
         ] {
             let mut payload = b"save-body".to_vec();
             append_save_version_footer(&mut payload, &header);
@@ -5852,16 +5945,24 @@ mod save_v2_version_tests {
             assert_eq!(rest, b"save-body");
         }
         // Known milestones map to vanilla's version pair.
-        let h = SaveVersionHeader::for_mc_version("1.21.4");
+        let h = SaveVersionHeader::for_mc_version("1.21.4").unwrap();
         assert_eq!((h.data_version, h.protocol_version), (4189, 769));
-        // An unlisted name keeps its spelling but never claims a version pair
-        // it did not write.
-        let custom = SaveVersionHeader::for_mc_version("1.21.5-custom");
-        assert_eq!(custom.mc_version, "1.21.5-custom");
-        assert_eq!(
-            (custom.data_version, custom.protocol_version),
-            (SAVE_DATA_VERSION_RUNNING, SAVE_PROTOCOL_VERSION_RUNNING)
-        );
+        // Both first-class targets are table entries.
+        let h = SaveVersionHeader::for_mc_version("1.21.1").unwrap();
+        assert_eq!((h.data_version, h.protocol_version), (3955, 767));
+        let h = SaveVersionHeader::for_mc_version("26.3").unwrap();
+        assert_eq!((h.data_version, h.protocol_version), (5023, 777));
+        for target in SAVE_TARGET_VERSIONS {
+            assert!(
+                SaveVersionHeader::for_mc_version(target).is_some(),
+                "{target} must have a version-table entry"
+            );
+        }
+        // A name the table does not know fails closed instead of guessing a
+        // DataVersion pair it did not write.
+        assert_eq!(SaveVersionHeader::for_mc_version("1.21.5-custom"), None);
+        assert_eq!(SaveVersionHeader::for_mc_version("26.4"), None);
+        assert_eq!(SaveVersionHeader::for_mc_version(""), None);
     }
 
     #[test]
@@ -5918,7 +6019,7 @@ mod save_v2_version_tests {
             classify_save_v2_version(&SaveVersionHeader::v1_21_1(), SAVE_DATA_VERSION_RUNNING),
             SaveVersionCompat::Exact
         );
-        let older = SaveVersionHeader::for_mc_version("1.20.6");
+        let older = SaveVersionHeader::for_mc_version("1.20.6").unwrap();
         assert_eq!(
             classify_save_v2_version(&older, SAVE_DATA_VERSION_RUNNING),
             SaveVersionCompat::OlderUpgradeable {
@@ -5941,56 +6042,188 @@ mod save_v2_version_tests {
     }
 
     #[test]
-    fn save_v2_mc_version_env_selects_the_written_header() {
-        std::env::set_var("MC_SPINE_MC_VERSION", "1.21.4");
-        let header = save_version_header();
-        std::env::remove_var("MC_SPINE_MC_VERSION");
-        let header = header.unwrap();
-        assert_eq!(
-            (
-                header.mc_version.as_str(),
-                header.data_version,
-                header.protocol_version
-            ),
-            ("1.21.4", 4189, 769)
-        );
+    fn save_v2_target_env_selects_the_written_header() {
+        // `MC_SPINE_TARGET_VERSION` is the canonical selector.
+        with_target_env(Some("26.3"), None, || {
+            let header = save_version_header().unwrap();
+            assert_eq!(
+                (
+                    header.mc_version.as_str(),
+                    header.data_version,
+                    header.protocol_version
+                ),
+                ("26.3", 5023, 777)
+            );
+        });
+        // The legacy `MC_SPINE_MC_VERSION` still selects a target when the
+        // canonical variable is unset, and loses to it otherwise.
+        with_target_env(None, Some("26.3"), || {
+            assert_eq!(save_version_header().unwrap().mc_version, "26.3");
+        });
+        with_target_env(Some("26.3"), Some("1.21.1"), || {
+            assert_eq!(save_version_header().unwrap().mc_version, "26.3");
+        });
         // Native or unset: nothing is emitted, the loader infers instead.
-        assert_eq!(save_version_header(), None);
-        std::env::set_var("MC_SPINE_MC_VERSION", "1.21.1");
-        assert_eq!(save_version_header(), None);
-        std::env::remove_var("MC_SPINE_MC_VERSION");
+        with_target_env(None, None, || assert_eq!(save_version_header(), None));
+        with_target_env(Some("1.21.1"), None, || {
+            assert_eq!(save_version_header(), None);
+        });
+    }
+
+    #[test]
+    fn save_v2_unknown_target_env_fails_closed() {
+        // An unrecognized name can never steer the written schema: the save
+        // keeps the native 1.21.1 layout and emits no VER1 claim.
+        for bogus in ["bogus", "1.21.4", "26.4"] {
+            with_target_env(Some(bogus), None, || {
+                assert_eq!(running_save_version(), SaveVersionHeader::v1_21_1());
+                assert_eq!(save_version_header(), None);
+            });
+        }
+        // An invalid canonical variable falls through to a valid legacy one.
+        with_target_env(Some("bogus"), Some("26.3"), || {
+            assert_eq!(running_save_version().mc_version, "26.3");
+        });
+        // An empty variable counts as unset.
+        with_target_env(Some("  "), None, || {
+            assert_eq!(running_save_version(), SaveVersionHeader::v1_21_1());
+        });
     }
 
     #[test]
     fn save_v2_native_save_has_no_header_and_infers_legacy_1211() {
-        let mut payload = Vec::new();
-        save_world_into(&mut payload);
-        assert!(payload.ends_with(WORLD_SEED_MAGIC));
-        // The native write emits no VER1 record, so the frame is byte-for-byte
-        // the pre-header layout and the loader infers the 1.21.1 defaults.
-        assert_eq!(read_save_version_header(&payload).unwrap(), None);
-        load_world_from(&payload).unwrap();
-        let loaded = loaded_save_version_header().unwrap();
-        assert!(loaded.inferred_legacy_header);
-        assert_eq!(loaded.mc_version, "1.21.1");
-        assert_eq!(loaded.data_version, SAVE_DATA_VERSION_RUNNING);
+        let _guard = world_guard();
+        with_target_env(None, None, || {
+            let mut payload = Vec::new();
+            save_world_into(&mut payload);
+            assert!(payload.ends_with(WORLD_SEED_MAGIC));
+            // The native write emits no VER1 record, so the frame is
+            // byte-for-byte the pre-header layout and the loader infers the
+            // 1.21.1 defaults.
+            assert_eq!(read_save_version_header(&payload).unwrap(), None);
+            load_world_from(&payload).unwrap();
+            let loaded = loaded_save_version_header().unwrap();
+            assert!(loaded.inferred_legacy_header);
+            assert_eq!(loaded.mc_version, "1.21.1");
+            assert_eq!(loaded.data_version, SAVE_DATA_VERSION_RUNNING);
+        });
     }
 
     #[test]
-    fn save_v2_foreign_version_header_round_trips_through_load() {
-        // A snapshot carrying a VER1 record keeps its release name and version
-        // pair all the way through decode.
+    fn save_v2_263_save_round_trips_under_263_target() {
+        let _guard = world_guard();
+        with_target_env(Some("26.3"), None, || {
+            let mut payload = Vec::new();
+            save_world_into(&mut payload);
+            assert!(payload.ends_with(WORLD_SEED_MAGIC));
+            // A 26.3 save must carry VER1 — a tagless frame would be read back
+            // as the 1.21.1 legacy form.
+            let header = read_save_version_header(&payload).unwrap().unwrap();
+            assert_eq!(
+                (
+                    header.mc_version.as_str(),
+                    header.data_version,
+                    header.protocol_version
+                ),
+                ("26.3", 5023, 777)
+            );
+            load_world_from(&payload).unwrap();
+            let loaded = loaded_save_version_header().unwrap();
+            assert!(!loaded.inferred_legacy_header);
+            assert_eq!(loaded.mc_version, "26.3");
+            assert_eq!(loaded.data_version, 5023);
+        });
+    }
+
+    #[test]
+    fn save_v2_foreign_version_header_is_rejected_with_migrate_hint() {
+        let _guard = world_guard();
+        // A snapshot whose DataVersion does not match the running target is
+        // never parsed under the wrong schema; the error names the tool that
+        // converts it. Covered: newer (26.3 on a 1.21.1 build), an intermediate
+        // milestone, and an older release.
+        let mut native = Vec::new();
+        with_target_env(None, None, || save_world_into(&mut native));
+        let (stripped, seed) = strip_world_seed_footer(&native).unwrap();
+        for header in [
+            SaveVersionHeader::for_mc_version("26.3").unwrap(),
+            SaveVersionHeader::for_mc_version("1.21.4").unwrap(),
+            SaveVersionHeader::for_mc_version("1.20.6").unwrap(),
+        ] {
+            let mut foreign = stripped.to_vec();
+            append_save_version_footer(&mut foreign, &header);
+            append_world_seed_footer(&mut foreign, seed.unwrap());
+            with_target_env(None, None, || {
+                let err = load_world_from(&foreign).unwrap_err();
+                assert!(
+                    err.contains("mc-spine-world-migrate"),
+                    "{err} should direct to the migration tool"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn save_v2_cross_version_mismatch_is_rejected_both_ways() {
+        let _guard = world_guard();
+        // A native (untagged) 1.21.1 save loads under the default target but
+        // is a cross-version mismatch under a 26.3 target.
+        let native = with_target_env(None, None, || {
+            let mut payload = Vec::new();
+            save_world_into(&mut payload);
+            load_world_from(&payload).unwrap();
+            payload
+        });
+        with_target_env(Some("26.3"), None, || {
+            let err = load_world_from(&native).unwrap_err();
+            assert!(
+                err.contains("mc-spine-world-migrate"),
+                "{err} should direct to the migration tool"
+            );
+        });
+        // And a VER1-tagged 1.21.1 save is equally foreign to a 26.3 target:
+        // the legacy inference and an explicit tag land on the same answer.
+        let (stripped, seed) = strip_world_seed_footer(&native).unwrap();
+        let mut tagged = stripped.to_vec();
+        append_save_version_footer(&mut tagged, &SaveVersionHeader::v1_21_1());
+        append_world_seed_footer(&mut tagged, seed.unwrap());
+        with_target_env(Some("26.3"), None, || {
+            let err = load_world_from(&tagged).unwrap_err();
+            assert!(
+                err.contains("mc-spine-world-migrate"),
+                "{err} should direct to the migration tool"
+            );
+        });
+    }
+
+    #[test]
+    fn save_v2_future_data_version_is_rejected() {
+        let _guard = world_guard();
+        // A DataVersion past anything the table knows can never pass for a
+        // native save, even when a future 26.3 target runs the check.
         let mut payload = Vec::new();
-        save_world_into(&mut payload);
+        with_target_env(None, None, || save_world_into(&mut payload));
         let (stripped, seed) = strip_world_seed_footer(&payload).unwrap();
-        let mut foreign = stripped.to_vec();
-        append_save_version_footer(&mut foreign, &SaveVersionHeader::for_mc_version("1.21.4"));
-        append_world_seed_footer(&mut foreign, seed.unwrap());
-        load_world_from(&foreign).unwrap();
-        let loaded = loaded_save_version_header().unwrap();
-        assert!(!loaded.inferred_legacy_header);
-        assert_eq!(loaded.mc_version, "1.21.4");
-        assert_eq!((loaded.data_version, loaded.protocol_version), (4189, 769));
+        let mut future = stripped.to_vec();
+        append_save_version_footer(
+            &mut future,
+            &SaveVersionHeader {
+                mc_version: "9.9.9".to_owned(),
+                data_version: 9999,
+                protocol_version: 9999,
+                inferred_legacy_header: false,
+            },
+        );
+        append_world_seed_footer(&mut future, seed.unwrap());
+        for target in [None, Some("1.21.1"), Some("26.3")] {
+            with_target_env(target, None, || {
+                let err = load_world_from(&future).unwrap_err();
+                assert!(
+                    err.contains("mc-spine-world-migrate"),
+                    "{err} should direct to the migration tool"
+                );
+            });
+        }
     }
 }
 
@@ -6257,18 +6490,16 @@ impl EvictedChunkArchive {
     }
 }
 
+/// The parked state of one region: chunk coordinates to its archive.
+type EvictedRegionArchive = std::collections::BTreeMap<(i32, i32), EvictedChunkArchive>;
+
 /// The compact per-region archive an unload parks its state in when no Anvil
 /// directory is asked for: region coordinates key the map so "what did region
 /// `(rx, rz)` lose" answers the way the `.mca` merge answers it on disk.
 #[allow(dead_code)]
-static EVICTED_REGIONS: Registry<
-    (DimId, i32, i32),
-    std::collections::BTreeMap<(i32, i32), EvictedChunkArchive>,
-> = OnceLock::new();
+static EVICTED_REGIONS: Registry<(DimId, i32, i32), EvictedRegionArchive> = OnceLock::new();
 #[allow(dead_code)]
-fn evicted_regions(
-) -> &'static LockedMap<(DimId, i32, i32), std::collections::BTreeMap<(i32, i32), EvictedChunkArchive>>
-{
+fn evicted_regions() -> &'static LockedMap<(DimId, i32, i32), EvictedRegionArchive> {
     EVICTED_REGIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
