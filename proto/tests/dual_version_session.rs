@@ -11,7 +11,8 @@ use std::sync::Arc;
 use mc_spine_proto::codec::CodecV767;
 use mc_spine_proto::router::TableDrivenCodec;
 use mc_spine_proto::session::{
-    text_component, ServerSession, ServerSessionConfig, SessionEvent, SessionOutput, SessionPhase,
+    text_component, BroadcastBatch, BroadcastBatchStats, ServerSession, ServerSessionConfig,
+    SessionEvent, SessionOutput, SessionPhase, SharedPacketFrame,
 };
 use mc_spine_proto::table::{PacketDir, PacketPhase, ProtocolTable};
 use mc_spine_proto::version::ProtocolVersion;
@@ -721,4 +722,159 @@ fn send_play_rejects_non_play_variants() {
         s.send_play(&S2CPacket::ConfigFinishConfiguration),
         Err(ProtoError::Malformed(_))
     ));
+}
+
+fn enter_play(
+    router: &Arc<VersionRouter>,
+    protocol: i32,
+    client_index: u8,
+    compression_threshold: Option<i32>,
+) -> ServerSession {
+    let client = ClientCodec::new(protocol);
+    let mut options = config(router, true);
+    options.compression_threshold = compression_threshold;
+    let mut session = ServerSession::new(options);
+    let uuid = [client_index; 16];
+    let name = format!("Player{client_index}");
+
+    session.on_frame(&handshake_frame(protocol, 2)).unwrap();
+    session
+        .on_frame(&client.c2s_named(
+            PacketPhase::Login,
+            "login_start",
+            &login_start_body(&name, &uuid),
+        ))
+        .unwrap();
+    session
+        .accept_login_with_session(uuid, &name, vec![], SESSION_777)
+        .unwrap();
+    session
+        .on_frame(&client.c2s_named(PacketPhase::Login, "login_acknowledged", &[]))
+        .unwrap();
+    session.finish_configuration().unwrap();
+    session
+        .on_frame(&client.c2s_named(PacketPhase::Configuration, "finish_configuration", &[]))
+        .unwrap();
+    assert_eq!(session.phase(), &SessionPhase::Play);
+    session
+}
+
+#[test]
+fn fifty_clients_share_two_encoded_play_frames_across_767_and_777() {
+    let router = router();
+    let packet = S2CPacket::KeepAlive { id: 0x1234_5678 };
+    let mut sessions: Vec<_> = (0..50)
+        .map(|i| {
+            let protocol = if i < 25 { 767 } else { 777 };
+            enter_play(&router, protocol, i, Some(256))
+        })
+        .collect();
+    let mut batch = BroadcastBatch::new(&packet);
+    let delivered: Vec<SharedPacketFrame> = sessions
+        .iter()
+        .map(|session| batch.frame_for(session).unwrap())
+        .collect();
+
+    assert_eq!(
+        batch.stats(),
+        BroadcastBatchStats {
+            unique_encodes: 2,
+            fanout_deliveries: 50,
+        }
+    );
+    assert!(!Arc::ptr_eq(&delivered[0].bytes, &delivered[25].bytes));
+
+    let v767 = ClientCodec::new(767);
+    let v777 = ClientCodec::new(777);
+    for (i, (session, shared)) in sessions.iter_mut().zip(&delivered).enumerate() {
+        let protocol = if i < 25 { 767 } else { 777 };
+        let first_same_version = if protocol == 767 { 0 } else { 25 };
+        assert!(Arc::ptr_eq(
+            &shared.bytes,
+            &delivered[first_same_version].bytes
+        ));
+        assert_eq!(shared.as_bytes(), session.send_play(&packet).unwrap());
+        let (client, expected_id) = if protocol == 767 {
+            (&v767, 0x26)
+        } else {
+            (&v777, 0x2d)
+        };
+        assert_eq!(frame_id(shared.as_bytes()), expected_id);
+        assert_eq!(
+            client.decode_s2c(PacketPhase::Play, shared.as_bytes()),
+            packet
+        );
+    }
+}
+
+#[test]
+fn broadcast_rejects_non_play_sessions_and_packets_without_counting_them() {
+    let router = router();
+    let packet = S2CPacket::KeepAlive { id: 5 };
+    let mut batch = BroadcastBatch::new(&packet);
+    let mut pending = ServerSession::new(config(&router, true));
+    assert!(matches!(
+        batch.frame_for(&pending),
+        Err(ProtoError::Malformed(_))
+    ));
+    pending.on_frame(&handshake_frame(767, 2)).unwrap();
+    assert!(matches!(
+        batch.frame_for(&pending),
+        Err(ProtoError::Malformed(_))
+    ));
+
+    let mut playing = enter_play(&router, 767, 1, Some(256));
+    let invalid_packet = S2CPacket::SetCompression { threshold: 256 };
+    let mut invalid_batch = BroadcastBatch::new(&invalid_packet);
+    assert!(matches!(
+        invalid_batch.frame_for(&playing),
+        Err(ProtoError::Malformed(_))
+    ));
+    assert_eq!(invalid_batch.stats(), BroadcastBatchStats::default());
+
+    batch.frame_for(&playing).unwrap();
+    playing.close();
+    assert!(matches!(
+        batch.frame_for(&playing),
+        Err(ProtoError::Malformed(_))
+    ));
+    assert_eq!(
+        batch.stats(),
+        BroadcastBatchStats {
+            unique_encodes: 1,
+            fanout_deliveries: 1,
+        }
+    );
+}
+
+#[test]
+fn broadcast_separates_compression_variants_and_rejects_foreign_router() {
+    let router = router();
+    let mut plain = enter_play(&router, 767, 1, None);
+    let mut compressed = enter_play(&router, 767, 2, Some(256));
+    let packet = S2CPacket::TickingStep { steps: 3 };
+    let mut batch = BroadcastBatch::new(&packet);
+
+    let plain_frame = batch.frame_for(&plain).unwrap();
+    let compressed_frame = batch.frame_for(&compressed).unwrap();
+    assert!(!Arc::ptr_eq(&plain_frame.bytes, &compressed_frame.bytes));
+    assert_eq!(plain_frame.as_bytes(), plain.send_play(&packet).unwrap());
+    assert_eq!(
+        compressed_frame.as_bytes(),
+        compressed.send_play(&packet).unwrap()
+    );
+
+    let foreign_router = Arc::new(VersionRouter::with_v767_and_v777());
+    let foreign = enter_play(&foreign_router, 767, 3, None);
+    assert!(matches!(
+        batch.frame_for(&foreign),
+        Err(ProtoError::Malformed(_))
+    ));
+    assert_eq!(
+        batch.stats(),
+        BroadcastBatchStats {
+            unique_encodes: 2,
+            fanout_deliveries: 2,
+        }
+    );
 }

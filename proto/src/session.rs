@@ -48,6 +48,7 @@
 //!   name for the embedding server to handle or ignore.
 
 use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 
@@ -882,6 +883,108 @@ impl ServerSession {
         let mut w = WireWriter::new();
         w.write_string(&json);
         self.status_frame("status_response", ID_STATUS_RESPONSE, w.as_slice())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared play packet broadcast
+// ---------------------------------------------------------------------------
+
+/// Wire variant used by a broadcast recipient. A threshold of `-1` means
+/// compression is disabled (`ServerSessionConfig::compression_threshold = None`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BroadcastVariantKey {
+    pub protocol_version: i32,
+    pub compression_threshold: i32,
+}
+
+/// Encoding and delivery counts for one logical packet broadcast.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BroadcastBatchStats {
+    pub unique_encodes: usize,
+    pub fanout_deliveries: usize,
+}
+
+/// A complete framed play packet whose bytes can be shared between recipients.
+/// Cloning `bytes` only increments the `Arc` reference count.
+#[derive(Clone, Debug)]
+pub struct SharedPacketFrame {
+    pub bytes: Arc<[u8]>,
+}
+
+impl SharedPacketFrame {
+    /// The wire frame, including its length prefix and packet id.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Encodes one play packet once per protocol/compression variant, then shares
+/// its immutable frame with each session via `Arc::clone`.
+///
+/// All recipients must use the same `VersionRouter` instance so identical
+/// protocol numbers resolve to identical codec tables. A new packet requires
+/// a new batch; the cache never outlives its borrowed packet.
+pub struct BroadcastBatch<'a> {
+    packet: &'a S2CPacket,
+    frames: HashMap<BroadcastVariantKey, Arc<[u8]>>,
+    router: Option<Arc<VersionRouter>>,
+    stats: BroadcastBatchStats,
+}
+
+impl<'a> BroadcastBatch<'a> {
+    pub fn new(packet: &'a S2CPacket) -> Self {
+        Self {
+            packet,
+            frames: HashMap::new(),
+            router: None,
+            stats: BroadcastBatchStats::default(),
+        }
+    }
+
+    /// Frame for a recipient in `Play`. A failed phase, router, or codec
+    /// check returns `ProtoError` without recording a delivery or cache entry.
+    pub fn frame_for(&mut self, session: &ServerSession) -> Result<SharedPacketFrame, ProtoError> {
+        if !matches!(session.phase, SessionPhase::Play) {
+            return Err(ProtoError::Malformed("broadcast outside the play phase"));
+        }
+        if let Some(router) = &self.router {
+            if !Arc::ptr_eq(router, &session.config.router) {
+                return Err(ProtoError::Malformed(
+                    "broadcast recipients use different routers",
+                ));
+            }
+        }
+        let protocol_version = session.protocol.ok_or(ProtoError::Malformed(
+            "broadcast without a negotiated version",
+        ))?;
+        if session.codec.is_none() {
+            return Err(ProtoError::Malformed(
+                "broadcast without a negotiated codec",
+            ));
+        }
+        let key = BroadcastVariantKey {
+            protocol_version,
+            compression_threshold: session.config.compression_threshold.unwrap_or(-1),
+        };
+        let bytes = if let Some(cached) = self.frames.get(&key) {
+            Arc::clone(cached)
+        } else {
+            let encoded = session.encode_s2c_checked(self.packet, PacketPhase::Play)?;
+            let bytes: Arc<[u8]> = encoded.into();
+            self.frames.insert(key, Arc::clone(&bytes));
+            self.stats.unique_encodes += 1;
+            bytes
+        };
+        if self.router.is_none() {
+            self.router = Some(Arc::clone(&session.config.router));
+        }
+        self.stats.fanout_deliveries += 1;
+        Ok(SharedPacketFrame { bytes })
+    }
+
+    pub fn stats(&self) -> BroadcastBatchStats {
+        self.stats
     }
 }
 
