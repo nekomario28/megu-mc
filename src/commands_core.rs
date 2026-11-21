@@ -4111,7 +4111,7 @@ fn command_usage(name: &str) -> String {
     // reports it as unknown rather than pretending a usage line exists.
     let usage = match name.trim_start_matches('/') {
         "advancement" => "/advancement grant|revoke|query <target> everything|from|through|until|only <id> [<criterion>]",
-        "attribute" => "/attribute <target> <attribute> base|modifier ...",
+        "attribute" => "/attribute <target> <attribute> get|base get|base set|modifier add|modifier remove|modifier value get ...",
         "ban" => "/ban <player> [<reason>]",
         "ban-ip" => "/ban-ip <target> [<reason>]",
         "banlist" => "/banlist [ips|players]",
@@ -4119,13 +4119,14 @@ fn command_usage(name: &str) -> String {
         "clear" => "/clear [<target>] [<item>] [<count>]",
         "clone" => "/clone <from> <to> <destination> [replace|masked|filtered <block>] [force|move|normal]",
         "counts" => "no arguments; debug entity/store census",
-        "damage" => "/damage <target> <amount> [<type>] [at <pos>|by <entity>]",
+        "damage" => "/damage <target> <amount> [<damageType>] [at <pos>|by <entity> [from <cause>]]",
         "data" => "/data get|merge|modify|remove block <x> <y> <z>|entity <target>|storage <id> [<path>] [<nbt|source|scale>]",
         "datapack" => "/datapack list [enabled|available] | enable <name> | disable <name>",
+        "debug" => "/debug start|stop | function <name>",
         "defaultgamemode" => "/defaultgamemode <survival|creative|adventure|spectator>",
         "deop" => "/deop <player>",
         "difficulty" => "/difficulty [peaceful|easy|normal|hard]",
-        "effect" => "/effect give <target> <effect> [<seconds>] [<amplifier>] [<hideParticles>] | clear [<target>] [<effect>]",
+        "effect" => "/effect give <target> <effect> [infinite|<seconds>] [<amplifier>] [<hideParticles>] | clear [<target>] [<effect>]",
         "enchant" => "/enchant <target> <enchantment> [<level>]",
         "execute" => "/execute <subcommand> ... run <command>",
         "experience" | "xp" => "/experience add|set <player> <amount> [points|levels] | query <player> points|levels",
@@ -4138,6 +4139,7 @@ fn command_usage(name: &str) -> String {
         "give" => "/give <player> <item> [<count>]",
         "help" => "/help [<command>]",
         "item" => "/item modify|replace <target> <slot> ...",
+        "jfr" => "/jfr start|stop",
         "kick" => "/kick <player> [<reason>]",
         "kill" => "/kill [<targets>]",
         "list" => "no arguments; list online players",
@@ -4149,10 +4151,12 @@ fn command_usage(name: &str) -> String {
         "pardon" => "/pardon <player>",
         "pardon-ip" => "/pardon-ip <target>",
         "particle" => "/particle <particle> [<x> <y> <z> [<dx> <dy> <dz> [<speed> [<count> [<mode> [<viewers>]]]]]]",
+        "perf" => "/perf start|stop",
         "place" => "/place feature|template <id> [<pos>]",
         "player" => "/player <name> spawn|look|attack|use|stop|kill",
         "profile" => "/profile [<top_n>|reset]",
         "playsound" => "/playsound <sound> [<source>] [<target>] [<pos>] [<volume>] [<pitch>] [<minVolume>]",
+        "publish" => "/publish [<allowCommands>] [<gamemode>] [<port>]",
         "random" => "/random value|roll <range> [<sequence>] | reset <sequence> [*]",
         "recipe" => "/recipe give|take <target> <recipe|*>",
         "reload" => "no arguments; reload datapacks",
@@ -4725,6 +4729,11 @@ fn native_command_dispatcher(
     }
     if level >= 4 {
         register(literal("profile").then(args("arguments")));
+    }
+    // P8c cluster-C owner commands; `required_permission_level` already maps
+    // all four to 4, so `register_at_level` advertises them at level 4 only.
+    for name in ["debug", "jfr", "perf", "publish"] {
+        register_at_level(name, literal(name).then(args("arguments")));
     }
     dispatcher
 }
@@ -6538,153 +6547,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             });
             "Stopping the server".into()
         }
-        "clear" => {
-            // /clear [target] [item] [maxCount]
-            let targets = match args.first() {
-                Some(sel) if sel.starts_with('@') => resolve_selector(sel, me),
-                Some(n) if name_to_item(n).is_none() => {
-                    clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == *n)
-                        .map(|c| vec![c.eid.to_string()]).unwrap_or_default()
-                }
-                _ => me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(),
-            };
-            if args.len() > 3 {
-                return "usage: /clear [target] [item] [maxCount]".into();
-            }
-            let want = match args.get(1) {
-                Some(item) => match name_to_item(item) {
-                    Some(id) => Some(id),
-                    None => return format!("Unknown item '{item}'"),
-                },
-                None => None,
-            };
-            let max = match args.get(2) {
-                Some(count) => match count.parse::<u32>() {
-                    Ok(value) => Some(value),
-                    Err(_) => return "Invalid maximum count".into(),
-                },
-                None => None,
-            };
-            let mut removed = 0i64;
-            let cls: Vec<Arc<Client>> = client_snapshot();
-            for t in &targets {
-                if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
-                    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    let keys: Vec<i16> = inv.iter()
-                        .filter(|(_, (it, _, _))| want.map(|w| w == *it).unwrap_or(true))
-                        .map(|(&k, _)| k).collect();
-                    let mut player_removed = 0u32;
-                    for k in keys {
-                        let (it, cnt, comps) = inv[&k].clone();
-                        let take = if max == Some(0) {
-                            u32::from(cnt)
-                        } else {
-                            max.map(|m| u32::from(cnt).min(m.saturating_sub(player_removed)))
-                                .unwrap_or(u32::from(cnt))
-                        };
-                        if take == 0 { break }
-                        player_removed += take;
-                        removed += i64::from(take);
-                        if max != Some(0) {
-                            if take == u32::from(cnt) { inv.remove(&k); }
-                            else { inv.insert(k, (it, cnt - take as u8, comps)); }
-                        }
-                    }
-                    // resync window 0 so the client drops the cleared items
-                    let mut q = vec![0u8];
-                    write_varint(&mut q, 0);
-                    write_varint(&mut q, 46);
-                    for i in 0..46i16 {
-                        let (it2, c2, _cc) = inv.get(&i).cloned().unwrap_or((0, 0, Vec::new()));
-                        q.extend_from_slice(&slot_wire(&(it2, c2, _cc)));
-                    }
-                    q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x13, q); }
-                }
-            }
-            format!("Cleared {} item(s)", removed)
-        }
-        "effect" => {
-            // /effect give <target> <effect> [seconds] [amplifier]
-            // /effect clear <target> [effect]
-            let sub = args.first().copied().unwrap_or("");
-            let sel = args.get(1).copied().unwrap_or("@s");
-            let targets = if sel.starts_with('@') { resolve_selector(sel, me) }
-                else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == sel)
-                    .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
-            // hold a snapshot of client Arcs, not the clients() mutex —
-            // broadcast_seen re-locks clients() internally.
-            let cls_snap: Vec<Arc<Client>> = client_snapshot();
-            let mut touched = 0;
-            let mut fx: Vec<(Arc<Client>, Vec<u8>)> = Vec::new(); // (target, entity_effect pkt)
-            let mut rx: Vec<(Arc<Client>, Vec<u8>)> = Vec::new(); // (target, remove_effect pkt)
-            let reply2 = match sub {
-                "give" => {
-                    let ename = args.get(2).copied().unwrap_or("");
-                    let Some(eid2) = name_to_effect(ename) else {
-                        return format!("unknown effect '{ename}'")
-                    };
-                    let secs = args.get(3).and_then(|a| a.parse::<i32>().ok()).unwrap_or(30);
-                    let amp = args.get(4).and_then(|a| a.parse::<i32>().ok()).unwrap_or(0);
-                    for t in &targets {
-                        if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
-                            match eid2 {
-                                // instant effects apply once, not stored
-                                5 => { let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
-                                    *h = (*h + 4.0 * (amp + 1) as f32).min(20.0);
-                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c)); } }
-                                6 => { let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
-                                    *h = (*h - 6.0 * (amp + 1) as f32).max(0.0);
-                                    if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap_or_else(|e| e.into_inner()); }
-                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c)); } }
-                                22 => { let mut f = c.food.lock().unwrap_or_else(|e| e.into_inner());
-                                    *f = (*f + amp + 1).min(20); drop(f);
-                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), c)); } }
-                                _ => {
-                                    let ticks = secs * TICKS_PER_SECOND as i32; // server ticks
-                                    { let mut ef = c.effs.lock().unwrap_or_else(|e| e.into_inner());
-                                      ef.retain(|e| e.id != eid2);
-                                      ef.push(Eff { id: eid2, amp, left: ticks }); }
-                                    fx.push(((*c).clone(), entity_effect_pkt(c.eid, eid2, amp, ticks)));
-                                }
-                            }
-                            touched += 1;
-                        }
-                    }
-                    format!("Applied effect to {} target(s)", touched)
-                }
-                "clear" => {
-                    let ename = args.get(2).copied().unwrap_or("");
-                    let want: Option<i32> = if ename.is_empty() { None } else {
-                        match name_to_effect(ename) {
-                            Some(effect) => Some(effect),
-                            None => return format!("unknown effect '{ename}'"),
-                        }
-                    };
-                    for t in &targets {
-                        if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
-                            let gone: Vec<i32> = { let mut ef = c.effs.lock().unwrap_or_else(|e| e.into_inner());
-                                let g: Vec<i32> = ef.iter().filter(|e| want.map(|w| w == e.id).unwrap_or(true)).map(|e| e.id).collect();
-                                ef.retain(|e| want.map(|w| w != e.id).unwrap_or(false)); g };
-                            for id in gone { rx.push(((*c).clone(), remove_effect_pkt(c.eid, id))); }
-                            touched += 1;
-                        }
-                    }
-                    format!("Cleared effects from {} target(s)", touched)
-                }
-                _ => "usage: /effect give|clear <target> [effect] [seconds] [amplifier]".into(),
-            };
-            // send outside any clients() lock
-            for (c, pk) in &fx {
-                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x76, pk.clone()); }
-            }
-            for (c, pk) in &rx {
-                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x43, pk.clone()); }
-            }
-            for (_c, pk) in &fx { broadcast_seen(_c.eid, |_o| (0x76, pk.clone())); }
-            for (_c, pk) in &rx { broadcast_seen(_c.eid, |_o| (0x43, pk.clone())); }
-            reply2
-        }
+        "clear" => run_clear_command(&args, me),
+        "effect" => run_effect_command(&args, me),
         "xp" | "experience" => run_experience_command(&args, me),
         "setblock" => {
             if args.len() < 4 {
@@ -7087,41 +6951,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "particle" => particle_command(ctx, &args, me),
         "spreadplayers" => spreadplayers_command(ctx, &args, me),
         "trigger" => run_trigger_command(&args, me),
-        "attribute" => {
-            // /attribute <target> <attr> base get|set <v>
-            let sel = args.first().copied().unwrap_or("");
-            let aname = args.get(1).copied().unwrap_or("");
-            if attr_key_id(aname).is_none() { return format!("Unknown attribute '{}'", aname) }
-            if args.get(2).copied() != Some("base") { return "usage: /attribute <target> <attr> base get|set <v>".into() }
-            let eids = resolve_selector(sel, me);
-            let mut out = String::new();
-            for e in &eids {
-                // resolve key: player name (persistent) or mob eid (transient)
-                let key = {
-                    let cls: Vec<Arc<Client>> = client_snapshot();
-                    cls.iter().find(|c| c.eid.to_string() == *e)
-                        .map(|c| format!("p:{}", c.name))
-                        .unwrap_or_else(|| format!("e:{}", e))
-                };
-                match args.get(3).copied().unwrap_or("get") {
-                    "get" => { out += &format!("{} = {}; ", e, attr_of(&key, aname)); }
-                    "set" => {
-                        let v: f64 = args.get(4).and_then(|x| x.parse().ok()).unwrap_or(0.0);
-                        attrs().lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default()
-                            .insert(aname.trim_start_matches("minecraft:").to_string(), v);
-                        let eid: i32 = e.parse().unwrap_or(0);
-                        let mut m = HashMap::new();
-                        m.insert(aname.trim_start_matches("minecraft:").to_string(), v);
-                        let pk = attrs_pkt(eid, &m);
-                        // vanilla pushes attribute updates to every client tracking the entity
-                        broadcast(-1, |_c| (0x75, pk.clone()));
-                        out += &format!("{} = {}; ", e, v);
-                    }
-                    _ => return "usage: /attribute <t> <a> base get|set <v>".into(),
-                }
-            }
-            if out.is_empty() { "No entity found".into() } else { out.trim_end().into() }
-        }
+        "attribute" => run_attribute_command(&args, me),
         "tellraw" => {
             // /tellraw <targets> <json-component>
             let targets = resolve_selector(args.first().copied().unwrap_or(""), me);
@@ -7228,98 +7058,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             if args.len() == 2 { format!("Gamerule {canonical} is now set to: {value}") }
             else { format!("{canonical} = {value}") }
         }
-        "tag" => {
-            // tag <target> add|remove|list <tag>
-            let sel = args.first().copied().unwrap_or("");
-            let sub = args.get(1).copied().unwrap_or("");
-            let tg = args.get(2).copied().unwrap_or("");
-            let tgts = if sel.starts_with('@') { resolve_selector(sel, me) }
-                else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == sel)
-                    .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
-            let tm = tags().lock().unwrap_or_else(|e| e.into_inner());
-            match sub {
-                "add" | "remove" if !tg.is_empty() => {
-                    let mut tm = tm; let mut n = 0;
-                    for t in &tgts {
-                        let key = if let Some(e) = t.strip_prefix("m:") { format!("e:{}", e) }
-                            else if t.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
-                                && t.contains(':') { t.clone() }
-                            else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid.to_string() == *t)
-                                .map(|c| format!("p:{}", c.name)).unwrap_or_default() };
-                        if key.is_empty() { continue }
-                        match sub { "add" => { tm.entry(key).or_default().insert(tg.to_string()); },
-                                    _ => { if let Some(st) = tm.get_mut(&key) { st.remove(tg); } } }
-                        n += 1;
-                    }
-                    format!("{}ed {} target(s)", if sub=="add" {"tagg"} else {"untagg"}, n)
-                }
-                "list" => {
-                    // one report per matched target: a `return` inside the loop
-                    // answered only for the first one and named the selector
-                    // (`@a`) instead of the target it was reporting.
-                    let mut lines: Vec<String> = Vec::new();
-                    for t in &tgts {
-                        let key = if let Some(e) = t.strip_prefix("m:") { format!("e:{}", e) }
-                            else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid.to_string() == *t)
-                                .map(|c| format!("p:{}", c.name)).unwrap_or_default() };
-                        if key.is_empty() { continue }
-                        let who = key.strip_prefix("p:").unwrap_or(t).to_string();
-                        let st = tm.get(&key);
-                        let mut tags: Vec<String> = st.map(|s| s.iter().cloned().collect()).unwrap_or_default();
-                        tags.sort();
-                        lines.push(format!("{} has {} tag(s): {}", who,
-                            tags.len(), tags.join(", ")));
-                    }
-                    if lines.is_empty() { "no targets".into() } else { lines.join(", ") }
-                }
-                _ => "usage: /tag <target> add|remove|list [tag]".into(),
-            }
-        }
-        "damage" => {
-            // damage <target> <amount> [type] — vanilla 1.20.2+
-            let sel = args.first().copied().unwrap_or("");
-            let amt = args.get(1).and_then(|a| a.parse::<f32>().ok()).unwrap_or(0.0);
-            let tgts = if sel.starts_with('@') { resolve_selector(sel, me) }
-                else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == sel)
-                    .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
-            let mut n = 0;
-            let cls_snap: Vec<Arc<Client>> = client_snapshot();
-            let mut mob_hits: Vec<(i32, f32)> = Vec::new();
-            for t in &tgts {
-                if let Some(e) = t.strip_prefix("m:").and_then(|e| e.parse::<i32>().ok()) {
-                    mob_hits.push((e, amt));
-                } else if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
-                    if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 { continue }
-                    let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
-                    *h = (*h - hurt_absorb(c, dmg_after(c, amt, 0))).max(0.0); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap_or_else(|e| e.into_inner()); }
-                    let hh = *h; drop(h);
-                    damage_armor(c, amt);
-                    if let Ok(mut w) = c.sock.lock() {
-                        let _ = send_packet(&mut w, 0x24, hurt_anim(c.eid));
-                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
-                    }
-                    n += 1;
-                }
-            }
-            for (eid, amt) in mob_hits {
-                let dead = { let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                    ms.iter().find(|m| m.eid == eid).map(|m| {
-                        let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner()); *h -= amt; *h <= 0.0
-                    }).unwrap_or(false) };
-                let mob = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|m| m.eid == eid).cloned();
-                if let Some(m) = mob {
-                    *m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                    broadcast_seen(eid, |_c| (0x24, hurt_anim(eid)));
-                    if dead {
-                        let (mx, my, mz) = { let p = m.pos.lock().unwrap_or_else(|e| e.into_inner()); (p.0, p.1, p.2) };
-                        let et = m.etype;
-                        kill_mob(eid, et, mx, my, mz);
-                    }
-                    n += 1;
-                }
-            }
-            format!("Applied {} damage to {} target(s)", amt, n)
-        }
+        "tag" => run_tag_command(&args, me),
+        "damage" => run_damage_command(ctx, &args, me),
         "schedule" => {
             // schedule function <fn> <time>[t|s|d] — t=game ticks(20/s), s=seconds
             if args.first().copied() == Some("clear") {
@@ -7404,6 +7144,12 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         // never reach either command.
         "profile" => run_profile_command(level, &args),
         "transfer" => run_transfer_command(ctx, level, &args),
+        // P8c cluster-C diagnostics are owner-level (4) too; each handler
+        // re-checks `level` like `run_profile_command` does.
+        "debug" => run_debug_command(ctx, level, &args, s),
+        "jfr" => run_jfr_command(level, &args),
+        "perf" => run_perf_command(level, &args),
+        "publish" => run_publish_command(level, &args),
         "list" => {
             let c = clients().lock().unwrap_or_else(|e| e.into_inner());
             let names: Vec<String> = c.iter().map(|x| x.name.clone()).collect();
@@ -7589,6 +7335,7 @@ fn command_reply_is_error(reply: &str) -> bool {
         "invalid ",
         "expected ",
         "cannot ",
+        "can't ",
         "could not",
         "no player",
         "no item",

@@ -3850,6 +3850,1150 @@ fn run_advancement_query(
         .join("; ")
 }
 
+// ---------------------------------------------------------------------------
+// Lane P8c: `/debug`, `/jfr`, `/perf`, `/publish` (all owner-level 4) plus the
+// remaining #225 player/entity subcommands — `/effect give` infinite/hide,
+// `/damage` type/at/by/from, `/tag` add|remove|list, `/attribute` get and
+// modifier verbs, `/clear` maxCount=0. The level gate in `server_ops` already
+// maps the four new commands to 4; each handler still re-checks `level` the
+// way `/profile` does so a level-2 `.mcfunction` frame can never reach them.
+// ---------------------------------------------------------------------------
+
+const P8C_DENIED: &str = "You do not have permission to run that command";
+
+/// `/debug`'s profiling session: the `Instant` measures the wall-clock leg of
+/// the Vanilla `commands.debug.stopped` report and `tick_start` bounds the
+/// game-tick count to the session window.
+struct DebugSession {
+    started: Instant,
+    tick_start: u64,
+}
+
+fn debug_session() -> &'static Mutex<Option<DebugSession>> {
+    static SESSION: OnceLock<Mutex<Option<DebugSession>>> = OnceLock::new();
+    SESSION.get_or_init(|| Mutex::new(None))
+}
+
+/// `true` while `/debug function` is tracing — Vanilla refuses a nested trace
+/// (`commands.debug.function.noRecursion`), including a `debug function` line
+/// inside the traced function itself.
+static DEBUG_TRACING: AtomicBool = AtomicBool::new(false);
+
+/// `/jfr`'s native telemetry window: the `Instant` records the session start;
+/// the bounded ring inside `live_hotspot_profiler` is reset on `start` so the
+/// stop summary covers exactly this session's recorded ticks.
+fn jfr_session() -> &'static Mutex<Option<Instant>> {
+    static SESSION: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    SESSION.get_or_init(|| Mutex::new(None))
+}
+
+/// `/perf`'s bounded capture session — same story as `/jfr`.
+fn perf_session() -> &'static Mutex<Option<Instant>> {
+    static SESSION: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    SESSION.get_or_init(|| Mutex::new(None))
+}
+
+/// The live "Open to LAN" metadata `/publish` mutates. No socket is bound:
+/// the record mirrors what Vanilla's `publishServer` would publish so the
+/// command stays metadata-only until a listener lane owns the bind.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct PublishState {
+    port: u16,
+    allow_commands: bool,
+    /// `DEFAULT_GAME_MODE` value: 0 survival, 1 creative, 2 adventure,
+    /// 3 spectator.
+    gamemode: u8,
+}
+
+fn publish_state() -> &'static Mutex<Option<PublishState>> {
+    static STATE: OnceLock<Mutex<Option<PublishState>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+/// The port `/publish` advertises when the argument is omitted: the configured
+/// game port (`MC_SPINE_PORT`, default 25599) like the main listener.
+fn publish_default_port() -> u16 {
+    std::env::var("MC_SPINE_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .filter(|p| *p >= 1024)
+        .unwrap_or(25599)
+}
+
+/// `/debug start|stop|function <name>` — Vanilla `DebugCommand` on the live
+/// hotspot ring. `start` zeroes the window so `stop`'s summary is exactly the
+/// session; `function` replays the function line-walk counting per-line
+/// results like Vanilla's trace.
+fn run_debug_command(
+    ctx: &CmdCtx,
+    level: u8,
+    args: &[&str],
+    s: &mut Option<&Client>,
+) -> String {
+    if level < 4 {
+        return P8C_DENIED.into();
+    }
+    match args {
+        ["start"] => {
+            let mut session = debug_session().lock().unwrap_or_else(|e| e.into_inner());
+            if session.is_some() {
+                return "Debug profiling has already started".into();
+            }
+            live_hotspot_profiler()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset();
+            *session = Some(DebugSession {
+                started: Instant::now(),
+                tick_start: TICK.load(Ordering::Relaxed),
+            });
+            "Started debug profiling".into()
+        }
+        ["stop"] => {
+            let Some(session) = debug_session().lock().unwrap_or_else(|e| e.into_inner()).take()
+            else {
+                return "Can't stop profiling when we haven't started yet!".into();
+            };
+            let secs = session.started.elapsed().as_secs_f64();
+            let ticks = TICK
+                .load(Ordering::Relaxed)
+                .saturating_sub(session.tick_start);
+            let tps = if secs > 0.0 {
+                ticks as f64 / secs
+            } else {
+                0.0
+            };
+            let report = live_hotspot_profiler()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .summary(5);
+            format!(
+                "Stopped debug profiling after {secs:.2} seconds and {ticks} ticks \
+                 ({tps:.2} ticks per second); MSPT mean {:.1} ms, p50 {:.1}, \
+                 p95 {:.1}, p99 {:.1} ({} ticks sampled)",
+                report.mspt_mean,
+                report.mspt_p50,
+                report.mspt_p95,
+                report.mspt_p99,
+                report.ticks_recorded
+            )
+        }
+        ["function", name] => {
+            if DEBUG_TRACING.swap(true, Ordering::Relaxed) {
+                return "Can't trace from inside a function".into();
+            }
+            let result = run_function_traced(name, ctx, s);
+            DEBUG_TRACING.store(false, Ordering::Relaxed);
+            match result {
+                Some((executed, succeeded)) => format!(
+                    "Finished tracing {executed} command(s) from function '{name}', \
+                     {succeeded} succeeded and {} failed",
+                    executed - succeeded
+                ),
+                None => "Failed to trace function".into(),
+            }
+        }
+        _ => "usage: /debug start|stop|function <name>".into(),
+    }
+}
+
+/// `/debug function`'s trace entry: `lookup_function` plus the same
+/// macro-instantiation guard `run_function_depth` applies (a `$`-bearing
+/// function called without `with` arguments fails the whole call).
+fn run_function_traced(
+    name: &str,
+    ctx: &CmdCtx,
+    s: &mut Option<&Client>,
+) -> Option<(usize, usize)> {
+    let lines = lookup_function(name)?;
+    if lines.iter().any(|line| line.starts_with('$')) {
+        return None;
+    }
+    Some(trace_function_lines(&lines, ctx, s, 0))
+}
+
+/// The same line walk `run_function_lines` performs — `function` lines nest
+/// through `run_function_depth`, `return` ends the frame — except every
+/// command's reply is captured so the trace can split succeeded from failed.
+/// Returns `(executed, succeeded)`; nested calls count only executed commands
+/// (their inner replies are not individually traced, same as Vanilla's
+/// per-line trace attribution).
+fn trace_function_lines(
+    lines: &[String],
+    ctx: &CmdCtx,
+    s: &mut Option<&Client>,
+    depth: usize,
+) -> (usize, usize) {
+    let mut executed = 0usize;
+    let mut succeeded = 0usize;
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("function ") {
+            let (inner, compound) = match rest.split_once(" with ") {
+                Some((name, compound)) => (name.trim(), Some(compound.trim())),
+                None => (rest.trim(), None),
+            };
+            let parsed = match compound {
+                Some(compound) => match function_macro_args(&["with", compound]) {
+                    Ok(parsed) => parsed,
+                    Err(_) => continue,
+                },
+                None => None,
+            };
+            let n = run_function_depth(inner, ctx.me.clone(), s, depth + 1, parsed.as_ref());
+            executed += n;
+            succeeded += n;
+        } else {
+            let reply = run_command_ctx(ctx, &format!("/{line}"), s);
+            executed += 1;
+            if !command_reply_is_error(&reply) {
+                succeeded += 1;
+            }
+            if *line == "return" || line.starts_with("return ") {
+                break;
+            }
+        }
+    }
+    (executed, succeeded)
+}
+
+/// `/jfr start|stop` — the native telemetry recording Vanilla's JFR command
+/// wraps; backed by the same bounded tick ring as `/profile`.
+fn run_jfr_command(level: u8, args: &[&str]) -> String {
+    if level < 4 {
+        return P8C_DENIED.into();
+    }
+    match args {
+        ["start"] => {
+            let mut session = jfr_session().lock().unwrap_or_else(|e| e.into_inner());
+            if session.is_some() {
+                return "Native telemetry profiling is already running".into();
+            }
+            live_hotspot_profiler()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset();
+            *session = Some(Instant::now());
+            "Started native telemetry profiling (Rust JFR equivalent)".into()
+        }
+        ["stop"] => {
+            let Some(started) = jfr_session().lock().unwrap_or_else(|e| e.into_inner()).take()
+            else {
+                return "Native telemetry profiling is not running".into();
+            };
+            let report = live_hotspot_profiler()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .summary(5);
+            format!(
+                "Stopped native telemetry profiling after {:.2} seconds \
+                 ({} ticks; MSPT p50 {:.1} ms, p95 {:.1} ms, p99 {:.1} ms)",
+                started.elapsed().as_secs_f64(),
+                report.ticks_recorded,
+                report.mspt_p50,
+                report.mspt_p95,
+                report.mspt_p99
+            )
+        }
+        _ => "usage: /jfr start|stop".into(),
+    }
+}
+
+/// `/perf start|stop` — a bounded capture over the same ring: `start` resets
+/// the window, `stop` prints the `format_human` report (TPS, MSPT
+/// mean/p50/p95/p99/max, top chunk hotspots).
+fn run_perf_command(level: u8, args: &[&str]) -> String {
+    if level < 4 {
+        return P8C_DENIED.into();
+    }
+    match args {
+        ["start"] => {
+            let mut session = perf_session().lock().unwrap_or_else(|e| e.into_inner());
+            if session.is_some() {
+                return "Performance capture is already running".into();
+            }
+            live_hotspot_profiler()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset();
+            *session = Some(Instant::now());
+            "Started performance capture".into()
+        }
+        ["stop"] => {
+            let Some(started) = perf_session().lock().unwrap_or_else(|e| e.into_inner()).take()
+            else {
+                return "No performance capture is running".into();
+            };
+            let report = live_hotspot_profiler()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .summary(5)
+                .format_human();
+            format!(
+                "Stopped performance capture after {:.2} seconds\n{}",
+                started.elapsed().as_secs_f64(),
+                report
+            )
+        }
+        _ => "usage: /perf start|stop".into(),
+    }
+}
+
+/// `/publish [<allowCommands>] [<gamemode>] [<port>]` — Vanilla 1.21.1
+/// `PublishCommand` reduced to its metadata half: arguments are validated the
+/// same way and the publish state is recorded, but no socket is bound.
+fn run_publish_command(level: u8, args: &[&str]) -> String {
+    if level < 4 {
+        return P8C_DENIED.into();
+    }
+    if args.len() > 3 {
+        return "usage: /publish [<allowCommands>] [<gamemode>] [<port>]".into();
+    }
+    let allow_commands = match args.first() {
+        None => false,
+        Some(&"true") => true,
+        Some(&"false") => false,
+        Some(raw) => return format!("Invalid allowCommands '{raw}'"),
+    };
+    let gamemode = match args.get(1) {
+        None => None,
+        Some(&"survival") => Some(0u8),
+        Some(&"creative") => Some(1u8),
+        Some(&"adventure") => Some(2u8),
+        Some(&"spectator") => Some(3u8),
+        Some(raw) => return format!("Invalid gamemode '{raw}'"),
+    };
+    let port = match args.get(2) {
+        None => publish_default_port(),
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(p) if (1024..=65535).contains(&p) => p as u16,
+            _ => return format!("Invalid port '{raw}'"),
+        },
+    };
+    let mut state = publish_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(active) = *state {
+        return format!("Local game already hosted on port {}", active.port);
+    }
+    let gamemode = gamemode.unwrap_or_else(|| DEFAULT_GAME_MODE.load(Ordering::Relaxed));
+    *state = Some(PublishState {
+        port,
+        allow_commands,
+        gamemode,
+    });
+    format!("Local game hosted on port {port}")
+}
+
+// ------------------------------------------------ #225: player/entity gaps
+
+/// The entity-effect wire packet with an explicit duration and particle
+/// visibility: the shared `entity_effect_pkt` always emits a finite duration
+/// with particles+icon, so `infinite` (Vanilla wire `-1`) and
+/// `hideParticles` need this variant.
+fn entity_effect_pkt_flags(
+    eid: i32,
+    id: i32,
+    amp: i32,
+    ticks: i32,
+    hide_particles: bool,
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, eid as i64);
+    write_varint(&mut p, effect_wire_id(id));
+    write_varint(&mut p, amp as i64);
+    write_varint(&mut p, ticks as i64);
+    // Flags byte: 0x02 show particles, 0x04 show icon — Vanilla's encoding.
+    p.push(if hide_particles { 0x04 } else { 0x06 });
+    p
+}
+
+/// `/effect give <targets> <effect> [infinite|<seconds>] [<amplifier>]
+/// [<hideParticles>]` and `/effect clear [<targets>] [<effect>]`. `infinite`
+/// stores a never-expiring `left` (the tick loop only ends an effect when it
+/// counts to zero) and reports Vanilla's wire duration of `-1`.
+fn run_effect_command(args: &[&str], me: Option<&Arc<Client>>) -> String {
+    let sub = args.first().copied().unwrap_or("");
+    let sel = args.get(1).copied().unwrap_or("@s");
+    let targets = if sel.starts_with('@') {
+        resolve_selector(sel, me)
+    } else {
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|c| c.name == sel)
+            .map(|c| vec![c.eid.to_string()])
+            .unwrap_or_default()
+    };
+    // hold a snapshot of client Arcs, not the clients() mutex —
+    // broadcast_seen re-locks clients() internally.
+    let cls_snap: Vec<Arc<Client>> = client_snapshot();
+    let mut touched = 0;
+    let mut fx: Vec<(Arc<Client>, Vec<u8>)> = Vec::new(); // (target, entity_effect pkt)
+    let mut rx: Vec<(Arc<Client>, Vec<u8>)> = Vec::new(); // (target, remove_effect pkt)
+    let reply2 = match sub {
+        "give" => {
+            let ename = args.get(2).copied().unwrap_or("");
+            let Some(eid2) = name_to_effect(ename) else {
+                return format!("unknown effect '{ename}'");
+            };
+            let (secs, infinite) = match args.get(3) {
+                None => (30, false),
+                Some(&"infinite") => (0, true),
+                Some(raw) => match raw.parse::<i32>() {
+                    Ok(s) if (1..=1_000_000).contains(&s) => (s, false),
+                    _ => return format!("Invalid duration '{raw}'"),
+                },
+            };
+            let amp = match args.get(4) {
+                None => 0,
+                Some(raw) => match raw.parse::<i32>() {
+                    Ok(a) if (0..=255).contains(&a) => a,
+                    _ => return format!("Invalid amplifier '{raw}'"),
+                },
+            };
+            let hide = match args.get(5) {
+                None => false,
+                Some(&"true") => true,
+                Some(&"false") => false,
+                Some(raw) => return format!("Invalid hideParticles '{raw}'"),
+            };
+            if args.len() > 6 {
+                return "usage: /effect give <targets> <effect> [infinite|<seconds>] [<amplifier>] [<hideParticles>]".into();
+            }
+            for t in &targets {
+                if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
+                    match eid2 {
+                        // instant effects apply once, not stored
+                        5 => {
+                            let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                            *h = (*h + 4.0 * (amp + 1) as f32).min(20.0);
+                            if let Ok(mut w) = c.sock.lock() {
+                                let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c));
+                            }
+                        }
+                        6 => {
+                            let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                            *h = (*h - 6.0 * (amp + 1) as f32).max(0.0);
+                            if *h <= 0.0 {
+                                drop(h);
+                                totem_check(c);
+                                h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                            }
+                            if let Ok(mut w) = c.sock.lock() {
+                                let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c));
+                            }
+                        }
+                        22 => {
+                            let mut f = c.food.lock().unwrap_or_else(|e| e.into_inner());
+                            *f = (*f + amp + 1).min(20);
+                            drop(f);
+                            if let Ok(mut w) = c.sock.lock() {
+                                let _ = send_packet(
+                                    &mut w,
+                                    0x5d,
+                                    health_pkt_c(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), c),
+                                );
+                            }
+                        }
+                        _ => {
+                            let ticks = if infinite {
+                                // The effect tick only expires an entry that
+                                // counts to zero; i32::MAX is the storable
+                                // "infinite" while the wire gets Vanilla's -1.
+                                i32::MAX
+                            } else {
+                                secs * TICKS_PER_SECOND as i32
+                            };
+                            {
+                                let mut ef = c.effs.lock().unwrap_or_else(|e| e.into_inner());
+                                ef.retain(|e| e.id != eid2);
+                                ef.push(Eff {
+                                    id: eid2,
+                                    amp,
+                                    left: ticks,
+                                });
+                            }
+                            fx.push((
+                                (*c).clone(),
+                                entity_effect_pkt_flags(
+                                    c.eid,
+                                    eid2,
+                                    amp,
+                                    if infinite { -1 } else { ticks },
+                                    hide,
+                                ),
+                            ));
+                        }
+                    }
+                    touched += 1;
+                }
+            }
+            format!("Applied effect to {} target(s)", touched)
+        }
+        "clear" => {
+            let ename = args.get(2).copied().unwrap_or("");
+            let want: Option<i32> = if ename.is_empty() {
+                None
+            } else {
+                match name_to_effect(ename) {
+                    Some(effect) => Some(effect),
+                    None => return format!("unknown effect '{ename}'"),
+                }
+            };
+            for t in &targets {
+                if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
+                    let gone: Vec<i32> = {
+                        let mut ef = c.effs.lock().unwrap_or_else(|e| e.into_inner());
+                        let g: Vec<i32> = ef
+                            .iter()
+                            .filter(|e| want.map(|w| w == e.id).unwrap_or(true))
+                            .map(|e| e.id)
+                            .collect();
+                        ef.retain(|e| want.map(|w| w != e.id).unwrap_or(false));
+                        g
+                    };
+                    for id in gone {
+                        rx.push(((*c).clone(), remove_effect_pkt(c.eid, id)));
+                    }
+                    touched += 1;
+                }
+            }
+            format!("Cleared effects from {} target(s)", touched)
+        }
+        _ => "usage: /effect give|clear <target> [effect] [infinite|seconds] [amplifier] [hideParticles]".into(),
+    };
+    // send outside any clients() lock
+    for (c, pk) in &fx {
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x76, pk.clone());
+        }
+    }
+    for (c, pk) in &rx {
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x43, pk.clone());
+        }
+    }
+    for (_c, pk) in &fx {
+        broadcast_seen(_c.eid, |_o| (0x76, pk.clone()));
+    }
+    for (_c, pk) in &rx {
+        broadcast_seen(_c.eid, |_o| (0x43, pk.clone()));
+    }
+    reply2
+}
+
+/// `/clear [<targets>] [<item>] [<maxCount>]` — `maxCount = 0` is Vanilla's
+/// dry-run: it counts matching items without removing any (pinned by
+/// `clear_max_count_applies_per_player_and_zero_only_counts`).
+fn run_clear_command(args: &[&str], me: Option<&Arc<Client>>) -> String {
+    let targets = match args.first() {
+        Some(sel) if sel.starts_with('@') => resolve_selector(sel, me),
+        Some(n) if name_to_item(n).is_none() => {
+            clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|c| c.name == *n)
+                .map(|c| vec![c.eid.to_string()])
+                .unwrap_or_default()
+        }
+        _ => me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(),
+    };
+    if args.len() > 3 {
+        return "usage: /clear [target] [item] [maxCount]".into();
+    }
+    let want = match args.get(1) {
+        Some(item) => match name_to_item(item) {
+            Some(id) => Some(id),
+            None => return format!("Unknown item '{item}'"),
+        },
+        None => None,
+    };
+    let max = match args.get(2) {
+        Some(count) => match count.parse::<u32>() {
+            Ok(value) => Some(value),
+            Err(_) => return "Invalid maximum count".into(),
+        },
+        None => None,
+    };
+    let mut removed = 0i64;
+    let cls: Vec<Arc<Client>> = client_snapshot();
+    for t in &targets {
+        if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
+            let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<i16> = inv
+                .iter()
+                .filter(|(_, (it, _, _))| want.map(|w| w == *it).unwrap_or(true))
+                .map(|(&k, _)| k)
+                .collect();
+            let mut player_removed = 0u32;
+            for k in keys {
+                let (it, cnt, comps) = inv[&k].clone();
+                let take = if max == Some(0) {
+                    u32::from(cnt)
+                } else {
+                    max.map(|m| u32::from(cnt).min(m.saturating_sub(player_removed)))
+                        .unwrap_or(u32::from(cnt))
+                };
+                if take == 0 {
+                    break;
+                }
+                player_removed += take;
+                removed += i64::from(take);
+                if max != Some(0) {
+                    if take == u32::from(cnt) {
+                        inv.remove(&k);
+                    } else {
+                        inv.insert(k, (it, cnt - take as u8, comps));
+                    }
+                }
+            }
+            // resync window 0 so the client drops the cleared items
+            let mut q = vec![0u8];
+            write_varint(&mut q, 0);
+            write_varint(&mut q, 46);
+            for i in 0..46i16 {
+                let (it2, c2, _cc) = inv.get(&i).cloned().unwrap_or((0, 0, Vec::new()));
+                q.extend_from_slice(&slot_wire(&(it2, c2, _cc)));
+            }
+            q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x13, q);
+            }
+        }
+    }
+    format!("Cleared {} item(s)", removed)
+}
+
+/// Vanilla 1.21.1 `DamageTypes` registry ids (the `minecraft:` prefix is
+/// implied). The `/damage` argument is a registry lookup, so unknown ids fail
+/// closed rather than silently re-typing the hit as `generic`.
+fn damage_type_known(name: &str) -> bool {
+    const TYPES: &[&str] = &[
+        "arrow",
+        "bad_respawn_point",
+        "cactus",
+        "campfire",
+        "cramming",
+        "dragon_breath",
+        "drown",
+        "dry_out",
+        "ender_pearl",
+        "explosion",
+        "fall",
+        "falling_anvil",
+        "falling_block",
+        "falling_stalactite",
+        "fireball",
+        "fireworks",
+        "fly_into_wall",
+        "freeze",
+        "generic",
+        "generic_kill",
+        "hot_floor",
+        "in_fire",
+        "in_wall",
+        "indirect_magic",
+        "lava",
+        "lightning_bolt",
+        "magic",
+        "mob_attack",
+        "mob_attack_no_aggro",
+        "mob_projectile",
+        "on_fire",
+        "out_of_world",
+        "outside_border",
+        "player_attack",
+        "player_explosion",
+        "sonic_boom",
+        "spit",
+        "stalagmite",
+        "starve",
+        "sting",
+        "sweet_berry_bush",
+        "thorns",
+        "thrown",
+        "trident",
+        "unattributed_fireball",
+        "wind_charge",
+        "wither",
+        "wither_skull",
+    ];
+    TYPES.contains(&name.trim_start_matches("minecraft:"))
+}
+
+/// `by <entity>`/`from <entity>` each take Vanilla's single-entity argument:
+/// anything resolving to a count other than one is an error, not a pick.
+fn damage_single_entity(sel: &str, me: Option<&Arc<Client>>) -> Result<String, String> {
+    let found = resolve_selector(sel, me);
+    if found.len() == 1 {
+        Ok(found[0].clone())
+    } else {
+        Err("Expected a single entity".to_owned())
+    }
+}
+
+/// `/damage <target> <amount> [<damageType>] [at <pos>|by <entity> [from
+/// <cause>]]`. The type, position and attacker clauses are validated like
+/// Vanilla's registry/entity arguments; the physical model (armor, totem,
+/// hurt animation) is the same whatever the declared source is.
+fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> String {
+    const USAGE: &str =
+        "usage: /damage <target> <amount> [<damageType>] [at <pos>|by <entity> [from <cause>]]";
+    let sel = args.first().copied().unwrap_or("");
+    let Some(raw_amount) = args.get(1) else {
+        return USAGE.into();
+    };
+    let amt = match raw_amount.parse::<f32>() {
+        Ok(a) if a.is_finite() && a >= 0.0 => a,
+        _ => return format!("Invalid damage amount '{raw_amount}'"),
+    };
+    // The optional tail starts at the damage type; `at`/`by` require it.
+    match args.get(2..).unwrap_or_default() {
+        [] | [_] => {}
+        [_, "at", x, y, z] => {
+            let _ = (
+                coord(x, ctx.x),
+                coord(y, ctx.y),
+                coord(z, ctx.z),
+            );
+        }
+        [_, "by", entity] => {
+            if let Err(e) = damage_single_entity(entity, me) {
+                return e;
+            }
+        }
+        [_, "by", entity, "from", cause] => {
+            for who in [entity, cause] {
+                if let Err(e) = damage_single_entity(who, me) {
+                    return e;
+                }
+            }
+        }
+        _ => return USAGE.into(),
+    }
+    if let Some(dtype) = args.get(2) {
+        if !damage_type_known(dtype) {
+            return format!("Invalid damage type '{dtype}'");
+        }
+    }
+    let tgts = if sel.starts_with('@') {
+        resolve_selector(sel, me)
+    } else {
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|c| c.name == sel)
+            .map(|c| vec![c.eid.to_string()])
+            .unwrap_or_default()
+    };
+    let mut n = 0;
+    let cls_snap: Vec<Arc<Client>> = client_snapshot();
+    let mut mob_hits: Vec<(i32, f32)> = Vec::new();
+    for t in &tgts {
+        if let Some(e) = t.strip_prefix("m:").and_then(|e| e.parse::<i32>().ok()) {
+            mob_hits.push((e, amt));
+        } else if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
+            if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
+                continue;
+            }
+            let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+            *h = (*h - hurt_absorb(c, dmg_after(c, amt, 0))).max(0.0);
+            if *h <= 0.0 {
+                drop(h);
+                totem_check(c);
+                h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+            }
+            let hh = *h;
+            drop(h);
+            damage_armor(c, amt);
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x24, hurt_anim(c.eid));
+                let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
+            }
+            n += 1;
+        }
+    }
+    for (eid, amt) in mob_hits {
+        let dead = {
+            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            ms.iter()
+                .find(|m| m.eid == eid)
+                .map(|m| {
+                    let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
+                    *h -= amt;
+                    *h <= 0.0
+                })
+                .unwrap_or(false)
+        };
+        let mob = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|m| m.eid == eid)
+            .cloned();
+        if let Some(m) = mob {
+            *m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+            broadcast_seen(eid, |_c| (0x24, hurt_anim(eid)));
+            if dead {
+                let (mx, my, mz) = {
+                    let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    (p.0, p.1, p.2)
+                };
+                let et = m.etype;
+                kill_mob(eid, et, mx, my, mz);
+            }
+            n += 1;
+        }
+    }
+    format!("Applied {} damage to {} target(s)", amt, n)
+}
+
+/// `/tag <targets> add <name> | remove <name> | list` — Vanilla's score-holder
+/// tag verbs over the shared `tags()` store; one report per matched target on
+/// `list` (pinned by `tag_list_reports_every_matched_target`).
+fn run_tag_command(args: &[&str], me: Option<&Arc<Client>>) -> String {
+    let sel = args.first().copied().unwrap_or("");
+    let sub = args.get(1).copied().unwrap_or("");
+    let tg = args.get(2).copied().unwrap_or("");
+    let tgts = if sel.starts_with('@') {
+        resolve_selector(sel, me)
+    } else {
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|c| c.name == sel)
+            .map(|c| vec![c.eid.to_string()])
+            .unwrap_or_default()
+    };
+    let tm = tags().lock().unwrap_or_else(|e| e.into_inner());
+    match sub {
+        "add" | "remove" if !tg.is_empty() => {
+            let mut tm = tm;
+            let mut n = 0;
+            for t in &tgts {
+                let key = if let Some(e) = t.strip_prefix("m:") {
+                    format!("e:{}", e)
+                } else if t.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+                    && t.contains(':')
+                {
+                    t.clone()
+                } else {
+                    clients()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .find(|c| c.eid.to_string() == *t)
+                        .map(|c| format!("p:{}", c.name))
+                        .unwrap_or_default()
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                match sub {
+                    "add" => {
+                        tm.entry(key).or_default().insert(tg.to_string());
+                    }
+                    _ => {
+                        if let Some(st) = tm.get_mut(&key) {
+                            st.remove(tg);
+                        }
+                    }
+                }
+                n += 1;
+            }
+            format!(
+                "{}ed {} target(s)",
+                if sub == "add" { "tagg" } else { "untagg" },
+                n
+            )
+        }
+        "list" => {
+            // one report per matched target: a `return` inside the loop
+            // answered only for the first one and named the selector
+            // (`@a`) instead of the target it was reporting.
+            let mut lines: Vec<String> = Vec::new();
+            for t in &tgts {
+                let key = if let Some(e) = t.strip_prefix("m:") {
+                    format!("e:{}", e)
+                } else {
+                    clients()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .find(|c| c.eid.to_string() == *t)
+                        .map(|c| format!("p:{}", c.name))
+                        .unwrap_or_default()
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                let who = key.strip_prefix("p:").unwrap_or(t).to_string();
+                let st = tm.get(&key);
+                let mut tags: Vec<String> =
+                    st.map(|s| s.iter().cloned().collect()).unwrap_or_default();
+                tags.sort();
+                lines.push(format!(
+                    "{} has {} tag(s): {}",
+                    who,
+                    tags.len(),
+                    tags.join(", ")
+                ));
+            }
+            if lines.is_empty() {
+                "no targets".into()
+            } else {
+                lines.join(", ")
+            }
+        }
+        _ => "usage: /tag <target> add|remove|list [tag]".into(),
+    }
+}
+
+// ---------------------------------------------------------- /attribute #225
+
+/// Vanilla `AttributeModifier.Operation` — `add` applies to the base,
+/// `multiply_base` scales the post-add base, `multiply` scales the total.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum AttrModOp {
+    Add,
+    MultiplyBase,
+    MultiplyTotal,
+}
+
+/// `/attribute`'s command-side modifier store, keyed the way `attrs()` is:
+/// `p:<name>` for players and `e:<eid>` for transient entities, then the bare
+/// attribute name, then the modifier id.
+fn attr_modifiers(
+) -> &'static Mutex<HashMap<String, HashMap<String, BTreeMap<String, (f64, AttrModOp)>>>>
+{
+    static STORE: OnceLock<
+        Mutex<HashMap<String, HashMap<String, BTreeMap<String, (f64, AttrModOp)>>>>,
+    > = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A modifier id is a Vanilla `ResourceLocation`: lowercase namespace + path
+/// of `[a-z0-9_.-/]` (path may also contain `/`).
+fn modifier_id_valid(id: &str) -> bool {
+    let (ns, path) = match id.split_once(':') {
+        Some((ns, path)) => (Some(ns), path),
+        None => (None, id),
+    };
+    let part_ok = |s: &str, slash: bool| {
+        !s.is_empty()
+            && s.bytes().all(|b| {
+                matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-')
+                    || (slash && b == b'/')
+            })
+    };
+    ns.map_or(true, |n| part_ok(n, false)) && part_ok(path, true)
+}
+
+/// The stored base (or Vanilla default) for `base get` — equipment and
+/// command modifiers stay out of it, matching `AttributeInstance.getBase`.
+fn attr_base_of(key: &str, name: &str) -> f64 {
+    attrs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .and_then(|m| m.get(name))
+        .copied()
+        .unwrap_or_else(|| attr_default(name))
+}
+
+/// Vanilla `AttributeInstance.calculateValue` over the command modifier set,
+/// on top of `attr_of`'s base-plus-equipment value:
+/// `(base + Σadd) → + that × Σmultiply_base → × Π(1 + multiply)`.
+fn attr_effective_of(key: &str, name: &str) -> f64 {
+    let base = attr_of(key, name);
+    let mods = attr_modifiers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(mods) = mods.get(key).and_then(|m| m.get(name)) else {
+        return base;
+    };
+    let (mut add, mut mb, mut mt) = (0.0, 0.0, 1.0);
+    for &(amount, op) in mods.values() {
+        match op {
+            AttrModOp::Add => add += amount,
+            AttrModOp::MultiplyBase => mb += amount,
+            AttrModOp::MultiplyTotal => mt *= 1.0 + amount,
+        }
+    }
+    let post_add = base + add;
+    (post_add + post_add * mb) * mt
+}
+
+/// `/attribute <target> <attr> get [<scale>] | base get [<scale>] | base set
+/// <v> | modifier add <id> <v> <op> | modifier remove <id> | modifier value
+/// get <id> [<scale>]` — Vanilla 1.21.1's single-entity attribute command.
+fn run_attribute_command(args: &[&str], me: Option<&Arc<Client>>) -> String {
+    const USAGE: &str = "usage: /attribute <target> <attribute> get [<scale>] | \
+        base get [<scale>] | base set <value> | modifier add <id> <value> \
+        add|multiply|multiply_base | modifier remove <id> | modifier value get <id> [<scale>]";
+    let sel = args.first().copied().unwrap_or("");
+    let aname = args.get(1).copied().unwrap_or("");
+    if attr_key_id(aname).is_none() {
+        return format!("Unknown attribute '{aname}'");
+    }
+    let attr = aname.trim_start_matches("minecraft:").to_string();
+    // Vanilla's target is `EntityArgument.entity()`: exactly one entity.
+    let eids = resolve_selector(sel, me);
+    let [target] = eids.as_slice() else {
+        return "Expected a single entity".into();
+    };
+    let (key, who) = {
+        let cls: Vec<Arc<Client>> = client_snapshot();
+        match cls.iter().find(|c| c.eid.to_string() == *target) {
+            Some(c) => (format!("p:{}", c.name), c.name.clone()),
+            None => {
+                let eid = target.strip_prefix("m:").unwrap_or(target);
+                (format!("e:{eid}"), format!("entity {eid}"))
+            }
+        }
+    };
+    let broadcast_attr = |eid: &str, value: f64| {
+        let eid: i32 = eid
+            .strip_prefix("m:")
+            .unwrap_or(eid)
+            .parse()
+            .unwrap_or(0);
+        let mut m = HashMap::new();
+        m.insert(attr.clone(), value);
+        let pk = attrs_pkt(eid, &m);
+        // vanilla pushes attribute updates to every client tracking the entity
+        broadcast(-1, |_c| (0x75, pk.clone()));
+    };
+    let scale_of = |arg: Option<&&str>| -> Result<f64, String> {
+        match arg {
+            None => Ok(1.0),
+            Some(raw) => raw
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| format!("Invalid scale '{raw}'")),
+        }
+    };
+    match args.get(2..).unwrap_or_default() {
+        ["get", rest @ ..] => {
+            if rest.len() > 1 {
+                return USAGE.into();
+            }
+            let scale = match scale_of(rest.first()) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            format!(
+                "Value of attribute {aname} for entity {who} is {}",
+                attr_effective_of(&key, &attr) * scale
+            )
+        }
+        ["base", "get", rest @ ..] => {
+            if rest.len() > 1 {
+                return USAGE.into();
+            }
+            let scale = match scale_of(rest.first()) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            format!(
+                "Base value of attribute {aname} for entity {who} is {}",
+                attr_base_of(&key, &attr) * scale
+            )
+        }
+        ["base", "set", raw] => {
+            let Ok(value) = raw.parse::<f64>() else {
+                return format!("Invalid value '{raw}'");
+            };
+            if !value.is_finite() {
+                return format!("Invalid value '{raw}'");
+            }
+            attrs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key.clone())
+                .or_default()
+                .insert(attr.clone(), value);
+            broadcast_attr(target, value);
+            format!("Set base value of attribute {aname} for entity {who} to {value}")
+        }
+        ["modifier", "add", id, raw, op] => {
+            if !modifier_id_valid(id) {
+                return format!("Invalid modifier id '{id}'");
+            }
+            let Ok(value) = raw.parse::<f64>() else {
+                return format!("Invalid value '{raw}'");
+            };
+            if !value.is_finite() {
+                return format!("Invalid value '{raw}'");
+            }
+            let op = match *op {
+                "add" => AttrModOp::Add,
+                "multiply" => AttrModOp::MultiplyTotal,
+                "multiply_base" => AttrModOp::MultiplyBase,
+                _ => return USAGE.into(),
+            };
+            let mut store = attr_modifiers().lock().unwrap_or_else(|e| e.into_inner());
+            let mods = store
+                .entry(key.clone())
+                .or_default()
+                .entry(attr.clone())
+                .or_default();
+            if mods.contains_key(*id) {
+                return format!(
+                    "Modifier {id} is already present on attribute {aname} for entity {who}"
+                );
+            }
+            mods.insert((*id).to_owned(), (value, op));
+            drop(store);
+            broadcast_attr(target, attr_effective_of(&key, &attr));
+            format!("Added modifier {id} to attribute {aname} for entity {who}")
+        }
+        ["modifier", "remove", id] => {
+            let mut store = attr_modifiers().lock().unwrap_or_else(|e| e.into_inner());
+            let mods = store
+                .entry(key.clone())
+                .or_default()
+                .entry(attr.clone())
+                .or_default();
+            if mods.remove(*id).is_none() {
+                return format!("Attribute {aname} on entity {who} has no modifier {id}");
+            }
+            drop(store);
+            broadcast_attr(target, attr_effective_of(&key, &attr));
+            format!("Removed modifier {id} from attribute {aname} for entity {who}")
+        }
+        ["modifier", "value", "get", id, rest @ ..] => {
+            if rest.len() > 1 {
+                return USAGE.into();
+            }
+            let scale = match scale_of(rest.first()) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            let store = attr_modifiers().lock().unwrap_or_else(|e| e.into_inner());
+            match store
+                .get(&key)
+                .and_then(|m| m.get(&attr))
+                .and_then(|m| m.get(*id))
+            {
+                Some((amount, _)) => format!(
+                    "Value of modifier {id} on attribute {aname} for entity {who} is {}",
+                    amount * scale
+                ),
+                None => {
+                    format!("Attribute {aname} on entity {who} has no modifier {id}")
+                }
+            }
+        }
+        _ => USAGE.into(),
+    }
+}
+
 // ------------------------------------------------------------------ tests ---
 
 #[cfg(test)]
@@ -5673,5 +6817,718 @@ mod p6d_parity_tests {
         tracker.progress.remove("p6d_adv");
         tracker.sent_progress.remove("p6d_adv");
         adv_done().lock().unwrap_or_else(|e| e.into_inner()).remove("p6d_adv");
+    }
+}
+
+// ------------------------------------------------------------ p8c_parity ---
+
+#[cfg(test)]
+mod p8c_parity_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    fn p8c_client(eid: i32, name: &str, x: f64, y: f64, z: f64) -> (Arc<Client>, TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.eid = eid;
+        client.name = name.into();
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0, 0.0, true);
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        (Arc::new(client), receiver)
+    }
+
+    fn p8c_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    fn p8c_run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    /// A level-`level` operator context for `name`: the ops registry is the
+    /// real `player_permission_level` source, no test-only bypass.
+    fn p8c_op_ctx(name: &str, level: u8) -> CmdCtx {
+        if level > 0 {
+            ops_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set(name, level, false);
+        }
+        let (client, _recv) = p8c_client(98_000 + level as i32, name, 0.5, 16.0, 0.5);
+        p8c_ctx(Some(client))
+    }
+
+    fn p8c_deop(name: &str) {
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+    }
+
+    fn p8c_frame_varint(r: &mut TcpStream) -> Option<(i64, usize)> {
+        let mut value = 0i64;
+        for i in 0..5 {
+            let mut b = [0u8; 1];
+            r.read_exact(&mut b).ok()?;
+            value |= ((b[0] & 0x7f) as i64) << (7 * i);
+            if b[0] & 0x80 == 0 {
+                return Some((value, i + 1));
+            }
+        }
+        None
+    }
+
+    /// One uncompressed frame: varint length, varint packet id, payload.
+    fn p8c_read_frame(r: &mut TcpStream) -> Option<(i64, Vec<u8>)> {
+        let (len, _) = p8c_frame_varint(r)?;
+        let (id, used) = p8c_frame_varint(r)?;
+        let mut payload = vec![0u8; (len as usize).checked_sub(used)?];
+        r.read_exact(&mut payload).ok()?;
+        Some((id, payload))
+    }
+
+    // #145-#148: every cluster-C command is owner-level (4) — refused at 0..3,
+    // refused inside a level-2 .mcfunction, never advertised below 4.
+    #[test]
+    fn p8c_parity_cluster_c_commands_require_op_level_four() {
+        let _world = world_guard();
+        for (name, level) in [("p8c_l0", 0u8), ("p8c_l2", 2), ("p8c_l3", 3)] {
+            let ctx = p8c_op_ctx(name, level);
+            for cmd in ["/debug start", "/jfr start", "/perf start", "/publish"] {
+                assert_eq!(
+                    p8c_run(&ctx, cmd),
+                    "You do not have permission to run that command",
+                    "level-{level} source must be refused {cmd}"
+                );
+            }
+            p8c_deop(name);
+        }
+        // The advertised tree hides all four literals below level 4 and shows
+        // them at exactly 4.
+        for level in 0..4u8 {
+            let root = native_command_dispatcher(level, None);
+            for cmd in ["debug", "jfr", "perf", "publish"] {
+                assert!(
+                    root.root().child(cmd).is_none(),
+                    "{cmd} literal must not be advertised at level {level}"
+                );
+            }
+        }
+        let level4 = native_command_dispatcher(4, None);
+        for cmd in ["debug", "jfr", "perf", "publish"] {
+            assert!(
+                level4.root().child(cmd).is_some(),
+                "{cmd} literal must be advertised at level 4"
+            );
+        }
+        // A level-2 `.mcfunction` frame re-enters run_command_ctx with the
+        // same source: run_function_lines is that path, not an approximation.
+        let ctx = p8c_op_ctx("p8c_fn2", 2);
+        run_function_lines(
+            &[
+                "debug start".to_owned(),
+                "jfr start".to_owned(),
+                "perf start".to_owned(),
+                "publish".to_owned(),
+            ],
+            ctx.me.clone(),
+            &mut None,
+            0,
+        );
+        assert!(
+            debug_session().lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "level-2 .mcfunction must not start /debug"
+        );
+        assert!(
+            jfr_session().lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "level-2 .mcfunction must not start /jfr"
+        );
+        assert!(
+            perf_session().lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "level-2 .mcfunction must not start /perf"
+        );
+        assert!(
+            publish_state().lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "level-2 .mcfunction must not publish"
+        );
+        p8c_deop("p8c_fn2");
+    }
+
+    // #145 /debug start|stop|function — session lifecycle on the live ring.
+    #[test]
+    fn p8c_parity_debug_session_and_function_trace() {
+        let _world = world_guard();
+        let ctx = p8c_ctx(None); // console: level 4
+        // stop-when-inactive refuses before anything else.
+        assert_eq!(
+            p8c_run(&ctx, "/debug stop"),
+            "Can't stop profiling when we haven't started yet!"
+        );
+        assert_eq!(p8c_run(&ctx, "/debug start"), "Started debug profiling");
+        assert_eq!(
+            p8c_run(&ctx, "/debug start"),
+            "Debug profiling has already started"
+        );
+        // Seed the session window, then the stop report carries the vanilla
+        // seconds/ticks/TPS line plus the profiler's MSPT summary.
+        {
+            let mut profiler = live_hotspot_profiler().lock().unwrap_or_else(|e| e.into_inner());
+            for us in [40_000u32, 50_000, 60_000, 50_000] {
+                profiler.record_tick_us(us);
+            }
+        }
+        let stop = p8c_run(&ctx, "/debug stop");
+        assert!(stop.starts_with("Stopped debug profiling after "), "{stop}");
+        assert!(stop.contains("ticks ("), "{stop}");
+        assert!(stop.contains("ticks per second"), "{stop}");
+        assert!(stop.contains("MSPT mean 50.0 ms"), "{stop}");
+        assert!(stop.contains("p50 50.0"), "{stop}");
+        assert!(stop.contains("(4 ticks sampled)"), "{stop}");
+        // A second stop is refused again.
+        assert_eq!(
+            p8c_run(&ctx, "/debug stop"),
+            "Can't stop profiling when we haven't started yet!"
+        );
+
+        // /debug function: trace a real datapack function, splitting
+        // succeeded from failed lines and honouring `return`.
+        let mut functions = HashMap::new();
+        functions.insert(
+            "p8c:traced".to_owned(),
+            vec![
+                "say first".to_owned(),
+                "notacommand at all".to_owned(),
+                "say second".to_owned(),
+            ],
+        );
+        functions.insert(
+            "p8c:early_return".to_owned(),
+            vec!["say one".to_owned(), "return 0".to_owned(), "say skipped".to_owned()],
+        );
+        functions.insert(
+            "p8c:recursive".to_owned(),
+            vec!["debug function p8c:traced".to_owned()],
+        );
+        functions.insert(
+            "p8c:macro".to_owned(),
+            vec!["$say $(x)".to_owned()],
+        );
+        packs().lock().unwrap_or_else(|e| e.into_inner()).push(Datapack {
+            name: "p8c_dbg".to_owned(),
+            functions,
+            load: Vec::new(),
+            tick: Vec::new(),
+        });
+        // say broadcasts to every connected client: a quiet audience keeps the
+        // trace deterministic either way.
+        let trace = p8c_run(&ctx, "/debug function p8c:traced");
+        assert_eq!(
+            trace,
+            "Finished tracing 3 command(s) from function 'p8c:traced', 2 succeeded and 1 failed"
+        );
+        // `return` ends the frame like Vanilla's discarded command frame.
+        let early = p8c_run(&ctx, "/debug function p8c:early_return");
+        assert_eq!(
+            early,
+            "Finished tracing 2 command(s) from function 'p8c:early_return', 2 succeeded and 0 failed"
+        );
+        // A nested `debug function` line is refused (noRecursion) and counts
+        // as the failed line it is.
+        let nested = p8c_run(&ctx, "/debug function p8c:recursive");
+        assert_eq!(
+            nested,
+            "Finished tracing 1 command(s) from function 'p8c:recursive', 0 succeeded and 1 failed"
+        );
+        // Unknown and macro-bearing functions fail the trace outright.
+        assert_eq!(
+            p8c_run(&ctx, "/debug function p8c:missing"),
+            "Failed to trace function"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/debug function p8c:macro"),
+            "Failed to trace function"
+        );
+        packs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|p| p.name != "p8c_dbg");
+        // usage forms refuse cleanly.
+        assert_eq!(
+            p8c_run(&ctx, "/debug"),
+            "usage: /debug start|stop|function <name>"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/debug function"),
+            "usage: /debug start|stop|function <name>"
+        );
+    }
+
+    // #146 /jfr start|stop — native telemetry recording on the live ring.
+    #[test]
+    fn p8c_parity_jfr_native_telemetry_session() {
+        let _world = world_guard();
+        let ctx = p8c_ctx(None);
+        assert_eq!(
+            p8c_run(&ctx, "/jfr stop"),
+            "Native telemetry profiling is not running"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/jfr start"),
+            "Started native telemetry profiling (Rust JFR equivalent)"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/jfr start"),
+            "Native telemetry profiling is already running"
+        );
+        {
+            let mut profiler = live_hotspot_profiler().lock().unwrap_or_else(|e| e.into_inner());
+            for us in [10_000u32, 20_000, 30_000, 100_000] {
+                profiler.record_tick_us(us);
+            }
+        }
+        let stop = p8c_run(&ctx, "/jfr stop");
+        assert!(stop.contains("4 ticks"), "{stop}");
+        // nearest-rank over [10,20,30,100]: p50 = 20, p95/p99 = 100.
+        assert!(stop.contains("p50 20.0 ms"), "{stop}");
+        assert!(stop.contains("p95 100.0 ms"), "{stop}");
+        assert!(stop.contains("p99 100.0 ms"), "{stop}");
+        assert_eq!(
+            p8c_run(&ctx, "/jfr stop"),
+            "Native telemetry profiling is not running"
+        );
+        assert_eq!(p8c_run(&ctx, "/jfr bogus"), "usage: /jfr start|stop");
+    }
+
+    // #147 /perf start|stop — bounded capture with the full MSPT + hotspot
+    // report on stop.
+    #[test]
+    fn p8c_parity_perf_bounded_capture_reports_hotspots() {
+        let _world = world_guard();
+        let ctx = p8c_ctx(None);
+        assert_eq!(
+            p8c_run(&ctx, "/perf stop"),
+            "No performance capture is running"
+        );
+        assert_eq!(p8c_run(&ctx, "/perf start"), "Started performance capture");
+        assert_eq!(
+            p8c_run(&ctx, "/perf start"),
+            "Performance capture is already running"
+        );
+        // start() reset the window: only the ticks seeded after it count.
+        {
+            let mut profiler = live_hotspot_profiler().lock().unwrap_or_else(|e| e.into_inner());
+            for us in [50_000u32; 8] {
+                profiler.record_tick_us(us);
+            }
+            profiler.record_chunk_work(DimId::Overworld, 3, -9, ProfilerSubsystem::Mobs, 4_200);
+        }
+        let stop = p8c_run(&ctx, "/perf stop");
+        assert!(stop.starts_with("Stopped performance capture"), "{stop}");
+        assert!(stop.contains("TPS 20.0"), "{stop}");
+        assert!(stop.contains("MSPT mean 50.0 ms"), "{stop}");
+        assert!(stop.contains("p50 50.0"), "{stop}");
+        assert!(stop.contains("p95 50.0"), "{stop}");
+        assert!(stop.contains("p99 50.0"), "{stop}");
+        assert!(stop.contains("max 50.0 ms"), "{stop}");
+        assert!(stop.contains("Top chunk hotspots:"), "{stop}");
+        assert!(stop.contains("Overworld chunk (3, -9)"), "{stop}");
+        assert!(stop.contains("mobs"), "{stop}");
+        assert_eq!(
+            p8c_run(&ctx, "/perf stop"),
+            "No performance capture is running"
+        );
+        assert_eq!(p8c_run(&ctx, "/perf x"), "usage: /perf start|stop");
+    }
+
+    // #148 /publish — vanilla argument order, port bound to 1024..=65535,
+    // metadata-only publish state, no socket.
+    #[test]
+    fn p8c_parity_publish_parses_validates_and_updates_state() {
+        let _world = world_guard();
+        let ctx = p8c_ctx(None);
+        assert!(
+            publish_state().lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "publish state must start empty for the test"
+        );
+        // Bare /publish uses the configured default port and gamemode.
+        let default_gm = DEFAULT_GAME_MODE.swap(1, Ordering::Relaxed);
+        let reply = p8c_run(&ctx, "/publish");
+        assert_eq!(
+            reply,
+            format!("Local game hosted on port {}", publish_default_port())
+        );
+        {
+            let state = publish_state().lock().unwrap_or_else(|e| e.into_inner());
+            let active = state.expect("published");
+            assert_eq!(active.port, publish_default_port());
+            assert!(!active.allow_commands);
+            assert_eq!(active.gamemode, 1, "default gamemode = creative");
+        }
+        DEFAULT_GAME_MODE.store(default_gm, Ordering::Relaxed);
+        // A second publish reports the active port like Vanilla.
+        assert_eq!(
+            p8c_run(&ctx, "/publish"),
+            format!("Local game already hosted on port {}", publish_default_port())
+        );
+        publish_state().lock().unwrap_or_else(|e| e.into_inner()).take();
+        // Full argument form updates the metadata exactly.
+        assert_eq!(
+            p8c_run(&ctx, "/publish true adventure 30000"),
+            "Local game hosted on port 30000"
+        );
+        {
+            let state = publish_state().lock().unwrap_or_else(|e| e.into_inner());
+            let active = state.expect("published");
+            assert_eq!((active.port, active.allow_commands, active.gamemode), (30000, true, 2));
+        }
+        publish_state().lock().unwrap_or_else(|e| e.into_inner()).take();
+        // Validation is fail-closed: bad bool, bad gamemode, out-of-range
+        // ports, and too many arguments all refuse before any state change.
+        assert_eq!(
+            p8c_run(&ctx, "/publish maybe"),
+            "Invalid allowCommands 'maybe'"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/publish true hardcore"),
+            "Invalid gamemode 'hardcore'"
+        );
+        for port in ["80", "1023", "65536", "abc", "-1"] {
+            assert_eq!(
+                p8c_run(&ctx, &format!("/publish false survival {port}")),
+                format!("Invalid port '{port}'")
+            );
+        }
+        // Boundary ports publish cleanly.
+        for port in ["1024", "65535"] {
+            assert_eq!(
+                p8c_run(&ctx, &format!("/publish false survival {port}")),
+                format!("Local game hosted on port {port}")
+            );
+            publish_state().lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+        assert_eq!(
+            p8c_run(&ctx, "/publish true survival 25000 extra"),
+            "usage: /publish [<allowCommands>] [<gamemode>] [<port>]"
+        );
+        assert!(
+            publish_state().lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "refused publishes must not leave state behind"
+        );
+    }
+
+    // #225 /effect give — `infinite` duration and `hideParticles`.
+    #[test]
+    fn p8c_parity_effect_infinite_duration_and_hidden_particles() {
+        let _world = world_guard();
+        let (player, mut recv) = p8c_client(98_100, "p8c_fx", 0.5, 16.0, 0.5);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
+        let ctx = p8c_ctx(None);
+        // infinite: stored left never reaches zero; the wire duration is -1
+        // and the flags byte keeps particles+icon (0x06).
+        assert_eq!(
+            p8c_run(&ctx, "/effect give p8c_fx speed infinite"),
+            "Applied effect to 1 target(s)"
+        );
+        {
+            let effs = player.effs.lock().unwrap_or_else(|e| e.into_inner());
+            let speed = effs.iter().find(|e| e.id == 0).expect("speed stored");
+            assert_eq!(speed.left, i32::MAX, "infinite never counts to zero");
+        }
+        let (id, payload) = p8c_read_frame(&mut recv).expect("effect frame");
+        assert_eq!(id, 0x76);
+        // [eid][effect][amp][duration = -1 as 5-byte varint][flags]
+        assert_eq!(*payload.last().unwrap(), 0x06, "particles shown");
+        assert!(
+            payload
+                .windows(5)
+                .any(|w| w == [0xff, 0xff, 0xff, 0xff, 0x0f]),
+            "wire duration -1 expected in {payload:?}"
+        );
+        // hidden particles flag the icon-only byte 0x04.
+        assert_eq!(
+            p8c_run(&ctx, "/effect give p8c_fx speed 60 2 true"),
+            "Applied effect to 1 target(s)"
+        );
+        {
+            let effs = player.effs.lock().unwrap_or_else(|e| e.into_inner());
+            let speed = effs.iter().find(|e| e.id == 0).expect("speed stored");
+            assert_eq!(speed.left, 60 * TICKS_PER_SECOND as i32);
+            assert_eq!(speed.amp, 2);
+        }
+        let (id, payload) = p8c_read_frame(&mut recv).expect("effect frame");
+        assert_eq!(id, 0x76);
+        assert_eq!(*payload.last().unwrap(), 0x04, "particles hidden");
+        // Validation refuses bad durations, amplifiers and flags outright.
+        for (line, want) in [
+            ("/effect give p8c_fx speed abc", "Invalid duration 'abc'"),
+            ("/effect give p8c_fx speed 0", "Invalid duration '0'"),
+            ("/effect give p8c_fx speed 1000001", "Invalid duration '1000001'"),
+            ("/effect give p8c_fx speed 30 256", "Invalid amplifier '256'"),
+            ("/effect give p8c_fx speed 30 1 maybe", "Invalid hideParticles 'maybe'"),
+        ] {
+            assert_eq!(p8c_run(&ctx, line), want, "{line}");
+        }
+        player.effs.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.eid != 98_100);
+    }
+
+    // #225 /damage — type validation and the at/by/from source clauses.
+    #[test]
+    fn p8c_parity_damage_type_and_source_clauses() {
+        let _world = world_guard();
+        let (player, _recv) = p8c_client(98_200, "p8c_dmg", 0.5, 16.0, 0.5);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set("p8c_dmg", 4, false);
+        let ctx = p8c_ctx(Some(player.clone()));
+        let hp0 = *player.hp.lock().unwrap_or_else(|e| e.into_inner());
+        // Bare and typed forms apply the same physical damage.
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s 5"),
+            "Applied 5 damage to 1 target(s)"
+        );
+        let hp1 = *player.hp.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(hp1 < hp0, "bare damage must land: {hp0} -> {hp1}");
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s 3 minecraft:generic"),
+            "Applied 3 damage to 1 target(s)"
+        );
+        // Registry lookup: unknown types refuse before any damage lands.
+        let hp2 = *player.hp.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s 9 not_a_type"),
+            "Invalid damage type 'not_a_type'"
+        );
+        assert_eq!(
+            *player.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            hp2,
+            "invalid type must not damage"
+        );
+        // at <pos> accepts vanilla coordinates including ~.
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s 2 fall at ~ ~ ~"),
+            "Applied 2 damage to 1 target(s)"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s 2 magic at 10 64 -20"),
+            "Applied 2 damage to 1 target(s)"
+        );
+        // by <entity> [from <cause>] each resolve exactly one entity.
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s 2 mob_attack by @s"),
+            "Applied 2 damage to 1 target(s)"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s 2 arrow by @s from @s"),
+            "Applied 2 damage to 1 target(s)"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s 2 arrow by @e[type=!player]"),
+            "Expected a single entity"
+        );
+        // Missing amount, bad amount and malformed tails fail closed.
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s"),
+            "usage: /damage <target> <amount> [<damageType>] [at <pos>|by <entity> [from <cause>]]"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s nope"),
+            "Invalid damage amount 'nope'"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s -5"),
+            "Invalid damage amount '-5'"
+        );
+        assert_eq!(
+            p8c_run(&ctx, "/damage @s 5 at 1 2 3"),
+            "usage: /damage <target> <amount> [<damageType>] [at <pos>|by <entity> [from <cause>]]"
+        );
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.eid != 98_200);
+        p8c_deop("p8c_dmg");
+    }
+
+    // #225 /attribute — get, base get/set and the modifier verbs.
+    #[test]
+    fn p8c_parity_attribute_get_base_and_modifier_cycle() {
+        let _world = world_guard();
+        let (player, _recv) = p8c_client(98_300, "p8c_attr", 0.5, 16.0, 0.5);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
+        let ctx = p8c_ctx(None);
+        let attr = "minecraft:generic.max_health";
+        // get reports the effective value, base get the stored base.
+        assert_eq!(
+            p8c_run(&ctx, &format!("/attribute p8c_attr {attr} get")),
+            format!("Value of attribute {attr} for entity p8c_attr is 20")
+        );
+        assert_eq!(
+            p8c_run(&ctx, &format!("/attribute p8c_attr {attr} base get")),
+            format!("Base value of attribute {attr} for entity p8c_attr is 20")
+        );
+        assert_eq!(
+            p8c_run(&ctx, &format!("/attribute p8c_attr {attr} base set 30")),
+            format!("Set base value of attribute {attr} for entity p8c_attr to 30")
+        );
+        // modifier add — Vanilla's three operations feed calculateValue:
+        // (base + add) then multiply_base on that, multiply on the total.
+        assert_eq!(
+            p8c_run(
+                &ctx,
+                &format!("/attribute p8c_attr {attr} modifier add spine:boost 2 add")
+            ),
+            format!("Added modifier spine:boost to attribute {attr} for entity p8c_attr")
+        );
+        assert_eq!(
+            p8c_run(
+                &ctx,
+                &format!("/attribute p8c_attr {attr} modifier add spine:boost 2 add")
+            ),
+            format!("Modifier spine:boost is already present on attribute {attr} for entity p8c_attr")
+        );
+        assert_eq!(
+            p8c_run(&ctx, &format!("/attribute p8c_attr {attr} get")),
+            format!("Value of attribute {attr} for entity p8c_attr is 32")
+        );
+        assert_eq!(
+            p8c_run(
+                &ctx,
+                &format!("/attribute p8c_attr {attr} modifier add spine:scale 0.5 multiply_base")
+            ),
+            format!("Added modifier spine:scale to attribute {attr} for entity p8c_attr")
+        );
+        // (30 + 2) + (30 + 2) * 0.5 = 48.
+        assert_eq!(
+            p8c_run(&ctx, &format!("/attribute p8c_attr {attr} get")),
+            format!("Value of attribute {attr} for entity p8c_attr is 48")
+        );
+        // base get still reports the untouched base.
+        assert_eq!(
+            p8c_run(&ctx, &format!("/attribute p8c_attr {attr} base get")),
+            format!("Base value of attribute {attr} for entity p8c_attr is 30")
+        );
+        // modifier value get reports the stored amount, with an optional scale.
+        assert_eq!(
+            p8c_run(
+                &ctx,
+                &format!("/attribute p8c_attr {attr} modifier value get spine:boost")
+            ),
+            format!("Value of modifier spine:boost on attribute {attr} for entity p8c_attr is 2")
+        );
+        assert_eq!(
+            p8c_run(
+                &ctx,
+                &format!("/attribute p8c_attr {attr} modifier value get spine:scale 2")
+            ),
+            format!("Value of modifier spine:scale on attribute {attr} for entity p8c_attr is 1")
+        );
+        // remove unrolls one modifier at a time; a second remove errors.
+        assert_eq!(
+            p8c_run(
+                &ctx,
+                &format!("/attribute p8c_attr {attr} modifier remove spine:scale")
+            ),
+            format!("Removed modifier spine:scale from attribute {attr} for entity p8c_attr")
+        );
+        assert_eq!(
+            p8c_run(&ctx, &format!("/attribute p8c_attr {attr} get")),
+            format!("Value of attribute {attr} for entity p8c_attr is 32")
+        );
+        assert_eq!(
+            p8c_run(
+                &ctx,
+                &format!("/attribute p8c_attr {attr} modifier remove spine:scale")
+            ),
+            format!("Attribute {attr} on entity p8c_attr has no modifier spine:scale")
+        );
+        // Invalid modifier ids and values fail closed; get on a missing
+        // modifier errors too.
+        assert_eq!(
+            p8c_run(
+                &ctx,
+                &format!("/attribute p8c_attr {attr} modifier add BAD_ID 1 add")
+            ),
+            "Invalid modifier id 'BAD_ID'"
+        );
+        assert_eq!(
+            p8c_run(
+                &ctx,
+                &format!("/attribute p8c_attr {attr} modifier value get spine:nope")
+            ),
+            format!("Attribute {attr} on entity p8c_attr has no modifier spine:nope")
+        );
+        // The target is a single-entity argument, not a multi-selector.
+        assert_eq!(
+            p8c_run(&ctx, &format!("/attribute @e[type=!player] {attr} get")),
+            "Expected a single entity"
+        );
+        attr_modifiers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("p:p8c_attr");
+        attrs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("p:p8c_attr");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.eid != 98_300);
+    }
+
+    // #225 /tag verbs + /clear maxCount=0 — the already-live semantics stay
+    // pinned through the P8c handlers.
+    #[test]
+    fn p8c_parity_tag_and_clear_subcommands() {
+        let _world = world_guard();
+        let (player, _recv) = p8c_client(98_400, "p8c_tag", 0.5, 16.0, 0.5);
+        let stone = name_to_item("stone").unwrap();
+        player
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, (stone, 8, Vec::new()));
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
+        let ctx = p8c_ctx(None);
+        // tag add | list | remove on a live player target.
+        assert_eq!(p8c_run(&ctx, "/tag p8c_tag add p8c_mark"), "tagged 1 target(s)");
+        let listed = p8c_run(&ctx, "/tag p8c_tag list");
+        assert!(listed.contains("p8c_tag"), "{listed}");
+        assert!(listed.contains("p8c_mark"), "{listed}");
+        assert_eq!(
+            p8c_run(&ctx, "/tag p8c_tag remove p8c_mark"),
+            "untagged 1 target(s)"
+        );
+        assert_eq!(p8c_run(&ctx, "/tag p8c_tag"), "usage: /tag <target> add|remove|list [tag]");
+        // clear maxCount=0 counts without removing; a real clear removes.
+        assert_eq!(p8c_run(&ctx, "/clear p8c_tag stone 0"), "Cleared 8 item(s)");
+        assert_eq!(
+            player.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&0).map(|s| s.1),
+            Some(8),
+            "maxCount=0 must not remove items"
+        );
+        assert_eq!(p8c_run(&ctx, "/clear p8c_tag stone 3"), "Cleared 3 item(s)");
+        assert_eq!(
+            player.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&0).map(|s| s.1),
+            Some(5)
+        );
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.eid != 98_400);
+        tags().lock().unwrap_or_else(|e| e.into_inner()).remove("p:p8c_tag");
     }
 }
