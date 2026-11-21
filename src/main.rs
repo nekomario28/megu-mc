@@ -5027,8 +5027,6 @@ impl GeneratedFluidOwner {
         self.next_order += 1;
     }
     fn write(&mut self, pos: BlockPos, cell: flowing_fluid::Cell, now: i64) -> Result<(), String> {
-        let old = block_at(pos.0, pos.1, pos.2);
-        let old_fluid = fluid_from_block(old);
         let state = match cell {
             flowing_fluid::Cell::Air => 0,
             flowing_fluid::Cell::Fluid(f) => {
@@ -9711,6 +9709,7 @@ fn clear_chunk_caches_for_tests() {
     sky_floors_cache().lock().unwrap().map.clear();
     sky_floors_cache().lock().unwrap().order.clear();
     *live_light_cache().lock().unwrap() = LiveLightCache::default();
+    live_light_engines().lock().unwrap().clear();
     pending_light_edits().lock().unwrap().clear();
 }
 
@@ -10121,6 +10120,33 @@ fn pre_edit_light_chunk(
     blocks
 }
 
+/// Per-dimension live light engine, persisted across `apply_queued_light_updates`
+/// calls. Rebuilding it every call re-evaluated ~98k cells per neighbour chunk
+/// (`pre_edit_light_chunk`) plus a full-window `rebuild()` for a handful of
+/// single-block edits — ~57 ms/tick under load (TICKPROF `block_updates`). The
+/// engine is incremental (`edit_batch`/`relight_patch`; the
+/// `assert_matches_full_rebuild` test oracle pins incremental==rebuild), so
+/// keeping it across calls reduces the steady-state cost to the edits
+/// themselves. It is rebuilt from `neighbors` whenever a fresh build could
+/// disagree: the generator changed, a needed neighbour is missing (a missing
+/// chunk is a hard light boundary, not a correct-but-stale one), or the engine
+/// grew past the cap — extra chunks only add accurate propagation context, but
+/// bounding it keeps memory steady.
+struct LiveLightEngine {
+    generation: u64,
+    /// Chunks the engine was built with. `engine.chunks` is not publicly
+    /// inspectable, so coverage is tracked here.
+    chunks: HashSet<Chunk>,
+    engine: IncrementalLighting,
+}
+
+const LIVE_LIGHT_ENGINE_CAP: usize = 512;
+
+fn live_light_engines() -> &'static Mutex<HashMap<DimId, LiveLightEngine>> {
+    static ENGINES: OnceLock<Mutex<HashMap<DimId, LiveLightEngine>>> = OnceLock::new();
+    ENGINES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn apply_queued_light_updates() {
     if pending_light_edits().lock().unwrap().is_empty() {
         return;
@@ -10135,7 +10161,8 @@ fn apply_queued_light_updates() {
             .extend(client.chunks.lock().unwrap().iter().copied());
     }
     let Some(reg) = breg() else { return };
-    let (generation, work) = with_save_guard(|| {
+    let generation = current_gen_seq();
+    let work = with_save_guard(|| {
         let mut work = Vec::new();
         let edits = std::mem::take(&mut *pending_light_edits().lock().unwrap());
         let mut props = HashMap::new();
@@ -10169,28 +10196,60 @@ fn apply_queued_light_updates() {
                 .filter(|chunk| light_halo([*chunk]).all(|neighbor| neighbors.contains(&neighbor)))
                 .map(|(cx, cz)| ((cx, cz), chunk_versions_3x3(dim, cx, cz)))
                 .collect();
-            let terrain: Vec<_> = neighbors
-                .into_iter()
-                .map(|chunk| {
-                    (
-                        chunk,
-                        pre_edit_light_chunk(dim, chunk, reg, &mut props, &old),
-                    )
-                })
-                .collect();
-            work.push((dim, targets, snapshots, terrain, new));
+            // Reuse the persisted engine when it covers every chunk a fresh
+            // build would visit; otherwise rebuild it from exactly `neighbors`,
+            // as before. A chunk's LightBlock array changes only through
+            // `note_light_edit`, and each such change arrives in `edits`, so a
+            // covered engine is still current.
+            let covered = live_light_engines()
+                .lock()
+                .unwrap()
+                .get(&dim)
+                .is_some_and(|entry| {
+                    entry.generation == generation
+                        && entry.chunks.len() <= LIVE_LIGHT_ENGINE_CAP
+                        && neighbors.iter().all(|chunk| entry.chunks.contains(chunk))
+                });
+            let terrain = (!covered).then(|| {
+                neighbors
+                    .iter()
+                    .copied()
+                    .map(|chunk| {
+                        (
+                            chunk,
+                            pre_edit_light_chunk(dim, chunk, reg, &mut props, &old),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            work.push((dim, targets, snapshots, neighbors, terrain, new));
         }
-        (current_gen_seq(), work)
+        work
     });
 
-    for (dim, targets, snapshots, terrain, new) in work {
-        let mut engine = IncrementalLighting::from_chunks(
-            dim.min_y(),
-            dim.height(),
-            worldgen::has_skylight(dim),
-            terrain,
-        );
-        let updates = engine.edit_batch(new, targets);
+    let mut engines = live_light_engines().lock().unwrap();
+    for (dim, targets, snapshots, neighbors, terrain, new) in work {
+        let entry = engines.entry(dim).or_insert_with(|| LiveLightEngine {
+            generation,
+            chunks: HashSet::new(),
+            engine: IncrementalLighting::from_chunks(
+                dim.min_y(),
+                dim.height(),
+                worldgen::has_skylight(dim),
+                Vec::new(),
+            ),
+        });
+        if let Some(terrain) = terrain {
+            entry.engine = IncrementalLighting::from_chunks(
+                dim.min_y(),
+                dim.height(),
+                worldgen::has_skylight(dim),
+                terrain,
+            );
+            entry.chunks = neighbors;
+            entry.generation = generation;
+        }
+        let updates = entry.engine.edit_batch(new, targets);
         {
             let mut cache = live_light_cache().lock().unwrap();
             if cache.generation != generation {
@@ -10209,8 +10268,8 @@ fn apply_queued_light_updates() {
                 let light = SettledLiveLight {
                     versions,
                     revision: versions.into_iter().max().unwrap_or(0),
-                    sky: engine.sections(chunk, LightKind::Sky),
-                    block: engine.sections(chunk, LightKind::Block),
+                    sky: entry.engine.sections(chunk, LightKind::Sky),
+                    block: entry.engine.sections(chunk, LightKind::Block),
                 };
                 if cache.chunks.insert(key, Arc::new(light)).is_none() {
                     cache.order.push_back(key);

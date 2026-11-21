@@ -174,3 +174,49 @@ parity/distribution tests. `tools/layers_check.sh`, `tools/debt_ratchet.sh`,
 `tools/provenance_check.py` and `git diff --check` all passed. These checks
 validate the sampled scenarios and contracts; the live WARM=1 CPU budget and
 equal-work Vanilla comparison still require measurement.
+
+## P1-3 follow-up: persistent live light engine (2026-11-21)
+
+Instrumented WARM=1 profiling (`MC_SPINE_TICK_PROFILE=1 MC_SPINE_LOCKPROFILE=1
+MC_SPINE_CHUNK_PROFILE=1`, seed 0, view 4, 8 gen workers) located the live CPU
+gap. It was not a busy-spin: the idle tick body measured 0.025 ms. During the
+moving-viewer window `apply_queued_light_updates` dominated the tick at
+~57–63 ms/tick (`block_updates`), of which ~52–56 ms was
+`pre_edit_light_chunk`: each call rebuilt a fresh `IncrementalLighting` engine
+by re-evaluating ~98k cells for every neighbour chunk (mostly
+`worldgen::terrain_section_dim` on section-store misses) plus a full-window
+`rebuild()`, for ~3 single-block light edits per tick. Generation-lock
+acquisitions reached ~3.5M per 100 ticks.
+
+`src/main.rs` now keeps one `IncrementalLighting` per dimension across calls
+(`LiveLightEngine`), feeding the same pending edits to `edit_batch` — the
+incremental path the engine's own `assert_matches_full_rebuild` test oracle
+equates with a rebuild. The engine is rebuilt from exactly `neighbors` when a
+fresh build could disagree (generator generation change, a needed neighbour
+missing, or the engine exceeding a 512-chunk bound). A chunk's LightBlock array
+changes only via `note_light_edit`, and every such change arrives in the edit
+queue, so a covered engine stays current without a version key.
+
+| Window | Server CPU |
+|---|---:|
+| Before (this tree, same drive) | 16.670 s |
+| After: LoadA window | 5.110 s |
+| After: second warm window | 3.290 s |
+| Documented pre-change median | 16.82 s |
+| Vanilla reference | 4.23 s |
+
+Post-change profile: `block_updates` 0.103 ms/tick (was ~57–63 ms), tick body
+~1.2–2.1 ms (LOOPPROF body 1.231 ms, sleep ~48.8 ms), GENLOCK acquisitions
+~105–165k per 100 ticks (was ~3.5M). The remaining window CPU is genuine work:
+datapack worldgen on eight workers and per-chunk map/light packet builds.
+
+Caveats: the after samples are sequential runs on one server under host
+contention, not the interleaved binary A/B used for the earlier table; the two
+drives are equivalent shape but not byte-identical runs. The Vanilla figure is
+the previously recorded reference, not re-measured here.
+
+Validation: `cargo check --offline --locked -j 1 --all-targets` zero warnings;
+`cargo test --offline --locked -j 1 -- flowing_fluid --test-threads=1` 9/9;
+all `light`-filtered tests pass (55+4 across binaries);
+`tools/layers_check.sh`, `tools/debt_ratchet.sh`,
+`tools/provenance_check.py`, `git diff --check` pass.
