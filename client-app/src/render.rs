@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use mc_spine_client_mesh::ffi::PackedVertex;
 use mc_spine_client_mesh::{
-    box_facing_mask, bucket_draw_mask, GraphCuller, RenderRegions, SectionCoord, DIRECTION_BUCKETS,
-    DIRECTION_BUCKET_UNASSIGNED,
+    box_facing_mask, bucket_draw_mask, GraphCuller, RenderBackendPreference, RenderRegions,
+    SectionCoord, DIRECTION_BUCKETS, DIRECTION_BUCKET_UNASSIGNED,
 };
 
 use crate::protocol::zlib_compress_stored;
@@ -64,6 +64,10 @@ pub struct RenderConfig {
     pub vsync: bool,
     /// Frame pacing cap for windowed presentation (`None` = uncapped).
     pub max_fps: Option<u32>,
+    /// GPU pipeline selection forwarded to the hardware backend;
+    /// `classic-low-spec` pins the minimal-hardware path for legacy Intel
+    /// integrated GPUs (GL 3.3 / Vulkan 1.1 only).
+    pub gpu_backend: RenderBackendPreference,
 }
 
 impl RenderConfig {
@@ -79,6 +83,7 @@ impl RenderConfig {
             entity_shadows: settings.entity_shadows,
             vsync: settings.vsync,
             max_fps: settings.max_fps,
+            gpu_backend: settings.gpu_backend,
         }
     }
 }
@@ -95,6 +100,7 @@ impl Default for RenderConfig {
             entity_shadows: true,
             vsync: true,
             max_fps: None,
+            gpu_backend: RenderBackendPreference::Auto,
         }
     }
 }
@@ -1191,6 +1197,7 @@ mod tests {
         let mut settings = ClientSettings::from_preset(QualityPreset::Fast);
         settings.fov = 100;
         settings.clouds = CloudMode::Off;
+        settings.gpu_backend = RenderBackendPreference::ClassicLowSpec;
         let config = RenderConfig::from_settings(&settings);
         assert_eq!(config.fov_deg, 100.0);
         assert!(!config.smooth_lighting);
@@ -1198,6 +1205,7 @@ mod tests {
         assert_eq!(config.clouds, CloudMode::Off);
         assert_eq!(config.particles, ParticleLevel::Decreased);
         assert!(!config.entity_shadows);
+        assert_eq!(config.gpu_backend, RenderBackendPreference::ClassicLowSpec);
         // Fast leaves vsync/max_fps at the shared defaults.
         assert!(config.vsync);
         assert_eq!(config.max_fps, None);

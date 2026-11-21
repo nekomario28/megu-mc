@@ -23,13 +23,15 @@ pub use cache::{MeshCache, SectionCoord, DEFAULT_RESORT_THRESHOLD};
 pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
 pub use culler::{through_bit, CullResult, GraphCuller, SectionGraph, THROUGH_ALL};
 pub use gpu_pipeline::{
-    cull_meshlets_cpu_reference, pack_axis_flags, pack_section_meshlets, resolve_render_backend,
-    ActiveRenderBackend, BackendResolution, DrawIndexedIndirectCommand, GpuCapabilities, GpuVendor,
-    KineticFrameUpload, KineticInstanceGpu, KineticInstancePool, MeshKindTemplate,
-    MeshletDescriptor, RenderBackendPreference, SectionMeshlets, SubWorldTransformGpu,
-    KINETIC_AXIS_MASK, KINETIC_FLAG_OVERSTRESSED, KINETIC_FLAG_REVERSED, KINETIC_SUBWORLD_MAX,
-    KINETIC_SUBWORLD_SHIFT, MAX_QUADS_PER_MESHLET, REQUIRED_MESH_OUTPUT_PRIMITIVES,
-    REQUIRED_MESH_OUTPUT_VERTICES,
+    cull_meshlets_cpu_reference, pack_axis_flags, pack_section_meshlets,
+    recommend_low_spec_budget, resolve_render_backend, ActiveRenderBackend, BackendResolution,
+    DrawIndexedIndirectCommand, GpuCapabilities, GpuMemoryProfile, GpuVendor, KineticFrameUpload,
+    KineticInstanceGpu, KineticInstancePool, KineticUboBatch, LowSpecRenderBudget,
+    MeshKindTemplate, MeshletDescriptor, RenderBackendPreference, SectionMeshlets,
+    SubWorldTransformGpu, KINETIC_AXIS_MASK, KINETIC_FLAG_OVERSTRESSED, KINETIC_FLAG_REVERSED,
+    KINETIC_INSTANCE_GPU_BYTES, KINETIC_SUBWORLD_MAX, KINETIC_SUBWORLD_SHIFT,
+    LOW_SPEC_VRAM_CEILING_MIB, MAX_INSTANCES_PER_UBO_16KB, MAX_QUADS_PER_MESHLET,
+    MIN_GUARANTEED_UBO_BYTES, REQUIRED_MESH_OUTPUT_PRIMITIVES, REQUIRED_MESH_OUTPUT_VERTICES,
 };
 pub use lod::{summarize_column, LodCell, LodSummary, LOD_COARSE, LOD_FINE};
 pub use mesh::{

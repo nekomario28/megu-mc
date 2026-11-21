@@ -559,3 +559,315 @@ fn all_faces_mask_never_direction_culls_unassigned_meshlets() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Lane G3: ClassicLowSpec backend, memory profiles & UBO kinetic batching
+// ---------------------------------------------------------------------------
+
+#[test]
+fn classic_low_spec_is_honored_on_every_profile() {
+    for caps in [
+        GpuCapabilities::intel_hd_legacy(),
+        GpuCapabilities::intel_uhd_630(),
+        GpuCapabilities::intel_iris_xe(),
+        GpuCapabilities::nvidia_rtx(),
+        GpuCapabilities::amd_rdna2(),
+        GpuCapabilities::apple_silicon(),
+        GpuCapabilities::software(),
+    ] {
+        let resolution =
+            resolve_render_backend(RenderBackendPreference::ClassicLowSpec, &caps);
+        assert_eq!(
+            resolution.backend,
+            ActiveRenderBackend::ClassicLowSpec,
+            "{caps:?}"
+        );
+        assert_eq!(resolution.fallback_reason, None, "{caps:?}");
+    }
+}
+
+#[test]
+fn legacy_intel_profiles_have_the_minimal_feature_floor() {
+    for caps in [GpuCapabilities::intel_hd_legacy(), GpuCapabilities::intel_uhd_630()] {
+        assert_eq!(caps.vendor, GpuVendor::Intel);
+        assert!(!caps.supports_ext_mesh_shader);
+        assert!(!caps.supports_multi_draw_indirect_count);
+        assert!(!caps.supports_compute_shaders);
+        assert!(!caps.mesh_shader_adequate());
+        assert!(!caps.compute_indirect_adequate());
+        // Auto negotiates down to Classic; ClassicLowSpec is opt-in only so
+        // a featureless device never loses the plain-Classic escape hatch.
+        let auto = resolve_render_backend(RenderBackendPreference::Auto, &caps);
+        assert_eq!(auto.backend, ActiveRenderBackend::Classic);
+        assert!(auto.fallback_reason.is_some());
+        // Explicit GPU-path requests still degrade cleanly, never panic.
+        for pref in [
+            RenderBackendPreference::MeshShader,
+            RenderBackendPreference::ComputeIndirect,
+        ] {
+            let resolution = resolve_render_backend(pref, &caps);
+            assert_eq!(resolution.backend, ActiveRenderBackend::Classic, "{pref:?}");
+            assert!(resolution.fallback_reason.is_some());
+        }
+    }
+    // Iris Xe keeps a full mesh-shader budget unlike the legacy parts.
+    let xe = GpuCapabilities::intel_iris_xe();
+    assert!(xe.mesh_shader_adequate());
+    assert_eq!(
+        resolve_render_backend(RenderBackendPreference::Auto, &xe).backend,
+        ActiveRenderBackend::MeshShader
+    );
+}
+
+#[test]
+fn backend_preference_tokens_roundtrip_and_fail_closed() {
+    for pref in [
+        RenderBackendPreference::Auto,
+        RenderBackendPreference::MeshShader,
+        RenderBackendPreference::ComputeIndirect,
+        RenderBackendPreference::Classic,
+        RenderBackendPreference::ClassicLowSpec,
+    ] {
+        assert_eq!(RenderBackendPreference::parse(pref.as_str()), Some(pref));
+    }
+    // Case-insensitive and `_`-tolerant so TOML files hand-edited with
+    // underscores still resolve.
+    assert_eq!(
+        RenderBackendPreference::parse("Classic_Low_Spec"),
+        Some(RenderBackendPreference::ClassicLowSpec)
+    );
+    assert_eq!(
+        RenderBackendPreference::parse("MESH-SHADER"),
+        Some(RenderBackendPreference::MeshShader)
+    );
+    for bad in ["", "vulkan", "low-spec", "classiclowspec", "gpu", "none"] {
+        assert_eq!(RenderBackendPreference::parse(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn ubo_batch_size_fits_the_guaranteed_16kib_limit() {
+    assert_eq!(KINETIC_INSTANCE_GPU_BYTES, 48);
+    assert_eq!(MAX_INSTANCES_PER_UBO_16KB, 256);
+    assert!(
+        MAX_INSTANCES_PER_UBO_16KB * KINETIC_INSTANCE_GPU_BYTES as usize
+            <= MIN_GUARANTEED_UBO_BYTES as usize
+    );
+    assert_eq!(
+        256 * 48,
+        12_288,
+        "256 x 48 B records = 12,288 B <= 16,384 B UBO floor"
+    );
+
+    // The 16 KiB floor every profile constructor reports yields 256.
+    assert_eq!(
+        GpuMemoryProfile::integrated_shared(512).max_instances_per_ubo(),
+        256
+    );
+    assert_eq!(GpuMemoryProfile::dedicated(8192).max_instances_per_ubo(), 256);
+    // Smaller reported UBO limits shrink the batch; larger ones still cap
+    // at 256.
+    let mut mem = GpuMemoryProfile::dedicated(1024);
+    mem.max_ubo_bytes = 8 * 1024;
+    assert_eq!(mem.max_instances_per_ubo(), 8 * 1024 / 48);
+    mem.max_ubo_bytes = 64 * 1024;
+    assert_eq!(mem.max_instances_per_ubo(), 256);
+}
+
+fn pool_with_shafts(count: u64) -> KineticInstancePool {
+    let mut pool = KineticInstancePool::new();
+    pool.set_mesh_template(0, 36, 0, 0); // shaft: 12 tris
+    for id in 0..count {
+        pool.upsert(id, 0, kinetic_instance(id, 0));
+    }
+    pool
+}
+
+#[test]
+fn ubo_batches_split_600_shafts_into_256_256_88() {
+    let pool = pool_with_shafts(600);
+    let batches = pool.build_ubo_batches(MAX_INSTANCES_PER_UBO_16KB);
+    assert_eq!(batches.len(), 3);
+    assert_eq!(
+        batches
+            .iter()
+            .map(|b| b.instances.len())
+            .collect::<Vec<_>>(),
+        vec![256, 256, 88]
+    );
+
+    // Exact conservation and ordered, gapless coverage of the packed stream.
+    let conserved: usize = batches.iter().map(|b| b.instances.len()).sum();
+    assert_eq!(conserved, pool.len());
+    let mut first_instance = 0u32;
+    for batch in &batches {
+        assert_eq!(batch.mesh_kind, 0);
+        assert_eq!(batch.index_count, 36);
+        assert_eq!(batch.first_index, 0);
+        assert_eq!(batch.vertex_offset, 0);
+        assert_eq!(batch.first_instance, first_instance);
+        assert!(batch.instances.iter().all(|r| r.mesh_kind == 0));
+        assert!(batch
+            .instances
+            .windows(2)
+            .all(|w| w[0].pos[0] < w[1].pos[0]));
+        first_instance += batch.instances.len() as u32;
+    }
+    // Instance ids are still strictly ascending across batch boundaries.
+    let ids: Vec<u64> = batches
+        .iter()
+        .flat_map(|b| b.instances.iter().map(|r| r.pos[0] as u64))
+        .collect();
+    assert_eq!(ids, (0..600).collect::<Vec<_>>());
+}
+
+#[test]
+fn ubo_batches_match_the_indirect_stream_byte_for_byte() {
+    let mut pool = KineticInstancePool::new();
+    pool.set_mesh_template(0, 36, 0, 0);
+    pool.set_mesh_template(1, 360, 36, 16);
+    pool.set_mesh_template(2, 1200, 396, 160);
+    for id in 0..900u64 {
+        let mesh_kind = (id % 3) as u32;
+        pool.upsert(id, mesh_kind, kinetic_instance(id, mesh_kind));
+    }
+
+    let indirect = pool.build_indirect_batches();
+    let batches = pool.build_ubo_batches(MAX_INSTANCES_PER_UBO_16KB);
+    // 300 instances per kind -> 256 + 44 per kind, kinds ascending.
+    assert_eq!(batches.len(), 6);
+    assert_eq!(batches[0].mesh_kind, 0);
+    assert_eq!(batches[2].mesh_kind, 1);
+    assert_eq!(batches[4].mesh_kind, 2);
+    assert_eq!(batches[1].instances.len(), 44);
+
+    let ubo_stream: Vec<KineticInstanceGpu> = batches
+        .iter()
+        .flat_map(|b| b.instances.iter().copied())
+        .collect();
+    assert_eq!(
+        instance_bytes(&ubo_stream),
+        instance_bytes(&indirect.instances),
+        "UBO batches must conserve the exact indirect instance bytes"
+    );
+    // Every batch carries its kind's template geometry run.
+    for batch in &batches {
+        let template = pool.mesh_template(batch.mesh_kind).unwrap();
+        assert_eq!(batch.index_count, template.index_count);
+        assert_eq!(batch.first_index, template.first_index);
+        assert_eq!(batch.vertex_offset, template.vertex_offset);
+    }
+
+    // Byte-identical determinism across repeated and fresh builds.
+    let again = pool.build_ubo_batches(MAX_INSTANCES_PER_UBO_16KB);
+    assert_eq!(batches, again);
+    let mut clone = KineticInstancePool::new();
+    clone.set_mesh_template(0, 36, 0, 0);
+    clone.set_mesh_template(1, 360, 36, 16);
+    clone.set_mesh_template(2, 1200, 396, 160);
+    for id in 0..900u64 {
+        let mesh_kind = (id % 3) as u32;
+        clone.upsert(id, mesh_kind, kinetic_instance(id, mesh_kind));
+    }
+    let rebuilt = clone.build_ubo_batches(MAX_INSTANCES_PER_UBO_16KB);
+    assert_eq!(batches, rebuilt);
+}
+
+#[test]
+fn ubo_batches_skip_untemplated_kinds_and_clamp_zero_budget() {
+    let mut pool = KineticInstancePool::new();
+    pool.set_mesh_template(1, 360, 36, 16);
+    pool.upsert(1, 1, kinetic_instance(1, 1));
+    pool.upsert(2, 9, kinetic_instance(2, 9)); // kind 9 has no template
+    pool.upsert(3, 1, kinetic_instance(3, 1));
+
+    let batches = pool.build_ubo_batches(MAX_INSTANCES_PER_UBO_16KB);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].instances.len(), 2);
+    assert!(batches[0].instances.iter().all(|r| r.mesh_kind == 1));
+
+    // A zero budget is clamped to one instance per UBO, never a panic or
+    // an infinite split.
+    let singletons = pool.build_ubo_batches(0);
+    assert_eq!(singletons.len(), 2);
+    assert!(singletons.iter().all(|b| b.instances.len() == 1));
+
+    // A budget larger than the run still emits one batch per kind.
+    assert_eq!(pool.build_ubo_batches(usize::MAX).len(), 1);
+
+    // Empty pool -> no batches, matching the empty indirect upload.
+    assert!(KineticInstancePool::new()
+        .build_ubo_batches(MAX_INSTANCES_PER_UBO_16KB)
+        .is_empty());
+}
+
+#[test]
+fn low_spec_budget_tightens_for_shared_ram_intel() {
+    // Intel UHD 630 reporting shared RAM: the low-spec budget caps dirty
+    // rebuilds at 2/frame, keeps a short full-detail ring inside 6..=8,
+    // pairs it with a far horizon LOD, and requests UBO kinetic batches.
+    let budget = recommend_low_spec_budget(
+        &GpuMemoryProfile::integrated_shared(512),
+        ActiveRenderBackend::ClassicLowSpec,
+    );
+    assert_eq!(budget.max_dirty_rebuilds_per_frame, 2);
+    assert!((6..=8).contains(&budget.recommended_full_detail_chunks));
+    assert!(budget.recommended_lod_chunks >= 24);
+    assert!(budget.use_ubo_kinetic_batches);
+    assert_eq!(budget.max_mesh_cache_mib, 32);
+
+    // Shared RAM is low-spec even at larger reported sizes; the
+    // full-detail ring scales with reported memory inside 6..=8.
+    let budget = recommend_low_spec_budget(
+        &GpuMemoryProfile::integrated_shared(0),
+        ActiveRenderBackend::Classic,
+    );
+    assert_eq!(budget.recommended_full_detail_chunks, 6);
+    assert_eq!(budget.max_dirty_rebuilds_per_frame, 2);
+    let budget = recommend_low_spec_budget(
+        &GpuMemoryProfile::integrated_shared(2048),
+        ActiveRenderBackend::ComputeIndirect,
+    );
+    assert_eq!(budget.recommended_full_detail_chunks, 8);
+    assert!(budget.use_ubo_kinetic_batches);
+
+    // A dedicated <=512 MiB card is low-spec without the shared-RAM flag.
+    let budget = recommend_low_spec_budget(
+        &GpuMemoryProfile::dedicated(512),
+        ActiveRenderBackend::Classic,
+    );
+    assert_eq!(budget.max_dirty_rebuilds_per_frame, 2);
+    assert_eq!(budget.recommended_full_detail_chunks, 8);
+    assert_eq!(budget.max_mesh_cache_mib, 64);
+    assert!(budget.use_ubo_kinetic_batches);
+
+    // An explicit ClassicLowSpec choice always yields the low-spec budget,
+    // even on a card that would not qualify on memory alone.
+    let budget = recommend_low_spec_budget(
+        &GpuMemoryProfile::dedicated(8192),
+        ActiveRenderBackend::ClassicLowSpec,
+    );
+    assert_eq!(budget.max_dirty_rebuilds_per_frame, 2);
+    assert!(budget.use_ubo_kinetic_batches);
+}
+
+#[test]
+fn low_spec_budget_stays_generous_on_dedicated_gpus() {
+    let budget = recommend_low_spec_budget(
+        &GpuMemoryProfile::dedicated(8192),
+        ActiveRenderBackend::MeshShader,
+    );
+    assert_eq!(budget.max_dirty_rebuilds_per_frame, u32::MAX);
+    assert_eq!(budget.max_mesh_cache_mib, 1024);
+    assert_eq!(budget.recommended_full_detail_chunks, 12);
+    assert_eq!(budget.recommended_lod_chunks, 64);
+    assert!(!budget.use_ubo_kinetic_batches);
+
+    // Mesh-cache budget scales with reported VRAM inside 128..=1024 MiB.
+    let budget = recommend_low_spec_budget(
+        &GpuMemoryProfile::dedicated(1024),
+        ActiveRenderBackend::ComputeIndirect,
+    );
+    assert_eq!(budget.max_mesh_cache_mib, 256);
+    assert!(!budget.use_ubo_kinetic_batches);
+}

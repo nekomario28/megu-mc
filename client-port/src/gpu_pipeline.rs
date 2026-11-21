@@ -7,8 +7,10 @@
 //!
 //! * [`resolve_render_backend`] picks [`ActiveRenderBackend::MeshShader`]
 //!   (`VK_EXT_mesh_shader`), [`ActiveRenderBackend::ComputeIndirect`] (compute
-//!   cull + `vkCmdDrawIndexedIndirectCount`) or [`ActiveRenderBackend::Classic`]
-//!   from reported device capabilities under an [`RenderBackendPreference`].
+//!   cull + `vkCmdDrawIndexedIndirectCount`), [`ActiveRenderBackend::Classic`]
+//!   or [`ActiveRenderBackend::ClassicLowSpec`] (OpenGL 3.3 / Vulkan 1.1
+//!   minimal-hardware path for legacy Intel iGPUs) from reported device
+//!   capabilities under an [`RenderBackendPreference`].
 //! * [`pack_section_meshlets`] folds a meshed section's quads into
 //!   direction-pure runs of at most [`MAX_QUADS_PER_MESHLET`] quads described
 //!   by [`MeshletDescriptor`], the work unit a mesh/task shader workgroup
@@ -52,6 +54,39 @@ pub enum RenderBackendPreference {
     ComputeIndirect = 2,
     /// Plain vertex pipeline with per-section draws; always available.
     Classic = 3,
+    /// Minimal-hardware vertex pipeline for legacy Intel integrated GPUs
+    /// (Intel HD 4000-630, UHD 620-630, Gen7-Gen11): assumes only
+    /// OpenGL 3.3 / Vulkan 1.1 core — no `VK_EXT_mesh_shader`, no
+    /// `vkCmdDrawIndexedIndirectCount`, no compute shaders, no SSBO.
+    /// Kinetic instances upload through 16 KiB-safe UBO batches instead
+    /// (see [`KineticInstancePool::build_ubo_batches`]). Always available.
+    ClassicLowSpec = 4,
+}
+
+impl RenderBackendPreference {
+    /// Lowercase TOML/CLI token for this preference.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::MeshShader => "mesh-shader",
+            Self::ComputeIndirect => "compute-indirect",
+            Self::Classic => "classic",
+            Self::ClassicLowSpec => "classic-low-spec",
+        }
+    }
+
+    /// Parse a TOML/CLI token (case-insensitive, `-`/`_` interchangeable);
+    /// `None` when the value names no backend, so callers fail closed.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().replace('_', "-").as_str() {
+            "auto" => Some(Self::Auto),
+            "mesh-shader" => Some(Self::MeshShader),
+            "compute-indirect" => Some(Self::ComputeIndirect),
+            "classic" => Some(Self::Classic),
+            "classic-low-spec" => Some(Self::ClassicLowSpec),
+            _ => None,
+        }
+    }
 }
 
 /// GPU vendor id as reported by `VkPhysicalDeviceProperties::vendorID`, kept
@@ -98,6 +133,94 @@ impl GpuCapabilities {
     pub fn compute_indirect_adequate(&self) -> bool {
         self.supports_compute_shaders && self.supports_multi_draw_indirect_count
     }
+
+    /// Legacy Intel integrated profile (HD 4000-630, UHD 620-630,
+    /// Gen7-Gen11): the minimal OpenGL 3.3 / Vulkan 1.1 feature floor —
+    /// no mesh shader, no indirect count, no compute, no SSBO.
+    /// [`RenderBackendPreference::ClassicLowSpec`] is built for exactly
+    /// this shape.
+    pub fn intel_hd_legacy() -> Self {
+        Self {
+            vendor: GpuVendor::Intel,
+            ..Self::minimal()
+        }
+    }
+
+    /// Intel UHD 620/630 integrated profile: shares the legacy minimal
+    /// feature floor; pair with a shared-RAM [`GpuMemoryProfile`].
+    pub fn intel_uhd_630() -> Self {
+        Self::intel_hd_legacy()
+    }
+
+    /// Intel Iris Xe (Gen12) integrated profile: mesh-shader capable with
+    /// a full output budget, like discrete Arc.
+    pub fn intel_iris_xe() -> Self {
+        Self {
+            vendor: GpuVendor::Intel,
+            ..Self::full_gpu()
+        }
+    }
+
+    /// Discrete NVIDIA profile (RTX 20+): full mesh-shader output budget.
+    pub fn nvidia_rtx() -> Self {
+        Self {
+            vendor: GpuVendor::Nvidia,
+            ..Self::full_gpu()
+        }
+    }
+
+    /// Discrete AMD profile (RDNA2+): mesh shader with the 256-primitive
+    /// budget RDNA ships.
+    pub fn amd_rdna2() -> Self {
+        Self {
+            vendor: GpuVendor::Amd,
+            supports_ext_mesh_shader: true,
+            max_mesh_output_vertices: 256,
+            max_mesh_output_primitives: 256,
+            supports_multi_draw_indirect_count: true,
+            supports_compute_shaders: true,
+        }
+    }
+
+    /// Apple silicon through Metal/MoltenVK: no `VK_EXT_mesh_shader`, but
+    /// compute and `vkCmdDrawIndexedIndirectCount` are available.
+    pub fn apple_silicon() -> Self {
+        Self {
+            vendor: GpuVendor::Apple,
+            supports_multi_draw_indirect_count: true,
+            supports_compute_shaders: true,
+            ..Self::minimal()
+        }
+    }
+
+    /// Software rasterizer profile: no GPU culling features at all.
+    pub fn software() -> Self {
+        Self::minimal()
+    }
+
+    /// Every feature flag clear: the floor legacy Intel iGPUs sit on.
+    fn minimal() -> Self {
+        Self {
+            vendor: GpuVendor::Other,
+            supports_ext_mesh_shader: false,
+            max_mesh_output_vertices: 0,
+            max_mesh_output_primitives: 0,
+            supports_multi_draw_indirect_count: false,
+            supports_compute_shaders: false,
+        }
+    }
+
+    /// Mesh-shader-class discrete feature set with a full output budget.
+    fn full_gpu() -> Self {
+        Self {
+            vendor: GpuVendor::Other,
+            supports_ext_mesh_shader: true,
+            max_mesh_output_vertices: 256,
+            max_mesh_output_primitives: 512,
+            supports_multi_draw_indirect_count: true,
+            supports_compute_shaders: true,
+        }
+    }
 }
 
 /// The backend a frame actually submits with.
@@ -110,6 +233,24 @@ pub enum ActiveRenderBackend {
     ComputeIndirect = 1,
     /// Baseline vertex pipeline, per-section multidraw on the CPU side.
     Classic = 2,
+    /// Minimal-hardware vertex pipeline for legacy Intel iGPUs: per-section
+    /// multidraw like [`Self::Classic`], but kinetic contraptions upload
+    /// through [`MAX_INSTANCES_PER_UBO_16KB`]-instance UBO batches instead
+    /// of an SSBO, and [`recommend_low_spec_budget`] tightens mesh-cache
+    /// and rebuild budgets for shared-RAM / low-VRAM devices.
+    ClassicLowSpec = 3,
+}
+
+impl ActiveRenderBackend {
+    /// Lowercase diagnostic token for this backend.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MeshShader => "mesh-shader",
+            Self::ComputeIndirect => "compute-indirect",
+            Self::Classic => "classic",
+            Self::ClassicLowSpec => "classic-low-spec",
+        }
+    }
 }
 
 /// Outcome of [`resolve_render_backend`]: the selected pipeline plus a
@@ -200,6 +341,127 @@ pub fn resolve_render_backend(
             }
         }
         RenderBackendPreference::Classic => resolution(ActiveRenderBackend::Classic),
+        // Needs nothing beyond a GL 3.3 / Vulkan 1.1 core context, so it is
+        // honored on every device including the legacy Intel iGPUs it was
+        // designed for.
+        RenderBackendPreference::ClassicLowSpec => {
+            resolution(ActiveRenderBackend::ClassicLowSpec)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory-aware low-spec render budgets
+// ---------------------------------------------------------------------------
+
+/// Uniform-buffer size every OpenGL 3.3 (`GL_MAX_UNIFORM_BLOCK_SIZE`) and
+/// Vulkan 1.1 (`maxUniformBufferRange`) implementation must expose: 16 KiB.
+/// [`MAX_INSTANCES_PER_UBO_16KB`] is sized so one UBO batch always fits.
+pub const MIN_GUARANTEED_UBO_BYTES: u32 = 16 * 1024;
+/// Instances per 16 KiB-safe kinetic UBO batch: `256 * 48 B = 12,288 B`,
+/// comfortably inside [`MIN_GUARANTEED_UBO_BYTES`] on every Intel HD 4000+.
+pub const MAX_INSTANCES_PER_UBO_16KB: usize = 256;
+/// Bytes per [`KineticInstanceGpu`] instance record.
+pub const KINETIC_INSTANCE_GPU_BYTES: u32 = std::mem::size_of::<KineticInstanceGpu>() as u32;
+/// Dedicated-VRAM ceiling (MiB) at or below which a device counts as
+/// low-spec; any shared-system-RAM device is low-spec regardless.
+pub const LOW_SPEC_VRAM_CEILING_MIB: u32 = 512;
+
+/// Reported memory environment for [`recommend_low_spec_budget`].
+/// `shared_system_ram` marks integrated GPUs whose "VRAM" is carved out of
+/// system memory (every Intel HD/UHD iGPU); `max_ubo_bytes` is the device's
+/// uniform-buffer limit — use [`MIN_GUARANTEED_UBO_BYTES`] when unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuMemoryProfile {
+    /// Device-local video memory in MiB (`0` = none / unknown).
+    pub vram_mib: u32,
+    /// Whether the GPU shares system RAM instead of owning dedicated VRAM.
+    pub shared_system_ram: bool,
+    /// `GL_MAX_UNIFORM_BLOCK_SIZE` / `maxUniformBufferRange` in bytes.
+    pub max_ubo_bytes: u32,
+}
+
+impl GpuMemoryProfile {
+    /// Discrete GPU with dedicated VRAM and the guaranteed 16 KiB UBO floor.
+    pub fn dedicated(vram_mib: u32) -> Self {
+        Self {
+            vram_mib,
+            shared_system_ram: false,
+            max_ubo_bytes: MIN_GUARANTEED_UBO_BYTES,
+        }
+    }
+
+    /// Integrated GPU sharing system RAM (all Intel HD/UHD iGPUs).
+    pub fn integrated_shared(vram_mib: u32) -> Self {
+        Self {
+            vram_mib,
+            shared_system_ram: true,
+            max_ubo_bytes: MIN_GUARANTEED_UBO_BYTES,
+        }
+    }
+
+    /// Largest safe instance count for
+    /// [`KineticInstancePool::build_ubo_batches`]: how many 48-byte records
+    /// fit `max_ubo_bytes`, capped at [`MAX_INSTANCES_PER_UBO_16KB`].
+    pub fn max_instances_per_ubo(&self) -> usize {
+        ((self.max_ubo_bytes / KINETIC_INSTANCE_GPU_BYTES) as usize)
+            .min(MAX_INSTANCES_PER_UBO_16KB)
+    }
+}
+
+/// Render budgets [`recommend_low_spec_budget`] derives for a device: how
+/// much mesh cache it may hold, how many dirty sections may rebuild per
+/// frame, and the chunk radii the renderer should aim at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LowSpecRenderBudget {
+    /// Mesh-cache budget in MiB (`u32::MAX` = unbounded).
+    pub max_mesh_cache_mib: u32,
+    /// Dirty-section rebuilds allowed per frame (`u32::MAX` = uncapped).
+    pub max_dirty_rebuilds_per_frame: u32,
+    /// Full-detail chunk radius to target (the short near ring on
+    /// low-spec hardware).
+    pub recommended_full_detail_chunks: u32,
+    /// Horizon-LOD chunk radius to target (kept far on low-spec hardware
+    /// so the world still looks distant while the near ring stays cheap).
+    pub recommended_lod_chunks: u32,
+    /// Whether kinetic contraptions should draw through
+    /// [`KineticInstancePool::build_ubo_batches`] UBO batches — the path
+    /// that needs no SSBO on GL 3.3 / Vulkan 1.1 minimal hardware.
+    pub use_ubo_kinetic_batches: bool,
+}
+
+/// Budget recommendation for `backend` under memory profile `mem`.
+///
+/// A device counts as low-spec when it runs [`ActiveRenderBackend::
+/// ClassicLowSpec`], shares system RAM, or reports at most
+/// [`LOW_SPEC_VRAM_CEILING_MIB`] MiB of VRAM. Low-spec budgets cap dirty
+/// rebuilds at 2 per frame, shrink the full-detail ring to 6-8 chunks
+/// (scaled by `vram_mib`), push horizon LOD far out (32 chunks), and
+/// request UBO kinetic batching. Everything else keeps a generous
+/// VRAM-scaled budget.
+pub fn recommend_low_spec_budget(
+    mem: &GpuMemoryProfile,
+    backend: ActiveRenderBackend,
+) -> LowSpecRenderBudget {
+    let low_spec = backend == ActiveRenderBackend::ClassicLowSpec
+        || mem.shared_system_ram
+        || mem.vram_mib <= LOW_SPEC_VRAM_CEILING_MIB;
+    if low_spec {
+        LowSpecRenderBudget {
+            max_mesh_cache_mib: if mem.shared_system_ram { 32 } else { 64 },
+            max_dirty_rebuilds_per_frame: 2,
+            recommended_full_detail_chunks: (mem.vram_mib / 64).clamp(6, 8),
+            recommended_lod_chunks: 32,
+            use_ubo_kinetic_batches: true,
+        }
+    } else {
+        LowSpecRenderBudget {
+            max_mesh_cache_mib: (mem.vram_mib / 4).clamp(128, 1024),
+            max_dirty_rebuilds_per_frame: u32::MAX,
+            recommended_full_detail_chunks: 12,
+            recommended_lod_chunks: 64,
+            use_ubo_kinetic_batches: false,
+        }
     }
 }
 
@@ -486,6 +748,30 @@ impl Default for SubWorldTransformGpu {
     }
 }
 
+/// One uniform-buffer-sized draw batch for the
+/// [`ActiveRenderBackend::ClassicLowSpec`] path: at most
+/// `max_instances_per_ubo` [`KineticInstanceGpu`] records of a single
+/// `mesh_kind`, uploaded through one UBO bind instead of the shared SSBO
+/// the indirect path uses.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KineticUboBatch {
+    /// The shared mesh template this batch draws.
+    pub mesh_kind: u32,
+    /// Index run length in the merged geometry buffer.
+    pub index_count: u32,
+    /// First index of the template's run in the merged geometry buffer.
+    pub first_index: u32,
+    /// Vertex offset applied when indexing the template's run.
+    pub vertex_offset: i32,
+    /// This batch's offset in the frame's packed instance stream (the sum
+    /// of all earlier batches' instance counts, across all mesh kinds).
+    pub first_instance: u32,
+    /// The exact instance records this batch uploads, in the same
+    /// deterministic order [`KineticInstancePool::build_indirect_batches`]
+    /// writes them.
+    pub instances: Vec<KineticInstanceGpu>,
+}
+
 /// One frame's instancing upload: the dense instance SSBO, the indirect
 /// command buffer, and the dense sub-world transform table.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -594,12 +880,14 @@ impl KineticInstancePool {
         record.phase + record.angular_velocity * time_secs
     }
 
-    /// Pack the frame's instancing upload. Deterministic: instances sort by
-    /// (`mesh_kind`, `instance_id`), so two builds over identical state are
-    /// byte-identical. One [`DrawIndexedIndirectCommand`] per active
-    /// `mesh_kind` with a registered template; `subworlds` is a dense table
-    /// from slot 0 through the highest registered id, identity-padded.
-    pub fn build_indirect_batches(&self) -> KineticFrameUpload {
+    /// Pack active instances into the deterministic frame stream — sorted
+    /// by (`mesh_kind`, `instance_id`), skipping kinds with no template —
+    /// and return it with each active kind's `(template, first_instance,
+    /// count)` run. Shared by the SSBO/indirect and UBO batch paths so both
+    /// emit identical instance bytes.
+    fn pack_instance_runs(
+        &self,
+    ) -> (Vec<KineticInstanceGpu>, Vec<(u32, MeshKindTemplate, u32, u32)>) {
         let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
         for record in self.instances.values() {
             if self.templates.contains_key(&record.mesh_kind) {
@@ -608,18 +896,11 @@ impl KineticInstancePool {
         }
         let total: u32 = counts.values().sum();
         let mut instances = vec![KineticInstanceGpu::default(); total as usize];
-        let mut commands = Vec::with_capacity(counts.len());
+        let mut runs = Vec::with_capacity(counts.len());
         let mut cursors: BTreeMap<u32, u32> = BTreeMap::new();
         let mut next = 0u32;
         for (&kind, &count) in &counts {
-            let template = self.templates[&kind];
-            commands.push(DrawIndexedIndirectCommand {
-                index_count: template.index_count,
-                instance_count: count,
-                first_index: template.first_index,
-                vertex_offset: template.vertex_offset,
-                first_instance: next,
-            });
+            runs.push((kind, self.templates[&kind], next, count));
             cursors.insert(kind, next);
             next += count;
         }
@@ -630,6 +911,26 @@ impl KineticInstancePool {
             instances[*slot as usize] = *record;
             *slot += 1;
         }
+        (instances, runs)
+    }
+
+    /// Pack the frame's instancing upload. Deterministic: instances sort by
+    /// (`mesh_kind`, `instance_id`), so two builds over identical state are
+    /// byte-identical. One [`DrawIndexedIndirectCommand`] per active
+    /// `mesh_kind` with a registered template; `subworlds` is a dense table
+    /// from slot 0 through the highest registered id, identity-padded.
+    pub fn build_indirect_batches(&self) -> KineticFrameUpload {
+        let (instances, runs) = self.pack_instance_runs();
+        let commands = runs
+            .iter()
+            .map(|&(_, template, first_instance, count)| DrawIndexedIndirectCommand {
+                index_count: template.index_count,
+                instance_count: count,
+                first_index: template.first_index,
+                vertex_offset: template.vertex_offset,
+                first_instance,
+            })
+            .collect();
 
         let subworlds = match self.subworlds.keys().next_back() {
             Some(&max_id) => {
@@ -648,10 +949,43 @@ impl KineticInstancePool {
             subworlds,
         }
     }
+
+    /// Split the frame's packed instance stream into uniform-buffer-sized
+    /// draw batches for [`ActiveRenderBackend::ClassicLowSpec`]: every
+    /// active `mesh_kind`'s run is chunked into groups of at most
+    /// `max_instances_per_ubo` instances (`0` is clamped to 1), in
+    /// ascending `mesh_kind` order. Pass [`MAX_INSTANCES_PER_UBO_16KB`] —
+    /// or [`GpuMemoryProfile::max_instances_per_ubo`] — so each batch fits
+    /// the 16 KiB UBO floor every GL 3.3 / Vulkan 1.1 device guarantees.
+    /// Deterministic and lossless: concatenating every batch's
+    /// `instances` reproduces the same byte stream
+    /// [`Self::build_indirect_batches`] packs.
+    pub fn build_ubo_batches(&self, max_instances_per_ubo: usize) -> Vec<KineticUboBatch> {
+        let per_ubo = max_instances_per_ubo.max(1);
+        let (instances, runs) = self.pack_instance_runs();
+        let mut batches = Vec::new();
+        for (kind, template, first, count) in runs {
+            let start = first as usize;
+            let end = (first + count) as usize;
+            for (offset, chunk) in instances[start..end].chunks(per_ubo).enumerate() {
+                batches.push(KineticUboBatch {
+                    mesh_kind: kind,
+                    index_count: template.index_count,
+                    first_index: template.first_index,
+                    vertex_offset: template.vertex_offset,
+                    first_instance: first + (offset * per_ubo) as u32,
+                    instances: chunk.to_vec(),
+                });
+            }
+        }
+        batches
+    }
 }
 
 const _: () = {
     assert!(std::mem::size_of::<KineticInstanceGpu>() == 48);
+    assert!(MAX_INSTANCES_PER_UBO_16KB * KINETIC_INSTANCE_GPU_BYTES as usize
+        <= MIN_GUARANTEED_UBO_BYTES as usize);
     assert!(std::mem::align_of::<KineticInstanceGpu>() == 4);
     assert!(std::mem::size_of::<DrawIndexedIndirectCommand>() == 20);
     assert!(std::mem::size_of::<SubWorldTransformGpu>() == 64);

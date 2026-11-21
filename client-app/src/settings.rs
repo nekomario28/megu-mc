@@ -6,7 +6,8 @@
 //! see [`BuiltInOptimizations`]. This module only exposes settings that
 //! genuinely change what the player sees or that trade something off:
 //! preset, view distance, distant horizon LOD, clouds, particles, smooth
-//! lighting, entity shadows, FOV, VSync, and an FPS cap.
+//! lighting, entity shadows, FOV, VSync, an FPS cap, and the GPU backend
+//! preference.
 //!
 //! Persistence is human-readable TOML (`mc-spine-client.toml`) plus a
 //! [`ClientSettings::import_vanilla_options_txt`] helper so players migrating
@@ -14,6 +15,8 @@
 //! particles, and VSync automatically. Pure std Rust; zero dependencies.
 
 use std::path::Path;
+
+use mc_spine_client_mesh::RenderBackendPreference;
 
 use crate::lod::LodConfig;
 
@@ -181,6 +184,10 @@ pub struct ClientSettings {
     pub vsync: bool,
     /// `None` = unlimited; `Some(30..=260)` otherwise.
     pub max_fps: Option<u32>,
+    /// GPU pipeline selection: `auto` negotiates from hardware
+    /// capabilities, `classic-low-spec` pins the minimal-hardware path for
+    /// legacy Intel integrated GPUs (GL 3.3 / Vulkan 1.1 only).
+    pub gpu_backend: RenderBackendPreference,
 }
 
 impl Default for ClientSettings {
@@ -204,6 +211,7 @@ impl ClientSettings {
             fov: DEFAULT_FOV,
             vsync: true,
             max_fps: None,
+            gpu_backend: RenderBackendPreference::Auto,
         };
         match preset {
             QualityPreset::Fast => {
@@ -271,7 +279,8 @@ impl ClientSettings {
              entity_shadows = {}\n\
              fov = {}\n\
              vsync = {}\n\
-             max_fps = {}\n",
+             max_fps = {}\n\
+             gpu_backend = \"{}\"\n",
             self.preset.as_str(),
             self.view_distance,
             self.distant_horizon.as_str(),
@@ -282,6 +291,7 @@ impl ClientSettings {
             self.fov,
             self.vsync,
             max_fps,
+            self.gpu_backend.as_str(),
         )
     }
 
@@ -311,6 +321,7 @@ impl ClientSettings {
                 "fov" => self.fov = parsed.fov,
                 "vsync" => self.vsync = parsed.vsync,
                 "max_fps" => self.max_fps = parsed.max_fps,
+                "gpu_backend" => self.gpu_backend = parsed.gpu_backend,
                 _ => {}
             }
         }
@@ -449,6 +460,13 @@ impl ClientSettings {
                         }
                     }
                 }
+                "gpu_backend" => match RenderBackendPreference::parse(value) {
+                    Some(g) => {
+                        settings.gpu_backend = g;
+                        seen.push("gpu_backend");
+                    }
+                    None => invalid(&mut warnings),
+                },
                 other => warnings.push(format!("unknown key '{other}' ignored")),
             }
         }
@@ -687,6 +705,7 @@ mod tests {
             fov: 90,
             vsync: false,
             max_fps: Some(144),
+            gpu_backend: RenderBackendPreference::ClassicLowSpec,
         };
         let text = s.to_toml();
         let (back, warnings) = ClientSettings::from_toml(&text);
@@ -698,6 +717,43 @@ mod tests {
         let (back, warnings) = ClientSettings::from_toml(&s.to_toml());
         assert_eq!(back.max_fps, None);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn gpu_backend_toml_roundtrip_defaults_and_fails_gracefully() {
+        // Every token round-trips losslessly through to_toml/from_toml.
+        for backend in [
+            RenderBackendPreference::Auto,
+            RenderBackendPreference::MeshShader,
+            RenderBackendPreference::ComputeIndirect,
+            RenderBackendPreference::ClassicLowSpec,
+            RenderBackendPreference::Classic,
+        ] {
+            let mut s = ClientSettings::default();
+            s.gpu_backend = backend;
+            let (back, warnings) = ClientSettings::from_toml(&s.to_toml());
+            assert_eq!(back, s, "{backend:?}");
+            assert_eq!(back.gpu_backend, backend);
+            assert!(warnings.is_empty(), "{backend:?}: {warnings:?}");
+        }
+
+        // Files written before the key existed stay valid and default to
+        // Auto (backward compatible).
+        let (s, warnings) = ClientSettings::from_toml("view_distance = 20\n");
+        assert_eq!(s.gpu_backend, RenderBackendPreference::Auto);
+        assert!(warnings.is_empty());
+
+        // An unrecognized value warns and keeps the default, like every
+        // other named-option key.
+        let (s, warnings) = ClientSettings::from_toml("gpu_backend = \"vulkan\"\n");
+        assert_eq!(s.gpu_backend, RenderBackendPreference::Auto);
+        assert!(warnings.iter().any(|w| w.contains("gpu_backend")));
+
+        // apply_toml overlays only the keys a file defines.
+        let mut s = ClientSettings::from_preset(QualityPreset::Fast);
+        s.apply_toml("gpu_backend = \"classic-low-spec\"\n");
+        assert_eq!(s.gpu_backend, RenderBackendPreference::ClassicLowSpec);
+        assert_eq!(s.preset, QualityPreset::Fast);
     }
 
     #[test]

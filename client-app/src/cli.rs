@@ -5,6 +5,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use mc_spine_client_mesh::RenderBackendPreference;
+
 use crate::settings::{
     ClientSettings, CloudMode, DistantHorizon, ParticleLevel, QualityPreset,
     MAX_FOV, MAX_MAX_FPS, MAX_VIEW_DISTANCE, MIN_FOV, MIN_MAX_FPS, MIN_VIEW_DISTANCE,
@@ -135,6 +137,9 @@ pub struct CliConfig {
     pub vsync: Option<bool>,
     /// `Some(None)` records `--max-fps unlimited`.
     pub max_fps: Option<Option<u32>>,
+    /// `--gpu-backend`: explicit GPU pipeline selection; overrides the
+    /// TOML `gpu_backend` key when given.
+    pub gpu_backend: Option<RenderBackendPreference>,
     /// Whether `--view-distance` was given on the command line.
     pub view_distance_explicit: bool,
 
@@ -197,6 +202,7 @@ impl Default for CliConfig {
             entity_shadows: None,
             vsync: None,
             max_fps: None,
+            gpu_backend: None,
             view_distance_explicit: false,
             client_settings: ClientSettings::default(),
             settings_source_present: false,
@@ -257,6 +263,7 @@ impl fmt::Debug for CliConfig {
             .field("entity_shadows", &self.entity_shadows)
             .field("vsync", &self.vsync)
             .field("max_fps", &self.max_fps)
+            .field("gpu_backend", &self.gpu_backend)
             .field("view_distance_explicit", &self.view_distance_explicit)
             .field("client_settings", &self.client_settings)
             .field("settings_source_present", &self.settings_source_present)
@@ -395,6 +402,10 @@ impl CliConfig {
         }
         if let Some(value) = self.max_fps {
             settings.max_fps = value;
+            tuned = true;
+        }
+        if let Some(value) = self.gpu_backend {
+            settings.gpu_backend = value;
             tuned = true;
         }
         if tuned {
@@ -699,6 +710,15 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                     cfg.max_fps = Some(Some(parsed as u32));
                 }
             }
+            "--gpu-backend" => {
+                let raw = take_val(flag, &mut i)?;
+                cfg.gpu_backend = Some(RenderBackendPreference::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "invalid --gpu-backend '{raw}' (expected auto, mesh-shader, \
+                         compute-indirect, classic-low-spec, or classic)"
+                    )
+                })?);
+            }
             "--mc-version" => {
                 let raw = take_val(flag, &mut i)?;
                 cfg.mc_version = parse_mc_version(&raw)?;
@@ -826,6 +846,10 @@ PLAYER SETTINGS:
   --entity-shadows <on|off>        Entity shadows
   --vsync <on|off>                 Vertical sync
   --max-fps <N|unlimited>          Frame rate cap, 30..=260
+  --gpu-backend <backend>          GPU pipeline: auto|mesh-shader|
+                                   compute-indirect|classic-low-spec|classic
+                                   (classic-low-spec targets legacy Intel
+                                   HD/UHD iGPUs: GL 3.3 / Vulkan 1.1 only)
 "
     )
 }
@@ -1039,6 +1063,65 @@ mod tests {
     }
 
     #[test]
+    fn gpu_backend_flag_parses_overrides_and_fails_closed() {
+        // The flag alone applies to the resolved settings and marks the
+        // preset Custom like every other explicit override.
+        let mut cfg = parse_args(&["--gpu-backend", "classic-low-spec"]).unwrap();
+        cfg.resolve_client_settings_from(Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.client_settings.gpu_backend,
+            RenderBackendPreference::ClassicLowSpec
+        );
+        assert_eq!(cfg.client_settings.preset, QualityPreset::Custom);
+        assert_eq!(cfg.gpu_backend, Some(RenderBackendPreference::ClassicLowSpec));
+
+        // Every documented token parses.
+        for (token, want) in [
+            ("auto", RenderBackendPreference::Auto),
+            ("mesh-shader", RenderBackendPreference::MeshShader),
+            ("compute-indirect", RenderBackendPreference::ComputeIndirect),
+            ("classic-low-spec", RenderBackendPreference::ClassicLowSpec),
+            ("classic", RenderBackendPreference::Classic),
+        ] {
+            let cfg = parse_args(&["--gpu-backend", token]).unwrap();
+            assert_eq!(cfg.gpu_backend, Some(want), "{token}");
+        }
+        // `--gpu-backend=...` inline form works too.
+        let cfg = parse_args(&["--gpu-backend=classic-low-spec"]).unwrap();
+        assert_eq!(
+            cfg.gpu_backend,
+            Some(RenderBackendPreference::ClassicLowSpec)
+        );
+
+        // The flag overrides the TOML key cleanly.
+        let dir = scratch_dir("gpu-backend");
+        let file = write_file(&dir, "custom.toml", "gpu_backend = \"mesh-shader\"\n");
+        let mut cfg = parse_args(&[
+            "--settings",
+            file.to_str().unwrap(),
+            "--gpu-backend",
+            "classic",
+        ])
+        .unwrap();
+        cfg.resolve_client_settings_from(&dir).unwrap();
+        assert_eq!(cfg.client_settings.gpu_backend, RenderBackendPreference::Classic);
+        // Without the flag the TOML value applies on its own.
+        let mut cfg = parse_args(&["--settings", file.to_str().unwrap()]).unwrap();
+        cfg.resolve_client_settings_from(&dir).unwrap();
+        assert_eq!(
+            cfg.client_settings.gpu_backend,
+            RenderBackendPreference::MeshShader
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Unknown values fail closed with a useful message.
+        let err = parse_args(&["--gpu-backend", "vulkan"]).unwrap_err();
+        assert!(err.contains("invalid --gpu-backend"), "unexpected: {err}");
+        let err = parse_args(&["--gpu-backend", "low-spec"]).unwrap_err();
+        assert!(err.contains("invalid --gpu-backend"), "unexpected: {err}");
+    }
+
+    #[test]
     fn invalid_flag_values_error_out() {
         for argv in [
             vec!["--preset", "ludicrous"],
@@ -1051,6 +1134,8 @@ mod tests {
             vec!["--smooth-lighting", "2"],
             vec!["--max-fps", "12"],
             vec!["--max-fps", "fast"],
+            vec!["--gpu-backend", "vulkan"],
+            vec!["--gpu-backend"],
         ] {
             assert!(parse_args(&argv).is_err(), "{argv:?} must fail");
         }

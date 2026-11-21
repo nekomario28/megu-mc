@@ -983,6 +983,48 @@ fn cli_mc_version_named_numeric_and_fail_closed() {
 }
 
 #[test]
+fn cli_gpu_backend_flag_flows_into_render_config() {
+    use mc_spine_client::render::RenderConfig;
+    use mc_spine_client_mesh::RenderBackendPreference;
+
+    // --gpu-backend classic-low-spec selects the legacy Intel iGPU path
+    // end-to-end: argv -> CliConfig -> ClientSettings -> RenderConfig.
+    let mut cfg = parse_args(&[
+        "--gpu-backend".to_string(),
+        "classic-low-spec".to_string(),
+        "--headless".to_string(),
+    ])
+    .expect("--gpu-backend parse");
+    cfg.resolve_client_settings_from(Path::new(".")).unwrap();
+    assert_eq!(
+        cfg.client_settings.gpu_backend,
+        RenderBackendPreference::ClassicLowSpec
+    );
+    let config = RenderConfig::from_settings(&cfg.client_settings);
+    assert_eq!(config.gpu_backend, RenderBackendPreference::ClassicLowSpec);
+
+    // Default settings keep Auto end-to-end.
+    let mut cfg = parse_args(&["--headless".to_string()]).expect("default parse");
+    cfg.resolve_client_settings_from(Path::new(".")).unwrap();
+    assert_eq!(
+        cfg.client_settings.gpu_backend,
+        RenderBackendPreference::Auto
+    );
+    assert_eq!(
+        RenderConfig::from_settings(&cfg.client_settings).gpu_backend,
+        RenderBackendPreference::Auto
+    );
+
+    // Unknown values fail closed at parse time.
+    for bad in ["vulkan", "low-spec", "opengl", ""] {
+        assert!(
+            parse_args(&["--gpu-backend".to_string(), bad.to_string()]).is_err(),
+            "--gpu-backend {bad:?} must fail closed"
+        );
+    }
+}
+
+#[test]
 fn cli_version_dir_flag_env_fallback_and_precedence() {
     use mc_spine_client::cli::VERSION_DIR_ENV;
 
