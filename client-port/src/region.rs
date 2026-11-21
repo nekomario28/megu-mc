@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::cull::box_facing_mask;
+use crate::draw_order::{aabb_distance_sq, depth_key, DrawOrder, KeyedDraw, MultidrawScratch};
 use crate::packed::{is_packable, pack_quad, PackedVertex};
 use crate::{Quad, SectionCoord, EDGE};
 
@@ -293,6 +294,51 @@ impl RenderRegion {
             })
             .collect()
     }
+
+    /// Scratch-driven sibling of [`build_multidraw`](Self::build_multidraw):
+    /// the same (facing-bucket) buckets, but each bucket's draws sort by
+    /// section distance to `camera` in `order` direction and every buffer
+    /// comes from `scratch`, so a steady-state frame allocates nothing.
+    /// Each emitted command reports its nearest draw's depth to `scratch`
+    /// for the caller's cross-region ordering.
+    fn build_multidraw_scratch(
+        &self,
+        camera: [f32; 3],
+        order: DrawOrder,
+        scratch: &mut MultidrawScratch,
+    ) {
+        scratch.clear_buckets();
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(slab) = slot else { continue };
+            if slab.indices == 0 {
+                continue;
+            }
+            let x = index % REGION_X;
+            let z = (index / REGION_X) % REGION_Z;
+            let y = index / (REGION_X * REGION_Z);
+            let min = [
+                ((self.origin[0] + x as i32) * EDGE as i32) as f32,
+                ((self.origin[1] + y as i32) * EDGE as i32) as f32,
+                ((self.origin[2] + z as i32) * EDGE as i32) as f32,
+            ];
+            let edge = EDGE as f32;
+            let max = [min[0] + edge, min[1] + edge, min[2] + edge];
+            scratch.push_bucket_draw(
+                box_facing_mask(min, camera),
+                KeyedDraw {
+                    depth_key: depth_key(aabb_distance_sq(min, max, camera)),
+                    draw: DrawElementsCommand {
+                        index_count: slab.indices,
+                        instance_count: 1,
+                        first_index: slab.index_offset,
+                        base_vertex: slab.vertex_offset as i32,
+                        base_instance: 0,
+                    },
+                },
+            );
+        }
+        scratch.drain_buckets(self.origin, order);
+    }
 }
 
 /// A world/dimension set of [`RenderRegion`]s keyed by region-minimum
@@ -360,6 +406,37 @@ impl RenderRegions {
             .collect();
         commands.sort_by(|a, b| a.region.cmp(&b.region).then(a.facing.cmp(&b.facing)));
         commands
+    }
+
+    /// Ordered, allocation-free sibling of [`build_multidraw`](Self::build_multidraw).
+    /// Emits the same one-command-per-(region, facing bucket) stream into
+    /// `scratch`, ordered by section distance to `camera` —
+    /// [`DrawOrder::FrontToBack`] draws nearest sections first so the depth
+    /// buffer rejects their overdraw (Early-Z), while
+    /// [`DrawOrder::BackToFront`] draws farthest first for correct
+    /// transparent compositing. Ordering applies inside each command's
+    /// `draws` and across the command stream itself. Read the result with
+    /// [`MultidrawScratch::commands`]; every buffer comes from `scratch`,
+    /// so steady-state frames perform zero heap growth
+    /// ([`MultidrawScratch::growth_events`]).
+    pub fn build_multidraw_into(
+        &self,
+        camera: [f32; 3],
+        order: DrawOrder,
+        scratch: &mut MultidrawScratch,
+    ) {
+        scratch.begin();
+        for &origin in self.regions.keys() {
+            scratch.push_region(origin);
+        }
+        scratch.sort_region_keys();
+        for i in 0..scratch.region_count() {
+            let origin = scratch.region_key(i);
+            if let Some(region) = self.regions.get(&origin) {
+                region.build_multidraw_scratch(camera, order, scratch);
+            }
+        }
+        scratch.finish(order);
     }
 }
 

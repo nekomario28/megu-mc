@@ -1640,6 +1640,13 @@ impl WorldState {
         )
     }
 
+    /// Packed 16-byte vertices for one section — the per-coordinate
+    /// counterpart of [`packed_meshes`](Self::packed_meshes) that avoids
+    /// materializing a lookup table per frame.
+    pub fn packed_mesh(&self, coord: SectionCoord) -> Option<&[PackedVertex]> {
+        self.packed_meshes.get(&coord).map(Vec::as_slice)
+    }
+
     /// Iterate rebuilt sections as `(coord, packed 16-byte vertices)` for the
     /// software rasterizer. Four vertices per quad, corner order preserved,
     /// quads in direction-bucket grouped order.

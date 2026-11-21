@@ -21,6 +21,8 @@ pub const DEFAULT_MAX_LIGHT_BATCHES_PER_FRAME: usize = 8;
 pub const DEFAULT_TARGET_FRAME_US: u64 = 16_667;
 /// Default number of frames in the join/teleport slow-start ramp.
 pub const DEFAULT_RAMP_FRAMES: u32 = 30;
+/// Frames retained by the sliding telemetry window: two seconds at 60 fps.
+pub const FRAME_STATS_WINDOW: usize = 120;
 
 const RAMP_START_RADIUS: u32 = 2;
 const RAMP_RADIUS_STEP: u32 = 2;
@@ -45,6 +47,116 @@ pub struct FrameBudget {
     pub upload_percent: u64,
     /// Streaming work/upload budget percentage after adaptive backoff.
     pub backoff_percent: u64,
+}
+
+/// Point-in-time view of the frame-time sliding window. All values are
+/// microseconds; percentiles are exact nearest-rank picks over the sorted
+/// window, so every figure is a duration a real frame actually took.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameStatsSnapshot {
+    /// Frames in the window (`0..=FRAME_STATS_WINDOW`).
+    pub count: usize,
+    /// Shortest frame in the window.
+    pub min_us: f64,
+    /// Nearest-rank 50th percentile — the median frame.
+    pub p50_us: f64,
+    /// Nearest-rank 95th percentile — the stutter tail the adaptive
+    /// budgets throttle against.
+    pub p95_us: f64,
+    /// Nearest-rank 99th percentile — the worst consistent spikes.
+    pub p99_us: f64,
+    /// Slowest frame in the window — the single worst spike.
+    pub max_us: f64,
+    /// Arithmetic mean of the window.
+    pub mean_us: f64,
+}
+
+/// Sliding-window frame-time statistics over the last
+/// [`FRAME_STATS_WINDOW`] reported frames.
+///
+/// Recording is a fixed-capacity ring overwrite — no allocation, no wall
+/// clock: callers report each observed frame time and
+/// [`snapshot`](Self::snapshot) produces the exact P50/P95/P99/max stutter
+/// telemetry the adaptive upload budgets consume. Non-finite (`NaN`,
+/// `±inf`) and negative readings are scrubbed at the door so a broken
+/// timer cannot poison the window.
+#[derive(Clone, Debug)]
+pub struct FrameStats {
+    ring: [f64; FRAME_STATS_WINDOW],
+    cursor: usize,
+    len: usize,
+}
+
+impl Default for FrameStats {
+    fn default() -> Self {
+        Self {
+            ring: [0.0; FRAME_STATS_WINDOW],
+            cursor: 0,
+            len: 0,
+        }
+    }
+}
+
+impl FrameStats {
+    /// An empty window.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one frame time in microseconds. `NaN`, infinite, and
+    /// negative readings are dropped; everything else enters the window,
+    /// evicting the oldest frame once it is full.
+    pub fn record(&mut self, frame_us: f64) {
+        if !frame_us.is_finite() || frame_us < 0.0 {
+            return;
+        }
+        self.ring[self.cursor] = frame_us;
+        self.cursor = (self.cursor + 1) % FRAME_STATS_WINDOW;
+        self.len = (self.len + 1).min(FRAME_STATS_WINDOW);
+    }
+
+    /// Frames currently in the window.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no valid frame has been recorded yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Exact percentile statistics over the window: the ring is copied and
+    /// fully sorted, then each percentile is the nearest-rank element —
+    /// `ceil(p * n / 100)` — so P50/P95/P99 are always real observed frame
+    /// times, never interpolated. `count == 0` yields a zeroed snapshot.
+    pub fn snapshot(&self) -> FrameStatsSnapshot {
+        if self.len == 0 {
+            return FrameStatsSnapshot::default();
+        }
+        let mut sorted = [0.0; FRAME_STATS_WINDOW];
+        sorted[..self.len].copy_from_slice(&self.ring[..self.len]);
+        sorted[..self.len].sort_unstable_by(f64::total_cmp);
+        let window = &sorted[..self.len];
+        let mean_us = window.iter().sum::<f64>() / self.len as f64;
+        FrameStatsSnapshot {
+            count: self.len,
+            min_us: window[0],
+            p50_us: percentile(window, 50.0),
+            p95_us: percentile(window, 95.0),
+            p99_us: percentile(window, 99.0),
+            max_us: window[self.len - 1],
+            mean_us,
+        }
+    }
+}
+
+/// Nearest-rank percentile over a sorted window: `ceil(p/100 * n)`,
+/// clamped to `1..=n`, indexes `sorted[rank - 1]`. Always an observed
+/// value — interpolation would invent frame times that never happened.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let n = sorted.len();
+    let rank = ((p / 100.0) * n as f64).ceil() as usize;
+    sorted[rank.clamp(1, n) - 1]
 }
 
 /// Per-frame pacer for chunk streaming, meshing, GPU uploads, and light
@@ -83,6 +195,7 @@ pub struct FrameBudgetPacer {
     consumed_work_us: u64,
     consumed_upload_bytes: usize,
     consumed_light_batches: usize,
+    frame_stats: FrameStats,
 }
 
 impl Default for FrameBudgetPacer {
@@ -110,6 +223,7 @@ impl Default for FrameBudgetPacer {
             consumed_work_us: 0,
             consumed_upload_bytes: 0,
             consumed_light_batches: 0,
+            frame_stats: FrameStats::new(),
         }
     }
 }
@@ -345,6 +459,32 @@ impl FrameBudgetPacer {
         self.last_frame_us
     }
 
+    /// The sliding-window frame-time telemetry: every reported
+    /// [`end_frame`](Self::end_frame) duration enters the last-120-frames
+    /// window.
+    pub fn frame_stats(&self) -> &FrameStats {
+        &self.frame_stats
+    }
+
+    /// Exact P50/P95/P99/max over the sliding window; see
+    /// [`FrameStats::snapshot`].
+    pub fn frame_stats_snapshot(&self) -> FrameStatsSnapshot {
+        self.frame_stats.snapshot()
+    }
+
+    /// VSync-friendly pacing headroom: `target_frame_us - P95` of the
+    /// sliding window, in microseconds. Positive means the worst-consistent
+    /// frame still fits inside the target (headroom for heavier uploads);
+    /// negative means the P95 tail is overrunning and adaptive budgets
+    /// should shrink. `None` until at least one frame has been reported.
+    pub fn frame_time_headroom_us(&self) -> Option<i64> {
+        let snapshot = self.frame_stats.snapshot();
+        if snapshot.count == 0 {
+            return None;
+        }
+        Some(self.target_frame_us as i64 - snapshot.p95_us as i64)
+    }
+
     fn try_consume_work(&mut self, cost_us: u64) -> bool {
         if !self.frame_open || cost_us > self.remaining_work_us {
             return false;
@@ -356,6 +496,7 @@ impl FrameBudgetPacer {
 
     fn finish_frame(&mut self, last_frame_us: u64) {
         self.last_frame_us = last_frame_us;
+        self.frame_stats.record(last_frame_us as f64);
         self.frame_open = false;
         let overrun_threshold = self
             .target_frame_us

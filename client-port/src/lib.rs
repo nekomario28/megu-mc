@@ -8,6 +8,7 @@ mod cache;
 mod column;
 mod cull;
 mod culler;
+pub mod draw_order;
 pub mod ffi;
 pub mod gpu_pipeline;
 pub mod hiz_culler;
@@ -17,6 +18,7 @@ pub mod model_baker;
 mod packed;
 mod region;
 mod section;
+pub mod upload_budget;
 pub mod visibility;
 
 #[cfg(test)]
@@ -31,6 +33,9 @@ pub use atlas::{
 pub use cache::{MeshCache, SectionCoord, DEFAULT_RESORT_THRESHOLD};
 pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
 pub use culler::{through_bit, CullResult, GraphCuller, SectionGraph, THROUGH_ALL};
+pub use draw_order::{
+    aabb_distance_sq, depth_key, DrawOrder, DrawOrderScratch, KeyedDraw, MultidrawScratch,
+};
 pub use gpu_pipeline::{
     cull_meshlets_cpu_reference, pack_axis_flags, pack_facing_and_flags,
     pack_section_meshlets, recommend_low_spec_budget, resolve_render_backend,
@@ -65,6 +70,10 @@ pub use region::{
     REGION_SECTIONS, REGION_X, REGION_Y, REGION_Z,
 };
 pub use section::*;
+pub use upload_budget::{
+    ChunkUploadBudget, DEFAULT_MAX_UPLOADS_PER_FRAME, DEFAULT_MAX_UPLOAD_BYTES_PER_FRAME,
+    DEFAULT_MAX_UPLOAD_WORK_US_PER_FRAME, DEFAULT_MIN_UPLOADS_PER_FRAME, DEFAULT_TARGET_FRAME_US,
+};
 pub use visibility::FaceVisibility;
 
 pub const PROTOCOL_VERSION: u32 = 767;

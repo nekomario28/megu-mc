@@ -22,10 +22,29 @@ use crate::state::{
 /// Build the frame for the current screen: `(draw_list, hit_regions)`.
 /// `width`/`height` are physical pixels.
 pub fn layout_screen(state: &UiState, width: u32, height: u32) -> (UiDrawList, Vec<HitRegion>) {
+    let mut list = UiDrawList::new();
+    let mut regions = Vec::new();
+    layout_screen_into(state, width, height, &mut list, &mut regions);
+    (list, regions)
+}
+
+/// Buffer-reusing [`layout_screen`]: `out` is
+/// [`UiDrawList::clear`]ed (recycling `Text` payload buffers) and
+/// `regions` is cleared, then both are refilled — the caller's buffers
+/// keep their heap capacity across frames.
+pub fn layout_screen_into(
+    state: &UiState,
+    width: u32,
+    height: u32,
+    out: &mut UiDrawList,
+    regions: &mut Vec<HitRegion>,
+) {
+    out.clear();
+    regions.clear();
     let s = state.effective_scale(height) as i32;
     let mut ctx = Ctx {
-        list: UiDrawList::new(),
-        regions: Vec::new(),
+        list: std::mem::take(out),
+        regions: std::mem::take(regions),
         w: (width as i32) / s,
         h: (height as i32) / s,
         s,
@@ -45,7 +64,8 @@ pub fn layout_screen(state: &UiState, width: u32, height: u32) -> (UiDrawList, V
         ctx.regions.clear();
         modal(&mut ctx);
     }
-    (ctx.list, ctx.regions)
+    *out = ctx.list;
+    *regions = ctx.regions;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,13 +118,13 @@ impl Ctx<'_> {
 
     fn text(&mut self, x: i32, y: i32, mult: u32, color: UiColor, s: &str) {
         self.list
-            .text(x * self.s, y * self.s, mult * self.s as u32, color, s);
+            .text_str(x * self.s, y * self.s, mult * self.s as u32, color, s);
     }
 
     /// Centered text: `cx` is the logical center x.
     fn ctext(&mut self, cx: i32, y: i32, mult: u32, color: UiColor, s: &str) {
         let w = text_width(s, mult * self.s as u32) as i32;
-        self.list.text(
+        self.list.text_str(
             cx * self.s - w / 2,
             y * self.s,
             mult * self.s as u32,

@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use mc_spine_client::cli::parse_args;
-use mc_spine_client::frame_pacer::FrameBudgetPacer;
+use mc_spine_client::frame_pacer::{FrameBudgetPacer, FrameStats, FRAME_STATS_WINDOW};
 use mc_spine_client::settings::{
     ClientSettings, FPS_SLIDER_PRESETS, MAX_MAX_FPS, MIN_MAX_FPS, VANILLA_OPTIONS_UNLIMITED_FPS,
 };
@@ -270,4 +270,114 @@ fn pacer_consumption_is_atomic_and_leaves_remainders_for_later_frames() {
     assert_eq!(next.work_us, 100);
     assert_eq!(next.upload_bytes, 1_000);
     assert_eq!(next.light_batches, 2);
+}
+
+#[test]
+fn frame_stats_percentiles_are_exact_nearest_rank() {
+    let mut stats = FrameStats::new();
+    assert!(stats.is_empty());
+    assert_eq!(stats.snapshot().count, 0);
+
+    for frame in 1..=120u32 {
+        stats.record(f64::from(frame));
+    }
+    assert_eq!(stats.len(), FRAME_STATS_WINDOW);
+
+    let snap = stats.snapshot();
+    assert_eq!(snap.count, 120);
+    assert_eq!(snap.min_us, 1.0);
+    // Nearest-rank picks over the sorted window 1..=120:
+    // ceil(0.50*120)=60 -> 60, ceil(0.95*120)=114 -> 114,
+    // ceil(0.99*120)=119 -> 119.
+    assert_eq!(snap.p50_us, 60.0);
+    assert_eq!(snap.p95_us, 114.0);
+    assert_eq!(snap.p99_us, 119.0);
+    assert_eq!(snap.max_us, 120.0);
+    assert_eq!(snap.mean_us, 60.5);
+}
+
+#[test]
+fn frame_stats_scrubs_non_finite_and_negative_inputs() {
+    let mut stats = FrameStats::new();
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.5] {
+        stats.record(bad);
+    }
+    assert_eq!(stats.len(), 0, "corrupt readings must not enter the window");
+    assert_eq!(stats.snapshot().count, 0);
+
+    stats.record(42.0);
+    let snap = stats.snapshot();
+    assert_eq!(snap.count, 1);
+    assert_eq!(snap.p50_us, 42.0);
+    assert_eq!(snap.p95_us, 42.0);
+    assert_eq!(snap.max_us, 42.0);
+}
+
+#[test]
+fn frame_stats_window_evicts_oldest_frames() {
+    let mut stats = FrameStats::new();
+    for frame in 1..=130u32 {
+        stats.record(f64::from(frame));
+    }
+    let snap = stats.snapshot();
+    assert_eq!(snap.count, 120);
+    assert_eq!(snap.min_us, 11.0, "frames 1..=10 were evicted");
+    assert_eq!(snap.max_us, 130.0);
+}
+
+#[test]
+fn pacer_end_frame_feeds_the_sliding_window() {
+    let mut pacer = FrameBudgetPacer::default().with_target_frame_us(16_667);
+    assert_eq!(pacer.frame_stats_snapshot().count, 0);
+    assert_eq!(pacer.frame_time_headroom_us(), None);
+
+    // 119 clean frames plus one heavy spike.
+    for _ in 0..119 {
+        pacer.begin_frame();
+        pacer.end_frame(8_000);
+    }
+    pacer.begin_frame();
+    pacer.end_frame(50_000);
+
+    let snap = pacer.frame_stats_snapshot();
+    assert_eq!(snap.count, 120);
+    assert_eq!(snap.p50_us, 8_000.0);
+    assert_eq!(snap.p95_us, 8_000.0);
+    assert_eq!(snap.p99_us, 8_000.0);
+    assert_eq!(snap.max_us, 50_000.0);
+    // P95 fits inside the target: positive headroom.
+    assert_eq!(pacer.frame_time_headroom_us(), Some(8_667));
+}
+
+#[test]
+fn pacer_window_drives_upload_budget_adaptation() {
+    use mc_spine_client_mesh::ChunkUploadBudget;
+
+    let mut pacer = FrameBudgetPacer::default().with_target_frame_us(16_667);
+    let mut budget = ChunkUploadBudget::new();
+
+    // Sustained 30 ms frames: P95 overruns the target, the upload count
+    // throttles toward the floor.
+    for expected in [4u32, 2, 1, 1, 1] {
+        pacer.begin_frame();
+        pacer.end_frame(30_000);
+        budget.adapt(pacer.frame_stats_snapshot().p95_us);
+        assert_eq!(budget.uploads_per_frame(), expected);
+    }
+
+    // Back under target: 120 clean frames evict every spike from the
+    // window, so P95 recovers to 5 ms and the budget regrows slot by slot
+    // back to the cap.
+    for _ in 0..120 {
+        pacer.begin_frame();
+        pacer.end_frame(5_000);
+        budget.adapt(pacer.frame_stats_snapshot().p95_us);
+    }
+    let snap = pacer.frame_stats_snapshot();
+    assert_eq!(snap.count, 120);
+    assert_eq!(snap.p50_us, 5_000.0);
+    assert_eq!(snap.p95_us, 5_000.0);
+    assert_eq!(snap.max_us, 5_000.0);
+    // P95 at 5 ms <= 90% of the 16.667 ms target: fully regrown.
+    assert_eq!(budget.uploads_per_frame(), budget.max_uploads_per_frame);
 }

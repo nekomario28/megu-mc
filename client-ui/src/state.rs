@@ -1093,14 +1093,24 @@ impl UiState {
     /// Lay out the current screen, cache the hit regions, and return the
     /// draw list for this frame.
     pub fn render(&mut self, width: u32, height: u32) -> crate::draw::UiDrawList {
-        let (list, regions) = layout::layout_screen(self, width, height);
+        let mut list = crate::draw::UiDrawList::new();
+        self.render_into(width, height, &mut list);
+        list
+    }
+
+    /// Buffer-reusing [`render`](Self::render): `out` is cleared and
+    /// refilled (its `Text` payload buffers are recycled, so steady-state
+    /// frames emit no text allocations), and `self.hit_regions` is rebuilt
+    /// in place keeping its capacity.
+    pub fn render_into(&mut self, width: u32, height: u32, out: &mut crate::draw::UiDrawList) {
+        let mut regions = std::mem::take(&mut self.hit_regions);
+        layout::layout_screen_into(self, width, height, out, &mut regions);
         self.hit_regions = regions;
         if let Some(i) = self.focus_index {
             if i >= self.hit_regions.len() {
                 self.focus_index = None;
             }
         }
-        list
     }
 
     /// Push `screen` and navigate to it.

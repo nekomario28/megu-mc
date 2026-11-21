@@ -162,14 +162,48 @@ pub enum UiCommand {
 }
 
 /// An ordered list of 2D commands; painting is back-to-front.
-#[derive(Clone, Debug, Default, PartialEq)]
+///
+/// [`clear`](Self::clear) recycles each `Text` command's `String` into a
+/// private pool (content dropped, heap capacity kept), and
+/// [`text_str`](Self::text_str) refills a pooled buffer instead of
+/// allocating — a screen rebuilt every frame through
+/// [`crate::state::UiState::render_into`] emits text with zero heap traffic
+/// once the pool matches the frame's widget count.
+#[derive(Clone, Debug, Default)]
 pub struct UiDrawList {
     pub commands: Vec<UiCommand>,
+    /// Recycled `Text` payload heaps; see the type docs. Contents are
+    /// stale — entries are cleared before reuse — so the pool never
+    /// affects equality or rendering.
+    string_pool: Vec<String>,
+}
+
+impl PartialEq for UiDrawList {
+    /// Draw lists compare by commands only; pooled string capacity is an
+    /// allocation detail, not content.
+    fn eq(&self, other: &Self) -> bool {
+        self.commands == other.commands
+    }
 }
 
 impl UiDrawList {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Drop every command while keeping `commands` capacity and recycling
+    /// `Text` payloads into the string pool for [`text_str`](Self::text_str).
+    pub fn clear(&mut self) {
+        for command in self.commands.drain(..) {
+            if let UiCommand::Text { text, .. } = command {
+                self.string_pool.push(text);
+            }
+        }
+    }
+
+    /// Number of recycled `Text` payload buffers held for reuse.
+    pub fn recycled_text_buffer_count(&self) -> usize {
+        self.string_pool.len()
     }
 
     pub fn push(&mut self, command: UiCommand) {
@@ -195,6 +229,22 @@ impl UiDrawList {
             scale: scale.max(1),
             color,
             text: text.into(),
+        });
+    }
+
+    /// `&str` text that reuses a recycled payload buffer (see
+    /// [`clear`](Self::clear)) instead of allocating a fresh `String` —
+    /// zero heap traffic on a warm pool.
+    pub fn text_str(&mut self, x: i32, y: i32, scale: u32, color: UiColor, text: &str) {
+        let mut owned = self.string_pool.pop().unwrap_or_default();
+        owned.clear();
+        owned.push_str(text);
+        self.push(UiCommand::Text {
+            x,
+            y,
+            scale: scale.max(1),
+            color,
+            text: owned,
         });
     }
 

@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use mc_spine_client_mesh::ffi::PackedVertex;
 use mc_spine_client_mesh::{
-    box_facing_mask, bucket_draw_mask, BakedModelQuad, DirectionBuckets, GraphCuller, HiZPyramid,
+    aabb_distance_sq, box_facing_mask, bucket_draw_mask, depth_key, BakedModelQuad,
+    DirectionBuckets, DrawOrder, GraphCuller, HiZPyramid, MultidrawScratch,
     RenderBackendPreference, RenderRegions, SectionCoord, DIRECTION_BUCKETS,
     DIRECTION_BUCKET_UNASSIGNED,
 };
@@ -1221,7 +1222,23 @@ fn render_frame_impl(
         }
     };
 
-    let meshes: HashMap<SectionCoord, &[PackedVertex]> = world.packed_meshes().collect();
+    // Opaque draw order: nearest sections first so the depth buffer (and
+    // hardware Early-Z hierarchies) reject the overdraw behind them before
+    // shading it. Depth-tested output is identical to unsorted order.
+    let mut visible_order: Vec<SectionCoord> = cull.visible.clone();
+    visible_order.sort_by_key(|coord| {
+        let min = [
+            coord.0 as f32 * 16.0,
+            coord.1 as f32 * 16.0,
+            coord.2 as f32 * 16.0,
+        ];
+        let edge = 16.0;
+        depth_key(aabb_distance_sq(
+            min,
+            [min[0] + edge, min[1] + edge, min[2] + edge],
+            eye32,
+        ))
+    });
     // Translucent draw list: (squared camera distance, coord, bucket draw mask).
     let mut translucent_sections: Vec<(f64, SectionCoord, u8)> = Vec::new();
     // Multi-draw accounting: per-region set of drawn-section slab identities
@@ -1237,11 +1254,11 @@ fn render_frame_impl(
     let mut hiz: Option<(HiZPyramid, [[f32; 4]; 4])> = None;
     if use_hiz {
         raster.depth_only = true;
-        for &coord in &cull.visible {
+        for &coord in &visible_order {
             if !within_view_distance(&coord) {
                 continue;
             }
-            let Some(&packed) = meshes.get(&coord) else {
+            let Some(packed) = world.packed_mesh(coord) else {
                 continue;
             };
             if packed.len() < 4 || packed.len() % 4 != 0 {
@@ -1283,12 +1300,12 @@ fn render_frame_impl(
         }
     }
 
-    for &coord in &cull.visible {
+    for &coord in &visible_order {
         if !within_view_distance(&coord) {
             raster.stats.culled_sections += 1;
             continue;
         }
-        let Some(&packed) = meshes.get(&coord) else {
+        let Some(packed) = world.packed_mesh(coord) else {
             continue;
         };
         if packed.len() < 4 || packed.len() % 4 != 0 {
@@ -1370,7 +1387,7 @@ fn render_frame_impl(
     // Translucent pass: far sections first, `sort_translucent` order within.
     translucent_sections.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     for (_, coord, draw_mask) in translucent_sections {
-        let Some(&packed) = meshes.get(&coord) else {
+        let Some(packed) = world.packed_mesh(coord) else {
             continue;
         };
         let origin = [
@@ -1379,11 +1396,20 @@ fn render_frame_impl(
             f64::from(coord.2) * 16.0,
         ];
         let quad_count = packed.len() / 4;
-        let order: Vec<usize> = match world.translucent_order(coord) {
-            Some(indices) => indices.iter().map(|&i| i as usize).collect(),
-            None => (0..quad_count).collect(),
+        // Iterate the stored `sort_translucent` indices in place — no
+        // per-section `Vec` materialization in the hot loop.
+        let stored_order = world.translucent_order(coord).unwrap_or(&[]);
+        let steps = if stored_order.is_empty() {
+            quad_count
+        } else {
+            stored_order.len()
         };
-        for qi in order {
+        for n in 0..steps {
+            let qi = if stored_order.is_empty() {
+                n
+            } else {
+                stored_order[n] as usize
+            };
             if qi >= quad_count {
                 continue;
             }
@@ -1420,12 +1446,16 @@ fn render_frame_impl(
         }
     }
 
-    // One multi-draw submission per (region, facing bucket); a submission
-    // counts only when at least one of its indirect draws belongs to a
-    // section drawn this frame — culled sections never reach the GPU.
-    raster.stats.region_draw_calls = world
+    // One multi-draw submission per (region, facing bucket), ordered
+    // front-to-back for Early-Z; a submission counts only when at least one
+    // of its indirect draws belongs to a section drawn this frame — culled
+    // sections never reach the GPU.
+    let mut multidraw_scratch = MultidrawScratch::new();
+    world
         .render_regions()
-        .build_multidraw(eye32)
+        .build_multidraw_into(eye32, DrawOrder::FrontToBack, &mut multidraw_scratch);
+    raster.stats.region_draw_calls = multidraw_scratch
+        .commands()
         .iter()
         .filter(|cmd| {
             drawn_slabs.get(&cmd.region).is_some_and(|slabs| {

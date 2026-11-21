@@ -644,3 +644,60 @@ fn draw_commands_match_spec_shape() {
     let rgba = rasterize_draw_list(32, 32, &list);
     assert_non_blank(&rgba);
 }
+
+#[test]
+fn render_into_reuses_draw_list_buffers_and_recycles_text_heaps() {
+    let mut ui = UiState::new();
+    ui.hud = mc_spine_client_ui::state::HudState::demo();
+    ui.navigate(Screen::InGameHud);
+
+    let mut list = UiDrawList::new();
+    ui.render_into(1280, 720, &mut list);
+    let first_commands = list.commands.clone();
+    // The demo HUD emits text commands whose payloads can be recycled.
+    let text_count = first_commands
+        .iter()
+        .filter(|c| matches!(c, UiCommand::Text { .. }))
+        .count();
+    assert!(text_count > 0);
+
+    // Re-render into the same list: commands stay identical and the
+    // recycled pool consumed as many heaps as this frame emitted.
+    ui.render_into(1280, 720, &mut list);
+    assert_eq!(list.commands, first_commands);
+    let pool_after_second = list.recycled_text_buffer_count();
+    assert!(
+        pool_after_second <= text_count,
+        "pool holds at most one frame's worth of payloads"
+    );
+
+    // Clearing recycles every Text payload; text_str drains them back.
+    let cap_before = list.commands.capacity();
+    list.clear();
+    assert!(list.commands.is_empty());
+    assert_eq!(list.commands.capacity(), cap_before);
+    assert_eq!(list.recycled_text_buffer_count(), text_count);
+    list.text_str(0, 0, 1, mc_spine_client_ui::draw::UiColor::rgb(1, 2, 3), "hud");
+    assert_eq!(list.recycled_text_buffer_count(), text_count - 1);
+    match &list.commands[0] {
+        UiCommand::Text { text, .. } => assert_eq!(text, "hud"),
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn render_into_matches_render_output_on_every_screen() {
+    for &(w, h) in &SIZES {
+        let mut ui = UiState::new();
+        for screen in all_screens(&mut ui) {
+            ui.navigate(screen);
+            let allocated = ui.render(w, h);
+            let mut reused = UiDrawList::new();
+            ui.render_into(w, h, &mut reused);
+            assert_eq!(
+                reused.commands, allocated.commands,
+                "{screen:?} at {w}x{h}"
+            );
+        }
+    }
+}
