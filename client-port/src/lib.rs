@@ -20,6 +20,7 @@ mod packed;
 mod region;
 mod section;
 pub mod shaderpack;
+pub mod shaderpack_reflect;
 pub mod upload_budget;
 pub mod visibility;
 

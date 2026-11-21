@@ -31,4 +31,5 @@
 
 pub mod draw;
 pub mod layout;
+pub mod shader_screen;
 pub mod state;
