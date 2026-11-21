@@ -9,15 +9,20 @@
 //
 // Surfaces wired under `--features mod-suite`:
 //   * `live_mod_suite_boot` — startup `mods/` scan over `MC_SPINE_MODS_DIR`
-//     (set in `main`, before the listener binds): every
-//     `BUILTIN_SUPERSEDED_PERF_MODS` entry is skipped before any bytecode
-//     work, every remaining JAR feeds the generic culinary auto-discovery
-//     (Farmer's Delight + addon `*:cooking` / `*:fermenting` / `*:cutting`
-//     recipes, item/block tags, `*:add_item` / `*:add_table` loot modifiers,
-//     food specs), and the pure-Rust `.class` Mixin scanner promotes mods
-//     whose only Tier 3 blockers are fully liftable `@Inject` sites to the
-//     bounded Tier 2 shim while unliftable mods stay Tier 3 with the exact
-//     offending site named.
+//     (set in `main`, before the listener binds) delegated 1:1 to
+//     `mod_adapter_core::auto_adapter::auto_adapt_mods_dir` — the same
+//     engine `mc-spine-mod-check --adapt-mods-dir` runs: renamed
+//     `BUILTIN_SUPERSEDED_PERF_MODS` entries are skipped before any
+//     bytecode read on their manifest-declared ids, loader metadata,
+//     data/culinary/dimension discovery, `.class` Mixin lifting, and
+//     `mc-spine-mod-bundle/1` synthesis all come from the adapter. Its
+//     emitted bundles register into `live_mod_unified_runtime()` next to
+//     standalone `*.bundle.json` files, the culinary registry feeds every
+//     discovered JAR (Farmer's Delight + addon `*:cooking` /
+//     `*:fermenting` / `*:cutting` recipes, item/block tags, `*:add_item`
+//     / `*:add_table` loot modifiers, food specs), and
+//     `live_mod_dispatch_hook` answers which lifted `LiftedBinding`s a
+//     standard event fires immediately after boot.
 //   * `live_mod_appleskin_sync` — per-tick `appleskin:exhaustion_sync` /
 //     `appleskin:saturation_sync` `CustomPacketPayload` emit on the play
 //     S2C `0x19` id (verified against `proto/src/data_v767.rs`'s
@@ -65,12 +70,14 @@ enum LiveProgressionVerdict {
 // ===========================================================================
 
 #[cfg(feature = "mod-suite")]
+use mod_adapter_core::auto_adapter::{
+    auto_adapt_jar, auto_adapt_mods_dir, AdaptationTier, AutoAdaptOptions, JarAdaptationResult,
+};
+#[cfg(feature = "mod-suite")]
 use mod_adapter_core::bytecode_subset_vm::{
     execute_verified_method, parse_class_methods, verify_subset_method, HostCallKind, SubsetVmHost,
     VerifiedMethod, VmError, VmValue, DEFAULT_FUEL,
 };
-#[cfg(feature = "mod-suite")]
-use mod_adapter_core::class_mixin_scanner::{scan_jar_mixins_with_options, JarScanOptions};
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::culinary_adapter::{
     CookResult, CookingPotState, CulinaryDiscoveryStats, CulinaryRegistry, CuttingOutcome,
@@ -81,20 +88,11 @@ use mod_adapter_core::ecosystem_compat::{
     DualLoaderPlan,
 };
 #[cfg(feature = "mod-suite")]
-use mod_adapter_core::fallback::{
-    classify_mod_with_mixins, is_builtin_superseded_mod, DiscoveredMod, ExecutionTier,
-    REASON_SUPERSEDED,
-};
-#[cfg(feature = "mod-suite")]
 use mod_adapter_core::mod_sync as lmb_sync;
 #[cfg(feature = "mod-suite")]
-use mod_adapter_core::mixin_lifter::{lift_mixin_sites, LiftedBinding, MixinLiftVerdict};
+use mod_adapter_core::mixin_lifter::{LiftedBinding, MixinLiftVerdict, StandardEventHook};
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::unified_bundle::{DeclarativeModBundle, UnifiedModRuntime};
-#[cfg(feature = "mod-suite")]
-use mod_adapter_core::modpack::infer_candidate_mod_id;
-#[cfg(feature = "mod-suite")]
-use mod_adapter_core::profile as lmb_profile;
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::version_compat::McVersion;
 #[cfg(feature = "mod-suite")]
@@ -121,14 +119,14 @@ fn live_mod_flagship_ids() -> BTreeSet<String> {
     BTreeSet::from(["create".to_string()])
 }
 
-/// Audit record for one scanned mod JAR: what the classifier decided and the
+/// Audit record for one scanned mod JAR: the `auto_adapter` verdict and the
 /// plain-language diagnostic the startup report prints.
 #[cfg(feature = "mod-suite")]
 #[derive(Clone, Debug)]
 struct LiveModJarReport {
     file_name: String,
     mod_id: String,
-    tier: ExecutionTier,
+    tier: AdaptationTier,
     diagnostic: String,
     classes_scanned: usize,
     mixin_sites: usize,
@@ -136,14 +134,16 @@ struct LiveModJarReport {
 }
 
 /// What was automatically onboarded from a JAR. Lifted bindings are installed
-/// only for a fully verified Tier 2 classification; Tier 3 is diagnostic.
+/// only for a fully verified [`AdaptationTier::Tier2LiftedShim`]
+/// classification; Tier 3 is diagnostic and auto-skipped JARs record no
+/// summary at all.
 #[cfg(feature = "mod-suite")]
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct AutoAdaptedModSummary {
     file_name: String,
     mod_id: String,
-    tier: ExecutionTier,
+    tier: AdaptationTier,
     lifted_hooks: Vec<LiftedBinding>,
     cooking_recipes: usize,
     cutting_recipes: usize,
@@ -240,11 +240,16 @@ impl LiveModSuite {
         jars
     }
 
-    /// Scan one `mods/` directory: superseded perf mods are skipped before
-    /// any bytecode work; every remaining JAR feeds the generic culinary
-    /// registry and the `.class` Mixin scanner, which promotes fully
-    /// liftable `@Inject` mods Tier 3 → bounded Tier 2 and reports the rest
-    /// as Tier 3 with exact diagnostics.
+    /// Scan one `mods/` directory. JAR classification is delegated 1:1 to
+    /// [`auto_adapt_mods_dir`] — the single source of truth shared with
+    /// `mc-spine-mod-check --adapt-mods-dir`: filename- and
+    /// manifest-declared superseded-perf-mod skips, loader metadata,
+    /// data/culinary/dimension discovery, `.class` Mixin lifting, and
+    /// `mc-spine-mod-bundle/1` synthesis all happen inside the adapter. The
+    /// bridge folds each [`JarAdaptationResult`] back into the live suite:
+    /// emitted bundles join the unified runtime, culinary stats aggregate
+    /// for the boot report, and fully lifted Tier 2 bindings arm
+    /// `live_mod_dispatch_hook`.
     fn scan_mods_dir(&mut self, dir: &std::path::Path) {
         if !dir.is_dir() {
             eprintln!(
@@ -255,12 +260,92 @@ impl LiveModSuite {
         }
         self.scan_bundles_dir(dir);
         let jars = Self::jar_listing(dir);
+        let options = AutoAdaptOptions {
+            target: LIVE_MOD_MC_TARGET,
+            flagship_mod_ids: live_mod_flagship_ids(),
+            ..AutoAdaptOptions::default()
+        };
+        // `auto_adapt_mods_dir` is fail-closed over the whole directory: one
+        // hostile or corrupt JAR aborts the pass. Boot must not lose every
+        // other mod to a single bad entry, so on `Err` the same engine runs
+        // per JAR (`auto_adapt_jar`) and failures land as Tier 3 rows —
+        // never silently dropped, never promoted.
+        let adapted: Vec<(String, Result<JarAdaptationResult, String>)> =
+            match auto_adapt_mods_dir(dir, &options) {
+                Ok(report) => {
+                    for note in &report.audit_notes {
+                        eprintln!("[live-mods] auto-adapt: {note}");
+                    }
+                    report
+                        .jars
+                        .into_iter()
+                        .map(|result| (result.jar.clone(), Ok(result)))
+                        .collect()
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[live-mods] auto-adaptation of {} failed ({error}); retrying per JAR",
+                        dir.display()
+                    );
+                    jars.iter()
+                        .map(|(file_name, path)| {
+                            (file_name.clone(), auto_adapt_jar(path, &options))
+                        })
+                        .collect()
+                }
+            };
+        // JARs the adapter culinary-scanned get their content merged into
+        // the live registry below — the report carries stats only.
+        let culinary_live: BTreeSet<&str> = adapted
+            .iter()
+            .filter_map(|(name, result)| {
+                result
+                    .as_ref()
+                    .ok()
+                    .filter(|r| r.culinary.is_some())
+                    .map(|_| name.as_str())
+            })
+            .collect();
+        for (file_name, result) in &adapted {
+            match result {
+                Ok(result) => self.adopt_jar_result(file_name, result),
+                Err(error) => {
+                    eprintln!("[live-mods] {file_name}: {error}");
+                    let mod_id = live_mod_file_stem(file_name);
+                    self.auto_adapted.push(AutoAdaptedModSummary {
+                        file_name: file_name.clone(),
+                        mod_id: mod_id.clone(),
+                        tier: AdaptationTier::Tier3FallbackRequired,
+                        lifted_hooks: Vec::new(),
+                        cooking_recipes: 0,
+                        cutting_recipes: 0,
+                        tag_files: 0,
+                        tag_values: 0,
+                    });
+                    self.reports.push(LiveModJarReport {
+                        file_name: file_name.clone(),
+                        mod_id,
+                        tier: AdaptationTier::Tier3FallbackRequired,
+                        diagnostic: error.clone(),
+                        classes_scanned: 0,
+                        mixin_sites: 0,
+                        skipped_client_mixins: 0,
+                    });
+                }
+            }
+        }
         let mut bounded_jars = Vec::new();
         for (file_name, path) in &jars {
-            self.scan_jar(file_name, path);
             if let Ok(metadata) = std::fs::metadata(path) {
                 if metadata.len() <= lmb_sync::MAX_MOD_JAR_BYTES {
                     if let Ok(bytes) = std::fs::read(path) {
+                        if culinary_live.contains(file_name.as_str()) {
+                            if let Err(error) = self.culinary.load_from_jar_bytes(&bytes) {
+                                eprintln!(
+                                    "[live-mods] {file_name}: culinary scan skipped: {error:?}"
+                                );
+                            }
+                        }
                         bounded_jars.push((file_name.clone(), bytes));
                     }
                 }
@@ -336,129 +421,145 @@ impl LiveModSuite {
             root_paths.sort();
             paths.extend(root_paths);
         }
-        let mut installed = BTreeSet::new();
         for path in paths {
-            let result = (|| {
+            let parsed = (|| -> Result<DeclarativeModBundle, String> {
                 let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
                 if metadata.len() > MAX_BUNDLE_BYTES {
                     return Err("bundle exceeds 4 MiB limit".to_string());
                 }
                 let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-                let bundle = DeclarativeModBundle::from_json(&json).map_err(|e| e.to_string())?;
-                if installed.contains(&bundle.mod_id) {
-                    return Err(format!("duplicate bundle mod id {}", bundle.mod_id));
-                }
-                let receipt = self.unified.register_bundle(&bundle, LIVE_MOD_MC_TARGET)
-                    .map_err(|e| e.to_string())?;
-                installed.insert(bundle.mod_id);
-                Ok(receipt)
+                DeclarativeModBundle::from_json(&json).map_err(|e| e.to_string())
             })();
-            match result {
-                Ok(receipt) => eprintln!(
-                    "[live-mods] auto-adapted native bundle {}: {} portals, {} progression barriers, {} regions, {} creatures, {} channels",
-                    receipt.mod_id, receipt.portals_installed, receipt.progression_barriers_installed,
-                    receipt.biome_regions_installed, receipt.creatures_installed,
-                    receipt.custom_channels_declared,
-                ),
-                Err(error) => eprintln!("[live-mods] bundle {} rejected: {error}", path.display()),
+            match parsed {
+                Ok(bundle) => self.install_bundle(&bundle, &path.display().to_string()),
+                Err(error) => {
+                    eprintln!("[live-mods] bundle {} rejected: {error}", path.display())
+                }
             }
         }
         self.barriers = self.unified.progression_engine();
     }
 
-    /// Classify + data-load one JAR file.
-    fn scan_jar(&mut self, file_name: &str, path: &std::path::Path) {
-        let mod_id = infer_candidate_mod_id(file_name)
-            .unwrap_or_else(|| file_name[..file_name.len() - 4].to_lowercase());
-        // Superseded perf mods never reach the scanner or the loader: their
-        // entire function already runs natively inside mc-spine.
-        if is_builtin_superseded_mod(&mod_id) {
-            self.reports.push(LiveModJarReport {
-                file_name: file_name.to_string(),
-                mod_id,
-                tier: ExecutionTier::BuiltInSuperseded,
-                diagnostic: REASON_SUPERSEDED.to_string(),
-                classes_scanned: 0,
-                mixin_sites: 0,
-                skipped_client_mixins: 0,
-            });
-            return;
-        }
-        let meta = match std::fs::metadata(path) {
-            Ok(meta) => meta,
-            Err(error) => {
-                eprintln!("[live-mods] {file_name}: cannot stat JAR: {error}");
-                return;
-            }
-        };
-        if meta.len() > lmb_sync::MAX_MOD_JAR_BYTES {
+    /// Install one validated `mc-spine-mod-bundle/1` document into the
+    /// unified runtime — the single registration path shared by standalone
+    /// `*.bundle.json` files and bundles the auto-adapter synthesized for
+    /// native JARs. First mod id wins (an operator's standalone bundle
+    /// beats a synthesized minimal one), barriers refresh on success.
+    fn install_bundle(&mut self, bundle: &DeclarativeModBundle, origin: &str) {
+        if self
+            .unified
+            .installed_mod_ids()
+            .iter()
+            .any(|id| id == &bundle.mod_id)
+        {
             eprintln!(
-                "[live-mods] {file_name}: {} bytes exceeds the {}-byte JAR bound — skipped",
-                meta.len(),
-                lmb_sync::MAX_MOD_JAR_BYTES
+                "[live-mods] bundle {origin}: duplicate mod id {} — skipped",
+                bundle.mod_id
             );
             return;
         }
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                eprintln!("[live-mods] {file_name}: cannot read JAR: {error}");
-                return;
+        match self.unified.register_bundle(bundle, LIVE_MOD_MC_TARGET) {
+            Ok(receipt) => {
+                eprintln!(
+                    "[live-mods] native bundle {} ({origin}): {} portals, {} progression barriers, {} regions, {} creatures, {} channels",
+                    receipt.mod_id, receipt.portals_installed, receipt.progression_barriers_installed,
+                    receipt.biome_regions_installed, receipt.creatures_installed,
+                    receipt.custom_channels_declared,
+                );
+                self.barriers = self.unified.progression_engine();
             }
-        };
-        // Generic culinary auto-discovery: only jars actually carrying
-        // `data/<ns>/{recipes,tags,loot_modifiers,food}` contribute, so this
-        // is safe to feed every content mod, not just Farmer's Delight.
-        let mut discovered = CulinaryDiscoveryStats::default();
-        match self.culinary.load_from_jar_bytes(&bytes) {
-            Ok(stats) => {
-                discovered = stats.clone();
-                let agg = &mut self.culinary_stats;
-                agg.jar_members += stats.jar_members;
-                agg.data_files += stats.data_files;
-                agg.cooking_recipes += stats.cooking_recipes;
-                agg.cutting_recipes += stats.cutting_recipes;
-                agg.skipped_recipes += stats.skipped_recipes;
-                agg.tag_files += stats.tag_files;
-                agg.tag_values += stats.tag_values;
-                agg.loot_modifiers += stats.loot_modifiers;
-                agg.food_specs += stats.food_specs;
-            }
-            Err(error) => {
-                eprintln!("[live-mods] {file_name}: culinary scan skipped: {error:?}");
-            }
+            Err(error) => eprintln!("[live-mods] bundle {origin} rejected: {error}"),
         }
-        let (tier, diagnostic, classes_scanned, mixin_sites, skipped_client_mixins) =
-            live_mod_classify(&mod_id, &bytes);
-        let lifted_hooks = if tier == ExecutionTier::BoundedJvmShim {
-            match scan_jar_mixins_with_options(&bytes, JarScanOptions::default()) {
-                Ok(scan) => match lift_mixin_sites(&scan.sites) {
-                    MixinLiftVerdict::FullyLiftable(hooks) if !hooks.is_empty() => hooks,
-                    _ => Vec::new(),
-                },
-                Err(_) => Vec::new(),
-            }
+    }
+
+    /// Fold one [`JarAdaptationResult`] into the live suite: install the
+    /// emitted bundle, aggregate the culinary stats, arm the lifted hook
+    /// bindings, and record the audit/summary rows the boot report reads.
+    /// Auto-skipped JARs report their skip but onboard nothing — exactly
+    /// what a superseded perf mod must do.
+    fn adopt_jar_result(&mut self, file_name: &str, result: &JarAdaptationResult) {
+        if let Some(bundle) = &result.bundle {
+            self.install_bundle(bundle, file_name);
+        }
+        if let Some(stats) = &result.culinary {
+            let agg = &mut self.culinary_stats;
+            agg.jar_members += stats.jar_members;
+            agg.data_files += stats.data_files;
+            agg.cooking_recipes += stats.cooking_recipes;
+            agg.cutting_recipes += stats.cutting_recipes;
+            agg.skipped_recipes += stats.skipped_recipes;
+            agg.tag_files += stats.tag_files;
+            agg.tag_values += stats.tag_values;
+            agg.loot_modifiers += stats.loot_modifiers;
+            agg.food_specs += stats.food_specs;
+        }
+        let mod_id = result
+            .mod_id()
+            .map(str::to_string)
+            .unwrap_or_else(|| live_mod_file_stem(file_name));
+        let (classes_scanned, mixin_sites, skipped_client_mixins) = result
+            .mixin_scan
+            .as_ref()
+            .map(|scan| {
+                (
+                    scan.classes_scanned,
+                    scan.sites.len(),
+                    scan.skipped_client_mixins,
+                )
+            })
+            .unwrap_or_default();
+        let lifted_hooks = if result.tier == AdaptationTier::Tier2LiftedShim {
+            result
+                .mixin_scan
+                .as_ref()
+                .map(|scan| live_lifted_bindings(&scan.verdict).to_vec())
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
         self.lifted_hooks.extend(
-            lifted_hooks.iter().cloned().map(|hook| (mod_id.clone(), hook))
+            lifted_hooks
+                .iter()
+                .cloned()
+                .map(|hook| (mod_id.clone(), hook)),
         );
-        self.auto_adapted.push(AutoAdaptedModSummary {
-            file_name: file_name.to_string(),
-            mod_id: mod_id.clone(),
-            tier,
-            lifted_hooks,
-            cooking_recipes: discovered.cooking_recipes,
-            cutting_recipes: discovered.cutting_recipes,
-            tag_files: discovered.tag_files,
-            tag_values: discovered.tag_values,
-        });
+        if result.tier != AdaptationTier::AutoSkipped {
+            self.auto_adapted.push(AutoAdaptedModSummary {
+                file_name: file_name.to_string(),
+                mod_id: mod_id.clone(),
+                tier: result.tier,
+                lifted_hooks,
+                cooking_recipes: result
+                    .culinary
+                    .as_ref()
+                    .map(|s| s.cooking_recipes)
+                    .unwrap_or_default(),
+                cutting_recipes: result
+                    .culinary
+                    .as_ref()
+                    .map(|s| s.cutting_recipes)
+                    .unwrap_or_default(),
+                tag_files: result
+                    .culinary
+                    .as_ref()
+                    .map(|s| s.tag_files)
+                    .unwrap_or_default(),
+                tag_values: result
+                    .culinary
+                    .as_ref()
+                    .map(|s| s.tag_values)
+                    .unwrap_or_default(),
+            });
+        }
         self.reports.push(LiveModJarReport {
             file_name: file_name.to_string(),
             mod_id,
-            tier,
-            diagnostic,
+            tier: result.tier,
+            diagnostic: if result.blockers.is_empty() {
+                result.audit_notes.join("; ")
+            } else {
+                result.blockers.join("; ")
+            },
             classes_scanned,
             mixin_sites,
             skipped_client_mixins,
@@ -547,21 +648,22 @@ impl LiveModSuite {
         completed
     }
 
-    /// Startup report: one line per tier group, then per-mod detail for
-    /// anything needing operator attention (lifted and unliftable alike).
+    /// Startup report: one line per adaptation tier, then per-mod detail
+    /// for anything needing operator attention (lifted and unliftable
+    /// alike).
     fn log_boot_report(&self, jars_seen: usize) {
         if self.reports.is_empty() {
             eprintln!("[live-mods] mods dir scanned: {jars_seen} jar(s), none classified");
             return;
         }
-        let count = |tier: ExecutionTier| self.reports.iter().filter(|r| r.tier == tier).count();
+        let count =
+            |tier: AdaptationTier| self.reports.iter().filter(|r| r.tier == tier).count();
         eprintln!(
-            "[live-mods] {jars_seen} jar(s): {} superseded, {} native, {} data-only, {} bounded-shim, {} tier3",
-            count(ExecutionTier::BuiltInSuperseded),
-            count(ExecutionTier::NativeFlagship),
-            count(ExecutionTier::UniversalNative),
-            count(ExecutionTier::BoundedJvmShim),
-            count(ExecutionTier::RequiresFallback),
+            "[live-mods] {jars_seen} jar(s): {} auto-skipped, {} native-bundle, {} tier2-shim, {} tier3",
+            count(AdaptationTier::AutoSkipped),
+            count(AdaptationTier::NativeBundle),
+            count(AdaptationTier::Tier2LiftedShim),
+            count(AdaptationTier::Tier3FallbackRequired),
         );
         let stats = &self.culinary_stats;
         if stats.cooking_recipes + stats.cutting_recipes + stats.loot_modifiers + stats.food_specs
@@ -586,7 +688,7 @@ impl LiveModSuite {
                 String::new()
             };
             match report.tier {
-                ExecutionTier::RequiresFallback => eprintln!(
+                AdaptationTier::Tier3FallbackRequired => eprintln!(
                     "[live-mods] {} ({}) tier3: {} classes, {} site(s){} — {}",
                     report.file_name,
                     report.mod_id,
@@ -595,8 +697,8 @@ impl LiveModSuite {
                     skipped,
                     report.diagnostic
                 ),
-                ExecutionTier::BoundedJvmShim => eprintln!(
-                    "[live-mods] {} ({}) bounded shim: {} classes, {} site(s){} — {}",
+                AdaptationTier::Tier2LiftedShim => eprintln!(
+                    "[live-mods] {} ({}) tier2 shim: {} classes, {} site(s){} — {}",
                     report.file_name,
                     report.mod_id,
                     report.classes_scanned,
@@ -863,6 +965,26 @@ fn live_mod_unified_runtime() -> UnifiedModRuntime {
         .clone()
 }
 
+/// The dispatch/query bridge over the lifted [`LiftedBinding`]s recorded
+/// at boot: every `(mod_id, binding)` pair subscribed to `hook`, in boot
+/// scan order. Callers fire a standard event by dispatching the returned
+/// bindings; an inactive suite (or a boot that never ran) answers empty —
+/// no manual step is needed between boot and the first query.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_dispatch_hook(hook: StandardEventHook) -> Vec<(String, LiftedBinding)> {
+    let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    if !suite.active {
+        return Vec::new();
+    }
+    suite
+        .lifted_hooks
+        .iter()
+        .filter(|(_, binding)| binding.hook == hook)
+        .cloned()
+        .collect()
+}
+
 /// The only capabilities exposed to verified damage bytecode. Each method
 /// receives a fresh host so that failures cannot leak partial mutations.
 #[cfg(feature = "mod-suite")]
@@ -1017,87 +1139,28 @@ fn live_mod_sync_manifest_for_client_probe(client_probe: Option<&[u8]>) -> Optio
     suite.mod_sync_body.clone()
 }
 
-/// Tier-classify one JAR's bytes: the pure-Rust `.class` scanner extracts
-/// every Mixin site, then `classify_mod_with_mixins` runs the shared
-/// superseded→version→flagship/profile→shim→fallback chain with the clean-room
-/// promotion step. Returns `(tier, diagnostic, classes, sites, skipped_client)`.
+/// The lifted bindings a [`MixinLiftVerdict`] carries — every binding when
+/// fully liftable, the diagnostic `lifted` prefix otherwise. Mirrors the
+/// adapter's internal selector; `auto_adapter` only promotes to Tier 2
+/// when this slice covers every site.
 #[cfg(feature = "mod-suite")]
-fn live_mod_classify(
-    mod_id: &str,
-    jar_bytes: &[u8],
-) -> (ExecutionTier, String, usize, usize, usize) {
-    let flagship = live_mod_flagship_ids();
-    let profiles: BTreeSet<String> = lmb_profile::builtin_reference_profiles()
-        .iter()
-        .map(|profile| profile.mod_id.clone())
-        .collect();
-    let report = match scan_jar_mixins_with_options(jar_bytes, JarScanOptions::default()) {
-        Ok(report) => report,
-        Err(error) => {
-            // A jar the parser cannot read is unverifiable — fail closed as
-            // Tier 3 with a non-mixin reason so promotion can never fire.
-            let m = DiscoveredMod {
-                mod_id: mod_id.to_string(),
-                has_java_bytecode: true,
-                shimcheck_compatible: false,
-                has_unsupported_mixin_or_at: false,
-                rejection_reasons: vec!["UNSCANNABLE_JAVA_MOD".to_string()],
-                mc_version_range: None,
-            };
-            let (tier, diagnostic, _) =
-                classify_mod_with_mixins(&m, &[], &flagship, &profiles, LIVE_MOD_MC_TARGET);
-            return (
-                tier,
-                format!("{diagnostic}; mixin scan failed closed: {error}"),
-                0,
-                0,
-                0,
-            );
-        }
-    };
-    let classes = report.classes_scanned;
-    let sites = report.sites.len();
-    let skipped_client = report.skipped_client_mixins;
-    let m = if sites == 0 {
-        if classes == 0 {
-            // Pure data pack in jar form — no bytecode at all.
-            DiscoveredMod {
-                mod_id: mod_id.to_string(),
-                has_java_bytecode: false,
-                shimcheck_compatible: false,
-                has_unsupported_mixin_or_at: false,
-                rejection_reasons: Vec::new(),
-                mc_version_range: None,
-            }
-        } else {
-            // Bytecode but zero mixin sites: the scanner proves nothing about
-            // `net.minecraft.*` API surface, so without a full ShimCheck this
-            // stays fail-closed Tier 3 rather than a blind Tier 2 grant.
-            DiscoveredMod {
-                mod_id: mod_id.to_string(),
-                has_java_bytecode: true,
-                shimcheck_compatible: false,
-                has_unsupported_mixin_or_at: false,
-                rejection_reasons: vec!["UNVERIFIED_JAVA_BYTECODE".to_string()],
-                mc_version_range: None,
-            }
-        }
-    } else {
-        // Mixin sites found: the recorded blockers are mixin-coded — the
-        // exact shape `classify_mod_with_mixins` needs before it will try
-        // lifting (promotion still requires every site to bind a hook).
-        DiscoveredMod {
-            mod_id: mod_id.to_string(),
-            has_java_bytecode: true,
-            shimcheck_compatible: false,
-            has_unsupported_mixin_or_at: true,
-            rejection_reasons: vec!["UNSUPPORTED_MIXIN_INJECTION".to_string()],
-            mc_version_range: None,
-        }
-    };
-    let (tier, diagnostic, _) =
-        classify_mod_with_mixins(&m, &report.sites, &flagship, &profiles, LIVE_MOD_MC_TARGET);
-    (tier, diagnostic, classes, sites, skipped_client)
+fn live_lifted_bindings(verdict: &MixinLiftVerdict) -> &[LiftedBinding] {
+    match verdict {
+        MixinLiftVerdict::FullyLiftable(bindings) => bindings,
+        MixinLiftVerdict::RequiresFallback { lifted, .. } => lifted,
+    }
+}
+
+/// Filename-stem fallback for a JAR the adapter reported without a mod id:
+/// the bare name lowercased, the same shape the old inferred-id fallback
+/// produced.
+#[cfg(feature = "mod-suite")]
+fn live_mod_file_stem(file_name: &str) -> String {
+    file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name)
+        .to_lowercase()
 }
 
 /// `custom_payload` S2C body: `write_str(channel) + raw payload` — the same
@@ -1522,6 +1585,9 @@ mod wire_mods_stub_tests {
 #[cfg(all(test, feature = "mod-suite"))]
 mod wire_mods_tests {
     use super::*;
+    use mod_adapter_core::auto_adapter::auto_adapt_jar_bytes;
+    use mod_adapter_core::class_mixin_scanner::{scan_jar_mixins_with_options, JarScanOptions};
+    use mod_adapter_core::fallback::REASON_SUPERSEDED;
     use mod_adapter_core::mixin_lifter::{
         InjectPoint, MixinAnnotationKind, MixinLiftVerdict, StandardEventHook,
     };
@@ -1919,8 +1985,19 @@ mod wire_mods_tests {
         ann(MIXIN, elems, true)
     }
 
+    /// A minimal `fabric.mod.json` giving a fixture jar a manifest-declared
+    /// mod id — without loader metadata the adapter (correctly) records a
+    /// no-manifest blocker and the jar can never leave Tier 3.
+    fn lmb_fabric_manifest(mod_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"schemaVersion":1,"id":"{mod_id}","version":"1.0.0","environment":"*"}}"#
+        )
+        .into_bytes()
+    }
+
     /// A `@Mixin(target)` class with one `@Inject(method, at = HEAD,
-    /// cancellable)` method — the liftable-injection fixture shape.
+    /// cancellable)` method — the liftable-injection fixture shape. The
+    /// manifest declares the package's last segment as the mod id.
     fn lmb_inject_jar(mod_pkg: &str, target: &str, method: &str) -> Vec<u8> {
         let class = build_class(
             &format!("{mod_pkg}/mixin/TestMixin"),
@@ -1942,7 +2019,9 @@ mod wire_mods_tests {
             r#"{{"required":true,"package":"{pkg}.mixin","mixins":["TestMixin"]}}"#,
             pkg = mod_pkg.replace('/', ".")
         );
+        let manifest = lmb_fabric_manifest(mod_pkg.rsplit('/').next().unwrap_or(mod_pkg));
         lmb_test_jar(&[
+            ("fabric.mod.json", manifest.as_slice()),
             ("test.mixins.json", config.as_bytes()),
             (
                 &format!("{mod_pkg}/mixin/TestMixin.class"),
@@ -1969,7 +2048,9 @@ mod wire_mods_tests {
             r#"{{"required":true,"package":"{pkg}.mixin","mixins":["RedirectMixin"]}}"#,
             pkg = mod_pkg.replace('/', ".")
         );
+        let manifest = lmb_fabric_manifest(mod_pkg.rsplit('/').next().unwrap_or(mod_pkg));
         lmb_test_jar(&[
+            ("fabric.mod.json", manifest.as_slice()),
             ("test.mixins.json", config.as_bytes()),
             (
                 &format!("{mod_pkg}/mixin/RedirectMixin.class"),
@@ -2197,7 +2278,7 @@ mod wire_mods_tests {
             "com/safemod", "net/minecraft/world/entity/LivingEntity", "hurt"
         )).unwrap();
         std::fs::write(dir.join("redirectmod-1.jar"), lmb_redirect_jar(
-            "com/redmod", "net/minecraft/world/entity/LivingEntity", "hurt"
+            "com/redirectmod", "net/minecraft/world/entity/LivingEntity", "hurt"
         )).unwrap();
         let previous = std::env::var_os("MC_SPINE_MODS_DIR");
         std::env::set_var("MC_SPINE_MODS_DIR", &dir);
@@ -2213,15 +2294,15 @@ mod wire_mods_tests {
         assert_eq!(suite.auto_adapted.iter().find(|m| m.mod_id == "delightaddon")
             .unwrap().tag_files, 1);
         let safe = suite.auto_adapted.iter().find(|m| m.mod_id == "safemod").unwrap();
-        assert_eq!(safe.tier, ExecutionTier::BoundedJvmShim);
+        assert_eq!(safe.tier, AdaptationTier::Tier2LiftedShim);
         assert_eq!(safe.lifted_hooks.len(), 1);
         assert_eq!(suite.lifted_hooks.len(), 1);
         assert_eq!(suite.lifted_hooks[0].1.hook, StandardEventHook::EntityDamagePre);
         let fallback = suite.auto_adapted.iter().find(|m| m.mod_id == "redirectmod").unwrap();
-        assert_eq!(fallback.tier, ExecutionTier::RequiresFallback);
+        assert_eq!(fallback.tier, AdaptationTier::Tier3FallbackRequired);
         assert!(fallback.lifted_hooks.is_empty());
         assert!(suite.reports.iter().any(|r| r.mod_id == "sodium"
-            && r.tier == ExecutionTier::BuiltInSuperseded));
+            && r.tier == AdaptationTier::AutoSkipped));
         drop(suite);
         fresh_suite();
         std::fs::remove_dir_all(dir).unwrap();
@@ -2259,7 +2340,7 @@ mod wire_mods_tests {
         std::fs::write(
             dir.join("redirectmod-2.0.jar"),
             lmb_redirect_jar(
-                "com/redmod",
+                "com/redirectmod",
                 "net/minecraft/world/entity/LivingEntity",
                 "hurt",
             ),
@@ -2275,8 +2356,12 @@ mod wire_mods_tests {
             .iter()
             .find(|r| r.mod_id == "sodium")
             .expect("sodium report");
-        assert_eq!(sodium.tier, ExecutionTier::BuiltInSuperseded);
-        assert_eq!(sodium.diagnostic, REASON_SUPERSEDED);
+        assert_eq!(sodium.tier, AdaptationTier::AutoSkipped);
+        assert!(
+            sodium.diagnostic.contains(REASON_SUPERSEDED),
+            "{}",
+            sodium.diagnostic
+        );
         assert_eq!(
             sodium.classes_scanned, 0,
             "superseded jars are never scanned"
@@ -2295,7 +2380,7 @@ mod wire_mods_tests {
             .is_some());
         assert!(suite.culinary.food_spec("delightaddon:test_soup").is_some());
 
-        // The safe @Inject jar promotes Tier 3 -> bounded Tier 2.
+        // The safe @Inject jar promotes to the lifted Tier 2 shim.
         let safe = suite
             .reports
             .iter()
@@ -2303,7 +2388,7 @@ mod wire_mods_tests {
             .expect("safemod report");
         assert_eq!(
             safe.tier,
-            ExecutionTier::BoundedJvmShim,
+            AdaptationTier::Tier2LiftedShim,
             "{}",
             safe.diagnostic
         );
@@ -2315,7 +2400,7 @@ mod wire_mods_tests {
             .iter()
             .find(|r| r.mod_id == "redirectmod")
             .expect("redirectmod report");
-        assert_eq!(redirect.tier, ExecutionTier::RequiresFallback);
+        assert_eq!(redirect.tier, AdaptationTier::Tier3FallbackRequired);
         assert!(
             redirect.diagnostic.to_uppercase().contains("MIXIN"),
             "{}",
@@ -2327,24 +2412,173 @@ mod wire_mods_tests {
     #[test]
     fn wire_mods_classify_data_only_and_unverified_bytecode() {
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // No `.class` members at all -> pure data jar -> Tier 1.
+        let options = AutoAdaptOptions {
+            target: LIVE_MOD_MC_TARGET,
+            ..AutoAdaptOptions::default()
+        };
+        // No `.class` members at all -> pure data jar -> native bundle.
         let data_jar = lmb_test_jar(&[("data/x/recipes/a.json", br#"{"type":"x:y"}"#)]);
-        let (tier, _, classes, sites, _) = live_mod_classify("datamod", &data_jar);
-        assert_eq!(tier, ExecutionTier::UniversalNative);
-        assert_eq!((classes, sites), (0, 0));
+        let result = auto_adapt_jar_bytes(&data_jar, "datamod.jar", &options).unwrap();
+        assert_eq!(result.tier, AdaptationTier::NativeBundle);
+        assert_eq!(result.data.java_class_members, 0);
+        assert_eq!(
+            result.bundle.as_ref().map(|b| b.mod_id.as_str()),
+            Some("datamod"),
+            "the synthesized bundle carries the filename-inferred mod id"
+        );
 
-        // Bytecode present but no mixin sites -> fail-closed Tier 3.
+        // Bytecode present but no mixin sites -> fail-closed Tier 3. The
+        // manifest keeps the loader-metadata blocker out so the exact
+        // bytecode blocker is what lands.
         let cls = build_class("com/codemod/Thing", vec![], vec![]);
-        let code_jar = lmb_test_jar(&[("com/codemod/Thing.class", cls.as_slice())]);
-        let (tier, diagnostic, classes, sites, _) = live_mod_classify("codemod", &code_jar);
-        assert_eq!(tier, ExecutionTier::RequiresFallback, "{diagnostic}");
-        assert_eq!(sites, 0);
-        assert!(classes > 0);
+        let manifest = lmb_fabric_manifest("codemod");
+        let code_jar = lmb_test_jar(&[
+            ("fabric.mod.json", manifest.as_slice()),
+            ("com/codemod/Thing.class", cls.as_slice()),
+        ]);
+        let result = auto_adapt_jar_bytes(&code_jar, "codemod.jar", &options).unwrap();
+        assert_eq!(result.tier, AdaptationTier::Tier3FallbackRequired);
+        assert!(result
+            .mixin_scan
+            .as_ref()
+            .is_some_and(|scan| scan.sites.is_empty()));
+        assert!(
+            result
+                .blockers
+                .iter()
+                .any(|b| b.contains("no liftable mixin sites")),
+            "{:?}",
+            result.blockers
+        );
 
-        // A truncated jar cannot even be scanned -> Tier 3, scan diagnostic.
-        let (tier, diagnostic, _, _, _) = live_mod_classify("badmod", &[0x50, 0x4b, 1, 2]);
-        assert_eq!(tier, ExecutionTier::RequiresFallback, "{diagnostic}");
-        assert!(diagnostic.contains("UNSCANNABLE"), "{diagnostic}");
+        // A truncated jar fails closed: the adaptation pass reports Err
+        // rather than guessing at a mod it cannot read.
+        assert!(auto_adapt_jar_bytes(&[0x50, 0x4b, 1, 2], "badmod.jar", &options).is_err());
+    }
+
+    // ---------- auto-adapter unified path ----------
+
+    #[test]
+    fn live_mod_bridge_renamed_superseded_mod_auto_skips() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let dir = lmb_temp_dir("renamed-superseded");
+        // The filename infers "harmless-tweaks" — only the manifest-declared
+        // id reveals the superseded perf mod; `auto_adapt_mods_dir` still
+        // skips it before a single `.class` byte is read.
+        let manifest =
+            br#"{"schemaVersion":1,"id":"lithium","version":"9.9.9","environment":"*"}"#;
+        std::fs::write(
+            dir.join("harmless-tweaks-1.0.jar"),
+            lmb_test_jar(&[("fabric.mod.json", manifest)]),
+        )
+        .unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        let report = suite
+            .reports
+            .iter()
+            .find(|r| r.mod_id == "lithium")
+            .expect("lithium report");
+        assert_eq!(report.tier, AdaptationTier::AutoSkipped);
+        assert_eq!(
+            report.classes_scanned, 0,
+            "superseded jars are never scanned"
+        );
+        assert!(
+            report.diagnostic.contains(REASON_SUPERSEDED),
+            "{}",
+            report.diagnostic
+        );
+        // A skipped jar reports its skip but onboards nothing.
+        assert!(suite.auto_adapted.iter().all(|m| m.mod_id != "lithium"));
+        assert!(suite.lifted_hooks.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_mod_bridge_synthesized_and_standalone_bundles_live_after_boot() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let dir = lmb_temp_dir("synth-register");
+        // A standalone bundle carrying a progression gate + channel, next
+        // to a native data jar the adapter synthesizes a bundle for.
+        std::fs::write(
+            dir.join("farmersdelight-1.0.jar"),
+            lmb_culinary_jar("farmersdelight"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("gated.bundle.json"),
+            r#"{"schema":"mc-spine-mod-bundle/1","mod_id":"gated_pack","mc_version_range":"[1.21,)","portals":[],"progression_barriers":[{"id":"gated_pack:seal","dimension":"minecraft:overworld","target_biomes":["minecraft:plains"],"required_advancements":["minecraft:story/mine_diamond"],"block_break_protected":true,"block_place_protected":false,"enforce_effects":[],"periodic_damage":null}],"biome_regions":[],"creatures":[],"custom_channels":["gated_pack:sync"]}"#,
+        )
+        .unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+
+        // Standalone files register first; the adapter's synthesized
+        // `mc-spine-mod-bundle/1` for the native jar joins the same
+        // runtime — one registry, zero manual steps.
+        assert_eq!(
+            suite.unified.installed_mod_ids(),
+            &["gated_pack", "farmersdelight"]
+        );
+        assert!(suite.unified.is_channel_registered("gated_pack:sync"));
+        // The standalone bundle's rules already gate in the barrier engine
+        // the boot scan refreshed.
+        assert!(matches!(
+            suite.barriers.check_progression(
+                "minecraft:overworld",
+                "minecraft:plains",
+                &BTreeSet::new(),
+                false,
+            ),
+            ProgressionVerdict::Locked { .. }
+        ));
+        // And the native jar's discovered culinary content is live too.
+        assert!(suite
+            .culinary
+            .food_spec("farmersdelight:test_soup")
+            .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_mod_bridge_dispatch_hook_answers_lifted_bindings_after_boot() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let dir = lmb_temp_dir("dispatch");
+        std::fs::write(
+            dir.join("safemod-1.0.jar"),
+            lmb_inject_jar(
+                "com/safemod",
+                "net/minecraft/world/entity/LivingEntity",
+                "hurt",
+            ),
+        )
+        .unwrap();
+        let previous = std::env::var_os("MC_SPINE_MODS_DIR");
+        std::env::set_var("MC_SPINE_MODS_DIR", &dir);
+        live_mod_suite_boot();
+        if let Some(value) = previous {
+            std::env::set_var("MC_SPINE_MODS_DIR", value);
+        } else {
+            std::env::remove_var("MC_SPINE_MODS_DIR");
+        }
+
+        // The lifted JAR's binding fires EntityDamagePre — live-queryable
+        // the instant boot returns.
+        let fired = live_mod_dispatch_hook(StandardEventHook::EntityDamagePre);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].0, "safemod");
+        assert_eq!(fired[0].1.site.mixin_class, "com/safemod/mixin/TestMixin");
+        assert!(fired[0].1.cancellable);
+        assert!(live_mod_dispatch_hook(StandardEventHook::BlockBreakPre).is_empty());
+
+        // An inactive suite dispatches nothing.
+        fresh_suite();
+        assert!(live_mod_dispatch_hook(StandardEventHook::EntityDamagePre).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------- appleskin wire ----------
@@ -2686,7 +2920,7 @@ mod wire_mods_tests {
         assert_eq!(bindings[0].hook, StandardEventHook::EntityDamagePre);
 
         let jar = lmb_redirect_jar(
-            "com/redmod",
+            "com/redirectmod",
             "net/minecraft/world/entity/LivingEntity",
             "hurt",
         );
