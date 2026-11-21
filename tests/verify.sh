@@ -97,6 +97,8 @@ python3 tools/vanilla_data/version_pack.py --self-test
 python3 tools/parity_cache.py --self-test
 python3 tools/release_bundle.py --self-test
 python3 tests/dev_check_test.py
+python3 tests/megu_translate_test.py
+python3 tests/live_parity_e2e_wire.py --self-test
 python3 website/check_site.py
 python3 tests/verify_gate_coverage_test.py
 
@@ -179,6 +181,7 @@ timeout 180 python3 tests/gp2_nether_spawn_wire.py "$binary"
 timeout 180 python3 tests/command_brigadier_ops_wire.py "$binary"
 timeout 180 python3 tests/command_datapack_wire.py
 timeout 180 python3 tests/w1_w3_live_wire.py "$binary"
+timeout 180 python3 tests/live_parity_e2e_wire.py "$binary"
 timeout 180 python3 tests/client_prediction_wire.py --binary "$binary"
 timeout 180 python3 tests/client_inventory_pickup_wire.py --binary "$binary"
 timeout 180 python3 tests/client_kernel_wire.py "$binary"
@@ -190,6 +193,8 @@ cargo check --offline --locked -j 2 --features fabric-probe
 cargo check --offline --locked -j 2 --features neoforge-events
 cargo check --offline --locked -j 2 --features create-offload
 cargo test --offline --locked -j 2 --features create-offload -- --test-threads=1 aeronautics_and_dim_bridge_tests
+cargo check --offline --locked -j 2 --features mod-suite
+cargo test --offline --locked -j 2 --features mod-suite -- --test-threads=1 wire_mods_
 
 # Last, because it is the slowest: prove the gates can still fail. A suite that is green over a gate
 # that cannot fail reports safety it does not have, and this is the only check that would notice.
