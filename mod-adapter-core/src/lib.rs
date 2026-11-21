@@ -18,6 +18,15 @@
 //!   mod portals (vertical frames, fluid pools, rocket ascent, interact
 //!   blocks), per-dimension environment profiles, and >64-section light
 //!   masks for tall custom dimensions.
+//! - [`ecosystem_compat`]: top-100 generic ecosystem primitives — map-mod
+//!   fair-play mode (Xaero control codes + level-id plugin payloads client
+//!   side, occluded-entity radar suppression server side, identical on
+//!   dedicated servers and friend hosts), a unified Curios/Trinkets
+//!   [`ecosystem_compat::AccessoryInventory`] with vanilla three-stage
+//!   attribute aggregation and `ACC1` persistence, and the dual-loader
+//!   (`fabric.mod.json` + `META-INF/neoforge.mods.toml`) JAR scanner feeding
+//!   [`ecosystem_compat::plan_dual_loader_mods_dir`]'s unified Fabric +
+//!   NeoForge mod table.
 //! - [`fallback`]: 4-tier mod execution classifier and safe fallback planner
 //!   (`Strict`, `Quarantine` with Save v2 block-loss guard, `DelegateNeoForge`),
 //!   plus [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`] superseding of redundant
@@ -93,6 +102,7 @@ pub mod creature_primitives;
 pub mod culinary_adapter;
 pub mod data_loader;
 pub mod dimension_mod;
+pub mod ecosystem_compat;
 pub mod fallback;
 pub mod mixin_lifter;
 pub mod modpack;
