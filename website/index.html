@@ -4,9 +4,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Megu — Minecraft-compatible engine written in Rust</title>
+  <title>Megu — Vanilla &amp; Modpacks, rebuilt in Rust</title>
   <meta name="description"
-        content="Megu (codename mc-spine) is an experimental Minecraft-compatible server and client engine written in Rust for Java Edition 1.21.1 and 26.3.">
+        content="Megu (codename mc-spine) is an experimental Minecraft: Java Edition 1.21.1 &amp; 26.3 server and client engine written in Rust with tiered NeoForge/Fabric mod support.">
   <link rel="stylesheet" href="style.css">
   <script src="site-config.js"></script>
   <script src="app.js" defer></script>
@@ -16,14 +16,15 @@
   <header class="nav">
     <div class="nav-inner">
       <a class="brand" href="#top" data-cfg="projectName">Megu</a>
-      <span class="status-tag" data-cfg="statusBadge">Experimental Alpha</span>
       <nav class="nav-links" aria-label="Primary">
-        <a href="#quickstart">Quickstart</a>
-        <a href="#checker">Modpack check</a>
-        <a href="#compatibility">Compatibility</a>
+        <a href="#checker" data-i18n="nav_checker">Modpack check</a>
+        <a href="#how" data-i18n="nav_how">How it works</a>
+        <a href="#quickstart" data-i18n="nav_quickstart">Quickstart</a>
+        <a href="#scope" data-i18n="nav_scope">Status</a>
         <a href="https://github.com/nekomario28/mc-spine"
            data-cfg-href="githubUrl">GitHub</a>
       </nav>
+      <button class="lang-toggle" id="lang-toggle" type="button" aria-label="Switch language">日本語</button>
     </div>
   </header>
 
@@ -31,100 +32,66 @@
 
     <section class="hero">
       <div class="wrap">
-        <h1 data-cfg="projectName">Megu</h1>
-        <p class="lead" data-cfg="valueProp">A Rust-native Minecraft server &amp; client runtime with tiered NeoForge/Fabric mod compatibility and Velocity forwarding support.</p>
-        <div class="meta-row">
-          <div class="pills" id="target-pills">
+        <p class="eyebrow">
+          <span>Minecraft: Java Edition</span>
+          <span class="pills" id="target-pills">
             <span class="pill">1.21.1 <span class="pill-tag">LTS</span></span>
             <span class="pill latest">26.3 <span class="pill-tag">Latest</span></span>
-          </div>
-          <span class="meta-sep" aria-hidden="true">·</span>
-          <span class="meta-item">GPL-3.0-or-later</span>
-          <span class="meta-sep" aria-hidden="true">·</span>
-          <span class="meta-item">Zero Mojang assets bundled</span>
-        </div>
+          </span>
+          <span class="sep" aria-hidden="true">·</span>
+          <span>Written in Rust</span>
+          <span class="sep" aria-hidden="true">·</span>
+          <span data-cfg="statusBadge">Experimental Alpha</span>
+        </p>
+
+        <h1 class="hero-title">
+          <span data-cfg="projectName">Megu</span>:
+          <span class="hero-sub" data-i18n="hero_headline">Vanilla &amp; Modpacks, rebuilt in Rust.</span>
+        </h1>
+
+        <p class="lead" data-i18n="hero_lead">
+          An open-source Minecraft server, mod runtime, and companion client toolkit written in Rust —
+          checked against vanilla 1.21.1, ready for 26.3 migration, with native engines for popular mods and safe fallback when Java is still needed.
+        </p>
+
         <div class="hero-actions">
-          <a class="btn primary" href="#quickstart">Get started</a>
-          <a class="btn" href="https://github.com/nekomario28/mc-spine"
-             data-cfg-href="githubUrl">Source on GitHub</a>
+          <a class="btn primary" href="#quickstart" data-i18n="cta_start">Get started</a>
+          <a class="btn" href="#checker" data-i18n="cta_check">Check a modpack</a>
+          <a class="btn ghost" href="https://github.com/nekomario28/mc-spine"
+             data-cfg-href="githubUrl" data-i18n="cta_github">View on GitHub</a>
         </div>
-      </div>
-    </section>
-
-    <section id="quickstart">
-      <div class="wrap">
-        <h2>Quickstart</h2>
-        <div class="steps">
-          <div class="step">
-            <div class="step-label">1. Initialize a server directory</div>
-            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-init init --dir ./server --mc-version 1.21.1">mc-spine-init init --dir ./server --mc-version 1.21.1</code></pre>
-          </div>
-          <div class="step">
-            <div class="step-label">2. Check a modpack before launch</div>
-            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-mod-check --modpack ./my-pack.mrpack --mc-version 1.21.1">mc-spine-mod-check --modpack ./my-pack.mrpack --mc-version 1.21.1</code></pre>
-          </div>
-          <div class="step">
-            <div class="step-label">3. Accept eula.txt and start</div>
-            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="cd ./server &amp;&amp; {{cli}}">cd ./server &amp;&amp; mc-spine</code></pre>
-          </div>
-        </div>
-
-        <details class="more-cmds">
-          <summary>Docker, world migration, server ping &amp; source build</summary>
-          <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="# Docker (requires explicit EULA=TRUE)
-docker build -f docker/Dockerfile -t {{cli}}:alpha .
-docker run --name {{cli}} -e EULA=TRUE -p 25565:25565 -v {{cli}}-data:/data {{cli}}:alpha
-
-# Inspect or migrate a world between 1.21.1 and 26.3
-{{cli}}-world-migrate inspect-anvil ./world
-{{cli}}-world-migrate migrate-level --in ./world/level.dat --out ./world/level.dat --to 26.3 --backup-old
-
-# Probe a running server (SRV-aware, 1.21.1 or 26.3)
-{{cli}}-client --ping localhost:25565
-
-# Build from source (Rust 1.98.0)
-cargo run --locked"># Docker (requires explicit EULA=TRUE)
-docker build -f docker/Dockerfile -t mc-spine:alpha .
-docker run --name mc-spine -e EULA=TRUE -p 25565:25565 -v mc-spine-data:/data mc-spine:alpha
-
-# Inspect or migrate a world between 1.21.1 and 26.3
-mc-spine-world-migrate inspect-anvil ./world
-mc-spine-world-migrate migrate-level --in ./world/level.dat --out ./world/level.dat --to 26.3 --backup-old
-
-# Probe a running server (SRV-aware, 1.21.1 or 26.3)
-mc-spine-client --ping localhost:25565
-
-# Build from source (Rust 1.98.0)
-cargo run --locked</code></pre>
-        </details>
       </div>
     </section>
 
     <section id="checker">
       <div class="wrap">
         <div class="section-head">
-          <h2>Modpack check</h2>
-          <p class="section-note">Runs locally in this tab — nothing is uploaded.</p>
+          <h2 data-i18n="checker_title">Check your modpack right here.</h2>
+          <p class="section-note" data-i18n="checker_note">Runs entirely in this tab — nothing is uploaded.</p>
         </div>
+        <p class="section-desc" data-i18n="checker_desc">
+          Drop a Modrinth <code>.mrpack</code> or CurseForge <code>.zip</code> to see which optimization mods are skipped automatically,
+          which mods run natively in Rust, and which JARs still need a JVM bridge or fallback.
+        </p>
 
         <div class="checker">
           <div class="checker-controls">
             <label class="target-select">
-              Target
+              <span data-i18n="checker_target">Target</span>
               <select id="mc-target-select">
                 <option value="1.21.1" selected>1.21.1</option>
                 <option value="26.3">26.3</option>
               </select>
             </label>
-            <button class="btn small" id="sample-pack-btn" type="button">
+            <button class="btn small" id="sample-pack-btn" type="button" data-i18n="checker_sample">
               Load sample pack
             </button>
           </div>
 
           <div class="dropzone" id="dropzone" role="button" tabindex="0"
                aria-label="Drop a modpack archive or manifest here or click to browse">
-            <strong>Drop a <code>.mrpack</code>, CurseForge <code>.zip</code>, or manifest <code>.json</code></strong>
-            <span class="hint">or click to browse</span>
+            <strong data-i18n="checker_drop">Drop a <code>.mrpack</code>, CurseForge <code>.zip</code>, or manifest <code>.json</code></strong>
+            <span class="hint" data-i18n="checker_hint">or click to browse</span>
             <input type="file" id="file-input" accept=".mrpack,.zip,.json" hidden>
           </div>
 
@@ -142,7 +109,7 @@ cargo run --locked</code></pre>
               </table>
             </div>
             <details class="report-details">
-              <summary>JSON report &amp; plain-text summary</summary>
+              <summary data-i18n="checker_raw">JSON report &amp; plain-text summary</summary>
               <pre class="code"><button class="copy-btn" type="button">copy</button><code id="report-json"></code></pre>
               <pre class="code"><button class="copy-btn" type="button">copy</button><code id="report-summary"></code></pre>
             </details>
@@ -151,33 +118,115 @@ cargo run --locked</code></pre>
       </div>
     </section>
 
-    <section id="compatibility">
+    <section id="how">
       <div class="wrap">
-        <h2>Compatibility &amp; current scope</h2>
+        <h2 data-i18n="how_title">Same worlds, less overhead.</h2>
+        <div class="pillars">
+          <article class="pillar">
+            <h3 data-i18n="p1_title">Your own server.jar</h3>
+            <p data-i18n="p1_body">
+              No Mojang binaries or assets are ever shipped. Runtime tables are generated locally from your own official Minecraft jar on first setup.
+            </p>
+          </article>
+          <article class="pillar">
+            <h3 data-i18n="p2_title">Drop-in modpacks</h3>
+            <p data-i18n="p2_body">
+              36 performance mods (Sodium, Lithium, ModernFix, Distant Horizons, and more) are skipped automatically.
+              Create kinetics, Farmer's Delight &amp; addons, and OpenPAC/FTB Chunks have clean-room Rust engines; unsupported Mixins delegate safely to NeoForge.
+            </p>
+          </article>
+          <article class="pillar">
+            <h3 data-i18n="p3_title">Built for every GPU</h3>
+            <p data-i18n="p3_body">
+              Selectable client rendering path: Vulkan Mesh Shaders (RTX, Radeon RDNA2+, Arc), Compute + Multi-Draw Indirect,
+              and a low-VRAM UBO path designed for older Intel HD/UHD integrated graphics.
+            </p>
+          </article>
+          <article class="pillar">
+            <h3 data-i18n="p4_title">Clean-room open source</h3>
+            <p data-i18n="p4_body">
+              Written from scratch in Rust with zero external crates in the core workspace. Root licensed GPL-3.0-or-later;
+              first-party crates triple-licensed LGPL/GPL/AGPL-3.0-or-later.
+            </p>
+          </article>
+        </div>
+      </div>
+    </section>
 
-        <div class="grid-2">
-          <div class="card">
-            <h3>Mod execution</h3>
-            <dl class="spec-list">
-              <dt>Auto-skipped performance mods</dt>
-              <dd>Recognizes 36 common client/server optimization mods (such as Sodium, Lithium, ModernFix, Distant Horizons) and skips loading them because equivalent behavior is built in natively.</dd>
-              <dt>Native &amp; data-driven mods</dt>
-              <dd>Datapacks, resource packs, Create kinetics/contraptions, Farmer's Delight &amp; culinary addons, and OpenPAC/FTB Chunks claims run in Rust without a JVM.</dd>
-              <dt>Standard Java mods &amp; fallback</dt>
-              <dd>Standard NeoForge/Fabric mods run via a bounded bridge; heavy Mixin mods either stay quarantined or delegate safely to upstream NeoForge.</dd>
-            </dl>
+    <section id="quickstart">
+      <div class="wrap">
+        <h2 data-i18n="qs_title">Three commands to launch.</h2>
+        <div class="steps">
+          <div class="step">
+            <div class="step-label" data-i18n="qs_1">1. Initialize a server directory</div>
+            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-init init --dir ./server --mc-version 1.21.1">mc-spine-init init --dir ./server --mc-version 1.21.1</code></pre>
           </div>
+          <div class="step">
+            <div class="step-label" data-i18n="qs_2">2. Inspect a modpack or mods/ folder (no JVM needed)</div>
+            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-mod-check --scan-mods-dir ./server/mods">mc-spine-mod-check --scan-mods-dir ./server/mods</code></pre>
+          </div>
+          <div class="step">
+            <div class="step-label" data-i18n="qs_3">3. Accept eula.txt and start</div>
+            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="cd ./server &amp;&amp; {{cli}}">cd ./server &amp;&amp; mc-spine</code></pre>
+          </div>
+        </div>
 
-          <div class="card">
-            <h3>Server &amp; client status</h3>
-            <dl class="spec-list">
-              <dt>Working today</dt>
-              <dd>Vanilla 1.21.1 protocol, worldgen parity, online-mode auth, Velocity modern forwarding, RCON, ops/bans/whitelist, autosave &amp; backups, and 26.3 wire/migration tooling.</dd>
-              <dt>In progress</dt>
-              <dd>Full vanilla combat/gamerule parity, native Anvil live storage, standalone GPU client rendering, and broader live mod coverage.</dd>
-              <dt>Out of scope</dt>
-              <dd>Bukkit/Spigot/Paper plugins (use Velocity proxy plugins or NeoForge/Fabric mods instead).</dd>
-            </dl>
+        <details class="more-cmds">
+          <summary data-i18n="qs_more">Docker, world migration (1.21.1 ↔ 26.3), server ping, voice relay &amp; source build</summary>
+          <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="# Docker (requires explicit EULA=TRUE)
+docker build -f docker/Dockerfile -t {{cli}}:alpha .
+docker run --name {{cli}} -e EULA=TRUE -p 25565:25565 -v {{cli}}-data:/data {{cli}}:alpha
+
+# Inspect or migrate a Vanilla world between 1.21.1 and 26.3
+{{cli}}-world-migrate inspect-anvil ./world
+{{cli}}-world-migrate migrate-level --in ./world/level.dat --out ./world/level.dat --to 26.3 --backup-old
+
+# Probe a running server (SRV-aware, 1.21.1 or 26.3)
+{{cli}}-client --ping localhost:25565
+
+# Run the standalone UDP proximity voice relay self-test
+{{cli}}-voice-relay --self-test
+
+# Build from source (Rust 1.98.0)
+cargo run --locked"># Docker (requires explicit EULA=TRUE)
+docker build -f docker/Dockerfile -t mc-spine:alpha .
+docker run --name mc-spine -e EULA=TRUE -p 25565:25565 -v mc-spine-data:/data mc-spine:alpha
+
+# Inspect or migrate a Vanilla world between 1.21.1 and 26.3
+mc-spine-world-migrate inspect-anvil ./world
+mc-spine-world-migrate migrate-level --in ./world/level.dat --out ./world/level.dat --to 26.3 --backup-old
+
+# Probe a running server (SRV-aware, 1.21.1 or 26.3)
+mc-spine-client --ping localhost:25565
+
+# Run the standalone UDP proximity voice relay self-test
+mc-spine-voice-relay --self-test
+
+# Build from source (Rust 1.98.0)
+cargo run --locked</code></pre>
+        </details>
+      </div>
+    </section>
+
+    <section id="scope">
+      <div class="wrap">
+        <h2 data-i18n="scope_title">Current status</h2>
+        <div class="scope-grid">
+          <div class="scope-col">
+            <h3 data-i18n="scope_now_h">Available in Alpha</h3>
+            <ul>
+              <li data-i18n="scope_now_1">Vanilla 1.21.1 protocol, online-mode AES-CFB8 auth, and Velocity modern forwarding</li>
+              <li data-i18n="scope_now_2">Deterministic worldgen, random ticks, villagers, commands, ops/bans/whitelist, RCON, and async backups</li>
+              <li data-i18n="scope_now_3">Standalone CLI suite: server bootstrapper &amp; OpenPAC claims, zero-JVM mod/Mixin scanner, Anvil &amp; 26.3 migrator, SRV client ping, and UDP voice relay</li>
+            </ul>
+          </div>
+          <div class="scope-col">
+            <h3 data-i18n="scope_wip_h">Still in progress</h3>
+            <ul>
+              <li data-i18n="scope_wip_1">Full vanilla parity across combat, remaining gamerules, and general-seed worldgen</li>
+              <li data-i18n="scope_wip_2">Native Anvil live world storage and broader live modpack execution</li>
+              <li data-i18n="scope_wip_3">Standalone GPU client rendering (Bukkit/Spigot/Paper plugins are out of scope — use Velocity plugins or NeoForge/Fabric mods)</li>
+            </ul>
           </div>
         </div>
       </div>
@@ -198,13 +247,87 @@ cargo run --locked</code></pre>
           <a href="https://github.com/nekomario28/mc-spine/tree/main/docs" data-cfg-href="docsBaseUrl">Docs</a>
         </div>
       </div>
-      <p class="foot-legal">
-        Clean-room Rust implementation. Root licensed <code>GPL-3.0-or-later</code>; first-party crates <code>LGPL/GPL/AGPL-3.0-or-later</code>.
-        No Mojang files or third-party mod code bundled; not an official Minecraft product.
+      <p class="foot-legal" data-i18n="footer_legal">
+        Independent clean-room open-source project. Not affiliated with or endorsed by Mojang, Microsoft, or any listed mod authors.
       </p>
       <p class="deploy-note" id="deploy-note"></p>
     </div>
   </footer>
+
+  <script>
+  (function () {
+    "use strict";
+    var JA = {
+      nav_checker: "Modpack診断",
+      nav_how: "仕組み",
+      nav_quickstart: "クイックスタート",
+      nav_scope: "対応状況",
+      hero_headline: "Vanilla も Modpack も、Rust で軽く。",
+      hero_lead: "Java Edition 1.21.1 互換検証と 26.3 移行を備えた、日本発のオープンソース Rust 製 Minecraft 互換エンジン。定番 Mod のクリーンルーム実装と安全なフォールバックで、サーバーからクライアント基盤まで軽量に動かします。",
+      cta_start: "はじめる",
+      cta_check: "Modpackを診断する",
+      cta_github: "GitHub を見る",
+      checker_title: "手元の Modpack をその場で診断。",
+      checker_note: "このタブ内で完結 — ファイルは一切アップロードされません。",
+      checker_desc: "Modrinth の .mrpack や CurseForge の .zip を落とすだけで、自動スキップされる軽量化 Mod・Rust ネイティブ動作・要検査 JAR を即座に表示します。",
+      checker_target: "対象バージョン",
+      checker_sample: "サンプルパックを試す",
+      checker_drop: ".mrpack / CurseForge .zip / manifest .json をドロップ",
+      checker_hint: "またはクリックしてファイルを選択",
+      checker_raw: "JSON レポートとテキスト要約",
+      how_title: "いつものワールドを、もっと軽く。",
+      p1_title: "手元の公式 server.jar から生成",
+      p1_body: "Mojang のバイナリやアセットは一切同梱しません。初回セットアップ時に手元の公式 Minecraft ファイルからローカル生成します。",
+      p2_title: "Modpack をそのまま投入",
+      p2_body: "Sodium・Lithium・ModernFix・Distant Horizons 等 36 種の軽量化 Mod を自動スキップ。Create 動力網・Farmer's Delight と全アドオン・OpenPAC/FTB Chunks はクリーンルーム Rust で動作し、未対応 Mixin は本家 NeoForge へ安全に委譲します。",
+      p3_title: "旧世代 Intel 内蔵 GPU から RTX まで",
+      p3_body: "Vulkan Mesh Shader（RTX / Radeon RDNA2+ / Arc）、Compute + Multi-Draw Indirect に加え、旧世代 Intel HD/UHD 内蔵 GPU 向けの省 VRAM・UBO バッチ経路を選択可能。",
+      p4_title: "クリーンルーム＆オープンソース",
+      p4_body: "コアワークスペース外部依存ゼロの独自 Rust 実装。本体 GPL-3.0-or-later、独立クレート群は LGPL/GPL/AGPL-3.0-or-later のトリプルライセンス。",
+      qs_title: "3 コマンドで起動。",
+      qs_1: "1. サーバーディレクトリを初期化",
+      qs_2: "2. Modpack や mods/ フォルダを事前診断（JVM 不要）",
+      qs_3: "3. eula.txt に同意して起動",
+      qs_more: "Docker・ワールド移行 (1.21.1 ↔ 26.3)・サーバー Ping・ボイスリレー・ソースビルド",
+      scope_title: "現在の対応状況",
+      scope_now_h: "Alpha で動作するもの",
+      scope_now_1: "Vanilla 1.21.1 プロトコル、online-mode AES-CFB8 認証、Velocity Modern Forwarding",
+      scope_now_2: "決定論的ワールド生成、ランダムティック、村人・取引、管理コマンド、ops/BAN/ホワイトリスト、RCON、非同期バックアップ",
+      scope_now_3: "純 Rust コンパニオン CLI 群（初期化＆OpenPAC クレーム、JVM 不要 Mod/Mixin スキャナ、Anvil/26.3 移行、SRV 対応 Ping、UDP 近接ボイスリレー）",
+      scope_wip_h: "開発中・対象外",
+      scope_wip_1: "戦闘・残りゲームルール・一般シード地形の完全 Vanilla パリティ",
+      scope_wip_2: "ライブサーバーのネイティブ Anvil 保存と実 Mod 実行範囲の拡大",
+      scope_wip_3: "独立 GPU クライアント実描画（Bukkit/Spigot/Paper プラグインは対象外 — Velocity プラグインまたは NeoForge/Fabric Mod を利用してください）",
+      footer_legal: "独立したクリーンルーム OSS プロジェクトです。Mojang・Microsoft および記載の各 Mod 作者とは一切関係ありません。"
+    };
+    var EN = {};
+    var nodes = document.querySelectorAll("[data-i18n]");
+    Array.prototype.forEach.call(nodes, function (el) {
+      EN[el.getAttribute("data-i18n")] = el.textContent;
+    });
+    var btn = document.getElementById("lang-toggle");
+    var lang = "en";
+    function applyLang(next) {
+      lang = next;
+      document.documentElement.lang = next;
+      var dict = next === "ja" ? JA : EN;
+      Array.prototype.forEach.call(nodes, function (el) {
+        var key = el.getAttribute("data-i18n");
+        if (dict[key]) {
+          el.textContent = dict[key];
+        }
+      });
+      if (btn) {
+        btn.textContent = next === "ja" ? "EN" : "日本語";
+      }
+    }
+    if (btn) {
+      btn.addEventListener("click", function () {
+        applyLang(lang === "en" ? "ja" : "en");
+      });
+    }
+  })();
+  </script>
 
 </body>
 </html>
