@@ -6,6 +6,7 @@ pub mod contraption;
 pub mod ffi;
 pub mod fluid_network;
 pub mod kinetic_graph;
+pub mod me_network;
 pub mod recipe_processor;
 pub mod region_scheduler;
 pub mod sleeping_transport;
