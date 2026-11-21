@@ -18,10 +18,210 @@ pub(crate) type P3 = (i32, i32, i32);
 
 // ---------- helpers ----------
 
+const BLOCK_BITSET_WORDS: usize = 24;
+
+struct TreeTables {
+    replaceable_by_trees: [u64; BLOCK_BITSET_WORDS],
+    logs: [u64; BLOCK_BITSET_WORDS],
+    leaves: [u64; BLOCK_BITSET_WORDS],
+    replaceable_or_logs: [u64; BLOCK_BITSET_WORDS],
+    vine_block_id: i32,
+    air_state: u32,
+    vine_east: u32,
+    vine_west: u32,
+    vine_south: u32,
+    vine_north: u32,
+    bee_nest_south: u32,
+    /// `distance_from_log(st)`: 0..=7 for `Some(d)`, 255 for `None`.
+    dist_of_state: Box<[u8]>,
+    /// Index into `leaf_dist_states` for `with_prop(st, "distance", 1..=6)`, or `u16::MAX`.
+    dist_slot: Box<[u16]>,
+    dist_states: Vec<[u32; 7]>,
+    /// Pre-resolved `schedule_leaf_edge_state` inputs: `0` means not a `*_leaves` with `distance`.
+    edge_leaf_dist: Box<[u8]>,
+    edge_leaf_default: Box<[u32]>,
+}
+
+fn fill_tag_bitset(reg: &BReg, tag: &str) -> [u64; BLOCK_BITSET_WORDS] {
+    let mut bits = [0u64; BLOCK_BITSET_WORDS];
+    for &bi in reg.tag_members(tag) {
+        let idx = (bi as usize) >> 6;
+        if idx < BLOCK_BITSET_WORDS {
+            bits[idx] |= 1u64 << (bi & 63);
+        }
+    }
+    bits
+}
+
+#[inline]
+fn bitset_has(bits: &[u64; BLOCK_BITSET_WORDS], bi: i32) -> bool {
+    let u = bi as usize;
+    let w = u >> 6;
+    w < BLOCK_BITSET_WORDS && (bits[w] & (1u64 << (u & 63))) != 0
+}
+
+impl TreeTables {
+    fn build(reg: &BReg) -> Self {
+        let replaceable_by_trees = fill_tag_bitset(reg, "minecraft:replaceable_by_trees");
+        let logs = fill_tag_bitset(reg, "minecraft:logs");
+        let leaves = fill_tag_bitset(reg, "minecraft:leaves");
+        let mut replaceable_or_logs = [0u64; BLOCK_BITSET_WORDS];
+        for i in 0..BLOCK_BITSET_WORDS {
+            replaceable_or_logs[i] = replaceable_by_trees[i] | logs[i];
+        }
+        let vine_base = reg.state_of("minecraft:vine", None);
+        let vine_block_id = reg.block_id_of(vine_base).unwrap_or(-1);
+        let air_state = reg.state_of("minecraft:air", None);
+        let vine_east = reg.with_prop(vine_base, "east", "true");
+        let vine_west = reg.with_prop(vine_base, "west", "true");
+        let vine_south = reg.with_prop(vine_base, "south", "true");
+        let vine_north = reg.with_prop(vine_base, "north", "true");
+        let bee_nest_south =
+            reg.state_of("minecraft:bee_nest", Some(&mkprops(&[("facing", "south")])));
+
+        let mut state_count = 0u32;
+        while reg.block_id_of(state_count).is_some() {
+            state_count += 1;
+        }
+        let n = state_count as usize;
+        let mut dist_of_state = vec![255u8; n];
+        let mut dist_slot = vec![u16::MAX; n];
+        let mut dist_states: Vec<[u32; 7]> = Vec::new();
+        let mut edge_leaf_dist = vec![0u8; n];
+        let mut edge_leaf_default = vec![0u32; n];
+        const NUMS: [&str; 7] = ["1", "2", "3", "4", "5", "6", "7"];
+        for st in 0..state_count {
+            let si = st as usize;
+            if let Some(d) = reg.distance_from_log(st) {
+                dist_of_state[si] = d;
+            }
+            if let Some(d_str) = reg.get_prop(st, "distance") {
+                if dist_states.len() < u16::MAX as usize {
+                    let slot = dist_states.len() as u16;
+                    let mut row = [st; 7];
+                    for (k, val) in NUMS.iter().enumerate() {
+                        row[k] = reg.with_prop(st, "distance", val);
+                    }
+                    dist_states.push(row);
+                    dist_slot[si] = slot;
+                }
+                let name = reg.name_of(st);
+                if name.ends_with("_leaves") {
+                    if let Ok(d) = d_str.parse::<u8>() {
+                        edge_leaf_dist[si] = d;
+                        edge_leaf_default[si] = reg.state_of(name, None);
+                    }
+                }
+            }
+        }
+        Self {
+            replaceable_by_trees,
+            logs,
+            leaves,
+            replaceable_or_logs,
+            vine_block_id,
+            air_state,
+            vine_east,
+            vine_west,
+            vine_south,
+            vine_north,
+            bee_nest_south,
+            dist_of_state: dist_of_state.into_boxed_slice(),
+            dist_slot: dist_slot.into_boxed_slice(),
+            dist_states,
+            edge_leaf_dist: edge_leaf_dist.into_boxed_slice(),
+            edge_leaf_default: edge_leaf_default.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    fn in_bitset(&self, bits: &[u64; BLOCK_BITSET_WORDS], reg: &BReg, st: u32, tag: &str) -> bool {
+        let Some(bi) = reg.block_id_of(st) else {
+            return false;
+        };
+        if (bi as usize) < BLOCK_BITSET_WORDS * 64 {
+            bitset_has(bits, bi)
+        } else {
+            reg.in_tag(st, tag)
+        }
+    }
+
+    #[inline]
+    fn is_replaceable_by_trees(&self, reg: &BReg, cur: u32) -> bool {
+        reg.is_air(cur)
+            || self.in_bitset(
+                &self.replaceable_by_trees,
+                reg,
+                cur,
+                "minecraft:replaceable_by_trees",
+            )
+    }
+
+    #[inline]
+    fn is_replaceable_or_log(&self, reg: &BReg, cur: u32) -> bool {
+        if reg.is_air(cur) {
+            return true;
+        }
+        let Some(bi) = reg.block_id_of(cur) else {
+            return false;
+        };
+        if (bi as usize) < BLOCK_BITSET_WORDS * 64 {
+            bitset_has(&self.replaceable_or_logs, bi)
+        } else {
+            reg.in_tag(cur, "minecraft:replaceable_by_trees") || reg.in_tag(cur, "minecraft:logs")
+        }
+    }
+
+    #[inline]
+    fn is_log(&self, reg: &BReg, cur: u32) -> bool {
+        self.in_bitset(&self.logs, reg, cur, "minecraft:logs")
+    }
+
+    #[inline]
+    fn is_leaves(&self, reg: &BReg, cur: u32) -> bool {
+        self.in_bitset(&self.leaves, reg, cur, "minecraft:leaves")
+    }
+
+    #[inline]
+    fn is_vine(&self, reg: &BReg, cur: u32) -> bool {
+        reg.block_id_of(cur) == Some(self.vine_block_id)
+    }
+
+    #[inline]
+    fn distance_from_log(&self, reg: &BReg, st: u32) -> Option<u8> {
+        match self.dist_of_state.get(st as usize) {
+            Some(&255) => None,
+            Some(&d) => Some(d),
+            None => reg.distance_from_log(st),
+        }
+    }
+
+    #[inline]
+    fn with_distance(&self, reg: &BReg, st: u32, depth: usize) -> u32 {
+        if (1..=7).contains(&depth) {
+            if let Some(&slot) = self.dist_slot.get(st as usize) {
+                if slot != u16::MAX {
+                    return self.dist_states[slot as usize][depth - 1];
+                }
+                return st;
+            }
+        }
+        const NUMS: [&str; 7] = ["0", "1", "2", "3", "4", "5", "6"];
+        let s = NUMS.get(depth).copied().unwrap_or("7");
+        reg.with_prop(st, "distance", s)
+    }
+}
+
+fn tree_tables(reg: &BReg) -> &'static TreeTables {
+    static TABLES: std::sync::OnceLock<TreeTables> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| TreeTables::build(reg))
+}
+
 /// Vanilla placers all ask the same question - may this position be written? - and
 /// answer it as air-or-in-tag. Which tag differs per placer, so it is the argument
 /// rather than three copies of the test with a different tag baked into each. That
 /// is how a placer ends up overwriting something it should not.
+#[cfg_attr(not(test), allow(dead_code))]
 fn is_replaceable(reg: &BReg, cur: u32, tags: &[&str]) -> bool {
     reg.is_air(cur) || tags.iter().any(|t| reg.in_tag(cur, t))
 }
@@ -32,7 +232,7 @@ fn set_if_can_replace(ctx: &mut FC, p: P3, st: u32) -> bool {
         None => return false,
     };
     let cur = ctx.get(p.0, p.1, p.2);
-    if is_replaceable(reg, cur, &["minecraft:replaceable_by_trees"]) {
+    if tree_tables(reg).is_replaceable_by_trees(reg, cur) {
         ctx.set(p.0, p.1, p.2, st);
         return true;
     }
@@ -44,11 +244,7 @@ fn set_if_can_replace_or_log(ctx: &mut FC, p: P3, st: u32) -> bool {
         None => return false,
     };
     let cur = ctx.get(p.0, p.1, p.2);
-    if is_replaceable(
-        reg,
-        cur,
-        &["minecraft:replaceable_by_trees", "minecraft:logs"],
-    ) {
+    if tree_tables(reg).is_replaceable_or_log(reg, cur) {
         ctx.set(p.0, p.1, p.2, st);
         return true;
     }
@@ -58,7 +254,7 @@ fn is_air_or_leaves(ctx: &mut FC, p: P3) -> bool {
     match breg() {
         Some(reg) => {
             let cur = ctx.get(p.0, p.1, p.2);
-            is_replaceable(reg, cur, &["minecraft:leaves"])
+            reg.is_air(cur) || tree_tables(reg).is_leaves(reg, cur)
         }
         None => false,
     }
@@ -73,7 +269,7 @@ pub(crate) fn set_dirt(
 ) {
     let Some(bsp) = provider else { return };
     match breg() {
-        Some(reg) if !force && reg.in_tag(ctx.get(p.0, p.1, p.2), "minecraft:logs") => return,
+        Some(reg) if !force && tree_tables(reg).is_log(reg, ctx.get(p.0, p.1, p.2)) => return,
         Some(_) => {}
         None => return,
     }
@@ -427,9 +623,7 @@ impl TrunkPl {
                             start.2 + q.floor() as i32,
                         );
                         let bp2 = (bp.0, bp.1 + 5, bp.2);
-                        let (ok, nl) = fancy_branch(ctx, bp, bp2, trunk_st, false);
-                        logs.extend(nl);
-                        if !ok {
+                        if !fancy_branch(ctx, bp, bp2, trunk_st, false, &mut logs) {
                             continue;
                         }
                         let r = start.0 - bp.0;
@@ -437,25 +631,27 @@ impl TrunkPl {
                         let t = bp.1 as f64 - ((r * r + s * s) as f64).sqrt() * 0.381;
                         let u = if t > m as f64 { m } else { t as i32 };
                         let bp3 = (start.0, u, start.2);
-                        let (ok, nl) = fancy_branch(ctx, bp3, bp, trunk_st, false);
-                        logs.extend(nl);
-                        if !ok {
+                        if !fancy_branch(ctx, bp3, bp, trunk_st, false, &mut logs) {
                             continue;
                         }
                         list.push((bp, u));
                     }
                 }
-                let (_, nl) =
-                    fancy_branch(ctx, start, (start.0, start.1 + k, start.2), trunk_st, true);
-                logs.extend(nl);
+                let _ = fancy_branch(
+                    ctx,
+                    start,
+                    (start.0, start.1 + k, start.2),
+                    trunk_st,
+                    true,
+                    &mut logs,
+                );
                 for (node_p, end_y) in &list {
                     let i = *end_y;
                     let bp = (start.0, i, start.2);
                     if bp == *node_p || !fancy_high(j, i - start.1) {
                         continue;
                     }
-                    let (_, nl) = fancy_branch(ctx, bp, *node_p, trunk_st, true);
-                    logs.extend(nl);
+                    let _ = fancy_branch(ctx, bp, *node_p, trunk_st, true, &mut logs);
                 }
                 for (node_p, end_y) in list {
                     if fancy_high(j, end_y - start.1) {
@@ -759,23 +955,30 @@ fn fancy_high(h: i32, y: i32) -> bool {
 /// `TrunkPlacer.isFree`: air, `REPLACEABLE_BY_TREES` (which already contains
 /// leaves) **or logs** (`BlockTags.LOGS`, mapping `awe.u`). A stone cell is not
 /// free; a branch cannot pass through rock.
+#[cfg_attr(not(test), allow(dead_code))]
 fn fancy_branch_open(reg: &BReg, cur: u32) -> bool {
-    is_replaceable(
-        reg,
-        cur,
-        &["minecraft:replaceable_by_trees", "minecraft:logs"],
-    )
+    tree_tables(reg).is_replaceable_or_log(reg, cur)
 }
-fn fancy_branch(ctx: &mut FC, a: P3, b: P3, trunk_st: u32, make: bool) -> (bool, Vec<P3>) {
-    let mut logs = vec![];
+fn fancy_branch(
+    ctx: &mut FC,
+    a: P3,
+    b: P3,
+    trunk_st: u32,
+    make: bool,
+    logs: &mut Vec<P3>,
+) -> bool {
     if !make && a == b {
-        return (true, logs);
+        return true;
     }
     let off = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
     let i = off.0.abs().max(off.1.abs()).max(off.2.abs());
     if i == 0 {
-        return (true, logs);
+        return true;
     }
+    let Some(reg) = breg() else {
+        return false;
+    };
+    let tables = tree_tables(reg);
     let f = off.0 as f32 / i as f32;
     let g = off.1 as f32 / i as f32;
     let h = off.2 as f32 / i as f32;
@@ -800,17 +1003,13 @@ fn fancy_branch(ctx: &mut FC, a: P3, b: P3, trunk_st: u32, make: bool) -> (bool,
                 continue;
             }
         }
-        let reg = match breg() {
-            Some(r) => r,
-            None => return (false, logs),
-        };
         let cur = ctx.get(p.0, p.1, p.2);
-        if fancy_branch_open(reg, cur) {
+        if tables.is_replaceable_or_log(reg, cur) {
             continue;
         }
-        return (false, logs);
+        return false;
     }
-    (true, logs)
+    true
 }
 #[expect(clippy::too_many_arguments)]
 fn cherry_branch(
@@ -927,7 +1126,7 @@ fn put_leaf(ctx: &mut FC, out: &mut Vec<P3>, p: P3, st: u32) {
 }
 fn is_leaf_set(ctx: &mut FC, p: P3) -> bool {
     if let Some(reg) = breg() {
-        reg.in_tag(ctx.get(p.0, p.1, p.2), "minecraft:leaves")
+        tree_tables(reg).is_leaves(reg, ctx.get(p.0, p.1, p.2))
     } else {
         false
     }
@@ -1107,8 +1306,9 @@ impl FP {
         }
     }
     #[expect(clippy::too_many_arguments)]
-    pub fn generate(
+    pub fn generate_into(
         &self,
+        out: &mut Vec<P3>,
         offset: i32,
         _placer_radius: &IP,
         ctx: &mut FC,
@@ -1117,13 +1317,12 @@ impl FP {
         fh: i32,
         radius: i32,
         fst: u32,
-    ) -> Vec<P3> {
-        let mut out = vec![];
+    ) {
         match self {
             FP::Blob { .. } => {
                 for y in (offset - fh..=offset).rev() {
                     let r = (radius + node.foliage_radius - 1 - y / 2).max(0);
-                    gen_square(self, &mut out, ctx, rng, node.center, r, y, node.giant, fst);
+                    gen_square(self, out, ctx, rng, node.center, r, y, node.giant, fst);
                 }
             }
             FP::Spruce { .. } => {
@@ -1131,7 +1330,7 @@ impl FP {
                 let mut max = 1;
                 let mut next = 0;
                 for y in (-fh..=offset).rev() {
-                    gen_square(self, &mut out, ctx, rng, node.center, r, y, node.giant, fst);
+                    gen_square(self, out, ctx, rng, node.center, r, y, node.giant, fst);
                     if r >= max {
                         r = next;
                         next = 1;
@@ -1144,7 +1343,7 @@ impl FP {
             FP::Pine { .. } => {
                 let mut r = 0;
                 for y in (offset - fh..=offset).rev() {
-                    gen_square(self, &mut out, ctx, rng, node.center, r, y, node.giant, fst);
+                    gen_square(self, out, ctx, rng, node.center, r, y, node.giant, fst);
                     if r >= 1 && y == offset - fh + 1 {
                         r -= 1;
                     } else if r < radius + node.foliage_radius {
@@ -1155,7 +1354,7 @@ impl FP {
             FP::Acacia => {
                 gen_square(
                     self,
-                    &mut out,
+                    out,
                     ctx,
                     rng,
                     node.center,
@@ -1166,7 +1365,7 @@ impl FP {
                 );
                 gen_square(
                     self,
-                    &mut out,
+                    out,
                     ctx,
                     rng,
                     node.center,
@@ -1177,7 +1376,7 @@ impl FP {
                 );
                 gen_square(
                     self,
-                    &mut out,
+                    out,
                     ctx,
                     rng,
                     node.center,
@@ -1190,13 +1389,13 @@ impl FP {
             FP::Bush { .. } => {
                 for y in (offset - fh..=offset).rev() {
                     let r = radius + node.foliage_radius - 1 - y;
-                    gen_square(self, &mut out, ctx, rng, node.center, r, y, node.giant, fst);
+                    gen_square(self, out, ctx, rng, node.center, r, y, node.giant, fst);
                 }
             }
             FP::Fancy { .. } => {
                 for y in (offset - fh..=offset).rev() {
                     let r = radius + i32::from(!(y == offset || y == offset - fh));
-                    gen_square(self, &mut out, ctx, rng, node.center, r, y, node.giant, fst);
+                    gen_square(self, out, ctx, rng, node.center, r, y, node.giant, fst);
                 }
             }
             FP::Jungle { .. } | FP::MegaJungle { .. } => {
@@ -1207,7 +1406,7 @@ impl FP {
                 };
                 for y in (offset - h..=offset).rev() {
                     let r = radius + node.foliage_radius + 1 - y;
-                    gen_square(self, &mut out, ctx, rng, node.center, r, y, node.giant, fst);
+                    gen_square(self, out, ctx, rng, node.center, r, y, node.giant, fst);
                 }
             }
             FP::MegaPine { .. } => {
@@ -1225,7 +1424,7 @@ impl FP {
                     };
                     gen_square(
                         self,
-                        &mut out,
+                        out,
                         ctx,
                         rng,
                         (pos.0, y, pos.2),
@@ -1241,7 +1440,7 @@ impl FP {
                 let pos = (node.center.0, node.center.1 + offset, node.center.2);
                 gen_square(
                     self,
-                    &mut out,
+                    out,
                     ctx,
                     rng,
                     pos,
@@ -1253,7 +1452,7 @@ impl FP {
                 if node.giant {
                     gen_square(
                         self,
-                        &mut out,
+                        out,
                         ctx,
                         rng,
                         pos,
@@ -1264,7 +1463,7 @@ impl FP {
                     );
                     gen_square(
                         self,
-                        &mut out,
+                        out,
                         ctx,
                         rng,
                         pos,
@@ -1274,12 +1473,12 @@ impl FP {
                         fst,
                     );
                     if rng.next_bool() {
-                        gen_square(self, &mut out, ctx, rng, pos, radius, 2, node.giant, fst);
+                        gen_square(self, out, ctx, rng, pos, radius, 2, node.giant, fst);
                     }
                 } else {
                     gen_square(
                         self,
-                        &mut out,
+                        out,
                         ctx,
                         rng,
                         pos,
@@ -1297,7 +1496,7 @@ impl FP {
                         node.center.1 + rng.next_bound(fh) - rng.next_bound(fh),
                         node.center.2 + rng.next_bound(radius) - rng.next_bound(radius),
                     );
-                    put_leaf(ctx, &mut out, p, fst);
+                    put_leaf(ctx, out, p, fst);
                 }
             }
             FP::Cherry { hang, hang_ext, .. } => {
@@ -1305,7 +1504,7 @@ impl FP {
                 let cr = radius + node.foliage_radius - 1;
                 gen_square(
                     self,
-                    &mut out,
+                    out,
                     ctx,
                     rng,
                     pos,
@@ -1316,7 +1515,7 @@ impl FP {
                 );
                 gen_square(
                     self,
-                    &mut out,
+                    out,
                     ctx,
                     rng,
                     pos,
@@ -1326,14 +1525,14 @@ impl FP {
                     fst,
                 );
                 for y in (0..=fh - 5).rev() {
-                    gen_square(self, &mut out, ctx, rng, pos, cr, y, node.giant, fst);
+                    gen_square(self, out, ctx, rng, pos, cr, y, node.giant, fst);
                 }
                 hanging_square(
-                    self, &mut out, ctx, rng, pos, cr, -1, node.giant, fst, *hang, *hang_ext,
+                    self, out, ctx, rng, pos, cr, -1, node.giant, fst, *hang, *hang_ext,
                 );
                 hanging_square(
                     self,
-                    &mut out,
+                    out,
                     ctx,
                     rng,
                     pos,
@@ -1351,16 +1550,16 @@ impl FP {
                 let flipped = rng.next_bool();
                 for (r, y) in [(cr - 2, fh - 1), (cr - 1, fh - 2), (cr - 1, fh - 3)] {
                     poplar_rhombus(
-                        &mut out, ctx, rng, pos, r, y, node.giant, fst, fh, flipped, *side_hole,
+                        out, ctx, rng, pos, r, y, node.giant, fst, fh, flipped, *side_hole,
                     );
                 }
                 for y in (1..=fh - 4).rev() {
                     poplar_rhombus(
-                        &mut out, ctx, rng, pos, cr, y, node.giant, fst, fh, flipped, *side_hole,
+                        out, ctx, rng, pos, cr, y, node.giant, fst, fh, flipped, *side_hole,
                     );
                 }
                 poplar_rhombus(
-                    &mut out,
+                    out,
                     ctx,
                     rng,
                     pos,
@@ -1373,7 +1572,7 @@ impl FP {
                     *side_hole,
                 );
                 poplar_rhombus(
-                    &mut out,
+                    out,
                     ctx,
                     rng,
                     pos,
@@ -1387,7 +1586,6 @@ impl FP {
                 );
             }
         }
-        out
     }
 }
 #[expect(clippy::too_many_arguments)]
@@ -1541,34 +1739,44 @@ impl Deco {
         decorations: &mut Vec<P3>,
     ) {
         let Some(reg) = breg() else { return };
+        let tables = tree_tables(reg);
         let mut set = |ctx: &mut FC, p: P3, st| {
             decorations.push(p);
             ctx.set(p.0, p.1, p.2, st);
         };
         match self {
             Deco::TrunkVine => {
+                let faces = [
+                    (4u8, tables.vine_east),
+                    (5, tables.vine_west),
+                    (2, tables.vine_south),
+                    (3, tables.vine_north),
+                ];
                 for &p in logs {
-                    for &(d, face) in &[(4u8, "east"), (5, "west"), (2, "south"), (3, "north")] {
+                    for &(d, st) in &faces {
                         if rng.next_bound(3) > 0 {
                             let (ox, oz) = hoff(d);
                             let t = (p.0 + ox, p.1, p.2 + oz);
                             if ctx.is_air(t.0, t.1, t.2) {
-                                let base = reg.state_of("minecraft:vine", None);
-                                set(ctx, t, reg.with_prop(base, face, "true"));
+                                set(ctx, t, st);
                             }
                         }
                     }
                 }
             }
             Deco::LeaveVine(prob) => {
+                let faces = [
+                    (4u8, tables.vine_east),
+                    (5, tables.vine_west),
+                    (2, tables.vine_south),
+                    (3, tables.vine_north),
+                ];
                 for &p in foliage {
-                    for &(d, face) in &[(4u8, "east"), (5, "west"), (2, "south"), (3, "north")] {
+                    for &(d, st) in &faces {
                         if rng.next_f32() < *prob {
                             let (ox, oz) = hoff(d);
                             let t = (p.0 + ox, p.1, p.2 + oz);
                             if ctx.is_air(t.0, t.1, t.2) {
-                                let base = reg.state_of("minecraft:vine", None);
-                                let st = reg.with_prop(base, face, "true");
                                 set(ctx, t, st);
                                 let mut cur = (t.0, t.1 - 1, t.2);
                                 for _ in 0..4 {
@@ -1606,8 +1814,7 @@ impl Deco {
                     let j = rng.next_bound(i as i32 + 1) as usize;
                     places.swap(i, j);
                 }
-                let nest =
-                    reg.state_of("minecraft:bee_nest", Some(&mkprops(&[("facing", "south")])));
+                let nest = tables.bee_nest_south;
                 for p in places {
                     let front = (p.0, p.1, p.2 + 1); // south
                     if ctx.is_air(p.0, p.1, p.2) && ctx.is_air(front.0, front.1, front.2) {
@@ -2113,12 +2320,18 @@ fn java_blockpos_hash(p: P3) -> i32 {
 /// a jungle tree's leaves 18 blocks above the reference's terrain and moved the next
 /// `would_survive` filter to y=87).
 pub(crate) fn decorator_list(v: &[P3]) -> Vec<P3> {
-    // java.util.HashSet: table starts at 16, load factor 0.75, `size > cap * 0.75` doubles.
-    let mut distinct = std::collections::HashSet::new();
-    for &p in v {
-        distinct.insert(p);
+    if v.is_empty() {
+        return Vec::new();
     }
-    let n = distinct.len();
+    // java.util.HashSet: table starts at 16, load factor 0.75, `size > cap * 0.75` doubles.
+    let mut seen = std::collections::HashSet::with_capacity(v.len());
+    let mut unique = Vec::with_capacity(v.len());
+    for &p in v {
+        if seen.insert(p) {
+            unique.push(p);
+        }
+    }
+    let n = unique.len();
     let mut cap = 16usize;
     while n > cap * 3 / 4 {
         cap *= 2;
@@ -2126,17 +2339,27 @@ pub(crate) fn decorator_list(v: &[P3]) -> Vec<P3> {
     // Buckets in index order, each bucket in insertion order: Java 8's `HashMap.putVal`
     // appends to the tail and a resize preserves the relative order of both halves.
     // Treeification (>8 in one bucket, cap >= 64) cannot be reached by tree coordinates.
-    let mut buckets: Vec<Vec<P3>> = vec![Vec::new(); cap];
-    let mut seen: std::collections::HashSet<P3> = std::collections::HashSet::new();
-    for &p in v {
-        if !seen.insert(p) {
-            continue;
-        }
+    let mut counts = vec![0usize; cap];
+    let mask = cap - 1;
+    for &p in &unique {
         let h = java_blockpos_hash(p);
         let spread = h ^ ((h as u32 >> 16) as i32);
-        buckets[(spread as usize) & (cap - 1)].push(p);
+        counts[(spread as usize) & mask] += 1;
     }
-    let mut out: Vec<P3> = buckets.into_iter().flatten().collect();
+    let mut offsets = vec![0usize; cap];
+    let mut total = 0usize;
+    for i in 0..cap {
+        offsets[i] = total;
+        total += counts[i];
+    }
+    let mut out = vec![(0, 0, 0); n];
+    for p in unique {
+        let h = java_blockpos_hash(p);
+        let spread = h ^ ((h as u32 >> 16) as i32);
+        let b = (spread as usize) & mask;
+        out[offsets[b]] = p;
+        offsets[b] += 1;
+    }
     out.sort_by_key(|p| p.1);
     out
 }
@@ -2155,21 +2378,17 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
         .as_ref()
         .map_or(pos, |p| (pos.0, pos.1 + p.trunk_off_y.get(rng), pos.2));
     // obstruction clipping: scan y 0..height+1 at size radius
+    let Some(reg) = breg() else { return false };
+    let tables = tree_tables(reg);
     let top = {
         let mut top = height;
         'outer: for y in 0..=height + 1 {
             let j = t.min_size.radius(height, y);
             for x in -j..=j {
                 for z in -j..=j {
-                    let p = (trunk_start.0 + x, trunk_start.1 + y, trunk_start.2 + z);
-                    let ok = {
-                        let Some(reg) = breg() else { return false };
-                        let cur = ctx.get(p.0, p.1, p.2);
-                        (reg.is_air(cur)
-                            || reg.in_tag(cur, "minecraft:replaceable_by_trees")
-                            || reg.in_tag(cur, "minecraft:logs"))
-                            && (t.ignore_vines || reg.name_of(cur) != "minecraft:vine")
-                    };
+                    let cur = ctx.get(trunk_start.0 + x, trunk_start.1 + y, trunk_start.2 + z);
+                    let ok = tables.is_replaceable_or_log(reg, cur)
+                        && (t.ignore_vines || !tables.is_vine(reg, cur));
                     if ok {
                         continue;
                     }
@@ -2206,10 +2425,11 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
         t,
     );
     let foliage_st = t.foliage_bsp.get(ctx, rng, pos.0, pos.1, pos.2);
-    let mut foliage = vec![];
+    let mut foliage = Vec::with_capacity(64);
     for node in &nodes {
         let off = t.foliage_offset.get(rng);
-        foliage.extend(t.foliage_placer.generate(
+        t.foliage_placer.generate_into(
+            &mut foliage,
             off,
             &t.foliage_radius,
             ctx,
@@ -2218,7 +2438,7 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
             foliage_h,
             frad,
             foliage_st,
-        ));
+        );
     }
     if logs.is_empty() && foliage.is_empty() {
         return false;
@@ -2227,14 +2447,127 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
     // `HashSet` into an `ObjectArrayList` (bucket order) and sorts that by `BlockPos::getY`
     // (stable). See `decorator_list`. The copy is what the decorators see; `update_leaves`
     // is handed the unsorted positions, as it is in vanilla.
-    let (dec_logs, dec_foliage, dec_roots) = (
-        decorator_list(&logs),
-        decorator_list(&foliage),
-        decorator_list(&root_positions),
-    );
     let mut decorations = Vec::new();
-    for d in &t.decorators {
-        d.run(ctx, rng, &dec_roots, &dec_logs, &dec_foliage, &mut decorations);
+    if !t.decorators.is_empty() {
+        let mut dec_logs: Option<Vec<P3>> = None;
+        let mut dec_foliage: Option<Vec<P3>> = None;
+        let mut dec_roots: Option<Vec<P3>> = None;
+        for d in &t.decorators {
+            // Fast probability gate for single-roll decorators so rejected rolls
+            // skip `decorator_list` allocation/bucketing while consuming the exact
+            // same RNG draw.
+            match d {
+                Deco::Beehive(prob) | Deco::Cocoa(prob) | Deco::Creaking(prob) => {
+                    if logs.is_empty() || rng.next_f32() >= *prob {
+                        continue;
+                    }
+                    let dl = dec_logs.get_or_insert_with(|| decorator_list(&logs));
+                    let df = dec_foliage.get_or_insert_with(|| decorator_list(&foliage));
+                    let dr = dec_roots.get_or_insert_with(|| decorator_list(&root_positions));
+                    // Probability already passed (consume 0.0 < 2.0 via 2.0 to skip re-draw).
+                    match d {
+                        Deco::Beehive(_) => {
+                            let hive_y = df.first().map_or_else(
+                                || {
+                                    let last_y = dl.last().map_or(0, |p| p.1);
+                                    (dl[0].1 + 1 + rng.next_bound(3)).min(last_y)
+                                },
+                                |fl| (fl.1 - 1).max(dl[0].1 + 1),
+                            );
+                            let mut places = vec![];
+                            for lp in dl.iter().filter(|p| p.1 == hive_y) {
+                                for dir in [5u8, 4, 3] {
+                                    let (ox, oz) = hoff(dir);
+                                    places.push((lp.0 + ox, lp.1, lp.2 + oz));
+                                }
+                            }
+                            for i in (1..places.len()).rev() {
+                                let j = rng.next_bound(i as i32 + 1) as usize;
+                                places.swap(i, j);
+                            }
+                            let nest = tables.bee_nest_south;
+                            for p in places {
+                                let front = (p.0, p.1, p.2 + 1);
+                                if ctx.is_air(p.0, p.1, p.2)
+                                    && ctx.is_air(front.0, front.1, front.2)
+                                {
+                                    decorations.push(p);
+                                    ctx.set(p.0, p.1, p.2, nest);
+                                    break;
+                                }
+                            }
+                        }
+                        Deco::Cocoa(_) => {
+                            let ty = dl[0].1;
+                            for lp in dl.iter().filter(|p| p.1 - ty <= 2) {
+                                for f in plane_horizontal() {
+                                    if rng.next_f32() <= 0.25 {
+                                        let (ox, oz) = hoff(f);
+                                        let cp = (lp.0 - ox, lp.1, lp.2 - oz);
+                                        if ctx.is_air(cp.0, cp.1, cp.2) {
+                                            let fdir = match f {
+                                                3 => "south",
+                                                4 => "west",
+                                                5 => "east",
+                                                _ => "north",
+                                            };
+                                            let st = reg.state_of(
+                                                "minecraft:cocoa",
+                                                Some(&mkprops(&[
+                                                    ("age", &rng.next_bound(3).to_string()),
+                                                    ("facing", fdir),
+                                                ])),
+                                            );
+                                            decorations.push(cp);
+                                            ctx.set(cp.0, cp.1, cp.2, st);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Deco::Creaking(_) => {
+                            let _ = dr;
+                            let mut shuffled = dl.clone();
+                            for i in (1..shuffled.len()).rev() {
+                                let j = rng.next_bound(i as i32 + 1) as usize;
+                                shuffled.swap(i, j);
+                            }
+                            for p in shuffled {
+                                let mut all_logs = true;
+                                for dir in 0..6u8 {
+                                    let (ox, oy, oz) = dir_off(dir);
+                                    let n = ctx.get(p.0 + ox, p.1 + oy, p.2 + oz);
+                                    if !tables.is_log(reg, n) {
+                                        all_logs = false;
+                                        break;
+                                    }
+                                }
+                                if all_logs {
+                                    let st = reg.state_of(
+                                        "minecraft:creaking_heart",
+                                        Some(&mkprops(&[
+                                            ("axis", "y"),
+                                            ("creaking_heart_state", "dormant"),
+                                            ("natural", "true"),
+                                        ])),
+                                    );
+                                    decorations.push(p);
+                                    ctx.set(p.0, p.1, p.2, st);
+                                    break;
+                                }
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => {
+                    let dl = dec_logs.get_or_insert_with(|| decorator_list(&logs));
+                    let df = dec_foliage.get_or_insert_with(|| decorator_list(&foliage));
+                    let dr = dec_roots.get_or_insert_with(|| decorator_list(&root_positions));
+                    d.run(ctx, rng, dr, dl, df, &mut decorations);
+                }
+            }
+        }
     }
     if let Some(shape) = update_leaves(ctx, &logs, &root_positions, &foliage, &decorations) {
         apply_edge_shape_updates(ctx, &shape);
@@ -2277,6 +2610,7 @@ fn update_leaves(
         return None;
     }
     let reg = breg()?;
+    let tables = tree_tables(reg);
     let mut min = (i32::MAX, i32::MAX, i32::MAX);
     let mut max = (i32::MIN, i32::MIN, i32::MIN);
     for p in logs.iter().chain(roots).chain(foliage).chain(decorations) {
@@ -2313,7 +2647,7 @@ fn update_leaves(
     for &p in logs {
         trunks.insert(p);
     }
-    let mut buckets: Vec<_> = (0..7).map(|_| LeafQueue::new()).collect();
+    let mut buckets: [LeafQueue; 7] = std::array::from_fn(|_| LeafQueue::new());
     while let Some(p) = trunks.pop() {
         buckets[0].insert(p);
     }
@@ -2328,12 +2662,7 @@ fn update_leaves(
         // can have been queued in multiple buckets and be written again.
         if depth != 0 {
             let st = ctx.get(p.0, p.1, p.2);
-            ctx.set(
-                p.0,
-                p.1,
-                p.2,
-                reg.with_prop(st, "distance", &depth.to_string()),
-            );
+            ctx.set(p.0, p.1, p.2, tables.with_distance(reg, st, depth));
         }
         visited[i] = true;
         for dir in 0..6 {
@@ -2344,7 +2673,7 @@ fn update_leaves(
                 continue;
             }
             let st = ctx.get(n.0, n.1, n.2);
-            let Some(d) = reg.distance_from_log(st) else {
+            let Some(d) = tables.distance_from_log(reg, st) else {
                 continue;
             };
             let next = (d as usize).min(depth + 1);
@@ -2362,6 +2691,75 @@ fn update_leaves(
         ys,
         zs,
     })
+}
+
+#[inline]
+fn schedule_leaf_edge_fast(
+    ctx: &mut FC,
+    reg: &BReg,
+    tables: &TreeTables,
+    cell: P3,
+    st: u32,
+    neighbor: u32,
+) {
+    let si = st as usize;
+    let Some(&distance) = tables.edge_leaf_dist.get(si) else {
+        return;
+    };
+    if distance == 0 {
+        return;
+    }
+    let next = tables.distance_from_log(reg, neighbor).unwrap_or(7) + 1;
+    if next != 1 || distance != 1 {
+        ctx.g
+            .schedule_generated_leaf(cell, tables.edge_leaf_default[si]);
+    }
+}
+
+thread_local! {
+    /// Reusable padded `(xs+2)*(ys+2)*(zs+2)` state cache for `apply_edge_shape_updates`.
+    /// Each boundary cell of a tree is shared by 2-6 exposed faces; caching its state
+    /// (and updating on the rare vine write) avoids redundant `FC::get` HashMap lookups.
+    static EDGE_STATE_CACHE: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[expect(clippy::too_many_arguments)]
+#[inline]
+fn handle_edge_face_cached(
+    ctx: &mut FC,
+    reg: &BReg,
+    tables: &TreeTables,
+    cache: &mut [u32],
+    p_idx: usize,
+    q_idx: usize,
+    direction: u8,
+    p: P3,
+    q: P3,
+) {
+    let mut inside = cache[p_idx];
+    if inside == u32::MAX {
+        inside = ctx.get(p.0, p.1, p.2);
+        cache[p_idx] = inside;
+    }
+    let mut outside = cache[q_idx];
+    if outside == u32::MAX {
+        outside = ctx.get(q.0, q.1, q.2);
+        cache[q_idx] = outside;
+    }
+    schedule_leaf_edge_fast(ctx, reg, tables, p, inside, outside);
+    schedule_leaf_edge_fast(ctx, reg, tables, q, outside, inside);
+    if tables.is_vine(reg, inside) {
+        if let Some(st) = vine_edge_state(ctx, reg, p, inside, direction) {
+            ctx.set(p.0, p.1, p.2, st);
+            cache[p_idx] = st;
+        }
+    }
+    if tables.is_vine(reg, outside) {
+        if let Some(st) = vine_edge_state(ctx, reg, q, outside, direction ^ 1) {
+            ctx.set(q.0, q.1, q.2, st);
+            cache[q_idx] = st;
+        }
+    }
 }
 
 /// `StructureTemplate.updateShapeAtEdge(level, 3, shape, x, y, z)`, which `TreeFeature.place`
@@ -2383,6 +2781,162 @@ fn update_leaves(
 /// state through `ctx.get`, because the write went into the same map.
 fn apply_edge_shape_updates(ctx: &mut FC, shape: &LeafShape) {
     let Some(reg) = breg() else { return };
+    let tables = tree_tables(reg);
+    let (ys, zs) = (shape.ys, shape.zs);
+    let yz = ys.saturating_mul(zs);
+    if yz == 0 {
+        return;
+    }
+    let xs = shape.filled.len() / yz;
+    if shape.filled.len() <= 65_536 && xs * yz == shape.filled.len() {
+        let filled = &shape.filled;
+        let (mx, my, mz) = shape.min;
+        let (pxs, pys, pzs) = (xs + 2, ys + 2, zs + 2);
+        let pyz = pys * pzs;
+        let padded_len = pxs * pyz;
+        let mut cache = EDGE_STATE_CACHE.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        cache.clear();
+        cache.resize(padded_len, u32::MAX);
+        // Native scans z (outer x, inner y), y (outer z, inner x), then x (outer y, inner z).
+        for x in 0..xs {
+            let wx = mx.wrapping_add(x as i32);
+            let xbase = x * yz;
+            let pxbase = (x + 1) * pyz;
+            for y in 0..ys {
+                let wy = my.wrapping_add(y as i32);
+                let row = xbase + y * zs;
+                let prow = pxbase + (y + 1) * pzs;
+                let mut prev = false;
+                for z in 0..=zs {
+                    let cur = z < zs && filled[row + z];
+                    if prev != cur {
+                        let wz = mz.wrapping_add(z as i32);
+                        let i_prev = prow + z;
+                        let i_cur = prow + z + 1;
+                        if prev {
+                            handle_edge_face_cached(
+                                ctx,
+                                reg,
+                                tables,
+                                &mut cache,
+                                i_prev,
+                                i_cur,
+                                3,
+                                (wx, wy, wz - 1),
+                                (wx, wy, wz),
+                            );
+                        } else {
+                            handle_edge_face_cached(
+                                ctx,
+                                reg,
+                                tables,
+                                &mut cache,
+                                i_cur,
+                                i_prev,
+                                2,
+                                (wx, wy, wz),
+                                (wx, wy, wz - 1),
+                            );
+                        }
+                    }
+                    prev = cur;
+                }
+            }
+        }
+        for z in 0..zs {
+            let wz = mz.wrapping_add(z as i32);
+            let pz = z + 1;
+            for x in 0..xs {
+                let wx = mx.wrapping_add(x as i32);
+                let col = x * yz + z;
+                let pcol = (x + 1) * pyz + pz;
+                let mut prev = false;
+                for y in 0..=ys {
+                    let cur = y < ys && filled[col + y * zs];
+                    if prev != cur {
+                        let wy = my.wrapping_add(y as i32);
+                        let i_prev = pcol + y * pzs;
+                        let i_cur = i_prev + pzs;
+                        if prev {
+                            handle_edge_face_cached(
+                                ctx,
+                                reg,
+                                tables,
+                                &mut cache,
+                                i_prev,
+                                i_cur,
+                                1,
+                                (wx, wy - 1, wz),
+                                (wx, wy, wz),
+                            );
+                        } else {
+                            handle_edge_face_cached(
+                                ctx,
+                                reg,
+                                tables,
+                                &mut cache,
+                                i_cur,
+                                i_prev,
+                                0,
+                                (wx, wy, wz),
+                                (wx, wy - 1, wz),
+                            );
+                        }
+                    }
+                    prev = cur;
+                }
+            }
+        }
+        for y in 0..ys {
+            let wy = my.wrapping_add(y as i32);
+            let yoff = y * zs;
+            let pyoff = (y + 1) * pzs;
+            for z in 0..zs {
+                let wz = mz.wrapping_add(z as i32);
+                let line = yoff + z;
+                let pline = pyoff + (z + 1);
+                let mut prev = false;
+                for x in 0..=xs {
+                    let cur = x < xs && filled[x * yz + line];
+                    if prev != cur {
+                        let wx = mx.wrapping_add(x as i32);
+                        let i_prev = x * pyz + pline;
+                        let i_cur = i_prev + pyz;
+                        if prev {
+                            handle_edge_face_cached(
+                                ctx,
+                                reg,
+                                tables,
+                                &mut cache,
+                                i_prev,
+                                i_cur,
+                                5,
+                                (wx - 1, wy, wz),
+                                (wx, wy, wz),
+                            );
+                        } else {
+                            handle_edge_face_cached(
+                                ctx,
+                                reg,
+                                tables,
+                                &mut cache,
+                                i_cur,
+                                i_prev,
+                                4,
+                                (wx, wy, wz),
+                                (wx - 1, wy, wz),
+                            );
+                        }
+                    }
+                    prev = cur;
+                }
+            }
+        }
+        EDGE_STATE_CACHE.with(|c| {
+            *c.borrow_mut() = cache;
+        });
+        return;
+    }
     for (direction, p, q) in crate::voxel_faces::exposed_faces(shape.positions()) {
         let inside = ctx.get(p.0, p.1, p.2);
         let outside = ctx.get(q.0, q.1, q.2);
@@ -2463,11 +3017,8 @@ fn vine_edge_state(
         .iter()
         .any(|&d| reg.get_prop(cur, VINE_FACES[d as usize]).as_deref() == Some("true"))
         || reg.get_prop(cur, "up").as_deref() == Some("true");
-    let out = if keeps {
-        cur
-    } else {
-        reg.state_of("minecraft:air", None)
-    };
+    let tables = tree_tables(reg);
+    let out = if keeps { cur } else { tables.air_state };
     if traced {
         eprintln!(
             "VEDGE {} {} {} {} before={st} after={out}",

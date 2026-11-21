@@ -127,12 +127,101 @@ enum Kick {
 }
 
 struct StructureDef {
+    idx: usize,
     kick: Kick,
     template: Option<structure_template::StructureKind>,
     step: usize,
     slot: usize,
     adjustment: BeardAdjustment,
     biomes: HashSet<String>,
+}
+
+struct SetMeta {
+    all_mineshaft: bool,
+    exclusion_idx: Option<usize>,
+    /// Loaded entries as `(structure_idx, weight)` in set order.
+    resolved_entries: Vec<(usize, i32)>,
+    total_weight: i32,
+}
+
+struct PresetMasks {
+    /// Per `StructureDef.idx`: `None` if `biomes` is empty (matches all) or any
+    /// leaf id >= 128; `Some(mask)` otherwise (`Some(0)` means impossible in this preset).
+    struct_masks: Vec<Option<u128>>,
+    /// Per set index: true iff at least one loaded entry can match a biome in this preset.
+    set_has_any_valid: Vec<bool>,
+    /// All sets with `set_has_any_valid[i]`.
+    all_valid_sets: Vec<usize>,
+    /// Adapting sets with `set_has_any_valid[i]`.
+    adapting_valid_sets: Vec<usize>,
+    /// Pre-resolved `#minecraft:required_ocean_monument_surrounding` leaf mask.
+    monument_surrounding_mask: Option<u128>,
+    /// Per set index: pre-resolved `PlacementDef::Rings::preferred_biomes` leaf mask.
+    ring_preferred_masks: Vec<Option<u128>>,
+}
+
+fn build_biome_mask(g: &Gen, names: &HashSet<String>) -> Option<u128> {
+    if names.is_empty() {
+        return None;
+    }
+    let mut mask = 0u128;
+    for name in names {
+        if let Some(leaf) = g.biome_leaf_of_name(name) {
+            if usize::from(leaf) >= 128 {
+                return None;
+            }
+            mask |= 1u128 << leaf;
+        }
+    }
+    Some(mask)
+}
+
+fn preset_masks<'a>(d: &'a Defs, g: &Gen) -> Option<&'a PresetMasks> {
+    if g.biome_name_of_leaf(0).is_none() {
+        return None;
+    }
+    let slot = &d.preset_masks[preset_tag(g.preset) as usize];
+    Some(slot.get_or_init(|| {
+        let mut struct_masks = vec![None; d.struct_ids.len()];
+        for def in d.structures.values() {
+            struct_masks[def.idx] = build_biome_mask(g, &def.biomes);
+        }
+        let mut set_has_any_valid = Vec::with_capacity(d.sets.len());
+        let mut all_valid_sets = Vec::with_capacity(d.sets.len());
+        let mut ring_preferred_masks = Vec::with_capacity(d.sets.len());
+        for (i, meta) in d.set_meta.iter().enumerate() {
+            let valid = meta
+                .resolved_entries
+                .iter()
+                .any(|&(sidx, _)| struct_masks[sidx] != Some(0));
+            set_has_any_valid.push(valid);
+            if valid {
+                all_valid_sets.push(i);
+            }
+            let rmask = match &d.sets[i].placement {
+                PlacementDef::Rings {
+                    preferred_biomes, ..
+                } => build_biome_mask(g, preferred_biomes),
+                _ => None,
+            };
+            ring_preferred_masks.push(rmask);
+        }
+        let adapting_valid_sets: Vec<usize> = d
+            .adapting_sets
+            .iter()
+            .copied()
+            .filter(|&i| set_has_any_valid[i])
+            .collect();
+        let monument_surrounding_mask = build_biome_mask(g, &d.monument_surrounding);
+        PresetMasks {
+            struct_masks,
+            set_has_any_valid,
+            all_valid_sets,
+            adapting_valid_sets,
+            monument_surrounding_mask,
+            ring_preferred_masks,
+        }
+    }))
 }
 
 enum PlacementDef {
@@ -162,10 +251,17 @@ struct SetDef {
 
 struct Defs {
     sets: Vec<SetDef>,
+    set_meta: Vec<SetMeta>,
+    #[cfg_attr(not(test), allow(dead_code))]
     by_id: HashMap<String, usize>,
     structures: HashMap<String, StructureDef>,
+    struct_ids: Vec<String>,
     /// Structures of each step, in registry (slot) order.
     by_step: Vec<Vec<String>>,
+    /// All set indices `0..sets.len()`.
+    all_sets: Vec<usize>,
+    /// Sets containing `minecraft:fortress`.
+    fortress_sets: Vec<usize>,
     /// Sets with at least one structure whose `terrain_adaptation` is not `none`.
     /// Only these can contribute a beardifier box, so a chunk whose neighbourhood
     /// admits none of them needs no beardifier at all.
@@ -176,6 +272,8 @@ struct Defs {
     non_adapting_sets: Vec<usize>,
     /// `#minecraft:required_ocean_monument_surrounding` biome set.
     monument_surrounding: HashSet<String>,
+    /// Lazily resolved biome-leaf bitmasks per `NoisePreset` (0=Overworld, 1=Nether, 2=End).
+    preset_masks: [std::sync::OnceLock<PresetMasks>; 3],
 }
 
 fn step_index(name: &str) -> Option<usize> {
@@ -297,6 +395,7 @@ fn load_defs_from_files(
 ) -> Option<Defs> {
     let mut counts = [0usize; STRUCTURE_STEPS.len()];
     let mut structures = HashMap::new();
+    let mut struct_ids = Vec::new();
     let mut by_step: Vec<Vec<String>> = vec![Vec::new(); STRUCTURE_STEPS.len()];
     for (id, bytes) in structure_files {
         let Some(j) = crate::json::jparse(bytes) else {
@@ -354,10 +453,13 @@ fn load_defs_from_files(
         // cannot shift the numbering of the ones after it.
         let slot = counts[step];
         counts[step] += 1;
+        let idx = struct_ids.len();
+        struct_ids.push(id.clone());
         by_step[step].push(id.clone());
         structures.insert(
             id.clone(),
             StructureDef {
+                idx,
                 kick,
                 template,
                 step,
@@ -411,14 +513,63 @@ fn load_defs_from_files(
         resource("tags/worldgen/biome", "minecraft:required_ocean_monument_surrounding")
             .and_then(|j| j.get("values").map(|v| biome_set(v, &mut HashSet::new())))
             .unwrap_or_default();
+    let set_meta: Vec<SetMeta> = sets
+        .iter()
+        .map(|set| {
+            let all_mineshaft = set.entries.iter().all(|(id, _)| {
+                structures
+                    .get(id)
+                    .is_some_and(|def| def.kick == Kick::Mineshaft)
+            });
+            let exclusion_idx = match &set.placement {
+                PlacementDef::Spread {
+                    exclusion: Some((other, _)),
+                    ..
+                } => by_id.get(other).copied(),
+                _ => None,
+            };
+            let resolved_entries: Vec<(usize, i32)> = set
+                .entries
+                .iter()
+                .filter_map(|(id, w)| structures.get(id).map(|def| (def.idx, *w)))
+                .collect();
+            let total_weight = resolved_entries.iter().map(|(_, w)| *w).sum();
+            SetMeta {
+                all_mineshaft,
+                exclusion_idx,
+                resolved_entries,
+                total_weight,
+            }
+        })
+        .collect();
+    let all_sets: Vec<usize> = (0..sets.len()).collect();
+    let fortress_sets: Vec<usize> = sets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, set)| {
+            set.entries
+                .iter()
+                .any(|(id, _)| id == "minecraft:fortress")
+                .then_some(index)
+        })
+        .collect();
     Some(Defs {
         sets,
+        set_meta,
         by_id,
         structures,
+        struct_ids,
         by_step,
+        all_sets,
+        fortress_sets,
         adapting_sets,
         non_adapting_sets,
         monument_surrounding,
+        preset_masks: [
+            std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
+        ],
     })
 }
 
@@ -514,11 +665,21 @@ fn ring_chunk_i_uncached(d: &Defs, g: &mut Gen, set: usize, i: i32) -> (i32, i32
     let Some(&(candidate, child_state)) = ring_candidates_cached(d, g, set).get(i as usize) else {
         return (i32::MIN, i32::MIN);
     };
+    let mut child = crate::generation_math::Lcg::from_raw_state(child_state);
+    if let Some(mask) = preset_masks(d, g).and_then(|pm| pm.ring_preferred_masks[set]) {
+        return mineshaft::concentric_rings_target(
+            candidate,
+            &mut child,
+            112,
+            |qx, qy, qz| g.biome_quart(qx, qy, qz, None),
+            |b| b.is_some_and(|(_, leaf)| usize::from(leaf) < 128 && (mask & (1u128 << leaf)) != 0),
+        )
+        .unwrap_or(candidate);
+    }
     let preferred: HashSet<u16> = preferred_biomes
         .iter()
         .filter_map(|name| g.biome_leaf_of_name(name))
         .collect();
-    let mut child = crate::generation_math::Lcg::from_raw_state(child_state);
     mineshaft::concentric_rings_target(
         candidate,
         &mut child,
@@ -696,11 +857,9 @@ fn set_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32, depth: u32) -> bo
     };
     match exclusion {
         None => true,
-        Some((other, count)) => {
+        Some((_, count)) => {
             let count = *count;
-            // The zone names a set id; its index is resolved here because the sets are
-            // enumerated in registry order and the referenced set may sort later.
-            let Some(&other) = d.by_id.get(other) else {
+            let Some(other) = d.set_meta[set].exclusion_idx else {
                 return false;
             };
             !mineshaft::exclusion_forbids(count, x, z, |ox, oz| {
@@ -730,9 +889,9 @@ fn set_admits_live(
             }
             match exclusion {
                 None => true,
-                Some((other, count)) => {
+                Some((_, count)) => {
                     let count = *count;
-                    let Some(&other) = d.by_id.get(other) else {
+                    let Some(other) = d.set_meta[set].exclusion_idx else {
                         return false;
                     };
                     !mineshaft::exclusion_forbids(count, x, z, |ox, oz| {
@@ -918,13 +1077,31 @@ fn with_templates<R>(f: impl FnOnce(&Templates) -> R) -> R {
     f(&templates)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn valid_biome(g: &mut Gen, allowed: &HashSet<String>, pos: (i32, i32, i32)) -> bool {
+    valid_biome_fast(g, allowed, None, pos)
+}
+
+fn valid_biome_fast(
+    g: &mut Gen,
+    allowed: &HashSet<String>,
+    mask: Option<u128>,
+    pos: (i32, i32, i32),
+) -> bool {
     if allowed.is_empty() {
         return true;
+    }
+    if mask == Some(0) {
+        return false;
     }
     // Structure.isValidBiome samples the noise source at QuartPos.fromBlock,
     // without the Voronoi zoom used by LevelReader.getBiome.
     if let Some((_, leaf)) = g.biome_quart(pos.0 >> 2, pos.1 >> 2, pos.2 >> 2, None) {
+        if let Some(m) = mask {
+            if usize::from(leaf) < 128 {
+                return (m & (1u128 << leaf)) != 0;
+            }
+        }
         return g
             .biome_name_of_leaf(leaf)
             .is_some_and(|name| allowed.contains(&name));
@@ -944,24 +1121,53 @@ fn min_corner_occupied_y(g: &mut Gen, x: i32, z: i32, dx: i32, dz: i32) -> i32 {
     h0.min(h1).min(h2).min(h3)
 }
 
-fn monument_surrounding_ok(g: &mut Gen, surrounding: &HashSet<String>, cx: i32, cz: i32) -> bool {
+fn monument_surrounding_ok(
+    g: &mut Gen,
+    surrounding: &HashSet<String>,
+    mask: Option<u128>,
+    cx: i32,
+    cz: i32,
+) -> bool {
     if surrounding.is_empty() {
+        return true;
+    }
+    if mask == Some(0) {
+        return false;
+    }
+    let (x, y, z) = (cx * 16 + 9, g.sea, cz * 16 + 9);
+    let Some((_, center_leaf)) = g.biome_quart(x >> 2, y >> 2, z >> 2, None) else {
+        return false;
+    };
+    let (qx0, qx1) = ((x - 29) >> 2, (x + 29) >> 2);
+    let (qy0, qy1) = ((y - 29) >> 2, (y + 29) >> 2);
+    let (qz0, qz1) = ((z - 29) >> 2, (z + 29) >> 2);
+    if let Some(m) = mask {
+        if usize::from(center_leaf) >= 128 || (m & (1u128 << center_leaf)) == 0 {
+            return false;
+        }
+        let mut last = Some(center_leaf);
+        for qx in qx0..=qx1 {
+            for qy in qy0..=qy1 {
+                for qz in qz0..=qz1 {
+                    let Some((_, leaf)) = g.biome_quart(qx, qy, qz, last) else {
+                        return false;
+                    };
+                    last = Some(leaf);
+                    if usize::from(leaf) >= 128 || (m & (1u128 << leaf)) == 0 {
+                        return false;
+                    }
+                }
+            }
+        }
         return true;
     }
     let allowed: HashSet<u16> = surrounding
         .iter()
         .filter_map(|name| g.biome_leaf_of_name(name))
         .collect();
-    let (x, y, z) = (cx * 16 + 9, g.sea, cz * 16 + 9);
-    let Some((_, center_leaf)) = g.biome_quart(x >> 2, y >> 2, z >> 2, None) else {
-        return false;
-    };
     if !allowed.contains(&center_leaf) {
         return false;
     }
-    let (qx0, qx1) = ((x - 29) >> 2, (x + 29) >> 2);
-    let (qy0, qy1) = ((y - 29) >> 2, (y + 29) >> 2);
-    let (qz0, qz1) = ((z - 29) >> 2, (z + 29) >> 2);
     let mut last = Some(center_leaf);
     for qx in qx0..=qx1 {
         for qy in qy0..=qy1 {
@@ -980,15 +1186,21 @@ fn monument_surrounding_ok(g: &mut Gen, surrounding: &HashSet<String>, cx: i32, 
 }
 
 /// Generate the structure this set entry names, or `None` when it refuses.
+#[expect(clippy::too_many_arguments)]
 fn try_generate(
     d: &Defs,
     g: &mut Gen,
     id: &str,
     def: &StructureDef,
+    pm: Option<&PresetMasks>,
     seed: u64,
     cx: i32,
     cz: i32,
 ) -> Option<Start> {
+    let biome_mask = pm.and_then(|p| p.struct_masks[def.idx]);
+    if biome_mask == Some(0) {
+        return None;
+    }
     match def.kick {
         Kick::Mineshaft => {
             let start = mineshaft::admit(g, cx, cz)?;
@@ -1032,7 +1244,7 @@ fn try_generate(
             // centre (-376,64,360) is `soul_sand_valley`. `#has_structure/nether_fossil`
             // holds only soul_sand_valley, so vanilla refuses the start and the port
             // used to place it (spurious beard at bb=[-384,88,366,-382,91,367]).
-            if !valid_biome(fc.g, &def.biomes, stub) {
+            if !valid_biome_fast(fc.g, &def.biomes, biome_mask, stub) {
                 return None;
             }
             let pieces = with_templates(|templates| build(&mut fc, templates, &mut gen, reg).ok())?;
@@ -1048,7 +1260,7 @@ fn try_generate(
         Kick::SinglePiece(kind) => match kind {
             SinglePieceKind::BuriedTreasure => {
                 let stub = (cx * 16 + 8, g.top_oc(cx * 16 + 8, cz * 16 + 8) - 1, cz * 16 + 8);
-                if !valid_biome(g, &def.biomes, stub) {
+                if !valid_biome_fast(g, &def.biomes, biome_mask, stub) {
                     return None;
                 }
                 let piece = mineshaft::BuriedTreasurePiece::new(cx, cz);
@@ -1063,7 +1275,7 @@ fn try_generate(
             }
             SinglePieceKind::SwampHut => {
                 let stub = (cx * 16 + 8, g.top_ws(cx * 16 + 8, cz * 16 + 8) - 1, cz * 16 + 8);
-                if !valid_biome(g, &def.biomes, stub) {
+                if !valid_biome_fast(g, &def.biomes, biome_mask, stub) {
                     return None;
                 }
                 let mut rng = crate::generation_math::Lcg::for_large_feature(seed, cx, cz);
@@ -1079,7 +1291,7 @@ fn try_generate(
             }
             SinglePieceKind::DesertPyramid => {
                 let stub = (cx * 16 + 8, g.top_ws(cx * 16 + 8, cz * 16 + 8) - 1, cz * 16 + 8);
-                if !valid_biome(g, &def.biomes, stub) {
+                if !valid_biome_fast(g, &def.biomes, biome_mask, stub) {
                     return None;
                 }
                 if min_corner_occupied_y(g, cx * 16, cz * 16, 21, 21) < g.sea {
@@ -1098,7 +1310,7 @@ fn try_generate(
             }
             SinglePieceKind::JungleTemple => {
                 let stub = (cx * 16 + 8, g.top_ws(cx * 16 + 8, cz * 16 + 8) - 1, cz * 16 + 8);
-                if !valid_biome(g, &def.biomes, stub) {
+                if !valid_biome_fast(g, &def.biomes, biome_mask, stub) {
                     return None;
                 }
                 if min_corner_occupied_y(g, cx * 16, cz * 16, 12, 15) < g.sea {
@@ -1132,7 +1344,7 @@ fn try_generate(
         Kick::Wave3a(kind) => match kind {
             Wave3aKind::Fortress => {
                 let stub = (cx * 16, 64, cz * 16);
-                if !valid_biome(g, &def.biomes, stub) {
+                if !valid_biome_fast(g, &def.biomes, biome_mask, stub) {
                     return None;
                 }
                 let mut rng = crate::generation_math::Lcg::for_large_feature(seed, cx, cz);
@@ -1153,11 +1365,12 @@ fn try_generate(
                 })
             }
             Wave3aKind::Monument => {
-                if !monument_surrounding_ok(g, &d.monument_surrounding, cx, cz) {
+                let mono_mask = pm.and_then(|p| p.monument_surrounding_mask);
+                if !monument_surrounding_ok(g, &d.monument_surrounding, mono_mask, cx, cz) {
                     return None;
                 }
                 let stub = (cx * 16 + 8, g.top_oc(cx * 16 + 8, cz * 16 + 8) - 1, cz * 16 + 8);
-                if !valid_biome(g, &def.biomes, stub) {
+                if !valid_biome_fast(g, &def.biomes, biome_mask, stub) {
                     return None;
                 }
                 let mut rng = crate::generation_math::Lcg::for_large_feature(seed, cx, cz);
@@ -1176,7 +1389,7 @@ fn try_generate(
             }
             Wave3aKind::Stronghold => {
                 let stub = (cx * 16, 0, cz * 16);
-                if !valid_biome(g, &def.biomes, stub) {
+                if !valid_biome_fast(g, &def.biomes, biome_mask, stub) {
                     return None;
                 }
                 let (start, _rng) =
@@ -1194,7 +1407,7 @@ fn try_generate(
                 let reg = crate::block_registry::breg()?;
                 let stub_probe =
                     (cx * 16 + 8, g.top_ws(cx * 16 + 8, cz * 16 + 8) - 1, cz * 16 + 8);
-                if !valid_biome(g, &def.biomes, stub_probe) {
+                if !valid_biome_fast(g, &def.biomes, biome_mask, stub_probe) {
                     return None;
                 }
                 let mut gen = crate::generation_math::Lcg::for_large_feature(seed, cx, cz);
@@ -1217,7 +1430,7 @@ fn try_generate(
                 let mut fc = FC::new(g);
                 let (stub, build) =
                     structure_template::find_mansion_pieces(&mut fc, cx, cz, &mut gen)?;
-                if !valid_biome(fc.g, &def.biomes, stub) {
+                if !valid_biome_fast(fc.g, &def.biomes, biome_mask, stub) {
                     return None;
                 }
                 let pieces = with_templates(|templates| build(&mut fc, templates, &mut gen, reg));
@@ -1241,19 +1454,23 @@ fn try_generate(
 /// stored yet), the placement has to admit the chunk, and a multi-entry set picks
 /// by weight with the set's own seeded random, dropping a refused entry and
 /// re-drawing.
-fn set_starts(d: &Defs, g: &mut Gen, set: &SetDef, cx: i32, cz: i32) -> Vec<Start> {
+fn set_starts(
+    d: &Defs,
+    g: &mut Gen,
+    set_idx: usize,
+    pm: Option<&PresetMasks>,
+    cx: i32,
+    cz: i32,
+) -> Vec<Start> {
+    let set = &d.sets[set_idx];
+    let meta = &d.set_meta[set_idx];
     // The mineshaft set owns its weighted selection (and its variant-specific biome
     // check) inside `mineshaft::admit`; re-drawing here would consume the selector
     // twice and admit a different entry.
-    let all_mineshaft = set.entries.iter().all(|(id, _)| {
-        d.structures
-            .get(id)
-            .is_some_and(|def| def.kick == Kick::Mineshaft)
-    });
-    if all_mineshaft {
+    if meta.all_mineshaft {
         let id = &set.entries[0].0;
         return match d.structures.get(id) {
-            Some(def) => try_generate(d, g, id, def, g.wseed(), cx, cz)
+            Some(def) => try_generate(d, g, id, def, pm, g.wseed(), cx, cz)
                 .into_iter()
                 .collect(),
             None => Vec::new(),
@@ -1264,19 +1481,15 @@ fn set_starts(d: &Defs, g: &mut Gen, set: &SetDef, cx: i32, cz: i32) -> Vec<Star
         let Some(def) = d.structures.get(id) else {
             return Vec::new();
         };
-        return try_generate(d, g, id, def, g.wseed(), cx, cz)
+        return try_generate(d, g, id, def, pm, g.wseed(), cx, cz)
             .into_iter()
             .collect();
     }
     // Multi-entry set: weighted selection over the candidates that are loaded.
-    let mut candidates: Vec<(&str, i32)> = set
-        .entries
-        .iter()
-        .filter(|(id, _)| d.structures.contains_key(id))
-        .map(|(id, w)| (id.as_str(), *w))
-        .collect();
-    let mut total: i32 = candidates.iter().map(|(_, w)| *w).sum();
-    let mut random = crate::generation_math::Lcg::for_large_feature(g.wseed(), cx, cz);
+    let mut candidates: Vec<(usize, i32)> = meta.resolved_entries.clone();
+    let mut total: i32 = meta.total_weight;
+    let seed = g.wseed();
+    let mut random = crate::generation_math::Lcg::for_large_feature(seed, cx, cz);
     while !candidates.is_empty() && total > 0 {
         let mut draw = random.next_bound(total);
         let mut index = 0usize;
@@ -1287,9 +1500,10 @@ fn set_starts(d: &Defs, g: &mut Gen, set: &SetDef, cx: i32, cz: i32) -> Vec<Star
                 break;
             }
         }
-        let (id, weight) = candidates[index];
+        let (sidx, weight) = candidates[index];
+        let id = &d.struct_ids[sidx];
         if let Some(def) = d.structures.get(id) {
-            if let Some(start) = try_generate(d, g, id, def, g.wseed(), cx, cz) {
+            if let Some(start) = try_generate(d, g, id, def, pm, seed, cx, cz) {
                 return vec![start];
             }
         }
@@ -1320,23 +1534,27 @@ fn starts_for_sets(
         crate::worldgen::M3_CHUNK_STARTS_OWNER,
         crate::worldgen::M3_CHUNK_STARTS_WORKER,
     );
+    let pm = preset_masks(d, g);
+    let seed = g.wseed();
     let mut out = Vec::new();
     for &i in sets {
-        let set = &d.sets[i];
-        if set.entries.len() == 1 && matches!(d.structures.get(&set.entries[0].0), None) {
+        let meta = &d.set_meta[i];
+        if meta.resolved_entries.is_empty() {
+            continue;
+        }
+        if pm.is_some_and(|p| !p.set_has_any_valid[i]) {
             continue;
         }
         // The mineshaft set owns its own admission (`mineshaft::admit`), which is
         // byte-for-byte the same placement/frequency/weighted/biome chain.
-        let mineshaft_set = set.entries.iter().all(|(id, _)| {
-            d.structures
-                .get(id)
-                .is_some_and(|def| def.kick == Kick::Mineshaft)
-        });
-        if !mineshaft_set && !set_admits_live(d, g, i, g.wseed(), cx, cz, 0) {
+        if !meta.all_mineshaft && !set_admits_live(d, g, i, seed, cx, cz, 0) {
             continue;
         }
-        out.extend(set_starts(d, g, set, cx, cz).into_iter().map(|s| (i, s)));
+        out.extend(
+            set_starts(d, g, i, pm, cx, cz)
+                .into_iter()
+                .map(|s| (i, s)),
+        );
     }
     out
 }
@@ -1686,19 +1904,8 @@ pub(crate) fn fortress_spawn_bounds(g: &mut Gen, cx: i32, cz: i32) -> Vec<(BB, V
     let Some(d) = defs() else {
         return Vec::new();
     };
-    let sets: Vec<_> = d
-        .sets
-        .iter()
-        .enumerate()
-        .filter_map(|(index, set)| {
-            set.entries
-                .iter()
-                .any(|(id, _)| id == "minecraft:fortress")
-                .then_some(index)
-        })
-        .collect();
     let mut bounds = Vec::new();
-    for (x, z) in window_admitted_chunks(d, g, &sets, cx, cz) {
+    for (x, z) in window_admitted_chunks(d, g, &d.fortress_sets, cx, cz) {
         for start in starts_cached(g, x, z).iter() {
             if let StartPieces::Fortress { pieces, .. } = &start.pieces {
                 if start.intersects_chunk(cx, cz) {
@@ -1723,15 +1930,25 @@ impl References {
                 rng_after: HashMap::new(),
             };
         };
-        // key -> starts, per structure id, in the encounter order of the window.
-        let mut found: HashMap<String, (usize, Vec<u64>, HashMap<u64, Start>)> = HashMap::new();
         // Only chunks admitted by some set can hold a start. Enumerate the grid cells that
         // can land in the window instead of scanning all 17x17 chunks; sort+dedup recovers
         // the exact row-major encounter order of the old full-window scan.
-        let all_sets: Vec<usize> = (0..d.sets.len()).collect();
-        let mut interesting = window_admitted_chunks(d, g, &all_sets, cx, cz);
+        let active_sets = preset_masks(d, g)
+            .map(|p| p.all_valid_sets.as_slice())
+            .unwrap_or(&d.all_sets);
+        let mut interesting = window_admitted_chunks(d, g, active_sets, cx, cz);
         interesting.sort_unstable();
         interesting.dedup();
+        if interesting.is_empty() {
+            return Self {
+                items: Vec::new(),
+                step_count: 0,
+                #[cfg(test)]
+                rng_after: HashMap::new(),
+            };
+        }
+        // key -> starts, per structure id, in the encounter order of the window.
+        let mut found: HashMap<String, (usize, Vec<u64>, HashMap<u64, Start>)> = HashMap::new();
         for (x, z) in interesting {
             for start in starts_cached(g, x, z).iter() {
                 if !start.intersects_chunk(cx, cz) {
@@ -1747,6 +1964,14 @@ impl References {
                 entry.1.push(key);
                 entry.2.insert(key, clone_start(start));
             }
+        }
+        if found.is_empty() {
+            return Self {
+                items: Vec::new(),
+                step_count: 0,
+                #[cfg(test)]
+                rng_after: HashMap::new(),
+            };
         }
         let mut ordered: Vec<(usize, usize, String, Vec<(u64, Start)>)> = found
             .into_iter()
@@ -1794,8 +2019,15 @@ impl References {
         cx: i32,
         cz: i32,
     ) {
+        #[cfg(not(test))]
+        if !self.items.iter().any(|(item_step, _, _)| *item_step == step) {
+            return;
+        }
         let Some(d) = defs() else { return };
-        for (index, id) in d.by_step.get(step).cloned().unwrap_or_default().iter().enumerate() {
+        let Some(step_ids) = d.by_step.get(step) else {
+            return;
+        };
+        for (index, id) in step_ids.iter().enumerate() {
             let seed = population_seed
                 .wrapping_add(index as u64)
                 .wrapping_add(10_000u64.wrapping_mul(step as u64));
@@ -2162,7 +2394,10 @@ fn beard_chunk_data(g: &mut Gen, cx: i32, cz: i32) -> BeardChunkData {
     // its heightmaps), so first ask the cheap question: does any terrain-adapting set
     // admit a chunk in the ±8 window? Enumerate only the spread grid cells and the nearby
     // stronghold indices that can land there, then sort+dedup to keep the row-major order.
-    let mut interesting = window_admitted_chunks(d, g, &d.adapting_sets, cx, cz);
+    let active_adapting = preset_masks(d, g)
+        .map(|p| p.adapting_valid_sets.as_slice())
+        .unwrap_or(&d.adapting_sets);
+    let mut interesting = window_admitted_chunks(d, g, active_adapting, cx, cz);
     interesting.sort_unstable();
     interesting.dedup();
     if interesting.is_empty() {

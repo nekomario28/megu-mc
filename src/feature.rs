@@ -24,6 +24,226 @@ use std::sync::Arc;
 #[path = "generation_contract_tests.rs"]
 mod generation_contract_tests;
 
+// ---------- fast block bitsets and pre-resolved tables ----------
+
+const FEAT_BITSET_WORDS: usize = 24;
+
+#[derive(Clone)]
+struct FeatBlockBitset {
+    bits: [u64; FEAT_BITSET_WORDS],
+    overflow: bool,
+}
+
+impl FeatBlockBitset {
+    fn empty() -> Self {
+        Self {
+            bits: [0; FEAT_BITSET_WORDS],
+            overflow: false,
+        }
+    }
+
+    fn insert_block_id(&mut self, bi: i32) {
+        if bi < 0 {
+            return;
+        }
+        let u = bi as usize;
+        let w = u >> 6;
+        if w < FEAT_BITSET_WORDS {
+            self.bits[w] |= 1u64 << (u & 63);
+        } else {
+            self.overflow = true;
+        }
+    }
+
+    fn from_tag(reg: &BReg, tag: &str) -> Self {
+        let mut out = Self::empty();
+        for &bi in reg.tag_members(tag) {
+            out.insert_block_id(bi as i32);
+        }
+        out
+    }
+
+    fn from_names<'a>(reg: &BReg, names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut out = Self::empty();
+        for name in names {
+            let st = reg.state_of(name, None);
+            if reg.name_of(st) == name {
+                if let Some(bi) = reg.block_id_of(st) {
+                    out.insert_block_id(bi);
+                }
+            }
+        }
+        out
+    }
+
+    #[inline]
+    fn contains_bid(&self, bi: i32) -> bool {
+        let u = bi as usize;
+        let w = u >> 6;
+        w < FEAT_BITSET_WORDS && (self.bits[w] & (1u64 << (u & 63))) != 0
+    }
+
+    #[inline]
+    fn contains_state(&self, reg: &BReg, st: u32) -> bool {
+        reg.block_id_of(st).is_some_and(|bi| self.contains_bid(bi))
+    }
+}
+
+enum FastRT {
+    True,
+    BlockId(i32),
+    BlockSet(Box<FeatBlockBitset>),
+    State(u32),
+    Fallback(RT),
+}
+
+impl FastRT {
+    fn compile(rt: RT, reg: &BReg) -> Self {
+        match rt {
+            RT::True => Self::True,
+            RT::BlockState(s) => Self::State(s),
+            RT::Tag(t) => {
+                let bs = FeatBlockBitset::from_tag(reg, &t);
+                if bs.overflow {
+                    Self::Fallback(RT::Tag(t))
+                } else {
+                    Self::BlockSet(Box::new(bs))
+                }
+            }
+            RT::Block(b) => {
+                let st = reg.state_of(&b, None);
+                if reg.name_of(st) == b {
+                    if let Some(bi) = reg.block_id_of(st) {
+                        return Self::BlockId(bi);
+                    }
+                }
+                Self::Fallback(RT::Block(b))
+            }
+            other => Self::Fallback(other),
+        }
+    }
+
+    #[inline]
+    fn matches(&self, reg: &BReg, st: u32, y: i32, r: &mut Xor) -> bool {
+        match self {
+            Self::True => true,
+            Self::State(s) => st == *s,
+            Self::BlockId(bi) => reg.block_id_of(st) == Some(*bi),
+            Self::BlockSet(bs) => bs.contains_state(reg, st),
+            Self::Fallback(rt) => test_rt(rt, reg, st, y, r),
+        }
+    }
+}
+
+struct FastOre {
+    size: i32,
+    discard: f32,
+    targets: Vec<(FastRT, u32)>,
+    scattered: bool,
+}
+
+struct FeatTables {
+    air_bid: i32,
+    cobble: u32,
+    mossy: u32,
+    cave_air: u32,
+    chest: u32,
+    spawner: u32,
+    chest_bid: i32,
+    spawner_bid: i32,
+    ice: u32,
+    snow: u32,
+    snow_layer_8: u32,
+    snow_bid: i32,
+    water_bid: i32,
+    magma_bid: i32,
+    seagrass: u32,
+    tall_seagrass_lo: u32,
+    tall_seagrass_hi: u32,
+    kelp_plant: u32,
+    kelp_ages: [u32; 4],
+    kelp_bid: i32,
+    snow_cannot_survive: FeatBlockBitset,
+    snow_can_survive: FeatBlockBitset,
+    features_cannot_replace: FeatBlockBitset,
+    snowy_blocks: FeatBlockBitset,
+}
+
+impl FeatTables {
+    fn build(reg: &BReg) -> Self {
+        let bid = |name: &str| reg.block_id_of(reg.state_of(name, None)).unwrap_or(-1);
+        let cobble = reg.state_of("minecraft:cobblestone", None);
+        let mossy = reg.state_of("minecraft:mossy_cobblestone", None);
+        let cave_air = reg.state_of("minecraft:cave_air", None);
+        let chest = reg.state_of("minecraft:chest", None);
+        let spawner = reg.state_of("minecraft:spawner", None);
+        let ice = reg.state_of("minecraft:ice", None);
+        let snow = reg.state_of("minecraft:snow", None);
+        let snow_layer_8 = reg.with_prop(snow, "layers", "8");
+        let seagrass = reg.state_of("minecraft:seagrass", None);
+        let half = |v: &str| J::Obj(vec![("half".to_string(), J::Str(v.to_string()))]);
+        let tall_seagrass_lo = reg.state_of("minecraft:tall_seagrass", Some(&half("lower")));
+        let tall_seagrass_hi = reg.state_of("minecraft:tall_seagrass", Some(&half("upper")));
+        let kelp_plant = reg.state_of("minecraft:kelp_plant", None);
+        let kelp_base = reg.state_of("minecraft:kelp", None);
+        let kelp_ages = [
+            reg.with_prop(kelp_base, "age", "20"),
+            reg.with_prop(kelp_base, "age", "21"),
+            reg.with_prop(kelp_base, "age", "22"),
+            reg.with_prop(kelp_base, "age", "23"),
+        ];
+        let mut snowy_blocks = FeatBlockBitset::empty();
+        let mut st = 0u32;
+        let mut last_bid = -1i32;
+        while let Some(b) = reg.block_id_of(st) {
+            if b != last_bid {
+                last_bid = b;
+                if reg.get_prop(st, "snowy").is_some() {
+                    snowy_blocks.insert_block_id(b);
+                }
+            }
+            st += 1;
+        }
+        Self {
+            air_bid: bid("minecraft:air"),
+            cobble,
+            mossy,
+            cave_air,
+            chest,
+            spawner,
+            chest_bid: reg.block_id_of(chest).unwrap_or(-1),
+            spawner_bid: reg.block_id_of(spawner).unwrap_or(-1),
+            ice,
+            snow,
+            snow_layer_8,
+            snow_bid: reg.block_id_of(snow).unwrap_or(-1),
+            water_bid: bid("minecraft:water"),
+            magma_bid: bid("minecraft:magma_block"),
+            seagrass,
+            tall_seagrass_lo,
+            tall_seagrass_hi,
+            kelp_plant,
+            kelp_ages,
+            kelp_bid: reg.block_id_of(kelp_base).unwrap_or(-1),
+            snow_cannot_survive: FeatBlockBitset::from_tag(
+                reg,
+                "minecraft:snow_layer_cannot_survive_on",
+            ),
+            snow_can_survive: FeatBlockBitset::from_tag(reg, "minecraft:snow_layer_can_survive_on"),
+            features_cannot_replace: FeatBlockBitset::from_tag(
+                reg,
+                "minecraft:features_cannot_replace",
+            ),
+            snowy_blocks,
+        }
+    }
+}
+
+fn feat_tables(reg: &BReg) -> &'static FeatTables {
+    static TABLES: std::sync::OnceLock<FeatTables> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| FeatTables::build(reg))
+}
+
 // ---------- configured features ----------
 
 enum FRef {
@@ -37,6 +257,10 @@ enum FRef {
     /// e.g. `block_predicate_filter(would_survive)`: every random_selector tree
     /// candidate then grew a tree where vanilla rejected it.
     Placed(String),
+    /// Pre-resolved index into `FReg::cfg_vec`.
+    CfgIdx(usize),
+    /// Pre-resolved `(placed_vec index, ball_mask)`.
+    PlacedIdx(usize, u128),
     Inline(Box<Cf>),
 }
 struct Pf {
@@ -221,12 +445,14 @@ enum Cf {
     /// explicit edge connections when `guarded`, consumes one crystal-yaw `next_f32()`
     /// draw, and sets `bedrock` at `height` and default `fire` at `height + 1`.
     EndSpike(EndSpikeCfg),
+    #[cfg_attr(not(test), allow(dead_code))]
     Ore {
         size: i32,
         discard: f32,
         targets: Vec<(RT, u32)>,
         scattered: bool,
     },
+    OreFast(Box<FastOre>),
     Disk {
         half: i32,
         radius: IP,
@@ -241,10 +467,12 @@ enum Cf {
     },
     Spring {
         fluid: u32,
+        fluid_id: i8,
         req_below: bool,
         rock: i32,
         hole: i32,
         valid: HashSet<String>,
+        valid_bits: Box<FeatBlockBitset>,
     },
     /// `minecraft:sea_pickle` (`edj`, `SeaPickleFeature`): `count` attempts, each
     /// drawing two `nextInt(8)` apart for an offset in +-8, taking the OCEAN_FLOOR
@@ -366,8 +594,11 @@ enum Cf {
 }
 
 pub(crate) struct MultifaceCfg {
-    name: String,
+    block_id: i32,
+    base_state: u32,
+    waterlogged_base: u32,
     on: HashSet<String>,
+    on_bits: FeatBlockBitset,
     dirs: Vec<u8>,
     search: i32,
     spread: f32,
@@ -1860,7 +2091,18 @@ fn safe_feature_set(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &
     if ctx.out_of_h(p.1) {
         return;
     }
-    if !reg.in_tag(ctx.get(p.0, p.1, p.2), cannot_replace) {
+    let cur = ctx.get(p.0, p.1, p.2);
+    let blocked = if cannot_replace == "minecraft:features_cannot_replace" {
+        let ft = feat_tables(reg);
+        if !ft.features_cannot_replace.overflow {
+            ft.features_cannot_replace.contains_state(reg, cur)
+        } else {
+            reg.in_tag(cur, cannot_replace)
+        }
+    } else {
+        reg.in_tag(cur, cannot_replace)
+    };
+    if !blocked {
         ctx.set(p.0, p.1, p.2, st);
     }
 }
@@ -4884,18 +5126,19 @@ fn p_cf(j: &J) -> Option<Cf> {
     Some(match ty {
         "fossil" => Cf::Fossil(Box::new(Fossil::parse(j)?)),
         "ore" | "scattered_ore" => {
+            let reg = breg()?;
             let mut targets = vec![];
             for t in jarr(j, "targets").map(|v| v.as_slice()).unwrap_or(&[]) {
                 let rt = js(t, "target").and_then(p_rt)?;
                 let (n, p) = js(t, "state").and_then(bs_parts)?;
-                targets.push((rt, breg()?.state_of(&n, p)));
+                targets.push((FastRT::compile(rt, reg), reg.state_of(&n, p)));
             }
-            Cf::Ore {
+            Cf::OreFast(Box::new(FastOre {
                 size: jint(j, "size", 0),
                 discard: jf32(j, "discard_chance_on_air_exposure", 0.0),
                 targets,
                 scattered: ty == "scattered_ore",
-            }
+            }))
         }
         "disk" => Cf::Disk {
             half: jint(j, "half_height", 0),
@@ -5016,14 +5259,13 @@ fn p_cf(j: &J) -> Option<Cf> {
             in_: name_list(j, "can_place_in"),
             under: name_list(j, "can_place_under"),
         },
-        "spring_feature" => Cf::Spring {
+        "spring_feature" => {
+            let reg = breg()?;
             // the config holds a *fluid* state and vanilla places its legacy block
             // (`createLegacyBlock`): falling water is level 8, a source is level 0
-            fluid: {
+            let fluid = {
                 let st = js(j, "state")?;
                 let (n, p) = bs_parts(st)?;
-                // the config holds a *fluid* state; vanilla places its legacy block
-                // (`createLegacyBlock`): falling water is level 8, a source level 0
                 let falling = J::Obj(vec![(
                     "level".to_string(),
                     J::Str(
@@ -5040,13 +5282,30 @@ fn p_cf(j: &J) -> Option<Cf> {
                 } else {
                     p
                 };
-                breg()?.state_of(&n, props)
-            },
-            req_below: jbool(j, "requires_block_below", true),
-            rock: jint(j, "rock_count", 4),
-            hole: jint(j, "hole_count", 1),
-            valid: name_list(j, "valid_blocks").into_iter().collect(),
-        },
+                reg.state_of(&n, props)
+            };
+            let fluid_id = match reg.fluid_name(fluid) {
+                "minecraft:water" => 0,
+                "minecraft:flowing_water" => 1,
+                "minecraft:lava" => 2,
+                "minecraft:flowing_lava" => 3,
+                _ => -1,
+            };
+            let valid: HashSet<String> = name_list(j, "valid_blocks").into_iter().collect();
+            let valid_bits = Box::new(FeatBlockBitset::from_names(
+                reg,
+                valid.iter().map(String::as_str),
+            ));
+            Cf::Spring {
+                fluid,
+                fluid_id,
+                req_below: jbool(j, "requires_block_below", true),
+                rock: jint(j, "rock_count", 4),
+                hole: jint(j, "hole_count", 1),
+                valid,
+                valid_bits,
+            }
+        }
         "seagrass" => Cf::Seagrass {
             prob: jf32(j, "probability", 0.0),
         },
@@ -5148,6 +5407,7 @@ fn p_cf(j: &J) -> Option<Cf> {
         },
         "freeze_top_layer" => Cf::FreezeTop,
         "multiface_growth" => {
+            let reg = breg()?;
             let mut dirs = Vec::new();
             if jbool(j, "can_place_on_ceiling", false) {
                 dirs.push(1);
@@ -5158,9 +5418,18 @@ fn p_cf(j: &J) -> Option<Cf> {
             if jbool(j, "can_place_on_wall", false) {
                 dirs.extend([2, 5, 3, 4]);
             }
+            let name = ns_name(&jstr(j, "block")?);
+            let base_state = reg.state_of(&name, None);
+            let waterlogged_base = reg.with_prop(base_state, "waterlogged", "true");
+            let block_id = reg.block_id_of(base_state).unwrap_or(-1);
+            let on: HashSet<String> = name_list(j, "can_be_placed_on").into_iter().collect();
+            let on_bits = FeatBlockBitset::from_names(reg, on.iter().map(String::as_str));
             Cf::Multiface(Box::new(MultifaceCfg {
-                name: ns_name(&jstr(j, "block")?),
-                on: name_list(j, "can_be_placed_on").into_iter().collect(),
+                block_id,
+                base_state,
+                waterlogged_base,
+                on,
+                on_bits,
                 dirs,
                 search: jint(j, "search_range", 10),
                 spread: jf32(j, "chance_of_spreading", 0.5),
@@ -5307,11 +5576,13 @@ struct StepEntry {
     #[cfg(test)]
     name: String,
     step_biome_mask: u128,
+    ball_mask: u128,
     placed_idx: usize,
 }
 
 pub(crate) struct FReg {
-    cfg: HashMap<String, Cf>,
+    cfg: HashMap<String, usize>,
+    cfg_vec: Vec<Cf>,
     /// Kept for legacy/test callers (and child placed features) that look a
     /// placed feature up by name. Shares its `Pf` values with `placed_vec`
     /// through `Arc`, so both views are the same object.
@@ -5325,6 +5596,9 @@ pub(crate) struct FReg {
     /// Precomputed `ball_biome_mask` per placed-feature name: the union of
     /// bit(biome) over all biomes whose flattened feature list contains it.
     ball_masks: HashMap<String, u128>,
+    /// Biomes that can ever satisfy `cold_enough_to_snow` at `y <= 320`
+    /// (`temperature_modifier == "frozen"` or `temperature < 0.50`).
+    possibly_cold_mask: u128,
     /// False only if there were more than 128 distinct feature biomes; in
     /// that defensive case `populate_body` uses the original string path.
     bit_ok: bool,
@@ -5415,13 +5689,83 @@ fn p_spawn_cost(j: &J) -> Option<SpawnCost> {
     })
 }
 
+fn resolve_fref(
+    fref: &mut FRef,
+    cfg_idx: &HashMap<String, usize>,
+    placed_idx: &HashMap<String, usize>,
+    ball_masks: &HashMap<String, u128>,
+) {
+    match fref {
+        FRef::Name(n) => {
+            if let Some(&idx) = cfg_idx.get(n.as_str()) {
+                *fref = FRef::CfgIdx(idx);
+            }
+        }
+        FRef::Placed(n) => {
+            if let Some(&idx) = placed_idx.get(n.as_str()) {
+                let mask = ball_masks.get(n.as_str()).copied().unwrap_or(0);
+                *fref = FRef::PlacedIdx(idx, mask);
+            }
+        }
+        FRef::Inline(cf) => resolve_cf(cf, cfg_idx, placed_idx, ball_masks),
+        FRef::CfgIdx(_) | FRef::PlacedIdx(_, _) => {}
+    }
+}
+
+fn resolve_pf(
+    pf: &mut Pf,
+    cfg_idx: &HashMap<String, usize>,
+    placed_idx: &HashMap<String, usize>,
+    ball_masks: &HashMap<String, u128>,
+) {
+    resolve_fref(&mut pf.feat, cfg_idx, placed_idx, ball_masks);
+}
+
+fn resolve_cf(
+    cf: &mut Cf,
+    cfg_idx: &HashMap<String, usize>,
+    placed_idx: &HashMap<String, usize>,
+    ball_masks: &HashMap<String, u128>,
+) {
+    match cf {
+        Cf::RandomPatch { feature, .. } => resolve_pf(feature, cfg_idx, placed_idx, ball_masks),
+        Cf::RandSel(list, default) => {
+            for (pf, _) in list {
+                resolve_pf(pf, cfg_idx, placed_idx, ball_masks);
+            }
+            if let Some(d) = default {
+                resolve_pf(d, cfg_idx, placed_idx, ball_masks);
+            }
+        }
+        Cf::SimpleRand(list) | Cf::Seq(list) => {
+            for pf in list {
+                resolve_pf(pf, cfg_idx, placed_idx, ball_masks);
+            }
+        }
+        Cf::WeightedSel(list) => {
+            for (pf, _) in list {
+                resolve_pf(pf, cfg_idx, placed_idx, ball_masks);
+            }
+        }
+        Cf::BoolSel(t, f) => {
+            resolve_pf(t, cfg_idx, placed_idx, ball_masks);
+            resolve_pf(f, cfg_idx, placed_idx, ball_masks);
+        }
+        Cf::VegPatch { vfeat, .. } => resolve_pf(vfeat, cfg_idx, placed_idx, ball_masks),
+        Cf::RootSystem(rc) => resolve_pf(&mut rc.feature, cfg_idx, placed_idx, ball_masks),
+        _ => {}
+    }
+}
+
 fn load_freg() -> FReg {
     let mut reg = FReg {
         cfg: HashMap::new(),
+        cfg_vec: Vec::new(),
         placed: HashMap::new(),
         placed_vec: Vec::new(),
         biome_bits: HashMap::new(),
         ball_masks: HashMap::new(),
+        possibly_cold_mask: 0,
         bit_ok: true,
         bsteps: HashMap::new(),
         ball: HashMap::new(),
@@ -5436,7 +5780,9 @@ fn load_freg() -> FReg {
         if let Some(j) = jparse(&b) {
             match p_cf(&j) {
                 Some(cf) => {
-                    reg.cfg.insert(name, cf);
+                    let idx = reg.cfg_vec.len();
+                    reg.cfg_vec.push(cf);
+                    reg.cfg.insert(name, idx);
                 }
                 None => {
                     if env_flag!("CF_UNPARSED") {
@@ -5446,18 +5792,26 @@ fn load_freg() -> FReg {
             }
         }
     }
+    let mut raw_placed: Vec<(String, Pf)> = Vec::new();
+    let mut placed_idx_map: HashMap<String, usize> = HashMap::new();
     for (name, b) in Gen::dp_files("placed_feature") {
         if let Some(j) = jparse(&b) {
             if let Some(mut pf) = p_pf(&j) {
                 pf.name = name.clone();
-                reg.placed.insert(name, Arc::new(pf));
+                let idx = raw_placed.len();
+                placed_idx_map.insert(name.clone(), idx);
+                raw_placed.push((name, pf));
             }
         }
     }
+    let mut frozen_biomes: HashSet<String> = HashSet::new();
     for (name, b) in Gen::dp_files("biome") {
         if let Some(j) = jparse(&b) {
             if let Some(t) = jnum(&j, "temperature") {
                 reg.btemp.insert(name.clone(), t as f32);
+            }
+            if jstr(&j, "temperature_modifier").as_deref() == Some("frozen") {
+                frozen_biomes.insert(name.clone());
             }
             let mut steps: Vec<Vec<String>> = vec![];
             if let Some(fs) = jarr(&j, "features") {
@@ -5540,11 +5894,31 @@ fn load_freg() -> FReg {
             }
         }
         reg.ball_masks = ball_masks;
+        let mut cold_mask = 0u128;
+        for (biome, &bi) in reg.biome_bits.iter() {
+            let temp = reg.btemp.get(biome).copied().unwrap_or(0.0);
+            if frozen_biomes.contains(biome) || temp < 0.50 {
+                cold_mask |= 1u128 << bi;
+            }
+        }
+        reg.possibly_cold_mask = cold_mask;
     }
 
-    // Direct-index view over the same `Pf` values; `StepEntry.placed_idx`
-    // points straight into this vector on the per-chunk hot path.
-    let placed_vec: Vec<Arc<Pf>> = reg.placed.values().cloned().collect();
+    // Pre-resolve every `FRef::Name`/`FRef::Placed` into direct slice indices so
+    // hot feature execution (RandomPatch, RandomSelector, etc.) avoids HashMap
+    // lookups on every placement attempt.
+    for cf in &mut reg.cfg_vec {
+        resolve_cf(cf, &reg.cfg, &placed_idx_map, &reg.ball_masks);
+    }
+    for (_, pf) in &mut raw_placed {
+        resolve_pf(pf, &reg.cfg, &placed_idx_map, &reg.ball_masks);
+    }
+    let mut placed_vec: Vec<Arc<Pf>> = Vec::with_capacity(raw_placed.len());
+    for (name, pf) in raw_placed {
+        let arc = Arc::new(pf);
+        placed_vec.push(Arc::clone(&arc));
+        reg.placed.insert(name, arc);
+    }
     reg.placed_vec = placed_vec;
     let placed_idx: HashMap<&str, usize> = reg
         .placed_vec
@@ -5604,6 +5978,7 @@ fn load_freg() -> FReg {
                     #[cfg(test)]
                     name: name.clone(),
                     step_biome_mask: mask,
+                    ball_mask: reg.ball_masks.get(name).copied().unwrap_or(0),
                     placed_idx: placed_idx
                         .get(name.as_str())
                         .copied()
@@ -5811,13 +6186,24 @@ fn veg_col_trace(pos: (i32, i32, i32)) -> bool {
 // `gen_pf` resolves it once per feature (a single hash lookup) and pushes it;
 // `PM::Biome` then reads the top of this stack, so each placement candidate
 // needs only one integer AND. Nested placed features push their own mask.
-thread_local! {
-    static PF_MASK: std::cell::RefCell<Vec<u128>> = std::cell::RefCell::new(Vec::new());
+fn gen_pf(pf: &Pf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
+    let mask = if pf.name.is_empty() {
+        0
+    } else {
+        fr.ball_masks.get(&pf.name).copied().unwrap_or(0)
+    };
+    gen_pf_with_mask(pf, mask, fr, ctx, rng, pos);
 }
 
-fn gen_pf(pf: &Pf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
-    let mask = fr.ball_masks.get(&pf.name).copied().unwrap_or(0);
-    PF_MASK.with(|s| s.borrow_mut().push(mask));
+#[inline]
+fn gen_pf_with_mask(
+    pf: &Pf,
+    pf_mask: u128,
+    fr: &'static FReg,
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+) {
     // Modifiers are streams of positions, not passes over a list. Vanilla builds
     // `Stream.of(origin).flatMap(modifier::getPositions)` for each modifier in turn, and the
     // terminal operation places the feature as each position is pulled. So a position produced by
@@ -5829,25 +6215,38 @@ fn gen_pf(pf: &Pf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
     // vein origins then differ for every multi-position feature - `ore_andesite_lower` in chunk
     // (0,0) put its veins at y=15 and y=18 instead of y=49 and y=18 - which is why no step index
     // reproduced vanilla's ore cells.
-    apply_modifiers(pf.mods.as_slice(), pf, fr, ctx, rng, pos);
-    PF_MASK.with(|s| {
-        s.borrow_mut().pop();
-    });
+    apply_modifiers(pf.mods.as_slice(), pf, pf_mask, fr, ctx, rng, pos);
 }
 
-// Reusable scratch buffers for `apply_modifiers`' per-stage position lists.
-// Each modifier stage used to allocate a fresh `Vec`; with a pool the buffers
-// survive across stages and features and the steady-state path allocates
-// nothing. A buffer is returned to the pool *before* the recursive walk so
-// deeper stages can pop it again.
+// Reusable scratch buffers for `PM::CountEveryLayer`, the only modifier that
+// must materialize all positions before recursing into downstream stages.
 thread_local! {
     static MOD_SCRATCH: std::cell::RefCell<Vec<Vec<(i32, i32, i32)>>> =
         std::cell::RefCell::new(Vec::new());
 }
 
+#[inline]
+fn fast_test_pred(pr: &Pr, reg: &BReg, ft: &FeatTables, ctx: &mut FC, x: i32, y: i32, z: i32) -> bool {
+    match pr {
+        Pr::True => true,
+        Pr::InsideWB => !ctx.out_of_h(y),
+        Pr::Blocks(names) if names.len() == 1 && names[0] == "minecraft:air" => {
+            reg.block_id_of(ctx.get(x, y, z)) == Some(ft.air_bid)
+        }
+        Pr::Solid => reg.is_solid(ctx.get(x, y, z)),
+        Pr::Replaceable => reg.is_replaceable(ctx.get(x, y, z)),
+        Pr::All(v) => v.iter().all(|p| fast_test_pred(p, reg, ft, ctx, x, y, z)),
+        Pr::Any(v) => v.iter().any(|p| fast_test_pred(p, reg, ft, ctx, x, y, z)),
+        Pr::Not(p) => !fast_test_pred(p, reg, ft, ctx, x, y, z),
+        Pr::Offset(p, off) => fast_test_pred(p, reg, ft, ctx, x + off[0], y + off[1], z + off[2]),
+        _ => test_pred(pr, reg, ctx, x, y, z),
+    }
+}
+
 fn apply_modifiers(
     mods: &[PM],
     pf: &Pf,
+    pf_mask: u128,
     fr: &'static FReg,
     ctx: &mut FC,
     rng: &mut Xor,
@@ -5857,24 +6256,237 @@ fn apply_modifiers(
         gen_cf_ref(&pf.feat, fr, ctx, rng, pos);
         return;
     };
-    let mut out = MOD_SCRATCH
-        .with(|p| p.borrow_mut().pop())
-        .unwrap_or_default();
-    mod_positions(m, fr, ctx, rng, pos, pf, &mut out);
-    // Hand the (now empty) buffer back before recursing: each nested stage can
-    // reuse it, so a whole feature's modifier chain may allocate no new Vec.
-    let positions = std::mem::take(&mut out);
-    MOD_SCRATCH.with(|p| p.borrow_mut().push(out));
-    for p in positions {
-        apply_modifiers(rest, pf, fr, ctx, rng, p);
+    match m {
+        PM::Count(ip) => {
+            let n = ip.get(rng).max(0);
+            for _ in 0..n {
+                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
+            }
+        }
+        PM::CountEveryLayer(ip) => {
+            let mut out = MOD_SCRATCH
+                .with(|p| p.borrow_mut().pop())
+                .unwrap_or_default();
+            out.clear();
+            count_every_layer_positions(ip, ctx, rng, pos, &mut out);
+            for i in 0..out.len() {
+                let p = out[i];
+                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, p);
+            }
+            out.clear();
+            MOD_SCRATCH.with(|p| {
+                let mut pool = p.borrow_mut();
+                if pool.len() < 16 {
+                    pool.push(out);
+                }
+            });
+        }
+        PM::InSquare => {
+            let (x, z) = (pos.0 + rng.next_bound(16), pos.2 + rng.next_bound(16));
+            if let Some(spec) = env_str!("INSQ_TRACE") {
+                if let Some((a, c)) = spec.split_once(',') {
+                    if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
+                        if (x >> 4) == cx && (z >> 4) == cz {
+                            let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                            eprintln!("INSQ {x} {z} feature={},{}", cf >> 32, cf & 0xFFFF);
+                        }
+                    }
+                }
+            }
+            apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, (x, pos.1, z));
+        }
+        PM::Offset(xz, ysp) => {
+            let next = (
+                pos.0 + xz.get(rng),
+                pos.1 + ysp.get(rng),
+                pos.2 + xz.get(rng),
+            );
+            apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, next);
+        }
+        PM::HeightRange(hp) => {
+            let next = (pos.0, hp.get(rng, ctx.g.min_y, ctx.g.height), pos.2);
+            apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, next);
+        }
+        PM::Heightmap(kind) => {
+            let top = ctx.heightmap(*kind, pos.0, pos.2);
+            if top > ctx.g.min_y {
+                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, (pos.0, top, pos.2));
+            }
+        }
+        PM::Fixed => apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos),
+        PM::Biome => {
+            let trace_spec = env_str!("BIOMEF_TRACE");
+            let fast = fr.bit_ok
+                && test_biome_leaf(ctx).is_none()
+                && LEAF_BITS.with(|c| c.borrow().active);
+            let leaf = if fast {
+                ctx.g
+                    .biome_blended(pos.0, pos.1, pos.2)
+                    .map(|(_, l)| l)
+                    .or_else(|| {
+                        ctx.g
+                            .biome_quart(pos.0 >> 2, pos.1 >> 2, pos.2 >> 2, None)
+                            .map(|(_, l)| l)
+                    })
+                    .filter(|l| usize::from(*l) < 128)
+            } else {
+                None
+            };
+            let mut ok = false;
+            let mut bname: Option<String> = None;
+            if let Some(leaf) = leaf {
+                let bit = leaf_bit(ctx, fr, leaf);
+                ok = bit.is_some_and(|b| (pf_mask & b) != 0);
+                if trace_spec.is_some() {
+                    bname = ctx.g.biome_name_of_leaf(leaf);
+                }
+            } else if let Some(b) = ctx.biome(pos.0, pos.1, pos.2) {
+                ok = fr
+                    .ball
+                    .get(&b)
+                    .map(|s| s.contains(&pf.name))
+                    .unwrap_or(false);
+                bname = Some(b);
+            }
+            if let Some(spec) = trace_spec {
+                if let Some((a, c)) = spec.split_once(',') {
+                    if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
+                        if (pos.0 >> 4) == cx && (pos.2 >> 4) == cz {
+                            let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "BIOMEF {} {} {} {} biome={} feature={},{}",
+                                pos.0,
+                                pos.1,
+                                pos.2,
+                                ok,
+                                bname.as_deref().unwrap_or(""),
+                                cf >> 32,
+                                cf & 0xFFFF
+                            );
+                        }
+                    }
+                }
+            }
+            if ok {
+                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
+            }
+        }
+        PM::BlockPred(p) => {
+            if let Some(reg) = breg() {
+                let ft = feat_tables(reg);
+                let ok = fast_test_pred(p, reg, ft, ctx, pos.0, pos.1, pos.2);
+                if let Some(spec) = env_str!("BLOCKPRED_TRACE") {
+                    if spec == "all" || spec == format!("{},{}", pos.0 >> 4, pos.2 >> 4) {
+                        eprintln!(
+                            "BLOCKPRED {} {} {} ok={} below={} at={} feature={},{}",
+                            pos.0,
+                            pos.1,
+                            pos.2,
+                            ok,
+                            reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)),
+                            reg.name_of(ctx.get(pos.0, pos.1, pos.2)),
+                            CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed) >> 32,
+                            CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed) & 0xFFFF
+                        );
+                    }
+                }
+                if ok {
+                    apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
+                }
+            }
+        }
+        PM::Rarity(ch) => {
+            if *ch > 0 && rng.next_f32() < 1.0 / *ch as f32 {
+                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
+            }
+        }
+        PM::SurfaceRel(kind, min_i, max_i) => {
+            let y = i64::from(ctx.heightmap(*kind, pos.0, pos.2));
+            let lo = y + i64::from(*min_i);
+            let hi = y + i64::from(*max_i);
+            if lo <= i64::from(pos.1) && i64::from(pos.1) <= hi {
+                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
+            }
+        }
+        PM::SurfWaterDepth(max) => {
+            let wt = ctx.hm_ws(pos.0, pos.2);
+            let oc = ctx.hm_oc(pos.0, pos.2);
+            if let Some(spec) = env_str!("SURF_TRACE") {
+                if spec == "all" || spec == format!("{},{}", pos.0 >> 4, pos.2 >> 4) {
+                    eprintln!(
+                        "SURF {} {} ws={} oc={} depth={} ok={}",
+                        pos.0,
+                        pos.2,
+                        wt,
+                        oc,
+                        wt - oc,
+                        wt - oc <= *max
+                    );
+                }
+            }
+            if wt - oc <= *max {
+                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
+            }
+        }
+        PM::NoiseCount(ratio, factor, offset) => {
+            let n = foliage_noise().sample(pos.0 as f64 / *factor, pos.2 as f64 / *factor);
+            let cnt = ((n + *offset) * *ratio as f64).ceil().max(0.0) as i32;
+            for _ in 0..cnt {
+                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
+            }
+        }
+        PM::NoiseThrCount(level, below, above) => {
+            let n = foliage_noise().sample(pos.0 as f64 / 200.0, pos.2 as f64 / 200.0);
+            let cnt = if n < *level { *below } else { *above };
+            for _ in 0..cnt.max(0) {
+                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
+            }
+        }
+        PM::RandomChance(c) => {
+            if rng.next_f32() < *c {
+                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
+            }
+        }
+        PM::EnvScan(up, allowed, target, max_steps) => {
+            if let Some(reg) = breg() {
+                let ft = feat_tables(reg);
+                let allowed_pred: &Pr = allowed.as_ref().unwrap_or(&Pr::True);
+                if !fast_test_pred(allowed_pred, reg, ft, ctx, pos.0, pos.1, pos.2) {
+                    return;
+                }
+                let (dx, dy, dz) = dir_off(*up);
+                let mut p = pos;
+                for _ in 0..*max_steps {
+                    if fast_test_pred(target, reg, ft, ctx, p.0, p.1, p.2) {
+                        apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, p);
+                        return;
+                    }
+                    p = (p.0 + dx, p.1 + dy, p.2 + dz);
+                    if ctx.out_of_h(p.1) {
+                        return;
+                    }
+                    if !fast_test_pred(allowed_pred, reg, ft, ctx, p.0, p.1, p.2) {
+                        break;
+                    }
+                }
+                if fast_test_pred(target, reg, ft, ctx, p.0, p.1, p.2) {
+                    apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, p);
+                }
+            }
+        }
+        PM::Carving => {}
     }
 }
 
 fn gen_cf_ref(fref: &FRef, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match fref {
+        FRef::CfgIdx(idx) => gen_cf(&fr.cfg_vec[*idx], fr, ctx, rng, pos),
+        FRef::PlacedIdx(idx, mask) => {
+            gen_pf_with_mask(&fr.placed_vec[*idx], *mask, fr, ctx, rng, pos);
+        }
         FRef::Name(n) => {
             match fr.cfg.get(n) {
-                Some(cf) => gen_cf(cf, fr, ctx, rng, pos),
+                Some(&idx) => gen_cf(&fr.cfg_vec[idx], fr, ctx, rng, pos),
                 None => {
                     // A configured feature that failed to parse is skipped
                     // silently, which looks exactly like "the feature chose not
@@ -5909,12 +6521,14 @@ fn gen_cf_ref(fref: &FRef, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: 
 /// pre-change path.
 struct LeafBitCache {
     active: bool,
+    present_mask: u128,
     bits: [u128; 128],
     known: u128,
 }
 thread_local! {
     static LEAF_BITS: std::cell::RefCell<LeafBitCache> = std::cell::RefCell::new(LeafBitCache {
         active: false,
+        present_mask: 0,
         bits: [0; 128],
         known: 0,
     });
@@ -5961,6 +6575,7 @@ fn leaf_bit(ctx: &mut FC, fr: &FReg, leaf: u16) -> Option<u128> {
     Some(bit)
 }
 
+#[cfg(test)]
 fn mod_positions(
     m: &PM,
     fr: &'static FReg,
@@ -5976,89 +6591,14 @@ fn mod_positions(
                 out.push(pos);
             }
         }
-        PM::CountEveryLayer(ip) => {
-            // `CountOnEveryLayerPlacement.getPositions` (`eim.a_(eiw,ayw,jd)`):
-            //
-            // ```java
-            // int layer = 0; boolean found;
-            // do {
-            //    found = false;
-            //    for (int j = 0; j < this.count.sample(random); j++) {   // per layer
-            //       int x = random.nextInt(16) + pos.getX();
-            //       int z = random.nextInt(16) + pos.getZ();
-            //       int top = context.getHeight(MOTION_BLOCKING, x, z);
-            //       int y = getY(context, x, top, z, layer);
-            //       if (y != Integer.MAX_VALUE) { builder.add(...); found = true; }
-            //    }
-            //    layer++;
-            // } while (found);
-            // ```
-            //
-            // Three details each move every later draw (and every later layer):
-            // the count is re-sampled *inside* the layer loop, the column height is
-            // `MOTION_BLOCKING` (not the OCEAN_FLOOR every other modifier here reads),
-            // and the layer scan uses `isEmpty() = isAir() || WATER || LAVA`.
-            let Some(reg) = breg() else { return };
-            let trace = cel_trace(pos);
-            let mut layer = 0i32;
-            loop {
-                let n = ip.get(rng).max(0);
-                let mut any = false;
-                for _ in 0..n {
-                    let x = pos.0 + rng.next_bound(16);
-                    let z = pos.2 + rng.next_bound(16);
-                    let top = ctx.heightmap(HeightmapKind::MotionBlocking, x, z);
-                    let y = cel_find_y(ctx, reg, x, top, z, layer);
-                    if trace.is_some() {
-                        // Every layer the column offers, so a layer-count difference says which
-                        // boundary one side has and the other does not instead of only "one more".
-                        let all = cel_layer_ys(ctx, reg, x, top, z);
-                        eprintln!(
-                            "CEL pass={},{} layer={layer} x={x} z={z} top={top} y={} layers={:?}",
-                            pos.0 >> 4,
-                            pos.2 >> 4,
-                            y.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-                            all
-                        );
-                    }
-                    if cel_column_wanted(x, z) {
-                        cel_column_dump(ctx, x, z, top);
-                    }
-                    if let Some(y) = y {
-                        out.push((x, y, z));
-                        any = true;
-                    }
-                }
-                layer += 1;
-                if !any {
-                    break;
-                }
-            }
-        }
-        PM::InSquare => {
-            let (x, z) = (pos.0 + rng.next_bound(16), pos.2 + rng.next_bound(16));
-            if let Some(spec) = env_str!("INSQ_TRACE") {
-                if let Some((a, c)) = spec.split_once(',') {
-                    if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
-                        if (x >> 4) == cx && (z >> 4) == cz {
-                            let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
-                            eprintln!("INSQ {x} {z} feature={},{}", cf >> 32, cf & 0xFFFF);
-                        }
-                    }
-                }
-            }
-            out.push((x, pos.1, z));
-        }
-        PM::Offset(xz, ysp) => {
-            out.push((
-                pos.0 + xz.get(rng),
-                pos.1 + ysp.get(rng),
-                pos.2 + xz.get(rng),
-            ));
-        }
-        PM::HeightRange(hp) => {
-            out.push((pos.0, hp.get(rng, ctx.g.min_y, ctx.g.height), pos.2));
-        }
+        PM::CountEveryLayer(ip) => count_every_layer_positions(ip, ctx, rng, pos, out),
+        PM::InSquare => out.push((pos.0 + rng.next_bound(16), pos.1, pos.2 + rng.next_bound(16))),
+        PM::Offset(xz, ysp) => out.push((
+            pos.0 + xz.get(rng),
+            pos.1 + ysp.get(rng),
+            pos.2 + xz.get(rng),
+        )),
+        PM::HeightRange(hp) => out.push((pos.0, hp.get(rng, ctx.g.min_y, ctx.g.height), pos.2)),
         PM::Heightmap(kind) => {
             let top = ctx.heightmap(*kind, pos.0, pos.2);
             if top > ctx.g.min_y {
@@ -6067,94 +6607,15 @@ fn mod_positions(
         }
         PM::Fixed => out.push(pos),
         PM::Biome => {
-            let trace_spec = env_str!("BIOMEF_TRACE");
-            // `FC::biome` selects the blended biome's leaf, falling back to
-            // the quart-sampled leaf; mirror that leaf selection exactly so
-            // the fast path and the original string path agree 100%.
-            let fast = fr.bit_ok
-                && test_biome_leaf(ctx).is_none()
-                && LEAF_BITS.with(|c| c.borrow().active);
-            let leaf = if fast {
-                ctx.g
-                    .biome_blended(pos.0, pos.1, pos.2)
-                    .map(|(_, l)| l)
-                    .or_else(|| {
-                        ctx.g
-                            .biome_quart(pos.0 >> 2, pos.1 >> 2, pos.2 >> 2, None)
-                            .map(|(_, l)| l)
-                    })
-                    .filter(|l| usize::from(*l) < 128)
-            } else {
-                None
-            };
-            let mut ok = false;
-            let mut bname: Option<String> = None;
-            if let Some(leaf) = leaf {
-                // At most one name lookup / allocation per distinct leaf.
-                let bit = leaf_bit(ctx, fr, leaf);
-                let mask = PF_MASK.with(|s| s.borrow().last().copied().unwrap_or(0));
-                ok = bit.is_some_and(|b| (mask & b) != 0);
-                if trace_spec.is_some() {
-                    bname = ctx.g.biome_name_of_leaf(leaf);
+            if let Some(b) = ctx.biome(pos.0, pos.1, pos.2) {
+                if fr.ball.get(&b).map(|s| s.contains(&pf.name)).unwrap_or(false) {
+                    out.push(pos);
                 }
-            } else {
-                // Defensive fallback: test override, overflow, or outside a
-                // populate pass. This is the exact original path.
-                if let Some(b) = ctx.biome(pos.0, pos.1, pos.2) {
-                    ok = fr
-                        .ball
-                        .get(&b)
-                        .map(|s| s.contains(&pf.name))
-                        .unwrap_or(false);
-                    bname = Some(b);
-                }
-            }
-            if let Some(spec) = trace_spec {
-                if let Some((a, c)) = spec.split_once(',') {
-                    if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
-                        if (pos.0 >> 4) == cx && (pos.2 >> 4) == cz {
-                            let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
-                            eprintln!(
-                                "BIOMEF {} {} {} {} biome={} feature={},{}",
-                                pos.0,
-                                pos.1,
-                                pos.2,
-                                ok,
-                                bname.as_deref().unwrap_or(""),
-                                cf >> 32,
-                                cf & 0xFFFF
-                            );
-                        }
-                    }
-                }
-            }
-            if ok {
-                out.push(pos);
             }
         }
         PM::BlockPred(p) => {
             if let Some(reg) = breg() {
-                let ok = test_pred(p, reg, ctx, pos.0, pos.1, pos.2);
-                // `BLOCKPRED_TRACE=<cx>,<cz>`: the filter decisions of every candidate that
-                // lands in that chunk. A filter that rejects where the reference accepts is
-                // invisible otherwise - it draws nothing, so the draw traces agree and only
-                // the *later* placements differ.
-                if let Some(spec) = env_str!("BLOCKPRED_TRACE") {
-                    if spec == "all" || spec == format!("{},{}", pos.0 >> 4, pos.2 >> 4) {
-                        eprintln!(
-                            "BLOCKPRED {} {} {} ok={} below={} at={} feature={},{}",
-                            pos.0,
-                            pos.1,
-                            pos.2,
-                            ok,
-                            reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)),
-                            reg.name_of(ctx.get(pos.0, pos.1, pos.2)),
-                            CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed) >> 32,
-                            CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed) & 0xFFFF
-                        );
-                    }
-                }
-                if ok {
+                if test_pred(p, reg, ctx, pos.0, pos.1, pos.2) {
                     out.push(pos);
                 }
             }
@@ -6166,7 +6627,6 @@ fn mod_positions(
         }
         PM::SurfaceRel(kind, min_i, max_i) => {
             let y = i64::from(ctx.heightmap(*kind, pos.0, pos.2));
-            // SurfaceRelativeThresholdFilter widens before adding the offsets.
             let lo = y + i64::from(*min_i);
             let hi = y + i64::from(*max_i);
             if lo <= i64::from(pos.1) && i64::from(pos.1) <= hi {
@@ -6174,26 +6634,8 @@ fn mod_positions(
             }
         }
         PM::SurfWaterDepth(max) => {
-            // Both reads are live scans through the same block view a feature sees, so the
-            // pair is comparable with a saved chunk's `WORLD_SURFACE`/`OCEAN_FLOOR`
-            // entries directly. `SURF_TRACE=<cx>,<cz>` prints every candidate of that
-            // chunk: a rejection that the reference did not make is otherwise invisible
-            // (this filter draws nothing, so the draw streams stay aligned).
             let wt = ctx.hm_ws(pos.0, pos.2);
             let oc = ctx.hm_oc(pos.0, pos.2);
-            if let Some(spec) = env_str!("SURF_TRACE") {
-                if spec == "all" || spec == format!("{},{}", pos.0 >> 4, pos.2 >> 4) {
-                    eprintln!(
-                        "SURF {} {} ws={} oc={} depth={} ok={}",
-                        pos.0,
-                        pos.2,
-                        wt,
-                        oc,
-                        wt - oc,
-                        wt - oc <= *max
-                    );
-                }
-            }
             if wt - oc <= *max {
                 out.push(pos);
             }
@@ -6244,6 +6686,72 @@ fn mod_positions(
             }
         }
         PM::Carving => {}
+    }
+}
+
+fn count_every_layer_positions(
+    ip: &IP,
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    out: &mut Vec<(i32, i32, i32)>,
+) {
+    // `CountOnEveryLayerPlacement.getPositions` (`eim.a_(eiw,ayw,jd)`):
+    //
+    // ```java
+    // int layer = 0; boolean found;
+    // do {
+    //    found = false;
+    //    for (int j = 0; j < this.count.sample(random); j++) {   // per layer
+    //       int x = random.nextInt(16) + pos.getX();
+    //       int z = random.nextInt(16) + pos.getZ();
+    //       int top = context.getHeight(MOTION_BLOCKING, x, z);
+    //       int y = getY(context, x, top, z, layer);
+    //       if (y != Integer.MAX_VALUE) { builder.add(...); found = true; }
+    //    }
+    //    layer++;
+    // } while (found);
+    // ```
+    //
+    // Three details each move every later draw (and every later layer):
+    // the count is re-sampled *inside* the layer loop, the column height is
+    // `MOTION_BLOCKING` (not the OCEAN_FLOOR every other modifier here reads),
+    // and the layer scan uses `isEmpty() = isAir() || WATER || LAVA`.
+    let Some(reg) = breg() else { return };
+    let trace = cel_trace(pos);
+    let mut layer = 0i32;
+    loop {
+        let n = ip.get(rng).max(0);
+        let mut any = false;
+        for _ in 0..n {
+            let x = pos.0 + rng.next_bound(16);
+            let z = pos.2 + rng.next_bound(16);
+            let top = ctx.heightmap(HeightmapKind::MotionBlocking, x, z);
+            let y = cel_find_y(ctx, reg, x, top, z, layer);
+            if trace.is_some() {
+                // Every layer the column offers, so a layer-count difference says which
+                // boundary one side has and the other does not instead of only "one more".
+                let all = cel_layer_ys(ctx, reg, x, top, z);
+                eprintln!(
+                    "CEL pass={},{} layer={layer} x={x} z={z} top={top} y={} layers={:?}",
+                    pos.0 >> 4,
+                    pos.2 >> 4,
+                    y.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                    all
+                );
+            }
+            if cel_column_wanted(x, z) {
+                cel_column_dump(ctx, x, z, top);
+            }
+            if let Some(y) = y {
+                out.push((x, y, z));
+                any = true;
+            }
+        }
+        layer += 1;
+        if !any {
+            break;
+        }
     }
 }
 
@@ -6349,6 +6857,19 @@ fn cel_find_y(ctx: &mut FC<'_>, reg: &BReg, x: i32, top: i32, z: i32, layer: i32
 
 // ---------- configured feature generation ----------
 
+struct OreScratch {
+    ds: Vec<f64>,
+    bits: Vec<u64>,
+}
+
+thread_local! {
+    static ORE_SCRATCH: std::cell::RefCell<OreScratch> = std::cell::RefCell::new(OreScratch {
+        ds: Vec::new(),
+        bits: Vec::new(),
+    });
+}
+
+#[cfg(test)]
 fn ore_should_place(
     discard: f32,
     ctx: &mut FC,
@@ -6358,9 +6879,17 @@ fn ore_should_place(
 ) -> bool {
     let st = ctx.get(pos.0, pos.1, pos.2);
     let Some(reg) = breg() else { return false };
-    if !test_rt(rt, reg, st, pos.1, r) {
-        return false;
-    }
+    test_rt(rt, reg, st, pos.1, r) && ore_air_discard_ok(discard, reg, ctx, pos, r)
+}
+
+#[inline]
+fn ore_air_discard_ok(
+    discard: f32,
+    reg: &BReg,
+    ctx: &mut FC,
+    pos: (i32, i32, i32),
+    r: &mut Xor,
+) -> bool {
     if discard <= 0.0 {
         return true;
     }
@@ -6379,7 +6908,7 @@ fn ore_should_place(
 }
 
 #[expect(clippy::too_many_arguments)]
-fn gen_vein(
+fn gen_vein_impl<T>(
     ctx: &mut FC,
     rng: &mut Xor,
     sx: f64,
@@ -6395,53 +6924,67 @@ fn gen_vein(
     vs: i32,
     size: i32,
     discard: f32,
-    targets: &[(RT, u32)],
+    targets: &[(T, u32)],
     trace: bool,
+    mut matches_rt: impl FnMut(&T, &BReg, u32, i32, &mut Xor) -> bool,
 ) {
+    let Some(reg) = breg() else { return };
     let j = size.max(1);
-    let mut ds = vec![0.0; (j * 4) as usize];
+    let ds_len = (j * 4) as usize;
+    let bsz = (hs.max(1) * vs.max(1) * hs.max(1)) as usize;
+    let words = bsz.div_ceil(64);
+    let (mut ds, mut bits) = ORE_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        (std::mem::take(&mut s.ds), std::mem::take(&mut s.bits))
+    });
+    ds.resize(ds_len, 0.0);
+    bits.clear();
+    bits.resize(words, 0u64);
     for k in 0..j {
         let f = k as f32 / j as f32;
-        ds[k as usize * 4] = sx + (ex - sx) * f as f64;
-        ds[k as usize * 4 + 1] = sy + (ey - sy) * f as f64;
-        ds[k as usize * 4 + 2] = sz + (ez - sz) * f as f64;
+        let ki = k as usize * 4;
+        ds[ki] = sx + (ex - sx) * f as f64;
+        ds[ki + 1] = sy + (ey - sy) * f as f64;
+        ds[ki + 2] = sz + (ez - sz) * f as f64;
         // The radius is the one place vanilla uses the table: `Mth.sin(float)` over
         // the f32 fraction, then double arithmetic around it.
         let hh = rng.next_f64() * j as f64 / 16.0;
         let s1 = crate::generation_math::mth_sin(std::f32::consts::PI * f) + 1.0f32;
-        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0;
+        ds[ki + 3] = (s1 as f64 * hh + 1.0) / 2.0;
     }
     for k in 0..(j - 1) {
-        if ds[k as usize * 4 + 3] <= 0.0 {
+        let ki = k as usize * 4;
+        if ds[ki + 3] <= 0.0 {
             continue;
         }
         for m in (k + 1)..j {
-            if ds[m as usize * 4 + 3] <= 0.0 {
+            let mi = m as usize * 4;
+            if ds[mi + 3] <= 0.0 {
                 continue;
             }
-            let hv = ds[k as usize * 4 + 3] - ds[m as usize * 4 + 3];
-            let dv = ds[k as usize * 4] - ds[m as usize * 4];
-            let ev = ds[k as usize * 4 + 1] - ds[m as usize * 4 + 1];
-            let gv = ds[k as usize * 4 + 2] - ds[m as usize * 4 + 2];
+            let hv = ds[ki + 3] - ds[mi + 3];
+            let dv = ds[ki] - ds[mi];
+            let ev = ds[ki + 1] - ds[mi + 1];
+            let gv = ds[ki + 2] - ds[mi + 2];
             if hv * hv > dv * dv + ev * ev + gv * gv {
                 if hv > 0.0 {
-                    ds[m as usize * 4 + 3] = -1.0;
+                    ds[mi + 3] = -1.0;
                 } else {
-                    ds[k as usize * 4 + 3] = -1.0;
+                    ds[ki + 3] = -1.0;
                 }
             }
         }
     }
-    let bsz = (hs.max(1) * vs.max(1) * hs.max(1)) as usize;
-    let mut bits = vec![false; bsz];
+    let hs_vs = hs * vs;
     for m in 0..j {
-        let d = ds[m as usize * 4 + 3];
+        let mi = m as usize * 4;
+        let d = ds[mi + 3];
         if d <= 0.0 {
             continue;
         }
-        let cx = ds[m as usize * 4];
-        let cy = ds[m as usize * 4 + 1];
-        let cz = ds[m as usize * 4 + 2];
+        let cx = ds[mi];
+        let cy = ds[mi + 1];
+        let cz = ds[mi + 2];
         let x0 = ((cx - d).floor() as i32).max(xb);
         let y0 = ((cy - d).floor() as i32).max(yb);
         let z0 = ((cz - d).floor() as i32).max(zb);
@@ -6450,12 +6993,14 @@ fn gen_vein(
         let z1 = ((cz + d).floor() as i32).max(z0);
         for xx in x0..=x1 {
             let ux = (xx as f64 + 0.5 - cx) / d;
-            if ux * ux >= 1.0 {
+            let ux2 = ux * ux;
+            if ux2 >= 1.0 {
                 continue;
             }
             for yy in y0..=y1 {
                 let uy = (yy as f64 + 0.5 - cy) / d;
-                if ux * ux + uy * uy >= 1.0 {
+                let uxy2 = ux2 + uy * uy;
+                if uxy2 >= 1.0 {
                     continue;
                 }
                 if ctx.out_of_h(yy) {
@@ -6464,19 +7009,25 @@ fn gen_vein(
                 let base = (xx - xb) + (yy - yb) * hs;
                 for zz in z0..=z1 {
                     let uz = (zz as f64 + 0.5 - cz) / d;
-                    if ux * ux + uy * uy + uz * uz >= 1.0 {
+                    if uxy2 + uz * uz >= 1.0 {
                         continue;
                     }
-                    let bi = (base + (zz - zb) * hs * vs) as usize;
-                    if bi >= bits.len() || bits[bi] {
+                    let bi = (base + (zz - zb) * hs_vs) as usize;
+                    if bi >= bsz {
                         continue;
                     }
-                    bits[bi] = true;
+                    let w = bi >> 6;
+                    let mask = 1u64 << (bi & 63);
+                    if (bits[w] & mask) != 0 {
+                        continue;
+                    }
+                    bits[w] |= mask;
+                    let cur = ctx.get(xx, yy, zz);
                     for (rt, st) in targets {
-                        let before = if trace { ctx.get(xx, yy, zz) } else { 0 };
-                        let ok = ore_should_place(discard, ctx, rt, (xx, yy, zz), rng);
+                        let ok = matches_rt(rt, reg, cur, yy, rng)
+                            && ore_air_discard_ok(discard, reg, ctx, (xx, yy, zz), rng);
                         if trace {
-                            eprintln!("OTEST {xx} {yy} {zz} state={before} ok={ok}");
+                            eprintln!("OTEST {xx} {yy} {zz} state={cur} ok={ok}");
                         }
                         if ok {
                             ctx.set(xx, yy, zz, *st);
@@ -6487,19 +7038,25 @@ fn gen_vein(
             }
         }
     }
+    ORE_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        s.ds = ds;
+        s.bits = bits;
+    });
 }
 
 /// (feature index << 32) | step of the placed feature currently being generated.
 pub(crate) static CUR_FEAT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
-fn gen_ore(
+fn gen_ore_impl<T>(
     ctx: &mut FC,
     rng: &mut Xor,
     pos: (i32, i32, i32),
     size: i32,
     discard: f32,
-    targets: &[(RT, u32)],
+    targets: &[(T, u32)],
     scattered: bool,
+    mut matches_rt: impl FnMut(&T, &BReg, u32, i32, &mut Xor) -> bool,
 ) {
     if let Some(spec) = env_str!("ORE_TRACE") {
         if let Some((a, b)) = spec.split_once(',') {
@@ -6518,6 +7075,7 @@ fn gen_ore(
         }
     }
     if scattered {
+        let Some(reg) = breg() else { return };
         let count = rng.next_bound(size + 1);
         for i in 0..count {
             let md = i.min(7);
@@ -6530,8 +7088,11 @@ fn gen_ore(
             if ctx.out_of_h(tp.1) {
                 continue;
             }
+            let cur = ctx.get(tp.0, tp.1, tp.2);
             for (rt, st) in targets {
-                if ore_should_place(discard, ctx, rt, tp, rng) {
+                if matches_rt(rt, reg, cur, tp.1, rng)
+                    && ore_air_discard_ok(discard, reg, ctx, tp, rng)
+                {
                     ctx.set(tp.0, tp.1, tp.2, *st);
                     break;
                 }
@@ -6565,8 +7126,25 @@ fn gen_ore(
             if o <= ctx.hm_oc_wg(xp, zp) {
                 let trace = env_str!("ORE_CELL_TRACE")
                     .is_some_and(|spec| spec == format!("{},{},{}", pos.0, pos.1, pos.2));
-                gen_vein(
-                    ctx, rng, d, e, h, j, l, mm, n, o, p, q, r2, size, discard, targets, trace,
+                gen_vein_impl(
+                    ctx,
+                    rng,
+                    d,
+                    e,
+                    h,
+                    j,
+                    l,
+                    mm,
+                    n,
+                    o,
+                    p,
+                    q,
+                    r2,
+                    size,
+                    discard,
+                    targets,
+                    trace,
+                    matches_rt,
                 );
                 if let Some(spec) = env_str!("ORE_CELL_TRACE") {
                     if spec == format!("{},{},{}", pos.0, pos.1, pos.2) {
@@ -6581,6 +7159,40 @@ fn gen_ore(
             }
         }
     }
+}
+
+fn gen_ore(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    size: i32,
+    discard: f32,
+    targets: &[(RT, u32)],
+    scattered: bool,
+) {
+    gen_ore_impl(
+        ctx,
+        rng,
+        pos,
+        size,
+        discard,
+        targets,
+        scattered,
+        |rt, reg, st, y, r| test_rt(rt, reg, st, y, r),
+    );
+}
+
+fn gen_ore_fast(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), ore: &FastOre) {
+    gen_ore_impl(
+        ctx,
+        rng,
+        pos,
+        ore.size,
+        ore.discard,
+        &ore.targets,
+        ore.scattered,
+        |rt, reg, st, y, r| rt.matches(reg, st, y, r),
+    );
 }
 
 /// Test helper: the cells one vein writes for a seed and position, with a rule test that
@@ -6672,12 +7284,37 @@ fn multiface_state(ctx: &mut FC, reg: &BReg, p: (i32, i32, i32), name: &str, d: 
     };
     Some(reg.with_prop(base, multiface_property(d), "true"))
 }
+fn multiface_state_cfg(
+    ctx: &mut FC,
+    reg: &BReg,
+    p: (i32, i32, i32),
+    cfg: &MultifaceCfg,
+    d: u8,
+) -> Option<u32> {
+    let cur = ctx.get(p.0, p.1, p.2);
+    let is_self = reg.block_id_of(cur) == Some(cfg.block_id);
+    if is_self && reg.get_prop(cur, multiface_property(d)).as_deref() == Some("true") {
+        return None;
+    }
+    let support = multiface_relative(p, d);
+    if !reg.supports_multiface(ctx.get(support.0, support.1, support.2), d) {
+        return None;
+    }
+    let base = if is_self {
+        cur
+    } else if reg.fluid_name(cur) == "minecraft:water" {
+        cfg.waterlogged_base
+    } else {
+        cfg.base_state
+    };
+    Some(reg.with_prop(base, multiface_property(d), "true"))
+}
 fn multiface_spread(
     ctx: &mut FC,
     reg: &BReg,
     rng: &mut Xor,
     p: (i32, i32, i32),
-    name: &str,
+    cfg: &MultifaceCfg,
     state: u32,
     from: u8,
 ) {
@@ -6698,12 +7335,12 @@ fn multiface_spread(
         ] {
             let cur = ctx.get(target.0, target.1, target.2);
             if !(reg.is_air(cur)
-                || reg.name_of(cur) == name
+                || reg.block_id_of(cur) == Some(cfg.block_id)
                 || (is_water_st(reg, cur) && reg.fluid_name(cur) == "minecraft:water"))
             {
                 continue;
             }
-            if let Some(st) = multiface_state(ctx, reg, target, name, face) {
+            if let Some(st) = multiface_state_cfg(ctx, reg, target, cfg, face) {
                 if ctx.out_of_h(target.1) {
                     break;
                 }
@@ -6733,13 +7370,16 @@ fn multiface_try(
 ) -> bool {
     for &d in dirs {
         let support = multiface_relative(p, d);
-        if !cfg
-            .on
-            .contains(reg.name_of(ctx.get(support.0, support.1, support.2)))
-        {
+        let s_st = ctx.get(support.0, support.1, support.2);
+        let ok = if !cfg.on_bits.overflow {
+            cfg.on_bits.contains_state(reg, s_st)
+        } else {
+            cfg.on.contains(reg.name_of(s_st))
+        };
+        if !ok {
             continue;
         }
-        let Some(st) = multiface_state(ctx, reg, p, &cfg.name, d) else {
+        let Some(st) = multiface_state_cfg(ctx, reg, p, cfg, d) else {
             return false;
         };
         if !ctx.out_of_h(p.1) {
@@ -6754,7 +7394,7 @@ fn multiface_try(
         }
         // The float draw happens even for zero/one spreading probabilities.
         if rng.next_f32() < cfg.spread {
-            multiface_spread(ctx, reg, rng, p, &cfg.name, st, d);
+            multiface_spread(ctx, reg, rng, p, cfg, st, d);
         }
         return true;
     }
@@ -6838,15 +7478,24 @@ fn grow_chorus(
 }
 
 fn snow_can_survive(reg: &BReg, below: u32) -> bool {
-    if reg.in_tag(below, "minecraft:snow_layer_cannot_survive_on") {
+    let ft = feat_tables(reg);
+    let cannot = if !ft.snow_cannot_survive.overflow {
+        ft.snow_cannot_survive.contains_state(reg, below)
+    } else {
+        reg.in_tag(below, "minecraft:snow_layer_cannot_survive_on")
+    };
+    if cannot {
         return false;
     }
-    if reg.in_tag(below, "minecraft:snow_layer_can_survive_on") {
+    let can = if !ft.snow_can_survive.overflow {
+        ft.snow_can_survive.contains_state(reg, below)
+    } else {
+        reg.in_tag(below, "minecraft:snow_layer_can_survive_on")
+    };
+    if can {
         return true;
     }
-    reg.supports_multiface(below, 0)
-        || (reg.name_of(below) == "minecraft:snow"
-            && reg.get_prop(below, "layers").as_deref() == Some("8"))
+    reg.supports_multiface(below, 0) || below == ft.snow_layer_8
 }
 
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
@@ -7030,6 +7679,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         } => {
             gen_ore(ctx, rng, pos, *size, *discard, targets, *scattered);
         }
+        Cf::OreFast(ore) => {
+            gen_ore_fast(ctx, rng, pos, ore);
+        }
         Cf::Disk {
             half,
             radius,
@@ -7037,6 +7689,8 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             target,
         } => {
             let Some(reg) = breg() else { return };
+            let ft = feat_tables(reg);
+            let disk_trace = env_flag!("DISK_TRACE");
             let top = pos.1 + half;
             let bottom = pos.1 - half - 1;
             let rr = radius.get(rng);
@@ -7054,7 +7708,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     let (x, z) = (pos.0 + cx, pos.2 + cz);
                     let mut y = top;
                     while y > bottom {
-                        if env_flag!("DISK_TRACE") && cx == 0 && cz == 0 {
+                        if disk_trace && cx == 0 && cz == 0 {
                             let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
                             eprintln!(
                                 "DISK {x} {y} {z} block={} target={} feature={},{}",
@@ -7064,7 +7718,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                                 cf & 0xFFFF
                             );
                         }
-                        if !ctx.out_of_h(y) && test_pred(target, reg, ctx, x, y, z) {
+                        if !ctx.out_of_h(y) && fast_test_pred(target, reg, ft, ctx, x, y, z) {
                             let st = bsp.get(ctx, rng, x, y, z);
                             ctx.set(x, y, z, st);
                             mark_above_for_post_processing(ctx, reg, x, y, z);
@@ -7153,23 +7807,32 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         }
         Cf::Spring {
             fluid,
+            fluid_id,
             req_below,
             rock,
             hole,
             valid,
+            valid_bits,
         } => {
             // `SpringFeature` (`edp`): `pos.above()` must be valid, and with
             // `requires_block_below` `pos.below()` too. The names are easy to
             // invert: `jd.d()` is above (Direction.UP) and `jd.e()` is below.
             let Some(reg) = breg() else { return };
-            if !valid.contains(reg.name_of(ctx.get(pos.0, pos.1 + 1, pos.2))) {
+            let is_valid = |st: u32| -> bool {
+                if !valid_bits.overflow {
+                    valid_bits.contains_state(reg, st)
+                } else {
+                    valid.contains(reg.name_of(st))
+                }
+            };
+            if !is_valid(ctx.get(pos.0, pos.1 + 1, pos.2)) {
                 return;
             }
-            if *req_below && !valid.contains(reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2))) {
+            if *req_below && !is_valid(ctx.get(pos.0, pos.1 - 1, pos.2)) {
                 return;
             }
             let at = ctx.get(pos.0, pos.1, pos.2);
-            if !reg.is_air(at) && !valid.contains(reg.name_of(at)) {
+            if !reg.is_air(at) && !is_valid(at) {
                 return;
             }
             let mut rocks = 0;
@@ -7178,7 +7841,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             for d in [4u8, 5, 2, 3, 0] {
                 let (dx, dy, dz) = dir_off(d);
                 let s = ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz);
-                if valid.contains(reg.name_of(s)) {
+                if is_valid(s) {
                     rocks += 1;
                 }
                 if reg.is_air(s) {
@@ -7201,21 +7864,19 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
             if rocks == *rock && air == *hole {
                 ctx.set(pos.0, pos.1, pos.2, *fluid);
-                let identity = match reg.fluid_name(*fluid) {
-                    "minecraft:water" => 0,
-                    "minecraft:flowing_water" => 1,
-                    "minecraft:lava" => 2,
-                    "minecraft:flowing_lava" => 3,
-                    other => {
-                        eprintln!("[worldgen] unsupported spring fluid tick {other} at {pos:?}");
-                        return;
-                    }
-                };
-                ctx.g.schedule_generated_fluid(pos, identity);
+                if *fluid_id < 0 {
+                    eprintln!(
+                        "[worldgen] unsupported spring fluid tick {} at {pos:?}",
+                        reg.fluid_name(*fluid)
+                    );
+                    return;
+                }
+                ctx.g.schedule_generated_fluid(pos, *fluid_id as u32);
             }
         }
         Cf::Seagrass { prob } => {
             let Some(reg) = breg() else { return };
+            let ft = feat_tables(reg);
             // dx, dz (4 draws), the heightmap read (none), the water test (none),
             // then the tall/short draw - that order is what the streams compare
             let (x, z) = (
@@ -7232,32 +7893,30 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             };
             let at = ctx.get(x, y, z);
             trace_read(y, at);
-            if reg.name_of(at) != "minecraft:water" {
+            if reg.block_id_of(at) != Some(ft.water_bid) {
                 return;
             }
             let tall = rng.next_f64() < f64::from(*prob);
             let below = ctx.get(x, y - 1, z);
             // `SeagrassBlock.mayPlaceOn`: sturdy top face, and not magma
-            if !reg.side_solid(below, 1) || reg.name_of(below) == "minecraft:magma_block" {
+            if !reg.side_solid(below, 1) || reg.block_id_of(below) == Some(ft.magma_bid) {
                 return;
             }
-            let half = |v: &str| J::Obj(vec![("half".to_string(), J::Str(v.to_string()))]);
             if tall {
                 let above = ctx.get(x, y + 1, z);
                 trace_read(y + 1, above);
-                if reg.name_of(above) != "minecraft:water" {
+                if reg.block_id_of(above) != Some(ft.water_bid) {
                     return;
                 }
-                let lo = reg.state_of("minecraft:tall_seagrass", Some(&half("lower")));
-                let hi = reg.state_of("minecraft:tall_seagrass", Some(&half("upper")));
-                ctx.set(x, y, z, lo);
-                ctx.set(x, y + 1, z, hi);
+                ctx.set(x, y, z, ft.tall_seagrass_lo);
+                ctx.set(x, y + 1, z, ft.tall_seagrass_hi);
             } else {
-                ctx.set(x, y, z, reg.state_of("minecraft:seagrass", None));
+                ctx.set(x, y, z, ft.seagrass);
             }
         }
         Cf::Kelp => {
             let Some(reg) = breg() else { return };
+            let ft = feat_tables(reg);
             let base_y = ctx.hm_oc(pos.0, pos.2);
             let mut p = (pos.0, base_y, pos.2);
             let trace = env_flag!("KELP_TRACE");
@@ -7274,15 +7933,10 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 let plant_survives = can_place(reg, ctx, "minecraft:kelp_plant", p.0, p.1, p.2);
                 if here_water && above_water && plant_survives {
                     if i == max_height {
-                        let age = rng.next_bound(4) + 20;
-                        let head = reg.with_prop(
-                            reg.state_of("minecraft:kelp", None),
-                            "age",
-                            &age.to_string(),
-                        );
-                        ctx.set(p.0, p.1, p.2, head);
+                        let age_off = rng.next_bound(4) as usize;
+                        ctx.set(p.0, p.1, p.2, ft.kelp_ages[age_off]);
                     } else {
-                        ctx.set(p.0, p.1, p.2, reg.state_of("minecraft:kelp_plant", None));
+                        ctx.set(p.0, p.1, p.2, ft.kelp_plant);
                     }
                     if trace && i == max_height {
                         eprintln!(
@@ -7301,17 +7955,12 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     }
                     let base = (p.0, p.1 - 1, p.2);
                     let below_is_head =
-                        reg.name_of(ctx.get(base.0, base.1 - 1, base.2)) == "minecraft:kelp";
+                        reg.block_id_of(ctx.get(base.0, base.1 - 1, base.2)) == Some(ft.kelp_bid);
                     if can_place(reg, ctx, "minecraft:kelp", base.0, base.1, base.2)
                         && !below_is_head
                     {
-                        let age = rng.next_bound(4) + 20;
-                        let head = reg.with_prop(
-                            reg.state_of("minecraft:kelp", None),
-                            "age",
-                            &age.to_string(),
-                        );
-                        ctx.set(base.0, base.1, base.2, head);
+                        let age_off = rng.next_bound(4) as usize;
+                        ctx.set(base.0, base.1, base.2, ft.kelp_ages[age_off]);
                     }
                     break;
                 }
@@ -8074,10 +8723,23 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         }
         Cf::FreezeTop => {
             let Some(reg) = breg() else { return };
-            let ice = reg.state_of("minecraft:ice", None);
-            let snow = reg.state_of("minecraft:snow", None);
             let min_y = ctx.g.world_min_y;
             let max_y = min_y + ctx.g.world_height;
+            // Fast skip: if the 3x3 chunk neighborhood carries no biome that can
+            // reach < 0.15 temperature anywhere below y=320, no column can freeze
+            // or accumulate snow and FreezeTop consumes zero RNG.
+            if fr.bit_ok && test_biome_leaf(ctx).is_none() && max_y <= 320 {
+                let skip = LEAF_BITS.with(|c| {
+                    let c = c.borrow();
+                    c.active && (c.present_mask & fr.possibly_cold_mask) == 0
+                });
+                if skip {
+                    return;
+                }
+            }
+            let ft = feat_tables(reg);
+            let ice = ft.ice;
+            let snow = ft.snow;
             for lx in 0..16i32 {
                 for lz in 0..16i32 {
                     let (x, z) = (pos.0 + lx, pos.2 + lz);
@@ -8092,7 +8754,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         && ctx.block_light(x, below_y, z) < 10
                     {
                         let below = ctx.get(x, below_y, z);
-                        if reg.name_of(below) == "minecraft:water"
+                        if reg.block_id_of(below) == Some(ft.water_bid)
                             && reg.fluid_name(below) == "minecraft:water"
                         {
                             ctx.set(x, below_y, z, ice);
@@ -8109,11 +8771,16 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         } else {
                             0
                         };
-                        if (reg.is_air(at) || reg.name_of(at) == "minecraft:snow")
+                        if (reg.is_air(at) || reg.block_id_of(at) == Some(ft.snow_bid))
                             && snow_can_survive(reg, below)
                         {
                             ctx.set(x, top, z, snow);
-                            if reg.has_prop(reg.name_of(below), "snowy") {
+                            let has_snowy = if !ft.snowy_blocks.overflow {
+                                ft.snowy_blocks.contains_state(reg, below)
+                            } else {
+                                reg.has_prop(reg.name_of(below), "snowy")
+                            };
+                            if has_snowy {
                                 ctx.set(x, below_y, z, reg.with_prop(below, "snowy", "true"));
                             }
                         }
@@ -8127,25 +8794,64 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             if !(reg.is_air(cur) || is_water_st(reg, cur)) {
                 return;
             }
-            let mut dirs = cfg.dirs.clone();
-            feature_util_shuffle(&mut dirs, rng);
-            if multiface_try(ctx, reg, rng, pos, cfg, &dirs) {
-                return;
-            }
-            for &d in &dirs {
-                let mut faces: Vec<_> =
-                    cfg.dirs.iter().copied().filter(|v| *v != (d ^ 1)).collect();
-                feature_util_shuffle(&mut faces, rng);
-                // ecw resets to origin + direction on EVERY iteration; it does
-                // not walk search_range blocks down the corridor.
-                let p = multiface_relative(pos, d);
-                for _ in 0..cfg.search {
-                    let cur = ctx.get(p.0, p.1, p.2);
-                    if !(reg.is_air(cur) || is_water_st(reg, cur) || reg.name_of(cur) == cfg.name) {
-                        break;
+            let dlen = cfg.dirs.len();
+            if dlen <= 6 {
+                let mut dirs_arr = [0u8; 6];
+                dirs_arr[..dlen].copy_from_slice(&cfg.dirs);
+                let dirs = &mut dirs_arr[..dlen];
+                feature_util_shuffle(dirs, rng);
+                if multiface_try(ctx, reg, rng, pos, cfg, dirs) {
+                    return;
+                }
+                for &d in dirs.iter() {
+                    let mut faces_arr = [0u8; 6];
+                    let mut flen = 0usize;
+                    for &v in &cfg.dirs {
+                        if v != (d ^ 1) {
+                            faces_arr[flen] = v;
+                            flen += 1;
+                        }
                     }
-                    if multiface_try(ctx, reg, rng, p, cfg, &faces) {
-                        return;
+                    let faces = &mut faces_arr[..flen];
+                    feature_util_shuffle(faces, rng);
+                    // ecw resets to origin + direction on EVERY iteration; it does
+                    // not walk search_range blocks down the corridor.
+                    let p = multiface_relative(pos, d);
+                    for _ in 0..cfg.search {
+                        let cur = ctx.get(p.0, p.1, p.2);
+                        if !(reg.is_air(cur)
+                            || is_water_st(reg, cur)
+                            || reg.block_id_of(cur) == Some(cfg.block_id))
+                        {
+                            break;
+                        }
+                        if multiface_try(ctx, reg, rng, p, cfg, faces) {
+                            return;
+                        }
+                    }
+                }
+            } else {
+                let mut dirs = cfg.dirs.clone();
+                feature_util_shuffle(&mut dirs, rng);
+                if multiface_try(ctx, reg, rng, pos, cfg, &dirs) {
+                    return;
+                }
+                for &d in &dirs {
+                    let mut faces: Vec<_> =
+                        cfg.dirs.iter().copied().filter(|v| *v != (d ^ 1)).collect();
+                    feature_util_shuffle(&mut faces, rng);
+                    let p = multiface_relative(pos, d);
+                    for _ in 0..cfg.search {
+                        let cur = ctx.get(p.0, p.1, p.2);
+                        if !(reg.is_air(cur)
+                            || is_water_st(reg, cur)
+                            || reg.block_id_of(cur) == Some(cfg.block_id))
+                        {
+                            break;
+                        }
+                        if multiface_try(ctx, reg, rng, p, cfg, &faces) {
+                            return;
+                        }
                     }
                 }
             }
@@ -8252,36 +8958,47 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         }
         Cf::MonsterRoom => {
             let Some(reg) = breg() else { return };
-            let cobble = reg.state_of("minecraft:cobblestone", None);
-            let mossy = reg.state_of("minecraft:mossy_cobblestone", None);
-            let cave_air = reg.state_of("minecraft:cave_air", None);
             let xr = rng.next_bound(2) + 2;
             let zr = rng.next_bound(2) + 2;
             let (min_x, max_x) = (-xr - 1, xr + 1);
             let (min_z, max_z) = (-zr - 1, zr + 1);
+            // The validation scan consumes zero RNG and makes zero writes. Count
+            // perimeter openings first (24-32 columns) and only verify floor/ceiling
+            // solidity when 1..=5 openings exist, skipping unused interior cells.
             let mut holes = 0;
             for dx in min_x..=max_x {
-                for dy in -1..=4i32 {
-                    for dz in min_z..=max_z {
-                        let cp = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
-                        let solid = reg.is_solid(ctx.get(cp.0, cp.1, cp.2));
-                        if (dy == -1 || dy == 4) && !solid {
+                for dz in min_z..=max_z {
+                    let on_wall = dx == min_x || dx == max_x || dz == min_z || dz == max_z;
+                    if !on_wall {
+                        continue;
+                    }
+                    let (wx, wz) = (pos.0 + dx, pos.2 + dz);
+                    if ctx.is_air(wx, pos.1, wz) && ctx.is_air(wx, pos.1 + 1, wz) {
+                        holes += 1;
+                        if holes > 5 {
                             return;
-                        }
-                        let on_wall = dx == min_x || dx == max_x || dz == min_z || dz == max_z;
-                        if on_wall
-                            && dy == 0
-                            && ctx.is_air(cp.0, cp.1, cp.2)
-                            && ctx.is_air(cp.0, cp.1 + 1, cp.2)
-                        {
-                            holes += 1;
                         }
                     }
                 }
             }
-            if !(1..=5).contains(&holes) {
+            if holes == 0 {
                 return;
             }
+            for dx in min_x..=max_x {
+                let wx = pos.0 + dx;
+                for dz in min_z..=max_z {
+                    let wz = pos.2 + dz;
+                    if !reg.is_solid(ctx.get(wx, pos.1 - 1, wz))
+                        || !reg.is_solid(ctx.get(wx, pos.1 + 4, wz))
+                    {
+                        return;
+                    }
+                }
+            }
+            let ft = feat_tables(reg);
+            let cobble = ft.cobble;
+            let mossy = ft.mossy;
+            let cave_air = ft.cave_air;
             for dx in min_x..=max_x {
                 for dy in (-1..=3i32).rev() {
                     for dz in min_z..=max_z {
@@ -8297,7 +9014,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                             let below = ctx.get(wp.0, wp.1 - 1, wp.2);
                             if wp.1 >= ctx.g.min_y && !reg.is_solid(below) {
                                 ctx.set(wp.0, wp.1, wp.2, cave_air);
-                            } else if reg.is_solid(cur) && reg.name_of(cur) != "minecraft:chest" {
+                            } else if reg.is_solid(cur)
+                                && reg.block_id_of(cur) != Some(ft.chest_bid)
+                            {
                                 let state = if dy == -1 && rng.next_bound(4) != 0 {
                                     mossy
                                 } else {
@@ -8311,8 +9030,8 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                                 );
                             }
                         } else {
-                            let n = reg.name_of(cur);
-                            if n != "minecraft:chest" && n != "minecraft:spawner" {
+                            let bid = reg.block_id_of(cur);
+                            if bid != Some(ft.chest_bid) && bid != Some(ft.spawner_bid) {
                                 safe_feature_set(
                                     ctx,
                                     wp,
@@ -8326,7 +9045,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
             // Chest placement precedes the spawner and its mob-selection draw.
             // Block-entity loot contents are not yet persisted by the feature layer.
-            let chest = reg.state_of("minecraft:chest", None);
+            let chest = ft.chest;
             for _ in 0..2 {
                 for _ in 0..3 {
                     let cx = pos.0 + rng.next_bound(xr * 2 + 1) - xr;
@@ -8348,18 +9067,18 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         );
                         // RandomizableContainer.setBlockEntityLootTable consumes
                         // nextLong only if the chest block entity exists.
-                        if reg.name_of(ctx.get(cx, pos.1, cz)) == "minecraft:chest" {
+                        if reg.block_id_of(ctx.get(cx, pos.1, cz)) == Some(ft.chest_bid) {
                             let _loot_seed = rng.next_i64();
                         }
                         break;
                     }
                 }
             }
-            let spawner = reg.state_of("minecraft:spawner", None);
+            let spawner = ft.spawner;
             safe_feature_set(ctx, pos, spawner, "minecraft:features_cannot_replace");
             // MonsterRoomFeature.randomEntityId is called only with a spawner
             // entity present. A protected centre must not consume this draw.
-            if reg.name_of(ctx.get(pos.0, pos.1, pos.2)) == "minecraft:spawner" {
+            if reg.block_id_of(ctx.get(pos.0, pos.1, pos.2)) == Some(ft.spawner_bid) {
                 let _mob = rng.next_bound(4);
             }
         }
@@ -9727,6 +10446,7 @@ fn populate_worker(
     LEAF_BITS.with(|c| {
         let mut c = c.borrow_mut();
         c.active = true;
+        c.present_mask = present_mask;
         c.known = 0;
     });
     let preset = owner.preset;
@@ -9765,7 +10485,12 @@ fn populate_worker(
                 .wrapping_add(*gi as u64)
                 .wrapping_add(10_000u64.wrapping_mul(step as u64));
             let mut rng = Xor::seed_worldgen(deco);
-            gen_pf(pf, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
+            if use_bits {
+                let mask = slot.expect("step entry parallel to order").ball_mask;
+                gen_pf_with_mask(pf, mask, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
+            } else {
+                gen_pf(pf, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
+            }
         }
     }
     crate::worldgen::m3_elapsed(
@@ -10865,6 +11590,7 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
     LEAF_BITS.with(|c| {
         let mut c = c.borrow_mut();
         c.active = true;
+        c.present_mask = present_mask;
         c.known = 0;
     });
     let trace = env_flag!("FEAT_TRACE");
@@ -10964,7 +11690,12 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
             if cell_trace {
                 eprintln!("FCTX {sx} {sz} {gi} {step} {name}");
             }
-            gen_pf(pf, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
+            if use_bits {
+                let mask = slot.expect("step entry parallel to order").ball_mask;
+                gen_pf_with_mask(pf, mask, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
+            } else {
+                gen_pf(pf, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
+            }
             if let Some(t0) = t0 {
                 feat_prof_record(name, t0.elapsed().as_nanos());
             }
