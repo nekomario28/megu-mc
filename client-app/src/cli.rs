@@ -10,9 +10,9 @@ use mc_spine_proto::friend_relay::InviteCode;
 
 use crate::hardware_profile::{probe_host_hardware, recommend_tuning};
 use crate::settings::{
-    ClientSettings, CloudMode, DistantHorizon, HostMinimapMode, HostPlayerRadarScope,
-    ParticleLevel, QualityPreset, MAX_BACKGROUND_FPS, MAX_FOV, MAX_MAX_FPS, MAX_VIEW_DISTANCE,
-    MIN_FOV, MIN_MAX_FPS, MIN_VIEW_DISTANCE, SETTINGS_FILE_NAME,
+    sanitize_shader_selector, ClientSettings, CloudMode, DistantHorizon, HostMinimapMode,
+    HostPlayerRadarScope, ParticleLevel, QualityPreset, MAX_BACKGROUND_FPS, MAX_FOV,
+    MAX_MAX_FPS, MAX_VIEW_DISTANCE, MIN_FOV, MIN_MAX_FPS, MIN_VIEW_DISTANCE, SETTINGS_FILE_NAME,
 };
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -147,6 +147,13 @@ pub struct CliConfig {
     /// `--gpu-backend`: explicit GPU pipeline selection; overrides the
     /// TOML `gpu_backend` key when given.
     pub gpu_backend: Option<RenderBackendPreference>,
+    /// `--shader-pack <path>`: external OptiFine/Iris/DistantHorizons
+    /// shaderpack (zip or directory) or Megu native `megu-shader.toml`
+    /// WGSL pack; overrides the TOML `shader_pack` key when given.
+    pub shader_pack: Option<String>,
+    /// `--shader-profile <name>`: `profile.<NAME>` inside the pack's
+    /// `shaders.properties`; overrides the TOML `shader_profile` key.
+    pub shader_profile: Option<String>,
     /// `--auto-tune`: seed settings from `recommend_tuning` of the probed
     /// host hardware before TOML keys and explicit flags are overlaid.
     pub auto_tune: bool,
@@ -240,6 +247,8 @@ impl Default for CliConfig {
             max_fps: None,
             background_fps: None,
             gpu_backend: None,
+            shader_pack: None,
+            shader_profile: None,
             auto_tune: false,
             fair_play: false,
             minimap_mode: None,
@@ -312,6 +321,8 @@ impl fmt::Debug for CliConfig {
             .field("max_fps", &self.max_fps)
             .field("background_fps", &self.background_fps)
             .field("gpu_backend", &self.gpu_backend)
+            .field("shader_pack", &self.shader_pack)
+            .field("shader_profile", &self.shader_profile)
             .field("auto_tune", &self.auto_tune)
             .field("fair_play", &self.fair_play)
             .field("minimap_mode", &self.minimap_mode)
@@ -476,6 +487,14 @@ impl CliConfig {
         }
         if let Some(value) = self.gpu_backend {
             settings.gpu_backend = value;
+            tuned = true;
+        }
+        if let Some(value) = &self.shader_pack {
+            settings.shader_pack = Some(value.clone());
+            tuned = true;
+        }
+        if let Some(value) = &self.shader_profile {
+            settings.shader_profile = Some(value.clone());
             tuned = true;
         }
         // Host fair-play policy: `--fair-play` switches the minimap into
@@ -853,6 +872,24 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                     )
                 })?);
             }
+            "--shader-pack" => {
+                let raw = take_val(flag, &mut i)?;
+                let Some(value) = sanitize_shader_selector(&raw) else {
+                    return Err(format!(
+                        "invalid --shader-pack '{raw}' (empty or contains '..' path traversal)"
+                    ));
+                };
+                cfg.shader_pack = Some(value);
+            }
+            "--shader-profile" => {
+                let raw = take_val(flag, &mut i)?;
+                let Some(value) = sanitize_shader_selector(&raw) else {
+                    return Err(format!(
+                        "invalid --shader-profile '{raw}' (empty or contains '..' path traversal)"
+                    ));
+                };
+                cfg.shader_profile = Some(value);
+            }
             "--auto-tune" => cfg.auto_tune = true,
             "--fair-play" => cfg.fair_play = true,
             "--minimap-mode" => {
@@ -1042,6 +1079,16 @@ PLAYER SETTINGS:
   --auto-tune                      Seed settings from probed host hardware;
                                    the settings file, options.txt import, and
                                    explicit flags still override
+
+SHADER PACKS:
+  --shader-pack <path>             External OptiFine/Iris shaderpack (zip or
+                                   directory), DistantHorizons LOD pack, or a
+                                   Megu native WGSL pack (megu-shader.toml);
+                                   packs requiring GPU features this device
+                                   lacks fall back to built-in rendering
+                                   with a notice instead of crashing
+  --shader-profile <name>          Optional profile.<NAME> inside the pack's
+                                   shaders.properties to activate on load
 
 HOST WORLD MAP FAIR PLAY:
   Applied when this client hosts a world (--quickPlaySingleplayer, LAN

@@ -401,6 +401,14 @@ pub struct ClientSettings {
     /// capabilities, `classic-low-spec` pins the minimal-hardware path for
     /// legacy Intel integrated GPUs (GL 3.3 / Vulkan 1.1 only).
     pub gpu_backend: RenderBackendPreference,
+    /// Selected shaderpack: an external OptiFine/Iris/DistantHorizons pack
+    /// (zip or directory) or a Megu native WGSL pack (`megu-shader.toml`).
+    /// `None` — the default on every preset — keeps built-in rendering;
+    /// packs that exceed the GPU's capabilities fail closed back to it.
+    pub shader_pack: Option<String>,
+    /// Optional `profile.<NAME>` inside the pack's `shaders.properties`
+    /// activated on load; `None` uses the pack's own defaults.
+    pub shader_profile: Option<String>,
     /// Map-mod fair-play policy applied when this client hosts a world
     /// (integrated server, LAN share, friend relay); ignored on plain
     /// client joins to a remote server.
@@ -439,6 +447,8 @@ impl ClientSettings {
             max_fps: None,
             background_fps_limit: DEFAULT_BACKGROUND_FPS_LIMIT,
             gpu_backend: RenderBackendPreference::Auto,
+            shader_pack: None,
+            shader_profile: None,
             map_fair_play: HostMapFairPlaySettings::default(),
             qol: ClientQolSettings::default(),
         };
@@ -497,6 +507,21 @@ impl ClientSettings {
         let max_fps = self
             .max_fps
             .map_or_else(|| "\"unlimited\"".to_string(), |v| v.to_string());
+        // Shader selectors are omitted entirely when unset so a default
+        // file carries no shaderpack noise; [`is_valid_shader_selector`]
+        // keeps programmatically-set unwritable values from producing
+        // malformed TOML.
+        let mut shader_lines = String::new();
+        if let Some(pack) = &self.shader_pack {
+            if is_valid_shader_selector(pack) {
+                shader_lines.push_str(&format!("shader_pack = \"{pack}\"\n"));
+            }
+        }
+        if let Some(profile) = &self.shader_profile {
+            if is_valid_shader_selector(profile) {
+                shader_lines.push_str(&format!("shader_profile = \"{profile}\"\n"));
+            }
+        }
         format!(
             "# mc-spine client settings\n\
              preset = \"{}\"\n\
@@ -511,6 +536,7 @@ impl ClientSettings {
              max_fps = {}\n\
              background_fps_limit = {}\n\
              gpu_backend = \"{}\"\n\
+             {shader_lines}\
              \n\
              [host_map_fair_play]\n\
              minimap_fair_play = {}\n\
@@ -588,6 +614,8 @@ impl ClientSettings {
                     self.background_fps_limit = parsed.background_fps_limit;
                 }
                 "gpu_backend" => self.gpu_backend = parsed.gpu_backend,
+                "shader_pack" => self.shader_pack = parsed.shader_pack.clone(),
+                "shader_profile" => self.shader_profile = parsed.shader_profile.clone(),
                 "minimap_fair_play" | "minimap_mode" => {
                     // The mirrored pair is already consistent in `parsed`.
                     self.map_fair_play.minimap_fair_play =
@@ -783,6 +811,20 @@ impl ClientSettings {
                     Some(g) => {
                         settings.gpu_backend = g;
                         seen.push("gpu_backend");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "shader_pack" => match sanitize_shader_selector(value) {
+                    Some(v) => {
+                        settings.shader_pack = Some(v);
+                        seen.push("shader_pack");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "shader_profile" => match sanitize_shader_selector(value) {
+                    Some(v) => {
+                        settings.shader_profile = Some(v);
+                        seen.push("shader_profile");
                     }
                     None => invalid(&mut warnings),
                 },
@@ -1044,6 +1086,27 @@ impl ClientSettings {
     }
 }
 
+/// Whether `value` is an acceptable `shader_pack`/`shader_profile`
+/// selector: non-empty after trimming and free of `..` path-traversal
+/// components and of characters that would break the settings file format.
+pub fn is_valid_shader_selector(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && !trimmed.chars().any(|c| c == '"' || c.is_control())
+        && !trimmed
+            .split(&['/', '\\'][..])
+            .any(|part| part == "..")
+}
+
+/// Normalize a `shader_pack`/`shader_profile` selector for the settings
+/// file and CLI: trims surrounding whitespace, returning `None` for empty
+/// strings or `..` traversal so the caller degrades to built-in rendering
+/// (TOML warns and keeps the default; the CLI fails closed).
+pub fn sanitize_shader_selector(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    is_valid_shader_selector(trimmed).then(|| trimmed.to_owned())
+}
+
 fn unquote(value: &str) -> &str {
     let bytes = value.as_bytes();
     if bytes.len() >= 2
@@ -1171,6 +1234,8 @@ mod tests {
             max_fps: Some(144),
             background_fps_limit: 45,
             gpu_backend: RenderBackendPreference::ClassicLowSpec,
+            shader_pack: Some("shaderpacks/Complementary.zip".to_owned()),
+            shader_profile: Some("HIGH".to_owned()),
             map_fair_play: HostMapFairPlaySettings {
                 minimap_fair_play: true,
                 allow_cave_map: false,

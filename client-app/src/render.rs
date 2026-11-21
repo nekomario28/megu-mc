@@ -18,9 +18,18 @@ use mc_spine_client_mesh::{
     DIRECTION_BUCKET_UNASSIGNED,
 };
 
+use mc_spine_client_mesh::{PackDimension, ShaderOptionOverrides, ShaderPackSource};
+
 use crate::audio_qol::ZoomState;
+use crate::lod::LodConfig;
 use crate::protocol::zlib_compress_stored;
+use crate::render_graph::{
+    plan_frame, plan_frame_with_shaderpack, FramePlanInput, GpuPipelineKind, RenderGraphPlan,
+};
 use crate::settings::{ClientSettings, CloudMode, ParticleLevel};
+use crate::shaderpack_runtime::{
+    activate_shaderpack, ActiveShaderSession, ShaderActivationOutcome, ShaderActivationRequest,
+};
 use crate::world::WorldState;
 
 const NEAR_Z: f64 = 0.08;
@@ -48,7 +57,7 @@ const FLUID_LAVA: u32 = 2;
 /// renderer; the remaining fields are carried 1:1 so a windowed frontend
 /// can honor them without re-mapping (the headless rasterizer has no
 /// cloud, particle, entity, or present pass to apply them to).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderConfig {
     /// Vertical field of view in degrees.
     pub fov_deg: f64,
@@ -74,6 +83,12 @@ pub struct RenderConfig {
     /// `classic-low-spec` pins the minimal-hardware path for legacy Intel
     /// integrated GPUs (GL 3.3 / Vulkan 1.1 only).
     pub gpu_backend: RenderBackendPreference,
+    /// Selected shaderpack path forwarded to the shaderpack runtime;
+    /// `None` keeps built-in rendering.
+    pub shader_pack: Option<String>,
+    /// Optional `profile.<NAME>` inside the pack's `shaders.properties` to
+    /// activate on load.
+    pub shader_profile: Option<String>,
 }
 
 impl RenderConfig {
@@ -91,6 +106,8 @@ impl RenderConfig {
             max_fps: settings.max_fps,
             background_fps_limit: settings.background_fps_limit,
             gpu_backend: settings.gpu_backend,
+            shader_pack: settings.shader_pack.clone(),
+            shader_profile: settings.shader_profile.clone(),
         }
     }
 
@@ -135,6 +152,131 @@ impl Default for RenderConfig {
             max_fps: None,
             background_fps_limit: crate::settings::DEFAULT_BACKGROUND_FPS_LIMIT,
             gpu_backend: RenderBackendPreference::Auto,
+            shader_pack: None,
+            shader_profile: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shaderpack session wiring
+// ---------------------------------------------------------------------------
+
+/// Inputs [`RenderConfig::resolve_shaderpack`] needs beyond the frame
+/// input: the already-opened pack source, the active dimension, the UI
+/// locale for `lang/*.lang` strings, and the distant-horizon LOD config.
+#[derive(Clone, Copy)]
+pub struct ShaderpackResolveInput<'a> {
+    /// Opened shaderpack source; `None` when the configured pack could not
+    /// be read from disk — resolution still degrades gracefully to
+    /// built-in rendering with a notice.
+    pub source: Option<&'a ShaderPackSource>,
+    /// Dimension whose `world<N>` program overrides to plan.
+    pub dimension: PackDimension,
+    /// UI locale for pack `lang/*.lang` strings (`"en_US"`, `"ja_JP"`, ...).
+    pub locale: &'a str,
+    /// Active distant-horizon LOD config, when enabled.
+    pub lod_config: Option<LodConfig>,
+}
+
+impl Default for ShaderpackResolveInput<'_> {
+    fn default() -> Self {
+        Self {
+            source: None,
+            dimension: PackDimension::Overworld,
+            locale: "en_US",
+            lod_config: None,
+        }
+    }
+}
+
+/// Shaderpack state resolved for the active GPU pipeline: the frame plan
+/// to execute, the live pack session when one is running, and the
+/// player-facing notice when a requested pack could not run.
+#[derive(Clone, Debug)]
+pub struct ShaderpackRenderState {
+    /// Deterministic frame plan the renderer executes — the built-in
+    /// vanilla plan, or the same plan layered with the pack's ordered
+    /// passes via [`plan_frame_with_shaderpack`].
+    pub frame_plan: RenderGraphPlan,
+    /// Active shaderpack session when the pack passed validation; `None`
+    /// for built-in rendering.
+    pub session: Option<ActiveShaderSession>,
+    /// Player-facing explanation shown when a requested pack fell back to
+    /// built-in rendering (`None` when the pack is active or none was
+    /// configured).
+    pub user_notice: Option<String>,
+    /// Missing GPU capabilities or validation errors reported on fallback,
+    /// in deterministic order.
+    pub missing_capabilities: Vec<String>,
+}
+
+impl RenderConfig {
+    /// Wire the configured shaderpack into deterministic frame planning.
+    ///
+    /// With no `shader_pack` configured this is exactly the built-in
+    /// [`plan_frame`] path. With a pack set, activation runs through
+    /// [`activate_shaderpack`]; every rejection — an unreadable source, GPU
+    /// capabilities the pack needs but the pipeline lacks, failed WGSL
+    /// validation — resolves to the built-in plan with
+    /// [`ShaderpackRenderState::user_notice`] populated. This path never
+    /// panics and never hard-fails, so an incompatible pack (e.g. a
+    /// compute/SSBO pack on `ClassicLowSpec`) always degrades to built-in
+    /// rendering instead of crashing.
+    pub fn resolve_shaderpack(
+        &self,
+        pipeline: GpuPipelineKind,
+        input: &FramePlanInput,
+        shaderpack: &ShaderpackResolveInput<'_>,
+    ) -> ShaderpackRenderState {
+        let vanilla_plan = plan_frame(pipeline, input);
+        let Some(pack_name) = self.shader_pack.as_deref() else {
+            return ShaderpackRenderState {
+                frame_plan: vanilla_plan,
+                session: None,
+                user_notice: None,
+                missing_capabilities: Vec::new(),
+            };
+        };
+        let Some(source) = shaderpack.source else {
+            return ShaderpackRenderState {
+                frame_plan: vanilla_plan,
+                session: None,
+                user_notice: Some(format!(
+                    "Shaderpack '{pack_name}' could not be opened; \
+                     switched back to built-in rendering."
+                )),
+                missing_capabilities: vec!["shaderpack source could not be loaded".to_owned()],
+            };
+        };
+        let req = ShaderActivationRequest {
+            pack_name,
+            dimension: shaderpack.dimension,
+            locale: shaderpack.locale,
+            overrides: ShaderOptionOverrides {
+                profile: self.shader_profile.clone(),
+                options: Default::default(),
+            },
+            lod_config: shaderpack.lod_config,
+        };
+        match activate_shaderpack(source, pipeline, input, &req) {
+            ShaderActivationOutcome::Active(session) => ShaderpackRenderState {
+                frame_plan: plan_frame_with_shaderpack(pipeline, input, &session),
+                session: Some(*session),
+                user_notice: None,
+                missing_capabilities: Vec::new(),
+            },
+            ShaderActivationOutcome::FallbackToVanilla {
+                missing_capabilities,
+                user_notice,
+                vanilla_graph,
+                ..
+            } => ShaderpackRenderState {
+                frame_plan: vanilla_graph,
+                session: None,
+                user_notice: Some(user_notice),
+                missing_capabilities,
+            },
         }
     }
 }

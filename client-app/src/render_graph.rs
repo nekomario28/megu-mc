@@ -16,10 +16,11 @@
 //! submits plain per-section draws.
 
 use mc_spine_client_mesh::{
-    ActiveRenderBackend, BLOCK_ENTITY_INSTANCE_GPU_BYTES, KINETIC_INSTANCE_GPU_BYTES,
-    MAX_INSTANCES_PER_UBO_16KB,
+    ActiveRenderBackend, PassKind, PipelineStage, BLOCK_ENTITY_INSTANCE_GPU_BYTES,
+    KINETIC_INSTANCE_GPU_BYTES, MAX_INSTANCES_PER_UBO_16KB,
 };
 
+use crate::shaderpack_runtime::{ActiveShaderSession, LoadedPackKind};
 use crate::shaders::{
     validate_wgsl_module, WgslBindingKind, WgslStage, BLOCK_ENTITY_INSTANCED_UBO_WGSL,
     BLOCK_ENTITY_INSTANCED_WGSL, HIZ_DOWNSAMPLE_COMPUTE_WGSL, MESHLET_CULL_COMPUTE_WGSL,
@@ -307,6 +308,33 @@ pub struct FramePlanInput {
     pub translucent_sections: u32,
 }
 
+/// One shaderpack pass layered over the built-in frame sequence by
+/// [`plan_frame_with_shaderpack`]. Unlike [`PlannedPass`] — whose identity
+/// is the fixed [`RenderPassId`] set — a pack pass keeps its pack-defined
+/// program name, Iris execution stage, and render-target list, so the
+/// plan mirrors the pack's `shaders.properties`/`megu-shader.toml`
+/// ordering 1:1.
+#[derive(Clone, Debug)]
+pub struct ShaderpackPlannedPass {
+    /// Pack program name (`shadow`, `dh_shadow`, `gbuffers_terrain`,
+    /// `dh_terrain`, `dh_water`, `deferred`, `composite`, `final`, or a
+    /// `begin`/`prepare`/`shadowcomp` compute pass).
+    pub name: String,
+    /// Iris execution stage the pass belongs to.
+    pub stage: PipelineStage,
+    /// Compute dispatch or graphics draw.
+    pub kind: PassKind,
+    /// Color-attachment target names the pass declares
+    /// (`RENDERTARGETS`/`DRAWBUFFERS` or `megu-shader.toml` `targets`).
+    pub render_targets: Vec<String>,
+    /// Compute workgroup counts for `PassKind::Compute` passes.
+    pub work_groups: Option<[u32; 3]>,
+    /// Estimated draw calls (or dispatched workgroups) this frame.
+    pub estimated_draw_calls: u32,
+    /// Estimated bytes of VRAM the pass's outputs occupy.
+    pub estimated_vram_bytes: u64,
+}
+
 /// A complete deterministic frame plan.
 #[derive(Clone, Debug)]
 pub struct RenderGraphPlan {
@@ -314,6 +342,14 @@ pub struct RenderGraphPlan {
     pub pipeline: GpuPipelineKind,
     /// Passes in [`RenderPassId::ORDER`].
     pub passes: Vec<PlannedPass>,
+    /// Shaderpack passes layered over the built-in sequence in pack
+    /// execution order (shadow / dh_shadow / gbuffers / dh_terrain /
+    /// dh_water / deferred / composite / final / compute). Empty for
+    /// vanilla rendering; populated only by [`plan_frame_with_shaderpack`].
+    pub shaderpack_passes: Vec<ShaderpackPlannedPass>,
+    /// Display name of the active shaderpack when `shaderpack_passes` is
+    /// populated; `None` for built-in rendering.
+    pub active_shaderpack: Option<String>,
 }
 
 impl RenderGraphPlan {
@@ -322,14 +358,24 @@ impl RenderGraphPlan {
         self.passes.iter().find(|p| p.id == id)
     }
 
-    /// Sum of every pass's estimated draw calls/dispatches.
+    /// Sum of every pass's estimated draw calls/dispatches, including the
+    /// layered shaderpack passes when present.
     pub fn total_estimated_draw_calls(&self) -> u32 {
-        self.passes.iter().map(|p| p.estimated_draw_calls).sum()
+        self.passes
+            .iter()
+            .map(|p| p.estimated_draw_calls)
+            .chain(self.shaderpack_passes.iter().map(|p| p.estimated_draw_calls))
+            .sum()
     }
 
-    /// Sum of every pass's estimated VRAM footprint in bytes.
+    /// Sum of every pass's estimated VRAM footprint in bytes, including
+    /// the layered shaderpack passes when present.
     pub fn vram_estimate_bytes(&self) -> u64 {
-        self.passes.iter().map(|p| p.estimated_vram_bytes).sum()
+        self.passes
+            .iter()
+            .map(|p| p.estimated_vram_bytes)
+            .chain(self.shaderpack_passes.iter().map(|p| p.estimated_vram_bytes))
+            .sum()
     }
 
     /// The `(group, binding, kind)` resource set declared for `pass`, for
@@ -648,5 +694,116 @@ pub fn plan_frame(pipeline: GpuPipelineKind, input: &FramePlanInput) -> RenderGr
             .all(|w| w[0] < w[1]),
         "passes must stay in RenderPassId::ORDER"
     );
-    RenderGraphPlan { pipeline, passes }
+    RenderGraphPlan {
+        pipeline,
+        passes,
+        shaderpack_passes: Vec::new(),
+        active_shaderpack: None,
+    }
+}
+
+/// Deterministic plan entry for one shaderpack pass. Compute passes report
+/// their declared workgroup count as dispatch cost; geometry stages
+/// (`shadow`/`dh_shadow` casters, `gbuffers` terrain, `dh_terrain`/
+/// `dh_water` LOD) re-issue the pipeline's section submission and budget
+/// per-section geometry, while fullscreen stages (`begin`/`prepare`/
+/// `deferred`/`composite`/`final`) cost a single draw per declared
+/// attachment.
+fn shaderpack_pass(
+    name: String,
+    stage: PipelineStage,
+    kind: PassKind,
+    render_targets: Vec<String>,
+    work_groups: Option<[u32; 3]>,
+    pipeline: GpuPipelineKind,
+    input: &FramePlanInput,
+) -> ShaderpackPlannedPass {
+    let workgroup_cost = |groups: Option<[u32; 3]>| -> u32 {
+        groups
+            .map(|g| g[0].max(1) * g[1].max(1) * g[2].max(1))
+            .unwrap_or(1)
+    };
+    let geometry_stage = matches!(
+        stage,
+        PipelineStage::Shadow | PipelineStage::Gbuffers | PipelineStage::DistantHorizons
+    );
+    let (estimated_draw_calls, estimated_vram_bytes) = match kind {
+        PassKind::Compute => (
+            workgroup_cost(work_groups),
+            u64::from(workgroup_cost(work_groups)) * 16,
+        ),
+        PassKind::Graphics => {
+            let target_bytes =
+                bytes(input.width, input.height, 4) * render_targets.len().max(1) as u64;
+            if geometry_stage {
+                (
+                    terrain_draw_calls(pipeline, input.visible_sections),
+                    target_bytes + u64::from(input.visible_sections) * 1024,
+                )
+            } else {
+                (1, target_bytes)
+            }
+        }
+    };
+    ShaderpackPlannedPass {
+        name,
+        stage,
+        kind,
+        render_targets,
+        work_groups,
+        estimated_draw_calls,
+        estimated_vram_bytes,
+    }
+}
+
+/// Layer an activated shaderpack's ordered passes over the deterministic
+/// built-in frame plan.
+///
+/// The vanilla [`plan_frame`] sequence stays untouched as the geometry
+/// submission and budget base; the pack's programs append to
+/// [`RenderGraphPlan::shaderpack_passes`] in Iris execution order
+/// (`begin`/`shadow`/`dh_shadow`/`prepare` compute and shadow passes →
+/// `gbuffers`/`dh_terrain`/`dh_water` geometry → `deferred`/`composite`/
+/// `final` fullscreen), each folded into the plan's total draw-call and
+/// VRAM estimates. `plan_frame` itself is unchanged for vanilla rendering.
+pub fn plan_frame_with_shaderpack(
+    pipeline: GpuPipelineKind,
+    input: &FramePlanInput,
+    session: &ActiveShaderSession,
+) -> RenderGraphPlan {
+    let mut plan = plan_frame(pipeline, input);
+    plan.shaderpack_passes = match &session.pack {
+        LoadedPackKind::IrisOptiFine(pack) => pack
+            .passes
+            .iter()
+            .map(|p| {
+                shaderpack_pass(
+                    p.name.clone(),
+                    p.stage,
+                    p.kind,
+                    p.render_targets.clone().unwrap_or_default(),
+                    p.work_groups,
+                    pipeline,
+                    input,
+                )
+            })
+            .collect(),
+        LoadedPackKind::MeguWgsl(pack) => pack
+            .passes
+            .iter()
+            .map(|p| {
+                shaderpack_pass(
+                    p.name.clone(),
+                    p.stage,
+                    p.kind,
+                    p.render_targets.clone(),
+                    p.work_groups,
+                    pipeline,
+                    input,
+                )
+            })
+            .collect(),
+    };
+    plan.active_shaderpack = Some(session.pack_name.clone());
+    plan
 }
