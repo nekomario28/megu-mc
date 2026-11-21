@@ -9585,7 +9585,16 @@ mod parity_51_gr_tests {
     }
 
     fn p51_frame(r: &mut TcpStream) -> Option<(i64, Vec<u8>)> {
-        read_packet(r, Instant::now() + Duration::from_millis(300))
+        // The assertion is about the `0x6c` admin-channel echo specifically;
+        // world-state broadcasts a command legitimately emits (e.g. the
+        // `0x64` set_time update `/time` pushes on change) are not it.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while let Some(frame) = read_packet(r, deadline) {
+            if frame.0 == 0x6c {
+                return Some(frame);
+            }
+        }
+        None
     }
 
     /// `commandBlockOutput=false`: the "@" admin-channel echo to operators is

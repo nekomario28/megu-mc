@@ -2957,13 +2957,54 @@ fn display_pkt(slot: i64, obj: &str) -> Vec<u8> {
     p
 }
 
+/// Vanilla `ServerScoreboard` tracking: an objective only reaches a client's
+/// wire while it is bound to a display slot (`startTrackingObjective` runs on
+/// `setDisplayObjective`, not on `addObjective`). All objective and score
+/// packet fanouts are gated on this.
+fn scoreboard_tracked(board: &ScoreboardEngine, objective: &str) -> bool {
+    board
+        .display_slots
+        .iter()
+        .flatten()
+        .any(|slot| slot.as_str() == objective)
+}
+
+/// `ScoreboardDisplaySlot` indexed by protocol id, for slot-clear packets.
+const SCOREBOARD_SLOTS: [ScoreboardDisplaySlot; 19] = [
+    ScoreboardDisplaySlot::List,
+    ScoreboardDisplaySlot::Sidebar,
+    ScoreboardDisplaySlot::BelowName,
+    ScoreboardDisplaySlot::TeamBlack,
+    ScoreboardDisplaySlot::TeamDarkBlue,
+    ScoreboardDisplaySlot::TeamDarkGreen,
+    ScoreboardDisplaySlot::TeamDarkAqua,
+    ScoreboardDisplaySlot::TeamDarkRed,
+    ScoreboardDisplaySlot::TeamDarkPurple,
+    ScoreboardDisplaySlot::TeamGold,
+    ScoreboardDisplaySlot::TeamGray,
+    ScoreboardDisplaySlot::TeamDarkGray,
+    ScoreboardDisplaySlot::TeamBlue,
+    ScoreboardDisplaySlot::TeamGreen,
+    ScoreboardDisplaySlot::TeamAqua,
+    ScoreboardDisplaySlot::TeamRed,
+    ScoreboardDisplaySlot::TeamLightPurple,
+    ScoreboardDisplaySlot::TeamYellow,
+    ScoreboardDisplaySlot::TeamWhite,
+];
+
 fn sync_scoreboard(w: &mut TcpStream, board: &ScoreboardEngine) -> std::io::Result<()> {
     for objective in board.objectives.values() {
+        if !scoreboard_tracked(board, &objective.name) {
+            continue;
+        }
         let (id, body) =
             encode_scoreboard_objective(ScoreboardObjectivePacket::Create(objective, None));
         send_packet(w, id, body)?;
     }
     for (objective, scores) in &board.scores {
+        if !scoreboard_tracked(board, objective) {
+            continue;
+        }
         for (owner, score) in scores {
             let (id, body) = encode_scoreboard_score(owner, objective, score.value, None, None);
             send_packet(w, id, body)?;
@@ -2978,6 +3019,9 @@ fn sync_scoreboard(w: &mut TcpStream, board: &ScoreboardEngine) -> std::io::Resu
 }
 
 fn broadcast_score(board: &ScoreboardEngine, owner: &str, objective: &str) {
+    if !scoreboard_tracked(board, objective) {
+        return;
+    }
     if let Some(score) = board.get(owner, objective) {
         let (id, body) = encode_scoreboard_score(owner, objective, score, None, None);
         broadcast(-1, |_| (id, body.clone()));
@@ -3037,6 +3081,21 @@ fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Resu
             return Err("Too many scores for objective".into());
         }
     }
+    // Vanilla `ServerScoreboard` keeps a tracked set — objectives bound to a
+    // display slot — and only sends objective/score/reset packets to clients
+    // tracking that objective. Snapshot the slots before the command mutates
+    // them so `remove` can still tell whether its audience existed.
+    let prior_display = board.display_slots.clone();
+    let reset_all_tracked = if let ["players", "reset", owner] = args {
+        prior_display.iter().flatten().any(|slot| {
+            board
+                .scores
+                .get(slot.as_str())
+                .is_some_and(|scores| scores.contains_key(*owner))
+        })
+    } else {
+        false
+    };
     let reply = match args {
         ["objectives", "modify", name, "displayname", text @ ..] if !text.is_empty() => {
             let Some(objective) = board.objectives.get_mut(*name) else {
@@ -3091,19 +3150,59 @@ fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Resu
     for &(owner, objective) in entries {
         broadcast_score(board, owner, objective);
     }
+    let tracked = |name: &str| scoreboard_tracked(board, name);
+    let was_tracked =
+        |name: &str| prior_display.iter().flatten().any(|slot| slot.as_str() == name);
     let packet = match args {
         ["objectives", "add", name, ..] => {
+            if !tracked(name) {
+                return Ok(reply);
+            }
             let objective = board.objective(name).unwrap();
             encode_scoreboard_objective(ScoreboardObjectivePacket::Create(objective, None))
         }
         ["objectives", "remove", name] => {
+            if !was_tracked(name) {
+                return Ok(reply);
+            }
+            // The client was tracking the objective through every slot that
+            // showed it: vanilla clears those slots before the remove lands.
+            for (index, slot) in prior_display.iter().enumerate() {
+                if slot.as_deref() == Some(*name) {
+                    let (_, body) = encode_scoreboard_display(SCOREBOARD_SLOTS[index], None);
+                    broadcast(-1, |_| (0x57, body.clone()));
+                }
+            }
             encode_scoreboard_objective(ScoreboardObjectivePacket::Remove(name))
         }
         ["objectives", "setdisplay", slot, ..] => {
             let slot = ScoreboardDisplaySlot::parse(slot).unwrap();
+            // `startTrackingObjective`: binding a slot to an objective nobody
+            // tracked yet pushes its create packet and every existing score to
+            // all clients ahead of the display-slot packet itself.
+            if let Some(name) = board.display(slot) {
+                if !was_tracked(name) {
+                    let objective = board.objective(name).unwrap();
+                    let (id, body) = encode_scoreboard_objective(
+                        ScoreboardObjectivePacket::Create(objective, None),
+                    );
+                    broadcast(-1, |_| (id, body.clone()));
+                    if let Some(scores) = board.scores.get(name) {
+                        for (owner, score) in scores {
+                            let (id, body) = encode_scoreboard_score(
+                                owner, name, score.value, None, None,
+                            );
+                            broadcast(-1, |_| (id, body.clone()));
+                        }
+                    }
+                }
+            }
             encode_scoreboard_display(slot, board.display(slot))
         }
         ["objectives", "modify", name, ..] => {
+            if !tracked(name) {
+                return Ok(reply);
+            }
             // mode 2: display name + render type changed in place.
             encode_scoreboard_objective(ScoreboardObjectivePacket::Update(
                 board.objective(name).unwrap(),
@@ -3111,6 +3210,13 @@ fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Resu
             ))
         }
         ["players", "reset", owner, objective @ ..] => {
+            let reached_client = match objective.first() {
+                Some(&name) => tracked(name),
+                None => reset_all_tracked,
+            };
+            if !reached_client {
+                return Ok(reply);
+            }
             encode_scoreboard_reset(owner, objective.first().copied())
         }
         _ => return Ok(reply),
@@ -6145,6 +6251,19 @@ fn tp_actor_destination(token: &str) -> Option<([f64; 3], DimId)> {
     })
 }
 
+/// One `/tp` axis. Vanilla parses the position with `Vec3Argument`
+/// (`centerCorrect = true`): an absolute X/Z token written without a decimal
+/// point centers on the block (`floor(v) + 0.5`), while Y, decimal tokens and
+/// `~`-relative offsets keep their exact value.
+fn tp_axis(tok: &str, base: f64, center: bool) -> f64 {
+    let value = coord(tok, base);
+    if center && !tok.starts_with('~') && !tok.contains('.') && tok.parse::<f64>().is_ok() {
+        value.floor() + 0.5
+    } else {
+        value
+    }
+}
+
 fn run_teleport_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> String {
     const USAGE: &str = "usage: /tp [<targets>] (<entity>|<x> <y> <z> [[<yaw> <pitch>]|facing (<fx> <fy> <fz>|entity <entity> [feet|eyes])])";
     let Some((&first, rest)) = args.split_first() else {
@@ -6212,9 +6331,9 @@ fn run_teleport_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -
         }
     } else if dest.len() >= 3 {
         let pos = [
-            coord(dest[0], ctx.x),
-            coord(dest[1], ctx.y),
-            coord(dest[2], ctx.z),
+            tp_axis(dest[0], ctx.x, true),
+            tp_axis(dest[1], ctx.y, false),
+            tp_axis(dest[2], ctx.z, true),
         ];
         if !pos.into_iter().all(f64::is_finite) {
             return "Invalid position".into();
@@ -6248,9 +6367,9 @@ fn run_teleport_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -
                         return USAGE.into();
                     }
                     let face = [
-                        coord(dest[4], ctx.x),
-                        coord(dest[5], ctx.y),
-                        coord(dest[6], ctx.z),
+                        tp_axis(dest[4], ctx.x, true),
+                        tp_axis(dest[5], ctx.y, false),
+                        tp_axis(dest[6], ctx.z, true),
                     ];
                     if !face.into_iter().all(f64::is_finite) {
                         return "Invalid position".into();
@@ -6710,6 +6829,21 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Vanilla `TimeCommand` routes through `ServerLevel.setDayTime`, and the
+/// clients see the new clock right away (a `set_time` update, not only the
+/// next periodic sync). Emitting `0x64` on the command path keeps clients
+/// current even while a slow tick still carries the pre-change sample.
+fn broadcast_world_time() {
+    let age = TICK.load(Ordering::Relaxed);
+    let day = WORLD_TIME.load(Ordering::Relaxed) % 24000;
+    broadcast(0, |_c| {
+        let mut p = Vec::new();
+        p.extend_from_slice(&age.to_be_bytes());
+        p.extend_from_slice(&(day as i64).to_be_bytes());
+        (0x64, p.clone())
+    });
+}
+
 fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     let me = ctx.me.as_ref();
     let Some(input) = msg.strip_prefix('/') else { return "Expected a command starting with /".into() };
@@ -6814,6 +6948,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     let current = WORLD_TIME.load(Ordering::Relaxed);
                     let updated = add_world_time(current, ticks);
                     WORLD_TIME.store(updated, Ordering::Relaxed);
+                    broadcast_world_time();
                     format!("Set the time to {}", updated)
                 } else {
                     "usage: /time add <ticks>".into()
@@ -6824,6 +6959,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     n => n.parse::<u64>().unwrap_or(1000),
                 };
                 WORLD_TIME.store(v, Ordering::Relaxed);
+                broadcast_world_time();
                 format!("Set time to {}", v)
             } else if matches!(args.first().copied(), Some("query") | Some("get")) {
                 match args.get(1).copied().unwrap_or("daytime") {
@@ -7223,6 +7359,16 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 }
             }
             place_block_dim(dim, x, y, z, st);
+            // Vanilla `SetBlockCommand` pushes a `ClientboundBlockUpdatePacket`
+            // (0x09) to every player tracking the chunk in that dimension as
+            // soon as the block lands; the queued section batch alone does not
+            // reach the wire the way the live server does.
+            {
+                let mut body = Vec::with_capacity(12);
+                write_pos(&mut body, x, y, z);
+                write_varint(&mut body, i64::from(visible_block_update_state(dim, x, y, z, st)));
+                broadcast_chunk_dim(dim, x >> 4, z >> 4, |_c| (0x09, body.clone()));
+            }
             if let Some(tag) = nbt {
                 setblock_attach_nbt(dim, x, y, z, tag);
             }
@@ -8313,15 +8459,16 @@ mod p5f_parity_tests {
         clients().lock().unwrap_or_else(|e| e.into_inner()).extend([a.clone(), b.clone()]);
         let ctx = p5f_ctx(None);
 
-        // coords + explicit rotation
+        // coords + explicit rotation — vanilla `Vec3Argument` centers integer
+        // X/Z tokens on the block (+0.5); Y keeps its exact value.
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 10 64 -20 90 -45"), "Teleported 1 target(s)");
         let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!((p.0, p.1, p.2), (10.0, 64.0, -20.0));
+        assert_eq!((p.0, p.1, p.2), (10.5, 64.0, -19.5));
         assert_eq!((p.3, p.4), (90.0, -45.0));
         // no rotation keeps the current one
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 1 65 2"), "Teleported 1 target(s)");
         let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!((p.0, p.1, p.2), (1.0, 65.0, 2.0));
+        assert_eq!((p.0, p.1, p.2), (1.5, 65.0, 2.5));
         assert_eq!((p.3, p.4), (90.0, -45.0));
         // relative rotation ~ wraps like vanilla
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 1 65 2 ~90 ~"), "Teleported 1 target(s)");
@@ -8340,14 +8487,15 @@ mod p5f_parity_tests {
         assert_eq!((p.3, p.4), (0.0, 90.0));
 
         // facing entity feet vs eyes: the eyes anchor adds the eye height.
+        // The subject landed on the centered integer coords (0.5, 64, 0.5).
         let (bx, by, bz) = (100.5, 70.0, -50.5);
         let (expect_yaw, expect_pitch) =
-            tp_look_angles([0.0, 64.0, 0.0], [bx, by, bz]);
+            tp_look_angles([0.5, 64.0, 0.5], [bx, by, bz]);
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing entity p5f-b feet"), "Teleported 1 target(s)");
         let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.3, p.4), (expect_yaw, expect_pitch));
         let (expect_yaw, expect_pitch) =
-            tp_look_angles([0.0, 64.0, 0.0], [bx, by + 1.62, bz]);
+            tp_look_angles([0.5, 64.0, 0.5], [bx, by + 1.62, bz]);
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing entity p5f-b eyes"), "Teleported 1 target(s)");
         let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.3, p.4), (expect_yaw, expect_pitch));
@@ -8405,7 +8553,7 @@ mod p5f_parity_tests {
         assert_eq!(p5f_run(&ctx, "/tp p5f-actor 8 70 9"), "Teleported 1 target(s)");
         assert_eq!(
             *actors().lock().unwrap_or_else(|e| e.into_inner()).get("p5f-actor").unwrap().pos.lock().unwrap_or_else(|e| e.into_inner()),
-            (8.0, 70.0, 9.0)
+            (8.5, 70.0, 9.5)
         );
         actors().lock().unwrap_or_else(|e| e.into_inner()).remove("p5f-actor");
 
