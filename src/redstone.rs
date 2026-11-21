@@ -378,6 +378,23 @@ enum RsBlock {
         triggered: bool,
         facing: RsDir,
     },
+    DaylightDetector {
+        inverted: bool,
+        power: u8,
+    },
+    TripwireHook {
+        facing: RsDir,
+        attached: bool,
+        powered: bool,
+    },
+    SculkSensor {
+        calibrated: bool,
+        // The amethyst input side; only meaningful on a calibrated sensor.
+        facing: RsDir,
+        phase: RsSculkPhase,
+        power: u8,
+        waterlogged: bool,
+    },
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -428,6 +445,9 @@ impl RsBlock {
                 | Self::Observer { .. }
                 | Self::Target { .. }
                 | Self::Source { .. }
+                | Self::DaylightDetector { .. }
+                | Self::TripwireHook { .. }
+                | Self::SculkSensor { .. }
         )
     }
 
@@ -448,6 +468,16 @@ impl RsBlock {
             Self::Comparator(comparator) if comparator.powered && toward == comparator.facing => {
                 comparator.output.min(15)
             }
+            Self::DaylightDetector { power, .. } => power,
+            Self::TripwireHook { powered: true, .. } => 15,
+            // The calibrated sensor emits nothing on the side opposite its
+            // facing: the amethyst input side is a filter, not an output.
+            Self::SculkSensor {
+                calibrated: true,
+                facing,
+                ..
+            } if toward == facing.opposite() => 0,
+            Self::SculkSensor { power, .. } => power,
             _ => 0,
         }
     }
@@ -470,6 +500,16 @@ impl RsBlock {
                 self.weak_signal(toward)
             }
             Self::Torch(_) | Self::WallTorch(_) if toward == RsDir::Up => self.weak_signal(toward),
+            // The hook strongly powers the block it is mounted on, opposite the
+            // wire line it faces.
+            Self::TripwireHook {
+                facing,
+                powered: true,
+                ..
+            } if toward == facing.opposite() => 15,
+            // Vanilla SculkSensorBlock.getDirectSignal: the sensor strongly
+            // powers only the block below it.
+            Self::SculkSensor { .. } if toward == RsDir::Down => self.weak_signal(toward),
             _ => 0,
         }
     }
@@ -503,6 +543,36 @@ trait RedstoneWorld {
             _ => None,
         }
     }
+
+    /// `(sky_light, day_time, raining, thundering)` for a daylight detector's
+    /// beam, or `None` when the host cannot observe the sky there. `None` keeps
+    /// the block's stored `power` property authoritative.
+    fn daylight_env(&self, _pos: RsPos) -> Option<(u8, i64, bool, bool)> {
+        None
+    }
+
+    /// Walk the tripwire line starting at the hook's `facing`: wire cells and
+    /// the far hook, folded into the vanilla attach/power result, or `None`
+    /// when the host cannot report entity intersection.
+    fn tripwire_line(&self, _pos: RsPos, _facing: RsDir) -> Option<RsTripwireResult> {
+        None
+    }
+
+    /// The vibration a sculk sensor at `pos` would hear, or `None`. The host
+    /// owns event delivery and wool occlusion; the block model owns power math.
+    fn sculk_vibration(&self, _pos: RsPos) -> Option<RsSculkVibration> {
+        None
+    }
+}
+
+/// One game event reaching a sculk sensor: the vanilla game-event name, the
+/// Euclidean distance to the source and whether wool blocked the path.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct RsSculkVibration {
+    event: String,
+    distance: f64,
+    wool_occluded: bool,
 }
 
 // These evaluators intentionally take the environmental observations as inputs. The
@@ -558,6 +628,8 @@ enum RsTripwireCell {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RsTripwireWireResult {
     attached: bool,
+    // The entity-driven powered flag the cell's own tick would write, not the
+    // stored one it read; writing it back keeps `powered` from latching.
     powered: bool,
 }
 
@@ -598,11 +670,10 @@ fn rs_tripwire_line(facing: RsDir, cells: &[RsTripwireCell]) -> RsTripwireResult
                 disarmed,
                 entity_intersects,
             } if wire_states.len() < 40 => {
-                let wire_powered = wire_powered || (entity_intersects && !disarmed);
-                powered |= wire_powered;
+                powered |= wire_powered || (entity_intersects && !disarmed);
                 wire_states.push(RsTripwireWireResult {
                     attached: false,
-                    powered: wire_powered,
+                    powered: entity_intersects && !disarmed,
                 });
             }
             RsTripwireCell::Hook {
@@ -926,6 +997,9 @@ trait RedstoneUpdates: RedstoneWorld {
     fn schedule(&mut self, pos: RsPos, delay: u64, priority: RsTickPriority);
     fn torch_histories(&mut self) -> &mut BTreeMap<RsPos, RsTorchHistory>;
     fn dispense(&mut self, pos: RsPos);
+    /// Write a tripwire cell's `attached`/`powered` properties. Hosts that let
+    /// the entity tick own those flags keep the default no-op.
+    fn update_tripwire_cell(&mut self, _pos: RsPos, _wire: RsTripwireWireResult) {}
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1150,10 +1224,103 @@ fn rs_update_device(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock
             }
             block.with_triggered(powered)
         }
+        RsBlock::DaylightDetector { inverted, .. } => rs_daylight_eval(world, pos, inverted, block),
+        RsBlock::TripwireHook { .. } => rs_tripwire_hook_update(world, pos, block),
+        RsBlock::SculkSensor {
+            calibrated,
+            facing,
+            phase: RsSculkPhase::Inactive,
+            waterlogged,
+            ..
+        } => {
+            let Some(vibration) = world.sculk_vibration(pos) else {
+                return;
+            };
+            let range = if calibrated { 16 } else { 8 };
+            // Vanilla getFacingInputSignal: the front block's signal, including
+            // an explicit dust power read when the wire is not pointed back.
+            let filter = calibrated
+                .then(|| {
+                    let front = pos.relative(facing);
+                    let input = rs_signal_from(world, front, facing.opposite(), true)
+                        .max(match world.redstone_block(front) {
+                            RsBlock::Wire(wire) => wire.power,
+                            _ => 0,
+                        });
+                    (input > 0).then_some(input)
+                })
+                .flatten();
+            let evaluation = rs_sculk_sensor_evaluate(
+                &vibration.event,
+                vibration.distance,
+                range,
+                vibration.wool_occluded,
+                filter,
+                calibrated,
+                Some(0),
+            );
+            if evaluation.power > 0 {
+                world.schedule(
+                    pos,
+                    if calibrated { 10 } else { 30 },
+                    RsTickPriority::Normal,
+                );
+                RsBlock::SculkSensor {
+                    calibrated,
+                    facing,
+                    phase: evaluation.phase,
+                    power: evaluation.power,
+                    waterlogged,
+                }
+            } else {
+                block
+            }
+        }
         _ => block,
     };
     if updated != block {
         world.set_component(pos, updated);
+    }
+}
+
+/// Re-read the environment for a daylight detector and reschedule the next
+/// refresh; `None` env keeps the stored `power` like a vanilla unloaded beam.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_daylight_eval(
+    world: &mut impl RedstoneUpdates,
+    pos: RsPos,
+    inverted: bool,
+    block: RsBlock,
+) -> RsBlock {
+    let Some((sky_light, day_time, raining, thundering)) = world.daylight_env(pos) else {
+        return block;
+    };
+    world.schedule(pos, 1, RsTickPriority::Normal);
+    RsBlock::DaylightDetector {
+        inverted,
+        power: rs_daylight_detector_signal(sky_light, day_time, raining, thundering, inverted),
+    }
+}
+
+/// Rescan the line the hook faces, pushing `attached`/`powered` back into the
+/// wire cells before reporting the hook's own flags.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_tripwire_hook_update(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock) -> RsBlock {
+    let RsBlock::TripwireHook { facing, .. } = block else {
+        return block;
+    };
+    let Some(result) = world.tripwire_line(pos, facing) else {
+        return block;
+    };
+    let mut cell_pos = pos;
+    for wire in &result.wires {
+        cell_pos = cell_pos.relative(facing);
+        world.update_tripwire_cell(cell_pos, *wire);
+    }
+    RsBlock::TripwireHook {
+        facing,
+        attached: result.attached,
+        powered: result.powered,
     }
 }
 
@@ -1185,6 +1352,16 @@ fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
         return;
     }
 
+    if matches!(
+        block,
+        RsBlock::DaylightDetector { .. } | RsBlock::TripwireHook { .. }
+    ) {
+        // These sensors poll their environment; the scheduled tick is just the
+        // next refresh of the same neighbor-change evaluation.
+        rs_update_device(world, pos, block);
+        return;
+    }
+
     let updated = match block {
         RsBlock::Repeater(mut repeater) if !repeater.is_locked(world, pos) => {
             let input = rs_diode_rear_input(world, pos, repeater.facing) != 0;
@@ -1208,6 +1385,35 @@ fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
         RsBlock::Lamp { lit: true } if rs_neighbor_signal(world, pos, true) == 0 => {
             RsBlock::Lamp { lit: false }
         }
+        RsBlock::SculkSensor {
+            calibrated,
+            facing,
+            phase: RsSculkPhase::Active,
+            waterlogged,
+            ..
+        } => {
+            world.schedule(pos, 10, RsTickPriority::Normal);
+            RsBlock::SculkSensor {
+                calibrated,
+                facing,
+                phase: RsSculkPhase::Cooldown,
+                power: 0,
+                waterlogged,
+            }
+        }
+        RsBlock::SculkSensor {
+            calibrated,
+            facing,
+            phase: RsSculkPhase::Cooldown,
+            waterlogged,
+            ..
+        } => RsBlock::SculkSensor {
+            calibrated,
+            facing,
+            phase: RsSculkPhase::Inactive,
+            power: 0,
+            waterlogged,
+        },
         RsBlock::Dispenser { .. } | RsBlock::Dropper { .. } => {
             world.dispense(pos);
             block
@@ -1263,6 +1469,10 @@ mod redstone_tests {
                     | "sticky_piston"
                     | "dispenser"
                     | "dropper"
+                    | "daylight_detector"
+                    | "tripwire_hook"
+                    | "sculk_sensor"
+                    | "calibrated_sculk_sensor"
             ) || name.ends_with("_button");
             let start = row[1].num() as u32;
             let len = row[2].num() as u32;
@@ -2032,6 +2242,9 @@ mod redstone_tests {
         comparator_outputs: BTreeMap<RsPos, u8>,
         analog: BTreeMap<RsPos, u8>,
         item_frames: BTreeMap<RsPos, (RsDir, u8)>,
+        daylight: BTreeMap<RsPos, (u8, i64, bool, bool)>,
+        entities: Vec<RsAabb>,
+        vibrations: BTreeMap<RsPos, RsSculkVibration>,
         dispensed: Vec<RsPos>,
         updates: VecDeque<RsPos>,
         pending: Vec<(u64, RsWorldTick)>,
@@ -2046,6 +2259,9 @@ mod redstone_tests {
                 comparator_outputs: BTreeMap::new(),
                 analog: BTreeMap::new(),
                 item_frames: BTreeMap::new(),
+                daylight: BTreeMap::new(),
+                entities: Vec::new(),
+                vibrations: BTreeMap::new(),
                 dispensed: Vec::new(),
                 updates: VecDeque::new(),
                 pending: Vec::new(),
@@ -2104,6 +2320,26 @@ mod redstone_tests {
         fn item_frame_signal(&self, pos: RsPos, facing: RsDir) -> Option<u8> {
             let &(direction, signal) = self.item_frames.get(&pos)?;
             (direction == facing).then_some(signal)
+        }
+
+        fn daylight_env(&self, pos: RsPos) -> Option<(u8, i64, bool, bool)> {
+            self.daylight.get(&pos).copied()
+        }
+
+        fn entity_intersects(&self, pos: RsPos) -> bool {
+            let cell = RsAabb {
+                min: [f64::from(pos.0), f64::from(pos.1), f64::from(pos.2)],
+                max: [
+                    f64::from(pos.0) + 1.0,
+                    f64::from(pos.1) + 1.0,
+                    f64::from(pos.2) + 1.0,
+                ],
+            };
+            rs_tripwire_entity_intersects(cell, &self.entities)
+        }
+
+        fn sculk_vibration(&self, pos: RsPos) -> Option<RsSculkVibration> {
+            self.vibrations.get(&pos).cloned()
         }
 
         fn apply_redstone_change(&mut self, pos: RsPos, state: u32, comparator_output: Option<u8>) {
@@ -2841,5 +3077,228 @@ mod redstone_tests {
                 power: 12
             })
         );
+    }
+
+    #[test]
+    fn redstone_sensors_daylight_tripwire_sculk_live_wire() {
+        let reg = breg().unwrap();
+        let mut torches = BTreeMap::new();
+        let prop = |world: &MemoryWorld, pos: RsPos, key: &str| {
+            reg.get_prop(world.state_at(pos), key)
+        };
+
+        // --- Daylight detector: stored power is authoritative until the world
+        // reports the environment, then the evaluator owns it. Normal mode
+        // emits in daylight; inverted mode emits at night.
+        let mut world = MemoryWorld::new(reg);
+        let detector = RsPos(0, 0, 0);
+        let dust = RsPos(0, 0, 1);
+        world.states.insert(
+            detector,
+            registered(reg, "daylight_detector", &[("power", "0")]),
+        );
+        world
+            .states
+            .insert(dust, registered(reg, "redstone_wire", &[("power", "0")]));
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[detector]);
+        world.drain_updates(&mut torches);
+        assert_eq!(prop(&world, dust, "power").as_deref(), Some("0"));
+
+        world.daylight.insert(detector, (15, 6_000, false, false));
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[detector]);
+        assert_eq!(prop(&world, detector, "power").as_deref(), Some("15"));
+        world.drain_updates(&mut torches);
+        assert_eq!(prop(&world, dust, "power").as_deref(), Some("15"));
+
+        // Inverted: dark at noon, lit at midnight (11 = 15 - max(0, 15 - 11)).
+        world.apply_redstone_change(
+            detector,
+            registered(
+                reg,
+                "daylight_detector",
+                &[("inverted", "true"), ("power", "0")],
+            ),
+            None,
+        );
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[detector]);
+        world.drain_updates(&mut torches);
+        assert_eq!(prop(&world, detector, "power").as_deref(), Some("0"));
+        assert_eq!(prop(&world, dust, "power").as_deref(), Some("0"));
+        world.daylight.insert(detector, (15, 18_000, false, false));
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[detector]);
+        assert_eq!(prop(&world, detector, "power").as_deref(), Some("11"));
+        world.drain_updates(&mut torches);
+        assert_eq!(prop(&world, dust, "power").as_deref(), Some("11"));
+
+        // --- Tripwire hook: entity on the line powers the hook, the wire cells
+        // and the dust beside the hook; clearing the entity shuts it off.
+        let mut world = MemoryWorld::new(reg);
+        let hook = RsPos(10, 0, 0);
+        let cell = RsPos(11, 0, 0);
+        let far_hook = RsPos(12, 0, 0);
+        let dust = RsPos(10, 0, 1);
+        world.states.extend([
+            (
+                RsPos(9, 0, 0),
+                registered(reg, "stone", &[]),
+            ),
+            (
+                hook,
+                registered(
+                    reg,
+                    "tripwire_hook",
+                    &[("attached", "false"), ("facing", "east")],
+                ),
+            ),
+            (cell, registered(reg, "tripwire", &[("disarmed", "false")])),
+            (
+                far_hook,
+                registered(
+                    reg,
+                    "tripwire_hook",
+                    &[("attached", "true"), ("facing", "west")],
+                ),
+            ),
+            (
+                RsPos(13, 0, 0),
+                registered(reg, "stone", &[]),
+            ),
+            (dust, registered(reg, "redstone_wire", &[("power", "0")])),
+        ]);
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[hook]);
+        world.drain_updates(&mut torches);
+        assert_eq!(prop(&world, hook, "powered").as_deref(), Some("false"));
+        assert_eq!(prop(&world, dust, "power").as_deref(), Some("0"));
+
+        world.entities.push(RsAabb {
+            min: [11.25, 0.0, 0.25],
+            max: [11.75, 1.0, 0.75],
+        });
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[hook]);
+        assert_eq!(prop(&world, hook, "attached").as_deref(), Some("true"));
+        assert_eq!(prop(&world, hook, "powered").as_deref(), Some("true"));
+        assert_eq!(prop(&world, cell, "attached").as_deref(), Some("true"));
+        assert_eq!(prop(&world, cell, "powered").as_deref(), Some("true"));
+        world.drain_updates(&mut torches);
+        assert_eq!(prop(&world, dust, "power").as_deref(), Some("15"));
+
+        world.entities.clear();
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[hook]);
+        world.drain_updates(&mut torches);
+        assert_eq!(prop(&world, hook, "powered").as_deref(), Some("false"));
+        assert_eq!(prop(&world, dust, "power").as_deref(), Some("0"));
+
+        // --- Sculk sensor: a block_place vibration powers the dust for the
+        // vanilla 30-tick pulse, then cools down and re-arms.
+        let mut world = MemoryWorld::new(reg);
+        let sensor = RsPos(20, 0, 0);
+        let dust = RsPos(20, 0, 1);
+        world.states.insert(sensor, registered(reg, "sculk_sensor", &[]));
+        world
+            .states
+            .insert(dust, registered(reg, "redstone_wire", &[("power", "0")]));
+        world.vibrations.insert(
+            sensor,
+            RsSculkVibration {
+                event: "block_place".into(),
+                distance: 2.0,
+                wool_occluded: false,
+            },
+        );
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[sensor]);
+        assert_eq!(
+            prop(&world, sensor, "sculk_sensor_phase").as_deref(),
+            Some("active")
+        );
+        assert_eq!(prop(&world, sensor, "power").as_deref(), Some("12"));
+        world.drain_updates(&mut torches);
+        assert_eq!(prop(&world, dust, "power").as_deref(), Some("12"));
+
+        world.advance(30, &mut torches);
+        assert_eq!(
+            prop(&world, sensor, "sculk_sensor_phase").as_deref(),
+            Some("cooldown")
+        );
+        world.drain_updates(&mut torches);
+        assert_eq!(prop(&world, dust, "power").as_deref(), Some("0"));
+        world.advance(40, &mut torches);
+        assert_eq!(
+            prop(&world, sensor, "sculk_sensor_phase").as_deref(),
+            Some("inactive")
+        );
+
+        // --- Calibrated sensor: 10-tick pulse, frequency filter on the amethyst
+        // input side, no output on the side opposite the input.
+        let mut world = MemoryWorld::new(reg);
+        let sensor = RsPos(30, 0, 0);
+        let input = sensor.relative(RsDir::North); // facing side
+        let quiet = sensor.relative(RsDir::South); // opposite the input
+        let loud = sensor.relative(RsDir::East);
+        world.states.extend([
+            (
+                sensor,
+                registered(
+                    reg,
+                    "calibrated_sculk_sensor",
+                    &[("facing", "north"), ("power", "0")],
+                ),
+            ),
+            (
+                input,
+                registered(
+                    reg,
+                    "lever",
+                    &[("face", "floor"), ("powered", "true")],
+                ),
+            ),
+            (
+                quiet,
+                registered(reg, "redstone_wire", &[("power", "0")]),
+            ),
+            (
+                loud,
+                registered(reg, "redstone_wire", &[("power", "0")]),
+            ),
+        ]);
+        world.vibrations.insert(
+            sensor,
+            RsSculkVibration {
+                event: "lightning_strike".into(), // frequency 15 = filter input
+                distance: 2.0,
+                wool_occluded: false,
+            },
+        );
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[sensor]);
+        assert_eq!(
+            prop(&world, sensor, "sculk_sensor_phase").as_deref(),
+            Some("active")
+        );
+        assert_eq!(prop(&world, sensor, "power").as_deref(), Some("14"));
+        world.drain_updates(&mut torches);
+        assert_eq!(prop(&world, loud, "power").as_deref(), Some("14"));
+        assert_eq!(prop(&world, quiet, "power").as_deref(), Some("0"));
+
+        // A filtered-out frequency never activates the sensor.
+        world.vibrations.insert(
+            sensor,
+            RsSculkVibration {
+                event: "explode".into(), // frequency 14 != filter 15
+                distance: 1.0,
+                wool_occluded: false,
+            },
+        );
+        world.advance(20, &mut torches);
+        assert_eq!(
+            prop(&world, sensor, "sculk_sensor_phase").as_deref(),
+            Some("inactive")
+        );
+        world.vibrations.remove(&sensor);
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[sensor]);
+        world.drain_updates(&mut torches);
+        assert_eq!(
+            prop(&world, sensor, "sculk_sensor_phase").as_deref(),
+            Some("inactive")
+        );
+        assert_eq!(prop(&world, loud, "power").as_deref(), Some("0"));
     }
 }

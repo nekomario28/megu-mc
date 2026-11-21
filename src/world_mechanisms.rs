@@ -5011,6 +5011,8 @@ mod p1a_random_tick_and_gamerule_tests {
             effs: Mutex::new(Vec::new()),
             lod_v1_enabled: AtomicBool::new(false),
             underground_revealed: AtomicBool::new(false),
+            sleeping: Mutex::new(None),
+            inv_state_id: AtomicI32::new(0),
         });
         let old_clients = std::mem::take(&mut *clients().lock().unwrap());
         let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());

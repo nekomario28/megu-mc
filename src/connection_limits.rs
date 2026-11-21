@@ -32,6 +32,15 @@ pub(crate) fn set_compression(threshold: i32) -> Vec<u8> {
     payload
 }
 
+/// `MC_SPINE_COMPRESSION_THRESHOLD` resolution: unset means vanilla 1.21.1's
+/// 256-byte threshold, `0` or a negative value disables compression, and a
+/// positive value is the threshold negotiated with the client.
+pub(crate) fn compression_threshold_env(get: impl Fn(&str) -> Option<String>) -> i32 {
+    get("MC_SPINE_COMPRESSION_THRESHOLD")
+        .and_then(|value| value.parse::<i32>().ok())
+        .map_or(256, |value| if value <= 0 { -1 } else { value })
+}
+
 /// Frame a packet (including its packet ID) after compression is enabled.
 pub(crate) fn encode_compressed_frame(raw: &[u8], threshold: usize) -> Vec<u8> {
     use std::io::Write;

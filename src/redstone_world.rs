@@ -146,6 +146,28 @@ fn rs_block_from_state(reg: &BReg, state: u32) -> RsBlock {
                 facing: facing()?,
                 extended: read("extended")?.as_str() == "true",
             }),
+            "minecraft:daylight_detector" => Some(RsBlock::DaylightDetector {
+                inverted: read("inverted")?.as_str() == "true",
+                power: read("power")?.parse().ok()?,
+            }),
+            "minecraft:tripwire_hook" => {
+                let hook = rs_tripwire_hook_state(reg, state)?;
+                Some(RsBlock::TripwireHook {
+                    facing: hook.facing,
+                    attached: hook.attached,
+                    powered: hook.powered,
+                })
+            }
+            "minecraft:sculk_sensor" | "minecraft:calibrated_sculk_sensor" => {
+                let sensor = rs_sculk_sensor_state(reg, state)?;
+                Some(RsBlock::SculkSensor {
+                    calibrated: sensor.calibrated,
+                    facing: facing().unwrap_or(RsDir::North),
+                    phase: sensor.phase,
+                    power: sensor.power,
+                    waterlogged: read("waterlogged")?.as_str() == "true",
+                })
+            }
             "minecraft:dispenser" => Some(RsBlock::Dispenser {
                 facing: facing()?,
                 triggered: read("triggered")?.as_str() == "true",
@@ -278,6 +300,48 @@ fn state_from_rs_block(reg: &BReg, block: &RsBlock) -> Option<u32> {
             prop("facing", facing.property().into());
             "minecraft:dropper"
         }
+        RsBlock::DaylightDetector { inverted, power } => {
+            prop("inverted", inverted.to_string());
+            prop("power", power.to_string());
+            "minecraft:daylight_detector"
+        }
+        RsBlock::TripwireHook {
+            facing,
+            attached,
+            powered,
+        } => {
+            prop("attached", attached.to_string());
+            prop("facing", facing.property().into());
+            prop("powered", powered.to_string());
+            "minecraft:tripwire_hook"
+        }
+        RsBlock::SculkSensor {
+            calibrated,
+            facing,
+            phase,
+            power,
+            waterlogged,
+        } => {
+            if calibrated {
+                prop("facing", facing.property().into());
+            }
+            prop("power", power.to_string());
+            prop(
+                "sculk_sensor_phase",
+                match phase {
+                    RsSculkPhase::Inactive => "inactive",
+                    RsSculkPhase::Active => "active",
+                    RsSculkPhase::Cooldown => "cooldown",
+                }
+                .into(),
+            );
+            prop("waterlogged", waterlogged.to_string());
+            if calibrated {
+                "minecraft:calibrated_sculk_sensor"
+            } else {
+                "minecraft:sculk_sensor"
+            }
+        }
     };
     reg.checked_state(name, &properties)
 }
@@ -302,6 +366,23 @@ trait RedstoneBlockWorld {
 
     /// Return the analog signal of exactly one item frame facing this direction.
     fn item_frame_signal(&self, _pos: RsPos, _facing: RsDir) -> Option<u8> {
+        None
+    }
+
+    /// `(sky_light, day_time, raining, thundering)` observed above a daylight
+    /// detector, or `None` when the host cannot sample the sky; `None` keeps the
+    /// stored `power` property authoritative.
+    fn daylight_env(&self, _pos: RsPos) -> Option<(u8, i64, bool, bool)> {
+        None
+    }
+
+    /// Whether an entity bounding box intersects the tripwire cell at `pos`.
+    fn entity_intersects(&self, _pos: RsPos) -> bool {
+        false
+    }
+
+    /// The vibration a sculk sensor at `pos` would hear, or `None`.
+    fn sculk_vibration(&self, _pos: RsPos) -> Option<RsSculkVibration> {
         None
     }
 
@@ -464,6 +545,35 @@ impl<W: RedstoneBlockWorld> RedstoneWorld for RedstoneWorldAdapter<'_, W> {
     fn item_frame_signal(&self, pos: RsPos, facing: RsDir) -> Option<u8> {
         self.world.item_frame_signal(pos, facing)
     }
+
+    fn daylight_env(&self, pos: RsPos) -> Option<(u8, i64, bool, bool)> {
+        self.world.daylight_env(pos)
+    }
+
+    fn tripwire_line(&self, pos: RsPos, facing: RsDir) -> Option<RsTripwireResult> {
+        let mut cells = Vec::new();
+        let mut cursor = pos;
+        for _ in 0..41 {
+            cursor = cursor.relative(facing);
+            let mut cell = rs_tripwire_cell_from_state(self.reg, self.world.state_at(cursor))?;
+            if let RsTripwireCell::Wire {
+                entity_intersects, ..
+            } = &mut cell
+            {
+                *entity_intersects = self.world.entity_intersects(cursor);
+            }
+            let end = !matches!(cell, RsTripwireCell::Wire { .. });
+            cells.push(cell);
+            if end {
+                break;
+            }
+        }
+        Some(rs_tripwire_line(facing, &cells))
+    }
+
+    fn sculk_vibration(&self, pos: RsPos) -> Option<RsSculkVibration> {
+        self.world.sculk_vibration(pos)
+    }
 }
 
 impl<W: RedstoneBlockWorld> RedstoneUpdates for RedstoneWorldAdapter<'_, W> {
@@ -502,6 +612,22 @@ impl<W: RedstoneBlockWorld> RedstoneUpdates for RedstoneWorldAdapter<'_, W> {
 
     fn dispense(&mut self, pos: RsPos) {
         self.world.dispense_redstone(pos);
+    }
+
+    fn update_tripwire_cell(&mut self, pos: RsPos, wire: RsTripwireWireResult) {
+        let state = self.world.state_at(pos);
+        if self.reg.name_of(state) != "minecraft:tripwire" {
+            return;
+        }
+        let updated = self.reg.with_prop(
+            self.reg
+                .with_prop(state, "attached", &wire.attached.to_string()),
+            "powered",
+            &wire.powered.to_string(),
+        );
+        if updated != state {
+            self.world.apply_redstone_change(pos, updated, None);
+        }
     }
 }
 

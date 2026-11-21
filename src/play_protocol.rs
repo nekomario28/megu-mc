@@ -560,6 +560,21 @@ struct Client {
     // to see real chunks, `false` while they get the surface-occluded lane.
     // Flipped by `update_underground_lane`, which re-sends held chunks.
     underground_revealed: AtomicBool,
+    // `Some` while the player lies in a bed; `sleep_tick` ages it and clears it
+    // on wake, damage or a completed night skip.
+    sleeping: Mutex<Option<Sleeping>>,
+    // Window-0/container stateId counter: every server-initiated full-content
+    // resync bumps it so a stale client echo on 0x0e can be detected.
+    inv_state_id: AtomicI32,
+}
+
+// Per-player bed occupancy: the bed position, game ticks slept so far and the
+// `last_hurt` watermark at sleep entry so damage wakes the player.
+#[derive(Clone, Copy)]
+struct Sleeping {
+    bed: (i32, i32, i32),
+    ticks: u32,
+    last_hurt: f32,
 }
 
 impl Client {
@@ -871,6 +886,235 @@ where
 fn broadcast<F: Fn(&Client) -> (i64, Vec<u8>)>(me_eid: i32, mk: F) {
     broadcast_in(&client_snapshot(), me_eid, mk)
 }
+
+/// The next container stateId for windows tracked by `inv_state_id`, wrapping
+/// like vanilla `AbstractContainerMenu.incrementStateId` (`& 0x7fff`).
+fn inv_state_next(me: &Client) -> i32 {
+    (me.inv_state_id.fetch_add(1, Ordering::Relaxed) + 1) & 0x7fff
+}
+
+/// Whether the stateId the client echoed on `0x0e` no longer matches the
+/// authoritative counter for `wid`. Unknown windows are not validated.
+fn container_state_stale(me: &Client, wid: u8, click_state_id: i32) -> bool {
+    let expected = match wid {
+        0 | 2 | 3 => me.inv_state_id.load(Ordering::Relaxed),
+        1 => me
+            .chest_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |sync| sync.state_id),
+        _ => return false,
+    };
+    click_state_id != expected
+}
+
+/// Full `0x13` SetContainerContent resync after a stale stateId click: the
+/// authoritative counter advances and every slot is resent, so the client and
+/// server re-agree instead of drifting apart.
+fn resend_container_content(me: &Client, wid: u8) {
+    let inv = me.inv.lock().unwrap().clone();
+    let cursor = me.cursor.lock().unwrap().clone();
+    let empty = Stack::default();
+    let mut q = vec![wid];
+    match wid {
+        0 => {
+            write_varint(&mut q, i64::from(inv_state_next(me)));
+            write_varint(&mut q, 46);
+            for slot in 0..46i16 {
+                q.extend_from_slice(&slot_wire(inv.get(&slot).unwrap_or(&empty)));
+            }
+        }
+        1 => {
+            let Some(window) = *me.open_chest.lock().unwrap() else {
+                return;
+            };
+            let slots = chest_window_slots(window);
+            let state_id = {
+                let mut sync = me.chest_sync.lock().unwrap();
+                let sync = sync.get_or_insert_with(|| ChestSyncState {
+                    window,
+                    anchor: None,
+                    state_id: 0,
+                    last_slots: slots.clone(),
+                });
+                sync.state_id = (sync.state_id + 1) & 0x7fff;
+                sync.last_slots = slots.clone();
+                sync.state_id
+            };
+            write_varint(&mut q, i64::from(state_id));
+            write_varint(&mut q, (slots.len() + 36) as i64);
+            for stack in &slots {
+                q.extend_from_slice(&slot_wire(stack));
+            }
+            for slot in 9..45i16 {
+                q.extend_from_slice(&slot_wire(inv.get(&slot).unwrap_or(&empty)));
+            }
+        }
+        2 => {
+            let Some((dim, x, y, z)) = *me.open_furnace.lock().unwrap() else {
+                return;
+            };
+            write_varint(&mut q, i64::from(inv_state_next(me)));
+            write_varint(&mut q, 39);
+            for stack in furnace_slot_snapshot_dim(dim, (x, y, z)) {
+                q.extend_from_slice(&slot_wire(&stack));
+            }
+            for slot in 3..39i16 {
+                q.extend_from_slice(&slot_wire(inv.get(&(slot + 6)).unwrap_or(&empty)));
+            }
+        }
+        3 => {
+            let craft9 = me.craft9.lock().unwrap().clone();
+            write_varint(&mut q, i64::from(inv_state_next(me)));
+            write_varint(&mut q, 46);
+            let result = json_craft_match(&craft9, 3).unwrap_or_default();
+            q.extend_from_slice(&slot_wire(&result));
+            for slot in 1..=9i16 {
+                q.extend_from_slice(&slot_wire(craft9.get(&slot).unwrap_or(&empty)));
+            }
+            for slot in 10..46i16 {
+                q.extend_from_slice(&slot_wire(inv.get(&(slot - 1)).unwrap_or(&empty)));
+            }
+        }
+        _ => return,
+    }
+    q.extend_from_slice(&slot_wire(&cursor));
+    if let Ok(mut w) = me.sock.lock() {
+        let _ = send_packet(&mut w, 0x13, q);
+    }
+}
+
+/// Entity metadata for pose 6 (`SLEEPING`) + LivingEntity's optional sleeping
+/// bed position at index 14. Vanilla broadcasts the full entity data on pose
+/// changes; for parity of the sleep animation these two entries suffice.
+fn sleep_meta_pkt(eid: i32, sleeping: bool, bed: (i32, i32, i32)) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, i64::from(eid));
+    p.push(6);
+    p.push(21); // POSE
+    write_varint(&mut p, if sleeping { 2 } else { 0 });
+    p.push(14); // SLEEPING_POS_ID
+    p.push(27); // OPTIONAL_POSITION
+    p.push(u8::from(sleeping));
+    if sleeping {
+        write_pos(&mut p, bed.0, bed.1, bed.2);
+    }
+    p.push(0xff);
+    p
+}
+
+fn broadcast_sleep_pose(me: &Client, sleeping: bool, bed: (i32, i32, i32)) {
+    let pkt = sleep_meta_pkt(me.eid, sleeping, bed);
+    broadcast_seen(me.eid, |_c| (0x58, pkt.clone()));
+}
+
+/// Wake the player if they are in a bed: clear the state and restore the pose
+/// for observers. Returns true when the player was sleeping.
+fn wake_if_sleeping(me: &Client) -> bool {
+    if let Some(state) = me.sleeping.lock().unwrap().take() {
+        broadcast_sleep_pose(me, false, state.bed);
+        true
+    } else {
+        false
+    }
+}
+
+/// Vanilla `ServerLevel.wakeUpAllPlayers` + `advanceWeatherCycle` on the night
+/// skip: jump to the next morning, clear rain/thunder and wake every sleeper.
+fn skip_night() {
+    let day = WORLD_TIME.load(Ordering::Relaxed).div_euclid(24000);
+    let morning = (day + 1) * 24000;
+    WORLD_TIME.store(morning, Ordering::Relaxed);
+    // `RAINING`/`THUNDERING` count the remaining ticks of weather.
+    RAINING.store(0, Ordering::Relaxed);
+    THUNDERING.store(0, Ordering::Relaxed);
+    let sleepers: Vec<Arc<Client>> = client_snapshot()
+        .into_iter()
+        .filter(|c| c.sleeping.lock().unwrap().is_some())
+        .collect();
+    let mut tm = Vec::new();
+    tm.extend_from_slice(&0i64.to_be_bytes());
+    tm.extend_from_slice(&morning.to_be_bytes());
+    let mut rain = vec![2u8]; // END_RAINING
+    rain.extend_from_slice(&0f32.to_be_bytes());
+    for sleeper in sleepers {
+        let bed = sleeper.sleeping.lock().unwrap().take().map_or((0, 0, 0), |s| s.bed);
+        broadcast_sleep_pose(&sleeper, false, bed);
+        if let Ok(mut w) = sleeper.sock.lock() {
+            let _ = send_packet(&mut w, 0x64, tm.clone());
+            let _ = send_packet(&mut w, 0x22, rain.clone());
+        }
+        let line = system_chat(&format!("{} slept through the night", sleeper.name));
+        broadcast(-1, |_c| (0x6c, line.clone()));
+    }
+}
+
+/// One server tick of sleep bookkeeping: wake on fresh damage, age every
+/// sleeper, then run vanilla's
+/// `sleepingPlayers * 100 >= playersSleepingPercentage * allPlayers` gate once
+/// at least one player has slept for 100 ticks.
+fn sleep_tick() {
+    let clients = client_snapshot();
+    let mut any_ready = false;
+    for c in &clients {
+        let mut sl = c.sleeping.lock().unwrap();
+        let Some(mut state) = *sl else {
+            continue;
+        };
+        let last_hurt = *c.last_hurt.lock().unwrap();
+        if last_hurt > state.last_hurt {
+            let bed = state.bed;
+            *sl = None;
+            drop(sl);
+            broadcast_sleep_pose(c, false, bed);
+            continue;
+        }
+        state.ticks = state.ticks.saturating_add(1);
+        if state.ticks >= 100 {
+            any_ready = true;
+        }
+        *sl = Some(state);
+    }
+    if !any_ready {
+        return;
+    }
+    // Vanilla counts everyone in the Overworld (awake or asleep) in the
+    // denominator; `playersSleepingPercentage` > 100 can never be met.
+    let (sleeping, all) = clients
+        .iter()
+        .filter(|c| *c.dim.lock().unwrap() == DimId::Overworld)
+        .fold((0i64, 0i64), |(s, a), c| {
+            (s + i64::from(c.sleeping.lock().unwrap().is_some()), a + 1)
+        });
+    if all == 0 {
+        return;
+    }
+    let percentage = command_gamerules()
+        .lock()
+        .unwrap()
+        .get("playersSleepingPercentage")
+        .copied()
+        .unwrap_or(100);
+    // `0` means a single sleeper can skip the night once they are done lying
+    // down; `> 100` disables sleep-skipping entirely.
+    if sleeping > 0 && sleeping * 100 >= i64::from(percentage) * all {
+        skip_night();
+    }
+}
+
+/// Bed use at night: vanilla `startSleepInBed` — mark the player sleeping
+/// (respawn was already set by the caller) and broadcast the pose change so
+/// observers see the lying-down animation. Actual time travel happens in
+/// `sleep_tick` after 100 slept ticks.
+fn enter_bed(me: &Client, x: i32, y: i32, z: i32) {
+    *me.sleeping.lock().unwrap() = Some(Sleeping {
+        bed: (x, y, z),
+        ticks: 0,
+        last_hurt: *me.last_hurt.lock().unwrap(),
+    });
+    broadcast_sleep_pose(me, true, (x, y, z));
+}
 fn broadcast_in<F: Fn(&Client) -> (i64, Vec<u8>)>(audience: &[Arc<Client>], me_eid: i32, mk: F) {
     fanout_in(audience, |c| c.eid != me_eid, mk)
 }
@@ -907,6 +1151,7 @@ fn interest_tick() {
     if cls.is_empty() {
         return;
     }
+    sleep_tick();
     // Build spawn payloads only when an observer starts tracking the entity.
     let mut ents = Vec::new();
     let mut queue = |dim, etype, job| {
@@ -2204,6 +2449,18 @@ fn player_attack_damage_wire_id(config: &[(i64, Vec<u8>)]) -> Option<i32> {
 }
 
 const SERVER_VIEW_DISTANCE: i32 = 8;
+const SERVER_SIMULATION_DISTANCE: i32 = SERVER_VIEW_DISTANCE;
+
+/// S2C `0x55` SetChunkCacheRadius + `0x62` SetSimulationDistance: sent right
+/// after Join Game and whenever the client's effective view distance changes.
+fn send_view_distance(s: &mut TcpStream, view: i32) {
+    let mut p = Vec::new();
+    write_varint(&mut p, i64::from(view));
+    let _ = send_packet(s, 0x55, p);
+    let mut p = Vec::new();
+    write_varint(&mut p, i64::from(SERVER_SIMULATION_DISTANCE));
+    let _ = send_packet(s, 0x62, p);
+}
 
 /// Decode protocol 767 Client Information; view distance is a signed Byte.
 /// The connection bounds the requested value, not the packet decoder.
@@ -3939,11 +4196,19 @@ fn handle(mut s: TcpStream) {
             return;
         }
     };
-    // Keep the existing uncompressed default. Zero compresses every packet.
-    let threshold = std::env::var("MC_SPINE_COMPRESSION_THRESHOLD")
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .unwrap_or(-1);
+    // Vanilla 1.21.1 compresses at 256 bytes by default; an explicit `-1`/`0`
+    // in the env keeps framing uncompressed. In-process live-TCP fixtures
+    // drive `handle` with a raw uncompressed client, so the test build keeps
+    // the old disabled default unless the env names a threshold.
+    let threshold =
+        connection_limits::compression_threshold_env(|name| std::env::var(name).ok());
+    let threshold = if cfg!(test)
+        && std::env::var_os("MC_SPINE_COMPRESSION_THRESHOLD").is_none()
+    {
+        -1
+    } else {
+        threshold
+    };
     let Ok(_compression_registration) = negotiate_compression(&mut s, threshold) else {
         return;
     };
@@ -4048,6 +4313,7 @@ fn handle(mut s: TcpStream) {
     if send_packet(&mut s, 0x2b, join_game(saved_dim, initial_gm, player_eid)).is_err() {
         return;
     }
+    send_view_distance(&mut s, client_view.clamp(2, SERVER_VIEW_DISTANCE));
     let login_admin = player_is_admin(&name);
     if send_commands(&mut s, login_admin).is_err() {
         return;
@@ -4208,6 +4474,8 @@ fn handle(mut s: TcpStream) {
         })),
         lod_v1_enabled: AtomicBool::new(false),
         underground_revealed: AtomicBool::new(!initial_occluded),
+        sleeping: Mutex::new(None),
+        inv_state_id: AtomicI32::new(0),
     });
     let mut retry_chunks = chunk_delivery.has_pending();
     me.enter_play_wire(compression, chunk_delivery);
@@ -4434,6 +4702,7 @@ fn handle(mut s: TcpStream) {
                 if effective != view {
                     view = effective;
                     *me.view.lock().unwrap() = view;
+                    send_view_distance(&mut me.sock.lock().unwrap(), view);
                     connection_limits::set_chunk_feedback_window(
                         &mut me.chunk_ack.lock().unwrap(),
                         window_batch(view),
@@ -4453,6 +4722,8 @@ fn handle(mut s: TcpStream) {
                     if !me.teleport.lock().unwrap().movement_allowed() {
                         continue;
                     }
+                    // Vanilla wakes a sleeping player when they move.
+                    wake_if_sleeping(&me);
                     // Anti-cheat runs before any lock is taken: it reads attributes, effects
                     // and blocks around the player, and may pull the player back.
                     let before = *me.pos.lock().unwrap();
@@ -4560,6 +4831,9 @@ fn handle(mut s: TcpStream) {
                     match act {
                         0 => *me.sneaking.lock().unwrap() = true,
                         1 => *me.sneaking.lock().unwrap() = false,
+                        2 => {
+                            wake_if_sleeping(&me);
+                        }
                         3 => *me.sprinting.lock().unwrap() = true,
                         4 => *me.sprinting.lock().unwrap() = false,
                         _ => {}
@@ -5346,8 +5620,16 @@ fn handle(mut s: TcpStream) {
                     name.starts_with("minecraft:") && name.ends_with("_bed")
                 }) {
                     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
-                    if dim == DimId::Overworld && (13000..=23500).contains(&wt) {
-                        WORLD_TIME.store(0, Ordering::Relaxed);
+                    // Vanilla sleeps at night or during a thunderstorm, and
+                    // only in dimensions whose spec allows beds to work.
+                    let sleep_ok = (13000..=23500).contains(&wt)
+                        || THUNDERING.load(Ordering::Relaxed) > 0;
+                    // Vanilla dims hardcode this (Overworld yes, Nether/End
+                    // explode); custom dims read it from their spec.
+                    let bed_works = dim == DimId::Overworld
+                        || crate::worldgen::dimension_spec(dim)
+                            .is_some_and(|spec| spec.bed_works);
+                    if bed_works && sleep_ok {
                         let angle = me.pos.lock().unwrap().3;
                         let position = (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5);
                         {
@@ -5370,8 +5652,11 @@ fn handle(mut s: TcpStream) {
                         write_pos(&mut sp, x, y, z);
                         sp.extend_from_slice(&angle.to_be_bytes());
                         let _ = send_packet(&mut me.sock.lock().unwrap(), 0x56, sp);
-                        let line = system_chat(&format!("{} slept through the night", me.name));
-                        broadcast(-1, |_c| (0x6c, line.clone()));
+                        // Vanilla `startSleepInBed`: the player lies down and
+                        // `sleep_tick` skips the night once enough Overworld
+                        // players have slept 100 ticks
+                        // (playersSleepingPercentage).
+                        enter_bed(&me, x, y, z);
                     }
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
@@ -6701,9 +6986,9 @@ fn handle(mut s: TcpStream) {
                     let mut sl = &b[..];
                     let wid = sl[0];
                     sl = &sl[1..];
-                    if read_protocol_i32(&mut sl).is_none() {
+                    let Some(click_state_id) = read_protocol_i32(&mut sl) else {
                         continue;
-                    }
+                    };
                     if sl.len() >= 4 {
                         let slot = i16::from_be_bytes(sl[..2].try_into().unwrap());
                         let btn = sl[2];
@@ -6714,6 +6999,21 @@ fn handle(mut s: TcpStream) {
                         let click_tail = sl;
                         if let Some(active) = live_menu_id(&me) {
                             if wid == active {
+                                // Vanilla never rejects on a stale stateId: it
+                                // pushes the authoritative contents first, then
+                                // processes the click anyway.
+                                let _ = live_menu_connection(&me).is_some_and(|conn| {
+                                    let mut session = conn.active.lock().unwrap();
+                                    match session.as_mut() {
+                                        Some(s)
+                                            if s.id == wid && s.state_id != click_state_id =>
+                                        {
+                                            sync_live_menu(&me, s, false);
+                                            true
+                                        }
+                                        _ => false,
+                                    }
+                                });
                                 with_save_guard(|| live_menu_click(&me, wid, slot, btn as i8, mode));
                             }
                             continue;
@@ -6729,6 +7029,12 @@ fn handle(mut s: TcpStream) {
                         };
                         if wid != active {
                             continue;
+                        }
+                        // Vanilla never rejects on a stale stateId: push the
+                        // authoritative SetContainerContent snapshot with a
+                        // fresh id, then process the click anyway.
+                        if container_state_stale(&me, wid, click_state_id) {
+                            resend_container_content(&me, wid);
                         }
                         let creative = *me.gm.lock().unwrap() == 1;
                         if wid == 0 && (5..=8).contains(&slot) && matches!(mode, 0 | 1 | 4) {
@@ -7978,6 +8284,7 @@ fn handle(mut s: TcpStream) {
         let mut cls = clients().lock().unwrap();
         cls.retain(|c| c.eid != me_cleanup.eid);
         drop(cls);
+        *me_cleanup.sleeping.lock().unwrap() = None;
         player_mechanism_sessions().lock().unwrap().remove(&me_cleanup.eid);
         death_drop_marks().lock().unwrap().remove(&me_cleanup.eid);
         beacon_menu_anchors().lock().unwrap().remove(&me_cleanup.eid);
@@ -8571,4 +8878,125 @@ mod connection_limits_wire_tests {
         let f5 = cached_chunk_frame(None, &mut gen, dim, cx, cz, false);
         assert_eq!(f1, f5, "restoring the cell restores the bytes");
     }
+}
+
+#[cfg(test)]
+mod sleep_protocol_parity_tests {
+    use super::*;
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(2)
+    }
+
+    #[test]
+    fn bed_sleep_respects_100_ticks_and_players_sleeping_percentage() {
+        let _serial = SLEEP_TEST_LOCK.lock().unwrap();
+        let old_clients = std::mem::take(&mut *clients().lock().unwrap());
+        let old_world_time = WORLD_TIME.load(Ordering::Relaxed);
+        let old_percentage = command_gamerules()
+            .lock()
+            .unwrap()
+            .get("playersSleepingPercentage")
+            .copied();
+        let (client, _peer) = effect_tests::client_pair();
+        let client = Arc::new(client);
+        clients().lock().unwrap().push(client.clone());
+
+        WORLD_TIME.store(13000, Ordering::Relaxed);
+        enter_bed(&client, 0, 64, 0);
+        assert!(client.sleeping.lock().unwrap().is_some());
+        // Entering a bed does not skip the night immediately.
+        assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 13000);
+        for _ in 0..99 {
+            sleep_tick();
+        }
+        assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 13000);
+        assert!(client.sleeping.lock().unwrap().is_some());
+        sleep_tick();
+        assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 24000);
+        assert!(client.sleeping.lock().unwrap().is_none());
+
+        // playersSleepingPercentage > 100 can never be met.
+        WORLD_TIME.store(13000, Ordering::Relaxed);
+        command_gamerules()
+            .lock()
+            .unwrap()
+            .insert("playersSleepingPercentage", 110);
+        enter_bed(&client, 0, 64, 0);
+        for _ in 0..150 {
+            sleep_tick();
+        }
+        assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 13000);
+        wake_if_sleeping(&client);
+
+        // Waking before the 100th tick keeps the night going.
+        match old_percentage {
+            Some(v) => {
+                command_gamerules()
+                    .lock()
+                    .unwrap()
+                    .insert("playersSleepingPercentage", v);
+            }
+            None => {
+                command_gamerules()
+                    .lock()
+                    .unwrap()
+                    .remove("playersSleepingPercentage");
+            }
+        }
+        enter_bed(&client, 0, 64, 0);
+        for _ in 0..50 {
+            sleep_tick();
+        }
+        assert!(wake_if_sleeping(&client));
+        for _ in 0..100 {
+            sleep_tick();
+        }
+        assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 13000);
+
+        *clients().lock().unwrap() = old_clients;
+        WORLD_TIME.store(old_world_time, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn protocol_sends_view_and_sim_distance_and_validates_container_state_id() {
+        let _serial = SLEEP_TEST_LOCK.lock().unwrap();
+        // Vanilla 1.21.1 default: 256; `0`/negative disables; positive is the
+        // negotiated threshold.
+        assert_eq!(connection_limits::compression_threshold_env(|_| None), 256);
+        for (raw, want) in [("-1", -1), ("0", -1), ("64", 64), ("junk", 256)] {
+            let value = connection_limits::compression_threshold_env(|name| {
+                (name == "MC_SPINE_COMPRESSION_THRESHOLD").then(|| raw.to_string())
+            });
+            assert_eq!(value, want, "threshold for {raw:?}");
+        }
+
+        let (client, mut peer) = effect_tests::client_pair();
+        client.enter_play_wire(None, Default::default());
+        send_view_distance(&mut client.sock.lock().unwrap(), SERVER_VIEW_DISTANCE);
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x55, vec![SERVER_VIEW_DISTANCE as u8]))
+        );
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x62, vec![SERVER_SIMULATION_DISTANCE as u8]))
+        );
+
+        // A matching stateId is accepted; a stale one triggers a full 0x13
+        // resync with a freshly incremented counter.
+        assert!(!container_state_stale(&client, 0, 0));
+        assert!(container_state_stale(&client, 0, 7));
+        resend_container_content(&client, 0);
+        assert_eq!(client.inv_state_id.load(Ordering::Relaxed), 1);
+        let (id, body) = read_packet(&mut peer, deadline()).expect("resync packet");
+        assert_eq!(id, 0x13);
+        assert_eq!(body[0], 0, "window id");
+        let mut sl = &body[1..];
+        assert_eq!(read_varint(&mut sl), Some(1), "incremented stateId");
+        assert_eq!(read_varint(&mut sl), Some(46), "slot count");
+        assert!(!container_state_stale(&client, 0, 1));
+    }
+
+    static SLEEP_TEST_LOCK: Mutex<()> = Mutex::new(());
 }

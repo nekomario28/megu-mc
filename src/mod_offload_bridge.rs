@@ -815,6 +815,8 @@ mod mod_offload_bridge_tests {
             absorb: Mutex::new(0.0),
             lod_v1_enabled: AtomicBool::new(false),
             underground_revealed: AtomicBool::new(false),
+            sleeping: Mutex::new(None),
+            inv_state_id: AtomicI32::new(0),
             pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
             xp: Mutex::new(0),
             skin: Mutex::new(None),

@@ -514,6 +514,8 @@ mod entity_push_tests {
             effs: Mutex::new(Vec::new()),
             lod_v1_enabled: AtomicBool::new(false),
             underground_revealed: AtomicBool::new(false),
+            sleeping: Mutex::new(None),
+            inv_state_id: AtomicI32::new(0),
         });
         (client, peer)
     }

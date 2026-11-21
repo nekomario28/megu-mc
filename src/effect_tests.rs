@@ -153,6 +153,8 @@ pub(super) fn client_pair() -> (Client, TcpStream) {
         effs: Mutex::new(Vec::new()),
         lod_v1_enabled: AtomicBool::new(false),
         underground_revealed: AtomicBool::new(false),
+        sleeping: Mutex::new(None),
+        inv_state_id: AtomicI32::new(0),
     };
     (client, receiver)
 }
