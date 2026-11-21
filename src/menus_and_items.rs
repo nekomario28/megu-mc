@@ -1414,6 +1414,24 @@ fn drop_tick() {
             let mut source = (d.item, d.cnt, d.comps.clone());
             let original = source.1;
             let before = inv.clone();
+            // QOL-DEATH (opt-in): a drop recorded as this player's own death
+            // item first tries to return to the slot it was scattered from.
+            // The flag is checked inside `death_slot_hint_for`; a disabled
+            // feature or a foreign owner falls through to the vanilla add.
+            let mut restored = false;
+            if let Some(original_slot) = death_slot_hint_for(deid, &c.name) {
+                let picked_cnt = source.1;
+                source = match insert_with_death_slot_restore(&mut inv, source, original_slot) {
+                    None => {
+                        restored = true;
+                        (0, 0, Vec::new())
+                    }
+                    Some(rem) => {
+                        restored = rem.1 != picked_cnt;
+                        rem
+                    }
+                };
+            }
             let accepted = pickup_into_inventory(&mut inv, selected, creative, &mut source);
             if source.1 == original {
                 continue;
@@ -1422,15 +1440,19 @@ fn drop_tick() {
             let remaining = (d.cnt > 0).then(|| drop_meta_pkt(d));
             if d.cnt == 0 {
                 ds.retain(|d| d.eid != deid);
+                death_slot_hint_forget(deid);
             }
-            let changed: Vec<_> = (9..=45)
+            let changed: Vec<_> = (5..=45)
                 .filter_map(|slot| {
                     inv.get(&slot)
                         .filter(|st| before.get(&slot) != Some(st))
                         .map(|st| (slot, st.clone()))
                 })
                 .collect();
-            (accepted, original, changed, remaining)
+            if changed.iter().any(|(slot, _)| (5..=8).contains(slot)) {
+                *c.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
+            }
+            (accepted || restored, original, changed, remaining)
         };
         for (slot, st) in changed {
             let mut p = vec![0u8];
@@ -1465,10 +1487,12 @@ fn drop_tick() {
         let exp: Vec<i32> = dp.iter().filter(|d| d.age >= life).map(|d| d.eid).collect();
         for eid in &exp {
             dp.retain(|d| d.eid != *eid);
+            death_slot_hint_forget(*eid);
             broadcast_seen_destroy(*eid);
         }
         while dp.len() > DROP_CAP {
             let d = dp.remove(0);
+            death_slot_hint_forget(d.eid);
             broadcast_seen_destroy(d.eid);
         }
         if let Some(t) = __t {
@@ -1479,6 +1503,7 @@ fn drop_tick() {
         __t = __prof.then(std::time::Instant::now);
         for eid in &merged {
             dp.retain(|d| d.eid != *eid);
+            death_slot_hint_forget(*eid);
             broadcast_seen_destroy(*eid);
         }
         if let Some(t) = __t {
@@ -8452,6 +8477,182 @@ fn move_to_slots(
     }
     source
 }
+// ---------- QOL-DEATH: opt-in death-drop original-slot restore ----------
+// Strictly opt-in: `drop_tick` only consults the hint table while this flag is
+// set, so a server that never opts in runs the vanilla `pickup_into_inventory`
+// path unchanged. The flag lives here until the lane owning the death path
+// exposes a toggle; the setter exists for that wiring and for tests.
+static DEATH_SLOT_RESTORE: AtomicBool = AtomicBool::new(false);
+fn death_slot_restore_enabled() -> bool {
+    DEATH_SLOT_RESTORE.load(Ordering::Relaxed)
+}
+#[cfg_attr(not(test), allow(dead_code))]
+fn set_death_slot_restore(enabled: bool) {
+    DEATH_SLOT_RESTORE.store(enabled, Ordering::Relaxed);
+}
+
+/// Where a death-scattered stack last lived: a hotbar/main storage slot
+/// (9..=44), an armor slot (5..=8) or the offhand (45). Keyed by the drop
+/// entity's eid — the `drop_id` the pickup path sees — and honoured only for
+/// the named owner.
+struct DeathSlotHint {
+    owner_name: String,
+    original_slot: i16,
+}
+/// Hard bound on live hints so a death-drop flood cannot grow this table
+/// without end; the oldest recorded slot loses its hint first.
+const MAX_DEATH_SLOT_HINTS: usize = 4096;
+struct DeathSlotHintTable {
+    map: HashMap<i32, DeathSlotHint>,
+    order: std::collections::VecDeque<i32>,
+}
+static DEATH_SLOT_HINTS: OnceLock<Mutex<DeathSlotHintTable>> = OnceLock::new();
+fn death_slot_hints() -> &'static Mutex<DeathSlotHintTable> {
+    DEATH_SLOT_HINTS.get_or_init(|| {
+        Mutex::new(DeathSlotHintTable {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    })
+}
+/// Record that `drop_eid` was scattered from `original_slot` of `owner_name`'s
+/// inventory. Leaf lock: never held while another lock is taken.
+#[cfg_attr(not(test), allow(dead_code))]
+fn death_slot_hint_record(drop_eid: i32, owner_name: &str, original_slot: i16) {
+    let mut hints = death_slot_hints().lock().unwrap_or_else(|e| e.into_inner());
+    if !hints.map.contains_key(&drop_eid) {
+        hints.order.push_back(drop_eid);
+    }
+    hints.map.insert(
+        drop_eid,
+        DeathSlotHint {
+            owner_name: owner_name.to_owned(),
+            original_slot,
+        },
+    );
+    while hints.order.len() > MAX_DEATH_SLOT_HINTS {
+        if let Some(old) = hints.order.pop_front() {
+            hints.map.remove(&old);
+        }
+    }
+}
+/// Drop a hint whose entity is gone (picked dry, despawned, merged or evicted)
+/// so the table cannot hand a dead entity's slot to a later drop.
+fn death_slot_hint_forget(drop_eid: i32) {
+    let mut hints = death_slot_hints().lock().unwrap_or_else(|e| e.into_inner());
+    if hints.map.remove(&drop_eid).is_some() {
+        hints.order.retain(|eid| *eid != drop_eid);
+    }
+}
+/// The slot a pickup may restore to: `None` while the feature is off, when no
+/// hint exists for this drop, or when the drop is not the picker's own death
+/// item (a foreign player always gets the normal pickup).
+fn death_slot_hint_for(drop_eid: i32, picker_name: &str) -> Option<i16> {
+    if !death_slot_restore_enabled() {
+        return None;
+    }
+    death_slot_hints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .get(&drop_eid)
+        .filter(|hint| hint.owner_name == picker_name)
+        .map(|hint| hint.original_slot)
+}
+/// `original_slot` is restorable for `st` when it names a storage slot, the
+/// offhand, or the armor slot `st`'s piece equips into. A crafting-grid index,
+/// an out-of-range index or the wrong armor slot is not a legal target, so the
+/// insert falls back to the normal pickup.
+fn death_restore_slot_accepts(original_slot: i16, st: &Stack) -> bool {
+    match original_slot {
+        5..=8 => armor_slot_for(st.0) == original_slot,
+        9..=45 => true,
+        _ => false,
+    }
+}
+/// Collision-safe original-slot restore for a death-scattered stack.
+///
+/// Conservation contract: the item multiset of `inv` plus the returned
+/// remainder equals `inv` plus `picked` on entry — under every collision no
+/// item is overwritten, voided or duplicated.
+///
+/// - Case A (slot empty): `picked` goes straight into `original_slot`.
+/// - Case B (slot holds the same stack): merge to the slot's stack limit, then
+///   the remainder inserts like any picked-up stack.
+/// - Case C (slot holds a different item): the collider relocates to a free
+///   hotbar/main slot — never into an armor slot — and `picked` takes the
+///   slot back. With no free slot nothing is moved: `picked` merges elsewhere
+///   or comes back to the ground whole.
+/// - Case D (slot not restorable for this item): normal inventory insert.
+fn insert_with_death_slot_restore(
+    inv: &mut HashMap<i16, Stack>,
+    picked: Stack,
+    original_slot: i16,
+) -> Option<Stack> {
+    if picked.0 == 0 || picked.1 == 0 {
+        return None;
+    }
+    let mut picked = picked;
+    if !death_restore_slot_accepts(original_slot, &picked) {
+        pickup_into_inventory(inv, 0, false, &mut picked);
+        return (picked.1 > 0).then_some(picked);
+    }
+    match inv.get(&original_slot).filter(|st| st.1 > 0).cloned() {
+        None => {
+            inv.insert(original_slot, picked);
+            None
+        }
+        Some(existing) if existing.0 == picked.0 && existing.2 == picked.2 => {
+            let amount = picked.1;
+            insert_into_slot(inv, original_slot, &mut picked, amount);
+            if picked.1 > 0 {
+                pickup_into_inventory(inv, 0, false, &mut picked);
+            }
+            (picked.1 > 0).then_some(picked)
+        }
+        Some(existing) => {
+            if let Some(free) = pickup_inventory_order()
+                .find(|slot| inv.get(slot).is_none_or(|st| st.1 == 0))
+            {
+                inv.insert(free, existing);
+                inv.insert(original_slot, picked);
+                None
+            } else {
+                pickup_into_inventory(inv, 0, false, &mut picked);
+                (picked.1 > 0).then_some(picked)
+            }
+        }
+    }
+}
+/// Spawn a drop that carries a death-slot hint: a real item entity whose
+/// pickup may restore it to `original_slot` for `owner_name` while the opt-in
+/// is set. Returns the drop id, or -1 for an empty stack.
+#[cfg_attr(not(test), allow(dead_code))]
+fn spawn_death_drop(
+    (x, y, z): (f64, f64, f64),
+    stack: Stack,
+    owner_name: &str,
+    original_slot: i16,
+) -> i32 {
+    if stack.1 == 0 {
+        return -1;
+    }
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
+        eid,
+        x,
+        y,
+        z,
+        item: stack.0,
+        cnt: stack.1,
+        comps: stack.2,
+        age: -(server_ticks(30) as i32),
+        target: None,
+        thrower: None,
+    });
+    death_slot_hint_record(eid, owner_name, original_slot);
+    eid
+}
 // The single/double chest menu shares one transfer owner; storage remains per container.
 fn quick_move_chest(
     all: &mut HashMap<ContainerKey, HashMap<i16, Stack>>,
@@ -12826,5 +13027,480 @@ mod w2_live_wire_tests {
         // Cleanup: absent positions read nothing.
         remove_world_block_entity(DimId::Overworld, pos);
         assert_eq!(live_comparator_signal_at(DimId::Overworld, x, y, z), None);
+    }
+}
+
+#[cfg(test)]
+mod qol_death_restore_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    fn item(name: &str) -> i64 {
+        name_to_item(name).unwrap()
+    }
+    fn stack(item: i64, cnt: u8) -> Stack {
+        (item, cnt, Vec::new())
+    }
+    /// The multiset the conservation proof quantifies over: `inv` slots plus
+    /// whatever is left on the ground, keyed by item id AND components so a
+    /// component-silent overwrite counts as loss.
+    fn multiset(inv: &HashMap<i16, Stack>, ground: &[Stack]) -> HashMap<(i64, Comps), u64> {
+        let mut m: HashMap<(i64, Comps), u64> = HashMap::new();
+        for st in inv.values().chain(ground.iter()) {
+            if st.0 != 0 && st.1 > 0 {
+                *m.entry((st.0, st.2.clone())).or_default() += u64::from(st.1);
+            }
+        }
+        m
+    }
+    /// multiset(inv_before) + multiset(picked) == multiset(inv_after) + multiset(remaining).
+    fn assert_conserved(
+        before: &HashMap<i16, Stack>,
+        picked: &Stack,
+        after: &HashMap<i16, Stack>,
+        remaining: Option<&Stack>,
+    ) {
+        let lhs = multiset(before, std::slice::from_ref(picked));
+        let rhs = multiset(after, remaining.map_or(&[][..], std::slice::from_ref));
+        assert_eq!(lhs, rhs, "item multiset not conserved: {before:?} + {picked:?} -> {after:?} + {remaining:?}");
+    }
+    /// Run the restore and assert the conservation invariant on this call.
+    fn run_restore(inv: &mut HashMap<i16, Stack>, picked: Stack, slot: i16) -> Option<Stack> {
+        let before = inv.clone();
+        let rem = insert_with_death_slot_restore(inv, picked.clone(), slot);
+        assert_conserved(&before, &picked, inv, rem.as_ref());
+        rem
+    }
+    /// Save/restore for the shared fixtures the live `drop_tick` reads.
+    struct DeathDropWorld {
+        clients: Vec<Arc<Client>>,
+        drops: Vec<Drop>,
+        hints: DeathSlotHintTable,
+        region: RegionSets,
+    }
+    impl DeathDropWorld {
+        fn take() -> Self {
+            Self {
+                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+                hints: std::mem::replace(
+                    &mut *death_slot_hints().lock().unwrap_or_else(|e| e.into_inner()),
+                    DeathSlotHintTable {
+                        map: HashMap::new(),
+                        order: std::collections::VecDeque::new(),
+                    },
+                ),
+                region: test_region(),
+            }
+        }
+    }
+    impl std::ops::Drop for DeathDropWorld {
+        fn drop(&mut self) {
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
+            *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
+            *death_slot_hints().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::replace(
+                    &mut self.hints,
+                    DeathSlotHintTable {
+                        map: HashMap::new(),
+                        order: std::collections::VecDeque::new(),
+                    },
+                );
+            set_test_region(self.region.0.clone(), self.region.1.clone());
+            DEATH_SLOT_RESTORE.store(false, Ordering::Relaxed);
+        }
+    }
+    /// A live client standing on a drop at the origin of a hot region.
+    fn live_client(name: &str) -> Arc<Client> {
+        let (mut client, _receiver) = client_pair();
+        client.name = name.to_owned();
+        let client = Arc::new(client);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(client.clone());
+        client
+    }
+    fn push_death_drop(eid: i32, item: i64, cnt: u8, owner: &str, slot: i16) {
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
+            eid,
+            x: 0.0,
+            y: 70.0,
+            z: 0.0,
+            item,
+            cnt,
+            comps: vec![],
+            age: 100,
+            target: None,
+            thrower: None,
+        });
+        death_slot_hint_record(eid, owner, slot);
+    }
+
+    /// Case A over a whole kit: every stack lands back in the exact slot it
+    /// was scattered from — hotbar, the four armor slots, the offhand and the
+    /// main grid — with nothing left on the ground.
+    #[test]
+    fn qol_death_restore_empty_inventory_returns_full_kit_to_original_slots() {
+        let sword = item("diamond_sword");
+        let pickaxe = item("diamond_pickaxe");
+        let helmet = item("diamond_helmet");
+        let chestplate = item("diamond_chestplate");
+        let leggings = item("diamond_leggings");
+        let boots = item("diamond_boots");
+        let shield = item("shield");
+        let dirt = item("dirt");
+        let cobble = item("cobblestone");
+        let kit: [(i16, Stack); 9] = [
+            (36, stack(sword, 1)),
+            (37, stack(pickaxe, 1)),
+            (5, stack(helmet, 1)),
+            (6, stack(chestplate, 1)),
+            (7, stack(leggings, 1)),
+            (8, stack(boots, 1)),
+            (45, stack(shield, 1)),
+            (9, stack(dirt, 64)),
+            (20, stack(cobble, 48)),
+        ];
+        let mut inv = HashMap::new();
+        for (slot, st) in &kit {
+            assert_eq!(run_restore(&mut inv, st.clone(), *slot), None, "slot {slot} rejected its item");
+            assert_eq!(inv.get(slot), Some(st), "slot {slot} does not hold its own item");
+        }
+        assert_eq!(inv.len(), kit.len());
+    }
+
+    /// Case C on a hotbar slot: the cobblestone picked up on the way to the
+    /// death spot relocates to the first free storage slot, the sword takes
+    /// slot 36 back, and the total multiset is conserved.
+    #[test]
+    fn qol_death_restore_occupied_hotbar_relocates_collider_and_conserves() {
+        let sword = item("diamond_sword");
+        let cobble = item("cobblestone");
+        let mut inv = HashMap::from([(36i16, stack(cobble, 64)), (9, stack(cobble, 10))]);
+        assert_eq!(run_restore(&mut inv, stack(sword, 1), 36), None);
+        assert_eq!(inv.get(&36), Some(&stack(sword, 1)));
+        // Hotbar-first order: 37 is the first free storage slot.
+        assert_eq!(inv.get(&37), Some(&stack(cobble, 64)));
+        assert_eq!(inv.get(&9), Some(&stack(cobble, 10)));
+        assert_eq!(inv.len(), 3);
+    }
+
+    /// Case C on an armor slot: the leather boots the player found on the way
+    /// relocate into a free storage slot (never another armor slot) and the
+    /// netherite boots equip into slot 8.
+    #[test]
+    fn qol_death_restore_occupied_armor_slot_relocates_and_equips() {
+        let netherite = item("netherite_boots");
+        let leather = item("leather_boots");
+        let dirt = item("dirt");
+        let mut inv = HashMap::from([(8i16, stack(leather, 1)), (36, stack(dirt, 64))]);
+        assert_eq!(run_restore(&mut inv, stack(netherite, 1), 8), None);
+        assert_eq!(inv.get(&8), Some(&stack(netherite, 1)));
+        assert_eq!(inv.get(&37), Some(&stack(leather, 1)));
+        assert_eq!(inv.get(&36), Some(&stack(dirt, 64)));
+        assert_eq!(inv.len(), 3);
+    }
+
+    /// The same collision on the offhand: whatever the player currently holds
+    /// there relocates to storage so the dropped shield comes home.
+    #[test]
+    fn qol_death_restore_occupied_offhand_relocates_and_conserves() {
+        let shield = item("shield");
+        let torch = item("torch");
+        let mut inv = HashMap::from([(45i16, stack(torch, 20))]);
+        assert_eq!(run_restore(&mut inv, stack(shield, 1), 45), None);
+        assert_eq!(inv.get(&45), Some(&stack(shield, 1)));
+        assert_eq!(inv.get(&36), Some(&stack(torch, 20)));
+        assert_eq!(inv.len(), 2);
+    }
+
+    /// Case B: the original slot already holds the same stack — merge up to
+    /// the stack limit, then the overflow lands in the first free slot.
+    #[test]
+    fn qol_death_restore_merge_fills_original_slot_then_overflows() {
+        let dirt = item("dirt");
+        let mut inv = HashMap::from([(36i16, stack(dirt, 60))]);
+        assert_eq!(run_restore(&mut inv, stack(dirt, 10), 36), None);
+        assert_eq!(inv.get(&36), Some(&stack(dirt, 64)));
+        assert_eq!(inv.get(&37), Some(&stack(dirt, 6)));
+        assert_eq!(inv.len(), 2);
+    }
+
+    /// Case B against an unstackable armor slot: same item cannot merge past
+    /// one, so the pickup inserts like a normal stack elsewhere.
+    #[test]
+    fn qol_death_restore_unstackable_collision_with_self_inserts_elsewhere() {
+        let helmet = item("iron_helmet");
+        let mut inv = HashMap::from([(5i16, stack(helmet, 1))]);
+        assert_eq!(run_restore(&mut inv, stack(helmet, 1), 5), None);
+        assert_eq!(inv.get(&5), Some(&stack(helmet, 1)));
+        assert_eq!(inv.get(&36), Some(&stack(helmet, 1)));
+        assert_eq!(inv.len(), 2);
+    }
+
+    /// A completely full storage grid gives Case C nowhere to relocate and the
+    /// merge fallback nowhere to go: the whole stack stays on the ground and
+    /// not one of the 36 resident stacks is overwritten.
+    #[test]
+    fn qol_death_restore_full_inventory_loses_nothing_and_overwrites_nothing() {
+        let dirt = item("dirt");
+        let sword = item("diamond_sword");
+        let netherite = item("netherite_boots");
+        let leather = item("leather_boots");
+        let mut inv: HashMap<i16, Stack> = (9..=44).map(|s| (s, stack(dirt, 64))).collect();
+        inv.insert(8, stack(leather, 1));
+        let before = inv.clone();
+        assert_eq!(
+            run_restore(&mut inv, stack(sword, 1), 36),
+            Some(stack(sword, 1)),
+            "the whole remainder must go back to the ground"
+        );
+        assert_eq!(inv, before, "a full inventory must not lose or overwrite a single item");
+        // An armor collision on a full grid resolves the same way: the worn
+        // boots keep slot 8 and the picked pair goes back to the ground whole.
+        assert_eq!(
+            run_restore(&mut inv, stack(netherite, 1), 8),
+            Some(stack(netherite, 1))
+        );
+        assert_eq!(inv, before);
+    }
+
+    /// Full except for one mergeable partial: the picked stack merges as far
+    /// as it can and only the true remainder stays on the ground.
+    #[test]
+    fn qol_death_restore_full_inventory_partial_merge_keeps_exact_remainder() {
+        let dirt = item("dirt");
+        let mut inv: HashMap<i16, Stack> = (9..=44).map(|s| (s, stack(dirt, 64))).collect();
+        inv.insert(20, stack(dirt, 63));
+        assert_eq!(
+            run_restore(&mut inv, stack(dirt, 10), 20),
+            Some(stack(dirt, 9)),
+            "one fits, nine stay on the ground"
+        );
+        assert_eq!(inv.get(&20), Some(&stack(dirt, 64)));
+    }
+
+    /// Case D: a hint that names a crafting-grid index, an out-of-range index
+    /// or the wrong armor slot falls back to the normal insert (hotbar first).
+    #[test]
+    fn qol_death_restore_bad_slot_and_wrong_armor_fall_back_to_normal_insert() {
+        let helmet = item("diamond_helmet");
+        let dirt = item("dirt");
+        for slot in [-1i16, 0, 2, 4, 46, 100] {
+            let mut inv = HashMap::new();
+            assert_eq!(run_restore(&mut inv, stack(dirt, 5), slot), None);
+            assert_eq!(inv, HashMap::from([(36i16, stack(dirt, 5))]), "slot {slot}");
+        }
+        // A helmet hinted for the boots slot is not a legal target either.
+        let mut inv = HashMap::new();
+        assert_eq!(run_restore(&mut inv, stack(helmet, 1), 8), None);
+        assert_eq!(inv, HashMap::from([(36i16, stack(helmet, 1))]));
+        // ...while it is legal for its own slot.
+        let mut inv = HashMap::new();
+        assert_eq!(run_restore(&mut inv, stack(helmet, 1), 5), None);
+        assert_eq!(inv, HashMap::from([(5i16, stack(helmet, 1))]));
+    }
+
+    /// The gating: off by default, owner-name match required, and the table
+    /// forgets a drop its entity is done with.
+    #[test]
+    fn qol_death_restore_hint_requires_opt_in_and_owner_name() {
+        let _guard = world_guard();
+        let _snapshot = DeathDropWorld::take();
+        death_slot_hint_record(7001, "alice", 36);
+        // Disabled by default: even the owner gets the vanilla answer.
+        assert!(!death_slot_restore_enabled());
+        assert_eq!(death_slot_hint_for(7001, "alice"), None);
+        set_death_slot_restore(true);
+        assert_eq!(death_slot_hint_for(7001, "alice"), Some(36));
+        // A foreign player is not the owner: no hint, normal pickup.
+        assert_eq!(death_slot_hint_for(7001, "bob"), None);
+        assert_eq!(death_slot_hint_for(9999, "alice"), None);
+        death_slot_hint_forget(7001);
+        assert_eq!(death_slot_hint_for(7001, "alice"), None);
+    }
+
+    /// The table is bounded at MAX_DEATH_SLOT_HINTS and evicts oldest-first.
+    #[test]
+    fn qol_death_restore_hint_table_stays_bounded() {
+        let _guard = world_guard();
+        let _snapshot = DeathDropWorld::take();
+        let base = 5_000_000i32;
+        for i in 0..(MAX_DEATH_SLOT_HINTS as i32 + 8) {
+            death_slot_hint_record(base + i, "cap-owner", 9);
+        }
+        let hints = death_slot_hints().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(hints.map.len(), MAX_DEATH_SLOT_HINTS);
+        assert_eq!(hints.order.len(), MAX_DEATH_SLOT_HINTS);
+        assert!(!hints.map.contains_key(&base), "oldest hint must evict first");
+        assert!(hints.map.contains_key(&(base + MAX_DEATH_SLOT_HINTS as i32 + 7)));
+    }
+
+    /// Live path, enabled: Alice's death-scattered sword comes back to slot 36
+    /// through the real `drop_tick`, pushing the cobblestone she picked up on
+    /// the way out of the slot. The hint is forgotten with the entity.
+    #[test]
+    fn qol_death_restore_drop_tick_restores_original_slot_for_owner() {
+        let _guard = world_guard();
+        let _snapshot = DeathDropWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        set_death_slot_restore(true);
+        let sword = item("diamond_sword");
+        let cobble = item("cobblestone");
+        let client = live_client("alice");
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, stack(cobble, 32));
+        // The death-path entry point: a real entity plus its slot hint. Age it
+        // past the pickup delay the way 30+ live ticks of `drop_tick` would.
+        let deid = spawn_death_drop((0.0, 70.0, 0.0), stack(sword, 1), "alice", 36);
+        {
+            let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
+            ds.iter_mut().find(|d| d.eid == deid).unwrap().age = 100;
+        }
+        drop_tick();
+        let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(inv.get(&36), Some(&stack(sword, 1)), "sword did not come home");
+        assert_eq!(inv.get(&37), Some(&stack(cobble, 32)), "collider was lost or overwritten");
+        assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(death_slot_hints().lock().unwrap_or_else(|e| e.into_inner()).map.is_empty());
+    }
+
+    /// Live path, enabled: armor slots resync and armor points follow an
+    /// equipped piece, not just the storage grid.
+    #[test]
+    fn qol_death_restore_drop_tick_equips_armor_and_updates_armor_points() {
+        let _guard = world_guard();
+        let _snapshot = DeathDropWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        set_death_slot_restore(true);
+        let netherite = item("netherite_boots");
+        let client = live_client("alice");
+        push_death_drop(7778, netherite, 1, "alice", 8);
+        drop_tick();
+        let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(inv.get(&8), Some(&stack(netherite, 1)));
+        assert_eq!(*client.armor_pts.lock().unwrap_or_else(|e| e.into_inner()), armor_pts_of(&inv));
+        assert_eq!(*client.armor_pts.lock().unwrap_or_else(|e| e.into_inner()), 3);
+    }
+
+    /// Live path, disabled: the identical drop with the identical hint takes
+    /// the vanilla first-free-slot landing (36), not the hinted slot 20.
+    #[test]
+    fn qol_death_restore_disabled_flag_leaves_vanilla_pickup_unchanged() {
+        let _guard = world_guard();
+        let _snapshot = DeathDropWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        let sword = item("diamond_sword");
+        let client = live_client("alice");
+        push_death_drop(7779, sword, 1, "alice", 20);
+        assert!(!death_slot_restore_enabled());
+        drop_tick();
+        let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(inv, HashMap::from([(36i16, stack(sword, 1))]), "hint applied while disabled");
+    }
+
+    /// Live path, enabled: Bob picking up Alice's death drop is a normal
+    /// pickup — the hint only answers to the owner name.
+    #[test]
+    fn qol_death_restore_foreign_player_pickup_ignores_the_owner_hint() {
+        let _guard = world_guard();
+        let _snapshot = DeathDropWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        set_death_slot_restore(true);
+        let sword = item("diamond_sword");
+        let client = live_client("bob");
+        push_death_drop(7780, sword, 1, "alice", 20);
+        drop_tick();
+        let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(inv, HashMap::from([(36i16, stack(sword, 1))]), "foreign pickup used the hint");
+        // The hint outlives the pickup attempt: the entity is gone but the
+        // table retired it with the drop.
+        assert!(death_slot_hints().lock().unwrap_or_else(|e| e.into_inner()).map.is_empty());
+    }
+
+    /// 500 randomized steps: every single restore call must satisfy the exact
+    /// conservation invariant — inv_before + picked == inv_after + ground —
+    /// counting components as part of the item identity. Inventories are
+    /// perturbed between steps to manufacture empty/merge/collision/full and
+    /// invalid-slot cases in every proportion.
+    #[test]
+    fn qol_death_restore_stress_500_steps_conserves_every_multiset() {
+        let dirt = item("dirt");
+        let cobble = item("cobblestone");
+        let apple = item("apple");
+        let sword = item("iron_sword");
+        let helmet = item("iron_helmet");
+        let chest = item("iron_chestplate");
+        let boots = item("iron_boots");
+        let shield = item("shield");
+        let pool = [dirt, cobble, apple, sword, helmet, chest, boots, shield];
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut picked_id = 0i64;
+        let mut gen_picked = |next: &mut dyn FnMut() -> u64| -> Stack {
+            let it = pool[(next() % pool.len() as u64) as usize];
+            let mut comps: Comps = Vec::new();
+            // One in four stacks carries a damage component so merges have to
+            // respect component identity, not just item id.
+            if next() % 4 == 0 {
+                comp_set_varint(&mut comps, COMP_DAMAGE, (next() % 8) as i64);
+            }
+            if next() % 16 == 0 {
+                comps.push((COMP_CUSTOM_NAME, nbt_string(&format!("stress-{picked_id}"))));
+            }
+            picked_id += 1;
+            let max = item_stack_max(it, &comps).clamp(1, 64) as u64;
+            (it, (1 + next() % max).min(u64::from(u8::MAX)) as u8, comps)
+        };
+        let mut inv: HashMap<i16, Stack> = HashMap::new();
+        let mut ground: Vec<Stack> = Vec::new();
+        let mut steps = 0;
+        while steps < 500 {
+            steps += 1;
+            // Perturb: fill a random legal slot (collision fodder) or clear one.
+            match next() % 5 {
+                0 | 1 => {
+                    let slot = [5i16, 6, 7, 8, 45, 9, 10, 36, 37, 44]
+                        [(next() % 10) as usize];
+                    inv.insert(slot, gen_picked(&mut next));
+                }
+                2 => {
+                    let slot = 5 + (next() % 41) as i16;
+                    inv.remove(&slot);
+                }
+                _ => {}
+            }
+            // Slots biased toward legal targets so collisions are frequent but
+            // out-of-range and crafting-grid indices still appear.
+            let slot = match next() % 8 {
+                0 => -1 + (next() % 8) as i16,            // -1..=6: invalid/craft/armor edge
+                1 => 46 + (next() % 4) as i16,            // 46..=49: out of range
+                2 => 5 + (next() % 4) as i16,             // armor
+                3 => 45,                                  // offhand
+                _ => 9 + (next() % 36) as i16,            // storage
+            };
+            let picked = gen_picked(&mut next);
+            let rem = run_restore(&mut inv, picked, slot);
+            if let Some(rem) = rem {
+                ground.push(rem);
+            }
+            // Every resident stack respects its own stack limit.
+            for (s, st) in &inv {
+                assert!(
+                    i64::from(st.1) <= stack_max_of(st),
+                    "slot {s} over its stack limit: {st:?}"
+                );
+            }
+        }
+        // Sanity: the run actually produced the collision cases it exists to
+        // cover, not an empty inventory walk-through.
+        assert!(!inv.is_empty());
+        assert!(ground.iter().any(|st| st.1 > 0) || inv.len() >= 36);
     }
 }
