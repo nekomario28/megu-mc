@@ -1198,21 +1198,20 @@ impl Normal {
     pub(crate) fn get(&self, x: f64, y: f64, z: f64) -> f64 {
         let key = (self.cache_id, x.to_bits(), y.to_bits(), z.to_bits());
         let idx = nhash(key);
-        if let Some(v) = NCACHE.with(|c| {
-            let slot = c.borrow()[idx];
-            if slot.0 == key {
-                Some(slot.1)
-            } else {
-                None
-            }
-        }) {
-            return v;
-        }
-        let v = self.get_uncached(x, y, z);
+        // Probe and store share one `RefCell` borrow: `get_uncached` never re-enters
+        // NCACHE (it evaluates `Perlin::get` octaves only), so the mutable borrow can
+        // span the miss evaluation.
         NCACHE.with(|c| {
-            c.borrow_mut()[idx] = (key, v);
-        });
-        v
+            let mut c = c.borrow_mut();
+            let slot = c[idx];
+            if slot.0 == key {
+                slot.1
+            } else {
+                let v = self.get_uncached(x, y, z);
+                c[idx] = (key, v);
+                v
+            }
+        })
     }
 
     /// Four scalar [`Normal::get`] values, bit for bit. NCACHE probes share one

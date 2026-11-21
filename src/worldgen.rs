@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use crate::block_registry::{breg, bs_parts};
+use crate::block_registry::{breg, bs_parts, BReg};
 use crate::json::{jbool, jparse, J};
 
 use crate::generation_math::*;
@@ -1345,6 +1345,13 @@ pub struct Gen {
     /// cache's type (it lives above this layer), so the round is a number here; see
     /// `feature::starts_round_begin`.
     pub(crate) starts_round: Option<u64>,
+    /// Memoized [`Gen::round_share`] answer for the current round. The lookup takes the
+    /// process-wide `terrain_shares` mutex and this generator calls it per `cols` /
+    /// `base_cols` / `resolve_beard` query, so at `jobs=8` it is the one lock every
+    /// worker's column/beard path contends on. The slot is keyed by the round id:
+    /// `starts_round` can be reassigned on a live generator (a new round, or `None`),
+    /// and a stale entry must never answer for a different round.
+    share_slot: Option<(u64, Option<std::sync::Arc<TerrainShare>>)>,
     /// `ChunkGenerator.getBaseColumn` columns: the noise-only answer a structure's
     /// `findGenerationPoint` scans. Keyed like `col_c` but *not* interchangeable with
     /// it: a base column has no beardifier and no surface rule, so it is pure in
@@ -2746,6 +2753,7 @@ impl Gen {
             col_c: HashMap::new(),
             col_ord: std::collections::VecDeque::new(),
             starts_round: None,
+            share_slot: None,
             base_c: HashMap::new(),
             base_ord: std::collections::VecDeque::new(),
             beard_c: HashMap::new(),
@@ -6159,13 +6167,27 @@ impl Gen {
         let mut last = None;
         // LevelChunkSection.fillBiomesFromNoise walks X, then Y, then Z.
         // Retain the preceding R-tree entry and its bounds across this section.
+        // The 64 quarts share only 16 (qx, qz) climate columns; keep them in a 4x4
+        // table so the inner walk hits memory instead of the `clim_c` map for the
+        // other 48 quarts.
+        let mut col4: [[Option<([i64; 5], f64)>; 4]; 4] = [[None; 4]; 4];
         for qx in qx0..qx0 + 4 {
             for qy in qy0..qy0 + 4 {
                 for qz in qz0..qz0 + 4 {
                     let pos = (qx, qy, qz);
                     let leaf = if self.preset == NoisePreset::End {
                         self.biome_quart(qx, qy, qz, None).map(|(_, leaf)| leaf)
-                    } else if let Some(target) = self.target7(qx, qy, qz) {
+                    } else if let Some(target) = {
+                        let (cx4, cz4) = ((qx - qx0) as usize, (qz - qz0) as usize);
+                        let col = match col4[cx4][cz4] {
+                            v @ Some(_) => v,
+                            None => {
+                                col4[cx4][cz4] = self.climate_col(qx, qz);
+                                col4[cx4][cz4]
+                            }
+                        };
+                        col.and_then(|(c5, off)| self.target7_with_col(c5, off, qx, qy, qz))
+                    } {
                         self.btree.as_ref().map(|tree| {
                             let mut best = last.as_ref().map_or((i64::MAX, 0), |(id, bounds)| {
                                 (ps_dist(bounds, &target), *id)
@@ -7666,6 +7688,7 @@ impl Gen {
             col_c: HashMap::new(),
             col_ord: std::collections::VecDeque::new(),
             starts_round: None,
+            share_slot: None,
             base_c: HashMap::new(),
             base_ord: std::collections::VecDeque::new(),
             beard_c: HashMap::new(),
@@ -7835,6 +7858,13 @@ impl Gen {
         // `ly`, `lz`, `lx`. Only the density call is batched, and the values are the
         // individual `block_density` values bit for bit, so the order the aquifer, the
         // material rules and the deep rules see is the order they saw before.
+        // Hoisted per-section invariants: the feature-read scope flag, the block
+        // registry, and (lazily, on the first material read) the mats cell. Resolving
+        // them once keeps each of the section's 4096 cells on the array write and the
+        // aquifer/density decision alone.
+        let m3_read = m3_on() && m3_in_feature_read();
+        let reg = breg();
+        let mut mats: Option<&SurfaceMats> = None;
         for ly in 0..16i32 {
             let y = sy + ly;
             if y < self.min_y || y >= ly_top {
@@ -7842,15 +7872,27 @@ impl Gen {
             }
             for lz in 0..16i32 {
                 let z = cz * 16 + lz;
+                // A z-row's 16 cells are contiguous in the section array: write through
+                // the slice once per z rather than re-deriving `(ly|lz|lx)` per cell.
+                let row = &mut arr[((ly << 8) | (lz << 4)) as usize
+                    ..((ly << 8) | (lz << 4) | 15) as usize + 1];
                 let mut lx = 0i32;
                 while lx < 16 {
                     let x = cx * 16 + lx;
                     let d = self.block_density_x8(cc, x, y, z);
                     for k in 0..DF8 {
-                        let (state, marked) =
-                            self.terrain_cell_density(cc, x + k as i32, y, z, d[k]);
+                        let (state, marked) = self.terrain_cell_density_m(
+                            cc,
+                            &mut mats,
+                            m3_read,
+                            reg,
+                            x + k as i32,
+                            y,
+                            z,
+                            d[k],
+                        );
                         let lx = lx + k as i32;
-                        arr[((ly << 8) | (lz << 4) | lx) as usize] = state;
+                        row[lx as usize] = state;
                         // One entry per writer: vanilla preserves duplicates, and a cell the
                         // fill marked and the surface then rewrote with another fluid is
                         // visited twice by `postProcessGeneration`.
@@ -8128,9 +8170,22 @@ impl Gen {
 
     /// This generator's round-scoped terrain share, or the per-world fallback share when no
     /// explicit round is open (and `WG_COUNT` is off).
-    fn round_share(&self) -> Option<std::sync::Arc<TerrainShare>> {
+    ///
+    /// The round lookup (`terrain_share`) takes the process-wide mutex and this function is
+    /// reached per `cols` / `base_cols` / `resolve_beard` call on every worker of a round,
+    /// so the `(round, share)` pair is memoized in `share_slot`. Round ids are unique
+    /// (`STARTS_NEXT_ROUND.fetch_add`), which makes the keyed memo safe across
+    /// `starts_round` reassignments: a different round refreshes the slot, and `None`
+    /// recomputes the fallback arm - an `Arc` clone that never touches the mutex anyway.
+    /// A straggler that asks after its round ended now still finds its share (the `Arc`
+    /// keeps it alive); the share's contents are the same keyed pure values it would have
+    /// built privately, so the answer is unchanged.
+    fn round_share(&mut self) -> Option<std::sync::Arc<TerrainShare>> {
         if let Some(round) = self.starts_round {
-            terrain_share(round)
+            if self.share_slot.as_ref().map(|(r, _)| *r) != Some(round) {
+                self.share_slot = Some((round, terrain_share(round)));
+            }
+            self.share_slot.as_ref().unwrap().1.clone()
         } else if !wg_count() {
             Some(self.data.fallback_share.clone())
         } else {
@@ -9507,10 +9562,37 @@ impl Gen {
         z: i32,
         d: f64,
     ) -> (u32, u8) {
+        let mut mats: Option<&SurfaceMats> = None;
+        self.terrain_cell_density_m(
+            cc,
+            &mut mats,
+            m3_on() && m3_in_feature_read(),
+            breg(),
+            x,
+            y,
+            z,
+            d,
+        )
+    }
+
+    /// `terrain_cell_density` with the per-call invariants passed in: the fill loop
+    /// resolves `m3_read`, the block registry, and the section's `surface_mats` cell
+    /// once instead of inside each of the 4096 cells of a section.
+    #[allow(clippy::too_many_arguments)]
+    fn terrain_cell_density_m<'a>(
+        &mut self,
+        cc: &'a ChunkCols,
+        mats: &mut Option<&'a SurfaceMats>,
+        m3_read: bool,
+        reg: Option<&BReg>,
+        x: i32,
+        y: i32,
+        z: i32,
+        d: f64,
+    ) -> (u32, u8) {
         // M3 P1a M3: which layer answered a *feature-side* cold read. The scope is set by
         // `FC::get`'s fallback, so the terrain fill (which warms the same memos on purpose)
         // stays out of these counts. `m3_on() &&` keeps the off path at one cached load.
-        let m3_read = m3_on() && m3_in_feature_read();
         if d > 0.0 {
             // `NoiseChunk.blockState` asks the aquifer for every cell, and its `density > 0`
             // arm clears `shouldScheduleFluidUpdate` before returning null. This path skips the
@@ -9519,11 +9601,16 @@ impl Gen {
             // asked about (measured: `--worldgen-cell` reported `mark=true` for solid
             // `grass_block` surface cells).
             self.aq_sched = false;
-            if let Some(st) = cc.mat(self, (x & 15) as usize, (z & 15) as usize, y) {
+            if let Some(st) = mat_in(
+                *mats.get_or_insert_with(|| cc.surface_mats(self)),
+                (x & 15) as usize,
+                (z & 15) as usize,
+                y,
+            ) {
                 let st = if st == u32::MAX { self.def_st } else { st };
                 let st = self.vein_override(cc, x, y, z, st);
                 inc_if(m3_read, M3_FALLBACK_DENSITY);
-                return (st, terrain_mark(0, st));
+                return (st, terrain_mark(reg, 0, st));
             }
             let st = self.deep_state_cached(x, y, z, cc);
             let st = self.vein_override(cc, x, y, z, st);
@@ -9537,18 +9624,23 @@ impl Gen {
             0
         };
         if let Some(st) = aq {
-            if st == 0 || breg().is_some_and(|r| r.is_air(st)) {
+            if st == 0 || reg.is_some_and(|r| r.is_air(st)) {
                 return (0, 0);
             }
             // The fill wrote this cell, so the gate is the one vanilla puts on the fill.
             inc_if(m3_read, M3_FALLBACK_AQUIFER);
-            return (st, terrain_mark(fill_mark, st));
+            return (st, terrain_mark(reg, fill_mark, st));
         }
         let lx = (x & 15) as usize;
         let lz = (z & 15) as usize;
         let surface_top = cc.wtop[lz * 16 + lx] as i32;
         if surface_material_applies(y, surface_top) {
-            if let Some(st) = cc.mat(self, lx, lz, y) {
+            if let Some(st) = mat_in(
+                *mats.get_or_insert_with(|| cc.surface_mats(self)),
+                lx,
+                lz,
+                y,
+            ) {
                 if st != u32::MAX {
                     let st = self.vein_override(cc, x, y, z, st);
                     // The aquifer answered a barrier here, so this state is the surface
@@ -9556,14 +9648,14 @@ impl Gen {
                     let _ = fill_mark;
                     m3_inc(M3_SURFACE_CELLS);
                     inc_if(m3_read, M3_FALLBACK_SURFACE);
-                    return (st, terrain_mark(MARK_SURFACE, st));
+                    return (st, terrain_mark(reg, MARK_SURFACE, st));
                 }
             }
         }
         match aq {
             Some(st) => {
                 inc_if(m3_read, M3_FALLBACK_AQUIFER);
-                (st, terrain_mark(fill_mark, st))
+                (st, terrain_mark(reg, fill_mark, st))
             }
             None => {
                 let st = self.deep_state_cached(x, y, z, cc);
@@ -10650,13 +10742,7 @@ impl ChunkCols {
     /// Some(u32::MAX) = scanned but no rule matched -> default block.
     /// None = outside the scanned window -> caller runs deep_state.
     pub fn mat(&self, g: &mut Gen, lx: usize, lz: usize, y: i32) -> Option<u32> {
-        let m = self.surface_mats(g).mats[lz * 16 + lx].as_ref()?;
-        let i = y - m.lo as i32;
-        if i < 0 || i as usize >= m.vals.len() {
-            return None;
-        }
-        let v = m.vals[i as usize];
-        Some(if v == u16::MAX { u32::MAX } else { v as u32 })
+        mat_in(self.surface_mats(g), lx, lz, y)
     }
     /// Per-column `run_depth`, used by the deep material rule.
     pub(crate) fn run_depth(&self, g: &mut Gen, lx: usize, lz: usize) -> i16 {
@@ -10676,6 +10762,22 @@ impl ChunkCols {
         let cells = self.grids.get(slot)?.as_deref()?;
         Some(trilinear(cells, self, x, y, z))
     }
+}
+
+/// The surface-material array lookup [`ChunkCols::mat`] performs once the mats
+/// cell is resolved, exposed separately so the fill loop can hoist the
+/// `surface_mats` resolution out of its 4096-per-section calls.
+/// `Some(u32::MAX)` = scanned but no rule matched -> default block;
+/// `None` = outside the scanned window -> caller runs deep_state.
+#[inline]
+fn mat_in(mats: &SurfaceMats, lx: usize, lz: usize, y: i32) -> Option<u32> {
+    let m = mats.mats[lz * 16 + lx].as_ref()?;
+    let i = y - m.lo as i32;
+    if i < 0 || i as usize >= m.vals.len() {
+        return None;
+    }
+    let v = m.vals[i as usize];
+    Some(if v == u16::MAX { u32::MAX } else { v as u32 })
 }
 
 #[inline]
@@ -11765,14 +11867,37 @@ impl Gen {
             }
             return arr;
         }
-        for ly in 0..16i32 {
-            let y = sy + ly;
-            for lz in 0..16i32 {
-                for lx in 0..16i32 {
-                    let x = cx * 16 + lx;
-                    let z = cz * 16 + lz;
-                    if let Some(st) = self.feat_state(x, y, z, &mut populate) {
-                        arr[((ly << 8) | (lz << 4) | lx) as usize] = st;
+        // The first `feat_state` call settles this chunk's population - its own pass
+        // plus the 3x3 writers `populate_request_box` covers, or the whole
+        // `pop_region` order - and every cell of the section belongs to that same
+        // chunk. Once settled, the bucket cannot change during this walk (only
+        // another `feat_state` call could trigger a populate, and no later one is
+        // reached), so the remaining cells read the bucket directly instead of
+        // repeating the region scan / `pop_done` / bound / double-map chain 4095
+        // more times. The settle itself can evict the bucket it just filled when
+        // `feat_ord` is past its bound: re-settle the way the next cell's
+        // `feat_state` would until `pop_done` sticks.
+        let (x0, y0, z0) = (cx * 16, sy, cz * 16);
+        loop {
+            // The first cell's own answer is discarded on purpose: the bucket pass
+            // below writes the same value at the same index.
+            let _ = self.feat_state(x0, y0, z0, &mut populate);
+            if self.pop_done.contains(&key) {
+                break;
+            }
+        }
+        if let Some(bucket) = self.feat_c.get(&key) {
+            let first = ((sy - self.min_y) as u32) << 8;
+            if bucket.capacity() < arr.len() {
+                for (&k, &st) in bucket {
+                    if let Some(cell) = arr.get_mut(k.wrapping_sub(first) as usize) {
+                        *cell = st;
+                    }
+                }
+            } else {
+                for (i, cell) in arr.iter_mut().enumerate() {
+                    if let Some(&st) = bucket.get(&first.wrapping_add(i as u32)) {
+                        *cell = st;
                     }
                 }
             }
@@ -11795,11 +11920,11 @@ pub fn feature_state(
 /// fill and surface updater both ask `!state.getFluidState().isEmpty()`, which is not the
 /// same question as "the state is water or lava" (a waterlogged stair answers yes; `magma_block`
 /// answers no), so it goes through the exported fluid identity rather than a name test.
-fn terrain_mark(gate: u8, state: u32) -> u8 {
+fn terrain_mark(reg: Option<&BReg>, gate: u8, state: u32) -> u8 {
     if gate == 0 {
         return 0;
     }
-    match breg() {
+    match reg {
         Some(reg) if reg.fluid_name(state) != "minecraft:empty" => gate,
         _ => 0,
     }
@@ -11975,7 +12100,16 @@ impl Gen {
         }
         let mut barrier = None;
         let l3 = g.aq_near_level(&near, 1, slot, m3_read);
-        let c12 = g.aq_calc_density(x, y, z, l2, l3, &mut barrier);
+        // Two identical levels make `aq_calc_density` return 0.0 at its `diff == 0`
+        // early-out, so that pair's blend can never reject the fluid and its
+        // barrier-noise sample is never needed. Under a uniform water table or in
+        // dry air all three levels are equal and no `aq_calc_density` runs at all -
+        // that is the common case, so it is checked before any pair density.
+        let c12 = if l2 == l3 {
+            0.0
+        } else {
+            g.aq_calc_density(x, y, z, l2, l3, &mut barrier)
+        };
         let (mut c13, mut c23) = (0.0f64, 0.0f64);
         if density + sim12 * c12 > 0.0 {
             g.aq_sched = false;
@@ -11985,6 +12119,20 @@ impl Gen {
             return None;
         }
         let l4 = g.aq_near_level(&near, 2, slot, m3_read);
+        if l2 == l3 && l3 == l4 {
+            // c13 and c23 are provably 0.0 as well: every blend is a no-op and the
+            // cell is the nearest level's fluid (or air), exactly the answer the
+            // full evaluation's tail produces.
+            g.aq_sched = true;
+            if trace {
+                eprintln!("Aqd {x} {y} {z} d={density} state {blk} sim={sim12:.4} c12=0 c13=0 c23=0 l0={:?} l1={:?} l2={:?}", l2, l3, l4);
+            }
+            return Some(match blk {
+                1 => water,
+                2 => lava,
+                _ => 0,
+            });
+        }
         let sim13 = 1.0 - (d2 - d0).abs() as f64 / 25.0;
         if sim13 > 0.0 {
             c13 = g.aq_calc_density(x, y, z, l2, l4, &mut barrier);
@@ -12402,6 +12550,20 @@ impl Gen {
     /// 7-param biome target at quart coords
     fn target7(&mut self, qx: i32, qy: i32, qz: i32) -> Option<[i64; 7]> {
         let (c5, off) = self.climate_col(qx, qz)?;
+        self.target7_with_col(c5, off, qx, qy, qz)
+    }
+
+    /// `target7` with the column pair already in hand: the 4x4x4 quart scan visits
+    /// each of its 16 (qx, qz) columns four times, so the caller keeps them in a
+    /// table and only the depth term (which depends on `qy`) is recomputed per quart.
+    fn target7_with_col(
+        &mut self,
+        c5: [i64; 5],
+        off: f64,
+        qx: i32,
+        qy: i32,
+        qz: i32,
+    ) -> Option<[i64; 7]> {
         let dq = match self.depth_split {
             Some((fc, fv, tc, tv, _)) => {
                 let y = (qy << 2) as f64;

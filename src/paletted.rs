@@ -126,6 +126,33 @@ fn unpack_all_const<const BITS: usize>(words: &[u64], out: &mut [u8; 4096]) {
     }
 }
 
+/// Decode the packed cells in `[start, end)` into `dst` (length `end - start`).
+/// A word holds `64 / bits` cells and never straddles, so each word emits its
+/// cells in one inner pass and the only per-cell work is the shift, mask and
+/// `map` lookup - no per-cell `idx / per` division and no per-cell variant
+/// dispatch. `end` need not land on a word boundary: the last word emits only
+/// the cells in range.
+#[inline]
+fn decode_cells<F: Fn(u32) -> u32>(
+    bits: u8,
+    words: &[u64],
+    map: F,
+    start: usize,
+    end: usize,
+    dst: &mut [u32],
+) {
+    let bits = bits as usize;
+    let per = 64 / bits;
+    let mask = (1u64 << bits) - 1;
+    for w in start / per..end.div_ceil(per) {
+        let word = words[w];
+        let base = w * per;
+        for i in start.saturating_sub(base)..(end - base).min(per) {
+            dst[base + i - start] = map(((word >> (i * bits)) & mask) as u32);
+        }
+    }
+}
+
 fn grow_indirect_words(old_bits: u8, old_words: &[u64], new_bits: u8) -> Box<[u64]> {
     let mut indices = [0u8; 4096];
     match old_bits {
@@ -587,14 +614,10 @@ impl PalettedSection {
                 entries,
                 words,
             } => {
-                for (idx, cell) in out.iter_mut().enumerate() {
-                    *cell = entries[indirect_get_word(*bits, words, idx)];
-                }
+                decode_cells(*bits, words, |i| entries[i as usize], 0, 4096, out);
             }
             SectionPalette::Direct { words } => {
-                for (idx, cell) in out.iter_mut().enumerate() {
-                    *cell = packed_get::<15>(words, idx);
-                }
+                decode_cells(15, words, |i| i, 0, 4096, out);
             }
         }
     }
@@ -613,10 +636,33 @@ impl PalettedSection {
             dst[..need].fill(st);
             return;
         }
-        for ly in ly0..ly0 + ly_count {
-            let row = (ly - ly0) * 256;
-            for i in 0..256usize {
-                dst[row + i] = self.get((ly << 8) | i);
+        // Hoist the per-cell `self.get` variant match out of the row walk: a
+        // non-uniform section is `Indirect` or `Direct`, and a row is a
+        // contiguous packed range, so each row is one `decode_cells` call.
+        match &self.states {
+            SectionPalette::Single(st) => dst[..need].fill(*st),
+            SectionPalette::Indirect {
+                bits,
+                entries,
+                words,
+            } => {
+                for ly in ly0..ly0 + ly_count {
+                    let row = (ly - ly0) * 256;
+                    decode_cells(
+                        *bits,
+                        words,
+                        |i| entries[i as usize],
+                        ly << 8,
+                        (ly << 8) + 256,
+                        &mut dst[row..row + 256],
+                    );
+                }
+            }
+            SectionPalette::Direct { words } => {
+                for ly in ly0..ly0 + ly_count {
+                    let row = (ly - ly0) * 256;
+                    decode_cells(15, words, |i| i, ly << 8, (ly << 8) + 256, &mut dst[row..row + 256]);
+                }
             }
         }
     }
