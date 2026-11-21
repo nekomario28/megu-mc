@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 """End-to-end companion suite smoke test.
 
-Proves the four pure-Rust companion CLI binaries and the multi-binary
+Proves the five pure-Rust companion CLI binaries and the multi-binary
 release bundler work together through the complete operator lifecycle:
 
   1. mc-spine-init      (server-files)  — init a server directory, doctor
                         gating on the EULA (rcon.password never printed),
-                        then offline op/whitelist/ban administration.
+                        offline op/whitelist/ban administration, then
+                        claims server-claim/list/unclaim with eula.txt
+                        byte-unchanged throughout.
   2. mc-spine-mod-check (mod-adapter-core) — pre-flight a real ZIP_DEFLATED
                         .mrpack; its --json report must match
                         tools/mod_launcher.py --modpack byte-for-byte, and a
@@ -19,7 +21,11 @@ release bundler work together through the complete operator lifecycle:
   4. mc-spine-client    (client-app)    — --ping a mock status server
                         speaking Protocol 777 (26.3): handshake, status
                         response JSON, ping/pong RTT.
-  5. tools/release_bundle.py            — build a --binary + 4x
+  5. mc-spine-voice-relay (proto)       — --self-test, a --bench-packets
+                        200 --json routing benchmark (routed == 200,
+                        packets_per_second > 0), and a public --bind
+                        refused with exit 2 without --allow-public-bind.
+  6. tools/release_bundle.py            — build a --binary + 5x
                         --extra-binary release bundle twice, prove the
                         .tar.gz is byte-identical, and pass verify.
 
@@ -29,6 +35,7 @@ Usage: python3 tests/companion_suite_e2e.py [--self-test]
                                             [--mod-check-bin PATH]
                                             [--world-migrate-bin PATH]
                                             [--client-bin PATH]
+                                            [--voice-relay-bin PATH]
 
 `--target-dir` (default: $CARGO_TARGET_DIR, else repo target/companion-e2e)
 receives the cargo build output for whichever binaries are not handed in
@@ -61,6 +68,7 @@ BINARIES = (
     ("mod_check", "mod-adapter-core", "mc-spine-mod-check", "mod_check_bin"),
     ("world_migrate", "state-store", "mc-spine-world-migrate", "world_migrate_bin"),
     ("client", "client-app", "mc-spine-client", "client_bin"),
+    ("voice_relay", "proto", "mc-spine-voice-relay", "voice_relay_bin"),
 )
 
 CARGO_FLAGS = ["--offline", "--locked", "-j1"]
@@ -126,7 +134,7 @@ def parse_json_stdout(result, what):
 # ------------------------------------------------------------------ build
 
 def ensure_binaries(args):
-    """Resolve the four companion binaries: prebuilt paths win, the rest are
+    """Resolve the five companion binaries: prebuilt paths win, the rest are
     cargo-built into --target-dir so no per-crate target/ tree appears."""
     target_dir = Path(args.target_dir or
                       os.environ.get("CARGO_TARGET_DIR",
@@ -173,7 +181,7 @@ def ensure_binaries(args):
 # ------------------------------------------------------- step 1: mc-spine-init
 
 def step_init(bins, work):
-    log("step 1/5: mc-spine-init server bootstrap + offline admin")
+    log("step 1/6: mc-spine-init server bootstrap + offline admin")
     binary = bins["init"]
     srv = work / "server"
 
@@ -231,10 +239,41 @@ def step_init(bins, work):
     props = props_path.read_text(encoding="utf-8")
     check("white-list=true" in props, "whitelist on did not set white-list=true")
 
+    # Offline OpenPAC/FTB-Chunks administration: claims live in
+    # openpac_claims.json / openpac_parties.json beside the admin files, so
+    # eula.txt must stay byte-unchanged through the whole sequence.
+    eula_bytes = eula.read_bytes()
+    expect([binary, "claims", "--dir", srv, "server-claim",
+            "overworld", "3", "-2", "--forceload"], 0)
+    listing = expect([binary, "claims", "--dir", srv, "list", "--json"], 0)
+    report = parse_json_stdout(listing, "claims list --json")
+    check(report.get("claim_count") == 1,
+          f"claims list reports {report.get('claim_count')} claims, not 1")
+    check(report.get("forceload_count") == 1,
+          "claims list reports no forceloaded claim")
+    rows = report.get("claims") or []
+    check(any(row.get("dimension") == "minecraft:overworld"
+              and row.get("cx") == 3 and row.get("cz") == -2
+              and row.get("owner") == "server"
+              and row.get("forceloaded") is True
+              for row in rows),
+          f"claims list lost the forceloaded server claim or its "
+          f"negative cz: {rows}")
+    removed = expect([binary, "claims", "--dir", srv, "unclaim",
+                      "overworld", "3", "-2", "--json"], 0)
+    check(parse_json_stdout(removed, "claims unclaim --json").get("removed")
+          is True, "claims unclaim did not confirm removal")
+    gone = expect([binary, "claims", "--dir", srv, "list", "--json"], 0)
+    check(parse_json_stdout(gone, "claims list after unclaim")
+          .get("claim_count") == 0,
+          "unclaimed chunk still listed")
+    check(eula.read_bytes() == eula_bytes,
+          "claims administration modified eula.txt")
+
     final = expect([binary, "doctor", "--dir", srv, "--json"], 0)
     check(parse_json_stdout(final, "final doctor").get("ready") is True,
           "admin-edited directory is not doctor-ready")
-    log("  init/doctor/op/whitelist/ban lifecycle verified")
+    log("  init/doctor/op/whitelist/ban/claims lifecycle verified")
 
 
 # --------------------------------------------- step 2: mc-spine-mod-check
@@ -280,7 +319,7 @@ def build_mrpack(path):
 
 
 def step_mod_check(bins, work):
-    log("step 2/5: mc-spine-mod-check .mrpack pre-flight (parity with mod_launcher.py)")
+    log("step 2/6: mc-spine-mod-check .mrpack pre-flight (parity with mod_launcher.py)")
     binary = bins["mod_check"]
     pack = work / "e2e-pack.mrpack"
     build_mrpack(pack)
@@ -353,7 +392,7 @@ def world_metadata_3955():
 
 
 def step_world_migrate(bins, work):
-    log("step 3/5: mc-spine-world-migrate 1.21.1 -> 26.3 -> 1.21.1")
+    log("step 3/6: mc-spine-world-migrate 1.21.1 -> 26.3 -> 1.21.1")
     binary = bins["world_migrate"]
     src = work / "level-1.21.1.json"
     src.write_text(world_metadata_3955(), encoding="utf-8")
@@ -519,7 +558,7 @@ def mock_status_exchange(conn, status_json, observed):
 
 
 def step_client_ping(bins, work):
-    log("step 4/5: mc-spine-client --ping against a Protocol 777 mock server")
+    log("step 4/6: mc-spine-client --ping against a Protocol 777 mock server")
     binary = bins["client"]
     motd = "Alpha Test Server"
     status_json = status_response_json(motd, online=2, max_players=20,
@@ -576,7 +615,35 @@ def step_client_ping(bins, work):
         f"rtt {doc['rtt_ms']:.3f} ms)")
 
 
-# ------------------------------------------------- step 5: release bundle
+# ----------------------------------------- step 5: mc-spine-voice-relay
+
+def step_voice_relay(bins, work):
+    log("step 5/6: mc-spine-voice-relay self-test, bench & bind posture")
+    binary = bins["voice_relay"]
+
+    expect([binary, "--self-test"], 0, cwd=work)
+
+    bench = expect([binary, "--bench-packets", "200", "--json"], 0, cwd=work)
+    report = parse_json_stdout(bench, "voice-relay --bench-packets --json")
+    check(report.get("frames") == 200 and report.get("routed") == 200,
+          f"bench routed {report.get('routed')}/{report.get('frames')} "
+          f"frames, expected 200/200")
+    pps = report.get("packets_per_second")
+    check(isinstance(pps, (int, float)) and not isinstance(pps, bool)
+          and pps > 0, f"packets_per_second is not positive: {pps!r}")
+    lat = report.get("latency_ns") or {}
+    check(all(isinstance(lat.get(k), int) and lat[k] >= 0
+              for k in ("p50", "p99", "mean", "max")),
+          f"latency_ns percentiles missing or malformed: {lat!r}")
+
+    refused = expect([binary, "--bind", "0.0.0.0:24454"], 2, cwd=work)
+    check("allow-public-bind" in refused.stderr,
+          "public-bind refusal did not name --allow-public-bind")
+    log(f"  loopback self-test, {report['routed']} routed frames "
+        f"({pps:,.0f} packets/s), public bind refused with exit 2")
+
+
+# ------------------------------------------------- step 6: release bundle
 
 def _bundle_argv(out_dir, primary, companions):
     argv = [sys.executable, RELEASE_BUNDLE, "build",
@@ -592,7 +659,7 @@ def _bundle_argv(out_dir, primary, companions):
 
 
 def step_release_bundle(bins, work):
-    log("step 5/5: release_bundle.py multi-binary build x2 + verify")
+    log("step 6/6: release_bundle.py multi-binary build x2 + verify")
     primary = work / "bin" / "mc-spine"
     primary.parent.mkdir(parents=True, exist_ok=True)
     primary.write_bytes(b"#!/bin/sh\n# e2e stand-in for the mc-spine server binary\n")
@@ -618,7 +685,8 @@ def step_release_bundle(bins, work):
         members = {member.name for member in archive.getmembers()}
     expected = {f"{BUNDLE_PREFIX}/{name}"
                 for name in ("mc-spine", "mc-spine-init", "mc-spine-mod-check",
-                             "mc-spine-world-migrate", "mc-spine-client")}
+                             "mc-spine-world-migrate", "mc-spine-client",
+                             "mc-spine-voice-relay")}
     check(expected <= members,
           f"bundle is missing suite binaries: {sorted(expected - members)}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -741,6 +809,17 @@ def self_test():
         check_("bundle argv: --binary once + --extra-binary repeat",
                argv.count("--binary") == 1 and argv.count("--extra-binary") == 1)
 
+    # the companions table is the single source of truth for what builds,
+    # what the bundle ships, and which --*-bin flags exist.
+    check_("binaries table: five companions, unique keys/names/flags",
+           len(BINARIES) == 5
+           and len({key for key, _, _, _ in BINARIES}) == 5
+           and len({name for _, _, name, _ in BINARIES}) == 5
+           and len({attr for _, _, _, attr in BINARIES}) == 5)
+    check_("binaries table: voice relay ships from proto",
+           ("voice_relay", "proto", "mc-spine-voice-relay", "voice_relay_bin")
+           in BINARIES)
+
     # the assertion helpers themselves must be able to fail.
     expect_failure("check(): false is a failure", check, False, "boom")
     expect_failure("expect(): wrong exit code is a failure", expect,
@@ -769,8 +848,9 @@ def e2e(args):
         step_mod_check(bins, work)
         step_world_migrate(bins, work)
         step_client_ping(bins, work)
+        step_voice_relay(bins, work)
         step_release_bundle(bins, work)
-    log("PASS — all 5 companion-suite steps verified")
+    log("PASS — all 6 companion-suite steps verified")
 
 
 def main():
@@ -791,6 +871,8 @@ def main():
                         help="prebuilt mc-spine-world-migrate binary")
     parser.add_argument("--client-bin", type=Path, default=None,
                         help="prebuilt mc-spine-client binary")
+    parser.add_argument("--voice-relay-bin", type=Path, default=None,
+                        help="prebuilt mc-spine-voice-relay binary")
     args = parser.parse_args()
     if args.self_test:
         return self_test()

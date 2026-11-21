@@ -5,7 +5,7 @@ knobs, Docker, world migration and status probing. Every command below is
 copied from the binaries in this tree — each binary's `--help` is the
 authoritative flag list.
 
-Five binaries ship in this repository:
+Six binaries ship in this repository:
 
 | binary | built from | job |
 |---|---|---|
@@ -14,10 +14,11 @@ Five binaries ship in this repository:
 | `mc-spine-mod-check` | [../mod-adapter-core](../mod-adapter-core) | modpack pre-flight checker |
 | `mc-spine-world-migrate` | [../state-store](../state-store) | inspect and migrate world data between 1.21.1 and 26.3 |
 | `mc-spine-client` | [../client-app](../client-app) | native client; `--ping` doubles as a status probe |
+| `mc-spine-voice-relay` | [../proto](../proto) | zero-dependency `VCR1` UDP proximity voice relay sidecar |
 
 The server and the tools target two Minecraft versions: `1.21.1`
 (protocol 767, DataVersion 3955) and `26.3` (protocol 777, DataVersion
-5023). What each piece does with them is stated where it is used; §6 is
+5023). What each piece does with them is stated where it is used; §7 is
 honest about today's coverage.
 
 ## 1. First-time server setup
@@ -59,6 +60,27 @@ mc-spine-init pardon --dir /srv/spine <player>
 entry; `--reason`, `--created` and `--source` have fixed defaults the
 `--help` text lists.
 
+The `claims` subcommand administers the offline OpenPAC/FTB-Chunks-style
+claims store (`openpac_claims.json` / `openpac_parties.json`, written
+atomically beside the admin files). Only those two files are read and
+written — `eula.txt` and the admin lists are never touched. Dimensions
+are normalized like any registry id (`overworld` and
+`minecraft:overworld` are the same chunk key), and chunk coordinates
+may be negative.
+
+```sh
+# List every claim (optionally --dimension <dim>), plus the forceload
+# count; parties prints parties with members, allies and invites.
+mc-spine-init claims --dir /srv/spine list [--json]
+mc-spine-init claims --dir /srv/spine parties
+
+# Spawn-protection style server claim on chunk (3, -2), force-loaded.
+mc-spine-init claims --dir /srv/spine server-claim overworld 3 -2 --forceload
+
+# Drop any claim on that chunk as admin.
+mc-spine-init claims --dir /srv/spine unclaim overworld 3 -2
+```
+
 ## 2. Modpack pre-flight
 
 Before a pack is downloaded or launched, `mc-spine-mod-check` reports
@@ -77,6 +99,22 @@ inspection, and which redundant performance mods are skipped
 automatically. `--flagship <ids>` names mod ids handled by a flagship
 native adapter (default `create`); `--profiles <ids>` names ids covered
 by declarative offload profiles; `--json` prints the machine report.
+
+A mod whose only unsupported surface is a fully liftable Mixin set —
+standard `@Inject` HEAD/TAIL/RETURN sites on vanilla lifecycle methods —
+is promoted from Tier 3 to Tier 2 with exact event bindings by the
+static lifter in
+[../mod-adapter-core/src/mixin_lifter.rs](../mod-adapter-core/src/mixin_lifter.rs).
+The lifter is fail-closed: `@Overwrite`/`@Redirect`/`@Modify*`/
+`@Accessor`/`@Invoker`, `locals` capture, non-trivial injection points,
+and unknown targets all keep the mod at Tier 3 — it never guesses.
+
+The same pre-flight also runs entirely in the browser: [../website](../website)
+is a zero-build static page (no bundler, no CDN) whose dropzone accepts a
+`.mrpack` or pack `.zip`, extracts the manifest client-side with a
+bounds-checked ZIP reader, and applies the same classifier and superseded
+perf-mod catalog — no bytes leave the tab. `website/check_site.py`
+verifies the page offline.
 
 Exit codes: `0` the pack can run (natively, with automatic skips, or
 pending a bytecode inspection), `2` a version mismatch or bad arguments,
@@ -201,6 +239,13 @@ between `1.21.1` and `26.3`.
 # its dimension, chunk, block-override and block-entity counts.
 mc-spine-world-migrate inspect save.stv1
 
+# Inspect a vanilla save directory directly: level.dat (gzip-wrapped or
+# raw NBT) for the level name, saved-by version, seed and data packs,
+# plus a region/, DIM-1/region/ and DIM1/region/ header scan counting
+# populated chunks and classifying compression methods. Pure-Rust,
+# read-only.
+mc-spine-world-migrate inspect-anvil /path/to/vanilla-world --json
+
 # Re-seal a snapshot for another version. --out is written atomically
 # and verified decodable before it is reported; --in is never modified.
 mc-spine-world-migrate migrate --in old.stv1 --out new.stv1 --to 26.3
@@ -235,7 +280,39 @@ online/max with the sample name list, MOTD, latency and favicon.
 `767`/`777` (default `1.21.1`); `--json`/`--json-summary` prints the
 machine-readable status.
 
-## 6. Alpha caveats and security notes
+## 6. Proximity voice relay
+
+`mc-spine-voice-relay` is the zero-dependency UDP sidecar for the
+clean-room `VCR1` proximity voice protocol in
+[../proto/src/voice_relay.rs](../proto/src/voice_relay.rs). Serve mode
+(the default) binds a datagram socket, authenticates players by shared
+secret, and forwards microphone frames to the players in earshot —
+distance and dimension culling plus a per-sender rate cap. It binds
+`127.0.0.1:24454` by default; a non-loopback `--bind` is refused with
+exit 2 unless `--allow-public-bind` is passed — the same opt-in posture
+as `MC_SPINE_ALLOW_PUBLIC_BIND` on the game listener.
+
+```sh
+mc-spine-voice-relay                                # serve on 127.0.0.1:24454
+mc-spine-voice-relay --bind 0.0.0.0:24454 --allow-public-bind
+mc-spine-voice-relay --max-distance 64 --whisper-distance 24 --max-pps 128
+
+# Offline checks that open no public socket.
+mc-spine-voice-relay --self-test                    # loopback auth + proximity, exit 0
+mc-spine-voice-relay --bench-packets 100000 --json  # p50/p99 routing latency + packets/s
+```
+
+The serve loop starts with an empty player table: until a game host
+feeds it player state every `Auth` fails closed — the fail-safe
+posture, not a bug — while the socket still exercises the live
+decode/drop path and reports metrics on stderr. `--bench-packets N`
+never opens a socket; it routes N frames over a synthetic 32-player
+table spread across three dimensions and prints
+p50/p99/mean/max latency and packets-per-second (text, or JSON with
+`--json`). Exit codes: `0` success, `1` a bind error or failed
+self-test, `2` a bad command line or a refused public bind.
+
+## 7. Alpha caveats and security notes
 
 - **This is Alpha.** The verified scope is what [../README.md](../README.md)
   and [../specs/ROADMAP.md](../specs/ROADMAP.md) state — treat anything
