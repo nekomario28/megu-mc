@@ -36,6 +36,10 @@ Set `MC_SPINE_MESH_COLUMN_UNIFORM_AIR` for known-air sections, with a null block
 
 `MeshCache` owns loaded section snapshots, a deduplicated queue, and the last assembled meshes. Use one cache per world or dimension. An interior edit queues its own section. An edit on a face also queues the loaded face neighbor. Edge and corner edits reach the loaded sections that sample those halo cells, up to seven neighbors at a corner. Insertions, replacements, and removals compare the affected boundary data, including both light channels. The cache builds borders and halo from loaded sections when it drains the queue. `rebuild_dirty(limit)` bounds the number of processed sections, and a dirty mesh is unavailable until rebuilt.
 
+## Wave 6 mesh pass optimization
+
+Commit `5d8e199` restructures the mesh pass without changing its output. Each section loads into an 18×18×18 padded structure-of-arrays scratchpad that holds the section and its one-cell border and halo, so neighbor reads need no bounds checks. Face visibility is culled with bitmask operations before greedy merging. Column meshing loads each section's shell directly from adjacent sections. The FFI entry points mesh into caller buffers without intermediate allocation, and vertex packing is inlined. C ABI v1 is unchanged. Output is bit-identical to the previous mesher across all 10 pre-change FNV-1a mesh hashes.
+
 ## C ABI
 
 Check `mc_spine_mesh_abi_version()` and initialize `mc_spine_mesh_input`. Call `mc_spine_mesh_section` with a null output and zero capacity to obtain the quad count, then call again with the same inputs and a caller-owned buffer. A short buffer returns the required count and leaves the output untouched. Each call performs a mesh pass and retains no pointers. The header specifies alignment, native byte order, statuses, and vertex/index conventions. A renderer can reconstruct repeating unit-cube UVs from the face direction and section-local positions. The C ABI exports stateless meshing for use by C, C++, or Java native interop. The incremental cache is a Rust API.
@@ -59,6 +63,14 @@ LD_LIBRARY_PATH="$PWD/target/debug" "$TMPDIR/mesh_abi_smoke"
 g++ -fsyntax-only -Wall -Wextra -Werror -x c++ include/mc_spine_client_mesh.h
 ```
 
-The solid benchmark fixture begins with 24,576 block faces, exposes 1,536 unit faces after culling, and produces six quads after merging. The checkerboard fixture exposes 12,288 faces and produces 12,288 quads. The timing covers the CPU mesh pass, including output allocation, and excludes conversion, I/O, and rendering.
+The solid benchmark fixture begins with 24,576 block faces, exposes 1,536 unit faces after culling, and produces six quads after merging. The checkerboard fixture exposes 12,288 faces and produces 12,288 quads. The timing covers the CPU mesh pass and excludes conversion, I/O, and rendering.
 
-The CF-2b release benchmark used a synthetic 24-section Overworld column spanning Y=-64 through 319, with stepped stone terrain, source water, nine expanded sections, and 15 known-air sections. On an AMD Ryzen 7 9800X3D (x86-64, rustc 1.98.0), 500 runs averaged **5,208.55 µs per column** and produced **2,037 quads and 8,148 packed vertices** per run. The timed region calls the column and packing ABI once each per run with reused output buffers. Fixture construction, the initial size query, translucent sorting, GPU upload, and rendering are outside the timed region.
+The CF-2b release benchmark used a synthetic 24-section Overworld column spanning Y=-64 through 319, with stepped stone terrain, source water, nine expanded sections, and 15 known-air sections. Each run produces **2,037 quads and 8,148 packed vertices**. The timed region calls the column and packing ABI once each per run with reused output buffers. Fixture construction, the initial size query, translucent sorting, GPU upload, and rendering are outside the timed region.
+
+Release results on an AMD Ryzen 7 9800X3D (x86-64), averaged over 500 runs, before and after the Wave 6 optimization:
+
+| Fixture | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| `solid` section (6 quads) | 602.29 µs | 5.14 µs | ~117× |
+| `checkerboard` section (12,288 quads) | 1,450.75 µs | 245.34 µs | ~5.9× |
+| Overworld column, mesh + pack | 5,208.55 µs (spec baseline), 5,307.83 µs (re-measured) | **141.79 µs** | ~37.4× |

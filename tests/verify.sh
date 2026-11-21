@@ -82,6 +82,8 @@ python3 tests/neoforge_s4_network_test.py
 python3 tools/mod_compat_audit/test_audit.py
 python3 tests/fabric_shim_test.py
 python3 tests/client_launcher_test.py
+python3 tests/load_client_test.py
+python3 tools/provenance_check.py
 
 echo "== module layering"
 python3 tests/layers_gate_test.py
@@ -89,6 +91,21 @@ bash tools/layers_check.sh || exit 1
 
 echo "== debt ratchet"
 bash tools/debt_ratchet.sh || exit 1
+
+# The trap is installed before the first stage that writes a standalone crate's target, so a red
+# standalone crate does not leave its target behind for the next run to build against.
+build_manifest=$(mktemp)
+cleanup_verify_artifacts() {
+  rm -f "$build_manifest"
+  rm -rf client-port/target client-kernel/target client-app/target mod-offload/target
+}
+trap cleanup_verify_artifacts EXIT
+
+echo "== standalone crates"
+cargo test --manifest-path client-port/Cargo.toml --offline --locked -j 2
+cargo test --manifest-path client-kernel/Cargo.toml --offline --locked -j 2
+cargo test --manifest-path client-app/Cargo.toml --offline --locked -j 2
+cargo test --manifest-path mod-offload/Cargo.toml --offline --locked -j 2
 
 echo "== tests, serial"
 cargo test --offline --locked -j 2 -- --test-threads=1
@@ -114,12 +131,6 @@ for i in 1 2 3; do
 done
 
 echo "== wire smoke"
-build_manifest=$(mktemp)
-cleanup_verify_artifacts() {
-  rm -f "$build_manifest"
-  rm -rf client-port/target client-kernel/target
-}
-trap cleanup_verify_artifacts EXIT
 cargo build --offline --locked -j 2 --message-format=json-render-diagnostics >"$build_manifest"
 binary=$(python3 tools/cargo_executable.py <"$build_manifest")
 timeout 180 python3 tests/wire_smoke.py "$binary"
@@ -137,6 +148,7 @@ timeout 180 python3 tests/gp2_nether_spawn_wire.py "$binary"
 timeout 180 python3 tests/command_brigadier_ops_wire.py "$binary"
 timeout 180 python3 tests/command_datapack_wire.py
 timeout 180 python3 tests/client_prediction_wire.py --binary "$binary"
+timeout 180 python3 tests/client_inventory_pickup_wire.py --binary "$binary"
 timeout 180 python3 tests/client_kernel_wire.py "$binary"
 timeout 180 python3 tests/client_mesh_wire.py
 timeout 180 python3 tests/client_vanilla_parity.py
