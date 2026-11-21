@@ -42,6 +42,7 @@ const LOG_TAGS: &[&str] = &[
 
 const LEAF_TAGS: &[&str] = &[
     "minecraft:leaves",
+    "minecraft:wart_blocks",
     "c:leaves",
     "forge:leaves",
     "neoforge:leaves",
