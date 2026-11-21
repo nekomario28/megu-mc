@@ -16,8 +16,8 @@ use mc_spine_client_mesh::{
     WATER,
 };
 use mc_spine_kernel::{
-    Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdate, PalettedSection,
-    Registry, STATE_COUNT,
+    Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdateMultiWord,
+    PalettedSection, Registry, STATE_COUNT,
 };
 
 use crate::protocol::{bitset_get, DecodedChunk, DecodedLightData, DimensionMeta};
@@ -1042,12 +1042,16 @@ fn light_engine_for(dimension: &DimensionMeta, enabled: bool) -> Option<LightEng
     if !enabled {
         return None;
     }
-    LightEngine::new(
-        dimension.min_y,
-        u32::try_from(dimension.height).ok()?,
-        dimension.has_skylight,
-    )
-    .ok()
+    let height = u32::try_from(dimension.height).ok()?;
+    // Windows of <=62 payload sections keep the standard u64-mask engine;
+    // taller custom dimensions (up to 128 sections, e.g. min_y=-512 with
+    // height=1536) need the multi-word engine so changed-section bits past
+    // 63 stay representable.
+    if height / 16 <= 62 {
+        LightEngine::new(dimension.min_y, height, dimension.has_skylight).ok()
+    } else {
+        LightEngine::new_tall(dimension.min_y, height, dimension.has_skylight).ok()
+    }
 }
 
 impl WorldState {
@@ -1254,7 +1258,7 @@ impl WorldState {
             let Some(engine) = self.light_engine.as_mut() else {
                 return;
             };
-            match engine.apply_edits(&[edit]) {
+            match engine.apply_edits_multi_word(&[edit]) {
                 Ok(update) => update,
                 Err(_) => return,
             }
@@ -1264,8 +1268,11 @@ impl WorldState {
     }
 
     /// Write engine-produced light sections back into `StoredSection`s and
-    /// reinsert changed sections into the `MeshCache`.
-    fn apply_local_light_update(&mut self, update: LightUpdate) {
+    /// reinsert changed sections into the `MeshCache`. The masks are
+    /// `BitSet.toLongArray`-shaped word lists: bit `i` lives at
+    /// `words[i / 64] >> (i % 64)`, so tall-dimension sections past bit 63
+    /// are covered by iterating every word.
+    fn apply_local_light_update(&mut self, update: LightUpdateMultiWord) {
         let min_sy = self.dimension.min_section_y();
         for chunk_update in update.chunks {
             let (cx, cz) = chunk_update.chunk;
@@ -1297,20 +1304,24 @@ impl WorldState {
                     put(light_idx - 1, None, Some(array));
                 }
             }
-            let mut empty_sky = chunk_update.empty_sky_mask;
-            while empty_sky != 0 {
-                let bit = empty_sky.trailing_zeros() as usize;
-                empty_sky &= empty_sky - 1;
-                if bit >= 1 {
-                    put(bit - 1, Some([0u8; LIGHT_BYTES]), None);
+            for (word_idx, word) in chunk_update.empty_sky_mask.iter().enumerate() {
+                let mut bits = *word;
+                while bits != 0 {
+                    let bit = word_idx * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if bit >= 1 {
+                        put(bit - 1, Some([0u8; LIGHT_BYTES]), None);
+                    }
                 }
             }
-            let mut empty_block = chunk_update.empty_block_mask;
-            while empty_block != 0 {
-                let bit = empty_block.trailing_zeros() as usize;
-                empty_block &= empty_block - 1;
-                if bit >= 1 {
-                    put(bit - 1, None, Some([0u8; LIGHT_BYTES]));
+            for (word_idx, word) in chunk_update.empty_block_mask.iter().enumerate() {
+                let mut bits = *word;
+                while bits != 0 {
+                    let bit = word_idx * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if bit >= 1 {
+                        put(bit - 1, None, Some([0u8; LIGHT_BYTES]));
+                    }
                 }
             }
 

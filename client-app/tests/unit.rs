@@ -617,6 +617,150 @@ fn kernel_registry_light_engine_local_edit_light_update_remesh() {
     assert!(world.metrics.total_quads > 0);
 }
 
+/// 96-payload-section custom dimension (min_y=-512, height=1536): WorldState
+/// must build the tall multi-word `LightEngine`, feed the whole column,
+/// relight a block placed above light bit 64 via `apply_edits_multi_word`,
+/// clear it again through the multi-word empty mask, remesh, and render.
+#[test]
+fn tall_dimension_multiword_light_edit_remesh_render() {
+    let dimension = DimensionMeta {
+        name: "minecraft:tall_custom".to_string(),
+        min_y: -512,
+        height: 1536,
+        has_skylight: true,
+    };
+    let mut world = WorldState::new(dimension, test_block_table());
+    let torch = world
+        .registry
+        .as_ref()
+        .expect("kernel Registry should load from ../assets")
+        .default_state("minecraft:torch")
+        .expect("torch block state");
+
+    let raw = build_synthetic_chunk_packet(0, 0, 96);
+    let decoded = decode_chunk_packet(&raw, 96, 64).expect("decode tall chunk");
+    assert_eq!(decoded.sections.len(), 96);
+    world.apply_chunk(decoded).expect("apply tall chunk");
+    assert_eq!(world.loaded_chunks(), 1);
+    {
+        let col = world.columns.get(&(0, 0)).expect("tall chunk column");
+        assert_eq!(col.sections.len(), 96);
+    }
+
+    // Drain the initial mesh queue so subsequent dirty marking is
+    // attributable to the local edits alone.
+    world
+        .rebuild_dirty_bounded(usize::MAX, [8.0, 706.0, 8.0])
+        .expect("initial tall mesh");
+    assert_eq!(world.pending_mesh_sections(), 0);
+
+    // y=700 lands in payload section (700 - -512) / 16 = 75, i.e. light bit
+    // 76 — word 1 of the multi-word masks, unreachable for a u64 consumer.
+    world
+        .apply_block_update([5, 700, 5], 1)
+        .expect("stone edit at y=700");
+    world
+        .apply_block_update([5, 701, 5], torch)
+        .expect("torch edit at y=701");
+    assert_eq!(world.local_light_edits, 2);
+    assert_eq!(world.get_block_state(5, 700, 5), Some(1));
+    assert_eq!(world.get_block_state(5, 701, 5), Some(torch));
+
+    // The relight landed in stored section 75 (world y 688..=703); the torch
+    // cell (local y=13) and a lateral neighbor must carry block light.
+    let torch_idx = section_index(5, 13, 5);
+    let (torch_light, neighbor_light) = {
+        let col = world.columns.get(&(0, 0)).expect("tall chunk column");
+        let sec = &col.sections[75];
+        (
+            read_light_nibble(&sec.block_light, torch_idx),
+            read_light_nibble(&sec.block_light, section_index(6, 13, 5)),
+        )
+    };
+    assert!(torch_light > 0, "torch cell should emit block light at y=701");
+    assert!(
+        neighbor_light > 0 && neighbor_light < torch_light,
+        "block light should decay away from the tall-dimension torch"
+    );
+
+    // The high section (min_sy -32 + 75 = sec_y 43) is dirty — marked via a
+    // word-1 mask bit — and remeshes through client-port.
+    let high_coord = mc_spine_client_mesh::SectionCoord(0, 43, 0);
+    assert!(world.pending_mesh_sections() > 0);
+    assert!(
+        world.mesh_cache.mesh(high_coord).is_none(),
+        "section sec_y=43 must sit in the dirty queue after the light edit"
+    );
+    world
+        .rebuild_dirty_bounded(usize::MAX, [8.0, 706.0, 8.0])
+        .expect("rebuild after tall light edit");
+    let quads = world
+        .mesh_cache
+        .mesh(high_coord)
+        .expect("high section remeshed");
+    assert!(!quads.is_empty(), "stone cube at y=700 should emit quads");
+
+    // Removing the torch must zero the section's block light through the
+    // multi-word empty_block_mask (word 1, bit 76); a u64-only consumer
+    // would leave the stale nibble array behind.
+    world
+        .apply_block_update([5, 701, 5], 0)
+        .expect("remove torch");
+    {
+        let col = world.columns.get(&(0, 0)).expect("tall chunk column");
+        let sec = &col.sections[75];
+        assert!(
+            sec.block_light.iter().all(|byte| *byte == 0),
+            "word-1 empty_block_mask must clear stored block light"
+        );
+    }
+    world
+        .rebuild_dirty_bounded(usize::MAX, [8.0, 706.0, 8.0])
+        .expect("rebuild after torch removal");
+
+    // Render from just above the high section, looking down toward the
+    // stone at (5, 700, 5): valid non-blank PNG.
+    let frame = render::render_frame(&world, [11.5, 707.0, 11.5], 135.0, 45.0, 160, 90)
+        .expect("render tall frame");
+    assert!(frame.stats.triangles_drawn > 0);
+    assert!(frame.stats.pixels_shaded > 0);
+
+    let png = frame.encode_png();
+    assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+    let mut idat = Vec::new();
+    let mut pos = 8usize;
+    let mut saw_iend = false;
+    while pos + 12 <= png.len() {
+        let len = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
+        let tag = &png[pos + 4..pos + 8];
+        let data = &png[pos + 8..pos + 8 + len];
+        match tag {
+            b"IDAT" => idat.extend_from_slice(data),
+            b"IEND" => {
+                saw_iend = true;
+                break;
+            }
+            _ => {}
+        }
+        pos += 12 + len;
+    }
+    assert!(!idat.is_empty(), "PNG must contain IDAT");
+    assert!(saw_iend, "PNG must contain IEND");
+    let stride = 160 * 3 + 1;
+    let raw_pixels = zlib_decompress(&idat, stride * 90 + 64).expect("inflate tall IDAT");
+    assert_eq!(raw_pixels.len(), stride * 90);
+    let mut distinct = std::collections::HashSet::new();
+    for row in raw_pixels.chunks_exact(stride) {
+        for px in row[1..].as_chunks::<3>().0 {
+            distinct.insert([px[0], px[1], px[2]]);
+        }
+    }
+    assert!(
+        distinct.len() > 1,
+        "tall-dimension frame must not be a flat fill"
+    );
+}
+
 #[test]
 fn render_packed_quads_into_valid_nonblank_png() {
     let raw = build_synthetic_chunk_packet(0, 0, 24);
