@@ -141,14 +141,24 @@ class ModeATest(unittest.TestCase):
             self.assertGreater(parity[key]["total"], 0)
             self.assertGreater(parity[key]["pct"], 0.0)
             self.assertLessEqual(parity[key]["pct"], 100.0)
-        # gap entries must carry dimension + id + loaders
+        # gap entries must carry dimension + id + loaders and match item status
+        expected_gaps = {
+            item["id"]
+            for dim in self.report["mode_a"]["dimensions"]
+            for item in dim["items"]
+            if item["status"] == "GAP"
+        }
+        gap_ids = {g["id"] for g in parity["gaps"]}
+        self.assertEqual(gap_ids, expected_gaps)
         for g in parity["gaps"]:
             self.assertIn("dimension", g)
             self.assertIn("id", g)
             self.assertIn("loaders", g)
-        # a known-real gap: no c:ingots evidence in the Rust tree
-        gap_ids = {g["id"] for g in parity["gaps"]}
-        self.assertIn("c:ingots", gap_ids)
+        # synthetic empty repo must still flag missing primitives such as c:ingots
+        with tempfile.TemporaryDirectory(prefix="megu-mpa-empty-") as td:
+            empty_ma = mpa.mode_a(Path(td))
+            empty_gaps = {g["id"] for g in empty_ma["mode_a"]["parity"]["gaps"]}
+            self.assertIn("c:ingots", empty_gaps)
 
     def test_test_code_is_masked(self):
         # test_support/_tests files must not be scanned
