@@ -111,6 +111,11 @@ cleanup_verify_artifacts() {
   rm -rf client-port/target client-kernel/target client-app/target mod-offload/target \
       mod-adapter-core/target create-adapter/target proto/target state-store/target \
       server-files/target core/target
+  # The companion suite only writes repo-local output when CARGO_TARGET_DIR is
+  # unset; a caller-provided target dir is the caller's to keep.
+  if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+    rm -rf target/companion-e2e
+  fi
 }
 trap cleanup_verify_artifacts EXIT
 
@@ -125,6 +130,9 @@ cargo test --manifest-path proto/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path state-store/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path server-files/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path core/Cargo.toml --offline --locked -j 2
+
+echo "== companion suite e2e"
+python3 tests/companion_suite_e2e.py --target-dir "${CARGO_TARGET_DIR:-$PWD/target/companion-e2e}"
 
 echo "== tests, serial"
 cargo test --offline --locked -j 2 -- --test-threads=1
