@@ -737,6 +737,32 @@ impl BrewingStandBlockEntity {
     }
 }
 
+/// The live stand's next `BrewingStand.tick` as a pure predicate: true only
+/// when the pass is guaranteed to leave every field untouched. It reads the
+/// same derived state `tick` reads, so it is exact rather than conservative:
+/// a queued powder burn (`fuel == 0 && blaze_powder > 0`) mutates, an active
+/// brew (`brew_time > 0`) counts down, and `brewable && fuel > 0` starts one;
+/// everything else returns `BrewingTick::Idle` without touching a field. A
+/// fuel-empty stand can never start a brew, so only the powder queue gates
+/// it. The fingerprint-sleep caller runs this after a real pass, while the
+/// derived `bottles`/`ingredient`/`blaze_powder` are still freshly synced.
+fn brewing_inert(stand: &BrewingStand) -> bool {
+    if stand.brew_time != 0 {
+        return false;
+    }
+    if stand.fuel == 0 {
+        return stand.blaze_powder == 0;
+    }
+    let Some((ingredient, _count)) = stand.ingredient.filter(|&(_, count)| count > 0) else {
+        return true;
+    };
+    stand
+        .bottles
+        .map(|bottle| brew_potion(bottle?, ingredient))
+        .iter()
+        .all(Option::is_none)
+}
+
 // ---------- Crafter (`minecraft:crafter`) ----------
 
 #[cfg_attr(not(test), allow(dead_code))]

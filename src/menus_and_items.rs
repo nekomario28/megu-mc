@@ -775,6 +775,16 @@ struct CellBuckets {
 const NO_MEMBER: u32 = u32::MAX;
 
 impl CellBuckets {
+    /// The empty index a thread-local scratch slot starts from; `reset` grows
+    /// it on first use.
+    const EMPTY: CellBuckets = CellBuckets {
+        cell: Vec::new(),
+        used: Vec::new(),
+        head: Vec::new(),
+        next: Vec::new(),
+        mask: 0,
+    };
+
     fn new(items: usize) -> Self {
         // At most `items` distinct cells, and a load factor of at most one half.
         let cap = (items.max(4) * 2).next_power_of_two();
@@ -785,6 +795,28 @@ impl CellBuckets {
             next: vec![NO_MEMBER; items],
             mask: cap - 1,
         }
+    }
+
+    /// Rebuild for `items` reusing the existing allocation when the table
+    /// size matches — `cell` needs no clearing because every read is gated
+    /// by `used`.
+    fn reset(&mut self, items: usize) {
+        let cap = (items.max(4) * 2).next_power_of_two();
+        if self.cell.len() != cap {
+            *self = CellBuckets::new(items);
+            return;
+        }
+        self.used.fill(false);
+        self.head.fill(NO_MEMBER);
+        self.next.clear();
+        self.next.resize(items, NO_MEMBER);
+    }
+
+    /// Rough heap footprint of the table, for the scratch cap.
+    fn byte_capacity(&self) -> usize {
+        self.cell.capacity() * std::mem::size_of::<(i32, i32, i32)>()
+            + self.used.capacity()
+            + (self.head.capacity() + self.next.capacity()) * std::mem::size_of::<u32>()
     }
 
     #[inline]
@@ -866,7 +898,9 @@ fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
     }
     let __prof = tickprof::enabled();
     let mut __t = __prof.then(std::time::Instant::now);
-    let mut buckets = CellBuckets::new(dp.len());
+    let mut buckets =
+        MERGE_CELL_SCRATCH.with(|s| std::mem::replace(&mut *s.borrow_mut(), CellBuckets::EMPTY));
+    buckets.reset(dp.len());
     for (idx, d) in dp.iter().enumerate() {
         buckets.push(
             (d.x.floor() as i32, d.y.floor() as i32, d.z.floor() as i32),
@@ -878,7 +912,7 @@ fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
     }
     __t = __prof.then(std::time::Instant::now);
     let mut merged: Vec<i32> = Vec::new();
-    let mut candidates: Vec<usize> = Vec::new();
+    let mut candidates = MERGE_CAND_SCRATCH.with(|s| scratch_take(s));
     for i in 0..dp.len() {
         let (cx, cy, cz) = (
             dp[i].x.floor() as i32,
@@ -926,6 +960,14 @@ fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
     if let Some(t) = __t {
         tickprof::add("drops/merge_scan", t.elapsed());
     }
+    MERGE_CAND_SCRATCH.with(|s| scratch_return(s, candidates));
+    MERGE_CELL_SCRATCH.with(|s| {
+        *s.borrow_mut() = if buckets.byte_capacity() <= SCRATCH_CAP_BYTES {
+            buckets
+        } else {
+            CellBuckets::EMPTY
+        };
+    });
     merged
 }
 
@@ -934,14 +976,31 @@ fn furnace_tick() {
     if fs.is_empty() {
         return;
     }
-    let mut dirty_pos: Vec<DimBlockPos> = Vec::new();
+    let mut dirty_pos = FURNACE_DIRTY_SCRATCH.with(|s| scratch_take(s));
     // One region borrow for the whole loop. Acquiring the mutex per furnace was
     // what dominated this stage, not the set lookup itself.
     let region = region_guard();
+    let mut sleep = furnace_sleep().lock().unwrap_or_else(|e| e.into_inner());
     for (pos, f) in fs.iter_mut() {
         if !region.is_warm(pos.1, pos.3) {
             continue;
         }
+        // Idle-sleep probe (the BOT-HOPPER cross-apply): a furnace whose last
+        // pass proved inert — no burn, no cook progress, nothing pending — is
+        // a pure function of its three slots and the content revision, so an
+        // unchanged fingerprint skips the recipe/fuel lookups entirely. A
+        // pass that ends inert cannot have mutated the furnace, so the
+        // fingerprint taken before it is the one stored after it.
+        let mut probed = None;
+        if f.burn_left <= 0 && f.progress <= 0 && !f.dirty {
+            let fp = furnace_epoch(f, content_revision());
+            if sleep.get(pos) == Some(&fp) {
+                FURNACE_SLEEP_SKIPS.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            probed = Some(fp);
+        }
+        FURNACE_ACTIVE_STEPS.fetch_add(1, Ordering::Relaxed);
         // The recipe result is only ever read behind `input.1 > 0`, so an empty
         // input skips the lookup instead of hashing an item it cannot smelt.
         let out = if f.input.1 > 0 {
@@ -996,14 +1055,33 @@ fn furnace_tick() {
         } else if f.progress > 0 {
             f.progress -= 1;
         }
+        // The pass just proved whether the furnace is inert; record the
+        // fingerprint it was probed with (or one computed now for a furnace
+        // that never entered the gate) only while the next pass is provably
+        // a no-op.
+        if f.burn_left <= 0 && f.progress <= 0 {
+            sleep.insert(
+                *pos,
+                probed.unwrap_or_else(|| furnace_epoch(f, content_revision())),
+            );
+        } else {
+            sleep.remove(pos);
+        }
         if f.dirty {
             f.dirty = false;
             dirty_pos.push(*pos);
         }
     }
+    // Entries for positions whose furnace was removed outside the tick path
+    // can only ever make the map larger than the store; sweep then.
+    if sleep.len() > fs.len() {
+        sleep.retain(|k, _| fs.contains_key(k));
+    }
+    drop(sleep);
     drop(region);
     drop(fs);
     if dirty_pos.is_empty() {
+        FURNACE_DIRTY_SCRATCH.with(|s| scratch_return(s, dirty_pos));
         return;
     }
     let cs: Vec<Arc<Client>> = client_snapshot();
@@ -1019,6 +1097,7 @@ fn furnace_tick() {
             }
         }
     }
+    FURNACE_DIRTY_SCRATCH.with(|s| scratch_return(s, dirty_pos));
 }
 
 static HOPPERS: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
@@ -1216,11 +1295,13 @@ fn suction_nonempty(hx: i32, hy: i32, hz: i32) -> bool {
     })
 }
 /// Drops resting in `pos`'s suction cell as spawn-time snapshots, sorted by
-/// eid — the same order `hopper_suck` scans them in.
-fn suction_snaps(hx: i32, hy: i32, hz: i32) -> Vec<DropCellSnap> {
+/// eid — the same order `hopper_suck` scans them in. The caller owns `out`
+/// (a reusable scratch buffer in the probe) so an idle visit allocates
+/// nothing.
+fn suction_snaps_into(hx: i32, hy: i32, hz: i32, out: &mut Vec<DropCellSnap>) {
     ensure_drop_cells();
     let dc = drop_cells().lock().unwrap_or_else(|e| e.into_inner());
-    let mut out = Vec::new();
+    out.clear();
     each_suction_cell(hx, hy, hz, |cx, cy, cz| {
         if let Some(v) = dc.map.get(&(cx, cy, cz)) {
             out.extend(
@@ -1232,7 +1313,6 @@ fn suction_snaps(hx: i32, hy: i32, hz: i32) -> Vec<DropCellSnap> {
         false
     });
     out.sort_by_key(|s| s.eid);
-    out
 }
 /// Sequential 128-bit mix for fingerprint fields whose order is fixed.
 #[inline]
@@ -1326,7 +1406,9 @@ fn hopper_probe_epoch(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> u128 {
             acc = mixv(acc, u64::from(pend.contains_key(&ow_block(pos))));
         }
     }
-    for s in suction_snaps(hx, hy, hz) {
+    let mut snaps = SUCTION_SNAP_SCRATCH.with(|s| scratch_take(s));
+    suction_snaps_into(hx, hy, hz, &mut snaps);
+    for s in &snaps {
         acc = mixv(acc, s.eid as u64);
         acc = mixv(acc, s.item as u64);
         acc = mixv(acc, s.comps_hash);
@@ -1334,6 +1416,7 @@ fn hopper_probe_epoch(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> u128 {
         acc = mixv(acc, s.y.to_bits());
         acc = mixv(acc, s.z.to_bits());
     }
+    SUCTION_SNAP_SCRATCH.with(|s| scratch_return(s, snaps));
     acc
 }
 /// Per-hopper sleep state: the fingerprint recorded after the last scan and
@@ -1355,6 +1438,148 @@ static HOPPER_SCAN_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// Bound on the sleep map so positions whose hoppers were removed outside the
 /// tick path cannot grow it without limit; a sweep only runs past this size.
 const HOPPER_SLEEP_MAX: usize = 8192;
+
+// ---------- reusable tick scratch (PERF-MEM-ZERO-ALLOC) ----------
+//
+// Hot tick loops used to allocate a fresh Vec/HashMap for every dirty batch,
+// probe window, merge index and sync diff. Each kind keeps one bounded buffer
+// per thread through `scratch_take`/`scratch_return`; a buffer a burst grew
+// past the cap is dropped on return so idle RAM stays tiny. Reuse is
+// allocation-only: the buffers never carry state across calls.
+
+/// Idle-RAM bound per reusable scratch buffer, measured as
+/// `capacity * size_of::<T>()` so element size cannot quietly scale it.
+const SCRATCH_CAP_BYTES: usize = 256 * 1024;
+
+/// Check out the thread's scratch buffer, leaving the slot empty until
+/// `scratch_return` hands the finished buffer back. Nested use of the same
+/// slot just sees an empty Vec.
+fn scratch_take<T>(slot: &std::cell::RefCell<Vec<T>>) -> Vec<T> {
+    std::mem::take(&mut *slot.borrow_mut())
+}
+
+/// Hand a finished scratch buffer back, emptied; a buffer a burst grew past
+/// `SCRATCH_CAP_BYTES` is dropped instead of kept.
+fn scratch_return<T>(slot: &std::cell::RefCell<Vec<T>>, mut buf: Vec<T>) {
+    buf.clear();
+    *slot.borrow_mut() = if buf.capacity() * std::mem::size_of::<T>() <= SCRATCH_CAP_BYTES {
+        buf
+    } else {
+        Vec::new()
+    };
+}
+
+/// Same take/return for a scratch map. `HashMap::capacity` is in entries;
+/// control-byte overhead is covered by the `+ 16` per entry.
+fn scratch_map_take<K, V, S>(slot: &std::cell::RefCell<HashMap<K, V, S>>) -> HashMap<K, V, S>
+where
+    S: Default + std::hash::BuildHasher,
+{
+    std::mem::take(&mut *slot.borrow_mut())
+}
+fn scratch_map_return<K, V, S>(slot: &std::cell::RefCell<HashMap<K, V, S>>, mut map: HashMap<K, V, S>)
+where
+    S: Default + std::hash::BuildHasher,
+{
+    map.clear();
+    *slot.borrow_mut() = if map.capacity() * (std::mem::size_of::<(K, V)>() + 16)
+        <= SCRATCH_CAP_BYTES
+    {
+        map
+    } else {
+        HashMap::default()
+    };
+}
+
+thread_local! {
+    /// `furnace_tick`'s dirty-position batch.
+    static FURNACE_DIRTY_SCRATCH: std::cell::RefCell<Vec<DimBlockPos>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// `live_brewing_tick`'s per-tick update batch. `HashMap::new` is not
+    /// const, so this one slot skips the const-init form.
+    static BREWING_UPDATES_SCRATCH: std::cell::RefCell<
+        HashMap<DimBlockPos, (bool, [WindowPropertyUpdate; 2], bool)>,
+    > = std::cell::RefCell::new(HashMap::new());
+    /// `hopper_probe_epoch`'s suction-window snapshot list.
+    static SUCTION_SNAP_SCRATCH: std::cell::RefCell<Vec<DropCellSnap>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// `hopper_suck`'s filtered cell candidates.
+    static HOPPER_CELL_SCRATCH: std::cell::RefCell<Vec<(i32, i64, u8, Comps)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// `chest_viewer_tick_on`'s per-viewer slot-diff batch.
+    static CHEST_SYNC_SCRATCH: std::cell::RefCell<Vec<(i16, i32, Stack)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// `merge_drops`' cell index and candidate list.
+    static MERGE_CELL_SCRATCH: std::cell::RefCell<CellBuckets> =
+        const { std::cell::RefCell::new(CellBuckets::EMPTY) };
+    static MERGE_CAND_SCRATCH: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// `drop_tick`'s despawn eid list.
+    static DROP_DESPAWN_SCRATCH: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// ---------- idle furnace / brewing-stand sleep (cross-apply of BOT-HOPPER) ----------
+//
+// `furnace_tick` resolves the recipe and fuel for every warm furnace on every
+// tick, and `live_brewing_tick` re-derives potion/ingredient state for every
+// stand. A settled block entity — no burn, no cook progress, no pending fuel
+// — can only be woken by a slot or content change, so a fingerprint over
+// exactly the state the pass reads proves an unchanged verdict in O(1). Like
+// the hopper probe, the fingerprint reads the live slots every visit instead
+// of trusting mutation hooks: a write from a menu click, a hopper, `/data`
+// merge or a save load lands in the fingerprint on the very next tick.
+
+/// Per-position fingerprint recorded after a furnace pass proved inert.
+static FURNACE_SLEEP: OnceLock<Mutex<HashMap<DimBlockPos, u128>>> = OnceLock::new();
+fn furnace_sleep() -> &'static Mutex<HashMap<DimBlockPos, u128>> {
+    FURNACE_SLEEP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Same for brewing stands.
+static BREWING_SLEEP: OnceLock<Mutex<HashMap<DimBlockPos, u128>>> = OnceLock::new();
+fn brewing_sleep() -> &'static Mutex<HashMap<DimBlockPos, u128>> {
+    BREWING_SLEEP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Visit accounting the `xpoll_be_sleep_*` tests read: full passes versus
+/// fingerprint-proven skips.
+static FURNACE_SLEEP_SKIPS: AtomicU64 = AtomicU64::new(0);
+static FURNACE_ACTIVE_STEPS: AtomicU64 = AtomicU64::new(0);
+static BREWING_SLEEP_SKIPS: AtomicU64 = AtomicU64::new(0);
+static BREWING_ACTIVE_STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// The watched-state fingerprint for one furnace visit: the three slot stacks
+/// (item, count, components) plus the content revision the recipe and fuel
+/// caches already key on. `burn_left`, `progress` and `dirty` are checked
+/// live in the caller's inert gate, so they stay out of the hash and a
+/// `/data` write to them still wakes on the same tick.
+fn furnace_epoch(f: &Furnace, rev: u64) -> u128 {
+    let mut acc = mixv(rev as u128, 0x9E37_79B9_7F4A_7C15);
+    acc = mix_stack_entry(acc, 0, &f.input);
+    acc = mix_stack_entry(acc, 1, &f.fuel);
+    mix_stack_entry(acc, 2, &f.output)
+}
+
+/// The watched-state fingerprint for one brewing-stand visit: the five menu
+/// slot stacks (bottle slots carry their potion in components), the persisted
+/// `Fuel`/`BrewTime` timers and `active_ingredient`, plus the content
+/// revision. The derived `bottles`/`ingredient`/`blaze_powder` fields are
+/// re-derived from the slots inside `LiveBrewingStand::tick`, so the slots
+/// cover them.
+fn brewing_epoch(entry: &LiveBrewingStand, rev: u64) -> u128 {
+    let mut acc = mixv(rev as u128, 0xD6E8_FEB8_6659_FD93);
+    for (slot, stack) in entry.menu.slots.iter().enumerate() {
+        acc = mix_stack_entry(acc, slot as i16, stack);
+    }
+    acc = mixv(acc, u64::from(entry.stand.fuel));
+    acc = mixv(acc, u64::from(entry.stand.brew_time));
+    mixv(
+        acc,
+        entry
+            .stand
+            .active_ingredient
+            .map_or(u64::MAX, |i| i as u64),
+    )
+}
 
 fn hopper_tick() {
     // Only the hoppers that come due are visited, so a tick costs the hoppers
@@ -1582,20 +1807,23 @@ fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
     if !suction_nonempty(hx, hy, hz) {
         return false;
     }
-    let mut cell: Vec<(i32, i64, u8, Comps)> = {
+    let mut cell = HOPPER_CELL_SCRATCH.with(|s| scratch_take(s));
+    {
         let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
-        dl.iter()
-            .filter(|d| {
-                (d.x - (hx as f64 + 0.5)).abs() < 0.7
-                    && d.y > hy as f64 + 0.4
-                    && d.y < hy as f64 + 1.6
-                    && (d.z - (hz as f64 + 0.5)).abs() < 0.7
-            })
-            .map(|d| (d.eid, d.item, d.cnt, d.comps.clone()))
-            .collect()
-    };
+        cell.extend(
+            dl.iter()
+                .filter(|d| {
+                    (d.x - (hx as f64 + 0.5)).abs() < 0.7
+                        && d.y > hy as f64 + 0.4
+                        && d.y < hy as f64 + 1.6
+                        && (d.z - (hz as f64 + 0.5)).abs() < 0.7
+                })
+                .map(|d| (d.eid, d.item, d.cnt, d.comps.clone())),
+        );
+    }
     cell.sort_by_key(|(eid, ..)| *eid);
-    for (deid, item, cnt, dcp) in cell {
+    let mut sucked = false;
+    for (deid, item, cnt, dcp) in cell.drain(..) {
         let smax = item_stack_max(item, &dcp) as u8;
         let mut remaining = cnt;
         let moved = {
@@ -1633,9 +1861,11 @@ fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
         {
             d.cnt = remaining;
         }
-        return true;
+        sucked = true;
+        break;
     }
-    false
+    HOPPER_CELL_SCRATCH.with(|s| scratch_return(s, cell));
+    sucked
 }
 fn drop_tick() {
     // Split under `MC_SPINE_TICK_PROFILE=1`. The bucketed merge landed without a
@@ -1835,12 +2065,14 @@ fn drop_tick() {
                 d.age += 1;
             }
         }
-        let exp: Vec<i32> = dp.iter().filter(|d| d.age >= life).map(|d| d.eid).collect();
+        let mut exp = DROP_DESPAWN_SCRATCH.with(|s| scratch_take(s));
+        exp.extend(dp.iter().filter(|d| d.age >= life).map(|d| d.eid));
         for eid in &exp {
             dp.retain(|d| d.eid != *eid);
             death_slot_hint_forget(*eid);
             broadcast_seen_destroy(*eid);
         }
+        DROP_DESPAWN_SCRATCH.with(|s| scratch_return(s, exp));
         while dp.len() > DROP_CAP {
             let d = dp.remove(0);
             death_slot_hint_forget(d.eid);
@@ -3004,6 +3236,7 @@ fn chest_viewer_tick_on(audience: &[Arc<Client>]) {
     if audience.is_empty() {
         return;
     }
+    let mut updates = CHEST_SYNC_SCRATCH.with(|s| scratch_take(s));
     for c in audience {
         let open = *c.open_chest.lock().unwrap_or_else(|e| e.into_inner());
         let Some(win) = open else {
@@ -3029,7 +3262,8 @@ fn chest_viewer_tick_on(audience: &[Arc<Client>]) {
             continue;
         }
         let current = chest_window_slots(win);
-        let updates: Vec<(i16, i32, Stack)> = {
+        updates.clear();
+        {
             let mut sync_guard = c.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
             let sync = sync_guard.get_or_insert_with(|| ChestSyncState {
                 window: win,
@@ -3043,19 +3277,17 @@ fn chest_viewer_tick_on(audience: &[Arc<Client>]) {
                 sync.state_id = 0;
                 sync.last_slots = vec![(0, 0, Vec::new()); current.len()];
             }
-            let mut out = Vec::new();
             for (idx, stack) in current.iter().enumerate() {
                 if sync.last_slots[idx] != *stack {
                     sync.state_id = (sync.state_id + 1) & 0x7fff;
                     sync.last_slots[idx] = stack.clone();
-                    out.push((idx as i16, sync.state_id, stack.clone()));
+                    updates.push((idx as i16, sync.state_id, stack.clone()));
                 }
             }
-            out
-        };
+        }
         if !updates.is_empty() {
             if let Ok(mut w) = c.sock.lock() {
-                for (slot, state_id, stack) in updates {
+                for (slot, state_id, stack) in updates.drain(..) {
                     let mut p = vec![1u8];
                     write_varint(&mut p, i64::from(state_id));
                     p.extend_from_slice(&slot.to_be_bytes());
@@ -3065,6 +3297,7 @@ fn chest_viewer_tick_on(audience: &[Arc<Client>]) {
             }
         }
     }
+    CHEST_SYNC_SCRATCH.with(|s| scratch_return(s, updates));
 }
 fn chest_viewer_tick() {
     let audience = client_snapshot();
@@ -11571,6 +11804,10 @@ fn update_brewing_bottles(key @ (dim, x, y, z): DimBlockPos) {
 }
 
 fn remove_live_brewing_stand(key @ (dim, x, y, z): DimBlockPos) {
+    brewing_sleep()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
     if let Some(entry) = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()).remove(&key) {
         // Item entities currently live in the Overworld simulation.
         if dim == DimId::Overworld {
@@ -11586,27 +11823,80 @@ fn remove_live_brewing_stand(key @ (dim, x, y, z): DimBlockPos) {
 
 fn live_brewing_tick() {
     with_save_guard(|| {
-        let mut updates = HashMap::new();
-        for (&key, entry) in live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
-            let (mut slots_changed, mut properties_changed, mut eject) = (false, false, false);
-            for _ in 0..GAME_TICKS_PER_TICK {
-                let (slots, properties, bottle) = entry.tick();
-                slots_changed |= slots;
-                properties_changed |= properties;
-                eject |= bottle;
+        let mut updates = BREWING_UPDATES_SCRATCH.with(|s| scratch_map_take(s));
+        {
+            let mut stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
+            let mut sleep = brewing_sleep().lock().unwrap_or_else(|e| e.into_inner());
+            for (&key, entry) in stands.iter_mut() {
+                // Idle-sleep probe (the BOT-HOPPER cross-apply): an inert stand
+                // is a pure function of its slots, persisted timers and the
+                // content revision, so an unchanged fingerprint skips the
+                // per-pass potion/ingredient re-derivation entirely. A pass is
+                // only recorded while `brewing_inert` proves the next one a
+                // no-op — `brew_time == 0` alone does not, because a stand
+                // that just completed or cancelled can start again.
+                if entry.stand.brew_time == 0 {
+                    let fp = brewing_epoch(entry, content_revision());
+                    if sleep.get(&key) == Some(&fp) {
+                        BREWING_SLEEP_SKIPS.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    BREWING_ACTIVE_STEPS.fetch_add(1, Ordering::Relaxed);
+                    let (mut slots_changed, mut properties_changed, mut eject) =
+                        (false, false, false);
+                    for _ in 0..GAME_TICKS_PER_TICK {
+                        let (slots, properties, bottle) = entry.tick();
+                        slots_changed |= slots;
+                        properties_changed |= properties;
+                        eject |= bottle;
+                    }
+                    if brewing_inert(&entry.stand) {
+                        sleep.insert(key, brewing_epoch(entry, content_revision()));
+                    } else {
+                        sleep.remove(&key);
+                    }
+                    if slots_changed || properties_changed {
+                        updates.insert(
+                            key,
+                            (
+                                slots_changed,
+                                brewing_window_properties(&entry.stand),
+                                eject,
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                BREWING_ACTIVE_STEPS.fetch_add(1, Ordering::Relaxed);
+                sleep.remove(&key);
+                let (mut slots_changed, mut properties_changed, mut eject) =
+                    (false, false, false);
+                for _ in 0..GAME_TICKS_PER_TICK {
+                    let (slots, properties, bottle) = entry.tick();
+                    slots_changed |= slots;
+                    properties_changed |= properties;
+                    eject |= bottle;
+                }
+                if slots_changed || properties_changed {
+                    updates.insert(
+                        key,
+                        (
+                            slots_changed,
+                            brewing_window_properties(&entry.stand),
+                            eject,
+                        ),
+                    );
+                }
             }
-            if slots_changed || properties_changed {
-                updates.insert(
-                    key,
-                    (
-                        slots_changed,
-                        brewing_window_properties(&entry.stand),
-                        eject,
-                    ),
-                );
+            // Entries for positions whose stand was removed outside
+            // `remove_live_brewing_stand` can only make the map larger than
+            // the store; sweep then.
+            if sleep.len() > stands.len() {
+                sleep.retain(|k, _| stands.contains_key(k));
             }
         }
         if updates.is_empty() {
+            BREWING_UPDATES_SCRATCH.with(|s| scratch_map_return(s, updates));
             return;
         }
         for (&key @ (dim, x, y, z), &(slots, _, eject)) in &updates {
@@ -11643,6 +11933,7 @@ fn live_brewing_tick() {
                 }
             }
         }
+        BREWING_UPDATES_SCRATCH.with(|s| scratch_map_return(s, updates));
     });
 }
 
@@ -14250,5 +14541,259 @@ mod bot_hopper_tests {
             merge_us < 1000,
             "500-drop spatial merge must stay under 1ms, took {merge_us}us"
         );
+    }
+}
+
+#[cfg(test)]
+mod xpoll_be_sleep_tests {
+    use super::*;
+
+    /// Save/restore for every shared fixture `furnace_tick` and
+    /// `live_brewing_tick` can read, including the sleep caches and counters
+    /// this lane adds.
+    struct SavedBe {
+        furnaces: HashMap<DimBlockPos, Furnace>,
+        fsleep: HashMap<DimBlockPos, u128>,
+        stands: HashMap<DimBlockPos, LiveBrewingStand>,
+        bsleep: HashMap<DimBlockPos, u128>,
+        fskips: u64,
+        fsteps: u64,
+        bskips: u64,
+        bsteps: u64,
+        region: (HashSet<(i32, i32)>, HashSet<(i32, i32)>),
+    }
+
+    fn save_be() -> SavedBe {
+        SavedBe {
+            furnaces: std::mem::take(&mut *furnaces().lock().unwrap_or_else(|e| e.into_inner())),
+            fsleep: std::mem::take(&mut *furnace_sleep().lock().unwrap_or_else(|e| e.into_inner())),
+            stands: std::mem::take(
+                &mut *live_brewing_stands()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ),
+            bsleep: std::mem::take(&mut *brewing_sleep().lock().unwrap_or_else(|e| e.into_inner())),
+            fskips: FURNACE_SLEEP_SKIPS.swap(0, Ordering::Relaxed),
+            fsteps: FURNACE_ACTIVE_STEPS.swap(0, Ordering::Relaxed),
+            bskips: BREWING_SLEEP_SKIPS.swap(0, Ordering::Relaxed),
+            bsteps: BREWING_ACTIVE_STEPS.swap(0, Ordering::Relaxed),
+            region: test_region(),
+        }
+    }
+
+    fn restore_be(saved: SavedBe) {
+        *furnaces().lock().unwrap_or_else(|e| e.into_inner()) = saved.furnaces;
+        *furnace_sleep().lock().unwrap_or_else(|e| e.into_inner()) = saved.fsleep;
+        *live_brewing_stands()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = saved.stands;
+        *brewing_sleep().lock().unwrap_or_else(|e| e.into_inner()) = saved.bsleep;
+        FURNACE_SLEEP_SKIPS.store(saved.fskips, Ordering::Relaxed);
+        FURNACE_ACTIVE_STEPS.store(saved.fsteps, Ordering::Relaxed);
+        BREWING_SLEEP_SKIPS.store(saved.bskips, Ordering::Relaxed);
+        BREWING_ACTIVE_STEPS.store(saved.bsteps, Ordering::Relaxed);
+        set_test_region(saved.region.0, saved.region.1);
+    }
+
+    fn warm_block_range(x0: i32, z0: i32, x1: i32, z1: i32) -> HashSet<(i32, i32)> {
+        let mut set = HashSet::new();
+        for cx in x0.div_euclid(16)..=x1.div_euclid(16) {
+            for cz in z0.div_euclid(16)..=z1.div_euclid(16) {
+                set.insert((cx, cz));
+            }
+        }
+        set
+    }
+
+    fn blank_furnace() -> Furnace {
+        Furnace {
+            input: (0, 0, Vec::new()),
+            fuel: (0, 0, Vec::new()),
+            output: (0, 0, Vec::new()),
+            burn_left: 0,
+            progress: 0,
+            dirty: false,
+            xp: 0.0,
+            recipe_cache: CachedLookup::default(),
+            fuel_cache: CachedLookup::default(),
+        }
+    }
+
+    fn furnace_counters() -> (u64, u64) {
+        (
+            FURNACE_ACTIVE_STEPS.load(Ordering::Relaxed),
+            FURNACE_SLEEP_SKIPS.load(Ordering::Relaxed),
+        )
+    }
+
+    fn brewing_counters() -> (u64, u64) {
+        (
+            BREWING_ACTIVE_STEPS.load(Ordering::Relaxed),
+            BREWING_SLEEP_SKIPS.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 500 idle furnaces plus one cooking furnace over 20 ticks: once the
+    /// first pass proves the idle farm inert, every further visit is an O(1)
+    /// fingerprint skip while the active furnace cooks at exactly the vanilla
+    /// rate — and a fuel+input insert into one idle furnace wakes it on the
+    /// same tick.
+    #[test]
+    fn xpoll_be_sleep_500_idle_furnaces_skip_and_wake_same_tick() {
+        let _guard = world_guard();
+        let saved = save_be();
+        let n_idle = 500usize;
+        let iron = name_to_item("raw_iron").unwrap();
+        let coal = name_to_item("coal").unwrap();
+        let warm = warm_block_range(0, 0, 63, 63);
+        set_test_region(warm.clone(), warm);
+
+        {
+            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..n_idle {
+                let pos = ow_block((((i % 25) * 2) as i32, 140, ((i / 25) * 2) as i32));
+                fs.insert(pos, blank_furnace());
+            }
+            // The one active furnace: iron + coal, cooking from tick one.
+            let mut active = blank_furnace();
+            active.input = (iron, 1, Vec::new());
+            active.fuel = (coal, 1, Vec::new());
+            fs.insert(ow_block((46, 140, 46)), active);
+        }
+        let active_pos = ow_block((46, 140, 46));
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 {
+            furnace_tick();
+        }
+        let twenty_ticks_us = t0.elapsed().as_micros();
+        let (steps, skips) = furnace_counters();
+        // First tick every furnace runs a real pass (501 steps); afterwards
+        // the 500 idle ones skip and only the active furnace steps.
+        assert_eq!(steps, 501 + 19, "one pass per furnace, then only the cooker");
+        assert_eq!(skips, 500 * 19, "every idle furnace skips every later tick");
+        {
+            let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            let f = fs.get(&active_pos).unwrap();
+            assert_eq!(f.progress, 20, "the cooker must advance one step per tick");
+            assert_eq!(f.burn_left, server_ticks(1600) as i32 - 20);
+            assert_eq!(f.output, (0, 0, Vec::new()));
+        }
+
+        // Wake on a fuel+input insert, same tick: the idle victim ignites and
+        // starts cooking on the very next furnace_tick, like vanilla.
+        let victim = ow_block((0, 140, 0));
+        {
+            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            let f = fs.get_mut(&victim).unwrap();
+            f.input = (iron, 2, Vec::new());
+            f.fuel = (coal, 1, Vec::new());
+        }
+        let (steps_w, skips_w) = furnace_counters();
+        furnace_tick();
+        let (steps_a, skips_a) = furnace_counters();
+        assert_eq!(steps_a - steps_w, 2, "victim wakes; cooker keeps stepping");
+        assert_eq!(skips_a - skips_w, 499, "the remaining idles still skip");
+        {
+            let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            let f = fs.get(&victim).unwrap();
+            assert_eq!(f.progress, 1, "woken furnace cooks on the wake tick");
+            assert_eq!(f.burn_left, server_ticks(1600) as i32 - 1);
+        }
+        eprintln!(
+            "xpoll_be_sleep: 500 idle + 1 active, 20 ticks: skips={} steps={} wall={}us",
+            skips, steps, twenty_ticks_us
+        );
+        restore_be(saved);
+    }
+
+    /// An idle brewing stand skips the per-pass potion/ingredient derivation,
+    /// and wakes on the exact same tick when an ingredient or blaze powder
+    /// lands in its slots.
+    #[test]
+    fn xpoll_be_sleep_brewing_stand_skips_idle_and_wakes_on_ingredient() {
+        let _guard = world_guard();
+        let saved = save_be();
+        let water = || {
+            (
+                name_to_item("potion").unwrap(),
+                1,
+                vec![(COMP_POTION_CONTENTS, vec![1, 0])],
+            )
+        };
+
+        // Stand A: charged with fuel, water bottles in, nothing to brew.
+        let key_a: DimBlockPos = (DimId::Overworld, 8, 140, 8);
+        {
+            let mut menu = BrewingMenu::default();
+            menu.slots[0] = water();
+            let mut stand = BrewingStand::default();
+            stand.fuel = 20;
+            live_brewing_stands()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key_a, LiveBrewingStand { stand, menu });
+        }
+        // Stand B: no fuel, no powder, nothing brewable.
+        let key_b: DimBlockPos = (DimId::Overworld, 10, 140, 8);
+        live_brewing_stands()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key_b, LiveBrewingStand::default());
+
+        // Tick 1 proves both stands inert and records their fingerprints;
+        // the following ticks are fingerprint skips.
+        for _ in 0..3 {
+            live_brewing_tick();
+        }
+        let (steps, skips) = brewing_counters();
+        assert_eq!(steps, 2, "each stand pays one proving pass");
+        assert_eq!(skips, 2 * 2, "both stands skip the settle ticks");
+
+        // Insert nether wart into A: the slot fingerprint changes, so the
+        // very next tick wakes the stand and the brew starts like vanilla.
+        {
+            let mut stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
+            stands.get_mut(&key_a).unwrap().menu.slots[3] =
+                (name_to_item("nether_wart").unwrap(), 1, Vec::new());
+        }
+        let (steps_w, skips_w) = brewing_counters();
+        live_brewing_tick();
+        let (steps_a, skips_a) = brewing_counters();
+        {
+            let stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
+            let a = &stands.get(&key_a).unwrap().stand;
+            assert_eq!(a.brew_time, 400, "the wake tick starts the brew");
+            assert_eq!(a.fuel, 19, "one fuel point spent on the same tick");
+            assert_eq!(a.active_ingredient, Some(BrewingIngredient::NetherWart));
+        }
+        assert_eq!(steps_a - steps_w, 1, "only the woken stand pays a pass");
+        assert_eq!(skips_a - skips_w, 1, "the untouched stand still skips");
+
+        // Let B prove inert again, then drop blaze powder into its fuel slot:
+        // same-tick wake burns one powder into 20 fuel.
+        live_brewing_tick();
+        {
+            let mut stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
+            stands.get_mut(&key_b).unwrap().menu.slots[4] =
+                (name_to_item("blaze_powder").unwrap(), 1, Vec::new());
+        }
+        let (_, skips_b) = brewing_counters();
+        live_brewing_tick();
+        let (steps_b, skips_c) = brewing_counters();
+        {
+            let stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
+            let b = stands.get(&key_b).unwrap();
+            assert_eq!(b.stand.fuel, 20, "powder burns to fuel on the wake tick");
+            assert_eq!(b.menu.slots[4].1, 0, "one powder consumed");
+        }
+        assert_eq!(skips_c - skips_b, 0, "powder wake is a real pass, not a skip");
+        let _ = steps_b;
+        eprintln!(
+            "xpoll_be_sleep: brewing skips={} steps={} (wart + powder same-tick wakes)",
+            BREWING_SLEEP_SKIPS.load(Ordering::Relaxed),
+            BREWING_ACTIVE_STEPS.load(Ordering::Relaxed)
+        );
+        restore_be(saved);
     }
 }
