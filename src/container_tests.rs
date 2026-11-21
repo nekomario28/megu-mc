@@ -446,7 +446,7 @@ fn mining_efficiency_and_durability_use_shared_mechanics() {
     assert_eq!(tool_dig_speed(&plain, stone), 6.0);
     assert_eq!(tool_dig_speed(&enchanted, stone), 11.0);
     assert!(dig_seconds(stone, &enchanted).unwrap() < dig_seconds(stone, &plain).unwrap());
-    assert_eq!(tool_max_damage(name_to_item("crossbow").unwrap()), Some(326));
+    assert_eq!(tool_max_damage(name_to_item("crossbow").unwrap()), Some(465));
     let mut worn = plain;
     comp_set_varint(&mut worn.2, COMP_DAMAGE, 249);
     assert!(damage_stack(&mut worn, 0.0));
