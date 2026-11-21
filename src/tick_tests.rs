@@ -7589,7 +7589,7 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
         // fresh state has `patrol_next`/`insomnia_next` at 0, so tick 1 reschedules
         // them with RNG draws and leaves the counters far past the tick range —
         // the pinned seed must stay untouched for the digest below to hold.
-        *special_spawn_state().lock().unwrap() = SpecialSpawnState {
+        *special_spawn_state().lock().unwrap_or_else(|e| e.into_inner()) = SpecialSpawnState {
             patrol_next: u64::MAX,
             insomnia_next: u64::MAX,
             ..SpecialSpawnState::default()
