@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use mc_spine_client::cli::{help_text, parse_args, redact_from_argv, version_info_text};
 use mc_spine_client::integrated;
+use mc_spine_client::settings::ClientSettings;
 use mc_spine_client::sim::run_session;
 
 fn main() -> ExitCode {
@@ -28,6 +29,49 @@ fn main() -> ExitCode {
     }
 
     let mut cfg = cfg;
+
+    // Resolve player settings: --preset base, settings-file keys, a Vanilla
+    // options.txt import, then explicit flags. File problems are warnings,
+    // not fatal, unless an explicitly named file cannot be read at all.
+    match cfg.resolve_client_settings() {
+        Ok(warnings) => {
+            for warning in warnings {
+                eprintln!("mc-spine-client: {}", cfg.redact(&warning));
+            }
+        }
+        Err(err) => {
+            eprintln!("mc-spine-client: {}", cfg.redact(&err));
+            return ExitCode::from(2);
+        }
+    }
+
+    // Settings write-out paths are settings-only actions: write the file and
+    // exit unless a server/render action was also requested.
+    if let Some(path) = cfg.write_default_settings.clone() {
+        return match ClientSettings::default().write_toml(&path) {
+            Ok(()) => {
+                println!("wrote default settings to {}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("mc-spine-client: {}", cfg.redact(&err));
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(path) = cfg.write_settings.clone() {
+        match cfg.client_settings.write_toml(&path) {
+            Ok(()) => println!("wrote settings to {}", path.display()),
+            Err(err) => {
+                eprintln!("mc-spine-client: {}", cfg.redact(&err));
+                return ExitCode::FAILURE;
+            }
+        }
+        if !cfg.wants_session_action() {
+            return ExitCode::SUCCESS;
+        }
+    }
+
     let endpoint = match cfg.target_endpoint() {
         Ok(ep) => ep,
         Err(err) => {

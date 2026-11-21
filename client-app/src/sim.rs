@@ -2,11 +2,13 @@
 //! Client-side 20 Hz physics prediction (`client-kernel`), scripted movement loop,
 //! and headless Protocol 767 session runner.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use mc_spine_kernel::{collide, fluid_impulse, Aabb, FluidKind, FluidQuery};
 
 use crate::cli::{CliConfig, ScriptMode};
+use crate::lod::LodManager;
 use crate::protocol::{offline_uuid, parse_uuid, PlayEvent, ProtocolClient, TeleportSync};
 use crate::world::{BlockTable, WorldState};
 
@@ -318,6 +320,16 @@ pub struct SessionSummary {
     pub keep_alives: u64,
     pub packets_rx: u64,
     pub packets_tx: u64,
+    /// Effective view distance used for the session (explicit flag or the
+    /// resolved `ClientSettings` value).
+    pub view_distance: i8,
+    /// LOD columns stored by the far-terrain `LodManager` (0 when
+    /// `distant_horizon` is off).
+    pub lod_stored_columns: usize,
+    /// Columns drawn at fine LOD in the final frame set.
+    pub lod_fine_drawn: usize,
+    /// Columns drawn at coarse LOD in the final frame set.
+    pub lod_coarse_drawn: usize,
     pub render_ms: f64,
     pub triangles_drawn: u64,
     pub pixels_shaded: u64,
@@ -375,6 +387,10 @@ impl SessionSummary {
                 "\"keep_alives\":{},",
                 "\"packets_rx\":{},",
                 "\"packets_tx\":{},",
+                "\"view_distance\":{},",
+                "\"lod_stored_columns\":{},",
+                "\"lod_fine_drawn\":{},",
+                "\"lod_coarse_drawn\":{},",
                 "\"render_ms\":{:.3},",
                 "\"triangles_drawn\":{},",
                 "\"pixels_shaded\":{},",
@@ -423,6 +439,10 @@ impl SessionSummary {
             self.keep_alives,
             self.packets_rx,
             self.packets_tx,
+            self.view_distance,
+            self.lod_stored_columns,
+            self.lod_fine_drawn,
+            self.lod_coarse_drawn,
             self.render_ms,
             self.triangles_drawn,
             self.pixels_shaded,
@@ -445,6 +465,7 @@ impl SessionSummary {
                 "  render:        {:.2} ms, {} triangles, {} px shaded\n",
                 "  culling:       sections drawn={} culled={} | region_draw_calls={} | buckets drawn={} culled={}\n",
                 "  prediction:    script={} ticks={} pos=({:.3}, {:.3}, {:.3}) on_ground={} teleports={} corrections_0x40={} max_drift={:.6}\n",
+                "  settings:      view_distance={} lod_stored={} lod_fine={} lod_coarse={}\n",
                 "  network:       health={:.1} food={} keep_alives={} rx={} tx={}"
             ),
             self.server,
@@ -484,6 +505,10 @@ impl SessionSummary {
             self.teleports_0x40,
             self.corrections_0x40,
             self.max_prediction_drift,
+            self.view_distance,
+            self.lod_stored_columns,
+            self.lod_fine_drawn,
+            self.lod_coarse_drawn,
             self.health,
             self.food,
             self.keep_alives,
@@ -513,6 +538,9 @@ struct SessionRunner {
     client: ProtocolClient,
     world: WorldState,
     player: PlayerPhysics,
+    /// Far-terrain LOD store driven by the resolved `ClientSettings`
+    /// (`None` when `distant_horizon` is off).
+    lod: Option<LodManager>,
     entity_id: i32,
     play_ok: bool,
     initial_spawn_done: bool,
@@ -560,8 +588,15 @@ impl SessionRunner {
             }
             PlayEvent::ChunkBatchStart => {}
             PlayEvent::ChunkData(chunk) => {
+                let (cx, cz) = (chunk.cx, chunk.cz);
                 self.world.apply_chunk(*chunk)?;
                 self.last_chunk_at = Some(Instant::now());
+                if let Some(lod) = self.lod.as_mut() {
+                    if let Some(sections) = self.world.column_sections(cx, cz) {
+                        let views: Vec<_> = sections.iter().map(|s| s.view()).collect();
+                        lod.insert_column(cx, cz, &views);
+                    }
+                }
             }
             PlayEvent::ChunkBatchFinished(_size) => {
                 self.client.send_chunk_batch_received(30.0)?;
@@ -580,6 +615,9 @@ impl SessionRunner {
             }
             PlayEvent::UnloadChunk { cx, cz } => {
                 self.world.unload_chunk(cx, cz);
+                if let Some(lod) = self.lod.as_mut() {
+                    lod.remove_column(cx, cz);
+                }
             }
             PlayEvent::SetCenterChunk { .. } => {}
             PlayEvent::SetHealth { health, food, .. } => {
@@ -626,10 +664,14 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
     )?;
 
     let world = WorldState::new(client.dimension.clone(), blocks);
+    // Resolved player settings drive the renderer, the far-terrain LOD
+    // radii, and (via `cfg.view_distance`) the requested chunk window.
+    let render_config = crate::render::RenderConfig::from_settings(&cfg.client_settings);
     let mut runner = SessionRunner {
         client,
         world,
         player: PlayerPhysics::new([0.0, 64.0, 0.0], 0.0, 0.0),
+        lod: cfg.client_settings.to_lod_config().map(LodManager::new),
         entity_id: 0,
         play_ok: false,
         initial_spawn_done: false,
@@ -656,11 +698,12 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         let cam = runner.player.camera();
         (
             cam,
-            crate::render::frustum_planes(
+            crate::render::frustum_planes_fov(
                 cam,
                 runner.player.yaw,
                 runner.player.pitch,
                 render_aspect,
+                render_config.fov_deg,
             ),
         )
     };
@@ -760,13 +803,14 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
     if let Some(ref png_path) = cfg.render_png {
         let cam = runner.player.camera();
         let eye = [f64::from(cam[0]), f64::from(cam[1]), f64::from(cam[2])];
-        let frame = crate::render::render_frame(
+        let frame = crate::render::render_frame_with_config(
             &runner.world,
             eye,
             runner.player.yaw,
             runner.player.pitch,
             cfg.render_width,
             cfg.render_height,
+            &render_config,
         )?;
         frame.write_png(png_path)?;
         render_ms = frame.stats.render_ms;
@@ -777,6 +821,24 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         region_draw_calls = frame.stats.region_draw_calls;
         buckets_drawn = frame.stats.buckets_drawn;
         buckets_culled = frame.stats.buckets_culled;
+    }
+
+    // Far-terrain LOD bookkeeping: which stored columns draw this frame,
+    // and at which tier, measured from the final player chunk.
+    let mut lod_stored_columns = 0usize;
+    let mut lod_fine_drawn = 0usize;
+    let mut lod_coarse_drawn = 0usize;
+    if let Some(lod) = runner.lod.as_mut() {
+        let camera_chunk = (
+            (runner.player.pos[0] / 16.0).floor() as i32,
+            (runner.player.pos[2] / 16.0).floor() as i32,
+        );
+        let loaded_full: HashSet<(i32, i32)> = runner.world.columns.keys().copied().collect();
+        let _ = lod.active_lod_columns(camera_chunk, &loaded_full);
+        let stats = lod.stats();
+        lod_stored_columns = stats.stored_columns;
+        lod_fine_drawn = stats.fine_drawn;
+        lod_coarse_drawn = stats.coarse_drawn;
     }
 
     Ok(SessionSummary {
@@ -816,6 +878,10 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         keep_alives: runner.keep_alives,
         packets_rx: runner.client.packets_rx,
         packets_tx: runner.client.packets_tx,
+        view_distance: cfg.view_distance,
+        lod_stored_columns,
+        lod_fine_drawn,
+        lod_coarse_drawn,
         render_ms,
         triangles_drawn,
         pixels_shaded,

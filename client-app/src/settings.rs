@@ -13,6 +13,8 @@
 //! from the official launcher keep their FOV, render distance, clouds,
 //! particles, and VSync automatically. Pure std Rust; zero dependencies.
 
+use std::path::Path;
+
 use crate::lod::LodConfig;
 
 /// Minimum render distance selectable in the UI (chunks).
@@ -46,6 +48,8 @@ pub enum QualityPreset {
     Fast,
     Balanced,
     High,
+    /// Maximum view distance plus the widest far-terrain horizon.
+    Ultra,
     /// The player tuned at least one field away from a preset.
     Custom,
 }
@@ -105,7 +109,8 @@ macro_rules! named_option {
 }
 
 named_option!(QualityPreset, QualityPreset::Balanced,
-    Fast => "fast", Balanced => "balanced", High => "high", Custom => "custom");
+    Fast => "fast", Balanced => "balanced", High => "high", Ultra => "ultra",
+    Custom => "custom");
 named_option!(DistantHorizon, DistantHorizon::Off,
     Off => "off", Medium => "medium", Far => "far");
 named_option!(CloudMode, CloudMode::Fancy,
@@ -117,31 +122,31 @@ named_option!(ParticleLevel, ParticleLevel::All,
 ///
 /// Every flag here is a zero-downside win, so none of them is exposed to the
 /// player: the settings UI stays small and there is no confusing way to make
-/// the game slower. This is also the coverage matrix that makes the
-/// `BUILTIN_SUPERSEDED_PERF_MODS` launcher catalog possible — each named mod
-/// is superseded by an original clean-room Rust implementation inside
-/// `client-port` / `client-app` / `mc-spine`; no third-party optimization mod
-/// code, shaders, assets, or logic is ever copied, linked, or ported (see
+/// the game slower. This is also the coverage matrix behind the launcher's
+/// built-in optimization catalog — every capability is an original
+/// clean-room Rust implementation inside `client-port` / `client-app` /
+/// `mc-spine`; no third-party optimization-mod code, shaders, assets, or
+/// logic is ever copied or linked (see
 /// `specs/client-fork/ux-and-builtin-optimizations.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuiltInOptimizations {
-    /// S1/S2: section-graph occlusion culling (BFS visibility graph x
-    /// frustum) — supersedes the Sodium/Embeddium culling pipeline.
+    /// Graph occlusion culling: BFS over the inter-section visibility
+    /// graph intersected with the camera frustum.
     pub graph_occlusion_culling: bool,
-    /// S3: per-section direction-bucket backface culling.
+    /// Per-section directional face bucketing for backface culling.
     pub backface_bucket_culling: bool,
-    /// S4: one multidraw submission per region x facing bucket.
+    /// One multi-draw submission per render region x facing bucket.
     pub multidraw_region_batching: bool,
-    /// S5: frustum-ordered dirty-section rebuilds + incremental translucent
+    /// Frustum-ordered dirty-section rebuilds + incremental translucent
     /// re-sort gated on camera displacement.
     pub frustum_prioritized_rebuilds: bool,
-    /// Compact `PalettedSection` storage (supersedes FerriteCore palettes).
+    /// Compact `PalettedSection` storage.
     pub compact_palettes: bool,
-    /// Deduplicated blockstate/model resources (supersedes memory-dedup mods).
+    /// Deduplicated blockstate/model resources.
     pub deduplicated_resources: bool,
-    /// Batched HUD text/icon submission (supersedes ImmediatelyFast).
+    /// Batched HUD text/icon submission.
     pub fast_hud_batching: bool,
-    /// Frustum + occlusion entity culling (supersedes EntityCulling).
+    /// Frustum + occlusion entity culling.
     pub entity_culling: bool,
 }
 
@@ -212,6 +217,10 @@ impl ClientSettings {
                 settings.view_distance = 16;
                 settings.distant_horizon = DistantHorizon::Medium;
             }
+            QualityPreset::Ultra => {
+                settings.view_distance = MAX_VIEW_DISTANCE;
+                settings.distant_horizon = DistantHorizon::Far;
+            }
             QualityPreset::Balanced | QualityPreset::Custom => {}
         }
         settings
@@ -281,8 +290,53 @@ impl ClientSettings {
     /// clamped out-of-range value — malformed files degrade gracefully to
     /// defaults instead of failing.
     pub fn from_toml(text: &str) -> (ClientSettings, Vec<String>) {
+        let (settings, warnings, _) = Self::parse_toml(text);
+        (settings, warnings)
+    }
+
+    /// Apply only the keys a `mc-spine-client.toml` document actually
+    /// defines onto `self`, keeping every field the file does not mention.
+    /// Returns the same warnings [`ClientSettings::from_toml`] would.
+    pub fn apply_toml(&mut self, text: &str) -> Vec<String> {
+        let (parsed, warnings, seen) = Self::parse_toml(text);
+        for key in seen {
+            match key {
+                "preset" => self.preset = parsed.preset,
+                "view_distance" => self.view_distance = parsed.view_distance,
+                "distant_horizon" => self.distant_horizon = parsed.distant_horizon,
+                "clouds" => self.clouds = parsed.clouds,
+                "particles" => self.particles = parsed.particles,
+                "smooth_lighting" => self.smooth_lighting = parsed.smooth_lighting,
+                "entity_shadows" => self.entity_shadows = parsed.entity_shadows,
+                "fov" => self.fov = parsed.fov,
+                "vsync" => self.vsync = parsed.vsync,
+                "max_fps" => self.max_fps = parsed.max_fps,
+                _ => {}
+            }
+        }
+        warnings
+    }
+
+    /// Write [`ClientSettings::to_toml`] to `path`, creating parent
+    /// directories as needed.
+    pub fn write_toml(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+        }
+        std::fs::write(path, self.to_toml())
+            .map_err(|e| format!("cannot write settings file {}: {e}", path.display()))
+    }
+
+    /// Shared TOML parser: resolved settings, warnings, and the list of
+    /// keys that parsed successfully (so overlays only touch what the
+    /// document defined).
+    fn parse_toml(text: &str) -> (ClientSettings, Vec<String>, Vec<&'static str>) {
         let mut settings = ClientSettings::default();
         let mut warnings = Vec::new();
+        let mut seen: Vec<&'static str> = Vec::new();
         for raw_line in text.lines() {
             let line = raw_line.split('#').next().unwrap_or("").trim();
             if line.is_empty() || (line.starts_with('[') && line.ends_with(']')) {
@@ -299,7 +353,10 @@ impl ClientSettings {
             };
             match key {
                 "preset" => match QualityPreset::parse(value) {
-                    Some(p) => settings.preset = p,
+                    Some(p) => {
+                        settings.preset = p;
+                        seen.push("preset");
+                    }
                     None => invalid(&mut warnings),
                 },
                 "view_distance" => match value.parse::<i64>() {
@@ -311,27 +368,43 @@ impl ClientSettings {
                             key,
                             &mut warnings,
                         );
+                        seen.push("view_distance");
                     }
                     Err(_) => invalid(&mut warnings),
                 },
                 "distant_horizon" => match DistantHorizon::parse(value) {
-                    Some(d) => settings.distant_horizon = d,
+                    Some(d) => {
+                        settings.distant_horizon = d;
+                        seen.push("distant_horizon");
+                    }
                     None => invalid(&mut warnings),
                 },
                 "clouds" => match CloudMode::parse(value) {
-                    Some(c) => settings.clouds = c,
+                    Some(c) => {
+                        settings.clouds = c;
+                        seen.push("clouds");
+                    }
                     None => invalid(&mut warnings),
                 },
                 "particles" => match ParticleLevel::parse(value) {
-                    Some(p) => settings.particles = p,
+                    Some(p) => {
+                        settings.particles = p;
+                        seen.push("particles");
+                    }
                     None => invalid(&mut warnings),
                 },
                 "smooth_lighting" => match parse_bool(value) {
-                    Some(b) => settings.smooth_lighting = b,
+                    Some(b) => {
+                        settings.smooth_lighting = b;
+                        seen.push("smooth_lighting");
+                    }
                     None => invalid(&mut warnings),
                 },
                 "entity_shadows" => match parse_bool(value) {
-                    Some(b) => settings.entity_shadows = b,
+                    Some(b) => {
+                        settings.entity_shadows = b;
+                        seen.push("entity_shadows");
+                    }
                     None => invalid(&mut warnings),
                 },
                 "fov" => match value.parse::<i64>() {
@@ -343,11 +416,15 @@ impl ClientSettings {
                             key,
                             &mut warnings,
                         );
+                        seen.push("fov");
                     }
                     Err(_) => invalid(&mut warnings),
                 },
                 "vsync" => match parse_bool(value) {
-                    Some(b) => settings.vsync = b,
+                    Some(b) => {
+                        settings.vsync = b;
+                        seen.push("vsync");
+                    }
                     None => invalid(&mut warnings),
                 },
                 "max_fps" => {
@@ -355,6 +432,7 @@ impl ClientSettings {
                         || value.eq_ignore_ascii_case("none")
                     {
                         settings.max_fps = None;
+                        seen.push("max_fps");
                     } else {
                         match value.parse::<i64>() {
                             Ok(v) => {
@@ -365,6 +443,7 @@ impl ClientSettings {
                                     key,
                                     &mut warnings,
                                 ));
+                                seen.push("max_fps");
                             }
                             Err(_) => invalid(&mut warnings),
                         }
@@ -373,7 +452,7 @@ impl ClientSettings {
                 other => warnings.push(format!("unknown key '{other}' ignored")),
             }
         }
-        (settings, warnings)
+        (settings, warnings, seen)
     }
 
     /// Import a Vanilla `options.txt` (`key:value` lines) so a migrating
@@ -389,6 +468,19 @@ impl ClientSettings {
     /// `smooth_lighting`/`entity_shadows` off unless `ao`/`entityShadows`
     /// override them).
     pub fn import_vanilla_options_txt(text: &str) -> ClientSettings {
+        let mut settings = ClientSettings {
+            preset: QualityPreset::Custom,
+            ..ClientSettings::default()
+        };
+        settings.apply_vanilla_options_txt(text);
+        settings
+    }
+
+    /// Merge the recognized keys of a Vanilla `options.txt` into `self`,
+    /// leaving fields the file does not carry untouched. Returns whether at
+    /// least one recognized key was applied; when any applied, `preset`
+    /// becomes [`QualityPreset::Custom`].
+    pub fn apply_vanilla_options_txt(&mut self, text: &str) -> bool {
         let mut pairs = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -403,20 +495,19 @@ impl ClientSettings {
                 .find(|(k, _)| k.eq_ignore_ascii_case(key))
                 .map(|(_, v)| unquote(v))
         };
-        let mut settings = ClientSettings {
-            preset: QualityPreset::Custom,
-            ..ClientSettings::default()
-        };
+        let mut applied = false;
         // graphicsMode applies first: Fast graphics turns AO and entity
         // shadows off; explicit ao/entityShadows keys then override.
         if let Some(mode) = get("graphicsMode").and_then(parse_i64) {
+            applied = true;
             if mode == 0 {
-                settings.smooth_lighting = false;
-                settings.entity_shadows = false;
+                self.smooth_lighting = false;
+                self.entity_shadows = false;
             }
         }
         if let Some(v) = get("renderDistance").and_then(parse_i64) {
-            settings.view_distance = v.clamp(
+            applied = true;
+            self.view_distance = v.clamp(
                 i64::from(MIN_VIEW_DISTANCE),
                 i64::from(MAX_VIEW_DISTANCE),
             ) as u8;
@@ -425,21 +516,24 @@ impl ClientSettings {
             // Vanilla stores fov as a 0..1 slider fraction (0.5 = 70 deg);
             // accept plain degrees too so hand-edited files still work.
             if let Ok(v) = raw.parse::<f64>() {
+                applied = true;
                 let degrees = if v <= 1.5 { 30.0 + 80.0 * v } else { v };
-                settings.fov = (degrees.round() as i64)
+                self.fov = (degrees.round() as i64)
                     .clamp(i64::from(MIN_FOV), i64::from(MAX_FOV))
                     as u8;
             }
         }
         if let Some(v) = get("particles").and_then(parse_i64) {
-            settings.particles = match v {
+            applied = true;
+            self.particles = match v {
                 0 => ParticleLevel::All,
                 1 => ParticleLevel::Decreased,
                 _ => ParticleLevel::Minimal,
             };
         }
         if let Some(v) = get("renderClouds") {
-            settings.clouds = if v.eq_ignore_ascii_case("fast") {
+            applied = true;
+            self.clouds = if v.eq_ignore_ascii_case("fast") {
                 CloudMode::Fast
             } else if v.eq_ignore_ascii_case("true") {
                 CloudMode::Fancy
@@ -448,24 +542,31 @@ impl ClientSettings {
             };
         }
         if let Some(v) = get("enableVsync") {
-            settings.vsync = v.eq_ignore_ascii_case("true");
+            applied = true;
+            self.vsync = v.eq_ignore_ascii_case("true");
         }
         if let Some(v) = get("maxFps").and_then(parse_i64) {
+            applied = true;
             // Vanilla's slider tops out at 260, which its UI shows as
             // "Unlimited".
-            settings.max_fps = if v >= i64::from(MAX_MAX_FPS) {
+            self.max_fps = if v >= i64::from(MAX_MAX_FPS) {
                 None
             } else {
                 Some(v.clamp(i64::from(MIN_MAX_FPS), i64::from(MAX_MAX_FPS)) as u32)
             };
         }
         if let Some(v) = get("ao").and_then(parse_i64) {
-            settings.smooth_lighting = v != 0;
+            applied = true;
+            self.smooth_lighting = v != 0;
         }
         if let Some(v) = get("entityShadows") {
-            settings.entity_shadows = v.eq_ignore_ascii_case("true");
+            applied = true;
+            self.entity_shadows = v.eq_ignore_ascii_case("true");
         }
-        settings
+        if applied {
+            self.preset = QualityPreset::Custom;
+        }
+        applied
     }
 }
 
@@ -521,6 +622,7 @@ mod tests {
             QualityPreset::Fast,
             QualityPreset::Balanced,
             QualityPreset::High,
+            QualityPreset::Ultra,
             QualityPreset::Custom,
         ] {
             let s = ClientSettings::from_preset(preset);
@@ -545,6 +647,10 @@ mod tests {
         let high = ClientSettings::from_preset(QualityPreset::High);
         assert_eq!(high.view_distance, 16);
         assert_eq!(high.distant_horizon, DistantHorizon::Medium);
+        let ultra = ClientSettings::from_preset(QualityPreset::Ultra);
+        assert_eq!(ultra.view_distance, MAX_VIEW_DISTANCE);
+        assert_eq!(ultra.distant_horizon, DistantHorizon::Far);
+        assert_eq!(QualityPreset::parse("ultra"), Some(QualityPreset::Ultra));
     }
 
     #[test]
@@ -667,5 +773,53 @@ mod tests {
         assert_eq!(s.view_distance, DEFAULT_VIEW_DISTANCE);
         assert!(s.vsync);
         assert_eq!(s.clouds, CloudMode::Fancy);
+    }
+
+    #[test]
+    fn apply_toml_overlays_only_defined_keys() {
+        let mut s = ClientSettings::from_preset(QualityPreset::Fast);
+        let warnings = s.apply_toml("view_distance = 20\nfov = 95\nbogus = 1\n");
+        assert_eq!(s.view_distance, 20);
+        assert_eq!(s.fov, 95);
+        // Untouched keys keep the preset's values.
+        assert_eq!(s.clouds, CloudMode::Fast);
+        assert_eq!(s.particles, ParticleLevel::Decreased);
+        assert!(!s.smooth_lighting);
+        // The file defined no preset key, so the base preset stays.
+        assert_eq!(s.preset, QualityPreset::Fast);
+        assert!(warnings.iter().any(|w| w.contains("bogus")));
+    }
+
+    #[test]
+    fn apply_vanilla_options_txt_overlays_and_marks_custom() {
+        let mut s = ClientSettings::from_preset(QualityPreset::High);
+        assert!(s.apply_vanilla_options_txt("fov:0.5\nrenderDistance:7\n"));
+        assert_eq!(s.fov, 70);
+        assert_eq!(s.view_distance, 7);
+        // High preset values survive for keys the file does not carry.
+        assert_eq!(s.distant_horizon, DistantHorizon::Medium);
+        assert_eq!(s.preset, QualityPreset::Custom);
+
+        let mut s = ClientSettings::from_preset(QualityPreset::Fast);
+        // A file with no recognized keys changes nothing and keeps the preset.
+        assert!(!s.apply_vanilla_options_txt("version:3465\ntitleUpdateIndex:0\n"));
+        assert_eq!(s.preset, QualityPreset::Fast);
+    }
+
+    #[test]
+    fn write_toml_round_trips_through_from_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "mc-spine-settings-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nested/out.toml");
+        let s = ClientSettings::from_preset(QualityPreset::Ultra);
+        s.write_toml(&path).expect("write_toml creates parents");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let (back, warnings) = ClientSettings::from_toml(&text);
+        assert_eq!(back, s);
+        assert!(warnings.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

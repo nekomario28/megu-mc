@@ -951,8 +951,9 @@ impl MeshMetrics {
     }
 }
 
-/// S1 graph node for one loaded section: the 6x6 `FaceVisibility` reachability
-/// matrix plus whether the section can emit geometry for `GraphCuller`.
+/// Visibility-graph node for one loaded section: the 6x6 `FaceVisibility`
+/// reachability matrix plus whether the section can emit geometry for
+/// `GraphCuller`.
 #[derive(Clone, Copy, Debug)]
 struct SectionVisibility {
     faces: FaceVisibility,
@@ -974,12 +975,12 @@ pub struct WorldState {
     packed_meshes: HashMap<SectionCoord, Vec<PackedVertex>>,
     translucent_orders: HashMap<SectionCoord, Vec<u32>>,
     quad_counts: HashMap<SectionCoord, usize>,
-    /// S1 per-section 6x6 face-to-face visibility graph (including uniform-air
+    /// Per-section 6x6 face-to-face visibility graph (including uniform-air
     /// sections) plus the renderable flag fed to `GraphCuller`.
     visibility: HashMap<SectionCoord, SectionVisibility>,
-    /// S3 per-section direction-bucket ranges over the grouped packed mesh.
+    /// Per-section direction-bucket ranges over the grouped packed mesh.
     direction_buckets: HashMap<SectionCoord, DirectionBuckets>,
-    /// S4 shared 8x4x8-section arena producing batched MultiDraw submissions.
+    /// Shared 8x4x8-section arena producing batched multi-draw submissions.
     render_regions: RenderRegions,
     pub chunks_decoded: u64,
     pub chunks_unloaded: u64,
@@ -1441,7 +1442,7 @@ impl WorldState {
         self.render_regions.remove(coord);
     }
 
-    /// Record the S1 visibility graph node for one loaded section.
+    /// Record the visibility-graph node for one loaded section.
     /// `renderable` mirrors `StoredSection::has_non_air`: the section can emit
     /// geometry toward `GraphCuller`'s `visible` set.
     fn set_section_visibility(
@@ -1493,7 +1494,7 @@ impl WorldState {
             refresh.extend(rebuilt);
         }
 
-        // S5: incremental translucent re-sort, gated on camera displacement.
+        // Incremental translucent re-sort, gated on camera displacement.
         // Under the resort threshold this returns an empty list and costs only
         // the distance check; dirty sections are skipped inside the cache.
         let t_sort = Instant::now();
@@ -1510,8 +1511,8 @@ impl WorldState {
     }
 
     /// Refresh every renderer-facing artifact for one clean meshed section:
-    /// S3 direction-bucket ranges over the grouped quad order, the packed
-    /// 16-byte vertices, the S4 shared-arena region upload and the S5
+    /// direction-bucket ranges over the grouped quad order, the packed
+    /// 16-byte vertices, the shared-arena render-region upload and the
     /// translucent sort order. Idempotent.
     fn derive_section_artifacts(
         &mut self,
@@ -1546,9 +1547,10 @@ impl WorldState {
         Ok(())
     }
 
-    /// S1 graph nodes for `GraphCuller::search`: every loaded section —
-    /// including uniform-air sections, which propagate sight but are never
-    /// renderable — with its 6x6 face-reachability mask and renderable flag.
+    /// Visibility-graph nodes for `GraphCuller::search`: every loaded
+    /// section — including uniform-air sections, which propagate sight but
+    /// are never renderable — with its 6x6 face-reachability mask and
+    /// renderable flag.
     pub fn section_graphs(&self) -> impl Iterator<Item = (SectionCoord, SectionGraph)> + '_ {
         self.visibility.iter().map(|(&coord, &entry)| {
             (
@@ -1561,20 +1563,34 @@ impl WorldState {
         })
     }
 
-    /// S3 direction-bucket ranges for one section, in grouped packed-vertex
+    /// Direction-bucket ranges for one section, in grouped packed-vertex
     /// order. `None` until the section's first rebuild.
     pub fn direction_buckets(&self, coord: SectionCoord) -> Option<DirectionBuckets> {
         self.direction_buckets.get(&coord).copied()
     }
 
-    /// S4 shared render-region arena for MultiDraw command batching.
+    /// Shared render-region arena for multi-draw command batching.
     pub fn render_regions(&self) -> &RenderRegions {
         &self.render_regions
     }
 
+    /// Mesh `Section`s of one loaded chunk column, bottom to top, ready for
+    /// `summarize_column` LOD ingestion. `None` when the column is not
+    /// loaded.
+    pub fn column_sections(&self, cx: i32, cz: i32) -> Option<Vec<Section>> {
+        let column = self.columns.get(&(cx, cz))?;
+        Some(
+            column
+                .sections
+                .iter()
+                .map(|section| section.to_mesh_section(&self.blocks))
+                .collect(),
+        )
+    }
+
     /// Iterate rebuilt sections as `(coord, packed 16-byte vertices)` for the
     /// software rasterizer. Four vertices per quad, corner order preserved,
-    /// quads in S3 direction-bucket grouped order.
+    /// quads in direction-bucket grouped order.
     pub fn packed_meshes(&self) -> impl Iterator<Item = (SectionCoord, &[PackedVertex])> {
         self.packed_meshes
             .iter()

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Distant-horizons style LOD column store: summarized `LodCell` grids keyed
-//! by chunk column, distance-tiered drawing that never overlaps full-detail
-//! meshes, LRU/farthest-first eviction under a strict byte budget, and the
-//! opt-in `mc-spine:lod_v1` wire codec.
+//! Distance-tiered far-terrain LOD column store: summarized `LodCell` grids
+//! keyed by chunk column, drawing that never overlaps full-detail meshes,
+//! LRU/farthest-first eviction under a strict byte budget, and the opt-in
+//! `mc-spine:lod_v1` wire codec.
 
 use std::collections::{HashMap, HashSet};
 
@@ -632,5 +632,77 @@ mod tests {
         let mut bad = good.clone();
         bad.push(0);
         assert_eq!(decode_lod_v1(&bad), Err(LodError::TrailingBytes));
+    }
+
+    /// The live-path bridge: a loaded `WorldState` column exports mesh
+    /// `Section`s, whose views feed `LodManager` exactly like the sim's
+    /// chunk-arrival handler.
+    #[test]
+    fn world_column_sections_feed_lod_manager() {
+        use crate::protocol::{DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta};
+        use crate::world::{BlockTable, WorldState};
+        use mc_spine_client_mesh::SECTION_CELLS;
+
+        let dimension = DimensionMeta {
+            name: "minecraft:overworld".to_string(),
+            min_y: 0,
+            height: 64,
+            has_skylight: true,
+        };
+        let mut world = WorldState::new(dimension, BlockTable::builtin());
+        assert!(world.column_sections(0, 0).is_none());
+
+        let mut states = [0u32; SECTION_CELLS];
+        states[5 * 16 * 16 + 3 * 16 + 9] = 7;
+        let decoded = DecodedChunk {
+            cx: 0,
+            cz: 0,
+            sections: vec![
+                DecodedSection {
+                    non_air: 1,
+                    states: Box::new(states),
+                    biomes: [0; 64],
+                },
+                DecodedSection {
+                    non_air: 0,
+                    states: Box::new([0; SECTION_CELLS]),
+                    biomes: [0; 64],
+                },
+                DecodedSection {
+                    non_air: 0,
+                    states: Box::new([0; SECTION_CELLS]),
+                    biomes: [0; 64],
+                },
+                DecodedSection {
+                    non_air: 0,
+                    states: Box::new([0; SECTION_CELLS]),
+                    biomes: [0; 64],
+                },
+            ],
+            light: DecodedLightData {
+                sky_mask: Vec::new(),
+                block_mask: Vec::new(),
+                empty_sky_mask: Vec::new(),
+                empty_block_mask: Vec::new(),
+                sky_arrays: Vec::new(),
+                block_arrays: Vec::new(),
+            },
+        };
+        world.apply_chunk(decoded).unwrap();
+
+        let sections = world.column_sections(0, 0).unwrap();
+        assert_eq!(sections.len(), 4);
+        let views: Vec<_> = sections.iter().map(|s| s.view()).collect();
+        let mut lod = LodManager::new(LodConfig::default());
+        assert!(lod.insert_column(0, 0, &views));
+        assert!(lod.contains(0, 0));
+        // The lone block at (9, 5, 3) surfaces in the fine summary.
+        let fine = lod.fine_cells(0, 0).unwrap();
+        assert!(fine.iter().any(|c| c.state_id == 7));
+
+        // Unload removes it from the LOD store too, as in the sim path.
+        world.unload_chunk(0, 0);
+        assert!(world.column_sections(0, 0).is_none());
+        assert!(lod.remove_column(0, 0));
     }
 }

@@ -216,6 +216,14 @@ fn prepare_world_dir(world_dir: &Path, runtime_root: &Path) -> Result<(), String
     Ok(())
 }
 
+/// The integrated server should stream at least what the client intends to
+/// draw: the resolved view distance when a settings source or an explicit
+/// `--view-distance` supplied one, otherwise `None` (keep the server
+/// default).
+pub fn server_view_distance(cfg: &CliConfig) -> Option<i8> {
+    (cfg.view_distance_explicit || cfg.settings_source_present).then_some(cfg.view_distance)
+}
+
 /// Launch the integrated server for `--quickPlaySingleplayer`. On success the
 /// returned guard keeps the child alive until dropped.
 pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
@@ -256,6 +264,9 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
+    if let Some(view) = server_view_distance(cfg) {
+        command.env("MC_SPINE_VIEW_DISTANCE", view.to_string());
+    }
     if let Some(seed) = cfg.seed {
         command.env("MC_SPINE_SEED", seed.to_string());
     }
@@ -290,5 +301,28 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
             ));
         }
         thread::sleep(READY_POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_view_distance_follows_resolved_settings() {
+        // No settings source and no explicit flag: keep the server default.
+        let mut cfg = CliConfig::default();
+        assert_eq!(server_view_distance(&cfg), None);
+
+        // A resolved settings source forwards its view distance.
+        cfg.view_distance = 16;
+        cfg.settings_source_present = true;
+        assert_eq!(server_view_distance(&cfg), Some(16));
+
+        // An explicit --view-distance forwards too, even alone.
+        let mut cfg = CliConfig::default();
+        cfg.view_distance = 9;
+        cfg.view_distance_explicit = true;
+        assert_eq!(server_view_distance(&cfg), Some(9));
     }
 }

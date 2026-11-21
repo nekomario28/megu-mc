@@ -17,11 +17,12 @@ use mc_spine_client_mesh::{
 };
 
 use crate::protocol::zlib_compress_stored;
+use crate::settings::{ClientSettings, CloudMode, ParticleLevel};
 use crate::world::WorldState;
 
 const NEAR_Z: f64 = 0.08;
 const FAR_Z: f64 = 1024.0;
-const FOV_DEG: f64 = 70.0;
+const DEFAULT_FOV_DEG: f64 = 70.0;
 
 // Packed vertex `attributes` bit layout (see mc_spine_client_mesh.h).
 const ATTR_DIRECTION_MASK: u32 = 0x7;
@@ -39,22 +40,82 @@ const LAYER_FLUID: u32 = 3;
 const FLUID_WATER: u32 = 1;
 const FLUID_LAVA: u32 = 2;
 
+/// Everything [`render_frame_with_config`] honors from `ClientSettings`.
+/// FOV, smooth lighting and the draw-distance cap take effect in this
+/// renderer; the remaining fields are carried 1:1 so a windowed frontend
+/// can honor them without re-mapping (the headless rasterizer has no
+/// cloud, particle, entity, or present pass to apply them to).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderConfig {
+    /// Vertical field of view in degrees.
+    pub fov_deg: f64,
+    /// Per-vertex ambient occlusion; off keeps flat per-face shading only.
+    pub smooth_lighting: bool,
+    /// Chebyshev chunk-column draw cap around the camera; `None` draws
+    /// everything the visibility culler reaches.
+    pub view_distance: Option<i32>,
+    /// Cloud drawing preference (no cloud pass in the headless rasterizer).
+    pub clouds: CloudMode,
+    /// Particle emission preference (no particle pass in the headless rasterizer).
+    pub particles: ParticleLevel,
+    /// Entity shadow preference (no entity pass in the headless rasterizer).
+    pub entity_shadows: bool,
+    /// VSync preference for windowed presentation.
+    pub vsync: bool,
+    /// Frame pacing cap for windowed presentation (`None` = uncapped).
+    pub max_fps: Option<u32>,
+}
+
+impl RenderConfig {
+    /// Map a resolved `ClientSettings` onto the renderer: `view_distance`
+    /// becomes the full-detail draw cap and `fov` the projection angle.
+    pub fn from_settings(settings: &ClientSettings) -> Self {
+        Self {
+            fov_deg: f64::from(settings.fov),
+            smooth_lighting: settings.smooth_lighting,
+            view_distance: Some(i32::from(settings.view_distance)),
+            clouds: settings.clouds,
+            particles: settings.particles,
+            entity_shadows: settings.entity_shadows,
+            vsync: settings.vsync,
+            max_fps: settings.max_fps,
+        }
+    }
+}
+
+impl Default for RenderConfig {
+    /// Legacy behavior: 70 deg FOV, smooth lighting, no distance cap.
+    fn default() -> Self {
+        Self {
+            fov_deg: DEFAULT_FOV_DEG,
+            smooth_lighting: true,
+            view_distance: None,
+            clouds: CloudMode::Fancy,
+            particles: ParticleLevel::All,
+            entity_shadows: true,
+            vsync: true,
+            max_fps: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RenderStats {
     pub render_ms: f64,
     pub triangles_drawn: u64,
     pub pixels_shaded: u64,
-    /// S2: renderable sections the `GraphCuller` BFS reached and that had
+    /// Renderable sections the `GraphCuller` BFS reached and that had
     /// packed geometry submitted to the rasterizer.
     pub drawn_sections: u64,
-    /// S2: renderable sections rejected by frustum or occlusion culling.
+    /// Renderable sections rejected by frustum, occlusion, or the
+    /// draw-distance cap.
     pub culled_sections: u64,
-    /// S4: batched MultiDraw submissions for the regions holding drawn
+    /// Batched multi-draw submissions for the regions holding drawn
     /// sections (one `MultiDrawCommand` per region x facing bucket).
     pub region_draw_calls: u64,
-    /// S3: non-empty direction buckets submitted across drawn sections.
+    /// Non-empty direction buckets submitted across drawn sections.
     pub buckets_drawn: u64,
-    /// S3: non-empty direction buckets skipped as backfacing across drawn
+    /// Non-empty direction buckets skipped as backfacing across drawn
     /// sections.
     pub buckets_culled: u64,
 }
@@ -113,7 +174,7 @@ struct Rasterizer {
 }
 
 impl Rasterizer {
-    fn new(width: u32, height: u32) -> Self {
+    fn new(width: u32, height: u32, fov_deg: f64) -> Self {
         let (w, h) = (width as usize, height as usize);
         let mut rgb = vec![0u8; w * h * 3];
         // Sky gradient: deep blue at the top horizon to pale at the bottom.
@@ -138,7 +199,7 @@ impl Rasterizer {
             height: h,
             rgb,
             depth: vec![f32::INFINITY; w * h],
-            focal: (f64::from(height) * 0.5) / (FOV_DEG.to_radians() * 0.5).tan(),
+            focal: (f64::from(height) * 0.5) / (fov_deg.to_radians() * 0.5).tan(),
             stats: RenderStats::default(),
         }
     }
@@ -317,7 +378,7 @@ fn tint_color(tint: u32) -> Option<[f32; 3]> {
 const FACE_SHADE: [f32; 6] = [0.45, 1.0, 0.75, 0.85, 0.7, 0.95];
 const AO_SHADE: [f32; 4] = [0.4, 0.6, 0.8, 1.0];
 
-fn decode_vertex(pv: &PackedVertex, origin: [f64; 3]) -> CamVertex {
+fn decode_vertex(pv: &PackedVertex, origin: [f64; 3], smooth_lighting: bool) -> CamVertex {
     let attr = pv.attributes;
     let lx = f64::from(pv.position & 0x1f);
     let lz = f64::from((pv.position >> 5) & 0x1f);
@@ -332,7 +393,9 @@ fn decode_vertex(pv: &PackedVertex, origin: [f64; 3]) -> CamVertex {
     let base = tint_color(pv.tint).unwrap_or_else(|| palette_color(pv.state_id));
     let light = (block_light.max(sky_light) / 15.0).clamp(0.0, 1.0);
     let illum = 0.25 + 0.75 * light;
-    let shade = FACE_SHADE[direction.min(5)] * AO_SHADE[ao] * illum;
+    // Smooth lighting off = flat per-face shading without per-vertex AO.
+    let ao_shade = if smooth_lighting { AO_SHADE[ao] } else { 1.0 };
+    let shade = FACE_SHADE[direction.min(5)] * ao_shade * illum;
     CamVertex {
         pos: [origin[0] + lx, origin[1] + ly, origin[2] + lz],
         color: [base[0] * shade, base[1] * shade, base[2] * shade],
@@ -382,18 +445,29 @@ fn camera_basis(yaw: f32, pitch: f32) -> ([f64; 3], [f64; 3], [f64; 3]) {
     }
 }
 
-/// The six world-space frustum planes of a camera pose, in
-/// `mc_spine_client_mesh::box_in_frustum` form (`dot(n, p) + d >= 0` inside).
-/// `aspect` is render width / height. Used by the S2 `GraphCuller` walk and to
-/// prioritize `MeshCache::rebuild_dirty_ordered`.
+/// The six world-space frustum planes of a camera pose at the default FOV,
+/// in `mc_spine_client_mesh::box_in_frustum` form (`dot(n, p) + d >= 0`
+/// inside). `aspect` is render width / height. Used by the `GraphCuller`
+/// walk and to prioritize `MeshCache::rebuild_dirty_ordered`.
 pub fn frustum_planes(camera: [f32; 3], yaw: f32, pitch: f32, aspect: f64) -> [[f32; 4]; 6] {
+    frustum_planes_fov(camera, yaw, pitch, aspect, DEFAULT_FOV_DEG)
+}
+
+/// [`frustum_planes`] with an explicit vertical field of view in degrees.
+pub fn frustum_planes_fov(
+    camera: [f32; 3],
+    yaw: f32,
+    pitch: f32,
+    aspect: f64,
+    fov_deg: f64,
+) -> [[f32; 4]; 6] {
     let eye = [
         f64::from(camera[0]),
         f64::from(camera[1]),
         f64::from(camera[2]),
     ];
     let (fwd, right, up) = camera_basis(yaw, pitch);
-    let tan_v = (FOV_DEG.to_radians() * 0.5).tan();
+    let tan_v = (fov_deg.to_radians() * 0.5).tan();
     let tan_h = tan_v * aspect;
     // Side planes pass through the eye: a camera-space point (x, y, z) is
     // inside when |x| <= z*tan_h and |y| <= z*tan_v.
@@ -447,7 +521,8 @@ pub fn frustum_planes(camera: [f32; 3], yaw: f32, pitch: f32, aspect: f64) -> [[
 /// Render one camera frame of the live world to an RGB buffer.
 /// `eye` is the camera position (player pos + eye height); `yaw`/`pitch` are
 /// degrees using the server's convention (`forward = (-sin yaw·cos pitch,
-/// -sin pitch, cos yaw·cos pitch)`).
+/// -sin pitch, cos yaw·cos pitch)`). Equivalent to
+/// [`render_frame_with_config`] with [`RenderConfig::default`].
 pub fn render_frame(
     world: &WorldState,
     eye: [f64; 3],
@@ -456,15 +531,45 @@ pub fn render_frame(
     width: u32,
     height: u32,
 ) -> Result<RenderedFrame, String> {
+    render_frame_with_config(
+        world,
+        eye,
+        yaw,
+        pitch,
+        width,
+        height,
+        &RenderConfig::default(),
+    )
+}
+
+/// [`render_frame`] honoring a resolved [`RenderConfig`]: `fov_deg` drives
+/// the projection, `smooth_lighting` the per-vertex AO term, and
+/// `view_distance` caps drawn sections to a Chebyshev chunk-column radius
+/// around the camera column.
+pub fn render_frame_with_config(
+    world: &WorldState,
+    eye: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    width: u32,
+    height: u32,
+    config: &RenderConfig,
+) -> Result<RenderedFrame, String> {
     if width == 0 || height == 0 {
         return Err("render dimensions must be non-zero".to_string());
     }
     let started = Instant::now();
-    let mut raster = Rasterizer::new(width, height);
+    let mut raster = Rasterizer::new(width, height, config.fov_deg);
 
     let (fwd, right, up) = camera_basis(yaw, pitch);
     let eye32 = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
-    let planes = frustum_planes(eye32, yaw, pitch, f64::from(width) / f64::from(height));
+    let planes = frustum_planes_fov(
+        eye32,
+        yaw,
+        pitch,
+        f64::from(width) / f64::from(height),
+        config.fov_deg,
+    );
 
     // Transform world vertices into camera space.
     let to_camera = |p: [f64; 3]| -> [f64; 3] {
@@ -476,8 +581,9 @@ pub fn render_frame(
         ]
     };
 
-    // S2: frustum x BFS graph cull over the S1 visibility graph. Only sections
-    // the walk reaches are rasterized; everything else is counted as culled.
+    // Frustum x BFS graph cull over the section visibility graph. Only
+    // sections the walk reaches are rasterized; everything else is counted
+    // as culled.
     let camera_section = SectionCoord(
         (eye[0] / 16.0).floor() as i32,
         (eye[1] / 16.0).floor() as i32,
@@ -485,16 +591,34 @@ pub fn render_frame(
     );
     let cull = GraphCuller::new(camera_section, &planes).search(world.section_graphs());
     raster.stats.culled_sections = cull.culled as u64;
+    // Draw-distance cap: sections in chunk columns farther than
+    // `view_distance` from the camera column are culled like any other
+    // reject (they belong to the far-terrain LOD path instead).
+    let within_view_distance = |coord: &SectionCoord| -> bool {
+        match config.view_distance {
+            None => true,
+            Some(distance) => {
+                let dc = i64::from(coord.0 - camera_section.0)
+                    .abs()
+                    .max(i64::from(coord.2 - camera_section.2).abs());
+                dc <= i64::from(distance)
+            }
+        }
+    };
 
     let meshes: HashMap<SectionCoord, &[PackedVertex]> = world.packed_meshes().collect();
     // Translucent draw list: (squared camera distance, coord, bucket draw mask).
     let mut translucent_sections: Vec<(f64, SectionCoord, u8)> = Vec::new();
-    // S4 accounting: per-region set of drawn-section slab identities
+    // Multi-draw accounting: per-region set of drawn-section slab identities
     // (vertex_offset, index_offset) so MultiDraw submissions are only counted
     // when they contain at least one drawn section's draw.
     let mut drawn_slabs: HashMap<[i32; 3], HashSet<(u32, u32)>> = HashMap::new();
 
     for &coord in &cull.visible {
+        if !within_view_distance(&coord) {
+            raster.stats.culled_sections += 1;
+            continue;
+        }
         let Some(&packed) = meshes.get(&coord) else {
             continue;
         };
@@ -521,8 +645,8 @@ pub fn render_frame(
             f64::from(coord.1) * 16.0,
             f64::from(coord.2) * 16.0,
         ];
-        // S3: keep only the direction buckets whose section side faces the
-        // camera; the unassigned bucket always draws.
+        // Directional face bucketing: keep only the direction buckets whose
+        // section side faces the camera; the unassigned bucket always draws.
         let draw_mask = bucket_draw_mask(box_facing_mask(
             [origin[0] as f32, origin[1] as f32, origin[2] as f32],
             eye32,
@@ -546,7 +670,7 @@ pub fn render_frame(
                 let mut verts = [CamVertex::default(); 4];
                 let mut any_translucent = false;
                 for (i, pv) in quad.iter().enumerate() {
-                    verts[i] = decode_vertex(pv, origin);
+                    verts[i] = decode_vertex(pv, origin, config.smooth_lighting);
                     any_translucent |= is_translucent_quad(&verts[i]);
                 }
                 // All four vertices of a quad share layer/fluid/diagonal.
@@ -604,15 +728,15 @@ pub fn render_frame(
                 continue;
             }
             let quad = &packed[qi * 4..qi * 4 + 4];
-            // S3 bucket culling applies to translucent quads too: the packed
-            // direction attribute is the quad's direction bucket.
+            // Direction-bucket backface culling applies to translucent quads
+            // too: the packed direction attribute is the quad's bucket.
             let direction = quad[0].attributes & ATTR_DIRECTION_MASK;
             if draw_mask & (1 << direction) == 0 {
                 continue;
             }
             let mut verts = [CamVertex::default(); 4];
             for (i, pv) in quad.iter().enumerate() {
-                verts[i] = decode_vertex(pv, origin);
+                verts[i] = decode_vertex(pv, origin, config.smooth_lighting);
             }
             if !is_translucent_quad(&verts[0]) {
                 continue;
@@ -636,9 +760,9 @@ pub fn render_frame(
         }
     }
 
-    // S4: one MultiDraw submission per (region, facing bucket); a submission
-    // counts only when at least one of its indirect draws belongs to a section
-    // drawn this frame — culled sections never reach the GPU.
+    // One multi-draw submission per (region, facing bucket); a submission
+    // counts only when at least one of its indirect draws belongs to a
+    // section drawn this frame — culled sections never reach the GPU.
     raster.stats.region_draw_calls = world
         .render_regions()
         .build_multidraw(eye32)
@@ -716,7 +840,7 @@ pub fn encode_png_rgb(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: S2 graph culling, S3 bucket culling, S4 region batching
+// Tests: graph occlusion culling, bucket culling, multi-draw region batching
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -725,6 +849,7 @@ mod tests {
     use mc_spine_client_mesh::SECTION_CELLS;
 
     use crate::protocol::{DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta};
+    use crate::settings::QualityPreset;
     use crate::world::{BlockTable, WorldState};
 
     fn test_dimension() -> DimensionMeta {
@@ -868,5 +993,96 @@ mod tests {
         // Each floor section also emits back-facing side/bottom buckets that
         // must be skipped while the camera is above the slab.
         assert!(frame.stats.buckets_culled > 0);
+    }
+
+    /// `RenderConfig::from_settings` mirrors the resolved `ClientSettings`,
+    /// and `RenderConfig::default()` keeps the legacy frame behavior.
+    #[test]
+    fn render_config_from_settings_maps_all_fields() {
+        let mut settings = ClientSettings::from_preset(QualityPreset::Fast);
+        settings.fov = 100;
+        settings.clouds = CloudMode::Off;
+        let config = RenderConfig::from_settings(&settings);
+        assert_eq!(config.fov_deg, 100.0);
+        assert!(!config.smooth_lighting);
+        assert_eq!(config.view_distance, Some(8));
+        assert_eq!(config.clouds, CloudMode::Off);
+        assert_eq!(config.particles, ParticleLevel::Decreased);
+        assert!(!config.entity_shadows);
+        // Fast leaves vsync/max_fps at the shared defaults.
+        assert!(config.vsync);
+        assert_eq!(config.max_fps, None);
+        // Default (Balanced) settings differ from the legacy renderer
+        // default only by gaining the explicit distance cap.
+        assert_eq!(
+            RenderConfig::from_settings(&ClientSettings::default()),
+            RenderConfig {
+                view_distance: Some(12),
+                ..RenderConfig::default()
+            }
+        );
+    }
+
+    /// `decode_vertex` only darkens by per-vertex AO when smooth lighting is
+    /// enabled; with it off the face shade is uniform.
+    #[test]
+    fn smooth_lighting_toggles_vertex_ao() {
+        let mut pv = PackedVertex {
+            position: 0,
+            state_id: 1,
+            attributes: 0,
+            tint: 0,
+        };
+        // direction = Up (index 1), ao = 0 (darkest), full sky light.
+        pv.attributes = 1 | (0 << ATTR_AO_SHIFT) | (15 << ATTR_SKY_LIGHT_SHIFT);
+        let smooth = decode_vertex(&pv, [0.0; 3], true);
+        let flat = decode_vertex(&pv, [0.0; 3], false);
+        assert!(flat.color[0] > smooth.color[0]);
+        // Full sky light + ao 0: smooth shade = base * AO_SHADE[0], flat = base.
+        let base = palette_color(1);
+        assert_eq!(smooth.color[0], base[0] * AO_SHADE[0]);
+        assert_eq!(flat.color[0], base[0]);
+    }
+
+    /// The view-distance cap removes in-frustum chunk columns beyond the
+    /// resolved distance without affecting nearer sections.
+    #[test]
+    fn view_distance_caps_sections_beyond_distance() {
+        let mut world = WorldState::new(test_dimension(), BlockTable::builtin());
+        // A contiguous 9-column strip so the graph culler reaches the far
+        // end; solid floor at y sections 0-1 under air.
+        for cz in 0..=8 {
+            let sections = vec![
+                uniform_section(1),
+                uniform_section(1),
+                uniform_section(0),
+                uniform_section(0),
+            ];
+            world.apply_chunk(chunk(0, cz, sections)).unwrap();
+        }
+        // Camera just above the floor looking along +z: every column's
+        // exposed top faces are inside the frustum, including the ones the
+        // view-distance cap must reject.
+        let cam32 = [8.0, 40.0, 8.0];
+        let planes = frustum_planes(cam32, 0.0, 0.0, 16.0 / 9.0);
+        world
+            .rebuild_dirty_bounded_ordered(usize::MAX, cam32, &planes)
+            .unwrap();
+
+        let eye = [8.0, 40.0, 8.0];
+        let full = render_frame(&world, eye, 0.0, 0.0, 160, 90).unwrap();
+        let mut settings = ClientSettings::default();
+        settings.view_distance = 6;
+        let config = RenderConfig::from_settings(&settings);
+        let limited =
+            render_frame_with_config(&world, eye, 0.0, 0.0, 160, 90, &config).unwrap();
+
+        assert!(
+            limited.stats.drawn_sections < full.stats.drawn_sections,
+            "cap drew {} of {} sections",
+            limited.stats.drawn_sections,
+            full.stats.drawn_sections
+        );
+        assert!(limited.stats.culled_sections > full.stats.culled_sections);
     }
 }
