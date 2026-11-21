@@ -58,7 +58,10 @@ def test_export(from_worktree):
                      'tests/companion_suite_e2e.py', 'docker/Dockerfile',
                      'docker/entrypoint.sh', 'docs/operator-guide.md',
                      'docs/architecture-crates.md', 'docs/release-checklist.md',
-                     '.github/workflows/pages.yml'):
+                     '.github/workflows/pages.yml',
+                     'website/index.html', 'website/site-config.js',
+                     'website/app.js', 'website/style.css',
+                     'website/check_site.py'):
             assert (out / path).is_file(), path
         # No generated (*_1211*) or local-state (world_overlay*.bin*) artifact may
         # be left anywhere in the exported tree.

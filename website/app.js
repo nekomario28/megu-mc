@@ -12,7 +12,10 @@
 //    documents fail-closed — malformed JSON, wrong
 //    formatVersion/manifestType/game, and path-traversal entries are hard
 //    errors, never silent skips — and emits the same
-//    `mc-spine-modpack-preflight/1` report shape the CLIs print.
+//    `mc-spine-modpack-preflight/1` report shape the CLIs print. A small
+//    bounds-checked ZIP reader (Stored + Deflate via the standard
+//    DecompressionStream, no third-party libraries) pulls the manifest
+//    member straight out of a dropped .mrpack/.zip archive.
 //
 // 2. The DOM wiring: SITE_CONFIG brand binding, the drag-and-drop checker
 //    UI, and copy-to-clipboard buttons. Everything runs 100% client-side;
@@ -935,6 +938,345 @@
   }
 
   // ---------------------------------------------------------------------
+  // Minimal ZIP reader — just enough to pull the manifest member out of a
+  // dropped .mrpack or CurseForge .zip. Bounds-checked end to end and
+  // fail-closed: multi-disk, encrypted, ZIP64, corrupt, and >16 MiB
+  // members are all hard errors, never silent skips. Compression method 0
+  // (Stored) needs no decoder; method 8 (Deflate) inflates through the
+  // standard DecompressionStream('deflate-raw') that modern browsers (and
+  // Node 18+) ship natively — zero third-party libraries.
+  // ---------------------------------------------------------------------
+
+  var EOCD_SIGNATURE = 0x06054b50;
+  var ZIP64_LOCATOR_SIGNATURE = 0x07064b50;
+  var CENTRAL_SIGNATURE = 0x02014b50;
+  var LOCAL_SIGNATURE = 0x04034b50;
+  var EOCD_MIN_BYTES = 22;
+  // The EOCD sits within the last 22 + 64 KiB bytes (max archive comment).
+  var EOCD_SEARCH_BYTES = EOCD_MIN_BYTES + 0xffff;
+  var METHOD_STORED = 0;
+  var METHOD_DEFLATE = 8;
+  var FLAG_MASK_ENCRYPTED = 0x0001 | 0x0040 | 0x2000;
+
+  function u16le(bytes, off) {
+    return bytes[off] | (bytes[off + 1] << 8);
+  }
+
+  function u32le(bytes, off) {
+    return (bytes[off] | (bytes[off + 1] << 8) |
+      (bytes[off + 2] << 16) | (bytes[off + 3] << 24)) >>> 0;
+  }
+
+  // Lossy UTF-8 decode for member names — a name that does not decode
+  // simply never matches the well-known manifest names.
+  function utf8DecodeLossy(bytes) {
+    if (typeof TextDecoder !== "undefined") {
+      return new TextDecoder("utf-8").decode(bytes);
+    }
+    var s = "";
+    for (var i = 0; i < bytes.length; i++) {
+      s += bytes[i] < 0x80
+        ? String.fromCharCode(bytes[i])
+        : "\ufffd";
+    }
+    return s;
+  }
+
+  // Strict UTF-8 decode for the manifest body; null on invalid input.
+  function utf8DecodeStrict(bytes) {
+    if (typeof TextDecoder === "undefined") {
+      for (var i = 0; i < bytes.length; i++) {
+        if (bytes[i] > 0x7f) {
+          return null;
+        }
+      }
+      return utf8DecodeLossy(bytes);
+    }
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  var CRC32_TABLE = (function () {
+    var table = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) {
+        c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      }
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32Bytes(bytes) {
+    var crc = 0xffffffff;
+    for (var i = 0; i < bytes.length; i++) {
+      crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  // Scan the trailing window for the EOCD record; the comment-length
+  // cross-check keeps a false signature inside a comment from matching.
+  function findEocdOffset(bytes, ctx) {
+    if (bytes.length < EOCD_MIN_BYTES) {
+      throw new ModpackError(ctx + ": not a ZIP archive (too small)");
+    }
+    var first = Math.max(0, bytes.length - EOCD_SEARCH_BYTES);
+    for (var pos = bytes.length - EOCD_MIN_BYTES; pos >= first; pos--) {
+      if (u32le(bytes, pos) !== EOCD_SIGNATURE) {
+        continue;
+      }
+      if (pos + EOCD_MIN_BYTES + u16le(bytes, pos + 20) === bytes.length) {
+        return pos;
+      }
+    }
+    throw new ModpackError(
+      ctx + ": not a ZIP archive (no end of central directory)");
+  }
+
+  function readCentralDirectory(bytes, ctx) {
+    var eocd = findEocdOffset(bytes, ctx);
+    var disk = u16le(bytes, eocd + 4);
+    var cdDisk = u16le(bytes, eocd + 6);
+    var diskEntries = u16le(bytes, eocd + 8);
+    var totalEntries = u16le(bytes, eocd + 10);
+    var cdSize = u32le(bytes, eocd + 12);
+    var cdOffset = u32le(bytes, eocd + 16);
+    if (disk === 0xffff || cdDisk === 0xffff || diskEntries === 0xffff ||
+        totalEntries === 0xffff || cdSize === 0xffffffff ||
+        cdOffset === 0xffffffff ||
+        (eocd >= 20 &&
+         u32le(bytes, eocd - 20) === ZIP64_LOCATOR_SIGNATURE)) {
+      throw new ModpackError(ctx + ": ZIP64 archives are unsupported");
+    }
+    if (disk !== 0 || cdDisk !== 0 || diskEntries !== totalEntries) {
+      throw new ModpackError(
+        ctx + ": multi-disk ZIP archives are unsupported");
+    }
+    if (cdOffset > eocd || cdSize > eocd - cdOffset) {
+      throw new ModpackError(ctx + ": corrupt central directory bounds");
+    }
+    var entries = [];
+    var pos = cdOffset;
+    var end = cdOffset + cdSize;
+    for (var i = 0; i < totalEntries; i++) {
+      if (pos + 46 > end || u32le(bytes, pos) !== CENTRAL_SIGNATURE) {
+        throw new ModpackError(ctx + ": corrupt central directory entry");
+      }
+      var nameLen = u16le(bytes, pos + 28);
+      var extraLen = u16le(bytes, pos + 30);
+      var commentLen = u16le(bytes, pos + 32);
+      var recLen = 46 + nameLen + extraLen + commentLen;
+      if (pos + recLen > end) {
+        throw new ModpackError(ctx + ": corrupt central directory entry");
+      }
+      if (u16le(bytes, pos + 34) !== 0) {
+        throw new ModpackError(
+          ctx + ": multi-disk ZIP archives are unsupported");
+      }
+      entries.push({
+        name: utf8DecodeLossy(bytes.subarray(pos + 46, pos + 46 + nameLen)),
+        flag: u16le(bytes, pos + 8),
+        method: u16le(bytes, pos + 10),
+        crc32: u32le(bytes, pos + 16),
+        compressedSize: u32le(bytes, pos + 20),
+        uncompressedSize: u32le(bytes, pos + 24),
+        localOffset: u32le(bytes, pos + 42),
+      });
+      pos += recLen;
+    }
+    if (pos !== end) {
+      throw new ModpackError(ctx + ": corrupt central directory bounds");
+    }
+    return entries;
+  }
+
+  var MANIFEST_MEMBER_NAMES = ["modrinth.index.json", "manifest.json"];
+
+  // modrinth.index.json is preferred wherever both exist; an exact
+  // root-level member beats a same-named file nested deeper.
+  function pickManifestMember(entries, ctx) {
+    var best = null;
+    var bestRank = 4;
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i];
+      if (!entry.name || entry.name.charAt(entry.name.length - 1) === "/") {
+        continue;
+      }
+      var base = entry.name.split("/").pop();
+      for (var j = 0; j < MANIFEST_MEMBER_NAMES.length; j++) {
+        var wanted = MANIFEST_MEMBER_NAMES[j];
+        var rank = entry.name === wanted
+          ? j
+          : base === wanted ? 2 + j : -1;
+        if (rank !== -1 && rank < bestRank) {
+          best = entry;
+          bestRank = rank;
+        }
+      }
+    }
+    if (best === null) {
+      throw new ModpackError(
+        ctx + ": no modrinth.index.json or manifest.json inside the " +
+          "archive");
+    }
+    return best;
+  }
+
+  // Bounds-check the member's local header and return its still-compressed
+  // data slice.
+  function memberCompressedData(bytes, entry, ctx) {
+    if (entry.flag & FLAG_MASK_ENCRYPTED) {
+      throw new ModpackError(
+        ctx + ": encrypted ZIP members are unsupported");
+    }
+    if (entry.method !== METHOD_STORED && entry.method !== METHOD_DEFLATE) {
+      throw new ModpackError(
+        ctx + ": unsupported ZIP compression method " + entry.method +
+          " for '" + entry.name + "'");
+    }
+    if (entry.uncompressedSize === 0xffffffff ||
+        entry.compressedSize === 0xffffffff) {
+      throw new ModpackError(ctx + ": ZIP64 archives are unsupported");
+    }
+    if (entry.uncompressedSize > MAX_MANIFEST_MEMBER_BYTES) {
+      throw new ModpackError(
+        ctx + ": '" + entry.name + "' exceeds the 16 MiB limit");
+    }
+    var off = entry.localOffset;
+    if (off + 30 > bytes.length ||
+        u32le(bytes, off) !== LOCAL_SIGNATURE) {
+      throw new ModpackError(ctx + ": corrupt local file header");
+    }
+    var dataStart = off + 30 + u16le(bytes, off + 26) +
+      u16le(bytes, off + 28);
+    if (dataStart > bytes.length ||
+        entry.compressedSize > bytes.length - dataStart) {
+      throw new ModpackError(ctx + ": corrupt member data bounds");
+    }
+    return bytes.subarray(dataStart, dataStart + entry.compressedSize);
+  }
+
+  // Raw-deflate inflation through DecompressionStream, capped fail-closed
+  // at MAX_MANIFEST_MEMBER_BYTES so a zip bomb cannot grow past it.
+  function inflateRaw(bytes, ctx) {
+    if (typeof DecompressionStream === "undefined" ||
+        typeof ReadableStream === "undefined") {
+      return Promise.reject(new ModpackError(
+        ctx + ": this environment cannot inflate deflate data"));
+    }
+    var reader;
+    try {
+      var source = new ReadableStream({
+        start: function (controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        }
+      });
+      reader = source.pipeThrough(
+        new DecompressionStream("deflate-raw")).getReader();
+    } catch (e) {
+      return Promise.reject(new ModpackError(
+        ctx + ": cannot inflate (" +
+          (e && e.message ? e.message : e) + ")"));
+    }
+    var chunks = [];
+    var total = 0;
+    function pump() {
+      return reader.read().then(function (result) {
+        if (result.done) {
+          var out = new Uint8Array(total);
+          var at = 0;
+          chunks.forEach(function (chunk) {
+            out.set(chunk, at);
+            at += chunk.byteLength;
+          });
+          return out;
+        }
+        total += result.value.byteLength;
+        if (total > MAX_MANIFEST_MEMBER_BYTES) {
+          return reader.cancel().then(function () {
+            throw new ModpackError(
+              ctx + ": decompressed data exceeds the 16 MiB limit");
+          });
+        }
+        chunks.push(result.value);
+        return pump();
+      });
+    }
+    return pump().then(function (out) {
+      return out;
+    }, function (err) {
+      if (err instanceof ModpackError) {
+        throw err;
+      }
+      throw new ModpackError(
+        ctx + ": corrupt deflate stream (" +
+          (err && err.message ? err.message : String(err)) + ")");
+    });
+  }
+
+  // extractManifestFromZipBytes(uint8Array) — locate modrinth.index.json
+  // (preferred) or manifest.json inside a .mrpack/.zip byte array and
+  // resolve to {name, text} with the member's decoded UTF-8 contents.
+  // Returns a promise that rejects with ModpackError on anything
+  // malformed, encrypted, ZIP64, oversized, or otherwise unsupported.
+  function extractManifestFromZipBytes(bytes, fileName) {
+    var ctx = fileName || "archive.zip";
+    var buf;
+    if (typeof Uint8Array !== "undefined" && bytes instanceof Uint8Array) {
+      buf = bytes;
+    } else if (typeof ArrayBuffer !== "undefined" &&
+               bytes instanceof ArrayBuffer) {
+      buf = new Uint8Array(bytes);
+    } else if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView &&
+               ArrayBuffer.isView(bytes)) {
+      buf = new Uint8Array(
+        bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    } else {
+      return Promise.reject(new ModpackError(
+        ctx + ": archive bytes must be a Uint8Array"));
+    }
+    var member;
+    var data;
+    try {
+      member = pickManifestMember(readCentralDirectory(buf, ctx), ctx);
+      data = memberCompressedData(buf, member, ctx);
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    var finish = function (out) {
+      if (out.length !== member.uncompressedSize) {
+        throw new ModpackError(
+          ctx + ": corrupt member '" + member.name +
+            "' (size mismatch)");
+      }
+      if (crc32Bytes(out) !== member.crc32) {
+        throw new ModpackError(
+          ctx + ": CRC-32 mismatch for '" + member.name + "'");
+      }
+      var text = utf8DecodeStrict(out);
+      if (text === null) {
+        throw new ModpackError(
+          ctx + ": '" + member.name + "' is not valid UTF-8");
+      }
+      return { name: member.name, text: text };
+    };
+    if (member.method === METHOD_STORED) {
+      try {
+        return Promise.resolve(finish(data));
+      } catch (e) {
+        return Promise.reject(e);
+      }
+    }
+    return inflateRaw(data, ctx).then(finish);
+  }
+
+  // ---------------------------------------------------------------------
   // Analysis (classify_entry / analyze_modpack / report helpers)
   // ---------------------------------------------------------------------
 
@@ -1282,6 +1624,7 @@
 
   var api = {
     analyzeModpackJson: analyzeModpackJson,
+    extractManifestFromZipBytes: extractManifestFromZipBytes,
     formatHumanSummary: formatHumanSummary,
     parseModrinthManifest: parseModrinthManifest,
     parseCurseforgeManifest: parseCurseforgeManifest,
@@ -1648,15 +1991,38 @@
     });
   }
 
+  // ZIP archives open with 'PK\x03\x04' (first local member) or 'PK\x05\x06'
+  // (empty archive's lone EOCD); a dropped file starting with either goes
+  // through the archive reader regardless of its extension.
+  function looksLikeZipBytes(bytes) {
+    return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b &&
+      ((bytes[2] === 0x03 && bytes[3] === 0x04) ||
+       (bytes[2] === 0x05 && bytes[3] === 0x06));
+  }
+
   function readManifestFile(file) {
     var reader = new FileReader();
     reader.onload = function () {
-      runAnalysis(String(reader.result), file.name);
+      var bytes = new Uint8Array(reader.result);
+      if (!looksLikeZipBytes(bytes)) {
+        runAnalysis(utf8DecodeLossy(bytes), file.name);
+        return;
+      }
+      extractManifestFromZipBytes(bytes, file.name).then(function (res) {
+        runAnalysis(res.text, file.name);
+      }, function (e) {
+        if (e instanceof ModpackError) {
+          showError(e.message);
+        } else {
+          showError(file.name + ": unexpected error (" +
+            (e && e.message ? e.message : e) + ")");
+        }
+      });
     };
     reader.onerror = function () {
       showError(file.name + ": could not read the file");
     };
-    reader.readAsText(file);
+    reader.readAsArrayBuffer(file);
   }
 
   // -- Boot ------------------------------------------------------------------

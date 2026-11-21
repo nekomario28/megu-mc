@@ -276,6 +276,9 @@ def map_changed_files(paths):
             commands.add("python3 tools/provenance_check.py")
         elif path == "tools/vanilla_data" or path.startswith("tools/vanilla_data/"):
             commands.add("python3 tools/vanilla_data/version_pack.py --self-test")
+        elif path == "website" or path.startswith("website/"):
+            commands.add("python3 website/check_site.py")
+            commands.add("python3 tools/provenance_check.py")
         elif path == "src" or path.startswith("src/"):
             commands.update(SRC_GATES)
             base = path.rsplit("/", 1)[-1]
@@ -556,6 +559,15 @@ class MapContract(unittest.TestCase):
                       map_changed_files(["client-app/src/lib.rs"]))
         self.assertIn("python3 tests/mod_fallback_test.py",
                       map_changed_files(["mod-adapter-core/src/lib.rs"]))
+
+    def test_website_paths_map_to_the_site_gate_and_provenance(self):
+        expected = {"python3 website/check_site.py",
+                    "python3 tools/provenance_check.py"}
+        self.assertEqual(set(map_changed_files(["website/app.js"])), expected)
+        self.assertEqual(set(map_changed_files(["website/index.html"])), expected)
+        self.assertEqual(set(map_changed_files(["website/check_site.py"])),
+                         expected)
+        self.assertEqual(set(map_changed_files(["website"])), expected)
 
     def test_tools_paths(self):
         self.assertEqual(map_changed_files(["tools/vanilla_data/build_vanilla_data.py"]),

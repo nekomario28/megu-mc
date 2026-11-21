@@ -64,8 +64,9 @@
         <p class="section-kicker">100% browser-local</p>
         <h2>Modpack pre-flight checker</h2>
         <p class="section-lede">
-          Drop a Modrinth <code>modrinth.index.json</code> or a CurseForge
-          <code>manifest.json</code> and see instantly how
+          Drop a Modrinth <code>.mrpack</code> or a CurseForge
+          <code>.zip</code> — or a bare <code>modrinth.index.json</code> /
+          <code>manifest.json</code> — and see instantly how
           <span data-cfg="projectName">mc-spine</span> would treat the pack:
           which performance mods are already built in and skipped, which
           entries run natively, and which Java JARs still need a
@@ -89,13 +90,13 @@
           </div>
 
           <div class="dropzone" id="dropzone" role="button" tabindex="0"
-               aria-label="Drop a modpack manifest here or click to browse">
-            <strong>Drop <code>modrinth.index.json</code> or <code>manifest.json</code> here</strong>
-            <span class="hint">or click to browse — .mrpack users: unzip and drop the index file inside</span>
-            <input type="file" id="file-input" accept=".json,application/json" hidden>
+               aria-label="Drop a modpack archive or manifest here or click to browse">
+            <strong>Drop a <code>.mrpack</code>, CurseForge <code>.zip</code>, or manifest <code>.json</code> here</strong>
+            <span class="hint">or click to browse — archives are unpacked right in this tab</span>
+            <input type="file" id="file-input" accept=".mrpack,.zip,.json" hidden>
           </div>
           <p class="privacy-note">
-            Analysis runs 100% client-side in vanilla JS — the manifest never
+            Analysis runs 100% client-side in vanilla JS — the modpack never
             leaves this tab.
           </p>
 

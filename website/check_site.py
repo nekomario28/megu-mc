@@ -20,7 +20,9 @@ Checks, all fail-closed:
   5. When `node` is on PATH, a small unit harness requires website/app.js
      (and site-config.js first, exactly like the browser) and exercises
      analyzeModpackJson against Modrinth + CurseForge fixtures, the
-     version-range engine, id inference, and path-traversal rejection.
+     version-range engine, id inference, path-traversal rejection, and
+     extractManifestFromZipBytes against a real ZIP_DEFLATED .mrpack, a
+     stored CurseForge .zip, and corrupt/oversized fail-closed archives.
 
 Exit status: 0 clean, 1 findings.
 """
@@ -367,12 +369,217 @@ expectThrow(JSON.stringify({
 expectThrow("{not json", "manifest.json", "invalid JSON");
 expectThrow("{}", "pack.json", "cannot determine pack format");
 
-console.log("app.js unit check: OK");
+// --- .mrpack / .zip archive extraction (pure-JS ZIP reader) --------------
+const zlib = require("zlib");
+
+const CRC_TABLE = new Uint32Array(256);
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : c >>> 1;
+  CRC_TABLE[n] = c >>> 0;
+}
+function crc32buf(buf) {
+  let crc = 0xffffffff;
+  for (const b of buf) crc = CRC_TABLE[(crc ^ b) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+// Minimal ZIP writer for fixtures: local headers + central dir + EOCD,
+// Stored (method 0) or deflateRaw (method 8) members.
+function buildZip(members) {
+  const parts = [];
+  const central = [];
+  let offset = 0;
+  for (const mdef of members) {
+    const nameBytes = Buffer.from(mdef.name, "utf8");
+    const data = Buffer.isBuffer(mdef.data)
+      ? mdef.data : Buffer.from(mdef.data);
+    const stored = mdef.method === 8 ? zlib.deflateRawSync(data) : data;
+    const crc = crc32buf(data);
+    const flag = mdef.flag || 0;
+    const method = mdef.method || 0;
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(flag, 6);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(stored.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    parts.push(local, nameBytes, stored);
+
+    const cd = Buffer.alloc(46);
+    cd.writeUInt32LE(0x02014b50, 0);
+    cd.writeUInt16LE(20, 4);
+    cd.writeUInt16LE(20, 6);
+    cd.writeUInt16LE(flag, 8);
+    cd.writeUInt16LE(method, 10);
+    cd.writeUInt32LE(crc, 16);
+    cd.writeUInt32LE(stored.length, 20);
+    cd.writeUInt32LE(data.length, 24);
+    cd.writeUInt16LE(nameBytes.length, 28);
+    cd.writeUInt32LE(offset, 42);
+    central.push(cd, nameBytes);
+    offset += 30 + nameBytes.length + stored.length;
+  }
+  const cdBuf = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(members.length, 8);
+  eocd.writeUInt16LE(members.length, 10);
+  eocd.writeUInt32LE(cdBuf.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([...parts, cdBuf, eocd]);
+}
+
+const CD_SIG = Buffer.from([0x50, 0x4b, 0x01, 0x02]);
+
+// Offset of the named member's central-directory record inside a fixture
+// built by buildZip (names are unique per fixture).
+function findCdEntry(zip, name) {
+  let pos = zip.indexOf(CD_SIG);
+  assert.ok(pos > 0);
+  while (zip.toString("utf8", pos + 46, pos + 46 + name.length) !== name) {
+    pos = zip.indexOf(CD_SIG, pos + 1);
+    assert.ok(pos > 0);
+  }
+  return pos;
+}
+
+async function expectExtractThrow(bytes, fileName, needle) {
+  try {
+    await m.extractManifestFromZipBytes(bytes, fileName);
+  } catch (e) {
+    assert.ok(
+      e instanceof m.ModpackError,
+      "expected ModpackError for " + fileName + ", got " +
+        (e && e.stack || e));
+    const hit = needle instanceof RegExp
+      ? needle.test(e.message) : e.message.includes(needle);
+    assert.ok(hit, "error '" + e.message + "' lacks '" + needle + "'");
+    return;
+  }
+  assert.fail("expected a ModpackError for " + fileName);
+}
+
+(async function () {
+  const indexBytes = Buffer.from(m.SAMPLE_MODRINTH_INDEX_JSON, "utf8");
+
+  // A real ZIP_DEFLATED .mrpack: the deflated index plus decoy members,
+  // exactly like a Modrinth export lays them out.
+  const mrpack = buildZip([
+    {name: "overrides/mods/sodium-fabric-0.6.13+mc1.21.1.jar",
+     data: Buffer.from("decoy-jar"), method: 0},
+    {name: "modrinth.index.json", data: indexBytes, method: 8},
+    {name: "overrides/config/client.cfg",
+     data: Buffer.from("x=1"), method: 8},
+  ]);
+  const fromMrpack = await m.extractManifestFromZipBytes(
+    new Uint8Array(mrpack), "sample.mrpack");
+  assert.strictEqual(fromMrpack.name, "modrinth.index.json");
+  const zippedReport = m.analyzeModpackJson(
+    fromMrpack.text, {fileName: "sample.mrpack", target: "1.21.1"});
+  assert.deepStrictEqual(zippedReport.entries, report.entries);
+  assert.strictEqual(zippedReport.readiness, report.readiness);
+  assert.strictEqual(zippedReport.format, "modrinth");
+
+  // A Stored (uncompressed) CurseForge .zip — classic CF export layout.
+  const cfZip = buildZip([
+    {name: "overrides/mods/readme.txt",
+     data: Buffer.from("hi"), method: 0},
+    {name: "manifest.json", data: Buffer.from(cf, "utf8"), method: 0},
+  ]);
+  const fromZip = await m.extractManifestFromZipBytes(
+    new Uint8Array(cfZip), "cf-pack.zip");
+  assert.strictEqual(fromZip.name, "manifest.json");
+  const zipCf = m.analyzeModpackJson(
+    fromZip.text, {fileName: "cf-pack.zip"});
+  assert.deepStrictEqual(zipCf.entries, cfReport.entries);
+  assert.strictEqual(zipCf.format, "curseforge");
+
+  // modrinth.index.json is preferred when both members exist.
+  const both = buildZip([
+    {name: "manifest.json", data: Buffer.from(cf, "utf8"), method: 0},
+    {name: "modrinth.index.json", data: indexBytes, method: 8},
+  ]);
+  const picked = await m.extractManifestFromZipBytes(
+    new Uint8Array(both), "both.mrpack");
+  assert.strictEqual(picked.name, "modrinth.index.json");
+
+  // Fail closed: garbage, truncated, corrupt, oversized, encrypted,
+  // foreign-method, ZIP64-flagged, and manifest-less archives.
+  await expectExtractThrow(
+    Buffer.from("definitely not a zip"), "bad.zip", "not a ZIP");
+  await expectExtractThrow(
+    new Uint8Array(mrpack.subarray(0, mrpack.length - 10)),
+    "truncated.mrpack", "central directory");
+
+  const corrupt = Buffer.from(mrpack);
+  // Flip one byte inside the deflated index member's payload (right after
+  // its 30-byte local header + name): inflate, size, or CRC must catch it.
+  const nameLen = Buffer.from("overrides/mods/sodium-fabric-0.6.13+mc1.21.1.jar").length;
+  const second = 30 + nameLen + Buffer.from("decoy-jar").length +
+    30 + "modrinth.index.json".length;
+  corrupt[second] ^= 0xff;
+  await expectExtractThrow(
+    new Uint8Array(corrupt), "corrupt.mrpack",
+    /crc|corrupt|deflate|mismatch|size/i);
+
+  // Declared >16 MiB uncompressed: rejected before a byte is inflated.
+  const declaredBomb = Buffer.from(mrpack);
+  declaredBomb.writeUInt32LE(
+    17 * 1024 * 1024,
+    findCdEntry(declaredBomb, "modrinth.index.json") + 24);
+  await expectExtractThrow(
+    new Uint8Array(declaredBomb), "declared-bomb.mrpack", "16 MiB");
+
+  // Lying about the size: real output is 17 MiB while the central
+  // directory claims 100 — the streaming cap must still stop it.
+  const streamBomb = Buffer.from(buildZip([
+    {name: "modrinth.index.json",
+     data: Buffer.alloc(17 * 1024 * 1024), method: 8},
+  ]));
+  streamBomb.writeUInt32LE(
+    100, findCdEntry(streamBomb, "modrinth.index.json") + 24);
+  await expectExtractThrow(
+    new Uint8Array(streamBomb), "stream-bomb.mrpack", "16 MiB");
+
+  const encrypted = Buffer.from(cfZip);
+  encrypted.writeUInt16LE(
+    0x0001, findCdEntry(encrypted, "manifest.json") + 8);
+  await expectExtractThrow(
+    new Uint8Array(encrypted), "encrypted.zip", "encrypted");
+
+  const imploded = Buffer.from(cfZip);
+  imploded.writeUInt16LE(
+    99, findCdEntry(imploded, "manifest.json") + 10);
+  await expectExtractThrow(
+    new Uint8Array(imploded), "imploded.zip", "compression method");
+
+  const zip64 = Buffer.from(cfZip);
+  zip64.writeUInt16LE(0xffff, zip64.length - 22 + 10);
+  await expectExtractThrow(
+    new Uint8Array(zip64), "zip64.mrpack", "ZIP64");
+
+  const noManifest = buildZip([
+    {name: "overrides/readme.txt", data: Buffer.from("hi"), method: 0},
+  ]);
+  await expectExtractThrow(
+    new Uint8Array(noManifest), "empty.zip", "manifest.json");
+
+  console.log("app.js unit check: OK");
+})().catch(function (err) {
+  console.error(err && err.stack || err);
+  process.exit(1);
+});
 """
 
 
 def check_js_unit():
-    """Check 5: node unit harness for analyzeModpackJson."""
+    """Check 5: node unit harness for analyzeModpackJson +
+    extractManifestFromZipBytes."""
     node = shutil.which("node")
     if node is None:
         return ["node not on PATH — skipped the app.js unit check "
