@@ -52,7 +52,7 @@ fn all_51_vanilla_gamerules_survive_save_v2_and_legacy_defaults_restore() {
     let _guard = world_guard();
     assert_eq!(COMMAND_GAMERULE_DEFAULTS.len(), 51);
     let original: Vec<i32> = {
-        let rules = command_gamerules().lock().unwrap();
+        let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
         COMMAND_GAMERULE_DEFAULTS.iter()
             .map(|&(name, _, _)| gamerule_value(name, &rules)).collect()
     };
@@ -70,13 +70,13 @@ fn all_51_vanilla_gamerules_survive_save_v2_and_legacy_defaults_restore() {
     let mut no_state = payload.clone();
     no_state.drain(full_state_frame(&payload));
 
-    attrs().lock().unwrap().insert("e:999999".into(),
+    attrs().lock().unwrap_or_else(|e| e.into_inner()).insert("e:999999".into(),
         [("generic.max_health".into(), 64.0)].into());
     restore_gamerules(Some(&original));
     load_world_from(&payload).unwrap();
-    assert!(!attrs().lock().unwrap().contains_key("e:999999"));
+    assert!(!attrs().lock().unwrap_or_else(|e| e.into_inner()).contains_key("e:999999"));
     {
-        let rules = command_gamerules().lock().unwrap();
+        let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
         for (index, &(name, _, _)) in COMMAND_GAMERULE_DEFAULTS.iter().enumerate() {
             assert_eq!(gamerule_value(name, &rules), changed[index], "rule {name}");
             assert_eq!(rules[name], changed[index], "registry {name}");
@@ -86,7 +86,7 @@ fn all_51_vanilla_gamerules_survive_save_v2_and_legacy_defaults_restore() {
     for legacy in [&old_state, &no_state] {
         restore_gamerules(Some(&changed));
         load_world_from(legacy).unwrap();
-        let rules = command_gamerules().lock().unwrap();
+        let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
         for &(name, _, default) in COMMAND_GAMERULE_DEFAULTS.iter() {
             let is_legacy_atomic = matches!(name,
                 "keepInventory" | "doDaylightCycle" | "doWeatherCycle" |
@@ -127,20 +127,20 @@ struct Loaded {
 }
 
 fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loaded {
-    let old_world = std::mem::take(&mut *world().lock().unwrap());
-    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
-    let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
+    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
     let old_time = WORLD_TIME.swap(555, Ordering::Relaxed);
-    let old_forced_chunk = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_forced_chunk = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_rng = world_rng::saved_state();
-    forceloaded().lock().unwrap().insert((0, 0));
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     world()
         .lock()
         .unwrap()
         .entry((DimId::Overworld, 0, 0))
         .or_default()
         .insert(0x0000_0004, 4);
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 777,
         x: 0.5,
         y: 70.0,
@@ -152,7 +152,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
         comps: vec![(2i64, br#"{"text":"legacy"}"#.to_vec())],
         age: drop_age,
     });
-    mobs().lock().unwrap().push(Arc::new(Mob {
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(Mob {
         dim: DimId::Overworld,
         eid: 778,
         uuid: [0u8; 16],
@@ -171,10 +171,10 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
     let mut payload = Vec::new();
     save_world_into(&mut payload);
     let loaded = {
-        *world().lock().unwrap() = HashMap::new();
-        *forceloaded().lock().unwrap() = HashSet::new();
-        *drops().lock().unwrap() = Vec::new();
-        *mobs().lock().unwrap() = Vec::new();
+        *world().lock().unwrap_or_else(|e| e.into_inner()) = HashMap::new();
+        *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = HashSet::new();
+        *drops().lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        *mobs().lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
         WORLD_TIME.store(0, Ordering::Relaxed);
         if let Some(magic) = legacy_tail {
             let frame = full_state_frame(&payload);
@@ -197,26 +197,26 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
             .unwrap()
             .first()
             .map(|d| (d.age, d.item, d.cnt, d.comps.clone()));
-        let m = mobs().lock().unwrap().first().cloned();
+        let m = mobs().lock().unwrap_or_else(|e| e.into_inner()).first().cloned();
         Loaded {
-            chunks: world().lock().unwrap().len(),
-            forced: forceloaded().lock().unwrap().len(),
+            chunks: world().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            forced: forceloaded().lock().unwrap_or_else(|e| e.into_inner()).len(),
             world_time: WORLD_TIME.load(Ordering::Relaxed),
-            drops: drops().lock().unwrap().len(),
+            drops: drops().lock().unwrap_or_else(|e| e.into_inner()).len(),
             drop_age: d.as_ref().map(|d| d.0).unwrap_or(-1),
             drop_item: d.as_ref().map(|d| d.1).unwrap_or(0),
             drop_count: d.as_ref().map(|d| d.2).unwrap_or(0),
             drop_comps: d.map(|d| d.3).unwrap_or_default(),
-            mobs: mobs().lock().unwrap().len(),
+            mobs: mobs().lock().unwrap_or_else(|e| e.into_inner()).len(),
             mob_etype: m.as_ref().map(|m| m.etype).unwrap_or(0),
-            mob_hp: m.as_ref().map(|m| *m.hp.lock().unwrap()).unwrap_or(0.0),
-            mob_air: m.as_ref().map(|m| *m.air.lock().unwrap()).unwrap_or(-1),
+            mob_hp: m.as_ref().map(|m| *m.hp.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or(0.0),
+            mob_air: m.as_ref().map(|m| *m.air.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or(-1),
         }
     };
-    *world().lock().unwrap() = old_world;
-    *forceloaded().lock().unwrap() = old_forced_chunk;
-    *drops().lock().unwrap() = old_drops;
-    *mobs().lock().unwrap() = old_mobs;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced_chunk;
+    *drops().lock().unwrap_or_else(|e| e.into_inner()) = old_drops;
+    *mobs().lock().unwrap_or_else(|e| e.into_inner()) = old_mobs;
     WORLD_TIME.store(old_time, Ordering::Relaxed);
     world_rng::restore(old_rng);
     loaded
@@ -436,9 +436,9 @@ fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
         return;
     }
     let _world_guard = world_guard();
-    let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
-    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
-    arrows().lock().unwrap().push(Arrow {
+    let old_arrows = std::mem::take(&mut *arrows().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
+    arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
         eid: 7001,
         owner: 1,
         x: 1.5,
@@ -459,7 +459,7 @@ fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
         last_hit: -1,
         stuck: true,
     });
-    arrows().lock().unwrap().push(Arrow {
+    arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
         eid: 7002,
         owner: 1,
         x: 2.5,
@@ -480,18 +480,18 @@ fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
         last_hit: -1,
         stuck: false,
     });
-    let live_arrows_before: Vec<i32> = arrows().lock().unwrap().iter().map(|a| a.eid).collect();
-    let live_drops_before = drops().lock().unwrap().len();
+    let live_arrows_before: Vec<i32> = arrows().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|a| a.eid).collect();
+    let live_drops_before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    let live_arrows_after: Vec<i32> = arrows().lock().unwrap().iter().map(|a| a.eid).collect();
-    let live_drops_after = drops().lock().unwrap().len();
+    let live_arrows_after: Vec<i32> = arrows().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|a| a.eid).collect();
+    let live_drops_after = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
     // A second save of an unchanged world must produce identical bytes. A save that
     // consumes the world is not idempotent and cannot be retried safely.
     let mut payload2 = Vec::new();
     save_world_into(&mut payload2);
-    *drops().lock().unwrap() = Vec::new();
-    *arrows().lock().unwrap() = Vec::new();
+    *drops().lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+    *arrows().lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
     load_world_from(&payload).unwrap();
     let loaded_drops: Vec<(i64, u8)> = drops()
         .lock()
@@ -499,9 +499,9 @@ fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
         .iter()
         .map(|d| (d.item, d.cnt))
         .collect();
-    let loaded_arrow_kinds: Vec<u8> = arrows().lock().unwrap().iter().map(|a| a.kind).collect();
-    *arrows().lock().unwrap() = old_arrows;
-    *drops().lock().unwrap() = old_drops;
+    let loaded_arrow_kinds: Vec<u8> = arrows().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|a| a.kind).collect();
+    *arrows().lock().unwrap_or_else(|e| e.into_inner()) = old_arrows;
+    *drops().lock().unwrap_or_else(|e| e.into_inner()) = old_drops;
     assert_eq!(
         live_arrows_before, live_arrows_after,
         "saving removed a live projectile"
@@ -532,10 +532,10 @@ fn the_falling_entities_survive_a_save_and_load_round_trip() {
         return;
     }
     let _g = world_guard();
-    let old_world = world().lock().unwrap().clone();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_world = world().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
 
-    falling().lock().unwrap().extend([
+    falling().lock().unwrap_or_else(|e| e.into_inner()).extend([
         Fall {
             eid: 7001,
             x: 1.5,
@@ -559,10 +559,10 @@ fn the_falling_entities_survive_a_save_and_load_round_trip() {
     save_world_into(&mut payload);
 
     // Clear it first: reading back a value that was never removed proves nothing.
-    falling().lock().unwrap().clear();
+    falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
 
-    let q = falling().lock().unwrap().clone();
+    let q = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(
         q.len(),
         2,
@@ -589,8 +589,8 @@ fn the_falling_entities_survive_a_save_and_load_round_trip() {
         "NEXT_EID must clear the loaded ids"
     );
 
-    *world().lock().unwrap() = old_world;
-    *falling().lock().unwrap() = old_falling;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
 }
 
 /// A save written by the old cell-moving model carries FAL1. Loading it must convert each cell
@@ -601,8 +601,8 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
         return;
     }
     let _g = world_guard();
-    let old_world = world().lock().unwrap().clone();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_world = world().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
 
     let sand = name_to_state("sand").unwrap();
     let mut payload = Vec::new();
@@ -618,8 +618,8 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
     payload.extend_from_slice(&100i32.to_be_bytes());
     payload.extend_from_slice(&2i32.to_be_bytes());
 
-    world().lock().unwrap().clear();
-    falling().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
 
     assert_eq!(
@@ -637,7 +637,7 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
         Some(0),
         "the migrated cell is an explicit air override, so a non-air generated base is not exposed"
     );
-    let q = falling().lock().unwrap().clone();
+    let q = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(q.len(), 1, "the legacy cell becomes one entity: {q:?}");
     assert_eq!(q[0].state, sand, "with the state the block had");
     assert!(
@@ -645,8 +645,8 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
         "at the cell center"
     );
 
-    *world().lock().unwrap() = old_world;
-    *falling().lock().unwrap() = old_falling;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
 }
 
 #[test]
@@ -655,7 +655,7 @@ fn the_world_rng_stream_continues_across_a_save_and_load_round_trip() {
         return;
     }
     let _g = world_guard();
-    let old_world = world().lock().unwrap().clone();
+    let old_world = world().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let old_rng = world_rng::saved_state();
 
     world_rng::seed(4242);
@@ -681,7 +681,7 @@ fn the_world_rng_stream_continues_across_a_save_and_load_round_trip() {
         "the reloaded stream must continue from the saved state, not restart"
     );
 
-    *world().lock().unwrap() = old_world;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
     world_rng::restore(old_rng);
 }
 
@@ -697,7 +697,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
     let input = (name_to_item("raw_iron").unwrap(), 3, Vec::new());
     for pos in [broken_furnace, live_furnace] {
         set_block(pos.0, pos.1, pos.2, name_to_state("furnace").unwrap());
-        furnaces().lock().unwrap().insert(
+        furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(
             ow_block(pos),
             Furnace {
                 input: input.clone(),
@@ -730,7 +730,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
     for pos in [broken_furnace, broken_sign] {
         set_block(pos.0, pos.1, pos.2, 0);
     }
-    assert!(!furnaces().lock().unwrap().contains_key(&ow_block(broken_furnace)));
+    assert!(!furnaces().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ow_block(broken_furnace)));
     assert!(!signs()
         .lock()
         .unwrap()
@@ -738,12 +738,12 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
         .any(|&(dim, x, y, z, _)| dim == DimId::Overworld && (x, y, z) == broken_sign));
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    world().lock().unwrap().clear();
-    furnaces().lock().unwrap().clear();
-    signs().lock().unwrap().clear();
-    drops().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    signs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
-    let fs = furnaces().lock().unwrap();
+    let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(fs.len(), 1);
     let loaded = fs
         .get(&ow_block(live_furnace))
@@ -754,7 +754,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
         block_at(live_furnace.0, live_furnace.1, live_furnace.2),
         name_to_state("furnace").unwrap()
     );
-    let sg = signs().lock().unwrap();
+    let sg = signs().lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(sg.len(), 2);
     for front in [0, 1] {
         assert_eq!(
@@ -774,18 +774,18 @@ fn dro1_round_trip_preserves_drop_target_and_thrower_uuids() {
         return;
     }
     let _world_guard = world_guard();
-    let old_world = std::mem::take(&mut *world().lock().unwrap());
-    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
-    let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
+    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
     let old_time = WORLD_TIME.swap(555, Ordering::Relaxed);
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_rng = world_rng::saved_state();
 
     let stone = name_to_item("stone").unwrap();
     let uuid_a = [0xAA; 16];
     let uuid_b = [0xBB; 16];
     let uuid_c = [0xCC; 16];
-    *drops().lock().unwrap() = vec![
+    *drops().lock().unwrap_or_else(|e| e.into_inner()) = vec![
         Drop {
             eid: 8801,
             x: 1.5,
@@ -844,7 +844,7 @@ fn dro1_round_trip_preserves_drop_target_and_thrower_uuids() {
         "save with drop owners must carry DRO1 footer"
     );
 
-    drops().lock().unwrap().clear();
+    drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
     let restored: Vec<_> = drops()
         .lock()
@@ -860,11 +860,11 @@ fn dro1_round_trip_preserves_drop_target_and_thrower_uuids() {
         .copy_from_slice(&0u64.to_be_bytes());
     let corrupt_err = load_world_from(&bad).is_err();
 
-    *world().lock().unwrap() = old_world;
-    *drops().lock().unwrap() = old_drops;
-    *mobs().lock().unwrap() = old_mobs;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    *drops().lock().unwrap_or_else(|e| e.into_inner()) = old_drops;
+    *mobs().lock().unwrap_or_else(|e| e.into_inner()) = old_mobs;
     WORLD_TIME.store(old_time, Ordering::Relaxed);
-    *forceloaded().lock().unwrap() = old_forced;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     world_rng::restore(old_rng);
 
     assert_eq!(
@@ -930,7 +930,7 @@ fn p2_3_s2a_one_cell_in_three_dimensions_stays_independent() {
     test_support::require_vanilla_data();
     let _world_guard = world_guard();
     p2_3_s2a_init_generators();
-    let old_world = std::mem::take(&mut *world().lock().unwrap());
+    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
 
     let cell = (5, 100, 7);
     let states = p2_3_s2a_states();
@@ -977,7 +977,7 @@ fn p2_3_s2a_one_cell_in_three_dimensions_stays_independent() {
         );
     }
 
-    *world().lock().unwrap() = old_world;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
     assert!(worldgen::init(0, name_to_state), "leave the Overworld active");
 }
 
@@ -994,7 +994,7 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
     test_support::require_vanilla_data();
     let _world_guard = world_guard();
     p2_3_s2a_init_generators();
-    let old_world = std::mem::take(&mut *world().lock().unwrap());
+    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
 
     let cell = (5, 100, 7);
     let states = p2_3_s2a_states();
@@ -1026,7 +1026,7 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
     );
 
     // It loads as the Overworld's chunks and nothing else.
-    world().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&with_dims).unwrap();
     assert_eq!(
         overlay_block_dim(DimId::Overworld, cell.0, cell.1, cell.2),
@@ -1034,7 +1034,7 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
         "a legacy (cx, cz) chunk loads into the Overworld"
     );
     {
-        let w = world().lock().unwrap();
+        let w = world().lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             w.keys().all(|key| key.0 == DimId::Overworld),
             "the legacy file carries no other dimension: {:?}",
@@ -1084,12 +1084,12 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
     }
 
     // A dimension with no edits writes no chunks, which is what makes its file removable.
-    world().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
     let mut empty = Vec::new();
     assert_eq!(save_dim_overlay_into(DimId::Nether, &mut empty), 0);
     assert_eq!(empty, vec![0], "an empty table is a zero count and nothing else");
 
-    *world().lock().unwrap() = old_world;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
     assert!(worldgen::init(0, name_to_state), "leave the Overworld active");
 }
 
@@ -1106,7 +1106,7 @@ fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
     test_support::require_vanilla_data();
     let _world_guard = world_guard();
     p2_3_s2a_init_generators();
-    let old_world = std::mem::take(&mut *world().lock().unwrap());
+    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
     let dir = std::env::temp_dir().join(format!("mc-spine-p2_3_s2a-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch save directory");
@@ -1127,7 +1127,7 @@ fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
     }
 
     // Every dimension comes back from disk, into its own dimension.
-    world().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_in(&dir).expect("load the scratch save");
     for (dim, st) in states {
         assert_eq!(
@@ -1155,14 +1155,14 @@ fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
     assert!(file(DimId::Overworld).is_file(), "the legacy file stays");
 
     // And the reload no longer invents them.
-    world().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_in(&dir).expect("reload the scratch save");
     for dim in [DimId::Nether, DimId::End] {
         assert_eq!(overlay_block_dim(dim, cell.0, cell.1, cell.2), None);
     }
 
     let _ = std::fs::remove_dir_all(&dir);
-    *world().lock().unwrap() = old_world;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
     assert!(worldgen::init(0, name_to_state), "leave the Overworld active");
 }
 
@@ -1175,8 +1175,8 @@ fn p2_3_s2c_signs_stay_isolated_per_dimension_and_round_trip() {
         return;
     }
     let _world_guard = world_guard();
-    let old_signs = std::mem::take(&mut *signs().lock().unwrap());
-    let old_pos = std::mem::take(&mut *pos_store().lock().unwrap());
+    let old_signs = std::mem::take(&mut *signs().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_pos = std::mem::take(&mut *pos_store().lock().unwrap_or_else(|e| e.into_inner()));
     let old_rng = world_rng::saved_state();
 
     let cell = (5, 100, 7);
@@ -1213,7 +1213,7 @@ fn p2_3_s2c_signs_stay_isolated_per_dimension_and_round_trip() {
             .unwrap()
             .insert((dim, cell.0, cell.1, cell.2, 1), lines.clone());
     }
-    assert_eq!(signs().lock().unwrap().len(), 3);
+    assert_eq!(signs().lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
     for dim in DimId::ALL {
         let here = signs_in_chunk(dim, chunk.0, chunk.1);
         assert_eq!(here.len(), 1, "{dim:?}: the chunk carries exactly its sign");
@@ -1245,9 +1245,9 @@ fn p2_3_s2c_signs_stay_isolated_per_dimension_and_round_trip() {
     assert!(footer_signs.iter().all(|s| s.0 != DimId::Overworld));
 
     // Full round-trip: all three come back, each into its own dimension.
-    signs().lock().unwrap().clear();
+    signs().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&with_dims).unwrap();
-    assert_eq!(signs().lock().unwrap().len(), 3);
+    assert_eq!(signs().lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
     for dim in DimId::ALL {
         assert_eq!(
             signs()
@@ -1260,14 +1260,14 @@ fn p2_3_s2c_signs_stay_isolated_per_dimension_and_round_trip() {
     }
 
     // A legacy payload without the footer defaults its sign to the Overworld.
-    signs().lock().unwrap().clear();
+    signs().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&overworld_only).unwrap();
-    assert_eq!(signs().lock().unwrap().len(), 1);
-    assert_eq!(signs().lock().unwrap().get(&ow_key), Some(&lines));
+    assert_eq!(signs().lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+    assert_eq!(signs().lock().unwrap_or_else(|e| e.into_inner()).get(&ow_key), Some(&lines));
 
     world_rng::restore(old_rng);
-    *signs().lock().unwrap() = old_signs;
-    *pos_store().lock().unwrap() = old_pos;
+    *signs().lock().unwrap_or_else(|e| e.into_inner()) = old_signs;
+    *pos_store().lock().unwrap_or_else(|e| e.into_inner()) = old_pos;
 }
 
 /// P2-3-S2c: the pending-block, backoff and plugin-cell stores keyed by chunk/block alone made the
@@ -1279,12 +1279,12 @@ fn p2_3_s2c_pending_blocks_backoff_and_plugin_cells_stay_isolated_per_dimension(
         return;
     }
     let _world_guard = world_guard();
-    let old_pending = std::mem::take(&mut *pending_blocks().lock().unwrap());
-    let old_backoff = std::mem::take(&mut *backoff().lock().unwrap());
-    let old_cells = std::mem::take(&mut *plugin_cells().lock().unwrap());
-    let old_pb = std::mem::take(&mut *plugin_backoff().lock().unwrap());
-    let old_waters = std::mem::take(&mut *waters().lock().unwrap());
-    let old_hoppers = std::mem::take(&mut *hoppers().lock().unwrap());
+    let old_pending = std::mem::take(&mut *pending_blocks().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_backoff = std::mem::take(&mut *backoff().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_cells = std::mem::take(&mut *plugin_cells().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_pb = std::mem::take(&mut *plugin_backoff().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_waters = std::mem::take(&mut *waters().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_hoppers = std::mem::take(&mut *hoppers().lock().unwrap_or_else(|e| e.into_inner()));
 
     let pos = (5, 100, 7);
     let sec = (pos.0 >> 4, pos.1 >> 4, pos.2 >> 4);
@@ -1319,10 +1319,10 @@ fn p2_3_s2c_pending_blocks_backoff_and_plugin_cells_stay_isolated_per_dimension(
             .unwrap()
             .insert((dim, 0, pos.0, pos.1, pos.2, 9), (100, 1));
     }
-    assert_eq!(pending_blocks().lock().unwrap().len(), 3);
-    assert_eq!(backoff().lock().unwrap().len(), 3);
-    assert_eq!(plugin_cells().lock().unwrap().len(), 3);
-    assert_eq!(plugin_backoff().lock().unwrap().len(), 3);
+    assert_eq!(pending_blocks().lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
+    assert_eq!(backoff().lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
+    assert_eq!(plugin_cells().lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
+    assert_eq!(plugin_backoff().lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
     for dim in DimId::ALL {
         assert_eq!(
             pending_blocks()
@@ -1388,12 +1388,12 @@ fn p2_3_s2c_pending_blocks_backoff_and_plugin_cells_stay_isolated_per_dimension(
         .unwrap()
         .contains_key(&(DimId::End, 0, pos.0, pos.1, pos.2, 9)));
 
-    *waters().lock().unwrap() = old_waters;
-    *hoppers().lock().unwrap() = old_hoppers;
-    *plugin_backoff().lock().unwrap() = old_pb;
-    *plugin_cells().lock().unwrap() = old_cells;
-    *backoff().lock().unwrap() = old_backoff;
-    *pending_blocks().lock().unwrap() = old_pending;
+    *waters().lock().unwrap_or_else(|e| e.into_inner()) = old_waters;
+    *hoppers().lock().unwrap_or_else(|e| e.into_inner()) = old_hoppers;
+    *plugin_backoff().lock().unwrap_or_else(|e| e.into_inner()) = old_pb;
+    *plugin_cells().lock().unwrap_or_else(|e| e.into_inner()) = old_cells;
+    *backoff().lock().unwrap_or_else(|e| e.into_inner()) = old_backoff;
+    *pending_blocks().lock().unwrap_or_else(|e| e.into_inner()) = old_pending;
 }
 
 /// P2-3-S2d: a player's dimension is part of their saved position. The legacy section writes all
@@ -1405,8 +1405,8 @@ fn p2_3_s2d_pos_store_preserves_dimension_and_defaults_legacy_to_overworld() {
         return;
     }
     let _world_guard = world_guard();
-    let old_pos = std::mem::take(&mut *pos_store().lock().unwrap());
-    let old_signs = std::mem::take(&mut *signs().lock().unwrap());
+    let old_pos = std::mem::take(&mut *pos_store().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_signs = std::mem::take(&mut *signs().lock().unwrap_or_else(|e| e.into_inner()));
     let old_rng = world_rng::saved_state();
 
     let expected = [
@@ -1461,29 +1461,29 @@ fn p2_3_s2d_pos_store_preserves_dimension_and_defaults_legacy_to_overworld() {
 
     // The footer-stripped payload is the legacy wire form. Every player is in it, and a legacy
     // load restores all of them into the Overworld with their exact coordinates and look.
-    pos_store().lock().unwrap().clear();
+    pos_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(legacy).unwrap();
     for (_, name, x, y, z, yaw, pitch) in &expected {
         assert_eq!(
-            pos_store().lock().unwrap().get(name),
+            pos_store().lock().unwrap_or_else(|e| e.into_inner()).get(name),
             Some(&(DimId::Overworld, *x, *y, *z, *yaw, *pitch)),
             "{name}: a legacy position defaults to the Overworld"
         );
     }
 
     // The full payload restores each player's exact (DimId, x, y, z, yaw, pitch).
-    pos_store().lock().unwrap().clear();
+    pos_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&full).unwrap();
     for (dim, name, x, y, z, yaw, pitch) in &expected {
         assert_eq!(
-            pos_store().lock().unwrap().get(name),
+            pos_store().lock().unwrap_or_else(|e| e.into_inner()).get(name),
             Some(&(*dim, *x, *y, *z, *yaw, *pitch)),
             "{name}: its dimension and position round-trip"
         );
     }
 
     // An Overworld-only save writes zero footer bytes.
-    pos_store().lock().unwrap().clear();
+    pos_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
     pos_store()
         .lock()
         .unwrap()
@@ -1498,8 +1498,8 @@ fn p2_3_s2d_pos_store_preserves_dimension_and_defaults_legacy_to_overworld() {
     );
 
     world_rng::restore(old_rng);
-    *signs().lock().unwrap() = old_signs;
-    *pos_store().lock().unwrap() = old_pos;
+    *signs().lock().unwrap_or_else(|e| e.into_inner()) = old_signs;
+    *pos_store().lock().unwrap_or_else(|e| e.into_inner()) = old_pos;
 }
 
 /// The dimension footer fails closed: an unknown dimension tag, a body that claims more bytes than
@@ -1570,11 +1570,11 @@ fn p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
         return;
     }
     let _guard = world_guard();
-    let old_chests = std::mem::take(&mut *chests().lock().unwrap());
-    let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap());
-    let old_crops = std::mem::take(&mut *crops().lock().unwrap());
-    let old_world = std::mem::take(&mut *world().lock().unwrap());
-    let old_loot = std::mem::take(&mut *pending_block_loot().lock().unwrap());
+    let old_chests = std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_crops = std::mem::take(&mut *crops().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_loot = std::mem::take(&mut *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()));
     let old_rng = world_rng::saved_state();
 
     let pos = (5, 70, 7);
@@ -1604,7 +1604,7 @@ fn p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
             .lock()
             .unwrap()
             .insert(key, make_furnace(100 + i as i32));
-        crops().lock().unwrap().insert(key, i as u8);
+        crops().lock().unwrap_or_else(|e| e.into_inner()).insert(key, i as u8);
     }
     // The Overworld's crop age also lives in its overlay: there is no legacy crop section, so a
     // legacy load rebuilds it from the block state.
@@ -1621,10 +1621,10 @@ fn p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
         "an Ender key must be stored under the Overworld in every dimension"
     );
     let ender_slots: HashMap<i16, Stack> = [(1i16, (iron, 9, Vec::new()))].into_iter().collect();
-    chests().lock().unwrap().insert(ender, ender_slots.clone());
-    assert_eq!(chests().lock().unwrap().len(), 4);
-    assert_eq!(furnaces().lock().unwrap().len(), 3);
-    assert_eq!(crops().lock().unwrap().len(), 3);
+    chests().lock().unwrap_or_else(|e| e.into_inner()).insert(ender, ender_slots.clone());
+    assert_eq!(chests().lock().unwrap_or_else(|e| e.into_inner()).len(), 4);
+    assert_eq!(furnaces().lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
+    assert_eq!(crops().lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
 
     let mut payload = Vec::new();
     save_world_into(&mut payload);
@@ -1632,45 +1632,45 @@ fn p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
         payload.windows(DIM2_MAGIC.len()).any(|w| w == DIM2_MAGIC),
         "a non-Overworld container must produce a DIM2 footer"
     );
-    chests().lock().unwrap().clear();
-    furnaces().lock().unwrap().clear();
-    crops().lock().unwrap().clear();
-    world().lock().unwrap().clear();
+    chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    crops().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
 
-    assert_eq!(chests().lock().unwrap().len(), 4);
-    assert_eq!(furnaces().lock().unwrap().len(), 3);
-    assert_eq!(crops().lock().unwrap().len(), 3);
+    assert_eq!(chests().lock().unwrap_or_else(|e| e.into_inner()).len(), 4);
+    assert_eq!(furnaces().lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
+    assert_eq!(crops().lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
     for (i, dim) in DimId::ALL.into_iter().enumerate() {
         let key = (dim, pos.0, pos.1, pos.2);
         assert_eq!(
-            chests().lock().unwrap().get(&ContainerKey::Block(key)).and_then(|m| m.get(&0)).map(|s| s.1),
+            chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::Block(key)).and_then(|m| m.get(&0)).map(|s| s.1),
             Some((i + 1) as u8),
             "{dim:?}: its own chest content came back"
         );
         assert_eq!(
-            furnaces().lock().unwrap().get(&key).map(|f| f.burn_left),
+            furnaces().lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|f| f.burn_left),
             Some(100 + i as i32),
             "{dim:?}: its own furnace state came back"
         );
         assert_eq!(
-            crops().lock().unwrap().get(&key).copied(),
+            crops().lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied(),
             Some(i as u8),
             "{dim:?}: its own crop age came back"
         );
     }
     assert_eq!(
-        chests().lock().unwrap().get(&ender),
+        chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ender),
         Some(&ender_slots),
         "the Ender chest is shared across dimensions through its Overworld key"
     );
 
     world_rng::restore(old_rng);
-    *chests().lock().unwrap() = old_chests;
-    *furnaces().lock().unwrap() = old_furnaces;
-    *crops().lock().unwrap() = old_crops;
-    *world().lock().unwrap() = old_world;
-    *pending_block_loot().lock().unwrap() = old_loot;
+    *chests().lock().unwrap_or_else(|e| e.into_inner()) = old_chests;
+    *furnaces().lock().unwrap_or_else(|e| e.into_inner()) = old_furnaces;
+    *crops().lock().unwrap_or_else(|e| e.into_inner()) = old_crops;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()) = old_loot;
 }
 
 /// P2-3-S2b: an Overworld-only save has no DIM2 footer at all, and stripping DIM2 from a mixed
@@ -1682,10 +1682,10 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
         return;
     }
     let _guard = world_guard();
-    let old_chests = std::mem::take(&mut *chests().lock().unwrap());
-    let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap());
-    let old_crops = std::mem::take(&mut *crops().lock().unwrap());
-    let old_world = std::mem::take(&mut *world().lock().unwrap());
+    let old_chests = std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_crops = std::mem::take(&mut *crops().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
     let old_rng = world_rng::saved_state();
     let pos = (8, 70, 9);
     let iron = name_to_item("iron_ingot").unwrap();
@@ -1696,7 +1696,7 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
             .lock()
             .unwrap()
             .insert(ContainerKey::Block(key), slots.clone());
-        furnaces().lock().unwrap().insert(
+        furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(
             key,
             Furnace {
                 input: (iron, 1, Vec::new()),
@@ -1710,7 +1710,7 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
                 fuel_cache: CachedLookup::default(),
             },
         );
-        crops().lock().unwrap().insert(key, 3);
+        crops().lock().unwrap_or_else(|e| e.into_inner()).insert(key, 3);
     }
     world()
         .lock()
@@ -1735,9 +1735,9 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
     // entries keep their iteration order and the two legacy regions must compare byte for byte.
     for dim in [DimId::Nether, DimId::End] {
         let key = (dim, pos.0, pos.1, pos.2);
-        chests().lock().unwrap().remove(&ContainerKey::Block(key));
-        furnaces().lock().unwrap().remove(&key);
-        crops().lock().unwrap().remove(&key);
+        chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::Block(key));
+        furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        crops().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
     }
     let mut overworld_only = Vec::new();
     save_world_into(&mut overworld_only);
@@ -1754,22 +1754,22 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
         "a non-Overworld entry changed a byte of the legacy save"
     );
 
-    chests().lock().unwrap().clear();
-    furnaces().lock().unwrap().clear();
-    crops().lock().unwrap().clear();
-    world().lock().unwrap().clear();
+    chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    crops().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&overworld_only).unwrap();
     let ow = ow_block(pos);
-    assert_eq!(chests().lock().unwrap().len(), 1);
-    assert!(chests().lock().unwrap().contains_key(&ContainerKey::Block(ow)));
-    assert!(furnaces().lock().unwrap().contains_key(&ow));
-    assert_eq!(crops().lock().unwrap().get(&ow).copied(), Some(3));
+    assert_eq!(chests().lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+    assert!(chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ContainerKey::Block(ow)));
+    assert!(furnaces().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ow));
+    assert_eq!(crops().lock().unwrap_or_else(|e| e.into_inner()).get(&ow).copied(), Some(3));
 
     world_rng::restore(old_rng);
-    *chests().lock().unwrap() = old_chests;
-    *furnaces().lock().unwrap() = old_furnaces;
-    *crops().lock().unwrap() = old_crops;
-    *world().lock().unwrap() = old_world;
+    *chests().lock().unwrap_or_else(|e| e.into_inner()) = old_chests;
+    *furnaces().lock().unwrap_or_else(|e| e.into_inner()) = old_furnaces;
+    *crops().lock().unwrap_or_else(|e| e.into_inner()) = old_crops;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
 }
 
 /// P2-3-S2b: the DIM2 footer is the trust boundary for another dimension's containers. It must
@@ -1870,29 +1870,29 @@ fn save_v2_keeps_complete_live_player_records_by_uuid_after_they_go_offline() {
     let ender: HashMap<_, _> = (0..27)
         .map(|slot| (slot, (904, 1 + slot as u8, vec![])))
         .collect();
-    *client.inv.lock().unwrap() = slots.clone();
+    *client.inv.lock().unwrap_or_else(|e| e.into_inner()) = slots.clone();
     chests()
         .lock()
         .unwrap()
         .insert(ender_container_key(&client.uuid), ender.clone());
-    *client.dim.lock().unwrap() = DimId::End;
-    *client.pos.lock().unwrap() = (12.75, 156.5, -43.25, 52.0, -27.0, true);
-    *client.held.lock().unwrap() = 8;
-    *client.hp.lock().unwrap() = 12.5;
-    *client.absorb.lock().unwrap() = 3.5;
-    *client.food.lock().unwrap() = 15;
-    *client.sat.lock().unwrap() = 4.75;
-    *client.walk_acc.lock().unwrap() = 3.875;
-    *client.xp.lock().unwrap() = 219;
-    *client.gm.lock().unwrap() = 2;
-    *client.effs.lock().unwrap() = vec![Eff {
+    *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (12.75, 156.5, -43.25, 52.0, -27.0, true);
+    *client.held.lock().unwrap_or_else(|e| e.into_inner()) = 8;
+    *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 12.5;
+    *client.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 3.5;
+    *client.food.lock().unwrap_or_else(|e| e.into_inner()) = 15;
+    *client.sat.lock().unwrap_or_else(|e| e.into_inner()) = 4.75;
+    *client.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) = 3.875;
+    *client.xp.lock().unwrap_or_else(|e| e.into_inner()) = 219;
+    *client.gm.lock().unwrap_or_else(|e| e.into_inner()) = 2;
+    *client.effs.lock().unwrap_or_else(|e| e.into_inner()) = vec![Eff {
         id: 1,
         amp: 2,
         left: 97,
     }];
-    *client.spawn_dim.lock().unwrap() = DimId::Nether;
-    *client.spawn_pt.lock().unwrap() = Some((8.5, 61.0, -19.5, 74.0));
-    player_mechanism_sessions().lock().unwrap().insert(
+    *client.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
+    *client.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = Some((8.5, 61.0, -19.5, 74.0));
+    player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(
         client.eid,
         PlayerMechanismSession {
             xp_bar: (11, 0.375),
@@ -1917,11 +1917,11 @@ fn save_v2_keeps_complete_live_player_records_by_uuid_after_they_go_offline() {
 
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    clients().lock().unwrap().clear();
-    saved_players().lock().unwrap().clear();
-    inv_store().lock().unwrap().clear();
-    pos_store().lock().unwrap().clear();
-    chests().lock().unwrap().clear();
+    clients().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    saved_players().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    inv_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    pos_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
     let expected = PlayerSave {
         position: (DimId::End, 12.75, 156.5, -43.25, 52.0, -27.0),
@@ -1947,29 +1947,29 @@ fn save_v2_keeps_complete_live_player_records_by_uuid_after_they_go_offline() {
         }),
     };
     assert_eq!(
-        saved_players().lock().unwrap().get(&player_id),
+        saved_players().lock().unwrap_or_else(|e| e.into_inner()).get(&player_id),
         Some(&expected)
     );
-    assert_eq!(saved_players().lock().unwrap()[&other_id].health, 20.0);
-    assert_eq!(inv_store().lock().unwrap()["resume-player"], slots);
+    assert_eq!(saved_players().lock().unwrap_or_else(|e| e.into_inner())[&other_id].health, 20.0);
+    assert_eq!(inv_store().lock().unwrap_or_else(|e| e.into_inner())["resume-player"], slots);
     assert_eq!(
-        pos_store().lock().unwrap()["resume-player"],
+        pos_store().lock().unwrap_or_else(|e| e.into_inner())["resume-player"],
         expected.position
     );
     assert_eq!(
-        chests().lock().unwrap()[&ender_container_key(&player_id)],
+        chests().lock().unwrap_or_else(|e| e.into_inner())[&ender_container_key(&player_id)],
         ender
     );
 
     let mut offline = Vec::new();
     save_world_into(&mut offline);
-    saved_players().lock().unwrap().clear();
+    saved_players().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&offline).unwrap();
     assert_eq!(
-        saved_players().lock().unwrap().get(&player_id),
+        saved_players().lock().unwrap_or_else(|e| e.into_inner()).get(&player_id),
         Some(&expected)
     );
-    assert!(saved_players().lock().unwrap().contains_key(&other_id));
+    assert!(saved_players().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&other_id));
 }
 
 #[test]
@@ -1978,12 +1978,12 @@ fn save_v2_world_spawn_keeps_packet_angle_and_old_footer_order() {
         return;
     }
     let world_spawn = (-10.5, 72.0, 5.5, 113.25);
-    *WORLD_SPAWN.lock().unwrap() = world_spawn;
-    *WORLD_SPAWN_PITCH.lock().unwrap() = -18.5;
+    *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = world_spawn;
+    *WORLD_SPAWN_PITCH.lock().unwrap_or_else(|e| e.into_inner()) = -18.5;
     WORLD_SEED.store(56412, Ordering::Relaxed);
-    world_border().lock().unwrap().center_z = 14.25;
+    world_border().lock().unwrap_or_else(|e| e.into_inner()).center_z = 14.25;
     {
-        let mut board = scoreboard().lock().unwrap();
+        let mut board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
         execute_scoreboard_command(&mut board, &["objectives", "add", "saved", "dummy"]).unwrap();
         board.set_display(ScoreboardDisplaySlot::Sidebar, Some("saved")).unwrap();
     }
@@ -2006,7 +2006,7 @@ fn save_v2_world_spawn_keeps_packet_angle_and_old_footer_order() {
         let (client, _peer) = effect_tests::client_pair();
         let mut state = PlayerSave::capture(&client, client_dim_pos(&client), &HashMap::new());
         state.respawn = Some(point);
-        saved_players().lock().unwrap().insert(uuid, state);
+        saved_players().lock().unwrap_or_else(|e| e.into_inner()).insert(uuid, state);
     }
     let mut payload = Vec::new();
     save_world_into(&mut payload);
@@ -2025,21 +2025,21 @@ fn save_v2_world_spawn_keeps_packet_angle_and_old_footer_order() {
         (payload.as_slice(), -18.5, true),
         (legacy.as_slice(), 0.0, false),
     ] {
-        *WORLD_SPAWN.lock().unwrap() = (0.0, 0.0, 0.0, 0.0);
-        *WORLD_SPAWN_PITCH.lock().unwrap() = 99.0;
-        *world_border().lock().unwrap() = WorldBorderState::default();
-        *scoreboard().lock().unwrap() = ScoreboardEngine::default();
+        *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0, 0.0, 0.0);
+        *WORLD_SPAWN_PITCH.lock().unwrap_or_else(|e| e.into_inner()) = 99.0;
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = WorldBorderState::default();
+        *scoreboard().lock().unwrap_or_else(|e| e.into_inner()) = ScoreboardEngine::default();
         load_world_from(bytes).unwrap();
         assert_eq!(saved_value(&WORLD_SPAWN), world_spawn);
         assert_eq!(saved_value(&WORLD_SPAWN_PITCH), pitch);
-        assert_eq!(world_border().lock().unwrap().center_z, 14.25);
-        let board = scoreboard().lock().unwrap();
+        assert_eq!(world_border().lock().unwrap_or_else(|e| e.into_inner()).center_z, 14.25);
+        let board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(board.display(ScoreboardDisplaySlot::Sidebar), Some("saved"));
         drop(board);
         let packet = spawn_position_packet(saved_value(&WORLD_SPAWN));
         assert_eq!(read_pos(&packet[..8]), (-11, 72, 5));
         assert_eq!(&packet[8..], &world_spawn.3.to_be_bytes());
-        let players = saved_players().lock().unwrap();
+        let players = saved_players().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             players.get(&[1; 16]).and_then(|p| p.respawn),
             has_players.then_some(anchor)
@@ -2061,12 +2061,12 @@ fn save_v2_restores_mob_behavior_merchant_and_raid_progress() {
     assert!(insert_live_mob(122, DimId::Nether, pos, 33.5, None));
     assert!(insert_live_mob(113, DimId::Overworld, pos, 15.25, None));
     assert!(insert_live_mob(118, DimId::End, pos, 18.75, None));
-    let original = mobs().lock().unwrap().clone();
+    let original = mobs().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let [wolf, merchant, witch] = original.as_slice() else {
         unreachable!()
     };
     {
-        let mut states = live_mob_states().lock().unwrap();
+        let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
         let Some(MobBehaviorState::Wolf(pet)) = &mut states.get_mut(&wolf.eid).unwrap().behavior
         else {
             unreachable!()
@@ -2085,17 +2085,17 @@ fn save_v2_restores_mob_behavior_merchant_and_raid_progress() {
         state.potions = vec![(WitchPotion::Swiftness, 125)];
     }
     TICK.store(100, Ordering::Relaxed);
-    *wolf.vel.lock().unwrap() = [0.25, -0.125, 0.5];
-    *wolf.fire_ticks.lock().unwrap() = 45;
-    *wolf.fuse.lock().unwrap() = 7;
-    *wolf.love.lock().unwrap() = 22;
-    *wolf.air.lock().unwrap() = 199;
-    sheared().lock().unwrap().insert(witch.eid);
-    attrs().lock().unwrap().insert(format!("e:{}", wolf.eid),
+    *wolf.vel.lock().unwrap_or_else(|e| e.into_inner()) = [0.25, -0.125, 0.5];
+    *wolf.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = 45;
+    *wolf.fuse.lock().unwrap_or_else(|e| e.into_inner()) = 7;
+    *wolf.love.lock().unwrap_or_else(|e| e.into_inner()) = 22;
+    *wolf.air.lock().unwrap_or_else(|e| e.into_inner()) = 199;
+    sheared().lock().unwrap_or_else(|e| e.into_inner()).insert(witch.eid);
+    attrs().lock().unwrap_or_else(|e| e.into_inner()).insert(format!("e:{}", wolf.eid),
         [("generic.max_health".into(), 43.5), ("custom.motion".into(), -0.25)].into());
-    attrs().lock().unwrap().insert(format!("e:{}", merchant.eid),
+    attrs().lock().unwrap_or_else(|e| e.into_inner()).insert(format!("e:{}", merchant.eid),
         [("generic.movement_speed".into(), 0.35)].into());
-    attrs().lock().unwrap().insert(format!("e:m:{}", wolf.eid),
+    attrs().lock().unwrap_or_else(|e| e.into_inner()).insert(format!("e:m:{}", wolf.eid),
         [("generic.armor".into(), 12.0)].into());
     tags()
         .lock()
@@ -2148,20 +2148,20 @@ fn save_v2_restores_mob_behavior_merchant_and_raid_progress() {
     let second_player = [78; 16];
     assert!(raid.record_defeat(first, Some(second_player)));
     let expected_remaining = raiders.map(|(raider, _)| raider).collect::<HashSet<_>>();
-    saved_raids().lock().unwrap().push((DimId::Overworld, raid));
+    saved_raids().lock().unwrap_or_else(|e| e.into_inner()).push((DimId::Overworld, raid));
 
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    mobs().lock().unwrap().clear();
-    live_mob_states().lock().unwrap().clear();
-    live_villagers().lock().unwrap().clear();
-    saved_raids().lock().unwrap().clear();
-    sheared().lock().unwrap().clear();
-    tags().lock().unwrap().clear();
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    live_villagers().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    saved_raids().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    sheared().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    tags().lock().unwrap_or_else(|e| e.into_inner()).clear();
     TICK.store(900, Ordering::Relaxed);
     load_world_from(&payload).unwrap();
 
-    let restored = mobs().lock().unwrap().clone();
+    let restored = mobs().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let [saved_wolf, saved_merchant, saved_witch] = restored.as_slice() else {
         unreachable!()
     };
@@ -2177,9 +2177,9 @@ fn save_v2_restores_mob_behavior_merchant_and_raid_progress() {
     assert_eq!(saved_value(&saved_wolf.fuse), 7);
     assert_eq!(saved_value(&saved_wolf.love), 22);
     assert_eq!(saved_value(&saved_wolf.air), 199);
-    assert!(sheared().lock().unwrap().contains(&saved_witch.eid));
+    assert!(sheared().lock().unwrap_or_else(|e| e.into_inner()).contains(&saved_witch.eid));
     {
-        let attributes = attrs().lock().unwrap();
+        let attributes = attrs().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(attributes[&format!("e:{}", saved_wolf.eid)]["generic.max_health"], 43.5);
         assert_eq!(attributes[&format!("e:{}", saved_wolf.eid)]["custom.motion"], -0.25);
         assert_eq!(attributes[&format!("e:{}", saved_merchant.eid)]["generic.movement_speed"], 0.35);
@@ -2187,9 +2187,9 @@ fn save_v2_restores_mob_behavior_merchant_and_raid_progress() {
         assert!(!attributes.contains_key(&format!("e:{}", wolf.eid)));
         assert!(!attributes.contains_key(&format!("e:m:{}", wolf.eid)));
     }
-    assert!(tags().lock().unwrap()[&format!("e:{}", saved_merchant.eid)].contains("trader"));
+    assert!(tags().lock().unwrap_or_else(|e| e.into_inner())[&format!("e:{}", saved_merchant.eid)].contains("trader"));
     {
-        let states = live_mob_states().lock().unwrap();
+        let states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
         let Some(MobBehaviorState::Wolf(pet)) = &states[&saved_wolf.eid].behavior else {
             unreachable!()
         };
@@ -2204,7 +2204,7 @@ fn save_v2_restores_mob_behavior_merchant_and_raid_progress() {
         assert_eq!(state.potions, [(WitchPotion::Swiftness, 925)]);
     }
     {
-        let villagers = live_villagers().lock().unwrap();
+        let villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
         let trader = &villagers[&saved_merchant.eid];
         assert_eq!(trader.id, merchant.uuid);
         assert_eq!(trader.profession, VillagerProfession::Librarian);
@@ -2221,7 +2221,7 @@ fn save_v2_restores_mob_behavior_merchant_and_raid_progress() {
         assert_eq!(trader.last_restock, Some(48008));
         assert_eq!(trader.last_gossip, Some(49001));
     }
-    let mut raids = saved_raids().lock().unwrap();
+    let mut raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
     let [(dim, raid)] = raids.as_mut_slice() else {
         unreachable!()
     };
@@ -2271,7 +2271,7 @@ fn save_v2_releases_world_ownership_before_writing_and_keeps_previous_file_on_fa
     assert_eq!(std::fs::read(&path).unwrap(), original);
     std::fs::remove_dir(&temp).unwrap();
 
-    world().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_in(&dir).unwrap();
     assert_eq!(overlay_block(2, 64, 3), Some(4));
     set_block(2, 64, 3, 8);
@@ -2281,7 +2281,7 @@ fn save_v2_releases_world_ownership_before_writing_and_keeps_previous_file_on_fa
         std::fs::read(dir.join(format!("{WORLD_FILE}.bak"))).unwrap(),
         original
     );
-    world().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_in(&dir).unwrap();
     assert_eq!(overlay_block(2, 64, 3), Some(8));
     std::fs::remove_dir_all(dir).unwrap();
@@ -2293,12 +2293,12 @@ fn save_v2_panics_abort_the_boundary_and_corruption_cannot_apply_the_new_state()
         return;
     }
     set_block(2, 64, 3, 4);
-    *WORLD_SPAWN_PITCH.lock().unwrap() = 15.0;
+    *WORLD_SPAWN_PITCH.lock().unwrap_or_else(|e| e.into_inner()) = 15.0;
     let mut payload = Vec::new();
     save_world_into(&mut payload);
     let frame = full_state_frame(&payload);
     payload[frame.start..frame.start + 4].copy_from_slice(&f32::NAN.to_be_bytes());
-    world().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
     assert_eq!(load_world_from(&payload), Err("non-finite save float"));
     assert_eq!(overlay_block(2, 64, 3), None);
     assert_eq!(saved_value(&WORLD_SPAWN_PITCH), 15.0);
@@ -2306,7 +2306,7 @@ fn save_v2_panics_abort_the_boundary_and_corruption_cannot_apply_the_new_state()
     // Inject a panic in a real dependency of snapshot capture. The writer
     // must never run and the ownership guard must be available again.
     assert!(thread::spawn(|| {
-        let _pitch = WORLD_SPAWN_PITCH.lock().unwrap();
+        let _pitch = WORLD_SPAWN_PITCH.lock().unwrap_or_else(|e| e.into_inner());
         panic!("snapshot fixture");
     })
     .join()
@@ -2320,7 +2320,7 @@ fn save_v2_panics_abort_the_boundary_and_corruption_cannot_apply_the_new_state()
     save_world_guarded(|_| Ok(())).unwrap();
 
     assert!(thread::spawn(|| {
-        let _world = world().lock().unwrap();
+        let _world = world().lock().unwrap_or_else(|e| e.into_inner());
         panic!("loader fixture");
     })
     .join()
@@ -2341,16 +2341,16 @@ fn save_v2_rejects_a_truncated_companion_before_publishing_any_of_its_edits() {
         .unwrap()
         .insert((DimId::Nether, 0, 0), [(3, 501)].into());
     assert_eq!(save_dim_overlay_into(DimId::Nether, &mut payload), 1);
-    world().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
     for cut in 0..payload.len() {
         assert!(
             load_dim_overlay_from(DimId::Nether, &payload[..cut]).is_err(),
             "cut={cut}"
         );
-        assert!(world().lock().unwrap().is_empty());
+        assert!(world().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     }
     load_dim_overlay_from(DimId::Nether, &payload).unwrap();
-    assert_eq!(world().lock().unwrap()[&(DimId::Nether, 0, 0)][&3], 501);
+    assert_eq!(world().lock().unwrap_or_else(|e| e.into_inner())[&(DimId::Nether, 0, 0)][&3], 501);
 }
 
 #[test]
@@ -2360,9 +2360,9 @@ fn save_v2_live_block_entities_round_trip_all_families() {
         return;
     }
     let _world_guard = world_guard();
-    let old_world = std::mem::take(&mut *world().lock().unwrap());
-    let old_store = std::mem::take(&mut *live_block_entities().lock().unwrap());
-    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
+    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_store = std::mem::take(&mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
     let old_rng = world_rng::saved_state();
 
     let cases = [
@@ -2436,7 +2436,7 @@ fn save_v2_live_block_entities_round_trip_all_families() {
         );
     }
 
-    live_block_entities().lock().unwrap().entries.clear();
+    live_block_entities().lock().unwrap_or_else(|e| e.into_inner()).entries.clear();
     load_world_from(&payload).unwrap();
     let restored: Vec<_> = cases
         .iter()
@@ -2447,9 +2447,9 @@ fn save_v2_live_block_entities_round_trip_all_families() {
         })
         .collect();
 
-    *world().lock().unwrap() = old_world;
-    *live_block_entities().lock().unwrap() = old_store;
-    *drops().lock().unwrap() = old_drops;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()) = old_store;
+    *drops().lock().unwrap_or_else(|e| e.into_inner()) = old_drops;
     world_rng::restore(old_rng);
 
     assert_eq!(restored, expected.into_iter().map(|(k, s)| (k, Some(s))).collect::<Vec<_>>());
@@ -2461,8 +2461,8 @@ fn save_v2_autosave_preserves_bed_and_anchor_spawn_target_kinds() {
         return;
     }
     let _world_guard = world_guard();
-    let old_players = std::mem::take(&mut *saved_players().lock().unwrap());
-    let old_clients = std::mem::take(&mut *clients().lock().unwrap());
+    let old_players = std::mem::take(&mut *saved_players().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
 
     let bed = SpawnTarget {
         kind: SpawnTargetKind::Bed,
@@ -2482,14 +2482,14 @@ fn save_v2_autosave_preserves_bed_and_anchor_spawn_target_kinds() {
         let (mut client, _peer) = effect_tests::client_pair();
         client.uuid = uuid;
         client.eid += 7_000;
-        *client.spawn_dim.lock().unwrap() = target.dim;
-        *client.spawn_pt.lock().unwrap() =
+        *client.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = target.dim;
+        *client.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((target.position.0, target.position.1, target.position.2, target.angle));
         let mut state =
             PlayerSave::capture(&client, client_dim_pos(&client), &HashMap::new());
         state.respawn = Some(target);
-        saved_players().lock().unwrap().insert(uuid, state);
-        clients().lock().unwrap().push(Arc::new(client));
+        saved_players().lock().unwrap_or_else(|e| e.into_inner()).insert(uuid, state);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
     }
 
     // The autosave recaptures every live client from spawn_pt, which carries no
@@ -2497,26 +2497,26 @@ fn save_v2_autosave_preserves_bed_and_anchor_spawn_target_kinds() {
     let mut payload = Vec::new();
     save_world_into(&mut payload);
     let after_save = {
-        let saved = saved_players().lock().unwrap();
+        let saved = saved_players().lock().unwrap_or_else(|e| e.into_inner());
         (saved[&[7; 16]].respawn, saved[&[9; 16]].respawn)
     };
-    saved_players().lock().unwrap().clear();
+    saved_players().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
     let after_load = {
-        let saved = saved_players().lock().unwrap();
+        let saved = saved_players().lock().unwrap_or_else(|e| e.into_inner());
         (saved[&[7; 16]].respawn, saved[&[9; 16]].respawn)
     };
 
     // A moved spawn point has no saved record to match and stays Legacy.
-    *clients().lock().unwrap()[0].spawn_pt.lock().unwrap() =
+    *clients().lock().unwrap_or_else(|e| e.into_inner())[0].spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((1.5, 60.0, 1.5, 0.0));
     let mut second = Vec::new();
     save_world_into(&mut second);
-    let moved = saved_players().lock().unwrap()[&[7; 16]].respawn;
+    let moved = saved_players().lock().unwrap_or_else(|e| e.into_inner())[&[7; 16]].respawn;
 
-    clients().lock().unwrap().clear();
-    *saved_players().lock().unwrap() = old_players;
-    *clients().lock().unwrap() = old_clients;
+    clients().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *saved_players().lock().unwrap_or_else(|e| e.into_inner()) = old_players;
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = old_clients;
 
     assert_eq!(after_save, (Some(bed), Some(anchor)));
     assert_eq!(after_load, (Some(bed), Some(anchor)));

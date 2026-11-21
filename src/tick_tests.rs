@@ -44,10 +44,10 @@ struct RuntimeRegistrySnapshot {
 impl RuntimeRegistrySnapshot {
     fn take() -> Self {
         Self {
-            mobs: std::mem::take(&mut *mobs().lock().unwrap()),
-            crops: std::mem::take(&mut *crops().lock().unwrap()),
-            sheared: std::mem::take(&mut *sheared().lock().unwrap()),
-            tags: std::mem::take(&mut *tags().lock().unwrap()),
+            mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
+            crops: std::mem::take(&mut *crops().lock().unwrap_or_else(|e| e.into_inner())),
+            sheared: std::mem::take(&mut *sheared().lock().unwrap_or_else(|e| e.into_inner())),
+            tags: std::mem::take(&mut *tags().lock().unwrap_or_else(|e| e.into_inner())),
             next_eid: NEXT_EID.load(Ordering::SeqCst),
         }
     }
@@ -72,14 +72,14 @@ fn d1_nether_crop_growth_writes_only_its_dimension() {
     let (x, y, z) = (0, 70, 0);
     set_block_dim(DimId::Overworld, x, y, z, 1);
     set_block_dim(DimId::Nether, x, y, z, 4278);
-    crops().lock().unwrap().insert((DimId::Nether, x, y, z), 0);
+    crops().lock().unwrap_or_else(|e| e.into_inner()).insert((DimId::Nether, x, y, z), 0);
 
     // y ^ tick is zero here, so this crop is due immediately.
     grow_crops(y as u64, |_, _| true);
 
     assert_eq!(block_at_dim(DimId::Nether, x, y, z), 4279);
     assert_eq!(block_at_dim(DimId::Overworld, x, y, z), 1);
-    assert_eq!(crops().lock().unwrap().get(&(DimId::Nether, x, y, z)), Some(&1));
+    assert_eq!(crops().lock().unwrap_or_else(|e| e.into_inner()).get(&(DimId::Nether, x, y, z)), Some(&1));
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn d1_reload_saved_drop_eid_does_not_collide_with_mob() {
     let _world = WorldSnapshot::take();
     let _runtime = RuntimeRegistrySnapshot::take();
     NEXT_EID.store(1000, Ordering::SeqCst);
-    mobs().lock().unwrap().push(Arc::new(Mob {
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(Mob {
         dim: DimId::Overworld,
         eid: 1001,
         uuid: [0; 16],
@@ -105,7 +105,7 @@ fn d1_reload_saved_drop_eid_does_not_collide_with_mob() {
         love: Mutex::new(0),
         air: Mutex::new(300),
     }));
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 1000,
         x: 0.5,
         y: 70.0,
@@ -119,13 +119,13 @@ fn d1_reload_saved_drop_eid_does_not_collide_with_mob() {
     });
     let mut saved = Vec::new();
     save_world_into(&mut saved);
-    mobs().lock().unwrap().clear();
-    drops().lock().unwrap().clear();
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     NEXT_EID.store(1000, Ordering::SeqCst);
 
     load_world_from(&saved).unwrap();
-    let mob_ids: Vec<i32> = mobs().lock().unwrap().iter().map(|m| m.eid).collect();
-    let drop_ids: Vec<i32> = drops().lock().unwrap().iter().map(|d| d.eid).collect();
+    let mob_ids: Vec<i32> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|m| m.eid).collect();
+    let drop_ids: Vec<i32> = drops().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|d| d.eid).collect();
     assert_eq!(mob_ids.len(), 1);
     assert_eq!(drop_ids, [1000]);
     assert_ne!(mob_ids[0], drop_ids[0]);
@@ -138,8 +138,8 @@ fn gp2_saved_mob_dimensions_follow_legacy_record_order() {
         return;
     }
     WORLD_SEED.store(4242, Ordering::Relaxed);
-    WORLD_SPAWN.lock().unwrap().3 = 45.0;
-    world_border().lock().unwrap().center_x = 12.5;
+    WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()).3 = 45.0;
+    world_border().lock().unwrap_or_else(|e| e.into_inner()).center_x = 12.5;
     let pos = (0.5, 70.0, 0.5, 0.0, 0.0);
     for dim in DimId::ALL {
         assert!(insert_live_mob(22, dim, pos, 10.0, None));
@@ -154,14 +154,14 @@ fn gp2_saved_mob_dimensions_follow_legacy_record_order() {
         (saved.as_slice(), DimId::ALL),
         (legacy, [DimId::Overworld; 3]),
     ] {
-        mobs().lock().unwrap().clear();
-        WORLD_SPAWN.lock().unwrap().3 = 0.0;
-        *world_border().lock().unwrap() = WorldBorderState::default();
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()).3 = 0.0;
+        *world_border().lock().unwrap_or_else(|e| e.into_inner()) = WorldBorderState::default();
         load_world_from(payload).unwrap();
-        let actual: Vec<_> = mobs().lock().unwrap().iter().map(|mob| mob.dim).collect();
+        let actual: Vec<_> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|mob| mob.dim).collect();
         assert_eq!(actual, expected);
-        assert_eq!(world_border().lock().unwrap().center_x, 12.5);
-        assert_eq!(WORLD_SPAWN.lock().unwrap().3, 45.0);
+        assert_eq!(world_border().lock().unwrap_or_else(|e| e.into_inner()).center_x, 12.5);
+        assert_eq!(WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()).3, 45.0);
     }
 }
 
@@ -188,7 +188,7 @@ fn gp2_mismatched_mob_dimension_footer_does_not_apply_overlay() {
         load_world_from(&payload),
         Err("mob dimension count does not match mob records")
     );
-    assert!(!world().lock().unwrap().contains_key(&chunk));
+    assert!(!world().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&chunk));
 }
 
 #[test]
@@ -506,7 +506,7 @@ fn generated_dispatcher_fixture() {
                 worldgen::take_generated_leaf_ticks().is_empty(),
                 "dispatcher did not drain published leaves"
             );
-            block_ticks().lock().unwrap().collect(now, 65536, |_| true)
+            block_ticks().lock().unwrap_or_else(|e| e.into_inner()).collect(now, 65536, |_| true)
         };
         let text = events
             .into_iter()
@@ -540,7 +540,7 @@ fn generated_dispatcher_fixture() {
 /// (rather than hanging) if it does not return.
 #[test]
 fn adv_event_returns_with_a_loaded_advancement_set() {
-    advancements().lock().unwrap().insert(
+    advancements().lock().unwrap_or_else(|e| e.into_inner()).insert(
         "test:ping".to_string(),
         Advancement {
             title: "ping".to_string(),
@@ -557,9 +557,9 @@ fn adv_event_returns_with_a_loaded_advancement_set() {
         rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
         "adv_event did not return: the event index build deadlocks on the advancement map"
     );
-    advancements().lock().unwrap().remove("test:ping");
-    adv_prog().lock().unwrap().remove("GuardTester");
-    adv_done().lock().unwrap().remove("GuardTester");
+    advancements().lock().unwrap_or_else(|e| e.into_inner()).remove("test:ping");
+    adv_prog().lock().unwrap_or_else(|e| e.into_inner()).remove("GuardTester");
+    adv_done().lock().unwrap_or_else(|e| e.into_inner()).remove("GuardTester");
 }
 
 /// Captures the globals a world test mutates and restores them when dropped, so a failing assertion
@@ -582,20 +582,20 @@ struct WorldSnapshot {
 impl WorldSnapshot {
     fn take() -> WorldSnapshot {
         WorldSnapshot {
-            world: std::mem::take(&mut *world().lock().unwrap()),
-            falling: std::mem::take(&mut *falling().lock().unwrap()),
-            drops: std::mem::take(&mut *drops().lock().unwrap()),
-            clients: std::mem::take(&mut *clients().lock().unwrap()),
-            forced: std::mem::take(&mut *forceloaded().lock().unwrap()),
+            world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+            falling: std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner())),
+            drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+            clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+            forced: std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner())),
             region: test_region(),
             scheduled_blocks: std::mem::replace(
-                &mut *block_ticks().lock().unwrap(),
+                &mut *block_ticks().lock().unwrap_or_else(|e| e.into_inner()),
                 scheduled_ticks::ScheduledTicks::new(),
             ),
             generated_fluids: GENERATED_FLUID_OWNER.get().map(|owner| {
-                std::mem::replace(&mut *owner.lock().unwrap(), GeneratedFluidOwner::new())
+                std::mem::replace(&mut *owner.lock().unwrap_or_else(|e| e.into_inner()), GeneratedFluidOwner::new())
             }),
-            pending_block_loot: std::mem::take(&mut *pending_block_loot().lock().unwrap()),
+            pending_block_loot: std::mem::take(&mut *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner())),
             // Park the worldgen leaf backlog alongside `block_ticks`: the next
             // `scheduled_block_tick` unpacks every pending generated tick, and a backlog
             // accumulated by earlier tests turns an ordinary falling-booking drain into a
@@ -670,16 +670,16 @@ fn fragile_support_loss_drops_torches_and_lanterns_exactly_once() {
         let unrelated = (block.0 + 1, block.1, block.2);
         set_block(unrelated.0, unrelated.1, unrelated.2, air);
         assert_eq!(block_at(block.0, block.1, block.2), state);
-        let before = drops().lock().unwrap().len();
+        let before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
         set_block(support.0, support.1, support.2, air);
         assert_eq!(block_at(block.0, block.1, block.2), air,
             "support loss must clear the fragile block");
-        assert_eq!(drops().lock().unwrap().len(), before + 1,
+        assert_eq!(drops().lock().unwrap_or_else(|e| e.into_inner()).len(), before + 1,
             "exactly one drop from the detached block");
-        let last_item = drops().lock().unwrap().last().unwrap().item;
+        let last_item = drops().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().item;
         assert_eq!(last_item, reg.block_drop(state).unwrap());
         set_block(support.0, support.1, support.2, air);
-        assert_eq!(drops().lock().unwrap().len(), before + 1,
+        assert_eq!(drops().lock().unwrap_or_else(|e| e.into_inner()).len(), before + 1,
             "repeated notifications must not duplicate drops");
     }
 }
@@ -807,7 +807,7 @@ fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
     {
         // Explicit closed chamber, so FluidReader never silently consults
         // unspecified generated terrain as a fixture input.
-        let mut world = world().lock().unwrap();
+        let mut world = world().lock().unwrap_or_else(|e| e.into_inner());
         let chunk = world.entry((DimId::Overworld, 0, 0)).or_default();
         for y in 210..=212 {
             for z in 2..=10 {
@@ -895,7 +895,7 @@ fn world_mechanisms_generated_fluids_cross_chunk_borders_on_their_tick_deadlines
         let source = (origin_x, 217, 5);
         let target = (origin_x + 1, 217, 5);
         {
-            let mut chunks = world().lock().unwrap();
+            let mut chunks = world().lock().unwrap_or_else(|e| e.into_inner());
             chunks.clear();
             for x in origin_x - 3..=origin_x + 4 {
                 for z in 2i32..=8 {
@@ -1035,15 +1035,15 @@ fn pickup_tick_drains_across_selected_offhand_then_hotbar() {
     let _snapshot = WorldSnapshot::take();
     set_test_region(HashSet::from([(0, 0)]), HashSet::new());
     let (client, _receiver) = client_pair();
-    *client.held.lock().unwrap() = 4;
+    *client.held.lock().unwrap_or_else(|e| e.into_inner()) = 4;
     let stone = name_to_item("stone").unwrap();
-    *client.inv.lock().unwrap() = [9, 36, 40, 45]
+    *client.inv.lock().unwrap_or_else(|e| e.into_inner()) = [9, 36, 40, 45]
         .into_iter()
         .map(|key| (key, (stone, 60, vec![])))
         .collect();
     let client = Arc::new(client);
-    clients().lock().unwrap().push(client.clone());
-    drops().lock().unwrap().push(Drop {
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(client.clone());
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9999,
         x: 0.0,
         y: 70.0,
@@ -1056,8 +1056,8 @@ fn pickup_tick_drains_across_selected_offhand_then_hotbar() {
         thrower: None,
     });
     drop_tick();
-    let remaining: Vec<_> = drops().lock().unwrap().iter().map(|d| d.cnt).collect();
-    let actual = client.inv.lock().unwrap().clone();
+    let remaining: Vec<_> = drops().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|d| d.cnt).collect();
+    let actual = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(
         remaining.is_empty(),
         "pickup left entity counts {remaining:?}"
@@ -1081,12 +1081,12 @@ fn pickup_tick_keeps_the_partial_entity_without_a_take_event() {
     let (client, mut receiver) = client_pair();
     let stone = name_to_item("stone").unwrap();
     let dirt = name_to_item("dirt").unwrap();
-    *client.inv.lock().unwrap() = (9..=44).map(|key| (key, (dirt, 64, vec![]))).collect();
-    client.inv.lock().unwrap().insert(45, (stone, 60, vec![]));
-    client.seen.lock().unwrap().insert(9999);
+    *client.inv.lock().unwrap_or_else(|e| e.into_inner()) = (9..=44).map(|key| (key, (dirt, 64, vec![]))).collect();
+    client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(45, (stone, 60, vec![]));
+    client.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(9999);
     let client = Arc::new(client);
-    clients().lock().unwrap().push(client.clone());
-    drops().lock().unwrap().push(Drop {
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(client.clone());
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9999,
         x: 0.0,
         y: 70.0,
@@ -1099,8 +1099,8 @@ fn pickup_tick_keeps_the_partial_entity_without_a_take_event() {
         thrower: None,
     });
     drop_tick();
-    let remaining: Vec<_> = drops().lock().unwrap().iter().map(|d| d.cnt).collect();
-    let offhand = client.inv.lock().unwrap().get(&45).cloned();
+    let remaining: Vec<_> = drops().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|d| d.cnt).collect();
+    let offhand = client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45).cloned();
     client
         .sock
         .lock()
@@ -1133,17 +1133,17 @@ fn pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack() {
     second.eid += 1;
     let first = Arc::new(first);
     let second = Arc::new(second);
-    *clients().lock().unwrap() = vec![first.clone(), second.clone()];
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![first.clone(), second.clone()];
     let stone = name_to_item("stone").unwrap();
     // With two eligible players, the live drop is consumed only once.
     for (full, creative) in [(false, false), (true, false), (true, true)] {
-        *first.gm.lock().unwrap() = u8::from(creative);
-        first.inv.lock().unwrap().clear();
-        second.inv.lock().unwrap().clear();
+        *first.gm.lock().unwrap_or_else(|e| e.into_inner()) = u8::from(creative);
+        first.inv.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        second.inv.lock().unwrap_or_else(|e| e.into_inner()).clear();
         if full {
-            *first.inv.lock().unwrap() = (9..=44).map(|key| (key, (stone, 64, vec![]))).collect();
+            *first.inv.lock().unwrap_or_else(|e| e.into_inner()) = (9..=44).map(|key| (key, (stone, 64, vec![]))).collect();
         }
-        drops().lock().unwrap().push(Drop {
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
             eid: 9999,
             x: 0.0,
             y: 70.0,
@@ -1156,9 +1156,9 @@ fn pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack() {
             thrower: None,
         });
         drop_tick();
-        let remaining = drops().lock().unwrap().len();
-        let a = first.inv.lock().unwrap().clone();
-        let b = second.inv.lock().unwrap().clone();
+        let remaining = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
+        let a = first.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let b = second.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(remaining, 0);
         if full {
             assert_eq!(a[&36].1, 64);
@@ -1196,15 +1196,15 @@ fn pickup_tick_refuses_a_drop_inside_its_pickup_delay() {
     let eid = client.eid;
     // Register the client as an observer, so "no packet" means the take did not happen rather
     // than the client being outside the broadcast audience.
-    client.seen.lock().unwrap().insert(9120);
+    client.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(9120);
     let client = Arc::new(client);
-    *clients().lock().unwrap() = vec![client.clone()];
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![client.clone()];
     let delay = server_ticks(PICKUP_DELAY_GT) as i32;
     assert!(
         delay > 1,
         "the boundary fixture needs at least one tick below the delay"
     );
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9120,
         x: 0.0,
         y: 70.0,
@@ -1229,7 +1229,7 @@ fn pickup_tick_refuses_a_drop_inside_its_pickup_delay() {
         Some((1, 10)),
         "a refused take must leave the entity's count and its aging stage alone"
     );
-    let young = client.inv.lock().unwrap().clone();
+    let young = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(
         young.is_empty(),
         "a fresh drop was collected: {young:?}"
@@ -1237,7 +1237,7 @@ fn pickup_tick_refuses_a_drop_inside_its_pickup_delay() {
     // Boundary: one tick short still refuses, and that tick is also the one that ages the entity
     // up to the threshold. The age stage stays after the take; the test reads the order, not a
     // reordering done to make the test pass.
-    for d in drops().lock().unwrap().iter_mut() {
+    for d in drops().lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
         if d.eid == 9120 {
             d.age = delay - 1;
         }
@@ -1255,7 +1255,7 @@ fn pickup_tick_refuses_a_drop_inside_its_pickup_delay() {
         "age {} is inside the delay and must refuse the take",
         delay - 1
     );
-    let edge = client.inv.lock().unwrap().clone();
+    let edge = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(
         edge.is_empty(),
         "the tick before the threshold collected: {edge:?}"
@@ -1278,11 +1278,11 @@ fn pickup_tick_refuses_a_drop_inside_its_pickup_delay() {
     // the delay and not a candidate the scan never offers again.
     drop_tick();
     assert!(
-        drops().lock().unwrap().iter().all(|d| d.eid != 9120),
+        drops().lock().unwrap_or_else(|e| e.into_inner()).iter().all(|d| d.eid != 9120),
         "the drop that reached the delay was never collected"
     );
     assert_eq!(
-        client.inv.lock().unwrap().get(&36),
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36),
         Some(&(stone, 10, vec![])),
         "the aged drop must reach the selected slot, collector {eid}"
     );
@@ -1299,13 +1299,13 @@ fn pickup_tick_collects_at_the_delay_and_reports_the_original_count() {
     let (client, mut receiver) = client_pair();
     let stone = name_to_item("stone").unwrap();
     let eid = client.eid;
-    client.seen.lock().unwrap().insert(9130);
+    client.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(9130);
     // The offhand holds 60, so the ten items spill from it into the selected slot: two slots
     // must change, and the entity is still consumed whole.
-    client.inv.lock().unwrap().insert(45, (stone, 60, vec![]));
+    client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(45, (stone, 60, vec![]));
     let client = Arc::new(client);
-    *clients().lock().unwrap() = vec![client.clone()];
-    drops().lock().unwrap().push(Drop {
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![client.clone()];
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9130,
         x: 0.0,
         y: 70.0,
@@ -1319,16 +1319,16 @@ fn pickup_tick_collects_at_the_delay_and_reports_the_original_count() {
     });
     drop_tick();
     assert!(
-        drops().lock().unwrap().is_empty(),
+        drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "a drop at its delay must be consumed whole"
     );
     assert_eq!(
-        client.inv.lock().unwrap().get(&45),
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
         Some(&(stone, 64, vec![])),
         "the offhand must be filled from the aged drop"
     );
     assert_eq!(
-        client.inv.lock().unwrap().get(&36),
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36),
         Some(&(stone, 6, vec![])),
         "the spill must reach the selected slot"
     );
@@ -1369,13 +1369,13 @@ fn pickup_tick_delay_boundary_keeps_the_partial_insert_and_leftover() {
     let (client, mut receiver) = client_pair();
     let stone = name_to_item("stone").unwrap();
     let dirt = name_to_item("dirt").unwrap();
-    client.seen.lock().unwrap().insert(9140);
-    *client.inv.lock().unwrap() = (9..=44).map(|key| (key, (dirt, 64, vec![]))).collect();
-    client.inv.lock().unwrap().insert(45, (stone, 60, vec![]));
+    client.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(9140);
+    *client.inv.lock().unwrap_or_else(|e| e.into_inner()) = (9..=44).map(|key| (key, (dirt, 64, vec![]))).collect();
+    client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(45, (stone, 60, vec![]));
     let client = Arc::new(client);
-    *clients().lock().unwrap() = vec![client.clone()];
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![client.clone()];
     let delay = server_ticks(PICKUP_DELAY_GT) as i32;
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9140,
         x: 0.0,
         y: 70.0,
@@ -1389,12 +1389,12 @@ fn pickup_tick_delay_boundary_keeps_the_partial_insert_and_leftover() {
     });
     drop_tick();
     assert_eq!(
-        client.inv.lock().unwrap().get(&45),
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
         Some(&(stone, 60, vec![])),
         "the tick before the threshold merged into the offhand"
     );
     assert_eq!(
-        client.inv.lock().unwrap().get(&9),
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&9),
         Some(&(dirt, 64, vec![])),
         "the tick before the threshold rewrote another slot"
     );
@@ -1408,8 +1408,8 @@ fn pickup_tick_delay_boundary_keeps_the_partial_insert_and_leftover() {
     // One tick later the same fixture runs the pinned insertion rule. Nothing about the partial
     // result is different for having waited.
     drop_tick();
-    let remaining: Vec<u8> = drops().lock().unwrap().iter().map(|d| d.cnt).collect();
-    let offhand = client.inv.lock().unwrap().get(&45).cloned();
+    let remaining: Vec<u8> = drops().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|d| d.cnt).collect();
+    let offhand = client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45).cloned();
     assert_eq!(remaining, [6], "the leftover must stay on the entity");
     assert_eq!(offhand, Some((stone, 64, vec![])));
     client
@@ -1448,13 +1448,13 @@ fn pickup_tick_delay_keeps_the_next_player_eligible() {
     second.eid += 1;
     let first = Arc::new(first);
     let second = Arc::new(second);
-    *clients().lock().unwrap() = vec![first.clone(), second.clone()];
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![first.clone(), second.clone()];
     let stone = name_to_item("stone").unwrap();
     let dirt = name_to_item("dirt").unwrap();
-    *first.inv.lock().unwrap() = (9..=44).map(|key| (key, (dirt, 64, vec![]))).collect();
-    let full = first.inv.lock().unwrap().clone();
+    *first.inv.lock().unwrap_or_else(|e| e.into_inner()) = (9..=44).map(|key| (key, (dirt, 64, vec![]))).collect();
+    let full = first.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let delay = server_ticks(PICKUP_DELAY_GT) as i32;
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9150,
         x: 0.0,
         y: 70.0,
@@ -1468,26 +1468,26 @@ fn pickup_tick_delay_keeps_the_next_player_eligible() {
     });
     drop_tick();
     assert!(
-        second.inv.lock().unwrap().is_empty(),
+        second.inv.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "the second player collected a drop inside its delay"
     );
     assert_eq!(
-        drops().lock().unwrap().iter().map(|d| (d.eid, d.cnt)).collect::<Vec<_>>(),
+        drops().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|d| (d.eid, d.cnt)).collect::<Vec<_>>(),
         [(9150, 10)],
         "a drop inside its delay must stay on the ground"
     );
     drop_tick();
     assert!(
-        drops().lock().unwrap().is_empty(),
+        drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "the full player monopolized the drop instead of letting the next one take it"
     );
     assert_eq!(
-        *second.inv.lock().unwrap(),
+        *second.inv.lock().unwrap_or_else(|e| e.into_inner()),
         HashMap::from([(36, (stone, 10, vec![]))]),
         "the next eligible player must receive the aged drop"
     );
     assert_eq!(
-        *first.inv.lock().unwrap(),
+        *first.inv.lock().unwrap_or_else(|e| e.into_inner()),
         full,
         "the full player's inventory must not change"
     );
@@ -1499,19 +1499,19 @@ fn pickup_tick_excludes_spectator_and_dead_players() {
     let _snapshot = WorldSnapshot::take();
     set_test_region(HashSet::from([(0, 0)]), HashSet::new());
     let (spectator, mut spectator_rx) = client_pair();
-    *spectator.gm.lock().unwrap() = 3;
-    spectator.seen.lock().unwrap().insert(9201);
+    *spectator.gm.lock().unwrap_or_else(|e| e.into_inner()) = 3;
+    spectator.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(9201);
     let spectator = Arc::new(spectator);
 
     let (mut dead, mut dead_rx) = client_pair();
     dead.eid += 1;
-    *dead.hp.lock().unwrap() = 0.0;
-    dead.seen.lock().unwrap().insert(9201);
+    *dead.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+    dead.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(9201);
     let dead = Arc::new(dead);
 
-    *clients().lock().unwrap() = vec![spectator.clone(), dead.clone()];
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![spectator.clone(), dead.clone()];
     let stone = name_to_item("stone").unwrap();
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9201,
         x: 0.0,
         y: 70.0,
@@ -1525,15 +1525,15 @@ fn pickup_tick_excludes_spectator_and_dead_players() {
     });
     drop_tick();
     assert!(
-        spectator.inv.lock().unwrap().is_empty(),
+        spectator.inv.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "spectator player must never pick up drops"
     );
     assert!(
-        dead.inv.lock().unwrap().is_empty(),
+        dead.inv.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "dead player (hp <= 0) must never pick up drops"
     );
     assert_eq!(
-        drops().lock().unwrap().iter().map(|d| (d.eid, d.cnt)).collect::<Vec<_>>(),
+        drops().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|d| (d.eid, d.cnt)).collect::<Vec<_>>(),
         [(9201, 8)],
         "spectator/dead players must leave the drop intact"
     );
@@ -1553,11 +1553,11 @@ fn pickup_tick_excludes_spectator_and_dead_players() {
     assert!(read_packet(&mut dead_rx, Instant::now() + Duration::from_secs(1)).is_none());
 
     // Switching the player back out of spectator into survival allows pickup.
-    *spectator.gm.lock().unwrap() = 0;
+    *spectator.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     drop_tick();
-    assert!(drops().lock().unwrap().is_empty());
+    assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     assert_eq!(
-        spectator.inv.lock().unwrap().get(&36),
+        spectator.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36),
         Some(&(stone, 8, vec![]))
     );
 }
@@ -1569,7 +1569,7 @@ fn pickup_tick_matches_1_21_1_player_touch_aabb_boundaries() {
     set_test_region(HashSet::from([(0, 0)]), HashSet::new());
     let (client, _rx) = client_pair();
     let client = Arc::new(client);
-    *clients().lock().unwrap() = vec![client.clone()];
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![client.clone()];
     let stone = name_to_item("stone").unwrap();
     let ready = server_ticks(PICKUP_DELAY_GT) as i32;
 
@@ -1602,11 +1602,11 @@ fn pickup_tick_matches_1_21_1_player_touch_aabb_boundaries() {
     ];
 
     for (eid, x, y, z, sneaking, fall_fly, expect_pickup, reason) in cases {
-        client.inv.lock().unwrap().clear();
-        drops().lock().unwrap().clear();
-        *client.sneaking.lock().unwrap() = sneaking;
-        *client.fall_fly.lock().unwrap() = fall_fly;
-        drops().lock().unwrap().push(Drop {
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *client.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = sneaking;
+        *client.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = fall_fly;
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
             eid,
             x,
             y,
@@ -1619,7 +1619,7 @@ fn pickup_tick_matches_1_21_1_player_touch_aabb_boundaries() {
             thrower: None,
         });
         drop_tick();
-        let picked = drops().lock().unwrap().is_empty();
+        let picked = drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         assert_eq!(picked, expect_pickup, "case {eid} ({reason})");
     }
 }
@@ -1634,21 +1634,21 @@ fn pickup_tick_enforces_target_uuid_over_closer_non_target() {
 
     let (mut closer, _rx1) = client_pair();
     closer.uuid = uuid_non_target;
-    *closer.pos.lock().unwrap() = (0.0, 70.0, 0.0, 0.0, 0.0, true);
+    *closer.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 70.0, 0.0, 0.0, 0.0, true);
     let closer = Arc::new(closer);
 
     let (mut owner, _rx2) = client_pair();
     owner.eid += 1;
     owner.uuid = uuid_owner;
-    *owner.pos.lock().unwrap() = (1.2, 70.0, 0.0, 0.0, 0.0, true);
+    *owner.pos.lock().unwrap_or_else(|e| e.into_inner()) = (1.2, 70.0, 0.0, 0.0, 0.0, true);
     let owner = Arc::new(owner);
 
-    *clients().lock().unwrap() = vec![closer.clone(), owner.clone()];
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![closer.clone(), owner.clone()];
     let stone = name_to_item("stone").unwrap();
     let ready = server_ticks(PICKUP_DELAY_GT) as i32;
 
     // 1. Target = uuid_owner, Thrower = uuid_non_target: closer (even at distance 0 & thrower) is rejected; owner collects!
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9230,
         x: 0.0,
         y: 70.0,
@@ -1661,18 +1661,18 @@ fn pickup_tick_enforces_target_uuid_over_closer_non_target() {
         thrower: Some(uuid_non_target),
     });
     drop_tick();
-    assert!(drops().lock().unwrap().is_empty());
-    assert!(closer.inv.lock().unwrap().is_empty(), "non-target closer player must not pick up targeted drop");
+    assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    assert!(closer.inv.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "non-target closer player must not pick up targeted drop");
     assert_eq!(
-        owner.inv.lock().unwrap().get(&36),
+        owner.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36),
         Some(&(stone, 5, vec![])),
         "target owner must pick up targeted drop"
     );
 
     // 2. Target = None, Thrower = uuid_owner: thrower alone does NOT restrict pickup in 1.21.1 ItemEntity.playerTouch.
-    closer.inv.lock().unwrap().clear();
-    owner.inv.lock().unwrap().clear();
-    drops().lock().unwrap().push(Drop {
+    closer.inv.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    owner.inv.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9231,
         x: 0.0,
         y: 70.0,
@@ -1685,16 +1685,16 @@ fn pickup_tick_enforces_target_uuid_over_closer_non_target() {
         thrower: Some(uuid_owner),
     });
     drop_tick();
-    assert!(drops().lock().unwrap().is_empty());
+    assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     assert_eq!(
-        closer.inv.lock().unwrap().get(&36),
+        closer.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36),
         Some(&(stone, 3, vec![])),
         "thrower alone must not block another player from picking up an untargeted drop"
     );
 
     // 3. Targeted drop with non-present owner stays on the ground even when closer non-target or an Actor is on top.
-    closer.inv.lock().unwrap().clear();
-    let old_actors = std::mem::take(&mut *actors().lock().unwrap());
+    closer.inv.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let old_actors = std::mem::take(&mut *actors().lock().unwrap_or_else(|e| e.into_inner()));
     let actor = Arc::new(Actor {
         name: "bot".into(),
         eid: 9239,
@@ -1704,9 +1704,9 @@ fn pickup_tick_enforces_target_uuid_over_closer_non_target() {
         held: Mutex::new((0, 0, Vec::new())),
         inv: Mutex::new(HashMap::new()),
     });
-    actors().lock().unwrap().insert("bot".into(), actor.clone());
-    *clients().lock().unwrap() = vec![closer.clone()];
-    drops().lock().unwrap().push(Drop {
+    actors().lock().unwrap_or_else(|e| e.into_inner()).insert("bot".into(), actor.clone());
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![closer.clone()];
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9232,
         x: 0.0,
         y: 70.0,
@@ -1720,10 +1720,10 @@ fn pickup_tick_enforces_target_uuid_over_closer_non_target() {
     });
     drop_tick();
     actor_tick();
-    assert!(closer.inv.lock().unwrap().is_empty());
-    assert!(actor.inv.lock().unwrap().is_empty(), "actor without matching UUID must not absorb targeted drop");
-    assert_eq!(drops().lock().unwrap().len(), 1);
-    *actors().lock().unwrap() = old_actors;
+    assert!(closer.inv.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    assert!(actor.inv.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "actor without matching UUID must not absorb targeted drop");
+    assert_eq!(drops().lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+    *actors().lock().unwrap_or_else(|e| e.into_inner()) = old_actors;
 }
 
 /// Sets a test's saver-thread stop flag when dropped, so a panic does not leave the thread taking
@@ -1752,21 +1752,21 @@ fn furnace(input_count: u8) -> Furnace {
 #[test]
 fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
     let _world_guard = world_guard();
-    let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (old_hot, old_warm) = test_region();
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let old_time = WORLD_TIME.swap(1000, Ordering::Relaxed);
     let old_daylight = GR_DAYLIGHT_CYCLE.swap(1, Ordering::Relaxed);
-    forceloaded().lock().unwrap().insert((0, 0));
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     let warm_pos = (0, 70, 0);
     let cold_pos = (1600, 70, 1600);
-    furnaces().lock().unwrap().insert(ow_block(warm_pos), furnace(2));
-    furnaces().lock().unwrap().insert(ow_block(cold_pos), furnace(2));
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(ow_block(warm_pos), furnace(2));
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(ow_block(cold_pos), furnace(2));
     game_tick(|_, tick| tick());
     let actual = {
-        let fs = furnaces().lock().unwrap();
+        let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
         let hot = &fs[&ow_block(warm_pos)];
         let cold = &fs[&ow_block(cold_pos)];
         (
@@ -1783,8 +1783,8 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
         TICK_IDX.load(Ordering::Relaxed),
         WORLD_TIME.load(Ordering::Relaxed),
     );
-    *furnaces().lock().unwrap() = old_furnaces;
-    *forceloaded().lock().unwrap() = old_forced;
+    *furnaces().lock().unwrap_or_else(|e| e.into_inner()) = old_furnaces;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(old_hot, old_warm);
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
@@ -1798,9 +1798,9 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
 #[test]
 fn region_membership_matches_hot_plus_skirt_across_input_changes() {
     let _world_guard = world_guard();
-    assert!(clients().lock().unwrap().is_empty());
-    let old_actors = std::mem::take(&mut *actors().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    assert!(clients().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    let old_actors = std::mem::take(&mut *actors().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (old_hot, old_warm) = test_region();
     let mut observations = Vec::new();
     refresh_hot();
@@ -1811,7 +1811,7 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
         HashSet::new(),
     ));
     for name in ["moving", "stationary"] {
-        actors().lock().unwrap().insert(
+        actors().lock().unwrap_or_else(|e| e.into_inner()).insert(
             name.into(),
             Arc::new(Actor {
                 name: name.into(),
@@ -1837,11 +1837,11 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
     .into_iter()
     .enumerate()
     {
-        *actors().lock().unwrap()["moving"].pos.lock().unwrap() = (x, 70.0, z);
-        forceloaded().lock().unwrap().clear();
+        *actors().lock().unwrap_or_else(|e| e.into_inner())["moving"].pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, 70.0, z);
+        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).clear();
         let mut expected_hot = HashSet::new();
         if i % 2 == 0 {
-            forceloaded().lock().unwrap().insert((200, -200));
+            forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((200, -200));
             expected_hot.insert((200, -200));
         }
         for (px, pz) in [(cx, cz), (0, 0)] {
@@ -1868,11 +1868,11 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
             expected_warm,
         ));
     }
-    actors().lock().unwrap().clear();
+    actors().lock().unwrap_or_else(|e| e.into_inner()).clear();
     for x in 0..10 {
         for z in 0..10 {
             let name = format!("dense-{x}-{z}");
-            actors().lock().unwrap().insert(
+            actors().lock().unwrap_or_else(|e| e.into_inner()).insert(
                 name.clone(),
                 Arc::new(Actor {
                     name,
@@ -1899,8 +1899,8 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
         expected_hot,
         expected_warm,
     ));
-    actors().lock().unwrap().clear();
-    forceloaded().lock().unwrap().insert((-12, 9));
+    actors().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((-12, 9));
     refresh_hot();
     let expected_hot = HashSet::from([(-12, 9)]);
     let mut expected_warm = HashSet::new();
@@ -1915,7 +1915,7 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
         expected_hot,
         expected_warm,
     ));
-    forceloaded().lock().unwrap().clear();
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).clear();
     refresh_hot();
     observations.push((
         test_region().0,
@@ -1923,8 +1923,8 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
         HashSet::new(),
         HashSet::new(),
     ));
-    *actors().lock().unwrap() = old_actors;
-    *forceloaded().lock().unwrap() = old_forced;
+    *actors().lock().unwrap_or_else(|e| e.into_inner()) = old_actors;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(old_hot, old_warm);
     for (actual_hot, actual_warm, expected_hot, expected_warm) in observations {
         assert_eq!(actual_hot, expected_hot);
@@ -1942,15 +1942,15 @@ fn cadence_owner_keeps_world_clock_at_vanilla_rate() {
     let old_time = WORLD_TIME.swap(1000, Ordering::Relaxed);
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
-    let old_actors = std::mem::take(&mut *actors().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_actors = std::mem::take(&mut *actors().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (old_hot, old_warm) = test_region();
     let advanced = {
         game_tick(|_, tick| tick());
         WORLD_TIME.load(Ordering::Relaxed) - 1000
     };
-    *actors().lock().unwrap() = old_actors;
-    *forceloaded().lock().unwrap() = old_forced;
+    *actors().lock().unwrap_or_else(|e| e.into_inner()) = old_actors;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(old_hot, old_warm);
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
@@ -1962,23 +1962,23 @@ fn cadence_owner_keeps_world_clock_at_vanilla_rate() {
 fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     let _world_guard = world_guard();
     let (client, mut receiver) = client_pair();
-    let old_clients = std::mem::take(&mut *clients().lock().unwrap());
+    let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(0, Ordering::Relaxed);
     let old_time = WORLD_TIME.swap(1000, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
-    let old_actors = std::mem::take(&mut *actors().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_actors = std::mem::take(&mut *actors().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (old_hot, old_warm) = test_region();
     let old_anchors: Vec<_> = [&TIME_NOTIFY_AT, &SIZE_LOG_AT]
         .iter()
-        .map(|cell| *wall_anchor(cell).lock().unwrap())
+        .map(|cell| *wall_anchor(cell).lock().unwrap_or_else(|e| e.into_inner()))
         .collect();
     // Re-anchor every period so this test starts from a known wall clock and
     // cannot inherit an anchor another test initialized long ago.
     for cell in [&TIME_NOTIFY_AT, &SIZE_LOG_AT] {
-        *wall_anchor(cell).lock().unwrap() = Instant::now();
+        *wall_anchor(cell).lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
     }
-    clients().lock().unwrap().push(Arc::new(client));
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
     // Neither packet should originate from the fresh timing anchors.
     let mut seen = Vec::new();
     while let Some((packet, _)) =
@@ -1990,7 +1990,7 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     }
     // Rewinding an anchor past its period must make the next tick fire it,
     // which is what proves the mechanism is a wall clock and not a counter.
-    *wall_anchor(&TIME_NOTIFY_AT).lock().unwrap() =
+    *wall_anchor(&TIME_NOTIFY_AT).lock().unwrap_or_else(|e| e.into_inner()) =
         Instant::now() - Duration::from_millis(TIME_NOTIFY_MS + 1);
     game_tick(|_, tick| tick());
     let mut fired = Vec::new();
@@ -2002,15 +2002,15 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
         }
     }
     // Restore before asserting so a failure cannot poison the shared fixture.
-    *clients().lock().unwrap() = old_clients;
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = old_clients;
     TICK.store(old_tick, Ordering::Relaxed);
     WORLD_TIME.store(old_time, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
-    *actors().lock().unwrap() = old_actors;
-    *forceloaded().lock().unwrap() = old_forced;
+    *actors().lock().unwrap_or_else(|e| e.into_inner()) = old_actors;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(old_hot, old_warm);
     for (cell, anchor) in [&TIME_NOTIFY_AT, &SIZE_LOG_AT].iter().zip(old_anchors) {
-        *wall_anchor(cell).lock().unwrap() = anchor;
+        *wall_anchor(cell).lock().unwrap_or_else(|e| e.into_inner()) = anchor;
     }
     assert!(
         seen.is_empty(),
@@ -2107,8 +2107,8 @@ fn per_tick_rates_keep_the_same_chance_per_real_second() {
 #[test]
 fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
     let _world_guard = world_guard();
-    let old_primed = std::mem::take(&mut *primed().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_primed = std::mem::take(&mut *primed().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
@@ -2122,8 +2122,8 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
     assert_eq!(chain_fuse_left(1023), server_ticks(30));
     assert_eq!(chain_fuse_left(0) * TICK_MS, 500);
     assert_eq!(chain_fuse_left(1023) * TICK_MS, 1500);
-    forceloaded().lock().unwrap().insert((0, 0));
-    primed().lock().unwrap().push(Primed {
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+    primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
         eid: 9001,
         x: 0.5,
         y: 70.0,
@@ -2133,14 +2133,14 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
     let mut exploded_at = None;
     for step in 1..=200 {
         game_tick(|_, tick| tick());
-        if primed().lock().unwrap().is_empty() {
+        if primed().lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
             exploded_at = Some(step);
             break;
         }
     }
     // Far outside the hot set the fuse must not advance at all, so an unloaded
     // TNT survives indefinitely instead of exploding on a wall-clock timer.
-    primed().lock().unwrap().push(Primed {
+    primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
         eid: 9002,
         x: 30_000_000.0,
         y: 70.0,
@@ -2161,8 +2161,8 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
     for jitter in [0u64, 1, 20, 1000, 1023] {
         chain_range.push(server_ticks(10 + jitter.min(20)) as i32);
     }
-    *primed().lock().unwrap() = old_primed;
-    *forceloaded().lock().unwrap() = old_forced;
+    *primed().lock().unwrap_or_else(|e| e.into_inner()) = old_primed;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
@@ -2179,9 +2179,9 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
 #[test]
 fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
     let _world_guard = world_guard();
-    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
-    let old_xps = std::mem::take(&mut *xps().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_xps = std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
@@ -2195,8 +2195,8 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
     assert_eq!(XP_LIFE_GT, 6000);
     assert_eq!(server_ticks(PICKUP_DELAY_GT) * TICK_MS, 500);
     assert_eq!(server_ticks(DROP_LIFE_GT) * TICK_MS, 300_000);
-    forceloaded().lock().unwrap().insert((0, 0));
-    drops().lock().unwrap().push(Drop {
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9101,
         x: 0.5,
         y: 70.0,
@@ -2208,7 +2208,7 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
         target: None,
         thrower: None,
     });
-    xps().lock().unwrap().push(Xp {
+    xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
         eid: 9102,
         x: 0.5,
         y: 70.0,
@@ -2217,7 +2217,7 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
         age: 0,
     });
     // A drop far outside the hot set must not age, so an unloaded world keeps it.
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9103,
         x: 30_000_000.0,
         y: 70.0,
@@ -2262,10 +2262,10 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
     for _ in 0..2 {
         game_tick(|_, tick| tick());
     }
-    let expired = drops().lock().unwrap().iter().all(|d| d.eid != 9101);
+    let expired = drops().lock().unwrap_or_else(|e| e.into_inner()).iter().all(|d| d.eid != 9101);
     // Pickup must stay blocked until the delay has elapsed in ticks. Use a hot
     // drop: 9103 is deliberately outside the hot set and therefore never ages.
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 9104,
         x: 0.5,
         y: 70.0,
@@ -2292,9 +2292,9 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
             break;
         }
     }
-    *drops().lock().unwrap() = old_drops;
-    *xps().lock().unwrap() = old_xps;
-    *forceloaded().lock().unwrap() = old_forced;
+    *drops().lock().unwrap_or_else(|e| e.into_inner()) = old_drops;
+    *xps().lock().unwrap_or_else(|e| e.into_inner()) = old_xps;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
@@ -2323,24 +2323,24 @@ fn air_supply_is_derived_everywhere_a_creature_is_constructed() {
     assert_eq!(AIR_SUPPLY_GT, 300);
     assert_eq!(server_ticks(AIR_SUPPLY_GT) * TICK_MS, 15_000);
     let _world_guard = world_guard();
-    let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
     let expected = server_ticks(AIR_SUPPLY_GT) as i32;
     // Every construction path shares one helper, so exercising the spawn path
     // covers the sites that build creatures directly.
-    forceloaded().lock().unwrap().insert((0, 0));
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     game_tick(|_, tick| tick());
     let mut seen: Vec<i32> = mobs()
         .lock()
         .unwrap()
         .iter()
-        .map(|m| *m.air.lock().unwrap())
+        .map(|m| *m.air.lock().unwrap_or_else(|e| e.into_inner()))
         .collect();
-    *mobs().lock().unwrap() = old_mobs;
-    *forceloaded().lock().unwrap() = old_forced;
+    *mobs().lock().unwrap_or_else(|e| e.into_inner()) = old_mobs;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
@@ -2463,14 +2463,14 @@ fn profile_game_tick() {
         // drops in one area grows the neighbourhood back toward n.
         ("drop_pile", 1, 0, false),
     ] {
-        actors().lock().unwrap().clear();
-        furnaces().lock().unwrap().clear();
-        forceloaded().lock().unwrap().clear();
-        drops().lock().unwrap().clear();
-        xps().lock().unwrap().clear();
-        crops().lock().unwrap().clear();
-        mobs().lock().unwrap().clear();
-        json_smelts().lock().unwrap().clear();
+        actors().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        xps().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        crops().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        json_smelts().lock().unwrap_or_else(|e| e.into_inner()).clear();
         if scenario == "active_furnaces_pack" {
             for i in 0..40i64 {
                 json_smelts()
@@ -2489,7 +2489,7 @@ fn profile_game_tick() {
                     70.0,
                     0.5 + (i / 3 % 3) as f64 * 0.05,
                 );
-                drops().lock().unwrap().push(Drop {
+                drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
                     eid: 30_000 + i,
                     x,
                     y,
@@ -2508,7 +2508,7 @@ fn profile_game_tick() {
                     70.0,
                     400.0 + (i / 20) as f64 * 0.4,
                 );
-                drops().lock().unwrap().push(Drop {
+                drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
                     eid: 31_000 + i,
                     x,
                     y,
@@ -2525,7 +2525,7 @@ fn profile_game_tick() {
         if scenario.starts_with("entity_heavy") {
             for i in 0..600 {
                 let (x, y, z) = (16.0 * (i % 20) as f64, 70.0, 16.0 * (i / 20) as f64);
-                drops().lock().unwrap().push(Drop {
+                drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
                     eid: 20_000 + i,
                     x,
                     y,
@@ -2537,7 +2537,7 @@ fn profile_game_tick() {
                     target: None,
                     thrower: None,
                 });
-                xps().lock().unwrap().push(Xp {
+                xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
                     eid: 21_000 + i,
                     x,
                     y,
@@ -2549,7 +2549,7 @@ fn profile_game_tick() {
                     .lock()
                     .unwrap()
                     .insert(ow_block((x as i32, y as i32, z as i32)), (i % 7) as u8);
-                mobs().lock().unwrap().push(Arc::new(Mob {
+                mobs().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(Mob {
                     dim: DimId::Overworld,
                     eid: 22_000 + i,
                     uuid: [0u8; 16],
@@ -2577,7 +2577,7 @@ fn profile_game_tick() {
             } else {
                 (0.0, 70.0, 0.0)
             };
-            actors().lock().unwrap().insert(
+            actors().lock().unwrap_or_else(|e| e.into_inner()).insert(
                 name.clone(),
                 Arc::new(Actor {
                     name,
@@ -2591,7 +2591,7 @@ fn profile_game_tick() {
             );
         }
         for i in 0..machines {
-            furnaces().lock().unwrap().insert(
+            furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(
                 ow_block((i % 16, 70 + i / 256, (i / 16) % 16)),
                 furnace(if active { 64 } else { 0 }),
             );
@@ -2619,7 +2619,7 @@ fn profile_game_tick() {
             // Assert the machines actually ran, so a faster measurement cannot be
             // a stage that silently stopped doing work. The counts themselves are
             // cadence dependent, so bound them rather than pin them.
-            let fs = furnaces().lock().unwrap();
+            let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
             for f in fs.values() {
                 assert_eq!(
                     (
@@ -2657,13 +2657,13 @@ fn profile_game_tick() {
 #[test]
 fn the_production_arrow_loop_decays_horizontal_velocity() {
     let _world_guard = world_guard();
-    let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_arrows = std::mem::take(&mut *arrows().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
-    forceloaded().lock().unwrap().insert((0, 0));
-    arrows().lock().unwrap().push(Arrow {
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+    arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
         eid: 8001,
         owner: 1,
         x: 0.5,
@@ -2689,7 +2689,7 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
     let mut steps = Vec::new();
     for _ in 0..5 {
         game_tick(|_, tick| tick());
-        let a = arrows().lock().unwrap();
+        let a = arrows().lock().unwrap_or_else(|e| e.into_inner());
         let Some(a) = a.iter().find(|a| a.eid == 8001) else {
             break;
         };
@@ -2700,7 +2700,7 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
     }
     let survived_flight = steps.len() == 5;
     {
-        let mut arrows = arrows().lock().unwrap();
+        let mut arrows = arrows().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(arrow) = arrows.iter_mut().find(|a| a.eid == 8001) {
             arrow.stuck = true;
             arrow.ttl = 2;
@@ -2714,9 +2714,9 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
         .find(|a| a.eid == 8001)
         .map(|a| a.ttl);
     arrow_tick();
-    let removed_after_two_ticks = arrows().lock().unwrap().iter().all(|a| a.eid != 8001);
-    *arrows().lock().unwrap() = old_arrows;
-    *forceloaded().lock().unwrap() = old_forced;
+    let removed_after_two_ticks = arrows().lock().unwrap_or_else(|e| e.into_inner()).iter().all(|a| a.eid != 8001);
+    *arrows().lock().unwrap_or_else(|e| e.into_inner()) = old_arrows;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
@@ -2765,12 +2765,12 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
 #[test]
 fn water_spread_trace_is_stable_across_the_scheduler_migration() {
     let _world_guard = world_guard();
-    let old_waters = std::mem::take(&mut *waters().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_waters = std::mem::take(&mut *waters().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
-    forceloaded().lock().unwrap().insert((0, 0));
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     refresh_hot();
     // One source block at the surface of a flat warm area.
     // In the air above the surface: this exercises the falling column, which
@@ -2793,7 +2793,7 @@ fn water_spread_trace_is_stable_across_the_scheduler_migration() {
     for _ in 0..40 {
         game_tick(|_, tick| tick());
         let mut cells: Vec<(i32, i32, i32, u32)> = {
-            let w = world().lock().unwrap();
+            let w = world().lock().unwrap_or_else(|e| e.into_inner());
             let mut v = Vec::new();
             for (&(_dim, cx, cz), c) in w.iter() {
                 for (idx, st) in c.iter() {
@@ -2817,8 +2817,8 @@ fn water_spread_trace_is_stable_across_the_scheduler_migration() {
     for (y, st) in original {
         set_block(0, y, 0, st);
     }
-    *waters().lock().unwrap() = old_waters;
-    *forceloaded().lock().unwrap() = old_forced;
+    *waters().lock().unwrap_or_else(|e| e.into_inner()) = old_waters;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
@@ -2853,20 +2853,20 @@ fn water_spread_trace_is_stable_across_the_scheduler_migration() {
 #[test]
 fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
     let _world_guard = world_guard();
-    let old_hoppers = std::mem::take(&mut *hoppers().lock().unwrap());
-    let old_chests = std::mem::take(&mut *chests().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_hoppers = std::mem::take(&mut *hoppers().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_chests = std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
-    forceloaded().lock().unwrap().insert((0, 0));
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     refresh_hot();
     let hy = 120;
     let hopper_st = 9225u32; // facing down
     let chest_st = name_to_state("chest").unwrap_or(9225);
     set_block(0, hy, 0, hopper_st);
     set_block(0, hy - 1, 0, chest_st);
-    hoppers().lock().unwrap().insert((0, hy, 0));
+    hoppers().lock().unwrap_or_else(|e| e.into_inner()).insert((0, hy, 0));
     let item = name_to_item("raw_iron").unwrap_or(1);
     chests()
         .lock()
@@ -2894,9 +2894,9 @@ fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
     // restore
     set_block(0, hy, 0, 0);
     set_block(0, hy - 1, 0, 0);
-    *hoppers().lock().unwrap() = old_hoppers;
-    *chests().lock().unwrap() = old_chests;
-    *forceloaded().lock().unwrap() = old_forced;
+    *hoppers().lock().unwrap_or_else(|e| e.into_inner()) = old_hoppers;
+    *chests().lock().unwrap_or_else(|e| e.into_inner()) = old_chests;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
@@ -2920,12 +2920,12 @@ fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
 #[test]
 fn lava_spread_trace_is_stable_across_the_scheduler_migration() {
     let _world_guard = world_guard();
-    let old_lavas = std::mem::take(&mut *lavas().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_lavas = std::mem::take(&mut *lavas().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
-    forceloaded().lock().unwrap().insert((0, 0));
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     refresh_hot();
     // High enough that the test never reaches terrain whatever worldgen state
     // another test leaves behind.
@@ -2947,8 +2947,8 @@ fn lava_spread_trace_is_stable_across_the_scheduler_migration() {
     for (y, st) in original {
         set_block(0, y, 0, st);
     }
-    *lavas().lock().unwrap() = old_lavas;
-    *forceloaded().lock().unwrap() = old_forced;
+    *lavas().lock().unwrap_or_else(|e| e.into_inner()) = old_lavas;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
@@ -2978,7 +2978,7 @@ fn a_neighbour_change_promotes_a_waiting_fluid_cell() {
         .unwrap()
         .schedule(pos, tick_queue::MAX_DELAY);
     assert!(
-        !water_queue().lock().unwrap().is_empty(),
+        !water_queue().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "the cell must be waiting"
     );
     // A block change next to it must pull it forward.
@@ -2987,7 +2987,7 @@ fn a_neighbour_change_promotes_a_waiting_fluid_cell() {
     let mut found = false;
     for _ in 0..2 {
         let due = {
-            let mut q = water_queue().lock().unwrap();
+            let mut q = water_queue().lock().unwrap_or_else(|e| e.into_inner());
             q.due()
         };
         if due.contains(&pos) {
@@ -2996,7 +2996,7 @@ fn a_neighbour_change_promotes_a_waiting_fluid_cell() {
         }
     }
     // clean up whatever is left
-    water_queue().lock().unwrap().cancel(pos);
+    water_queue().lock().unwrap_or_else(|e| e.into_inner()).cancel(pos);
     assert!(
         found,
         "a neighbour change must wake a waiting cell within two ticks"
@@ -3022,11 +3022,11 @@ fn a_periodic_system_expresses_its_backoff_in_invocations() {
                 (DimId::Overworld, pos.0, pos.1, pos.2),
                 (TICK_IDX.load(Ordering::Relaxed) + ahead, 1),
             );
-        lava_queue().lock().unwrap().cancel(pos);
+        lava_queue().lock().unwrap_or_else(|e| e.into_inner()).cancel(pos);
         requeue_lava(pos.0, pos.1, pos.2);
         for n in 1..=12 {
             let due = {
-                let mut q = lava_queue().lock().unwrap();
+                let mut q = lava_queue().lock().unwrap_or_else(|e| e.into_inner());
                 q.due()
             };
             if due.contains(&pos) {
@@ -3052,7 +3052,7 @@ fn a_periodic_system_expresses_its_backoff_in_invocations() {
         invocations(period + 1) > invocations(period),
         "crossing a period boundary must cost an invocation"
     );
-    lava_queue().lock().unwrap().cancel(pos);
+    lava_queue().lock().unwrap_or_else(|e| e.into_inner()).cancel(pos);
     backoff()
         .lock()
         .unwrap()
@@ -3070,17 +3070,17 @@ fn a_periodic_system_expresses_its_backoff_in_invocations() {
 #[test]
 fn a_backoff_past_the_queue_cap_waits_for_its_real_deadline() {
     let _world_guard = world_guard();
-    let old_waters = std::mem::take(&mut *waters().lock().unwrap());
+    let old_waters = std::mem::take(&mut *waters().lock().unwrap_or_else(|e| e.into_inner()));
     let old_queue = std::mem::replace(
-        &mut *water_queue().lock().unwrap(),
+        &mut *water_queue().lock().unwrap_or_else(|e| e.into_inner()),
         tick_queue::TickQueue::new(),
     );
-    let old_backoff = std::mem::take(&mut *backoff().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_backoff = std::mem::take(&mut *backoff().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
-    forceloaded().lock().unwrap().insert((0, 0));
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     refresh_hot();
 
     assert!(
@@ -3128,10 +3128,10 @@ fn a_backoff_past_the_queue_cap_waits_for_its_real_deadline() {
     for (x, y, z, st) in original {
         set_block(x, y, z, st);
     }
-    *waters().lock().unwrap() = old_waters;
-    *water_queue().lock().unwrap() = old_queue;
-    *backoff().lock().unwrap() = old_backoff;
-    *forceloaded().lock().unwrap() = old_forced;
+    *waters().lock().unwrap_or_else(|e| e.into_inner()) = old_waters;
+    *water_queue().lock().unwrap_or_else(|e| e.into_inner()) = old_queue;
+    *backoff().lock().unwrap_or_else(|e| e.into_inner()) = old_backoff;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
@@ -3176,7 +3176,7 @@ fn a_backoff_past_the_queue_cap_waits_for_its_real_deadline() {
 fn sixteen_random_ticks_raise_sugar_cane_one_block() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (old_hot, old_warm) = test_region();
     let top = 150;
     let cane = name_to_state("sugar_cane").expect("sugar_cane must exist");
@@ -3238,7 +3238,7 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
     for (y, st) in original {
         set_block(0, y, 0, st);
     }
-    *forceloaded().lock().unwrap() = old_forced;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(old_hot, old_warm);
 }
 
@@ -3250,8 +3250,8 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
 fn measure_the_light_cost_per_chunk() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
-    forceloaded().lock().unwrap().insert((0, 0));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     refresh_hot();
 
     let time_it = |f: &mut dyn FnMut()| {
@@ -3289,7 +3289,7 @@ fn measure_the_light_cost_per_chunk() {
     });
     set_block(tx, ty, tz, old);
 
-    *forceloaded().lock().unwrap() = old_forced;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
 
     // Split the sky cost: the surface lookup and the walk down through block_at are the two
     // candidates, and which one dominates decides what to fix.
@@ -3445,7 +3445,7 @@ fn measure_the_light_cost_per_chunk() {
 fn eligible_falling_bookings() -> bool {
     let Some(reg) = crate::block_registry::breg() else { return false };
     let eligible = scheduled_tick_chunks();
-    block_ticks().lock().unwrap().has_pending_matching(|t| {
+    block_ticks().lock().unwrap_or_else(|e| e.into_inner()).has_pending_matching(|t| {
         reg.behaviour_of(t.block) == crate::block_registry::B_FALLING
             && eligible.contains(&(t.pos.0 >> 4, t.pos.2 >> 4))
     })
@@ -3465,7 +3465,7 @@ fn drain_falling_bookings(max: usize) {
 }
 
 fn falling_work_in_progress() -> bool {
-    !falling().lock().unwrap().is_empty() || eligible_falling_bookings()
+    !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() || eligible_falling_bookings()
 }
 
 /// The real game tick always runs scheduled callbacks before entity physics.
@@ -3502,13 +3502,13 @@ fn falling_booking_is_two_game_ticks_and_support_rescue_cancels_it() {
     set_block(x, y, z, stone);
     advance_falling_scheduled_tick();
     assert_eq!(block_at(x, y + 1, z), sand, "a restored support cancels the fall");
-    assert!(falling().lock().unwrap().iter().all(|f| (f.x.floor() as i32, f.y.floor() as i32, f.z.floor() as i32) != (x, y + 1, z)));
+    assert!(falling().lock().unwrap_or_else(|e| e.into_inner()).iter().all(|f| (f.x.floor() as i32, f.y.floor() as i32, f.z.floor() as i32) != (x, y + 1, z)));
     set_block(x, y, z, 0);
     advance_falling_scheduled_tick();
     assert_eq!(block_at(x, y + 1, z), sand, "rescheduled callback still waits +1 GT");
     advance_falling_scheduled_tick();
     assert_eq!(block_at(x, y + 1, z), 0, "second callback converts unsupported sand");
-    assert_eq!(falling().lock().unwrap().iter().filter(|f| f.state == sand
+    assert_eq!(falling().lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|f| f.state == sand
         && f.x.floor() as i32 == x && f.z.floor() as i32 == z).count(), 1,
         "gravity conversion is exactly once");
     TICK_IDX.store(old_tick, Ordering::Relaxed);
@@ -3523,8 +3523,8 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
@@ -3549,7 +3549,7 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
     );
     set_block(3, base + 3, 3, sand);
     assert!(
-        falling().lock().unwrap().is_empty(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "supported sand must not fall"
     );
 
@@ -3563,7 +3563,7 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
     // the due callback can convert the still-unsupported block into an entity.
     set_block(3, base + 2, 3, 0);
     assert_eq!(block_at(3, base + 3, 3), sand, "reserved, not immediately converted");
-    assert!(falling().lock().unwrap().is_empty());
+    assert!(falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     advance_falling_scheduled_tick();
     assert_eq!(block_at(3, base + 3, 3), sand, "no fall at +1 GT");
     advance_falling_scheduled_tick();
@@ -3572,7 +3572,7 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
         0,
         "the block must leave the world"
     );
-    let entity = falling().lock().unwrap().clone();
+    let entity = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(entity.len(), 1, "exactly one falling entity");
     assert_eq!(entity[0].state, sand, "the entity carries the block state");
     assert!(
@@ -3585,7 +3585,7 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
     for n in 1..=9 {
         falling_tick();
         expected -= 0.04 * n as f64;
-        let cur = falling().lock().unwrap().clone();
+        let cur = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(cur.len(), 1, "still in flight at tick {n}");
         assert!(
             (cur[0].y - expected).abs() < 1e-9,
@@ -3596,7 +3596,7 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
     // Tick ten reaches the floor's top face and places the block there.
     falling_tick();
     assert!(
-        falling().lock().unwrap().is_empty(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "the entity landed and despawned"
     );
     assert_eq!(
@@ -3609,8 +3609,8 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
     for (y, st) in original {
         set_block(3, y, 3, st);
     }
-    *falling().lock().unwrap() = old_falling;
-    *forceloaded().lock().unwrap() = old_forced;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(oh, ow);
 }
 
@@ -3622,8 +3622,8 @@ fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
@@ -3646,7 +3646,7 @@ fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
         falling_tick();
     }
     assert!(
-        falling().lock().unwrap().is_empty(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "the entity must have landed"
     );
     let name = |y: i32| {
@@ -3665,8 +3665,8 @@ fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
     for (y, st) in original {
         set_block(3, y, 3, st);
     }
-    *falling().lock().unwrap() = old_falling;
-    *forceloaded().lock().unwrap() = old_forced;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(oh, ow);
 }
 
@@ -3675,8 +3675,8 @@ fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
 #[test]
 fn beginning_a_falling_tick_leaves_the_queue_visible() {
     let _world_guard = world_guard();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    falling().lock().unwrap().push(Fall {
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
+    falling().lock().unwrap_or_else(|e| e.into_inner()).push(Fall {
         eid: 7,
         x: 0.5,
         y: 80.0,
@@ -3689,11 +3689,11 @@ fn beginning_a_falling_tick_leaves_the_queue_visible() {
     assert_eq!(active.len(), 1, "the tick advances the in-flight entity");
     assert_eq!(processed.len(), 1);
     assert_eq!(
-        falling().lock().unwrap().len(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
         1,
         "a concurrent save must still see the in-flight entity"
     );
-    *falling().lock().unwrap() = old_falling;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
 }
 
 /// A save that runs while blocks are falling must not lose or duplicate them. A saver thread
@@ -3739,12 +3739,12 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
                 let _lock = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 let mut buf = Vec::new();
                 save_world_into(&mut buf);
-                let mut store = snapshots_store.lock().unwrap();
+                let mut store = snapshots_store.lock().unwrap_or_else(|e| e.into_inner());
                 if store.len() < 16 {
                     store.push(buf);
                 }
                 drop(store);
-                if !falling().lock().unwrap().is_empty() {
+                if !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
                     saves_during_fall.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 n += 1;
@@ -3763,7 +3763,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
     }
     drain_falling_bookings(2 * height as usize + 4);
     assert_eq!(
-        falling().lock().unwrap().len(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
         expected,
         "every block becomes an entity"
     );
@@ -3779,7 +3779,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
         std::thread::yield_now();
     }
     let mut ticks = 0;
-    while !falling().lock().unwrap().is_empty() && ticks < 200 {
+    while !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() && ticks < 200 {
         falling_tick();
         ticks += 1;
     }
@@ -3811,22 +3811,22 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
         "live: no block is lost or duplicated"
     );
     assert!(
-        falling().lock().unwrap().is_empty(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "nothing is left in flight"
     );
     assert!(
-        drops().lock().unwrap().is_empty(),
+        drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "landed blocks do not drop"
     );
 
     // Reload every concurrent snapshot into a clean state and land it: each must conserve its
     // blocks. A snapshot taken mid-transition would drop or duplicate one.
-    let saved = snapshots_store.lock().unwrap().clone();
+    let saved = snapshots_store.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(!saved.is_empty(), "the saver stored a snapshot");
     for (i, snap) in saved.iter().enumerate() {
-        world().lock().unwrap().clear();
-        falling().lock().unwrap().clear();
-        drops().lock().unwrap().clear();
+        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         load_world_from(snap).unwrap();
         let mut t = 0;
         while falling_work_in_progress() && t < 200 {
@@ -3876,7 +3876,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
                 let _lock = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 let mut buf = Vec::new();
                 save_world_into(&mut buf);
-                let mut store = snapshots_store.lock().unwrap();
+                let mut store = snapshots_store.lock().unwrap_or_else(|e| e.into_inner());
                 if store.len() < 16 {
                     store.push(buf);
                 }
@@ -3895,7 +3895,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     // without waiting for one would fail on scheduling and world size rather than on
     // the race it is about. Wait for the thread to prove itself, then start the fall.
     let wait = std::time::Instant::now();
-    while snapshots_store.lock().unwrap().is_empty() {
+    while snapshots_store.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
         assert!(
             wait.elapsed().as_secs() < 10,
             "the saver never stored a snapshot"
@@ -3906,12 +3906,12 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     set_block(1, MIN_Y + 3, 1, 0);
     drain_falling_bookings(4);
     assert_eq!(
-        falling().lock().unwrap().len(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
         1,
         "the block becomes an entity"
     );
     let mut ticks = 0;
-    while !falling().lock().unwrap().is_empty() && ticks < 400 {
+    while !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() && ticks < 400 {
         falling_tick();
         ticks += 1;
     }
@@ -3929,7 +3929,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
         .sum();
     assert_eq!(live, 1, "the below-world block becomes exactly one item");
     assert!(
-        falling().lock().unwrap().is_empty(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "nothing is left in flight"
     );
 
@@ -3946,12 +3946,12 @@ fn a_saved_below_world_drop_is_not_duplicated() {
             .count() as u32
     };
     assert_eq!(sand_blocks() + live, 1, "live: block + item is conserved");
-    let saved = snapshots_store.lock().unwrap().clone();
+    let saved = snapshots_store.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(!saved.is_empty(), "the saver stored a snapshot");
     for (i, snap) in saved.iter().enumerate() {
-        world().lock().unwrap().clear();
-        falling().lock().unwrap().clear();
-        drops().lock().unwrap().clear();
+        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         load_world_from(snap).unwrap();
         let mut t = 0;
         while falling_work_in_progress() && t < 400 {
@@ -4043,11 +4043,11 @@ fn concurrent_knockout_and_falling_conserve_blocks() {
         "a concurrent knock-out duplicated or lost a block"
     );
     assert!(
-        falling().lock().unwrap().is_empty(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "nothing is left in flight"
     );
     assert!(
-        drops().lock().unwrap().is_empty(),
+        drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "landed blocks do not drop"
     );
 }
@@ -4060,8 +4060,8 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
@@ -4091,7 +4091,7 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     set_block(5, base + 2, 5, 0);
     drain_falling_bookings(8);
     assert_eq!(
-        falling().lock().unwrap().len(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
         2,
         "both blocks must become entities"
     );
@@ -4103,13 +4103,13 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
             .to_string()
     };
     let mut ticks = 0;
-    while !falling().lock().unwrap().is_empty() && ticks < 30 {
+    while !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() && ticks < 30 {
         falling_tick();
         ticks += 1;
     }
     assert!(ticks < 30, "both entities must land");
     assert!(
-        falling().lock().unwrap().is_empty(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "nothing left in flight"
     );
     assert_eq!(name(base + 1), "minecraft:sand", "the lower one lands");
@@ -4127,8 +4127,8 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     for (y, st) in original {
         set_block(5, y, 5, st);
     }
-    *falling().lock().unwrap() = old_falling;
-    *forceloaded().lock().unwrap() = old_forced;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(oh, ow);
 }
 
@@ -4140,8 +4140,8 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let _snap = WorldSnapshot::take();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
@@ -4157,7 +4157,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     set_block(x, base + 3, z, sand);
     drain_falling_bookings(4);
     assert_eq!(
-        falling().lock().unwrap().len(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
         1,
         "the first block becomes an entity"
     );
@@ -4165,7 +4165,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     set_block(x, base + 3, z, sand);
     drain_falling_bookings(4);
     assert_eq!(
-        falling().lock().unwrap().len(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
         2,
         "a new block in the passing entity's cell must still fall"
     );
@@ -4173,12 +4173,12 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     // Both entities are co-located and descend in lockstep. Landing both must keep both blocks:
     // the batch must not overwrite one with the other.
     let mut ticks = 0;
-    while !falling().lock().unwrap().is_empty() && ticks < 40 {
+    while !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() && ticks < 40 {
         falling_tick();
         ticks += 1;
     }
     assert!(
-        falling().lock().unwrap().is_empty(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "both entities must land"
     );
     let name = |y: i32| {
@@ -4201,8 +4201,8 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
         set_block(x, y, z, st);
     }
 
-    *falling().lock().unwrap() = old_falling;
-    *forceloaded().lock().unwrap() = old_forced;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(oh, ow);
 }
 
@@ -4213,8 +4213,8 @@ fn a_falling_block_passes_through_a_replaceable_block() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let _snap = WorldSnapshot::take();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
@@ -4240,12 +4240,12 @@ fn a_falling_block_passes_through_a_replaceable_block() {
     set_block(x, base + 2, z, 0);
     drain_falling_bookings(4);
     assert_eq!(
-        falling().lock().unwrap().len(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
         1,
         "the sand must fall, not rest on the plant"
     );
     let mut ticks = 0;
-    while !falling().lock().unwrap().is_empty() && ticks < 40 {
+    while !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() && ticks < 40 {
         falling_tick();
         ticks += 1;
     }
@@ -4263,8 +4263,8 @@ fn a_falling_block_passes_through_a_replaceable_block() {
         set_block(x, y, z, st);
     }
 
-    *falling().lock().unwrap() = old_falling;
-    *forceloaded().lock().unwrap() = old_forced;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(oh, ow);
 }
 
@@ -4275,8 +4275,8 @@ fn a_long_unsupported_column_converts_in_one_pass() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let _snap = WorldSnapshot::take();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
@@ -4299,13 +4299,13 @@ fn a_long_unsupported_column_converts_in_one_pass() {
         set_block(x, base + i, z, sand);
     }
     assert!(
-        falling().lock().unwrap().is_empty(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "a supported column must not fall yet"
     );
     set_block(x, base, z, 0);
     drain_falling_bookings(2 * height as usize + 10);
     assert_eq!(
-        falling().lock().unwrap().len(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
         height as usize,
         "the whole column must become entities in one pass"
     );
@@ -4313,8 +4313,8 @@ fn a_long_unsupported_column_converts_in_one_pass() {
         set_block(x, y, z, st);
     }
 
-    *falling().lock().unwrap() = old_falling;
-    *forceloaded().lock().unwrap() = old_forced;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(oh, ow);
 }
 
@@ -4326,10 +4326,10 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let _snap = WorldSnapshot::take();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
-    let old_world = world().lock().unwrap().clone();
-    pending_blocks().lock().unwrap().clear();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = world().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    pending_blocks().lock().unwrap_or_else(|e| e.into_inner()).clear();
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
@@ -4358,9 +4358,9 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
     for (yy, st) in original {
         set_block(x, yy, z, st);
     }
-    *world().lock().unwrap() = old_world;
-    *falling().lock().unwrap() = old_falling;
-    *forceloaded().lock().unwrap() = old_forced;
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(oh, ow);
 }
 
@@ -4374,8 +4374,8 @@ fn every_falling_block_becomes_an_entity_and_lands() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let _snap = WorldSnapshot::take();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
@@ -4395,7 +4395,7 @@ fn every_falling_block_becomes_an_entity_and_lands() {
             set_block(x, y, 9, 0);
         }
         set_block(x, base, 9, name_to_state("stone").unwrap());
-        *falling().lock().unwrap() = Vec::new();
+        *falling().lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
         set_block(x, base + 3, 9, st);
         drain_falling_bookings(4);
         assert_eq!(
@@ -4404,17 +4404,17 @@ fn every_falling_block_becomes_an_entity_and_lands() {
             "{n} must leave the world when it falls"
         );
         assert_eq!(
-            falling().lock().unwrap().len(),
+            falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
             1,
             "{n} must become one entity"
         );
         assert_eq!(
-            falling().lock().unwrap()[0].state,
+            falling().lock().unwrap_or_else(|e| e.into_inner())[0].state,
             st,
             "{n} must keep its state"
         );
         let mut ticks = 0;
-        while !falling().lock().unwrap().is_empty() && ticks < 30 {
+        while !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() && ticks < 30 {
             falling_tick();
             ticks += 1;
         }
@@ -4426,8 +4426,8 @@ fn every_falling_block_becomes_an_entity_and_lands() {
             "{n} must land on the floor's top face"
         );
     }
-    *falling().lock().unwrap() = old_falling;
-    *forceloaded().lock().unwrap() = old_forced;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(oh, ow);
 }
 
@@ -4439,8 +4439,8 @@ fn a_falling_block_waits_in_a_cold_chunk() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let _snap = WorldSnapshot::take();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (oh, ow) = test_region();
     set_test_region(HashSet::new(), HashSet::new());
     let base = 150;
@@ -4456,7 +4456,7 @@ fn a_falling_block_waits_in_a_cold_chunk() {
         advance_falling_scheduled_tick();
     }
     assert_eq!(block_at(11, base + 3, 11), sand, "cold: block remains");
-    assert!(falling().lock().unwrap().is_empty(), "cold: no falling entity");
+    assert!(falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "cold: no falling entity");
     // After warming, the overdue block callback runs first and the entity
     // moves only when the entity-physics stage runs.
     let mut warm = ow.clone();
@@ -4465,18 +4465,18 @@ fn a_falling_block_waits_in_a_cold_chunk() {
     advance_falling_scheduled_tick();
     assert_eq!(block_at(11, base + 3, 11), 0, "warm: callback converts block");
     let y0 = {
-        let q = falling().lock().unwrap();
+        let q = falling().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(q.len(), 1);
         q[0].y
     };
     falling_tick();
-    let q = falling().lock().unwrap().clone();
+    let q = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(q.len() == 1 && q[0].y < y0,
             "warm: entity physics resumes after scheduled callback: {q:?}");
 
     set_test_region(oh, ow);
-    *falling().lock().unwrap() = old_falling;
-    *forceloaded().lock().unwrap() = old_forced;
+    *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
 }
 
 /// A live container is the positive control: a no-op reader must fail this round trip.
@@ -4500,20 +4500,20 @@ fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
     }
     set_block(broken.0, broken.1, broken.2, 0);
     assert!(
-        !chests().lock().unwrap().contains_key(&ContainerKey::ow(broken)),
+        !chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ContainerKey::ow(broken)),
         "cleanup on break"
     );
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    world().lock().unwrap().clear();
-    chests().lock().unwrap().clear();
-    drops().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
     assert_eq!(
         block_at(live.0, live.1, live.2),
         name_to_state("chest").unwrap()
     );
-    let containers = chests().lock().unwrap().clone();
+    let containers = chests().lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(containers.len(), 2);
     assert!(
         !containers.contains_key(&ContainerKey::ow(broken)),
@@ -4526,7 +4526,7 @@ fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
         );
         assert!(container_kind(block_at(pos.0, pos.1, pos.2)).is_some());
     }
-    let ground = drops().lock().unwrap();
+    let ground = drops().lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(
         ground.len(),
         1,
@@ -4619,7 +4619,7 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     set_block(x, base + 4, z, sand);
     drain_falling_bookings(4);
     assert_eq!(
-        falling().lock().unwrap().len(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
         1,
         "the block becomes an entity"
     );
@@ -4627,7 +4627,7 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     // Place the support one block under the in-flight entity.
     set_block(x, base + 2, z, stone);
     let mut ticks = 0;
-    while !falling().lock().unwrap().is_empty() && ticks < 200 {
+    while !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() && ticks < 200 {
         falling_tick();
         ticks += 1;
     }
@@ -4639,21 +4639,21 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     );
     assert_eq!(block_at(x, base + 2, z), stone, "the support is untouched");
     assert!(
-        drops().lock().unwrap().is_empty(),
+        drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "a landed block does not drop"
     );
 
     // The same state survives a save/reload: the support and the in-flight entity are written,
     // and the reloaded world lands the entity on the same cell.
-    falling().lock().unwrap().clear();
-    drops().lock().unwrap().clear();
+    falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     for y in base..=base + 8 {
         set_block(x, y, z, 0);
     }
     // Clearing a lower cell can spawn a fall for the block above it; those entities belong to the
     // previous scenario, not to the snapshot.
-    falling().lock().unwrap().clear();
-    drops().lock().unwrap().clear();
+    falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     set_block(x, base, z, stone);
     set_block(x, base + 4, z, sand);
     drain_falling_bookings(4);
@@ -4664,9 +4664,9 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
         let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         save_world_into(&mut buf);
     }
-    world().lock().unwrap().clear();
-    falling().lock().unwrap().clear();
-    drops().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&buf).unwrap();
     let mut t = 0;
     while falling_work_in_progress() && t < 200 {
@@ -4701,9 +4701,9 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
     let stone = name_to_state("stone").expect("stone must exist");
     let (x, z, base, height) = (5, 5, 150, 3);
     for _ in 0..4 {
-        world().lock().unwrap().clear();
-        falling().lock().unwrap().clear();
-        drops().lock().unwrap().clear();
+        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         for y in base - 1..=base + height + 4 {
             set_block(x, y, z, 0);
         }
@@ -4714,7 +4714,7 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
         }
         set_block(x, base, z, 0); // callbacks are pending; blocks remain until due
         let live = sand_count(x, z, base, base + height + 4)
-            + falling().lock().unwrap().len()
+            + falling().lock().unwrap_or_else(|e| e.into_inner()).len()
             + drop_count(sand_item);
         assert_eq!(
             live, height as usize,
@@ -4725,9 +4725,9 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
             let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             save_world_into(&mut buf);
         }
-        world().lock().unwrap().clear();
-        falling().lock().unwrap().clear();
-        drops().lock().unwrap().clear();
+        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         load_world_from(&buf).unwrap();
         let mut t = 0;
         while falling_work_in_progress() && t < 400 {
@@ -4820,7 +4820,7 @@ fn two_knockouts_of_adjacent_supports_conserve_every_block() {
     let dropped = drop_count(sand_item);
     assert_eq!(placed + dropped, expected, "no block is lost or duplicated");
     assert!(
-        falling().lock().unwrap().is_empty(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "nothing is left in flight"
     );
 }
@@ -4845,7 +4845,7 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
     set_block(x, MIN_Y + 1, z, sand);
     drain_falling_bookings(4);
     assert_eq!(
-        falling().lock().unwrap().len(),
+        falling().lock().unwrap_or_else(|e| e.into_inner()).len(),
         1,
         "the block becomes an entity"
     );
@@ -4858,7 +4858,7 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
     }
     // Let it convert, then snapshot again.
     let mut t = 0;
-    while !falling().lock().unwrap().is_empty() && t < 200 {
+    while !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() && t < 200 {
         falling_tick();
         t += 1;
     }
@@ -4870,9 +4870,9 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
         save_world_into(&mut after);
     }
     for (name, snap) in [("mid-flight", &mid), ("after conversion", &after)] {
-        world().lock().unwrap().clear();
-        falling().lock().unwrap().clear();
-        drops().lock().unwrap().clear();
+        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         load_world_from(snap).unwrap();
         let mut t = 0;
         while falling_work_in_progress() && t < 200 {
@@ -4913,20 +4913,20 @@ fn region_change_mid_fall_keeps_the_entity() {
     set_block(x, base + 4, z, sand);
     drain_falling_bookings(4);
     falling_tick();
-    let before = falling().lock().unwrap()[0].y;
+    let before = falling().lock().unwrap_or_else(|e| e.into_inner())[0].y;
     // Cold: the entity must be kept and not advanced.
     set_test_region(HashSet::new(), HashSet::new());
     for _ in 0..20 {
         falling_tick();
     }
-    let held = falling().lock().unwrap();
+    let held = falling().lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(held.len(), 1, "a cold chunk keeps the entity");
     assert_eq!(held[0].y, before, "a cold chunk does not advance it");
     drop(held);
     // Warm again: it lands on the support.
     set_test_region(warm.clone(), warm);
     let mut ticks = 0;
-    while !falling().lock().unwrap().is_empty() && ticks < 200 {
+    while !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty() && ticks < 200 {
         falling_tick();
         ticks += 1;
     }
@@ -4984,16 +4984,16 @@ fn primitives_arrow_tick_hits_between_the_old_samples() {
 
 fn arrow_sweep_outcome(target_x: f64, velocity: f64) -> (Option<f32>, Option<f64>) {
     let _world_guard = world_guard();
-    let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
-    let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_arrows = std::mem::take(&mut *arrows().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
-    forceloaded().lock().unwrap().insert((0, 0));
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     // The point-blank case uses ordinary falling-arrow speed. The between-sample
     // discriminator deliberately uses higher velocity, without claiming native physics.
-    arrows().lock().unwrap().push(Arrow {
+    arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
         eid: 8100,
         owner: 1,
         x: 0.5,
@@ -5015,7 +5015,7 @@ fn arrow_sweep_outcome(target_x: f64, velocity: f64) -> (Option<f32>, Option<f64
         stuck: false,
     });
     // One target isolates intersection from entity ordering or block occlusion.
-    mobs().lock().unwrap().push(Arc::new(Mob {
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(Mob {
         dim: DimId::Overworld,
         eid: 8101,
         uuid: [0u8; 16],
@@ -5037,16 +5037,16 @@ fn arrow_sweep_outcome(target_x: f64, velocity: f64) -> (Option<f32>, Option<f64
         .unwrap()
         .iter()
         .find(|m| m.eid == 8101)
-        .map(|m| *m.hp.lock().unwrap());
+        .map(|m| *m.hp.lock().unwrap_or_else(|e| e.into_inner()));
     let arrow_x = arrows()
         .lock()
         .unwrap()
         .iter()
         .find(|a| a.eid == 8100)
         .map(|a| a.x);
-    *arrows().lock().unwrap() = old_arrows;
-    *mobs().lock().unwrap() = old_mobs;
-    *forceloaded().lock().unwrap() = old_forced;
+    *arrows().lock().unwrap_or_else(|e| e.into_inner()) = old_arrows;
+    *mobs().lock().unwrap_or_else(|e| e.into_inner()) = old_mobs;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
@@ -5099,8 +5099,8 @@ fn gp2_nightly_hostiles_spawn_packs_and_stop_at_the_cap() {
     }
 
     let (client, _peer) = client_pair();
-    *client.pos.lock().unwrap() = (0.5, 100.0, 0.5, 0.0, 0.0, true);
-    clients().lock().unwrap().push(Arc::new(client));
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 100.0, 0.5, 0.0, 0.0, true);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
     let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
     let angle = tick as f64 * 2.399;
     let x = (0.5 + angle.cos() * 32.0).floor() as i32;
@@ -5136,19 +5136,19 @@ fn gp2_nightly_hostiles_spawn_packs_and_stop_at_the_cap() {
         }
         let expected_rng = world_rng::saved_state();
         world_rng::seed(41);
-        *mobs().lock().unwrap() = (0..existing)
+        *mobs().lock().unwrap_or_else(|e| e.into_inner()) = (0..existing)
             .map(|i| test_mob(20_000 + i as i32, zombie, (0.5, 100.0, 0.5), 20.0))
             .collect();
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
         environment_time_tick();
 
-        let mobs = mobs().lock().unwrap();
+        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
         let new_mobs = &mobs[existing..];
         let actual: Vec<_> = new_mobs
             .iter()
             .map(|mob| {
-                let (mx, my, mz, ..) = *mob.pos.lock().unwrap();
+                let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
                 assert_eq!(my, 100.0);
                 assert_eq!(mx.fract(), 0.5);
                 assert_eq!(mz.fract(), 0.5);
@@ -5187,23 +5187,23 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
     set_block(bx, 99, bz, stone);
     let player = |dim, spectator, (x, y, z)| {
         let (client, peer) = client_pair();
-        *client.dim.lock().unwrap() = dim;
-        *client.gm.lock().unwrap() = if spectator { 3 } else { 0 };
-        *client.pos.lock().unwrap() = (x, y, z, 0.0, 0.0, true);
+        *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
+        *client.gm.lock().unwrap_or_else(|e| e.into_inner()) = if spectator { 3 } else { 0 };
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0, 0.0, true);
         (Arc::new(client), peer)
     };
     let attempt = |players: &[(Arc<Client>, TcpStream)]| {
-        *clients().lock().unwrap() = players.iter().map(|(client, _)| client.clone()).collect();
-        mobs().lock().unwrap().clear();
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) = players.iter().map(|(client, _)| client.clone()).collect();
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
         world_rng::seed(CLEAR_MIDNIGHT_PACK_SEED);
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
         WORLD_TIME.store(18000, Ordering::Relaxed);
         environment_time_tick();
-        let spawned = mobs().lock().unwrap();
+        let spawned = mobs().lock().unwrap_or_else(|e| e.into_inner());
         assert!(spawned.len() <= 1);
         spawned.first().map(|mob| {
-            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
             (x, y, z)
         })
     };
@@ -5264,13 +5264,13 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
     let high_anchor = player(DimId::Overworld, false, (origin.0, origin.1 + 140.0, origin.2));
     let at_128 = player(DimId::Overworld, false, (pos.0, pos.1 + 128.0, pos.2));
     assert_eq!(attempt(&[high_anchor, at_128]), Some(pos), "128 blocks is in range");
-    let default_spawn = *WORLD_SPAWN.lock().unwrap();
-    *WORLD_SPAWN.lock().unwrap() = (pos.0, pos.1, pos.2, 0.0);
+    let default_spawn = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+    *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (pos.0, pos.1, pos.2, 0.0);
     assert!(
         attempt(&[overworld()]).is_none(),
         "world spawn excludes the site"
     );
-    *WORLD_SPAWN.lock().unwrap() = default_spawn;
+    *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = default_spawn;
 
     // The candidate block is excluded at the maximum edge and included at the minimum.
     let size = f64::from(bz) * 2.0;
@@ -5282,7 +5282,7 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
         attempt(&[overworld()]).is_none(),
         "maximum border edge excludes the site"
     );
-    world_border().lock().unwrap().center_z = size;
+    world_border().lock().unwrap_or_else(|e| e.into_inner()).center_z = size;
     assert_eq!(
         attempt(&[overworld()]),
         Some(pos),
@@ -5337,14 +5337,14 @@ fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
             .iter()
             .map(|&(dim, spectator, x)| {
                 let (client, peer) = client_pair();
-                *client.dim.lock().unwrap() = dim;
-                *client.gm.lock().unwrap() = if spectator { 3 } else { 0 };
-                *client.pos.lock().unwrap() = (x, y, 0.5, 0.0, 0.0, true);
+                *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
+                *client.gm.lock().unwrap_or_else(|e| e.into_inner()) = if spectator { 3 } else { 0 };
+                *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, 0.5, 0.0, 0.0, true);
                 (Arc::new(client), peer)
             })
             .collect();
-        *clients().lock().unwrap() = players.iter().map(|(client, _)| client.clone()).collect();
-        *mobs().lock().unwrap() = (0..existing)
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) = players.iter().map(|(client, _)| client.clone()).collect();
+        *mobs().lock().unwrap_or_else(|e| e.into_inner()) = (0..existing)
             .map(|i| test_mob(20_000 + i as i32, kind, (0.5, y, 0.5), 20.0))
             .collect();
         world_rng::seed(CLEAR_MIDNIGHT_PACK_SEED);
@@ -5353,7 +5353,7 @@ fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
         WORLD_TIME.store(18000, Ordering::Relaxed);
         environment_time_tick();
 
-        let actual = mobs().lock().unwrap().len();
+        let actual = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
         let expected = existing + usize::from(spawn);
         if actual != expected {
             failures.push(format!("{name}: expected {expected}, got {actual}"));
@@ -5383,8 +5383,8 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
     let spider = name_to_etype("spider").unwrap();
 
     let (client, _peer) = client_pair();
-    *client.pos.lock().unwrap() = (0.5, 70.0, 0.5, 0.0, 0.0, true);
-    clients().lock().unwrap().push(Arc::new(client));
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 0.5, 0.0, 0.0, true);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
     let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
     let angle = tick as f64 * 2.399;
     let x = (0.5 + angle.cos() * 32.0).floor() as i32;
@@ -5451,7 +5451,7 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
     let mut failures = Vec::new();
     for (name, seed, changes, expected) in cases {
         {
-            let mut world = world().lock().unwrap();
+            let mut world = world().lock().unwrap_or_else(|e| e.into_inner());
             for (dx, y, state) in platform.into_iter().chain(changes.iter().copied()) {
                 let bx = x + dx;
                 world
@@ -5461,19 +5461,19 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
             }
         }
         assert_eq!(surface_y(x, z), 100.0);
-        mobs().lock().unwrap().clear();
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
         world_rng::seed(seed);
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
         WORLD_TIME.store(18000, Ordering::Relaxed);
         environment_time_tick();
 
-        let actual: Vec<_> = mobs().lock().unwrap().iter().map(|mob| mob.etype).collect();
+        let actual: Vec<_> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|mob| mob.etype).collect();
         if actual.as_slice() != expected.as_slice() {
             failures.push(format!("{name}: expected {expected:?}, got {actual:?}"));
         }
     }
-    *mobs().lock().unwrap() = vec![test_mob(
+    *mobs().lock().unwrap_or_else(|e| e.into_inner()) = vec![test_mob(
         20_000,
         creeper,
         (f64::from(x) + 0.5, 100.0, f64::from(z) + 0.5),
@@ -5484,7 +5484,7 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
     TICK.store(tick, Ordering::Relaxed);
     WORLD_TIME.store(18000, Ordering::Relaxed);
     environment_time_tick();
-    let mob_count = mobs().lock().unwrap().len();
+    let mob_count = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
     if mob_count != 1 {
         failures.push(format!(
             "occupied site: expected one existing mob, got {mob_count}"
@@ -5508,8 +5508,8 @@ fn gp2_nightly_hostiles_respect_spawn_light() {
     let stone = reg.state_of("minecraft:stone", None);
     let glowstone = reg.state_of("minecraft:glowstone", None);
     let (client, _peer) = client_pair();
-    *client.pos.lock().unwrap() = (0.5, 100.0, 0.5, 0.0, 0.0, true);
-    clients().lock().unwrap().push(Arc::new(client));
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 100.0, 0.5, 0.0, 0.0, true);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
     let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
     let angle = tick as f64 * 2.399;
     let x = (0.5 + angle.cos() * 32.0).floor() as i32;
@@ -5554,12 +5554,12 @@ fn gp2_nightly_hostiles_respect_spawn_light() {
         }
         let expected_rng = world_rng::saved_state();
         world_rng::seed(seed);
-        mobs().lock().unwrap().clear();
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
         SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
         TICK.store(tick, Ordering::Relaxed);
         environment_time_tick();
 
-        let actual = mobs().lock().unwrap().len();
+        let actual = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
         if actual != usize::from(expected) {
             failures.push(format!(
                 "{name}: expected {} mobs, got {actual}",
@@ -6219,7 +6219,7 @@ fn a_block_write_waits_for_an_in_progress_save_before_booking() {
     set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand");
     set_block(1, 200, 1, 0);
-    *block_ticks().lock().unwrap() = scheduled_ticks::ScheduledTicks::new();
+    *block_ticks().lock().unwrap_or_else(|e| e.into_inner()) = scheduled_ticks::ScheduledTicks::new();
 
     let save = crate::SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tx, rx) = std::sync::mpsc::channel();
@@ -6287,7 +6287,7 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
                 let _lock = crate::SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 let mut buf = Vec::new();
                 save_world_into(&mut buf);
-                snaps.lock().unwrap().push(buf);
+                snaps.lock().unwrap_or_else(|e| e.into_inner()).push(buf);
                 n += 1;
                 // See the matching saver above: yield so queued writers are not starved.
                 std::thread::yield_now();
@@ -6299,7 +6299,7 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
     // would already be over before its first snapshot: wait until it has proved itself,
     // like `a_saved_below_world_drop_is_not_duplicated` does, before exercising the writes.
     let wait = std::time::Instant::now();
-    while snaps.lock().unwrap().is_empty() {
+    while snaps.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
         assert!(
             wait.elapsed().as_secs() < 10,
             "the saver never captured a snapshot"
@@ -6318,12 +6318,12 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
     assert!(n > 0, "the saver must capture at least one snapshot");
 
     let reg = crate::block_registry::breg().unwrap();
-    let snapshots = snaps.lock().unwrap().clone();
+    let snapshots = snaps.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for (i, snap) in snapshots.iter().enumerate() {
-        world().lock().unwrap().clear();
-        falling().lock().unwrap().clear();
-        drops().lock().unwrap().clear();
-        *block_ticks().lock().unwrap() = scheduled_ticks::ScheduledTicks::new();
+        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *block_ticks().lock().unwrap_or_else(|e| e.into_inner()) = scheduled_ticks::ScheduledTicks::new();
         load_world_from(snap).unwrap();
         let pending: std::collections::HashSet<_> = block_ticks()
             .lock()
@@ -6400,7 +6400,7 @@ fn removing_a_support_schedules_the_block_above_after_its_own_booking_fired() {
         advance_falling_scheduled_tick();
     }
     assert_eq!(block_at(x, base + 1, z), sand, "the supported sand stays");
-    assert!(falling().lock().unwrap().is_empty(), "no entity while supported");
+    assert!(falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "no entity while supported");
     assert!(
         !pending((x, base + 1, z)),
         "the placement booking must be consumed before this test means anything"
@@ -6439,7 +6439,7 @@ fn a_falling_entity_stops_moving_when_its_chunk_goes_cold() {
     set_block(x, base + 5, z, sand);
     drain_falling_bookings(8);
     let y0 = {
-        let q = falling().lock().unwrap();
+        let q = falling().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(q.len(), 1, "the callback converted the block into one entity");
         q[0].y
     };
@@ -6448,13 +6448,13 @@ fn a_falling_entity_stops_moving_when_its_chunk_goes_cold() {
     for _ in 0..3 {
         falling_tick();
     }
-    let cold = falling().lock().unwrap().clone();
+    let cold = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(cold.len(), 1, "the entity stays in flight");
     assert_eq!(cold[0].y, y0, "a cold chunk must not integrate gravity: {cold:?}");
 
     set_test_region(warm.clone(), warm.clone());
     falling_tick();
-    let q = falling().lock().unwrap().clone();
+    let q = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(q.len() == 1 && q[0].y < y0, "warming resumes the physics: {q:?}");
     let _ = oh;
 }
@@ -6521,7 +6521,7 @@ fn block_events(frames: Vec<(i64, Vec<u8>)>) -> Vec<(BlockPos, u8, u8, i64)> {
 fn chest_viewer(eid: i32, at: BlockPos) -> (Arc<Client>, TcpStream) {
     let (mut client, receiver) = client_pair();
     client.eid = eid;
-    *client.pos.lock().unwrap() = (
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
         f64::from(at.0) + 0.5,
         f64::from(at.1),
         f64::from(at.2) + 0.5,
@@ -6560,7 +6560,7 @@ fn a_chest_state_change_keeps_its_contents() {
         .entry(ContainerKey::ow(pos))
         .or_default()
         .insert(0, stack.clone());
-    let dropped = drops().lock().unwrap().len();
+    let dropped = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
     for (prop, value) in [("waterlogged", "true"), ("facing", "east"), ("type", "left")] {
         let current = block_at(pos.0, pos.1, pos.2);
         let next = reg.with_prop(current, prop, value);
@@ -6577,12 +6577,12 @@ fn a_chest_state_change_keeps_its_contents() {
         );
     }
     assert_eq!(
-        drops().lock().unwrap().len(),
+        drops().lock().unwrap_or_else(|e| e.into_inner()).len(),
         dropped,
         "no state change may drop the contents"
     );
     // The break itself does drop, so take the map entry out before clearing the block.
-    chests().lock().unwrap().remove(&ContainerKey::ow(pos));
+    chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::ow(pos));
     set_block(pos.0, pos.1, pos.2, 0);
 }
 
@@ -6782,7 +6782,7 @@ fn two_viewers_move_the_opener_count_and_broadcast_it() {
 
     let before = chest_opener_snapshot(&audience, &halves);
     assert_eq!(before, vec![(right, 0), (left, 0)]);
-    *first.open_chest.lock().unwrap() = Some(window);
+    *first.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = Some(window);
     sync_chest_openers(&audience, &before);
     let expected = vec![
         (right, 1u8, 1u8, chest_id),
@@ -6797,7 +6797,7 @@ fn two_viewers_move_the_opener_count_and_broadcast_it() {
 
     let before = chest_opener_snapshot(&audience, &halves);
     assert_eq!(before, vec![(right, 1), (left, 1)]);
-    *second.open_chest.lock().unwrap() = Some(window);
+    *second.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = Some(window);
     sync_chest_openers(&audience, &before);
     let expected = vec![
         (right, 1u8, 2u8, chest_id),
@@ -6808,7 +6808,7 @@ fn two_viewers_move_the_opener_count_and_broadcast_it() {
 
     let before = chest_opener_snapshot(&audience, &halves);
     assert_eq!(before, vec![(right, 2), (left, 2)]);
-    *second.open_chest.lock().unwrap() = None;
+    *second.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
     sync_chest_openers(&audience, &before);
     let expected = vec![
         (right, 1u8, 1u8, chest_id),
@@ -6817,7 +6817,7 @@ fn two_viewers_move_the_opener_count_and_broadcast_it() {
     assert_eq!(block_events(frames_on(&mut r_first)), expected);
 
     let before = chest_opener_snapshot(&audience, &halves);
-    *first.open_chest.lock().unwrap() = None;
+    *first.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
     sync_chest_openers(&audience, &before);
     let expected = vec![
         (right, 1u8, 0u8, chest_id),
@@ -6843,7 +6843,7 @@ fn a_removed_container_closes_the_window_built_on_it() {
     let pos: BlockPos = (66, y, 60);
     set_block(pos.0, pos.1, pos.2, chest_state("chest"));
     let (viewer, mut receiver) = chest_viewer(1, pos);
-    *viewer.open_chest.lock().unwrap() = Some((ContainerKey::ow(pos), None));
+    *viewer.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = Some((ContainerKey::ow(pos), None));
     let closed = invalidate_container_windows(
         &[viewer.clone()],
         ContainerKey::ow(pos),
@@ -6851,7 +6851,7 @@ fn a_removed_container_closes_the_window_built_on_it() {
     );
     assert_eq!(closed, 1, "one window was closed");
     assert!(
-        viewer.open_chest.lock().unwrap().is_none(),
+        viewer.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
         "a stale window must not survive the block"
     );
     let frames = frames_on(&mut receiver);
@@ -6887,10 +6887,10 @@ fn breaking_a_chest_drops_each_stack_once_and_leaves_no_entry() {
         .lock()
         .unwrap()
         .insert(ContainerKey::ow(pos), slots);
-    let before = drops().lock().unwrap().len();
+    let before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
     set_block(pos.0, pos.1, pos.2, 0);
     assert!(
-        !chests().lock().unwrap().contains_key(&ContainerKey::ow(pos)),
+        !chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ContainerKey::ow(pos)),
         "no container entry may outlive the block"
     );
     assert!(
@@ -6898,7 +6898,7 @@ fn breaking_a_chest_drops_each_stack_once_and_leaves_no_entry() {
         "the click guard must refuse a window whose block is gone"
     );
     assert!(!container_exists(ContainerKey::ow(pos)));
-    let ds = drops().lock().unwrap();
+    let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(
         ds.len(),
         before + 2,
@@ -6911,7 +6911,7 @@ fn breaking_a_chest_drops_each_stack_once_and_leaves_no_entry() {
     expected.sort_unstable();
     assert_eq!(spilled, expected);
     drop(ds);
-    drops().lock().unwrap().truncate(before);
+    drops().lock().unwrap_or_else(|e| e.into_inner()).truncate(before);
 }
 
 /// The pair relationship is block state and the viewer count is not persisted (`the
@@ -6953,9 +6953,9 @@ fn chest_pairing_states_and_contents_survive_a_save_and_load() {
     }
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    world().lock().unwrap().clear();
-    chests().lock().unwrap().clear();
-    drops().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
     assert_eq!(
         chest_type(block_at(left.0, left.1, left.2)),
@@ -6968,7 +6968,7 @@ fn chest_pairing_states_and_contents_survive_a_save_and_load() {
         Some((right, left)),
         "the pair is re-derived from the reloaded states"
     );
-    let containers = chests().lock().unwrap().clone();
+    let containers = chests().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let keys: HashSet<ContainerKey> = containers.keys().copied().collect();
     assert_eq!(
         keys,
@@ -6992,10 +6992,10 @@ fn chest_pairing_states_and_contents_survive_a_save_and_load() {
         Some(&(diamond, 3, Vec::new()))
     );
     for cell in [left, right, lone] {
-        chests().lock().unwrap().remove(&ContainerKey::ow(cell));
+        chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::ow(cell));
         set_block(cell.0, cell.1, cell.2, 0);
     }
-    drops().lock().unwrap().clear();
+    drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 // ---------- chest world-side contract (M2 slice 3c) ----------
@@ -7183,12 +7183,12 @@ fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
         love: Mutex::new(0),
         air: Mutex::new(300),
     });
-    mobs().lock().unwrap().push(cat.clone());
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).push(cat.clone());
     assert!(
         !chest_window_blocked(win),
         "standing cat does not block ChestBlock.isCatSittingOnChest"
     );
-    sitting_cats().lock().unwrap().insert(cat_eid);
+    sitting_cats().lock().unwrap_or_else(|e| e.into_inner()).insert(cat_eid);
     assert!(
         is_cat_sitting_on_chest(left),
         "sitting cat on left cell blocks left half"
@@ -7198,7 +7198,7 @@ fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
         "sitting cat on left half blocks double chest window"
     );
     // Moving the sitting cat off the chest unblocks it.
-    *cat.pos.lock().unwrap() = (
+    *cat.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
         f64::from(left.0) + 0.5,
         f64::from(left.1) + 2.5,
         f64::from(left.2) + 0.5,
@@ -7206,8 +7206,8 @@ fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
         0.0,
     );
     assert!(!chest_window_blocked(win));
-    sitting_cats().lock().unwrap().remove(&cat_eid);
-    mobs().lock().unwrap().retain(|m| m.eid != cat_eid);
+    sitting_cats().lock().unwrap_or_else(|e| e.into_inner()).remove(&cat_eid);
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != cat_eid);
 
     for cell in [single, left, right] {
         set_block(cell.0, cell.1, cell.2, 0);
@@ -7262,7 +7262,7 @@ fn chest_contract_multi_viewer_broadcast_changes() {
     let s_iron: Stack = (iron, 7, Vec::new());
     let s_gold: Stack = (gold, 4, Vec::new());
     {
-        let mut all = chests().lock().unwrap();
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
         all.entry(ContainerKey::ow(right))
             .or_default()
             .insert(3, s_iron.clone());
@@ -7306,7 +7306,7 @@ fn chest_contract_multi_viewer_broadcast_changes() {
     );
 
     for cell in [right, left, other] {
-        chests().lock().unwrap().remove(&ContainerKey::ow(cell));
+        chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::ow(cell));
         set_block(cell.0, cell.1, cell.2, 0);
     }
 }
@@ -7335,12 +7335,12 @@ fn chest_contract_recheck_openers_reach_and_lid_close() {
     // Viewer 1 interacts; Observer sits adjacent to watch 0x08 lid events.
     let (v1, mut r1) = fast_chest_viewer(201, right);
     let (obs, mut r_obs) = fast_chest_viewer(202, right);
-    *v1.gm.lock().unwrap() = 0;
+    *v1.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     let audience = [v1.clone(), obs.clone()];
 
     // Check exact `Player.canInteractWithBlock(pos, 4.0)` boundary:
     // For survival (`4.5 + 4.0 = 8.5`), eye at z = 69.40 gives dz = 8.40, dy = 0.62 -> dist = 8.423 < 8.5.
-    *v1.pos.lock().unwrap() = (89.5, f64::from(y), 69.40, 0.0, 0.0, true);
+    *v1.pos.lock().unwrap_or_else(|e| e.into_inner()) = (89.5, f64::from(y), 69.40, 0.0, 0.0, true);
     let before = chest_opener_snapshot(&audience, &[right, left]);
     open_chest_for_client(&v1, win, None, &HashMap::new(), "Chest");
     sync_chest_openers(&audience, &before);
@@ -7352,26 +7352,26 @@ fn chest_contract_recheck_openers_reach_and_lid_close() {
 
     chest_viewer_tick_on(&audience);
     assert!(
-        v1.open_chest.lock().unwrap().is_some(),
+        v1.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
         "inside 8.5 block reach stays open"
     );
     assert!(frames_on(&mut r1).is_empty());
     assert!(frames_on(&mut r_obs).is_empty());
 
     // Move to z = 69.49: dist = sqrt(0.62^2 + 8.49^2) = 8.513 (> 8.5 survival, < 9.0 creative).
-    *v1.gm.lock().unwrap() = 1;
-    *v1.pos.lock().unwrap() = (89.5, f64::from(y), 69.49, 0.0, 0.0, true);
+    *v1.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+    *v1.pos.lock().unwrap_or_else(|e| e.into_inner()) = (89.5, f64::from(y), 69.49, 0.0, 0.0, true);
     chest_viewer_tick_on(&audience);
     assert!(
-        v1.open_chest.lock().unwrap().is_some(),
+        v1.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
         "creative range 5.0 + 4.0 = 9.0 keeps chest open at 8.513"
     );
 
     // Switch back to survival at 8.513 -> closes window (`0x12`), drops both halves to 0 (`0x08`).
-    *v1.gm.lock().unwrap() = 0;
+    *v1.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     chest_viewer_tick_on(&audience);
-    assert!(v1.open_chest.lock().unwrap().is_none());
-    assert!(v1.chest_sync.lock().unwrap().is_none());
+    assert!(v1.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+    assert!(v1.chest_sync.lock().unwrap_or_else(|e| e.into_inner()).is_none());
     let v1_frames = frames_on(&mut r1);
     assert!(
         v1_frames.iter().any(|(pid, body)| *pid == 0x12 && *body == vec![1u8]),
@@ -7385,31 +7385,31 @@ fn chest_contract_recheck_openers_reach_and_lid_close() {
 
     // Double chest: within 8.5 of `right` (x = 97.5 -> dx = 7.5) but > 8.5 from `left` (dx = 8.5)
     // must still fail `CompoundContainer.stillValid` and close.
-    *v1.pos.lock().unwrap() = (97.5, f64::from(y), 60.5, 0.0, 0.0, true);
+    *v1.pos.lock().unwrap_or_else(|e| e.into_inner()) = (97.5, f64::from(y), 60.5, 0.0, 0.0, true);
     open_chest_for_client(&v1, win, None, &HashMap::new(), "Chest");
     let _ = frames_on(&mut r1);
     chest_viewer_tick_on(&audience);
     assert!(
-        v1.open_chest.lock().unwrap().is_none(),
+        v1.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
         "double chest must close when farthest half is beyond reach"
     );
     let _ = frames_on(&mut r1);
     let _ = frames_on(&mut r_obs);
 
     // Crouching eye height (1.27 vs 1.62) affects vertical reach cleanly.
-    *v1.pos.lock().unwrap() = (89.5, f64::from(y) + 7.89, 60.5, 0.0, 0.0, true);
-    *v1.sneaking.lock().unwrap() = true;
+    *v1.pos.lock().unwrap_or_else(|e| e.into_inner()) = (89.5, f64::from(y) + 7.89, 60.5, 0.0, 0.0, true);
+    *v1.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = true;
     open_chest_for_client(&v1, win, None, &HashMap::new(), "Chest");
     let _ = frames_on(&mut r1);
     chest_viewer_tick_on(&audience);
     assert!(
-        v1.open_chest.lock().unwrap().is_some(),
+        v1.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
         "crouching eye height (y + 1.27 -> dy = 8.16 < 8.5) stays open"
     );
-    *v1.sneaking.lock().unwrap() = false;
+    *v1.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = false;
     chest_viewer_tick_on(&audience);
     assert!(
-        v1.open_chest.lock().unwrap().is_none(),
+        v1.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
         "standing up lifts eye to dy = 8.51 > 8.5 and closes"
     );
 
@@ -7423,14 +7423,14 @@ fn chest_contract_recheck_openers_reach_and_lid_close() {
         breg().expect("block registry").state_of("minecraft:ender_chest", None),
     );
     let ek = ender_container_key(&v1.uuid);
-    *v1.pos.lock().unwrap() = (88.5, f64::from(y), 60.5, 0.0, 0.0, true);
+    *v1.pos.lock().unwrap_or_else(|e| e.into_inner()) = (88.5, f64::from(y), 60.5, 0.0, 0.0, true);
     open_chest_for_client(&v1, (ek, None), Some(ender_pos), &HashMap::new(), "Ender Chest");
     let _ = frames_on(&mut r1);
     chest_viewer_tick_on(&audience);
-    assert!(v1.open_chest.lock().unwrap().is_some());
-    *v1.pos.lock().unwrap() = (100.0, f64::from(y), 60.5, 0.0, 0.0, true);
+    assert!(v1.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+    *v1.pos.lock().unwrap_or_else(|e| e.into_inner()) = (100.0, f64::from(y), 60.5, 0.0, 0.0, true);
     chest_viewer_tick_on(&audience);
-    assert!(v1.open_chest.lock().unwrap().is_none());
+    assert!(v1.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none());
     assert!(frames_on(&mut r1)
         .iter()
         .any(|(pid, body)| *pid == 0x12 && *body == vec![1u8]));
@@ -7548,9 +7548,9 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
         "payload_digest is not FNV-1a 128"
     );
     let (old_hot, old_warm) = test_region();
-    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
-    let old_orbs = std::mem::take(&mut *xps().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_orbs = std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let old_time = WORLD_TIME.swap(1000, Ordering::Relaxed);
@@ -7567,15 +7567,15 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
     // while the payload stays deterministic: `save_world_into` writes the forceload set
     // in `HashSet` iteration order, and one element has only one order.
     let chunks: HashSet<(i32, i32)> = std::iter::once((0, 0)).collect();
-    *forceloaded().lock().unwrap() = chunks.clone();
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = chunks.clone();
     set_test_region(chunks.clone(), chunks);
 
     let run_once = || {
         let mut orbs = Vec::new();
         let mut items = Vec::new();
         let counts = identity_fixture(&mut orbs, &mut items);
-        *xps().lock().unwrap() = orbs;
-        *drops().lock().unwrap() = items;
+        *xps().lock().unwrap_or_else(|e| e.into_inner()) = orbs;
+        *drops().lock().unwrap_or_else(|e| e.into_inner()) = items;
         TICK.store(1, Ordering::Relaxed);
         TICK_IDX.store(0, Ordering::Relaxed);
         WORLD_TIME.store(1000, Ordering::Relaxed);
@@ -7598,17 +7598,17 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
             game_tick(|_, tick| tick());
         }
         let left = (
-            xps().lock().unwrap().len(),
-            drops().lock().unwrap().len(),
+            xps().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            drops().lock().unwrap_or_else(|e| e.into_inner()).len(),
         );
         let mut payload = Vec::new();
         save_world_into(&mut payload);
-        let overlay = world().lock().unwrap().len();
+        let overlay = world().lock().unwrap_or_else(|e| e.into_inner()).len();
         let mut state: Vec<String> = Vec::new();
-        for x in xps().lock().unwrap().iter() {
+        for x in xps().lock().unwrap_or_else(|e| e.into_inner()).iter() {
             state.push(format!("orb {} {} {} {} {} {}", x.eid, x.x, x.y, x.z, x.val, x.age));
         }
-        for d in drops().lock().unwrap().iter() {
+        for d in drops().lock().unwrap_or_else(|e| e.into_inner()).iter() {
             state.push(format!("drop {} {} {} {} {} {}", d.eid, d.x, d.y, d.z, d.item, d.age));
         }
         (payload, left, counts, overlay, state)
@@ -7656,9 +7656,9 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
     );
     eprintln!("IDENTITY {first} orbs={} drops={}", first_left.0, first_left.1);
 
-    *drops().lock().unwrap() = old_drops;
-    *xps().lock().unwrap() = old_orbs;
-    *forceloaded().lock().unwrap() = old_forced;
+    *drops().lock().unwrap_or_else(|e| e.into_inner()) = old_drops;
+    *xps().lock().unwrap_or_else(|e| e.into_inner()) = old_orbs;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     WORLD_TIME.store(old_time, Ordering::Relaxed);
@@ -7750,27 +7750,27 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     materialize_generation_payloads(payloads);
 
     assert!(
-        !chests().lock().unwrap().contains_key(&ContainerKey::ow(chest_pos)),
+        !chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ContainerKey::ow(chest_pos)),
         "placed chest with LootTable must remain unmaterialized before first open"
     );
     assert!(
-        !chests().lock().unwrap().contains_key(&ContainerKey::ow(save_pos)),
+        !chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ContainerKey::ow(save_pos)),
         "placed barrel with LootTable must remain unmaterialized before first open"
     );
 
     // Save and reload before opening preserves unexpanded LootTable+LootTableSeed.
     let mut saved = Vec::new();
     save_world_into(&mut saved);
-    chests().lock().unwrap().clear();
+    chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&saved).unwrap();
     assert!(
-        !chests().lock().unwrap().contains_key(&ContainerKey::ow(save_pos)),
+        !chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ContainerKey::ow(save_pos)),
         "save/reload before opening must not expand LootTable early"
     );
 
     // Non-spectator open unpacks deterministically once and clears pending metadata.
     let (viewer, _rx) = fast_chest_viewer(301, chest_pos);
-    *viewer.gm.lock().unwrap() = 0;
+    *viewer.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     open_chest_for_client(
         &viewer,
         (ContainerKey::ow(chest_pos), None),
@@ -7780,7 +7780,7 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     );
     let expected_chest = roll_cart_loot(424242);
     assert_eq!(
-        chests().lock().unwrap().get(&ContainerKey::ow(chest_pos)).cloned(),
+        chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::ow(chest_pos)).cloned(),
         Some(expected_chest.clone())
     );
     // Clearing slot 0 and re-opening must NOT re-roll the loot table.
@@ -7816,26 +7816,26 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
         "Barrel",
     );
     assert_eq!(
-        chests().lock().unwrap().get(&ContainerKey::ow(save_pos)).cloned(),
+        chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::ow(save_pos)).cloned(),
         Some(roll_cart_loot(13579))
     );
 
     // Breaking an unopened loot chest materializes and spills its drops.
-    let drops_before = drops().lock().unwrap().len();
+    let drops_before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
     set_block(break_pos.0, break_pos.1, break_pos.2, 0);
     let expected_drop_count = roll_cart_loot(24680)
         .values()
         .filter(|(it, cnt, _)| *it > 0 && *cnt > 0)
         .count();
     assert_eq!(
-        drops().lock().unwrap().len(),
+        drops().lock().unwrap_or_else(|e| e.into_inner()).len(),
         drops_before + expected_drop_count,
         "breaking an unopened loot chest must unpack and drop its rolled loot stacks"
     );
 
     // Custom datapack loot table rolls deterministically from explicit LootTableSeed.
     let custom_table = "test:slice3d_seeded_loot";
-    loot_tables().lock().unwrap().insert(
+    loot_tables().lock().unwrap_or_else(|e| e.into_inner()).insert(
         custom_table.to_owned(),
         vec![LootPool {
             rolls: 3,
@@ -7884,17 +7884,17 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
         &HashMap::new(),
         "Chest",
     );
-    let rolled_a = chests().lock().unwrap().get(&ContainerKey::ow(seed_a)).cloned();
-    let rolled_b = chests().lock().unwrap().get(&ContainerKey::ow(seed_b)).cloned();
+    let rolled_a = chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::ow(seed_a)).cloned();
+    let rolled_b = chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::ow(seed_b)).cloned();
     assert!(rolled_a.as_ref().is_some_and(|m| !m.is_empty()));
     assert_eq!(
         rolled_a, rolled_b,
         "custom loot_table with explicit LootTableSeed must materialize identically on first open"
     );
-    loot_tables().lock().unwrap().remove(custom_table);
+    loot_tables().lock().unwrap_or_else(|e| e.into_inner()).remove(custom_table);
 
     for pos in [chest_pos, save_pos, break_pos, seed_a, seed_b] {
-        chests().lock().unwrap().remove(&ContainerKey::ow(pos));
+        chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::ow(pos));
         set_block(pos.0, pos.1, pos.2, 0);
     }
 }
@@ -7948,16 +7948,16 @@ fn chest_contract_3d_barrel_toggles_open_property_without_block_event() {
 
     // 2 -> 1: remains open=true, no extra 0x09 or 0x08.
     let before = chest_opener_snapshot(&audience, &[barrel_pos]);
-    *v2.open_chest.lock().unwrap() = None;
-    *v2.chest_sync.lock().unwrap() = None;
+    *v2.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *v2.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
     sync_chest_openers(&audience, &before);
     assert_eq!(block_at(barrel_pos.0, barrel_pos.1, barrel_pos.2), open_north);
     assert!(frames_on(&mut r_obs).is_empty(), "2 -> 1 must stay open without packets");
 
     // 1 -> 0: open returns to false preserving facing=north, 0x09 broadcast, NO 0x08.
     let before = chest_opener_snapshot(&audience, &[barrel_pos]);
-    *v1.open_chest.lock().unwrap() = None;
-    *v1.chest_sync.lock().unwrap() = None;
+    *v1.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *v1.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
     sync_chest_openers(&audience, &before);
     assert_eq!(block_at(barrel_pos.0, barrel_pos.1, barrel_pos.2), closed_north);
     let obs_frames = frames_on(&mut r_obs);
@@ -7985,7 +7985,7 @@ fn chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_
 
     // Build an enclosed chamber inside chunk (6, 3) around (100, 170, 56).
     {
-        let mut w = world().lock().unwrap();
+        let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
         let chunk = w.entry((DimId::Overworld, 6, 3)).or_default();
         for y in 169..=171 {
             for z in 54..=59 {
@@ -8087,7 +8087,7 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
     let (spec, mut r_spec) = fast_chest_viewer(323, ender_a);
     let (other, mut r_other) = fast_chest_viewer(324, ender_b);
     let (obs, mut r_obs) = fast_chest_viewer(325, ender_a);
-    *spec.gm.lock().unwrap() = 3;
+    *spec.gm.lock().unwrap_or_else(|e| e.into_inner()) = 3;
     let audience = [v1.clone(), v2.clone(), spec.clone(), other.clone(), obs.clone()];
 
     // v1 & v2 open ender_a; other opens ender_b; spec stays out of opener count.
@@ -8166,12 +8166,12 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
     let _ = frames_on(&mut r_spec);
 
     // Put audience in global clients() so set_block invalidates windows on ender_a.
-    *clients().lock().unwrap() = audience.to_vec();
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = audience.to_vec();
     set_block(ender_a.0, ender_a.1, ender_a.2, 0);
-    assert!(v1.open_chest.lock().unwrap().is_none(), "breaking ender_a closes v1");
-    assert!(v2.open_chest.lock().unwrap().is_none(), "breaking ender_a closes v2");
+    assert!(v1.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none(), "breaking ender_a closes v1");
+    assert!(v2.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none(), "breaking ender_a closes v2");
     assert!(
-        other.open_chest.lock().unwrap().is_some(),
+        other.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
         "breaking ender_a must NOT close viewer anchored on ender_b"
     );
     assert!(
@@ -8189,7 +8189,7 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
         "breaking an ender chest must preserve player's personal ender inventory"
     );
 
-    chests().lock().unwrap().remove(&ender_container_key(&v1.uuid));
+    chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ender_container_key(&v1.uuid));
     set_block(ender_b.0, ender_b.1, ender_b.2, 0);
 }
 
@@ -8238,10 +8238,10 @@ struct Travel4dWorld {
 impl Travel4dWorld {
     fn take() -> Self {
         Self {
-            world: std::mem::take(&mut *world().lock().unwrap()),
-            mobs: std::mem::take(&mut *mobs().lock().unwrap()),
-            region: std::mem::take(&mut *region().lock().unwrap()),
-            clients: std::mem::take(&mut *clients().lock().unwrap()),
+            world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+            mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
+            region: std::mem::take(&mut *region().lock().unwrap_or_else(|e| e.into_inner())),
+            clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
             tick: TICK.load(Ordering::Relaxed),
             world_time: WORLD_TIME.load(Ordering::Relaxed),
             ultra_warm: level_ultra_warm(),
@@ -8670,7 +8670,7 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
 
     // Only the client's position matters here: it makes the chunk hot and keeps `cls` non-empty.
     let (dummy, _rx) = client_pair();
-    *clients().lock().unwrap() = vec![Arc::new(dummy)];
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![Arc::new(dummy)];
 
     let spider = test_mob(9501, 100, (2.5, 64.0, 2.5), 16.0);
     let blaze = test_mob(9502, 8, (6.5, 59.5, 6.5), 20.0);
@@ -8687,7 +8687,7 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
     // ticks. Re-assert both rather than read a shorter loop as a sink rate.
     for _ in 0..80 {
         {
-            let mut ms = mobs().lock().unwrap();
+            let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
             for m in [&spider, &blaze] {
                 if !ms.iter().any(|x| x.eid == m.eid) {
                     ms.push(m.clone());
@@ -8698,7 +8698,7 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
         mob_tick();
     }
 
-    let (sx, sy, sz, _, _) = *spider.pos.lock().unwrap();
+    let (sx, sy, sz, _, _) = *spider.pos.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         sy < 63.0 && sy > 61.5,
         "spider must sink in water at the getFluidFallingAdjustedMovement rate, got y={sy}"
@@ -8708,23 +8708,23 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
         "still water has no current: no horizontal drift expected, got ({sx}, {sz})"
     );
     assert_eq!(
-        *spider.hp.lock().unwrap(),
+        *spider.hp.lock().unwrap_or_else(|e| e.into_inner()),
         16.0,
         "descending through water must not charge fall damage"
     );
     assert_ne!(
-        *spider.vel.lock().unwrap(),
+        *spider.vel.lock().unwrap_or_else(|e| e.into_inner()),
         [0.0; 3],
         "travel keeps a fluid velocity"
     );
 
-    let (_, by, _, _, _) = *blaze.pos.lock().unwrap();
+    let (_, by, _, _, _) = *blaze.pos.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         (by - 58.0).abs() < 1e-2,
         "blaze must sink to the lava floor at the travel rate, got y={by}"
     );
     assert_eq!(
-        *blaze.hp.lock().unwrap(),
+        *blaze.hp.lock().unwrap_or_else(|e| e.into_inner()),
         20.0,
         "fire-immune blaze takes no lava damage; the sink itself is not damage"
     );
@@ -8732,7 +8732,7 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
     // A mob must not be snapped by `mob_snap_y` while it is in a fluid: travel owns the vertical
     // motion. The lava case needs a mob with no support below, or the `mob_has_support` arm of the
     // same guard answers first and the assertion would pass without the lava arm existing.
-    let mut water_snap = *spider.pos.lock().unwrap();
+    let mut water_snap = *spider.pos.lock().unwrap_or_else(|e| e.into_inner());
     let before = water_snap.1;
     mob_snap_y(&spider, &mut water_snap);
     assert_eq!(
@@ -8744,12 +8744,12 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
     for y in 50..=57 {
         set_block(6, y, 6, lava);
     }
-    let (bx, by, bz, _, _) = *blaze.pos.lock().unwrap();
+    let (bx, by, bz, _, _) = *blaze.pos.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         !mob_has_support(blaze.etype, bx, by, bz),
         "the lava pocket must have no floor, or the support arm hides the lava arm"
     );
-    let mut lava_snap = *blaze.pos.lock().unwrap();
+    let mut lava_snap = *blaze.pos.lock().unwrap_or_else(|e| e.into_inner());
     mob_snap_y(&blaze, &mut lava_snap);
     assert_eq!(
         lava_snap.1, by,
@@ -8759,14 +8759,14 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
     // Leaving the fluid clears the stored deltaMovement (the non-fluid branch's friction). A
     // high, dry column keeps this independent of whatever another test did to the overlay.
     let dry = test_mob(9503, 8, (6.5, 120.0, 6.5), 20.0);
-    *dry.vel.lock().unwrap() = [0.0, -0.025, 0.0];
-    let mut dry_pos = *dry.pos.lock().unwrap();
+    *dry.vel.lock().unwrap_or_else(|e| e.into_inner()) = [0.0, -0.025, 0.0];
+    let mut dry_pos = *dry.pos.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         mob_fluid_travel_tick(&dry, &mut dry_pos).is_none(),
         "a mob in neither fluid must not take a fluid travel step"
     );
     assert_eq!(
-        *dry.vel.lock().unwrap(),
+        *dry.vel.lock().unwrap_or_else(|e| e.into_inner()),
         [0.0; 3],
         "a mob in neither fluid must have its fluid velocity cleared"
     );
@@ -9361,7 +9361,7 @@ fn p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords() {
     assert_eq!(opacity_windowed_dim(DimId::Overworld, x, y, z), 15);
     assert_eq!(opacity_windowed_dim(DimId::End, x, y, z), 0);
 
-    let store = section_store().lock().unwrap();
+    let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
     for (dim, sections) in [
         (DimId::Overworld, 24),
         (DimId::Nether, 16),
@@ -9483,21 +9483,21 @@ fn p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_positio
     );
 
     let (client, mut receiver) = client_pair();
-    *client.dim.lock().unwrap() = DimId::Overworld;
-    *client.pos.lock().unwrap() = (7.5, 70.0, 9.5, 10.0, 20.0, true);
-    client.seen.lock().unwrap().insert(4242);
-    client.chunks.lock().unwrap().insert((0, 0));
-    client.gen_sources.lock().unwrap().insert((0, 0), Vec::new());
+    *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (7.5, 70.0, 9.5, 10.0, 20.0, true);
+    client.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(4242);
+    client.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+    client.gen_sources.lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0), Vec::new());
     let client = Arc::new(client);
     // A far-away chunk proves the whole window was dropped, not just the centre.
-    client.chunks.lock().unwrap().insert((90, 90));
+    client.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((90, 90));
 
     switch_client_dimension(&client, DimId::Nether, (100.5, 32.0, 200.5, 30.0, 40.0), 0);
 
-    assert_eq!(*client.dim.lock().unwrap(), DimId::Nether);
-    assert!(client.seen.lock().unwrap().is_empty());
-    assert!(!client.chunks.lock().unwrap().contains(&(90, 90)));
-    let p = *client.pos.lock().unwrap();
+    assert_eq!(*client.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Nether);
+    assert!(client.seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    assert!(!client.chunks.lock().unwrap_or_else(|e| e.into_inner()).contains(&(90, 90)));
+    let p = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!((p.0, p.1, p.2, p.3, p.4), (100.5, 32.0, 200.5, 30.0, 40.0));
 
     let mut packets = Vec::new();
@@ -9543,12 +9543,12 @@ fn p2_3_s4_portal_scaling_clamps_y_and_the_arrival_guard_blocks_bounce() {
 #[test]
 fn p2_3_s4_logout_persists_the_clients_live_dimension() {
     let (client, _rx) = client_pair();
-    *client.pos.lock().unwrap() = (12.5, 64.0, 48.5, 90.0, -10.0, true);
-    *client.dim.lock().unwrap() = DimId::End;
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (12.5, 64.0, 48.5, 90.0, -10.0, true);
+    *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
     let (dim, x, y, z, yaw, pitch) = client_dim_pos(&client);
     assert_eq!(dim, DimId::End, "the saved dimension is the live one");
     assert_eq!((x, y, z, yaw, pitch), (12.5, 64.0, 48.5, 90.0, -10.0));
-    *client.dim.lock().unwrap() = DimId::Nether;
+    *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
     assert_eq!(client_dim_pos(&client).0, DimId::Nether);
 }
 
@@ -9559,12 +9559,12 @@ fn p2_3_s4_broadcast_chunk_dim_filters_other_dimensions() {
     // edited dimension may receive the block delta.
     let (ow, mut ow_rx) = client_pair();
     let (ne, mut ne_rx) = client_pair();
-    *ne.dim.lock().unwrap() = DimId::Nether;
-    ow.chunks.lock().unwrap().insert((0, 0));
-    ne.chunks.lock().unwrap().insert((0, 0));
+    *ne.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
+    ow.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+    ne.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     let (ow, ne) = (Arc::new(ow), Arc::new(ne));
-    let saved = std::mem::take(&mut *clients().lock().unwrap());
-    clients().lock().unwrap().extend([ow.clone(), ne.clone()]);
+    let saved = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
+    clients().lock().unwrap_or_else(|e| e.into_inner()).extend([ow.clone(), ne.clone()]);
 
     broadcast_chunk_dim(DimId::Nether, 0, 0, |_c| (0x49, vec![1, 2, 3]));
 
@@ -9576,7 +9576,7 @@ fn p2_3_s4_broadcast_chunk_dim_filters_other_dimensions() {
     while let Some((id, _)) = read_packet(&mut ow_rx, Instant::now() + Duration::from_secs(1)) {
         ow_ids.push(id);
     }
-    *clients().lock().unwrap() = saved;
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = saved;
 
     assert!(ne_ids.contains(&0x49), "the Nether holder must see the edit: {ne_ids:?}");
     assert!(!ow_ids.contains(&0x49), "the Overworld holder must not: {ow_ids:?}");
@@ -9650,7 +9650,7 @@ fn m3_p5_map_chunk_cache_hit_and_invalidation() {
     // per-call signature must catch it.
     let key: SignKey = (dim, 8, 70, 8, 1);
     {
-        let mut sg = signs().lock().unwrap();
+        let mut sg = signs().lock().unwrap_or_else(|e| e.into_inner());
         let mut lines: SignLines = Default::default();
         lines[0] = "hello".to_string();
         sg.insert(key, lines);
@@ -9660,7 +9660,7 @@ fn m3_p5_map_chunk_cache_hit_and_invalidation() {
         p4, p3_restored,
         "a sign edit must invalidate the cached map_chunk payload"
     );
-    signs().lock().unwrap().remove(&key);
+    signs().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
     set_block_dim(dim, 8, 70, 8, cur);
     clear_chunk_caches_for_tests();
     let p5 = map_chunk(cx, cz, dim, &mut gen);
