@@ -1430,6 +1430,30 @@ fn interest_tick() {
         .lock()
         .unwrap()
         .retain(|eid, _| live_eids.contains(eid));
+    for (&knot_eid, &(dim, pos)) in leash_knots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        let (x, y, z) = (
+            pos.0 as f64 + 0.5,
+            pos.1 as f64 + 0.5,
+            pos.2 as f64 + 0.5,
+        );
+        queue(
+            dim,
+            name_to_etype("leash_knot").unwrap(),
+            (
+                knot_eid,
+                x,
+                y,
+                z,
+                Box::new(move || {
+                    vec![(0x01, spawn_typed_pkt(knot_eid, 63, x, y, z))]
+                }),
+            ),
+        );
+    }
     for &projectile in live_mob_projectiles().lock().unwrap().iter() {
         let [x, y, z] = projectile.pos;
         queue(
@@ -7228,6 +7252,23 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
+                // `FenceBlock.useItemOn` -> `LeadItem.bindPlayerMobs`: a fence
+                // right-click while this player holds leashed mobs spawns (or
+                // reuses) the `leash_knot` on the clicked fence and re-anchors
+                // every held tether onto it.
+                if !sneaking
+                    && crate::block_registry::breg().is_some_and(|reg| {
+                        reg.name_of(clicked).ends_with("_fence")
+                    })
+                    && hitch_player_tethers(me.eid, dim, (x, y, z))
+                {
+                    let _ = send_packet(
+                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                        0x05,
+                        ack(seq),
+                    );
+                    continue;
+                }
                 if !sneaking
                     && (open_live_block_menu(&me, (dim, x, y, z), clicked)
                         || use_redstone_component(&me, (dim, x, y, z), clicked))
@@ -7746,6 +7787,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 .find(|c| c.eid == target)
                                 .and_then(|c| c.pos().ok())
                                 .map(|p| (p[0], p[1], p[2], true))
+                        })
+                        .or_else(|| {
+                            leash_knots()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&target)
+                                .map(|&(_, p)| {
+                                    (
+                                        p.0 as f64 + 0.5,
+                                        p.1 as f64 + 0.5,
+                                        p.2 as f64 + 0.5,
+                                        false,
+                                    )
+                                })
                         });
                     let ok = tp
                         .map(|(tx, ty, tz, is_cart)| {
@@ -7795,6 +7850,23 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 sync_chest_openers_dim(&audience, &before);
                             }
                         }
+                        continue;
+                    }
+                    // `LeashFenceKnotEntity.interact` runs `LeadItem.bindPlayerMobs`:
+                    // every mob leashed to this player re-anchors onto the knot.
+                    if let Some(&(kdim, kpos)) = leash_knots()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&target)
+                    {
+                        if kdim == *me.dim.lock().unwrap_or_else(|e| e.into_inner()) {
+                            hitch_player_tethers(me.eid, kdim, kpos);
+                        }
+                        continue;
+                    }
+                    // `LeadItem`/`NameTagItem` `mobInteract`: leash toggle and
+                    // custom-name application before the pet paths.
+                    if leash_name_tag_interact(&me, target, 36 + held_slot) {
                         continue;
                     }
                     if pet_collar_or_parrot_interact(&me, target, 36 + held_slot) {
@@ -7944,6 +8016,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 }
                 if mouse == 1 {
                     // attack
+                    // `LeashFenceKnotEntity.hurt`: the knot breaks and every
+                    // tether it anchored detaches with its lead.
+                    if break_leash_knot(target) {
+                        continue;
+                    }
                     // PvP: target may be another player
                     if target != me.eid {
                         let gm = *me.gm.lock().unwrap();
@@ -10165,6 +10242,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         // `Entity.remove` on the leaving player: they step out of any vehicle
         // and the vehicle's trackers get the updated SetPassengers.
         live_mount_forget(me_cleanup.eid);
+        // A leaving holder drops every lead it held: detach the tethers at the
+        // mobs (`0x59(target, -1)` + lead item), the same way mob death does.
+        detach_tethers_involving(me_cleanup.eid, None);
         // vanilla culls the destroy to this entity's trackers
         broadcast_seen_destroy(me_cleanup.eid);
         let mut p = Vec::new();
@@ -10358,6 +10438,74 @@ fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> boo
         None => {}
     }
     true
+}
+
+/// The renamed stack's `minecraft:custom_name` component decoded to text. The
+/// component payload is an NBT string tag — `[8][u16 len][modified UTF-8]` —
+/// the same layout `anvil_hover_name` reads.
+fn renamed_custom_name(comps: &Comps) -> Option<String> {
+    let [8, hi, lo, text @ ..] = comp_get(comps, COMP_CUSTOM_NAME)? else {
+        return None;
+    };
+    let text = text.get(..usize::from(u16::from_be_bytes([*hi, *lo])))?;
+    let name = String::from_utf8_lossy(text).into_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+/// `LeadItem`/`NameTagItem` `mobInteract`. A lead toggles the tether to this
+/// player: attach (`0x59(mob, player)` + one lead consumed outside creative),
+/// or detach a mob that is already leashed (`0x59(mob, -1)` and the lead drops
+/// where it stood, exactly like vanilla `dropLeash(true, true)`). A renamed
+/// `name_tag` writes the mob's custom name (metadata slots 2 and 3) and
+/// consumes one tag outside creative.
+fn leash_name_tag_interact(client: &Client, target: i32, slot: i16) -> bool {
+    if *client.gm.lock().unwrap_or_else(|e| e.into_inner()) == 3 {
+        return false;
+    }
+    let mob = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|m| m.eid == target)
+        .cloned();
+    let Some(mob) = mob else { return false };
+    let (item, comps) = client
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&slot)
+        .map(|stack| (stack.0, stack.2.clone()))
+        .unwrap_or((0, Vec::new()));
+    if Some(item) == name_to_item("lead") {
+        if entity_tethers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&target)
+        {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            detach_tether(target, Some((x, y, z)));
+        } else {
+            attach_tether(vanilla_lead_tether(
+                target,
+                TetherAnchor::Entity(client.eid),
+            ));
+            consume_one_item(client, slot);
+        }
+        return true;
+    }
+    if Some(item) == name_to_item("name_tag") {
+        let Some(name) = renamed_custom_name(&comps) else {
+            return false;
+        };
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(target, name.clone());
+        broadcast_mob_custom_name(target, &name);
+        consume_one_item(client, slot);
+        return true;
+    }
+    false
 }
 
 /// Vanilla `TamableAnimal` follow teleport: a standing tamed pet more than 12

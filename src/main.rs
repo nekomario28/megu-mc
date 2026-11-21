@@ -2480,7 +2480,18 @@ fn remove_live_mob(eid: i32) -> Option<(Arc<Mob>, Option<LiveMobState>)> {
     let mut mobs = mobs().lock().unwrap();
     let index = mobs.iter().position(|mob| mob.eid == eid)?;
     let state = live_mob_states().lock().unwrap().remove(&eid);
-    Some((mobs.remove(index), state))
+    let mob = mobs.remove(index);
+    drop(mobs);
+    mob_custom_names()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
+    // Vanilla `Entity.remove` drops the leash at the dying entity; any tether
+    // this mob anchored (a mob cannot hold a lead, but the generic table does
+    // not know that) detaches with its own drop at the other end.
+    let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+    detach_tethers_involving(eid, Some((x, y, z)));
+    Some((mob, state))
 }
 
 fn convert_live_mob(mob: &Mob, dim: DimId, etype: i64) {
@@ -2497,6 +2508,434 @@ fn convert_live_mob(mob: &Mob, dim: DimId, etype: i64) {
     live_mob_states().lock().unwrap().remove(&mob.eid);
     drop(mobs);
     broadcast_seen_destroy(mob.eid);
+}
+
+// ---------- entity tethers (vanilla lead / generic chain tether) ----------
+/// What a tether is anchored to. `Entity` is a live entity holding the lead —
+/// normally the player that leashed the mob; `FenceKnot` is the `leash_knot`
+/// entity (`leash_knots()` owns its registry entry) sitting on a fence block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TetherAnchor {
+    Entity(i32),
+    FenceKnot {
+        dim: DimId,
+        pos: (i32, i32, i32),
+        knot_eid: i32,
+    },
+}
+
+/// One tethered entity: `target_eid` is the mob on the rope. The vanilla lead
+/// is `max_length 10` / `elastic_start 6` / `break_on_stretch`; a generic chain
+/// tether (e.g. a mod's dragon chain) sets `break_on_stretch = false` and a
+/// longer `max_length`, which clamps the target onto the sphere instead of
+/// snapping. `drop_item_on_break` is the item spawned when the tether detaches
+/// (`lead` for the vanilla lead, `None` for a chain that must not drop).
+#[derive(Clone, Copy)]
+struct EntityTether {
+    target_eid: i32,
+    anchor: TetherAnchor,
+    max_length: f64,
+    elastic_start: f64,
+    break_on_stretch: bool,
+    drop_item_on_break: Option<i32>,
+}
+static ENTITY_TETHERS: OnceLock<Mutex<HashMap<i32, EntityTether>>> = OnceLock::new();
+fn entity_tethers() -> &'static Mutex<HashMap<i32, EntityTether>> {
+    ENTITY_TETHERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Custom names applied by `name_tag`, keyed by the mob's entity id. Metadata
+/// slot 2/3 broadcasts keep the viewers in sync; the entry dies with the mob.
+static MOB_CUSTOM_NAMES: OnceLock<Mutex<HashMap<i32, String>>> = OnceLock::new();
+fn mob_custom_names() -> &'static Mutex<HashMap<i32, String>> {
+    MOB_CUSTOM_NAMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Live `leash_knot` entities: knot eid -> (dimension, fence block position).
+static LEASH_KNOTS: OnceLock<Mutex<HashMap<i32, (DimId, BlockPos)>>> = OnceLock::new();
+fn leash_knots() -> &'static Mutex<HashMap<i32, (DimId, BlockPos)>> {
+    LEASH_KNOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Protocol 767 S2C `set_entity_link` (`0x59`): the attached entity id then the
+/// holding entity id, both as big-endian `i32`. A holding id of `-1` detaches
+/// (`proto/src/data_v767.rs` pins the packet id).
+fn set_entity_link_pkt(attached_eid: i32, holding_eid: i32) -> Vec<u8> {
+    let mut p = Vec::with_capacity(8);
+    p.extend_from_slice(&attached_eid.to_be_bytes());
+    p.extend_from_slice(&holding_eid.to_be_bytes());
+    p
+}
+
+/// The vanilla lead shape of `EntityTether`: ten blocks, elastic from six,
+/// snaps on stretch and drops a lead item where the tethered mob stood.
+fn vanilla_lead_tether(target_eid: i32, anchor: TetherAnchor) -> EntityTether {
+    EntityTether {
+        target_eid,
+        anchor,
+        max_length: 10.0,
+        elastic_start: 6.0,
+        break_on_stretch: true,
+        drop_item_on_break: name_to_item("lead").map(|id| id as i32),
+    }
+}
+
+/// Position + dimension of any entity id this server tracks: players first,
+/// then mobs. `None` means the entity is gone (disconnect/death).
+fn entity_pos_dim(eid: i32) -> Option<(DimId, f64, f64, f64)> {
+    let clients = clients().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = clients.iter().find(|c| c.eid == eid) {
+        let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+        return Some((dim, p.0, p.1, p.2));
+    }
+    drop(clients);
+    let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+    let m = mobs.iter().find(|m| m.eid == eid)?;
+    let p = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+    Some((m.dim, p.0, p.1, p.2))
+}
+
+/// A mob's position + dimension by entity id — the tether target lookup.
+fn mob_tether_pos(eid: i32) -> Option<(DimId, f64, f64, f64)> {
+    let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+    let m = mobs.iter().find(|m| m.eid == eid)?;
+    let p = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+    Some((m.dim, p.0, p.1, p.2))
+}
+
+/// Where the anchor end of a tether is, or `None` when the holder is gone. A
+/// knot only counts while its `leash_knots()` entry lives.
+fn tether_anchor_pos(anchor: &TetherAnchor) -> Option<(DimId, f64, f64, f64)> {
+    match *anchor {
+        TetherAnchor::Entity(eid) => entity_pos_dim(eid),
+        TetherAnchor::FenceKnot {
+            dim,
+            pos,
+            knot_eid,
+        } => leash_knots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&knot_eid)
+            .then_some((
+                dim,
+                pos.0 as f64 + 0.5,
+                pos.1 as f64 + 0.5,
+                pos.2 as f64 + 0.5,
+            )),
+    }
+}
+
+/// Attach a tether and tell every tracker of the target the vanilla way:
+/// `0x59 SetEntityLink(attached, holding)`.
+fn attach_tether(tether: EntityTether) {
+    let holding = match tether.anchor {
+        TetherAnchor::Entity(eid) => eid,
+        TetherAnchor::FenceKnot { knot_eid, .. } => knot_eid,
+    };
+    let target = tether.target_eid;
+    entity_tethers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(target, tether);
+    broadcast_seen(target, move |_c| {
+        (0x59, set_entity_link_pkt(target, holding))
+    });
+}
+
+/// Detach `target_eid`: broadcast `0x59(target, -1)` and spawn
+/// `drop_item_on_break` at `drop_pos` when both are set (vanilla `dropLeash`
+/// spawns the lead at the entity). Returns the removed tether.
+fn detach_tether(target_eid: i32, drop_pos: Option<(f64, f64, f64)>) -> Option<EntityTether> {
+    let tether = entity_tethers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&target_eid)?;
+    broadcast_seen(target_eid, move |_c| {
+        (0x59, set_entity_link_pkt(target_eid, -1))
+    });
+    if let (Some(item), Some((x, y, z))) = (tether.drop_item_on_break, drop_pos) {
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x,
+            y,
+            z,
+            item: i64::from(item),
+            cnt: 1,
+            comps: Vec::new(),
+            age: 0,
+            target: None,
+            thrower: None,
+        });
+    }
+    Some(tether)
+}
+
+/// Detach every tether anchored to or targeting `eid` — the disconnect and
+/// mob-death cleanup. Leads drop where the tethered mob stands;
+/// `drop_pos_of_eid` supplies the position when `eid` itself is the target
+/// (its own record is already gone when this runs).
+fn detach_tethers_involving(eid: i32, drop_pos_of_eid: Option<(f64, f64, f64)>) {
+    let work: Vec<(i32, bool)> = {
+        let map = entity_tethers().lock().unwrap_or_else(|e| e.into_inner());
+        map.values()
+            .filter(|t| {
+                t.target_eid == eid
+                    || matches!(t.anchor, TetherAnchor::Entity(a) if a == eid)
+            })
+            .map(|t| (t.target_eid, t.target_eid == eid))
+            .collect()
+    };
+    for (target, is_self) in work {
+        let drop_at = if is_self {
+            drop_pos_of_eid
+        } else {
+            mob_tether_pos(target).map(|(_, x, y, z)| (x, y, z))
+        };
+        detach_tether(target, drop_at);
+    }
+}
+
+/// The knot entity sitting on `(dim, pos)`, if one is already spawned there.
+fn knot_eid_at(dim: DimId, pos: BlockPos) -> Option<i32> {
+    leash_knots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(_, &(d, p))| d == dim && p == pos)
+        .map(|(&eid, _)| eid)
+}
+
+/// Vanilla `LeashFenceKnotEntity.getOrCreateKnot`: reuse the knot already on
+/// the fence, or spawn one. Streaming to observers rides `interest_tick`.
+fn ensure_leash_knot(dim: DimId, pos: BlockPos) -> i32 {
+    if let Some(eid) = knot_eid_at(dim, pos) {
+        return eid;
+    }
+    let knot_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    leash_knots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(knot_eid, (dim, pos));
+    knot_eid
+}
+
+/// Vanilla `LeadItem.bindPlayerMobs`: move every tether this player holds onto
+/// the knot at `(dim, pos)`. Returns false when the player holds nothing —
+/// the right-click then falls through to the fence's normal behaviour.
+fn hitch_player_tethers(player_eid: i32, dim: DimId, pos: BlockPos) -> bool {
+    let held: Vec<i32> = entity_tethers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|t| t.anchor == TetherAnchor::Entity(player_eid))
+        .map(|t| t.target_eid)
+        .collect();
+    if held.is_empty() {
+        return false;
+    }
+    let knot_eid = ensure_leash_knot(dim, pos);
+    for target in held {
+        let mut map = entity_tethers().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = map.get_mut(&target) {
+            t.anchor = TetherAnchor::FenceKnot {
+                dim,
+                pos,
+                knot_eid,
+            };
+        }
+        drop(map);
+        broadcast_seen(target, move |_c| {
+            (0x59, set_entity_link_pkt(target, knot_eid))
+        });
+    }
+    true
+}
+
+/// `LeashFenceKnotEntity.hurt` / block loss: the knot dies, every tether it
+/// held detaches with its lead dropped at the mob, and the trackers get the
+/// `0x42` destroy for the knot itself.
+fn break_leash_knot(knot_eid: i32) -> bool {
+    if leash_knots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&knot_eid)
+        .is_none()
+    {
+        return false;
+    }
+    let anchored: Vec<i32> = entity_tethers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|t| matches!(t.anchor, TetherAnchor::FenceKnot { knot_eid: k, .. } if k == knot_eid))
+        .map(|t| t.target_eid)
+        .collect();
+    for target in anchored {
+        let drop_at = mob_tether_pos(target).map(|(_, x, y, z)| (x, y, z));
+        detach_tether(target, drop_at);
+    }
+    broadcast_seen_destroy(knot_eid);
+    true
+}
+
+/// `set_entity_data` (`0x58`) for the two custom-name slots vanilla writes in
+/// `Entity`: index 2 `Optional<TextComponent>` (serializer 6 — a boolean then
+/// the component tag) and index 3 `CustomNameVisible` (serializer 8 boolean).
+/// A bare `TAG_String` is the serialized form vanilla picks for a literal
+/// component without style or siblings.
+fn mob_custom_name_meta_pkt(eid: i32, name: &str) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, i64::from(eid));
+    p.push(2);
+    write_varint(&mut p, 6);
+    p.push(1);
+    p.extend_from_slice(&nbt_string(name));
+    p.push(3);
+    write_varint(&mut p, 8);
+    p.push(1);
+    p.push(0xff);
+    p
+}
+
+fn broadcast_mob_custom_name(eid: i32, name: &str) {
+    let pkt = mob_custom_name_meta_pkt(eid, name);
+    broadcast_seen(eid, move |_c| (0x58, pkt.clone()));
+}
+
+/// Move the tethered mob by `delta` and tell its trackers. The impulse goes
+/// through `vel` (vanilla `deltaMovement`) as well so a mob already in a fluid
+/// keeps the pull across `mob_fluid_travel_tick`; the land path is
+/// displacement-based, so the position is advanced here directly.
+fn tether_move(eid: i32, delta: [f64; 3]) {
+    let mob = {
+        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        mobs.iter().find(|m| m.eid == eid).cloned()
+    };
+    let Some(mob) = mob else { return };
+    {
+        let mut p = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        p.0 += delta[0];
+        p.1 += delta[1];
+        p.2 += delta[2];
+    }
+    let (x, y, z, yaw, pitch) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+    *mob.vel.lock().unwrap_or_else(|e| e.into_inner()) = delta;
+    let grounded = mob.dim == DimId::Overworld && mob_has_support(mob.etype, x, y, z);
+    broadcast_seen(eid, move |_c| {
+        (0x70, entity_teleport(eid, x, y, z, yaw, pitch, grounded))
+    });
+}
+
+/// Set the tethered mob's position outright (the non-breaking chain clamp).
+fn tether_set_pos(eid: i32, x: f64, y: f64, z: f64) {
+    let mob = {
+        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        mobs.iter().find(|m| m.eid == eid).cloned()
+    };
+    let Some(mob) = mob else { return };
+    let (.., yaw, pitch) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+    *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, yaw, pitch);
+    let grounded = mob.dim == DimId::Overworld && mob_has_support(mob.etype, x, y, z);
+    broadcast_seen(eid, move |_c| {
+        (0x70, entity_teleport(eid, x, y, z, yaw, pitch, grounded))
+    });
+}
+
+/// One tether's share of `Entity.tick` (`Leashable.tickLeash`): resolve both
+/// ends, snap or clamp past `max_length`, and inside the elastic band apply
+/// vanilla's per-axis impulse `copySign(d * d * 0.4, d)` where `d` is the unit
+/// direction from target to anchor.
+fn tether_step(tether: &EntityTether) {
+    let Some((tdim, tx, ty, tz)) = mob_tether_pos(tether.target_eid) else {
+        // The target is gone (death/unload): vanilla drops the leash where the
+        // holder was, so the lead lands at the anchor rather than nowhere.
+        let drop_at = tether_anchor_pos(&tether.anchor).map(|(_, x, y, z)| (x, y, z));
+        detach_tether(tether.target_eid, drop_at);
+        return;
+    };
+    let Some((adim, ax, ay, az)) = tether_anchor_pos(&tether.anchor) else {
+        // Holder gone without an eager cleanup path: drop the lead at the mob.
+        detach_tether(tether.target_eid, Some((tx, ty, tz)));
+        return;
+    };
+    if adim != tdim {
+        // Vanilla leashes never cross dimensions; the same snap applies.
+        detach_tether(tether.target_eid, Some((tx, ty, tz)));
+        return;
+    }
+    let (dx, dy, dz) = (ax - tx, ay - ty, az - tz);
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    if dist > tether.max_length {
+        if tether.break_on_stretch {
+            detach_tether(tether.target_eid, Some((tx, ty, tz)));
+        } else {
+            // Non-breaking chain: pull the entity cleanly back onto the
+            // max_length sphere, no snap and no item drop.
+            let scale = tether.max_length / dist;
+            tether_set_pos(
+                tether.target_eid,
+                ax - dx * scale,
+                ay - dy * scale,
+                az - dz * scale,
+            );
+        }
+    } else if dist > tether.elastic_start && dist > f64::EPSILON {
+        let impulse = |d: f64| 0.4 * d * d * d.signum();
+        tether_move(
+            tether.target_eid,
+            [
+                impulse(dx / dist),
+                impulse(dy / dist),
+                impulse(dz / dist),
+            ],
+        );
+    }
+}
+
+/// `LeashFenceKnotEntity.tick -> survives()`: a knot whose fence block is gone
+/// dies the same tick — `break_leash_knot` detaches every tether it held and
+/// destroys the entity on the wire. Iterated only while knots exist.
+fn leash_knot_survival_tick() {
+    let knots: Vec<(i32, DimId, BlockPos)> = leash_knots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(&eid, &(dim, pos))| (eid, dim, pos))
+        .collect();
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    for (eid, dim, (x, y, z)) in knots {
+        if !reg.name_of(block_at_dim(dim, x, y, z)).ends_with("_fence") {
+            break_leash_knot(eid);
+        }
+    }
+}
+
+/// The tether stage of `game_tick`. An empty table pays one lock and one
+/// `is_empty`: zero RNG draws, zero entity scans, and the empty-world digest
+/// stays byte-identical.
+fn tether_tick() {
+    let empty = entity_tethers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+        && leash_knots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+    if empty {
+        return;
+    }
+    leash_knot_survival_tick();
+    let tethers: Vec<EntityTether> = entity_tethers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .copied()
+        .collect();
+    for tether in &tethers {
+        tether_step(tether);
+    }
 }
 
 fn live_mob_interact(client: &Client, target: i32, slot: i16) -> bool {
@@ -2910,6 +3349,24 @@ fn live_mob_metadata(eid: i32, index: u8, kind: u8, value: u8) -> Vec<u8> {
 
 fn live_mob_spawn_packets(mob: &Mob) -> Vec<(i64, Vec<u8>)> {
     let mut packets = vec![(0x01, spawn_mob(mob))];
+    if let Some(name) = mob_custom_names()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&mob.eid)
+    {
+        packets.push((0x58, mob_custom_name_meta_pkt(mob.eid, name)));
+    }
+    if let Some(tether) = entity_tethers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&mob.eid)
+    {
+        let holding = match tether.anchor {
+            TetherAnchor::Entity(eid) => eid,
+            TetherAnchor::FenceKnot { knot_eid, .. } => knot_eid,
+        };
+        packets.push((0x59, set_entity_link_pkt(mob.eid, holding)));
+    }
     if let Some(state) = live_mob_states().lock().unwrap().get(&mob.eid) {
         match &state.behavior {
             Some(MobBehaviorState::Slime { behavior, .. }) => {
@@ -4378,6 +4835,10 @@ fn mob_tick() {
         w1_wool_colors()
             .lock()
             .unwrap()
+            .retain(|eid, _| alive.contains(eid));
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|eid, _| alive.contains(eid));
         mobs.clone()
     };
@@ -14594,6 +15055,9 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("vehicles", w1_vehicle_tick);
     run("falling", falling_tick);
     run("mobs", mob_tick);
+    // `Leashable.tickLeash` runs inside `Entity.tick`; an empty tether table
+    // makes the stage a one-lock no-op.
+    run("tethers", tether_tick);
     run("furnaces", furnace_tick);
     run("hoppers", hopper_tick);
     run("brewing", live_brewing_tick);
@@ -18589,5 +19053,380 @@ mod xplat2_tests {
             "filled buffer must not stay zeroed"
         );
         assert_ne!(a, b, "two consecutive draws must differ");
+    }
+}
+
+#[cfg(test)]
+mod vanilla_leash_tests {
+    use super::*;
+
+    fn vl_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    fn vl_spawn_mob(etype: i64, pos: (f64, f64, f64)) -> Arc<Mob> {
+        let mob = new_live_mob(etype, DimId::Overworld, (pos.0, pos.1, pos.2, 0.0, 0.0), 8.0, None);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(mob.clone());
+        mob
+    }
+
+    /// A registered, tracking client: in `clients()` with the entity marked
+    /// `seen` so the broadcast helpers write onto its socket pair.
+    fn vl_client(eid: i32, pos: (f64, f64, f64)) -> (Arc<Client>, TcpStream) {
+        let (mut client, peer) = effect_tests::client_pair();
+        client.eid = eid;
+        client.pos = Mutex::new((pos.0, pos.1, pos.2, 0.0, 0.0, true));
+        let client = Arc::new(client);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+        (client, peer)
+    }
+
+    struct VlCleanup {
+        eids: Vec<i32>,
+        client_eids: Vec<i32>,
+    }
+    impl std::ops::Drop for VlCleanup {
+        fn drop(&mut self) {
+            for &eid in &self.eids {
+                mobs()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|m| m.eid != eid);
+                live_mob_states()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&eid);
+                mob_custom_names()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&eid);
+            }
+            entity_tethers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            leash_knots()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            drops()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
+            for &eid in &self.client_eids {
+                cls.retain(|c| c.eid != eid);
+            }
+        }
+    }
+
+    fn vl_read(peer: &mut TcpStream) -> (i64, Vec<u8>) {
+        read_packet(peer, vl_deadline()).expect("expected a packet on the wire")
+    }
+
+    #[test]
+    fn vanilla_leash_set_entity_link_wire_bytes() {
+        // Protocol 767 `set_entity_link` (`0x59`): two big-endian i32s,
+        // attached then holding; -1 is the detach form.
+        assert_eq!(
+            set_entity_link_pkt(0x0102_0304, 0x0506_0708),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            set_entity_link_pkt(0x0102_0304, -1),
+            vec![1, 2, 3, 4, 0xff, 0xff, 0xff, 0xff]
+        );
+    }
+
+    #[test]
+    fn vanilla_leash_attach_pull_snap_and_drop() {
+        let _world_guard = world_guard();
+        let mob = vl_spawn_mob(22, (0.0, 70.0, 8.0)); // cow, 8 blocks out
+        let (client, mut peer) = vl_client(42420, (0.0, 70.0, 0.0));
+        client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(mob.eid);
+        let _cleanup = VlCleanup {
+            eids: vec![mob.eid],
+            client_eids: vec![client.eid],
+        };
+        let lead = name_to_item("lead").unwrap();
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (lead, 2, Vec::new()));
+
+        // Right-click with a lead: tether to the player, wire 0x59(mob, player),
+        // one lead consumed in survival (the slot resync packet trails it).
+        assert!(leash_name_tag_interact(&client, mob.eid, 36));
+        assert_eq!(
+            vl_read(&mut peer),
+            (0x59, set_entity_link_pkt(mob.eid, client.eid))
+        );
+        let (id, _) = vl_read(&mut peer); // 0x15 slot resync for the spent lead
+        assert_eq!(id, 0x15);
+        assert_eq!(
+            client
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .map(|s| s.1),
+            Some(1)
+        );
+        {
+            let tethers = entity_tethers().lock().unwrap_or_else(|e| e.into_inner());
+            let t = tethers.get(&mob.eid).expect("tether recorded");
+            assert_eq!(t.anchor, TetherAnchor::Entity(client.eid));
+            assert_eq!((t.max_length, t.elastic_start), (10.0, 6.0));
+            assert!(t.break_on_stretch);
+            assert_eq!(t.drop_item_on_break, Some(lead as i32));
+        }
+
+        // At 8 blocks the elastic band applies the vanilla impulse
+        // copySign(d^2 * 0.4, d): one tick pulls 0.4 toward the holder.
+        tether_tick();
+        {
+            let p = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                (p.2 - 7.6).abs() < 1e-9,
+                "elastic pull must move the mob 0.4 blocks, got z={}",
+                p.2
+            );
+            assert_eq!(*mob.vel.lock().unwrap_or_else(|e| e.into_inner()), [0.0, 0.0, -0.4]);
+        }
+        let (id, _) = vl_read(&mut peer); // 0x70 teleport for the pull
+        assert_eq!(id, 0x70);
+
+        // Past the 10-block lead it snaps: detach on the wire and a lead drop
+        // at the mob's position.
+        *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 70.0, 11.0, 0.0, 0.0);
+        tether_tick();
+        assert!(entity_tethers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        assert_eq!(vl_read(&mut peer), (0x59, set_entity_link_pkt(mob.eid, -1)));
+        let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(ds.len(), 1);
+        assert_eq!((ds[0].item, ds[0].cnt), (lead, 1));
+        assert_eq!((ds[0].x, ds[0].y, ds[0].z), (0.0, 70.0, 11.0));
+    }
+
+    #[test]
+    fn vanilla_leash_chain_tether_clamps_at_max_length() {
+        let _world_guard = world_guard();
+        let mob = vl_spawn_mob(22, (20.0, 70.0, 0.0));
+        let (client, _peer) = vl_client(42421, (0.0, 70.0, 0.0));
+        let _cleanup = VlCleanup {
+            eids: vec![mob.eid],
+            client_eids: vec![client.eid],
+        };
+        entity_tethers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                mob.eid,
+                EntityTether {
+                    target_eid: mob.eid,
+                    anchor: TetherAnchor::Entity(client.eid),
+                    max_length: 14.0,
+                    elastic_start: 6.0,
+                    break_on_stretch: false,
+                    drop_item_on_break: None,
+                },
+            );
+        tether_tick();
+        // 20 > 14, non-breaking: pulled onto the 14-block sphere, still held.
+        let p = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert!((p.0 - 14.0).abs() < 1e-9, "clamped to max_length, x={}", p.0);
+        assert!(entity_tethers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&mob.eid));
+        assert!(drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        // A second tick at exactly max_length leaves the tether intact.
+        tether_tick();
+        assert!(entity_tethers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&mob.eid));
+    }
+
+    #[test]
+    fn vanilla_leash_fence_hitch_reanchors_and_knot_break_detaches() {
+        let _world_guard = world_guard();
+        let mob = vl_spawn_mob(87, (2.0, 70.0, 2.0)); // sheep
+        let (client, mut peer) = vl_client(42422, (0.0, 70.0, 0.0));
+        {
+            let mut seen = client.seen.lock().unwrap_or_else(|e| e.into_inner());
+            seen.insert(mob.eid);
+        }
+        let _cleanup = VlCleanup {
+            eids: vec![mob.eid],
+            client_eids: vec![client.eid],
+        };
+        attach_tether(vanilla_lead_tether(
+            mob.eid,
+            TetherAnchor::Entity(client.eid),
+        ));
+        assert_eq!(
+            vl_read(&mut peer),
+            (0x59, set_entity_link_pkt(mob.eid, client.eid))
+        );
+
+        // Hitch to a fence: one knot entity is created at the block and the
+        // tether re-anchors to it on the wire.
+        assert!(hitch_player_tethers(client.eid, DimId::Overworld, (5, 70, 5)));
+        let knot = knot_eid_at(DimId::Overworld, (5, 70, 5)).expect("knot spawned");
+        client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(knot);
+        assert_eq!(
+            vl_read(&mut peer),
+            (0x59, set_entity_link_pkt(mob.eid, knot))
+        );
+        {
+            let tethers = entity_tethers().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                tethers.get(&mob.eid).map(|t| t.anchor),
+                Some(TetherAnchor::FenceKnot {
+                    dim: DimId::Overworld,
+                    pos: (5, 70, 5),
+                    knot_eid: knot,
+                })
+            );
+        }
+        // A second hitch reuses the knot rather than spawning another.
+        attach_tether(vanilla_lead_tether(
+            mob.eid,
+            TetherAnchor::Entity(client.eid),
+        ));
+        let _ = vl_read(&mut peer);
+        assert!(hitch_player_tethers(client.eid, DimId::Overworld, (5, 70, 5)));
+        assert_eq!(knot_eid_at(DimId::Overworld, (5, 70, 5)), Some(knot));
+        let _ = vl_read(&mut peer); // re-anchor 0x59
+
+        // Breaking the knot detaches the tether, drops the lead at the mob and
+        // destroys the knot entity for its trackers.
+        assert!(break_leash_knot(knot));
+        assert!(entity_tethers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        assert_eq!(vl_read(&mut peer), (0x59, set_entity_link_pkt(mob.eid, -1)));
+        assert_eq!(
+            vl_read(&mut peer),
+            (0x42, remove_entities_payload(&[knot]))
+        );
+        let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].item, name_to_item("lead").unwrap());
+    }
+
+    #[test]
+    fn vanilla_leash_name_tag_renames_and_consumes() {
+        let _world_guard = world_guard();
+        let mob = vl_spawn_mob(77, (1.0, 70.0, 1.0)); // pig
+        let (client, mut peer) = vl_client(42423, (0.0, 70.0, 0.0));
+        client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(mob.eid);
+        let _cleanup = VlCleanup {
+            eids: vec![mob.eid],
+            client_eids: vec![client.eid],
+        };
+        let tag = name_to_item("name_tag").unwrap();
+        // An unrenamed tag does nothing.
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (tag, 1, Vec::new()));
+        assert!(!leash_name_tag_interact(&client, mob.eid, 36));
+        // A renamed tag applies the custom name and is consumed in survival.
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (tag, 1, vec![(COMP_CUSTOM_NAME, nbt_string("Bessie"))]));
+        assert!(leash_name_tag_interact(&client, mob.eid, 36));
+        assert_eq!(
+            mob_custom_names()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&mob.eid)
+                .cloned(),
+            Some("Bessie".to_string())
+        );
+        let (id, body) = vl_read(&mut peer);
+        assert_eq!(id, 0x58);
+        assert_eq!(body, mob_custom_name_meta_pkt(mob.eid, "Bessie"));
+        // Slot 2 (Optional<TextComponent>, serializer 6) carries the name;
+        // slot 3 (boolean) marks it always visible.
+        let mut sl = &body[..];
+        let _eid = read_varint(&mut sl).unwrap();
+        assert_eq!(&sl[..4], &[2, 6, 1, 8]);
+        let name_len = u16::from_be_bytes(sl[4..6].try_into().unwrap()) as usize;
+        assert_eq!(&sl[6..6 + name_len], b"Bessie");
+        assert_eq!(&sl[6 + name_len..], &[3, 8, 1, 0xff]);
+        assert!(client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&36)
+            .is_none());
+    }
+
+    #[test]
+    fn vanilla_leash_disconnect_detaches_held_leads() {
+        let _world_guard = world_guard();
+        let mob = vl_spawn_mob(22, (4.0, 70.0, 4.0));
+        let (client, mut peer) = vl_client(42424, (0.0, 70.0, 0.0));
+        client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(mob.eid);
+        let _cleanup = VlCleanup {
+            eids: vec![mob.eid],
+            client_eids: vec![client.eid],
+        };
+        attach_tether(vanilla_lead_tether(
+            mob.eid,
+            TetherAnchor::Entity(client.eid),
+        ));
+        assert_eq!(
+            vl_read(&mut peer),
+            (0x59, set_entity_link_pkt(mob.eid, client.eid))
+        );
+        // The disconnect path calls detach_tethers_involving: held leads
+        // detach with the wire form and drop at the mob.
+        detach_tethers_involving(client.eid, None);
+        assert!(entity_tethers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        assert_eq!(vl_read(&mut peer), (0x59, set_entity_link_pkt(mob.eid, -1)));
+        let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].item, name_to_item("lead").unwrap());
+        assert_eq!((ds[0].x, ds[0].y, ds[0].z), (4.0, 70.0, 4.0));
     }
 }
