@@ -1,19 +1,12 @@
 <!DOCTYPE html>
 <!-- SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later -->
-<!--
-  Zero-build, zero-CDN landing page for mc-spine.
-  Works straight from GitHub Pages or file:// — no build step, no external
-  fonts or scripts. Every brand mention and CLI example binds dynamically
-  from window.SITE_CONFIG (site-config.js); the static text in this file is
-  the no-JS fallback and stays readable on its own.
--->
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>mc-spine — Rust-native Minecraft server &amp; client runtime</title>
+  <title>Megu — Minecraft-compatible engine written in Rust</title>
   <meta name="description"
-        content="mc-spine is an experimental Rust-native Minecraft server & client runtime with tiered NeoForge/Fabric mod compatibility and Velocity forwarding support.">
+        content="Megu (codename mc-spine) is an experimental Minecraft-compatible server and client engine written in Rust for Java Edition 1.21.1 and 26.3.">
   <link rel="stylesheet" href="style.css">
   <script src="site-config.js"></script>
   <script src="app.js" defer></script>
@@ -22,15 +15,12 @@
 
   <header class="nav">
     <div class="nav-inner">
-      <a class="brand" href="#top">
-        <span class="logo-mark">&gt;_</span>
-        <span data-cfg="projectName">mc-spine</span>
-      </a>
-      <span class="badge" data-cfg="statusBadge">Experimental Alpha</span>
-      <nav class="nav-links">
-        <a href="#checker">Pre-flight</a>
+      <a class="brand" href="#top" data-cfg="projectName">Megu</a>
+      <span class="status-tag" data-cfg="statusBadge">Experimental Alpha</span>
+      <nav class="nav-links" aria-label="Primary">
         <a href="#quickstart">Quickstart</a>
-        <a href="#architecture">Architecture</a>
+        <a href="#checker">Modpack check</a>
+        <a href="#compatibility">Compatibility</a>
         <a href="https://github.com/nekomario28/mc-spine"
            data-cfg-href="githubUrl">GitHub</a>
       </nav>
@@ -39,66 +29,104 @@
 
   <main id="top">
 
-    <!-- ================= Hero ================= -->
     <section class="hero">
       <div class="wrap">
-        <span class="badge" data-cfg="statusBadge">Experimental Alpha</span>
-        <h1><span data-cfg="projectName">mc-spine</span><span class="accent">.</span></h1>
-        <p class="value-prop" data-cfg="valueProp">A Rust-native Minecraft server &amp; client runtime with tiered NeoForge/Fabric mod compatibility and Velocity forwarding support.</p>
-        <div class="pills" id="target-pills">
-          <span class="pill"><span class="dot"></span>1.21.1 <span class="pill-tag">LTS</span></span>
-          <span class="pill latest"><span class="dot"></span>26.3 <span class="pill-tag">Latest</span></span>
+        <h1 data-cfg="projectName">Megu</h1>
+        <p class="lead" data-cfg="valueProp">A Rust-native Minecraft server &amp; client runtime with tiered NeoForge/Fabric mod compatibility and Velocity forwarding support.</p>
+        <div class="meta-row">
+          <div class="pills" id="target-pills">
+            <span class="pill">1.21.1 <span class="pill-tag">LTS</span></span>
+            <span class="pill latest">26.3 <span class="pill-tag">Latest</span></span>
+          </div>
+          <span class="meta-sep" aria-hidden="true">·</span>
+          <span class="meta-item">GPL-3.0-or-later</span>
+          <span class="meta-sep" aria-hidden="true">·</span>
+          <span class="meta-item">Zero Mojang assets bundled</span>
         </div>
         <div class="hero-actions">
-          <a class="btn primary" href="#quickstart">Quickstart</a>
-          <a class="btn" href="#checker">Try the pre-flight checker</a>
+          <a class="btn primary" href="#quickstart">Get started</a>
           <a class="btn" href="https://github.com/nekomario28/mc-spine"
-             data-cfg-href="githubUrl">GitHub ↗</a>
+             data-cfg-href="githubUrl">Source on GitHub</a>
         </div>
       </div>
     </section>
 
-    <!-- ============ Modpack pre-flight checker ============ -->
+    <section id="quickstart">
+      <div class="wrap">
+        <h2>Quickstart</h2>
+        <div class="steps">
+          <div class="step">
+            <div class="step-label">1. Initialize a server directory</div>
+            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-init init --dir ./server --mc-version 1.21.1">mc-spine-init init --dir ./server --mc-version 1.21.1</code></pre>
+          </div>
+          <div class="step">
+            <div class="step-label">2. Check a modpack before launch</div>
+            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-mod-check --modpack ./my-pack.mrpack --mc-version 1.21.1">mc-spine-mod-check --modpack ./my-pack.mrpack --mc-version 1.21.1</code></pre>
+          </div>
+          <div class="step">
+            <div class="step-label">3. Accept eula.txt and start</div>
+            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="cd ./server &amp;&amp; {{cli}}">cd ./server &amp;&amp; mc-spine</code></pre>
+          </div>
+        </div>
+
+        <details class="more-cmds">
+          <summary>Docker, world migration, server ping &amp; source build</summary>
+          <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="# Docker (requires explicit EULA=TRUE)
+docker build -f docker/Dockerfile -t {{cli}}:alpha .
+docker run --name {{cli}} -e EULA=TRUE -p 25565:25565 -v {{cli}}-data:/data {{cli}}:alpha
+
+# Inspect or migrate a world between 1.21.1 and 26.3
+{{cli}}-world-migrate inspect-anvil ./world
+{{cli}}-world-migrate migrate-level --in ./world/level.dat --out ./world/level.dat --to 26.3 --backup-old
+
+# Probe a running server (SRV-aware, 1.21.1 or 26.3)
+{{cli}}-client --ping localhost:25565
+
+# Build from source (Rust 1.98.0)
+cargo run --locked"># Docker (requires explicit EULA=TRUE)
+docker build -f docker/Dockerfile -t mc-spine:alpha .
+docker run --name mc-spine -e EULA=TRUE -p 25565:25565 -v mc-spine-data:/data mc-spine:alpha
+
+# Inspect or migrate a world between 1.21.1 and 26.3
+mc-spine-world-migrate inspect-anvil ./world
+mc-spine-world-migrate migrate-level --in ./world/level.dat --out ./world/level.dat --to 26.3 --backup-old
+
+# Probe a running server (SRV-aware, 1.21.1 or 26.3)
+mc-spine-client --ping localhost:25565
+
+# Build from source (Rust 1.98.0)
+cargo run --locked</code></pre>
+        </details>
+      </div>
+    </section>
+
     <section id="checker">
       <div class="wrap">
-        <p class="section-kicker">100% browser-local</p>
-        <h2>Modpack pre-flight checker</h2>
-        <p class="section-lede">
-          Drop a Modrinth <code>.mrpack</code> or a CurseForge
-          <code>.zip</code> — or a bare <code>modrinth.index.json</code> /
-          <code>manifest.json</code> — and see instantly how
-          <span data-cfg="projectName">mc-spine</span> would treat the pack:
-          which performance mods are already built in and skipped, which
-          entries run natively, and which Java JARs still need a
-          compatibility inspection. Same logic as
-          <code>mod-adapter-core/src/modpack.rs</code> — running entirely in
-          your browser. Nothing is uploaded, ever.
-        </p>
+        <div class="section-head">
+          <h2>Modpack check</h2>
+          <p class="section-note">Runs locally in this tab — nothing is uploaded.</p>
+        </div>
 
         <div class="checker">
           <div class="checker-controls">
-            <button class="btn small" id="sample-pack-btn" type="button">
-              Try Sample 1.21.1 Create + Perf-Mod Pack
-            </button>
             <label class="target-select">
-              Server target
+              Target
               <select id="mc-target-select">
                 <option value="1.21.1" selected>1.21.1</option>
                 <option value="26.3">26.3</option>
               </select>
             </label>
+            <button class="btn small" id="sample-pack-btn" type="button">
+              Load sample pack
+            </button>
           </div>
 
           <div class="dropzone" id="dropzone" role="button" tabindex="0"
                aria-label="Drop a modpack archive or manifest here or click to browse">
-            <strong>Drop a <code>.mrpack</code>, CurseForge <code>.zip</code>, or manifest <code>.json</code> here</strong>
-            <span class="hint">or click to browse — archives are unpacked right in this tab</span>
+            <strong>Drop a <code>.mrpack</code>, CurseForge <code>.zip</code>, or manifest <code>.json</code></strong>
+            <span class="hint">or click to browse</span>
             <input type="file" id="file-input" accept=".mrpack,.zip,.json" hidden>
           </div>
-          <p class="privacy-note">
-            Analysis runs 100% client-side in vanilla JS — the modpack never
-            leaves this tab.
-          </p>
 
           <div class="checker-error" id="checker-error" role="alert"></div>
 
@@ -108,13 +136,13 @@
             <div class="entries-table-wrap">
               <table class="entries-table">
                 <thead>
-                  <tr><th>Path</th><th>Mod id</th><th>Class</th><th>Note</th></tr>
+                  <tr><th>Path</th><th>Mod</th><th>Handling</th><th>Note</th></tr>
                 </thead>
                 <tbody id="entries-body"></tbody>
               </table>
             </div>
             <details class="report-details">
-              <summary>Raw report JSON (<code>mc-spine-modpack-preflight/1</code> schema) and operator summary</summary>
+              <summary>JSON report &amp; plain-text summary</summary>
               <pre class="code"><button class="copy-btn" type="button">copy</button><code id="report-json"></code></pre>
               <pre class="code"><button class="copy-btn" type="button">copy</button><code id="report-summary"></code></pre>
             </details>
@@ -123,228 +151,58 @@
       </div>
     </section>
 
-    <!-- ================= Quickstart ================= -->
-    <section id="quickstart">
+    <section id="compatibility">
       <div class="wrap">
-        <p class="section-kicker">Quickstart</p>
-        <h2>Three commands to a running server</h2>
-        <p class="section-lede">
-          Release binaries ship the whole toolchain. Scaffold a server
-          directory, pre-flight a modpack, launch.
-        </p>
+        <h2>Compatibility &amp; current scope</h2>
 
-        <div class="steps">
-          <div class="step">
-            <h3>1 · Scaffold</h3>
-            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-init init --dir ./server --mc-version 1.21.1">mc-spine-init init --dir ./server --mc-version 1.21.1</code></pre>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Mod execution</h3>
+            <dl class="spec-list">
+              <dt>Auto-skipped performance mods</dt>
+              <dd>Recognizes 36 common client/server optimization mods (such as Sodium, Lithium, ModernFix, Distant Horizons) and skips loading them because equivalent behavior is built in natively.</dd>
+              <dt>Native &amp; data-driven mods</dt>
+              <dd>Datapacks, resource packs, Create kinetics/contraptions, Farmer's Delight &amp; culinary addons, and OpenPAC/FTB Chunks claims run in Rust without a JVM.</dd>
+              <dt>Standard Java mods &amp; fallback</dt>
+              <dd>Standard NeoForge/Fabric mods run via a bounded bridge; heavy Mixin mods either stay quarantined or delegate safely to upstream NeoForge.</dd>
+            </dl>
           </div>
-          <div class="step">
-            <h3>2 · Pre-flight a modpack</h3>
-            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-mod-check --modpack ./packs/my-pack.mrpack --mc-version 1.21.1">mc-spine-mod-check --modpack ./packs/my-pack.mrpack --mc-version 1.21.1</code></pre>
-          </div>
-          <div class="step">
-            <h3>3 · Run</h3>
-            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="cd ./server &amp;&amp; {{cli}}">cd ./server &amp;&amp; mc-spine</code></pre>
+
+          <div class="card">
+            <h3>Server &amp; client status</h3>
+            <dl class="spec-list">
+              <dt>Working today</dt>
+              <dd>Vanilla 1.21.1 protocol, worldgen parity, online-mode auth, Velocity modern forwarding, RCON, ops/bans/whitelist, autosave &amp; backups, and 26.3 wire/migration tooling.</dd>
+              <dt>In progress</dt>
+              <dd>Full vanilla combat/gamerule parity, native Anvil live storage, standalone GPU client rendering, and broader live mod coverage.</dd>
+              <dt>Out of scope</dt>
+              <dd>Bukkit/Spigot/Paper plugins (use Velocity proxy plugins or NeoForge/Fabric mods instead).</dd>
+            </dl>
           </div>
         </div>
-
-        <details class="more-cmds">
-          <summary>More commands — world migration, client ping, dev build</summary>
-          <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="# Migrate a saved world to the latest target
-{{cli}}-world-migrate migrate --in world.stv1 --out world-26_3.stv1 --to 26.3
-
-# Ping a running server (SRV-aware)
-{{cli}}-client --ping localhost:25565
-
-# From a source checkout (Rust 1.98.0, pinned via rust-toolchain.toml)
-cargo run --locked"># Migrate a saved world to the latest target
-mc-spine-world-migrate migrate --in world.stv1 --out world-26_3.stv1 --to 26.3
-
-# Ping a running server (SRV-aware)
-mc-spine-client --ping localhost:25565
-
-# From a source checkout (Rust 1.98.0, pinned via rust-toolchain.toml)
-cargo run --locked</code></pre>
-        </details>
-
-        <h3 class="sub">Docker</h3>
-        <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="docker build -f docker/Dockerfile -t {{cli}}:alpha .
-docker run --name {{cli}} -e EULA=TRUE -p 25565:25565 \
-    -v {{cli}}-data:/data {{cli}}:alpha">docker build -f docker/Dockerfile -t mc-spine:alpha .
-docker run --name mc-spine -e EULA=TRUE -p 25565:25565 \
-    -v mc-spine-data:/data mc-spine:alpha</code></pre>
-        <p class="privacy-note">
-          The image ships no Mojang data and refuses to start without
-          <code>EULA=TRUE</code>. Optional <code>MC_SPINE_MODPACK</code> runs
-          the same pre-flight the checker above demonstrates.
-        </p>
       </div>
     </section>
 
-    <!-- ============ Architecture & honest scope ============ -->
-    <section id="architecture">
-      <div class="wrap">
-        <p class="section-kicker">Architecture</p>
-        <h2>4-tier mod execution</h2>
-        <p class="section-lede">
-          Every mod JAR and datapack is classified before launch. Redundant
-          performance mods are recognized up front and skipped so their
-          Mixins can never force a JVM fallback.
-        </p>
-        <div class="tbl-wrap">
-          <table class="tbl">
-            <thead>
-              <tr><th>Tier</th><th>Name</th><th>How it runs</th></tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td class="tier-name">Tier 0</td>
-                <td>Native Flagship</td>
-                <td>Dedicated Rust adapter — zero JVM. Ships with a
-                  <code>create</code> adapter; more flagships planned.</td>
-              </tr>
-              <tr>
-                <td class="tier-name">Tier 1</td>
-                <td>Universal Native</td>
-                <td>Pure-data or declarative offload profile — datapacks,
-                  resourcepacks, configs, profiled mods. Zero JVM.</td>
-              </tr>
-              <tr>
-                <td class="tier-name">Tier 2</td>
-                <td>Bounded JVM Shim</td>
-                <td>ShimCheck-verified NeoForge/Fabric bytecode inside a
-                  bounded S0–S4 sandbox with direct batch + offload.</td>
-              </tr>
-              <tr>
-                <td class="tier-name">Tier 3</td>
-                <td>Quarantine / NeoForge Fallback</td>
-                <td>Unsupported Mixin/AT or unknown
-                  <code>net.minecraft.*</code> surface — quarantined under a
-                  Save&nbsp;v2 integrity guard, or delegated to the pinned
-                  upstream NeoForge runtime.</td>
-              </tr>
-              <tr>
-                <td class="tier-name">Auto-skipped</td>
-                <td>Built-in optimizations</td>
-                <td><code>sodium</code>, <code>lithium</code>,
-                  <code>modernfix</code>, <code>distanthorizons</code> and
-                  32 more perf mods whose optimization surface
-                  <span data-cfg="projectName">mc-spine</span> already
-                  implements natively — recognized before ShimCheck and
-                  skipped automatically.</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3 class="sub">What works / what's experimental — honestly</h3>
-        <div class="tbl-wrap">
-          <table class="tbl">
-            <thead>
-              <tr><th>Status</th><th>Area</th><th>Notes</th></tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td class="status ok">Verified</td>
-                <td>Worldgen &amp; protocol parity</td>
-                <td><small>Fixed-seed / chunk / stage oracle comparisons
-                  against vanilla 1.21.1, plus the 26.3 wire target.</small></td>
-              </tr>
-              <tr>
-                <td class="status ok">Verified</td>
-                <td>Modpack pre-flight</td>
-                <td><small>Modrinth <code>.mrpack</code> + CurseForge
-                  <code>manifest.json</code> analysis — the same code the
-                  checker above runs.</small></td>
-              </tr>
-              <tr>
-                <td class="status ok">Verified</td>
-                <td>Velocity forwarding</td>
-                <td><small>Modern forwarding supported; run
-                  <span data-cfg="projectName">mc-spine</span> behind a
-                  Velocity proxy.</small></td>
-              </tr>
-              <tr>
-                <td class="status exp">Experimental</td>
-                <td>Mod compatibility</td>
-                <td><small>Tier 0 flagship <code>create</code>, Tier 1
-                  profiles and the Tier 2 bounded shim are alpha; arbitrary
-                  mods are <em>not</em> guaranteed.</small></td>
-              </tr>
-              <tr>
-                <td class="status exp">Experimental</td>
-                <td>M2/M3 full parity</td>
-                <td><small>Full session parity (rendering, complete client
-                  loop) is still in progress — this is an alpha
-                  runtime.</small></td>
-              </tr>
-              <tr>
-                <td class="status no">Not this</td>
-                <td>Bukkit/Paper plugins</td>
-                <td><small><span data-cfg="projectName">mc-spine</span> is
-                  not a plugin server like Mohist — no Bukkit API. Mods go
-                  through the 4-tier pipeline instead.</small></td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3 class="sub">Clean-room &amp; licensing</h3>
-        <div class="tbl-wrap">
-          <table class="tbl">
-            <tbody>
-              <tr>
-                <td class="status">License</td>
-                <td>Root distribution <code>GPL-3.0-or-later</code>;
-                  first-party subcrates triple-licensed
-                  <code>LGPL-3.0-or-later OR GPL-3.0-or-later OR
-                  AGPL-3.0-or-later</code> so the shared kernel can move
-                  freely between them.</td>
-              </tr>
-              <tr>
-                <td class="status">Clean-room</td>
-                <td>Every built-in optimization is an original Rust
-                  implementation. Mod-id matching only decides whether a
-                  user-supplied JAR is loaded or skipped — no third-party
-                  mod code, shaders, or assets are copied, linked, bundled,
-                  or ported. No affiliation with any named optimization mod
-                  is claimed.</td>
-              </tr>
-              <tr>
-                <td class="status">Assets</td>
-                <td>Zero Mojang assets bundled — runtime data is regenerated
-                  from the operator's own <code>server.jar</code>. Zero
-                  copied PolyForm / all-rights-reserved code.</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </section>
   </main>
 
   <footer>
     <div class="wrap">
-      <div class="foot-grid">
+      <div class="foot-row">
         <div>
-          <strong data-cfg="projectName">mc-spine</strong> —
-          <span data-cfg="statusBadge">Experimental Alpha</span><br>
-          <span data-cfg="tagline">A Rust-native Minecraft server &amp; client runtime</span>
+          <strong data-cfg="projectName">Megu</strong> ·
+          <span data-cfg="tagline">A Minecraft-compatible engine written in Rust (codename: mc-spine)</span>
         </div>
-        <div>
-          <a href="https://github.com/nekomario28/mc-spine"
-             data-cfg-href="githubUrl">Repository</a> ·
-          <a href="https://github.com/nekomario28/mc-spine/releases"
-             data-cfg-href="releasesUrl">Releases</a> ·
-          <a href="https://github.com/nekomario28/mc-spine/tree/main/docs"
-             data-cfg-href="docsBaseUrl">Docs</a>
+        <div class="foot-links">
+          <a href="https://github.com/nekomario28/mc-spine" data-cfg-href="githubUrl">GitHub</a>
+          <a href="https://github.com/nekomario28/mc-spine/releases" data-cfg-href="releasesUrl">Releases</a>
+          <a href="https://github.com/nekomario28/mc-spine/tree/main/docs" data-cfg-href="docsBaseUrl">Docs</a>
         </div>
       </div>
+      <p class="foot-legal">
+        Clean-room Rust implementation. Root licensed <code>GPL-3.0-or-later</code>; first-party crates <code>LGPL/GPL/AGPL-3.0-or-later</code>.
+        No Mojang files or third-party mod code bundled; not an official Minecraft product.
+      </p>
       <p class="deploy-note" id="deploy-note"></p>
-      <p class="deploy-note visible" id="brand-note">
-        Rebranding? Edit <code>website/site-config.js</code> — one file
-        controls every brand mention, CLI prefix, link, and domain on this
-        page.</p>
     </div>
   </footer>
 
