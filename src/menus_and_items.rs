@@ -7716,17 +7716,37 @@ fn slot_wire(s: &Stack) -> Vec<u8> {
     write_varint(&mut p, s.1 as i64);
     if s.1 > 0 {
         write_varint(&mut p, s.0);
-        write_varint(&mut p, s.2.len() as i64);
-        write_varint(&mut p, 0);
-        for (ty, data) in &s.2 {
-            write_varint(&mut p, *ty);
-            p.extend_from_slice(data);
+        // Removed default components have no payload in the protocol. Preserve
+        // them as an internal, negative-id entry without changing Stack's API.
+        let removed = comp_get(&s.2, SLOT_REMOVED_COMPONENTS).unwrap_or_default();
+        let mut ids = removed;
+        let mut removed_count = 0;
+        while !ids.is_empty() {
+            if read_protocol_i32(&mut ids).is_none() {
+                break;
+            }
+            removed_count += 1;
         }
+        write_varint(&mut p, s.2.iter().filter(|(ty, _)| *ty >= 0).count() as i64);
+        write_varint(&mut p, removed_count);
+        for (ty, data) in &s.2 {
+            if *ty >= 0 {
+                write_varint(&mut p, *ty);
+                p.extend_from_slice(data);
+            }
+        }
+        p.extend_from_slice(removed);
     }
     p
 }
-// wire-format slot decode (1.21.1 structured components). Unknown comp
-// ids are rejected because their payload boundary is type-specific.
+// The on-wire removed-component list is stored as raw VarInts under this
+// private marker. Component type ids in protocol 767 are all non-negative.
+const SLOT_REMOVED_COMPONENTS: i64 = -1;
+const SLOT_COMPONENT_TYPE_COUNT: i64 = 57;
+
+// Protocol 767 data-component boundaries. Keep each payload's original bytes
+// (including non-canonical VarInts and NBT) instead of decoding and rebuilding
+// values. The typed readers only establish where the next component begins.
 fn slot_read_varint(b: &[u8], p: &mut usize) -> Option<i64> {
     let mut rest = b.get(*p..)?;
     let value = read_protocol_i32(&mut rest)?;
@@ -7734,151 +7754,405 @@ fn slot_read_varint(b: &[u8], p: &mut usize) -> Option<i64> {
     Some(i64::from(value))
 }
 
-fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
-    if b.len() < 2 {
+fn slot_read_bytes(b: &[u8], p: &mut usize, len: usize) -> Option<()> {
+    let end = (*p).checked_add(len)?;
+    b.get(*p..end)?;
+    *p = end;
+    Some(())
+}
+
+fn slot_read_bool(b: &[u8], p: &mut usize) -> Option<bool> {
+    let value = *b.get(*p)?;
+    if value > 1 {
         return None;
     }
-    let slot = i16::from_be_bytes(b[..2].try_into().unwrap());
-    let mut p = 2usize;
-    let cnt = slot_read_varint(b, &mut p)?;
-    if cnt == 0 {
-        return (p == b.len()).then_some((slot, (0, 0, Vec::new())));
-    }
-    if !(1..=127).contains(&cnt) {
+    *p += 1;
+    Some(value != 0)
+}
+
+fn slot_read_count(b: &[u8], p: &mut usize, max: i64) -> Option<usize> {
+    usize::try_from(slot_read_varint(b, p)?).ok().filter(|&n| n <= max as usize)
+}
+
+fn slot_read_string(b: &[u8], p: &mut usize) -> Option<()> {
+    let len = slot_read_count(b, p, 98301)?;
+    let text = b.get(*p..(*p).checked_add(len)?)?;
+    std::str::from_utf8(text).ok()?;
+    *p += len;
+    Some(())
+}
+
+fn slot_read_nbt_payload(b: &[u8], p: &mut usize, tag: u8, depth: usize) -> Option<()> {
+    if depth > 64 {
         return None;
     }
-    let item = slot_read_varint(b, &mut p)?;
-    let nadd = slot_read_varint(b, &mut p)?;
-    let nrem = slot_read_varint(b, &mut p)?;
-    let mut comps: Comps = Vec::new();
-    if nadd < 0 || nadd > 128 || nrem < 0 || nrem > 128 {
+    match tag {
+        1 => slot_read_bytes(b, p, 1)?,
+        2 => slot_read_bytes(b, p, 2)?,
+        3 | 5 => slot_read_bytes(b, p, 4)?,
+        4 | 6 => slot_read_bytes(b, p, 8)?,
+        7 | 11 | 12 => {
+            let length = i32::from_be_bytes(b.get(*p..(*p).checked_add(4)?)?.try_into().ok()?);
+            *p += 4;
+            let length = usize::try_from(length).ok()?;
+            let element_size = match tag {
+                7 => 1,
+                11 => 4,
+                12 => 8,
+                _ => return None,
+            };
+            slot_read_bytes(b, p, length.checked_mul(element_size)?)?;
+        }
+        8 => {
+            let length = u16::from_be_bytes(b.get(*p..(*p).checked_add(2)?)?.try_into().ok()?)
+                as usize;
+            slot_read_bytes(b, p, 2 + length)?;
+        }
+        9 => {
+            let element_tag = *b.get(*p)?;
+            *p += 1;
+            let length = i32::from_be_bytes(b.get(*p..(*p).checked_add(4)?)?.try_into().ok()?);
+            *p += 4;
+            let length = usize::try_from(length).ok()?;
+            if length > 1_000_000 || (element_tag == 0 && length != 0) {
+                return None;
+            }
+            for _ in 0..length {
+                slot_read_nbt_payload(b, p, element_tag, depth + 1)?;
+            }
+        }
+        10 => loop {
+            let child_tag = *b.get(*p)?;
+            *p += 1;
+            if child_tag == 0 {
+                break;
+            }
+            if child_tag > 12 {
+                return None;
+            }
+            let name_length =
+                u16::from_be_bytes(b.get(*p..(*p).checked_add(2)?)?.try_into().ok()?) as usize;
+            slot_read_bytes(b, p, 2 + name_length)?;
+            slot_read_nbt_payload(b, p, child_tag, depth + 1)?;
+        },
+        _ => return None,
+    }
+    Some(())
+}
+
+fn slot_read_nbt(b: &[u8], p: &mut usize) -> Option<()> {
+    let tag = *b.get(*p)?;
+    if !(1..=12).contains(&tag) {
         return None;
     }
-    // This stack representation has no removed-component set. Accepting one while
-    // silently discarding it would change the item; reject the slot atomically.
-    if nrem != 0 {
+    *p += 1;
+    slot_read_nbt_payload(b, p, tag, 0)
+}
+
+fn slot_read_optional_nbt(b: &[u8], p: &mut usize) -> Option<()> {
+    if *b.get(*p)? == 0 {
+        *p += 1;
+        Some(())
+    } else {
+        slot_read_nbt(b, p)
+    }
+}
+
+fn slot_read_text(b: &[u8], p: &mut usize) -> Option<()> {
+    // Text components are unnamed NBT values, commonly strings or compounds.
+    slot_read_nbt(b, p)
+}
+
+fn slot_read_optional_string(b: &[u8], p: &mut usize) -> Option<()> {
+    if slot_read_bool(b, p)? {
+        slot_read_string(b, p)?;
+    }
+    Some(())
+}
+
+fn slot_read_holder_set(b: &[u8], p: &mut usize) -> Option<()> {
+    let kind = slot_read_varint(b, p)?;
+    if kind == 0 {
+        slot_read_string(b, p)?;
+    } else {
+        for _ in 0..usize::try_from(kind - 1).ok().filter(|&n| n <= 4096)? {
+            slot_read_varint(b, p)?;
+        }
+    }
+    Some(())
+}
+
+fn slot_read_block_predicate(b: &[u8], p: &mut usize) -> Option<()> {
+    if slot_read_bool(b, p)? {
+        slot_read_holder_set(b, p)?;
+    }
+    if slot_read_bool(b, p)? {
+        for _ in 0..slot_read_count(b, p, 256)? {
+            slot_read_string(b, p)?;
+            if slot_read_bool(b, p)? {
+                slot_read_string(b, p)?;
+            } else {
+                slot_read_string(b, p)?;
+                slot_read_string(b, p)?;
+            }
+        }
+    }
+    slot_read_optional_nbt(b, p)
+}
+
+fn slot_read_trim_material(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_read_string(b, p)?;
+    slot_read_varint(b, p)?;
+    for _ in 0..slot_read_count(b, p, 256)? {
+        slot_read_varint(b, p)?;
+        slot_read_string(b, p)?;
+    }
+    slot_read_nbt(b, p)
+}
+
+fn slot_read_trim_pattern(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_read_string(b, p)?;
+    slot_read_varint(b, p)?;
+    slot_read_nbt(b, p)?;
+    slot_read_bool(b, p)?;
+    Some(())
+}
+
+fn slot_read_sound_event(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_read_string(b, p)?;
+    if slot_read_bool(b, p)? {
+        slot_read_bytes(b, p, 4)?;
+    }
+    Some(())
+}
+
+fn slot_read_sound_holder(b: &[u8], p: &mut usize) -> Option<()> {
+    if slot_read_varint(b, p)? == 0 {
+        slot_read_sound_event(b, p)?;
+    }
+    Some(())
+}
+
+fn slot_read_instrument_data(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_read_sound_holder(b, p)?;
+    slot_read_bytes(b, p, 8)?;
+    slot_read_nbt(b, p)
+}
+
+fn slot_read_jukebox_song_data(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_read_sound_holder(b, p)?;
+    slot_read_nbt(b, p)?;
+    slot_read_bytes(b, p, 4)?;
+    slot_read_varint(b, p)?;
+    Some(())
+}
+
+fn slot_read_firework_explosion(b: &[u8], p: &mut usize) -> Option<()> {
+    if !(0..=4).contains(&slot_read_varint(b, p)?) {
         return None;
     }
+    for _ in 0..2 {
+        let count = slot_read_count(b, p, 256)?;
+        slot_read_bytes(b, p, count * 4)?;
+    }
+    slot_read_bool(b, p)?;
+    slot_read_bool(b, p)?;
+    Some(())
+}
+
+fn slot_read_component(b: &[u8], p: &mut usize, ty: i64, depth: usize) -> Option<()> {
+    match ty {
+        0 => slot_read_nbt(b, p)?,
+        1..=3 | 13 | 16 | 26 | 28 | 41 | 50 => {
+            slot_read_varint(b, p)?;
+        }
+        8 => {
+            if !(0..=3).contains(&slot_read_varint(b, p)?) {
+                return None;
+            }
+        }
+        4 | 18 => { slot_read_bool(b, p)?; }
+        5 | 6 => slot_read_text(b, p)?,
+        7 => for _ in 0..slot_read_count(b, p, 256)? { slot_read_optional_nbt(b, p)?; },
+        9 | 23 => {
+            for _ in 0..slot_read_count(b, p, 256)? {
+                slot_read_varint(b, p)?;
+                slot_read_varint(b, p)?;
+            }
+            slot_read_bool(b, p)?;
+        }
+        10 | 11 => {
+            for _ in 0..slot_read_count(b, p, 256)? {
+                slot_read_block_predicate(b, p)?;
+            }
+            slot_read_bool(b, p)?;
+        }
+        COMP_ATTRIBUTE_MODIFIERS => {
+            let mut rest = b.get(*p..)?;
+            attr_modifiers_read(&mut rest)?;
+            *p = b.len() - rest.len();
+        }
+        14 | 15 | 17 | 21 => {} // Unit components have zero-byte payloads.
+        19 | 27 | 36..=39 | 43 | 55 | 56 => slot_read_nbt(b, p)?,
+        20 => {
+            slot_read_varint(b, p)?; // nutrition
+            slot_read_bytes(b, p, 4)?; // saturation
+            slot_read_bool(b, p)?; // can always eat
+            slot_read_bytes(b, p, 4)?; // eating seconds
+            slot_read_stack(b, p, depth + 1)?; // conversion item, possibly empty
+            for _ in 0..slot_read_count(b, p, 256)? {
+                slot_read_varint(b, p)?;
+                slot_read_bytes(b, p, 4)?; // probability
+            }
+        }
+        22 => {
+            for _ in 0..slot_read_count(b, p, 256)? {
+                slot_read_holder_set(b, p)?;
+                if slot_read_bool(b, p)? { slot_read_bytes(b, p, 4)?; }
+                if slot_read_bool(b, p)? { slot_read_bool(b, p)?; }
+            }
+            slot_read_bytes(b, p, 4)?;
+            slot_read_varint(b, p)?;
+        }
+        24 => {
+            slot_read_bytes(b, p, 4)?;
+            slot_read_bool(b, p)?;
+        }
+        25 => slot_read_bytes(b, p, 4)?,
+        29 | 30 | 52 => {
+            for _ in 0..slot_read_count(b, p, 256)? {
+                slot_read_stack(b, p, depth + 1)?;
+            }
+        }
+        COMP_POTION_CONTENTS => {
+            let mut rest = b.get(*p..)?;
+            if read_merchant_bool(&mut rest)? { read_protocol_i32(&mut rest)?; }
+            if read_merchant_bool(&mut rest)? { rest = rest.get(4..)?; }
+            for _ in 0..read_protocol_i32(&mut rest).filter(|&n| (0..=256).contains(&n))? {
+                read_protocol_i32(&mut rest)?;
+                read_live_potion_effect_details(&mut rest, 0)?;
+            }
+            *p = b.len() - rest.len();
+            slot_read_optional_string(b, p)?;
+        }
+        32 => for _ in 0..slot_read_count(b, p, 256)? {
+            slot_read_varint(b, p)?;
+            slot_read_varint(b, p)?;
+        },
+        33 => for _ in 0..slot_read_count(b, p, 100)? {
+            slot_read_string(b, p)?;
+            slot_read_optional_string(b, p)?;
+        },
+        34 => {
+            slot_read_string(b, p)?;
+            slot_read_optional_string(b, p)?;
+            slot_read_string(b, p)?;
+            slot_read_varint(b, p)?;
+            for _ in 0..slot_read_count(b, p, 100)? {
+                slot_read_text(b, p)?;
+                slot_read_optional_nbt(b, p)?;
+            }
+            slot_read_bool(b, p)?;
+        }
+        COMP_ARMOR_TRIM => {
+            if slot_read_varint(b, p)? == 0 { slot_read_trim_material(b, p)?; }
+            if slot_read_varint(b, p)? == 0 { slot_read_trim_pattern(b, p)?; }
+            slot_read_bool(b, p)?;
+        }
+        40 => {
+            if slot_read_varint(b, p)? == 0 {
+                slot_read_instrument_data(b, p)?;
+            }
+        }
+        42 => {
+            if slot_read_bool(b, p)? {
+                if slot_read_varint(b, p)? == 0 {
+                    slot_read_jukebox_song_data(b, p)?;
+                }
+            } else {
+                slot_read_string(b, p)?;
+            }
+            slot_read_bool(b, p)?;
+        }
+        44 => {
+            if slot_read_bool(b, p)? {
+                slot_read_string(b, p)?;
+                slot_read_bytes(b, p, 8)?;
+            }
+            slot_read_bool(b, p)?;
+        }
+        45 => slot_read_firework_explosion(b, p)?,
+        46 => {
+            slot_read_varint(b, p)?;
+            for _ in 0..slot_read_count(b, p, 256)? { slot_read_firework_explosion(b, p)?; }
+        }
+        47 => {
+            if slot_read_bool(b, p)? { slot_read_string(b, p)?; }
+            if slot_read_bool(b, p)? { slot_read_bytes(b, p, 16)?; }
+            for _ in 0..slot_read_count(b, p, 256)? {
+                slot_read_string(b, p)?;
+                slot_read_string(b, p)?;
+                if slot_read_bool(b, p)? { slot_read_string(b, p)?; }
+            }
+        }
+        48 => slot_read_string(b, p)?,
+        COMP_BANNER_PATTERNS => {
+            for _ in 0..slot_read_count(b, p, 256)? {
+                if slot_read_varint(b, p)? == 0 {
+                    slot_read_string(b, p)?;
+                    slot_read_string(b, p)?;
+                }
+                if !(0..=15).contains(&slot_read_varint(b, p)?) { return None; }
+            }
+        }
+        51 => for _ in 0..slot_read_count(b, p, 4)? { slot_read_varint(b, p)?; },
+        53 => for _ in 0..slot_read_count(b, p, 256)? {
+            slot_read_string(b, p)?;
+            slot_read_string(b, p)?;
+        },
+        54 => for _ in 0..slot_read_count(b, p, 256)? {
+            slot_read_nbt(b, p)?;
+            slot_read_varint(b, p)?;
+            slot_read_varint(b, p)?;
+        },
+        _ => return None,
+    }
+    Some(())
+}
+
+fn slot_read_stack(b: &[u8], p: &mut usize, depth: usize) -> Option<Stack> {
+    if depth > 16 { return None; }
+    let cnt = slot_read_varint(b, p)?;
+    if cnt == 0 { return Some((0, 0, Vec::new())); }
+    if !(1..=127).contains(&cnt) { return None; }
+    let item = slot_read_varint(b, p)?;
+    if !(0..=i32::MAX as i64).contains(&item) { return None; }
+    let nadd = slot_read_count(b, p, 128)?;
+    let nrem = slot_read_count(b, p, 128)?;
+    let mut comps = Vec::with_capacity(nadd + usize::from(nrem != 0));
     for _ in 0..nadd {
-        let ty = slot_read_varint(b, &mut p)?;
-        let start = p;
-        match ty {
-            1..=3 | 16 => {
-                slot_read_varint(b, &mut p)?;
-            } // varint payload
-            4 => {
-                let value = *b.get(p)?;
-                if value > 1 {
-                    return None;
-                }
-                p += 1;
-            } // unbreakable: bool
-            5 => {
-                if p + 3 <= b.len() && b[p] == 8 {
-                    // nbt_string
-                    let l = u16::from_be_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
-                    p += 3;
-                    p = p.checked_add(l).filter(|end| *end <= b.len())?;
-                } else {
-                    return None;
-                }
-            }
-            7 => {
-                let n = slot_read_varint(b, &mut p)?; // lore: n strings
-                if !(0..=128).contains(&n) {
-                    return None;
-                }
-                for _ in 0..n {
-                    if p + 3 <= b.len() && b[p] == 8 {
-                        let l = u16::from_be_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
-                        p += 3;
-                        p = p.checked_add(l).filter(|end| *end <= b.len())?;
-                    } else {
-                        return None;
-                    }
-                }
-            }
-            9 | 23 => {
-                let n = slot_read_varint(b, &mut p)?; // enchantments / stored_enchantments
-                if !(0..=256).contains(&n) {
-                    return None;
-                }
-                for _ in 0..n {
-                    slot_read_varint(b, &mut p)?;
-                    slot_read_varint(b, &mut p)?;
-                }
-                let value = *b.get(p)?;
-                if value > 1 {
-                    return None;
-                }
-                p += 1;
-            }
-            COMP_POTION_CONTENTS => {
-                let mut payload = b.get(p..)?;
-                if read_merchant_bool(&mut payload)? {
-                    read_protocol_i32(&mut payload)?;
-                }
-                if read_merchant_bool(&mut payload)? {
-                    payload = payload.get(4..)?;
-                }
-                let effects = read_protocol_i32(&mut payload)?;
-                if !(0..=256).contains(&effects) {
-                    return None;
-                }
-                for _ in 0..effects {
-                    read_protocol_i32(&mut payload)?; // effect registry id
-                    read_live_potion_effect_details(&mut payload, 0)?;
-                }
-                p = b.len() - payload.len();
-            }
-            COMP_ARMOR_TRIM => {
-                // The smithing menu emits registry-backed holders.
-                if slot_read_varint(b, &mut p)? == 0 || slot_read_varint(b, &mut p)? == 0 {
-                    return None;
-                }
-                let value = *b.get(p)?;
-                if value > 1 {
-                    return None;
-                }
-                p += 1;
-            }
-            COMP_BANNER_PATTERNS => {
-                let layers = slot_read_varint(b, &mut p)?;
-                if !(0..=256).contains(&layers) {
-                    return None;
-                }
-                for _ in 0..layers {
-                    // Holder<BannerPattern>: 0 carries an inline definition
-                    // (asset id + translation key); otherwise it is id + 1.
-                    if slot_read_varint(b, &mut p)? == 0 {
-                        let mut rest = b.get(p..)?;
-                        registry_wire_name(&mut rest)?;
-                        registry_wire_name(&mut rest)?;
-                        p = b.len() - rest.len();
-                    }
-                    if !(0..=15).contains(&slot_read_varint(b, &mut p)?) {
-                        return None;
-                    }
-                }
-            }
-            COMP_ATTRIBUTE_MODIFIERS => {
-                let mut rest = b.get(p..)?;
-                attr_modifiers_read(&mut rest)?;
-                p = b.len() - rest.len();
-            }
-            // Component payloads are not length-prefixed. Without a type-aware
-            // decoder their boundary cannot be recovered, so reject the whole
-            // stack rather than returning a truncated item as if it were valid.
-            _ => return None,
-        }
-        if p <= b.len() && p > start {
-            comps.push((ty, b[start..p].to_vec()));
-        } else {
-            return None;
-        }
+        let ty = slot_read_varint(b, p)?;
+        if !(0..SLOT_COMPONENT_TYPE_COUNT).contains(&ty) { return None; }
+        let start = *p;
+        slot_read_component(b, p, ty, depth)?;
+        comps.push((ty, b.get(start..*p)?.to_vec()));
     }
-    (p == b.len() && (0..=i32::MAX as i64).contains(&item))
-        .then_some((slot, (item, cnt as u8, comps)))
+    if nrem != 0 {
+        let start = *p;
+        for _ in 0..nrem {
+            let ty = slot_read_varint(b, p)?;
+            if !(0..SLOT_COMPONENT_TYPE_COUNT).contains(&ty) { return None; }
+        }
+        comps.push((SLOT_REMOVED_COMPONENTS, b.get(start..*p)?.to_vec()));
+    }
+    Some((item, cnt as u8, comps))
+}
+
+fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
+    let slot = i16::from_be_bytes(b.get(..2)?.try_into().ok()?);
+    let mut position = 2;
+    let stack = slot_read_stack(b, &mut position, 0)?;
+    (position == b.len()).then_some((slot, stack))
 }
 
 fn creative_inventory_slot(slot: i16) -> bool {
@@ -11708,5 +11982,191 @@ mod p6c_hopper_parity_tests {
         }
         // Third activation: the source is empty, so only the push moves.
         assert_eq!(engine.tick().items_transferred, 1);
+    }
+}
+
+#[cfg(test)]
+mod p8b2_parity_component_wire_tests {
+    use super::*;
+
+    fn vi(number: i64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, number);
+        bytes
+    }
+
+    fn string(text: &str) -> Vec<u8> {
+        [vi(text.len() as i64), text.as_bytes().to_vec()].concat()
+    }
+
+    fn named_text() -> Vec<u8> {
+        vec![8, 0, 1, b'X'] // unnamed NBT string
+    }
+
+    fn compound() -> Vec<u8> {
+        vec![10, 0] // unnamed empty NBT compound
+    }
+
+    fn all_v767_component_samples() -> Comps {
+        let nested = slot_wire(&(6, 1, vec![(16, vi(4)), (SLOT_REMOVED_COMPONENTS, vi(3))]));
+        let empty = vi(0);
+        let holder_set = [vi(0), string("minecraft:stone")].concat();
+        let block_predicate = [
+            vec![1], holder_set.clone(), vec![1], vi(1), string("facing"),
+            vec![1], string("north"), vec![0],
+        ].concat();
+        let enchantments = [vi(1), vi(1), vi(3), vec![1]].concat();
+        let tool = [
+            vi(1), holder_set, vec![1], 2.0f32.to_be_bytes().to_vec(),
+            vec![1, 1], 1.0f32.to_be_bytes().to_vec(), vi(1),
+        ].concat();
+        let food = [
+            vi(5), 0.6f32.to_be_bytes().to_vec(), vec![1],
+            1.6f32.to_be_bytes().to_vec(), empty.clone(), vi(1), vi(2),
+            0.4f32.to_be_bytes().to_vec(),
+        ].concat();
+        let potion = [
+            vec![1], vi(2), vec![1], vec![0x00, 0x33, 0x55, 0x77], vi(1),
+            vi(3), vi(1), vi(60), vec![0, 1, 1, 0], vec![1], string("custom"),
+        ].concat();
+        let trim_material = [
+            string("minecraft:gold"), vi(1), vi(1), vi(2),
+            string("minecraft:gold"), named_text(),
+        ].concat();
+        let trim_pattern = [
+            string("minecraft:coast"), vi(2), named_text(), vec![1],
+        ].concat();
+        let trim = [
+            vi(0), trim_material, vi(0), trim_pattern, vec![0],
+        ].concat();
+        let firework_explosion = [
+            vi(2), vi(1), vec![1, 2, 3, 4], vi(1),
+            vec![5, 6, 7, 8], vec![1, 0],
+        ].concat();
+        let sound_event = [string("minecraft:test"), vec![0]].concat();
+        let song = [
+            vi(0), sound_event.clone(), named_text(),
+            30.0f32.to_be_bytes().to_vec(), vi(3),
+        ].concat();
+        vec![
+            (0, compound()), // custom_data
+            (1, vi(64)), // max_stack_size
+            (2, vi(1561)), // max_damage
+            (3, vi(23)), // damage
+            (4, vec![1]), // unbreakable
+            (5, named_text()), // custom_name
+            (6, named_text()), // item_name
+            (7, [vi(1), vec![0]].concat()), // lore, nullable text
+            (8, vi(3)), // rarity
+            (9, enchantments.clone()), // enchantments
+            (10, [vi(1), block_predicate.clone(), vec![1]].concat()), // can_place_on
+            (11, [vi(1), block_predicate, vec![0]].concat()), // can_break
+            (12, [vi(0), vec![1]].concat()), // attribute_modifiers
+            (13, vi(12)), // custom_model_data
+            (14, vec![]), // hide_additional_tooltip
+            (15, vec![]), // hide_tooltip
+            (16, vi(7)), // repair_cost
+            (17, vec![]), // creative_slot_lock
+            (18, vec![1]), // enchantment_glint_override
+            (19, compound()), // intangible_projectile
+            (20, food), // food
+            (21, vec![]), // fire_resistant
+            (22, tool), // tool
+            (23, enchantments), // stored_enchantments
+            (24, vec![0x11, 0x22, 0x33, 0x44, 1]), // dyed_color
+            (25, vec![0x11, 0x22, 0x33, 0x44]), // map_color
+            (26, vi(42)), // map_id
+            (27, compound()), // map_decorations
+            (28, vi(1)), // map_post_processing
+            (29, [vi(1), nested.clone()].concat()), // charged_projectiles
+            (30, [vi(1), nested.clone()].concat()), // bundle_contents
+            (31, potion), // potion_contents
+            (32, [vi(1), vi(1), vi(300)].concat()), // suspicious_stew_effects
+            (33, [vi(1), string("raw"), vec![1], string("filtered")].concat()), // writable_book
+            (34, [
+                string("title"), vec![1], string("filtered"), string("author"),
+                vi(1), vi(1), named_text(), vec![0], vec![1],
+            ].concat()), // written_book
+            (35, trim), // trim with inline holders
+            (36, compound()), // debug_stick_state
+            (37, compound()), // entity_data
+            (38, compound()), // bucket_entity_data
+            (39, compound()), // block_entity_data
+            (40, [vi(0), vi(0), sound_event, 1.0f32.to_be_bytes().to_vec(),
+                  16.0f32.to_be_bytes().to_vec(), named_text()].concat()), // instrument
+            (41, vi(3)), // ominous_bottle_amplifier
+            (42, [vec![1], vi(0), song, vec![1]].concat()), // jukebox_playable
+            (43, compound()), // recipes
+            (44, [vec![1], string("minecraft:overworld"), vec![0; 8], vec![1]].concat()), // lodestone
+            (45, firework_explosion.clone()), // firework_explosion
+            (46, [vi(2), vi(1), firework_explosion].concat()), // fireworks
+            (47, [vec![1], string("player"), vec![0], vi(0)].concat()), // profile
+            (48, string("minecraft:test")), // note_block_sound
+            (49, [vi(1), vi(0), string("minecraft:stripe"), string("stripe"), vi(5)].concat()), // banners
+            (50, vi(5)), // base_color
+            (51, [vi(4), vi(1), vi(2), vi(3), vi(4)].concat()), // pot_decorations
+            (52, [vi(1), nested].concat()), // container
+            (53, [vi(1), string("facing"), string("north")].concat()), // block_state
+            (54, [vi(1), compound(), vi(42), vi(20)].concat()), // bees
+            (55, compound()), // lock
+            (56, compound()), // container_loot
+        ]
+    }
+
+    #[test]
+    fn p8b2_parity_all_57_components_and_nested_slots_roundtrip_losslessly() {
+        let components = all_v767_component_samples();
+        assert!(include_str!("../proto/src/data_v767.rs")
+            .contains("pub(crate) static V767_COMPONENTS: [&str; 57]"));
+        assert_eq!(components.len(), SLOT_COMPONENT_TYPE_COUNT as usize);
+        for (expected_id, (id, _)) in components.iter().enumerate() {
+            assert_eq!(*id, expected_id as i64);
+        }
+        let invalid: Vec<_> = components.iter().filter_map(|(id, bytes)| {
+            let mut position = 0;
+            let result = slot_read_component(bytes, &mut position, *id, 0);
+            (result.is_none() || position != bytes.len())
+                .then_some((*id, position, bytes.len()))
+        }).collect();
+        assert!(invalid.is_empty(), "invalid component boundaries: {invalid:?}");
+        let stack: Stack = (6, 1, components);
+        let mut packet = 12i16.to_be_bytes().to_vec();
+        packet.extend_from_slice(&slot_wire(&stack));
+        let (slot, decoded) = slot_read_wire(&packet).expect("all component boundaries decode");
+        assert_eq!(slot, 12);
+        assert_eq!(decoded, stack);
+        assert_eq!(slot_wire(&decoded), slot_wire(&stack));
+    }
+
+    #[test]
+    fn p8b2_parity_creative_removed_and_noncanonical_component_payloads() {
+        let original: Stack = (
+            4, 3,
+            vec![
+                (COMP_CUSTOM_NAME, named_text()),
+                (16, vec![0x80, 0x00]), // repair_cost
+                (SLOT_REMOVED_COMPONENTS, [vi(3), vi(4), vi(12)].concat()),
+            ],
+        );
+        let mut packet = 45i16.to_be_bytes().to_vec();
+        packet.extend_from_slice(&slot_wire(&original));
+        assert_eq!(slot_read_wire(&packet), Some((45, original)));
+        assert!(creative_inventory_slot(45));
+        packet.push(1);
+        assert!(slot_read_wire(&packet).is_none(), "trailing data must be rejected");
+    }
+
+    #[test]
+    fn p8b2_parity_truncated_and_out_of_range_components_are_rejected() {
+        let stack: Stack = (7, 1, all_v767_component_samples());
+        let mut packet = 10i16.to_be_bytes().to_vec();
+        packet.extend_from_slice(&slot_wire(&stack));
+        for end in 0..packet.len() {
+            assert!(slot_read_wire(&packet[..end]).is_none(), "truncated at byte {end}");
+        }
+        let mut invalid = 10i16.to_be_bytes().to_vec();
+        invalid.extend_from_slice(&[1, 1, 1, 0]);
+        write_varint(&mut invalid, SLOT_COMPONENT_TYPE_COUNT);
+        assert!(slot_read_wire(&invalid).is_none());
     }
 }

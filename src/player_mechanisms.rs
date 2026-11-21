@@ -873,6 +873,138 @@ fn swift_sneak_speed_multiplier(level: i32) -> f32 {
     (0.3 + level.max(0) as f32 * 0.15).min(1.0)
 }
 
+// 1.21.1 enchantment effects from Enchantments.bootstrap and the relevant
+// item implementations. These evaluators take the world conditions explicitly.
+#[cfg_attr(not(test), allow(dead_code))]
+fn soul_speed_on_soul_block_bonus(level: i32, standing_on_soul_block: bool) -> f32 {
+    if !standing_on_soul_block || level <= 0 {
+        return 0.0;
+    }
+    0.03 + level as f32 * 0.0105
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn frost_walker_freeze_radius(level: i32) -> i32 {
+    if level <= 0 { 0 } else { level.saturating_add(2).min(16) }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn respiration_air_loss_probability(level: i32) -> f32 {
+    1.0 / (level.max(0) as f32 + 1.0)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn aqua_affinity_mining_factor(level: i32, submerged: bool) -> f32 {
+    if submerged && level <= 0 { 0.2 } else { 1.0 }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn feather_falling_damage_reduction(level: i32) -> f32 {
+    // Each level contributes three protection points; each point is four percent.
+    (level.max(0) as f32 * 0.12).min(0.80)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn quick_charge_crossbow_ticks(level: i32) -> i32 {
+    // floor((1.25 - 0.25 * level) * 20) in CrossbowItem.getPullTime.
+    25 - 5 * level.clamp(0, 3)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn multishot_projectile_angles(level: i32) -> &'static [f32] {
+    if level > 0 { &[-10.0, 0.0, 10.0] } else { &[0.0] }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn piercing_max_entities(level: i32) -> i32 {
+    level.max(0).saturating_add(1)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn density_smash_bonus_damage(level: i32, fall_blocks: f32) -> f32 {
+    level.max(0) as f32 * 0.5 * fall_blocks.max(0.0)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn breach_effective_armor_fraction(level: i32) -> f32 {
+    (1.0 - 0.15 * level.max(0) as f32).max(0.0)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn wind_burst_bounce_strength(level: i32, smash_fall_blocks: f32, fall_flying: bool) -> f32 {
+    // The wind explosion uses strength 3.5; the resulting upward velocity
+    // also depends on the explosion geometry and affected entity position.
+    if level <= 0 || smash_fall_blocks <= 1.5 || fall_flying {
+        0.0
+    } else {
+        3.5 * level as f32
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn riptide_dash_velocity(
+    level: i32,
+    wet: bool,
+    use_ticks: i32,
+    yaw_degrees: f32,
+    pitch_degrees: f32,
+) -> Option<[f32; 3]> {
+    if level <= 0 || !wet || use_ticks < 10 {
+        return None;
+    }
+    let strength = 0.75 * (level as f32 + 1.0);
+    let yaw = yaw_degrees.to_radians();
+    let pitch = pitch_degrees.to_radians();
+    Some([
+        -yaw.sin() * pitch.cos() * strength,
+        -pitch.sin() * strength,
+        yaw.cos() * pitch.cos() * strength,
+    ])
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn channeling_strikes_lightning(
+    level: i32,
+    thunderstorm: bool,
+    sky_visible: bool,
+    trident_hit: bool,
+    hit_entity: bool,
+    hit_lightning_rod: bool,
+) -> bool {
+    level > 0 && thunderstorm && sky_visible && trident_hit && (hit_entity || hit_lightning_rod)
+}
+
+/// Protocol 767 play clientbound packet 0x04 `award_stats` payload.
+/// The network layer supplies the packet id and length framing.
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_award_stats_0x04(entries: &[(u8, i32, i32)]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_varint(&mut payload, entries.len() as i64);
+    for &(category, stat_id, value) in entries {
+        write_varint(&mut payload, category as i64);
+        write_varint(&mut payload, stat_id as i64);
+        write_varint(&mut payload, value as i64);
+    }
+    payload
+}
+
+// Vanilla 1.21.1's CUSTOM_STAT registry uses Stats.register insertion order.
+// These are the raw ids sent under category 8 in ClientboundAwardStatsPacket.
+#[cfg_attr(not(test), allow(dead_code))]
+fn v767_custom_stat_id(name: &str) -> Option<i32> {
+    match name {
+        "minecraft:play_time" => Some(1),
+        "minecraft:time_since_rest" => Some(4),
+        "minecraft:walk_one_cm" => Some(6),
+        "minecraft:jump" => Some(21),
+        "minecraft:damage_dealt" => Some(23),
+        "minecraft:damage_taken" => Some(26),
+        "minecraft:deaths" => Some(30),
+        "minecraft:mob_kills" => Some(31),
+        _ => None,
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn tool_base_mining_speed(item: &str) -> f32 {
     let Some((tier, kind)) = tool_parts(item) else {
@@ -4113,5 +4245,149 @@ mod p5e_parity_mining_tests {
             mining_speed_with_modifiers(6.0, false, 0, None, Some(3), false, true),
             6.0 * 0.00081
         );
+    }
+}
+
+#[cfg(test)]
+mod p8b2_parity_enchantment_and_stats_tests {
+    use super::*;
+
+    #[test]
+    fn p8b2_parity_armor_mobility_and_mining_enchantments() {
+        assert_eq!(depth_strider_underwater_factor(-1), 0.0);
+        assert_eq!(depth_strider_underwater_factor(1), 1.0 / 3.0);
+        assert_eq!(depth_strider_underwater_factor(3), 1.0);
+        assert_eq!(depth_strider_underwater_factor(10), 1.0);
+        assert_eq!(soul_speed_on_soul_block_bonus(3, false), 0.0);
+        assert!((soul_speed_on_soul_block_bonus(3, true) - 0.0615).abs() < 1e-6);
+        assert_eq!(swift_sneak_speed_multiplier(0), 0.3);
+        assert_eq!(swift_sneak_speed_multiplier(3), 0.75);
+        assert_eq!(swift_sneak_speed_multiplier(10), 1.0);
+        assert_eq!(frost_walker_freeze_radius(0), 0);
+        assert_eq!(frost_walker_freeze_radius(1), 3);
+        assert_eq!(frost_walker_freeze_radius(2), 4);
+        assert_eq!(frost_walker_freeze_radius(100), 16);
+        assert_eq!(respiration_air_loss_probability(0), 1.0);
+        assert_eq!(respiration_air_loss_probability(3), 0.25);
+        assert!(respiration_preserves_air(3, 0.74));
+        assert!(!respiration_preserves_air(3, 0.75));
+        assert_eq!(aqua_affinity_mining_factor(0, true), 0.2);
+        assert_eq!(aqua_affinity_mining_factor(1, true), 1.0);
+        assert_eq!(aqua_affinity_mining_factor(0, false), 1.0);
+        assert_eq!(feather_falling_damage_reduction(0), 0.0);
+        assert!((feather_falling_damage_reduction(4) - 0.48).abs() < 1e-6);
+        assert_eq!(feather_falling_damage_reduction(10), 0.8);
+        assert!(thorns_triggers(3, 0.44));
+        assert!(!thorns_triggers(3, 0.46));
+        for damage in 1..=4 {
+            assert_eq!(thorns_damage(3, damage), damage);
+        }
+    }
+
+    #[test]
+    fn p8b2_parity_crossbow_trident_and_mace_enchantments() {
+        assert_eq!(quick_charge_crossbow_ticks(0), 25);
+        assert_eq!(quick_charge_crossbow_ticks(1), 20);
+        assert_eq!(quick_charge_crossbow_ticks(2), 15);
+        assert_eq!(quick_charge_crossbow_ticks(3), 10);
+        assert_eq!(quick_charge_crossbow_ticks(9), 10);
+        assert_eq!(multishot_projectile_angles(0), &[0.0]);
+        assert_eq!(multishot_projectile_angles(1), &[-10.0, 0.0, 10.0]);
+        assert_eq!(piercing_max_entities(0), 1);
+        assert_eq!(piercing_max_entities(4), 5);
+        assert_eq!(density_smash_bonus_damage(2, 6.0), 6.0);
+        assert_eq!(density_smash_bonus_damage(5, -1.0), 0.0);
+        assert!((breach_effective_armor_fraction(4) - 0.4).abs() < 1e-6);
+        assert_eq!(breach_effective_armor_fraction(0), 1.0);
+        assert_eq!(wind_burst_bounce_strength(3, 4.0, false), 10.5);
+        assert_eq!(wind_burst_bounce_strength(2, 1.5, false), 0.0);
+        assert_eq!(wind_burst_bounce_strength(2, 4.0, true), 0.0);
+        assert_eq!(riptide_dash_velocity(2, false, 20, 0.0, 0.0), None);
+        assert_eq!(riptide_dash_velocity(2, true, 9, 0.0, 0.0), None);
+        let forward = riptide_dash_velocity(2, true, 10, 0.0, 0.0).unwrap();
+        assert!((forward[2] - 2.25).abs() < 1e-6);
+        assert!(forward[0].abs() < 1e-6 && forward[1].abs() < 1e-6);
+        let up = riptide_dash_velocity(1, true, 10, 0.0, -90.0).unwrap();
+        assert!((up[1] - 1.5).abs() < 1e-6);
+        assert!(!channeling_strikes_lightning(1, false, true, true, true, false));
+        assert!(!channeling_strikes_lightning(1, true, false, true, true, false));
+        assert!(!channeling_strikes_lightning(1, true, true, false, true, false));
+        assert!(channeling_strikes_lightning(1, true, true, true, true, false));
+        assert!(channeling_strikes_lightning(1, true, true, true, false, true));
+        assert!(!channeling_strikes_lightning(0, true, true, true, true, true));
+    }
+
+    #[test]
+    fn p8b2_parity_all_nine_stat_categories_and_award_stats_wire() {
+        assert!(include_str!("../proto/src/data_v767.rs").lines().any(|line| {
+            line.trim() == "(PacketPhase::Play, PacketDir::Clientbound, \"award_stats\", 0x04),"
+        }));
+        let categories = [
+            StatCategory::Mined,
+            StatCategory::Crafted,
+            StatCategory::Used,
+            StatCategory::Broken,
+            StatCategory::PickedUp,
+            StatCategory::Dropped,
+            StatCategory::Killed,
+            StatCategory::KilledBy,
+            StatCategory::Custom,
+        ];
+        let mut stats = PlayerStats::new();
+        let mut entries = Vec::new();
+        for (category, kind) in categories.into_iter().enumerate() {
+            assert_eq!(StatCategory::from_id(category as i32), Some(kind));
+            let id = 10 + category as i32;
+            let value = 100 + category as i32;
+            stats.increment(kind, id, value);
+            entries.push((category as u8, id, value));
+            assert_eq!(stats.get(kind, id), value);
+        }
+        assert_eq!(stats.len(), 9);
+        let payload = encode_award_stats_0x04(&entries);
+        assert_eq!(payload, encode_award_stats(&stats));
+        assert_eq!(payload[0], 9);
+        let mut input = payload.as_slice();
+        assert_eq!(decode_award_stats(&mut input), Some(stats));
+        assert_eq!(encode_award_stats_0x04(&[]), vec![0]);
+        assert_eq!(
+            encode_award_stats_0x04(&[(8, 7, -1)]),
+            vec![1, 8, 7, 0xff, 0xff, 0xff, 0xff, 0x0f]
+        );
+    }
+
+    #[test]
+    fn p8b2_parity_custom_stat_registry_ids_and_packet_framing() {
+        let custom = [
+            ("minecraft:play_time", 1),
+            ("minecraft:time_since_rest", 4),
+            ("minecraft:walk_one_cm", 6),
+            ("minecraft:jump", 21),
+            ("minecraft:damage_dealt", 23),
+            ("minecraft:damage_taken", 26),
+            ("minecraft:deaths", 30),
+            ("minecraft:mob_kills", 31),
+        ];
+        let mut stats = PlayerStats::new();
+        for &(name, id) in &custom {
+            assert_eq!(v767_custom_stat_id(name), Some(id));
+            stats.increment(StatCategory::Custom, id, 128 + id);
+            assert_eq!(stats.get(StatCategory::Custom, id), 128 + id);
+        }
+        assert_eq!(v767_custom_stat_id("minecraft:unknown"), None);
+
+        let entries: Vec<_> = custom
+            .iter()
+            .map(|&(_, id)| (StatCategory::Custom as u8, id, 128 + id))
+            .collect();
+        let payload = encode_award_stats_0x04(&entries);
+        assert_eq!(payload, encode_award_stats(&stats));
+        let mut packet = Vec::new();
+        write_varint(&mut packet, (payload.len() + 1) as i64);
+        write_varint(&mut packet, 0x04);
+        packet.extend_from_slice(&payload);
+        assert_eq!(&packet[0..3], &[34, 4, 8]);
+        let mut body = &packet[2..];
+        assert_eq!(decode_award_stats(&mut body), Some(stats));
     }
 }
