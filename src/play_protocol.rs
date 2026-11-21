@@ -70,6 +70,9 @@ fn read_before(s: &mut TcpStream, mut out: &mut [u8], deadline: Instant) -> Opti
         if n == 0 {
             return None;
         }
+        if let Some(cipher) = conn_cipher(s) {
+            cipher.rx.lock().unwrap().decrypt(&mut out[..n]);
+        }
         out = &mut out[n..];
     }
     Some(())
@@ -190,6 +193,9 @@ impl RxBuf {
         match s.read(&mut tmp) {
             Ok(0) => RxOut::Closed,
             Ok(n) => {
+                if let Some(cipher) = conn_cipher(s) {
+                    cipher.rx.lock().unwrap().decrypt(&mut tmp[..n]);
+                }
                 self.buf.extend(&tmp[..n]);
                 match self.try_frame() {
                     Some(frame) => frame.unwrap_or(RxOut::Idle),
@@ -225,6 +231,45 @@ fn socket_key(socket: &TcpStream) -> u64 {
 struct SocketWireState {
     compression: Option<usize>,
     play: Option<PlayWireState>,
+    cipher: Option<Arc<ConnCipher>>,
+}
+
+/// The AES-128-CFB8 pair one online-mode connection runs under. Registered per
+/// socket fd like the rest of `SocketWireState`: the login socket and the
+/// `try_clone`d play writer are two fds pointing at one `Arc`, so bytes either
+/// side writes advance a single keystream — matching Java's single cipher pair.
+struct ConnCipher {
+    rx: Mutex<Aes128Cfb8>,
+    tx: Mutex<Aes128Cfb8>,
+}
+
+/// The connection's cipher if encryption was negotiated on this socket, else
+/// `None` — one map lookup per socket call, on top of the lookup `send_packet`
+/// already performs.
+fn conn_cipher(s: &TcpStream) -> Option<Arc<ConnCipher>> {
+    SOCKET_WIRE
+        .get()?
+        .lock()
+        .unwrap()
+        .get(&socket_key(s))?
+        .cipher
+        .clone()
+}
+
+/// Arm encryption on `s`'s wire entry with the negotiated shared secret. Called
+/// the moment the Encryption Response verifies: every later byte crossing the
+/// read/write paths below is en- or decrypted through `conn_cipher`.
+fn enable_conn_encryption(s: &TcpStream, secret: &[u8; 16]) {
+    let cipher = Arc::new(ConnCipher {
+        rx: Mutex::new(Aes128Cfb8::new(secret, secret)),
+        tx: Mutex::new(Aes128Cfb8::new(secret, secret)),
+    });
+    socket_wire()
+        .lock()
+        .unwrap()
+        .entry(socket_key(s))
+        .or_default()
+        .cipher = Some(cipher);
 }
 
 #[derive(Default)]
@@ -398,6 +443,17 @@ impl std::ops::Drop for LoginCompression {
     }
 }
 
+/// Same drop-unregister discipline for the cipher `enable_conn_encryption`
+/// arms on the login socket's fd. Without it the entry outlives the connection
+/// and a later connection reusing the fd inherits a dead keystream.
+struct SocketCipherGuard(u64);
+
+impl std::ops::Drop for SocketCipherGuard {
+    fn drop(&mut self) {
+        unregister_socket_wire(self.0);
+    }
+}
+
 fn negotiate_compression(
     s: &mut TcpStream,
     threshold: i32,
@@ -407,13 +463,10 @@ fn negotiate_compression(
     };
     send_packet(s, 0x03, connection_limits::set_compression(threshold))?;
     let key = socket_key(s);
-    socket_wire().lock().unwrap().insert(
-        key,
-        SocketWireState {
-            compression: Some(size),
-            play: None,
-        },
-    );
+    let mut states = socket_wire().lock().unwrap();
+    // Merge, not overwrite: online-mode login arms a cipher on this socket
+    // before compression is negotiated.
+    states.entry(key).or_default().compression = Some(size);
     Ok(Some(LoginCompression(key)))
 }
 
@@ -448,7 +501,7 @@ fn send_packet(s: &mut TcpStream, mut id: i64, mut payload: Vec<u8>) -> std::io:
 }
 
 fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> std::io::Result<()> {
-    let frame = match compression {
+    let mut frame = match compression {
         Some(threshold) => connection_limits::encode_compressed_frame(body, threshold),
         None => {
             let mut frame = Vec::new();
@@ -457,6 +510,9 @@ fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> st
             frame
         }
     };
+    if let Some(cipher) = conn_cipher(s) {
+        cipher.tx.lock().unwrap().encrypt(&mut frame);
+    }
     let result = s.write_all(&frame);
     if result.is_err() {
         // A partial write invalidates both the frame boundary and entity baselines.
@@ -584,16 +640,15 @@ impl Client {
         chunk_delivery: connection_limits::ChunkDelivery,
     ) {
         let key = socket_key(&self.sock.lock().unwrap());
-        socket_wire().lock().unwrap().insert(
-            key,
-            SocketWireState {
-                compression,
-                play: Some(PlayWireState {
-                    chunk_delivery,
-                    ..PlayWireState::default()
-                }),
-            },
-        );
+        let mut states = socket_wire().lock().unwrap();
+        // Merge, not overwrite: the encryption handshake may have armed a
+        // cipher on this writer fd before the play state existed.
+        let state = states.entry(key).or_default();
+        state.compression = compression;
+        state.play = Some(PlayWireState {
+            chunk_delivery,
+            ..PlayWireState::default()
+        });
     }
 
     fn is_spectator(&self) -> bool {
@@ -2729,6 +2784,16 @@ fn socket_compression(s: &TcpStream) -> Option<usize> {
 /// Write an already-framed packet (bytes shared from `ChunkPacketCache`) with
 /// `write_frame`'s failure contract: a partial write kills the socket.
 fn write_shared_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
+    let encrypted;
+    let frame = match conn_cipher(s) {
+        Some(cipher) => {
+            let mut v = frame.to_vec();
+            cipher.tx.lock().unwrap().encrypt(&mut v);
+            encrypted = v;
+            &encrypted[..]
+        }
+        None => frame,
+    };
     let result = s.write_all(frame);
     if result.is_err() {
         let _ = s.shutdown(std::net::Shutdown::Both);
@@ -4226,6 +4291,125 @@ fn login_disconnect_text(s: &mut TcpStream, reason: &str) {
     let _ = send_packet(s, 0, pl);
 }
 
+// ---------- W4 live protocol wiring ----------
+
+/// The env-flag spelling the rest of the config surface already uses.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
+        .unwrap_or(false)
+}
+
+/// Velocity "modern forwarding" gate (`MC_SPINE_VELOCITY_FORWARDING=1`). When
+/// on, the connecting peer must answer `velocity:player_info` with an
+/// HMAC-SHA256-signed identity — a direct client, a dropped response or one
+/// flipped byte all fail closed, because the forwarded name/UUID/IP is the
+/// only trustworthy identity from that point on.
+fn velocity_forwarding_enabled() -> bool {
+    env_flag("MC_SPINE_VELOCITY_FORWARDING")
+}
+
+/// `MC_SPINE_ONLINE_MODE=1`: the Encryption Request/Response exchange plus the
+/// session check. Kept `else if` behind forwarding — a Velocity proxy already
+/// terminated the client's real authentication, and running both on one
+/// connection would contradict that.
+fn online_mode_enabled() -> bool {
+    env_flag("MC_SPINE_ONLINE_MODE")
+}
+
+/// S2C Login Plugin Request (`0x04`) on `velocity:player_info`, then the C2S
+/// Plugin Response (`0x02`) verified through `verify_velocity_forwarding`.
+/// The `data` of both plugin messages is the remaining frame bytes, not a
+/// length-prefixed array.
+fn velocity_login(s: &mut TcpStream, deadline: Instant) -> Result<VelocityForwardedPlayer, String> {
+    const FORWARDING_MESSAGE_ID: i64 = 0;
+    let mut body = Vec::new();
+    write_varint(&mut body, FORWARDING_MESSAGE_ID);
+    write_str(&mut body, VELOCITY_FORWARDING_CHANNEL);
+    // Velocity reads the max modern-forwarding version it may answer with.
+    body.push(VELOCITY_FORWARDING_VERSION_MAX as u8);
+    send_packet(s, 0x04, body).map_err(|e| format!("plugin request write failed: {e}"))?;
+    let (id, resp) = read_login_frame(s, deadline, None)
+        .ok_or_else(|| "client left before the plugin response".to_string())?;
+    if id != 0x02 {
+        return Err(format!("expected plugin response 0x02, got packet {id:#04x}"));
+    }
+    let mut b = resp.as_slice();
+    let mid = read_varint(&mut b).ok_or_else(|| "truncated plugin response".to_string())?;
+    if mid != FORWARDING_MESSAGE_ID {
+        return Err(format!("plugin response id {mid} does not match the request"));
+    }
+    let (ok, rest) = b
+        .split_first()
+        .ok_or_else(|| "truncated plugin response".to_string())?;
+    if *ok != 1 {
+        return Err("client refused the forwarding request".into());
+    }
+    if rest.is_empty() {
+        return Err("plugin response carried no forwarding data".into());
+    }
+    let secret = std::env::var("MC_SPINE_VELOCITY_SECRET")
+        .map_err(|_| "MC_SPINE_VELOCITY_SECRET is not configured".to_string())?;
+    verify_velocity_forwarding(secret.as_bytes(), rest)
+}
+
+/// Vanilla online-mode login: Encryption Request (`0x01`), the client's
+/// wrapped shared-secret/verify-token answer (`0x01`), the `hasJoined` session
+/// check, then the transport switches to AES-128-CFB8 for every later byte.
+/// With no installed provider this fails closed — the env flag alone is not a
+/// keypair.
+fn online_login(
+    s: &mut TcpStream,
+    name: &str,
+    peer: &str,
+    deadline: Instant,
+) -> Result<MojangJoinedProfile, String> {
+    let auth = online_auth_provider()
+        .ok_or_else(|| "online mode needs a keypair/session provider".to_string())?;
+    let key_der = auth.public_key_der();
+    let token = auth.verify_token();
+    send_packet(
+        s,
+        LOGIN_ENCRYPTION_REQUEST_ID,
+        encode_encryption_request("", &key_der, &token, true),
+    )
+    .map_err(|e| format!("encryption request write failed: {e}"))?;
+    let (id, body) = read_login_frame(s, deadline, None)
+        .ok_or_else(|| "client left before the encryption response".to_string())?;
+    if id != LOGIN_ENCRYPTION_RESPONSE_ID {
+        return Err(format!("expected encryption response 0x01, got packet {id:#04x}"));
+    }
+    let (enc_secret, enc_token) = decode_encryption_response(&body)
+        .ok_or_else(|| "malformed encryption response".to_string())?;
+    let returned_token = auth
+        .decrypt_login_field(&enc_token)
+        .ok_or_else(|| "verify token did not decrypt".to_string())?;
+    if returned_token != token {
+        return Err("verify token mismatch".into());
+    }
+    let secret_vec = auth
+        .decrypt_login_field(&enc_secret)
+        .ok_or_else(|| "shared secret did not decrypt".to_string())?;
+    let secret: [u8; 16] = secret_vec
+        .try_into()
+        .map_err(|_| "shared secret is not 16 bytes".to_string())?;
+    let hash = mc_server_hash("", &secret, &key_der);
+    let profile = auth.has_joined(name, &hash, Some(peer))?;
+    // Every byte from here on travels under AES-128-CFB8; the play writer
+    // (a `try_clone` further down) picks the same cipher up on its own fd.
+    enable_conn_encryption(s, &secret);
+    Ok(profile)
+}
+
+/// The `textures` property a Velocity forward or a Mojang session profile
+/// carries, in `Client.skin`'s `(value, signature)` shape.
+fn forwarded_skin(properties: &[ForwardedProperty]) -> Option<(String, String)> {
+    properties
+        .iter()
+        .find(|p| p.name == "textures")
+        .map(|p| (p.value.clone(), p.signature.clone().unwrap_or_default()))
+}
+
 // ---------- mob equipment (S2C 0x5b SetEquipment) ----------
 
 /// Live mob equipment keyed by entity id, so `Mob` literals stay untouched:
@@ -4800,9 +4984,41 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     }
 }
 
-fn handle(mut s: TcpStream) {
+/// Entry point for one accepted socket (`main` spawns one thread per call).
+/// The whole connection body runs inside `run_isolated_connection`: a panic in
+/// any packet handler becomes one logged, counted disconnect — the listener
+/// and every other client keep running — instead of taking the process down.
+fn handle(s: TcpStream) {
+    let label = s
+        .peer_addr()
+        .map_or_else(|_| "unknown".to_string(), |a| a.to_string());
+    // The play eid this connection registers, shared with the panic cleanup so
+    // a mid-session panic still unregisters the client and its mount state.
+    let live_eid = Arc::new(AtomicI32::new(-1));
+    let cleanup_eid = Arc::clone(&live_eid);
+    let _ = run_isolated_connection(
+        &label,
+        move || handle_inner(s, live_eid),
+        move || {
+            let eid = cleanup_eid.load(Ordering::SeqCst);
+            if eid >= 0 {
+                forget_live_client(eid);
+            }
+        },
+    );
+}
+
+/// The play-state part of a connection's teardown when the handler panics
+/// mid-session: unregister the client from the online list and detach it from
+/// the mount graph like the normal disconnect path does.
+fn forget_live_client(eid: i32) {
+    clients().lock().unwrap().retain(|c| c.eid != eid);
+    live_mount_forget(eid);
+}
+
+fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     s.set_nodelay(true).ok();
-    let peer = s
+    let mut peer = s
         .peer_addr()
         .map_or_else(|_| "unknown".to_string(), |a| a.ip().to_string());
     // Applied before handshake/login: idle unauthenticated sockets must expire.
@@ -4831,11 +5047,15 @@ fn handle(mut s: TcpStream) {
     }
     if next == 1 {
         if let Some((0, _)) = read_packet(&mut s, login_deadline) {
-            let online = clients().lock().unwrap().len();
+            let online_players: Vec<(String, [u8; 16])> = clients()
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| (c.name.clone(), c.uuid))
+                .collect();
             let max = std::env::var("MC_SPINE_MAX_PLAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(20);
             let motd = std::env::var("MC_SPINE_MOTD").unwrap_or_else(|_| "mc-spine".to_owned());
-            let motd = motd.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
-            let json = format!("{{\"version\":{{\"name\":\"1.21.1\",\"protocol\":767}},\"players\":{{\"max\":{max},\"online\":{online}}},\"description\":{{\"text\":\"{motd}\"}}}}");
+            let json = build_status_json_rich(&motd, max, &online_players, status_favicon());
             let mut pl = Vec::new();
             write_str(&mut pl, &json);
             let _ = send_packet(&mut s, 0, pl);
@@ -4856,9 +5076,46 @@ fn handle(mut s: TcpStream) {
     if lid != 0 {
         return;
     }
-    let Some((name, uuid)) = login_identity(&lbody) else {
+    let Some((mut name, mut uuid)) = login_identity(&lbody) else {
         return;
     };
+    // W4: identity-bearing login exchanges run before admission, so the ban and
+    // whitelist checks judge the *verified* identity — the Velocity-forwarded
+    // triple or the Mojang session profile — not whatever the socket claims.
+    let mut login_skin = None;
+    if velocity_forwarding_enabled() {
+        match velocity_login(&mut s, login_deadline) {
+            Ok(fwd) => {
+                eprintln!("[spine] {peer} forwarded {} as {}", fwd.forwarded_ip, fwd.username);
+                peer = fwd.forwarded_ip;
+                uuid = fwd.uuid;
+                name = fwd.username;
+                login_skin = forwarded_skin(&fwd.properties);
+            }
+            Err(why) => {
+                eprintln!("[security] velocity forwarding refused for {name} from {peer}: {why}");
+                login_disconnect_text(&mut s, "This server requires connections through the proxy.");
+                return;
+            }
+        }
+    } else if online_mode_enabled() {
+        match online_login(&mut s, &name, &peer, login_deadline) {
+            Ok(profile) => {
+                uuid = profile.uuid;
+                name = profile.name;
+                login_skin = forwarded_skin(&profile.properties);
+            }
+            Err(why) => {
+                eprintln!("[security] online-mode login refused for {name} from {peer}: {why}");
+                login_disconnect(&mut s, "Failed to verify username!");
+                return;
+            }
+        }
+    }
+    // `LoginCompression` only guards the wire entry when a threshold was
+    // negotiated; a cipher armed above must not outlive this connection, or a
+    // later connection reusing the fd would read a dead keystream.
+    let _cipher_guard = conn_cipher(&s).map(|_| SocketCipherGuard(socket_key(&s)));
     if let Some(list) = connection_limits::allowlist() {
         if !list.permits(&name, &uuid) {
             eprintln!("[security] login refused for {name} from {peer}: not on the allowlist");
@@ -5133,6 +5390,17 @@ fn handle(mut s: TcpStream) {
     );
     // ---- multiplayer: register self, tell others, learn others ----
     let Ok(writer) = s.try_clone() else { return };
+    // The play writer is a second fd on the same socket; the cipher armed on
+    // `s` during the encryption handshake must cover it or broadcasts to this
+    // client would leave in the clear.
+    if let Some(cipher) = conn_cipher(&s) {
+        socket_wire()
+            .lock()
+            .unwrap()
+            .entry(socket_key(&writer))
+            .or_default()
+            .cipher = Some(cipher);
+    }
     let me = Arc::new(Client {
         eid: player_eid,
         uuid: player_uuid,
@@ -5191,7 +5459,7 @@ fn handle(mut s: TcpStream) {
         spawn_dim: Mutex::new(saved_player.as_ref().and_then(|save| save.respawn.map(|point| point.dim)).unwrap_or(saved_dim)),
         in_portal: Mutex::new(false),
         portal_at: Mutex::new(None),
-        skin: Mutex::new(None),
+        skin: Mutex::new(login_skin.clone()),
         held: Mutex::new(initial_held),
         effs: Mutex::new(saved_player.as_ref().map_or_else(Vec::new, |save| {
             save.effects.iter().map(|&(id, amp, left)| Eff { id, amp, left }).collect()
@@ -5201,6 +5469,9 @@ fn handle(mut s: TcpStream) {
         sleeping: Mutex::new(None),
         inv_state_id: AtomicI32::new(0),
     });
+    // Published to the panic cleanup in `handle` before the client list sees
+    // the player, so a panic anywhere below still unregisters this eid.
+    live_eid.store(me.eid, Ordering::SeqCst);
     let mut retry_chunks = chunk_delivery.has_pending();
     me.enter_play_wire(compression, chunk_delivery);
     {
@@ -5270,7 +5541,11 @@ fn handle(mut s: TcpStream) {
     if login_admin != player_is_admin(&me.name) {
         update_client_commands(&me);
     }
-    kick_skin(name.clone(), &me);
+    // A forwarded or session-verified skin is already on `me`; only run the
+    // offline Mojang lookup when login left the player skinless.
+    if login_skin.is_none() {
+        kick_skin(name.clone(), &me);
+    }
     // refresh armor points from restored inventory
     {
         let iv = me.inv.lock().unwrap();
@@ -9122,6 +9397,24 @@ fn handle(mut s: TcpStream) {
     }
 }
 
+/// The `server-icon.png` favicon for the status reply, loaded once at first
+/// ping. An absent or invalid icon is simply omitted — a bad file must never
+/// take down a status answer.
+fn status_favicon() -> Option<&'static str> {
+    static FAVICON: OnceLock<Option<String>> = OnceLock::new();
+    FAVICON
+        .get_or_init(|| {
+            match load_server_icon_favicon(std::path::Path::new("server-icon.png")) {
+                Ok(icon) => icon,
+                Err(why) => {
+                    eprintln!("[spine] {why}");
+                    None
+                }
+            }
+        })
+        .as_deref()
+}
+
 fn status_version_mismatch(s: &mut TcpStream, reason: &str, deadline: Instant) {
     if !matches!(read_packet(s, deadline), Some((0, _))) {
         return;
@@ -10192,5 +10485,528 @@ mod w3_tests {
         assert_eq!(block_empty, tall.light_mask_longs());
 
         worldgen::reset_dimension_registry();
+    }
+}
+
+#[cfg(test)]
+mod w4_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn w4_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(15)
+    }
+
+    /// Restores env vars and shared wiring state on drop — including under a
+    /// panic, so a failed assert cannot poison the tests that run after it.
+    struct W4Env {
+        vars: Vec<(&'static str, Option<String>)>,
+    }
+    impl W4Env {
+        fn new() -> Self {
+            W4Env { vars: Vec::new() }
+        }
+        fn set(mut self, name: &'static str, value: &str) -> Self {
+            self.vars.push((name, std::env::var(name).ok()));
+            std::env::set_var(name, value);
+            self
+        }
+    }
+    impl std::ops::Drop for W4Env {
+        fn drop(&mut self) {
+            for (name, old) in self.vars.drain(..) {
+                match old {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+            *live_admission().lock().unwrap() = None;
+            set_online_auth_provider(None);
+        }
+    }
+
+    /// The client half of a loopback session: a `ConnStream` so the same code
+    /// drives both the plain and the AES-128-CFB8 wire forms.
+    fn w4_client() -> (ConnStream, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (srv, _) = listener.accept().unwrap();
+            handle(srv);
+        });
+        let cli = TcpStream::connect(addr).unwrap();
+        cli.set_nodelay(true).ok();
+        cli.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        (ConnStream::from(cli), server)
+    }
+
+    fn w4_send(cli: &mut ConnStream, id: i64, payload: &[u8]) {
+        let mut body = Vec::new();
+        write_varint(&mut body, id);
+        body.extend_from_slice(payload);
+        let mut frame = Vec::new();
+        write_varint(&mut frame, body.len() as i64);
+        frame.extend_from_slice(&body);
+        cli.write_all(&frame).unwrap();
+    }
+
+    fn w4_read_exact(cli: &mut ConnStream, mut out: &mut [u8], deadline: Instant) -> Option<()> {
+        while !out.is_empty() {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            cli.tcp().set_read_timeout(Some(remaining)).ok()?;
+            let n = cli.read(out).ok()?;
+            if n == 0 {
+                return None;
+            }
+            out = &mut out[n..];
+        }
+        Some(())
+    }
+
+    /// Frame + packet-id decode on the test client, like `read_login_frame`
+    /// without compression (the test build negotiates none by default).
+    fn w4_read_packet(cli: &mut ConnStream, deadline: Instant) -> Option<(i64, Vec<u8>)> {
+        let mut len = 0u64;
+        let mut done = false;
+        for i in 0..3 {
+            let mut b = [0u8; 1];
+            w4_read_exact(cli, &mut b, deadline)?;
+            len |= ((b[0] & 0x7f) as u64) << (7 * i);
+            if b[0] & 0x80 == 0 {
+                done = true;
+                break;
+            }
+        }
+        if !done || len == 0 || len > 64 * 1024 {
+            return None;
+        }
+        let mut body = vec![0u8; len as usize];
+        w4_read_exact(cli, &mut body, deadline)?;
+        let mut payload = body.as_slice();
+        let id = read_protocol_i32(&mut payload)?;
+        Some((i64::from(id), payload.to_vec()))
+    }
+
+    /// Handshake (next=2) + Login Start through the current transport.
+    fn w4_login_start(cli: &mut ConnStream, name: &str, uuid: [u8; 16]) {
+        let mut hs = Vec::new();
+        write_varint(&mut hs, 767);
+        write_str(&mut hs, "127.0.0.1");
+        hs.extend_from_slice(&25565u16.to_be_bytes());
+        write_varint(&mut hs, 2);
+        w4_send(cli, 0x00, &hs);
+        let mut login = Vec::new();
+        write_str(&mut login, name);
+        login.extend_from_slice(&uuid);
+        w4_send(cli, 0x00, &login);
+    }
+
+    /// The first packet carrying `wanted`'s id, or the decode error that came
+    /// instead; drains anything else the server sends first.
+    fn w4_read_until(cli: &mut ConnStream, wanted: i64, deadline: Instant) -> Option<Vec<u8>> {
+        while let Some((pid, body)) = w4_read_packet(cli, deadline) {
+            if pid == wanted {
+                return Some(body);
+            }
+        }
+        None
+    }
+
+    /// A signed `velocity:player_info` body: the forwarding fields followed by
+    /// the 32-byte HMAC-SHA256 prefix `verify_velocity_forwarding` checks.
+    fn w4_velocity_payload(
+        secret: &[u8],
+        ip: &str,
+        uuid: [u8; 16],
+        name: &str,
+        properties: &[ForwardedProperty],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        write_varint(&mut body, VELOCITY_FORWARDING_VERSION_MAX as i64);
+        write_str(&mut body, ip);
+        body.extend_from_slice(&uuid);
+        write_str(&mut body, name);
+        write_varint(&mut body, properties.len() as i64);
+        for p in properties {
+            write_str(&mut body, &p.name);
+            write_str(&mut body, &p.value);
+            match &p.signature {
+                Some(sig) => {
+                    body.push(1);
+                    write_str(&mut body, sig);
+                }
+                None => body.push(0),
+            }
+        }
+        let mut payload = hmac_sha256(secret, &body).to_vec();
+        payload.extend_from_slice(&body);
+        payload
+    }
+
+    /// After Login Start the forwarding gate asks for `velocity:player_info`;
+    /// return its message id so the test can answer.
+    fn w4_expect_plugin_request(cli: &mut ConnStream, deadline: Instant) -> i64 {
+        let (pid, body) = w4_read_packet(cli, deadline).expect("plugin request");
+        assert_eq!(pid, 0x04);
+        let mut b = &body[..];
+        let mid = read_varint(&mut b).unwrap();
+        let channel_len = usize::try_from(read_varint(&mut b).unwrap()).unwrap();
+        assert_eq!(&b[..channel_len], VELOCITY_FORWARDING_CHANNEL.as_bytes());
+        assert_eq!(&b[channel_len..], &[VELOCITY_FORWARDING_VERSION_MAX as u8]);
+        mid
+    }
+
+    fn w4_send_plugin_response(cli: &mut ConnStream, mid: i64, data: &[u8]) {
+        let mut resp = Vec::new();
+        write_varint(&mut resp, mid);
+        resp.push(1); // successful
+        resp.extend_from_slice(data);
+        w4_send(cli, 0x02, &resp);
+    }
+
+    /// An offline online-mode provider: a fixed "public key", identity
+    /// decryption, and a canned session profile; it records what the server
+    /// asked it to verify so the test can check the vanilla server hash.
+    struct W4Auth {
+        key_der: Vec<u8>,
+        token: Vec<u8>,
+        profile: MojangJoinedProfile,
+        decrypt_calls: Mutex<Vec<Vec<u8>>>,
+        seen_hash: Mutex<Option<String>>,
+        seen_ip: Mutex<Option<String>>,
+    }
+    impl OnlineAuth for W4Auth {
+        fn public_key_der(&self) -> Vec<u8> {
+            self.key_der.clone()
+        }
+        fn decrypt_login_field(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+            self.decrypt_calls
+                .lock()
+                .unwrap()
+                .push(ciphertext.to_vec());
+            Some(ciphertext.to_vec())
+        }
+        fn verify_token(&self) -> Vec<u8> {
+            self.token.clone()
+        }
+        fn has_joined(
+            &self,
+            _username: &str,
+            server_hash: &str,
+            client_ip: Option<&str>,
+        ) -> Result<MojangJoinedProfile, String> {
+            *self.seen_hash.lock().unwrap() = Some(server_hash.to_string());
+            *self.seen_ip.lock().unwrap() = client_ip.map(str::to_string);
+            Ok(self.profile.clone())
+        }
+    }
+
+    #[test]
+    fn w4_status_ping_includes_player_sample_and_valid_favicon() {
+        // The favicon cache is process-global; write the icon before the first
+        // ping this binary ever answers so the OnceLock captures it.
+        let icon = std::path::Path::new("server-icon.png");
+        assert!(!icon.exists(), "test requires a clean working dir");
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&64u32.to_be_bytes());
+        png.extend_from_slice(&64u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        std::fs::write(icon, &png).unwrap();
+
+        // One registered client makes `players.sample` non-empty.
+        let (mut viewer, _hold) = effect_tests::client_pair();
+        viewer.name = "W4StatusViewer".to_string();
+        viewer.uuid = [0xabu8; 16];
+        let viewer = Arc::new(viewer);
+        clients().lock().unwrap().push(viewer.clone());
+
+        let (mut cli, server) = w4_client();
+        let deadline = w4_deadline();
+        let mut hs = Vec::new();
+        write_varint(&mut hs, 767);
+        write_str(&mut hs, "127.0.0.1");
+        hs.extend_from_slice(&25565u16.to_be_bytes());
+        write_varint(&mut hs, 1); // status
+        w4_send(&mut cli, 0x00, &hs);
+        w4_send(&mut cli, 0x00, &[]); // Status Request
+        let body = w4_read_until(&mut cli, 0x00, deadline).expect("status response");
+        let mut sl = &body[..];
+        let n = usize::try_from(read_varint(&mut sl).unwrap()).unwrap();
+        let text = std::str::from_utf8(&sl[..n]).unwrap().to_string();
+        jparse(text.as_bytes()).expect("status response parses as json");
+        assert!(text.contains("\"name\":\"1.21.1\",\"protocol\":767"), "{text}");
+        assert!(text.contains("\"name\":\"W4StatusViewer\""), "{text}");
+        assert!(
+            text.contains("\"id\":\"abababab-abab-abab-abab-abababababab\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"favicon\":\"data:image/png;base64,"),
+            "{text}"
+        );
+        assert!(text.contains("\"text\":\"mc-spine\""), "{text}");
+
+        // Ping keeps working after the rich response (payload echoes).
+        w4_send(&mut cli, 0x01, &0xfeed_beefi64.to_be_bytes());
+        let pong = w4_read_until(&mut cli, 0x01, deadline).expect("pong");
+        assert_eq!(pong, 0xfeed_beefi64.to_be_bytes().to_vec());
+
+        clients().lock().unwrap().retain(|c| c.eid != viewer.eid);
+        drop(cli);
+        let _ = server.join();
+        let _ = std::fs::remove_file(icon);
+    }
+
+    #[test]
+    fn w4_velocity_forwarding_accepts_signed_and_rejects_tampered_login() {
+        let secret = "w4-shared-secret";
+        let _env = W4Env::new()
+            .set("MC_SPINE_VELOCITY_FORWARDING", "1")
+            .set("MC_SPINE_VELOCITY_SECRET", secret);
+        let deadline = w4_deadline();
+
+        // A valid signed payload adopts the forwarded identity: the client lied
+        // about its name/uuid in Login Start, and Login Success carries the
+        // forwarded triple instead.
+        let fwd_uuid = [0xabu8; 16];
+        let signed = w4_velocity_payload(
+            secret.as_bytes(),
+            "203.0.113.10",
+            fwd_uuid,
+            "W4Velocity",
+            &[ForwardedProperty {
+                name: "textures".into(),
+                value: "dmFs".into(),
+                signature: Some("c2ln".into()),
+            }],
+        );
+        let (mut cli, server) = w4_client();
+        w4_login_start(&mut cli, "Impostor_Name", [0x11u8; 16]);
+        let mid = w4_expect_plugin_request(&mut cli, deadline);
+        w4_send_plugin_response(&mut cli, mid, &signed);
+        let body = w4_read_until(&mut cli, 0x02, deadline).expect("login success");
+        let mut b = &body[..];
+        assert_eq!(&b[..16], &fwd_uuid, "forwarded uuid must be adopted");
+        b = &b[16..];
+        let n = usize::try_from(read_varint(&mut b).unwrap()).unwrap();
+        assert_eq!(&b[..n], b"W4Velocity", "forwarded name must be adopted");
+        drop(cli);
+        let _ = server.join();
+
+        // The IP ban runs on the *forwarded* address, not the loopback peer.
+        *live_admission().lock().unwrap() = Some(LiveAdmission {
+            ops: OpsRegistry::default(),
+            bans: BanRegistry {
+                players: Vec::new(),
+                ips: vec![IpBanEntry {
+                    ip: "203.0.113.99".into(),
+                    created: "test".into(),
+                    source: "test".into(),
+                    expires: "forever".into(),
+                    reason: "test ban".into(),
+                }],
+            },
+            whitelist: WhitelistRegistry::default(),
+            max_players: 20,
+        });
+        let signed = w4_velocity_payload(
+            secret.as_bytes(),
+            "203.0.113.99",
+            [0xbcu8; 16],
+            "W4BannedIp",
+            &[],
+        );
+        let (mut cli, server) = w4_client();
+        w4_login_start(&mut cli, "LoopbackOk", [0x22u8; 16]);
+        let mid = w4_expect_plugin_request(&mut cli, deadline);
+        w4_send_plugin_response(&mut cli, mid, &signed);
+        let body = w4_read_until(&mut cli, 0x00, deadline).expect("ip ban disconnect");
+        let mut sl = &body[..];
+        let n = usize::try_from(read_varint(&mut sl).unwrap()).unwrap();
+        let text = std::str::from_utf8(&sl[..n]).unwrap().to_string();
+        assert!(
+            text.contains("Your IP address is banned from this server."),
+            "{text}"
+        );
+        drop(cli);
+        let _ = server.join();
+        *live_admission().lock().unwrap() = None;
+
+        // A tampered payload fails closed with a Login Disconnect, then the
+        // connection is gone entirely.
+        let mut bad = w4_velocity_payload(
+            secret.as_bytes(),
+            "203.0.113.10",
+            [0xccu8; 16],
+            "W4Tamperer",
+            &[],
+        );
+        let last = bad.len() - 1;
+        bad[last] ^= 0x80;
+        let (mut cli, server) = w4_client();
+        w4_login_start(&mut cli, "W4Tamperer", [0x33u8; 16]);
+        let mid = w4_expect_plugin_request(&mut cli, deadline);
+        w4_send_plugin_response(&mut cli, mid, &bad);
+        let (pid, _body) = w4_read_packet(&mut cli, deadline).expect("fail-closed disconnect");
+        assert_eq!(pid, 0x00, "a tampered forward must disconnect");
+        assert!(
+            w4_read_packet(&mut cli, deadline).is_none(),
+            "the connection must be closed after the disconnect"
+        );
+        drop(cli);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn w4_encrypted_stream_roundtrips_protocol_packets_with_aes128_cfb8() {
+        let _env = W4Env::new().set("MC_SPINE_ONLINE_MODE", "1");
+        let deadline = w4_deadline();
+        let secret = [0x5au8; 16];
+        let key_der = vec![0x30, 0x82, 0x01, 0x0a];
+        let auth = Arc::new(W4Auth {
+            key_der: key_der.clone(),
+            token: vec![0xde, 0xad, 0xbe, 0xef],
+            profile: MojangJoinedProfile {
+                uuid: [0x42u8; 16],
+                name: "W4Verified".into(),
+                properties: vec![ForwardedProperty {
+                    name: "textures".into(),
+                    value: "dmFs".into(),
+                    signature: Some("c2ln".into()),
+                }],
+            },
+            decrypt_calls: Mutex::new(Vec::new()),
+            seen_hash: Mutex::new(None),
+            seen_ip: Mutex::new(None),
+        });
+        set_online_auth_provider(Some(auth.clone()));
+
+        let (mut cli, server) = w4_client();
+        w4_login_start(&mut cli, "W4Plain", [0x33u8; 16]);
+
+        // Encryption Request: the provider's key and verify token go out plain.
+        let body = w4_read_until(&mut cli, 0x01, deadline).expect("encryption request");
+        let (server_id, req_key, req_token, should_auth) =
+            decode_encryption_request(&body).expect("request decodes");
+        assert_eq!(server_id, "");
+        assert_eq!(req_key, key_der);
+        assert_eq!(req_token, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert!(should_auth);
+
+        // Encryption Response ("encrypted" is the identity map under the test
+        // provider), then both ends switch to AES-128-CFB8.
+        w4_send(&mut cli, 0x01, &encode_encryption_response(&secret, &req_token));
+        cli.enable_encryption(&secret).unwrap();
+
+        // Login Success arrives encrypted, carrying the session profile.
+        let body = w4_read_until(&mut cli, 0x02, deadline).expect("login success");
+        let mut b = &body[..];
+        assert_eq!(&b[..16], &[0x42u8; 16], "profile uuid must be adopted");
+        b = &b[16..];
+        let n = usize::try_from(read_varint(&mut b).unwrap()).unwrap();
+        assert_eq!(&b[..n], b"W4Verified", "profile name must be adopted");
+
+        // Login Acknowledged + the configuration dance, all encrypted. The
+        // server only advances if these serverbound frames decode.
+        w4_send(&mut cli, 0x03, &[]);
+        let mut ci = Vec::new();
+        write_str(&mut ci, "en_us");
+        ci.push(2);
+        write_varint(&mut ci, 0);
+        ci.push(1);
+        ci.push(0x7f);
+        write_varint(&mut ci, 1);
+        ci.push(0);
+        ci.push(1);
+        w4_send(&mut cli, 0x00, &ci);
+        let mut finished = false;
+        while let Some((pid, _)) = w4_read_packet(&mut cli, deadline) {
+            if pid == 0x0e {
+                let mut kp = Vec::new();
+                write_varint(&mut kp, 0);
+                w4_send(&mut cli, 0x07, &kp);
+            } else if pid == 0x03 {
+                w4_send(&mut cli, 0x03, &[]);
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "finish configuration under encryption");
+
+        // The first Play packet family — Join Game 0x2b — must decrypt too.
+        assert!(
+            w4_read_until(&mut cli, 0x2b, deadline).is_some(),
+            "join game under AES-128-CFB8"
+        );
+
+        // The session check saw the vanilla server hash and the real peer IP.
+        assert_eq!(
+            *auth.seen_hash.lock().unwrap(),
+            Some(mc_server_hash("", &secret, &key_der)),
+            "hasJoined must be asked for the sha1 of id || secret || key"
+        );
+        assert_eq!(
+            auth.seen_ip.lock().unwrap().as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(auth.decrypt_calls.lock().unwrap().len(), 2);
+        drop(cli);
+        let _ = server.join();
+
+        // Fail closed: online mode enabled without an installed provider
+        // refuses the login rather than silently running offline.
+        set_online_auth_provider(None);
+        let (mut cli, server) = w4_client();
+        w4_login_start(&mut cli, "W4NoAuth", [0x44u8; 16]);
+        let (pid, _body) = w4_read_packet(&mut cli, deadline).expect("disconnect");
+        assert_eq!(pid, 0x00, "no provider must fail closed");
+        drop(cli);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn w4_isolated_connection_catches_panic_without_poisoning_server() {
+        // A registered, mounted client that a panicking handler would orphan.
+        let (client, _peer) = effect_tests::client_pair();
+        let me = Arc::new(client);
+        clients().lock().unwrap().push(me.clone());
+        let vehicle = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut live = mounts().lock().unwrap();
+            live.registry
+                .register_vehicle(vehicle, VehicleKind::Boat, [0.0, 64.0, 0.0]);
+            live.registry.register_rider(me.eid, [0.0, 64.0, 0.0]);
+            live.registry.mount(vehicle, me.eid).unwrap();
+        }
+        assert_eq!(vehicle_of(me.eid), Some(vehicle));
+
+        let before = ISOLATED_CONNECTION_DISCONNECTS.load(Ordering::SeqCst);
+        let out: Option<u8> = run_isolated_connection(
+            "w4-panic-test",
+            || -> u8 { panic!("synthetic handler bug") },
+            || forget_live_client(me.eid),
+        );
+        assert_eq!(out, None);
+        assert_eq!(
+            ISOLATED_CONNECTION_DISCONNECTS.load(Ordering::SeqCst),
+            before + 1
+        );
+        assert!(
+            clients().lock().unwrap().iter().all(|c| c.eid != me.eid),
+            "the panicked client must be unregistered"
+        );
+        assert_eq!(vehicle_of(me.eid), None, "the ghost rider must dismount");
+
+        // The process is not poisoned: a fresh loopback login still completes.
+        let (mut cli, server) = w4_client();
+        w4_login_start(&mut cli, "W4Survivor", [0x99u8; 16]);
+        assert!(
+            w4_read_until(&mut cli, 0x02, w4_deadline()).is_some(),
+            "server still answers logins after an isolated panic"
+        );
+        drop(cli);
+        let _ = server.join();
     }
 }

@@ -626,6 +626,145 @@ where
     }
 }
 
+// ================= connection transport: plain or AES-128-CFB8 =================
+//
+// One connection's bytes either go through the socket untouched (offline /
+// pre-encryption login) or through an AES-128-CFB8 pair keyed by the shared
+// secret negotiated in the Encryption Response. `Plain` costs one match arm
+// per call; `Encrypted` adds an in-place cipher pass per read/write.
+
+#[allow(dead_code)]
+pub(crate) enum ConnStream {
+    Plain(TcpStream),
+    Encrypted {
+        stream: TcpStream,
+        rx: Aes128Cfb8,
+        tx: Aes128Cfb8,
+    },
+}
+
+#[allow(dead_code)]
+impl ConnStream {
+    /// The socket underneath either lane, for timeouts, shutdown and peer
+    /// lookups the transport enum itself does not model.
+    pub(crate) fn tcp(&self) -> &TcpStream {
+        match self {
+            ConnStream::Plain(s) => s,
+            ConnStream::Encrypted { stream, .. } => stream,
+        }
+    }
+
+    /// Switch a still-plain transport to encrypted with the negotiated shared
+    /// secret (key == IV, per the Java protocol). Fails on an already-encrypted
+    /// stream rather than silently restarting the keystream.
+    pub(crate) fn enable_encryption(&mut self, secret: &[u8; 16]) -> std::io::Result<()> {
+        let ConnStream::Plain(stream) = self else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "connection already runs encrypted",
+            ));
+        };
+        let stream = stream.try_clone()?;
+        *self = ConnStream::Encrypted {
+            stream,
+            rx: Aes128Cfb8::new(secret, secret),
+            tx: Aes128Cfb8::new(secret, secret),
+        };
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+impl From<TcpStream> for ConnStream {
+    fn from(stream: TcpStream) -> Self {
+        ConnStream::Plain(stream)
+    }
+}
+
+#[allow(dead_code)]
+impl Read for ConnStream {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ConnStream::Plain(s) => s.read(out),
+            ConnStream::Encrypted { stream, rx, .. } => {
+                let n = stream.read(out)?;
+                rx.decrypt(&mut out[..n]);
+                Ok(n)
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl Write for ConnStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            ConnStream::Plain(s) => s.write(buf),
+            ConnStream::Encrypted { stream, tx, .. } => {
+                // The cipher consumes exactly what leaves the socket; encrypt
+                // the slice and report it written only once it all went out.
+                let mut encrypted = buf.to_vec();
+                tx.encrypt(&mut encrypted);
+                stream.write_all(&encrypted)?;
+                Ok(buf.len())
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ConnStream::Plain(s) => s.flush(),
+            ConnStream::Encrypted { stream, .. } => stream.flush(),
+        }
+    }
+}
+
+// ================= online-mode provider slot =================
+//
+// The login handshake needs two things the audited dependency set cannot grow
+// into this file: an RSA keypair (the Encryption Request's public key, and the
+// private key that unwraps the client's answer) and the session-server check.
+// Both sit behind this installed-at-startup provider so the handshake stays
+// testable offline and the keypair can arrive as a later lane without a
+// signature change. `None` (the shipping default) fails every online-mode
+// login closed rather than pretending to verify.
+
+/// The keypair and session-verification half of online-mode login.
+#[allow(dead_code)]
+pub(crate) trait OnlineAuth: Send + Sync {
+    /// DER-encoded public key sent in the Encryption Request.
+    fn public_key_der(&self) -> Vec<u8>;
+    /// Unwrap one client-encrypted field of the Encryption Response.
+    fn decrypt_login_field(&self, ciphertext: &[u8]) -> Option<Vec<u8>>;
+    /// Fresh per-handshake bytes the client must echo back encrypted.
+    fn verify_token(&self) -> Vec<u8>;
+    /// `sessionserver` hasJoined for `username`/`server_hash`; `client_ip` is
+    /// the optional prevent-proxy IP argument.
+    fn has_joined(
+        &self,
+        username: &str,
+        server_hash: &str,
+        client_ip: Option<&str>,
+    ) -> Result<MojangJoinedProfile, String>;
+}
+
+fn online_auth_slot() -> &'static Mutex<Option<Arc<dyn OnlineAuth>>> {
+    static SLOT: OnceLock<Mutex<Option<Arc<dyn OnlineAuth>>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Install (or clear) the online-mode provider. Startup wiring and tests use
+/// this; the login path reads through `online_auth_provider`.
+#[allow(dead_code)]
+pub(crate) fn set_online_auth_provider(provider: Option<Arc<dyn OnlineAuth>>) {
+    *online_auth_slot().lock().unwrap() = provider;
+}
+
+/// The installed provider, or `None` when online mode must fail closed.
+#[allow(dead_code)]
+pub(crate) fn online_auth_provider() -> Option<Arc<dyn OnlineAuth>> {
+    online_auth_slot().lock().unwrap().clone()
+}
+
 // ================= async background autosave =================
 //
 // The tick loop produces an immutable serialized snapshot and hands it to one
