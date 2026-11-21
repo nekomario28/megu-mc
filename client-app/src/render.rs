@@ -12,10 +12,12 @@ use std::time::{Duration, Instant};
 
 use mc_spine_client_mesh::ffi::PackedVertex;
 use mc_spine_client_mesh::{
-    box_facing_mask, bucket_draw_mask, GraphCuller, RenderBackendPreference, RenderRegions,
-    SectionCoord, DIRECTION_BUCKETS, DIRECTION_BUCKET_UNASSIGNED,
+    box_facing_mask, bucket_draw_mask, BakedModelQuad, DirectionBuckets, GraphCuller, HiZPyramid,
+    RenderBackendPreference, RenderRegions, SectionCoord, DIRECTION_BUCKETS,
+    DIRECTION_BUCKET_UNASSIGNED,
 };
 
+use crate::audio_qol::ZoomState;
 use crate::protocol::zlib_compress_stored;
 use crate::settings::{ClientSettings, CloudMode, ParticleLevel};
 use crate::world::WorldState;
@@ -344,6 +346,14 @@ pub struct RenderStats {
     /// Non-empty direction buckets skipped as backfacing across drawn
     /// sections.
     pub buckets_culled: u64,
+    /// Sections whose 16^3 AABB was tested against the `HiZPyramid` during
+    /// a Hi-Z frame (0 when Hi-Z is off).
+    pub hiz_tested_sections: u64,
+    /// Sections the `HiZPyramid` proved fully occluded — skipped before
+    /// rasterization with zero effect on the output pixels.
+    pub hiz_culled_sections: u64,
+    /// `BakedModelQuad`s rasterized by the placed-model pass.
+    pub model_quads_drawn: u64,
 }
 
 /// A rendered RGB frame ready for PNG encoding.
@@ -396,6 +406,10 @@ struct Rasterizer {
     rgb: Vec<u8>,
     depth: Vec<f32>,
     focal: f64,
+    /// Depth-prepass mode: triangles write only `depth` (no color, no
+    /// `pixels_shaded` accounting) so the resulting buffer can feed a
+    /// `HiZPyramid` build before the shading pass runs.
+    depth_only: bool,
     stats: RenderStats,
 }
 
@@ -426,6 +440,7 @@ impl Rasterizer {
             rgb,
             depth: vec![f32::INFINITY; w * h],
             focal: (f64::from(height) * 0.5) / (fov_deg.to_radians() * 0.5).tan(),
+            depth_only: false,
             stats: RenderStats::default(),
         }
     }
@@ -498,6 +513,10 @@ impl Rasterizer {
                 if depth >= self.depth[idx] as f64 {
                     continue;
                 }
+                if self.depth_only {
+                    self.depth[idx] = depth as f32;
+                    continue;
+                }
                 let wsum = iz;
                 let shade = |c: usize| {
                     (w0 * p[0].color[c] as f64 * inv[0]
@@ -559,6 +578,29 @@ impl Rasterizer {
         for fan in 1..poly.len() - 1 {
             self.triangle(&[poly[0], poly[fan], poly[fan + 1]], translucent, alpha);
         }
+    }
+
+    /// The depth buffer re-mapped to `[0, 1]` (`0` = `NEAR_Z`, `1` =
+    /// `FAR_Z`/untouched), exactly the `z_ndc = a + b/z` mapping
+    /// [`view_proj_matrix`] produces, for `HiZPyramid::from_depth_buffer`.
+    fn depth_01(&self) -> Vec<f32> {
+        self.depth
+            .iter()
+            .map(|&z| {
+                let z = f64::from(z);
+                if !z.is_finite() || z <= 0.0 {
+                    1.0
+                } else {
+                    ((FAR_Z * (z - NEAR_Z) / ((FAR_Z - NEAR_Z) * z)) as f32).clamp(0.0, 1.0)
+                }
+            })
+            .collect()
+    }
+
+    /// Restore every depth texel to the untouched (far) value after a
+    /// prepass, so the shading pass re-resolves visibility from scratch.
+    fn reset_depth(&mut self) {
+        self.depth.fill(f32::INFINITY);
     }
 }
 
@@ -744,6 +786,281 @@ pub fn frustum_planes_fov(
     ]
 }
 
+/// Row-major 4x4 `clip = view_proj * [x, y, z, 1]` matching the
+/// rasterizer's perspective projection: camera-space `x` right, `y` up, `z`
+/// forward; NDC `x`/`y` map linearly onto `width`/`height` pixels with
+/// top-left origin, and NDC `z` is the Vulkan-style `[0, 1]` range
+/// (`0` = `NEAR_Z`, `1` = `FAR_Z`) that `HiZPyramid::cull_world_aabb`
+/// reads.
+fn view_proj_matrix(
+    eye: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    width: u32,
+    height: u32,
+    fov_deg: f64,
+) -> [[f32; 4]; 4] {
+    let (fwd, right, up) = camera_basis(yaw, pitch);
+    // view: world -> camera.
+    let view = [
+        [
+            right[0],
+            right[1],
+            right[2],
+            -(right[0] * eye[0] + right[1] * eye[1] + right[2] * eye[2]),
+        ],
+        [
+            up[0],
+            up[1],
+            up[2],
+            -(up[0] * eye[0] + up[1] * eye[1] + up[2] * eye[2]),
+        ],
+        [
+            fwd[0],
+            fwd[1],
+            fwd[2],
+            -(fwd[0] * eye[0] + fwd[1] * eye[1] + fwd[2] * eye[2]),
+        ],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    let focal = (f64::from(height) * 0.5) / (fov_deg.to_radians() * 0.5).tan();
+    // Rasterizer convention: sx = W/2 + cx*f/z, sy = H/2 - cy*f/z, and the
+    // Hi-Z pixel mapping py = (ndc*0.5 + 0.5) * dim counts from the top, so
+    // clip y flips sign.
+    let fx = 2.0 * focal / f64::from(width);
+    let fy = -2.0 * focal / f64::from(height);
+    let a = FAR_Z / (FAR_Z - NEAR_Z);
+    let b = -FAR_Z * NEAR_Z / (FAR_Z - NEAR_Z);
+    // proj: camera -> clip with w = z_cam, ndc_z in [0, 1].
+    let proj = [
+        [fx, 0.0, 0.0, 0.0],
+        [0.0, fy, 0.0, 0.0],
+        [0.0, 0.0, a, b],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+    let mut out = [[0.0f32; 4]; 4];
+    for (r, row) in out.iter_mut().enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
+            let mut v = 0.0f64;
+            for k in 0..4 {
+                v += proj[r][k] * view[k][c];
+            }
+            *cell = v as f32;
+        }
+    }
+    out
+}
+
+/// Rasterize the opaque quads of one packed section across the direction
+/// buckets `draw_mask` keeps, returning whether any translucent quads were
+/// seen (they queue the section for the later sorted pass). Bucket
+/// accounting is charged only when `count_stats` — the Hi-Z depth prepass
+/// re-runs the same routine and must not double-count.
+#[allow(clippy::too_many_arguments)]
+fn rasterize_section_opaque(
+    raster: &mut Rasterizer,
+    packed: &[PackedVertex],
+    buckets: &DirectionBuckets,
+    draw_mask: u8,
+    origin: [f64; 3],
+    config: &RenderConfig,
+    to_camera: &dyn Fn([f64; 3]) -> [f64; 3],
+    count_stats: bool,
+) -> bool {
+    let mut section_has_translucent = false;
+    for bucket in 0..DIRECTION_BUCKETS {
+        let (offset, count) = (
+            buckets.offset[bucket] as usize,
+            buckets.count[bucket] as usize,
+        );
+        if count == 0 {
+            continue;
+        }
+        if bucket != DIRECTION_BUCKET_UNASSIGNED && draw_mask & (1 << bucket) == 0 {
+            if count_stats {
+                raster.stats.buckets_culled += 1;
+            }
+            continue;
+        }
+        if count_stats {
+            raster.stats.buckets_drawn += 1;
+        }
+        for qi in offset..offset + count {
+            let quad = &packed[qi * 4..qi * 4 + 4];
+            let mut verts = [CamVertex::default(); 4];
+            let mut any_translucent = false;
+            for (i, pv) in quad.iter().enumerate() {
+                verts[i] = decode_vertex(pv, origin, config.smooth_lighting);
+                any_translucent |= is_translucent_quad(&verts[i]);
+            }
+            // All four vertices of a quad share layer/fluid/diagonal.
+            if any_translucent {
+                section_has_translucent = true;
+                continue;
+            }
+            let diagonal = verts[0].diagonal;
+            for vtx in verts.iter_mut() {
+                vtx.pos = to_camera(vtx.pos);
+            }
+            let tris: [[usize; 3]; 2] = if diagonal {
+                [[0, 1, 3], [1, 2, 3]]
+            } else {
+                [[0, 1, 2], [0, 2, 3]]
+            };
+            for tri in tris {
+                raster.clipped_triangle(
+                    &[verts[tri[0]], verts[tri[1]], verts[tri[2]]],
+                    false,
+                    1.0,
+                );
+            }
+        }
+    }
+    section_has_translucent
+}
+
+/// One placed batch of resource-pack model geometry: `BakedModelQuad`s in
+/// block-local `0..=1` space drawn at `origin` with a uniform `scale`.
+/// Resource packs produce these through
+/// `mc_spine_client_mesh::model_baker::bake_model`.
+#[derive(Clone, Debug)]
+pub struct BakedModelDraw<'a> {
+    /// Quads in block-local model space (e.g. `BakedModel::quads`).
+    pub quads: &'a [BakedModelQuad],
+    /// World-space origin of the block the model occupies.
+    pub origin: [f64; 3],
+    /// Uniform scale applied to model-space coordinates (`1.0` = one block).
+    pub scale: f64,
+}
+
+/// Dominant face index of a baked quad's rotated normal, in `Direction`
+/// order (down/up/north/south/west/east), for `FACE_SHADE` lookup.
+fn normal_face_index(n: [f32; 3]) -> usize {
+    let a = [n[0].abs(), n[1].abs(), n[2].abs()];
+    if a[1] >= a[0] && a[1] >= a[2] {
+        if n[1] > 0.0 {
+            1
+        } else {
+            0
+        }
+    } else if a[2] >= a[0] {
+        if n[2] > 0.0 {
+            3
+        } else {
+            2
+        }
+    } else if n[0] > 0.0 {
+        5
+    } else {
+        4
+    }
+}
+
+/// Deterministic color for a `BakedModelQuad`: an FNV-1a hash of the
+/// resolved texture id picks a stable hue (the resource-pack atlas lookup
+/// replaces this in the Vulkan path), `shade` applies the vanilla per-face
+/// brightness, and `tintindex >= 0` multiplies in a deterministic biome-class
+/// tint like the CPU `tint` word does for packed quads.
+fn baked_quad_color(quad: &BakedModelQuad) -> [f32; 3] {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &b in quad.texture.as_bytes() {
+        hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let base = hsv_to_rgb((hash as f64 * 0.618_033_988_749_895).fract(), 0.55, 0.9);
+    let shade = if quad.shade {
+        FACE_SHADE[normal_face_index(quad.normal)]
+    } else {
+        1.0
+    };
+    let mut rgb = [base[0] * shade, base[1] * shade, base[2] * shade];
+    if quad.tintindex >= 0 {
+        let tint = hsv_to_rgb((f64::from(quad.tintindex) * 0.31 + 0.33).fract(), 0.6, 1.0);
+        for (channel, &t) in tint.iter().enumerate() {
+            rgb[channel] *= t;
+        }
+    }
+    rgb
+}
+
+/// Rasterize `quads` (block-local `0..=1` space) placed at `origin` and
+/// scaled by `scale` into `raster`, through the same projection, clipping,
+/// and depth test as terrain. Returns the number of quads submitted.
+fn rasterize_baked_quads(
+    raster: &mut Rasterizer,
+    quads: &[BakedModelQuad],
+    origin: [f64; 3],
+    scale: f64,
+    to_camera: &dyn Fn([f64; 3]) -> [f64; 3],
+) -> usize {
+    let mut drawn = 0usize;
+    for quad in quads {
+        let color = baked_quad_color(quad);
+        let mut verts = [CamVertex::default(); 4];
+        for (i, p) in quad.positions.iter().enumerate() {
+            verts[i] = CamVertex {
+                pos: to_camera([
+                    origin[0] + f64::from(p[0]) * scale,
+                    origin[1] + f64::from(p[1]) * scale,
+                    origin[2] + f64::from(p[2]) * scale,
+                ]),
+                color,
+                layer: 0,
+                fluid_kind: 0,
+                diagonal: false,
+            };
+        }
+        for tri in [[0, 1, 2], [0, 2, 3]] {
+            raster.clipped_triangle(
+                &[verts[tri[0]], verts[tri[1]], verts[tri[2]]],
+                false,
+                1.0,
+            );
+        }
+        drawn += 1;
+    }
+    drawn
+}
+
+/// Render placed `BakedModelQuad` resource-pack geometry to a fresh RGB
+/// frame through the same camera/projection/shading path as
+/// [`render_frame`]. `quads` are in block-local `0..=1` space, drawn at
+/// `origin`; `fov_deg` is the vertical field of view in degrees.
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_baked_model_quads(
+    quads: &[BakedModelQuad],
+    origin: [f64; 3],
+    eye: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    width: u32,
+    height: u32,
+    fov_deg: f64,
+) -> Result<RenderedFrame, String> {
+    if width == 0 || height == 0 {
+        return Err("render dimensions must be non-zero".to_string());
+    }
+    let started = Instant::now();
+    let mut raster = Rasterizer::new(width, height, fov_deg);
+    let (fwd, right, up) = camera_basis(yaw, pitch);
+    let to_camera = |p: [f64; 3]| -> [f64; 3] {
+        let d = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
+        [
+            d[0] * right[0] + d[1] * right[1] + d[2] * right[2],
+            d[0] * up[0] + d[1] * up[1] + d[2] * up[2],
+            d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2],
+        ]
+    };
+    raster.stats.model_quads_drawn =
+        rasterize_baked_quads(&mut raster, quads, origin, 1.0, &to_camera) as u64;
+    raster.stats.render_ms = started.elapsed().as_secs_f64() * 1000.0;
+    Ok(RenderedFrame {
+        width,
+        height,
+        rgb: raster.rgb,
+        stats: raster.stats,
+    })
+}
+
 /// Render one camera frame of the live world to an RGB buffer.
 /// `eye` is the camera position (player pos + eye height); `yaw`/`pitch` are
 /// degrees using the server's convention (`forward = (-sin yaw·cos pitch,
@@ -781,11 +1098,83 @@ pub fn render_frame_with_config(
     height: u32,
     config: &RenderConfig,
 ) -> Result<RenderedFrame, String> {
+    render_frame_impl(
+        world,
+        eye,
+        yaw,
+        pitch,
+        width,
+        height,
+        config,
+        config.fov_deg,
+        false,
+        &[],
+    )
+}
+
+/// [`render_frame_with_config`] with a Hi-Z occlusion pass, the smooth zoom
+/// controller, and placed resource-pack model geometry:
+///
+/// * `zoom` is ticked by `zoom_dt_seconds`; the interpolated
+///   [`ZoomState::fov`] replaces `config.fov_deg` for this frame.
+/// * `models` draws `BakedModelQuad` batches (block entities, torches, mod
+///   models) through the same depth-tested pipeline after opaque terrain.
+/// * A depth-only prepass rasterizes opaque geometry into the depth buffer,
+///   builds a `HiZPyramid`, then the shading pass skips every section whose
+///   16^3 AABB the pyramid proves fully occluded (`hiz_tested_sections` /
+///   `hiz_culled_sections` in [`RenderStats`]). Hi-Z culling is
+///   conservative: a culled section could not have contributed a single
+///   pixel, so the RGB output matches a non-Hi-Z frame exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn render_frame_with_hiz_and_zoom(
+    world: &WorldState,
+    eye: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    width: u32,
+    height: u32,
+    config: &RenderConfig,
+    zoom: &mut ZoomState,
+    zoom_dt_seconds: f32,
+    models: &[BakedModelDraw<'_>],
+) -> Result<RenderedFrame, String> {
+    let fov_deg = f64::from(zoom.tick(zoom_dt_seconds));
+    render_frame_impl(
+        world,
+        eye,
+        yaw,
+        pitch,
+        width,
+        height,
+        config,
+        fov_deg,
+        true,
+        models,
+    )
+}
+
+/// Shared frame body for [`render_frame_with_config`] and
+/// [`render_frame_with_hiz_and_zoom`]. `fov_deg` is the resolved projection
+/// FOV (config or zoom-interpolated); `use_hiz` runs the depth-prepass +
+/// `HiZPyramid` occlusion pass; `models` is the placed-model draw list.
+#[allow(clippy::too_many_arguments)]
+fn render_frame_impl(
+    world: &WorldState,
+    eye: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    width: u32,
+    height: u32,
+    config: &RenderConfig,
+    fov_deg: f64,
+    use_hiz: bool,
+    models: &[BakedModelDraw<'_>],
+) -> Result<RenderedFrame, String> {
     if width == 0 || height == 0 {
         return Err("render dimensions must be non-zero".to_string());
     }
     let started = Instant::now();
-    let mut raster = Rasterizer::new(width, height, config.fov_deg);
+    let mut raster = Rasterizer::new(width, height, fov_deg);
 
     let (fwd, right, up) = camera_basis(yaw, pitch);
     let eye32 = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
@@ -794,7 +1183,7 @@ pub fn render_frame_with_config(
         yaw,
         pitch,
         f64::from(width) / f64::from(height),
-        config.fov_deg,
+        fov_deg,
     );
 
     // Transform world vertices into camera space.
@@ -840,6 +1229,60 @@ pub fn render_frame_with_config(
     // when they contain at least one drawn section's draw.
     let mut drawn_slabs: HashMap<[i32; 3], HashSet<(u32, u32)>> = HashMap::new();
 
+    // Hi-Z depth prepass: rasterize opaque geometry depth-only, build the
+    // max-depth pyramid, then re-run the shading pass with every section's
+    // AABB occlusion-tested first. The pyramid is conservative — a section
+    // it culls could not show a single pixel, so the RGB output is
+    // identical to a frame rendered without it.
+    let mut hiz: Option<(HiZPyramid, [[f32; 4]; 4])> = None;
+    if use_hiz {
+        raster.depth_only = true;
+        for &coord in &cull.visible {
+            if !within_view_distance(&coord) {
+                continue;
+            }
+            let Some(&packed) = meshes.get(&coord) else {
+                continue;
+            };
+            if packed.len() < 4 || packed.len() % 4 != 0 {
+                continue;
+            }
+            let Some(buckets) = world.direction_buckets(coord) else {
+                continue;
+            };
+            let origin = [
+                f64::from(coord.0) * 16.0,
+                f64::from(coord.1) * 16.0,
+                f64::from(coord.2) * 16.0,
+            ];
+            let draw_mask = bucket_draw_mask(box_facing_mask(
+                [origin[0] as f32, origin[1] as f32, origin[2] as f32],
+                eye32,
+            ));
+            rasterize_section_opaque(
+                &mut raster,
+                packed,
+                &buckets,
+                draw_mask,
+                origin,
+                config,
+                &to_camera,
+                false,
+            );
+        }
+        raster.depth_only = false;
+        let depth01 = raster.depth_01();
+        raster.reset_depth();
+        if let Ok(pyramid) =
+            HiZPyramid::from_depth_buffer(raster.width, raster.height, &depth01)
+        {
+            hiz = Some((
+                pyramid,
+                view_proj_matrix(eye, yaw, pitch, width, height, fov_deg),
+            ));
+        }
+    }
+
     for &coord in &cull.visible {
         if !within_view_distance(&coord) {
             raster.stats.culled_sections += 1;
@@ -854,6 +1297,26 @@ pub fn render_frame_with_config(
         let Some(buckets) = world.direction_buckets(coord) else {
             continue;
         };
+        let origin = [
+            f64::from(coord.0) * 16.0,
+            f64::from(coord.1) * 16.0,
+            f64::from(coord.2) * 16.0,
+        ];
+        if let Some((pyramid, view_proj)) = &hiz {
+            raster.stats.hiz_tested_sections += 1;
+            if pyramid.cull_world_aabb(
+                view_proj,
+                [origin[0] as f32, origin[1] as f32, origin[2] as f32],
+                [
+                    origin[0] as f32 + 16.0,
+                    origin[1] as f32 + 16.0,
+                    origin[2] as f32 + 16.0,
+                ],
+            ) {
+                raster.stats.hiz_culled_sections += 1;
+                continue;
+            }
+        }
         raster.stats.drawn_sections += 1;
         if let Some(slab) = world
             .render_regions()
@@ -866,62 +1329,22 @@ pub fn render_frame_with_config(
                 .insert((slab.vertex_offset, slab.index_offset));
         }
 
-        let origin = [
-            f64::from(coord.0) * 16.0,
-            f64::from(coord.1) * 16.0,
-            f64::from(coord.2) * 16.0,
-        ];
         // Directional face bucketing: keep only the direction buckets whose
         // section side faces the camera; the unassigned bucket always draws.
         let draw_mask = bucket_draw_mask(box_facing_mask(
             [origin[0] as f32, origin[1] as f32, origin[2] as f32],
             eye32,
         ));
-        let mut section_has_translucent = false;
-        for bucket in 0..DIRECTION_BUCKETS {
-            let (offset, count) = (
-                buckets.offset[bucket] as usize,
-                buckets.count[bucket] as usize,
-            );
-            if count == 0 {
-                continue;
-            }
-            if bucket != DIRECTION_BUCKET_UNASSIGNED && draw_mask & (1 << bucket) == 0 {
-                raster.stats.buckets_culled += 1;
-                continue;
-            }
-            raster.stats.buckets_drawn += 1;
-            for qi in offset..offset + count {
-                let quad = &packed[qi * 4..qi * 4 + 4];
-                let mut verts = [CamVertex::default(); 4];
-                let mut any_translucent = false;
-                for (i, pv) in quad.iter().enumerate() {
-                    verts[i] = decode_vertex(pv, origin, config.smooth_lighting);
-                    any_translucent |= is_translucent_quad(&verts[i]);
-                }
-                // All four vertices of a quad share layer/fluid/diagonal.
-                if any_translucent {
-                    section_has_translucent = true;
-                    continue;
-                }
-                let diagonal = verts[0].diagonal;
-                for vtx in verts.iter_mut() {
-                    vtx.pos = to_camera(vtx.pos);
-                }
-                let tris: [[usize; 3]; 2] = if diagonal {
-                    [[0, 1, 3], [1, 2, 3]]
-                } else {
-                    [[0, 1, 2], [0, 2, 3]]
-                };
-                for tri in tris {
-                    raster.clipped_triangle(
-                        &[verts[tri[0]], verts[tri[1]], verts[tri[2]]],
-                        false,
-                        1.0,
-                    );
-                }
-            }
-        }
+        let section_has_translucent = rasterize_section_opaque(
+            &mut raster,
+            packed,
+            &buckets,
+            draw_mask,
+            origin,
+            config,
+            &to_camera,
+            true,
+        );
         if section_has_translucent {
             let center = [
                 origin[0] + 8.0 - eye[0],
@@ -931,6 +1354,17 @@ pub fn render_frame_with_config(
             let dist2 = center[0] * center[0] + center[1] * center[1] + center[2] * center[2];
             translucent_sections.push((dist2, coord, draw_mask));
         }
+    }
+
+    // Placed resource-pack model geometry (block entities, torches, mod
+    // models): rasterized after opaque terrain so the shared depth buffer
+    // resolves intersections. Models submit unconditionally — the section
+    // Hi-Z test already dropped every section AABB the pyramid proved
+    // occluded, and a placed model inside one is hidden with it.
+    for draw in models {
+        raster.stats.model_quads_drawn +=
+            rasterize_baked_quads(&mut raster, draw.quads, draw.origin, draw.scale, &to_camera)
+                as u64;
     }
 
     // Translucent pass: far sections first, `sort_translucent` order within.
