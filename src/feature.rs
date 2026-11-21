@@ -2121,9 +2121,9 @@ fn gen_end_gateway(ctx: &mut FC, pos: (i32, i32, i32)) {
                     gateway
                 } else if dy == 0 {
                     air
-                } else if dy.abs() == 2 && dx == 0 && dz == 0 {
-                    bedrock
-                } else if (dx == 0 || dz == 0) && dy.abs() != 2 {
+                } else if (dy.abs() == 2 && dx == 0 && dz == 0)
+                    || ((dx == 0 || dz == 0) && dy.abs() != 2)
+                {
                     bedrock
                 } else {
                     air
@@ -2693,7 +2693,7 @@ fn coral_mushroom(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), state: u32)
                     && (lz != 0 && lz != zb || ly != 0 && ly != yb)
                     && (lx != 0 && lx != xb || lz != 0 && lz != zb)
                     && (lx == 0 || lx == xb || ly == 0 || ly == yb || lz == 0 || lz == zb);
-                if shell && !(rng.next_f32() < 0.1) {
+                if shell && rng.next_f32().partial_cmp(&0.1) != Some(std::cmp::Ordering::Less) {
                     coral_piece(ctx, rng, (pos.0 + lx, pos.1 + ly - len, pos.2 + lz), state);
                 }
             }
@@ -3597,6 +3597,7 @@ fn spc_spread_all(
 /// `MultifaceSpreader.spread(state, level, pos, from, to, spreadOnly)` (`dkz.a`): the axis gate,
 /// the source gate, then the spread types in order, taking the first candidate the predicate
 /// accepts and placing there (a failed placement does not fall through to the next type).
+#[expect(clippy::too_many_arguments)]
 fn spc_spread(
     ctx: &mut FC,
     reg: &BReg,
@@ -4205,7 +4206,7 @@ fn grow_vines(
     let (x, mut y, z) = pos;
     let (start, step) = if down { (0, -1) } else { (1, 1) };
     let mut i = start;
-    while if down { i <= height } else { i <= height } {
+    while i <= height {
         if ctx.is_air(x, y, z) {
             let beyond = if down { y - 1 } else { y + 1 };
             if i == height || !ctx.is_air(x, beyond, z) {
@@ -5909,7 +5910,7 @@ fn load_freg_report(
     }
     let mut frozen_biomes: HashSet<String> = HashSet::new();
     for (name, b) in biome_files {
-        if let Some(j) = jparse(&b) {
+        if let Some(j) = jparse(b) {
             if let Some(t) = jnum(&j, "temperature") {
                 reg.btemp.insert(name.clone(), t as f32);
             }
@@ -6381,7 +6382,7 @@ fn gen_pf_with_mask(
 // must materialize all positions before recursing into downstream stages.
 thread_local! {
     static MOD_SCRATCH: std::cell::RefCell<Vec<Vec<(i32, i32, i32)>>> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[inline]
@@ -6428,8 +6429,7 @@ fn apply_modifiers(
                 .unwrap_or_default();
             out.clear();
             count_every_layer_positions(ip, ctx, rng, pos, &mut out);
-            for i in 0..out.len() {
-                let p = out[i];
+            for &p in &out {
                 apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, p);
             }
             out.clear();
@@ -6685,12 +6685,12 @@ struct LeafBitCache {
     known: u128,
 }
 thread_local! {
-    static LEAF_BITS: std::cell::RefCell<LeafBitCache> = std::cell::RefCell::new(LeafBitCache {
+    static LEAF_BITS: std::cell::RefCell<LeafBitCache> = const { std::cell::RefCell::new(LeafBitCache {
         active: false,
         present_mask: 0,
         bits: [0; 128],
         known: 0,
-    });
+    }) };
 }
 
 /// Test-only override that makes `FC::biome` return a pinned leaf regardless
@@ -6974,7 +6974,7 @@ fn cel_layer_ys(ctx: &mut FC<'_>, reg: &BReg, x: i32, top: i32, z: i32) -> Vec<i
     let mut out = Vec::new();
     let mut cur = ctx.get(x, top, z);
     let mut y = top;
-    while y >= min_y + 1 {
+    while y > min_y {
         let below = ctx.get(x, y - 1, z);
         let boundary = !cel_empty(reg, below) && cel_empty(reg, cur);
         if boundary && reg.name_of(below) != "minecraft:bedrock" {
@@ -7000,7 +7000,7 @@ fn cel_find_y(ctx: &mut FC<'_>, reg: &BReg, x: i32, top: i32, z: i32, layer: i32
     // the build height, so the first cell the loop reads is `top - 1`.
     let mut cur = ctx.get(x, top, z);
     let mut y = top;
-    while y >= min_y + 1 {
+    while y > min_y {
         let below = ctx.get(x, y - 1, z);
         if !cel_empty(reg, below) && cel_empty(reg, cur) && reg.name_of(below) != "minecraft:bedrock" {
             if found == layer {
@@ -7022,10 +7022,10 @@ struct OreScratch {
 }
 
 thread_local! {
-    static ORE_SCRATCH: std::cell::RefCell<OreScratch> = std::cell::RefCell::new(OreScratch {
+    static ORE_SCRATCH: std::cell::RefCell<OreScratch> = const { std::cell::RefCell::new(OreScratch {
         ds: Vec::new(),
         bits: Vec::new(),
-    });
+    }) };
 }
 
 #[cfg(test)]
@@ -7215,6 +7215,7 @@ fn gen_vein_impl<T>(
 /// (feature index << 32) | step of the placed feature currently being generated.
 pub(crate) static CUR_FEAT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
+#[expect(clippy::too_many_arguments)]
 fn gen_ore_impl<T>(
     ctx: &mut FC,
     rng: &mut Xor,
@@ -7343,7 +7344,7 @@ fn gen_ore(
         discard,
         targets,
         scattered,
-        |rt, reg, st, y, r| test_rt(rt, reg, st, y, r),
+        test_rt,
     );
 }
 
@@ -8351,7 +8352,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     } else {
                         None
                     };
-                    if side_edge && edge_draw.map_or(true, |d| d > *extra_edge) {
+                    if side_edge && edge_draw.is_none_or(|d| d > *extra_edge) {
                         if veg_col_trace(pos) {
                             eprintln!("VCOL dx={dx} dz={dz} edge={edge_draw:?} SKIP edge");
                         }
@@ -9998,7 +9999,7 @@ impl OriginGrid {
         if let Some(sparse) = &self.sparse {
             return sparse.get(&(ox, oz)).copied().flatten();
         }
-        self.idx(ox, oz).map_or(None, |i| self.cells[i])
+        self.idx(ox, oz).and_then(|i| self.cells[i])
     }
     #[inline]
     fn set(&mut self, ox: i32, oz: i32, v: OriginCarvers) {
@@ -10694,10 +10695,12 @@ pub(crate) fn precarve_order(g: &mut Gen, pending: &[(i32, i32)], jobs: usize) {
     });
 }
 
+type PrecarveScratch = (Vec<(i32, i32)>, HashSet<(i32, i32)>);
+
 thread_local! {
     /// `precarve_order`'s dedupe buffers, parked between populates. The pair is a
     /// few KB at the 32-chunk call bound, well under the 256 KiB idle-scratch cap.
-    static PRECARVE_SCRATCH: std::cell::RefCell<(Vec<(i32, i32)>, HashSet<(i32, i32)>)> =
+    static PRECARVE_SCRATCH: std::cell::RefCell<PrecarveScratch> =
         std::cell::RefCell::new((Vec::new(), HashSet::new()));
 }
 
@@ -10751,13 +10754,17 @@ fn wave_levels(pending: &[(i32, i32)], spacing: i32) -> Vec<usize> {
     levels
 }
 
+type WorkerCols = Vec<((i32, i32), std::sync::Arc<crate::worldgen::ChunkCols>)>;
+type WorkerChunkBiomes = Vec<((i32, i32), std::sync::Arc<Vec<String>>)>;
+type WorkerDirectMarks = Vec<((i32, i32), Vec<(i32, i32, i32)>)>;
+
 /// What one worker hands back: every write and mark the placement loop produced, plus the
 /// ticks and direct marks it filed on its scratch `Gen`. The owner replays them in `pending`
 /// order at the wave commit.
 struct PopulateWorkerResult {
     wr: crate::generation_context::FlatChunkWriteMap,
     shape_marks: Vec<(i32, i32, i32)>,
-    direct_marks: Vec<((i32, i32), Vec<(i32, i32, i32)>)>,
+    direct_marks: WorkerDirectMarks,
     payloads: crate::generation_context::StagedPayloads,
     mineshaft_spawners: HashSet<(i32, i32, usize)>,
     feat_hm: HashMap<(i32, i32), (i32, i32)>,
@@ -10767,8 +10774,8 @@ struct PopulateWorkerResult {
     /// biome unions it computed (`Gen::chunk_biomes`). Pure functions of the round's chunks,
     /// so the owner installs them (`Gen::install_cols` / `Gen::merge_chunk_biomes`) and
     /// later waves plus `promote_full_chunks` answer from the owner instead of rebuilding.
-    cols: Vec<((i32, i32), std::sync::Arc<crate::worldgen::ChunkCols>)>,
-    chunk_biomes: Vec<((i32, i32), std::sync::Arc<Vec<String>>)>,
+    cols: WorkerCols,
+    chunk_biomes: WorkerChunkBiomes,
 }
 
 /// The worker half of a feature pass: biome union, `References::collect` and the placement
@@ -10807,7 +10814,7 @@ fn populate_worker(
         return empty();
     }
 
-    let mut gen: &mut Gen = scratch;
+    let gen: &mut Gen = scratch;
     gen.pop_active = Some((sx, sz));
     gen.suppress_generated_ticks = owner.restores_ticks_for((sx, sz));
 
@@ -10835,8 +10842,8 @@ fn populate_worker(
         }
     }
     let pop = pop_seed(owner.wseed(), sx * 16, sz * 16);
-    let mut structures = References::collect(&mut gen, sx, sz);
-    let mut ctx = FC::new_worker(&mut gen, owner, population_order, index);
+    let mut structures = References::collect(gen, sx, sz);
+    let mut ctx = FC::new_worker(gen, owner, population_order, index);
     LEAF_BITS.with(|c| {
         let mut c = c.borrow_mut();
         c.active = true;
@@ -10846,7 +10853,7 @@ fn populate_worker(
     let preset = owner.preset;
     let t0 = crate::worldgen::m3_start();
     for step in 0..order.len().max(structures.step_count()) {
-        structures.place_step(&mut ctx, step, pop as u64, sx, sz);
+        structures.place_step(&mut ctx, step, pop, sx, sz);
         let Some(entries) = order.get(step) else { continue };
         let bit_entries = fr.step_entries.get(&preset).and_then(|v| v.get(step));
         for (ei, (gi, name)) in entries.iter().enumerate() {
@@ -10870,7 +10877,7 @@ fn populate_worker(
                 if idx == usize::MAX {
                     continue;
                 }
-                &*fr.placed_vec[idx]
+                &fr.placed_vec[idx]
             } else {
                 let Some(p) = fr.placed.get(name) else { continue };
                 p
@@ -11312,12 +11319,12 @@ fn wg_heightmaps_after_carve_run(
         let slot = &mut carve_top[(lz & 15) as usize][(lx & 15) as usize];
         *slot = (*slot).max(y);
     }
-    for lz in 0..16 {
-        for lx in 0..16 {
+    for (lz, carve_row) in carve_top.iter().enumerate() {
+        for (lx, &ct) in carve_row.iter().enumerate() {
             let (wx, wz) = (tx * 16 + lx as i32, tz * 16 + lz as i32);
             let mut y = cc
-                .wtop(lx as usize, lz as usize)
-                .max(carve_top[lz][lx])
+                .wtop(lx, lz)
+                .max(ct)
                 .min(min_y + height - 1);
             let mut surface = None;
             let mut floor = None;
@@ -11327,7 +11334,7 @@ fn wg_heightmaps_after_carve_run(
                 // needs; the fold one cannot apply here).
                 // A column with no carve writes has nothing for `written` to find, so skip
                 // that lookup entirely there — the base/terrain answer is identical.
-                let st = if carve_top[lz][lx] == i32::MIN {
+                let st = if ct == i32::MIN {
                     match prefetched_cell(g, run.pref, wx, y, wz) {
                         Some(st) => st,
                         None => g.terrain_cell(cc, wx, y, wz),
@@ -12023,7 +12030,7 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
     for step in 0..order.len().max(structures.step_count()) {
         // Structures have steps even when the biome has no placed features.
         // Their registry slots and RNG streams are independent.
-        structures.place_step(&mut ctx, step, pop as u64, sx, sz);
+        structures.place_step(&mut ctx, step, pop, sx, sz);
         let Some(entries) = order.get(step) else { continue };
         let bit_entries = fr.step_entries.get(&preset).and_then(|v| v.get(step));
         for (ei, (gi, name)) in entries.iter().enumerate() {
@@ -12047,7 +12054,7 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
                 if idx == usize::MAX {
                     continue;
                 }
-                &*fr.placed_vec[idx]
+                &fr.placed_vec[idx]
             } else {
                 let Some(p) = fr.placed.get(name) else {
                     continue;
@@ -12422,6 +12429,7 @@ mod carver_parity_tests {
     /// Everything the carver stage hands an owner for one chunk: the block writes, both WG
     /// heightmaps over all 256 columns, and the marks in the order they were filed.
     type Snapshot = (Vec<((i32, i32, i32), u32)>, Vec<i32>, Vec<(i32, i32, i32)>);
+    type RingSnapshot = (i32, i32, Vec<((i32, i32, i32), u32)>, Vec<i32>, Vec<(i32, i32, i32)>);
 
     fn snapshot(g: &mut Gen, cx: i32, cz: i32) -> Snapshot {
         let mut writes: Vec<((i32, i32, i32), u32)> = g.feature_bucket_writes(cx, cz).collect();
@@ -12447,7 +12455,7 @@ mod carver_parity_tests {
         g: &mut Gen,
         sx: i32,
         sz: i32,
-    ) -> Vec<(i32, i32, Vec<((i32, i32, i32), u32)>, Vec<i32>, Vec<(i32, i32, i32)>)> {
+    ) -> Vec<RingSnapshot> {
         let mut out = Vec::with_capacity(9);
         for dz in -1..=1 {
             for dx in -1..=1 {
@@ -12929,19 +12937,23 @@ mod a3a_tests {
     use super::*;
     use crate::worldgen::{lock_gen_for_tests, NoisePreset};
 
+    type ChunkWrites = Vec<((i32, i32), Vec<((i32, i32, i32), u32)>)>;
+    type WgTops = Vec<((i32, i32), Vec<i32>)>;
+    type ChunkMarks = Vec<((i32, i32), Vec<(i32, i32, i32)>)>;
+
     /// Everything the feature + carver layers leave on the owner for a window: the write
     /// buckets, the heightmap maxima, the promotion marks, the staged payloads, the ticks,
     /// the post-carve WG tops and the `pop_done` set. Order is preserved where serial order
     /// is observable (writes, marks, ticks).
     #[derive(Debug)]
     struct State {
-        writes: Vec<((i32, i32), Vec<((i32, i32, i32), u32)>)>,
+        writes: ChunkWrites,
         heights: Vec<((i32, i32), (i32, i32))>,
-        marks: Vec<((i32, i32), Vec<(i32, i32, i32)>)>,
+        marks: ChunkMarks,
         payloads: crate::generation_context::StagedPayloads,
         leaves: Vec<GeneratedTick>,
         fluids: Vec<GeneratedTick>,
-        wg: Vec<((i32, i32), Vec<i32>)>,
+        wg: WgTops,
         done: Vec<(i32, i32)>,
     }
 

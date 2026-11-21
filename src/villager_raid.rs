@@ -1873,7 +1873,6 @@ fn live_native_utility_states() -> &'static Mutex<HashMap<i32, NativeUtilityStat
     STATES.get_or_init(Mutex::default)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(dead_code)]
 fn live_native_mob(eid: i32, name: &str) -> Option<Arc<Mob>> {
     let etype = name_to_etype(name)?;
@@ -1884,7 +1883,6 @@ fn live_native_mob(eid: i32, name: &str) -> Option<Arc<Mob>> {
 
 /// Item-interaction entry points maintain the same per-entity state as the
 /// periodic tick. Their callers are the corresponding packet/block handlers.
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(dead_code)]
 fn live_iron_golem_repair(eid: i32, iron_ingot: bool) -> bool {
     let Some(mob) = live_native_mob(eid, "iron_golem") else { return false };
@@ -1898,7 +1896,6 @@ fn live_iron_golem_repair(eid: i32, iron_ingot: bool) -> bool {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(dead_code)]
 fn live_iron_golem_hostile_to_player(eid: i32, gossip: &VillagerGossip, player: VillageUuid) -> bool {
     if live_native_mob(eid, "iron_golem").is_none() { return false; }
@@ -1908,7 +1905,6 @@ fn live_iron_golem_hostile_to_player(eid: i32, gossip: &VillagerGossip, player: 
     matches!(state, NativeUtilityState::Iron(golem) if golem.hostile_to_player(gossip, player))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(dead_code)]
 fn live_snow_golem_shear(eid: i32) -> bool {
     let Some(mob) = live_native_mob(eid, "snow_golem") else { return false };
@@ -1927,7 +1923,6 @@ fn live_snow_golem_shear(eid: i32) -> bool {
     false
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(dead_code)]
 fn live_allay_give(eid: i32, player: VillageUuid, item: Stack) -> bool {
     if live_native_mob(eid, "allay").is_none() { return false; }
@@ -1941,7 +1936,6 @@ fn live_allay_give(eid: i32, player: VillageUuid, item: Stack) -> bool {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(dead_code)]
 fn live_allay_note(eid: i32, note: BlockPos, tick: u64) -> bool {
     if live_native_mob(eid, "allay").is_none() { return false; }
@@ -1954,7 +1948,6 @@ fn live_allay_note(eid: i32, note: BlockPos, tick: u64) -> bool {
     } else { false }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(dead_code)]
 fn live_allay_duplicate(eid: i32, dancing: bool, jukebox_active: bool, shard: bool, tick: u64) -> Option<Arc<Mob>> {
     let original = live_native_mob(eid, "allay")?;
@@ -2128,7 +2121,6 @@ fn live_fox_collect(mob: &Arc<Mob>, at: [f64; 3]) {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(dead_code)]
 fn live_fox_trust(eid: i32, player: VillageUuid) -> bool {
     if live_native_mob(eid, "fox").is_none() { return false; }
@@ -2141,7 +2133,6 @@ fn live_fox_trust(eid: i32, player: VillageUuid) -> bool {
     } else { false }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(dead_code)]
 fn live_camel_toggle_sitting(eid: i32) -> bool {
     if live_native_mob(eid, "camel").is_none() { return false; }
@@ -2154,7 +2145,6 @@ fn live_camel_toggle_sitting(eid: i32) -> bool {
     } else { false }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(dead_code)]
 fn live_camel_dash(eid: i32, tick: u64, yaw: f32) -> Option<[f64; 3]> {
     let mob = live_native_mob(eid, "camel")?;
@@ -2277,7 +2267,7 @@ fn live_golem_provoke_step(mob: &Arc<Mob>, at: [f64; 3], _tick: u64) {
                 &client,
                 pos,
                 7.5 + world_rng::next_below(140) as f32 / 10.0,
-                f64::from(fling[1]),
+                fling[1],
             );
             break;
         }
@@ -2291,16 +2281,15 @@ fn equine_jump_charges() -> &'static Mutex<HashMap<i32, i32>> {
     CHARGES.get_or_init(Mutex::default)
 }
 
+type PendingFoal = (DimId, [f64; 3], EquineOffspringStats, u64);
+
 /// Foal attributes rolled from two in-love parents by `live_equine_breed_roll`,
 /// waiting for the foal's first utility tick to claim them. The spawn itself
 /// is produced by the generic `live_mob_breed` path; this hands the child the
 /// vanilla `setOffspringAttributes` roll instead of fresh spawn dice.
 #[cfg_attr(not(test), allow(dead_code))]
-fn live_equine_pending_foals(
-) -> &'static Mutex<Vec<(DimId, [f64; 3], EquineOffspringStats, u64)>> {
-    static FOALS: OnceLock<
-        Mutex<Vec<(DimId, [f64; 3], EquineOffspringStats, u64)>>,
-    > = OnceLock::new();
+fn live_equine_pending_foals() -> &'static Mutex<Vec<PendingFoal>> {
+    static FOALS: OnceLock<Mutex<Vec<PendingFoal>>> = OnceLock::new();
     FOALS.get_or_init(Mutex::default)
 }
 
@@ -2629,8 +2618,7 @@ fn live_parrot_utility_step(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
                 .unwrap_or_else(|e| e.into_inner())
                 .registry
                 .vehicle_of
-                .get(&client.eid)
-                .is_some(),
+                .contains_key(&client.eid),
             player_in_water: in_water,
             player_in_powder_snow: in_powder_snow,
             shoulder_slot_free,
@@ -3446,11 +3434,11 @@ fn live_raid_bar_id(dim: DimId, center: BlockPos) -> String {
 /// Audience for a raid bossbar: same-dimension players inside the vanilla
 /// 96-block raid tracking range.
 #[cfg_attr(not(test), allow(dead_code))]
-fn live_raid_audience<'a>(
-    clients: &'a [Arc<Client>],
+fn live_raid_audience(
+    clients: &[Arc<Client>],
     dim: DimId,
     center: BlockPos,
-) -> Vec<&'a Arc<Client>> {
+) -> Vec<&Arc<Client>> {
     clients
         .iter()
         .filter(|client| {
@@ -3730,7 +3718,7 @@ fn live_raid_step() {
 /// `PatrolSpawner`: one attempt every `12000 + rand(1200)` ticks, fires only
 /// from day 5 on during daytime, then a one-in-five roll.
 fn eval_patrol_spawn_attempt(day: u64, is_day: bool, roll_mod_5: u32) -> bool {
-    day >= 5 && is_day && roll_mod_5 % 5 == 0
+    day >= 5 && is_day && roll_mod_5.is_multiple_of(5)
 }
 
 /// `WanderingTraderSpawner`: each 24000-tick attempt raises the spawn chance
@@ -3990,7 +3978,7 @@ fn live_special_spawn_tick(clients: &[Arc<Client>]) {
     // `SculkShrieker` + `WardenSpawnTracker`: warning level 4 near a
     // `can_summon` shrieker summons the warden. Warnings accrue on a
     // twenty-tick cadence, matching the shrieker's own cooldown granularity.
-    if gamerule_live_value("doWardenSpawning") != 0 && now % 20 == 0 {
+    if gamerule_live_value("doWardenSpawning") != 0 && now.is_multiple_of(20) {
         for (uuid, pos, _) in &overworld_players {
             let (bx, by, bz) = (pos.0.floor() as i32, pos.1.floor() as i32, pos.2.floor() as i32);
             if can_summon_shrieker_near(DimId::Overworld, bx, by, bz) {
@@ -5938,10 +5926,7 @@ mod p2_parity_village_tests {
         let old_tick = TICK.swap(500_000, Ordering::Relaxed);
         let old_spawn = {
             let mut state = special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::replace(
-                &mut *state,
-                SpecialSpawnState::default(),
-            )
+            std::mem::take(&mut *state)
         };
         struct Restore(
             Vec<Arc<Client>>,
@@ -5957,7 +5942,7 @@ mod p2_parity_village_tests {
                 WORLD_TIME.store(self.2, Ordering::Relaxed);
                 TICK.store(self.3, Ordering::Relaxed);
                 *special_spawn_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                    std::mem::replace(&mut self.4, Default::default());
+                    std::mem::take(&mut self.4);
             }
         }
         let _restore = Restore(old_clients, old_mobs, old_time, old_tick, old_spawn);

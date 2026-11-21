@@ -216,7 +216,7 @@ impl DimId {
     /// resolve; a custom slot resolves only while a datapack holds it — which is
     /// exactly why the binary saves name custom dimensions by key instead.
     pub(crate) fn from_index(index: usize) -> Option<Self> {
-        (index < registered_dimension_count()).then(|| DimId(index as u32))
+        (index < registered_dimension_count()).then_some(DimId(index as u32))
     }
 
     /// Every registered dimension: the three vanilla slots, then custom dimensions in
@@ -304,7 +304,7 @@ impl DimId {
         match self.0 {
             0 => -64,
             1 | 2 => 0,
-            _ => return dimension_spec(self).map_or(0, |spec| spec.min_y),
+            _ => dimension_spec(self).map_or(0, |spec| spec.min_y),
         }
     }
 
@@ -314,7 +314,7 @@ impl DimId {
         match self.0 {
             0 => 384,
             1 | 2 => 256,
-            _ => return dimension_spec(self).map_or(256, |spec| spec.height),
+            _ => dimension_spec(self).map_or(256, |spec| spec.height),
         }
     }
 
@@ -519,7 +519,7 @@ pub(crate) fn reset_dimension_registry() {
 fn jint(j: &J, key: &str) -> Option<i64> {
     let value = j.get(key)?.num();
     (value.fract() == 0.0 && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX))
-        .then(|| value as i64)
+        .then_some(value as i64)
 }
 
 /// `j.str()` for a string field that must be present.
@@ -1131,13 +1131,7 @@ fn beard_burying_value(x: f64, y: f64, z: f64) -> f64 {
 /// `Mth.clampedMap(value, min, max, newMin, newMax)`.
 fn clamped_map(value: f64, min: f64, max: f64, new_min: f64, new_max: f64) -> f64 {
     let delta = (value - min) / (max - min);
-    let t = if delta < 0.0 {
-        0.0
-    } else if delta > 1.0 {
-        1.0
-    } else {
-        delta
-    };
+    let t = delta.clamp(0.0, 1.0);
     new_min + t * (new_max - new_min)
 }
 
@@ -1518,7 +1512,7 @@ fn fold_constant_dfs(dfs: &mut Vec<DF>) -> usize {
                 }
             }
             DF::Div(a, b) => match const_at(dfs, *b, vals, state) {
-                Some(b) if b == 0.0 => Some(0.0),
+                Some(0.0) => Some(0.0),
                 Some(b) => const_at(dfs, *a, vals, state).map(|a| a / b),
                 None => None,
             },
@@ -1878,7 +1872,8 @@ fn classify_interp_inner(dfs: &[DF], inner: usize) -> InterpKind {
             _ => None,
         }
     };
-    let match_affine_noise = |id: usize| -> Option<(usize, f64, f64, Option<(f64, bool)>, Option<(f64, bool)>)> {
+    type AffineMatch = (usize, f64, f64, Option<(f64, bool)>, Option<(f64, bool)>);
+    let match_affine_noise = |id: usize| -> Option<AffineMatch> {
         let mut cur = strip_cache(id);
         let mut add = None;
         if let DF::Add(a, b) = dfs.get(cur)? {
@@ -2248,12 +2243,16 @@ struct BaseColLazy {
     fz_zero: bool,
 }
 
+type ShapeMarkMap = HashMap<(i32, i32), Vec<(i32, i32, i32)>>;
+type ShapeMarkBuckets = Vec<((i32, i32), Vec<(i32, i32, i32)>)>;
+type FlatMemo = HashMap<(usize, i32, i32, i32), f64>;
+
 pub struct Gen {
     /// The immutable inputs. `Deref` keeps every existing field name working;
     /// `DerefMut` exists only for construction (see below).
     pub(crate) data: std::sync::Arc<GenData>,
     // scratch memo for the vein sampler's density evaluations
-    memo: HashMap<(usize, i32, i32, i32), f64>,
+    memo: FlatMemo,
     corner_memo: Option<FlatCornerMemo>,
     /// Scratch shared by `DfCols` evaluations (stack + hoisted 2D slots), taken
     /// by a corner-grid fill and put back when it ends so the next chunk reuses
@@ -2354,7 +2353,7 @@ pub struct Gen {
     ///
     /// The owner is `getChunk(pos)`, not the chunk being generated: a carver paints up to
     /// eight chunks away, and its mark follows the position.
-    shape_marks: HashMap<(i32, i32), Vec<(i32, i32, i32)>>,
+    shape_marks: ShapeMarkMap,
     /// Freed [`Gen::shape_marks`] buckets kept for reuse. A promoted chunk's bucket is
     /// consumed once; parking it here turns the next `store_shape_mark` into a move
     /// instead of a fresh allocation. Bounded small — a bucket is a few marks.
@@ -5691,6 +5690,7 @@ impl DfProg {
 /// empty `v2`) and `DfCols` (the `ops2` prefix, then one 3D program per grid):
 /// one instruction set and one dispatch. `Push2`/`Store2`/`Done` appear only in
 /// `DfCols` lists, where every slot index was proved `< n2` at compile time.
+#[expect(clippy::too_many_arguments)]
 fn df_run(
     ops: &[Op],
     g: &Gen,
@@ -5700,7 +5700,7 @@ fn df_run(
     z: i32,
     st: &mut [f64],
     v2: &mut [f64],
-    mut cm: Option<&mut HashMap<(usize, i32, i32, i32), f64>>,
+    mut cm: Option<&mut FlatMemo>,
 ) -> f64 {
     {
         let mut sp = 0usize;
@@ -6011,7 +6011,7 @@ impl DfCols {
     /// `Op::Push2` for one grid's program, or `None` when the set did not
     /// compile this `interpolated` node (it is a `YNoise` grid the specialised
     /// fill owns).
-    fn prog<'a>(&'a self, slot: usize) -> Option<&'a [Op]> {
+    fn prog(&self, slot: usize) -> Option<&[Op]> {
         self.pi_of
             .get(slot)
             .and_then(|&pi| (pi != u32::MAX).then_some(pi))
@@ -6039,6 +6039,7 @@ impl DfCols {
     /// falls back to four scalar `eval`s, so the result is always the four
     /// `eval` results bit for bit. `df4_disabled` gates the arm the same way
     /// `DfProg::eval_x4`'s is gated.
+    #[expect(clippy::too_many_arguments)]
     fn eval_y4(
         &self,
         ops: &[Op],
@@ -6067,6 +6068,7 @@ impl DfCols {
     /// allow it, two `eval_y4` passes where it does not — the same composition
     /// `trilinear_x8` and `DfProg::eval_x8` use. `df8_disabled` gates the arm
     /// the same way `DfProg::eval_x8`'s is gated.
+    #[expect(clippy::too_many_arguments)]
     fn eval_y8(
         &self,
         ops: &[Op],
@@ -6669,7 +6671,7 @@ unsafe fn run4_avx2(
                     // The common case is no beardifier at all (or an empty one): the
                     // marker evaluates to zero at every lane, so push one vector rather
                     // than four scalar `compute_beardifier` calls.
-                    if beard.map_or(true, |b| b.is_empty()) {
+                    if beard.is_none_or(|b| b.is_empty()) {
                         wr!(sp, _mm256_setzero_pd());
                     } else {
                         let beard = beard.unwrap();
@@ -6725,7 +6727,7 @@ unsafe fn run4_avx2(
                     let lo = _mm256_cmp_pd(v, _mm256_set1_pd(mi), _CMP_GE_OQ);
                     let hi = _mm256_cmp_pd(v, _mm256_set1_pd(ma), _CMP_LT_OQ);
                     match _mm256_movemask_pd(_mm256_and_pd(lo, hi)) {
-                        m if m == 0xF => {
+                        0xF => {
                             sp -= 1;
                             pc += 1;
                         }
@@ -7050,7 +7052,7 @@ unsafe fn run8_avx512(
                     // The common case is no beardifier at all (or an empty one): the
                     // marker evaluates to zero at every lane, so push one vector rather
                     // than eight scalar `compute_beardifier` calls.
-                    if beard.map_or(true, |b| b.is_empty()) {
+                    if beard.is_none_or(|b| b.is_empty()) {
                         wr!(sp, _mm512_setzero_pd());
                     } else {
                         let beard = beard.unwrap();
@@ -7101,7 +7103,7 @@ unsafe fn run8_avx512(
                     let lo = _mm512_cmp_pd_mask(v, _mm512_set1_pd(mi), _CMP_GE_OQ);
                     let hi = _mm512_cmp_pd_mask(v, _mm512_set1_pd(ma), _CMP_LT_OQ);
                     match lo & hi {
-                        m if m == 0xFF => {
+                        0xFF => {
                             sp -= 1;
                             pc += 1;
                         }
@@ -7171,6 +7173,7 @@ unsafe fn run8_avx512(
 /// checks both).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[expect(clippy::too_many_arguments)]
 unsafe fn run4y_avx2(
     ops: &[Op],
     v2: &[f64],
@@ -7433,7 +7436,7 @@ unsafe fn run4y_avx2(
                 }
                 Op::Beardifier => {
                     let beard = cc.and_then(|cc| cc.beard.as_deref());
-                    if beard.map_or(true, |b| b.is_empty()) {
+                    if beard.is_none_or(|b| b.is_empty()) {
                         wr!(sp, _mm256_setzero_pd());
                     } else {
                         let beard = beard.unwrap();
@@ -7493,7 +7496,7 @@ unsafe fn run4y_avx2(
                     let lo = _mm256_cmp_pd(v, _mm256_set1_pd(mi), _CMP_GE_OQ);
                     let hi = _mm256_cmp_pd(v, _mm256_set1_pd(ma), _CMP_LT_OQ);
                     match _mm256_movemask_pd(_mm256_and_pd(lo, hi)) {
-                        m if m == 0xF => {
+                        0xF => {
                             sp -= 1;
                             pc += 1;
                         }
@@ -7559,6 +7562,7 @@ unsafe fn run4y_avx2(
 /// depth must be at most `DF4_SLOTS` (the caller checks both).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512dq")]
+#[expect(clippy::too_many_arguments)]
 unsafe fn run8y_avx512(
     ops: &[Op],
     v2: &[f64],
@@ -7829,7 +7833,7 @@ unsafe fn run8y_avx512(
                 }
                 Op::Beardifier => {
                     let beard = cc.and_then(|cc| cc.beard.as_deref());
-                    if beard.map_or(true, |b| b.is_empty()) {
+                    if beard.is_none_or(|b| b.is_empty()) {
                         wr!(sp, _mm512_setzero_pd());
                     } else {
                         let beard = beard.unwrap();
@@ -7881,7 +7885,7 @@ unsafe fn run8y_avx512(
                     let lo = _mm512_cmp_pd_mask(v, _mm512_set1_pd(mi), _CMP_GE_OQ);
                     let hi = _mm512_cmp_pd_mask(v, _mm512_set1_pd(ma), _CMP_LT_OQ);
                     match lo & hi {
-                        m if m == 0xFF => {
+                        0xFF => {
                             sp -= 1;
                             pc += 1;
                         }
@@ -7993,7 +7997,7 @@ impl<'a> DfCompiler<'a> {
                 _ => None,
             },
             DF::Div(a, b) => match self.const_value(*b) {
-                Some(b) if b == 0.0 => Some(0.0),
+                Some(0.0) => Some(0.0),
                 Some(b) => self.const_value(*a).map(|a| a / b),
                 None => None,
             },
@@ -8400,7 +8404,8 @@ impl Gen {
         // The 64 quarts share only 16 (qx, qz) climate columns; keep them in a 4x4
         // table so the inner walk hits memory instead of the `clim_c` map for the
         // other 48 quarts.
-        let mut col4: [[Option<([i64; 5], f64)>; 4]; 4] = [[None; 4]; 4];
+        type ClimCol = Option<([i64; 5], f64)>;
+        let mut col4: [[ClimCol; 4]; 4] = [[None; 4]; 4];
         for qx in qx0..qx0 + 4 {
             for qy in qy0..qy0 + 4 {
                 for qz in qz0..qz0 + 4 {
@@ -8874,7 +8879,8 @@ static PER_DIM: PerDimGen = PerDimGen {
 static GEN_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The block-state lookup `init` installed, kept for the same lazy install.
-static BLOCK_LOOKUP: Mutex<Option<fn(&str) -> Option<u32>>> = Mutex::new(None);
+type BlockLookupFn = fn(&str) -> Option<u32>;
+static BLOCK_LOOKUP: Mutex<Option<BlockLookupFn>> = Mutex::new(None);
 
 /// Which slot the dim-less accessors answer for.
 ///
@@ -9351,14 +9357,11 @@ pub(crate) fn population_discipline(requests: &[(i32, i32)]) -> Vec<PopBatch> {
         }
     }
     let mut batches = Vec::new();
-    loop {
-        let Some(level) = buckets
-            .iter()
-            .find(|(_, bucket)| !bucket.is_empty())
-            .map(|(level, _)| *level)
-        else {
-            break;
-        };
+    while let Some(level) = buckets
+        .iter()
+        .find(|(_, bucket)| !bucket.is_empty())
+        .map(|(level, _)| *level)
+    {
         let demander = buckets
             .get_mut(&level)
             .and_then(|bucket| bucket.pop_front())
@@ -9576,6 +9579,9 @@ pub fn chunk_cols_scratch(
     Gen::fresh_scratch(data.clone()).cols(cx, cz)
 }
 
+#[cfg(test)]
+type PrefetchedCols = Vec<((i32, i32), Option<std::sync::Arc<ChunkCols>>)>;
+
 /// Compute `keys` with up to `workers` scratch generators, returned in the caller's order.
 /// `workers <= 1` runs inline, which is the reference path; every worker count must give
 /// the same `ChunkCols` because `cols` is pure (the determinism test pins that).
@@ -9584,7 +9590,7 @@ pub fn prefetch_cols(
     data: &std::sync::Arc<GenData>,
     keys: &[(i32, i32)],
     workers: usize,
-) -> Vec<((i32, i32), Option<std::sync::Arc<ChunkCols>>)> {
+) -> PrefetchedCols {
     keys.iter()
         .copied()
         .zip(prefetch_cols_with(data, None, keys, workers, None))
@@ -9733,6 +9739,7 @@ impl MarkSrc {
 ///
 /// A worker that panics leaves its keys as `None` (the consumer builds those chunks
 /// inline) and gets a fresh generator; it never poisons the owner's.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn prefetch_terrain(
     data: &std::sync::Arc<GenData>,
     resolver: Option<BeardResolver>,
@@ -9876,6 +9883,8 @@ pub fn chunk_cols_dim(dimension: DimId, cx: i32, cz: i32) -> Option<std::sync::A
     ensure_dim_generator(dimension);
     gen_lock_dim(dimension).as_mut()?.cols(cx, cz)
 }
+
+type ChunkBiomeEntries = Vec<((i32, i32), std::sync::Arc<Vec<String>>)>;
 
 impl Gen {
     /// Queue a leaf block tick.
@@ -10072,7 +10081,7 @@ impl Gen {
     /// `chunk_biome_set`.
     pub(crate) fn merge_chunk_biomes(
         &mut self,
-        entries: Vec<((i32, i32), std::sync::Arc<Vec<String>>)>,
+        entries: ChunkBiomeEntries,
     ) {
         for (key, arc) in entries {
             if self.chunk_biomes.contains_key(&key) {
@@ -10198,7 +10207,7 @@ impl Gen {
                 while lx < 16 {
                     let x = cx * 16 + lx;
                     let d = self.block_density_x8(cc, x, y, z);
-                    for k in 0..DF8 {
+                    for (k, &lane_v) in d.iter().enumerate() {
                         let (state, marked) = self.terrain_cell_density_m(
                             cc,
                             &mut mats,
@@ -10207,7 +10216,7 @@ impl Gen {
                             x + k as i32,
                             y,
                             z,
-                            d[k],
+                            lane_v,
                         );
                         let lx = lx + k as i32;
                         row[lx as usize] = state;
@@ -10430,9 +10439,7 @@ impl Gen {
         if share_nofeat() {
             return None;
         }
-        let Some(resolver) = self.beard_resolver.or_else(global_beard_resolver) else {
-            return None;
-        };
+        let resolver = self.beard_resolver.or_else(global_beard_resolver)?;
         // M3 P1b: the round's other workers and its owner want the same chunk's beardifier
         // input (P1a measured 234 resolutions serially against 64 per worker on top of 148-164
         // on the owner: the same chunk resolved twice). Resolving is only entered at
@@ -10784,8 +10791,7 @@ impl Gen {
         let mut any_pos = false;
         {
             let ub_cells = lazy.cc.grids[ub_slot].as_deref().unwrap();
-            for c in 0..n_corners {
-                let (dxi, dzi, _, _) = lazy.corners[c];
+            for &(dxi, dzi, _, _) in &lazy.corners[..n_corners] {
                 let base = ((zi + dzi) * nx + (xi + dxi)) * ny + yi;
                 if ub_cells[base] > 0.0 || ub_cells[base + 1] > 0.0 {
                     any_pos = true;
@@ -10825,8 +10831,7 @@ impl Gen {
                                 let gv = fv + t.clamp(0.0, 1.0) * (tv - fv);
                                 if gv >= mi && gv < ma { None } else { Some(ov) }
                             });
-                            for c in 0..n_corners {
-                                let (dxi, dzi, bx, bz) = lazy.corners[c];
+                            for &(dxi, dzi, bx, bz) in &lazy.corners[..n_corners] {
                                 let v = match out {
                                     Some(ov) => ov,
                                     None => {
@@ -10836,10 +10841,12 @@ impl Gen {
                                             bz as f64 * xzs,
                                         );
                                         if let Some((mc, left)) = mul {
-                                            nv = if left { mc * nv } else { nv * mc };
+                                            let (lhs, rhs) = if left { (mc, nv) } else { (nv, mc) };
+                                            nv = lhs * rhs;
                                         }
                                         if let Some((ac, left)) = add {
-                                            nv = if left { ac + nv } else { nv + ac };
+                                            let (lhs, rhs) = if left { (ac, nv) } else { (nv, ac) };
+                                            nv = lhs + rhs;
                                         }
                                         nv
                                     }
@@ -10952,10 +10959,12 @@ impl Gen {
         }
         let apply = |mut v: f64| -> f64 {
             if let Some((c, left)) = mul {
-                v = if left { c * v } else { v * c };
+                let (lhs, rhs) = if left { (c, v) } else { (v, c) };
+                v = lhs * rhs;
             }
             if let Some((c, left)) = add {
-                v = if left { c + v } else { v + c };
+                let (lhs, rhs) = if left { (c, v) } else { (v, c) };
+                v = lhs + rhs;
             }
             v
         };
@@ -12085,7 +12094,7 @@ impl Gen {
             // `grass_block` surface cells).
             self.aq_sched = false;
             if let Some(st) = mat_in(
-                *mats.get_or_insert_with(|| cc.surface_mats(self)),
+                mats.get_or_insert_with(|| cc.surface_mats(self)),
                 (x & 15) as usize,
                 (z & 15) as usize,
                 y,
@@ -12119,7 +12128,7 @@ impl Gen {
         let surface_top = cc.wtop[lz * 16 + lx] as i32;
         if surface_material_applies(y, surface_top) {
             if let Some(st) = mat_in(
-                *mats.get_or_insert_with(|| cc.surface_mats(self)),
+                mats.get_or_insert_with(|| cc.surface_mats(self)),
                 lx,
                 lz,
                 y,
@@ -12358,8 +12367,7 @@ impl Gen {
                                         let gv = fv + t.clamp(0.0, 1.0) * (tv - fv);
                                         if gv >= mi && gv < ma { None } else { Some(ov) }
                                     });
-                                    for c in 0..n_corners {
-                                        let (dxi, dzi, bx, bz) = corners[c];
+                                    for &(dxi, dzi, bx, bz) in &corners[..n_corners] {
                                         let v = match out {
                                             Some(ov) => ov,
                                             None => {
@@ -12369,10 +12377,12 @@ impl Gen {
                                                     bz as f64 * xzs,
                                                 );
                                                 if let Some((mc, left)) = mul {
-                                                    nv = if left { mc * nv } else { nv * mc };
+                                                    let (lhs, rhs) = if left { (mc, nv) } else { (nv, mc) };
+                                                    nv = lhs * rhs;
                                                 }
                                                 if let Some((ac, left)) = add {
-                                                    nv = if left { ac + nv } else { nv + ac };
+                                                    let (lhs, rhs) = if left { (ac, nv) } else { (nv, ac) };
+                                                    nv = lhs + rhs;
                                                 }
                                                 nv
                                             }
@@ -12600,7 +12610,7 @@ impl Gen {
     /// the owner to merge after a wave (`Gen::merge_chunk_biomes`). `Arc` clones only.
     pub(crate) fn chunk_biomes_snapshot(
         &self,
-    ) -> Vec<((i32, i32), std::sync::Arc<Vec<String>>)> {
+    ) -> ChunkBiomeEntries {
         self.chunk_biomes.iter().map(|(k, v)| (*k, v.clone())).collect()
     }
 
@@ -12979,14 +12989,14 @@ impl Gen {
     /// the serial order.
     pub(crate) fn take_all_shape_marks(
         &mut self,
-    ) -> Vec<((i32, i32), Vec<(i32, i32, i32)>)> {
+    ) -> ShapeMarkBuckets {
         std::mem::take(&mut self.shape_marks).into_iter().collect()
     }
 
     /// Land a worker's direct shape marks on the owner, keeping each bucket's mark order.
     pub(crate) fn merge_shape_marks(
         &mut self,
-        marks: Vec<((i32, i32), Vec<(i32, i32, i32)>)>,
+        marks: ShapeMarkBuckets,
     ) {
         for (chunk, bucket) in marks {
             self.shape_marks.entry(chunk).or_default().extend(bucket);
@@ -13362,7 +13372,7 @@ pub fn df_stats() -> String {
         *per_kind.entry(k).or_insert(0) += n;
         rows.push((n, id, k));
     }
-    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
     let mut out = String::new();
     out.push_str(&format!(
         "[dfstats] nodes={} reachable_visited={} visits={total}\n",
@@ -13370,7 +13380,7 @@ pub fn df_stats() -> String {
         rows.len()
     ));
     let mut kinds: Vec<_> = per_kind.into_iter().collect();
-    kinds.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    kinds.sort_unstable_by_key(|k| std::cmp::Reverse(k.1));
     for (k, n) in kinds {
         out.push_str(&format!(
             "[dfstats] kind {k:<20} {n:>12} ({:.1}%)\n",
@@ -15261,8 +15271,7 @@ pub fn biome_at(qx: i32, qy: i32, qz: i32) -> Option<i64> {
 /// `MC_SPINE_HM_DUMP=cx,cz` lives in `generation_context::hm_dump`: the live maps are
 /// what a feature reads (`FC::hm_oc`/`hm_ws`), and `worldgen` may not reach for the
 /// generation context (module layers).
-
-
+///
 /// `MC_SPINE_BIOME_AT=x,y,z;x,y,z;...`: print both biome notions at each position.
 /// The container (what a saved chunk holds) and the blended lookup that
 /// `LevelReader.getBiome` returns are different answers; a placement filter reads
@@ -15886,7 +15895,7 @@ mod wg_tests {
                             continue;
                         }
                         got.insert(
-                            (lx as i32, sy + ly, lz as i32),
+                            (lx, sy + ly, lz),
                             reg.canonical_state(st),
                         );
                     }
@@ -15894,7 +15903,8 @@ mod wg_tests {
             }
             sy += 16;
         }
-        let mut diffs: Vec<((i32, i32, i32), Option<&String>, Option<&String>)> = Vec::new();
+        type CellDiff<'a> = ((i32, i32, i32), Option<&'a String>, Option<&'a String>);
+        let mut diffs: Vec<CellDiff> = Vec::new();
         for key in want.keys().chain(got.keys()) {
             if want.get(key) != got.get(key) && !diffs.iter().any(|d| d.0 == *key) {
                 diffs.push((*key, want.get(key), got.get(key)));
@@ -15974,7 +15984,7 @@ mod wg_tests {
                             continue;
                         }
                         got.insert(
-                            (-96 * 16 + lx as i32, sy + ly, 35 * 16 + lz as i32),
+                            (-96 * 16 + lx, sy + ly, 35 * 16 + lz),
                             reg.canonical_state(st),
                         );
                     }
@@ -15982,7 +15992,8 @@ mod wg_tests {
             }
             sy += 16;
         }
-        let mut diffs: Vec<((i32, i32, i32), Option<&String>, Option<&String>)> = Vec::new();
+        type CellDiff<'a> = ((i32, i32, i32), Option<&'a String>, Option<&'a String>);
+        let mut diffs: Vec<CellDiff> = Vec::new();
         for key in want.keys().chain(got.keys()) {
             if want.get(key) != got.get(key) && !diffs.iter().any(|d| d.0 == *key) {
                 diffs.push((*key, want.get(key), got.get(key)));
@@ -16724,10 +16735,10 @@ mod wg_tests {
             for y in [g.min_y, -56, -40, 0, 240, 255, 256, g.min_y + g.height - 1] {
                 let want = prog.eval(&g, None, 3, y, -2);
                 let got = prog.eval_x4(&g, None, 3, y, -2);
-                for k in 0..DF4 {
+                for (k, &lane_v) in got.iter().enumerate() {
                     assert_eq!(
                         want.to_bits(),
-                        got[k].to_bits(),
+                        lane_v.to_bits(),
                         "grad fc={fc} y={y} lane {k}"
                     );
                     compared += 1;
@@ -16785,11 +16796,11 @@ mod wg_tests {
                             let x = cx * 16 + lx;
                             let z = cz * 16 + lz;
                             let got = g.block_density_x4(&cc, x, y, z);
-                            for k in 0..DF4 {
+                            for (k, &lane_v) in got.iter().enumerate() {
                                 let want = g.block_density(&cc, x + k as i32, y, z);
                                 assert_eq!(
                                     want.to_bits(),
-                                    got[k].to_bits(),
+                                    lane_v.to_bits(),
                                     "{preset:?} seed {seed} chunk ({cx},{cz}) at {}, {y}, {z}",
                                     x + k as i32
                                 );
@@ -19825,7 +19836,7 @@ mod wg_tests {
     /// core would put one `Gen`'s caches of RSS per core on a shared host.
     #[test]
     fn the_default_terrain_worker_count_is_bounded() {
-        assert!(TERRAIN_MAX_JOBS <= 8);
+        const _: () = assert!(TERRAIN_MAX_JOBS <= 8);
         assert!(terrain_jobs() <= TERRAIN_MAX_JOBS.max(1));
     }
 
@@ -19980,7 +19991,7 @@ mod wg_tests {
         let _ = g.feat_state(8, 64, 8, |_, x, z| visited.push((x, z)));
         assert_eq!(
             render_population_order(&visited),
-            squash(&GOLDEN_DEFAULT_ORDER_1X1),
+            squash(GOLDEN_DEFAULT_ORDER_1X1),
             "the default dispatch must run the named member, not a coordinate sort"
         );
         // A chunk the run already decorated is served from the cache: the discipline is a queue,
@@ -19999,7 +20010,7 @@ mod wg_tests {
         let order = population_discipline_order(&request_box(0, 0, 2, 2));
         assert_eq!(
             render_population_order(&order),
-            squash(&GOLDEN_DEFAULT_ORDER_3X3),
+            squash(GOLDEN_DEFAULT_ORDER_3X3),
             "the named member's 3x3 request box order"
         );
     }
@@ -21644,11 +21655,11 @@ mod wg_tests {
                         for y in [min_y, min_y + 13, min_y + 121] {
                             let got = trilinear_x8(&cells, &columns, x, y, z)
                                 .expect("8-aligned start with cell_w = 4");
-                            for k in 0..DF8 {
+                            for (k, &lane_v) in got.iter().enumerate() {
                                 let want = trilinear(&cells, &columns, x + k as i32, y, z);
                                 assert_eq!(
                                     want.to_bits(),
-                                    got[k].to_bits(),
+                                    lane_v.to_bits(),
                                     "trilinear lane {k} at {x}+{k}, {y}, {z}"
                                 );
                                 compared += 1;
@@ -21731,7 +21742,7 @@ mod wg_tests {
         ];
         for (name, op) in unary {
             for v in DF4_EDGES {
-                check(vec![Op::Push(v), op.clone(), Op::Halt], name, v, v);
+                check(vec![Op::Push(v), op, Op::Halt], name, v, v);
             }
         }
         let binary: [(&str, Op); 6] = [
@@ -21745,7 +21756,7 @@ mod wg_tests {
         for (name, op) in binary {
             for a in DF4_EDGES {
                 for b in DF4_EDGES {
-                    check(vec![Op::Push(a), Op::Push(b), op.clone(), Op::Halt], name, a, b);
+                    check(vec![Op::Push(a), Op::Push(b), op, Op::Halt], name, a, b);
                 }
             }
         }
@@ -21778,8 +21789,8 @@ mod wg_tests {
             for y in [g.min_y, -40, 0, 240, g.min_y + g.height - 1] {
                 let want = prog.eval(&g, None, 3, y, -2);
                 let got = prog.eval_x8(&g, None, 3, y, -2);
-                for k in 0..DF8 {
-                    assert_eq!(want.to_bits(), got[k].to_bits(), "grad {fc} y={y} lane {k}");
+                for (k, &lane_v) in got.iter().enumerate() {
+                    assert_eq!(want.to_bits(), lane_v.to_bits(), "grad {fc} y={y} lane {k}");
                     compared += 1;
                 }
             }
@@ -21896,8 +21907,8 @@ mod wg_tests {
         ]);
         let want = nan_branch.eval(&g, None, x, y, z);
         let got = nan_branch.eval_x8(&g, None, x, y, z);
-        for k in 0..DF8 {
-            assert_eq!(want.to_bits(), got[k].to_bits(), "NaN branch_out lane {k}");
+        for (k, &lane_v) in got.iter().enumerate() {
+            assert_eq!(want.to_bits(), lane_v.to_bits(), "NaN branch_out lane {k}");
         }
     }
 
@@ -21933,11 +21944,11 @@ mod wg_tests {
                             let y = g.min_y + ly;
                             let z = cz * 16 + lz;
                             let got = g.block_density_x8(&cc, x, y, z);
-                            for k in 0..DF8 {
+                            for (k, &lane_v) in got.iter().enumerate() {
                                 let want = g.block_density(&cc, x + k as i32, y, z);
                                 assert_eq!(
                                     want.to_bits(),
-                                    got[k].to_bits(),
+                                    lane_v.to_bits(),
                                     "{preset:?} seed {seed} chunk ({cx},{cz}) x={} y={y} z={z}",
                                     x + k as i32
                                 );
@@ -21968,7 +21979,8 @@ mod wg_tests {
     /// both see `beard = None`, which is the premise of the fast path.
     #[test]
     fn a2b_single_column_top_ws_and_top_oc_match_full_cols_bit_for_bit() {
-        let cases: [(NoisePreset, u64, &[(i32, i32)]); 4] = [
+        type TopColCase = (NoisePreset, u64, &'static [(i32, i32)]);
+        let cases: [TopColCase; 4] = [
             (NoisePreset::Overworld, 0, &[(0, 0), (1, 0), (-1, 0), (0, -1)]),
             (NoisePreset::Overworld, 4242, &[(0, 0), (-2, 1)]),
             (NoisePreset::Nether, 4242, &[(0, 0), (-1, 1)]),

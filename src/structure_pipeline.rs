@@ -177,9 +177,7 @@ fn build_biome_mask(g: &Gen, names: &HashSet<String>) -> Option<u128> {
 }
 
 fn preset_masks<'a>(d: &'a Defs, g: &Gen) -> Option<&'a PresetMasks> {
-    if g.biome_name_of_leaf(0).is_none() {
-        return None;
-    }
+    g.biome_name_of_leaf(0)?;
     let slot = &d.preset_masks[preset_tag(g.preset) as usize];
     Some(slot.get_or_init(|| {
         let mut struct_masks = vec![None; d.struct_ids.len()];
@@ -299,9 +297,9 @@ fn load_defs_inner() -> Option<Defs> {
     // Structures first: the slot of a structure inside its step is its index in the
     // registry enumeration, which is what `setFeatureSeed(pop, index, step)` uses.
     let mut structure_files: Vec<(String, Vec<u8>)> = Gen::dp_files("structure").into_iter().collect();
-    structure_files.sort_by(|a, b| registry_sort_key(&a.0).cmp(&registry_sort_key(&b.0)));
+    structure_files.sort_by_key(|a| registry_sort_key(&a.0));
     let mut set_files: Vec<(String, Vec<u8>)> = Gen::dp_files("structure_set").into_iter().collect();
-    set_files.sort_by(|a, b| registry_sort_key(&a.0).cmp(&registry_sort_key(&b.0)));
+    set_files.sort_by_key(|a| registry_sort_key(&a.0));
     load_defs_from_files(&structure_files, &set_files)
 }
 
@@ -583,15 +581,18 @@ fn preset_tag(preset: worldgen::NoisePreset) -> u8 {
     }
 }
 
+type RingSetMap = HashMap<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>;
+type RingCandidateMap = HashMap<(u64, u8, usize), std::sync::Arc<Vec<((i32, i32), u64)>>>;
+
 thread_local! {
     /// Cached relocated stronghold chunks per `(seed, preset_tag, set_index)` — the eager,
     /// all-128 view. Tests and any caller that must enumerate every ring use this; admission
     /// checks use the lazy per-index path below instead.
-    static RING_CACHE: std::cell::RefCell<HashMap<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>> =
+    static RING_CACHE: std::cell::RefCell<RingSetMap> =
         std::cell::RefCell::new(HashMap::new());
     /// The cheap, pure candidate list `(candidate chunk, child RNG state)` per ring set.
     /// Building it costs a few LCG draws and **no** biome lookups.
-    static RING_CANDIDATES: std::cell::RefCell<HashMap<(u64, u8, usize), std::sync::Arc<Vec<((i32, i32), u64)>>>> =
+    static RING_CANDIDATES: std::cell::RefCell<RingCandidateMap> =
         std::cell::RefCell::new(HashMap::new());
     /// Lazily relocated chunk for one ring index, keyed by `(seed, preset_tag, set, index)`.
     static RING_I_CACHE: std::cell::RefCell<RingIndexCache> = std::cell::RefCell::new(RingIndexCache {
@@ -1232,9 +1233,7 @@ fn try_generate(
                     .ok()
                     .flatten()
             });
-            let Some((stub, build)) = found else {
-                return None;
-            };
+            let (stub, build) = found?;
             // The gate is `Structure.findValidGenerationPoint`, which filters on the
             // stub the structure's own `findGenerationPoint` returned - not on the
             // chunk centre. Reading the centre's biome at a fixed y=64 asks a different
@@ -1596,19 +1595,30 @@ thread_local! {
         std::cell::RefCell::new(AdaptingStartsCache { seed: 0, preset: 0, map: std::collections::HashMap::new(), ord: std::collections::VecDeque::new() });
 }
 
+type StartsByChunk = HashMap<(i32, i32), std::sync::Arc<Vec<Start>>>;
+type AdaptingStartsByChunk = HashMap<(i32, i32), std::sync::Arc<Vec<(usize, Start)>>>;
+
 struct StartsCache {
     seed: u64,
     preset: u8,
-    map: HashMap<(i32, i32), std::sync::Arc<Vec<Start>>>,
+    map: StartsByChunk,
     ord: std::collections::VecDeque<(i32, i32)>,
 }
 
 struct AdaptingStartsCache {
     seed: u64,
     preset: u8,
-    map: HashMap<(i32, i32), std::sync::Arc<Vec<(usize, Start)>>>,
+    map: AdaptingStartsByChunk,
     ord: std::collections::VecDeque<(i32, i32)>,
 }
+
+type StartsFlight =
+    crate::worldgen::FlightCache<(u64, u8, i32, i32), std::sync::Arc<Vec<Start>>>;
+type AdaptingStartsFlight =
+    crate::worldgen::FlightCache<(u64, u8, i32, i32), std::sync::Arc<Vec<(usize, Start)>>>;
+type RingsFlight =
+    crate::worldgen::FlightCache<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>;
+type RingIFlight = crate::worldgen::FlightCache<(u64, u8, usize, i32), (i32, i32)>;
 
 /// One parallel terrain round's structure-start cache, shared by that round's workers
 /// **and nobody else**.
@@ -1637,14 +1647,13 @@ static STARTS_ROUNDS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, std::syn
 /// workers and 376-571 at eight, varying run to run because the count was a race, not a
 /// difference in what was generated.
 struct RoundCache {
-    starts: crate::worldgen::FlightCache<(u64, u8, i32, i32), std::sync::Arc<Vec<Start>>>,
+    starts: StartsFlight,
     /// Adapting-only starts: beard resolution asks for these without ever generating a
     /// non-adapting structure. `starts_cached` takes its adapting half from this cache.
-    adapting_starts:
-        crate::worldgen::FlightCache<(u64, u8, i32, i32), std::sync::Arc<Vec<(usize, Start)>>>,
-    rings: crate::worldgen::FlightCache<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>,
+    adapting_starts: AdaptingStartsFlight,
+    rings: RingsFlight,
     /// One lazily relocated chunk per `(seed, preset, set, ring index)`.
-    ring_i: crate::worldgen::FlightCache<(u64, u8, usize, i32), (i32, i32)>,
+    ring_i: RingIFlight,
     /// Test probe: `chunk_starts` scans this round actually ran. The M1 counters aggregate the
     /// whole process (a worker flushes into them on its way out), so a test that wants *this
     /// round's* duplicate count reads it here instead of subtracting two aggregates that other
@@ -1900,11 +1909,15 @@ pub(crate) fn reset_cache() {
 /// order the native `LongOpenHashSet` iterates.
 pub(crate) struct References {
     /// (step, structure id, starts in reference order)
-    items: Vec<(usize, String, Vec<(u64, Start)>)>,
+    items: ReferenceItems,
     step_count: usize,
     #[cfg(test)]
     rng_after: HashMap<(usize, usize), (u64, u64)>,
 }
+
+type ReferenceItems = Vec<(usize, String, Vec<(u64, Start)>)>;
+type FoundStarts = HashMap<String, (usize, Vec<u64>, HashMap<u64, Start>)>;
+type OrderedStarts = Vec<(usize, usize, String, Vec<(u64, Start)>)>;
 
 /// The structure and piece boxes of each fortress referenced by this chunk.
 pub(crate) fn fortress_spawn_bounds(g: &mut Gen, cx: i32, cz: i32) -> Vec<(BB, Vec<BB>)> {
@@ -1955,7 +1968,7 @@ impl References {
             };
         }
         // key -> starts, per structure id, in the encounter order of the window.
-        let mut found: HashMap<String, (usize, Vec<u64>, HashMap<u64, Start>)> = HashMap::new();
+        let mut found: FoundStarts = HashMap::new();
         for (x, z) in interesting {
             for start in starts_cached(g, x, z).iter() {
                 if !start.intersects_chunk(cx, cz) {
@@ -1980,7 +1993,7 @@ impl References {
                 rng_after: HashMap::new(),
             };
         }
-        let mut ordered: Vec<(usize, usize, String, Vec<(u64, Start)>)> = found
+        let mut ordered: OrderedStarts = found
             .into_iter()
             .map(|(id, (step, keys, starts))| {
                 let slot = d.structures.get(&id).map(|s| s.slot).unwrap_or(0);
@@ -2854,7 +2867,7 @@ mod pipeline_tests {
         let pop = pop_seed(g.wseed(), cx * 16, cz * 16);
         let mut refs = References::collect(&mut g, cx, cz);
         let mut ctx = FC::new(&mut g);
-        refs.place_step(&mut ctx, step, pop as u64, cx, cz);
+        refs.place_step(&mut ctx, step, pop, cx, cz);
         assert!(!ctx.wr.is_empty(), "stronghold placement should write blocks");
     }
 
@@ -2904,7 +2917,7 @@ mod pipeline_tests {
         let pop = pop_seed(g.wseed(), cx * 16, cz * 16);
         let mut refs = References::collect(&mut g, cx, cz);
         let mut ctx = FC::new(&mut g);
-        refs.place_step(&mut ctx, step, pop as u64, cx, cz);
+        refs.place_step(&mut ctx, step, pop, cx, cz);
         assert!(!ctx.wr.is_empty(), "village placement should write blocks");
     }
 
@@ -2950,7 +2963,7 @@ mod pipeline_tests {
         let mut s_refs = References::collect(&mut ow, sx, sz);
         let s_pop = pop_seed(ow.wseed(), sx * 16, sz * 16);
         let mut s_ctx = FC::new(&mut ow);
-        s_refs.place_step(&mut s_ctx, s_step, s_pop as u64, sx, sz);
+        s_refs.place_step(&mut s_ctx, s_step, s_pop, sx, sz);
         assert!(!s_ctx.wr.is_empty(), "SinglePiece placement should write blocks");
 
         // 2. Nether Fortress via Wave3A.
@@ -2979,7 +2992,7 @@ mod pipeline_tests {
         let mut f_refs = References::collect(&mut nether, fx, fz);
         let f_pop = pop_seed(nether.wseed(), fx * 16, fz * 16);
         let mut f_ctx = FC::new(&mut nether);
-        f_refs.place_step(&mut f_ctx, f_step, f_pop as u64, fx, fz);
+        f_refs.place_step(&mut f_ctx, f_step, f_pop, fx, fz);
         assert!(!f_ctx.wr.is_empty(), "Fortress placement should write blocks");
 
         // 3. End City via Wave3A (outer End islands start beyond 1000 blocks).
@@ -3004,7 +3017,7 @@ mod pipeline_tests {
         let mut e_refs = References::collect(&mut end, ex, ez);
         let e_pop = pop_seed(end.wseed(), ex * 16, ez * 16);
         let mut e_ctx = FC::new(&mut end);
-        e_refs.place_step(&mut e_ctx, e_step, e_pop as u64, ex, ez);
+        e_refs.place_step(&mut e_ctx, e_step, e_pop, ex, ez);
         assert!(!e_ctx.wr.is_empty(), "EndCity placement should write blocks");
     }
 
@@ -3265,7 +3278,7 @@ mod pipeline_tests {
         let pop = pop_seed(nether.wseed(), pop_at.0 * 16, pop_at.1 * 16);
         let mut refs = References::collect(&mut nether, pop_at.0, pop_at.1);
         let mut ctx = FC::new(&mut nether);
-        refs.place_step(&mut ctx, step, pop as u64, pop_at.0, pop_at.1);
+        refs.place_step(&mut ctx, step, pop, pop_at.0, pop_at.1);
         let reg = crate::block_registry::breg().expect("block registry");
         let bones = ctx
             .wr
@@ -3502,7 +3515,7 @@ mod pipeline_tests {
             let mut refs = References::collect(&mut nether, cx, cz);
             let pop = pop_seed(nether.wseed(), cx * 16, cz * 16);
             let mut ctx = FC::new(&mut nether);
-            refs.place_step(&mut ctx, f_step, pop as u64, cx, cz);
+            refs.place_step(&mut ctx, f_step, pop, cx, cz);
             for (pos, payload) in ctx.payloads {
                 if matches!(&payload, GenerationPayload::SpawnerEntity(id) if id == "minecraft:blaze") {
                     blaze_spawners.push(pos);
@@ -3547,7 +3560,7 @@ mod pipeline_tests {
             let mut refs = References::collect(&mut ow, cx, cz);
             let pop = pop_seed(ow.wseed(), cx * 16, cz * 16);
             let mut ctx = FC::new(&mut ow);
-            refs.place_step(&mut ctx, sh_step, pop as u64, cx, cz);
+            refs.place_step(&mut ctx, sh_step, pop, cx, cz);
             for (pos, payload) in ctx.payloads {
                 if matches!(&payload, GenerationPayload::SpawnerEntity(id) if id == "minecraft:silverfish") {
                     silverfish_spawners.push(pos);
@@ -3582,7 +3595,7 @@ mod pipeline_tests {
                 let mut refs = References::collect(&mut ow, cx, cz);
                 let pop = pop_seed(ow.wseed(), cx * 16, cz * 16);
                 let mut ctx = FC::new(&mut ow);
-                refs.place_step(&mut ctx, m_step, pop as u64, cx, cz);
+                refs.place_step(&mut ctx, m_step, pop, cx, cz);
                 for (_, payload) in ctx.payloads {
                     if let GenerationPayload::Entity { id, pos, .. } = payload {
                         if id == "minecraft:elder_guardian" {
@@ -3624,7 +3637,7 @@ mod pipeline_tests {
                 let mut refs = References::collect(&mut ow, cx, cz);
                 let pop = pop_seed(ow.wseed(), cx * 16, cz * 16);
                 let mut ctx = FC::new(&mut ow);
-                refs.place_step(&mut ctx, h_step, pop as u64, cx, cz);
+                refs.place_step(&mut ctx, h_step, pop, cx, cz);
                 for (_, payload) in ctx.payloads {
                     if let GenerationPayload::Entity { id, .. } = payload {
                         hut_entities.push(id);
@@ -3654,7 +3667,7 @@ mod pipeline_tests {
             let mut refs = References::collect(g, cx, cz);
             let pop = pop_seed(g.wseed(), cx * 16, cz * 16);
             let mut ctx = FC::new(g);
-            refs.place_step(&mut ctx, step, pop as u64, cx, cz);
+            refs.place_step(&mut ctx, step, pop, cx, cz);
             ctx.payloads
         }
 
@@ -3856,7 +3869,7 @@ mod defs_loader_tests {
 
     fn vanilla(kind: &str) -> Vec<(String, Vec<u8>)> {
         let mut files: Vec<_> = Gen::dp_files(kind).into_iter().collect();
-        files.sort_by(|a, b| registry_sort_key(&a.0).cmp(&registry_sort_key(&b.0)));
+        files.sort_by_key(|a| registry_sort_key(&a.0));
         files
     }
 
