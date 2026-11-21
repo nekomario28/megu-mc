@@ -296,6 +296,7 @@ fn parallel_scaling() {
             RegionKey {
                 dimension: 0,
                 x: index as i32,
+                y: 0,
                 z: -3,
             },
             PARALLEL_CHAINS,

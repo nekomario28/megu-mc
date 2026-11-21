@@ -434,6 +434,34 @@ pub unsafe extern "C" fn mso_region_create(
             Ok(Box::into_raw(Box::new(MsoRegion(Region::new(RegionKey {
                 dimension,
                 x,
+                y: 0,
+                z,
+            })))))
+        })
+    })
+}
+
+/// Create a region at the given tall-dimension banded coordinates. The `y`
+/// argument is a vertical band index (block y div 32); pass 0 for
+/// vanilla-height dimensions.
+///
+/// # Safety
+///
+/// `out` must point to writable, aligned storage for one handle.
+#[no_mangle]
+pub unsafe extern "C" fn mso_region_create_tall(
+    dimension: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    out: *mut *mut MsoRegion,
+) -> MsoStatus {
+    boundary(|| unsafe {
+        write_result(out, || {
+            Ok(Box::into_raw(Box::new(MsoRegion(Region::new(RegionKey {
+                dimension,
+                x,
+                y,
                 z,
             })))))
         })
@@ -492,7 +520,12 @@ pub unsafe extern "C" fn mso_contraption_create(
                 body,
                 previous,
                 pose: MsoContraptionPose::default(),
-                batch: BatchQueue::new(RegionKey { dimension, x, z }),
+                batch: BatchQueue::new(RegionKey {
+                    dimension,
+                    x,
+                    y: 0,
+                    z,
+                }),
             })))
         })
     })

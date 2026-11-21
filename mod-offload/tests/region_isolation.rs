@@ -28,6 +28,7 @@ fn independent_scheduler_threads_progress_while_one_output_queue_stays_full() {
         let key = RegionKey {
             dimension: -1,
             x: -8,
+            y: 0,
             z: 9,
         };
         let mut scheduler = RegionScheduler::default();
@@ -125,6 +126,7 @@ fn run_peer(peer: i32, start: &Barrier) {
     let key = RegionKey {
         dimension: peer % 2,
         x: peer,
+        y: 0,
         z: -peer,
     };
     let mut scheduler = RegionScheduler::default();
@@ -167,7 +169,7 @@ fn check_header(frame: &[u8], key: RegionKey, count: u32, sequence: u64) -> &[u8
     assert_eq!(&frame[16..20], &key.dimension.to_le_bytes());
     assert_eq!(&frame[20..24], &key.x.to_le_bytes());
     assert_eq!(&frame[24..28], &key.z.to_le_bytes());
-    assert_eq!(&frame[28..32], &[0; 4]);
+    assert_eq!(&frame[28..32], &key.y.to_le_bytes());
     &frame[32..]
 }
 

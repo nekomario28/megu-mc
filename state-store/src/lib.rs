@@ -21,15 +21,29 @@
 //! * [`datafix`] — the format-agnostic [`datafix::DataValue`] tree,
 //!   [`datafix::DataFixStep`] units and
 //!   [`datafix::DataFixer::v1_21_1_to_26_3`]: block-state key normalization,
-//!   `pack_format` -> `min_format`/`max_format` migration, a data-driven
-//!   resource-location rename table that leaves unknown/modded namespaces
-//!   untouched, and `DataVersion` stamping that is idempotent and fails closed
-//!   on documents newer than the target.
+//!   `level.dat` version metadata, chunk-section palette migration,
+//!   item-component upgrades, `pack_format` -> `min_format`/`max_format`
+//!   migration, a data-driven resource-location rename table that leaves
+//!   unknown/modded namespaces untouched, and `DataVersion` stamping that is
+//!   idempotent and fails closed on documents newer than the target. The
+//!   explicit opt-in [`datafix::DataFixer::v26_3_to_1_21_1_downgrade`]
+//!   mirrors it for reversible roundtrips.
+//! * [`region_tick`] — 8x8-chunk [`region_tick::RegionCoord`] super-regions
+//!   and the four-color [`region_tick::partition_independent_regions`]
+//!   checkerboard waves behind
+//!   [`region_tick::tick_dimension_regions_parallel`]: same-wave regions can
+//!   never share a chunk border, so parallel ticking is bit-identical to
+//!   serial ticking.
 
 pub mod datafix;
+pub mod region_tick;
 pub mod sharded;
 
 pub use datafix::{DataFixError, DataFixReport, DataFixStep, DataFixer, DataValue, DV_1_21_1, DV_26_3};
+pub use region_tick::{
+    partition_independent_regions, tick_dimension_regions_parallel, RegionCoord, RegionTickStats,
+    RegionWork, REGION_SIDE_CHUNKS, WAVE_COUNT,
+};
 pub use sharded::{
     chunk_shard, BlockCoord, ChunkCoord, ChunkOverlay, DimensionState, EntityRecord, PendingTick,
     ServerContext, TickKind, SHARD_COUNT,

@@ -130,6 +130,14 @@ typedef struct {
  * release the handle. Rust panics that unwind are contained at the boundary.
  */
 mso_status mso_region_create(int32_t dimension, int32_t x, int32_t z, mso_region **out);
+
+/*
+ * Banded variant for tall custom dimensions: y is the vertical band index
+ * (block y div 32), carried in the S5 header's last word. Vanilla-height
+ * callers pass 0 and get identical streams to mso_region_create.
+ */
+mso_status mso_region_create_tall(int32_t dimension, int32_t x, int32_t y, int32_t z,
+                                  mso_region **out);
 mso_status mso_region_free(mso_region *region);
 
 /*

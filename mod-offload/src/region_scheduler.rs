@@ -5,6 +5,7 @@
 //! and contraption edits are synchronous.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::contraption::Contraption;
@@ -28,18 +29,42 @@ const TRANSFER_PAYLOAD_BYTES: usize = 9;
 const TANK_PAYLOAD_BYTES: usize = 9;
 const RECIPE_PAYLOAD_BYTES: usize = 5;
 
+/// A region address: dimension, horizontal 32-block cell, and vertical band.
+/// `y` is a block-y band index, not a block coordinate — vanilla-height
+/// dimensions keep `y == 0` (one band spanning the column), while custom
+/// "tall" dimensions exceeding the vanilla 384-block span use
+/// [`RegionKey::for_block_tall`] so vertically distant work schedules
+/// independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RegionKey {
     pub dimension: i32,
     pub x: i32,
+    /// Vertical band: block y `div_euclid` `REGION_SIDE_BLOCKS`. `0` for
+    /// column regions built by [`RegionKey::for_block`].
+    pub y: i32,
     pub z: i32,
 }
 
 impl RegionKey {
+    /// Columnar region key for vanilla-height dimensions: `y` band `0`.
     pub fn for_block(dimension: i32, x: i32, z: i32) -> Self {
         Self {
             dimension,
             x: x.div_euclid(REGION_SIDE_BLOCKS),
+            y: 0,
+            z: z.div_euclid(REGION_SIDE_BLOCKS),
+        }
+    }
+
+    /// Banded region key for tall dimensions (heights past the vanilla
+    /// `[-64, 320)` span — e.g. mod dimensions taller than ~1,008 blocks):
+    /// the block `y` maps to a 32-block vertical band exactly like `x`/`z`
+    /// map to horizontal cells.
+    pub fn for_block_tall(dimension: i32, x: i32, y: i32, z: i32) -> Self {
+        Self {
+            dimension,
+            x: x.div_euclid(REGION_SIDE_BLOCKS),
+            y: y.div_euclid(REGION_SIDE_BLOCKS),
             z: z.div_euclid(REGION_SIDE_BLOCKS),
         }
     }
@@ -89,6 +114,51 @@ impl RegionScheduler {
     /// Obtain a region's independent kernels, clock, work budget and output queue.
     pub fn region_mut(&mut self, key: RegionKey) -> &mut Region {
         self.regions.entry(key).or_insert_with(|| Region::new(key))
+    }
+
+    /// Region keys present, in deterministic sorted order.
+    pub fn region_keys(&self) -> Vec<RegionKey> {
+        self.regions.keys().copied().collect()
+    }
+
+    /// Advance every region to `tick` under `budget`, spread across `threads`
+    /// workers. Regions are independent by construction, so worker count
+    /// changes only wall-clock parallelism — never the result: the returned
+    /// `(key, outcome)` pairs come back in sorted key order regardless of how
+    /// the work interleaved, making `threads = 1` and `threads = N` runs
+    /// bit-identical. One region's error never stops its neighbours.
+    pub fn advance_all(
+        &mut self,
+        tick: u64,
+        budget: RegionBudget,
+        threads: usize,
+    ) -> Vec<(RegionKey, Result<RegionReport, TransportError>)> {
+        let mut regions: Vec<(RegionKey, &mut Region)> = self
+            .regions
+            .iter_mut()
+            .map(|(&key, region)| (key, region))
+            .collect();
+        let workers = threads.max(1).min(regions.len().max(1));
+        let slice_len = regions.len().div_ceil(workers);
+        let run = |slice: &mut [(RegionKey, &mut Region)]| {
+            slice
+                .iter_mut()
+                .map(|(key, region)| (*key, region.advance_to(tick, budget)))
+                .collect::<Vec<_>>()
+        };
+        if workers <= 1 {
+            return run(&mut regions);
+        }
+        thread::scope(|scope| {
+            let handles: Vec<_> = regions
+                .chunks_mut(slice_len)
+                .map(|slice| scope.spawn(move || run(slice)))
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        })
     }
 }
 
@@ -454,6 +524,7 @@ impl BatchQueue {
         header[16..20].copy_from_slice(&self.key.dimension.to_le_bytes());
         header[20..24].copy_from_slice(&self.key.x.to_le_bytes());
         header[24..28].copy_from_slice(&self.key.z.to_le_bytes());
+        header[28..32].copy_from_slice(&self.key.y.to_le_bytes());
         write(0, &header);
         self.sequence = sequence;
         Ok(BatchReport {
@@ -513,6 +584,7 @@ mod tests {
             RegionKey {
                 dimension: -1,
                 x: -1,
+                y: 0,
                 z: -1
             }
         );
@@ -521,6 +593,7 @@ mod tests {
             RegionKey {
                 dimension: 1,
                 x: -2,
+                y: 0,
                 z: 1
             }
         );
@@ -592,6 +665,7 @@ mod tests {
         let region = scheduler.region_mut(RegionKey {
             dimension: -2,
             x: -1,
+            y: 0,
             z: 3,
         });
         region.add_machine(7, 1, 2).unwrap();
@@ -680,5 +754,200 @@ mod tests {
                 .records,
             2
         );
+    }
+
+    /// A custom tall dimension twice the vanilla depth: block y spans
+    /// -2032..=2031, well past 1,008 blocks.
+    const TALL_DIM: i32 = 7;
+
+    fn tall_keys() -> Vec<RegionKey> {
+        vec![
+            RegionKey::for_block(0, 0, 0),                      // overworld column
+            RegionKey::for_block(-1, 0, 0),                     // nether
+            RegionKey::for_block(1, 0, 0),                      // end
+            RegionKey::for_block_tall(TALL_DIM, 0, -2048, 0),   // bedrock band
+            RegionKey::for_block_tall(TALL_DIM, 0, -1024, 0),   // deep band
+            RegionKey::for_block_tall(TALL_DIM, 0, 0, 0),       // surface band
+            RegionKey::for_block_tall(TALL_DIM, 0, 1024, 0),    // sky band
+            RegionKey::for_block_tall(TALL_DIM, 0, 2031, 0),    // roof band
+            RegionKey::for_block_tall(TALL_DIM, -64, 512, -64), // offset cell
+        ]
+    }
+
+    fn seed_region(region: &mut Region, machine: u32, items: &[u32]) {
+        region.add_machine(machine, 8, 1).unwrap();
+        for &item in items {
+            region.insert_item(machine, item).unwrap();
+        }
+    }
+
+    #[test]
+    fn tall_dimension_bands_are_euclidean_and_carry_y_on_the_wire() {
+        assert_eq!(
+            RegionKey::for_block_tall(TALL_DIM, 33, -1025, -1),
+            RegionKey {
+                dimension: TALL_DIM,
+                x: 1,
+                y: -33,
+                z: -1
+            }
+        );
+        // The vanilla column helper keeps band 0 even for tall heights' x/z.
+        assert_eq!(RegionKey::for_block(TALL_DIM, 0, 0).y, 0);
+        // Distinct bands are distinct regions; the same band maps together.
+        assert_ne!(
+            RegionKey::for_block_tall(TALL_DIM, 0, -1, 0),
+            RegionKey::for_block_tall(TALL_DIM, 0, 0, 0)
+        );
+        assert_eq!(
+            RegionKey::for_block_tall(TALL_DIM, 0, 100, 0),
+            RegionKey::for_block_tall(TALL_DIM, 0, 101, 0)
+        );
+
+        // The exported S5 header carries the y band in its last word.
+        let key = RegionKey::for_block_tall(TALL_DIM, 0, -1024, 0); // y band -32
+        let mut scheduler = RegionScheduler::default();
+        let region = scheduler.region_mut(key);
+        region.queue_delta(FIRST_ADAPTER_KIND, 0, b"b").unwrap();
+        let mut frame = [0; 64];
+        let report = region.export_into(&mut frame, 1).unwrap();
+        assert_eq!(report.bytes, 32 + 16 + 1);
+        assert_eq!(&frame[16..20], &TALL_DIM.to_le_bytes());
+        assert_eq!(&frame[28..32], &(-32_i32).to_le_bytes());
+    }
+
+    #[test]
+    fn multi_dimension_and_tall_regions_progress_independently() {
+        let mut scheduler = RegionScheduler::default();
+        let keys = tall_keys();
+        for (i, &key) in keys.iter().enumerate() {
+            seed_region(
+                scheduler.region_mut(key),
+                i as u32,
+                &[100 + i as u32, 200 + i as u32],
+            );
+        }
+        // Advance only the deep band; every other region must stay at tick 0.
+        let deep = RegionKey::for_block_tall(TALL_DIM, 0, -1024, 0);
+        let report = scheduler.region_mut(deep).advance_to(4, BUDGET).unwrap();
+        assert_eq!(report.processed, 1);
+        for &key in &keys {
+            let now = scheduler.region(key).unwrap().transport().now();
+            assert_eq!(now, if key == deep { 1 } else { 0 }, "{key:?}");
+        }
+        // Region ordering is a deterministic sorted sequence: dimension
+        // first, then x, band and z.
+        assert_eq!(
+            scheduler.region_keys(),
+            {
+                let mut sorted = keys.clone();
+                sorted.sort();
+                sorted
+            }
+        );
+    }
+
+    /// One fully deterministic run of every region, returning each exported
+    /// frame in sorted-key order. `budget.max_time` stays `None` — wall time
+    /// is never part of the result.
+    fn run_all_and_export(
+        scheduler: &mut RegionScheduler,
+        tick: u64,
+        threads: usize,
+    ) -> (Vec<(RegionKey, Result<RegionReport, TransportError>)>, Vec<(RegionKey, Vec<u8>)>) {
+        let reports = scheduler.advance_all(
+            tick,
+            RegionBudget {
+                max_steps: 64,
+                max_time: None,
+            },
+            threads,
+        );
+        let mut frames = Vec::new();
+        let mut buffer = vec![0; MAX_BATCH_BYTES];
+        for key in scheduler.region_keys() {
+            let report = scheduler
+                .region_mut(key)
+                .export_into(&mut buffer, MAX_BATCH_RECORDS)
+                .unwrap();
+            frames.push((key, buffer[..report.bytes].to_vec()));
+        }
+        (reports, frames)
+    }
+
+    #[test]
+    fn advance_all_is_bit_identical_between_serial_and_parallel() {
+        let keys = tall_keys();
+        let build = || {
+            let mut scheduler = RegionScheduler::default();
+            for (i, &key) in keys.iter().enumerate() {
+                let region = scheduler.region_mut(key);
+                seed_region(region, i as u32, &[100 + i as u32, 200 + i as u32]);
+                region.queue_delta(FIRST_ADAPTER_KIND, i as u32, b"mark").unwrap();
+            }
+            scheduler
+        };
+        let mut serial = build();
+        let mut parallel = build();
+        let mut octa = build();
+
+        let serial_out = run_all_and_export(&mut serial, 40, 1);
+        let parallel_out = run_all_and_export(&mut parallel, 40, 4);
+        let octa_out = run_all_and_export(&mut octa, 40, 8);
+
+        assert_eq!(serial_out, parallel_out);
+        assert_eq!(serial_out, octa_out);
+        // Keys are reported in sorted order, one outcome each.
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(
+            serial_out.0.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            sorted
+        );
+        // Every region processed its seeded work: 2 items each plus the
+        // queued delta already exported.
+        for (_, report) in &serial_out.0 {
+            assert_eq!(report.unwrap().processed, 2);
+        }
+        // A second identical round keeps parity (regions are deterministic).
+        let serial_out2 = run_all_and_export(&mut serial, 80, 1);
+        let parallel_out2 = run_all_and_export(&mut parallel, 80, 4);
+        assert_eq!(serial_out2, parallel_out2);
+    }
+
+    #[test]
+    fn advance_all_keeps_sorted_order_and_survives_a_region_error() {
+        let mut scheduler = RegionScheduler::default();
+        let keys = tall_keys();
+        for (i, &key) in keys.iter().enumerate() {
+            seed_region(scheduler.region_mut(key), i as u32, &[i as u32]);
+        }
+        // Push one region's clock ahead, then ask all regions for an earlier
+        // tick: that region reports its own error; neighbours still advance.
+        let ahead = keys[3];
+        scheduler.region_mut(ahead).advance_to(50, BUDGET).unwrap();
+        let reports = scheduler.advance_all(40, BUDGET, 4);
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(
+            reports.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            sorted
+        );
+        for (key, outcome) in &reports {
+            if *key == ahead {
+                assert_eq!(
+                    *outcome,
+                    Err(TransportError::TimeWentBackwards {
+                        current: 50,
+                        requested: 40
+                    })
+                );
+            } else {
+                assert!(outcome.is_ok(), "{key:?}: {outcome:?}");
+            }
+        }
+        // Empty scheduler: no work, no panic, whatever the thread count.
+        let mut empty = RegionScheduler::default();
+        assert!(empty.advance_all(10, BUDGET, 4).is_empty());
     }
 }
