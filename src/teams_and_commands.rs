@@ -1730,7 +1730,7 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             } else {
                 None
             };
-            let mut reg = registry.lock().unwrap();
+            let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = reg.add(name, display.as_deref()) {
                 return e;
             }
@@ -1749,7 +1749,7 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             let [_, name] = args[..2.min(args.len())] else {
                 return "usage: /team remove <team>".to_owned();
             };
-            match registry.lock().unwrap().remove(name) {
+            match registry.lock().unwrap_or_else(|e| e.into_inner()).remove(name) {
                 Ok(_) => {
                     p3b_broadcast_team_packet(set_player_team_packet(
                         name,
@@ -1766,7 +1766,7 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             let [_, name] = args[..2.min(args.len())] else {
                 return "usage: /team empty <team>".to_owned();
             };
-            match registry.lock().unwrap().empty(name) {
+            match registry.lock().unwrap_or_else(|e| e.into_inner()).empty(name) {
                 Ok(members) => {
                     p3b_broadcast_team_packet(set_player_team_packet(
                         name,
@@ -1798,7 +1798,7 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             let mut joined = Vec::new();
             let mut errors = Vec::new();
             {
-                let mut reg = registry.lock().unwrap();
+                let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                 for member in &member_tokens {
                     match reg.join(name, member) {
                         Ok(_) => joined.push(member.clone()),
@@ -1832,7 +1832,7 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             let mut left: Vec<(String, String)> = Vec::new(); // (member, team)
             let mut errors = Vec::new();
             {
-                let mut reg = registry.lock().unwrap();
+                let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                 for member in &members {
                     match reg.leave(member) {
                         Ok(team) => left.push((member.clone(), team)),
@@ -1868,7 +1868,7 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             }
         }
         "list" => {
-            let reg = registry.lock().unwrap();
+            let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
             match args.get(1) {
                 None => {
                     let names: Vec<&str> = reg.list().iter().map(|t| t.name.as_str()).collect();
@@ -1900,7 +1900,7 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             };
             let value = args[3..].join(" ");
             let result = {
-                let mut reg = registry.lock().unwrap();
+                let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(team) = reg.get_mut(name) else {
                     return format!("No team with name '{name}'");
                 };
@@ -1957,7 +1957,7 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             };
             match result {
                 Ok(reply) => {
-                    let reg = registry.lock().unwrap();
+                    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                     let team = reg.get(name).expect("present").clone();
                     drop(reg);
                     p3b_broadcast_team_packet(set_player_team_packet(
@@ -2016,7 +2016,7 @@ fn tick_command(args: &[&str]) -> String {
     let ctl = tick_controller();
     match args.first().copied() {
         Some("query") => {
-            let c = ctl.lock().unwrap();
+            let c = ctl.lock().unwrap_or_else(|e| e.into_inner());
             let mut lines = vec![format!(
                 "Target tick rate: {:.1} per second",
                 c.tick_rate
@@ -2046,28 +2046,28 @@ fn tick_command(args: &[&str]) -> String {
                 return "usage: /tick rate <1.0..10000.0>".to_owned();
             };
             {
-                let mut c = ctl.lock().unwrap();
+                let mut c = ctl.lock().unwrap_or_else(|e| e.into_inner());
                 if let Err(e) = c.set_tick_rate(value) {
                     return e;
                 }
             }
-            let c = ctl.lock().unwrap();
+            let c = ctl.lock().unwrap_or_else(|e| e.into_inner());
             fanout_in(&client_snapshot(), |_| true, |_| {
                 (0x71, ticking_state_packet(c.tick_rate, c.frozen))
             });
             format!("Set tick rate to {value}")
         }
         Some("freeze") => {
-            ctl.lock().unwrap().frozen = true;
-            let c = ctl.lock().unwrap();
+            ctl.lock().unwrap_or_else(|e| e.into_inner()).frozen = true;
+            let c = ctl.lock().unwrap_or_else(|e| e.into_inner());
             fanout_in(&client_snapshot(), |_| true, |_| {
                 (0x71, ticking_state_packet(c.tick_rate, c.frozen))
             });
             "Froze the game".to_owned()
         }
         Some("unfreeze") => {
-            ctl.lock().unwrap().frozen = false;
-            let c = ctl.lock().unwrap();
+            ctl.lock().unwrap_or_else(|e| e.into_inner()).frozen = false;
+            let c = ctl.lock().unwrap_or_else(|e| e.into_inner());
             fanout_in(&client_snapshot(), |_| true, |_| {
                 (0x71, ticking_state_packet(c.tick_rate, c.frozen))
             });
@@ -2075,7 +2075,7 @@ fn tick_command(args: &[&str]) -> String {
         }
         Some("step") => {
             if args.get(1) == Some(&"stop") {
-                ctl.lock().unwrap().step_remaining = 0;
+                ctl.lock().unwrap_or_else(|e| e.into_inner()).step_remaining = 0;
                 return "Stopped stepping".to_owned();
             }
             let ticks = match args.get(1) {
@@ -2085,7 +2085,7 @@ fn tick_command(args: &[&str]) -> String {
                     None => return "Invalid step count (use ticks like 1, or time like 5s, 1d)".to_owned(),
                 },
             };
-            let mut c = ctl.lock().unwrap();
+            let mut c = ctl.lock().unwrap_or_else(|e| e.into_inner());
             if !c.frozen {
                 return "Game is not frozen; /tick step only works while frozen".to_owned();
             }
@@ -2098,7 +2098,7 @@ fn tick_command(args: &[&str]) -> String {
         }
         Some("sprint") => {
             if args.get(1) == Some(&"stop") {
-                ctl.lock().unwrap().stop_sprinting();
+                ctl.lock().unwrap_or_else(|e| e.into_inner()).stop_sprinting();
                 return "Stopped sprinting".to_owned();
             }
             let Some(v) = args.get(1) else {
@@ -2107,7 +2107,7 @@ fn tick_command(args: &[&str]) -> String {
             let Some(ticks) = parse_tick_time_arg(v) else {
                 return "Invalid sprint length (use ticks like 1, or time like 5s, 1d)".to_owned();
             };
-            ctl.lock().unwrap().request_sprint(ticks);
+            ctl.lock().unwrap_or_else(|e| e.into_inner()).request_sprint(ticks);
             format!("Sprinting {ticks} tick(s)")
         }
         _ => "usage: /tick query | rate <rate> | freeze | unfreeze | step [ticks|stop] | sprint <ticks|stop>".to_owned(),
@@ -2152,7 +2152,7 @@ fn random_command(ctx: &CmdCtx, args: &[&str]) -> String {
         .map(|c| c.name.clone())
         .unwrap_or_else(|| "Server".to_owned());
     let reply = exec_random_command(
-        &mut random_sequences().lock().unwrap(),
+        &mut random_sequences().lock().unwrap_or_else(|e| e.into_inner()),
         p3b_world_seed(),
         args,
         &roller,
@@ -2218,7 +2218,7 @@ fn ride_mount(target: &ExecuteEntity, vehicle: &ExecuteEntity) -> String {
     let (t, v) = (target.id(), vehicle.id());
     let (kind, vpos) = ride_vehicle_kind(vehicle);
     let seat = {
-        let mut live = mounts().lock().unwrap();
+        let mut live = mounts().lock().unwrap_or_else(|e| e.into_inner());
         live.registry.register_vehicle(v, kind, vpos);
         live.registry.register_rider(t, target.location().0);
         match live.registry.mount(v, t) {
@@ -2236,7 +2236,7 @@ fn ride_mount(target: &ExecuteEntity, vehicle: &ExecuteEntity) -> String {
     let off = kind.seat_offset(seat);
     match target {
         ExecuteEntity::Player(player) => {
-            let mut p = player.pos.lock().unwrap();
+            let mut p = player.pos.lock().unwrap_or_else(|e| e.into_inner());
             *p = (
                 vpos[0] + off[0],
                 vpos[1] + off[1],
@@ -2248,7 +2248,7 @@ fn ride_mount(target: &ExecuteEntity, vehicle: &ExecuteEntity) -> String {
             ac_note_carried_motion(player.eid, off);
         }
         ExecuteEntity::Mob(mob) => {
-            let mut p = mob.pos.lock().unwrap();
+            let mut p = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
             *p = (
                 vpos[0] + off[0],
                 vpos[1] + off[1],
@@ -2259,7 +2259,7 @@ fn ride_mount(target: &ExecuteEntity, vehicle: &ExecuteEntity) -> String {
         }
         ExecuteEntity::Other { .. } => {}
     }
-    let packet = mounts().lock().unwrap().registry.encode_set_passengers(v);
+    let packet = mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.encode_set_passengers(v);
     broadcast_seen(v, |_c| (0x5f, packet.clone()));
     format!("Now riding {}", vehicle.kind())
 }
@@ -2273,11 +2273,11 @@ fn ride_dismount(target: &ExecuteEntity) -> String {
         player_dismount(player, true);
         return "No longer riding".into();
     }
-    let Some(at) = mounts().lock().unwrap().registry.dismount(target.id()) else {
+    let Some(at) = mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.dismount(target.id()) else {
         return "Not riding anything".into();
     };
     if let ExecuteEntity::Mob(mob) = target {
-        let mut p = mob.pos.lock().unwrap();
+        let mut p = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
         *p = (at[0], at[1], at[2], p.3, p.4);
     }
     let packet = mounts()
@@ -2354,11 +2354,11 @@ fn spectate_command(ctx: &CmdCtx, args: &[&str]) -> String {
         },
         None => (viewer.eid, String::new()),
     };
-    spectator_cameras().lock().unwrap().insert(viewer.eid, camera);
+    spectator_cameras().lock().unwrap_or_else(|e| e.into_inner()).insert(viewer.eid, camera);
     let mut body = Vec::new();
     write_varint(&mut body, i64::from(camera));
     let _ = send_packet(
-        &mut viewer.sock.lock().unwrap(),
+        &mut viewer.sock.lock().unwrap_or_else(|e| e.into_inner()),
         SET_CAMERA_PACKET_767,
         body,
     );
@@ -2448,7 +2448,7 @@ fn fillbiome_command(ctx: &CmdCtx, args: &[&str]) -> String {
         }
     }
     let changed = cells.len();
-    let mut overrides = biome_overrides().lock().unwrap();
+    let mut overrides = biome_overrides().lock().unwrap_or_else(|e| e.into_inner());
     let store = overrides.entry(dim).or_default();
     for cell in cells {
         store.insert(cell, biome_id.clone());
@@ -2517,7 +2517,7 @@ fn place_command(ctx: &CmdCtx, args: &[&str]) -> String {
             if !known {
                 return format!("No feature with the name '{id}' exists");
             }
-            place_dispatches().lock().unwrap().push(PlaceDispatch {
+            place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).push(PlaceDispatch {
                 dim,
                 pos,
                 id: id.clone(),
@@ -2527,7 +2527,7 @@ fn place_command(ctx: &CmdCtx, args: &[&str]) -> String {
         }
         _ => match place_template_live(dim, pos, &id) {
             Ok(placed) => {
-                place_dispatches().lock().unwrap().push(PlaceDispatch {
+                place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).push(PlaceDispatch {
                     dim,
                     pos,
                     id: id.clone(),
@@ -2583,9 +2583,9 @@ fn run_profile_command(level: u8, args: &[&str]) -> String {
     }
     let profiler = live_hotspot_profiler();
     match args {
-        [] => profiler.lock().unwrap().summary(5).format_human(),
+        [] => profiler.lock().unwrap_or_else(|e| e.into_inner()).summary(5).format_human(),
         ["reset"] => {
-            profiler.lock().unwrap().reset();
+            profiler.lock().unwrap_or_else(|e| e.into_inner()).reset();
             "Profiler counters reset".into()
         }
         [raw] => match raw.parse::<usize>() {
@@ -2651,7 +2651,7 @@ fn run_transfer_command(ctx: &CmdCtx, level: u8, args: &[&str]) -> String {
     let mut sent = 0usize;
     for target in &targets {
         if send_packet(
-            &mut target.sock.lock().unwrap(),
+            &mut target.sock.lock().unwrap_or_else(|e| e.into_inner()),
             TRANSFER_PACKET_ID,
             payload.clone(),
         )
@@ -2723,7 +2723,7 @@ fn data_entity_root(entity: &ExecuteEntity) -> ExecTag {
     let mut put = |name: &str, value: ExecTag| {
         fields.insert(NbtString::text(name), value);
     };
-    let extras = data_entity_extras().lock().unwrap().clone();
+    let extras = data_entity_extras().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let extras = extras.get(&entity.tag_key());
     let extra = |name: &str| -> Option<&ExecTag> {
         extras.and_then(|tag| tag.get(name))
@@ -2738,13 +2738,13 @@ fn data_entity_root(entity: &ExecuteEntity) -> ExecTag {
         )
     };
     let motion = match entity {
-        ExecuteEntity::Mob(mob) => *mob.vel.lock().unwrap(),
+        ExecuteEntity::Mob(mob) => *mob.vel.lock().unwrap_or_else(|e| e.into_inner()),
         _ => [0.0; 3],
     };
     put("Motion", doubles(motion));
     match entity {
         ExecuteEntity::Player(player) => {
-            let air = *player.air.lock().unwrap();
+            let air = *player.air.lock().unwrap_or_else(|e| e.into_inner());
             put("Air", ExecTag::Short(air.clamp(-300, 30_000) as i16));
             put(
                 "Fire",
@@ -2756,8 +2756,8 @@ fn data_entity_root(entity: &ExecuteEntity) -> ExecTag {
                     .cloned()
                     .unwrap_or(ExecTag::Byte(0)),
             );
-            let inv = player.inv.lock().unwrap();
-            let held = *player.held.lock().unwrap();
+            let inv = player.inv.lock().unwrap_or_else(|e| e.into_inner());
+            let held = *player.held.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(selected) = inv
                 .get(&(36 + held))
                 .and_then(|stack| data_item_nbt(stack))
@@ -2770,11 +2770,11 @@ fn data_entity_root(entity: &ExecuteEntity) -> ExecTag {
         ExecuteEntity::Mob(mob) => {
             put(
                 "Air",
-                ExecTag::Short((*mob.air.lock().unwrap()).clamp(-300, 30_000) as i16),
+                ExecTag::Short((*mob.air.lock().unwrap_or_else(|e| e.into_inner())).clamp(-300, 30_000) as i16),
             );
             put(
                 "Fire",
-                ExecTag::Short((*mob.fire_ticks.lock().unwrap()).clamp(-20, 30_000) as i16),
+                ExecTag::Short((*mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner())).clamp(-20, 30_000) as i16),
             );
             put(
                 "Invulnerable",
@@ -2882,7 +2882,7 @@ fn data_item_stack(tag: &ExecTag) -> Option<Stack> {
 }
 
 fn data_actor_root(actor: &Actor) -> ExecTag {
-    let (x, y, z) = *actor.pos.lock().unwrap();
+    let (x, y, z) = *actor.pos.lock().unwrap_or_else(|e| e.into_inner());
     execute_nbt_compound([
         (
             "Pos",
@@ -2896,7 +2896,7 @@ fn data_actor_root(actor: &Actor) -> ExecTag {
         ),
         (
             "Inventory",
-            stacks_to_items_nbt(&actor.inv.lock().unwrap()),
+            stacks_to_items_nbt(&actor.inv.lock().unwrap_or_else(|e| e.into_inner())),
         ),
     ])
 }
@@ -2951,7 +2951,7 @@ fn data_read_root(source: &ExecuteSource, target: &DataTarget) -> Result<(String
 /// model keeps it, file it under `data_entity_extras` otherwise.
 fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) {
     let extra = |entity: &ExecuteEntity, name: &str, value: &ExecTag| {
-        let mut extras = data_entity_extras().lock().unwrap();
+        let mut extras = data_entity_extras().lock().unwrap_or_else(|e| e.into_inner());
         let entry = extras
             .entry(entity.tag_key())
             .or_insert_with(|| ExecTag::Compound(Default::default()));
@@ -2965,11 +2965,11 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
             if let Some([x, y, z]) = data_nbt_vec3(value) {
                 match entity {
                     ExecuteEntity::Player(player) => {
-                        let mut pos = player.pos.lock().unwrap();
+                        let mut pos = player.pos.lock().unwrap_or_else(|e| e.into_inner());
                         (pos.0, pos.1, pos.2) = (x, y, z);
                     }
                     ExecuteEntity::Mob(mob) => {
-                        let mut pos = mob.pos.lock().unwrap();
+                        let mut pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
                         (pos.0, pos.1, pos.2) = (x, y, z);
                     }
                     ExecuteEntity::Other { id, kind, .. } => {
@@ -2987,11 +2987,11 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
                 if let [yaw, pitch, ..] = angles.as_slice() {
                     match entity {
                         ExecuteEntity::Player(player) => {
-                            let mut pos = player.pos.lock().unwrap();
+                            let mut pos = player.pos.lock().unwrap_or_else(|e| e.into_inner());
                             (pos.3, pos.4) = (*yaw, *pitch);
                         }
                         ExecuteEntity::Mob(mob) => {
-                            let mut pos = mob.pos.lock().unwrap();
+                            let mut pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
                             (pos.3, pos.4) = (*yaw, *pitch);
                         }
                         ExecuteEntity::Other { .. } => {}
@@ -3002,7 +3002,7 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
         "Motion" => {
             if let Some(motion) = data_nbt_vec3(value) {
                 match entity {
-                    ExecuteEntity::Mob(mob) => *mob.vel.lock().unwrap() = motion,
+                    ExecuteEntity::Mob(mob) => *mob.vel.lock().unwrap_or_else(|e| e.into_inner()) = motion,
                     _ => extra(entity, name, value),
                 }
             }
@@ -3011,9 +3011,9 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
             if let Some(hp) = data_nbt_f64(value) {
                 match entity {
                     ExecuteEntity::Player(player) => {
-                        *player.hp.lock().unwrap() = hp as f32;
+                        *player.hp.lock().unwrap_or_else(|e| e.into_inner()) = hp as f32;
                     }
-                    ExecuteEntity::Mob(mob) => *mob.hp.lock().unwrap() = hp as f32,
+                    ExecuteEntity::Mob(mob) => *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = hp as f32,
                     ExecuteEntity::Other { .. } => {}
                 }
             }
@@ -3021,8 +3021,8 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
         "Air" => {
             if let Some(ticks) = data_nbt_f64(value).map(|n| n as i32) {
                 match entity {
-                    ExecuteEntity::Player(player) => *player.air.lock().unwrap() = ticks,
-                    ExecuteEntity::Mob(mob) => *mob.air.lock().unwrap() = ticks,
+                    ExecuteEntity::Player(player) => *player.air.lock().unwrap_or_else(|e| e.into_inner()) = ticks,
+                    ExecuteEntity::Mob(mob) => *mob.air.lock().unwrap_or_else(|e| e.into_inner()) = ticks,
                     ExecuteEntity::Other { .. } => {}
                 }
             }
@@ -3030,7 +3030,7 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
         "Fire" => {
             if let Some(ticks) = data_nbt_f64(value).map(|n| n as i32) {
                 match entity {
-                    ExecuteEntity::Mob(mob) => *mob.fire_ticks.lock().unwrap() = ticks,
+                    ExecuteEntity::Mob(mob) => *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = ticks,
                     _ => extra(entity, name, value),
                 }
             }
@@ -3038,7 +3038,7 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
         "Invulnerable" => {
             if let ExecuteEntity::Player(player) = entity {
                 let flag = data_nbt_f64(value).map_or(false, |n| n != 0.0);
-                *player.invulnerable.lock().unwrap() = if flag { i32::MAX } else { 0 };
+                *player.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = if flag { i32::MAX } else { 0 };
             }
             extra(entity, name, value);
         }
@@ -3052,7 +3052,7 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
                         }
                     }
                 }
-                let mut store = tags().lock().unwrap();
+                let mut store = tags().lock().unwrap_or_else(|e| e.into_inner());
                 let key = entity.tag_key();
                 if set.is_empty() {
                     store.remove(&key);
@@ -3066,7 +3066,7 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
                 match entity {
                     ExecuteEntity::Player(player) => {
                         if let Ok(slots) = items_nbt_to_stacks(value) {
-                            *player.inv.lock().unwrap() = slots;
+                            *player.inv.lock().unwrap_or_else(|e| e.into_inner()) = slots;
                         }
                     }
                     _ => extra(entity, name, value),
@@ -3077,8 +3077,8 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
             if let ExecTag::Compound(..) = value {
                 match entity {
                     ExecuteEntity::Player(player) => {
-                        let slot = 36 + *player.held.lock().unwrap();
-                        let mut inv = player.inv.lock().unwrap();
+                        let slot = 36 + *player.held.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut inv = player.inv.lock().unwrap_or_else(|e| e.into_inner());
                         match data_item_stack(value) {
                             Some(stack) => {
                                 inv.insert(slot, stack);
@@ -3096,7 +3096,7 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
             if let ExecTag::List(_, entries) = value {
                 match entity {
                     ExecuteEntity::Player(player) => {
-                        let mut inv = player.inv.lock().unwrap();
+                        let mut inv = player.inv.lock().unwrap_or_else(|e| e.into_inner());
                         for (slot, entry) in [8, 7, 6, 5].into_iter().zip(entries.iter()) {
                             match data_item_stack(entry) {
                                 Some(stack) => {
@@ -3116,8 +3116,8 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
             if let ExecTag::List(_, entries) = value {
                 match entity {
                     ExecuteEntity::Player(player) => {
-                        let held = *player.held.lock().unwrap();
-                        let mut inv = player.inv.lock().unwrap();
+                        let held = *player.held.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut inv = player.inv.lock().unwrap_or_else(|e| e.into_inner());
                         for (slot, entry) in [36 + held, 45].into_iter().zip(entries.iter()) {
                             match data_item_stack(entry) {
                                 Some(stack) => {
@@ -3143,7 +3143,7 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
 /// save produces is unaffected; the rest reset to their load defaults.
 fn data_remove_entity_field(entity: &ExecuteEntity, name: &str) {
     let drop_extra = |entity: &ExecuteEntity, name: &str| {
-        if let Some(tag) = data_entity_extras().lock().unwrap().get_mut(&entity.tag_key()) {
+        if let Some(tag) = data_entity_extras().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&entity.tag_key()) {
             if let ExecTag::Compound(fields) = tag {
                 fields.remove(&NbtString::text(name));
             }
@@ -3152,46 +3152,46 @@ fn data_remove_entity_field(entity: &ExecuteEntity, name: &str) {
     match name {
         "id" | "x" | "y" | "z" | "UUID" | "Pos" | "Rotation" | "Motion" | "Item" => {}
         "Health" => match entity {
-            ExecuteEntity::Player(player) => *player.hp.lock().unwrap() = 20.0,
+            ExecuteEntity::Player(player) => *player.hp.lock().unwrap_or_else(|e| e.into_inner()) = 20.0,
             ExecuteEntity::Mob(mob) => {
-                *mob.hp.lock().unwrap() = entity_max_health_1211(mob.etype);
+                *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = entity_max_health_1211(mob.etype);
             }
             ExecuteEntity::Other { .. } => {}
         },
         "Air" => match entity {
-            ExecuteEntity::Player(player) => *player.air.lock().unwrap() = 300,
-            ExecuteEntity::Mob(mob) => *mob.air.lock().unwrap() = 300,
+            ExecuteEntity::Player(player) => *player.air.lock().unwrap_or_else(|e| e.into_inner()) = 300,
+            ExecuteEntity::Mob(mob) => *mob.air.lock().unwrap_or_else(|e| e.into_inner()) = 300,
             ExecuteEntity::Other { .. } => {}
         },
         "Fire" => match entity {
-            ExecuteEntity::Mob(mob) => *mob.fire_ticks.lock().unwrap() = -20,
+            ExecuteEntity::Mob(mob) => *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = -20,
             _ => drop_extra(entity, name),
         },
         "Invulnerable" => {
             if let ExecuteEntity::Player(player) = entity {
-                *player.invulnerable.lock().unwrap() = 0;
+                *player.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = 0;
             }
             drop_extra(entity, name);
         }
         "Tags" => {
-            tags().lock().unwrap().remove(&entity.tag_key());
+            tags().lock().unwrap_or_else(|e| e.into_inner()).remove(&entity.tag_key());
         }
         "Inventory" => {
             if let ExecuteEntity::Player(player) = entity {
-                player.inv.lock().unwrap().clear();
+                player.inv.lock().unwrap_or_else(|e| e.into_inner()).clear();
             }
             drop_extra(entity, name);
         }
         "SelectedItem" => {
             if let ExecuteEntity::Player(player) = entity {
-                let slot = 36 + *player.held.lock().unwrap();
-                player.inv.lock().unwrap().remove(&slot);
+                let slot = 36 + *player.held.lock().unwrap_or_else(|e| e.into_inner());
+                player.inv.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
             }
             drop_extra(entity, name);
         }
         "ArmorItems" => {
             if let ExecuteEntity::Player(player) = entity {
-                let mut inv = player.inv.lock().unwrap();
+                let mut inv = player.inv.lock().unwrap_or_else(|e| e.into_inner());
                 for slot in [8, 7, 6, 5] {
                     inv.remove(&slot);
                 }
@@ -3200,8 +3200,8 @@ fn data_remove_entity_field(entity: &ExecuteEntity, name: &str) {
         }
         "HandItems" => {
             if let ExecuteEntity::Player(player) = entity {
-                let held = *player.held.lock().unwrap();
-                let mut inv = player.inv.lock().unwrap();
+                let held = *player.held.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inv = player.inv.lock().unwrap_or_else(|e| e.into_inner());
                 for slot in [36 + held, 45] {
                     inv.remove(&slot);
                 }
@@ -3215,7 +3215,7 @@ fn data_remove_entity_field(entity: &ExecuteEntity, name: &str) {
 fn data_move_other_entity(id: i32, kind: &str, [x, y, z]: [f64; 3]) {
     match kind {
         "minecraft:item" => {
-            if let Some(drop) = drops().lock().unwrap().iter_mut().find(|d| d.eid == id) {
+            if let Some(drop) = drops().lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|d| d.eid == id) {
                 (drop.x, drop.y, drop.z) = (x, y, z);
             }
         }
@@ -3474,7 +3474,7 @@ fn data_sync_block_items(dim: DimId, (x, y, z): BlockPos, root: &ExecTag) {
         Some(items) => {
             if let Ok(mut slots) = items_nbt_to_stacks(items) {
                 if furnace {
-                    if let Some(f) = furnaces().lock().unwrap().get_mut(&key) {
+                    if let Some(f) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&key) {
                         f.input = slots.remove(&0).unwrap_or_default();
                         f.fuel = slots.remove(&1).unwrap_or_default();
                         f.output = slots.remove(&2).unwrap_or_default();
@@ -3488,11 +3488,11 @@ fn data_sync_block_items(dim: DimId, (x, y, z): BlockPos, root: &ExecTag) {
             }
         }
         None => {
-            chests().lock().unwrap().remove(&ContainerKey::Block(key));
+            chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::Block(key));
             // A removed `Items` empties a live furnace only when it held
             // anything; `furnace_slots` reports the non-empty slots.
             if furnace && !furnace_slots((x, y, z)).is_empty() {
-                if let Some(f) = furnaces().lock().unwrap().get_mut(&key) {
+                if let Some(f) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&key) {
                     f.input = (0, 0, Vec::new());
                     f.fuel = (0, 0, Vec::new());
                     f.output = (0, 0, Vec::new());
@@ -3730,7 +3730,7 @@ fn advancement_query_scope(tracker: &AdvancementTracker, scope: &[&str]) -> Resu
         } else {
             format!("minecraft:{id}")
         };
-        if advancements().lock().unwrap().contains_key(&id) {
+        if advancements().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id) {
             Ok(id)
         } else {
             Err(format!("Unknown advancement: {id}"))
@@ -3743,7 +3743,7 @@ fn advancement_query_scope(tracker: &AdvancementTracker, scope: &[&str]) -> Resu
                 .iter()
                 .map(|definition| definition.id.to_owned())
                 .collect();
-            for id in advancements().lock().unwrap().keys() {
+            for id in advancements().lock().unwrap_or_else(|e| e.into_inner()).keys() {
                 if !ids.iter().any(|known| known == id) {
                     ids.push(id.clone());
                 }
@@ -4039,7 +4039,7 @@ mod teams_and_commands_tests {
         crate::test_support::require_vanilla_data();
         let _guard = world_guard();
         // Overlay restore on any path: a panic must not leak the seeded blocks.
-        let saved_world = std::mem::take(&mut *world().lock().unwrap());
+        let saved_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
         struct RestoreWorld(HashMap<DimChunkKey, HashMap<u32, u32>>);
         impl std::ops::Drop for RestoreWorld {
             fn drop(&mut self) {
@@ -4213,7 +4213,7 @@ mod p3_parity_tests {
         let (mut client, receiver) = crate::effect_tests::client_pair();
         client.eid = eid;
         client.name = name.into();
-        *client.pos.lock().unwrap() = (x, y, z, 0.0, 0.0, true);
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0, 0.0, true);
         receiver
             .set_read_timeout(Some(std::time::Duration::from_millis(300)))
             .unwrap();
@@ -4268,7 +4268,7 @@ mod p3_parity_tests {
     fn p3_parity_ride_mount_dismount_self_reject_and_level_two() {
         let _world = world_guard();
         let (player, _recv) = p3_packet_client(9101, "p3rider", 0.5, 16.0, 0.5);
-        clients().lock().unwrap().push(player.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
         assert!(insert_live_mob(
             name_to_etype("horse").unwrap(),
             DimId::Overworld,
@@ -4276,7 +4276,7 @@ mod p3_parity_tests {
             20.0,
             None,
         ));
-        let mob_eid = mobs().lock().unwrap().last().unwrap().eid;
+        let mob_eid = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
         p3_tag_entity(mob_eid, "p3ride_vehicle");
 
         // Level-2 enforcement through the real permission table + the wire
@@ -4296,7 +4296,7 @@ mod p3_parity_tests {
         );
         assert_eq!(vehicle_of(player.eid), Some(mob_eid));
         {
-            let live = mounts().lock().unwrap();
+            let live = mounts().lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(live.registry.passengers_of(mob_eid), &[player.eid]);
         }
         // self-mount is rejected by the registry (vanilla EntityLoopException)
@@ -4316,7 +4316,7 @@ mod p3_parity_tests {
             20.0,
             None,
         ));
-        let a = mobs().lock().unwrap().last().unwrap().eid;
+        let a = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
         p3_tag_entity(a, "p3ride_a");
         assert!(insert_live_mob(
             name_to_etype("zombie").unwrap(),
@@ -4325,7 +4325,7 @@ mod p3_parity_tests {
             20.0,
             None,
         ));
-        let b = mobs().lock().unwrap().last().unwrap().eid;
+        let b = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
         p3_tag_entity(b, "p3ride_b");
         assert_eq!(
             p3_run(&ctx, "/ride @e[tag=p3ride_a,limit=1] mount @e[tag=p3ride_b,limit=1]"),
@@ -4338,13 +4338,13 @@ mod p3_parity_tests {
         p3_run(&ctx, "/ride @e[tag=p3ride_a,limit=1] dismount");
 
         // teardown
-        mounts().lock().unwrap().registry.dismount(player.eid);
-        mounts().lock().unwrap().registry.dismount(a);
-        clients().lock().unwrap().retain(|c| c.eid != player.eid);
-        mobs().lock().unwrap().retain(|m| m.eid != mob_eid && m.eid != a && m.eid != b);
-        tags().lock().unwrap().remove(&format!("e:{mob_eid}"));
-        tags().lock().unwrap().remove(&format!("e:{a}"));
-        tags().lock().unwrap().remove(&format!("e:{b}"));
+        mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.dismount(player.eid);
+        mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.dismount(a);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != player.eid);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != mob_eid && m.eid != a && m.eid != b);
+        tags().lock().unwrap_or_else(|e| e.into_inner()).remove(&format!("e:{mob_eid}"));
+        tags().lock().unwrap_or_else(|e| e.into_inner()).remove(&format!("e:{a}"));
+        tags().lock().unwrap_or_else(|e| e.into_inner()).remove(&format!("e:{b}"));
     }
 
     #[test]
@@ -4352,7 +4352,7 @@ mod p3_parity_tests {
         let _world = world_guard();
         let (viewer, mut recv) = p3_packet_client(9201, "p3watcher", 0.5, 16.0, 0.5);
         let (target, _rt) = p3_packet_client(9202, "p3prey", 1.5, 16.0, 0.5);
-        clients().lock().unwrap().extend([viewer.clone(), target.clone()]);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).extend([viewer.clone(), target.clone()]);
         let ctx = p3_ctx(None);
 
         // level 2 gate + spectator-only check
@@ -4365,7 +4365,7 @@ mod p3_parity_tests {
 
         // Spectator: target set sends the verified protocol-767 set_camera id.
         assert_eq!(SET_CAMERA_PACKET_767, 0x52);
-        *viewer.gm.lock().unwrap() = 3;
+        *viewer.gm.lock().unwrap_or_else(|e| e.into_inner()) = 3;
         assert_eq!(
             p3_run(&ctx, "/spectate p3prey p3watcher"),
             "Now spectating minecraft:player"
@@ -4375,7 +4375,7 @@ mod p3_parity_tests {
         let mut body = Vec::new();
         write_varint(&mut body, i64::from(target.eid));
         assert_eq!(payload, body, "camera payload is the target's VarInt eid");
-        assert_eq!(spectator_cameras().lock().unwrap().get(&viewer.eid), Some(&target.eid));
+        assert_eq!(spectator_cameras().lock().unwrap_or_else(|e| e.into_inner()).get(&viewer.eid), Some(&target.eid));
 
         // Bare `/spectate` on the viewer resets the camera to their own eid.
         assert_eq!(
@@ -4387,7 +4387,7 @@ mod p3_parity_tests {
         let mut body = Vec::new();
         write_varint(&mut body, i64::from(viewer.eid));
         assert_eq!(payload, body);
-        assert_eq!(spectator_cameras().lock().unwrap().get(&viewer.eid), Some(&viewer.eid));
+        assert_eq!(spectator_cameras().lock().unwrap_or_else(|e| e.into_inner()).get(&viewer.eid), Some(&viewer.eid));
 
         // non-player `<player>` arg and console default viewer are refused
         assert_eq!(
@@ -4396,9 +4396,9 @@ mod p3_parity_tests {
         );
         assert_eq!(p3_run(&ctx, "/spectate"), "Only players may use this command");
 
-        *viewer.gm.lock().unwrap() = 0;
-        spectator_cameras().lock().unwrap().remove(&viewer.eid);
-        clients().lock().unwrap().retain(|c| c.eid != viewer.eid && c.eid != target.eid);
+        *viewer.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        spectator_cameras().lock().unwrap_or_else(|e| e.into_inner()).remove(&viewer.eid);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != viewer.eid && c.eid != target.eid);
     }
 
     #[test]
@@ -4416,7 +4416,7 @@ mod p3_parity_tests {
             "Changed biome of 8 cells to minecraft:plains"
         );
         {
-            let store = biome_overrides().lock().unwrap();
+            let store = biome_overrides().lock().unwrap_or_else(|e| e.into_inner());
             let dim_map = &store[&dim];
             for qy in 25..=25 {
                 for qz in 500..=501 {
@@ -4444,7 +4444,7 @@ mod p3_parity_tests {
 
         // `#tag` filter through the loaded registry (injected tag fixture).
         {
-            let mut registry = datapack_registry().lock().unwrap();
+            let mut registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
             registry
                 .tags
                 .entry("biome".to_owned())
@@ -4489,7 +4489,7 @@ mod p3_parity_tests {
             "Changed biome of 1 cells to minecraft:savanna"
         );
 
-        biome_overrides().lock().unwrap().remove(&dim);
+        biome_overrides().lock().unwrap_or_else(|e| e.into_inner()).remove(&dim);
     }
 
     #[test]
@@ -4502,13 +4502,13 @@ mod p3_parity_tests {
         assert!(command_allowed_at_level("place", 2));
 
         // feature: real configured_feature from datapacks/vanilla dispatches.
-        let before = place_dispatches().lock().unwrap().len();
+        let before = place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(
             p3_run(&ctx, "/place feature minecraft:patch_taiga_grass 3000 90 3000"),
             "Placed feature 'minecraft:patch_taiga_grass' at [3000, 90, 3000]"
         );
         {
-            let log = place_dispatches().lock().unwrap();
+            let log = place_dispatches().lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(log.len(), before + 1);
             let dispatch = log.last().unwrap();
             assert_eq!(dispatch.kind, PlaceKind::Feature);
@@ -4530,7 +4530,7 @@ mod p3_parity_tests {
             "unexpected: {reply}"
         );
         {
-            let log = place_dispatches().lock().unwrap();
+            let log = place_dispatches().lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(log.last().unwrap().kind, PlaceKind::Template);
         }
         // restore the area to air (fixture was placed over untouched terrain)
@@ -4555,12 +4555,12 @@ mod p3_parity_tests {
             "Block position is outside the world"
         );
         // default pos = executor feet (0.5,16,0.5 -> 0,16,0)
-        let before = place_dispatches().lock().unwrap().len();
+        let before = place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(
             p3_run(&ctx, "/place feature minecraft:patch_taiga_grass"),
             "Placed feature 'minecraft:patch_taiga_grass' at [0, 16, 0]"
         );
-        assert_eq!(place_dispatches().lock().unwrap().len(), before + 1);
+        assert_eq!(place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).len(), before + 1);
     }
 }
 
@@ -4632,7 +4632,7 @@ mod p5d_parity_tests {
     fn p5d_parity_schedule_function_times_and_clear() {
         let _world = world_guard();
         let ctx = p5d_ctx(None);
-        let saved = std::mem::take(&mut *sched_fns().lock().unwrap());
+        let saved = std::mem::take(&mut *sched_fns().lock().unwrap_or_else(|e| e.into_inner()));
         let now = TICK.load(Ordering::Relaxed);
 
         assert_eq!(
@@ -4649,7 +4649,7 @@ mod p5d_parity_tests {
             "Scheduled function 'p5d:alpha' in 5 ticks"
         );
         {
-            let scheduled = sched_fns().lock().unwrap();
+            let scheduled = sched_fns().lock().unwrap_or_else(|e| e.into_inner());
             let alpha: Vec<u64> = scheduled
                 .iter()
                 .filter(|(name, _)| name == "p5d:alpha")
@@ -4668,7 +4668,7 @@ mod p5d_parity_tests {
             "Scheduled function 'p5d:alpha' in 3 ticks"
         );
         {
-            let scheduled = sched_fns().lock().unwrap();
+            let scheduled = sched_fns().lock().unwrap_or_else(|e| e.into_inner());
             let alpha: Vec<u64> = scheduled
                 .iter()
                 .filter(|(name, _)| name == "p5d:alpha")
@@ -4680,7 +4680,7 @@ mod p5d_parity_tests {
         assert_eq!(p5d_run(&ctx, "/schedule clear p5d:alpha"), "Removed 1 scheduled function(s)");
         assert_eq!(p5d_run(&ctx, "/schedule clear p5d:alpha"), "Removed 0 scheduled function(s)");
         assert_eq!(p5d_run(&ctx, "/schedule clear"), "Removed 1 scheduled function(s)");
-        assert!(sched_fns().lock().unwrap().is_empty());
+        assert!(sched_fns().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
         // malformed time and unknown mode are rejected like vanilla parse errors.
         assert_eq!(
             p5d_run(&ctx, "/schedule function p5d:x nope"),
@@ -4690,7 +4690,7 @@ mod p5d_parity_tests {
             p5d_run(&ctx, "/schedule function p5d:x 1t sideways"),
             "usage: /schedule function <fn> <time>[t|s|d] [append|replace]"
         );
-        *sched_fns().lock().unwrap() = saved;
+        *sched_fns().lock().unwrap_or_else(|e| e.into_inner()) = saved;
     }
 
     // #163 — /help lists the caller-visible commands, /help <command> prints
@@ -4757,12 +4757,12 @@ mod p5d_parity_tests {
     #[test]
     fn p5d_parity_forceload_query_chunk_and_remove_all() {
         let _world = world_guard();
-        let previous = std::mem::replace(&mut *forceloaded().lock().unwrap(), HashSet::new());
+        let previous = std::mem::replace(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()), HashSet::new());
         let ctx = p5d_ctx(None);
 
         let added = p5d_run(&ctx, "/forceload add 32 48");
         assert!(added.contains("1 chunks"), "{added}");
-        assert!(forceloaded().lock().unwrap().contains(&(2, 3)));
+        assert!(forceloaded().lock().unwrap_or_else(|e| e.into_inner()).contains(&(2, 3)));
         // every block inside the chunk reports forced; the neighbour does not.
         assert_eq!(p5d_run(&ctx, "/forceload query 32 48"), "Chunk 2, 3 is force loaded");
         assert_eq!(p5d_run(&ctx, "/forceload query 47 63"), "Chunk 2, 3 is force loaded");
@@ -4770,10 +4770,10 @@ mod p5d_parity_tests {
         assert_eq!(p5d_run(&ctx, "/forceload query -1 -1"), "Chunk -1, -1 is not force loaded");
         let removed = p5d_run(&ctx, "/forceload remove all");
         assert_eq!(removed, "Removed 1 forceloaded chunk(s)");
-        assert!(forceloaded().lock().unwrap().is_empty());
+        assert!(forceloaded().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
         assert_eq!(p5d_run(&ctx, "/forceload query"), "0 forceloaded chunk(s)");
 
-        *forceloaded().lock().unwrap() = previous;
+        *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = previous;
     }
 
     // #172 — /setworldspawn and /spawnpoint take the optional yaw and persist
@@ -4782,7 +4782,7 @@ mod p5d_parity_tests {
     fn p5d_parity_spawn_commands_store_angle() {
         let _world = world_guard();
         let ctx = p5d_ctx(None);
-        let previous = *WORLD_SPAWN.lock().unwrap();
+        let previous = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
 
         assert_eq!(spawn_yaw(Some("270.5"), None), Some(-89.5));
         assert_eq!(spawn_yaw(None, None), Some(0.0));
@@ -4790,34 +4790,34 @@ mod p5d_parity_tests {
 
         let reply = p5d_run(&ctx, "/setworldspawn 10 70 20 135");
         assert_eq!(reply, "Set the world spawn point to 10, 70, 20 facing 135");
-        assert_eq!(*WORLD_SPAWN.lock().unwrap(), (10.0, 70.0, 20.0, 135.0));
+        assert_eq!(*WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()), (10.0, 70.0, 20.0, 135.0));
         // no angle defaults to 0.0
         p5d_run(&ctx, "/setworldspawn 1 2 3");
-        assert_eq!(*WORLD_SPAWN.lock().unwrap(), (1.0, 2.0, 3.0, 0.0));
+        assert_eq!(*WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()), (1.0, 2.0, 3.0, 0.0));
         assert_eq!(p5d_run(&ctx, "/setworldspawn 1 2 3 nope"), "Invalid spawn angle");
 
         let (player, _recv) = p5d_client(60002, 0x52, "p5d_spawn");
-        clients().lock().unwrap().push(player.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
         let reply = p5d_run(&ctx, "/spawnpoint p5d_spawn 5 65 15 -90");
         assert_eq!(reply, "Set spawn point to 5, 65, 15 facing -90 for p5d_spawn");
-        assert_eq!(*player.spawn_pt.lock().unwrap(), Some((5.0, 65.0, 15.0, -90.0)));
+        assert_eq!(*player.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()), Some((5.0, 65.0, 15.0, -90.0)));
         // executor spawnpoint without pos uses the live position and yaw 0.
-        ops_registry().lock().unwrap().set("p5d_spawn", 4, false);
-        *player.pos.lock().unwrap() = (7.5, 64.0, -3.5, 0.0, 0.0, true);
+        ops_registry().lock().unwrap_or_else(|e| e.into_inner()).set("p5d_spawn", 4, false);
+        *player.pos.lock().unwrap_or_else(|e| e.into_inner()) = (7.5, 64.0, -3.5, 0.0, 0.0, true);
         let player_ctx = p5d_ctx(Some(player.clone()));
         assert_eq!(
             p5d_run(&player_ctx, "/spawnpoint"),
             "Set spawn point to 7.5, 64, -3.5 facing 0 for p5d_spawn"
         );
-        assert_eq!(*player.spawn_pt.lock().unwrap(), Some((7.5, 64.0, -3.5, 0.0)));
+        assert_eq!(*player.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()), Some((7.5, 64.0, -3.5, 0.0)));
         ops_registry()
             .lock()
             .unwrap()
             .entries
             .retain(|e| e.name != "p5d_spawn");
 
-        clients().lock().unwrap().retain(|c| c.eid != 60002);
-        *WORLD_SPAWN.lock().unwrap() = previous;
+        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != 60002);
+        *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = previous;
     }
 
     // #177 — /bossbar set players assigns the viewer list (empty clears it)
@@ -4825,11 +4825,11 @@ mod p5d_parity_tests {
     #[test]
     fn p5d_parity_bossbar_players_and_exact_get_results() {
         let _world = world_guard();
-        let saved = std::mem::take(&mut *bossbars().lock().unwrap());
+        let saved = std::mem::take(&mut *bossbars().lock().unwrap_or_else(|e| e.into_inner()));
         let (a, _ra) = p5d_client(60011, 0x61, "p5d_a");
         let (b, _rb) = p5d_client(60012, 0x62, "p5d_b");
-        clients().lock().unwrap().push(a.clone());
-        clients().lock().unwrap().push(b.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(a.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(b.clone());
 
         assert_eq!(
             run_bossbar_command(&["add", "bar", "Title"], None),
@@ -4887,8 +4887,8 @@ mod p5d_parity_tests {
             "Unknown bossbar 'minecraft:none'"
         );
 
-        clients().lock().unwrap().retain(|c| c.eid != 60011 && c.eid != 60012);
-        *bossbars().lock().unwrap() = saved;
+        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != 60011 && c.eid != 60012);
+        *bossbars().lock().unwrap_or_else(|e| e.into_inner()) = saved;
     }
 
     // #224 — objectives modify displayname/rendertype, players list forms, and
@@ -5029,13 +5029,13 @@ mod p5d_parity_tests {
         let (a, _ra) = p5d_client(60021, 0x6a, "p5d_alpha");
         let (b, _rb) = p5d_client(60022, 0x6b, "p5d_beta");
         let (c, _rc) = p5d_client(60023, 0x6c, "p5d_solo");
-        clients().lock().unwrap().push(a.clone());
-        clients().lock().unwrap().push(b.clone());
-        clients().lock().unwrap().push(c.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(a.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(b.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(c.clone());
 
         // team members share one pile; unteamed players keep their own.
         {
-            let mut registry = teams().lock().unwrap();
+            let mut registry = teams().lock().unwrap_or_else(|e| e.into_inner());
             registry.add("p5d_team", None).unwrap();
             registry.join("p5d_team", "p5d_alpha").unwrap();
             registry.join("p5d_team", "p5d_beta").unwrap();
@@ -5052,7 +5052,7 @@ mod p5d_parity_tests {
             "{reply}"
         );
         {
-            let (pa, pb) = (*a.pos.lock().unwrap(), *b.pos.lock().unwrap());
+            let (pa, pb) = (*a.pos.lock().unwrap_or_else(|e| e.into_inner()), *b.pos.lock().unwrap_or_else(|e| e.into_inner()));
             assert_eq!((pa.0, pa.1, pa.2), (pb.0, pb.1, pb.2), "teammates share a pile");
             assert_eq!(pa.1, 241.0, "feet y sits on the floor");
         }
@@ -5071,10 +5071,10 @@ mod p5d_parity_tests {
             20.0,
             None,
         ));
-        let mob = mobs().lock().unwrap().last().unwrap().clone();
+        let mob = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().clone();
         let mob_key = uuid_text(&mob.uuid);
         {
-            let mut registry = teams().lock().unwrap();
+            let mut registry = teams().lock().unwrap_or_else(|e| e.into_inner());
             registry.join("p5d_team", &mob_key).unwrap();
         }
         assert_eq!(
@@ -5084,14 +5084,14 @@ mod p5d_parity_tests {
 
         // teardown: team, clients, mob and the floor.
         {
-            let mut registry = teams().lock().unwrap();
+            let mut registry = teams().lock().unwrap_or_else(|e| e.into_inner());
             let _ = registry.remove("p5d_team");
         }
         clients()
             .lock()
             .unwrap()
             .retain(|p| !matches!(p.eid, 60021 | 60022 | 60023));
-        mobs().lock().unwrap().retain(|m| m.eid != mob.eid);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != mob.eid);
         for x in -11..=11 {
             for z in -11..=11 {
                 place_block_dim(dim, x, 240, z, 0);
@@ -5112,7 +5112,7 @@ mod p6d_parity_tests {
         let (mut client, receiver) = crate::effect_tests::client_pair();
         client.eid = eid;
         client.name = name.into();
-        *client.pos.lock().unwrap() = (x, y, z, 0.0, 0.0, true);
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0, 0.0, true);
         receiver
             .set_read_timeout(Some(std::time::Duration::from_millis(300)))
             .unwrap();
@@ -5146,7 +5146,7 @@ mod p6d_parity_tests {
     }
 
     fn p6d_deop(name: &str) {
-        ops_registry().lock().unwrap().remove(name);
+        ops_registry().lock().unwrap_or_else(|e| e.into_inner()).remove(name);
     }
 
     fn p6d_frame_varint(r: &mut TcpStream) -> Option<(i64, usize)> {
@@ -5172,7 +5172,7 @@ mod p6d_parity_tests {
     }
 
     fn p6d_seed_profiler() {
-        let mut profiler = live_hotspot_profiler().lock().unwrap();
+        let mut profiler = live_hotspot_profiler().lock().unwrap_or_else(|e| e.into_inner());
         profiler.reset();
         for us in [9_000u32, 11_000, 14_000, 10_000, 12_000] {
             profiler.record_tick_us(us);
@@ -5241,7 +5241,7 @@ mod p6d_parity_tests {
             &mut None,
             0,
         );
-        let report = live_hotspot_profiler().lock().unwrap().summary(5);
+        let report = live_hotspot_profiler().lock().unwrap_or_else(|e| e.into_inner()).summary(5);
         assert_eq!(
             report.ticks_recorded, 5,
             "level-2 .mcfunction `profile reset` must not touch the profiler"
@@ -5297,7 +5297,7 @@ mod p6d_parity_tests {
         // `proto/src/data_v767.rs` pins (Play, Clientbound, "transfer", 0x73).
         assert_eq!(TRANSFER_PACKET_ID, 0x73);
         let (player, mut recv) = p6d_client(97_100, "p6d_xfer", 0.5, 16.0, 0.5);
-        clients().lock().unwrap().push(player.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
         let ctx = p6d_ctx(None);
         assert_eq!(
             p6d_run(&ctx, "/transfer example.org 25565 p6d_xfer"),
@@ -5312,8 +5312,8 @@ mod p6d_parity_tests {
         assert_eq!(payload, expected, "transfer wire bytes");
         // Default port 25565 when omitted, executor = default target.
         let (admin, mut recv2) = p6d_client(97_101, "p6d_xfer4", 0.5, 16.0, 0.5);
-        ops_registry().lock().unwrap().set("p6d_xfer4", 4, false);
-        clients().lock().unwrap().push(admin.clone());
+        ops_registry().lock().unwrap_or_else(|e| e.into_inner()).set("p6d_xfer4", 4, false);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(admin.clone());
         let admin_ctx = p6d_ctx(Some(admin));
         assert_eq!(
             p6d_run(&admin_ctx, "/transfer localhost"),
@@ -5329,7 +5329,7 @@ mod p6d_parity_tests {
             .lock()
             .unwrap()
             .retain(|c| !matches!(c.eid, 97_100 | 97_101));
-        ops_registry().lock().unwrap().remove("p6d_xfer4");
+        ops_registry().lock().unwrap_or_else(|e| e.into_inner()).remove("p6d_xfer4");
     }
 
     #[test]
@@ -5340,7 +5340,7 @@ mod p6d_parity_tests {
             .lock()
             .unwrap()
             .set("p6d_xfer3", 3, false);
-        clients().lock().unwrap().push(player.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
         let ctx3 = p6d_ctx(Some(player.clone()));
         // Level 3 is exactly enough — vanilla hasPermission(3).
         assert!(p6d_run(&ctx3, "/transfer ok.example 7777")
@@ -5388,8 +5388,8 @@ mod p6d_parity_tests {
             .lock()
             .unwrap()
             .retain(|c| !matches!(c.eid, 97_110 | 97_111));
-        ops_registry().lock().unwrap().remove("p6d_xfer3");
-        ops_registry().lock().unwrap().remove("p6d_xfer2");
+        ops_registry().lock().unwrap_or_else(|e| e.into_inner()).remove("p6d_xfer3");
+        ops_registry().lock().unwrap_or_else(|e| e.into_inner()).remove("p6d_xfer2");
     }
 
     // /data: storage, entity, block roundtrips through get/merge/modify/remove.
@@ -5469,14 +5469,14 @@ mod p6d_parity_tests {
             p6d_run(&ctx, &format!("/data get storage {store} missing")),
             format!("Found no elements at 'missing'")
         );
-        execute_storage().lock().unwrap().remove(store);
+        execute_storage().lock().unwrap_or_else(|e| e.into_inner()).remove(store);
     }
 
     #[test]
     fn p6d_parity_data_entity_roundtrip() {
         let _world = world_guard();
         let (player, _recv) = p6d_client(97_200, "p6d_data", 1.5, 64.0, -2.5);
-        clients().lock().unwrap().push(player.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
         let ctx = p6d_ctx(None);
         // Live reads: Pos/Health/Motion/Air/Tags out of the real player state.
         let pos = p6d_run(&ctx, "/data get entity p6d_data Pos");
@@ -5489,7 +5489,7 @@ mod p6d_parity_tests {
         );
         assert_eq!(
             p6d_run(&ctx, "/data get entity p6d_data Air"),
-            format!("p6d_data has the following entity data: {}s", *player.air.lock().unwrap())
+            format!("p6d_data has the following entity data: {}s", *player.air.lock().unwrap_or_else(|e| e.into_inner()))
         );
         assert_eq!(
             p6d_run(&ctx, "/data get entity p6d_data Motion"),
@@ -5500,7 +5500,7 @@ mod p6d_parity_tests {
             p6d_run(&ctx, "/data merge entity p6d_data {Health:5.0f,Tags:[\"marker\"],NoAI:1b}"),
             "Modified data"
         );
-        assert_eq!(*player.hp.lock().unwrap(), 5.0);
+        assert_eq!(*player.hp.lock().unwrap_or_else(|e| e.into_inner()), 5.0);
         assert!(tags()
             .lock()
             .unwrap()
@@ -5524,7 +5524,7 @@ mod p6d_parity_tests {
             p6d_run(&ctx, "/data remove entity p6d_data Health"),
             "Removed data"
         );
-        assert_eq!(*player.hp.lock().unwrap(), 20.0);
+        assert_eq!(*player.hp.lock().unwrap_or_else(|e| e.into_inner()), 20.0);
         // SelectedItem/Inventory write through to the live inventory map.
         let stone = name_to_item("stone").unwrap();
         assert_eq!(
@@ -5534,9 +5534,9 @@ mod p6d_parity_tests {
             ),
             "Modified data"
         );
-        let held_slot = 36 + *player.held.lock().unwrap();
+        let held_slot = 36 + *player.held.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
-            player.inv.lock().unwrap().get(&held_slot).map(|s| (s.0, s.1)),
+            player.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&held_slot).map(|s| (s.0, s.1)),
             Some((stone, 2))
         );
         assert_eq!(
@@ -5548,11 +5548,11 @@ mod p6d_parity_tests {
             p6d_run(&ctx, "/data merge entity p6d_data {Rotation:[90.0f,45.0f]}"),
             "Modified data"
         );
-        let pos = *player.pos.lock().unwrap();
+        let pos = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((pos.3, pos.4), (90.0, 45.0));
-        clients().lock().unwrap().retain(|c| c.eid != 97_200);
-        tags().lock().unwrap().remove("p:p6d_data");
-        data_entity_extras().lock().unwrap().remove("p:p6d_data");
+        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != 97_200);
+        tags().lock().unwrap_or_else(|e| e.into_inner()).remove("p:p6d_data");
+        data_entity_extras().lock().unwrap_or_else(|e| e.into_inner()).remove("p:p6d_data");
     }
 
     #[test]
@@ -5579,7 +5579,7 @@ mod p6d_parity_tests {
             "Modified data"
         );
         {
-            let live = chests().lock().unwrap();
+            let live = chests().lock().unwrap_or_else(|e| e.into_inner());
             let slots = live.get(&key).unwrap();
             assert_eq!(slots.get(&2).map(|s| s.1), Some(1));
             assert_eq!(slots.len(), 1);
@@ -5594,7 +5594,7 @@ mod p6d_parity_tests {
             "Storage has the following contents: 7"
         );
         assert_eq!(
-            chests().lock().unwrap().get(&key).and_then(|s| s.get(&2)).map(|s| s.1),
+            chests().lock().unwrap_or_else(|e| e.into_inner()).get(&key).and_then(|s| s.get(&2)).map(|s| s.1),
             Some(7)
         );
         // remove Items empties the live container.
@@ -5602,14 +5602,14 @@ mod p6d_parity_tests {
             p6d_run(&ctx, "/data remove block 40 90 40 Items"),
             "Removed data"
         );
-        assert!(chests().lock().unwrap().get(&key).is_none()
-            || chests().lock().unwrap().get(&key).is_some_and(|s| s.is_empty()));
+        assert!(chests().lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_none()
+            || chests().lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some_and(|s| s.is_empty()));
         // A block position with no block entity fails closed.
         assert_eq!(
             p6d_run(&ctx, "/data get block 60 90 60"),
             "The block at 60, 90, 60 is not a block entity"
         );
-        chests().lock().unwrap().remove(&key);
+        chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
         data_block_overrides()
             .lock()
             .unwrap()
@@ -5625,7 +5625,7 @@ mod p6d_parity_tests {
     fn p6d_parity_advancement_query_exact_counts() {
         let _world = world_guard();
         let (player, _recv) = p6d_client(97_300, "p6d_adv", 0.5, 16.0, 0.5);
-        clients().lock().unwrap().push(player.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
         let ctx = p6d_ctx(None);
         // 19 live definitions in CORE_ADVANCEMENTS; nothing granted yet.
         assert_eq!(
@@ -5668,10 +5668,10 @@ mod p6d_parity_tests {
             only.contains("obtain_armor"),
             "{only}"
         );
-        clients().lock().unwrap().retain(|c| c.eid != 97_300);
-        let mut tracker = player_advancements().lock().unwrap();
+        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != 97_300);
+        let mut tracker = player_advancements().lock().unwrap_or_else(|e| e.into_inner());
         tracker.progress.remove("p6d_adv");
         tracker.sent_progress.remove("p6d_adv");
-        adv_done().lock().unwrap().remove("p6d_adv");
+        adv_done().lock().unwrap_or_else(|e| e.into_inner()).remove("p6d_adv");
     }
 }
