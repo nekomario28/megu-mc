@@ -625,6 +625,7 @@ fn held_slot_resync(me: &Client) {
     }
 }
 
+#[derive(Clone)]
 struct Drop {
     eid: i32,
     x: f64,
@@ -1051,6 +1052,310 @@ fn ender_container_key(uuid: &[u8; 16]) -> ContainerKey {
     ContainerKey::Block((DimId::Overworld, ek.0, ek.1, ek.2))
 }
 
+// ---------- idle-hopper sleep probe ----------
+//
+// `hopper_tick` runs `hopper_push | hopper_pull | hopper_suck` for every due
+// hopper on every visit. For a settled array — hoppers whose pull source,
+// push target, own slots and suction cell have all come back empty-handed —
+// that work is provably wasted: the scan can only ever report "nothing".
+//
+// The probe fingerprints exactly the state those three scans can observe, in
+// bounded O(1) work per visit (containers cap at 54 slots, the suction window
+// at the drops resting in 18 spatial cells). When the fingerprint matches the
+// one recorded after the last empty-handed scan, the visit is skipped and the
+// queue/backoff contract receives the same `did_work = false` a real scan
+// would have produced, so scheduling stays bit-identical.
+//
+// The fingerprint reads live state on every visit instead of relying on
+// mutation hooks: container writes also arrive through packet handlers,
+// commands and the save loader, and one missed hook would strand items a
+// vanilla hopper would have moved. Reading the watched cells directly makes a
+// stale "still idle" verdict impossible — any change, from any file or
+// thread, lands in the fingerprint on the very next visit.
+
+/// One drop's spawn-time identity for suction-window queries. Position, item
+/// and components are immutable after spawn; `cnt` and `age` are deliberately
+/// absent — `cnt` is the one mutable field besides `age`, and the "does
+/// anything fit?" verdict never reads it (room is checked before any count is
+/// spent), so a stale snapshot can never flip a skip decision.
+#[derive(Clone)]
+struct DropCellSnap {
+    eid: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    item: i64,
+    comps_hash: u64,
+}
+/// Drops bucketed by unit cell, rebuilt only when `drops()` membership may
+/// have moved. `hopper_suck` and the sleep probe turn the vanilla O(N) entity
+/// scan into a lookup over the cells the suction window can touch.
+struct DropCells {
+    /// Membership version, all O(1) reads taken under the `drops()` lock:
+    /// length, the `NEXT_EID` high-water mark, and the two end eids. Every
+    /// production spawn draws a fresh eid, so a remove+add that keeps `len`
+    /// still moves the mark; count/age edits move nothing and cannot change
+    /// window membership.
+    len: usize,
+    mark: i32,
+    first_eid: i32,
+    last_eid: i32,
+    /// Server tick the map was built on. Membership edits are caught by the
+    /// version tuple, but a `/data` teleport rewrites `x/y/z` in place without
+    /// touching any of it — rebuilding once per tick bounds that staleness to
+    /// under one activation, which is the same freshness a live scan has.
+    built_tick: u64,
+    map: HashMap<(i32, i32, i32), Vec<DropCellSnap>>,
+}
+static DROP_CELLS: OnceLock<Mutex<DropCells>> = OnceLock::new();
+fn drop_cells() -> &'static Mutex<DropCells> {
+    DROP_CELLS.get_or_init(|| {
+        Mutex::new(DropCells {
+            len: usize::MAX,
+            mark: 0,
+            first_eid: 0,
+            last_eid: 0,
+            built_tick: u64::MAX,
+            map: HashMap::new(),
+        })
+    })
+}
+/// FNV-1a over the component list: order matters (`Comps` equality is a Vec
+/// compare), so this folds sequentially rather than summing.
+fn comps_fingerprint(comps: &Comps) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for (ty, data) in comps {
+        h = (h ^ (*ty as u64)).wrapping_mul(0x100000001b3);
+        h = (h ^ data.len() as u64).wrapping_mul(0x100000001b3);
+        for &b in data {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+/// Refresh the spatial index when `drops()` membership may have moved. The
+/// version tuple is read and the map rebuilt under the same `drops()` lock,
+/// so the snapshot and its stamp can never disagree.
+fn ensure_drop_cells() {
+    let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
+    let len = dl.len();
+    let mark = NEXT_EID.load(Ordering::Relaxed);
+    let (first_eid, last_eid) = match (dl.first(), dl.last()) {
+        (Some(f), Some(l)) => (f.eid, l.eid),
+        _ => (0, 0),
+    };
+    let tick = TICK_IDX.load(Ordering::Relaxed);
+    {
+        let dc = drop_cells().lock().unwrap_or_else(|e| e.into_inner());
+        if dc.built_tick == tick
+            && dc.len == len
+            && dc.mark == mark
+            && dc.first_eid == first_eid
+            && dc.last_eid == last_eid
+        {
+            return;
+        }
+    }
+    let mut map: HashMap<(i32, i32, i32), Vec<DropCellSnap>> =
+        HashMap::with_capacity(len.saturating_mul(2).saturating_add(8));
+    for d in dl.iter() {
+        let snap = DropCellSnap {
+            eid: d.eid,
+            x: d.x,
+            y: d.y,
+            z: d.z,
+            item: d.item,
+            comps_hash: comps_fingerprint(&d.comps),
+        };
+        map.entry((d.x.floor() as i32, d.y.floor() as i32, d.z.floor() as i32))
+            .or_default()
+            .push(snap);
+    }
+    let mut dc = drop_cells().lock().unwrap_or_else(|e| e.into_inner());
+    dc.len = len;
+    dc.mark = mark;
+    dc.first_eid = first_eid;
+    dc.last_eid = last_eid;
+    dc.built_tick = tick;
+    dc.map = map;
+}
+/// The exact `hopper_suck` window, evaluated on any position triple.
+#[inline]
+fn in_suction_cell(x: f64, y: f64, z: f64, hx: i32, hy: i32, hz: i32) -> bool {
+    (x - (hx as f64 + 0.5)).abs() < 0.7
+        && y > hy as f64 + 0.4
+        && y < hy as f64 + 1.6
+        && (z - (hz as f64 + 0.5)).abs() < 0.7
+}
+/// The cell range the suction window can touch for integer hopper coords:
+/// x/z span `(h ± 0.2, h + 1.2)` → cells `h-1..=h+1`; y spans `(hy+0.4,
+/// hy+1.6)` → cells `hy..=hy+1`. The predicate re-checks every snap exactly,
+/// so the coarse range only bounds the lookup count.
+fn each_suction_cell(hx: i32, hy: i32, hz: i32, mut f: impl FnMut(i32, i32, i32) -> bool) -> bool {
+    for cx in hx - 1..=hx + 1 {
+        for cy in hy..=hy + 1 {
+            for cz in hz - 1..=hz + 1 {
+                if f(cx, cy, cz) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+/// Whether any snap sits in the suction cell — the O(1) idle exit for
+/// `hopper_suck`. A `false` here is only reached after `ensure_drop_cells`
+/// proved the index matches `drops()` membership.
+fn suction_nonempty(hx: i32, hy: i32, hz: i32) -> bool {
+    ensure_drop_cells();
+    let dc = drop_cells().lock().unwrap_or_else(|e| e.into_inner());
+    each_suction_cell(hx, hy, hz, |cx, cy, cz| {
+        dc.map
+            .get(&(cx, cy, cz))
+            .is_some_and(|v| v.iter().any(|s| in_suction_cell(s.x, s.y, s.z, hx, hy, hz)))
+    })
+}
+/// Drops resting in `pos`'s suction cell as spawn-time snapshots, sorted by
+/// eid — the same order `hopper_suck` scans them in.
+fn suction_snaps(hx: i32, hy: i32, hz: i32) -> Vec<DropCellSnap> {
+    ensure_drop_cells();
+    let dc = drop_cells().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    each_suction_cell(hx, hy, hz, |cx, cy, cz| {
+        if let Some(v) = dc.map.get(&(cx, cy, cz)) {
+            out.extend(
+                v.iter()
+                    .filter(|s| in_suction_cell(s.x, s.y, s.z, hx, hy, hz))
+                    .cloned(),
+            );
+        }
+        false
+    });
+    out.sort_by_key(|s| s.eid);
+    out
+}
+/// Sequential 128-bit mix for fingerprint fields whose order is fixed.
+#[inline]
+fn mixv(acc: u128, x: u64) -> u128 {
+    acc.wrapping_mul(0x9E37_79B1_97F4_A7C1)
+        .wrapping_add(x as u128)
+}
+fn mix_pos(acc: u128, pos: Option<(i32, i32, i32)>) -> u128 {
+    match pos {
+        None => mixv(acc, u64::MAX),
+        Some(p) => mixv(mixv(mixv(acc, p.0 as u64), p.1 as u64), p.2 as u64),
+    }
+}
+/// One `(slot, stack)` entry's contribution. Entries are summed into the map
+/// fingerprint, so `HashMap` iteration order cannot leak into the result.
+fn mix_stack_entry(acc: u128, slot: i16, st: &Stack) -> u128 {
+    let h = (slot as i64 as u64 as u128)
+        .wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        .wrapping_add(st.0 as u64 as u128);
+    let h = h
+        .wrapping_mul(0x1656_67B1_9E37_79F9)
+        .wrapping_add(st.1 as u128);
+    let h = h
+        .wrapping_mul(0x85EB_CA77_C2B2_AE63)
+        .wrapping_add(comps_fingerprint(&st.2) as u128);
+    acc.wrapping_add(h)
+}
+/// Fingerprint one container map. Absent and present-but-empty hash
+/// differently — the scan reads them through the same slot probes, and the
+/// distinction costs nothing.
+fn mix_container_map(acc: u128, map: Option<&HashMap<i16, Stack>>) -> u128 {
+    let Some(m) = map else {
+        return mixv(acc, u64::MAX);
+    };
+    let mut h = m.len() as u128;
+    for (slot, st) in m {
+        h = mix_stack_entry(h, *slot, st);
+    }
+    mixv(acc.wrapping_add(h), 0xD6E8_FEB8_6659_FD93)
+}
+/// `chest_partner` for a state the caller already read: identical pairing
+/// rules, minus the redundant `block_at` — the probe fingerprints the resolved
+/// position, which is everything the partner lookup can observe.
+fn probe_partner(st: u32, pos: (i32, i32, i32)) -> Option<(i32, i32, i32)> {
+    chest_pair_of_dim(DimId::Overworld, st, pos).map(|(right, left)| {
+        if pos == right {
+            left
+        } else {
+            right
+        }
+    })
+}
+/// The watched-state fingerprint for one hopper visit: everything
+/// `hopper_push`, `hopper_pull` and `hopper_suck` can observe, and nothing
+/// else. Block states cover container-ness and double-chest pairing; the
+/// resolved partner positions stand in for the neighbour reads `chest_pair`
+/// makes; container maps cover slot contents; pending-loot flags cover the
+/// `unpack_block_loot_if_needed` materialization; the suction snaps cover the
+/// drop window. `content_revision` rides along so a datapack reload can never
+/// hide behind an unchanged world image.
+fn hopper_probe_epoch(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> u128 {
+    let own = (hx, hy, hz);
+    let above = (hx, hy + 1, hz);
+    let ast = block_at(above.0, above.1, above.2);
+    let dst_st = block_at(dst.0, dst.1, dst.2);
+    let ap = probe_partner(ast, above);
+    let dp = probe_partner(dst_st, dst);
+    let mut acc = mixv(content_revision() as u128, 0x5BD1_E995_27D4_EB2F);
+    acc = mixv(acc, ast as u64);
+    acc = mixv(acc, dst_st as u64);
+    acc = mix_pos(acc, ap);
+    acc = mix_pos(acc, dp);
+    {
+        let all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        acc = mix_container_map(acc, all.get(&ContainerKey::ow(own)));
+        acc = mix_container_map(acc, all.get(&ContainerKey::ow(above)));
+        if let Some(p) = ap {
+            acc = mix_container_map(acc, all.get(&ContainerKey::ow(p)));
+        }
+        acc = mix_container_map(acc, all.get(&ContainerKey::ow(dst)));
+        if let Some(p) = dp {
+            acc = mix_container_map(acc, all.get(&ContainerKey::ow(p)));
+        }
+    }
+    {
+        let pend = pending_block_loot().lock().unwrap_or_else(|e| e.into_inner());
+        for pos in [Some(own), Some(above), ap, Some(dst), dp]
+            .into_iter()
+            .flatten()
+        {
+            acc = mixv(acc, u64::from(pend.contains_key(&ow_block(pos))));
+        }
+    }
+    for s in suction_snaps(hx, hy, hz) {
+        acc = mixv(acc, s.eid as u64);
+        acc = mixv(acc, s.item as u64);
+        acc = mixv(acc, s.comps_hash);
+        acc = mixv(acc, s.x.to_bits());
+        acc = mixv(acc, s.y.to_bits());
+        acc = mixv(acc, s.z.to_bits());
+    }
+    acc
+}
+/// Per-hopper sleep state: the fingerprint recorded after the last scan and
+/// whether that scan moved nothing. Only `idle` hoppers may skip, and only on
+/// an unchanged fingerprint; an active hopper always re-scans and never pays
+/// for the probe at all.
+struct HopperSleep {
+    epoch: u128,
+    idle: bool,
+}
+static HOPPER_SLEEP: OnceLock<Mutex<HashMap<(i32, i32, i32), HopperSleep>>> = OnceLock::new();
+fn hopper_sleep() -> &'static Mutex<HashMap<(i32, i32, i32), HopperSleep>> {
+    HOPPER_SLEEP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Visit accounting the `bot_hopper_*` tests read: real scans versus
+/// fingerprint-proven skips.
+static HOPPER_SCAN_RUNS: AtomicU64 = AtomicU64::new(0);
+static HOPPER_SCAN_SKIPS: AtomicU64 = AtomicU64::new(0);
+/// Bound on the sleep map so positions whose hoppers were removed outside the
+/// tick path cannot grow it without limit; a sweep only runs past this size.
+const HOPPER_SLEEP_MAX: usize = 8192;
+
 fn hopper_tick() {
     // Only the hoppers that come due are visited, so a tick costs the hoppers
     // that need work rather than every hopper that exists. Every exit re-queues
@@ -1071,6 +1376,7 @@ fn hopper_tick() {
         let st = block_at(hx, hy, hz);
         if !(9225..=9234).contains(&st) {
             hoppers().lock().unwrap_or_else(|e| e.into_inner()).remove(&(hx, hy, hz));
+            hopper_sleep().lock().unwrap_or_else(|e| e.into_inner()).remove(&(hx, hy, hz));
             continue;
         }
         if st >= 9230 {
@@ -1087,6 +1393,23 @@ fn hopper_tick() {
             _ => (1, 0, 0),
         };
         let dst = (hx + dx, hy + dy, hz + dz);
+        // Idle-sleep probe: only a hopper whose last scan moved nothing can
+        // skip, and only when the watched-state fingerprint is unchanged. The
+        // probe runs only for cached-idle hoppers, so a working hopper pays
+        // nothing extra.
+        let idle_epoch = {
+            let sl = hopper_sleep().lock().unwrap_or_else(|e| e.into_inner());
+            sl.get(&(hx, hy, hz))
+                .and_then(|s| s.idle.then_some(s.epoch))
+        };
+        let epoch = idle_epoch.map(|_| hopper_probe_epoch(hx, hy, hz, dst));
+        if epoch.is_some() && epoch == idle_epoch {
+            HOPPER_SCAN_SKIPS.fetch_add(1, Ordering::Relaxed);
+            sched_result(hx, hy, hz, false);
+            requeue_hopper(hx, hy, hz);
+            continue;
+        }
+        HOPPER_SCAN_RUNS.fetch_add(1, Ordering::Relaxed);
         unpack_block_loot_if_needed(ow_block((hx, hy, hz)));
         // Vanilla 1.21.1 `HopperBlockEntity.tryMoveItems` is
         // `flag = ejectItems(...) | suckInItems(...)` — an *eager* bitwise OR, so
@@ -1099,6 +1422,27 @@ fn hopper_tick() {
             did = true;
         } else if hopper_suck(hx, hy, hz) {
             did = true;
+        }
+        {
+            let mut sl = hopper_sleep().lock().unwrap_or_else(|e| e.into_inner());
+            if sl.len() > HOPPER_SLEEP_MAX {
+                let reg = hoppers().lock().unwrap_or_else(|e| e.into_inner());
+                sl.retain(|k, _| reg.contains(k));
+            }
+            sl.insert(
+                (hx, hy, hz),
+                HopperSleep {
+                    // An idle hopper stores the fingerprint it just proved
+                    // empty-handed against; an active one stores none, so a
+                    // working hopper never pays for a probe it cannot use.
+                    epoch: if did {
+                        0
+                    } else {
+                        epoch.unwrap_or_else(|| hopper_probe_epoch(hx, hy, hz, dst))
+                    },
+                    idle: !did,
+                },
+            );
         }
         sched_result(hx, hy, hz, did);
         requeue_hopper(hx, hy, hz);
@@ -1231,6 +1575,13 @@ fn hopper_pull(hx: i32, hy: i32, hz: i32) -> bool {
 /// remainder on the entity). One entity per activation, like the engine's
 /// `attempt_suck`.
 fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
+    // O(1) idle exit: the spatial index proves no drop rests in the suction
+    // cell, so the vanilla scan below — a full `drops()` walk — cannot find a
+    // candidate. When the index says otherwise the original scan runs
+    // verbatim, so a stale-extra entry costs one scan and never a wrong take.
+    if !suction_nonempty(hx, hy, hz) {
+        return false;
+    }
     let mut cell: Vec<(i32, i64, u8, Comps)> = {
         let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
         dl.iter()
@@ -13502,5 +13853,402 @@ mod qol_death_restore_tests {
         // cover, not an empty inventory walk-through.
         assert!(!inv.is_empty());
         assert!(ground.iter().any(|st| st.1 > 0) || inv.len() >= 36);
+    }
+}
+
+#[cfg(test)]
+mod bot_hopper_tests {
+    use super::*;
+
+    const BHY: i32 = 140;
+
+    /// Save/restore for every shared fixture the live hopper and drop paths
+    /// read — including the sleep cache and the drop-cell index this lane adds.
+    struct SavedWorld {
+        hoppers: HashSet<(i32, i32, i32)>,
+        chests: HashMap<ContainerKey, HashMap<i16, Stack>>,
+        drops: Vec<Drop>,
+        forced: HashSet<(i32, i32)>,
+        backoff: HashMap<DimBlockPos, (u64, u32)>,
+        sleep: HashMap<(i32, i32, i32), HopperSleep>,
+        cells: DropCells,
+        tick: u64,
+        index: u64,
+        hot: HashSet<(i32, i32)>,
+        warm: HashSet<(i32, i32)>,
+        runs: u64,
+        skips: u64,
+        placed: Vec<(i32, i32, i32)>,
+    }
+
+    fn save_world() -> SavedWorld {
+        SavedWorld {
+            hoppers: std::mem::take(&mut *hoppers().lock().unwrap_or_else(|e| e.into_inner())),
+            chests: std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner())),
+            drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+            forced: std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner())),
+            backoff: std::mem::take(&mut *backoff().lock().unwrap_or_else(|e| e.into_inner())),
+            sleep: std::mem::take(&mut *hopper_sleep().lock().unwrap_or_else(|e| e.into_inner())),
+            cells: std::mem::replace(
+                &mut *drop_cells().lock().unwrap_or_else(|e| e.into_inner()),
+                DropCells {
+                    len: usize::MAX,
+                    mark: 0,
+                    first_eid: 0,
+                    last_eid: 0,
+                    built_tick: u64::MAX,
+                    map: HashMap::new(),
+                },
+            ),
+            tick: TICK.swap(1, Ordering::Relaxed),
+            index: TICK_IDX.swap(0, Ordering::Relaxed),
+            hot: test_region().0,
+            warm: test_region().1,
+            runs: HOPPER_SCAN_RUNS.swap(0, Ordering::Relaxed),
+            skips: HOPPER_SCAN_SKIPS.swap(0, Ordering::Relaxed),
+            placed: Vec::new(),
+        }
+    }
+
+    fn restore_world(saved: SavedWorld) {
+        for pos in &saved.placed {
+            set_block(pos.0, pos.1, pos.2, 0);
+            hopper_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cancel(*pos);
+        }
+        *hoppers().lock().unwrap_or_else(|e| e.into_inner()) = saved.hoppers;
+        *chests().lock().unwrap_or_else(|e| e.into_inner()) = saved.chests;
+        *drops().lock().unwrap_or_else(|e| e.into_inner()) = saved.drops;
+        *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = saved.forced;
+        *backoff().lock().unwrap_or_else(|e| e.into_inner()) = saved.backoff;
+        *hopper_sleep().lock().unwrap_or_else(|e| e.into_inner()) = saved.sleep;
+        *drop_cells().lock().unwrap_or_else(|e| e.into_inner()) = saved.cells;
+        TICK.store(saved.tick, Ordering::Relaxed);
+        TICK_IDX.store(saved.index, Ordering::Relaxed);
+        HOPPER_SCAN_RUNS.store(saved.runs, Ordering::Relaxed);
+        HOPPER_SCAN_SKIPS.store(saved.skips, Ordering::Relaxed);
+        set_test_region(saved.hot, saved.warm);
+    }
+
+    /// Warm every chunk the fixture touches so `hopper_tick`'s `is_warm` gate
+    /// and `drop_tick`'s hot despawn pass see the whole array.
+    fn warm_chunks(x0: i32, z0: i32, x1: i32, z1: i32) -> (HashSet<(i32, i32)>, HashSet<(i32, i32)>) {
+        let mut set = HashSet::new();
+        for cx in x0.div_euclid(16)..=x1.div_euclid(16) {
+            for cz in z0.div_euclid(16)..=z1.div_euclid(16) {
+                set.insert((cx, cz));
+            }
+        }
+        (set.clone(), set)
+    }
+
+    fn put(pos: (i32, i32, i32), slot: i16, stack: Stack) {
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ContainerKey::ow(pos))
+            .or_default()
+            .insert(slot, stack);
+    }
+
+    fn stacks_at(pos: (i32, i32, i32)) -> Vec<(i64, u8)> {
+        let mut v: Vec<(i64, u8)> = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::ow(pos))
+            .map(|m| m.values().map(|(i, c, _)| (*i, *c)).collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Put every test hopper on this tick's due bucket with no backoff, the
+    /// cadence vanilla gives a hopper: one activation per game tick.
+    fn make_all_due(placed: &[(i32, i32, i32)]) {
+        let mut b = backoff().lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = hopper_queue().lock().unwrap_or_else(|e| e.into_inner());
+        for pos in placed {
+            b.remove(&(DimId::Overworld, pos.0, pos.1, pos.2));
+            q.requeue(*pos, 1);
+        }
+    }
+
+    fn counters() -> (u64, u64) {
+        (
+            HOPPER_SCAN_RUNS.load(Ordering::Relaxed),
+            HOPPER_SCAN_SKIPS.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 500 idle hoppers plus one working hopper: after the first scans settle,
+    /// every idle visit must be an O(1) fingerprint skip while the working
+    /// hopper keeps scanning — and a chest edit or a drop above an idle hopper
+    /// must wake it on that same `hopper_tick`.
+    #[test]
+    fn bot_hopper_idle_array_skips_scans_and_wakes_same_tick() {
+        let _guard = world_guard();
+        let mut saved = save_world();
+        let n_idle = 500;
+        // 23x22 grid at y=BHY, two blocks apart, all facing down into air:
+        // pull source empty, push target air, suction cell empty -> every one
+        // settles idle. Two blocks keeps the windows from overlapping.
+        let mut placed: Vec<(i32, i32, i32)> = Vec::with_capacity(n_idle + 1);
+        let (hot, warm) = warm_chunks(0, 0, 63, 95);
+        set_test_region(hot, warm);
+        for i in 0..n_idle {
+            let pos = (
+                ((i % 23) * 2 + 8) as i32,
+                BHY,
+                ((i / 23) * 2 + 8) as i32,
+            );
+            set_block(pos.0, pos.1, pos.2, 9225);
+            placed.push(pos);
+        }
+        saved.placed = placed.clone();
+        // The one active hopper: a chest above it keeps it working every tick.
+        // z=80 sits outside the idle grid (which ends at z=50) but inside the
+        // warm chunks.
+        let active = (8, BHY, 80);
+        let chest_st = name_to_state("chest").unwrap_or(2954);
+        let item = name_to_item("raw_iron").unwrap_or(1);
+        set_block(active.0, active.1, active.2, 9225);
+        set_block(active.0, active.1 + 1, active.2, chest_st);
+        put((active.0, active.1 + 1, active.2), 0, (item, 64, Vec::new()));
+        placed.push(active);
+        saved.placed = placed.clone();
+        saved.placed.push((active.0, active.1 + 1, active.2));
+
+        // Three settle ticks: first visit scans (no cache), the hopper stores
+        // its fingerprint, the next visits skip.
+        for _ in 0..3 {
+            make_all_due(&placed);
+            hopper_tick();
+        }
+        let (runs0, skips0) = counters();
+        assert!(skips0 > 0, "idle hoppers must skip scans once settled");
+
+        // Five more ticks: skips accumulate at the idle rate, scans stay flat
+        // (only the active hopper plus any still-settling entries).
+        for _ in 0..5 {
+            make_all_due(&placed);
+            hopper_tick();
+        }
+        let (runs1, skips1) = counters();
+        assert_eq!(runs1 - runs0, 5, "only the active hopper may scan per tick");
+        assert_eq!(skips1 - skips0, 5 * n_idle as u64, "every idle hopper skips every tick");
+
+        // Wake on a chest edit, same tick: put an item in the chest above one
+        // idle hopper and run exactly one activation pass.
+        let victim = placed[0];
+        set_block(victim.0, victim.1 + 1, victim.2, chest_st);
+        saved.placed.push((victim.0, victim.1 + 1, victim.2));
+        put((victim.0, victim.1 + 1, victim.2), 0, (item, 1, Vec::new()));
+        let (runs_w, skips_w) = counters();
+        make_all_due(&placed);
+        hopper_tick();
+        let (runs_a, skips_a) = counters();
+        assert_eq!(runs_a - runs_w, 2, "victim + active hopper scan; the rest skip");
+        assert_eq!(skips_a - skips_w, n_idle as u64 - 1);
+        assert_eq!(
+            stacks_at(victim),
+            vec![(item, 1)],
+            "the woken hopper must pull the chest item on the same tick"
+        );
+
+        // One settle tick so the first victim re-idles before the drop wake:
+        // it scanned last activation, so it is owed exactly one more scan.
+        make_all_due(&placed);
+        hopper_tick();
+
+        // Wake on a drop above, same tick: a second idle hopper sucks the item
+        // entity out of its suction cell during the very next activation.
+        let victim2 = placed[1];
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
+            eid: 71001,
+            x: victim2.0 as f64 + 0.5,
+            y: victim2.1 as f64 + 1.0,
+            z: victim2.2 as f64 + 0.5,
+            item,
+            cnt: 3,
+            comps: Vec::new(),
+            age: 0,
+            target: None,
+            thrower: None,
+        });
+        let (runs_w2, skips_w2) = counters();
+        make_all_due(&placed);
+        hopper_tick();
+        let (runs_a2, skips_a2) = counters();
+        assert_eq!(runs_a2 - runs_w2, 2, "drop wakes its hopper plus the active one");
+        assert_eq!(skips_a2 - skips_w2, n_idle as u64 - 1);
+        assert_eq!(stacks_at(victim2), vec![(item, 3)], "sucked stack lands same tick");
+        eprintln!(
+            "bot_hopper_idle_array: runs={} skips={} ({} idle hoppers, 1 active)",
+            runs_a2, skips_a2, n_idle
+        );
+        restore_world(saved);
+    }
+
+    /// Scalar reference for the drop merge: the original full pairwise scan,
+    /// kept verbatim so the spatial production path can be held to it — the
+    /// same contract `merge_tests::reference_outcome` pins.
+    fn scalar_merge_outcome(mut dp: Vec<Drop>) -> Vec<(i32, i64, u8)> {
+        let mut merged: Vec<i32> = Vec::new();
+        for i in 0..dp.len() {
+            for j in (i + 1)..dp.len() {
+                let (ax, ay, az, ait, acnt, aage) = {
+                    let a = &dp[i];
+                    (a.x, a.y, a.z, a.item, a.cnt, a.age)
+                };
+                let (bx, by, bz, bit, bcnt, bage) = {
+                    let b = &dp[j];
+                    (b.x, b.y, b.z, b.item, b.cnt, b.age)
+                };
+                if ait == bit
+                    && dp[i].target == dp[j].target
+                    && dp[i].comps == dp[j].comps
+                    && (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 0.25
+                    && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16
+                {
+                    let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
+                    dp[keep].cnt = dp[keep].cnt.saturating_add(dp[eat].cnt);
+                    merged.push(dp[eat].eid);
+                    break;
+                }
+            }
+        }
+        let mut out: Vec<(i32, i64, u8)> = dp
+            .into_iter()
+            .filter(|d| !merged.contains(&d.eid))
+            .map(|d| (d.eid, d.item, d.cnt))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn drop_at(eid: i32, x: f64, y: f64, z: f64, item: i64, cnt: u8, age: i32) -> Drop {
+        Drop {
+            eid,
+            x,
+            y,
+            z,
+            item,
+            cnt,
+            comps: Vec::new(),
+            age,
+            target: None,
+            thrower: None,
+        }
+    }
+
+    /// 500 drops in a kill chamber: 250 isolated merge pairs three blocks
+    /// apart, so every merge is a clean pairwise absorption. Item totals must
+    /// be conserved exactly and the spatial path must reproduce the scalar
+    /// reference outcome drop for drop.
+    #[test]
+    fn bot_hopper_merge_500_drops_conserves_totals_and_matches_scalar() {
+        let _guard = world_guard();
+        let item = name_to_item("rotten_flesh").unwrap_or(1);
+        let mut dp: Vec<Drop> = Vec::with_capacity(500);
+        let mut eid = 80000i32;
+        // 16x16 grid of pair sites, 48 blocks apart pair-to-pair, 0.4 inside;
+        // 250 complete pairs fill the 500 drops exactly.
+        'outer: for gx in 0..16 {
+            for gz in 0..16 {
+                let bx = gx * 48 + 4;
+                let bz = gz * 48 + 4;
+                let age_a = eid % 97;
+                let age_b = eid % 89;
+                dp.push(drop_at(eid, bx as f64 + 0.1, 70.0, bz as f64 + 0.1, item, 1, age_a));
+                eid += 1;
+                if dp.len() == 500 {
+                    break 'outer;
+                }
+                dp.push(drop_at(eid, bx as f64 + 0.5, 70.0, bz as f64 + 0.1, item, 1, age_b));
+                eid += 1;
+                if dp.len() == 500 {
+                    break 'outer;
+                }
+            }
+        }
+        assert_eq!(dp.len(), 500);
+        let total_before: u64 = dp.iter().map(|d| u64::from(d.cnt)).sum();
+
+        let t0 = std::time::Instant::now();
+        let mut prod = dp.clone();
+        let absorbed = merge_drops(&mut prod);
+        let merge_us = t0.elapsed().as_micros();
+        let mut survivors: Vec<(i32, i64, u8)> = prod
+            .iter()
+            .filter(|d| !absorbed.contains(&d.eid))
+            .map(|d| (d.eid, d.item, d.cnt))
+            .collect();
+        survivors.sort_unstable();
+        let t1 = std::time::Instant::now();
+        let expected = scalar_merge_outcome(dp.clone());
+        let scalar_us = t1.elapsed().as_micros();
+        assert_eq!(survivors, expected, "spatial merge diverged from scalar scan");
+        let total_after: u64 = survivors.iter().map(|(_, _, c)| u64::from(*c)).sum();
+        assert_eq!(total_after, total_before, "merge must conserve every item");
+        eprintln!(
+            "bot_hopper_merge_500_pairs: spatial={}us scalar={}us survivors={}",
+            merge_us,
+            scalar_us,
+            survivors.len()
+        );
+    }
+
+    /// The dense kill chamber: 500 drops packed into a 9x9x3 cellar where
+    /// merge chains and re-merge order matter. The spatial path must reproduce
+    /// the scalar reference exactly, and the merge stage must stay far under
+    /// the pairwise scan's cost.
+    #[test]
+    fn bot_hopper_merge_500_dense_drops_parity_and_timing() {
+        let _guard = world_guard();
+        let item = name_to_item("rotten_flesh").unwrap_or(1);
+        let mut dp: Vec<Drop> = Vec::with_capacity(500);
+        for i in 0..500 {
+            let h = (i as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            dp.push(drop_at(
+                90000 + i as i32,
+                0.5 + (h % 9) as f64 + ((h >> 8) % 10) as f64 / 64.0,
+                70.0 + ((h >> 16) % 3) as f64 + ((h >> 24) % 10) as f64 / 64.0,
+                0.5 + ((h >> 32) % 9) as f64 + ((h >> 40) % 10) as f64 / 64.0,
+                item,
+                ((h >> 48) % 3) as u8 + 1,
+                (h % 251) as i32,
+            ));
+        }
+        let t0 = std::time::Instant::now();
+        let mut prod = dp.clone();
+        let absorbed = merge_drops(&mut prod);
+        let merge_us = t0.elapsed().as_micros();
+        let mut survivors: Vec<(i32, i64, u8)> = prod
+            .iter()
+            .filter(|d| !absorbed.contains(&d.eid))
+            .map(|d| (d.eid, d.item, d.cnt))
+            .collect();
+        survivors.sort_unstable();
+        let expected = scalar_merge_outcome(dp.clone());
+        assert_eq!(survivors, expected, "dense merge diverged from scalar scan");
+        // The lane budget is <1ms for the 500-drop merge stage; the scalar
+        // scan is timed alongside purely for the report's ratio.
+        let t1 = std::time::Instant::now();
+        let _ = scalar_merge_outcome(dp);
+        let scalar_us = t1.elapsed().as_micros();
+        eprintln!(
+            "bot_hopper_merge_500_dense: spatial={}us scalar={}us survivors={}",
+            merge_us,
+            scalar_us,
+            survivors.len()
+        );
+        assert!(
+            merge_us < 1000,
+            "500-drop spatial merge must stay under 1ms, took {merge_us}us"
+        );
     }
 }
