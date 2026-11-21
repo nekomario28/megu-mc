@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use mod_adapter_core::neoforge_wire::{
     read_mc_string, read_varint, write_mc_string, write_varint,
 };
+use mod_adapter_core::version_compat::{data_version_for, McVersion};
 use mod_offload::kinetic_graph::NetworkStatus;
 
 use crate::addon_profile::{CreateAddonProfile, PropulsionSpec};
@@ -23,6 +24,14 @@ use crate::factory::{Axis, CreateFactory, DimBlockPos};
 pub const AERO_MAGIC: [u8; 4] = *b"AERO";
 /// Snapshot format version.
 pub const AERO_VERSION: u8 = 1;
+/// `AERO2` version-tagged envelope version byte (header + `aero_v1` payload).
+pub const AERO2_VERSION: u8 = 2;
+/// Mojang `DataVersion` for the `1.21.1` target (`3955`): stamped on `AERO2`
+/// envelopes encoded for that target and reported when decoding a legacy
+/// `AERO` v1 snapshot that carries no version tag of its own.
+pub const AERO_DATA_VERSION_1_21_1: i32 = 3955;
+/// Mojang `DataVersion` for the latest vanilla `26.3` target (`5023`).
+pub const AERO_DATA_VERSION_26_3: i32 = 5023;
 /// Default per-block mass (kg) when the caller has no better table.
 pub const DEFAULT_BLOCK_MASS: f64 = 100.0;
 /// Sea-level air density normalization for `step`'s `air_density` argument.
@@ -439,6 +448,25 @@ impl RigidBodySubWorld {
             l[2] + self.center_of_mass[2],
         ]
     }
+
+    /// Encode this sub-world as an `AERO2` version-tagged envelope: the
+    /// legacy `AERO` v1 payload wrapped in a header carrying the Mojang
+    /// `data_version` the snapshot was written for (e.g.
+    /// [`AERO_DATA_VERSION_1_21_1`] = 3955, [`AERO_DATA_VERSION_26_3`] =
+    /// 5023), the payload length, and an IEEE CRC32 of the payload. The
+    /// inner `aero_v1` byte format is unchanged, so envelopes are fully
+    /// additive. Decode with [`decode_snapshot_with_data_version`].
+    pub fn encode_snapshot_for_data_version(&self, data_version: i32) -> Vec<u8> {
+        let payload = encode_aeronautics_snapshot(self);
+        let mut out = Vec::with_capacity(AERO2_HEADER_LEN + payload.len());
+        out.extend_from_slice(&AERO_MAGIC);
+        out.push(AERO2_VERSION);
+        out.extend_from_slice(&data_version.to_be_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&crc32_ieee(&payload).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +665,113 @@ pub fn decode_aeronautics_snapshot(
     };
     sub.rebuild_factory();
     Ok(sub)
+}
+
+// ---------------------------------------------------------------------------
+// `AERO2` version-tagged envelope (legacy `aero_v1` payload + data_version)
+// ---------------------------------------------------------------------------
+
+/// Byte length of the `AERO2` envelope header: 4 magic + 1 version +
+/// 4 `data_version` + 4 `payload_len` + 4 CRC32.
+const AERO2_HEADER_LEN: usize = 17;
+
+/// Whether `data_version` is a Mojang `DataVersion` the shared
+/// [`mod_adapter_core::version_compat`] table recognizes — the
+/// `1.20.4`-`1.21.5` line plus the `26.3` target. `AERO2` decode fails
+/// closed on anything else so a corrupt or unknown version tag can never
+/// silently restore a sub-world.
+pub fn is_known_aero_data_version(data_version: i32) -> bool {
+    [
+        McVersion::V1_20_4,
+        McVersion::V1_20_6,
+        McVersion::V1_21_0,
+        McVersion::V1_21_1,
+        McVersion::V1_21_3,
+        McVersion::V1_21_4,
+        McVersion::V1_21_5,
+        McVersion::V26_3,
+    ]
+    .iter()
+    .any(|&v| data_version_for(v) == Some(data_version))
+}
+
+/// Decode an `AERO2` version-tagged envelope *or* a legacy `AERO` v1
+/// snapshot, returning the restored sub-world and the `data_version` the
+/// snapshot claims. Legacy v1 inputs report [`AERO_DATA_VERSION_1_21_1`]
+/// (`3955`, the target the format shipped under). `AERO2` payloads decode
+/// through the unchanged `aero_v1` path, so a `3955` or `5023` envelope
+/// restores identically to its bare `AERO` v1 bytes.
+///
+/// Fails closed on bad magic/version byte, truncated header or payload,
+/// payload-length mismatch, CRC32 mismatch, unknown `data_version`, or any
+/// corruption inside the wrapped `aero_v1` payload.
+pub fn decode_snapshot_with_data_version(
+    bytes: &[u8],
+    registry: &CreateBlockRegistry,
+) -> Result<(RigidBodySubWorld, i32), AeronauticsError> {
+    let corrupt = |what: &str| AeronauticsError::CorruptSnapshot(what.to_string());
+    if bytes.len() < 5 || bytes[..4] != AERO_MAGIC {
+        return Err(corrupt("bad magic"));
+    }
+    if bytes[4] == AERO_VERSION {
+        let sub = decode_aeronautics_snapshot(bytes, registry)?;
+        return Ok((sub, AERO_DATA_VERSION_1_21_1));
+    }
+    if bytes[4] != AERO2_VERSION {
+        return Err(corrupt("bad magic/version"));
+    }
+    let header = bytes
+        .get(..AERO2_HEADER_LEN)
+        .ok_or_else(|| corrupt("truncated AERO2 header"))?;
+    let data_version = i32::from_be_bytes([header[5], header[6], header[7], header[8]]);
+    let payload_len = u32::from_be_bytes([header[9], header[10], header[11], header[12]]) as usize;
+    let crc = u32::from_be_bytes([header[13], header[14], header[15], header[16]]);
+    let payload = &bytes[AERO2_HEADER_LEN..];
+    if payload.len() != payload_len {
+        return Err(corrupt("payload length mismatch"));
+    }
+    if !is_known_aero_data_version(data_version) {
+        return Err(corrupt("unknown data_version"));
+    }
+    if crc32_ieee(payload) != crc {
+        return Err(corrupt("crc32 mismatch"));
+    }
+    let sub = decode_aeronautics_snapshot(payload, registry)?;
+    Ok((sub, data_version))
+}
+
+/// IEEE 802.3 CRC32 (poly `0xEDB88320`, reflected, init/xorout `0xFFFFFFFF`)
+/// of `data` — the checksum zlib/JAR internals use, computed with a
+/// zero-dependency compile-time table so `AERO2` envelopes detect
+/// corruption before the inner `aero_v1` decoder reads a single byte.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = CRC32_IEEE_TABLE[((crc ^ u32::from(b)) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+const CRC32_IEEE_TABLE: [u32; 256] = crc32_table();
+
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,6 +1286,127 @@ mod tests {
         let mut padded = snap.clone();
         padded.push(0);
         assert!(decode_aeronautics_snapshot(&padded, &reg).is_err());
+    }
+
+    #[test]
+    fn crc32_ieee_known_vector_and_data_version_table() {
+        // The canonical CRC32 check vector (`zlib` "123456789" -> 0xCBF43926).
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_ieee(b""), 0);
+        // The stamped constants equal the shared version table's rows exactly
+        // and the known-version gate covers both canonical targets.
+        assert_eq!(
+            data_version_for(McVersion::V1_21_1),
+            Some(AERO_DATA_VERSION_1_21_1)
+        );
+        assert_eq!(
+            data_version_for(McVersion::V26_3),
+            Some(AERO_DATA_VERSION_26_3)
+        );
+        assert!(is_known_aero_data_version(3955));
+        assert!(is_known_aero_data_version(5023));
+        for dv in [i32::MIN, -1, 0, 1, 3956, 5024, 9999, i32::MAX] {
+            assert!(!is_known_aero_data_version(dv), "data_version {dv}");
+        }
+    }
+
+    #[test]
+    fn aero2_envelope_roundtrips_data_version_and_legacy_defaults_to_3955() {
+        let (addon, reg) = aero_registry();
+        let mut cells = BTreeMap::new();
+        cells.insert(
+            [0, 0, 0],
+            canonical_with(&reg, "createaeronautics:propeller_engine", "axis", "x"),
+        );
+        cells.insert(
+            [1, 0, 0],
+            canonical_with(&reg, "createaeronautics:propeller_bearing", "facing", "east"),
+        );
+        cells.insert([0, 1, 0], canonical(&reg, "createaeronautics:balloon_envelope"));
+
+        let mut sub =
+            RigidBodySubWorld::assemble(7, 3, cells, &reg, Some(&addon), 100.0).unwrap();
+        sub.pos = [2.0, 64.0, -1.0];
+        for _ in 0..10 {
+            sub.step(0.05, 9.81, SEA_LEVEL_AIR_DENSITY);
+        }
+        let inner = encode_aeronautics_snapshot(&sub);
+
+        for dv in [AERO_DATA_VERSION_1_21_1, AERO_DATA_VERSION_26_3] {
+            let env = sub.encode_snapshot_for_data_version(dv);
+            assert_eq!(&env[..5], b"AERO\x02");
+            // The wrapped payload is the untouched `aero_v1` byte stream.
+            assert_eq!(&env[17..], inner.as_slice());
+            let (restored, got) = decode_snapshot_with_data_version(&env, &reg).unwrap();
+            assert_eq!(got, dv);
+            assert_eq!(encode_aeronautics_snapshot(&restored), inner);
+        }
+
+        // Legacy `AERO` v1 inputs decode through the same entry point and
+        // report the 1.21.1 data version (3955).
+        let (restored, got) = decode_snapshot_with_data_version(&inner, &reg).unwrap();
+        assert_eq!(got, AERO_DATA_VERSION_1_21_1);
+        assert_eq!(got, 3955);
+        assert_eq!(encode_aeronautics_snapshot(&restored), inner);
+    }
+
+    #[test]
+    fn aero2_envelope_fails_closed_on_corruption() {
+        let (addon, reg) = aero_registry();
+        let mut cells = BTreeMap::new();
+        cells.insert([0, 0, 0], canonical(&reg, "createaeronautics:airship_assembler"));
+        cells.insert([0, 1, 0], canonical(&reg, "createaeronautics:balloon_envelope"));
+        let sub = RigidBodySubWorld::assemble(1, 0, cells, &reg, Some(&addon), 100.0).unwrap();
+        let env = sub.encode_snapshot_for_data_version(AERO_DATA_VERSION_26_3);
+
+        // Truncated header, truncated payload, trailing bytes.
+        assert!(decode_snapshot_with_data_version(&env[..10], &reg).is_err());
+        assert!(decode_snapshot_with_data_version(&env[..16], &reg).is_err());
+        assert!(decode_snapshot_with_data_version(&env[..env.len() - 2], &reg).is_err());
+        let mut padded = env.clone();
+        padded.push(0);
+        assert!(decode_snapshot_with_data_version(&padded, &reg).is_err());
+
+        // Flipped payload byte: length still matches, CRC catches it.
+        let mut bad = env.clone();
+        let n = bad.len();
+        bad[n - 1] ^= 0xFF;
+        assert!(decode_snapshot_with_data_version(&bad, &reg).is_err());
+
+        // Corrupted CRC field.
+        let mut bad = env.clone();
+        bad[13] ^= 0xFF;
+        assert!(decode_snapshot_with_data_version(&bad, &reg).is_err());
+
+        // Unknown / negative / zero data_version tags fail closed.
+        for dv in [0i32, -1, 9999, i32::MAX] {
+            let mut bad = env.clone();
+            bad[5..9].copy_from_slice(&dv.to_be_bytes());
+            assert!(
+                decode_snapshot_with_data_version(&bad, &reg).is_err(),
+                "data_version {dv} must fail closed"
+            );
+        }
+
+        // Bad magic and unknown envelope version byte.
+        let mut bad = env.clone();
+        bad[0] = b'X';
+        assert!(decode_snapshot_with_data_version(&bad, &reg).is_err());
+        let mut bad = env.clone();
+        bad[4] = 0x03;
+        assert!(decode_snapshot_with_data_version(&bad, &reg).is_err());
+
+        // A well-formed envelope (valid CRC/len/version tag) wrapping a
+        // non-`aero_v1` payload still fails inside the inner decoder.
+        let junk = b"not a snapshot";
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&AERO_MAGIC);
+        bad.push(AERO2_VERSION);
+        bad.extend_from_slice(&AERO_DATA_VERSION_26_3.to_be_bytes());
+        bad.extend_from_slice(&(junk.len() as u32).to_be_bytes());
+        bad.extend_from_slice(&crc32_ieee(junk).to_be_bytes());
+        bad.extend_from_slice(junk);
+        assert!(decode_snapshot_with_data_version(&bad, &reg).is_err());
     }
 
     #[test]

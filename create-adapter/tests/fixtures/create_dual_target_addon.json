@@ -1,0 +1,20 @@
+{
+  "mod_id": "createdual",
+  "mc_version_range": "[1.21.1,1.22),[26.3,26.4)",
+  "blocks": [
+    {"id": "createdual:deck_plate", "role": "decorative"}
+  ],
+  "kinetic_sources": [
+    {"id": "createdual:aero_motor", "rpm": 96, "capacity": 4096.0, "axis": "z"}
+  ],
+  "kinetic_consumers": [
+    {"id": "createdual:propeller_bearing", "impact": 8.0, "min_rpm": 4.0}
+  ],
+  "assembly_anchors": ["createdual:hull_assembler"],
+  "propulsion": {
+    "thrust_per_rpm": 120.0,
+    "propeller_blocks": ["createdual:propeller_bearing", "createdual:aero_motor"],
+    "buoyancy_blocks": ["createdual:gas_envelope"],
+    "rudder_blocks": ["createdual:tail_rudder"]
+  }
+}

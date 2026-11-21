@@ -142,6 +142,31 @@ impl PropulsionSpec {
     }
 }
 
+/// Compatibility of a [`CreateAddonProfile`] against the two canonical
+/// mc-spine targets: `1.21.1` (`DataVersion` 3955) and latest vanilla `26.3`
+/// (`DataVersion` 5023). `None` verdicts mean the profile declares no
+/// `mc_version_range` and applies unconditionally.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetCompatibilitySummary {
+    /// Verdict on the `1.21.1` target.
+    pub v1_21_1: Option<VersionCompatVerdict>,
+    /// Verdict on the `26.3` target.
+    pub v26_3: Option<VersionCompatVerdict>,
+}
+
+impl TargetCompatibilitySummary {
+    /// Whether both canonical targets accept the profile. Mirrors
+    /// [`CreateAddonProfile::supports_both_targets`]: an undeclared range
+    /// (`None`) counts as supported, every mismatch or malformed
+    /// declaration fails closed.
+    pub fn compatible_on_both(&self) -> bool {
+        fn supported(verdict: &Option<VersionCompatVerdict>) -> bool {
+            matches!(verdict, None | Some(VersionCompatVerdict::Compatible))
+        }
+        supported(&self.v1_21_1) && supported(&self.v26_3)
+    }
+}
+
 /// Declarative Create addon profile: Create-specific component rules layered
 /// on a [`ModOffloadProfile`] base so one manifest drives both the flagship
 /// `create-adapter` registry and the universal `mod-adapter-core` runtime.
@@ -506,6 +531,25 @@ impl CreateAddonProfile {
             Ok(Some(range)) => range.contains(target),
             Ok(None) => true,
             Err(_) => false,
+        }
+    }
+
+    /// Whether this profile applies to BOTH canonical mc-spine targets:
+    /// `1.21.1` (`DataVersion` 3955) and latest vanilla `26.3` (`DataVersion`
+    /// 5023). Profiles declaring no range apply unconditionally; malformed
+    /// declarations fail closed on both.
+    pub fn supports_both_targets(&self) -> bool {
+        self.supports_mc_version(McVersion::V1_21_1) && self.supports_mc_version(McVersion::V26_3)
+    }
+
+    /// Per-target [`VersionCompatVerdict`] for the two canonical mc-spine
+    /// targets — the diagnostic view behind
+    /// [`Self::supports_both_targets`], reporting *why* a profile does not
+    /// offload on a given target (minor vs major mismatch vs malformed).
+    pub fn target_compatibility_summary(&self) -> TargetCompatibilitySummary {
+        TargetCompatibilitySummary {
+            v1_21_1: self.check_mc_version(McVersion::V1_21_1),
+            v26_3: self.check_mc_version(McVersion::V26_3),
         }
     }
 
@@ -962,6 +1006,13 @@ fn axis_from_name(name: &str) -> Axis {
 /// 1.21.1/1.21.3/1.21.4/1.21.5+ via [`CreateAddonProfile::supports_mc_version`].
 pub const BUILTIN_ADDON_MC_VERSION_RANGE: &str = "[1.21.1,1.22)";
 
+/// Declared Minecraft compatibility spanning BOTH canonical mc-spine
+/// targets: the `1.21.x` line from 1.21.1 plus the `26.3.x` band, written as
+/// a NeoForge Maven union interval (parsed by [`VersionRange`]). Profiles
+/// carrying this declaration satisfy
+/// [`CreateAddonProfile::supports_both_targets`].
+pub const DUAL_TARGET_MC_VERSION_RANGE: &str = "[1.21.1,1.22),[26.3,26.4)";
+
 /// Create: Aeronautics (`createaeronautics`): airship assembly anchor,
 /// propeller bearings/thrusters, balloon envelopes, and rudder/helm control.
 pub fn createaeronautics_profile() -> CreateAddonProfile {
@@ -1338,6 +1389,86 @@ mod tests {
         assert!(open.parsed_mc_version_range().is_err());
         assert!(matches!(
             open.check_mc_version(McVersion::V1_21_1),
+            Some(VersionCompatVerdict::InvalidRange { .. })
+        ));
+    }
+
+    #[test]
+    fn dual_target_profile_fixture_supports_both_1_21_1_and_26_3() {
+        // Declarative dual-target addon manifest (tests/fixtures) declaring
+        // the Maven union `[1.21.1,1.22),[26.3,26.4)`.
+        let profile = CreateAddonProfile::from_json(include_bytes!(
+            "../tests/fixtures/create_dual_target_addon.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            profile.mc_version_range.as_deref(),
+            Some(DUAL_TARGET_MC_VERSION_RANGE)
+        );
+
+        // Both canonical targets accept the profile; neighbors inside the
+        // declared bands do too, versions outside either band do not.
+        assert!(profile.supports_both_targets());
+        assert_eq!(
+            profile.check_mc_version(McVersion::V1_21_1),
+            Some(VersionCompatVerdict::Compatible)
+        );
+        assert_eq!(
+            profile.check_mc_version(McVersion::V26_3),
+            Some(VersionCompatVerdict::Compatible)
+        );
+        assert!(profile.supports_mc_version(McVersion::V1_21_5));
+        assert!(profile.supports_mc_version(McVersion::new(26, 3, 7)));
+        assert!(!profile.supports_mc_version(McVersion::new(26, 4, 0)));
+        assert!(!profile.supports_mc_version(McVersion::new(1, 22, 0)));
+        assert!(!profile.supports_mc_version(McVersion::V1_20_6));
+        assert!(!profile.supports_mc_version(McVersion::new(27, 0, 0)));
+
+        // The summary reports Compatible on both targets verbatim.
+        let summary = profile.target_compatibility_summary();
+        assert_eq!(summary.v1_21_1, Some(VersionCompatVerdict::Compatible));
+        assert_eq!(summary.v26_3, Some(VersionCompatVerdict::Compatible));
+        assert!(summary.compatible_on_both());
+
+        // Dual-target Create-side blocks merge into the flagship registry
+        // and the universal offload mirror alongside the core catalog.
+        let reg = create_registry_with_addons(
+            crate::blockstates::DEFAULT_BASE_STATE_ID,
+            std::slice::from_ref(&profile),
+        )
+        .unwrap();
+        assert!(reg.default_state("createdual:aero_motor").is_some());
+        assert!(reg.default_state("createdual:propeller_bearing").is_some());
+        assert!(reg.default_state("create:shaft").is_some());
+
+        // The built-in 1.21.x profiles are deliberately single-target: they
+        // reject 26.3 as a major mismatch, not a silent pass.
+        for builtin in builtin_create_addon_profiles() {
+            assert!(
+                !builtin.supports_both_targets(),
+                "profile {}",
+                builtin.mod_id
+            );
+            let s = builtin.target_compatibility_summary();
+            assert_eq!(s.v1_21_1, Some(VersionCompatVerdict::Compatible));
+            assert!(matches!(
+                s.v26_3,
+                Some(VersionCompatVerdict::MajorMismatch { .. })
+            ));
+            assert!(!s.compatible_on_both());
+        }
+
+        // An undeclared range applies unconditionally on both targets; a
+        // malformed one fails closed on both.
+        let mut open = CreateAddonProfile::new("noversion");
+        assert!(open.supports_both_targets());
+        assert!(open.target_compatibility_summary().compatible_on_both());
+        open.mc_version_range = Some("[unterminated".to_string());
+        assert!(!open.supports_both_targets());
+        let s = open.target_compatibility_summary();
+        assert!(!s.compatible_on_both());
+        assert!(matches!(
+            s.v26_3,
             Some(VersionCompatVerdict::InvalidRange { .. })
         ));
     }
