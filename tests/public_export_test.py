@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Exercise the public export without a jar, network, or changes to the source checkout."""
 import argparse
+import json
 import re
 import subprocess
+import tarfile
 import tempfile
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPORT = ROOT / 'tools/export_public_branch.sh'
 TSVS = ('biome_probe', 'vanilla_vectors', 'biome_probe_ties', 'random_next_int')
+SUITE = ('mc-spine', 'mc-spine-client', 'mc-spine-mod-check',
+         'mc-spine-world-migrate', 'mc-spine-init')
 
 
 def run(cwd, *cmd, expect=0):
@@ -30,8 +35,64 @@ def check_docs(root):
         assert 'tools/export_public_branch.sh' in (root / doc).read_text(), doc
 
 
+def check_public_licenses(root):
+    # Inspect every exported package, including workspace members that the
+    # provenance gate's explicit manifest list may not yet know about.
+    manifests = sorted(root.rglob('Cargo.toml'))
+    assert manifests
+    for path in manifests:
+        package = tomllib.loads(path.read_text()).get('package')
+        if package is None:
+            continue
+        license_id = package.get('license', '')
+        if not license_id:
+            continue  # Developer-only probe/benchmark manifests can omit this field.
+        incompatible = re.search(
+            r'(?i)(?<![A-Za-z0-9])(?:polyform|arr|busl|sspl|proprietary)'
+            r'(?![A-Za-z0-9])|all[ _-]+rights[ _-]+reserved', license_id,
+        )
+        assert not incompatible, f'{path}: incompatible license {license_id!r}'
+
+
+def check_exported_bundle(out, tmp):
+    # An exported checkout must be able to package the real guide and the
+    # whole binary suite without importing generated Minecraft data.
+    binaries = tmp / 'suite'
+    binaries.mkdir()
+    for name in SUITE:
+        path = binaries / name
+        path.write_bytes(f'\x7fELF exported-suite fixture {name}\n'.encode())
+        path.chmod(0o755)
+
+    artifacts = tmp / 'artifacts'
+    args = ['python3', 'tools/release_bundle.py', 'build',
+            '--binary', binaries / SUITE[0]]
+    for name in SUITE[1:]:
+        args.extend(('--extra-binary', binaries / name))
+    args.extend(('--out-dir', artifacts, '--version', '0.1.0',
+                 '--target', 'x86_64-unknown-linux-gnu', '--repo-root', out))
+    run(out, *args)
+
+    prefix = 'mc-spine-0.1.0-x86_64-unknown-linux-gnu'
+    bundle = artifacts / f'{prefix}.tar.gz'
+    manifest = artifacts / 'release-manifest.json'
+    run(out, 'python3', 'tools/release_bundle.py', 'verify',
+        '--bundle', bundle, '--manifest', manifest, '--sums', artifacts / 'SHA256SUMS')
+    records = {record['path']: record for record in json.loads(manifest.read_text())['files']}
+    assert {f'{prefix}/{name}' for name in SUITE} <= set(records)
+    assert records[f'{prefix}/docs/mod-author-guide.md']['mode'] == '0644'
+    with tarfile.open(bundle, 'r:gz') as archive:
+        names = {member.name for member in archive.getmembers()}
+        assert names == set(records)
+        assert not [name for name in names if '_1211' in name or name.endswith(('.jar', '.class'))]
+        guide = archive.extractfile(f'{prefix}/docs/mod-author-guide.md').read()
+        assert guide == (out / 'docs/mod-author-guide.md').read_bytes()
+
+
 def test_export(from_worktree):
-    with tempfile.TemporaryDirectory(prefix='public-export-test-') as tmp:
+    # The exporter requires its destination to be outside the source tree,
+    # even when the caller sets TMPDIR to the checkout's target/tmp.
+    with tempfile.TemporaryDirectory(prefix='public-export-test-', dir='/tmp') as tmp:
         out = Path(tmp) / 'export'
         extra = ['--from-worktree'] if from_worktree else []
         run(ROOT, EXPORT, '--out', out, '--verify', *extra)
@@ -55,7 +116,9 @@ def test_export(from_worktree):
                      'client-app/Cargo.toml', 'tools/vanilla_data/version_pack.py',
                      'tools/vanilla_data/gen_vanilla_data.sh', 'tools/mod_launcher.py',
                      'tools/parity_cache.py', 'tools/release_bundle.py',
-                     'tests/companion_suite_e2e.py', 'docker/Dockerfile',
+                     'tests/companion_suite_e2e.py', 'tests/release_bundle_test.py',
+                     'server-files/src/bin/mc_spine_init.rs',
+                     'docs/mod-author-guide.md', 'docker/Dockerfile',
                      'docker/entrypoint.sh', 'docs/operator-guide.md',
                      'docs/architecture-crates.md', 'docs/release-checklist.md',
                      '.github/workflows/pages.yml',
@@ -69,6 +132,21 @@ def test_export(from_worktree):
         assert not generated, generated[:5]
         assert not list(out.rglob('world_overlay*.bin*')), 'world_overlay artifact exported'
         check_docs(out)
+        check_public_licenses(out)
+        check_exported_bundle(out, Path(tmp))
+
+        # Both forbidden proprietary license identifiers must fail the real
+        # strict-public gate even if planted after a clean public export.
+        manifest_path = out / 'client-app/Cargo.toml'
+        original = manifest_path.read_bytes()
+        for incompatible in ('ARR', 'PolyForm-Shield-1.0.0'):
+            poisoned = re.sub(r'(?m)^license\s*=.*$',
+                              f'license = "{incompatible}"', original.decode())
+            assert poisoned != original.decode()
+            manifest_path.write_text(poisoned)
+            assert 'incompatible license' in run(out, *strict, expect=1), incompatible
+        manifest_path.write_bytes(original)
+        run(out, *strict)
 
         assert 'not empty' in run(ROOT, EXPORT, '--out', out, expect=1)
         path = 'config_packets.bin'

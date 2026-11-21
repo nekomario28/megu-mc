@@ -22,12 +22,20 @@ Inside the tarball every member lives under the single directory
   <prefix>/<binary basename>                     each release binary (0755)
   <prefix>/LICENSE, COPYING.LESSER, COPYING.AGPL, NOTICE,
       LICENSING.md, THIRD_PARTY.md, README.md    (0644)
+  <prefix>/docs/mod-author-guide.md              (0644)
   <prefix>/tools/vanilla_data/gen_vanilla_data.sh
   <prefix>/tools/vanilla_data/version_pack.py
   <prefix>/tools/mod_launcher.py
   <prefix>/tools/megu_start.py
   <prefix>/tools/megu_translate.py               public setup/translation and
                                                  data regeneration helpers
+
+The five-binary release suite is `mc-spine` plus `mc-spine-client`,
+`mc-spine-mod-check`, `mc-spine-world-migrate` and `mc-spine-init`. Pass the
+server as `--binary` and each of the other four as `--extra-binary`, for example
+from the same Cargo release directory. Each binary is recorded independently
+in `release-manifest.json` under `files`, with its SHA-256, size and mode.
+The CLI also supports single-binary bundles and other companion binaries.
 
 Determinism: members are sorted by name, written to a USTAR archive with
 mtime 0, uid/gid 0, empty uname/gname and modes normalised to 0644/0755, and
@@ -93,6 +101,7 @@ REQUIRED_DOCS = (
     "LICENSING.md",
     "THIRD_PARTY.md",
     "README.md",
+    "docs/mod-author-guide.md",
 )
 REQUIRED_TOOLS = (
     "tools/vanilla_data/gen_vanilla_data.sh",
@@ -548,7 +557,9 @@ SELFTEST_GIT_SHA = "0" * 39 + "1"
 def _fixture_repo(root):
     """A minimal stand-in repository: the docs/tools build requires, nothing else."""
     for rel in REQUIRED_DOCS:
-        (root / rel).write_text(f"stub {rel} for self-test\n")
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"stub {rel} for self-test\n")
     for rel in REQUIRED_TOOLS:
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -721,7 +732,7 @@ def self_test():
         suite_dir = Path(tmp) / "suite-bin"
         suite_dir.mkdir()
         suite_names = ("mc-spine-client", "mc-spine-mod-check",
-                       "mc-spine-world-migrate")
+                       "mc-spine-world-migrate", "mc-spine-init")
         suite_flags = []
         for suite_name in suite_names:
             suite_path = suite_dir / suite_name
@@ -748,6 +759,8 @@ def self_test():
         check("manifest: every suite binary records mode 0755",
               all(modes[f"{prefix}/{name}"] == "0755"
                   for name in (PRODUCT, *suite_names)))
+        check("manifest: mod author guide records mode 0644",
+              modes[f"{prefix}/docs/mod-author-guide.md"] == "0644")
 
         # The same fail-closed guard covers companion binaries: duplicate
         # basenames, artifact-name collisions, doc shadows, forbidden names and
