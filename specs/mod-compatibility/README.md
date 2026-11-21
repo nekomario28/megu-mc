@@ -41,6 +41,8 @@ Normal Fabric player/adult-cow landing is verified with the original Seed Protec
 
 The bounded NeoForge event adapter now uses actual upstream game-bus and FarmlandTrampleEvent classes with the original Seed Protect HetyfPep JAR. One guarded native commit and JVM owner serve both loaders (with `DimId` scoping). Five normal-server modes and four startup refusals pass, as do real event-bus contract checks. Full FML discovery/bootstrap and a full NeoForge reference remain NOT RUN. Next, close broader collision/crop coverage and proceed along the staged NeoForge S0–S3+ architecture in [neoforge-architecture.md](neoforge-architecture.md) (starting with S0 `shimcheck`).
 
+For heavyweight factory/automation mods (Create 6.x class), see the finalized hybrid Rust-first architecture in [create-mod-strategy.md](create-mod-strategy.md) backed by the six clean-room native kernels in [s5-offload-kernels.md](s5-offload-kernels.md).
+
 ## Sources
 
 - [Fabric Loader architecture](https://wiki.fabricmc.net/documentation:fabric_loader) and pinned `0.19.5` JAR interfaces.
