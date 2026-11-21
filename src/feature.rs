@@ -5929,6 +5929,17 @@ fn load_freg() -> FReg {
 
     let sources = jparse(include_bytes!("../assets/feature_order_1211.json"))
         .expect("native biome-source iteration");
+    // A server rooted at a directory with no `datapacks/` tree at all — the
+    // wire-test layout, where the working directory carries only `assets` and
+    // `config_packets.bin` — loads zero biome files, so `bsteps` is empty and
+    // every preset entry would trip the `expect` below on the tick thread.
+    // That is an empty-registry bootstrap, not corrupt data: skip the order
+    // build and leave `order`/`step_entries` empty. The fail-closed contract
+    // is unchanged: once *any* generation settings loaded, a possible biome
+    // without them still panics instead of silently ordering nothing.
+    if reg.bsteps.is_empty() {
+        return reg;
+    }
     for preset in [
         NoisePreset::Overworld,
         NoisePreset::Nether,
@@ -6111,6 +6122,45 @@ pub(crate) fn choose_supported_hostile(biome: &str, roll: u64) -> Option<&'stati
         point -= s.weight as i64;
     }
     None
+}
+
+#[cfg(test)]
+mod empty_registry_tests {
+    /// The wire-test harness runs `mc-spine` from a scratch working directory
+    /// that carries only `assets` and `config_packets.bin`, so `Gen::packs()`
+    /// sees no `datapacks/` tree and every datapack inventory — biome files
+    /// included — comes back empty. `load_freg` must still build an (empty)
+    /// registry there: before the guard it panicked on the first
+    /// `feature_order_1211.json` biome that `bsteps` could never contain, which
+    /// is how the live server's tick thread died on the first natural-spawn
+    /// pass (`spawners_for` → `freg()` → `expect("possible biome generation
+    /// settings")`). The fail-closed arm is the opposite case — a registry
+    /// that loaded *some* generation settings but not a listed possible biome
+    /// — and stays pinned by the unchanged `expect` inside the loop.
+    #[test]
+    fn load_freg_without_datapacks_builds_empty_registry() {
+        let _gen = crate::worldgen::lock_gen_for_tests();
+        // Restore cwd even if `load_freg` panics, so the pre-fix failure does
+        // not corrupt the next test's relative paths.
+        struct Cwd(std::path::PathBuf);
+        impl Drop for Cwd {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let scratch =
+            std::env::temp_dir().join(format!("spine-freg-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir(&scratch);
+        std::fs::create_dir(&scratch).unwrap();
+        let _cwd = Cwd(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&scratch).unwrap();
+        let reg = super::load_freg();
+        drop(_cwd);
+        let _ = std::fs::remove_dir(&scratch);
+        assert!(reg.bsteps.is_empty(), "fixture must hide every datapack");
+        assert!(reg.order.is_empty());
+        assert!(reg.step_entries.is_empty());
+    }
 }
 
 fn foliage_noise() -> &'static OSimp {
