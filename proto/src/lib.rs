@@ -24,8 +24,9 @@
 //!   `minecraft:menu`, `minecraft:data_component_type`), plus
 //!   [`table::IdRemapper`] for O(1) id translation between two versions of one
 //!   registry. [`table::ProtocolTable::v767_builtin`] ships the verified 1.21.1
-//!   tables; [`table::ProtocolTable::from_version_pack_json`] loads the same
-//!   shape from normalized DataGenerator reports at runtime.
+//!   tables, [`table::ProtocolTable::v777_builtin`] the 26.3 packet tables;
+//!   [`table::ProtocolTable::from_version_pack_json`] loads the same shape
+//!   from normalized DataGenerator reports at runtime.
 //! * [`codec`] — the canonical packet IR ([`codec::S2CPacket`],
 //!   [`codec::C2SPacket`]), the [`codec::ProtocolCodec`] trait and
 //!   [`codec::CodecV767`], the protocol-767 implementation.
@@ -34,9 +35,13 @@
 //!   loaded 1.21.4 pack), [`router::SessionRemapper`] (per-connection
 //!   registry-id translation) and [`router::VersionRouter`] (codec selection
 //!   by handshake protocol number).
+//! * [`resolver`] — vanilla's `_minecraft._tcp.<host>.` SRV redirect lookup
+//!   and address resolution, pure `std` DNS (RFC 1035/2782).
 
 pub mod codec;
 mod data_v767;
+mod data_v777;
+pub mod resolver;
 pub mod router;
 pub mod table;
 pub mod version;
@@ -46,6 +51,7 @@ pub use codec::{
     C2SPacket, CodecV767, EquipmentSlot, ItemStack, LoginProperty, MenuKind,
     ProtocolCodec, RawComponent, RegistryDataEntry, S2CPacket, TeamInfo, TeamOperation,
 };
+pub use resolver::{resolve as resolve_server_address, ResolveError};
 pub use router::{SessionRemapSummary, SessionRemapper, TableDrivenCodec, VersionRouter};
 pub use table::{IdRemapper, PacketDir, PacketPhase, ProtocolTable, Registry, RemapReport};
 pub use version::{

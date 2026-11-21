@@ -18,6 +18,8 @@ pub enum ProtocolVersion {
     V1_21_4,
     /// Minecraft 1.21.5.
     V1_21_5,
+    /// Minecraft 26.3 — the latest vanilla release in the target set.
+    V26_3,
     /// Any other (snapshot, newer, or older) numeric protocol.
     Custom(i32),
 }
@@ -27,6 +29,7 @@ impl ProtocolVersion {
     pub const V1_21_3_NUMBER: i32 = 768;
     pub const V1_21_4_NUMBER: i32 = 769;
     pub const V1_21_5_NUMBER: i32 = 770;
+    pub const V26_3_NUMBER: i32 = 777;
 
     /// Map a wire/handshake number to the enum, keeping unknown numbers.
     pub fn from_number(number: i32) -> Self {
@@ -35,6 +38,7 @@ impl ProtocolVersion {
             Self::V1_21_3_NUMBER => Self::V1_21_3,
             Self::V1_21_4_NUMBER => Self::V1_21_4,
             Self::V1_21_5_NUMBER => Self::V1_21_5,
+            Self::V26_3_NUMBER => Self::V26_3,
             other => Self::Custom(other),
         }
     }
@@ -46,6 +50,7 @@ impl ProtocolVersion {
             Self::V1_21_3 => Self::V1_21_3_NUMBER,
             Self::V1_21_4 => Self::V1_21_4_NUMBER,
             Self::V1_21_5 => Self::V1_21_5_NUMBER,
+            Self::V26_3 => Self::V26_3_NUMBER,
             Self::Custom(n) => n,
         }
     }
@@ -57,6 +62,7 @@ impl ProtocolVersion {
             Self::V1_21_3 => Some("1.21.3"),
             Self::V1_21_4 => Some("1.21.4"),
             Self::V1_21_5 => Some("1.21.5"),
+            Self::V26_3 => Some("26.3"),
             Self::Custom(_) => None,
         }
     }
@@ -68,6 +74,7 @@ impl ProtocolVersion {
             Self::V1_21_3 => CAP_1_21_3,
             Self::V1_21_4 => CAP_1_21_4,
             Self::V1_21_5 => CAP_1_21_5,
+            Self::V26_3 => CAP_26_3,
             // Unknown versions get the oldest known profile as a conservative
             // baseline; callers that need exact behaviour must check the
             // concrete `protocol_version` field anyway.
@@ -78,7 +85,7 @@ impl ProtocolVersion {
     /// The lowest protocol version the codebase can negotiate.
     pub const MIN_SUPPORTED: i32 = Self::V1_21_1_NUMBER;
     /// The highest protocol version this crate ships a table for.
-    pub const MAX_KNOWN: i32 = Self::V1_21_5_NUMBER;
+    pub const MAX_KNOWN: i32 = Self::V26_3_NUMBER;
 }
 
 impl fmt::Display for ProtocolVersion {
@@ -103,6 +110,12 @@ pub enum RecipeSyncMode {
     FullOnJoin,
     /// Recipes resolve against a versioned catalog as the client asks for them.
     LazyOnDemand,
+    /// The server syncs *recipe displays* — the 26.x `recipe_book_add` /
+    /// `recipe_book_remove` / `recipe_book_settings` clientbound packets —
+    /// instead of the 1.21.x `update_recipes` + `unlock_recipes` pair. The
+    /// client renders the book from display entries; recipe evaluation moved
+    /// server-side.
+    RecipeBookDisplays,
 }
 
 /// Which JSON shape a version's DataGenerator emits for block-state reports,
@@ -116,6 +129,9 @@ pub enum RecipeSyncMode {
 pub enum BlockStateJsonFormat {
     NameString,
     StructuredEntry,
+    /// 26.x reports address each block both by its `minecraft:name` string
+    /// and by numeric id — a loader must accept either keying form.
+    DualNameOrId,
 }
 
 /// Structured facts about one protocol version. Every flag corresponds to a
@@ -129,8 +145,19 @@ pub struct VersionCapabilities {
     pub mc_version: &'static str,
     /// The `DataVersion` world-save number reported by DataGenerator packs.
     pub data_version: u32,
-    /// The data-pack `pack_format` for this release.
+    /// The data-pack `pack_format` for this release — the major component of
+    /// [`VersionCapabilities::data_pack_format_tuple`], kept for callers that
+    /// predate tuple pack formats (1.21.x versions only ever had a bare major
+    /// number, so this remains the whole value for them).
     pub pack_format: u32,
+    /// The data-pack `pack_format` as vanilla's `PackType.SERVER_DATA` version
+    /// reports it: `(major, minor)`. Pre-tuple releases carry minor 0, and
+    /// `major` always equals [`VersionCapabilities::pack_format`].
+    pub data_pack_format_tuple: (u32, u32),
+    /// The resource-pack `pack_format` as `PackType.CLIENT_RESOURCES` reports
+    /// it: `(major, minor)`. Distinct from the data-pack format since vanilla
+    /// numbers the two pack types independently.
+    pub resource_pack_format_tuple: (u32, u32),
     /// How the recipe book synchronizes.
     pub recipe_sync_mode: RecipeSyncMode,
     /// Shape of DataGenerator block-state reports.
@@ -174,6 +201,8 @@ const CAP_1_21_1: VersionCapabilities = VersionCapabilities {
     mc_version: "1.21.1",
     data_version: 3955,
     pack_format: 48,
+    data_pack_format_tuple: (48, 0),
+    resource_pack_format_tuple: (34, 0),
     recipe_sync_mode: RecipeSyncMode::FullOnJoin,
     block_state_json_format: BlockStateJsonFormat::NameString,
     multi_word_light_mask: true,
@@ -188,6 +217,8 @@ const CAP_1_21_3: VersionCapabilities = VersionCapabilities {
     mc_version: "1.21.3",
     data_version: 4082,
     pack_format: 57,
+    data_pack_format_tuple: (57, 0),
+    resource_pack_format_tuple: (42, 0),
     recipe_sync_mode: RecipeSyncMode::FullOnJoin,
     block_state_json_format: BlockStateJsonFormat::StructuredEntry,
     multi_word_light_mask: true,
@@ -202,6 +233,8 @@ const CAP_1_21_4: VersionCapabilities = VersionCapabilities {
     mc_version: "1.21.4",
     data_version: 4189,
     pack_format: 61,
+    data_pack_format_tuple: (61, 0),
+    resource_pack_format_tuple: (46, 0),
     recipe_sync_mode: RecipeSyncMode::FullOnJoin,
     block_state_json_format: BlockStateJsonFormat::StructuredEntry,
     multi_word_light_mask: true,
@@ -216,8 +249,30 @@ const CAP_1_21_5: VersionCapabilities = VersionCapabilities {
     mc_version: "1.21.5",
     data_version: 4325,
     pack_format: 71,
+    data_pack_format_tuple: (71, 0),
+    resource_pack_format_tuple: (55, 0),
     recipe_sync_mode: RecipeSyncMode::FullOnJoin,
     block_state_json_format: BlockStateJsonFormat::StructuredEntry,
+    multi_word_light_mask: true,
+    split_particle_status: true,
+    relative_movement_flags: true,
+    consumable_component: true,
+    player_input_flags: true,
+};
+
+/// 26.3 (protocol 777, `DataVersion` 5023): the latest vanilla release in the
+/// target set. Pack formats went `(major, minor)` upstream — data (121, 0),
+/// resources (97, 1) — and the recipe book moved to recipe-display sync
+/// (`recipe_book_add`/`recipe_book_remove`/`recipe_book_settings`).
+const CAP_26_3: VersionCapabilities = VersionCapabilities {
+    protocol_version: ProtocolVersion::V26_3_NUMBER,
+    mc_version: "26.3",
+    data_version: 5023,
+    pack_format: 121,
+    data_pack_format_tuple: (121, 0),
+    resource_pack_format_tuple: (97, 1),
+    recipe_sync_mode: RecipeSyncMode::RecipeBookDisplays,
+    block_state_json_format: BlockStateJsonFormat::DualNameOrId,
     multi_word_light_mask: true,
     split_particle_status: true,
     relative_movement_flags: true,
@@ -233,10 +288,15 @@ mod tests {
     fn protocol_numbers_round_trip() {
         assert_eq!(ProtocolVersion::from_number(767), ProtocolVersion::V1_21_1);
         assert_eq!(ProtocolVersion::from_number(769), ProtocolVersion::V1_21_4);
+        assert_eq!(ProtocolVersion::from_number(777), ProtocolVersion::V26_3);
         assert_eq!(ProtocolVersion::from_number(999).number(), 999);
         assert_eq!(ProtocolVersion::V1_21_4.number(), 769);
+        assert_eq!(ProtocolVersion::V26_3.number(), 777);
         assert_eq!(ProtocolVersion::V1_21_1.mc_version(), Some("1.21.1"));
+        assert_eq!(ProtocolVersion::V26_3.mc_version(), Some("26.3"));
         assert_eq!(ProtocolVersion::Custom(5).mc_version(), None);
+        assert_eq!(ProtocolVersion::MIN_SUPPORTED, 767);
+        assert_eq!(ProtocolVersion::MAX_KNOWN, 777);
     }
 
     #[test]
@@ -255,5 +315,41 @@ mod tests {
         let custom = ProtocolVersion::Custom(800).capabilities();
         assert_eq!(custom.protocol_version, 800);
         assert_eq!(custom.mc_version, "custom");
+    }
+
+    #[test]
+    fn capabilities_26_3_exact_constants() {
+        let c = ProtocolVersion::V26_3.capabilities();
+        assert_eq!(c.protocol_version, 777);
+        assert_eq!(c.mc_version, "26.3");
+        assert_eq!(c.data_version, 5023);
+        assert_eq!(c.pack_format, 121);
+        assert_eq!(c.data_pack_format_tuple, (121, 0));
+        assert_eq!(c.resource_pack_format_tuple, (97, 1));
+        assert_eq!(c.recipe_sync_mode, RecipeSyncMode::RecipeBookDisplays);
+        assert_eq!(
+            c.block_state_json_format,
+            BlockStateJsonFormat::DualNameOrId
+        );
+        assert!(c.multi_word_light_mask);
+        assert!(c.player_input_flags);
+    }
+
+    #[test]
+    fn pack_format_tuples_track_the_scalar_field() {
+        for v in [
+            ProtocolVersion::V1_21_1,
+            ProtocolVersion::V1_21_3,
+            ProtocolVersion::V1_21_4,
+            ProtocolVersion::V1_21_5,
+            ProtocolVersion::V26_3,
+        ] {
+            let c = v.capabilities();
+            // The legacy scalar stays the data-pack major everywhere.
+            assert_eq!(c.pack_format, c.data_pack_format_tuple.0);
+        }
+        let c = ProtocolVersion::V1_21_1.capabilities();
+        assert_eq!(c.data_pack_format_tuple, (48, 0));
+        assert_eq!(c.resource_pack_format_tuple, (34, 0));
     }
 }

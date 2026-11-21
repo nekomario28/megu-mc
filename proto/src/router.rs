@@ -382,6 +382,18 @@ impl VersionRouter {
         router
     }
 
+    /// Router carrying the two versions of the current target set:
+    /// 1.21.1/767 through [`CodecV767`] and 26.3/777 through a
+    /// [`TableDrivenCodec`] over [`ProtocolTable::v777_builtin`].
+    pub fn with_v767_and_v777() -> Self {
+        let mut router = Self::with_v767_default();
+        router.register(Arc::new(TableDrivenCodec::for_version(
+            ProtocolVersion::V26_3,
+            ProtocolTable::v777_builtin(),
+        )));
+        router
+    }
+
     /// Register `codec` under the protocol number its capabilities declare
     /// ([`VersionCapabilities::protocol_version`]). Re-registering a version
     /// replaces the previous codec — registration order is irrelevant.
@@ -415,7 +427,10 @@ impl VersionRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{C2SPacket, MenuKind, S2CPacket};
+    use crate::codec::{
+        C2SPacket, EquipmentSlot, ItemStack, MenuKind, RawComponent, RegistryDataEntry,
+        S2CPacket, TeamOperation,
+    };
     use crate::table::Registry;
     use crate::wire::{read_frame, ProtoError};
 
@@ -919,5 +934,362 @@ mod tests {
         router.register(Arc::new(codec_769()));
         router.register(Arc::new(codec_769())); // replaces, no dup entry
         assert_eq!(router.supported_versions(), vec![767, 769]);
+    }
+
+    // -- Dual-version 767 + 777 router -----------------------------------------
+
+    fn codec_777() -> TableDrivenCodec {
+        let mut c = TableDrivenCodec::for_version(
+            ProtocolVersion::V26_3,
+            ProtocolTable::v777_builtin(),
+        );
+        c.set_phase(PacketPhase::Play);
+        c
+    }
+
+    #[test]
+    fn router_dual_selects_767_and_777_and_rejects_others() {
+        let router = VersionRouter::with_v767_and_v777();
+        assert_eq!(router.supported_versions(), vec![767, 777]);
+
+        let c767 = router.select(767).unwrap();
+        assert_eq!(c767.capabilities().protocol_version, 767);
+        assert!(!c767.capabilities().player_input_flags);
+        assert_eq!(c767.table().protocol_version(), Some(767));
+
+        let c777 = router.select(777).unwrap();
+        assert_eq!(c777.capabilities().protocol_version, 777);
+        assert_eq!(c777.capabilities().mc_version, "26.3");
+        assert_eq!(c777.capabilities().data_pack_format_tuple, (121, 0));
+        assert!(c777.capabilities().player_input_flags);
+        assert_eq!(c777.table().protocol_version(), Some(777));
+
+        for other in [765, 768, 769, 770, 776, 778] {
+            assert!(matches!(
+                router.select(other).err(),
+                Some(ProtoError::UnsupportedVersion { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn router_dual_routes_handshakes_to_distinct_codecs() {
+        let router = VersionRouter::with_v767_and_v777();
+        for (proto, mc) in [(767, "1.21.1"), (777, "26.3")] {
+            // Same wire id 0x00 in both versions: the codec a handshake
+            // decodes under is what the router selects afterwards.
+            let codec = router.select(proto).unwrap();
+            let mut frame = Vec::new();
+            codec
+                .encode_c2s(
+                    &C2SPacket::Handshake {
+                        protocol_version: proto,
+                        server_address: "example.org".into(),
+                        server_port: 25565,
+                        next_state: 2,
+                    },
+                    &mut frame,
+                )
+                .unwrap();
+            // Fresh codecs start in the handshake phase, so the trait's
+            // `decode_c2s` resolves the frame there.
+            let decoded = codec.decode_c2s(&frame).unwrap();
+            let C2SPacket::Handshake {
+                protocol_version, ..
+            } = decoded
+            else {
+                panic!("expected handshake, got {decoded:?}")
+            };
+            assert_eq!(protocol_version, proto);
+            // The routed codec is the one speaking the negotiated version.
+            let routed = router.select(protocol_version).unwrap();
+            assert_eq!(routed.capabilities().mc_version, mc);
+        }
+    }
+
+    /// `(packet, 767 wire id, 777 wire id)` for the canonical S2C surface.
+    #[test]
+    fn router_dual_s2c_packets_roundtrip_with_distinct_ids() {
+        let router = VersionRouter::with_v767_and_v777();
+        let mut c767 = CodecV767::new();
+        c767.set_phase(PacketPhase::Play);
+        let c777 = codec_777();
+        // Prove the selected codecs are the two different implementations.
+        let selected767 = router.select(767).unwrap();
+        let selected777 = router.select(777).unwrap();
+        assert_eq!(selected767.capabilities().protocol_version, 767);
+        assert_eq!(selected777.capabilities().protocol_version, 777);
+
+        let damage_767 = ProtocolTable::v767_builtin()
+            .registry_id("minecraft:data_component_type", "minecraft:damage")
+            .unwrap();
+        let damage_777 = ProtocolTable::v777_builtin()
+            .registry_id("minecraft:data_component_type", "minecraft:damage")
+            .unwrap();
+        assert_ne!(damage_767, damage_777); // registry renumbered, names didn't
+
+        let stack_for = |damage: u32| ItemStack {
+            item_id: 1,
+            count: 1,
+            added: vec![RawComponent {
+                type_id: damage,
+                data: vec![0x2a], // VarInt 42
+            }],
+            removed: vec![],
+        };
+
+        let cases: [(S2CPacket, S2CPacket, u32, u32, PacketPhase); 11] = [
+            // (767 form, 777 form, expected 767 id, expected 777 id, phase)
+            (
+                S2CPacket::KeepAlive { id: -42 },
+                S2CPacket::KeepAlive { id: -42 },
+                0x26,
+                45,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::TickingState {
+                    tick_rate: 20.0,
+                    is_frozen: true,
+                },
+                S2CPacket::TickingState {
+                    tick_rate: 20.0,
+                    is_frozen: true,
+                },
+                0x71,
+                130,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::TickingStep { steps: 7 },
+                S2CPacket::TickingStep { steps: 7 },
+                0x72,
+                131,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::SetPlayerTeam {
+                    name: "alpha".into(),
+                    operation: TeamOperation::AddMembers {
+                        members: vec!["steve".into()],
+                    },
+                },
+                S2CPacket::SetPlayerTeam {
+                    name: "alpha".into(),
+                    operation: TeamOperation::AddMembers {
+                        members: vec!["steve".into()],
+                    },
+                },
+                0x60,
+                111,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::SetEquipment {
+                    entity_id: 99,
+                    slots: vec![EquipmentSlot {
+                        slot: 5,
+                        item: stack_for(damage_767),
+                    }],
+                },
+                S2CPacket::SetEquipment {
+                    entity_id: 99,
+                    slots: vec![EquipmentSlot {
+                        slot: 5,
+                        item: stack_for(damage_777),
+                    }],
+                },
+                0x5b,
+                104,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::SetPassengers {
+                    vehicle: 8,
+                    passengers: vec![1, 2],
+                },
+                S2CPacket::SetPassengers {
+                    vehicle: 8,
+                    passengers: vec![1, 2],
+                },
+                0x5f,
+                109,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::OpenScreen {
+                    container_id: 3,
+                    menu: MenuKind::Anvil,
+                    title: text_component("anvil"),
+                },
+                S2CPacket::OpenScreen {
+                    container_id: 3,
+                    menu: MenuKind::Anvil,
+                    title: text_component("anvil"),
+                },
+                0x33,
+                60,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::TabList {
+                    header: text_component("h"),
+                    footer: text_component("f"),
+                },
+                S2CPacket::TabList {
+                    header: text_component("h"),
+                    footer: text_component("f"),
+                },
+                0x6d,
+                125,
+                PacketPhase::Play,
+            ),
+            (
+                S2CPacket::ConfigRegistryData {
+                    registry_id: "minecraft:dimension_type".into(),
+                    entries: vec![RegistryDataEntry {
+                        entry_id: "minecraft:overworld".into(),
+                        data: None,
+                    }],
+                },
+                S2CPacket::ConfigRegistryData {
+                    registry_id: "minecraft:dimension_type".into(),
+                    entries: vec![RegistryDataEntry {
+                        entry_id: "minecraft:overworld".into(),
+                        data: None,
+                    }],
+                },
+                0x07,
+                0x07, // registry_data kept id 7 between 767 and 777
+                PacketPhase::Configuration,
+            ),
+            (
+                S2CPacket::ConfigKeepAlive { id: 4242 },
+                S2CPacket::ConfigKeepAlive { id: 4242 },
+                0x04,
+                0x04,
+                PacketPhase::Configuration,
+            ),
+            (
+                S2CPacket::LoginSuccess {
+                    uuid: [0x55; 16],
+                    username: "steve".into(),
+                    properties: vec![],
+                },
+                S2CPacket::LoginSuccess {
+                    uuid: [0x55; 16],
+                    username: "steve".into(),
+                    properties: vec![],
+                },
+                0x02,
+                0x02,
+                PacketPhase::Login,
+            ),
+        ];
+
+        for (p767, p777, id767, id777, phase) in cases {
+            let mut f767 = Vec::new();
+            let mut f777 = Vec::new();
+            c767.encode_s2c(&p767, &mut f767).unwrap();
+            c777.encode_s2c(&p777, &mut f777).unwrap();
+            // The router-selected codecs emit identical frames — the Arc they
+            // hand out is a live codec, not just a registry entry.
+            let mut s767 = Vec::new();
+            let mut s777 = Vec::new();
+            selected767.encode_s2c(&p767, &mut s767).unwrap();
+            selected777.encode_s2c(&p777, &mut s777).unwrap();
+            assert_eq!(s767, f767);
+            assert_eq!(s777, f777);
+            let (w767, body767) = read_frame(&f767).unwrap();
+            let (w777, body777) = read_frame(&f777).unwrap();
+            assert_eq!((w767, w777), (id767 as i32, id777 as i32));
+            if p767 == p777 {
+                assert_eq!(body767, body777, "body drift on {p767:?}");
+            }
+            assert_eq!(c767.decode_s2c_in(phase, &f767).unwrap(), p767);
+            assert_eq!(c777.decode_s2c_in(phase, &f777).unwrap(), p777);
+        }
+    }
+
+    #[test]
+    fn router_dual_player_input_wire_shapes_differ() {
+        let router = VersionRouter::with_v767_and_v777();
+        let mut c767 = CodecV767::new();
+        c767.set_phase(PacketPhase::Play);
+        let c777 = codec_777();
+        assert_eq!(router.select(767).unwrap().capabilities().protocol_version, 767);
+        assert_eq!(router.select(777).unwrap().capabilities().protocol_version, 777);
+
+        // 767: id 0x26, `f32 sideways, f32 forward, u8 flags`.
+        let mut f767 = Vec::new();
+        c767
+            .encode_c2s(
+                &C2SPacket::PlayerInput {
+                    sideways: -0.5,
+                    forward: 0.98,
+                    jump: true,
+                    unmount: false,
+                },
+                &mut f767,
+            )
+            .unwrap();
+        let (id767, body767) = read_frame(&f767).unwrap();
+        assert_eq!(id767, 0x26);
+        assert_eq!(body767.len(), 9);
+        assert_eq!(
+            c767.decode_c2s_in(PacketPhase::Play, &f767).unwrap(),
+            C2SPacket::PlayerInput {
+                sideways: -0.5,
+                forward: 0.98,
+                jump: true,
+                unmount: false,
+            }
+        );
+
+        // 777: id 43, one `Input` flag byte — decoded as PlayerInputFlags.
+        let flags = C2SPacket::PlayerInputFlags {
+            forward: true,
+            backward: false,
+            left: false,
+            right: true,
+            jump: true,
+            shift: false,
+            sprint: true,
+        };
+        let mut f777 = Vec::new();
+        c777.encode_c2s(&flags, &mut f777).unwrap();
+        let (id777, body777) = read_frame(&f777).unwrap();
+        assert_eq!(id777, 43);
+        assert_eq!(body777, &[0x01 | 0x08 | 0x10 | 0x40]);
+        assert_eq!(
+            c777.decode_c2s_in(PacketPhase::Play, &f777).unwrap(),
+            flags
+        );
+
+        // The float IR under 777 quantizes to the same flag form.
+        let mut f = Vec::new();
+        c777
+            .encode_c2s(
+                &C2SPacket::PlayerInput {
+                    sideways: -1.0,
+                    forward: 1.0,
+                    jump: false,
+                    unmount: true,
+                },
+                &mut f,
+            )
+            .unwrap();
+        assert_eq!(
+            c777.decode_c2s_in(PacketPhase::Play, &f).unwrap(),
+            C2SPacket::PlayerInputFlags {
+                forward: true,
+                backward: false,
+                left: false,
+                right: true,
+                jump: false,
+                shift: true,
+                sprint: false,
+            }
+        );
     }
 }

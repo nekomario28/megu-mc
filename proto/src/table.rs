@@ -23,6 +23,7 @@ use std::fmt;
 use crate::data_v767::{
     V767_BLOCKS, V767_COMPONENTS, V767_ENTITY_TYPES, V767_ITEMS, V767_MENUS, V767_PACKETS,
 };
+use crate::data_v777::{V777_COMPONENTS, V777_MENUS, V777_PACKETS};
 use crate::wire::ProtoError;
 
 /// The five protocol phases a connection moves through.
@@ -215,6 +216,37 @@ impl ProtocolTable {
         table.insert_registry(
             "minecraft:data_component_type",
             Registry::from_dense_names(&V767_COMPONENTS),
+        );
+        table
+    }
+
+    /// The builtin Protocol 777 (Minecraft 26.3) table.
+    ///
+    /// Packet ids are the values the vanilla 26.3 DataGenerator `packets`
+    /// report assigns (transcribed via the MIT-licensed `horizon-protocol`
+    /// `ids.rs`) — every phase/direction, including the 26.x additions
+    /// (`recipe_book_add`, `entity_position_sync`, `waypoint`, `clear_dialog`,
+    /// `client_tick_end`, `player_loaded`…). Registries are deliberately
+    /// narrower: `minecraft:menu` holds the menu types the canonical IR
+    /// models, and `minecraft:data_component_type` the codec-facing accepted
+    /// subset. `minecraft:block`, `minecraft:item` and
+    /// `minecraft:entity_type` are absent on purpose — they are
+    /// DataGenerator-report data that arrive through
+    /// [`ProtocolTable::from_version_pack_json`], and their absence makes a
+    /// 767<->777 [`IdRemapper`]/`SessionRemapper` build fail closed instead
+    /// of fabricating 26.3 ids.
+    pub fn v777_builtin() -> Self {
+        let mut table = Self::new();
+        table.protocol_version = Some(777);
+        for (phase, dir, name, id) in V777_PACKETS {
+            table
+                .insert_packet(phase, dir, name, id)
+                .expect("builtin 777 packet table contains a duplicate");
+        }
+        table.insert_registry("minecraft:menu", Registry::from_dense_names(&V777_MENUS));
+        table.insert_registry(
+            "minecraft:data_component_type",
+            Registry::from_dense_names(&V777_COMPONENTS),
         );
         table
     }
@@ -907,6 +939,193 @@ mod tests {
             .packet_name(PacketPhase::Play, PacketDir::Clientbound, 0x7c)
             .is_none());
         assert!(t.registry_name("minecraft:item", 1333).is_none());
+    }
+
+    // -- builtin 26.3 table ---------------------------------------------------
+
+    #[test]
+    fn v777_packet_ids_match_the_26_3_report() {
+        let t = ProtocolTable::v777_builtin();
+        assert_eq!(t.protocol_version(), Some(777));
+        let s2c = |name| t.packet_id(PacketPhase::Play, PacketDir::Clientbound, name);
+        // Every id below is the 26.3 DataGenerator packets-report value.
+        assert_eq!(s2c("keep_alive"), Some(45));
+        assert_eq!(s2c("login"), Some(50));
+        assert_eq!(s2c("light_update"), Some(49));
+        assert_eq!(s2c("open_screen"), Some(60));
+        assert_eq!(s2c("set_equipment"), Some(104));
+        assert_eq!(s2c("set_passengers"), Some(109));
+        assert_eq!(s2c("set_player_team"), Some(111));
+        assert_eq!(s2c("tab_list"), Some(125));
+        assert_eq!(s2c("ticking_state"), Some(130));
+        assert_eq!(s2c("ticking_step"), Some(131));
+        assert_eq!(s2c("entity_position_sync"), Some(35));
+        assert_eq!(s2c("recipe_book_add"), Some(75));
+        assert_eq!(s2c("waypoint"), Some(141));
+        assert_eq!(s2c("show_dialog"), Some(143));
+        let c2s = |name| t.packet_id(PacketPhase::Play, PacketDir::Serverbound, name);
+        assert_eq!(c2s("accept_teleportation"), Some(0));
+        assert_eq!(c2s("keep_alive"), Some(28));
+        assert_eq!(c2s("move_vehicle"), Some(34));
+        assert_eq!(c2s("paddle_boat"), Some(35));
+        assert_eq!(c2s("player_input"), Some(43));
+        assert_eq!(c2s("client_tick_end"), Some(13));
+        assert_eq!(c2s("player_loaded"), Some(44));
+        assert_eq!(c2s("use_item"), Some(67));
+        assert_eq!(c2s("custom_click_action"), Some(68));
+        // The other phases.
+        assert_eq!(
+            t.packet_id(PacketPhase::Handshake, PacketDir::Serverbound, "handshake"),
+            Some(0x00)
+        );
+        assert_eq!(
+            t.packet_id(PacketPhase::Login, PacketDir::Clientbound, "login_success"),
+            Some(0x02)
+        );
+        assert_eq!(
+            t.packet_id(PacketPhase::Login, PacketDir::Clientbound, "encryption_request"),
+            Some(0x01)
+        );
+        assert_eq!(
+            t.packet_id(PacketPhase::Login, PacketDir::Clientbound, "set_compression"),
+            Some(0x03)
+        );
+        assert_eq!(
+            t.packet_id(
+                PacketPhase::Configuration,
+                PacketDir::Clientbound,
+                "registry_data"
+            ),
+            Some(0x07)
+        );
+        assert_eq!(
+            t.packet_id(
+                PacketPhase::Configuration,
+                PacketDir::Clientbound,
+                "code_of_conduct"
+            ),
+            Some(0x14)
+        );
+        assert_eq!(
+            t.packet_id(
+                PacketPhase::Configuration,
+                PacketDir::Serverbound,
+                "accept_code_of_conduct"
+            ),
+            Some(0x09)
+        );
+        // Full-table sizes pin the whole 777 surface.
+        assert_eq!(
+            t.packet_registry(PacketPhase::Play, PacketDir::Clientbound)
+                .unwrap()
+                .len(),
+            144
+        );
+        assert_eq!(
+            t.packet_registry(PacketPhase::Play, PacketDir::Serverbound)
+                .unwrap()
+                .len(),
+            69
+        );
+        assert_eq!(
+            t.packet_registry(PacketPhase::Configuration, PacketDir::Clientbound)
+                .unwrap()
+                .len(),
+            21
+        );
+        assert_eq!(
+            t.packet_registry(PacketPhase::Configuration, PacketDir::Serverbound)
+                .unwrap()
+                .len(),
+            10
+        );
+    }
+
+    #[test]
+    fn v777_ids_are_dense_and_distinct_from_767() {
+        let t = ProtocolTable::v777_builtin();
+        // No sparse holes inside the wire range: every id below len has a
+        // name, so the table is a complete dense map per (phase, dir). The
+        // handshake registry is deliberately sparse (0x00 + 0xfe legacy).
+        for (phase, dir) in [
+            (PacketPhase::Status, PacketDir::Serverbound),
+            (PacketPhase::Status, PacketDir::Clientbound),
+            (PacketPhase::Login, PacketDir::Serverbound),
+            (PacketPhase::Login, PacketDir::Clientbound),
+            (PacketPhase::Configuration, PacketDir::Serverbound),
+            (PacketPhase::Configuration, PacketDir::Clientbound),
+            (PacketPhase::Play, PacketDir::Serverbound),
+            (PacketPhase::Play, PacketDir::Clientbound),
+        ] {
+            let reg = t.packet_registry(phase, dir).unwrap();
+            for id in 0..reg.len() {
+                assert!(
+                    reg.name(id).is_some(),
+                    "hole at {phase}/{dir}/{id} in the 777 table"
+                );
+            }
+        }
+        // The same packets moved ids between 1.21.1 and 26.3.
+        let t767 = ProtocolTable::v767_builtin();
+        for name in [
+            "keep_alive",
+            "open_screen",
+            "set_equipment",
+            "set_passengers",
+            "set_player_team",
+            "tab_list",
+            "ticking_state",
+            "ticking_step",
+            "login",
+        ] {
+            let a = t767.packet_id(PacketPhase::Play, PacketDir::Clientbound, name);
+            let b = t.packet_id(PacketPhase::Play, PacketDir::Clientbound, name);
+            assert!(a.is_some() && b.is_some() && a != b, "{name}: {a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn v777_registries_cover_the_codec_surface() {
+        let t = ProtocolTable::v777_builtin();
+        // Menus resolve for the OpenScreen IR — same stable ids as 767.
+        for (name, id) in [
+            ("minecraft:anvil", 8),
+            ("minecraft:crafter_3x3", 7),
+            ("minecraft:stonecutter", 24),
+        ] {
+            assert_eq!(t.registry_id("minecraft:menu", name), Some(id), "{name}");
+        }
+        // The component registry is the codec-facing subset.
+        for name in [
+            "minecraft:damage",
+            "minecraft:custom_name",
+            "minecraft:enchantments",
+            "minecraft:potion_contents",
+            "minecraft:trim",
+        ] {
+            assert!(
+                t.registry_id("minecraft:data_component_type", name).is_some(),
+                "{name} missing from the 777 component subset"
+            );
+        }
+        // `food` no longer exists in 26.3 — absent from the subset too.
+        assert!(t
+            .registry_id("minecraft:data_component_type", "minecraft:food")
+            .is_none());
+        // The absent full registries fail lookups closed.
+        assert!(t.registry("minecraft:block").is_none());
+        assert!(t.registry("minecraft:item").is_none());
+        assert!(t.registry("minecraft:entity_type").is_none());
+    }
+
+    #[test]
+    fn v767_to_v777_session_remap_fails_closed() {
+        // The 777 builtin deliberately carries no block/item/entity tables:
+        // a session remap cannot invent 26.3 registry ids.
+        let canonical = ProtocolTable::v767_builtin();
+        let wire = ProtocolTable::v777_builtin();
+        let remapper = crate::router::SessionRemapper::build(&canonical, &wire);
+        assert!(matches!(remapper, Err(ProtoError::VersionPack(_))));
     }
 
     // -- version-pack JSON loader --------------------------------------------
