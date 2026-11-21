@@ -108,6 +108,14 @@
 //!   dimension/size bounds, per-player quotas, SHA-256 dedup, canvas
 //!   placement tracking, and chunked `MDIA` wire framing with verified
 //!   out-of-order reassembly for immersive-painting/camera mods.
+//! - [`loader_extensions`]: generic NeoForge/Fabric 1.21.1 loader
+//!   extensions — `quilt.mod.json` parsing, bounded recursive
+//!   `META-INF/jarjar/` Jar-in-Jar inspection, `accesstransformer.cfg`
+//!   directives with JVM-bridge classification, the
+//!   `fabric:registry/sync/direct` wire codec, `tags/fluid` loading,
+//!   NeoForge `data_maps` + `neoforge/biome_modifier` documents, and the
+//!   ten `c:` conventional tag families with `forge:`/`neoforge:` alias
+//!   resolution over a Vanilla 1.21.1 baseline.
 //! - [`unified_bundle`]: shrink-to-generic `mc-spine-mod-bundle/1`
 //!   declarative mod bundle — one pure-JSON document declaring a mod's
 //!   portals, progression barriers, biome regions, creature specs, and
@@ -129,6 +137,7 @@ pub mod dep_resolver;
 pub mod dimension_mod;
 pub mod ecosystem_compat;
 pub mod fallback;
+pub mod loader_extensions;
 pub mod mixin_lifter;
 pub mod mine_cut_all;
 pub mod modpack;

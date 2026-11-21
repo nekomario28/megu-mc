@@ -31,6 +31,7 @@ use std::fmt;
 
 use crate::data_loader::{parse_json, JsonValue};
 use crate::fallback::is_builtin_superseded_mod;
+use crate::loader_extensions::{self, JarExtensionReport};
 use crate::modpack;
 use crate::version_compat::VersionRange;
 
@@ -1132,6 +1133,12 @@ pub struct ModJarDescriptor {
     pub entrypoints: Vec<String>,
     /// Merged dependency table (`required` wins on id collisions).
     pub dependencies: Vec<ModDependency>,
+    /// Secondary loader-extension surface of the JAR: `quilt.mod.json`
+    /// contents (the `loader` field still reports the Fabric-family
+    /// ecosystem for Quilt-only archives), the bounded
+    /// `META-INF/jarjar/` scan, and any `accesstransformer.cfg`
+    /// directives — see [`crate::loader_extensions::inspect_jar_extensions`].
+    pub extensions: JarExtensionReport,
 }
 
 /// Error produced by [`scan_mod_jar`]. Every variant is fail-closed: the
@@ -2249,7 +2256,18 @@ pub fn scan_mod_jar_named(
         })
         .transpose()?;
 
-    if fabric.is_none() && forge.is_none() {
+    // Secondary loader-extension surface: `quilt.mod.json`, bounded
+    // `META-INF/jarjar/` nested-JAR scan, and `accesstransformer.cfg` —
+    // every parse failure is fail-closed like the primary manifests.
+    let extensions = loader_extensions::inspect_jar_extensions_with(
+        jar_bytes,
+        display,
+        &entries,
+    )
+    .map_err(|e| jar_err(e.reason()))?;
+    let quilt = extensions.quilt.clone();
+
+    if fabric.is_none() && forge.is_none() && quilt.is_none() {
         if has_pack_mcmeta || has_data_dir {
             return Ok(ModJarDescriptor {
                 loader: ModLoaderKind::DatapackOnly,
@@ -2261,22 +2279,30 @@ pub fn scan_mod_jar_named(
                 mixin_configs: Vec::new(),
                 entrypoints: Vec::new(),
                 dependencies: Vec::new(),
+                extensions,
             });
         }
         return Err(jar_err(format!(
-            "{display}: no loader manifest (fabric.mod.json / META-INF/*.mods.toml) and no datapack evidence"
+            "{display}: no loader manifest (fabric.mod.json / quilt.mod.json / META-INF/*.mods.toml) and no datapack evidence"
         )));
     }
 
-    let loader = match (&fabric, &forge, forge_file) {
-        (Some(_), Some(_), _) => ModLoaderKind::DualFabricNeoForge,
-        (Some(_), None, _) => ModLoaderKind::Fabric,
-        (None, Some(_), true) => ModLoaderKind::NeoForge,
-        (None, Some(_), false) => ModLoaderKind::ForgeLegacy,
-        (None, None, _) => unreachable!(),
+    // Quilt is a Fabric-fork toolchain: a `quilt.mod.json`-only JAR joins
+    // the Fabric-family ecosystem (`loader` reports Fabric); paired with a
+    // Forge-family manifest it reads as a unified multi-loader release.
+    let fabricish = fabric.is_some() || quilt.is_some();
+    let loader = match (fabricish, &forge, forge_file) {
+        (true, Some(_), _) => ModLoaderKind::DualFabricNeoForge,
+        (true, None, _) => ModLoaderKind::Fabric,
+        (false, Some(_), true) => ModLoaderKind::NeoForge,
+        (false, Some(_), false) => ModLoaderKind::ForgeLegacy,
+        (false, None, _) => unreachable!(),
     };
 
-    let fab_id = fabric.as_ref().map(|f| f.mod_id.as_str());
+    let fab_id = fabric
+        .as_ref()
+        .map(|f| f.mod_id.as_str())
+        .or_else(|| quilt.as_ref().map(|q| q.mod_id.as_str()));
     let mut declared_mod_ids = Vec::new();
     if let Some(id) = fab_id {
         declared_mod_ids.push(id.to_string());
@@ -2294,19 +2320,27 @@ pub fn scan_mod_jar_named(
     let mod_id = fabric
         .as_ref()
         .map(|f| f.mod_id.clone())
+        .or_else(|| quilt.as_ref().map(|q| q.mod_id.clone()))
         .or_else(|| forge.as_ref().and_then(|f| f.mod_ids.first().cloned()))
         .unwrap_or_default();
     let version = fabric
         .as_ref()
         .map(|f| f.version.clone())
+        .or_else(|| quilt.as_ref().map(|q| q.version.clone()))
         .filter(|v| !v.is_empty())
         .or_else(|| forge.as_ref().map(|f| f.version.clone()))
         .unwrap_or_default();
     let environment = merge_environment(
-        fabric
-            .as_ref()
-            .map(|f| f.environment)
-            .unwrap_or(ModEnvironment::Both),
+        merge_environment(
+            fabric
+                .as_ref()
+                .map(|f| f.environment)
+                .unwrap_or(ModEnvironment::Both),
+            quilt
+                .as_ref()
+                .map(|q| q.environment)
+                .unwrap_or(ModEnvironment::Both),
+        ),
         forge
             .as_ref()
             .map(|f| f.environment)
@@ -2315,6 +2349,7 @@ pub fn scan_mod_jar_named(
     let declared_mc_range = match fabric
         .as_ref()
         .and_then(|f| f.mc_range.clone())
+        .or_else(|| quilt.as_ref().and_then(|q| q.mc_range.clone()))
         .or_else(|| forge.as_ref().and_then(|f| f.mc_range.clone()))
     {
         Some(declared) => Some(VersionRange::parse(&declared).map_err(|e| {
@@ -2332,6 +2367,12 @@ pub fn scan_mod_jar_named(
             .unwrap_or_default()
             .into_iter()
             .chain(
+                quilt
+                    .as_ref()
+                    .map(|q| q.mixin_configs.clone())
+                    .unwrap_or_default(),
+            )
+            .chain(
                 forge
                     .as_ref()
                     .map(|f| f.mixin_configs.clone())
@@ -2340,10 +2381,16 @@ pub fn scan_mod_jar_named(
             .collect(),
     );
     let dependencies = merge_dependencies(
-        fabric
-            .as_ref()
-            .map(|f| f.dependencies.clone())
-            .unwrap_or_default(),
+        merge_dependencies(
+            fabric
+                .as_ref()
+                .map(|f| f.dependencies.clone())
+                .unwrap_or_default(),
+            quilt
+                .as_ref()
+                .map(|q| q.dependencies.clone())
+                .unwrap_or_default(),
+        ),
         forge
             .as_ref()
             .map(|f| f.dependencies.clone())
@@ -2358,8 +2405,19 @@ pub fn scan_mod_jar_named(
         environment,
         declared_mc_range,
         mixin_configs,
-        entrypoints: fabric.map(|f| f.entrypoints).unwrap_or_default(),
+        entrypoints: fabric
+            .map(|f| f.entrypoints)
+            .unwrap_or_default()
+            .into_iter()
+            .chain(
+                quilt
+                    .as_ref()
+                    .map(|q| q.entrypoints.clone())
+                    .unwrap_or_default(),
+            )
+            .collect(),
         dependencies,
+        extensions,
     })
 }
 

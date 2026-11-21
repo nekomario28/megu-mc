@@ -150,6 +150,18 @@ pub fn decode_config_registry_data_0x07(body: &[u8]) -> Option<(String, Vec<Stri
     (cursor == body.len()).then_some((registry, entries))
 }
 
+// The Fabric-family counterpart of the `neoforge:frozen_registry*` frames
+// above: `fabric:registry/sync/direct` carries the same
+// registry→(entry, raw id) snapshot on Fabric API 1.21.1 and reuses this
+// module's VarInt/string primitives (the codec itself lives in
+// `crate::loader_extensions` next to the other loader-extension codecs).
+pub use crate::loader_extensions::{
+    decode_fabric_registry_sync_direct, encode_fabric_registry_sync_direct,
+    FabricRegistrySyncMap, CHANNEL_FABRIC_REGISTRY_SYNC_DIRECT,
+    MAX_FABRIC_REGISTRY_SYNC_BODY_BYTES, MAX_FABRIC_REGISTRY_SYNC_ENTRIES,
+    MAX_FABRIC_REGISTRY_SYNC_REGISTRIES,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
