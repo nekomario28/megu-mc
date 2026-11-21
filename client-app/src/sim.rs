@@ -286,6 +286,8 @@ pub fn script_input(mode: ScriptMode, tick: u32, on_ground: bool) -> TickInput {
 pub struct SessionSummary {
     pub username: String,
     pub server: String,
+    /// Protocol version negotiated for this session (`767` or `777`).
+    pub protocol: i32,
     pub login_ok: bool,
     pub config_ok: bool,
     pub play_ok: bool,
@@ -350,7 +352,7 @@ impl SessionSummary {
             concat!(
                 "{{",
                 "\"status\":\"ok\",",
-                "\"protocol\":767,",
+                "\"protocol\":{},",
                 "\"username\":\"{}\",",
                 "\"server\":\"{}\",",
                 "\"login_ok\":{},",
@@ -401,6 +403,7 @@ impl SessionSummary {
                 "\"buckets_culled\":{}",
                 "}}"
             ),
+            self.protocol,
             escape_json(&self.username),
             escape_json(&self.server),
             self.login_ok,
@@ -457,7 +460,7 @@ impl SessionSummary {
     pub fn to_human(&self) -> String {
         format!(
             concat!(
-                "mc-spine-client session complete (Protocol 767)\n",
+                "mc-spine-client session complete (Protocol {})\n",
                 "  server:        {} (dimension={}, entity_id={})\n",
                 "  handshake:     login={} config={} play={} compression={:?}\n",
                 "  world:         chunks_decoded={} loaded={} unloaded={} batches={} light_updates={} block_updates={} local_light={}\n",
@@ -468,6 +471,7 @@ impl SessionSummary {
                 "  settings:      view_distance={} lod_stored={} lod_fine={} lod_coarse={}\n",
                 "  network:       health={:.1} food={} keep_alives={} rx={} tx={}"
             ),
+            self.protocol,
             self.server,
             self.dimension,
             self.entity_id,
@@ -574,9 +578,17 @@ impl SessionRunner {
                 self.keep_alives += 1;
             }
             PlayEvent::Teleport(tp) => {
-                self.client.send_confirm_teleport(tp.teleport_id)?;
-                self.teleports_0x40 += 1;
+                // Apply first so 26.x can echo the resulting pose back in
+                // `accept_teleportation`; on 767 the wire output is identical.
                 let drift = self.player.apply_teleport(&tp);
+                self.client.send_accept_teleportation(
+                    tp.teleport_id,
+                    self.player.pos,
+                    self.player.yaw,
+                    self.player.pitch,
+                    self.player.on_ground,
+                )?;
+                self.teleports_0x40 += 1;
                 if self.initial_spawn_done {
                     self.corrections_0x40 += 1;
                     if drift > self.max_prediction_drift {
@@ -654,16 +666,21 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         None => offline_uuid(&cfg.username),
     };
     let blocks = BlockTable::load(cfg.assets_json.as_deref());
-    let (client, handshake) = ProtocolClient::connect(
+    let (mut client, handshake) = ProtocolClient::connect_for_version(
         &host,
         port,
         &cfg.username,
         uuid,
         cfg.view_distance,
         Duration::from_secs(15),
+        cfg.mc_version,
     )?;
 
-    let world = WorldState::new(client.dimension.clone(), blocks);
+    let world = match cfg.version_dir.as_deref() {
+        Some(dir) => WorldState::new_from_version_dir(client.dimension.clone(), blocks, dir)?,
+        None => WorldState::new(client.dimension.clone(), blocks),
+    };
+    client.block_state_count = world.state_count;
     // Resolved player settings drive the renderer, the far-terrain LOD
     // radii, and (via `cfg.view_distance`) the requested chunk window.
     let render_config = crate::render::RenderConfig::from_settings(&cfg.client_settings);
@@ -844,6 +861,7 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
     Ok(SessionSummary {
         username: handshake.server_username,
         server: format!("{host}:{port}"),
+        protocol: runner.client.protocol_version.number(),
         login_ok: handshake.login_ok,
         config_ok: handshake.config_ok,
         play_ok: runner.play_ok,

@@ -4,8 +4,11 @@
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use mc_spine_proto::{PacketDir, PacketPhase, ProtocolCodec, RecipeSyncMode};
 
 /// Protocol 767 / Minecraft 1.21.1 — the single canonical version constant,
 /// sourced from `mc-spine-proto` rather than a local literal.
@@ -970,15 +973,56 @@ fn decode_light_section_payload(
     })
 }
 
+/// Version-sensitive knobs for `level_chunk_with_light` decoding: the
+/// block-state bound a version pack declares (`registry.state_count()`) and
+/// whether the heightmaps field is the 1.21.5+ array-of-`Heightmap`-records
+/// form (`false` is the 767 single-NBT-compound form).
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkDecodeProfile {
+    pub state_count: usize,
+    pub heightmaps_are_records: bool,
+}
+
+impl ChunkDecodeProfile {
+    /// The pinned 1.21.1 profile: kernel `STATE_COUNT` + NBT heightmaps.
+    pub fn v767() -> Self {
+        Self {
+            state_count: mc_spine_kernel::STATE_COUNT as usize,
+            heightmaps_are_records: false,
+        }
+    }
+}
+
 pub fn decode_chunk_packet(
     body: &[u8],
     section_count: usize,
     biome_count: usize,
 ) -> Result<DecodedChunk, String> {
+    decode_chunk_packet_profiled(body, section_count, biome_count, ChunkDecodeProfile::v767())
+}
+
+pub fn decode_chunk_packet_profiled(
+    body: &[u8],
+    section_count: usize,
+    biome_count: usize,
+    profile: ChunkDecodeProfile,
+) -> Result<DecodedChunk, String> {
     let mut reader = WireReader::new(body);
     let cx = reader.read_i32()?;
     let cz = reader.read_i32()?;
-    let _heightmaps = reader.read_nbt()?;
+    if profile.heightmaps_are_records {
+        // 1.21.5+ form: VarInt count of {type VarInt, packed long array}.
+        let count = usize::try_from(reader.read_varint()?)
+            .map_err(|_| "negative heightmap count".to_string())?;
+        for _ in 0..count {
+            let _hm_type = reader.read_varint()?;
+            let longs = usize::try_from(reader.read_varint()?)
+                .map_err(|_| "negative heightmap long count".to_string())?;
+            let _ = reader.take(longs * 8)?;
+        }
+    } else {
+        let _heightmaps = reader.read_nbt()?;
+    }
 
     let data_len = usize::try_from(reader.read_varint()?)
         .map_err(|_| "negative chunk data length".to_string())?;
@@ -990,7 +1034,8 @@ pub fn decode_chunk_packet(
     } else {
         (usize::BITS - (biome_count - 1).leading_zeros()) as u8
     };
-    let state_direct_bits = (u32::BITS - (mc_spine_kernel::STATE_COUNT - 1).leading_zeros()) as u8;
+    let state_bound = u32::try_from(profile.state_count.saturating_sub(1)).unwrap_or(u32::MAX);
+    let state_direct_bits = (u32::BITS - state_bound.leading_zeros()) as u8;
 
     let mut sections = Vec::with_capacity(section_count);
     for _ in 0..section_count {
@@ -1174,20 +1219,79 @@ pub struct ProtocolClient {
     stream: TcpStream,
     compression: Option<usize>,
     read_buf: Vec<u8>,
+    /// Version-selected packet table (`ProtocolVersion::V1_21_1` or
+    /// `ProtocolVersion::V26_3`) — every packet id below resolves through it
+    /// by phase/direction/name instead of a hardcoded hex literal.
+    codec: Arc<dyn ProtocolCodec>,
     dimension_types_by_id: HashMap<i32, (i32, i32, bool)>,
     dimension_types_by_name: HashMap<String, (i32, i32, bool)>,
+    /// Upper bound on global block-state ids for `level_chunk_with_light`
+    /// decoding (`mc_spine_kernel::STATE_COUNT` with the pinned assets);
+    /// `sim` reseeds it from `WorldState::state_count` so `--version-dir`
+    /// packs bound the global palette correctly.
+    pub block_state_count: usize,
     pub dimension: DimensionMeta,
     pub biome_count: usize,
-    /// The protocol version this client offered in its handshake — always
-    /// `V1_21_1` (767) today, exposed as the canonical
-    /// `mc_spine_proto::ProtocolVersion` so a future negotiated version
-    /// flows through one type instead of a raw number.
+    /// The protocol version this client offered in its handshake
+    /// (`V1_21_1`/`767` by default, `V26_3`/`777` via `--mc-version`).
     pub protocol_version: mc_spine_proto::ProtocolVersion,
     pub packets_rx: u64,
     pub packets_tx: u64,
 }
 
 impl ProtocolClient {
+    /// True when the selected table carries the 26.x wire profile
+    /// (`RecipeBookDisplays` is the proto's 26.x-generation marker): the
+    /// post-1.21.5 login/play shapes — Game-Profile login success with a
+    /// session id, VarInt game modes + `online_mode` in spawn info, echoed
+    /// `accept_teleportation`, Int teleport flags with velocity fields, the
+    /// heightmap record array, and the `player_input` flags byte.
+    fn wire_26x(&self) -> bool {
+        matches!(
+            self.codec.capabilities().recipe_sync_mode,
+            RecipeSyncMode::RecipeBookDisplays
+        )
+    }
+
+    /// Resolve an inbound `pid` to its protocol-table name for the active
+    /// version — packet ids differ between 767 and 777 (e.g. play
+    /// `keep_alive` is `0x26` vs `0x2d`), so dispatch goes through names.
+    fn s2c_name(&self, phase: PacketPhase, pid: i32) -> Option<String> {
+        let id = u32::try_from(pid).ok()?;
+        self.codec
+            .table()
+            .packet_name(phase, PacketDir::Clientbound, id)
+            .map(str::to_string)
+    }
+
+    /// Resolve an outbound packet name to its id for the active version.
+    fn c2s_id(&self, phase: PacketPhase, name: &'static str) -> Result<i32, String> {
+        self.codec
+            .table()
+            .packet_id(phase, PacketDir::Serverbound, name)
+            .map(|id| id as i32)
+            .ok_or_else(|| {
+                format!(
+                    "protocol table for {:?} lacks c2s {phase:?}/{name}",
+                    self.protocol_version
+                )
+            })
+    }
+
+    fn send_named(
+        &mut self,
+        phase: PacketPhase,
+        name: &'static str,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let pid = self.c2s_id(phase, name)?;
+        self.send_raw(pid, payload)
+    }
+
+    /// Connect, handshake, and ride through Login + Configuration to Play.
+    ///
+    /// Returns `(Self, HandshakeReport)` with the negotiated profile on
+    /// success, or a descriptive error on any wire/parse failure.
     pub fn connect(
         host: &str,
         port: u16,
@@ -1196,9 +1300,69 @@ impl ProtocolClient {
         view_distance: i8,
         timeout: Duration,
     ) -> Result<(Self, HandshakeReport), String> {
+        Self::connect_for_version(
+            host,
+            port,
+            username,
+            uuid,
+            view_distance,
+            timeout,
+            mc_spine_proto::ProtocolVersion::V1_21_1,
+        )
+    }
+
+    /// `connect` at an explicit `ProtocolVersion`: the live `_minecraft._tcp`
+    /// SRV lookup resolves the socket address while the Handshake still
+    /// carries the original `host`/`port` — the vanilla
+    /// `ServerNameResolver` rule.
+    pub fn connect_for_version(
+        host: &str,
+        port: u16,
+        username: &str,
+        uuid: [u8; 16],
+        view_distance: i8,
+        timeout: Duration,
+        protocol_version: mc_spine_proto::ProtocolVersion,
+    ) -> Result<(Self, HandshakeReport), String> {
+        Self::connect_resolved(
+            host,
+            port,
+            username,
+            uuid,
+            view_distance,
+            timeout,
+            protocol_version,
+            |h, p| {
+                mc_spine_proto::resolve_server_address(h, p).map_err(|e| e.to_string())
+            },
+        )
+    }
+
+    /// `connect_for_version` with the `_minecraft._tcp` SRV / address lookup
+    /// injected, so loopback tests can prove both the SRV redirect and the
+    /// original-host-preservation rule without live DNS.
+    pub fn connect_resolved(
+        host: &str,
+        port: u16,
+        username: &str,
+        uuid: [u8; 16],
+        view_distance: i8,
+        timeout: Duration,
+        protocol_version: mc_spine_proto::ProtocolVersion,
+        resolve: impl FnOnce(&str, u16) -> Result<Vec<SocketAddr>, String>,
+    ) -> Result<(Self, HandshakeReport), String> {
+        let codec = mc_spine_proto::VersionRouter::with_v767_and_v777()
+            .select(protocol_version.number())
+            .map_err(|e| e.to_string())?;
+        let addrs = resolve(host, port)?;
+        if addrs.is_empty() {
+            return Err(format!(
+                "resolve_server_address({host}:{port}) yielded no addresses"
+            ));
+        }
         let addr = format!("{host}:{port}");
-        let stream =
-            TcpStream::connect(&addr).map_err(|e| format!("failed to connect to {addr}: {e}"))?;
+        let stream = TcpStream::connect(addrs.as_slice())
+            .map_err(|e| format!("failed to connect to {addr}: {e}"))?;
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(timeout));
         let _ = stream.set_write_timeout(Some(timeout));
@@ -1207,30 +1371,33 @@ impl ProtocolClient {
             stream,
             compression: None,
             read_buf: Vec::new(),
+            codec,
             dimension_types_by_id: HashMap::new(),
             dimension_types_by_name: HashMap::new(),
+            block_state_count: mc_spine_kernel::STATE_COUNT as usize,
             dimension: DimensionMeta::default(),
             biome_count: 64,
-            protocol_version: mc_spine_proto::ProtocolVersion::V1_21_1,
+            protocol_version,
             packets_rx: 0,
             packets_tx: 0,
         };
 
-        // 1. Handshake (0x00, next_state = 2 Login)
+        // 1. Handshake — original host/port even when the SRV lookup
+        //    redirected the TCP target (vanilla ServerNameResolver rule).
         let mut hs = Vec::new();
         write_varint(&mut hs, client.protocol_version.number());
         write_string(&mut hs, host);
         hs.extend_from_slice(&port.to_be_bytes());
         write_varint(&mut hs, 2);
-        client.send_raw(0x00, &hs)?;
+        client.send_named(PacketPhase::Handshake, "handshake", &hs)?;
 
-        // 2. Login Start (0x00)
+        // 2. Login Start
         let mut login = Vec::new();
         write_string(&mut login, username);
         login.extend_from_slice(&uuid);
-        client.send_raw(0x00, &login)?;
+        client.send_named(PacketPhase::Login, "login_start", &login)?;
 
-        // 3. Login loop -> Set Compression (0x03) / Login Success (0x02)
+        // 3. Login loop -> Set Compression / Login Success
         let deadline = Instant::now() + timeout;
         let (server_uuid, server_username) = loop {
             let remaining = deadline
@@ -1239,29 +1406,42 @@ impl ProtocolClient {
             let Some((pid, body)) = client.recv_raw(remaining)? else {
                 return Err("login timed out waiting for server".to_string());
             };
-            match pid {
-                0x00 => {
+            match client.s2c_name(PacketPhase::Login, pid).as_deref() {
+                Some("disconnect") | Some("login_disconnect") => {
                     let msg = WireReader::new(&body)
                         .read_string(32_767)
                         .unwrap_or_else(|_| "login disconnect".to_string());
                     return Err(format!("disconnected during login: {msg}"));
                 }
-                0x01 => {
+                Some("encryption_request") => {
                     return Err(
-                        "server requested online-mode encryption (0x01); offline-mode server required"
+                        "server requested online-mode encryption; offline-mode server required"
                             .to_string(),
                     );
                 }
-                0x03 => {
+                Some("set_compression") | Some("login_compression") => {
                     let threshold = WireReader::new(&body).read_varint()?;
                     client.compression = usize::try_from(threshold).ok();
                 }
-                0x02 => {
+                Some("login_success") | Some("login_finished") => {
                     let mut r = WireReader::new(&body);
                     let got_uuid = r.read_uuid()?;
                     let got_name = r.read_string(64)?;
-                    // Send Login Acknowledged (0x03)
-                    client.send_raw(0x03, &[])?;
+                    if client.wire_26x() {
+                        // 26.x Game Profile properties (name, value, optional
+                        // signature) then a Session ID UUID.
+                        let props = usize::try_from(r.read_varint()?)
+                            .map_err(|_| "negative profile property count".to_string())?;
+                        for _ in 0..props {
+                            let _pname = r.read_string(1024)?;
+                            let _pvalue = r.read_string(32_767)?;
+                            if r.read_bool()? {
+                                let _sig = r.read_string(1024)?;
+                            }
+                        }
+                        let _session_id = r.read_uuid()?;
+                    }
+                    client.send_named(PacketPhase::Login, "login_acknowledged", &[])?;
                     break (got_uuid, got_name);
                 }
                 _ => {}
@@ -1270,7 +1450,8 @@ impl ProtocolClient {
 
         // 4. Configuration loop
         let mut sent_client_info = false;
-        let client_info_payload = build_client_information(view_distance);
+        let client_info_payload =
+            build_client_information(view_distance, client.codec.capabilities());
         let config_deadline = Instant::now() + timeout;
         loop {
             let remaining = config_deadline
@@ -1279,55 +1460,59 @@ impl ProtocolClient {
             let Some((pid, body)) = client.recv_raw(remaining)? else {
                 return Err("configuration timed out waiting for server".to_string());
             };
-            match pid {
-                // Cookie Request (0x00) — or 8-byte keepalive fallback
-                0x00 => {
+            match client.s2c_name(PacketPhase::Configuration, pid).as_deref() {
+                // Cookie Request — or the legacy 8-byte keepalive fallback on
+                // pid 0x00 in the 767 table.
+                Some("cookie_request") => {
                     let mut r = WireReader::new(&body);
                     if let Ok(key) = r.read_string(1024) {
                         if r.remaining() == 0 {
                             let mut resp = Vec::new();
                             write_string(&mut resp, &key);
                             resp.push(0); // has_payload = false
-                            client.send_raw(0x01, &resp)?;
+                            client.send_named(PacketPhase::Configuration, "cookie_response", &resp)?;
                             continue;
                         }
                     }
                     if body.len() == 8 {
-                        client.send_raw(0x04, &body)?;
+                        client.send_named(PacketPhase::Configuration, "keep_alive", &body)?;
                     }
                 }
-                // Configuration Keep Alive (0x04 -> 0x04)
-                0x04 => {
-                    client.send_raw(0x04, &body)?;
+                Some("keep_alive") => {
+                    client.send_named(PacketPhase::Configuration, "keep_alive", &body)?;
                 }
-                // Configuration Disconnect (0x02)
-                0x02 => {
+                Some("disconnect") => {
                     let msg = WireReader::new(&body)
                         .read_nbt()
                         .map(|v| v.extract_text())
                         .unwrap_or_else(|_| "configuration disconnect".to_string());
                     return Err(format!("disconnected during configuration: {msg}"));
                 }
-                // Registry Data (0x07)
-                0x07 => {
+                Some("registry_data") => {
                     client.parse_registry_data(&body)?;
                 }
-                // Select Known Packs (0x0E) -> Client Info (0x00) + Known Packs (0x07)
-                0x0e => {
+                Some("select_known_packs") => {
                     if !sent_client_info {
-                        client.send_raw(0x00, &client_info_payload)?;
+                        client.send_named(
+                            PacketPhase::Configuration,
+                            "client_information",
+                            &client_info_payload,
+                        )?;
                         sent_client_info = true;
                     }
                     let mut packs = Vec::new();
                     write_varint(&mut packs, 0);
-                    client.send_raw(0x07, &packs)?;
+                    client.send_named(PacketPhase::Configuration, "select_known_packs", &packs)?;
                 }
-                // Finish Configuration (0x03) -> Client Info (if unsent) + Ack (0x03)
-                0x03 => {
+                Some("finish_configuration") => {
                     if !sent_client_info {
-                        client.send_raw(0x00, &client_info_payload)?;
+                        client.send_named(
+                            PacketPhase::Configuration,
+                            "client_information",
+                            &client_info_payload,
+                        )?;
                     }
-                    client.send_raw(0x03, &[])?;
+                    client.send_named(PacketPhase::Configuration, "finish_configuration", &[])?;
                     break;
                 }
                 _ => {}
@@ -1386,6 +1571,33 @@ impl ProtocolClient {
         Ok(())
     }
 
+    /// Shared `login`/`respawn` tail: dimension + seed + game modes + flags
+    /// + death location + portal cooldown (+ `sea_level` from 1.21.2). The
+    /// 26.x profile switches the two game modes to VarInt enums.
+    fn parse_spawn_info(&self, r: &mut WireReader<'_>) -> Result<(i32, String), String> {
+        let dim_type_id = r.read_varint()?;
+        let dim_name = r.read_string(256)?;
+        let _hashed_seed = r.read_i64()?;
+        if self.wire_26x() {
+            let _game_mode = r.read_varint()?;
+            let _prev_game_mode = r.read_varint()?; // 0 = undefined, else id+1
+        } else {
+            let _game_mode = r.read_u8()?;
+            let _prev_game_mode = r.read_u8()?;
+        }
+        let _is_debug = r.read_bool()?;
+        let _is_flat = r.read_bool()?;
+        if r.read_bool()? {
+            let _death_dim = r.read_string(256)?;
+            let _death_pos = r.read_i64()?;
+        }
+        let _portal_cooldown = r.read_varint()?;
+        if self.codec.capabilities().relative_movement_flags {
+            let _sea_level = r.read_varint()?;
+        }
+        Ok((dim_type_id, dim_name))
+    }
+
     fn resolve_dimension(&self, dim_type_id: i32, dim_name: String) -> DimensionMeta {
         let (min_y, height, has_skylight) = self
             .dimension_types_by_id
@@ -1411,18 +1623,90 @@ impl ProtocolClient {
         Ok(())
     }
 
+    /// Bare `accept_teleportation` (teleport id only) — the 767 wire form.
+    /// 26.x requires the echoed resulting pose, so version-aware callers use
+    /// `send_accept_teleportation` instead.
     pub fn send_confirm_teleport(&mut self, teleport_id: i32) -> Result<(), String> {
         let mut p = Vec::with_capacity(5);
         write_varint(&mut p, teleport_id);
-        self.send_raw(0x00, &p)
+        self.send_named(PacketPhase::Play, "accept_teleportation", &p)
+    }
+
+    /// Confirm a teleport in the active version's wire shape: 767 sends the
+    /// bare teleport id; 26.x echoes the resulting pose and, like vanilla,
+    /// immediately follows with `move_player_pos_rot`.
+    pub fn send_accept_teleportation(
+        &mut self,
+        teleport_id: i32,
+        pos: [f64; 3],
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+    ) -> Result<(), String> {
+        let mut p = Vec::with_capacity(33);
+        write_varint(&mut p, teleport_id);
+        if !self.wire_26x() {
+            return self.send_named(PacketPhase::Play, "accept_teleportation", &p);
+        }
+        p.extend_from_slice(&pos[0].to_be_bytes());
+        p.extend_from_slice(&pos[1].to_be_bytes());
+        p.extend_from_slice(&pos[2].to_be_bytes());
+        p.extend_from_slice(&yaw.to_be_bytes());
+        p.extend_from_slice(&pitch.to_be_bytes());
+        self.send_named(PacketPhase::Play, "accept_teleportation", &p)?;
+        self.send_player_position_rotation(pos[0], pos[1], pos[2], yaw, pitch, on_ground)
     }
 
     pub fn send_chunk_batch_received(&mut self, chunks_per_tick: f32) -> Result<(), String> {
-        self.send_raw(0x08, &chunks_per_tick.to_be_bytes())
+        self.send_named(
+            PacketPhase::Play,
+            "chunk_batch_received",
+            &chunks_per_tick.to_be_bytes(),
+        )
     }
 
     pub fn send_keep_alive(&mut self, id: i64) -> Result<(), String> {
-        self.send_raw(0x18, &id.to_be_bytes())
+        self.send_named(PacketPhase::Play, "keep_alive", &id.to_be_bytes())
+    }
+
+    /// `player_input` in the active version's shape: 767's float impulse +
+    /// jump/unmount flag byte; 26.x's single `Input` flag byte
+    /// (`caps.player_input_flags`). Flag bits match vanilla `Input`.
+    pub fn send_player_input(
+        &mut self,
+        sideways: f32,
+        forward: f32,
+        jump: bool,
+        unmount: bool,
+    ) -> Result<(), String> {
+        let mut p = Vec::with_capacity(9);
+        if self.codec.capabilities().player_input_flags {
+            let mut bits = 0u8;
+            if forward > 0.0 {
+                bits |= 0x01;
+            }
+            if forward < 0.0 {
+                bits |= 0x02;
+            }
+            if sideways < 0.0 {
+                bits |= 0x04;
+            }
+            if sideways > 0.0 {
+                bits |= 0x08;
+            }
+            if jump {
+                bits |= 0x10;
+            }
+            if unmount {
+                bits |= 0x20;
+            }
+            p.push(bits);
+        } else {
+            p.extend_from_slice(&sideways.to_be_bytes());
+            p.extend_from_slice(&forward.to_be_bytes());
+            p.push(u8::from(jump) | (u8::from(unmount) << 1));
+        }
+        self.send_named(PacketPhase::Play, "player_input", &p)
     }
 
     pub fn send_player_position(
@@ -1432,12 +1716,15 @@ impl ProtocolClient {
         z: f64,
         on_ground: bool,
     ) -> Result<(), String> {
+        // 767 ends with a bare on-ground boolean, 26.x with a flag byte whose
+        // 0x01 bit is on-ground — the encoding is identical for a client that
+        // never reports horizontal collision.
         let mut p = Vec::with_capacity(25);
         p.extend_from_slice(&x.to_be_bytes());
         p.extend_from_slice(&y.to_be_bytes());
         p.extend_from_slice(&z.to_be_bytes());
         p.push(u8::from(on_ground));
-        self.send_raw(0x1a, &p)
+        self.send_named(PacketPhase::Play, "move_player_pos", &p)
     }
 
     pub fn send_player_position_rotation(
@@ -1456,7 +1743,7 @@ impl ProtocolClient {
         p.extend_from_slice(&yaw.to_be_bytes());
         p.extend_from_slice(&pitch.to_be_bytes());
         p.push(u8::from(on_ground));
-        self.send_raw(0x1b, &p)
+        self.send_named(PacketPhase::Play, "move_player_pos_rot", &p)
     }
 
     pub fn recv_play(&mut self, timeout: Duration) -> Result<Option<PlayEvent>, String> {
@@ -1467,8 +1754,8 @@ impl ProtocolClient {
     }
 
     fn decode_play_event(&mut self, pid: i32, body: &[u8]) -> Result<PlayEvent, String> {
-        match pid {
-            0x2b => {
+        match self.s2c_name(PacketPhase::Play, pid).as_deref() {
+            Some("login") => {
                 let mut r = WireReader::new(body);
                 let entity_id = r.read_i32()?;
                 let _is_hardcore = r.read_bool()?;
@@ -1483,7 +1770,10 @@ impl ProtocolClient {
                 let _reduced_debug = r.read_bool()?;
                 let _respawn_screen = r.read_bool()?;
                 let _limited_crafting = r.read_bool()?;
-                let (dim_type_id, dim_name) = parse_spawn_info(&mut r)?;
+                let (dim_type_id, dim_name) = self.parse_spawn_info(&mut r)?;
+                if self.wire_26x() {
+                    let _online_mode = r.read_bool()?;
+                }
                 let _enforces_secure_chat = r.read_bool()?;
                 let dimension = self.resolve_dimension(dim_type_id, dim_name);
                 self.dimension = dimension.clone();
@@ -1492,77 +1782,101 @@ impl ProtocolClient {
                     dimension,
                 })
             }
-            0x47 => {
+            Some("respawn") => {
                 let mut r = WireReader::new(body);
-                let (dim_type_id, dim_name) = parse_spawn_info(&mut r)?;
+                let (dim_type_id, dim_name) = self.parse_spawn_info(&mut r)?;
                 let _data_kept = r.read_u8()?;
                 let dimension = self.resolve_dimension(dim_type_id, dim_name);
                 self.dimension = dimension.clone();
                 Ok(PlayEvent::Respawn { dimension })
             }
-            0x26 => {
+            Some("keep_alive") => {
                 let id = WireReader::new(body).read_i64()?;
                 Ok(PlayEvent::KeepAlive(id))
             }
-            0x40 => {
+            Some("player_position") => {
                 let mut r = WireReader::new(body);
-                let x = r.read_f64()?;
-                let y = r.read_f64()?;
-                let z = r.read_f64()?;
-                let yaw = r.read_f32()?;
-                let pitch = r.read_f32()?;
-                let flags = r.read_u8()?;
-                let teleport_id = r.read_varint()?;
+                let (teleport_id, x, y, z, yaw, pitch, flags) = if self.wire_26x() {
+                    // 26.x: teleport id first, then position/velocity doubles,
+                    // yaw/pitch and an Int relative-flag bitmask.
+                    let teleport_id = r.read_varint()?;
+                    let x = r.read_f64()?;
+                    let y = r.read_f64()?;
+                    let z = r.read_f64()?;
+                    let _vx = r.read_f64()?;
+                    let _vy = r.read_f64()?;
+                    let _vz = r.read_f64()?;
+                    let yaw = r.read_f32()?;
+                    let pitch = r.read_f32()?;
+                    let flags = r.read_i32()?;
+                    (teleport_id, x, y, z, yaw, pitch, flags)
+                } else {
+                    let x = r.read_f64()?;
+                    let y = r.read_f64()?;
+                    let z = r.read_f64()?;
+                    let yaw = r.read_f32()?;
+                    let pitch = r.read_f32()?;
+                    let flags = i32::from(r.read_u8()?);
+                    let teleport_id = r.read_varint()?;
+                    (teleport_id, x, y, z, yaw, pitch, flags)
+                };
                 Ok(PlayEvent::Teleport(TeleportSync {
                     x,
                     y,
                     z,
                     yaw,
                     pitch,
-                    flags,
+                    flags: flags as u8,
                     teleport_id,
                 }))
             }
-            0x0d => Ok(PlayEvent::ChunkBatchStart),
-            0x27 => {
-                let chunk =
-                    decode_chunk_packet(body, self.dimension.section_count(), self.biome_count)?;
+            Some("chunk_batch_start") => Ok(PlayEvent::ChunkBatchStart),
+            Some("level_chunk_with_light") => {
+                let chunk = decode_chunk_packet_profiled(
+                    body,
+                    self.dimension.section_count(),
+                    self.biome_count,
+                    ChunkDecodeProfile {
+                        state_count: self.block_state_count,
+                        heightmaps_are_records: self.wire_26x(),
+                    },
+                )?;
                 Ok(PlayEvent::ChunkData(Box::new(chunk)))
             }
-            0x0c => {
+            Some("chunk_batch_finished") => {
                 let batch_size = WireReader::new(body).read_varint()?;
                 Ok(PlayEvent::ChunkBatchFinished(batch_size))
             }
-            0x2a => {
+            Some("light_update") => {
                 let (cx, cz, light) =
                     decode_update_light_packet(body, self.dimension.section_count())?;
                 Ok(PlayEvent::UpdateLight { cx, cz, light })
             }
-            0x09 => {
+            Some("block_update") => {
                 let mut r = WireReader::new(body);
                 let pos = r.read_position()?;
                 let state_id = u32::try_from(r.read_varint()?)
                     .map_err(|_| "negative block state id".to_string())?;
                 Ok(PlayEvent::BlockUpdate { pos, state_id })
             }
-            0x49 => {
+            Some("section_blocks_update") => {
                 let updates = decode_section_blocks_update(body)?;
                 Ok(PlayEvent::SectionBlocksUpdate(updates))
             }
-            0x21 => {
+            Some("forget_level_chunk") => {
                 let mut r = WireReader::new(body);
-                // Protocol 767 encodes ChunkPos as a big-endian i64: cz in high 32 bits, cx in low 32 bits.
+                // ChunkPos is a big-endian i64: cz in high 32 bits, cx in low 32 bits.
                 let cz = r.read_i32()?;
                 let cx = r.read_i32()?;
                 Ok(PlayEvent::UnloadChunk { cx, cz })
             }
-            0x54 => {
+            Some("set_chunk_cache_center") => {
                 let mut r = WireReader::new(body);
                 let cx = r.read_varint()?;
                 let cz = r.read_varint()?;
                 Ok(PlayEvent::SetCenterChunk { cx, cz })
             }
-            0x5d => {
+            Some("set_health") => {
                 let mut r = WireReader::new(body);
                 let health = r.read_f32()?;
                 let food = r.read_varint()?;
@@ -1573,14 +1887,14 @@ impl ProtocolClient {
                     saturation,
                 })
             }
-            0x1d => {
+            Some("disconnect") => {
                 let msg = WireReader::new(body)
                     .read_nbt()
                     .map(|v| v.extract_text())
                     .unwrap_or_else(|_| "disconnected by server".to_string());
                 Ok(PlayEvent::Disconnect(msg))
             }
-            other => Ok(PlayEvent::Other(other)),
+            _ => Ok(PlayEvent::Other(pid)),
         }
     }
 
@@ -1641,24 +1955,11 @@ impl ProtocolClient {
     }
 }
 
-fn parse_spawn_info(r: &mut WireReader<'_>) -> Result<(i32, String), String> {
-    let dim_type_id = r.read_varint()?;
-    let dim_name = r.read_string(256)?;
-    let _hashed_seed = r.read_i64()?;
-    let _game_mode = r.read_u8()?;
-    let _prev_game_mode = r.read_u8()?;
-    let _is_debug = r.read_bool()?;
-    let _is_flat = r.read_bool()?;
-    if r.read_bool()? {
-        let _death_dim = r.read_string(256)?;
-        let _death_pos = r.read_i64()?;
-    }
-    let _portal_cooldown = r.read_varint()?;
-    Ok((dim_type_id, dim_name))
-}
-
-fn build_client_information(view_distance: i8) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16);
+fn build_client_information(
+    view_distance: i8,
+    caps: &mc_spine_proto::VersionCapabilities,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18);
     write_string(&mut out, "en_us");
     out.push(view_distance as u8);
     write_varint(&mut out, 0); // chat_mode: enabled
@@ -1667,5 +1968,8 @@ fn build_client_information(view_distance: i8) -> Vec<u8> {
     write_varint(&mut out, 1); // main_hand: right
     out.push(0); // enable_text_filtering: false
     out.push(1); // allow_server_listings: true
+    if caps.split_particle_status {
+        write_varint(&mut out, 0); // particle_status: all (1.21.2+)
+    }
     out
 }

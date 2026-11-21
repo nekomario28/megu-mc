@@ -883,14 +883,16 @@ impl StoredSection {
         block_light: [u8; LIGHT_BYTES],
         sky_light: [u8; LIGHT_BYTES],
         blocks: &BlockTable,
+        state_count: usize,
     ) -> Result<Self, String> {
-        let first = states[0].min(STATE_COUNT - 1);
-        let mut palette = PalettedSection::new_single(first)
-            .map_err(|e| format!("PalettedSection::new_single failed: {e:?}"))?;
+        let bound = u32::try_from(state_count.saturating_sub(1)).unwrap_or(u32::MAX);
+        let first = states[0].min(bound);
+        let mut palette = PalettedSection::new_single_bounded(first, state_count)
+            .map_err(|e| format!("PalettedSection::new_single_bounded failed: {e:?}"))?;
         let mut has_non_air = !blocks.is_air(first);
         if states.iter().any(|&s| s != first) {
             for (idx, &raw_state) in states.iter().enumerate() {
-                let clamped = raw_state.min(STATE_COUNT - 1);
+                let clamped = raw_state.min(bound);
                 if clamped != first {
                     palette
                         .set(idx, clamped)
@@ -965,8 +967,13 @@ pub struct WorldState {
     pub blocks: BlockTable,
     /// Pinned Vanilla 1.21.1 block registry (luminance, opacity, fluid and
     /// occlusion facts) when `assets/block_states_1211.json` +
-    /// `assets/blocks_1211.json` were available; `None` in fallback mode.
+    /// `assets/blocks_1211.json` were available, or the `--version-dir` pack
+    /// opened via `Registry::from_version_dir`; `None` in fallback mode.
     pub registry: Option<Registry>,
+    /// Number of global block-state ids the active registry declares
+    /// (`Registry::state_count()` or pinned `STATE_COUNT`); bounds the
+    /// `PalettedSection` global palette and every incoming state id.
+    pub state_count: usize,
     /// Incremental light engine fed by local block edits; only present when
     /// the registry loaded and the dimension fits the engine window.
     light_engine: Option<LightEngine>,
@@ -1046,11 +1053,37 @@ fn light_engine_for(dimension: &DimensionMeta, enabled: bool) -> Option<LightEng
 impl WorldState {
     pub fn new(dimension: DimensionMeta, blocks: BlockTable) -> Self {
         let registry = load_kernel_registry(blocks.source_path.as_deref());
+        Self::with_registry(dimension, blocks, registry)
+    }
+
+    /// `new` with the kernel `Registry` opened from a `--version-dir` pack
+    /// (`blocks.json` + `block_state_facts.bin`, optional
+    /// `block_states.json`); the pack's `state_count()` bounds every stored
+    /// section's global palette.
+    pub fn new_from_version_dir(
+        dimension: DimensionMeta,
+        blocks: BlockTable,
+        dir: &std::path::Path,
+    ) -> Result<Self, String> {
+        let registry = Registry::from_version_dir(dir)
+            .map_err(|e| format!("cannot open version pack {}: {e:?}", dir.display()))?;
+        Ok(Self::with_registry(dimension, blocks, Some(registry)))
+    }
+
+    fn with_registry(
+        dimension: DimensionMeta,
+        blocks: BlockTable,
+        registry: Option<Registry>,
+    ) -> Self {
+        let state_count = registry
+            .as_ref()
+            .map_or(STATE_COUNT as usize, Registry::state_count);
         let light_engine = light_engine_for(&dimension, registry.is_some());
         Self {
             dimension,
             blocks,
             registry,
+            state_count,
             light_engine,
             columns: HashMap::new(),
             mesh_cache: MeshCache::new(MissingNeighbor::Air),
@@ -1126,7 +1159,8 @@ impl WorldState {
         for (idx, sec) in decoded.sections.iter().enumerate() {
             let sky = sky_per_section[idx].unwrap_or(default_sky);
             let blk = block_per_section[idx].unwrap_or([0u8; LIGHT_BYTES]);
-            let stored = StoredSection::from_states(&sec.states, blk, sky, &self.blocks)?;
+            let stored =
+                StoredSection::from_states(&sec.states, blk, sky, &self.blocks, self.state_count)?;
             let coord = SectionCoord(decoded.cx, min_sy + idx as i32, decoded.cz);
             if stored.has_non_air {
                 let mesh_sec = stored.to_mesh_section(&self.blocks);
@@ -1168,6 +1202,7 @@ impl WorldState {
         if col.sections.len() * SECTION_CELLS != cells_per_chunk {
             return;
         }
+        let bound = u32::try_from(self.state_count.saturating_sub(1)).unwrap_or(u32::MAX);
         let mut cells = Vec::with_capacity(cells_per_chunk);
         for y_off in 0..height_blocks {
             let sy = y_off / 16;
@@ -1179,7 +1214,7 @@ impl WorldState {
                         .palette
                         .get(section_index(lx, ly, lz))
                         .unwrap_or(0)
-                        .min(STATE_COUNT - 1);
+                        .min(bound);
                     let fact = registry.facts(state).unwrap_or_default();
                     cells.push(LightFact {
                         opacity: fact.opacity,
@@ -1384,7 +1419,8 @@ impl WorldState {
         let ly = (y - min_y).rem_euclid(16) as usize;
         let lz = z.rem_euclid(16) as usize;
         let cell_idx = section_index(lx, ly, lz);
-        let clamped = state_id.min(STATE_COUNT - 1);
+        let clamped = state_id
+            .min(u32::try_from(self.state_count.saturating_sub(1)).unwrap_or(u32::MAX));
         sec.palette
             .set(cell_idx, clamped)
             .map_err(|e| format!("PalettedSection::set failed: {e:?}"))?;

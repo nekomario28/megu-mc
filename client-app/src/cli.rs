@@ -15,6 +15,24 @@ pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MINECRAFT_VERSION: &str = "1.21.1";
 pub const PROTOCOL_VERSION: u32 = mc_spine_proto::ProtocolVersion::V1_21_1.number() as u32;
 
+/// Environment variable consulted for the kernel version pack directory when
+/// `--version-dir` is not passed — the same name the server's
+/// `VersionAssetPaths::resolve` honors.
+pub const VERSION_DIR_ENV: &str = "MC_SPINE_VERSION_DIR";
+
+/// Parse a `--mc-version` value into the protocol the client should speak.
+/// Accepts the Minecraft release name or its numeric protocol; anything else
+/// fails closed instead of guessing a table.
+pub fn parse_mc_version(value: &str) -> Result<mc_spine_proto::ProtocolVersion, String> {
+    match value.trim() {
+        "1.21.1" | "767" => Ok(mc_spine_proto::ProtocolVersion::V1_21_1),
+        "26.3" | "777" => Ok(mc_spine_proto::ProtocolVersion::V26_3),
+        other => Err(format!(
+            "invalid --mc-version '{other}' (expected 1.21.1, 26.3, 767, or 777)"
+        )),
+    }
+}
+
 const TOKEN_FLAGS: &[&str] = &[
     "--accessToken",
     "--clientToken",
@@ -80,6 +98,12 @@ pub struct CliConfig {
     pub seed: Option<i64>,
 
     // Native mc-spine-client flags
+    /// Protocol the client handshakes with (`--mc-version`); defaults to
+    /// 1.21.1/767.
+    pub mc_version: mc_spine_proto::ProtocolVersion,
+    /// Kernel version pack directory (`--version-dir` or
+    /// `MC_SPINE_VERSION_DIR`) for `Registry::from_version_dir`.
+    pub version_dir: Option<PathBuf>,
     pub headless: bool,
     pub ticks: u32,
     pub view_distance: i8,
@@ -144,6 +168,8 @@ impl Default for CliConfig {
             port: 25565,
             server_bin: None,
             seed: None,
+            mc_version: mc_spine_proto::ProtocolVersion::V1_21_1,
+            version_dir: None,
             headless: false,
             ticks: 40,
             view_distance: 2,
@@ -203,6 +229,8 @@ impl fmt::Debug for CliConfig {
             .field("port", &self.port)
             .field("server_bin", &self.server_bin)
             .field("seed", &self.seed)
+            .field("mc_version", &self.mc_version)
+            .field("version_dir", &self.version_dir)
             .field("headless", &self.headless)
             .field("ticks", &self.ticks)
             .field("view_distance", &self.view_distance)
@@ -666,6 +694,13 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                     cfg.max_fps = Some(Some(parsed as u32));
                 }
             }
+            "--mc-version" => {
+                let raw = take_val(flag, &mut i)?;
+                cfg.mc_version = parse_mc_version(&raw)?;
+            }
+            "--version-dir" => {
+                cfg.version_dir = Some(PathBuf::from(take_val(flag, &mut i)?));
+            }
             "--assets-json" => cfg.assets_json = Some(PathBuf::from(take_val(flag, &mut i)?)),
             "--script" => {
                 let raw_script = take_val(flag, &mut i)?;
@@ -707,6 +742,15 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
         i += 1;
     }
 
+    // `--version-dir` wins over the environment; an empty value disables it.
+    if cfg.version_dir.is_none() {
+        if let Some(dir) = std::env::var_os(VERSION_DIR_ENV) {
+            if !dir.is_empty() {
+                cfg.version_dir = Some(PathBuf::from(dir));
+            }
+        }
+    }
+
     Ok(cfg)
 }
 
@@ -739,6 +783,9 @@ LAUNCHER COMPATIBILITY FLAGS:
   --seed <seed>                      World seed for a new --quickPlaySingleplayer world
 
 NATIVE CLIENT FLAGS:
+  --mc-version <ver>                 Client protocol: 1.21.1|26.3 or 767|777 (default: 1.21.1)
+  --version-dir <path>               Kernel version pack directory for the block
+                                     registry (env: MC_SPINE_VERSION_DIR)
   --headless                         Run headless protocol + meshing + physics session
   --ticks <N>                        Number of simulation ticks to run (default: 40)
   --view-distance <N>                Client view distance in chunks, 2..=32 (default: 2)

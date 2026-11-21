@@ -751,3 +751,458 @@ fn quickplay_singleplayer_loopback_e2e_renders_png() {
     );
     let _ = std::fs::remove_dir_all(&game_dir);
 }
+
+// ---------------------------------------------------------------------------
+// Lane H4: --mc-version / --version-dir CLI, SRV redirect, dual 767/777 wire
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_mc_version_named_numeric_and_fail_closed() {
+    for (value, want) in [
+        ("1.21.1", 767),
+        ("767", 767),
+        ("26.3", 777),
+        ("777", 777),
+    ] {
+        let cfg = parse_args(&[
+            "--mc-version".to_string(),
+            value.to_string(),
+            "--headless".to_string(),
+        ])
+        .unwrap_or_else(|e| panic!("--mc-version {value} should parse: {e}"));
+        assert_eq!(
+            cfg.mc_version.number(),
+            want,
+            "--mc-version {value} mapped to wrong protocol"
+        );
+    }
+    // Default stays the pinned 1.21.1 profile.
+    let cfg = parse_args(&["--headless".to_string()]).expect("default parse");
+    assert_eq!(cfg.mc_version.number(), 767);
+    assert_eq!(cfg.mc_version, mc_spine_proto::ProtocolVersion::V1_21_1);
+    // Unknown values fail closed instead of guessing a table.
+    for bad in ["1.20.4", "765", "26.4", "778", "", "vanilla"] {
+        assert!(
+            parse_args(&["--mc-version".to_string(), bad.to_string()]).is_err(),
+            "--mc-version {bad:?} must fail closed"
+        );
+    }
+    // parse_mc_version itself accepts surrounding whitespace-free values only
+    // via trim, so a padded-but-valid string still resolves.
+    assert_eq!(
+        mc_spine_client::cli::parse_mc_version(" 777 ")
+            .unwrap()
+            .number(),
+        777
+    );
+}
+
+#[test]
+fn cli_version_dir_flag_env_fallback_and_precedence() {
+    use mc_spine_client::cli::VERSION_DIR_ENV;
+
+    std::env::remove_var(VERSION_DIR_ENV);
+    let cfg = parse_args(&["--headless".to_string()]).expect("no dir");
+    assert!(cfg.version_dir.is_none());
+
+    // Explicit flag.
+    let cfg = parse_args(&[
+        "--version-dir".to_string(),
+        "/tmp/vdir-flag".to_string(),
+        "--headless".to_string(),
+    ])
+    .expect("--version-dir parse");
+    assert_eq!(cfg.version_dir.as_deref(), Some(Path::new("/tmp/vdir-flag")));
+
+    // Environment fallback when the flag is absent.
+    std::env::set_var(VERSION_DIR_ENV, "/tmp/vdir-env");
+    let cfg = parse_args(&["--headless".to_string()]).expect("env fallback");
+    assert_eq!(cfg.version_dir.as_deref(), Some(Path::new("/tmp/vdir-env")));
+    // The flag still wins over the environment.
+    let cfg = parse_args(&[
+        "--version-dir".to_string(),
+        "/tmp/vdir-flag".to_string(),
+        "--headless".to_string(),
+    ])
+    .expect("flag precedence");
+    assert_eq!(cfg.version_dir.as_deref(), Some(Path::new("/tmp/vdir-flag")));
+    // An empty env value is ignored.
+    std::env::set_var(VERSION_DIR_ENV, "");
+    let cfg = parse_args(&["--headless".to_string()]).expect("empty env");
+    assert!(cfg.version_dir.is_none());
+    std::env::remove_var(VERSION_DIR_ENV);
+}
+
+/// Read one uncompressed `len | pid | payload` frame off a mock server socket.
+fn read_mock_frame(sock: &mut std::net::TcpStream) -> (i32, Vec<u8>) {
+    let mut len = 0u32;
+    for i in 0..5 {
+        let mut b = [0u8; 1];
+        sock.read_exact(&mut b).unwrap();
+        len |= u32::from(b[0] & 0x7f) << (7 * i);
+        if b[0] & 0x80 == 0 {
+            break;
+        }
+    }
+    let mut frame = vec![0u8; len as usize];
+    sock.read_exact(&mut frame).unwrap();
+    let mut r = WireReader::new(&frame);
+    let pid = r.read_varint().unwrap();
+    let body = r.take(r.remaining()).unwrap().to_vec();
+    (pid, body)
+}
+
+#[test]
+fn srv_redirect_connect_preserves_original_host_in_handshake() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let backend_port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept backend");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Handshake must carry the ORIGINAL host/port even though the TCP
+        // connection arrived on the loopback "backend" (SRV redirect).
+        let (pid, body) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00, "first packet must be handshake");
+        let mut r = WireReader::new(&body);
+        assert_eq!(r.read_varint().unwrap(), 767);
+        assert_eq!(r.read_string(255).unwrap(), "play.example.org");
+        let mut port = [0u8; 2];
+        port.copy_from_slice(r.take(2).unwrap());
+        assert_eq!(u16::from_be_bytes(port), 25565);
+        assert_eq!(r.read_varint().unwrap(), 2, "next_state login");
+        // Login Start follows; answer with a login disconnect so the client
+        // unwinds cleanly.
+        let (pid, _login_start) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00, "second packet must be login_start");
+        let mut disco = Vec::new();
+        write_string(&mut disco, "srv test complete");
+        sock.write_all(&encode_packet(0x00, &disco, None)).unwrap();
+    });
+
+    let result = ProtocolClient::connect_resolved(
+        "play.example.org",
+        25565,
+        "Tester",
+        offline_uuid("Tester"),
+        2,
+        Duration::from_secs(5),
+        mc_spine_proto::ProtocolVersion::V1_21_1,
+        move |host, port| {
+            // The injected `_minecraft._tcp` SRV answer redirects the socket.
+            assert_eq!(host, "play.example.org");
+            assert_eq!(port, 25565);
+            Ok(vec![format!("127.0.0.1:{backend_port}").parse().unwrap()])
+        },
+    );
+    assert!(result.is_err(), "mock server disconnects during login");
+    server.join().unwrap();
+}
+
+#[test]
+fn protocol777_login_config_play_keepalive_mock_server() {
+    use mc_spine_proto::{PacketDir, PacketPhase, ProtocolTable};
+
+    // The 767 vs 777 KeepAlive split this test exercises end-to-end.
+    let t767 = ProtocolTable::v767_builtin();
+    let t777 = ProtocolTable::v777_builtin();
+    let play = PacketPhase::Play;
+    assert_eq!(
+        t767.packet_id(play, PacketDir::Clientbound, "keep_alive"),
+        Some(0x26)
+    );
+    assert_eq!(
+        t777.packet_id(play, PacketDir::Clientbound, "keep_alive"),
+        Some(0x2d)
+    );
+    assert_eq!(
+        t767.packet_id(play, PacketDir::Serverbound, "keep_alive"),
+        Some(0x18)
+    );
+    assert_eq!(
+        t777.packet_id(play, PacketDir::Serverbound, "keep_alive"),
+        Some(0x1c)
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        // Handshake: protocol 777, next_state login.
+        let (pid, body) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00);
+        let mut r = WireReader::new(&body);
+        assert_eq!(r.read_varint().unwrap(), 777);
+        let _host = r.read_string(255).unwrap();
+        let _ = r.take(2).unwrap();
+        assert_eq!(r.read_varint().unwrap(), 2);
+
+        // Login Start -> 26.3 Login Success: Game Profile
+        // (uuid + username + empty property array) + session UUID.
+        let (pid, _login) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00);
+        let mut ls = Vec::new();
+        ls.extend_from_slice(&offline_uuid("Tester"));
+        write_string(&mut ls, "Tester");
+        write_varint(&mut ls, 0); // properties: 0
+        ls.extend_from_slice(&[7u8; 16]); // session id
+        sock.write_all(&encode_packet(0x02, &ls, None)).unwrap();
+        let (pid, _) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x03, "login_acknowledged");
+
+        // Configuration keepalive (0x04) -> echo on 0x04.
+        sock.write_all(&encode_packet(0x04, &42i64.to_be_bytes(), None))
+            .unwrap();
+        let (pid, ka) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x04);
+        assert_eq!(ka, 42i64.to_be_bytes());
+
+        // Finish Configuration (0x03) -> client_information (0x00) + ack (0x03).
+        sock.write_all(&encode_packet(0x03, &[], None)).unwrap();
+        let (pid, info) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00, "client_information");
+        // 26.3 client_information carries the extra particle_status VarInt.
+        let mut r = WireReader::new(&info);
+        let _locale = r.read_string(16).unwrap();
+        let _view = r.read_u8().unwrap();
+        let _chat = r.read_varint().unwrap();
+        let _colors = r.read_u8().unwrap();
+        let _skin = r.read_u8().unwrap();
+        let _hand = r.read_varint().unwrap();
+        let _filter = r.read_u8().unwrap();
+        let _listings = r.read_u8().unwrap();
+        assert_eq!(r.read_varint().unwrap(), 0, "particle_status present");
+        let (pid, _) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x03, "finish_configuration ack");
+
+        // Play KeepAlive (s2c 0x2d / 45) -> c2s echo on 0x1c / 28.
+        sock.write_all(&encode_packet(0x2d, &99i64.to_be_bytes(), None))
+            .unwrap();
+        let (pid, ka) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x1c, "777 c2s keep_alive id");
+        assert_eq!(ka, 99i64.to_be_bytes());
+
+        // 26.3 Synchronize Player Position (0x49): teleport id first, then
+        // pos/velocity doubles, yaw/pitch, Int flags.
+        let mut tp = Vec::new();
+        write_varint(&mut tp, 7); // teleport id
+        tp.extend_from_slice(&10.5f64.to_be_bytes());
+        tp.extend_from_slice(&65.0f64.to_be_bytes());
+        tp.extend_from_slice(&(-4.5f64).to_be_bytes());
+        tp.extend_from_slice(&0.0f64.to_be_bytes()); // vx
+        tp.extend_from_slice(&0.0f64.to_be_bytes()); // vy
+        tp.extend_from_slice(&0.0f64.to_be_bytes()); // vz
+        tp.extend_from_slice(&15.0f32.to_be_bytes()); // yaw
+        tp.extend_from_slice(&(-5.0f32).to_be_bytes()); // pitch
+        tp.extend_from_slice(&0i32.to_be_bytes()); // flags
+        sock.write_all(&encode_packet(0x49, &tp, None)).unwrap();
+
+        // 26.3 accept_teleportation (0x00) echoes the resulting pose.
+        let (pid, ack) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00, "accept_teleportation");
+        let mut r = WireReader::new(&ack);
+        assert_eq!(r.read_varint().unwrap(), 7);
+        assert_eq!(r.read_f64().unwrap(), 10.5);
+        assert_eq!(r.read_f64().unwrap(), 65.0);
+        assert_eq!(r.read_f64().unwrap(), -4.5);
+        assert_eq!(r.read_f32().unwrap(), 15.0);
+        assert_eq!(r.read_f32().unwrap(), -5.0);
+        // Vanilla follows with move_player_pos_rot (0x1f).
+        let (pid, _pos_rot) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x1f, "move_player_pos_rot after accept_teleportation");
+
+        // 26.3 player_input (c2s 0x2b / 43) is a single flag byte.
+        let (pid, input) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x2b, "777 c2s player_input id");
+        assert_eq!(input, vec![0x11], "forward + jump flag bits");
+    });
+
+    let (mut cli, report) = ProtocolClient::connect_for_version(
+        "127.0.0.1",
+        port,
+        "Tester",
+        offline_uuid("Tester"),
+        2,
+        Duration::from_secs(5),
+        mc_spine_proto::ProtocolVersion::V26_3,
+    )
+    .expect("777 connect");
+    assert!(report.login_ok && report.config_ok);
+    assert_eq!(cli.protocol_version.number(), 777);
+
+    match cli.recv_play(Duration::from_secs(2)).unwrap().unwrap() {
+        PlayEvent::KeepAlive(id) => {
+            assert_eq!(id, 99);
+            cli.send_keep_alive(id).unwrap();
+        }
+        other => panic!("expected KeepAlive, got {other:?}"),
+    }
+    match cli.recv_play(Duration::from_secs(2)).unwrap().unwrap() {
+        PlayEvent::Teleport(tp) => {
+            assert_eq!(tp.teleport_id, 7);
+            assert_eq!((tp.x, tp.y, tp.z), (10.5, 65.0, -4.5));
+            cli.send_accept_teleportation(
+                tp.teleport_id,
+                [tp.x, tp.y, tp.z],
+                tp.yaw,
+                tp.pitch,
+                true,
+            )
+            .unwrap();
+        }
+        other => panic!("expected Teleport, got {other:?}"),
+    }
+    cli.send_player_input(0.0, 1.0, true, false).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn protocol_table_driven_ids_match_builtins() {
+    use mc_spine_proto::{PacketDir, PacketPhase, ProtocolTable};
+
+    let t767 = ProtocolTable::v767_builtin();
+    let t777 = ProtocolTable::v777_builtin();
+    let play = PacketPhase::Play;
+    // Table-driven resolution supplies the ids the client sends — the
+    // version-divergent core set must differ where 26.3 remapped them.
+    for name in [
+        "keep_alive",
+        "level_chunk_with_light",
+        "player_position",
+        "disconnect",
+        "chunk_batch_start",
+        "chunk_batch_finished",
+        "light_update",
+        "block_update",
+        "section_blocks_update",
+        "forget_level_chunk",
+        "set_chunk_cache_center",
+        "set_health",
+        "respawn",
+        "login",
+        "ticking_state",
+    ] {
+        assert!(
+            t767.packet_id(play, PacketDir::Clientbound, name).is_some(),
+            "767 table missing s2c {name}"
+        );
+        assert!(
+            t777.packet_id(play, PacketDir::Clientbound, name).is_some(),
+            "777 table missing s2c {name}"
+        );
+    }
+    for name in [
+        "accept_teleportation",
+        "chunk_batch_received",
+        "keep_alive",
+        "player_input",
+        "move_player_pos",
+        "move_player_pos_rot",
+    ] {
+        assert!(
+            t767.packet_id(play, PacketDir::Serverbound, name).is_some(),
+            "767 table missing c2s {name}"
+        );
+        assert!(
+            t777.packet_id(play, PacketDir::Serverbound, name).is_some(),
+            "777 table missing c2s {name}"
+        );
+    }
+    // The two ids this lane hinges on.
+    assert_eq!(
+        t777.packet_id(play, PacketDir::Serverbound, "player_input"),
+        Some(0x2b)
+    );
+    assert_eq!(
+        t767.packet_id(play, PacketDir::Serverbound, "player_input"),
+        Some(0x26)
+    );
+}
+
+/// Minimal `block_state_facts.bin` row: [flags, emission<<4|opacity,
+/// sturdy u24le, reserved].
+fn fact_row(flags: u8, emission: u8, opacity: u8, sturdy: u32) -> [u8; 6] {
+    let sturdy = sturdy & 0x3f;
+    [
+        flags,
+        emission << 4 | opacity,
+        sturdy as u8,
+        (sturdy >> 8) as u8,
+        (sturdy >> 16) as u8,
+        0,
+    ]
+}
+
+#[test]
+fn world_state_opens_version_dir_pack() {
+    const FACT_IS_AIR: u8 = 1;
+    const FACT_LIQUID: u8 = 1 << 1;
+    const FACT_BLOCKS_MOTION: u8 = 1 << 2;
+    const FACT_CAN_OCCLUDE: u8 = 1 << 3;
+    const FACT_SOLID_RENDER: u8 = 1 << 4;
+    const FACT_FLUID_EMPTY: u8 = 1 << 7;
+
+    // A small custom 5-state pack proves `Registry::from_version_dir` drives
+    // `WorldState::state_count` instead of the pinned STATE_COUNT.
+    let dir = std::env::temp_dir().join(format!(
+        "mc-spine-client-vdir-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("blocks.json"),
+        r#"[
+            {"name": "air", "defaultState": 0, "minStateId": 0, "maxStateId": 0},
+            {"name": "stone", "defaultState": 1, "minStateId": 1, "maxStateId": 1},
+            {"name": "water", "defaultState": 2, "minStateId": 2, "maxStateId": 4}
+        ]"#,
+    )
+    .unwrap();
+    let facts: Vec<u8> = [
+        fact_row(FACT_IS_AIR | FACT_FLUID_EMPTY, 0, 0, 0),
+        fact_row(
+            FACT_SOLID_RENDER | FACT_CAN_OCCLUDE | FACT_BLOCKS_MOTION,
+            0,
+            15,
+            0x3f,
+        ),
+        fact_row(FACT_LIQUID, 0, 0, 0x3e),
+        fact_row(FACT_LIQUID, 0, 0, 0x3e),
+        fact_row(FACT_LIQUID, 0, 0, 0x3e),
+    ]
+    .concat();
+    std::fs::write(dir.join("block_state_facts.bin"), facts).unwrap();
+
+    let ws = WorldState::new_from_version_dir(
+        DimensionMeta::default(),
+        test_block_table(),
+        &dir,
+    )
+    .expect("open custom version pack");
+    assert!(ws.registry.is_some());
+    assert_eq!(ws.state_count, 5, "pack state_count drives the bound");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The pinned `assets/` directory is itself a valid version pack
+    // (`*_1211` fallback names).
+    let pinned_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../assets"));
+    let ws = WorldState::new_from_version_dir(
+        DimensionMeta::default(),
+        test_block_table(),
+        pinned_dir,
+    )
+    .expect("open pinned assets as version pack");
+    assert_eq!(ws.state_count, mc_spine_kernel::STATE_COUNT as usize);
+
+    // A missing directory fails closed.
+    assert!(WorldState::new_from_version_dir(
+        DimensionMeta::default(),
+        test_block_table(),
+        Path::new("/nonexistent-mc-spine-version-pack"),
+    )
+    .is_err());
+}
