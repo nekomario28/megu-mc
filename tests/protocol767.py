@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 from wire_smoke import frame, port, recv_exact, recv_vint, status, vint
 
@@ -40,6 +41,41 @@ class ContractFailure(AssertionError):
 def require(condition, code):
     if not condition:
         raise ContractFailure(code)
+
+
+def frame_packet(raw, threshold=-1):
+    """Length-prefix one packet (`raw` = VarInt packet id + body) for the wire.
+
+    Vanilla 767 compression framing: once Set Compression has negotiated a
+    non-negative threshold, every frame is `VarInt(frame_len)` over
+    `VarInt(data_len) + payload`, where `data_len` is 0 for an uncompressed
+    packet shorter than the threshold and the uncompressed length followed by
+    the zlib stream otherwise."""
+    if threshold >= 0:
+        inner = (vint(0) + raw) if len(raw) < threshold else (
+            vint(len(raw)) + zlib.compress(raw))
+    else:
+        inner = raw
+    return vint(len(inner)) + inner
+
+
+def unframe_packet(frame_data, threshold=-1):
+    """Inverse of `frame_packet` for one received frame (length prefix removed)."""
+    if threshold < 0:
+        return frame_data
+    reader = Reader(frame_data)
+    data_len = reader.varint()
+    rest = reader.take(len(reader.data) - reader.pos)
+    if data_len == 0:
+        assert len(rest) < threshold, "uncompressed packet meets compression threshold"
+        return rest
+    assert threshold <= data_len <= 16 * 1024 * 1024, "invalid compressed data length"
+    try:
+        packet = zlib.decompress(rest)
+    except zlib.error as exc:
+        raise AssertionError(f"invalid zlib stream: {exc}") from exc
+    assert len(packet) == data_len, "decompressed length mismatch"
+    return packet
 
 
 class Reader:
@@ -311,8 +347,9 @@ class Client:
     has_skylight = True
     dimension_name = "minecraft:overworld"
 
-    def __init__(self, game, name="WireTester"):
+    def __init__(self, game, name="WireTester", threshold=-1):
         self.socket = socket.create_connection(("127.0.0.1", game), timeout=10)
+        self.compression_threshold = threshold
         self.game, self.name = game, name
         self.chunks, self.messages, self.updates = {}, [], []
         # how many Chunk Batch Finished frames arrived, and the batch sizes they
@@ -333,8 +370,11 @@ class Client:
     def __exit__(self, *args):
         self.socket.close()
 
+    def _compression(self):
+        return getattr(self, "compression_threshold", -1)
+
     def send(self, pid, body=b""):
-        self.socket.sendall(frame(pid, body))
+        self.socket.sendall(frame_packet(vint(pid) + body, self._compression()))
 
     def _set_dimension(self, min_y, height, has_skylight, dimension_name, reset_chunks=False):
         assert height > 0 and height % 16 == 0, f"invalid dimension height {height}"
@@ -388,7 +428,8 @@ class Client:
 
     def read(self, timeout):
         self.socket.settimeout(timeout)
-        response = Reader(recv_exact(self.socket, recv_vint(self.socket)))
+        frame_data = recv_exact(self.socket, recv_vint(self.socket))
+        response = Reader(unframe_packet(frame_data, self._compression()))
         pid = response.varint()
         body = response.take(len(response.data) - response.pos)
         if self.phase != "play":
@@ -423,7 +464,8 @@ class Client:
                 coord, sections, masks, sky, block = decode_chunk_light(
                     body, biome_count, section_count=self.section_count,
                     has_skylight=self.has_skylight)
-            assert coord not in self.chunks, f"duplicate chunk {coord}"
+            # The server re-sends a held chunk when the occlusion lane flips;
+            # a resent 0x27 replaces the client's copy rather than erroring.
             self.chunks[coord] = sections
             self.raw_chunk[coord] = body
             self.chunk_light[coord] = (masks, sky, block)
@@ -536,11 +578,20 @@ class Client:
         uid[6] = (uid[6] & 15) | 48
         uid[8] = (uid[8] & 63) | 128
         self.send(0, string(self.name) + uid)
-        assert self.read(10)[0] == 2, "login success"
+        pid, body = self.read(10)
+        if pid == 0x03:
+            # Set Compression: every frame after this one is zlib-framed.
+            reader = Reader(body)
+            threshold = reader.varint()
+            assert 0 <= threshold and reader.pos == len(body), "invalid set compression"
+            self.compression_threshold = threshold
+            pid, body = self.read(10)
+        assert pid == 2, "login success"
         self.send(3)
         self.phase = "configuration"
         self.until_id(0x0e)
-        info, known = frame(0, settings(view)), frame(7, vint(0))
+        info = frame_packet(vint(0) + settings(view), self._compression())
+        known = frame_packet(vint(7) + vint(0), self._compression())
         self.socket.sendall(known + info if late else info + known)
         self.contract_started = True
         self.until_id(3)

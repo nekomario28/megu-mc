@@ -102,12 +102,18 @@ def exercise(binary, root):
                     require(observer.dimension_name == "minecraft:overworld",
                             "observer-overworld")
                     observer.until_chunks(square(*chunk_of(observer.pos)))
-                    before = list(observer.updates)
+                    before = len(observer.updates)
                     target = (2, 40, 2)
                     command(traveller, f"setblock {target[0]} {target[1]} {target[2]} "
                                        "minecraft:stone")
                     drain(observer)
-                    require(observer.updates == before, "nether-edit-leaked-to-overworld")
+                    # Random-tick corrections (burnout, decay) stream ambient
+                    # same-dimension block updates even to an idle single client,
+                    # so quiescence cannot be asserted; dimension isolation means
+                    # the Nether edit's position never reaches this client.
+                    leaked = observer.updates[before:]
+                    require(not any(pos == target for pos, _ in leaked),
+                            "nether-edit-leaked-to-overworld")
                     require(((target), 1) not in observer.updates,
                             "nether-stone-visible-in-overworld")
 

@@ -20,7 +20,8 @@ from wire_smoke import port, rcon_frame, rcon_response, status
 COMMANDS = 0x11
 SUGGEST = 0x0B
 SUGGESTIONS = 0x10
-PUBLIC_COMMANDS = {"help", "list", "me", "msg", "tell", "time", "w"}
+PUBLIC_COMMANDS = {"help", "list", "me", "msg", "tell", "time", "w",
+                   "teammsg", "tm", "trigger"}
 PLAYER = "BrigadierProbe"
 SECRET = "local-brigadier-wire-test"
 
@@ -146,7 +147,9 @@ class CommandClient(Client):
 
     def login(self):
         super().login()
-        assert self.play_prefix == [0x2B, COMMANDS], self.play_prefix
+        # Join Game, then the vanilla view-distance pair (SetChunkCacheRadius,
+        # SetSimulationDistance), then the command tree.
+        assert self.play_prefix == [0x2B, 0x55, 0x62, COMMANDS], self.play_prefix
         self.until_id(0x40)
 
     def suggest(self, transaction, text):

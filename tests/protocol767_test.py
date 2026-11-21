@@ -2,8 +2,12 @@
 """Known-answer/negative checks for the CLI decoder, not just its happy-path server."""
 import socket
 import struct
+import threading
 import unittest
-from protocol767 import Client, ROOT, Reader, decode_chunk, frame, palette, position, unpack_position, vint
+import zlib
+from protocol767 import (Client, ROOT, Reader, decode_chunk, frame, frame_packet,
+                         palette, position, unframe_packet, unpack_position, vint)
+from wire_smoke import recv_exact, recv_vint
 
 
 def nbt_compound(entries):
@@ -345,6 +349,145 @@ class DecoderTests(unittest.TestCase):
         self.assertEqual(client.dimension_types_by_id[0], (-64, 384, True))
         self.assertEqual(client.dimension_types_by_id[2], (0, 256, False))
         self.assertEqual(client.dimension_types_by_id[3], (0, 256, False))
+
+
+class CompressionTests(unittest.TestCase):
+    def _client(self, sock, threshold=-1, phase="play"):
+        client = Client.__new__(Client)
+        client.socket = sock
+        client.compression_threshold = threshold
+        client.phase = phase
+        client.game, client.name = 25565, "Tester"
+        client.chunks, client.messages, client.updates = {}, [], []
+        client.chunk_batches, client.light_updates = [], []
+        client.chunk_light, client.raw_chunk = {}, {}
+        client.pos, client.contract_started = None, False
+        client.registry_counts = {}
+        client.dimension_types_by_id = {}
+        client.dimension_types_by_name = {}
+        return client
+
+    @staticmethod
+    def _frame_body(framed):
+        reader = Reader(framed)
+        body = reader.take(reader.varint())
+        assert reader.pos == len(framed), "trailing bytes after frame"
+        return body
+
+    @staticmethod
+    def _recv_packet(sock, threshold):
+        return unframe_packet(recv_exact(sock, recv_vint(sock)), threshold)
+
+    def test_uncompressed_framing_is_unchanged(self):
+        raw = vint(0x2f) + b"payload"
+        self.assertEqual(frame_packet(raw, -1), frame(0x2f, b"payload"))
+        self.assertEqual(unframe_packet(raw, -1), raw)
+
+    def test_compressed_frame_roundtrip(self):
+        small = vint(0x2f) + b"tiny"
+        inner = Reader(self._frame_body(frame_packet(small, 256)))
+        self.assertEqual(inner.varint(), 0)  # below threshold: data_len == 0
+        rest = inner.take(len(inner.data) - inner.pos)
+        self.assertEqual(rest, small)
+
+        big = vint(0x27) + bytes(300)
+        framed = frame_packet(big, 256)
+        self.assertLess(len(framed), len(big))  # actually compressed
+        inner = Reader(self._frame_body(framed))
+        self.assertEqual(inner.varint(), len(big))  # data_len = uncompressed size
+        rest = inner.take(len(inner.data) - inner.pos)
+        self.assertEqual(zlib.decompress(rest), big)
+        self.assertEqual(unframe_packet(self._frame_body(framed), 256), big)
+
+    def test_client_send_read_roundtrip_compressed(self):
+        a, b = socket.socketpair()
+        with a, b:
+            client = self._client(a, threshold=64)
+            client.send(0x60, b"hello")
+            reader = Reader(self._recv_packet(b, 64))
+            self.assertEqual(reader.varint(), 0x60)
+            self.assertEqual(reader.take(len(reader.data) - reader.pos), b"hello")
+            b.sendall(frame_packet(vint(0x60) + b"teams", 64))
+            self.assertEqual(client.read(1), (0x60, b"teams"))
+
+    def _drive_login(self, server_sock, threshold):
+        # Handshake and Login Start always travel uncompressed.
+        for _ in range(2):
+            Reader(recv_exact(server_sock, recv_vint(server_sock))).varint()
+        login_success = bytes(16) + vint(1) + b"n" + vint(0) + b"\0"
+        if threshold >= 0:
+            server_sock.sendall(frame(0x03, vint(threshold)))  # Set Compression
+            server_sock.sendall(frame_packet(vint(2) + login_success, threshold))
+        else:
+            server_sock.sendall(frame(2, login_success))
+        # Login Acknowledged, then configuration: the client waits on 0x0e.
+        self.assertEqual(Reader(self._recv_packet(server_sock, threshold)).varint(), 3)
+        server_sock.sendall(frame_packet(vint(0x0e), threshold))
+        config_ids = [Reader(self._recv_packet(server_sock, threshold)).varint()
+                      for _ in range(2)]
+        self.assertEqual(sorted(config_ids), [0, 7])
+        server_sock.sendall(frame_packet(vint(3), threshold))  # Finish Configuration
+        self.assertEqual(Reader(self._recv_packet(server_sock, threshold)).varint(), 3)
+        # Play: Chunk Batch Finished unlocks login; the client answers 0x08.
+        server_sock.sendall(frame_packet(vint(0x0c) + vint(4), threshold))
+        self.assertEqual(Reader(self._recv_packet(server_sock, threshold)).varint(), 0x08)
+
+    def _run_login(self, threshold):
+        a, b = socket.socketpair()
+        with a, b:
+            client = self._client(a, phase="login")
+            errors = []
+
+            def login():
+                try:
+                    client.login()
+                except Exception as exc:  # surfaced in the asserting thread
+                    errors.append(exc)
+
+            worker = threading.Thread(target=login, daemon=True)
+            worker.start()
+            self._drive_login(b, threshold)
+            worker.join(10)
+            self.assertFalse(worker.is_alive(), "login did not complete")
+            self.assertEqual(errors, [])
+            return client
+
+    def test_login_negotiates_set_compression(self):
+        client = self._run_login(64)
+        self.assertEqual(client.compression_threshold, 64)
+        self.assertEqual(client.phase, "play")
+        self.assertEqual(client.chunk_batches, [4])
+
+    def test_login_without_set_compression_still_works(self):
+        client = self._run_login(-1)
+        self.assertEqual(client.compression_threshold, -1)
+        self.assertEqual(client.phase, "play")
+        self.assertEqual(client.chunk_batches, [4])
+
+    def test_corrupt_compression_fails_closed(self):
+        raw = vint(0x60) + bytes(300)
+        blob = zlib.compress(raw)
+        bad_inners = [
+            vint(len(raw) + 1) + blob,   # data_len does not match the stream
+            vint(len(raw)) + blob[:-4],  # truncated zlib stream
+            vint(10) + blob,             # compressed packet below threshold
+            vint(0) + raw,               # data_len 0 yet at/above threshold
+            vint(1 << 25) + blob,        # absurd decompressed length
+            vint(300) + b"not-zlib-at",  # not a zlib stream at all
+        ]
+        for inner in bad_inners:
+            with self.assertRaises(AssertionError):
+                unframe_packet(inner, 64)
+        # ... and through the socket path of Client.read as well.
+        a, b = socket.socketpair()
+        with a, b:
+            client = self._client(a, threshold=64)
+            b.sendall(frame_packet(vint(0x60) + b"fine", 64))
+            self.assertEqual(client.read(1), (0x60, b"fine"))
+            bad = vint(len(raw) + 7) + blob
+            b.sendall(vint(len(bad)) + bad)
+            with self.assertRaises(AssertionError):
+                client.read(1)
 
 
 if __name__ == "__main__":

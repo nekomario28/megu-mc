@@ -151,11 +151,10 @@ def live_server(binary, root, extra_env=None):
         if not (root / link).exists():
             (root / link).symlink_to(target, target_is_directory=target.is_dir())
     game = port()
-    # The binary negotiates a 256-byte compression threshold unless the env says
-    # otherwise; this suite's fixtures speak raw frames, so it opts out.
+    # The binary negotiates vanilla's 256-byte compression threshold by default;
+    # protocol767.Client speaks that framing, so the default stays enabled.
     env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-               MC_SPINE_WG="old", MC_SPINE_RESOURCE_PACK_URL="",
-               MC_SPINE_COMPRESSION_THRESHOLD="-1")
+               MC_SPINE_WG="old", MC_SPINE_RESOURCE_PACK_URL="")
     env.pop("MC_SPINE_RCON_PORT", None)
     env.setdefault("MC_SPINE_ANTICHEAT", "off")
     if extra_env:

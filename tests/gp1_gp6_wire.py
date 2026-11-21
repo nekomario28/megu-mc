@@ -44,6 +44,16 @@ class MobClient(Client):
         elif pid == 0x70:
             eid = r.varint()
             self.moves.setdefault(eid, []).append(struct.unpack(">ddd", r.take(24)))
+        elif pid in (0x2e, 0x2f):
+            # Relative entity move/rotate: vanilla i16 deltas in 1/4096 blocks.
+            eid = r.varint()
+            dx, dy, dz = struct.unpack(">hhh", r.take(6))
+            if pid == 0x2f:
+                r.take(2)  # yaw/pitch
+            r.take(1)      # on_ground
+            path = self.moves.setdefault(eid, [])
+            last = path[-1] if path else self.spawns.get(eid, (0, (0.0, 0.0, 0.0)))[1]
+            path.append((last[0] + dx / 4096, last[1] + dy / 4096, last[2] + dz / 4096))
         elif pid == 0x42:
             self.removed.update(r.varint() for _ in range(r.varint()))
         elif pid == 0x48:

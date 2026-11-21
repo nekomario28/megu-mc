@@ -17,7 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from protocol767 import Client, ROOT, string
+from protocol767 import Client, Reader, ROOT, frame_packet, string, unframe_packet
 from wire_smoke import frame, port, recv_exact, recv_vint, rcon_frame, rcon_response, status, vint
 
 
@@ -154,8 +154,17 @@ def pre_play_deadline_and_no_spin(binary):
         # Login to the configuration phase, then vanish: the handler used to
         # spin at 100% CPU on the dead socket for up to 15 s.
         sock = raw_login_start(game, "Ghost")
-        body = recv_exact(sock, recv_vint(sock))  # login success
-        sock.sendall(frame(3))
+        # Set Compression (0x03) precedes Login Success when the default
+        # threshold is negotiated; the login ack then travels zlib-framed.
+        threshold = -1
+        packet = unframe_packet(recv_exact(sock, recv_vint(sock)), threshold)
+        reader = Reader(packet)
+        if reader.varint() == 0x03:
+            threshold = reader.varint()
+            packet = unframe_packet(recv_exact(sock, recv_vint(sock)), threshold)
+            reader = Reader(packet)
+        assert reader.varint() == 2, "login success"
+        sock.sendall(frame_packet(vint(3), threshold))
         time.sleep(0.5)
         sock.shutdown(socket.SHUT_WR)  # EOF to the server
         before = cpu_seconds(proc.pid)

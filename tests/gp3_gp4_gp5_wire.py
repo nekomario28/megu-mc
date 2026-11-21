@@ -210,6 +210,9 @@ def boot(client, name):
     client.login()
     if client.pos is None:
         client.until_id(0x40)
+    # Players spawn in the configured default gamemode (survival); the creative
+    # inventory packet below is only honoured for a creative-mode client.
+    client.command("gamemode creative", f"Set {client.name}'s gamemode to creative")
     x, y, z = map(math.floor, client.pos)
     needed = {(bx // 16, bz // 16) for bx in (x - 5, x + 5) for bz in (z - 5, z + 5)}
     client.until(lambda *_: needed.issubset(client.chunks), f"{name}-fixture-chunks")
@@ -372,7 +375,12 @@ def merchant(game):
     with WireClient(game, "FarmerTrader") as client:
         x, y, z = boot(client, "merchant")
         client.set_item(37, "wheat", 25)
-        client.command(f"summon villager {x + 1.5} {y} {z + 0.5}", "Summoned villager")
+        # Pen the villager into its own cell first: the stroll goal walks it out
+        # of the 3.2-block interact reach before the menu is reopened below.
+        client.command(f"fill {x + 1} {y - 1} {z - 1} {x + 3} {y - 1} {z + 1} stone", "Filled")
+        for wx, wz in ((x + 3, z), (x + 1, z), (x + 2, z - 1), (x + 2, z + 1)):
+            client.command(f"fill {wx} {y} {wz} {wx} {y + 2} {wz} stone", "Filled")
+        client.command(f"summon villager {x + 2.5} {y} {z + 0.5}", "Summoned villager")
         eid = None
 
         def villager(pid, body):
