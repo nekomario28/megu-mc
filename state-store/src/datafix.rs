@@ -425,7 +425,7 @@ fn is_block_state_map(map: &BTreeMap<String, DataValue>) -> bool {
     let props_ok = map
         .get("properties")
         .or_else(|| map.get("Properties"))
-        .map_or(true, |p| matches!(p, DataValue::Map(_)));
+        .is_none_or(|p| matches!(p, DataValue::Map(_)));
     id_str && pure_keys && props_ok
 }
 
