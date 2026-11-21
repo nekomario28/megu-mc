@@ -848,6 +848,423 @@ pub(crate) fn run_stdin_console_loop(
     ConsoleExit::Eof
 }
 
+// ------------------------------------------------------- signed chat policy
+
+/// Vanilla `enforce-secure-profile` (`server.properties`, exported as
+/// `MC_SPINE_ENFORCE_SECURE_PROFILE`): whether an online-mode client must
+/// present a Mojang chat-signing session for its chat to relay. The default is
+/// off — offline and modded deployments have no session keys at all, so
+/// forcing the check there would silence every client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ChatSignaturePolicy {
+    /// Reject unsigned chat from online-mode connections (Vanilla
+    /// `enforce-secure-profile=true`, which itself requires `online-mode`).
+    pub enforce_secure_profile: bool,
+    /// Permit unsigned chat from offline-mode connections. Off is the strict
+    /// lane for deployments that only trust signed envelopes end-to-end.
+    pub allow_unsigned_offline: bool,
+}
+
+#[allow(dead_code)]
+impl Default for ChatSignaturePolicy {
+    fn default() -> Self {
+        ChatSignaturePolicy {
+            enforce_secure_profile: false,
+            allow_unsigned_offline: true,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl ChatSignaturePolicy {
+    /// Layered resolution, the same precedence `server_config_boot` gives every
+    /// ops knob: `MC_SPINE_ENFORCE_SECURE_PROFILE` wins, a dropped-in
+    /// `server.properties` `enforce-secure-profile` fills an unset variable,
+    /// and nothing configured means off. An unparsable value falls through to
+    /// the layer below, like `ops_bool`.
+    pub(crate) fn resolve(
+        env: Option<&str>,
+        server_properties: Option<&str>,
+    ) -> ChatSignaturePolicy {
+        let enforce = env
+            .and_then(ops_bool_str)
+            .or_else(|| server_properties.and_then(ops_bool_str))
+            .unwrap_or(false);
+        ChatSignaturePolicy {
+            enforce_secure_profile: enforce,
+            ..ChatSignaturePolicy::default()
+        }
+    }
+}
+
+/// The live policy: the environment first, then the `server.properties` next to
+/// the active `server.toml` (`server_properties_path(server_config_path())`,
+/// the same location `server_config_boot` reads).
+#[allow(dead_code)]
+pub(crate) fn chat_signature_policy() -> ChatSignaturePolicy {
+    let env = std::env::var("MC_SPINE_ENFORCE_SECURE_PROFILE").ok();
+    let props = if env.as_deref().is_some_and(|v| ops_bool_str(v).is_some()) {
+        // The variable is set and valid: it decides, no file read needed.
+        None
+    } else {
+        server_properties_read(&server_properties_path(&server_config_path()))
+            .and_then(|props| props.get("enforce-secure-profile").cloned())
+    };
+    ChatSignaturePolicy::resolve(env.as_deref(), props.as_deref())
+}
+
+/// One C2S play `0x06` Chat Message, protocol 767. `signature` is the fixed
+/// 256-byte `MessageSignature` blob; `message_count` + `acknowledged_bitset`
+/// are the `LastSeenMessages.Update` pair (a VarInt count and the fixed 20-bit
+/// bit set — three bytes — naming the messages this sender had seen).
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct ChatMessageEnvelope {
+    /// The connection's session UUID (not carried on the C2S wire).
+    pub sender: [u8; 16],
+    /// Plain-text body; Vanilla caps it at 256 characters.
+    pub message: String,
+    pub timestamp_ms: i64,
+    pub salt: i64,
+    pub signature: Option<[u8; 256]>,
+    pub message_count: i32,
+    pub acknowledged_bitset: [u8; 3],
+}
+
+/// Protocol 767 play S2C packet ids (verified in `proto/src/data_v767.rs`).
+#[allow(dead_code)]
+pub(crate) const S2C_DISGUISED_CHAT_767: i64 = 0x1e;
+#[allow(dead_code)]
+pub(crate) const S2C_PLAYER_CHAT_767: i64 = 0x39;
+/// Protocol 767 configuration ids: S2C `registry_data` / `select_known_packs`
+/// and the C2S `select_known_packs` reply.
+#[allow(dead_code)]
+pub(crate) const CONFIG_S2C_REGISTRY_DATA_767: i64 = 0x07;
+#[allow(dead_code)]
+pub(crate) const CONFIG_S2C_SELECT_KNOWN_PACKS_767: i64 = 0x0e;
+#[allow(dead_code)]
+pub(crate) const CONFIG_C2S_SELECT_KNOWN_PACKS_767: i64 = 0x07;
+
+/// How a chat envelope that passed validation may relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ChatVerdict {
+    /// S2C `0x39` Player Chat: the sender's signature forwards end-to-end.
+    Signed,
+    /// S2C `0x1e` Disguised Chat: unsigned input or a system-relayed line —
+    /// there is no sender signature to forward.
+    Disguised,
+}
+
+#[allow(dead_code)]
+impl ChatVerdict {
+    pub(crate) fn packet_id(self) -> i64 {
+        match self {
+            ChatVerdict::Signed => S2C_PLAYER_CHAT_767,
+            ChatVerdict::Disguised => S2C_DISGUISED_CHAT_767,
+        }
+    }
+}
+
+/// Why a chat envelope was refused. `disconnect_text` is the line the
+/// connection handler puts on the client's disconnect screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ChatRejectReason {
+    /// More than 256 characters.
+    TooLong,
+    /// NUL, C0 control or DEL characters — a Vanilla client cannot type them.
+    IllegalCharacters,
+    /// `§` from a non-operator sender (colour-code injection).
+    SectionSign,
+    /// A declared signature that is not exactly 256 bytes on the wire.
+    BadSignatureLength,
+    /// No signature where the policy requires one.
+    MissingSignature,
+    /// Truncated or trailing-garbage packet body.
+    Malformed,
+}
+
+#[allow(dead_code)]
+impl ChatRejectReason {
+    pub(crate) fn disconnect_text(self) -> &'static str {
+        match self {
+            ChatRejectReason::TooLong => "Chat message too long",
+            ChatRejectReason::IllegalCharacters | ChatRejectReason::SectionSign => {
+                "Illegal characters in chat"
+            }
+            ChatRejectReason::MissingSignature => {
+                "Chat disabled due to missing profile public key. Please try reconnecting."
+            }
+            ChatRejectReason::BadSignatureLength | ChatRejectReason::Malformed => {
+                "Invalid chat signature"
+            }
+        }
+    }
+}
+
+/// `validate_chat_envelope_as` with the sender treated as a non-operator — the
+/// conservative default for callers that have no ops lookup at hand.
+#[allow(dead_code)]
+pub(crate) fn validate_chat_envelope(
+    env: &ChatMessageEnvelope,
+    policy: &ChatSignaturePolicy,
+    is_online_mode: bool,
+) -> Result<ChatVerdict, ChatRejectReason> {
+    validate_chat_envelope_as(env, policy, is_online_mode, false)
+}
+
+/// The admission gate for one chat envelope. Vanilla's rules in order: the
+/// `ServerboundChatPacket` 256-character cap, `SharedConstants.isAllowedChatCharacter`
+/// (no control characters, no DEL), the `§` colour-code injection that only an
+/// operator line may carry, and the `enforce-secure-profile` signature contract.
+/// A signed envelope relays as `0x39`; anything else as `0x1e`.
+#[allow(dead_code)]
+pub(crate) fn validate_chat_envelope_as(
+    env: &ChatMessageEnvelope,
+    policy: &ChatSignaturePolicy,
+    is_online_mode: bool,
+    sender_is_op: bool,
+) -> Result<ChatVerdict, ChatRejectReason> {
+    if env.message.chars().count() > connection_limits::MAX_CHAT_CHARS {
+        return Err(ChatRejectReason::TooLong);
+    }
+    for c in env.message.chars() {
+        if c == '\u{a7}' {
+            if !sender_is_op {
+                return Err(ChatRejectReason::SectionSign);
+            }
+        } else if c < ' ' || c == '\u{7f}' {
+            return Err(ChatRejectReason::IllegalCharacters);
+        }
+    }
+    match &env.signature {
+        Some(_) => Ok(ChatVerdict::Signed),
+        None => {
+            let required = (is_online_mode && policy.enforce_secure_profile)
+                || (!is_online_mode && !policy.allow_unsigned_offline);
+            if required {
+                Err(ChatRejectReason::MissingSignature)
+            } else {
+                Ok(ChatVerdict::Disguised)
+            }
+        }
+    }
+}
+
+/// Decode a C2S play `0x06` Chat Message body (packet id already consumed).
+/// `sender` is the connection's session UUID — the wire message carries none.
+/// Fail-closed like the other decoders: a signature field that is present but
+/// short of the fixed 256 bytes is a `BadSignatureLength`, truncation or
+/// trailing garbage a `Malformed`.
+#[allow(dead_code)]
+pub(crate) fn decode_serverbound_chat_0x06(
+    sender: [u8; 16],
+    body: &[u8],
+) -> Result<ChatMessageEnvelope, ChatRejectReason> {
+    let mut b = body;
+    // Vanilla `readUtf(256)` bounds the byte length at 256*4; the character
+    // cap itself is `validate_chat_envelope`'s `TooLong`.
+    let message = read_string_bounded(&mut b, connection_limits::MAX_CHAT_CHARS * 4)
+        .ok_or(ChatRejectReason::Malformed)?;
+    if b.len() < 16 {
+        return Err(ChatRejectReason::Malformed);
+    }
+    let timestamp_ms = i64::from_be_bytes(b[..8].try_into().unwrap());
+    let salt = i64::from_be_bytes(b[8..16].try_into().unwrap());
+    b = &b[16..];
+    let signature = match b.first() {
+        None => return Err(ChatRejectReason::Malformed),
+        Some(0) => {
+            b = &b[1..];
+            None
+        }
+        Some(1) => {
+            b = &b[1..];
+            let (sig, rest) = b
+                .split_at_checked(256)
+                .ok_or(ChatRejectReason::BadSignatureLength)?;
+            b = rest;
+            Some(sig.try_into().unwrap())
+        }
+        _ => return Err(ChatRejectReason::Malformed),
+    };
+    let message_count = read_protocol_i32(&mut b).ok_or(ChatRejectReason::Malformed)?;
+    let (ack, rest) = b
+        .split_at_checked(3)
+        .ok_or(ChatRejectReason::Malformed)?;
+    if !rest.is_empty() {
+        return Err(ChatRejectReason::Malformed);
+    }
+    Ok(ChatMessageEnvelope {
+        sender,
+        message,
+        timestamp_ms,
+        salt,
+        signature,
+        message_count,
+        acknowledged_bitset: ack.try_into().unwrap(),
+    })
+}
+
+/// S2C `0x39` Player Chat (protocol 767) for a signed envelope: packet id, the
+/// sender UUID, the server's global signature-chain `index`, the optional
+/// 256-byte signature, then the packed body (message, timestamp, salt, the
+/// last-seen `offset` + 3-byte acknowledged bit set), optional unsigned
+/// display content (already-encoded network NBT), a pass-through filter mask,
+/// and the bound chat type (`chat_type` registry index, sender name, no
+/// target). Bytes include the packet id, the same shape `load_config_packets`
+/// keeps.
+#[allow(dead_code)]
+pub(crate) fn encode_player_chat_0x39(
+    env: &ChatMessageEnvelope,
+    index: i32,
+    unsigned_content_nbt: Option<&[u8]>,
+    chat_type: i32,
+    sender_name: &str,
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, S2C_PLAYER_CHAT_767);
+    p.extend_from_slice(&env.sender);
+    write_varint(&mut p, i64::from(index));
+    match &env.signature {
+        Some(sig) => {
+            p.push(1);
+            p.extend_from_slice(sig);
+        }
+        None => p.push(0),
+    }
+    write_str(&mut p, &env.message);
+    p.extend_from_slice(&env.timestamp_ms.to_be_bytes());
+    p.extend_from_slice(&env.salt.to_be_bytes());
+    write_varint(&mut p, i64::from(env.message_count));
+    p.extend_from_slice(&env.acknowledged_bitset);
+    match unsigned_content_nbt {
+        Some(nbt) => {
+            p.push(1);
+            p.extend_from_slice(nbt);
+        }
+        None => p.push(0),
+    }
+    write_varint(&mut p, 0); // filter mask: pass-through, nothing filtered
+    write_varint(&mut p, i64::from(chat_type));
+    p.extend_from_slice(&chat_nbt(sender_name));
+    p.push(0); // target name: none
+    p
+}
+
+/// S2C `0x1e` Disguised Chat (protocol 767): the displayed component (already
+/// encoded network NBT), the bound chat type index, the sender name and no
+/// target name. This is the relay path for unsigned and system lines.
+#[allow(dead_code)]
+pub(crate) fn encode_disguised_chat_0x1e(
+    message_component_nbt: &[u8],
+    chat_type: i32,
+    sender_name: &str,
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, S2C_DISGUISED_CHAT_767);
+    p.extend_from_slice(message_component_nbt);
+    write_varint(&mut p, i64::from(chat_type));
+    p.extend_from_slice(&chat_nbt(sender_name));
+    p.push(0); // target name: none
+    p
+}
+
+// ------------------------------------------- configuration registry sync
+
+/// One `minecraft:known_pack` triple (`namespace`, `id`, `version`) — the
+/// `1.21.1` client's `minecraft:core` is how it asks "which registry pack
+/// generation do you run".
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct KnownPackEntry {
+    pub namespace: String,
+    pub id: String,
+    pub version: String,
+}
+
+/// The cap on a C2S known-packs list: a real client sends its handful of data
+/// packs; anything bigger is a forged count, not a configuration.
+#[allow(dead_code)]
+pub(crate) const MAX_KNOWN_PACKS: usize = 64;
+
+/// Per-field byte bound on the wire strings (namespaces/ids/versions are
+/// resource-location sized; a longer claim is a bad string).
+#[allow(dead_code)]
+const MAX_KNOWN_PACK_FIELD: usize = 1024;
+
+/// S2C configuration `0x0e` `select_known_packs` (protocol 767): packet id,
+/// pack count, then `namespace`/`id`/`version` per entry. Bytes include the
+/// packet id, matching the `(i64, Vec<u8>)` shape `load_config_packets` uses.
+#[allow(dead_code)]
+pub(crate) fn encode_select_known_packs_0x0e(packs: &[KnownPackEntry]) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, CONFIG_S2C_SELECT_KNOWN_PACKS_767);
+    write_varint(&mut p, packs.len() as i64);
+    for pack in packs {
+        write_str(&mut p, &pack.namespace);
+        write_str(&mut p, &pack.id);
+        write_str(&mut p, &pack.version);
+    }
+    p
+}
+
+/// The C2S configuration `0x07` `select_known_packs` body (packet id already
+/// consumed). Fail-closed: more than `MAX_KNOWN_PACKS` entries, an unreadable
+/// or over-long field, or trailing bytes all return `None`.
+#[allow(dead_code)]
+pub(crate) fn decode_client_known_packs_0x07(body: &[u8]) -> Option<Vec<KnownPackEntry>> {
+    let mut b = body;
+    let count = usize::try_from(read_protocol_i32(&mut b)?).ok()?;
+    if count > MAX_KNOWN_PACKS {
+        return None;
+    }
+    let mut packs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let namespace = read_string_bounded(&mut b, MAX_KNOWN_PACK_FIELD)?;
+        let id = read_string_bounded(&mut b, MAX_KNOWN_PACK_FIELD)?;
+        let version = read_string_bounded(&mut b, MAX_KNOWN_PACK_FIELD)?;
+        packs.push(KnownPackEntry {
+            namespace,
+            id,
+            version,
+        });
+    }
+    b.is_empty().then_some(packs)
+}
+
+/// S2C configuration `0x07` `registry_data` (protocol 767) built from live
+/// registry contents instead of the static `config_packets.bin` blob: packet
+/// id, `registry_id` (`minecraft:enchantment`, `minecraft:damage_type`,
+/// `minecraft:chat_type`, `minecraft:wolf_variant`, `minecraft:painting_variant`,
+/// `minecraft:banner_pattern`, `minecraft:jukebox_song`, …), the entry count,
+/// then per entry the id and an optional already-encoded network-NBT payload
+/// (`0x00` for absent, `0x01` + bytes when present) — the exact layout
+/// `registry_wire_entries` parses back.
+#[allow(dead_code)]
+pub(crate) fn encode_registry_data_0x07(
+    registry_id: &str,
+    entries: &[(String, Option<Vec<u8>>)],
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, CONFIG_S2C_REGISTRY_DATA_767);
+    write_str(&mut p, registry_id);
+    write_varint(&mut p, entries.len() as i64);
+    for (id, nbt) in entries {
+        write_str(&mut p, id);
+        match nbt {
+            Some(bytes) => {
+                p.push(1);
+                p.extend_from_slice(bytes);
+            }
+            None => p.push(0),
+        }
+    }
+    p
+}
+
 #[cfg(test)]
 mod server_ops_tests {
     use super::*;
@@ -1113,5 +1530,339 @@ mod server_ops_tests {
         );
         assert_eq!(exit, ConsoleExit::Eof);
         assert_eq!(calls, 0);
+    }
+
+    fn chat_env(message: &str, signature: Option<[u8; 256]>) -> ChatMessageEnvelope {
+        ChatMessageEnvelope {
+            sender: [0xabu8; 16],
+            message: message.to_owned(),
+            timestamp_ms: 1_763_000_000_000,
+            salt: -42,
+            signature,
+            message_count: 3,
+            acknowledged_bitset: [0xaa, 0xbb, 0x0f],
+        }
+    }
+
+    #[test]
+    fn p7a_parity_secure_profile_policy_resolves_env_then_properties() {
+        // Defaults keep offline/modded ergonomics: no enforcement, unsigned ok.
+        let p = ChatSignaturePolicy::resolve(None, None);
+        assert!(!p.enforce_secure_profile && p.allow_unsigned_offline);
+        // server.properties layer fills an unset variable.
+        assert!(ChatSignaturePolicy::resolve(None, Some("true")).enforce_secure_profile);
+        // The environment wins over the file, including an explicit `false`.
+        assert!(!ChatSignaturePolicy::resolve(Some("false"), Some("true")).enforce_secure_profile);
+        assert!(ChatSignaturePolicy::resolve(Some("on"), Some("false")).enforce_secure_profile);
+        // An unparsable variable falls through to the file; both unset -> off.
+        assert!(ChatSignaturePolicy::resolve(Some("bogus"), Some("true")).enforce_secure_profile);
+        assert!(!ChatSignaturePolicy::resolve(Some("bogus"), None).enforce_secure_profile);
+        // `chat_signature_policy` reads the live environment without panicking
+        // when no server.properties exists to consult.
+        let _ = chat_signature_policy();
+    }
+
+    #[test]
+    fn p7a_parity_enforce_secure_profile_gates_unsigned_online_chat() {
+        let enforce = ChatSignaturePolicy {
+            enforce_secure_profile: true,
+            allow_unsigned_offline: true,
+        };
+        // enforce-secure-profile only binds online-mode connections.
+        assert_eq!(
+            validate_chat_envelope(&chat_env("hi", None), &enforce, true),
+            Err(ChatRejectReason::MissingSignature)
+        );
+        assert_eq!(
+            validate_chat_envelope(&chat_env("hi", None), &enforce, false),
+            Ok(ChatVerdict::Disguised)
+        );
+        // The strict offline lane can refuse unsigned envelopes too.
+        let strict = ChatSignaturePolicy {
+            enforce_secure_profile: true,
+            allow_unsigned_offline: false,
+        };
+        assert_eq!(
+            validate_chat_envelope(&chat_env("hi", None), &strict, false),
+            Err(ChatRejectReason::MissingSignature)
+        );
+        // Default policy never requires a signature either way.
+        let default = ChatSignaturePolicy::default();
+        assert_eq!(
+            validate_chat_envelope(&chat_env("hi", None), &default, true),
+            Ok(ChatVerdict::Disguised)
+        );
+        // A full 256-byte signature passes and selects the Player Chat frame.
+        let signed = validate_chat_envelope(&chat_env("hi", Some([7u8; 256])), &enforce, true);
+        assert_eq!(signed, Ok(ChatVerdict::Signed));
+        assert_eq!(ChatVerdict::Signed.packet_id(), 0x39);
+        assert_eq!(ChatVerdict::Disguised.packet_id(), 0x1e);
+    }
+
+    #[test]
+    fn p7a_parity_chat_envelope_rejects_vanilla_illegal_content() {
+        let p = ChatSignaturePolicy::default();
+        assert_eq!(
+            validate_chat_envelope(&chat_env(&"a".repeat(257), None), &p, false),
+            Err(ChatRejectReason::TooLong)
+        );
+        assert_eq!(
+            validate_chat_envelope(&chat_env(&"a".repeat(256), None), &p, false),
+            Ok(ChatVerdict::Disguised)
+        );
+        // 256 chars counts characters, not bytes.
+        assert!(validate_chat_envelope(&chat_env(&"\u{3042}".repeat(256), None), &p, false).is_ok());
+        for bad in ["nul\0x", "tab\tx", "nl\nx", "del\u{7f}x"] {
+            assert_eq!(
+                validate_chat_envelope(&chat_env(bad, None), &p, false),
+                Err(ChatRejectReason::IllegalCharacters),
+                "{bad:?}"
+            );
+        }
+        // `§` colour-code injection: non-ops are refused; an operator line may
+        // carry it (the `_as` entry point the wiring uses for ops).
+        assert_eq!(
+            validate_chat_envelope(&chat_env("\u{a7}cred", None), &p, false),
+            Err(ChatRejectReason::SectionSign)
+        );
+        assert!(validate_chat_envelope_as(&chat_env("\u{a7}cred", None), &p, false, true).is_ok());
+    }
+
+    #[test]
+    fn p7a_parity_serverbound_chat_decode_bounds_and_signature_length() {
+        let sender = [0x42u8; 16];
+        // A body that validates cleanly end-to-end.
+        let mut body = Vec::new();
+        write_str(&mut body, "hello");
+        body.extend_from_slice(&1_000i64.to_be_bytes());
+        body.extend_from_slice(&(-7i64).to_be_bytes());
+        body.push(1);
+        body.extend_from_slice(&[9u8; 256]);
+        write_varint(&mut body, 4);
+        body.extend_from_slice(&[1, 2, 3]);
+        let env = decode_serverbound_chat_0x06(sender, &body).unwrap();
+        assert_eq!(env.sender, sender);
+        assert_eq!(env.message, "hello");
+        assert_eq!(env.timestamp_ms, 1_000);
+        assert_eq!(env.salt, -7);
+        assert_eq!(env.signature, Some([9u8; 256]));
+        assert_eq!(env.message_count, 4);
+        assert_eq!(env.acknowledged_bitset, [1, 2, 3]);
+
+        // An unsigned envelope decodes `None` signature.
+        let mut unsigned = Vec::new();
+        write_str(&mut unsigned, "hi");
+        unsigned.extend_from_slice(&[0; 16]);
+        unsigned.push(0);
+        write_varint(&mut unsigned, 0);
+        unsigned.extend_from_slice(&[0; 3]);
+        assert_eq!(
+            decode_serverbound_chat_0x06(sender, &unsigned).unwrap().signature,
+            None
+        );
+
+        // A declared signature short of 256 bytes is a bad signature length,
+        // and every other truncation or trailing byte is malformed.
+        let mut short_sig = Vec::new();
+        write_str(&mut short_sig, "hi");
+        short_sig.extend_from_slice(&[0; 16]);
+        short_sig.push(1);
+        short_sig.extend_from_slice(&[9u8; 10]); // present flag, 10/256 bytes
+        assert_eq!(
+            decode_serverbound_chat_0x06(sender, &short_sig),
+            Err(ChatRejectReason::BadSignatureLength)
+        );
+        assert_eq!(
+            decode_serverbound_chat_0x06(sender, &unsigned[..unsigned.len() - 1]),
+            Err(ChatRejectReason::Malformed)
+        );
+        let mut trailing = unsigned.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_serverbound_chat_0x06(sender, &trailing),
+            Err(ChatRejectReason::Malformed)
+        );
+        assert_eq!(
+            decode_serverbound_chat_0x06(sender, &[0xff]),
+            Err(ChatRejectReason::Malformed)
+        );
+    }
+
+    #[test]
+    fn p7a_parity_signed_chat_emits_exact_767_player_chat_frame() {
+        let env = chat_env("hello", Some([0x55u8; 256]));
+        let frame = encode_player_chat_0x39(&env, 17, None, 0, "Steve");
+        let mut b = frame.as_slice();
+        // Header: packet id, sender UUID, signature-chain index.
+        assert_eq!(read_protocol_i32(&mut b), Some(0x39));
+        let (uuid, rest) = b.split_at(16);
+        assert_eq!(uuid, [0xabu8; 16]);
+        b = rest;
+        assert_eq!(read_protocol_i32(&mut b), Some(17));
+        // Signature present: flag + exactly the 256 blob bytes.
+        assert_eq!(b[0], 1);
+        assert_eq!(&b[1..257], &[0x55u8; 256]);
+        b = &b[257..];
+        // Packed body: message, timestamp, salt, last-seen offset + bitset.
+        assert_eq!(read_string_bounded(&mut b, 1024).as_deref(), Some("hello"));
+        assert_eq!(i64::from_be_bytes(b[..8].try_into().unwrap()), env.timestamp_ms);
+        assert_eq!(i64::from_be_bytes(b[8..16].try_into().unwrap()), env.salt);
+        b = &b[16..];
+        assert_eq!(read_protocol_i32(&mut b), Some(3));
+        assert_eq!(&b[..3], &[0xaa, 0xbb, 0x0f]);
+        b = &b[3..];
+        // No unsigned content, pass-through filter, bound chat type 0 with the
+        // sender name component and no target name.
+        assert_eq!(b[0], 0);
+        assert_eq!(read_protocol_i32(&mut &b[1..]), Some(0));
+        assert_eq!(*b.last().unwrap(), 0);
+    }
+
+    #[test]
+    fn p7a_parity_unsigned_chat_relays_as_767_disguised_chat() {
+        let frame = encode_disguised_chat_0x1e(&chat_nbt("<Steve> hello"), 0, "Steve");
+        let mut b = frame.as_slice();
+        assert_eq!(read_protocol_i32(&mut b), Some(0x1e));
+        // Component NBT compound, then the bound chat type varint.
+        assert_eq!(b[0], 10, "anonymous NBT compound tag id");
+        let name_at = frame
+            .windows(5)
+            .position(|w| w == b"Steve")
+            .expect("sender name component");
+        assert_eq!(*frame.last().unwrap(), 0, "no target name");
+        let _ = name_at;
+    }
+
+    #[test]
+    fn p7a_parity_known_packs_wire_matches_the_vanilla_capture() {
+        // The 0x0e blob inside the shipped vanilla `config_packets.bin`:
+        // one pack, minecraft:core 1.21.1.
+        let packs = [KnownPackEntry {
+            namespace: "minecraft".into(),
+            id: "core".into(),
+            version: "1.21.1".into(),
+        }];
+        let packet = encode_select_known_packs_0x0e(&packs);
+        assert_eq!(
+            packet,
+            [
+                0x0e, 0x01, 0x09, b'm', b'i', b'n', b'e', b'c', b'r', b'a', b'f', b't', 0x04, b'c',
+                b'o', b'r', b'e', 0x06, b'1', b'.', b'2', b'1', b'.', b'1'
+            ]
+        );
+        // The C2S body (same list encoding, no packet id) decodes back.
+        let decoded = decode_client_known_packs_0x07(&packet[1..]).unwrap();
+        assert_eq!(decoded, packs);
+        assert_eq!(decode_client_known_packs_0x07(&[0]), Some(vec![]));
+    }
+
+    #[test]
+    fn p7a_parity_known_packs_decode_is_fail_closed() {
+        // Counts above the cap and negative counts are refused before reading.
+        assert_eq!(decode_client_known_packs_0x07(&[65]), None);
+        assert_eq!(decode_client_known_packs_0x07(&[64]), None); // count ok, no bodies
+        let mut forged = vec![64];
+        for _ in 0..64 {
+            forged.extend_from_slice(&[1, b'a', 1, b'b', 1, b'c']);
+        }
+        assert_eq!(decode_client_known_packs_0x07(&forged).unwrap().len(), 64);
+        // Bad strings: truncated, invalid UTF-8, over the field bound.
+        assert_eq!(decode_client_known_packs_0x07(&[1, 5, b'a']), None);
+        assert_eq!(
+            decode_client_known_packs_0x07(&[1, 1, 0xff, 1, b'b', 1, b'c']),
+            None
+        );
+        let mut oversized = vec![1];
+        write_varint(&mut oversized, 1025);
+        oversized.extend_from_slice(&[b'a'; 1025]);
+        assert_eq!(decode_client_known_packs_0x07(&oversized), None);
+        // Trailing garbage after a complete list is still a bad packet.
+        let mut body = vec![0];
+        body.push(0);
+        assert_eq!(decode_client_known_packs_0x07(&body), None);
+    }
+
+    #[test]
+    fn p7a_parity_registry_data_0x07_dynamic_builder_matches_wire_layout() {
+        // A live `minecraft:chat_type` registry: two entries, the second with
+        // no NBT (`element = null` on the wire).
+        let packet = encode_registry_data_0x07(
+            "minecraft:chat_type",
+            &[
+                ("minecraft:chat".into(), Some(vec![0x0a, 0x00])),
+                ("minecraft:emote_command".into(), None),
+            ],
+        );
+        // The same header/entries parser `load_config_packets` trusts reads
+        // this builder's bytes back: exact wire-layout parity.
+        let (name, body) = config_registry_header(&packet).unwrap();
+        assert_eq!(name, "minecraft:chat_type");
+        let entries = registry_wire_entries(body).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "minecraft:chat");
+        assert_eq!(entries[0].1, [1, 0x0a, 0x00]);
+        assert_eq!(entries[1].0, "minecraft:emote_command");
+        assert_eq!(entries[1].1, [0]);
+        // An empty registry still encodes a well-formed packet.
+        let empty = encode_registry_data_0x07("minecraft:jukebox_song", &[]);
+        let (name, body) = config_registry_header(&empty).unwrap();
+        assert_eq!(name, "minecraft:jukebox_song");
+        assert_eq!(registry_wire_entries(body), Some(vec![]));
+    }
+
+    #[test]
+    fn p7a_parity_mutex_poison_never_cascades_into_server_ops() {
+        // A panicked handler poisons whatever lock it held. Recovery keeps the
+        // registries serving: `exec_server_ops_command` sees the same entries
+        // the panic left behind.
+        let bans = Mutex::new(BanRegistry::default());
+        let whitelist = Mutex::new(WhitelistRegistry::default());
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = bans.lock().unwrap_or_else(|e| e.into_inner());
+            guard.ban_player("Griefer", "griefing", "Server", "now");
+            panic!("synthetic handler panic");
+        }));
+        assert!(poisoned.is_err());
+        // Without recovery this lock() would cascade-panic; with it the ban the
+        // panic committed is still visible and mutations keep working.
+        {
+            let mut guard = bans.lock().unwrap_or_else(|e| e.into_inner());
+            let mut wl = whitelist.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(guard.player_ban("griefer").is_some());
+            let (reply, _) = exec_server_ops_command(
+                "banlist",
+                &mut guard,
+                &mut wl,
+                std::path::Path::new("/nonexistent-dir-for-test"),
+                "Server",
+                "now",
+            );
+            assert!(reply.contains("Griefer"), "{reply}");
+        }
+        // `login_identity`-pure admission logic is untouched by the poison.
+        let ops = OpsRegistry::default();
+        let wl = whitelist.lock().unwrap_or_else(|e| e.into_inner());
+        let b = bans.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(check_login_admission("Newbie", "1.2.3.4", 0, 4, &ops, &b, &wl).is_ok());
+        assert!(check_login_admission("Griefer", "1.2.3.4", 0, 4, &ops, &b, &wl).is_err());
+    }
+
+    #[test]
+    fn p7a_parity_no_unrecovered_lock_remains_in_owned_files() {
+        // The lane's lock-poison contract, pinned as a source scan: no
+        // unguarded lock/read/write-then-unwrap acquisition may come back in
+        // the two files this lane owns.
+        for file in ["src/server_ops.rs", "src/connection_limits.rs"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+            let text = std::fs::read_to_string(&path).unwrap();
+            // Needles are built, not written: the scan must not match itself.
+            for stem in [".lock()", ".read()", ".write()"] {
+                let needle = format!("{stem}.unwrap()");
+                assert!(
+                    !text.contains(&needle),
+                    "{file} still contains an unrecovered lock acquisition `{needle}`"
+                );
+            }
+        }
     }
 }

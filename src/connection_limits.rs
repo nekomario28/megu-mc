@@ -1532,4 +1532,64 @@ mod tests {
         assert!(within_broadcast_range(0.0, 0.0, 0.0, 8.0, 8.0, 8.0, 16.0));
         assert!(!within_broadcast_range(0.0, 0.0, 0.0, 9.3, 9.3, 9.3, 16.0));
     }
+
+    #[test]
+    fn p7a_parity_mutex_poison_never_cascades_into_connection_limits() {
+        // A handler that panics while holding the mutex leaves it poisoned.
+        // Every acquisition in this module goes through `lock()`, which recovers
+        // the guard, so the next unrelated request is served instead of
+        // cascade-panicking.
+        static CONNS: IpConnections = IpConnections::new();
+        static LOGINS: LoginRegistry = LoginRegistry::new();
+        let auth = AuthThrottle::new();
+        let peer = ip(203, 0, 113, 77);
+
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut c = lock(&CONNS.counts);
+            c.insert(peer, 1); // state the panic commits still lands
+            let mut h = lock(&LOGINS.held);
+            h.push(("steve".to_owned(), [9; 16]));
+            let mut e = lock(&auth.entries);
+            e.insert(
+                peer,
+                AuthEntry {
+                    failures: 3,
+                    locked_until: None,
+                    last_failure: Instant::now(),
+                },
+            );
+            panic!("synthetic handler panic while holding three locks");
+        }));
+        assert!(r.is_err());
+
+        // Per-IP slots still acquire and release; the panic's partial write is
+        // visible as it would be after any mid-update disconnect.
+        assert_eq!(CONNS.count(peer), 1);
+        let slot = CONNS.acquire(peer, 2).unwrap();
+        assert_eq!(CONNS.count(peer), 2);
+        drop(slot);
+        assert_eq!(CONNS.count(peer), 1);
+        // The login guard still refuses the name the panic left reserved.
+        assert_eq!(
+            LOGINS.reserve("Steve", [1; 16]).err(),
+            Some(LoginRefusal::NameInUse)
+        );
+        assert!(LOGINS.reserve("Alex", [1; 16]).is_ok());
+        // And the auth table still tracks and locks out.
+        let t0 = Instant::now();
+        assert_eq!(
+            auth.record_failure(peer, t0, 5, Duration::from_secs(30)),
+            4
+        );
+        assert_eq!(
+            auth.record_failure(peer, t0, 5, Duration::from_secs(30)),
+            5
+        );
+        assert_eq!(
+            auth.locked_for(peer, t0),
+            Some(Duration::from_secs(30))
+        );
+        auth.record_success(peer);
+        assert!(auth.locked_for(peer, t0).is_none());
+    }
 }
