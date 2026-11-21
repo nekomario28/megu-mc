@@ -2042,7 +2042,127 @@ fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
         }
         Err(error) => eprintln!("[spine] unable to load datapack registries: {error}"),
     }
+    append_custom_dimension_types(&mut config);
     config
+}
+
+/// The `minecraft:dimension_type` entry NBT a registered custom dimension declares,
+/// in the field order the vanilla registry writer emits.
+fn custom_dimension_type_nbt(spec: &worldgen::DimensionSpec) -> nbt::Tag {
+    let b = |v: bool| nbt::Tag::Byte(v as i8);
+    let t = nbt::NbtString::text;
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(t("piglin_safe"), b(spec.piglin_safe));
+    fields.insert(t("has_raids"), b(spec.has_raids));
+    fields.insert(
+        t("monster_spawn_light_level"),
+        nbt::Tag::Int(spec.monster_spawn_light_level),
+    );
+    fields.insert(
+        t("monster_spawn_block_light_limit"),
+        nbt::Tag::Int(spec.monster_spawn_block_light_limit),
+    );
+    fields.insert(t("natural"), b(spec.natural));
+    fields.insert(
+        t("ambient_light"),
+        nbt::Tag::Float(spec.ambient_light.to_bits()),
+    );
+    if let Some(fixed_time) = spec.fixed_time {
+        fields.insert(t("fixed_time"), nbt::Tag::Long(fixed_time));
+    }
+    fields.insert(
+        t("infiniburn"),
+        nbt::Tag::String(t(&spec.infiniburn)),
+    );
+    fields.insert(t("respawn_anchor_works"), b(spec.respawn_anchor_works));
+    fields.insert(t("has_skylight"), b(spec.has_skylight));
+    fields.insert(t("bed_works"), b(spec.bed_works));
+    fields.insert(t("effects"), nbt::Tag::String(t(&spec.effects)));
+    fields.insert(t("min_y"), nbt::Tag::Int(spec.min_y));
+    fields.insert(t("height"), nbt::Tag::Int(spec.height));
+    fields.insert(t("logical_height"), nbt::Tag::Int(spec.logical_height));
+    fields.insert(
+        t("coordinate_scale"),
+        nbt::Tag::Double(spec.coordinate_scale.to_bits()),
+    );
+    fields.insert(t("ultrawarm"), b(spec.ultrawarm));
+    fields.insert(t("has_ceiling"), b(spec.has_ceiling));
+    nbt::Tag::Compound(fields)
+}
+
+/// Append the registered custom `dimension_type` entries to the merged `0x07` registry
+/// packet — a datapack may already carry its type file (merged by the overlays), in
+/// which case only the wire-id table learns its position — and record every entry's
+/// wire index so `dim_type_wire_id` can answer for custom dimensions.
+fn append_custom_dimension_types(config: &mut [(i64, Vec<u8>)]) {
+    let specs = worldgen::custom_dimension_specs();
+    if specs.is_empty() {
+        return;
+    }
+    for (_, packet) in config.iter_mut().filter(|(id, _)| *id == 0x07) {
+        let Some((name, body)) = config_registry_header(packet) else {
+            continue;
+        };
+        if name != "minecraft:dimension_type" {
+            continue;
+        }
+        let Some(entries) = registry_wire_entries(body) else {
+            continue;
+        };
+        let mut ids: HashMap<String, i32> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, (entry, _))| (entry.to_string(), index as i32))
+            .collect();
+        let mut appended = Vec::new();
+        for spec in &specs {
+            if ids.contains_key(spec.type_key) {
+                continue;
+            }
+            let Ok(nbt) = nbt::write_network_nbt(&custom_dimension_type_nbt(spec)) else {
+                eprintln!("[spine] cannot encode dimension_type {}", spec.type_key);
+                continue;
+            };
+            let mut entry = Vec::new();
+            entry.push(1); // Optional NBT present.
+            entry.extend_from_slice(&nbt);
+            let index = (entries.len() + appended.len()) as i32;
+            ids.insert(spec.type_key.to_string(), index);
+            appended.push((spec.type_key, entry));
+        }
+        {
+            let mut table = dim_type_entry_ids().lock().unwrap();
+            for spec in &specs {
+                if let Some(&index) = ids.get(spec.type_key) {
+                    table.insert(spec.type_key, index);
+                }
+            }
+        }
+        if appended.is_empty() {
+            continue;
+        }
+        let count = entries.len() + appended.len();
+        let mut merged = vec![0x07];
+        write_str(&mut merged, name);
+        write_varint(&mut merged, count as i64);
+        for (id, payload) in entries {
+            write_str(&mut merged, id);
+            merged.extend_from_slice(payload);
+        }
+        for (id, payload) in appended {
+            write_str(&mut merged, id);
+            merged.extend_from_slice(&payload);
+        }
+        *packet = merged;
+    }
+}
+
+/// `type_key -> wire index` for the `minecraft:dimension_type` entries registered
+/// custom dimensions reference, published by `append_custom_dimension_types` when the
+/// config blob is built.
+fn dim_type_entry_ids() -> &'static Mutex<HashMap<&'static str, i32>> {
+    static IDS: OnceLock<Mutex<HashMap<&'static str, i32>>> = OnceLock::new();
+    IDS.get_or_init(Mutex::default)
 }
 
 fn player_attack_damage_wire_id(config: &[(i64, Vec<u8>)]) -> Option<i32> {
@@ -2769,7 +2889,21 @@ fn dim_type_wire_ids() -> [i32; 3] {
         .unwrap_or(&DIM_WIRE_IDS_FALLBACK)
 }
 fn dim_type_wire_id(dim: DimId) -> i32 {
-    dim_type_wire_ids()[dim.index()]
+    if dim.is_vanilla() {
+        return dim_type_wire_ids()[dim.index()];
+    }
+    // A custom dimension answers the index its `dimension_type` holds in the merged
+    // registry — where its datapack's type file landed or where
+    // `append_custom_dimension_types` appended it — never a slot number.
+    let Some(spec) = worldgen::dimension_spec(dim) else {
+        return dim_type_wire_ids()[0];
+    };
+    dim_type_entry_ids()
+        .lock()
+        .unwrap()
+        .get(spec.type_key)
+        .copied()
+        .unwrap_or_else(|| dim_type_wire_ids()[0])
 }
 
 /// 0x2b Join Game. Every dimension type the client can be moved into is declared so a
@@ -2779,8 +2913,9 @@ fn join_game(dim: DimId, gm: u8, eid: i32) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&eid.to_be_bytes());
     p.push(0);
-    write_varint(&mut p, 3);
-    for d in DimId::ALL {
+    let dimensions = DimId::all_registered();
+    write_varint(&mut p, dimensions.len() as i64);
+    for d in dimensions {
         write_str(&mut p, d.dimension_id());
     }
     write_varint(&mut p, 20);

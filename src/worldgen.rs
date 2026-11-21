@@ -58,81 +58,166 @@ impl NoisePreset {
 /// sky light layer. They agree one-to-one here only because this port loads one dimension per
 /// preset. The registry exists so a streaming caller can *name* the generator it wants
 /// instead of reading whichever one `init` installed last.
+/// A dimension registry slot. Slots 0..2 are pinned to the vanilla dimensions — the
+/// binary saves, the protocol wire IDs and the enum-era call sites all depend on them —
+/// and slots >= 3 are datapack-registered custom dimensions in registration order.
+///
+/// The constants keep `DimId::Overworld` / `DimId::Nether` / `DimId::End` valid in
+/// expressions AND match patterns, so the enum conversion touches no call-site syntax.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum DimId {
-    Overworld,
-    Nether,
-    End,
-}
+pub(crate) struct DimId(u32);
 
 impl DimId {
-    /// Every dimension the registry holds a slot for, in slot order.
+    /// Vanilla slot 0.
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Overworld: DimId = DimId(0);
+    /// Vanilla slot 1.
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Nether: DimId = DimId(1);
+    /// Vanilla slot 2.
+    #[allow(non_upper_case_globals)]
+    pub(crate) const End: DimId = DimId(2);
+
+    /// The pinned vanilla slots, in order.
     pub(crate) const ALL: [DimId; 3] = [DimId::Overworld, DimId::Nether, DimId::End];
+    /// Same set, under the name a reader reaches for next to `all_registered`.
+    #[allow(dead_code)]
+    pub(crate) const VANILLA: [DimId; 3] = Self::ALL;
+
+    /// A handle for a raw slot, validated or not. `from_index` is the checked entry.
+    #[allow(dead_code)]
+    pub(crate) const fn from_raw(raw: u32) -> DimId {
+        DimId(raw)
+    }
+
+    /// The raw slot value: registry index and the legacy one-byte save encoding.
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Slots 0..2 are the pinned vanilla dimensions; higher slots are datapack ones.
+    pub(crate) const fn is_vanilla(self) -> bool {
+        self.0 < Self::ALL.len() as u32
+    }
 
     /// The slot this dimension owns in the registry arrays: `ALL[i].index() == i`.
-    pub(crate) fn index(self) -> usize {
-        match self {
-            Self::Overworld => 0,
-            Self::Nether => 1,
-            Self::End => 2,
-        }
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
     }
 
+    /// Slot `index`'s dimension when it is registered now. Vanilla slots always
+    /// resolve; a custom slot resolves only while a datapack holds it — which is
+    /// exactly why the binary saves name custom dimensions by key instead.
     pub(crate) fn from_index(index: usize) -> Option<Self> {
-        Self::ALL.get(index).copied()
+        (index < registered_dimension_count()).then(|| DimId(index as u32))
     }
 
+    /// Every registered dimension: the three vanilla slots, then custom dimensions in
+    /// registration order.
+    pub(crate) fn all_registered() -> Vec<DimId> {
+        (0..registered_dimension_count())
+            .map(|index| DimId(index as u32))
+            .collect()
+    }
+
+    /// The noise preset a vanilla dimension's generator is built from. A custom
+    /// `Noise` spec keeps its own preset; other custom generators report `Overworld`
+    /// because there is no noise preset to name.
     pub(crate) fn preset(self) -> NoisePreset {
-        match self {
-            Self::Overworld => NoisePreset::Overworld,
-            Self::Nether => NoisePreset::Nether,
-            Self::End => NoisePreset::End,
+        match self.0 {
+            0 => NoisePreset::Overworld,
+            1 => NoisePreset::Nether,
+            2 => NoisePreset::End,
+            _ => match dimension_spec(self).map(|spec| spec.generator) {
+                Some(CustomGeneratorKind::Noise { preset }) => preset,
+                _ => NoisePreset::Overworld,
+            },
         }
     }
 
-    /// The `dimension_type` file name under `data/minecraft/dimension_type/`. Two of the
-    /// three are not the preset name: `the_nether` and `the_end`.
-    pub(crate) fn dimension_file(self) -> &'static str {
-        match self {
-            Self::Overworld => "overworld",
-            Self::Nether => "the_nether",
-            Self::End => "the_end",
+    /// The `dimension_type` file name under `data/minecraft/dimension_type/`, for the
+    /// vanilla dimensions. Two of the three are not the preset name: `the_nether` and
+    /// `the_end`. `None` for a custom dimension, whose type name is its `type_key`.
+    pub(crate) fn dimension_file(self) -> Option<&'static str> {
+        match self.0 {
+            0 => Some("overworld"),
+            1 => Some("the_nether"),
+            2 => Some("the_end"),
+            _ => None,
         }
     }
 
-    /// The dimension id a datapack (or the wire) names this dimension by.
+    /// The canonical `"namespace:path"` id a datapack (or the wire) names this
+    /// dimension by. The empty string answers for an unregistered slot, which the
+    /// wire paths must never emit.
     pub(crate) fn dimension_id(self) -> &'static str {
-        match self {
-            Self::Overworld => "minecraft:overworld",
-            Self::Nether => "minecraft:the_nether",
-            Self::End => "minecraft:the_end",
+        match self.0 {
+            0 => "minecraft:overworld",
+            1 => "minecraft:the_nether",
+            2 => "minecraft:the_end",
+            _ => dimension_key(self).unwrap_or(""),
         }
     }
 
+    /// Resolve a canonical `"namespace:path"` dimension id. A bare `path` names
+    /// `minecraft:path`, matching vanilla ResourceLocation defaults.
     pub(crate) fn parse_dimension_id(name: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|dimension| dimension.dimension_id() == name)
+        match name {
+            "minecraft:overworld" | "overworld" => return Some(Self::Overworld),
+            "minecraft:the_nether" | "the_nether" => return Some(Self::Nether),
+            "minecraft:the_end" | "the_end" => return Some(Self::End),
+            _ => {}
+        }
+        let canonical: std::borrow::Cow<'_, str> = if name.contains(':') {
+            name.into()
+        } else {
+            format!("minecraft:{name}").into()
+        };
+        DIMENSION_REGISTRY
+            .read()
+            .unwrap()
+            .by_key
+            .get(canonical.as_ref())
+            .map(|&raw| DimId(raw))
     }
 
-    /// `DimensionType.hasSkyLight()`: only the Overworld has a sky light layer.
+    /// `DimensionType.hasSkyLight()`: only the Overworld among the vanilla three, plus
+    /// whatever a custom `dimension_type` declares.
     pub(crate) fn has_skylight(self) -> bool {
-        matches!(self, DimId::Overworld)
-    }
-
-    /// The `dimension_type.min_y`: -64 for the Overworld, 0 for the Nether and the End.
-    pub(crate) fn min_y(self) -> i32 {
-        match self {
-            Self::Overworld => -64,
-            Self::Nether | Self::End => 0,
+        match self.0 {
+            0 => true,
+            1 | 2 => false,
+            _ => dimension_spec(self).is_some_and(|spec| spec.has_skylight),
         }
     }
 
-    /// The `dimension_type.height`: 384 for the Overworld, 256 for the Nether and the End.
+    /// The `dimension_type.min_y`: -64 for the Overworld, 0 for the Nether and the End,
+    /// the declared value for a custom dimension.
+    pub(crate) fn min_y(self) -> i32 {
+        match self.0 {
+            0 => -64,
+            1 | 2 => 0,
+            _ => return dimension_spec(self).map_or(0, |spec| spec.min_y),
+        }
+    }
+
+    /// The `dimension_type.height`: 384 for the Overworld, 256 for the Nether and the
+    /// End, the declared value for a custom dimension.
     pub(crate) fn height(self) -> i32 {
-        match self {
-            Self::Overworld => 384,
-            Self::Nether | Self::End => 256,
+        match self.0 {
+            0 => 384,
+            1 | 2 => 256,
+            _ => return dimension_spec(self).map_or(256, |spec| spec.height),
+        }
+    }
+
+    /// `dimension_type.coordinate_scale`: 1 for the Overworld and the End, 8 for the
+    /// Nether, the declared value for a custom dimension.
+    pub(crate) fn coordinate_scale(self) -> f64 {
+        match self.0 {
+            0 | 2 => 1.0,
+            1 => 8.0,
+            _ => dimension_spec(self).map_or(1.0, |spec| spec.coordinate_scale),
         }
     }
 
@@ -153,10 +238,27 @@ impl DimId {
         self.min_y() - 16
     }
 
-    /// The all-ones mask over this dimension's light sections: `0x3ff_ffff` for the
-    /// Overworld (26 bits), `0x3_ffff` for the Nether and the End (18 bits).
+    /// The all-ones mask over this dimension's light sections, saturated into one i64:
+    /// `0x3ff_ffff` for the Overworld (26 bits), `0x3_ffff` for the Nether and the End
+    /// (18 bits). Dimensions with more than 63 light sections need the word list in
+    /// [`DimId::light_mask_longs`]; this saturates to `i64::MAX` rather than shifting
+    /// past the word.
     pub(crate) fn light_mask(self) -> i64 {
-        (1i64 << self.light_sections()) - 1
+        (1i64 << self.light_sections().min(63)) - 1
+    }
+
+    /// The all-ones mask as the little-endian u64 word list the protocol bitset
+    /// carries: one word for every dimension the runtime supports today (up to 63
+    /// light sections), more for a taller custom `dimension_type`.
+    #[allow(dead_code)]
+    pub(crate) fn light_mask_longs(self) -> Vec<u64> {
+        let light = self.light_sections();
+        let mut words = vec![u64::MAX; light / 64];
+        let rest = light % 64;
+        if rest != 0 {
+            words.push((1u64 << rest) - 1);
+        }
+        words
     }
 }
 
@@ -169,6 +271,572 @@ impl From<NoisePreset> for DimId {
 impl From<DimId> for NoisePreset {
     fn from(dimension: DimId) -> Self {
         dimension.preset()
+    }
+}
+
+// ---------- custom dimension registry ----------
+
+/// The `generator.type` of a datapack `dimension/` file, reduced to what this engine
+/// can generate.
+#[derive(Clone, Debug)]
+pub(crate) enum CustomGeneratorKind {
+    /// `minecraft:noise` over one of the three vanilla noise settings, windowed by the
+    /// custom `dimension_type` (the generator's own noise window stays the preset's;
+    /// cells outside it answer air, exactly like the Nether's 0..255 world over its
+    /// 0..127 generator).
+    Noise { preset: NoisePreset },
+    /// `minecraft:flat`: `(block state id, layer height)` stacked upward from
+    /// `min_y`, every cell above the last layer air, every biome quart `biome_id`.
+    Flat { layers: Vec<(u16, u32)>, biome_id: i64 },
+    /// `minecraft:debug`, an unknown generator type, or a noise/flat settings object
+    /// this engine cannot load: every cell air, every biome quart `biome_id`.
+    Void { biome_id: i64 },
+}
+
+/// A custom dimension's `dimension_type` plus its generator choice — everything the
+/// runtime needs that vanilla's three hard-coded answers used to provide inline.
+#[derive(Clone, Debug)]
+pub(crate) struct DimensionSpec {
+    /// The registry slot this dimension owns (>= 3).
+    pub id: DimId,
+    /// Canonical `"namespace:path"` of the `dimension/` file.
+    pub key: &'static str,
+    /// Canonical `"namespace:path"` of the `dimension_type` it names.
+    pub type_key: &'static str,
+    pub min_y: i32,
+    pub height: i32,
+    pub logical_height: i32,
+    pub has_skylight: bool,
+    pub has_ceiling: bool,
+    pub ultrawarm: bool,
+    pub natural: bool,
+    pub coordinate_scale: f64,
+    pub ambient_light: f32,
+    pub fixed_time: Option<i64>,
+    pub piglin_safe: bool,
+    pub has_raids: bool,
+    pub bed_works: bool,
+    pub respawn_anchor_works: bool,
+    pub effects: String,
+    pub infiniburn: String,
+    pub monster_spawn_light_level: i32,
+    pub monster_spawn_block_light_limit: i32,
+    pub generator: CustomGeneratorKind,
+}
+
+/// The registered custom dimensions. `specs[i]` owns slot `3 + i`; `by_key` maps a
+/// canonical name to its raw slot. Registration is append-only so a slot never
+/// changes hands inside a process.
+#[derive(Default)]
+struct DimensionRegistry {
+    specs: Vec<DimensionSpec>,
+    by_key: std::collections::BTreeMap<String, u32>,
+}
+
+static DIMENSION_REGISTRY: std::sync::RwLock<DimensionRegistry> =
+    std::sync::RwLock::new(DimensionRegistry {
+        specs: Vec::new(),
+        by_key: std::collections::BTreeMap::new(),
+    });
+
+/// The legacy one-byte dimension encoding plus the java-compat u8 slot bound the
+/// registry to 255 slots: indices 0..=254 exist, 255 stays unresolvable forever.
+const MAX_DIMENSIONS: usize = 255;
+
+/// Total registered slots: the pinned vanilla three plus every custom dimension.
+pub(crate) fn registered_dimension_count() -> usize {
+    DimId::ALL.len() + DIMENSION_REGISTRY.read().unwrap().specs.len()
+}
+
+/// The spec a custom dimension registered under, cloned. Vanilla dimensions and
+/// unregistered slots answer `None` — their facts live in `GenFacts`.
+pub(crate) fn dimension_spec(dimension: DimId) -> Option<DimensionSpec> {
+    let index = dimension.index().checked_sub(DimId::ALL.len())?;
+    DIMENSION_REGISTRY.read().unwrap().specs.get(index).cloned()
+}
+
+/// Every custom dimension, in registration (and therefore slot) order.
+pub(crate) fn custom_dimension_specs() -> Vec<DimensionSpec> {
+    DIMENSION_REGISTRY.read().unwrap().specs.clone()
+}
+
+/// A custom dimension's canonical key without cloning its spec.
+fn dimension_key(dimension: DimId) -> Option<&'static str> {
+    let index = dimension.index().checked_sub(DimId::ALL.len())?;
+    DIMENSION_REGISTRY
+        .read()
+        .unwrap()
+        .specs
+        .get(index)
+        .map(|spec| spec.key)
+}
+
+/// Install `spec` under its canonical key. Re-registering an existing key updates it
+/// in place so slots stay stable across a datapack rescan.
+fn register_dimension_spec(mut spec: DimensionSpec) -> Result<DimId, String> {
+    let mut registry = DIMENSION_REGISTRY.write().unwrap();
+    if let Some(&raw) = registry.by_key.get(spec.key) {
+        spec.id = DimId(raw);
+        registry.specs[raw as usize - DimId::ALL.len()] = spec;
+        return Ok(DimId(raw));
+    }
+    let total = DimId::ALL.len() + registry.specs.len();
+    if total >= MAX_DIMENSIONS {
+        return Err(format!(
+            "dimension registry is full ({MAX_DIMENSIONS} slots): {}",
+            spec.key
+        ));
+    }
+    let raw = total as u32;
+    spec.id = DimId(raw);
+    registry.by_key.insert(spec.key.to_string(), raw);
+    registry.specs.push(spec);
+    Ok(DimId(raw))
+}
+
+/// Drop every custom registration and generator slot. Registration is append-only at
+/// runtime; tests reset between fixtures.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn reset_dimension_registry() {
+    let mut registry = DIMENSION_REGISTRY.write().unwrap();
+    registry.specs.clear();
+    registry.by_key.clear();
+    drop(registry);
+    PER_DIM.gens.lock().unwrap().truncate(DimId::ALL.len());
+    PER_DIM.data.lock().unwrap().truncate(DimId::ALL.len());
+    PER_DIM.facts.lock().unwrap().truncate(DimId::ALL.len());
+}
+
+/// `j.num()` as an integer, or `None` when the field is absent or not a whole number.
+fn jint(j: &J, key: &str) -> Option<i64> {
+    let value = j.get(key)?.num();
+    (value.fract() == 0.0 && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX))
+        .then(|| value as i64)
+}
+
+/// `j.str()` for a string field that must be present.
+fn jstring<'a>(j: &'a J, key: &str) -> Option<&'a str> {
+    match j.get(key)? {
+        J::Str(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// A canonical `"namespace:path"` from a ResourceLocation string; a bare path names
+/// the `minecraft` namespace.
+fn canonical_key(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let (namespace, path) = match name.split_once(':') {
+        Some((ns, path)) => (ns, path),
+        None => ("minecraft", name),
+    };
+    let valid = |part: &str, colon: bool| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./".contains(c) || (colon && c == ':'))
+    };
+    (valid(namespace, false) && valid(path, true))
+        .then(|| format!("{namespace}:{path}"))
+}
+
+/// The `dimension_type` values the four vanilla registry names carry. Custom
+/// dimensions may name them; `minecraft:overworld_caves` maps onto the Overworld
+/// window because this port does not distinguish the caves variant.
+fn vanilla_dimension_type(type_key: &str) -> Option<DimensionSpec> {
+    let (min_y, height, skylight, ceiling, ultrawarm, scale, ambient, effects, infiniburn, raids, bed, anchor) =
+        match type_key {
+            "minecraft:overworld" | "minecraft:overworld_caves" => (
+                -64, 384, true, false, false, 1.0, 0.0, "minecraft:overworld",
+                "#minecraft:infiniburn_overworld", true, true, false,
+            ),
+            "minecraft:the_nether" => (
+                0, 256, false, true, true, 8.0, 0.1, "minecraft:the_nether",
+                "#minecraft:infiniburn_nether", false, false, true,
+            ),
+            "minecraft:the_end" => (
+                0, 256, false, false, false, 1.0, 0.0, "minecraft:the_end",
+                "#minecraft:infiniburn_end", false, false, false,
+            ),
+            _ => return None,
+        };
+    Some(DimensionSpec {
+        id: DimId::Overworld,
+        key: "",
+        type_key: "",
+        min_y,
+        height,
+        logical_height: height,
+        has_skylight: skylight,
+        has_ceiling: ceiling,
+        ultrawarm,
+        natural: true,
+        coordinate_scale: scale,
+        ambient_light: ambient,
+        fixed_time: None,
+        piglin_safe: false,
+        has_raids: raids,
+        bed_works: bed,
+        respawn_anchor_works: anchor,
+        effects: effects.into(),
+        infiniburn: infiniburn.into(),
+        monster_spawn_light_level: 0,
+        monster_spawn_block_light_limit: 0,
+        generator: CustomGeneratorKind::Void { biome_id: 39 },
+    })
+}
+
+/// Parse one `dimension_type/*.json` body into the fields a `DimensionSpec` carries,
+/// with vanilla's defaults for the optional fields and hard validation on the window.
+fn parse_dimension_type(key: &str, j: &J) -> Result<DimensionSpec, String> {
+    let bad = |why: &str| format!("dimension_type {key}: {why}");
+    let min_y = jint(j, "min_y").ok_or_else(|| bad("missing integer min_y"))? as i32;
+    let height = jint(j, "height").ok_or_else(|| bad("missing integer height"))? as i32;
+    if min_y % 16 != 0 {
+        return Err(bad("min_y must be a multiple of 16"));
+    }
+    if height <= 0 || height % 16 != 0 || height > 4096 {
+        return Err(bad("height must be a positive multiple of 16 up to 4096"));
+    }
+    let coordinate_scale = j.get("coordinate_scale").map(J::num).unwrap_or(1.0);
+    if !(coordinate_scale > 0.0 && coordinate_scale.is_finite()) {
+        return Err(bad("coordinate_scale must be positive and finite"));
+    }
+    let ambient_light = j.get("ambient_light").map(J::num).unwrap_or(0.0) as f32;
+    let natural = jbool(j, "natural", true);
+    Ok(DimensionSpec {
+        id: DimId::Overworld,
+        key: "",
+        type_key: "",
+        min_y,
+        height,
+        logical_height: jint(j, "logical_height").map_or(height, |v| v as i32),
+        has_skylight: jbool(j, "has_skylight", true),
+        has_ceiling: jbool(j, "has_ceiling", false),
+        ultrawarm: jbool(j, "ultrawarm", false),
+        natural,
+        coordinate_scale,
+        ambient_light,
+        fixed_time: jint(j, "fixed_time"),
+        piglin_safe: jbool(j, "piglin_safe", false),
+        has_raids: jbool(j, "has_raids", natural),
+        bed_works: jbool(j, "bed_works", true),
+        respawn_anchor_works: jbool(j, "respawn_anchor_works", false),
+        effects: jstring(j, "effects").unwrap_or("minecraft:overworld").into(),
+        infiniburn: jstring(j, "infiniburn")
+            .unwrap_or("#minecraft:infiniburn_overworld")
+            .into(),
+        monster_spawn_light_level: j
+            .get("monster_spawn_light_level")
+            .and_then(|v| jint(&J::Obj(vec![("v".into(), v.clone())]), "v"))
+            .unwrap_or(0) as i32,
+        monster_spawn_block_light_limit: jint(j, "monster_spawn_block_light_limit")
+            .unwrap_or(0) as i32,
+        generator: CustomGeneratorKind::Void { biome_id: 39 },
+    })
+}
+
+/// The `settings.biome` of a flat/unknown generator, or the engine's fallback.
+fn generator_biome_id(generator: &J) -> i64 {
+    generator
+        .get("biome")
+        .map(J::str)
+        .map(biome_id)
+        .unwrap_or(39) // plains
+}
+
+/// Parse the `generator` object of a `dimension/*.json` into a generator kind.
+fn parse_dimension_generator(
+    key: &str,
+    j: &J,
+    res: fn(&str) -> Option<u32>,
+) -> Result<CustomGeneratorKind, String> {
+    let bad = |why: &str| format!("dimension {key}: {why}");
+    let generator = j.get("generator").ok_or_else(|| bad("missing generator"))?;
+    match generator.get("type").map(J::str) {
+        Some("minecraft:noise") => {
+            let preset = generator
+                .get("settings")
+                .map(J::str)
+                .and_then(|name| NoisePreset::parse(name.rsplit(':').next().unwrap_or(name)));
+            Ok(match preset {
+                Some(preset) => CustomGeneratorKind::Noise { preset },
+                // Noise settings beyond the three vanilla presets cannot be loaded:
+                // fall back to a void world rather than refusing the dimension.
+                None => CustomGeneratorKind::Void {
+                    biome_id: generator_biome_id(generator),
+                },
+            })
+        }
+        Some("minecraft:flat") => {
+            let settings = generator
+                .get("settings")
+                .ok_or_else(|| bad("flat generator without settings"))?;
+            let mut layers = Vec::new();
+            if let Some(list) = settings.get("layers").and_then(J::as_arr) {
+                for layer in list {
+                    let name = layer.get("block").map(J::str).unwrap_or("");
+                    let height = layer.get("height").map(J::num).unwrap_or(0.0);
+                    if !(height > 0.0 && height.fract() == 0.0 && height <= 4096.0) {
+                        return Err(bad("flat layer height must be a positive integer"));
+                    }
+                    let Some(state) = res(name).filter(|&id| id <= u32::from(u16::MAX))
+                    else {
+                        return Err(bad(&format!("flat layer block '{name}' is unknown")));
+                    };
+                    layers.push((state as u16, height as u32));
+                }
+            }
+            Ok(CustomGeneratorKind::Flat {
+                layers,
+                biome_id: generator_biome_id(settings),
+            })
+        }
+        // `minecraft:debug` and every generator type this engine does not know:
+        // a safe void world is the honest answer.
+        _ => Ok(CustomGeneratorKind::Void {
+            biome_id: generator_biome_id(generator),
+        }),
+    }
+}
+
+/// One datapack's raw materials for the dimension scan: a directory root whose
+/// `data/` tree is walked, or a zip's already-extracted `(entry path, body)` pairs.
+pub(crate) enum DatapackDimensionSource {
+    Directory(std::path::PathBuf),
+    Entries(Vec<(String, String)>),
+}
+
+/// Scan `data/<ns>/dimension_type/*.json` and `data/<ns>/dimension/*.json` across the
+/// packs, in the order `datapack_sources` declared them (later packs override earlier
+/// ones, matching `read_entry`'s own merge), and register every valid custom
+/// dimension. Custom slots are assigned in `(namespace, path)` order across the whole
+/// merge, so the wire ids are deterministic. The three vanilla dimension names are
+/// pinned and never re-registered. Returns the number of distinct custom dimensions
+/// now registered.
+///
+/// An invalid file is skipped with a diagnostic rather than aborting the scan —
+/// vanilla ignores a bad pack file the same way.
+pub(crate) fn register_datapack_dimensions(
+    sources: &[DatapackDimensionSource],
+    res: fn(&str) -> Option<u32>,
+) -> Result<usize, String> {
+    *BLOCK_LOOKUP.lock().unwrap() = Some(res);
+    let mut types: std::collections::BTreeMap<(String, String), J> = Default::default();
+    let mut dims: std::collections::BTreeMap<(String, String), J> = Default::default();
+    for source in sources {
+        let files: Vec<(String, String)> = match source {
+            DatapackDimensionSource::Entries(entries) => entries
+                .iter()
+                .filter(|(path, _)| path.ends_with(".json"))
+                .map(|(path, body)| (path.clone(), body.clone()))
+                .collect(),
+            DatapackDimensionSource::Directory(root) => {
+                let mut dirs = vec![root.join("data")];
+                let mut files = Vec::new();
+                while let Some(dir) = dirs.pop() {
+                    let Ok(entries) = std::fs::read_dir(&dir) else {
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        let Ok(file_kind) = entry.file_type() else {
+                            continue;
+                        };
+                        let path = entry.path();
+                        if file_kind.is_dir() {
+                            dirs.push(path);
+                        } else if file_kind.is_file()
+                            && path.extension().is_some_and(|ext| ext == "json")
+                        {
+                            let rel = path
+                                .strip_prefix(root)
+                                .ok()
+                                .and_then(|p| p.to_str())
+                                .map(|p| p.replace('\\', "/"));
+                            if let (Some(rel), Ok(body)) = (rel, std::fs::read_to_string(&path))
+                            {
+                                files.push((rel, body));
+                            }
+                        }
+                    }
+                }
+                files
+            }
+        };
+        for (rel, body) in files {
+            // `data/<ns>/<kind>/<path>.json` — anything else is not a dimension file.
+            let mut parts = rel.splitn(3, '/');
+            let (Some("data"), Some(ns), Some(rest)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let Some((kind, name)) = rest.split_once('/') else {
+                continue;
+            };
+            let Some(name) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let map = match kind {
+                "dimension_type" => &mut types,
+                "dimension" => &mut dims,
+                _ => continue,
+            };
+            match jparse(body.as_bytes()) {
+                Some(j) => {
+                    map.insert((ns.to_string(), name.to_string()), j);
+                }
+                None => eprintln!("[spine] invalid {kind} JSON {rel}"),
+            }
+        }
+    }
+    register_dimension_maps(&types, &dims, res)
+}
+
+/// The registration half of [`register_datapack_dimensions`], separated so the file
+/// walk and the (ns, path)-sorted registration order stay testable apart.
+fn register_dimension_maps(
+    types: &std::collections::BTreeMap<(String, String), J>,
+    dims: &std::collections::BTreeMap<(String, String), J>,
+    res: fn(&str) -> Option<u32>,
+) -> Result<usize, String> {
+    let mut registered = 0usize;
+    for ((ns, path), dim_j) in dims {
+        let key = format!("{ns}:{path}");
+        // The three vanilla names are pinned: a datapack must not move a vanilla
+        // slot or its wire id.
+        if matches!(
+            key.as_str(),
+            "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
+        ) {
+            continue;
+        }
+        let Some(type_key) = canonical_key(dim_j.get("type").map(J::str).unwrap_or(""))
+        else {
+            eprintln!("[spine] dimension {key}: missing or invalid type");
+            continue;
+        };
+        let type_spec = match dim_j.get("type") {
+            // An inline type object parses directly; the dimension's own key names it.
+            Some(J::Obj(_)) => {
+                match parse_dimension_type(&key, dim_j.get("type").unwrap()) {
+                    Ok(spec) => Ok(spec),
+                    Err(error) => Err(error),
+                }
+            }
+            _ => {
+                let (tns, tpath) = type_key.split_once(':').unwrap();
+                match types.get(&(tns.to_string(), tpath.to_string())) {
+                    Some(tj) => parse_dimension_type(&type_key, tj),
+                    None => match vanilla_dimension_type(&type_key) {
+                        Some(spec) => Ok(spec),
+                        None => Err(format!(
+                            "dimension {key}: unknown dimension_type '{type_key}'"
+                        )),
+                    },
+                }
+            }
+        };
+        let mut spec = match type_spec {
+            Ok(spec) => spec,
+            Err(error) => {
+                eprintln!("[spine] {error}");
+                continue;
+            }
+        };
+        spec.generator = match parse_dimension_generator(&key, dim_j, res) {
+            Ok(generator) => generator,
+            Err(error) => {
+                eprintln!("[spine] {error}");
+                continue;
+            }
+        };
+        spec.key = Box::leak(key.clone().into_boxed_str());
+        spec.type_key = match dim_j.get("type") {
+            Some(J::Obj(_)) => spec.key,
+            _ => Box::leak(type_key.into_boxed_str()),
+        };
+        match register_dimension_spec(spec) {
+            Ok(_) => registered += 1,
+            Err(error) => eprintln!("[spine] {error}"),
+        }
+    }
+    Ok(registered)
+}
+
+/// The generated state for one cell of a `Flat`/`Void` custom dimension, without a
+/// generator. `Noise` specs, vanilla dimensions and unregistered slots answer `None`:
+/// their `Gen` owns the answer.
+pub(crate) fn custom_dim_state(dimension: DimId, _x: i32, y: i32, _z: i32) -> Option<u32> {
+    let spec = dimension_spec(dimension)?;
+    match &spec.generator {
+        CustomGeneratorKind::Void { .. } => Some(0),
+        CustomGeneratorKind::Flat { layers, .. } => {
+            let mut top = i64::from(spec.min_y);
+            for &(state, height) in layers {
+                top += i64::from(height);
+                if i64::from(y) < top {
+                    return Some(u32::from(state));
+                }
+            }
+            Some(0)
+        }
+        CustomGeneratorKind::Noise { .. } => None,
+    }
+}
+
+/// The uniform biome id a `Flat`/`Void` custom dimension reports, or `None`.
+fn custom_biome_id(dimension: DimId) -> Option<i64> {
+    match dimension_spec(dimension)?.generator {
+        CustomGeneratorKind::Flat { biome_id, .. } | CustomGeneratorKind::Void { biome_id } => {
+            Some(biome_id)
+        }
+        CustomGeneratorKind::Noise { .. } => None,
+    }
+}
+
+/// One 16³ section of a `Flat`/`Void` custom dimension, or `None` when the dimension
+/// has a real generator (vanilla or custom `Noise`) that must answer instead.
+fn custom_terrain_section(dimension: DimId, sy: i32) -> Option<Box<[u32; 4096]>> {
+    let spec = dimension_spec(dimension)?;
+    match &spec.generator {
+        CustomGeneratorKind::Noise { .. } => None,
+        CustomGeneratorKind::Void { .. } => Some(Box::new([0; 4096])),
+        CustomGeneratorKind::Flat { layers, .. } => {
+            let mut arr = Box::new([0u32; 4096]);
+            let mut top = i64::from(spec.min_y);
+            for &(state, height) in layers {
+                let bottom = top;
+                top += i64::from(height);
+                for ly in 0..16i64 {
+                    let y = i64::from(sy) + ly;
+                    if y >= bottom && y < top {
+                        let row = ly as usize * 256;
+                        arr[row..row + 256].fill(u32::from(state));
+                    }
+                }
+            }
+            Some(arr)
+        }
+    }
+}
+
+/// The column surface a `Flat`/`Void` custom dimension reports for the light and
+/// height paths: the top of its layer stack (`min_y` for a void). `None` for anything
+/// with a real generator.
+pub(crate) fn custom_surface_height(dimension: DimId) -> Option<i32> {
+    let spec = dimension_spec(dimension)?;
+    match &spec.generator {
+        CustomGeneratorKind::Flat { layers, .. } => Some(
+            spec.min_y
+                .saturating_add(layers.iter().map(|(_, height)| *height as i32).sum::<i32>()),
+        ),
+        CustomGeneratorKind::Void { .. } => Some(spec.min_y),
+        CustomGeneratorKind::Noise { .. } => None,
     }
 }
 
@@ -186,7 +854,7 @@ pub(crate) fn parse_world_seed(value: &str) -> Result<u64, std::num::ParseIntErr
 /// (`overworld_caves` is a separate dimension_type this port does not load), and it
 /// declares the same -64/384 window.
 fn dimension_type_file(preset: NoisePreset) -> &'static str {
-    preset.dim().dimension_file()
+    preset.dim().dimension_file().unwrap_or("overworld")
 }
 
 /// The world window one `dimension_type` object declares, or `None` when it is not a
@@ -6599,9 +7267,6 @@ pub fn take_generated_fluid_ticks() -> Vec<GeneratedTick> {
     queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.fluids))
 }
 
-/// How many dimensions the registry holds a generator slot for.
-pub(crate) const DIM_SLOTS: usize = DimId::ALL.len();
-
 /// The per-dimension generator registry: one `Gen` per dimension, every one built from the
 /// same world seed and its own preset's noise settings.
 ///
@@ -6610,24 +7275,36 @@ pub(crate) const DIM_SLOTS: usize = DimId::ALL.len();
 /// offline diagnostic (`MC_SPINE_WG_PRESET`). The Overworld keeps its old meaning exactly:
 /// the dim-less accessors ([`with_gen`], [`terrain_section`], [`facts`], [`data_snapshot`])
 /// answer for the [`active_dim`] slot, and `init` always makes that the Overworld.
+///
+/// The vectors index by [`DimId::index`]: slots 0..2 are the pinned vanilla dimensions
+/// and custom dimensions extend them in registration order. A vector reads as "no
+/// generator" for a slot that has not been installed, so a `Flat`/`Void` custom
+/// dimension — which has no `Gen` — just never fills its slot.
 pub(crate) struct PerDimGen {
-    /// The generators, indexed by [`DimId::index`]. One lock for all three, because a
+    /// The generators, indexed by [`DimId::index`]. One lock for all of them, because a
     /// `Gen` is not `Send`-shareable work in progress: generation holds its dimension's
     /// generator exclusively, exactly as it held `GEN`.
-    gens: Mutex<[Option<Gen>; DIM_SLOTS]>,
+    gens: Mutex<Vec<Option<Gen>>>,
     /// The immutable half of each generator, published at init. A worker clones the `Arc`
     /// once and then reads a dimension's inputs without touching the generator lock.
-    data: Mutex<[Option<std::sync::Arc<GenData>>; DIM_SLOTS]>,
+    data: Mutex<Vec<Option<std::sync::Arc<GenData>>>>,
     /// The dimension facts of each generator, published at init: the lock-free answer a
     /// reader wants for the build height, the sea level or the world window.
-    facts: Mutex<[Option<GenFacts>; DIM_SLOTS]>,
+    facts: Mutex<Vec<Option<GenFacts>>>,
 }
 
 static PER_DIM: PerDimGen = PerDimGen {
-    gens: Mutex::new([None, None, None]),
-    data: Mutex::new([None, None, None]),
-    facts: Mutex::new([None, None, None]),
+    gens: Mutex::new(Vec::new()),
+    data: Mutex::new(Vec::new()),
+    facts: Mutex::new(Vec::new()),
 };
+
+/// The seed `init` installed, kept so a custom `Noise` dimension can lazily build its
+/// generator on first use.
+static GEN_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The block-state lookup `init` installed, kept for the same lazy install.
+static BLOCK_LOOKUP: Mutex<Option<fn(&str) -> Option<u32>>> = Mutex::new(None);
 
 /// Which slot the dim-less accessors answer for.
 ///
@@ -6636,7 +7313,7 @@ static PER_DIM: PerDimGen = PerDimGen {
 /// `with_gen`, its `world_min_y()`, its dump length). `init` — the runtime's only call —
 /// always installs the Overworld, so a server's dim-less path is the Overworld.
 static ACTIVE_DIM: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(DimId::Overworld as u8);
+    std::sync::atomic::AtomicU8::new(DimId::Overworld.raw() as u8);
 
 /// The dimension the dim-less accessors answer for (the Overworld unless an offline
 /// diagnostic selected another one). The streaming path never asks this: it names its
@@ -6735,7 +7412,7 @@ pub(crate) mod parallel_probe {
 /// the lock was taken for — so `gen_lock().as_mut()` still means "the Overworld generator",
 /// unchanged, and `gen_lock_dim(dim)` means the same thing for another dimension.
 pub(crate) struct GenLock {
-    guard: std::sync::MutexGuard<'static, [Option<Gen>; DIM_SLOTS]>,
+    guard: std::sync::MutexGuard<'static, Vec<Option<Gen>>>,
     dim: DimId,
     /// `Some` when profiling: the time spent inside `PER_DIM.gens.lock()`.
     waited_ns: Option<u64>,
@@ -6779,6 +7456,7 @@ impl std::ops::DerefMut for GenLock {
 /// later writer would silently diverge from the generator.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GenFacts {
+    #[allow(dead_code)]
     pub preset: NoisePreset,
     pub sea: i32,
     /// generator window (`noise_settings`)
@@ -6807,7 +7485,13 @@ pub fn data_snapshot() -> Option<std::sync::Arc<GenData>> {
 
 /// One dimension's immutable half, published at init.
 pub(crate) fn data_snapshot_dim(dimension: DimId) -> Option<std::sync::Arc<GenData>> {
-    PER_DIM.data.lock().unwrap()[dimension.index()].clone()
+    PER_DIM
+        .data
+        .lock()
+        .unwrap()
+        .get(dimension.index())
+        .cloned()
+        .flatten()
 }
 
 /// The active dimension's immutable facts, without the generator lock. `None` before `init`.
@@ -6818,16 +7502,22 @@ pub(crate) fn facts() -> Option<GenFacts> {
 /// One dimension's immutable facts, without the generator lock. `None` until that dimension
 /// is installed.
 pub(crate) fn facts_dim(dimension: DimId) -> Option<GenFacts> {
-    PER_DIM.facts.lock().unwrap()[dimension.index()]
+    PER_DIM
+        .facts
+        .lock()
+        .unwrap()
+        .get(dimension.index())
+        .copied()
+        .flatten()
 }
 
 /// `DimensionType.hasSkyLight()` for one dimension, answered from the published facts (no
 /// generator lock); the Overworld's answer before any dimension is installed, which is the
 /// frame every pre-registry default came from.
 pub(crate) fn has_skylight(dimension: DimId) -> bool {
-    facts_dim(dimension).map_or(dimension.has_skylight(), |facts| {
-        facts.preset.dim().has_skylight()
-    })
+    // `DimId::has_skylight` is authoritative: the vanilla match answers slots 0..2 and
+    // a custom dimension's `dimension_type` answers the rest.
+    dimension.has_skylight()
 }
 
 fn gen_lock() -> GenLock {
@@ -6841,7 +7531,14 @@ fn gen_lock_dim(dimension: DimId) -> GenLock {
     // that queues behind a section pass.
     let prof = env_flag!("FEAT_PROFILE") || env_flag!("MC_SPINE_TICK_PROFILE");
     let started = prof.then(std::time::Instant::now);
-    let guard = PER_DIM.gens.lock().unwrap();
+    let mut guard = PER_DIM.gens.lock().unwrap();
+    // The caller's slot always exists: a custom dimension registers before it can be
+    // named, and this grow is what turns "slot beyond the vanilla three" from a panic
+    // into a `None` generator.
+    let need = dimension.index() + 1;
+    if guard.len() < need {
+        guard.resize_with(need, || None);
+    }
     GenLock {
         guard,
         dim: dimension,
@@ -6912,19 +7609,35 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
         NoisePreset::Overworld => Gen::load(seed, res),
         NoisePreset::End | NoisePreset::Nether => Gen::load_preset(seed, res, preset),
     };
-    let Some(g) = generator else { return false };
+    let Some(mut g) = generator else { return false };
     // Published before the generator, in the order a reader needs them: once a reader can see
     // this dimension as active, its facts, its data snapshot and its generator are all there.
+    GEN_SEED.store(seed, std::sync::atomic::Ordering::Relaxed);
+    *BLOCK_LOOKUP.lock().unwrap() = Some(res);
+    // A custom `Noise` dimension keeps its preset's generator window but its own
+    // declared world window — the same split the Nether's 0..255 world over a 0..127
+    // generator already exercises. `block_state_at` answers air outside the generator
+    // window and `feat_write` stays inside the world window, both unchanged.
+    if let Some(spec) = dimension_spec(dimension)
+        .filter(|spec| matches!(spec.generator, CustomGeneratorKind::Noise { .. }))
+    {
+        g.world_min_y = spec.min_y;
+        g.world_height = spec.height;
+    }
+    let (world_min_y, world_height) = (g.world_min_y, g.world_height);
     let slot = dimension.index();
     {
         let mut facts = PER_DIM.facts.lock().unwrap();
+        if facts.len() <= slot {
+            facts.resize(slot + 1, None);
+        }
         facts[slot] = Some(GenFacts {
             preset: g.preset,
             sea: g.sea,
             min_y: g.min_y,
             height: g.height,
-            world_min_y: g.world_min_y,
-            world_height: g.world_height,
+            world_min_y,
+            world_height,
             #[cfg(test)]
             def_st: g.def_st,
             #[cfg(test)]
@@ -6935,6 +7648,9 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
     }
     {
         let mut data = PER_DIM.data.lock().unwrap();
+        if data.len() <= slot {
+            data.resize(slot + 1, None);
+        }
         data[slot] = Some(g.data.clone());
     }
     let ticks = g.generated_ticks.clone();
@@ -7191,7 +7907,34 @@ pub(crate) fn parse_population_order(
 /// generator instead of whatever `init` installed last. A dimension with no generator
 /// installed answers `None`, exactly as an uninitialised world answered before.
 pub fn with_gen_dim<R>(dimension: DimId, f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
+    ensure_dim_generator(dimension);
     gen_lock_dim(dimension).as_mut().map(f)
+}
+
+/// Install a custom `Noise` dimension's generator on first use, with the seed and
+/// block lookup `init` published. `Flat`/`Void` dimensions and vanilla slots answer
+/// early — their `None`/`Some` slots need nothing installed.
+fn ensure_dim_generator(dimension: DimId) {
+    let spec = match dimension_spec(dimension) {
+        Some(spec) => spec,
+        None => return,
+    };
+    if !matches!(spec.generator, CustomGeneratorKind::Noise { .. }) {
+        return;
+    }
+    let slot_ready = PER_DIM
+        .gens
+        .lock()
+        .unwrap()
+        .get(dimension.index())
+        .is_some_and(|slot| slot.is_some());
+    if slot_ready {
+        return;
+    }
+    let Some(res) = *BLOCK_LOOKUP.lock().unwrap() else {
+        return;
+    };
+    install(dimension, GEN_SEED.load(std::sync::atomic::Ordering::Relaxed), res, false);
 }
 
 /// Run a diagnostic against the active dimension's generator — the Overworld for every
@@ -7560,6 +8303,7 @@ pub fn chunk_cols(cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
 /// owns the chunk, not whichever one `init` installed last: the Nether's column heights are
 /// not the Overworld's.
 pub fn chunk_cols_dim(dimension: DimId, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
+    ensure_dim_generator(dimension);
     gen_lock_dim(dimension).as_mut()?.cols(cx, cz)
 }
 
@@ -11796,6 +12540,10 @@ pub fn terrain_section_dim(
     cz: i32,
     populate: impl FnMut(&mut Gen, i32, i32),
 ) -> Option<Box<[u32; 4096]>> {
+    if let Some(section) = custom_terrain_section(dimension, sy) {
+        return Some(section);
+    }
+    ensure_dim_generator(dimension);
     let mut gg = gen_lock_dim(dimension);
     gg.as_mut()?
         .terrain_section_at(cx, sy, cz, populate)
@@ -12790,6 +13538,10 @@ pub fn biome_section_dim(
     sy: i32,
     cz: i32,
 ) -> Option<Box<[i64; 64]>> {
+    if let Some(biome) = custom_biome_id(dimension) {
+        return Some(Box::new([biome; 64]));
+    }
+    ensure_dim_generator(dimension);
     let mut gg = gen_lock_dim(dimension);
     let g = gg.as_mut()?;
     let mut out = Box::new([39i64; 64]); // plains
@@ -16283,7 +17035,7 @@ mod wg_tests {
             assert_eq!(NoisePreset::from(dimension), dimension.preset());
             assert_eq!(
                 dimension.dimension_file(),
-                dimension_type_file(dimension.preset())
+                Some(dimension_type_file(dimension.preset()))
             );
         }
 

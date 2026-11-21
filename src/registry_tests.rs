@@ -1314,6 +1314,7 @@ fn sky_light_reaches_sideways_through_an_opening() {
         }
     };
     let spill = sky_spill(
+        DimId::Overworld,
         0,
         0,
         |x, z| floors[((z.rem_euclid(16) as usize) << 4) | (x.rem_euclid(16) as usize)],
@@ -1918,7 +1919,7 @@ fn p5_check_spill_scene(label: &str, solid: impl Fn(i32, i32, i32) -> bool) {
         }
     };
 
-    let dense = sky_spill(0, 0, &floor_of, &opacity);
+    let dense = sky_spill(DimId::Overworld, 0, 0, &floor_of, &opacity);
     let sparse = p5_reference_sky_spill(0, 0, &floor_of, &opacity);
     // A scene that produced nothing would agree trivially, and one that produced only seeds
     // would never enter the BFS at all.
@@ -1976,7 +1977,7 @@ fn p5_check_spill_scene(label: &str, solid: impl Fn(i32, i32, i32) -> bool) {
         }
     }
     let mut applied = sky_light_sections_from(0, 0, &floors);
-    sky_spill_apply(0, 0, &floor_of, &opacity, &mut applied);
+    sky_spill_apply(DimId::Overworld, 0, 0, &floor_of, &opacity, &mut applied);
     let composed = sky_light_sections_with_spill(0, 0, &floors, &sparse);
     assert_eq!(applied, composed, "{label}: the packed payloads differ");
 }
@@ -2259,7 +2260,7 @@ fn m3_p5_hot_path_ab_bench() {
         }));
         let new_spill = time(Box::new(|| {
             let mut out = sky_light_sections_from(0, 0, &floors);
-            sky_spill_apply(0, 0, &floor_of, &opacity, &mut out);
+            sky_spill_apply(DimId::Overworld, 0, 0, &floor_of, &opacity, &mut out);
             std::hint::black_box(&out);
         }));
         assert!(cells > 256, "{label}: the scene must spread, got {cells} cells");
@@ -3397,4 +3398,238 @@ fn datapack_mod_e2e_duplicate_paths_are_pack_local_and_later_packs_win() {
     // The same path in two different packs is a legal override, and the later pack wins.
     assert_eq!(entries[0].1.get("message_id"), Some(&nbt_str("generic_mod")));
     assert_eq!(entries[1].1.get("message_id"), Some(&nbt_str("mod_only")));
+}
+
+// ---- Track 2: dynamic dimension architecture --------------------------------
+
+// The dimension registry is process-global; tests that register custom
+// dimensions must not run concurrently.
+static DYNAMIC_DIM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn dynamic_dim_entries(files: &[(&str, &str)]) -> Vec<worldgen::DatapackDimensionSource> {
+    vec![worldgen::DatapackDimensionSource::Entries(
+        files
+            .iter()
+            .map(|(p, b)| (p.to_string(), b.to_string()))
+            .collect(),
+    )]
+}
+
+const DYNAMIC_DIM_TYPE: &str = r##"{
+        "ultrawarm": false, "natural": true, "coordinate_scale": 4.0,
+        "has_skylight": true, "has_ceiling": false, "ambient_light": 0.0,
+        "piglin_safe": false, "bed_works": true, "respawn_anchor_works": false,
+        "has_raids": true, "logical_height": 192, "min_y": -32, "height": 192,
+        "infiniburn": "#minecraft:infiniburn_overworld",
+        "effects": "minecraft:overworld",
+        "monster_spawn_light_level": 0, "monster_spawn_block_light_limit": 0
+    }"##;
+
+#[test]
+fn dynamic_dim_datapack_registers_flat_dimension() {
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    worldgen::reset_dimension_registry();
+    let sources = dynamic_dim_entries(&[
+        ("data/custom/dimension_type/my_type.json", DYNAMIC_DIM_TYPE),
+        (
+            "data/custom/dimension/my_dim.json",
+            r#"{"type": "custom:my_type", "generator": {"type": "minecraft:flat",
+                "settings": {"biome": "minecraft:plains", "layers": [
+                    {"block": "minecraft:bedrock", "height": 1},
+                    {"block": "minecraft:stone", "height": 10}]}}}"#,
+        ),
+    ]);
+    let registered = worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap();
+    assert_eq!(registered, 1);
+    let dim = DimId::parse_dimension_id("custom:my_dim").expect("custom dimension resolves");
+    assert!(!dim.is_vanilla());
+    assert_eq!(dim.index(), 3, "first custom slot follows the vanilla three");
+    assert_eq!(dim.dimension_id(), "custom:my_dim");
+    assert_eq!(dim.min_y(), -32);
+    assert_eq!(dim.height(), 192);
+    assert_eq!(dim.sections(), 12, "a 192-tall dimension has 12 sections");
+    let spec = worldgen::dimension_spec(dim).unwrap();
+    assert_eq!(spec.logical_height, 192);
+    assert!(spec.has_skylight);
+    assert!(!spec.has_ceiling);
+    assert_eq!(dim.coordinate_scale(), 4.0);
+    assert!(matches!(
+        worldgen::dimension_spec(dim).map(|s| s.generator),
+        Some(worldgen::CustomGeneratorKind::Flat { .. })
+    ));
+    // Vanilla identity is untouched by the registration.
+    assert_eq!(DimId::Overworld.min_y(), -64);
+    assert_eq!(DimId::Overworld.sections(), 24);
+    assert_eq!(DimId::Nether.sections(), 16);
+    assert_eq!(DimId::parse_dimension_id("minecraft:the_nether"), Some(DimId::Nether));
+    worldgen::reset_dimension_registry();
+}
+
+#[test]
+fn dynamic_dim_slots_are_sorted_and_stable_by_canonical_name() {
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    worldgen::reset_dimension_registry();
+    let sources = dynamic_dim_entries(&[
+        ("data/zz/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        ("data/zz/dimension/z_dim.json", r#"{"type": "zz:t", "generator": {"type": "minecraft:debug"}}"#),
+        ("data/aa/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        ("data/aa/dimension/a_dim.json", r#"{"type": "aa:t", "generator": {"type": "minecraft:debug"}}"#),
+    ]);
+    worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap();
+    // Slot order follows canonical (namespace, path), not declaration order.
+    let a = DimId::parse_dimension_id("aa:a_dim").unwrap();
+    let z = DimId::parse_dimension_id("zz:z_dim").unwrap();
+    assert!(a.index() < z.index());
+    assert_eq!(DimId::all_registered().len(), 5);
+    // `minecraft:debug`/unknown generators fall back to void rather than erroring.
+    worldgen::reset_dimension_registry();
+}
+
+#[test]
+fn dynamic_dim_invalid_geometry_is_rejected() {
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    worldgen::reset_dimension_registry();
+    for (min_y, height) in [(-33, 192), (-32, 190), (0, 0)] {
+        let ty = DYNAMIC_DIM_TYPE
+            .replace("\"min_y\": -32", &format!("\"min_y\": {min_y}"))
+            .replace("\"height\": 192", &format!("\"height\": {height}"));
+        let sources = dynamic_dim_entries(&[
+            ("data/bad/dimension_type/t.json", ty.as_str()),
+            ("data/bad/dimension/d.json", r#"{"type": "bad:t", "generator": {"type": "minecraft:flat", "settings": {"layers": [], "biome": "minecraft:plains"}}}"#),
+        ]);
+        let result = worldgen::register_datapack_dimensions(&sources, |_| Some(1));
+        assert!(result.is_err() || result == Ok(0), "min_y={min_y} height={height} must not register");
+        assert_eq!(DimId::all_registered().len(), 3);
+        worldgen::reset_dimension_registry();
+    }
+}
+
+#[test]
+fn dynamic_dim_noise_generator_uses_custom_window() {
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    worldgen::reset_dimension_registry();
+    let sources = dynamic_dim_entries(&[
+        ("data/nz/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        (
+            "data/nz/dimension/d.json",
+            r#"{"type": "nz:t", "generator": {"type": "minecraft:noise",
+                "settings": "minecraft:overworld", "biome_source": {"type": "minecraft:multi_noise",
+                "preset": "minecraft:overworld"}}}"#,
+        ),
+    ]);
+    worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap();
+    let dim = DimId::parse_dimension_id("nz:d").unwrap();
+    let spec = worldgen::dimension_spec(dim).unwrap();
+    assert!(matches!(spec.generator, worldgen::CustomGeneratorKind::Noise { .. }));
+    assert_eq!(spec.min_y, -32);
+    assert_eq!(spec.height, 192);
+    worldgen::reset_dimension_registry();
+}
+
+#[test]
+fn dynamic_dim_join_game_names_all_dimensions() {
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    worldgen::reset_dimension_registry();
+    let sources = dynamic_dim_entries(&[
+        ("data/custom/dimension_type/my_type.json", DYNAMIC_DIM_TYPE),
+        ("data/custom/dimension/my_dim.json", r#"{"type": "custom:my_type", "generator": {"type": "minecraft:debug"}}"#),
+    ]);
+    worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap();
+    let dim = DimId::parse_dimension_id("custom:my_dim").unwrap();
+    let payload = join_game(dim, 0, 1);
+    // The join packet declares every registered dimension by canonical name and
+    // carries the joining dimension's own name + dimension-type identifier.
+    assert!(payload.windows(b"custom:my_dim".len()).any(|w| w == b"custom:my_dim"));
+    assert!(payload.windows(b"minecraft:overworld".len()).any(|w| w == b"minecraft:overworld"));
+    assert!(payload.windows(b"minecraft:the_nether".len()).any(|w| w == b"minecraft:the_nether"));
+    assert!(payload.windows(b"minecraft:the_end".len()).any(|w| w == b"minecraft:the_end"));
+    // Vanilla wire IDs stay pinned.
+    assert_eq!(dim_type_wire_id(DimId::Overworld), 0);
+    assert_eq!(dim_type_wire_id(DimId::End), 2);
+    assert_eq!(dim_type_wire_id(DimId::Nether), 3);
+    worldgen::reset_dimension_registry();
+}
+
+#[test]
+fn dynamic_dim_execute_in_resolves_custom_name() {
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    worldgen::reset_dimension_registry();
+    let sources = dynamic_dim_entries(&[
+        ("data/custom/dimension_type/my_type.json", DYNAMIC_DIM_TYPE),
+        ("data/custom/dimension/my_dim.json", r#"{"type": "custom:my_type", "generator": {"type": "minecraft:debug"}}"#),
+    ]);
+    worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap();
+    // `/execute in custom:my_dim` resolves through the same parse path commands use.
+    assert_eq!(
+        DimId::parse_dimension_id("custom:my_dim"),
+        DimId::all_registered().last().copied()
+    );
+    assert!(DimId::parse_dimension_id("custom:nope").is_none());
+    worldgen::reset_dimension_registry();
+}
+
+#[test]
+fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    worldgen::reset_dimension_registry();
+    let sources = dynamic_dim_entries(&[
+        ("data/zz/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        ("data/zz/dimension/z_dim.json", r#"{"type": "zz:t", "generator": {"type": "minecraft:debug"}}"#),
+        ("data/aa/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        ("data/aa/dimension/a_dim.json", r#"{"type": "aa:t", "generator": {"type": "minecraft:debug"}}"#),
+    ]);
+    worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap();
+    let first_a = DimId::parse_dimension_id("aa:a_dim").unwrap();
+    let first_z = DimId::parse_dimension_id("zz:z_dim").unwrap();
+    assert_eq!(first_a.index(), 3);
+    assert_eq!(first_z.index(), 4);
+    // An edit and a logout position in the higher-slotted dimension.
+    world().lock().unwrap().insert(
+        (first_z, 2, -3),
+        HashMap::from([(local_idx(2, -16, 3), 17u32)]),
+    );
+    pos_store()
+        .lock()
+        .unwrap()
+        .insert("Tester".to_string(), (first_z, 8.0, 64.0, -24.0, 0.0, 0.0));
+    let mut bytes = Vec::new();
+    save_world_into(&mut bytes);
+    assert!(
+        bytes.windows(b"DXT1".len()).any(|w| w == b"DXT1"),
+        "a custom-dimension save carries the named DXT1 footer"
+    );
+    // Restart: the registry rebuilds in a different slot order.
+    world().lock().unwrap().clear();
+    pos_store().lock().unwrap().clear();
+    worldgen::reset_dimension_registry();
+    let reversed = dynamic_dim_entries(&[
+        ("data/aa/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        ("data/aa/dimension/a_dim.json", r#"{"type": "aa:t", "generator": {"type": "minecraft:debug"}}"#),
+        ("data/zz/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        ("data/zz/dimension/z_dim.json", r#"{"type": "zz:t", "generator": {"type": "minecraft:debug"}}"#),
+        // A new dimension inserted between restarts shifts every later slot.
+        ("data/mm/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        ("data/mm/dimension/m_dim.json", r#"{"type": "mm:t", "generator": {"type": "minecraft:debug"}}"#),
+    ]);
+    worldgen::register_datapack_dimensions(&reversed, |_| Some(1)).unwrap();
+    let second_z = DimId::parse_dimension_id("zz:z_dim").unwrap();
+    assert_eq!(second_z.index(), 5, "slot moved after the registry change");
+    decode_world_payload(&bytes).unwrap();
+    // Named persistence lands the edit on the same dimension despite the new slot.
+    assert!(
+        world()
+            .lock()
+            .unwrap()
+            .get(&(second_z, 2, -3))
+            .is_some_and(|edits| edits.get(&local_idx(2, -16, 3)) == Some(&17)),
+        "the chunk edit resolves to zz:z_dim's new slot"
+    );
+    assert_eq!(
+        pos_store().lock().unwrap().get("Tester").map(|p| p.0),
+        Some(second_z),
+        "the logout dimension resolves by name"
+    );
+    world().lock().unwrap().clear();
+    pos_store().lock().unwrap().clear();
+    worldgen::reset_dimension_registry();
 }

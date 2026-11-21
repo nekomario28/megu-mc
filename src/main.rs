@@ -2744,7 +2744,7 @@ fn mob_tick() {
         return;
     };
     tick_live_mob_projectiles(reg, &players);
-    for dim in [DimId::Overworld, DimId::Nether, DimId::End] {
+    for dim in DimId::all_registered() {
         let mobs: Vec<_> = mobs_snap
             .iter()
             .filter(|mob| mob.dim == dim)
@@ -4257,6 +4257,10 @@ fn height_at(x: i32, z: i32) -> i32 {
 fn height_at_dim(dim: DimId, x: i32, z: i32) -> i32 {
     if dim == DimId::Overworld {
         return height_at(x, z);
+    }
+    // A Flat/Void custom dimension's surface is its layer stack, no generator needed.
+    if let Some(h) = worldgen::custom_surface_height(dim) {
+        return h;
     }
     if worldgen::enabled() {
         return worldgen::chunk_cols_dim(dim, x >> 4, z >> 4)
@@ -5914,7 +5918,9 @@ fn dim_base_state(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     if dim == DimId::Overworld {
         return Some(base_state(x, y, z));
     }
-    worldgen::with_gen_dim(dim, |g| g.block_state_at(x, y, z, crate::feature::populate))
+    worldgen::custom_dim_state(dim, x, y, z).or_else(|| {
+        worldgen::with_gen_dim(dim, |g| g.block_state_at(x, y, z, crate::feature::populate))
+    })
 }
 
 /// The generated state at a cell in `dim`, air when that dimension has no generator. The
@@ -7717,6 +7723,7 @@ pub(crate) type GenSources = HashMap<(i32, i32), Vec<((i32, i32, i32), u8)>>;
 /// sends `getLightSectionCount() = getSectionsCount() + 2` sections from here, so the array at
 /// index i belongs to light section `LIGHT_MIN_Y/16 + i`. Anchoring at `MIN_Y` instead would
 /// shift every array up one section.
+#[allow(dead_code)] // cfg(test) fixtures anchor light sections here
 const LIGHT_MIN_Y: i32 = MIN_Y - 16;
 
 #[cfg(test)]
@@ -8086,22 +8093,23 @@ impl SkySpill {
     }
 
     /// Raise the centre chunk's packed nibbles to this grid's levels.
-    fn raise_into(&self, cx: i32, cz: i32, out: &mut [[u8; 2048]]) {
+    fn raise_into(&self, dim: DimId, cx: i32, cz: i32, out: &mut [[u8; 2048]]) {
         let plane = self.w * self.d;
         for &(at, level) in &self.lit {
             let at = at as usize;
             let x = self.x0 + (at % self.w) as i32;
             let z = self.z0 + ((at / self.w) % self.d) as i32;
             let y = self.y0 + (at / plane) as i32;
-            raise_sky_nibble(out, cx, cz, x, y, z, level);
+            raise_sky_nibble(dim, out, cx, cz, x, y, z, level);
         }
     }
 }
 
-/// Raise one cell's nibble in the packed 26-section sky-light output. The single owner of the
+/// Raise one cell's nibble in the packed light-section output. The single owner of the
 /// layout arithmetic: both the map-shaped composition the tests drive and the dense grid above
 /// write through it.
 fn raise_sky_nibble(
+    dim: DimId,
     out: &mut [[u8; 2048]],
     cx: i32,
     cz: i32,
@@ -8110,16 +8118,17 @@ fn raise_sky_nibble(
     z: i32,
     level: u8,
 ) {
+    let light_min_y = dim.light_min_y();
     if x.div_euclid(16) != cx
         || z.div_euclid(16) != cz
-        || !(LIGHT_MIN_Y..LIGHT_MIN_Y + 26 * 16).contains(&y)
+        || !(light_min_y..light_min_y + out.len() as i32 * 16).contains(&y)
     {
         return;
     }
     let (lx, lz, relative_y) = (
         (x & 15) as usize,
         (z & 15) as usize,
-        (y - LIGHT_MIN_Y) as usize,
+        (y - light_min_y) as usize,
     );
     let byte = &mut out[relative_y / 16][(relative_y & 15) * 128 + lz * 8 + lx / 2];
     let shift = (lx & 1) * 4;
@@ -8128,6 +8137,7 @@ fn raise_sky_nibble(
 }
 
 fn sky_spill(
+    dim: DimId,
     cx: i32,
     cz: i32,
     floor_of: impl Fn(i32, i32) -> i32,
@@ -8149,8 +8159,11 @@ fn sky_spill(
     }
     // Fourteen steps of reach in both directions, clipped to the world — plus the seeds
     // themselves, which a floor outside the world's range can put a block past that clip.
-    let y0 = (smin.saturating_sub(14).max(MIN_Y)).min(smin);
-    let y1 = (smax.saturating_add(14).min(MIN_Y + 383)).max(smax);
+    let y0 = (smin.saturating_sub(14).max(dim.min_y())).min(smin);
+    let y1 = (smax
+        .saturating_add(14)
+        .min(dim.min_y() + dim.height() - 1))
+    .max(smax);
     let h = (y1 - y0 + 1) as usize;
     let dark = |x: i32, y: i32, z: i32| -> bool { y <= floor_of(x, z) };
     let mut grid = SkySpill {
@@ -8200,7 +8213,7 @@ fn sky_spill(
             if !(x0..=x1).contains(&qx)
                 || !(z0..=z1).contains(&qz)
                 || !(y0..=y1).contains(&qy)
-                || !(MIN_Y..MIN_Y + 384).contains(&qy)
+                || !(dim.min_y()..dim.min_y() + dim.height()).contains(&qy)
             {
                 continue;
             }
@@ -8225,19 +8238,20 @@ fn sky_spill(
 
 /// Build the spill and raise it into an already-packed centre chunk, without a map in between.
 fn sky_spill_apply(
+    dim: DimId,
     cx: i32,
     cz: i32,
     floor_of: impl Fn(i32, i32) -> i32,
     op: impl Fn(i32, i32, i32) -> u8,
     out: &mut [[u8; 2048]],
 ) {
-    let spill = sky_spill(cx, cz, floor_of, op);
+    let spill = sky_spill(dim, cx, cz, floor_of, op);
     // The type is pinned on its own line rather than at the call. `tools/mutation_check.sh`
     // replaces the line above with `Default::default()` and requires the light assembly test to
     // go red; a `default()` whose type is only fixed by a method call on it is an inference
     // error (E0282), and a mutant that does not build proves nothing.
     let grid: SkySpill = spill;
-    grid.raise_into(cx, cz, out);
+    grid.raise_into(dim, cx, cz, out);
 }
 
 /// The first opaque block y in each column, scanning down from the surface (the sky floor).
@@ -8369,15 +8383,13 @@ fn section_store() -> &'static Mutex<SectionStore> {
     })
 }
 
-/// `(world min_y, section count)` for a dimension. The Overworld window is `-64..320` (24
-/// sections); Nether and End are `0..256` (16 sections). Kept here rather than on `DimId`
-/// because that type lives in `worldgen.rs` and the storage window is a delivery concern.
+/// `(world min_y, section count)` for a dimension. The vanilla windows are the same
+/// answers the `dimension_type` declares — Overworld `-64..320` (24 sections), Nether
+/// and End `0..256` (16) — and a custom dimension answers whatever it declared, e.g.
+/// 12 sections for `min_y: -32, height: 192`.
 #[inline]
 fn section_window(dim: DimId) -> (i32, usize) {
-    match dim {
-        DimId::Overworld => (MIN_Y, 24),
-        DimId::Nether | DimId::End => (0, 16),
-    }
+    (dim.min_y(), dim.sections() as usize)
 }
 
 fn section_index_dim(dim: DimId, sy: i32) -> Option<usize> {
@@ -8951,20 +8963,26 @@ fn sky_floors_dim(
 /// Sky light for a chunk, from the world: the per-column value, raised where light has arrived
 /// sideways.
 fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
-    if let Some(light) = settled_live_light(DimId::Overworld, cx, cz) {
+    sky_light_sections_dim(DimId::Overworld, cx, cz)
+}
+
+/// The same sky-light composition for any dimension: its own settled light, its own
+/// light-section count, its own floors and opacity reads.
+fn sky_light_sections_dim(dim: DimId, cx: i32, cz: i32) -> Vec<[u8; 2048]> {
+    if let Some(light) = settled_live_light(dim, cx, cz) {
         return light.sky.clone();
     }
     if crate::block_registry::breg().is_none() {
-        return vec![[0u8; 2048]; 26];
+        return vec![[0u8; 2048]; dim.light_sections()];
     }
-    let op = |x: i32, y: i32, z: i32| opacity_windowed(x, y, z);
-    let floors = sky_floors(cx, cz, &op);
+    let op = |x: i32, y: i32, z: i32| opacity_windowed_dim(dim, x, y, z);
+    let floors = sky_floors_dim(dim, cx, cz, &op);
     // Floors for the 3x3 window: a margin cell (a neighbour chunk) must be tested against its own
     // column, not wrapped onto the centre chunk's, or the BFS routes through cells that are not dark.
     let mut f9 = [[0i32; 256]; 9];
     for dx in -1..=1i32 {
         for dz in -1..=1i32 {
-            f9[((dx + 1) * 3 + (dz + 1)) as usize] = sky_floors(cx + dx, cz + dz, &op);
+            f9[((dx + 1) * 3 + (dz + 1)) as usize] = sky_floors_dim(dim, cx + dx, cz + dz, &op);
         }
     }
     let floor_of = |x: i32, z: i32| -> i32 {
@@ -8977,8 +8995,8 @@ fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     };
     // The spill raises only the cells the column rule left dark, so it composes onto the packed
     // columns instead of replacing them; a map is never built.
-    let mut out = sky_light_sections_from(cx, cz, &floors);
-    sky_spill_apply(cx, cz, floor_of, op, &mut out);
+    let mut out = sky_light_sections_from_dim(dim, cx, cz, &floors);
+    sky_spill_apply(dim, cx, cz, floor_of, op, &mut out);
     out
 }
 
@@ -8998,7 +9016,7 @@ fn sky_light_sections_with_spill(
     // map at every voxel needlessly defeated the uniform-section fast paths.
     let mut out = sky_light_sections_from(cx, cz, floors);
     for (&(x, y, z), &level) in spill {
-        raise_sky_nibble(&mut out, cx, cz, x, y, z, level);
+        raise_sky_nibble(DimId::Overworld, &mut out, cx, cz, x, y, z, level);
     }
     out
 }
@@ -9045,16 +9063,27 @@ fn pack_sky_section(sy: i32, floors: &[i32; 256]) -> [u8; 2048] {
     arr
 }
 
+#[cfg(test)]
 fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 2048]> {
+    sky_light_sections_from_dim(DimId::Overworld, cx, cz, floors)
+}
+
+fn sky_light_sections_from_dim(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    floors: &[i32; 256],
+) -> Vec<[u8; 2048]> {
     let _ = (cx, cz);
     let (mut fmin, mut fmax) = (i32::MAX, i32::MIN);
     for f in floors {
         fmin = fmin.min(*f);
         fmax = fmax.max(*f);
     }
-    let mut out = Vec::with_capacity(26);
-    for sec in 0..26 {
-        let sy = sec * 16 + LIGHT_MIN_Y;
+    let light_min_y = dim.light_min_y();
+    let mut out = Vec::with_capacity(dim.light_sections());
+    for sec in 0..dim.light_sections() as i32 {
+        let sy = sec * 16 + light_min_y;
         let mut arr = [0u8; 2048];
         if fmax < sy {
             // Every floor is below this section, so the whole section is above its own
@@ -9894,7 +9923,7 @@ fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSo
     let sky = if sky_mask == 0 {
         Vec::new()
     } else {
-        sky_light_sections_world(cx, cz)
+        sky_light_sections_dim(dim, cx, cz)
     };
     if let Some(t) = __tsky {
         chunkprof::add(&chunkprof::SKY, t);

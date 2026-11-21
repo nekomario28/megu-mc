@@ -664,8 +664,10 @@ impl ExecuteSource {
             In { dimension } => {
                 let dimension =
                     DimId::parse_dimension_id(dimension).ok_or("Unknown execute dimension")?;
-                let scale = |dim| if dim == DimId::Nether { 8.0 } else { 1.0 };
-                let ratio = scale(self.dimension) / scale(dimension);
+                // Vanilla's `execute in` rescales x/z by the ratio of the two
+                // dimension_types' coordinate_scale — 8 for the Nether, 1 for the
+                // Overworld and the End, and whatever a custom type declares.
+                let ratio = self.dimension.coordinate_scale() / dimension.coordinate_scale();
                 self.ctx.x *= ratio;
                 self.ctx.z *= ratio;
                 self.dimension = dimension;

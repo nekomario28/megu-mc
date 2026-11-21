@@ -1968,6 +1968,7 @@ fn reload_datapacks(
         item_tags: builtin_item_tags(),
         ..DatapackContent::default()
     };
+    let mut dim_sources = Vec::new();
     for (name, path, zip) in sources {
         if disabled.contains(&name) {
             continue;
@@ -1992,12 +1993,25 @@ fn reload_datapacks(
                 );
                 continue;
             };
+            dim_sources.push(worldgen::DatapackDimensionSource::Entries(
+                entries
+                    .iter()
+                    .filter_map(|(path, body)| {
+                        std::str::from_utf8(body)
+                            .ok()
+                            .map(|body| (path.clone(), body.to_string()))
+                    })
+                    .collect(),
+            ));
             for (path, body) in entries {
                 if let Ok(body) = std::str::from_utf8(&body) {
                     content.read_entry(&mut pack, &path, body);
                 }
             }
         } else {
+            dim_sources.push(worldgen::DatapackDimensionSource::Directory(
+                path.clone(),
+            ));
             read_directory_datapack(&path, &mut pack, &mut content);
         }
         eprintln!(
@@ -2024,6 +2038,10 @@ fn reload_datapacks(
         let mut disabled_packs = disabled_datapacks().lock().unwrap();
         content.publish();
         *disabled_packs = disabled;
+    }
+    if let Err(error) = worldgen::register_datapack_dimensions(&dim_sources, name_to_state)
+    {
+        eprintln!("[spine] {error}");
     }
     if run_load_functions {
         for function in loads {

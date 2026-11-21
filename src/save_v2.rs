@@ -179,7 +179,7 @@ impl PlayerSave {
 
     fn write(&self, out: &mut Vec<u8>) {
         let (dim, x, y, z, yaw, pitch) = self.position;
-        out.push(dim.index() as u8);
+        out.push(legacy_dim_byte(dim));
         save_numbers!(out, x, y, z, yaw, pitch);
         write_saved_slots(out, &self.inventory);
         write_saved_slots(out, &self.ender_chest);
@@ -206,7 +206,7 @@ impl PlayerSave {
                 SpawnTargetKind::Bed => 2,
                 SpawnTargetKind::Anchor => 3,
             });
-            out.push(point.dim.index() as u8);
+            out.push(legacy_dim_byte(point.dim));
             let (x, y, z) = point.position;
             save_numbers!(out, x, y, z, point.angle);
             out.push(u8::from(point.forced));
@@ -753,7 +753,7 @@ const SAVED_RAID_STATES: [RaidState; 5] = [
 ];
 
 fn write_saved_raid(out: &mut Vec<u8>, dim: DimId, raid: &Raid) {
-    out.push(dim.index() as u8);
+    out.push(legacy_dim_byte(dim));
     write_saved_block_pos(out, raid.center);
     write_saved_block_pos(out, raid.origin);
     let state = SAVED_RAID_STATES
@@ -1138,16 +1138,20 @@ const WORLD_SEED_MAGIC: &[u8; 4] = b"SED1";
 ///
 /// The legacy name and the legacy bytes stay the Overworld's: a server that only ever edits the
 /// Overworld writes exactly the one file it always did, and none of the companions.
-fn dim_overlay_name(dim: DimId) -> &'static str {
+fn dim_overlay_name(dim: DimId) -> Option<&'static str> {
     match dim {
-        DimId::Overworld => WORLD_FILE,
-        DimId::Nether => "world_overlay_nether.bin",
-        DimId::End => "world_overlay_end.bin",
+        DimId::Overworld => Some(WORLD_FILE),
+        DimId::Nether => Some("world_overlay_nether.bin"),
+        DimId::End => Some("world_overlay_end.bin"),
+        // Custom dimensions keep their chunks inside `WORLD_FILE`'s DXT1 footer —
+        // named by canonical dimension key, so adding or reordering datapack
+        // dimensions never moves them — not a fixed companion file name.
+        _ => None,
     }
 }
 
 fn dim_overlay_path(dir: &std::path::Path, dim: DimId) -> std::path::PathBuf {
-    dir.join(dim_overlay_name(dim))
+    dir.join(dim_overlay_name(dim).unwrap_or(WORLD_FILE))
 }
 
 /// The directory the world save lives in: `WORLD_FILE`'s own, so the default bare file name means
@@ -1768,13 +1772,17 @@ fn save_world_into(f: &mut Vec<u8>) {
     // collected before any container lock: the growth tick holds `crops` while writing a block,
     // which can take `chests`, so taking them in the opposite order here would invert the locks.
     let mut dim2 = Dim2Entries::default();
-    dim2.crops = crops()
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(pos, _)| pos.0 != DimId::Overworld)
-        .map(|(pos, age)| (*pos, *age))
-        .collect();
+    let mut dxt = DxtEntries::default();
+    for (pos, age) in crops().lock().unwrap().iter() {
+        if pos.0 == DimId::Overworld {
+            continue;
+        }
+        if pos.0.is_vanilla() {
+            dim2.crops.push((*pos, *age));
+        } else {
+            dxt.crops.push((dim_key(pos.0), pos.1, pos.2, pos.3, *age));
+        }
+    }
     (*f).extend_from_slice(b"MET4");
     let ms = mobs().lock().unwrap().clone();
     let mob_dimensions = ms.iter().map(|mob| mob.dim).collect::<Vec<_>>();
@@ -1830,7 +1838,12 @@ fn save_world_into(f: &mut Vec<u8>) {
             .filter_map(|(key, slots)| match key {
                 ContainerKey::Block((DimId::Overworld, x, y, z)) => Some(((*x, *y, *z), slots)),
                 ContainerKey::Block(pos) => {
-                    dim2.chests.push((*pos, slots.clone()));
+                    if pos.0.is_vanilla() {
+                        dim2.chests.push((*pos, slots.clone()));
+                    } else {
+                        dxt.chests
+                            .push((dim_key(pos.0), pos.1, pos.2, pos.3, slots.clone()));
+                    }
                     None
                 }
                 ContainerKey::Cart(_) => None,
@@ -1862,9 +1875,13 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
         dim_signs = sg
             .iter()
-            .filter(|(k, _)| k.0 != DimId::Overworld)
+            .filter(|(k, _)| k.0 != DimId::Overworld && k.0.is_vanilla())
             .map(|(k, v)| (k.0, k.1, k.2, k.3, k.4, v.clone()))
             .collect();
+        for (k, v) in sg.iter().filter(|(k, _)| !k.0.is_vanilla()) {
+            dxt.signs
+                .push((dim_key(k.0), k.1, k.2, k.3, k.4, v.clone()));
+        }
         // forceload tail — vanilla keeps forced chunks across restarts;
         // losing them would silently freeze fixture+machine regions.
         let fl = forceloaded().lock().unwrap();
@@ -1890,7 +1907,11 @@ fn save_world_into(f: &mut Vec<u8>) {
             (*f).extend_from_slice(&yaw.to_be_bytes());
             (*f).extend_from_slice(&pitch.to_be_bytes());
             if dim != DimId::Overworld {
-                dim_players.push((name.clone(), dim));
+                if dim.is_vanilla() {
+                    dim_players.push((name.clone(), dim));
+                } else {
+                    dxt.players.push((name.clone(), dim_key(dim)));
+                }
             }
         }
         // dropped items are world entities in vanilla — they survive
@@ -1946,8 +1967,18 @@ fn save_world_into(f: &mut Vec<u8>) {
             .iter()
             .filter_map(|(pos, fr)| match pos.0 {
                 DimId::Overworld => Some((pos, fr)),
-                _ => {
+                dim if dim.is_vanilla() => {
                     dim2.furnaces.push((*pos, clone_furnace_for_footer(fr)));
+                    None
+                }
+                dim => {
+                    dxt.furnaces.push((
+                        dim_key(dim),
+                        pos.1,
+                        pos.2,
+                        pos.3,
+                        clone_furnace_for_footer(fr),
+                    ));
                     None
                 }
             })
@@ -2230,7 +2261,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         f.extend_from_slice(b"SPA1");
         f.extend_from_slice(&world_spawn.3.to_be_bytes());
     }
-    append_block_entities_footer(f);
+    append_block_entities_footer(f, &mut dxt);
     append_save_state(f, &players, spawn_pitch, &ms, &mob_data);
     generated.append(f);
     let (sources, generated_blocks, generated_fluids) = worldgen::with_gen(|g| {
@@ -2268,8 +2299,11 @@ fn save_world_into(f: &mut Vec<u8>) {
     for (&(dim, x, y, z), entry) in pending_block_loot().lock().unwrap().iter() {
         if dim == DimId::Overworld {
             block_loot.push(((x, y, z), entry.clone()));
-        } else {
+        } else if dim.is_vanilla() {
             dim2.loot.push(((dim, x, y, z), entry.clone()));
+        } else {
+            dxt.loot
+                .push((dim_key(dim), x, y, z, entry.clone()));
         }
     }
     block_loot.sort_by_key(|(pos, _)| *pos);
@@ -2287,7 +2321,37 @@ fn save_world_into(f: &mut Vec<u8>) {
         append_dim2_footer(f, &dim2);
     }
     append_brewing_footer(f);
+    collect_dxt_brewing(&mut dxt);
     append_mob_dimensions_footer(f, &mob_dimensions);
+    // Everything a custom dimension owns, named by its canonical key so a
+    // datapack added, removed or reordered between restarts cannot move it.
+    for spec in worldgen::custom_dimension_specs() {
+        let mut table = Vec::new();
+        if save_dim_overlay_into(spec.id, &mut table) > 0 {
+            dxt.overlays.push((spec.key.to_string(), table));
+        }
+    }
+    for (uuid, state) in players.iter() {
+        let position = (!state.position.0.is_vanilla()).then(|| dim_key(state.position.0));
+        let respawn = state
+            .respawn
+            .filter(|point| !point.dim.is_vanilla())
+            .map(|point| dim_key(point.dim));
+        if position.is_some() || respawn.is_some() {
+            dxt.saved_players.push((*uuid, position, respawn));
+        }
+    }
+    for (ordinal, dim) in mob_dimensions.iter().enumerate() {
+        if !dim.is_vanilla() {
+            dxt.mob_dims.push((ordinal as u32, dim_key(*dim)));
+        }
+    }
+    for (ordinal, (dim, _)) in saved_raids().lock().unwrap().iter().enumerate() {
+        if !dim.is_vanilla() {
+            dxt.raid_dims.push((ordinal as u32, dim_key(*dim)));
+        }
+    }
+    append_dxt_footer(f, &dxt);
     append_world_seed_footer(f, WORLD_SEED.load(Ordering::Relaxed));
     // Keep full UUID records for players who go offline before the next save.
     *saved_players().lock().unwrap() = players;
@@ -2344,7 +2408,7 @@ fn append_mob_dimensions_footer(out: &mut Vec<u8>, dimensions: &[DimId]) {
     if dimensions.iter().all(|dim| *dim == DimId::Overworld) {
         return;
     }
-    out.extend(dimensions.iter().map(|dim| dim.index() as u8));
+    out.extend(dimensions.iter().map(|dim| legacy_dim_byte(*dim)));
     out.extend_from_slice(&(dimensions.len() as u64).to_be_bytes());
     out.extend_from_slice(MOB_DIM_MAGIC);
 }
@@ -2727,6 +2791,485 @@ fn read_dim2_footer(payload: &[u8]) -> Result<(&[u8], Dim2Entries), &'static str
     }
     Ok((&payload[..start], out))
 }
+
+// ---------- custom-dimension extension (DXT1) ----------
+//
+// Custom dimensions have no stable slot: a datapack added, removed or reordered
+// between restarts moves every index at or above the first custom slot, so the
+// one-byte `DimId` encoding the other footers use cannot name one. Every record a
+// custom dimension owns rides here instead, keyed by its canonical
+// `"namespace:path"` string. The footer is written last, so a save without a
+// custom dimension keeps every byte of the legacy layout — and every earlier
+// footer's position — exactly where it was.
+//
+// Version 1 body layout:
+//   u8 version(=1)
+//   varint overlay count, then per dimension `u16 key`, `u32 table_len`, the
+//     overlay table `save_dim_overlay_into` writes verbatim
+//   varint pos_store count, then `u16 name` + `u16 key` player-dimension fixes
+//   varint saved-player count, then `uuid` + `u8 flags` (bit0 position,
+//     bit1 respawn) + `u16 key` per set flag
+//   varint mob count, then `varint ordinal` + `u16 key`
+//   varint raid count, then `varint ordinal` + `u16 key`
+//   u32 sign count, then `u16 key` + xyz + front + four `u16` lines
+//   u32 chest count, then `u16 key` + xyz + stack table
+//   u32 furnace count, then `u16 key` + xyz + furnace state
+//   u32 crop count, then `u16 key` + xyz + `u8` age
+//   u32 loot count, then `u16 key` + xyz + loot record
+//   u32 brewing count, then `u16 key` + xyz + stack table + fuel + `i32` timer
+//   u32 block-entity count, then `u16 key` + xyz + `u32` state + `u32`-framed NBT
+//   u64 body size, "DXT1"
+const DXT_MAGIC: &[u8; 4] = b"DXT1";
+
+#[derive(Default)]
+struct DxtEntries {
+    overlays: Vec<(String, Vec<u8>)>,
+    players: Vec<(String, String)>,
+    saved_players: Vec<([u8; 16], Option<String>, Option<String>)>,
+    mob_dims: Vec<(u32, String)>,
+    raid_dims: Vec<(u32, String)>,
+    signs: Vec<(String, i32, i32, i32, u8, [String; 4])>,
+    chests: Vec<(String, i32, i32, i32, HashMap<i16, Stack>)>,
+    furnaces: Vec<(String, i32, i32, i32, Furnace)>,
+    crops: Vec<(String, i32, i32, i32, u8)>,
+    loot: Vec<(String, i32, i32, i32, PendingBlockLoot)>,
+    brewing: Vec<(String, i32, i32, i32, HashMap<i16, Stack>, u8, u16)>,
+    block_entities: Vec<(String, i32, i32, i32, u32, nbt::Tag)>,
+}
+
+impl DxtEntries {
+    fn is_empty(&self) -> bool {
+        self.overlays.is_empty()
+            && self.players.is_empty()
+            && self.saved_players.is_empty()
+            && self.mob_dims.is_empty()
+            && self.raid_dims.is_empty()
+            && self.signs.is_empty()
+            && self.chests.is_empty()
+            && self.furnaces.is_empty()
+            && self.crops.is_empty()
+            && self.loot.is_empty()
+            && self.brewing.is_empty()
+            && self.block_entities.is_empty()
+    }
+}
+
+/// The one-byte save encoding for a dimension whose records live in a legacy
+/// footer. A custom dimension's records never reach those footers — they ride
+/// DXT1 by name — so the byte is a placeholder the reader never sees; `0` keeps
+/// it deterministic.
+fn legacy_dim_byte(dim: DimId) -> u8 {
+    if dim.is_vanilla() {
+        dim.index() as u8
+    } else {
+        0
+    }
+}
+
+/// A dimension's canonical `"namespace:path"` — the identity DXT1 records carry.
+fn dim_key(dim: DimId) -> String {
+    dim.dimension_id().to_string()
+}
+
+/// Resolve a DXT1 dimension name. A datapack dropped between restarts leaves the
+/// key unresolvable; the record is skipped with a diagnostic rather than silently
+/// relocated into the Overworld.
+fn dxt_dim(key: &str) -> Option<DimId> {
+    let dim = DimId::parse_dimension_id(key);
+    if dim.is_none() {
+        eprintln!("[spine] save references unregistered dimension {key}: skipping its records");
+    }
+    dim
+}
+
+fn write_dxt_key(out: &mut Vec<u8>, key: &str) {
+    out.extend_from_slice(&(key.len() as u16).to_be_bytes());
+    out.extend_from_slice(key.as_bytes());
+}
+
+fn read_dxt_key<'a>(body: &'a [u8], p: &mut usize) -> Result<&'a str, &'static str> {
+    let len = u16::from_be_bytes(
+        body.get(*p..*p + 2)
+            .ok_or("truncated DXT key length")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    *p += 2;
+    let key = body.get(*p..*p + len).ok_or("truncated DXT key")?;
+    *p += len;
+    std::str::from_utf8(key).map_err(|_| "invalid DXT key")
+}
+
+fn write_dxt_pos(out: &mut Vec<u8>, key: &str, x: i32, y: i32, z: i32) {
+    write_dxt_key(out, key);
+    out.extend_from_slice(&x.to_be_bytes());
+    out.extend_from_slice(&y.to_be_bytes());
+    out.extend_from_slice(&z.to_be_bytes());
+}
+
+fn read_dxt_pos<'a>(
+    body: &'a [u8],
+    p: &mut usize,
+) -> Result<(&'a str, i32, i32, i32), &'static str> {
+    let key = read_dxt_key(body, p)?;
+    let raw = body.get(*p..*p + 12).ok_or("truncated DXT position")?;
+    *p += 12;
+    Ok((
+        key,
+        i32::from_be_bytes(raw[0..4].try_into().unwrap()),
+        i32::from_be_bytes(raw[4..8].try_into().unwrap()),
+        i32::from_be_bytes(raw[8..12].try_into().unwrap()),
+    ))
+}
+
+fn append_dxt_footer(out: &mut Vec<u8>, entries: &DxtEntries) {
+    use crate::generation_payload::ContainerKind;
+    // A save with no custom-dimension state emits no footer at all — vanilla
+    // worlds keep the exact legacy byte layout.
+    if entries.is_empty() {
+        return;
+    }
+    let start = out.len();
+    out.push(1); // version
+    write_varint(out, entries.overlays.len() as i64);
+    for (key, table) in &entries.overlays {
+        write_dxt_key(out, key);
+        out.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        out.extend_from_slice(table);
+    }
+    write_varint(out, entries.players.len() as i64);
+    for (name, key) in &entries.players {
+        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        out.extend_from_slice(name.as_bytes());
+        write_dxt_key(out, key);
+    }
+    write_varint(out, entries.saved_players.len() as i64);
+    for (uuid, position, respawn) in &entries.saved_players {
+        out.extend_from_slice(uuid);
+        out.push(
+            u8::from(position.is_some()) | (u8::from(respawn.is_some()) << 1),
+        );
+        for key in [position, respawn].into_iter().flatten() {
+            write_dxt_key(out, key);
+        }
+    }
+    write_varint(out, entries.mob_dims.len() as i64);
+    for (ordinal, key) in &entries.mob_dims {
+        write_varint(out, i64::from(*ordinal));
+        write_dxt_key(out, key);
+    }
+    write_varint(out, entries.raid_dims.len() as i64);
+    for (ordinal, key) in &entries.raid_dims {
+        write_varint(out, i64::from(*ordinal));
+        write_dxt_key(out, key);
+    }
+    out.extend_from_slice(&(entries.signs.len() as u32).to_be_bytes());
+    for (key, x, y, z, front, lines) in &entries.signs {
+        write_dxt_pos(out, key, *x, *y, *z);
+        out.push(*front);
+        for line in lines {
+            out.extend_from_slice(&(line.len() as u16).to_be_bytes());
+            out.extend_from_slice(line.as_bytes());
+        }
+    }
+    out.extend_from_slice(&(entries.chests.len() as u32).to_be_bytes());
+    for (key, x, y, z, slots) in &entries.chests {
+        write_dxt_pos(out, key, *x, *y, *z);
+        write_stack_table(out, slots);
+    }
+    out.extend_from_slice(&(entries.furnaces.len() as u32).to_be_bytes());
+    for (key, x, y, z, fr) in &entries.furnaces {
+        write_dxt_pos(out, key, *x, *y, *z);
+        write_furnace_state(out, fr);
+    }
+    out.extend_from_slice(&(entries.crops.len() as u32).to_be_bytes());
+    for (key, x, y, z, age) in &entries.crops {
+        write_dxt_pos(out, key, *x, *y, *z);
+        out.push(*age);
+    }
+    out.extend_from_slice(&(entries.loot.len() as u32).to_be_bytes());
+    for (key, x, y, z, entry) in &entries.loot {
+        write_dxt_pos(out, key, *x, *y, *z);
+        match entry.kind {
+            ContainerKind::Chest => out.push(0),
+            ContainerKind::Furnace => out.push(1),
+            ContainerKind::BlockContainer(size) => {
+                out.push(2);
+                out.push(size);
+            }
+        }
+        let table = entry.loot_table.as_bytes();
+        let tlen = table.len().min(u16::MAX as usize);
+        out.extend_from_slice(&(tlen as u16).to_be_bytes());
+        out.extend_from_slice(&table[..tlen]);
+        if let Some(seed) = entry.loot_seed {
+            out.push(1);
+            out.extend_from_slice(&seed.to_be_bytes());
+        } else {
+            out.push(0);
+        }
+    }
+    out.extend_from_slice(&(entries.brewing.len() as u32).to_be_bytes());
+    for (key, x, y, z, slots, fuel, remaining) in &entries.brewing {
+        write_dxt_pos(out, key, *x, *y, *z);
+        write_stack_table(out, slots);
+        out.push(*fuel);
+        out.extend_from_slice(&remaining.to_be_bytes());
+    }
+    out.extend_from_slice(&(entries.block_entities.len() as u32).to_be_bytes());
+    for (key, x, y, z, state, tag) in &entries.block_entities {
+        write_dxt_pos(out, key, *x, *y, *z);
+        out.extend_from_slice(&state.to_be_bytes());
+        let encoded =
+            nbt::write_named(&nbt::NbtString::text(""), tag).expect("block entity NBT must encode");
+        out.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        out.extend_from_slice(&encoded);
+    }
+    let size = (out.len() - start) as u64;
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(DXT_MAGIC);
+}
+
+fn read_dxt_footer(payload: &[u8]) -> Result<(&[u8], DxtEntries), &'static str> {
+    if !payload.ends_with(DXT_MAGIC) {
+        return Ok((payload, DxtEntries::default()));
+    }
+    let end = payload
+        .len()
+        .checked_sub(12)
+        .ok_or("truncated DXT footer")?;
+    let size = usize::try_from(u64::from_be_bytes(
+        payload[end..end + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| "invalid DXT footer size")?;
+    let start = end.checked_sub(size).ok_or("invalid DXT footer size")?;
+    let body = &payload[start..end];
+    let mut p = 0usize;
+    let mut out = DxtEntries::default();
+    let version = *body.get(p).ok_or("truncated DXT footer")?;
+    p += 1;
+    if version != 1 {
+        return Err("unsupported DXT version");
+    }
+    let mut input = SaveInput(&body[p..]);
+    let overlay_count = input.var_count(10)?;
+    p = body.len() - input.0.len();
+    for _ in 0..overlay_count {
+        let key = read_dxt_key(body, &mut p)?.to_string();
+        let tlen = u32::from_be_bytes(
+            body.get(p..p + 4)
+                .ok_or("truncated DXT overlay table length")?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        p += 4;
+        let table = body
+            .get(p..p + tlen)
+            .ok_or("truncated DXT overlay table")?
+            .to_vec();
+        p += tlen;
+        out.overlays.push((key, table));
+    }
+    let mut input = SaveInput(&body[p..]);
+    let player_count = input.var_count(10)?;
+    p = body.len() - input.0.len();
+    for _ in 0..player_count {
+        let nlen = u16::from_be_bytes(
+            body.get(p..p + 2)
+                .ok_or("truncated DXT player name")?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        p += 2;
+        let name = body
+            .get(p..p + nlen)
+            .ok_or("truncated DXT player name")?;
+        p += nlen;
+        let name = std::str::from_utf8(name)
+            .map_err(|_| "invalid DXT player name")?
+            .to_string();
+        let key = read_dxt_key(body, &mut p)?.to_string();
+        out.players.push((name, key));
+    }
+    let mut input = SaveInput(&body[p..]);
+    let saved_count = input.var_count(10)?;
+    p = body.len() - input.0.len();
+    for _ in 0..saved_count {
+        let uuid: [u8; 16] = body
+            .get(p..p + 16)
+            .ok_or("truncated DXT saved player")?
+            .try_into()
+            .unwrap();
+        p += 16;
+        let flags = *body.get(p).ok_or("truncated DXT saved player")?;
+        p += 1;
+        let mut fields = [None, None];
+        for (bit, field) in fields.iter_mut().enumerate() {
+            if flags & (1 << bit) != 0 {
+                *field = Some(read_dxt_key(body, &mut p)?.to_string());
+            }
+        }
+        let [position, respawn] = fields;
+        out.saved_players.push((uuid, position, respawn));
+    }
+    for dims in [&mut out.mob_dims, &mut out.raid_dims] {
+        let mut input = SaveInput(&body[p..]);
+        let count = input.var_count(10)?;
+        p = body.len() - input.0.len();
+        for _ in 0..count {
+            let mut input = SaveInput(&body[p..]);
+            let ordinal = u32::try_from(input.varint()?).map_err(|_| "invalid DXT ordinal")?;
+            p = body.len() - input.0.len();
+            let key = read_dxt_key(body, &mut p)?.to_string();
+            dims.push((ordinal, key));
+        }
+    }
+    let n = read_dim2_count(body, &mut p, 15)?;
+    for _ in 0..n {
+        let (key, x, y, z) = read_dxt_pos(body, &mut p)?;
+        let front = *body.get(p).ok_or("truncated DXT sign")?;
+        p += 1;
+        let mut lines: [String; 4] = Default::default();
+        for line in lines.iter_mut() {
+            let llen = u16::from_be_bytes(
+                body.get(p..p + 2)
+                    .ok_or("truncated DXT sign line")?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            p += 2;
+            let text = body.get(p..p + llen).ok_or("truncated DXT sign line")?;
+            p += llen;
+            *line = String::from_utf8_lossy(text).to_string();
+        }
+        out.signs.push((key.to_string(), x, y, z, front, lines));
+    }
+    let n = read_dim2_count(body, &mut p, 15)?;
+    for _ in 0..n {
+        let (key, x, y, z) = read_dxt_pos(body, &mut p)?;
+        let slots = read_stack_table(body, &mut p, true);
+        out.chests.push((key.to_string(), x, y, z, slots));
+    }
+    let n = read_dim2_count(body, &mut p, 15)?;
+    for _ in 0..n {
+        let (key, x, y, z) = read_dxt_pos(body, &mut p)?;
+        let fr = read_furnace_state(body, &mut p, true, false)
+            .ok_or("truncated DXT furnace")?;
+        out.furnaces.push((key.to_string(), x, y, z, fr));
+    }
+    let n = read_dim2_count(body, &mut p, 16)?;
+    for _ in 0..n {
+        let (key, x, y, z) = read_dxt_pos(body, &mut p)?;
+        let age = *body.get(p).ok_or("truncated DXT crop age")?;
+        p += 1;
+        out.crops.push((key.to_string(), x, y, z, age));
+    }
+    {
+        use crate::generation_payload::ContainerKind;
+        let n = read_dim2_count(body, &mut p, 18)?;
+        for _ in 0..n {
+            let (key, x, y, z) = read_dxt_pos(body, &mut p)?;
+            let tag = *body.get(p).ok_or("truncated DXT loot kind")?;
+            p += 1;
+            let kind = match tag {
+                0 => ContainerKind::Chest,
+                1 => ContainerKind::Furnace,
+                2 => {
+                    let sz = *body.get(p).ok_or("truncated DXT loot size")?;
+                    p += 1;
+                    ContainerKind::BlockContainer(sz)
+                }
+                _ => return Err("invalid DXT loot kind"),
+            };
+            let tlen = u16::from_be_bytes(
+                body.get(p..p + 2)
+                    .ok_or("truncated DXT loot table length")?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            p += 2;
+            let table = body.get(p..p + tlen).ok_or("truncated DXT loot table")?;
+            p += tlen;
+            let loot_table = String::from_utf8_lossy(table).to_string();
+            let has_seed = *body.get(p).ok_or("truncated DXT loot seed flag")?;
+            p += 1;
+            let loot_seed = match has_seed {
+                0 => None,
+                1 => {
+                    let s = i64::from_be_bytes(
+                        body.get(p..p + 8)
+                            .ok_or("truncated DXT loot seed")?
+                            .try_into()
+                            .unwrap(),
+                    );
+                    p += 8;
+                    Some(s)
+                }
+                _ => return Err("invalid DXT loot seed flag"),
+            };
+            out.loot.push((
+                key.to_string(),
+                x,
+                y,
+                z,
+                PendingBlockLoot {
+                    kind,
+                    loot_table,
+                    loot_seed,
+                },
+            ));
+        }
+    }
+    let n = read_dim2_count(body, &mut p, 15)?;
+    for _ in 0..n {
+        let (key, x, y, z) = read_dxt_pos(body, &mut p)?;
+        let slots = read_stack_table(body, &mut p, true);
+        let timers = body.get(p..p + 5).ok_or("truncated DXT brewing stand")?;
+        p += timers.len();
+        let fuel = timers[0];
+        let brew_time = u32::from_be_bytes(timers[1..5].try_into().unwrap());
+        if fuel > BREW_FUEL_PER_POWDER || brew_time > u32::from(BREW_TIME_TICKS) {
+            return Err("invalid DXT brewing stand timers");
+        }
+        out.brewing.push((
+            key.to_string(),
+            x,
+            y,
+            z,
+            slots,
+            fuel,
+            brew_time as u16,
+        ));
+    }
+    let n = read_dim2_count(body, &mut p, 23)?;
+    for _ in 0..n {
+        let (key, x, y, z) = read_dxt_pos(body, &mut p)?;
+        let state = u32::from_be_bytes(
+            body.get(p..p + 4)
+                .ok_or("truncated DXT block entity")?
+                .try_into()
+                .unwrap(),
+        );
+        p += 4;
+        let len = u32::from_be_bytes(
+            body.get(p..p + 4)
+                .ok_or("truncated DXT block entity NBT")?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        p += 4;
+        let data = body.get(p..p + len).ok_or("truncated DXT block entity NBT")?;
+        p += len;
+        let (_, tag) = nbt::read_named(data).map_err(|_| "invalid DXT block entity NBT")?;
+        out.block_entities
+            .push((key.to_string(), x, y, z, state, tag));
+    }
+    if p != body.len() {
+        return Err("invalid DXT footer tail");
+    }
+    Ok((&payload[..start], out))
+}
+
 const BLOCK_LOOT_FOOTER_LEN: usize = 12;
 const BLOCK_LOOT_MAGIC: &[u8; 4] = b"BLT1";
 fn append_block_loot_footer(out: &mut Vec<u8>, entries: &[(BlockPos, PendingBlockLoot)]) {
@@ -2983,8 +3526,9 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
 fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     // Footers are stripped last-written-first.
     let (payload, _) = read_world_seed_footer(payload)?;
-    let (payload, mob_dimensions) = read_mob_dimensions_footer(payload)?;
-    let (payload, brewing) = read_brewing_footer(payload)?;
+    let (payload, dxt) = read_dxt_footer(payload)?;
+    let (payload, mut mob_dimensions) = read_mob_dimensions_footer(payload)?;
+    let (payload, mut brewing) = read_brewing_footer(payload)?;
     // A payload with no DIM2 footer is the legacy (or DIM1-only) form and parses exactly as before.
     let (payload, dim2) = read_dim2_footer(payload)?;
     let (payload, dim_signs, dim_players) = read_dim_footer(payload)?;
@@ -2997,7 +3541,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     let (payload, body) = split_save_footer(before_generated, SAVE_STATE_MAGIC)?;
     let mut state = body.map(SaveState::read).transpose()?;
     let (payload, block_entities) = split_save_footer(payload, BLOCK_ENTITIES_MAGIC)?;
-    let block_entities = block_entities
+    let mut block_entities = block_entities
         .map(read_block_entities_body)
         .transpose()?;
     if generated.as_ref().is_some_and(|s| (!s.sources.is_empty() || !s.spider_flags.is_empty())
@@ -4105,7 +4649,123 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
     }
-    let state = state.unwrap_or_default();
+    let mut state = state.unwrap_or_default();
+    if !dxt.is_empty() {
+        let dxt = &dxt;
+        // Resolve every named record against the registry this process is
+        // running — a datapack added, removed, or reordered between restarts
+        // changes slots, never names.
+        for (key, bytes) in &dxt.overlays {
+            if let Some(dim) = dxt_dim(key) {
+                if let Err(msg) = load_dim_overlay_from(dim, bytes) {
+                    eprintln!("[spine] {key} overlay: {msg}");
+                }
+            }
+        }
+        {
+            let mut ps = pos_store().lock().unwrap();
+            for (name, key) in &dxt.players {
+                if let (Some(dim), Some(entry)) = (dxt_dim(key), ps.get_mut(name)) {
+                    entry.0 = dim;
+                }
+            }
+        }
+        for (uuid, position, respawn) in &dxt.saved_players {
+            if let Some(player) = state.players.get_mut(uuid) {
+                if let Some(key) = position {
+                    if let Some(dim) = dxt_dim(key) {
+                        player.position.0 = dim;
+                    }
+                }
+                if let Some(key) = respawn {
+                    if let Some(dim) = dxt_dim(key) {
+                        if let Some(point) = &mut player.respawn {
+                            point.dim = dim;
+                        }
+                    }
+                }
+            }
+        }
+        for (ordinal, key) in &dxt.mob_dims {
+            if let (Some(dim), Some(slot)) = (dxt_dim(key), mob_dimensions.get_mut(*ordinal as usize)) {
+                *slot = dim;
+            }
+        }
+        let raids = &mut state.raids;
+        for (ordinal, key) in &dxt.raid_dims {
+            if let (Some(dim), Some(raid)) = (dxt_dim(key), raids.get_mut(*ordinal as usize)) {
+                raid.0 = dim;
+            }
+        }
+        {
+            let mut sg = signs().lock().unwrap();
+            for (key, x, y, z, front, lines) in &dxt.signs {
+                if let Some(dim) = dxt_dim(key) {
+                    sg.insert((dim, *x, *y, *z, *front), lines.clone());
+                }
+            }
+        }
+        {
+            let mut ch = chests().lock().unwrap();
+            for (key, x, y, z, items) in &dxt.chests {
+                if let Some(dim) = dxt_dim(key) {
+                    ch.insert(ContainerKey::Block((dim, *x, *y, *z)), items.clone());
+                }
+            }
+        }
+        {
+            let mut fs = furnaces().lock().unwrap();
+            for (key, x, y, z, furnace) in &dxt.furnaces {
+                if let Some(dim) = dxt_dim(key) {
+                    fs.insert((dim, *x, *y, *z), clone_furnace_for_footer(furnace));
+                }
+            }
+        }
+        {
+            let mut cg = crops().lock().unwrap();
+            for (key, x, y, z, age) in &dxt.crops {
+                if let Some(dim) = dxt_dim(key) {
+                    cg.insert((dim, *x, *y, *z), *age);
+                }
+            }
+        }
+        for (key, x, y, z, loot) in &dxt.loot {
+            if let Some(dim) = dxt_dim(key) {
+                pending_block_loot().lock().unwrap().insert((dim, *x, *y, *z), loot.clone());
+            }
+        }
+        for (key, x, y, z, slots, fuel, remaining) in &dxt.brewing {
+            if let Some(dim) = dxt_dim(key) {
+                let mut entry = LiveBrewingStand::default();
+                for (index, stack) in slots {
+                    if let Some(slot) = entry.menu.slots.get_mut(*index as usize) {
+                        *slot = stack.clone();
+                    }
+                }
+                entry.stand.fuel = *fuel;
+                entry.stand.brew_time = *remaining;
+                if *remaining > 0 {
+                    entry.stand.active_ingredient =
+                        item_to_name(entry.menu.slots[3].0).and_then(BrewingIngredient::from_item);
+                }
+                brewing.insert((dim, *x, *y, *z), entry);
+            }
+        }
+        let mut custom_entities = Vec::with_capacity(dxt.block_entities.len());
+        for (key, x, y, z, state_id, tag) in &dxt.block_entities {
+            if let Some(dim) = dxt_dim(key) {
+                custom_entities.push(((dim, *x, *y, *z), *state_id, tag.clone()));
+            }
+        }
+        block_entities = Some(
+            block_entities
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .chain(custom_entities)
+                .collect(),
+        );
+    }
     restore_gamerules(state.gamerules.as_deref());
     *WORLD_SPAWN_PITCH.lock().unwrap() = state.spawn_pitch;
     *saved_players().lock().unwrap() = state.players;
@@ -4122,12 +4782,44 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
 
 const BREWING_SAVE_MAGIC: &[u8; 4] = b"BRS1";
 
+/// The live brewing stands a custom dimension owns, for DXT1. The BRS1 footer
+/// keeps its vanilla-only set and its byte-identical layout.
+fn collect_dxt_brewing(dxt: &mut DxtEntries) {
+    let stands = live_brewing_stands().lock().unwrap();
+    let mut entries: Vec<_> = stands
+        .iter()
+        .filter(|(pos, _)| !pos.0.is_vanilla())
+        .collect();
+    entries.sort_by_key(|(&(dim, x, y, z), _)| (dim_key(dim), x, y, z));
+    for (&(dim, x, y, z), entry) in entries {
+        let slots = entry
+            .menu
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, stack)| stack.1 > 0)
+            .map(|(i, stack)| (i as i16, stack.clone()))
+            .collect();
+        let current =
+            item_to_name(entry.menu.slots[3].0).and_then(BrewingIngredient::from_item);
+        let remaining = if current == entry.stand.active_ingredient {
+            entry.stand.brew_time
+        } else {
+            0
+        };
+        dxt.brewing
+            .push((dim_key(dim), x, y, z, slots, entry.stand.fuel, remaining));
+    }
+}
+
 fn append_brewing_footer(out: &mut Vec<u8>) {
     let stands = live_brewing_stands().lock().unwrap();
     let mut entries: Vec<_> = stands
         .iter()
-        .filter(|(_, stand)| {
-            stand.stand.fuel > 0 || stand.menu.slots.iter().any(|stack| stack.1 > 0)
+        .filter(|(pos, stand)| {
+            pos.0.is_vanilla()
+                && (stand.stand.fuel > 0
+                    || stand.menu.slots.iter().any(|stack| stack.1 > 0))
         })
         .collect();
     if entries.is_empty() {
@@ -4234,7 +4926,7 @@ fn read_brewing_footer(
 // every legacy byte — and every other footer's position — exactly where it was.
 const BLOCK_ENTITIES_MAGIC: &[u8; 4] = b"BEN1";
 
-fn append_block_entities_footer(out: &mut Vec<u8>) {
+fn append_block_entities_footer(out: &mut Vec<u8>, dxt: &mut DxtEntries) {
     let Some(reg) = breg() else { return };
     // Pick up blocks placed since the last tick's scan so entities nobody has
     // interacted with persist too.
@@ -4249,7 +4941,12 @@ fn append_block_entities_footer(out: &mut Vec<u8>) {
     let mut entries = Vec::new();
     for key in keys {
         if let Some((state, tag)) = live_block_entity_snapshot(key) {
-            entries.push((key, state, tag));
+            if key.0.is_vanilla() {
+                entries.push((key, state, tag));
+            } else {
+                dxt.block_entities
+                    .push((dim_key(key.0), key.1, key.2, key.3, state, tag));
+            }
         }
     }
     if entries.is_empty() {
