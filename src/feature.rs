@@ -5927,8 +5927,6 @@ fn load_freg() -> FReg {
         .map(|(i, pf)| (pf.name.as_str(), i))
         .collect();
 
-    let sources = jparse(include_bytes!("../assets/feature_order_1211.json"))
-        .expect("native biome-source iteration");
     // A server rooted at a directory with no `datapacks/` tree at all — the
     // wire-test layout, where the working directory carries only `assets` and
     // `config_packets.bin` — loads zero biome files, so `bsteps` is empty and
@@ -5940,6 +5938,14 @@ fn load_freg() -> FReg {
     if reg.bsteps.is_empty() {
         return reg;
     }
+    // The order source is a runtime read now, so a stripped checkout still
+    // compiles: with a populated registry the pinned table is required, and a
+    // missing or corrupt one is the same fail-closed panic as before.
+    let sources = jparse(&crate::structure_transform::pinned_data_expect(
+        "assets/feature_order_1211.json",
+        "native biome-source iteration",
+    ))
+    .expect("native biome-source iteration");
     for preset in [
         NoisePreset::Overworld,
         NoisePreset::Nether,

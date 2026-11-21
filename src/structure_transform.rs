@@ -127,13 +127,93 @@ pub(crate) fn bounds(
         first.2.max(last.2).wrapping_add(origin.2),
     ]
 }
+// ---------- pinned jar-derived data on disk ----------
+//
+// The 1.21.1 tables this server reads are generated from the pinned server
+// jar, so the build never `include_bytes!`s them: a stripped checkout carries
+// none of the files until `tools/vanilla_data/gen_vanilla_data.sh` runs.
+// Resolution order matches the block-registry pack: the directory
+// `MC_SPINE_VERSION_DIR` names first (version-neutral spelling, then the
+// bundled `*_1211` tag), then the checkout layout relative to the working
+// directory, then the manifest directory so in-repo callers still resolve
+// when the working directory is somewhere else.
+
+/// Every location [`pinned_data_bytes`] tries for `rel`, in order, so a
+/// failure can name the whole search instead of a bare "not found".
+fn pinned_data_candidates(rel: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::with_capacity(4);
+    if let Some(dir) = std::env::var_os("MC_SPINE_VERSION_DIR") {
+        if !dir.is_empty() {
+            let dir = std::path::PathBuf::from(dir);
+            if let Some(name) = rel.strip_prefix("assets/") {
+                // The version-pack spelling drops the bundled tag (e.g.
+                // `feature_order.json`); the tagged name stays a fallback so
+                // an `assets/` copy also serves as a version directory.
+                if let Some((stem, ext)) = name.split_once('.') {
+                    let stem = stem.strip_suffix("_1211").unwrap_or(stem);
+                    out.push(dir.join(format!("{stem}.{ext}")));
+                }
+                out.push(dir.join(name));
+            } else if let Some(rest) = rel.strip_prefix("datapacks/vanilla/") {
+                // The pack roots its datapack content at `data/`; the full
+                // checkout spelling stays a fallback for a mirrored tree.
+                out.push(dir.join(rest));
+                out.push(dir.join(rel));
+            } else {
+                out.push(dir.join(rel));
+            }
+        }
+    }
+    out.push(rel.into());
+    out.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel));
+    out
+}
+
+/// The bytes of one pinned data file, or `None` when no candidate exists.
+pub(crate) fn pinned_data_bytes(rel: &str) -> Option<Vec<u8>> {
+    pinned_data_candidates(rel)
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+}
+
+/// [`pinned_data_bytes`] for a table that must exist: the panic names every
+/// candidate tried so a missing pack is a readable error, not a silent none.
+pub(crate) fn pinned_data_expect(rel: &str, what: &str) -> Vec<u8> {
+    pinned_data_bytes(rel).unwrap_or_else(|| {
+        panic!(
+            "{what}: {rel} is absent (searched {})",
+            pinned_data_candidates(rel)
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+/// The per-state `StructureTemplate` transform table: 12 u32s per state,
+/// generated from the pinned 1.21.1 jar. `include_bytes!` used to compile it
+/// in; loading it lazily keeps stripped checkouts building while a missing
+/// pack still fails closed on first use.
+fn transform_table() -> &'static [u8] {
+    static TABLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            pinned_data_expect(
+                "assets/structure_state_transforms_1211.bin",
+                "structure state transform table",
+            )
+        })
+        .as_slice()
+}
+
 pub(crate) fn state(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u32> {
     let index = (state as usize)
         .checked_mul(12)?
         .checked_add(mirror as usize * 4 + rotation as usize)?
         .checked_mul(4)?;
     let end = index.checked_add(4)?;
-    let bytes = include_bytes!("../assets/structure_state_transforms_1211.bin").get(index..end)?;
+    let bytes = transform_table().get(index..end)?;
     Some(u32::from_be_bytes(bytes.try_into().unwrap()))
 }
 

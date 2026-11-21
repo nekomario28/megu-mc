@@ -658,10 +658,20 @@ fn natural_spawn_light_sources(clients: &[Arc<Client>], dim: DimId, cx: i32, cz:
 fn nightly_spawn_is_dark(x: i32, y: i32, z: i32, sources: &GenSources) -> bool {
     static RULES: OnceLock<OverworldMonsterLight> = OnceLock::new();
     let rules = RULES.get_or_init(|| {
-        OverworldMonsterLight::from_dimension_type(include_bytes!(
-            "../datapacks/vanilla/data/minecraft/dimension_type/overworld.json"
-        ))
-        .expect("pinned Overworld dimension type must have valid monster spawn light rules")
+        match crate::structure_transform::pinned_data_bytes(
+            "datapacks/vanilla/data/minecraft/dimension_type/overworld.json",
+        ) {
+            Some(bytes) => OverworldMonsterLight::from_dimension_type(&bytes)
+                .expect("pinned Overworld dimension type must have valid monster spawn light rules"),
+            // A scratch run with no `datapacks/` tree (the wire-test
+            // `local_server` layout) still spawns by the pinned 1.21.1
+            // values: block-light limit 0, uniform light level 0..=7.
+            None => OverworldMonsterLight {
+                block_limit: 0,
+                min: 0,
+                max: 7,
+            },
+        }
     });
     let (cx, cz) = (x >> 4, z >> 4);
     let sky_light = nibble_at(&sky_light_sections_world(cx, cz), x, y, z);

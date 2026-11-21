@@ -4,7 +4,9 @@
 use crate::block_registry::HeightmapKind;
 use crate::feature::SpawnerData;
 
-#[cfg_attr(not(test), allow(dead_code))]
+// `NetherSpawnRules::vanilla` reads this file at runtime; the test module still
+// pins the same bytes so its assertions read the datapack file itself.
+#[cfg(test)]
 const NETHER_DIMENSION_TYPE: &[u8] =
     include_bytes!("../datapacks/vanilla/data/minecraft/dimension_type/the_nether.json");
 
@@ -110,8 +112,18 @@ pub(crate) struct NetherSpawnRules {
 impl NetherSpawnRules {
     pub(crate) fn vanilla() -> Self {
         Self {
-            light: NetherMonsterLight::from_dimension_type(NETHER_DIMENSION_TYPE)
-                .expect("pinned Nether dimension type must have valid monster spawn light rules"),
+            light: match crate::structure_transform::pinned_data_bytes(
+                "datapacks/vanilla/data/minecraft/dimension_type/the_nether.json",
+            ) {
+                Some(bytes) => NetherMonsterLight::from_dimension_type(&bytes)
+                    .expect("pinned Nether dimension type must have valid monster spawn light rules"),
+                // No `datapacks/` tree at all: the pinned 1.21.1 file's own
+                // values - block-light limit 15, constant light level 7.
+                None => NetherMonsterLight {
+                    block_limit: 15,
+                    spawn_limit: 7,
+                },
+            },
             // NetherFortressStructure.FORTRESS_ENEMIES. The pinned fortress.json
             // registers the same list for its piece-level Monster override.
             fortress_spawners: [
