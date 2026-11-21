@@ -462,3 +462,86 @@ fn packed_fluid_vertices_preserve_fractional_heights_and_material() {
         assert_eq!(vertex.tint, water.fluid_tint);
     }
 }
+
+#[test]
+fn ffi_bucket_directions_regroups_like_the_rust_helper() {
+    let mut section = Section::filled(Block::AIR, Light::new(0, 15));
+    section.set(15, 15, 2, Block::opaque_cube(26_683), Light::new(10, 0));
+    section.set(3, 4, 5, Block::opaque_cube(700), Light::new(1, 2));
+    let east = [Sample::new(Block::opaque_cube(1), Light::new(0, 0)); FACE_CELLS];
+    let mut view = section.view();
+    view.borders[Direction::East as usize] = Some(&east);
+    let quads = mesh_section(&view);
+    assert!(quads.len() > DIRECTION_BUCKETS);
+    let (grouped_expected, buckets_expected) = DirectionBuckets::group(&quads);
+
+    let mut buckets = DirectionBuckets::default();
+    let mut count = usize::MAX;
+    // SAFETY: quads is a live slice; buckets and count are writable.
+    assert_eq!(
+        unsafe {
+            mc_spine_client_mesh_bucket_directions(
+                quads.as_ptr(),
+                quads.len(),
+                ptr::null_mut(),
+                0,
+                &mut buckets,
+                &mut count,
+            )
+        },
+        ABI_OK
+    );
+    assert_eq!(count, quads.len());
+    assert_eq!(buckets, buckets_expected);
+
+    let mut output = vec![quads[0]; count + 1];
+    // SAFETY: output has one extra writable slot past the required count.
+    assert_eq!(
+        unsafe {
+            mc_spine_client_mesh_bucket_directions(
+                quads.as_ptr(),
+                quads.len(),
+                output.as_mut_ptr(),
+                count - 1,
+                &mut buckets,
+                &mut count,
+            )
+        },
+        ABI_BUFFER_TOO_SMALL
+    );
+    assert_eq!(count, quads.len());
+    assert_eq!(output[0], quads[0]);
+    // SAFETY: output now has enough writable slots, still disjoint from input.
+    assert_eq!(
+        unsafe {
+            mc_spine_client_mesh_bucket_directions(
+                quads.as_ptr(),
+                quads.len(),
+                output.as_mut_ptr(),
+                count,
+                ptr::null_mut(),
+                &mut count,
+            )
+        },
+        ABI_OK
+    );
+    assert_eq!(&output[..count], grouped_expected.as_slice());
+    assert_eq!(output[count], quads[0]);
+
+    let mut count = usize::MAX;
+    // SAFETY: null input is rejected without a dereference.
+    assert_eq!(
+        unsafe {
+            mc_spine_client_mesh_bucket_directions(
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                0,
+                &mut buckets,
+                &mut count,
+            )
+        },
+        ABI_INVALID_ARGUMENT
+    );
+    assert_eq!(count, 0);
+}

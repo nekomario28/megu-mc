@@ -11,6 +11,7 @@ mod lod;
 mod mesh;
 mod packed;
 mod section;
+pub mod visibility;
 
 #[cfg(test)]
 mod tests;
@@ -18,7 +19,11 @@ mod tests;
 pub use cache::{MeshCache, SectionCoord};
 pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
 pub use lod::{summarize_column, LodCell, LodSummary, LOD_COARSE, LOD_FINE};
-pub use mesh::{mesh_section, Layer, Quad, QUAD_FALLING, QUAD_TINTED};
+pub use mesh::{
+    bucket_draw_mask, mesh_section, DirectionBuckets, Layer, Quad, DIRECTION_BUCKETS,
+    DIRECTION_BUCKET_UNASSIGNED, QUAD_FALLING, QUAD_TINTED,
+};
 pub use section::*;
+pub use visibility::FaceVisibility;
 
 pub const PROTOCOL_VERSION: u32 = 767;

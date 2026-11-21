@@ -186,6 +186,31 @@ int32_t mc_spine_client_mesh_sort_translucent(const mc_spine_mesh_quad *quads, s
                                               float camera_x, float camera_y, float camera_z,
                                               uint32_t *output, size_t capacity, size_t *count);
 
+/* Direction buckets (additive ABI v1 extension). Bucket indices 0..5 are the
+   face directions MC_SPINE_MESH_DOWN..MC_SPINE_MESH_EAST; index 6 is the
+   unassigned bucket and always draws. Drawing the buckets whose side faces
+   the camera plus the unassigned bucket skips the three back-facing ranges;
+   a camera inside the section bounds draws all seven. Ranges are in quads and
+   scale by four for packed-vertex buffers. */
+enum {
+    MC_SPINE_MESH_DIR_BUCKETS = 7,
+    MC_SPINE_MESH_DIR_UNASSIGNED = 6,
+};
+
+typedef struct mc_spine_mesh_dir_buckets {
+    uint32_t offset[MC_SPINE_MESH_DIR_BUCKETS]; /* first quad of each bucket */
+    uint32_t count[MC_SPINE_MESH_DIR_BUCKETS];  /* quads per bucket */
+} mc_spine_mesh_dir_buckets;
+
+/* Regroups quads into the seven direction buckets, stable within each bucket,
+   and reports the contiguous ranges. Uses the v1 buffer, count and status
+   conventions: NULL output with zero capacity queries *count and still fills
+   *buckets when non-NULL. buckets may be NULL when the ranges are not needed.
+   Mesher output always uses buckets 0..5, leaving unassigned empty. */
+int32_t mc_spine_client_mesh_bucket_directions(const mc_spine_mesh_quad *quads, size_t quad_count,
+                                               mc_spine_mesh_quad *output, size_t capacity,
+                                               mc_spine_mesh_dir_buckets *buckets, size_t *count);
+
 #ifdef __cplusplus
 }
 #endif

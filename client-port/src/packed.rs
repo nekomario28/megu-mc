@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
+use crate::mesh::{DirectionBuckets, DIRECTION_BUCKETS};
 use crate::{Layer, Quad, EDGE, LAVA, QUAD_FALLING, QUAD_TINTED, WATER};
 
 pub(crate) const MAX_COLUMN_SECTIONS: usize = 32;
@@ -108,4 +109,18 @@ pub(crate) fn pack_quad(quad: &Quad) -> [PackedVertex; 4] {
         }
     };
     [make(0), make(1), make(2), make(3)]
+}
+
+impl DirectionBuckets {
+    /// `(offset, count)` per bucket in packed vertices. `pack_quad` emits four
+    /// vertices per quad in order, so both quad values scale by four; the
+    /// ranges index the buffer produced by packing the grouped quads
+    /// sequentially into the same base.
+    pub fn vertex_ranges(&self) -> [(u32, u32); DIRECTION_BUCKETS] {
+        let mut ranges = [(0, 0); DIRECTION_BUCKETS];
+        for (i, (&offset, &count)) in self.offset.iter().zip(&self.count).enumerate() {
+            ranges[i] = (offset * 4, count * 4);
+        }
+        ranges
+    }
 }

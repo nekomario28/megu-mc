@@ -1860,3 +1860,90 @@ pub fn mesh_section(view: &SectionView<'_>) -> Vec<Quad> {
         quads
     })
 }
+
+/// Seven draw buckets for face-direction culling: indices 0..5 follow
+/// `Direction`, and [`DIRECTION_BUCKET_UNASSIGNED`] holds quads a directional
+/// culler must always draw. Mesher output always carries one of the six face
+/// directions, so its unassigned bucket stays empty; the bucket exists for
+/// renderer-appended geometry and ABI parity.
+pub const DIRECTION_BUCKETS: usize = 7;
+pub const DIRECTION_BUCKET_UNASSIGNED: usize = Direction::East as usize + 1;
+
+/// Bit per bucket to draw when `facing` holds the section-boundary sides
+/// facing the camera (see `crate::box_facing_mask`: one `Direction::bit` per
+/// visible side). The unassigned bucket always draws. An enclosed camera
+/// produces a zero facing mask and must draw every bucket, so zero maps to a
+/// full mask. A camera outside the bounds on an axis reports one bit per axis,
+/// so the typical case draws three face buckets plus unassigned and skips the
+/// three back-facing ones in O(1).
+pub const fn bucket_draw_mask(facing: u8) -> u8 {
+    let facing = facing & ALL_FACES;
+    if facing == 0 {
+        (1 << DIRECTION_BUCKETS) - 1
+    } else {
+        facing | (1 << DIRECTION_BUCKET_UNASSIGNED)
+    }
+}
+
+/// Contiguous quad ranges of a direction-grouped mesh. Offsets index the
+/// grouped order; `offset[b] + count[b]` ends bucket `b`, and the buckets
+/// cover the whole range with no gaps.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirectionBuckets {
+    /// First quad of each bucket in the grouped output.
+    pub offset: [u32; DIRECTION_BUCKETS],
+    /// Number of quads in each bucket.
+    pub count: [u32; DIRECTION_BUCKETS],
+}
+
+impl DirectionBuckets {
+    /// Bucket index of a face direction: the `Direction` value itself.
+    pub const fn index_of(direction: Direction) -> usize {
+        direction as usize
+    }
+
+    /// Ranges for `count` laid out contiguously starting at `base`.
+    pub(crate) fn laid_out(count: [u32; DIRECTION_BUCKETS], base: u32) -> Self {
+        let mut buckets = Self {
+            offset: [0; DIRECTION_BUCKETS],
+            count,
+        };
+        let mut next = base;
+        for (offset, &count) in buckets.offset.iter_mut().zip(&count) {
+            *offset = next;
+            next += count;
+        }
+        buckets
+    }
+
+    /// Stable regrouping: a copy of `quads` ordered by bucket with input order
+    /// preserved inside each bucket, plus its ranges.
+    pub fn group(quads: &[Quad]) -> (Vec<Quad>, Self) {
+        let mut grouped = Vec::with_capacity(quads.len());
+        let buckets = Self::group_into(quads, &mut grouped);
+        (grouped, buckets)
+    }
+
+    /// Appends the same stable regrouping to `out`. The returned ranges index
+    /// `out` directly, so quads already held there shift every offset by the
+    /// length `out` had before the call. Panics when the result would exceed
+    /// `u32::MAX` quads.
+    pub fn group_into(quads: &[Quad], out: &mut Vec<Quad>) -> Self {
+        assert!(out.len() + quads.len() <= u32::MAX as usize);
+        let mut count = [0u32; DIRECTION_BUCKETS];
+        for quad in quads {
+            count[Self::index_of(quad.direction)] += 1;
+        }
+        let buckets = Self::laid_out(count, out.len() as u32);
+        for bucket in 0..DIRECTION_BUCKETS {
+            out.extend(
+                quads
+                    .iter()
+                    .filter(|quad| Self::index_of(quad.direction) == bucket)
+                    .copied(),
+            );
+        }
+        buckets
+    }
+}

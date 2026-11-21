@@ -94,7 +94,30 @@ static void column_roundtrip(void) {
     assert(mc_spine_client_mesh_sort_translucent(quads, 9, 15, 100, 8, indices, 9, &count)
            == MC_SPINE_MESH_OK);
     assert(count == 9 && indices[0] == 0 && indices[8] == 5);
-    puts("C ABI column roundtrip: 9 quads, 36 packed vertices, 9 sorted indices");
+
+    mc_spine_mesh_dir_buckets buckets = {{0}, {0}};
+    mc_spine_mesh_quad grouped[9];
+    assert(mc_spine_client_mesh_bucket_directions(NULL, 0, NULL, 0, &buckets, &count)
+           == MC_SPINE_MESH_INVALID_ARGUMENT && count == 0);
+    assert(mc_spine_client_mesh_bucket_directions(quads, 9, NULL, 0, &buckets, &count)
+           == MC_SPINE_MESH_OK);
+    assert(count == 9 && buckets.count[MC_SPINE_MESH_DIR_UNASSIGNED] == 0);
+    size_t total = 0;
+    for (size_t b = 0; b < MC_SPINE_MESH_DIR_BUCKETS; ++b) {
+        assert(buckets.offset[b] == total);
+        total += buckets.count[b];
+    }
+    assert(total == 9);
+    assert(mc_spine_client_mesh_bucket_directions(quads, 9, grouped, 8, &buckets, &count)
+           == MC_SPINE_MESH_BUFFER_TOO_SMALL && count == 9);
+    assert(mc_spine_client_mesh_bucket_directions(quads, 9, grouped, 9, &buckets, &count)
+           == MC_SPINE_MESH_OK);
+    for (size_t b = 0; b < MC_SPINE_MESH_DIR_BUCKETS; ++b) {
+        for (uint32_t i = 0; i < buckets.count[b]; ++i) {
+            assert(grouped[buckets.offset[b] + i].direction == b);
+        }
+    }
+    puts("C ABI column roundtrip: 9 quads, 36 packed vertices, 9 sorted indices, direction buckets");
 }
 
 int main(void) {

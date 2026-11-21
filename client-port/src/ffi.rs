@@ -11,8 +11,8 @@ use crate::{
     column::{mesh_column_into, ColumnSection, FacePlane},
     mesh::{mesh_section_with_scratch, with_scratch, CountSink},
     packed::{depth_key, is_packable, is_translucent, pack_quad, MAX_COLUMN_SECTIONS},
-    Block, Direction, Layer, MissingNeighbor, Quad, Sample, SectionView, EDGE_CORNER_CELLS,
-    FACE_CELLS, LIGHT_BYTES, SECTION_CELLS,
+    Block, Direction, DirectionBuckets, Layer, MissingNeighbor, Quad, Sample, SectionView,
+    EDGE_CORNER_CELLS, FACE_CELLS, LIGHT_BYTES, SECTION_CELLS,
 };
 
 pub const ABI_VERSION: u32 = 1;
@@ -410,4 +410,71 @@ pub unsafe extern "C" fn mc_spine_client_mesh_sort_translucent(
         scratch.sort_buf = order;
         ABI_OK
     })
+}
+
+/// Regroups quads into the seven direction buckets, stable within each bucket,
+/// and reports the contiguous ranges. A null output with zero capacity queries
+/// `count` and still fills `buckets` when non-null.
+///
+/// # Safety
+///
+/// Non-null buffers must be aligned and valid for their stated lengths. Input
+/// fields must be initialized and readable. Output, buckets and count must be
+/// writable and disjoint from the input and each other; buckets may be null.
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_client_mesh_bucket_directions(
+    quads: *const Quad,
+    quad_count: usize,
+    output: *mut Quad,
+    capacity: usize,
+    buckets: *mut DirectionBuckets,
+    count: *mut usize,
+) -> i32 {
+    if count.is_null() {
+        return ABI_INVALID_ARGUMENT;
+    }
+    // SAFETY: non-null count is writable.
+    unsafe { count.write(0) };
+    if (output.is_null() && capacity != 0)
+        || quads.is_null()
+        || quad_count > isize::MAX as usize / std::mem::size_of::<Quad>()
+        || u32::try_from(quad_count).is_err()
+    {
+        return ABI_INVALID_ARGUMENT;
+    }
+    for i in 0..quad_count {
+        // SAFETY: quads is valid for quad_count initialized elements.
+        let qptr = unsafe { quads.add(i) };
+        if !unsafe { validate_quad_enums(qptr) } {
+            return ABI_INVALID_ARGUMENT;
+        }
+    }
+    // SAFETY: enum discriminants were validated above.
+    let quads = unsafe { std::slice::from_raw_parts(quads, quad_count) };
+    let mut counts = [0u32; crate::DIRECTION_BUCKETS];
+    for quad in quads {
+        counts[DirectionBuckets::index_of(quad.direction)] += 1;
+    }
+    let buckets_layout = DirectionBuckets::laid_out(counts, 0);
+    // SAFETY: count is writable and separate from input, output and buckets.
+    unsafe { count.write(quad_count) };
+    if !buckets.is_null() {
+        // SAFETY: non-null buckets is writable and disjoint from other buffers.
+        unsafe { buckets.write(buckets_layout) };
+    }
+    if output.is_null() {
+        return ABI_OK;
+    }
+    if capacity < quad_count {
+        return ABI_BUFFER_TOO_SMALL;
+    }
+    let mut cursor = buckets_layout.offset;
+    for &quad in quads {
+        let bucket = DirectionBuckets::index_of(quad.direction);
+        // SAFETY: bucket ranges partition 0..quad_count and output is disjoint
+        // from input, so each write lands exactly once inside capacity.
+        unsafe { output.add(cursor[bucket] as usize).write(quad) };
+        cursor[bucket] += 1;
+    }
+    ABI_OK
 }

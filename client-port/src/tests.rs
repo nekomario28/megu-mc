@@ -1891,3 +1891,89 @@ fn column_culling_matches_scalar_reference_on_sealed_columns() {
         .iter()
         .all(|q| q.positions.iter().all(|p| p[1] == 16.0)));
 }
+
+#[test]
+fn direction_buckets_group_partitions_and_stays_stable() {
+    // Multiple emitters spread across the section produce several quads per
+    // direction, so every face bucket ends up non-empty.
+    let mut section = air();
+    section.set(4, 4, 4, STONE, DAY);
+    section.set(10, 11, 12, STONE, DAY);
+    section.set(
+        7,
+        7,
+        7,
+        Block {
+            state_id: 519,
+            flags: CUTOUT | TINTED,
+            tint: 0x102030,
+            ..Block::AIR
+        },
+        DAY,
+    );
+    section.set(2, 2, 2, fluid(WATER, 0), DAY);
+    let quads = mesh_section(&section.view());
+    assert!(quads.len() > DIRECTION_BUCKETS);
+
+    let (grouped, buckets) = DirectionBuckets::group(&quads);
+    assert_eq!(grouped.len(), quads.len());
+    let mut next = 0;
+    for b in 0..DIRECTION_BUCKETS {
+        // Ranges tile the whole output with no gaps and contain exactly the
+        // input quads of that bucket, in input order.
+        assert_eq!(buckets.offset[b], next);
+        let range = &grouped[next as usize..(next + buckets.count[b]) as usize];
+        let expected: Vec<Quad> = quads
+            .iter()
+            .filter(|q| DirectionBuckets::index_of(q.direction) == b)
+            .copied()
+            .collect();
+        assert_eq!(range, expected.as_slice(), "bucket {b}");
+        next += buckets.count[b];
+    }
+    assert_eq!(next as usize, quads.len());
+    // Mesher output always carries a face direction, so unassigned is empty.
+    assert_eq!(buckets.count[DIRECTION_BUCKET_UNASSIGNED], 0);
+    assert_eq!(
+        buckets.offset[DIRECTION_BUCKET_UNASSIGNED] as usize,
+        quads.len()
+    );
+
+    // group_into appends and reports absolute offsets into the buffer.
+    let mut out = vec![quads[0]];
+    let appended = DirectionBuckets::group_into(&quads, &mut out);
+    assert_eq!(out.len(), quads.len() + 1);
+    for b in 0..DIRECTION_BUCKETS {
+        assert_eq!(appended.offset[b], buckets.offset[b] + 1);
+        assert_eq!(appended.count[b], buckets.count[b]);
+    }
+    assert_eq!(&out[1..], grouped.as_slice());
+}
+
+#[test]
+fn direction_buckets_draw_mask_and_vertex_ranges() {
+    // An enclosed camera faces no boundary plane and must draw all buckets.
+    assert_eq!(bucket_draw_mask(0), 0x7f);
+    // A camera outside on one or more axes draws those face buckets plus the
+    // unassigned bucket; the typical corner view skips three directions.
+    let facing = Direction::West.bit() | Direction::Up.bit() | Direction::South.bit();
+    let mask = bucket_draw_mask(facing);
+    assert_eq!(mask, facing | (1 << DIRECTION_BUCKET_UNASSIGNED));
+    assert_eq!(mask.count_ones(), 4);
+    let enclosed = bucket_draw_mask(box_facing_mask([0.0; 3], [8.0, 8.0, 8.0]));
+    assert_eq!(enclosed, 0x7f);
+    let west_north = bucket_draw_mask(box_facing_mask([0.0; 3], [-1.0, 8.0, -1.0]));
+    assert_eq!(
+        west_north,
+        Direction::West.bit() | Direction::North.bit() | (1 << DIRECTION_BUCKET_UNASSIGNED)
+    );
+
+    let buckets = DirectionBuckets {
+        offset: [0, 3, 3, 9, 9, 9, 10],
+        count: [0, 3, 0, 6, 0, 1, 0],
+    };
+    let vr = buckets.vertex_ranges();
+    for b in 0..DIRECTION_BUCKETS {
+        assert_eq!(vr[b], (buckets.offset[b] * 4, buckets.count[b] * 4));
+    }
+}
