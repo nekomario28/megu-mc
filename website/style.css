@@ -303,6 +303,79 @@ h3 {
   font-size: 14.5px;
 }
 
+/* Benchmarks */
+
+.bench-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.bench-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+
+.bench-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+
+.bar-row {
+  display: grid;
+  grid-template-columns: 102px 1fr 92px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.bar-name {
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.bar-track {
+  height: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  border-radius: 2px;
+}
+
+.bar-fill.accent {
+  background: var(--accent);
+}
+
+.bar-fill.muted {
+  background: var(--border-strong);
+}
+
+.bar-val {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text-dim);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.bench-caveat {
+  margin: 14px 0 0;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  line-height: 1.55;
+}
+
 /* Checker */
 
 .checker {

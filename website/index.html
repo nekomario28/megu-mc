@@ -17,6 +17,7 @@
     <div class="nav-inner">
       <a class="brand" href="#top" data-cfg="projectName">Megu</a>
       <nav class="nav-links" aria-label="Primary">
+        <a href="#benchmarks" data-i18n="nav_bench">Benchmarks</a>
         <a href="#checker" data-i18n="nav_checker">Modpack check</a>
         <a href="#how" data-i18n="nav_how">How it works</a>
         <a href="#quickstart" data-i18n="nav_quickstart">Quickstart</a>
@@ -60,6 +61,50 @@
           <a class="btn ghost" href="https://github.com/nekomario28/mc-spine"
              data-cfg-href="githubUrl" data-i18n="cta_github">View on GitHub</a>
         </div>
+      </div>
+    </section>
+
+    <section id="benchmarks">
+      <div class="wrap">
+        <div class="section-head">
+          <h2 data-i18n="bench_title">~1/9.6 the RAM usage.</h2>
+          <p class="section-note" data-i18n="bench_meta">Measured on Linux x86_64 · 3-run mean · seed 0 · view 4</p>
+        </div>
+
+        <div class="bench-grid">
+          <div class="bench-card">
+            <div class="bench-label" data-i18n="bench_ram_label">Resident memory (VmRSS)</div>
+            <div class="bar-row">
+              <span class="bar-name" data-cfg="projectName">Megu</span>
+              <div class="bar-track"><div class="bar-fill accent" style="width:10.5%"></div></div>
+              <span class="bar-val">122.1 MiB</span>
+            </div>
+            <div class="bar-row">
+              <span class="bar-name">Vanilla 1.21.1</span>
+              <div class="bar-track"><div class="bar-fill muted" style="width:100%"></div></div>
+              <span class="bar-val">1,168.4 MiB</span>
+            </div>
+          </div>
+
+          <div class="bench-card">
+            <div class="bench-label" data-i18n="bench_thr_label">OS threads under load</div>
+            <div class="bar-row">
+              <span class="bar-name" data-cfg="projectName">Megu</span>
+              <div class="bar-track"><div class="bar-fill accent" style="width:4.7%"></div></div>
+              <span class="bar-val">3 threads</span>
+            </div>
+            <div class="bar-row">
+              <span class="bar-name">Vanilla 1.21.1</span>
+              <div class="bar-track"><div class="bar-fill muted" style="width:100%"></div></div>
+              <span class="bar-val">64 threads</span>
+            </div>
+          </div>
+        </div>
+
+        <p class="bench-caveat" data-i18n="bench_caveat">
+          Recorded via tools/load_compare.sh (20s moving viewer, same seed &amp; machine; receipt in evidence/gameplay/load-compare/receipt.json).
+          Caveat: Alpha implements fewer vanilla features than server.jar, and worldgen feature CPU is still being optimized (not yet a full like-for-like M3 proof).
+        </p>
       </div>
     </section>
 
@@ -258,6 +303,7 @@ cargo run --locked</code></pre>
   (function () {
     "use strict";
     var JA = {
+      nav_bench: "実測値",
       nav_checker: "Modpack診断",
       nav_how: "設計",
       nav_quickstart: "起動手順",
@@ -267,6 +313,11 @@ cargo run --locked</code></pre>
       cta_start: "起動手順へ",
       cta_check: "Modpackを診断",
       cta_github: "GitHub を見る",
+      bench_title: "RAM 使用量、約 1/10（1/9.6）。",
+      bench_meta: "Linux x86_64 実測 · 3 回平均 · seed 0 · 描画距離 4",
+      bench_ram_label: "常駐メモリ (VmRSS)",
+      bench_thr_label: "負荷時の OS スレッド数",
+      bench_caveat: "tools/load_compare.sh（同一マシン・20 秒移動負荷）の実測記録（evidence/gameplay/load-compare/receipt.json）。※ Alpha 版は本家より実装機能が少ないため完全同一条件ではなく、地形 feature 生成の CPU 最適化は引き続き進行中です。",
       checker_title: "手元の Modpack をその場で診断。",
       checker_note: "このタブ内で完結 — ファイルは一切送信されません。",
       checker_desc: "Modrinth の .mrpack や CurseForge の .zip を落とすだけで、自動スキップされる軽量化 Mod・ネイティブ動作・要検査 JAR を即座に表示します。",
