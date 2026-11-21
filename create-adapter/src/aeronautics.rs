@@ -305,8 +305,8 @@ impl RigidBodySubWorld {
     /// new dimension and live propeller RPMs keep solving there.
     pub fn transfer_to_dimension(&mut self, new_dim: u32, new_pos: [f64; 3]) {
         self.parent_dim = new_dim;
-        for i in 0..3 {
-            self.pos[i] = sanitize(new_pos[i]);
+        for (position, value) in self.pos.iter_mut().zip(new_pos) {
+            *position = sanitize(value);
         }
         self.rebuild_factory();
     }

@@ -14,6 +14,8 @@
 //!   the generic tier and in 4-tier fallback classification.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use mod_adapter_core::blockstates::{
     BlockDef, BlockRegistry, PropertyDef, RegistryError, UniversalBlockRole,
@@ -26,6 +28,522 @@ use mod_adapter_core::version_compat::{
 
 use crate::blockstates::{core_create_block_defs, CreateBlockRegistry, CreateBlockRole};
 use crate::factory::Axis;
+
+/// A single operation in a data-defined assembly recipe. The resource
+/// identities are preserved so a caller can check consumed items and fluids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssemblyStepKind {
+    Deploying { held_item: String },
+    Pressing,
+    Filling { fluid_id: String, amount_mb: u32 },
+    Cutting,
+    CustomStep(String),
+}
+
+/// An assembly whose sequence repeats `loops` times before selecting an output.
+/// Result tuple fields are (item id, count, relative selection weight).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SequencedAssemblyRecipe {
+    pub id: String,
+    pub ingredient_item: String,
+    pub transitional_item: String,
+    pub loops: u32,
+    pub sequence: Vec<AssemblyStepKind>,
+    pub results: Vec<(String, u32, f32)>,
+}
+
+/// Standalone pressing and fluid-spouting recipes share the assembly result
+/// representation, including deterministic weighted output selection.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AddonProcessingRecipe {
+    SequencedAssembly(SequencedAssemblyRecipe),
+    Pressing {
+        id: String,
+        ingredient_item: String,
+        results: Vec<(String, u32, f32)>,
+    },
+    Filling {
+        id: String,
+        ingredient_item: String,
+        fluid_id: String,
+        amount_mb: u32,
+        results: Vec<(String, u32, f32)>,
+    },
+}
+
+/// Resumable position in one assembly. The item changes to the transitional
+/// item on the first accepted step and stays there until the final output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequencedAssemblyState {
+    pub recipe_id: String,
+    pub current_item: String,
+    pub completed_loops: u32,
+    pub next_step: usize,
+    pub finished: bool,
+}
+
+impl SequencedAssemblyState {
+    pub fn new(recipe: &SequencedAssemblyRecipe) -> Self {
+        Self {
+            recipe_id: recipe.id.clone(),
+            current_item: recipe.ingredient_item.clone(),
+            completed_loops: 0,
+            next_step: 0,
+            finished: false,
+        }
+    }
+}
+
+/// A rejected step leaves the state unchanged, allowing a correct retry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssemblyOutcome {
+    InProgress {
+        current_item: String,
+        completed_loops: u32,
+        next_step: usize,
+    },
+    Completed {
+        item: String,
+        count: u32,
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
+/// Advance exactly one step. `rng_roll` is consumed only for the last step,
+/// and must lie in `[0, 1)` at that point. Results use their declared weights
+/// normalized to their sum, with zero-weight results never selected.
+pub fn advance_assembly_step(
+    state: &mut SequencedAssemblyState,
+    recipe: &SequencedAssemblyRecipe,
+    applied_step: &AssemblyStepKind,
+    rng_roll: f32,
+) -> AssemblyOutcome {
+    let valid_position = state.recipe_id == recipe.id
+        && !state.finished
+        && (1..=64).contains(&recipe.loops)
+        && (1..=32).contains(&recipe.sequence.len())
+        && state.completed_loops < recipe.loops
+        && state.next_step < recipe.sequence.len()
+        && state.current_item.as_str()
+            == if state.completed_loops == 0 && state.next_step == 0 {
+                recipe.ingredient_item.as_str()
+            } else {
+                recipe.transitional_item.as_str()
+            };
+    if !valid_position {
+        return AssemblyOutcome::Rejected {
+            reason: "invalid or completed assembly state".into(),
+        };
+    }
+    if recipe.sequence[state.next_step] != *applied_step {
+        return AssemblyOutcome::Rejected {
+            reason: "assembly step out of order or wrong resource".into(),
+        };
+    }
+
+    let final_step =
+        state.completed_loops == recipe.loops - 1 && state.next_step == recipe.sequence.len() - 1;
+    let selected = if final_step {
+        if !(0.0..1.0).contains(&rng_roll) {
+            return AssemblyOutcome::Rejected {
+                reason: "final roll must be finite and in [0, 1)".into(),
+            };
+        }
+        match select_assembly_result(&recipe.results, rng_roll) {
+            Some(result) => Some(result),
+            None => {
+                return AssemblyOutcome::Rejected {
+                    reason: "assembly results have invalid weights or counts".into(),
+                };
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some((item, count)) = selected {
+        state.current_item = item.clone();
+        state.completed_loops = recipe.loops;
+        state.next_step = recipe.sequence.len();
+        state.finished = true;
+        return AssemblyOutcome::Completed { item, count };
+    }
+
+    state.current_item = recipe.transitional_item.clone();
+    state.next_step += 1;
+    if state.next_step == recipe.sequence.len() {
+        state.completed_loops += 1;
+        state.next_step = 0;
+    }
+    AssemblyOutcome::InProgress {
+        current_item: state.current_item.clone(),
+        completed_loops: state.completed_loops,
+        next_step: state.next_step,
+    }
+}
+
+fn select_assembly_result(results: &[(String, u32, f32)], roll: f32) -> Option<(String, u32)> {
+    if results.is_empty() || results.len() > 32 {
+        return None;
+    }
+    let mut total = 0.0f64;
+    for (_, count, weight) in results {
+        if !(1..=64).contains(count) || !weight.is_finite() || *weight < 0.0 {
+            return None;
+        }
+        total += f64::from(*weight);
+    }
+    if !(total > 0.0 && total.is_finite()) {
+        return None;
+    }
+    let threshold = f64::from(roll) * total;
+    let mut cumulative = 0.0;
+    let mut last_positive = None;
+    for (item, count, weight) in results {
+        if *weight > 0.0 {
+            last_positive = Some((item.clone(), *count));
+            cumulative += f64::from(*weight);
+            if threshold < cumulative {
+                return last_positive;
+            }
+        }
+    }
+    // Guard against floating-point rounding at the upper endpoint.
+    last_positive
+}
+
+/// Parse a namespaced `*:sequenced_assembly` JSON recipe with bounded counts,
+/// a nonempty sequence, and explicit item/fluid operands for every step.
+pub fn parse_sequenced_assembly_json(
+    id: &str,
+    json: &str,
+) -> Result<SequencedAssemblyRecipe, String> {
+    let root = parse_json(json.as_bytes()).map_err(|err| format!("{id}: {err:?}"))?;
+    let obj = root
+        .as_object()
+        .ok_or_else(|| format!("{id}: recipe root must be an object"))?;
+    parse_assembly_object(id, obj)
+}
+
+fn parse_assembly_object(
+    id: &str,
+    obj: &BTreeMap<String, JsonValue>,
+) -> Result<SequencedAssemblyRecipe, String> {
+    if processing_type(obj)? != "sequenced_assembly" {
+        return Err(format!("{id}: expected a sequenced_assembly recipe"));
+    }
+    let ingredient = obj
+        .get("ingredient")
+        .ok_or("assembly ingredient is missing")?;
+    let ingredient_item = parse_item_id(ingredient)?;
+    let transitional_item = parse_item_id(
+        obj.get("transitionalItem")
+            .or_else(|| obj.get("transitional_item"))
+            .ok_or("assembly transitional item is missing")?,
+    )?;
+    let loops = bounded_integer(obj.get("loops"), "loops", 1, 64)?;
+    let sequence = obj
+        .get("sequence")
+        .and_then(JsonValue::as_array)
+        .ok_or("assembly sequence must be an array")?;
+    if !(1..=32).contains(&sequence.len()) {
+        return Err("assembly sequence length must be in 1..=32".into());
+    }
+    let sequence = sequence
+        .iter()
+        .map(parse_assembly_step)
+        .collect::<Result<Vec<_>, _>>()?;
+    let results = parse_assembly_results(obj)?;
+    Ok(SequencedAssemblyRecipe {
+        id: id.into(),
+        ingredient_item,
+        transitional_item,
+        loops,
+        sequence,
+        results,
+    })
+}
+
+fn processing_type(obj: &BTreeMap<String, JsonValue>) -> Result<&str, String> {
+    let recipe_type = obj
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .ok_or("recipe type must be a string")?;
+    let (namespace, name) = recipe_type
+        .split_once(':')
+        .ok_or("recipe type must be namespaced")?;
+    if namespace.is_empty() || name.is_empty() {
+        return Err("recipe type namespace and name must be nonempty".into());
+    }
+    Ok(name)
+}
+
+fn parse_item_id(value: &JsonValue) -> Result<String, String> {
+    let id = match value {
+        JsonValue::String(item) => Some(item.as_str()),
+        JsonValue::Object(obj) => {
+            let item = obj.get("item").or_else(|| obj.get("id"));
+            match item {
+                Some(JsonValue::String(id)) => Some(id.as_str()),
+                Some(JsonValue::Object(inner)) => inner.get("id").and_then(JsonValue::as_str),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+    .filter(|id| !id.is_empty() && !id.trim().is_empty())
+    .ok_or("expected a concrete item id")?;
+    Ok(id.to_string())
+}
+
+fn bounded_integer(
+    value: Option<&JsonValue>,
+    field: &str,
+    min: u32,
+    max: u32,
+) -> Result<u32, String> {
+    let number = value
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| format!("{field} must be an integer"))?;
+    if number < f64::from(min) || number > f64::from(max) || number.fract() != 0.0 {
+        return Err(format!("{field} must be in {min}..={max}"));
+    }
+    Ok(number as u32)
+}
+
+fn parse_assembly_step(value: &JsonValue) -> Result<AssemblyStepKind, String> {
+    let obj = value.as_object().ok_or("assembly step must be an object")?;
+    let step_type = processing_type(obj)?;
+    match step_type {
+        "deploying" => {
+            let held = obj
+                .get("held_item")
+                .or_else(|| obj.get("heldItem"))
+                .or_else(|| obj.get("ingredients")?.as_array()?.get(1))
+                .ok_or("deploying step is missing held item")?;
+            Ok(AssemblyStepKind::Deploying {
+                held_item: parse_item_id(held)?,
+            })
+        }
+        "pressing" => Ok(AssemblyStepKind::Pressing),
+        "filling" => {
+            let (fluid_id, amount_mb) = parse_fluid_operand(obj)?;
+            Ok(AssemblyStepKind::Filling {
+                fluid_id,
+                amount_mb,
+            })
+        }
+        "cutting" => Ok(AssemblyStepKind::Cutting),
+        _ => Ok(AssemblyStepKind::CustomStep(
+            obj.get("type").and_then(JsonValue::as_str).unwrap().into(),
+        )),
+    }
+}
+
+fn parse_fluid_operand(obj: &BTreeMap<String, JsonValue>) -> Result<(String, u32), String> {
+    let candidate = obj
+        .get("fluid_id")
+        .or_else(|| obj.get("fluid"))
+        .or_else(|| {
+            obj.get("ingredients")?
+                .as_array()?
+                .iter()
+                .find(|ingredient| {
+                    ingredient
+                        .as_object()
+                        .is_some_and(|part| part.contains_key("fluid"))
+                })
+        })
+        .ok_or("filling recipe is missing a fluid")?;
+    let (fluid_id, count_obj) = match candidate {
+        JsonValue::String(id) => (id.as_str(), obj),
+        JsonValue::Object(o) => {
+            let id = o
+                .get("fluid")
+                .or_else(|| o.get("id"))
+                .and_then(JsonValue::as_str)
+                .ok_or("filling fluid id must be a string")?;
+            (id, o)
+        }
+        _ => return Err("filling fluid must be a string or object".into()),
+    };
+    if fluid_id.trim().is_empty() {
+        return Err("filling fluid id must be nonempty".into());
+    }
+    let amount = bounded_integer(
+        count_obj
+            .get("amount_mb")
+            .or_else(|| count_obj.get("amount"))
+            .or_else(|| obj.get("amount_mb"))
+            .or_else(|| obj.get("amount")),
+        "fluid amount",
+        1,
+        u32::MAX,
+    )?;
+    Ok((fluid_id.into(), amount))
+}
+
+fn parse_assembly_results(
+    obj: &BTreeMap<String, JsonValue>,
+) -> Result<Vec<(String, u32, f32)>, String> {
+    let result_value = obj
+        .get("results")
+        .or_else(|| obj.get("result"))
+        .ok_or("recipe results are missing")?;
+    let results = match result_value {
+        JsonValue::Array(items) => items.as_slice(),
+        JsonValue::Object(_) => std::slice::from_ref(result_value),
+        _ => return Err("recipe results must be an array or object".into()),
+    };
+    if !(1..=32).contains(&results.len()) {
+        return Err("recipe result count must be in 1..=32".into());
+    }
+    let mut output = Vec::with_capacity(results.len());
+    for result in results {
+        let item = parse_item_id(result)?;
+        let entry = result
+            .as_object()
+            .ok_or("recipe result must be an object")?;
+        let nested_count = entry
+            .get("item")
+            .and_then(JsonValue::as_object)
+            .and_then(|inner| inner.get("count"));
+        let count = match entry.get("count").or(nested_count) {
+            Some(value) => bounded_integer(Some(value), "item count", 1, u32::MAX)?,
+            None => 1,
+        };
+        let weight = match entry.get("chance").or_else(|| entry.get("weight")) {
+            Some(value) => value.as_f64().ok_or("result weight must be finite")?,
+            None => 1.0,
+        };
+        if !(0.0..=f64::from(f32::MAX)).contains(&weight) {
+            return Err("result weight must be nonnegative and finite".into());
+        }
+        output.push((item, count, weight as f32));
+    }
+    if !output.iter().any(|(_, _, weight)| *weight > 0.0) {
+        return Err("at least one result must have a positive weight".into());
+    }
+    Ok(output)
+}
+
+/// Discover assembly, pressing, and filling recipes from both singular and
+/// plural recipe directories under every namespace, including nested paths.
+/// Invalid recipe JSON or invalid recognized recipes abort the scan.
+pub fn discover_addon_processing_recipes(
+    root: &Path,
+) -> Result<Vec<AddonProcessingRecipe>, String> {
+    let data = root.join("data");
+    if !data.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    let namespaces = fs::read_dir(&data).map_err(|e| format!("{}: {e}", data.display()))?;
+    for namespace in namespaces {
+        let namespace = namespace.map_err(|e| format!("{}: {e}", data.display()))?;
+        if !namespace.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        for directory in ["recipe", "recipes"] {
+            let folder = namespace.path().join(directory);
+            if fs::symlink_metadata(&folder).is_ok_and(|metadata| metadata.is_dir()) {
+                collect_addon_recipe_paths(&folder, &mut paths)?;
+            }
+        }
+    }
+    paths.sort();
+
+    let mut found = Vec::new();
+    for path in paths {
+        let relative = path.strip_prefix(&data).map_err(|e| e.to_string())?;
+        let mut pieces = relative.components();
+        let namespace = pieces
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            .ok_or("invalid namespace path")?;
+        pieces.next(); // recipe or recipes
+        let recipe_path = pieces.as_path().with_extension("");
+        let id = format!(
+            "{namespace}:{}",
+            recipe_path.to_string_lossy().replace('\\', "/")
+        );
+        let metadata = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if metadata.len() > 4 * 1024 * 1024 {
+            return Err(format!(
+                "{}: recipe JSON exceeds maximum size",
+                path.display()
+            ));
+        }
+        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let json = parse_json(&bytes).map_err(|e| format!("{}: {e:?}", path.display()))?;
+        let obj = json
+            .as_object()
+            .ok_or_else(|| format!("{id}: recipe root must be an object"))?;
+        let Some(kind) = obj.get("type").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some((namespace, kind)) = kind.split_once(':') else {
+            continue;
+        };
+        if namespace.is_empty() {
+            continue;
+        }
+        match kind {
+            "sequenced_assembly" => found.push(AddonProcessingRecipe::SequencedAssembly(
+                parse_assembly_object(&id, obj).map_err(|e| format!("{id}: {e}"))?,
+            )),
+            "pressing" | "filling" => {
+                let item = if let Some(ingredients) = obj.get("ingredients") {
+                    ingredients
+                        .as_array()
+                        .ok_or_else(|| format!("{id}: processing ingredients must be an array"))?
+                        .iter()
+                        .find(|input| parse_item_id(input).is_ok())
+                } else {
+                    obj.get("ingredient")
+                }
+                .ok_or_else(|| format!("{id}: processing input item is missing"))?;
+                let ingredient_item = parse_item_id(item)?;
+                let results = parse_assembly_results(obj).map_err(|e| format!("{id}: {e}"))?;
+                if kind == "pressing" {
+                    found.push(AddonProcessingRecipe::Pressing {
+                        id,
+                        ingredient_item,
+                        results,
+                    });
+                } else {
+                    let (fluid_id, amount_mb) =
+                        parse_fluid_operand(obj).map_err(|e| format!("{id}: {e}"))?;
+                    found.push(AddonProcessingRecipe::Filling {
+                        id,
+                        ingredient_item,
+                        fluid_id,
+                        amount_mb,
+                        results,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
+fn collect_addon_recipe_paths(folder: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", folder.display()))?;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_dir() {
+            collect_addon_recipe_paths(&entry.path(), files)?;
+        } else if kind.is_file() && entry.path().extension().is_some_and(|ext| ext == "json") {
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
 
 /// Kinetic connector variants understood by `CreateFactory` topology rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
