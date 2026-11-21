@@ -793,7 +793,7 @@ fn gamerule_commands_query_and_set_all_vanilla_rules() {
 #[test]
 fn command_dispatch_rejects_unclosed_quotes_and_incomplete_title() {
     let ctx = command_context(None);
-    assert!(run_command_ctx(&ctx, "/say \"unclosed", &mut None).starts_with("Invalid command:"));
+    assert!(run_command_ctx(&ctx, "/title @a title \"unclosed", &mut None).starts_with("Invalid command:"));
     assert!(run_command_ctx(&ctx, "/title", &mut None).starts_with("usage:"));
     assert_eq!(run_command_ctx(&ctx, r#"/title @a title {"text": "hello world"}"#, &mut None), "Title title to 0 player(s)");
     assert!(run_command_ctx(&ctx, "/gamerule randomTickSpeed 1 extra", &mut None).starts_with("usage:"));

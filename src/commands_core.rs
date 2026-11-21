@@ -4474,9 +4474,14 @@ fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
 fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     let me = ctx.me.as_ref();
     let Some(input) = msg.strip_prefix('/') else { return "Expected a command starting with /".into() };
-    let tokens = match crate::brigadier::split_command_args_preserving_quotes(input) {
-        Ok(tokens) => tokens,
-        Err(error) => return format!("Invalid command: {error}"),
+    let first_word = input.split_whitespace().next().unwrap_or("");
+    let tokens = if matches!(first_word, "say" | "execute") {
+        input.split_whitespace().map(str::to_owned).collect()
+    } else {
+        match crate::brigadier::split_command_args_preserving_quotes(input) {
+            Ok(tokens) => tokens,
+            Err(error) => return format!("Invalid command: {error}"),
+        }
     };
     let cmd = tokens.first().map(String::as_str).unwrap_or("");
     let args: Vec<&str> = tokens.iter().skip(1).map(String::as_str).collect();

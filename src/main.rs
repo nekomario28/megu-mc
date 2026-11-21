@@ -12277,8 +12277,15 @@ mod mineshaft_runtime_tests {
         // Save before any interaction: cart keeps LootTable and no Items.
         let mut pre_open_save = Vec::new();
         save_world_into(&mut pre_open_save);
+        let (p, _) = read_world_seed_footer(&pre_open_save).unwrap();
+        let (p, _) = read_mob_dimensions_footer(p).unwrap();
+        let (p, _) = read_brewing_footer(p).unwrap();
+        let (p, _) = read_dim2_footer(p).unwrap();
+        let (p, _, _) = read_dim_footer(p).unwrap();
+        let (p, _) = read_block_loot_footer(p).unwrap();
+        let (p, _) = read_drop_owners_footer(p).unwrap();
         let pre_snap = generated_content::Snapshot::read(
-            tick_persistence::prefix(&pre_open_save).unwrap(),
+            tick_persistence::prefix(p).unwrap(),
         )
         .unwrap()
         .unwrap();

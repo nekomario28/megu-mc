@@ -621,7 +621,7 @@ fn stage_native_case(g: &mut Gen, case: &J) {
     g.stage_payloads((int(case, "cx"), int(case, "cz")), &mut payloads);
 }
 
-fn strip_outer_footers(payload: &[u8]) -> &[u8] {
+pub(crate) fn strip_outer_footers(payload: &[u8]) -> &[u8] {
     let (payload, _) = crate::read_world_seed_footer(payload).unwrap();
     let (payload, _) = crate::read_mob_dimensions_footer(payload).unwrap();
     let (payload, _) = crate::read_brewing_footer(payload).unwrap();
@@ -767,6 +767,10 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
     let (client, mut receiver) = crate::effect_tests::client_pair();
     let [x, y, z] = cart.pos().unwrap();
     *client.pos.lock().unwrap() = (x, y, z, 0., 0., true);
+    client.chunks.lock().unwrap().insert((
+        (x.floor() as i32).div_euclid(16),
+        (z.floor() as i32).div_euclid(16),
+    ));
     crate::clients()
         .lock()
         .unwrap()
