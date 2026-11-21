@@ -29,7 +29,8 @@ fn main() {
     };
 
     let main = source("main");
-    let varint = between(&main, "\nfn write_varint(", "\nfn write_str(");
+    let protocol = source("play_protocol");
+    let varint = between(&protocol, "\nfn write_varint(", "\nfn write_str(");
     let palette = source("paletted");
     let palette = split(&palette, "    pub(crate) fn write_wire(").0;
     emit("palette.rs", format!("{varint}\n{palette}}}\n"));

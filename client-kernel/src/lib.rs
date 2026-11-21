@@ -10,7 +10,13 @@ mod brigadier;
 mod command;
 mod ffi;
 mod gzip;
+#[rustfmt::skip]
+#[allow(dead_code, clippy::all)]
+#[path = "../../src/json.rs"]
+mod json;
+mod light;
 mod physics;
+mod registry;
 mod section;
 
 // These projected modules retain server-only methods and lint conventions.
@@ -20,9 +26,14 @@ mod nbt {
 }
 
 pub use command::{CommandDispatcher, CommandParse, Suggestions};
+pub use light::{
+    ChunkLightUpdate, LightEdit, LightEngine, LightFact, LightKind, LightUpdate,
+    LIGHT_SECTION_BYTES,
+};
 pub use physics::{
     collide, fluid_impulse, Aabb, Collision, FluidCell, FluidImpulse, FluidKind, FluidQuery,
 };
+pub use registry::{BlockFacts, Registry};
 pub use section::PalettedSection;
 
 pub const ABI_VERSION: u32 = 1;
@@ -46,6 +57,9 @@ pub enum Error {
     BufferTooSmall = 10,
     QueryFailed = 11,
     Panic = 12,
+    InvalidWire = 13,
+    InvalidJson = 14,
+    NotFound = 15,
 }
 
 fn nbt_error(error: &str) -> Error {

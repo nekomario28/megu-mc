@@ -2,7 +2,8 @@
 //! The C pointer and lifetime contract is declared in include/mc_spine_kernel.h.
 
 use crate::{
-    Aabb, CommandDispatcher, Error, FluidCell, FluidKind, FluidQuery, PalettedSection, Suggestions,
+    Aabb, BlockFacts, CommandDispatcher, Error, FluidCell, FluidKind, FluidQuery, LightEdit,
+    LightEngine, LightFact, LightKind, LightUpdate, PalettedSection, Registry, Suggestions,
     SECTION_CELLS,
 };
 use std::{
@@ -75,6 +76,65 @@ pub struct FluidImpulse {
     push: [f64; 3],
     max_height: f64,
     in_fluid: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LightBlock {
+    opacity: u8,
+    emission: u8,
+    occlusion: [u8; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LightEditRecord {
+    x: i32,
+    y: i32,
+    z: i32,
+    block: LightBlock,
+}
+
+#[repr(C)]
+pub struct LightUpdateInfo {
+    chunk_count: u64,
+    invalidated_cells: u64,
+}
+
+#[repr(C)]
+pub struct LightChunkInfo {
+    chunk_x: i32,
+    chunk_z: i32,
+    sky_mask: u64,
+    empty_sky_mask: u64,
+    block_mask: u64,
+    empty_block_mask: u64,
+    sky_count: u64,
+    block_count: u64,
+}
+
+#[repr(C)]
+pub struct LightSection {
+    section_index: u32,
+    data: *const u8,
+}
+
+impl From<LightBlock> for LightFact {
+    fn from(block: LightBlock) -> Self {
+        Self {
+            opacity: block.opacity,
+            emission: block.emission,
+            occlusion: block.occlusion,
+        }
+    }
+}
+
+fn light_kind(kind: u8) -> Result<LightKind, Error> {
+    match kind {
+        0 => Ok(LightKind::Sky),
+        1 => Ok(LightKind::Block),
+        _ => Err(Error::InvalidArgument),
+    }
 }
 
 type FluidLookup = unsafe extern "C" fn(*mut c_void, i32, i32, i32, *mut FluidFacts) -> i32;
@@ -259,6 +319,259 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_write_block_states_wire(
             Ok(bytes.into())
         })
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_palette_decode_block_states_wire(
+    input: *const u8,
+    len: usize,
+    out_consumed: *mut usize,
+    out: *mut *mut PalettedSection,
+) -> i32 {
+    status(|| {
+        check_ptr(out_consumed)?;
+        check_ptr(out)?;
+        let (section, consumed) =
+            PalettedSection::decode_block_states_wire(unsafe { input_span(input, len)? })?;
+        unsafe {
+            out_consumed.write(consumed);
+            out.write(Box::into_raw(Box::new(section)));
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_light_new(
+    min_y: i32,
+    height: u32,
+    has_skylight: u8,
+    out: *mut *mut LightEngine,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            if has_skylight > 1 {
+                return Err(Error::InvalidArgument);
+            }
+            let engine = LightEngine::new(min_y, height, has_skylight == 1)?;
+            Ok(Box::into_raw(Box::new(engine)))
+        })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_light_free(engine: *mut LightEngine) -> i32 {
+    unsafe { drop_handle(engine) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_light_load_chunk(
+    engine: *mut LightEngine,
+    chunk_x: i32,
+    chunk_z: i32,
+    cells: *const LightBlock,
+    count: usize,
+) -> i32 {
+    status(|| {
+        check_ptr(engine)?;
+        let cells: Vec<LightFact> = unsafe { input_span(cells, count)? }
+            .iter()
+            .map(|&block| block.into())
+            .collect();
+        unsafe { &mut *engine }.load_chunk(chunk_x, chunk_z, &cells)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_light_apply_edit(
+    engine: *mut LightEngine,
+    edits: *const LightEditRecord,
+    count: usize,
+    out: *mut *mut LightUpdate,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            check_ptr(engine)?;
+            let edits: Vec<LightEdit> = input_span(edits, count)?
+                .iter()
+                .map(|edit| LightEdit {
+                    x: edit.x,
+                    y: edit.y,
+                    z: edit.z,
+                    fact: edit.block.into(),
+                })
+                .collect();
+            Ok(Box::into_raw(Box::new((&mut *engine).apply_edits(&edits)?)))
+        })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_light_get_section(
+    engine: *const LightEngine,
+    chunk_x: i32,
+    chunk_z: i32,
+    kind: u8,
+    section_index: u32,
+    out: *mut u8,
+    capacity: usize,
+) -> i32 {
+    unsafe {
+        write_result(out.cast::<[u8; crate::LIGHT_SECTION_BYTES]>(), || {
+            let engine = read_handle(engine)?;
+            let kind = light_kind(kind)?;
+            if capacity < crate::LIGHT_SECTION_BYTES {
+                return Err(Error::BufferTooSmall);
+            }
+            engine.section(chunk_x, chunk_z, kind, section_index as usize)
+        })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_light_update_info(
+    update: *const LightUpdate,
+    out: *mut LightUpdateInfo,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            let update = read_handle(update)?;
+            Ok(LightUpdateInfo {
+                chunk_count: update.chunks.len() as u64,
+                invalidated_cells: update.invalidated_cells as u64,
+            })
+        })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_light_update_chunk(
+    update: *const LightUpdate,
+    index: usize,
+    out: *mut LightChunkInfo,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            let chunk = read_handle(update)?
+                .chunks
+                .get(index)
+                .ok_or(Error::OutOfRange)?;
+            Ok(LightChunkInfo {
+                chunk_x: chunk.chunk.0,
+                chunk_z: chunk.chunk.1,
+                sky_mask: chunk.sky_mask,
+                empty_sky_mask: chunk.empty_sky_mask,
+                block_mask: chunk.block_mask,
+                empty_block_mask: chunk.empty_block_mask,
+                sky_count: chunk.sky_sections.len() as u64,
+                block_count: chunk.block_sections.len() as u64,
+            })
+        })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_light_update_section(
+    update: *const LightUpdate,
+    chunk_index: usize,
+    kind: u8,
+    ordinal: usize,
+    out: *mut LightSection,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            let chunk = read_handle(update)?
+                .chunks
+                .get(chunk_index)
+                .ok_or(Error::OutOfRange)?;
+            let sections = match light_kind(kind)? {
+                LightKind::Sky => &chunk.sky_sections,
+                LightKind::Block => &chunk.block_sections,
+            };
+            let (index, data) = sections.get(ordinal).ok_or(Error::OutOfRange)?;
+            Ok(LightSection {
+                section_index: *index as u32,
+                data: data.as_ptr(),
+            })
+        })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_light_update_free(update: *mut LightUpdate) -> i32 {
+    unsafe { drop_handle(update) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_registry_open_json(
+    states_json: *const u8,
+    states_len: usize,
+    blocks_json: *const u8,
+    blocks_len: usize,
+    out: *mut *mut Registry,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            let registry = Registry::open_json(
+                input_span(states_json, states_len)?,
+                input_span(blocks_json, blocks_len)?,
+            )?;
+            Ok(Box::into_raw(Box::new(registry)))
+        })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_registry_free(registry: *mut Registry) -> i32 {
+    unsafe { drop_handle(registry) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_registry_state_count(
+    registry: *const Registry,
+    out: *mut u32,
+) -> i32 {
+    unsafe { write_result(out, || Ok(read_handle(registry)?.state_count())) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_registry_state_name(
+    registry: *const Registry,
+    state: u32,
+    out: *mut Text,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            let name = read_handle(registry)?.state_name(state)?;
+            Ok(Text {
+                data: name.as_ptr(),
+                len: name.len() as u64,
+            })
+        })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_registry_default_state(
+    registry: *const Registry,
+    name: *const u8,
+    len: usize,
+    out: *mut u32,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            read_handle(registry)?.default_state(text_input(name, len)?)
+        })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_registry_state_facts(
+    registry: *const Registry,
+    state: u32,
+    out: *mut BlockFacts,
+) -> i32 {
+    unsafe { write_result(out, || read_handle(registry)?.facts(state)) }
 }
 
 #[no_mangle]

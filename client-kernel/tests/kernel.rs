@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 use mc_spine_kernel::{
     collide, fluid_impulse, nbt_read_gzip_validate, nbt_read_named_validate, nbt_roundtrip_named,
-    Aabb, CommandDispatcher, Error, FluidCell, FluidKind, FluidQuery, PalettedSection,
-    SECTION_CELLS, STATE_COUNT,
+    Aabb, CommandDispatcher, Error, FluidCell, FluidKind, FluidQuery, LightEdit, LightEngine,
+    LightFact, LightKind, PalettedSection, Registry, SECTION_CELLS, STATE_COUNT,
 };
 
 fn varint(input: &mut &[u8]) -> u32 {
@@ -343,4 +343,296 @@ fn fluid_uses_snapshot_facts_for_push_height_and_sturdy_faces() {
         fluid_impulse(actor, query, |_, _, _| Ok(cell(FluidKind::Water, 9))),
         Err(Error::InvalidArgument)
     );
+}
+
+fn section_from(states: &[u32; SECTION_CELLS]) -> PalettedSection {
+    let mut section = PalettedSection::new_single(states[0]).unwrap();
+    for (i, &state) in states.iter().enumerate() {
+        section.set(i, state).unwrap();
+    }
+    section
+}
+
+#[test]
+fn wire_decode_roundtrips_every_width_and_reports_consumed_bytes() {
+    for distinct in [1usize, 2, 17, 33, 65, 129, 257] {
+        let states: [u32; SECTION_CELLS] = std::array::from_fn(|i| ((i * 7) % distinct) as u32 * 3);
+        let section = section_from(&states);
+        let mut wire = Vec::new();
+        section.write_block_states_wire(&mut wire);
+        let canonical = wire.len();
+        wire.extend_from_slice(&[0xaa, 0xbb]);
+        let (decoded, consumed) = PalettedSection::decode_block_states_wire(&wire).unwrap();
+        assert_eq!(consumed, canonical);
+        let mut cells = [0; SECTION_CELLS];
+        decoded.unpack_into(&mut cells);
+        assert_eq!(cells, states);
+        assert_eq!(decoded.non_air(), section.non_air());
+        let mut again = Vec::new();
+        decoded.write_block_states_wire(&mut again);
+        assert_eq!(again, wire[..canonical]);
+    }
+}
+
+#[test]
+fn wire_decode_rejects_malformed_containers_without_panicking() {
+    let states: [u32; SECTION_CELLS] = std::array::from_fn(|i| (i % 5) as u32);
+    let mut wire = Vec::new();
+    section_from(&states).write_block_states_wire(&mut wire);
+    for end in 0..wire.len() {
+        assert_eq!(
+            PalettedSection::decode_block_states_wire(&wire[..end]).err(),
+            Some(Error::InvalidWire),
+            "truncated at {end}"
+        );
+    }
+    let decode = |bytes: &[u8]| PalettedSection::decode_block_states_wire(bytes).err();
+    assert_eq!(
+        decode(&[0, 0xff, 0xff, 0xff, 0xff, 0x0f, 0]),
+        Some(Error::InvalidWire)
+    );
+    assert_eq!(decode(&[0, 0xbc, 0xd0, 0x01, 0]), Some(Error::InvalidState));
+    assert_eq!(decode(&[0, 0, 1]), Some(Error::InvalidWire));
+    for bits in [1, 3, 9, 14, 16, 255] {
+        assert_eq!(decode(&[bits, 1, 0, 0]), Some(Error::InvalidWire));
+    }
+    // Palette length: empty, larger than 2^bits, and an unsupported VarInt width.
+    assert_eq!(decode(&[4, 0, 0]), Some(Error::InvalidWire));
+    assert_eq!(decode(&[4, 17]), Some(Error::InvalidWire));
+    assert_eq!(
+        decode(&[4, 0x80, 0x80, 0x80, 0x80, 0x80, 0]),
+        Some(Error::InvalidWire)
+    );
+    // A palette state outside the registry.
+    let mut bad_state = wire.clone();
+    bad_state[2] = 0xff;
+    bad_state.insert(3, 0xff);
+    bad_state.insert(4, 0x7f);
+    assert_eq!(decode(&bad_state), Some(Error::InvalidState));
+    // Wrong word count and an index beyond the palette.
+    let mut short = wire.clone();
+    let count_at = 2 + 5;
+    short[count_at] -= 1;
+    assert_eq!(decode(&short), Some(Error::InvalidWire));
+    let mut index = wire.clone();
+    index[count_at + 1 + 7] |= 0x0f;
+    assert_eq!(decode(&index), Some(Error::InvalidWire));
+    // Direct values are checked against the registry.
+    let mut direct = vec![15, 0x80, 0x08];
+    direct.extend(std::iter::repeat_n(0xff, 1024 * 8));
+    assert_eq!(decode(&direct), Some(Error::InvalidState));
+}
+
+const AIR: LightFact = LightFact {
+    opacity: 0,
+    emission: 0,
+    occlusion: [0; 6],
+};
+const STONE: LightFact = LightFact {
+    opacity: 15,
+    emission: 0,
+    occlusion: [0xf; 6],
+};
+
+fn column(height: usize, fill: impl Fn(usize, usize, usize, usize) -> LightFact) -> Vec<LightFact> {
+    (0..height * 256)
+        .map(|i| fill(i & 15, i >> 8, (i >> 4) & 15, i))
+        .collect()
+}
+
+fn nibble(section: &[u8], x: usize, y: usize, z: usize) -> u8 {
+    let cell = y << 8 | z << 4 | x;
+    (section[cell / 2] >> (cell % 2 * 4)) & 0xf
+}
+
+#[test]
+fn light_engine_lights_and_edits_through_the_server_algorithm() {
+    assert!(LightEngine::new(1, 16, true).is_err());
+    assert!(LightEngine::new(0, 0, true).is_err());
+    assert!(LightEngine::new(0, 17, true).is_err());
+    assert!(LightEngine::new(0, 16 * 63, true).is_err());
+    let mut engine = LightEngine::new(0, 32, true).unwrap();
+    assert_eq!(engine.section_count(), 4);
+    assert_eq!(
+        engine.load_chunk(0, 0, &[AIR; 3]).err(),
+        Some(Error::OutOfRange)
+    );
+    let bad = LightFact { opacity: 16, ..AIR };
+    assert_eq!(
+        engine.load_chunk(0, 0, &column(32, |_, _, _, _| bad)).err(),
+        Some(Error::InvalidArgument)
+    );
+    assert_eq!(
+        engine.section(0, 0, LightKind::Sky, 0).err(),
+        Some(Error::OutOfRange)
+    );
+    engine
+        .load_chunk(0, 0, &column(32, |_, _, _, _| AIR))
+        .unwrap();
+    engine
+        .load_chunk(1, 0, &column(32, |_, _, _, _| AIR))
+        .unwrap();
+    // Open sky is full-bright, including the guard section above the dimension.
+    for index in 1..4 {
+        let sky = engine.section(0, 0, LightKind::Sky, index).unwrap();
+        assert!(sky.iter().all(|&byte| byte == 0xff), "section {index}");
+    }
+    assert!(engine
+        .section(0, 0, LightKind::Block, 1)
+        .unwrap()
+        .iter()
+        .all(|&b| b == 0));
+    assert_eq!(
+        engine.section(0, 0, LightKind::Block, 4).err(),
+        Some(Error::OutOfRange)
+    );
+
+    let torch = LightFact {
+        emission: 14,
+        ..AIR
+    };
+    let edit = |x, y, z, fact| LightEdit { x, y, z, fact };
+    let update = engine.apply_edits(&[edit(15, 4, 4, torch)]).unwrap();
+    assert!(update.invalidated_cells > 0);
+    let chunks: Vec<_> = update.chunks.iter().map(|chunk| chunk.chunk).collect();
+    assert_eq!(chunks, [(0, 0), (1, 0)]);
+    assert_eq!(update.chunks[0].block_mask, 0b110);
+    let section = &update.chunks[0].block_sections[0];
+    assert_eq!(section.0, 1);
+    assert_eq!(nibble(&section.1, 15, 4, 4), 14);
+    assert_eq!(nibble(&section.1, 12, 4, 4), 11);
+    assert_eq!(
+        nibble(&engine.section(1, 0, LightKind::Block, 1).unwrap(), 0, 4, 4),
+        13
+    );
+
+    // Removing the emitter darkens the section, reported through the empty mask.
+    let update = engine.apply_edits(&[edit(15, 4, 4, AIR)]).unwrap();
+    assert!(update
+        .chunks
+        .iter()
+        .all(|c| c.block_sections.is_empty() && c.block_mask == 0));
+    assert!(update.chunks.iter().all(|c| c.empty_block_mask == 0b110));
+
+    // A roof shades the column below it and only reports the sky layer.
+    let roof: Vec<_> = (0..16)
+        .flat_map(|x| (0..16).map(move |z| edit(x, 31, z, STONE)))
+        .collect();
+    let update = engine.apply_edits(&roof).unwrap();
+    assert!(update
+        .chunks
+        .iter()
+        .any(|c| c.sky_mask != 0 || c.empty_sky_mask != 0));
+    let sky = engine.section(0, 0, LightKind::Sky, 1).unwrap();
+    assert_eq!(nibble(&sky, 0, 0, 0), 0);
+}
+
+#[test]
+fn light_edits_are_atomic_and_fail_closed() {
+    let mut engine = LightEngine::new(-16, 32, true).unwrap();
+    engine
+        .load_chunk(-1, -1, &column(32, |_, _, _, _| AIR))
+        .unwrap();
+    let torch = LightFact {
+        emission: 15,
+        ..AIR
+    };
+    let edit = |x, y, z, fact| LightEdit { x, y, z, fact };
+    assert_eq!(engine.apply_edits(&[]).err(), Some(Error::InvalidArgument));
+    let good = edit(-1, -16, -1, torch);
+    for bad in [
+        edit(-1, 16, -1, torch),
+        edit(-1, -17, -1, torch),
+        edit(16, 0, -1, torch),
+        edit(
+            -1,
+            0,
+            -1,
+            LightFact {
+                occlusion: [0x10; 6],
+                ..torch
+            },
+        ),
+    ] {
+        assert!(engine.apply_edits(&[good, bad]).is_err());
+    }
+    // The rejected batches left the window untouched.
+    assert!(engine
+        .section(-1, -1, LightKind::Block, 1)
+        .unwrap()
+        .iter()
+        .all(|&b| b == 0));
+    let update = engine.apply_edits(&[good]).unwrap();
+    assert_eq!(update.chunks.len(), 1);
+    assert_eq!(update.chunks[0].chunk, (-1, -1));
+    assert_eq!(
+        nibble(
+            &engine.section(-1, -1, LightKind::Block, 1).unwrap(),
+            15,
+            0,
+            15
+        ),
+        15
+    );
+}
+
+#[test]
+fn light_without_skylight_keeps_sky_dark() {
+    let mut engine = LightEngine::new(0, 16, false).unwrap();
+    engine
+        .load_chunk(0, 0, &column(16, |_, _, _, _| AIR))
+        .unwrap();
+    for index in 0..3 {
+        assert!(engine
+            .section(0, 0, LightKind::Sky, index)
+            .unwrap()
+            .iter()
+            .all(|&b| b == 0));
+    }
+}
+
+fn open_registry() -> Registry {
+    let read = |name: &str| {
+        std::fs::read(format!("{}/../assets/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    };
+    Registry::open_json(&read("block_states_1211.json"), &read("blocks_1211.json")).unwrap()
+}
+
+#[test]
+fn registry_facts_feed_the_light_engine_and_agree_with_palette_ids() {
+    let registry = open_registry();
+    assert_eq!(registry.state_count(), STATE_COUNT);
+    let stone = registry.default_state("minecraft:stone").unwrap();
+    let glowstone = registry.default_state("minecraft:glowstone").unwrap();
+    let to_fact = |state| {
+        let facts = registry.facts(state).unwrap();
+        LightFact {
+            opacity: facts.opacity,
+            emission: facts.luminance,
+            occlusion: facts.face_occlusion,
+        }
+    };
+    assert_eq!(registry.facts(glowstone).unwrap().luminance, 15);
+    assert_eq!(to_fact(stone), STONE);
+    let mut engine = LightEngine::new(0, 16, true).unwrap();
+    engine
+        .load_chunk(
+            0,
+            0,
+            &column(16, |x, y, z, _| {
+                if (x, y, z) == (8, 8, 8) {
+                    to_fact(glowstone)
+                } else {
+                    AIR
+                }
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        nibble(&engine.section(0, 0, LightKind::Block, 1).unwrap(), 8, 8, 8),
+        15
+    );
+    // Section air accounting uses the same state-ID table.
+    assert_eq!(registry.facts(0).unwrap().is_air, 1);
+    assert_eq!(PalettedSection::new_single(0).unwrap().non_air(), 0);
 }
