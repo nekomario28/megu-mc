@@ -1,0 +1,99 @@
+name: Bug report
+description: Report a crash, misbehavior, or compatibility bug in Megu (mc-spine). Crash reports need a MEGU-E fingerprint.
+title: "[Bug] "
+labels: ["triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep it compact — one issue per bug. Crash reports are easiest to
+        triage with a `MEGU-E-XXXXXXXX` fingerprint from the crash screen.
+        Feature requests and support questions belong in GitHub Discussions
+        or Discord (see the issue chooser).
+
+  - type: input
+    id: fingerprint
+    attributes:
+      label: Crash fingerprint
+      description: "From the crash report header, e.g. `MEGU-E-1A2B3C4D`. Leave blank for non-crash bugs."
+      placeholder: "MEGU-E-XXXXXXXX"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: mc_version
+    attributes:
+      label: Minecraft version
+      options:
+        - "1.21.1 (LTS)"
+        - "26.3 (Latest)"
+        - Other / multiple
+    validations:
+      required: true
+
+  - type: input
+    id: engine_version
+    attributes:
+      label: Megu / engine version
+      description: "Commit SHA, release tag, or build identifier."
+      placeholder: "e.g. alpha-2026.11.22 or git sha"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "e.g. Linux x86_64, Windows 11, macOS 15"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU / renderer
+      description: "Optional — e.g. Vulkan on RTX 4060, ClassicLowSpec on Intel UHD 630."
+      placeholder: "Optional"
+    validations:
+      required: false
+
+  - type: input
+    id: mods
+    attributes:
+      label: Mod count / key mods
+      description: "Optional — e.g. `14 mods, Create + Sodium`."
+      placeholder: "Optional"
+    validations:
+      required: false
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: "1–2 lines: what happened and what you expected."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: "Minimal repro — commands, world state, or modpack name."
+      placeholder: |
+        1. Start server with ...
+        2. Join and run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Masked log snippet
+      description: |
+        Paste the relevant lines only (crash header, ERROR/WARN lines,
+        top stack frames — max ~20 lines). Redact home paths, IPs, and
+        tokens first.
+      render: shell
+    validations:
+      required: false

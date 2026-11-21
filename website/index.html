@@ -307,8 +307,12 @@ cargo run --locked</code></pre>
         </div>
         <div class="foot-links">
           <a href="https://github.com/nekomario28/mc-spine" data-cfg-href="githubUrl">GitHub</a>
+          <a href="https://github.com/nekomario28/mc-spine" data-cfg-href="githubUrl">Contribute</a>
           <a href="https://github.com/nekomario28/mc-spine/releases" data-cfg-href="releasesUrl">Releases</a>
           <a href="https://github.com/nekomario28/mc-spine/tree/main/docs" data-cfg-href="docsBaseUrl">Docs</a>
+          <a class="opt-link" data-opt-url="discussionsUrl" href="#" hidden>Requests</a>
+          <a class="opt-link" data-opt-url="discordUrl" href="#" hidden>Discord</a>
+          <a class="opt-link" data-opt-url="sponsorUrl" href="#" hidden>Support</a>
         </div>
       </div>
       <p class="foot-legal" data-i18n="footer_legal">
@@ -321,6 +325,17 @@ cargo run --locked</code></pre>
   <script>
   (function () {
     "use strict";
+    // Optional footer links (Requests/Discord/Support) stay hidden until
+    // site-config.js gives them a real URL.
+    var siteCfg = window.SITE_CONFIG || {};
+    Array.prototype.forEach.call(
+      document.querySelectorAll("[data-opt-url]"), function (el) {
+        var url = siteCfg[el.getAttribute("data-opt-url")];
+        if (typeof url === "string" && url.length > 0) {
+          el.setAttribute("href", url);
+          el.removeAttribute("hidden");
+        }
+      });
     var JA = {
       nav_bench: "実測値",
       nav_checker: "Modpack診断",

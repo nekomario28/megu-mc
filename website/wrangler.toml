@@ -1,0 +1,32 @@
+# Cloudflare Pages configuration for the mc-spine / Megu landing site.
+#
+# Deploy: the `website/` directory is the Pages project root —
+# static assets come from pages_build_output_dir and the zero-dependency
+# API endpoints live in website/functions/api/.
+
+name = "megu-site"
+pages_build_output_dir = "."
+compatibility_date = "2025-01-01"
+
+# ---------------------------------------------------------------------------
+# Non-secret vars (safe to commit):
+#
+#   GITHUB_REPO = "nekomario28/mc-spine"   # optional; this is the default
+#
+# Secrets — NEVER commit real values; set via the dashboard or
+# `wrangler pages secret put <NAME> --project-name megu-site`:
+#
+#   GITHUB_TOKEN           fine-grained PAT, issues:write on GITHUB_REPO
+#                          (required by /api/report)
+#   TURNSTILE_SECRET_KEY   optional; when set, /api/report requires a valid
+#                          turnstile_token and fails closed without one
+# ---------------------------------------------------------------------------
+
+# KV namespace backing the /api/report crash/bug dedup counters
+# (one GitHub Issue per fingerprint, milestone-only comments).
+# Create once with:  wrangler kv namespace create CRASH_INDEX
+# then paste the returned id below.
+#
+# [[kv_namespaces]]
+# binding = "CRASH_INDEX"
+# id = "<kv-namespace-id>"

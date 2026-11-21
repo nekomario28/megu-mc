@@ -54,6 +54,17 @@
     // (--flagship-mods create, no --profiles-dir).
     flagshipMods: ["create"],
     profileMods: [],
+
+    // Optional community/support endpoints. Each stays "" until a real
+    // destination exists — the footer hides the matching link while empty.
+    // reportApiUrl  — e.g. "/api/report" once Pages Functions are deployed
+    // discussionsUrl — GitHub Discussions (or forum) for ideas & support
+    // discordUrl     — Discord invite, when the community server exists
+    // sponsorUrl     — GitHub Sponsors / donation page
+    reportApiUrl: "",
+    discussionsUrl: "",
+    discordUrl: "",
+    sponsorUrl: "",
   };
 
   root.SITE_CONFIG = SITE_CONFIG;

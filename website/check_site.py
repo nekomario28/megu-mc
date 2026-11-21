@@ -23,6 +23,10 @@ Checks, all fail-closed:
      version-range engine, id inference, path-traversal rejection, and
      extractManifestFromZipBytes against a real ZIP_DEFLATED .mrpack, a
      stored CurseForge .zip, and corrupt/oversized fail-closed archives.
+  6. When `node` is on PATH, website/test_functions.mjs exercises the
+     Cloudflare Pages Functions in functions/api/ (payload validation,
+     redaction, milestone comments, KV dedup, Turnstile, /api/latest)
+     against fully mocked GitHub/KV/fetch — no network access.
 
 Exit status: 0 clean, 1 findings.
 """
@@ -614,6 +618,29 @@ def check_js_unit():
     return []
 
 
+def check_functions_unit():
+    """Check 6: node unit tests for the Pages Functions in functions/api/."""
+    node = shutil.which("node")
+    if node is None:
+        return ["node not on PATH — skipped the functions unit check "
+                "(install node to run it)"]
+    suite = WEBSITE / "test_functions.mjs"
+    if not suite.is_file():
+        return ["website/test_functions.mjs is missing"]
+    result = subprocess.run(
+        [node, str(suite)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        return [
+            "functions unit check failed:\n"
+            + (result.stdout + result.stderr).strip()
+        ]
+    return []
+
+
 def main():
     checks = (
         ("local assets & zero external deps", check_local_assets),
@@ -621,6 +648,7 @@ def main():
         ("forbidden asset names", check_forbidden_names),
         ("site-config.js keys", check_site_config_keys),
         ("app.js unit check (node)", check_js_unit),
+        ("functions unit check (node)", check_functions_unit),
     )
     failures = []
     skipped = 0
