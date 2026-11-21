@@ -111,9 +111,10 @@ fn main() {
         summary.cells().len()
     );
     let mut fine = [LodCell::EMPTY; LOD_FINE * LOD_FINE];
-    black_box(summarize_column(&views, LOD_FINE, &mut fine));
+    summarize_column(&views, LOD_FINE, &mut fine);
+    black_box(&fine);
     let us = time_us(runs, || {
-        black_box(summarize_column(black_box(&views), LOD_FINE, &mut fine));
+        summarize_column(black_box(&views), LOD_FINE, &mut fine);
     });
     println!(
         "lod 16x16: {us:.2} us/column ({} cells, {runs} runs)",

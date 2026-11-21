@@ -211,6 +211,39 @@ int32_t mc_spine_client_mesh_bucket_directions(const mc_spine_mesh_quad *quads, 
                                                mc_spine_mesh_quad *output, size_t capacity,
                                                mc_spine_mesh_dir_buckets *buckets, size_t *count);
 
+/* Horizon LOD column summaries (additive ABI v1 extension). Summarizes the
+   sections of one chunk column into edge*edge cells, each holding the
+   highest non-air block found in its footprint: state_id is the global
+   palette id at top_y (0 when empty), tint is the block tint for tinted
+   tops, the fluid tint for fluid tops and 0 otherwise, top_y is the
+   column-local height (-1 when empty) and light packs block in the low
+   nibble and sky in the high nibble at top_y. Cells are written in
+   x-fastest, z-major order, matching section_index's X/Z layout. The
+   column input reuses mc_spine_mesh_column_input; cardinal border planes
+   are accepted but not needed for summaries. */
+enum {
+    MC_SPINE_MESH_LOD_COARSE = 4,  /* one cell per 4x4-block footprint */
+    MC_SPINE_MESH_LOD_FINE = 16,   /* one cell per block column */
+};
+
+typedef struct mc_spine_lod_cell {
+    uint32_t state_id;
+    uint32_t tint;
+    int16_t top_y;
+    uint8_t light;
+    uint8_t pad;
+} mc_spine_lod_cell;
+
+/* resolution must be MC_SPINE_MESH_LOD_COARSE or MC_SPINE_MESH_LOD_FINE.
+   count receives resolution*resolution (16 or 256). Uses the v1 buffer,
+   count and status conventions: NULL output with zero capacity queries
+   *count; a too-small buffer reports the required count and leaves output
+   untouched. */
+int32_t mc_spine_client_mesh_summarize_column(const mc_spine_mesh_column_input *input,
+                                              uint32_t resolution,
+                                              mc_spine_lod_cell *output,
+                                              size_t capacity, size_t *count);
+
 #ifdef __cplusplus
 }
 #endif

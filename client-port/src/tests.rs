@@ -1613,7 +1613,7 @@ fn lod_summary_finds_top_block_tint_and_light_per_column() {
     let mut upper = air();
     let leaves = Block {
         state_id: 238,
-        tint: 0x2288_33,
+        tint: 0x0022_8833,
         flags: CUTOUT | TINTED,
         ..Block::AIR
     };
@@ -1622,7 +1622,7 @@ fn lod_summary_finds_top_block_tint_and_light_per_column() {
     let views = [lower.view(), upper.view()];
     summarize_column(&views, LOD_FINE, &mut out);
 
-    let cell = out[1 * EDGE + 2];
+    let cell = out[EDGE + 2];
     assert_eq!(cell.top_y, 16 + 3);
     assert_eq!(cell.state_id, leaves.state_id);
     assert_eq!(cell.tint, leaves.tint);
@@ -1635,7 +1635,7 @@ fn lod_summary_finds_top_block_tint_and_light_per_column() {
     assert_eq!(low.light, DARK.0);
 
     for (i, cell) in out.iter().enumerate() {
-        if i != 1 * EDGE + 2 && i != 0 {
+        if i != EDGE + 2 && i != 0 {
             assert!(cell.is_empty(), "column {i} should be empty");
         }
     }
@@ -1973,7 +1973,342 @@ fn direction_buckets_draw_mask_and_vertex_ranges() {
         count: [0, 3, 0, 6, 0, 1, 0],
     };
     let vr = buckets.vertex_ranges();
-    for b in 0..DIRECTION_BUCKETS {
-        assert_eq!(vr[b], (buckets.offset[b] * 4, buckets.count[b] * 4));
+    for (b, range) in vr.iter().enumerate() {
+        assert_eq!(*range, (buckets.offset[b] * 4, buckets.count[b] * 4));
+    }
+}
+
+mod lod_ffi {
+    use super::*;
+    use crate::ffi::{
+        mc_spine_client_mesh_summarize_column, McSpineLodCell, MeshColumnInput, MeshColumnSection,
+        ABI_BUFFER_TOO_SMALL, ABI_INVALID_ARGUMENT, ABI_OK, ABI_OPAQUE, ABI_VERSION,
+    };
+    use std::ptr;
+
+    fn column_input(
+        sections: &[Section],
+        flags: impl Fn(usize) -> u32,
+    ) -> (Vec<MeshColumnSection>, MeshColumnInput) {
+        let inputs: Vec<_> = sections
+            .iter()
+            .enumerate()
+            .map(|(index, section)| {
+                let uniform_air = flags(index) == crate::ffi::ABI_COLUMN_UNIFORM_AIR;
+                MeshColumnSection {
+                    flags: flags(index),
+                    blocks: if uniform_air {
+                        ptr::null()
+                    } else {
+                        section.blocks.as_ptr()
+                    },
+                    block_light: section.block_light.as_ptr(),
+                    sky_light: section.sky_light.as_ptr(),
+                }
+            })
+            .collect();
+        let input = MeshColumnInput {
+            abi_version: ABI_VERSION,
+            missing: ABI_OPAQUE,
+            sections: inputs.as_ptr(),
+            section_count: inputs.len(),
+            borders: [ptr::null(); 4],
+        };
+        (inputs, input)
+    }
+
+    // SAFETY: helper keeps `inputs` alive for the duration of each call.
+    unsafe fn summarize(
+        input: &MeshColumnInput,
+        resolution: u32,
+        output: *mut McSpineLodCell,
+        capacity: usize,
+        count: &mut usize,
+    ) -> i32 {
+        unsafe { mc_spine_client_mesh_summarize_column(input, resolution, output, capacity, count) }
+    }
+
+    fn clone_input(input: &MeshColumnInput) -> MeshColumnInput {
+        MeshColumnInput {
+            abi_version: input.abi_version,
+            missing: input.missing,
+            sections: input.sections,
+            section_count: input.section_count,
+            borders: input.borders,
+        }
+    }
+
+    fn fixture() -> (Vec<Section>, MeshColumnInput, Vec<MeshColumnSection>) {
+        let mut lower = Section::filled(Block::AIR, Light::new(0, 15));
+        lower.set(2, 3, 1, STONE, Light::new(4, 9));
+        lower.set(0, 15, 0, STONE, DARK);
+        let mut upper = air();
+        let leaves = Block {
+            state_id: 238,
+            tint: 0x0022_8833,
+            flags: CUTOUT | TINTED,
+            ..Block::AIR
+        };
+        upper.set(2, 3, 1, leaves, Light::new(1, 14));
+        let sections = vec![lower, upper, air()];
+        let (inputs, input) = column_input(&sections, |i| {
+            if i == 2 {
+                crate::ffi::ABI_COLUMN_UNIFORM_AIR
+            } else {
+                0
+            }
+        });
+        (sections, input, inputs)
+    }
+
+    #[test]
+    fn lod_ffi_rejects_invalid_arguments() {
+        let (_sections, input, _inputs) = fixture();
+        let mut count = usize::MAX;
+        let mut out = [McSpineLodCell::default(); LOD_FINE * LOD_FINE];
+
+        // Null count pointer.
+        assert_eq!(
+            unsafe {
+                mc_spine_client_mesh_summarize_column(
+                    &input,
+                    LOD_FINE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    ptr::null_mut(),
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        // Null input zeroes the count.
+        assert_eq!(
+            unsafe {
+                mc_spine_client_mesh_summarize_column(
+                    ptr::null(),
+                    LOD_FINE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut count,
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        assert_eq!(count, 0);
+        // Output without capacity, and capacity without output semantics.
+        assert_eq!(
+            unsafe { summarize(&input, LOD_FINE as u32, ptr::null_mut(), 4, &mut count) },
+            ABI_INVALID_ARGUMENT
+        );
+        // Unsupported resolutions.
+        for resolution in [0, 1, 8, 15, 17, u32::MAX] {
+            assert_eq!(
+                unsafe { summarize(&input, resolution, out.as_mut_ptr(), out.len(), &mut count) },
+                ABI_INVALID_ARGUMENT,
+                "resolution {resolution}"
+            );
+        }
+        // Mutated header fields.
+        let mut bad = clone_input(&input);
+        bad.abi_version = ABI_VERSION + 1;
+        assert_eq!(
+            unsafe {
+                summarize(
+                    &bad,
+                    LOD_FINE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut count,
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        let mut bad = clone_input(&input);
+        bad.missing = 7;
+        assert_eq!(
+            unsafe {
+                summarize(
+                    &bad,
+                    LOD_FINE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut count,
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        let mut bad = clone_input(&input);
+        bad.sections = ptr::null();
+        assert_eq!(
+            unsafe {
+                summarize(
+                    &bad,
+                    LOD_FINE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut count,
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        let mut bad = clone_input(&input);
+        bad.section_count = 0;
+        assert_eq!(
+            unsafe {
+                summarize(
+                    &bad,
+                    LOD_FINE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut count,
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        let mut bad = clone_input(&input);
+        bad.section_count = crate::ffi::ABI_MAX_COLUMN_SECTIONS + 1;
+        assert_eq!(
+            unsafe {
+                summarize(
+                    &bad,
+                    LOD_FINE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut count,
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn lod_ffi_rejects_bad_section_descriptors() {
+        let sections = vec![air(), air()];
+        let (mut inputs, input) = column_input(&sections, |_| 0);
+        let mut count = 0usize;
+        let mut out = [McSpineLodCell::default(); LOD_COARSE * LOD_COARSE];
+
+        // Dense flags require a block array.
+        inputs[0].blocks = ptr::null();
+        assert_eq!(
+            unsafe {
+                summarize(
+                    &input,
+                    LOD_COARSE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut count,
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        inputs[0].blocks = sections[0].blocks.as_ptr();
+        // Unknown flags and uniform air with a supplied block array fail.
+        inputs[0].flags = 99;
+        assert_eq!(
+            unsafe {
+                summarize(
+                    &input,
+                    LOD_COARSE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut count,
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        inputs[0].flags = crate::ffi::ABI_COLUMN_UNIFORM_AIR;
+        assert_eq!(
+            unsafe {
+                summarize(
+                    &input,
+                    LOD_COARSE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut count,
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        // Light arrays are always required.
+        inputs[0].flags = 0;
+        inputs[0].block_light = ptr::null();
+        assert_eq!(
+            unsafe {
+                summarize(
+                    &input,
+                    LOD_COARSE as u32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut count,
+                )
+            },
+            ABI_INVALID_ARGUMENT
+        );
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn lod_ffi_queries_and_matches_summarize_column() {
+        let (sections, input, _inputs) = fixture();
+        let views: Vec<_> = sections.iter().map(Section::view).collect();
+        let mut count = 0usize;
+
+        for (resolution, edge) in [(LOD_COARSE as u32, LOD_COARSE), (LOD_FINE as u32, LOD_FINE)] {
+            let required = edge * edge;
+            // NULL output queries the required cell count.
+            assert_eq!(
+                unsafe { summarize(&input, resolution, ptr::null_mut(), 0, &mut count) },
+                ABI_OK
+            );
+            assert_eq!(count, required);
+
+            // A short buffer reports the requirement and stays untouched.
+            let mut short = vec![
+                McSpineLodCell {
+                    state_id: u32::MAX,
+                    ..McSpineLodCell::default()
+                };
+                required - 1
+            ];
+            let sentinel = short[0];
+            assert_eq!(
+                unsafe {
+                    summarize(
+                        &input,
+                        resolution,
+                        short.as_mut_ptr(),
+                        short.len(),
+                        &mut count,
+                    )
+                },
+                ABI_BUFFER_TOO_SMALL
+            );
+            assert_eq!(count, required);
+            assert_eq!(short[0], sentinel);
+
+            // A full buffer matches summarize_column field for field.
+            let mut out = vec![McSpineLodCell::default(); required];
+            assert_eq!(
+                unsafe { summarize(&input, resolution, out.as_mut_ptr(), out.len(), &mut count) },
+                ABI_OK
+            );
+            assert_eq!(count, required);
+            let mut expected = vec![LodCell::EMPTY; required];
+            summarize_column(&views, edge, &mut expected);
+            for (got, want) in out.iter().zip(&expected) {
+                assert_eq!(got.state_id, want.state_id);
+                assert_eq!(got.tint, want.tint);
+                assert_eq!(got.top_y, want.top_y);
+                assert_eq!(got.light, want.light);
+            }
+            if edge == LOD_FINE {
+                // Spot-check the known top through the FFI layout.
+                let fine_cell = out[LOD_FINE + 2];
+                assert_eq!(fine_cell.top_y, EDGE as i16 + 3);
+                assert_eq!(fine_cell.state_id, 238);
+                assert_eq!(fine_cell.tint, 0x0022_8833);
+            }
+        }
     }
 }

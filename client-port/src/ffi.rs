@@ -9,6 +9,7 @@ pub use crate::packed::PackedVertex;
 
 use crate::{
     column::{mesh_column_into, ColumnSection, FacePlane},
+    lod::{summarize_column, LodCell, LOD_COARSE, LOD_FINE},
     mesh::{mesh_section_with_scratch, with_scratch, CountSink},
     packed::{depth_key, is_packable, is_translucent, pack_quad, MAX_COLUMN_SECTIONS},
     Block, Direction, DirectionBuckets, Layer, MissingNeighbor, Quad, Sample, SectionView,
@@ -475,6 +476,135 @@ pub unsafe extern "C" fn mc_spine_client_mesh_bucket_directions(
         // from input, so each write lands exactly once inside capacity.
         unsafe { output.add(cursor[bucket] as usize).write(quad) };
         cursor[bucket] += 1;
+    }
+    ABI_OK
+}
+
+/// One summarized LOD cell as seen by C callers: 12 bytes, matching
+/// `mc_spine_lod_cell` in the header. Differs from the internal `LodCell`,
+/// which reserves five trailing bytes per cell.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct McSpineLodCell {
+    /// Global palette state id at `top_y` (0 when the footprint is empty).
+    pub state_id: u32,
+    /// Block tint for `TINTED` tops, fluid tint for `FLUID_TINTED` tops, else 0.
+    pub tint: u32,
+    /// Column-local height of the top non-air block; -1 when empty.
+    pub top_y: i16,
+    /// Packed light at `top_y` (block nibble | sky nibble << 4).
+    pub light: u8,
+    pub pad: u8,
+}
+
+/// Summarize a chunk column into coarse LOD cells for distant-horizon
+/// rendering. `resolution` is `LOD_COARSE` (4) or `LOD_FINE` (16); `count`
+/// receives `resolution * resolution`, the number of cells written in
+/// x-fastest, z-major order. Uses the v1 buffer, count and status conventions:
+/// NULL output with zero capacity queries `count`, and a too-small buffer
+/// reports the required count without touching the output.
+///
+/// # Safety
+///
+/// Same contract as `mc_spine_client_mesh_column`: non-null buffers must be
+/// aligned and valid for the lengths in the header, initialized and readable.
+/// Output and count must be writable and disjoint from each other and all
+/// input buffers.
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_client_mesh_summarize_column(
+    input: *const MeshColumnInput,
+    resolution: u32,
+    output: *mut McSpineLodCell,
+    capacity: usize,
+    count: *mut usize,
+) -> i32 {
+    if count.is_null() {
+        return ABI_INVALID_ARGUMENT;
+    }
+    // SAFETY: non-null count is writable.
+    unsafe { count.write(0) };
+    let edge = match resolution {
+        x if x == LOD_COARSE as u32 => LOD_COARSE,
+        x if x == LOD_FINE as u32 => LOD_FINE,
+        _ => return ABI_INVALID_ARGUMENT,
+    };
+    let Some(input) = (unsafe { input.as_ref() }) else {
+        return ABI_INVALID_ARGUMENT;
+    };
+    if input.abi_version != ABI_VERSION
+        || input.sections.is_null()
+        || !(1..=MAX_COLUMN_SECTIONS).contains(&input.section_count)
+        || (output.is_null() && capacity != 0)
+    {
+        return ABI_INVALID_ARGUMENT;
+    }
+    let missing = match input.missing {
+        ABI_AIR => MissingNeighbor::Air,
+        ABI_OPAQUE => MissingNeighbor::Opaque,
+        _ => return ABI_INVALID_ARGUMENT,
+    };
+    // SAFETY: the header requires section_count readable descriptors and the
+    // count is bounded before constructing the slice.
+    let inputs = unsafe { std::slice::from_raw_parts(input.sections, input.section_count) };
+    let mut view_slots: [MaybeUninit<SectionView<'_>>; MAX_COLUMN_SECTIONS] =
+        [const { MaybeUninit::uninit() }; MAX_COLUMN_SECTIONS];
+    for (slot, section) in view_slots.iter_mut().zip(inputs) {
+        let blocks = match section.flags {
+            // SAFETY: a non-null dense block array has the fixed length and
+            // alignment declared in the header.
+            0 | ABI_COLUMN_SEALED_SOLID => {
+                match unsafe { section.blocks.cast::<[Block; SECTION_CELLS]>().as_ref() } {
+                    Some(blocks) => blocks,
+                    None => return ABI_INVALID_ARGUMENT,
+                }
+            }
+            ABI_COLUMN_UNIFORM_AIR if section.blocks.is_null() => &AIR_BLOCKS,
+            _ => return ABI_INVALID_ARGUMENT,
+        };
+        // SAFETY: non-null light arrays have the fixed length in the header.
+        let (Some(block_light), Some(sky_light)) = (unsafe {
+            (
+                section.block_light.cast::<[u8; LIGHT_BYTES]>().as_ref(),
+                section.sky_light.cast::<[u8; LIGHT_BYTES]>().as_ref(),
+            )
+        }) else {
+            return ABI_INVALID_ARGUMENT;
+        };
+        slot.write(SectionView {
+            blocks,
+            block_light,
+            sky_light,
+            missing,
+            borders: [None; 6],
+            edges_and_corners: None,
+        });
+    }
+    // SAFETY: the first inputs.len() slots were initialized in the loop above.
+    let views = unsafe {
+        std::slice::from_raw_parts(view_slots.as_ptr().cast::<SectionView<'_>>(), inputs.len())
+    };
+    let mut cells = [LodCell::EMPTY; LOD_FINE * LOD_FINE];
+    summarize_column(views, edge, &mut cells[..edge * edge]);
+    let required = edge * edge;
+    // SAFETY: count is writable and separate from the other buffers.
+    unsafe { count.write(required) };
+    if output.is_null() {
+        return ABI_OK;
+    }
+    if capacity < required {
+        return ABI_BUFFER_TOO_SMALL;
+    }
+    for (i, cell) in cells[..required].iter().enumerate() {
+        // SAFETY: output has room for required cells and is disjoint.
+        unsafe {
+            output.add(i).write(McSpineLodCell {
+                state_id: cell.state_id,
+                tint: cell.tint,
+                top_y: cell.top_y,
+                light: cell.light,
+                pad: 0,
+            });
+        }
     }
     ABI_OK
 }
