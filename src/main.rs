@@ -63,6 +63,7 @@ include!("combat_and_health.rs");
 include!("play_protocol.rs");
 include!("lod_protocol.rs");
 include!("anvil_io.rs");
+include!("recipes_and_stats.rs");
 #[cfg(feature = "create-offload")]
 include!("mod_offload_bridge.rs");
 
