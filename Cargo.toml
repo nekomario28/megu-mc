@@ -27,9 +27,15 @@ native-oracle = []
 java-compat = ["dep:jni"]
 fabric-probe = ["java-compat"]
 neoforge-events = ["java-compat"]
+# Opt-in production bridge to the local mod adapters (`src/mod_offload_bridge.rs`,
+# `include!`d behind this cfg). All three crates are path-local with zero
+# crates-io dependencies, so default builds keep an unchanged dependency graph.
+create-offload = ["dep:mod-adapter-core", "dep:create-adapter"]
 
 [dependencies]
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 jni = { version = "0.21.1", features = ["invocation"], optional = true }
+mod-adapter-core = { path = "mod-adapter-core", optional = true }
+create-adapter = { path = "create-adapter", optional = true }
 signal-hook = "0.4.4"
 ureq = { version = "3.4.2", features = ["rustls"] }

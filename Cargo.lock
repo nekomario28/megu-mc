@@ -62,6 +62,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "create-adapter"
+version = "0.1.0"
+dependencies = [
+ "mod-adapter-core",
+ "mod-offload",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -208,8 +216,10 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "mc-spine"
 version = "0.0.0"
 dependencies = [
+ "create-adapter",
  "flate2",
  "jni",
+ "mod-adapter-core",
  "signal-hook",
  "ureq",
 ]
@@ -229,6 +239,17 @@ dependencies = [
  "adler2",
  "simd-adler32",
 ]
+
+[[package]]
+name = "mod-adapter-core"
+version = "0.1.0"
+dependencies = [
+ "mod-offload",
+]
+
+[[package]]
+name = "mod-offload"
+version = "0.1.0"
 
 [[package]]
 name = "once_cell"

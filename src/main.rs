@@ -59,6 +59,8 @@ include!("menus_and_items.rs");
 include!("combat_and_health.rs");
 include!("play_protocol.rs");
 include!("lod_protocol.rs");
+#[cfg(feature = "create-offload")]
+include!("mod_offload_bridge.rs");
 
 // ---------- clients (multiplayer visibility) ----------
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -11347,6 +11349,8 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("random_ticks", random_tick_pass);
     run("block_updates", apply_queued_block_updates);
     run("chest_viewers", chest_viewer_tick);
+    #[cfg(feature = "create-offload")]
+    run("mod_offload", mod_offload_tick);
 }
 
 fn main() {
