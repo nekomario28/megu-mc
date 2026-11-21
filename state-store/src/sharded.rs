@@ -358,6 +358,17 @@ impl DimensionState {
             .insert(coord, overlay);
     }
 
+    /// Remove and return the overlay at `coord`, if one is resident. The
+    /// ticket unloader uses this to flush a chunk out of memory without
+    /// dropping its edits: the returned overlay carries every block override
+    /// and block entity the chunk held.
+    pub(crate) fn remove_overlay(&self, coord: ChunkCoord) -> Option<ChunkOverlay> {
+        self.chunk_shards[coord.shard()]
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&coord)
+    }
+
     /// Number of chunk columns carrying an overlay.
     pub fn overlay_count(&self) -> usize {
         self.chunk_shards

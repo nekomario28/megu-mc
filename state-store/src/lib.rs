@@ -56,10 +56,26 @@
 //!   [`anvil_inspect::migrate_anvil_level_dat`], which runs a decoded
 //!   `level.dat` through the fixer and re-seals it as a verified gzip
 //!   member.
+//! * [`audit_log`] — the CoreProtect-style `AUD1` append-only audit WAL:
+//!   CRC32-framed [`audit_log::AuditRecord`]s whose torn trailing write is
+//!   dropped cleanly on [`audit_log::AuditLog::recover_from_file`], a
+//!   `(dimension, cx, cz)` chunk-bucket index for spatial
+//!   [`audit_log::AuditQuery`]s, and atomic
+//!   [`audit_log::AuditLog::rollback_blocks`] /
+//!   [`audit_log::AuditLog::restore_blocks`] that replay block mutations
+//!   against the live [`sharded::ServerContext`] in strict `seq` order.
+//! * [`pregen`] — the Chunky-style [`pregen::PregenJob`]: a deterministic
+//!   outward spiral over a square or circular radius, handed out in
+//!   per-tick-capped batches with pause/resume/cancel — and the
+//!   [`pregen::ChunkTicketLruUnloader`], which pins resident chunks through
+//!   reference-counted [`pregen::TicketKind`]s and evicts unticketed ones in
+//!   strict LRU order, flushing their overlays back to the caller.
 
 pub mod anvil_inspect;
+pub mod audit_log;
 pub mod datafix;
 pub mod migrate;
+pub mod pregen;
 pub mod region_tick;
 pub mod sharded;
 pub mod snapshot;
@@ -72,10 +88,17 @@ pub use anvil_inspect::{
     McaRegionSummary, MCA_HEADER_BYTES, MCA_SECTOR_BYTES, MCA_SLOT_COUNT, NBT_DEPTH_CAP,
     NBT_SIZE_CAP,
 };
+pub use audit_log::{
+    AuditAction, AuditLog, AuditQuery, AuditRecord, BlockRollbackDelta,
+};
 pub use datafix::{DataFixError, DataFixReport, DataFixStep, DataFixer, DataValue, DV_1_21_1, DV_26_3};
 pub use migrate::{
     inspect_snapshot, migrate_json_document, migrate_snapshot, parse_data_json, to_data_json,
     write_file_atomic, JsonError, MigrationError, SnapshotMigrationReport, SnapshotSummary,
+};
+pub use pregen::{
+    spiral_order, ChunkTicketLruUnloader, FlushedChunk, PregenJob, PregenProgress, PregenShape,
+    PregenState, TicketKind,
 };
 pub use region_tick::{
     partition_independent_regions, tick_dimension_regions_parallel, RegionCoord, RegionTickStats,
