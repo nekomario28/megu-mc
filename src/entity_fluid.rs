@@ -235,6 +235,101 @@ fn fluid_flow_with(
     fluid_vec3_normalize(vec)
 }
 
+/// `bsr.a(Lawu;D)Z` offsets 305–431: average the accumulated flows, normalize
+/// for non-players, scale by `d`, then apply the stationary min-speed frame.
+fn fluid_push_finalize(
+    acc: [f64; 3],
+    count: i32,
+    is_player: bool,
+    motion_scale: f64,
+    vel: [f64; 3],
+) -> [f64; 3] {
+    let mut push = [0.0f64; 3];
+    if fluid_vec3_len(acc) > 0.0 {
+        let mut v = acc;
+        if count > 0 {
+            let inv = 1.0 / f64::from(count);
+            v = [v[0] * inv, v[1] * inv, v[2] * inv];
+        }
+        if !is_player {
+            v = fluid_vec3_normalize(v);
+        }
+        v = [
+            v[0] * motion_scale,
+            v[1] * motion_scale,
+            v[2] * motion_scale,
+        ];
+        if vel[0].abs() < FLUID_VELOCITY_THRESHOLD
+            && vel[2].abs() < FLUID_VELOCITY_THRESHOLD
+            && fluid_vec3_len(v) < FLUID_PUSH_MIN_SPEED
+        {
+            let vn = fluid_vec3_normalize(v);
+            v = [
+                vn[0] * FLUID_PUSH_MIN_SPEED,
+                vn[1] * FLUID_PUSH_MIN_SPEED,
+                vn[2] * FLUID_PUSH_MIN_SPEED,
+            ];
+        }
+        push = v;
+    }
+    push
+}
+
+/// Accumulate `in_fluid`/`max_height` (and, when `is_pushed_by_fluid`, the flow
+/// sum) over the `(bx, by, bz, fs)` cells of one deflated-AABB sweep whose kind
+/// matches `kind`. `cells` must be in the sweep's (x, y, z) visit order so the
+/// flow accumulation is ordered exactly as the boxed loop did it.
+#[allow(clippy::too_many_arguments)]
+fn fluid_result_from_cells(
+    cells: &[(i32, i32, i32, EntityFluidState)],
+    deflated: EntityAabb,
+    kind: EntityFluidKind,
+    motion_scale: f64,
+    is_pushed_by_fluid: bool,
+    is_player: bool,
+    vel: [f64; 3],
+    get_block: &impl Fn(i32, i32, i32) -> u32,
+) -> FluidPushResult {
+    let mut max_height = 0.0f64;
+    let mut found = false;
+    let mut acc = [0.0f64; 3];
+    let mut count = 0i32;
+    for &(bx, by, bz, fs) in cells {
+        if fs.kind != kind {
+            continue;
+        }
+        let h = if fluid_has_same_above_with(fs.kind, bx, by, bz, get_block) {
+            1.0f32
+        } else {
+            fluid_own_height(fs)
+        };
+        let e = f64::from(by as f32 + h);
+        if e >= deflated.min_y {
+            found = true;
+            max_height = max_height.max(e - deflated.min_y);
+            if is_pushed_by_fluid {
+                let mut flow = fluid_flow_with(bx, by, bz, fs, get_block);
+                if max_height < 0.4 {
+                    flow = [
+                        flow[0] * max_height,
+                        flow[1] * max_height,
+                        flow[2] * max_height,
+                    ];
+                }
+                acc[0] += flow[0];
+                acc[1] += flow[1];
+                acc[2] += flow[2];
+                count += 1;
+            }
+        }
+    }
+    FluidPushResult {
+        in_fluid: found,
+        max_height,
+        push: fluid_push_finalize(acc, count, is_player, motion_scale, vel),
+    }
+}
+
 /// 1.21.1 `Entity.updateFluidHeightAndDoFluidPushing(TagKey<Fluid>, double)` (`bsr.a(Lawu;D)Z`, offsets 0–431).
 fn update_fluid_height_and_push_with(
     aabb: EntityAabb,
@@ -296,39 +391,10 @@ fn update_fluid_height_and_push_with(
         }
     }
 
-    let mut push = [0.0f64; 3];
-    if fluid_vec3_len(acc) > 0.0 {
-        let mut v = acc;
-        if count > 0 {
-            let inv = 1.0 / f64::from(count);
-            v = [v[0] * inv, v[1] * inv, v[2] * inv];
-        }
-        if !is_player {
-            v = fluid_vec3_normalize(v);
-        }
-        v = [
-            v[0] * motion_scale,
-            v[1] * motion_scale,
-            v[2] * motion_scale,
-        ];
-        if vel[0].abs() < FLUID_VELOCITY_THRESHOLD
-            && vel[2].abs() < FLUID_VELOCITY_THRESHOLD
-            && fluid_vec3_len(v) < FLUID_PUSH_MIN_SPEED
-        {
-            let vn = fluid_vec3_normalize(v);
-            v = [
-                vn[0] * FLUID_PUSH_MIN_SPEED,
-                vn[1] * FLUID_PUSH_MIN_SPEED,
-                vn[2] * FLUID_PUSH_MIN_SPEED,
-            ];
-        }
-        push = v;
-    }
-
     FluidPushResult {
         in_fluid: found,
         max_height,
-        push,
+        push: fluid_push_finalize(acc, count, is_player, motion_scale, vel),
     }
 }
 
@@ -651,7 +717,7 @@ fn fluid_input_vector(input: [f64; 3], amount: f32, yaw_deg: f32) -> [f64; 3] {
 /// level's entity-AABB query, and this server's mob lacks one (the mob push grid excludes the
 /// querying mob rather than answering obstruction).
 fn entity_is_free_blocks(aabb: EntityAabb) -> bool {
-    collect_block_collision_boxes(aabb.min(), aabb.max()).is_empty()
+    !any_block_collision_box(aabb.min(), aabb.max())
 }
 
 /// The `LivingEntity.travel` inputs the fluid branches read, separated from the mob so the step
@@ -802,6 +868,9 @@ fn mob_water_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushRes
     )
 }
 
+/// The standalone lava sweep, kept as the scalar reference the combined
+/// `fluid_sweep_states` is verified against in tests.
+#[allow(dead_code)]
 fn mob_lava_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResult {
     let (w, h) = mob_dimensions(etype);
     let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
@@ -814,6 +883,108 @@ fn mob_lava_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResu
         vel,
         &block_at,
     )
+}
+
+/// Retained-capacity bound for the per-tick fluid sweep cell list. A mob AABB
+/// covers single-digit block cells; the bound only guards a pathological AABB
+/// from pinning a peak allocation in the thread-local buffer.
+const FLUID_SWEEP_KEEP: usize =
+    256 * 1024 / std::mem::size_of::<(i32, i32, i32, EntityFluidState)>();
+
+thread_local! {
+    static FLUID_SWEEP_CELLS: std::cell::RefCell<Vec<(i32, i32, i32, EntityFluidState)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Borrow the per-thread fluid sweep cell list. `block_at` never reaches back
+/// into it, but a reentrant caller still falls back to a fresh `Vec`.
+fn with_fluid_sweep_cells<R>(
+    f: impl FnOnce(&mut Vec<(i32, i32, i32, EntityFluidState)>) -> R,
+) -> R {
+    FLUID_SWEEP_CELLS.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut cells) => {
+            let result = f(&mut cells);
+            if cells.capacity() > FLUID_SWEEP_KEEP {
+                cells.shrink_to(FLUID_SWEEP_KEEP);
+            }
+            result
+        }
+        Err(_) => f(&mut Vec::new()),
+    })
+}
+
+/// Record every `(bx, by, bz, fluid state)` inside `aabb`'s deflated sweep
+/// window into `out`, preserving the (x, y, z) visit order so replaying the
+/// list accumulates pushes exactly as the boxed loop did. The deflate is
+/// spelled through `deflate_xyz` — the pinned `aabb.deflate(0.001)` call site
+/// in `update_fluid_height_and_push_with` stays unique — and the widened
+/// arguments are the same three `0.001`s.
+fn fluid_sweep_cells(
+    aabb: EntityAabb,
+    get_block: &impl Fn(i32, i32, i32) -> u32,
+    out: &mut Vec<(i32, i32, i32, EntityFluidState)>,
+) -> EntityAabb {
+    out.clear();
+    let deflated = aabb.deflate_xyz(0.001, 0.001, 0.001);
+    let x0 = deflated.min_x.floor() as i32;
+    let x1 = deflated.max_x.ceil() as i32;
+    let y0 = deflated.min_y.floor() as i32;
+    let y1 = deflated.max_y.ceil() as i32;
+    let z0 = deflated.min_z.floor() as i32;
+    let z1 = deflated.max_z.ceil() as i32;
+    for bx in x0..x1 {
+        for by in y0..y1 {
+            for bz in z0..z1 {
+                if let Some(fs) = entity_fluid_state_of(get_block(bx, by, bz)) {
+                    out.push((bx, by, bz, fs));
+                }
+            }
+        }
+    }
+    deflated
+}
+
+/// One deflated AABB pass answering `mob_water_state_vel` and
+/// `mob_lava_state_vel` together: a dry sweep skips every per-kind check after
+/// a single scan, and a lava-only mob no longer pays a second full block
+/// rescan. Water's result is identical to the standalone call; lava's `push`
+/// is materialized only when water is dry, matching what the caller consumed
+/// before (a mob already in water never read the lava push).
+fn fluid_sweep_states(
+    aabb: EntityAabb,
+    vel: [f64; 3],
+    get_block: &impl Fn(i32, i32, i32) -> u32,
+) -> (FluidPushResult, FluidPushResult) {
+    with_fluid_sweep_cells(|cells| {
+        let deflated = fluid_sweep_cells(aabb, get_block, cells);
+        let water = fluid_result_from_cells(
+            cells,
+            deflated,
+            EntityFluidKind::Water,
+            fluid_push_scale(EntityFluidKind::Water, level_ultra_warm()),
+            true,
+            false,
+            vel,
+            get_block,
+        );
+        let lava = fluid_result_from_cells(
+            cells,
+            deflated,
+            EntityFluidKind::Lava,
+            fluid_push_scale(EntityFluidKind::Lava, level_ultra_warm()),
+            !water.in_fluid,
+            false,
+            vel,
+            get_block,
+        );
+        (water, lava)
+    })
+}
+
+fn mob_fluid_states_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> (FluidPushResult, FluidPushResult) {
+    let (w, h) = mob_dimensions(etype);
+    let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
+    fluid_sweep_states(aabb, vel, &block_at)
 }
 
 /// One `LivingEntity.travel` fluid tick for a mob.
@@ -829,19 +1000,16 @@ fn mob_fluid_travel_tick(
     let (w, h) = mob_dimensions(m.etype);
     let pos = [mp.0, mp.1, mp.2];
     let mut vel = *m.vel.lock().unwrap_or_else(|e| e.into_inner());
-    let water = mob_water_state_vel(m.etype, pos, vel);
+    let (water, lava) = mob_fluid_states_vel(m.etype, pos, vel);
     let (kind, state) = if water.in_fluid {
         (EntityFluidKind::Water, water)
+    } else if lava.max_height > 0.0 {
+        (EntityFluidKind::Lava, lava)
     } else {
-        let lava = mob_lava_state_vel(m.etype, pos, vel);
-        if lava.max_height > 0.0 {
-            (EntityFluidKind::Lava, lava)
-        } else {
-            if vel != [0.0; 3] {
-                *m.vel.lock().unwrap_or_else(|e| e.into_inner()) = [0.0; 3];
-            }
-            return None;
+        if vel != [0.0; 3] {
+            *m.vel.lock().unwrap_or_else(|e| e.into_inner()) = [0.0; 3];
         }
+        return None;
     };
     vel = [
         vel[0] + state.push[0],
@@ -1666,6 +1834,113 @@ mod entity_fluid_tests {
             *creeper_water.fuse.lock().unwrap_or_else(|e| e.into_inner()),
             8,
             "creeper fuse must NOT be cleared by water contact (7 -> 8, not 0 -> 1)"
+        );
+    }
+
+    #[test]
+    fn xpoll_entity_scratch_fluid_sweep_matches_scalar_sweeps_with_zero_growth() {
+        crate::test_support::require_vanilla_data();
+        // Synthetic pool: a water source ringed by flowing levels, a lava
+        // pocket behind stone, a solid floor. State ids are the synthetic
+        // fluid table (80..=95 water, 96..=111 lava) the file's other tests use.
+        let stone = name_to_state("stone").unwrap();
+        let world = move |x: i32, y: i32, z: i32| -> u32 {
+            match (x, y, z) {
+                (0, 64, 0) => 80,
+                (1, 64, 0) | (-1, 64, 0) | (0, 64, 1) | (0, 64, -1) => 81,
+                (2, 64, 0) => 82,
+                (3, 63, 0) => 96,
+                (4, 63, 0) => 98,
+                (_, y, _) if y <= 63 => stone,
+                _ => 0,
+            }
+        };
+        let water_scale = fluid_push_scale(EntityFluidKind::Water, level_ultra_warm());
+        let lava_scale = fluid_push_scale(EntityFluidKind::Lava, level_ultra_warm());
+        let aabb = EntityAabb::from_min_max([0.0, 64.0, 0.0], [0.6, 65.8, 0.6]);
+        let vel = [0.001, 0.0, 0.002];
+
+        // Warm every code path once so lazy registry init lands outside the
+        // timed loops.
+        let _ = fluid_sweep_states(aabb, vel, &world);
+        let _ = update_fluid_height_and_push_with(
+            aabb, EntityFluidKind::Water, water_scale, true, false, vel, &world,
+        );
+        let _ = update_fluid_height_and_push_with(
+            aabb, EntityFluidKind::Lava, lava_scale, true, false, vel, &world,
+        );
+
+        let mut expected = Vec::with_capacity(500);
+        let fresh_start = Instant::now();
+        for i in 0..500usize {
+            let probe = aabb.offset((i % 5) as f64 * 0.5, 0.0, -((i % 3) as f64) * 0.5);
+            let water = update_fluid_height_and_push_with(
+                probe, EntityFluidKind::Water, water_scale, true, false, vel, &world,
+            );
+            let lava = update_fluid_height_and_push_with(
+                probe,
+                EntityFluidKind::Lava,
+                lava_scale,
+                !water.in_fluid,
+                false,
+                vel,
+                &world,
+            );
+            expected.push((water, lava));
+        }
+        let fresh_us = fresh_start.elapsed().as_micros();
+
+        let pooled_start = Instant::now();
+        for i in 0..500usize {
+            let probe = aabb.offset((i % 5) as f64 * 0.5, 0.0, -((i % 3) as f64) * 0.5);
+            let actual = fluid_sweep_states(probe, vel, &world);
+            assert_eq!(expected[i], actual, "sweep #{i} must be bit-identical");
+        }
+        let pooled_us = pooled_start.elapsed().as_micros();
+        eprintln!(
+            "xpoll_entity_scratch_fluid: fresh {fresh_us}us vs pooled {pooled_us}us over 500 pairs"
+        );
+
+        // The pooled cell list holds steady capacity after warmup.
+        let before = FLUID_SWEEP_CELLS.with(|cell| cell.borrow().capacity());
+        for i in 0..500usize {
+            let probe = aabb.offset((i % 5) as f64 * 0.5, 0.0, -((i % 3) as f64) * 0.5);
+            let _ = fluid_sweep_states(probe, vel, &world);
+        }
+        let after = FLUID_SWEEP_CELLS.with(|cell| cell.borrow().capacity());
+        assert_eq!(before, after, "fluid sweep cells must not grow after warmup");
+        assert!(before > 0, "warmup must have populated the sweep cell list");
+
+        // Dry-cell short-circuit: an all-air sweep never calls back into
+        // get_block beyond the scan itself, and matches the scalar result.
+        let calls = std::cell::Cell::new(0usize);
+        let counting = |x: i32, y: i32, z: i32| {
+            calls.set(calls.get() + 1);
+            world(x, y, z)
+        };
+        let dry = aabb.offset(64.0, 8.0, 64.0);
+        let (water_dry, lava_dry) = fluid_sweep_states(dry, vel, &counting);
+        let scan_calls = calls.get();
+        let dry_window = dry.deflate(0.001);
+        let expected_scan = ((dry_window.max_x.ceil() as i32) - (dry_window.min_x.floor() as i32))
+            * ((dry_window.max_y.ceil() as i32) - (dry_window.min_y.floor() as i32))
+            * ((dry_window.max_z.ceil() as i32) - (dry_window.min_z.floor() as i32));
+        assert_eq!(
+            scan_calls,
+            expected_scan as usize,
+            "a dry sweep must skip per-kind flow/height lookups entirely"
+        );
+        assert_eq!(
+            (water_dry, lava_dry),
+            (
+                update_fluid_height_and_push_with(
+                    dry, EntityFluidKind::Water, water_scale, true, false, vel, &world,
+                ),
+                update_fluid_height_and_push_with(
+                    dry, EntityFluidKind::Lava, lava_scale, true, false, vel, &world,
+                ),
+            ),
+            "dry-cell result must be bit-identical to the scalar sweeps"
         );
     }
 }

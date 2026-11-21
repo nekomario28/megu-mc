@@ -87,6 +87,9 @@ pub(crate) fn can_spawn_for_category(
 #[derive(Default, Debug)]
 pub(crate) struct LocalMobCapCalculator {
     counts: std::collections::HashMap<u64, [u64; 7]>,
+    /// Per-`add_mob` dedup, kept between calls so the census sweep doesn't
+    /// reallocate the set for every counted mob.
+    seen: std::collections::HashSet<u64>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -100,9 +103,9 @@ impl LocalMobCapCalculator {
     }
 
     pub(crate) fn add_mob(&mut self, category: MobCategory, players: &[u64]) {
-        let mut seen = std::collections::HashSet::new();
+        self.seen.clear();
         for id in players {
-            if seen.insert(*id) {
+            if self.seen.insert(*id) {
                 self.counts.entry(*id).or_default()[category.index()] += 1;
             }
         }
@@ -199,6 +202,13 @@ pub(crate) struct NaturalSpawnState {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+impl Default for NaturalSpawnState {
+    fn default() -> Self {
+        Self::new(0, false)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 impl NaturalSpawnState {
     pub(crate) fn new(spawnable_chunk_count: u32, use_local_caps: bool) -> Self {
         Self {
@@ -207,6 +217,22 @@ impl NaturalSpawnState {
             potential: PotentialCalculator::default(),
             local_caps: use_local_caps.then(LocalMobCapCalculator::default),
         }
+    }
+
+    /// Re-prime a pooled state for the next pass: same result as `new`, while
+    /// the charges vector and per-player count map keep their capacity.
+    pub(crate) fn reset(&mut self, spawnable_chunk_count: u32, use_local_caps: bool) {
+        self.spawnable_chunk_count = spawnable_chunk_count;
+        self.counts = [0; 7];
+        self.potential.charges.clear();
+        self.local_caps = match self.local_caps.take() {
+            Some(mut caps) if use_local_caps => {
+                caps.counts.clear();
+                caps.seen.clear();
+                Some(caps)
+            }
+            _ => use_local_caps.then(LocalMobCapCalculator::default),
+        };
     }
 
     /// Preexisting cap-eligible mobs contribute their category and biome cost.
@@ -637,6 +663,22 @@ fn nightly_spawn_light_sources(clients: &[Arc<Client>], cx: i32, cz: i32) -> Gen
 
 fn natural_spawn_light_sources(clients: &[Arc<Client>], dim: DimId, cx: i32, cz: i32) -> GenSources {
     let mut nearby = GenSources::new();
+    natural_spawn_light_sources_into(clients, dim, cx, cz, &mut nearby, &mut Vec::new());
+    nearby
+}
+
+/// `natural_spawn_light_sources` filling a caller-provided map. Reused maps
+/// keep their bucket capacity, and `list_pool` supplies the per-chunk section
+/// vectors so the 3x3 clone pass stops reallocating every 2048-entry buffer.
+fn natural_spawn_light_sources_into(
+    clients: &[Arc<Client>],
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    out: &mut GenSources,
+    list_pool: &mut Vec<Vec<((i32, i32, i32), u8)>>,
+) {
+    out.clear();
     for client in clients {
         // Chunk streaming takes these locks in this order.
         let sources = client.gen_sources.lock().unwrap_or_else(|e| e.into_inner());
@@ -647,12 +689,16 @@ fn natural_spawn_light_sources(clients: &[Arc<Client>], dim: DimId, cx: i32, cz:
             for dz in -1..=1 {
                 let key = (cx + dx, cz + dz);
                 if let Some(chunk) = sources.get(&key) {
-                    nearby.entry(key).or_insert_with(|| chunk.clone());
+                    out.entry(key).or_insert_with(|| {
+                        let mut list = list_pool.pop().unwrap_or_default();
+                        list.clear();
+                        list.extend_from_slice(chunk);
+                        list
+                    });
                 }
             }
         }
     }
-    nearby
 }
 
 fn nightly_spawn_is_dark(x: i32, y: i32, z: i32, sources: &GenSources) -> bool {
@@ -880,33 +926,150 @@ fn try_nightly_monster_at(
     })
 }
 
+/// Retained-capacity bound for each reused spawn-pass buffer. One pass sees
+/// ~290 eligible chunks per player; the bound only stops a pathological burst
+/// from pinning peak capacity in the thread-local scratch.
+const SPAWN_SCRATCH_KEEP: usize = 256 * 1024;
+
+fn bound_spawn_vec<T>(v: &mut Vec<T>) {
+    let keep = SPAWN_SCRATCH_KEEP / std::mem::size_of::<T>().max(1);
+    if v.capacity() > keep {
+        v.shrink_to(keep);
+    }
+}
+
+fn bound_spawn_map<K: Eq + std::hash::Hash, V, S: std::hash::BuildHasher>(
+    m: &mut HashMap<K, V, S>,
+) {
+    let keep = SPAWN_SCRATCH_KEEP / std::mem::size_of::<(K, V)>().max(1);
+    if m.capacity() > keep {
+        m.shrink_to(keep);
+    }
+}
+
+fn bound_spawn_set<T: Eq + std::hash::Hash, S: std::hash::BuildHasher>(s: &mut HashSet<T, S>) {
+    let keep = SPAWN_SCRATCH_KEEP / std::mem::size_of::<T>().max(1);
+    if s.capacity() > keep {
+        s.shrink_to(keep);
+    }
+}
+
+/// Per-tick buffers the two live spawn passes share. Player/chunk sweeps and
+/// the mob-cap state are rebuilt every pass; pooling them keeps the steady
+/// tick allocation-free while `recycle` reclaims nested vectors and bounds
+/// every retained capacity.
+#[derive(Default)]
+struct SpawnTickScratch {
+    players_xyz: Vec<(f64, f64, f64)>,
+    players_eid: Vec<(u64, [f64; 3])>,
+    spawn_chunks: HashSet<(i32, i32)>,
+    loaded_chunks: HashSet<(i32, i32)>,
+    chunk_players: HashMap<(i32, i32), Vec<u64>>,
+    chunk_player_lists: Vec<Vec<u64>>,
+    sources: HashMap<(i32, i32), GenSources>,
+    gen_sources: Vec<GenSources>,
+    source_lists: Vec<Vec<((i32, i32, i32), u8)>>,
+    census: Vec<(&'static str, NaturalSpawnPos)>,
+    fortresses: HashMap<(i32, i32), Vec<([i32; 6], Vec<[i32; 6]>)>>,
+    nether_light: HashMap<(i32, i32), Vec<[u8; 2048]>>,
+    caps: NaturalSpawnState,
+}
+
+impl SpawnTickScratch {
+    /// After a pass: drain nested vectors back to their free lists, clear
+    /// every buffer, and shrink anything retained above the cap.
+    fn recycle(&mut self) {
+        bound_spawn_vec(&mut self.players_xyz);
+        bound_spawn_vec(&mut self.players_eid);
+        bound_spawn_set(&mut self.spawn_chunks);
+        bound_spawn_set(&mut self.loaded_chunks);
+        for (_, mut list) in self.chunk_players.drain() {
+            list.clear();
+            bound_spawn_vec(&mut list);
+            self.chunk_player_lists.push(list);
+        }
+        bound_spawn_map(&mut self.chunk_players);
+        bound_spawn_vec(&mut self.chunk_player_lists);
+        for (_, mut sources) in self.sources.drain() {
+            for (_, mut list) in sources.drain() {
+                list.clear();
+                bound_spawn_vec(&mut list);
+                self.source_lists.push(list);
+            }
+            bound_spawn_map(&mut sources);
+            self.gen_sources.push(sources);
+        }
+        bound_spawn_map(&mut self.sources);
+        bound_spawn_vec(&mut self.gen_sources);
+        bound_spawn_vec(&mut self.source_lists);
+        bound_spawn_vec(&mut self.census);
+        self.fortresses.clear();
+        bound_spawn_map(&mut self.fortresses);
+        self.nether_light.clear();
+        bound_spawn_map(&mut self.nether_light);
+        bound_spawn_vec(&mut self.caps.potential.charges);
+        if let Some(caps) = &mut self.caps.local_caps {
+            bound_spawn_map(&mut caps.counts);
+            bound_spawn_set(&mut caps.seen);
+        }
+    }
+}
+
+thread_local! {
+    static SPAWN_TICK_SCRATCH: RefCell<SpawnTickScratch> =
+        RefCell::new(SpawnTickScratch::default());
+}
+
+/// Borrow the per-tick spawn buffers for one spawn pass. Both live passes run
+/// sequentially on the tick thread; a reentrant call gets a fresh scratch.
+fn with_spawn_scratch<R>(f: impl FnOnce(&mut SpawnTickScratch) -> R) -> R {
+    SPAWN_TICK_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => {
+            let result = f(&mut scratch);
+            scratch.recycle();
+            result
+        }
+        Err(_) => f(&mut SpawnTickScratch::default()),
+    })
+}
+
 fn spawn_nightly_hostile(tick: u64) {
+    with_spawn_scratch(|scratch| spawn_nightly_hostile_scratch(tick, scratch));
+}
+
+fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
+    let SpawnTickScratch {
+        players_xyz: players,
+        spawn_chunks,
+        sources,
+        gen_sources,
+        source_lists,
+        ..
+    } = scratch;
     let clients = client_snapshot();
-    let players: Vec<_> = clients
-        .iter()
-        .filter_map(|client| {
-            if client.is_spectator() {
-                return None;
-            }
-            let dim = client.dim.lock().unwrap_or_else(|e| e.into_inner());
-            if *dim != DimId::Overworld {
-                return None;
-            }
-            let (x, y, z, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
-            Some((x, y, z))
-        })
-        .collect();
+    players.clear();
+    players.extend(clients.iter().filter_map(|client| {
+        if client.is_spectator() {
+            return None;
+        }
+        let dim = client.dim.lock().unwrap_or_else(|e| e.into_inner());
+        if *dim != DimId::Overworld {
+            return None;
+        }
+        let (x, y, z, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
+        Some((x, y, z))
+    }));
     if players.is_empty() {
         return;
     }
 
-    let mut spawn_chunks = HashSet::new();
-    for &(x, _, z) in &players {
+    spawn_chunks.clear();
+    for &(x, _, z) in players.iter() {
         let center = (
             (x.floor() as i32).div_euclid(16),
             (z.floor() as i32).div_euclid(16),
         );
-        extend_chunk_square(&mut spawn_chunks, center, NATURAL_SPAWN_CHUNK_RADIUS);
+        extend_chunk_square(spawn_chunks, center, NATURAL_SPAWN_CHUNK_RADIUS);
     }
     let cap = MobCategory::Monster.global_cap(spawn_chunks.len() as u32) as usize;
     if !has_room_for_nightly_monster(&mobs().lock().unwrap_or_else(|e| e.into_inner()), cap) {
@@ -937,7 +1100,7 @@ fn spawn_nightly_hostile(tick: u64) {
             + (sy.floor() + 0.5 - y).powi(2)
             + (sz.floor() + 0.5 - z).powi(2)
     };
-    let mut sources = HashMap::new();
+    sources.clear();
     let mut spawned = 0;
     for _ in 0..3 {
         let mut pack = SpawnPack::new(origin, nightly_spawn_float());
@@ -997,9 +1160,18 @@ fn spawn_nightly_hostile(tick: u64) {
             let etype = name_to_etype(&entry.kind).expect("registered nightly monster");
             // Streaming can generate chunks while holding the client cache
             // lock. Copy the light sources before taking the world-write guard.
-            let light_sources = sources
-                .entry(chunk)
-                .or_insert_with(|| nightly_spawn_light_sources(&clients, chunk.0, chunk.1));
+            let light_sources = sources.entry(chunk).or_insert_with(|| {
+                let mut nearby = gen_sources.pop().unwrap_or_default();
+                natural_spawn_light_sources_into(
+                    &clients,
+                    DimId::Overworld,
+                    chunk.0,
+                    chunk.1,
+                    &mut nearby,
+                    source_lists,
+                );
+                nearby
+            });
             match try_nightly_monster_at(pos, etype, cap, light_sources) {
                 NightlySpawnAttempt::Rejected => continue,
                 NightlySpawnAttempt::AtCap => return,
@@ -1643,6 +1815,165 @@ mod natural_spawner_tests {
             ) > 0
         );
     }
+
+    fn spawn_scratch_capacities() -> [usize; 8] {
+        SPAWN_TICK_SCRATCH.with(|cell| {
+            let s = cell.borrow();
+            [
+                s.players_xyz.capacity(),
+                s.players_eid.capacity(),
+                s.spawn_chunks.capacity(),
+                s.loaded_chunks.capacity(),
+                s.chunk_players.capacity(),
+                s.sources.capacity(),
+                s.census.capacity(),
+                s.caps.potential.charges.capacity(),
+            ]
+        })
+    }
+
+    #[test]
+    fn xpoll_entity_scratch_spawner_reset_matches_fresh_state_with_zero_growth() {
+        let players = [7u64, 9, 7, 11];
+        let cost = MobSpawnCost {
+            energy_budget: 8.0,
+            charge: 0.5,
+        };
+        let record = |state: &mut NaturalSpawnState| {
+            for (cat, pos) in [
+                (MobCategory::Monster, pos(16, 64, 0)),
+                (MobCategory::Monster, pos(32, 64, 0)),
+                (MobCategory::Creature, pos(48, 64, 0)),
+            ] {
+                state.count_existing(cat, pos, Some(cost), &players);
+            }
+            state.record_success(MobCategory::Monster, pos(64, 64, 0), Some(cost), &players);
+        };
+
+        // A reset pooled state behaves exactly like a fresh one on the same
+        // inputs: identical global/local caps, counts and potential checks.
+        let mut fresh = NaturalSpawnState::new(289, true);
+        record(&mut fresh);
+        let mut pooled = NaturalSpawnState::new(17, false);
+        pooled.record_success(MobCategory::WaterAmbient, pos(0, 0, 0), Some(cost), &[1]);
+        pooled.reset(289, true);
+        record(&mut pooled);
+        for cat in [
+            MobCategory::Monster,
+            MobCategory::Creature,
+            MobCategory::Ambient,
+        ] {
+            assert_eq!(fresh.count(cat), pooled.count(cat), "count({cat:?})");
+            for far in [pos(0, 64, 0), pos(1024, 70, -512)] {
+                assert_eq!(
+                    fresh.can_spawn(cat, far, Some(cost), &players),
+                    pooled.can_spawn(cat, far, Some(cost), &players),
+                    "can_spawn({cat:?}, {far:?})"
+                );
+            }
+        }
+        let fresh_caps = fresh.local_caps.as_ref().unwrap();
+        let pooled_caps = pooled.local_caps.as_ref().unwrap();
+        for id in players {
+            assert_eq!(
+                fresh_caps.count(id, MobCategory::Monster),
+                pooled_caps.count(id, MobCategory::Monster),
+                "local count player {id}"
+            );
+        }
+
+        // The pooled path: mob-cap sweep over the TLS scratch. After warmup,
+        // 500 passes must not grow any retained buffer.
+        let mut lcg = Lcg::new(0xC0FFEE);
+        let mut fill = |s: &mut SpawnTickScratch, n: usize| {
+            s.players_xyz.clear();
+            s.players_eid.clear();
+            s.spawn_chunks.clear();
+            s.loaded_chunks.clear();
+            s.chunk_players.clear();
+            s.loaded_chunks.clear();
+            s.census.clear();
+            for i in 0..n {
+                let id = i as u64;
+                s.players_xyz.push((i as f64, 64.0, -(i as f64)));
+                s.players_eid.push((id, [i as f64, 64.0, -(i as f64)]));
+                s.spawn_chunks.insert((i as i32 >> 4, 0));
+                s.loaded_chunks.insert((i as i32 >> 4, 0));
+                s.chunk_players
+                    .entry((i as i32 >> 4, 0))
+                    .or_insert_with(|| s.chunk_player_lists.pop().unwrap_or_default())
+                    .push(id);
+                s.census.push(("minecraft:zombie", pos(i as i32, 64, 0)));
+            }
+            let mut nearby = s.gen_sources.pop().unwrap_or_default();
+            nearby.insert((0, 0), vec![((0, 64, 0), 15u8)]);
+            s.sources.insert((0, 0), nearby);
+            s.caps.reset(s.chunk_players.len() as u32, true);
+            for i in 0..n {
+                let cat = if lcg.next_bound(2) == 0 {
+                    MobCategory::Monster
+                } else {
+                    MobCategory::Creature
+                };
+                s.caps.count_existing(
+                    cat,
+                    pos(i as i32, 64, 0),
+                    Some(cost),
+                    s.chunk_players
+                        .get(&(i as i32 >> 4, 0))
+                        .map_or(&[], Vec::as_slice),
+                );
+            }
+        };
+        with_spawn_scratch(|s| fill(s, 200));
+        let before = spawn_scratch_capacities();
+        let start = Instant::now();
+        for _ in 0..500 {
+            with_spawn_scratch(|s| fill(s, 200));
+        }
+        let pooled_us = start.elapsed().as_micros();
+        assert_eq!(
+            before,
+            spawn_scratch_capacities(),
+            "spawn scratch must hold steady capacity across 500 passes"
+        );
+        assert!(
+            before.iter().all(|&cap| cap > 0),
+            "every pooled buffer must be populated by warmup: {before:?}"
+        );
+
+        // Fresh-alloc reference for the same sweep (per-pass state + sets).
+        let mut lcg = Lcg::new(0xC0FFEE);
+        let fresh_start = Instant::now();
+        for _ in 0..500 {
+            let mut chunk_players = HashMap::<(i32, i32), Vec<u64>>::new();
+            for i in 0..200usize {
+                let id = i as u64;
+                chunk_players.entry((i as i32 >> 4, 0)).or_default().push(id);
+            }
+            let mut state = NaturalSpawnState::new(chunk_players.len() as u32, true);
+            for i in 0..200usize {
+                let cat = if lcg.next_bound(2) == 0 {
+                    MobCategory::Monster
+                } else {
+                    MobCategory::Creature
+                };
+                state.count_existing(
+                    cat,
+                    pos(i as i32, 64, 0),
+                    Some(cost),
+                    chunk_players
+                        .get(&(i as i32 >> 4, 0))
+                        .map_or(&[], Vec::as_slice),
+                );
+            }
+            std::hint::black_box(state.count(MobCategory::Monster));
+        }
+        let fresh_us = fresh_start.elapsed().as_micros();
+        eprintln!(
+            "xpoll_entity_scratch_spawner: fresh {fresh_us}us vs pooled {pooled_us}us over 500 sweeps"
+        );
+    }
 }
 
 include!("nether_spawn_rules.rs");
@@ -1746,39 +2077,55 @@ impl NetherSpawnQueries for LiveNetherSpawnQueries<'_> {
 }
 
 fn spawn_nether_natural(tick: u64) {
+    with_spawn_scratch(|scratch| spawn_nether_natural_scratch(tick, scratch));
+}
+
+fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
+    let SpawnTickScratch {
+        players_eid: players,
+        chunk_players: chunks,
+        chunk_player_lists,
+        loaded_chunks: loaded,
+        census,
+        fortresses,
+        nether_light,
+        caps,
+        ..
+    } = scratch;
     let clients = client_snapshot();
-    let players: Vec<_> = clients
-        .iter()
-        .filter_map(|client| {
-            if client.is_spectator() {
-                return None;
-            }
-            let (dim, x, y, z, ..) = client_dim_pos(client);
-            (dim == NETHER_SPAWN_DIM).then_some((client.eid as u64, [x, y, z]))
-        })
-        .collect();
+    players.clear();
+    players.extend(clients.iter().filter_map(|client| {
+        if client.is_spectator() {
+            return None;
+        }
+        let (dim, x, y, z, ..) = client_dim_pos(client);
+        (dim == NETHER_SPAWN_DIM).then_some((client.eid as u64, [x, y, z]))
+    }));
     let Some(reg) = breg().filter(|_| !players.is_empty()) else {
         return;
     };
 
-    let mut chunks = HashMap::<_, Vec<_>>::new();
-    let mut loaded = HashSet::new();
+    chunks.clear();
+    loaded.clear();
     for client in &clients {
         let held = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
         if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == NETHER_SPAWN_DIM {
             loaded.extend(held.iter().copied());
         }
     }
-    for &(eid, [x, _, z]) in &players {
+    for &(eid, [x, _, z]) in players.iter() {
         let (cx, cz) = (x.floor() as i32 >> 4, z.floor() as i32 >> 4);
         for dx in -NATURAL_SPAWN_CHUNK_RADIUS..=NATURAL_SPAWN_CHUNK_RADIUS {
             for dz in -NATURAL_SPAWN_CHUNK_RADIUS..=NATURAL_SPAWN_CHUNK_RADIUS {
-                chunks.entry((cx + dx, cz + dz)).or_default().push(eid);
+                chunks
+                    .entry((cx + dx, cz + dz))
+                    .or_insert_with(|| chunk_player_lists.pop().unwrap_or_default())
+                    .push(eid);
             }
         }
     }
-    let mut caps = NaturalSpawnState::new(chunks.len() as u32, true);
-    let mut census = Vec::new();
+    caps.reset(chunks.len() as u32, true);
+    census.clear();
     {
         let current = mobs().lock().unwrap_or_else(|e| e.into_inner());
         if current.len() >= MOB_CAP {
@@ -1826,7 +2173,7 @@ fn spawn_nether_natural(tick: u64) {
     let query = LiveNetherSpawnQueries {
         reg,
         clients: &clients,
-        light: RefCell::default(),
+        light: RefCell::new(std::mem::take(nether_light)),
     };
     // The Nether has many floors below the roof. Sample a slice near the anchor,
     // then look down for one open surface instead of using the column's top.
@@ -1838,7 +2185,7 @@ fn spawn_nether_natural(tick: u64) {
     }) else {
         return;
     };
-    let mut costs = SpawnCostState::from_existing(census, |pos, chunk| {
+    let mut costs = SpawnCostState::from_existing(census.iter().copied(), |pos, chunk| {
         if !loaded.contains(&chunk) {
             return None;
         }
@@ -1852,7 +2199,7 @@ fn spawn_nether_natural(tick: u64) {
     let (min_x, min_z, max_x, max_z) = world_border().lock().unwrap_or_else(|e| e.into_inner()).bounds(border_now_ms());
     // DerivedLevelData uses the same shared spawn position in the Nether.
     let (sx, sy, sz, _) = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-    let mut fortresses = HashMap::new();
+    fortresses.clear();
     let inside = |bb: &[i32; 6], pos: NaturalSpawnPos| {
         (bb[0]..=bb[3]).contains(&pos.x)
             && (bb[1]..=bb[4]).contains(&pos.y)
@@ -2002,6 +2349,9 @@ fn spawn_nether_natural(tick: u64) {
             }
         }
     }
+    // The populated light cache returns to the scratch; recycle clears it.
+    let LiveNetherSpawnQueries { light, .. } = query;
+    *nether_light = light.into_inner();
 }
 
 fn nether_spawn_in_fluid(

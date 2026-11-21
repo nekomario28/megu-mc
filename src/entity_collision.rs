@@ -63,21 +63,36 @@ impl EntityAabb {
     }
 }
 
-/// 1.21.1 `BlockCollisions` (`dca.<init>` and `dca.computeNext`) world block collision reader.
-/// Scans `[floor(min - 1e-7) - 1 ..= floor(max + 1e-7) + 1]` on all three axes so blocks
-/// with shapes extending outside `[0, 1]^3` (such as 1.5-block fences/walls/gates) are visited
-/// even when `min[1]` sits above `by` (e.g. after step-up), then filters by `aabb_overlaps`.
-fn collect_block_collision_boxes(min: [f64; 3], max: [f64; 3]) -> Vec<([f64; 3], [f64; 3])> {
-    let Some(reg) = crate::block_registry::breg() else {
-        return Vec::new();
-    };
+/// The 1.21.1 `BlockCollisions` (`dca.<init>`) block window shared by the boxed
+/// collector and the early-exit `any` probe: `[floor(min - 1e-7) - 1 ..=
+/// floor(max + 1e-7) + 1]` on all three axes so blocks with shapes extending
+/// outside `[0, 1]^3` (such as 1.5-block fences/walls/gates) are visited even
+/// when `min[1]` sits above `by` (e.g. after step-up).
+#[inline]
+fn block_collision_window(min: [f64; 3], max: [f64; 3]) -> (i32, i32, i32, i32, i32, i32) {
     let bx0 = (min[0] - 1e-7).floor() as i32 - 1;
     let bx1 = (max[0] + 1e-7).floor() as i32 + 1;
     let by0 = (min[1] - 1e-7).floor() as i32 - 1;
     let by1 = (max[1] + 1e-7).floor() as i32 + 1;
     let bz0 = (min[2] - 1e-7).floor() as i32 - 1;
     let bz1 = (max[2] + 1e-7).floor() as i32 + 1;
-    let mut boxes = Vec::new();
+    (bx0, bx1, by0, by1, bz0, bz1)
+}
+
+/// 1.21.1 `BlockCollisions` (`dca.computeNext`) world block collision reader
+/// appending to `out` (cleared first). The sweep window is
+/// [`block_collision_window`]; a caller-owned buffer turns the per-tick
+/// `Vec` allocation into reuse.
+fn collect_block_collision_boxes_into(
+    min: [f64; 3],
+    max: [f64; 3],
+    out: &mut Vec<([f64; 3], [f64; 3])>,
+) {
+    out.clear();
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    let (bx0, bx1, by0, by1, bz0, bz1) = block_collision_window(min, max);
     for by in by0..=by1 {
         for bz in bz0..=bz1 {
             for bx in bx0..=bx1 {
@@ -94,12 +109,54 @@ fn collect_block_collision_boxes(min: [f64; 3], max: [f64; 3]) -> Vec<([f64; 3],
                         bz as f64 + bmax[2],
                     ];
                     if aabb_overlaps((min, max), (wmin, wmax)) {
-                        boxes.push((wmin, wmax));
+                        out.push((wmin, wmax));
                     }
                 }
             }
         }
     }
+}
+
+/// `!collect_block_collision_boxes(min, max).is_empty()` without materializing
+/// the list: stops at the first overlapping block box. Same window, same
+/// `aabb_overlaps` filter — the emptiness answer is identical.
+fn any_block_collision_box(min: [f64; 3], max: [f64; 3]) -> bool {
+    let Some(reg) = crate::block_registry::breg() else {
+        return false;
+    };
+    let (bx0, bx1, by0, by1, bz0, bz1) = block_collision_window(min, max);
+    for by in by0..=by1 {
+        for bz in bz0..=bz1 {
+            for bx in bx0..=bx1 {
+                let st = block_at(bx, by, bz);
+                for (bmin, bmax) in reg.collision_boxes(st) {
+                    let wmin = [
+                        bx as f64 + bmin[0],
+                        by as f64 + bmin[1],
+                        bz as f64 + bmin[2],
+                    ];
+                    let wmax = [
+                        bx as f64 + bmax[0],
+                        by as f64 + bmax[1],
+                        bz as f64 + bmax[2],
+                    ];
+                    if aabb_overlaps((min, max), (wmin, wmax)) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 1.21.1 `BlockCollisions` (`dca.<init>` and `dca.computeNext`) world block collision reader.
+/// Scans `[floor(min - 1e-7) - 1 ..= floor(max + 1e-7) + 1]` on all three axes so blocks
+/// with shapes extending outside `[0, 1]^3` (such as 1.5-block fences/walls/gates) are visited
+/// even when `min[1]` sits above `by` (e.g. after step-up), then filters by `aabb_overlaps`.
+fn collect_block_collision_boxes(min: [f64; 3], max: [f64; 3]) -> Vec<([f64; 3], [f64; 3])> {
+    let mut boxes = Vec::new();
+    collect_block_collision_boxes_into(min, max, &mut boxes);
     boxes
 }
 
@@ -187,14 +244,16 @@ fn collide_with_shapes(
 }
 
 /// 1.21.1 `Entity.collectCandidateStepUpHeights(AABB, List<VoxelShape>, float, float)`
-/// (`bsr.a(ewx, List, F, F)`).
+/// (`bsr.a(ewx, List, F, F)`). Writes the sorted, deduplicated heights into
+/// `out` (cleared first) so the caller can reuse one buffer per collide.
 fn collect_candidate_step_up_heights(
     aabb: EntityAabb,
     boxes: &[([f64; 3], [f64; 3])],
     max_up_step: f32,
     y_clipped: f32,
-) -> Vec<f32> {
-    let mut heights = Vec::with_capacity(4);
+    out: &mut Vec<f32>,
+) {
+    out.clear();
     for &(b_min, b_max) in boxes {
         for d in [b_min[1], b_max[1]] {
             let f = (d - aabb.min_y) as f32;
@@ -205,37 +264,99 @@ fn collect_candidate_step_up_heights(
                 break;
             }
             let f_norm = if f == 0.0 { 0.0 } else { f };
-            if !heights.contains(&f_norm) {
-                heights.push(f_norm);
+            if !out.contains(&f_norm) {
+                out.push(f_norm);
             }
         }
     }
-    heights.sort_by(f32::total_cmp);
-    heights
+    out.sort_by(f32::total_cmp);
 }
 
-/// 1.21.1 `Entity.collide(Vec3)` (`bsr.a(exc)`) + `Entity.move` collision flags (`bsr.a(bts, exc)`).
-fn entity_collide(
+/// Reusable buffers for one `entity_collide`: the world-box list of the
+/// movement sweep, the step-up sweep's list, and the candidate step heights.
+/// Kept per-thread because the tick loop's collide calls are strictly
+/// sequential.
+#[derive(Default)]
+struct CollideScratch {
+    shapes: Vec<([f64; 3], [f64; 3])>,
+    step_shapes: Vec<([f64; 3], [f64; 3])>,
+    step_heights: Vec<f32>,
+}
+
+/// Retained-capacity bound for each reused collision buffer. A rare oversized
+/// sweep (giant AABB or dense geometry) must not pin its peak capacity in the
+/// thread-local scratch forever; past this bound the buffer is shrunk before
+/// it is stashed back.
+const COLLIDE_SCRATCH_KEEP_BYTES: usize = 256 * 1024;
+
+fn bound_collide_vec<T>(v: &mut Vec<T>) {
+    let keep = COLLIDE_SCRATCH_KEEP_BYTES / std::mem::size_of::<T>().max(1);
+    if v.capacity() > keep {
+        v.shrink_to(keep);
+    }
+}
+
+fn bound_collide_scratch(scratch: &mut CollideScratch) {
+    bound_collide_vec(&mut scratch.shapes);
+    bound_collide_vec(&mut scratch.step_shapes);
+    bound_collide_vec(&mut scratch.step_heights);
+}
+
+thread_local! {
+    static COLLIDE_SCRATCH: std::cell::RefCell<CollideScratch> = const {
+        std::cell::RefCell::new(CollideScratch {
+            shapes: Vec::new(),
+            step_shapes: Vec::new(),
+            step_heights: Vec::new(),
+        })
+    };
+}
+
+/// Borrow the per-thread collide scratch for `f`. The collector only reads
+/// world blocks and never reaches back into this scratch, but a reentrant
+/// caller still falls back to fresh buffers with identical math.
+fn with_collide_scratch<R>(f: impl FnOnce(&mut CollideScratch) -> R) -> R {
+    COLLIDE_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => {
+            let result = f(&mut scratch);
+            bound_collide_scratch(&mut scratch);
+            result
+        }
+        Err(_) => f(&mut CollideScratch::default()),
+    })
+}
+
+/// `entity_collide` with caller-owned `scratch` and a `collect_world_boxes`
+/// that appends into a supplied `Vec` instead of allocating one per sweep.
+fn entity_collide_scratch(
     aabb: EntityAabb,
     delta: [f64; 3],
     on_ground: bool,
     max_up_step: f32,
     extra_boxes: &[([f64; 3], [f64; 3])],
-    mut collect_world_boxes: impl FnMut(EntityAabb) -> Vec<([f64; 3], [f64; 3])>,
+    mut collect_world_boxes: impl FnMut(EntityAabb, &mut Vec<([f64; 3], [f64; 3])>),
+    scratch: &mut CollideScratch,
 ) -> CollideResult {
     let len_sq = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
-    let vec3 = if len_sq == 0.0 {
-        delta
-    } else {
-        let sweep = aabb.expand_towards(delta[0], delta[1], delta[2]);
-        let mut shapes = collect_world_boxes(sweep);
-        for &(emin, emax) in extra_boxes {
-            if aabb_overlaps((sweep.min(), sweep.max()), (emin, emax)) {
-                shapes.push((emin, emax));
-            }
+    // A stationary entity resolves to its requested delta untouched: no sweep,
+    // no world-box read, no step-up — the flags all compute to false below.
+    if len_sq == 0.0 {
+        return CollideResult {
+            delta,
+            horizontal_collision: false,
+            vertical_collision: false,
+            vertical_collision_below: false,
+            stepped_up: false,
+        };
+    }
+    let sweep = aabb.expand_towards(delta[0], delta[1], delta[2]);
+    collect_world_boxes(sweep, &mut scratch.shapes);
+    for &(emin, emax) in extra_boxes {
+        if aabb_overlaps((sweep.min(), sweep.max()), (emin, emax)) {
+            scratch.shapes.push((emin, emax));
         }
-        collide_with_shapes(delta, aabb, &shapes)
-    };
+    }
+    let vec3 = collide_with_shapes(delta, aabb, &scratch.shapes);
 
     let x_changed = delta[0] != vec3[0];
     let y_changed = delta[1] != vec3[1];
@@ -255,17 +376,23 @@ fn entity_collide(
         if !initial_vertical_below {
             aabb3 = aabb3.expand_towards(0.0, f64::from(-1.0e-5f32), 0.0);
         }
-        let mut shapes2 = collect_world_boxes(aabb3);
+        collect_world_boxes(aabb3, &mut scratch.step_shapes);
         for &(emin, emax) in extra_boxes {
             if aabb_overlaps((aabb3.min(), aabb3.max()), (emin, emax)) {
-                shapes2.push((emin, emax));
+                scratch.step_shapes.push((emin, emax));
             }
         }
         let base_h_dist_sq = vec3[0] * vec3[0] + vec3[2] * vec3[2];
-        let heights =
-            collect_candidate_step_up_heights(aabb2, &shapes2, max_up_step, vec3[1] as f32);
-        for h in heights {
-            let cand = collide_with_shapes([delta[0], f64::from(h), delta[2]], aabb2, &shapes2);
+        collect_candidate_step_up_heights(
+            aabb2,
+            &scratch.step_shapes,
+            max_up_step,
+            vec3[1] as f32,
+            &mut scratch.step_heights,
+        );
+        for &h in &scratch.step_heights {
+            let cand =
+                collide_with_shapes([delta[0], f64::from(h), delta[2]], aabb2, &scratch.step_shapes);
             let cand_h_dist_sq = cand[0] * cand[0] + cand[2] * cand[2];
             if cand_h_dist_sq > base_h_dist_sq {
                 let d = aabb.min_y - aabb2.min_y;
@@ -294,6 +421,26 @@ fn entity_collide(
     }
 }
 
+/// 1.21.1 `Entity.collide(Vec3)` (`bsr.a(exc)`) + `Entity.move` collision flags (`bsr.a(bts, exc)`).
+fn entity_collide(
+    aabb: EntityAabb,
+    delta: [f64; 3],
+    on_ground: bool,
+    max_up_step: f32,
+    extra_boxes: &[([f64; 3], [f64; 3])],
+    mut collect_world_boxes: impl FnMut(EntityAabb) -> Vec<([f64; 3], [f64; 3])>,
+) -> CollideResult {
+    entity_collide_scratch(
+        aabb,
+        delta,
+        on_ground,
+        max_up_step,
+        extra_boxes,
+        |sweep, out| *out = collect_world_boxes(sweep),
+        &mut CollideScratch::default(),
+    )
+}
+
 fn entity_collide_world(
     aabb: EntityAabb,
     delta: [f64; 3],
@@ -301,8 +448,16 @@ fn entity_collide_world(
     max_up_step: f32,
     extra_boxes: &[([f64; 3], [f64; 3])],
 ) -> CollideResult {
-    entity_collide(aabb, delta, on_ground, max_up_step, extra_boxes, |sweep| {
-        collect_block_collision_boxes(sweep.min(), sweep.max())
+    with_collide_scratch(|scratch| {
+        entity_collide_scratch(
+            aabb,
+            delta,
+            on_ground,
+            max_up_step,
+            extra_boxes,
+            |sweep, out| collect_block_collision_boxes_into(sweep.min(), sweep.max(), out),
+            scratch,
+        )
     })
 }
 
@@ -717,5 +872,122 @@ mod entity_collision_tests {
             "cow (half_w=0.45) must stop before 1.0-block wall at x=1.0: {cow_pos:?}"
         );
         assert_eq!(cow_pos.1, 64.0);
+    }
+
+    fn collide_scratch_capacities() -> (usize, usize, usize) {
+        COLLIDE_SCRATCH.with(|cell| {
+            let scratch = cell.borrow();
+            (
+                scratch.shapes.capacity(),
+                scratch.step_shapes.capacity(),
+                scratch.step_heights.capacity(),
+            )
+        })
+    }
+
+    #[test]
+    fn xpoll_entity_scratch_collide_matches_allocating_path_with_zero_growth() {
+        // Synthetic geometry: ground plane, a half-block step wall and a
+        // full-block wall so both the movement sweep and the step-up sweep
+        // collect shapes on every iteration.
+        let world: Vec<([f64; 3], [f64; 3])> = vec![
+            ([-64.0, -1.0, -64.0], [64.0, 0.0, 64.0]),
+            ([1.0, 0.0, -2.0], [1.5, 0.5, 2.0]),
+            ([3.0, 0.0, -2.0], [4.0, 2.0, 2.0]),
+        ];
+        let deltas = [
+            [0.5, 0.0, 0.0],
+            [0.0, 0.0, -0.75],
+            [0.4, 0.0, 0.3],
+            [-0.2, -0.1, 0.2],
+            [0.25, -0.05, 0.25],
+            [0.0, 0.0, 0.0],
+        ];
+        // The pooled sweep writes into the scratch Vec without an
+        // intermediate allocation, mirroring `collect_block_collision_boxes_into`.
+        let pooled = |aabb: EntityAabb, delta: [f64; 3], on_ground: bool| {
+            with_collide_scratch(|scratch| {
+                entity_collide_scratch(
+                    aabb,
+                    delta,
+                    on_ground,
+                    0.6,
+                    &[],
+                    |sweep, out| {
+                        out.clear();
+                        let (smin, smax) = (sweep.min(), sweep.max());
+                        out.extend(
+                            world
+                                .iter()
+                                .copied()
+                                .filter(|&b| aabb_overlaps((smin, smax), b)),
+                        );
+                    },
+                    scratch,
+                )
+            })
+        };
+
+        // Bit-identical parity across 500 collide calls including a
+        // stationary (zero-delta) one every sixth call. One warmup of each
+        // path keeps lazy-init out of the timed loops.
+        let aabb = EntityAabb::from_min_max([0.0, 0.0, 0.0], [0.6, 1.8, 0.6]);
+        let _ = entity_collide(aabb, [0.5, 0.0, 0.0], true, 0.6, &[], |s| {
+            slice_boxes(&world, s)
+        });
+        let _ = pooled(aabb, [0.5, 0.0, 0.0], true);
+        let fresh_start = Instant::now();
+        let mut expected = Vec::with_capacity(500);
+        for i in 0..500usize {
+            let delta = deltas[i % deltas.len()];
+            let probe = aabb.offset((i % 9) as f64 * 0.25, 0.0, -((i % 5) as f64) * 0.4);
+            expected.push(entity_collide(probe, delta, i % 2 == 0, 0.6, &[], |s| {
+                slice_boxes(&world, s)
+            }));
+        }
+        let fresh_us = fresh_start.elapsed().as_micros();
+        let pooled_start = Instant::now();
+        for i in 0..500usize {
+            let delta = deltas[i % deltas.len()];
+            let probe = aabb.offset((i % 9) as f64 * 0.25, 0.0, -((i % 5) as f64) * 0.4);
+            let actual = pooled(probe, delta, i % 2 == 0);
+            assert_eq!(expected[i], actual, "collide #{i} must be bit-identical");
+        }
+        let pooled_us = pooled_start.elapsed().as_micros();
+        eprintln!(
+            "xpoll_entity_scratch_collide: fresh {fresh_us}us vs pooled {pooled_us}us over 500 calls"
+        );
+
+        // Warmup already happened; 500 more calls must not grow the scratch.
+        let before = collide_scratch_capacities();
+        for i in 0..500usize {
+            let delta = deltas[i % deltas.len()];
+            let probe = aabb.offset((i % 9) as f64 * 0.25, 0.0, -((i % 5) as f64) * 0.4);
+            let _ = pooled(probe, delta, i % 2 == 0);
+        }
+        assert_eq!(
+            before,
+            collide_scratch_capacities(),
+            "collide scratch must hold steady capacity after warmup"
+        );
+        assert!(
+            before.0 > 0 && before.1 > 0 && before.2 > 0,
+            "warmup must have populated all three scratch buffers: {before:?}"
+        );
+
+        // The stationary early-out returns the requested delta with all flags
+        // false and never consults the world collector — identical to the
+        // allocating path's result.
+        let still = aabb.offset(64.0, 0.0, 64.0);
+        let expected_still = entity_collide(still, [0.0; 3], true, 0.6, &[], |s| {
+            slice_boxes(&world, s)
+        });
+        let actual_still = with_collide_scratch(|scratch| {
+            entity_collide_scratch(still, [0.0; 3], true, 0.6, &[], |_, out| {
+                out.clear();
+                panic!("stationary early-out must not read the world");
+            }, scratch)
+        });
+        assert_eq!(expected_still, actual_still);
     }
 }

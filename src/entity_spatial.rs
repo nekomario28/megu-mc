@@ -48,6 +48,121 @@ struct EntitySpatialGrid {
     cell_entries: Vec<u32>,
 }
 
+/// Retained-capacity bound for each reused spatial buffer. A burst of entities
+/// far above the steady-state working set must not pin its peak capacity in
+/// the thread-local pool forever; past this bound a stashed buffer is shrunk.
+const SPATIAL_POOL_KEEP_BYTES: usize = 256 * 1024;
+
+fn bound_spatial_vec<T>(v: &mut Vec<T>) {
+    let keep = SPATIAL_POOL_KEEP_BYTES / std::mem::size_of::<T>().max(1);
+    if v.capacity() > keep {
+        v.shrink_to(keep);
+    }
+}
+
+fn bound_spatial_cells(cells: &mut HashMap<(i32, i32), (u32, u32)>) {
+    let keep =
+        SPATIAL_POOL_KEEP_BYTES / std::mem::size_of::<((i32, i32), (u32, u32))>().max(1);
+    if cells.capacity() > keep {
+        cells.shrink_to(keep);
+    }
+}
+
+/// Buffers a dropped [`EntitySpatialGrid`] returns for the next rebuild, plus
+/// the dedup stamp/output pair for ad-hoc neighbor queries. Rebuilds run on
+/// the tick thread every tick, so one pool slot per buffer is enough.
+#[derive(Default)]
+struct SpatialPool {
+    entities: Vec<SpatialEntity>,
+    cells: HashMap<(i32, i32), (u32, u32)>,
+    cell_entries: Vec<u32>,
+    query_scratch: SpatialScratch,
+    query_out: Vec<u32>,
+}
+
+thread_local! {
+    static SPATIAL_POOL: std::cell::RefCell<SpatialPool> =
+        std::cell::RefCell::new(SpatialPool {
+            entities: Vec::new(),
+            cells: HashMap::new(),
+            cell_entries: Vec::new(),
+            query_scratch: SpatialScratch::default(),
+            query_out: Vec::new(),
+        });
+}
+
+/// Take the pooled cell map and entry array (empty, capacity retained) for a
+/// grid rebuild.
+fn spatial_pool_take_cells() -> (HashMap<(i32, i32), (u32, u32)>, Vec<u32>) {
+    SPATIAL_POOL.with(|pool| {
+        pool.try_borrow_mut()
+            .map(|mut pool| {
+                (
+                    std::mem::take(&mut pool.cells),
+                    std::mem::take(&mut pool.cell_entries),
+                )
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Take the pooled entity snapshot vector (empty, capacity retained).
+fn spatial_pool_take_entities() -> Vec<SpatialEntity> {
+    SPATIAL_POOL.with(|pool| {
+        pool.try_borrow_mut()
+            .map(|mut pool| std::mem::take(&mut pool.entities))
+            .unwrap_or_default()
+    })
+}
+
+/// Return a dropped grid's buffers to the pool, bounded at
+/// [`SPATIAL_POOL_KEEP_BYTES`]. The pool keeps whichever side holds more
+/// capacity so a small grid never evicts a larger warmed buffer.
+fn spatial_pool_stash(
+    mut entities: Vec<SpatialEntity>,
+    mut cells: HashMap<(i32, i32), (u32, u32)>,
+    mut cell_entries: Vec<u32>,
+) {
+    entities.clear();
+    cells.clear();
+    cell_entries.clear();
+    bound_spatial_vec(&mut entities);
+    bound_spatial_cells(&mut cells);
+    bound_spatial_vec(&mut cell_entries);
+    let _ = SPATIAL_POOL.try_with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut() {
+            if entities.capacity() > pool.entities.capacity() {
+                pool.entities = entities;
+            }
+            if cells.capacity() > pool.cells.capacity() {
+                pool.cells = cells;
+            }
+            if cell_entries.capacity() > pool.cell_entries.capacity() {
+                pool.cell_entries = cell_entries;
+            }
+        }
+    });
+}
+
+/// Borrow the per-thread neighbor-query buffers (dedup stamp + output slots)
+/// for one query batch. `SpatialScratch` creation is free, but its `seen`
+/// vector has to grow to the entity count once; pooling it amortizes that
+/// growth across every ad-hoc query on the thread.
+fn with_spatial_query_scratch<R>(
+    f: impl FnOnce(&mut SpatialScratch, &mut Vec<u32>) -> R,
+) -> R {
+    SPATIAL_POOL.with(|pool| match pool.try_borrow_mut() {
+        Ok(mut pool) => {
+            let pool = &mut *pool;
+            let result = f(&mut pool.query_scratch, &mut pool.query_out);
+            bound_spatial_vec(&mut pool.query_scratch.seen);
+            bound_spatial_vec(&mut pool.query_out);
+            result
+        }
+        Err(_) => f(&mut SpatialScratch::default(), &mut Vec::new()),
+    })
+}
+
 #[inline]
 fn spatial_chunk_coord(v: f64) -> i32 {
     (v.floor() as i32) >> 4
@@ -59,13 +174,23 @@ fn mob_type_is_pushable(etype: i64) -> bool {
     !matches!(etype, 3 | 6)
 }
 
+impl std::ops::Drop for EntitySpatialGrid {
+    fn drop(&mut self) {
+        spatial_pool_stash(
+            std::mem::take(&mut self.entities),
+            std::mem::take(&mut self.cells),
+            std::mem::take(&mut self.cell_entries),
+        );
+    }
+}
+
 impl EntitySpatialGrid {
     fn from_entities(entities: Vec<SpatialEntity>) -> Self {
         // Pass 1: per-chunk entity counts. The single `cells` map holds
         // `(0, count)` — range start in the first field, write cursor in the
         // second — so the separate `counts` map disappears.
-        let mut cells: HashMap<(i32, i32), (u32, u32)> =
-            HashMap::with_capacity(entities.len().max(1));
+        let (mut cells, mut cell_entries) = spatial_pool_take_cells();
+        cells.clear();
         let mut total_entries = 0usize;
 
         for ent in &entities {
@@ -103,7 +228,8 @@ impl EntitySpatialGrid {
 
         // Pass 2: fill `cell_entries` through the per-cell cursors. After the
         // pass each value reads `(start, start + count)` — the query range.
-        let mut cell_entries = vec![0u32; total_entries];
+        cell_entries.clear();
+        cell_entries.resize(total_entries, 0);
         for (slot, ent) in entities.iter().enumerate() {
             if !ent.aabb.min_x.is_finite()
                 || !ent.aabb.max_x.is_finite()
@@ -137,7 +263,9 @@ impl EntitySpatialGrid {
     }
 
     fn build_mobs_and_clients(mobs_snap: &[Arc<Mob>], cls_snap: &[Arc<Client>]) -> Self {
-        let mut entities = Vec::with_capacity(mobs_snap.len() + cls_snap.len());
+        let mut entities = spatial_pool_take_entities();
+        entities.clear();
+        entities.reserve(mobs_snap.len() + cls_snap.len());
         for (idx, m) in mobs_snap.iter().enumerate() {
             let (x, y, z, _, _) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
             let alive = *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
@@ -237,9 +365,10 @@ impl EntitySpatialGrid {
 
     #[allow(dead_code)]
     fn query_aabb(&self, aabb: EntityAabb, exclude_eid: i32) -> Vec<u32> {
-        let mut scratch = SpatialScratch::default();
         let mut out = Vec::new();
-        self.query_aabb_into(aabb, exclude_eid, &mut scratch, &mut out);
+        with_spatial_query_scratch(|scratch, _| {
+            self.query_aabb_into(aabb, exclude_eid, scratch, &mut out)
+        });
         out
     }
 
@@ -304,9 +433,10 @@ impl EntitySpatialGrid {
 
     #[allow(dead_code)]
     fn query_radius_xz(&self, x: f64, z: f64, r: f64, exclude_eid: i32) -> Vec<u32> {
-        let mut scratch = SpatialScratch::default();
         let mut out = Vec::new();
-        self.query_radius_xz_into(x, z, r, exclude_eid, &mut scratch, &mut out);
+        with_spatial_query_scratch(|scratch, _| {
+            self.query_radius_xz_into(x, z, r, exclude_eid, scratch, &mut out)
+        });
         out
     }
 }
@@ -739,5 +869,144 @@ mod entity_spatial_tests {
                 ent.eid
             );
         }
+    }
+
+    fn spatial_pool_capacities() -> (usize, usize, usize, usize, usize) {
+        SPATIAL_POOL.with(|pool| {
+            let pool = pool.borrow();
+            (
+                pool.entities.capacity(),
+                pool.cells.capacity(),
+                pool.cell_entries.capacity(),
+                pool.query_scratch.seen.capacity(),
+                pool.query_out.capacity(),
+            )
+        })
+    }
+
+    #[test]
+    fn xpoll_entity_scratch_spatial_queries_match_bruteforce_with_zero_growth() {
+        // 500 entities straddling chunk borders so multi-cell dedup runs.
+        let entities: Vec<SpatialEntity> = (0..500usize)
+            .map(|i| {
+                let x = (i % 10) as f64 * 3.7 - 18.0;
+                let z = (i / 10) as f64 * 5.3 - 120.0;
+                SpatialEntity {
+                    idx: i,
+                    eid: i as i32 + 1,
+                    is_mob: i % 2 == 0,
+                    is_spectator: false,
+                    is_pushable: true,
+                    is_passenger: false,
+                    is_vehicle: false,
+                    no_physics: false,
+                    etype: 87,
+                    aabb: EntityAabb::from_dimensions(x, 64.0, z, 0.7, 1.3),
+                    x,
+                    z,
+                }
+            })
+            .collect();
+        let grid = EntitySpatialGrid::from_entities(entities);
+
+        // Pooled query path vs the same queries through per-call scratch; both
+        // are already brute-force verified by the grid tests above.
+        let queries: Vec<(f64, f64, f64)> = (0..500usize)
+            .map(|i| {
+                let e = &grid.entities[i];
+                (e.x + (i % 4) as f64 * 0.3, e.z - (i % 6) as f64 * 0.2, e.aabb.min_x)
+            })
+            .collect();
+
+        // Warm the pooled path so the timed loops measure steady state.
+        with_spatial_query_scratch(|scratch, out| {
+            grid.query_radius_xz_into(0.0, 0.0, 24.0, -1, scratch, out);
+        });
+
+        let fresh_start = Instant::now();
+        let mut expected = Vec::with_capacity(500);
+        for &(x, z, ax) in &queries {
+            let mut scratch = SpatialScratch::default();
+            let mut out = Vec::new();
+            grid.query_radius_xz_into(x, z, 24.0, -1, &mut scratch, &mut out);
+            let probe = EntityAabb::from_min_max([ax, 63.5, z], [ax + 0.9, 65.0, z + 0.9]);
+            grid.query_aabb_into(probe, -1, &mut scratch, &mut out);
+            expected.push(out);
+        }
+        let fresh_us = fresh_start.elapsed().as_micros();
+
+        let pooled_start = Instant::now();
+        for (i, &(x, z, ax)) in queries.iter().enumerate() {
+            let out = with_spatial_query_scratch(|scratch, out| {
+                grid.query_radius_xz_into(x, z, 24.0, -1, scratch, out);
+                let probe = EntityAabb::from_min_max([ax, 63.5, z], [ax + 0.9, 65.0, z + 0.9]);
+                grid.query_aabb_into(probe, -1, scratch, out);
+                out.clone()
+            });
+            assert_eq!(expected[i], out, "pooled query #{i} must be identical");
+        }
+        let pooled_us = pooled_start.elapsed().as_micros();
+        eprintln!(
+            "xpoll_entity_scratch_spatial: fresh {fresh_us}us vs pooled {pooled_us}us over 500 queries"
+        );
+
+        // After warmup, 500 more pooled queries must not grow the buffers.
+        let (_, _, _, seen_before, out_before) = spatial_pool_capacities();
+        for &(x, z, ax) in &queries {
+            with_spatial_query_scratch(|scratch, out| {
+                grid.query_radius_xz_into(x, z, 24.0, -1, scratch, out);
+                let probe = EntityAabb::from_min_max([ax, 63.5, z], [ax + 0.9, 65.0, z + 0.9]);
+                grid.query_aabb_into(probe, -1, scratch, out);
+            });
+        }
+        let (_, _, _, seen_after, out_after) = spatial_pool_capacities();
+        assert_eq!(seen_before, seen_after, "dedup stamp buffer must not grow");
+        assert_eq!(out_before, out_after, "pooled output buffer must not grow");
+        assert!(seen_before >= 500 && out_before > 0, "warmup must fill scratch");
+
+        // Dropping a grid returns its storage; the next rebuild reuses it
+        // instead of reallocating the entity list, cell map and entry array.
+        drop(grid);
+        let (entities_cap, cells_cap, entries_cap, _, _) = spatial_pool_capacities();
+        assert!(
+            entities_cap >= 500 && cells_cap > 0 && entries_cap > 0,
+            "dropped grid storage must be stashed for reuse: {entities_cap}/{cells_cap}/{entries_cap}"
+        );
+
+        // The rebuilt grid uses the pooled storage and stays bit-identical.
+        let rebuilt = EntitySpatialGrid::from_entities((0..500usize)
+            .map(|i| {
+                let x = (i % 10) as f64 * 3.7 - 18.0;
+                let z = (i / 10) as f64 * 5.3 - 120.0;
+                SpatialEntity {
+                    idx: i,
+                    eid: i as i32 + 1,
+                    is_mob: i % 2 == 0,
+                    is_spectator: false,
+                    is_pushable: true,
+                    is_passenger: false,
+                    is_vehicle: false,
+                    no_physics: false,
+                    etype: 87,
+                    aabb: EntityAabb::from_dimensions(x, 64.0, z, 0.7, 1.3),
+                    x,
+                    z,
+                }
+            })
+            .collect());
+        let mut scratch = SpatialScratch::default();
+        let mut hits = Vec::new();
+        let mut all = Vec::new();
+        for &(x, z, ax) in &queries {
+            rebuilt.query_radius_xz_into(x, z, 24.0, -1, &mut scratch, &mut hits);
+            let probe = EntityAabb::from_min_max([ax, 63.5, z], [ax + 0.9, 65.0, z + 0.9]);
+            rebuilt.query_aabb_into(probe, -1, &mut scratch, &mut hits);
+            all.extend_from_slice(&hits);
+        }
+        assert_eq!(
+            all,
+            expected.iter().flatten().copied().collect::<Vec<u32>>(),
+            "rebuilt-grid queries must match the first grid's results"
+        );
     }
 }
