@@ -13,5 +13,7 @@
 #![deny(unsafe_code)]
 
 pub mod blockstates;
+pub mod contraption_adapter;
 pub mod data_loader;
 pub mod factory;
+pub mod neoforge_wire;
