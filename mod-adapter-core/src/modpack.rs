@@ -1257,6 +1257,9 @@ struct CentralMember {
     comp_size: u64,
     uncomp_size: u64,
     local_offset: u64,
+    /// Any of the three size/offset fields carried the `0xFFFFFFFF` ZIP64
+    /// sentinel: the real values live in an extra field we do not decode.
+    zip64: bool,
 }
 
 /// Read the manifest member out of a pack archive: `modrinth.index.json`
@@ -1279,6 +1282,40 @@ fn pack_member_bytes(
         return Ok(None);
     };
 
+    // Later duplicates shadow earlier ones, matching `zipfile`'s
+    // `NameToInfo` last-wins table.
+    let mut modrinth: Option<CentralMember> = None;
+    let mut curseforge: Option<CentralMember> = None;
+    for (name, member) in central_dir_members(bytes, eocd, display)? {
+        if name == b"modrinth.index.json" {
+            modrinth = Some(member);
+        } else if name == b"manifest.json" {
+            curseforge = Some(member);
+        }
+    }
+
+    let (member, entry_name, format) = match (modrinth, curseforge) {
+        (Some(m), _) => (m, "modrinth.index.json", ModpackFormat::Modrinth),
+        (None, Some(m)) => (m, "manifest.json", ModpackFormat::CurseForge),
+        (None, None) => {
+            return Err(err(format!(
+                "{display}: archive contains neither modrinth.index.json nor manifest.json"
+            )))
+        }
+    };
+    let text = extract_member(bytes, &member, entry_name, display)?;
+    Ok(Some((format, text)))
+}
+
+/// Walk the central directory of a verified archive (EOCD already located
+/// by [`find_eocd`]), returning every member's name bytes and record in
+/// stored order. Shared by [`pack_member_bytes`], which picks one member,
+/// and [`zip_member_list`], which scans whole archives.
+fn central_dir_members<'a>(
+    bytes: &'a [u8],
+    eocd: usize,
+    display: &str,
+) -> Result<Vec<(&'a [u8], CentralMember)>, ModpackError> {
     let count = u16_at(bytes, eocd + 10) as usize;
     let cd_size = u32_at(bytes, eocd + 12) as u64;
     let cd_offset = u32_at(bytes, eocd + 16) as u64;
@@ -1295,10 +1332,7 @@ fn pack_member_bytes(
         .ok_or_else(|| err(format!("{display}: corrupt central directory offsets")))?;
     let mut cursor = (cd_offset + concat) as usize;
 
-    // Later duplicates shadow earlier ones, matching `zipfile`'s
-    // `NameToInfo` last-wins table.
-    let mut modrinth: Option<CentralMember> = None;
-    let mut curseforge: Option<CentralMember> = None;
+    let mut members = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
         if cursor + 46 > eocd {
             return Err(err(format!("{display}: truncated central directory")));
@@ -1319,7 +1353,6 @@ fn pack_member_bytes(
             return Err(err(format!("{display}: truncated central directory name")));
         }
         let name = &bytes[cursor + 46..name_end];
-        let is_manifest = name == b"modrinth.index.json" || name == b"manifest.json";
         let member = CentralMember {
             flags: u16_at(bytes, cursor + 8),
             method: u16_at(bytes, cursor + 10),
@@ -1327,12 +1360,12 @@ fn pack_member_bytes(
             comp_size: u32_at(bytes, cursor + 20) as u64,
             uncomp_size: u32_at(bytes, cursor + 24) as u64,
             local_offset: u32_at(bytes, cursor + 42) as u64 + concat,
+            zip64: u32_at(bytes, cursor + 20) == u32::MAX
+                || u32_at(bytes, cursor + 24) == u32::MAX
+                || u32_at(bytes, cursor + 42) == u32::MAX,
         };
-        if is_manifest {
-            if member.comp_size == u64::from(u32::MAX)
-                || member.uncomp_size == u64::from(u32::MAX)
-                || member.local_offset - concat == u64::from(u32::MAX)
-            {
+        if name == b"modrinth.index.json" || name == b"manifest.json" {
+            if member.zip64 {
                 return Err(err(format!(
                     "{display}: ZIP64 manifest member is unsupported"
                 )));
@@ -1343,29 +1376,55 @@ fn pack_member_bytes(
                     member.method
                 )));
             }
-            if name == b"modrinth.index.json" {
-                modrinth = Some(member);
-            } else {
-                curseforge = Some(member);
-            }
         }
+        members.push((name, member));
         cursor = name_end
             .checked_add(extra_len)
             .and_then(|v| v.checked_add(entry_comment_len))
             .ok_or_else(|| err(format!("{display}: central directory length overflow")))?;
     }
+    Ok(members)
+}
 
-    let (member, entry_name, format) = match (modrinth, curseforge) {
-        (Some(m), _) => (m, "modrinth.index.json", ModpackFormat::Modrinth),
-        (None, Some(m)) => (m, "manifest.json", ModpackFormat::CurseForge),
-        (None, None) => {
-            return Err(err(format!(
-                "{display}: archive contains neither modrinth.index.json nor manifest.json"
-            )))
-        }
-    };
-    let text = extract_member(bytes, &member, entry_name, display)?;
-    Ok(Some((format, text)))
+/// One central-directory member of a readable archive, for callers that
+/// scan whole archives (the JAR mixin scanner) rather than extract one
+/// manifest. `name` is lossy UTF-8 — suffix checks only need ASCII.
+pub(crate) struct ZipMemberEntry {
+    pub(crate) name: String,
+    member: CentralMember,
+}
+
+/// List every member of a complete ZIP archive. Unlike
+/// [`pack_member_bytes`], a missing EOCD is `Err`, not `None` — archive
+/// scanning has no standalone-file fallback.
+pub(crate) fn zip_member_list(
+    bytes: &[u8],
+    display: &str,
+) -> Result<Vec<ZipMemberEntry>, ModpackError> {
+    let eocd = find_eocd(bytes).ok_or_else(|| {
+        err(format!(
+            "{display}: not a readable archive (missing end-of-central-directory record)"
+        ))
+    })?;
+    Ok(central_dir_members(bytes, eocd, display)?
+        .into_iter()
+        .map(|(name, member)| ZipMemberEntry {
+            name: String::from_utf8_lossy(name).into_owned(),
+            member,
+        })
+        .collect())
+}
+
+/// Extract one listed member with the same fail-closed rules as the
+/// manifest reader — encryption, ZIP64, unsupported compression methods,
+/// oversized declarations, truncation, wrong decompressed length, and CRC
+/// mismatches all reject — returning raw bytes, not UTF-8.
+pub(crate) fn read_zip_member(
+    bytes: &[u8],
+    entry: &ZipMemberEntry,
+    display: &str,
+) -> Result<Vec<u8>, ModpackError> {
+    extract_member_bytes(bytes, &entry.member, &entry.name, display)
 }
 
 /// Read, decompress, and verify one archive member — fail closed on
@@ -1377,6 +1436,20 @@ fn extract_member(
     name: &str,
     display: &str,
 ) -> Result<String, ModpackError> {
+    let decoded = extract_member_bytes(bytes, member, name, display)?;
+    String::from_utf8(decoded).map_err(|_| err(format!("{display}: {name} is not UTF-8")))
+}
+
+/// [`extract_member`] without the UTF-8 gate: the verified member bytes.
+fn extract_member_bytes(
+    bytes: &[u8],
+    member: &CentralMember,
+    name: &str,
+    display: &str,
+) -> Result<Vec<u8>, ModpackError> {
+    if member.zip64 {
+        return Err(err(format!("{display}: ZIP64 member {name} is unsupported")));
+    }
     if member.flags & 0x1 != 0 {
         return Err(err(format!("{display}: {name} is encrypted")));
     }
@@ -1415,7 +1488,11 @@ fn extract_member(
         0 => payload.to_vec(),
         8 => inflate_raw(payload, budget)
             .map_err(|e| err(format!("{display}: corrupt deflate stream in {name} ({e})")))?,
-        _ => unreachable!("method checked during directory scan"),
+        other => {
+            return Err(err(format!(
+                "{display}: {name} uses unsupported compression method {other}"
+            )))
+        }
     };
     if decoded.len() as u64 != member.uncomp_size {
         return Err(err(format!(
@@ -1425,8 +1502,7 @@ fn extract_member(
     if crc32(&decoded) != member.crc32 {
         return Err(err(format!("{display}: CRC-32 mismatch in {name}")));
     }
-    String::from_utf8(decoded)
-        .map_err(|_| err(format!("{display}: {name} is not UTF-8")))
+    Ok(decoded)
 }
 
 // ---------------------------------------------------------------------------

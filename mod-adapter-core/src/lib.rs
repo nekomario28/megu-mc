@@ -29,6 +29,11 @@
 //!   Intermediary, and Yarn names) onto [`mixin_lifter::StandardEventHook`]
 //!   bindings, failing closed on any `@Overwrite`/`@Redirect`/locals-capture/
 //!   non-`HEAD`/`TAIL`/`RETURN` site or unknown target.
+//! - [`class_mixin_scanner`]: pure-`std` JVM `.class` bytecode parser and
+//!   JAR Mixin scanner — extracts `@Mixin`/`@Inject` (and every other
+//!   `org.spongepowered.asm.mixin` annotation) from real mod JAR bytecode
+//!   with zero JVM invocation, feeding [`mixin_lifter::MixinSite`]s
+//!   directly into [`mixin_lifter::lift_mixin_sites`].
 //! - [`version_compat`]: multi-version Minecraft compatibility engine —
 //!   dependency-free Maven interval (NeoForge/Forge) and SemVer (Fabric)
 //!   version-range parsing, the `pack_format`/`DataVersion` lookup table, and
@@ -45,6 +50,7 @@
 #![deny(unsafe_code)]
 
 pub mod blockstates;
+pub mod class_mixin_scanner;
 pub mod data_loader;
 pub mod dimension_mod;
 pub mod fallback;
