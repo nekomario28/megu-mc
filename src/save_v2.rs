@@ -825,6 +825,48 @@ fn read_saved_raid(input: &mut SaveInput<'_>) -> Result<(DimId, Raid), &'static 
 // The new extension sits between the legacy BRD1/SPA1 region and GEN1.
 // Outer readers still peel the same SED1, MDM1, BRS1 and dimension footers.
 const SAVE_STATE_MAGIC: &[u8; 4] = b"SVP1";
+const SAVE_ENTITY_RULES_MAGIC: &[u8; 4] = b"SVX1";
+
+// The eight live rules have dedicated atomics. All other rules live in the
+// command registry; capture the atomics as authoritative when saving.
+fn gamerule_value(name: &str, rules: &HashMap<&'static str, i32>) -> i32 {
+    match name {
+        "keepInventory" => GR_KEEP_INVENTORY.load(Ordering::Relaxed) as i32,
+        "doDaylightCycle" => GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) as i32,
+        "doWeatherCycle" => GR_WEATHER_CYCLE.load(Ordering::Relaxed) as i32,
+        "doMobSpawning" => GR_MOB_SPAWNING.load(Ordering::Relaxed) as i32,
+        "mobGriefing" => GR_MOB_GRIEFING.load(Ordering::Relaxed) as i32,
+        "naturalRegeneration" => GR_NATURAL_REGEN.load(Ordering::Relaxed) as i32,
+        "doMobLoot" => GR_MOB_LOOT.load(Ordering::Relaxed) as i32,
+        "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed),
+        _ => rules[name],
+    }
+}
+
+fn restore_gamerules(saved: Option<&[i32]>) {
+    let mut rules = command_gamerules().lock().unwrap();
+    rules.clear();
+    rules.extend(COMMAND_GAMERULE_DEFAULTS.iter().map(|&(name, _, default)| (name, default)));
+    for (index, &(name, _, _)) in COMMAND_GAMERULE_DEFAULTS.iter().enumerate() {
+        // Legacy files carry the eight live rules outside SVP1. Read their
+        // atomics back into the command registry, while defaulting the rest.
+        let value = saved.map_or_else(|| gamerule_value(name, &rules), |values| values[index]);
+        rules.insert(name, value);
+        if saved.is_some() {
+            match name {
+                "keepInventory" => GR_KEEP_INVENTORY.store(value as u8, Ordering::Relaxed),
+                "doDaylightCycle" => GR_DAYLIGHT_CYCLE.store(value as u8, Ordering::Relaxed),
+                "doWeatherCycle" => GR_WEATHER_CYCLE.store(value as u8, Ordering::Relaxed),
+                "doMobSpawning" => GR_MOB_SPAWNING.store(value as u8, Ordering::Relaxed),
+                "mobGriefing" => GR_MOB_GRIEFING.store(value as u8, Ordering::Relaxed),
+                "naturalRegeneration" => GR_NATURAL_REGEN.store(value as u8, Ordering::Relaxed),
+                "doMobLoot" => GR_MOB_LOOT.store(value as u8, Ordering::Relaxed),
+                "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.store(value, Ordering::Relaxed),
+                _ => {}
+            }
+        }
+    }
+}
 
 fn split_save_footer<'a>(
     payload: &'a [u8],
@@ -849,13 +891,10 @@ fn append_save_state(
     out: &mut Vec<u8>,
     players: &HashMap<[u8; 16], PlayerSave>,
     spawn_pitch: f32,
-    mob_count: usize,
+    mobs: &[Arc<Mob>],
     mob_data: &[u8],
 ) {
     let raids = saved_raids().lock().unwrap();
-    if players.is_empty() && spawn_pitch == 0.0 && mob_count == 0 && raids.is_empty() {
-        return;
-    }
     let start = out.len();
     save_numbers!(out, spawn_pitch);
     let mut players: Vec<_> = players.iter().collect();
@@ -865,11 +904,49 @@ fn append_save_state(
         out.extend_from_slice(uuid);
         state.write(out);
     }
-    write_varint(out, mob_count as i64);
+    write_varint(out, mobs.len() as i64);
     out.extend_from_slice(mob_data);
     write_varint(out, raids.len() as i64);
     for (dim, raid) in raids.iter() {
         write_saved_raid(out, *dim, raid);
+    }
+    // SVX1 is inside SVP1, after the original records. Old SVP1 readers in
+    // this version can still load older SVP1 bodies with no SVX1 suffix.
+    out.extend_from_slice(SAVE_ENTITY_RULES_MAGIC);
+    let rules = command_gamerules().lock().unwrap();
+    write_varint(out, COMMAND_GAMERULE_DEFAULTS.len() as i64);
+    for &(name, _, _) in COMMAND_GAMERULE_DEFAULTS.iter() {
+        write_varint(out, name.len() as i64);
+        out.extend_from_slice(name.as_bytes());
+        save_numbers!(out, gamerule_value(name, &rules));
+    }
+    drop(rules);
+    // EIDs change across loads, so persist custom mob attributes by MET4
+    // ordinal and restore them against the newly assigned IDs.
+    let attributes = attrs().lock().unwrap();
+    let mut mob_attrs = Vec::new();
+    for (index, mob) in mobs.iter().enumerate() {
+        for (selector_key, key) in [
+            (false, format!("e:{}", mob.eid)),
+            (true, format!("e:m:{}", mob.eid)),
+        ] {
+            if let Some(values) = attributes.get(&key).filter(|values| !values.is_empty()) {
+                mob_attrs.push((index, selector_key, values));
+            }
+        }
+    }
+    write_varint(out, mob_attrs.len() as i64);
+    for (index, selector_key, values) in mob_attrs {
+        write_varint(out, index as i64);
+        out.push(u8::from(selector_key));
+        let mut entries: Vec<_> = values.iter().collect();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        write_varint(out, entries.len() as i64);
+        for (name, value) in entries {
+            write_varint(out, name.len() as i64);
+            out.extend_from_slice(name.as_bytes());
+            save_numbers!(out, value);
+        }
     }
     let size = (out.len() - start) as u64;
     save_numbers!(out, size);
@@ -882,6 +959,8 @@ struct SaveState {
     players: HashMap<[u8; 16], PlayerSave>,
     mobs: Vec<MobSave>,
     raids: Vec<(DimId, Raid)>,
+    gamerules: Option<Vec<i32>>,
+    mob_attributes: Vec<(usize, bool, HashMap<String, f64>)>,
 }
 
 impl SaveState {
@@ -910,6 +989,48 @@ impl SaveState {
         for _ in 0..input.var_count(38)? {
             raids.push(read_saved_raid(&mut input)?);
         }
+        let mut gamerules = None;
+        let mut mob_attributes = Vec::new();
+        if !input.0.is_empty() {
+            if input.take::<4>()? != *SAVE_ENTITY_RULES_MAGIC {
+                return Err("unknown save state extension");
+            }
+            let count = input.var_count(5)?;
+            if count != COMMAND_GAMERULE_DEFAULTS.len() {
+                return Err("invalid saved gamerule count");
+            }
+            let mut values = Vec::with_capacity(count);
+            for &(name, is_bool, _) in COMMAND_GAMERULE_DEFAULTS.iter() {
+                let len = input.var_count(1)?;
+                if input.bytes(len)? != name.as_bytes() {
+                    return Err("saved gamerule name mismatch");
+                }
+                let value = i32::from_be_bytes(input.take()?);
+                if is_bool && !(0..=1).contains(&value) {
+                    return Err("invalid saved boolean gamerule");
+                }
+                values.push(value);
+            }
+            gamerules = Some(values);
+            let mut used = std::collections::HashSet::new();
+            for _ in 0..input.var_count(3)? {
+                let index = usize::try_from(input.varint()?).map_err(|_| "invalid saved mob ordinal")?;
+                let selector_key = input.flag()?;
+                if index >= mobs.len() || !used.insert((index, selector_key)) {
+                    return Err("invalid or duplicate saved mob ordinal");
+                }
+                let mut entries = HashMap::new();
+                for _ in 0..input.var_count(9)? {
+                    let len = input.var_count(1)?;
+                    let key = std::str::from_utf8(input.bytes(len)?)
+                        .map_err(|_| "invalid saved mob attribute name")?.to_string();
+                    if key.is_empty() || entries.insert(key, input.f64()?).is_some() {
+                        return Err("invalid or duplicate saved mob attribute");
+                    }
+                }
+                mob_attributes.push((index, selector_key, entries));
+            }
+        }
         if !input.0.is_empty() {
             return Err("trailing bytes in save state");
         }
@@ -918,6 +1039,8 @@ impl SaveState {
             players,
             mobs,
             raids,
+            gamerules,
+            mob_attributes,
         })
     }
 }
@@ -2090,7 +2213,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         f.extend_from_slice(b"SPA1");
         f.extend_from_slice(&world_spawn.3.to_be_bytes());
     }
-    append_save_state(f, &players, spawn_pitch, ms.len(), &mob_data);
+    append_save_state(f, &players, spawn_pitch, &ms, &mob_data);
     generated.append(f);
     let (sources, generated_blocks, generated_fluids) = worldgen::with_gen(|g| {
         (
@@ -3867,9 +3990,15 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
     }
+    // Entity-scoped attributes belong to the loaded world, including when it
+    // contains no mobs. Old runtime EIDs must not retain stale values.
+    attrs().lock().unwrap().retain(|key, _| !key.starts_with("e:"));
     // Persisted drop, projectile, TNT and falling-block IDs must reserve their range
     // before mobs receive fresh IDs. Keep mob ordinals stable for shearing and tags.
     if !restored_mobs.is_empty() {
+        let mob_attributes = state.as_mut()
+            .map(|s| std::mem::take(&mut s.mob_attributes))
+            .unwrap_or_default();
         let extra = state
             .as_mut()
             .map(|s| std::mem::take(&mut s.mobs))
@@ -3935,6 +4064,11 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 air: Mutex::new(air),
             }));
         }
+        let mut attributes = attrs().lock().unwrap();
+        for (index, selector_key, values) in mob_attributes {
+            let prefix = if selector_key { "e:m:" } else { "e:" };
+            attributes.insert(format!("{}{}", prefix, ms[first + index].eid), values);
+        }
         let mut sh = sheared().lock().unwrap();
         for index in restored_sheared {
             if let Some(m) = ms.get(first + index) {
@@ -3950,6 +4084,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
     }
     let state = state.unwrap_or_default();
+    restore_gamerules(state.gamerules.as_deref());
     *WORLD_SPAWN_PITCH.lock().unwrap() = state.spawn_pitch;
     *saved_players().lock().unwrap() = state.players;
     *saved_raids().lock().unwrap() = state.raids;

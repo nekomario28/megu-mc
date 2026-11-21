@@ -28,6 +28,84 @@ fn full_state_frame(payload: &[u8]) -> std::ops::Range<usize> {
     before.len()..legacy.len()
 }
 
+// Rebuild a historical SVP1 frame without its later SVX1 extension. The old
+// spawn, player, mob and raid records are kept verbatim.
+fn without_entity_rule_extension(payload: &[u8]) -> Vec<u8> {
+    let frame = full_state_frame(payload);
+    let body = &payload[frame.start..frame.end - 12];
+    let extension = body.windows(4).rposition(|bytes| bytes == SAVE_ENTITY_RULES_MAGIC)
+        .expect("SVX1 extension");
+    let mut legacy = Vec::new();
+    legacy.extend_from_slice(&payload[..frame.start]);
+    legacy.extend_from_slice(&body[..extension]);
+    legacy.extend_from_slice(&(extension as u64).to_be_bytes());
+    legacy.extend_from_slice(SAVE_STATE_MAGIC);
+    legacy.extend_from_slice(&payload[frame.end..]);
+    legacy
+}
+
+#[test]
+fn all_51_vanilla_gamerules_survive_save_v2_and_legacy_defaults_restore() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+    assert_eq!(COMMAND_GAMERULE_DEFAULTS.len(), 51);
+    let original: Vec<i32> = {
+        let rules = command_gamerules().lock().unwrap();
+        COMMAND_GAMERULE_DEFAULTS.iter()
+            .map(|&(name, _, _)| gamerule_value(name, &rules)).collect()
+    };
+    let changed: Vec<i32> = COMMAND_GAMERULE_DEFAULTS.iter().enumerate()
+        .map(|(index, &(_, is_bool, default))| {
+            if is_bool { i32::from(default == 0) }
+            else { default.wrapping_add(101 + index as i32) }
+        })
+        .collect();
+    restore_gamerules(Some(&changed));
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    assert!(payload.ends_with(b"SED1"));
+    let old_state = without_entity_rule_extension(&payload);
+    let mut no_state = payload.clone();
+    no_state.drain(full_state_frame(&payload));
+
+    attrs().lock().unwrap().insert("e:999999".into(),
+        [("generic.max_health".into(), 64.0)].into());
+    restore_gamerules(Some(&original));
+    load_world_from(&payload).unwrap();
+    assert!(!attrs().lock().unwrap().contains_key("e:999999"));
+    {
+        let rules = command_gamerules().lock().unwrap();
+        for (index, &(name, _, _)) in COMMAND_GAMERULE_DEFAULTS.iter().enumerate() {
+            assert_eq!(gamerule_value(name, &rules), changed[index], "rule {name}");
+            assert_eq!(rules[name], changed[index], "registry {name}");
+        }
+    }
+
+    for legacy in [&old_state, &no_state] {
+        restore_gamerules(Some(&changed));
+        load_world_from(legacy).unwrap();
+        let rules = command_gamerules().lock().unwrap();
+        for &(name, _, default) in COMMAND_GAMERULE_DEFAULTS.iter() {
+            let is_legacy_atomic = matches!(name,
+                "keepInventory" | "doDaylightCycle" | "doWeatherCycle" |
+                "doMobSpawning" | "mobGriefing" | "naturalRegeneration" |
+                "doMobLoot" | "maxEntityCramming");
+            if is_legacy_atomic {
+                assert_eq!(gamerule_value(name, &rules),
+                    changed[COMMAND_GAMERULE_DEFAULTS.iter().position(|r| r.0 == name).unwrap()],
+                    "legacy atomic {name}");
+                assert_eq!(rules[name], gamerule_value(name, &rules),
+                    "legacy registry {name}");
+            } else {
+                assert_eq!(rules[name], default, "legacy default {name}");
+            }
+        }
+    }
+    restore_gamerules(Some(&original));
+}
+
 // Round-trip fixtures. No real saved world exists for this repository, so the
 // MET2/MET3 consequences are pinned against the production encoder instead of
 // being skipped for lack of data. Observations are returned and asserted after
@@ -2013,6 +2091,12 @@ fn save_v2_restores_mob_behavior_merchant_and_raid_progress() {
     *wolf.love.lock().unwrap() = 22;
     *wolf.air.lock().unwrap() = 199;
     sheared().lock().unwrap().insert(witch.eid);
+    attrs().lock().unwrap().insert(format!("e:{}", wolf.eid),
+        [("generic.max_health".into(), 43.5), ("custom.motion".into(), -0.25)].into());
+    attrs().lock().unwrap().insert(format!("e:{}", merchant.eid),
+        [("generic.movement_speed".into(), 0.35)].into());
+    attrs().lock().unwrap().insert(format!("e:m:{}", wolf.eid),
+        [("generic.armor".into(), 12.0)].into());
     tags()
         .lock()
         .unwrap()
@@ -2094,6 +2178,15 @@ fn save_v2_restores_mob_behavior_merchant_and_raid_progress() {
     assert_eq!(saved_value(&saved_wolf.love), 22);
     assert_eq!(saved_value(&saved_wolf.air), 199);
     assert!(sheared().lock().unwrap().contains(&saved_witch.eid));
+    {
+        let attributes = attrs().lock().unwrap();
+        assert_eq!(attributes[&format!("e:{}", saved_wolf.eid)]["generic.max_health"], 43.5);
+        assert_eq!(attributes[&format!("e:{}", saved_wolf.eid)]["custom.motion"], -0.25);
+        assert_eq!(attributes[&format!("e:{}", saved_merchant.eid)]["generic.movement_speed"], 0.35);
+        assert_eq!(attributes[&format!("e:m:{}", saved_wolf.eid)]["generic.armor"], 12.0);
+        assert!(!attributes.contains_key(&format!("e:{}", wolf.eid)));
+        assert!(!attributes.contains_key(&format!("e:m:{}", wolf.eid)));
+    }
     assert!(tags().lock().unwrap()[&format!("e:{}", saved_merchant.eid)].contains("trader"));
     {
         let states = live_mob_states().lock().unwrap();
