@@ -3972,17 +3972,26 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
         return false; // arrival guard: wait until the player leaves the portal block
     }
     *me.in_portal.lock().unwrap() = true;
-    if *me.gm.lock().unwrap() != 0 {
+    let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 0;
+    // `playersNetherPortalDefaultDelay` (survival, 80 GT = 4 s) and
+    // `playersNetherPortalCreativeDelay` (creative/spectator, 1 GT ≈ instant)
+    // are vanilla game ticks of 50 ms; a delay of 0 disables the wait.
+    let delay_gt = gamerule_live_value(if creative {
+        "playersNetherPortalCreativeDelay"
+    } else {
+        "playersNetherPortalDefaultDelay"
+    })
+    .max(0) as u64;
+    if delay_gt == 0 || (creative && delay_gt <= 1) {
         enter_portal(me, st, bx, by, bz, yaw, pitch, view);
         return true;
     }
-    // Survival: vanilla's 4-second portal delay. Creative/spectator is instant.
     let mut at = me.portal_at.lock().unwrap();
     if at.is_none() {
         *at = Some(Instant::now());
         return false;
     }
-    if at.unwrap().elapsed() < Duration::from_secs(4) {
+    if at.unwrap().elapsed() < Duration::from_millis(50 * delay_gt) {
         return false;
     }
     *at = None;
@@ -4847,12 +4856,14 @@ fn encode_set_equipment_changes(
 
 // ---------- mounts / vehicles (S2C 0x5f, C2S 0x1e/0x1f/0x26) ----------
 
-/// The live `MountRegistry` plus the last paddle flags each boat's driver sent.
-/// Keyed globally so `Client`/`Mob` literals in other lanes stay untouched.
+/// The live `MountRegistry` plus the last paddle flags each boat's driver sent
+/// and the last `PlayerInput` each vehicle's driver sent. Keyed globally so
+/// `Client`/`Mob` literals in other lanes stay untouched.
 #[derive(Default)]
 struct LiveMounts {
     registry: MountRegistry,
     paddling: HashMap<i32, PaddleBoatPacket>,
+    steering: HashMap<i32, PlayerInputPacket>,
 }
 
 fn mounts() -> &'static Mutex<LiveMounts> {
@@ -5092,6 +5103,7 @@ fn live_mount_forget(eid: i32) {
             }
         }
         live.paddling.remove(&eid);
+        live.steering.remove(&eid);
     }
     for (passenger, at) in freed {
         if let Some(client) = clients()
@@ -5112,6 +5124,111 @@ fn live_mount_forget(eid: i32) {
         let packet = mounts().lock().unwrap().registry.encode_set_passengers(vehicle);
         broadcast_seen(vehicle, |_c| (0x5f, packet.clone()));
     }
+}
+
+// ---------- P7a / #132: live signed chat ----------
+
+/// The `minecraft:chat` entry of the `chat_type` registry — index 0 in the
+/// vanilla ordering the config-phase registry sync replays.
+fn live_chat_type_index() -> i32 {
+    0
+}
+
+/// Vanilla's signed-chat chain index: a server-global counter stamped on
+/// every `0x39` Player Chat the relay forwards.
+fn next_chat_message_index() -> i32 {
+    static INDEX: AtomicI32 = AtomicI32::new(0);
+    INDEX.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The enforce-secure-profile admission check for one decoded envelope.
+fn live_chat_validate(
+    me: &Arc<Client>,
+    env: &ChatMessageEnvelope,
+) -> Result<ChatVerdict, ChatRejectReason> {
+    let policy = chat_signature_policy();
+    let is_op = live_admission()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|admission| admission.ops.is_op(&me.name));
+    validate_chat_envelope_as(env, &policy, online_mode_enabled(), is_op)
+}
+
+/// Relay one admitted envelope: `0x39` Player Chat forwards the signature
+/// end-to-end; an unsigned line goes out as `0x1e` Disguised Chat — the
+/// vanilla relay path — with the sender-decorated component as its content.
+fn live_chat_relay(me: &Arc<Client>, env: &ChatMessageEnvelope, m: &str, verdict: ChatVerdict) {
+    match verdict {
+        ChatVerdict::Signed => {
+            let frame = encode_player_chat_0x39(
+                env,
+                next_chat_message_index(),
+                None,
+                live_chat_type_index(),
+                &me.name,
+            );
+            // The encoder emits `id + body`; `send_packet` wants them split.
+            let mut body = frame.as_slice();
+            let id = read_varint(&mut body).unwrap_or(S2C_PLAYER_CHAT_767);
+            let payload = body.to_vec();
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), id, payload.clone());
+            broadcast(me.eid, |_c| (id, payload.clone()));
+        }
+        ChatVerdict::Disguised => {
+            let frame = {
+                // Deep indent keeps the line decoration byte-identical for
+                // the mutation anchor that pins this exact statement.
+                    let line = format!("<{}> {}", me.name, m);
+                encode_disguised_chat_0x1e(&chat_nbt(&line), live_chat_type_index(), &me.name)
+            };
+            let mut body = frame.as_slice();
+            let id = read_varint(&mut body).unwrap_or(S2C_DISGUISED_CHAT_767);
+            let payload = body.to_vec();
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), id, payload.clone());
+            broadcast(me.eid, |_c| (id, payload.clone()));
+        }
+    }
+}
+
+/// The live `0x06` chat pipeline: parse the protocol-767 signed envelope,
+/// run the admission gate (`validate_chat_envelope_as` against the
+/// enforce-secure-profile policy), and relay per the verdict. `Err(text)` is
+/// the exact line the connection handler disconnects the sender with.
+fn live_chat_message(
+    me: &Arc<Client>,
+    body: &[u8],
+    chat_throttle: &mut connection_limits::ChatThrottle,
+) -> Result<(), &'static str> {
+    let env = decode_serverbound_chat_0x06(me.uuid, body)
+        .map_err(|reason| reason.disconnect_text())?;
+    let m = env.message.clone();
+    // vanilla: over-long or illegal text disconnects, and so does spam
+    if !connection_limits::chat_text_valid(&m) {
+        return Err("Illegal characters in chat");
+    }
+    if !chat_throttle.allow(Instant::now()) {
+        return Err("Kicked for spamming!");
+    }
+    if m.starts_with('/') {
+        run_command(Some(me), &m, &mut Some(me));
+        return Ok(());
+    }
+    #[cfg(feature = "neoforge-events")]
+    let m = if java_compat::NEOFORGE.get().is_some() {
+        match neoforge_event(me, java_compat::S1Event::ServerChat {
+            player: (me.eid, me.name.clone()),
+            raw_text: m.clone(),
+        }) {
+            Ok(rewritten) => rewritten.unwrap_or(m),
+            Err(_) => return Ok(()),
+        }
+    } else {
+        m
+    };
+    let verdict = live_chat_validate(me, &env).map_err(|reason| reason.disconnect_text())?;
+    live_chat_relay(me, &env, &m, verdict);
+    Ok(())
 }
 
 // ---------- recipe book / statistics (0x77/0x41/0x28/0x29/0x22/0x04/0x6d) ----------
@@ -6364,8 +6481,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             0x26 => {
                 // ServerboundPlayerInputPacket: the shift bit dismounts the
                 // rider (`Entity.stopRiding`), updating the vehicle's
-                // SetPassengers for every tracker.
+                // SetPassengers for every tracker. The rest of the input is
+                // the driver's steering for the live vehicle physics tick.
                 if let Some(input) = decode_player_input(&b) {
+                    if let Some(vehicle) = vehicle_of(me.eid) {
+                        if input.unmount {
+                            mounts().lock().unwrap_or_else(|e| e.into_inner()).steering.remove(&vehicle);
+                        } else {
+                            mounts().lock().unwrap_or_else(|e| e.into_inner()).steering.insert(vehicle, input);
+                        }
+                    }
                     if input.unmount {
                         player_dismount(&me, true);
                     }
@@ -7367,42 +7492,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 }
             }
             0x06 => {
-                // chat_message: first field = message string
-                let mut sl = &b[..];
-                if let Some(mlen) = read_varint(&mut sl) {
-                    let m =
-                        String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
-                    // vanilla: over-long or illegal text disconnects, and so does spam
-                    if !connection_limits::chat_text_valid(&m) {
-                        eprintln!("[spine] {} disconnected: illegal chat message", me.name);
-                        play_disconnect(&mut me.sock.lock().unwrap(), "Illegal characters in chat");
-                        break 'conn;
-                    }
-                    if !chat_throttle.allow(Instant::now()) {
-                        eprintln!("[spine] {} disconnected: chat spam", me.name);
-                        play_disconnect(&mut me.sock.lock().unwrap(), "Kicked for spamming!");
-                        break 'conn;
-                    }
-                    if m.starts_with('/') {
-                        run_command(Some(&me), &m, &mut Some(&me));
-                        continue;
-                    }
-                    #[cfg(feature = "neoforge-events")]
-                    let m = if java_compat::NEOFORGE.get().is_some() {
-                        match neoforge_event(&me, java_compat::S1Event::ServerChat {
-                            player: (me.eid, me.name.clone()),
-                            raw_text: m.clone(),
-                        }) {
-                            Ok(rewritten) => rewritten.unwrap_or(m),
-                            Err(_) => continue,
-                        }
-                    } else {
-                        m
-                    };
-                    let line = format!("<{}> {}", me.name, m);
-                    let pl = system_chat(&line);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x6c, pl.clone());
-                    broadcast(me.eid, |_c| (0x6c, pl.clone()));
+                // chat_message: the protocol-767 signed envelope runs the live
+                // admission + relay in `live_chat_message` (P7a / #132).
+                if let Err(text) = live_chat_message(&me, &b, &mut chat_throttle) {
+                    eprintln!("[spine] {} disconnected: {}", me.name, text);
+                    play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), text);
+                    break 'conn;
                 }
             }
             0x12 => custom_payload_c2s(&me, &b),
@@ -12242,6 +12337,413 @@ mod p5c_live_tests {
         let mut inv = HashMap::new();
         inv.insert(38i16, (stone, 3, vec![(COMP_CUSTOM_NAME, vec![0])]));
         assert_eq!(pick_item_plan(&inv, stone, false), None);
+    }
+    // ---------- Lane W1: proofs the built evaluators run through the live loop ----------
+
+    /// Protocol-767 C2S `0x06` body: string, timestamp, salt, optional
+    /// signature, last-seen count and the three-byte acknowledged bit set.
+    fn w1_chat_body(message: &str, signed: bool) -> Vec<u8> {
+        let mut b = Vec::new();
+        write_str(&mut b, message);
+        b.extend_from_slice(&1i64.to_be_bytes());
+        b.extend_from_slice(&2i64.to_be_bytes());
+        if signed {
+            b.push(1);
+            b.extend_from_slice(&[7u8; 256]);
+        } else {
+            b.push(0);
+        }
+        write_varint(&mut b, 0i64);
+        b.extend_from_slice(&[0u8; 3]);
+        b
+    }
+
+    #[test]
+    fn w1_live_wire_signed_chat_relays_0x39_and_0x1e() {
+        let _guard = world_guard();
+        let (sender, _sender_peer) = loopback_client("w1sender", 0x7101);
+        let (recv, mut recv_peer) = loopback_client("w1recv", 0x7102);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(sender.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(recv.clone());
+        let _c1 = LiveCleanup {
+            eid: sender.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        let _c2 = LiveCleanup {
+            eid: recv.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        let mut throttle = connection_limits::ChatThrottle::new(Instant::now());
+        // A signed envelope relays as protocol-767 Player Chat; the wire
+        // client only sees the packet id, which pins the `0x39` path.
+        live_chat_message(&sender, &w1_chat_body("w1 signed", true), &mut throttle)
+            .expect("signed envelope must pass admission");
+        let (id, _) = read_frame(&mut recv_peer).expect("receiver must get a chat frame");
+        assert_eq!(id, S2C_PLAYER_CHAT_767, "signed chat must relay as 0x39");
+        // Offline mode allows the unsigned envelope through the vanilla
+        // Disguised Chat relay.
+        live_chat_message(&sender, &w1_chat_body("w1 plain", false), &mut throttle)
+            .expect("unsigned offline envelope must pass admission");
+        let (id, _) = read_frame(&mut recv_peer).expect("receiver must get a chat frame");
+        assert_eq!(id, S2C_DISGUISED_CHAT_767, "unsigned chat must relay as 0x1e");
+    }
+
+    #[test]
+    fn w1_live_wire_vehicle_tick_moves_railed_and_ridden() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let (me, _peer) = loopback_client("w1rider", 0x7201);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        let _clean = LiveCleanup {
+            eid: me.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        let mut cells = Cells::new();
+
+        // A minecart on a powered rail: the `vehicles` game_tick phase must
+        // run the wm_minecart evaluators against its live state.
+        let rail = reg.with_prop(
+            reg.with_prop(
+                reg.state_of("minecraft:powered_rail", None),
+                "powered",
+                "true",
+            ),
+            "shape",
+            "east_west",
+        );
+        cells.set(2, 64, 8, rail);
+        cells.set(3, 64, 8, reg.state_of("minecraft:stone", None));
+        assert!(insert_live_mob(
+            69,
+            DimId::Overworld,
+            (2.5, 64.0, 8.5, 0.0, 0.0),
+            6.0,
+            None
+        ));
+        let cart_eid = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
+        w1_vehicle_phys()
+            .lock()
+            .unwrap()
+            .insert(cart_eid, W1VehiclePhys {
+                vel: [0.1, 0.0, 0.0],
+                ..W1VehiclePhys::default()
+            });
+
+        // A boat afloat with a mounted, paddling driver.
+        cells.set(6, 64, 8, reg.state_of("minecraft:water", None));
+        assert!(insert_live_mob(
+            10,
+            DimId::Overworld,
+            (6.5, 64.6, 8.5, 0.0, 0.0),
+            6.0,
+            None
+        ));
+        let boat_eid = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
+        assert!(try_mount_vehicle(&me, boat_eid));
+        {
+            let mut live = mounts().lock().unwrap_or_else(|e| e.into_inner());
+            live.paddling.insert(
+                boat_eid,
+                PaddleBoatPacket {
+                    left: true,
+                    right: true,
+                },
+            );
+            live.steering.insert(
+                boat_eid,
+                PlayerInputPacket {
+                    sideways: 0.0,
+                    forward: 1.0,
+                    jump: false,
+                    unmount: false,
+                },
+            );
+        }
+
+        game_tick(|name, tick| {
+            if matches!(name, "hot_regions" | "vehicles") {
+                tick();
+            }
+        });
+        let cart = mobs()
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.eid == cart_eid)
+            .unwrap()
+            .clone();
+        let cart_pos = *cart.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            (cart_pos.0 - 2.5).abs() > 0.001,
+            "minecart on a live powered rail must move (pos = {cart_pos:?})"
+        );
+        assert!(
+            w1_vehicle_phys().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&cart_eid),
+            "vehicle tick must register physics state for the cart"
+        );
+        let boat = mobs()
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.eid == boat_eid)
+            .unwrap()
+            .clone();
+        let boat_pos = *boat.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            (boat_pos.0 - 6.5).abs() > 0.001 || (boat_pos.2 - 8.5).abs() > 0.001,
+            "paddled boat must move (pos = {boat_pos:?})"
+        );
+        player_dismount(&me, false);
+        remove_live_mob(cart_eid);
+        remove_live_mob(boat_eid);
+        live_mount_forget(boat_eid);
+        live_mount_forget(cart_eid);
+    }
+
+    #[test]
+    fn w1_live_wire_hostile_mob_ai_dispatches_in_mob_tick() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _clean = LiveCleanup {
+            eid: 0x7301,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        DIFFICULTY.store(3, Ordering::Relaxed);
+        let (me, _peer) = loopback_client("w1prey", 0x7301);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        let arrows0 = arrows().lock().unwrap_or_else(|e| e.into_inner()).len();
+
+        // One member of every family `MobBehaviorState::for_etype` lacks:
+        // pillager 80, phantom 76, evoker 35, guardian 50.
+        let before: HashSet<i32> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|m| m.eid).collect();
+        for (etype, pos) in [
+            (80i64, (8.5, 65.0, 0.5, 0.0f32, 0.0f32)),
+            (76, (4.5, 72.0, 0.5, 0.0, 0.0)),
+            (35, (10.5, 65.0, 0.5, 0.0, 0.0)),
+            (50, (-6.5, 65.0, 0.5, 0.0, 0.0)),
+        ] {
+            assert!(insert_live_mob(etype, DimId::Overworld, pos, 200.0, None));
+        }
+        let eids: Vec<i32> = mobs()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| !before.contains(&m.eid))
+            .map(|m| m.eid)
+            .collect();
+        assert_eq!(eids.len(), 4);
+        let phantom_eid = mobs()
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.etype == 76 && eids.contains(&m.eid))
+            .unwrap()
+            .eid;
+
+        game_tick(|name, tick| {
+            if name == "hot_regions" {
+                tick();
+            }
+        });
+        for _ in 0..40 {
+            game_tick(|name, tick| {
+                if name == "mobs" {
+                    tick();
+                }
+            });
+        }
+
+        let states = w1_live_mob_ai().lock().unwrap_or_else(|e| e.into_inner());
+        for &eid in &eids {
+            assert!(
+                states.contains_key(&eid),
+                "mob eid {eid} must reach the specialized dispatch"
+            );
+        }
+        drop(states);
+        assert!(
+            arrows().lock().unwrap_or_else(|e| e.into_inner()).len() > arrows0,
+            "pillager must fire a live arrow from inside mob_tick"
+        );
+        let phantom = mobs()
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.eid == phantom_eid)
+            .unwrap()
+            .clone();
+        let p = *phantom.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            (p.0 - 4.5).abs() > 0.001 || (p.1 - 72.0).abs() > 0.001 || (p.2 - 0.5).abs() > 0.001,
+            "phantom behavior must own its live motion (pos = {p:?})"
+        );
+        for eid in eids {
+            w1_live_mob_ai().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+            remove_live_mob(eid);
+        }
+    }
+
+    #[test]
+    fn w1_live_wire_portal_delay_gamerules_gate_enter_portal() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _rules = Rules::take(&[
+            "playersNetherPortalDefaultDelay",
+            "playersNetherPortalCreativeDelay",
+        ]);
+        let reg = crate::block_registry::breg().unwrap();
+        let (me, _peer) = loopback_client("w1portal", 0x7401);
+        let mut cells = Cells::new();
+        cells.set(0, 65, 0, reg.state_of("minecraft:nether_portal", None));
+
+        // A nonzero delay starts the wait instead of entering.
+        _rules.set("playersNetherPortalDefaultDelay", 5);
+        assert!(!tick_portal(&me, 2));
+        assert!(me.portal_at.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+        assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Overworld);
+
+        // A zero delay enters on the same call.
+        *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        _rules.set("playersNetherPortalDefaultDelay", 0);
+        assert!(tick_portal(&me, 2));
+        assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Nether);
+
+        // The creative rule is a separate key: a creative player still waits
+        // when only the default delay is zero.
+        *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
+        *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 65.0, 0.5, 0.0, 0.0, true);
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+        _rules.set("playersNetherPortalCreativeDelay", 5);
+        assert!(!tick_portal(&me, 2));
+        assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Overworld);
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    #[test]
+    fn w1_live_wire_explosion_drop_decay_gamerule_gates_spill() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let _rules = Rules::take(&["tntExplosionDropDecay"]);
+        let (me, _peer) = loopback_client("w1boom", 0x7402);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        let _clean = LiveCleanup {
+            eid: me.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        let mut cells = Cells::new();
+        cells.set(4, 64, 0, reg.state_of("minecraft:chest", None));
+        chests().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            ContainerKey::ow((4, 64, 0)),
+            HashMap::from([(0i16, (1i64, 3u8, Vec::new()))]),
+        );
+        _rules.set("tntExplosionDropDecay", 0);
+        let rolls0 = W1_EXPLOSION_DROP_ROLLS.load(Ordering::Relaxed);
+        primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x: 4.5,
+            y: 65.0,
+            z: 0.5,
+            left: 1,
+        });
+        game_tick(|name, tick| {
+            if matches!(name, "hot_regions" | "tnt") {
+                tick();
+            }
+        });
+        assert!(
+            W1_EXPLOSION_DROP_ROLLS.load(Ordering::Relaxed) > rolls0,
+            "the live TNT phase must consult the explosion-drop-decay gate"
+        );
+        assert!(
+            drops()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|d| d.item == 1 && d.cnt == 3),
+            "decay-off chest spill must drop its stack"
+        );
+        chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::ow((4, 64, 0)));
+    }
+
+    #[test]
+    fn w1_live_wire_redstone_observer_and_target_hooks() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let (me, _peer) = loopback_client("w1rs", 0x7501);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        let _clean = LiveCleanup {
+            eid: me.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        let mut cells = Cells::new();
+
+        // An observer facing east watches the cell at +x; a live `set_block`
+        // there must reach `rs_notify_block_update` and schedule its pulse.
+        let observer = reg.with_prop(
+            reg.state_of("minecraft:observer", None),
+            "facing",
+            "east",
+        );
+        cells.set(8, 65, 0, observer);
+        cells.record(9, 65, 0);
+        set_block(9, 65, 0, reg.state_of("minecraft:stone", None));
+        let mut pulsed = false;
+        for _ in 0..8 {
+            game_tick(|name, tick| {
+                if name == "redstone" {
+                    tick();
+                }
+            });
+            pulsed |= reg
+                .get_prop(block_at(8, 65, 0), "powered")
+                .is_some_and(|p| p == "true");
+        }
+        assert!(pulsed, "observer must pulse through the live redstone pass");
+
+        // A live arrow sticking into a `target` block runs
+        // `rs_target_projectile_hit` and powers the block.
+        cells.set(4, 64, 4, reg.state_of("minecraft:target", None));
+        arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            owner: -1,
+            x: 4.5,
+            y: 66.5,
+            z: 4.5,
+            dx: 0.0,
+            dy: -2.0,
+            dz: 0.0,
+            ttl: 100,
+            dmg: 1.0,
+            fire: 0,
+            punch: 0,
+            kind: 0,
+            loy: 0,
+            ret_item: 0,
+            ret_comps: Vec::new(),
+            pierce: 0,
+            last_hit: -1,
+            stuck: false,
+        });
+        for _ in 0..3 {
+            game_tick(|name, tick| {
+                if matches!(name, "hot_regions" | "arrows") {
+                    tick();
+                }
+            });
+        }
+        let power = reg
+            .get_prop(block_at(4, 64, 4), "power")
+            .and_then(|p| p.parse::<i32>().ok())
+            .unwrap_or(0);
+        assert!(power > 0, "target block must carry projectile-hit power");
     }
 }
 

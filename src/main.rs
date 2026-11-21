@@ -846,6 +846,45 @@ fn environment_time_tick() {
                         h = c.hp.lock().unwrap();
                     }
                 }
+                // powder snow: vanilla LivingEntity freezes for 7s, then takes
+                // 1hp per 2s. The ramp lives in a per-eid timer since players
+                // carry no frozen field yet.
+                {
+                    let in_powder = name_to_state("powder_snow").is_some_and(|st| {
+                        block_at_dim(
+                            player_dim,
+                            px.floor() as i32,
+                            py.floor() as i32,
+                            pz.floor() as i32,
+                        ) == st
+                    });
+                    let frozen = {
+                        let mut timers = w1_frozen_ticks().lock().unwrap_or_else(|e| e.into_inner());
+                        if in_powder {
+                            *timers.entry(c.eid).or_insert(0) += 1;
+                            *timers.get(&c.eid).unwrap_or(&0)
+                        } else {
+                            timers.remove(&c.eid);
+                            0
+                        }
+                    };
+                    if frozen >= server_ticks(140) as u64
+                        && t.is_multiple_of(server_ticks(40))
+                        && GR_FREEZE_DAMAGE.load(Ordering::Relaxed) != 0
+                    {
+                        *h = (*h - 1.0).max(0.0);
+                        dirty = true;
+                        // vanilla: environmental damage arms the same timer, so a melee hit in
+                        // the next ten ticks is measured against this amount
+                        *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
+                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(20) as i32;
+                        if *h <= 0.0 {
+                            drop(h);
+                            totem_check(c);
+                            h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                        }
+                    }
+                }
                 // void: 4hp per 0.5s below y=-64, ignores armor (vanilla)
                 if py < -64.0 && t.is_multiple_of(server_ticks(10)) {
                     *h = (*h - 4.0).max(0.0);
@@ -2943,7 +2982,7 @@ fn live_mob_projectile_impact(
             if let Some(player) = hit {
                 live_mob_damage_player(player.client, pos, diff_mob_dmg(6.0), Some(3), None);
             }
-            live_mob_explosion(projectile.dim, pos, projectile.power, players);
+            w1_live_mob_explosion(projectile.dim, pos, projectile.power, players);
         }
         WitherSkull { .. } => {
             if let Some(player) = hit {
@@ -2958,7 +2997,7 @@ fn live_mob_projectile_impact(
                     }
                 }
             }
-            live_mob_explosion(projectile.dim, pos, projectile.power, players);
+            w1_live_mob_explosion(projectile.dim, pos, projectile.power, players);
         }
         ShulkerBullet { .. } => {
             if let Some(player) = hit {
@@ -3071,6 +3110,19 @@ fn tick_live_mob_projectiles(reg: &crate::block_registry::BReg, players: &[LiveM
         if let Some((player, point)) = hit {
             live_mob_projectile_impact(*projectile, point, Some(player), players);
         } else if let Some(point) = block {
+            // P6c / #215: the hit cell is one nudge past the surface point
+            // along the shot; a `target` block there takes its
+            // onProjectileHit hook.
+            let cell: [i32; 3] = std::array::from_fn(|i| {
+                (point[i] + projectile.velocity[i] * 1e-3).floor() as i32
+            });
+            w1_live_target_projectile_hit(
+                dim,
+                RsPos(cell[0], cell[1], cell[2]),
+                point,
+                w1_dominant_axis(projectile.velocity),
+                false,
+            );
             live_mob_projectile_impact(*projectile, point, None, players);
         } else {
             projectile.pos = next;
@@ -3308,7 +3360,7 @@ fn apply_live_mob_effects(
                     );
                 }
             }
-            Explosion { pos, power } => live_mob_explosion(dim, pos, power, players),
+            Explosion { pos, power } => w1_live_mob_explosion(dim, pos, power, players),
             Teleport { to: [x, y, z] } => {
                 let (yaw, pitch) = {
                     let mut position = mob.pos.lock().unwrap();
@@ -3474,6 +3526,800 @@ fn apply_live_mob_effects(
     true
 }
 
+// ---------- W1 / P6a: phantom, pillager, evoker, guardian live dispatch ----------
+//
+// `MobBehaviorState` is declared inside `mob_behaviors.rs`, which another
+// lane owns, so the four families it does not enumerate keep their behavior
+// structs in this parallel map. The live `mob_tick` steps them on the same
+// path as the enum-dispatched families, and their attacks replace the
+// generic melee fallback at the bottom of `live_mob_tick_dimension`.
+
+enum W1LiveMobAi {
+    Phantom(PhantomBehavior),
+    Pillager(PillagerBehavior),
+    Evoker(EvokerBehavior),
+    Guardian(GuardianBehavior),
+}
+
+fn w1_live_mob_ai() -> &'static Mutex<HashMap<i32, W1LiveMobAi>> {
+    static AI: OnceLock<Mutex<HashMap<i32, W1LiveMobAi>>> = OnceLock::new();
+    AI.get_or_init(Mutex::default)
+}
+
+/// elder guardian 29, evoker 35, guardian 50, phantom 76, pillager 80.
+fn w1_hostile_ai_owns(etype: i64) -> bool {
+    matches!(etype, 29 | 35 | 50 | 76 | 80)
+}
+
+fn w1_live_mob_ai_for(etype: i64) -> W1LiveMobAi {
+    match etype {
+        29 => W1LiveMobAi::Guardian(GuardianBehavior::new(true)),
+        35 => W1LiveMobAi::Evoker(EvokerBehavior::new()),
+        50 => W1LiveMobAi::Guardian(GuardianBehavior::new(false)),
+        76 => W1LiveMobAi::Phantom(PhantomBehavior::new()),
+        _ => W1LiveMobAi::Pillager(PillagerBehavior::new()),
+    }
+}
+
+/// Evoker fangs the live dispatch spawned: `(eid, ticks_left)`. Vanilla
+/// EvokerFangs lives ~22 ticks; the damage lands on the cast tick.
+fn w1_evoker_fangs() -> &'static Mutex<Vec<(i32, i32)>> {
+    static FANGS: OnceLock<Mutex<Vec<(i32, i32)>>> = OnceLock::new();
+    FANGS.get_or_init(Mutex::default)
+}
+
+/// Wool colors the live wololo wrote: mob eid -> dye index. Sheep colors are
+/// not instanced at spawn yet, so an unrecorded sheep still counts as a blue
+/// candidate for the easter-egg spell.
+fn w1_wool_colors() -> &'static Mutex<HashMap<i32, u8>> {
+    static WOOL: OnceLock<Mutex<HashMap<i32, u8>>> = OnceLock::new();
+    WOOL.get_or_init(Mutex::default)
+}
+
+/// Count down live evoker-fang lifetimes each `mob_tick`; a spent fang sends
+/// its destroy packet and leaves the tracker list.
+fn w1_evoker_fangs_tick() {
+    let mut dead = Vec::new();
+    w1_evoker_fangs().lock().unwrap_or_else(|e| e.into_inner()).retain_mut(|(eid, left)| {
+        *left -= 1;
+        if *left <= 0 {
+            dead.push(*eid);
+        }
+        *left > 0
+    });
+    for eid in dead {
+        broadcast_seen_destroy(eid);
+    }
+}
+
+// ---------- W1 / P2: powder-snow freeze ramp + explosion drop decay ----------
+
+/// Per-player powder-snow contact time in server ticks (`Entity#getTicksFrozen`
+/// is not instanced on `Client` yet, so the live ramp is tracked here).
+fn w1_frozen_ticks() -> &'static Mutex<HashMap<i32, u64>> {
+    static FROZEN: OnceLock<Mutex<HashMap<i32, u64>>> = OnceLock::new();
+    FROZEN.get_or_init(Mutex::default)
+}
+
+thread_local! {
+    /// `(kind, power)` while a live explosion pass destroys blocks: the
+    /// `*ExplosionDropDecay` rules gate the spill each broken container emits.
+    static W1_EXPLOSION_CTX: std::cell::Cell<Option<(ExplosionDropKind, f32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn w1_explosion_scope<R>(kind: ExplosionDropKind, power: f32, work: impl FnOnce() -> R) -> R {
+    W1_EXPLOSION_CTX.with(|ctx| ctx.set(Some((kind, power))));
+    let out = work();
+    W1_EXPLOSION_CTX.with(|ctx| ctx.set(None));
+    out
+}
+
+/// One decay roll per block a live explosion destroys; the counter is the
+/// execution evidence the wire tests assert on.
+static W1_EXPLOSION_DROP_ROLLS: AtomicU64 = AtomicU64::new(0);
+
+/// The `DESTROY_WITH_DECAY` roll for one explosion-broken block. Outside an
+/// explosion context nothing changes (`DESTROY` always drops).
+fn w1_explosion_drop_allowed() -> bool {
+    let Some((kind, power)) = W1_EXPLOSION_CTX.with(|ctx| ctx.get()) else {
+        return true;
+    };
+    W1_EXPLOSION_DROP_ROLLS.fetch_add(1, Ordering::Relaxed);
+    let roll = (world_rng::next_u64() % 1_000_000) as f32 / 1_000_000.0;
+    eval_explosion_block_drop(explosion_drop_decay_enabled(kind), power, roll)
+}
+
+/// `primed_tick` is the only `explode_at` caller, so the whole TNT phase runs
+/// under the `Tnt` `BlockInteraction` at vanilla power 4.
+fn w1_tnt_tick() {
+    w1_explosion_scope(ExplosionDropKind::Tnt, 4.0, primed_tick);
+}
+
+/// Mob-sourced explosions (creepers, ghast/wither/dragon projectiles and the
+/// behavior effect) run under `mobExplosionDropDecay`.
+fn w1_live_mob_explosion(dim: DimId, pos: [f64; 3], power: f32, players: &[LiveMobPlayer<'_>]) {
+    w1_explosion_scope(ExplosionDropKind::Mob, power, || {
+        live_mob_explosion(dim, pos, power, players);
+    });
+}
+
+// ---------- W1 / P6c: canonical target-block projectile hits ----------
+
+fn w1_dominant_axis(velocity: [f64; 3]) -> RsAxis {
+    if velocity[0].abs() >= velocity[1].abs() && velocity[0].abs() >= velocity[2].abs() {
+        RsAxis::X
+    } else if velocity[1].abs() >= velocity[2].abs() {
+        RsAxis::Y
+    } else {
+        RsAxis::Z
+    }
+}
+
+/// A live projectile hitting a `target` block runs the canonical
+/// `redstone::rs_target_projectile_hit` through the same `RedstoneWorldAdapter`
+/// `run_redstone_pass` uses, then commits the power write; the power-off tick
+/// rides the shared `live_redstone_tick` scheduler.
+fn w1_live_target_projectile_hit(
+    dim: DimId,
+    pos: RsPos,
+    hit: [f64; 3],
+    face_axis: RsAxis,
+    arrow: bool,
+) {
+    let Some(reg) = breg() else { return };
+    let (writes, dispensers) = {
+        let mut dimensions = live_redstone().lock().unwrap_or_else(|e| e.into_inner());
+        let state = dimensions.entry(dim).or_default();
+        let mut torches = std::mem::take(&mut state.torches);
+        let now = TICK_IDX.load(Ordering::Relaxed);
+        let mut world = LiveRedstoneWorld {
+            dim,
+            reg,
+            state,
+            now,
+            reads: Default::default(),
+            writes: Default::default(),
+            dispensers: Vec::new(),
+        };
+        {
+            let mut adapter = RedstoneWorldAdapter::new(reg, &mut world, &mut torches);
+            rs_target_projectile_hit(&mut adapter, pos, hit, face_axis, arrow);
+            adapter.propagate(&[pos]);
+        }
+        world.state.torches = torches;
+        (world.writes, world.dispensers)
+    };
+    for (RsPos(x, y, z), state) in writes {
+        set_block_if_inner_dim(dim, x, y, z, state, None);
+        note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
+    }
+    if dim == DimId::Overworld {
+        for RsPos(x, y, z) in dispensers {
+            fire_dispenser(x, y, z, block_at(x, y, z));
+        }
+    }
+}
+
+/// `arrow_tick` owns the flight; this wrapper diffs the live arrow list for
+/// projectiles that landed inside a `target` block this tick and runs the
+/// vanilla `TargetBlock.onProjectileHit` hook on them (P6c / #215).
+fn w1_arrow_tick() {
+    let before: HashMap<i32, ([f64; 6], bool)> = arrows()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| (a.eid, ([a.x, a.y, a.z, a.dx, a.dy, a.dz], a.stuck)))
+        .collect();
+    arrow_tick();
+    let Some(reg) = breg() else { return };
+    let after = arrows().lock().unwrap_or_else(|e| e.into_inner());
+    for (eid, (prev, was_stuck)) in before {
+        // `landed` covers the plain-arrow stick and the trident path, which
+        // dies on block impact and leaves the list entirely.
+        let landed = after
+            .iter()
+            .find(|a| a.eid == eid)
+            .map(|a| a.stuck && !was_stuck)
+            .unwrap_or(!was_stuck);
+        if !landed {
+            continue;
+        }
+        let at = after
+            .iter()
+            .find(|a| a.eid == eid)
+            .map(|a| [a.x, a.y, a.z])
+            .unwrap_or([prev[0] + prev[3], prev[1] + prev[4], prev[2] + prev[5]]);
+        let cell = at.map(|coord| coord.floor() as i32);
+        if reg.name_of(block_at(cell[0], cell[1], cell[2])) == "minecraft:target" {
+            w1_live_target_projectile_hit(
+                DimId::Overworld,
+                RsPos(cell[0], cell[1], cell[2]),
+                at,
+                w1_dominant_axis([prev[3], prev[4], prev[5]]),
+                true,
+            );
+        }
+    }
+}
+
+// ---------- W1 / P4b: live vehicle physics ----------
+
+/// Per-vehicle physics state the riding tick carries between game ticks.
+#[derive(Default, Clone, Copy)]
+struct W1VehiclePhys {
+    vel: [f64; 3],
+    delta_rot: f64,
+    boost_elapsed: u32,
+    boost_total: u32,
+}
+
+fn w1_vehicle_phys() -> &'static Mutex<HashMap<i32, W1VehiclePhys>> {
+    static PHYS: OnceLock<Mutex<HashMap<i32, W1VehiclePhys>>> = OnceLock::new();
+    PHYS.get_or_init(Mutex::default)
+}
+
+/// Detector-rail cells a live minecart currently occupies: the `powered`
+/// property is written while a cart sits on the rail and cleared when the
+/// last cart leaves, so the cell emits 15 for exactly the occupied window.
+fn w1_detector_rails() -> &'static Mutex<HashSet<(DimId, i32, i32, i32)>> {
+    static RAILS: OnceLock<Mutex<HashSet<(DimId, i32, i32, i32)>>> = OnceLock::new();
+    RAILS.get_or_init(Mutex::default)
+}
+
+/// Write `powered` on a detector rail through the normal block-edit path so
+/// the change fans out to the live redstone pass like any other edit.
+fn w1_detector_power(dim: DimId, x: i32, y: i32, z: i32, on: bool) {
+    let Some(reg) = breg() else { return };
+    let st = block_at_dim(dim, x, y, z);
+    if reg.name_of(st) != "minecraft:detector_rail" {
+        return;
+    }
+    let next = reg.with_prop(st, "powered", if on { "true" } else { "false" });
+    if next != st {
+        set_block_dim(dim, x, y, z, next);
+        note_block_update_dim(dim, x, y, z, next);
+    }
+}
+
+/// One `game_tick` of P4b vehicle physics for every live vehicle-kind mob:
+/// boats float and paddle, minecarts ride their rails (slowdown, powered
+/// boost/brake, detector signal), and rideable mobs steer off the driver's
+/// `PlayerInput`. Evaluator outputs move the live entity, re-seat its
+/// passengers, and broadcast a `0x70` teleport.
+fn w1_vehicle_tick() {
+    let Some(reg) = breg() else { return };
+    let snap: Vec<(Arc<Mob>, VehicleKind)> = mobs()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|mob| vehicle_kind_of(mob.etype).map(|kind| (mob.clone(), kind)))
+        .collect();
+    {
+        let live: HashSet<i32> = snap.iter().map(|(mob, _)| mob.eid).collect();
+        w1_vehicle_phys()
+            .lock()
+            .unwrap()
+            .retain(|eid, _| live.contains(eid));
+    }
+    if snap.is_empty() {
+        return;
+    }
+    let seats: HashMap<i32, (Option<PaddleBoatPacket>, Option<PlayerInputPacket>, Vec<i32>)> = {
+        let live = mounts().lock().unwrap_or_else(|e| e.into_inner());
+        snap.iter()
+            .map(|(mob, _)| {
+                (
+                    mob.eid,
+                    (
+                        live.paddling.get(&mob.eid).copied(),
+                        live.steering.get(&mob.eid).copied(),
+                        live.registry.passengers_of(mob.eid).to_vec(),
+                    ),
+                )
+            })
+            .collect()
+    };
+    let region = region_guard();
+    let mut phys = w1_vehicle_phys().lock().unwrap_or_else(|e| e.into_inner());
+    let mut occupied_rails: HashSet<(DimId, i32, i32, i32)> = HashSet::new();
+    for (mob, kind) in &snap {
+        let (x, y, z, yaw, pitch, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        if !region.is_hot(x as i32, z as i32) {
+            continue;
+        }
+        let pos = [x, y, z];
+        let dim = mob.dim;
+        let (paddle, input, passengers) = seats.get(&mob.eid).cloned().unwrap_or_default();
+        let driver = passengers.first().and_then(|eid| {
+            clients()
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|c| c.eid == *eid)
+                .cloned()
+        });
+        let env = live_vehicle_env(dim, mob.etype, pos, *kind);
+        let state = phys.entry(mob.eid).or_default();
+        if state.boost_total > 0 {
+            state.boost_elapsed += 1;
+        }
+        let mut new_pos;
+        let mut new_yaw = yaw;
+        match kind {
+            VehicleKind::Boat | VehicleKind::ChestBoat => {
+                let paddle = paddle.unwrap_or(PaddleBoatPacket {
+                    left: false,
+                    right: false,
+                });
+                let boat_input = WmBoatInput {
+                    left: paddle.left,
+                    right: paddle.right,
+                    up: input.is_some_and(|i| i.forward > 0.0),
+                    down: input.is_some_and(|i| i.forward < 0.0),
+                };
+                let (yaw2, rot, vel) = if let Some(driver) = &driver {
+                    let steer = f64::from(driver.pos.lock().unwrap_or_else(|e| e.into_inner()).3);
+                    wm_boat_control_tick(boat_input, steer, state.delta_rot, state.vel)
+                } else {
+                    // An empty boat just damps its hull rotation (cov.J runs
+                    // only while a passenger rows).
+                    (f64::from(yaw), state.delta_rot * 0.9, state.vel)
+                };
+                new_yaw = yaw2 as f32;
+                let status = if env.on_water {
+                    WmBoatStatus::InWater
+                } else if mob_has_support(mob.etype, pos[0], pos[1], pos[2]) {
+                    WmBoatStatus::OnLand
+                } else {
+                    WmBoatStatus::InAir
+                };
+                // The fluid probe is binary, so a floating hull rides at its
+                // rest depth fraction.
+                let lift = wm_boat_lift(status, 0.5);
+                let below_name = if status == WmBoatStatus::OnLand {
+                    let below = block_at_dim(
+                        dim,
+                        pos[0].floor() as i32,
+                        (pos[1] - 0.5).floor() as i32,
+                        pos[2].floor() as i32,
+                    );
+                    reg.name_of(below)
+                        .strip_prefix("minecraft:")
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                let (vel2, rot2) = wm_boat_float_tick(
+                    status,
+                    wm_support_friction(&below_name),
+                    WM_BOAT_GRAVITY,
+                    vel,
+                    lift,
+                    rot,
+                );
+                state.vel = vel2;
+                state.delta_rot = rot2;
+                new_pos = [pos[0] + vel2[0], pos[1] + vel2[1], pos[2] + vel2[2]];
+            }
+            VehicleKind::Minecart => {
+                let has_passenger = !passengers.is_empty();
+                let mut vel = wm_minecart_slowdown(has_passenger, env.on_water, state.vel);
+                let (bx, by, bz) =
+                    (pos[0].floor() as i32, pos[1].floor() as i32, pos[2].floor() as i32);
+                let rail = [by, by - 1].into_iter().find_map(|ry| {
+                    let st = block_at_dim(dim, bx, ry, bz);
+                    matches!(
+                        reg.name_of(st),
+                        "minecraft:rail"
+                            | "minecraft:powered_rail"
+                            | "minecraft:detector_rail"
+                            | "minecraft:activator_rail"
+                    )
+                    .then_some((ry, st))
+                });
+                if let Some((ry, st)) = rail {
+                    let name = reg.name_of(st);
+                    if name == "minecraft:powered_rail" {
+                        if reg.get_prop(st, "powered").as_deref() == Some("true") {
+                            let shape = match reg.get_prop(st, "shape").as_deref() {
+                                Some("east_west") => WmRailShape::EastWest,
+                                Some("north_south") => WmRailShape::NorthSouth,
+                                _ => WmRailShape::Other,
+                            };
+                            let conductor = |dx: i32, dz: i32| {
+                                reg.is_redstone_conductor(block_at_dim(
+                                    dim,
+                                    bx + dx,
+                                    ry,
+                                    bz + dz,
+                                ))
+                            };
+                            let (neg, pos_conductor) = match shape {
+                                WmRailShape::EastWest => (conductor(1, 0), conductor(-1, 0)),
+                                WmRailShape::NorthSouth => (conductor(0, 1), conductor(0, -1)),
+                                WmRailShape::Other => (false, false),
+                            };
+                            let (vx, vz) = wm_minecart_powered_boost(
+                                vel[0],
+                                vel[2],
+                                shape,
+                                neg,
+                                pos_conductor,
+                            );
+                            vel[0] = vx;
+                            vel[2] = vz;
+                        } else {
+                            let (vx, vz) = wm_minecart_rail_brake(vel[0], vel[2]);
+                            vel[0] = vx;
+                            vel[2] = vz;
+                        }
+                    }
+                    let (mx, mz) =
+                        wm_minecart_rail_move(vel[0], vel[2], has_passenger, env.on_water);
+                    vel[0] = mx;
+                    vel[2] = mz;
+                    // The rail carries y: the cart rides 0.0625 above the
+                    // rail block's top face.
+                    new_pos = [pos[0] + vel[0], f64::from(ry) + 0.0625, pos[2] + vel[2]];
+                    if name == "minecraft:detector_rail"
+                        && wm_detector_rail_signal(true) == 15
+                    {
+                        occupied_rails.insert((dim, bx, ry, bz));
+                    }
+                } else {
+                    vel[1] -= 0.04;
+                    new_pos = [pos[0] + vel[0], pos[1] + vel[1], pos[2] + vel[2]];
+                }
+                state.vel = vel;
+            }
+            _ => {
+                // Rideable mobs only take physics while a driver sits on them;
+                // unridden ones keep their own AI.
+                let Some(driver) = &driver else { continue };
+                let driver_yaw = f64::from(driver.pos.lock().unwrap_or_else(|e| e.into_inner()).3);
+                new_yaw = driver_yaw as f32;
+                let input = input.unwrap_or(PlayerInputPacket {
+                    sideways: 0.0,
+                    forward: 0.0,
+                    jump: false,
+                    unmount: false,
+                });
+                let boost = if state.boost_total > state.boost_elapsed {
+                    wm_boost_multiplier(state.boost_elapsed, state.boost_total)
+                } else {
+                    1.0
+                };
+                let speed = match kind {
+                    VehicleKind::Pig => wm_pig_ride_speed(env.move_speed, boost),
+                    VehicleKind::Strider => {
+                        wm_strider_ride_speed(env.move_speed, !env.on_lava, boost)
+                    }
+                    _ => env.move_speed * boost,
+                };
+                let fwd = f64::from(input.forward.clamp(-1.0, 1.0));
+                let side = f64::from(input.sideways.clamp(-1.0, 1.0));
+                let rad = driver_yaw.to_radians();
+                let mx = -rad.sin() * fwd - rad.cos() * side;
+                let mz = rad.cos() * fwd - rad.sin() * side;
+                let len = mx.hypot(mz);
+                let (sx, sz) = if len > 0.0 {
+                    (mx / len * speed, mz / len * speed)
+                } else {
+                    (0.0, 0.0)
+                };
+                let grounded = mob_has_support(mob.etype, pos[0], pos[1], pos[2]);
+                state.vel[0] = sx;
+                state.vel[2] = sz;
+                if input.jump
+                    && grounded
+                    && matches!(
+                        kind,
+                        VehicleKind::Horse
+                            | VehicleKind::Donkey
+                            | VehicleKind::Mule
+                            | VehicleKind::Camel
+                            | VehicleKind::Llama
+                    )
+                {
+                    // The 0x26 packet is the instant-jump edge; vanilla's
+                    // charge meter rides the jump action button instead.
+                    let scale = wm_horse_jump_scale(100);
+                    state.vel[1] = wm_horse_jump_velocity(
+                        0.7,
+                        scale,
+                        1.0,
+                        wm_jump_boost_power(None),
+                    );
+                    if fwd > 0.0 {
+                        let (jx, jz) = wm_horse_jump_horizontal(driver_yaw, scale);
+                        state.vel[0] += jx;
+                        state.vel[2] += jz;
+                    }
+                }
+                if *kind == VehicleKind::Strider && env.on_lava {
+                    state.vel = wm_strider_lava_buoyancy(state.vel);
+                } else if !grounded {
+                    state.vel[1] -= 0.08;
+                } else {
+                    state.vel[1] = 0.0;
+                }
+                new_pos = [
+                    pos[0] + state.vel[0],
+                    pos[1] + state.vel[1],
+                    pos[2] + state.vel[2],
+                ];
+            }
+        }
+        // A falling vehicle stops on the terrain surface; the fluid paths
+        // (in_water boat float, strider buoyancy) own their own y.
+        let on_fluid = env.on_water || (*kind == VehicleKind::Strider && env.on_lava);
+        if new_pos[1] < pos[1] && !on_fluid {
+            let ground = height_at_dim(dim, new_pos[0].floor() as i32, new_pos[2].floor() as i32);
+            if new_pos[1] < f64::from(ground) {
+                new_pos[1] = f64::from(ground);
+                state.vel[1] = 0.0;
+            }
+        }
+        *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) = (new_pos[0], new_pos[1], new_pos[2], new_yaw, pitch);
+        // `Entity.positionRider`: every seated passenger follows the vehicle
+        // and is credited for the carry.
+        for (seat, &passenger) in passengers.iter().enumerate() {
+            let off = kind.seat_offset(seat);
+            if let Some(client) = clients()
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|c| c.eid == passenger)
+                .cloned()
+            {
+                let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+                let delta = [
+                    new_pos[0] + off[0] - p.0,
+                    new_pos[1] + off[1] - p.1,
+                    new_pos[2] + off[2] - p.2,
+                ];
+                let (yaw2, pitch2, ground2) = (p.3, p.4, p.5);
+                *p = (
+                    new_pos[0] + off[0],
+                    new_pos[1] + off[1],
+                    new_pos[2] + off[2],
+                    yaw2,
+                    pitch2,
+                    ground2,
+                );
+                drop(p);
+                ac_note_carried_motion(passenger, delta);
+            }
+        }
+        mounts()
+            .lock()
+            .unwrap()
+            .registry
+            .register_rider(mob.eid, new_pos);
+        broadcast_seen(mob.eid, |_| {
+            (
+                0x70,
+                entity_teleport(mob.eid, new_pos[0], new_pos[1], new_pos[2], new_yaw, pitch, true),
+            )
+        });
+    }
+    drop(phys);
+    // Detector rails emit 15 exactly while a live cart stands on them.
+    let mut rails = w1_detector_rails().lock().unwrap_or_else(|e| e.into_inner());
+    for key in &occupied_rails {
+        if rails.insert(*key) {
+            w1_detector_power(key.0, key.1, key.2, key.3, true);
+        }
+    }
+    let vacated: Vec<_> = rails.difference(&occupied_rails).copied().collect();
+    for key in vacated {
+        rails.remove(&key);
+        w1_detector_power(key.0, key.1, key.2, key.3, false);
+    }
+}
+
+/// One live `mob_tick` step for the four P6a families `MobBehaviorState` does
+/// not enumerate. `target`/`perception` are the same snapshot the generic
+/// profile consumed this tick.
+fn w1_hostile_mob_tick(
+    m: &Mob,
+    dim: DimId,
+    pos: [f64; 3],
+    target: Option<&LiveMobPlayer<'_>>,
+    perception: Option<AiEntityPerception>,
+    players: &[LiveMobPlayer<'_>],
+    mobs_snap: &[Arc<Mob>],
+) {
+    let visible = target.zip(perception).filter(|(_, seen)| seen.line_of_sight);
+    let mut states = w1_live_mob_ai().lock().unwrap_or_else(|e| e.into_inner());
+    let ai = states
+        .entry(m.eid)
+        .or_insert_with(|| w1_live_mob_ai_for(m.etype));
+    match ai {
+        W1LiveMobAi::Phantom(phantom) => {
+            let mut rng = world_rng::next_u64();
+            let tick = phantom.tick(
+                pos,
+                visible.map(|(player, _)| (player.client.eid, player.pos.into())),
+                &mut |bound| {
+                    let draw = (rng % u64::from(bound.max(1))) as u32;
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    draw
+                },
+            );
+            drop(states);
+            // The phantom owns its motion: Circle/Swoop/Climb velocities are
+            // per-tick displacements, applied straight to the live position.
+            if tick.velocity != [0.0; 3] {
+                let (x, y, z, yaw, pitch) = {
+                    let mut p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    p.0 += tick.velocity[0];
+                    p.1 += tick.velocity[1];
+                    p.2 += tick.velocity[2];
+                    *p
+                };
+                broadcast_seen(m.eid, |_| {
+                    (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, false))
+                });
+            }
+            if let Some(victim) = tick.attack {
+                if let Some(player) = players
+                    .iter()
+                    .find(|p| p.dim == dim && p.client.eid == victim)
+                {
+                    live_mob_melee(m, player.client, pos, PHANTOM_ATTACK_DAMAGE, 0.35);
+                }
+            }
+        }
+        W1LiveMobAi::Pillager(pillager) => {
+            let action = pillager.tick(visible.map(|(player, _)| player.client.eid));
+            drop(states);
+            if let Some(PillagerAction::Shoot { .. }) = action {
+                if let Some(player) = target {
+                    live_skeleton_shoot(m, pos, player.pos);
+                }
+            }
+        }
+        W1LiveMobAi::Evoker(evoker) => {
+            let sheep: Vec<(i32, [f64; 3])> = mobs_snap
+                .iter()
+                .filter(|sheep| sheep.etype == 87 && sheep.dim == dim)
+                .filter(|sheep| {
+                    w1_wool_colors()
+                        .lock()
+                        .unwrap()
+                        .get(&sheep.eid)
+                        .map_or(true, |&color| color == 11)
+                })
+                .map(|sheep| {
+                    let p = *sheep.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    (sheep.eid, [p.0, p.1, p.2])
+                })
+                .collect();
+            let event = evoker.tick(
+                pos,
+                visible.map(|(player, _)| (player.client.eid, player.pos.into())),
+                &sheep,
+            );
+            drop(states);
+            match event {
+                Some(EvokerEvent::FangAttack { positions }) => {
+                    for &[fx, fy, fz] in &positions {
+                        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                        broadcast_seen(m.eid, |_| {
+                            (
+                                0x01,
+                                spawn_entity_pkt(
+                                    eid,
+                                    36,
+                                    f64::from(fx) + 0.5,
+                                    f64::from(fy),
+                                    f64::from(fz) + 0.5,
+                                    0.0,
+                                    0.0,
+                                    0,
+                                ),
+                            )
+                        });
+                        w1_evoker_fangs().lock().unwrap_or_else(|e| e.into_inner()).push((eid, 22));
+                    }
+                    for player in players.iter().filter(|p| p.dim == dim) {
+                        let feet = (
+                            player.pos.0.floor() as i32,
+                            player.pos.1.floor() as i32,
+                            player.pos.2.floor() as i32,
+                        );
+                        if positions.iter().any(|&[fx, fy, fz]| {
+                            fx == feet.0 && fz == feet.2 && (feet.1 - fy).abs() <= 1
+                        }) {
+                            live_mob_damage_player(
+                                player.client,
+                                pos,
+                                diff_mob_dmg(6.0),
+                                Some(0),
+                                Some(0.4),
+                            );
+                        }
+                    }
+                }
+                Some(EvokerEvent::SummonVex { count }) => {
+                    let vex_hp = entity_spec_by_id(112).map_or(14.0, |spec| spec.max_health);
+                    for i in 0..count {
+                        let angle =
+                            f64::from(i) * 2.0 * std::f64::consts::PI / f64::from(count.max(1));
+                        insert_live_mob(
+                            112,
+                            dim,
+                            (pos[0] + angle.cos(), pos[1] + 1.5, pos[2] + angle.sin(), 0.0, 0.0),
+                            vex_hp,
+                            None,
+                        );
+                    }
+                }
+                Some(EvokerEvent::Wololo { target: sheep_eid }) => {
+                    w1_wool_colors().lock().unwrap_or_else(|e| e.into_inner()).insert(sheep_eid, 14);
+                    // Sheep color is metadata index 16 (byte); dye 14 = red.
+                    let mut meta = Vec::new();
+                    write_varint(&mut meta, sheep_eid as i64);
+                    meta.push(16);
+                    write_varint(&mut meta, 0);
+                    meta.push(14);
+                    meta.push(0xff);
+                    broadcast_seen(m.eid, |_| (0x58, meta.clone()));
+                }
+                None => {}
+            }
+        }
+        W1LiveMobAi::Guardian(guardian) => {
+            let events = guardian.tick(visible.map(|(player, _)| {
+                let dx = pos[0] - player.pos.0;
+                let dy = pos[1] - player.pos.1;
+                let dz = pos[2] - player.pos.2;
+                (player.client.eid, (dx * dx + dy * dy + dz * dz).sqrt())
+            }));
+            drop(states);
+            for event in events {
+                let (victim, damage) = match event {
+                    GuardianEvent::Laser { target, damage } => (target, Some(damage)),
+                    GuardianEvent::MiningFatigue { target } => (target, None),
+                };
+                let Some(player) = players
+                    .iter()
+                    .find(|p| p.dim == dim && p.client.eid == victim)
+                else {
+                    continue;
+                };
+                match damage {
+                    Some(damage) => {
+                        live_mob_damage_player(
+                            player.client,
+                            pos,
+                            diff_mob_dmg(damage),
+                            Some(0),
+                            Some(0.25),
+                        );
+                    }
+                    None => {
+                        let pkt = entity_effect_pkt(
+                            victim,
+                            name_to_effect("mining_fatigue").unwrap_or(3),
+                            i32::from(ELDER_FATIGUE_AMPLIFIER),
+                            ELDER_FATIGUE_DURATION,
+                        );
+                        if let Ok(mut sock) = player.client.sock.lock() {
+                            let _ = send_packet(&mut sock, 0x76, pkt);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn mob_tick() {
     let clients = client_snapshot();
     let players: Vec<_> = clients.iter().map(LiveMobPlayer::new).collect();
@@ -3485,8 +4331,17 @@ fn mob_tick() {
         let alive: HashSet<_> = mobs.iter().map(|mob| mob.eid).collect();
         LIVE_MOB_AI.with(|ai| ai.borrow_mut().retain(|eid, _| alive.contains(eid)));
         states.retain(|eid, _| alive.contains(eid));
+        w1_live_mob_ai()
+            .lock()
+            .unwrap()
+            .retain(|eid, _| alive.contains(eid));
+        w1_wool_colors()
+            .lock()
+            .unwrap()
+            .retain(|eid, _| alive.contains(eid));
         mobs.clone()
     };
+    w1_evoker_fangs_tick();
     if players.is_empty() {
         return;
     }
@@ -3652,7 +4507,7 @@ fn live_mob_tick_dimension(
                 damage += 2.0;
             }
         }
-        if matches!(m.etype, 124 | 91)
+        if matches!(m.etype, 124 | 91 | 76)
             && dim == DimId::Overworld
             && day
             && !in_water
@@ -3675,6 +4530,16 @@ fn live_mob_tick_dimension(
         }
         if m.etype == 8 && in_water && tick.is_multiple_of(server_ticks(20)) {
             damage += blaze_hazard_damage(BlazeHazard::Water);
+        }
+        // Powder snow freeze damage for mobs; the vanilla
+        // `freeze_immune_entity_types` tag (polar bear, snow golem, stray,
+        // wither) is exempt.
+        if tick.is_multiple_of(server_ticks(40))
+            && GR_FREEZE_DAMAGE.load(Ordering::Relaxed) != 0
+            && !matches!(m.etype, 81 | 96 | 102 | 119)
+            && reg.name_of(feet_state) == "minecraft:powder_snow"
+        {
+            damage += 1.0;
         }
         if damage > 0.0 {
             let hp = {
@@ -3712,7 +4577,8 @@ fn live_mob_tick_dimension(
             .min_by(|a, b| distance(a).total_cmp(&distance(b)));
         let target = if matches!(
             m.etype,
-            8 | 23 | 31 | 45 | 91 | 116 | 118 | 119 | 124 | 100 | 16 | 27 | 33 | 54 | 88 | 102
+            8 | 23 | 29 | 31 | 35 | 45 | 50 | 76 | 80 | 91 | 116 | 118 | 119 | 124 | 100 | 16
+                | 27 | 33 | 54 | 88 | 102
         ) {
             target
         } else {
@@ -3763,6 +4629,14 @@ fn live_mob_tick_dimension(
                 .iter()
                 .any(|effect| matches!(effect, MobBehaviorEffect::Teleport { .. }));
             if !apply_live_mob_effects(m, dim, pos, effects, players) || teleported {
+                continue;
+            }
+        }
+
+        if w1_hostile_ai_owns(m.etype) {
+            w1_hostile_mob_tick(m, dim, pos, target, perception, players, mobs_snap);
+            // The phantom's Circle/Swoop/Climb evaluator owns its motion.
+            if m.etype == 76 {
                 continue;
             }
         }
@@ -3870,7 +4744,7 @@ fn live_mob_tick_dimension(
             if *fuse >= server_ticks(CREEPER_IGNITE_GT) as i32 {
                 drop(fuse);
                 if remove_live_mob(m.eid).is_some() {
-                    live_mob_explosion(dim, pos, 3.0, players);
+                    w1_live_mob_explosion(dim, pos, 3.0, players);
                     broadcast_seen_destroy(m.eid);
                 }
                 continue;
@@ -3900,7 +4774,10 @@ fn live_mob_tick_dimension(
         if let Some(player) = target.filter(|p| result.attack_target == Some(p.client.eid)) {
             if m.etype == 91 && dim == DimId::Overworld {
                 live_skeleton_shoot(m, pos, player.pos);
-            } else if m.etype != 91 && perception.is_some_and(|p| p.line_of_sight) {
+            } else if m.etype != 91
+                && !w1_hostile_ai_owns(m.etype)
+                && perception.is_some_and(|p| p.line_of_sight)
+            {
                 live_mob_melee(m, player.client, pos, 3.0, 0.35);
             }
         }
@@ -7520,7 +8397,10 @@ fn set_block_if_inner_dim(
                         .filter(|(it, cn, _)| *it > 0 && *cn > 0),
                 );
             }
-            if !spill.is_empty() && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
+            if !spill.is_empty()
+                && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0
+                && w1_explosion_drop_allowed()
+            {
                 let mut ds = drops().lock().unwrap();
                 for (item, cnt, comps) in spill {
                     ds.push(Drop {
@@ -7718,18 +8598,6 @@ impl LiveRedstoneWorld<'_> {
                 delay,
                 priority: RsTickPriority::Normal,
             });
-        }
-    }
-
-    fn notify_observers(&mut self, origin: RsPos) {
-        for dir in RsDir::ALL {
-            let pos = origin.relative(dir);
-            if matches!(
-                rs_block_from_state(self.reg, self.state_at(pos)),
-                RsBlock::Observer { facing, powered: false } if facing == dir.opposite()
-            ) {
-                self.schedule_component(pos, 2);
-            }
         }
     }
 
@@ -7972,9 +8840,16 @@ fn run_redstone_pass(dim: DimId, origin: RsPos, scheduled: Option<u32>) {
             dispensers: Vec::new(),
         };
         if let Some(block_id) = scheduled {
-            world.run_host_tick(origin, block_id);
+            // The canonical sim (`rs_run_tick`) owns the observer pulse; the
+            // host toggle would undo its powered edge inside the same pass.
+            // Powered buttons have no sim arm and stay host-toggled.
+            if !matches!(
+                rs_block_from_state(reg, world.state_at(origin)),
+                RsBlock::Observer { .. }
+            ) {
+                world.run_host_tick(origin, block_id);
+            }
         } else {
-            world.notify_observers(origin);
             let state = world.state_at(origin);
             if let RsBlock::Button { powered: true, .. } = rs_block_from_state(reg, state) {
                 let delay = if reg.in_tag(state, "minecraft:wooden_buttons") {
@@ -7994,6 +8869,10 @@ fn run_redstone_pass(dim: DimId, origin: RsPos, scheduled: Option<u32>) {
             for pos in nearby {
                 adapter.refresh_wire_shape(pos);
             }
+            // P6c / #214: the observer fan-out runs the canonical
+            // `redstone::rs_notify_block_update`, scheduling each facing
+            // observer through the shared pending-tick scheduler.
+            rs_notify_block_update(&mut adapter, origin);
         }
         adapter.propagate(&[origin]);
         world.state.torches = torches;
@@ -13433,9 +14312,10 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("generated_content", materialize_pending_generation);
     run("interest", interest_tick);
     run("drops", drop_tick);
-    run("arrows", arrow_tick);
-    run("tnt", primed_tick);
+    run("arrows", w1_arrow_tick);
+    run("tnt", w1_tnt_tick);
     run("carts", cart_tick);
+    run("vehicles", w1_vehicle_tick);
     run("falling", falling_tick);
     run("mobs", mob_tick);
     run("furnaces", furnace_tick);
