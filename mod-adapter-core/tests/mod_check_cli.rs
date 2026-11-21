@@ -247,22 +247,22 @@ const DEFLATED_INDEX_DOC: &str = concat!(
 /// plaintext: `0x6b5e827b`.
 const DEFLATED_INDEX_PAYLOAD: &[u8] = &[
     197, 147, 77, 79, 195, 48, 12, 134, 255, 74, 148, 43, 109, 186, 108, 218, 164, 245, 10, 66,
-    226, 134, 64, 226, 130, 56, 120, 137, 187, 6, 154, 164, 36, 217, 248, 152, 250, 223, 113,
-    214, 74, 128, 16, 18, 156, 230, 220, 94, 191, 137, 236, 199, 206, 129, 55, 62, 88, 72, 119,
-    24, 162, 241, 142, 215, 178, 224, 91, 176, 200, 107, 110, 141, 67, 21, 160, 73, 188, 224,
-    251, 49, 125, 165, 73, 95, 11, 58, 164, 185, 209, 118, 129, 77, 7, 9, 53, 187, 6, 245, 68,
-    114, 220, 89, 11, 225, 141, 50, 49, 249, 64, 186, 113, 12, 152, 30, 93, 204, 162, 221, 96,
-    96, 201, 51, 124, 197, 160, 76, 68, 150, 90, 100, 55, 151, 231, 76, 174, 151, 146, 124, 202,
-    107, 12, 244, 78, 99, 58, 140, 188, 190, 63, 240, 30, 82, 155, 235, 241, 58, 86, 42, 32, 61,
-    83, 74, 49, 151, 66, 150, 43, 49, 19, 43, 241, 8, 217, 223, 66, 108, 243, 133, 3, 143, 45,
-    44, 229, 156, 110, 192, 137, 131, 15, 5, 71, 183, 207, 53, 169, 206, 160, 75, 84, 83, 192,
-    231, 157, 33, 44, 153, 20, 6, 226, 250, 85, 35, 191, 246, 47, 174, 243, 160, 115, 235, 188,
-    77, 169, 143, 117, 85, 41, 237, 4, 181, 31, 140, 75, 173, 80, 222, 86, 26, 18, 84, 176, 81,
-    19, 143, 35, 130, 135, 145, 217, 173, 121, 167, 177, 200, 213, 236, 24, 67, 241, 157, 95,
-    244, 218, 236, 108, 233, 208, 211, 220, 183, 88, 102, 126, 114, 113, 102, 213, 72, 244, 119,
-    150, 155, 19, 199, 95, 89, 250, 62, 209, 162, 66, 247, 79, 150, 180, 159, 19, 155, 159, 44,
-    231, 19, 74, 18, 53, 246, 232, 52, 58, 101, 70, 60, 159, 127, 164, 230, 35, 193, 252, 49, 38,
-    184, 164, 29, 153, 174, 23, 124, 24, 62, 0,
+    226, 134, 64, 226, 130, 56, 120, 137, 187, 6, 154, 164, 36, 217, 248, 152, 250, 223, 113, 214,
+    74, 128, 16, 18, 156, 230, 220, 94, 191, 137, 236, 199, 206, 129, 55, 62, 88, 72, 119, 24, 162,
+    241, 142, 215, 178, 224, 91, 176, 200, 107, 110, 141, 67, 21, 160, 73, 188, 224, 251, 49, 125,
+    165, 73, 95, 11, 58, 164, 185, 209, 118, 129, 77, 7, 9, 53, 187, 6, 245, 68, 114, 220, 89, 11,
+    225, 141, 50, 49, 249, 64, 186, 113, 12, 152, 30, 93, 204, 162, 221, 96, 96, 201, 51, 124, 197,
+    160, 76, 68, 150, 90, 100, 55, 151, 231, 76, 174, 151, 146, 124, 202, 107, 12, 244, 78, 99, 58,
+    140, 188, 190, 63, 240, 30, 82, 155, 235, 241, 58, 86, 42, 32, 61, 83, 74, 49, 151, 66, 150,
+    43, 49, 19, 43, 241, 8, 217, 223, 66, 108, 243, 133, 3, 143, 45, 44, 229, 156, 110, 192, 137,
+    131, 15, 5, 71, 183, 207, 53, 169, 206, 160, 75, 84, 83, 192, 231, 157, 33, 44, 153, 20, 6,
+    226, 250, 85, 35, 191, 246, 47, 174, 243, 160, 115, 235, 188, 77, 169, 143, 117, 85, 41, 237,
+    4, 181, 31, 140, 75, 173, 80, 222, 86, 26, 18, 84, 176, 81, 19, 143, 35, 130, 135, 145, 217,
+    173, 121, 167, 177, 200, 213, 236, 24, 67, 241, 157, 95, 244, 218, 236, 108, 233, 208, 211,
+    220, 183, 88, 102, 126, 114, 113, 102, 213, 72, 244, 119, 150, 155, 19, 199, 95, 89, 250, 62,
+    209, 162, 66, 247, 79, 150, 180, 159, 19, 155, 159, 44, 231, 19, 74, 18, 53, 246, 232, 52, 58,
+    101, 70, 60, 159, 127, 164, 230, 35, 193, 252, 49, 38, 184, 164, 29, 153, 174, 23, 124, 24, 62,
+    0,
 ];
 
 fn deflated_index_entry() -> ZipEntry<'static> {
@@ -284,13 +284,14 @@ fn mrpack(bytes_manifest: &str) -> Vec<u8> {
 }
 
 fn obj(v: &JsonValue) -> &std::collections::BTreeMap<String, JsonValue> {
-    v.as_object().expect("report JSON root member must be an object")
+    v.as_object()
+        .expect("report JSON root member must be an object")
 }
 
 fn str_field<'a>(o: &'a std::collections::BTreeMap<String, JsonValue>, key: &str) -> &'a str {
-    o.get(key).and_then(JsonValue::as_str).unwrap_or_else(|| {
-        panic!("report JSON field '{key}' must be a string: {o:?}")
-    })
+    o.get(key)
+        .and_then(JsonValue::as_str)
+        .unwrap_or_else(|| panic!("report JSON field '{key}' must be a string: {o:?}"))
 }
 
 fn str_list(o: &std::collections::BTreeMap<String, JsonValue>, key: &str) -> Vec<String> {
@@ -311,7 +312,8 @@ fn stored_mrpack_prints_human_summary() {
     let (code, stdout, stderr) = run(&["--modpack", pack.to_str().unwrap()]);
     assert_eq!(code, 0, "expected success, stderr: {stderr}");
     assert!(stderr.is_empty(), "clean run must not log: {stderr}");
-    assert!(stdout.contains("Pre-flight report for \"Create NeoForge Adventure\" 1.4.0 (Modrinth pack)"));
+    assert!(stdout
+        .contains("Pre-flight report for \"Create NeoForge Adventure\" 1.4.0 (Modrinth pack)"));
     assert!(stdout.contains("matches this server"));
     assert!(stdout.contains("distanthorizons"));
     assert!(stdout.contains("iris"));
@@ -346,7 +348,10 @@ fn standalone_curseforge_manifest_is_sniffed_by_key_and_name() {
         "minecraft": {"version": "1.21.1"}, "files": []}"#;
     let by_name = write_fixture(&dir, "manifest.json", missing_type.as_bytes());
     let (code, _, _) = run(&["--modpack", by_name.to_str().unwrap()]);
-    assert_eq!(code, 1, "manifest.json routed to CF parser must fail closed");
+    assert_eq!(
+        code, 1,
+        "manifest.json routed to CF parser must fail closed"
+    );
 }
 
 #[test]
@@ -380,7 +385,10 @@ fn deflated_mrpack_member_preflights() {
     );
     let (code, stdout, stderr) = run(&["--modpack", pack.to_str().unwrap()]);
     assert_eq!(code, 0, "deflated .mrpack must pass, stderr: {stderr}");
-    assert!(stdout.contains("\"Deflated Pack\" 9.9.9"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("\"Deflated Pack\" 9.9.9"),
+        "stdout:\n{stdout}"
+    );
     assert!(stdout.contains("sodium"));
 }
 
@@ -400,8 +408,7 @@ fn equals_form_and_duplicate_member_handling() {
 fn json_report_matches_preflight_schema() {
     let dir = fixture_dir("json");
     let pack = write_fixture(&dir, "a.mrpack", &mrpack(MODRINTH_1211));
-    let (code, stdout, stderr) =
-        run(&["--modpack", pack.to_str().unwrap(), "--json"]);
+    let (code, stdout, stderr) = run(&["--modpack", pack.to_str().unwrap(), "--json"]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
     let root = parse_json(stdout.as_bytes()).expect("stdout must be valid JSON");
@@ -438,10 +445,7 @@ fn json_report_matches_preflight_schema() {
             .map(|e| str_field(obj(e), "class").to_string())
             .unwrap()
     };
-    assert_eq!(
-        class_of("mods/create-1.21.1-6.0.6.jar"),
-        "native_flagship"
-    );
+    assert_eq!(class_of("mods/create-1.21.1-6.0.6.jar"), "native_flagship");
     assert_eq!(
         class_of("mods/sodium-neoforge-0.6.13+mc1.21.1.jar"),
         "superseded_perf_mod"
@@ -513,19 +517,21 @@ fn mc_version_26_3_target_accepts_matching_pack() {
         .replace("\"minecraft\": \"1.21.1\"", "\"minecraft\": \"26.3\"")
         .replace("1.21.1-6.0.6.jar", "26.3-6.0.6.jar");
     let path = write_fixture(&dir, "v263.mrpack", &mrpack(&pack263));
-    let (code, stdout, stderr) = run(&[
-        "--modpack",
-        path.to_str().unwrap(),
-        "--mc-version",
-        "26.3",
-    ]);
-    assert_eq!(code, 0, "26.3 pack on 26.3 target must pass, stderr: {stderr}");
+    let (code, stdout, stderr) =
+        run(&["--modpack", path.to_str().unwrap(), "--mc-version", "26.3"]);
+    assert_eq!(
+        code, 0,
+        "26.3 pack on 26.3 target must pass, stderr: {stderr}"
+    );
     assert!(stdout.contains("matches this server"));
 
     // Same pack against the default 1.21.1 target: version mismatch -> 2.
     let (code, stdout, _) = run(&["--modpack", path.to_str().unwrap()]);
     assert_eq!(code, 2, "26.3 pack on default target must be refused");
-    assert!(stdout.contains("versions do not match"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("versions do not match"),
+        "stdout:\n{stdout}"
+    );
     assert!(stdout.contains("not compatible"), "stdout:\n{stdout}");
 }
 
@@ -653,6 +659,513 @@ fn help_prints_usage_and_exits_0() {
         assert!(stdout.contains("--profiles"));
         assert!(stdout.contains("--json"));
     }
+}
+
+// -- Minimal JVM .class builder (for --scan-jar fixtures) ----------------
+
+/// Constant-pool item; indices are plain 1-based insertion order — the
+/// fixtures are tiny so no deduplication is needed.
+enum CpItem {
+    Utf8(String),
+    Class(u16),
+    Int(i32),
+}
+
+#[derive(Default)]
+struct Cp(Vec<CpItem>);
+
+impl Cp {
+    fn push(&mut self, item: CpItem) -> u16 {
+        self.0.push(item);
+        self.0.len() as u16
+    }
+    fn utf8(&mut self, s: &str) -> u16 {
+        self.push(CpItem::Utf8(s.to_string()))
+    }
+    fn class(&mut self, internal_name: &str) -> u16 {
+        let name_index = self.utf8(internal_name);
+        self.push(CpItem::Class(name_index))
+    }
+    fn int(&mut self, v: i32) -> u16 {
+        self.push(CpItem::Int(v))
+    }
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for item in &self.0 {
+            match item {
+                CpItem::Utf8(s) => {
+                    out.push(1);
+                    out.extend((s.len() as u16).to_be_bytes());
+                    out.extend(s.as_bytes());
+                }
+                CpItem::Class(name_index) => {
+                    out.push(7);
+                    out.extend(name_index.to_be_bytes());
+                }
+                CpItem::Int(v) => {
+                    out.push(3);
+                    out.extend(v.to_be_bytes());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One annotation `element_value` for the fixture builder.
+enum Ev {
+    /// `s` string constant.
+    S(String),
+    /// `Z` boolean (stored as a `CONSTANT_Integer`).
+    Z(bool),
+    /// `@` nested annotation (type descriptor, element pairs).
+    Nested(&'static str, Vec<(&'static str, Ev)>),
+    /// `[` array of element values.
+    Arr(Vec<Ev>),
+}
+
+fn ev_s(v: &str) -> Ev {
+    Ev::S(v.to_string())
+}
+
+fn write_ev(out: &mut Vec<u8>, cp: &mut Cp, ev: &Ev) {
+    match ev {
+        Ev::S(v) => {
+            out.push(b's');
+            out.extend(cp.utf8(v).to_be_bytes());
+        }
+        Ev::Z(b) => {
+            out.push(b'Z');
+            out.extend(cp.int(i32::from(*b)).to_be_bytes());
+        }
+        Ev::Nested(desc, elems) => {
+            out.push(b'@');
+            write_ann(out, cp, desc, elems);
+        }
+        Ev::Arr(items) => {
+            out.push(b'[');
+            out.extend((items.len() as u16).to_be_bytes());
+            for item in items {
+                write_ev(out, cp, item);
+            }
+        }
+    }
+}
+
+fn write_ann(out: &mut Vec<u8>, cp: &mut Cp, desc: &str, elems: &[(&str, Ev)]) {
+    out.extend(cp.utf8(desc).to_be_bytes());
+    out.extend((elems.len() as u16).to_be_bytes());
+    for (name, ev) in elems {
+        out.extend(cp.utf8(name).to_be_bytes());
+        write_ev(out, cp, ev);
+    }
+}
+
+const MIXIN_DESC: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
+const INJECT_DESC: &str = "Lorg/spongepowered/asm/mixin/injection/Inject;";
+const AT_DESC: &str = "Lorg/spongepowered/asm/mixin/injection/At;";
+const REDIRECT_DESC: &str = "Lorg/spongepowered/asm/mixin/injection/Redirect;";
+const OVERWRITE_DESC: &str = "Lorg/spongepowered/asm/mixin/Overwrite;";
+
+fn at(value: &str) -> Ev {
+    Ev::Nested(AT_DESC, vec![("value", ev_s(value))])
+}
+
+/// One annotated `()V` method: name, annotation descriptor, elements.
+struct FixtureMethod {
+    name: &'static str,
+    ann_desc: &'static str,
+    elems: Vec<(&'static str, Ev)>,
+}
+
+/// Assemble a minimal but structurally valid `.class`: public class
+/// `internal` extending `java/lang/Object`, zero fields, each method
+/// carrying one `RuntimeInvisibleAnnotations` attribute with a single
+/// annotation (Mixin's real CLASS retention), and a class-level
+/// `@Mixin(targets = [...])` attribute.
+fn build_mixin_class(internal: &str, targets: &[&str], methods: &[FixtureMethod]) -> Vec<u8> {
+    let mut cp = Cp::default();
+    let this_idx = cp.class(internal);
+    let super_idx = cp.class("java/lang/Object");
+    let rva_idx = cp.utf8("RuntimeInvisibleAnnotations");
+    let desc_idx = cp.utf8("()V");
+
+    // Class-level @Mixin payload — the `targets` string-array form real
+    // mods use for obfuscated names.
+    let mut mixin_payload = 1u16.to_be_bytes().to_vec();
+    write_ann(
+        &mut mixin_payload,
+        &mut cp,
+        MIXIN_DESC,
+        &[(
+            "targets",
+            Ev::Arr(targets.iter().map(|t| ev_s(t)).collect()),
+        )],
+    );
+
+    let mut method_parts = Vec::new();
+    for m in methods {
+        let name_idx = cp.utf8(m.name);
+        let mut payload = 1u16.to_be_bytes().to_vec();
+        write_ann(&mut payload, &mut cp, m.ann_desc, &m.elems);
+        method_parts.push((name_idx, payload));
+    }
+
+    let mut out = Vec::new();
+    out.extend(0xCAFE_BABEu32.to_be_bytes());
+    out.extend(0u16.to_be_bytes()); // minor
+    out.extend(61u16.to_be_bytes()); // major (Java 17)
+    out.extend(((cp.0.len() + 1) as u16).to_be_bytes());
+    out.extend(cp.encode());
+    out.extend(0x0021u16.to_be_bytes()); // public + super
+    out.extend(this_idx.to_be_bytes());
+    out.extend(super_idx.to_be_bytes());
+    out.extend(0u16.to_be_bytes()); // interfaces_count
+    out.extend(0u16.to_be_bytes()); // fields_count
+    out.extend((methods.len() as u16).to_be_bytes());
+    for (name_idx, payload) in &method_parts {
+        out.extend(0x0001u16.to_be_bytes()); // public
+        out.extend(name_idx.to_be_bytes());
+        out.extend(desc_idx.to_be_bytes());
+        out.extend(1u16.to_be_bytes()); // one attribute
+        out.extend(rva_idx.to_be_bytes());
+        out.extend((payload.len() as u32).to_be_bytes());
+        out.extend(payload);
+    }
+    out.extend(1u16.to_be_bytes()); // one class attribute
+    out.extend(rva_idx.to_be_bytes());
+    out.extend((mixin_payload.len() as u32).to_be_bytes());
+    out.extend(mixin_payload);
+    out
+}
+
+/// JAR with `safe.mixins.json` registering a `@Mixin` whose
+/// `@Inject(method = "hurt", at = @At("HEAD"), cancellable = true)` on
+/// `LivingEntity` lifts fully to `EntityDamagePre`.
+fn safe_jar() -> Vec<u8> {
+    let config = br#"{
+        "required": true,
+        "package": "com.safemod.mixin",
+        "compatibilityLevel": "JAVA_17",
+        "minVersion": "0.8",
+        "mixins": ["LivingEntityMixin"],
+        "injectors": {"defaultRequire": 1}
+    }"#;
+    let class = build_mixin_class(
+        "com/safemod/mixin/LivingEntityMixin",
+        &["net.minecraft.world.entity.LivingEntity"],
+        &[FixtureMethod {
+            name: "safemod$onHurt",
+            ann_desc: INJECT_DESC,
+            elems: vec![
+                ("method", ev_s("hurt")),
+                ("at", at("HEAD")),
+                ("cancellable", Ev::Z(true)),
+            ],
+        }],
+    );
+    build_zip(&[
+        stored_entry("safe.mixins.json", config),
+        stored_entry("com/safemod/mixin/LivingEntityMixin.class", &class),
+    ])
+}
+
+/// JAR whose single registered mixin carries a `@Redirect` and an
+/// `@Overwrite` — both unliftable (`UnsupportedAnnotation`).
+fn unliftable_jar() -> Vec<u8> {
+    let config = br#"{
+        "package": "com.badmod.mixin",
+        "mixins": ["BrokenMixin"]
+    }"#;
+    let class = build_mixin_class(
+        "com/badmod/mixin/BrokenMixin",
+        &["net.minecraft.world.entity.LivingEntity"],
+        &[
+            FixtureMethod {
+                name: "badmod$redirectHurt",
+                ann_desc: REDIRECT_DESC,
+                elems: vec![
+                    ("method", ev_s("hurt")),
+                    (
+                        "at",
+                        Ev::Nested(
+                            AT_DESC,
+                            vec![
+                                ("value", ev_s("INVOKE")),
+                                ("target", ev_s("net/minecraft/x/damage")),
+                            ],
+                        ),
+                    ),
+                ],
+            },
+            FixtureMethod {
+                name: "badmod$overwriteHurt",
+                ann_desc: OVERWRITE_DESC,
+                elems: vec![],
+            },
+        ],
+    );
+    build_zip(&[
+        stored_entry("bad.mixins.json", config),
+        stored_entry("com/badmod/mixin/BrokenMixin.class", &class),
+    ])
+}
+
+/// JAR with a safe `mixins` entry plus a `client`-only mixin carrying an
+/// unliftable `@Overwrite` — skipped by the default server-side scan,
+/// scanned under `--include-client-mixins`.
+fn client_mixin_jar() -> Vec<u8> {
+    let config = br#"{
+        "package": "com.clientmod.mixin",
+        "mixins": ["ServerMixin"],
+        "client": ["ClientOnlyMixin"]
+    }"#;
+    let server = build_mixin_class(
+        "com/clientmod/mixin/ServerMixin",
+        &["net.minecraft.world.entity.LivingEntity"],
+        &[FixtureMethod {
+            name: "clientmod$onHurt",
+            ann_desc: INJECT_DESC,
+            elems: vec![("method", ev_s("hurt")), ("at", at("HEAD"))],
+        }],
+    );
+    let client = build_mixin_class(
+        "com/clientmod/mixin/ClientOnlyMixin",
+        &["net.minecraft.world.entity.LivingEntity"],
+        &[FixtureMethod {
+            name: "clientmod$overwriteHurt",
+            ann_desc: OVERWRITE_DESC,
+            elems: vec![],
+        }],
+    );
+    build_zip(&[
+        stored_entry("clientmod.mixins.json", config),
+        stored_entry("com/clientmod/mixin/ServerMixin.class", &server),
+        stored_entry("com/clientmod/mixin/ClientOnlyMixin.class", &client),
+    ])
+}
+
+#[test]
+fn scan_jar_safe_inject_lifts_and_exits_0() {
+    let dir = fixture_dir("scan-safe");
+    let jar = write_fixture(&dir, "safe.jar", &safe_jar());
+    let jar = jar.to_str().unwrap();
+
+    let (code, stdout, stderr) = run(&["--scan-jar", jar]);
+    assert_eq!(code, 0, "fully liftable JAR must exit 0, stderr: {stderr}");
+    assert!(stderr.is_empty(), "clean run must not log: {stderr}");
+    assert!(stdout.contains("mixin config"), "stdout:\n{stdout}");
+    assert!(stdout.contains("EntityDamagePre"), "stdout:\n{stdout}");
+    assert!(stdout.contains("LivingEntity"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Tier 2 eligible"), "stdout:\n{stdout}");
+
+    let (code, stdout, stderr) = run(&["--scan-jar", jar, "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let root = parse_json(stdout.as_bytes()).expect("stdout must be valid JSON");
+    let r = obj(&root);
+    assert_eq!(str_field(r, "schema"), "mc-spine-jar-mixin-scan/1");
+    assert_eq!(str_field(r, "path"), jar);
+    assert_eq!(
+        r.get("mixin_configs_found").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        r.get("classes_scanned").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        r.get("skipped_client_mixins").and_then(JsonValue::as_u64),
+        Some(0)
+    );
+    assert_eq!(r.get("sites_found").and_then(JsonValue::as_u64), Some(1));
+    assert_eq!(str_field(r, "verdict"), "fully_liftable");
+
+    let lifted = r
+        .get("lifted_hooks")
+        .and_then(JsonValue::as_array)
+        .expect("lifted_hooks array");
+    assert_eq!(lifted.len(), 1);
+    let hook = obj(&lifted[0]);
+    assert_eq!(str_field(hook, "hook"), "EntityDamagePre");
+    assert_eq!(
+        str_field(hook, "mixin_class"),
+        "com/safemod/mixin/LivingEntityMixin"
+    );
+    assert_eq!(str_field(hook, "target_method"), "hurt");
+    assert_eq!(str_field(hook, "annotation"), "@Inject");
+    assert_eq!(str_field(hook, "at"), "HEAD");
+    assert_eq!(
+        hook.get("cancellable").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert!(r
+        .get("unliftable")
+        .and_then(JsonValue::as_array)
+        .expect("unliftable array")
+        .is_empty());
+}
+
+#[test]
+fn scan_jar_unliftable_redirect_overwrite_exits_2() {
+    let dir = fixture_dir("scan-bad");
+    let jar = write_fixture(&dir, "bad.jar", &unliftable_jar());
+    let jar = jar.to_str().unwrap();
+
+    let (code, stdout, _) = run(&["--scan-jar", jar]);
+    assert_eq!(code, 2, "unliftable sites must exit 2");
+    assert!(stdout.contains("BrokenMixin"), "stdout:\n{stdout}");
+    assert!(stdout.contains("@Redirect"), "stdout:\n{stdout}");
+    assert!(stdout.contains("@Overwrite"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("UnsupportedAnnotation"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("Tier 3"), "stdout:\n{stdout}");
+    assert!(stdout.contains("requires fallback"), "stdout:\n{stdout}");
+
+    let (code, stdout, _) = run(&["--scan-jar", jar, "--json"]);
+    assert_eq!(code, 2);
+    let root = parse_json(stdout.as_bytes()).unwrap();
+    let r = obj(&root);
+    assert_eq!(str_field(r, "verdict"), "requires_fallback");
+    assert_eq!(r.get("sites_found").and_then(JsonValue::as_u64), Some(2));
+    let unliftable = r
+        .get("unliftable")
+        .and_then(JsonValue::as_array)
+        .expect("unliftable array");
+    assert_eq!(unliftable.len(), 2);
+    for site in unliftable {
+        let s = obj(site);
+        assert_eq!(str_field(s, "reason"), "UnsupportedAnnotation");
+        assert_eq!(str_field(s, "mixin_class"), "com/badmod/mixin/BrokenMixin");
+    }
+    let annotations: Vec<String> = unliftable
+        .iter()
+        .map(|u| str_field(obj(u), "annotation").to_string())
+        .collect();
+    assert!(annotations.contains(&"@Redirect".to_string()));
+    assert!(annotations.contains(&"@Overwrite".to_string()));
+}
+
+#[test]
+fn scan_jar_client_mixins_skipped_unless_flagged() {
+    let dir = fixture_dir("scan-client");
+    let jar = write_fixture(&dir, "client.jar", &client_mixin_jar());
+    let jar = jar.to_str().unwrap();
+
+    // Default server-side scan: the client-only mixin is skipped, the
+    // server mixin lifts -> exit 0.
+    let (code, stdout, stderr) = run(&["--scan-jar", jar, "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let root = parse_json(stdout.as_bytes()).unwrap();
+    let r = obj(&root);
+    assert_eq!(
+        r.get("classes_scanned").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        r.get("skipped_client_mixins").and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(str_field(r, "verdict"), "fully_liftable");
+
+    // --include-client-mixins scans the client class too — its
+    // @Overwrite flips the verdict to requires_fallback.
+    let (code, stdout, _) = run(&["--scan-jar", jar, "--include-client-mixins", "--json"]);
+    assert_eq!(code, 2);
+    let root = parse_json(stdout.as_bytes()).unwrap();
+    let r = obj(&root);
+    assert_eq!(
+        r.get("classes_scanned").and_then(JsonValue::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        r.get("skipped_client_mixins").and_then(JsonValue::as_u64),
+        Some(0)
+    );
+    assert_eq!(str_field(r, "verdict"), "requires_fallback");
+}
+
+#[test]
+fn scan_jar_missing_and_corrupt_inputs_exit_1() {
+    let dir = fixture_dir("scan-errors");
+    let (code, _, stderr) = run(&["--scan-jar", "/nonexistent/mod.jar"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("mc-spine-mod-check"), "stderr: {stderr}");
+
+    // Not a ZIP archive at all.
+    let garbage = write_fixture(&dir, "garbage.jar", b"not a zip at all");
+    let (code, _, _) = run(&["--scan-jar", garbage.to_str().unwrap()]);
+    assert_eq!(code, 1, "non-ZIP input must fail closed");
+
+    // Config registers a class absent from the archive.
+    let missing_class = write_fixture(
+        &dir,
+        "missing-class.jar",
+        &build_zip(&[stored_entry(
+            "x.mixins.json",
+            br#"{"package": "com.x.mixin", "mixins": ["Gone"]}"#,
+        )]),
+    );
+    let (code, _, stderr) = run(&["--scan-jar", missing_class.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Gone"), "stderr: {stderr}");
+
+    // Config-registered class is not a .class file (bad magic).
+    let bad_class = write_fixture(
+        &dir,
+        "bad-class.jar",
+        &build_zip(&[
+            stored_entry(
+                "x.mixins.json",
+                br#"{"package": "com.x.mixin", "mixins": ["Broken"]}"#,
+            ),
+            stored_entry("com/x/mixin/Broken.class", b"definitely not a class"),
+        ]),
+    );
+    let (code, _, stderr) = run(&["--scan-jar", bad_class.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("magic"), "stderr: {stderr}");
+}
+
+#[test]
+fn modpack_and_scan_jar_are_mutually_exclusive() {
+    let dir = fixture_dir("scan-mutex");
+    let pack = write_fixture(&dir, "a.mrpack", &mrpack(MODRINTH_1211));
+    let jar = write_fixture(&dir, "safe.jar", &safe_jar());
+
+    let (code, _, stderr) = run(&[
+        "--modpack",
+        pack.to_str().unwrap(),
+        "--scan-jar",
+        jar.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("mutually exclusive"), "stderr: {stderr}");
+
+    // Modpack-only flags are usage errors in scan mode.
+    for extra in [
+        vec!["--mc-version", "26.3"],
+        vec!["--flagship", "create"],
+        vec!["--profiles", "jei"],
+    ] {
+        let mut args = vec!["--scan-jar", jar.to_str().unwrap()];
+        args.extend(extra);
+        let (code, _, _) = run(&args);
+        assert_eq!(code, 2, "args {args:?} must exit 2");
+    }
+
+    // --include-client-mixins outside --scan-jar mode.
+    let (code, _, _) = run(&[
+        "--modpack",
+        pack.to_str().unwrap(),
+        "--include-client-mixins",
+    ]);
+    assert_eq!(code, 2);
+
+    // Missing --scan-jar value.
+    let (code, _, _) = run(&["--scan-jar"]);
+    assert_eq!(code, 2);
 }
 
 #[test]
