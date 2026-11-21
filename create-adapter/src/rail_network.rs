@@ -1202,7 +1202,9 @@ pub fn tick_rail_network(
                     // Move the station name into the departure event only on
                     // departure, avoiding a String clone on every waiting tick.
                     let station = std::mem::take(station);
-                    t.schedule_idx += 1;
+                    // A decoded snapshot can carry schedule_idx = usize::MAX:
+                    // saturate rather than panic on the increment.
+                    t.schedule_idx = t.schedule_idx.saturating_add(1);
                     if t.schedule.looping && t.schedule_idx >= t.schedule.instructions.len() {
                         t.schedule_idx = 0;
                     }
@@ -1215,7 +1217,7 @@ pub fn tick_rail_network(
         refresh_occupancy_gated(net, id);
         update_render_mode(net, id, loaded_chunks, &mut events);
     }
-    net.tick += 1;
+    net.tick = net.tick.wrapping_add(1);
     net.id_scratch = ids;
     events
 }
@@ -1387,8 +1389,14 @@ fn ensure_target(net: &mut RailNetwork, id: TrainId, events: &mut Vec<TransitEve
             None
         }
     } else {
-        let start = net.graph.edges[&pos_edge].to;
-        net.find_route(start, anchor.edge, &gauge).map(VecDeque::from)
+        match net.graph.edges.get(&pos_edge) {
+            // The edge under the train vanished from the public graph map:
+            // park it rather than panic on the index.
+            None => None,
+            Some(e) => net
+                .find_route(e.to, anchor.edge, &gauge)
+                .map(VecDeque::from),
+        }
     };
     let t = net.trains.get_mut(&id).expect("checked");
     match route {
@@ -1432,9 +1440,18 @@ fn step_running(net: &mut RailNetwork, id: TrainId, events: &mut Vec<TransitEven
             t.route.front().copied(),
         )
     };
-    let edge_len = net.graph.edges[&pos_edge].length();
+    let Some(edge) = net.graph.edges.get(&pos_edge) else {
+        // The edge under the train vanished from the public graph map:
+        // park it rather than panic on the index.
+        let t = net.trains.get_mut(&id).expect("checked");
+        t.speed = 0.0;
+        t.state = TrainRunState::Terminus;
+        events.push(TransitEvent::ReachedTerminus { train: id });
+        return;
+    };
+    let edge_len = edge.length();
     let remaining = (edge_len - pos_s).max(0.0);
-    let head_node = net.graph.edges[&pos_edge].to;
+    let head_node = edge.to;
 
     let mut dist_to_stop = f64::INFINITY;
     let mut stop_kind = StopKind::None;
@@ -1450,7 +1467,7 @@ fn step_running(net: &mut RailNetwork, id: TrainId, events: &mut Vec<TransitEven
                 d += if i + 1 == n {
                     target_s
                 } else {
-                    net.graph.edges[e].length()
+                    net.graph.edges.get(e).map(|x| x.length()).unwrap_or(0.0)
                 };
             }
             d
@@ -1552,7 +1569,13 @@ fn advance(net: &mut RailNetwork, id: TrainId, mut d: f64) {
             let t = net.trains.get(&id).expect("checked");
             (t.pos_edge, t.pos_s)
         };
-        let edge_len = net.graph.edges[&pos_edge].length();
+        let Some(edge_len) = net.graph.edges.get(&pos_edge).map(|e| e.length()) else {
+            // The edge under the train vanished from the public graph
+            // map: hold position rather than panic on the index.
+            let t = net.trains.get_mut(&id).expect("checked");
+            t.speed = 0.0;
+            return;
+        };
         if pos_s + d <= edge_len + 1e-9 {
             let t = net.trains.get_mut(&id).expect("checked");
             t.pos_s = (pos_s + d).min(edge_len);
@@ -1561,8 +1584,10 @@ fn advance(net: &mut RailNetwork, id: TrainId, mut d: f64) {
         let next = {
             let t = net.trains.get(&id).expect("checked");
             t.route.front().copied().or_else(|| {
-                let node = net.graph.edges[&pos_edge].to;
-                net.graph.next_edge_for(node, t.gauge())
+                net.graph
+                    .edges
+                    .get(&pos_edge)
+                    .and_then(|e| net.graph.next_edge_for(e.to, t.gauge()))
             })
         };
         match next {

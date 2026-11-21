@@ -315,7 +315,7 @@ impl AuditLog {
     /// overwritten), indexing its chunk bucket, and returning the `seq`.
     pub fn append(&mut self, mut record: AuditRecord) -> u64 {
         record.seq = self.next_seq;
-        self.next_seq += 1;
+        self.next_seq = self.next_seq.saturating_add(1);
         let seq = record.seq;
         self.records.push(record);
         self.index_record(self.records.len() - 1);
@@ -328,13 +328,14 @@ impl AuditLog {
     /// write leaves the log unchanged.
     pub fn append_to<W: Write>(&mut self, out: &mut W, mut record: AuditRecord) -> io::Result<u64> {
         record.seq = self.next_seq;
+        let seq = record.seq;
         let frame = Self::encode_frame(&record);
         out.write_all(&frame)?;
-        self.next_seq += 1;
+        self.next_seq = self.next_seq.saturating_add(1);
         self.records.push(record);
         self.index_record(self.records.len() - 1);
         self.enforce_ram_window();
-        Ok(self.next_seq - 1)
+        Ok(seq)
     }
 
     /// Open `path` in append mode and write the record's frame. Existing
@@ -520,9 +521,11 @@ impl AuditLog {
     }
 
     /// Insert a record exactly as stored (its `seq` is trusted, not
-    /// re-assigned), index it, and push `next_seq` past it.
+    /// re-assigned), index it, and push `next_seq` past it. A hostile WAL
+    /// can carry `seq == u64::MAX`; saturating keeps the counter pinned at
+    /// the top instead of panicking or wrapping it to `0`.
     fn push_recovered(&mut self, record: AuditRecord) {
-        self.next_seq = self.next_seq.max(record.seq + 1);
+        self.next_seq = self.next_seq.max(record.seq.saturating_add(1));
         self.records.push(record);
         self.index_record(self.records.len() - 1);
         self.enforce_ram_window();
@@ -990,6 +993,30 @@ mod tests {
         let (log, truncated) = AuditLog::recover(&bytes);
         assert_eq!(log.len(), 1);
         assert_eq!(truncated, bad.len() + good_c.len());
+    }
+
+    #[test]
+    fn recover_survives_hostile_seq_u64_max() {
+        // A forged WAL frame can carry seq = u64::MAX: pushing next_seq
+        // past it must saturate rather than panic (debug) or wrap to 0
+        // (release, silently reusing sequence numbers).
+        let frame = AuditLog::encode_frame(&rec(u64::MAX, 1, "forged", [0, 0, 0]));
+        let (mut log, truncated) = AuditLog::recover(&frame);
+        assert_eq!(truncated, 0);
+        assert_eq!(log.len(), 1);
+
+        // Later appends keep assigning the saturated sequence without
+        // panicking or wrapping back to small sequence numbers.
+        assert_eq!(log.append(rec(0, 2, "a", [0, 0, 0])), u64::MAX);
+        assert_eq!(log.append(rec(0, 3, "b", [0, 0, 0])), u64::MAX);
+        let mut wal = Vec::new();
+        assert_eq!(
+            log.append_to(&mut wal, rec(0, 4, "c", [0, 0, 0]))
+                .expect("append_to must not panic"),
+            u64::MAX,
+            "append_to must return the assigned (saturated) seq"
+        );
+        assert!(!wal.is_empty());
     }
 
     #[test]

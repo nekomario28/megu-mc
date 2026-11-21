@@ -321,13 +321,11 @@ impl BlastVolumeCache {
 
     /// Cache bounds `[min, max]` (inclusive, `i64` for overflow safety).
     pub fn bounds(&self) -> ([i64; 3], [i64; 3]) {
-        let mut max = [0i64; 3];
-        for axis in 0..3 {
-            max[axis] = self
-                .min[axis]
+        let max = std::array::from_fn(|axis| {
+            self.min[axis]
                 .saturating_add(self.dims[axis] as i64)
-                .saturating_sub(1);
-        }
+                .saturating_sub(1)
+        });
         (self.min, max)
     }
 

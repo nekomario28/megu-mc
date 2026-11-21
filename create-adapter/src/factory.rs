@@ -12,7 +12,7 @@ use mc_spine_core::perf_kit::{
     FingerprintStats,
 };
 use mod_offload::fluid_network::FluidError;
-use mod_offload::kinetic_graph::{KineticNode, NetworkStatus, Solution};
+use mod_offload::kinetic_graph::{GraphError, KineticNode, NetworkStatus, Solution};
 use mod_offload::recipe_processor::{Drive, Recipe, RecipeError, Stack};
 use mod_offload::region_scheduler::{
     BatchReport, RegionBudget, RegionKey, RegionReport, RegionScheduler, MAX_BATCH_BYTES,
@@ -307,13 +307,11 @@ impl CreateFactory {
             .unwrap_or(Axis::Y);
         let powered = entry.property("powered") == Some("true");
 
-        let id = self.next_node_id;
-        self.next_node_id += 1;
         let region_key = pos.region_key();
         self.active_regions.insert(region_key);
 
-        let placed = PlacedKinetic {
-            id,
+        let mut placed = PlacedKinetic {
+            id: 0,
             state_id,
             role: def.role,
             axis,
@@ -322,11 +320,21 @@ impl CreateFactory {
             stress_capacity: def.capacity_factor,
         };
         let input = kinetic_node_input(placed, 1.0);
-        self.scheduler
-            .region_mut(region_key)
-            .kinetic
-            .add_node(id, input)
-            .expect("unique kinetic node id");
+        let region = self.scheduler.region_mut(region_key);
+        // Draw ids until the graph accepts one: next_node_id wraps rather
+        // than panicking past u32::MAX, and an id still live in the graph
+        // is skipped (DuplicateNode) instead of panic-colliding. Any other
+        // failure means the registry-derived input itself was rejected —
+        // placement aborts rather than panicking.
+        placed.id = loop {
+            let id = self.next_node_id;
+            self.next_node_id = self.next_node_id.wrapping_add(1).max(1);
+            match region.kinetic.add_node(id, input) {
+                Ok(()) => break id,
+                Err(GraphError::DuplicateNode(_)) => continue,
+                Err(_) => return Vec::new(),
+            }
+        };
         self.kinetics.insert(pos, placed);
 
         // Connect compatible adjacent nodes within the same region.

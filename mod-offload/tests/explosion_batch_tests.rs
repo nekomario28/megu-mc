@@ -43,13 +43,10 @@ fn scalar_reference(
     let mut rng = XorShift64::new(seed);
     let mut density: HashMap<[i32; 3], f32> = HashMap::new();
     let in_bounds = |p: [i32; 3]| -> bool {
-        for axis in 0..3 {
-            let v = i64::from(p[axis]);
-            if v < bounds.0[axis] || v > bounds.1[axis] {
-                return false;
-            }
-        }
-        true
+        p.iter().enumerate().all(|(axis, &v)| {
+            let v = i64::from(v);
+            v >= bounds.0[axis] && v <= bounds.1[axis]
+        })
     };
     for i in 0..RAY_GRID {
         for j in 0..RAY_GRID {

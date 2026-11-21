@@ -888,6 +888,52 @@ fn audit_query_rows_filters_and_json() {
     assert!(text.contains("3 match"), "{text}");
     assert!(!text.contains("pos=(200,60,200)"), "{text}");
 
+    // A negative radius is clamped to 0 by AuditQuery::within — only the
+    // exact-position record survives, and the query still exits 0.
+    let out = run(&[
+        "audit-query",
+        "--log",
+        log_str,
+        "--pos",
+        "4,64,8",
+        "--radius",
+        "-1",
+    ]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(text.contains("1 match"), "{text}");
+    assert!(text.contains("actor=Griefer"), "{text}");
+
+    // An i32::MAX radius must answer instantly: the spatial index walks
+    // occupied chunk buckets, not the coordinate range, and the squared
+    // distance math is i128-safe at i32 extremes.
+    let out = run(&[
+        "audit-query",
+        "--log",
+        log_str,
+        "--pos",
+        "0,64,0",
+        "--radius",
+        "2147483647",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("4 match"), "{}", stdout(&out));
+
+    // The opposite extreme: a huge-radius sphere around an i32-corner
+    // center genuinely contains none of the records (their Euclidean
+    // distance ~3e9 exceeds i32::MAX) — and still answers instantly.
+    let out = run(&[
+        "audit-query",
+        "--log",
+        log_str,
+        "--pos",
+        "2147483647,0,-2147483648",
+        "--radius",
+        "2147483647",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("0 match"), "{}", stdout(&out));
+
     // --limit caps the printed rows; the matched count still reflects the
     // full filter result.
     let out = run(&["audit-query", "--log", log_str, "--limit", "2"]);

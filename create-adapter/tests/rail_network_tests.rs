@@ -795,3 +795,65 @@ fn rail_snapshot_fails_closed_on_corruption() {
     forged.extend_from_slice(&payload);
     assert!(decode_snapshot(&forged).is_err());
 }
+
+#[test]
+fn rail_snapshot_hostile_schedule_idx_does_not_panic() {
+    // A forged RAIL payload can encode schedule_idx = usize::MAX: the
+    // WaitingAtStation departure increment must saturate, never panic
+    // (debug) or wrap to 0 and silently restart a finished schedule.
+    let mut net = snapshot_fixture();
+    {
+        let t = net.trains.get_mut(&TrainId(42)).unwrap();
+        t.state = TrainRunState::WaitingAtStation {
+            station: "limbo_halt".into(),
+            ticks_left: 0,
+        };
+        t.schedule_idx = usize::MAX;
+    }
+    let mut decoded = decode_snapshot(&encode_snapshot(&net)).unwrap();
+    assert_eq!(
+        decoded.trains[&TrainId(42)].schedule_idx,
+        usize::MAX,
+        "the hostile index must survive the round trip for this test to be meaningful"
+    );
+
+    // Looping schedule: the out-of-range index wraps back to the start.
+    let events = tick_rail_network(&mut decoded, &empty_loaded());
+    assert!(events.iter().any(
+        |e| matches!(e, TransitEvent::DepartedStation { train, .. } if *train == TrainId(42))
+    ));
+    assert_eq!(decoded.trains[&TrainId(42)].schedule_idx, 0);
+    assert_eq!(decoded.trains[&TrainId(42)].state, TrainRunState::Running);
+
+    // Point-to-point schedule: the saturated index runs the train to
+    // Terminus instead of indexing past the instruction list.
+    let mut net = snapshot_fixture();
+    {
+        let t = net.trains.get_mut(&TrainId(42)).unwrap();
+        t.schedule.looping = false;
+        t.state = TrainRunState::WaitingAtStation {
+            station: "limbo_halt".into(),
+            ticks_left: 0,
+        };
+        t.schedule_idx = usize::MAX;
+    }
+    let mut decoded = decode_snapshot(&encode_snapshot(&net)).unwrap();
+    let _ = tick_rail_network(&mut decoded, &empty_loaded());
+    let events = tick_rail_network(&mut decoded, &empty_loaded());
+    assert_eq!(decoded.trains[&TrainId(42)].state, TrainRunState::Terminus);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, TransitEvent::ReachedTerminus { train } if *train == TrainId(42))));
+}
+
+#[test]
+fn rail_snapshot_hostile_tick_wraps_without_panic() {
+    // A forged snapshot can stamp tick = u64::MAX: the counter wraps
+    // rather than panicking in a debug build.
+    let mut net = snapshot_fixture();
+    net.tick = u64::MAX;
+    let mut decoded = decode_snapshot(&encode_snapshot(&net)).unwrap();
+    assert_eq!(decoded.tick, u64::MAX);
+    let _ = tick_rail_network(&mut decoded, &empty_loaded());
+    assert_eq!(decoded.tick, 0);
+}

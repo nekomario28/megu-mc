@@ -387,3 +387,38 @@ fn contraption_rejects_oversized_and_backpressured_edits_before_mutating() {
         assert_eq!(mso_contraption_free(body), MsoStatus::Ok);
     }
 }
+
+#[test]
+fn ffi_rejects_misaligned_pointers_without_dereferencing() {
+    // SAFETY: every pointer passed below is null, misaligned, or a live
+    // owned handle; the API must reject the bad ones before any access.
+    unsafe {
+        // A misaligned output slot is refused by validate_ptr's alignment
+        // check before a single byte is written.
+        let mut cell: usize = 0;
+        let misaligned_out = ((&mut cell as *mut usize) as usize + 1) as *mut *mut MsoRegion;
+        assert_eq!(
+            mso_region_create(0, 0, 0, misaligned_out),
+            MsoStatus::InvalidArgument
+        );
+
+        // A misaligned handle is refused, not dereferenced.
+        let mut a = ptr::null_mut();
+        assert_eq!(mso_region_create(3, 4, 5, &mut a), MsoStatus::Ok);
+        let misaligned_handle = (a as usize + 1) as *mut MsoRegion;
+        let mut step = MsoStepReport::default();
+        assert_eq!(
+            mso_region_step(misaligned_handle, 1, 1, u64::MAX, &mut step),
+            MsoStatus::InvalidArgument
+        );
+        assert_eq!(
+            mso_region_free(misaligned_handle),
+            MsoStatus::InvalidArgument
+        );
+
+        // Freeing a null handle is a documented no-op; the live handle
+        // still frees normally afterwards.
+        assert_eq!(mso_region_free(ptr::null_mut()), MsoStatus::Ok);
+        assert_eq!(mso_region_free(a), MsoStatus::Ok);
+    }
+}
