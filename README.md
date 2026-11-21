@@ -36,6 +36,15 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 設定ファイルは任意です。初回起動時にカレントディレクトリへ短い `server.toml` を書き出します（`MC_SPINE_CONFIG` で場所を変更可）。`[server]` の各キーは既存の `MC_SPINE_*` 環境変数に対応し、環境変数が常に優先されます。`[anticheat]` は on/off の 4 項目です: `enabled`（移動・落下・設置チェックの on/off）、`antixray`（埋まったバニラ鉱石＋`#c:ores`/`#forge:ores` 等の Mod 鉱石・チェスト・埋没 BlockEntity NBT を隠す）、`antifullbright`（密閉された地下空洞の光を送らない。クライアントのガンマ/フルブライト自体はサーバーからは止められません）、`check_ops`（`true` で OP も検査対象）。しきい値はプレイヤーの属性・エフェクト・エンチャント・Mod ブロック輸送からサーバー側で毎回自動計算し（`src/anticheat.rs`）、違反は引き戻し・取り消しのみでキックしません。クリエイティブ・スペクテイターは常に対象外で、サバイバル復帰時は短い猶予が付きます。非バニラコマンドは追加せず、既存のバニラ `/reload` で `server.toml` と Mod タグも自然に再読込されます。環境変数 `MC_SPINE_ANTICHEAT=off` でも無効化できます。
 
+## 導入・周辺ツール（Alpha）
+
+- **1 コマンド導入**: `python3 tools/megu_start.py --dir ./server [--modpack pack.mrpack] [--accept-eula]`（`[]` 内は任意）。ローカルサーバーの初期設定と起動を補助します。`--accept-eula` は EULA に同意した場合のみ指定してください。`--modpack` は事前検査用で、Mod の自動ダウンロード・導入はしません。
+- **任意のローカル Mod 翻訳**: `python3 tools/megu_translate.py --mods-dir ./mods --out ./megu-auto-lang-ja_jp.zip`。欠けている日本語訳から、ローカルで個人利用するためのクライアント用リソースパックをオンデマンド生成します。ローカルの翻訳 API が必要で、既定の接続先は `127.0.0.1` のループバックのみです。外部 API への接続は `--allow-remote-llm` による明示的な許可が必要です。
+- **JVM 不要の Mod 検査**: `mc-spine-mod-check --scan-mods-dir ./mods` で `mods/` 内の JAR を静的検査し、互換性経路を分類します。任意の Mod が動作する保証ではありません。
+- **ワールド操作**: `mc-spine-world-migrate` は `inspect-anvil`、`migrate-level`、`audit-query`、`rollback`、`pregen-plan` を提供します。`pregen-plan` は事前生成の計画のみを行います。
+- **クライアント CLI**: `mc-spine-client` は `--ping <host:port>`、`--join-code <code> --relay <host:port>`、`--gpu-backend classic-low-spec`、`--background-fps <0..240>` を提供します。
+- **Mod 統合の検証**: `cargo check --offline --locked --features mod-suite` で `mod-suite` feature を有効にしたビルドを検査できます。
+
 ## 軽量化 Mod について（プレイヤー・運用者向け）
 
 - `Sodium` / `Embeddium` / `Lithium` / `Starlight` / `FerriteCore` / `ModernFix` / `EntityCulling` / `Distant Horizons` などの軽量化 Mod は別途導入する必要はありません（描画カリング・ライティング・パレット圧縮・並列チャンク処理・遠景 LOD といった同等カテゴリの最適化を、`mc-spine` 独自のクリーンルーム Rust 実装として標準搭載しています）。

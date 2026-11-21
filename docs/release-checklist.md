@@ -19,6 +19,14 @@ and [tests/dev_check_test.py](../tests/dev_check_test.py).
 `--without-mutations` skips only the mutation campaign; every gate above
 still runs.
 
+The pre-release gate also runs [tests/verify_gate_coverage_test.py](../tests/verify_gate_coverage_test.py),
+[tools/debt_ratchet.sh](../tools/debt_ratchet.sh) (including the
+`.lock().unwrap()` ceiling), adversarial decoder/parser fuzz tests in
+`proto`, `state-store`, `mod-adapter-core` and `server-files`, and
+[tests/live_parity_e2e_wire.py](../tests/live_parity_e2e_wire.py) both as an
+offline self-test and against the built server. It checks the `mod-suite`
+feature as well.
+
 ## 2. Clean public export
 
 Produce the Mojang-free export and let `--verify` rehearse it:
@@ -43,10 +51,21 @@ python3 tools/provenance_check.py --strict-public
 stripped paths are untracked *and* ignored, so a release commit cannot pick
 them up again by accident.
 
-## 3. Regenerate the build inputs the export strips
+T1-2 removed four non-test generated-data `include_bytes!` calls. A stripped
+public export now compiles its binaries without any Mojang data files. Check
+this separately in the exported directory:
 
-The release build compiles four generated tables into the binary, so the
-export needs the 1.21.1 data once:
+```sh
+cargo check --bins --offline --locked
+```
+
+This check establishes buildability of the stripped binaries, not playable
+world generation or runtime data availability.
+
+## 3. Regenerate runtime data for playable worlds
+
+For actual world generation and gameplay, regenerate the local 1.21.1 data
+from the operator's own server jar before building a playable release:
 
 ```sh
 bash tools/vanilla_data/gen_vanilla_data.sh \
@@ -79,6 +98,10 @@ tarball (sorted members, mtime 0, normalised modes) and `verify` re-reads
 the tarball bytes: manifest, `SHA256SUMS` and per-member records must all
 agree, and the purity guard rejects any Mojang-derived or
 repository-internal member.
+The payload includes `tools/megu_start.py` and `tools/megu_translate.py` as
+executable helpers. Separately built `mc-spine-client`, `mc-spine-mod-check`
+and `mc-spine-world-migrate` binaries can be included with repeated
+`--extra-binary <path>` arguments to `build`.
 
 ## 5. Container image
 

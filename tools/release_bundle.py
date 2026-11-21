@@ -10,7 +10,7 @@
 
 `build` packages the primary release binary plus any companion binaries given
 with the repeatable `--extra-binary` flag, the licence/legal/docs files and
-the user-facing vanilla-data tools into
+the user-facing setup, translation and vanilla-data tools into
 
   <out-dir>/mc-spine-<version>-<target>.tar.gz   the bundle
   <out-dir>/release-manifest.json                machine-readable contents
@@ -24,9 +24,10 @@ Inside the tarball every member lives under the single directory
       LICENSING.md, THIRD_PARTY.md, README.md    (0644)
   <prefix>/tools/vanilla_data/gen_vanilla_data.sh
   <prefix>/tools/vanilla_data/version_pack.py
-  <prefix>/tools/mod_launcher.py                 the tools a public user needs
-                                                 to regenerate the data the
-                                                 clean tree does not ship
+  <prefix>/tools/mod_launcher.py
+  <prefix>/tools/megu_start.py
+  <prefix>/tools/megu_translate.py               public setup/translation and
+                                                 data regeneration helpers
 
 Determinism: members are sorted by name, written to a USTAR archive with
 mtime 0, uid/gid 0, empty uname/gname and modes normalised to 0644/0755, and
@@ -97,6 +98,8 @@ REQUIRED_TOOLS = (
     "tools/vanilla_data/gen_vanilla_data.sh",
     "tools/vanilla_data/version_pack.py",
     "tools/mod_launcher.py",
+    "tools/megu_start.py",
+    "tools/megu_translate.py",
 )
 
 # Basenames that are forbidden wherever they appear in a bundle. The two
@@ -698,7 +701,8 @@ def self_test():
 
         # Layout: the manifest records every expected member exactly once.
         manifest = load_json(manifest_path, MANIFEST_NAME)
-        expected = {f"{bundle_stem('0.1.0', 'x86_64-unknown-linux-gnu')}/{name}"
+        prefix = bundle_stem("0.1.0", "x86_64-unknown-linux-gnu")
+        expected = {f"{prefix}/{name}"
                     for name in [PRODUCT, *REQUIRED_DOCS, *REQUIRED_TOOLS]}
         check("manifest: files cover binary + docs + tools",
               {record["path"] for record in manifest["files"]} == expected)
@@ -706,6 +710,10 @@ def self_test():
               manifest["mc_targets"] == MC_TARGETS
               and manifest["license"] == LICENSE_ID
               and manifest["subcrate_license"] == SUBCRATE_LICENSE)
+        modes = {record["path"]: record["mode"] for record in manifest["files"]}
+        check("manifest: onboarding and translation helpers record mode 0755",
+              all(modes[f"{prefix}/{name}"] == "0755"
+                  for name in ("tools/megu_start.py", "tools/megu_translate.py")))
 
         # Multi-binary suite: repeatable --extra-binary stages each companion
         # under its own basename with mode 0755, keeps the whole artifact set
@@ -724,7 +732,6 @@ def self_test():
         check("build: multi-binary suite build succeeds", rc == 0)
         rc, out_m2 = _build(tmp, "multi-b", repo, binary, extra=suite_flags)
         check("build: second multi-binary suite build succeeds", rc == 0)
-        prefix = bundle_stem("0.1.0", "x86_64-unknown-linux-gnu")
         for name in (f"{prefix}.tar.gz", MANIFEST_NAME, SUMS_NAME):
             check(f"deterministic: multi-binary {name} is byte-identical",
                   (out_m1 / name).read_bytes() == (out_m2 / name).read_bytes())
