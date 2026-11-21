@@ -1948,6 +1948,19 @@ fn classify_interp_inner(dfs: &[DF], inner: usize) -> InterpKind {
     InterpKind::General(inner)
 }
 
+/// `(grid slot, inner)` for every `InterpKind::General` entry: the roots
+/// `DfCols::compile` lowers into the corner-grid column programs. `YNoise`
+/// grids belong to the specialised `fill_ynoise_grid` path and are not roots.
+fn general_roots(nodes: &[(usize, InterpKind)]) -> Vec<(usize, usize)> {
+    nodes
+        .iter()
+        .filter_map(|&(iid, kind)| match kind {
+            InterpKind::General(inner) => Some((iid, inner)),
+            InterpKind::YNoise { .. } => None,
+        })
+        .collect()
+}
+
 fn detect_upper_bound_interp(dfs: &[DF], final_density: usize) -> Option<usize> {
     let base = match dfs.get(final_density)? {
         DF::Add(a, b) if matches!(dfs.get(*b), Some(DF::Beardifier)) => *a,
@@ -2181,6 +2194,13 @@ pub struct GenData {
     /// `final_density` compiled once into a flat post-order program (see
     /// `DfProg`). `None` keeps the interpreted evaluator (`MC_SPINE_DF_INTERP`).
     dfprog: Option<Box<DfProg>>,
+    /// The `interpolated` inputs of the density path, compiled for the
+    /// corner-grid column sweep (`DfCols`): a hoisted 2D prefix per `(x, z)`
+    /// column plus a 3D program per grid. `None` keeps `eval_flat`
+    /// (`MC_SPINE_DF_INTERP` or `MC_SPINE_DFCOL=0`).
+    dfcols: Option<Box<DfCols>>,
+    /// The same for the vein-path `interpolated` inputs (`vein_interp_nodes`).
+    vfcols: Option<Box<DfCols>>,
 }
 struct AqCell12 {
     valid: bool,
@@ -2235,6 +2255,10 @@ pub struct Gen {
     // scratch memo for the vein sampler's density evaluations
     memo: HashMap<(usize, i32, i32, i32), f64>,
     corner_memo: Option<FlatCornerMemo>,
+    /// Scratch shared by `DfCols` evaluations (stack + hoisted 2D slots), taken
+    /// by a corner-grid fill and put back when it ends so the next chunk reuses
+    /// the same buffers.
+    dfcol_scratch: Option<DfColScratch>,
     /// Chunk-local aquifer grids (see [`AqChunkCache`]). A small MRU ring rather than a
     /// single slot: carvers and features read neighbour chunks while a chunk is being
     /// filled, and a one-slot cache would recompute the same 12-cell neighbourhood.
@@ -3690,6 +3714,8 @@ impl Gen {
                 upper_bound_interp: None,
                 fallback_share: std::sync::Arc::new(TerrainShare::new()),
                 dfprog: None,
+                dfcols: None,
+                vfcols: None,
             }),
             aq_chunk: std::array::from_fn(|_| None),
             aq_chunk_use: [0; AQ_CHUNK_SLOTS],
@@ -3750,6 +3776,7 @@ impl Gen {
             a3a_dispatch: None,
             memo: HashMap::new(),
             corner_memo: None,
+            dfcol_scratch: None,
             mineshaft_spawners: HashSet::new(),
             payload_sources: HashSet::new(),
             feat_hm: HashMap::new(),
@@ -4104,6 +4131,10 @@ impl Gen {
         g.vein_interp_nodes = vein_interp_nodes;
         g.upper_bound_interp = detect_upper_bound_interp(&g.dfs, g.final_density);
         g.dfprog = DfProg::compile(&g);
+        // BOT-DF-BATCH: the `interpolated` inputs compiled for the corner-grid
+        // column sweep (a hoisted 2D prefix per column plus a 3D tail per level).
+        g.dfcols = DfCols::compile(&g, &general_roots(&g.density_interp_nodes));
+        g.vfcols = DfCols::compile(&g, &general_roots(&g.vein_interp_nodes));
         // Diagnostic counters sized to this generator's node table (WG_COUNT only).
         if std::env::var_os("WG_COUNT").is_some() {
             g.df_hits_init();
@@ -5497,6 +5528,17 @@ enum Op {
     Jump(u32),
     /// Discard the top slot.
     Drop,
+    /// Column evaluator (`DfCols`) only: push `v2[k]`, the value the 2D prefix
+    /// computed once for this `(x, z)` column. `k < n2` is a compile-time
+    /// invariant (see `DfCompiler::emit_hoisted`), which is why the interpreter
+    /// indexes `v2` unchecked.
+    Push2(u32),
+    /// Column evaluator only: pop the top slot into `v2[k]`; terminates one
+    /// hoisted subtree inside `ops2`. Same `k < n2` invariant as `Push2`.
+    Store2(u32),
+    /// End of the `ops2` prefix list: a program that leaves its values in `v2`,
+    /// not on the stack, so it cannot share `Halt`'s "one value on top" rule.
+    Done,
     Halt,
 }
 
@@ -5592,6 +5634,7 @@ impl DfProg {
             max_depth: 0,
             consts: vec![None; n],
             consts_known: vec![false; n],
+            col: None,
         };
         c.emit(d.final_density);
         if c.ops.len() < 8 {
@@ -5635,6 +5678,26 @@ impl DfProg {
         z: i32,
         st: &mut [f64],
     ) -> f64 {
+        df_run(&self.ops, g, cc, x, y, z, st, &mut [], None)
+    }
+}
+
+/// The stack-machine interpreter shared by `DfProg` (the whole `ops` list, an
+/// empty `v2`) and `DfCols` (the `ops2` prefix, then one 3D program per grid):
+/// one instruction set and one dispatch. `Push2`/`Store2`/`Done` appear only in
+/// `DfCols` lists, where every slot index was proved `< n2` at compile time.
+fn df_run(
+    ops: &[Op],
+    g: &Gen,
+    cc: Option<&ChunkCols>,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: &mut [f64],
+    v2: &mut [f64],
+    mut cm: Option<&mut HashMap<(usize, i32, i32, i32), f64>>,
+) -> f64 {
+    {
         let mut sp = 0usize;
         let mut pc = 0usize;
         macro_rules! bin {
@@ -5651,7 +5714,7 @@ impl DfProg {
             }};
         }
         loop {
-            match self.ops[pc] {
+            match ops[pc] {
                 Op::Push(v) => {
                     st[sp] = v;
                     sp += 1;
@@ -5752,8 +5815,16 @@ impl DfProg {
                     None => pc += 1,
                 },
                 Op::Call(id) => {
-                    let mut memo = HashMap::new();
-                    st[sp] = g.eval_c(id as usize, x, y, z, &mut memo, cc);
+                    st[sp] = if let Some(m) = cm.as_deref_mut() {
+                        // The memo's scope is one `Call`; clearing first makes
+                        // the reuse bit-identical to the fresh `HashMap` the
+                        // interpreter arm would build.
+                        m.clear();
+                        g.eval_c(id as usize, x, y, z, m, cc)
+                    } else {
+                        let mut memo = HashMap::new();
+                        g.eval_c(id as usize, x, y, z, &mut memo, cc)
+                    };
                     sp += 1;
                     pc += 1;
                 }
@@ -5782,6 +5853,29 @@ impl DfProg {
                     sp -= 1;
                     pc += 1;
                 }
+                Op::Push2(k) => {
+                    // SAFETY: `k < n2` is invariant under `DfCols` compilation
+                    // (`emit_hoisted` hands out dense slots), and the column
+                    // callers all run with `v2.len() >= n2`. `DfProg` programs
+                    // never carry this op.
+                    debug_assert!((k as usize) < v2.len());
+                    st[sp] = unsafe { *v2.get_unchecked(k as usize) };
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Store2(k) => {
+                    sp -= 1;
+                    // SAFETY: as `Op::Push2`.
+                    debug_assert!((k as usize) < v2.len());
+                    unsafe { *v2.get_unchecked_mut(k as usize) = st[sp] };
+                    pc += 1;
+                }
+                Op::Done => {
+                    // Every `Store2` returns the stack to depth zero, so the
+                    // prefix must end empty; the value is never read.
+                    debug_assert_eq!(sp, 0, "2D prefix left {sp} values, not 0");
+                    return 0.0;
+                }
                 Op::Halt => {
                     // The program leaves exactly one value. Compile-time depth and
                     // runtime depth disagreeing is how a producer written as an
@@ -5793,6 +5887,239 @@ impl DfProg {
             }
         }
     }
+}
+
+// ---------- BOT-DF-BATCH: the corner-grid column evaluator ----------
+//
+// The corner-grid fill walks `for yi in 0..ny` per `(x, z)` column and used to
+// answer every level through `eval_flat`: a recursive interpreter that checks
+// `is_2d` and the `Cache` generation on every node visit. The flat memo already
+// keeps each y-independent node to one evaluation per column; what remains per
+// level is the dispatch itself. `DfCols` compiles the same split into
+// instructions: every `is_2d` subtree is emitted once into `ops2` (run once per
+// column, its result held in `v2[k]`), and the per-level program keeps only the
+// 3D tail, reading the hoisted values through `Op::Push2`. The instruction set,
+// the operand order and the `Op::Call` fallback are `DfProg`'s, so a cell is
+// the `eval_flat` value bit for bit.
+//
+// The two pieces share the shape the reference evaluator already proves:
+//
+// * **`ops2` runs where `FlatCornerMemo::next_2d` fired.** A y-independent
+//   node is evaluated once per `(x, z)`, by slot index rather than by a
+//   generation-stamped array read. Nested is_2d nodes emit inline (see
+//   `emit_hoisted`), so the prefix is a straight run.
+// * **The 3D tail runs per `iy`.** `Op::Push2(k)` stands where the subtree's
+//   instructions stood; branches still read the value off the same stack slot.
+//   Laziness only ever skips work: a hoisted node that sat under an untaken
+//   branch is computed once per column anyway, which cannot change a value.
+
+/// The compiled form of one interp-grid family (the density set, or the vein
+/// set): one shared 2D prefix plus one program per grid.
+#[derive(Clone)]
+struct DfCols {
+    /// Hoisted 2D subtrees, each terminated by `Op::Store2`; the list itself
+    /// ends at `Op::Done`. Runs once per `(x, z)` column.
+    ops2: Box<[Op]>,
+    /// One post-order program per `interpolated` grid, `Op::Push2` where the
+    /// interpreter re-evaluated a y-independent subtree. Each ends at `Op::Halt`.
+    progs: Box<[Box<[Op]>]>,
+    /// `interpolated` node id (the `ChunkCols::grids` index) -> `progs` index,
+    /// `u32::MAX` for a node this set did not compile.
+    pi_of: Box<[u32]>,
+    /// Peak stack depth across `ops2` and every program; one scratch serves all.
+    slots: usize,
+    /// `v2` length: the hoisted 2D value count.
+    n2: usize,
+}
+
+/// Scratch shared by every `DfCols` evaluation on one generator: the stack and
+/// the hoisted 2D values, allocated once and reused across all `ny` levels of a
+/// `(cx, cz)` column and across chunks. `v2` is fully rewritten by `ops2`
+/// before any `Op::Push2` reads it, so no zeroing is needed between columns.
+#[derive(Default)]
+struct DfColScratch {
+    st: Vec<f64>,
+    v2: Vec<f64>,
+    /// The memo `Op::Call` would otherwise allocate fresh on every dispatch;
+    /// it is cleared per call, so the reuse changes nothing but the
+    /// allocation.
+    cm: HashMap<(usize, i32, i32, i32), f64>,
+}
+
+impl DfCols {
+    /// Compile one program per `(grid, inner)` pair, sharing the hoisted 2D
+    /// prefix so a node two inputs read is still evaluated once per column.
+    /// `None` when the switch keeps the interpreter (`MC_SPINE_DF_INTERP`) or
+    /// the set has no `InterpKind::General` inputs.
+    fn compile(d: &GenData, roots: &[(usize, usize)]) -> Option<Box<DfCols>> {
+        if roots.is_empty() || df_compile_disabled() {
+            return None;
+        }
+        debug_assert_eq!(
+            d.is_2d.len(),
+            d.dfs.len(),
+            "is_2d must cover the node table before column compilation"
+        );
+        let n = d.dfs.len();
+        let mut c = DfCompiler {
+            d,
+            ops: Vec::new(),
+            depth: 0,
+            max_depth: 0,
+            consts: vec![None; n],
+            consts_known: vec![false; n],
+            col: Some(ColEmit {
+                ops2: Vec::new(),
+                slot_of: vec![u32::MAX; n],
+                n2: 0,
+            }),
+        };
+        let mut pi_of = vec![u32::MAX; n];
+        let mut progs = Vec::with_capacity(roots.len());
+        for &(slot, inner) in roots {
+            pi_of[slot] = progs.len() as u32;
+            c.emit(inner);
+            c.ops.push(Op::Halt);
+            c.depth = 0;
+            progs.push(std::mem::take(&mut c.ops).into_boxed_slice());
+        }
+        let col = c.col.take().expect("column emission state");
+        let mut ops2 = col.ops2;
+        ops2.push(Op::Done);
+        let n2 = col.n2 as usize;
+        // The invariant `v2` indexing relies on: every slot index emitted is
+        // `< n2`, because `emit_hoisted` hands out dense slots. Debug-check it
+        // here, at compile time, rather than per access.
+        debug_assert!(ops2
+            .iter()
+            .chain(progs.iter().flat_map(|p| p.iter()))
+            .all(|op| !matches!(op, Op::Push2(k) | Op::Store2(k) if (*k as usize) >= n2)));
+        Some(Box::new(DfCols {
+            ops2: ops2.into_boxed_slice(),
+            progs: progs.into_boxed_slice(),
+            pi_of: pi_of.into_boxed_slice(),
+            slots: c.max_depth.max(1),
+            n2,
+        }))
+    }
+
+    /// `Op::Push2` for one grid's program, or `None` when the set did not
+    /// compile this `interpolated` node (it is a `YNoise` grid the specialised
+    /// fill owns).
+    fn prog<'a>(&'a self, slot: usize) -> Option<&'a [Op]> {
+        self.pi_of
+            .get(slot)
+            .and_then(|&pi| (pi != u32::MAX).then_some(pi))
+            .map(|pi| &*self.progs[pi as usize])
+    }
+
+    /// The 2D prefix for one `(x, z)` column: every `Op::Push2` the level
+    /// programs dispatch reads a slot this fills. `y` is immaterial — every op
+    /// in `ops2` is y-independent, the same invariant `FlatCornerMemo` holds
+    /// under `cur_2d`.
+    fn begin(&self, g: &Gen, x: i32, z: i32, sc: &mut DfColScratch) {
+        #[cfg(test)]
+        DFCOL_BEGINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        df_run(&self.ops2, g, None, x, 0, z, &mut sc.st, &mut sc.v2, Some(&mut sc.cm));
+    }
+
+    /// One corner's density: `eval_flat(inner, x, y, z)` compiled.
+    fn eval(&self, ops: &[Op], g: &Gen, x: i32, y: i32, z: i32, sc: &mut DfColScratch) -> f64 {
+        df_run(ops, g, None, x, y, z, &mut sc.st, &mut sc.v2, Some(&mut sc.cm))
+    }
+
+    /// Four levels of one column's tail program — `y0, y0+ystep, y0+2*ystep,
+    /// y0+3*ystep` — as one `run4y_avx2` pass. `None` from the vector arm (a
+    /// conditional that found the lanes disagreeing) or a host without AVX2
+    /// falls back to four scalar `eval`s, so the result is always the four
+    /// `eval` results bit for bit. `df4_disabled` gates the arm the same way
+    /// `DfProg::eval_x4`'s is gated.
+    fn eval_y4(
+        &self,
+        ops: &[Op],
+        g: &Gen,
+        x: i32,
+        y0: i32,
+        ystep: i32,
+        z: i32,
+        sc: &mut DfColScratch,
+    ) -> [f64; DF4] {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.slots <= DF4_SLOTS && !df4_disabled() && df4_avx2() {
+                // SAFETY: `df4_avx2` proved the feature is present at runtime,
+                // and `slots <= DF4_SLOTS` bounds the vector stack.
+                if let Some(v) = unsafe { run4y_avx2(ops, &sc.v2, g, None, x, y0, ystep, z) }
+                {
+                    return v;
+                }
+            }
+        }
+        std::array::from_fn(|k| self.eval(ops, g, x, y0 + (k as i32) * ystep, z, sc))
+    }
+
+    /// Eight levels of the tail: `run8y_avx512` where the CPU and the program
+    /// allow it, two `eval_y4` passes where it does not — the same composition
+    /// `trilinear_x8` and `DfProg::eval_x8` use. `df8_disabled` gates the arm
+    /// the same way `DfProg::eval_x8`'s is gated.
+    fn eval_y8(
+        &self,
+        ops: &[Op],
+        g: &Gen,
+        x: i32,
+        y0: i32,
+        ystep: i32,
+        z: i32,
+        sc: &mut DfColScratch,
+    ) -> [f64; DF8] {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.slots <= DF4_SLOTS && !df8_disabled() && df8_avx512() {
+                // SAFETY: `df8_avx512` proved both features are present at
+                // runtime, and `slots <= DF4_SLOTS` bounds the vector stack.
+                if let Some(v) = unsafe { run8y_avx512(ops, &sc.v2, g, None, x, y0, ystep, z) }
+                {
+                    return v;
+                }
+            }
+        }
+        let a = self.eval_y4(ops, g, x, y0, ystep, z, sc);
+        let b = self.eval_y4(ops, g, x, y0 + (DF4 as i32) * ystep, ystep, z, sc);
+        std::array::from_fn(|k| if k < DF4 { a[k] } else { b[k - DF4] })
+    }
+}
+
+/// The A/B switch for the compiled column fill, mirroring `df4_disabled`:
+/// `MC_SPINE_DFCOL=0` keeps the flat-memo evaluator, and the test toggle runs
+/// the same binary through both arms.
+fn dfcol_flat() -> bool {
+    #[cfg(test)]
+    if DFCOL_TEST_FLAT.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    matches!(env_str!("MC_SPINE_DFCOL").as_deref(), Some("0"))
+}
+
+/// The in-process form of `MC_SPINE_DFCOL=0`, so the parity/bench test holds
+/// the two fill paths to the same bytes without a second binary.
+#[cfg(test)]
+static DFCOL_TEST_FLAT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn dfcol_test_force_flat(on: bool) {
+    DFCOL_TEST_FLAT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many `(x, z)` columns ran the compiled 2D prefix since the counter was
+/// reset: the proof that the parity run exercised `DfCols` and not the
+/// reference it is compared against.
+#[cfg(test)]
+static DFCOL_BEGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn dfcol_test_begins() -> u64 {
+    DFCOL_BEGINS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 // ---------- M3 P4: the four-lane density evaluator ----------
@@ -6435,6 +6762,9 @@ unsafe fn run4_avx2(
                     sp -= 1;
                     pc += 1;
                 }
+                // `DfCols` ops; a `DfProg` never contains them, so treat one as a
+                // bail-out rather than a lane op.
+                Op::Push2(_) | Op::Store2(_) | Op::Done => return None,
                 Op::Halt => {
                     debug_assert_eq!(sp, 1, "compiled program left {sp} values, not 1");
                     return Some(v4_to_arr(rd!(0)));
@@ -6807,6 +7137,789 @@ unsafe fn run8_avx512(
                     sp -= 1;
                     pc += 1;
                 }
+                // `DfCols` ops; a `DfProg` never contains them (see `run4_avx2`).
+                Op::Push2(_) | Op::Store2(_) | Op::Done => return None,
+                Op::Halt => {
+                    debug_assert_eq!(sp, 1, "compiled program left {sp} values, not 1");
+                    return Some(v8_to_arr(rd!(0)));
+                }
+            }
+        }
+    }
+}
+
+/// The column-fill four-lane interpreter: `run4_avx2` with the lanes turned
+/// 90° — `y0, y0+ystep, y0+2*ystep, y0+3*ystep` of one corner column instead of
+/// four `x` positions at one `y`. One column means `x`, `z` and every hoisted
+/// `Op::Push2` value are lane-uniform, which is what `begin` left in `v2`.
+/// `None` means a conditional jump found the lanes disagreeing, and the caller
+/// finishes the group one level at a time.
+///
+/// Every arithmetic op is `run4_avx2`'s own sequence — the plain IEEE-754
+/// operation (NO FMA), `df_min`/`df_max`'s compare/blend ladder, `f64::clamp`'s
+/// two compares — so lane `k`'s result is the scalar `df_run` result at
+/// `(x, y0 + k*ystep, z)` bit for bit.
+///
+/// # Safety
+/// The caller must have checked `is_x86_feature_detected!("avx2")`, and the
+/// program's compile-time stack depth must be at most `DF4_SLOTS` (the caller
+/// checks both).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn run4y_avx2(
+    ops: &[Op],
+    v2: &[f64],
+    g: &Gen,
+    cc: Option<&ChunkCols>,
+    x: i32,
+    y0: i32,
+    ystep: i32,
+    z: i32,
+) -> Option<[f64; DF4]> {
+    use std::arch::x86_64::*;
+    unsafe {
+        // Written before it is read: the program's compile-time depth and its
+        // runtime depth agree (`df_run` relies on the same invariant), so slot
+        // `sp` always holds a value pushed earlier in the same evaluation.
+        let mut st: [std::mem::MaybeUninit<__m256d>; DF4_SLOTS] =
+            [std::mem::MaybeUninit::uninit(); DF4_SLOTS];
+        macro_rules! rd {
+            ($i:expr) => {
+                st[$i].assume_init()
+            };
+        }
+        macro_rules! wr {
+            ($i:expr, $v:expr) => {
+                st[$i] = std::mem::MaybeUninit::new($v)
+            };
+        }
+        // The one position input that varies across lanes.
+        let lane_y: [f64; DF4] = std::array::from_fn(|k| (y0 + (k as i32) * ystep) as f64);
+        let yv = v4_from_arr(lane_y);
+        let xf = x as f64;
+        let zf = z as f64;
+        let mut sp = 0usize;
+        let mut pc = 0usize;
+        /// Two lane operands through one floating-point instruction.
+        macro_rules! binop {
+            ($f:ident) => {{
+                let b = rd!(sp - 1);
+                let a = rd!(sp - 2);
+                sp -= 1;
+                wr!(sp - 1, $f(a, b));
+                pc += 1;
+            }};
+        }
+        /// `f64::clamp`'s own two comparisons, so `NaN` and the sign of zero answer what the
+        /// scalar method answers.
+        macro_rules! clampv {
+            ($v:expr, $lo:expr, $hi:expr) => {{
+                let v = $v;
+                let lo = _mm256_set1_pd($lo);
+                let hi = _mm256_set1_pd($hi);
+                let r = _mm256_blendv_pd(v, lo, _mm256_cmp_pd(v, lo, _CMP_LT_OQ));
+                _mm256_blendv_pd(r, hi, _mm256_cmp_pd(r, hi, _CMP_GT_OQ))
+            }};
+        }
+        /// [`df_min`] on four lanes: its four cases (`a < b`, `b < a`, equal, and one NaN),
+        /// which is why this is not `_mm256_min_pd` - that op answers differently on the two
+        /// zeros and on NaN.
+        macro_rules! minv {
+            ($a:expr, $b:expr) => {{
+                let a = $a;
+                let b = $b;
+                let r = _mm256_blendv_pd(b, a, _mm256_cmp_pd(a, b, _CMP_LT_OQ));
+                let r = _mm256_blendv_pd(r, _mm256_or_pd(a, b), _mm256_cmp_pd(a, b, _CMP_EQ_OQ));
+                let r = _mm256_blendv_pd(r, a, _mm256_cmp_pd(b, b, _CMP_UNORD_Q));
+                _mm256_blendv_pd(r, b, _mm256_cmp_pd(a, a, _CMP_UNORD_Q))
+            }};
+        }
+        /// [`df_max`] on four lanes, the same four cases (`+0.0` for the two zeros).
+        macro_rules! maxv {
+            ($a:expr, $b:expr) => {{
+                let a = $a;
+                let b = $b;
+                let r = _mm256_blendv_pd(b, a, _mm256_cmp_pd(a, b, _CMP_GT_OQ));
+                let r =
+                    _mm256_blendv_pd(r, _mm256_and_pd(a, b), _mm256_cmp_pd(a, b, _CMP_EQ_OQ));
+                let r = _mm256_blendv_pd(r, b, _mm256_cmp_pd(a, b, _CMP_UNORD_Q));
+                _mm256_blendv_pd(r, b, _mm256_cmp_pd(a, a, _CMP_UNORD_Q))
+            }};
+        }
+        /// Eight `f64`s out of (or into) the stack, for the ops that have to be scalar.
+        macro_rules! lanes3 {
+            () => {{
+                let c = v4_to_arr(rd!(sp - 1));
+                let b = v4_to_arr(rd!(sp - 2));
+                let a = v4_to_arr(rd!(sp - 3));
+                (a, b, c)
+            }};
+        }
+        loop {
+            match ops[pc] {
+                Op::Push(v) => {
+                    wr!(sp, _mm256_set1_pd(v));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Push2(k) => {
+                    // One column, one hoisted value: the same slot feeds all
+                    // four lanes.
+                    debug_assert!((k as usize) < v2.len());
+                    wr!(sp, _mm256_set1_pd(*v2.get_unchecked(k as usize)));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Add => binop!(_mm256_add_pd),
+                Op::Sub => binop!(_mm256_sub_pd),
+                Op::Mul => binop!(_mm256_mul_pd),
+                Op::Div => binop!(_mm256_div_pd),
+                Op::Min => {
+                    let b = rd!(sp - 1);
+                    let a = rd!(sp - 2);
+                    sp -= 1;
+                    wr!(sp - 1, minv!(a, b));
+                    pc += 1;
+                }
+                Op::Max => {
+                    let b = rd!(sp - 1);
+                    let a = rd!(sp - 2);
+                    sp -= 1;
+                    wr!(sp - 1, maxv!(a, b));
+                    pc += 1;
+                }
+                Op::Neg => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm256_xor_pd(a, _mm256_set1_pd(-0.0)));
+                    pc += 1;
+                }
+                Op::Abs => {
+                    let a = rd!(sp - 1);
+                    let mask = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fff_ffff_ffff_ffffu64 as i64));
+                    wr!(sp - 1, _mm256_and_pd(a, mask));
+                    pc += 1;
+                }
+                Op::Sq => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm256_mul_pd(a, a));
+                    pc += 1;
+                }
+                Op::Cube => {
+                    let a = rd!(sp - 1);
+                    let sq = _mm256_mul_pd(a, a);
+                    wr!(sp - 1, _mm256_mul_pd(sq, a));
+                    pc += 1;
+                }
+                Op::HNeg => {
+                    let a = rd!(sp - 1);
+                    let half = _mm256_mul_pd(a, _mm256_set1_pd(0.5));
+                    let pos = _mm256_cmp_pd(a, _mm256_setzero_pd(), _CMP_GT_OQ);
+                    wr!(sp - 1, _mm256_blendv_pd(half, a, pos));
+                    pc += 1;
+                }
+                Op::QNeg => {
+                    let a = rd!(sp - 1);
+                    let quarter = _mm256_mul_pd(a, _mm256_set1_pd(0.25));
+                    let pos = _mm256_cmp_pd(a, _mm256_setzero_pd(), _CMP_GT_OQ);
+                    wr!(sp - 1, _mm256_blendv_pd(quarter, a, pos));
+                    pc += 1;
+                }
+                Op::Squeeze => {
+                    let a = rd!(sp - 1);
+                    let v = clampv!(a, -1.0, 1.0);
+                    let cube = _mm256_mul_pd(_mm256_mul_pd(v, v), v);
+                    let half = _mm256_div_pd(v, _mm256_set1_pd(2.0));
+                    let over = _mm256_div_pd(cube, _mm256_set1_pd(24.0));
+                    wr!(sp - 1, _mm256_sub_pd(half, over));
+                    pc += 1;
+                }
+                Op::Clamp { lo, hi } => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, clampv!(a, lo, hi));
+                    pc += 1;
+                }
+                Op::Lerp => {
+                    let s = rd!(sp - 1);
+                    let f = rd!(sp - 2);
+                    let a = rd!(sp - 3);
+                    sp -= 2;
+                    wr!(sp - 1, _mm256_add_pd(f, _mm256_mul_pd(a, _mm256_sub_pd(s, f))));
+                    pc += 1;
+                }
+                Op::AddC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm256_add_pd(a, _mm256_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MulC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm256_mul_pd(a, _mm256_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MinC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, minv!(a, _mm256_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MaxC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, maxv!(a, _mm256_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::Grad { fc, fv, tc, tv } => {
+                    let denom = _mm256_set1_pd(tc - fc);
+                    let t = _mm256_div_pd(
+                        _mm256_sub_pd(yv, _mm256_set1_pd(fc)),
+                        denom,
+                    );
+                    let t = clampv!(t, 0.0, 1.0);
+                    wr!(
+                        sp,
+                        _mm256_add_pd(
+                            _mm256_set1_pd(fv),
+                            _mm256_mul_pd(t, _mm256_set1_pd(tv - fv))
+                        )
+                    );
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Noise { ni, xzs, ys } => {
+                    let (xs, ysv, zs) = lanes3!();
+                    sp -= 2;
+                    let noise = &g.noises[ni as usize];
+                    // The lanes differ in y only: `x` and `z` are the column's
+                    // scalars, `y` is the lane.
+                    let nx: [f64; DF4] = std::array::from_fn(|k| xf * xzs + xs[k]);
+                    let ny: [f64; DF4] = std::array::from_fn(|k| lane_y[k] * ys + ysv[k]);
+                    let nz: [f64; DF4] = std::array::from_fn(|k| zf * xzs + zs[k]);
+                    let r = noise.get_4(nx, ny, nz);
+                    wr!(sp - 1, v4_from_arr(r));
+                    pc += 1;
+                }
+                Op::ShiftA(ni) => {
+                    let noise = &g.noises[ni as usize];
+                    let nx = [xf * 0.25; DF4];
+                    let nz = [zf * 0.25; DF4];
+                    let r = noise.get_4(nx, [0.0; DF4], nz).map(|v| v * 4.0);
+                    wr!(sp, v4_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::ShiftB(ni) => {
+                    let noise = &g.noises[ni as usize];
+                    let nx = [zf * 0.25; DF4];
+                    let ny = [xf * 0.25; DF4];
+                    let r = noise.get_4(nx, ny, [0.0; DF4]).map(|v| v * 4.0);
+                    wr!(sp, v4_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Weird { ni, mapper } => {
+                    let rarity_in = v4_to_arr(rd!(sp - 1));
+                    let noise = &g.noises[ni as usize];
+                    let rarity: [f64; DF4] = std::array::from_fn(|k| mapper.rarity(rarity_in[k]));
+                    let nx: [f64; DF4] = std::array::from_fn(|k| xf / rarity[k]);
+                    let ny: [f64; DF4] = std::array::from_fn(|k| lane_y[k] / rarity[k]);
+                    let nz: [f64; DF4] = std::array::from_fn(|k| zf / rarity[k]);
+                    let nv = noise.get_4(nx, ny, nz);
+                    let r: [f64; DF4] = std::array::from_fn(|k| rarity[k] * nv[k].abs());
+                    wr!(sp - 1, v4_from_arr(r));
+                    pc += 1;
+                }
+                Op::Beardifier => {
+                    let beard = cc.and_then(|cc| cc.beard.as_deref());
+                    if beard.map_or(true, |b| b.is_empty()) {
+                        wr!(sp, _mm256_setzero_pd());
+                    } else {
+                        let beard = beard.unwrap();
+                        let mut r = [0.0f64; DF4];
+                        for (k, o) in r.iter_mut().enumerate() {
+                            *o = compute_beardifier(beard, x, y0 + (k as i32) * ystep, z);
+                        }
+                        wr!(sp, v4_from_arr(r));
+                    }
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Interp { slot, join } => {
+                    let cells = cc
+                        .and_then(|c| c.grids.get(slot as usize))
+                        .and_then(|g| g.as_deref());
+                    match (cells, cc) {
+                        (Some(cells), Some(columns)) => {
+                            let mut r = [0.0f64; DF4];
+                            for (k, o) in r.iter_mut().enumerate() {
+                                *o = trilinear(
+                                    cells,
+                                    columns,
+                                    x,
+                                    y0 + (k as i32) * ystep,
+                                    z,
+                                );
+                            }
+                            wr!(sp, v4_from_arr(r));
+                            sp += 1;
+                            pc = join as usize;
+                        }
+                        _ => pc += 1,
+                    }
+                }
+                Op::Call(id) => {
+                    let mut r = [0.0f64; DF4];
+                    for (k, o) in r.iter_mut().enumerate() {
+                        let mut memo = HashMap::new();
+                        *o = g.eval_c(
+                            id as usize,
+                            x,
+                            y0 + (k as i32) * ystep,
+                            z,
+                            &mut memo,
+                            cc,
+                        );
+                    }
+                    wr!(sp, v4_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::BranchOut { mi, ma, target } => {
+                    // `t >= mi && t < ma` with ordered-quiet compares: NaN answers
+                    // false in both, exactly as the scalar `&&` does.
+                    let v = rd!(sp - 1);
+                    let lo = _mm256_cmp_pd(v, _mm256_set1_pd(mi), _CMP_GE_OQ);
+                    let hi = _mm256_cmp_pd(v, _mm256_set1_pd(ma), _CMP_LT_OQ);
+                    match _mm256_movemask_pd(_mm256_and_pd(lo, hi)) {
+                        m if m == 0xF => {
+                            sp -= 1;
+                            pc += 1;
+                        }
+                        0 => {
+                            sp -= 1;
+                            pc = target as usize;
+                        }
+                        _ => return None, // lanes disagree: caller finishes scalar
+                    }
+                }
+                Op::BranchLt { t, target } => {
+                    let v = rd!(sp - 1);
+                    let mask = _mm256_movemask_pd(_mm256_cmp_pd(v, _mm256_set1_pd(t), _CMP_LT_OQ));
+                    sp -= 1;
+                    if mask == 0xF {
+                        pc = target as usize;
+                    } else if mask == 0 {
+                        pc += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                Op::BranchZero { target } => {
+                    let v = rd!(sp - 1);
+                    // `== 0.0` is true for both zeros and false for NaN, which is
+                    // what the ordered-equal compare answers too.
+                    let mask =
+                        _mm256_movemask_pd(_mm256_cmp_pd(v, _mm256_setzero_pd(), _CMP_EQ_OQ));
+                    if mask == 0xF {
+                        pc = target as usize;
+                    } else if mask == 0 {
+                        pc += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                Op::Jump(target) => pc = target as usize,
+                Op::Drop => {
+                    sp -= 1;
+                    pc += 1;
+                }
+                // `ops2` ops never reach the per-level programs; treat one as a
+                // bail-out rather than a lane op.
+                Op::Store2(_) | Op::Done => return None,
+                Op::Halt => {
+                    debug_assert_eq!(sp, 1, "compiled program left {sp} values, not 1");
+                    return Some(v4_to_arr(rd!(0)));
+                }
+            }
+        }
+    }
+}
+
+/// `run4y_avx2`'s eight-lane form: `y0 + k*ystep` for `k` in `0..8` of one
+/// corner column on one `__m512d`, mirroring `run8_avx512`'s op-for-op
+/// sequences (so each lane is the scalar `df_run` result bit for bit). `None`
+/// means a conditional jump found the lanes disagreeing; the caller finishes
+/// the group through two `run4y_avx2`-backed `eval_y4` calls.
+///
+/// # Safety
+/// The caller must have checked `is_x86_feature_detected!("avx512f")` and
+/// `is_x86_feature_detected!("avx512dq")`, and the program's compile-time stack
+/// depth must be at most `DF4_SLOTS` (the caller checks both).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq")]
+unsafe fn run8y_avx512(
+    ops: &[Op],
+    v2: &[f64],
+    g: &Gen,
+    cc: Option<&ChunkCols>,
+    x: i32,
+    y0: i32,
+    ystep: i32,
+    z: i32,
+) -> Option<[f64; DF8]> {
+    use std::arch::x86_64::*;
+    unsafe {
+        // Written before it is read: the program's compile-time depth and its
+        // runtime depth agree (`df_run` relies on the same invariant), so slot
+        // `sp` always holds a value pushed earlier in the same evaluation.
+        let mut st: [std::mem::MaybeUninit<__m512d>; DF4_SLOTS] =
+            [std::mem::MaybeUninit::uninit(); DF4_SLOTS];
+        macro_rules! rd {
+            ($i:expr) => {
+                st[$i].assume_init()
+            };
+        }
+        macro_rules! wr {
+            ($i:expr, $v:expr) => {
+                st[$i] = std::mem::MaybeUninit::new($v)
+            };
+        }
+        // The one position input that varies across lanes.
+        let lane_y: [f64; DF8] = std::array::from_fn(|k| (y0 + (k as i32) * ystep) as f64);
+        let yv = v8_from_arr(lane_y);
+        let xf = x as f64;
+        let zf = z as f64;
+        let zero = _mm512_setzero_pd();
+        let negzero = _mm512_set1_pd(-0.0);
+        let abs_mask = _mm512_castsi512_pd(_mm512_set1_epi64(0x7fff_ffff_ffff_ffffu64 as i64));
+        let mut sp = 0usize;
+        let mut pc = 0usize;
+        /// Two lane operands through one floating-point instruction.
+        macro_rules! binop {
+            ($f:ident) => {{
+                let b = rd!(sp - 1);
+                let a = rd!(sp - 2);
+                sp -= 1;
+                wr!(sp - 1, $f(a, b));
+                pc += 1;
+            }};
+        }
+        /// `f64::clamp`'s own two comparisons, so `NaN` and the sign of zero answer what the
+        /// scalar method answers (`_mm512_mask_blend_pd(k, a, b)` picks `b` where `k` is set).
+        macro_rules! clampv {
+            ($v:expr, $lo:expr, $hi:expr) => {{
+                let v = $v;
+                let lo = _mm512_set1_pd($lo);
+                let hi = _mm512_set1_pd($hi);
+                let r = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(v, lo, _CMP_LT_OQ), v, lo);
+                _mm512_mask_blend_pd(_mm512_cmp_pd_mask(r, hi, _CMP_GT_OQ), r, hi)
+            }};
+        }
+        /// [`df_min`] on eight lanes: the same four cases (`a < b`, `b < a`, equal, one NaN)
+        /// and the same operand order as `run4_avx2`'s `minv!`.
+        macro_rules! minv {
+            ($a:expr, $b:expr) => {{
+                let a = $a;
+                let b = $b;
+                let r = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(a, b, _CMP_LT_OQ), b, a);
+                let r = _mm512_mask_blend_pd(
+                    _mm512_cmp_pd_mask(a, b, _CMP_EQ_OQ),
+                    r,
+                    _mm512_or_pd(a, b),
+                );
+                let r = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(b, b, _CMP_UNORD_Q), r, a);
+                _mm512_mask_blend_pd(_mm512_cmp_pd_mask(a, a, _CMP_UNORD_Q), r, b)
+            }};
+        }
+        /// [`df_max`] on eight lanes, the same four cases (`+0.0` for the two zeros).
+        macro_rules! maxv {
+            ($a:expr, $b:expr) => {{
+                let a = $a;
+                let b = $b;
+                let r = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(a, b, _CMP_GT_OQ), b, a);
+                let r = _mm512_mask_blend_pd(
+                    _mm512_cmp_pd_mask(a, b, _CMP_EQ_OQ),
+                    r,
+                    _mm512_and_pd(a, b),
+                );
+                let r = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(b, b, _CMP_UNORD_Q), r, a);
+                _mm512_mask_blend_pd(_mm512_cmp_pd_mask(a, a, _CMP_UNORD_Q), r, b)
+            }};
+        }
+        /// Eight `f64`s out of the top three stack slots, for the ops that must be scalar.
+        macro_rules! lanes3 {
+            () => {{
+                let c = v8_to_arr(rd!(sp - 1));
+                let b = v8_to_arr(rd!(sp - 2));
+                let a = v8_to_arr(rd!(sp - 3));
+                (a, b, c)
+            }};
+        }
+        loop {
+            match ops[pc] {
+                Op::Push(v) => {
+                    wr!(sp, _mm512_set1_pd(v));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Push2(k) => {
+                    // One column, one hoisted value: the same slot feeds all
+                    // eight lanes.
+                    debug_assert!((k as usize) < v2.len());
+                    wr!(sp, _mm512_set1_pd(*v2.get_unchecked(k as usize)));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Add => binop!(_mm512_add_pd),
+                Op::Sub => binop!(_mm512_sub_pd),
+                Op::Mul => binop!(_mm512_mul_pd),
+                Op::Div => binop!(_mm512_div_pd),
+                Op::Min => {
+                    let b = rd!(sp - 1);
+                    let a = rd!(sp - 2);
+                    sp -= 1;
+                    wr!(sp - 1, minv!(a, b));
+                    pc += 1;
+                }
+                Op::Max => {
+                    let b = rd!(sp - 1);
+                    let a = rd!(sp - 2);
+                    sp -= 1;
+                    wr!(sp - 1, maxv!(a, b));
+                    pc += 1;
+                }
+                Op::Neg => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm512_xor_pd(a, negzero));
+                    pc += 1;
+                }
+                Op::Abs => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm512_and_pd(a, abs_mask));
+                    pc += 1;
+                }
+                Op::Sq => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm512_mul_pd(a, a));
+                    pc += 1;
+                }
+                Op::Cube => {
+                    let a = rd!(sp - 1);
+                    let sq = _mm512_mul_pd(a, a);
+                    wr!(sp - 1, _mm512_mul_pd(sq, a));
+                    pc += 1;
+                }
+                Op::HNeg => {
+                    let a = rd!(sp - 1);
+                    let half = _mm512_mul_pd(a, _mm512_set1_pd(0.5));
+                    let pos = _mm512_cmp_pd_mask(a, zero, _CMP_GT_OQ);
+                    wr!(sp - 1, _mm512_mask_blend_pd(pos, half, a));
+                    pc += 1;
+                }
+                Op::QNeg => {
+                    let a = rd!(sp - 1);
+                    let quarter = _mm512_mul_pd(a, _mm512_set1_pd(0.25));
+                    let pos = _mm512_cmp_pd_mask(a, zero, _CMP_GT_OQ);
+                    wr!(sp - 1, _mm512_mask_blend_pd(pos, quarter, a));
+                    pc += 1;
+                }
+                Op::Squeeze => {
+                    let a = rd!(sp - 1);
+                    let v = clampv!(a, -1.0, 1.0);
+                    let cube = _mm512_mul_pd(_mm512_mul_pd(v, v), v);
+                    let half = _mm512_div_pd(v, _mm512_set1_pd(2.0));
+                    let over = _mm512_div_pd(cube, _mm512_set1_pd(24.0));
+                    wr!(sp - 1, _mm512_sub_pd(half, over));
+                    pc += 1;
+                }
+                Op::Clamp { lo, hi } => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, clampv!(a, lo, hi));
+                    pc += 1;
+                }
+                Op::Lerp => {
+                    let s = rd!(sp - 1);
+                    let f = rd!(sp - 2);
+                    let a = rd!(sp - 3);
+                    sp -= 2;
+                    wr!(sp - 1, _mm512_add_pd(f, _mm512_mul_pd(a, _mm512_sub_pd(s, f))));
+                    pc += 1;
+                }
+                Op::AddC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm512_add_pd(a, _mm512_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MulC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm512_mul_pd(a, _mm512_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MinC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, minv!(a, _mm512_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MaxC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, maxv!(a, _mm512_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::Grad { fc, fv, tc, tv } => {
+                    let denom = _mm512_set1_pd(tc - fc);
+                    let t = _mm512_div_pd(
+                        _mm512_sub_pd(yv, _mm512_set1_pd(fc)),
+                        denom,
+                    );
+                    let t = clampv!(t, 0.0, 1.0);
+                    wr!(
+                        sp,
+                        _mm512_add_pd(
+                            _mm512_set1_pd(fv),
+                            _mm512_mul_pd(t, _mm512_set1_pd(tv - fv))
+                        )
+                    );
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Noise { ni, xzs, ys } => {
+                    let (xs, ysv, zs) = lanes3!();
+                    sp -= 2;
+                    let noise = &g.noises[ni as usize];
+                    // The lanes differ in y only: `x` and `z` are the column's
+                    // scalars, `y` is the lane.
+                    let nx: [f64; DF8] = std::array::from_fn(|k| xf * xzs + xs[k]);
+                    let ny: [f64; DF8] = std::array::from_fn(|k| lane_y[k] * ys + ysv[k]);
+                    let nz: [f64; DF8] = std::array::from_fn(|k| zf * xzs + zs[k]);
+                    let r = noise.get_8(nx, ny, nz);
+                    wr!(sp - 1, v8_from_arr(r));
+                    pc += 1;
+                }
+                Op::ShiftA(ni) => {
+                    let noise = &g.noises[ni as usize];
+                    let nx = [xf * 0.25; DF8];
+                    let nz = [zf * 0.25; DF8];
+                    let r = noise.get_8(nx, [0.0; DF8], nz).map(|v| v * 4.0);
+                    wr!(sp, v8_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::ShiftB(ni) => {
+                    let noise = &g.noises[ni as usize];
+                    let nx = [zf * 0.25; DF8];
+                    let ny = [xf * 0.25; DF8];
+                    let r = noise.get_8(nx, ny, [0.0; DF8]).map(|v| v * 4.0);
+                    wr!(sp, v8_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Weird { ni, mapper } => {
+                    let rarity_in = v8_to_arr(rd!(sp - 1));
+                    let noise = &g.noises[ni as usize];
+                    let rarity: [f64; DF8] = std::array::from_fn(|k| mapper.rarity(rarity_in[k]));
+                    let nx: [f64; DF8] = std::array::from_fn(|k| xf / rarity[k]);
+                    let ny: [f64; DF8] = std::array::from_fn(|k| lane_y[k] / rarity[k]);
+                    let nz: [f64; DF8] = std::array::from_fn(|k| zf / rarity[k]);
+                    let nv = noise.get_8(nx, ny, nz);
+                    let r: [f64; DF8] = std::array::from_fn(|k| rarity[k] * nv[k].abs());
+                    wr!(sp - 1, v8_from_arr(r));
+                    pc += 1;
+                }
+                Op::Beardifier => {
+                    let beard = cc.and_then(|cc| cc.beard.as_deref());
+                    if beard.map_or(true, |b| b.is_empty()) {
+                        wr!(sp, _mm512_setzero_pd());
+                    } else {
+                        let beard = beard.unwrap();
+                        let r: [f64; DF8] = std::array::from_fn(|k| {
+                            compute_beardifier(beard, x, y0 + (k as i32) * ystep, z)
+                        });
+                        wr!(sp, v8_from_arr(r));
+                    }
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Interp { slot, join } => {
+                    let cells = cc
+                        .and_then(|c| c.grids.get(slot as usize))
+                        .and_then(|g| g.as_deref());
+                    match (cells, cc) {
+                        (Some(cells), Some(columns)) => {
+                            let r: [f64; DF8] = std::array::from_fn(|k| {
+                                trilinear(cells, columns, x, y0 + (k as i32) * ystep, z)
+                            });
+                            wr!(sp, v8_from_arr(r));
+                            sp += 1;
+                            pc = join as usize;
+                        }
+                        _ => pc += 1,
+                    }
+                }
+                Op::Call(id) => {
+                    let r: [f64; DF8] = std::array::from_fn(|k| {
+                        let mut memo = HashMap::new();
+                        g.eval_c(
+                            id as usize,
+                            x,
+                            y0 + (k as i32) * ystep,
+                            z,
+                            &mut memo,
+                            cc,
+                        )
+                    });
+                    wr!(sp, v8_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::BranchOut { mi, ma, target } => {
+                    // `t >= mi && t < ma` with ordered-quiet compares, exactly as in
+                    // `run4y_avx2` and the scalar `run`: NaN answers false in both, so
+                    // it takes the "out of range" branch. The lanes must all agree.
+                    let v = rd!(sp - 1);
+                    let lo = _mm512_cmp_pd_mask(v, _mm512_set1_pd(mi), _CMP_GE_OQ);
+                    let hi = _mm512_cmp_pd_mask(v, _mm512_set1_pd(ma), _CMP_LT_OQ);
+                    match lo & hi {
+                        m if m == 0xFF => {
+                            sp -= 1;
+                            pc += 1;
+                        }
+                        0 => {
+                            sp -= 1;
+                            pc = target as usize;
+                        }
+                        _ => return None,
+                    }
+                }
+                Op::BranchLt { t, target } => {
+                    let v = rd!(sp - 1);
+                    let mask = _mm512_cmp_pd_mask(v, _mm512_set1_pd(t), _CMP_LT_OQ);
+                    sp -= 1;
+                    if mask == 0xFF {
+                        pc = target as usize;
+                    } else if mask == 0 {
+                        pc += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                Op::BranchZero { target } => {
+                    let v = rd!(sp - 1);
+                    // `== 0.0` is true for both zeros and false for NaN, which is
+                    // what the ordered-equal compare answers too.
+                    let mask = _mm512_cmp_pd_mask(v, zero, _CMP_EQ_OQ);
+                    if mask == 0xFF {
+                        pc = target as usize;
+                    } else if mask == 0 {
+                        pc += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                Op::Jump(target) => pc = target as usize,
+                Op::Drop => {
+                    sp -= 1;
+                    pc += 1;
+                }
+                // `ops2` ops never reach the per-level programs; treat one as a
+                // bail-out rather than a lane op.
+                Op::Store2(_) | Op::Done => return None,
                 Op::Halt => {
                     debug_assert_eq!(sp, 1, "compiled program left {sp} values, not 1");
                     return Some(v8_to_arr(rd!(0)));
@@ -6825,6 +7938,21 @@ struct DfCompiler<'a> {
     /// Folded constant per node id, filled on demand (`consts_known`).
     consts: Vec<Option<f64>>,
     consts_known: Vec<bool>,
+    /// Column-compilation state: `Some` only while `DfCols::compile` emits. When
+    /// set, a y-independent subtree leaves the main stream for `ops2` and the
+    /// main stream pushes its slot (`Op::Push2`) — the same separation
+    /// `FlatCornerMemo`'s `val_2d`/`cur_2d` generations perform at runtime.
+    col: Option<ColEmit>,
+}
+
+/// `DfCols` emission: the hoisted 2D prefix and the node-to-slot map.
+struct ColEmit {
+    /// Every hoisted subtree's instructions, each run ending in `Op::Store2`.
+    ops2: Vec<Op>,
+    /// Node id -> hoisted slot (`u32::MAX` = not hoisted yet).
+    slot_of: Vec<u32>,
+    /// Slots handed out so far; also the `v2` length the evaluator needs.
+    n2: u32,
 }
 
 impl<'a> DfCompiler<'a> {
@@ -6897,6 +8025,15 @@ impl<'a> DfCompiler<'a> {
         if let Some(v) = self.const_value(id) {
             self.ops.push(Op::Push(v));
             self.stack_push(1);
+            return;
+        }
+        // Column compilation: a y-independent subtree is emitted into `ops2`
+        // once per `(x, z)` column and the main stream pushes its slot. The ops
+        // are the same ones the subtree would have emitted inline - `Push2` is
+        // a value-transparent indirection, so nothing about the result can
+        // differ - it just no longer runs `ny` times per column.
+        if self.col.is_some() && self.d.is_2d.get(id).copied().unwrap_or(false) {
+            self.emit_hoisted(id);
             return;
         }
         let node = &self.d.dfs[id];
@@ -7066,6 +8203,43 @@ impl<'a> DfCompiler<'a> {
         self.ops.push(Op::Push(0.0));
         let end = self.ops.len() as u32;
         self.ops[to_end] = Op::Jump(end);
+    }
+
+    /// Column compilation of a y-independent node: emit the subtree into
+    /// `ops2` (terminated by `Op::Store2`) and leave `Op::Push2` in the main
+    /// stream. The first caller pays the emission; every later reference to the
+    /// same node reuses its slot, matching `FlatCornerMemo`'s one-per-column
+    /// `val_2d` write.
+    fn emit_hoisted(&mut self, id: usize) {
+        let existing = self.col.as_ref().unwrap().slot_of[id];
+        if existing != u32::MAX {
+            self.ops.push(Op::Push2(existing));
+            self.stack_push(1);
+            return;
+        }
+        let k = {
+            let col = self.col.as_mut().unwrap();
+            let k = col.n2;
+            col.n2 += 1;
+            col.slot_of[id] = k;
+            k
+        };
+        // `self.ops` IS `ops2` while the subtree emits, so every jump target it
+        // resolves lands in the list the prefix interpreter walks. `col` is
+        // dropped for the duration, so a nested is_2d node inside the subtree
+        // emits inline rather than taking a second slot for the same column's
+        // work.
+        let mut col = self.col.take().unwrap();
+        std::mem::swap(&mut self.ops, &mut col.ops2);
+        let depth = self.depth;
+        self.depth = 0;
+        self.emit(id);
+        self.ops.push(Op::Store2(k));
+        self.depth = depth;
+        std::mem::swap(&mut self.ops, &mut col.ops2);
+        self.col = Some(col);
+        self.ops.push(Op::Push2(k));
+        self.stack_push(1);
     }
 
     fn bin_op(&mut self, a: usize, b: usize, op: Op) {
@@ -8802,6 +9976,7 @@ impl Gen {
             data,
             memo: HashMap::new(),
             corner_memo: None,
+            dfcol_scratch: None,
             aq_chunk: std::array::from_fn(|_| None),
             aq_chunk_use: [0; AQ_CHUNK_SLOTS],
             aq_chunk_tick: 0,
@@ -9698,6 +10873,20 @@ impl Gen {
             .unwrap_or_else(|| FlatCornerMemo::new(self.dfs.len()))
     }
 
+    /// The column evaluator's shared scratch, grown to `cols`' demand. Buffers
+    /// keep their capacity across chunks; `v2` needs no clearing because `ops2`
+    /// rewrites every slot before any `Op::Push2` reads it.
+    fn take_dfcol_scratch(&mut self, cols: &DfCols) -> DfColScratch {
+        let mut sc = self.dfcol_scratch.take().unwrap_or_default();
+        if sc.st.len() < cols.slots {
+            sc.st.resize(cols.slots, 0.0);
+        }
+        if sc.v2.len() < cols.n2 {
+            sc.v2.resize(cols.n2, 0.0);
+        }
+        sc
+    }
+
     fn fill_ynoise_grid(
         &self,
         cells: &mut [f64],
@@ -9938,23 +11127,91 @@ impl Gen {
                     }
                 }
                 if !general.is_empty() {
-                    let mut flat = g.take_corner_memo();
-                    for zi in 0..nx {
-                        for xi in 0..nx {
-                            flat.next_2d();
-                            let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
-                            let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
-                            for yi in 0..ny {
-                                flat.next_3d();
-                                let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                                for &(iid, inner) in &general {
-                                    grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
-                                        g.eval_flat(inner, bx, by, bz, &mut flat);
+                    let data = g.data.clone();
+                    if let Some(cols) = data.dfcols.as_deref().filter(|_| !dfcol_flat()) {
+                        let mut sc = g.take_dfcol_scratch(cols);
+                        // Each grid's program resolves once; the column then pays
+                        // the 2D prefix once and `ny` runs of each 3D tail, one
+                        // contiguous run of cells per grid.
+                        let resolved: Vec<(usize, &[Op])> = general
+                            .iter()
+                            .map(|&(iid, _)| (iid, cols.prog(iid).unwrap()))
+                            .collect();
+                        for zi in 0..nx {
+                            for xi in 0..nx {
+                                let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
+                                let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
+                                cols.begin(g, bx, bz, &mut sc);
+                                for &(iid, ops) in &resolved {
+                                    let cells = grids[iid].as_mut().unwrap();
+                                    let base = (zi * nx + xi) * ny;
+                                    let mut yi = 0usize;
+                                    // Four (or eight) levels of the tail at a
+                                    // time on the AVX2 arm; the scalar tail
+                                    // covers the `ny` remainder.
+                                    while yi + DF8 <= ny {
+                                        let by =
+                                            g.min_y + (yi as i32) * g.noise_cell_h;
+                                        let r = cols.eval_y8(
+                                            ops,
+                                            g,
+                                            bx,
+                                            by,
+                                            g.noise_cell_h,
+                                            bz,
+                                            &mut sc,
+                                        );
+                                        cells[base + yi..base + yi + DF8]
+                                            .copy_from_slice(&r);
+                                        yi += DF8;
+                                    }
+                                    while yi + DF4 <= ny {
+                                        let by =
+                                            g.min_y + (yi as i32) * g.noise_cell_h;
+                                        let r = cols.eval_y4(
+                                            ops,
+                                            g,
+                                            bx,
+                                            by,
+                                            g.noise_cell_h,
+                                            bz,
+                                            &mut sc,
+                                        );
+                                        cells[base + yi..base + yi + DF4]
+                                            .copy_from_slice(&r);
+                                        yi += DF4;
+                                    }
+                                    while yi < ny {
+                                        let by =
+                                            g.min_y + (yi as i32) * g.noise_cell_h;
+                                        cells[base + yi] =
+                                            cols.eval(ops, g, bx, by, bz, &mut sc);
+                                        yi += 1;
+                                    }
                                 }
                             }
                         }
+                        g.dfcol_scratch = Some(sc);
+                    } else {
+                        let mut flat = g.take_corner_memo();
+                        for zi in 0..nx {
+                            for xi in 0..nx {
+                                flat.next_2d();
+                                let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
+                                let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
+                                for yi in 0..ny {
+                                    flat.next_3d();
+                                    let by = g.min_y + (yi as i32) * g.noise_cell_h;
+                                    for &(iid, inner) in &general {
+                                        grids[iid].as_mut().unwrap()
+                                            [(zi * nx + xi) * ny + yi] =
+                                            g.eval_flat(inner, bx, by, bz, &mut flat);
+                                    }
+                                }
+                            }
+                        }
+                        g.corner_memo = Some(flat);
                     }
-                    g.corner_memo = Some(flat);
                 }
             }
             if final_columns && !g.vein_interp_nodes.is_empty() {
@@ -9976,23 +11233,85 @@ impl Gen {
                     }
                 }
                 if !general_vein.is_empty() {
-                    let mut flat = g.take_corner_memo();
-                    for zi in 0..nx {
-                        for xi in 0..nx {
-                            flat.next_2d();
-                            let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
-                            let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
-                            for yi in 0..ny {
-                                flat.next_3d();
-                                let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                                for &(iid, inner) in &general_vein {
-                                    grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
-                                        g.eval_flat(inner, bx, by, bz, &mut flat);
+                    let data = g.data.clone();
+                    if let Some(cols) = data.vfcols.as_deref().filter(|_| !dfcol_flat()) {
+                        let mut sc = g.take_dfcol_scratch(cols);
+                        let resolved: Vec<(usize, &[Op])> = general_vein
+                            .iter()
+                            .map(|&(iid, _)| (iid, cols.prog(iid).unwrap()))
+                            .collect();
+                        for zi in 0..nx {
+                            for xi in 0..nx {
+                                let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
+                                let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
+                                cols.begin(g, bx, bz, &mut sc);
+                                for &(iid, ops) in &resolved {
+                                    let cells = grids[iid].as_mut().unwrap();
+                                    let base = (zi * nx + xi) * ny;
+                                    let mut yi = 0usize;
+                                    while yi + DF8 <= ny {
+                                        let by =
+                                            g.min_y + (yi as i32) * g.noise_cell_h;
+                                        let r = cols.eval_y8(
+                                            ops,
+                                            g,
+                                            bx,
+                                            by,
+                                            g.noise_cell_h,
+                                            bz,
+                                            &mut sc,
+                                        );
+                                        cells[base + yi..base + yi + DF8]
+                                            .copy_from_slice(&r);
+                                        yi += DF8;
+                                    }
+                                    while yi + DF4 <= ny {
+                                        let by =
+                                            g.min_y + (yi as i32) * g.noise_cell_h;
+                                        let r = cols.eval_y4(
+                                            ops,
+                                            g,
+                                            bx,
+                                            by,
+                                            g.noise_cell_h,
+                                            bz,
+                                            &mut sc,
+                                        );
+                                        cells[base + yi..base + yi + DF4]
+                                            .copy_from_slice(&r);
+                                        yi += DF4;
+                                    }
+                                    while yi < ny {
+                                        let by =
+                                            g.min_y + (yi as i32) * g.noise_cell_h;
+                                        cells[base + yi] =
+                                            cols.eval(ops, g, bx, by, bz, &mut sc);
+                                        yi += 1;
+                                    }
                                 }
                             }
                         }
+                        g.dfcol_scratch = Some(sc);
+                    } else {
+                        let mut flat = g.take_corner_memo();
+                        for zi in 0..nx {
+                            for xi in 0..nx {
+                                flat.next_2d();
+                                let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
+                                let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
+                                for yi in 0..ny {
+                                    flat.next_3d();
+                                    let by = g.min_y + (yi as i32) * g.noise_cell_h;
+                                    for &(iid, inner) in &general_vein {
+                                        grids[iid].as_mut().unwrap()
+                                            [(zi * nx + xi) * ny + yi] =
+                                            g.eval_flat(inner, bx, by, bz, &mut flat);
+                                    }
+                                }
+                            }
+                        }
+                        g.corner_memo = Some(flat);
                     }
-                    g.corner_memo = Some(flat);
                 }
             }
         }
@@ -15000,6 +16319,119 @@ mod wg_tests {
         assert_eq!(
             compiled, 4,
             "every preset must compile here, or this test stops covering the compiler"
+        );
+    }
+
+    // ---- BOT-DF-BATCH: the corner-grid column evaluator ----
+
+    /// The `DfCols` fill must write the same corner-grid cells the `eval_flat`
+    /// reference wrote, bit for bit. The comparison is `to_bits` for the same
+    /// reason `compiled_density_matches_interpreter_per_block`'s is: a cell is
+    /// a trilinear weight and a `> 0.0` input, so a last-bit difference is a
+    /// different block somewhere in the world.
+    ///
+    /// Both arms run `build_cols` end to end — the reference under
+    /// `dfcol_test_force_flat` and the compiled path as shipped — on separate
+    /// generators so a cache populated under one arm cannot answer the other.
+    /// The `DFCOL_BEGINS` count is the proof the compiled arm actually ran the
+    /// hoisted prefix rather than comparing the reference against itself.
+    #[test]
+    fn bot_df_batch_parity_and_bench() {
+        let _guard = lock_gen();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                dfcol_test_force_flat(false);
+                df4_test_force_scalar(false);
+            }
+        }
+        let _restore = Restore;
+
+        // Parity: four chunks on each preset that produced a column program,
+        // once on the vector arms and once with `df4_test_force_scalar` so the
+        // scalar `df_run` tail is held to the same bytes.
+        let mut compared = 0usize;
+        let mut total_begins = 0u64;
+        for (preset, seed) in COMPILE_CASES {
+            let mut g_ref = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            let mut g_new = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            if g_new.dfcols.is_none() && g_new.vfcols.is_none() {
+                continue;
+            }
+            let nx = (16 / g_new.noise_cell_w + 1) as u64;
+            for scalar in [false, true] {
+                df4_test_force_scalar(scalar);
+                for (cx, cz) in [(0, 0), (3, -2), (-7, 5), (12, 9)] {
+                    dfcol_test_force_flat(true);
+                    let want = g_ref.build_cols(cx, cz, true).expect("reference columns");
+                    dfcol_test_force_flat(false);
+                    let _ = dfcol_test_begins();
+                    let got = g_new.build_cols(cx, cz, true).expect("columns");
+                    total_begins += dfcol_test_begins();
+                    assert_eq!(want.grids.len(), got.grids.len());
+                    for (slot, (a, b)) in want.grids.iter().zip(&got.grids).enumerate() {
+                        assert_eq!(a.is_some(), b.is_some(), "grid {slot} presence differs");
+                        let (Some(a), Some(b)) = (a, b) else {
+                            continue;
+                        };
+                        assert_eq!(a.len(), b.len());
+                        for (cell, (&va, &vb)) in a.iter().zip(b.iter()).enumerate() {
+                            assert_eq!(
+                                va.to_bits(),
+                                vb.to_bits(),
+                                "{preset:?} seed {seed} chunk ({cx},{cz}) grid {slot} cell \
+                                 {cell} (scalar={scalar}): reference {va:?} compiled {vb:?}"
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+            df4_test_force_scalar(false);
+            assert!(
+                total_begins >= nx * nx,
+                "{preset:?} seed {seed}: the compiled column fill ran {total_begins} prefixes, \
+                 fewer than one column grid's {nx}x{nx}"
+            );
+        }
+        assert!(
+            compared > 10_000,
+            "only {compared} cells were compared; the comparison loop did not run"
+        );
+
+        // Bench: `cols()` over 32 chunks on each arm of the Overworld generator.
+        // `load_preset_uncached`, not `load_preset`: the test cache hands every
+        // arm the same `Arc<GenData>`, and `cols()` answers misses through the
+        // shared `fallback_share` `FlightCache` inside it — under the cache one
+        // arm would be timing the other's hits.
+        const N: i32 = 32;
+        let bench = |flat: bool| -> f64 {
+            let mut g = Gen::load_preset_uncached(0, crate::name_to_state, NoisePreset::Overworld)
+                .expect("generator for the bench");
+            dfcol_test_force_flat(flat);
+            let t0 = std::time::Instant::now();
+            for k in 0..N {
+                std::hint::black_box(g.cols(31 + k, -101).expect("bench columns"));
+            }
+            dfcol_test_force_flat(false);
+            t0.elapsed().as_secs_f64() * 1_000.0 / N as f64
+        };
+        let flat_ms = bench(true);
+        let col_ms = bench(false);
+        let g = Gen::load_preset_uncached(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("generator for the stats");
+        if let Some(d) = g.data.dfcols.as_deref() {
+            println!(
+                "bot_df_batch: ops2={} n2={} progs={:?}",
+                d.ops2.len(),
+                d.n2,
+                d.progs.iter().map(|p| p.len()).collect::<Vec<_>>()
+            );
+        }
+        println!(
+            "bot_df_batch: eval_flat {flat_ms:.3} ms/chunk, dfcols {col_ms:.3} ms/chunk \
+             ({:.2}x) over {N} chunks",
+            flat_ms / col_ms
         );
     }
 
