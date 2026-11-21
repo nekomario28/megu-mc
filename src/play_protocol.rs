@@ -1201,9 +1201,11 @@ fn interest_tick() {
             ),
         );
     }
+    let mut live_eids = HashSet::new();
     for m in mobs().lock().unwrap().iter() {
         let p = *m.pos.lock().unwrap();
         let m = m.clone();
+        live_eids.insert(m.eid);
         queue(
             m.dim,
             m.etype,
@@ -1212,10 +1214,22 @@ fn interest_tick() {
                 p.0,
                 p.1,
                 p.2,
-                Box::new(move || live_mob_spawn_packets(&m)),
+                Box::new(move || {
+                    let mut packets = live_mob_spawn_packets(&m);
+                    // SetEquipment trails the spawn so a skeleton's bow or a
+                    // pillager's crossbow is visible from the first frame.
+                    if let Some(equipment) = mob_equipment_packet(&m) {
+                        packets.push((0x5b, equipment));
+                    }
+                    packets
+                }),
             ),
         );
     }
+    mob_equipment()
+        .lock()
+        .unwrap()
+        .retain(|eid, _| live_eids.contains(eid));
     for &projectile in live_mob_projectiles().lock().unwrap().iter() {
         let [x, y, z] = projectile.pos;
         queue(
@@ -1476,6 +1490,13 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
     note_block_update_dim(dim, x, y, z, 0);
     if *me.gm.lock().unwrap() != 1 {
         *me.walk_acc.lock().unwrap() += 0.005; // block-break exhaustion
+        // `Stats.BLOCK_MINED` for the block that was there — keyed by the
+        // block item registry id like every other mined stat entry.
+        if let Some(reg) = crate::block_registry::breg() {
+            if let Some(block_id) = reg.block_id_of(old) {
+                stat_increment(me, StatCategory::Mined, block_id, 1);
+            }
+        }
                                                // vanilla: breaking a block damages the held tool
         if tool_max_damage(held.0).is_some()
             || comp_get(&held.2, COMP_MAX_DAMAGE).is_some()
@@ -2541,26 +2562,56 @@ impl ChunkWindow {
 /// lists. Block and biome palettes still carry one record per vertical section.
 fn cull_chunk_light(packet: &mut Vec<u8>, dim: DimId) {
     const ARRAY_WIRE_SIZE: usize = 2 + 2048;
-    const MASK_WIRE_SIZE: usize = 2 * (1 + 8) + 2; // two one-long and two empty bitsets
+    let all = dim.light_mask_longs();
+    let words = all.len();
     let block_count = dim.light_sections();
     let sky_count = if worldgen::has_skylight(dim) {
         block_count
     } else {
         0
     };
-    let suffix_size = MASK_WIRE_SIZE + 2 + (sky_count + block_count) * ARRAY_WIRE_SIZE;
+    // VarInt-coded `long[]` length; every count here stays under 128 except a
+    // very tall dimension's array counts.
+    let varint_len = |v: usize| ((usize::BITS - v.leading_zeros()) as usize).div_ceil(7).max(1);
+    // two full bitsets, two empty ones, the two array-count VarInts, then the
+    // two counted array lists.
+    let suffix_size = 2 * (1 + 8 * words)
+        + 2
+        + varint_len(sky_count)
+        + varint_len(block_count)
+        + (sky_count + block_count) * ARRAY_WIRE_SIZE;
     let Some(start) = packet.len().checked_sub(suffix_size) else {
         return;
     };
     let mut light = &packet[start..];
-    for expected in [
-        if sky_count == 0 { 0 } else { dim.light_mask() },
-        dim.light_mask(),
-    ] {
-        if read_protocol_i32(&mut light) != Some(1) || !light.starts_with(&expected.to_be_bytes()) {
-            return;
+    let read_mask = |light: &mut &[u8]| -> Option<Vec<u64>> {
+        let count = usize::try_from(read_protocol_i32(light)?).ok()?;
+        if count * 8 > light.len() {
+            return None;
         }
-        light = &light[8..];
+        let (raw, rest) = light.split_at(count * 8);
+        *light = rest;
+        Some(
+            raw.chunks_exact(8)
+                .map(|w| u64::from_be_bytes(w.try_into().unwrap()))
+                .collect(),
+        )
+    };
+    // The two full-coverage masks: sky is `all` for a lit dimension and an
+    // all-zero bitset (zero words, or padded zero words) for a dark one; the
+    // block mask is always `all`. Anything else is not a full-coverage packet
+    // this transform understands.
+    let Some(sky_mask) = read_mask(&mut light) else {
+        return;
+    };
+    let sky_ok = if sky_count == 0 {
+        sky_mask.iter().all(|w| *w == 0)
+    } else {
+        sky_mask == all
+    };
+    let block_ok = read_mask(&mut light).is_some_and(|m| m == all);
+    if !sky_ok || !block_ok {
+        return;
     }
     if !light.starts_with(&[0, 0]) {
         return;
@@ -2593,16 +2644,26 @@ fn cull_chunk_light(packet: &mut Vec<u8>, dim: DimId) {
         light_sections_in_band(&nonempty, 0, arrays.len().saturating_sub(1))
     });
     let [(sky, empty_sky), (block, empty_block)] = std::array::from_fn(|layer| {
-        let present = bands[layer].iter().fold(0u64, |mask, &i| mask | (1 << i));
-        (present, ((1 << lists[layer].len()) - 1) ^ present)
+        let mut present = vec![0u64; lists[layer].len().div_ceil(64)];
+        for &i in &bands[layer] {
+            present[i / 64] |= 1 << (i % 64);
+        }
+        let full = if lists[layer].len() == block_count {
+            all.clone()
+        } else {
+            Vec::new()
+        };
+        let empty = full
+            .iter()
+            .zip(&present)
+            .map(|(a, p)| a ^ p)
+            .collect::<Vec<u64>>();
+        (present, empty)
     });
     let array_bytes = (bands[0].len() + bands[1].len()) * ARRAY_WIRE_SIZE;
-    let mut sparse = Vec::with_capacity(4 * (1 + 8) + 2 + array_bytes);
-    for mask in [sky, block, empty_sky, empty_block] {
-        write_varint(&mut sparse, i64::from(mask != 0));
-        if mask != 0 {
-            sparse.extend_from_slice(&mask.to_be_bytes());
-        }
+    let mut sparse = Vec::with_capacity(4 * (1 + 8 * words) + 2 + array_bytes);
+    for mask in [&sky, &block, &empty_sky, &empty_block] {
+        write_light_bitset(&mut sparse, mask);
     }
     for (band, arrays) in bands.iter().zip(&lists) {
         write_varint(&mut sparse, band.len() as i64);
@@ -4116,6 +4177,629 @@ fn save_live_player_snapshot(
     saved.insert(player.uuid, snapshot);
 }
 
+// ---------- W3 live protocol wiring ----------
+
+/// The live copies of the Vanilla ops/ban/whitelist files, loaded lazily from
+/// the server working directory on the first login and refreshed by the admin
+/// commands. `None` means "not loaded yet"; `max_players` snapshots
+/// `MC_SPINE_MAX_PLAYERS` (default 20) at load so the check is a single read.
+struct LiveAdmission {
+    ops: OpsRegistry,
+    bans: BanRegistry,
+    whitelist: WhitelistRegistry,
+    max_players: usize,
+}
+
+impl LiveAdmission {
+    fn load() -> Self {
+        let dir = std::path::Path::new(".");
+        let mut whitelist =
+            WhitelistRegistry::load(&dir.join(WHITELIST_FILE)).unwrap_or_default();
+        // `enforceWhitelist` is a server.properties fact upstream; mc-spine keeps
+        // it in the environment so whitelist.json stays data-only.
+        whitelist.enabled = std::env::var("MC_SPINE_WHITELIST")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
+            .unwrap_or(false);
+        Self {
+            ops: OpsRegistry::load(&dir.join(OPS_FILE)).unwrap_or_default(),
+            bans: BanRegistry::load(dir).unwrap_or_default(),
+            whitelist,
+            max_players: std::env::var("MC_SPINE_MAX_PLAYERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(20),
+        }
+    }
+}
+
+fn live_admission() -> &'static Mutex<Option<LiveAdmission>> {
+    static LIVE: OnceLock<Mutex<Option<LiveAdmission>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(None))
+}
+
+/// `login_disconnect` for computed reasons: a ban carries an operator-supplied
+/// `reason` string, so the component is built through `json_text` rather than
+/// raw interpolation (a `"` or newline in it must not corrupt the JSON).
+fn login_disconnect_text(s: &mut TcpStream, reason: &str) {
+    let mut pl = Vec::new();
+    write_str(&mut pl, &format!("{{\"text\":{}}}", json_text(reason)));
+    let _ = send_packet(s, 0, pl);
+}
+
+// ---------- mob equipment (S2C 0x5b SetEquipment) ----------
+
+/// Live mob equipment keyed by entity id, so `Mob` literals stay untouched:
+/// `default_mob_equipment` decides the loadout the first time an entity's
+/// spawn packets are built, and the entry dies with the mob.
+fn mob_equipment() -> &'static Mutex<HashMap<i32, EntityEquipment>> {
+    static EQUIPMENT: OnceLock<Mutex<HashMap<i32, EntityEquipment>>> = OnceLock::new();
+    EQUIPMENT.get_or_init(Mutex::default)
+}
+
+/// The `ClientboundSetEquipmentPacket` body for an entity, or `None` when it
+/// has nothing worn at all — vanilla requires at least one slot entry on the
+/// wire, so a fully empty `EntityEquipment` is simply not announced.
+fn entity_equipment_packet(eid: i32, eq: &EntityEquipment) -> Option<Vec<u8>> {
+    eq.slots
+        .iter()
+        .any(|st| st.1 > 0)
+        .then(|| encode_set_equipment(eid, eq))
+}
+
+/// The 0x5b a fresh observer needs after a mob's spawn packets, or `None` when
+/// `default_mob_equipment` leaves the mob bare-handed.
+fn mob_equipment_packet(mob: &Mob) -> Option<Vec<u8>> {
+    let spec = entity_spec_by_id(mob.etype)?;
+    let mut equipment = mob_equipment().lock().unwrap();
+    let eq = equipment.entry(mob.eid).or_insert_with(|| {
+        default_mob_equipment(
+            spec.name,
+            DIFFICULTY.load(Ordering::Relaxed),
+            world_rng::next_u64(),
+        )
+    });
+    entity_equipment_packet(mob.eid, eq)
+}
+
+// ---------- mounts / vehicles (S2C 0x5f, C2S 0x1e/0x1f/0x26) ----------
+
+/// The live `MountRegistry` plus the last paddle flags each boat's driver sent.
+/// Keyed globally so `Client`/`Mob` literals in other lanes stay untouched.
+#[derive(Default)]
+struct LiveMounts {
+    registry: MountRegistry,
+    paddling: HashMap<i32, PaddleBoatPacket>,
+}
+
+fn mounts() -> &'static Mutex<LiveMounts> {
+    static MOUNTS: OnceLock<Mutex<LiveMounts>> = OnceLock::new();
+    MOUNTS.get_or_init(Mutex::default)
+}
+
+/// `entity_types` that can carry a player (`AbstractBoat`, `AbstractMinecart`
+/// and the vanilla rideable mobs).
+fn vehicle_kind_of(etype: i64) -> Option<VehicleKind> {
+    let name = entity_spec_by_id(etype)?.name;
+    Some(match name.strip_prefix("minecraft:").unwrap_or(name) {
+        "boat" => VehicleKind::Boat,
+        "chest_boat" => VehicleKind::ChestBoat,
+        "minecart" => VehicleKind::Minecart,
+        "horse" => VehicleKind::Horse,
+        "donkey" => VehicleKind::Donkey,
+        "mule" => VehicleKind::Mule,
+        "pig" => VehicleKind::Pig,
+        "strider" => VehicleKind::Strider,
+        "camel" => VehicleKind::Camel,
+        "llama" => VehicleKind::Llama,
+        _ => return None,
+    })
+}
+
+/// A right-click (`interact`/`interact_at`) on a free-seated vehicle starts the
+/// ride: vanilla `Entity.startRiding` plus a SetPassengers to every tracker.
+fn try_mount_vehicle(me: &Arc<Client>, target: i32) -> bool {
+    if me.is_spectator() {
+        return false;
+    }
+    let Some(mob) = ({
+        let ms = mobs().lock().unwrap();
+        ms.iter().find(|m| m.eid == target).cloned()
+    }) else {
+        return false;
+    };
+    let Some(kind) = vehicle_kind_of(mob.etype) else {
+        return false;
+    };
+    let at = {
+        let p = *mob.pos.lock().unwrap();
+        [p.0, p.1, p.2]
+    };
+    let seat = {
+        let mut live = mounts().lock().unwrap();
+        live.registry.register_vehicle(target, kind, at);
+        let rider = {
+            let p = *me.pos.lock().unwrap();
+            [p.0, p.1, p.2]
+        };
+        live.registry.register_rider(me.eid, rider);
+        if live.registry.mount(target, me.eid).is_err() {
+            return false;
+        }
+        live.registry.passengers_of(target).len().saturating_sub(1)
+    };
+    // `Entity.positionRider`: the passenger snaps to its attachment offset and
+    // the carry is credited so anti-cheat does not flag the seat move.
+    let off = kind.seat_offset(seat);
+    {
+        let mut p = me.pos.lock().unwrap();
+        *p = (at[0] + off[0], at[1] + off[1], at[2] + off[2], p.3, p.4, p.5);
+    }
+    ac_note_carried_motion(me.eid, [off[0], off[1], off[2]]);
+    let packet = mounts().lock().unwrap().registry.encode_set_passengers(target);
+    broadcast_seen(target, |_c| (0x5f, packet.clone()));
+    true
+}
+
+/// The environment facts `step_vehicle_move` prices a tick at, read where the
+/// vehicle actually stands (fluid probes take the entity's own hitbox).
+fn live_vehicle_env(dim: DimId, etype: i64, pos: [f64; 3], kind: VehicleKind) -> VehicleEnv {
+    let (x, y, z) = (pos[0], pos[1], pos[2]);
+    let on_ice = crate::block_registry::breg().is_some_and(|reg| {
+        let below = block_at_dim(dim, x.floor() as i32, (y - 0.5).floor() as i32, z.floor() as i32);
+        matches!(
+            reg.name_of(below),
+            "minecraft:ice"
+                | "minecraft:packed_ice"
+                | "minecraft:blue_ice"
+                | "minecraft:frosted_ice"
+        )
+    });
+    let on_rail = crate::block_registry::breg().is_some_and(|reg| {
+        [y, y - 1.0].iter().any(|&level| {
+            let state = block_at_dim(
+                dim,
+                x.floor() as i32,
+                level.floor() as i32,
+                z.floor() as i32,
+            );
+            matches!(
+                reg.name_of(state),
+                "minecraft:rail"
+                    | "minecraft:powered_rail"
+                    | "minecraft:detector_rail"
+                    | "minecraft:activator_rail"
+            )
+        })
+    });
+    VehicleEnv {
+        on_water: mob_in_water(etype, x, y, z),
+        on_ice,
+        on_lava: mob_in_lava(etype, x, y, z),
+        on_rail,
+        // Vanilla DefaultAttributes rideable `generic.movement_speed`; per-kind
+        // constants here since mob attributes are not instanced per entity yet.
+        move_speed: match kind {
+            VehicleKind::Horse => 0.225,
+            VehicleKind::Pig => 0.25,
+            VehicleKind::Camel => 0.09,
+            VehicleKind::Donkey | VehicleKind::Mule | VehicleKind::Llama
+            | VehicleKind::Strider => 0.175,
+            _ => 0.0,
+        },
+    }
+}
+
+/// The controlling passenger's `MoveVehicle` applied to the world: vehicle
+/// position plus yaw, every seated rider re-seated, the driver credited for
+/// the carry and a `0x70` teleport to the vehicle's trackers.
+fn step_live_vehicle(me: &Arc<Client>, pkt: &MoveVehiclePacket) {
+    let Some(vehicle) = mounts().lock().unwrap().registry.vehicle_of.get(&me.eid).copied()
+    else {
+        return;
+    };
+    let Some(mob) = ({
+        let ms = mobs().lock().unwrap();
+        ms.iter().find(|m| m.eid == vehicle).cloned()
+    }) else {
+        return;
+    };
+    let Some(kind) = vehicle_kind_of(mob.etype) else {
+        return;
+    };
+    let dim = *me.dim.lock().unwrap();
+    let from = {
+        let p = *mob.pos.lock().unwrap();
+        [p.0, p.1, p.2]
+    };
+    let env = live_vehicle_env(dim, mob.etype, from, kind);
+    let step = {
+        let mut live = mounts().lock().unwrap();
+        // The registry's last word on the vehicle position is what the vanilla
+        // anti-cheat distance check prices the step against.
+        live.registry.register_rider(vehicle, from);
+        live.registry.step_vehicle_move(vehicle, pkt, &env)
+    };
+    let Ok(step) = step else { return };
+    {
+        let mut p = mob.pos.lock().unwrap();
+        p.0 = step.pos[0];
+        p.1 = step.pos[1];
+        p.2 = step.pos[2];
+        p.3 = pkt.yaw;
+        p.4 = pkt.pitch;
+    }
+    ac_note_carried_motion(
+        me.eid,
+        [step.carry_delta.0, step.carry_delta.1, step.carry_delta.2],
+    );
+    let seat = mounts()
+        .lock()
+        .unwrap()
+        .registry
+        .passengers_of(vehicle)
+        .iter()
+        .position(|&e| e == me.eid);
+    if let Some(seat) = seat {
+        let off = kind.seat_offset(seat);
+        let mut p = me.pos.lock().unwrap();
+        let (yaw, pitch, ground) = (p.3, p.4, p.5);
+        *p = (
+            step.pos[0] + off[0],
+            step.pos[1] + off[1],
+            step.pos[2] + off[2],
+            yaw,
+            pitch,
+            ground,
+        );
+    }
+    let packet = entity_teleport(vehicle, step.pos[0], step.pos[1], step.pos[2], pkt.yaw, pkt.pitch, true);
+    broadcast_seen(vehicle, |_c| (0x70, packet.clone()));
+}
+
+/// The vehicle a passenger eid is riding, per the live mount graph.
+fn vehicle_of(eid: i32) -> Option<i32> {
+    mounts().lock().unwrap().registry.vehicle_of.get(&eid).copied()
+}
+
+/// Dismount a riding player, re-seat them at the offset vanilla
+/// `Entity.stopRiding` computes, and tell the vehicle's trackers.
+fn player_dismount(me: &Arc<Client>, reposition: bool) {
+    let Some(vehicle) = vehicle_of(me.eid) else {
+        return;
+    };
+    let at = mounts().lock().unwrap().registry.dismount(me.eid);
+    let Some(at) = at else { return };
+    if reposition {
+        let (yaw, pitch) = {
+            let p = me.pos.lock().unwrap();
+            (p.3, p.4)
+        };
+        let mut sock = me.sock.lock().unwrap();
+        teleport_in_dimension(me, &mut sock, (at[0], at[1], at[2], yaw, pitch));
+    } else {
+        let mut p = me.pos.lock().unwrap();
+        let (yaw, pitch, ground) = (p.3, p.4, p.5);
+        *p = (at[0], at[1], at[2], yaw, pitch, ground);
+    }
+    let packet = mounts().lock().unwrap().registry.encode_set_passengers(vehicle);
+    broadcast_seen(vehicle, |_c| (0x5f, packet.clone()));
+}
+
+/// Entity teardown for the mount graph (`Entity.remove`/`die` plus player
+/// disconnect): a dead vehicle frees its riders and a dead rider leaves its
+/// seat; every vehicle whose seats changed sends a fresh SetPassengers.
+fn live_mount_forget(eid: i32) {
+    let mut freed: Vec<(i32, [f64; 3])> = Vec::new();
+    let mut updated: Vec<i32> = Vec::new();
+    {
+        let mut live = mounts().lock().unwrap();
+        let seats = live.registry.passengers_of(eid).to_vec();
+        if !seats.is_empty() {
+            for passenger in seats {
+                if let Some(at) = live.registry.dismount(passenger) {
+                    freed.push((passenger, at));
+                }
+            }
+            updated.push(eid);
+        }
+        if let Some(vehicle) = live.registry.vehicle_of.get(&eid).copied() {
+            if live.registry.dismount(eid).is_some() {
+                updated.push(vehicle);
+            }
+        }
+        live.paddling.remove(&eid);
+    }
+    for (passenger, at) in freed {
+        if let Some(client) = clients()
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.eid == passenger)
+            .cloned()
+        {
+            let mut p = client.pos.lock().unwrap();
+            let (yaw, pitch, ground) = (p.3, p.4, p.5);
+            *p = (at[0], at[1], at[2], yaw, pitch, ground);
+        }
+    }
+    updated.sort_unstable();
+    updated.dedup();
+    for vehicle in updated {
+        let packet = mounts().lock().unwrap().registry.encode_set_passengers(vehicle);
+        broadcast_seen(vehicle, |_c| (0x5f, packet.clone()));
+    }
+}
+
+// ---------- recipe book / statistics (0x77/0x41/0x28/0x29/0x22/0x04/0x6d) ----------
+
+/// Per-player recipe books keyed by player uuid — `Client` literals stay
+/// untouched across lanes.
+fn recipe_books() -> &'static Mutex<HashMap<[u8; 16], PlayerRecipeBook>> {
+    static BOOKS: OnceLock<Mutex<HashMap<[u8; 16], PlayerRecipeBook>>> = OnceLock::new();
+    BOOKS.get_or_init(Mutex::default)
+}
+
+/// Per-player `StatsCounter` (S2C 0x04 AwardStats source).
+fn player_stats() -> &'static Mutex<HashMap<[u8; 16], PlayerStats>> {
+    static STATS: OnceLock<Mutex<HashMap<[u8; 16], PlayerStats>>> = OnceLock::new();
+    STATS.get_or_init(Mutex::default)
+}
+
+/// `StatsCounter.increment` for a live client.
+fn stat_increment(me: &Client, category: StatCategory, stat_id: i32, delta: i32) {
+    player_stats()
+        .lock()
+        .unwrap()
+        .entry(me.uuid)
+        .or_insert_with(PlayerStats::new)
+        .increment(category, stat_id, delta);
+}
+
+/// The recipe ids the book reports as unlocked at join plus the unlocks the
+/// runtime grants — the 0x41 INIT `recipes` list source.
+fn player_recipe_book(uuid: [u8; 16]) -> PlayerRecipeBook {
+    recipe_books()
+        .lock()
+        .unwrap()
+        .entry(uuid)
+        .or_insert_with(PlayerRecipeBook::new)
+        .clone()
+}
+
+/// The server's stonecutting universe as 0x77 `RecipeHolder` entries —
+/// `wm_stonecut_recipes` is also the table the live stonecutter menu cuts
+/// against, so the recipe list and the menu agree. Datapack crafting/smelting
+/// recipes do not carry their ResourceLocation ids in memory yet, so only the
+/// built-in stonecutting set is listed here.
+fn update_recipes_entries() -> Vec<RbsRecipeEntry> {
+    let mut entries = Vec::new();
+    let mut inputs: Vec<String> = WM_STONECUT.iter().map(|(n, _)| n.to_string()).collect();
+    for prefix in WM_COPPER_PREFIXES {
+        inputs.push(format!("{prefix}copper_block"));
+        inputs.push(format!("{prefix}cut_copper"));
+    }
+    for input in inputs {
+        let Some(input_item) = name_to_item(&input) else {
+            continue;
+        };
+        for (item, count) in wm_stonecut_recipes(&input) {
+            let Some(out_name) = item_to_name(item) else {
+                continue;
+            };
+            entries.push(RbsRecipeEntry {
+                id: format!("minecraft:{out_name}_from_{input}_stonecutting"),
+                recipe: RbsRecipe::Stonecutting {
+                    group: String::new(),
+                    ingredient: vec![RbsSlot::simple(input_item as i32, 1)],
+                    result: RbsSlot::simple(item as i32, i32::from(count)),
+                },
+            });
+        }
+    }
+    entries
+}
+
+/// The craft-grid recipes `handlePlaceRecipe` can lay out — a bounded set that
+/// matches what `craft_result`/`craft3_result` actually produce, so a placed
+/// pattern immediately shows its result slot. Cells are row-major; `""` is
+/// air, `"#planks"`/`"#logs"` match the tag, anything else is an item name.
+struct W3PlaceRecipe {
+    id: &'static str,
+    pattern: &'static [&'static str],
+    width: usize,
+    needs_3x3: bool,
+}
+
+const W3_PLACE_RECIPES: &[W3PlaceRecipe] = &[
+    W3PlaceRecipe {
+        id: "minecraft:crafting_table",
+        pattern: &["#planks", "#planks", "#planks", "#planks"],
+        width: 2,
+        needs_3x3: false,
+    },
+    W3PlaceRecipe {
+        id: "minecraft:stick",
+        pattern: &["#planks", "", "#planks", ""],
+        width: 2,
+        needs_3x3: false,
+    },
+    W3PlaceRecipe {
+        id: "minecraft:torch",
+        pattern: &["coal", "", "stick", ""],
+        width: 2,
+        needs_3x3: false,
+    },
+    W3PlaceRecipe {
+        id: "minecraft:oak_planks",
+        pattern: &["#logs"],
+        width: 1,
+        needs_3x3: false,
+    },
+    W3PlaceRecipe {
+        id: "minecraft:chest",
+        pattern: &[
+            "#planks", "#planks", "#planks", "#planks", "", "#planks", "#planks", "#planks",
+            "#planks",
+        ],
+        width: 3,
+        needs_3x3: true,
+    },
+    W3PlaceRecipe {
+        id: "minecraft:furnace",
+        pattern: &[
+            "cobblestone", "cobblestone", "cobblestone", "cobblestone", "", "cobblestone",
+            "cobblestone", "cobblestone", "cobblestone",
+        ],
+        width: 3,
+        needs_3x3: true,
+    },
+    W3PlaceRecipe {
+        id: "minecraft:bread",
+        pattern: &["wheat", "wheat", "wheat"],
+        width: 3,
+        needs_3x3: true,
+    },
+];
+
+fn w3_ingredient_matches(matcher: &str, item: i64) -> bool {
+    match matcher {
+        "#planks" => tag_planks(item),
+        "#logs" => planks_for_log(item).is_some(),
+        name => name_to_item(name) == Some(item),
+    }
+}
+
+/// `ServerGamePacketListenerImpl.handlePlaceRecipe`: the client asks the server
+/// to lay an unlocked recipe out over its craft grid, one or (`makeAll`) as
+/// many sets as the inventory feeds. Unknown or locked recipes are ignored the
+/// same way vanilla's `ServerRecipeBook.contains` check drops them.
+fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
+    let grid_is_3x3 = if place.window_id == 0 {
+        false
+    } else if place.window_id == 3 && *me.open_table.lock().unwrap() {
+        true
+    } else {
+        return;
+    };
+    let Some(recipe) = W3_PLACE_RECIPES
+        .iter()
+        .find(|r| r.id == place.recipe_id)
+    else {
+        return;
+    };
+    if recipe.needs_3x3 && !grid_is_3x3 {
+        return;
+    }
+    if !recipe_books()
+        .lock()
+        .unwrap()
+        .get(&me.uuid)
+        .is_some_and(|book| book.is_unlocked(&place.recipe_id))
+    {
+        return;
+    }
+    let dim = if grid_is_3x3 { 3usize } else { 2 };
+    let wants: Vec<(i16, &str)> = recipe
+        .pattern
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| !cell.is_empty())
+        .map(|(i, cell)| (((i / recipe.width) * dim + i % recipe.width + 1) as i16, *cell))
+        .collect();
+    let repeats = if place.make_all { 64 } else { 1 };
+    let mut placed = false;
+    {
+        let mut inv = me.inv.lock().unwrap();
+        let mut grid = if grid_is_3x3 {
+            me.craft9.lock().unwrap()
+        } else {
+            me.craft.lock().unwrap()
+        };
+        for _ in 0..repeats {
+            // Commit-or-nothing one repeat: try the whole pattern on copies so
+            // a half-empty inventory never leaves a partial row in the grid.
+            let mut try_inv = inv.clone();
+            let mut try_grid = grid.clone();
+            let mut fits = true;
+            for &(slot, matcher) in &wants {
+                let takes = try_grid.get(&slot).is_none_or(|st| st.1 == 0)
+                    || try_grid.get(&slot).is_some_and(|st| {
+                        w3_ingredient_matches(matcher, st.0)
+                            && i64::from(st.1) < item_stack_max(st.0, &st.2)
+                    });
+                let pick = if takes {
+                    try_inv
+                        .iter()
+                        .find(|(_, st)| st.1 > 0 && w3_ingredient_matches(matcher, st.0))
+                        .map(|(&islot, st)| (islot, st.0, st.2.clone()))
+                } else {
+                    None
+                };
+                let Some((islot, item, comps)) = pick else {
+                    fits = false;
+                    break;
+                };
+                let st = try_inv.get_mut(&islot).unwrap();
+                st.1 -= 1;
+                if st.1 == 0 {
+                    try_inv.remove(&islot);
+                }
+                let cur = try_grid.entry(slot).or_insert((item, 0, comps));
+                cur.1 += 1;
+            }
+            if !fits {
+                break;
+            }
+            *inv = try_inv;
+            *grid = try_grid;
+            placed = true;
+        }
+        if !placed {
+            return;
+        }
+    }
+    // Mirror the click handler's post-change echoes: the recipe result, the
+    // grid slots and the inventory slots the ingredients came from.
+    let (grid, inv) = (
+        if grid_is_3x3 {
+            me.craft9.lock().unwrap().clone()
+        } else {
+            me.craft.lock().unwrap().clone()
+        },
+        me.inv.lock().unwrap().clone(),
+    );
+    let result = if grid_is_3x3 {
+        craft3_result(&grid)
+    } else {
+        craft_result(&grid)
+    }
+    .unwrap_or((0, 0, Vec::new()));
+    let wid = place.window_id as u8;
+    let mut sock = me.sock.lock().unwrap();
+    let mut echo = |slot: i16, st: &Stack| {
+        let mut p = vec![wid];
+        write_varint(&mut p, 0);
+        p.extend_from_slice(&slot.to_be_bytes());
+        p.extend_from_slice(&slot_wire(st));
+        let _ = send_packet(&mut sock, 0x15, p);
+    };
+    echo(0, &result);
+    let grid_len = if grid_is_3x3 { 9 } else { 4 };
+    for slot in 1..=grid_len {
+        echo(
+            slot,
+            &grid.get(&slot).cloned().unwrap_or((0, 0, Vec::new())),
+        );
+    }
+    // window slot -> inventory key: window 0's inventory cells share the map's
+    // indices; the 3x3 table offsets them by one column of craft slots.
+    let offset = if grid_is_3x3 { 1 } else { 0 };
+    for slot in 9..=44i16 {
+        let st = inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+        echo(slot + offset, &st);
+    }
+}
+
 fn handle(mut s: TcpStream) {
     s.set_nodelay(true).ok();
     let peer = s
@@ -4179,6 +4863,27 @@ fn handle(mut s: TcpStream) {
         if !list.permits(&name, &uuid) {
             eprintln!("[security] login refused for {name} from {peer}: not on the allowlist");
             login_disconnect(&mut s, "You are not white-listed on this server!");
+            return;
+        }
+    }
+    // Vanilla `PlayerList.canPlayerLogin`: IP ban, player ban, whitelist, then
+    // the player cap — evaluated before Login Success so the refusal arrives
+    // as a Login-state Disconnect like Vanilla's.
+    {
+        let online = clients().lock().unwrap().len();
+        let mut live = live_admission().lock().unwrap();
+        let live = live.get_or_insert_with(LiveAdmission::load);
+        if let Err(reason) = check_login_admission(
+            &name,
+            &peer,
+            online,
+            live.max_players,
+            &live.ops,
+            &live.bans,
+            &live.whitelist,
+        ) {
+            eprintln!("[security] login refused for {name} from {peer}: {reason}");
+            login_disconnect_text(&mut s, &reason);
             return;
         }
     }
@@ -4395,6 +5100,25 @@ fn handle(mut s: TcpStream) {
     let _ = send_packet(&mut s, 0x5d, hp);
     if let Some(rp) = resource_pack_pkt() {
         let _ = send_packet(&mut s, 0x46, rp);
+    }
+    // `PlayerList.placeNewPlayer` recipe-book order: UpdateRecipes, then the
+    // recipe-book INIT carrying the player's settings and highlights; the
+    // tab-list header/footer pair is opt-in like Vanilla's dedicated server
+    // files rather than the single `header` key some forks expose.
+    {
+        let book = player_recipe_book(player_uuid);
+        let _ = send_packet(&mut s, 0x77, encode_update_recipes(&update_recipes_entries()));
+        let init = UpdateRecipesBook {
+            action: RecipeBookAction::Init,
+            settings: book.settings,
+            recipes: book.unlocked.iter().cloned().collect(),
+            to_highlight: book.to_highlight(),
+        };
+        let _ = send_packet(&mut s, 0x41, encode_update_recipes_book(&init));
+        if let Ok(header) = std::env::var("MC_SPINE_TABLIST_HEADER") {
+            let footer = std::env::var("MC_SPINE_TABLIST_FOOTER").unwrap_or_default();
+            let _ = send_packet(&mut s, 0x6d, encode_tab_list(&header, &footer));
+        }
     }
     // restore saved inventory for this name
     let saved_inv = saved_player
@@ -4870,6 +5594,22 @@ fn handle(mut s: TcpStream) {
                 if b.len() >= 2 {
                     held_slot = i16::from_be_bytes(b[..2].try_into().unwrap()).clamp(0, 8);
                     *me.held.lock().unwrap() = held_slot;
+                    // `EntityEquipment.setChanged` on the hotbar switch: the new
+                    // main-hand stack rides a SetEquipment to every tracker —
+                    // an empty stack is a legal entry here, it clears the old
+                    // item on their screens.
+                    let held = me
+                        .inv
+                        .lock()
+                        .unwrap()
+                        .get(&(36 + held_slot))
+                        .cloned()
+                        .unwrap_or((0, 0, Vec::new()));
+                    let mut packet = Vec::new();
+                    write_varint(&mut packet, i64::from(me.eid));
+                    packet.push(EquipmentSlot::MainHand as u8);
+                    packet.extend_from_slice(&slot_wire(&held));
+                    broadcast_seen(me.eid, |_c| (0x5b, packet.clone()));
                 }
             }
             0x1d => {
@@ -4890,6 +5630,34 @@ fn handle(mut s: TcpStream) {
                     drop(p);
                     drop(teleport);
                     landing::player_move(&me, prev_gnd);
+                }
+            }
+            0x1e => {
+                // ServerboundMoveVehiclePacket: the riding client drives the
+                // vehicle. `step_live_vehicle` runs the vanilla speed gate and
+                // credits the carry to anti-cheat, so riding never trips the
+                // mover checks.
+                if let Some(pkt) = decode_move_vehicle(&b) {
+                    step_live_vehicle(&me, &pkt);
+                }
+            }
+            0x1f => {
+                // ServerboundPaddleBoatPacket: remembered per vehicle for the
+                // boat-paddle animation state; it moves no world state itself.
+                if let Some(paddle) = decode_paddle_boat(&b) {
+                    if let Some(vehicle) = vehicle_of(me.eid) {
+                        mounts().lock().unwrap().paddling.insert(vehicle, paddle);
+                    }
+                }
+            }
+            0x26 => {
+                // ServerboundPlayerInputPacket: the shift bit dismounts the
+                // rider (`Entity.stopRiding`), updating the vehicle's
+                // SetPassengers for every tracker.
+                if let Some(input) = decode_player_input(&b) {
+                    if input.unmount {
+                        player_dismount(&me, true);
+                    }
                 }
             }
             0x24 => {
@@ -6003,6 +6771,12 @@ fn handle(mut s: TcpStream) {
                     if live_mob_interact(&me, target, 36 + held_slot) {
                         continue;
                     }
+                    // Boats, minecarts and the rideable mobs: `interact` on a
+                    // free seat starts the ride and updates every tracker with
+                    // the new SetPassengers list.
+                    if try_mount_vehicle(&me, target) {
+                        continue;
+                    }
                     // interact: villagers open trade UI; wheat breeds animals
                     let villager = mobs()
                         .lock()
@@ -6622,6 +7396,7 @@ fn handle(mut s: TcpStream) {
                     }
                     for (deid, etype, mx, my, mz) in dead {
                         adv_event(&me.name, "player_killed_entity", Some(etype));
+                        stat_increment(&me, StatCategory::Killed, etype as i32, 1);
                         let mn = match etype {
                             124 => "Zombie",
                             22 => "Cow",
@@ -6643,6 +7418,10 @@ fn handle(mut s: TcpStream) {
                         live_mob_death(&mob, state, [mx, my, mz]);
                         broadcast_seen_destroy(deid);
                         let was_sheared = sheared().lock().unwrap().remove(&deid);
+                        // A dead vehicle drops its riders, a dead rider leaves
+                        // its seat, and the mob's equipment record dies with it.
+                        live_mount_forget(deid);
+                        mob_equipment().lock().unwrap().remove(&deid);
                         // looting: +0..level extra count per drop
                         let held2 = {
                             let i2 = me.inv.lock().unwrap();
@@ -6688,10 +7467,50 @@ fn handle(mut s: TcpStream) {
                     }
                 }
             }
-            0x09 => {
-                // client_command: perform_respawn
+            0x28 => {
+                // ServerboundRecipeBookChangeSettingsPacket
                 let mut sl = &b[..];
-                if read_varint(&mut sl) == Some(0) && sl.is_empty() {
+                if let Some(s) = decode_recipe_book_change_settings(&mut sl) {
+                    recipe_books()
+                        .lock()
+                        .unwrap()
+                        .entry(me.uuid)
+                        .or_insert_with(PlayerRecipeBook::new)
+                        .apply_book_settings(s.book_type, s.book_open, s.filter_active);
+                }
+            }
+            0x29 => {
+                // ServerboundRecipeBookSeenRecipePacket
+                let mut sl = &b[..];
+                if let Some(id) = decode_recipe_book_seen_recipe(&mut sl) {
+                    recipe_books()
+                        .lock()
+                        .unwrap()
+                        .entry(me.uuid)
+                        .or_insert_with(PlayerRecipeBook::new)
+                        .seen_recipe(&id);
+                }
+            }
+            0x22 => {
+                // ServerboundPlaceRecipePacket
+                let mut sl = &b[..];
+                if let Some(place) = decode_place_recipe(&mut sl) {
+                    place_live_recipe(&me, &place);
+                }
+            }
+            0x09 => {
+                // client_command: 0 = perform respawn, 1 = request stats
+                // (`ServerboundClientCommandPacket` actions).
+                let mut sl = &b[..];
+                let action = read_varint(&mut sl);
+                if action == Some(1) && sl.is_empty() {
+                    let body = {
+                        let mut stats = player_stats().lock().unwrap();
+                        let stats = stats.entry(me.uuid).or_insert_with(PlayerStats::new);
+                        handle_client_stats_request(stats)
+                    };
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x04, body);
+                } else if action == Some(0) && sl.is_empty() {
                     drop_player_items_on_death(&me);
                     let restored_health = max_hp_of(&me.name);
                     {
@@ -6701,6 +7520,9 @@ fn handle(mut s: TcpStream) {
                         }
                         *health = restored_health;
                     }
+                    // `ServerPlayer.stopRiding` on death: the respawn starts
+                    // unmounted wherever the death happened.
+                    player_dismount(&me, false);
                     death_drop_marks().lock().unwrap().remove(&me.eid);
                     close_live_menu(&me, true, true);
                     // P2-3-S4: respawn in the dimension the spawn point belongs to. A
@@ -8288,6 +9110,9 @@ fn handle(mut s: TcpStream) {
         player_mechanism_sessions().lock().unwrap().remove(&me_cleanup.eid);
         death_drop_marks().lock().unwrap().remove(&me_cleanup.eid);
         beacon_menu_anchors().lock().unwrap().remove(&me_cleanup.eid);
+        // `Entity.remove` on the leaving player: they step out of any vehicle
+        // and the vehicle's trackers get the updated SetPassengers.
+        live_mount_forget(me_cleanup.eid);
         // vanilla culls the destroy to this entity's trackers
         broadcast_seen_destroy(me_cleanup.eid);
         let mut p = Vec::new();
@@ -8999,4 +9824,373 @@ mod sleep_protocol_parity_tests {
     }
 
     static SLEEP_TEST_LOCK: Mutex<()> = Mutex::new(());
+}
+
+#[cfg(test)]
+mod w3_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn w3_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(15)
+    }
+
+    /// Handshake + Login Start on a fresh loopback connection, then the raw
+    /// socket; the server side is a spawned `handle` on the accepted half.
+    fn w3_login_session(name: &str, uuid: [u8; 16]) -> (TcpStream, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (srv, _) = listener.accept().unwrap();
+            handle(srv);
+        });
+        let mut cli = TcpStream::connect(addr).unwrap();
+        cli.set_nodelay(true).ok();
+        cli.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        let mut hs = Vec::new();
+        write_varint(&mut hs, 767);
+        write_str(&mut hs, "127.0.0.1");
+        hs.extend_from_slice(&25565u16.to_be_bytes());
+        write_varint(&mut hs, 2);
+        send_packet(&mut cli, 0x00, hs).unwrap();
+        let mut login = Vec::new();
+        write_str(&mut login, name);
+        login.extend_from_slice(&uuid);
+        send_packet(&mut cli, 0x00, login).unwrap();
+        (cli, server)
+    }
+
+    /// `w3_login_session` continued through configuration into the play loop.
+    fn w3_connect(name: &str, uuid: [u8; 16]) -> (TcpStream, std::thread::JoinHandle<()>, Arc<Client>) {
+        let (mut cli, server) = w3_login_session(name, uuid);
+        let deadline = w3_deadline();
+        loop {
+            let (pid, _) = read_packet(&mut cli, deadline).expect("login success");
+            if pid == 0x02 {
+                break;
+            }
+        }
+        send_packet(&mut cli, 0x03, vec![]).unwrap(); // Login Acknowledged
+        let mut ci = Vec::new();
+        write_str(&mut ci, "en_us");
+        ci.push(2);
+        write_varint(&mut ci, 0);
+        ci.push(1);
+        ci.push(0x7f);
+        write_varint(&mut ci, 1);
+        ci.push(0);
+        ci.push(1);
+        send_packet(&mut cli, 0x00, ci).unwrap();
+        loop {
+            let (pid, _) = read_packet(&mut cli, deadline).expect("config packets");
+            if pid == 0x0e {
+                let mut kp = Vec::new();
+                write_varint(&mut kp, 0);
+                send_packet(&mut cli, 0x07, kp).unwrap();
+            } else if pid == 0x03 {
+                send_packet(&mut cli, 0x03, vec![]).unwrap();
+                break;
+            }
+        }
+        loop {
+            let (pid, body) = read_packet(&mut cli, deadline).expect("play position");
+            if pid == 0x40 {
+                send_packet(&mut cli, 0x00, body[33..].to_vec()).unwrap();
+                break;
+            }
+        }
+        let reg_deadline = Instant::now() + Duration::from_secs(2);
+        let me = loop {
+            if let Some(found) = clients()
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|c| c.name == name)
+                .cloned()
+            {
+                break found;
+            }
+            assert!(Instant::now() < reg_deadline, "registered play client");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        (cli, server, me)
+    }
+
+    /// Read until `wanted` arrives or the deadline passes; returns the payload.
+    fn w3_read_until(cli: &mut TcpStream, wanted: i64) -> Option<Vec<u8>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Some((pid, body)) = read_packet(cli, deadline) {
+            if pid == wanted {
+                return Some(body);
+            }
+        }
+        None
+    }
+
+    /// A VarInt-counted `long[]` bitset off the wire, like `readProtocol.i` in
+    /// vanilla's `FriendlyByteBuf`.
+    fn w3_read_bitset(b: &mut &[u8]) -> Vec<u64> {
+        let count = usize::try_from(read_protocol_i32(b).expect("bitset word count"))
+            .expect("bitset word count");
+        let mut words = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (head, tail) = b.split_at(8);
+            words.push(u64::from_be_bytes(head.try_into().unwrap()));
+            *b = tail;
+        }
+        words
+    }
+
+    fn w3_test_admission(
+        bans: BanRegistry,
+        whitelist: WhitelistRegistry,
+        max_players: usize,
+    ) -> LiveAdmission {
+        LiveAdmission {
+            ops: OpsRegistry::default(),
+            bans,
+            whitelist,
+            max_players,
+        }
+    }
+
+    #[test]
+    fn w3_login_admission_rejects_banned_and_full_server() {
+        let banned = BanRegistry {
+            players: vec![BanEntry {
+                uuid: "00000000-0000-0000-0000-000000000001".into(),
+                name: "Banned_Player".into(),
+                created: "2024-01-01T00:00:00Z".into(),
+                source: "test".into(),
+                expires: "forever".into(),
+                reason: "test ban".into(),
+            }],
+            ips: Vec::new(),
+        };
+        let cases: Vec<(&str, LiveAdmission, &str)> = vec![
+            (
+                "Banned_Player",
+                w3_test_admission(banned.clone(), WhitelistRegistry::default(), 20),
+                "You are banned from this server.\nReason: test ban",
+            ),
+            (
+                "NotOnTheList",
+                w3_test_admission(
+                    BanRegistry::default(),
+                    WhitelistRegistry {
+                        enabled: true,
+                        entries: Vec::new(),
+                    },
+                    20,
+                ),
+                "You are not white-listed on this server!",
+            ),
+            (
+                "TooLate",
+                w3_test_admission(BanRegistry::default(), WhitelistRegistry::default(), 0),
+                "The server is full!",
+            ),
+        ];
+        for (name, admission, reason) in cases {
+            *live_admission().lock().unwrap() = Some(admission);
+            let (mut cli, server) = w3_login_session(name, [0xabu8; 16]);
+            let (pid, body) = read_packet(&mut cli, w3_deadline()).expect("disconnect packet");
+            assert_eq!(pid, 0x00, "login must be refused with 0x00 for {name}");
+            let mut sl = &body[..];
+            let json = {
+                let n = usize::try_from(read_varint(&mut sl).unwrap()).unwrap();
+                std::str::from_utf8(&sl[..n]).unwrap().to_owned()
+            };
+            assert!(
+                reason.lines().all(|l| json.contains(l)),
+                "disconnect for {name} must carry the vanilla text, got {json}"
+            );
+            drop(cli);
+            let _ = server.join();
+        }
+        *live_admission().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn w3_vehicle_move_0x1e_and_dismount_0x26_and_stats_0x09_live() {
+        let (mut cli, server, me) = w3_connect("W3Rider", [0x77u8; 16]);
+        let (px, py, pz, ..) = *me.pos.lock().unwrap();
+        let boat_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+        let boat = Arc::new(Mob {
+            dim: DimId::Overworld,
+            eid: boat_eid,
+            uuid: [0x55u8; 16],
+            etype: name_to_etype("boat").unwrap(),
+            pos: Mutex::new((px + 1.0, py, pz, 0.0, 0.0)),
+            hp: Mutex::new(1.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(300),
+            vel: Mutex::new([0.0; 3]),
+        });
+        mobs().lock().unwrap().push(boat.clone());
+        me.seen.lock().unwrap().insert(boat_eid);
+
+        // 0x16 interact -> mounted, 0x5f broadcast reaches the tracker.
+        let mut interact = Vec::new();
+        write_varint(&mut interact, i64::from(boat_eid));
+        write_varint(&mut interact, 0);
+        send_packet(&mut cli, 0x16, interact).unwrap();
+        let body = w3_read_until(&mut cli, 0x5f).expect("set passengers on mount");
+        let mut rest = &body[..];
+        assert_eq!(
+            decode_set_passengers(&mut rest),
+            Some((boat_eid, vec![me.eid])),
+            "mount must broadcast the rider on the vehicle"
+        );
+        assert_eq!(vehicle_of(me.eid), Some(boat_eid));
+
+        // 0x1e MoveVehicle: a small on-land step is accepted, moves the boat,
+        // re-seats the rider and echoes a 0x70 teleport to the trackers.
+        let mut mv = Vec::new();
+        mv.extend_from_slice(&(px + 1.05f64).to_be_bytes());
+        mv.extend_from_slice(&(py).to_be_bytes());
+        mv.extend_from_slice(&(pz).to_be_bytes());
+        mv.extend_from_slice(&0f32.to_be_bytes());
+        mv.extend_from_slice(&0f32.to_be_bytes());
+        send_packet(&mut cli, 0x1e, mv).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while boat.pos.lock().unwrap().0 <= px + 1.0 + 1.0e-9 {
+            assert!(Instant::now() < deadline, "boat never moved");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let seat = *me.pos.lock().unwrap();
+        assert!(
+            (seat.0 - (px + 1.05)).abs() < 1.0e-6,
+            "rider must be re-seated onto the moved vehicle, got {seat:?}"
+        );
+
+        // 0x26 PlayerInput with the unmount bit dismounts and re-broadcasts
+        // the now-empty passenger list; the rider is re-positioned by teleport.
+        let mut input = Vec::new();
+        input.extend_from_slice(&0f32.to_be_bytes());
+        input.extend_from_slice(&0f32.to_be_bytes());
+        input.push(0x02);
+        send_packet(&mut cli, 0x26, input).unwrap();
+        let body = w3_read_until(&mut cli, 0x5f).expect("set passengers on dismount");
+        let mut rest = &body[..];
+        assert_eq!(
+            decode_set_passengers(&mut rest),
+            Some((boat_eid, Vec::new())),
+            "dismount must broadcast an empty passenger list"
+        );
+        assert_eq!(vehicle_of(me.eid), None);
+
+        // 0x09 action 1 (Request Stats) -> 0x04 AwardStats with the live book.
+        stat_increment(&me, StatCategory::Mined, 1, 7);
+        let mut req = Vec::new();
+        write_varint(&mut req, 1);
+        send_packet(&mut cli, 0x09, req).unwrap();
+        let body = w3_read_until(&mut cli, 0x04).expect("award stats reply");
+        let mut rest = &body[..];
+        let stats = decode_award_stats(&mut rest).expect("valid award stats");
+        assert_eq!(stats.get(StatCategory::Mined, 1), 7);
+
+        mobs().lock().unwrap().retain(|m| m.eid != boat_eid);
+        drop(cli);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn w3_tall_custom_dim_over_64_sections_encodes_multiword_light_mask() {
+        // 1024-block-tall custom dimension: 64 block sections + the 2
+        // light-only guard sections = 66 light sections -> a 2-word bitset.
+        worldgen::reset_dimension_registry();
+        let sources = vec![worldgen::DatapackDimensionSource::Entries(vec![
+            (
+                "data/w3/dimension_type/tall_type.json".to_string(),
+                r##"{
+                    "ultrawarm": false, "natural": false, "coordinate_scale": 1.0,
+                    "has_skylight": false, "has_ceiling": false, "ambient_light": 0.0,
+                    "piglin_safe": false, "bed_works": false,
+                    "respawn_anchor_works": false, "has_raids": false,
+                    "logical_height": 1024, "min_y": 0, "height": 1024,
+                    "infiniburn": "#minecraft:infiniburn_overworld",
+                    "effects": "minecraft:overworld",
+                    "monster_spawn_light_level": 0,
+                    "monster_spawn_block_light_limit": 0
+                }"##
+                .to_string(),
+            ),
+            (
+                "data/w3/dimension/tall.json".to_string(),
+                r#"{"type": "w3:tall_type", "generator": {"type": "minecraft:debug"}}"#
+                    .to_string(),
+            ),
+        ])];
+        assert_eq!(
+            worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap(),
+            1
+        );
+        let tall = DimId::parse_dimension_id("w3:tall").expect("custom dimension resolves");
+        assert_eq!(tall.light_sections(), 66);
+        assert_eq!(tall.light_mask_longs(), vec![u64::MAX, 0b11]);
+
+        // The chunk-join writer: the sky half is empty for a no-skylight dim;
+        // the block half carries the full 2-word masks rather than a single
+        // saturated u64.
+        let gen = GenSources::new();
+        let mut p = Vec::new();
+        write_light_arrays(&mut p, 0, 0, tall, &gen);
+        let mut light = &p[..];
+        let sky_mask = w3_read_bitset(&mut light);
+        let block_mask = w3_read_bitset(&mut light);
+        let sky_empty = w3_read_bitset(&mut light);
+        let block_empty = w3_read_bitset(&mut light);
+        assert!(sky_mask.is_empty() && sky_empty.is_empty());
+        // Words are trimmed like `BitSet.toLongArray`, so cover every section
+        // index across mask+empty rather than comparing word vectors blindly.
+        let cover: Vec<u64> = (0..tall.light_mask_longs().len())
+            .map(|i| {
+                block_mask.get(i).copied().unwrap_or(0)
+                    | block_empty.get(i).copied().unwrap_or(0)
+            })
+            .collect();
+        assert_eq!(
+            cover,
+            tall.light_mask_longs(),
+            "every light section must sit in mask or empty for all 66 sections"
+        );
+
+        // The update writer over a synthetic 130-section payload: the lit
+        // section lands in bit 65 (word 2), proving multi-word placement.
+        let mut sections = vec![[0u8; 2048]; 130];
+        sections[129][0] = 1;
+        let wire = block_light_update((0, 0), &sections);
+        let mut light = &wire[2..]; // skip the two cx/cz varints
+        let sky_mask = w3_read_bitset(&mut light);
+        let block_mask = w3_read_bitset(&mut light);
+        let sky_empty = w3_read_bitset(&mut light);
+        let block_empty = w3_read_bitset(&mut light);
+        assert!(sky_mask.is_empty() && sky_empty.is_empty());
+        assert_eq!(block_mask, vec![0, 0, 0b10]);
+        assert_eq!(block_empty, vec![u64::MAX, u64::MAX, 0b01]);
+        assert_eq!(read_protocol_i32(&mut light), Some(0), "no sky arrays");
+        assert_eq!(
+            read_protocol_i32(&mut light),
+            Some(1),
+            "exactly one block-light array may follow"
+        );
+
+        // The same encode through the lane update path produces the same
+        // 2-word empty coverage for the 66-section dim.
+        let packet = update_light_packet_lane(tall, 0, 0, &gen, None);
+        let mut light = &packet[2..];
+        let _sky = w3_read_bitset(&mut light);
+        let _block = w3_read_bitset(&mut light);
+        let _sky_empty = w3_read_bitset(&mut light);
+        let block_empty = w3_read_bitset(&mut light);
+        assert_eq!(block_empty, tall.light_mask_longs());
+
+        worldgen::reset_dimension_registry();
+    }
 }

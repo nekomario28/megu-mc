@@ -11612,17 +11612,24 @@ fn light_reveals() -> &'static Mutex<HashMap<DimId, Vec<Position>>> {
 /// The block-light half of a light update for a whole chunk: lit sections in the mask,
 /// all-zero ones in the empty mask (vanilla's encoding for them).
 fn block_light_update(chunk: Chunk, block: &[[u8; 2048]]) -> Vec<u8> {
-    let (mut mask, mut empty) = (0u64, 0u64);
+    let words = block.len().div_ceil(64);
+    let mut mask = vec![0u64; words];
+    let mut empty = vec![0u64; words];
     let mut lit = Vec::new();
     for (i, section) in block.iter().enumerate() {
         if section.iter().all(|b| *b == 0) {
-            empty |= 1 << i;
+            empty[i / 64] |= 1 << (i % 64);
         } else {
-            mask |= 1 << i;
+            mask[i / 64] |= 1 << (i % 64);
             lit.push(section);
         }
     }
-    encode_light_update(chunk, [0, mask, 0, empty], [].into_iter(), lit.into_iter())
+    encode_light_update_multi(
+        chunk,
+        [Vec::new(), mask, Vec::new(), empty],
+        [].into_iter(),
+        lit.into_iter(),
+    )
 }
 
 /// The light half of a chunk packet, shared with `update_light_packet`: four section masks, then
@@ -11644,7 +11651,14 @@ fn write_light_arrays_lane(
     gen: &GenSources,
     occlude_ceil: Option<i32>,
 ) {
-    let all = dim.light_mask();
+    // Single-word fast path keeps the <=63-section dims (every vanilla world)
+    // allocation-free and byte-identical; `light_mask` saturates at bit 62, so
+    // exactly-64 and taller dims must take `light_mask_longs` for full bits.
+    let all = if dim.light_sections() < 64 {
+        vec![dim.light_mask() as u64]
+    } else {
+        dim.light_mask_longs()
+    };
     let has_sky = worldgen::has_skylight(dim);
     let __tsky = chunkprof::enabled().then(std::time::Instant::now);
     let mut sky = if has_sky {
@@ -11684,30 +11698,35 @@ fn write_light_arrays_lane(
     // A section that is all zero goes in the empty mask with no array: vanilla's own
     // encoding, saving 2 KB per empty section before compression.
     let split = |sections: &[[u8; 2048]]| {
-        let (mut mask, mut empty) = (0i64, 0i64);
+        let mut mask = vec![0u64; all.len()];
+        let mut empty = vec![0u64; all.len()];
         for (i, s) in sections.iter().enumerate() {
             if s.iter().all(|b| *b == 0) {
-                empty |= 1 << i;
+                empty[i / 64] |= 1 << (i % 64);
             } else {
-                mask |= 1 << i;
+                mask[i / 64] |= 1 << (i % 64);
             }
         }
-        (mask & all, empty & all)
+        for (m, a) in mask.iter_mut().zip(all.iter()) {
+            *m &= a;
+        }
+        for (e, a) in empty.iter_mut().zip(all.iter()) {
+            *e &= a;
+        }
+        (mask, empty)
     };
     let (sky_mask, sky_empty) = split(&sky);
     let (block_mask, block_empty) = split(&block);
-    for m in [sky_mask, block_mask, sky_empty, block_empty] {
-        if m == 0 {
-            write_varint(p, 0);
-        } else {
-            write_varint(p, 1);
-            p.extend_from_slice(&m.to_be_bytes());
-        }
+    for m in [&sky_mask, &block_mask, &sky_empty, &block_empty] {
+        write_light_bitset(p, m);
     }
-    for (sections, mask) in [(&sky, sky_mask), (&block, block_mask)] {
-        write_varint(p, mask.count_ones() as i64);
+    for (sections, mask) in [(&sky, &sky_mask), (&block, &block_mask)] {
+        write_varint(
+            p,
+            mask.iter().map(|w| w.count_ones() as i64).sum::<i64>(),
+        );
         for (i, sec) in sections.iter().enumerate() {
-            if mask & (1 << i) != 0 {
+            if mask[i / 64] & (1 << (i % 64)) != 0 {
                 write_varint(p, 2048);
                 p.extend_from_slice(sec);
             }
@@ -11748,20 +11767,52 @@ fn update_light_packet_lane(
     block_light_update((cx, cz), &block)
 }
 
+/// Protocol `BitSet` (`long[]`) on the light-update wire: a VarInt word count
+/// then that many big-endian u64 words, trailing all-zero words trimmed — the
+/// same shape `BitSet.toLongArray` produces. A single-word mask is byte-for-byte
+/// what the old one-long writers emitted (`1` + the word, or `0` when empty).
+fn write_light_bitset(p: &mut Vec<u8>, words: &[u64]) {
+    let kept = words.iter().rposition(|w| *w != 0).map_or(0, |i| i + 1);
+    write_varint(p, kept as i64);
+    for w in &words[..kept] {
+        p.extend_from_slice(&w.to_be_bytes());
+    }
+}
+
 fn encode_light_update<'a>(
     (cx, cz): Chunk,
     masks: [u64; 4],
     sky: impl ExactSizeIterator<Item = &'a [u8; 2048]>,
     block: impl ExactSizeIterator<Item = &'a [u8; 2048]>,
 ) -> Vec<u8> {
+    encode_light_update_multi(
+        (cx, cz),
+        masks.map(|m| {
+            if m == 0 {
+                Vec::new()
+            } else {
+                vec![m]
+            }
+        }),
+        sky,
+        block,
+    )
+}
+
+/// `encode_light_update` over multi-word masks so a dimension with more than
+/// 64 light sections (a `dimension_type` taller than 1,008 blocks) encodes its
+/// whole `long[]` instead of truncating past the first word.
+fn encode_light_update_multi<'a>(
+    (cx, cz): Chunk,
+    masks: [Vec<u64>; 4],
+    sky: impl ExactSizeIterator<Item = &'a [u8; 2048]>,
+    block: impl ExactSizeIterator<Item = &'a [u8; 2048]>,
+) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, cx as i64);
     write_varint(&mut p, cz as i64);
-    for mask in masks {
-        write_varint(&mut p, i64::from(mask != 0));
-        if mask != 0 {
-            p.extend_from_slice(&mask.to_be_bytes());
-        }
+    for mask in &masks {
+        write_light_bitset(&mut p, mask);
     }
     write_varint(&mut p, sky.len() as i64);
     for section in sky {
