@@ -41,24 +41,46 @@ pub(crate) fn compression_threshold_env(get: impl Fn(&str) -> Option<String>) ->
         .map_or(256, |value| if value <= 0 { -1 } else { value })
 }
 
+/// Zlib level for compressed frames: `MC_SPINE_ZLIB_LEVEL` clamped to
+/// `1..=9`, defaulting to 1 (`Compression::fast`). Level 1 is several times
+/// quicker than the old level-6 default and the per-chunk send latency win
+/// dwarfs the few-percent size cost on already-compressible chunk data.
+fn zlib_level_from(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .map_or(1, |level| level.clamp(1, 9))
+}
+
+fn zlib_level() -> u32 {
+    static LEVEL: OnceLock<u32> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        zlib_level_from(std::env::var("MC_SPINE_ZLIB_LEVEL").ok().as_deref())
+    })
+}
+
 /// Frame a packet (including its packet ID) after compression is enabled.
 pub(crate) fn encode_compressed_frame(raw: &[u8], threshold: usize) -> Vec<u8> {
     use std::io::Write;
 
-    let mut body = Vec::new();
+    // One body buffer for both paths; the zlib stream is appended to it in
+    // place instead of round-tripping through the encoder's own Vec, then the
+    // outer length is prepended in a single allocation.
+    let mut body = Vec::with_capacity(raw.len() + 8);
     if raw.len() < threshold {
         crate::write_varint(&mut body, 0);
         body.extend_from_slice(raw);
     } else {
         crate::write_varint(&mut body, raw.len() as i64);
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::ZlibEncoder::new(
+            &mut body,
+            flate2::Compression::new(zlib_level()),
+        );
         encoder
             .write_all(raw)
             .expect("writing to a Vec cannot fail");
-        body.extend_from_slice(&encoder.finish().expect("writing to a Vec cannot fail"));
+        encoder.finish().expect("writing to a Vec cannot fail");
     }
-    let mut frame = Vec::new();
+    let mut frame = Vec::with_capacity(body.len() + 5);
     crate::write_varint(&mut frame, body.len() as i64);
     frame.extend_from_slice(&body);
     frame
@@ -318,6 +340,19 @@ mod chunk_delivery_tests {
 
 // -------------------------------------------------------- chunk packet frames
 
+/// The single wire form a cached chunk frame retains. Keeping both the plain
+/// and the compressed bytes doubled the entry's RAM for no benefit: chunk
+/// frames compress ~5:1, so once a compressed form exists the plain buffer is
+/// dead weight.
+enum CachedPayload {
+    /// `varint(len)` + `varint(0x27)` + payload — the exact bytes an
+    /// uncompressed client receives.
+    Plain(Arc<Vec<u8>>),
+    /// `encode_compressed_frame` of the same body, built on first request for
+    /// the negotiated threshold (uniform per server: one env knob).
+    Compressed { threshold: usize, frame: Arc<Vec<u8>> },
+}
+
 /// One fully encoded `0x27` chunk packet, shared by every client that asks for
 /// the same column at the same world revision.
 struct CachedChunkPacket {
@@ -330,12 +365,7 @@ struct CachedChunkPacket {
     /// The chunk's own generated light emitters, restored into the caller's
     /// `GenSources` on a hit exactly as a rebuild would record them.
     own_emitters: Vec<((i32, i32, i32), u8)>,
-    /// `varint(len)` + `varint(0x27)` + payload — the exact bytes an
-    /// uncompressed client receives.
-    plain: Arc<Vec<u8>>,
-    /// `encode_compressed_frame` of the same body, built on first request for
-    /// the negotiated threshold (uniform per server: one env knob).
-    compressed: Option<(usize, Arc<Vec<u8>>)>,
+    payload: CachedPayload,
 }
 
 /// The `0x27` frame body: packet id + payload.
@@ -383,8 +413,8 @@ pub(crate) struct ChunkPacketCache {
     order: VecDeque<(crate::DimId, i32, i32, bool)>,
 }
 
-/// Entries retained; each holds a full chunk frame plus (at most) its
-/// compressed form.
+/// Entries retained; each holds one wire form of a full chunk frame — the
+/// plain frame, or only its compressed form once a compressed client asks.
 const CHUNK_PACKET_CACHE_CAP: usize = 512;
 
 impl ChunkPacketCache {
@@ -420,20 +450,56 @@ impl ChunkPacketCache {
             return None;
         }
         let frame = match compression {
-            None => entry.plain.clone(),
-            Some(threshold) => match &entry.compressed {
-                Some((for_threshold, frame)) if *for_threshold == threshold => frame.clone(),
-                _ => {
+            None => match &entry.payload {
+                CachedPayload::Plain(frame) => frame.clone(),
+                // The plain buffer was dropped on the first compressed
+                // request; a mode change is a miss and the caller rebuilds.
+                CachedPayload::Compressed { .. } => return None,
+            },
+            Some(threshold) => match &entry.payload {
+                CachedPayload::Compressed {
+                    threshold: stored,
+                    frame,
+                } if *stored == threshold => frame.clone(),
+                // A different threshold needs the plain bytes, which are
+                // gone: miss so the caller rebuilds and re-inserts.
+                CachedPayload::Compressed { .. } => return None,
+                CachedPayload::Plain(plain) => {
+                    // Compress once, then swap the payload: assigning drops
+                    // the ~20-40 KiB plain buffer in the same move.
                     let frame = Arc::new(encode_compressed_frame(
-                        body_of_frame(&entry.plain),
+                        body_of_frame(plain),
                         threshold,
                     ));
-                    entry.compressed = Some((threshold, frame.clone()));
+                    entry.payload = CachedPayload::Compressed {
+                        threshold,
+                        frame: frame.clone(),
+                    };
                     frame
                 }
             },
         };
         Some((frame, entry.own_emitters.clone()))
+    }
+
+    /// Approximate heap bytes retained: each entry's frame buffer at its
+    /// allocated capacity, its emitter list, and the entry struct itself.
+    /// Measures the plain-drop win directly in tests and diagnostics.
+    #[allow(dead_code)]
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        self.map
+            .values()
+            .map(|entry| {
+                let frame_bytes = match &entry.payload {
+                    CachedPayload::Plain(frame)
+                    | CachedPayload::Compressed { frame, .. } => frame.capacity(),
+                };
+                frame_bytes
+                    + entry.own_emitters.capacity()
+                        * std::mem::size_of::<((i32, i32, i32), u8)>()
+                    + std::mem::size_of::<CachedChunkPacket>()
+            })
+            .sum()
     }
 
     /// Store `payload` (no packet id — the `0x27` prefix is added here) at
@@ -452,8 +518,7 @@ impl ChunkPacketCache {
         let entry = CachedChunkPacket {
             revision,
             own_emitters,
-            plain: Arc::new(plain_frame(&chunk_packet_body(&payload))),
-            compressed: None,
+            payload: CachedPayload::Plain(Arc::new(plain_frame(&chunk_packet_body(&payload)))),
         };
         if self.map.insert(key, entry).is_none() {
             self.order.push_back(key);
@@ -479,6 +544,73 @@ impl ChunkPacketCache {
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
+    }
+}
+
+// ------------------------------------------------------- per-tick coalescing
+
+/// Batches the small S2C frames one tick emits into a single `write_all`,
+/// flushing early only when the buffer would exceed `capacity` (default
+/// 64 KiB). Paired with `TCP_NODELAY` the bytes still leave at the end-of-tick
+/// `flush`, so delivery latency is identical while a burst of small packets
+/// costs one syscall instead of one per packet.
+#[allow(dead_code)] // wired into the shared Play writer by the protocol lane
+pub(crate) struct PacketCoalescer {
+    buf: Vec<u8>,
+    capacity: usize,
+}
+
+#[allow(dead_code)]
+impl PacketCoalescer {
+    /// Default auto-flush threshold.
+    pub(crate) const DEFAULT_CAPACITY: usize = 64 * 1024;
+
+    pub(crate) fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Bytes queued for the next `flush`.
+    #[cfg(test)]
+    pub(crate) fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Queue `frame` for the next flush. Flushes first when appending would
+    /// exceed the capacity; a frame larger than the whole buffer is written
+    /// through directly so the buffer stays bounded.
+    pub(crate) fn push_frame(
+        &mut self,
+        frame: &[u8],
+        w: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        if self.buf.len() + frame.len() > self.capacity {
+            self.flush(w)?;
+            if frame.len() >= self.capacity {
+                return w.write_all(frame);
+            }
+        }
+        self.buf.extend_from_slice(frame);
+        if self.buf.len() >= self.capacity {
+            self.flush(w)?;
+        }
+        Ok(())
+    }
+
+    /// Write everything queued so far as one `write_all`.
+    pub(crate) fn flush(&mut self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        w.write_all(&self.buf)?;
+        self.buf.clear();
+        Ok(())
     }
 }
 
@@ -1451,11 +1583,14 @@ mod tests {
         let mut payload = &body[..];
         assert_eq!(crate::read_protocol_i32(&mut payload), Some(0x27));
         assert_eq!(payload, [9, 9, 9]);
-        let (c3, _) = cache.frame(10, key, 41, Some(64)).unwrap();
-        assert!(
-            !Arc::ptr_eq(&c1, &c3),
-            "each threshold builds its own compressed frame"
-        );
+        // A different compression mode is a miss: the plain buffer was
+        // dropped on the first compressed request, so the caller rebuilds
+        // and re-inserts instead of the cache holding two wire forms.
+        assert!(cache.frame(10, key, 41, Some(64)).is_none());
+        assert!(cache.frame(10, key, 41, None).is_none());
+        // The matching threshold still hits the shared compressed frame.
+        let (c4, _) = cache.frame(10, key, 41, Some(256)).unwrap();
+        assert!(Arc::ptr_eq(&c1, &c4));
         // A block/light revision bump (what set_block* produces) invalidates.
         assert!(cache.frame(10, key, 42, None).is_none());
         cache.insert(10, key, 42, vec![], vec![7]);
@@ -1591,5 +1726,159 @@ mod tests {
         );
         auth.record_success(peer);
         assert!(auth.locked_for(peer, t0).is_none());
+    }
+
+    #[test]
+    fn perf_net_ram_zlib_level_defaults_to_fast_and_clamps() {
+        assert_eq!(zlib_level_from(None), 1, "default is Compression::fast");
+        assert_eq!(zlib_level_from(Some("")), 1);
+        assert_eq!(zlib_level_from(Some("abc")), 1);
+        assert_eq!(zlib_level_from(Some("0")), 1, "clamped into 1..=9");
+        assert_eq!(zlib_level_from(Some("1")), 1);
+        assert_eq!(zlib_level_from(Some("6")), 6);
+        assert_eq!(zlib_level_from(Some("9")), 9);
+        assert_eq!(zlib_level_from(Some("42")), 9, "clamped at the top");
+        assert_eq!(zlib_level(), zlib_level_from(
+            std::env::var("MC_SPINE_ZLIB_LEVEL").ok().as_deref()
+        ));
+    }
+
+    #[test]
+    fn perf_net_ram_compressed_frame_roundtrips_at_fast_level() {
+        // A compressible chunk-sized payload exercises the compressed path.
+        let mut raw = Vec::with_capacity(8 * 1024);
+        for i in 0..2048u32 {
+            raw.extend_from_slice(&[b'a' + (i % 26) as u8, (i >> 8) as u8]);
+        }
+        let frame = encode_compressed_frame(&raw, 256);
+        // Protocol 767 framing: the outer VarInt length covers the rest.
+        let mut body = frame.as_slice();
+        let length = crate::read_protocol_i32(&mut body).unwrap() as usize;
+        assert_eq!(length, body.len(), "outer frame length is exact");
+        // The inner data-length VarInt is the uncompressed length.
+        let mut inner = body;
+        let data_len = crate::read_protocol_i32(&mut inner).unwrap() as usize;
+        assert_eq!(data_len, raw.len(), "compressed path taken");
+        assert!(
+            inner.len() < raw.len(),
+            "level-1 zlib still shrinks compressible chunk data"
+        );
+        assert_eq!(
+            decode_compressed_frame(body, 256, 1 << 20).unwrap(),
+            raw,
+            "fast level round-trips byte-for-byte"
+        );
+        // Two allocations total (body + one prepend): the returned Vec has no
+        // oversized spare capacity beyond the 5-byte length prefix.
+        assert!(frame.capacity() >= frame.len());
+        assert!(
+            frame.capacity() - frame.len() <= 5,
+            "capacity {} vs len {}",
+            frame.capacity(),
+            frame.len()
+        );
+        // The uncompressed path keeps identical framing for small packets.
+        let small = encode_compressed_frame(b"\x01hello", 10);
+        let mut sbody = small.as_slice();
+        let slen = crate::read_protocol_i32(&mut sbody).unwrap() as usize;
+        assert_eq!(slen, sbody.len());
+        assert_eq!(sbody[0], 0, "below threshold sends the 0 data length");
+        assert_eq!(&sbody[1..], b"\x01hello");
+    }
+
+    #[test]
+    fn perf_net_ram_chunk_cache_drops_plain_on_compression() {
+        let mut cache = ChunkPacketCache::new();
+        let key = (crate::DimId::Overworld, 9, 9, false);
+        // A compressible ~20 KiB chunk payload, like a real 0x27 frame.
+        let mut payload = Vec::with_capacity(20 * 1024);
+        for i in 0..5120u32 {
+            payload.extend_from_slice(&[b'x' + (i % 7) as u8, b'y', b'z', b'w']);
+        }
+        cache.insert(3, key, 5, vec![], payload);
+        let before = cache.estimated_bytes();
+        assert!(before > 15 * 1024, "plain frame retained: {before}");
+
+        let (c1, _) = cache.frame(3, key, 5, Some(256)).unwrap();
+        let after = cache.estimated_bytes();
+        eprintln!("perf_net_ram cache RAM: {before} -> {after} bytes");
+        assert!(
+            after * 2 < before,
+            "compressed entry must retain <50% of the plain+compressed pair: {before} -> {after}"
+        );
+        // Same-threshold hits share the one compressed frame.
+        let (c2, _) = cache.frame(3, key, 5, Some(256)).unwrap();
+        assert!(Arc::ptr_eq(&c1, &c2));
+        // Any other mode misses; the caller rebuilds and re-inserts.
+        assert!(cache.frame(3, key, 5, Some(64)).is_none());
+        assert!(cache.frame(3, key, 5, None).is_none());
+        // The shared frame still decodes to the exact wire body.
+        let mut framed = &c1[..];
+        crate::read_protocol_i32(&mut framed);
+        let body = decode_compressed_frame(framed, 256, 1 << 20).unwrap();
+        let mut inner = &body[..];
+        assert_eq!(crate::read_protocol_i32(&mut inner), Some(0x27));
+        assert_eq!(inner.len(), 20 * 1024);
+    }
+
+    #[test]
+    fn perf_net_ram_coalescer_batches_frames_into_one_write() {
+        use std::io::Write;
+
+        struct Counting {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+        impl Write for Counting {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut w = Counting {
+            bytes: Vec::new(),
+            writes: 0,
+        };
+        let mut coalescer = PacketCoalescer::new();
+        let mut expected = Vec::new();
+        for i in 0..20usize {
+            let frame = vec![i as u8; 64 + i];
+            coalescer.push_frame(&frame, &mut w).unwrap();
+            expected.extend_from_slice(&frame);
+        }
+        assert_eq!(w.writes, 0, "nothing leaves before flush");
+        assert_eq!(coalescer.buffered(), expected.len());
+        coalescer.flush(&mut w).unwrap();
+        assert_eq!(w.writes, 1, "20 frames coalesce into one write");
+        assert_eq!(w.bytes, expected, "wire order is byte-for-byte");
+        assert_eq!(coalescer.buffered(), 0);
+        coalescer.flush(&mut w).unwrap();
+        assert_eq!(w.writes, 1, "empty flush is a no-op");
+
+        // The auto-flush threshold bounds the buffer and a frame larger than
+        // the whole buffer writes through directly; order still holds.
+        let mut w2 = Counting {
+            bytes: Vec::new(),
+            writes: 0,
+        };
+        let mut bounded = PacketCoalescer::with_capacity(300);
+        let mut expected2 = Vec::new();
+        for i in 0..10u8 {
+            let frame = vec![0xa0 + i; 100];
+            bounded.push_frame(&frame, &mut w2).unwrap();
+            expected2.extend_from_slice(&frame);
+        }
+        let big = vec![0xff; 400];
+        bounded.push_frame(&big, &mut w2).unwrap();
+        expected2.extend_from_slice(&big);
+        bounded.flush(&mut w2).unwrap();
+        assert!(w2.writes >= 3, "threshold flushes plus passthrough: {}", w2.writes);
+        assert_eq!(w2.bytes, expected2, "auto-flush preserves wire order");
+        assert_eq!(bounded.buffered(), 0);
     }
 }
