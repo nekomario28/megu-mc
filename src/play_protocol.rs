@@ -3698,15 +3698,26 @@ fn parse_dim_type_wire_ids() -> Option<[i32; 3]> {
         if name != "minecraft:dimension_type" {
             continue;
         }
-        let mut ids = [-1i32; 3];
-        for (index, (entry, _)) in registry_wire_entries(body)?.into_iter().enumerate() {
-            if let Some(dim) = DimId::parse_dimension_id(entry) {
+        return dim_wire_ids_from_entries(registry_wire_entries(body)?);
+    }
+    None
+}
+
+/// Map `dimension_type` registry entry names to their wire ids, indexed by
+/// `DimId::index()`. A datapack dimension can register a slot >= 3 whose
+/// canonical id also appears as a registry entry name; the pinned table only
+/// has room for the three vanilla ids, so out-of-range slots are skipped
+/// rather than indexing past the array.
+fn dim_wire_ids_from_entries(entries: Vec<(&str, &[u8])>) -> Option<[i32; 3]> {
+    let mut ids = [-1i32; 3];
+    for (index, (entry, _)) in entries.into_iter().enumerate() {
+        if let Some(dim) = DimId::parse_dimension_id(entry) {
+            if dim.index() < ids.len() {
                 ids[dim.index()] = index as i32;
             }
         }
-        return ids.iter().all(|&id| id >= 0).then_some(ids);
     }
-    None
+    ids.iter().all(|&id| id >= 0).then_some(ids)
 }
 
 static DIM_WIRE_IDS: OnceLock<Option<[i32; 3]>> = OnceLock::new();
@@ -6417,6 +6428,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if b.len() >= 9 {
                     let yaw = f32::from_be_bytes(b[..4].try_into().unwrap());
                     let pitch = f32::from_be_bytes(b[4..8].try_into().unwrap());
+                    // The same rule `valid_movement_frame` applies to the
+                    // position packets: a non-finite angle must not reach `pos`,
+                    // the rotation broadcasts, or the projectile math that turns
+                    // yaw/pitch into velocities.
+                    if !yaw.is_finite() || !pitch.is_finite() {
+                        continue;
+                    }
                     let teleport = me.teleport.lock().unwrap();
                     if !teleport.movement_allowed() {
                         continue;
@@ -11392,6 +11410,93 @@ mod w3_tests {
         let block_empty = w3_read_bitset(&mut light);
         assert_eq!(block_empty, tall.light_mask_longs());
 
+        worldgen::reset_dimension_registry();
+    }
+
+    #[test]
+    fn bughunt_net_look_packet_0x1c_rejects_non_finite_angles() {
+        let (mut cli, server, me) = w3_connect("BugHuntLook", [0x66u8; 16]);
+        *me.pos.lock().unwrap() = (0.5, 71.0, 0.5, 10.0, 20.0, true);
+        let look = |yaw: f32, pitch: f32| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&yaw.to_be_bytes());
+            b.extend_from_slice(&pitch.to_be_bytes());
+            b.push(1);
+            b
+        };
+        // NaN and both infinities in either angle must not reach `pos`.
+        for (yaw, pitch) in [
+            (f32::NAN, 0.0),
+            (0.0, f32::NAN),
+            (f32::INFINITY, 0.0),
+            (0.0, f32::NEG_INFINITY),
+        ] {
+            send_packet(&mut cli, 0x1c, look(yaw, pitch)).unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+            let p = *me.pos.lock().unwrap();
+            assert_eq!((p.3, p.4), (10.0, 20.0), "non-finite look {yaw}/{pitch} applied");
+        }
+        // A finite look still lands, proving the packet path executed.
+        send_packet(&mut cli, 0x1c, look(90.0, -15.0)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let p = *me.pos.lock().unwrap();
+            if p.3 == 90.0 && p.4 == -15.0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "finite look never applied");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(cli);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn bughunt_net_dim_wire_ids_skip_custom_dimension_slots() {
+        let _world_guard = world_guard();
+        let _gen_guard = worldgen::lock_gen_for_tests();
+        worldgen::reset_dimension_registry();
+        let sources = vec![worldgen::DatapackDimensionSource::Entries(vec![
+            (
+                "data/bhn/dimension_type/bhn_type.json".to_string(),
+                r##"{
+                    "ultrawarm": false, "natural": false, "coordinate_scale": 1.0,
+                    "has_skylight": false, "has_ceiling": false, "ambient_light": 0.0,
+                    "piglin_safe": false, "bed_works": false,
+                    "respawn_anchor_works": false, "has_raids": false,
+                    "logical_height": 256, "min_y": 0, "height": 256,
+                    "infiniburn": "#minecraft:infiniburn_overworld",
+                    "effects": "minecraft:overworld",
+                    "monster_spawn_light_level": 0,
+                    "monster_spawn_block_light_limit": 0
+                }"##
+                .to_string(),
+            ),
+            (
+                "data/bhn/dimension/net_dim.json".to_string(),
+                r#"{"type": "bhn:bhn_type", "generator": {"type": "minecraft:debug"}}"#
+                    .to_string(),
+            ),
+        ])];
+        assert_eq!(
+            worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap(),
+            1
+        );
+        let custom = DimId::parse_dimension_id("bhn:net_dim").expect("custom dimension resolves");
+        assert!(custom.index() >= 3, "custom slot follows the vanilla three");
+        // A registry whose entry names include the custom dimension id used to
+        // index `ids[dim.index()]` past the end of the three-slot table.
+        let entries: Vec<(&str, &[u8])> = vec![
+            ("minecraft:overworld", &[]),
+            ("minecraft:the_nether", &[]),
+            ("minecraft:the_end", &[]),
+            ("bhn:net_dim", &[]),
+        ];
+        assert_eq!(
+            dim_wire_ids_from_entries(entries),
+            Some([0, 1, 2]),
+            "vanilla wire ids must still resolve with a custom slot present"
+        );
         worldgen::reset_dimension_registry();
     }
 }
