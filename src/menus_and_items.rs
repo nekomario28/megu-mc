@@ -395,7 +395,7 @@ fn damage_held(me: &Arc<Client>) -> bool {
     let slot = 36 + *me.held.lock().unwrap();
     damage_inv_slot(me, slot)
 }
-fn damage_inv_slot(me: &Arc<Client>, slot: i16) -> bool {
+fn damage_inv_slot(me: &Client, slot: i16) -> bool {
     let mut inv = me.inv.lock().unwrap();
     let Some(st) = inv.get_mut(&slot) else {
         return false;
@@ -411,7 +411,7 @@ fn damage_inv_slot(me: &Arc<Client>, slot: i16) -> bool {
 
 // resend the held slot to the owner after damage/break so the client
 // model stays honest
-fn held_slot_resync(me: &Arc<Client>) {
+fn held_slot_resync(me: &Client) {
     let hs = *me.held.lock().unwrap();
     let slot = 36 + hs;
     let st = me
@@ -4200,7 +4200,6 @@ fn items_nbt_to_stacks(tag: &crate::nbt::Tag) -> Result<HashMap<i16, Stack>, &'s
 
 // Block-entity NBT payloads and transitions for the runtime integration.
 // The integration supplies world inputs and owns blockstate, ticks, and packets.
-// The state types have test callers until they are connected to the world.
 use crate::brigadier_wire::ResourceLocation;
 use crate::nbt::Tag;
 
@@ -4722,7 +4721,7 @@ impl Default for ChiseledBookshelf {
 #[cfg_attr(not(test), allow(dead_code))]
 impl ChiseledBookshelf {
     pub(crate) fn from_nbt(tag: &Tag) -> Self {
-        let slot = block_entity_int(tag, "last_interacted_slot");
+        let slot = block_entity_number(tag, "last_interacted_slot").unwrap_or(-1);
         Self {
             slots: block_entity_read_slots(tag),
             last_interacted_slot: (0..6).contains(&slot).then_some(slot as usize),
@@ -6014,6 +6013,997 @@ impl Vault {
     }
 }
 
+// The block identity owns the payload. Property changes (including updates made
+// by these entities) keep the same entry.
+#[derive(Debug)]
+enum LiveBlockEntity {
+    Beacon(Beacon),
+    Campfire(Campfire),
+    Lectern(Lectern, Option<i64>),
+    ChiseledBookshelf(ChiseledBookshelf),
+    DecoratedPot(DecoratedPot),
+    Crafter(Crafter, Option<i64>),
+    Jukebox(Jukebox),
+    Banner(Banner),
+    Skull(Skull),
+    Brushable(Brushable),
+    TrialSpawner(TrialSpawner),
+    Vault(Vault),
+}
+
+fn live_block_entity_id(name: &str) -> Option<&'static str> {
+    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    Some(match bare {
+        "beacon" => "minecraft:beacon",
+        "campfire" | "soul_campfire" => "minecraft:campfire",
+        "lectern" => "minecraft:lectern",
+        "chiseled_bookshelf" => "minecraft:chiseled_bookshelf",
+        "decorated_pot" => "minecraft:decorated_pot",
+        "crafter" => "minecraft:crafter",
+        "jukebox" => "minecraft:jukebox",
+        "suspicious_sand" | "suspicious_gravel" => "minecraft:brushable_block",
+        "trial_spawner" => "minecraft:trial_spawner",
+        "vault" => "minecraft:vault",
+        name if name.ends_with("_banner") => "minecraft:banner",
+        "skeleton_skull"
+        | "wither_skeleton_skull"
+        | "zombie_head"
+        | "player_head"
+        | "creeper_head"
+        | "dragon_head"
+        | "piglin_head"
+        | "skeleton_wall_skull"
+        | "wither_skeleton_wall_skull"
+        | "zombie_wall_head"
+        | "player_wall_head"
+        | "creeper_wall_head"
+        | "dragon_wall_head"
+        | "piglin_wall_head" => "minecraft:skull",
+        _ => return None,
+    })
+}
+
+impl LiveBlockEntity {
+    fn load(reg: &BReg, state: u32, id: &str, tag: &Tag) -> Self {
+        match id {
+            "minecraft:beacon" => Self::Beacon(Beacon::from_nbt(tag)),
+            "minecraft:campfire" => Self::Campfire(Campfire::from_nbt(tag)),
+            "minecraft:lectern" => Self::Lectern(
+                Lectern::from_nbt(tag),
+                (reg.get_prop(state, "powered").as_deref() == Some("true"))
+                    .then(|| live_block_entity_time().saturating_add(2)),
+            ),
+            "minecraft:chiseled_bookshelf" => {
+                Self::ChiseledBookshelf(ChiseledBookshelf::from_nbt(tag))
+            }
+            "minecraft:decorated_pot" => Self::DecoratedPot(DecoratedPot::from_nbt(tag)),
+            "minecraft:crafter" => Self::Crafter(Crafter::from_nbt(tag), None),
+            "minecraft:jukebox" => Self::Jukebox(Jukebox::from_nbt(tag, live_jukebox_song)),
+            "minecraft:banner" => Self::Banner(Banner::from_nbt(tag)),
+            "minecraft:skull" => Self::Skull(Skull::from_nbt(tag)),
+            "minecraft:brushable_block" => Self::Brushable(Brushable::from_nbt(tag)),
+            "minecraft:trial_spawner" => Self::TrialSpawner(TrialSpawner::from_nbt(tag)),
+            "minecraft:vault" => {
+                let phase = match reg.get_prop(state, "vault_state").as_deref() {
+                    Some("active") => VaultPhase::Active,
+                    Some("unlocking") => VaultPhase::Unlocking,
+                    Some("ejecting") => VaultPhase::Ejecting,
+                    _ => VaultPhase::Inactive,
+                };
+                let mut vault = Vault::from_nbt(tag, phase);
+                if tag.get("config").is_none()
+                    && reg.get_prop(state, "ominous").as_deref() == Some("true")
+                {
+                    vault.config.key_item = BlockEntityItem::new("ominous_trial_key", 1);
+                    vault.config.loot_table =
+                        ResourceLocation::parse("minecraft:chests/trial_chambers/reward_ominous")
+                            .unwrap();
+                }
+                Self::Vault(vault)
+            }
+            _ => unreachable!("unsupported block entity type"),
+        }
+    }
+
+    // This payload is separate from the block state and scheduled ticks.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn to_nbt(&self) -> Tag {
+        match self {
+            Self::Beacon(entity) => entity.to_nbt(),
+            Self::Campfire(entity) => entity.to_nbt(),
+            Self::Lectern(entity, _) => entity.to_nbt(),
+            Self::ChiseledBookshelf(entity) => entity.to_nbt(),
+            Self::DecoratedPot(entity) => entity.to_nbt(),
+            Self::Crafter(entity, _) => entity.to_nbt(),
+            Self::Jukebox(entity) => entity.to_nbt(),
+            Self::Banner(entity) => entity.to_nbt(),
+            Self::Skull(entity) => entity.to_nbt(),
+            Self::Brushable(entity) => entity.to_nbt(),
+            Self::TrialSpawner(entity) => entity.to_nbt(),
+            Self::Vault(entity) => entity.to_nbt(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct LiveBlockEntityStore {
+    entries: HashMap<DimBlockPos, (i32, LiveBlockEntity)>,
+    chunk_versions: HashMap<DimChunkKey, u64>,
+    scanned_at: u64,
+}
+
+fn live_block_entities() -> &'static Mutex<LiveBlockEntityStore> {
+    static STORE: OnceLock<Mutex<LiveBlockEntityStore>> = OnceLock::new();
+    STORE.get_or_init(Mutex::default)
+}
+
+impl LiveBlockEntityStore {
+    fn at(&mut self, reg: &BReg, key: DimBlockPos, state: u32) -> Option<&mut LiveBlockEntity> {
+        let block = reg.block_id_of(state)?;
+        if self.entries.get(&key).is_some_and(|(id, _)| *id != block) {
+            self.entries.remove(&key);
+        }
+        let id = live_block_entity_id(reg.name_of(state))?;
+        Some(
+            &mut self
+                .entries
+                .entry(key)
+                .or_insert_with(|| (block, LiveBlockEntity::load(reg, state, id, &Tag::End)))
+                .1,
+        )
+    }
+
+    // The world edit path already publishes per-chunk write versions. Read only
+    // changed chunks, without holding the overlay lock during entity updates.
+    fn discover(&mut self, reg: &BReg) {
+        let sequence = CHUNK_VERSION_SEQ.load(Ordering::Relaxed);
+        if self.scanned_at == sequence {
+            return;
+        }
+        let first_scan = self.scanned_at == 0;
+        self.scanned_at = sequence;
+        let mut changed = chunk_versions()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(&key, &version)| {
+                (self.chunk_versions.insert(key, version) != Some(version)).then_some(key)
+            })
+            .collect::<HashSet<_>>();
+        let placements = {
+            let edits = world().lock().unwrap();
+            if first_scan {
+                changed.extend(edits.keys().copied());
+            }
+            let mut placements = Vec::new();
+            for &(dim, cx, cz) in &changed {
+                let Some(cells) = edits.get(&(dim, cx, cz)) else {
+                    continue;
+                };
+                placements.extend(cells.iter().filter_map(|(&index, &state)| {
+                    live_block_entity_id(reg.name_of(state))?;
+                    let key = (
+                        dim,
+                        (cx << 4) + (index & 15) as i32,
+                        MIN_Y + (index >> 8) as i32,
+                        (cz << 4) + ((index >> 4) & 15) as i32,
+                    );
+                    Some((key, state))
+                }));
+            }
+            placements
+        };
+        self.entries.retain(|&(dim, x, y, z), (id, _)| {
+            !changed.contains(&(dim, x >> 4, z >> 4))
+                || reg.block_id_of(block_at_dim(dim, x, y, z)) == Some(*id)
+        });
+        for (key, state) in placements {
+            self.at(reg, key, state);
+        }
+    }
+}
+
+// Snapshot callers keep the block state alongside this vanilla NBT payload.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_block_entity_snapshot(key @ (dim, x, y, z): DimBlockPos) -> Option<(u32, Tag)> {
+    with_save_guard(|| {
+        let reg = breg()?;
+        let state = block_at_dim(dim, x, y, z);
+        let id = live_block_entity_id(reg.name_of(state))?;
+        let mut store = live_block_entities().lock().unwrap();
+        let Tag::Compound(mut fields) = store.at(reg, key, state)?.to_nbt() else {
+            unreachable!("block entity payload must be a compound");
+        };
+        for (field, value) in [("x", x), ("y", y), ("z", z)] {
+            block_entity_put(&mut fields, field, Tag::Int(value));
+        }
+        block_entity_put(&mut fields, "id", block_entity_string(id));
+        Some((state, Tag::Compound(fields)))
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn restore_live_block_entity(key @ (dim, x, y, z): DimBlockPos, tag: &Tag) -> bool {
+    with_save_guard(|| {
+        let Some(reg) = breg() else { return false };
+        let state = block_at_dim(dim, x, y, z);
+        let Some(block) = reg.block_id_of(state) else {
+            return false;
+        };
+        let Some(id) = live_block_entity_id(reg.name_of(state)) else {
+            return false;
+        };
+        if block_entity_str_field(tag, "id").as_deref() != Some(id) {
+            return false;
+        }
+        let entity = LiveBlockEntity::load(reg, state, id, tag);
+        live_block_entities()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(key, (block, entity));
+        true
+    })
+}
+
+impl BlockEntityItem {
+    fn from_stack(stack: &Stack) -> Option<Self> {
+        let item = Self::from_nbt(&stack_to_nbt(0, stack)?)?;
+        // Only accept component patches the shared inventory codec can round-trip.
+        let restored = item.to_stack()?;
+        (stack.2.len() == restored.2.len()
+            && stack
+                .2
+                .iter()
+                .all(|component| restored.2.contains(component)))
+        .then_some(item)
+    }
+
+    fn to_stack(&self) -> Option<Stack> {
+        let mut fields = self.nbt_fields();
+        block_entity_put(&mut fields, "Slot", Tag::Byte(0));
+        let stack = items_nbt_to_stacks(&block_entity_list(10, vec![Tag::Compound(fields)]))
+            .ok()?
+            .remove(&0)?;
+        let round_trip = Self::from_nbt(&stack_to_nbt(0, &stack)?)?;
+        (*self == round_trip).then_some(stack)
+    }
+}
+
+// Built-in campfire recipes from the 1.21.1 server recipe data. The shared
+// smelting table combines recipe types and discards cookingtime.
+fn live_campfire_result(item: &BlockEntityItem) -> Option<BlockEntityItem> {
+    if item.id.namespace() != "minecraft" {
+        return None;
+    }
+    let result = match item.id.path() {
+        "beef" => "cooked_beef",
+        "chicken" => "cooked_chicken",
+        "cod" => "cooked_cod",
+        "kelp" => "dried_kelp",
+        "mutton" => "cooked_mutton",
+        "porkchop" => "cooked_porkchop",
+        "potato" => "baked_potato",
+        "rabbit" => "cooked_rabbit",
+        "salmon" => "cooked_salmon",
+        _ => return None,
+    };
+    BlockEntityItem::new(result, 1)
+}
+
+fn live_jukebox_song(item: &BlockEntityItem) -> Option<JukeboxSong> {
+    live_jukebox_song_entry(item).map(|(_, song)| song)
+}
+
+fn live_jukebox_song_entry(item: &BlockEntityItem) -> Option<(i32, JukeboxSong)> {
+    static SONGS: OnceLock<HashMap<String, (i32, JukeboxSong)>> = OnceLock::new();
+    let songs = SONGS.get_or_init(|| {
+        load_config_packets()
+            .iter()
+            .filter_map(|(_, packet)| config_registry_header(packet))
+            .find(|(id, _)| *id == "minecraft:jukebox_song")
+            .and_then(|(_, body)| registry_wire_entries(body))
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(id, (name, mut payload))| {
+                if !read_merchant_bool(&mut payload)? {
+                    return None;
+                }
+                let tag = nbt::read_network_nbt(&mut payload).ok()?;
+                let duration = block_entity_double_field(&tag, "length_in_seconds")? * 20.0;
+                Some((
+                    name.to_owned(),
+                    (
+                        id as i32,
+                        JukeboxSong {
+                            length_in_ticks: duration.ceil() as i32,
+                            comparator_output: u8::try_from(block_entity_number(
+                                &tag,
+                                "comparator_output",
+                            )?)
+                            .ok()?,
+                        },
+                    ),
+                ))
+            })
+            .collect()
+    });
+    let component = NbtString::text("minecraft:jukebox_playable");
+    if let Some(playable) = item.components.get(&component) {
+        return songs
+            .get(&block_entity_resource(playable, "song")?.to_string())
+            .copied();
+    }
+    let disc = item.id.path().strip_prefix("music_disc_")?;
+    songs
+        .get(&format!("{}:{disc}", item.id.namespace()))
+        .copied()
+}
+
+fn live_block_entity_time() -> i64 {
+    (TICK_IDX.load(Ordering::Relaxed) * u64::from(GAME_TICKS_PER_TICK)) as i64
+}
+
+fn live_block_entity_loot(table: &ResourceLocation, seed: i64) -> Vec<BlockEntityItem> {
+    loot_tables()
+        .lock()
+        .unwrap()
+        .get(&table.to_string())
+        .map(|pools| {
+            roll_loot_seeded(pools, seed)
+                .iter()
+                .filter_map(BlockEntityItem::from_stack)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn emit_block_entity_item((dim, x, y, z): DimBlockPos, item: BlockEntityItem) {
+    // The existing item-entity simulation and broadcasts are Overworld-only.
+    if dim == DimId::Overworld {
+        if let Some(stack) = item.to_stack() {
+            drop_live_stack((x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5), stack);
+        }
+    }
+}
+
+fn update_live_block_entity_state((dim, x, y, z): DimBlockPos, before: u32, after: u32) {
+    if before != after && set_block_if_inner_dim(dim, x, y, z, after, Some(before)) {
+        note_block_update_dim(dim, x, y, z, after);
+    }
+}
+
+fn live_vault_state(reg: &BReg, state: u32, vault: &Vault) -> u32 {
+    let phase = match vault.phase {
+        VaultPhase::Inactive => "inactive",
+        VaultPhase::Active => "active",
+        VaultPhase::Unlocking => "unlocking",
+        VaultPhase::Ejecting => "ejecting",
+    };
+    reg.with_prop(state, "vault_state", phase)
+}
+
+fn live_entity_hit(c: &Client, (x, y, z): BlockPos) -> Option<(RsDir, [f64; 3])> {
+    let (eye_x, eye_y, eye_z) = client_eye_pos(c);
+    let eye = [eye_x - x as f64, eye_y - y as f64, eye_z - z as f64];
+    let (_, _, _, yaw, pitch, _) = *c.pos.lock().unwrap();
+    let (yaw_sin, yaw_cos) = f64::from(yaw).to_radians().sin_cos();
+    let (pitch_sin, pitch_cos) = f64::from(pitch).to_radians().sin_cos();
+    let ray = [-yaw_sin * pitch_cos, -pitch_sin, yaw_cos * pitch_cos];
+    RsDir::ALL
+        .into_iter()
+        .filter_map(|face| {
+            let axis = match face {
+                RsDir::Up | RsDir::Down => 1,
+                RsDir::West | RsDir::East => 0,
+                RsDir::North | RsDir::South => 2,
+            };
+            let upper = matches!(face, RsDir::Up | RsDir::East | RsDir::South);
+            if ray[axis] == 0.0 || (ray[axis] > 0.0) == upper {
+                return None;
+            }
+            let distance = (f64::from(upper) - eye[axis]) / ray[axis];
+            let hit = std::array::from_fn(|i| eye[i] + distance * ray[i]);
+            (distance >= 0.0 && hit.iter().all(|value| (-1e-7..=1.0 + 1e-7).contains(value)))
+                .then_some((distance, face, hit))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, face, hit)| (face, hit))
+}
+
+fn live_bookshelf_slot(reg: &BReg, state: u32, hit: (RsDir, [f64; 3])) -> Option<usize> {
+    let (face, [x, y, z]) = hit;
+    if reg.get_prop(state, "facing").as_deref() != Some(face.property()) {
+        return None;
+    }
+    let horizontal = match face {
+        RsDir::North => 1.0 - x,
+        RsDir::South => x,
+        RsDir::West => z,
+        RsDir::East => 1.0 - z,
+        _ => return None,
+    };
+    Some(usize::from(y < 0.5) * 3 + ((horizontal * 3.0) as usize).min(2))
+}
+
+fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u32) -> bool {
+    let Some(reg) = breg() else { return false };
+    if live_block_entity_id(reg.name_of(state)).is_none() || c.is_spectator() {
+        return false;
+    }
+    with_save_guard(|| {
+        if block_at_dim(dim, x, y, z) != state {
+            return false;
+        }
+        if reg.name_of(state) == "minecraft:lectern"
+            && reg.get_prop(state, "has_book").as_deref() == Some("true")
+        {
+            open_live_menu(c, Some(key), LiveMenu::Lectern);
+            return true;
+        }
+        let creative = *c.gm.lock().unwrap() == 1;
+        let held_index = *c.held.lock().unwrap();
+        let selected = 36 + held_index;
+        let hit = || live_entity_hit(c, (x, y, z));
+        let mut inv = c.inv.lock().unwrap();
+        let stack = inv.get(&selected).cloned().unwrap_or_default();
+        let mut held = BlockEntityItem::from_stack(&stack);
+        let held_before = held.as_ref().map_or(0, BlockEntityItem::count);
+        let mut next_state = state;
+        let mut ejected = None;
+        let mut brush_breaks = false;
+        let mut event = None;
+        let mut inventory_changed = false;
+        let used = {
+            let mut store = live_block_entities().lock().unwrap();
+            let Some(entity) = store.at(reg, key, state) else {
+                return false;
+            };
+            match entity {
+                LiveBlockEntity::Campfire(fire)
+                    if reg.get_prop(state, "lit").as_deref() == Some("true") =>
+                {
+                    fire.place(&mut held, |item| live_campfire_result(item).map(|_| 600))
+                        .is_some()
+                }
+                LiveBlockEntity::Lectern(lectern, _) => {
+                    if lectern.place(&mut held) {
+                        next_state = reg.with_prop(state, "has_book", "true");
+                        true
+                    } else {
+                        false
+                    }
+                }
+                LiveBlockEntity::ChiseledBookshelf(shelf) => {
+                    let Some(slot) = hit().and_then(|hit| live_bookshelf_slot(reg, state, hit))
+                    else {
+                        return false;
+                    };
+                    if let Some(book) = &shelf.slots[slot] {
+                        let Some(mut stack) = book.to_stack() else {
+                            return false;
+                        };
+                        if dim == DimId::Overworld {
+                            ejected = shelf.remove_book(slot);
+                        } else {
+                            let mut candidate = inv.clone();
+                            pickup_into_inventory(&mut candidate, held_index, false, &mut stack);
+                            if stack.1 != 0 {
+                                return false;
+                            }
+                            *inv = candidate;
+                            inventory_changed = true;
+                            shelf.remove_book(slot);
+                        }
+                    } else if !shelf.insert_book(slot, &mut held) {
+                        return false;
+                    }
+                    next_state = reg.with_prop(
+                        state,
+                        &format!("slot_{slot}_occupied"),
+                        if shelf.slots[slot].is_some() {
+                            "true"
+                        } else {
+                            "false"
+                        },
+                    );
+                    true
+                }
+                LiveBlockEntity::DecoratedPot(pot) => {
+                    pot.insert(&mut held, stack_max_of(&stack) as u8)
+                }
+                LiveBlockEntity::Jukebox(box_) => {
+                    if let Some(record) = &box_.record {
+                        if dim != DimId::Overworld || record.to_stack().is_none() {
+                            return false;
+                        }
+                        if box_.playback.is_some() {
+                            event = Some((1011, 0));
+                        }
+                        ejected = box_.eject();
+                        next_state = reg.with_prop(state, "has_record", "false");
+                    } else if box_.insert(&mut held, live_jukebox_song) {
+                        if let Some((id, _)) =
+                            box_.record.as_ref().and_then(live_jukebox_song_entry)
+                        {
+                            event = Some((1010, id));
+                        }
+                        next_state = reg.with_prop(state, "has_record", "true");
+                    } else {
+                        return false;
+                    }
+                    true
+                }
+                LiveBlockEntity::Brushable(brushable)
+                    if dim == DimId::Overworld && item_to_name(stack.0) == Some("brush") =>
+                {
+                    let Some((face, _)) = hit() else { return false };
+                    match brushable.brush(
+                        live_block_entity_time(),
+                        Brushable::DIRECTIONS[face as usize],
+                        |table| {
+                            live_block_entity_loot(
+                                &table.id,
+                                if table.seed == 0 {
+                                    world_rng::next_u64() as i64
+                                } else {
+                                    table.seed
+                                },
+                            )
+                            .into_iter()
+                            .next()
+                        },
+                    ) {
+                        BrushResult::CoolingDown => {}
+                        BrushResult::Progress { dusted } => {
+                            next_state = reg.with_prop(state, "dusted", &dusted.to_string());
+                        }
+                        BrushResult::Completed { loot, .. } => {
+                            let replacement = match reg.name_of(state) {
+                                "minecraft:suspicious_sand" => "minecraft:sand",
+                                _ => "minecraft:gravel",
+                            };
+                            next_state = reg.state_of(replacement, None);
+                            ejected = loot;
+                            brush_breaks = !creative;
+                            store.entries.remove(&key);
+                        }
+                    }
+                    true
+                }
+                LiveBlockEntity::Vault(vault) if dim == DimId::Overworld => {
+                    let unlocked =
+                        vault.try_unlock(live_block_entity_time(), c.uuid, &mut held, |table| {
+                            live_block_entity_loot(table, world_rng::next_u64() as i64)
+                        });
+                    next_state = live_vault_state(reg, state, vault);
+                    unlocked
+                }
+                _ => false,
+            }
+        };
+        if !used {
+            return false;
+        }
+        let consumed = held_before - held.as_ref().map_or(0, BlockEntityItem::count);
+        let to_inventory =
+            ejected.take_if(|_| reg.name_of(state) == "minecraft:chiseled_bookshelf");
+        if let Some(mut stack) = to_inventory.as_ref().and_then(BlockEntityItem::to_stack) {
+            inventory_changed = pickup_into_inventory(&mut inv, held_index, creative, &mut stack);
+            if stack.1 != 0 && dim == DimId::Overworld {
+                drop_live_stack((x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5), stack);
+            }
+        }
+        if consumed != 0 && !creative {
+            map_take(&mut inv, selected, consumed);
+            inventory_changed = true;
+        }
+        if inventory_changed {
+            let cursor = c.cursor.lock().unwrap();
+            let mut sock = c.sock.lock().unwrap();
+            send_live_contents(&mut sock, 0, 0, &[], &inv, 0..46, &cursor);
+        }
+        drop(inv);
+        if brush_breaks {
+            damage_inv_slot(c, selected);
+            held_slot_resync(c);
+        }
+        update_live_block_entity_state(key, state, next_state);
+        if let Some(item) = ejected {
+            emit_block_entity_item(key, item);
+        }
+        if let Some((event, data)) = event {
+            live_block_entity_event(key, event, data);
+        }
+        true
+    })
+}
+
+fn live_block_entity_event((dim, x, y, z): DimBlockPos, event: i32, data: i32) {
+    let mut packet = event.to_be_bytes().to_vec();
+    write_pos(&mut packet, x, y, z);
+    packet.extend_from_slice(&data.to_be_bytes());
+    packet.push(0); // dimension-scoped event
+    broadcast_chunk_dim(dim, x >> 4, z >> 4, |_| (0x28, packet.clone()));
+}
+
+fn live_beacon_pulse((dim, x, y, z): DimBlockPos, pulse: BeaconPulse, players: &[Arc<Client>]) {
+    let range = f64::from(pulse.range);
+    for player in players {
+        if *player.dim.lock().unwrap() != dim || player.is_spectator() {
+            continue;
+        }
+        let (px, py, pz, ..) = *player.pos.lock().unwrap();
+        if !(x as f64 - range..x as f64 + 1.0 + range).contains(&px)
+            || !(z as f64 - range..z as f64 + 1.0 + range).contains(&pz)
+            || !(y as f64 - range..(dim.min_y() + dim.height()) as f64 + range).contains(&py)
+        {
+            continue;
+        }
+        for (effect, amp) in [(Some(pulse.primary), pulse.amplifier), (pulse.secondary, 0)] {
+            let Some(effect) = effect else { continue };
+            let id = name_to_effect(BeaconEffect::IDS[effect as usize].1).unwrap();
+            let amp = i32::from(amp);
+            let left = server_ticks(pulse.duration as u64) as i32;
+            {
+                let mut effects = player.effs.lock().unwrap();
+                if effects
+                    .iter()
+                    .any(|e| e.id == id && (e.amp > amp || e.amp == amp && e.left >= left))
+                {
+                    continue;
+                }
+                effects.retain(|e| e.id != id);
+                effects.push(Eff { id, amp, left });
+            }
+            let packet = entity_effect_pkt(player.eid, id, amp, pulse.duration);
+            let _ = send_packet(&mut player.sock.lock().unwrap(), 0x76, packet.clone());
+            broadcast_seen_ex(player.eid, player.eid, |_| (0x76, packet.clone()));
+        }
+    }
+}
+
+fn nearby_block_entity_players(
+    players: &[Arc<Client>],
+    (dim, x, y, z): DimBlockPos,
+    range: f64,
+) -> Vec<BlockEntityUuid> {
+    players
+        .iter()
+        .filter_map(|player| {
+            if *player.dim.lock().unwrap() != dim
+                || player.is_spectator()
+                || *player.hp.lock().unwrap() <= 0.0
+            {
+                return None;
+            }
+            let (px, py, pz, ..) = *player.pos.lock().unwrap();
+            let distance = (px - x as f64 - 0.5).powi(2)
+                + (py - y as f64 - 0.5).powi(2)
+                + (pz - z as f64 - 0.5).powi(2);
+            (distance <= range * range).then_some(player.uuid)
+        })
+        .collect()
+}
+
+fn live_crafter_recipe(
+    slots: &[Option<BlockEntityItem>; 9],
+) -> Option<(BlockEntityItem, Vec<BlockEntityItem>)> {
+    let mut grid = HashMap::new();
+    for (i, item) in slots.iter().enumerate() {
+        if let Some(item) = item {
+            grid.insert(i as i16 + 1, item.to_stack()?);
+        }
+    }
+    let result = BlockEntityItem::from_stack(&craft3_result(&grid)?)?;
+    let remainders = slots
+        .iter()
+        .flatten()
+        .filter(|item| {
+            item.vanilla(&[
+                "milk_bucket",
+                "water_bucket",
+                "lava_bucket",
+                "powder_snow_bucket",
+            ])
+        })
+        .filter_map(|_| BlockEntityItem::new("bucket", 1))
+        .collect();
+    Some((result, remainders))
+}
+
+fn live_crafter_powered(reg: &'static BReg, (dim, x, y, z): DimBlockPos, now: i64) -> bool {
+    let mut dimensions = live_redstone().lock().unwrap();
+    let mut empty = LiveRedstoneState::default();
+    let mut world = LiveRedstoneWorld {
+        dim,
+        reg,
+        state: dimensions.get_mut(&dim).unwrap_or(&mut empty),
+        now: now as u64,
+        reads: Default::default(),
+        writes: Default::default(),
+        dispensers: Vec::new(),
+    };
+    let mut torches = BTreeMap::new();
+    let adapter = RedstoneWorldAdapter::new(reg, &mut world, &mut torches);
+    rs_neighbor_signal(&adapter, RsPos(x, y, z), true) != 0
+}
+
+fn tick_live_trial_spawner(
+    spawner: &mut TrialSpawner,
+    reg: &BReg,
+    key @ (dim, x, y, z): DimBlockPos,
+    state: u32,
+    now: i64,
+    players: &[Arc<Client>],
+    items: &mut Vec<BlockEntityItem>,
+) -> u32 {
+    let property = "trial_spawner_state";
+    let phase = reg.get_prop(state, property);
+    let Some(spawn) = spawner.spawn_data.as_ref() else {
+        return reg.with_prop(state, property, "inactive");
+    };
+    let Some(spec) = spawn
+        .get("entity")
+        .and_then(|entity| block_entity_str_field(entity, "id"))
+        .and_then(|id| entity_spec_by_name(&id))
+        .filter(|spec| spec.max_health > 0.0)
+    else {
+        return state;
+    };
+    if DIFFICULTY.load(Ordering::Relaxed) == 0 {
+        return state;
+    }
+    match phase.as_deref() {
+        Some("cooldown") if now < spawner.cooldown_ends_at => return state,
+        Some("cooldown") => {
+            spawner.registered_players.clear();
+            spawner.ejecting_loot_table = None;
+            return reg.with_prop(state, property, "waiting_for_players");
+        }
+        Some("waiting_for_reward_ejection" | "ejecting_reward") => {
+            if now < spawner.next_mob_spawns_at {
+                return state;
+            }
+            if let Some(table) = &spawner.ejecting_loot_table {
+                if dim != DimId::Overworld {
+                    return state;
+                }
+                for _ in &spawner.registered_players {
+                    items.extend(live_block_entity_loot(table, world_rng::next_u64() as i64));
+                }
+            }
+            return reg.with_prop(state, property, "cooldown");
+        }
+        _ => {}
+    }
+    let nearby =
+        nearby_block_entity_players(players, key, f64::from(spawner.required_player_range));
+    for uuid in nearby {
+        if !spawner.registered_players.contains(&uuid) {
+            spawner.registered_players.push(uuid);
+        }
+    }
+    if spawner.registered_players.is_empty() {
+        return reg.with_prop(state, property, "waiting_for_players");
+    }
+    let config = if reg.get_prop(state, "ominous").as_deref() == Some("true") {
+        spawner.ominous_config.as_ref()
+    } else {
+        spawner.normal_config.as_ref()
+    }
+    .unwrap_or(&Tag::End);
+    let additional = spawner.registered_players.len().saturating_sub(1) as f64;
+    let quota = |base, per_player, default, default_extra| {
+        (block_entity_double_field(config, base).unwrap_or(default)
+            + additional * block_entity_double_field(config, per_player).unwrap_or(default_extra))
+        .floor()
+        .max(0.0) as i32
+    };
+    let total = quota("total_mobs", "total_mobs_added_per_player", 6.0, 2.0);
+    let simultaneous = quota(
+        "simultaneous_mobs",
+        "simultaneous_mobs_added_per_player",
+        2.0,
+        1.0,
+    );
+    let interval = block_entity_number(config, "ticks_between_spawn")
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|&value| value >= 0)
+        .unwrap_or(40);
+    let range = block_entity_number(config, "spawn_range")
+        .filter(|value| (1..=128).contains(value))
+        .unwrap_or(4);
+    let mut mobs = mobs().lock().unwrap();
+    for uuid in spawner.current_mobs.clone() {
+        if !mobs
+            .iter()
+            .any(|mob| mob.dim == dim && mob.uuid == uuid && *mob.hp.lock().unwrap() > 0.0)
+        {
+            spawner.remove_mob(now, interval, uuid);
+        }
+    }
+    if spawner.total_mobs_spawned >= total {
+        if spawner.begin_rewards(now) {
+            spawner.next_mob_spawns_at = now.saturating_add(40);
+            return reg.with_prop(state, property, "waiting_for_reward_ejection");
+        }
+    } else if spawner.current_mobs.len() < simultaneous as usize
+        && now >= spawner.next_mob_spawns_at
+        && mobs.len() < MOB_CAP
+    {
+        let mut rng = generation_math::Lcg::new(world_rng::next_u64());
+        let px = x as f64 + 0.5 + (rng.next_f32() - rng.next_f32()) as f64 * range as f64;
+        let pz = z as f64 + 0.5 + (rng.next_f32() - rng.next_f32()) as f64 * range as f64;
+        let py = y as f64 + f64::from(rng.next_bound(3) - 1);
+        let half = f64::from(spec.width) / 2.0;
+        if live_mob_block_boxes(
+            dim,
+            reg,
+            [px - half, py, pz - half],
+            [px + half, py + f64::from(spec.height), pz + half],
+        )
+        .is_empty()
+        {
+            let mob = new_live_mob(
+                spec.id,
+                dim,
+                (px, py, pz, rng.next_f32() * 360.0, 0.0),
+                spec.max_health,
+                None,
+            );
+            if spawner.record_spawn(now, interval, mob.uuid) {
+                mobs.push(mob);
+            }
+        }
+    }
+    reg.with_prop(state, property, "active")
+}
+
+fn tick_live_block_entities(players: &[Arc<Client>]) {
+    let Some(reg) = breg() else { return };
+    with_save_guard(|| {
+        let game_time = live_block_entity_time();
+        let updates = {
+            let mut store = live_block_entities().lock().unwrap();
+            store.discover(reg);
+            let mut updates = Vec::new();
+            for (&key @ (dim, x, y, z), (_, entity)) in &mut store.entries {
+                if matches!(
+                    entity,
+                    LiveBlockEntity::Banner(_)
+                        | LiveBlockEntity::Skull(_)
+                        | LiveBlockEntity::DecoratedPot(_)
+                        | LiveBlockEntity::ChiseledBookshelf(_)
+                ) {
+                    continue;
+                }
+                let state = block_at_dim(dim, x, y, z);
+                let mut after = state;
+                let mut items = Vec::new();
+                let mut pulse = None;
+                let mut event = None;
+                let lit = || reg.get_prop(state, "lit").as_deref() == Some("true");
+                for now in game_time..game_time + i64::from(GAME_TICKS_PER_TICK) {
+                    match entity {
+                        LiveBlockEntity::Beacon(beacon) if now % 80 == 0 => {
+                            let beam_clear = ((y + 1)..dim.min_y() + dim.height()).all(|y| {
+                                let above = block_at_dim(dim, x, y, z);
+                                reg.opacity_of(above) < 15
+                                    || reg.name_of(above) == "minecraft:bedrock"
+                            });
+                            pulse = beacon.tick(now, beam_clear, |dx, dy, dz| {
+                                let base = block_at_dim(dim, x + dx, y + dy, z + dz);
+                                matches!(
+                                    reg.name_of(base),
+                                    "minecraft:iron_block"
+                                        | "minecraft:gold_block"
+                                        | "minecraft:emerald_block"
+                                        | "minecraft:diamond_block"
+                                        | "minecraft:netherite_block"
+                                )
+                            });
+                        }
+                        LiveBlockEntity::Campfire(fire) => {
+                            items.extend(fire.tick(lit(), live_campfire_result, |item| {
+                                dim == DimId::Overworld && item.to_stack().is_some()
+                            }));
+                        }
+                        LiveBlockEntity::Lectern(_, due) => {
+                            if due.is_some_and(|time| now >= time) {
+                                *due = None;
+                                after = reg.with_prop(after, "powered", "false");
+                            }
+                        }
+                        LiveBlockEntity::Crafter(crafter, due) => {
+                            crafter.tick();
+                            if crafter.crafting_ticks_remaining == 0 {
+                                after = reg.with_prop(after, "crafting", "false");
+                            }
+                            if now == game_time {
+                                let powered = live_crafter_powered(reg, key, now);
+                                if let Some(delay) = crafter.set_powered(powered) {
+                                    due.get_or_insert(now.saturating_add(i64::from(delay)));
+                                }
+                                after = reg.with_prop(
+                                    after,
+                                    "triggered",
+                                    if powered { "true" } else { "false" },
+                                );
+                            }
+                            if due.is_some_and(|time| now >= time) {
+                                *due = None;
+                                if dim == DimId::Overworld {
+                                    if let Some((result, remainders)) =
+                                        crafter.craft(live_crafter_recipe)
+                                    {
+                                        after = reg.with_prop(after, "crafting", "true");
+                                        items.push(result);
+                                        items.extend(remainders);
+                                    }
+                                }
+                            }
+                        }
+                        LiveBlockEntity::Jukebox(jukebox) => {
+                            if jukebox.tick() == Some(JukeboxTick::Stopped) {
+                                event = Some((1011, 0));
+                            }
+                        }
+                        LiveBlockEntity::Brushable(brushable) => {
+                            brushable.tick(now);
+                            after = reg.with_prop(after, "dusted", &brushable.dusted().to_string());
+                        }
+                        LiveBlockEntity::TrialSpawner(spawner) => {
+                            after = tick_live_trial_spawner(
+                                spawner, reg, key, after, now, players, &mut items,
+                            );
+                        }
+                        LiveBlockEntity::Vault(vault) => {
+                            if dim == DimId::Overworld || vault.items_to_eject.is_empty() {
+                                items.extend(vault.tick(now, |range| {
+                                    nearby_block_entity_players(players, key, range)
+                                }));
+                            }
+                            after = live_vault_state(reg, after, vault);
+                        }
+                        _ => {}
+                    }
+                }
+                if after != state || !items.is_empty() || pulse.is_some() || event.is_some() {
+                    updates.push((key, state, after, items, pulse, event));
+                }
+            }
+            updates
+        };
+        for (key, state, after, items, pulse, event) in updates {
+            update_live_block_entity_state(key, state, after);
+            if reg.name_of(state) == "minecraft:crafter" {
+                for player in players {
+                    let Some(connection) = live_menu_connection(player) else {
+                        continue;
+                    };
+                    let mut active = connection.active.lock().unwrap();
+                    if let Some(session) = active.as_mut().filter(|session| {
+                        matches!(session.menu, LiveMenu::Crafter) && session.anchor == Some(key)
+                    }) {
+                        sync_live_menu(player, session, false);
+                    }
+                }
+            }
+            for item in items {
+                emit_block_entity_item(key, item);
+            }
+            if let Some(pulse) = pulse {
+                live_beacon_pulse(key, pulse, players);
+            }
+            if let Some((event, data)) = event {
+                live_block_entity_event(key, event, data);
+            }
+        }
+    });
+}
+
 // ---------- item -> blockstate (1.21.1 ids) ----------
 fn item_to_state(item: i64) -> Option<u32> {
     Some(match item {
@@ -6031,7 +7021,12 @@ fn item_to_state(item: i64) -> Option<u32> {
         291 => 2355,
         299 => 2955, // chest's 1.21.1 default state (single, north, dry)
         678 => 9120, // trapped_chest's default state (single, north, dry)
-        _ => return None,
+        _ => {
+            let name = item_to_name(item)?;
+            live_block_entity_id(name)?;
+            let reg = breg()?;
+            reg.state_of(&format!("minecraft:{name}"), None)
+        }
     })
 }
 
@@ -7110,6 +8105,8 @@ enum LiveMenu {
     Anvil(AnvilMenu),
     Enchanting(EnchantmentMenu),
     Brewing,
+    Crafter,
+    Lectern,
     Smithing(SmithingMenu),
     Merchant(i32, MerchantMenu),
 }
@@ -7119,6 +8116,8 @@ impl LiveMenu {
         match self {
             Self::Anvil(_) => (8, "Repair & Name"),
             Self::Brewing => (11, "Brewing Stand"),
+            Self::Crafter => (7, "Crafter"),
+            Self::Lectern => (17, "Lectern"),
             Self::Enchanting(_) => (13, "Enchant"),
             Self::Merchant(..) => (19, "Villager"),
             Self::Smithing(_) => (21, "Upgrade Gear"),
@@ -7131,7 +8130,7 @@ impl LiveMenu {
             Self::Enchanting(menu) => vec![&mut menu.item, &mut menu.lapis],
             Self::Smithing(menu) => vec![&mut menu.template, &mut menu.base, &mut menu.addition],
             Self::Merchant(_, menu) => menu.payments.iter_mut().collect(),
-            Self::Brewing => Vec::new(),
+            Self::Brewing | Self::Crafter | Self::Lectern => Vec::new(),
         }
     }
 }
@@ -7260,8 +8259,9 @@ fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u3
         }
         "minecraft:enchanting_table" => LiveMenu::Enchanting(EnchantmentMenu::default()),
         "minecraft:brewing_stand" => LiveMenu::Brewing,
+        "minecraft:crafter" => LiveMenu::Crafter,
         "minecraft:smithing_table" => LiveMenu::Smithing(SmithingMenu::default()),
-        _ => return false,
+        _ => return use_live_block_entity(c, key, state),
     };
     if !c.is_spectator() {
         // Recheck under the block transaction lock before creating the stand entity.
@@ -7275,6 +8275,9 @@ fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u3
                     .unwrap()
                     .entry(key)
                     .or_default();
+            }
+            if matches!(menu, LiveMenu::Crafter) {
+                live_block_entities().lock().unwrap().at(reg, key, state);
             }
             open_live_menu(c, Some(key), menu);
         });
@@ -7384,6 +8387,55 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
             properties.extend(brewing_window_properties(&entry.stand));
             entry.menu.slots.to_vec()
         }
+        LiveMenu::Crafter => {
+            let store = live_block_entities().lock().unwrap();
+            let Some((_, LiveBlockEntity::Crafter(crafter, _))) =
+                store.entries.get(&session.anchor.unwrap())
+            else {
+                return;
+            };
+            properties.extend((0..9).map(|slot| WindowPropertyUpdate {
+                property: slot as i16,
+                value: i16::from(crafter.disabled[slot]),
+            }));
+            properties.push(WindowPropertyUpdate {
+                property: 9,
+                value: i16::from(crafter.triggered),
+            });
+            let mut slots = crafter
+                .slots()
+                .iter()
+                .map(|item| {
+                    item.as_ref()
+                        .and_then(BlockEntityItem::to_stack)
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
+            let result =
+                live_crafter_recipe(crafter.slots()).and_then(|(result, _)| result.to_stack());
+            slots.push(result.unwrap_or_default());
+            slots
+        }
+        LiveMenu::Lectern => {
+            let (dim, x, y, z) = session.anchor.unwrap();
+            let (Some(reg), state) = (breg(), block_at_dim(dim, x, y, z)) else {
+                return;
+            };
+            let mut store = live_block_entities().lock().unwrap();
+            let Some(LiveBlockEntity::Lectern(lectern, _)) = store.at(reg, (dim, x, y, z), state)
+            else {
+                return;
+            };
+            properties.push(WindowPropertyUpdate {
+                property: 0,
+                value: lectern.page() as i16,
+            });
+            vec![lectern
+                .book
+                .as_ref()
+                .and_then(BlockEntityItem::to_stack)
+                .unwrap_or_default()]
+        }
         LiveMenu::Smithing(menu) => {
             vec![
                 menu.template.clone(),
@@ -7420,7 +8472,11 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
         session.state_id,
         &slots,
         &inventory,
-        9..45,
+        if matches!(session.menu, LiveMenu::Lectern) {
+            0..0
+        } else {
+            9..45
+        },
         &cursor,
     );
     for property in properties {
@@ -7538,6 +8594,13 @@ fn live_enchant_button(c: &Client, window: i32, button: i32) {
     let Some(session) = active.as_mut().filter(|s| i32::from(s.id) == window) else {
         return;
     };
+    if matches!(session.menu, LiveMenu::Lectern) {
+        if live_menu_valid(c, session) {
+            live_lectern_button(c, session.anchor.unwrap(), button);
+            sync_live_menu(c, session, false);
+        }
+        return;
+    }
     if let LiveMenu::Enchanting(menu) = &mut session.menu {
         let creative = *c.gm.lock().unwrap() == 1;
         let mut seed = connection.enchantment_seed.lock().unwrap();
@@ -7548,6 +8611,41 @@ fn live_enchant_button(c: &Client, window: i32, button: i32) {
         });
         drop(seed);
         sync_live_menu(c, session, false);
+    }
+}
+
+fn live_lectern_button(c: &Client, key @ (dim, x, y, z): DimBlockPos, button: i32) {
+    let Some(reg) = breg() else { return };
+    let state = block_at_dim(dim, x, y, z);
+    let mut store = live_block_entities().lock().unwrap();
+    let Some(LiveBlockEntity::Lectern(lectern, pulse_end)) = store.at(reg, key, state) else {
+        return;
+    };
+    if button == 3 && matches!(*c.gm.lock().unwrap(), 0 | 1) {
+        if let Some(book) = lectern.book.as_ref().and_then(BlockEntityItem::to_stack) {
+            lectern.take_book();
+            *pulse_end = None;
+            drop(store);
+            return_live_inputs(c, [book]);
+            let state_without_book = reg.with_prop(state, "has_book", "false");
+            update_live_block_entity_state(
+                key,
+                state,
+                reg.with_prop(state_without_book, "powered", "false"),
+            );
+        }
+        return;
+    }
+    let page = match button {
+        1 => lectern.page() - 1,
+        2 => lectern.page() + 1,
+        100.. => button - 100,
+        _ => return,
+    };
+    if lectern.book.is_some() && lectern.set_page(page) {
+        *pulse_end = Some(live_block_entity_time() + 2);
+        drop(store);
+        update_live_block_entity_state(key, state, reg.with_prop(state, "powered", "true"));
     }
 }
 
@@ -7621,9 +8719,15 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
         LiveMenu::Anvil(_) | LiveMenu::Merchant(..) => 3,
         LiveMenu::Enchanting(_) => 2,
         LiveMenu::Brewing => 5,
+        LiveMenu::Crafter => 10,
+        LiveMenu::Lectern => {
+            sync_live_menu(c, session, false);
+            return;
+        }
         LiveMenu::Smithing(_) => 4,
     };
     let output_slot = match session.menu {
+        LiveMenu::Crafter => 9,
         LiveMenu::Anvil(_) | LiveMenu::Merchant(..) | LiveMenu::Smithing(_) => slots - 1,
         _ => -1,
     };
@@ -7706,6 +8810,40 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                     before != stack.1
                 };
             }
+        } else if matches!(session.menu, LiveMenu::Crafter) {
+            let mut store = live_block_entities().lock().unwrap();
+            if let Some((_, LiveBlockEntity::Crafter(crafter, _))) =
+                store.entries.get_mut(&session.anchor.unwrap())
+            {
+                let index = slot as usize;
+                let original = &crafter.slots()[index];
+                if !crafter.disabled[index]
+                    && crafter.loot_table.is_none()
+                    && (original.is_none()
+                        || original
+                            .as_ref()
+                            .and_then(BlockEntityItem::to_stack)
+                            .is_some())
+                    && (cursor.1 == 0 || BlockEntityItem::from_stack(&cursor).is_some())
+                {
+                    let mut target = original
+                        .as_ref()
+                        .and_then(BlockEntityItem::to_stack)
+                        .unwrap_or_default();
+                    if mode == 0 {
+                        let limit = stack_max_of(&cursor) as u8;
+                        click_live_input(&mut target, &mut cursor, button, limit);
+                    } else {
+                        pickup_into_inventory(
+                            &mut inventory,
+                            *c.held.lock().unwrap(),
+                            false,
+                            &mut target,
+                        );
+                    }
+                    crafter.set_slot(index, BlockEntityItem::from_stack(&target));
+                }
+            }
         } else {
             let limit = live_input_limit(&session.menu, slot as usize, &cursor);
             let mut inputs = session.menu.input_slots();
@@ -7732,6 +8870,18 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                         {
                             brewing_changed |= entry.menu.click_slot(target, 0, &mut source);
                         }
+                    }
+                }
+            } else if matches!(session.menu, LiveMenu::Crafter) {
+                let mut store = live_block_entities().lock().unwrap();
+                if let Some((_, LiveBlockEntity::Crafter(crafter, _))) =
+                    store.entries.get_mut(&session.anchor.unwrap())
+                {
+                    if let Some(item) = BlockEntityItem::from_stack(&source) {
+                        let mut remaining = Some(item);
+                        let limit = stack_max_of(&source) as u8;
+                        while crafter.insert(&mut remaining, limit).is_some() {}
+                        source.1 = remaining.as_ref().map_or(0, BlockEntityItem::count);
                     }
                 }
             } else if !matches!(session.menu, LiveMenu::Merchant(..)) {
@@ -7848,19 +8998,27 @@ fn live_menu_valid(c: &Client, session: &LiveMenuSession) -> bool {
         return false;
     }
     let Some(reg) = breg() else { return false };
+    let state = block_at_dim(dim, x, y, z);
+    if matches!(session.menu, LiveMenu::Lectern) {
+        return reg.name_of(state) == "minecraft:lectern"
+            && reg.get_prop(state, "has_book").as_deref() == Some("true");
+    }
     matches!(
-        (&session.menu, reg.name_of(block_at_dim(dim, x, y, z))),
+        (&session.menu, reg.name_of(state)),
         (
             LiveMenu::Anvil(_),
             "minecraft:anvil" | "minecraft:chipped_anvil" | "minecraft:damaged_anvil"
         ) | (LiveMenu::Enchanting(_), "minecraft:enchanting_table")
             | (LiveMenu::Brewing, "minecraft:brewing_stand")
+            | (LiveMenu::Crafter, "minecraft:crafter")
             | (LiveMenu::Smithing(_), "minecraft:smithing_table")
     )
 }
 
 fn live_menu_tick() {
-    for c in client_snapshot() {
+    let players = client_snapshot();
+    tick_live_block_entities(&players);
+    for c in players {
         let Some(connection) = live_menu_connection(&c) else {
             continue;
         };

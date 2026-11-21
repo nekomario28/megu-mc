@@ -1173,4 +1173,499 @@ mod block_entity_helpers {
             vault
         );
     }
+    struct LiveWorld {
+        store: LiveBlockEntityStore,
+        time: u64,
+        players: Vec<Arc<Client>>,
+        sessions: HashMap<i32, PlayerMechanismSession>,
+        drops: Vec<Drop>,
+        rng: u64,
+        cells: Vec<(DimBlockPos, u32)>,
+    }
+
+    impl LiveWorld {
+        fn new() -> Self {
+            Self {
+                store: std::mem::take(&mut *live_block_entities().lock().unwrap()),
+                time: TICK_IDX.swap(0, Ordering::Relaxed),
+                players: std::mem::take(&mut *clients().lock().unwrap()),
+                sessions: std::mem::take(&mut *player_mechanism_sessions().lock().unwrap()),
+                drops: std::mem::take(&mut *drops().lock().unwrap()),
+                rng: world_rng::saved_state(),
+                cells: Vec::new(),
+            }
+        }
+
+        fn place(&mut self, key @ (dim, x, y, z): DimBlockPos, block: &str) -> u32 {
+            let state = item_to_state(name_to_item(block).unwrap()).unwrap();
+            let old = block_at_dim(dim, x, y, z);
+            self.cells.push((key, old));
+            place_block_dim(dim, x, y, z, state);
+            assert_eq!(block_at_dim(dim, x, y, z), state, "{block}");
+            state
+        }
+
+        fn tick_at(&self, age: u64) {
+            TICK_IDX.store(age / u64::from(GAME_TICKS_PER_TICK), Ordering::Relaxed);
+            live_menu_tick();
+        }
+    }
+
+    impl std::ops::Drop for LiveWorld {
+        fn drop(&mut self) {
+            for &((dim, x, y, z), state) in self.cells.iter().rev() {
+                set_block_dim(dim, x, y, z, state);
+            }
+            world_rng::restore(self.rng);
+            TICK_IDX.store(self.time, Ordering::Relaxed);
+            *live_block_entities().lock().unwrap() = std::mem::take(&mut self.store);
+            *clients().lock().unwrap() = std::mem::take(&mut self.players);
+            *player_mechanism_sessions().lock().unwrap() = std::mem::take(&mut self.sessions);
+            *drops().lock().unwrap() = std::mem::take(&mut self.drops);
+        }
+    }
+
+    fn reload_at((dim, x, y, z): DimBlockPos) -> Tag {
+        let key = (dim, x, y, z);
+        let (snapshot_state, tag) = live_block_entity_snapshot(key).unwrap();
+        let decoded = saved(&tag);
+        assert!(live_block_entities()
+            .lock()
+            .unwrap()
+            .entries
+            .remove(&key)
+            .is_some());
+        assert!(restore_live_block_entity(key, &decoded));
+        assert_eq!(
+            live_block_entity_snapshot(key),
+            Some((snapshot_state, decoded.clone()))
+        );
+        decoded
+    }
+
+    fn attach_live_menu(c: &Client) {
+        let (x, _, z, ..) = *c.pos.lock().unwrap();
+        c.enter_play_wire(None, ChunkWindow::at(x, z, 2));
+        player_mechanism_sessions().lock().unwrap().insert(
+            c.eid,
+            PlayerMechanismSession {
+                xp_bar: (0, 0.0),
+                food_timer: 0,
+                menus: Arc::new(LiveMenuConnection {
+                    active: Mutex::new(None),
+                    next_id: std::sync::atomic::AtomicU8::new(4),
+                    enchantment_seed: Mutex::new(0),
+                }),
+            },
+        );
+    }
+
+    fn put_hand(c: &Client, item: &str, count: u8) {
+        c.inv
+            .lock()
+            .unwrap()
+            .insert(36, (name_to_item(item).unwrap(), count, vec![]));
+    }
+
+    fn click_block(c: &Client, (dim, x, y, z): DimBlockPos) -> bool {
+        open_live_block_menu(c, (dim, x, y, z), block_at_dim(dim, x, y, z))
+    }
+
+    #[test]
+    fn live_block_entity_placement_discovers_all_families_and_restores_nbt() {
+        let _guard = world_guard();
+        let mut world = LiveWorld::new();
+        let cases = [
+            ("beacon", "beacon"),
+            ("soul_campfire", "campfire"),
+            ("lectern", "lectern"),
+            ("chiseled_bookshelf", "chiseled_bookshelf"),
+            ("decorated_pot", "decorated_pot"),
+            ("crafter", "crafter"),
+            ("jukebox", "jukebox"),
+            ("red_banner", "banner"),
+            ("player_head", "skull"),
+            ("suspicious_gravel", "brushable_block"),
+            ("trial_spawner", "trial_spawner"),
+            ("vault", "vault"),
+        ];
+        for (i, (block, _)) in cases.iter().enumerate() {
+            world.place((DimId::Nether, 91_000 + i as i32, 220, 91_000), block);
+        }
+        world.tick_at(0);
+        for (i, (_, id)) in cases.iter().enumerate() {
+            let key = (DimId::Nether, 91_000 + i as i32, 220, 91_000);
+            // Discovery must already have installed the entity before any use or snapshot.
+            assert!(
+                live_block_entities()
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .contains_key(&key),
+                "{id}"
+            );
+            let tag = reload_at(key);
+            assert_eq!(
+                block_entity_str_field(&tag, "id"),
+                Some(format!("minecraft:{id}"))
+            );
+            assert_eq!(block_entity_int(&tag, "x"), key.1);
+            assert_eq!(block_entity_int(&tag, "y"), key.2);
+            assert_eq!(block_entity_int(&tag, "z"), key.3);
+        }
+        let key @ (dim, x, y, z) = (DimId::Nether, 91_007, 220, 91_000);
+        let banner = compound([
+            ("id", string("minecraft:banner")),
+            (
+                "patterns",
+                Tag::List(
+                    10,
+                    vec![compound([
+                        ("pattern", string("minecraft:stripe_center")),
+                        ("color", string("blue")),
+                    ])],
+                ),
+            ),
+        ]);
+        assert!(restore_live_block_entity(key, &banner));
+        let reg = breg().unwrap();
+        set_block_dim(
+            dim,
+            x,
+            y,
+            z,
+            reg.with_prop(block_at_dim(dim, x, y, z), "rotation", "3"),
+        );
+        world.tick_at(20);
+        assert_eq!(reload_at(key).get("patterns"), banner.get("patterns"));
+        let head_key = (dim, x + 1, y, z);
+        assert!(!restore_live_block_entity(head_key, &banner));
+        let skull = compound([
+            ("id", string("minecraft:skull")),
+            ("profile", compound([("name", string("Alex"))])),
+            (
+                "note_block_sound",
+                string("minecraft:block.note_block.harp"),
+            ),
+        ]);
+        assert!(restore_live_block_entity(head_key, &skull));
+        assert_eq!(reload_at(head_key).get("profile"), skull.get("profile"));
+        assert!(live_block_entity_snapshot((DimId::Overworld, x, y, z)).is_none());
+        set_block_dim(dim, x, y, z, 0);
+        world.tick_at(40);
+        assert!(!live_block_entities()
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&key));
+        world.place(key, "red_banner");
+        assert!(reload_at(key).get("patterns").is_none());
+    }
+
+    #[test]
+    fn live_block_entity_use_consumes_items_and_updates_world_state() {
+        let _guard = world_guard();
+        let mut world = LiveWorld::new();
+        let (client, _receiver) = effect_tests::client_pair();
+        let reg = breg().unwrap();
+        let (dim, x, y, z) = (DimId::Overworld, 92_000, 312, 92_000);
+        *client.pos.lock().unwrap() = (
+            x as f64 + 0.5,
+            y as f64 - 0.7,
+            z as f64 - 1.0,
+            0.0,
+            0.0,
+            true,
+        );
+        attach_live_menu(&client);
+
+        let shelf = (dim, x, y, z);
+        let shelf_state = world.place(shelf, "chiseled_bookshelf");
+        set_block_dim(dim, x, y, z, reg.with_prop(shelf_state, "facing", "north"));
+        put_hand(&client, "book", 2);
+        assert!(click_block(&client, shelf));
+        assert_eq!(client.inv.lock().unwrap()[&36].1, 1);
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, x, y, z), "slot_1_occupied")
+                .as_deref(),
+            Some("true")
+        );
+        let shelf_tag = reload_at(shelf);
+        assert_eq!(block_entity_int(&shelf_tag, "last_interacted_slot"), 1);
+        assert!(click_block(&client, shelf));
+        assert_eq!(client.inv.lock().unwrap()[&36].1, 2);
+
+        let pot = (dim, x + 1, y, z);
+        world.place(pot, "decorated_pot");
+        put_hand(&client, "brick", 3);
+        assert!(click_block(&client, pot));
+        put_hand(&client, "emerald", 1);
+        assert!(!click_block(&client, pot));
+        assert_eq!(client.inv.lock().unwrap()[&36].1, 1);
+        assert_eq!(
+            reload_at(pot).get("item"),
+            Some(&item_nbt("minecraft:brick", 1))
+        );
+
+        let lectern = (dim, x + 2, y, z);
+        world.place(lectern, "lectern");
+        put_hand(&client, "writable_book", 1);
+        assert!(click_block(&client, lectern));
+        assert!(!client.inv.lock().unwrap().contains_key(&36));
+        let (_, inserted) = live_block_entity_snapshot(lectern).unwrap();
+        assert_eq!(
+            inserted.get("Book"),
+            Some(&item_nbt("minecraft:writable_book", 1))
+        );
+        assert_eq!(block_entity_int(&inserted, "Page"), 0);
+        assert!(click_block(&client, lectern));
+        let window = live_menu_id(&client).unwrap();
+        // The native clamp returns -1 when the selected book has no pages.
+        with_save_guard(|| live_enchant_button(&client, i32::from(window), 2));
+        assert_eq!(block_entity_int(&reload_at(lectern), "Page"), -1);
+        with_save_guard(|| live_enchant_button(&client, i32::from(window), 3));
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, x + 2, y, z), "has_book")
+                .as_deref(),
+            Some("false")
+        );
+        assert!(reload_at(lectern).get("Book").is_none());
+
+        let box_key = (dim, x + 3, y, z);
+        world.place(box_key, "jukebox");
+        put_hand(&client, "music_disc_13", 1);
+        assert!(click_block(&client, box_key));
+        world.tick_at(0);
+        let jukebox = reload_at(box_key);
+        assert_eq!(
+            jukebox.get("RecordItem"),
+            Some(&item_nbt("minecraft:music_disc_13", 1))
+        );
+        assert_eq!(
+            block_entity_number(&jukebox, "ticks_since_song_started"),
+            Some(i64::from(GAME_TICKS_PER_TICK))
+        );
+        assert!(click_block(&client, box_key));
+        assert!(reload_at(box_key).get("RecordItem").is_none());
+        assert!(drops()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|drop| item_to_name(drop.item) == Some("music_disc_13")));
+    }
+
+    #[test]
+    fn live_block_entity_ticks_resume_saved_progress_and_run_world_transitions() {
+        let _guard = world_guard();
+        let mut world = LiveWorld::new();
+        let (client, _receiver) = effect_tests::client_pair();
+        let client = Arc::new(client);
+        clients().lock().unwrap().push(client.clone());
+        let reg = breg().unwrap();
+        let (dim, x, y, z) = (DimId::Overworld, 93_000, 318, 93_000);
+        *client.pos.lock().unwrap() = (
+            x as f64 + 0.5,
+            y as f64 - 0.7,
+            z as f64 - 1.0,
+            0.0,
+            0.0,
+            true,
+        );
+        attach_live_menu(&client);
+
+        let beacon = (dim, x, y, z);
+        world.place(beacon, "beacon");
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let key = (dim, x + dx, y - 1, z + dz);
+                world
+                    .cells
+                    .push((key, block_at_dim(dim, key.1, key.2, key.3)));
+                set_block_dim(
+                    dim,
+                    key.1,
+                    key.2,
+                    key.3,
+                    reg.state_of("minecraft:iron_block", None),
+                );
+            }
+        }
+        assert!(restore_live_block_entity(
+            beacon,
+            &compound([
+                ("id", string("minecraft:beacon")),
+                ("primary_effect", string("minecraft:speed")),
+            ])
+        ));
+
+        let campfire = (dim, x + 1, y, z);
+        world.place(campfire, "campfire");
+        put_hand(&client, "beef", 2);
+        assert!(click_block(&client, campfire));
+        assert_eq!(client.inv.lock().unwrap()[&36].1, 1);
+        for now in (0..600).step_by(GAME_TICKS_PER_TICK as usize) {
+            world.tick_at(now);
+            if now == 200 {
+                assert_eq!(
+                    block_entity_int_array(&reload_at(campfire), "CookingTimes")[0],
+                    200 + GAME_TICKS_PER_TICK as i32
+                );
+            }
+        }
+        assert!(block_entity_entries(&reload_at(campfire), "Items").is_empty());
+        assert!(drops()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|drop| item_to_name(drop.item) == Some("cooked_beef")));
+        assert_eq!(block_entity_int(&reload_at(beacon), "Levels"), 1);
+        assert!(client
+            .effs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|effect| effect.id == 0));
+
+        let crafter = (dim, x + 2, y, z);
+        world.place(crafter, "crafter");
+        assert!(click_block(&client, crafter));
+        let window = live_menu_id(&client).unwrap();
+        *client.cursor.lock().unwrap() = (name_to_item("oak_log").unwrap(), 2, vec![]);
+        with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
+        assert_eq!(block_entity_entries(&reload_at(crafter), "Items").len(), 1);
+        let power = (dim, x + 3, y, z);
+        world
+            .cells
+            .push((power, block_at_dim(dim, power.1, power.2, power.3)));
+        set_block_dim(
+            dim,
+            power.1,
+            power.2,
+            power.3,
+            reg.state_of("minecraft:redstone_block", None),
+        );
+        for now in (600..620).step_by(GAME_TICKS_PER_TICK as usize) {
+            world.tick_at(now);
+        }
+        assert_eq!(
+            block_entity_number(
+                &block_entity_entries(&reload_at(crafter), "Items")[0],
+                "count"
+            ),
+            Some(1)
+        );
+        assert!(drops()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|drop| item_to_name(drop.item) == Some("oak_planks") && drop.cnt == 4));
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, x + 2, y, z), "crafting")
+                .as_deref(),
+            Some("false")
+        );
+
+        let brushable = (dim, x, y, z + 2);
+        world.place(brushable, "suspicious_sand");
+        put_hand(&client, "brush", 1);
+        assert!(click_block(&client, brushable));
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, x, y, z + 2), "dusted")
+                .as_deref(),
+            Some("1")
+        );
+        world.tick_at(680);
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, x, y, z + 2), "dusted")
+                .as_deref(),
+            Some("0")
+        );
+
+        let spawner = (dim, x, y, z + 1);
+        world.place(spawner, "trial_spawner");
+        assert!(restore_live_block_entity(
+            spawner,
+            &compound([
+                ("id", string("minecraft:trial_spawner")),
+                (
+                    "spawn_data",
+                    compound([("entity", compound([("id", string("minecraft:zombie"))]))])
+                ),
+                ("next_mob_spawns_at", Tag::Long(i64::MAX)),
+            ])
+        ));
+        let vault = (dim, x + 1, y, z + 1);
+        world.place(vault, "vault");
+        world.tick_at(700);
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, x, y, z + 1), "trial_spawner_state")
+                .as_deref(),
+            Some("active")
+        );
+        assert_eq!(
+            block_entity_entries(&reload_at(spawner), "registered_players").len(),
+            1
+        );
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, x + 1, y, z + 1), "vault_state")
+                .as_deref(),
+            Some("active")
+        );
+        assert_eq!(
+            block_entity_entries(
+                reload_at(vault).get("shared_data").unwrap(),
+                "connected_players"
+            )
+            .len(),
+            1
+        );
+        let table = "example:live_vault_test";
+        let mut vault_tag = reload_at(vault);
+        let config = compound([
+            ("loot_table", string(table)),
+            ("key_item", item_nbt("minecraft:trial_key", 1)),
+        ]);
+        let Tag::Compound(fields) = &mut vault_tag else {
+            unreachable!()
+        };
+        block_entity_put(fields, "config", config);
+        assert!(restore_live_block_entity(vault, &vault_tag));
+        let old_table = loot_tables().lock().unwrap().insert(
+            table.into(),
+            vec![LootPool {
+                rolls: 1,
+                chance: 1.0,
+                entries: vec![LootEntry {
+                    item: name_to_item("emerald").unwrap(),
+                    min: 2,
+                    max: 2,
+                    funcs: Vec::new(),
+                }],
+                funcs: Vec::new(),
+            }],
+        );
+        put_hand(&client, "trial_key", 2);
+        let unlocked = click_block(&client, vault);
+        let mut tables = loot_tables().lock().unwrap();
+        tables.remove(table);
+        if let Some(old) = old_table {
+            tables.insert(table.into(), old);
+        }
+        drop(tables);
+        assert!(unlocked);
+        assert_eq!(client.inv.lock().unwrap()[&36].1, 1);
+        assert!(!click_block(&client, vault));
+        let pending = reload_at(vault);
+        assert_eq!(
+            block_entity_entries(pending.get("server_data").unwrap(), "items_to_eject").len(),
+            1
+        );
+        world.tick_at(720);
+        world.tick_at(740);
+        assert!(drops()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|drop| item_to_name(drop.item) == Some("emerald") && drop.cnt == 2));
+    }
 }
