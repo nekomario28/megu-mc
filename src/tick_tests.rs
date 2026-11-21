@@ -826,6 +826,88 @@ fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
 }
 
 #[test]
+fn world_mechanisms_fluid_reactions_resolve_vanilla_blocks() {
+    crate::test_support::require_vanilla_data();
+    let reg = crate::block_registry::breg().unwrap();
+    for (reaction, name) in [
+        (flowing_fluid::Solidification::Obsidian, "minecraft:obsidian"),
+        (flowing_fluid::Solidification::Cobblestone, "minecraft:cobblestone"),
+        (flowing_fluid::Solidification::Stone, "minecraft:stone"),
+    ] {
+        assert_eq!(fluid_solidification_state(reaction), Some(reg.state_of(name, None)));
+    }
+}
+
+#[test]
+fn world_mechanisms_fluid_wash_away_excludes_waterloggable_hosts() {
+    crate::test_support::require_vanilla_data();
+    let reg = crate::block_registry::breg().unwrap();
+    for name in ["minecraft:torch", "minecraft:wall_torch", "minecraft:wheat", "minecraft:short_grass"] {
+        let state = reg.state_of(name, None);
+        assert!(fluid_washes_away(reg, state), "water must replace {name}");
+    }
+    for name in ["minecraft:stone", "minecraft:air", "minecraft:ladder"] {
+        assert!(!fluid_washes_away(reg, reg.state_of(name, None)), "water must not wash away {name}");
+    }
+    for name in ["minecraft:rail", "minecraft:powered_rail", "minecraft:glass_pane", "minecraft:oak_stairs"] {
+        let state = reg.state_of(name, None);
+        assert!(reg.get_prop(state, "waterlogged").is_some(), "{name} is waterloggable in Java 1.21.1");
+        assert!(!fluid_washes_away(reg, state), "waterlogging retains the host {name}");
+        let wet = reg.with_prop(state, "waterlogged", "true");
+        assert_eq!(reg.get_prop(wet, "waterlogged").as_deref(), Some("true"));
+        assert!(!fluid_washes_away(reg, wet));
+    }
+}
+
+#[test]
+fn world_mechanisms_generated_fluids_cross_chunk_borders_on_their_tick_deadlines() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    WATERLOGGED_DEFER.with(|deferred| deferred.borrow_mut().clear());
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let air = reg.state_of("minecraft:air", None);
+
+    for (origin_x, kind, source_state, level, delay) in [
+        (15i32, flowing_fluid::Kind::Water, 80, 81, 5),
+        (-1, flowing_fluid::Kind::Water, 80, 81, 5),
+        (15, flowing_fluid::Kind::Lava, 96, 98, 30),
+        (-1, flowing_fluid::Kind::Lava, 96, 98, 30),
+    ] {
+        let source = (origin_x, 217, 5);
+        let target = (origin_x + 1, 217, 5);
+        {
+            let mut chunks = world().lock().unwrap();
+            chunks.clear();
+            for x in origin_x - 3..=origin_x + 4 {
+                for z in 2i32..=8 {
+                    for y in 216..=218 {
+                        let chunk = chunks.entry((DimId::Overworld, x.div_euclid(16), z.div_euclid(16))).or_default();
+                        chunk.insert(local_idx(x, y, z), stone);
+                    }
+                }
+            }
+            chunks.get_mut(&(DimId::Overworld, origin_x.div_euclid(16), 0))
+                .unwrap().insert(local_idx(source.0, source.1, source.2), source_state);
+            chunks.get_mut(&(DimId::Overworld, target.0.div_euclid(16), 0))
+                .unwrap().insert(local_idx(target.0, target.1, target.2), air);
+        }
+        let eligible = HashSet::from([(origin_x.div_euclid(16), 0), (target.0.div_euclid(16), 0)]);
+        let mut owner = GeneratedFluidOwner::new();
+        owner.schedule(source, flowing_fluid::Fluid { kind, level: 0 }, 100, false);
+        owner.tick(100 + delay - 1, &eligible).unwrap();
+        assert_eq!(block_at(target.0, target.1, target.2), air,
+            "{kind:?} crossed the chunk edge before {delay} ticks");
+        owner.tick(100 + delay, &eligible).unwrap();
+        assert_eq!(block_at(source.0, source.1, source.2), source_state);
+        assert_eq!(block_at(target.0, target.1, target.2), level,
+            "{kind:?} failed to cross chunk edge {origin_x} -> {}", target.0);
+    }
+    WATERLOGGED_DEFER.with(|deferred| deferred.borrow_mut().clear());
+}
+
+#[test]
 fn scheduled_leaf_distance_matches_native_vectors() {
     let reg = crate::block_registry::breg().unwrap();
     let make = |kind: &str| -> u32 {

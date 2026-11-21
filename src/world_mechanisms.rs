@@ -1,5 +1,39 @@
 // R7 GP-7 evaluators. Included by main.rs alongside BlockPos and the wire helpers.
 
+/// Resolve a fluid reaction to the block-registry state used by the world writer.
+#[cfg_attr(not(test), allow(dead_code))]
+fn fluid_solidification_state(reaction: flowing_fluid::Solidification) -> Option<u32> {
+    let name = match reaction {
+        flowing_fluid::Solidification::Obsidian => "minecraft:obsidian",
+        flowing_fluid::Solidification::Cobblestone => "minecraft:cobblestone",
+        flowing_fluid::Solidification::Stone => "minecraft:stone",
+    };
+    crate::block_registry::breg().map(|registry| registry.state_of(name, None))
+}
+
+/// Empty-collision hosts that water replaces instead of waterlogging. Rails and other
+/// SimpleWaterloggedBlocks retain their host and therefore stay out of this set.
+#[cfg_attr(not(test), allow(dead_code))]
+fn fluid_washes_away(reg: &crate::block_registry::BReg, state: u32) -> bool {
+    if reg.is_air(state) || reg.get_prop(state, "waterlogged").is_some() {
+        return false;
+    }
+    if matches!(
+        reg.name_of(state),
+        "minecraft:ladder"
+            | "minecraft:sugar_cane"
+            | "minecraft:bubble_column"
+            | "minecraft:nether_portal"
+            | "minecraft:end_portal"
+            | "minecraft:end_gateway"
+            | "minecraft:structure_void"
+    ) || reg.in_tag(state, "minecraft:signs")
+    {
+        return false;
+    }
+    reg.is_collision_empty(state) && !reg.blocks_motion(state)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 const WORLD_BORDER_MAX_SIZE: f64 = 59_999_968.0;
 

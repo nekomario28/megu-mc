@@ -1,8 +1,8 @@
-//! FlowingFluid's scheduled update for full-cube, air, plant and liquid cells.
+//! FlowingFluid's scheduled update for full-cube, air, replaceable and liquid cells.
 //!
-//! A cell with a **non-empty, non-full** collision shape, and cross-fluid contact, still need
-//! additional native shape/contact contracts; callers receive an error before committing
-//! writes. A cell whose collision shape is empty (a plant, `minecraft:short_grass` in the
+//! A cell with a **non-empty, non-full** collision shape still needs a native shape contract;
+//! callers receive an error before committing writes. A cell whose collision shape is empty
+//! (a plant, `minecraft:short_grass` in the
 //! measured case) is modelled: `FlowingFluid.canPassThrough` intersects the two collision
 //! shapes and an empty one intersects nothing, while `canHoldFluid` answers
 //! `!state.blocksMotion()` for every block outside its sign/door/ladder/sugar-cane/bubble-column
@@ -68,6 +68,15 @@ pub(crate) enum Cell {
     Passable,
 }
 
+/// Block produced when lava meets water. This stays separate from [`Cell`] because fluid
+/// writes and block replacement have different ownership in the live world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Solidification {
+    Obsidian,
+    Cobblestone,
+    Stone,
+}
+
 pub(crate) trait Reader {
     type Error;
     fn cell(&mut self, pos: Pos) -> Result<Cell, Self::Error>;
@@ -76,6 +85,9 @@ pub(crate) trait Reader {
 
 pub(crate) struct Plan {
     pub writes: Vec<(Pos, Cell)>,
+    /// Lava-to-block changes that the caller must apply with its block writer.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub solidifications: Vec<(Pos, Solidification)>,
     pub updated_self: Option<Fluid>,
 }
 
@@ -91,6 +103,7 @@ struct Context<'a, W> {
     world: &'a mut W,
     overlay: HashMap<Pos, Cell>,
     writes: Vec<(Pos, Cell)>,
+    solidifications: Vec<(Pos, Solidification)>,
     kind: Kind,
 }
 
@@ -133,7 +146,7 @@ impl<W: Reader> Context<'_, W> {
                 sources += u8::from(f.source());
             }
         }
-        if source_conversion && sources >= 2 {
+        if source_conversion && self.kind == Kind::Water && sources >= 2 {
             let below = self.get(add(p, (0, -1, 0)))?;
             if matches!(below, Cell::Solid) || self.same(below).is_some_and(Fluid::source) {
                 return Ok(Some(Fluid {
@@ -180,7 +193,21 @@ impl<W: Reader> Context<'_, W> {
             // fluid written over it. `beforeDestroyingBlock` is a no-op for water.
             Cell::Passable => self.put(p, Cell::Fluid(fluid)),
             Cell::Fluid(other) if other.kind != fluid.kind => {
-                Err(self.world.unsupported_contact(p))
+                if other.kind == Kind::Lava {
+                    self.solidifications.push((
+                        p,
+                        if other.source() {
+                            Solidification::Obsidian
+                        } else {
+                            Solidification::Cobblestone
+                        },
+                    ));
+                } else {
+                    // Lava entering water horizontally reacts at its originating lava cell.
+                    // The caller's lava tick recognizes that contact before spreading.
+                    return Err(self.world.unsupported_contact(p));
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -203,10 +230,10 @@ impl<W: Reader> Context<'_, W> {
         let mut choices = Vec::new();
         for (i, d) in HORIZONTAL.into_iter().enumerate() {
             let q = add(p, d);
-            let next = self.new_liquid(q, source_conversion)?;
             if !self.can_pass(q)? {
                 continue;
             }
+            let next = self.new_liquid(q, source_conversion)?;
             let distance = if self.hole(q)? {
                 0
             } else {
@@ -242,15 +269,45 @@ pub(crate) fn tick<W: Reader>(
         world,
         overlay: HashMap::new(),
         writes: Vec::new(),
+        solidifications: Vec::new(),
         kind,
     };
     let cell = cx.get(p)?;
     let Some(mut current) = cx.same(cell).filter(|f| f.source() == expected_source) else {
         return Ok(Plan {
             writes: cx.writes,
+            solidifications: cx.solidifications,
             updated_self: None,
         });
     };
+
+    // LiquidBlock.shouldSpreadLiquid checks horizontal neighbours and the block above.
+    // Lava touching water at one of these faces solidifies *at the lava position*.
+    if kind == Kind::Lava {
+        for offset in HORIZONTAL.into_iter().chain([(0, 1, 0)]) {
+            if matches!(
+                cx.get(add(p, offset))?,
+                Cell::Fluid(Fluid {
+                    kind: Kind::Water,
+                    ..
+                })
+            ) {
+                cx.solidifications.push((
+                    p,
+                    if current.source() {
+                        Solidification::Obsidian
+                    } else {
+                        Solidification::Cobblestone
+                    },
+                ));
+                return Ok(Plan {
+                    writes: cx.writes,
+                    solidifications: cx.solidifications,
+                    updated_self: None,
+                });
+            }
+        }
+    }
     let mut updated_self = None;
     if !current.source() {
         match cx.new_liquid(p, source_conversion)? {
@@ -258,6 +315,7 @@ pub(crate) fn tick<W: Reader>(
                 cx.put(p, Cell::Air)?;
                 return Ok(Plan {
                     writes: cx.writes,
+                    solidifications: cx.solidifications,
                     updated_self,
                 });
             }
@@ -271,6 +329,25 @@ pub(crate) fn tick<W: Reader>(
     }
     let below = add(p, (0, -1, 0));
     let below_state = cx.get(below)?;
+    if let Cell::Fluid(other) = below_state {
+        if other.kind != kind {
+            cx.solidifications.push((
+                below,
+                if kind == Kind::Lava {
+                    Solidification::Stone
+                } else if other.source() {
+                    Solidification::Obsidian
+                } else {
+                    Solidification::Cobblestone
+                },
+            ));
+            return Ok(Plan {
+                writes: cx.writes,
+                solidifications: cx.solidifications,
+                updated_self,
+            });
+        }
+    }
     // `canSpreadTo(..., Direction.DOWN, below, ...)`: the same empty-shape answer that lets a
     // fluid take a plant cell sideways lets it fall through one.
     if matches!(below_state, Cell::Air | Cell::Passable) {
@@ -290,6 +367,7 @@ pub(crate) fn tick<W: Reader>(
     }
     Ok(Plan {
         writes: cx.writes,
+        solidifications: cx.solidifications,
         updated_self,
     })
 }
@@ -323,6 +401,169 @@ mod tests {
             })),
         }
     }
+
+    fn fixture_with_floor(center: Fluid) -> Fixture {
+        let mut cells = HashMap::new();
+        for x in -6..=6 {
+            for z in -6..=6 {
+                cells.insert((x, -1, z), Some(Cell::Solid));
+                cells.insert((x, 0, z), Some(Cell::Solid));
+                cells.insert((x, 1, z), Some(Cell::Air));
+            }
+        }
+        cells.insert((0, 0, 0), Some(Cell::Fluid(center)));
+        Fixture(cells)
+    }
+
+    fn fluid(kind: Kind, level: u8) -> Fluid {
+        Fluid { kind, level }
+    }
+
+    #[test]
+    fn two_horizontal_water_sources_create_source_only_with_supported_floor() {
+        for floor in [Cell::Solid, Cell::Fluid(fluid(Kind::Water, 0)), Cell::Air] {
+            let mut fixture = fixture_with_floor(fluid(Kind::Water, 3));
+            fixture.0.insert((0, -1, 0), Some(floor));
+            fixture
+                .0
+                .insert((-1, 0, 0), Some(Cell::Fluid(fluid(Kind::Water, 0))));
+            fixture
+                .0
+                .insert((1, 0, 0), Some(Cell::Fluid(fluid(Kind::Water, 0))));
+            let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, false, true).unwrap();
+            let should_convert = floor != Cell::Air;
+            assert_eq!(
+                plan.updated_self == Some(fluid(Kind::Water, 0)),
+                should_convert
+            );
+            assert_eq!(
+                plan.writes
+                    .contains(&((0, 0, 0), Cell::Fluid(fluid(Kind::Water, 0)))),
+                should_convert
+            );
+        }
+        let mut one_source = fixture_with_floor(fluid(Kind::Water, 3));
+        one_source
+            .0
+            .insert((-1, 0, 0), Some(Cell::Fluid(fluid(Kind::Water, 0))));
+        let plan = tick(&mut one_source, (0, 0, 0), Kind::Water, false, true).unwrap();
+        assert_ne!(plan.updated_self, Some(fluid(Kind::Water, 0)));
+
+        let mut lava = fixture_with_floor(fluid(Kind::Lava, 3));
+        lava.0
+            .insert((-1, 0, 0), Some(Cell::Fluid(fluid(Kind::Lava, 0))));
+        lava.0
+            .insert((1, 0, 0), Some(Cell::Fluid(fluid(Kind::Lava, 0))));
+        let plan = tick(&mut lava, (0, 0, 0), Kind::Lava, false, true).unwrap();
+        assert_ne!(plan.updated_self, Some(fluid(Kind::Lava, 0)));
+    }
+
+    #[test]
+    fn slope_search_prefers_water_drop_reachable_at_four_but_not_lava_two() {
+        for kind in [Kind::Water, Kind::Lava] {
+            let mut fixture = fixture_with_floor(fluid(kind, 0));
+            for x in -1..=4 {
+                fixture.0.insert((x, 0, 0), Some(Cell::Air));
+            }
+            fixture
+                .0
+                .insert((0, 0, 0), Some(Cell::Fluid(fluid(kind, 0))));
+            fixture.0.insert((4, -1, 0), Some(Cell::Air));
+            let plan = tick(&mut fixture, (0, 0, 0), kind, true, kind == Kind::Water).unwrap();
+            assert!(plan.writes.contains(&(
+                (1, 0, 0),
+                Cell::Fluid(fluid(kind, if kind == Kind::Water { 1 } else { 2 }))
+            )));
+            assert_eq!(
+                plan.writes.iter().any(|(pos, _)| *pos == (-1, 0, 0)),
+                kind == Kind::Lava,
+                "only water finds the distant downhill route: {:?}",
+                plan.writes
+            );
+        }
+    }
+
+    #[test]
+    fn falling_fluid_and_waterlogged_sources_keep_correct_levels_and_host() {
+        let mut fixture = fixture_with_floor(fluid(Kind::Water, 0));
+        fixture.0.insert((0, -1, 0), Some(Cell::Passable));
+        let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, true, true).unwrap();
+        assert!(plan
+            .writes
+            .contains(&((0, -1, 0), Cell::Fluid(fluid(Kind::Water, 8)))));
+        assert!(!plan.writes.iter().any(|(pos, _)| *pos == (0, 0, 0)));
+
+        // A waterlogged host is exposed to this solver as a water source. The
+        // caller retains the host state, and only the neighbouring air takes water.
+        let mut waterlogged = fixture_with_floor(fluid(Kind::Water, 0));
+        waterlogged.0.insert((1, 0, 0), Some(Cell::Air));
+        let plan = tick(&mut waterlogged, (0, 0, 0), Kind::Water, true, true).unwrap();
+        assert_eq!(
+            plan.writes,
+            vec![((1, 0, 0), Cell::Fluid(fluid(Kind::Water, 1)))]
+        );
+    }
+
+    #[test]
+    fn lava_contact_produces_obsidian_cobblestone_and_downward_stone() {
+        for (level, expected) in [
+            (0, Solidification::Obsidian),
+            (3, Solidification::Cobblestone),
+        ] {
+            for water in [(1, 0, 0), (0, 1, 0)] {
+                let mut fixture = fixture_with_floor(fluid(Kind::Lava, level));
+                fixture
+                    .0
+                    .insert(water, Some(Cell::Fluid(fluid(Kind::Water, 0))));
+                let plan = tick(&mut fixture, (0, 0, 0), Kind::Lava, level == 0, false).unwrap();
+                assert_eq!(plan.solidifications, vec![((0, 0, 0), expected)]);
+                assert!(plan.writes.is_empty());
+            }
+        }
+        let mut fixture = fixture_with_floor(fluid(Kind::Lava, 0));
+        fixture
+            .0
+            .insert((0, -1, 0), Some(Cell::Fluid(fluid(Kind::Water, 0))));
+        let plan = tick(&mut fixture, (0, 0, 0), Kind::Lava, true, false).unwrap();
+        assert_eq!(
+            plan.solidifications,
+            vec![((0, -1, 0), Solidification::Stone)]
+        );
+    }
+
+    #[test]
+    fn water_spreading_into_lava_solidifies_the_lava_target() {
+        for (level, expected) in [
+            (0, Solidification::Obsidian),
+            (3, Solidification::Cobblestone),
+        ] {
+            let mut fixture = fixture_with_floor(fluid(Kind::Water, 0));
+            fixture
+                .0
+                .insert((1, 0, 0), Some(Cell::Fluid(fluid(Kind::Lava, level))));
+            let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, true, true).unwrap();
+            assert_eq!(plan.solidifications, vec![((1, 0, 0), expected)]);
+            assert!(!plan.writes.iter().any(|(pos, _)| *pos == (1, 0, 0)));
+        }
+    }
+
+    #[test]
+    fn fluid_crosses_positive_and_negative_chunk_edges() {
+        for origin in [15, -1] {
+            let mut fixture = fixture_with_floor(fluid(Kind::Water, 0));
+            fixture.0.insert((1, 0, 0), Some(Cell::Air));
+            fixture.0 = fixture
+                .0
+                .into_iter()
+                .map(|((x, y, z), v)| ((x + origin, y, z), v))
+                .collect();
+            let plan = tick(&mut fixture, (origin, 0, 0), Kind::Water, true, true).unwrap();
+            assert_eq!(
+                plan.writes,
+                vec![((origin + 1, 0, 0), Cell::Fluid(fluid(Kind::Water, 1)))]
+            );
+        }
+    }
     /// The empty-collision-shape arm, on two synthetic scenes: `canHoldFluid` answers true for a
     /// plant and `canPassThrough` cannot fail against an empty shape, so the fluid enters and
     /// `spreadTo` replaces the block. A full-cube cell in the same position takes nothing, which
@@ -343,11 +584,20 @@ mod tests {
                 cells.insert((x, 1, z), Some(Cell::Air));
             }
         }
-        cells.insert((0, 0, 0), Some(Cell::Fluid(Fluid { kind: Kind::Water, level: 0 })));
+        cells.insert(
+            (0, 0, 0),
+            Some(Cell::Fluid(Fluid {
+                kind: Kind::Water,
+                level: 0,
+            })),
+        );
         cells.insert((1, 0, 0), Some(Cell::Passable));
         let mut fixture = Fixture(cells.clone());
         let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, true, true).unwrap();
-        let flowing = Cell::Fluid(Fluid { kind: Kind::Water, level: 1 });
+        let flowing = Cell::Fluid(Fluid {
+            kind: Kind::Water,
+            level: 1,
+        });
         assert!(
             plan.writes.contains(&((1, 0, 0), flowing)),
             "the plant east of the source is replaced by a flowing level: {:?}",
@@ -357,7 +607,11 @@ mod tests {
         cells.insert((1, 0, 0), Some(Cell::Solid));
         let mut fixture = Fixture(cells);
         let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, true, true).unwrap();
-        assert!(plan.writes.is_empty(), "a full cube takes no fluid: {:?}", plan.writes);
+        assert!(
+            plan.writes.is_empty(),
+            "a full cube takes no fluid: {:?}",
+            plan.writes
+        );
     }
 
     #[test]
@@ -371,11 +625,20 @@ mod tests {
                 cells.insert((x, 1, z), Some(Cell::Air));
             }
         }
-        cells.insert((0, 0, 0), Some(Cell::Fluid(Fluid { kind: Kind::Water, level: 0 })));
+        cells.insert(
+            (0, 0, 0),
+            Some(Cell::Fluid(Fluid {
+                kind: Kind::Water,
+                level: 0,
+            })),
+        );
         cells.insert((0, -1, 0), Some(Cell::Passable));
         let mut fixture = Fixture(cells);
         let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, true, true).unwrap();
-        let falling = Cell::Fluid(Fluid { kind: Kind::Water, level: 8 });
+        let falling = Cell::Fluid(Fluid {
+            kind: Kind::Water,
+            level: 8,
+        });
         assert!(
             plan.writes.contains(&((0, -1, 0), falling)),
             "the plant below the source takes the falling fluid: {:?}",
