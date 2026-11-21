@@ -1895,6 +1895,462 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
     Ok(summary)
 }
 
+// ---------- single-chunk flush / reload (live region-scoped unloader) ----------
+
+/// The `{id, x, y, z}` compound fields at `(x, y, z)` in `by_pos`, inserting a
+/// fresh record when the position has none yet. Every tag the block-entity
+/// writers produce is a compound, so a non-compound here can only be a foreign
+/// record and is left untouched rather than silently overwritten.
+#[allow(dead_code)]
+fn anvil_be_fields<'a>(
+    by_pos: &'a mut std::collections::BTreeMap<(i32, i32, i32), AnvilNbt>,
+    x: i32,
+    y: i32,
+    z: i32,
+    id: &str,
+) -> Option<&'a mut std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>> {
+    let entity = by_pos.entry((x, y, z)).or_insert_with(|| {
+        anvil_obj(&[
+            ("id", anvil_s(id)),
+            ("x", AnvilNbt::Int(x)),
+            ("y", AnvilNbt::Int(y)),
+            ("z", AnvilNbt::Int(z)),
+        ])
+    });
+    match entity {
+        AnvilNbt::Compound(fields) => Some(fields),
+        _ => None,
+    }
+}
+
+/// The block-entity `id` a live store writes for the block at `(x, y, z)`: the
+/// block's own registry name when a store kind owns it (a hopper keeps
+/// `minecraft:hopper`, a trapped chest keeps `minecraft:trapped_chest`), else
+/// the store's fallback id so the record still re-hydrates to the right store.
+#[allow(dead_code)]
+fn live_chunk_be_id(dim: DimId, x: i32, y: i32, z: i32, fallback: &str) -> String {
+    breg()
+        .and_then(|reg| {
+            let name = reg.name_of(block_at_dim(dim, x, y, z));
+            crate::generation_payload::ContainerKind::for_block(name).map(|_| name.to_string())
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Every block-entity record a single-chunk flush must carry: what
+/// `anvil_export_block_entities` already emits (imported records, generated
+/// spawners, sign text) plus the live stores the export pass cannot see — the
+/// `live_block_entities` payloads (beacon, lectern, decorated pot, …) and the
+/// container stores' `Items` (chests/barrels/hoppers in `chests()`, the
+/// three-stack furnace records, the five-stack brewing stands), with a pending
+/// `LootTable` merged into the same position's compound. Positions dedup
+/// live-over-imported, so a container the runtime has touched wins over the
+/// tag an earlier import parked.
+#[allow(dead_code)]
+fn evict_chunk_block_entities(dim: DimId, cx: i32, cz: i32) -> Vec<AnvilNbt> {
+    let in_chunk = |x: i32, z: i32| x >> 4 == cx && z >> 4 == cz;
+    let mut by_pos: std::collections::BTreeMap<(i32, i32, i32), AnvilNbt> =
+        Default::default();
+    for entity in anvil_export_block_entities(dim, cx, cz) {
+        if let (Some(x), Some(y), Some(z)) = (
+            anvil_i32(&entity, "x"),
+            anvil_i32(&entity, "y"),
+            anvil_i32(&entity, "z"),
+        ) {
+            by_pos.insert((x, y, z), entity);
+        }
+    }
+    let store_keys: Vec<DimBlockPos> = live_block_entities()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .keys()
+        .copied()
+        .filter(|&(d, x, _, z)| d == dim && in_chunk(x, z))
+        .collect();
+    for key @ (_, x, y, z) in store_keys {
+        if let Some((_, tag)) = live_block_entity_snapshot(key) {
+            by_pos.insert((x, y, z), tag);
+        }
+    }
+    // Positions whose contents already materialized: a `LootTable` must not be
+    // written next to live `Items`, or a reload would roll the table over the
+    // real contents.
+    let mut items_at: HashSet<(i32, i32, i32)> = HashSet::new();
+    let chest_entries: Vec<(DimBlockPos, HashMap<i16, Stack>)> = chests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(key, slots)| match key {
+            ContainerKey::Block(pos) if pos.0 == dim && in_chunk(pos.1, pos.3) => {
+                Some((*pos, slots.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    for ((_, x, y, z), slots) in chest_entries {
+        let id = live_chunk_be_id(dim, x, y, z, "minecraft:chest");
+        if let Some(fields) = anvil_be_fields(&mut by_pos, x, y, z, &id) {
+            fields.insert(
+                crate::nbt::NbtString::text("Items"),
+                stacks_to_items_nbt(&slots),
+            );
+            items_at.insert((x, y, z));
+        }
+    }
+    let furnace_entries: Vec<(DimBlockPos, Furnace)> = furnaces()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|&(&(d, x, _, z), _)| d == dim && in_chunk(x, z))
+        .map(|(key, fr)| (*key, clone_furnace_for_footer(fr)))
+        .collect();
+    for ((_, x, y, z), fr) in furnace_entries {
+        let id = live_chunk_be_id(dim, x, y, z, "minecraft:furnace");
+        let Some(fields) = anvil_be_fields(&mut by_pos, x, y, z, &id) else {
+            continue;
+        };
+        let mut slots = HashMap::new();
+        for (slot, stack) in [(0i16, &fr.input), (1, &fr.fuel), (2, &fr.output)] {
+            if stack.1 > 0 {
+                slots.insert(slot, stack.clone());
+            }
+        }
+        fields.insert(
+            crate::nbt::NbtString::text("Items"),
+            stacks_to_items_nbt(&slots),
+        );
+        fields.insert(
+            crate::nbt::NbtString::text("BurnTime"),
+            AnvilNbt::Short(fr.burn_left.clamp(0, i32::from(i16::MAX)) as i16),
+        );
+        fields.insert(
+            crate::nbt::NbtString::text("CookTime"),
+            AnvilNbt::Short(fr.progress.clamp(0, i32::from(i16::MAX)) as i16),
+        );
+        items_at.insert((x, y, z));
+    }
+    let stand_entries: Vec<(DimBlockPos, HashMap<i16, Stack>, u16, u8)> =
+        live_brewing_stands()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&(&(d, x, _, z), _)| d == dim && in_chunk(x, z))
+            .map(|(key, live)| {
+                let slots = live
+                    .menu
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, stack)| stack.1 > 0)
+                    .map(|(slot, stack)| (slot as i16, stack.clone()))
+                    .collect();
+                (*key, slots, live.stand.brew_time, live.stand.fuel)
+            })
+            .collect();
+    for ((_, x, y, z), slots, brew_time, fuel) in stand_entries {
+        let Some(fields) = anvil_be_fields(&mut by_pos, x, y, z, "minecraft:brewing_stand")
+        else {
+            continue;
+        };
+        fields.insert(
+            crate::nbt::NbtString::text("Items"),
+            stacks_to_items_nbt(&slots),
+        );
+        fields.insert(
+            crate::nbt::NbtString::text("BrewTime"),
+            AnvilNbt::Short(i32::from(brew_time).clamp(0, i32::from(i16::MAX)) as i16),
+        );
+        fields.insert(
+            crate::nbt::NbtString::text("Fuel"),
+            AnvilNbt::Byte(i8::try_from(fuel).unwrap_or(i8::MAX)),
+        );
+        items_at.insert((x, y, z));
+    }
+    let loot_entries: Vec<(DimBlockPos, PendingBlockLoot)> = pending_block_loot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|&(&(d, x, _, z), _)| d == dim && in_chunk(x, z))
+        .map(|(key, loot)| (*key, loot.clone()))
+        .collect();
+    for ((_, x, y, z), loot) in loot_entries {
+        if items_at.contains(&(x, y, z)) {
+            continue;
+        }
+        let id = live_chunk_be_id(dim, x, y, z, "minecraft:chest");
+        let Some(fields) = anvil_be_fields(&mut by_pos, x, y, z, &id) else {
+            continue;
+        };
+        fields.insert(
+            crate::nbt::NbtString::text("LootTable"),
+            anvil_s(&loot.loot_table),
+        );
+        if let Some(seed) = loot.loot_seed {
+            fields.insert(
+                crate::nbt::NbtString::text("LootTableSeed"),
+                AnvilNbt::Long(seed),
+            );
+        }
+    }
+    by_pos.into_values().collect()
+}
+
+/// A live brewing stand rebuilt from its vanilla `Items`/`BrewTime`/`Fuel`
+/// record: the menu keeps the raw stacks and the stand state is re-derived
+/// from them exactly the way `LiveBrewingStand::tick` derives it each pass.
+#[allow(dead_code)]
+fn live_brewing_stand_from_nbt(entity: &AnvilNbt, slots: &HashMap<i16, Stack>) -> LiveBrewingStand {
+    let mut menu_slots: [Stack; 5] = Default::default();
+    for (&slot, stack) in slots {
+        if let Ok(index) = usize::try_from(slot) {
+            if let Some(target) = menu_slots.get_mut(index) {
+                *target = stack.clone();
+            }
+        }
+    }
+    let ingredient = item_to_name(menu_slots[3].0)
+        .and_then(BrewingIngredient::from_item)
+        .filter(|_| menu_slots[3].1 > 0)
+        .map(|item| (item, menu_slots[3].1));
+    LiveBrewingStand {
+        stand: BrewingStand {
+            bottles: [
+                live_potion_stack(&menu_slots[0]),
+                live_potion_stack(&menu_slots[1]),
+                live_potion_stack(&menu_slots[2]),
+            ],
+            ingredient,
+            blaze_powder: menu_slots[4].1,
+            fuel: entity
+                .get("Fuel")
+                .and_then(nbt_int_val)
+                .unwrap_or(0)
+                .clamp(0, i64::from(u8::MAX)) as u8,
+            brew_time: entity
+                .get("BrewTime")
+                .and_then(nbt_int_val)
+                .unwrap_or(0)
+                .clamp(0, i64::from(u16::MAX)) as u16,
+            active_ingredient: None,
+        },
+        menu: BrewingMenu {
+            slots: menu_slots,
+        },
+    }
+}
+
+/// Flush exactly one chunk's live state into `dir`'s vanilla region file: the
+/// overlay edits land on the generated base (`anvil_export_sections`) and the
+/// merged live block entities ride in `block_entities`, merged into the
+/// existing `r.<rx>.<rz>.mca` so every other chunk already on disk stays
+/// untouched — a clean chunk in the same region keeps its record byte-for-byte.
+/// The write goes through `write_region_file`'s fsync-then-rename, so a crash
+/// leaves either the old file or the new one, never a partial. Returns the
+/// number of overlay cells flushed.
+#[allow(dead_code)]
+fn flush_single_chunk_to_anvil_dir(
+    dir: &std::path::Path,
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+) -> Result<usize, String> {
+    let rel = anvil_dim_region_dir(dim)
+        .ok_or_else(|| format!("dimension {dim:?} has no anvil region directory"))?;
+    let region_dir = dir.join(rel);
+    std::fs::create_dir_all(&region_dir)
+        .map_err(|e| format!("cannot create {}: {e}", region_dir.display()))?;
+    let region_path = region_dir.join(format!(
+        "r.{}.{}.mca",
+        cx.div_euclid(32),
+        cz.div_euclid(32)
+    ));
+    // Merge, never blindly overwrite: an existing region file keeps its other
+    // chunks; one that fails to read aborts the flush outright — a partial file
+    // must never replace a good one.
+    let mut region = if region_path.is_file() {
+        read_region_file(&region_path)?
+    } else {
+        AnvilRegion::default()
+    };
+    let overlay = world()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(dim, cx, cz))
+        .cloned()
+        .unwrap_or_default();
+    let flushed = overlay.len();
+    let chunk = AnvilChunk {
+        cx,
+        cz,
+        data_version: ANVIL_DATA_VERSION,
+        status: "minecraft:full".to_string(),
+        sections: anvil_export_sections(dim, cx, cz, &overlay),
+        block_entities: evict_chunk_block_entities(dim, cx, cz),
+        unknown_states: 0,
+        dropped_sections: 0,
+    };
+    let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
+    region.chunks.insert(
+        (cx, cz),
+        AnvilChunkRecord {
+            timestamp,
+            compression: 2,
+            nbt: anvil_chunk_to_nbt(&chunk, dim.min_y() >> 4),
+        },
+    );
+    write_region_file(&region_path, &region)?;
+    Ok(flushed)
+}
+
+/// Re-home one flushed chunk's `block_entities` into the live stores: `Items`
+/// records go to `chests()`/`furnaces()`/`live_brewing_stands()` by the
+/// record's container kind, sign text to `signs()`, an unspent `LootTable` back
+/// to `pending_block_loot()`, and store-owned kinds (beacon, decorated pot, …)
+/// to `live_block_entities()`. Every record also lands in
+/// `anvil_block_entities()`: what no live store owns is still re-exported
+/// verbatim, so a flush -> reload -> flush cycle loses no tag — the same
+/// treatment `apply_anvil_import` gives an imported chunk.
+#[allow(dead_code)]
+fn apply_chunk_block_entities(dim: DimId, entities: &[AnvilNbt]) {
+    use crate::generation_payload::ContainerKind;
+    for entity in entities {
+        let (Some(x), Some(y), Some(z)) = (
+            anvil_i32(entity, "x"),
+            anvil_i32(entity, "y"),
+            anvil_i32(entity, "z"),
+        ) else {
+            continue;
+        };
+        let key: DimBlockPos = (dim, x, y, z);
+        let id = anvil_str(entity, "id").unwrap_or_default();
+        anvil_block_entities()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, entity.clone());
+        if id.ends_with(":sign") || id.ends_with(":hanging_sign") {
+            let mut sign_map = signs().lock().unwrap_or_else(|e| e.into_inner());
+            let front = anvil_sign_lines(entity.get("front_text"));
+            if front.iter().any(|line| !line.is_empty()) {
+                sign_map.insert((dim, x, y, z, 1), front);
+            }
+            let back = anvil_sign_lines(entity.get("back_text"));
+            if back.iter().any(|line| !line.is_empty()) {
+                sign_map.insert((dim, x, y, z, 0), back);
+            }
+        }
+        let _ = restore_live_block_entity(key, entity);
+        let mut items_owned = false;
+        if let Some(items) = entity.get("Items") {
+            if let Ok(slots) = items_nbt_to_stacks(items) {
+                items_owned = match ContainerKind::for_block(&id) {
+                    Some(ContainerKind::Furnace) => {
+                        furnaces()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(
+                                key,
+                                Furnace {
+                                    input: slots.get(&0).cloned().unwrap_or_default(),
+                                    fuel: slots.get(&1).cloned().unwrap_or_default(),
+                                    output: slots.get(&2).cloned().unwrap_or_default(),
+                                    burn_left: entity
+                                        .get("BurnTime")
+                                        .and_then(nbt_int_val)
+                                        .unwrap_or(0) as i32,
+                                    progress: entity
+                                        .get("CookTime")
+                                        .and_then(nbt_int_val)
+                                        .unwrap_or(0) as i32,
+                                    dirty: false,
+                                    xp: 0.0,
+                                    recipe_cache: CachedLookup::default(),
+                                    fuel_cache: CachedLookup::default(),
+                                },
+                            );
+                        true
+                    }
+                    Some(_) => {
+                        chests()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(ContainerKey::Block(key), slots);
+                        true
+                    }
+                    None if id == "minecraft:brewing_stand" => {
+                        live_brewing_stands()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(key, live_brewing_stand_from_nbt(entity, &slots));
+                        true
+                    }
+                    None => false,
+                };
+            }
+        }
+        // A `LootTable` next to materialized `Items` was already rolled: the
+        // live container owns the cell, so only an Items-less record restores
+        // a pending roll.
+        if !items_owned {
+            if let Some(table) = anvil_str(entity, "LootTable") {
+                pending_block_loot()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        key,
+                        PendingBlockLoot {
+                            kind: ContainerKind::for_block(&id)
+                                .unwrap_or(ContainerKind::Chest),
+                            loot_table: table,
+                            loot_seed: anvil_i64(entity, "LootTableSeed"),
+                        },
+                    );
+            }
+        }
+    }
+}
+
+/// Re-hydrate one chunk from `dir`'s vanilla region file: the stored sections
+/// become the live overlay (generated terrain included, which is what a flush
+/// wrote) and the block entities return to the stores that own them via
+/// `apply_chunk_block_entities`. `Ok(false)` when the region file or the chunk
+/// record does not exist — a chunk that was never flushed is a miss, not an
+/// error.
+#[allow(dead_code)]
+fn reload_single_chunk_from_anvil_dir(
+    dir: &std::path::Path,
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+) -> Result<bool, String> {
+    let Some(rel) = anvil_dim_region_dir(dim) else {
+        return Err(format!("dimension {dim:?} has no anvil region directory"));
+    };
+    let region_path = dir.join(rel).join(format!(
+        "r.{}.{}.mca",
+        cx.div_euclid(32),
+        cz.div_euclid(32)
+    ));
+    if !region_path.is_file() {
+        return Ok(false);
+    }
+    let region = read_region_file(&region_path)?;
+    let Some(record) = region.chunks.get(&(cx, cz)) else {
+        return Ok(false);
+    };
+    let chunk = anvil_chunk_from_nbt(&record.nbt, (cx, cz))?;
+    let edits = anvil_chunk_edits(&chunk, dim);
+    let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+    if edits.is_empty() {
+        w.remove(&(dim, cx, cz));
+    } else {
+        w.insert((dim, cx, cz), edits);
+    }
+    drop(w);
+    apply_chunk_block_entities(dim, &chunk.block_entities);
+    Ok(true)
+}
+
 #[cfg(test)]
 mod anvil_io_tests {
     use super::*;

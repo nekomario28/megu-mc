@@ -5830,3 +5830,951 @@ mod p5b_parity_world_border_tests {
         assert!(load_world_from(&payload).is_err());
     }
 }
+
+// ---------- live region-scoped chunk unloader (issue #105) ----------
+
+/// One sweep's eviction bounds: the most unticketed chunks it may unload and
+/// how many ticks a chunk keeps its residency after it was last covered by a
+/// player view window, the spawn ring, or a `/forceload` ticket.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(dead_code)]
+struct LiveChunkUnloadPolicy {
+    max_unticketed_chunks: usize,
+    grace_ticks: u64,
+}
+
+/// What one unload or sweep did. `blocks_flushed` counts overlay cells
+/// preserved — written to `flush_dir` or parked in `evicted_regions`;
+/// `block_entities_unloaded` counts reclaimed container/sign/store records;
+/// `entities_unloaded` counts the non-player mobs and item drops reclaimed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[allow(dead_code)]
+struct LiveUnloadSummary {
+    chunks_unloaded: usize,
+    blocks_flushed: usize,
+    block_entities_unloaded: usize,
+    entities_unloaded: usize,
+}
+
+/// The last sweep tick a resident chunk sat inside a covered window: a
+/// connected client's view, the spawn ring, or the forceload set. The sweep
+/// stamps the covered chunks it sees; a resident chunk whose stamp is more
+/// than `grace_ticks` old has lost its ticket and may be evicted.
+#[allow(dead_code)]
+static LIVE_CHUNK_TICKETS: Registry<DimChunkKey, u64> = OnceLock::new();
+#[allow(dead_code)]
+fn live_chunk_tickets() -> &'static LockedMap<DimChunkKey, u64> {
+    LIVE_CHUNK_TICKETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Everything `park_evicted_chunk` drains out of the live stores for one
+/// chunk, kept as the stores' own record types so a re-hydrate puts every
+/// block, container and block entity back exactly as the unload left it.
+#[derive(Default)]
+#[allow(dead_code)]
+struct EvictedChunkArchive {
+    edits: HashMap<u32, u32>,
+    chests: Vec<(DimBlockPos, HashMap<i16, Stack>)>,
+    furnaces: Vec<(DimBlockPos, Furnace)>,
+    brewing: Vec<(DimBlockPos, LiveBrewingStand)>,
+    signs: Vec<(SignKey, SignLines)>,
+    live_entities: Vec<(DimBlockPos, (i32, LiveBlockEntity))>,
+    anvil_records: Vec<(DimBlockPos, AnvilNbt)>,
+    crops: Vec<(DimBlockPos, u8)>,
+    pending_loot: Vec<(DimBlockPos, PendingBlockLoot)>,
+}
+
+#[allow(dead_code)]
+impl EvictedChunkArchive {
+    /// Whether the drain carried anything at all — an archive with no records
+    /// is not parked.
+    fn has_records(&self) -> bool {
+        !(self.edits.is_empty()
+            && self.chests.is_empty()
+            && self.furnaces.is_empty()
+            && self.brewing.is_empty()
+            && self.signs.is_empty()
+            && self.live_entities.is_empty()
+            && self.anvil_records.is_empty()
+            && self.crops.is_empty()
+            && self.pending_loot.is_empty())
+    }
+
+    /// The block-entity-shaped records the drain carried: one entry per store
+    /// record, so `block_entities_unloaded` counts the same cells a later
+    /// flush would write.
+    fn block_entity_records(&self) -> usize {
+        self.chests.len()
+            + self.furnaces.len()
+            + self.brewing.len()
+            + self.signs.len()
+            + self.live_entities.len()
+            + self.anvil_records.len()
+            + self.pending_loot.len()
+    }
+}
+
+/// The compact per-region archive an unload parks its state in when no Anvil
+/// directory is asked for: region coordinates key the map so "what did region
+/// `(rx, rz)` lose" answers the way the `.mca` merge answers it on disk.
+#[allow(dead_code)]
+static EVICTED_REGIONS: Registry<
+    (DimId, i32, i32),
+    std::collections::BTreeMap<(i32, i32), EvictedChunkArchive>,
+> = OnceLock::new();
+#[allow(dead_code)]
+fn evicted_regions(
+) -> &'static LockedMap<(DimId, i32, i32), std::collections::BTreeMap<(i32, i32), EvictedChunkArchive>>
+{
+    EVICTED_REGIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The spawn ring in the Overworld — the `spawnChunkRadius` gamerule's window
+/// around the world-spawn chunk, the set vanilla keeps entity-ticking at all
+/// times. Only the Overworld carries a world spawn.
+#[allow(dead_code)]
+fn live_spawn_ticket_chunks() -> HashSet<DimChunkKey> {
+    let (sx, _, sz, _) = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+    let radius = command_gamerules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get("spawnChunkRadius")
+        .copied()
+        .unwrap_or(2)
+        .clamp(0, 32);
+    let mut cells = HashSet::new();
+    extend_chunk_square(
+        &mut cells,
+        (
+            (sx.floor() as i32).div_euclid(16),
+            (sz.floor() as i32).div_euclid(16),
+        ),
+        radius,
+    );
+    cells
+        .into_iter()
+        .map(|(cx, cz)| (DimId::Overworld, cx, cz))
+        .collect()
+}
+
+/// The union of every connected client's held chunk window, tagged with the
+/// dimension that client is in — the live answer to "which chunks is a player
+/// looking at right now".
+#[allow(dead_code)]
+fn live_client_view_chunks() -> HashSet<DimChunkKey> {
+    clients()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .flat_map(|client| {
+            let dim = *client.dim.lock().unwrap_or_else(|e| e.into_inner());
+            client
+                .chunks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|&(cx, cz)| (dim, cx, cz))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The ticket check applied at the point of no return. A covered chunk — any
+/// connected client's held window, the spawn ring, or the forceload set —
+/// must never reach eviction, so `unload_unticketed_chunk_overlays` verifies
+/// it itself rather than trusting every caller's covered set to be complete.
+#[allow(dead_code)]
+fn live_chunk_is_ticketed(dim: DimId, cx: i32, cz: i32) -> bool {
+    live_spawn_ticket_chunks().contains(&(dim, cx, cz))
+        || forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(cx, cz))
+        || live_client_view_chunks().contains(&(dim, cx, cz))
+}
+
+/// Does the chunk hold any block-entity-shaped record a flush must carry —
+/// containers, furnaces, stands, signs, store entries, imported tags or a
+/// pending loot roll? An empty answer with an empty overlay means the chunk
+/// has nothing worth writing.
+#[allow(dead_code)]
+fn live_chunk_has_records(dim: DimId, cx: i32, cz: i32) -> bool {
+    let in_chunk = |x: i32, z: i32| x >> 4 == cx && z >> 4 == cz;
+    let block_in_chunk = |&(d, x, _, z): &DimBlockPos| d == dim && in_chunk(x, z);
+    chests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .any(|key| matches!(key, ContainerKey::Block(pos) if block_in_chunk(pos)))
+        || furnaces()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .any(block_in_chunk)
+        || live_brewing_stands()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .any(block_in_chunk)
+        || signs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .any(|&(d, x, _, z, _)| d == dim && in_chunk(x, z))
+        || live_block_entities()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .keys()
+            .any(block_in_chunk)
+        || anvil_block_entities()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .any(block_in_chunk)
+        || pending_block_loot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .any(block_in_chunk)
+}
+
+/// Every chunk holding unloadable live state: overlay edits, any block-entity
+/// store record, and the entities parked in it.
+#[allow(dead_code)]
+fn live_resident_chunks() -> HashSet<DimChunkKey> {
+    let mut out: HashSet<DimChunkKey> = world()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .copied()
+        .collect();
+    let block_chunk = |&(d, x, _, z): &DimBlockPos| (d, x >> 4, z >> 4);
+    out.extend(
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .filter_map(|key| match key {
+                ContainerKey::Block(pos) => Some(block_chunk(pos)),
+                ContainerKey::Cart(_) => None,
+            }),
+    );
+    for keys in [
+        furnaces()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect::<Vec<DimBlockPos>>(),
+        live_brewing_stands()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect(),
+        anvil_block_entities()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect(),
+        live_block_entities()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .keys()
+            .copied()
+            .collect(),
+        crops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect(),
+        pending_block_loot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect(),
+    ] {
+        out.extend(keys.iter().map(block_chunk));
+    }
+    out.extend(
+        signs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .map(|&(d, x, _, z, _)| (d, x >> 4, z >> 4)),
+    );
+    for mob in mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        let (x, _, z, _, _) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        out.insert((
+            mob.dim,
+            (x.floor() as i32).div_euclid(16),
+            (z.floor() as i32).div_euclid(16),
+        ));
+    }
+    // Drops carry no dimension in this store; they are parked with the
+    // Overworld chunk their position falls in, the same dim the legacy save
+    // section writes them under.
+    for item_drop in drops().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        out.insert((
+            DimId::Overworld,
+            (item_drop.x.floor() as i32).div_euclid(16),
+            (item_drop.z.floor() as i32).div_euclid(16),
+        ));
+    }
+    out
+}
+
+/// Drain `(dim, cx, cz)` out of every live store into an archive. The caller
+/// decides whether the archive is parked in `evicted_regions` or dropped after
+/// a disk flush — either way the live copies are gone, which is what
+/// "unloaded" means. Derived per-chunk caches (`op_bands`, `section_store`,
+/// `chunk_versions`) are dropped too: they rebuild on demand and their memory
+/// is the exploration memory this unloader exists to reclaim.
+#[allow(dead_code)]
+fn park_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> EvictedChunkArchive {
+    let in_chunk = |x: i32, z: i32| x >> 4 == cx && z >> 4 == cz;
+    let mut archive = EvictedChunkArchive {
+        edits: world()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(dim, cx, cz))
+            .unwrap_or_default(),
+        ..EvictedChunkArchive::default()
+    };
+    {
+        let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<ContainerKey> = store
+            .keys()
+            .copied()
+            .filter(|key| {
+                matches!(key, ContainerKey::Block((d, x, _, z)) if *d == dim && in_chunk(*x, *z))
+            })
+            .collect();
+        for key in keys {
+            if let (ContainerKey::Block(pos), Some(slots)) = (key, store.remove(&key)) {
+                archive.chests.push((pos, slots));
+            }
+        }
+    }
+    {
+        let mut store = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<DimBlockPos> = store
+            .keys()
+            .copied()
+            .filter(|&(d, x, _, z)| d == dim && in_chunk(x, z))
+            .collect();
+        for key in keys {
+            if let Some(furnace) = store.remove(&key) {
+                archive.furnaces.push((key, furnace));
+            }
+        }
+    }
+    {
+        let mut store = live_brewing_stands()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<DimBlockPos> = store
+            .keys()
+            .copied()
+            .filter(|&(d, x, _, z)| d == dim && in_chunk(x, z))
+            .collect();
+        for key in keys {
+            if let Some(stand) = store.remove(&key) {
+                archive.brewing.push((key, stand));
+            }
+        }
+    }
+    {
+        let mut store = signs().lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<SignKey> = store
+            .keys()
+            .copied()
+            .filter(|&(d, x, _, z, _)| d == dim && in_chunk(x, z))
+            .collect();
+        for key in keys {
+            if let Some(lines) = store.remove(&key) {
+                archive.signs.push((key, lines));
+            }
+        }
+    }
+    {
+        let mut store = live_block_entities()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<DimBlockPos> = store
+            .entries
+            .keys()
+            .copied()
+            .filter(|&(d, x, _, z)| d == dim && in_chunk(x, z))
+            .collect();
+        for key in keys {
+            if let Some(entry) = store.entries.remove(&key) {
+                archive.live_entities.push((key, entry));
+            }
+        }
+        store.chunk_versions.remove(&(dim, cx, cz));
+    }
+    {
+        let mut store = anvil_block_entities()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<DimBlockPos> = store
+            .keys()
+            .copied()
+            .filter(|&(d, x, _, z)| d == dim && in_chunk(x, z))
+            .collect();
+        for key in keys {
+            if let Some(tag) = store.remove(&key) {
+                archive.anvil_records.push((key, tag));
+            }
+        }
+    }
+    {
+        let mut store = crops().lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<DimBlockPos> = store
+            .keys()
+            .copied()
+            .filter(|&(d, x, _, z)| d == dim && in_chunk(x, z))
+            .collect();
+        for key in keys {
+            if let Some(age) = store.remove(&key) {
+                archive.crops.push((key, age));
+            }
+        }
+    }
+    {
+        let mut store = pending_block_loot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<DimBlockPos> = store
+            .keys()
+            .copied()
+            .filter(|&(d, x, _, z)| d == dim && in_chunk(x, z))
+            .collect();
+        for key in keys {
+            if let Some(loot) = store.remove(&key) {
+                archive.pending_loot.push((key, loot));
+            }
+        }
+    }
+    chunk_versions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(dim, cx, cz));
+    op_bands()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .remove(&(dim, cx, cz));
+    section_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .remove(&(dim, cx, cz));
+    archive
+}
+
+/// Drop the non-player entities a chunk held: mobs keyed by dimension, plus
+/// item drops, which this store keeps dimension-agnostic and which are
+/// therefore reclaimed only with the Overworld chunk their position falls in.
+/// Connected players are never in either store — `clients()` is a separate
+/// list the unloader never touches.
+#[allow(dead_code)]
+fn reclaim_chunk_entities(dim: DimId, cx: i32, cz: i32) -> usize {
+    let mut reclaimed = 0;
+    {
+        let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let before = ms.len();
+        ms.retain(|mob| {
+            if mob.dim != dim {
+                return true;
+            }
+            let (x, _, z, _, _) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            (x.floor() as i32).div_euclid(16) != cx
+                || (z.floor() as i32).div_euclid(16) != cz
+        });
+        reclaimed += before - ms.len();
+    }
+    if dim == DimId::Overworld {
+        let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
+        let before = ds.len();
+        ds.retain(|item_drop| {
+            (item_drop.x.floor() as i32).div_euclid(16) != cx
+                || (item_drop.z.floor() as i32).div_euclid(16) != cz
+        });
+        reclaimed += before - ds.len();
+    }
+    reclaimed
+}
+
+/// Evict one unticketed chunk: flush its dirty overlay and block entities to
+/// `flush_dir` (or park them in `evicted_regions` when no directory is given),
+/// then reclaim the live overlay cells, container stores, block entities and
+/// non-player entities the chunk held. The flush runs before anything is
+/// removed, so a failed write aborts the unload, the chunk stays resident and
+/// no edit is ever lost. A chunk still covered by a player window, the spawn
+/// ring or `/forceload` is refused outright.
+#[allow(dead_code)]
+fn unload_unticketed_chunk_overlays(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    flush_dir: Option<&std::path::Path>,
+) -> Result<LiveUnloadSummary, String> {
+    if live_chunk_is_ticketed(dim, cx, cz) {
+        return Err(format!("chunk ({dim:?}, {cx}, {cz}) is still ticketed"));
+    }
+    with_save_guard(|| {
+        let mut summary = LiveUnloadSummary::default();
+        if let Some(dir) = flush_dir {
+            // The flush reads the live stores, so it runs before the drain;
+            // a failed write leaves the chunk resident and loses nothing.
+            let dirty = world()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(dim, cx, cz))
+                .is_some_and(|edits| !edits.is_empty())
+                || live_chunk_has_records(dim, cx, cz);
+            if dirty {
+                summary.blocks_flushed = flush_single_chunk_to_anvil_dir(dir, dim, cx, cz)?;
+            }
+            let dropped = park_evicted_chunk(dim, cx, cz);
+            summary.block_entities_unloaded = dropped.block_entity_records();
+            // The flush preserved the edits; the dropped archive is only the
+            // drain record, so count the cells the flush wrote.
+            debug_assert_eq!(summary.blocks_flushed, dropped.edits.len());
+        } else {
+            let archive = park_evicted_chunk(dim, cx, cz);
+            summary.block_entities_unloaded = archive.block_entity_records();
+            summary.blocks_flushed = archive.edits.len();
+            if archive.has_records() {
+                evicted_regions()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry((dim, cx.div_euclid(32), cz.div_euclid(32)))
+                    .or_default()
+                    .insert((cx, cz), archive);
+            }
+        }
+        summary.entities_unloaded = reclaim_chunk_entities(dim, cx, cz);
+        live_chunk_tickets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(dim, cx, cz));
+        if summary.blocks_flushed > 0
+            || summary.block_entities_unloaded > 0
+            || summary.entities_unloaded > 0
+        {
+            summary.chunks_unloaded = 1;
+        }
+        Ok(summary)
+    })
+}
+
+/// Evict resident chunks that have lost their ticket. A chunk covered by an
+/// active player view window (the caller's set plus every live client's held
+/// window), the Overworld spawn ring or `/forceload` is stamped and never
+/// unloaded; the rest age by `grace_ticks` from their last stamp and are
+/// unloaded up to `max_unticketed_chunks` per call. Each unload preserves its
+/// blocks to `flush_dir` (or `evicted_regions`) before reclaiming, so a failed
+/// write aborts that chunk's eviction rather than losing an edit.
+#[allow(dead_code)]
+fn sweep_unticketed_regions(
+    active_player_chunks: &HashSet<DimChunkKey>,
+    forceloaded_chunks: &HashSet<(i32, i32)>,
+    policy: LiveChunkUnloadPolicy,
+    current_tick: u64,
+    flush_dir: Option<&std::path::Path>,
+) -> Result<LiveUnloadSummary, String> {
+    let mut covered = live_client_view_chunks();
+    covered.extend(active_player_chunks.iter().copied());
+    // The forceload set is dimension-agnostic server state — a ticket at
+    // `(cx, cz)` covers that chunk in every registered dimension.
+    {
+        let forced = forceloaded().lock().unwrap_or_else(|e| e.into_inner());
+        for dim in DimId::all_registered() {
+            for &(cx, cz) in forceloaded_chunks.iter().chain(forced.iter()) {
+                covered.insert((dim, cx, cz));
+            }
+        }
+    }
+    covered.extend(live_spawn_ticket_chunks());
+    let mut residents = live_resident_chunks();
+    {
+        let mut tickets = live_chunk_tickets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for key in covered.intersection(&residents) {
+            tickets.insert(*key, current_tick);
+        }
+    }
+    residents.retain(|key| !covered.contains(key));
+    let mut candidates: Vec<DimChunkKey> = residents.into_iter().collect();
+    candidates.sort();
+    let mut summary = LiveUnloadSummary::default();
+    for (dim, cx, cz) in candidates {
+        if summary.chunks_unloaded >= policy.max_unticketed_chunks {
+            break;
+        }
+        let last = live_chunk_tickets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(dim, cx, cz))
+            .copied()
+            .unwrap_or(0);
+        if current_tick.saturating_sub(last) < policy.grace_ticks {
+            continue;
+        }
+        let step = unload_unticketed_chunk_overlays(dim, cx, cz, flush_dir)?;
+        summary.chunks_unloaded += step.chunks_unloaded;
+        summary.blocks_flushed += step.blocks_flushed;
+        summary.block_entities_unloaded += step.block_entities_unloaded;
+        summary.entities_unloaded += step.entities_unloaded;
+    }
+    Ok(summary)
+}
+
+/// Re-hydrate a chunk parked in `evicted_regions`: the parked overlay and
+/// every drained store record returns to the live world exactly as the unload
+/// left it, with the derived caches left to rebuild on demand.
+#[allow(dead_code)]
+fn rehydrate_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> bool {
+    let archive = {
+        let mut regions = evicted_regions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let region_key = (dim, cx.div_euclid(32), cz.div_euclid(32));
+        let archive = regions
+            .get_mut(&region_key)
+            .and_then(|region| region.remove(&(cx, cz)));
+        if regions
+            .get(&region_key)
+            .is_some_and(|region| region.is_empty())
+        {
+            regions.remove(&region_key);
+        }
+        archive
+    };
+    let Some(archive) = archive else {
+        return false;
+    };
+    with_save_guard(|| {
+        if !archive.edits.is_empty() {
+            world()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((dim, cx, cz), archive.edits);
+        }
+        for (pos, slots) in archive.chests {
+            chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(ContainerKey::Block(pos), slots);
+        }
+        for (pos, furnace) in archive.furnaces {
+            furnaces()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pos, furnace);
+        }
+        for (pos, stand) in archive.brewing {
+            live_brewing_stands()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pos, stand);
+        }
+        for (key, lines) in archive.signs {
+            signs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, lines);
+        }
+        {
+            let mut store = live_block_entities()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (pos, entry) in archive.live_entities {
+                store.entries.insert(pos, entry);
+            }
+        }
+        for (pos, tag) in archive.anvil_records {
+            anvil_block_entities()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pos, tag);
+        }
+        for (pos, age) in archive.crops {
+            crops()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pos, age);
+        }
+        for (pos, loot) in archive.pending_loot {
+            pending_block_loot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pos, loot);
+        }
+    });
+    true
+}
+
+/// Re-hydrate a chunk the unloader evicted: with a `flush_dir` the merged
+/// `.mca` record answers, without one the parked `evicted_regions` archive
+/// does — either way edited blocks and containers come back byte-for-byte.
+#[allow(dead_code)]
+fn reload_unticketed_chunk_overlay(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    flush_dir: Option<&std::path::Path>,
+) -> Result<bool, String> {
+    match flush_dir {
+        Some(dir) => reload_single_chunk_from_anvil_dir(dir, dim, cx, cz),
+        None => Ok(rehydrate_evicted_chunk(dim, cx, cz)),
+    }
+}
+
+#[cfg(test)]
+mod p8b4_issue105_tests {
+    use super::*;
+
+    fn p8b4_mob(eid: i32, x: f64, y: f64, z: f64) -> Arc<Mob> {
+        Arc::new(Mob {
+            dim: DimId::Overworld,
+            eid,
+            uuid: [eid as u8; 16],
+            etype: 1,
+            pos: Mutex::new((x, y, z, 0.0, 0.0)),
+            hp: Mutex::new(10.0),
+            last_hit: Mutex::new(Instant::now()),
+            hurt_at: Mutex::new(Instant::now()),
+            last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(60),
+        })
+    }
+
+    fn p8b4_overlay_len(key: DimChunkKey) -> usize {
+        world()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .map_or(0, HashMap::len)
+    }
+
+    fn p8b4_total_overlay_cells() -> usize {
+        world()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(HashMap::len)
+            .sum()
+    }
+
+    #[test]
+    fn p8b4_issue105_sweep_unloads_unticketed_chunk_and_preserves_edits() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        test_support::require_vanilla_data();
+        let dir =
+            std::env::temp_dir().join(format!("mc-spine-p8b4-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stone = name_to_state("minecraft:stone").expect("stone state");
+        let dirt = name_to_state("minecraft:dirt").expect("dirt state");
+        let glass = name_to_state("minecraft:glass").expect("glass state");
+        let states = [stone, dirt, glass];
+        // 200 edits, a stocked chest and a mob in far chunk (50, 50); the
+        // spawn chunk (0, 0) keeps an edit of its own under a live ticket.
+        let mut edits = Vec::new();
+        for i in 0..200i32 {
+            let (x, y, z) = (800 + (i % 16), 64 + (i / 16), 800 + (i % 3));
+            let st = states[(i as usize) % states.len()];
+            set_block_dim(DimId::Overworld, x, y, z, st);
+            edits.push(((x, y, z), st));
+        }
+        let chest_pos: DimBlockPos = (DimId::Overworld, 803, 70, 803);
+        let apple = name_to_item("minecraft:apple").expect("apple item");
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                ContainerKey::Block(chest_pos),
+                HashMap::from([(4i16, (apple, 3u8, Vec::new()))]),
+            );
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(p8b4_mob(900_001, 808.5, 70.0, 808.5));
+        set_block_dim(DimId::Overworld, 2, 64, 3, stone);
+        assert_eq!(p8b4_overlay_len((DimId::Overworld, 50, 50)), 200);
+        let cells_before = p8b4_total_overlay_cells();
+
+        let active: HashSet<DimChunkKey> = HashSet::from([(DimId::Overworld, 0, 0)]);
+        let summary = sweep_unticketed_regions(
+            &active,
+            &HashSet::new(),
+            LiveChunkUnloadPolicy {
+                max_unticketed_chunks: 64,
+                grace_ticks: 0,
+            },
+            1,
+            Some(&dir),
+        )
+        .unwrap();
+        assert_eq!(summary.chunks_unloaded, 1, "only the unticketed far chunk unloads");
+        assert_eq!(summary.blocks_flushed, 200);
+        assert!(summary.block_entities_unloaded >= 1, "chest record reclaimed");
+        assert!(summary.entities_unloaded >= 1, "mob reclaimed");
+        assert_eq!(p8b4_overlay_len((DimId::Overworld, 50, 50)), 0);
+        assert_eq!(
+            p8b4_total_overlay_cells(),
+            cells_before - 200,
+            "the overlay dropped exactly the evicted cells"
+        );
+        assert_eq!(
+            p8b4_overlay_len((DimId::Overworld, 0, 0)),
+            1,
+            "spawn chunk 100% untouched"
+        );
+        assert!(chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        assert!(mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        assert!(dir.join("region").join("r.1.1.mca").is_file());
+
+        // Re-hydrate from the flushed Anvil dir: every edited block returns
+        // byte-for-byte and the chest gets its slots back.
+        assert!(
+            reload_single_chunk_from_anvil_dir(&dir, DimId::Overworld, 50, 50).unwrap()
+        );
+        for ((x, y, z), st) in &edits {
+            assert_eq!(
+                block_at_dim(DimId::Overworld, *x, *y, *z),
+                *st,
+                "edit at ({x}, {y}, {z})"
+            );
+        }
+        let restored = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::Block(chest_pos))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(restored.get(&4), Some(&(apple, 3, Vec::new())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p8b4_issue105_evicted_region_archive_rehydrates_blocks_and_chest() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        let stone = name_to_state("minecraft:stone").unwrap_or(7);
+        let dirt = name_to_state("minecraft:dirt").unwrap_or(11);
+        set_block_dim(DimId::Overworld, 640, 64, 640, stone);
+        set_block_dim(DimId::Overworld, 641, 64, 641, dirt);
+        let chest_pos: DimBlockPos = (DimId::Overworld, 642, 70, 642);
+        let apple = name_to_item("minecraft:apple").unwrap_or(1);
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                ContainerKey::Block(chest_pos),
+                HashMap::from([(0i16, (apple, 2u8, Vec::new()))]),
+            );
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(p8b4_mob(900_002, 645.5, 70.0, 645.5));
+
+        // No flush dir: the per-region evicted archive is the preservation path.
+        let summary = sweep_unticketed_regions(
+            &HashSet::new(),
+            &HashSet::new(),
+            LiveChunkUnloadPolicy {
+                max_unticketed_chunks: 64,
+                grace_ticks: 0,
+            },
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.chunks_unloaded, 1);
+        assert_eq!(summary.blocks_flushed, 2);
+        assert!(summary.block_entities_unloaded >= 1);
+        assert!(summary.entities_unloaded >= 1);
+        assert_eq!(p8b4_overlay_len((DimId::Overworld, 40, 40)), 0);
+        assert!(evicted_regions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(DimId::Overworld, 1, 1))
+            .is_some_and(|region| region.contains_key(&(40, 40))));
+
+        assert!(
+            reload_unticketed_chunk_overlay(DimId::Overworld, 40, 40, None).unwrap(),
+            "archive re-hydrates the chunk"
+        );
+        assert_eq!(block_at_dim(DimId::Overworld, 640, 64, 640), stone);
+        assert_eq!(block_at_dim(DimId::Overworld, 641, 64, 641), dirt);
+        let restored = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::Block(chest_pos))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(restored.get(&0), Some(&(apple, 2, Vec::new())));
+    }
+
+    #[test]
+    fn p8b4_issue105_forceloaded_chunk_is_never_unloaded() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        let stone = name_to_state("minecraft:stone").unwrap_or(7);
+        set_block_dim(DimId::Overworld, 800, 64, 800, stone);
+        let forced: HashSet<(i32, i32)> = HashSet::from([(50, 50)]);
+        let summary = sweep_unticketed_regions(
+            &HashSet::new(),
+            &forced,
+            LiveChunkUnloadPolicy {
+                max_unticketed_chunks: 64,
+                grace_ticks: 0,
+            },
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.chunks_unloaded, 0);
+        assert_eq!(p8b4_overlay_len((DimId::Overworld, 50, 50)), 1);
+        // The primitive itself also refuses the chunk while the ticket lives.
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((50, 50));
+        assert!(unload_unticketed_chunk_overlays(DimId::Overworld, 50, 50, None).is_err());
+        assert_eq!(p8b4_overlay_len((DimId::Overworld, 50, 50)), 1);
+    }
+}
