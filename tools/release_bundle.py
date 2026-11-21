@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Build and verify a deterministic, fail-closed mc-spine release bundle.
 
-  tools/release_bundle.py build --binary <path> --out-dir <dir> \
-      --version <ver> --target <triple> [--repo-root <dir>] [--git-sha <40hex>]
+  tools/release_bundle.py build --binary <path> [--extra-binary <path>]... \
+      --out-dir <dir> --version <ver> --target <triple> \
+      [--repo-root <dir>] [--git-sha <40hex>]
   tools/release_bundle.py verify --bundle <tar.gz> \
       --manifest <release-manifest.json> --sums <SHA256SUMS>
   tools/release_bundle.py self-test            (or: --self-test)
 
-`build` packages one release binary plus the licence/legal/docs files and the
-user-facing vanilla-data tools into
+`build` packages the primary release binary plus any companion binaries given
+with the repeatable `--extra-binary` flag, the licence/legal/docs files and
+the user-facing vanilla-data tools into
 
   <out-dir>/mc-spine-<version>-<target>.tar.gz   the bundle
   <out-dir>/release-manifest.json                machine-readable contents
@@ -17,7 +19,7 @@ user-facing vanilla-data tools into
 Inside the tarball every member lives under the single directory
 `mc-spine-<version>-<target>/`:
 
-  <prefix>/<binary basename>                     the release binary (0755)
+  <prefix>/<binary basename>                     each release binary (0755)
   <prefix>/LICENSE, COPYING.LESSER, COPYING.AGPL, NOTICE,
       LICENSING.md, THIRD_PARTY.md, README.md    (0644)
   <prefix>/tools/vanilla_data/gen_vanilla_data.sh
@@ -188,19 +190,29 @@ def git_sha(repo_root, override):
     return sha
 
 
-def stage_entries(repo_root, binary):
+def stage_entries(repo_root, binary, extra_binaries=()):
     """The (arcname, data, mode) list the bundle is built from, before the prefix.
 
-    The binary ships under its own basename with mode 0755; docs ship 0644 and
+    Every binary ships under its own basename with mode 0755; docs ship 0644 and
     the tools keep their tracked executable bit (0755/0644), so the layout is a
-    pure function of the inputs.
+    pure function of the inputs. Two binaries may not share a basename, and no
+    binary may shadow a required doc/tool path.
     """
     repo_root = Path(repo_root)
-    binary = Path(binary)
     entries = []
-    if binary.is_symlink() or not binary.is_file():
-        raise BundleError(f"--binary: not a regular file: {binary}")
-    entries.append((binary.name, read_bytes(binary, "binary"), 0o755))
+    seen_binaries = set()
+    for flag, raw in [("--binary", binary)] + [
+            ("--extra-binary", path) for path in extra_binaries]:
+        path = Path(raw)
+        if path.is_symlink() or not path.is_file():
+            raise BundleError(f"{flag}: not a regular file: {path}")
+        if path.name in seen_binaries:
+            raise BundleError(f"duplicate binary basename {path.name!r}")
+        if path.name in (MANIFEST_NAME, SUMS_NAME):
+            raise BundleError(
+                f"{flag}: {path.name!r} collides with a release artifact name")
+        seen_binaries.add(path.name)
+        entries.append((path.name, read_bytes(path, flag), 0o755))
     for rel in REQUIRED_DOCS:
         source = repo_root / rel
         if source.is_symlink() or not source.is_file():
@@ -499,7 +511,7 @@ def cmd_build(args):
     if not repo_root.is_dir():
         raise BundleError(f"--repo-root: not a directory: {repo_root}")
     sha = git_sha(repo_root, args.git_sha)
-    entries = stage_entries(repo_root, args.binary)
+    entries = stage_entries(repo_root, args.binary, args.extra_binary or ())
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = bundle_stem(args.version, args.target)
@@ -546,11 +558,13 @@ def _fixture_repo(root):
     return binary
 
 
-def _build(tmp, name, repo, binary, version="0.1.0", target="x86_64-unknown-linux-gnu"):
+def _build(tmp, name, repo, binary, version="0.1.0",
+           target="x86_64-unknown-linux-gnu", extra=()):
     out = Path(tmp) / name
-    rc = main(["build", "--binary", str(binary), "--out-dir", str(out),
-               "--version", version, "--target", target,
-               "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA])
+    rc = main(["build", "--binary", str(binary), *extra,
+               "--out-dir", str(out), "--version", version,
+               "--target", target, "--repo-root", str(repo),
+               "--git-sha", SELFTEST_GIT_SHA])
     return rc, out
 
 
@@ -693,6 +707,103 @@ def self_test():
               and manifest["license"] == LICENSE_ID
               and manifest["subcrate_license"] == SUBCRATE_LICENSE)
 
+        # Multi-binary suite: repeatable --extra-binary stages each companion
+        # under its own basename with mode 0755, keeps the whole artifact set
+        # deterministic, and verify passes on the result unchanged.
+        suite_dir = Path(tmp) / "suite-bin"
+        suite_dir.mkdir()
+        suite_names = ("mc-spine-client", "mc-spine-mod-check",
+                       "mc-spine-world-migrate")
+        suite_flags = []
+        for suite_name in suite_names:
+            suite_path = suite_dir / suite_name
+            suite_path.write_bytes(f"\x7fELF fake {suite_name} v1\n".encode())
+            suite_path.chmod(0o755)
+            suite_flags += ["--extra-binary", str(suite_path)]
+        rc, out_m1 = _build(tmp, "multi-a", repo, binary, extra=suite_flags)
+        check("build: multi-binary suite build succeeds", rc == 0)
+        rc, out_m2 = _build(tmp, "multi-b", repo, binary, extra=suite_flags)
+        check("build: second multi-binary suite build succeeds", rc == 0)
+        prefix = bundle_stem("0.1.0", "x86_64-unknown-linux-gnu")
+        for name in (f"{prefix}.tar.gz", MANIFEST_NAME, SUMS_NAME):
+            check(f"deterministic: multi-binary {name} is byte-identical",
+                  (out_m1 / name).read_bytes() == (out_m2 / name).read_bytes())
+        rc = main(["verify", "--bundle", str(out_m1 / f"{prefix}.tar.gz"),
+                   "--manifest", str(out_m1 / MANIFEST_NAME),
+                   "--sums", str(out_m1 / SUMS_NAME)])
+        check("verify: a multi-binary suite bundle passes", rc == 0)
+        manifest = load_json(out_m1 / MANIFEST_NAME, MANIFEST_NAME)
+        expected_suite = {f"{prefix}/{name}" for name in
+                          [PRODUCT, *suite_names, *REQUIRED_DOCS, *REQUIRED_TOOLS]}
+        check("manifest: files cover every suite binary + docs + tools",
+              {record["path"] for record in manifest["files"]} == expected_suite)
+        modes = {record["path"]: record["mode"] for record in manifest["files"]}
+        check("manifest: every suite binary records mode 0755",
+              all(modes[f"{prefix}/{name}"] == "0755"
+                  for name in (PRODUCT, *suite_names)))
+
+        # The same fail-closed guard covers companion binaries: duplicate
+        # basenames, artifact-name collisions, doc shadows, forbidden names and
+        # missing files are refused before anything is written.
+        shadow = Path(tmp) / "shadow" / PRODUCT
+        shadow.parent.mkdir(parents=True, exist_ok=True)
+        shadow.write_bytes(b"shadow binary\n")
+        expect_build_fail("build: refuses an extra binary named like the primary",
+                          "--binary", str(binary), "--extra-binary", str(shadow),
+                          "--out-dir", str(Path(tmp) / "out-shadow"),
+                          "--version", "0.1.0",
+                          "--target", "x86_64-unknown-linux-gnu",
+                          "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA)
+        dup_a = Path(tmp) / "dup-a" / "companion"
+        dup_b = Path(tmp) / "dup-b" / "companion"
+        for dup in (dup_a, dup_b):
+            dup.parent.mkdir(parents=True, exist_ok=True)
+            dup.write_bytes(b"companion\n")
+        expect_build_fail("build: refuses two extra binaries sharing a basename",
+                          "--binary", str(binary),
+                          "--extra-binary", str(dup_a),
+                          "--extra-binary", str(dup_b),
+                          "--out-dir", str(Path(tmp) / "out-dup"),
+                          "--version", "0.1.0",
+                          "--target", "x86_64-unknown-linux-gnu",
+                          "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA)
+        jar_extra = Path(tmp) / "evil-extra.jar"
+        jar_extra.write_bytes(b"PK\x03\x04 planted")
+        expect_build_fail("build: refuses a .jar extra binary",
+                          "--binary", str(binary),
+                          "--extra-binary", str(jar_extra),
+                          "--out-dir", str(Path(tmp) / "out-jar"),
+                          "--version", "0.1.0",
+                          "--target", "x86_64-unknown-linux-gnu",
+                          "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA)
+        expect_build_fail("build: refuses a missing extra binary",
+                          "--binary", str(binary),
+                          "--extra-binary", str(Path(tmp) / "no-such-binary"),
+                          "--out-dir", str(Path(tmp) / "out-missing"),
+                          "--version", "0.1.0",
+                          "--target", "x86_64-unknown-linux-gnu",
+                          "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA)
+        doc_shadow = Path(tmp) / "doc-shadow" / "LICENSE"
+        doc_shadow.parent.mkdir(parents=True, exist_ok=True)
+        doc_shadow.write_bytes(b"not a licence\n")
+        expect_build_fail("build: refuses an extra binary shadowing LICENSE",
+                          "--binary", str(binary),
+                          "--extra-binary", str(doc_shadow),
+                          "--out-dir", str(Path(tmp) / "out-docshadow"),
+                          "--version", "0.1.0",
+                          "--target", "x86_64-unknown-linux-gnu",
+                          "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA)
+        reserved = Path(tmp) / "reserved" / SUMS_NAME
+        reserved.parent.mkdir(parents=True, exist_ok=True)
+        reserved.write_bytes(b"not a sums file\n")
+        expect_build_fail(f"build: refuses an extra binary named {SUMS_NAME}",
+                          "--binary", str(binary),
+                          "--extra-binary", str(reserved),
+                          "--out-dir", str(Path(tmp) / "out-reserved"),
+                          "--version", "0.1.0",
+                          "--target", "x86_64-unknown-linux-gnu",
+                          "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA)
+
         # build refuses forbidden basenames handed in through --binary, and a
         # staged tree that grows a forbidden file can never pass the guard.
         for bad in ("evil.jar", "config_packets.bin", "world_overlay.bin",
@@ -831,6 +942,10 @@ def main(argv=None):
 
     p_build = sub.add_parser("build", help="stage, package and self-verify a bundle")
     p_build.add_argument("--binary", required=True, help="release binary path")
+    p_build.add_argument("--extra-binary", action="append", default=None,
+                         metavar="PATH",
+                         help="companion binary shipped alongside --binary "
+                              "(repeatable, staged under its own basename)")
     p_build.add_argument("--out-dir", required=True, help="artifact output directory")
     p_build.add_argument("--version", required=True, help="release version, e.g. 0.1.0")
     p_build.add_argument("--target", required=True,
