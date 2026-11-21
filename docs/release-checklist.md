@@ -114,7 +114,7 @@ agree, and the purity guard rejects any Mojang-derived or
 repository-internal member.
 The payload includes `tools/megu_start.py` and `tools/megu_translate.py` as
 executable helpers. Separately built `mc-spine-client`, `mc-spine-mod-check`
-and `mc-spine-world-migrate` binaries can be included with repeated
+`mc-spine-world-migrate` and `mc-spine-init` binaries can be included with repeated
 `--extra-binary <path>` arguments to `build`.
 
 ## 5. Container image
@@ -191,6 +191,22 @@ client each:
 - Point operators at [SECURITY_NOTES.md](../SECURITY_NOTES.md) for the
   bind/allowlist posture; in the image the published port, not the bind
   address, decides exposure.
+- State the bounded strict Vanilla parity audit results (`ceaf3849`) explicitly:
+  58/58 C2S Play, 51/51 GameRules, 89/89 command roots, 30/30 behavioral
+  matrix; `eddeea93` records 12/12 MATCH against live Vanilla 1.21.1 cases.
+  Static S2C Play emissions remain 83/124, with 41 unemitted packets and
+  16 unresolved send sites. Whole-world M2 parity remains open.
+- State that the strict NeoForge 1.21.1 / Fabric 1.21.1 repository self-audit
+  is 53/53 overall (50/50 per loader, `ceaf3849`), while Wave 3 real
+  third-party modpack E2E remains unverified. The debt ratchet is at its
+  lock/rwlock unwrap ceiling of 19/19, with 0 wall-clock reads.
+- Link the [mod/shader author guide](mod-author-guide.md) (`008a42c9`).
+  External shaderpack handling covers Classic OptiFine, Iris 1.7–1.11+,
+  DistantHorizons `dh_shadow`/`dh_terrain`/`dh_water`, `megu-shader.toml`,
+  a GLSL 120–460 reflector, CLI/TOML/RenderGraph and a `client-ui` shader
+  screen (`469a15f5`, `11e82fb8`, `001de852`, `a079e1d6`). The native
+  WGSL path has a legacy-GPU-safe fallback. No third-party shaders are
+  bundled; shader visual fidelity and a real GPU-windowed client are pending.
 
 ## 8. Phase 2 / 3 / 4 Alpha ship gates
 
