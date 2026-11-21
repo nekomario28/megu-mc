@@ -99,6 +99,7 @@ python3 tools/release_bundle.py --self-test
 python3 tests/dev_check_test.py
 python3 tests/megu_translate_test.py
 python3 tests/live_parity_e2e_wire.py --self-test
+python3 tests/mod_suite_live_wire.py --self-test
 python3 website/check_site.py
 python3 tests/verify_gate_coverage_test.py
 
