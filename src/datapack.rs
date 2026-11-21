@@ -286,6 +286,1030 @@ fn datapack_registry() -> &'static Mutex<DatapackRegistry> {
     R.get_or_init(|| Mutex::new(DatapackRegistry::default()))
 }
 
+// DPC1 hashes the complete enabled input tree, including files the current
+// loader does not parse. That makes metadata and new resource types part of
+// invalidation as well. The snapshot reader below never trusts cache lengths.
+
+#[allow(dead_code)]
+const DPC1_MAGIC: &[u8; 4] = b"DPC1";
+#[allow(dead_code)]
+const DPC1_VERSION: u32 = 1;
+#[allow(dead_code)]
+const DPC1_HEADER_LEN: usize = 4 + 4 + 32 + 8 + 4;
+#[allow(dead_code)]
+const DPC1_MAX_PAYLOAD: usize = 64 * 1024 * 1024;
+#[allow(dead_code)]
+const DPC1_MAX_ENTRIES: usize = 1_000_000;
+#[allow(dead_code)]
+const DPC1_MAX_STRING: usize = 8 * 1024 * 1024;
+#[allow(dead_code)]
+static DPC1_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+// SHA-256 (FIPS 180-4), streaming to avoid retaining a second copy of
+// every datapack file while hashing. No additional dependency is needed.
+#[allow(dead_code)]
+struct Dpc1Sha256 {
+    state: [u32; 8],
+    block: [u8; 64],
+    buffered: usize,
+    bits: u64,
+}
+
+impl Dpc1Sha256 {
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            block: [0; 64],
+            buffered: 0,
+            bits: 0,
+        }
+    }
+
+    fn compress(&mut self) {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut words = [0u32; 64];
+        for (i, chunk) in self.block.chunks_exact(4).enumerate() {
+            words[i] = u32::from_be_bytes(chunk.try_into().expect("four bytes"));
+        }
+        for i in 16..64 {
+            let s0 = words[i - 15].rotate_right(7)
+                ^ words[i - 15].rotate_right(18)
+                ^ (words[i - 15] >> 3);
+            let s1 = words[i - 2].rotate_right(17)
+                ^ words[i - 2].rotate_right(19)
+                ^ (words[i - 2] >> 10);
+            words[i] = words[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ (!e & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(choice)
+                .wrapping_add(K[i])
+                .wrapping_add(words[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (state, add) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *state = state.wrapping_add(add);
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.bits = self.bits.wrapping_add((data.len() as u64).wrapping_mul(8));
+        while !data.is_empty() {
+            let n = (64 - self.buffered).min(data.len());
+            self.block[self.buffered..self.buffered + n].copy_from_slice(&data[..n]);
+            self.buffered += n;
+            data = &data[n..];
+            if self.buffered == 64 {
+                self.compress();
+                self.buffered = 0;
+            }
+        }
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        let bits = self.bits;
+        self.update(&[0x80]);
+        while self.buffered != 56 {
+            self.update(&[0]);
+        }
+        // update() above adds padding to the length counter, but the
+        // encoded length must be that of the original message.
+        self.block[56..64].copy_from_slice(&bits.to_be_bytes());
+        self.compress();
+        let mut digest = [0; 32];
+        for (out, word) in digest.chunks_exact_mut(4).zip(self.state) {
+            out.copy_from_slice(&word.to_be_bytes());
+        }
+        digest
+    }
+}
+
+#[allow(dead_code)]
+fn dpc1_frame(hash: &mut Dpc1Sha256, bytes: &[u8]) {
+    hash.update(&(bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+/// Hash each enabled pack in its specified priority order. Directory
+/// entries use UTF-8 relative paths sorted lexicographically. ZIP packs
+/// use their complete archive bytes so even unused archive entries count.
+/// Reject symlinks, special files and unreadable input rather than risk
+/// a cache hit based on an incomplete walk.
+#[allow(dead_code)]
+fn compute_datapack_tree_digest(
+    root: &std::path::Path,
+    enabled_order: &[String],
+) -> Result<[u8; 32], String> {
+    if !std::fs::symlink_metadata(root)
+        .map_err(|e| e.to_string())?
+        .file_type()
+        .is_dir()
+    {
+        return Err("datapack root is not a directory".into());
+    }
+    let sources = datapack_sources(root);
+    let mut hash = Dpc1Sha256::new();
+    hash.update(b"mc-spine DPC1 tree v1");
+    hash.update(&(enabled_order.len() as u64).to_le_bytes());
+    let mut seen = std::collections::HashSet::new();
+    for name in enabled_order {
+        if !seen.insert(name) {
+            return Err(format!("duplicate datapack {name}"));
+        }
+        let (_, path, zip) = sources
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .ok_or_else(|| format!("missing datapack {name}"))?;
+        dpc1_frame(&mut hash, name.as_bytes());
+        if *zip {
+            hash.update(b"zip");
+            dpc1_hash_file(&mut hash, path)?;
+            continue;
+        }
+        hash.update(b"directory");
+        let mut pending = vec![path.to_path_buf()];
+        let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let ty = entry.file_type().map_err(|e| e.to_string())?;
+                let item = entry.path();
+                if ty.is_symlink() {
+                    return Err(format!("datapack symlink rejected: {}", item.display()));
+                }
+                if ty.is_dir() {
+                    pending.push(item);
+                } else if ty.is_file() {
+                    let relative = item
+                        .strip_prefix(path)
+                        .map_err(|e| e.to_string())?
+                        .to_str()
+                        .ok_or("non-UTF-8 datapack path")?
+                        .replace('\\', "/");
+                    files.push((relative, item));
+                } else {
+                    return Err(format!("unsupported datapack entry: {}", item.display()));
+                }
+            }
+        }
+        files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        hash.update(&(files.len() as u64).to_le_bytes());
+        for (relative, path) in files {
+            dpc1_frame(&mut hash, relative.as_bytes());
+            dpc1_hash_file(&mut hash, &path)?;
+        }
+    }
+    Ok(hash.finish())
+}
+
+#[allow(dead_code)]
+fn dpc1_hash_file(hash: &mut Dpc1Sha256, path: &std::path::Path) -> Result<(), String> {
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err(format!("not a regular datapack file: {}", path.display()));
+    }
+    hash.update(&meta.len().to_le_bytes());
+    let mut buf = [0u8; 32 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        total = total
+            .checked_add(n as u64)
+            .ok_or("datapack file too large")?;
+        hash.update(&buf[..n]);
+    }
+    if total != meta.len() {
+        return Err(format!(
+            "datapack changed while hashing: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn dpc1_checksum(body: &[u8]) -> u32 {
+    let mut crc = flate2::Crc::new();
+    crc.update(body);
+    crc.sum()
+}
+
+#[allow(dead_code)]
+fn dpc1_cache_path(cache_dir: &std::path::Path) -> std::path::PathBuf {
+    cache_dir.join("datapacks.dpc1")
+}
+
+#[allow(dead_code)]
+fn dpc1_read_payload(path: &std::path::Path, expected: &[u8; 32]) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > (DPC1_HEADER_LEN + DPC1_MAX_PAYLOAD) as u64 {
+        return None;
+    }
+    file.take((DPC1_HEADER_LEN + DPC1_MAX_PAYLOAD + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() < DPC1_HEADER_LEN
+        || &bytes[..4] != DPC1_MAGIC
+        || bytes[4..8] != DPC1_VERSION.to_le_bytes()
+        || &bytes[8..40] != expected
+    {
+        return None;
+    }
+    let length = u64::from_le_bytes(bytes[40..48].try_into().ok()?);
+    if length > DPC1_MAX_PAYLOAD as u64 || bytes.len() != DPC1_HEADER_LEN + length as usize {
+        return None;
+    }
+    let crc = u32::from_le_bytes(bytes[48..52].try_into().ok()?);
+    (dpc1_checksum(&bytes[DPC1_HEADER_LEN..]) == crc).then(|| bytes.split_off(DPC1_HEADER_LEN))
+}
+
+#[allow(dead_code)]
+fn dpc1_write_payload(
+    path: &std::path::Path,
+    digest: &[u8; 32],
+    payload: &[u8],
+) -> Result<(), String> {
+    if payload.len() > DPC1_MAX_PAYLOAD {
+        return Err("datapack cache payload too large".into());
+    }
+    let parent = path.parent().ok_or("cache path has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let sequence = DPC1_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".datapacks-{}-{sequence}.tmp", std::process::id()));
+    let write = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(DPC1_MAGIC)?;
+        file.write_all(&DPC1_VERSION.to_le_bytes())?;
+        file.write_all(digest)?;
+        file.write_all(&(payload.len() as u64).to_le_bytes())?;
+        file.write_all(&dpc1_checksum(payload).to_le_bytes())?;
+        file.write_all(payload)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write.map_err(|e| e.to_string())
+}
+
+/// The persisted subset is the complete extended recipe/tag registry,
+/// pack-format verdicts, lossless loot JSON, and all seven parsed dynamic
+/// registry categories. The core loader owns additional independent live
+/// stores (functions, crafted recipes, advancement state, etc.).
+#[derive(Default)]
+#[allow(dead_code)]
+struct Dpc1Snapshot {
+    pub registry: DatapackRegistry,
+    pub pack_verdicts: std::collections::BTreeMap<String, PackFormatVerdict>,
+    pub loot_json: std::collections::BTreeMap<String, String>,
+    pub dynamic: DynamicDataRegistries,
+}
+
+#[allow(dead_code)]
+struct Dpc1Reader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Dpc1Reader<'a> {
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(len)?;
+        let data = self.bytes.get(self.offset..end)?;
+        self.offset = end;
+        Some(data)
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        Some(*self.take(1)?.first()?)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn i64(&mut self) -> Option<i64> {
+        Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn len(&mut self) -> Option<usize> {
+        let n = self.u32()? as usize;
+        (n <= DPC1_MAX_ENTRIES).then_some(n)
+    }
+    fn string(&mut self) -> Option<String> {
+        let n = self.u32()? as usize;
+        if n > DPC1_MAX_STRING {
+            return None;
+        }
+        Some(std::str::from_utf8(self.take(n)?).ok()?.to_owned())
+    }
+    fn strings(&mut self) -> Option<Vec<String>> {
+        let n = self.len()?;
+        (0..n).map(|_| self.string()).collect()
+    }
+    fn ingredients(&mut self) -> Option<Vec<Ingr>> {
+        let n = self.len()?;
+        (0..n)
+            .map(|_| match self.byte()? {
+                0 => Some(Ingr::Item(self.i64()?)),
+                1 => Some(Ingr::Tag(self.string()?)),
+                _ => None,
+            })
+            .collect()
+    }
+    fn smithing(&mut self) -> Option<SmithingRecipe> {
+        let template = self.ingredients()?;
+        let base = self.ingredients()?;
+        let addition = self.ingredients()?;
+        let result = match self.byte()? {
+            0 => None,
+            1 => Some(self.i64()?),
+            _ => return None,
+        };
+        Some(SmithingRecipe {
+            template,
+            base,
+            addition,
+            result,
+        })
+    }
+    fn map(&mut self) -> Option<std::collections::BTreeMap<String, String>> {
+        let n = self.len()?;
+        let mut map = std::collections::BTreeMap::new();
+        for _ in 0..n {
+            if map.insert(self.string()?, self.string()?).is_some() {
+                return None;
+            }
+        }
+        Some(map)
+    }
+}
+
+#[allow(dead_code)]
+fn dpc1_u32_into(out: &mut Vec<u8>, v: usize) {
+    out.extend_from_slice(&(v as u32).to_le_bytes());
+}
+
+#[allow(dead_code)]
+fn dpc1_string_into(out: &mut Vec<u8>, value: &str) {
+    dpc1_u32_into(out, value.len());
+    out.extend_from_slice(value.as_bytes());
+}
+
+#[allow(dead_code)]
+fn dpc1_strings_into(out: &mut Vec<u8>, list: &[String]) {
+    dpc1_u32_into(out, list.len());
+    for entry in list {
+        dpc1_string_into(out, entry);
+    }
+}
+
+#[allow(dead_code)]
+fn dpc1_ingredients_into(out: &mut Vec<u8>, list: &[Ingr]) {
+    dpc1_u32_into(out, list.len());
+    for ing in list {
+        match ing {
+            Ingr::Item(item) => {
+                out.push(0);
+                out.extend_from_slice(&item.to_le_bytes());
+            }
+            Ingr::Tag(tag) => {
+                out.push(1);
+                dpc1_string_into(out, tag);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn dpc1_smithing_into(out: &mut Vec<u8>, recipe: &SmithingRecipe) {
+    dpc1_ingredients_into(out, &recipe.template);
+    dpc1_ingredients_into(out, &recipe.base);
+    dpc1_ingredients_into(out, &recipe.addition);
+    match recipe.result {
+        None => out.push(0),
+        Some(item) => {
+            out.push(1);
+            out.extend_from_slice(&item.to_le_bytes());
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn dpc1_map_into(out: &mut Vec<u8>, map: &std::collections::BTreeMap<String, String>) {
+    dpc1_u32_into(out, map.len());
+    for (key, value) in map {
+        dpc1_string_into(out, key);
+        dpc1_string_into(out, value);
+    }
+}
+
+#[allow(dead_code)]
+fn dpc1_encode(snapshot: &Dpc1Snapshot) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut categories: Vec<_> = snapshot.registry.tags.iter().collect();
+    categories.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    dpc1_u32_into(&mut out, categories.len());
+    for (category, tags) in categories {
+        dpc1_string_into(&mut out, category);
+        let mut sorted: Vec<_> = tags.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        dpc1_u32_into(&mut out, sorted.len());
+        for (name, members) in sorted {
+            dpc1_string_into(&mut out, name);
+            dpc1_strings_into(&mut out, members);
+        }
+    }
+    dpc1_u32_into(&mut out, snapshot.registry.stonecutting.len());
+    for item in &snapshot.registry.stonecutting {
+        dpc1_ingredients_into(&mut out, &item.ingredients);
+        out.extend_from_slice(&item.result.to_le_bytes());
+        out.push(item.count);
+    }
+    for recipes in [
+        &snapshot.registry.smithing_transform,
+        &snapshot.registry.smithing_trim,
+    ] {
+        dpc1_u32_into(&mut out, recipes.len());
+        for recipe in recipes {
+            dpc1_smithing_into(&mut out, recipe);
+        }
+    }
+    dpc1_map_into(&mut out, &snapshot.registry.special_recipes);
+    dpc1_u32_into(&mut out, snapshot.pack_verdicts.len());
+    for (name, verdict) in &snapshot.pack_verdicts {
+        dpc1_string_into(&mut out, name);
+        match verdict {
+            PackFormatVerdict::Compatible => out.push(0),
+            PackFormatVerdict::TooOld {
+                max_supported: PackVersion(major, minor),
+            } => {
+                out.push(1);
+                out.extend_from_slice(&major.to_le_bytes());
+                out.extend_from_slice(&minor.to_le_bytes());
+            }
+            PackFormatVerdict::TooNew {
+                min_supported: PackVersion(major, minor),
+            } => {
+                out.push(2);
+                out.extend_from_slice(&major.to_le_bytes());
+                out.extend_from_slice(&minor.to_le_bytes());
+            }
+            PackFormatVerdict::Invalid => out.push(3),
+        }
+    }
+    dpc1_map_into(&mut out, &snapshot.loot_json);
+    // The raw source for each dynamic entry is retained by the reader.
+    // Reusing read_entry keeps derived fields consistent with source JSON.
+    let mut dynamic = std::collections::BTreeMap::new();
+    macro_rules! add_dynamic {
+        ($field:ident, $kind:literal) => {
+            for (name, value) in &snapshot.dynamic.$field {
+                dynamic.insert(format!("{}/{}", $kind, name), value.raw.clone());
+            }
+        };
+    }
+    add_dynamic!(enchantment, "enchantment");
+    add_dynamic!(damage_type, "damage_type");
+    add_dynamic!(chat_type, "chat_type");
+    add_dynamic!(wolf_variant, "wolf_variant");
+    add_dynamic!(painting_variant, "painting_variant");
+    add_dynamic!(banner_pattern, "banner_pattern");
+    add_dynamic!(jukebox_song, "jukebox_song");
+    dpc1_map_into(&mut out, &dynamic);
+    (out.len() <= DPC1_MAX_PAYLOAD).then_some(out)
+}
+
+#[allow(dead_code)]
+fn dpc1_decode(bytes: &[u8]) -> Option<Dpc1Snapshot> {
+    let mut reader = Dpc1Reader { bytes, offset: 0 };
+    let mut snapshot = Dpc1Snapshot::default();
+    for _ in 0..reader.len()? {
+        let category = reader.string()?;
+        let mut tags = HashMap::new();
+        for _ in 0..reader.len()? {
+            if tags.insert(reader.string()?, reader.strings()?).is_some() {
+                return None;
+            }
+        }
+        if snapshot.registry.tags.insert(category, tags).is_some() {
+            return None;
+        }
+    }
+    for _ in 0..reader.len()? {
+        let ingredients = reader.ingredients()?;
+        let result = reader.i64()?;
+        let count = reader.byte()?;
+        if count == 0 || count > 64 {
+            return None;
+        }
+        snapshot.registry.stonecutting.push(StonecuttingRecipe {
+            ingredients,
+            result,
+            count,
+        });
+    }
+    for recipes in [
+        &mut snapshot.registry.smithing_transform,
+        &mut snapshot.registry.smithing_trim,
+    ] {
+        for _ in 0..reader.len()? {
+            recipes.push(reader.smithing()?);
+        }
+    }
+    snapshot.registry.special_recipes = reader.map()?;
+    for _ in 0..reader.len()? {
+        let name = reader.string()?;
+        let verdict = match reader.byte()? {
+            0 => PackFormatVerdict::Compatible,
+            1 => PackFormatVerdict::TooOld {
+                max_supported: PackVersion(reader.u32()?, reader.u32()?),
+            },
+            2 => PackFormatVerdict::TooNew {
+                min_supported: PackVersion(reader.u32()?, reader.u32()?),
+            },
+            3 => PackFormatVerdict::Invalid,
+            _ => return None,
+        };
+        if snapshot.pack_verdicts.insert(name, verdict).is_some() {
+            return None;
+        }
+    }
+    snapshot.loot_json = reader.map()?;
+    for (kind_and_id, body) in reader.map()? {
+        let (kind, id) = kind_and_id.split_once('/')?;
+        let (namespace, resource) = id.split_once(':')?;
+        if namespace.is_empty() || resource.is_empty() {
+            return None;
+        }
+        let path = format!("data/{namespace}/{kind}/{resource}.json");
+        snapshot.dynamic.read_entry(&path, &body);
+        let accepted = match kind {
+            "enchantment" => snapshot.dynamic.enchantment.contains_key(id),
+            "damage_type" => snapshot.dynamic.damage_type.contains_key(id),
+            "chat_type" => snapshot.dynamic.chat_type.contains_key(id),
+            "wolf_variant" => snapshot.dynamic.wolf_variant.contains_key(id),
+            "painting_variant" => snapshot.dynamic.painting_variant.contains_key(id),
+            "banner_pattern" => snapshot.dynamic.banner_pattern.contains_key(id),
+            "jukebox_song" => snapshot.dynamic.jukebox_song.contains_key(id),
+            _ => false,
+        };
+        if !accepted {
+            return None;
+        }
+    }
+    (reader.offset == bytes.len()).then_some(snapshot)
+}
+
+/// Optional integration boundary. Cache failure (including an unreadable
+/// input tree) always falls back to building from the original data.
+#[allow(dead_code)]
+fn dpc1_load_or_build<F>(
+    root: &std::path::Path,
+    enabled_order: &[String],
+    cache_dir: Option<&std::path::Path>,
+    build: F,
+) -> Result<(Dpc1Snapshot, bool), String>
+where
+    F: FnOnce() -> Result<Dpc1Snapshot, String>,
+{
+    let digest = cache_dir.and_then(|_| compute_datapack_tree_digest(root, enabled_order).ok());
+    if let (Some(directory), Some(digest)) = (cache_dir, digest) {
+        let path = dpc1_cache_path(directory);
+        if let Some(snapshot) = dpc1_read_payload(&path, &digest).and_then(|b| dpc1_decode(&b)) {
+            return Ok((snapshot, true));
+        }
+    }
+    let snapshot = build()?;
+    if let (Some(directory), Some(initial)) = (cache_dir, digest) {
+        // A source edit during parsing must not seed a stale hit.
+        if compute_datapack_tree_digest(root, enabled_order).ok() == Some(initial) {
+            if let Some(encoded) = dpc1_encode(&snapshot) {
+                let _ = dpc1_write_payload(&dpc1_cache_path(directory), &initial, &encoded);
+            }
+        }
+    }
+    Ok((snapshot, false))
+}
+
+#[allow(dead_code)]
+fn dpc1_configured_cache_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("MC_SPINE_DATAPACK_CACHE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+#[cfg(test)]
+mod bot_boot_cache_tests {
+    use super::*;
+
+    struct Fixture {
+        dir: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "spine-bot-boot-cache-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn put(&self, rel: &str, value: &[u8]) {
+            let file = self.dir.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, value).unwrap();
+        }
+
+        fn root(&self) -> std::path::PathBuf {
+            self.dir.join("datapacks")
+        }
+        fn cache(&self) -> std::path::PathBuf {
+            self.dir.join("cache")
+        }
+    }
+
+    impl std::ops::Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+
+    fn order(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn build_from_json(root: &std::path::Path, packs: &[String]) -> Result<Dpc1Snapshot, String> {
+        let mut snapshot = Dpc1Snapshot::default();
+        let sources = datapack_sources(root);
+        let mut content = DatapackContent::default();
+        for name in packs {
+            let (_, path, zip) = sources
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .ok_or_else(|| format!("missing {name}"))?;
+            if *zip {
+                return Err("zip test fixture unsupported".into());
+            }
+            let tags = path.join("data/test/tags/item/probe.json");
+            if tags.exists() {
+                let body = std::fs::read_to_string(tags).map_err(|e| e.to_string())?;
+                content.read_tag_entry("item", "test:probe", &body);
+            }
+            let recipe = path.join("data/test/recipe/stone.json");
+            if recipe.exists() {
+                let body = std::fs::read_to_string(recipe).map_err(|e| e.to_string())?;
+                content.read_extended_recipe("test:stone", &body);
+            }
+        }
+        snapshot.registry = content.registry;
+        snapshot.pack_verdicts.insert(
+            "a".into(),
+            PackFormatVerdict::TooNew {
+                min_supported: PackVersion(121, 1),
+            },
+        );
+        snapshot
+            .loot_json
+            .insert("test:loot".into(), "{\"pools\":[]}".into());
+        snapshot.dynamic.read_entry(
+            "data/test/damage_type/probe.json",
+            "{\"message_id\":\"boom\",\"exhaustion\":0.2}",
+        );
+        Ok(snapshot)
+    }
+
+    fn populate(f: &Fixture) {
+        f.put("datapacks/a/pack.mcmeta", br#"{"pack":{"pack_format":48}}"#);
+        f.put(
+            "datapacks/a/data/test/tags/item/probe.json",
+            br#"{"replace":true,"values":["minecraft:stone"]}"#,
+        );
+        f.put("datapacks/a/data/test/recipe/stone.json", br#"{"type":"minecraft:stonecutting","ingredient":{"item":"minecraft:stone"},"result":{"id":"minecraft:diamond","count":2}}"#);
+    }
+
+    #[test]
+    fn bot_boot_cache_sha256_vectors() {
+        for (input, expected) in [
+            (
+                "",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+        ] {
+            let mut h = Dpc1Sha256::new();
+            h.update(input.as_bytes());
+            let hex: String = h.finish().iter().map(|v| format!("{v:02x}")).collect();
+            assert_eq!(hex, expected);
+        }
+        let mut hash = Dpc1Sha256::new();
+        for chunk in vec![b'a'; 1_000_000].chunks(997) {
+            hash.update(chunk);
+        }
+        let hex: String = hash.finish().iter().map(|v| format!("{v:02x}")).collect();
+        assert_eq!(
+            hex,
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        assert_eq!(dpc1_checksum(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn bot_boot_cache_cold_warm_identical_registry_and_auxiliary_data() {
+        let f = Fixture::new();
+        populate(&f);
+        let names = order(&["a"]);
+        let root = f.root();
+        let (cold, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            build_from_json(&root, &names)
+        })
+        .unwrap();
+        assert!(!hit);
+        let cache_bytes = std::fs::read(f.cache().join("datapacks.dpc1")).unwrap();
+        assert!(cache_bytes.starts_with(DPC1_MAGIC));
+        let (warm, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            panic!("cache hit must skip JSON parsing")
+        })
+        .unwrap();
+        assert!(hit);
+        assert_eq!(dpc1_encode(&cold), dpc1_encode(&warm));
+        assert_eq!(warm.registry.stonecutting.len(), 1);
+        assert_eq!(warm.registry.stonecutting[0].count, 2);
+        assert_eq!(
+            warm.registry.tags["item"]["test:probe"],
+            ["minecraft:stone"]
+        );
+        assert_eq!(warm.pack_verdicts["a"], cold.pack_verdicts["a"]);
+        assert_eq!(warm.loot_json, cold.loot_json);
+        assert_eq!(warm.dynamic.damage_type["test:probe"].message_id, "boom");
+    }
+
+    #[test]
+    fn bot_boot_cache_disabled_uses_builder_every_time() {
+        let f = Fixture::new();
+        populate(&f);
+        let root = f.root();
+        let names = order(&["a"]);
+        for _ in 0..2 {
+            let (_, hit) =
+                dpc1_load_or_build(&root, &names, None, || build_from_json(&root, &names)).unwrap();
+            assert!(!hit);
+        }
+        assert!(!f.cache().exists());
+    }
+
+    #[test]
+    fn bot_boot_cache_snapshot_cold_warm_timing() {
+        let f = Fixture::new();
+        f.put("datapacks/a/pack.mcmeta", br#"{"pack":{"pack_format":48}}"#);
+        for index in 0..500 {
+            f.put(
+                &format!("datapacks/a/data/test/tags/item/tag_{index}.json"),
+                format!(r#"{{"values":["minecraft:stone","minecraft:dirt","minecraft:diamond","minecraft:coal","minecraft:iron_ingot","minecraft:gold_ingot","minecraft:emerald","minecraft:oak_log","minecraft:birch_log","minecraft:acacia_log","minecraft:netherite_ingot","minecraft:lapis_lazuli"]}}"#).as_bytes(),
+            );
+        }
+        let root = f.root();
+        let names = order(&["a"]);
+        let build = || {
+            let mut snapshot = Dpc1Snapshot::default();
+            for index in 0..500 {
+                let file = root.join(format!("a/data/test/tags/item/tag_{index}.json"));
+                let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+                let mut content = DatapackContent::default();
+                content.read_tag_entry("item", &format!("test:tag_{index}"), &text);
+                snapshot
+                    .registry
+                    .tags
+                    .entry("item".into())
+                    .or_default()
+                    .extend(content.registry.tags.remove("item").unwrap_or_default());
+            }
+            Ok(snapshot)
+        };
+        let start = std::time::Instant::now();
+        let (cold, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), build).unwrap();
+        let cold_time = start.elapsed();
+        assert!(!hit);
+        let start = std::time::Instant::now();
+        let (warm, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            panic!("unexpected cold build")
+        })
+        .unwrap();
+        let warm_time = start.elapsed();
+        assert!(hit);
+        assert_eq!(dpc1_encode(&cold), dpc1_encode(&warm));
+        println!("DPC1 snapshot path (500 JSON files): cold={cold_time:?}, warm={warm_time:?}");
+    }
+
+    #[test]
+    fn bot_boot_cache_single_byte_edit_add_remove_and_metadata() {
+        let f = Fixture::new();
+        populate(&f);
+        let names = order(&["a"]);
+        let root = f.root();
+        let digest = compute_datapack_tree_digest(&root, &names).unwrap();
+        let (_, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            build_from_json(&root, &names)
+        })
+        .unwrap();
+        assert!(!hit);
+        f.put(
+            "datapacks/a/data/test/tags/item/probe.json",
+            br#"{"replace":true,"values":["minecraft:stove"]}"#,
+        );
+        assert_ne!(compute_datapack_tree_digest(&root, &names).unwrap(), digest);
+        let (new, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            build_from_json(&root, &names)
+        })
+        .unwrap();
+        assert!(!hit);
+        assert_eq!(new.registry.tags["item"]["test:probe"], ["minecraft:stove"]);
+        let edit_digest = compute_datapack_tree_digest(&root, &names).unwrap();
+        f.put("datapacks/a/pack.mcmeta", br#"{"pack":{"pack_format":49}}"#);
+        assert_ne!(
+            compute_datapack_tree_digest(&root, &names).unwrap(),
+            edit_digest
+        );
+        let (_, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            build_from_json(&root, &names)
+        })
+        .unwrap();
+        assert!(!hit, "pack.mcmeta edit must invalidate cache");
+        f.put("datapacks/a/data/test/new.txt", b"new");
+        let with_extra = compute_datapack_tree_digest(&root, &names).unwrap();
+        let (_, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            build_from_json(&root, &names)
+        })
+        .unwrap();
+        assert!(!hit, "added datapack file must invalidate cache");
+        std::fs::remove_file(f.root().join("a/data/test/new.txt")).unwrap();
+        assert_ne!(
+            compute_datapack_tree_digest(&root, &names).unwrap(),
+            with_extra
+        );
+        let (_, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            build_from_json(&root, &names)
+        })
+        .unwrap();
+        assert!(!hit, "removed datapack file must invalidate cache");
+    }
+
+    #[test]
+    fn bot_boot_cache_zip_raw_bytes_invalidation() {
+        let f = Fixture::new();
+        populate(&f);
+        f.put("datapacks/extra.zip", b"raw archive A");
+        let names = order(&["a", "extra.zip"]);
+        let before = compute_datapack_tree_digest(&f.root(), &names).unwrap();
+        f.put("datapacks/extra.zip", b"raw archive B");
+        let after = compute_datapack_tree_digest(&f.root(), &names).unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn bot_boot_cache_order_change_and_disabled_pack() {
+        let f = Fixture::new();
+        populate(&f);
+        f.put(
+            "datapacks/b/data/test/tags/item/probe.json",
+            br#"{"replace":true,"values":["minecraft:dirt"]}"#,
+        );
+        let root = f.root();
+        let ab = order(&["a", "b"]);
+        let ba = order(&["b", "a"]);
+        let (first, hit) =
+            dpc1_load_or_build(&root, &ab, Some(&f.cache()), || build_from_json(&root, &ab))
+                .unwrap();
+        assert!(!hit);
+        assert_eq!(
+            first.registry.tags["item"]["test:probe"],
+            ["minecraft:dirt"]
+        );
+        assert_ne!(
+            compute_datapack_tree_digest(&root, &ab).unwrap(),
+            compute_datapack_tree_digest(&root, &ba).unwrap()
+        );
+        let (second, hit) =
+            dpc1_load_or_build(&root, &ba, Some(&f.cache()), || build_from_json(&root, &ba))
+                .unwrap();
+        assert!(!hit);
+        assert_eq!(
+            second.registry.tags["item"]["test:probe"],
+            ["minecraft:stone"]
+        );
+        assert_ne!(
+            compute_datapack_tree_digest(&root, &ba).unwrap(),
+            compute_datapack_tree_digest(&root, &order(&["a"])).unwrap()
+        );
+    }
+
+    #[test]
+    fn bot_boot_cache_every_byte_corruption_and_truncation_falls_back() {
+        let f = Fixture::new();
+        populate(&f);
+        let names = order(&["a"]);
+        let root = f.root();
+        let path = f.cache().join("datapacks.dpc1");
+        dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            build_from_json(&root, &names)
+        })
+        .unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        for index in 0..valid.len() {
+            let mut changed = valid.clone();
+            changed[index] ^= 1;
+            std::fs::write(&path, changed).unwrap();
+            let (_, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+                build_from_json(&root, &names)
+            })
+            .unwrap();
+            assert!(!hit, "flipped byte at {index} passed validation");
+        }
+        for len in 0..valid.len() {
+            std::fs::write(&path, &valid[..len]).unwrap();
+            let (_, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+                build_from_json(&root, &names)
+            })
+            .unwrap();
+            assert!(!hit, "truncated cache length {len} passed validation");
+        }
+        let mut wrong_schema = valid.clone();
+        wrong_schema[4..8].copy_from_slice(&2_u32.to_le_bytes());
+        std::fs::write(&path, wrong_schema).unwrap();
+        let (_, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            build_from_json(&root, &names)
+        })
+        .unwrap();
+        assert!(!hit, "schema version mismatch must invalidate cache");
+        std::fs::write(&path, valid).unwrap();
+        let (_, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
+            panic!("valid snapshot missed")
+        })
+        .unwrap();
+        assert!(hit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bot_boot_cache_symlink_escape_fails_closed() {
+        let f = Fixture::new();
+        populate(&f);
+        std::os::unix::fs::symlink("/etc/passwd", f.root().join("a/data/test/escape.json"))
+            .unwrap();
+        assert!(compute_datapack_tree_digest(&f.root(), &order(&["a"])).is_err());
+        let (_, hit) = dpc1_load_or_build(&f.root(), &order(&["a"]), Some(&f.cache()), || {
+            Ok(Dpc1Snapshot::default())
+        })
+        .unwrap();
+        assert!(!hit);
+        assert!(!f.cache().join("datapacks.dpc1").exists());
+    }
+}
+
 /// One `{"item"|"tag": ...}` slot or a bare `"ns:id"` member.
 fn dp_ingredient(spec: &str) -> Option<Ingr> {
     if let Some(t) = jstr(spec, "tag") {
