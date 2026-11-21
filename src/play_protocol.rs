@@ -123,6 +123,20 @@ fn decode_packet(
     let id = read_protocol_i32(&mut payload)?;
     (id >= 0).then(|| (i64::from(id), payload.to_vec()))
 }
+
+/// The ceiling an *inflated* play frame may occupy, from `/megu policy set
+/// max_frame_mib <2..=32>`. The wire prefix still cannot describe more than
+/// vanilla's three-byte VarInt bound — this governs the decompressed payload
+/// only, so raising it admits modded frames whose compressed bodies stay
+/// small. The default `2` lands exactly on `ingress_guard::MAX_PLAY_FRAME`.
+fn live_play_frame_bound() -> usize {
+    ((live_server_policy()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .max_frame_mib as usize)
+        << 20)
+        - 1
+}
 // Buffered frame reader for the consume loop: a mid-frame timeout must NOT
 // drop already-read bytes. Dropped length bytes desync the stream -> garbage
 // length fields -> repeated <=16MiB allocs -> allocator arena churn -> the OOM.
@@ -177,7 +191,7 @@ impl RxBuf {
             .copied()
             .collect();
         self.buf.drain(..total);
-        let (id, payload) = decode_packet(body, self.compression, ingress_guard::MAX_PLAY_FRAME)?;
+        let (id, payload) = decode_packet(body, self.compression, live_play_frame_bound())?;
         Some(Some(RxOut::Frame(id, payload)))
     }
     fn next(&mut self, s: &mut TcpStream) -> RxOut {
@@ -4622,40 +4636,82 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Opt-in minimap policy (`MC_SPINE_FAIR_PLAY`, default **off**). The Xaero
-/// fair-play control code `§f§a§i§r§x§a§e§r§o` is only ever emitted when the
-/// operator armed the flag — a client that did not ask for enforcement must
-/// never see it. The two `allow` switches record what a fair-play server
-/// still permits: they default off under fair-play, on otherwise.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Opt-in minimap policy (`MC_SPINE_FAIR_PLAY` and `/megu policy`
+/// `minimap_mode`, both default **off**). The Xaero fair-play control code
+/// `§f§a§i§r§x§a§e§r§o` is only ever emitted when the operator armed the flag
+/// or the live policy restricts the map — a client that did not ask for
+/// enforcement must never see it. The two `allow` switches record what a
+/// fair-play server still permits: they default off under fair-play, on
+/// otherwise.
+#[derive(Clone, Debug, PartialEq)]
 struct MapFairPlayPolicy {
     fair_play: bool,
     allow_cave_map: bool,
     allow_entity_radar: bool,
+    /// The `§`-coded Xaero control signal the join sends once, verbatim; an
+    /// empty signal means the client stays on its own defaults.
+    control: String,
 }
 
 fn map_fair_play_policy() -> MapFairPlayPolicy {
-    let fair_play = env_flag("MC_SPINE_FAIR_PLAY");
+    let env_fair_play = env_flag("MC_SPINE_FAIR_PLAY");
     let allow = |name: &str| {
         std::env::var_os(name)
             .map(|_| env_flag(name))
-            .unwrap_or(!fair_play)
+            .unwrap_or(!env_fair_play)
+    };
+    // POLICY-CMD joins the env knobs: `minimap_mode` `unrestricted` adds
+    // nothing, `fair_play` gates each feature on the granular `allow_*`
+    // switches and `disabled` is the full lock — the same resolution
+    // `server.properties` and the integrated client spell.
+    let live = live_server_policy()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let allow_cave_map = allow("MC_SPINE_ALLOW_CAVE_MAP") && live.allow_cave_map;
+    let allow_entity_radar =
+        allow("MC_SPINE_ALLOW_ENTITY_RADAR") && live.allow_mob_radar;
+    let live_restricted = live.minimap_mode != "unrestricted";
+    let control = if env_fair_play
+        || live.minimap_mode == "disabled"
+        || (live_restricted && !allow_cave_map && !allow_entity_radar)
+    {
+        // The env flag keeps its historical meaning — the full lock — and
+        // `disabled` takes the same code: Xaero's protocol has no dedicated
+        // disable signal, so the fair-play lock is the strongest there is.
+        String::from("§f§a§i§r§x§a§e§r§o")
+    } else if !live_restricted {
+        String::new()
+    } else {
+        // `fair_play` with something still allowed: reset, then the
+        // selective `§`-code for each feature the policy denies.
+        let mut signal = String::from("§r§e§s§e§t§x§a§e§r§o");
+        if !allow_cave_map {
+            signal.push_str("§n§o§c§a§v§e§m§a§p§x§a§e§r§o");
+        }
+        if !allow_entity_radar {
+            signal.push_str("§n§o§e§n§t§i§t§y§r§a§d§a§r§x§a§e§r§o");
+        }
+        signal
     };
     MapFairPlayPolicy {
-        fair_play,
-        allow_cave_map: allow("MC_SPINE_ALLOW_CAVE_MAP"),
-        allow_entity_radar: allow("MC_SPINE_ALLOW_ENTITY_RADAR"),
+        fair_play: env_fair_play || live_restricted,
+        allow_cave_map,
+        allow_entity_radar,
+        control,
     }
 }
 
 /// The system-chat control codes a joining client needs, as encoded `0x6c`
-/// payloads. Empty unless fair-play is armed: default (`unset`/`0`) emits
-/// zero codes, `MC_SPINE_FAIR_PLAY=1` emits `§f§a§i§r§x§a§e§r§o` exactly once.
+/// payloads. Empty while no restriction applies: default (`unset`/`0` env and
+/// `minimap_mode` `unrestricted`) emits zero codes, while an armed env flag,
+/// `/megu policy set minimap_mode fair_play|disabled` or a denied `allow_*`
+/// switch emits the resolved `§`-coded signal exactly once.
 fn map_fair_play_join_chats(policy: &MapFairPlayPolicy) -> Vec<Vec<u8>> {
-    if !policy.fair_play {
+    if policy.control.is_empty() {
         return Vec::new();
     }
-    vec![system_chat("§f§a§i§r§x§a§e§r§o")]
+    vec![system_chat(&policy.control)]
 }
 
 /// Velocity "modern forwarding" gate (`MC_SPINE_VELOCITY_FORWARDING=1`). When
@@ -6091,9 +6147,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         // drops/xp/mobs stream via interest_tick (distance-gated)
     }
     let me_cleanup = me.clone();
-    // Opt-in minimap fair-play (`MC_SPINE_FAIR_PLAY`, default off): the control
-    // code goes out once here, on play join. Off by default — nothing is sent
-    // unless the operator armed the flag.
+    // Opt-in minimap fair-play (`MC_SPINE_FAIR_PLAY` or `/megu policy`
+    // `minimap_mode`, default off): the control code goes out once here, on
+    // play join. Off by default — nothing is sent unless the operator armed
+    // the flag or restricted the map.
     {
         let policy = map_fair_play_policy();
         if policy.fair_play {
@@ -8327,7 +8384,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let body = {
                         let mut stats = player_stats().lock().unwrap();
                         let stats = stats.entry(me.uuid).or_insert_with(PlayerStats::new);
-                        handle_client_stats_request(stats)
+                        // P8b-2: the protocol-767 `award_stats` payload comes
+                        // from the P8b-2 codec over the live counter book —
+                        // same `(category, stat, value)` triples the save codec
+                        // encodes, in `BTreeMap` order.
+                        let entries: Vec<(u8, i32, i32)> = stats
+                            .counts
+                            .iter()
+                            .map(|(&(category, stat_id), &value)| {
+                                (category.id() as u8, stat_id, value)
+                            })
+                            .collect();
+                        encode_award_stats_0x04(&entries)
                     };
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x04, body);
                 } else if action == Some(0) && sl.is_empty() {

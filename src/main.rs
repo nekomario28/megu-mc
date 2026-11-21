@@ -8653,50 +8653,15 @@ impl RedstoneBlockWorld for LiveRedstoneWorld<'_> {
     }
 
     fn analog_signal(&self, pos @ RsPos(x, y, z): RsPos) -> Option<u8> {
-        let state = self.state_at(pos);
-        let fullness = |stack: &Stack| (u32::from(stack.1), stack_max_of(stack) as u32);
-        if self.reg.name_of(state) == "minecraft:brewing_stand" {
-            let stands = live_brewing_stands().lock().unwrap();
-            let slots = stands
-                .get(&(self.dim, x, y, z))
-                .map(|entry| entry.menu.slots.iter().map(fullness).collect::<Vec<_>>())
-                .unwrap_or_default();
-            return Some(container_analog_output_signal(&slots, 5));
-        }
-        let size = match self.reg.name_of(state) {
-            "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => 27,
-            "minecraft:dispenser" | "minecraft:dropper" => 9,
-            "minecraft:hopper" => 5,
-            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
-                let furnaces = furnaces().lock().unwrap();
-                let slots = furnaces
-                    .get(&(self.dim, x, y, z))
-                    .map(|f| [&f.input, &f.fuel, &f.output].map(fullness));
-                return Some(container_analog_output_signal(
-                    slots.as_ref().map_or(&[], |s| &s[..]),
-                    3,
-                ));
-            }
-            _ => return None,
-        };
-        let chests = chests().lock().unwrap();
-        let window = chest_window_dim(self.dim, x, y, z);
-        let containers = [Some(window.0), window.1];
-        let slots = containers
-            .into_iter()
-            .flatten()
-            .flat_map(|key| {
-                chests
-                    .get(&key)
-                    .into_iter()
-                    .flat_map(|slots| slots.values())
-            })
-            .map(fullness)
-            .collect::<Vec<_>>();
-        Some(container_analog_output_signal(
-            &slots,
-            size * if window.1.is_some() { 2 } else { 1 },
-        ))
+        // The positional read still records into `reads` like every other
+        // accessor on this world view. The answer itself delegates to the one
+        // live comparator reader: the W-BE store and the materialized block
+        // entities (lectern, chiseled bookshelf, jukebox, decorated pot,
+        // crafter, brewing stand, spawner) first, then the classic container
+        // fullness for chests, barrels, dispensers, droppers, hoppers and
+        // furnaces, in whichever dimension this pass runs in.
+        self.state_at(pos);
+        live_comparator_signal_at(self.dim, x, y, z)
     }
 
     fn apply_redstone_change(&mut self, pos: RsPos, state: u32, comparator_output: Option<u8>) {
@@ -14259,6 +14224,191 @@ fn compute_safe_initial_world_spawn() -> (f64, f64, f64) {
     find_safe_world_spawn(DimId::Overworld)
 }
 
+/// A beacon pulse granted or refreshed on one client: survival/adventure and
+/// alive only, an equal-or-stronger entry already counting past the new
+/// duration is left alone, and the 0x76 notification reaches the player and
+/// their trackers — the same wire shape `live_mob_player_effect` sends.
+fn w_be_grant_effect(client: &Client, id: i32, amp: i32, game_ticks: i32) {
+    if !matches!(*client.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 2)
+        || *client.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+    {
+        return;
+    }
+    let ticks = server_ticks(game_ticks.max(0) as u64) as i32;
+    let mut effects = client.effs.lock().unwrap_or_else(|e| e.into_inner());
+    if effects
+        .iter()
+        .any(|effect| effect.id == id && effect.amp >= amp && effect.left >= ticks)
+    {
+        return;
+    }
+    effects.retain(|effect| effect.id != id);
+    effects.push(Eff {
+        id,
+        amp,
+        left: ticks,
+    });
+    drop(effects);
+    let packet = entity_effect_pkt(client.eid, id, amp, ticks);
+    if let Ok(mut sock) = client.sock.lock() {
+        let _ = send_packet(&mut sock, 0x76, packet.clone());
+    }
+    broadcast_seen_ex(client.eid, client.eid, |_| (0x76, packet.clone()));
+}
+
+/// The `block_entities` stage of `game_tick`: advances every registered W-BE
+/// block entity (campfires, brewing stands, mob spawners, jukeboxes and
+/// beacons) and commits the emitted effects — cooked items and ejected glass
+/// bottles as live drops, spawner attempts as live mobs, beacon pulses as
+/// refreshed player effects. The registry check keeps an untouched world at
+/// zero cost: no lock beyond the emptiness read, no RNG draw, no payload
+/// drift — `the_tick_preserves_the_saved_world_payload_byte_for_byte` holds.
+fn world_block_entity_tick() {
+    // One registry scan per tick: the dimensions that actually hold W-BE
+    // entities. Empty world (the payload-parity case) pays a single lock and
+    // no RNG draw; a world with entities ticks only the dimensions present.
+    let dims: Vec<DimId> = {
+        let store = world_block_entity_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut dims: Vec<DimId> = store.keys().map(|(dim, ..)| *dim).collect();
+        dims.sort_unstable();
+        dims.dedup();
+        dims
+    };
+    if dims.is_empty() {
+        return;
+    }
+    with_save_guard(|| {
+        let clients = client_snapshot();
+        let world_tick = TICK_IDX.load(Ordering::Relaxed);
+        for dim in dims {
+            // The beacon event's `player` indexes this slice, so the client
+            // list and the position list must come from one filtered pass in
+            // the same order.
+            let players: Vec<Arc<Client>> = clients
+                .iter()
+                .filter(|c| {
+                    !c.is_spectator()
+                        && *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == dim
+                })
+                .cloned()
+                .collect();
+            let positions: Vec<[f64; 3]> = players
+                .iter()
+                .map(|c| {
+                    let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    [p.0, p.1, p.2]
+                })
+                .collect();
+            let events = tick_world_block_entities(
+                dim,
+                world_tick,
+                &positions,
+                crate::world_rng::next_u64(),
+            );
+            for event in events {
+                match event {
+                    WorldBlockEntityEvent::Cooked { pos, item, .. } => {
+                        // Item entities currently live in the Overworld
+                        // simulation — the bound `remove_live_brewing_stand`
+                        // already drops by.
+                        if dim == DimId::Overworld {
+                            if let Some(item) = name_to_item(&item) {
+                                drop_live_stack(
+                                    (
+                                        f64::from(pos.0) + 0.5,
+                                        f64::from(pos.1) + 0.5,
+                                        f64::from(pos.2) + 0.5,
+                                    ),
+                                    (item, 1, Vec::new()),
+                                );
+                            }
+                        }
+                    }
+                    WorldBlockEntityEvent::Brewed {
+                        pos,
+                        ejected_glass_bottle,
+                    } => {
+                        if ejected_glass_bottle && dim == DimId::Overworld {
+                            if let Some(item) = name_to_item("glass_bottle") {
+                                drop_live_stack(
+                                    (
+                                        f64::from(pos.0) + 0.5,
+                                        f64::from(pos.1) + 0.5,
+                                        f64::from(pos.2) + 0.5,
+                                    ),
+                                    (item, 1, Vec::new()),
+                                );
+                            }
+                        }
+                    }
+                    WorldBlockEntityEvent::Spawn {
+                        entity_id,
+                        location,
+                        ..
+                    } => {
+                        if let Some(etype) = name_to_etype(&entity_id) {
+                            let mut ms =
+                                mobs().lock().unwrap_or_else(|e| e.into_inner());
+                            if ms.len() < MOB_CAP {
+                                let mut uuid = [0u8; 16];
+                                std::fs::File::open("/dev/urandom")
+                                    .and_then(|mut f| f.read_exact(&mut uuid))
+                                    .expect("entity UUID entropy");
+                                uuid[6] = (uuid[6] & 15) | 64;
+                                uuid[8] = (uuid[8] & 63) | 128;
+                                ms.push(Arc::new(Mob {
+                                    dim,
+                                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                    uuid,
+                                    etype,
+                                    pos: Mutex::new((
+                                        location[0], location[1], location[2], 0.0, 0.0,
+                                    )),
+                                    hp: Mutex::new(default_mob_hp(&entity_id)),
+                                    last_hit: Mutex::new(
+                                        Instant::now() - Duration::from_secs(10),
+                                    ),
+                                    hurt_at: Mutex::new(
+                                        Instant::now() - Duration::from_secs(10),
+                                    ),
+                                    last_hurt_tick: Mutex::new(None),
+                                    vel: Mutex::new([0.0; 3]),
+                                    fuse: Mutex::new(0),
+                                    fire_ticks: Mutex::new(0),
+                                    love: Mutex::new(0),
+                                    air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+                                }));
+                            }
+                        }
+                    }
+                    WorldBlockEntityEvent::BeaconEffect {
+                        player,
+                        effect,
+                        amplifier,
+                        duration_ticks,
+                        ..
+                    } => {
+                        let Some(client) = players.get(player) else {
+                            continue;
+                        };
+                        let Some(id) = name_to_effect(&effect) else {
+                            continue;
+                        };
+                        w_be_grant_effect(
+                            client,
+                            id,
+                            i32::from(amplifier),
+                            duration_ticks,
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// The live hotspot profiler fed by every real `game_tick` is the SAME
 /// `OnceLock` `/profile` reads (`live_hotspot_profiler` in
 /// `teams_and_commands.rs`) — a second instance would record tick timings a
@@ -14322,6 +14472,11 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("hoppers", hopper_tick);
     run("brewing", live_brewing_tick);
     run("spawners", spawner_tick);
+    // The chunk-source pass' block entities: campfire cooks, brewing timers,
+    // spawner attempts, jukebox bookkeeping, beacon pulses. The stage itself
+    // short-circuits on an empty W-BE registry, so an untouched world pays
+    // nothing and keeps the saved payload bit-identical.
+    run("block_entities", world_block_entity_tick);
     run("random_ticks", random_tick_pass);
     run("player_menus", live_menu_tick);
     run("plugins", plugin_tick);
@@ -17893,5 +18048,399 @@ mod p8a_parity_tests {
         GR_DISABLE_RAIDS.store(0, Ordering::Relaxed);
         assert!(!gr_disable_raids());
         GR_DISABLE_RAIDS.store(saved, Ordering::Relaxed);
+    }
+}
+
+/// Lane W3 live-wire coverage: the four seams this lane connected — the
+/// comparator analog read through `live_comparator_signal_at`, the W-BE
+/// registry through the `block_entities` `game_tick` stage, the live policy
+/// into the join fair-play signal and play frame bound, and the P8b-2
+/// `award_stats` encoder behind C2S `ClientCommand` action 1.
+#[cfg(test)]
+mod w3_live_wire_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BinaryHeap};
+    use std::env;
+
+    /// Records an overlay block write so the original cell (set or absent)
+    /// goes back exactly — the same discipline `DimCells` uses in
+    /// `p8a_parity_tests`, which lives in a different test module.
+    struct LiveCells(Vec<(DimId, i32, i32, i32, Option<u32>)>);
+    impl LiveCells {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+        fn set(&mut self, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+            let key = (dim, x >> 4, z >> 4);
+            let cell = local_idx(x, y, z);
+            let prev = {
+                let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+                let chunk = w.entry(key).or_default();
+                let prev = chunk.get(&cell).copied();
+                chunk.insert(cell, st);
+                prev
+            };
+            self.0.push((dim, x, y, z, prev));
+        }
+    }
+    impl std::ops::Drop for LiveCells {
+        fn drop(&mut self) {
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            for (dim, x, y, z, prev) in self.0.drain(..).rev() {
+                if let Some(chunk) = w.get_mut(&(dim, x >> 4, z >> 4)) {
+                    match prev {
+                        Some(st) => {
+                            chunk.insert(local_idx(x, y, z), st);
+                        }
+                        None => {
+                            chunk.remove(&local_idx(x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn redstone_world<'a>(
+        state: &'a mut LiveRedstoneState,
+        dim: DimId,
+        reg: &'static BReg,
+    ) -> LiveRedstoneWorld<'a> {
+        LiveRedstoneWorld {
+            dim,
+            reg,
+            state,
+            now: 0,
+            reads: std::cell::RefCell::new(BTreeMap::new()),
+            writes: BTreeMap::new(),
+            dispensers: Vec::new(),
+        }
+    }
+
+    fn empty_redstone_state() -> LiveRedstoneState {
+        LiveRedstoneState {
+            comparator_outputs: BTreeMap::new(),
+            torches: BTreeMap::new(),
+            ticks: BinaryHeap::new(),
+            pending: BTreeMap::new(),
+            sequence: 0,
+        }
+    }
+
+    /// Runs one `game_tick` but only the named stage — proof the stage is
+    /// registered in the live tick loop, without letting the whole world tick.
+    fn run_tick_stage(stage: &'static str) {
+        {
+            let mut ctl = tick_controller()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ctl.frozen = false;
+            ctl.step_remaining = 0;
+            ctl.sprint_remaining = 0;
+        }
+        let mut ran = false;
+        game_tick(|name, tick| {
+            if name == stage {
+                tick();
+                ran = true;
+            }
+        });
+        assert!(ran, "game_tick must schedule the {stage} stage");
+    }
+
+    /// #1: `LiveRedstoneWorld::analog_signal` answers through
+    /// `live_comparator_signal_at` — a W-BE jukebox with a record reads its
+    /// disc's comparator output while a bare position still reads nothing.
+    #[test]
+    fn w3_live_wire_comparator_reads_w_be_signal() {
+        crate::test_support::require_vanilla_data();
+        let Some(reg) = breg() else { return };
+        let _guard = world_guard();
+        let dim = DimId::Overworld;
+        let pos = (2_530_001, 200, -2_530_001);
+        let jukebox_state = reg.state_of("minecraft:jukebox", None);
+        let mut cells = LiveCells::new();
+        cells.set(dim, pos.0, pos.1, pos.2, jukebox_state);
+        assert!(register_world_block_entity(
+            dim,
+            pos,
+            VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
+                record_item: Some("minecraft:music_disc_cat".into()),
+                ticks_since_song_started: 0,
+            }),
+        )
+        .is_none());
+        let mut state = empty_redstone_state();
+        let (loaded, empty_at) = {
+            let world = redstone_world(&mut state, dim, reg);
+            (
+                world.analog_signal(RsPos(pos.0, pos.1, pos.2)),
+                world.analog_signal(RsPos(pos.0 + 8, pos.1, pos.2)),
+            )
+        };
+        remove_world_block_entity(dim, pos);
+        // `music_disc_cat`'s jukebox_song `comparator_output` is 2; an absent
+        // block entity must stay `None` (vanilla "no comparator source").
+        assert_eq!(loaded, Some(2));
+        assert_eq!(empty_at, None);
+    }
+
+    /// #2a: the `block_entities` stage of `game_tick` runs
+    /// `tick_world_block_entities` live — a lit campfire's finished slot
+    /// commits as a cooked-item entity drop, and the jukebox's song timer
+    /// advances in the same pass.
+    #[test]
+    fn w3_live_wire_game_tick_campfire_drop_and_jukebox_advance() {
+        crate::test_support::require_vanilla_data();
+        let Some(reg) = breg() else { return };
+        let _guard = world_guard();
+        let dim = DimId::Overworld;
+        let fire_pos = (2_531_001, 200, -2_531_001);
+        let box_pos = (2_531_009, 200, -2_531_009);
+        let campfire = reg.state_of("minecraft:campfire", None);
+        let mut cells = LiveCells::new();
+        cells.set(
+            dim,
+            fire_pos.0,
+            fire_pos.1,
+            fire_pos.2,
+            reg.with_prop(campfire, "lit", "true"),
+        );
+        let mut fire = CampfireBlockEntity::default();
+        assert!(fire.place("beef", 1).is_some());
+        assert!(register_world_block_entity(
+            dim,
+            fire_pos,
+            VanillaBlockEntity::Campfire(fire),
+        )
+        .is_none());
+        assert!(register_world_block_entity(
+            dim,
+            box_pos,
+            VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
+                record_item: Some("minecraft:music_disc_cat".into()),
+                ticks_since_song_started: 0,
+            }),
+        )
+        .is_none());
+        let base_drops = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
+        run_tick_stage("block_entities");
+        let cooked = name_to_item("minecraft:cooked_beef").expect("item id");
+        let dropped = drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .skip(base_drops)
+            .any(|drop| {
+                drop.item == cooked
+                    && drop.cnt == 1
+                    && (drop.x - (f64::from(fire_pos.0) + 0.5)).abs() < f64::EPSILON
+                    && (drop.z - (f64::from(fire_pos.2) + 0.5)).abs() < f64::EPSILON
+            });
+        drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .truncate(base_drops);
+        let VanillaBlockEntity::Jukebox(jukebox) =
+            remove_world_block_entity(dim, box_pos).expect("jukebox")
+        else {
+            panic!("jukebox must still be registered")
+        };
+        let VanillaBlockEntity::Campfire(fire) =
+            remove_world_block_entity(dim, fire_pos).expect("campfire")
+        else {
+            panic!("campfire must still be registered")
+        };
+        assert!(dropped, "cooked beef must appear as a live item drop");
+        assert!(fire.slots.iter().all(Option::is_none));
+        assert_eq!(jukebox.ticks_since_song_started, 1);
+    }
+
+    /// #2b: the same stage grants a beacon's effect pulse — a level-1 pyramid
+    /// under a live beacon must reach a nearby survival client through
+    /// `w_be_grant_effect` (and the 0x76 packet path).
+    #[test]
+    fn w3_live_wire_game_tick_beacon_grants_effect() {
+        crate::test_support::require_vanilla_data();
+        let Some(reg) = breg() else { return };
+        let _guard = world_guard();
+        let dim = DimId::Overworld;
+        let pos = (2_532_001, 250, -2_532_001);
+        let iron = reg.state_of("minecraft:iron_block", None);
+        let beacon_state = reg.state_of("minecraft:beacon", None);
+        let mut cells = LiveCells::new();
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                cells.set(dim, pos.0 + dx, pos.1 - 1, pos.2 + dz, iron);
+            }
+        }
+        cells.set(dim, pos.0, pos.1, pos.2, beacon_state);
+        assert!(register_world_block_entity(
+            dim,
+            pos,
+            VanillaBlockEntity::Beacon(BeaconBlockEntity {
+                levels: 1,
+                primary_effect: Some("minecraft:haste".into()),
+                secondary_effect: None,
+            }),
+        )
+        .is_none());
+        let (mut client, _receiver) = crate::effect_tests::client_pair();
+        client.eid = 0x7A33;
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (f64::from(pos.0) + 1.5, f64::from(pos.1) + 2.0, f64::from(pos.2) + 1.5, 0.0, 0.0, true);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(client));
+        // The beacon fires on `world_tick % 80 == 0`; game_tick advances
+        // TICK_IDX once before the stage runs.
+        let saved_tick = TICK_IDX.swap(79, Ordering::Relaxed);
+        run_tick_stage("block_entities");
+        TICK_IDX.store(saved_tick, Ordering::Relaxed);
+        let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
+        let client = cls
+            .iter()
+            .find(|c| c.eid == 0x7A33)
+            .cloned()
+            .expect("client still connected");
+        cls.retain(|c| c.eid != 0x7A33);
+        drop(cls);
+        remove_world_block_entity(dim, pos);
+        let effects = client.effs.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            effects
+                .iter()
+                .any(|eff| eff.id == 2 && eff.amp == 0 && eff.left > 0),
+            "haste (effect id 2) must be granted by the live beacon pulse"
+        );
+    }
+
+    /// #3: `live_server_policy()` joins `MC_SPINE_FAIR_PLAY` at the join
+    /// decision — `unrestricted` sends nothing, `fair_play` sends the reset
+    /// plus selective deny codes, `disabled` sends the full lock — and
+    /// `max_frame_mib` scales the decompressed play-frame bound.
+    #[test]
+    fn w3_live_wire_policy_minimap_signal_and_frame_bound() {
+        let _guard = world_guard();
+        const ENVS: [&str; 3] = [
+            "MC_SPINE_FAIR_PLAY",
+            "MC_SPINE_ALLOW_CAVE_MAP",
+            "MC_SPINE_ALLOW_ENTITY_RADAR",
+        ];
+        let saved_env: Vec<Option<std::ffi::OsString>> =
+            ENVS.iter().map(env::var_os).collect();
+        let saved_policy = live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for name in ENVS {
+            env::remove_var(name);
+        }
+        let restore = |saved_env: &[Option<std::ffi::OsString>],
+                       saved_policy: &LiveServerPolicy| {
+            *live_server_policy()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = saved_policy.clone();
+            for (name, value) in ENVS.iter().zip(saved_env) {
+                match value {
+                    Some(v) => env::set_var(name, v),
+                    None => env::remove_var(name),
+                }
+            }
+        };
+        // Default: unrestricted + env unset → vanilla-permissive, zero codes.
+        let policy = map_fair_play_policy();
+        assert!(!policy.fair_play);
+        assert!(map_fair_play_join_chats(&policy).is_empty());
+        // fair_play with all features allowed → the reset signal only.
+        live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .minimap_mode = "fair_play".to_owned();
+        let policy = map_fair_play_policy();
+        assert!(policy.fair_play);
+        assert_eq!(policy.control, "§r§e§s§e§t§x§a§e§r§o");
+        assert_eq!(map_fair_play_join_chats(&policy).len(), 1);
+        // Denying mob radar adds the selective code after the reset.
+        live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .allow_mob_radar = false;
+        let policy = map_fair_play_policy();
+        assert_eq!(
+            policy.control,
+            "§r§e§s§e§t§x§a§e§r§o§n§o§e§n§t§i§t§y§r§a§d§a§r§x§a§e§r§o"
+        );
+        // Denying everything under fair_play collapses to the full lock.
+        live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .allow_cave_map = false;
+        let policy = map_fair_play_policy();
+        assert_eq!(policy.control, "§f§a§i§r§x§a§e§r§o");
+        // `disabled` is the full lock on its own.
+        {
+            let mut p = live_server_policy()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            p.minimap_mode = "disabled".to_owned();
+            p.allow_cave_map = true;
+            p.allow_mob_radar = true;
+        }
+        let policy = map_fair_play_policy();
+        assert_eq!(policy.control, "§f§a§i§r§x§a§e§r§o");
+        // The env flag still forces the lock under an unrestricted policy.
+        {
+            let mut p = live_server_policy()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            p.minimap_mode = "unrestricted".to_owned();
+        }
+        env::set_var("MC_SPINE_FAIR_PLAY", "1");
+        let policy = map_fair_play_policy();
+        assert_eq!(policy.control, "§f§a§i§r§x§a§e§r§o");
+        env::remove_var("MC_SPINE_FAIR_PLAY");
+        // `max_frame_mib` scales the decompressed frame bound.
+        live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .max_frame_mib = 16;
+        assert_eq!(live_play_frame_bound(), (16usize << 20) - 1);
+        live_server_policy()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .max_frame_mib = 2;
+        assert_eq!(live_play_frame_bound(), ingress_guard::MAX_PLAY_FRAME);
+        restore(&saved_env, &saved_policy);
+    }
+
+    /// #4: the `award_stats` payload C2S `ClientCommand` action 1 now encodes
+    /// through the P8b-2 `encode_award_stats_0x04` codec — byte-identical to
+    /// the stats-request encoder it replaced, and it decodes through the same
+    /// live `award_stats` wire decoder.
+    #[test]
+    fn w3_live_wire_award_stats_uses_p8b2_codec() {
+        let mut stats = PlayerStats::new();
+        stats.increment(StatCategory::Custom, 42, 7);
+        stats.increment(StatCategory::Mined, 3, 11);
+        stats.increment(StatCategory::Dropped, 9, 2);
+        // The exact mapping the live 0x09 handler applies to the stat book.
+        let entries: Vec<(u8, i32, i32)> = stats
+            .counts
+            .iter()
+            .map(|(&(category, stat_id), &value)| {
+                (category.id() as u8, stat_id, value)
+            })
+            .collect();
+        let payload = encode_award_stats_0x04(&entries);
+        assert_eq!(
+            payload,
+            handle_client_stats_request(&stats),
+            "the live handler must emit the same award_stats payload"
+        );
+        let decoded =
+            decode_award_stats(&mut &payload[..]).expect("valid 0x04 payload");
+        assert_eq!(decoded.counts, stats.counts);
     }
 }
