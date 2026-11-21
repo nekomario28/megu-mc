@@ -13,6 +13,113 @@ use crate::json::{jbool, jparse, J};
 use crate::generation_math::*;
 use crate::trace_env::{env_flag, env_str};
 
+// ---------- worldgen datapack parse diagnostics ----------
+
+/// One worldgen datapack entry that failed to parse: the datapack directory
+/// family (`configured_feature`, `placed_feature`, `configured_carver` or
+/// `surface_rule`), the resource id, and why the loader refused it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorldgenParseError {
+    pub kind: &'static str,
+    pub id: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for WorldgenParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}: {}", self.kind, self.id, self.reason)
+    }
+}
+
+impl std::error::Error for WorldgenParseError {}
+
+/// The worldgen datapack parse failures one load saw, in the order they
+/// happened. A clean report means nothing was dropped.
+#[derive(Clone, Debug, Default)]
+pub struct WorldgenParseReport {
+    pub errors: Vec<WorldgenParseError>,
+}
+
+impl WorldgenParseReport {
+    /// No recorded failures.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_clean(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// The recorded failures of one datapack family, in load order.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn of_kind<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> impl Iterator<Item = &'a WorldgenParseError> + 'a {
+        self.errors.iter().filter(move |e| e.kind == kind)
+    }
+
+    /// Record one failure: a one-line warning on stderr, kept for queries.
+    pub(crate) fn fail(
+        &mut self,
+        kind: &'static str,
+        id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> WorldgenParseError {
+        let e = WorldgenParseError {
+            kind,
+            id: id.into(),
+            reason: reason.into(),
+        };
+        eprintln!("worldgen parse error: {e}");
+        self.errors.push(e.clone());
+        e
+    }
+}
+
+static WG_PARSE_REPORT: Mutex<WorldgenParseReport> =
+    Mutex::new(WorldgenParseReport { errors: Vec::new() });
+
+/// The process-wide worldgen parse diagnostics: every failure any registry or
+/// generator load has recorded, in the order it happened.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn last_worldgen_parse_report() -> WorldgenParseReport {
+    WG_PARSE_REPORT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Merge one loader's findings into the process-wide report.
+pub(crate) fn publish_worldgen_parse_report(rep: &WorldgenParseReport) {
+    if rep.errors.is_empty() {
+        return;
+    }
+    WG_PARSE_REPORT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .errors
+        .extend(rep.errors.iter().cloned());
+}
+
+/// Record one failure straight into the process-wide report, for loaders that
+/// do not carry a local report.
+pub(crate) fn record_worldgen_parse_error(
+    kind: &'static str,
+    id: impl Into<String>,
+    reason: impl Into<String>,
+) -> WorldgenParseError {
+    let mut rep = WorldgenParseReport::default();
+    let e = rep.fail(kind, id, reason);
+    publish_worldgen_parse_report(&rep);
+    e
+}
+
+/// `MC_SPINE_STRICT_WORLDGEN=1` opts a load into fail-closed parsing: the first
+/// failure in any of the four worldgen datapack families aborts the load
+/// (`Err` / refusal) instead of continuing with the entry dropped. Read per
+/// call, never cached, so a test can toggle it between loads.
+pub(crate) fn strict_worldgen_parse() -> bool {
+    std::env::var("MC_SPINE_STRICT_WORLDGEN").as_deref() == Ok("1")
+}
+
 // ---------- density functions ----------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2123,6 +2230,11 @@ pub struct Gen {
     feat_hm: HashMap<(i32, i32), (i32, i32)>,
     // Each generator owns its pending ticks; only the active world's handles are published.
     generated_ticks: GeneratedTickQueues,
+    /// The most precise `(id, reason)` a failed surface-rule parse recorded on
+    /// the way out, committed to [`WorldgenParseReport`] only when the load
+    /// actually gives up. Parser probes that never reach the load site leave it
+    /// set but unreported.
+    rule_diag: Option<(String, String)>,
 }
 
 /// Generation-stamped, zero-allocation scratch memo for the corner-grid fill.
@@ -3467,6 +3579,7 @@ impl Gen {
             mineshaft_spawners: HashSet::new(),
             payload_sources: HashSet::new(),
             feat_hm: HashMap::new(),
+            rule_diag: None,
             generated_ticks: GeneratedTickQueues::default(),
         };
         // noise settings (sea level, bounds, router names)
@@ -3729,7 +3842,10 @@ impl Gen {
             if let Some(rule) = ns.get("surface_rule").or_else(|| ns.get("material_rule")) {
                 g.surface_rule = g.rule_node(rule, &files, &rfiles, &cfiles, res);
                 if g.surface_rule.is_none() {
-                    Self::load_trace("noise_settings surface_rule/material_rule did not resolve");
+                    let e = g.surface_rule_load_failure(preset);
+                    Self::load_trace(&format!(
+                        "noise_settings surface_rule/material_rule did not resolve: {e}"
+                    ));
                     return None;
                 }
                 if let Some(root) = g.surface_rule {
@@ -3831,6 +3947,29 @@ impl Gen {
         }
     }
 
+    /// The `(id, reason)` pair a failed surface-rule parse leaves for the load
+    /// site: the innermost failure is the most precise, so the first writer
+    /// wins and later `?` propagations only keep it.
+    fn note_rule_diag(&mut self, id: String, reason: String) {
+        if self.rule_diag.is_none() {
+            self.rule_diag = Some((id, reason));
+        }
+    }
+
+    /// Commit the pending surface-rule diagnostic into the process-wide report
+    /// and return the error; called at the one place a failed rule load gives
+    /// up. The surface rule is the generator's only surface pipeline, so the
+    /// load already refuses: this makes the refusal name what it lost.
+    fn surface_rule_load_failure(&mut self, preset: NoisePreset) -> WorldgenParseError {
+        let (id, reason) = self.rule_diag.take().unwrap_or_else(|| {
+            (
+                format!("minecraft:{}", preset.name()),
+                "surface_rule/material_rule did not resolve".to_string(),
+            )
+        });
+        record_worldgen_parse_error("surface_rule", id, reason)
+    }
+
     fn resolve_rule(
         &mut self,
         name: &str,
@@ -3846,6 +3985,7 @@ impl Gen {
             Self::load_trace(&format!(
                 "surface rule reference {name:?}: missing or invalid JSON"
             ));
+            self.note_rule_diag(name.to_string(), "missing or invalid JSON".to_string());
             return None;
         };
         let idx = self.rules.len();
@@ -3854,6 +3994,7 @@ impl Gen {
         let Some(r) = self.parse_rule(&j, files, rf, cf, res) else {
             self.rule_ids.remove(name);
             Self::load_trace(&format!("surface rule reference {name:?}: did not parse"));
+            self.note_rule_diag(name.to_string(), "did not parse".to_string());
             return None;
         };
         self.rules[idx] = r;
@@ -3873,12 +4014,22 @@ impl Gen {
             J::Obj(_) => {
                 let Some(r) = self.parse_rule(j, files, rf, cf, res) else {
                     Self::load_trace(&format!("surface rule did not parse: {j:?}"));
+                    self.note_rule_diag(
+                        format!("minecraft:{}", self.preset.name()),
+                        "surface rule node did not parse".to_string(),
+                    );
                     return None;
                 };
                 self.rules.push(r);
                 Some(self.rules.len() - 1)
             }
-            _ => None,
+            _ => {
+                self.note_rule_diag(
+                    format!("minecraft:{}", self.preset.name()),
+                    "surface rule node is not a name or object".to_string(),
+                );
+                None
+            }
         }
     }
 
@@ -3936,6 +4087,10 @@ impl Gen {
             }
             _ => {
                 Self::load_trace(&format!("unknown surface rule type {ty:?}"));
+                self.note_rule_diag(
+                    format!("minecraft:{}", self.preset.name()),
+                    format!("unknown surface rule type {ty:?}"),
+                );
                 return None;
             }
         })
@@ -3961,6 +4116,10 @@ impl Gen {
             Self::load_trace(&format!(
                 "surface condition reference {name:?}: missing or invalid JSON"
             ));
+            self.note_rule_diag(
+                name.to_string(),
+                "surface condition: missing or invalid JSON".to_string(),
+            );
             return None;
         };
         let idx = self.conds.len();
@@ -3971,6 +4130,7 @@ impl Gen {
             Self::load_trace(&format!(
                 "surface condition reference {name:?}: did not parse"
             ));
+            self.note_rule_diag(name.to_string(), "surface condition did not parse".to_string());
             return None;
         };
         self.conds[idx] = c;
@@ -3985,7 +4145,13 @@ impl Gen {
                 self.conds.push(c);
                 Some(self.conds.len() - 1)
             }
-            _ => None,
+            _ => {
+                self.note_rule_diag(
+                    format!("minecraft:{}", self.preset.name()),
+                    "surface condition is not a name or object".to_string(),
+                );
+                None
+            }
         }
     }
 
@@ -4086,6 +4252,10 @@ impl Gen {
             "temperature" => Cond::Temperature,
             _ => {
                 Self::load_trace(&format!("unknown surface condition type {ty:?}"));
+                self.note_rule_diag(
+                    format!("minecraft:{}", self.preset.name()),
+                    format!("unknown surface condition type {ty:?}"),
+                );
                 return None;
             }
         })
@@ -8486,6 +8656,7 @@ impl Gen {
             payload_sources: HashSet::new(),
             feat_hm: HashMap::new(),
             generated_ticks: GeneratedTickQueues::default(),
+            rule_diag: None,
         }
     }
 
@@ -13616,6 +13787,68 @@ pub(crate) fn lock_gen_for_tests() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod wg_tests {
     use super::*;
+
+    /// Issue #199: a surface_rule that fails to parse used to give up with only
+    /// a `LOAD_TRACE`-gated line. Now the load records the exact
+    /// `{kind, id, reason}` in the queryable `WorldgenParseReport` — and the
+    /// report must name the file (or rule type) that failed, not just "it
+    /// failed".
+    #[test]
+    fn p8b1_issue199_surface_rule_failures_are_recorded_not_dropped() {
+        crate::test_support::require_vanilla_data();
+        let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack");
+        let empty = HashMap::new();
+        let before = last_worldgen_parse_report().errors.len();
+
+        // An unknown rule type: the deepest failure names the type.
+        let rule = jparse(br#"{"type":"minecraft:bogus_rule"}"#).unwrap();
+        assert!(
+            g.rule_node(&rule, &empty, &empty, &empty, crate::name_to_state)
+                .is_none()
+        );
+        let e = g.surface_rule_load_failure(NoisePreset::Overworld);
+        assert_eq!(e.kind, "surface_rule");
+        assert_eq!(e.id, "minecraft:overworld");
+        assert!(
+            e.reason.contains("unknown surface rule type") && e.reason.contains("bogus_rule"),
+            "the reason must name the refused type: {e}"
+        );
+        let after = last_worldgen_parse_report();
+        assert_eq!(after.errors.len(), before + 1);
+        assert_eq!(after.errors[before], e, "the report is queryable");
+
+        // A dangling material_rule reference names the missing file.
+        let rule = J::Str("test:missing_rule".to_string());
+        assert!(
+            g.rule_node(&rule, &empty, &empty, &empty, crate::name_to_state)
+                .is_none()
+        );
+        let e = g.surface_rule_load_failure(NoisePreset::Overworld);
+        assert_eq!(e.id, "test:missing_rule");
+        assert_eq!(e.reason, "missing or invalid JSON");
+
+        // A node that is neither name nor object is malformed, not skipped.
+        let rule = J::Num(1.0);
+        assert!(
+            g.rule_node(&rule, &empty, &empty, &empty, crate::name_to_state)
+                .is_none()
+        );
+        let e = g.surface_rule_load_failure(NoisePreset::Overworld);
+        assert_eq!(e.reason, "surface rule node is not a name or object");
+    }
+
+    /// The pinned datapack's noise_settings must resolve its surface_rule
+    /// without a single recorded failure.
+    #[test]
+    fn p8b1_issue199_vanilla_gen_load_has_clean_surface_rules() {
+        crate::test_support::require_vanilla_data();
+        let before = last_worldgen_parse_report().of_kind("surface_rule").count();
+        let g = Gen::load(0, crate::name_to_state).expect("pinned pack loads");
+        assert!(g.surface_rule.is_some());
+        assert!(g.rule_diag.is_none(), "a clean load leaves no pending diag");
+        let after = last_worldgen_parse_report().of_kind("surface_rule").count();
+        assert_eq!(after, before, "a clean vanilla load records nothing");
+    }
 
     #[test]
     fn rule_seq_preserves_order_fallback_and_nested_conditions() {

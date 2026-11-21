@@ -5757,7 +5757,121 @@ fn resolve_cf(
     }
 }
 
+/// Best-effort reason a `configured_feature` body refused to parse: an absent
+/// `type` is a missing-field failure, anything else that reaches this point is
+/// a body `p_cf` rejected (an unimplemented type resolves to `Cf::Unknown`,
+/// never `None`).
+fn cf_fail_reason(j: &J) -> String {
+    match jstr(j, "type") {
+        Some(ty) => format!("malformed configured_feature body (type {ty:?})"),
+        None => "missing required field \"type\"".to_string(),
+    }
+}
+
+/// Parse one `configured_feature` file into `reg`. A failure is recorded in
+/// `rep` (one stderr line, queryable after the load) and returned so a strict
+/// load can refuse instead of dropping the entry.
+fn load_cf_entry(
+    reg: &mut FReg,
+    name: &str,
+    b: &[u8],
+    rep: &mut WorldgenParseReport,
+) -> Result<(), WorldgenParseError> {
+    let Some(j) = jparse(b) else {
+        return Err(rep.fail("configured_feature", name, "malformed JSON"));
+    };
+    match p_cf(&j) {
+        Some(cf) => {
+            let idx = reg.cfg_vec.len();
+            reg.cfg_vec.push(cf);
+            reg.cfg.insert(name.to_string(), idx);
+            Ok(())
+        }
+        None => {
+            if env_flag!("CF_UNPARSED") {
+                eprintln!("CFUNPARSED {name}");
+            }
+            Err(rep.fail("configured_feature", name, cf_fail_reason(&j)))
+        }
+    }
+}
+
+/// Best-effort reason a `placed_feature` body refused to parse: mirrors the
+/// `p_pf` contract (a `feature` name or inline body, then the modifier chain).
+fn pf_fail_reason(j: &J) -> String {
+    let f = match js(j, "feature") {
+        Some(f) => f,
+        None => return "missing required field \"feature\"".to_string(),
+    };
+    match f {
+        J::Str(_) => {}
+        o @ J::Obj(_) => {
+            if js(o, "feature").is_some() {
+                return pf_fail_reason(o);
+            }
+            return cf_fail_reason(o);
+        }
+        _ => return "field \"feature\" is not a name or object".to_string(),
+    }
+    if let Some(ms) = jarr(j, "placement") {
+        for m in ms {
+            if p_mod(m).is_none() {
+                return match jstr(m, "type") {
+                    Some(ty) => format!("unsupported placement modifier {ty:?}"),
+                    None => "placement modifier missing required field \"type\"".to_string(),
+                };
+            }
+        }
+    }
+    "placed_feature did not parse".to_string()
+}
+
+/// Parse one `placed_feature` file into the staging list. Same contract as
+/// [`load_cf_entry`]: failures are recorded and returned, never dropped.
+fn load_pf_entry(
+    raw_placed: &mut Vec<(String, Pf)>,
+    placed_idx_map: &mut HashMap<String, usize>,
+    name: String,
+    b: &[u8],
+    rep: &mut WorldgenParseReport,
+) -> Result<(), WorldgenParseError> {
+    let Some(j) = jparse(b) else {
+        return Err(rep.fail("placed_feature", name, "malformed JSON"));
+    };
+    match p_pf(&j) {
+        Some(mut pf) => {
+            pf.name = name.clone();
+            let idx = raw_placed.len();
+            placed_idx_map.insert(name.clone(), idx);
+            raw_placed.push((name, pf));
+            Ok(())
+        }
+        None => Err(rep.fail("placed_feature", name, pf_fail_reason(&j))),
+    }
+}
+
 fn load_freg() -> FReg {
+    let mut rep = WorldgenParseReport::default();
+    let reg = load_freg_report(
+        &mut rep,
+        strict_worldgen_parse(),
+        &Gen::dp_files_any(&["configured_feature", "feature"]),
+        &Gen::dp_files("placed_feature"),
+        &Gen::dp_files("biome"),
+    );
+    publish_worldgen_parse_report(&rep);
+    // Strict mode fails closed: a registry that dropped an entry reports the
+    // refusal instead of loading a partial feature set.
+    reg.unwrap_or_else(|e| panic!("worldgen parse error: {e}"))
+}
+
+fn load_freg_report(
+    rep: &mut WorldgenParseReport,
+    strict: bool,
+    cf_files: &HashMap<String, Vec<u8>>,
+    pf_files: &HashMap<String, Vec<u8>>,
+    biome_files: &HashMap<String, Vec<u8>>,
+) -> Result<FReg, WorldgenParseError> {
     let mut reg = FReg {
         cfg: HashMap::new(),
         cfg_vec: Vec::new(),
@@ -5776,36 +5890,25 @@ fn load_freg() -> FReg {
         order: HashMap::new(),
         step_entries: HashMap::new(),
     };
-    for (name, b) in Gen::dp_files_any(&["configured_feature", "feature"]) {
-        if let Some(j) = jparse(&b) {
-            match p_cf(&j) {
-                Some(cf) => {
-                    let idx = reg.cfg_vec.len();
-                    reg.cfg_vec.push(cf);
-                    reg.cfg.insert(name, idx);
-                }
-                None => {
-                    if env_flag!("CF_UNPARSED") {
-                        eprintln!("CFUNPARSED {name}");
-                    }
-                }
+    for (name, b) in cf_files {
+        if let Err(e) = load_cf_entry(&mut reg, name, b, rep) {
+            if strict {
+                return Err(e);
             }
         }
     }
     let mut raw_placed: Vec<(String, Pf)> = Vec::new();
     let mut placed_idx_map: HashMap<String, usize> = HashMap::new();
-    for (name, b) in Gen::dp_files("placed_feature") {
-        if let Some(j) = jparse(&b) {
-            if let Some(mut pf) = p_pf(&j) {
-                pf.name = name.clone();
-                let idx = raw_placed.len();
-                placed_idx_map.insert(name.clone(), idx);
-                raw_placed.push((name, pf));
+    for (name, b) in pf_files {
+        if let Err(e) = load_pf_entry(&mut raw_placed, &mut placed_idx_map, name.clone(), b, rep)
+        {
+            if strict {
+                return Err(e);
             }
         }
     }
     let mut frozen_biomes: HashSet<String> = HashSet::new();
-    for (name, b) in Gen::dp_files("biome") {
+    for (name, b) in biome_files {
         if let Some(j) = jparse(&b) {
             if let Some(t) = jnum(&j, "temperature") {
                 reg.btemp.insert(name.clone(), t as f32);
@@ -5859,7 +5962,7 @@ fn load_freg() -> FReg {
             }
             reg.ball
                 .insert(name.clone(), steps.iter().flatten().cloned().collect());
-            reg.bsteps.insert(name, steps);
+            reg.bsteps.insert(name.clone(), steps);
         }
     }
     // Compact biome -> bit index over every biome that declares features.
@@ -5936,7 +6039,7 @@ fn load_freg() -> FReg {
     // is unchanged: once *any* generation settings loaded, a possible biome
     // without them still panics instead of silently ordering nothing.
     if reg.bsteps.is_empty() {
-        return reg;
+        return Ok(reg);
     }
     // The order source is a runtime read now, so a stripped checkout still
     // compiles: with a populated registry the pinned table is required, and a
@@ -6007,7 +6110,7 @@ fn load_freg() -> FReg {
         reg.step_entries.insert(preset, step_entries);
         reg.order.insert(preset, order);
     }
-    reg
+    Ok(reg)
 }
 
 fn sort_features(reg: &FReg, biomes: &[&str], max_steps: usize) -> FeatureOrder {
@@ -9348,7 +9451,71 @@ pub(crate) fn creg() -> &'static CarverReg {
     R.get_or_init(load_creg)
 }
 
+/// Best-effort reason a `configured_carver` body refused to parse: an absent
+/// `type` is a missing-field failure, an unlisted `type` is unsupported, and a
+/// listed one that still failed has a malformed `config`.
+fn carver_fail_reason(j: &J) -> String {
+    let Some(ty) = jstr(j, "type") else {
+        return "missing required field \"type\"".to_string();
+    };
+    match ty.rsplit(':').next().unwrap_or(&ty) {
+        "cave" | "nether_cave" | "canyon" => match js(j, "config") {
+            Some(_) => format!("malformed {ty} carver config (missing or invalid field)"),
+            None => "missing required field \"config\"".to_string(),
+        },
+        _ => format!("unsupported carver type {ty:?}"),
+    }
+}
+
+/// Parse one `configured_carver` file into `reg`. A failure is recorded in
+/// `rep` (one stderr line, queryable after the load) and returned so a strict
+/// load can refuse instead of dropping the entry.
+fn load_carver_entry(
+    reg: &mut CarverReg,
+    by_name: &mut HashMap<String, usize>,
+    name: &str,
+    b: &[u8],
+    rep: &mut WorldgenParseReport,
+) -> Result<(), WorldgenParseError> {
+    let Some(j) = jparse(b) else {
+        return Err(rep.fail("configured_carver", name, "malformed JSON"));
+    };
+    match p_carver(&j) {
+        Some(d) => {
+            // The registry is `&'static` and each carver is immutable, so leaking the
+            // definition lets both `cfg` and `defs` own a stable `&'static` reference.
+            let d: &'static CarverDef = Box::leak(Box::new(d));
+            let idx = reg.defs.len();
+            reg.cfg.insert(name.to_string(), d);
+            reg.defs.push(d);
+            by_name.insert(name.to_string(), idx);
+            Ok(())
+        }
+        // A carver type this port does not implement must not silently
+        // become a different algorithm: it stays out of the registry and
+        // the miss is reported once.
+        None => Err(rep.fail("configured_carver", name, carver_fail_reason(&j))),
+    }
+}
+
 fn load_creg() -> CarverReg {
+    let mut rep = WorldgenParseReport::default();
+    let reg = load_creg_report(
+        &mut rep,
+        strict_worldgen_parse(),
+        &Gen::dp_files("configured_carver"),
+        &Gen::dp_files("biome"),
+    );
+    publish_worldgen_parse_report(&rep);
+    reg.unwrap_or_else(|e| panic!("worldgen parse error: {e}"))
+}
+
+fn load_creg_report(
+    rep: &mut WorldgenParseReport,
+    strict: bool,
+    carver_files: &HashMap<String, Vec<u8>>,
+    biome_files: &HashMap<String, Vec<u8>>,
+) -> Result<CarverReg, WorldgenParseError> {
     let mut reg = CarverReg {
         cfg: HashMap::new(),
         defs: Vec::new(),
@@ -9356,27 +9523,15 @@ fn load_creg() -> CarverReg {
         biome_resolved: HashMap::new(),
     };
     let mut by_name: HashMap<String, usize> = HashMap::new();
-    for (name, b) in Gen::dp_files("configured_carver") {
-        if let Some(j) = jparse(&b) {
-            match p_carver(&j) {
-                Some(d) => {
-                    // The registry is `&'static` and each carver is immutable, so leaking the
-                    // definition lets both `cfg` and `defs` own a stable `&'static` reference.
-                    let d: &'static CarverDef = Box::leak(Box::new(d));
-                    let idx = reg.defs.len();
-                    reg.cfg.insert(name.clone(), d);
-                    reg.defs.push(d);
-                    by_name.insert(name, idx);
-                }
-                // A carver type this port does not implement must not silently
-                // become a different algorithm: it stays out of the registry and
-                // the miss is reported once.
-                None => eprintln!("[carver] unsupported configured_carver {name}"),
+    for (name, b) in carver_files {
+        if let Err(e) = load_carver_entry(&mut reg, &mut by_name, name, b, rep) {
+            if strict {
+                return Err(e);
             }
         }
     }
-    for (name, b) in Gen::dp_files("biome") {
-        if let Some(list) = jparse(&b).and_then(|j| carver_list(&j)) {
+    for (name, b) in biome_files {
+        if let Some(list) = jparse(b).and_then(|j| carver_list(&j)) {
             // Resolve every name once. Keep unknown names as a sentinel entry so the
             // seed offset (`k`, the list position) stays exactly as before.
             let resolved = list
@@ -9387,10 +9542,10 @@ fn load_creg() -> CarverReg {
                 })
                 .collect();
             reg.biome_resolved.insert(name.clone(), resolved);
-            reg.biome.insert(name, list);
+            reg.biome.insert(name.clone(), list);
         }
     }
-    reg
+    Ok(reg)
 }
 
 /// 1.21.1 writes `carvers` as `{"air": [...]}` and uses a bare string when the
@@ -12795,6 +12950,272 @@ mod a3a_tests {
             0,
             "the serial reference must not spawn wave workers"
         );
+    }
+}
+
+#[cfg(test)]
+mod p8b1_issue199_tests {
+    // Issue #199: a configured_feature / placed_feature / configured_carver
+    // file that fails to parse used to be dropped with at most an env-gated
+    // trace. These tests pin the structured report (`WorldgenParseReport`),
+    // the default-mode continuation, and the `MC_SPINE_STRICT_WORLDGEN=1`
+    // fail-closed mode.
+    use super::*;
+
+    fn empty_freg() -> FReg {
+        FReg {
+            cfg: HashMap::new(),
+            cfg_vec: Vec::new(),
+            placed: HashMap::new(),
+            placed_vec: Vec::new(),
+            biome_bits: HashMap::new(),
+            ball_masks: HashMap::new(),
+            possibly_cold_mask: 0,
+            bit_ok: true,
+            bsteps: HashMap::new(),
+            ball: HashMap::new(),
+            btemp: HashMap::new(),
+            spawners: HashMap::new(),
+            spawn_costs: HashMap::new(),
+            spawn_probability: HashMap::new(),
+            order: HashMap::new(),
+            step_entries: HashMap::new(),
+        }
+    }
+
+    fn empty_creg() -> CarverReg {
+        CarverReg {
+            cfg: HashMap::new(),
+            defs: Vec::new(),
+            biome: HashMap::new(),
+            biome_resolved: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn p8b1_issue199_configured_feature_failures_are_recorded_not_dropped() {
+        let mut rep = WorldgenParseReport::default();
+        let mut reg = empty_freg();
+
+        let e = load_cf_entry(&mut reg, "test:bad_json", b"{", &mut rep).unwrap_err();
+        assert_eq!(e.kind, "configured_feature");
+        assert_eq!(e.id, "test:bad_json");
+        assert_eq!(e.reason, "malformed JSON");
+
+        let e = load_cf_entry(&mut reg, "test:no_type", br#"{"config":{}}"#, &mut rep)
+            .unwrap_err();
+        assert_eq!(e.id, "test:no_type");
+        assert_eq!(e.reason, "missing required field \"type\"");
+
+        let e = load_cf_entry(
+            &mut reg,
+            "test:bad_disk",
+            br#"{"type":"minecraft:disk"}"#,
+            &mut rep,
+        )
+        .unwrap_err();
+        assert_eq!(e.id, "test:bad_disk");
+        assert!(
+            e.reason.contains("malformed configured_feature body")
+                && e.reason.contains("minecraft:disk"),
+            "reason should name the refused type: {e}"
+        );
+
+        assert_eq!(rep.of_kind("configured_feature").count(), 3);
+        assert_eq!(rep.errors.len(), 3);
+        assert!(
+            reg.cfg.is_empty() && reg.cfg_vec.is_empty(),
+            "a refused entry must not enter the registry"
+        );
+    }
+
+    #[test]
+    fn p8b1_issue199_placed_feature_failures_are_recorded_not_dropped() {
+        let mut rep = WorldgenParseReport::default();
+        let mut raw: Vec<(String, Pf)> = Vec::new();
+        let mut idx: HashMap<String, usize> = HashMap::new();
+
+        let e = load_pf_entry(&mut raw, &mut idx, "test:bad_json".into(), b"{", &mut rep)
+            .unwrap_err();
+        assert_eq!(e.kind, "placed_feature");
+        assert_eq!(e.id, "test:bad_json");
+        assert_eq!(e.reason, "malformed JSON");
+
+        let e = load_pf_entry(
+            &mut raw,
+            &mut idx,
+            "test:no_feature".into(),
+            br#"{"placement":[]}"#,
+            &mut rep,
+        )
+        .unwrap_err();
+        assert_eq!(e.reason, "missing required field \"feature\"");
+
+        let e = load_pf_entry(
+            &mut raw,
+            &mut idx,
+            "test:bad_mod".into(),
+            br#"{"feature":"minecraft:foo","placement":[{"type":"minecraft:bogus_modifier"}]}"#,
+            &mut rep,
+        )
+        .unwrap_err();
+        assert_eq!(e.reason, "unsupported placement modifier \"minecraft:bogus_modifier\"");
+
+        assert_eq!(rep.of_kind("placed_feature").count(), 3);
+        assert!(raw.is_empty() && idx.is_empty());
+    }
+
+    #[test]
+    fn p8b1_issue199_configured_carver_failures_are_recorded_not_dropped() {
+        let mut rep = WorldgenParseReport::default();
+        let mut reg = empty_creg();
+        let mut by_name = HashMap::new();
+
+        let e = load_carver_entry(&mut reg, &mut by_name, "test:bad_json", b"{", &mut rep)
+            .unwrap_err();
+        assert_eq!(e.kind, "configured_carver");
+        assert_eq!(e.id, "test:bad_json");
+        assert_eq!(e.reason, "malformed JSON");
+
+        let e = load_carver_entry(
+            &mut reg,
+            &mut by_name,
+            "test:geyser",
+            br#"{"type":"minecraft:geyser","config":{}}"#,
+            &mut rep,
+        )
+        .unwrap_err();
+        assert_eq!(e.reason, "unsupported carver type \"minecraft:geyser\"");
+
+        let e = load_carver_entry(
+            &mut reg,
+            &mut by_name,
+            "test:no_config",
+            br#"{"type":"minecraft:cave"}"#,
+            &mut rep,
+        )
+        .unwrap_err();
+        assert_eq!(e.reason, "missing required field \"config\"");
+
+        assert_eq!(rep.of_kind("configured_carver").count(), 3);
+        assert!(reg.cfg.is_empty() && reg.defs.is_empty());
+    }
+
+    /// One report collects every family: feeding a malformed entry of each
+    /// kind leaves exactly four `{kind, id, reason}` entries, none dropped.
+    #[test]
+    fn p8b1_issue199_one_report_collects_all_four_kinds() {
+        let mut rep = WorldgenParseReport::default();
+        let mut fr = empty_freg();
+        let _ = load_cf_entry(&mut fr, "test:cf", b"{", &mut rep);
+        let mut raw = Vec::new();
+        let mut idx = HashMap::new();
+        let _ = load_pf_entry(&mut raw, &mut idx, "test:pf".to_string(), b"{", &mut rep);
+        let mut cr = empty_creg();
+        let mut by_name = HashMap::new();
+        let _ = load_carver_entry(&mut cr, &mut by_name, "test:cv", b"{", &mut rep);
+        // The surface-rule arm records through the same channel.
+        rep.fail("surface_rule", "test:sr", "malformed JSON");
+
+        for (kind, id) in [
+            ("configured_feature", "test:cf"),
+            ("placed_feature", "test:pf"),
+            ("configured_carver", "test:cv"),
+            ("surface_rule", "test:sr"),
+        ] {
+            let found: Vec<_> = rep.of_kind(kind).collect();
+            assert_eq!(found.len(), 1, "{kind} must be recorded exactly once");
+            assert_eq!(found[0].id, id);
+            assert_eq!(found[0].reason, "malformed JSON");
+        }
+        assert_eq!(rep.errors.len(), 4);
+    }
+
+    #[test]
+    fn p8b1_issue199_default_mode_continues_strict_mode_refuses() {
+        let bad_cf = HashMap::from([
+            ("test:bad1".to_string(), b"{".to_vec()),
+            ("test:bad2".to_string(), b"{".to_vec()),
+        ]);
+        let empty: HashMap<String, Vec<u8>> = HashMap::new();
+
+        // Default: every failure recorded, the load still completes.
+        let mut rep = WorldgenParseReport::default();
+        let reg = load_freg_report(&mut rep, false, &bad_cf, &empty, &empty).unwrap();
+        assert_eq!(rep.of_kind("configured_feature").count(), 2);
+        assert!(reg.cfg.is_empty());
+
+        // Strict (`MC_SPINE_STRICT_WORLDGEN=1`): the first failure is the `Err`.
+        let mut rep = WorldgenParseReport::default();
+        let e = load_freg_report(&mut rep, true, &bad_cf, &empty, &empty)
+            .err()
+            .expect("strict load must refuse");
+        assert_eq!(e.kind, "configured_feature");
+        assert!(e.id.starts_with("test:bad"), "the refused file: {e}");
+        assert_eq!(rep.errors.len(), 1, "strict aborts at the first failure");
+
+        // Same contract for placed_feature entries.
+        let bad_pf = HashMap::from([("test:pf".to_string(), b"{".to_vec())]);
+        let mut rep = WorldgenParseReport::default();
+        let e = load_freg_report(&mut rep, true, &empty, &bad_pf, &empty)
+            .err()
+            .expect("strict load must refuse");
+        assert_eq!((e.kind, e.id.as_str()), ("placed_feature", "test:pf"));
+
+        // And configured_carver.
+        let mut rep = WorldgenParseReport::default();
+        let e = load_creg_report(&mut rep, true, &bad_pf, &empty)
+            .err()
+            .expect("strict load must refuse");
+        assert_eq!((e.kind, e.id.as_str()), ("configured_carver", "test:pf"));
+        assert_eq!(rep.errors.len(), 1);
+    }
+
+    #[test]
+    fn p8b1_issue199_strict_flag_is_read_per_load() {
+        std::env::set_var("MC_SPINE_STRICT_WORLDGEN", "1");
+        assert!(strict_worldgen_parse());
+        std::env::set_var("MC_SPINE_STRICT_WORLDGEN", "0");
+        assert!(!strict_worldgen_parse());
+        std::env::remove_var("MC_SPINE_STRICT_WORLDGEN");
+        assert!(!strict_worldgen_parse());
+    }
+
+    /// The pinned datapack must load with an empty report: the diagnostic
+    /// exists to name failures, and vanilla has none for these families.
+    #[test]
+    fn p8b1_issue199_vanilla_datapack_reports_zero_parse_failures() {
+        crate::test_support::require_vanilla_data();
+        let mut rep = WorldgenParseReport::default();
+        let reg = load_freg_report(
+            &mut rep,
+            false,
+            &Gen::dp_files_any(&["configured_feature", "feature"]),
+            &Gen::dp_files("placed_feature"),
+            &Gen::dp_files("biome"),
+        )
+        .unwrap();
+        assert!(
+            rep.is_clean(),
+            "vanilla configured/placed features must parse clean: {:?}",
+            rep.errors
+        );
+        assert!(!reg.cfg.is_empty() && !reg.placed_vec.is_empty());
+
+        let mut rep = WorldgenParseReport::default();
+        let reg = load_creg_report(
+            &mut rep,
+            false,
+            &Gen::dp_files("configured_carver"),
+            &Gen::dp_files("biome"),
+        )
+        .unwrap();
+        assert!(
+            rep.is_clean(),
+            "vanilla carvers must parse clean: {:?}",
+            rep.errors
+        );
+        assert!(!reg.defs.is_empty());
     }
 }
 
