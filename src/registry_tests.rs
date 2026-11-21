@@ -1068,7 +1068,7 @@ fn light_values_come_from_the_asset_for_every_state() {
         opacity.iter().filter(|&&v| v > 0).count()
     );
     assert!(
-        opacity.iter().any(|&v| v == 15) && opacity.iter().any(|&v| v == 1),
+        opacity.contains(&15) && opacity.contains(&1),
         "both blocked-light populations must be present"
     );
 }
@@ -1973,7 +1973,7 @@ fn p5_check_spill_scene(label: &str, solid: impl Fn(i32, i32, i32) -> bool) {
         }
     };
 
-    let dense = sky_spill(DimId::Overworld, 0, 0, &floor_of, &opacity);
+    let dense = sky_spill(DimId::Overworld, 0, 0, floor_of, opacity);
     let sparse = p5_reference_sky_spill(0, 0, &floor_of, &opacity);
     // A scene that produced nothing would agree trivially, and one that produced only seeds
     // would never enter the BFS at all.
@@ -2031,7 +2031,7 @@ fn p5_check_spill_scene(label: &str, solid: impl Fn(i32, i32, i32) -> bool) {
         }
     }
     let mut applied = sky_light_sections_from(0, 0, &floors);
-    sky_spill_apply(DimId::Overworld, 0, 0, &floor_of, &opacity, &mut applied);
+    sky_spill_apply(DimId::Overworld, 0, 0, floor_of, opacity, &mut applied);
     let composed = sky_light_sections_with_spill(0, 0, &floors, &sparse);
     assert_eq!(applied, composed, "{label}: the packed payloads differ");
 }
@@ -2314,7 +2314,7 @@ fn m3_p5_hot_path_ab_bench() {
         }));
         let new_spill = time(Box::new(|| {
             let mut out = sky_light_sections_from(0, 0, &floors);
-            sky_spill_apply(DimId::Overworld, 0, 0, &floor_of, &opacity, &mut out);
+            sky_spill_apply(DimId::Overworld, 0, 0, floor_of, opacity, &mut out);
             std::hint::black_box(&out);
         }));
         assert!(cells > 256, "{label}: the scene must spread, got {cells} cells");
@@ -2362,7 +2362,7 @@ fn m3_p5_hot_path_ab_bench() {
         .map(|c| (0..300u32).map(|i| (i * 7 + c, 1u32)).collect())
         .collect();
     let clones = time(Box::new(|| {
-        let copied: Vec<HashMap<u32, u32>> = edited.iter().map(|c| c.clone()).collect();
+        let copied: Vec<HashMap<u32, u32>> = edited.to_vec();
         std::hint::black_box(&copied);
     }));
     eprintln!(

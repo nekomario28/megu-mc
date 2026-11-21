@@ -5396,7 +5396,8 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
     let creeper_seed = CLEAR_MIDNIGHT_PACK_SEED;
     // The spider seed also steps straight to the isolated supported column.
     let spider_seed = 1629;
-    let cases: [(&str, u64, &[(i32, i32, u32)], Option<i64>); 10] = [
+    type SpawnCase<'a> = (&'a str, u64, &'a [(i32, i32, u32)], Option<i64>);
+    let cases: [SpawnCase<'_>; 10] = [
         (
             "clear stone supports a creeper",
             creeper_seed,
@@ -5613,7 +5614,7 @@ fn chunk_delivery_path_bench() {
             let base = block_at(x, 64, z);
             let mut n = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let st = if n % 2 == 0 { base } else { 0 };
+                let st = if n.is_multiple_of(2) { base } else { 0 };
                 let _ = set_block_if(x, 64, z, st, None);
                 n += 1;
                 std::thread::sleep(std::time::Duration::from_micros(2000));
@@ -5781,7 +5782,8 @@ fn chunk_delivery_digest() {
     };
     // Two seeds and three sweep directions. The switch prefetches the +x neighbour, so a
     // +z sweep exercises the case where the prefetched chunk is not the one delivered next.
-    let mut changed: Vec<(u64, (i32, i32), (i32, i32))> = Vec::new();
+    type ChangedChunk = (u64, (i32, i32), (i32, i32));
+    let mut changed: Vec<ChangedChunk> = Vec::new();
     for seed in [0u64, 60007] {
         for dir in [(1, 0), (0, 1), (-1, 0)] {
             let plain = sweep(seed, dir, false, &mut gen_sources);
@@ -6845,7 +6847,7 @@ fn a_removed_container_closes_the_window_built_on_it() {
     let (viewer, mut receiver) = chest_viewer(1, pos);
     *viewer.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = Some((ContainerKey::ow(pos), None));
     let closed = invalidate_container_windows(
-        &[viewer.clone()],
+        std::slice::from_ref(&viewer),
         ContainerKey::ow(pos),
         &[pos],
     );
@@ -6864,7 +6866,7 @@ fn a_removed_container_closes_the_window_built_on_it() {
     );
     // Second time round there is nothing to close and the count does not move.
     let again =
-        invalidate_container_windows(&[viewer.clone()], ContainerKey::ow(pos), &[pos]);
+        invalidate_container_windows(std::slice::from_ref(&viewer), ContainerKey::ow(pos), &[pos]);
     assert_eq!(again, 0);
     assert!(frames_on(&mut receiver).is_empty());
     set_block(pos.0, pos.1, pos.2, 0);
@@ -8604,7 +8606,7 @@ fn travel_contract_4d_horizontal_collision_lift_and_climbable() {
     );
     travel_4d_close(
         climbing.vel,
-        [0.0, 0.15500000238418579, 0.0],
+        [0.0, 0.155_000_002_384_185_8, 0.0],
         "climbable lift 0.2d then 0.8f",
     );
 }
@@ -9701,7 +9703,7 @@ fn p2_c_uniform_sections_emitters_match_cell_by_cell() {
             publish_section(dim, cx, cz, sec_idx * 16 + min_y, sec.clone());
         }
         let _ = chunk_data(cx, cz, dim, &mut gen);
-        gen.get(&(cx, cz)).map(|v| v.clone()).unwrap_or_default()
+        gen.get(&(cx, cz)).cloned().unwrap_or_default()
     };
 
     let torch = name_to_state("torch").expect("torch in the pinned registry");
@@ -9751,9 +9753,9 @@ fn p2_c_uniform_sections_emitters_match_cell_by_cell() {
     // Mixed section: `uniform_state` is None, the cell-by-cell path runs, and the
     // emit list still matches the cell-by-cell reference of the same states.
     let mut mixed = [name_to_state("stone").expect("stone"); 4096];
-    for idx in 0..4096usize {
+    for (idx, state) in mixed.iter_mut().enumerate() {
         if idx % 3 == 0 {
-            mixed[idx] = torch;
+            *state = torch;
         }
     }
     let sec = PalettedSection::pack(&mixed, &|_| false, &|_| false);

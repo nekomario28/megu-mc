@@ -133,8 +133,10 @@ fn alternatives_picks_first_child_whose_conditions_pass() {
         eval_entry(json, &LootContext::default(), 1),
         vec![item("minecraft:golden_apple", 1)]
     );
-    let mut ctx = LootContext::default();
-    ctx.killed_by_player = true;
+    let ctx = LootContext {
+        killed_by_player: true,
+        ..Default::default()
+    };
     assert_eq!(
         eval_entry(json, &ctx, 1),
         vec![item("minecraft:apple", 1)]
@@ -170,8 +172,10 @@ fn group_expands_every_child_that_passes() {
         eval_entry(json, &LootContext::default(), 1),
         vec![item("minecraft:stone", 3), item("minecraft:gravel", 1)]
     );
-    let mut ctx = LootContext::default();
-    ctx.killed_by_player = true;
+    let ctx = LootContext {
+        killed_by_player: true,
+        ..Default::default()
+    };
     assert_eq!(
         eval_entry(json, &ctx, 1),
         vec![
@@ -197,8 +201,10 @@ fn sequence_stops_at_the_first_failing_child() {
         eval_entry(json, &LootContext::default(), 1),
         vec![item("minecraft:stone", 1)]
     );
-    let mut ctx = LootContext::default();
-    ctx.killed_by_player = true;
+    let ctx = LootContext {
+        killed_by_player: true,
+        ..Default::default()
+    };
     assert_eq!(
         eval_entry(json, &ctx, 1),
         vec![
@@ -226,8 +232,10 @@ fn nested_alternatives_and_sequence_compose() {
         eval_entry(json, &LootContext::default(), 1),
         vec![item("minecraft:gravel", 1)]
     );
-    let mut ctx = LootContext::default();
-    ctx.killed_by_player = true;
+    let ctx = LootContext {
+        killed_by_player: true,
+        ..Default::default()
+    };
     assert_eq!(
         eval_entry(json, &ctx, 1),
         vec![item("minecraft:stone", 1), item("minecraft:dirt", 1)]
@@ -287,8 +295,10 @@ fn tag_entry_conditions_gate_the_whole_entry() {
         "conditions": [{"condition":"minecraft:killed_by_player"}]
     }"#;
     assert!(eval_entry(json, &LootContext::default(), 1).is_empty());
-    let mut ctx = LootContext::default();
-    ctx.killed_by_player = true;
+    let ctx = LootContext {
+        killed_by_player: true,
+        ..Default::default()
+    };
     assert_eq!(eval_entry(json, &ctx, 1).len(), 3);
 }
 
@@ -307,8 +317,10 @@ fn inverted_condition_negates_its_term() {
         "term":{"condition":"minecraft:killed_by_player"}
     }"#;
     assert!(eval_condition(json, &LootContext::default(), 1));
-    let mut ctx = LootContext::default();
-    ctx.killed_by_player = true;
+    let ctx = LootContext {
+        killed_by_player: true,
+        ..Default::default()
+    };
     assert!(!eval_condition(json, &ctx, 1));
 }
 
@@ -325,8 +337,10 @@ fn any_of_and_all_of_combine_terms() {
          "predicate":{"flags":{"is_on_fire":true}}}
     ]}"#;
     let base = LootContext::default();
-    let mut fire = LootContext::default();
-    fire.this_on_fire = true;
+    let fire = LootContext {
+        this_on_fire: true,
+        ..Default::default()
+    };
     let mut both = fire.clone();
     both.killed_by_player = true;
 
@@ -376,8 +390,10 @@ fn random_chance_with_enchanted_bonus_enchanted_zero_means_no_drop() {
 fn killed_by_player_condition_reads_context() {
     let json = r#"{"condition":"minecraft:killed_by_player"}"#;
     assert!(!eval_condition(json, &LootContext::default(), 1));
-    let mut ctx = LootContext::default();
-    ctx.killed_by_player = true;
+    let ctx = LootContext {
+        killed_by_player: true,
+        ..Default::default()
+    };
     assert!(eval_condition(json, &ctx, 1));
 }
 
@@ -396,9 +412,11 @@ fn entity_properties_checks_on_fire_and_baby_for_this_and_attacker() {
     assert!(!eval_condition(this_fire, &base, 1));
     assert!(eval_condition(not_fire, &base, 1));
 
-    let mut ctx = LootContext::default();
-    ctx.this_on_fire = true;
-    ctx.this_is_baby = true;
+    let mut ctx = LootContext {
+        this_on_fire: true,
+        this_is_baby: true,
+        ..Default::default()
+    };
     assert!(eval_condition(this_fire, &ctx, 1));
     assert!(eval_condition(this_baby, &ctx, 1));
     assert!(!eval_condition(attacker_fire, &ctx, 1));
@@ -560,8 +578,10 @@ fn function_level_conditions_gate_only_that_function() {
         eval_entry(&entry, &LootContext::default(), 1),
         vec![item("minecraft:stone", 1)]
     );
-    let mut ctx = LootContext::default();
-    ctx.killed_by_player = true;
+    let ctx = LootContext {
+        killed_by_player: true,
+        ..Default::default()
+    };
     assert_eq!(
         eval_entry(&entry, &ctx, 1),
         vec![item("minecraft:stone", 9)]
@@ -581,8 +601,11 @@ fn table_rolls_weighted_entries_and_applies_pool_functions() {
         ],
         "functions":[{"function":"minecraft:set_count","count":5}]
     }]}"#;
-    let mut ctx = LootContext::default();
-    ctx.luck = 2.0; // 2 rolls + floor(1.0 * 2) = 4 draws.
+    // 2 rolls + floor(1.0 * 2) = 4 draws.
+    let ctx = LootContext {
+        luck: 2.0,
+        ..Default::default()
+    };
     let got = eval_table(table, &ctx, 23);
     assert_eq!(got.len(), 4);
 
@@ -614,8 +637,10 @@ fn table_skips_pools_whose_conditions_fail() {
         eval_table(table, &LootContext::default(), 3),
         vec![item("minecraft:stone", 1)]
     );
-    let mut ctx = LootContext::default();
-    ctx.killed_by_player = true;
+    let ctx = LootContext {
+        killed_by_player: true,
+        ..Default::default()
+    };
     assert_eq!(
         eval_table(table, &ctx, 3),
         vec![
@@ -635,8 +660,11 @@ fn table_quality_scales_entry_weight_with_luck() {
             {"type":"minecraft:item","name":"minecraft:dirt","weight":1}
         ]
     }]}"#;
-    let mut ctx = LootContext::default();
-    ctx.luck = 3.0; // stone weight = 1 + floor(1 * 3) = 4, dirt = 1.
+    // stone weight = 1 + floor(1 * 3) = 4, dirt = 1.
+    let ctx = LootContext {
+        luck: 3.0,
+        ..Default::default()
+    };
     // Every seed that picks below 4 must be stone; verify across many seeds.
     for seed in 0..32 {
         let got = eval_table(table, &ctx, seed);

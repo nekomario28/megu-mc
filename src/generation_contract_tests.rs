@@ -836,7 +836,7 @@ fn netherrack_replace_blobs_matches_native_cells_and_rng() {
                             }
                         }
                         1 => {
-                            if r2 <= 9 || (dy <= -4 && dy >= -8 && x.abs() <= 4 && z.abs() <= 4) {
+                            if r2 <= 9 || ((-8..=-4).contains(&dy) && x.abs() <= 4 && z.abs() <= 4) {
                                 netherrack
                             } else {
                                 0
@@ -1125,7 +1125,8 @@ fn generic_feature_cases(cases_json: &str, fixture: &str) {
         None => DEFAULT_BOX,
     };
     let cf = super::p_cf(&cases).expect("the cases file is a configured feature");
-    let mut scenes: Vec<(String, Vec<(u32, [[i32; 2]; 3])>)> = Vec::new();
+    type Scene = (String, Vec<(u32, [[i32; 2]; 3])>);
+    let mut scenes: Vec<Scene> = Vec::new();
     for scene in jarr(&cases, "scenes").expect("scenes") {
         let mut plies = Vec::new();
         for ply in jarr(scene, "plies").expect("plies") {
@@ -1808,11 +1809,11 @@ fn sculk_patch_converts_a_deepslate_floor() {
         .filter(|n| *n != "minecraft:deepslate" && *n != "minecraft:air")
         .collect();
     assert!(
-        names.iter().any(|n| *n == "minecraft:sculk"),
+        names.contains(&"minecraft:sculk"),
         "no sculk written: {names:?}"
     );
     assert!(
-        names.iter().any(|n| *n == "minecraft:sculk_vein"),
+        names.contains(&"minecraft:sculk_vein"),
         "no vein written: {names:?}"
     );
 }
@@ -6236,7 +6237,7 @@ fn bonus_chest_places_chest_loot_seed_and_supported_torches() {
     let mut control = Xor::seed(SEED);
     for _ in 0..2 {
         for i in (1..16).rev() {
-            let _ = control.next_bound(i as i32 + 1);
+            let _ = control.next_bound(i + 1);
         }
     }
     assert_eq!(control.next_i64(), loot_seed, "the 30 draws, then the seed");
@@ -6362,7 +6363,7 @@ fn bonus_chest_writes_nothing_when_the_heightmap_is_outside_the_world() {
     let mut control = Xor::seed(seed);
     for _ in 0..2 {
         for i in (1..16).rev() {
-            let _ = control.next_bound(i as i32 + 1);
+            let _ = control.next_bound(i + 1);
         }
     }
     assert_eq!(
