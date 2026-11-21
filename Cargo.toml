@@ -21,6 +21,13 @@ debug = "line-tables-only"
 [profile.test]
 opt-level = 1
 
+# Optimized but quick-to-link builds for iteration: cargo build --profile fast
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
 [features]
 # Opt-in CI-only Java fixtures; tests hard-fail without native files.
 native-oracle = []

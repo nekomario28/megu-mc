@@ -1,0 +1,11 @@
+[package]
+name = "mc-spine-state-store"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+description = "Standalone 64-shard DimensionState/ServerContext runtime store and the declarative 1.21.1 <-> 26.3 DataFixer pipeline for mc-spine"
+
+# Zero external dependencies by contract: this crate is the clean-room runtime
+# state core the server lanes converge on, so it must build on pure `std`.
+[dependencies]
