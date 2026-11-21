@@ -9092,6 +9092,12 @@ fn s3_parse_map_chunk(bytes: &[u8]) -> S3Packet {
             first = (value & 0x1ff) as i32; // column 0 occupies bits 0..9
         }
     }
+    assert_eq!(s3_take(&mut b, 1)[0], 12, "WORLD_SURFACE is a long array");
+    let ws_name_len = u16::from_be_bytes(s3_take(&mut b, 2).try_into().unwrap()) as usize;
+    assert_eq!(s3_take(&mut b, ws_name_len), b"WORLD_SURFACE");
+    let ws_longs = i32::from_be_bytes(s3_take(&mut b, 4).try_into().unwrap());
+    assert_eq!(ws_longs, 37);
+    s3_take(&mut b, (ws_longs as usize) * 8);
     assert_eq!(s3_take(&mut b, 1)[0], 0, "end of heightmaps compound");
 
     let data_len = s3_varint(&mut b);
