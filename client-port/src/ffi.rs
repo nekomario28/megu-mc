@@ -23,6 +23,7 @@ pub const ABI_AIR: u32 = 0;
 pub const ABI_OPAQUE: u32 = 1;
 pub const ABI_MAX_COLUMN_SECTIONS: usize = MAX_COLUMN_SECTIONS;
 pub const ABI_COLUMN_UNIFORM_AIR: u32 = 1;
+pub const ABI_COLUMN_SEALED_SOLID: u32 = 2;
 
 #[repr(C)]
 pub struct MeshInput {
@@ -182,13 +183,15 @@ pub unsafe extern "C" fn mc_spine_client_mesh_column(
     let mut section_slots: [MaybeUninit<ColumnSection<'_>>; MAX_COLUMN_SECTIONS] =
         [const { MaybeUninit::uninit() }; MAX_COLUMN_SECTIONS];
     for (slot, section) in section_slots.iter_mut().zip(inputs) {
-        let (blocks, uniform_air) = match section.flags {
+        let (blocks, uniform_air, sealed) = match section.flags {
             // SAFETY: a non-null dense block array has the fixed length and alignment.
-            0 => match unsafe { section.blocks.cast::<[Block; SECTION_CELLS]>().as_ref() } {
-                Some(blocks) => (blocks, false),
-                None => return ABI_INVALID_ARGUMENT,
-            },
-            ABI_COLUMN_UNIFORM_AIR if section.blocks.is_null() => (&AIR_BLOCKS, true),
+            0 | ABI_COLUMN_SEALED_SOLID => {
+                match unsafe { section.blocks.cast::<[Block; SECTION_CELLS]>().as_ref() } {
+                    Some(blocks) => (blocks, false, section.flags == ABI_COLUMN_SEALED_SOLID),
+                    None => return ABI_INVALID_ARGUMENT,
+                }
+            }
+            ABI_COLUMN_UNIFORM_AIR if section.blocks.is_null() => (&AIR_BLOCKS, true, false),
             _ => return ABI_INVALID_ARGUMENT,
         };
         // SAFETY: non-null light arrays have the fixed length in the header.
@@ -202,6 +205,7 @@ pub unsafe extern "C" fn mc_spine_client_mesh_column(
         };
         slot.write(ColumnSection {
             uniform_air,
+            sealed,
             view: SectionView {
                 blocks,
                 block_light,

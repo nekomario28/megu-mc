@@ -5,7 +5,9 @@
 
 mod cache;
 mod column;
+mod cull;
 pub mod ffi;
+mod lod;
 mod mesh;
 mod packed;
 mod section;
@@ -14,6 +16,8 @@ mod section;
 mod tests;
 
 pub use cache::{MeshCache, SectionCoord};
+pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
+pub use lod::{summarize_column, LodCell, LodSummary, LOD_COARSE, LOD_FINE};
 pub use mesh::{mesh_section, Layer, Quad, QUAD_FALLING, QUAD_TINTED};
 pub use section::*;
 

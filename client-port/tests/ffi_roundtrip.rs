@@ -258,6 +258,90 @@ fn column_skips_air_and_packs_the_maximum_height_endpoint() {
 }
 
 #[test]
+fn column_sealed_solid_flag_culls_without_changing_output() {
+    let solid = Section::filled(Block::opaque_cube(7), Light::new(0, 0));
+    let air = Section::filled(Block::AIR, Light::new(0, 15));
+    let descriptors = |flags: u32, section: &Section| MeshColumnSection {
+        flags,
+        blocks: section.blocks.as_ptr(),
+        block_light: section.block_light.as_ptr(),
+        sky_light: section.sky_light.as_ptr(),
+    };
+    // Two solid sections below an open-air section, opaque missing below.
+    let flags = [ABI_COLUMN_SEALED_SOLID, ABI_COLUMN_SEALED_SOLID, 0];
+    let sources = [&solid, &solid, &air];
+    let sections: Vec<_> = sources
+        .into_iter()
+        .zip(flags)
+        .map(|(section, flags)| descriptors(flags, section))
+        .collect();
+    let mut input = MeshColumnInput {
+        abi_version: ABI_VERSION,
+        missing: ABI_OPAQUE,
+        sections: sections.as_ptr(),
+        section_count: sections.len(),
+        borders: [ptr::null(); 4],
+    };
+    let mut count = 99;
+    // SAFETY: all non-null buffers are live and the count slot is writable.
+    unsafe {
+        // The sealed flag still requires the 4096-cell block array.
+        let null_blocks = [MeshColumnSection {
+            blocks: ptr::null(),
+            ..sections[0]
+        }];
+        let mut bad = MeshColumnInput {
+            sections: null_blocks.as_ptr(),
+            ..input
+        };
+        assert_eq!(
+            mc_spine_client_mesh_column(&bad, ptr::null_mut(), 0, &mut count),
+            ABI_INVALID_ARGUMENT
+        );
+        assert_eq!(count, 0);
+        // Unknown flag values stay invalid.
+        let bad_flags = [MeshColumnSection {
+            flags: 3,
+            ..sections[0]
+        }];
+        bad.sections = bad_flags.as_ptr();
+        assert_eq!(
+            mc_spine_client_mesh_column(&bad, ptr::null_mut(), 0, &mut count),
+            ABI_INVALID_ARGUMENT
+        );
+        assert_eq!(count, 0);
+        // Hinted output must equal the unhinted expanded output.
+        let mesh_all = |input: &MeshColumnInput, count: &mut usize| {
+            assert_eq!(
+                mc_spine_client_mesh_column(input, ptr::null_mut(), 0, count),
+                ABI_OK
+            );
+            let mut out = vec![MaybeUninit::<Quad>::uninit(); *count];
+            assert_eq!(
+                mc_spine_client_mesh_column(input, out.as_mut_ptr().cast(), out.len(), count),
+                ABI_OK
+            );
+            out.into_iter()
+                .take(*count)
+                .map(|q| q.assume_init())
+                .collect::<Vec<_>>()
+        };
+        let hinted = mesh_all(&input, &mut count);
+        let expanded: Vec<_> = sections
+            .iter()
+            .map(|section| MeshColumnSection {
+                flags: 0,
+                ..*section
+            })
+            .collect();
+        input.sections = expanded.as_ptr();
+        let expanded = mesh_all(&input, &mut count);
+        assert_eq!(hinted, expanded);
+        assert!(hinted.iter().all(|q| q.direction == Direction::Up));
+    }
+}
+
+#[test]
 fn translucent_sort_uses_camera_distance_and_preserves_index_order_on_ties() {
     let mut section = Section::filled(Block::AIR, Light::new(0, 15));
     section.set(1, 4, 1, Block::opaque_cube(1), Light::new(0, 0));

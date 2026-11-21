@@ -116,11 +116,17 @@ int32_t mc_spine_mesh_section(const mc_spine_mesh_input *input,
 enum {
     MC_SPINE_MESH_MAX_COLUMN_SECTIONS = 32,
     MC_SPINE_MESH_COLUMN_UNIFORM_AIR = 1,
+    MC_SPINE_MESH_COLUMN_SEALED_SOLID = 2,
 };
 
 typedef struct mc_spine_mesh_column_section {
-    uint32_t flags; /* zero for expanded cells, MC_SPINE_MESH_COLUMN_UNIFORM_AIR for air */
-    const mc_spine_mesh_block *blocks; /* 4096 cells for flags == 0, NULL for uniform air */
+    uint32_t flags; /* zero for expanded cells, MC_SPINE_MESH_COLUMN_UNIFORM_AIR
+                       for air, MC_SPINE_MESH_COLUMN_SEALED_SOLID for a caller
+                       guarantee that every cell is a full-occlusion opaque
+                       non-fluid cube so the interior never emits */
+    const mc_spine_mesh_block *blocks; /* 4096 cells for flags 0 and
+                                          MC_SPINE_MESH_COLUMN_SEALED_SOLID,
+                                          NULL for uniform air */
     const uint8_t *block_light; /* required, including for uniform air */
     const uint8_t *sky_light;   /* required, including for uniform air */
 } mc_spine_mesh_column_section;

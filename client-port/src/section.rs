@@ -125,9 +125,13 @@ impl Block {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn occludes(self, side: Direction) -> bool {
         self.flags & OPAQUE != 0 && self.occlusion & side.bit() != 0
+    }
+
+    /// Mesher-level "can draw something": a renderable cube flag or any fluid.
+    pub(crate) fn renderable(self) -> bool {
+        self.flags & (OPAQUE | CUTOUT | TRANSLUCENT) != 0 || self.fluid() != NO_FLUID
     }
 
     pub(crate) fn fluid(self) -> u8 {

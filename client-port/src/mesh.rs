@@ -1820,6 +1820,28 @@ pub(crate) fn mesh_section_with_scratch<S: QuadSink>(
     y_offset: f32,
     quads: &mut S,
 ) {
+    // Sealed and empty sections skip the interior load, shell fill and greedy
+    // pass entirely. `emits_nothing` exits on the first live boundary face, so
+    // open sections pay only a couple of cell checks.
+    let missing_sealed = matches!(view.missing, MissingNeighbor::Opaque);
+    if crate::cull::emits_nothing(
+        view.blocks,
+        false,
+        |direction| match view.borders[direction as usize] {
+            Some(border) => border
+                .iter()
+                .all(|sample| sample.block.occludes(direction.opposite())),
+            None => missing_sealed,
+        },
+        |direction, p| {
+            view.borders[direction as usize].map_or_else(
+                || view.missing.sample().block,
+                |border| border[direction.border_index(p)].block,
+            )
+        },
+    ) {
+        return;
+    }
     let scan = load_interior(view.blocks, view.block_light, view.sky_light, scratch);
     if !scan.any_cube && !scan.any_fluid {
         return;

@@ -20,6 +20,10 @@ pub(crate) const CARDINALS: [Direction; 4] = [
 pub(crate) struct ColumnSection<'a> {
     pub view: SectionView<'a>,
     pub uniform_air: bool,
+    /// Caller guarantee that every cell is a full-occlusion opaque non-fluid
+    /// cube. Lets the culler skip the interior scan; boundary faces are still
+    /// checked against the real neighbors.
+    pub sealed: bool,
 }
 
 struct ColumnBorders<'a> {
@@ -285,6 +289,58 @@ pub(crate) fn mesh_column_into<S: QuadSink>(
             continue;
         }
         let view = &section.view;
+        let miss = view.missing.sample().block;
+        let missing_sealed = matches!(view.missing, crate::MissingNeighbor::Opaque);
+        // Same skip as `mesh_section_with_scratch`: a section sealed on every
+        // side by its neighbors (or holding nothing renderable) cannot emit a
+        // quad, so it avoids the interior load, shell fill and greedy pass.
+        // A uniform-air neighbor counts as air no matter what its buffers say.
+        if crate::cull::emits_nothing(
+            view.blocks,
+            section.sealed,
+            |direction| match direction {
+                Direction::Down => index.checked_sub(1).map_or(missing_sealed, |other| {
+                    !sections[other].uniform_air
+                        && sections[other].view.blocks[(EDGE - 1) * FACE_CELLS..EDGE * FACE_CELLS]
+                            .iter()
+                            .all(|block| block.occludes(Direction::Up))
+                }),
+                Direction::Up => sections.get(index + 1).map_or(missing_sealed, |other| {
+                    !other.uniform_air
+                        && other.view.blocks[..FACE_CELLS]
+                            .iter()
+                            .all(|block| block.occludes(Direction::Down))
+                }),
+                cardinal => {
+                    // CARDINALS order is North..East = directions 2..=5.
+                    neighbors[cardinal as usize - 2].map_or(missing_sealed, |faces| {
+                        faces[index]
+                            .iter()
+                            .all(|sample| sample.block.occludes(cardinal.opposite()))
+                    })
+                }
+            },
+            |direction, p| match direction {
+                Direction::Down => index.checked_sub(1).map_or(miss, |other| {
+                    if sections[other].uniform_air {
+                        crate::Block::AIR
+                    } else {
+                        sections[other].view.blocks[(EDGE - 1) * FACE_CELLS + p[2] * EDGE + p[0]]
+                    }
+                }),
+                Direction::Up => sections.get(index + 1).map_or(miss, |other| {
+                    if other.uniform_air {
+                        crate::Block::AIR
+                    } else {
+                        other.view.blocks[p[2] * EDGE + p[0]]
+                    }
+                }),
+                cardinal => neighbors[cardinal as usize - 2]
+                    .map_or(miss, |faces| faces[index][cardinal.border_index(p)].block),
+            },
+        ) {
+            continue;
+        }
         let scan = load_interior(view.blocks, view.block_light, view.sky_light, scratch);
         if !scan.any_cube && !scan.any_fluid {
             continue;

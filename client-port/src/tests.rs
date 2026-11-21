@@ -481,14 +481,17 @@ fn column_stitches_solid_sections_and_preserves_sky_from_known_air() {
             ColumnSection {
                 view: lower.view(),
                 uniform_air: false,
+                sealed: false,
             },
             ColumnSection {
                 view: upper.view(),
                 uniform_air: false,
+                sealed: false,
             },
             ColumnSection {
                 view: air.view(),
                 uniform_air: true,
+                sealed: false,
             },
         ],
         [None; 4],
@@ -522,10 +525,12 @@ fn column_stitches_water_and_samples_cardinal_halo_across_y() {
             ColumnSection {
                 view: lower.view(),
                 uniform_air: false,
+                sealed: false,
             },
             ColumnSection {
                 view: upper.view(),
                 uniform_air: false,
+                sealed: false,
             },
         ],
         [None, None, None, Some(&east)],
@@ -1257,10 +1262,12 @@ fn parity_against_scalar_reference_on_bench_and_complex_fixtures() {
             Some(s) => ColumnSection {
                 view: s.view(),
                 uniform_air: false,
+                sealed: false,
             },
             None => ColumnSection {
                 view: air_section.view(),
                 uniform_air: true,
+                sealed: false,
             },
         })
         .collect();
@@ -1428,18 +1435,22 @@ fn parity_against_scalar_reference_on_bench_and_complex_fixtures() {
             ColumnSection {
                 view: make_view(&sec0, missing),
                 uniform_air: false,
+                sealed: false,
             },
             ColumnSection {
                 view: make_view(&sec1, missing),
                 uniform_air: false,
+                sealed: false,
             },
             ColumnSection {
                 view: make_view(&sec2, missing),
                 uniform_air: true,
+                sealed: false,
             },
             ColumnSection {
                 view: make_view(&sec3, missing),
                 uniform_air: false,
+                sealed: false,
             },
         ];
         let neighbors = [
@@ -1543,14 +1554,17 @@ fn parity_on_uniform_slice_and_column_fast_path_edge_cases() {
         ColumnSection {
             view: v0,
             uniform_air: false,
+            sealed: false,
         },
         ColumnSection {
             view: v1,
             uniform_air: false,
+            sealed: false,
         },
         ColumnSection {
             view: v2,
             uniform_air: false,
+            sealed: false,
         },
     ];
     reference::assert_quads_bit_identical(
@@ -1589,4 +1603,291 @@ fn packed_y_rounding_matches_f32_round_on_halfway_boundaries() {
             }
         }
     }
+}
+
+#[test]
+fn lod_summary_finds_top_block_tint_and_light_per_column() {
+    let mut lower = Section::filled(Block::AIR, Light::new(0, 15));
+    lower.set(2, 3, 1, STONE, Light::new(4, 9));
+    lower.set(0, 15, 0, STONE, DARK);
+    let mut upper = air();
+    let leaves = Block {
+        state_id: 238,
+        tint: 0x2288_33,
+        flags: CUTOUT | TINTED,
+        ..Block::AIR
+    };
+    upper.set(2, 3, 1, leaves, Light::new(1, 14));
+    let mut out = [LodCell::EMPTY; LOD_FINE * LOD_FINE];
+    let views = [lower.view(), upper.view()];
+    summarize_column(&views, LOD_FINE, &mut out);
+
+    let cell = out[1 * EDGE + 2];
+    assert_eq!(cell.top_y, 16 + 3);
+    assert_eq!(cell.state_id, leaves.state_id);
+    assert_eq!(cell.tint, leaves.tint);
+    assert_eq!(cell.light, Light::new(1, 14).0);
+
+    let low = out[0];
+    assert_eq!(low.top_y, 15);
+    assert_eq!(low.state_id, STONE.state_id);
+    assert_eq!(low.tint, 0);
+    assert_eq!(low.light, DARK.0);
+
+    for (i, cell) in out.iter().enumerate() {
+        if i != 1 * EDGE + 2 && i != 0 {
+            assert!(cell.is_empty(), "column {i} should be empty");
+        }
+    }
+
+    // An untinted fluid counts as the visible top too.
+    let mut water_col = air();
+    water_col.set(5, 9, 7, fluid(WATER, 0), Light::new(0, 12));
+    summarize_column(&[water_col.view()], LOD_FINE, &mut out);
+    let cell = out[7 * EDGE + 5];
+    assert_eq!(cell.top_y, 9);
+    assert_eq!(cell.state_id, 80);
+}
+
+#[test]
+fn lod_summary_coarse_takes_footprint_max_and_reuses_buffer() {
+    let mut section = air();
+    // Same 4x4 footprint, different column heights: the tallest wins.
+    section.set(1, 2, 1, STONE, DARK);
+    let tall = Block::opaque_cube(42);
+    section.set(3, 9, 2, tall, DARK);
+    section.set(0, 5, 0, STONE, DARK);
+    let mut summary = LodSummary::new(LOD_COARSE);
+    let cells = summary.update(&[section.view()]).to_vec();
+    assert_eq!(summary.edge(), LOD_COARSE);
+    assert_eq!(summary.height(), EDGE);
+    let best = cells[0];
+    assert_eq!(best.top_y, 9);
+    assert_eq!(best.state_id, tall.state_id);
+
+    // Reusing the buffer does not reallocate and clears stale tops.
+    let ptr = summary.cells().as_ptr();
+    let empty = air();
+    let cells = summary.update(&[empty.view()]);
+    assert_eq!(cells.as_ptr(), ptr);
+    assert!(cells.iter().all(|cell| cell.is_empty()));
+
+    // A taller column reports a larger height and saturates only above
+    // i16::MAX.
+    let views: Vec<_> = (0..24).map(|_| section.view()).collect();
+    summary.update(&views);
+    assert_eq!(summary.height(), 24 * EDGE);
+    assert_eq!(summary.cells()[0].top_y, (23 * EDGE + 9) as i16);
+}
+
+#[test]
+fn lod_summary_empty_column_and_boundary_cells() {
+    let mut out = [LodCell::EMPTY; LOD_FINE * LOD_FINE];
+    summarize_column(&[], LOD_FINE, &mut out);
+    assert!(out.iter().all(|cell| cell.is_empty()));
+    let empty = air();
+    summarize_column(&[empty.view()], LOD_COARSE, &mut out);
+    assert!(out[..LOD_COARSE * LOD_COARSE]
+        .iter()
+        .all(|cell| cell.is_empty()));
+
+    // The highest possible cell is reachable.
+    let mut section = air();
+    section.set(15, 15, 15, STONE, Light::new(15, 0));
+    summarize_column(&[section.view()], LOD_FINE, &mut out);
+    let cell = out[15 * EDGE + 15];
+    assert_eq!(cell.top_y, 15);
+    assert_eq!(cell.light, Light::new(15, 0).0);
+}
+
+#[test]
+fn cull_scan_marks_uniform_air_boundary_faces_and_sealed_sections() {
+    let empty = air();
+    let vis = SectionVis::scan(&empty.view());
+    assert!(vis.uniform_air);
+    assert_eq!(vis.boundary_faces, 0);
+    assert!(!vis.interior_faces);
+    assert!(!vis.emits_any());
+
+    // A uniform cube against air emits on all six outer faces but has no
+    // interior geometry.
+    let solid = Section::filled(STONE, DARK);
+    let vis = SectionVis::scan(&solid.view());
+    assert!(!vis.uniform_air);
+    assert_eq!(vis.boundary_faces, ALL_FACES);
+    assert!(!vis.interior_faces);
+    assert!(vis.emits_any());
+
+    // Fully sealed by opaque neighbors: the mesher proves empty too.
+    let mut sealed = solid.view();
+    sealed.missing = MissingNeighbor::Opaque;
+    let vis = SectionVis::scan(&sealed);
+    assert_eq!(vis.boundary_faces, 0);
+    assert!(!vis.interior_faces);
+    assert!(!vis.emits_any());
+    assert!(mesh_section(&sealed).is_empty());
+
+    // One open side alone flips the verdict. The meshed quads all face East;
+    // the opaque-missing halo keeps them from merging into one.
+    let open_border = [Sample::new(Block::AIR, DAY); FACE_CELLS];
+    sealed.borders[Direction::East as usize] = Some(&open_border);
+    let vis = SectionVis::scan(&sealed);
+    assert_eq!(vis.boundary_faces, Direction::East.bit());
+    assert!(vis.emits_any());
+    let quads = mesh_section(&sealed);
+    assert!(!quads.is_empty());
+    assert!(quads.iter().all(|q| q.direction == Direction::East));
+}
+
+#[test]
+fn cull_scan_counts_interior_and_fluid_faces() {
+    // A lone cube at the centre emits only interior faces.
+    let mut cave = air();
+    cave.set(8, 8, 8, STONE, DARK);
+    let vis = SectionVis::scan(&cave.view());
+    assert_eq!(vis.boundary_faces, 0);
+    assert!(vis.interior_faces);
+    assert!(vis.visible_towards(0));
+
+    // Water on the top slice emits an Up boundary face; its side and bottom
+    // faces count as interior.
+    let mut pool = air();
+    pool.set(4, 15, 4, fluid(WATER, 0), DAY);
+    let vis = SectionVis::scan(&pool.view());
+    assert_eq!(vis.boundary_faces, Direction::Up.bit());
+    assert!(vis.interior_faces);
+    assert!(vis.emits_any());
+
+    // Same-state-culled glass touching an identical border emits nothing on
+    // that side.
+    let glass = Block {
+        state_id: 519,
+        flags: TRANSLUCENT | SAME_STATE_CULL,
+        ..Block::AIR
+    };
+    let mut window = air();
+    window.set(15, 8, 8, glass, DAY);
+    let glass_border = [Sample::new(glass, DAY); FACE_CELLS];
+    let mut view = window.view();
+    view.borders[Direction::East as usize] = Some(&glass_border);
+    let vis = SectionVis::scan(&view);
+    // The only outward face is same-state-culled, yet the cube still emits
+    // its five interior faces.
+    assert_eq!(vis.boundary_faces, 0);
+    assert!(vis.interior_faces);
+    assert!(vis.emits_any());
+}
+
+#[test]
+fn cull_facing_mask_and_frustum_decide_visibility() {
+    let min = [0.0, 0.0, 0.0];
+    assert_eq!(
+        box_facing_mask(min, [-1.0, 8.0, 8.0]),
+        Direction::West.bit()
+    );
+    assert_eq!(
+        box_facing_mask(min, [20.0, -4.0, 30.0]),
+        Direction::East.bit() | Direction::Down.bit() | Direction::South.bit()
+    );
+    assert_eq!(box_facing_mask(min, [8.0, 8.0, 8.0]), 0);
+
+    // A boundary-only section is invisible from inside or behind a sealed side.
+    let solid = Section::filled(STONE, DARK);
+    let vis = SectionVis::scan(&solid.view());
+    assert!(!vis.visible_towards(0));
+    assert!(vis.visible_towards(box_facing_mask(min, [-1.0, 8.0, 8.0])));
+    assert!(vis.visible_towards(box_facing_mask(min, [8.0, 20.0, 8.0])));
+
+    // Six-plane frustum: inside half-space dot(n, p) + d >= 0.
+    let left = [1.0, 0.0, 0.0, -20.0]; // x >= 20
+    assert!(!box_in_frustum(min, &[left]));
+    assert!(box_in_frustum([24.0, 0.0, 0.0], &[left]));
+    let right = [-1.0, 0.0, 0.0, 40.0]; // x <= 40
+    assert!(!box_in_frustum(min, &[left, right]));
+    assert!(box_in_frustum([24.0, 0.0, 0.0], &[left, right]));
+    // A top plane at y >= 17 clips a box that ends at y = 16.
+    assert!(!box_in_frustum(
+        [24.0, 0.0, 0.0],
+        &[left, right, [0.0, 1.0, 0.0, -17.0]]
+    ));
+    assert!(box_in_frustum(
+        [24.0, 0.0, 0.0],
+        &[left, right, [0.0, 1.0, 0.0, -16.0]]
+    ));
+}
+
+#[test]
+fn column_culling_matches_scalar_reference_on_sealed_columns() {
+    use crate::column::{mesh_column, ColumnSection};
+
+    let solid = Section::filled(STONE, DARK);
+    let mut v_opaque = solid.view();
+    v_opaque.missing = MissingNeighbor::Opaque;
+    let col: Vec<_> = (0..4)
+        .map(|_| ColumnSection {
+            view: v_opaque,
+            uniform_air: false,
+            sealed: false,
+        })
+        .collect();
+    let quads = mesh_column(&col, [None; 4]);
+    assert!(quads.is_empty());
+    reference::assert_quads_bit_identical(
+        &quads,
+        &reference::mesh_column_scalar(&col, [None; 4]),
+        "sealed_column",
+    );
+
+    // An air section on top unseals exactly the Up faces of the sealed
+    // section below it: every emitted quad faces Up at y = 16.
+    let top_air = air();
+    let col2 = [
+        ColumnSection {
+            view: v_opaque,
+            uniform_air: false,
+            sealed: false,
+        },
+        ColumnSection {
+            view: top_air.view(),
+            uniform_air: false,
+            sealed: false,
+        },
+    ];
+    let quads = mesh_column(&col2, [None; 4]);
+    reference::assert_quads_bit_identical(
+        &quads,
+        &reference::mesh_column_scalar(&col2, [None; 4]),
+        "sealed_column_open_top",
+    );
+
+    // The caller `sealed` hint must not change output: a truthful hint only
+    // skips the interior scan, so hinted columns match the unhinted result
+    // whether the skip fires or an open side still emits boundary faces.
+    let hinted: Vec<_> = col
+        .iter()
+        .map(|section| ColumnSection {
+            view: section.view,
+            uniform_air: section.uniform_air,
+            sealed: true,
+        })
+        .collect();
+    assert!(mesh_column(&hinted, [None; 4]).is_empty());
+    let col3 = [
+        ColumnSection {
+            view: v_opaque,
+            uniform_air: false,
+            sealed: true,
+        },
+        ColumnSection {
+            view: top_air.view(),
+            uniform_air: false,
+            sealed: false,
+        },
+    ];
+    assert_eq!(mesh_column(&col3, [None; 4]), quads);
+    assert!(!quads.is_empty());
+    assert!(quads.iter().all(|q| q.direction == Direction::Up));
+    assert!(quads
+        .iter()
+        .all(|q| q.positions.iter().all(|p| p[1] == 16.0)));
 }
