@@ -21,7 +21,14 @@
 //! - [`fallback`]: 4-tier mod execution classifier and safe fallback planner
 //!   (`Strict`, `Quarantine` with Save v2 block-loss guard, `DelegateNeoForge`),
 //!   plus [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`] superseding of redundant
-//!   optimization mods (skipped before any Tier 3 check).
+//!   optimization mods (skipped before any Tier 3 check) and
+//!   [`fallback::classify_mod_with_mixins`], which promotes a mod whose only
+//!   Tier 3 blockers are fully liftable `@Inject` sites to `BoundedJvmShim`.
+//! - [`mixin_lifter`]: clean-room Mixin-to-Event static lifter — maps standard
+//!   `@Inject` sites on vanilla lifecycle methods (Mojang dot/slash,
+//!   Intermediary, and Yarn names) onto [`mixin_lifter::StandardEventHook`]
+//!   bindings, failing closed on any `@Overwrite`/`@Redirect`/locals-capture/
+//!   non-`HEAD`/`TAIL`/`RETURN` site or unknown target.
 //! - [`version_compat`]: multi-version Minecraft compatibility engine —
 //!   dependency-free Maven interval (NeoForge/Forge) and SemVer (Fabric)
 //!   version-range parsing, the `pack_format`/`DataVersion` lookup table, and
@@ -41,6 +48,7 @@ pub mod blockstates;
 pub mod data_loader;
 pub mod dimension_mod;
 pub mod fallback;
+pub mod mixin_lifter;
 pub mod modpack;
 pub mod neoforge_wire;
 pub mod profile;

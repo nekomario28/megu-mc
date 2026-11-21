@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::mixin_lifter::{lift_mixin_sites, MixinLiftVerdict, MixinSite};
 use crate::version_compat::{check_mod_mc_version, McVersion, VersionCompatVerdict};
 
 /// Execution tier assigned to one discovered mod JAR or datapack.
@@ -273,6 +274,98 @@ pub fn classify_mod_for_version(
         }
     }
     classify_execution_path(m, flagship_mod_ids, profile_mod_ids)
+}
+
+/// Whether `reason` is a Mixin-attributed rejection code. Known codes include
+/// `UNSUPPORTED_MIXIN_INJECTION`, `UNSUPPORTED_MIXIN_AT`,
+/// `UNSUPPORTED_MIXIN_CONFIG`, `UNSUPPORTED_RUNTIME_MIXIN`,
+/// `MISSING_MIXIN_CONFIG`, and the shimcheck `MIXIN_DETECTED`/`MIXIN_INJECT`
+/// family; non-mixin blockers (`CUSTOM_CHUNK_GENERATOR`,
+/// `MC_VERSION_INCOMPATIBLE`, `MC_VERSION_RANGE_INVALID`,
+/// `UNSCANNABLE_JAVA_MOD`, `PACK_FORMAT_INCOMPATIBLE`, ...) never match.
+fn is_mixin_reason(reason: &str) -> bool {
+    reason.to_ascii_uppercase().contains("MIXIN")
+}
+
+/// Mixin-aware variant of [`classify_mod_for_version`]: identical ordering —
+/// [`BUILTIN_SUPERSEDED_PERF_MODS`] first, the [`McVersion`] range gate
+/// second, the shared flagship/profile/ShimCheck/Tier-3 chain third — plus a
+/// final clean-room promotion step powered by
+/// [`crate::mixin_lifter::lift_mixin_sites`].
+///
+/// When a mod lands in [`ExecutionTier::RequiresFallback`] *only* because of
+/// Mixin reason codes (every returned reason contains `MIXIN`; a mod with no
+/// recorded reasons cannot prove mixin-only cause and never promotes), all
+/// of its extracted [`MixinSite`]s are lifted. If every site binds to a
+/// [`crate::mixin_lifter::StandardEventHook`] and at least one binding
+/// exists, the mod is promoted to [`ExecutionTier::BoundedJvmShim`] with a
+/// diagnostic naming the lifted hooks. A single unliftable site
+/// (`@Redirect`, `locals` capture, `@At("INVOKE")`, cancellable post hook,
+/// unknown target, ...) or any non-mixin rejection keeps it firmly in Tier 3
+/// with the exact offending site and reason.
+///
+/// Returns `(tier, diagnostic, verdict)`: `verdict` is `Some` only when the
+/// lifter actually ran — `None` for superseded mods, version-gate refusals,
+/// non-Tier-3 classifications, and Tier-3 verdicts with non-mixin or
+/// unrecorded blockers.
+pub fn classify_mod_with_mixins(
+    m: &DiscoveredMod,
+    mixin_sites: &[MixinSite],
+    flagship_mod_ids: &BTreeSet<String>,
+    profile_mod_ids: &BTreeSet<String>,
+    target: McVersion,
+) -> (ExecutionTier, String, Option<MixinLiftVerdict>) {
+    let (tier, reasons) = classify_mod_for_version(m, flagship_mod_ids, profile_mod_ids, target);
+    if tier != ExecutionTier::RequiresFallback {
+        return (tier, reasons.join("; "), None);
+    }
+    // Promotion requires proof the Tier 3 verdict is mixin-only:
+    // - `m.rejection_reasons` non-empty: the shared chain synthesizes a
+    //   generic "unsupported Mixin/AT or Minecraft API surface" reason when
+    //   the audit recorded nothing, which does not prove mixin-only cause.
+    // - Every *returned* reason names a mixin: version-gate refusals and
+    //   other non-mixin blockers never contain "MIXIN", so they stay
+    //   fail-closed Tier 3 automatically.
+    let mixin_only_blockers =
+        !m.rejection_reasons.is_empty() && reasons.iter().all(|r| is_mixin_reason(r));
+    if !mixin_only_blockers {
+        return (tier, reasons.join("; "), None);
+    }
+
+    let verdict = lift_mixin_sites(mixin_sites);
+    match &verdict {
+        MixinLiftVerdict::FullyLiftable(bindings) if !bindings.is_empty() => {
+            let mut hooks: Vec<&'static str> = bindings.iter().map(|b| b.hook.as_str()).collect();
+            hooks.sort_unstable();
+            hooks.dedup();
+            (
+                ExecutionTier::BoundedJvmShim,
+                format!(
+                    "promoted from Tier 3 to bounded JVM shim: {} mixin site(s) lifted to standard event hooks ({})",
+                    bindings.len(),
+                    hooks.join(", ")
+                ),
+                Some(verdict),
+            )
+        }
+        MixinLiftVerdict::FullyLiftable(_) => (
+            ExecutionTier::RequiresFallback,
+            format!(
+                "{}; mixin reason codes found but no mixin sites supplied for lifting",
+                reasons.join("; ")
+            ),
+            Some(verdict),
+        ),
+        MixinLiftVerdict::RequiresFallback { .. } => (
+            ExecutionTier::RequiresFallback,
+            format!(
+                "{}; mixin lift incomplete: {}",
+                reasons.join("; "),
+                verdict.format_lift_summary()
+            ),
+            Some(verdict),
+        ),
+    }
 }
 
 /// Classify discovered mods against registered flagship adapters, declarative
@@ -792,5 +885,222 @@ mod tests {
             }
             other => panic!("expected RefuseStartup, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // classify_mod_with_mixins: Tier 3 -> Tier 2 promotion via the
+    // clean-room Mixin-to-Event lifter.
+    // ------------------------------------------------------------------
+
+    use crate::mixin_lifter::{
+        InjectPoint, MixinAnnotationKind, StandardEventHook, UnliftableReason,
+    };
+
+    fn mixin_site(target_class: &str, target_method: &str, at: InjectPoint) -> MixinSite {
+        MixinSite {
+            mixin_class: "com.example.mixin.StandardMixin".into(),
+            target_class: target_class.into(),
+            target_method: target_method.into(),
+            annotation: MixinAnnotationKind::Inject,
+            at: Some(at),
+            cancellable: false,
+            captures_locals: false,
+        }
+    }
+
+    fn mixin_only_mod(mod_id: &str) -> DiscoveredMod {
+        DiscoveredMod {
+            mod_id: mod_id.into(),
+            has_java_bytecode: true,
+            shimcheck_compatible: false,
+            has_unsupported_mixin_or_at: true,
+            rejection_reasons: vec![
+                "UNSUPPORTED_MIXIN_INJECTION".into(),
+                "MIXIN_DETECTED".into(),
+            ],
+            mc_version_range: None,
+        }
+    }
+
+    #[test]
+    fn liftable_inject_only_mod_promotes_tier3_to_tier2() {
+        // A mod whose whole unsupported surface is standard @Inject(HEAD)
+        // damage/block-break hooks promotes cleanly, naming the lifted hooks.
+        let sites = vec![
+            mixin_site(
+                "net/minecraft/world/entity/LivingEntity",
+                "hurt",
+                InjectPoint::Head,
+            ),
+            mixin_site(
+                "net.minecraft.server.level.ServerPlayerGameMode",
+                "destroyBlock",
+                InjectPoint::Head,
+            ),
+        ];
+        let (tier, diagnostic, verdict) = classify_mod_with_mixins(
+            &mixin_only_mod("damage_indicator"),
+            &sites,
+            &set(&[]),
+            &set(&[]),
+            McVersion::V1_21_1,
+        );
+        assert_eq!(tier, ExecutionTier::BoundedJvmShim);
+        assert!(diagnostic.contains("EntityDamagePre"), "{diagnostic}");
+        assert!(diagnostic.contains("BlockBreakPre"), "{diagnostic}");
+        match verdict {
+            Some(MixinLiftVerdict::FullyLiftable(bindings)) => {
+                assert_eq!(bindings.len(), 2);
+                assert_eq!(bindings[0].hook, StandardEventHook::EntityDamagePre);
+                assert_eq!(bindings[1].hook, StandardEventHook::BlockBreakPre);
+            }
+            other => panic!("expected fully liftable verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_unliftable_site_keeps_whole_mod_tier3() {
+        // One good @Inject plus one @Redirect: the mod stays Tier 3 and the
+        // diagnostic names the exact unliftable site and reason.
+        let mut redirect = mixin_site(
+            "net/minecraft/server/level/ServerLevel",
+            "tick",
+            InjectPoint::Head,
+        );
+        redirect.annotation = MixinAnnotationKind::Redirect;
+        let sites = vec![
+            mixin_site(
+                "net/minecraft/world/entity/LivingEntity",
+                "hurt",
+                InjectPoint::Head,
+            ),
+            redirect,
+        ];
+        let (tier, diagnostic, verdict) = classify_mod_with_mixins(
+            &mixin_only_mod("mixed_mod"),
+            &sites,
+            &set(&[]),
+            &set(&[]),
+            McVersion::V1_21_1,
+        );
+        assert_eq!(tier, ExecutionTier::RequiresFallback);
+        assert!(diagnostic.contains("UnsupportedAnnotation"), "{diagnostic}");
+        assert!(diagnostic.contains("ServerLevel#tick"), "{diagnostic}");
+        match verdict {
+            Some(MixinLiftVerdict::RequiresFallback { lifted, unliftable }) => {
+                assert_eq!(lifted.len(), 1);
+                assert_eq!(unliftable.len(), 1);
+                assert_eq!(unliftable[0].1, UnliftableReason::UnsupportedAnnotation);
+            }
+            other => panic!("expected RequiresFallback verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_mixin_reason_codes_block_promotion() {
+        // CUSTOM_CHUNK_GENERATOR is not a mixin code: a liftable @Inject on
+        // top changes nothing — the mod stays Tier 3 and the lifter never
+        // even runs.
+        let mut m = mixin_only_mod("chunky_gen");
+        m.rejection_reasons = vec![
+            "CUSTOM_CHUNK_GENERATOR".into(),
+            "UNSUPPORTED_MIXIN_INJECTION".into(),
+        ];
+        let sites = vec![mixin_site(
+            "net/minecraft/world/entity/LivingEntity",
+            "hurt",
+            InjectPoint::Head,
+        )];
+        let (tier, diagnostic, verdict) =
+            classify_mod_with_mixins(&m, &sites, &set(&[]), &set(&[]), McVersion::V1_21_1);
+        assert_eq!(tier, ExecutionTier::RequiresFallback);
+        assert_eq!(
+            diagnostic,
+            "CUSTOM_CHUNK_GENERATOR; UNSUPPORTED_MIXIN_INJECTION"
+        );
+        assert!(verdict.is_none());
+    }
+
+    #[test]
+    fn superseded_perf_mod_never_reaches_the_lifter() {
+        // `sodium` is skipped as BuiltInSuperseded before the version gate
+        // and before any mixin analysis, even with liftable-looking sites.
+        let sodium = versioned_mod("sodium", Some("[1.21.1,1.22)"));
+        let sites = vec![mixin_site(
+            "net/minecraft/world/entity/LivingEntity",
+            "hurt",
+            InjectPoint::Head,
+        )];
+        let (tier, diagnostic, verdict) =
+            classify_mod_with_mixins(&sodium, &sites, &set(&[]), &set(&[]), McVersion::V1_21_1);
+        assert_eq!(tier, ExecutionTier::BuiltInSuperseded);
+        assert_eq!(diagnostic, REASON_SUPERSEDED);
+        assert!(verdict.is_none());
+    }
+
+    #[test]
+    fn version_gate_beats_mixin_promotion() {
+        // A mod built for another Minecraft version stays Tier 3 even when
+        // its mixin sites are perfectly liftable.
+        let m = versioned_mod("liftable_but_old", Some("[1.20.1,1.20.2)"));
+        let sites = vec![mixin_site(
+            "net/minecraft/world/entity/LivingEntity",
+            "hurt",
+            InjectPoint::Head,
+        )];
+        let (tier, diagnostic, verdict) =
+            classify_mod_with_mixins(&m, &sites, &set(&[]), &set(&[]), McVersion::V1_21_1);
+        assert_eq!(tier, ExecutionTier::RequiresFallback);
+        assert!(
+            diagnostic.contains("server is running 1.21.1"),
+            "{diagnostic}"
+        );
+        assert!(verdict.is_none());
+    }
+
+    #[test]
+    fn mixin_reasons_without_sites_do_not_promote() {
+        // Mixin-only codes with zero supplied sites cannot prove a fully
+        // lifted binding set — stay Tier 3.
+        let (tier, diagnostic, verdict) = classify_mod_with_mixins(
+            &mixin_only_mod("no_sites"),
+            &[],
+            &set(&[]),
+            &set(&[]),
+            McVersion::V1_21_1,
+        );
+        assert_eq!(tier, ExecutionTier::RequiresFallback);
+        assert!(
+            diagnostic.contains("no mixin sites supplied"),
+            "{diagnostic}"
+        );
+        assert_eq!(verdict, Some(MixinLiftVerdict::FullyLiftable(vec![])));
+    }
+
+    #[test]
+    fn non_tier3_tiers_are_unaffected_by_sites() {
+        // Tier 0/1/2 classifications return before the lift step: flagship
+        // and profile mods keep their tiers and report no verdict.
+        let sites = vec![mixin_site(
+            "net/minecraft/world/entity/LivingEntity",
+            "hurt",
+            InjectPoint::Head,
+        )];
+        let m = mixin_only_mod("create");
+        let (tier, _, verdict) =
+            classify_mod_with_mixins(&m, &sites, &set(&["create"]), &set(&[]), McVersion::V1_21_1);
+        assert_eq!(tier, ExecutionTier::NativeFlagship);
+        assert!(verdict.is_none());
+
+        let m = mixin_only_mod("profiled");
+        let (tier, _, verdict) = classify_mod_with_mixins(
+            &m,
+            &sites,
+            &set(&[]),
+            &set(&["profiled"]),
+            McVersion::V1_21_1,
+        );
+        assert_eq!(tier, ExecutionTier::UniversalNative);
+        assert!(verdict.is_none());
     }
 }
