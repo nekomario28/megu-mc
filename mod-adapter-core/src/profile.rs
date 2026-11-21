@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use mod_offload::fluid_network::TankState;
 use mod_offload::kinetic_graph::{KineticNode, NetworkStatus, Solution};
 use mod_offload::recipe_processor::{Drive, Recipe, Stack};
 use mod_offload::region_scheduler::{
@@ -144,6 +145,171 @@ impl ModOffloadProfile {
             tank_capacity_mb,
             processor_recipe_types,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in reference declarative profiles (AE2 / Mekanism / Pipez-class mods)
+// ---------------------------------------------------------------------------
+
+/// Sample declarative profile for an AE2-class channel network mod:
+/// a powered controller, lossy fluix cables, a channel-consuming storage
+/// drive, and an inscriber-driven molecular assembler.
+pub const AE2_CLASS_PROFILE_JSON: &[u8] = br#"{
+  "mod_id": "ae2",
+  "blocks": [
+    {"id": "ae2:controller", "role": "network_generator", "capacity": 32.0},
+    {"id": "ae2:fluix_cable", "role": "network_cable", "load": 0.5,
+     "properties": {"waterlogged": ["false", "true"]}},
+    {"id": "ae2:drive", "role": "network_consumer", "load": 2.0},
+    {"id": "ae2:molecular_assembler", "role": "processor", "load": 1.0,
+     "recipe_types": ["ae2:inscriber"]}
+  ]
+}"#;
+
+/// Sample declarative profile for a Mekanism-class tech mod: a heat generator,
+/// tiered universal cables, a crusher processor, and a pressurized
+/// pipe/tank/pump fluid network.
+pub const MEKANISM_CLASS_PROFILE_JSON: &[u8] = br#"{
+  "mod_id": "mekanism",
+  "blocks": [
+    {"id": "mekanism:heat_generator", "role": "network_generator", "capacity": 200.0},
+    {"id": "mekanism:universal_cable", "role": "network_cable",
+     "properties": {"tier": ["basic", "advanced", "elite", "ultimate"]}},
+    {"id": "mekanism:crusher", "role": "processor",
+     "recipe_types": ["mekanism:crushing"]},
+    {"id": "mekanism:mechanical_pipe", "role": "fluid_pipe", "tank_capacity_mb": 1000},
+    {"id": "mekanism:basic_fluid_tank", "role": "fluid_tank", "tank_capacity_mb": 16000},
+    {"id": "mekanism:electric_pump", "role": "fluid_pump", "tank_capacity_mb": 1000}
+  ]
+}"#;
+
+/// Sample declarative profile for a Pipez-class logistics mod: sleeping
+/// item pipes with a per-hop transfer delay plus small-buffer fluid pipes.
+pub const PIPEZ_CLASS_PROFILE_JSON: &[u8] = br#"{
+  "mod_id": "pipez",
+  "blocks": [
+    {"id": "pipez:item_pipe", "role": "transport_pipe", "transport_delay_ticks": 2,
+     "properties": {
+       "north": ["false", "true"], "south": ["false", "true"],
+       "east": ["false", "true"], "west": ["false", "true"],
+       "up": ["false", "true"], "down": ["false", "true"]
+     }},
+    {"id": "pipez:fluid_pipe", "role": "fluid_pipe", "tank_capacity_mb": 500}
+  ]
+}"#;
+
+/// Parse the built-in AE2-class channel network profile.
+pub fn ae2_class_profile() -> ModOffloadProfile {
+    builtin_profile(AE2_CLASS_PROFILE_JSON)
+}
+
+/// Parse the built-in Mekanism-class power/fluid tech profile.
+pub fn mekanism_class_profile() -> ModOffloadProfile {
+    builtin_profile(MEKANISM_CLASS_PROFILE_JSON)
+}
+
+/// Parse the built-in Pipez-class sleeping pipe profile.
+pub fn pipez_class_profile() -> ModOffloadProfile {
+    builtin_profile(PIPEZ_CLASS_PROFILE_JSON)
+}
+
+/// All built-in reference profiles in deterministic `(namespace)` order.
+pub fn builtin_reference_profiles() -> Vec<ModOffloadProfile> {
+    vec![
+        ae2_class_profile(),
+        mekanism_class_profile(),
+        pipez_class_profile(),
+    ]
+}
+
+fn builtin_profile(json: &[u8]) -> ModOffloadProfile {
+    ModOffloadProfile::from_json(json).expect("checked-in reference profile must parse")
+}
+
+/// Generic power-network profile for any `mod_id`: a `{mod}:power_generator`,
+/// `{mod}:power_cable` and a speed-driven `{mod}:crusher` processor, mirroring
+/// Mekanism/Thermal-class tech mods without any per-mod Rust code.
+pub fn generic_power_profile(mod_id: &str) -> ModOffloadProfile {
+    let crusher = format!("{mod_id}:crusher");
+    ModOffloadProfile {
+        mod_id: mod_id.to_string(),
+        blocks: vec![
+            profile_block(
+                format!("{mod_id}:power_generator"),
+                0.0,
+                200.0,
+                UniversalBlockRole::NetworkGenerator,
+            ),
+            profile_block(
+                format!("{mod_id}:power_cable"),
+                0.0,
+                0.0,
+                UniversalBlockRole::NetworkCable,
+            ),
+            profile_block(crusher.clone(), 1.0, 0.0, UniversalBlockRole::Processor),
+        ],
+        transport_delay_ticks: BTreeMap::new(),
+        tank_capacity_mb: BTreeMap::new(),
+        processor_recipe_types: BTreeMap::from([(crusher, vec![format!("{mod_id}:crushing")])]),
+    }
+}
+
+/// Generic sleeping item-pipe chain profile for any `mod_id` (Pipez /
+/// PrettyPipes-class): one `{mod}:item_pipe` transport node with a 2-tick
+/// per-hop delay.
+pub fn generic_item_pipe_profile(mod_id: &str) -> ModOffloadProfile {
+    let pipe = format!("{mod_id}:item_pipe");
+    ModOffloadProfile {
+        mod_id: mod_id.to_string(),
+        blocks: vec![profile_block(
+            pipe.clone(),
+            0.0,
+            0.0,
+            UniversalBlockRole::TransportPipe,
+        )],
+        transport_delay_ticks: BTreeMap::from([(pipe, 2)]),
+        tank_capacity_mb: BTreeMap::new(),
+        processor_recipe_types: BTreeMap::new(),
+    }
+}
+
+/// Generic pressurized fluid network profile for any `mod_id`: a
+/// `{mod}:fluid_tank` reservoir, `{mod}:fluid_pipe` segments, and a
+/// `{mod}:pump` head source.
+pub fn generic_fluid_profile(mod_id: &str) -> ModOffloadProfile {
+    let tank = format!("{mod_id}:fluid_tank");
+    let pipe = format!("{mod_id}:fluid_pipe");
+    ModOffloadProfile {
+        mod_id: mod_id.to_string(),
+        blocks: vec![
+            profile_block(tank.clone(), 0.0, 0.0, UniversalBlockRole::FluidTank),
+            profile_block(pipe.clone(), 0.0, 0.0, UniversalBlockRole::FluidPipe),
+            profile_block(
+                format!("{mod_id}:pump"),
+                0.0,
+                0.0,
+                UniversalBlockRole::FluidPump,
+            ),
+        ],
+        transport_delay_ticks: BTreeMap::new(),
+        tank_capacity_mb: BTreeMap::from([(tank, 16_000), (pipe, 1_000)]),
+        processor_recipe_types: BTreeMap::new(),
+    }
+}
+
+fn profile_block(
+    id: String,
+    load: f64,
+    capacity: f64,
+    role: UniversalBlockRole,
+) -> BlockDef<UniversalBlockRole> {
+    BlockDef {
+        id,
+        properties: Vec::new(),
+        load_factor: load,
+        capacity_factor: capacity,
+        role,
     }
 }
 
@@ -333,6 +499,65 @@ impl UniversalModRuntime {
             .ok()
     }
 
+    /// Link the transport pipe at `pos` downstream into the pipe at `next`.
+    /// Both positions must hold `TransportPipe` nodes in the same region.
+    pub fn link_transport(&mut self, pos: DimBlockPos, next: DimBlockPos) -> bool {
+        if pos.region_key() != next.region_key() {
+            return false;
+        }
+        let (Some(&from), Some(&to)) = (
+            self.transport_nodes.get(&pos),
+            self.transport_nodes.get(&next),
+        ) else {
+            return false;
+        };
+        self.scheduler
+            .region_mut(pos.region_key())
+            .set_downstream(from, Some(to))
+            .is_ok()
+    }
+
+    /// Queue an item into the sleeping transport pipe at `pos`.
+    pub fn insert_transport_item(&mut self, pos: DimBlockPos, item_id: u32) -> bool {
+        let Some(&id) = self.transport_nodes.get(&pos) else {
+            return false;
+        };
+        self.scheduler
+            .region_mut(pos.region_key())
+            .insert_item(id, item_id)
+            .is_ok()
+    }
+
+    /// Take the oldest item collected in the transport pipe's local output FIFO.
+    pub fn extract_transport_output(&mut self, pos: DimBlockPos) -> Option<u32> {
+        let &id = self.transport_nodes.get(&pos)?;
+        self.scheduler
+            .region_mut(pos.region_key())
+            .extract_output(id)
+            .ok()
+            .flatten()
+    }
+
+    /// Insert `amount_mb` of `fluid_id` into the tank/pipe/pump node at `pos`.
+    pub fn insert_tank_fluid(
+        &mut self,
+        pos: DimBlockPos,
+        fluid_id: u32,
+        amount_mb: u32,
+    ) -> Option<u32> {
+        let &id = self.tank_nodes.get(&pos)?;
+        self.scheduler
+            .region_mut(pos.region_key())
+            .insert_fluid(id, fluid_id, amount_mb)
+            .ok()
+    }
+
+    /// Current `(fluid, amount_mb)` state of the tank/pipe/pump node at `pos`.
+    pub fn tank_state(&self, pos: DimBlockPos) -> Option<TankState> {
+        let &id = self.tank_nodes.get(&pos)?;
+        self.scheduler.region(pos.region_key())?.fluid().tank(id)
+    }
+
     pub fn step_tick(
         &mut self,
         tick: u64,
@@ -445,5 +670,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(produced, 2);
+    }
+
+    #[test]
+    fn builtin_reference_profiles_parse_and_drive_sleeping_and_fluid_chains() {
+        let profiles = builtin_reference_profiles();
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|p| p.mod_id.as_str())
+                .collect::<Vec<_>>(),
+            ["ae2", "mekanism", "pipez"]
+        );
+        let mut rt = UniversalModRuntime::from_profiles(DEFAULT_BASE_STATE_ID, &profiles).unwrap();
+        let mut ids = ItemFluidIdTable::new();
+        let wheat = ids.intern_item("minecraft:wheat");
+        let water = ids.intern_fluid("minecraft:water");
+
+        let pipe_a = DimBlockPos::new(3, 0, 64, 0);
+        let pipe_b = DimBlockPos::new(3, 1, 64, 0);
+        let item_pipe = rt.registry().default_state("pipez:item_pipe").unwrap();
+        assert!(rt.place_block(pipe_a, item_pipe, Vec::new()));
+        assert!(rt.place_block(pipe_b, item_pipe, Vec::new()));
+        assert!(rt.link_transport(pipe_a, pipe_b));
+        assert!(rt.insert_transport_item(pipe_a, wheat));
+
+        let tank_a = DimBlockPos::new(3, 0, 64, 4);
+        let tank_b = DimBlockPos::new(3, 1, 64, 4);
+        let tank = rt
+            .registry()
+            .default_state("mekanism:basic_fluid_tank")
+            .unwrap();
+        assert!(rt.place_block(tank_a, tank, Vec::new()));
+        assert!(rt.place_block(tank_b, tank, Vec::new()));
+        assert_eq!(rt.insert_tank_fluid(tank_a, water, 4000), Some(4000));
+
+        let mut records = 0usize;
+        for tick in 1..=6 {
+            for out in rt.step_tick(tick, 128, None) {
+                records += out.batch.records;
+            }
+        }
+        assert!(records >= 4);
+        assert_eq!(rt.extract_transport_output(pipe_b), Some(wheat));
+        assert_eq!(rt.tank_state(tank_a).unwrap().amount, 2000);
+        assert_eq!(rt.tank_state(tank_b).unwrap().amount, 2000);
+    }
+
+    #[test]
+    fn generic_pattern_profiles_compose_for_arbitrary_mod_ids() {
+        let profiles = vec![
+            generic_power_profile("thermalexp"),
+            generic_item_pipe_profile("prettypipes"),
+            generic_fluid_profile("fluidics"),
+        ];
+        assert!(ModOffloadProfile::from_json(AE2_CLASS_PROFILE_JSON).is_ok());
+        assert!(ModOffloadProfile::from_json(MEKANISM_CLASS_PROFILE_JSON).is_ok());
+        assert!(ModOffloadProfile::from_json(PIPEZ_CLASS_PROFILE_JSON).is_ok());
+        let mut rt = UniversalModRuntime::from_profiles(DEFAULT_BASE_STATE_ID, &profiles).unwrap();
+        let gen = rt
+            .registry()
+            .default_state("thermalexp:power_generator")
+            .unwrap();
+        let cable = rt
+            .registry()
+            .default_state("thermalexp:power_cable")
+            .unwrap();
+        rt.place_block(DimBlockPos::new(0, 0, 64, 0), gen, Vec::new());
+        rt.place_block(DimBlockPos::new(0, 1, 64, 0), cable, Vec::new());
+        assert!(rt.network_running(DimBlockPos::new(0, 1, 64, 0)));
     }
 }
