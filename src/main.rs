@@ -66,6 +66,8 @@ include!("anvil_io.rs");
 include!("recipes_and_stats.rs");
 #[cfg(feature = "create-offload")]
 include!("mod_offload_bridge.rs");
+#[cfg(feature = "create-offload")]
+include!("aeronautics_and_dim_bridge.rs");
 
 // ---------- clients (multiplayer visibility) ----------
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
