@@ -1505,6 +1505,11 @@ impl WardenAngerManagement {
         *anger
     }
 
+    /// A sniff noticing an entity adds the same +35 a vibration does.
+    fn add_sniff(&mut self, entity: i32) -> u16 {
+        self.add_vibration(entity)
+    }
+
     fn anger(&self, entity: i32) -> u16 {
         self.entities.get(&entity).copied().unwrap_or(0)
     }
@@ -1545,6 +1550,11 @@ struct WardenTarget {
 enum WardenEvent {
     Roar {
         target: i32,
+    },
+    /// Reachable victims take the warden's full melee hit.
+    Melee {
+        target: i32,
+        damage: f32,
     },
     ChargeSonicBoom {
         target: i32,
@@ -2082,6 +2092,11 @@ impl MobBehaviorState {
                         target_eid: target,
                         damage,
                     }),
+                    Some(WardenEvent::Melee { target, damage }) => Some(MeleeDamage {
+                        target_eid: target,
+                        amount: damage,
+                        knockback_y: 0.0,
+                    }),
                     None => None,
                 }
             }
@@ -2178,6 +2193,647 @@ fn eval_entity_cramming_damage(
         ENTITY_CRAMMING_HIT
     } else {
         0.0
+    }
+}
+
+// ---------- P6a / #219: additional hostile-family evaluators ----------
+//
+// The four families the earlier passes had not covered — phantom, pillager,
+// evoker, guardian/elder guardian — plus the named constants and evaluators
+// the parity spec pins for families already dispatched (ghast notice range,
+// blaze hover height, warden melee/unreachable rules). All are deterministic:
+// no wall clock, no hash iteration order, scripted draws only.
+
+/// Vanilla `generic.follow_range` for a ghast is 100.0: it notices targets up
+/// to 100 blocks away even though `GhastAttackGoal` only fires within 64.
+#[cfg_attr(not(test), allow(dead_code))]
+const GHAST_FOLLOW_RANGE: f64 = 100.0;
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn ghast_acquires_target(distance: f64) -> bool {
+    distance <= GHAST_FOLLOW_RANGE
+}
+
+/// `BlazeAttackGoal` hovers the blaze half a block above the target's
+/// mid-body (`getY(0.5) + 0.5`).
+#[cfg_attr(not(test), allow(dead_code))]
+fn blaze_hover_y(target_pos: [f64; 3], target_height: f64) -> f64 {
+    target_pos[1] + f64::from(target_height) * 0.5 + 0.5
+}
+
+// --- Phantom: circle / swoop / climb state machine ---
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhantomPhase {
+    /// Orbiting an anchor 20–30 blocks above the target.
+    Circle,
+    /// Diving at the target.
+    Swoop,
+    /// Climbing back to altitude after a hit or an aborted dive.
+    Climb,
+}
+
+/// One tick of phantom intent: the steering velocity the caller applies and
+/// the melee connect the swoop produces.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+struct PhantomTick {
+    velocity: [f64; 3],
+    attack: Option<i32>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+const PHANTOM_ATTACK_DAMAGE: f32 = 2.0;
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct PhantomBehavior {
+    phase: PhantomPhase,
+    anchor: Option<[f64; 3]>,
+    clockwise: bool,
+    phase_ticks: u16,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PhantomBehavior {
+    const CIRCLE_TICKS: u16 = 60;
+    const SWOOP_TIMEOUT_TICKS: u16 = 80;
+    const CLIMB_TIMEOUT_TICKS: u16 = 100;
+    const SWOOP_HIT_DISTANCE: f64 = 2.0;
+    const SWOOP_SPEED: f64 = 1.0;
+    const CLIMB_SPEED: f64 = 0.7;
+
+    fn new() -> Self {
+        Self {
+            phase: PhantomPhase::Circle,
+            anchor: None,
+            clockwise: true,
+            phase_ticks: 0,
+        }
+    }
+
+    fn set_phase(&mut self, phase: PhantomPhase) {
+        self.phase = phase;
+        self.phase_ticks = 0;
+    }
+
+    /// `target` is `(eid, position)` of the tracked victim.
+    fn tick(
+        &mut self,
+        pos: [f64; 3],
+        target: Option<(i32, [f64; 3])>,
+        draw: &mut impl FnMut(u32) -> u32,
+    ) -> PhantomTick {
+        let Some((eid, target_pos)) = target else {
+            self.anchor = None;
+            self.set_phase(PhantomPhase::Circle);
+            return PhantomTick {
+                velocity: [0.0; 3],
+                attack: None,
+            };
+        };
+        self.phase_ticks = self.phase_ticks.saturating_add(1);
+        match self.phase {
+            PhantomPhase::Circle => {
+                let Some(anchor) = self.anchor else {
+                    // Vanilla lifts the anchor 20–30 blocks over the target
+                    // with a ±10 XZ jitter and a coin-flip orbit direction.
+                    self.anchor = Some([
+                        target_pos[0] + f64::from(draw(21)) - 10.0,
+                        target_pos[1] + 20.0 + f64::from(draw(11)),
+                        target_pos[2] + f64::from(draw(21)) - 10.0,
+                    ]);
+                    self.clockwise = draw(2) == 0;
+                    return PhantomTick {
+                        velocity: [0.0; 3],
+                        attack: None,
+                    };
+                };
+                if self.phase_ticks >= Self::CIRCLE_TICKS {
+                    self.set_phase(PhantomPhase::Swoop);
+                }
+                PhantomTick {
+                    velocity: phantom_circle_velocity(pos, anchor, self.clockwise),
+                    attack: None,
+                }
+            }
+            PhantomPhase::Swoop => {
+                let delta = mob_behavior_delta(pos, target_pos);
+                let close = mob_behavior_dot(delta, delta) <= Self::SWOOP_HIT_DISTANCE.powi(2);
+                if close || self.phase_ticks >= Self::SWOOP_TIMEOUT_TICKS {
+                    self.set_phase(PhantomPhase::Climb);
+                    return PhantomTick {
+                        velocity: phantom_swoop_velocity(pos, target_pos),
+                        attack: close.then_some(eid),
+                    };
+                }
+                PhantomTick {
+                    velocity: phantom_swoop_velocity(pos, target_pos)
+                        .map(|c| c * Self::SWOOP_SPEED),
+                    attack: None,
+                }
+            }
+            PhantomPhase::Climb => {
+                let anchor = self.anchor.unwrap_or([
+                    target_pos[0],
+                    target_pos[1] + 25.0,
+                    target_pos[2],
+                ]);
+                let at_altitude = pos[1] >= anchor[1] - 1.0;
+                if at_altitude || self.phase_ticks >= Self::CLIMB_TIMEOUT_TICKS {
+                    self.anchor = None;
+                    self.set_phase(PhantomPhase::Circle);
+                    return PhantomTick {
+                        velocity: [0.0; 3],
+                        attack: None,
+                    };
+                }
+                PhantomTick {
+                    velocity: mob_behavior_unit(mob_behavior_delta(pos, anchor))
+                        .map(|c| c * Self::CLIMB_SPEED),
+                    attack: None,
+                }
+            }
+        }
+    }
+}
+
+// --- Pillager: crossbow charge + strafe ---
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum PillagerAction {
+    Shoot { target: i32 },
+}
+
+/// Vanilla `CrossbowItem.getChargeDuration` is 1.25 s = 25 ticks.
+#[cfg_attr(not(test), allow(dead_code))]
+const PILLAGER_CROSSBOW_CHARGE_TICKS: u8 = 25;
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct PillagerBehavior {
+    charge_ticks: u8,
+    strafe_clockwise: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PillagerBehavior {
+    /// `RangedCrossbowAttackMob` holds roughly a 10 m ring around the target.
+    const STRAFE_RANGE: f64 = 12.0;
+    const STRAFE_MIN: f64 = 4.0;
+    const STRAFE_SPEED: f64 = 0.5;
+
+    fn new() -> Self {
+        Self {
+            charge_ticks: 0,
+            strafe_clockwise: true,
+        }
+    }
+
+    /// `distance` is the horizontal gap to the visible target; the strafe is
+    /// the same shape as the skeleton's, just the pillager's band and speed.
+    fn strafe_velocity(&self, distance: f64, forward: bool) -> [f64; 3] {
+        if distance < Self::STRAFE_MIN || distance > Self::STRAFE_RANGE {
+            return [0.0; 3];
+        }
+        let direction = if self.strafe_clockwise { 1.0 } else { -1.0 };
+        let ahead = if forward { 1.0 } else { -1.0 };
+        [
+            direction * Self::STRAFE_SPEED * 0.5,
+            0.0,
+            ahead * Self::STRAFE_SPEED * 0.5,
+        ]
+    }
+
+    /// `Some(eid)` while a target is visible. A charge started stays latched
+    /// while the crossbow loads, then releases the bolt on the 25th tick.
+    fn tick(&mut self, target: Option<i32>) -> Option<PillagerAction> {
+        let Some(target) = target else {
+            self.charge_ticks = 0;
+            return None;
+        };
+        if self.charge_ticks < PILLAGER_CROSSBOW_CHARGE_TICKS {
+            self.charge_ticks += 1;
+            return None;
+        }
+        self.charge_ticks = 0;
+        Some(PillagerAction::Shoot { target })
+    }
+}
+
+// --- Evoker: fangs, vex summon, wololo ---
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvokerSpell {
+    /// 16 fangs marching toward the victim.
+    FangLine,
+    /// The close-range defense: an inner ring of 5 and an outer ring of 8.
+    FangCircle,
+    SummonVex,
+    /// The blue-sheep-to-red-sheep easter egg.
+    Wololo,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum EvokerEvent {
+    FangAttack { positions: Vec<[i32; 3]> },
+    SummonVex { count: u8 },
+    Wololo { target: i32 },
+}
+
+/// Vanilla `SpellcastingIllager` warmup for the fang spells is 40 ticks.
+#[cfg_attr(not(test), allow(dead_code))]
+const EVOKER_SPELL_WARMUP: u8 = 40;
+/// The summoning spell's post-cast cooldown.
+#[cfg_attr(not(test), allow(dead_code))]
+const EVOKER_VEX_COOLDOWN: u16 = 100;
+/// Wololo also rests between casts.
+#[cfg_attr(not(test), allow(dead_code))]
+const EVOKER_WOLOLO_COOLDOWN: u16 = 100;
+/// The wololo spell reaches blue sheep up to 16 blocks away.
+#[cfg_attr(not(test), allow(dead_code))]
+const EVOKER_WOLOLO_RANGE: f64 = 16.0;
+#[cfg_attr(not(test), allow(dead_code))]
+const EVOKER_FANG_LINE_COUNT: usize = 16;
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn evoker_fang_line(from: [f64; 3], to: [f64; 3]) -> Vec<[i32; 3]> {
+    // Vanilla advances each fang 1.25 blocks along the ray to the target.
+    let [dx, _, dz] = mob_behavior_delta(from, to);
+    let yaw = dz.atan2(dx);
+    let ground_y = to[1].floor() as i32;
+    (1..=EVOKER_FANG_LINE_COUNT)
+        .map(|i| {
+            let reach = i as f64 * 1.25;
+            [
+                (from[0] + reach * yaw.cos()).floor() as i32,
+                ground_y,
+                (from[2] + reach * yaw.sin()).floor() as i32,
+            ]
+        })
+        .collect()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn evoker_fang_circle(center: [f64; 3]) -> Vec<[i32; 3]> {
+    let mut positions = Vec::with_capacity(13);
+    let ground_y = center[1].floor() as i32;
+    for (count, radius) in [(5usize, 1.5f64), (8, 2.5)] {
+        for i in 0..count {
+            let angle = 2.0 * std::f64::consts::PI * i as f64 / count as f64;
+            positions.push([
+                (center[0] + radius * angle.cos()).floor() as i32,
+                ground_y,
+                (center[2] + radius * angle.sin()).floor() as i32,
+            ]);
+        }
+    }
+    positions
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct EvokerBehavior {
+    cast: Option<(EvokerSpell, u8)>,
+    /// Fang-line direction source or the wololo victim position, taken at cast.
+    cast_anchor: Option<[f64; 3]>,
+    cast_eid: Option<i32>,
+    vex_cooldown: u16,
+    wololo_cooldown: u16,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl EvokerBehavior {
+    /// `FangCircle` when the victim closes to melee, `FangLine` otherwise.
+    const FANG_CIRCLE_RANGE: f64 = 3.0;
+    const FANG_LINE_RANGE: f64 = 15.0;
+
+    fn new() -> Self {
+        Self {
+            cast: None,
+            cast_anchor: None,
+            cast_eid: None,
+            vex_cooldown: 0,
+            wololo_cooldown: 0,
+        }
+    }
+
+    fn casting(&self) -> bool {
+        self.cast.is_some()
+    }
+
+    /// `target` is `(eid, position)`; `blue_sheep` is `(eid, position)` of
+    /// blue-wool sheep the world noticed this tick.
+    fn tick(
+        &mut self,
+        pos: [f64; 3],
+        target: Option<(i32, [f64; 3])>,
+        blue_sheep: &[(i32, [f64; 3])],
+    ) -> Option<EvokerEvent> {
+        self.vex_cooldown = self.vex_cooldown.saturating_sub(1);
+        self.wololo_cooldown = self.wololo_cooldown.saturating_sub(1);
+
+        if let Some((spell, ticks)) = self.cast {
+            if ticks > 1 {
+                self.cast = Some((spell, ticks - 1));
+                return None;
+            }
+            self.cast = None;
+            return Some(match spell {
+                EvokerSpell::FangLine => EvokerEvent::FangAttack {
+                    positions: evoker_fang_line(pos, self.cast_anchor.take().unwrap_or(pos)),
+                },
+                EvokerSpell::FangCircle => EvokerEvent::FangAttack {
+                    positions: evoker_fang_circle(pos),
+                },
+                EvokerSpell::SummonVex => {
+                    self.vex_cooldown = EVOKER_VEX_COOLDOWN;
+                    EvokerEvent::SummonVex { count: 3 }
+                }
+                EvokerSpell::Wololo => {
+                    self.wololo_cooldown = EVOKER_WOLOLO_COOLDOWN;
+                    EvokerEvent::Wololo {
+                        target: self.cast_eid.take().unwrap_or(0),
+                    }
+                }
+            });
+        }
+
+        // An idle evoker with a blue sheep in reach does the wololo.
+        if target.is_none() && self.wololo_cooldown == 0 {
+            if let Some(&(eid, _)) = blue_sheep
+                .iter()
+                .filter(|&(_, sheep_pos)| {
+                    let delta = mob_behavior_delta(pos, *sheep_pos);
+                    mob_behavior_dot(delta, delta) <= EVOKER_WOLOLO_RANGE * EVOKER_WOLOLO_RANGE
+                })
+                .min_by(|a, b| {
+                    let da = mob_behavior_delta(pos, a.1);
+                    let db = mob_behavior_delta(pos, b.1);
+                    mob_behavior_dot(da, da).total_cmp(&mob_behavior_dot(db, db))
+                })
+            {
+                self.cast = Some((EvokerSpell::Wololo, EVOKER_SPELL_WARMUP));
+                self.cast_eid = Some(eid);
+                return None;
+            }
+        }
+        let Some((_, target_pos)) = target else {
+            return None;
+        };
+        let [dx, _, dz] = mob_behavior_delta(pos, target_pos);
+        let distance = dx.hypot(dz);
+        let spell = if self.vex_cooldown == 0 {
+            EvokerSpell::SummonVex
+        } else if distance <= Self::FANG_CIRCLE_RANGE {
+            EvokerSpell::FangCircle
+        } else if distance <= Self::FANG_LINE_RANGE {
+            EvokerSpell::FangLine
+        } else {
+            return None;
+        };
+        self.cast = Some((spell, EVOKER_SPELL_WARMUP));
+        self.cast_anchor = Some(target_pos);
+        None
+    }
+}
+
+// --- Guardian / elder guardian ---
+
+/// `GuardianAttackGoal.getAttackDuration` is 80 ticks (4 s) of beam charge.
+#[cfg_attr(not(test), allow(dead_code))]
+const GUARDIAN_LASER_TICKS: u16 = 80;
+/// The guardian's follow range is 16 blocks.
+#[cfg_attr(not(test), allow(dead_code))]
+const GUARDIAN_ATTACK_RANGE: f64 = 16.0;
+/// Normal-difficulty beam damage; easy deals 5, hard deals 9.
+#[cfg_attr(not(test), allow(dead_code))]
+const GUARDIAN_LASER_DAMAGE: f32 = 6.0;
+/// Elder guardian beam damage on normal; easy 5, hard 12.
+#[cfg_attr(not(test), allow(dead_code))]
+const ELDER_GUARDIAN_LASER_DAMAGE: f32 = 8.0;
+/// The aura reaches every player within 50 blocks every 1200 ticks (60 s).
+#[cfg_attr(not(test), allow(dead_code))]
+const ELDER_FATIGUE_RADIUS: f64 = 50.0;
+#[cfg_attr(not(test), allow(dead_code))]
+const ELDER_FATIGUE_PERIOD: u16 = 1200;
+/// Mining Fatigue III: amplifier 2, applied for 5 minutes = 6000 ticks.
+#[cfg_attr(not(test), allow(dead_code))]
+const ELDER_FATIGUE_AMPLIFIER: u8 = 2;
+#[cfg_attr(not(test), allow(dead_code))]
+const ELDER_FATIGUE_DURATION: i32 = 6000;
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum GuardianEvent {
+    Laser { target: i32, damage: f32 },
+    MiningFatigue { target: i32 },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct GuardianBehavior {
+    elder: bool,
+    attack_ticks: u16,
+    aura_ticks: u16,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl GuardianBehavior {
+    fn new(elder: bool) -> Self {
+        Self {
+            elder,
+            attack_ticks: 0,
+            aura_ticks: 0,
+        }
+    }
+
+    fn damage(&self) -> f32 {
+        if self.elder {
+            ELDER_GUARDIAN_LASER_DAMAGE
+        } else {
+            GUARDIAN_LASER_DAMAGE
+        }
+    }
+
+    /// `target` is `(eid, distance)` of a visible victim. The beam needs line
+    /// of sight the whole charge; losing it resets the 4 s timer.
+    fn tick(&mut self, target: Option<(i32, f64)>) -> Vec<GuardianEvent> {
+        let mut events = Vec::new();
+        if self.elder {
+            self.aura_ticks += 1;
+            if self.aura_ticks >= ELDER_FATIGUE_PERIOD {
+                self.aura_ticks = 0;
+                if let Some((eid, distance)) = target {
+                    if distance <= ELDER_FATIGUE_RADIUS {
+                        events.push(GuardianEvent::MiningFatigue { target: eid });
+                    }
+                }
+            }
+        }
+        let Some((eid, _)) = target.filter(|&(_, d)| d <= GUARDIAN_ATTACK_RANGE) else {
+            self.attack_ticks = 0;
+            return events;
+        };
+        self.attack_ticks += 1;
+        if self.attack_ticks >= GUARDIAN_LASER_TICKS {
+            self.attack_ticks = 0;
+            events.push(GuardianEvent::Laser {
+                target: eid,
+                damage: self.damage(),
+            });
+        }
+        events
+    }
+}
+
+// --- Warden melee / unreachable-ranged combat plan ---
+//
+// `WardenBehavior` above owns the vibration-anger loop (0..=150, agitated at
+// 80, -1/s decay, +35 per vibration — a sniff contributes the same 35). This
+// plan owns the attack choice once a target exists: melee at reach, or the
+// sonic boom after 200 ticks without reach — 60-tick charge, then a hit that
+// pierces armor and shields and ignores blocks in the way.
+
+#[cfg_attr(not(test), allow(dead_code))]
+const WARDEN_MELEE_DAMAGE: f32 = 30.0;
+#[cfg_attr(not(test), allow(dead_code))]
+const WARDEN_SONIC_TRIGGER_TICKS: u16 = 200;
+#[cfg_attr(not(test), allow(dead_code))]
+const WARDEN_SONIC_CHARGE_TICKS: u8 = 60;
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Default)]
+struct WardenCombatPlan {
+    unreachable_ticks: u16,
+    sonic_charge: u8,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WardenCombatPlan {
+    /// `reachable` is the caller's melee-reach verdict for this tick.
+    fn tick(&mut self, target: Option<i32>, reachable: bool) -> Option<WardenEvent> {
+        let target = target?;
+        if reachable {
+            self.unreachable_ticks = 0;
+            self.sonic_charge = 0;
+            return Some(WardenEvent::Melee {
+                target,
+                damage: WARDEN_MELEE_DAMAGE,
+            });
+        }
+        self.unreachable_ticks = self.unreachable_ticks.saturating_add(1);
+        if self.sonic_charge > 0 {
+            self.sonic_charge -= 1;
+            if self.sonic_charge == 0 {
+                self.unreachable_ticks = 0;
+                return Some(WardenEvent::SonicBoom {
+                    target,
+                    damage: 10.0,
+                    bypass_armor: true,
+                    bypass_shield: true,
+                });
+            }
+            return None;
+        }
+        if self.unreachable_ticks >= WARDEN_SONIC_TRIGGER_TICKS {
+            self.sonic_charge = WARDEN_SONIC_CHARGE_TICKS;
+            return Some(WardenEvent::ChargeSonicBoom { target });
+        }
+        None
+    }
+}
+
+// ---------- P6a / #220: projectile despawn & ground-life rules ----------
+//
+// Vanilla keeps no artificial in-flight lifetime on arrows, tridents,
+// throwables or fireballs: a projectile lives until it lands, hits, or leaves
+// the world. `AbstractArrow` counts `inGroundTime` only while `in_ground` —
+// 1200 ticks (60 s) — and a dislodged arrow that starts falling again resets
+// the timer. A Loyalty trident returning to its owner never despawns.
+
+/// Out-of-bounds: `Y < min_y - 64` discards regardless of family.
+#[cfg_attr(not(test), allow(dead_code))]
+const PROJECTILE_VOID_MARGIN: i32 = 64;
+/// `AbstractArrow` ground-life budget in ticks (60 s).
+#[cfg_attr(not(test), allow(dead_code))]
+const ARROW_GROUND_LIFE_TICKS: u32 = 1200;
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectileFamily {
+    Arrow,
+    SpectralArrow,
+    Trident,
+    /// Snowballs, ender pearls, eggs, thrown potions, experience bottles.
+    Throwable,
+    /// Ghast/blaze/dragon fireballs, wither skulls, wind charges.
+    Fireball,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ProjectileFamily {
+    /// Only `AbstractArrow` subclasses carry the `in_ground` life timer.
+    fn has_ground_life(self) -> bool {
+        matches!(
+            self,
+            Self::Arrow | Self::SpectralArrow | Self::Trident
+        )
+    }
+}
+
+/// One tick of the observations the despawn rule reads.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+struct ProjectileTick {
+    family: ProjectileFamily,
+    in_ground: bool,
+    /// A Loyalty trident on the way back to its owner.
+    returning_to_owner: bool,
+    y: f64,
+    min_y: i32,
+    chunk_loaded: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Default)]
+struct ProjectileDespawnPolicy {
+    /// `AbstractArrow.inGroundTime`.
+    ground_life: u32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ProjectileDespawnPolicy {
+    fn new() -> Self {
+        Self { ground_life: 0 }
+    }
+
+    fn grounded_ticks(&self) -> u32 {
+        self.ground_life
+    }
+
+    /// Returns true when the projectile must be discarded this tick.
+    fn tick(&mut self, tick: ProjectileTick) -> bool {
+        // A returning Loyalty trident can cross the void and still lives.
+        if tick.returning_to_owner {
+            return false;
+        }
+        // No ticking in unloaded chunks — an entity that unloaded despawns.
+        if !tick.chunk_loaded {
+            return true;
+        }
+        if tick.y < f64::from(tick.min_y - PROJECTILE_VOID_MARGIN) {
+            return true;
+        }
+        if tick.in_ground && tick.family.has_ground_life() {
+            self.ground_life = self.ground_life.saturating_add(1);
+            return self.ground_life >= ARROW_GROUND_LIFE_TICKS;
+        }
+        if !tick.in_ground {
+            // In-flight or dislodged: no lifetime cap, ground timer resets.
+            self.ground_life = 0;
+        }
+        false
     }
 }
 
@@ -4027,5 +4683,577 @@ mod p2_parity_mob_tests {
             "maxEntityCramming=0 disables cramming damage"
         );
         gamerule_atomic_store("maxEntityCramming", 24);
+    }
+}
+
+#[cfg(test)]
+mod p6a_parity_tests {
+    use super::*;
+
+    fn zero(_: u32) -> u32 {
+        0
+    }
+
+    // ---------- #219: hostile families ----------
+
+    #[test]
+    fn p6a_parity_enderman_stare_angle_pumpkin_and_teleport_bounds() {
+        let eye = [0.0, 1.62, 0.0];
+        let enderman = [10.0, 2.55, 0.0];
+        // A direct stare inside 64 blocks aggroes; a carved pumpkin blinds it.
+        assert!(enderman_stared_at(eye, [1.0, 0.06, 0.0], enderman, "air", true));
+        assert!(!enderman_stared_at(
+            eye,
+            [1.0, 0.06, 0.0],
+            enderman,
+            "minecraft:carved_pumpkin",
+            true
+        ));
+        // Blocked line of sight never aggroes, whatever the angle.
+        assert!(!enderman_stared_at(eye, [1.0, 0.06, 0.0], enderman, "air", false));
+        // Perpendicular gaze is far outside the 0.025 cone.
+        assert!(!enderman_stared_at(eye, [0.0, 0.0, 1.0], enderman, "air", true));
+        // Past 64 blocks there is no stare check at all.
+        assert!(!enderman_stared_at(eye, [1.0, 0.0, 0.0], [65.0, 2.55, 0.0], "air", true));
+
+        // A water escape keeps the destination within the vanilla attempt box
+        // and a projectile escape additionally rejects the incoming damage.
+        let draws = std::cell::Cell::new(0u32);
+        let mut draw = |bound: u32| {
+            draws.set(draws.get() + 1);
+            bound / 2
+        };
+        let escape = enderman_escape(
+            EndermanHazard::Water,
+            [0.0, 70.0, 0.0],
+            -64..320,
+            |[_, y, _]| EndermanTeleportBlock {
+                blocks_motion: y == 60,
+                liquid: false,
+            },
+            |_| true,
+            &mut draw,
+        );
+        let [x, y, z] = escape.destination.expect("open world teleports");
+        assert!((-32.0..=32.0).contains(&x) && (-32.0..=32.0).contains(&z));
+        assert!((38.0..=102.0).contains(&y), "y must stay within +/-32 of 70");
+        assert!(!escape.reject_damage);
+        assert!(draws.get() <= 3 * 64, "at most 64 attempts of three draws");
+        // With no legal destination the 64-attempt budget exhausts at 192 draws.
+        draws.set(0);
+        let nowhere = enderman_escape(
+            EndermanHazard::Projectile,
+            [0.0, 70.0, 0.0],
+            -64..320,
+            |_| EndermanTeleportBlock::default(),
+            |_| false,
+            &mut draw,
+        );
+        assert!(nowhere.destination.is_none());
+        assert!(nowhere.reject_damage);
+        assert_eq!(draws.get(), 192);
+    }
+
+    #[test]
+    fn p6a_parity_blaze_burst_hazards_and_hover() {
+        // 60-tick charge, three shots at 6-tick spacing, 100-tick cooldown.
+        let mut blaze = BlazeBehavior::new();
+        for _ in 0..60 {
+            assert!(blaze.tick(Some((7, 12.0))).is_none());
+        }
+        assert!(blaze.on_fire());
+        for _ in 0..60 {
+            assert!(blaze.tick(Some((7, 12.0))).is_none());
+        }
+        let mut shots = 0;
+        for gap in [1, 6, 6] {
+            for _ in 0..gap {
+                if let Some(BlazeAttack::SmallFireball { target: 7 }) =
+                    blaze.tick(Some((7, 12.0)))
+                {
+                    shots += 1;
+                }
+            }
+        }
+        assert_eq!(shots, 3);
+        assert_eq!(blaze.phase, BlazePhase::Cooldown(100));
+        // Water hurts for 1, a snowball for 3.
+        assert_eq!(blaze_hazard_damage(BlazeHazard::Water), 1.0);
+        assert_eq!(blaze_hazard_damage(BlazeHazard::Snowball), 3.0);
+        // The flight hover target is half a block above the victim's mid-body.
+        assert_eq!(blaze_hover_y([0.0, 64.0, 0.0], 1.8), 65.4);
+    }
+
+    #[test]
+    fn p6a_parity_witch_drinks_and_chooses_splash_by_distance_and_hp() {
+        // Drinking priorities: water breathing underwater, fire resistance in
+        // fire, healing while hurt, swiftness against a far chase.
+        let mut witch = WitchBehavior::default();
+        let needs = |underwater, fire, hurt, chase| WitchNeeds {
+            underwater,
+            in_fire_or_lava: fire,
+            hurt,
+            chase_distance: chase,
+        };
+        assert_eq!(
+            witch.tick_drinking(needs(true, false, false, None), &[], &mut zero),
+            Some(WitchAction::StartDrinking(WitchPotion::WaterBreathing))
+        );
+        let mut witch = WitchBehavior::default();
+        assert_eq!(
+            witch.tick_drinking(needs(false, true, false, None), &[], &mut zero),
+            Some(WitchAction::StartDrinking(WitchPotion::FireResistance))
+        );
+        let mut witch = WitchBehavior::default();
+        assert_eq!(
+            witch.tick_drinking(needs(false, false, true, None), &[], &mut zero),
+            Some(WitchAction::StartDrinking(WitchPotion::Healing))
+        );
+        // Splash selection: Slowness beyond 8m, Poison at target hp >= 8,
+        // Weakness inside 3m on a 1-in-4 roll, otherwise Harming.
+        let witch = WitchBehavior::default();
+        assert_eq!(
+            witch.splash(
+                WitchTarget {
+                    entity: 7,
+                    horizontal_distance: 9.0,
+                    hp: 20.0,
+                    effects: &[],
+                },
+                &mut zero,
+            ),
+            Some(WitchAction::Splash {
+                target: 7,
+                potion: WitchPotion::Slowness
+            })
+        );
+        assert_eq!(
+            witch.splash(
+                WitchTarget {
+                    entity: 7,
+                    horizontal_distance: 5.0,
+                    hp: 8.0,
+                    effects: &[],
+                },
+                &mut zero,
+            ),
+            Some(WitchAction::Splash {
+                target: 7,
+                potion: WitchPotion::Poison
+            })
+        );
+        assert_eq!(
+            witch.splash(
+                WitchTarget {
+                    entity: 7,
+                    horizontal_distance: 2.0,
+                    hp: 2.0,
+                    effects: &[],
+                },
+                &mut zero,
+            ),
+            Some(WitchAction::Splash {
+                target: 7,
+                potion: WitchPotion::Weakness
+            })
+        );
+        assert_eq!(
+            witch.splash(
+                WitchTarget {
+                    entity: 7,
+                    horizontal_distance: 2.0,
+                    hp: 2.0,
+                    effects: &[WitchPotion::Weakness],
+                },
+                &mut zero,
+            ),
+            Some(WitchAction::Splash {
+                target: 7,
+                potion: WitchPotion::Harming
+            })
+        );
+    }
+
+    #[test]
+    fn p6a_parity_phantom_circles_swoops_hits_and_climbs() {
+        let mut phantom = PhantomBehavior::new();
+        let target_pos = [10.0, 64.0, -4.0];
+        // First tick latches the orbit anchor 20–30 blocks above the target.
+        let tick = phantom.tick([0.0, 90.0, 0.0], Some((7, target_pos)), &mut zero);
+        let anchor = phantom.anchor.expect("circling needs an anchor");
+        assert!((84.0..=94.0).contains(&anchor[1]));
+        assert!((target_pos[0] - 10.0..=target_pos[0] + 10.0).contains(&anchor[0]));
+        assert_eq!(tick.velocity, [0.0; 3]);
+        assert_eq!(phantom.phase, PhantomPhase::Circle);
+        // Orbit until the dive: 60 circle ticks then a swoop.
+        for _ in 0..58 {
+            let tick = phantom.tick(anchor, Some((7, target_pos)), &mut zero);
+            assert_eq!(phantom.phase, PhantomPhase::Circle);
+            assert!(tick.attack.is_none());
+        }
+        let _ = phantom.tick(anchor, Some((7, target_pos)), &mut zero);
+        assert_eq!(phantom.phase, PhantomPhase::Swoop);
+        // Dive: 3 blocks over the victim closes inside a tick or two.
+        let mut pos = [target_pos[0], target_pos[1] + 3.0, target_pos[2]];
+        let mut hit = None;
+        for _ in 0..PhantomBehavior::SWOOP_TIMEOUT_TICKS {
+            let tick = phantom.tick(pos, Some((7, target_pos)), &mut zero);
+            pos = std::array::from_fn(|i| pos[i] + tick.velocity[i]);
+            if let Some(eid) = tick.attack {
+                hit = Some(eid);
+                break;
+            }
+        }
+        assert_eq!(hit, Some(7));
+        assert_eq!(PHANTOM_ATTACK_DAMAGE, 2.0);
+        assert_eq!(phantom.phase, PhantomPhase::Climb);
+        // The climb restores altitude and falls back to circling.
+        let mut pos = target_pos;
+        for _ in 0..PhantomBehavior::CLIMB_TIMEOUT_TICKS + 10 {
+            let tick = phantom.tick(pos, Some((7, target_pos)), &mut zero);
+            if phantom.phase == PhantomPhase::Circle {
+                break;
+            }
+            pos = std::array::from_fn(|i| pos[i] + tick.velocity[i]);
+        }
+        assert_eq!(phantom.phase, PhantomPhase::Circle);
+        // Daylight burns phantoms in the open sky.
+        assert!(phantom_burns_in_sun(true, true, 0.6));
+        assert!(!phantom_burns_in_sun(false, true, 0.6));
+        assert!(!phantom_burns_in_sun(true, false, 0.6));
+    }
+
+    #[test]
+    fn p6a_parity_pillager_charges_25_ticks_and_strafes_in_band() {
+        let mut pillager = PillagerBehavior::new();
+        for _ in 0..PILLAGER_CROSSBOW_CHARGE_TICKS {
+            assert!(pillager.tick(Some(7)).is_none());
+        }
+        assert_eq!(
+            pillager.tick(Some(7)),
+            Some(PillagerAction::Shoot { target: 7 })
+        );
+        // A lost target re-arms the charge.
+        for _ in 0..10 {
+            assert!(pillager.tick(None).is_none());
+        }
+        for _ in 0..PILLAGER_CROSSBOW_CHARGE_TICKS {
+            assert!(pillager.tick(Some(7)).is_none());
+        }
+        assert_eq!(
+            pillager.tick(Some(7)),
+            Some(PillagerAction::Shoot { target: 7 })
+        );
+        // The strafe only applies inside the 4–12 m ring.
+        assert_eq!(pillager.strafe_velocity(3.9, true), [0.0; 3]);
+        assert_eq!(pillager.strafe_velocity(12.1, true), [0.0; 3]);
+        assert_ne!(pillager.strafe_velocity(8.0, true), [0.0; 3]);
+    }
+
+    #[test]
+    fn p6a_parity_evoker_fangs_vex_cooldown_and_wololo() {
+        let pos = [0.0, 64.0, 0.0];
+        // Vex summon wins when its cooldown is ready; it casts for 40 ticks.
+        let mut evoker = EvokerBehavior::new();
+        for _ in 0..EVOKER_SPELL_WARMUP {
+            assert!(evoker.tick(pos, Some((7, [10.0, 64.0, 0.0])), &[]).is_none());
+            assert!(evoker.casting());
+        }
+        assert_eq!(
+            evoker.tick(pos, Some((7, [10.0, 64.0, 0.0])), &[]),
+            Some(EvokerEvent::SummonVex { count: 3 })
+        );
+        assert_eq!(evoker.vex_cooldown, EVOKER_VEX_COOLDOWN);
+        // While the vex cooldown runs the evoker falls back to fangs: a line
+        // of 16 marching toward a 10 m victim.
+        for _ in 0..EVOKER_SPELL_WARMUP {
+            assert!(evoker.tick(pos, Some((7, [10.0, 64.0, 0.0])), &[]).is_none());
+        }
+        let Some(EvokerEvent::FangAttack { positions }) =
+            evoker.tick(pos, Some((7, [10.0, 64.0, 0.0])), &[])
+        else {
+            panic!("expected a fang line");
+        };
+        assert_eq!(positions.len(), EVOKER_FANG_LINE_COUNT);
+        let xs: Vec<i32> = positions.iter().map(|p| p[0]).collect();
+        assert!(xs.windows(2).all(|w| w[1] >= w[0]), "fangs march toward +x");
+        assert_eq!(positions[0][0], 1);
+        // A victim inside 3 m triggers the circle defense instead.
+        let mut evoker = EvokerBehavior::new();
+        evoker.vex_cooldown = EVOKER_VEX_COOLDOWN;
+        for _ in 0..EVOKER_SPELL_WARMUP {
+            assert!(evoker.tick(pos, Some((7, [2.0, 64.0, 0.0])), &[]).is_none());
+        }
+        let Some(EvokerEvent::FangAttack { positions }) =
+            evoker.tick(pos, Some((7, [2.0, 64.0, 0.0])), &[])
+        else {
+            panic!("expected a fang circle");
+        };
+        assert_eq!(positions.len(), 13); // 5 inner + 8 outer
+        // Idle, a blue sheep inside 16 m gets the wololo; outside it does not.
+        let mut evoker = EvokerBehavior::new();
+        assert!(evoker.tick(pos, None, &[(9, [14.0, 64.0, 0.0])]).is_none());
+        for _ in 0..EVOKER_SPELL_WARMUP - 1 {
+            assert!(evoker.tick(pos, None, &[(9, [14.0, 64.0, 0.0])]).is_none());
+        }
+        assert_eq!(
+            evoker.tick(pos, None, &[(9, [14.0, 64.0, 0.0])]),
+            Some(EvokerEvent::Wololo { target: 9 })
+        );
+        let mut evoker = EvokerBehavior::new();
+        for _ in 0..200 {
+            assert!(evoker.tick(pos, None, &[(9, [20.0, 64.0, 0.0])]).is_none());
+        }
+    }
+
+    #[test]
+    fn p6a_parity_warden_anger_decay_melee_and_unreachable_sonic() {
+        // Vibrations add 35 each against the 150 roar ceiling; 80 agitates.
+        let mut anger = WardenAngerManagement::default();
+        assert_eq!(anger.add_vibration(7), 35);
+        assert!(!anger.agitated(7));
+        assert_eq!(anger.add_sniff(7), 70);
+        assert_eq!(anger.add_vibration(7), 105);
+        assert!(anger.agitated(7));
+        // Anger decays one point per second (per 20 ticks).
+        for _ in 0..20 {
+            anger.tick();
+        }
+        assert_eq!(anger.anger(7), 104);
+        // Reachable targets eat the 30-damage melee.
+        let mut plan = WardenCombatPlan::default();
+        assert_eq!(
+            plan.tick(Some(7), true),
+            Some(WardenEvent::Melee {
+                target: 7,
+                damage: WARDEN_MELEE_DAMAGE
+            })
+        );
+        assert_eq!(WARDEN_MELEE_DAMAGE, 30.0);
+        // After 200 unreachable ticks the 60-tick sonic charge starts.
+        for _ in 0..WARDEN_SONIC_TRIGGER_TICKS - 1 {
+            assert!(plan.tick(Some(7), false).is_none());
+        }
+        assert_eq!(
+            plan.tick(Some(7), false),
+            Some(WardenEvent::ChargeSonicBoom { target: 7 })
+        );
+        for _ in 0..WARDEN_SONIC_CHARGE_TICKS - 1 {
+            assert!(plan.tick(Some(7), false).is_none());
+        }
+        assert_eq!(
+            plan.tick(Some(7), false),
+            Some(WardenEvent::SonicBoom {
+                target: 7,
+                damage: 10.0,
+                bypass_armor: true,
+                bypass_shield: true,
+            })
+        );
+        // A returned reach resets the unreachable counter.
+        assert_eq!(
+            plan.tick(Some(7), true),
+            Some(WardenEvent::Melee {
+                target: 7,
+                damage: WARDEN_MELEE_DAMAGE
+            })
+        );
+        for _ in 0..WARDEN_SONIC_TRIGGER_TICKS - 1 {
+            assert!(plan.tick(Some(7), false).is_none());
+        }
+        assert_eq!(
+            plan.tick(Some(7), false),
+            Some(WardenEvent::ChargeSonicBoom { target: 7 })
+        );
+    }
+
+    #[test]
+    fn p6a_parity_guardian_80_tick_laser_and_elder_fatigue_aura() {
+        // The beam charges for 80 ticks against a visible target in 16 m.
+        let mut guardian = GuardianBehavior::new(false);
+        for _ in 0..GUARDIAN_LASER_TICKS - 1 {
+            assert!(guardian.tick(Some((7, 10.0))).is_empty());
+        }
+        assert_eq!(
+            guardian.tick(Some((7, 10.0))),
+            [GuardianEvent::Laser {
+                target: 7,
+                damage: GUARDIAN_LASER_DAMAGE
+            }]
+        );
+        // Losing the beam target resets the charge.
+        assert!(guardian.tick(None).is_empty());
+        for _ in 0..GUARDIAN_LASER_TICKS - 1 {
+            assert!(guardian.tick(Some((7, 10.0))).is_empty());
+        }
+        // Outside the 16 m attack range the laser never charges.
+        let mut guardian = GuardianBehavior::new(false);
+        for _ in 0..200 {
+            assert!(guardian.tick(Some((7, 16.5))).is_empty());
+        }
+        // The elder guardian hits harder and paces the 50 m fatigue aura every
+        // 1200 ticks.
+        let mut elder = GuardianBehavior::new(true);
+        for _ in 0..GUARDIAN_LASER_TICKS - 1 {
+            elder.tick(Some((7, 10.0)));
+        }
+        assert_eq!(
+            elder.tick(Some((7, 10.0))),
+            [GuardianEvent::Laser {
+                target: 7,
+                damage: ELDER_GUARDIAN_LASER_DAMAGE
+            }]
+        );
+        let mut elder = GuardianBehavior::new(true);
+        for _ in 0..ELDER_FATIGUE_PERIOD - 1 {
+            elder.tick(Some((7, 30.0)));
+        }
+        assert_eq!(
+            elder.tick(Some((7, 30.0))),
+            [GuardianEvent::MiningFatigue { target: 7 }]
+        );
+        let mut elder = GuardianBehavior::new(true);
+        for _ in 0..ELDER_FATIGUE_PERIOD {
+            assert!(elder.tick(Some((7, 55.0))).is_empty());
+        }
+        assert_eq!(ELDER_FATIGUE_AMPLIFIER, 2);
+        assert_eq!(ELDER_FATIGUE_DURATION, 6000);
+    }
+
+    #[test]
+    fn p6a_parity_ghast_100_block_sight_and_20_tick_volley() {
+        assert!(ghast_acquires_target(100.0));
+        assert!(!ghast_acquires_target(100.5));
+        // 20 ticks of charge -> fireball, then a 60-tick cycle to the next.
+        let mut ghast = GhastBehavior::new(4, 80.0);
+        let delta = Some([10.0, 0.0, 0.0]);
+        let mut warnings = 0;
+        for _ in 0..10 {
+            if ghast.tick(delta, true) == Some(GhastAttack::Warning) {
+                warnings += 1;
+            }
+        }
+        assert_eq!(warnings, 1);
+        for _ in 0..9 {
+            assert!(ghast.tick(delta, true).is_none());
+        }
+        assert!(matches!(ghast.tick(delta, true), Some(GhastAttack::Fire(_))));
+        for _ in 0..59 {
+            assert!(!matches!(
+                ghast.tick(delta, true),
+                Some(GhastAttack::Fire(_))
+            ));
+        }
+        assert!(matches!(ghast.tick(delta, true), Some(GhastAttack::Fire(_))));
+    }
+
+    // ---------- #220: projectile despawn ----------
+
+    fn flying(family: ProjectileFamily) -> ProjectileTick {
+        ProjectileTick {
+            family,
+            in_ground: false,
+            returning_to_owner: false,
+            y: 64.0,
+            min_y: -64,
+            chunk_loaded: true,
+        }
+    }
+
+    #[test]
+    fn p6a_parity_in_flight_projectile_never_despawns_artificially() {
+        for family in [
+            ProjectileFamily::Arrow,
+            ProjectileFamily::SpectralArrow,
+            ProjectileFamily::Trident,
+            ProjectileFamily::Throwable,
+            ProjectileFamily::Fireball,
+        ] {
+            let mut policy = ProjectileDespawnPolicy::new();
+            for _ in 0..2200 {
+                assert!(!policy.tick(flying(family)), "{family:?} must keep flying");
+            }
+            assert_eq!(policy.grounded_ticks(), 0);
+        }
+    }
+
+    #[test]
+    fn p6a_parity_grounded_arrow_1200_ticks_and_dislodge_reset() {
+        let grounded = |family| ProjectileTick {
+            in_ground: true,
+            ..flying(family)
+        };
+        // Exactly 1200 grounded ticks discards arrows and spectral arrows.
+        for family in [ProjectileFamily::Arrow, ProjectileFamily::SpectralArrow] {
+            let mut policy = ProjectileDespawnPolicy::new();
+            for _ in 0..ARROW_GROUND_LIFE_TICKS - 1 {
+                assert!(!policy.tick(grounded(family)), "{family:?} early despawn");
+            }
+            assert!(policy.tick(grounded(family)), "{family:?} lives past 1200");
+        }
+        // A broken support resets the timer: 600 grounded + dislodged + 1200
+        // fresh grounded ticks are needed before despawn.
+        let mut policy = ProjectileDespawnPolicy::new();
+        for _ in 0..600 {
+            policy.tick(grounded(ProjectileFamily::Arrow));
+        }
+        assert_eq!(policy.grounded_ticks(), 600);
+        assert!(!policy.tick(flying(ProjectileFamily::Arrow)));
+        assert_eq!(policy.grounded_ticks(), 0, "a dislodged arrow restarts");
+        for _ in 0..ARROW_GROUND_LIFE_TICKS - 1 {
+            assert!(!policy.tick(grounded(ProjectileFamily::Arrow)));
+        }
+        assert!(policy.tick(grounded(ProjectileFamily::Arrow)));
+        // Throwables and fireballs never take the ground-life rule at all.
+        for family in [ProjectileFamily::Throwable, ProjectileFamily::Fireball] {
+            let mut policy = ProjectileDespawnPolicy::new();
+            for _ in 0..ARROW_GROUND_LIFE_TICKS + 10 {
+                assert!(!policy.tick(grounded(family)));
+            }
+            assert_eq!(policy.grounded_ticks(), 0);
+        }
+        // Out-of-world and unloaded despawn regardless of the life timer.
+        let mut policy = ProjectileDespawnPolicy::new();
+        assert!(policy.tick(ProjectileTick {
+            y: -129.0,
+            ..flying(ProjectileFamily::Throwable)
+        }));
+        assert!(!policy.tick(ProjectileTick {
+            y: -128.0,
+            ..flying(ProjectileFamily::Throwable)
+        }));
+        assert!(policy.tick(ProjectileTick {
+            chunk_loaded: false,
+            ..flying(ProjectileFamily::Throwable)
+        }));
+    }
+
+    #[test]
+    fn p6a_parity_loyalty_trident_returns_instead_of_despawning() {
+        // A returning Loyalty trident crosses the void and lives past any
+        // ground timer — it despawns only once actually delivered.
+        let mut policy = ProjectileDespawnPolicy::new();
+        for _ in 0..3000 {
+            assert!(!policy.tick(ProjectileTick {
+                family: ProjectileFamily::Trident,
+                returning_to_owner: true,
+                y: -200.0,
+                ..flying(ProjectileFamily::Trident)
+            }));
+        }
+        // A stuck non-loyalty trident still follows the arrow ground rule.
+        let mut policy = ProjectileDespawnPolicy::new();
+        for _ in 0..ARROW_GROUND_LIFE_TICKS - 1 {
+            assert!(!policy.tick(ProjectileTick {
+                family: ProjectileFamily::Trident,
+                in_ground: true,
+                ..flying(ProjectileFamily::Trident)
+            }));
+        }
+        assert!(policy.tick(ProjectileTick {
+            family: ProjectileFamily::Trident,
+            in_ground: true,
+            ..flying(ProjectileFamily::Trident)
+        }));
     }
 }
