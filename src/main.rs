@@ -6523,6 +6523,9 @@ fn on_random_tick_dim(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: 
         "minecraft:grass_block" | "minecraft:mycelium" => {
             grass_random_tick(reg, dim, x, y, z, st)
         }
+        // `bamboo_sapling` must reach its own handler before the `_sapling`
+        // suffix arm claims it for the tree-grow tick.
+        _ if p2_plant_random_tick(reg, dim, x, y, z, st) => {}
         name if name.ends_with("_leaves") => leaf_random_tick(reg, dim, x, y, z, st),
         name if name.ends_with("_sapling") => sapling_random_tick(reg, dim, x, y, z, st),
         _ => {}
@@ -12909,12 +12912,15 @@ fn submit_world_snapshot(
 /// a 20 TPS loop never waits on disk.
 fn autosave_world() {
     let Some(worker) = live_save_worker() else {
-        return save_world();
+        save_world();
+        live_anvil_save_if_armed();
+        return;
     };
     let dir = world_save_dir();
     if let Err(error) = save_world_guarded(|snapshot| submit_world_snapshot(worker, snapshot, &dir)) {
         eprintln!("[spine] WORLD SAVE FAILED: {error}");
     }
+    live_anvil_save_if_armed();
 }
 
 /// Wait until the background writer has finished every snapshot handed to it.
@@ -12939,6 +12945,7 @@ fn shutdown_world_save() {
     }) {
         eprintln!("[spine] WORLD SAVE FAILED: {error}");
     }
+    live_anvil_save_if_armed();
 }
 
 /// Per-natural-spawn-pass fractional credit. `mob_spawn_scale` below 1.0 means
@@ -12982,6 +12989,113 @@ fn start_lan_announcer(port: u16) {
 fn stop_lan_announcer() {
     if let Some(announcer) = LAN_ANNOUNCER.lock().unwrap().take() {
         announcer.stop();
+    }
+}
+
+/// The opt-in GS4 query responder ("enable-query" in vanilla
+/// server.properties): one UDP thread serving challenge tokens and the live
+/// status/rules snapshot. Armed by `MC_SPINE_ENABLE_QUERY=1` (or `true`) or a
+/// `enable-query=true` line in server.properties; `MC_SPINE_QUERY_PORT`, then
+/// a `query.port` property, then the game port itself select the UDP port —
+/// vanilla's own default.
+static GS4_QUERY: Mutex<Option<Gs4QueryHandle>> = Mutex::new(None);
+
+struct Gs4QueryHandle {
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl std::ops::Drop for Gs4QueryHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn server_properties_lookup(key: &str) -> Option<String> {
+    server_properties_read(&server_properties_path(&server_config_path()))
+        .and_then(|props| props.get(key).cloned())
+}
+
+fn gs4_query_enabled() -> bool {
+    match std::env::var("MC_SPINE_ENABLE_QUERY").as_deref() {
+        Ok(v) => return v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => {}
+    }
+    server_properties_lookup("enable-query").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+fn gs4_query_port(game_port: u16) -> u16 {
+    if let Some(port) = std::env::var("MC_SPINE_QUERY_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return port;
+    }
+    server_properties_lookup("query.port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(game_port)
+}
+
+fn start_gs4_query(bind: &str, game_port: u16) {
+    if !gs4_query_enabled() {
+        return;
+    }
+    let port = gs4_query_port(game_port);
+    let host_ip = bind.to_string();
+    let snapshot_fn: Arc<dyn Fn() -> Gs4StatusSnapshot + Send + Sync> = Arc::new(move || {
+        let players = client_snapshot()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>();
+        let motd = std::env::var("MC_SPINE_MOTD").unwrap_or_else(|_| "mc-spine".into());
+        let map = world_save_dir()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "world".to_string());
+        gs4_vanilla_snapshot(motd, map, players, operator_max_players(), game_port, host_ip.clone())
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    match spawn_gs4_query_thread(&format!("{bind}:{port}"), snapshot_fn, stop.clone()) {
+        Ok((addr, join)) => {
+            *GS4_QUERY.lock().unwrap() = Some(Gs4QueryHandle {
+                stop,
+                join: Some(join),
+            });
+            eprintln!("[query] GS4 query listening on {addr}");
+        }
+        Err(error) => eprintln!("[query] GS4 query bind {bind}:{port} failed: {error}"),
+    }
+}
+
+fn stop_gs4_query() {
+    // Dropping the handle flips the flag and joins the responder thread.
+    GS4_QUERY.lock().unwrap().take();
+}
+
+/// Live Anvil world store: `MC_SPINE_ANVIL_WORLD_DIR` points the running
+/// server at a vanilla-format world directory. The boot import runs after the
+/// overlay save loads so Anvil data wins on overlap; every autosave and the
+/// shutdown save write the world back through the region codec.
+fn live_anvil_load_if_armed() {
+    let Some(dir) = anvil_world_dir_from_env() else {
+        return;
+    };
+    match live_anvil_load_dir(&dir) {
+        Ok(summary) => eprintln!("[anvil] loaded {}: {summary:?}", dir.display()),
+        Err(error) => eprintln!("[anvil] load of {} failed: {error}", dir.display()),
+    }
+}
+
+fn live_anvil_save_if_armed() {
+    let Some(dir) = anvil_world_dir_from_env() else {
+        return;
+    };
+    match live_anvil_save_dir(&dir) {
+        Ok(summary) => eprintln!("[anvil] saved {}: {summary:?}", dir.display()),
+        Err(error) => eprintln!("[anvil] save to {} failed: {error}", dir.display()),
     }
 }
 
@@ -14093,6 +14207,9 @@ fn main() {
         eprintln!("[spine] refusing corrupt world save: {error} (original file preserved)");
         std::process::exit(1);
     }
+    // A configured live Anvil directory imports after the overlay save so its
+    // chunks win where both stores name the same position.
+    live_anvil_load_if_armed();
     // The initial-spawn decision happens after the save loads so a recorded
     // `setworldspawn` always wins; only a world with nothing recorded (or an
     // explicit MC_SPINE_SAFE_SPAWN=1) takes the dry-ground search.
@@ -14124,8 +14241,13 @@ fn main() {
     }
     std::thread::spawn(rcon_listener);
     http_server();
-    // seed a few mobs near spawn (only if none restored from save)
-    if mobs().lock().unwrap().is_empty() {
+    // Opt-in debug seeding of a few mobs near spawn (only if none restored
+    // from save). Vanilla spawns nothing at startup; a live natural spawner
+    // populates the area instead. `MC_SPINE_SEED_DEBUG_MOBS=1` restores the
+    // old fixed cow/zombie pair for harnesses that want a known entity set.
+    if std::env::var("MC_SPINE_SEED_DEBUG_MOBS").as_deref() == Ok("1")
+        && mobs().lock().unwrap().is_empty()
+    {
         let mut ms = mobs().lock().unwrap();
         // (etype, x, z): 22=cow, 124=zombie (1.21.1 entity ids)
         for (i, (et, x, z)) in [
@@ -14212,6 +14334,7 @@ fn main() {
         thread::spawn(move || {
             if sigs.forever().next().is_some() {
                 stop_lan_announcer();
+                stop_gs4_query();
                 shutdown_world_save();
                 disconnect_all_clients("Server closed");
                 thread::sleep(Duration::from_millis(100));
@@ -14243,6 +14366,9 @@ fn main() {
     // Vanilla's "Open to LAN" multicast advertisement — opt-in, and only ever
     // armed on the port the listener actually owns.
     start_lan_announcer(l.local_addr().map(|a| a.port()).unwrap_or(port));
+    // The GS4 query responder follows the same rule: it is armed only once
+    // the game listener owns its port, and only when opted into.
+    start_gs4_query(&bind, l.local_addr().map(|a| a.port()).unwrap_or(port));
     eprintln!(
         "mc-spine v0.6 listening {bind}:{port} (offline identities; no Mojang authentication)"
     );

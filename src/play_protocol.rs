@@ -1474,7 +1474,15 @@ fn interest_tick() {
                 x,
                 y,
                 z,
-                Box::new(move || vec![(0x01, spawn_player(&o2))]),
+                Box::new(move || {
+                    let mut packets = vec![(0x01, spawn_player(&o2))];
+                    // SetEquipment trails the spawn so an observer sees the
+                    // player's held item and armor from the first frame.
+                    if let Some(equipment) = player_equipment_packet(&o2) {
+                        packets.push((0x5b, equipment));
+                    }
+                    packets
+                }),
             ),
         );
     }
@@ -1514,6 +1522,285 @@ fn dig_progress_tick(cls: &[Arc<Client>]) {
     }
 }
 
+/// Step a ray from the eye along the look vector and return the first cell
+/// that is not air — the crosshair block `pick_item` resolves. Vanilla's
+/// `ProjectileUtil.getHitResultOnViewVector` is a block-grid traversal; a
+/// 0.1-length walk reaches the same cells inside the ~5-block interaction
+/// range without a hit-box model.
+fn ray_pick_block(
+    dim: DimId,
+    ex: f64,
+    ey: f64,
+    ez: f64,
+    yaw: f32,
+    pitch: f32,
+    reach: f64,
+) -> Option<(i32, i32, i32)> {
+    let yaw = f64::from(yaw).to_radians();
+    let pitch = f64::from(pitch).to_radians();
+    let (dx, dy, dz) = (-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos());
+    let (mut x, mut y, mut z) = (ex, ey, ez);
+    let mut last = (i32::MIN, i32::MIN, i32::MIN);
+    let mut walked = 0.0;
+    while walked <= reach {
+        let cell = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+        if cell != last {
+            last = cell;
+            if block_at_dim(dim, cell.0, cell.1, cell.2) != 0 {
+                return Some(cell);
+            }
+        }
+        x += dx * 0.1;
+        y += dy * 0.1;
+        z += dz * 0.1;
+        walked += 0.1;
+    }
+    None
+}
+
+/// `Inventory.pick`'s decision over menu slot numbers, split out so the
+/// packet handler only moves stacks. The match compares item id and empty
+/// components, mirroring `isSameItemSameComponents` against the plain block
+/// stack the server resolved.
+#[derive(Debug, PartialEq, Eq)]
+enum PickItemPlan {
+    /// The match already sits on the hotbar: select that slot.
+    Select(i16),
+    /// A main-inventory slot swaps contents with the selected hotbar slot.
+    Swap(i16),
+    /// Creative invents a copy of the picked stack in the selected slot.
+    FillCreative,
+}
+
+fn pick_item_plan(
+    inv: &HashMap<i16, Stack>,
+    item: i64,
+    creative: bool,
+) -> Option<PickItemPlan> {
+    let plain = |st: &Stack| st.0 == item && st.1 > 0 && st.2.is_empty();
+    for slot in 36..=44 {
+        if inv.get(&slot).is_some_and(plain) {
+            return Some(PickItemPlan::Select(slot));
+        }
+    }
+    for slot in 9..=35 {
+        if inv.get(&slot).is_some_and(plain) {
+            return Some(PickItemPlan::Swap(slot));
+        }
+    }
+    creative.then_some(PickItemPlan::FillCreative)
+}
+
+/// `ServerGamePacketListenerImpl.handlePickItem`: ray-trace the looked-at
+/// block, `Inventory.pick` its stack into the selection, then resync the
+/// touched slots and the carried-item index the way vanilla's packet does.
+fn pick_item(me: &Arc<Client>, held_slot: &mut i16) {
+    let (px, py, pz, yaw, pitch, _) = *me.pos.lock().unwrap();
+    let creative = *me.gm.lock().unwrap() == 1;
+    let reach = if creative { 5.6f64 } else { 4.9 };
+    let dim = *me.dim.lock().unwrap();
+    let Some((bx, by, bz)) = ray_pick_block(dim, px, py + 1.62, pz, yaw, pitch, reach)
+    else {
+        return;
+    };
+    let Some(reg) = block_registry::breg() else {
+        return;
+    };
+    let name = reg.name_of(block_at_dim(dim, bx, by, bz));
+    let Some(item) = name_to_item(name.trim_start_matches("minecraft:")) else {
+        return;
+    };
+    let selected = 36 + *held_slot;
+    let plan = {
+        let inv = me.inv.lock().unwrap();
+        pick_item_plan(&inv, item, creative)
+    };
+    match plan {
+        Some(PickItemPlan::Select(slot)) => {
+            *held_slot = slot - 36;
+            *me.held.lock().unwrap() = *held_slot;
+        }
+        Some(PickItemPlan::Swap(slot)) => {
+            let mut inv = me.inv.lock().unwrap();
+            let held_stack = inv.get(&selected).cloned().unwrap_or((0, 0, Vec::new()));
+            let match_stack = inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+            inv.insert(selected, match_stack);
+            if held_stack.1 > 0 {
+                inv.insert(slot, held_stack);
+            } else {
+                inv.remove(&slot);
+            }
+            drop(inv);
+            let stacks: Vec<(i16, Stack)> = [selected, slot]
+                .into_iter()
+                .map(|wslot| {
+                    (
+                        wslot,
+                        me.inv
+                            .lock()
+                            .unwrap()
+                            .get(&wslot)
+                            .cloned()
+                            .unwrap_or((0, 0, Vec::new())),
+                    )
+                })
+                .collect();
+            for (wslot, st) in stacks {
+                resync_slot(me, 0, wslot, &st);
+            }
+        }
+        Some(PickItemPlan::FillCreative) => {
+            me.inv.lock().unwrap().insert(selected, (item, 1, Vec::new()));
+            held_slot_resync(me);
+        }
+        None => return,
+    }
+    // Vanilla closes `handlePickItem` with ClientboundSetHeldSlotPacket.
+    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x53, vec![*held_slot as u8]);
+}
+
+/// `can_place_on`/`can_break` component ids (protocol 767 data-component
+/// registry indices 10 and 11). Both encode `AdventureModePredicate`: a
+/// VarInt count of `BlockPredicate` entries — optional block holder-set,
+/// optional property-matcher list, optional NBT — where any one matching
+/// predicate allows the interaction.
+const COMP_CAN_PLACE_ON: i64 = 10;
+const COMP_CAN_BREAK: i64 = 11;
+
+/// A `PropertyMatcher`'s min/max arm: `true` when `value` falls inside the
+/// closed range. Ordered property values compare numerically when every side
+/// parses (vanilla's ordered properties are index-ordered and overwhelmingly
+/// numeric); anything else takes the lexicographic answer. Only used where a
+/// missing matcher already failed the predicate.
+fn prop_value_in_range(value: &str, min: &str, max: &str) -> bool {
+    match (value.parse::<i64>(), min.parse::<i64>(), max.parse::<i64>()) {
+        (Ok(v), Ok(lo), Ok(hi)) => v >= lo && v <= hi,
+        _ => value >= min && value <= max,
+    }
+}
+
+/// Parse one `BlockPredicate` off `b` and test the parts a block state can
+/// answer: the holder-set (explicit ids or a named tag) and the property
+/// matchers. Returns `Ok(false)` for a parsed-but-unmatched predicate and
+/// `Err(())` for truncated/unsupported input — including a present NBT clause,
+/// which needs a block entity this layer does not see and therefore fails the
+/// whole component closed.
+fn adventure_predicate_match(
+    reg: &block_registry::BReg,
+    st: u32,
+    b: &mut &[u8],
+) -> Result<bool, ()> {
+    // Optional<HolderSet<Block>>: absent matches every block. On the wire a
+    // negative size (-1) names a registry tag; otherwise `n` VarInt block ids.
+    let has_blocks = *b.first().ok_or(())? != 0;
+    *b = &b[1..];
+    if has_blocks {
+        let n = read_varint(b).ok_or(())?;
+        let in_set = if n < 0 {
+            let tag = read_string_bounded(b, 32767).ok_or(())?;
+            reg.in_tag(st, &tag)
+        } else {
+            if n > 4096 {
+                return Err(());
+            }
+            let mut hit = false;
+            for _ in 0..n {
+                hit |= reg.block_id_of(st) == Some(read_varint(b).ok_or(())? as i32);
+            }
+            hit
+        };
+        if !in_set {
+            return Ok(false);
+        }
+    }
+    // Optional<List<PropertyMatcher>>: absent matches every state.
+    let has_props = *b.first().ok_or(())? != 0;
+    *b = &b[1..];
+    if has_props {
+        let count = read_varint(b).ok_or(())?;
+        if !(0..=256).contains(&count) {
+            return Err(());
+        }
+        for _ in 0..count {
+            let name = read_string_bounded(b, 32767).ok_or(())?;
+            let kind = *b.first().ok_or(())?;
+            *b = &b[1..];
+            let value = reg.get_prop(st, &name);
+            let ok = match kind {
+                0 => {
+                    let want = read_string_bounded(b, 32767).ok_or(())?;
+                    value.as_deref() == Some(want.as_str())
+                }
+                1 => {
+                    let min = read_string_bounded(b, 32767).ok_or(())?;
+                    let max = read_string_bounded(b, 32767).ok_or(())?;
+                    value.is_some_and(|v| prop_value_in_range(&v, &min, &max))
+                }
+                _ => return Err(()),
+            };
+            if !ok {
+                return Ok(false);
+            }
+        }
+    }
+    // Optional<Nbt>: a present clause needs the block entity and cannot be
+    // skipped byte-wise here, so the component fails closed.
+    if *b.first().ok_or(())? != 0 {
+        return Err(());
+    }
+    *b = &b[1..];
+    Ok(true)
+}
+
+/// `AdventureModePredicate.test` over a held stack's `can_place_on` /
+/// `can_break` component against one block state. A stack without the
+/// component allows nothing in adventure mode; a malformed or
+/// NBT-bearing component is treated the same — deny.
+fn adventure_stack_allows(reg: &block_registry::BReg, st: u32, held: &Stack, comp: i64) -> bool {
+    let Some(data) = comp_get(&held.2, comp) else {
+        return false;
+    };
+    let mut b = data;
+    let Some(count) = read_varint(&mut b) else {
+        return false;
+    };
+    if !(0..=256).contains(&count) {
+        return false;
+    }
+    for _ in 0..count {
+        match adventure_predicate_match(reg, st, &mut b) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(()) => return false,
+        }
+    }
+    false
+}
+
+/// `TrapDoorBlock.useWithoutItem`: every trapdoor but the iron one toggles
+/// `open` on right-click; the iron variant answers redstone only. A toggled
+/// state is pushed to every chunk watcher through `note_block_update_dim`.
+/// Returns whether a toggle ran.
+fn try_toggle_trapdoor(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    let st = block_at_dim(dim, x, y, z);
+    if !trapdoor_state(st) {
+        return false;
+    }
+    let Some(reg) = block_registry::breg() else {
+        return false;
+    };
+    if reg.name_of(st) == "minecraft:iron_trapdoor" {
+        return false;
+    }
+    let Some(opened) = reg.get_prop(st, "open").map(|v| v == "true") else {
+        return false;
+    };
+    let updated = reg.with_prop(st, "open", if opened { "false" } else { "true" });
+    set_block_dim(dim, x, y, z, updated);
+    note_block_update_dim(dim, x, y, z, updated);
+    true
+}
+
 /// Apply a confirmed block break: clear the cell, fan the update out to every
 /// chunk watcher, then run the survival bookkeeping (exhaustion, tool wear,
 /// drops). Shared by the dig packet's immediate path and the tick-driven
@@ -1524,6 +1811,16 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
         let inv = me.inv.lock().unwrap();
         inv.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new()))
     };
+    // Vanilla rechecks mayDestroy in `destroyAndAck`: an adventure-mode dig
+    // still finishes only while the held stack's can_break matches.
+    if *me.gm.lock().unwrap() == 2 {
+        let allowed = block_registry::breg().is_some_and(|reg| {
+            adventure_stack_allows(reg, old, &held, COMP_CAN_BREAK)
+        });
+        if !allowed {
+            return;
+        }
+    }
     #[cfg(feature = "neoforge-events")]
     if java_compat::NEOFORGE.get().is_some() {
         let result = neoforge_event(me, java_compat::S1Event::BlockBreak {
@@ -4445,6 +4742,57 @@ fn mob_equipment_packet(mob: &Mob) -> Option<Vec<u8>> {
     entity_equipment_packet(mob.eid, eq)
 }
 
+/// The player's live `EntityEquipment` view of the menu inventory: the main
+/// hand is the selected hotbar slot (36..=44), the off hand is menu slot 45,
+/// and armor is menu slots 5..=8 in vanilla order head→feet.
+fn player_equipment(me: &Client) -> EntityEquipment {
+    let inv = me.inv.lock().unwrap();
+    let held = *me.held.lock().unwrap();
+    let stack = |slot: i16| inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+    let mut eq = EntityEquipment::default();
+    eq.set(EquipmentSlot::MainHand, stack(36 + held));
+    eq.set(EquipmentSlot::OffHand, stack(45));
+    eq.set(EquipmentSlot::Feet, stack(8));
+    eq.set(EquipmentSlot::Legs, stack(7));
+    eq.set(EquipmentSlot::Chest, stack(6));
+    eq.set(EquipmentSlot::Head, stack(5));
+    eq
+}
+
+/// The 0x5b a fresh observer needs after a player's spawn packet, or `None`
+/// when the player holds and wears nothing.
+fn player_equipment_packet(me: &Client) -> Option<Vec<u8>> {
+    entity_equipment_packet(me.eid, &player_equipment(me))
+}
+
+/// A `ClientboundSetEquipmentPacket` body carrying exactly the slots that
+/// changed between `before` and `after` — including now-empty stacks, which
+/// is how trackers learn a piece came off. `None` when nothing changed, so a
+/// fully cleared loadout still announces itself.
+fn encode_set_equipment_changes(
+    eid: i32,
+    before: &EntityEquipment,
+    after: &EntityEquipment,
+) -> Option<Vec<u8>> {
+    let changed: Vec<(u8, &Stack)> = after
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(i, st)| **st != before.slots[*i])
+        .map(|(i, st)| (i as u8, st))
+        .collect();
+    if changed.is_empty() {
+        return None;
+    }
+    let mut p = Vec::new();
+    write_varint(&mut p, i64::from(eid));
+    for (i, (slot, st)) in changed.iter().enumerate() {
+        p.push(slot | if i + 1 < changed.len() { 0x80 } else { 0 });
+        p.extend_from_slice(&slot_wire(st));
+    }
+    Some(p)
+}
+
 // ---------- mounts / vehicles (S2C 0x5f, C2S 0x1e/0x1f/0x26) ----------
 
 /// The live `MountRegistry` plus the last paddle flags each boat's driver sent.
@@ -5575,6 +5923,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     let mut keepalive = connection_limits::KeepaliveState::new(Instant::now());
     let mut next_keepalive_id = 1i64;
     let mut held_slot: i16 = initial_held;
+    // `EntityEquipment.setChanged` baseline: every consumed packet may touch
+    // the menu (hotbar switch, armor drag, plugin write), so the loop head
+    // diffs the live view and ships one sparse SetEquipment.
+    let mut last_equipment = player_equipment(&me);
 
     let mut rx = RxBuf::new(compression);
     // Play-state packet inactivity is tracked separately from the keep-alive deadline.
@@ -5584,6 +5936,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     let mut last_chunk_retry_tick = TICK_IDX.load(Ordering::Relaxed);
     'conn: loop {
         drop_player_items_on_death(&me);
+        {
+            let equipment_now = player_equipment(&me);
+            if let Some(packet) =
+                encode_set_equipment_changes(me.eid, &last_equipment, &equipment_now)
+            {
+                last_equipment = equipment_now;
+                broadcast_seen(me.eid, |_c| (0x5b, packet.clone()));
+            }
+        }
         use connection_limits::KeepaliveAction;
         match keepalive.tick(Instant::now(), next_keepalive_id) {
             KeepaliveAction::Send(id) => {
@@ -5865,27 +6226,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 }
             }
             0x2f => {
-                // held_item_slot: i16
+                // held_item_slot: i16 — `EntityEquipment.setChanged` for the
+                // new main hand is emitted by the loop-head equipment diff.
                 if b.len() >= 2 {
                     held_slot = i16::from_be_bytes(b[..2].try_into().unwrap()).clamp(0, 8);
                     *me.held.lock().unwrap() = held_slot;
-                    // `EntityEquipment.setChanged` on the hotbar switch: the new
-                    // main-hand stack rides a SetEquipment to every tracker —
-                    // an empty stack is a legal entry here, it clears the old
-                    // item on their screens.
-                    let held = me
-                        .inv
-                        .lock()
-                        .unwrap()
-                        .get(&(36 + held_slot))
-                        .cloned()
-                        .unwrap_or((0, 0, Vec::new()));
-                    let mut packet = Vec::new();
-                    write_varint(&mut packet, i64::from(me.eid));
-                    packet.push(EquipmentSlot::MainHand as u8);
-                    packet.extend_from_slice(&slot_wire(&held));
-                    broadcast_seen(me.eid, |_c| (0x5b, packet.clone()));
                 }
+            }
+            0x20 => {
+                // pick_item: the server ray-traces the block under the
+                // crosshair itself and runs `Inventory.pick` on its item —
+                // the one-byte includeData flag needs no parse.
+                pick_item(&me, &mut held_slot);
             }
             0x1d => {
                 // flying: onGround only
@@ -6300,7 +6652,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     // vanilla dig timing: survival needs the destroy duration for
                     // the block+tool; finish packets arriving early are rejected.
                     let mut break_now = false;
-                    if in_range && old != 0 && game_mode != 2 {
+                    // Adventure `mayDestroy`: only a held stack whose
+                    // can_break predicates match the block may dig it.
+                    let may_destroy = game_mode != 2
+                        || block_registry::breg().is_some_and(|reg| {
+                            adventure_stack_allows(reg, old, &held, COMP_CAN_BREAK)
+                        });
+                    if in_range && old != 0 && may_destroy {
                         if (gm_creative && status == 0) || req == Some(0.0) {
                             break_now = true;
                         } else if let Some(t) = req {
@@ -6390,7 +6748,21 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let clicked = block_at_dim(dim, x, y, z);
                 let place = |pos: BlockPos, state| {
                     if *me.gm.lock().unwrap() == 2 {
-                        return false;
+                        // Adventure `mayPlace`: the held stack's can_place_on
+                        // predicates must match the clicked block.
+                        let held = me
+                            .inv
+                            .lock()
+                            .unwrap()
+                            .get(&(36 + held_slot))
+                            .cloned()
+                            .unwrap_or((0, 0, Vec::new()));
+                        let allowed = block_registry::breg().is_some_and(|reg| {
+                            adventure_stack_allows(reg, clicked, &held, COMP_CAN_PLACE_ON)
+                        });
+                        if !allowed {
+                            return false;
+                        }
                     }
                     if !ac_check_place(&me, dim, (x, y, z), clicked, pos) {
                         ac_resync_block(&me, dim, pos);
@@ -6725,16 +7097,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     continue;
                 }
                 if trapdoor_state(block_at_dim(dim, x, y, z)) {
-                    let st = block_at_dim(dim, x, y, z);
-                    let iron = breg().is_some_and(|reg| reg.name_of(st) == "minecraft:iron_trapdoor");
-                    if !iron {
-                        let opened = breg().map(|reg| reg.get_prop(st, "open").as_deref() == Some("true"));
-                        if let (Some(reg), Some(opened)) = (breg(), opened) {
-                            let updated = reg.with_prop(st, "open", if opened { "false" } else { "true" });
-                            set_block_dim(dim, x, y, z, updated);
-                            note_block_update_dim(dim, x, y, z, updated);
-                        }
-                    }
+                    try_toggle_trapdoor(dim, x, y, z);
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
@@ -11008,5 +11371,494 @@ mod w4_tests {
         );
         drop(cli);
         let _ = server.join();
+    }
+}
+
+// ---------------- Lane P5c: live-path wiring tests ----------------
+
+#[cfg(test)]
+mod p5c_live_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    /// Restores every `world()` cell a fixture wrote, in reverse order.
+    struct Cells(Vec<(i32, i32, i32, u32)>);
+    impl Cells {
+        fn new() -> Self {
+            Cells(Vec::new())
+        }
+        fn set(&mut self, x: i32, y: i32, z: i32, st: u32) {
+            self.0.push((x, y, z, block_at(x, y, z)));
+            set_block(x, y, z, st);
+        }
+        fn record(&mut self, x: i32, y: i32, z: i32) {
+            self.0.push((x, y, z, block_at(x, y, z)));
+        }
+    }
+    impl std::ops::Drop for Cells {
+        fn drop(&mut self) {
+            for (x, y, z, st) in self.0.drain(..).rev() {
+                set_block(x, y, z, st);
+            }
+        }
+    }
+
+    /// Restores the gamerules a test touched, on every exit path.
+    struct Rules(Vec<(&'static str, i32)>);
+    impl Rules {
+        fn take(names: &[&'static str]) -> Self {
+            let rules = command_gamerules().lock().unwrap();
+            let taken = names
+                .iter()
+                .map(|name| (*name, rules.get(name).copied().unwrap_or(-1)))
+                .collect::<Vec<_>>();
+            Rules(taken)
+        }
+        fn set(&self, name: &'static str, value: i32) {
+            command_gamerules().lock().unwrap().insert(name, value);
+        }
+    }
+    impl std::ops::Drop for Rules {
+        fn drop(&mut self) {
+            let mut rules = command_gamerules().lock().unwrap();
+            for (name, value) in self.0.drain(..) {
+                rules.insert(name, value);
+            }
+        }
+    }
+
+    /// A loopback client for wire-path tests: `me.sock` is the end the server
+    /// writes to; the returned peer reads exactly those bytes.
+    fn loopback_client(name: &str, eid: i32) -> (Arc<Client>, std::net::TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let me = Arc::new(Client {
+            eid,
+            uuid: [0x5cu8; 16],
+            name: name.to_string(),
+            player_attack_damage_id: None,
+            pos: Mutex::new((0.5, 65.0, 0.5, 0.0, 0.0, true)),
+            teleport: Mutex::new(Default::default()),
+            hp: Mutex::new(20.0),
+            sock: Mutex::new(stream),
+            inv: Mutex::new(HashMap::new()),
+            cursor: Mutex::new((0, 0, Vec::new())),
+            drag: Mutex::new((0, Vec::new())),
+            open_chest: Mutex::new(None),
+            chest_sync: Mutex::new(None),
+            open_furnace: Mutex::new(None),
+            craft: Mutex::new(HashMap::new()),
+            craft9: Mutex::new(HashMap::new()),
+            open_table: Mutex::new(false),
+            open_merchant: Mutex::new(false),
+            trade_sel: Mutex::new(0),
+            merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
+            bow_draw: Mutex::new(None),
+            dig: Mutex::new(None),
+            eat_start: Mutex::new(None),
+            blocking: Mutex::new(false),
+            sprinting: Mutex::new(false),
+            sneaking: Mutex::new(false),
+            last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            fall_fly: Mutex::new(false),
+            invulnerable: Mutex::new(0),
+            last_hurt: Mutex::new(0.0),
+            shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            absorb: Mutex::new(0.0),
+            pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            xp: Mutex::new(0),
+            skin: Mutex::new(None),
+            seen: Mutex::new(HashSet::new()),
+            chunks: Mutex::new(HashSet::from([(-1, -1), (-1, 0), (0, -1), (0, 0)])),
+            chunk_ack: Mutex::new(ChunkFeedback::new(1)),
+            gen_sources: Mutex::new(GenSources::default()),
+            gm: Mutex::new(0),
+            fall_from: Mutex::new(65.0),
+            food: Mutex::new(20),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            armor_pts: Mutex::new(0),
+            sat: Mutex::new(5.0),
+            walk_acc: Mutex::new(0.0),
+            lastp: Mutex::new((0.5, 65.0, 0.5)),
+            spawn_pt: Mutex::new(None),
+            dim: Mutex::new(DimId::Overworld),
+            spawn_dim: Mutex::new(DimId::Overworld),
+            view: Mutex::new(2),
+            in_portal: Mutex::new(false),
+            portal_at: Mutex::new(None),
+            held: Mutex::new(0),
+            effs: Mutex::new(Vec::new()),
+            lod_v1_enabled: AtomicBool::new(false),
+            underground_revealed: AtomicBool::new(false),
+            sleeping: Mutex::new(None),
+            inv_state_id: AtomicI32::new(0),
+        });
+        (me, peer)
+    }
+
+    /// Removes the test client from the live list and restores `DIFFICULTY`.
+    struct LiveCleanup {
+        eid: i32,
+        difficulty: u8,
+    }
+    impl std::ops::Drop for LiveCleanup {
+        fn drop(&mut self) {
+            clients()
+                .lock()
+                .unwrap()
+                .retain(|c| c.eid != self.eid);
+            DIFFICULTY.store(self.difficulty, Ordering::Relaxed);
+        }
+    }
+
+    /// Read one framed server packet from the client peer, or None on timeout.
+    fn read_frame(peer: &mut std::net::TcpStream) -> Option<(i64, Vec<u8>)> {
+        peer.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let mut buf = [0u8; 4096];
+        let n = peer.read(&mut buf).ok()?;
+        let mut body = &buf[..n];
+        let _len = read_varint(&mut body)?;
+        let id = read_varint(&mut body)?;
+        Some((id, body.to_vec()))
+    }
+
+    #[test]
+    fn p5c_live_random_tick_dim_dispatches_p2_plants() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _rules = Rules::take(&["doVinesSpread"]);
+        let reg = crate::block_registry::breg().unwrap();
+        let (cactus, sapling, kelp, vine) = (
+            reg.state_of("minecraft:cactus", None),
+            reg.state_of("minecraft:bamboo_sapling", None),
+            reg.state_of("minecraft:kelp", None),
+            reg.state_of("minecraft:vine", None),
+        );
+        if reg.name_of(cactus) != "minecraft:cactus"
+            || reg.name_of(sapling) != "minecraft:bamboo_sapling"
+            || reg.name_of(kelp) != "minecraft:kelp"
+            || reg.name_of(vine) != "minecraft:vine"
+        {
+            return;
+        }
+        let mut cells = Cells::new();
+
+        // Cactus at age 15 grows a fresh segment through the live dispatch —
+        // no roll involved.
+        cells.set(0, 199, 0, reg.state_of("minecraft:sand", None));
+        cells.set(0, 200, 0, reg.with_prop(cactus, "age", "15"));
+        cells.record(0, 201, 0);
+        on_random_tick_dim(reg, DimId::Overworld, 0, 200, 0);
+        assert_eq!(
+            reg.name_of(block_at(0, 201, 0)),
+            "minecraft:cactus",
+            "on_random_tick_dim must reach cactus_random_tick"
+        );
+
+        // The bamboo_sapling arm must outrank the `_sapling` suffix arm: the
+        // sapling becomes a bamboo stalk, not a tree-grow tick.
+        cells.set(4, 199, 0, reg.state_of("minecraft:dirt", None));
+        cells.set(4, 200, 0, sapling);
+        let mut stalk = false;
+        for _ in 0..64 {
+            on_random_tick_dim(reg, DimId::Overworld, 4, 200, 0);
+            if reg.name_of(block_at(4, 200, 0)) == "minecraft:bamboo" {
+                stalk = true;
+                break;
+            }
+        }
+        assert!(stalk, "on_random_tick_dim must reach bamboo_random_tick");
+
+        // Kelp head under a water source grows into the water cell.
+        cells.set(8, 200, 0, reg.with_prop(kelp, "age", "5"));
+        cells.set(8, 201, 0, reg.state_of("minecraft:water", None));
+        on_random_tick_dim(reg, DimId::Overworld, 8, 200, 0);
+        assert_eq!(
+            reg.name_of(block_at(8, 201, 0)),
+            "minecraft:kelp",
+            "on_random_tick_dim must reach kelp_random_tick"
+        );
+        assert_eq!(reg.name_of(block_at(8, 200, 0)), "minecraft:kelp_plant");
+
+        // doVinesSpread=true: a hanging vine spreads down on the one-in-four
+        // roll — 64 dispatch passes make the roll effectively certain.
+        _rules.set("doVinesSpread", 1);
+        cells.set(12, 200, 0, vine);
+        cells.record(12, 199, 0);
+        let mut spread = false;
+        for _ in 0..64 {
+            on_random_tick_dim(reg, DimId::Overworld, 12, 200, 0);
+            if reg.name_of(block_at(12, 199, 0)) == "minecraft:vine" {
+                spread = true;
+                break;
+            }
+        }
+        assert!(spread, "on_random_tick_dim must reach vine_random_tick");
+    }
+
+    #[test]
+    fn p5c_live_player_equipment_wire_round_trip() {
+        crate::test_support::require_vanilla_data();
+        let (me, _peer) = loopback_client("GearCheck", 42001);
+        let (sword, shield, boots, pants, chest, helm) = (
+            name_to_item("iron_sword").unwrap(),
+            name_to_item("shield").unwrap(),
+            name_to_item("iron_boots").unwrap(),
+            name_to_item("iron_leggings").unwrap(),
+            name_to_item("iron_chestplate").unwrap(),
+            name_to_item("iron_helmet").unwrap(),
+        );
+        {
+            let mut inv = me.inv.lock().unwrap();
+            inv.insert(36, (sword, 1, Vec::new())); // selected hotbar
+            inv.insert(45, (shield, 1, Vec::new())); // offhand
+            inv.insert(5, (helm, 1, Vec::new()));
+            inv.insert(6, (chest, 1, Vec::new()));
+            inv.insert(7, (pants, 1, Vec::new()));
+            inv.insert(8, (boots, 1, Vec::new()));
+        }
+        let eq = player_equipment(&me);
+        let packet = player_equipment_packet(&me).expect("six worn slots encode a packet");
+        let (eid, entries) = decode_set_equipment(&packet).expect("decodes");
+        assert_eq!(eid, me.eid);
+        let by_slot: HashMap<u8, Stack> = entries.into_iter().collect();
+        assert_eq!(by_slot.len(), 6, "mainhand+offhand+4 armor on the wire");
+        assert_eq!(by_slot[&0].0, sword);
+        assert_eq!(by_slot[&1].0, shield);
+        assert_eq!(by_slot[&2].0, boots);
+        assert_eq!(by_slot[&3].0, pants);
+        assert_eq!(by_slot[&4].0, chest);
+        assert_eq!(by_slot[&5].0, helm);
+        assert_eq!(eq.slots[EquipmentSlot::MainHand as usize].0, sword);
+
+        // The diff encoder emits only changed slots — and an emptied slot
+        // still rides the wire, which is how trackers see a piece come off.
+        let mut after = EntityEquipment::default();
+        after.slots = eq.slots.clone();
+        after.slots[EquipmentSlot::Head as usize] = (0, 0, Vec::new());
+        let packet = encode_set_equipment_changes(me.eid, &eq, &after).expect("one change");
+        let (eid, entries) = decode_set_equipment(&packet).expect("decodes");
+        assert_eq!(eid, me.eid);
+        assert_eq!(entries, vec![(5u8, (0, 0, Vec::new()))]);
+        assert!(encode_set_equipment_changes(me.eid, &after, &after).is_none());
+    }
+
+    #[test]
+    fn p5c_live_teleport_confirmation_tracks_current_id() {
+        // #123: only the id of the currently-sent teleport unblocks movement;
+        // a stale or mismatched confirmation is ignored.
+        let mut sync = connection_limits::TeleportSync::default();
+        assert!(sync.movement_allowed());
+        let first = sync.begin();
+        let second = sync.begin();
+        assert_ne!(first, second);
+        assert!(sync.preparing(second));
+        sync.sent();
+        sync.confirm(first);
+        assert!(
+            !sync.movement_allowed(),
+            "a stale teleport id must not unblock movement"
+        );
+        sync.confirm(second + 1);
+        assert!(!sync.movement_allowed(), "a wrong id must not confirm");
+        sync.confirm(second);
+        assert!(sync.movement_allowed(), "the current sent id confirms");
+    }
+
+    #[test]
+    fn p5c_live_difficulty_op_gate_and_broadcast() {
+        let _guard = world_guard();
+        let (me, mut peer) = loopback_client("OpCheck", 42002);
+        let _cleanup = LiveCleanup {
+            eid: me.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        clients().lock().unwrap().push(me.clone());
+
+        // #131: hasPermission(2) — a non-operator is refused before the
+        // difficulty ever changes; a level-4 operator is let through.
+        assert!(!player_is_admin(&me.name), "default players are not operators");
+        OPERATORS
+            .lock()
+            .unwrap()
+            .insert(me.name.to_ascii_lowercase());
+        assert!(player_is_admin(&me.name));
+        OPERATORS.lock().unwrap().remove(&me.name.to_ascii_lowercase());
+
+        set_difficulty(0);
+        assert_eq!(DIFFICULTY.load(Ordering::Relaxed), 0);
+        let (id, body) = read_frame(&mut peer).expect("0x0b broadcast lands");
+        assert_eq!(id, 0x0b);
+        assert_eq!(body, vec![0u8, 0u8], "difficulty 0, unlocked");
+        set_difficulty(5);
+        assert_eq!(DIFFICULTY.load(Ordering::Relaxed), 0, "out of range refused");
+    }
+
+    #[test]
+    fn p5c_live_end_and_nether_furnaces_tick() {
+        let _guard = world_guard();
+        let input = name_to_item("raw_iron").unwrap();
+        let coal = name_to_item("coal").unwrap();
+        test_region_warm_insert((0, 0));
+        furnaces().lock().unwrap().clear();
+        for dim in [DimId::Nether, DimId::End] {
+            furnaces().lock().unwrap().insert(
+                (dim, 0, 70, 0),
+                Furnace {
+                    input: (input, 1, Vec::new()),
+                    fuel: (coal, 1, Vec::new()),
+                    output: (0, 0, Vec::new()),
+                    burn_left: 0,
+                    progress: 0,
+                    dirty: false,
+                    xp: 0.0,
+                    recipe_cache: CachedLookup::default(),
+                    fuel_cache: CachedLookup::default(),
+                },
+            );
+        }
+        furnace_tick();
+        let guard = furnaces().lock().unwrap();
+        for dim in [DimId::Nether, DimId::End] {
+            let furnace = guard
+                .get(&(dim, 0, 70, 0))
+                .unwrap_or_else(|| panic!("{dim:?} furnace must keep its key"));
+            assert_eq!(furnace.progress, 1, "{dim:?} furnace must tick");
+        }
+        drop(guard);
+        furnaces().lock().unwrap().clear();
+        test_region_warm_remove(&(0, 0));
+    }
+
+    #[test]
+    fn p5c_live_adventure_can_break_and_place_on_predicates() {
+        crate::test_support::require_vanilla_data();
+        let reg = crate::block_registry::breg().unwrap();
+        let stone = reg.state_of("minecraft:stone", None);
+        let dirt = reg.state_of("minecraft:dirt", None);
+        if reg.name_of(stone) != "minecraft:stone" || reg.name_of(dirt) != "minecraft:dirt" {
+            return;
+        }
+        let stone_id = reg.block_id_of(stone).unwrap();
+        // predicates = 1 entry: holder-set { stone }, no properties, no NBT.
+        let mut data = Vec::new();
+        write_varint(&mut data, 1);
+        data.push(1); // blocks present
+        write_varint(&mut data, 1);
+        write_varint(&mut data, i64::from(stone_id));
+        data.push(0); // no property matchers
+        data.push(0); // no NBT
+        let held: Stack = (name_to_item("diamond_pickaxe").unwrap(), 1, vec![
+            (COMP_CAN_BREAK, data.clone()),
+            (COMP_CAN_PLACE_ON, data),
+        ]);
+        assert!(adventure_stack_allows(reg, stone, &held, COMP_CAN_BREAK));
+        assert!(!adventure_stack_allows(reg, dirt, &held, COMP_CAN_BREAK));
+        assert!(adventure_stack_allows(reg, stone, &held, COMP_CAN_PLACE_ON));
+        assert!(!adventure_stack_allows(reg, dirt, &held, COMP_CAN_PLACE_ON));
+
+        // A stack without the component allows nothing; one unconstrained
+        // predicate allows every block.
+        let bare: Stack = (held.0, 1, Vec::new());
+        assert!(!adventure_stack_allows(reg, stone, &bare, COMP_CAN_BREAK));
+        let mut open = Vec::new();
+        write_varint(&mut open, 1);
+        open.extend_from_slice(&[0, 0, 0]);
+        let any: Stack = (held.0, 1, vec![(COMP_CAN_BREAK, open)]);
+        assert!(adventure_stack_allows(reg, stone, &any, COMP_CAN_BREAK));
+        assert!(adventure_stack_allows(reg, dirt, &any, COMP_CAN_BREAK));
+    }
+
+    #[test]
+    fn p5c_live_trapdoor_wooden_toggles_iron_stays_put() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let oak = reg.state_of("minecraft:oak_trapdoor", None);
+        let iron = reg.state_of("minecraft:iron_trapdoor", None);
+        if reg.name_of(oak) != "minecraft:oak_trapdoor"
+            || reg.name_of(iron) != "minecraft:iron_trapdoor"
+        {
+            return;
+        }
+        let mut cells = Cells::new();
+
+        cells.set(0, 100, 0, oak);
+        let before = reg.get_prop(block_at(0, 100, 0), "open");
+        assert!(
+            try_toggle_trapdoor(DimId::Overworld, 0, 100, 0),
+            "wooden trapdoor must answer a right-click"
+        );
+        let after = reg.get_prop(block_at(0, 100, 0), "open");
+        assert_ne!(before, after, "the open property must flip");
+        assert!(try_toggle_trapdoor(DimId::Overworld, 0, 100, 0));
+        assert_eq!(reg.get_prop(block_at(0, 100, 0), "open"), before);
+
+        cells.set(4, 100, 0, iron);
+        let iron_before = block_at(4, 100, 0);
+        assert!(
+            !try_toggle_trapdoor(DimId::Overworld, 4, 100, 0),
+            "iron trapdoor is redstone-only"
+        );
+        assert_eq!(block_at(4, 100, 0), iron_before);
+    }
+
+    #[test]
+    fn p5c_live_light_edits_coalesce_to_one_batch_entry() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let glow = reg.state_of("minecraft:glowstone", None);
+        if reg.name_of(glow) != "minecraft:glowstone" {
+            return;
+        }
+        pending_light_edits().lock().unwrap().clear();
+        let pos = Position { x: 5, y: 70, z: 5 };
+        // Two edits to the same cell inside one tick collapse into a single
+        // queued entry carrying the first old and the last new — the drain
+        // then feeds ONE edit_batch per dimension.
+        note_light_edit(DimId::Overworld, pos, glow, 0);
+        note_light_edit(DimId::Overworld, pos, 0, glow);
+        let edits = pending_light_edits().lock().unwrap();
+        let per_dim = edits.get(&DimId::Overworld).expect("queued");
+        assert_eq!(per_dim.len(), 1, "same-cell edits coalesce");
+        let (old, new) = per_dim.get(&pos).copied().unwrap();
+        drop(edits);
+        assert_eq!(old, light_properties(reg, glow));
+        assert_eq!(new, light_properties(reg, glow));
+        pending_light_edits().lock().unwrap().clear();
+    }
+
+    #[test]
+    fn p5c_live_pick_item_plan_selects_swaps_or_fills() {
+        let stone = name_to_item("stone").unwrap();
+        let mut inv = HashMap::new();
+        // Hotbar hit: the slot is merely selected.
+        inv.insert(38i16, (stone, 3, Vec::new()));
+        assert_eq!(
+            pick_item_plan(&inv, stone, false),
+            Some(PickItemPlan::Select(38))
+        );
+        // Main-inventory hit swaps into the selected slot.
+        let mut inv = HashMap::new();
+        inv.insert(20i16, (stone, 3, Vec::new()));
+        assert_eq!(
+            pick_item_plan(&inv, stone, false),
+            Some(PickItemPlan::Swap(20))
+        );
+        // No hit: only creative invents the stack.
+        let inv = HashMap::new();
+        assert_eq!(pick_item_plan(&inv, stone, false), None);
+        assert_eq!(
+            pick_item_plan(&inv, stone, true),
+            Some(PickItemPlan::FillCreative)
+        );
+        // A component-bearing stack does not match a plain block pick.
+        let mut inv = HashMap::new();
+        inv.insert(38i16, (stone, 3, vec![(COMP_CUSTOM_NAME, vec![0])]));
+        assert_eq!(pick_item_plan(&inv, stone, false), None);
     }
 }
