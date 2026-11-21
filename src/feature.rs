@@ -9782,11 +9782,21 @@ fn cave_rng_y_scale(r: &mut Lcg) -> f32 {
     f
 }
 
+thread_local! {
+    /// The `canyon_widths` profile buffer, parked between tunnels: a canyon run
+    /// resizes the same `height`-sized allocation every branch instead of
+    /// allocating it anew. Bounded by the 256 KiB idle-scratch rule.
+    static CANYON_WIDTHS: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// `CanyonWorldCarver.getWidths`: one squared width per block of world height,
 /// re-drawn every `width_smoothness` blocks. The height index is absolute world
 /// height, so the array is `getGenDepth()` long from the bottom.
 fn canyon_widths(depth: usize, smoothness: i32, r: &mut Lcg) -> Vec<f32> {
-    let mut out = vec![0.0f32; depth];
+    let mut out = CANYON_WIDTHS.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    out.clear();
+    out.resize(depth, 0.0);
     let mut f = 1.0f32;
     for (i, slot) in out.iter_mut().enumerate() {
         // `i == 0 ||` short-circuits, so the first entry never draws nextInt
@@ -9796,6 +9806,23 @@ fn canyon_widths(depth: usize, smoothness: i32, r: &mut Lcg) -> Vec<f32> {
         *slot = f * f;
     }
     out
+}
+
+/// Return a `canyon_widths` buffer to the parked slot. `v` keeps its allocation;
+/// the caller swaps it out with `mem::take` when it still owns the vector, so an
+/// over-sized buffer is replaced rather than parked past the idle bound.
+fn park_canyon_widths(v: &mut Vec<f32>) {
+    v.clear();
+    if v.capacity() > (256 * 1024) / std::mem::size_of::<f32>() {
+        *v = Vec::new();
+        return;
+    }
+    CANYON_WIDTHS.with(|b| {
+        let mut b = b.borrow_mut();
+        if v.capacity() > b.capacity() {
+            std::mem::swap(&mut *b, v);
+        }
+    });
 }
 
 /// `CanyonWorldCarver.getY`: a triangular vertical-radius window over the
@@ -10100,6 +10127,9 @@ struct CarveScratch {
     out: Vec<u32>,
     out_order: Vec<u32>,
     shape_marks: Vec<(i32, i32, i32)>,
+    /// The write list a finished carve hands to the owner; the commit returns the
+    /// emptied buffer here so the next chunk's `out_writes` needs no allocation.
+    out_writes: Vec<(i32, i32, i32, u32)>,
 }
 
 impl CarveScratch {
@@ -10110,6 +10140,7 @@ impl CarveScratch {
             out: Vec::new(),
             out_order: Vec::new(),
             shape_marks: Vec::new(),
+            out_writes: Vec::new(),
         }
     }
     /// Make the buffers ready for a chunk of `height` blocks. On the common same-height path
@@ -10128,6 +10159,13 @@ impl CarveScratch {
         }
         self.out_order.clear();
         self.shape_marks.clear();
+        self.out_writes.clear();
+        // The write list is committed one bucket at a time; a bucket that ever
+        // grew past the idle bound is shrunk so a parked scratch stays tiny.
+        if self.out_writes.capacity() > (256 * 1024) / std::mem::size_of::<(i32, i32, i32, u32)>()
+        {
+            self.out_writes = Vec::new();
+        }
     }
 }
 
@@ -10377,15 +10415,19 @@ fn carve_ring(g: &mut Gen, sx: i32, sz: i32) {
 /// function with one argument different (a test can compare them in one process: the
 /// environment is read once per call site and cannot be changed after that).
 fn carve_ring_with(g: &mut Gen, sx: i32, sz: i32, jobs: usize) {
-    let mut order: Vec<(i32, i32)> = Vec::with_capacity(9);
-    order.push((sx, sz));
-    for dx in -1..=1 {
-        for dz in -1..=1 {
-            if dx != 0 || dz != 0 {
-                order.push((sx + dx, sz + dz));
-            }
-        }
-    }
+    // The chunk itself first, then the ring in the `(dx, dz)` scan order of the
+    // double loop it replaces — a fixed 9-cell walk needs no allocation.
+    let order = [
+        (sx, sz),
+        (sx - 1, sz - 1),
+        (sx - 1, sz),
+        (sx - 1, sz + 1),
+        (sx, sz - 1),
+        (sx, sz + 1),
+        (sx + 1, sz - 1),
+        (sx + 1, sz),
+        (sx + 1, sz + 1),
+    ];
     // A diagnostic that prints per-cell lines is ordered by the carver call it came from, so
     // it runs on one thread: interleaved lines from eight workers would not be the same trace.
     if jobs <= 1 || carver_diag_env() {
@@ -10601,8 +10643,16 @@ fn populate_diag_env() -> bool {
 /// owner first, which makes every later `carve_ring` a no-op (`begin_carve` returns false) and
 /// removes the 49+ tiny per-chunk scopes the old loop spawned.
 pub(crate) fn precarve_order(g: &mut Gen, pending: &[(i32, i32)], jobs: usize) {
-    let mut order: Vec<(i32, i32)> = Vec::with_capacity(pending.len().saturating_mul(9));
-    let mut seen: HashSet<(i32, i32)> = HashSet::with_capacity(order.capacity());
+    // The order list and dedupe set are rebuilt identically for every populate;
+    // the parked buffers carry the allocation across calls (cleared before use).
+    let (mut order, mut seen) = PRECARVE_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        (std::mem::take(&mut s.0), std::mem::take(&mut s.1))
+    });
+    order.clear();
+    seen.clear();
+    order.reserve(pending.len().saturating_mul(9).saturating_sub(order.capacity()));
+    seen.reserve(pending.len().saturating_mul(9).saturating_sub(seen.capacity()));
     for &(sx, sz) in pending {
         // The chunk itself comes first, then the ring in the same `(dx, dz)` order as
         // `carve_ring`, so the claims (and therefore the commit order) stay identical.
@@ -10629,6 +10679,26 @@ pub(crate) fn precarve_order(g: &mut Gen, pending: &[(i32, i32)], jobs: usize) {
     for part in order.chunks(PER_CALL) {
         carve_batch(g, part, jobs);
     }
+    PRECARVE_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        order.clear();
+        seen.clear();
+        if order.capacity() > (256 * 1024) / std::mem::size_of::<(i32, i32)>() {
+            order = Vec::new();
+        }
+        if seen.capacity() > (256 * 1024) / std::mem::size_of::<(i32, i32)>() {
+            seen = HashSet::new();
+        }
+        s.0 = order;
+        s.1 = seen;
+    });
+}
+
+thread_local! {
+    /// `precarve_order`'s dedupe buffers, parked between populates. The pair is a
+    /// few KB at the 32-chunk call bound, well under the 256 KiB idle-scratch cap.
+    static PRECARVE_SCRATCH: std::cell::RefCell<(Vec<(i32, i32)>, HashSet<(i32, i32)>)> =
+        std::cell::RefCell::new((Vec::new(), HashSet::new()));
 }
 
 /// The minimum Chebyshev-independent spacing of two chunks in one wave. `POP_WRITE_RADIUS`
@@ -11018,9 +11088,18 @@ fn commit_carve(g: &mut Gen, out: CarveOutput) {
     for (x, y, z) in shape_marks {
         g.store_shape_mark_from(x, y, z, crate::worldgen::MarkSrc::Carver);
     }
-    for (x, y, z, st) in out_writes {
+    let mut out_writes = out_writes;
+    for (x, y, z, st) in out_writes.drain(..) {
         g.feat_write(x, y, z, st);
     }
+    // The emptied buffer goes back to the owner's scratch so the next committed
+    // carve writes into the same allocation.
+    CARVE_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        if out_writes.capacity() > s.out_writes.capacity() {
+            s.out_writes = out_writes;
+        }
+    });
 }
 
 /// Carve one claimed chunk and return what the owner has to record.
@@ -11161,7 +11240,10 @@ fn compute_carve_chunk(
         );
     }
     let wg = wg_heightmaps_after_carve_run(g, cc, tx, tz, &run);
-    let mut out_writes = Vec::with_capacity(run.scratch.out_order.len());
+    // The write list rides out on the scratch the run already used and comes back
+    // emptied at commit time, so a run of chunks allocates it once.
+    let mut out_writes = std::mem::take(&mut run.scratch.out_writes);
+    out_writes.reserve(run.scratch.out_order.len());
     for &i in &run.scratch.out_order {
         let (lx, y, lz) = run.pos_of(i);
         out_writes.push((
@@ -11405,7 +11487,7 @@ impl CarveRun<'_, '_> {
     ) {
         let Some(shape) = c.canyon else { return };
         let mut r = Lcg::new(seed);
-        let widths = canyon_widths(self.height as usize, shape.width_smoothness, &mut r);
+        let mut widths = canyon_widths(self.height as usize, shape.width_smoothness, &mut r);
         let mut yaw_drift = 0.0f32;
         let mut pitch_drift = 0.0f32;
         for i in branch_index..branch_count {
@@ -11431,10 +11513,12 @@ impl CarveRun<'_, '_> {
                 continue;
             }
             if !can_reach(self.tx, self.tz, x, z, i, branch_count, thickness) {
+                park_canyon_widths(&mut widths);
                 return;
             }
             self.canyon_ellipsoid(g, cc, c, x, y, z, d0, d1, &widths);
         }
+        park_canyon_widths(&mut widths);
     }
 
     /// `CanyonWorldCarver.carveEllipsoid`: the canyon profile is a vertical
@@ -11789,7 +11873,7 @@ pub(crate) static FEAT_PROF: std::sync::OnceLock<std::sync::Mutex<HashMap<String
     std::sync::OnceLock::new();
 pub(crate) fn feat_prof_record(name: &str, ns: u128) {
     let m = FEAT_PROF.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut g = m.lock().unwrap();
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
     let e = g.entry(name.to_string()).or_insert((0, 0));
     e.0 += ns;
     e.1 += 1;
@@ -11798,7 +11882,7 @@ pub(crate) fn feat_prof_record(name: &str, ns: u128) {
 #[cfg(test)]
 pub(crate) fn feat_prof_dump() {
     let Some(m) = FEAT_PROF.get() else { return };
-    let m = m.lock().unwrap();
+    let m = m.lock().unwrap_or_else(|e| e.into_inner());
     let mut v: Vec<(String, u128, u64)> = m.iter().map(|(k, (t, c))| (k.clone(), *t, *c)).collect();
     v.sort_by_key(|x| std::cmp::Reverse(x.1));
     let total: u128 = v.iter().map(|x| x.1).sum();
@@ -12156,6 +12240,9 @@ fn promote_full_chunks(ctx: &mut FC<'_>, sx: i32, sz: i32) {
             // the light the shape rules read before the pass rewrites anything.
             ctx.begin_promotion_pass(cx, cz, &marks);
             crate::structure_template::postprocess_shape_marks(ctx, reg, &marks);
+            // The consumed bucket goes back to the generator's pool so the next
+            // chunk that files marks reuses the allocation.
+            ctx.g.recycle_mark_bucket(marks);
         }
     }
     ctx.end_promotion_pass();

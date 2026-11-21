@@ -2355,6 +2355,10 @@ pub struct Gen {
     /// The owner is `getChunk(pos)`, not the chunk being generated: a carver paints up to
     /// eight chunks away, and its mark follows the position.
     shape_marks: HashMap<(i32, i32), Vec<(i32, i32, i32)>>,
+    /// Freed [`Gen::shape_marks`] buckets kept for reuse. A promoted chunk's bucket is
+    /// consumed once; parking it here turns the next `store_shape_mark` into a move
+    /// instead of a fresh allocation. Bounded small — a bucket is a few marks.
+    mark_pool: Vec<Vec<(i32, i32, i32)>>,
     /// Which writer filed each mark, for `MARK_TRACE` only. Kept apart from
     /// [`Gen::shape_marks`] because the buckets are the answer and this is the audit of it;
     /// a position filed twice keeps its last writer.
@@ -3756,6 +3760,7 @@ impl Gen {
             pop_done: HashSet::new(),
             pop_plan_window: None,
             shape_marks: HashMap::new(),
+            mark_pool: Vec::new(),
             mark_src: HashMap::new(),
             aq_sched: false,
             aq_calls: 0,
@@ -10016,6 +10021,7 @@ impl Gen {
             pop_done: HashSet::new(),
             pop_plan_window: None,
             shape_marks: HashMap::new(),
+            mark_pool: Vec::new(),
             mark_src: HashMap::new(),
             aq_sched: false,
             aq_calls: 0,
@@ -10352,6 +10358,13 @@ impl Gen {
     /// workers. The landed row is that same cell's base state, so answering from it keeps
     /// the feature stage's cost where it was.
     pub(crate) fn prefetched_cell(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        // An empty store answers `None` without the tuple-hash probe; the miss
+        // count still has to move or the report under-counts exactly the stage
+        // being measured.
+        if self.terr_c.is_empty() {
+            m3_inc(M3_PREFETCH_MISS);
+            return None;
+        }
         let rows = match self.terr_c.get(&(x >> 4, y & !15, z >> 4)) {
             Some(rows) => rows,
             None => {
@@ -11112,7 +11125,8 @@ impl Gen {
                 .take()
                 .unwrap_or_else(|| (0..g.dfs.len()).map(|_| None).collect());
             if !have_density {
-                let mut general: Vec<(usize, usize)> = Vec::new();
+                let mut general: Vec<(usize, usize)> =
+                    Vec::with_capacity(g.density_interp_nodes.len());
                 for &(iid, kind) in &g.density_interp_nodes {
                     match kind {
                         InterpKind::General(inner) => {
@@ -11133,10 +11147,13 @@ impl Gen {
                         // Each grid's program resolves once; the column then pays
                         // the 2D prefix once and `ny` runs of each 3D tail, one
                         // contiguous run of cells per grid.
-                        let resolved: Vec<(usize, &[Op])> = general
-                            .iter()
-                            .map(|&(iid, _)| (iid, cols.prog(iid).unwrap()))
-                            .collect();
+                        let mut resolved: Vec<(usize, &[Op])> =
+                            Vec::with_capacity(general.len());
+                        resolved.extend(
+                            general
+                                .iter()
+                                .map(|&(iid, _)| (iid, cols.prog(iid).unwrap())),
+                        );
                         for zi in 0..nx {
                             for xi in 0..nx {
                                 let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
@@ -12851,10 +12868,28 @@ impl Gen {
     /// `ChunkAccess.markPosForPostprocessing`, filed under the chunk that owns the cell
     /// and kept in mark order.
     pub(crate) fn store_shape_mark(&mut self, x: i32, y: i32, z: i32) {
-        self.shape_marks
-            .entry((x >> 4, z >> 4))
-            .or_default()
-            .push((x, y, z));
+        match self.shape_marks.entry((x >> 4, z >> 4)) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                e.into_mut().push((x, y, z));
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(self.mark_pool.pop().unwrap_or_default())
+                    .push((x, y, z));
+            }
+        }
+    }
+
+    /// Hand a consumed mark bucket back for [`Gen::store_shape_mark`] to reuse. The
+    /// caller has already drained it; a bucket that grew past the idle bound is
+    /// dropped rather than parked (the pool itself stays tiny).
+    pub(crate) fn recycle_mark_bucket(&mut self, mut bucket: Vec<(i32, i32, i32)>) {
+        bucket.clear();
+        if bucket.capacity() > (256 * 1024) / std::mem::size_of::<(i32, i32, i32)>() {
+            bucket = Vec::new();
+        }
+        if self.mark_pool.len() < 64 {
+            self.mark_pool.push(bucket);
+        }
     }
 
     /// [`Gen::store_shape_mark`] with the writer recorded for `MARK_TRACE`.
@@ -14919,20 +14954,43 @@ fn ps_dist(ps: &[[i32; 2]; 7], t: &[i64; 7]) -> i64 {
 }
 
 impl BTNode {
+    /// The exact distance when it is below `bound`, else `bound`. Every term is
+    /// a non-negative squared distance, so once the running sum reaches `bound`
+    /// the full sum cannot be below it — and the search only ever asks
+    /// `d < best`, so a node that reached the bound is rejected either way.
+    /// Same ordering decision the unbounded sum gives; the terms are just not
+    /// all paid for.
     #[inline(always)]
-    fn dist(&self, t: &[i64; 7]) -> i64 {
-        let d6 = if t[6] == 0 {
+    fn dist_bounded(&self, t: &[i64; 7], bound: i64) -> i64 {
+        let mut sum = dim_dist_sq(self.bounds[0], t[0]);
+        if sum >= bound {
+            return bound;
+        }
+        sum += dim_dist_sq(self.bounds[1], t[1]);
+        if sum >= bound {
+            return bound;
+        }
+        sum += dim_dist_sq(self.bounds[2], t[2]);
+        if sum >= bound {
+            return bound;
+        }
+        sum += dim_dist_sq(self.bounds[3], t[3]);
+        if sum >= bound {
+            return bound;
+        }
+        sum += dim_dist_sq(self.bounds[4], t[4]);
+        if sum >= bound {
+            return bound;
+        }
+        sum += dim_dist_sq(self.bounds[5], t[5]);
+        if sum >= bound {
+            return bound;
+        }
+        sum + if t[6] == 0 {
             self.off6_sq
         } else {
             dim_dist_sq(self.bounds[6], t[6])
-        };
-        dim_dist_sq(self.bounds[0], t[0])
-            + dim_dist_sq(self.bounds[1], t[1])
-            + dim_dist_sq(self.bounds[2], t[2])
-            + dim_dist_sq(self.bounds[3], t[3])
-            + dim_dist_sq(self.bounds[4], t[4])
-            + dim_dist_sq(self.bounds[5], t[5])
-            + d6
+        }
     }
 }
 
@@ -14960,7 +15018,7 @@ impl BT {
     ) -> Option<&[[i32; 2]; 7]> {
         let node = &self.nodes[idx];
         if node.child_len == 0 {
-            let d = node.dist(t);
+            let d = node.dist_bounded(t, best.0);
             if d < best.0 {
                 *best = (d, node.child_start as u16);
                 return Some(&node.bounds);
@@ -14972,7 +15030,9 @@ impl BT {
         let mut selected = None;
         for ci in start..end {
             let child = &self.nodes[ci];
-            let d = child.dist(t);
+            // Bounded distance: a child already at the incumbent is rejected
+            // without paying for its remaining dimensions (see `dist_bounded`).
+            let d = child.dist_bounded(t, best.0);
             if d < best.0 {
                 if child.child_len == 0 {
                     *best = (d, child.child_start as u16);
@@ -16432,6 +16492,90 @@ mod wg_tests {
             "bot_df_batch: eval_flat {flat_ms:.3} ms/chunk, dfcols {col_ms:.3} ms/chunk \
              ({:.2}x) over {N} chunks",
             flat_ms / col_ms
+        );
+    }
+
+    // ---- PERF-WORLDGEN-SPEED: the 16-chunk digest + timing gate ----
+
+    /// Every block state of a 4x4 chunk grid through `terrain_section_at` — the
+    /// same function the streaming path serves — folded into one md5, so a
+    /// "same timing, different bytes" optimization cannot pass. The grid sits
+    /// on mixed terrain at seed 0 and the assertion that it spans more than
+    /// one biome keeps the fixture honest: a chunk grid clipped to a single
+    /// biome would not exercise the feature paths this lane touches.
+    ///
+    /// `feature::populate` runs inside the measured window the way it runs on
+    /// the serving path: the first `feat_state` of a chunk settles its whole
+    /// population (carvers included), so the per-chunk figure is the full
+    /// generation cost, not the terrain fill alone. A fresh scratch generator
+    /// keeps the measurement off the shared `GenData` flight caches.
+    #[test]
+    fn perf_worldgen_speed_16chunk_bit_identical_and_bench() {
+        let _guard = lock_gen();
+        let local = Gen::load_preset_uncached(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("generator for the 16-chunk bench");
+        let mut g = Gen::fresh_scratch(std::sync::Arc::clone(&local.data));
+        drop(local);
+        let lo = g.min_y;
+        let hi = g.min_y + g.height - 16;
+        m3_reset_local();
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut cells = 0u64;
+        let mut elapsed = std::time::Duration::ZERO;
+        for cz in -2..2 {
+            for cx in -2..2 {
+                let mut sy = lo;
+                while sy <= hi {
+                    let s0 = std::time::Instant::now();
+                    let arr = g.terrain_section_at(cx, sy, cz, crate::feature::populate);
+                    elapsed += s0.elapsed();
+                    for &st in arr.iter() {
+                        bytes.extend_from_slice(&st.to_le_bytes());
+                    }
+                    cells += arr.len() as u64;
+                    sy += 16;
+                }
+            }
+        }
+        let sections = (hi - lo) / 16 + 1;
+        assert_eq!(
+            cells,
+            16 * sections as u64 * 4096,
+            "the 16-chunk grid must have produced every cell"
+        );
+        // The grid must span more than one biome, or the feature-layer timings
+        // it reports describe a corner of the input space this lane does not
+        // optimise for.
+        let mut biome_names: Vec<String> = Vec::new();
+        for (cx, cz) in (-2..2).flat_map(|cz| (-2..2).map(move |cx| (cx, cz))) {
+            if let Some(set) = g.chunk_biome_set_readonly(cx, cz) {
+                for b in set.iter() {
+                    if !biome_names.iter().any(|n| n == b) {
+                        biome_names.push(b.clone());
+                    }
+                }
+            }
+        }
+        assert!(
+            biome_names.len() > 1,
+            "the 16-chunk bench grid must span multiple biomes, got {biome_names:?}"
+        );
+        let digest: String = crate::generation_math::md5(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        println!(
+            "perf_worldgen_speed: {} biomes, {} bytes, {:.1} us/chunk over 16 chunks",
+            biome_names.len(),
+            bytes.len(),
+            elapsed.as_secs_f64() * 1e6 / 16.0
+        );
+        if m3_on() {
+            eprintln!("{}", m3_report());
+        }
+        assert_eq!(
+            digest, "e7020b651cd5bf136f7bbac0f3c844f5",
+            "16-chunk worldgen digest changed"
         );
     }
 
