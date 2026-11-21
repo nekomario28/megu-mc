@@ -2844,6 +2844,98 @@ fn log_refusal(ip: &str, why: &str) {
     }
 }
 
+// The owning connection checks for deaths even when no play packets arrive.
+// PvP invokes this on the victim as well, so drops happen at the death site.
+fn death_drop_marks() -> &'static Mutex<HashSet<i32>> {
+    static MARKS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    MARKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn drop_player_items_on_death(player: &Arc<Client>) {
+    if *player.hp.lock().unwrap() > 0.0 {
+        return;
+    }
+    if !death_drop_marks().lock().unwrap().insert(player.eid) {
+        return;
+    }
+    if GR_KEEP_INVENTORY.load(Ordering::Relaxed) != 0
+        || !matches!(*player.gm.lock().unwrap(), 0 | 2)
+    {
+        return;
+    }
+    close_live_menu(player, true, true);
+    let (dx, dy, dz, ..) = *player.pos.lock().unwrap();
+    let mut spill: Vec<Stack> = {
+        let mut inventory = player.inv.lock().unwrap();
+        let items = inventory.values().cloned().collect();
+        inventory.clear();
+        items
+    };
+    *player.armor_pts.lock().unwrap() = 0;
+    let cursor = std::mem::take(&mut *player.cursor.lock().unwrap());
+    if cursor.1 > 0 {
+        spill.push(cursor);
+    }
+    for grid in [&player.craft, &player.craft9] {
+        spill.extend(std::mem::take(&mut *grid.lock().unwrap()).into_values());
+    }
+    {
+        let mut spawned = drops().lock().unwrap();
+        for (item, cnt, comps) in spill
+            .into_iter()
+            .filter(|stack| stack.1 > 0 && enchant_level(&stack.2, 40) == 0)
+        {
+            spawned.push(Drop {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                x: dx,
+                y: dy + 0.4,
+                z: dz,
+                item,
+                cnt,
+                comps,
+                age: 0,
+                target: None,
+                thrower: None,
+            });
+        }
+    }
+    let mut experience = take_dropped_experience(player);
+    let mut spawned = xps().lock().unwrap();
+    while experience > 0 {
+        let count = experience.min(10) as i16;
+        experience -= i64::from(count);
+        spawned.push(Xp {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x: dx,
+            y: dy + 0.5,
+            z: dz,
+            val: count,
+            age: 0,
+        });
+    }
+}
+
+fn save_live_player_snapshot(
+    player: &Arc<Client>,
+    position: DimPosRot,
+    inventory: &HashMap<i16, Stack>,
+) {
+    let mut snapshot = PlayerSave::capture(player, position, inventory);
+    let mut saved = saved_players().lock().unwrap();
+    if let (Some(old), Some(current)) = (
+        saved.get(&player.uuid).and_then(|save| save.respawn),
+        snapshot.respawn,
+    ) {
+        if old.dim == current.dim
+            && old.position == current.position
+            && old.angle == current.angle
+        {
+            snapshot.respawn = Some(old);
+        }
+    }
+    saved.insert(player.uuid, snapshot);
+}
+
 fn handle(mut s: TcpStream) {
     s.set_nodelay(true).ok();
     let peer = s
@@ -3015,17 +3107,21 @@ fn handle(mut s: TcpStream) {
     // P2-3-S4: read the saved dimension BEFORE 0x2b so Join Game and the first chunk
     // window both name the world the player actually logged out in. The 0x2b payload and
     // the camera position must agree or the client asks for chunks from the wrong generator.
-    let (saved_dim, sx, sy, sz, syaw, spitch) = pos_store()
-        .lock()
-        .unwrap()
-        .get(&name)
-        .copied()
+    let player_uuid: [u8; 16] = uuid.as_slice().try_into().unwrap();
+    let saved_player = saved_players().lock().unwrap().get(&player_uuid).cloned();
+    let (saved_dim, sx, sy, sz, syaw, spitch) = saved_player
+        .as_ref()
+        .map(|save| save.position)
+        .or_else(|| pos_store().lock().unwrap().get(&name).copied())
         .unwrap_or_else(|| {
             let w = *WORLD_SPAWN.lock().unwrap();
             (DimId::Overworld, w.0, w.1, w.2, w.3, 0.0)
         });
     let player_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-    let initial_gm = DEFAULT_GAME_MODE.load(Ordering::Relaxed);
+    let initial_gm = saved_player
+        .as_ref()
+        .map_or_else(|| DEFAULT_GAME_MODE.load(Ordering::Relaxed), |save| save.gamemode);
+    let initial_held = saved_player.as_ref().map_or(0, |save| save.held.clamp(0, 8));
     if send_packet(&mut s, 0x2b, join_game(saved_dim, initial_gm, player_eid)).is_err() {
         return;
     }
@@ -3033,7 +3129,7 @@ fn handle(mut s: TcpStream) {
     if send_commands(&mut s, login_admin).is_err() {
         return;
     }
-    let _ = send_packet(&mut s, 0x53, vec![0]); // held slot 0
+    let _ = send_packet(&mut s, 0x53, vec![initial_held as u8]);
     let mut vp = Vec::new();
     write_varint(&mut vp, 0);
     write_varint(&mut vp, 0);
@@ -3089,20 +3185,23 @@ fn handle(mut s: TcpStream) {
         vec![DIFFICULTY.load(Ordering::Relaxed), 0],
     );
     let mut xp = Vec::new();
-    xp.extend_from_slice(&0f32.to_be_bytes());
-    write_varint(&mut xp, 0);
-    write_varint(&mut xp, 0);
+    xp.extend_from_slice(&saved_player.as_ref().map_or(0.0, |save| save.xp_progress).to_be_bytes());
+    write_varint(&mut xp, saved_player.as_ref().map_or(0, |save| save.xp_level) as i64);
+    write_varint(&mut xp, saved_player.as_ref().map_or(0, |save| save.xp_total));
     let _ = send_packet(&mut s, 0x5c, xp);
     let mut hp = Vec::new();
-    hp.extend_from_slice(&max_hp_of(&name).to_be_bytes());
-    write_varint(&mut hp, 20);
-    hp.extend_from_slice(&5f32.to_be_bytes());
+    hp.extend_from_slice(&saved_player.as_ref().map_or_else(|| max_hp_of(&name), |save| save.health).to_be_bytes());
+    write_varint(&mut hp, saved_player.as_ref().map_or(20, |save| save.food) as i64);
+    hp.extend_from_slice(&saved_player.as_ref().map_or(5.0, |save| save.saturation).to_be_bytes());
     let _ = send_packet(&mut s, 0x5d, hp);
     if let Some(rp) = resource_pack_pkt() {
         let _ = send_packet(&mut s, 0x46, rp);
     }
     // restore saved inventory for this name
-    let saved_inv = inv_store().lock().unwrap().get(&name).cloned();
+    let saved_inv = saved_player
+        .as_ref()
+        .map(|save| save.inventory.clone())
+        .or_else(|| inv_store().lock().unwrap().get(&name).cloned());
     eprintln!(
         "[spine] {} joined from {} (uuid {})",
         name,
@@ -3113,16 +3212,12 @@ fn handle(mut s: TcpStream) {
     let Ok(writer) = s.try_clone() else { return };
     let me = Arc::new(Client {
         eid: player_eid,
-        uuid: {
-            let mut u = [0u8; 16];
-            u.copy_from_slice(&uuid);
-            u
-        },
+        uuid: player_uuid,
         name: name.clone(),
         player_attack_damage_id: player_attack_damage_wire_id(&cfg),
         pos: Mutex::new((sx, sy, sz, syaw, spitch, true)),
         teleport: Mutex::new(teleport),
-        hp: Mutex::new(20.0),
+        hp: Mutex::new(saved_player.as_ref().map_or(20.0, |save| save.health)),
         sock: Mutex::new(writer),
         inv: Mutex::new(saved_inv.unwrap_or_default()),
         cursor: Mutex::new((0, 0, Vec::new())),
@@ -3150,30 +3245,34 @@ fn handle(mut s: TcpStream) {
         invulnerable: Mutex::new(0),
         last_hurt: Mutex::new(0.0),
         shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
-        absorb: Mutex::new(0.0),
+        absorb: Mutex::new(saved_player.as_ref().map_or(0.0, |save| save.absorption)),
         pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
         seen: Mutex::new(HashSet::new()),
         chunks: Mutex::new(HashSet::new()),
         chunk_ack: Mutex::new(chunk_ack),
         gen_sources: Mutex::new(gen),
-        xp: Mutex::new(0),
+        xp: Mutex::new(saved_player.as_ref().map_or(0, |save| save.xp_total)),
         gm: Mutex::new(initial_gm),
         fall_from: Mutex::new(sy),
-        food: Mutex::new(20),
+        food: Mutex::new(saved_player.as_ref().map_or(20, |save| save.food)),
         air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         armor_pts: Mutex::new(0),
-        sat: Mutex::new(5.0),
-        walk_acc: Mutex::new(0.0),
+        sat: Mutex::new(saved_player.as_ref().map_or(5.0, |save| save.saturation)),
+        walk_acc: Mutex::new(saved_player.as_ref().map_or(0.0, |save| save.exhaustion)),
         lastp: Mutex::new((sx, sy, sz)),
-        spawn_pt: Mutex::new(None),
+        spawn_pt: Mutex::new(saved_player.as_ref().and_then(|save| save.respawn.map(|point| {
+            (point.position.0, point.position.1, point.position.2, point.angle)
+        }))),
         dim: Mutex::new(saved_dim),
         view: Mutex::new(view),
-        spawn_dim: Mutex::new(saved_dim),
+        spawn_dim: Mutex::new(saved_player.as_ref().and_then(|save| save.respawn.map(|point| point.dim)).unwrap_or(saved_dim)),
         in_portal: Mutex::new(false),
         portal_at: Mutex::new(None),
         skin: Mutex::new(None),
-        held: Mutex::new(0),
-        effs: Mutex::new(Vec::new()),
+        held: Mutex::new(initial_held),
+        effs: Mutex::new(saved_player.as_ref().map_or_else(Vec::new, |save| {
+            save.effects.iter().map(|&(id, amp, left)| Eff { id, amp, left }).collect()
+        })),
     });
     me.enter_play_wire(compression, initial_window);
     {
@@ -3194,7 +3293,7 @@ fn handle(mut s: TcpStream) {
         player_mechanism_sessions().lock().unwrap().insert(
             me.eid,
             PlayerMechanismSession {
-                xp_bar: (0, 0.0),
+                xp_bar: saved_player.as_ref().map_or((0, 0.0), |save| (save.xp_level, save.xp_progress)),
                 food_timer: 0,
                 menus: Arc::new(LiveMenuConnection {
                     active: Mutex::new(None),
@@ -3203,6 +3302,15 @@ fn handle(mut s: TcpStream) {
                 }),
             },
         );
+    }
+    if let Some(save) = saved_player.as_ref() {
+        chests().lock().unwrap().insert(
+            ender_container_key(&me.uuid),
+            save.ender_chest.clone(),
+        );
+        for &(id, amp, left) in &save.effects {
+            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x76, entity_effect_pkt(me.eid, id, amp, left));
+        }
     }
     // Java sees the login before the tick thread can snapshot this player.
     #[cfg(feature = "neoforge-events")]
@@ -3264,13 +3372,14 @@ fn handle(mut s: TcpStream) {
     s.set_write_timeout(Some(Duration::from_secs(2))).ok();
     let mut keepalive = connection_limits::KeepaliveState::new(Instant::now());
     let mut next_keepalive_id = 1i64;
-    let mut held_slot: i16 = 0;
+    let mut held_slot: i16 = initial_held;
 
     let mut rx = RxBuf::new(compression);
     // Play-state packet inactivity is tracked separately from the keep-alive deadline.
     let mut last_rx = Instant::now();
     let mut chat_throttle = connection_limits::ChatThrottle::new(Instant::now());
     'conn: loop {
+        drop_player_items_on_death(&me);
         use connection_limits::KeepaliveAction;
         match keepalive.tick(Instant::now(), next_keepalive_id) {
             KeepaliveAction::Send(id) => {
@@ -3306,6 +3415,7 @@ fn handle(mut s: TcpStream) {
                 (pid, b)
             }
         };
+        drop_player_items_on_death(&me);
 
         // a client that stopped answering chunk batches is gone, not slow
         if me.chunk_ack.lock().unwrap().timed_out(Instant::now()) {
@@ -3848,7 +3958,7 @@ fn handle(mut s: TcpStream) {
                 } // aborted dig
                 if status == 0 || status == 2 {
                     // vanilla block_interaction_range: 4.5 survival / 5.0 creative
-                    let (px, py, pz, ..) = *me.pos.lock().unwrap();
+                    let (px, py, pz, _, _, on_ground) = *me.pos.lock().unwrap();
                     let game_mode = *me.gm.lock().unwrap();
                     let gm_creative = game_mode == 1;
                     let reach = if gm_creative { 5.6f64 } else { 4.9 };
@@ -3867,7 +3977,35 @@ fn handle(mut s: TcpStream) {
                             .unwrap_or((0, 0, Vec::new()))
                     };
                     let req = if in_range {
+                        let (haste, fatigue) = {
+                            let effects = me.effs.lock().unwrap();
+                            (
+                                effects.iter().find(|effect| effect.id == 2).map(|effect| effect.amp),
+                                effects.iter().find(|effect| effect.id == 3).map(|effect| effect.amp),
+                            )
+                        };
+                        let underwater = block_registry::breg().is_some_and(|registry| {
+                            let (bx, by, bz) = (
+                                px.floor() as i32,
+                                (py + 1.62).floor() as i32,
+                                pz.floor() as i32,
+                            );
+                            registry.has_water(block_at_dim(dim, bx, by, bz))
+                        });
+                        let aqua_affinity = me.inv.lock().unwrap().get(&5)
+                            .is_some_and(|helmet| enchant_level(&helmet.2, 0) > 0);
+                        let base_speed = tool_dig_speed(&held, old as i64);
+                        let modified_speed = mining_speed_with_modifiers(
+                            base_speed,
+                            false,
+                            0,
+                            haste,
+                            fatigue,
+                            underwater && !aqua_affinity,
+                            on_ground,
+                        );
                         dig_seconds(old as i64, &held)
+                            .map(|seconds| seconds * base_speed / modified_speed.max(f32::MIN_POSITIVE))
                     } else {
                         None
                     };
@@ -4316,15 +4454,27 @@ fn handle(mut s: TcpStream) {
                     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
                     if dim == DimId::Overworld && (13000..=23500).contains(&wt) {
                         WORLD_TIME.store(0, Ordering::Relaxed);
+                        let angle = me.pos.lock().unwrap().3;
+                        let position = (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5);
                         {
                             let mut spawn_dim = me.spawn_dim.lock().unwrap();
                             *me.spawn_pt.lock().unwrap() =
-                                Some((x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5, 0.0));
+                                Some((position.0, position.1, position.2, angle));
                             *spawn_dim = dim;
                         }
+                        let inventory = me.inv.lock().unwrap().clone();
+                        let mut snapshot = PlayerSave::capture(&me, client_dim_pos(&me), &inventory);
+                        snapshot.respawn = Some(SpawnTarget {
+                            kind: SpawnTargetKind::Bed,
+                            dim,
+                            position,
+                            angle,
+                            forced: false,
+                        });
+                        saved_players().lock().unwrap().insert(me.uuid, snapshot);
                         let mut sp = Vec::new();
                         write_pos(&mut sp, x, y, z);
-                        sp.extend_from_slice(&0.0f32.to_be_bytes());
+                        sp.extend_from_slice(&angle.to_be_bytes());
                         let _ = send_packet(&mut me.sock.lock().unwrap(), 0x56, sp);
                         let line = system_chat(&format!("{} slept through the night", me.name));
                         broadcast(-1, |_c| (0x6c, line.clone()));
@@ -4993,6 +5143,12 @@ fn handle(mut s: TcpStream) {
                         if let Some((veid, vname, hh)) = found {
                             broadcast_seen_ex(veid, veid, |_c| (0x24, hurt_anim(veid)));
                             if hh <= 0.0 {
+                                let victim = {
+                                    clients().lock().unwrap().iter().find(|c| c.eid == veid).cloned()
+                                };
+                                if let Some(victim) = victim {
+                                    drop_player_items_on_death(&victim);
+                                }
                                 let line =
                                     system_chat(&format!("{} was slain by {}", vname, me.name));
                                 broadcast(-1, |_c| (0x6c, line.clone()));
@@ -5000,7 +5156,8 @@ fn handle(mut s: TcpStream) {
                             continue;
                         }
                     }
-                    let mut dead: Option<(i32, i64, f64, f64, f64)> = None;
+                    let mut dead: Vec<(i32, i64, f64, f64, f64)> = Vec::new();
+                    let mut swept: Vec<i32> = Vec::new();
                     {
                         let ms = mobs().lock().unwrap();
                         if let Some(m) = ms.iter().find(|m| m.eid == target) {
@@ -5139,26 +5296,51 @@ fn handle(mut s: TcpStream) {
                                     * scale
                                     * if crit { 1.5 } else { 1.0 };
                                 drop(h);
-                                // sweeping_edge: lvl dmg to other mobs within 1.5 blocks (needs ~full charge)
-                                let sw = enchant_level(&held.2, 36);
-                                if sw > 0 && charge >= 0.9 {
-                                    let (mx0, my0, mz0, ..) = *m.pos.lock().unwrap();
-                                    let others: Vec<Arc<Mob>> =
-                                        ms.iter().filter(|&o| o.eid != m.eid).cloned().collect();
-                                    for o in others {
-                                        let (ox, oy, oz, ..) = {
-                                            let p = o.pos.lock().unwrap();
-                                            *p
+                                // Vanilla swords sweep even without Sweeping Edge.
+                                if kind == 0 {
+                                    let (mx, my, mz, ..) = *m.pos.lock().unwrap();
+                                    let (width, height) = entity_dimensions_1211(m.etype);
+                                    let target_box = PlayerAabb {
+                                        min: [mx - f64::from(width) / 2.0, my, mz - f64::from(width) / 2.0],
+                                        max: [mx + f64::from(width) / 2.0, my + f64::from(height), mz + f64::from(width) / 2.0],
+                                    };
+                                    for other in ms.iter().filter(|other| other.eid != m.eid && other.dim == dim) {
+                                        let (ox, oy, oz, ..) = *other.pos.lock().unwrap();
+                                        let (ow, oh) = entity_dimensions_1211(other.etype);
+                                        let candidate = PlayerAabb {
+                                            min: [ox - f64::from(ow) / 2.0, oy, oz - f64::from(ow) / 2.0],
+                                            max: [ox + f64::from(ow) / 2.0, oy + f64::from(oh), oz + f64::from(ow) / 2.0],
                                         };
-                                        if (ox - mx0).abs() < 1.5
-                                            && (oy - my0).abs() < 1.5
-                                            && (oz - mz0).abs() < 1.5
-                                        {
-                                            let mut oh = o.hp.lock().unwrap();
-                                            *oh -= wep * (sw as f32) / (sw as f32 + 1.0);
-                                            drop(oh);
-                                            broadcast_seen(o.eid, |_c| (0x24, hurt_anim(o.eid)));
+                                        let sweep = sweeping_attack(
+                                            charge,
+                                            grounded,
+                                            *me.sprinting.lock().unwrap(),
+                                            crit,
+                                            [px, py, pz],
+                                            target_box,
+                                            candidate,
+                                            (wep + sharp + strb + wkb).max(0.0),
+                                            enchant_level(&held.2, 36) as i32,
+                                        );
+                                        if !sweep.eligible || !live_mob_hit_allowed(other, me.eid, BossHit::Other) {
+                                            continue;
                                         }
+                                        let mut hurt_at = other.hurt_at.lock().unwrap();
+                                        if hurt_at.elapsed() < Duration::from_millis(500) {
+                                            continue;
+                                        }
+                                        *hurt_at = Instant::now();
+                                        drop(hurt_at);
+                                        let mut health = other.hp.lock().unwrap();
+                                        if *health <= 0.0 {
+                                            continue;
+                                        }
+                                        *health -= sweep.damage;
+                                        if *health <= 0.0 {
+                                            dead.push((other.eid, other.etype, ox, oy, oz));
+                                        }
+                                        drop(health);
+                                        swept.push(other.eid);
                                     }
                                 }
                                 // Fire Aspect adds four seconds of independent burn time per level.
@@ -5181,7 +5363,7 @@ fn handle(mut s: TcpStream) {
                                         let p = m.pos.lock().unwrap();
                                         *p
                                     };
-                                    dead = Some((m.eid, m.etype, mx, my, mz));
+                                    dead.push((m.eid, m.etype, mx, my, mz));
                                 }
                                 let ha = hurt_anim(m.eid);
                                 let _ =
@@ -5228,7 +5410,10 @@ fn handle(mut s: TcpStream) {
                             }
                         }
                     }
-                    if let Some((deid, etype, mx, my, mz)) = dead {
+                    for target_eid in swept {
+                        broadcast_seen(target_eid, |_c| (0x24, hurt_anim(target_eid)));
+                    }
+                    for (deid, etype, mx, my, mz) in dead {
                         adv_event(&me.name, "player_killed_entity", Some(etype));
                         let mn = match etype {
                             124 => "Zombie",
@@ -5297,6 +5482,7 @@ fn handle(mut s: TcpStream) {
                 // client_command: perform_respawn
                 let mut sl = &b[..];
                 if read_varint(&mut sl) == Some(0) && sl.is_empty() {
+                    drop_player_items_on_death(&me);
                     let restored_health = max_hp_of(&me.name);
                     {
                         let mut health = me.hp.lock().unwrap();
@@ -5305,77 +5491,8 @@ fn handle(mut s: TcpStream) {
                         }
                         *health = restored_health;
                     }
+                    death_drop_marks().lock().unwrap().remove(&me.eid);
                     close_live_menu(&me, true, true);
-                    // vanilla death drops the inventory at the death
-                    // location (keepInventory=false) — the player's pos
-                    // is still the death site at this point
-                    if *me.gm.lock().unwrap() == 0 && GR_KEEP_INVENTORY.load(Ordering::Relaxed) == 0
-                    {
-                        let (dx, dy, dz) = {
-                            let p = me.pos.lock().unwrap();
-                            (p.0, p.1, p.2)
-                        };
-                        let mut spill: Vec<Stack> = Vec::new();
-                        {
-                            let mut iv = me.inv.lock().unwrap();
-                            spill.extend(iv.values().cloned());
-                            iv.clear();
-                            *me.armor_pts.lock().unwrap() = 0;
-                        }
-                        {
-                            let mut cur = me.cursor.lock().unwrap();
-                            if cur.1 > 0 {
-                                spill.push(cur.clone());
-                            }
-                            *cur = (0, 0, Vec::new());
-                        }
-                        {
-                            let mut cr = me.craft.lock().unwrap();
-                            spill.extend(cr.values().cloned());
-                            cr.clear();
-                        }
-                        {
-                            let mut cr = me.craft9.lock().unwrap();
-                            spill.extend(cr.values().cloned());
-                            cr.clear();
-                        }
-                        {
-                            let mut ds = drops().lock().unwrap();
-                            for (item, cnt, comps) in spill
-                                .into_iter()
-                                .filter(|s| s.1 > 0 && enchant_level(&s.2, 40) == 0)
-                            {
-                                ds.push(Drop {
-                                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                    x: dx,
-                                    y: dy + 0.4,
-                                    z: dz,
-                                    item,
-                                    cnt,
-                                    comps,
-                                    age: 0,
-                                    target: None,
-                                    thrower: None,
-                                });
-                            }
-                        }
-                        // Scatter the XP represented by the player's bar.
-                        let mut rem = take_dropped_experience(&me);
-                        let mut xs = xps().lock().unwrap();
-                        while rem > 0 {
-                            let v = rem.min(10) as i16;
-                            rem -= v as i64;
-                            xs.push(Xp {
-                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                x: dx,
-                                y: dy + 0.5,
-                                z: dz,
-                                val: v,
-                                age: 0,
-                            });
-                        }
-                        drop(xs);
-                    }
                     // P2-3-S4: respawn in the dimension the spawn point belongs to. A
                     // death in the Nether returns to the Overworld bed/world spawn when that
                     // is where the spawn point was set, with a full window rebuild.
@@ -5414,6 +5531,8 @@ fn handle(mut s: TcpStream) {
                     }
                     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); // carried
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x13, q);
+                    let inventory = me.inv.lock().unwrap().clone();
+                    save_live_player_snapshot(&me, client_dim_pos(&me), &inventory);
                 }
             }
             0x2b => {
@@ -6741,6 +6860,7 @@ fn handle(mut s: TcpStream) {
                 broadcast_seen_destroy(*eid);
             }
         }
+        drop_player_items_on_death(&me_cleanup);
         close_live_menu(&me_cleanup, false, false);
         {
             // vanilla containerMenu.removed: cursor and crafting grid
@@ -6804,14 +6924,17 @@ fn handle(mut s: TcpStream) {
                 }
             }
             *me_cleanup.drag.lock().unwrap() = (-1, Vec::new());
+            let inventory_snapshot = inv.clone();
+            drop(inv);
             inv_store()
                 .lock()
                 .unwrap()
-                .insert(name.clone(), inv.clone());
+                .insert(name.clone(), inventory_snapshot.clone());
             // A logout persists the dimension the player was actually in, so the next
             // login's 0x2b Join Game and first chunk window resume in that world.
             let record = client_dim_pos(&me_cleanup);
             pos_store().lock().unwrap().insert(name.clone(), record);
+            save_live_player_snapshot(&me_cleanup, record, &inventory_snapshot);
         }
         // vanilla `ServerPlayer.disconnect` -> `containerMenu.removed` -> stopOpen:
         // the leaving viewer stops counting before it leaves the client list. The window
@@ -6836,6 +6959,7 @@ fn handle(mut s: TcpStream) {
         cls.retain(|c| c.eid != me_cleanup.eid);
         drop(cls);
         player_mechanism_sessions().lock().unwrap().remove(&me_cleanup.eid);
+        death_drop_marks().lock().unwrap().remove(&me_cleanup.eid);
         broadcast(me_cleanup.eid, |_c| {
             (0x42, {
                 let mut p = Vec::new();
