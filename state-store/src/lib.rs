@@ -34,10 +34,16 @@
 //!   [`region_tick::tick_dimension_regions_parallel`]: same-wave regions can
 //!   never share a chunk border, so parallel ticking is bit-identical to
 //!   serial ticking.
+//! * [`snapshot`] — the `STV1` binary codec ([`snapshot::encode_snapshot`] /
+//!   [`snapshot::decode_snapshot`]): a deterministic, CRC32-sealed snapshot of
+//!   a [`sharded::ServerContext`]'s chunk overlays keyed on
+//!   `mc_spine_core::version::TargetVersion`, failing closed on any
+//!   corruption.
 
 pub mod datafix;
 pub mod region_tick;
 pub mod sharded;
+pub mod snapshot;
 
 pub use datafix::{DataFixError, DataFixReport, DataFixStep, DataFixer, DataValue, DV_1_21_1, DV_26_3};
 pub use region_tick::{
@@ -48,3 +54,4 @@ pub use sharded::{
     chunk_shard, BlockCoord, ChunkCoord, ChunkOverlay, DimensionState, EntityRecord, PendingTick,
     ServerContext, TickKind, SHARD_COUNT,
 };
+pub use snapshot::{decode_snapshot, encode_snapshot, SnapshotError};

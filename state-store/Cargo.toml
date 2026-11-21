@@ -8,4 +8,7 @@ description = "Standalone 64-shard DimensionState/ServerContext runtime store an
 
 # Zero external dependencies by contract: this crate is the clean-room runtime
 # state core the server lanes converge on, so it must build on pure `std`.
+# `mc-spine-core` is the workspace-internal leaf crate (the canonical
+# TargetVersion registry), not a crates.io dependency.
 [dependencies]
+mc_spine_core = { package = "mc-spine-core", path = "../core" }

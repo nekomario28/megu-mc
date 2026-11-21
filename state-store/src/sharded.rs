@@ -134,6 +134,22 @@ impl ChunkOverlay {
         self.revision
     }
 
+    /// Rebuild an overlay from persisted parts. The `revision` arrives with
+    /// the snapshot record, so this constructor must not re-earn it through
+    /// the per-write bump `set_block`/`set_block_entity` perform. Crate
+    /// internal: only the snapshot codec states a revision outright.
+    pub(crate) fn from_snapshot_parts(
+        blocks: HashMap<(u8, i32, u8), u32>,
+        block_entities: HashMap<(u8, i32, u8), Vec<u8>>,
+        revision: u64,
+    ) -> Self {
+        Self {
+            blocks,
+            block_entities,
+            revision,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty() && self.block_entities.is_empty()
     }
@@ -319,6 +335,29 @@ impl DimensionState {
         self.with_chunks_read(&[coord], |set| set.get(coord).map_or(0, ChunkOverlay::revision))
     }
 
+    /// Visit every chunk overlay, locking one shard at a time in ascending
+    /// shard-index order (the §4 lock order). Callers that need a
+    /// deterministic sequence — the snapshot codec — sort afterwards, so the
+    /// shard-internal `HashMap` order never leaks into the output.
+    pub(crate) fn for_each_overlay(&self, mut f: impl FnMut(ChunkCoord, &ChunkOverlay)) {
+        for shard in &self.chunk_shards {
+            let map = shard.read().unwrap_or_else(|p| p.into_inner());
+            for (coord, overlay) in map.iter() {
+                f(*coord, overlay);
+            }
+        }
+    }
+
+    /// Install a fully-formed overlay at `coord`, replacing any existing one.
+    /// Only the snapshot codec uses this: the overlay's revision is part of
+    /// the persisted record, not re-earned through writes.
+    pub(crate) fn install_overlay(&self, coord: ChunkCoord, overlay: ChunkOverlay) {
+        self.chunk_shards[coord.shard()]
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(coord, overlay);
+    }
+
     /// Number of chunk columns carrying an overlay.
     pub fn overlay_count(&self) -> usize {
         self.chunk_shards
@@ -446,6 +485,20 @@ impl ServerContext {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .remove(name)
+    }
+
+    /// Every `(name, dimension)` pair, sorted by name, taken under a single
+    /// read guard so the snapshot codec sees one point-in-time view of the
+    /// map (names and `Arc`s cannot be torn apart by a concurrent register
+    /// or remove the way `dimension_names` + per-name lookups can).
+    pub(crate) fn dimensions_sorted(&self) -> Vec<(String, Arc<DimensionState>)> {
+        let map = self.dimensions.read().unwrap_or_else(|p| p.into_inner());
+        let mut dims: Vec<(String, Arc<DimensionState>)> = map
+            .iter()
+            .map(|(name, dim)| (name.clone(), Arc::clone(dim)))
+            .collect();
+        dims.sort_by(|a, b| a.0.cmp(&b.0));
+        dims
     }
 
     /// Dimension names in sorted (deterministic) order.

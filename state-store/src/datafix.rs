@@ -14,14 +14,17 @@
 //! exact mirror: it refuses documents newer than `5023`, reverses each fix,
 //! warns on 26.3-only entries it cannot represent, and stamps `3955`.
 
+use mc_spine_core::version::TargetVersion;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-/// DataVersion shipped by Minecraft 1.21.1.
-pub const DV_1_21_1: i32 = 3955;
-/// DataVersion shipped by Minecraft 26.3.
-pub const DV_26_3: i32 = 5023;
+/// DataVersion shipped by Minecraft 1.21.1 — the same constant
+/// [`TargetVersion::V1_21_1`] carries, so the fixer and the version registry
+/// can never drift apart.
+pub const DV_1_21_1: i32 = TargetVersion::V1_21_1.meta().data_version;
+/// DataVersion shipped by Minecraft 26.3 — [`TargetVersion::V26_3`]'s.
+pub const DV_26_3: i32 = TargetVersion::V26_3.meta().data_version;
 
 /// Minimal NBT/JSON-compatible tagged tree the fix steps operate on.
 #[derive(Clone, Debug, Default, PartialEq)]

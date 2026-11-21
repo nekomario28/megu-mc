@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "mc-spine-core"
+version = "0.1.0"
+
+[[package]]
 name = "mc-spine-server-files"
 version = "0.1.0"
+dependencies = [
+ "mc-spine-core",
+]

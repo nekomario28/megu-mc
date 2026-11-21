@@ -8,5 +8,7 @@ description = "Standalone Vanilla server files for mc-spine: server.properties, 
 
 # Zero external dependencies by contract: this crate is the clean-room server
 # files core the dedicated-server lanes converge on, so it must build on pure
-# `std`.
+# `std`. `mc-spine-core` is the workspace-internal leaf crate (the canonical
+# TargetVersion registry), not a crates.io dependency.
 [dependencies]
+mc_spine_core = { package = "mc-spine-core", path = "../core" }

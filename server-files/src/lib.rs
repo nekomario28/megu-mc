@@ -26,8 +26,12 @@
 //!   `banned-ips.json`.
 //! * [`usercache`] — `usercache.json`: a bounded `uuid` <-> `name` most
 //!   recently used cache.
+//! * [`directory`] — [`directory::ServerDirectory`], the facade that owns the
+//!   whole set: `load_or_init`, Vanilla-precedence `admit_login` and
+//!   `save_all_atomic`, pinned to a [`mc_spine_core::version::TargetVersion`].
 
 pub mod atomic;
+pub mod directory;
 pub mod eula;
 pub mod json;
 pub mod lists;
@@ -35,6 +39,7 @@ pub mod properties;
 pub mod usercache;
 
 pub use atomic::write_atomic;
+pub use directory::{AdmissionDecision, ServerDirectory};
 pub use eula::{check_eula, write_default_eula, EulaStatus, EULA_FILE, EULA_LINK};
 pub use json::{Json, JsonError};
 pub use lists::{
