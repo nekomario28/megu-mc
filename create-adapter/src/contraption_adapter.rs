@@ -294,11 +294,11 @@ impl LiveContraption {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blockstates::DEFAULT_BASE_STATE_ID;
+    use crate::blockstates::{core_create_registry, DEFAULT_BASE_STATE_ID};
 
     #[test]
     fn bearing_contraption_assemble_rotate_carry_passenger_and_disassemble() {
-        let reg = CreateBlockRegistry::core_create(DEFAULT_BASE_STATE_ID);
+        let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
         let shaft = reg.default_state("create:shaft").unwrap();
         let mut world = BTreeMap::new();
         // 3-block horizontal arm at anchor (10, 64, 10) extending along +X.

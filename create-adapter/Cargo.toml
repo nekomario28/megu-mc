@@ -3,8 +3,9 @@ name = "create-adapter"
 version = "0.1.0"
 edition = "2021"
 license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
-description = "Zero-JVM Create Mod core adapter on top of mc-spine mod-offload kernels"
+description = "Flagship zero-JVM Create Mod special-case optimizer built on mod-adapter-core and mod-offload"
 publish = false
 
 [dependencies]
+mod-adapter-core = { path = "../mod-adapter-core" }
 mod-offload = { path = "../mod-offload" }

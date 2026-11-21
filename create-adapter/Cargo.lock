@@ -6,6 +6,14 @@ version = 4
 name = "create-adapter"
 version = "0.1.0"
 dependencies = [
+ "mod-adapter-core",
+ "mod-offload",
+]
+
+[[package]]
+name = "mod-adapter-core"
+version = "0.1.0"
+dependencies = [
  "mod-offload",
 ]
 

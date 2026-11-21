@@ -1,0 +1,10 @@
+[package]
+name = "mod-adapter-core"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+description = "Universal zero-JVM mod adapter, declarative offload profile engine, and 4-tier fallback planner on mod-offload"
+publish = false
+
+[dependencies]
+mod-offload = { path = "../mod-offload" }

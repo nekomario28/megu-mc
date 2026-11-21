@@ -209,8 +209,8 @@ impl CreateFactory {
             role: def.role,
             axis,
             powered,
-            stress_impact: def.stress_impact,
-            stress_capacity: def.stress_capacity,
+            stress_impact: def.load_factor,
+            stress_capacity: def.capacity_factor,
         };
         let input = kinetic_node_input(placed, 1.0);
         self.scheduler
@@ -685,13 +685,13 @@ fn canonical_pair(a: DimBlockPos, b: DimBlockPos) -> (DimBlockPos, DimBlockPos) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blockstates::DEFAULT_BASE_STATE_ID;
+    use crate::blockstates::{core_create_registry, DEFAULT_BASE_STATE_ID};
     use crate::data_loader::{parse_create_recipe_json, ItemFluidIdTable};
     use mod_offload::recipe_processor::{Resource, ResourceKind};
 
     #[test]
     fn cogwheel_gearing_clutch_gearshift_overstress_and_recovery() {
-        let reg = CreateBlockRegistry::core_create(DEFAULT_BASE_STATE_ID);
+        let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
         let water_wheel_z = reg
             .with_property(
                 reg.default_state("create:water_wheel").unwrap(),
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn wrench_rotation_disconnects_and_reconnects_shafts() {
-        let reg = CreateBlockRegistry::core_create(DEFAULT_BASE_STATE_ID);
+        let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
         let wheel_x = reg
             .with_property(
                 reg.default_state("create:water_wheel").unwrap(),
@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn end_to_end_recipes_belts_fluids_and_custom_dimension_isolation() {
-        let reg = CreateBlockRegistry::core_create(DEFAULT_BASE_STATE_ID);
+        let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
         let wheel = reg
             .with_property(
                 reg.default_state("create:windmill_bearing").unwrap(),

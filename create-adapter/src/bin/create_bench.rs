@@ -7,13 +7,13 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use create_adapter::blockstates::{CreateBlockRegistry, DEFAULT_BASE_STATE_ID};
+use create_adapter::blockstates::{core_create_registry, DEFAULT_BASE_STATE_ID};
 use create_adapter::data_loader::{parse_create_recipe_json, ItemFluidIdTable};
 use create_adapter::factory::{CreateFactory, DimBlockPos};
 use mod_offload::recipe_processor::{Resource, ResourceKind, Stack};
 
 fn main() {
-    let reg = CreateBlockRegistry::core_create(DEFAULT_BASE_STATE_ID);
+    let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
     let wheel_x = reg
         .with_property(
             reg.default_state("create:water_wheel").unwrap(),
