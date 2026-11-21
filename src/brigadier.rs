@@ -5158,3 +5158,259 @@ fn collect_paths<S>(
         collect_paths(&child, result, &mut next);
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Live front-end: parse-and-validate a command line against the caller's op level
+// ---------------------------------------------------------------------------------------
+
+/// How a [`BrigadierTree::parse_command_for_level`] call failed.
+///
+/// `UnknownRoot` and `InvalidBranch` wrap the `CommandSyntaxException` the walk produced;
+/// `PermissionDenied` is raised before the walk starts, when the root literal's required
+/// level exceeds the caller's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrigadierErrorKind {
+    /// The first word is not a registered root literal (vanilla `dispatcherUnknownCommand`).
+    UnknownRoot,
+    /// The root matched but a later literal or argument did not (vanilla
+    /// `dispatcherUnknownArgument`, or the argument node's own parse error).
+    InvalidBranch,
+    /// The root literal's required permission level exceeds the caller's. Raised before the
+    /// tree walk so a denied command cannot be probed for syntax.
+    PermissionDenied,
+}
+
+/// A live parse failure: the vanilla `CommandSyntaxException` (input + cursor, so `context()`
+/// renders the `...<input><--[HERE]` window the client displays) plus the failure
+/// classification and the root literal the line tried to run.
+#[derive(Clone, Debug)]
+pub struct BrigadierSyntaxError {
+    kind: BrigadierErrorKind,
+    exception: CommandSyntaxException,
+    root_literal: String,
+    required_level: Option<u8>,
+}
+
+impl BrigadierSyntaxError {
+    /// Which stage rejected the line.
+    pub fn kind(&self) -> BrigadierErrorKind {
+        self.kind
+    }
+
+    /// The wrapped `CommandSyntaxException`.
+    pub fn exception(&self) -> &CommandSyntaxException {
+        &self.exception
+    }
+
+    /// `getMessage`: the message plus ` at position N: <context>` when the cursor is known.
+    pub fn full_message(&self) -> String {
+        self.exception.full_message()
+    }
+
+    /// `getRawMessage`.
+    pub fn raw_message(&self) -> &str {
+        self.exception.raw_message()
+    }
+
+    /// `getContext`: the `<--[HERE]` window, or `None` without input/position.
+    pub fn context(&self) -> Option<String> {
+        self.exception.context()
+    }
+
+    /// The root literal (first word) the line tried to run; `""` for an empty line.
+    pub fn root_literal(&self) -> &str {
+        &self.root_literal
+    }
+
+    /// The op level the root literal required — `Some` for `PermissionDenied` only.
+    pub fn required_level(&self) -> Option<u8> {
+        self.required_level
+    }
+
+    /// The input the exception was created against (no leading `/`).
+    pub fn input(&self) -> Option<&str> {
+        self.exception.input()
+    }
+
+    /// `getCursor`; `-1` when the exception carries no position.
+    pub fn cursor(&self) -> i32 {
+        self.exception.cursor()
+    }
+}
+
+impl fmt::Display for BrigadierSyntaxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.exception.fmt(f)
+    }
+}
+
+impl std::error::Error for BrigadierSyntaxError {}
+
+/// A line [`BrigadierTree::parse_command_for_level`] accepted: the resolved root literal plus
+/// the built `CommandContext` (node path, argument values, the executable at the tail).
+pub struct ParsedBrigadierCommand<S> {
+    input: String,
+    root_literal: String,
+    context: CommandContext<S>,
+}
+
+impl<S> fmt::Debug for ParsedBrigadierCommand<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParsedBrigadierCommand")
+            .field("input", &self.input)
+            .field("root_literal", &self.root_literal)
+            .field("path", &self.path())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> ParsedBrigadierCommand<S> {
+    /// The line as parsed — without a leading `/`.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    /// The root literal the line resolved to. Alias names report themselves (`tp` stays `tp`;
+    /// the tree does not canonicalize them, matching vanilla).
+    pub fn root_literal(&self) -> &str {
+        &self.root_literal
+    }
+
+    /// The built context: `nodes()`, `arguments()` and `command()` all read from it.
+    pub fn context(&self) -> &CommandContext<S> {
+        &self.context
+    }
+
+    /// The names of every node the walk consumed, root literal first.
+    pub fn path(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut current = &self.context;
+        loop {
+            names.extend(
+                current
+                    .nodes()
+                    .iter()
+                    .map(|node| node.node().name().to_owned()),
+            );
+            match current.child() {
+                Some(child) => current = child,
+                None => return names,
+            }
+        }
+    }
+
+    /// `getArgument(name, Class)` against the executable tail context.
+    pub fn argument<T: 'static>(&self, name: &str) -> Result<&T, ArgumentError> {
+        self.context.last_child().argument(name)
+    }
+}
+
+/// The live command front-end: one `CommandDispatcher` plus a `root literal -> required op
+/// level` lookup. `parse_command_for_level` is what `Commands.performCommand` does ahead of
+/// dispatch — the `hasPermission` gate on the root runs first, then the registered literal
+/// and argument nodes walk the line and produce the vanilla `<--[HERE]` syntax context.
+pub struct BrigadierTree<S> {
+    dispatcher: CommandDispatcher<S>,
+    required_level: Arc<dyn Fn(&str) -> u8 + Send + Sync>,
+}
+
+impl<S: Clone> BrigadierTree<S> {
+    /// `dispatcher` is the registered tree to walk; `required_level` maps a root literal to
+    /// the op level vanilla's `requires(...)`/`hasPermission` gate demands for it.
+    pub fn new(
+        dispatcher: CommandDispatcher<S>,
+        required_level: impl Fn(&str) -> u8 + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            dispatcher,
+            required_level: Arc::new(required_level),
+        }
+    }
+
+    /// The registered tree this front-end walks.
+    pub fn dispatcher(&self) -> &CommandDispatcher<S> {
+        &self.dispatcher
+    }
+
+    /// The op level `literal` requires under this tree's lookup.
+    pub fn required_level(&self, literal: &str) -> u8 {
+        (self.required_level)(literal)
+    }
+
+    /// Parse `line` (with or without the leading `/`) for a source at `op_level`.
+    ///
+    /// The root literal's required level is checked before the walk; a caller below it gets a
+    /// `PermissionDenied` error whose exception reads `Unknown command` — the shape a literal
+    /// the source cannot see takes in vanilla. A caller at or above it walks the tree; the
+    /// error selection mirrors `CommandDispatcher.execute`: a lone recorded node exception
+    /// wins, then the context range splits `Unknown command` from `Incorrect argument for
+    /// command`, and a line whose tail node carries no command is not executable.
+    pub fn parse_command_for_level(
+        &self,
+        line: &str,
+        op_level: u8,
+    ) -> Result<ParsedBrigadierCommand<S>, BrigadierSyntaxError>
+    where
+        S: Default,
+    {
+        let input = line.strip_prefix('/').unwrap_or(line).trim_start();
+        let root_literal = input.split_whitespace().next().unwrap_or("").to_owned();
+        let required = (self.required_level)(&root_literal);
+        let syntax_error = |kind: BrigadierErrorKind, exception: CommandSyntaxException| {
+            BrigadierSyntaxError {
+                kind,
+                exception,
+                root_literal: root_literal.clone(),
+                required_level: None,
+            }
+        };
+        if op_level < required {
+            let mut error = syntax_error(
+                BrigadierErrorKind::PermissionDenied,
+                BUILT_IN_EXCEPTIONS
+                    .dispatcher_unknown_command()
+                    .create_with_context(&StringReader::new(input)),
+            );
+            error.required_level = Some(required);
+            return Err(error);
+        }
+        let results = self.dispatcher.parse(input, S::default());
+        if results.reader().can_read() {
+            let (kind, exception) = if results.exceptions().len() == 1 {
+                (
+                    BrigadierErrorKind::InvalidBranch,
+                    results.exceptions()[0].1.clone(),
+                )
+            } else if results.context().range().is_empty() {
+                (
+                    BrigadierErrorKind::UnknownRoot,
+                    BUILT_IN_EXCEPTIONS
+                        .dispatcher_unknown_command()
+                        .create_with_context(results.reader()),
+                )
+            } else {
+                (
+                    BrigadierErrorKind::InvalidBranch,
+                    BUILT_IN_EXCEPTIONS
+                        .dispatcher_unknown_argument()
+                        .create_with_context(results.reader()),
+                )
+            };
+            return Err(syntax_error(kind, exception));
+        }
+        let context = results.context().build(input);
+        if ContextChain::try_flatten(&context).is_none() {
+            return Err(syntax_error(
+                BrigadierErrorKind::InvalidBranch,
+                BUILT_IN_EXCEPTIONS
+                    .dispatcher_unknown_command()
+                    .create_with_context(results.reader()),
+            ));
+        }
+        Ok(ParsedBrigadierCommand {
+            input: input.to_owned(),
+            root_literal,
+            context,
+        })
+    }
+}

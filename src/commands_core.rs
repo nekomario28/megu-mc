@@ -4451,6 +4451,24 @@ fn command_dispatcher_at_level(
     completions: Option<&CommandCompletions>,
 ) -> brigadier::CommandDispatcher<()> {
     let dispatcher = native_command_dispatcher(level, completions);
+    // Issue #125 — literals registered through `register_mod_command` advertise at their
+    // `required_op_level` and above, with a greedy `arguments` tail so any mod syntax
+    // parses. A level-0 tree gains nothing unless a mod explicitly registers for it.
+    for (name, required) in mod_command_literals() {
+        if required <= level {
+            dispatcher
+                .register(
+                    PlayCommandBuilder::literal(name)
+                        .executes(|_| Ok(0))
+                        .then(completion_argument(
+                            "arguments",
+                            brigadier::StringArgumentType::greedy_string(),
+                            None,
+                        )),
+                )
+                .expect("registered mod command literal");
+        }
+    }
     #[cfg(feature = "neoforge-events")]
     if let Some(runtime) = java_compat::NEOFORGE.get() {
         for name in &runtime.commands {
@@ -4465,6 +4483,204 @@ fn command_dispatcher_at_level(
 fn exclude_native_neoforge_literals(literals: &mut Vec<String>) {
     let dispatcher = native_command_dispatcher(4, None);
     literals.retain(|name| dispatcher.root().child(name).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #125 — custom (NeoForge / mod) command registration and live dispatch
+// ---------------------------------------------------------------------------
+
+/// What a registered mod handler sees when its literal runs: the parsed line plus the
+/// executor's identity and position — the same context `CmdCtx` hands the vanilla
+/// handlers.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct ModCommandCall {
+    /// The root literal as invoked.
+    pub(crate) literal: String,
+    /// The whole line, without the leading `/`.
+    pub(crate) input: String,
+    /// Everything after the literal, leading whitespace stripped.
+    pub(crate) arguments: String,
+    /// The names of every Brigadier node the walk consumed, root literal first.
+    pub(crate) parsed_nodes: Vec<String>,
+    /// The executor's name: the player name, or `"Server"` for console/RCON/function
+    /// frames.
+    pub(crate) executor_name: String,
+    /// The executor's permission level (4 for the console, the ops.json level otherwise).
+    pub(crate) op_level: u8,
+    /// The position `~`/`^` coordinates resolve against.
+    pub(crate) position: (f64, f64, f64),
+}
+
+/// What a mod handler returns: the exact reply string shown to the source and the
+/// command's exit code — the value `mod_command_last_result` reports after the run.
+#[allow(dead_code)]
+pub(crate) struct ModCommandOutcome {
+    pub(crate) message: String,
+    pub(crate) result: i32,
+}
+
+type ModCommandHandler =
+    Arc<dyn Fn(&ModCommandCall) -> Result<ModCommandOutcome, String> + Send + Sync>;
+
+/// The live execution table half of `register_mod_command`: literal -> required op level
+/// and handler. The Brigadier-tree half lives in `command_dispatcher_at_level`, which reads
+/// the same registry so advertisement and execution never disagree.
+#[derive(Default)]
+struct CustomModCommandRegistry {
+    handlers: HashMap<String, (u8, ModCommandHandler)>,
+}
+
+fn mod_command_registry() -> &'static Mutex<CustomModCommandRegistry> {
+    static REGISTRY: OnceLock<Mutex<CustomModCommandRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(CustomModCommandRegistry::default()))
+}
+
+/// `true` when `literal` can serve as a Brigadier literal name: the characters vanilla's
+/// unquoted-string rule accepts, plus `:` for the `modid:name` form mods register.
+fn valid_mod_command_literal(literal: &str) -> bool {
+    !literal.is_empty()
+        && literal
+            .chars()
+            .all(|c| brigadier::StringReader::is_allowed_in_unquoted_string(c) || c == ':')
+}
+
+/// Issue #125 — register `literal` in BOTH the advertised Brigadier tree (it appears in
+/// `command_tree_at_level` at `required_op_level` and up) and the live execution table
+/// `run_command_ctx` consults after `parse_command_for_level` accepts the line.
+#[allow(dead_code)]
+pub(crate) fn register_mod_command(
+    literal: &str,
+    required_op_level: u8,
+    handler: ModCommandHandler,
+) -> Result<(), String> {
+    if !valid_mod_command_literal(literal) {
+        return Err(format!("Invalid command literal '{literal}'"));
+    }
+    // A mod literal must not shadow a native command: the mod outcome wins the
+    // live dispatch, so a collision would silently replace the vanilla handler.
+    if native_command_dispatcher(4, None)
+        .root()
+        .child(literal)
+        .is_some()
+    {
+        return Err(format!("Command literal '{literal}' already exists"));
+    }
+    mod_command_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .handlers
+        .insert(literal.to_owned(), (required_op_level.min(4), handler));
+    Ok(())
+}
+
+/// Remove a previously registered literal; `true` when one existed.
+#[allow(dead_code)]
+pub(crate) fn unregister_mod_command(literal: &str) -> bool {
+    mod_command_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .handlers
+        .remove(literal)
+        .is_some()
+}
+
+/// The registered `required_op_level` for `literal`, or `None` for a vanilla/unknown name.
+fn mod_command_required_level(literal: &str) -> Option<u8> {
+    mod_command_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .handlers
+        .get(literal)
+        .map(|entry| entry.0)
+}
+
+/// The permission check for mod literals: a registered literal runs at its
+/// `required_op_level` and above. Unregistered names are not mod commands, so the vanilla
+/// `command_allowed_at_level` gate decides for them.
+fn mod_command_permitted(literal: &str, level: u8) -> bool {
+    mod_command_required_level(literal).is_some_and(|required| level >= required)
+}
+
+/// The literal -> required level table `command_dispatcher_at_level` merges into the tree.
+/// Sorted so the merge order — and the resulting node ordering — is deterministic.
+fn mod_command_literals() -> Vec<(String, u8)> {
+    let mut literals: Vec<(String, u8)> = mod_command_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .handlers
+        .iter()
+        .map(|(name, (required, _))| (name.clone(), *required))
+        .collect();
+    literals.sort();
+    literals
+}
+
+/// The live front-end: the level-4 superset dispatcher (every vanilla literal plus every
+/// registered mod literal) wrapped with the `root literal -> required op level` gate. Mod
+/// literals report their own level; everything else defers to the vanilla
+/// `required_permission_level` table.
+fn live_brigadier_tree() -> brigadier::BrigadierTree<()> {
+    brigadier::BrigadierTree::new(command_dispatcher_at_level(4, None), |literal| {
+        mod_command_required_level(literal)
+            .unwrap_or_else(|| required_permission_level(literal))
+    })
+}
+
+/// The exit code the most recent mod command returned — the result channel
+/// `/execute store result` observes through.
+static MOD_COMMAND_LAST_RESULT: AtomicI32 = AtomicI32::new(0);
+
+#[allow(dead_code)]
+fn mod_command_last_result() -> i32 {
+    MOD_COMMAND_LAST_RESULT.load(Ordering::Relaxed)
+}
+
+/// Issue #125 — dispatch a parsed line to the handler `register_mod_command` stored for its
+/// root literal. `None` means the literal is not a mod command and vanilla dispatch
+/// continues; the `required_op_level` re-check mirrors the parse-stage gate for callers that
+/// reach the table without it.
+fn run_custom_mod_command(
+    ctx: &CmdCtx,
+    parsed: &brigadier::ParsedBrigadierCommand<()>,
+    level: u8,
+) -> Option<ModCommandOutcome> {
+    let (required, handler) = mod_command_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .handlers
+        .get(parsed.root_literal())
+        .cloned()?;
+    if level < required {
+        MOD_COMMAND_LAST_RESULT.store(0, Ordering::Relaxed);
+        return Some(ModCommandOutcome {
+            message: "You do not have permission to run that command".into(),
+            result: 0,
+        });
+    }
+    let call = ModCommandCall {
+        literal: parsed.root_literal().to_owned(),
+        input: parsed.input().to_owned(),
+        arguments: parsed
+            .input()
+            .split_once(char::is_whitespace)
+            .map(|(_, tail)| tail.trim_start().to_owned())
+            .unwrap_or_default(),
+        parsed_nodes: parsed.path(),
+        executor_name: ctx
+            .me
+            .as_ref()
+            .map(|client| client.name.clone())
+            .unwrap_or_else(|| "Server".to_owned()),
+        op_level: level,
+        position: (ctx.x, ctx.y, ctx.z),
+    };
+    let outcome = match handler(&call) {
+        Ok(outcome) => outcome,
+        Err(message) => ModCommandOutcome { message, result: 0 },
+    };
+    MOD_COMMAND_LAST_RESULT.store(outcome.result, Ordering::Relaxed);
+    Some(outcome)
 }
 
 fn native_command_dispatcher(
@@ -6174,7 +6390,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     // players at their ops.json level. `command_allowed_for_player` keeps the
     // argument-aware level-0 exceptions (e.g. `/time query`) on top.
     let level = me.map_or(4, |player| player_permission_level(&player.name));
-    if !command_allowed_at_level(cmd, level) && !command_allowed_for_player(cmd, &args) {
+    if !command_allowed_at_level(cmd, level)
+        && !command_allowed_for_player(cmd, &args)
+        && !mod_command_permitted(cmd, level)
+    {
         let reply = "You do not have permission to run that command";
         if let Some(client) = s {
             let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat(reply));
@@ -6202,7 +6421,31 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         }
         return reply;
     }
-    let reply = match cmd {
+    // Lane W-BRIG: live parse-and-validate through the registered Brigadier tree —
+    // the same tree the client tab-completes against — using the caller's op level.
+    // A parse failure still falls through to the handwritten dispatcher, which stays
+    // authoritative for the argument grammar the advertised tree only approximates (and
+    // for the console-only `status` literal). A genuinely unknown root additionally shows
+    // the connected player the vanilla `<--[HERE]` context.
+    let parsed_brigadier = live_brigadier_tree().parse_command_for_level(input, level);
+    if let Err(error) = &parsed_brigadier {
+        if error.kind() == brigadier::BrigadierErrorKind::UnknownRoot {
+            if let (Some(client), Some(context)) = (*s, error.context()) {
+                let _ = send_packet(
+                    &mut client.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                    0x6c,
+                    system_chat(&context),
+                );
+            }
+        }
+    }
+    let mod_outcome = parsed_brigadier
+        .as_ref()
+        .ok()
+        .and_then(|parsed| run_custom_mod_command(ctx, parsed, level));
+    let reply = match mod_outcome {
+        Some(outcome) => outcome.message,
+        None => match cmd {
         "execute" => run_execute(ctx, &args, s),
         "time" => {
             if args.first() == Some(&"add") {
@@ -7166,6 +7409,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "seed" => WORLD_SEED.load(Ordering::Relaxed).to_string(),
         "" => "".into(),
         _ => format!("Unknown command: {}", cmd),
+        }
     };
     if !reply.is_empty() {
         if let Some(client) = s {
@@ -8023,5 +8267,350 @@ mod p5f_parity_tests {
         p5f_run(&ctx, "/forceload remove all");
         scoreboard().lock().unwrap_or_else(|e| e.into_inner()).remove_objective("p5f");
         *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = previous;
+    }
+}
+
+#[cfg(test)]
+mod w_brig_tests {
+    // Lane W-BRIG — live command parsing/validation through `src/brigadier.rs`
+    // (`BrigadierTree::parse_command_for_level`) plus issue #125: custom
+    // NeoForge/mod commands bridging the advertised tree and live dispatch.
+    use super::*;
+    use std::net::TcpStream;
+
+    fn w_brig_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    fn w_brig_run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    fn w_brig_player(eid: i32, name: &str, level: u8) -> (Arc<Client>, TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.eid = eid;
+        client.name = name.into();
+        if level > 0 {
+            ops_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set(name, level, false);
+        }
+        (Arc::new(client), receiver)
+    }
+
+    fn w_brig_drop_player(name: &str) {
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .retain(|e| e.name != name);
+    }
+
+    #[test]
+    fn w_brig_parse_accepts_vanilla_commands_and_resolves_aliases() {
+        let tree = live_brigadier_tree();
+
+        let parsed = tree
+            .parse_command_for_level("/time set 1000", 4)
+            .expect("/time set 1000 parses for the console");
+        assert_eq!(parsed.root_literal(), "time");
+        assert_eq!(parsed.input(), "time set 1000");
+        assert_eq!(parsed.path(), ["time", "set", "ticks"]);
+        assert_eq!(
+            *parsed.argument::<i64>("ticks").expect("ticks arg"),
+            1000
+        );
+
+        // The `/` prefix is optional input sugar; the parse is identical.
+        let bare = tree
+            .parse_command_for_level("time set 1000", 4)
+            .expect("bare input parses the same");
+        assert_eq!(bare.root_literal(), "time");
+
+        // Alias literals resolve to themselves — the tree does not canonicalize.
+        for alias in ["tp", "teleport", "xp", "experience"] {
+            let parsed = tree
+                .parse_command_for_level(&format!("/{alias} @a 1 2 3"), 4)
+                .unwrap_or_else(|error| panic!("/{alias}: {error}"));
+            assert_eq!(parsed.root_literal(), alias);
+        }
+        for alias in ["tell", "w", "msg"] {
+            let parsed = tree
+                .parse_command_for_level(&format!("/{alias} Steve hi"), 4)
+                .unwrap_or_else(|error| panic!("/{alias}: {error}"));
+            assert_eq!(parsed.root_literal(), alias);
+        }
+
+        for valid in ["/help", "/list", "/seed", "/gamemode creative", "/weather clear"] {
+            tree.parse_command_for_level(valid, 4)
+                .unwrap_or_else(|error| panic!("{valid}: {error}"));
+        }
+    }
+
+    #[test]
+    fn w_brig_parse_denies_above_level_and_reports_here_context() {
+        let tree = live_brigadier_tree();
+
+        // `required_permission_level` gates the root BEFORE the tree walk.
+        let denied = tree
+            .parse_command_for_level("/time set 1000", 0)
+            .expect_err("level 0 must not reach the level-2 literal");
+        assert_eq!(denied.kind(), brigadier::BrigadierErrorKind::PermissionDenied);
+        assert_eq!(denied.required_level(), Some(2));
+        assert_eq!(denied.root_literal(), "time");
+        assert_eq!(denied.raw_message(), "Unknown command");
+
+        // Unknown root: vanilla dispatcherUnknownCommand at cursor 0.
+        let unknown = tree
+            .parse_command_for_level("/w_brig_nosuchcmd", 4)
+            .expect_err("unknown root fails");
+        assert_eq!(unknown.kind(), brigadier::BrigadierErrorKind::UnknownRoot);
+        assert_eq!(
+            unknown.exception().kind(),
+            brigadier::CommandExceptionType::DispatcherUnknownCommand
+        );
+        assert_eq!(unknown.context().as_deref(), Some("<--[HERE]"));
+
+        // Invalid literal branch: the input tail fails at the cursor with the
+        // vanilla `<--[HERE]` window (the marker sits where the walk stopped,
+        // so the unparseable tail itself is not part of the window).
+        let branch = tree
+            .parse_command_for_level("/time frobnicate", 4)
+            .expect_err("bad literal branch fails");
+        assert_eq!(branch.kind(), brigadier::BrigadierErrorKind::InvalidBranch);
+        assert_eq!(branch.context().as_deref(), Some("time <--[HERE]"));
+
+        // The 10-character context window truncates with `...` like vanilla.
+        let long = tree
+            .parse_command_for_level("/defaultgamemode bogus", 4)
+            .expect_err("bad gamemode branch fails");
+        assert_eq!(long.kind(), brigadier::BrigadierErrorKind::InvalidBranch);
+        assert_eq!(
+            long.context().as_deref(),
+            Some("...tgamemode <--[HERE]")
+        );
+    }
+
+    #[test]
+    fn w_brig_run_command_executes_through_brigadier_parse() {
+        let _world = world_guard();
+        let console = w_brig_ctx(None);
+
+        // A live run goes through the same tree the client is sent: `/time set`
+        // parses in the tree and dispatches to the live handler.
+        let previous_time = WORLD_TIME.load(Ordering::Relaxed);
+        assert_eq!(w_brig_run(&console, "/time set 42"), "Set time to 42");
+        assert!(w_brig_run(&console, "/time query daytime").starts_with("The time is "));
+        assert!(w_brig_run(&console, "/seed").parse::<u64>().is_ok());
+        WORLD_TIME.store(previous_time, Ordering::Relaxed);
+
+        // A genuinely unknown root keeps the legacy reply while the parse
+        // reports the vanilla unknown-command shape.
+        assert_eq!(
+            w_brig_run(&console, "/w_brig_definitely_not_a_command"),
+            "Unknown command: w_brig_definitely_not_a_command"
+        );
+
+        // A level-0 player is denied a level-2 command at the permission gate.
+        let (player, _hold) = w_brig_player(8851, "w_brig_plain", 0);
+        let pctx = w_brig_ctx(Some(player));
+        assert!(w_brig_run(&pctx, "/time set 42").contains("permission"));
+        w_brig_drop_player("w_brig_plain");
+    }
+
+    #[test]
+    fn w_brig_mod_command_registers_in_tree_and_executes_live() {
+        let _world = world_guard();
+        let console = w_brig_ctx(None);
+        let calls: Arc<Mutex<Vec<ModCommandCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        register_mod_command(
+            "wbrigmymod",
+            2,
+            Arc::new(move |call| {
+                seen.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(call.clone());
+                Ok(ModCommandOutcome {
+                    message: format!("mymod says: {}", call.arguments),
+                    result: 7,
+                })
+            }),
+        )
+        .expect("register wbrigmymod");
+
+        // The literal advertises in the level-2+ trees but not the level-0 one.
+        assert!(command_tree_at_level(0).child("wbrigmymod").is_none());
+        for level in [2u8, 3, 4] {
+            assert!(
+                command_tree_at_level(level).child("wbrigmymod").is_some(),
+                "level {level} tree exposes wbrigmymod"
+            );
+        }
+
+        // The parse stage enforces the registered level before dispatch.
+        assert_eq!(
+            live_brigadier_tree()
+                .parse_command_for_level("/wbrigmymod", 0)
+                .expect_err("level 0 denied")
+                .kind(),
+            brigadier::BrigadierErrorKind::PermissionDenied
+        );
+        live_brigadier_tree()
+            .parse_command_for_level("/wbrigmymod alpha beta", 2)
+            .expect("level 2 parses");
+
+        // A level-0 player never reaches the handler.
+        let (plain, _h1) = w_brig_player(8852, "w_brig_mod_plain", 0);
+        let pctx = w_brig_ctx(Some(plain));
+        assert!(w_brig_run(&pctx, "/wbrigmymod").contains("permission"));
+        assert!(calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+        // The console executes the handler through the Brigadier front-end and
+        // gets the exact reply string plus the recorded exit code.
+        assert_eq!(w_brig_run(&console, "/wbrigmymod alpha beta"), "mymod says: alpha beta");
+        assert_eq!(mod_command_last_result(), 7);
+        {
+            let calls = calls.lock().unwrap_or_else(|e| e.into_inner());
+            let call = calls.last().expect("handler ran");
+            assert_eq!(call.literal, "wbrigmymod");
+            assert_eq!(call.input, "wbrigmymod alpha beta");
+            assert_eq!(call.arguments, "alpha beta");
+            assert_eq!(call.executor_name, "Server");
+            assert_eq!(call.op_level, 4);
+            assert_eq!(call.parsed_nodes, ["wbrigmymod", "arguments"]);
+        }
+
+        // The argument tail is optional: the bare literal is executable too.
+        assert_eq!(w_brig_run(&console, "/wbrigmymod"), "mymod says: ");
+
+        assert!(unregister_mod_command("wbrigmymod"));
+        assert!(command_tree_at_level(4).child("wbrigmymod").is_none());
+        w_brig_drop_player("w_brig_mod_plain");
+    }
+
+    #[test]
+    fn w_brig_mod_command_level0_registration_reaches_players() {
+        let _world = world_guard();
+        register_mod_command(
+            "wbrigfree",
+            0,
+            Arc::new(|_| {
+                Ok(ModCommandOutcome {
+                    message: "free for all".into(),
+                    result: 1,
+                })
+            }),
+        )
+        .expect("register wbrigfree");
+
+        // Required level 0 advertises in the default tree — an explicit
+        // registration is the only thing that touches it.
+        assert!(command_tree_at_level(0).child("wbrigfree").is_some());
+
+        let (player, _hold) = w_brig_player(8853, "w_brig_free_player", 0);
+        let pctx = w_brig_ctx(Some(player));
+        assert_eq!(w_brig_run(&pctx, "/wbrigfree"), "free for all");
+        assert_eq!(mod_command_last_result(), 1);
+
+        assert!(unregister_mod_command("wbrigfree"));
+        assert!(command_tree_at_level(0).child("wbrigfree").is_none());
+        w_brig_drop_player("w_brig_free_player");
+    }
+
+    #[test]
+    fn w_brig_mod_command_feeds_execute_store_result() {
+        let _world = world_guard();
+        let console = w_brig_ctx(None);
+        register_mod_command(
+            "wbrigstore",
+            2,
+            Arc::new(|_call| {
+                Ok(ModCommandOutcome {
+                    message: "mod ok".into(),
+                    result: 7,
+                })
+            }),
+        )
+        .expect("register wbrigstore");
+
+        assert_eq!(
+            w_brig_run(&console, "/scoreboard objectives add wbrigo dummy"),
+            "Added objective wbrigo"
+        );
+        // The handler's reply routes through the standard result mapping, so a
+        // successful run stores a nonzero result and a failing run stores 0.
+        assert_eq!(
+            w_brig_run(&console, "/execute store result score holder wbrigo run wbrigstore"),
+            "Stored 1 in wbrigo for holder"
+        );
+        assert_eq!(
+            scoreboard()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("holder", "wbrigo"),
+            Some(1)
+        );
+        // The handler's exact exit code is reported on the bridge channel.
+        assert_eq!(mod_command_last_result(), 7);
+
+        scoreboard()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_objective("wbrigo");
+        assert!(unregister_mod_command("wbrigstore"));
+    }
+
+    #[test]
+    fn w_brig_mod_command_handler_failure_reports_zero_result() {
+        let _world = world_guard();
+        let console = w_brig_ctx(None);
+        register_mod_command(
+            "wbrigfail",
+            2,
+            Arc::new(|_| Err("mymod exploded".into())),
+        )
+        .expect("register wbrigfail");
+
+        assert_eq!(w_brig_run(&console, "/wbrigfail"), "mymod exploded");
+        assert_eq!(mod_command_last_result(), 0);
+
+        assert!(unregister_mod_command("wbrigfail"));
+    }
+
+    #[test]
+    fn w_brig_mod_command_rejects_invalid_literals() {
+        assert!(register_mod_command("", 2, Arc::new(|_| unreachable!())).is_err());
+        assert!(register_mod_command("bad literal", 2, Arc::new(|_| unreachable!())).is_err());
+        assert!(register_mod_command("bad{brace}", 2, Arc::new(|_| unreachable!())).is_err());
+        // `modid:name` is the namespaced form mods actually register.
+        assert!(register_mod_command("wbrig:namespaced", 4, Arc::new(|_| {
+            Ok(ModCommandOutcome { message: "ns ok".into(), result: 1 })
+        }))
+        .is_ok());
+        let console = w_brig_ctx(None);
+        assert_eq!(w_brig_run(&console, "/wbrig:namespaced"), "ns ok");
+        assert!(unregister_mod_command("wbrig:namespaced"));
+    }
+
+    #[test]
+    fn w_brig_level0_tree_untouched_by_unregistered_mods() {
+        // The default tree gains nothing from the bridge itself: only an
+        // explicit `register_mod_command` adds literals.
+        assert!(command_tree_at_level(0).child("wbrigabsent").is_none());
+        assert!(command_tree_at_level(4).child("wbrigabsent").is_none());
+        assert_eq!(
+            live_brigadier_tree()
+                .parse_command_for_level("/wbrigabsent", 4)
+                .expect_err("unregistered literal is unknown")
+                .kind(),
+            brigadier::BrigadierErrorKind::UnknownRoot
+        );
     }
 }
