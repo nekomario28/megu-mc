@@ -810,4 +810,18 @@ fn deeply_nested_toml_arrays_and_tables_fail_closed_without_stack_overflow() {
         scan_mod_jar(&table_jar),
         Err(JarScanError::Toml(_))
     ));
+
+    let deep_dotted_key = format!("{}a = 1\n", "a.".repeat(5_000));
+    let dotted_jar = jar(&[("META-INF/neoforge.mods.toml", deep_dotted_key.as_bytes())]);
+    assert!(matches!(
+        scan_mod_jar(&dotted_jar),
+        Err(JarScanError::Toml(_))
+    ));
+
+    let deep_header = format!("[{}a]\nk = 1\n", "a.".repeat(5_000));
+    let header_jar = jar(&[("META-INF/neoforge.mods.toml", deep_header.as_bytes())]);
+    assert!(matches!(
+        scan_mod_jar(&header_jar),
+        Err(JarScanError::Toml(_))
+    ));
 }

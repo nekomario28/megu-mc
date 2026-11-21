@@ -1378,6 +1378,11 @@ impl<'a> TomlParser<'a> {
         loop {
             self.skip_inline_ws();
             if self.peek() == Some(b'.') {
+                if parts.len() >= MAX_TOML_NESTING_DEPTH {
+                    return Err(self.err(format!(
+                        "TOML dotted key exceeds maximum depth {MAX_TOML_NESTING_DEPTH}"
+                    )));
+                }
                 self.pos += 1;
                 parts.push(self.parse_keypart()?);
             } else {
