@@ -2181,8 +2181,367 @@ fn return_command(ctx: &CmdCtx, args: &[&str], s: &mut Option<&Client>) -> Strin
     }
 }
 
+// ---------------------------------------------------------------------------
+// /ride (vanilla RideCommand, level 2): `ride <target> mount <vehicle>` and
+// `ride <target> dismount`. Reuses the live MountRegistry + 0x5f SetPassengers
+// broadcast that right-click mounting uses; unlike `try_mount_vehicle` it also
+// mounts non-vehicle entities — riders/vehicles without a natural kind get the
+// one-seat Horse bound, and self/cycle rejection comes from the registry.
+// ---------------------------------------------------------------------------
+
+fn ride_select(source: &ExecuteSource, sel: &str) -> Result<ExecuteEntity, String> {
+    match source.select(sel) {
+        Ok(v) if v.len() == 1 => Ok(v.into_iter().next().expect("len checked")),
+        Ok(v) if v.is_empty() => Err("No entity was found".into()),
+        Ok(_) => Err("Only one entity is allowed".into()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `entity_types` with a natural vehicle kind use their seat table; every
+/// other vehicle (including players) rides one deep, matching Horse's bound.
+fn ride_vehicle_kind(entity: &ExecuteEntity) -> (VehicleKind, [f64; 3]) {
+    let pos = entity.location().0;
+    let kind = match entity {
+        ExecuteEntity::Mob(mob) => vehicle_kind_of(mob.etype),
+        ExecuteEntity::Other { kind, .. } => {
+            entity_spec_by_name(kind.strip_prefix("minecraft:").unwrap_or(kind))
+                .and_then(|spec| vehicle_kind_of(spec.id))
+        }
+        ExecuteEntity::Player(_) => None,
+    }
+    .unwrap_or(VehicleKind::Horse);
+    (kind, pos)
+}
+
+fn ride_mount(target: &ExecuteEntity, vehicle: &ExecuteEntity) -> String {
+    let (t, v) = (target.id(), vehicle.id());
+    let (kind, vpos) = ride_vehicle_kind(vehicle);
+    let seat = {
+        let mut live = mounts().lock().unwrap();
+        live.registry.register_vehicle(v, kind, vpos);
+        live.registry.register_rider(t, target.location().0);
+        match live.registry.mount(v, t) {
+            Ok(()) => live.registry.passengers_of(v).len() - 1,
+            Err(MountError::SelfMount) => return "Entity cannot ride itself".into(),
+            Err(MountError::Cycle) => {
+                return "Can't ride an entity that is already riding this entity, this would create a circular rider list".into()
+            }
+            Err(MountError::Full) => return "Vehicle has no free seat".into(),
+            Err(MountError::UnknownVehicle) => return "Unknown vehicle".into(),
+        }
+    };
+    // `Entity.positionRider`: snap the passenger to its attachment offset and
+    // credit the carry so anti-cheat does not flag the seat move.
+    let off = kind.seat_offset(seat);
+    match target {
+        ExecuteEntity::Player(player) => {
+            let mut p = player.pos.lock().unwrap();
+            *p = (
+                vpos[0] + off[0],
+                vpos[1] + off[1],
+                vpos[2] + off[2],
+                p.3,
+                p.4,
+                p.5,
+            );
+            ac_note_carried_motion(player.eid, off);
+        }
+        ExecuteEntity::Mob(mob) => {
+            let mut p = mob.pos.lock().unwrap();
+            *p = (
+                vpos[0] + off[0],
+                vpos[1] + off[1],
+                vpos[2] + off[2],
+                p.3,
+                p.4,
+            );
+        }
+        ExecuteEntity::Other { .. } => {}
+    }
+    let packet = mounts().lock().unwrap().registry.encode_set_passengers(v);
+    broadcast_seen(v, |_c| (0x5f, packet.clone()));
+    format!("Now riding {}", vehicle.kind())
+}
+
+fn ride_dismount(target: &ExecuteEntity) -> String {
+    let Some(vehicle) = vehicle_of(target.id()) else {
+        return "Not riding anything".into();
+    };
+    if let ExecuteEntity::Player(player) = target {
+        // The C2S-dismount path already re-seats + broadcasts to trackers.
+        player_dismount(player, true);
+        return "No longer riding".into();
+    }
+    let Some(at) = mounts().lock().unwrap().registry.dismount(target.id()) else {
+        return "Not riding anything".into();
+    };
+    if let ExecuteEntity::Mob(mob) = target {
+        let mut p = mob.pos.lock().unwrap();
+        *p = (at[0], at[1], at[2], p.3, p.4);
+    }
+    let packet = mounts()
+        .lock()
+        .unwrap()
+        .registry
+        .encode_set_passengers(vehicle);
+    broadcast_seen(vehicle, |_c| (0x5f, packet.clone()));
+    "No longer riding".into()
+}
+
+fn ride_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    const USAGE: &str = "usage: /ride <target> mount <vehicle> | /ride <target> dismount";
+    let source = ExecuteSource::new(ctx);
+    let Some(&sel) = args.first() else {
+        return USAGE.into();
+    };
+    let target = match ride_select(&source, sel) {
+        Ok(target) => target,
+        Err(e) => return e,
+    };
+    match &args[1..] {
+        ["mount", vehicle] => match ride_select(&source, vehicle) {
+            Ok(vehicle) => ride_mount(&target, &vehicle),
+            Err(e) => e,
+        },
+        ["dismount"] => ride_dismount(&target),
+        _ => USAGE.into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /spectate (vanilla SpectateCommand, level 2): spectator-only (gamemode 3),
+// `spectate <target>` sets the camera entity, bare `spectate` resets it to the
+// viewer. The client is moved with the protocol-767 set_camera packet —
+// 0x52, verified against `proto/src/data_v767.rs` — payload VarInt eid.
+// ---------------------------------------------------------------------------
+
+const SET_CAMERA_PACKET_767: i64 = 0x52;
+
+fn spectate_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    const USAGE: &str = "usage: /spectate [<target>] [<player>]";
+    let source = ExecuteSource::new(ctx);
+    let (target_sel, player_sel) = match args {
+        [] => (None, None),
+        [t] => (Some(*t), None),
+        [t, p] => (Some(*t), Some(*p)),
+        _ => return USAGE.into(),
+    };
+    let viewer = match player_sel {
+        Some(sel) => match source.select(sel) {
+            Ok(v) if v.len() == 1 => match &v[0] {
+                ExecuteEntity::Player(player) => player.clone(),
+                _ => return "Only players may be affected by this command".into(),
+            },
+            Ok(v) if v.is_empty() => return "No player was found".into(),
+            Ok(_) => return "Only one player is allowed".into(),
+            Err(e) => return e,
+        },
+        None => match &ctx.me {
+            Some(me) => me.clone(),
+            None => return "Only players may use this command".into(),
+        },
+    };
+    if !viewer.is_spectator() {
+        return "Only players in spectator mode can use this command".into();
+    }
+    let (camera, label) = match target_sel {
+        Some(sel) => match source.select(sel) {
+            Ok(v) if v.len() == 1 => (v[0].id(), v[0].kind().to_owned()),
+            Ok(v) if v.is_empty() => return "No entity was found".into(),
+            Ok(_) => return "Only one entity is allowed".into(),
+            Err(e) => return e,
+        },
+        None => (viewer.eid, String::new()),
+    };
+    spectator_cameras().lock().unwrap().insert(viewer.eid, camera);
+    let mut body = Vec::new();
+    write_varint(&mut body, i64::from(camera));
+    let _ = send_packet(
+        &mut viewer.sock.lock().unwrap(),
+        SET_CAMERA_PACKET_767,
+        body,
+    );
+    if target_sel.is_some() {
+        format!("Now spectating {label}")
+    } else {
+        "No longer spectating".into()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /fillbiome (vanilla FillBiomeCommand, level 2): quart-cell box, the live
+// commandModificationBlockLimit bound, and a `replace` predicate that accepts
+// a biome id or a `#biome` tag against the effective (override-aware) biome.
+// ---------------------------------------------------------------------------
+
+fn fillbiome_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    const USAGE: &str = "usage: /fillbiome <from> <to> <biome> [replace <filter>]";
+    let (from_t, to_t, biome, filter) = match args {
+        [a0, a1, a2, b0, b1, b2, bm] => ((*a0, *a1, *a2), (*b0, *b1, *b2), *bm, None),
+        [a0, a1, a2, b0, b1, b2, bm, "replace", f] => {
+            ((*a0, *a1, *a2), (*b0, *b1, *b2), *bm, Some(*f))
+        }
+        _ => return USAGE.into(),
+    };
+    let parse = |t: &(&str, &str, &str)| {
+        (
+            coord(t.0, ctx.x).floor() as i32,
+            coord(t.1, ctx.y).floor() as i32,
+            coord(t.2, ctx.z).floor() as i32,
+        )
+    };
+    let (from, to) = (parse(&from_t), parse(&to_t));
+    let dim = cmd_dim(ctx);
+    if let Err(e) =
+        check_modification_bounds(dim, from).and_then(|_| check_modification_bounds(dim, to))
+    {
+        return e;
+    }
+    let biome_id = p3b_ns(biome);
+    if !known_biome(&biome_id) {
+        return format!("Unknown biome '{biome}'");
+    }
+    if let Some(f) = filter {
+        match f.strip_prefix('#') {
+            Some(tag) if !biome_tag_known(&p3b_ns(tag)) => {
+                return format!("Unknown biome tag '{f}'");
+            }
+            None if !known_biome(&p3b_ns(f)) => {
+                return format!("Unknown biome filter '{f}'");
+            }
+            _ => {}
+        }
+    }
+    // Vanilla maps each block pos corner through CubePos.fromBlock (>>2); the
+    // two corners can span different quart cells, so normalize the quart box.
+    let q = |p: (i32, i32, i32)| (p.0 >> 2, p.1 >> 2, p.2 >> 2);
+    let (qa, qb) = (q(from), q(to));
+    let (x0, x1) = (qa.0.min(qb.0), qa.0.max(qb.0));
+    let (y0, y1) = (qa.1.min(qb.1), qa.1.max(qb.1));
+    let (z0, z1) = (qa.2.min(qb.2), qa.2.max(qb.2));
+    let volume = (x1 - x0 + 1) as i64 * (y1 - y0 + 1) as i64 * (z1 - z0 + 1) as i64;
+    let limit = GR_COMMAND_MODIFICATION_BLOCK_LIMIT
+        .load(Ordering::Relaxed)
+        .clamp(1, i32::MAX) as i64;
+    if volume > limit {
+        return format!("Too many blocks ({volume}, maximum {limit})");
+    }
+    let (qy0, qy1) = (
+        dim.min_y() >> 2,
+        (dim.min_y() + dim.height() - 1) >> 2,
+    );
+    let mut cells = Vec::new();
+    for qy in y0..=y1 {
+        if !(qy0..=qy1).contains(&qy) {
+            continue;
+        }
+        for qz in z0..=z1 {
+            for qx in x0..=x1 {
+                if let Some(f) = filter {
+                    if !fillbiome_filter_matches(f, dim, qx, qy, qz) {
+                        continue;
+                    }
+                }
+                cells.push((qx, qy, qz));
+            }
+        }
+    }
+    let changed = cells.len();
+    let mut overrides = biome_overrides().lock().unwrap();
+    let store = overrides.entry(dim).or_default();
+    for cell in cells {
+        store.insert(cell, biome_id.clone());
+    }
+    format!("Changed biome of {changed} cells to {biome_id}")
+}
+
+fn fillbiome_filter_matches(filter: &str, dim: DimId, qx: i32, qy: i32, qz: i32) -> bool {
+    let Some(current) = effective_biome_name(dim, qx, qy, qz) else {
+        return false;
+    };
+    match filter.strip_prefix('#') {
+        Some(tag) => {
+            let tag = p3b_ns(tag);
+            datapack_tag_contains("biome", &tag, &current)
+                || datapack_tag_contains("worldgen/biome", &tag, &current)
+        }
+        None => current == p3b_ns(filter),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /place (vanilla PlaceCommand, level 2): `place feature <id> [pos]` validates
+// the configured-feature id and records the accepted dispatch (no live `FC`
+// seam exists — see datapack.rs); `place template <id> [pos]` stamps the
+// structure's palette-0 blocks into the world.
+// ---------------------------------------------------------------------------
+
+fn place_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    const USAGE: &str = "usage: /place feature <id> [<pos>] | /place template <id> [<pos>]";
+    let Some((&kind, rest)) = args.split_first() else {
+        return USAGE.into();
+    };
+    let Some((&id, pos_args)) = rest.split_first() else {
+        return USAGE.into();
+    };
+    if !matches!(kind, "feature" | "template") {
+        return USAGE.into();
+    }
+    if !p3b_resource_name(id) {
+        return format!("Invalid id '{id}'");
+    }
+    let pos = match pos_args {
+        [] => (
+            ctx.x.floor() as i32,
+            ctx.y.floor() as i32,
+            ctx.z.floor() as i32,
+        ),
+        [x, y, z] => (
+            coord(x, ctx.x).floor() as i32,
+            coord(y, ctx.y).floor() as i32,
+            coord(z, ctx.z).floor() as i32,
+        ),
+        _ => return USAGE.into(),
+    };
+    let dim = cmd_dim(ctx);
+    if let Err(e) = check_modification_bounds(dim, pos) {
+        return e;
+    }
+    let id = p3b_ns(id);
+    match kind {
+        "feature" => {
+            let known = worldgen::Gen::dp_resource("worldgen/configured_feature", &id, "json")
+                .is_some()
+                || worldgen::Gen::dp_resource("worldgen/feature", &id, "json").is_some();
+            if !known {
+                return format!("No feature with the name '{id}' exists");
+            }
+            place_dispatches().lock().unwrap().push(PlaceDispatch {
+                dim,
+                pos,
+                id: id.clone(),
+                kind: PlaceKind::Feature,
+            });
+            format!("Placed feature '{id}' at [{}, {}, {}]", pos.0, pos.1, pos.2)
+        }
+        _ => match place_template_live(dim, pos, &id) {
+            Ok(placed) => {
+                place_dispatches().lock().unwrap().push(PlaceDispatch {
+                    dim,
+                    pos,
+                    id: id.clone(),
+                    kind: PlaceKind::Template,
+                });
+                format!("Placed template '{id}' ({placed} blocks)")
+            }
+            Err(e) => e,
+        },
+    }
+}
+
 /// The one entry point the command match in `commands_core.rs` calls for every
-/// P3-B command name. Kept narrow on purpose: a five-line drop-in arm.
+/// P3-B command name. Kept narrow on purpose: a drop-in arm per command.
 #[allow(dead_code)]
 fn exec_p3b_command(ctx: &CmdCtx, cmd: &str, args: &[&str], s: &mut Option<&Client>) -> String {
     match cmd {
@@ -2192,6 +2551,10 @@ fn exec_p3b_command(ctx: &CmdCtx, cmd: &str, args: &[&str], s: &mut Option<&Clie
         "locate" => locate_command(ctx, args),
         "random" => random_command(ctx, args),
         "return" => return_command(ctx, args, s),
+        "ride" => ride_command(ctx, args),
+        "spectate" => spectate_command(ctx, args),
+        "fillbiome" => fillbiome_command(ctx, args),
+        "place" => place_command(ctx, args),
         _ => format!("unknown P3-B command '{cmd}'"),
     }
 }
@@ -2544,5 +2907,368 @@ mod teams_and_commands_tests {
         assert!(parse_return_command(&["run"]).is_err());
         assert!(parse_return_command(&["abc"]).is_err());
         assert!(parse_return_command(&["1", "2"]).is_err());
+    }
+}
+
+// ------------------------------------------------------------ p3_parity ---
+
+#[cfg(test)]
+mod p3_parity_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    fn p3_packet_client(eid: i32, name: &str, x: f64, y: f64, z: f64) -> (Arc<Client>, TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.eid = eid;
+        client.name = name.into();
+        *client.pos.lock().unwrap() = (x, y, z, 0.0, 0.0, true);
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        (Arc::new(client), receiver)
+    }
+
+    fn p3_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    fn p3_frame_varint(r: &mut TcpStream) -> Option<(i64, usize)> {
+        let mut value = 0i64;
+        for i in 0..5 {
+            let mut b = [0u8; 1];
+            r.read_exact(&mut b).ok()?;
+            value |= ((b[0] & 0x7f) as i64) << (7 * i);
+            if b[0] & 0x80 == 0 {
+                return Some((value, i + 1));
+            }
+        }
+        None
+    }
+
+    /// One uncompressed frame: varint length, varint packet id, payload.
+    fn p3_read_frame(r: &mut TcpStream) -> Option<(i64, Vec<u8>)> {
+        let (len, _) = p3_frame_varint(r)?;
+        let (id, used) = p3_frame_varint(r)?;
+        let mut payload = vec![0u8; (len as usize).checked_sub(used)?];
+        r.read_exact(&mut payload).ok()?;
+        Some((id, payload))
+    }
+
+    fn p3_run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    fn p3_tag_entity(eid: i32, tag: &str) {
+        tags()
+            .lock()
+            .unwrap()
+            .entry(format!("e:{eid}"))
+            .or_default()
+            .insert(tag.into());
+    }
+
+    #[test]
+    fn p3_parity_ride_mount_dismount_self_reject_and_level_two() {
+        let _world = world_guard();
+        let (player, _recv) = p3_packet_client(9101, "p3rider", 0.5, 16.0, 0.5);
+        clients().lock().unwrap().push(player.clone());
+        assert!(insert_live_mob(
+            name_to_etype("horse").unwrap(),
+            DimId::Overworld,
+            (4.5, 16.0, 4.5, 0.0, 0.0),
+            20.0,
+            None,
+        ));
+        let mob_eid = mobs().lock().unwrap().last().unwrap().eid;
+        p3_tag_entity(mob_eid, "p3ride_vehicle");
+
+        // Level-2 enforcement through the real permission table + the wire
+        // gate: a level-0 player context is refused before dispatch.
+        assert!(!command_allowed_at_level("ride", 1));
+        assert!(command_allowed_at_level("ride", 2));
+        let denied = p3_run(&p3_ctx(Some(player.clone())), "/ride p3rider mount @e[tag=p3ride_vehicle]");
+        assert!(
+            denied.contains("permission"),
+            "level-0 player must be refused: {denied}"
+        );
+
+        let ctx = p3_ctx(None); // console: level 4
+        assert_eq!(
+            p3_run(&ctx, "/ride p3rider mount @e[tag=p3ride_vehicle]"),
+            "Now riding minecraft:horse"
+        );
+        assert_eq!(vehicle_of(player.eid), Some(mob_eid));
+        {
+            let live = mounts().lock().unwrap();
+            assert_eq!(live.registry.passengers_of(mob_eid), &[player.eid]);
+        }
+        // self-mount is rejected by the registry (vanilla EntityLoopException)
+        assert_eq!(
+            p3_run(&ctx, "/ride p3rider mount p3rider"),
+            "Entity cannot ride itself"
+        );
+        assert_eq!(p3_run(&ctx, "/ride p3rider dismount"), "No longer riding");
+        assert!(vehicle_of(player.eid).is_none());
+        assert_eq!(p3_run(&ctx, "/ride p3rider dismount"), "Not riding anything");
+
+        // cycle: A rides B, so B cannot ride A.
+        assert!(insert_live_mob(
+            name_to_etype("zombie").unwrap(),
+            DimId::Overworld,
+            (8.5, 16.0, 4.5, 0.0, 0.0),
+            20.0,
+            None,
+        ));
+        let a = mobs().lock().unwrap().last().unwrap().eid;
+        p3_tag_entity(a, "p3ride_a");
+        assert!(insert_live_mob(
+            name_to_etype("zombie").unwrap(),
+            DimId::Overworld,
+            (9.5, 16.0, 4.5, 0.0, 0.0),
+            20.0,
+            None,
+        ));
+        let b = mobs().lock().unwrap().last().unwrap().eid;
+        p3_tag_entity(b, "p3ride_b");
+        assert_eq!(
+            p3_run(&ctx, "/ride @e[tag=p3ride_a,limit=1] mount @e[tag=p3ride_b,limit=1]"),
+            "Now riding minecraft:zombie"
+        );
+        assert_eq!(
+            p3_run(&ctx, "/ride @e[tag=p3ride_b,limit=1] mount @e[tag=p3ride_a,limit=1]"),
+            "Can't ride an entity that is already riding this entity, this would create a circular rider list"
+        );
+        p3_run(&ctx, "/ride @e[tag=p3ride_a,limit=1] dismount");
+
+        // teardown
+        mounts().lock().unwrap().registry.dismount(player.eid);
+        mounts().lock().unwrap().registry.dismount(a);
+        clients().lock().unwrap().retain(|c| c.eid != player.eid);
+        mobs().lock().unwrap().retain(|m| m.eid != mob_eid && m.eid != a && m.eid != b);
+        tags().lock().unwrap().remove(&format!("e:{mob_eid}"));
+        tags().lock().unwrap().remove(&format!("e:{a}"));
+        tags().lock().unwrap().remove(&format!("e:{b}"));
+    }
+
+    #[test]
+    fn p3_parity_spectate_requires_spectator_and_sets_camera() {
+        let _world = world_guard();
+        let (viewer, mut recv) = p3_packet_client(9201, "p3watcher", 0.5, 16.0, 0.5);
+        let (target, _rt) = p3_packet_client(9202, "p3prey", 1.5, 16.0, 0.5);
+        clients().lock().unwrap().extend([viewer.clone(), target.clone()]);
+        let ctx = p3_ctx(None);
+
+        // level 2 gate + spectator-only check
+        assert!(!command_allowed_at_level("spectate", 1));
+        assert!(command_allowed_at_level("spectate", 2));
+        assert_eq!(
+            p3_run(&ctx, "/spectate p3prey p3watcher"),
+            "Only players in spectator mode can use this command"
+        );
+
+        // Spectator: target set sends the verified protocol-767 set_camera id.
+        assert_eq!(SET_CAMERA_PACKET_767, 0x52);
+        *viewer.gm.lock().unwrap() = 3;
+        assert_eq!(
+            p3_run(&ctx, "/spectate p3prey p3watcher"),
+            "Now spectating minecraft:player"
+        );
+        let (id, payload) = p3_read_frame(&mut recv).expect("set_camera frame");
+        assert_eq!(id, 0x52, "767 set_camera is 0x52 (proto/src/data_v767.rs)");
+        let mut body = Vec::new();
+        write_varint(&mut body, i64::from(target.eid));
+        assert_eq!(payload, body, "camera payload is the target's VarInt eid");
+        assert_eq!(spectator_cameras().lock().unwrap().get(&viewer.eid), Some(&target.eid));
+
+        // Bare `/spectate` on the viewer resets the camera to their own eid.
+        assert_eq!(
+            spectate_command(&p3_ctx(Some(viewer.clone())), &[]),
+            "No longer spectating"
+        );
+        let (id, payload) = p3_read_frame(&mut recv).expect("reset frame");
+        assert_eq!(id, 0x52);
+        let mut body = Vec::new();
+        write_varint(&mut body, i64::from(viewer.eid));
+        assert_eq!(payload, body);
+        assert_eq!(spectator_cameras().lock().unwrap().get(&viewer.eid), Some(&viewer.eid));
+
+        // non-player `<player>` arg and console default viewer are refused
+        assert_eq!(
+            p3_run(&ctx, "/spectate p3prey @e[tag=p3notanentity]"),
+            "No player was found"
+        );
+        assert_eq!(p3_run(&ctx, "/spectate"), "Only players may use this command");
+
+        *viewer.gm.lock().unwrap() = 0;
+        spectator_cameras().lock().unwrap().remove(&viewer.eid);
+        clients().lock().unwrap().retain(|c| c.eid != viewer.eid && c.eid != target.eid);
+    }
+
+    #[test]
+    fn p3_parity_fillbiome_box_replace_filter_and_fail_closed() {
+        let _world = world_guard();
+        let ctx = p3_ctx(None);
+        let dim = cmd_dim(&ctx);
+        assert!(!command_allowed_at_level("fillbiome", 1));
+        assert!(command_allowed_at_level("fillbiome", 2));
+
+        // Box 1000..1007 x 100..107 x 2000..2007 -> quart (250..=251)^2 x (25) —
+        // exactly 8 cells, matching CubePos.fromBlock (>>2) corner mapping.
+        assert_eq!(
+            p3_run(&ctx, "/fillbiome 1000 100 2000 1007 107 2007 plains"),
+            "Changed biome of 8 cells to minecraft:plains"
+        );
+        {
+            let store = biome_overrides().lock().unwrap();
+            let dim_map = &store[&dim];
+            for qy in 25..=25 {
+                for qz in 500..=501 {
+                    for qx in 250..=251 {
+                        assert_eq!(dim_map[&(qx, qy, qz)], "minecraft:plains");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            effective_biome_name(dim, 250, 25, 500).as_deref(),
+            Some("minecraft:plains")
+        );
+
+        // `replace` predicate matches the override-aware current biome.
+        assert_eq!(
+            p3_run(&ctx, "/fillbiome 1000 100 2000 1007 107 2007 desert replace plains"),
+            "Changed biome of 8 cells to minecraft:desert"
+        );
+        assert_eq!(
+            p3_run(&ctx, "/fillbiome 1000 100 2000 1007 107 2007 forest replace plains"),
+            "Changed biome of 0 cells to minecraft:forest",
+            "no cell is plains any more"
+        );
+
+        // `#tag` filter through the loaded registry (injected tag fixture).
+        {
+            let mut registry = datapack_registry().lock().unwrap();
+            registry
+                .tags
+                .entry("biome".to_owned())
+                .or_default()
+                .insert("test:p3_is_desert".to_owned(), vec!["minecraft:desert".to_owned()]);
+        }
+        assert_eq!(
+            p3_run(&ctx, "/fillbiome 1000 100 2000 1007 107 2007 jungle replace #test:p3_is_desert"),
+            "Changed biome of 8 cells to minecraft:jungle"
+        );
+        datapack_registry()
+            .lock()
+            .unwrap()
+            .tags
+            .entry("biome".to_owned())
+            .or_default()
+            .remove("test:p3_is_desert");
+
+        // fail-closed: unknown biome id, unknown filter, out-of-world, limit.
+        assert_eq!(
+            p3_run(&ctx, "/fillbiome 1000 100 2000 1007 107 2007 notabiome"),
+            "Unknown biome 'notabiome'"
+        );
+        assert_eq!(
+            p3_run(&ctx, "/fillbiome 1000 100 2000 1007 107 2007 plains replace notabiome"),
+            "Unknown biome filter 'notabiome'"
+        );
+        assert_eq!(
+            p3_run(&ctx, "/fillbiome 0 400 0 0 400 0 plains"),
+            "Block position is outside the world"
+        );
+        GR_COMMAND_MODIFICATION_BLOCK_LIMIT.store(2, Ordering::Relaxed);
+        assert_eq!(
+            p3_run(&ctx, "/fillbiome 1000 100 2000 1016 100 2000 plains"),
+            "Too many blocks (5, maximum 2)"
+        );
+        GR_COMMAND_MODIFICATION_BLOCK_LIMIT.store(32768, Ordering::Relaxed);
+
+        // relative `~` coords resolve against the executor position (0.5,16,0.5)
+        assert_eq!(
+            p3_run(&ctx, "/fillbiome ~400 ~80 ~600 ~401 ~81 ~601 savanna"),
+            "Changed biome of 1 cells to minecraft:savanna"
+        );
+
+        biome_overrides().lock().unwrap().remove(&dim);
+    }
+
+    #[test]
+    fn p3_parity_place_feature_and_template_validation_and_dispatch() {
+        crate::test_support::require_vanilla_data();
+        let _world = world_guard();
+        let ctx = p3_ctx(None);
+        let dim = cmd_dim(&ctx);
+        assert!(!command_allowed_at_level("place", 1));
+        assert!(command_allowed_at_level("place", 2));
+
+        // feature: real configured_feature from datapacks/vanilla dispatches.
+        let before = place_dispatches().lock().unwrap().len();
+        assert_eq!(
+            p3_run(&ctx, "/place feature minecraft:patch_taiga_grass 3000 90 3000"),
+            "Placed feature 'minecraft:patch_taiga_grass' at [3000, 90, 3000]"
+        );
+        {
+            let log = place_dispatches().lock().unwrap();
+            assert_eq!(log.len(), before + 1);
+            let dispatch = log.last().unwrap();
+            assert_eq!(dispatch.kind, PlaceKind::Feature);
+            assert_eq!(dispatch.dim, dim);
+            assert_eq!(dispatch.id, "minecraft:patch_taiga_grass");
+            assert_eq!(dispatch.pos, (3000, 90, 3000));
+        }
+        assert_eq!(
+            p3_run(&ctx, "/place feature minecraft:not_a_feature 0 90 0"),
+            "No feature with the name 'minecraft:not_a_feature' exists"
+        );
+
+        // template: the real woodland_mansion carpet palette is stamped for
+        // real — capture the pre-existing states so the fixture restores.
+        let anchor = (5000, 250, 5000);
+        let reply = p3_run(&ctx, "/place template minecraft:woodland_mansion/carpet_north 5000 250 5000");
+        assert!(
+            reply.starts_with("Placed template 'minecraft:woodland_mansion/carpet_north' ("),
+            "unexpected: {reply}"
+        );
+        {
+            let log = place_dispatches().lock().unwrap();
+            assert_eq!(log.last().unwrap().kind, PlaceKind::Template);
+        }
+        // restore the area to air (fixture was placed over untouched terrain)
+        for dx in -2..8 {
+            for dz in -2..8 {
+                for dy in 0..4 {
+                    place_block_dim(dim, anchor.0 + dx, anchor.1 + dy, anchor.2 + dz, 0);
+                }
+            }
+        }
+        assert_eq!(
+            p3_run(&ctx, "/place template minecraft:not_a_template 0 90 0"),
+            "No such template 'minecraft:not_a_template'"
+        );
+
+        // validation: usage, unknown subcommand, bad id, out-of-world pos
+        assert!(p3_run(&ctx, "/place").starts_with("usage:"));
+        assert!(p3_run(&ctx, "/place jigsaw minecraft:x").starts_with("usage:"));
+        assert!(p3_run(&ctx, "/place feature Bad ID").contains("Invalid id"));
+        assert_eq!(
+            p3_run(&ctx, "/place feature minecraft:oak 0 400 0"),
+            "Block position is outside the world"
+        );
+        // default pos = executor feet (0.5,16,0.5 -> 0,16,0)
+        let before = place_dispatches().lock().unwrap().len();
+        assert_eq!(
+            p3_run(&ctx, "/place feature minecraft:patch_taiga_grass"),
+            "Placed feature 'minecraft:patch_taiga_grass' at [0, 16, 0]"
+        );
+        assert_eq!(place_dispatches().lock().unwrap().len(), before + 1);
     }
 }

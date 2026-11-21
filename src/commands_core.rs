@@ -1297,6 +1297,9 @@ pub(crate) fn name_to_state(n: &str) -> Option<u32> {
 }
 
 // ---------- datapacks (directories and ZIP files under datapacks/) ----------
+// Lane P3 extended tag/recipe registries + command stores live in the included
+// file (same flat scope — no `mod`, keeping the 44-module layer gate).
+include!("datapack.rs");
 struct Datapack {
     name: String,
     functions: HashMap<String, Vec<String>>,
@@ -1314,8 +1317,10 @@ struct DatapackContent {
     recipes: Vec<JsonRecipe>,
     recipe_ids: std::collections::BTreeSet<String>,
     smelts: Vec<SmeltRecipe>,
-    block_tags: HashMap<String, Vec<String>>,
-    item_tags: HashMap<String, Vec<String>>,
+    registry: DatapackRegistry,
+    /// `{"id": ..., "required": false}` tag members, deferred until every pack
+    /// has contributed — `resolve_optional_tags` drops the unresolved ones.
+    optional_tags: Vec<(String, String, String)>,
     loot: HashMap<String, Vec<LootPool>>,
     loot_raw: HashMap<String, String>,
     mob_loot: HashMap<i64, Vec<LootPool>>,
@@ -1325,7 +1330,21 @@ struct DatapackContent {
 }
 
 impl DatapackContent {
-    fn publish(self) {
+    fn publish(mut self) {
+        self.resolve_optional_tags();
+        // `block`/`item` mirror into the legacy globals consumed elsewhere.
+        let block_map = self
+            .registry
+            .tags
+            .get("block")
+            .cloned()
+            .unwrap_or_default();
+        let item_map = self
+            .registry
+            .tags
+            .get("item")
+            .cloned()
+            .unwrap_or_default();
         // Recipes consult item tags while holding their own locks. Counts also
         // reads block tags under the recipe lock. Publish in that lock order.
         let mut recipes = json_recipes().lock().unwrap();
@@ -1339,18 +1358,20 @@ impl DatapackContent {
         let mut advs = advancements().lock().unwrap();
         let mut conditions = predicates().lock().unwrap();
         let mut ids = recipe_ids().lock().unwrap();
+        let mut registry = datapack_registry().lock().unwrap();
         let mut active = packs().lock().unwrap();
         *recipes = self.recipes;
         *ids = self.recipe_ids;
         *smelts = self.smelts;
-        *blocks = self.block_tags;
-        *items = self.item_tags;
+        *blocks = block_map;
+        *items = item_map;
         *loot = self.loot;
         *loot_raw = self.loot_raw;
         *mob_loot = self.mob_loot;
         *mods = self.item_mods;
         *advs = self.advancements;
         *conditions = self.predicates;
+        *registry = self.registry;
         *active = self.packs;
         CONTENT_REVISION.fetch_add(1, Ordering::Release);
     }
@@ -1384,63 +1405,48 @@ impl DatapackContent {
         let key = format!("{ns}:{rel}");
         match kind {
             "tags" => {
-                let Some((tag, name)) = rel.split_once('/') else {
+                let Some((category, name)) = split_tag_path(rel) else {
                     return;
                 };
-                match tag {
-                    "block" | "blocks" | "item" | "items" => {
-                        let dst = if tag.starts_with('b') {
-                            &mut self.block_tags
-                        } else {
-                            &mut self.item_tags
-                        };
-                        if let Some(values) = body.split("\"values\"").nth(1) {
-                            dst.entry(format!("{ns}:{name}")).or_default().extend(
-                                values
-                                    .split('"')
-                                    .skip(1)
-                                    .step_by(2)
-                                    .map(str::trim)
-                                    .filter(|m| !m.is_empty() && !m.starts_with([']', '{']))
-                                    .map(|m| {
-                                        if m.contains(':') || m.starts_with('#') {
-                                            m.to_owned()
-                                        } else {
-                                            format!("minecraft:{m}")
-                                        }
-                                    }),
-                            );
+                if category == "function" {
+                    // Function hooks keep their existing wiring; only the
+                    // vanilla `load`/`tick` hooks run, arbitrary function tags
+                    // are still indexed below in the registry for `execute if`.
+                    match name {
+                        "load" | "tick" => {
+                            let dst = if name == "load" {
+                                &mut pack.load
+                            } else {
+                                &mut pack.tick
+                            };
+                            if let Some(values) = body.split("\"values\"").nth(1) {
+                                dst.extend(
+                                    values
+                                        .split('"')
+                                        .skip(1)
+                                        .step_by(2)
+                                        .filter(|m| m.starts_with('#') || m.contains(':'))
+                                        .map(|m| {
+                                            let m = m.trim_start_matches('#');
+                                            if m.contains(':') {
+                                                m.to_owned()
+                                            } else {
+                                                format!("minecraft:{m}")
+                                            }
+                                        }),
+                                );
+                            }
                         }
+                        _ => {}
                     }
-                    "function" | "functions" => {
-                        let dst = match name {
-                            "load" => &mut pack.load,
-                            "tick" => &mut pack.tick,
-                            _ => return,
-                        };
-                        if let Some(values) = body.split("\"values\"").nth(1) {
-                            dst.extend(
-                                values
-                                    .split('"')
-                                    .skip(1)
-                                    .step_by(2)
-                                    .filter(|m| m.starts_with('#') || m.contains(':'))
-                                    .map(|m| {
-                                        let m = m.trim_start_matches('#');
-                                        if m.contains(':') {
-                                            m.to_owned()
-                                        } else {
-                                            format!("minecraft:{m}")
-                                        }
-                                    }),
-                            );
-                        }
-                    }
-                    _ => {}
                 }
+                self.read_tag_entry(&category, &format!("{ns}:{name}"), body);
             }
             "recipe" | "recipes" => {
                 self.recipe_ids.insert(key.clone());
+                if self.read_extended_recipe(&key, body) {
+                    return;
+                }
                 self.read_recipe(body)
             }
             "loot_table" | "loot_tables" => self.read_loot(key, rel, body),
@@ -1969,11 +1975,15 @@ fn reload_datapacks(
             return Err(format!("Datapack '{name}' is already disabled"));
         }
     }
-    let mut content = DatapackContent {
-        block_tags: builtin_block_tags(),
-        item_tags: builtin_item_tags(),
-        ..DatapackContent::default()
-    };
+    let mut content = DatapackContent::default();
+    content
+        .registry
+        .tags
+        .insert("block".to_owned(), builtin_block_tags());
+    content
+        .registry
+        .tags
+        .insert("item".to_owned(), builtin_item_tags());
     let mut dim_sources = Vec::new();
     for (name, path, zip) in sources {
         if disabled.contains(&name) {
@@ -3864,6 +3874,10 @@ fn command_usage(name: &str) -> String {
     let usage = match name.trim_start_matches('/') {
         "setblock" => "/setblock <x> <y> <z> <block> [replace|destroy|keep]",
         "fill" => "/fill <from> <to> <block> [replace|destroy|keep|hollow|outline]",
+        "fillbiome" => "/fillbiome <from> <to> <biome> [replace <filter>]",
+        "place" => "/place feature|template <id> [<pos>]",
+        "ride" => "/ride <target> mount <vehicle> | /ride <target> dismount",
+        "spectate" => "/spectate [<target>] [<player>]",
         "gamemode" => "/gamemode <survival|creative|adventure|spectator> [player]",
         "defaultgamemode" => "/defaultgamemode <survival|creative|adventure|spectator>",
         "save-on" | "save-off" => "no arguments",
@@ -4276,6 +4290,11 @@ fn native_command_dispatcher(
         literal("team").then(args("arguments")),
     );
     for name in ["locate", "random", "return", "recipe"] {
+        register_at_level(name, literal(name).then(args("arguments")));
+    }
+    // P3 commands are permission level 2 (vanilla `requires(2)`) — exposed to
+    // ops through `register_at_level` like every other cheat command.
+    for name in ["fillbiome", "place", "ride", "spectate"] {
         register_at_level(name, literal(name).then(args("arguments")));
     }
     register_at_level(
@@ -6409,7 +6428,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "ban" | "ban-ip" | "banlist" | "pardon" | "pardon-ip" | "whitelist" => {
             run_server_ops_command(ctx, cmd, &args)
         }
-        "team" | "teammsg" | "tm" | "tick" | "locate" | "random" | "return" => {
+        "team" | "teammsg" | "tm" | "tick" | "locate" | "random" | "return" | "ride"
+        | "spectate" | "fillbiome" | "place" => {
             exec_p3b_command(ctx, cmd, &args, s)
         }
         "recipe" => run_recipe_command(ctx, &args),
