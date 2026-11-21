@@ -535,6 +535,120 @@ fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> st
     result
 }
 
+/// `write_frame` for an already-framed packet. `SharedBroadcastFrame` fans the
+/// same `Arc<[u8]>` out to every recipient, so the bytes here are borrowed: a
+/// plain connection writes them with no copy at all, while a ciphered
+/// connection encrypts a scratch copy rather than mutating the shared
+/// allocation the other recipients still have to send.
+fn write_raw_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
+    let result = if let Some(cipher) = conn_cipher(s) {
+        let mut bytes = frame.to_vec();
+        cipher
+            .tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .encrypt(&mut bytes);
+        s.write_all(&bytes)
+    } else {
+        s.write_all(frame)
+    };
+    if result.is_err() {
+        // A partial write invalidates both the frame boundary and entity baselines.
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+    result
+}
+
+/// One broadcast's reusable wire form. The first `(id, payload)` `mk` produces
+/// is framed once by the `SharedBroadcastFrame`; every later recipient `mk`
+/// hands the same bytes to is served from it, so the fanout encodes and — for
+/// compressed clients — compresses once instead of once per client. A
+/// recipient whose `mk` returns different bytes reframes, which keeps
+/// per-client producers byte-exact.
+struct BroadcastFrameCache {
+    id: i64,
+    payload: Box<[u8]>,
+    frame: connection_limits::SharedBroadcastFrame,
+}
+
+/// The shared frame for `(id, payload)`, building the cache entry on the first
+/// call and whenever `mk` produced different bytes than the last recipient.
+fn broadcast_frame<'c>(
+    cache: &'c mut Option<BroadcastFrameCache>,
+    id: i64,
+    payload: &[u8],
+) -> &'c mut connection_limits::SharedBroadcastFrame {
+    let hit = cache
+        .as_ref()
+        .is_some_and(|c| c.id == id && c.payload.as_ref() == payload);
+    if !hit {
+        *cache = Some(BroadcastFrameCache {
+            id,
+            payload: payload.into(),
+            frame: connection_limits::SharedBroadcastFrame::new(id, payload),
+        });
+    }
+    &mut cache.as_mut().expect("populated above").frame
+}
+
+/// `send_packet` for the broadcast loops: the per-recipient work — the
+/// anti-cheat note and the pose-tracking `update_packet` gate — still runs on
+/// every client exactly as before, so a gate suppression or a per-client
+/// rewrite (a `0x70` teleport becoming a relative move this one recipient
+/// tracks differently) stays byte-identical to the old per-client send. Only
+/// the framing changes: a packet that crosses the gate unmodified writes the
+/// broadcast's shared `SharedBroadcastFrame`, encoding and compressing once
+/// for the whole fanout rather than once per recipient.
+fn send_broadcast_frame(
+    s: &mut TcpStream,
+    cache: &mut Option<BroadcastFrameCache>,
+    mut id: i64,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    if id == 0x5a {
+        // SetEntityMotion: whatever the server (or a mod acting through it) launches a
+        // player with is movement the anti-cheat must allow for.
+        let mut body = payload;
+        if let Some(eid) = read_varint(&mut body) {
+            if body.len() >= 6 {
+                let axis = |i: usize| f64::from(i16::from_be_bytes([body[i], body[i + 1]])) / 8000.0;
+                ac_note_server_velocity(eid as i32, [axis(0), axis(2), axis(4)]);
+            }
+        }
+    }
+    let mut send = true;
+    let mut rewritten: Option<Vec<u8>> = None;
+    let compression = SOCKET_WIRE.get().and_then(|states| {
+        let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
+        let state = states.get_mut(&socket_key(s))?;
+        if let Some(play) = &mut state.play {
+            let mut wire_id = id;
+            let mut scratch = payload.to_vec();
+            send = play.update_packet(
+                &mut wire_id,
+                &mut scratch,
+                TICK_IDX.load(Ordering::Relaxed),
+            );
+            if wire_id != id || scratch.as_slice() != payload {
+                id = wire_id;
+                rewritten = Some(scratch);
+            }
+        }
+        state.compression
+    });
+    if !send {
+        return Ok(());
+    }
+    if let Some(payload) = rewritten {
+        let mut body = Vec::with_capacity(payload.len() + 5);
+        write_varint(&mut body, id);
+        body.extend_from_slice(&payload);
+        return write_frame(s, &body, compression);
+    }
+    let frame = broadcast_frame(cache, id, payload).frame_for(compression);
+    write_raw_frame(s, frame.as_ref())
+}
+
 /// A START_DESTROY_BLOCK the client has not cancelled. Vanilla survival mining
 /// advances on the server (`ServerPlayerGameMode.tick` accumulates destroy
 /// progress and breaks the block when it reaches the dig duration); the finish
@@ -941,13 +1055,30 @@ where
     F: Fn(&Client) -> (i64, Vec<u8>),
     P: Fn(&Client) -> bool,
 {
+    let mut shared = None;
+    fanout_shared_in(audience, interested, mk, &mut shared);
+}
+
+/// `fanout_in` with the broadcast's frame cache handed in rather than owned:
+/// production callers pass a fresh `None`; a test keeps the cache afterwards
+/// and reads `frame.encode_count()`, the direct proof that a fanout encoded
+/// once for every identical packet instead of once per recipient.
+fn fanout_shared_in<F, P>(
+    audience: &[Arc<Client>],
+    interested: P,
+    mk: F,
+    shared: &mut Option<BroadcastFrameCache>,
+) where
+    F: Fn(&Client) -> (i64, Vec<u8>),
+    P: Fn(&Client) -> bool,
+{
     for c in audience.iter() {
         if !interested(c) {
             continue;
         }
-        let pl = mk(c);
+        let (id, packet) = mk(c);
         if let Ok(mut w) = c.sock.lock() {
-            let _ = send_packet(&mut w, pl.0, pl.1);
+            let _ = send_broadcast_frame(&mut w, shared, id, &packet);
         }
     }
 }
@@ -2053,6 +2184,7 @@ fn broadcast_chunk_dim_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     cz: i32,
     mk: F,
 ) {
+    let mut shared = None;
     for client in audience {
         // Stream and unload take the chunk lock before the socket. Keep the
         // audience check in that order so a delta cannot follow an unload.
@@ -2067,7 +2199,7 @@ fn broadcast_chunk_dim_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
             continue;
         }
         let (id, packet) = mk(client);
-        if send_packet(&mut socket, id, packet).is_err() {
+        if send_broadcast_frame(&mut socket, &mut shared, id, &packet).is_err() {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
     }
@@ -2092,13 +2224,14 @@ fn broadcast_seen_ex_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     excl: i32,
     mk: F,
 ) {
+    let mut shared = None;
     for client in audience.iter().filter(|c| c.eid != excl) {
         // Serialize updates with the tracking sweep's spawn and remove packets.
         let seen = client.seen.lock().unwrap();
         if seen.contains(&eid) {
             let (id, packet) = mk(client);
             if let Ok(mut socket) = client.sock.lock() {
-                let _ = send_packet(&mut socket, id, packet);
+                let _ = send_broadcast_frame(&mut socket, &mut shared, id, &packet);
             }
         }
     }
@@ -2129,6 +2262,7 @@ fn broadcast_near_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     me_eid: i32,
     mk: F,
 ) {
+    let mut shared = None;
     for client in audience.iter().filter(|c| c.eid != me_eid) {
         if *client.dim.lock().unwrap() != dim {
             continue;
@@ -2142,7 +2276,7 @@ fn broadcast_near_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
             continue;
         }
         if let Ok(mut socket) = client.sock.lock() {
-            let _ = send_packet(&mut socket, id, packet);
+            let _ = send_broadcast_frame(&mut socket, &mut shared, id, &packet);
         }
     }
 }
@@ -10231,7 +10365,6 @@ fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> boo
 /// to its owner. Sitting pets never teleport, and a landing only counts when
 /// the block below is solid while the two blocks at foot and head height are
 /// not.
-#[cfg_attr(not(test), allow(dead_code))]
 fn pet_follow_teleport_step(
     owner_dim: DimId,
     owner_pos: (f64, f64, f64),
@@ -13862,5 +13995,412 @@ mod p8a_parity_protocol_tests {
             Some(v) => std::env::set_var("MC_SPINE_CONFIG", v),
             None => std::env::remove_var("MC_SPINE_CONFIG"),
         }
+    }
+}
+
+/// Lane BOT-NET-2: the live wiring behind the primitives — the broadcast
+/// loops share one `SharedBroadcastFrame` per fanout instead of re-framing
+/// and re-compressing per recipient, `game_tick` can run the issue-#105
+/// region sweep on an opt-in interval, and standing tamed pets run
+/// `pet_follow_teleport_step` inside the live mob tick.
+#[cfg(test)]
+mod bot_net2_tests {
+    use super::*;
+    use std::io::Read;
+    use std::time::Duration;
+
+    fn bot_client(eid: i32) -> (Arc<Client>, TcpStream) {
+        let (mut c, r) = crate::effect_tests::client_pair();
+        c.eid = eid;
+        r.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        (Arc::new(c), r)
+    }
+
+    /// Arm the negotiated compression threshold on a test client's socket the
+    /// way `negotiate_compression` does for a live connection.
+    fn arm_compression(client: &Client, threshold: usize) {
+        let key = {
+            let sock = client.sock.lock().unwrap_or_else(|e| e.into_inner());
+            socket_key(&sock)
+        };
+        socket_wire()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_default()
+            .compression = Some(threshold);
+    }
+
+    fn clear_socket_wire(client: &Client) {
+        let key = {
+            let sock = client.sock.lock().unwrap_or_else(|e| e.into_inner());
+            socket_key(&sock)
+        };
+        unregister_socket_wire(key);
+    }
+
+    /// Everything that arrived on the receiver half of the socket pair.
+    fn drained(r: &mut TcpStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// A compressible ~4 KiB broadcast payload, identical to the shape the
+    /// 50-player fanout in BOT-NET-1 measured.
+    fn broadcast_payload() -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 * 1024);
+        for i in 0..2048u32 {
+            payload.extend_from_slice(&[b'a' + (i % 26) as u8, (i >> 8) as u8]);
+        }
+        payload
+    }
+
+    #[test]
+    fn bot_net2_broadcast_compresses_once_and_fans_out_byte_identical_frames() {
+        let payload = broadcast_payload();
+        let (a, mut ra) = bot_client(1);
+        let (b, mut rb) = bot_client(2);
+        let (plain, mut rp) = bot_client(3);
+        arm_compression(&a, 256);
+        arm_compression(&b, 256);
+        let audience = [a.clone(), b.clone(), plain.clone()];
+
+        let mut shared = None;
+        fanout_shared_in(&audience, |_| true, |_c| (0x27, payload.clone()), &mut shared);
+        let cache = shared.expect("a delivered broadcast builds the cache");
+        assert_eq!(
+            cache.frame.encode_count(),
+            2,
+            "one compressed build for every compressed client plus one plain build"
+        );
+
+        let mut body = Vec::new();
+        write_varint(&mut body, 0x27);
+        body.extend_from_slice(&payload);
+        let expected_compressed = connection_limits::encode_compressed_frame(&body, 256);
+        let mut expected_plain = Vec::new();
+        write_varint(&mut expected_plain, body.len() as i64);
+        expected_plain.extend_from_slice(&body);
+
+        assert_eq!(drained(&mut ra), expected_compressed, "client A wire form");
+        assert_eq!(drained(&mut rb), expected_compressed, "client B wire form");
+        assert_eq!(drained(&mut rp), expected_plain, "plain client wire form");
+
+        for c in [&a, &b, &plain] {
+            clear_socket_wire(c);
+        }
+    }
+
+    #[test]
+    fn bot_net2_broadcast_to_one_compression_class_encodes_a_single_frame() {
+        let payload = broadcast_payload();
+        let (a, mut ra) = bot_client(11);
+        let (b, mut rb) = bot_client(12);
+        let (c, mut rc) = bot_client(13);
+        for client in [&a, &b, &c] {
+            arm_compression(client, 256);
+        }
+        // broadcast_in: everyone except the named sender — three recipients.
+        let audience = [a.clone(), b.clone(), c.clone()];
+        let mut shared = None;
+        fanout_shared_in(&audience, |c| c.eid != 11, |_c| (0x6c, payload.clone()), &mut shared);
+
+        assert_eq!(drained(&mut ra).len(), 0, "the excluded sender gets nothing");
+        assert_eq!(
+            shared.expect("cache").frame.encode_count(),
+            1,
+            "three recipients, one wire form, one encode"
+        );
+        let mut body = Vec::new();
+        write_varint(&mut body, 0x6c);
+        body.extend_from_slice(&payload);
+        let expected = connection_limits::encode_compressed_frame(&body, 256);
+        assert_eq!(drained(&mut rb), expected);
+        assert_eq!(drained(&mut rc), expected);
+
+        for client in [&a, &b, &c] {
+            clear_socket_wire(client);
+        }
+    }
+
+    /// The world/globals the pet-follow and auto-unload fixtures replace, put
+    /// back on drop so a failed assert cannot leak state into the next test.
+    struct BotNet2World {
+        clients: Vec<Arc<Client>>,
+        mobs: Vec<Arc<Mob>>,
+        states: HashMap<i32, LiveMobState>,
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
+        region: Region,
+        forced: HashSet<(i32, i32)>,
+        spawn: (f64, f64, f64, f32),
+        tick_idx: u64,
+        tickets: HashMap<DimChunkKey, u64>,
+        evicted: HashMap<
+            (DimId, i32, i32),
+            std::collections::BTreeMap<(i32, i32), EvictedChunkArchive>,
+        >,
+        env_unload: Option<String>,
+        env_anvil: Option<String>,
+    }
+
+    impl BotNet2World {
+        fn take() -> Self {
+            Self {
+                clients: std::mem::take(
+                    &mut *clients().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
+                states: std::mem::take(
+                    &mut *live_mob_states()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                ),
+                world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+                region: std::mem::take(
+                    &mut *region().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                forced: std::mem::take(
+                    &mut *forceloaded()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                ),
+                spawn: *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()),
+                tick_idx: TICK_IDX.load(Ordering::Relaxed),
+                tickets: std::mem::take(
+                    &mut *live_chunk_tickets()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                ),
+                evicted: std::mem::take(
+                    &mut *evicted_regions()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                ),
+                env_unload: std::env::var("MC_SPINE_AUTO_UNLOAD_TICKS").ok(),
+                env_anvil: std::env::var("MC_SPINE_ANVIL_WORLD_DIR").ok(),
+            }
+        }
+    }
+
+    impl std::ops::Drop for BotNet2World {
+        fn drop(&mut self) {
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.clients);
+            *mobs().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.mobs);
+            *live_mob_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.states);
+            *world().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.world);
+            *region().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.region);
+            *forceloaded()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.forced);
+            *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = self.spawn;
+            TICK_IDX.store(self.tick_idx, Ordering::Relaxed);
+            *live_chunk_tickets()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.tickets);
+            *evicted_regions()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.evicted);
+            match self.env_unload.take() {
+                Some(v) => std::env::set_var("MC_SPINE_AUTO_UNLOAD_TICKS", v),
+                None => std::env::remove_var("MC_SPINE_AUTO_UNLOAD_TICKS"),
+            }
+            match self.env_anvil.take() {
+                Some(v) => std::env::set_var("MC_SPINE_ANVIL_WORLD_DIR", v),
+                None => std::env::remove_var("MC_SPINE_ANVIL_WORLD_DIR"),
+            }
+        }
+    }
+
+    /// A wolf mob at `pos` whose live behavior state is a pet owned by
+    /// `owner`, `sitting` flag applied, inserted into the live mob set.
+    fn tamed_wolf(
+        pos: (f64, f64, f64),
+        owner: [u8; 16],
+        sitting: bool,
+    ) -> Arc<Mob> {
+        assert!(insert_live_mob(
+            122,
+            DimId::Overworld,
+            (pos.0, pos.1, pos.2, 0.0, 0.0),
+            40.0,
+            None
+        ));
+        let wolf = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .expect("inserted")
+            .clone();
+        {
+            let mut states = live_mob_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let state = states.get_mut(&wolf.eid).expect("wolf behavior state");
+            let Some(MobBehaviorState::Wolf(pet)) = &mut state.behavior else {
+                panic!("insert_live_mob(122) must produce a wolf pet");
+            };
+            pet.owner = Some(owner);
+            pet.sitting = sitting;
+        }
+        wolf
+    }
+
+    /// Stone floor at y=63 with air above across the columns the follow scan
+    /// visits, so the teleport lands deterministically at (-2.5, 64.0, -2.5)
+    /// for an owner at (0.5, 64.0, 0.5).
+    fn lay_pet_floor(stone: u32) {
+        for x in -6..=6 {
+            for z in -6..=6 {
+                set_block(x, 63, z, stone);
+                for y in 64..=67 {
+                    set_block(x, y, z, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bot_net2_live_tick_teleports_standing_wolf_past_twelve_blocks() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        let _saved = BotNet2World::take();
+        let stone = name_to_state("stone").expect("stone must exist");
+        lay_pet_floor(stone);
+
+        let (mut owner_c, _rx) = crate::effect_tests::client_pair();
+        owner_c.uuid = [7u8; 16];
+        *owner_c.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (0.5, 64.0, 0.5, 0.0, 0.0, true);
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![Arc::new(owner_c)];
+
+        let wolf = tamed_wolf((13.5, 64.0, 0.5), [7u8; 16], false);
+        refresh_hot();
+        mob_tick();
+
+        let (x, y, z, ..) = *wolf.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            (x, y, z),
+            (-2.5, 64.0, -2.5),
+            "a standing wolf 13 blocks out reseats on the safe floor next to its owner"
+        );
+    }
+
+    #[test]
+    fn bot_net2_live_tick_keeps_sitting_wolf_put() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        let _saved = BotNet2World::take();
+        let stone = name_to_state("stone").expect("stone must exist");
+        lay_pet_floor(stone);
+        // Floor under the sitting wolf too, so nothing but the pet rule can
+        // move it.
+        for x in -14..=-12 {
+            for z in -2..=2 {
+                set_block(x, 63, z, stone);
+                set_block(x, 64, z, 0);
+                set_block(x, 65, z, 0);
+            }
+        }
+
+        let (mut owner_c, _rx) = crate::effect_tests::client_pair();
+        owner_c.uuid = [9u8; 16];
+        *owner_c.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (0.5, 64.0, 0.5, 0.0, 0.0, true);
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![Arc::new(owner_c)];
+
+        let wolf = tamed_wolf((-13.5, 64.0, 0.5), [9u8; 16], true);
+        refresh_hot();
+        mob_tick();
+
+        let (x, y, z, ..) = *wolf.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            (x, y, z),
+            (-13.5, 64.0, 0.5),
+            "a sitting wolf stays exactly where it was told to sit"
+        );
+    }
+
+    #[test]
+    fn bot_net2_auto_unload_respects_env_and_parks_evicted_region() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        let _saved = BotNet2World::take();
+        // The default is off: the stage must not touch resident state no
+        // matter where TICK_IDX sits — this is what keeps the saved-payload
+        // digest bit-identical with the hook wired in.
+        std::env::remove_var("MC_SPINE_AUTO_UNLOAD_TICKS");
+        std::env::remove_var("MC_SPINE_ANVIL_WORLD_DIR");
+        *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 64.0, 0.5, 0.0);
+        assert_eq!(auto_unload_period(), 0, "unset disables the stage");
+        std::env::set_var("MC_SPINE_AUTO_UNLOAD_TICKS", "0");
+        assert_eq!(auto_unload_period(), 0, "an explicit 0 disables too");
+        std::env::set_var("MC_SPINE_AUTO_UNLOAD_TICKS", "abc");
+        assert_eq!(auto_unload_period(), 0, "unparseable disables");
+        std::env::set_var("MC_SPINE_AUTO_UNLOAD_TICKS", "600");
+        assert_eq!(auto_unload_period(), 600);
+
+        let stone = name_to_state("stone").expect("stone must exist");
+        set_block_dim(DimId::Overworld, 800, 64, 800, stone); // chunk (50, 50)
+        let overlay_len = || {
+            world()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(DimId::Overworld, 50, 50))
+                .map_or(0, |chunk| chunk.len())
+        };
+
+        // Disabled at a tick boundary that would fire if enabled: nothing moves.
+        std::env::remove_var("MC_SPINE_AUTO_UNLOAD_TICKS");
+        TICK_IDX.store(600, Ordering::Relaxed);
+        auto_unload_tick();
+        assert_eq!(overlay_len(), 1, "disabled stage must not evict");
+
+        // Enabled at period 5: off-boundary ticks skip, on-boundary ticks run.
+        std::env::set_var("MC_SPINE_AUTO_UNLOAD_TICKS", "5");
+        TICK_IDX.store(602, Ordering::Relaxed);
+        auto_unload_tick();
+        assert_eq!(overlay_len(), 1, "602 is not a multiple of 5");
+        TICK_IDX.store(605, Ordering::Relaxed);
+        auto_unload_tick();
+        assert_eq!(
+            overlay_len(),
+            0,
+            "605 fires the sweep; the unticketed far chunk evicts"
+        );
+        assert!(
+            !evicted_regions()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "with no Anvil dir the unload parks in evicted_regions"
+        );
+
+        // Re-hydration brings the edit back byte-for-byte.
+        assert!(rehydrate_evicted_chunk(DimId::Overworld, 50, 50));
+        assert_eq!(
+            block_at_dim(DimId::Overworld, 800, 64, 800),
+            stone,
+            "the parked chunk restores its block"
+        );
     }
 }

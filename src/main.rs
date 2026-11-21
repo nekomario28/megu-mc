@@ -4485,6 +4485,50 @@ fn live_mob_tick_dimension(
         if spec.max_health <= 0.0 {
             continue;
         }
+        // Vanilla `TamableAnimal` follow: a standing tamed wolf/cat more than
+        // 12 blocks behind its owner teleports onto a safe floor next to them
+        // rather than being left behind. The owner must be online and in the
+        // pet's dimension; a sitting pet never moves. Mirrors the
+        // behavior-effect teleport below — a mob that teleported is done for
+        // the tick.
+        if matches!(m.etype, 15 | 122) {
+            let pet_state = live_mob_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&m.eid)
+                .and_then(|state| match &state.behavior {
+                    Some(MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet)) => {
+                        Some((pet.owner, pet.sitting))
+                    }
+                    _ => None,
+                });
+            if let Some((Some(owner), sitting)) = pet_state {
+                if let Some(owner_pos) = players
+                    .iter()
+                    .find_map(|p| (p.dim == dim && p.client.uuid == owner).then_some(p.pos))
+                {
+                    if let Some((tx, ty, tz)) = pet_follow_teleport_step(
+                        dim,
+                        owner_pos,
+                        (mp.0, mp.1, mp.2),
+                        sitting,
+                        |d, x, y, z| reg.blocks_motion(block_at_dim(d, x, y, z)),
+                    ) {
+                        let (yaw, pitch) = (mp.3, mp.4);
+                        *mp = (tx, ty, tz, yaw, pitch);
+                        drop(mp);
+                        m.vel
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .fill(0.0);
+                        broadcast_seen(m.eid, |_| {
+                            (0x70, entity_teleport(m.eid, tx, ty, tz, yaw, pitch, true))
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
         let [bx, by, bz] = [mp.0, mp.1, mp.2].map(|value| value.floor() as i32);
         let feet_state = block_at_dim(dim, bx, by, bz);
         let (in_water, in_lava) = if dim == DimId::Overworld {
@@ -14442,6 +14486,52 @@ fn world_block_entity_tick() {
     });
 }
 
+/// `MC_SPINE_AUTO_UNLOAD_TICKS`: the opt-in game-tick interval between live
+/// issue-#105 region sweeps. `0`, unset or unparseable disables the stage
+/// entirely — the default tick pays one env read and nothing else, so a
+/// server that never asks for the sweep keeps an identical tick.
+fn auto_unload_period() -> u64 {
+    std::env::var("MC_SPINE_AUTO_UNLOAD_TICKS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// The `auto_unload` stage of `game_tick`: every `MC_SPINE_AUTO_UNLOAD_TICKS`
+/// ticks, `sweep_unticketed_regions` evicts resident chunks whose ticket
+/// lapsed — chunks covered by no connected client's view window, the
+/// Overworld spawn ring or `/forceload` — flushing each unload into the Anvil
+/// world dir when `MC_SPINE_ANVIL_WORLD_DIR` is armed or parking it in
+/// `evicted_regions` for re-hydration otherwise, so a long-running server
+/// stops holding every explored chunk's RAM forever.
+fn auto_unload_tick() {
+    let period = auto_unload_period();
+    if period == 0 {
+        return;
+    }
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    if !now.is_multiple_of(server_ticks(period)) {
+        return;
+    }
+    let active = live_client_view_chunks();
+    let forced = forceloaded()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let dir = anvil_world_dir_from_env();
+    let policy = LiveChunkUnloadPolicy {
+        max_unticketed_chunks: 256,
+        grace_ticks: server_ticks(600),
+    };
+    match sweep_unticketed_regions(&active, &forced, policy, now, dir.as_deref()) {
+        Ok(summary) if summary.chunks_unloaded > 0 => {
+            eprintln!("[spine] auto-unload swept {summary:?}");
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("[spine] auto-unload sweep failed: {error}"),
+    }
+}
+
 /// The live hotspot profiler fed by every real `game_tick` is the SAME
 /// `OnceLock` `/profile` reads (`live_hotspot_profiler` in
 /// `teams_and_commands.rs`) — a second instance would record tick timings a
@@ -14494,6 +14584,9 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("villager_raid", villager_raid_tick);
     run("generated_content", materialize_pending_generation);
     run("interest", interest_tick);
+    // Vanilla `ChunkMap.tick` evicts chunks whose tickets lapsed; the sweep is
+    // opt-in (`MC_SPINE_AUTO_UNLOAD_TICKS`), so the default stage is a no-op.
+    run("auto_unload", auto_unload_tick);
     run("drops", drop_tick);
     run("arrows", w1_arrow_tick);
     run("tnt", w1_tnt_tick);
