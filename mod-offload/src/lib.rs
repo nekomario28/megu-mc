@@ -4,6 +4,7 @@
 
 pub mod contraption;
 pub mod entity_spatial;
+pub mod explosion_batch;
 pub mod ffi;
 pub mod fluid_network;
 pub mod kinetic_graph;
@@ -18,6 +19,15 @@ pub use entity_spatial::{
     tick_confined_ai, AiTickInput, AiTickResult, ChunkSensorBroadPhase, CollisionResult,
     DroppedItem, EntityAiState, EntityKind, MergeReport, MobSensor, SensorEntity, SoaEntityPool,
     XpOrb,
+};
+pub use explosion_batch::{
+    blast_bounds, coalesce_item_counts, scrub_power, BlastBlockSource, BlastCell, BlastResult,
+    BlastStats, BlastTickSlice, BlastVolumeCache, BlastWorld, BlastWorldStats, BlockRemoval,
+    ExplosionBatch, ExplosionError, ItemStack, MegaBlastPlan, SectionBlockUpdate,
+    SectionBlocksUpdate, AffectedCell, XorShift64,
+    BLAST_BOUNDS_MARGIN, BLAST_REACH_FACTOR, BLOCK_COST_BASE, FLAG_INDESTRUCTIBLE,
+    MAX_BLAST_POWER, MAX_CACHE_CELLS, MAX_RAY_STEPS, MAX_STACK_SIZE, RAY_GRID, RAY_POWER_MIN,
+    RAY_POWER_RANGE, RAY_STEP, RAY_SURFACE_CELLS, STEP_DRAIN, TNT_POWER,
 };
 pub use party_storage::{
     award_experience, decode_storage, eligible_evolutions, encode_storage,
