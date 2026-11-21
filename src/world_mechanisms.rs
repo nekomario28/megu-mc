@@ -899,19 +899,41 @@ impl AdvancementTracker {
             .sum()
     }
 
+    /// Every requirement group satisfied by the recorded criteria — the
+    /// completion test rewards key on, without the parent-visibility walk of
+    /// `completed`.
+    fn criteria_complete(&self, player: &str, definition: &AdvancementDefinition) -> bool {
+        self.progress
+            .get(player)
+            .and_then(|progress| progress.get(definition.id))
+            .is_some_and(|criteria| {
+                definition
+                    .requirements
+                    .iter()
+                    .all(|group| group.iter().any(|name| criteria.contains_key(name)))
+            })
+    }
+
     fn grant_definition(
         &mut self,
         player: &str,
         definition: &AdvancementDefinition,
         time_ms: i64,
     ) -> usize {
-        definition
+        let was_complete = self.criteria_complete(player, definition);
+        let granted = definition
             .requirements
             .iter()
             .copied()
             .flatten()
             .filter(|name| self.grant_criterion(player, definition.id, name, time_ms))
-            .count()
+            .count();
+        // `Advancement.performRewards`: the false->true completion edge is the
+        // one moment the rewards execute, for command and event grants alike.
+        if !was_complete && self.criteria_complete(player, definition) {
+            live_grant_advancement_rewards(player, definition.id);
+        }
+        granted
     }
 
     fn has_ancestor(&self, mut id: &str, ancestor: &str) -> bool {
@@ -2146,6 +2168,10 @@ enum RandomTickDispatch {
     Leaves,
     Snow,
     Ice,
+    Cactus,
+    Bamboo,
+    Kelp,
+    Vine,
     Other,
 }
 
@@ -2222,6 +2248,14 @@ fn eval_random_ticks(
                 RandomTickDispatch::Snow
             } else if name == "minecraft:ice" {
                 RandomTickDispatch::Ice
+            } else if name == "minecraft:cactus" {
+                RandomTickDispatch::Cactus
+            } else if matches!(name.as_str(), "minecraft:bamboo" | "minecraft:bamboo_sapling") {
+                RandomTickDispatch::Bamboo
+            } else if name == "minecraft:kelp" {
+                RandomTickDispatch::Kelp
+            } else if name == "minecraft:vine" {
+                RandomTickDispatch::Vine
             } else {
                 RandomTickDispatch::Other
             };
@@ -2427,6 +2461,529 @@ fn eval_grass_spread(input: GrassSpreadInput) -> GrassSpreadResult {
         return GrassSpreadResult::SpreadToNeighbor;
     }
     GrassSpreadResult::NoChange
+}
+
+// ---------- P2: remaining vanilla gamerules + plant random ticks ----------
+//
+// Live gamerule reads go through `gamerule_live_value`: the atomic registry
+// `/gamerule` writes first, then the stored command map for rules that keep
+// no dedicated atomic — the same state the command reports and mutates.
+#[cfg_attr(not(test), allow(dead_code))]
+fn gamerule_live_value(name: &str) -> i32 {
+    gamerule_atomic_value(name)
+        .or_else(|| command_gamerules().lock().unwrap().get(name).copied())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CactusTickInput {
+    /// `CactusBlock.AGE` 0..=15; a tick landing on 15 grows the segment above.
+    age: u8,
+    /// Cactus cells in this column including the ticked one.
+    column_height: u8,
+    /// The growth cell above is air.
+    space_above: bool,
+    /// A solid block horizontally touches the growth cell: `canSurvive`
+    /// rejects a cactus there, so the tick refuses to grow into it.
+    solid_touching_growth: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CactusTickResult {
+    NoChange,
+    /// `age` advances toward the 15 that extends the column.
+    AdvanceAge(u8),
+    /// The cell above becomes a fresh cactus; this block's age resets to 0.
+    GrowSegment,
+}
+
+/// `CactusBlock.randomTick`: age counts to 15, then a segment grows into the
+/// air above while the column stays under the vanilla 3-block cap and no
+/// solid block touches the new cell sideways.
+fn eval_cactus_random_tick(input: CactusTickInput) -> CactusTickResult {
+    if !input.space_above || input.column_height >= 3 || input.solid_touching_growth {
+        return CactusTickResult::NoChange;
+    }
+    if input.age >= 15 {
+        CactusTickResult::GrowSegment
+    } else {
+        CactusTickResult::AdvanceAge(input.age + 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BambooLeaves {
+    None,
+    Small,
+    Large,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl BambooLeaves {
+    fn prop(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Small => "small",
+            Self::Large => "large",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BambooTickInput {
+    is_sapling: bool,
+    /// `BambooStalkBlock.STAGE`: only a stage-0 stalk may grow.
+    stage: u8,
+    /// Stalk cells in the column including this one; the sapling counts as 1.
+    column_height: u8,
+    /// `Level.getRawBrightness(pos.above(), 0)`: growth needs at least 9.
+    light_above: u8,
+    /// The growth cell above is air (a sapling reuses its own cell instead).
+    space_above: bool,
+    /// Raw roll; vanilla draws `random.nextInt(3)` and grows on 0.
+    random_roll: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BambooTickResult {
+    NoChange,
+    /// `BambooSaplingBlock` becomes a bamboo stalk with `leaves=small`.
+    SaplingToStalk,
+    /// A new stalk goes above with `leaves=large`; the old top relaxes to
+    /// `leaves=small`.
+    GrowStalk,
+}
+
+/// `BambooSaplingBlock`/`BambooStalkBlock.randomTick`: a one-in-three roll
+/// with light 9+ above turns the sapling into a stalk or extends the column
+/// up to the vanilla 16-block cap.
+fn eval_bamboo_random_tick(input: BambooTickInput) -> BambooTickResult {
+    if input.random_roll % 3 != 0 || input.light_above < 9 {
+        return BambooTickResult::NoChange;
+    }
+    if input.is_sapling {
+        return BambooTickResult::SaplingToStalk;
+    }
+    if input.stage != 0 || !input.space_above || input.column_height >= 16 {
+        return BambooTickResult::NoChange;
+    }
+    BambooTickResult::GrowStalk
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KelpTickInput {
+    /// `KelpBlock` head `AGE` 0..=25.
+    age: u8,
+    /// The cell above holds a water source — the only cell kelp grows into.
+    above_is_water_source: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KelpTickResult {
+    NoChange,
+    /// The water above becomes a kelp head of `new_age`; the old head turns
+    /// into the ageless `kelp_plant` body.
+    GrowIntoWater { new_age: u8 },
+}
+
+/// `KelpPlantBlock`/`GrowingPlantHeadBlock.randomTick`: kelp stops aging at
+/// 25 and only ever grows into a water source cell.
+fn eval_kelp_random_tick(input: KelpTickInput) -> KelpTickResult {
+    if input.age >= 25 || !input.above_is_water_source {
+        return KelpTickResult::NoChange;
+    }
+    KelpTickResult::GrowIntoWater {
+        new_age: input.age + 1,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VineTickInput {
+    /// `doVinesSpread` gamerule; vanilla gates the entire spread pass on it.
+    spread_allowed: bool,
+    /// Raw roll; vanilla draws `random.nextInt(4)` and spreads on 0.
+    random_roll: u8,
+    /// Air below — vines creep downward without needing a face to attach to.
+    space_below: bool,
+    /// A horizontally adjacent air cell has a solid face a vine can claim.
+    side_can_attach: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VineTickResult {
+    NoChange,
+    /// Extend the vine into the air below.
+    SpreadDown,
+    /// Claim one face of a horizontally adjacent air cell.
+    SpreadSide,
+}
+
+/// `VineBlock.randomTick` under the `doVinesSpread` gate: on a one-in-four
+/// roll the vine creeps down first, else onto a neighboring face.
+fn eval_vine_random_tick(input: VineTickInput) -> VineTickResult {
+    if !input.spread_allowed || input.random_roll % 4 != 0 {
+        return VineTickResult::NoChange;
+    }
+    if input.space_below {
+        VineTickResult::SpreadDown
+    } else if input.side_can_attach {
+        VineTickResult::SpreadSide
+    } else {
+        VineTickResult::NoChange
+    }
+}
+
+/// The vine faces 1.21.1's `VineBlock` state carries.
+#[cfg_attr(not(test), allow(dead_code))]
+const VINE_SIDES: &[(&str, (i32, i32))] = &[
+    ("north", (0, -1)),
+    ("east", (1, 0)),
+    ("south", (0, 1)),
+    ("west", (-1, 0)),
+];
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn cactus_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
+    // Only the column top may grow: vanilla requires `pos.above()` to be air,
+    // so a tick on a middle segment does nothing at all.
+    let mut height = 1u8;
+    while height < 3
+        && reg.name_of(block_at_dim(dim, x, y - i32::from(height), z)) == "minecraft:cactus"
+    {
+        height += 1;
+    }
+    let age = reg
+        .get_prop(st, "age")
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(0);
+    let solid_touching = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        .iter()
+        .any(|(dx, dz)| {
+            reg.is_collision_shape_full_block(block_at_dim(dim, x + dx, y + 1, z + dz))
+        });
+    match eval_cactus_random_tick(CactusTickInput {
+        age,
+        column_height: height,
+        space_above: reg.is_air(block_at_dim(dim, x, y + 1, z)),
+        solid_touching_growth: solid_touching,
+    }) {
+        CactusTickResult::NoChange => {}
+        CactusTickResult::AdvanceAge(next) => {
+            set_block_dim(dim, x, y, z, reg.with_prop(st, "age", &next.to_string()));
+        }
+        CactusTickResult::GrowSegment => {
+            let fresh = reg.state_of("minecraft:cactus", None);
+            set_block_dim(dim, x, y + 1, z, fresh);
+            note_block_update_dim(dim, x, y + 1, z, fresh);
+            set_block_dim(dim, x, y, z, reg.with_prop(st, "age", "0"));
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn bamboo_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
+    let is_sapling = reg.name_of(st) == "minecraft:bamboo_sapling";
+    let mut height = 1u8;
+    if !is_sapling {
+        while height < 16
+            && reg.name_of(block_at_dim(dim, x, y - i32::from(height), z))
+                == "minecraft:bamboo"
+        {
+            height += 1;
+        }
+    }
+    let stage = reg
+        .get_prop(st, "stage")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let light_above = if random_tick_sky_exposed(dim, x, y + 1, z) {
+        15
+    } else {
+        random_tick_block_light(reg, dim, x, y + 1, z)
+    };
+    match eval_bamboo_random_tick(BambooTickInput {
+        is_sapling,
+        stage,
+        column_height: height,
+        light_above,
+        space_above: reg.is_air(block_at_dim(dim, x, y + 1, z)),
+        random_roll: world_rng::next_below(3) as u8,
+    }) {
+        BambooTickResult::NoChange => {}
+        BambooTickResult::SaplingToStalk => {
+            let stalk = reg.with_prop(
+                reg.state_of("minecraft:bamboo", None),
+                "leaves",
+                BambooLeaves::Small.prop(),
+            );
+            set_block_dim(dim, x, y, z, stalk);
+            note_block_update_dim(dim, x, y, z, stalk);
+        }
+        BambooTickResult::GrowStalk => {
+            let top = reg.with_prop(
+                reg.state_of("minecraft:bamboo", None),
+                "leaves",
+                BambooLeaves::Large.prop(),
+            );
+            set_block_dim(dim, x, y + 1, z, top);
+            note_block_update_dim(dim, x, y + 1, z, top);
+            set_block_dim(
+                dim,
+                x,
+                y,
+                z,
+                reg.with_prop(st, "leaves", BambooLeaves::Small.prop()),
+            );
+            // Vanilla's leaf gradient: the new top is `large`, the stalk
+            // under it `small`, and every deeper stalk `none`.
+            let below = block_at_dim(dim, x, y - 1, z);
+            if reg.name_of(below) == "minecraft:bamboo" {
+                set_block_dim(
+                    dim,
+                    x,
+                    y - 1,
+                    z,
+                    reg.with_prop(below, "leaves", BambooLeaves::None.prop()),
+                );
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn kelp_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
+    let age = reg
+        .get_prop(st, "age")
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(0);
+    let above_is_water_source = fluid_from_block(block_at_dim(dim, x, y + 1, z))
+        .is_some_and(|f| f.kind == flowing_fluid::Kind::Water && f.source());
+    match eval_kelp_random_tick(KelpTickInput {
+        age,
+        above_is_water_source,
+    }) {
+        KelpTickResult::NoChange => {}
+        KelpTickResult::GrowIntoWater { new_age } => {
+            let head = reg.with_prop(
+                reg.state_of("minecraft:kelp", None),
+                "age",
+                &new_age.to_string(),
+            );
+            set_block_dim(dim, x, y + 1, z, head);
+            note_block_update_dim(dim, x, y + 1, z, head);
+            set_block_dim(dim, x, y, z, reg.state_of("minecraft:kelp_plant", None));
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn vine_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
+    let space_below = reg.is_air(block_at_dim(dim, x, y - 1, z));
+    let side = VINE_SIDES.iter().find(|(_, (dx, dz))| {
+        reg.is_air(block_at_dim(dim, x + dx, y, z + dz))
+            && reg.is_collision_shape_full_block(block_at_dim(dim, x + dx * 2, y, z + dz * 2))
+    });
+    match eval_vine_random_tick(VineTickInput {
+        spread_allowed: gamerule_live_value("doVinesSpread") != 0,
+        random_roll: world_rng::next_below(4) as u8,
+        space_below,
+        side_can_attach: side.is_some(),
+    }) {
+        VineTickResult::NoChange => {}
+        VineTickResult::SpreadDown => {
+            set_block_dim(dim, x, y - 1, z, st);
+            note_block_update_dim(dim, x, y - 1, z, st);
+        }
+        VineTickResult::SpreadSide => {
+            let (face, (dx, dz)) = side.unwrap();
+            let mut grown = reg.state_of("minecraft:vine", None);
+            // The claimed face is the side of the new cell touching the solid
+            // neighbor behind it — the opposite face from the spread direction.
+            let opposite = VINE_SIDES
+                .iter()
+                .find(|(_, d)| *d == (-dx, -dz))
+                .map(|(name, _)| *name)
+                .unwrap_or(face);
+            grown = reg.with_prop(grown, opposite, "true");
+            set_block_dim(dim, x + dx, y, z + dz, grown);
+            note_block_update_dim(dim, x + dx, y, z + dz, grown);
+        }
+    }
+}
+
+/// The P2 random-tick arm: cactus, bamboo, kelp and vines dispatch here,
+/// matching the name-based arms `on_random_tick_dim` already runs. Returns
+/// `true` when the block name was claimed by one of the four handlers.
+#[cfg_attr(not(test), allow(dead_code))]
+fn p2_plant_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) -> bool {
+    match reg.name_of(st) {
+        "minecraft:cactus" => cactus_random_tick(reg, dim, x, y, z, st),
+        "minecraft:bamboo" | "minecraft:bamboo_sapling" => {
+            bamboo_random_tick(reg, dim, x, y, z, st)
+        }
+        "minecraft:kelp" => kelp_random_tick(reg, dim, x, y, z, st),
+        "minecraft:vine" => vine_random_tick(reg, dim, x, y, z, st),
+        _ => return false,
+    }
+    true
+}
+
+// ---- Explosion drop decay + world griefing gates ----
+
+/// Vanilla `Explosion.BlockInteraction` sources: which `*ExplosionDropDecay`
+/// rule chooses between `DESTROY` (everything drops) and `DESTROY_WITH_DECAY`
+/// (each broken block drops with probability `1 / power`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum ExplosionDropKind {
+    /// `blockExplosionDropDecay` — beds, respawn anchors, etc.
+    Block,
+    /// `mobExplosionDropDecay` — creepers, ghasts, withers, end crystals.
+    Mob,
+    /// `tntExplosionDropDecay` — primed TNT (vanilla default: off).
+    Tnt,
+}
+
+/// Live read of the drop-decay rule for an explosion source.
+#[cfg_attr(not(test), allow(dead_code))]
+fn explosion_drop_decay_enabled(kind: ExplosionDropKind) -> bool {
+    gamerule_live_value(match kind {
+        ExplosionDropKind::Block => "blockExplosionDropDecay",
+        ExplosionDropKind::Mob => "mobExplosionDropDecay",
+        ExplosionDropKind::Tnt => "tntExplosionDropDecay",
+    }) != 0
+}
+
+/// `Block.dropResources` inside an explosion: `DESTROY` always drops, while
+/// `DESTROY_WITH_DECAY` rolls `random < 1 / power` per broken block.
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_explosion_block_drop(drop_decay: bool, power: f32, roll_0_to_1: f32) -> bool {
+    !drop_decay || roll_0_to_1 < 1.0 / power.max(1.0)
+}
+
+/// `mobGriefing` for the world-modification arm of explosions, block carries
+/// and crop griefing — the same atomic `/gamerule` writes and the live mob
+/// explosion path reads.
+#[cfg_attr(not(test), allow(dead_code))]
+fn world_griefing_enabled() -> bool {
+    gamerule_live_value("mobGriefing") != 0
+}
+
+// ---- Advancement rewards ----
+
+/// The `rewards` object of a vanilla advancement JSON, distilled to the fields
+/// the server can execute: experience points, recipe ids to unlock, loot
+/// tables to roll into drops, and an optional function to run as the player.
+/// Kept `const`-friendly so `AdvancementDefinition` can carry it inline.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct AdvancementRewardSpec {
+    experience: i32,
+    recipes: &'static [&'static str],
+    loot: &'static [&'static str],
+    function: Option<&'static str>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl AdvancementRewardSpec {
+    fn to_rewards(self) -> AdvancementRewards {
+        AdvancementRewards {
+            experience: self.experience,
+            recipes: self.recipes.iter().map(|id| (*id).to_string()).collect(),
+            loot: self.loot.iter().map(|id| (*id).to_string()).collect(),
+            function: self.function.map(str::to_string),
+        }
+    }
+}
+
+/// The `rewards` blocks of the built-in story advancements, mirroring
+/// `data/minecraft/advancement/story/*.json`: milestone grants unlock the
+/// matching recipe sets and pay the vanilla experience amounts.
+#[cfg_attr(not(test), allow(dead_code))]
+fn advancement_reward_spec(id: &str) -> Option<AdvancementRewardSpec> {
+    const STONE_RECIPES: &[&str] = &[
+        "minecraft:stone_pickaxe",
+        "minecraft:stone_axe",
+        "minecraft:stone_shovel",
+        "minecraft:stone_hoe",
+        "minecraft:stone_sword",
+        "minecraft:furnace",
+    ];
+    const IRON_RECIPES: &[&str] = &[
+        "minecraft:iron_pickaxe",
+        "minecraft:iron_axe",
+        "minecraft:iron_shovel",
+        "minecraft:iron_hoe",
+        "minecraft:iron_sword",
+        "minecraft:iron_helmet",
+        "minecraft:iron_chestplate",
+        "minecraft:iron_leggings",
+        "minecraft:iron_boots",
+        "minecraft:bucket",
+        "minecraft:shears",
+        "minecraft:shield",
+        "minecraft:flint_and_steel",
+        "minecraft:compass",
+    ];
+    Some(match id {
+        "minecraft:story/mine_stone" => AdvancementRewardSpec {
+            experience: 0,
+            recipes: STONE_RECIPES,
+            loot: &[],
+            function: None,
+        },
+        "minecraft:story/smelt_iron" => AdvancementRewardSpec {
+            experience: 0,
+            recipes: IRON_RECIPES,
+            loot: &[],
+            function: None,
+        },
+        "minecraft:story/obtain_armor"
+        | "minecraft:story/lava_bucket"
+        | "minecraft:story/form_obsidian"
+        | "minecraft:story/enter_the_nether" => AdvancementRewardSpec {
+            experience: 100,
+            recipes: &[],
+            loot: &[],
+            function: None,
+        },
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -5216,5 +5773,572 @@ mod p1a_random_tick_and_gamerule_tests {
             );
         }
         drop(rules);
+    }
+}
+
+/// P2 parity tests: the plant random ticks, the remaining gamerule reads and
+/// the advancement rewards grant path.
+#[cfg(test)]
+mod p2_parity_world_tests {
+    use super::*;
+
+    /// Records the original state of every cell a test writes and restores
+    /// them on drop, so a failed assertion cannot leak world edits into the
+    /// next test under the world lock.
+    struct Cells(Vec<(i32, i32, i32, u32)>);
+    impl Cells {
+        fn new() -> Self {
+            Cells(Vec::new())
+        }
+        fn set(&mut self, x: i32, y: i32, z: i32, st: u32) {
+            self.0.push((x, y, z, block_at(x, y, z)));
+            set_block(x, y, z, st);
+        }
+        fn record(&mut self, x: i32, y: i32, z: i32) {
+            self.0.push((x, y, z, block_at(x, y, z)));
+        }
+    }
+    impl std::ops::Drop for Cells {
+        fn drop(&mut self) {
+            for (x, y, z, st) in self.0.drain(..).rev() {
+                set_block(x, y, z, st);
+            }
+        }
+    }
+
+    /// Restores gamerule atomics a test changed, on every exit path.
+    struct Rules(Vec<(&'static str, i32)>);
+    impl Rules {
+        fn take(names: &[&'static str]) -> Self {
+            Rules(
+                names
+                    .iter()
+                    .map(|name| (*name, gamerule_atomic_value(name).unwrap_or(0)))
+                    .collect(),
+            )
+        }
+    }
+    impl std::ops::Drop for Rules {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                gamerule_atomic_store(name, value);
+            }
+        }
+    }
+
+    /// Restores stored-only gamerule map entries a test changed.
+    struct StoredRules(Vec<(&'static str, i32)>);
+    impl StoredRules {
+        fn take(names: &[&'static str]) -> Self {
+            let map = command_gamerules().lock().unwrap();
+            StoredRules(
+                names
+                    .iter()
+                    .map(|name| (*name, map.get(*name).copied().unwrap_or(0)))
+                    .collect(),
+            )
+        }
+        fn set(&self, name: &'static str, value: i32) {
+            command_gamerules().lock().unwrap().insert(name, value);
+        }
+    }
+    impl std::ops::Drop for StoredRules {
+        fn drop(&mut self) {
+            let mut map = command_gamerules().lock().unwrap();
+            for (name, value) in self.0.drain(..) {
+                map.insert(name, value);
+            }
+        }
+    }
+
+    fn prop(reg: &crate::block_registry::BReg, st: u32, key: &str) -> Option<String> {
+        reg.get_prop(st, key)
+    }
+
+    /// The dummy-client fixture the live tests use elsewhere, trimmed to what
+    /// the reward and gamerule paths touch.
+    fn test_client(name: &str, eid: i32, uuid: [u8; 16]) -> Arc<Client> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let _accepted = listener.accept().unwrap();
+        Arc::new(Client {
+            eid,
+            uuid,
+            name: name.to_string(),
+            player_attack_damage_id: None,
+            pos: Mutex::new((0.5, 65.0, 0.5, 0.0, 0.0, true)),
+            teleport: Mutex::new(Default::default()),
+            hp: Mutex::new(20.0),
+            sock: Mutex::new(stream),
+            inv: Mutex::new(HashMap::new()),
+            cursor: Mutex::new((0, 0, Vec::new())),
+            drag: Mutex::new((0, Vec::new())),
+            open_chest: Mutex::new(None),
+            chest_sync: Mutex::new(None),
+            open_furnace: Mutex::new(None),
+            craft: Mutex::new(HashMap::new()),
+            craft9: Mutex::new(HashMap::new()),
+            open_table: Mutex::new(false),
+            open_merchant: Mutex::new(false),
+            trade_sel: Mutex::new(0),
+            merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
+            bow_draw: Mutex::new(None),
+            dig: Mutex::new(None),
+            eat_start: Mutex::new(None),
+            blocking: Mutex::new(false),
+            sprinting: Mutex::new(false),
+            sneaking: Mutex::new(false),
+            last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            fall_fly: Mutex::new(false),
+            invulnerable: Mutex::new(0),
+            last_hurt: Mutex::new(0.0),
+            shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            absorb: Mutex::new(0.0),
+            pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            xp: Mutex::new(0),
+            skin: Mutex::new(None),
+            seen: Mutex::new(HashSet::new()),
+            chunks: Mutex::new(HashSet::from([(-1, -1), (-1, 0), (0, -1), (0, 0)])),
+            chunk_ack: Mutex::new(ChunkFeedback::new(1)),
+            gen_sources: Mutex::new(GenSources::default()),
+            gm: Mutex::new(0),
+            fall_from: Mutex::new(65.0),
+            food: Mutex::new(20),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            armor_pts: Mutex::new(0),
+            sat: Mutex::new(5.0),
+            walk_acc: Mutex::new(0.0),
+            lastp: Mutex::new((0.5, 65.0, 0.5)),
+            spawn_pt: Mutex::new(None),
+            dim: Mutex::new(DimId::Overworld),
+            spawn_dim: Mutex::new(DimId::Overworld),
+            view: Mutex::new(2),
+            in_portal: Mutex::new(false),
+            portal_at: Mutex::new(None),
+            held: Mutex::new(0),
+            effs: Mutex::new(Vec::new()),
+            lod_v1_enabled: AtomicBool::new(false),
+            underground_revealed: AtomicBool::new(false),
+            sleeping: Mutex::new(None),
+            inv_state_id: AtomicI32::new(0),
+        })
+    }
+
+    #[test]
+    fn p2_parity_cactus_age_growth_height_cap_and_side_block_check() {
+        let eval = |age: u8, height: u8, space: bool, solid: bool| {
+            eval_cactus_random_tick(CactusTickInput {
+                age,
+                column_height: height,
+                space_above: space,
+                solid_touching_growth: solid,
+            })
+        };
+        assert_eq!(eval(0, 1, true, false), CactusTickResult::AdvanceAge(1));
+        assert_eq!(eval(14, 1, true, false), CactusTickResult::AdvanceAge(15));
+        assert_eq!(eval(15, 1, true, false), CactusTickResult::GrowSegment);
+        assert_eq!(eval(15, 3, true, false), CactusTickResult::NoChange);
+        assert_eq!(eval(15, 2, true, true), CactusTickResult::NoChange);
+        assert_eq!(eval(15, 1, false, false), CactusTickResult::NoChange);
+
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let cactus = reg.state_of("minecraft:cactus", None);
+        if reg.name_of(cactus) != "minecraft:cactus" {
+            return; // registry without cactus: evaluator assertions above still ran
+        }
+        let sand = reg.state_of("minecraft:sand", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        let mut cells = Cells::new();
+
+        // One cactus at age 15 grows a fresh segment and resets its age.
+        cells.set(0, 99, 0, sand);
+        cells.set(0, 100, 0, reg.with_prop(cactus, "age", "15"));
+        for y in 100..=102 {
+            cells.record(0, y, 0);
+        }
+        cactus_random_tick(reg, DimId::Overworld, 0, 100, 0, block_at(0, 100, 0));
+        assert_eq!(reg.name_of(block_at(0, 101, 0)), "minecraft:cactus");
+        assert_eq!(prop(reg, block_at(0, 100, 0), "age").as_deref(), Some("0"));
+
+        // A three-high column is capped: no fourth segment.
+        cells.set(4, 99, 0, sand);
+        for y in 100..=102 {
+            cells.set(4, y, 0, reg.with_prop(cactus, "age", "15"));
+        }
+        cells.record(4, 103, 0);
+        cactus_random_tick(reg, DimId::Overworld, 4, 100, 0, block_at(4, 100, 0));
+        assert!(
+            reg.is_air(block_at(4, 103, 0)),
+            "height-3 cactus must not grow a fourth segment"
+        );
+
+        // A solid block touching the growth cell sideways blocks the segment.
+        cells.set(8, 99, 0, sand);
+        cells.set(8, 100, 0, reg.with_prop(cactus, "age", "15"));
+        cells.set(9, 101, 0, stone);
+        cells.record(8, 101, 0);
+        cactus_random_tick(reg, DimId::Overworld, 8, 100, 0, block_at(8, 100, 0));
+        assert!(
+            reg.is_air(block_at(8, 101, 0)),
+            "a solid side neighbor at growth level must block cactus growth"
+        );
+    }
+
+    #[test]
+    fn p2_parity_bamboo_sapling_stalk_growth_height_cap_and_leaves() {
+        let eval = |is_sapling: bool, stage: u8, height: u8, light: u8, space: bool, roll: u8| {
+            eval_bamboo_random_tick(BambooTickInput {
+                is_sapling,
+                stage,
+                column_height: height,
+                light_above: light,
+                space_above: space,
+                random_roll: roll,
+            })
+        };
+        assert_eq!(eval(true, 0, 1, 15, true, 0), BambooTickResult::SaplingToStalk);
+        assert_eq!(eval(true, 0, 1, 8, true, 0), BambooTickResult::NoChange);
+        assert_eq!(eval(true, 0, 1, 15, true, 1), BambooTickResult::NoChange);
+        assert_eq!(eval(false, 0, 4, 15, true, 3), BambooTickResult::GrowStalk);
+        assert_eq!(eval(false, 0, 16, 15, true, 0), BambooTickResult::NoChange);
+        assert_eq!(eval(false, 1, 4, 15, true, 0), BambooTickResult::NoChange);
+        assert_eq!(eval(false, 0, 4, 15, false, 0), BambooTickResult::NoChange);
+
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let sapling = reg.state_of("minecraft:bamboo_sapling", None);
+        let bamboo = reg.state_of("minecraft:bamboo", None);
+        if reg.name_of(sapling) != "minecraft:bamboo_sapling"
+            || reg.name_of(bamboo) != "minecraft:bamboo"
+        {
+            return;
+        }
+        let mut cells = Cells::new();
+
+        // High above the surface so the growth cell is sky-lit; a sapling
+        // turns into a small-leaved stalk on the one-in-three roll.
+        cells.set(0, 149, 0, reg.state_of("minecraft:dirt", None));
+        cells.set(0, 150, 0, sapling);
+        let mut grew = false;
+        for _ in 0..64 {
+            bamboo_random_tick(reg, DimId::Overworld, 0, 150, 0, block_at(0, 150, 0));
+            if reg.name_of(block_at(0, 150, 0)) == "minecraft:bamboo" {
+                grew = true;
+                break;
+            }
+        }
+        assert!(grew, "sapling must transition to a bamboo stalk");
+        assert_eq!(prop(reg, block_at(0, 150, 0), "leaves").as_deref(), Some("small"));
+
+        // A stage-0 stalk grows a new top with leaves=large; the old top
+        // relaxes to leaves=small.
+        cells.set(4, 149, 0, reg.state_of("minecraft:dirt", None));
+        cells.set(4, 150, 0, reg.with_prop(bamboo, "stage", "0"));
+        let mut grew = false;
+        for _ in 0..64 {
+            bamboo_random_tick(reg, DimId::Overworld, 4, 150, 0, block_at(4, 150, 0));
+            if reg.name_of(block_at(4, 151, 0)) == "minecraft:bamboo" {
+                grew = true;
+                break;
+            }
+        }
+        assert!(grew, "a stage-0 stalk must grow a new top");
+        assert_eq!(prop(reg, block_at(4, 151, 0), "leaves").as_deref(), Some("large"));
+        assert_eq!(prop(reg, block_at(4, 150, 0), "leaves").as_deref(), Some("small"));
+
+        // A 16-high column is capped.
+        cells.set(8, 149, 0, reg.state_of("minecraft:dirt", None));
+        for y in 135..=150 {
+            cells.set(8, y, 0, bamboo);
+        }
+        for _ in 0..64 {
+            bamboo_random_tick(reg, DimId::Overworld, 8, 150, 0, block_at(8, 150, 0));
+        }
+        assert!(
+            reg.is_air(block_at(8, 151, 0)),
+            "a 16-high bamboo column must not grow"
+        );
+    }
+
+    #[test]
+    fn p2_parity_kelp_grows_into_water_only_and_ages_out_at_25() {
+        let eval = |age: u8, water: bool| {
+            eval_kelp_random_tick(KelpTickInput {
+                age,
+                above_is_water_source: water,
+            })
+        };
+        assert_eq!(eval(0, true), KelpTickResult::GrowIntoWater { new_age: 1 });
+        assert_eq!(eval(24, true), KelpTickResult::GrowIntoWater { new_age: 25 });
+        assert_eq!(eval(25, true), KelpTickResult::NoChange);
+        assert_eq!(eval(0, false), KelpTickResult::NoChange);
+
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let kelp = reg.state_of("minecraft:kelp", None);
+        if reg.name_of(kelp) != "minecraft:kelp" {
+            return;
+        }
+        let water = reg.state_of("minecraft:water", None);
+        let mut cells = Cells::new();
+
+        // A young head under a water source grows; the old head becomes body.
+        cells.set(0, 100, 0, reg.with_prop(kelp, "age", "5"));
+        cells.set(0, 101, 0, water);
+        kelp_random_tick(reg, DimId::Overworld, 0, 100, 0, block_at(0, 100, 0));
+        assert_eq!(reg.name_of(block_at(0, 101, 0)), "minecraft:kelp");
+        assert_eq!(prop(reg, block_at(0, 101, 0), "age").as_deref(), Some("6"));
+
+        // Age 25 is the cap, and air above is not a growth cell.
+        cells.set(4, 100, 0, reg.with_prop(kelp, "age", "25"));
+        cells.set(4, 101, 0, water);
+        kelp_random_tick(reg, DimId::Overworld, 4, 100, 0, block_at(4, 100, 0));
+        assert_eq!(
+            reg.name_of(block_at(4, 101, 0)),
+            "minecraft:water",
+            "age-25 kelp must not grow"
+        );
+        cells.set(8, 100, 0, reg.with_prop(kelp, "age", "5"));
+        cells.record(8, 101, 0);
+        kelp_random_tick(reg, DimId::Overworld, 8, 100, 0, block_at(8, 100, 0));
+        assert!(
+            reg.is_air(block_at(8, 101, 0)),
+            "kelp must not grow into air"
+        );
+    }
+
+    #[test]
+    fn p2_parity_vine_spread_obeys_do_vines_spread() {
+        let eval = |allowed: bool, roll: u8, below: bool, side: bool| {
+            eval_vine_random_tick(VineTickInput {
+                spread_allowed: allowed,
+                random_roll: roll,
+                space_below: below,
+                side_can_attach: side,
+            })
+        };
+        assert_eq!(eval(false, 0, true, false), VineTickResult::NoChange);
+        assert_eq!(eval(true, 1, true, true), VineTickResult::NoChange);
+        assert_eq!(eval(true, 0, true, true), VineTickResult::SpreadDown);
+        assert_eq!(eval(true, 0, false, true), VineTickResult::SpreadSide);
+        assert_eq!(eval(true, 0, false, false), VineTickResult::NoChange);
+
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _rules = Rules::take(&["doVinesSpread"]);
+        let reg = crate::block_registry::breg().unwrap();
+        let vine = reg.state_of("minecraft:vine", None);
+        if reg.name_of(vine) != "minecraft:vine" {
+            return;
+        }
+        let mut cells = Cells::new();
+
+        // doVinesSpread=false: a hanging vine never creeps down.
+        gamerule_atomic_store("doVinesSpread", 0);
+        cells.set(0, 100, 0, vine);
+        cells.record(0, 99, 0);
+        for _ in 0..64 {
+            vine_random_tick(reg, DimId::Overworld, 0, 100, 0, block_at(0, 100, 0));
+        }
+        assert!(
+            reg.is_air(block_at(0, 99, 0)),
+            "doVinesSpread=false must block every spread attempt"
+        );
+
+        // doVinesSpread=true: the same vine creeps down on the one-in-four
+        // roll.
+        gamerule_atomic_store("doVinesSpread", 1);
+        let mut spread = false;
+        for _ in 0..64 {
+            vine_random_tick(reg, DimId::Overworld, 0, 100, 0, block_at(0, 100, 0));
+            if reg.name_of(block_at(0, 99, 0)) == "minecraft:vine" {
+                spread = true;
+                break;
+            }
+        }
+        assert!(spread, "doVinesSpread=true must let the vine creep down");
+    }
+
+    #[test]
+    fn p2_parity_plant_tick_driver_claims_only_the_four_blocks() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        // The driver claims the four P2 plants and nothing else; on a live
+        // cell it also performs the block's own tick.
+        for name in [
+            "minecraft:cactus",
+            "minecraft:bamboo",
+            "minecraft:bamboo_sapling",
+            "minecraft:kelp",
+            "minecraft:vine",
+        ] {
+            let st = reg.state_of(name, None);
+            if reg.name_of(st) != name {
+                continue;
+            }
+            assert!(
+                p2_plant_random_tick(reg, DimId::Overworld, 64, 200, 64, st),
+                "{name} must be claimed by the P2 random-tick arm"
+            );
+        }
+        let stone = reg.state_of("minecraft:stone", None);
+        assert!(
+            !p2_plant_random_tick(reg, DimId::Overworld, 64, 200, 64, stone),
+            "unrelated blocks must fall through to other dispatch arms"
+        );
+    }
+
+    #[test]
+    fn p2_parity_random_tick_dispatch_classifies_the_new_plants() {
+        let sections = [RandomTickSection {
+            chunk_x: 0,
+            section_y: 0,
+            chunk_z: 0,
+        }];
+        let names = [
+            "minecraft:cactus",
+            "minecraft:bamboo",
+            "minecraft:bamboo_sapling",
+            "minecraft:kelp",
+            "minecraft:vine",
+            "minecraft:stone",
+        ];
+        let mut index = 0usize;
+        let samples = eval_random_ticks(&sections, 6, 7, |_| {
+            let name = names[index % names.len()];
+            index += 1;
+            name.to_string()
+        });
+        let dispatches: Vec<RandomTickDispatch> =
+            samples.iter().map(|sample| sample.dispatch).collect();
+        assert_eq!(dispatches.len(), 6);
+        assert_eq!(dispatches[0], RandomTickDispatch::Cactus);
+        assert_eq!(dispatches[1], RandomTickDispatch::Bamboo);
+        assert_eq!(dispatches[2], RandomTickDispatch::Bamboo);
+        assert_eq!(dispatches[3], RandomTickDispatch::Kelp);
+        assert_eq!(dispatches[4], RandomTickDispatch::Vine);
+        assert_eq!(dispatches[5], RandomTickDispatch::Other);
+    }
+
+    #[test]
+    fn p2_parity_source_conversion_rules_stay_live() {
+        let _rules = Rules::take(&["waterSourceConversion", "lavaSourceConversion"]);
+        gamerule_atomic_store("waterSourceConversion", 0);
+        assert!(!source_conversion_enabled(flowing_fluid::Kind::Water));
+        gamerule_atomic_store("waterSourceConversion", 1);
+        assert!(source_conversion_enabled(flowing_fluid::Kind::Water));
+        gamerule_atomic_store("lavaSourceConversion", 1);
+        assert!(source_conversion_enabled(flowing_fluid::Kind::Lava));
+        gamerule_atomic_store("lavaSourceConversion", 0);
+        assert!(!source_conversion_enabled(flowing_fluid::Kind::Lava));
+        // And the unified live read agrees with the atomics.
+        gamerule_atomic_store("waterSourceConversion", 0);
+        assert_eq!(gamerule_live_value("waterSourceConversion"), 0);
+        gamerule_atomic_store("waterSourceConversion", 1);
+        assert_eq!(gamerule_live_value("waterSourceConversion"), 1);
+    }
+
+    #[test]
+    fn p2_parity_explosion_drop_decay_rules_and_roll() {
+        let _stored = StoredRules::take(&[
+            "blockExplosionDropDecay",
+            "mobExplosionDropDecay",
+            "tntExplosionDropDecay",
+        ]);
+        _stored.set("blockExplosionDropDecay", 0);
+        assert!(!explosion_drop_decay_enabled(ExplosionDropKind::Block));
+        _stored.set("blockExplosionDropDecay", 1);
+        assert!(explosion_drop_decay_enabled(ExplosionDropKind::Block));
+        _stored.set("mobExplosionDropDecay", 0);
+        assert!(!explosion_drop_decay_enabled(ExplosionDropKind::Mob));
+        _stored.set("tntExplosionDropDecay", 1);
+        assert!(explosion_drop_decay_enabled(ExplosionDropKind::Tnt));
+        _stored.set("tntExplosionDropDecay", 0);
+        assert!(!explosion_drop_decay_enabled(ExplosionDropKind::Tnt));
+
+        // DESTROY drops everything; DESTROY_WITH_DECAY rolls under 1/power.
+        assert!(eval_explosion_block_drop(false, 4.0, 0.99));
+        assert!(eval_explosion_block_drop(true, 4.0, 0.2));
+        assert!(!eval_explosion_block_drop(true, 4.0, 0.3));
+        assert!(eval_explosion_block_drop(true, 0.5, 0.99));
+    }
+
+    #[test]
+    fn p2_parity_world_griefing_rule_reads_the_live_atomic() {
+        let _rules = Rules::take(&["mobGriefing"]);
+        gamerule_atomic_store("mobGriefing", 0);
+        assert!(!world_griefing_enabled());
+        gamerule_atomic_store("mobGriefing", 1);
+        assert!(world_griefing_enabled());
+    }
+
+    #[test]
+    fn p2_parity_advancement_rewards_execute_on_the_completion_edge() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let client = test_client("reward_tester", 9777, [7u8; 16]);
+        let uuid = client.uuid;
+        {
+            clients().lock().unwrap().push(client);
+        }
+        struct RemoveClient(i32);
+        impl std::ops::Drop for RemoveClient {
+            fn drop(&mut self) {
+                clients().lock().unwrap().retain(|c| c.eid != self.0);
+                recipe_books().lock().unwrap().remove(&[7u8; 16]);
+            }
+        }
+        let _cleanup = RemoveClient(9777);
+
+        // The reward recipe ids exist in the live universe.
+        let spec = advancement_reward_spec("minecraft:story/mine_stone")
+            .expect("mine_stone carries recipe rewards");
+        for id in spec.recipes {
+            recipe_ids().lock().unwrap().insert((*id).to_string());
+        }
+
+        let mut tracker = AdvancementTracker::default();
+        tracker.grant_only("reward_tester", "minecraft:story/mine_stone", 0);
+        let book = recipe_books()
+            .lock()
+            .unwrap()
+            .get(&uuid)
+            .cloned()
+            .unwrap_or_default();
+        for id in spec.recipes {
+            assert!(
+                book.is_unlocked(id),
+                "grant completing mine_stone must unlock {id}"
+            );
+        }
+        // The completion edge is once-only: regranting a completed definition
+        // does not rerun rewards.
+        let mut second = AdvancementTracker::default();
+        second.grant_only("reward_tester", "minecraft:story/root", 0);
+        second.grant_only("reward_tester", "minecraft:story/mine_stone", 0);
+        let before = recipe_books()
+            .lock()
+            .unwrap()
+            .get(&uuid)
+            .cloned()
+            .unwrap_or_default()
+            .unlocked
+            .len();
+        second.grant_only("reward_tester", "minecraft:story/mine_stone", 0);
+        let after = recipe_books()
+            .lock()
+            .unwrap()
+            .get(&uuid)
+            .cloned()
+            .unwrap_or_default()
+            .unlocked
+            .len();
+        assert_eq!(before, after, "a second grant of the same advancement must not re-pay rewards");
     }
 }

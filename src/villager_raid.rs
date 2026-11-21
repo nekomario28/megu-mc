@@ -2205,19 +2205,299 @@ fn live_raid_step() {
     raids.retain(|(_, raid)| raid.state != RaidState::Stopped);
 }
 
+// ---------- P2: patrol / trader / warden / phantom spawner gamerules ----------
+//
+// Each gate reads `gamerule_live_value` (world_mechanisms.rs) — the same
+// atomic registry and stored command map `/gamerule` mutates.
+
+/// `PatrolSpawner`: one attempt every `12000 + rand(1200)` ticks, fires only
+/// from day 5 on during daytime, then a one-in-five roll.
+fn eval_patrol_spawn_attempt(day: u64, is_day: bool, roll_mod_5: u32) -> bool {
+    day >= 5 && is_day && roll_mod_5 % 5 == 0
+}
+
+/// `WanderingTraderSpawner`: each 24000-tick attempt raises the spawn chance
+/// by 25 (25 → 50 → 75) until a trader lands.
+fn eval_trader_spawn_attempt(spawn_chance: i32, roll_0_to_99: u32) -> bool {
+    (roll_0_to_99 % 100) < spawn_chance.max(0) as u32
+}
+
+/// `SculkShrieker`/`WardenSpawnTracker`: a `can_summon` shrieker summons the
+/// warden once the player's warning level reaches 4 — `doWardenSpawning`
+/// gates the whole arm.
+fn eval_warden_summon(spawning_enabled: bool, warning_level: u8) -> bool {
+    spawning_enabled && warning_level >= 4
+}
+
+/// `PhantomSpawner`: phantoms circle a player whose `time_since_rest` passed
+/// 72000 ticks (three full days), at night, above the surface under open sky.
+fn eval_insomnia_spawn(time_since_rest: u64, night: bool, above_surface: bool, sky_visible: bool) -> bool {
+    time_since_rest >= 72_000 && night && above_surface && sky_visible
+}
+
+#[derive(Default)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct SpecialSpawnState {
+    /// Next game tick a patrol attempt is due (`PatrolSpawner.nextTick`).
+    patrol_next: u64,
+    /// `WanderingTraderSpawner`: countdown within each 1200-tick slot.
+    trader_tick_delay: u32,
+    /// `WanderingTraderSpawner.spawnDelay`: 24000 ticks between attempts.
+    trader_spawn_delay: u32,
+    /// `WanderingTraderSpawner.spawnChance`: 25 → 50 → 75 while attempts fail.
+    trader_spawn_chance: i32,
+    /// Next game tick a phantom sweep is due (`PhantomSpawner.nextTick`).
+    insomnia_next: u64,
+    /// Per-player `Stats.CUSTOM.TIME_SINCE_REST` in game ticks.
+    time_since_rest: HashMap<VillageUuid, u64>,
+    /// Per-player shrieker warning level (`WardenSpawnTracker`), 0..4.
+    warden_warnings: HashMap<VillageUuid, u8>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn special_spawn_state() -> &'static Mutex<SpecialSpawnState> {
+    static STATE: OnceLock<Mutex<SpecialSpawnState>> = OnceLock::new();
+    STATE.get_or_init(Mutex::default)
+}
+
+/// Spawn one named mob at a position, the same way raid waves place raiders.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_spawn_named(dim: DimId, name: &str, pos: (f64, f64, f64, f32, f32)) -> Option<Arc<Mob>> {
+    let spec = entity_spec_by_name(name)?;
+    with_save_guard(|| {
+        let mut current = mobs().lock().unwrap();
+        if current.len() >= MOB_CAP {
+            return None;
+        }
+        let mob = new_live_mob(spec.id, dim, pos, spec.max_health, None);
+        push_natural_hostile(&mut current, mob.clone());
+        Some(mob)
+    })
+}
+
+/// `PatrolSpawner.spawnPatrolMember`: a five-pillager patrol placed on the
+/// surface 24-48 blocks out from the target player.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_spawn_patrol(dim: DimId, center: (f64, f64, f64)) {
+    for index in 0..5 {
+        let angle = index as f64 / 5.0 * std::f64::consts::TAU;
+        let radius = 24.0 + f64::from(world_rng::next_below(25));
+        let bx = (center.0 + angle.cos() * radius).floor() as i32;
+        let bz = (center.2 + angle.sin() * radius).floor() as i32;
+        let by = if dim == DimId::Overworld {
+            surface_y(bx, bz).floor() as i32
+        } else {
+            dim.min_y() + 64
+        };
+        let yaw = world_rng::next_below(360) as f32;
+        live_spawn_named(dim, "pillager", (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, yaw, 0.0));
+    }
+}
+
+/// `WanderingTraderSpawner`: the trader lands within 48 blocks of a player
+/// (ten position tries), trailed by two leashed trader llamas.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_spawn_trader(dim: DimId, center: (f64, f64, f64)) -> bool {
+    let mut spawned = None;
+    for _ in 0..10 {
+        let bx = (center.0 + f64::from(world_rng::next_below(97)) - 48.0).floor() as i32;
+        let bz = (center.2 + f64::from(world_rng::next_below(97)) - 48.0).floor() as i32;
+        let by = if dim == DimId::Overworld {
+            surface_y(bx, bz).floor() as i32
+        } else {
+            dim.min_y() + 64
+        };
+        let yaw = world_rng::next_below(360) as f32;
+        if live_spawn_named(
+            dim,
+            "wandering_trader",
+            (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, yaw, 0.0),
+        )
+        .is_some()
+        {
+            spawned = Some((bx, by, bz));
+            break;
+        }
+    }
+    let Some((bx, by, bz)) = spawned else {
+        return false;
+    };
+    for side in [-1.0, 1.0] {
+        live_spawn_named(
+            dim,
+            "trader_llama",
+            (bx as f64 + 0.5 + side, by as f64, bz as f64 + 0.5, 0.0, 0.0),
+        );
+    }
+    true
+}
+
+/// `PhantomSpawner`: phantoms spawn circling above a sleepless player.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_spawn_phantoms(dim: DimId, player_pos: (f64, f64, f64)) {
+    let count = 1 + world_rng::next_below(3);
+    for _ in 0..count {
+        let bx = (player_pos.0 + f64::from(world_rng::next_below(41)) - 20.0).floor() as i32;
+        let bz = (player_pos.2 + f64::from(world_rng::next_below(41)) - 20.0).floor() as i32;
+        let by = (player_pos.1 + f64::from(world_rng::next_below(11)) + 15.0).floor() as i32;
+        let yaw = world_rng::next_below(360) as f32;
+        live_spawn_named(dim, "phantom", (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, yaw, 0.0));
+    }
+}
+
+/// `WardenSpawnTracker.spawnWarden`: the warden emerges near the player that
+/// tripped the fourth shrieker warning.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_spawn_warden(dim: DimId, player_pos: (f64, f64, f64)) {
+    let bx = player_pos.0.floor() as i32;
+    let bz = player_pos.2.floor() as i32;
+    let by = if dim == DimId::Overworld {
+        surface_y(bx, bz).floor() as i32
+    } else {
+        dim.min_y() + 64
+    };
+    let yaw = world_rng::next_below(360) as f32;
+    live_spawn_named(dim, "warden", (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, yaw, 0.0));
+}
+
+/// Whether a `sculk_shrieker` with `can_summon=true` sits within 8 blocks of
+/// the player — vanilla's shrieker pickup range for warning accrual.
+#[cfg_attr(not(test), allow(dead_code))]
+fn can_summon_shrieker_near(dim: DimId, bx: i32, by: i32, bz: i32) -> bool {
+    let Some(reg) = crate::block_registry::breg() else {
+        return false;
+    };
+    for dx in -8i32..=8 {
+        for dy in -4i32..=4 {
+            for dz in -8i32..=8 {
+                let st = block_at_dim(dim, bx + dx, by + dy, bz + dz);
+                if reg.name_of(st) == "minecraft:sculk_shrieker"
+                    && reg.get_prop(st, "can_summon").as_deref() == Some("true")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The four special-spawner arms of `NaturalSpawner`'s host-side tick, run
+/// once per game tick alongside the raid logic. Every arm reads its gamerule
+/// live and spawns through the same `new_live_mob` path raid waves use.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_special_spawn_tick(clients: &[Arc<Client>]) {
+    let now = TICK.load(Ordering::Relaxed);
+    let world_time = WORLD_TIME.load(Ordering::Relaxed);
+    let mut state = special_spawn_state().lock().unwrap();
+    let overworld_players: Vec<(VillageUuid, (f64, f64, f64), bool)> = clients
+        .iter()
+        .filter(|client| !client.is_spectator())
+        .filter(|client| *client.dim.lock().unwrap() == DimId::Overworld)
+        .map(|client| {
+            let (x, y, z, ..) = *client.pos.lock().unwrap();
+            (
+                client.uuid,
+                (x, y, z),
+                client.sleeping.lock().unwrap().is_some(),
+            )
+        })
+        .collect();
+
+    // `time_since_rest` accrues whether or not phantoms are allowed; sleeping
+    // resets the stat exactly like vanilla's wake handling.
+    for (uuid, _, sleeping) in &overworld_players {
+        if *sleeping {
+            state.time_since_rest.insert(*uuid, 0);
+        } else {
+            *state.time_since_rest.entry(*uuid).or_default() += 1;
+        }
+    }
+
+    // `PatrolSpawner`: day 5+, daytime, one-in-five roll per attempt window.
+    if now >= state.patrol_next {
+        state.patrol_next = now + 12_000 + u64::from(world_rng::next_below(1200));
+        if gamerule_live_value("doPatrolSpawning") != 0 && !overworld_players.is_empty() {
+            let day = world_time / VILLAGER_DAY_TICKS;
+            let is_day = world_time % VILLAGER_DAY_TICKS < 12_300;
+            if eval_patrol_spawn_attempt(day, is_day, world_rng::next_below(5)) {
+                let pick = world_rng::next_below(overworld_players.len() as u32) as usize;
+                live_spawn_patrol(DimId::Overworld, overworld_players[pick].1);
+            }
+        }
+    }
+
+    // `WanderingTraderSpawner`: 1200-tick delay slots drain a 24000-tick
+    // spawn delay; each failed attempt raises the chance by 25 to a 75 cap.
+    if state.trader_tick_delay > 0 {
+        state.trader_tick_delay -= 1;
+    } else {
+        state.trader_tick_delay = 1200;
+        state.trader_spawn_delay = state.trader_spawn_delay.saturating_sub(1200);
+        if state.trader_spawn_delay == 0 {
+            state.trader_spawn_delay = 24_000;
+            if gamerule_live_value("doTraderSpawning") != 0 && !overworld_players.is_empty() {
+                state.trader_spawn_chance = (state.trader_spawn_chance + 25).min(75);
+                if eval_trader_spawn_attempt(state.trader_spawn_chance, world_rng::next_below(100))
+                {
+                    let pick =
+                        world_rng::next_below(overworld_players.len() as u32) as usize;
+                    if live_spawn_trader(DimId::Overworld, overworld_players[pick].1) {
+                        state.trader_spawn_chance = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    // `PhantomSpawner`: every ~1-2 minutes sweep each unslept player.
+    if now >= state.insomnia_next {
+        state.insomnia_next = now + (60 + u64::from(world_rng::next_below(60))) * 20;
+        if gamerule_live_value("doInsomnia") != 0 {
+            let night = {
+                let daytime = world_time % VILLAGER_DAY_TICKS;
+                (13_000..23_000).contains(&daytime)
+            };
+            for (uuid, pos, _) in &overworld_players {
+                let rest = state.time_since_rest.get(uuid).copied().unwrap_or(0);
+                let (bx, by, bz) = (pos.0.floor() as i32, pos.1.floor() as i32, pos.2.floor() as i32);
+                let above_surface = pos.1 > surface_y(bx, bz);
+                let sky_visible = by >= height_at_dim(DimId::Overworld, bx, bz);
+                if eval_insomnia_spawn(rest, night, above_surface, sky_visible) {
+                    live_spawn_phantoms(DimId::Overworld, *pos);
+                }
+            }
+        }
+    }
+
+    // `SculkShrieker` + `WardenSpawnTracker`: warning level 4 near a
+    // `can_summon` shrieker summons the warden. Warnings accrue on a
+    // twenty-tick cadence, matching the shrieker's own cooldown granularity.
+    if gamerule_live_value("doWardenSpawning") != 0 && now % 20 == 0 {
+        for (uuid, pos, _) in &overworld_players {
+            let (bx, by, bz) = (pos.0.floor() as i32, pos.1.floor() as i32, pos.2.floor() as i32);
+            if can_summon_shrieker_near(DimId::Overworld, bx, by, bz) {
+                let level = state.warden_warnings.entry(*uuid).or_default();
+                *level = (*level + 1).min(4);
+                if eval_warden_summon(true, *level) {
+                    state.warden_warnings.insert(*uuid, 0);
+                    live_spawn_warden(DimId::Overworld, *pos);
+                }
+            }
+        }
+    }
+}
+
 /// One game tick of live villager/raid work, called from `game_tick`. The
 /// `Villager` and `Raid` units keep their "once per game tick" contracts.
 #[cfg_attr(not(test), allow(dead_code))]
 fn villager_raid_tick() {
     live_villager_tick(TICK.load(Ordering::Relaxed));
-    if command_gamerules()
-        .lock()
-        .unwrap()
-        .get("disableRaids")
-        .copied()
-        .unwrap_or(0)
-        != 0
-    {
+    // Patrols, traders, wardens and phantoms are not raids — their gamerules
+    // gate them individually inside the special-spawn tick.
+    live_special_spawn_tick(&client_snapshot());
+    // `disableRaids` reads the same atomic `/gamerule` writes.
+    if gr_disable_raids() {
         return;
     }
     live_raid_omen_tick();
@@ -3788,6 +4068,198 @@ mod villager_raid_tests {
         assert!(
             !second_wave.is_empty() && second_wave.iter().all(|eid| !first_wave.contains(eid)),
             "wave two should spawn a fresh set of live raider mobs"
+        );
+    }
+}
+
+/// P2 parity tests: the special-spawner gamerules and the raid gate's live
+/// atomic read.
+#[cfg(test)]
+mod p2_parity_village_tests {
+    use super::*;
+
+    /// Restores gamerule atomics a test changed, on every exit path.
+    struct Rules(Vec<(&'static str, i32)>);
+    impl Rules {
+        fn take(names: &[&'static str]) -> Self {
+            Rules(
+                names
+                    .iter()
+                    .map(|name| (*name, gamerule_atomic_value(name).unwrap_or(0)))
+                    .collect(),
+            )
+        }
+    }
+    impl std::ops::Drop for Rules {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                gamerule_atomic_store(name, value);
+            }
+        }
+    }
+
+    /// Restores stored-only gamerule map entries a test changed.
+    struct StoredRules(Vec<(&'static str, i32)>);
+    impl StoredRules {
+        fn take(names: &[&'static str]) -> Self {
+            let map = command_gamerules().lock().unwrap();
+            StoredRules(
+                names
+                    .iter()
+                    .map(|name| (*name, map.get(*name).copied().unwrap_or(0)))
+                    .collect(),
+            )
+        }
+        fn set(&self, name: &'static str, value: i32) {
+            command_gamerules().lock().unwrap().insert(name, value);
+        }
+    }
+    impl std::ops::Drop for StoredRules {
+        fn drop(&mut self) {
+            let mut map = command_gamerules().lock().unwrap();
+            for (name, value) in self.0.drain(..) {
+                map.insert(name, value);
+            }
+        }
+    }
+
+    #[test]
+    fn p2_parity_disable_raids_reads_the_live_atomic() {
+        let _rules = Rules::take(&["disableRaids"]);
+        gamerule_atomic_store("disableRaids", 1);
+        assert!(gr_disable_raids(), "the raid gate must read the atomic /gamerule writes");
+        gamerule_atomic_store("disableRaids", 0);
+        assert!(!gr_disable_raids());
+    }
+
+    #[test]
+    fn p2_parity_patrol_spawn_needs_day_five_daytime_roll_and_rule() {
+        assert!(!eval_patrol_spawn_attempt(4, true, 0), "patrols wait for day 5");
+        assert!(!eval_patrol_spawn_attempt(5, false, 0), "patrols spawn in daylight");
+        assert!(!eval_patrol_spawn_attempt(5, true, 3), "the one-in-five roll gates");
+        assert!(eval_patrol_spawn_attempt(5, true, 0));
+        assert!(eval_patrol_spawn_attempt(120, true, 10));
+
+        let _stored = StoredRules::take(&["doPatrolSpawning"]);
+        _stored.set("doPatrolSpawning", 0);
+        assert_eq!(gamerule_live_value("doPatrolSpawning"), 0);
+        _stored.set("doPatrolSpawning", 1);
+        assert_eq!(gamerule_live_value("doPatrolSpawning"), 1);
+    }
+
+    #[test]
+    fn p2_parity_trader_spawn_chance_progression_and_rule() {
+        assert!(eval_trader_spawn_attempt(25, 24));
+        assert!(!eval_trader_spawn_attempt(25, 25));
+        assert!(eval_trader_spawn_attempt(75, 74));
+        assert!(!eval_trader_spawn_attempt(75, 99));
+        assert!(!eval_trader_spawn_attempt(0, 0), "a zero chance never spawns");
+
+        let _stored = StoredRules::take(&["doTraderSpawning"]);
+        _stored.set("doTraderSpawning", 0);
+        assert_eq!(gamerule_live_value("doTraderSpawning"), 0);
+        _stored.set("doTraderSpawning", 1);
+        assert_eq!(gamerule_live_value("doTraderSpawning"), 1);
+    }
+
+    #[test]
+    fn p2_parity_warden_summon_needs_warning_four_and_rule() {
+        assert!(!eval_warden_summon(true, 0));
+        assert!(!eval_warden_summon(true, 3), "warnings 0-3 never summon");
+        assert!(eval_warden_summon(true, 4), "warning level 4 summons the warden");
+        assert!(!eval_warden_summon(false, 4), "doWardenSpawning=false blocks the summon");
+
+        let _stored = StoredRules::take(&["doWardenSpawning"]);
+        _stored.set("doWardenSpawning", 0);
+        assert_eq!(gamerule_live_value("doWardenSpawning"), 0);
+        _stored.set("doWardenSpawning", 1);
+        assert_eq!(gamerule_live_value("doWardenSpawning"), 1);
+    }
+
+    #[test]
+    fn p2_parity_insomnia_needs_three_days_night_and_open_sky() {
+        assert!(!eval_insomnia_spawn(71_999, true, true, true));
+        assert!(eval_insomnia_spawn(72_000, true, true, true));
+        assert!(!eval_insomnia_spawn(72_000, false, true, true), "daylight blocks phantoms");
+        assert!(!eval_insomnia_spawn(72_000, true, false, true));
+        assert!(!eval_insomnia_spawn(72_000, true, true, false), "cover blocks phantoms");
+
+        let _stored = StoredRules::take(&["doInsomnia"]);
+        _stored.set("doInsomnia", 0);
+        assert_eq!(gamerule_live_value("doInsomnia"), 0);
+        _stored.set("doInsomnia", 1);
+        assert_eq!(gamerule_live_value("doInsomnia"), 1);
+    }
+
+    /// The live gate: with `doInsomnia` off an insomniac player draws no
+    /// phantoms; with it on the same state spawns them. The phantom entity
+    /// must exist for the spawn arm to run.
+    #[test]
+    fn p2_parity_insomnia_live_gate_blocks_and_allows_phantoms() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let Some(phantom) = name_to_etype("phantom") else {
+            return;
+        };
+        let _stored = StoredRules::take(&["doInsomnia"]);
+        let old_clients = std::mem::take(&mut *clients().lock().unwrap());
+        let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
+        let old_time = WORLD_TIME.swap(15_000, Ordering::Relaxed);
+        let old_tick = TICK.swap(500_000, Ordering::Relaxed);
+        let old_spawn = {
+            let mut state = special_spawn_state().lock().unwrap();
+            std::mem::replace(
+                &mut *state,
+                SpecialSpawnState::default(),
+            )
+        };
+        struct Restore(
+            Vec<Arc<Client>>,
+            Vec<Arc<Mob>>,
+            u64,
+            u64,
+            SpecialSpawnState,
+        );
+        impl std::ops::Drop for Restore {
+            fn drop(&mut self) {
+                *clients().lock().unwrap() = std::mem::take(&mut self.0);
+                *mobs().lock().unwrap() = std::mem::take(&mut self.1);
+                WORLD_TIME.store(self.2, Ordering::Relaxed);
+                TICK.store(self.3, Ordering::Relaxed);
+                *special_spawn_state().lock().unwrap() =
+                    std::mem::replace(&mut self.4, Default::default());
+            }
+        }
+        let _restore = Restore(old_clients, old_mobs, old_time, old_tick, old_spawn);
+
+        let (client, _receiver) = effect_tests::client_pair();
+        *client.pos.lock().unwrap() = (0.5, 150.0, 0.5, 0.0, 0.0, true);
+        let uuid = client.uuid;
+        let client = Arc::new(client);
+        clients().lock().unwrap().push(Arc::clone(&client));
+        {
+            let mut state = special_spawn_state().lock().unwrap();
+            state.time_since_rest.insert(uuid, 100_000);
+            // Sweep now, then force the next sweep through the tick call.
+            state.insomnia_next = 500_000;
+        }
+
+        // doInsomnia=false: the sweep runs but no phantom spawns.
+        command_gamerules().lock().unwrap().insert("doInsomnia", 0);
+        live_special_spawn_tick(&[Arc::clone(&client)]);
+        assert!(
+            mobs().lock().unwrap().iter().all(|mob| mob.etype != phantom),
+            "doInsomnia=false must block phantom spawns"
+        );
+
+        // doInsomnia=true: the same state spawns phantoms for the sleepless.
+        // The first sweep rescheduled `insomnia_next`, so force it due again.
+        command_gamerules().lock().unwrap().insert("doInsomnia", 1);
+        special_spawn_state().lock().unwrap().insomnia_next = 500_000;
+        live_special_spawn_tick(&[Arc::clone(&client)]);
+        assert!(
+            mobs().lock().unwrap().iter().any(|mob| mob.etype == phantom),
+            "doInsomnia=true must spawn phantoms for a 100k-tick insomniac"
         );
     }
 }

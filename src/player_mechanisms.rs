@@ -2075,6 +2075,226 @@ impl FoodData {
     }
 }
 
+// ---------- P2: advancement rewards + remaining live gamerules ----------
+//
+// Every read goes through `gamerule_live_value` (world_mechanisms.rs): the
+// atomic registry `/gamerule` writes first, then the stored command map —
+// the same state the command reports and mutates.
+
+/// The `rewards` object of a vanilla advancement JSON: experience to grant,
+/// recipe ids to unlock in the player's book, loot tables to roll into drops
+/// at the player's feet, and an optional function to run as the player.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct AdvancementRewards {
+    experience: i32,
+    recipes: Vec<String>,
+    loot: Vec<String>,
+    function: Option<String>,
+}
+
+/// `Advancement.performRewards`: a freshly completed advancement pays its
+/// rewards once — XP through the session bar, recipe unlocks through the
+/// same `0x41` path `/recipe give` uses, loot rolled into drops at the
+/// player, and the function hook run with the player as the command source.
+#[cfg_attr(not(test), allow(dead_code))]
+fn apply_advancement_rewards(client: &Arc<Client>, rewards: &AdvancementRewards) {
+    if rewards.experience != 0 {
+        let _ = send_player_xp(client, |xp| add_player_xp_points(xp, rewards.experience));
+    }
+    if !rewards.recipes.is_empty() {
+        let universe: Vec<String> = recipe_ids().lock().unwrap().iter().cloned().collect();
+        let packets = {
+            let mut books = recipe_books().lock().unwrap();
+            let book = books
+                .entry(client.uuid)
+                .or_insert_with(PlayerRecipeBook::new);
+            rewards
+                .recipes
+                .iter()
+                .filter_map(|id| {
+                    exec_recipe_command(book, RecipeCommandVerb::Give, &universe, id)
+                })
+                .flat_map(|outcome| outcome.packets)
+                .collect::<Vec<_>>()
+        };
+        for payload in packets {
+            if let Ok(mut socket) = client.sock.lock() {
+                let _ = send_packet(&mut socket, 0x41, payload);
+            }
+        }
+    }
+    if !rewards.loot.is_empty() {
+        let (x, y, z, ..) = *client.pos.lock().unwrap();
+        for table in &rewards.loot {
+            let pools: Vec<LootPool> = loot_tables()
+                .lock()
+                .unwrap()
+                .get(table)
+                .map(|pools| {
+                    pools
+                        .iter()
+                        .map(|pool| LootPool {
+                            rolls: pool.rolls,
+                            chance: pool.chance,
+                            funcs: pool.funcs.clone(),
+                            entries: pool
+                                .entries
+                                .iter()
+                                .map(|entry| LootEntry {
+                                    item: entry.item,
+                                    min: entry.min,
+                                    max: entry.max,
+                                    funcs: entry.funcs.clone(),
+                                })
+                                .collect(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (item, count, comps) in roll_loot_seeded(&pools, world_rng::next_u64() as i64) {
+                drops().lock().unwrap().push(Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x,
+                    y,
+                    z,
+                    item,
+                    cnt: count,
+                    comps,
+                    age: 0,
+                    target: Some(client.uuid),
+                    thrower: None,
+                });
+            }
+        }
+    }
+    if let Some(function) = &rewards.function {
+        run_function(function, Some(client.clone()), &mut None);
+    }
+}
+
+/// Grant-path hook called when an advancement completes for `player`: the
+/// spec on the definition resolves to the rewards the live client receives.
+/// A player who is offline earns nothing — matching the delta, which also
+/// only ships to a connected session.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_grant_advancement_rewards(player: &str, advancement_id: &str) {
+    let Some(spec) = advancement_reward_spec(advancement_id) else {
+        return;
+    };
+    let Some(client) = client_snapshot()
+        .into_iter()
+        .find(|client| client.name == player)
+    else {
+        return;
+    };
+    apply_advancement_rewards(&client, &spec.to_rewards());
+}
+
+/// `GameRules.RULE_ANNOUNCE_ADVANCEMENTS`: whether a grant writes the
+/// "<player> has made the advancement" line to chat — the live broadcast
+/// reads the same atomic this accessor exposes.
+#[cfg_attr(not(test), allow(dead_code))]
+fn announce_advancements_enabled() -> bool {
+    gamerule_live_value("announceAdvancements") != 0
+}
+
+/// The four environmental damage rules plus `naturalRegeneration` all gate
+/// whole damage/regen arms in vanilla `Player.tick`/`hurt`: when the rule is
+/// off the event simply does not happen.
+#[cfg_attr(not(test), allow(dead_code))]
+fn player_damage_rule_enabled(name: &str) -> bool {
+    gamerule_live_value(name) != 0
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn drowning_damage_enabled() -> bool {
+    player_damage_rule_enabled("drowningDamage")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn fall_damage_enabled() -> bool {
+    player_damage_rule_enabled("fallDamage")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn fire_damage_enabled() -> bool {
+    player_damage_rule_enabled("fireDamage")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn freeze_damage_enabled() -> bool {
+    player_damage_rule_enabled("freezeDamage")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn natural_regeneration_enabled() -> bool {
+    player_damage_rule_enabled("naturalRegeneration")
+}
+
+/// Vanilla's rule-gated damage arms return no damage at all when the rule is
+/// off — there is no partial or reduced mode.
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_environmental_damage(rule_enabled: bool, raw_damage: f32) -> f32 {
+    if rule_enabled {
+        raw_damage
+    } else {
+        0.0
+    }
+}
+
+/// `GameRules.RULE_DO_IMMEDIATE_RESPAWN`: death screens skip the respawn
+/// button and revive the player on the spot.
+#[cfg_attr(not(test), allow(dead_code))]
+fn do_immediate_respawn_enabled() -> bool {
+    gamerule_live_value("doImmediateRespawn") != 0
+}
+
+/// `GameRules.RULE_DO_LIMITED_CRAFTING`: crafting is restricted to recipes
+/// the player's book has unlocked.
+#[cfg_attr(not(test), allow(dead_code))]
+fn do_limited_crafting_enabled() -> bool {
+    gamerule_live_value("doLimitedCrafting") != 0
+}
+
+/// `ServerRecipeBook`-style check: with `doLimitedCrafting` on only an
+/// unlocked recipe may produce a result; off means everything crafts.
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_limited_crafting_allowed(limited_crafting: bool, recipe_unlocked: bool) -> bool {
+    !limited_crafting || recipe_unlocked
+}
+
+/// `spawnRadius`: the half-width of the square around the world spawn a
+/// respawning player scatters into.
+#[cfg_attr(not(test), allow(dead_code))]
+fn spawn_radius_blocks() -> i32 {
+    gamerule_live_value("spawnRadius").max(0)
+}
+
+/// `PlayerRespawnLogic`: a uniform offset in `[-radius, radius]` along each
+/// horizontal axis, drawn from one raw roll.
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_spawn_offset(radius: i32, random_roll: u32) -> i32 {
+    if radius <= 0 {
+        return 0;
+    }
+    let span = (radius * 2 + 1) as u32;
+    (random_roll % span) as i32 - radius
+}
+
+/// `playersNetherPortalDefaultDelay` / `playersNetherPortalCreativeDelay`:
+/// game ticks a player stands inside a portal before the dimension change —
+/// 80 in survival, 1 in creative by default.
+#[cfg_attr(not(test), allow(dead_code))]
+fn players_nether_portal_delay_ticks(creative: bool) -> i32 {
+    gamerule_live_value(if creative {
+        "playersNetherPortalCreativeDelay"
+    } else {
+        "playersNetherPortalDefaultDelay"
+    })
+    .max(0)
+}
+
 #[cfg(test)]
 mod player_mechanisms_tests {
     use super::*;
@@ -3372,5 +3592,218 @@ mod player_mechanisms_tests {
         assert!(menu.click_slot(4, 0, &mut cursor));
         assert_eq!((menu.slots[4].1, cursor.1), (3, 1));
         assert!(!menu.click_slot(4, 1, &mut cursor));
+    }
+}
+
+/// P2 parity tests: advancement reward application and the live gamerule
+/// accessors the player damage/regen/portal/spawn paths consult.
+#[cfg(test)]
+mod p2_parity_player_tests {
+    use super::*;
+
+    /// Restores gamerule atomics a test changed, on every exit path.
+    struct Rules(Vec<(&'static str, i32)>);
+    impl Rules {
+        fn take(names: &[&'static str]) -> Self {
+            Rules(
+                names
+                    .iter()
+                    .map(|name| (*name, gamerule_atomic_value(name).unwrap_or(0)))
+                    .collect(),
+            )
+        }
+    }
+    impl std::ops::Drop for Rules {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                gamerule_atomic_store(name, value);
+            }
+        }
+    }
+
+    /// Restores stored-only gamerule map entries a test changed.
+    struct StoredRules(Vec<(&'static str, i32)>);
+    impl StoredRules {
+        fn take(names: &[&'static str]) -> Self {
+            let map = command_gamerules().lock().unwrap();
+            StoredRules(
+                names
+                    .iter()
+                    .map(|name| (*name, map.get(*name).copied().unwrap_or(0)))
+                    .collect(),
+            )
+        }
+        fn set(&self, name: &'static str, value: i32) {
+            command_gamerules().lock().unwrap().insert(name, value);
+        }
+    }
+    impl std::ops::Drop for StoredRules {
+        fn drop(&mut self) {
+            let mut map = command_gamerules().lock().unwrap();
+            for (name, value) in self.0.drain(..) {
+                map.insert(name, value);
+            }
+        }
+    }
+
+    #[test]
+    fn p2_parity_environmental_damage_rules_read_live_and_gate() {
+        let _rules = Rules::take(&[
+            "drowningDamage",
+            "fallDamage",
+            "fireDamage",
+            "freezeDamage",
+            "naturalRegeneration",
+        ]);
+        for (name, enabled) in [
+            ("drowningDamage", drowning_damage_enabled as fn() -> bool),
+            ("fallDamage", fall_damage_enabled as fn() -> bool),
+            ("fireDamage", fire_damage_enabled as fn() -> bool),
+            ("freezeDamage", freeze_damage_enabled as fn() -> bool),
+            ("naturalRegeneration", natural_regeneration_enabled as fn() -> bool),
+        ] {
+            gamerule_atomic_store(name, 0);
+            assert!(!enabled(), "{name}=false must disable the arm");
+            gamerule_atomic_store(name, 1);
+            assert!(enabled(), "{name}=true must enable the arm");
+            gamerule_atomic_store(name, 1);
+        }
+        // A gated arm returns no damage at all when its rule is off.
+        assert_eq!(eval_environmental_damage(false, 2.0), 0.0);
+        assert_eq!(eval_environmental_damage(true, 2.0), 2.0);
+    }
+
+    #[test]
+    fn p2_parity_natural_regeneration_gates_food_healing() {
+        let _rules = Rules::take(&["naturalRegeneration"]);
+        gamerule_atomic_store("naturalRegeneration", 0);
+        let mut food = FoodData {
+            food_level: 20,
+            saturation: 5.0,
+            ..FoodData::default()
+        };
+        for _ in 0..40 {
+            assert_eq!(
+                food.tick(10.0, 20.0, HungerDifficulty::Normal, natural_regeneration_enabled()),
+                FoodTick::None,
+                "naturalRegeneration=false must suppress saturated healing"
+            );
+        }
+        gamerule_atomic_store("naturalRegeneration", 1);
+        let mut healed = false;
+        for _ in 0..40 {
+            if food.tick(10.0, 20.0, HungerDifficulty::Normal, natural_regeneration_enabled())
+                != FoodTick::None
+            {
+                healed = true;
+                break;
+            }
+        }
+        assert!(healed, "naturalRegeneration=true must restore saturated healing");
+    }
+
+    #[test]
+    fn p2_parity_immediate_respawn_and_limited_crafting_rules() {
+        let _rules = Rules::take(&["doImmediateRespawn"]);
+        let _stored = StoredRules::take(&["doLimitedCrafting"]);
+        gamerule_atomic_store("doImmediateRespawn", 1);
+        assert!(do_immediate_respawn_enabled());
+        gamerule_atomic_store("doImmediateRespawn", 0);
+        assert!(!do_immediate_respawn_enabled());
+
+        _stored.set("doLimitedCrafting", 1);
+        assert!(do_limited_crafting_enabled());
+        assert!(!eval_limited_crafting_allowed(true, false));
+        assert!(eval_limited_crafting_allowed(true, true));
+        _stored.set("doLimitedCrafting", 0);
+        assert!(!do_limited_crafting_enabled());
+        assert!(eval_limited_crafting_allowed(false, false));
+        assert!(eval_limited_crafting_allowed(false, true));
+    }
+
+    #[test]
+    fn p2_parity_portal_delays_and_spawn_radius_read_live() {
+        let _stored = StoredRules::take(&[
+            "playersNetherPortalDefaultDelay",
+            "playersNetherPortalCreativeDelay",
+            "spawnRadius",
+        ]);
+        _stored.set("playersNetherPortalDefaultDelay", 42);
+        _stored.set("playersNetherPortalCreativeDelay", 3);
+        _stored.set("spawnRadius", 7);
+        assert_eq!(players_nether_portal_delay_ticks(false), 42);
+        assert_eq!(players_nether_portal_delay_ticks(true), 3);
+        assert_eq!(spawn_radius_blocks(), 7);
+        for roll in 0..1000u32 {
+            let offset = eval_spawn_offset(7, roll);
+            assert!((-7..=7).contains(&offset), "offset {offset} outside ±7");
+        }
+        assert_eq!(eval_spawn_offset(0, u32::MAX), 0);
+    }
+
+    #[test]
+    fn p2_parity_announce_advancements_toggles_the_broadcast_rule() {
+        let _rules = Rules::take(&["announceAdvancements"]);
+        gamerule_atomic_store("announceAdvancements", 0);
+        assert!(!announce_advancements_enabled());
+        gamerule_atomic_store("announceAdvancements", 1);
+        assert!(announce_advancements_enabled());
+    }
+
+    #[test]
+    fn p2_parity_advancement_rewards_spec_converts_and_unlocks_recipes() {
+        let spec = AdvancementRewardSpec {
+            experience: 100,
+            recipes: &["minecraft:stone_pickaxe", "minecraft:stone_axe"],
+            loot: &["minecraft:entities/pig"],
+            function: Some("minecraft:test/reward_fn"),
+        };
+        let rewards = spec.to_rewards();
+        assert_eq!(
+            rewards,
+            AdvancementRewards {
+                experience: 100,
+                recipes: vec![
+                    "minecraft:stone_pickaxe".to_string(),
+                    "minecraft:stone_axe".to_string()
+                ],
+                loot: vec!["minecraft:entities/pig".to_string()],
+                function: Some("minecraft:test/reward_fn".to_string()),
+            }
+        );
+
+        // The recipe arm applies the same book update `/recipe give` runs.
+        let mut book = PlayerRecipeBook::new();
+        let universe = vec!["minecraft:stone_pickaxe".to_string()];
+        let outcome = exec_recipe_command(
+            &mut book,
+            RecipeCommandVerb::Give,
+            &universe,
+            "minecraft:stone_pickaxe",
+        )
+        .expect("known recipe gives");
+        assert!(book.is_unlocked("minecraft:stone_pickaxe"));
+        assert_eq!(outcome.changed, vec!["minecraft:stone_pickaxe".to_string()]);
+        assert_eq!(outcome.packets.len(), 1);
+        // Unknown ids in the table are skipped exactly like a filtered /recipe.
+        assert!(
+            exec_recipe_command(
+                &mut book,
+                RecipeCommandVerb::Give,
+                &universe,
+                "minecraft:stone_axe",
+            )
+            .is_none()
+        );
+
+        // The XP arm adds points through the vanilla curve.
+        let mut xp = PlayerXpState {
+            level: 0,
+            progress: 0.0,
+            total_experience: 0,
+        };
+        add_player_xp_points(&mut xp, rewards.experience).unwrap();
+        assert_eq!(xp.total_experience, 100);
+        assert!(xp.level > 0 || xp.progress > 0.0);
     }
 }

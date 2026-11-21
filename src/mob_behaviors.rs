@@ -366,6 +366,10 @@ enum PiglinEvent {
 #[derive(Default)]
 struct PiglinBehavior {
     anger: Option<(i32, u16)>,
+    /// `universalAnger`: the last provocation angers at every nearby player
+    /// and holds while the rule stays on, instead of ticking down at one
+    /// target.
+    universal: bool,
     barter: Option<(i32, u8)>,
     conversion: NetherConversion,
 }
@@ -373,14 +377,27 @@ struct PiglinBehavior {
 #[cfg_attr(not(test), allow(dead_code))]
 impl PiglinBehavior {
     fn hostile_to(&self, player: i32, armor: &[&str]) -> bool {
-        !self.conversion.converted()
-            && (self.anger.is_some_and(|(target, _)| target == player)
-                || !armor.iter().any(|piece| {
+        if self.conversion.converted() {
+            return false;
+        }
+        if self.universal {
+            // A universal provocation makes every nearby player a target;
+            // golden armor still pacifies the piglin itself.
+            return self.anger.is_some()
+                && !armor.iter().any(|piece| {
                     matches!(
                         mob_behavior_id(piece),
                         "golden_helmet" | "golden_chestplate" | "golden_leggings" | "golden_boots"
                     )
-                }))
+                });
+        }
+        self.anger.is_some_and(|(target, _)| target == player)
+            || !armor.iter().any(|piece| {
+                matches!(
+                    mob_behavior_id(piece),
+                    "golden_helmet" | "golden_chestplate" | "golden_leggings" | "golden_boots"
+                )
+            })
     }
 
     fn anger_ticks(&self) -> u16 {
@@ -391,14 +408,27 @@ impl PiglinBehavior {
         if self.conversion.converted() || distance > 16.0 || !event.guards() {
             return false;
         }
+        self.universal = universal_anger_enabled();
         self.anger = Some((player, 600));
         true
     }
 
+    /// `forgiveDeadPlayers` arm: the caller reports whether the angered target
+    /// died (or left the world); vanilla clears the grudge on that death.
+    fn forgive_target(&mut self, target_dead: bool) {
+        if forgive_dead_players_enabled() && target_dead && self.anger.is_some() {
+            self.anger = None;
+            self.universal = false;
+        }
+    }
+
     // A successful offer transfers one item from the caller to the piglin.
+    // `mobGriefing` gates the item pickup itself, so a piglin that cannot take
+    // the ingot never starts a barter.
     fn offer(&mut self, player: i32, item: &str) -> bool {
         if self.conversion.converted()
             || self.barter.is_some()
+            || !mob_griefing_enabled()
             || mob_behavior_id(item) != "gold_ingot"
         {
             return false;
@@ -414,11 +444,14 @@ impl PiglinBehavior {
     ) -> Option<PiglinEvent> {
         if self.conversion.tick(dimension_piglin_safe) {
             self.anger = None;
+            self.universal = false;
             self.barter = None;
             return Some(PiglinEvent::ConvertToZombifiedPiglin);
         }
-        if let Some((player, ticks)) = self.anger {
-            self.anger = (ticks > 1).then_some((player, ticks - 1));
+        if !self.universal {
+            if let Some((player, ticks)) = self.anger {
+                self.anger = (ticks > 1).then_some((player, ticks - 1));
+            }
         }
         let (player, ticks) = self.barter?;
         self.barter = (ticks > 1).then_some((player, ticks - 1));
@@ -1843,16 +1876,25 @@ impl MobBehaviorState {
                     None => None,
                 }
             }
-            Self::Piglin(piglin) => match piglin.tick(ctx.dim == DimId::Nether, &mut draw) {
-                Some(PiglinEvent::ConvertToZombifiedPiglin) => {
-                    Some(ConvertEntity { target_etype: 127 })
+            Self::Piglin(piglin) => {
+                // `forgiveDeadPlayers`: a grudge target seen dead (or gone) is
+                // forgiven before the anger ticks.
+                let target_dead = piglin.anger.is_some_and(|(target, _)| {
+                    ctx.nearest_target
+                        .is_some_and(|snapshot| snapshot.eid == target && snapshot.hp <= 0.0)
+                });
+                piglin.forgive_target(target_dead);
+                match piglin.tick(ctx.dim == DimId::Nether, &mut draw) {
+                    Some(PiglinEvent::ConvertToZombifiedPiglin) => {
+                        Some(ConvertEntity { target_etype: 127 })
+                    }
+                    Some(PiglinEvent::Barter { player, loot }) => Some(PiglinBarter {
+                        player_eid: player,
+                        loot,
+                    }),
+                    None => None,
                 }
-                Some(PiglinEvent::Barter { player, loot }) => Some(PiglinBarter {
-                    player_eid: player,
-                    loot,
-                }),
-                None => None,
-            },
+            }
             Self::Hoglin(hoglin) => hoglin
                 .tick(ctx.dim == DimId::Nether)
                 .map(|HoglinEvent::ConvertToZoglin| ConvertEntity { target_etype: 123 }),
@@ -2079,6 +2121,63 @@ impl MobBehaviorState {
             _ => None,
         };
         effect.into_iter().collect()
+    }
+}
+
+// ---------- P2: mob gamerules ----------
+//
+// Each accessor reads `gamerule_live_value` (world_mechanisms.rs) — the same
+// atomic registry and stored map `/gamerule` mutates.
+
+/// `mobGriefing`: whether mobs may modify the world — pick up items (the
+/// piglin barter gate above), carry or break blocks, trample crops, and
+/// destroy blocks in explosions.
+#[cfg_attr(not(test), allow(dead_code))]
+fn mob_griefing_enabled() -> bool {
+    gamerule_live_value("mobGriefing") != 0
+}
+
+/// `forgiveDeadPlayers`: neutral mobs drop a grudge when the player it was
+/// held against dies.
+#[cfg_attr(not(test), allow(dead_code))]
+fn forgive_dead_players_enabled() -> bool {
+    gamerule_live_value("forgiveDeadPlayers") != 0
+}
+
+/// `universalAnger`: a provoked neutral mob angers at every nearby player,
+/// not just the source of the provocation.
+#[cfg_attr(not(test), allow(dead_code))]
+fn universal_anger_enabled() -> bool {
+    gamerule_live_value("universalAnger") != 0
+}
+
+/// `maxEntityCramming`: the live push engine reads the same atomic; `0`
+/// disables cramming damage entirely.
+#[cfg_attr(not(test), allow(dead_code))]
+fn max_entity_cramming_limit() -> i32 {
+    gamerule_live_value("maxEntityCramming")
+}
+
+/// `LivingEntity.pushEntities` cramming arm, mirrored from the live push
+/// engine: more than `limit - 1` pushable entities sharing the cell, at least
+/// that many not riding anything, and a one-in-four roll — a limit of `0`
+/// (or lower) disables the damage.
+#[cfg_attr(not(test), allow(dead_code))]
+fn eval_entity_cramming_damage(
+    limit: i32,
+    pushable: usize,
+    non_passengers: usize,
+    roll_mod_4: u32,
+) -> f32 {
+    const ENTITY_CRAMMING_HIT: f32 = 6.0;
+    if limit > 0
+        && pushable > (limit - 1) as usize
+        && roll_mod_4 % 4 == 0
+        && non_passengers > (limit - 1) as usize
+    {
+        ENTITY_CRAMMING_HIT
+    } else {
+        0.0
     }
 }
 
@@ -3738,5 +3837,195 @@ mod mob_behaviors_tests {
         assert!((fling[0] - 0.24).abs() < 1e-12);
         assert_eq!(fling[1], 0.4);
         assert!((fling[2] - 0.32).abs() < 1e-12);
+    }
+}
+
+/// P2 parity tests: neutral-mob gamerules and entity cramming.
+#[cfg(test)]
+mod p2_parity_mob_tests {
+    use super::*;
+
+    /// Restores gamerule atomics a test changed, on every exit path.
+    struct Rules(Vec<(&'static str, i32)>);
+    impl Rules {
+        fn take(names: &[&'static str]) -> Self {
+            Rules(
+                names
+                    .iter()
+                    .map(|name| (*name, gamerule_atomic_value(name).unwrap_or(0)))
+                    .collect(),
+            )
+        }
+    }
+    impl std::ops::Drop for Rules {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                gamerule_atomic_store(name, value);
+            }
+        }
+    }
+
+    /// Restores stored-only gamerule map entries a test changed.
+    struct StoredRules(Vec<(&'static str, i32)>);
+    impl StoredRules {
+        fn take(names: &[&'static str]) -> Self {
+            let map = command_gamerules().lock().unwrap();
+            StoredRules(
+                names
+                    .iter()
+                    .map(|name| (*name, map.get(*name).copied().unwrap_or(0)))
+                    .collect(),
+            )
+        }
+        fn set(&self, name: &'static str, value: i32) {
+            command_gamerules().lock().unwrap().insert(name, value);
+        }
+    }
+    impl std::ops::Drop for StoredRules {
+        fn drop(&mut self) {
+            let mut map = command_gamerules().lock().unwrap();
+            for (name, value) in self.0.drain(..) {
+                map.insert(name, value);
+            }
+        }
+    }
+
+    #[test]
+    fn p2_parity_universal_anger_targets_every_player_when_on() {
+        let _stored = StoredRules::take(&["universalAnger"]);
+        _stored.set("universalAnger", 0);
+        let mut piglin = PiglinBehavior::default();
+        assert!(piglin.provoke(11, 1.0, PiglinProvocation::Opened("chest")));
+        // The provoker is chased even in golden armor; another player in
+        // golden armor stays safe without universalAnger.
+        assert!(piglin.hostile_to(11, &["golden_helmet"]));
+        assert!(
+            !piglin.hostile_to(12, &["golden_helmet"]),
+            "without universalAnger golden armor still pacifies non-provokers"
+        );
+        // And the grudge decays on the vanilla 600-tick anger timer.
+        for _ in 0..700 {
+            piglin.tick(true, &mut |_| 0);
+        }
+        assert!(
+            !piglin.hostile_to(11, &["golden_helmet"]),
+            "a normal grudge expires after 600 ticks"
+        );
+
+        _stored.set("universalAnger", 1);
+        assert!(universal_anger_enabled());
+        let mut universal = PiglinBehavior::default();
+        assert!(universal.provoke(11, 1.0, PiglinProvocation::Opened("chest")));
+        // The universal flag is sampled live at provoke time.
+        assert!(universal.universal);
+        // Universal anger holds past the 600-tick timer while the rule stays
+        // on, so the piglin never stands down.
+        for _ in 0..700 {
+            universal.tick(true, &mut |_| 0);
+        }
+        assert!(
+            universal.hostile_to(12, &["iron_helmet"]),
+            "universal anger must not decay on the 600-tick timer"
+        );
+        // Golden armor still pacifies the piglin itself.
+        assert!(!universal.hostile_to(12, &["golden_helmet"]));
+    }
+
+    #[test]
+    fn p2_parity_forgive_dead_players_clears_the_grudge() {
+        let _stored = StoredRules::take(&["forgiveDeadPlayers"]);
+        let mut piglin = PiglinBehavior::default();
+        piglin.provoke(11, 1.0, PiglinProvocation::Opened("chest"));
+
+        _stored.set("forgiveDeadPlayers", 0);
+        piglin.forgive_target(true);
+        assert!(
+            piglin.hostile_to(11, &["golden_helmet"]) || piglin.anger.is_some(),
+            "forgiveDeadPlayers=false keeps the grudge even after the target dies"
+        );
+
+        _stored.set("forgiveDeadPlayers", 1);
+        piglin.forgive_target(true);
+        assert!(
+            piglin.anger.is_none(),
+            "forgiveDeadPlayers=true forgives the dead target"
+        );
+        // A living target is never forgiven.
+        piglin.provoke(12, 1.0, PiglinProvocation::Opened("chest"));
+        piglin.forgive_target(false);
+        assert!(piglin.anger.is_some());
+    }
+
+    #[test]
+    fn p2_parity_forgive_dead_players_flows_through_the_live_step() {
+        let _stored = StoredRules::take(&["forgiveDeadPlayers"]);
+        _stored.set("forgiveDeadPlayers", 1);
+        let mut state = MobBehaviorState::for_etype(78).expect("piglin behavior");
+        let MobBehaviorState::Piglin(piglin) = &mut state else {
+            unreachable!()
+        };
+        piglin.provoke(11, 1.0, PiglinProvocation::Opened("chest"));
+        let ctx = MobBehaviorTickCtx {
+            dim: DimId::Nether,
+            pos: [0.0, 64.0, 0.0],
+            hp: 16.0,
+            max_hp: 16.0,
+            in_water: false,
+            in_rain: false,
+            on_fire: false,
+            nearest_target: Some(MobTargetSnapshot {
+                eid: 11,
+                pos: [1.0, 64.0, 0.0],
+                hp: 0.0,
+                visible: true,
+            }),
+            rng_u64: 0,
+        };
+        state.step(&ctx);
+        let MobBehaviorState::Piglin(piglin) = &state else {
+            unreachable!()
+        };
+        assert!(
+            piglin.anger.is_none(),
+            "a dead grudge target must be forgiven inside the live step"
+        );
+    }
+
+    #[test]
+    fn p2_parity_mob_griefing_gates_piglin_item_pickup() {
+        let _rules = Rules::take(&["mobGriefing"]);
+        let mut piglin = PiglinBehavior::default();
+        gamerule_atomic_store("mobGriefing", 0);
+        assert!(!mob_griefing_enabled());
+        assert!(
+            !piglin.offer(7, "gold_ingot"),
+            "mobGriefing=false must block the barter pickup"
+        );
+        gamerule_atomic_store("mobGriefing", 1);
+        assert!(mob_griefing_enabled());
+        assert!(piglin.offer(7, "gold_ingot"));
+    }
+
+    #[test]
+    fn p2_parity_max_entity_cramming_reads_atomic_and_zero_disables() {
+        let _rules = Rules::take(&["maxEntityCramming"]);
+        gamerule_atomic_store("maxEntityCramming", 4);
+        assert_eq!(max_entity_cramming_limit(), 4);
+        assert_eq!(eval_entity_cramming_damage(4, 4, 4, 0), 6.0);
+        assert_eq!(eval_entity_cramming_damage(4, 3, 3, 0), 0.0);
+        assert_eq!(
+            eval_entity_cramming_damage(4, 4, 3, 0),
+            0.0,
+            "riders do not count toward the cramming limit"
+        );
+        assert_eq!(eval_entity_cramming_damage(4, 4, 4, 2), 0.0);
+        gamerule_atomic_store("maxEntityCramming", 0);
+        assert_eq!(max_entity_cramming_limit(), 0);
+        assert_eq!(
+            eval_entity_cramming_damage(0, 100, 100, 0),
+            0.0,
+            "maxEntityCramming=0 disables cramming damage"
+        );
+        gamerule_atomic_store("maxEntityCramming", 24);
     }
 }
