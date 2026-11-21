@@ -23,10 +23,13 @@ server.jar (`--vanilla-jar`, run via `java -DbundlerMainClass=net.minecraft.data
 
 Pure Python 3 stdlib. No shell=True. Linux/macOS/Windows portable.
 
-Exit codes: 0 = report produced; 2 = fail-closed input/parse error.
+Exit codes: 0 = report produced (or strict gate passed); 1 = strict gate
+violation (--strict/--min-*/--require-zero-proto-drift); 2 = fail-closed
+input/parse error.
 """
 
 import argparse
+import bisect
 import json
 import os
 import re
@@ -76,104 +79,105 @@ class AuditError(Exception):
 # Rust source lexing: comment/string-aware skeleton + live text
 # ---------------------------------------------------------------------------
 
-_STRING_START = re.compile(r'(?:br|cr|rb|b|c|r)?(#+)?"')
-_CHAR_LITERAL = re.compile(r"'(\\.|[^'\\])'")
+# Regex-tokenized lexer: line comments, (nested) block comments, raw strings
+# (r"...", r#"..."#, br#/cr#/rb# prefixes), cooked strings ("...", b"...",
+# c"...") and char literals. Produces the same (comment_spans, literal_spans)
+# contract as a per-char scanner at a fraction of the cost on multi-MB files.
+_LEX_RE = re.compile(
+    r'//[^\n]*'
+    r'|/\*'
+    r'|(?:br|cr|rb|r)(#*)"[\s\S]*?"\1'
+    r'|(?:b|c)"(?:\\[\s\S]|[^"\\\n])*"'
+    r'|"(?:\\[\s\S]|[^"\\\n])*"'
+    r"|'(?:\\[\s\S]|[^'\\\n])'"
+)
+_BLOCK_TOKEN = re.compile(r'/\*|\*/')
+_NONL_RE = re.compile(r'[^\n]')
+_NONL_KEEP_RE = re.compile(r'[^\n"\'#]')
+
+
+def _block_comment_end(text, start):
+    """End offset (exclusive) of the nested block comment opened at `start`."""
+    depth = 1
+    for m in _BLOCK_TOKEN.finditer(text, start + 2):
+        if m.group(0) == "/*":
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                return m.end()
+    return len(text)
 
 
 def _lex_spans(text):
     """Return (comment_spans, literal_spans); spans are [start, end) char ranges."""
     comments = []
     literals = []
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        two = text[i:i + 2]
-        if two == "//":
-            j = text.find("\n", i)
-            j = n if j < 0 else j
-            comments.append((i, j))
-            i = j
-            continue
-        if two == "/*":
-            depth = 1
-            j = i + 2
-            while j < n and depth:
-                if text[j:j + 2] == "/*":
-                    depth += 1
-                    j += 2
-                elif text[j:j + 2] == "*/":
-                    depth -= 1
-                    j += 2
-                else:
-                    j += 1
-            comments.append((i, j))
-            i = j
-            continue
-        # string / raw-string / byte-string / c-string literal
-        m = _STRING_START.match(text, i)
-        if m:
-            prefix = m.group(0)
-            kind = prefix[:-1].rstrip('#')
-            hashes = prefix.count('#')
-            is_raw = 'r' in kind
-            start = i
-            i += len(prefix)
-            if is_raw:
-                closing = '"' + '#' * hashes
-                j = text.find(closing, i)
-                j = n if j < 0 else j + len(closing)
-            else:
-                j = i
-                while j < n:
-                    if text[j] == '\\':
-                        j += 2
-                        continue
-                    if text[j] == '"':
-                        j += 1
-                        break
-                    j += 1
-            literals.append((start, j))
-            i = j
-            continue
-        # byte string b"..." / c"..."
-        if c in 'bc' and i + 1 < n and text[i + 1] == '"':
-            start = i
-            j = i + 2
-            while j < n:
-                if text[j] == '\\':
-                    j += 2
-                    continue
-                if text[j] == '"':
-                    j += 1
-                    break
-                j += 1
-            literals.append((start, j))
-            i = j
-            continue
-        # char literal: 'x' , '\n' , '\'' ; lifetimes left alone
-        if c == "'":
-            m = _CHAR_LITERAL.match(text, i)
-            if m:
-                literals.append((i, i + len(m.group(0))))
-                i += len(m.group(0))
-                continue
-        i += 1
+    pos = 0
+    n = len(text)
+    while pos < n:
+        m = _LEX_RE.search(text, pos)
+        if not m:
+            break
+        s, e = m.span()
+        tok = text[s:e]
+        if tok.startswith("//"):
+            comments.append((s, e))
+        elif tok.startswith("/*"):
+            e = _block_comment_end(text, s)
+            comments.append((s, e))
+        else:
+            literals.append((s, e))
+        pos = e
     return comments, literals
 
 
-def _blank(text, spans):
-    chars = list(text)
+def _splice_blank(text, spans, pattern):
+    """Blank every [a,b) span's chars (except '\\n') -> same-length text."""
+    if not spans:
+        return text
+    parts = []
+    prev = 0
+    sub = pattern.sub
     for a, b in spans:
-        for k in range(a, b):
-            if chars[k] != "\n":
-                chars[k] = " "
-    return "".join(chars)
+        if a > prev:
+            parts.append(text[prev:a])
+        parts.append(sub(" ", text[a:b]))
+        prev = b
+    if prev < len(text):
+        parts.append(text[prev:])
+    return "".join(parts)
+
+
+def _skel_from_spans(text, comments, literals):
+    """code_skeleton() from precomputed spans: comments blanked fully, literal
+    contents blanked except the delimiter characters ``"`` ``'`` ``#``."""
+    parts = []
+    prev = 0
+    i = j = 0
+    nc, nl = len(comments), len(literals)
+    while i < nc or j < nl:
+        if j >= nl or (i < nc and comments[i][0] < literals[j][0]):
+            a, b = comments[i]
+            i += 1
+            pat = _NONL_RE
+        else:
+            a, b = literals[j]
+            j += 1
+            pat = _NONL_KEEP_RE
+        if a > prev:
+            parts.append(text[prev:a])
+        parts.append(pat.sub(" ", text[a:b]))
+        prev = b
+    if prev < len(text):
+        parts.append(text[prev:])
+    return "".join(parts)
 
 
 def live_text(text):
     """Source with comments blanked but string contents preserved."""
     comments, _ = _lex_spans(text)
-    return _blank(text, comments)
+    return _splice_blank(text, comments, _NONL_RE)
 
 
 def code_skeleton(text):
@@ -186,13 +190,7 @@ def code_skeleton(text):
     so structure matching stays correct.
     """
     comments, literals = _lex_spans(text)
-    chars = list(_blank(text, comments))
-    keep = set("\"'#")
-    for a, b in literals:
-        for k in range(a, b):
-            if chars[k] != "\n" and chars[k] not in keep:
-                chars[k] = " "
-    return "".join(chars)
+    return _skel_from_spans(text, comments, literals)
 
 
 # ---------------------------------------------------------------------------
@@ -249,16 +247,8 @@ def region_after(skel, marker, open_c="[", close_c="]"):
 _CFG_TEST = re.compile(r"#\[cfg\(test\)\]|#\[cfg\((?:all|any)\([^]]*\btest\b[^]]*\)\)\]")
 
 
-def mask_test_regions(text):
-    """Blank out #[cfg(test)]-annotated items; return (masked, test_text).
-
-    `text` must be live_text() output (comments blanked, strings intact).
-    Structure is computed on code_skeleton(text) so braces inside string
-    literals cannot confuse the matcher. The masked output preserves length
-    and line numbers: test code becomes whitespace, string contents of live
-    code are untouched.
-    """
-    skel = code_skeleton(text)
+def _mask_test_spans(skel):
+    """Char spans of every #[cfg(test)]-annotated item on a skeleton."""
     n = len(skel)
     spans = []
     for m in _CFG_TEST.finditer(skel):
@@ -301,16 +291,36 @@ def mask_test_regions(text):
         if end < 0:
             end = n
         spans.append((m.start(), end))
+    # nested #[cfg(test)] items (e.g. a test fn inside a `mod tests`) yield
+    # overlapping spans; merge so splicing stays length-preserving.
+    spans.sort()
+    merged = []
+    for a, b in spans:
+        if merged and a < merged[-1][1]:
+            if b > merged[-1][1]:
+                merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def mask_test_regions(text, skel=None):
+    """Blank out #[cfg(test)]-annotated items; return (masked, test_text).
+
+    `text` must be live_text() output (comments blanked, strings intact).
+    Structure is computed on code_skeleton(text) so braces inside string
+    literals cannot confuse the matcher. The masked output preserves length
+    and line numbers: test code becomes whitespace, string contents of live
+    code are untouched.
+    """
+    if skel is None:
+        skel = code_skeleton(text)
+    spans = _mask_test_spans(skel)
     if not spans:
         return text, ""
-    masked = list(text)
-    test_parts = []
-    for a, b in spans:
-        test_parts.append(text[a:b])
-        for x in range(a, b):
-            if masked[x] != "\n":
-                masked[x] = " "
-    return "".join(masked), "\n".join(test_parts)
+    masked = _splice_blank(text, spans, _NONL_RE)
+    test_parts = [text[a:b] for a, b in spans]
+    return masked, "\n".join(test_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -529,23 +539,48 @@ def audit_packets(repo):
     }
 
 
-def _live_src_texts(repo):
-    """{relpath: (live_text, test_text)} for every src/**/*.rs file.
+_TEXTS_CACHE = {}
 
-    live_text: comments blanked, test-only items removed.
-    test_text: the removed #[cfg(test)] regions plus whole *_tests.rs files.
+
+def _live_src_texts(repo):
+    """{relpath: (live, test, skel)} for every src/**/*.rs file.
+
+    live: comments blanked, test-only items removed (string contents intact).
+    test: the removed #[cfg(test)] regions plus whole *_tests.rs files.
+    skel: code_skeleton aligned with `live` (None for whole-test files).
+    One lexer pass per file feeds all three views. Results are memoized per
+    repo keyed on (path, mtime_ns, size) so repeated audits in one process
+    (e.g. the test suite's shared Mode A scan plus per-test main() calls)
+    don't rescan unchanged sources.
     """
+    repo = Path(repo)
+    src_dir = repo / "src"
+    paths = sorted(src_dir.rglob("*.rs"))
+    sig = tuple((p.relative_to(repo).as_posix(), p.stat().st_mtime_ns,
+                 p.stat().st_size) for p in paths)
+    cached = _TEXTS_CACHE.get(repo)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
     out = {}
-    for path in sorted((repo / "src").rglob("*.rs")):
+    for path in paths:
         rel = path.relative_to(repo).as_posix()
         raw = path.read_text(errors="replace")
-        live_full = live_text(raw)
+        comments, literals = _lex_spans(raw)
+        live_full = _splice_blank(raw, comments, _NONL_RE)
+        skel_full = _skel_from_spans(raw, comments, literals)
         is_test_file = path.name.endswith("_tests.rs") or path.name == "test_support.rs"
         if is_test_file:
-            out[rel] = ("", live_full)
+            out[rel] = ("", live_full, None)
             continue
-        live, removed = mask_test_regions(live_full)
-        out[rel] = (live, removed)
+        spans = _mask_test_spans(skel_full)
+        if not spans:
+            out[rel] = (live_full, "", skel_full)
+            continue
+        masked = _splice_blank(live_full, spans, _NONL_RE)
+        skel = _splice_blank(skel_full, spans, _NONL_RE)
+        test = "\n".join(live_full[a:b] for a, b in spans)
+        out[rel] = (masked, test, skel)
+    _TEXTS_CACHE[repo] = (sig, out)
     return out
 
 
@@ -566,7 +601,7 @@ def audit_gamerules(repo, texts):
 
     # GR_* atomic definitions across all live src files
     gr_defs = {}  # GR_NAME -> relpath
-    for rel, (live, _t) in texts.items():
+    for rel, (live, _t, _s) in texts.items():
         for gm in re.finditer(r'\bstatic\s+(GR_[A-Z0-9_]+)\s*:', live):
             gr_defs.setdefault(gm.group(1), rel)
 
@@ -592,9 +627,9 @@ def audit_gamerules(repo, texts):
     #  - the gamerule_atomic_value/store plumbing bodies in main.rs
     #  - COMMAND_GAMERULE_DEFAULTS tuple lines in commands_core.rs
     exclude = {}  # rel -> list[(start,end)]
-    for rel, (live, _t) in texts.items():
+    for rel, (live, _t, skel) in texts.items():
         spans = []
-        sk = code_skeleton(live)
+        sk = skel if skel is not None else ""
         for gm in re.finditer(r'\bstatic\s+GR_[A-Z0-9_]+\s*:', sk):
             ls = sk.rfind("\n", 0, gm.start()) + 1
             le = sk.find("\n", gm.end())
@@ -615,53 +650,52 @@ def audit_gamerules(repo, texts):
         if spans:
             exclude[rel] = spans
 
-    def count_in_live(token, rel_filter=None):
-        total = 0
-        sites = []
-        for rel, (live, _t) in texts.items():
-            if rel_filter and rel != rel_filter:
+    # One pass per file counts every GR_* token and every "name" literal that
+    # survives the per-file exclusion spans — equivalent to the old per-token
+    # count_in_live scans at a fraction of the cost.
+    count_re = re.compile(r'\b(GR_[A-Z0-9_]+)\b|"([A-Za-z][A-Za-z0-9]*)"')
+    gr_counts = {}
+    gr_files = {}
+    name_counts = {}
+    name_files = {}
+    for rel, (live, _t, _s) in texts.items():
+        spans = exclude.get(rel, [])
+        for m in count_re.finditer(live):
+            pos = m.start()
+            if any(a <= pos < b for a, b in spans):
                 continue
-            spans = exclude.get(rel, [])
-            for m in re.finditer(r"\b" + re.escape(token) + r"\b", live):
-                pos = m.start()
-                if any(a <= pos < b for a, b in spans):
-                    continue
-                total += 1
-                sites.append(rel)
-        return total, sites
+            if m.group(1):
+                tok = m.group(1)
+                gr_counts[tok] = gr_counts.get(tok, 0) + 1
+                gr_files.setdefault(tok, set()).add(rel)
+            else:
+                tok = m.group(2)
+                name_counts[tok] = name_counts.get(tok, 0) + 1
+                name_files.setdefault(tok, set()).add(rel)
 
     rules = []
     rule_names = sorted(set(names) | set(atomic_for_name))
     for name in rule_names:
         gr = atomic_for_name.get(name)
         if gr:
-            live_sites, site_files = count_in_live(gr)
-            site_files = sorted(set(site_files))
+            live_sites = gr_counts.get(gr, 0)
+            site_files = sorted(gr_files.get(gr, ()))
         else:
             # hash-map-backed rule: count "name" literal uses in live code
-            needle = '"' + name + '"'
-            total = 0
-            site_files = set()
-            for rel, (live, _t) in texts.items():
-                spans = exclude.get(rel, [])
-                for m in re.finditer(re.escape(needle), live):
-                    pos = m.start()
-                    if any(a <= pos < b for a, b in spans):
-                        continue
-                    total += 1
-                    site_files.add(rel)
-            live_sites = total
+            live_sites = name_counts.get(name, 0)
+            site_files = sorted(name_files.get(name, ()))
         rules.append({
             "name": name, "atomic": gr, "in_defaults": name in names,
-            "live_sites": live_sites, "site_files": sorted(site_files),
+            "live_sites": live_sites, "site_files": site_files,
             "status": "WIRED" if live_sites > 0 else "DEFINED_NOT_WIRED",
         })
     # GR_* statics not referenced by any gamerule name still get reported
     for gr in sorted(set(gr_defs) - set(atomic_for_name.values())):
-        live_sites, site_files = count_in_live(gr)
+        live_sites = gr_counts.get(gr, 0)
         rules.append({
             "name": gr, "atomic": gr, "in_defaults": False,
-            "live_sites": live_sites, "site_files": sorted(set(site_files)),
+            "live_sites": live_sites,
+            "site_files": sorted(gr_files.get(gr, ())),
             "status": "WIRED" if live_sites > 0 else "DEFINED_NOT_WIRED",
         })
 
@@ -742,14 +776,19 @@ def audit_commands(repo):
             for name in re.findall(r'"([^"]+)"', arr_live):
                 registered.add(name)
 
-    # dispatch arms of `match cmd` inside run_command_ctx
-    fn_span = fn_body_span(skel, "run_command_ctx")
+    # dispatch arms of `match cmd` — lives in run_command_ctx_level (the
+    # permission-pinned variant run_command_ctx delegates to)
+    fn_span = None
+    for fname in ("run_command_ctx_level", "run_command_ctx"):
+        fn_span = fn_body_span(skel, fname)
+        if fn_span:
+            mm = re.search(r"\bmatch\s+cmd\s*\{", skel[fn_span[0]:fn_span[1]])
+            if mm:
+                break
+            fn_span = None
     if not fn_span:
-        raise AuditError("run_command_ctx not found in src/commands_core.rs")
-    fs, fe = fn_span
-    mm = re.search(r"\bmatch\s+cmd\s*\{", skel[fs:fe])
-    if not mm:
-        raise AuditError("match cmd dispatch not found in run_command_ctx")
+        raise AuditError("match cmd dispatch not found in run_command_ctx*")
+    fs, _fe = fn_span
     match_pos = fs + mm.start()
     dispatched = set()
     for a, b, _eq in extract_match_arms(skel, match_pos):
@@ -781,19 +820,26 @@ _TOP_FN = re.compile(
 
 def audit_mechanisms(repo, texts):
     """Classify top-level fns in mechanism files: live_wired / test_only / dead."""
-    # gather all live+test text once
-    all_live = "\n".join(live for live, _t in texts.values() if live)
-    all_test = "\n".join(t for _l, t in texts.values() if t)
+    # gather all live+test text once; call sites counted in two regex passes
+    # instead of one findall per function (the old per-fn scan was the Mode A
+    # bottleneck: ~500 fns x ~12 MB of source).
+    all_live = "\n".join(t[0] for t in texts.values() if t[0])
+    all_test = "\n".join(t[1] for t in texts.values() if t[1])
+    call_re = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+    live_calls = {}
+    for m in call_re.finditer(all_live):
+        live_calls[m.group(1)] = live_calls.get(m.group(1), 0) + 1
+    test_calls = {}
+    for m in call_re.finditer(all_test):
+        test_calls[m.group(1)] = test_calls.get(m.group(1), 0) + 1
 
     per_file = {}
     totals = {"functions": 0, "live_wired": 0, "test_only": 0, "dead": 0}
     for rel in MECHANISM_FILES:
-        path = repo / rel
-        if not path.exists():
+        entry = texts.get(rel)
+        if entry is None or not entry[0]:
             continue
-        raw = path.read_text(errors="replace")
-        lv = live_text(raw)
-        live_code, test_code = mask_test_regions(lv)
+        live_code = entry[0]
         fns = []
         for m in _TOP_FN.finditer(live_code):
             name = m.group(1)
@@ -802,14 +848,13 @@ def audit_mechanisms(repo, texts):
         wired = only_test = dead = 0
         details = []
         for name, def_pos in fns:
-            call = re.compile(r"\b" + re.escape(name) + r"\s*\(")
-            live_calls = len(call.findall(all_live)) - 1  # minus this def
-            # other defs of same name elsewhere also counted; approximate
-            test_calls = len(call.findall(all_test))
-            if live_calls > 0:
+            # `name(` occurrences in live code minus this definition site
+            lc = live_calls.get(name, 0) - 1
+            tc = test_calls.get(name, 0)
+            if lc > 0:
                 wired += 1
                 status = "live_wired"
-            elif test_calls > 0:
+            elif tc > 0:
                 only_test += 1
                 status = "test_only"
             else:
@@ -830,6 +875,418 @@ def audit_mechanisms(repo, texts):
     return {"mechanisms": {"files": per_file, "totals": totals}}
 
 
+# ---------------------------------------------------------------------------
+# Mode A: S2C Play packet send coverage
+# ---------------------------------------------------------------------------
+
+# send helpers -> index of the packet-id argument
+_SEND_IDXS = {
+    "send_packet": 1,
+    "send_broadcast_frame": 2,
+    "SharedBroadcastFrame::new": 0,
+}
+_SEND_RE = re.compile(r"\b(send_packet|send_broadcast_frame|SharedBroadcastFrame::new)\s*\(")
+# `(ID,` tuple producers: mk closures `|c| (0x42, pkt)`, `=> (ID, ..)`,
+# `return (ID, ..)`, `let x = (ID, ..)` and line-leading tail tuples.
+_TUPLE_RE = re.compile(r"\(\s*(0x[0-9a-fA-F]+|[A-Za-z_][A-Za-z0-9_]*)\s*,")
+_WRITE_VARINT_RE = re.compile(r"\bwrite_varint\s*\(")
+_S2C_CONST_RE = re.compile(
+    r"\b[A-Za-z_][A-Za-z0-9_]*S2C[A-Za-z0-9_]*\b|\bCB_[A-Za-z0-9_]+\b")
+_LET_RE = re.compile(
+    r"\blet\s+(?:mut\s+)?([a-zA-Z_]\w*)\s*=\s*"
+    r"(0x[0-9a-fA-F]+|[0-9]+|[A-Z][A-Z0-9_]{2,})\s*;")
+_FN_DEF_RE = re.compile(
+    r"\b(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?"
+    r"fn\s+([A-Za-z_]\w*)\s*\(")
+_STATIC_LIT_RE = re.compile(
+    r"\bstatic\s+([A-Z][A-Z0-9_]*)\s*:[^=;]+?=\s*(0x[0-9a-fA-F]+|[0-9]+)\s*;")
+_ARG_TOKEN_RE = re.compile(r"(0x[0-9a-fA-F]+|[0-9]+|[A-Za-z_][A-Za-z0-9_]*)")
+
+# Functions whose send_packet calls carry login/configuration/status-phase
+# ids, not Play S2C ids (send_packet is phase-agnostic). Signals inside these
+# are excluded from the S2C coverage audit.
+_NON_PLAY_FNS = frozenset({
+    "negotiate_compression",      # login set_compression (0x03)
+    "login_disconnect",           # login disconnect (0x00)
+    "login_disconnect_text",      # login disconnect (0x00)
+    "velocity_login",             # login plugin request (0x04)
+    "online_login",               # login encryption request (0x01)
+    "status_version_mismatch",    # status response/pong (0x00/0x01)
+})
+# Identifier prefixes that name non-Play-phase packet ids.
+_NON_PLAY_PREFIXES = ("CONFIG_", "LOGIN_")
+
+
+def _call_args(skel, open_idx):
+    """Top-level argument spans of the call whose '(' is at open_idx."""
+    args = []
+    start = open_idx + 1
+    i = start
+    n = len(skel)
+    par = brk = brace = 0
+    while i < n:
+        c = skel[i]
+        if c == "(":
+            par += 1
+        elif c == ")":
+            if par == 0 and brk == 0 and brace == 0:
+                args.append((start, i))
+                return args
+            par -= 1
+        elif c == "[":
+            brk += 1
+        elif c == "]":
+            brk -= 1
+        elif c == "{":
+            brace += 1
+        elif c == "}":
+            brace -= 1
+        elif c == "," and par == 0 and brk == 0 and brace == 0:
+            args.append((start, i))
+            start = i + 1
+        i += 1
+    return []
+
+
+def _arg_id_token(skel, span):
+    """First token of a call argument, or None."""
+    a, b = span
+    m = _ARG_TOKEN_RE.match(skel[a:b].lstrip())
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _resolve_packet_id(tok, consts, letmap, allow_dec=True):
+    """Resolve a hex/dec/ident token to an int packet id, or None."""
+    if tok is None:
+        return None
+    tok = tok.strip()
+    if tok.startswith(_NON_PLAY_PREFIXES):
+        return None
+    if re.fullmatch(r"0x[0-9a-fA-F]+", tok):
+        return int(tok, 16)
+    if re.fullmatch(r"[0-9]+", tok):
+        return int(tok) if allow_dec else None
+    if tok in letmap:
+        return letmap[tok]
+    return consts.get(tok)
+
+
+def _tuple_context_ok(skel, pos):
+    """Is the '(' at pos a packet-tuple producer rather than a pattern/arg?
+
+    Accepts closure returns `|..| (ID,`, match arms `=> (ID,`, `return (ID,`,
+    `= (ID,` bindings and line-leading tail expressions `(ID, ..)`.
+    """
+    # closure PARAM list `|(i, v)|` has '|' right after its ')' — reject those
+    # up front (closure RETURN `|args| (ID, payload)` ends in ')' ';'/',' etc.)
+    depth = 0
+    k = pos
+    while k < len(skel):
+        c = skel[k]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        k += 1
+    if k < len(skel):
+        j = k + 1
+        while j < len(skel) and skel[j] in " \t\n":
+            j += 1
+        if j < len(skel) and skel[j] == "|":
+            return False
+    i = pos - 1
+    while i >= 0 and skel[i] in " \t\n":
+        i -= 1
+    if i < 0:
+        return True
+    c = skel[i]
+    if c in "|>=":
+        return True
+    tail = skel[max(0, pos - 40):pos]
+    if re.search(r"\breturn\s*$", tail):
+        return True
+    # line-leading expression: first non-ws char on its line, preceded by a
+    # block boundary ('{' ';' '}') — the shape of a fn/match-arm tail tuple.
+    ls = skel.rfind("\n", 0, pos) + 1
+    if not skel[ls:pos].strip():
+        j = ls - 1
+        while j >= 0 and skel[j] in " \t\n":
+            j -= 1
+        if j < 0 or skel[j] in "{;}":
+            return True
+    return False
+
+
+def audit_s2c(repo, texts):
+    """S2C Play packet send coverage: which clientbound Play ids have a live
+    emission site in non-test src/ code."""
+    d767 = (repo / "proto/src/data_v767.rs").read_text()
+    packets = parse_v767_packets(d767)
+    s2c = [p for p in packets
+           if p["phase"] == "play" and p["direction"] == "clientbound"]
+    s2c_ids = {p["id"] for p in s2c}
+
+    # packet-id constants across all live files (consts + literal statics)
+    consts = {}
+    for rel, (live, _t, _s) in texts.items():
+        if not live:
+            continue
+        consts.update(parse_int_consts(live))
+        for m in _STATIC_LIT_RE.finditer(live):
+            consts.setdefault(m.group(1), int(m.group(2), 0))
+
+    all_live = "\n".join(t[0] for t in texts.values() if t[0])
+    call_re = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+    call_counts = {}
+    for m in call_re.finditer(all_live):
+        call_counts[m.group(1)] = call_counts.get(m.group(1), 0) + 1
+
+    def_counts = {}
+    pub_fns = set()
+    per_file = {}
+    for rel, (live, _t, sk) in texts.items():
+        if sk is None:
+            continue
+        letmap = {}
+        letmap_hex = {}  # decimal `let` bindings are too ambiguous for tuples
+        for m in _LET_RE.finditer(sk):
+            rhs = m.group(2)
+            letmap[m.group(1)] = _resolve_packet_id(rhs, consts, {})
+            letmap_hex[m.group(1)] = _resolve_packet_id(rhs, consts, {},
+                                                      allow_dec=False)
+        fns = []  # (pos, name, is_pub) sorted by pos
+        for m in _FN_DEF_RE.finditer(sk):
+            name = m.group(1)
+            is_pub = m.group(0).lstrip().startswith("pub")
+            fns.append((m.start(), name, is_pub))
+            def_counts[name] = def_counts.get(name, 0) + 1
+            if is_pub:
+                pub_fns.add(name)
+        per_file[rel] = (sk, live, letmap, letmap_hex, fns)
+
+    def fn_live(name):
+        # live-wired = has non-def `name(` occurrences in live code, or is pub
+        return call_counts.get(name, 0) - def_counts.get(name, 0) > 0 \
+            or name in pub_fns
+
+    # handle_inner's login/config handshake ends at the `// ---- play ----`
+    # marker; send sites before it carry login/config ids, not Play ids.
+    nonplay_spans = {}  # rel -> [(start,end)]
+    pp_raw = (repo / "src/play_protocol.rs").read_text(errors="replace")
+    marker = pp_raw.find("---- play ----")
+    if marker > 0:
+        pp_skel = per_file.get("src/play_protocol.rs", (None,))[0]
+        if pp_skel is not None:
+            hs = fn_body_span(pp_skel, "handle_inner")
+            if hs and hs[0] < marker:
+                nonplay_spans["src/play_protocol.rs"] = [(hs[0], marker)]
+
+    emitted = {}   # proto play clientbound id -> set(signal kinds)
+    unresolved_sites = 0
+    excluded_sites = 0
+
+    def note(packet_id, via):
+        if packet_id in s2c_ids:
+            emitted.setdefault(packet_id, set()).add(via)
+
+    for rel, (sk, live, letmap, letmap_hex, fns) in per_file.items():
+        positions = [p for p, _n, _u in fns]
+
+        def enclosing(pos):
+            i = bisect.bisect_right(positions, pos) - 1
+            return fns[i] if i >= 0 else None
+
+        def in_nonplay(pos):
+            if any(a <= pos < b for a, b in nonplay_spans.get(rel, ())):
+                return True
+            fn = enclosing(pos)
+            return fn is not None and fn[1] in _NON_PLAY_FNS
+
+        # 1) direct send-helper call sites: id argument position
+        for m in _SEND_RE.finditer(sk):
+            pos = m.start()
+            if in_nonplay(pos):
+                excluded_sites += 1
+                continue
+            idx = _SEND_IDXS[m.group(1)]
+            args = _call_args(sk, m.end() - 1)
+            if len(args) <= idx:
+                unresolved_sites += 1
+                continue
+            tok = _arg_id_token(sk, args[idx])
+            pid = _resolve_packet_id(tok, consts, letmap)
+            if pid is None:
+                unresolved_sites += 1
+            else:
+                note(pid, "send:" + m.group(1))
+
+        # 2) S2C/CB packet-id constants used anywhere in live code
+        for m in _S2C_CONST_RE.finditer(live):
+            name = m.group(0)
+            if "S2C" not in name and not name.startswith("CB_"):
+                continue
+            if name.startswith(_NON_PLAY_PREFIXES):
+                continue
+            pid = consts.get(name)
+            if pid is not None:
+                note(pid, "const:" + name)
+
+        # 3) packet-tuple producers `(ID, payload)` in live-wired fns
+        for m in _TUPLE_RE.finditer(sk):
+            pos = m.start()
+            if in_nonplay(pos) or not _tuple_context_ok(sk, pos):
+                continue
+            fn = enclosing(pos)
+            if fn is not None and not fn_live(fn[1]):
+                continue
+            tok = m.group(1)
+            if re.fullmatch(r"[0-9]+", tok):
+                continue  # bare decimals are too ambiguous in tuple position
+            pid = _resolve_packet_id(tok, consts, letmap_hex, allow_dec=False)
+            if pid is not None:
+                note(pid, "tuple")
+
+        # 4) write_varint-embedded packet ids inside encode_* builders
+        for m in _WRITE_VARINT_RE.finditer(sk):
+            pos = m.start()
+            if in_nonplay(pos):
+                continue
+            fn = enclosing(pos)
+            if fn is None or not fn[1].startswith("encode") or not fn_live(fn[1]):
+                continue
+            args = _call_args(sk, m.end() - 1)
+            if len(args) < 2:
+                continue
+            tok = _arg_id_token(sk, args[1])
+            if tok is not None and re.fullmatch(r"[0-9]+", tok):
+                continue
+            pid = _resolve_packet_id(tok, consts, letmap_hex, allow_dec=False)
+            if pid is not None:
+                note(pid, "encode_varint")
+
+    emitted_list = []
+    unemitted = []
+    for p in sorted(s2c, key=lambda x: x["id"]):
+        if p["id"] in emitted:
+            emitted_list.append({
+                "name": p["name"], "id": p["id"],
+                "via": sorted(emitted[p["id"]]),
+            })
+        else:
+            unemitted.append({"name": p["name"], "id": p["id"]})
+    return {
+        "s2c_play_packets": {
+            "total": len(s2c),
+            "emitted_count": len(emitted_list),
+            "emitted_pct": round(100.0 * len(emitted_list) / max(1, len(s2c)), 1),
+            "emitted": emitted_list,
+            "unemitted": unemitted,
+            "unresolved_send_sites": unresolved_sites,
+            "non_play_excluded_sites": excluded_sites,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mode A: behavioral parity feature matrix
+# ---------------------------------------------------------------------------
+
+# (bullet group, feature, lowercase needles). impl = live non-test src text,
+# test = #[cfg(test)] regions + *_tests.rs + tests/**/*.py.
+_BEHAVIOR_MATRIX = [
+    ("combat", "combat", ["combat"]),
+    ("combat", "wind_charge", ["wind_charge", "windcharge", "wind_burst", "windburst"]),
+    ("combat", "shield", ["shield"]),
+    ("combat", "totem", ["totem"]),
+    ("combat", "trident", ["trident"]),
+    ("redstone", "redstone", ["redstone"]),
+    ("redstone", "hopper", ["hopper"]),
+    ("redstone", "comparator", ["comparator"]),
+    ("redstone", "observer", ["observer"]),
+    ("redstone", "piston", ["piston"]),
+    ("end", "end_portal", ["end_portal", "endportal"]),
+    ("end", "end_gateway", ["end_gateway", "endgateway"]),
+    ("end", "eye_of_ender", ["eye_of_ender", "eyeofender", "eye of ender"]),
+    ("end", "chorus", ["chorus"]),
+    ("end", "shulker", ["shulker"]),
+    ("nether", "nether_portal", ["nether_portal", "netherportal"]),
+    ("nether", "respawn_anchor", ["respawn_anchor", "respawnanchor"]),
+    ("nether", "piglin", ["piglin"]),
+    ("tame", "tame", ["tame"]),
+    ("tame", "leash", ["leash"]),
+    ("tame", "horse", ["horse"]),
+    ("tame", "parrot", ["parrot"]),
+    ("commands", "command_block", ["command_block", "commandblock"]),
+    ("commands", "datapack", ["datapack"]),
+    ("commands", "datapack_zip", ["zip"]),
+    ("commands", "dpc1", ["dpc1"]),
+    ("save", "save", ["save_v2", "world_save", "save_game", "player_save"]),
+    ("save", "anvil", ["anvil"]),
+    ("save", "playerdata", ["playerdata", "player_data"]),
+    ("save", "chunk_unload", ["chunk_unload", "unload_chunk",
+                             "auto_unload", "sweep_unticketed"]),
+]
+
+
+def audit_behavior_matrix(repo, texts):
+    """Per-subsystem COVERED/GAP: needs BOTH a live non-test implementation
+    and dedicated parity-test evidence."""
+    live_blob_parts = []
+    test_blob_parts = []
+    for live, test, _s in texts.values():
+        if live:
+            live_blob_parts.append(live)
+        if test:
+            test_blob_parts.append(test)
+    tests_dir = repo / "tests"
+    if tests_dir.is_dir():
+        for path in sorted(tests_dir.rglob("*.py")):
+            try:
+                test_blob_parts.append(path.read_text(errors="replace"))
+            except OSError:
+                continue
+    live_blob = "\n".join(live_blob_parts).lower()
+    test_blob = "\n".join(test_blob_parts).lower()
+
+    subsystems = []
+    groups = {}
+    covered = 0
+    for group, feature, needles in _BEHAVIOR_MATRIX:
+        impl_hits = [n for n in needles if n in live_blob]
+        test_hits = [n for n in needles if n in test_blob]
+        status = "COVERED" if impl_hits and test_hits else "GAP"
+        if status == "COVERED":
+            covered += 1
+        subsystems.append({
+            "group": group,
+            "feature": feature,
+            "status": status,
+            "impl": bool(impl_hits),
+            "test": bool(test_hits),
+            "impl_evidence": impl_hits,
+            "test_evidence": test_hits,
+        })
+        g = groups.setdefault(group, {"covered": 0, "total": 0})
+        g["total"] += 1
+        if status == "COVERED":
+            g["covered"] += 1
+    return {
+        "behavior_matrix": {
+            "subsystems": subsystems,
+            "totals": {
+                "subsystems": len(subsystems),
+                "covered": covered,
+                "gaps": len(subsystems) - covered,
+            },
+            "groups": groups,
+        }
+    }
+
+
 def mode_a(repo):
     texts = _live_src_texts(repo)
     report = {"schema": SCHEMA, "mode": "offline", "offline": {}}
@@ -840,6 +1297,8 @@ def mode_a(repo):
     report["offline"].update(audit_gamerules(repo, texts))
     report["offline"].update(audit_commands(repo))
     report["offline"].update(audit_mechanisms(repo, texts))
+    report["offline"].update(audit_s2c(repo, texts))
+    report["offline"].update(audit_behavior_matrix(repo, texts))
     # consistency: V767 entity table vs entity_registry (same protocol ids)
     d767 = (repo / "proto/src/data_v767.rs").read_text()
     v767_entities = parse_v767_name_table(d767, "V767_ENTITY_TYPES") or []
@@ -922,6 +1381,39 @@ def parse_registries_report(report):
     return out
 
 
+def parse_blocks_report(report):
+    """reports/blocks.json (optional) -> per-block state counts + totals.
+
+    Vanilla shape: {block_name: {..., "states": [{"id": int, "default": bool,
+    ...}]}} with globally contiguous ascending state ids. Fail-closed on a
+    corrupt or non-contiguous report, same as the other Mode B inputs.
+    """
+    blocks = {}
+    for name, rec in _req_obj(report, "blocks.json").items():
+        rec = _req_obj(rec, f"blocks.json[{name}]")
+        states = rec.get("states")
+        if not isinstance(states, list) or not states:
+            raise AuditError(f"blocks.json[{name}]: expected a non-empty 'states' list")
+        ids = []
+        for i, st in enumerate(states):
+            st = _req_obj(st, f"blocks.json[{name}].states[{i}]")
+            ids.append(_req_int(st.get("id"),
+                                f"blocks.json[{name}].states[{i}].id"))
+        for i in range(1, len(ids)):
+            if ids[i] != ids[i - 1] + 1:
+                raise AuditError(
+                    f"blocks.json[{name}]: state ids are not contiguous "
+                    f"(... {ids[i - 1]}, {ids[i]} ...)")
+        blocks[str(name)] = len(ids)
+    if not blocks:
+        raise AuditError("blocks.json: no blocks present")
+    return {
+        "blocks": blocks,
+        "block_count": len(blocks),
+        "state_total": sum(blocks.values()),
+    }
+
+
 def load_reports_dir(path):
     path = Path(path)
     if not path.is_dir():
@@ -941,6 +1433,17 @@ def load_reports_dir(path):
             raise
         except Exception as exc:  # noqa: BLE001 - fail closed on any parse issue
             raise AuditError(f"{fp}: {exc}") from exc
+    # blocks.json is optional: vanilla --reports emits it, hand-built dirs may not
+    blocks_fp = path / "blocks.json"
+    if blocks_fp.is_file():
+        try:
+            data["blocks.json"] = parse_blocks_report(json.loads(blocks_fp.read_text()))
+        except json.JSONDecodeError as exc:
+            raise AuditError(f"{blocks_fp}: corrupt JSON: {exc}") from exc
+        except AuditError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AuditError(f"{blocks_fp}: {exc}") from exc
     return data, f"reports-dir:{path}"
 
 
@@ -1103,33 +1606,82 @@ def audit_vanilla(repo, report_offline, data, source):
             "extra_ids": extra,
         }
 
-    return {
-        "vanilla": {
-            "source": source,
-            "protocol": PROTOCOL,
-            "packets": {
-                "vanilla_total": len(vanilla_packets),
-                "missing_in_proto": missing_in_proto,
-                "missing_in_proto_count": len(missing_in_proto),
-                "id_mismatch_in_proto": id_mismatch,
-                "id_mismatch_in_proto_count": len(id_mismatch),
-                "name_mismatch_in_proto": name_mismatch,
-                "name_mismatch_in_proto_count": len(name_mismatch),
-                "extra_in_proto": extra_in_proto,
-                "extra_in_proto_count": len(extra_in_proto),
-                "unhandled_in_live_server": unhandled_in_live,
-                "unhandled_in_live_server_count": len(unhandled_in_live),
+    # blocks.json differential: vanilla block count + total state ids vs the
+    # V767_BLOCKS table, the FIRST_MOD_BLOCK_STATE_ID ceiling and (when the
+    # generated asset is present) per-block state counts.
+    blocks_diff = None
+    if "blocks.json" in data:
+        vb = data["blocks.json"]
+        v767_blocks = parse_v767_name_table(d767, "V767_BLOCKS") or []
+        lt = (repo / "src/landing_types.rs").read_text(errors="replace")
+        cm = re.search(r"FIRST_MOD_BLOCK_STATE_ID[^=]*=\s*([0-9_]+)", lt)
+        ceiling = int(cm.group(1).replace("_", "")) if cm else None
+        asset_blocks = {}
+        asset_fp = repo / "assets/block_states_1211.json"
+        if asset_fp.is_file():
+            try:
+                adoc = json.loads(asset_fp.read_text())
+                for row in adoc.get("blocks", []):
+                    if isinstance(row, list) and len(row) >= 3:
+                        asset_blocks[str(row[0])] = int(row[2])
+            except Exception:  # noqa: BLE001 - asset is advisory here
+                asset_blocks = {}
+        per_block = []
+        for name, cnt in sorted(vb["blocks"].items()):
+            ours = asset_blocks.get(name)
+            if ours is not None and ours != cnt:
+                per_block.append({
+                    "block": name,
+                    "vanilla_states": cnt,
+                    "ours_states": ours,
+                })
+        blocks_diff = {
+            "vanilla": {
+                "block_count": vb["block_count"],
+                "state_total": vb["state_total"],
             },
-            "commands": {
-                "vanilla_root_count": len(vanilla_cmds),
-                "missing_vanilla_commands": missing_cmds,
-                "missing_vanilla_commands_count": len(missing_cmds),
-                "extra_registered_commands": extra_cmds,
-                "extra_registered_commands_count": len(extra_cmds),
+            "ours": {
+                "v767_block_count": len(v767_blocks),
+                "state_ceiling": ceiling,
+                "asset_block_count": len(asset_blocks) or None,
+                "asset_state_total": sum(asset_blocks.values()) or None,
             },
-            "registries": registries,
+            "per_block_state_mismatches": per_block[:50],
+            "per_block_state_mismatch_count": len(per_block),
         }
+        blocks_diff["match"] = (
+            vb["block_count"] == len(v767_blocks)
+            and ceiling is not None and ceiling == vb["state_total"]
+            and not per_block)
+
+    vanilla_out = {
+        "source": source,
+        "protocol": PROTOCOL,
+        "packets": {
+            "vanilla_total": len(vanilla_packets),
+            "missing_in_proto": missing_in_proto,
+            "missing_in_proto_count": len(missing_in_proto),
+            "id_mismatch_in_proto": id_mismatch,
+            "id_mismatch_in_proto_count": len(id_mismatch),
+            "name_mismatch_in_proto": name_mismatch,
+            "name_mismatch_in_proto_count": len(name_mismatch),
+            "extra_in_proto": extra_in_proto,
+            "extra_in_proto_count": len(extra_in_proto),
+            "unhandled_in_live_server": unhandled_in_live,
+            "unhandled_in_live_server_count": len(unhandled_in_live),
+        },
+        "commands": {
+            "vanilla_root_count": len(vanilla_cmds),
+            "missing_vanilla_commands": missing_cmds,
+            "missing_vanilla_commands_count": len(missing_cmds),
+            "extra_registered_commands": extra_cmds,
+            "extra_registered_commands_count": len(extra_cmds),
+        },
+        "registries": registries,
     }
+    if blocks_diff is not None:
+        vanilla_out["blocks"] = blocks_diff
+    return {"vanilla": vanilla_out}
 
 
 # ---------------------------------------------------------------------------
@@ -1173,6 +1725,28 @@ def render_text(report):
     ec = off["entity_table_consistency"]
     lines.append(f"  Entity table consistency: v767={ec['v767_count']} registry={ec['registry_count']} "
                  f"mismatches={len(ec['mismatches'])}")
+    s2c = off.get("s2c_play_packets")
+    if s2c:
+        lines.append(f"  S2C Play packets: {s2c['emitted_count']}/{s2c['total']} emitted "
+                     f"({s2c['emitted_pct']}%)")
+        if s2c["unemitted"]:
+            lines.append(f"    UNEMITTED ({len(s2c['unemitted'])}): " +
+                         ", ".join(f"{x['name']}({hex(x['id'])})" for x in s2c["unemitted"]))
+        lines.append(f"    unresolved_send_sites={s2c['unresolved_send_sites']} "
+                     f"non_play_excluded={s2c['non_play_excluded_sites']}")
+    bm = off.get("behavior_matrix")
+    if bm:
+        t = bm["totals"]
+        lines.append(f"  Behavioral parity matrix: {t['covered']}/{t['subsystems']} COVERED, "
+                     f"{t['gaps']} GAP")
+        for s in bm["subsystems"]:
+            if s["status"] == "GAP":
+                missing = []
+                if not s["impl"]:
+                    missing.append("impl")
+                if not s["test"]:
+                    missing.append("test")
+                lines.append(f"    GAP {s['group']}/{s['feature']}: missing {'+'.join(missing)}")
 
     if "vanilla" in report:
         v = report["vanilla"]
@@ -1204,6 +1778,16 @@ def render_text(report):
                 lines.append(f"    missing: id={item['id']} {item['name']}")
             for item in rr["id_mismatch"][:30]:
                 lines.append(f"    id_mismatch: id={item['id']} {item['name']} -> {item['id_mismatch_in']}")
+        if "blocks" in v:
+            b = v["blocks"]
+            lines.append(f"  Blocks: vanilla={b['vanilla']['block_count']} blocks/"
+                         f"{b['vanilla']['state_total']} states vs ours "
+                         f"v767_blocks={b['ours']['v767_block_count']} "
+                         f"ceiling={b['ours']['state_ceiling']} "
+                         f"match={b['match']}")
+            for item in b["per_block_state_mismatches"][:30]:
+                lines.append(f"    block_state_mismatch: {item['block']} "
+                             f"vanilla={item['vanilla_states']} ours={item['ours_states']}")
     return "\n".join(lines)
 
 
@@ -1247,6 +1831,28 @@ def render_markdown(report):
     ec = off["entity_table_consistency"]
     lines += [f"- **Entity table consistency**: v767={ec['v767_count']} "
               f"registry={ec['registry_count']} mismatches={len(ec['mismatches'])}", ""]
+    s2c = off.get("s2c_play_packets")
+    if s2c:
+        lines += [f"- **S2C Play packets**: {s2c['emitted_count']}/{s2c['total']} emitted "
+                  f"({s2c['emitted_pct']}%)", ""]
+        if s2c["unemitted"]:
+            lines.append("Unemitted S2C Play packets:")
+            lines.append("")
+            lines.append("| packet | id |")
+            lines.append("|---|---|")
+            for x in s2c["unemitted"]:
+                lines.append(f"| {x['name']} | `{hex(x['id'])}` |")
+            lines.append("")
+    bm = off.get("behavior_matrix")
+    if bm:
+        t = bm["totals"]
+        lines += [f"- **Behavioral parity matrix**: {t['covered']}/{t['subsystems']} COVERED, "
+                  f"{t['gaps']} GAP", ""]
+        lines.append("| group | feature | status |")
+        lines.append("|---|---|---|")
+        for s in bm["subsystems"]:
+            lines.append(f"| {s['group']} | {s['feature']} | {s['status']} |")
+        lines.append("")
 
     if "vanilla" in report:
         v = report["vanilla"]
@@ -1264,6 +1870,13 @@ def render_markdown(report):
             lines.append(f"- `{reg}`: vanilla={rr['vanilla_count']} ours={rr['ours_count']} "
                          f"missing={len(rr['missing_ids'])} "
                          f"id_mismatch={len(rr['id_mismatch'])} extra={len(rr['extra_ids'])}")
+        if "blocks" in v:
+            b = v["blocks"]
+            lines.append(f"- **blocks.json**: vanilla={b['vanilla']['block_count']} blocks/"
+                         f"{b['vanilla']['state_total']} states; ours "
+                         f"v767_blocks={b['ours']['v767_block_count']} "
+                         f"ceiling={b['ours']['state_ceiling']} "
+                         f"match={b['match']}")
         lines.append("")
     return "\n".join(lines)
 
@@ -1285,7 +1898,71 @@ def build_parser():
                          "(runs net.minecraft.data.Main --reports)")
     ap.add_argument("--format", choices=["text", "markdown", "json"], default="text")
     ap.add_argument("--out", default=None, help="also write the report to this path")
+    # Strict regression gate: any violation exits 1 with a diagnostic on stderr.
+    ap.add_argument("--strict", action="store_true",
+                    help="regression gate: imply --require-zero-proto-drift and "
+                         "enforce every floor flag that is set")
+    ap.add_argument("--min-c2s-handled", type=int, default=None, metavar="N",
+                    help="gate: fail if live-handled C2S Play packets < N")
+    ap.add_argument("--min-gamerules-wired", type=int, default=None, metavar="N",
+                    help="gate: fail if wired gamerules < N")
+    ap.add_argument("--require-zero-proto-drift", action="store_true",
+                    help="gate: fail on ANY Mode B proto/command/registry/"
+                         "block-state drift (requires --reports-dir/--vanilla-jar)")
     return ap
+
+
+def evaluate_gate(report, args):
+    """Strict-gate violations -> list of exact diagnostic strings (empty = pass)."""
+    violations = []
+    off = report["offline"]
+    if args.min_c2s_handled is not None:
+        handled = off["packets"]["handled_count"]
+        if handled < args.min_c2s_handled:
+            violations.append(
+                f"c2s_play handled {handled} < --min-c2s-handled "
+                f"{args.min_c2s_handled}")
+    if args.min_gamerules_wired is not None:
+        wired = off["gamerules"]["wired_count"]
+        if wired < args.min_gamerules_wired:
+            violations.append(
+                f"gamerules wired {wired} < --min-gamerules-wired "
+                f"{args.min_gamerules_wired}")
+    want_drift = args.require_zero_proto_drift or args.strict
+    if want_drift and "vanilla" in report:
+        v = report["vanilla"]
+        vp = v["packets"]
+        if vp["missing_in_proto_count"]:
+            violations.append(
+                f"proto drift: missing_in_proto={vp['missing_in_proto_count']}")
+        if vp["id_mismatch_in_proto_count"]:
+            violations.append(
+                f"proto drift: id_mismatch={vp['id_mismatch_in_proto_count']}")
+        if vp["name_mismatch_in_proto_count"]:
+            violations.append(
+                f"proto drift: name_mismatch={vp['name_mismatch_in_proto_count']}")
+        vc = v["commands"]
+        if vc["missing_vanilla_commands_count"]:
+            violations.append(
+                f"command drift: missing_vanilla_commands="
+                f"{vc['missing_vanilla_commands_count']}")
+        for reg, rr in sorted(v["registries"].items()):
+            n_miss = len(rr["missing_ids"])
+            n_mism = len(rr["id_mismatch"])
+            if n_miss or n_mism or rr["vanilla_count"] != rr["ours_count"]:
+                violations.append(
+                    f"registry drift {reg}: missing_ids={n_miss} "
+                    f"id_mismatch={n_mism} vanilla_count={rr['vanilla_count']} "
+                    f"ours_count={rr['ours_count']}")
+        if "blocks" in v and not v["blocks"]["match"]:
+            b = v["blocks"]
+            violations.append(
+                f"block-state drift: vanilla={b['vanilla']['block_count']} blocks/"
+                f"{b['vanilla']['state_total']} states vs ours "
+                f"v767_blocks={b['ours']['v767_block_count']} "
+                f"ceiling={b['ours']['state_ceiling']} "
+                f"per_block_mismatches={b['per_block_state_mismatch_count']}")
+    return violations
 
 
 def main(argv=None):
@@ -1321,6 +1998,15 @@ def main(argv=None):
     sys.stdout.write(rendered)
     if args.out:
         Path(args.out).write_text(rendered)
+    gate_active = (args.strict or args.min_c2s_handled is not None
+                   or args.min_gamerules_wired is not None
+                   or args.require_zero_proto_drift)
+    if gate_active:
+        violations = evaluate_gate(report, args)
+        if violations:
+            for v in violations:
+                print(f"vanilla_parity_audit: gate violation: {v}", file=sys.stderr)
+            return 1
     return 0
 
 
